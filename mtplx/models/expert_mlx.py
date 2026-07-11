@@ -548,6 +548,38 @@ def _run_component_bank_q4(
     return output.reshape((len(bindings), int(output.shape[-1])))
 
 
+def _run_component_bank_q4_slots(
+    x: mx.array,
+    bank: MlxComponentBank,
+    slot_indices: mx.array,
+    *,
+    group_size: int,
+) -> mx.array:
+    """Execute assignment rows using a device-resident logical-slot vector."""
+
+    assignments = int(x.shape[0])
+    selected = x.reshape((assignments, 1, 1, int(x.shape[-1])))
+    rhs_indices = slot_indices.reshape((-1, 1)).astype(mx.int32)
+
+    def qmm(values: mx.array, projection: str) -> mx.array:
+        return mx.gather_qmm(
+            values,
+            bank.arrays[f"{projection}.weight"],
+            bank.arrays[f"{projection}.scales"],
+            bank.arrays[f"{projection}.biases"],
+            rhs_indices=rhs_indices,
+            transpose=True,
+            group_size=group_size,
+            bits=4,
+            mode="affine",
+        )
+
+    gate = qmm(selected, "gate_proj")
+    up = qmm(selected, "up_proj")
+    output = qmm(swiglu(gate, up), "down_proj")
+    return output.reshape((assignments, int(output.shape[-1])))
+
+
 def _run_mapped_q4(
     x: mx.array,
     mapped: MappedExpertRecord,
@@ -642,6 +674,111 @@ class HotExpertSwitchGLU(nn.Module):
         self.runtime = runtime
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
+        metal_route_mode = os.environ.get(
+            "MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION",
+            "",
+        ).strip().lower()
+        self._metal_route_enabled = (
+            metal_route_mode in {"1", "true", "yes", "on", "speculative"}
+            and runtime.config.slot_layout == "component-banks"
+            and runtime.config.cache_scope == "layer"
+            and runtime.plan.slots_per_layer > 0
+        )
+        self._metal_slot_table_host = tuple(
+            -1 for _ in range(runtime.spec.expert_count)
+        )
+        self._metal_slot_table = mx.array(
+            self._metal_slot_table_host,
+            dtype=mx.int32,
+        )
+
+    def _refresh_metal_slot_table(self) -> None:
+        if not self._metal_route_enabled:
+            return
+        table = self.runtime.resident_slot_table(self.layer_index)
+        if table is None or table == self._metal_slot_table_host:
+            return
+        self._metal_slot_table_host = table
+        self._metal_slot_table = mx.array(table, dtype=mx.int32)
+        mx.async_eval(self._metal_slot_table)
+
+    def _try_metal_resolved_route(
+        self,
+        tokens: mx.array,
+        indices: mx.array,
+        *,
+        phase: RoutingPhase,
+        hidden_size: int,
+        top_k: int,
+    ) -> mx.array | None:
+        if not self._metal_route_enabled or phase is not RoutingPhase.DECODE:
+            return None
+        bank = self.runtime.slots.persistent_component_bank(self.layer_index)
+        if bank is None:
+            return None
+
+        with self.runtime.slots.external_route_lifetime(), self.runtime.metal_route_lease(
+            self.layer_index
+        ):
+            current_table = self.runtime.resident_slot_table_locked(self.layer_index)
+            if current_table is None:
+                return None
+            if current_table != self._metal_slot_table_host:
+                self._metal_slot_table_host = current_table
+                self._metal_slot_table = mx.array(current_table, dtype=mx.int32)
+                mx.async_eval(self._metal_slot_table)
+                return None
+            resolved = mx.take(self._metal_slot_table, indices).reshape(-1)
+            miss_count = mx.sum(resolved < 0)
+            assignment_inputs = mx.broadcast_to(
+                tokens[:, None, :],
+                (int(tokens.shape[0]), top_k, hidden_size),
+            ).reshape((-1, hidden_size))
+            # The branch is explicitly experimental: issue the all-hit graph
+            # next to the compact miss probe, then discard it on a miss. The
+            # candidate is fenced before releasing the mapping lease so even a
+            # failed probe can never observe an overwritten slot generation.
+            candidate = _run_component_bank_q4_slots(
+                assignment_inputs,
+                bank,
+                mx.maximum(resolved, mx.array(0, dtype=mx.int32)),
+                group_size=self.group_size,
+            )
+            mx.async_eval(candidate, miss_count)
+            sync_started = time.perf_counter()
+            mx.eval(miss_count)
+            sync_time = time.perf_counter() - sync_started
+            all_hit = int(miss_count.item()) == 0
+            mx.eval(candidate)
+            self.runtime.observe_metal_route_probe(
+                all_hit=all_hit,
+                speculative=True,
+                sync_time_s=sync_time,
+            )
+            if not all_hit:
+                return None
+
+            # Materialize IDs only after the Q4 graph has consumed the stable
+            # mapping. This keeps the eight-ID copy and Python policy update
+            # out of the pre-compute boundary while preserving exact LRU/LFU
+            # semantics for the next token.
+            expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
+            resolved_slots = tuple(int(value) for value in resolved.tolist())
+            plan = self.runtime.commit_metal_resolved_all_hits_locked(
+                self.layer_index,
+                expert_ids,
+                resolved_slots,
+                phase=phase,
+            )
+            if plan is None:
+                raise RuntimeError("Metal route table changed under its layer lease")
+            self.runtime.observe_route(
+                self.layer_index,
+                phase,
+                expert_ids,
+                token_count=int(tokens.shape[0]),
+            )
+            return candidate.reshape((*indices.shape, hidden_size))
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         if indices.ndim < 1:
@@ -659,12 +796,21 @@ class HotExpertSwitchGLU(nn.Module):
             )
         tokens = x.reshape(-1, hidden_size)
         top_k = int(indices.shape[-1])
+        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
+        metal_output = self._try_metal_resolved_route(
+            tokens,
+            indices,
+            phase=phase,
+            hidden_size=hidden_size,
+            top_k=top_k,
+        )
+        if metal_output is not None:
+            return metal_output
         mx.eval(indices)
         expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
         # Batch size is not a generation phase. A batched decode has shape
         # ``[B, 1, H]`` and must still train/use the persistent decode hot set;
         # only the sequence length distinguishes prefill from decode here.
-        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
         self.runtime.observe_route(
             self.layer_index,
             phase,
@@ -800,6 +946,7 @@ class HotExpertSwitchGLU(nn.Module):
         joined = mx.concatenate(outputs, axis=0)
         order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
         joined = mx.take(joined, order, axis=0)
+        self._refresh_metal_slot_table()
         return joined.reshape((*indices.shape, hidden_size))
 
 

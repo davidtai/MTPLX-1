@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable
@@ -355,6 +356,27 @@ class ExpertSlotPool:
         if not 0 <= transient_index < len(self._transient):
             raise ExpertSlotError("transient slot is outside the memory plan")
         return self._transient[transient_index]
+
+    def persistent_component_bank(self, layer: int) -> Any | None:
+        """Return the stable component bank used by one layer, when present."""
+
+        if self.cache_scope != "layer" or self.plan.slots_per_layer <= 0:
+            return None
+        slot = self._physical(layer, 0)
+        return getattr(slot.buffer, "bank", None)
+
+    @contextmanager
+    def external_route_lifetime(self):
+        """Keep close/reset accounting aware of a lock-fenced device route."""
+
+        with self._lifecycle:
+            if self._closed:
+                raise ExpertSlotError("expert slot pool is closed")
+            self.metrics.update(active_routes=1)
+        try:
+            yield
+        finally:
+            self._route_released()
 
     @staticmethod
     def _remaining(deadline_ns: int | None) -> float | None:

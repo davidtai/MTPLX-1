@@ -6,6 +6,7 @@ import os
 import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -492,6 +493,11 @@ class ExpertStreamingRuntime:
         self._mapped_expert_store: Any | None = None
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
+        self._metal_route_probes = 0
+        self._metal_route_all_hits = 0
+        self._metal_route_misses = 0
+        self._metal_route_speculative_misses = 0
+        self._metal_route_sync_time_s = 0.0
         self._split_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="mtplx-route-miss",
@@ -669,6 +675,79 @@ class ExpertStreamingRuntime:
             plan,
             expert_record_bytes=self.spec.expert_record_bytes,
         )
+
+    def resident_slot_table(self, layer: int) -> tuple[int, ...] | None:
+        """Snapshot one layer-local expert directory for a Metal mirror."""
+
+        if self._global_bank is not None:
+            return None
+        try:
+            lock = self._layer_locks[layer]
+            bank = self._banks[layer]
+        except KeyError as exc:
+            raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
+        with lock:
+            return bank.resident_slot_table()
+
+    def resident_slot_table_locked(self, layer: int) -> tuple[int, ...] | None:
+        """Read the directory while the caller owns ``metal_route_lease``."""
+
+        if self._global_bank is not None:
+            return None
+        return self._banks[layer].resident_slot_table()
+
+    @contextmanager
+    def metal_route_lease(self, layer: int):
+        """Hold the policy mapping stable through device lookup and Q4 use."""
+
+        if self._global_bank is not None:
+            raise ExpertSlotError("Metal route resolution requires a layer-local cache")
+        try:
+            lock = self._layer_locks[layer]
+        except KeyError as exc:
+            raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+
+    def commit_metal_resolved_all_hits_locked(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        resolved_slots: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> RoutePlan | None:
+        """Commit a device-resolved hit route while ``metal_route_lease`` is held."""
+
+        if self._global_bank is not None:
+            return None
+        plan = self._banks[layer].commit_resolved_all_hits(
+            expert_ids,
+            resolved_slots,
+            phase=phase,
+        )
+        if plan is not None:
+            self._observe_plan(layer, plan)
+        return plan
+
+    def observe_metal_route_probe(
+        self,
+        *,
+        all_hit: bool,
+        speculative: bool,
+        sync_time_s: float,
+    ) -> None:
+        self._metal_route_probes += 1
+        self._metal_route_sync_time_s += max(0.0, float(sync_time_s))
+        if all_hit:
+            self._metal_route_all_hits += 1
+        else:
+            self._metal_route_misses += 1
+            if speculative:
+                self._metal_route_speculative_misses += 1
 
     def _plan_route(
         self,
@@ -855,6 +934,11 @@ class ExpertStreamingRuntime:
             self._phase_counters = {
                 phase: CacheCounters() for phase in RoutingPhase
             }
+            self._metal_route_probes = 0
+            self._metal_route_all_hits = 0
+            self._metal_route_misses = 0
+            self._metal_route_speculative_misses = 0
+            self._metal_route_sync_time_s = 0.0
         finally:
             for lock in reversed(locks):
                 lock.release()
@@ -894,6 +978,13 @@ class ExpertStreamingRuntime:
             "cache_by_phase": {
                 phase.value: counters.as_dict()
                 for phase, counters in self._phase_counters.items()
+            },
+            "metal_route_resolution": {
+                "probes": self._metal_route_probes,
+                "all_hits": self._metal_route_all_hits,
+                "misses": self._metal_route_misses,
+                "speculative_misses": self._metal_route_speculative_misses,
+                "sync_time_s": self._metal_route_sync_time_s,
             },
             "slots": self.slots.snapshot(),
         }

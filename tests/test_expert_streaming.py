@@ -198,6 +198,29 @@ def test_duplicate_router_ids_share_one_load_and_slot() -> None:
     assert plan.slots[0] == plan.slots[1]
 
 
+def test_device_resolved_hit_commit_validates_the_mirrored_slot_table() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=2,
+        transient_slots=2,
+    )
+    first = bank.plan([2, 5], phase="decode")
+    table = bank.resident_slot_table()
+
+    assert table[2] == first.slots[0]
+    assert table[5] == first.slots[1]
+    assert bank.commit_resolved_all_hits(
+        [5, 2, 5],
+        [table[5], table[2], table[5]],
+        phase="decode",
+    ) is not None
+    assert bank.commit_resolved_all_hits(
+        [5, 2],
+        [table[2], table[5]],
+        phase="decode",
+    ) is None
+
+
 def test_counters_preserve_router_assignment_multiplicity() -> None:
     bank = LayerExpertSlotBank(
         expert_count=8,

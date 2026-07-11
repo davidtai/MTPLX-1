@@ -197,6 +197,14 @@ class LayerExpertSlotBank:
     def occupancy(self) -> int:
         return len(self._expert_to_slot)
 
+    def resident_slot_table(self) -> tuple[int, ...]:
+        """Return an immutable expert-to-slot snapshot for device mirroring."""
+
+        table = [-1] * self.expert_count
+        for expert, slot in self._expert_to_slot.items():
+            table[expert] = slot
+        return tuple(table)
+
     def invalidate_expert(self, expert_id: int) -> int | None:
         """Forget a failed/stale persistent mapping and return its slot."""
 
@@ -404,6 +412,49 @@ class LayerExpertSlotBank:
             misses=tuple(miss_order),
             loads=tuple(loads),
             evictions=tuple(evictions),
+        )
+
+    def commit_resolved_all_hits(
+        self,
+        expert_ids: Iterable[int],
+        resolved_slots: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> RoutePlan | None:
+        """Validate a device-resolved route, then apply normal hit accounting.
+
+        A mismatch is side-effect free. The caller must keep the layer policy
+        locked from the device-table probe through this commit.
+        """
+
+        experts = self._validate_experts_for_seed(expert_ids)
+        if not experts:
+            raise ValueError("a route must select at least one expert")
+        try:
+            slots = tuple(_integer("slot", slot, minimum=0) for slot in resolved_slots)
+        except TypeError as exc:
+            raise TypeError("resolved slots must be exact integers") from exc
+        if len(slots) != len(experts):
+            raise ValueError("resolved slots must match router assignments")
+        if any(self._expert_to_slot.get(expert) != slot for expert, slot in zip(experts, slots, strict=True)):
+            return None
+
+        phase = RoutingPhase(phase)
+        unique_experts = tuple(dict.fromkeys(experts))
+        if phase is RoutingPhase.DECODE:
+            self._decode_epoch += 1
+            for expert in experts:
+                self._touch_decode(expert)
+            for expert in unique_experts:
+                self._history[expert].last_used = self._decode_epoch
+        return RoutePlan(
+            phase=phase,
+            experts=experts,
+            slots=slots,
+            hits=unique_experts,
+            misses=(),
+            loads=(),
+            evictions=(),
         )
 
 
