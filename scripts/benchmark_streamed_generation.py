@@ -131,6 +131,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reset-between", action="store_true")
     parser.add_argument(
+        "--concurrency",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Saturation-lane stream count: decode N identical prompts through "
+            "the streamed continuous-batch runner and report aggregate and "
+            "per-stream tok/s. 1 keeps the reference single-stream path. "
+            "Streams whose combined prompt+max-tokens KV exceeds "
+            "--max-live-kv-tokens are serialized at step boundaries. "
+            "Outputs at different concurrencies are not token-comparable: "
+            "batch size is part of the run configuration label."
+        ),
+    )
+    parser.add_argument(
+        "--max-prefills-per-step",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Joining prefills allowed per decode step boundary while other "
+            "streams are actively decoding (concurrency > 1 only)."
+        ),
+    )
+    parser.add_argument(
         "--transient-slots",
         type=_positive_int,
         help="Global miss-service/I/O slots (default: model top-k).",
@@ -197,8 +220,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--mtp-artifacts",
         type=Path,
         help=(
-            "Directory holding layer80-residents-q.safetensors and "
-            "layer80-q4.safetensors for the Hy3 MTP head."
+            "Directory holding the layer-80 Hy3 MTP head artifacts "
+            "(layer80-bf16.safetensors for bf16; layer80-residents-q"
+            ".safetensors and layer80-q4.safetensors for q4)."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-precision",
+        choices=("bf16", "q4"),
+        help=(
+            "Layer-80 NextN head precision (default bf16). bf16 loads the "
+            "bit-exact BF16 head (~7.5 GB resident; quantized MTP heads "
+            "collapse acceptance, docs/FORGE_BACKEND_CONTRACT.md section 6) "
+            "- budget it against --expert-cache-limit. q4 loads the pinned "
+            "quantized artifacts (~1.94 GiB expert bank). Requires "
+            "--enable-mtp."
         ),
     )
     return parser
@@ -210,8 +246,150 @@ def validate_mtp_flags(parser: argparse.ArgumentParser, args: argparse.Namespace
             parser.error("--enable-mtp is packaged for --model-key hy3-q4 only")
         if args.mtp_artifacts is None:
             parser.error("--enable-mtp requires --mtp-artifacts")
+        if getattr(args, "concurrency", 1) > 1:
+            parser.error(
+                "--enable-mtp is single-stream; the batch runner is AR-only "
+                "and concurrent MTP requests would only queue"
+            )
+        if args.mtp_precision is None:
+            args.mtp_precision = "bf16"
     elif args.mtp_artifacts is not None:
         parser.error("--mtp-artifacts requires --enable-mtp")
+    elif args.mtp_precision is not None:
+        parser.error("--mtp-precision requires --enable-mtp")
+
+
+def build_concurrent_requests(
+    prompt_ids,
+    *,
+    concurrency: int,
+    max_tokens: int,
+    sampler,
+    seed: int,
+):
+    """Build the saturation lane's N identical prompts as batch requests.
+
+    Prompts are identical across streams; per-stream seeds are ``seed + i``
+    so sampled profiles produce distinct streams while the deterministic
+    profile stays seed-independent.
+    """
+
+    from mtplx.streamed_batch import StreamedBatchRequest
+
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+    return [
+        StreamedBatchRequest(
+            request_id=f"stream-{index:02d}",
+            prompt_ids=tuple(int(token) for token in prompt_ids),
+            max_tokens=max_tokens,
+            sampler=sampler,
+            seed=seed + index,
+        )
+        for index in range(concurrency)
+    ]
+
+
+def _run_concurrent_repeats(
+    args,
+    runtime,
+    *,
+    prompt_ids,
+    sampler,
+    max_tokens: int,
+    run_label: str,
+) -> list[dict]:
+    """Saturation lane: N identical prompts, aggregate and per-stream tok/s."""
+
+    from mtplx.streamed_batch import StreamedBatchRunner
+
+    rows: list[dict] = []
+    for repeat in range(args.repeats):
+        if args.reset_between and repeat:
+            runtime.expert_streaming.reset()
+        requests = build_concurrent_requests(
+            prompt_ids,
+            concurrency=args.concurrency,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            seed=args.seed,
+        )
+        before = runtime.expert_streaming_snapshot()
+        runner = StreamedBatchRunner(
+            runtime,
+            max_concurrency=args.concurrency,
+            max_prefills_per_step=args.max_prefills_per_step,
+        )
+        for request in requests:
+            runner.submit(request)
+        started = time.perf_counter()
+        results = runner.run()
+        finished = time.perf_counter()
+        elapsed = finished - started
+        after = runtime.expert_streaming_snapshot()
+        streams = []
+        for result in results:
+            completion_tokens = len(result.tokens)
+            stream_elapsed = result.last_token_s - result.admitted_s
+            decode_elapsed = result.last_token_s - result.first_token_s
+            response_path = None
+            if args.output_dir is not None:
+                output_dir = args.output_dir.expanduser().resolve()
+                output_dir.mkdir(parents=True, exist_ok=True)
+                response_path = output_dir / (
+                    f"{args.model_key}-{run_label}-repeat-{repeat}"
+                    f"-{result.request_id}.md"
+                )
+                response_path.write_text(result.text + "\n", encoding="utf-8")
+            streams.append(
+                {
+                    "request_id": result.request_id,
+                    "seed": args.seed + len(streams),
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "completion_tokens_per_second": (
+                        completion_tokens / stream_elapsed
+                        if stream_elapsed > 0.0
+                        else 0.0
+                    ),
+                    "decode_tokens_per_second": (
+                        (completion_tokens - 1) / decode_elapsed
+                        if completion_tokens > 1 and decode_elapsed > 0.0
+                        else 0.0
+                    ),
+                    "finish_reason": result.finish_reason,
+                    "admitted_step": result.admitted_step,
+                    "finished_step": result.finished_step,
+                    "decode_steps": result.decode_steps,
+                    "prefill_seconds": result.prefill_seconds,
+                    "token_times_s": [
+                        token_time - started for token_time in result.token_times_s
+                    ],
+                    "token_ids": list(result.tokens),
+                    "text": result.text,
+                    "response_path": (
+                        str(response_path) if response_path is not None else None
+                    ),
+                }
+            )
+        aggregate_tokens = sum(stream["completion_tokens"] for stream in streams)
+        rows.append(
+            {
+                "repeat": repeat,
+                "elapsed_seconds": elapsed,
+                "prompt_tokens": len(prompt_ids),
+                "concurrency": args.concurrency,
+                "aggregate_completion_tokens": aggregate_tokens,
+                "aggregate_completion_tokens_per_second": (
+                    aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
+                ),
+                "scheduler": runner.stats(),
+                "streams": streams,
+                "streaming_before": before,
+                "streaming_after": after,
+            }
+        )
+    return rows
 
 
 def main() -> int:
@@ -325,6 +503,7 @@ def main() -> int:
             if args.mtp_artifacts is not None
             else None
         ),
+        mtp_precision=(args.mtp_precision or "bf16"),
     )
     rows = []
     try:
@@ -375,7 +554,19 @@ def main() -> int:
             top_p=top_p,
             top_k=top_k,
         )
-        for repeat in range(args.repeats):
+        if args.concurrency > 1:
+            rows.extend(
+                _run_concurrent_repeats(
+                    args,
+                    runtime,
+                    prompt_ids=prompt_ids,
+                    sampler=sampler,
+                    max_tokens=max_tokens,
+                    run_label=run_label,
+                )
+            )
+        # The single-stream reference lane runs only at concurrency 1.
+        for repeat in range(args.repeats if args.concurrency == 1 else 0):
             if args.reset_between and repeat:
                 runtime.expert_streaming.reset()
             before = runtime.expert_streaming_snapshot()
@@ -505,9 +696,12 @@ def main() -> int:
                 if args.mtp_artifacts is not None
                 else None
             ),
+            "precision": args.mtp_precision,
         },
         "generation_profile": args.generation_profile,
         "run_label": run_label,
+        "concurrency": args.concurrency,
+        "max_prefills_per_step": args.max_prefills_per_step,
         "generation": {
             "max_tokens": max_tokens,
             "documented_max_output_tokens": model_defaults["max_output_tokens"],
