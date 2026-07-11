@@ -3,7 +3,7 @@
 - Date: 2026-07-11
 - Research branch: `codex/hy3-q4-native-serialized`
 - Implementation commit: `4bcb382`
-- Performance claim: none
+- Performance gates: completed; see `hy3-q4-native-benchmark-matrix.md`
 
 ## Delivered artifact
 
@@ -107,15 +107,35 @@ tests before the real build; the post-build validator suite passed 12 tests.
 Ruff passed on every changed Python file. A repo-wide Ruff invocation still
 reports five unrelated pre-existing findings outside this branch's diff.
 
+## Generation gate summary
+
+The main-session generation gates are complete. The full comparison is in
+`benchmarks/results/hy3-q4-native-benchmark-matrix.md`, with raw provenance in
+the three `hy3-q4-native-gate-*.json` files.
+
+- Native AR: 1,905 tokens, 5.922 tok/s, 83.02 GiB peak.
+- Native Q4 trunk plus BF16 MTP head: 316/1,404 accepted (22.51%),
+  3.832 tok/s, 96.00 GiB peak.
+- Fully quantized native Q4 trunk plus Q4 MTP head: 296/1,424 accepted
+  (20.79%), 3.769 tok/s, 86.17 GiB peak.
+
+Native AR token IDs exactly match the community AR gate. Native BF16-MTP token
+IDs, accepted/drafted counts, acceptance, and peak memory exactly match the
+community BF16-MTP gate. The new trunk therefore does not improve the MTP
+acceptance stall in this gate, strongly refuting community trunk hiddens as
+the dominant cause for this prompt and runtime. These are single-run
+measurements and should not be read as throughput confidence intervals.
+
 ## Operational handoff and deviations
 
-- Qwen was stopped only for quantization and GPU validation, then restored.
+- Qwen was stopped only for quantization, GPU validation, and the serialized
+  generation-gate window, then restored.
   Its `/v1/models` endpoint again serves
   `mtplx-qwen36-27b-optimized-speed`.
 - The benchmark/probe run-lock was clear before compute and was checked during
   every quantization unit.
-- No full generation, acceptance, throughput, thermal, or long-context
-  benchmark was run. Those gates remain for the main benchmark session.
+- The fixed realistic-prompt AR, BF16-MTP, and Q4-MTP generation gates were
+  run in the main session. Thermal and long-context gates were not run.
 - The official BF16 source directory remains intact at
   `/Users/davidtai/.cache/huggingface/hy3-mtp-layer80`.
 - The duplicated community artifact remains intact. The branch includes a
@@ -124,7 +144,7 @@ reports five unrelated pre-existing findings outside this branch's diff.
 - No source shard, cache entry, or old artifact was deleted automatically.
 - The native artifact is local and was not uploaded to Hugging Face.
 
-The main session can now run its normal AR/MTP release gates using
-`hy3-q4-native`, the artifact root above, and the artifact's authoritative
-manifest. For the Q4 MTP A/B path, point `mtp_artifacts` at the same artifact
-root; the default BF16 MTP path uses the manifest-bound BF16 auxiliary file.
+The artifact remains available under `hy3-q4-native`, using the artifact root
+above and its authoritative manifest. For the Q4 MTP path, point
+`mtp_artifacts` at the same artifact root; the BF16 MTP path uses the
+manifest-bound BF16 auxiliary file.
