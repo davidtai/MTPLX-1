@@ -734,7 +734,11 @@ class HotExpertSwitchGLU(nn.Module):
                     mx.eval(result)
                 finally:
                     ready.release(synchronize=False)
-                return result.reshape((*indices.shape, hidden_size))
+                output = result.reshape((*indices.shape, hidden_size))
+                # An all-hit route has no miss I/O to hide, so preserve the
+                # original routed-then-shared ordering and keep the shared
+                # branch lazy.
+                return output, (shared_work() if shared_work is not None else None)
 
         outputs: list[mx.array] = []
         output_positions: list[int] = []
