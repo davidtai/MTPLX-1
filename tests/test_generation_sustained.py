@@ -249,6 +249,40 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
     assert os.environ["MTPLX_BLOCK_OWNED_ATTN_KV"] == "1"
 
 
+def test_direct_paged_prefill_keeps_q8_physical_and_skips_bf16_repage(monkeypatch):
+    cache: list[object] = []
+    events: list[tuple[str, str | None, str | None]] = []
+
+    class Runtime:
+        def make_cache(self):
+            events.append(
+                (
+                    "make_cache",
+                    os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN"),
+                    os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT"),
+                )
+            )
+            return cache
+
+    def configure(_received_cache):
+        raise AssertionError("direct paged Q8 prefill must not perform a BF16 repage")
+
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", "q8")
+    monkeypatch.setattr(
+        "mtplx.cache_state.configure_tail_owned_attention_kv_cache",
+        configure,
+    )
+
+    made_cache = _make_target_prefill_cache(Runtime())
+    elapsed = _maybe_repage_target_prefill_cache(made_cache)
+
+    assert made_cache is cache
+    assert elapsed == 0.0
+    assert events == [("make_cache", "1", "q8")]
+
+
 def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")

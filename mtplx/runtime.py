@@ -405,7 +405,11 @@ def load(
     expert_runtime = None
     resident_load_report = None
     if streaming_requested:
-        from .expert_runtime import ExpertStreamingConfig, ExpertStreamingRuntime
+        from .expert_runtime import (
+            ExpertStreamingConfig,
+            ExpertStreamingRuntime,
+            apply_expert_streaming_kv_env,
+        )
         from .expert_streaming_models import get_model_spec
         from .models.expert_mlx import (
             make_mlx_component_bank_allocator,
@@ -415,6 +419,14 @@ def load(
 
         import mlx.core as mx
 
+        if not isinstance(expert_streaming_config, ExpertStreamingConfig):
+            raise TypeError(
+                "expert_streaming_config must be an ExpertStreamingConfig"
+            )
+        # Q8 planning is valid only when every target cache is actually the
+        # paged Q8 layout. Apply the same contract for direct runtime.load
+        # callers as profile-driven server startup.
+        apply_expert_streaming_kv_env(expert_streaming_config)
         streaming_spec = get_model_spec(expert_streaming_config.model_key)
         streaming_plan = expert_streaming_config.memory_plan(streaming_spec)
         if expert_streaming_config.slot_layout == "component-banks":
@@ -431,10 +443,6 @@ def load(
                 streaming_plan, streaming_spec
             )
 
-        if not isinstance(expert_streaming_config, ExpertStreamingConfig):
-            raise TypeError(
-                "expert_streaming_config must be an ExpertStreamingConfig"
-            )
         if mtp and mtp_artifacts is None:
             raise RuntimeError(
                 "the pinned Hy3-4bit and GLM-5.2-4bit artifacts omit MTP weights; "

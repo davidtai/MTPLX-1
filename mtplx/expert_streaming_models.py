@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from operator import index
 
+from .runtime_options import normalize_paged_kv_quantization
+
 
 def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
     """Normalize an integer-like value without accepting lossy coercions."""
@@ -59,6 +61,7 @@ class ExpertStreamingModelSpec:
     kv_bytes_per_token: int
     mtp_layer_index: int | None
     mtp_included: bool
+    paged_kv_q8_bytes_per_token: int | None = None
     full_indexer_layers: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -82,6 +85,17 @@ class ExpertStreamingModelSpec:
             object.__setattr__(self, name, normalized)
         if not isinstance(self.mtp_included, bool):
             raise TypeError("mtp_included must be bool")
+        if self.paged_kv_q8_bytes_per_token is not None:
+            q8_bytes = _integer(
+                "paged_kv_q8_bytes_per_token",
+                self.paged_kv_q8_bytes_per_token,
+                minimum=1,
+            )
+            if q8_bytes > self.kv_bytes_per_token:
+                raise ValueError(
+                    "paged Q8 KV bytes per token cannot exceed unquantized KV bytes"
+                )
+            object.__setattr__(self, "paged_kv_q8_bytes_per_token", q8_bytes)
         if self.mtp_layer_index is not None:
             object.__setattr__(
                 self,
@@ -183,6 +197,29 @@ class ExpertStreamingModelSpec:
             raise ValueError(f"slots_per_layer must be inside [0, {self.expert_count}]")
         return self.routed_layer_count * slots_per_layer * self.expert_record_bytes
 
+    def physical_kv_bytes_per_token(self, paged_kv_quantization: object = "off") -> int:
+        """Return the pinned physical KV allocation for one admitted token.
+
+        Q8 is credited only for model/cache layouts whose packed values and
+        scale rows have been measured explicitly. Falling back to a nominal
+        50% estimate here could over-allocate expert slots and violate the
+        process memory ceiling.
+        """
+
+        mode = normalize_paged_kv_quantization(paged_kv_quantization)
+        if mode == "off":
+            return self.kv_bytes_per_token
+        if mode == "q8" and self.paged_kv_q8_bytes_per_token is not None:
+            return self.paged_kv_q8_bytes_per_token
+        if mode == "q8":
+            raise ValueError(
+                f"{self.key} has no verified paged Q8 KV physical layout"
+            )
+        raise ValueError(
+            f"{self.key} expert memory planning supports paged KV modes off and q8; "
+            f"got {mode!r}"
+        )
+
 
 @dataclass(frozen=True)
 class ExpertMemoryPlan:
@@ -195,6 +232,8 @@ class ExpertMemoryPlan:
     execution_workspace_bytes: int
     context_tokens: int
     resident_bytes: int
+    paged_kv_quantization: str
+    kv_bytes_per_token: int
     kv_bytes: int
     transient_slots: int
     transient_bytes: int
@@ -247,6 +286,9 @@ HY3_Q4 = ExpertStreamingModelSpec(
     kv_bytes_per_token=327_680,
     mtp_layer_index=80,
     mtp_included=False,
+    # 80 layers * 8 KV heads * (128 int8 K + 128 int8 V + two FP16
+    # per-head scale rows) = 166400 physical bytes per admitted token.
+    paged_kv_q8_bytes_per_token=166_400,
 )
 
 
@@ -304,6 +346,7 @@ def plan_expert_memory(
     io_staging_bytes: int = 0,
     execution_workspace_bytes: int = 0,
     cache_scope: str = "layer",
+    paged_kv_quantization: object = "off",
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -341,7 +384,9 @@ def plan_expert_memory(
     if service_slots < spec.top_k:
         raise ValueError(f"transient_slots must be at least top_k ({spec.top_k})")
 
-    kv_bytes = context_tokens * spec.kv_bytes_per_token
+    kv_mode = normalize_paged_kv_quantization(paged_kv_quantization)
+    kv_bytes_per_token = spec.physical_kv_bytes_per_token(kv_mode)
+    kv_bytes = context_tokens * kv_bytes_per_token
     transient_bytes = service_slots * spec.expert_record_bytes
     fixed_bytes = (
         spec.resident_bytes
@@ -384,6 +429,8 @@ def plan_expert_memory(
         execution_workspace_bytes=execution_workspace_bytes,
         context_tokens=context_tokens,
         resident_bytes=spec.resident_bytes,
+        paged_kv_quantization=kv_mode,
+        kv_bytes_per_token=kv_bytes_per_token,
         kv_bytes=kv_bytes,
         transient_slots=service_slots,
         transient_bytes=transient_bytes,

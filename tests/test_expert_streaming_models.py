@@ -49,6 +49,9 @@ def test_hy3_q4_exact_expert_layout() -> None:
     assert spec.source_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
     assert spec.quant_revision == "160619d3f96c8470350b6dac0ef033a8381551e3"
     assert spec.kv_bytes_per_token == 327_680
+    assert spec.paged_kv_q8_bytes_per_token == 166_400
+    assert spec.physical_kv_bytes_per_token("off") == 327_680
+    assert spec.physical_kv_bytes_per_token("q8") == 166_400
     assert spec.mtp_layer_index == 80
     assert spec.mtp_included is False
     assert spec.full_indexer_layers == ()
@@ -84,6 +87,7 @@ def test_glm52_q4_exact_expert_and_indexshare_layout() -> None:
     assert spec.source_revision == "b4734de4facf877f85769a911abafc5283eab3d9"
     assert spec.quant_revision == "6b347a6472d46bf55de65ee34032136a3929d778"
     assert spec.kv_bytes_per_token == 95_232
+    assert spec.paged_kv_q8_bytes_per_token is None
     assert spec.mtp_layer_index == 78
     assert spec.mtp_included is False
     assert spec.full_indexer_layers == (0, 1, 2, *range(6, 75, 4))
@@ -123,6 +127,8 @@ def test_memory_plan_turns_a_total_limit_into_whole_per_layer_slots(
     assert plan.context_tokens == context_tokens
     assert plan.runtime_reserve_bytes == runtime_reserve
     assert plan.resident_bytes == spec.resident_bytes
+    assert plan.paged_kv_quantization == "off"
+    assert plan.kv_bytes_per_token == spec.kv_bytes_per_token
     assert plan.kv_bytes == context_tokens * spec.kv_bytes_per_token
     assert plan.transient_bytes == spec.transient_scratch_bytes
     assert plan.persistent_budget_bytes == spec.persistent_cache_bytes(20) + 12_345
@@ -130,6 +136,40 @@ def test_memory_plan_turns_a_total_limit_into_whole_per_layer_slots(
     assert plan.persistent_cache_bytes == spec.persistent_cache_bytes(20)
     assert plan.unallocated_bytes == 12_345
     assert plan.allocated_bytes <= plan.total_limit_bytes
+
+
+def test_hy3_q8_128k_plan_uses_physical_scale_aware_bytes_and_adds_slots() -> None:
+    spec = get_model_spec("hy3-q4")
+    common = {
+        "total_limit_bytes": 112 * GIB,
+        "context_tokens": 131_072,
+        "runtime_reserve_bytes": 8 * GIB,
+        "transient_slots": 32,
+    }
+
+    bf16 = plan_expert_memory(spec, **common)
+    q8 = plan_expert_memory(spec, **common, paged_kv_quantization="q8")
+
+    assert bf16.kv_bytes_per_token == 327_680
+    assert bf16.kv_bytes == 40 * GIB
+    assert bf16.slots_per_layer == 75
+    assert q8.paged_kv_quantization == "q8"
+    assert q8.kv_bytes_per_token == 166_400
+    assert q8.kv_bytes == 166_400 * 131_072
+    assert q8.slots_per_layer == 100
+    assert q8.allocated_bytes <= q8.total_limit_bytes
+
+
+def test_q8_planning_fails_closed_without_a_verified_physical_layout() -> None:
+    spec = get_model_spec("glm52-q4")
+
+    with pytest.raises(ValueError, match="no verified paged Q8 KV physical layout"):
+        plan_expert_memory(
+            spec,
+            total_limit_bytes=128 * GIB,
+            context_tokens=131_072,
+            paged_kv_quantization="q8",
+        )
 
 
 def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None:
@@ -380,6 +420,40 @@ def test_memory_planner_cli_runs_from_a_clean_checkout_environment() -> None:
     assert payload["plan"]["expert_cache_limit_bytes"] is None
     assert payload["plan"]["fixed_bytes"] < payload["plan"]["accounted_bytes"]
     assert payload["plan"]["accounted_bytes"] <= payload["plan"]["memory_limit_bytes"]
+
+
+def test_memory_planner_cli_reports_hy3_q8_physical_bytes_and_slots() -> None:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "plan_expert_memory.py"),
+            "--model",
+            "hy3-q4",
+            "--memory-limit-gib",
+            "112",
+            "--context-tokens",
+            "131072",
+            "--runtime-reserve-gib",
+            "8",
+            "--transient-slots",
+            "32",
+            "--paged-kv-quantization",
+            "q8",
+        ],
+        cwd=ROOT,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["plan"]["paged_kv_quantization"] == "q8"
+    assert payload["plan"]["kv_bytes_per_token"] == 166_400
+    assert payload["plan"]["kv_gib"] == pytest.approx(20.3125)
+    assert payload["plan"]["persistent_slots_per_layer"] == 100
 
 
 def test_memory_planner_cli_returns_json_and_exit_two_for_fixed_deficit() -> None:

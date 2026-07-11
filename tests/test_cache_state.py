@@ -30,6 +30,7 @@ from mtplx.cache_state import (
     tail_owned_attention_kv_stats,
     trim_verified_window_to_prefix,
 )
+from mtplx.expert_streaming_models import get_model_spec
 from mtplx.kv_quant import PagedKVQuantConfig
 
 
@@ -906,6 +907,28 @@ def test_vllm_metal_paged_q8_kv_quant_roundtrips_active_state():
     assert stats["mode"] == "vllm_metal_paged_kv_q8"
     assert stats["kv_quant"] == 1
     assert stats["kv_quant_mode"] == "q8"
+
+
+def test_hy3_planner_q8_bytes_match_the_physical_paged_cache_layout():
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+
+    block_size = 16
+    cache = VllmMetalPagedKVCache(
+        block_size=block_size,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    keys = mx.zeros((1, 8, 1, 128), dtype=mx.bfloat16)
+    values = mx.zeros((1, 8, 1, 128), dtype=mx.bfloat16)
+
+    cache.update_without_fetch(keys, values)
+
+    physical_bytes_per_layer_token = cache.nbytes // block_size
+    assert physical_bytes_per_layer_token == 2_080
+    assert 80 * physical_bytes_per_layer_token == get_model_spec(
+        "hy3-q4"
+    ).physical_kv_bytes_per_token("q8")
 
 
 def test_vllm_metal_paged_q4_kv_quant_roundtrips_active_state():

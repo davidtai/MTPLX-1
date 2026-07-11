@@ -91,6 +91,7 @@ class ExpertStreamingConfig:
     model_key: str
     memory_limit_bytes: int
     max_live_kv_tokens: int
+    paged_kv_quantization: str = "off"
     runtime_reserve_bytes: int = 16 * 1024**3
     expert_cache_limit_bytes: int | None = None
     transient_slots: int | None = None
@@ -114,6 +115,13 @@ class ExpertStreamingConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
             raise TypeError("model_key must be a non-empty string")
+        from .runtime_options import normalize_paged_kv_quantization
+
+        object.__setattr__(
+            self,
+            "paged_kv_quantization",
+            normalize_paged_kv_quantization(self.paged_kv_quantization),
+        )
         for name, minimum in (
             ("memory_limit_bytes", 1),
             ("max_live_kv_tokens", 0),
@@ -205,10 +213,38 @@ class ExpertStreamingConfig:
             io_staging_bytes=self.io_staging_bytes,
             execution_workspace_bytes=self.execution_workspace_bytes,
             cache_scope=self.cache_scope,
+            paged_kv_quantization=self.paged_kv_quantization,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+def apply_expert_streaming_kv_env(
+    config: ExpertStreamingConfig,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Make the physical paged-KV layout match the expert memory plan."""
+
+    if not isinstance(config, ExpertStreamingConfig):
+        raise TypeError("config must be an ExpertStreamingConfig")
+    from .runtime_options import apply_paged_kv_quantization_env
+
+    target = os.environ if env is None else env
+    mode = apply_paged_kv_quantization_env(
+        config.paged_kv_quantization,
+        target,
+    )
+    if mode == "q8":
+        target["MTPLX_VLLM_METAL_PAGED_ATTN"] = "1"
+        target["MTPLX_DYNAMIC_PAGED_KV"] = "1"
+        target.setdefault("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+        # The generic Q8 auto policy prefills a full BF16 cache and repages it.
+        # That transient is incompatible with reinvesting the Q8 savings in
+        # expert slots at 128K, so streamed Q8 must be physical from token one.
+        target["MTPLX_SUSTAINED_PREFILL_LAYOUT"] = "paged"
+    return mode
 
 
 @dataclass(frozen=True)
@@ -869,6 +905,10 @@ class ExpertStreamingRuntime:
             "memory_plan": {
                 "total_limit_bytes": self.plan.total_limit_bytes,
                 "fixed_bytes": self.plan.fixed_bytes,
+                "context_tokens": self.plan.context_tokens,
+                "paged_kv_quantization": self.plan.paged_kv_quantization,
+                "kv_bytes_per_token": self.plan.kv_bytes_per_token,
+                "kv_bytes": self.plan.kv_bytes,
                 "persistent_cache_bytes": self.plan.persistent_cache_bytes,
                 "slots_per_layer": self.plan.slots_per_layer,
                 "cache_scope": self.config.cache_scope,

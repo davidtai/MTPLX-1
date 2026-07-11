@@ -12,6 +12,8 @@ from mtplx.expert_cli import (
     append_expert_streaming_child_args,
     expert_streaming_load_kwargs,
 )
+from mtplx.expert_runtime import apply_expert_streaming_kv_env
+from mtplx.expert_streaming_models import get_model_spec
 from mtplx.attention_context import attention_phase
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.models.expert_mlx import current_expert_routing_phase
@@ -98,6 +100,39 @@ def test_expert_cli_json_and_flags_are_strict_and_forwarded(tmp_path: Path) -> N
     assert "--expert-streaming" in command
     assert command[command.index("--expert-memory-limit") + 1] == "320GiB"
     assert "--no-expert-verify-record-hashes" in command
+
+
+def test_top_level_q8_selection_reaches_expert_plan_and_runtime_env(tmp_path: Path) -> None:
+    root = _model_root(tmp_path)
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "112GiB",
+            "--expert-max-live-kv-tokens",
+            "131072",
+            "--expert-runtime-reserve",
+            "8GiB",
+            "--expert-transient-slots",
+            "32",
+        ]
+    )
+    args.paged_kv_quantization = "q8"
+
+    config = expert_streaming_load_kwargs(args, root)["expert_streaming_config"]
+    plan = config.memory_plan(get_model_spec("hy3-q4"))
+    env: dict[str, str] = {}
+
+    assert config.paged_kv_quantization == "q8"
+    assert plan.kv_bytes_per_token == 166_400
+    assert plan.slots_per_layer == 100
+    assert apply_expert_streaming_kv_env(config, env=env) == "q8"
+    assert env["MTPLX_VLLM_METAL_PAGED_KV_QUANT"] == "q8"
+    assert env["MTPLX_PAGED_KV_QUANT"] == "q8"
+    assert env["MTPLX_VLLM_METAL_PAGED_ATTN"] == "1"
+    assert env["MTPLX_DYNAMIC_PAGED_KV"] == "1"
+    assert env["MTPLX_VLLM_METAL_PAGED_ATTN_IMPL"] == "mlx_vector_paged"
+    assert env["MTPLX_SUSTAINED_PREFILL_LAYOUT"] == "paged"
 
 
 def test_expert_cli_requires_memory_and_kv_limits(tmp_path: Path) -> None:

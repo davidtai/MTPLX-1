@@ -164,6 +164,7 @@ def expert_streaming_load_kwargs(
         "model_key": getattr(args, "expert_model_key", None),
         "memory_limit_bytes": getattr(args, "expert_memory_limit", None),
         "max_live_kv_tokens": getattr(args, "expert_max_live_kv_tokens", None),
+        "paged_kv_quantization": getattr(args, "paged_kv_quantization", None),
         "runtime_reserve_bytes": getattr(args, "expert_runtime_reserve", None),
         "expert_cache_limit_bytes": getattr(args, "expert_cache_limit", None),
         "cache_policy": getattr(args, "expert_cache_policy", None),

@@ -82,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required maximum live KV tokens across admitted sequences; use 0 only for load-only planning.",
     )
     parser.add_argument(
+        "--paged-kv-quantization",
+        choices=("off", "q8"),
+        default="off",
+        help="Physical paged KV layout to reserve (default: off/BF16).",
+    )
+    parser.add_argument(
         "--runtime-reserve-gib",
         type=_nonnegative_decimal,
         default=Decimal("16"),
@@ -130,6 +136,7 @@ def main() -> int:
             transient_slots=args.transient_slots,
             io_staging_bytes=_gib_to_bytes(args.io_staging_gib),
             execution_workspace_bytes=_gib_to_bytes(args.execution_workspace_gib),
+            paged_kv_quantization=args.paged_kv_quantization,
         )
     except (TypeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -158,7 +165,8 @@ def main() -> int:
             "memory_limit_bytes": plan.total_limit_bytes,
             "memory_limit_gib": _as_gib(plan.total_limit_bytes),
             "context_tokens": plan.context_tokens,
-            "kv_bytes_per_token": spec.kv_bytes_per_token,
+            "paged_kv_quantization": plan.paged_kv_quantization,
+            "kv_bytes_per_token": plan.kv_bytes_per_token,
             "resident_bytes": plan.resident_bytes,
             "resident_gib": _as_gib(plan.resident_bytes),
             "kv_bytes": plan.kv_bytes,

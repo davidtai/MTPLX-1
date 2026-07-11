@@ -346,6 +346,10 @@ def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> 
         assert waves[1].positions == (1, 3)
         snapshot = runtime.snapshot(mx_module=object())
         assert snapshot["cache"]["expert_requests"] == 1
+        assert snapshot["memory_plan"]["context_tokens"] == 4
+        assert snapshot["memory_plan"]["paged_kv_quantization"] == "off"
+        assert snapshot["memory_plan"]["kv_bytes_per_token"] == 16
+        assert snapshot["memory_plan"]["kv_bytes"] == 64
         assert snapshot["slots"]["pins"] == 0
         runtime.reset()
         assert runtime.snapshot(mx_module=object())["slots"]["states"]["empty"] == 2
