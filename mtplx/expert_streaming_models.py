@@ -59,6 +59,11 @@ class ExpertStreamingModelSpec:
     kv_bytes_per_token: int
     mtp_layer_index: int | None
     mtp_included: bool
+    manifest_source_model: str | None = None
+    manifest_source_revision: str | None = None
+    mtp_q4_resident_bytes: int = 0
+    mtp_q4_expert_bytes: int = 0
+    mtp_bf16_tensor_bytes: int = 0
     full_indexer_layers: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -76,6 +81,9 @@ class ExpertStreamingModelSpec:
             "quant_parameter_bytes": 1,
             "router_bytes": 0,
             "kv_bytes_per_token": 0,
+            "mtp_q4_resident_bytes": 0,
+            "mtp_q4_expert_bytes": 0,
+            "mtp_bf16_tensor_bytes": 0,
         }
         for name, minimum in integer_fields.items():
             normalized = _integer(name, getattr(self, name), minimum=minimum)
@@ -88,6 +96,18 @@ class ExpertStreamingModelSpec:
                 "mtp_layer_index",
                 _integer("mtp_layer_index", self.mtp_layer_index, minimum=0),
             )
+        if self.mtp_included and self.mtp_layer_index is None:
+            raise ValueError("mtp_layer_index is required when MTP is included")
+        if (self.manifest_source_model is None) != (
+            self.manifest_source_revision is None
+        ):
+            raise ValueError(
+                "manifest source model and revision must be supplied together"
+            )
+        for name in ("manifest_source_model", "manifest_source_revision"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise TypeError(f"{name} must be a non-empty string when supplied")
         if not isinstance(self.full_indexer_layers, tuple):
             raise TypeError("full_indexer_layers must be a tuple")
         object.__setattr__(
@@ -127,10 +147,43 @@ class ExpertStreamingModelSpec:
 
     @property
     def routed_layer_indices(self) -> tuple[int, ...]:
-        """Target layer indices whose routed experts are streamed."""
+        """Runtime transformer-layer indices whose routed experts are streamed."""
 
         stop = self.routed_layer_start + self.routed_layer_count
         return tuple(range(self.routed_layer_start, stop))
+
+    @property
+    def expert_record_layer_indices(self) -> tuple[int, ...]:
+        """Layer indices stored as expert records in the artifact.
+
+        An included MTP layer is packaged in the expert sidecar for provenance
+        and A/B loading, but it is not part of the trunk runtime slot plan.
+        """
+
+        layers = self.routed_layer_indices
+        if not self.mtp_included:
+            return layers
+        if self.mtp_layer_index is None:  # Guarded by ``__post_init__``.
+            raise RuntimeError("included MTP layer has no layer index")
+        return (*layers, self.mtp_layer_index)
+
+    @property
+    def expert_record_layer_count(self) -> int:
+        """Number of routed-expert layers serialized in the artifact."""
+
+        return len(self.expert_record_layer_indices)
+
+    @property
+    def manifest_repo(self) -> str:
+        """Repository identity required in the expert manifest."""
+
+        return self.manifest_source_model or self.quant_model
+
+    @property
+    def manifest_revision(self) -> str:
+        """Immutable revision identity required in the expert manifest."""
+
+        return self.manifest_source_revision or self.quant_revision
 
     @property
     def expert_source_parameters(self) -> int:
@@ -156,14 +209,49 @@ class ExpertStreamingModelSpec:
         return self.packed_weight_bytes + self.scale_bias_bytes
 
     @property
-    def routed_expert_bytes(self) -> int:
+    def streamed_expert_bytes(self) -> int:
+        """Routed-expert bytes addressable by the trunk runtime cache."""
+
         return self.routed_layer_count * self.expert_count * self.expert_record_bytes
 
     @property
+    def routed_expert_bytes(self) -> int:
+        """All routed-expert bytes serialized in the artifact, including MTP."""
+
+        return (
+            self.expert_record_layer_count
+            * self.expert_count
+            * self.expert_record_bytes
+        )
+
+    @property
     def resident_bytes(self) -> int:
-        """All target tensors except routed experts, before runtime/KV reserve."""
+        """Artifact tensors outside expert records, before runtime/KV reserve."""
 
         return self.total_tensor_bytes - self.routed_expert_bytes
+
+    @property
+    def runtime_trunk_resident_bytes(self) -> int:
+        """Resident bytes loaded by the trunk before an optional MTP head."""
+
+        mtp_residents = self.mtp_q4_resident_bytes if self.mtp_included else 0
+        result = self.resident_bytes - mtp_residents
+        if result <= 0:
+            raise ValueError("runtime trunk resident footprint must be positive")
+        return result
+
+    def mtp_runtime_bytes(self, precision: str) -> int:
+        """Additional resident bytes loaded for one packaged MTP precision."""
+
+        if precision == "bf16":
+            result = self.mtp_bf16_tensor_bytes
+        elif precision == "q4":
+            result = self.mtp_q4_resident_bytes + self.mtp_q4_expert_bytes
+        else:
+            raise ValueError(f"unsupported MTP precision {precision!r}")
+        if result <= 0:
+            raise ValueError(f"{self.key} has no {precision} MTP artifact budget")
+        return result
 
     @property
     def cold_expert_bytes_per_token(self) -> int:
@@ -247,6 +335,41 @@ HY3_Q4 = ExpertStreamingModelSpec(
     kv_bytes_per_token=327_680,
     mtp_layer_index=80,
     mtp_included=False,
+    mtp_q4_resident_bytes=121_070_848,
+    mtp_q4_expert_bytes=2_038_431_744,
+    mtp_bf16_tensor_bytes=7_505_224_960,
+)
+
+
+HY3_Q4_NATIVE = ExpertStreamingModelSpec(
+    key="hy3-q4-native",
+    display_name="Tencent Hy3 native affine Q4",
+    source_model="tencent/Hy3",
+    source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    quant_model="local/hy3-q4-native",
+    quant_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    total_tensor_bytes=168_147_964_416,
+    total_layers=80,
+    routed_layer_start=1,
+    routed_layer_count=79,
+    expert_count=192,
+    top_k=8,
+    hidden_size=4096,
+    expert_hidden_size=1536,
+    quant_bits=4,
+    quant_group_size=64,
+    quant_parameter_bytes=2,
+    router_storage="affine-q8 with fp32 correction bias",
+    router_matmul_dtype="float32",
+    router_bytes=66_908_160,
+    kv_bytes_per_token=327_680,
+    mtp_layer_index=80,
+    mtp_included=True,
+    manifest_source_model="tencent/Hy3",
+    manifest_source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    mtp_q4_resident_bytes=121_070_848,
+    mtp_q4_expert_bytes=2_038_431_744,
+    mtp_bf16_tensor_bytes=7_505_224_960,
 )
 
 
@@ -279,7 +402,7 @@ GLM52_Q4 = ExpertStreamingModelSpec(
 
 
 MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
-    spec.key: spec for spec in (HY3_Q4, GLM52_Q4)
+    spec.key: spec for spec in (HY3_Q4, HY3_Q4_NATIVE, GLM52_Q4)
 }
 
 
@@ -303,6 +426,7 @@ def plan_expert_memory(
     transient_slots: int | None = None,
     io_staging_bytes: int = 0,
     execution_workspace_bytes: int = 0,
+    resident_overhead_bytes: int = 0,
     cache_scope: str = "layer",
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
@@ -329,6 +453,9 @@ def plan_expert_memory(
     execution_workspace_bytes = _integer(
         "execution_workspace_bytes", execution_workspace_bytes, minimum=0
     )
+    resident_overhead_bytes = _integer(
+        "resident_overhead_bytes", resident_overhead_bytes, minimum=0
+    )
     if expert_cache_limit_bytes is not None:
         expert_cache_limit_bytes = _integer(
             "expert_cache_limit_bytes", expert_cache_limit_bytes, minimum=0
@@ -344,7 +471,8 @@ def plan_expert_memory(
     kv_bytes = context_tokens * spec.kv_bytes_per_token
     transient_bytes = service_slots * spec.expert_record_bytes
     fixed_bytes = (
-        spec.resident_bytes
+        spec.runtime_trunk_resident_bytes
+        + resident_overhead_bytes
         + kv_bytes
         + runtime_reserve_bytes
         + transient_bytes
@@ -352,7 +480,7 @@ def plan_expert_memory(
         + execution_workspace_bytes
     )
     available_bytes = max(0, total_limit_bytes - fixed_bytes)
-    persistent_budget_bytes = min(available_bytes, spec.routed_expert_bytes)
+    persistent_budget_bytes = min(available_bytes, spec.streamed_expert_bytes)
     if expert_cache_limit_bytes is not None:
         persistent_budget_bytes = min(persistent_budget_bytes, expert_cache_limit_bytes)
 
@@ -383,7 +511,7 @@ def plan_expert_memory(
         io_staging_bytes=io_staging_bytes,
         execution_workspace_bytes=execution_workspace_bytes,
         context_tokens=context_tokens,
-        resident_bytes=spec.resident_bytes,
+        resident_bytes=spec.runtime_trunk_resident_bytes + resident_overhead_bytes,
         kv_bytes=kv_bytes,
         transient_slots=service_slots,
         transient_bytes=transient_bytes,

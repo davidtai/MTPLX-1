@@ -19,9 +19,11 @@ from mtplx.expert_manifest import (
 )
 from mtplx.expert_runtime import ExpertStreamingConfig, ExpertStreamingRuntime
 from mtplx.expert_slots import ExpertSlotBinding
-from mtplx.expert_streaming_models import ExpertStreamingModelSpec
+from mtplx.expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
 from mtplx.models.expert_mlx import (
     _run_q4_expert,
+    HotExpertSwitchGLU,
+    bind_streamed_switches,
     make_mlx_component_bank_allocator,
     make_mlx_slot_buffer_allocator,
 )
@@ -30,7 +32,7 @@ from mtplx.models.glm52_mlx import Model as GlmModel
 from mtplx.models.glm52_mlx import ModelArgs as GlmArgs
 from mtplx.models.hy3_mlx import Model as Hy3Model
 from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
-from mtplx.resident_loader import construct_resident_model
+from mtplx.resident_loader import construct_resident_model, runtime_resident_tensors
 
 
 def _hy3_args() -> Hy3Args:
@@ -90,6 +92,47 @@ def _glm_args(*, layers: int = 6, first_sparse: int = 1) -> GlmArgs:
         index_topk_pattern="FSFSFS" if layers == 6 else None,
         index_topk_freq=4,
         index_skip_topk_offset=3,
+    )
+
+
+def test_native_hy3_binding_stops_at_the_last_trunk_layer() -> None:
+    spec = get_model_spec("hy3-q4-native")
+    original_switches = [object() for _ in range(spec.total_layers)]
+    layers = [
+        SimpleNamespace(mlp=SimpleNamespace(switch_mlp=switch))
+        for switch in original_switches
+    ]
+    runtime = SimpleNamespace(
+        spec=spec,
+        config=SimpleNamespace(slot_layout="direct-slots"),
+    )
+
+    bound = bind_streamed_switches(
+        SimpleNamespace(model=SimpleNamespace(layers=layers)), runtime
+    )
+
+    assert bound == 79
+    assert layers[0].mlp.switch_mlp is original_switches[0]
+    assert all(
+        isinstance(layers[layer].mlp.switch_mlp, HotExpertSwitchGLU)
+        for layer in range(1, 80)
+    )
+
+
+def test_native_runtime_residents_exclude_the_packaged_mtp_layer() -> None:
+    spec = get_model_spec("hy3-q4-native")
+    trunk = SimpleNamespace(tensor="model.layers.79.input_layernorm.weight")
+    mtp = SimpleNamespace(tensor="model.layers.80.input_layernorm.weight")
+    global_weight = SimpleNamespace(tensor="model.embed_tokens.weight")
+    manifest = SimpleNamespace(resident_tensors=(global_weight, trunk, mtp))
+
+    selected = runtime_resident_tensors(manifest, spec)
+
+    assert selected == (global_weight, trunk)
+    assert runtime_resident_tensors(manifest, get_model_spec("hy3-q4")) == (
+        global_weight,
+        trunk,
+        mtp,
     )
 
 

@@ -6,7 +6,7 @@ import inspect as py_inspect
 import json
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -430,9 +430,34 @@ def load(
 
         import mlx.core as mx
 
+        if not isinstance(expert_streaming_config, ExpertStreamingConfig):
+            raise TypeError(
+                "expert_streaming_config must be an ExpertStreamingConfig"
+            )
         streaming_spec = get_model_spec(expert_streaming_config.model_key)
-        streaming_plan = expert_streaming_config.memory_plan(streaming_spec)
-        if expert_streaming_config.slot_layout == "component-banks":
+        if mtp and mtp_artifacts is None:
+            raise RuntimeError(
+                "streamed Hy3 MTP requires its packaged layer-80 head files; "
+                "pass mtp_artifacts=<artifact directory> or load with mtp=False"
+            )
+        if mtp and streaming_spec.source_model != "tencent/Hy3":
+            raise RuntimeError(
+                "streamed MTP artifacts are packaged for Hy3 only; "
+                f"got {expert_streaming_config.model_key!r}"
+            )
+        if mtp_adapter is not None or merge_mtp_adapter:
+            raise RuntimeError("MTP adapters are unavailable for streamed loading")
+        effective_streaming_config = expert_streaming_config
+        if mtp:
+            effective_streaming_config = replace(
+                expert_streaming_config,
+                resident_overhead_bytes=(
+                    expert_streaming_config.resident_overhead_bytes
+                    + streaming_spec.mtp_runtime_bytes(mtp_precision)
+                ),
+            )
+        streaming_plan = effective_streaming_config.memory_plan(streaming_spec)
+        if effective_streaming_config.slot_layout == "component-banks":
             from .expert_manifest import load_expert_manifest
 
             streaming_manifest = load_expert_manifest(expert_manifest)
@@ -446,27 +471,10 @@ def load(
                 streaming_plan, streaming_spec
             )
 
-        if not isinstance(expert_streaming_config, ExpertStreamingConfig):
-            raise TypeError(
-                "expert_streaming_config must be an ExpertStreamingConfig"
-            )
-        if mtp and mtp_artifacts is None:
-            raise RuntimeError(
-                "the pinned Hy3-4bit and GLM-5.2-4bit artifacts omit MTP weights; "
-                "pass mtp_artifacts=<layer-80 artifact directory> to enable "
-                "streamed Hy3 MTP or load with mtp=False"
-            )
-        if mtp and expert_streaming_config.model_key != "hy3-q4":
-            raise RuntimeError(
-                "streamed MTP artifacts are packaged for hy3-q4 only; "
-                f"got {expert_streaming_config.model_key!r}"
-            )
-        if mtp_adapter is not None or merge_mtp_adapter:
-            raise RuntimeError("MTP adapters are unavailable for streamed loading")
         expert_runtime = ExpertStreamingRuntime.open(
             path,
             expert_manifest,
-            expert_streaming_config,
+            effective_streaming_config,
             spec=streaming_spec,
             buffer_allocator=slot_allocator,
             device_synchronize=mx.synchronize,

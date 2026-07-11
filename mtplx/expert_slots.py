@@ -255,8 +255,11 @@ class ExpertSlotPool:
         )
         self._persistent: dict[tuple[int, int], _PhysicalSlot] = {}
         self._transient: tuple[_PhysicalSlot, ...]
+        runtime_layers = frozenset(spec.routed_layer_indices)
         self._record_map = {
-            (record.layer, record.expert): record for record in manifest.records
+            (record.layer, record.expert): record
+            for record in manifest.records
+            if record.layer in runtime_layers
         }
         self._ensure_locks = {
             layer: threading.Lock() for layer in spec.routed_layer_indices

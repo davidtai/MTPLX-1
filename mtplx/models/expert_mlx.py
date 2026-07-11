@@ -305,12 +305,18 @@ class MappedExpertStore:
         manifest: ExpertManifest,
         *,
         workers: int = 96,
+        layer_indices: tuple[int, ...] | None = None,
     ) -> None:
         if manifest.sidecar is None:
             raise ValueError("metal-mmap execution requires a sidecar manifest")
         self.root = Path(root).resolve()
         self.path = self.root / manifest.sidecar.file
-        self.records = tuple(manifest.records)
+        allowed_layers = None if layer_indices is None else frozenset(layer_indices)
+        self.records = tuple(
+            record
+            for record in manifest.records
+            if allowed_layers is None or record.layer in allowed_layers
+        )
         self.workers = max(1, min(int(workers), 256))
         self._mapped: dict[tuple[int, int], MappedExpertRecord] = {}
         self._lock = threading.Lock()
@@ -404,8 +410,10 @@ def make_mlx_component_bank_allocator(
     """
 
     record_by_layer: dict[int, ExpertRecord] = {}
+    runtime_layers = frozenset(spec.routed_layer_indices)
     for record in manifest.records:
-        record_by_layer.setdefault(record.layer, record)
+        if record.layer in runtime_layers:
+            record_by_layer.setdefault(record.layer, record)
     missing = set(spec.routed_layer_indices) - set(record_by_layer)
     if missing:
         raise ValueError(f"manifest has no exemplar records for layers {sorted(missing)}")
@@ -821,6 +829,7 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
             runtime.root,
             runtime.manifest,
             workers=workers,
+            layer_indices=runtime.spec.routed_layer_indices,
         )
         mapped_store.prepare()
         runtime._mapped_expert_store = mapped_store

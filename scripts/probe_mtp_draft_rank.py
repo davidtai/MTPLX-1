@@ -31,6 +31,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes  # noqa: E402
+from mtplx.expert_streaming_models import MODEL_SPECS, get_model_spec  # noqa: E402
 from mtplx.runtime import load  # noqa: E402
 
 HIDDEN_VARIANTS = ("post_norm", "pre_norm")
@@ -57,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_root", type=Path)
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--model-key", choices=["hy3-q4", "glm52-q4"], required=True)
+    parser.add_argument("--model-key", choices=sorted(MODEL_SPECS), required=True)
     parser.add_argument("--memory-limit", required=True)
     parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
     parser.add_argument("--runtime-reserve", default="16GiB")
@@ -166,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Required acknowledgment that the layer-80 NextN head will be "
-            "loaded (hy3-q4 only; requires --mtp-artifacts). The probe cannot "
+            "loaded (Hy3 only; requires --mtp-artifacts). The probe cannot "
             "run without it."
         ),
     )
@@ -207,8 +208,8 @@ def validate_probe_flags(
             "this probe measures the layer-80 NextN head; pass --enable-mtp "
             "with --mtp-artifacts"
         )
-    if args.model_key != "hy3-q4":
-        parser.error("--enable-mtp is packaged for --model-key hy3-q4 only")
+    if get_model_spec(args.model_key).source_model != "tencent/Hy3":
+        parser.error("--enable-mtp is packaged for Hy3 model keys only")
     if args.mtp_artifacts is None:
         parser.error("--enable-mtp requires --mtp-artifacts")
     if args.mtp_precision is None:

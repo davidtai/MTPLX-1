@@ -15,6 +15,7 @@ from .expert_manifest import (
     ExpertManifest,
     ExpertManifestError,
     load_expert_manifest,
+    validate_expert_manifest_spec,
     verify_expert_manifest,
 )
 from .expert_slots import ExpertSlotError, ExpertSlotPool, ReadyRoute
@@ -92,6 +93,7 @@ class ExpertStreamingConfig:
     memory_limit_bytes: int
     max_live_kv_tokens: int
     runtime_reserve_bytes: int = 16 * 1024**3
+    resident_overhead_bytes: int = 0
     expert_cache_limit_bytes: int | None = None
     transient_slots: int | None = None
     io_staging_bytes: int = 0
@@ -118,6 +120,7 @@ class ExpertStreamingConfig:
             ("memory_limit_bytes", 1),
             ("max_live_kv_tokens", 0),
             ("runtime_reserve_bytes", 0),
+            ("resident_overhead_bytes", 0),
             ("io_staging_bytes", 0),
             ("execution_workspace_bytes", 0),
             ("max_open_files", 1),
@@ -204,6 +207,7 @@ class ExpertStreamingConfig:
             transient_slots=transient_slots,
             io_staging_bytes=self.io_staging_bytes,
             execution_workspace_bytes=self.execution_workspace_bytes,
+            resident_overhead_bytes=self.resident_overhead_bytes,
             cache_scope=self.cache_scope,
         )
 
@@ -583,9 +587,9 @@ class ExpertStreamingRuntime:
         errors: list[str] = []
         if manifest.model_key != spec.key:
             errors.append("model key")
-        if manifest.source_repo != spec.quant_model:
+        if manifest.source_repo != spec.manifest_repo:
             errors.append("source repository")
-        if manifest.source_revision != spec.quant_revision:
+        if manifest.source_revision != spec.manifest_revision:
             errors.append("source revision")
         if manifest.quant_bits != spec.quant_bits:
             errors.append("quantization bits")
@@ -597,6 +601,12 @@ class ExpertStreamingRuntime:
             raise ExpertStreamingConfigurationError(
                 "manifest does not match pinned model descriptor: " + ", ".join(errors)
             )
+        try:
+            validate_expert_manifest_spec(manifest, spec)
+        except ExpertManifestError as exc:
+            raise ExpertStreamingConfigurationError(
+                f"manifest record layout does not match pinned model descriptor: {exc}"
+            ) from exc
 
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
         count = _integer("tokens", tokens, minimum=1)

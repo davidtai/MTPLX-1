@@ -66,6 +66,26 @@ def test_enable_mtp_parses_with_artifacts_for_hy3() -> None:
     assert str(args.mtp_artifacts) == "/artifacts"
 
 
+def test_native_hy3_model_key_is_available_to_benchmark_and_mtp() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "hy3-q4-native",
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+        ]
+    )
+
+    module.validate_mtp_flags(parser, args)
+
+    assert args.model_key == "hy3-q4-native"
+    assert args.mtp_precision == "bf16"
+
+
 def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
     import pytest
 
@@ -82,7 +102,7 @@ def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
                               "--enable-mtp", "--mtp-artifacts", "/artifacts"])
     with pytest.raises(SystemExit):
         module.validate_mtp_flags(parser, args)
-    assert "hy3-q4" in capsys.readouterr().err
+    assert "Hy3" in capsys.readouterr().err
 
     args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
                               "--mtp-artifacts", "/artifacts"])

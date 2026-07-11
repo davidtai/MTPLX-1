@@ -8,15 +8,23 @@ from pathlib import Path
 
 import pytest
 
+import mtplx.expert_manifest as expert_manifest_module
 from mtplx.expert_manifest import (
+    AuxiliaryFileInfo,
     ExpertManifest,
     ExpertManifestError,
+    ExpertRecord,
+    ResidentTensor,
+    ShardInfo,
     build_expert_manifest,
     build_expert_sidecar,
     load_expert_manifest,
+    make_sidecar_authoritative,
     read_expert_record,
     resolve_artifact_member,
     save_expert_manifest,
+    validate_expert_manifest_spec,
+    verify_auxiliary_file,
     verify_expert_manifest,
 )
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec
@@ -207,6 +215,65 @@ def test_manifest_roundtrip_digest_and_unknown_fields_fail_closed(
         ExpertManifest.from_dict(escaped, verify_digest=False)
 
 
+def test_manifest_spec_validation_rejects_same_byte_wrong_record_geometry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "model"
+    spec, _expected = _make_checkpoint(root)
+    manifest = build_expert_manifest(root, spec)
+    wrong = replace(
+        manifest,
+        records=(manifest.records[0], replace(manifest.records[1], layer=2)),
+        manifest_sha256=None,
+    ).with_digest()
+    wrong.validate_structure()
+
+    with pytest.raises(ExpertManifestError, match="record geometry"):
+        validate_expert_manifest_spec(wrong, spec)
+
+
+def test_auxiliary_file_is_digest_bound_and_hash_verified(tmp_path: Path) -> None:
+    root = tmp_path / "model"
+    spec, _expected = _make_checkpoint(root)
+    manifest = build_expert_manifest(root, spec)
+    auxiliary_path = root / "layer80-bf16.safetensors"
+    _write_safetensors(
+        auxiliary_path,
+        [("model.layers.80.norm.weight", "F32", [2], bytes(range(8)))],
+    )
+    auxiliary_shard, _tensors = expert_manifest_module._read_safetensors_header(
+        auxiliary_path,
+        relative_name=auxiliary_path.name,
+    )
+    auxiliary = AuxiliaryFileInfo(
+        file=auxiliary_path.name,
+        role="mtp-bf16",
+        size=auxiliary_shard.size,
+        sha256=hashlib.sha256(auxiliary_path.read_bytes()).hexdigest(),
+        header_bytes=auxiliary_shard.header_bytes,
+        header_sha256=auxiliary_shard.header_sha256,
+        source_repo="tencent/Hy3",
+        source_revision="source-revision",
+    )
+    with_auxiliary = replace(
+        manifest,
+        auxiliary_files=(auxiliary,),
+        manifest_sha256=None,
+    ).with_digest()
+    saved = save_expert_manifest(with_auxiliary, root / "expert-manifest.json")
+    loaded = load_expert_manifest(root / "expert-manifest.json")
+    assert loaded == saved
+    assert verify_auxiliary_file(loaded, root, "mtp-bf16") == auxiliary
+
+    fd = os.open(auxiliary_path, os.O_RDWR)
+    try:
+        os.pwrite(fd, b"\xff", auxiliary.header_bytes)
+    finally:
+        os.close(fd)
+    with pytest.raises(ExpertManifestError, match="auxiliary file hash mismatch"):
+        verify_auxiliary_file(loaded, root, "mtp-bf16")
+
+
 def test_hugging_face_snapshot_blob_symlink_is_allowed_but_other_escapes_fail(
     tmp_path: Path,
 ) -> None:
@@ -268,6 +335,203 @@ def test_aligned_sidecar_is_readable_and_verifiable(tmp_path: Path) -> None:
     assert read_expert_record(updated, root, 1, 1) == expected[1]
     report = verify_expert_manifest(updated, root, verify_sidecar_hash=True)
     assert report["sidecar_verified"] is True
+
+
+def _repack_fixture_resident_only(
+    root: Path,
+    legacy: ExpertManifest,
+) -> tuple[ExpertManifest, ExpertManifest, Path]:
+    resident_path = root / "resident-00001-of-00001.safetensors"
+    _write_safetensors(
+        resident_path,
+        [("model.embed_tokens.weight", "F32", [2], bytes(range(8)))],
+    )
+    resident_shard, resident_infos = expert_manifest_module._read_safetensors_header(
+        resident_path, relative_name=resident_path.name
+    )
+    resident_shard = replace(
+        resident_shard,
+        sha256=hashlib.sha256(resident_path.read_bytes()).hexdigest(),
+    )
+    resident_info = resident_infos[0]
+    resident_tensor = ResidentTensor(
+        tensor=resident_info.name,
+        shard=resident_info.shard,
+        offset=resident_info.offset,
+        length=resident_info.length,
+        dtype=resident_info.dtype,
+        shape=resident_info.shape,
+    )
+    repacked = replace(
+        legacy,
+        shards=(*legacy.shards, resident_shard),
+        resident_tensors=(resident_tensor,),
+        manifest_sha256=None,
+    ).with_digest()
+    repacked.validate_structure()
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": resident_tensor.length},
+                "weight_map": {resident_tensor.tensor: resident_tensor.shard},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return repacked, make_sidecar_authoritative(repacked), resident_path
+
+
+def test_authoritative_sidecar_manifest_is_backward_compatible_and_source_absent(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "model"
+    spec, expected = _make_checkpoint(root)
+    manifest = build_expert_manifest(root, spec, hash_shards=True)
+    legacy = build_expert_sidecar(manifest, root, root / "experts.bin")
+
+    repacked, compact, resident_path = _repack_fixture_resident_only(root, legacy)
+
+    assert all("kind" not in shard.to_dict() for shard in legacy.shards)
+
+    assert compact.source_repo == repacked.source_repo
+    assert compact.source_revision == repacked.source_revision
+    sidecar_shard = compact.shards[-1]
+    assert sidecar_shard.kind == "sidecar"
+    assert sidecar_shard.header_bytes == 0
+    assert sidecar_shard.to_dict()["kind"] == "sidecar"
+    assert ShardInfo.from_dict(sidecar_shard.to_dict()) == sidecar_shard
+    for old_record, record in zip(legacy.records, compact.records, strict=True):
+        offset = record.sidecar_offset
+        assert offset is not None
+        for old_segment, segment in zip(
+            old_record.segments, record.segments, strict=True
+        ):
+            assert segment.component == old_segment.component
+            assert segment.tensor == old_segment.tensor
+            assert segment.shard == "experts.bin"
+            assert segment.offset == offset
+            offset += segment.length
+        assert offset == record.sidecar_offset + record.logical_bytes
+
+    compact_names = {shard.name for shard in compact.shards}
+    for shard in legacy.shards:
+        if shard.name not in compact_names:
+            (root / shard.name).unlink()
+    assert sorted(path.name for path in root.glob("*.safetensors")) == [
+        resident_path.name
+    ]
+    saved = save_expert_manifest(compact, root / "expert-manifest.json")
+    loaded = load_expert_manifest(root / "expert-manifest.json")
+    assert loaded == saved
+
+    report = verify_expert_manifest(
+        loaded,
+        root,
+        verify_records=True,
+        verify_shard_hashes=True,
+        verify_sidecar_hash=True,
+    )
+    assert report["checked_records"] == 2
+    assert report["checked_shards"] == len(compact.shards)
+    assert report["sidecar_verified"] is True
+    for expert in range(2):
+        assert (
+            read_expert_record(loaded, root, 1, expert, prefer_sidecar=False)
+            == expected[expert]
+        )
+
+
+def test_authoritative_sidecar_corruption_fails_record_and_file_hashes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "model"
+    spec, _expected = _make_checkpoint(root)
+    manifest = build_expert_manifest(root, spec, hash_shards=True)
+    legacy = build_expert_sidecar(manifest, root, root / "experts.bin")
+    _repacked, compact, _resident_path = _repack_fixture_resident_only(root, legacy)
+    first = compact.records[0]
+    assert first.sidecar_offset is not None
+    sidecar = root / "experts.bin"
+    fd = os.open(sidecar, os.O_RDWR)
+    try:
+        original = os.pread(fd, 1, first.sidecar_offset)
+        os.pwrite(fd, bytes([original[0] ^ 0xFF]), first.sidecar_offset)
+    finally:
+        os.close(fd)
+
+    with pytest.raises(ExpertManifestError, match="record hash mismatch"):
+        verify_expert_manifest(compact, root, verify_records=True)
+    with pytest.raises(ExpertManifestError, match="shard hash mismatch"):
+        verify_expert_manifest(compact, root, verify_shard_hashes=True)
+    with pytest.raises(ExpertManifestError, match="sidecar hash mismatch"):
+        verify_expert_manifest(compact, root, verify_sidecar_hash=True)
+
+
+def test_authoritative_verifier_rejects_experts_hidden_in_resident_shards(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "model"
+    spec, _expected = _make_checkpoint(root)
+    manifest = build_expert_manifest(root, spec, hash_shards=True)
+    legacy = build_expert_sidecar(manifest, root, root / "experts.bin")
+    falsely_compact = make_sidecar_authoritative(legacy)
+
+    with pytest.raises(ExpertManifestError, match="compact resident inventory"):
+        verify_expert_manifest(falsely_compact, root)
+
+
+def test_sidecar_resume_reuses_hashed_prefix_before_reading_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "model"
+    spec, _expected = _make_checkpoint(root)
+    manifest = build_expert_manifest(root, spec)
+    complete = build_expert_sidecar(manifest, root, root / "experts.bin")
+    first = complete.records[0]
+    assert first.sidecar_offset is not None
+    assert first.sidecar_length is not None
+    final = root / "experts.bin"
+    partial = root / ".experts.bin.partial"
+    expected_sidecar = final.read_bytes()
+    final.replace(partial)
+    with partial.open("r+b") as handle:
+        handle.truncate(first.sidecar_offset + first.sidecar_length)
+
+    source_reads: list[tuple[int, int]] = []
+    original_reader = expert_manifest_module._read_source_record
+
+    def recording_reader(root: Path, record: ExpertRecord) -> bytes:
+        source_reads.append((record.layer, record.expert))
+        return original_reader(root, record)
+
+    monkeypatch.setattr(expert_manifest_module, "_read_source_record", recording_reader)
+    resumed = build_expert_sidecar(manifest, root, final)
+
+    assert source_reads == [(1, 1)]
+    assert resumed.sidecar == complete.sidecar
+    assert final.read_bytes() == expected_sidecar
+
+
+def test_sidecar_resume_completes_with_all_source_shards_absent(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "model"
+    spec, expected = _make_checkpoint(root)
+    manifest = build_expert_manifest(root, spec)
+    complete = build_expert_sidecar(manifest, root, root / "experts.bin")
+    final = root / "experts.bin"
+    partial = root / ".experts.bin.partial"
+    expected_sidecar = final.read_bytes()
+    final.replace(partial)
+    for shard in manifest.shards:
+        (root / shard.name).unlink()
+
+    resumed = build_expert_sidecar(manifest, root, final)
+
+    assert resumed.sidecar == complete.sidecar
+    assert final.read_bytes() == expected_sidecar
+    assert read_expert_record(resumed, root, 1, 0) == expected[0]
 
 
 def test_corrupt_payload_and_truncated_sidecar_fail_closed(tmp_path: Path) -> None:

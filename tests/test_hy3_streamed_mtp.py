@@ -381,7 +381,7 @@ def test_load_rejects_streamed_mtp_for_non_hy3_models(tmp_path: Path) -> None:
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
     )
-    with pytest.raises(RuntimeError, match="hy3-q4 only"):
+    with pytest.raises(RuntimeError, match="Hy3 only"):
         load(
             root,
             mtp=True,

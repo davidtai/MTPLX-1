@@ -9,6 +9,7 @@ from typing import Any, Callable
 from .expert_manifest import (
     ExpertManifest,
     ExpertManifestError,
+    ResidentTensor,
     resolve_artifact_member,
 )
 from .expert_runtime import ExpertStreamingRuntime
@@ -69,6 +70,7 @@ def load_resident_arrays(
     root: Path | str,
     manifest: ExpertManifest,
     *,
+    resident_tensors: tuple[ResidentTensor, ...] | None = None,
     mx_module: Any | None = None,
 ) -> dict[str, Any]:
     """Create lazy MLX arrays for only manifest-allowlisted resident tensors."""
@@ -83,8 +85,11 @@ def load_resident_arrays(
     else:
         mx = mx_module
     artifact_root = Path(root).resolve()
+    expected_residents = (
+        manifest.resident_tensors if resident_tensors is None else resident_tensors
+    )
     by_shard: dict[str, list[Any]] = {}
-    for tensor in manifest.resident_tensors:
+    for tensor in expected_residents:
         by_shard.setdefault(tensor.shard, []).append(tensor)
     selected: dict[str, Any] = {}
     for shard_name, expected_tensors in sorted(by_shard.items()):
@@ -128,9 +133,33 @@ def load_resident_arrays(
         # Routed arrays returned by mx.load stay lazy and become unreachable
         # here; only the selected resident leaves survive to mx.eval.
         del loaded
-    if len(selected) != len(manifest.resident_tensors):
+    if len(selected) != len(expected_residents):
         raise ResidentLoadError("resident allowlist was not loaded completely")
     return selected
+
+
+def runtime_resident_tensors(
+    manifest: ExpertManifest,
+    spec: Any,
+) -> tuple[ResidentTensor, ...]:
+    """Select artifact residents that belong to the executable trunk model.
+
+    A native artifact also carries quantized MTP-layer residents for the Q4
+    A/B head. The trunk has layers ``0..total_layers-1`` and must not receive
+    separate ``model.layers.<mtp_layer_index>`` keys during its strict load.
+    """
+
+    if not bool(getattr(spec, "mtp_included", False)):
+        return manifest.resident_tensors
+    mtp_layer_index = getattr(spec, "mtp_layer_index", None)
+    if mtp_layer_index is None:
+        raise ResidentLoadError("included MTP artifact has no layer index")
+    prefix = f"model.layers.{int(mtp_layer_index)}."
+    return tuple(
+        tensor
+        for tensor in manifest.resident_tensors
+        if not tensor.tensor.startswith(prefix)
+    )
 
 
 def get_streaming_model_classes(config: dict[str, Any]) -> tuple[type, type]:
@@ -233,7 +262,13 @@ def construct_resident_model(
         raise ResidentLoadError(
             f"bound {bound} sparse layers; expected {runtime.spec.routed_layer_count}"
         )
-    weights = load_resident_arrays(artifact_root, runtime.manifest, mx_module=mx_module)
+    trunk_residents = runtime_resident_tensors(runtime.manifest, runtime.spec)
+    weights = load_resident_arrays(
+        artifact_root,
+        runtime.manifest,
+        resident_tensors=trunk_residents,
+        mx_module=mx_module,
+    )
     try:
         if hasattr(model, "sanitize"):
             weights = model.sanitize(weights)
@@ -253,9 +288,9 @@ def construct_resident_model(
         raise ResidentLoadError(f"resident parameter evaluation failed: {exc}") from exc
     parameter_count = sum(1 for _name, _value in _flatten_tree(parameters))
     report = ResidentLoadReport(
-        shard_count=len({tensor.shard for tensor in runtime.manifest.resident_tensors}),
-        tensor_count=len(runtime.manifest.resident_tensors),
-        raw_tensor_bytes=runtime.manifest.resident_tensor_bytes,
+        shard_count=len({tensor.shard for tensor in trunk_residents}),
+        tensor_count=len(trunk_residents),
+        raw_tensor_bytes=sum(tensor.length for tensor in trunk_residents),
         evaluated_parameter_count=parameter_count,
         bound_sparse_layers=bound,
         strict=strict,

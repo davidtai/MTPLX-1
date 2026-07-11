@@ -109,7 +109,7 @@ def test_validate_requires_enable_mtp_and_artifacts(capsys) -> None:
     )
     with pytest.raises(SystemExit):
         module.validate_probe_flags(parser, args)
-    assert "hy3-q4" in capsys.readouterr().err
+    assert "Hy3" in capsys.readouterr().err
 
 
 def test_validate_defaults_mtp_precision_to_bf16() -> None:
@@ -133,6 +133,24 @@ def test_validate_defaults_mtp_precision_to_bf16() -> None:
     )
     module.validate_probe_flags(parser, args)
     assert args.mtp_precision == "q4"
+
+
+def test_native_hy3_model_key_is_available_to_draft_rank_probe() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *("hy3-q4-native" if arg == "hy3-q4" else arg for arg in _BASE_ARGS),
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+        ]
+    )
+
+    module.validate_probe_flags(parser, args)
+
+    assert args.model_key == "hy3-q4-native"
+    assert args.mtp_precision == "bf16"
 
 
 def test_probe_rejects_runtimes_without_mtp(tmp_path: Path) -> None:

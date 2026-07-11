@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .expert_runtime import ExpertStreamingConfig, parse_memory_bytes
+from .expert_streaming_models import MODEL_SPECS
 
 
 _BYTE_FIELDS = {
     "memory_limit_bytes",
     "runtime_reserve_bytes",
+    "resident_overhead_bytes",
     "expert_cache_limit_bytes",
     "io_staging_bytes",
     "execution_workspace_bytes",
@@ -41,7 +43,7 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--expert-model-key",
-        choices=["hy3-q4", "glm52-q4"],
+        choices=sorted(MODEL_SPECS),
         help="Pinned streamed model descriptor; inferred from config.json by default.",
     )
     group.add_argument(
@@ -112,7 +114,16 @@ def expert_streaming_requested(args: Any) -> bool:
     )
 
 
-def _read_model_key(model_path: Path) -> str:
+def _read_model_key(model_path: Path, manifest_path: Path | None = None) -> str:
+    if manifest_path is not None:
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest_data = None
+        if isinstance(manifest_data, dict):
+            manifest_key = manifest_data.get("model_key")
+            if isinstance(manifest_key, str) and manifest_key in MODEL_SPECS:
+                return manifest_key
     config_path = model_path / "config.json"
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -159,6 +170,9 @@ def expert_streaming_load_kwargs(
     if not expert_streaming_requested(args):
         return {}
     root = Path(model_path).resolve()
+    manifest = Path(
+        getattr(args, "expert_manifest", None) or root / "expert-manifest.json"
+    ).resolve()
     values = _load_config_object(getattr(args, "expert_streaming_config", None))
     overrides = {
         "model_key": getattr(args, "expert_model_key", None),
@@ -186,7 +200,7 @@ def expert_streaming_load_kwargs(
     }
     values.update({key: value for key, value in overrides.items() if value is not None})
     if "model_key" not in values:
-        values["model_key"] = _read_model_key(root)
+        values["model_key"] = _read_model_key(root, manifest)
     values.setdefault("runtime_reserve_bytes", 16 * 1024**3)
     values.setdefault("io_staging_bytes", 0)
     values.setdefault("execution_workspace_bytes", 0)
@@ -206,9 +220,6 @@ def expert_streaming_load_kwargs(
         config = ExpertStreamingConfig(**values)
     except TypeError as exc:
         raise ValueError(f"invalid expert streaming config: {exc}") from exc
-    manifest = Path(
-        getattr(args, "expert_manifest", None) or root / "expert-manifest.json"
-    ).resolve()
     if not manifest.is_file():
         raise ValueError(f"expert manifest does not exist: {manifest}")
     return {

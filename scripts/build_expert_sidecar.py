@@ -17,7 +17,9 @@ from mtplx.expert_manifest import (  # noqa: E402
     ExpertManifestError,
     build_expert_sidecar,
     load_expert_manifest,
+    make_sidecar_authoritative,
     save_expert_manifest,
+    verify_expert_manifest,
 )
 
 
@@ -39,6 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alignment", type=_positive_int, default=DEFAULT_ALIGNMENT)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--authoritative",
+        action="store_true",
+        help=(
+            "Rebase record segments onto the completed sidecar and drop source "
+            "shards not referenced by resident tensors. Source files are not deleted."
+        ),
+    )
     return parser
 
 
@@ -56,6 +66,15 @@ def main() -> int:
             resume=not args.no_resume,
             overwrite=args.overwrite,
         )
+        if args.authoritative:
+            manifest = make_sidecar_authoritative(manifest)
+            verify_expert_manifest(
+                manifest,
+                root,
+                verify_records=True,
+                verify_shard_hashes=True,
+                verify_sidecar_hash=True,
+            )
         manifest = save_expert_manifest(manifest, manifest_output)
     except ExpertManifestError as exc:
         raise SystemExit(f"expert sidecar build failed: {exc}") from exc
@@ -70,6 +89,7 @@ def main() -> int:
                 "sidecar_bytes": manifest.sidecar.size,
                 "alignment": manifest.sidecar.alignment,
                 "records": len(manifest.records),
+                "authoritative": args.authoritative,
             },
             indent=2,
             sort_keys=True,

@@ -14,6 +14,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes  # noqa: E402
+from mtplx.expert_streaming_models import MODEL_SPECS  # noqa: E402
 from mtplx.runtime import load  # noqa: E402
 
 
@@ -29,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("model_root", type=Path)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("probes", type=Path)
-    parser.add_argument("--model-key", choices=["hy3-q4", "glm52-q4"], required=True)
+    parser.add_argument("--model-key", choices=sorted(MODEL_SPECS), required=True)
     parser.add_argument("--memory-limit", required=True)
     parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
     parser.add_argument("--runtime-reserve", default="16GiB")

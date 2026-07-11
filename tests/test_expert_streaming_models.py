@@ -35,6 +35,9 @@ def test_hy3_q4_exact_expert_layout() -> None:
     assert spec.quant_group_size == 64
     assert spec.quant_parameter_bytes == 2
     assert spec.expert_record_bytes == 10_616_832
+    assert spec.expert_record_layer_indices == tuple(range(1, 80))
+    assert spec.expert_record_layer_count == 79
+    assert spec.streamed_expert_bytes == 161_036_107_776
     assert spec.routed_expert_bytes == 161_036_107_776
     assert spec.cold_expert_bytes_per_token == 6_709_837_824
     assert spec.transient_scratch_bytes == 84_934_656
@@ -54,6 +57,32 @@ def test_hy3_q4_exact_expert_layout() -> None:
     assert spec.full_indexer_layers == ()
 
 
+def test_hy3_q4_native_stores_mtp_experts_outside_the_runtime_layer_plan() -> None:
+    spec = get_model_spec("hy3-q4-native")
+
+    assert MODEL_SPECS["hy3-q4-native"] is spec
+    assert spec.total_layers == 80
+    assert spec.total_tensor_bytes == 168_147_964_416
+    assert spec.routed_layer_indices == tuple(range(1, 80))
+    assert spec.expert_record_layer_indices == tuple(range(1, 81))
+    assert spec.expert_record_layer_count == 80
+    assert spec.expert_record_bytes == 10_616_832
+    assert spec.streamed_expert_bytes == 161_036_107_776
+    assert spec.routed_expert_bytes == 163_074_539_520
+    assert spec.resident_bytes == 5_073_424_896
+    assert spec.routed_expert_bytes + spec.resident_bytes == spec.total_tensor_bytes
+    assert spec.persistent_cache_bytes(spec.expert_count) == spec.streamed_expert_bytes
+    assert spec.router_bytes == 66_908_160
+    assert spec.source_model == "tencent/Hy3"
+    assert spec.source_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+    assert spec.quant_model == "local/hy3-q4-native"
+    assert spec.quant_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+    assert spec.manifest_repo == "tencent/Hy3"
+    assert spec.manifest_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+    assert spec.mtp_layer_index == 80
+    assert spec.mtp_included is True
+
+
 def test_glm52_q4_exact_expert_and_indexshare_layout() -> None:
     spec = get_model_spec("glm52-q4")
 
@@ -69,6 +98,9 @@ def test_glm52_q4_exact_expert_and_indexshare_layout() -> None:
     assert spec.quant_group_size == 64
     assert spec.quant_parameter_bytes == 2
     assert spec.expert_record_bytes == 21_233_664
+    assert spec.expert_record_layer_indices == tuple(range(3, 78))
+    assert spec.expert_record_layer_count == 75
+    assert spec.streamed_expert_bytes == 407_686_348_800
     assert spec.routed_expert_bytes == 407_686_348_800
     assert spec.cold_expert_bytes_per_token == 12_740_198_400
     assert spec.transient_scratch_bytes == 169_869_312
@@ -90,8 +122,8 @@ def test_glm52_q4_exact_expert_and_indexshare_layout() -> None:
     assert len(spec.full_indexer_layers) == 21
 
 
-def test_model_registry_contains_both_q4_targets() -> None:
-    assert {"hy3-q4", "glm52-q4"} <= MODEL_SPECS.keys()
+def test_model_registry_contains_all_q4_targets() -> None:
+    assert {"hy3-q4", "hy3-q4-native", "glm52-q4"} <= MODEL_SPECS.keys()
     with pytest.raises(ValueError, match="unknown model"):
         get_model_spec("unknown-model")
 
@@ -156,7 +188,7 @@ def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None
 def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding() -> None:
     spec = get_model_spec("hy3-q4")
     expert_cache_limit = 80 * GIB
-    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    fixed = spec.runtime_trunk_resident_bytes + spec.transient_scratch_bytes
 
     layer_plan = plan_expert_memory(
         spec,
@@ -208,7 +240,7 @@ def test_memory_plan_reports_when_fixed_footprint_does_not_fit() -> None:
 @pytest.mark.parametrize("model_key", ["hy3-q4", "glm52-q4"])
 def test_memory_plan_exact_fixed_one_slot_and_full_residency(model_key: str) -> None:
     spec = get_model_spec(model_key)
-    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    fixed = spec.runtime_trunk_resident_bytes + spec.transient_scratch_bytes
 
     fixed_only = plan_expert_memory(
         spec,
@@ -239,6 +271,59 @@ def test_memory_plan_exact_fixed_one_slot_and_full_residency(model_key: str) -> 
         plan.allocated_bytes <= plan.total_limit_bytes
         for plan in (fixed_only, one_slot, full)
     )
+
+
+def test_native_memory_plan_caps_runtime_cache_at_trunk_experts() -> None:
+    spec = get_model_spec("hy3-q4-native")
+    fixed = spec.runtime_trunk_resident_bytes + spec.transient_scratch_bytes
+
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + spec.routed_expert_bytes + GIB,
+        context_tokens=0,
+    )
+
+    assert plan.persistent_budget_bytes == spec.streamed_expert_bytes
+    assert plan.persistent_slots == spec.routed_layer_count * spec.expert_count
+    assert plan.persistent_cache_bytes == spec.streamed_expert_bytes
+    assert plan.unallocated_bytes == (
+        spec.routed_expert_bytes - spec.streamed_expert_bytes + GIB
+    )
+
+
+def test_native_memory_plan_reserves_selected_mtp_head_precision() -> None:
+    spec = get_model_spec("hy3-q4-native")
+    assert spec.runtime_trunk_resident_bytes == 4_952_354_048
+    assert spec.mtp_runtime_bytes("q4") == 2_159_502_592
+    assert spec.mtp_runtime_bytes("bf16") == 7_505_224_960
+
+    q4 = plan_expert_memory(
+        spec,
+        total_limit_bytes=32 * GIB,
+        context_tokens=0,
+        resident_overhead_bytes=spec.mtp_runtime_bytes("q4"),
+    )
+    bf16 = plan_expert_memory(
+        spec,
+        total_limit_bytes=32 * GIB,
+        context_tokens=0,
+        resident_overhead_bytes=spec.mtp_runtime_bytes("bf16"),
+    )
+
+    assert q4.resident_bytes == 7_111_856_640
+    assert bf16.resident_bytes == 12_457_579_008
+    assert bf16.resident_bytes - q4.resident_bytes == 5_345_722_368
+
+    from mtplx.expert_runtime import ExpertStreamingConfig
+
+    configured = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=32 * GIB,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        resident_overhead_bytes=spec.mtp_runtime_bytes("bf16"),
+    ).memory_plan(spec)
+    assert configured.resident_bytes == bf16.resident_bytes
 
 
 def test_zero_cache_cap_and_explicit_fixed_workspaces_are_accounted() -> None:
@@ -304,6 +389,10 @@ def test_model_spec_rejects_float_dimensions_and_misaligned_projections() -> Non
         replace(spec, total_layers=80.0)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="projection input"):
         replace(spec, expert_hidden_size=1537)
+    with pytest.raises(ValueError, match="mtp_layer_index is required"):
+        replace(spec, mtp_included=True, mtp_layer_index=None)
+    with pytest.raises(ValueError, match="must be supplied together"):
+        replace(spec, manifest_source_model="example/source", manifest_source_revision=None)
 
 
 def test_glm_model_key_drives_trace_simulator_geometry(tmp_path: Path) -> None:

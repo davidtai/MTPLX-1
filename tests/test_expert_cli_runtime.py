@@ -65,6 +65,45 @@ def test_expert_cli_builds_explicit_bounded_config(tmp_path: Path) -> None:
     assert config.prefer_sidecar is False
 
 
+def test_expert_cli_accepts_the_native_hy3_descriptor(tmp_path: Path) -> None:
+    root = _model_root(tmp_path)
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-model-key",
+            "hy3-q4-native",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].model_key == "hy3-q4-native"
+
+
+def test_expert_cli_infers_native_hy3_from_its_manifest(tmp_path: Path) -> None:
+    root = _model_root(tmp_path)
+    (root / "expert-manifest.json").write_text(
+        json.dumps({"model_key": "hy3-q4-native"}), encoding="utf-8"
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].model_key == "hy3-q4-native"
+
+
 def test_expert_cli_json_and_flags_are_strict_and_forwarded(tmp_path: Path) -> None:
     root = _model_root(tmp_path, "glm_moe_dsa")
     config_path = tmp_path / "stream.json"

@@ -16,6 +16,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes  # noqa: E402
+from mtplx.expert_streaming_models import MODEL_SPECS, get_model_spec  # noqa: E402
 from mtplx.runtime import load  # noqa: E402
 
 
@@ -39,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_root", type=Path)
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--model-key", choices=["hy3-q4", "glm52-q4"], required=True)
+    parser.add_argument("--model-key", choices=sorted(MODEL_SPECS), required=True)
     parser.add_argument("--memory-limit", required=True)
     parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
     parser.add_argument("--runtime-reserve", default="16GiB")
@@ -212,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Speculative decoding through the packaged layer-80 NextN head "
-            "(hy3-q4 only; requires --mtp-artifacts). Default off: the AR "
+            "(Hy3 only; requires --mtp-artifacts). Default off: the AR "
             "path is unchanged unless this flag is passed."
         ),
     )
@@ -242,8 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_mtp_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.enable_mtp:
-        if args.model_key != "hy3-q4":
-            parser.error("--enable-mtp is packaged for --model-key hy3-q4 only")
+        if get_model_spec(args.model_key).source_model != "tencent/Hy3":
+            parser.error("--enable-mtp is packaged for Hy3 model keys only")
         if args.mtp_artifacts is None:
             parser.error("--enable-mtp requires --mtp-artifacts")
         if getattr(args, "concurrency", 1) > 1:
@@ -397,7 +398,7 @@ def main() -> int:
     args = parser.parse_args()
     root = args.model_root.expanduser().resolve()
     model_defaults = {
-        "glm52-q4": {
+        "zai-org/GLM-5.2": {
             "max_tokens": 65_536,
             "max_output_tokens": 131_072,
             "temperature": 1.0,
@@ -406,7 +407,7 @@ def main() -> int:
             "enable_thinking": True,
             "reasoning_effort": "max",
         },
-        "hy3-q4": {
+        "tencent/Hy3": {
             "max_tokens": 65_536,
             "max_output_tokens": 262_144,
             "temperature": 0.9,
@@ -415,7 +416,7 @@ def main() -> int:
             "enable_thinking": False,
             "reasoning_effort": None,
         },
-    }[args.model_key]
+    }[get_model_spec(args.model_key).source_model]
     if args.generation_profile == "deterministic":
         profile_defaults = {
             **model_defaults,

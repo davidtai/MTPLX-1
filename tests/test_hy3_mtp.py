@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -11,9 +13,22 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
+import mtplx.expert_manifest as expert_manifest_module
+from mtplx.expert_manifest import (
+    AuxiliaryFileInfo,
+    EMPTY_SHA256,
+    ExpertManifest,
+    ExpertRecord,
+    ShardInfo,
+    SidecarInfo,
+    TensorSegment,
+    load_expert_manifest,
+    save_expert_manifest,
+)
 from mtplx.hy3_mtp_patch import (
     HY3_MTP_BF16_FILE,
     HY3_MTP_EXPERTS_FILE,
+    HY3_MTP_SOURCE_REPO,
     HY3_MTP_RESIDENTS_FILE,
     Hy3MTPLoadError,
     build_hy3_mtp_module,
@@ -131,6 +146,89 @@ def _write_tiny_artifacts(tmp_path: Path, *, revision: str = TEST_REVISION) -> P
         str(tmp_path / HY3_MTP_EXPERTS_FILE), experts, metadata=metadata
     )
     return tmp_path
+
+
+def _replace_q4_experts_with_compact_sidecar(tmp_path: Path) -> dict[str, mx.array]:
+    """Serialize the tiny layer-80 records exactly as the native artifact does."""
+
+    args = _tiny_args()
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    experts_path = tmp_path / HY3_MTP_EXPERTS_FILE
+    experts = dict(mx.load(str(experts_path), format="safetensors"))
+    sidecar_payload = bytearray()
+    records: list[ExpertRecord] = []
+    for expert in range(args.num_experts):
+        record_offset = len(sidecar_payload)
+        segments: list[TensorSegment] = []
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            for leaf in ("weight", "scales", "biases"):
+                component = f"{projection}.{leaf}"
+                tensor = f"{prefix}mlp.experts.{expert}.{component}"
+                value = experts[tensor]
+                raw = memoryview(value).cast("B").tobytes()
+                segment_offset = len(sidecar_payload)
+                sidecar_payload.extend(raw)
+                segments.append(
+                    TensorSegment(
+                        component=component,
+                        tensor=tensor,
+                        shard="experts.bin",
+                        offset=segment_offset,
+                        length=len(raw),
+                        dtype="U32" if leaf == "weight" else "BF16",
+                        shape=tuple(int(dimension) for dimension in value.shape),
+                    )
+                )
+        logical_bytes = len(sidecar_payload) - record_offset
+        record_payload = bytes(sidecar_payload[record_offset:])
+        records.append(
+            ExpertRecord(
+                layer=args.num_hidden_layers,
+                expert=expert,
+                logical_bytes=logical_bytes,
+                segments=tuple(segments),
+                sha256=hashlib.sha256(record_payload).hexdigest(),
+                sidecar_offset=record_offset,
+                sidecar_length=logical_bytes,
+            )
+        )
+
+    sidecar_path = tmp_path / "experts.bin"
+    sidecar_path.write_bytes(sidecar_payload)
+    sidecar_sha256 = hashlib.sha256(sidecar_payload).hexdigest()
+    routed_bytes = len(sidecar_payload)
+    manifest = ExpertManifest(
+        model_key="tiny-hy3-q4-native",
+        source_repo=HY3_MTP_SOURCE_REPO,
+        source_revision=TEST_REVISION,
+        quant_bits=4,
+        quant_group_size=64,
+        quant_mode="affine",
+        artifact_tensor_bytes=routed_bytes,
+        resident_tensor_bytes=0,
+        routed_expert_bytes=routed_bytes,
+        shards=(
+            ShardInfo(
+                name="experts.bin",
+                size=routed_bytes,
+                header_bytes=0,
+                header_sha256=EMPTY_SHA256,
+                sha256=sidecar_sha256,
+                kind="sidecar",
+            ),
+        ),
+        resident_tensors=(),
+        records=tuple(records),
+        sidecar=SidecarInfo(
+            file="experts.bin",
+            alignment=256,
+            size=routed_bytes,
+            sha256=sidecar_sha256,
+        ),
+    ).with_digest()
+    save_expert_manifest(manifest, tmp_path / "expert-manifest.json")
+    experts_path.unlink()
+    return experts
 
 
 def _write_tiny_bf16_artifact(tmp_path: Path, *, revision: str = TEST_REVISION) -> Path:
@@ -334,6 +432,89 @@ def test_stacked_expert_weights_match_artifact_order(tmp_path: Path) -> None:
         weights["layers.0.eh_proj.weight"],
         experts[prefix + "eh_proj.weight"],
     ).item()
+
+
+def test_q4_loader_falls_back_to_compact_layer80_sidecar(tmp_path: Path) -> None:
+    args = _tiny_args()
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    _write_tiny_artifacts(tmp_path)
+    experts = _replace_q4_experts_with_compact_sidecar(tmp_path)
+
+    weights = load_hy3_mtp_weights(
+        tmp_path,
+        args,
+        expected_revision=TEST_REVISION,
+    )
+
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        for leaf in ("weight", "scales", "biases"):
+            stacked = weights[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.{leaf}"]
+            assert stacked.shape[0] == args.num_experts
+            for expert in range(args.num_experts):
+                source = experts[f"{prefix}mlp.experts.{expert}.{projection}.{leaf}"]
+                assert mx.array_equal(stacked[expert], source).item()
+
+
+def test_q4_loader_rejects_corrupt_compact_layer80_record(tmp_path: Path) -> None:
+    args = _tiny_args()
+    _write_tiny_artifacts(tmp_path)
+    _replace_q4_experts_with_compact_sidecar(tmp_path)
+    sidecar = tmp_path / "experts.bin"
+    payload = bytearray(sidecar.read_bytes())
+    payload[0] ^= 0xFF
+    sidecar.write_bytes(payload)
+
+    with pytest.raises(Hy3MTPLoadError, match="record hash mismatch"):
+        load_hy3_mtp_weights(
+            tmp_path,
+            args,
+            expected_revision=TEST_REVISION,
+        )
+
+
+def test_native_bf16_loader_requires_manifest_bound_full_hash(tmp_path: Path) -> None:
+    args = _tiny_args()
+    _write_tiny_artifacts(tmp_path)
+    _write_tiny_bf16_artifact(tmp_path)
+    _replace_q4_experts_with_compact_sidecar(tmp_path)
+
+    with pytest.raises(Hy3MTPLoadError, match="auxiliary file role"):
+        load_hy3_mtp_bf16_weights(
+            tmp_path,
+            args,
+            expected_revision=TEST_REVISION,
+        )
+
+    path = tmp_path / HY3_MTP_BF16_FILE
+    shard, _tensors = expert_manifest_module._read_safetensors_header(
+        path,
+        relative_name=path.name,
+    )
+    auxiliary = AuxiliaryFileInfo(
+        file=path.name,
+        role="mtp-bf16",
+        size=shard.size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        header_bytes=shard.header_bytes,
+        header_sha256=shard.header_sha256,
+        source_repo=HY3_MTP_SOURCE_REPO,
+        source_revision=TEST_REVISION,
+    )
+    manifest_path = tmp_path / "expert-manifest.json"
+    manifest = load_expert_manifest(manifest_path)
+    manifest = replace(
+        manifest,
+        auxiliary_files=(auxiliary,),
+        manifest_sha256=None,
+    ).with_digest()
+    save_expert_manifest(manifest, manifest_path)
+
+    weights = load_hy3_mtp_bf16_weights(
+        tmp_path,
+        args,
+        expected_revision=TEST_REVISION,
+    )
+    assert weights
 
 
 def _module_leaves(mtp) -> list[tuple[str, object]]:

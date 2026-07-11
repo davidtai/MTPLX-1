@@ -25,6 +25,9 @@ from .expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
 MANIFEST_FORMAT = "mtplx-expert-manifest-v1"
 DEFAULT_ALIGNMENT = 16 * 1024
 MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+_SHARD_KINDS = ("safetensors", "sidecar")
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _LEAVES = ("weight", "scales", "biases")
@@ -251,6 +254,7 @@ class ShardInfo:
     header_bytes: int
     header_sha256: str
     sha256: str | None = None
+    kind: str = "safetensors"
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -261,6 +265,8 @@ class ShardInfo:
         }
         if self.sha256 is not None:
             result["sha256"] = self.sha256
+        if self.kind != "safetensors":
+            result["kind"] = self.kind
         return result
 
     @classmethod
@@ -270,17 +276,100 @@ class ShardInfo:
             obj,
             label="shard",
             required=("name", "size", "header_bytes", "header_sha256"),
-            optional=("sha256",),
+            optional=("sha256", "kind"),
         )
         digest = obj.get("sha256")
-        return cls(
+        shard = cls(
             name=_safe_relative_name(obj["name"], label="shard name"),
             size=_integer(obj["size"], label="shard size", minimum=1),
             header_bytes=_integer(
-                obj["header_bytes"], label="shard header_bytes", minimum=1
+                obj["header_bytes"], label="shard header_bytes", minimum=0
             ),
             header_sha256=_string(obj["header_sha256"], label="shard header_sha256"),
             sha256=None if digest is None else _string(digest, label="shard sha256"),
+            kind=_string(obj.get("kind", "safetensors"), label="shard kind"),
+        )
+        shard.validate_structure()
+        return shard
+
+    def validate_structure(self) -> None:
+        if self.kind not in _SHARD_KINDS:
+            raise ExpertManifestError(f"unsupported shard kind {self.kind!r}")
+        if self.kind == "safetensors":
+            if self.header_bytes < 1:
+                raise ExpertManifestError(
+                    "safetensors shard header_bytes must be positive"
+                )
+            return
+        if self.header_bytes != 0:
+            raise ExpertManifestError("sidecar shard header_bytes must be zero")
+        if self.header_sha256 != EMPTY_SHA256:
+            raise ExpertManifestError(
+                "sidecar shard header_sha256 must hash the empty header"
+            )
+        if self.sha256 is None:
+            raise ExpertManifestError("sidecar shard requires a full-file hash")
+
+
+@dataclass(frozen=True)
+class AuxiliaryFileInfo:
+    """Hash-pinned file shipped beside the logical Q4 model artifact."""
+
+    file: str
+    role: str
+    size: int
+    sha256: str
+    header_bytes: int
+    header_sha256: str
+    source_repo: str
+    source_revision: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "file": self.file,
+            "role": self.role,
+            "size": self.size,
+            "sha256": self.sha256,
+            "header_bytes": self.header_bytes,
+            "header_sha256": self.header_sha256,
+            "source_repo": self.source_repo,
+            "source_revision": self.source_revision,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> AuxiliaryFileInfo:
+        obj = _expect_object(value, label="auxiliary file")
+        _expect_keys(
+            obj,
+            label="auxiliary file",
+            required=(
+                "file",
+                "role",
+                "size",
+                "sha256",
+                "header_bytes",
+                "header_sha256",
+                "source_repo",
+                "source_revision",
+            ),
+        )
+        return cls(
+            file=_safe_relative_name(obj["file"], label="auxiliary file path"),
+            role=_string(obj["role"], label="auxiliary file role"),
+            size=_integer(obj["size"], label="auxiliary file size", minimum=1),
+            sha256=_string(obj["sha256"], label="auxiliary file sha256"),
+            header_bytes=_integer(
+                obj["header_bytes"], label="auxiliary file header_bytes", minimum=1
+            ),
+            header_sha256=_string(
+                obj["header_sha256"], label="auxiliary file header_sha256"
+            ),
+            source_repo=_string(
+                obj["source_repo"], label="auxiliary file source_repo"
+            ),
+            source_revision=_string(
+                obj["source_revision"], label="auxiliary file source_revision"
+            ),
         )
 
 
@@ -493,6 +582,7 @@ class ExpertManifest:
     shards: tuple[ShardInfo, ...]
     resident_tensors: tuple[ResidentTensor, ...]
     records: tuple[ExpertRecord, ...]
+    auxiliary_files: tuple[AuxiliaryFileInfo, ...] = ()
     sidecar: SidecarInfo | None = None
     manifest_sha256: str | None = None
     format: str = MANIFEST_FORMAT
@@ -519,6 +609,10 @@ class ExpertManifest:
             "resident_tensors": [tensor.to_dict() for tensor in self.resident_tensors],
             "records": [record.to_dict() for record in self.records],
         }
+        if self.auxiliary_files:
+            result["auxiliary_files"] = [
+                auxiliary.to_dict() for auxiliary in self.auxiliary_files
+            ]
         if self.sidecar is not None:
             result["sidecar"] = self.sidecar.to_dict()
         if include_digest and self.manifest_sha256 is not None:
@@ -552,7 +646,7 @@ class ExpertManifest:
                 "resident_tensors",
                 "records",
             ),
-            optional=("sidecar", "manifest_sha256"),
+            optional=("auxiliary_files", "sidecar", "manifest_sha256"),
         )
         if obj["format"] != MANIFEST_FORMAT:
             raise ExpertManifestError(f"unsupported manifest format {obj['format']!r}")
@@ -586,6 +680,12 @@ class ExpertManifest:
             ResidentTensor.from_dict(item) for item in raw_resident
         )
         records = tuple(ExpertRecord.from_dict(item) for item in raw_records)
+        raw_auxiliary = obj.get("auxiliary_files", [])
+        if not isinstance(raw_auxiliary, list):
+            raise ExpertManifestError("auxiliary_files must be an array")
+        auxiliary_files = tuple(
+            AuxiliaryFileInfo.from_dict(item) for item in raw_auxiliary
+        )
         if artifact["shard_count"] != len(shards) or artifact["record_count"] != len(
             records
         ):
@@ -615,6 +715,7 @@ class ExpertManifest:
             shards=shards,
             resident_tensors=resident_tensors,
             records=records,
+            auxiliary_files=auxiliary_files,
             sidecar=None
             if obj.get("sidecar") is None
             else SidecarInfo.from_dict(obj["sidecar"]),
@@ -634,8 +735,20 @@ class ExpertManifest:
     def validate_structure(self) -> None:
         if self.quant_bits != 4 or self.quant_mode != "affine":
             raise ExpertManifestError("only affine Q4 expert manifests are supported")
+        for shard in self.shards:
+            shard.validate_structure()
         if len({shard.name for shard in self.shards}) != len(self.shards):
             raise ExpertManifestError("duplicate shard names")
+        auxiliary_paths = [item.file for item in self.auxiliary_files]
+        auxiliary_roles = [item.role for item in self.auxiliary_files]
+        if len(auxiliary_paths) != len(set(auxiliary_paths)):
+            raise ExpertManifestError("duplicate auxiliary file paths")
+        if len(auxiliary_roles) != len(set(auxiliary_roles)):
+            raise ExpertManifestError("duplicate auxiliary file roles")
+        if set(auxiliary_paths) & {shard.name for shard in self.shards}:
+            raise ExpertManifestError("auxiliary files cannot also be model shards")
+        if self.sidecar is not None and self.sidecar.file in set(auxiliary_paths):
+            raise ExpertManifestError("sidecar cannot also be an auxiliary file")
         if (
             self.artifact_tensor_bytes
             != self.resident_tensor_bytes + self.routed_expert_bytes
@@ -651,9 +764,32 @@ class ExpertManifest:
             set(resident_names)
         ):
             raise ExpertManifestError("resident tensor names must be sorted and unique")
-        shard_sizes = {shard.name: shard.size for shard in self.shards}
+        shards_by_name = {shard.name: shard for shard in self.shards}
+        sidecar_shards = [shard for shard in self.shards if shard.kind == "sidecar"]
+        if sidecar_shards:
+            if self.sidecar is None:
+                raise ExpertManifestError(
+                    "sidecar-kind shard requires sidecar metadata"
+                )
+            if len(sidecar_shards) != 1:
+                raise ExpertManifestError(
+                    "manifest must contain only one sidecar shard"
+                )
+            sidecar_shard = sidecar_shards[0]
+            if (
+                sidecar_shard.name != self.sidecar.file
+                or sidecar_shard.size != self.sidecar.size
+                or sidecar_shard.sha256 != self.sidecar.sha256
+            ):
+                raise ExpertManifestError(
+                    "sidecar shard does not match sidecar metadata"
+                )
         routed_bytes = 0
         for record in self.records:
+            if tuple(segment.component for segment in record.segments) != _COMPONENTS:
+                raise ExpertManifestError(
+                    "expert record must contain the nine ordered Q4 components"
+                )
             if (
                 sum(segment.length for segment in record.segments)
                 != record.logical_bytes
@@ -669,14 +805,49 @@ class ExpertManifest:
                     "sidecar record length must equal logical_bytes"
                 )
             routed_bytes += record.logical_bytes
+            segment_kinds: set[str] = set()
             for segment in record.segments:
-                size = shard_sizes.get(segment.shard)
-                if size is None or segment.offset + segment.length > size:
+                shard = shards_by_name.get(segment.shard)
+                if shard is None or segment.offset + segment.length > shard.size:
                     raise ExpertManifestError(
                         f"segment for {segment.tensor} exceeds its shard"
                     )
+                segment_kinds.add(shard.kind)
+            if "sidecar" in segment_kinds:
+                if segment_kinds != {"sidecar"}:
+                    raise ExpertManifestError(
+                        "expert record cannot mix sidecar and safetensors segments"
+                    )
+                if self.sidecar is None or record.sidecar_offset is None:
+                    raise ExpertManifestError(
+                        "sidecar segments require record sidecar metadata"
+                    )
+                expected_offset = record.sidecar_offset
+                for segment in record.segments:
+                    if (
+                        segment.shard != self.sidecar.file
+                        or segment.offset != expected_offset
+                    ):
+                        raise ExpertManifestError(
+                            "sidecar segments must exactly cover the ordered record"
+                        )
+                    expected_offset += segment.length
+                if expected_offset != record.sidecar_offset + record.logical_bytes:
+                    raise ExpertManifestError(
+                        "sidecar segments must exactly cover the ordered record"
+                    )
         if routed_bytes != self.routed_expert_bytes:
             raise ExpertManifestError("record bytes do not equal routed_expert_bytes")
+        for tensor in self.resident_tensors:
+            shard = shards_by_name.get(tensor.shard)
+            if shard is None or tensor.offset + tensor.length > shard.size:
+                raise ExpertManifestError(
+                    f"resident tensor {tensor.tensor} exceeds its shard"
+                )
+            if shard.kind != "safetensors":
+                raise ExpertManifestError(
+                    "resident tensors must be stored in safetensors shards"
+                )
         if (
             sum(tensor.length for tensor in self.resident_tensors)
             != self.resident_tensor_bytes
@@ -927,7 +1098,7 @@ def _classify_expert_tensor(
     if match is None:
         return None
     layer = int(match.group("layer"))
-    if layer not in spec.routed_layer_indices:
+    if layer not in spec.expert_record_layer_indices:
         return None
     parts = match.group("tail").split(".")
     expert: int | None = None
@@ -1006,7 +1177,7 @@ def _expert_segments(
 
     records: list[ExpertRecord] = []
     missing: list[tuple[int, int, str]] = []
-    for layer in spec.routed_layer_indices:
+    for layer in spec.expert_record_layer_indices:
         for expert in range(spec.expert_count):
             segments: list[TensorSegment] = []
             for component in _COMPONENTS:
@@ -1036,6 +1207,57 @@ def _expert_segments(
             f"checkpoint is missing {len(missing)} expert components: {preview}"
         )
     return tuple(records), expert_tensor_names
+
+
+def validate_expert_manifest_spec(
+    manifest: ExpertManifest,
+    spec: ExpertStreamingModelSpec,
+    *,
+    require_pinned_tensor_bytes: bool = True,
+) -> None:
+    """Require exact record geometry for a pinned model descriptor."""
+
+    expected_keys = tuple(
+        (layer, expert)
+        for layer in spec.expert_record_layer_indices
+        for expert in range(spec.expert_count)
+    )
+    actual_keys = tuple((record.layer, record.expert) for record in manifest.records)
+    if actual_keys != expected_keys:
+        missing = sorted(set(expected_keys) - set(actual_keys))
+        extra = sorted(set(actual_keys) - set(expected_keys))
+        raise ExpertManifestError(
+            "manifest record geometry does not match model descriptor; "
+            f"missing={missing[:4]}, extra={extra[:4]}"
+        )
+    if manifest.routed_expert_bytes != spec.routed_expert_bytes:
+        raise ExpertManifestError(
+            "manifest routed bytes do not match model descriptor"
+        )
+    if (
+        require_pinned_tensor_bytes
+        and manifest.resident_tensor_bytes != spec.resident_bytes
+    ):
+        raise ExpertManifestError(
+            "manifest resident bytes do not match model descriptor"
+        )
+    for record in manifest.records:
+        if record.logical_bytes != spec.expert_record_bytes:
+            raise ExpertManifestError(
+                f"record ({record.layer}, {record.expert}) byte size does not "
+                "match model descriptor"
+            )
+        for segment in record.segments:
+            dtype, shape, length = _expected_component_shape(spec, segment.component)
+            if (
+                segment.dtype != dtype
+                or segment.shape != shape
+                or segment.length != length
+            ):
+                raise ExpertManifestError(
+                    f"record ({record.layer}, {record.expert}) component "
+                    f"{segment.component} does not match model descriptor"
+                )
 
 
 def _pread_exact(fd: int, offset: int, length: int) -> bytes:
@@ -1143,8 +1365,8 @@ def build_expert_manifest(
         records = tuple(hashed)
     manifest = ExpertManifest(
         model_key=model_spec.key,
-        source_repo=source_repo or model_spec.quant_model,
-        source_revision=source_revision or model_spec.quant_revision,
+        source_repo=source_repo or model_spec.manifest_repo,
+        source_revision=source_revision or model_spec.manifest_revision,
         quant_bits=model_spec.quant_bits,
         quant_group_size=model_spec.quant_group_size,
         quant_mode="affine",
@@ -1156,7 +1378,39 @@ def build_expert_manifest(
         records=records,
     ).with_digest()
     manifest.validate_structure()
+    validate_expert_manifest_spec(
+        manifest,
+        model_spec,
+        require_pinned_tensor_bytes=require_pinned_tensor_bytes,
+    )
     return manifest
+
+
+def verify_auxiliary_file(
+    manifest: ExpertManifest,
+    root: Path | str,
+    role: str,
+    *,
+    verify_hash: bool = True,
+) -> AuxiliaryFileInfo:
+    """Verify and return one manifest-bound auxiliary safetensors file."""
+
+    try:
+        info = next(item for item in manifest.auxiliary_files if item.role == role)
+    except StopIteration as exc:
+        raise ExpertManifestError(f"manifest has no auxiliary file role {role!r}") from exc
+    artifact_root = Path(root).resolve()
+    path = _resolve_member(artifact_root, info.file)
+    current, _tensors = _read_safetensors_header(path, relative_name=info.file)
+    if (
+        current.size != info.size
+        or current.header_bytes != info.header_bytes
+        or current.header_sha256 != info.header_sha256
+    ):
+        raise ExpertManifestError(f"auxiliary file provenance mismatch: {info.file}")
+    if verify_hash and _hash_file(path) != info.sha256:
+        raise ExpertManifestError(f"auxiliary file hash mismatch: {info.file}")
+    return info
 
 
 def verify_expert_manifest(
@@ -1174,21 +1428,103 @@ def verify_expert_manifest(
     if manifest.manifest_sha256 != manifest.with_digest().manifest_sha256:
         raise ExpertManifestError("manifest digest mismatch")
     checked_shards = 0
+    verified_file_hashes: dict[str, str] = {}
+    authoritative = any(shard.kind == "sidecar" for shard in manifest.shards)
+    expected_residents_by_shard: dict[str, dict[str, ResidentTensor]] = {}
+    for tensor in manifest.resident_tensors:
+        expected_residents_by_shard.setdefault(tensor.shard, {})[tensor.tensor] = tensor
     for shard in manifest.shards:
         path = _resolve_member(artifact_root, shard.name)
-        current, _tensors = _read_safetensors_header(path, relative_name=shard.name)
-        if (
-            current.size != shard.size
-            or current.header_bytes != shard.header_bytes
-            or current.header_sha256 != shard.header_sha256
-        ):
-            raise ExpertManifestError(f"shard provenance mismatch: {shard.name}")
+        if shard.kind == "sidecar":
+            try:
+                current_size = path.stat().st_size
+            except OSError as exc:
+                raise ExpertManifestError(
+                    f"could not inspect sidecar shard {shard.name}: {exc}"
+                ) from exc
+            if current_size != shard.size:
+                raise ExpertManifestError(f"sidecar shard size mismatch: {shard.name}")
+        else:
+            current, current_tensors = _read_safetensors_header(
+                path, relative_name=shard.name
+            )
+            if (
+                current.size != shard.size
+                or current.header_bytes != shard.header_bytes
+                or current.header_sha256 != shard.header_sha256
+            ):
+                raise ExpertManifestError(f"shard provenance mismatch: {shard.name}")
+            if authoritative:
+                expected = expected_residents_by_shard.get(shard.name, {})
+                actual = {tensor.name: tensor for tensor in current_tensors}
+                if set(actual) != set(expected):
+                    missing = sorted(set(expected) - set(actual))
+                    extra = sorted(set(actual) - set(expected))
+                    raise ExpertManifestError(
+                        "compact resident inventory mismatch in "
+                        f"{shard.name}; missing={missing[:4]}, extra={extra[:4]}"
+                    )
+                for name, tensor in actual.items():
+                    wanted = expected[name]
+                    if (
+                        tensor.shard != wanted.shard
+                        or tensor.offset != wanted.offset
+                        or tensor.length != wanted.length
+                        or tensor.dtype != wanted.dtype
+                        or tensor.shape != wanted.shape
+                    ):
+                        raise ExpertManifestError(
+                            f"compact resident tensor metadata mismatch: {name}"
+                        )
         if verify_shard_hashes:
             if shard.sha256 is None:
                 raise ExpertManifestError(f"shard {shard.name} has no full-file hash")
-            if _hash_file(path) != shard.sha256:
+            current_hash = verified_file_hashes.setdefault(shard.name, _hash_file(path))
+            if current_hash != shard.sha256:
                 raise ExpertManifestError(f"shard hash mismatch: {shard.name}")
         checked_shards += 1
+    if authoritative:
+        index_path = _resolve_member(
+            artifact_root, "model.safetensors.index.json"
+        )
+        index = _expect_object(
+            _load_json_file(index_path), label="compact safetensors index"
+        )
+        _expect_keys(
+            index,
+            label="compact safetensors index",
+            required=("weight_map",),
+            optional=("metadata",),
+        )
+        raw_weight_map = _expect_object(
+            index["weight_map"], label="compact safetensors weight_map"
+        )
+        weight_map = {
+            _string(name, label="compact tensor name"): _safe_relative_name(
+                shard, label="compact tensor shard"
+            )
+            for name, shard in raw_weight_map.items()
+        }
+        expected_weight_map = {
+            tensor.tensor: tensor.shard for tensor in manifest.resident_tensors
+        }
+        if weight_map != expected_weight_map:
+            missing = sorted(set(expected_weight_map) - set(weight_map))
+            extra = sorted(set(weight_map) - set(expected_weight_map))
+            raise ExpertManifestError(
+                "compact safetensors index does not exactly cover residents; "
+                f"missing={missing[:4]}, extra={extra[:4]}"
+            )
+        metadata = index.get("metadata")
+        if isinstance(metadata, dict) and "total_size" in metadata:
+            total_size = _integer(
+                metadata["total_size"],
+                label="compact index metadata total_size",
+            )
+            if total_size != manifest.resident_tensor_bytes:
+                raise ExpertManifestError(
+                    "compact index total_size does not equal resident tensor bytes"
+                )
     checked_records = 0
     if verify_records:
         for record in manifest.records:
@@ -1204,13 +1540,26 @@ def verify_expert_manifest(
                     f"record hash mismatch: ({record.layer}, {record.expert})"
                 )
             checked_records += 1
+    checked_auxiliary_files = 0
+    for auxiliary in manifest.auxiliary_files:
+        verify_auxiliary_file(
+            manifest,
+            artifact_root,
+            auxiliary.role,
+            verify_hash=verify_shard_hashes,
+        )
+        checked_auxiliary_files += 1
     sidecar_verified = False
     if manifest.sidecar is not None:
         sidecar_path = _resolve_member(artifact_root, manifest.sidecar.file)
         if sidecar_path.stat().st_size != manifest.sidecar.size:
             raise ExpertManifestError("sidecar size mismatch")
         if verify_sidecar_hash:
-            if _hash_file(sidecar_path) != manifest.sidecar.sha256:
+            current_hash = verified_file_hashes.get(manifest.sidecar.file)
+            if current_hash is None:
+                current_hash = _hash_file(sidecar_path)
+                verified_file_hashes[manifest.sidecar.file] = current_hash
+            if current_hash != manifest.sidecar.sha256:
                 raise ExpertManifestError("sidecar hash mismatch")
             sidecar_verified = True
     return {
@@ -1218,6 +1567,7 @@ def verify_expert_manifest(
         "model_key": manifest.model_key,
         "checked_shards": checked_shards,
         "checked_records": checked_records,
+        "checked_auxiliary_files": checked_auxiliary_files,
         "sidecar_verified": sidecar_verified,
     }
 
@@ -1317,22 +1667,28 @@ def build_expert_sidecar(
     try:
         for record in manifest.records:
             offset = _align_up(cursor, alignment)
-            payload = read_expert_record(
-                manifest,
-                artifact_root,
-                record.layer,
-                record.expert,
-                prefer_sidecar=False,
-                verify_hash=record.sha256 is not None,
-            )
-            digest = _sha256_bytes(payload)
             current_size = os.fstat(fd).st_size
             reusable = False
-            if resume and current_size >= offset + len(payload):
+            digest = record.sha256
+            if (
+                resume
+                and digest is not None
+                and current_size >= offset + record.logical_bytes
+            ):
                 reusable = (
-                    _sha256_bytes(_pread_exact(fd, offset, len(payload))) == digest
+                    _sha256_bytes(_pread_exact(fd, offset, record.logical_bytes))
+                    == digest
                 )
             if not reusable:
+                payload = read_expert_record(
+                    manifest,
+                    artifact_root,
+                    record.layer,
+                    record.expert,
+                    prefer_sidecar=False,
+                    verify_hash=record.sha256 is not None,
+                )
+                digest = _sha256_bytes(payload)
                 os.ftruncate(fd, offset)
                 if offset > os.fstat(fd).st_size:
                     os.ftruncate(fd, offset)
@@ -1352,10 +1708,10 @@ def build_expert_sidecar(
                     record,
                     sha256=digest,
                     sidecar_offset=offset,
-                    sidecar_length=len(payload),
+                    sidecar_length=record.logical_bytes,
                 )
             )
-            cursor = offset + len(payload)
+            cursor = offset + record.logical_bytes
         os.ftruncate(fd, cursor)
         os.fsync(fd)
     except (OSError, ExpertManifestError) as exc:
@@ -1388,6 +1744,72 @@ def build_expert_sidecar(
     ).with_digest()
     updated.validate_structure()
     return updated
+
+
+def make_sidecar_authoritative(manifest: ExpertManifest) -> ExpertManifest:
+    """Rebase expert segments onto ``experts.bin`` for a compact artifact.
+
+    The returned manifest preserves source provenance and logical tensor
+    metadata, retains only safetensors shards needed by resident tensors, and
+    records the sidecar as a hash-pinned shard.  The source files themselves
+    are never deleted.
+    """
+
+    manifest.validate_structure()
+    if manifest.sidecar is None:
+        raise ExpertManifestError(
+            "an existing sidecar is required before it can become authoritative"
+        )
+
+    sidecar = manifest.sidecar
+    resident_shard_names = {tensor.shard for tensor in manifest.resident_tensors}
+    if sidecar.file in resident_shard_names:
+        raise ExpertManifestError(
+            "sidecar file cannot also contain resident safetensors tensors"
+        )
+    resident_shards = tuple(
+        shard
+        for shard in manifest.shards
+        if shard.name in resident_shard_names and shard.kind == "safetensors"
+    )
+    found_resident_shards = {shard.name for shard in resident_shards}
+    if found_resident_shards != resident_shard_names:
+        missing = sorted(resident_shard_names - found_resident_shards)
+        raise ExpertManifestError(
+            f"resident tensors reference missing safetensors shards: {missing[:4]}"
+        )
+
+    authoritative_records: list[ExpertRecord] = []
+    for record in manifest.records:
+        if record.sidecar_offset is None or record.sidecar_length is None:
+            raise ExpertManifestError("every record requires a sidecar offset")
+        offset = record.sidecar_offset
+        segments: list[TensorSegment] = []
+        for segment in record.segments:
+            segments.append(replace(segment, shard=sidecar.file, offset=offset))
+            offset += segment.length
+        if offset != record.sidecar_offset + record.sidecar_length:
+            raise ExpertManifestError(
+                f"record ({record.layer}, {record.expert}) sidecar layout mismatch"
+            )
+        authoritative_records.append(replace(record, segments=tuple(segments)))
+
+    sidecar_shard = ShardInfo(
+        name=sidecar.file,
+        size=sidecar.size,
+        header_bytes=0,
+        header_sha256=EMPTY_SHA256,
+        sha256=sidecar.sha256,
+        kind="sidecar",
+    )
+    authoritative = replace(
+        manifest,
+        shards=(*resident_shards, sidecar_shard),
+        records=tuple(authoritative_records),
+        manifest_sha256=None,
+    ).with_digest()
+    authoritative.validate_structure()
+    return authoritative
 
 
 def iter_record_keys(manifest: ExpertManifest) -> Iterator[tuple[int, int]]:

@@ -14,6 +14,10 @@ head is packaged separately from the official tencent/Hy3 BF16 weights:
     layer80-q4.safetensors           192 routed experts in the pinned affine
                                      Q4/gs64 expert segment format
                                      (scripts/quantize_mtp_layer80.py)
+    expert-manifest.json + experts.bin
+                                     compact native artifacts store those same
+                                     layer-80 records in the shared sidecar,
+                                     without duplicating layer80-q4.safetensors
 
 The default precision is ``bf16``: docs/FORGE_BACKEND_CONTRACT.md section 6
 documents that quantizing MTP weights collapses MoE acceptance to 5-11%
@@ -36,6 +40,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 HY3_MTP_SOURCE_REPO = "tencent/Hy3"
@@ -43,6 +49,7 @@ HY3_MTP_SOURCE_REVISION = "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
 HY3_MTP_BF16_FILE = "layer80-bf16.safetensors"
 HY3_MTP_RESIDENTS_FILE = "layer80-residents-q.safetensors"
 HY3_MTP_EXPERTS_FILE = "layer80-q4.safetensors"
+HY3_MTP_MANIFEST_FILES = ("expert-manifest.json", "expert-manifest-sidecar.json")
 HY3_MTP_PRECISIONS = ("bf16", "q4")
 # Forge contract section 6: quantized MTP heads collapse acceptance, so the
 # bit-exact BF16 head is the default despite its larger resident footprint.
@@ -166,12 +173,187 @@ def _validate_leaf_dtype(name: str, value: Any, mx: Any) -> None:
             raise Hy3MTPLoadError(f"{name} must be float32, found {value.dtype}")
     elif name.endswith(".weight"):
         base = name.rsplit(".", 1)[0]
-        quantized = any(
-            base.endswith(candidate) for candidate in _QUANTIZED_RESIDENT_BASES
-        ) or ".mlp.experts." in name
+        quantized = (
+            any(base.endswith(candidate) for candidate in _QUANTIZED_RESIDENT_BASES)
+            or ".mlp.experts." in name
+        )
         wanted = mx.uint32 if quantized else mx.bfloat16
         if value.dtype != wanted:
             raise Hy3MTPLoadError(f"{name} must be {wanted}, found {value.dtype}")
+
+
+def _native_manifest_path(artifact_dir: Path) -> Path | None:
+    for filename in HY3_MTP_MANIFEST_FILES:
+        candidate = artifact_dir / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _verify_manifest_bound_bf16_head(
+    artifact_dir: Path,
+    *,
+    expected_revision: str,
+) -> None:
+    manifest_path = _native_manifest_path(artifact_dir)
+    if manifest_path is None:
+        return
+    from .expert_manifest import (
+        ExpertManifestError,
+        load_expert_manifest,
+        verify_auxiliary_file,
+    )
+
+    try:
+        manifest = load_expert_manifest(manifest_path)
+        info = verify_auxiliary_file(
+            manifest,
+            artifact_dir,
+            "mtp-bf16",
+            verify_hash=True,
+        )
+    except ExpertManifestError as exc:
+        raise Hy3MTPLoadError(f"invalid manifest-bound BF16 MTP head: {exc}") from exc
+    if info.file != HY3_MTP_BF16_FILE:
+        raise Hy3MTPLoadError(
+            f"BF16 MTP manifest points to {info.file!r}; "
+            f"expected {HY3_MTP_BF16_FILE!r}"
+        )
+    if info.source_repo != HY3_MTP_SOURCE_REPO:
+        raise Hy3MTPLoadError(
+            f"BF16 MTP source {info.source_repo!r}; expected {HY3_MTP_SOURCE_REPO!r}"
+        )
+    if info.source_revision != expected_revision:
+        raise Hy3MTPLoadError(
+            f"BF16 MTP revision {info.source_revision!r}; "
+            f"expected {expected_revision!r}"
+        )
+
+
+def _array_from_record_bytes(
+    payload: bytes,
+    *,
+    dtype: str,
+    shape: tuple[int, ...],
+    mx: Any,
+) -> Any:
+    if dtype == "U32":
+        host_dtype = np.dtype("<u4")
+        mlx_dtype = None
+    elif dtype == "BF16":
+        host_dtype = np.dtype("<u2")
+        mlx_dtype = mx.bfloat16
+    else:
+        raise Hy3MTPLoadError(f"unsupported compact expert dtype {dtype!r}")
+
+    expected_bytes = host_dtype.itemsize
+    for dimension in shape:
+        expected_bytes *= int(dimension)
+    if len(payload) != expected_bytes:
+        raise Hy3MTPLoadError(
+            f"compact expert {dtype} segment has {len(payload)} bytes for "
+            f"shape {shape}; expected {expected_bytes}"
+        )
+
+    host = np.frombuffer(payload, dtype=host_dtype).copy()
+    if mlx_dtype is None:
+        value = mx.array(host)
+    else:
+        value = mx.array(host).view(mx.bfloat16)
+    return value.reshape(shape)
+
+
+def _load_compact_expert_tensors(
+    artifact_dir: Path,
+    args: Any,
+    *,
+    expected_revision: str,
+    mx: Any,
+) -> dict[str, Any]:
+    """Reconstruct layer-80 Q4 leaves from the shared expert sidecar."""
+
+    from .expert_manifest import (
+        ExpertManifestError,
+        load_expert_manifest,
+        read_expert_record,
+    )
+
+    manifest_path = _native_manifest_path(artifact_dir)
+    if manifest_path is None:
+        raise Hy3MTPLoadError(
+            "missing Hy3 MTP artifact "
+            f"{artifact_dir / HY3_MTP_EXPERTS_FILE} and compact expert manifest"
+        )
+    try:
+        manifest = load_expert_manifest(manifest_path)
+    except ExpertManifestError as exc:
+        raise Hy3MTPLoadError(f"invalid compact expert manifest: {exc}") from exc
+    if manifest.source_repo != HY3_MTP_SOURCE_REPO:
+        raise Hy3MTPLoadError(
+            f"compact manifest source {manifest.source_repo!r}; "
+            f"expected {HY3_MTP_SOURCE_REPO!r}"
+        )
+    if manifest.source_revision != expected_revision:
+        raise Hy3MTPLoadError(
+            f"compact manifest revision {manifest.source_revision!r}; "
+            f"expected {expected_revision!r}"
+        )
+    if manifest.quant_group_size != 64:
+        raise Hy3MTPLoadError(
+            f"compact manifest group size {manifest.quant_group_size}; expected 64"
+        )
+    if manifest.sidecar is None:
+        raise Hy3MTPLoadError("compact expert manifest has no sidecar")
+
+    prefix = _layer_prefix(args)
+    layer = int(args.num_hidden_layers)
+    tensors: dict[str, Any] = {}
+    expected_components = tuple(
+        f"{projection}.{leaf}"
+        for projection in _EXPERT_PROJECTIONS
+        for leaf in _QUANT_LEAVES
+    )
+    for expert in range(int(args.num_experts)):
+        try:
+            record = manifest.record(layer, expert)
+            payload = read_expert_record(
+                manifest,
+                artifact_dir,
+                layer,
+                expert,
+                prefer_sidecar=True,
+                verify_hash=True,
+            )
+        except ExpertManifestError as exc:
+            raise Hy3MTPLoadError(
+                f"could not read compact MTP expert ({layer}, {expert}): {exc}"
+            ) from exc
+        components = tuple(segment.component for segment in record.segments)
+        if components != expected_components:
+            raise Hy3MTPLoadError(
+                f"compact MTP expert {expert} has unexpected component order"
+            )
+        cursor = 0
+        for segment in record.segments:
+            end = cursor + segment.length
+            if end > len(payload):
+                raise Hy3MTPLoadError(
+                    f"compact MTP expert {expert} has a truncated {segment.component}"
+                )
+            projection, leaf = segment.component.split(".", 1)
+            name = f"{prefix}mlp.experts.{expert}.{projection}.{leaf}"
+            tensors[name] = _array_from_record_bytes(
+                payload[cursor:end],
+                dtype=segment.dtype,
+                shape=segment.shape,
+                mx=mx,
+            )
+            cursor = end
+        if cursor != len(payload):
+            raise Hy3MTPLoadError(
+                f"compact MTP expert {expert} has trailing record bytes"
+            )
+    return tensors
 
 
 def load_hy3_mtp_weights(
@@ -183,10 +365,10 @@ def load_hy3_mtp_weights(
 ) -> dict[str, Any]:
     """Read and validate both layer-80 artifacts into module-path weights.
 
-    Residents come only from the residents artifact and routed experts only
-    from the expert artifact (whose BF16 resident pass-through copies are
-    ignored).  Expert projections are stacked into ``switch_mlp`` tensors of
-    shape ``[num_experts, ...]``.
+    Residents come only from the residents artifact. Routed experts come from
+    ``layer80-q4.safetensors`` when present, otherwise from the layer-80 records
+    in the compact native expert sidecar. Expert projections are stacked into
+    ``switch_mlp`` tensors of shape ``[num_experts, ...]``.
     """
 
     if mx_module is None:
@@ -196,10 +378,9 @@ def load_hy3_mtp_weights(
     artifact_dir = Path(artifact_dir).expanduser().resolve()
     residents_path = artifact_dir / HY3_MTP_RESIDENTS_FILE
     experts_path = artifact_dir / HY3_MTP_EXPERTS_FILE
-    for path in (residents_path, experts_path):
-        if not path.exists():
-            raise Hy3MTPLoadError(f"missing Hy3 MTP artifact {path}")
-        _require_revision(path, expected_revision)
+    if not residents_path.exists():
+        raise Hy3MTPLoadError(f"missing Hy3 MTP artifact {residents_path}")
+    _require_revision(residents_path, expected_revision)
 
     prefix = _layer_prefix(args)
     mapped: dict[str, Any] = {}
@@ -218,9 +399,18 @@ def load_hy3_mtp_weights(
         )
     for name, value in residents.items():
         _validate_leaf_dtype(name, value, mx)
-        mapped["layers.0." + _resident_target(name[len(prefix):])] = value
+        mapped["layers.0." + _resident_target(name[len(prefix) :])] = value
 
-    experts = mx.load(str(experts_path), format="safetensors")
+    if experts_path.is_file():
+        _require_revision(experts_path, expected_revision)
+        experts = mx.load(str(experts_path), format="safetensors")
+    else:
+        experts = _load_compact_expert_tensors(
+            artifact_dir,
+            args,
+            expected_revision=expected_revision,
+            mx=mx,
+        )
     expected_experts = expected_expert_names(args)
     missing = expected_experts - set(experts)
     if missing:
@@ -228,9 +418,7 @@ def load_hy3_mtp_weights(
             f"{experts_path.name} is missing expert tensors: {sorted(missing)[:4]}"
         )
     unexpected = {
-        name
-        for name in set(experts) - expected_experts
-        if ".mlp.experts." in name
+        name for name in set(experts) - expected_experts if ".mlp.experts." in name
     }
     if unexpected:
         raise Hy3MTPLoadError(
@@ -253,8 +441,8 @@ def load_hy3_mtp_weights(
                         f"{name} shape {shape} differs from expert 0 {reference}"
                     )
                 values.append(value)
-            mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.{leaf}"] = (
-                mx.stack(values)
+            mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.{leaf}"] = mx.stack(
+                values
             )
     return mapped
 
@@ -280,6 +468,10 @@ def load_hy3_mtp_bf16_weights(
         mx = mx_module
     artifact_dir = Path(artifact_dir).expanduser().resolve()
     path = artifact_dir / HY3_MTP_BF16_FILE
+    _verify_manifest_bound_bf16_head(
+        artifact_dir,
+        expected_revision=expected_revision,
+    )
     if not path.exists():
         raise Hy3MTPLoadError(f"missing Hy3 MTP artifact {path}")
     _require_revision(path, expected_revision)
@@ -290,9 +482,7 @@ def load_hy3_mtp_bf16_weights(
     missing = expected - set(tensors)
     extra = set(tensors) - expected
     if missing:
-        raise Hy3MTPLoadError(
-            f"{path.name} is missing tensors: {sorted(missing)[:4]}"
-        )
+        raise Hy3MTPLoadError(f"{path.name} is missing tensors: {sorted(missing)[:4]}")
     if extra:
         raise Hy3MTPLoadError(
             f"{path.name} has unexpected tensors: {sorted(extra)[:4]}"
@@ -306,7 +496,7 @@ def load_hy3_mtp_bf16_weights(
         elif value.dtype != mx.bfloat16:
             raise Hy3MTPLoadError(f"{name} must be bfloat16, found {value.dtype}")
         if ".mlp.experts." not in name:
-            mapped["layers.0." + _resident_target(name[len(prefix):])] = value
+            mapped["layers.0." + _resident_target(name[len(prefix) :])] = value
 
     num_experts = int(args.num_experts)
     for projection in _EXPERT_PROJECTIONS:
@@ -323,8 +513,8 @@ def load_hy3_mtp_bf16_weights(
                     f"{name} shape {shape} differs from expert 0 {reference}"
                 )
             values.append(value)
-        mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.weight"] = (
-            mx.stack(values)
+        mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.weight"] = mx.stack(
+            values
         )
     return mapped
 
@@ -353,8 +543,7 @@ def _quantization_spec_for(
     derived_group, remainder = divmod(logical_in, int(scales.shape[-1]))
     if remainder or derived_group != group_size:
         raise Hy3MTPLoadError(
-            f"{path}.scales implies group size {derived_group}; "
-            f"expected {group_size}"
+            f"{path}.scales implies group size {derived_group}; expected {group_size}"
         )
     return {"bits": bits, "group_size": group_size, "mode": "affine"}
 
@@ -401,9 +590,7 @@ def build_hy3_mtp_module(
         mtp = Hy3MTP(args, num_mtp_layers=1)
 
         def class_predicate(path: str, module: Any) -> bool | dict[str, Any]:
-            return _quantization_spec_for(
-                path, module, weights, group_size=group_size
-            )
+            return _quantization_spec_for(path, module, weights, group_size=group_size)
 
         nn.quantize(
             mtp,
