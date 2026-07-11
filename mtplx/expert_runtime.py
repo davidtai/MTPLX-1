@@ -17,7 +17,12 @@ from .expert_manifest import (
     load_expert_manifest,
     verify_expert_manifest,
 )
-from .expert_slots import ExpertSlotError, ExpertSlotPool, ReadyRoute
+from .expert_slots import (
+    ExpertSlotError,
+    ExpertSlotPool,
+    ProjectionReadyRoute,
+    ReadyRoute,
+)
 from .expert_streaming import (
     CacheCounters,
     GlobalExpertSlotBank,
@@ -289,6 +294,7 @@ class PendingSplitRoute:
         self.hit_ready = hit_ready
         self._miss_future = miss_future
         self._miss_ready: ReadyRoute | None = None
+        self._gate_up_ready: ProjectionReadyRoute | None = None
         self._layer_lock = layer_lock
         self._closed = False
 
@@ -296,6 +302,37 @@ class PendingSplitRoute:
         if self.hit_ready is not None:
             self.hit_ready.release(synchronize=False)
             self.hit_ready = None
+
+    @property
+    def misses_pending(self) -> bool:
+        return self._miss_future is not None and not self._miss_future.done()
+
+    def finish_gate_up(self) -> ProjectionReadyRoute | None:
+        """Wait only for trusted gate/up bytes, leaving down I/O in flight."""
+
+        if self._gate_up_ready is not None:
+            return self._gate_up_ready
+        future = self._miss_future
+        if (
+            future is None
+            or future.done()
+            or not self.runtime.slots.progressive_component_reads
+        ):
+            return None
+        miss_plan = self.runtime._subset_route_plan(self.plan, hits=False)
+        if miss_plan is None:
+            return None
+        self._gate_up_ready = self.runtime.slots.wait_projection_route(
+            self.layer,
+            miss_plan,
+            load_future=future,
+        )
+        return self._gate_up_ready
+
+    def release_gate_up(self) -> None:
+        if self._gate_up_ready is not None:
+            self._gate_up_ready.release()
+            self._gate_up_ready = None
 
     def finish_misses(self) -> ReadyRoute | None:
         if self._miss_ready is not None:
@@ -305,6 +342,7 @@ class PendingSplitRoute:
         try:
             self._miss_ready = self._miss_future.result()
         except BaseException:
+            self.release_gate_up()
             self.runtime._rollback_route_loads(self.layer, self.plan)
             raise
         finally:
@@ -324,6 +362,7 @@ class PendingSplitRoute:
             if self._miss_ready is not None:
                 self._miss_ready.release(synchronize=False)
                 self._miss_ready = None
+            self.release_gate_up()
         finally:
             self._closed = True
             self._layer_lock.release()
@@ -559,6 +598,10 @@ class ExpertStreamingRuntime:
                 ),
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
+                progressive_component_reads=(
+                    config.slot_layout == "component-banks"
+                    and config.verify_sidecar_hash_at_open
+                ),
             )
         except Exception:
             reader.close()

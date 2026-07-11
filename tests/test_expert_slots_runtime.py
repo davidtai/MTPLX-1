@@ -21,6 +21,7 @@ from mtplx.expert_manifest import (
     ResidentTensor,
     ShardInfo,
     TensorSegment,
+    build_expert_sidecar,
     save_expert_manifest,
 )
 from mtplx.expert_runtime import (
@@ -168,6 +169,24 @@ def _plan(spec: ExpertStreamingModelSpec):
     )
 
 
+class _ComponentDestination:
+    def __init__(self, record: ExpertRecord) -> None:
+        self.nbytes = record.logical_bytes
+        self._components = {
+            segment.component: bytearray(segment.length)
+            for segment in record.segments
+        }
+
+    def record_views(self, record: ExpertRecord) -> tuple[memoryview, ...]:
+        return tuple(
+            memoryview(self._components[segment.component])
+            for segment in record.segments
+        )
+
+    def component_view(self, component: str) -> memoryview:
+        return memoryview(self._components[component])
+
+
 def test_positional_reader_fills_and_hashes_source_record(tmp_path: Path) -> None:
     root, _spec_value, manifest, expected = _artifact(tmp_path)
     destination = bytearray(manifest.records[0].logical_bytes)
@@ -182,6 +201,232 @@ def test_positional_reader_fills_and_hashes_source_record(tmp_path: Path) -> Non
     assert metrics["read_operations"] == 9
     assert metrics["read_bytes"] == len(destination)
     assert metrics["open_files_peak"] == 1
+
+
+def test_projection_reader_publishes_gate_up_before_down(
+    tmp_path: Path,
+) -> None:
+    root, _spec_value, source_manifest, expected = _artifact(tmp_path)
+    manifest = build_expert_sidecar(
+        source_manifest,
+        root,
+        root / "experts.bin",
+    )
+    record = manifest.records[0]
+    destination = _ComponentDestination(record)
+    callback_snapshots: list[tuple[bytes, bytes]] = []
+
+    with PositionalExpertReader(root, use_native=False) as reader:
+        with pytest.raises(ExpertIOIntegrityError, match="verified sidecar"):
+            reader.read_record_projection_pipeline_into(
+                manifest,
+                record,
+                destination,
+                verified_sidecar=False,
+                on_gate_up_ready=lambda: None,
+            )
+        digest = reader.read_record_projection_pipeline_into(
+            manifest,
+            record,
+            destination,
+            verified_sidecar=True,
+            on_gate_up_ready=lambda: callback_snapshots.append(
+                (
+                    bytes(destination.component_view("up_proj.biases")),
+                    bytes(destination.component_view("down_proj.weight")),
+                )
+            ),
+        )
+        metrics = reader.metrics.as_dict()
+
+    assert digest == "unverified"
+    assert callback_snapshots == [
+        (
+            bytes([6]) * 128,
+            bytes(2_048),
+        )
+    ]
+    assert b"".join(
+        bytes(destination.component_view(segment.component))
+        for segment in record.segments
+    ) == expected[0]
+    assert metrics["record_requests"] == 1
+    assert metrics["sidecar_record_requests"] == 1
+    assert metrics["read_operations"] == 2
+
+
+def test_projection_slot_route_is_available_while_down_read_is_blocked(
+    tmp_path: Path,
+) -> None:
+    root, spec, source_manifest, expected = _artifact(tmp_path)
+    manifest = build_expert_sidecar(
+        source_manifest,
+        root,
+        root / "experts.bin",
+    )
+    plan = _plan(spec)
+    record = manifest.records[0]
+    reader = PositionalExpertReader(root, use_native=False)
+    original_readv = reader._readv_range_into
+    down_started = threading.Event()
+    allow_down = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def controlled_readv(*args, **kwargs) -> None:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call = calls
+        if call == 2:
+            down_started.set()
+            assert allow_down.wait(timeout=2)
+        original_readv(*args, **kwargs)
+
+    reader._readv_range_into = controlled_readv
+
+    def allocate(_size: int, _label: str) -> _ComponentDestination:
+        return _ComponentDestination(record)
+
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        reader,
+        buffer_allocator=allocate,
+        verify_hashes=False,
+        progressive_component_reads=True,
+    )
+    route_plan = _manual_plan(0, plan.slots_per_layer)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(pool.ensure_route, 1, route_plan)
+            projection = pool.wait_projection_route(
+                1,
+                route_plan,
+                load_future=pending,
+            )
+            assert down_started.wait(timeout=2)
+            assert pending.done() is False
+            projection.validate()
+            binding = projection.bindings[0]
+            assert bytes(binding.component_view("gate_proj.weight")) == (
+                bytes([1]) * 2_048
+            )
+            assert bytes(binding.component_view("down_proj.weight")) == bytes(2_048)
+
+            allow_down.set()
+            ready = pending.result(timeout=2)
+        projection.validate()
+        projection.release()
+        assert bytes(ready.bindings[0].buffer.component_view("down_proj.weight")) == (
+            bytes([7]) * 2_048
+        )
+        ready.release(synchronize=False)
+        snapshot = pool.snapshot()
+        assert snapshot["progressive_component_reads"] is True
+        assert snapshot["metrics"]["progressive_loads"] == 1
+        assert snapshot["metrics"]["projection_ready_routes"] == 1
+        assert snapshot["io"]["read_operations"] == 2
+        assert b"".join(
+            bytes(ready.bindings[0].component_view(segment.component))
+            for segment in record.segments
+        ) == expected[0]
+    finally:
+        allow_down.set()
+        pool.close()
+
+
+def test_projection_slot_pool_rejects_record_hashing_mode(tmp_path: Path) -> None:
+    root, spec, source_manifest, _expected = _artifact(tmp_path)
+    manifest = build_expert_sidecar(
+        source_manifest,
+        root,
+        root / "experts.bin",
+    )
+    reader = PositionalExpertReader(root, use_native=False)
+    try:
+        with pytest.raises(ValueError, match="without per-record hashing"):
+            ExpertSlotPool(
+                spec,
+                _plan(spec),
+                manifest,
+                reader,
+                progressive_component_reads=True,
+                verify_hashes=True,
+            )
+    finally:
+        reader.close()
+
+
+def test_projection_down_failure_never_publishes_a_ready_route(
+    tmp_path: Path,
+) -> None:
+    root, spec, source_manifest, _expected = _artifact(tmp_path)
+    manifest = build_expert_sidecar(
+        source_manifest,
+        root,
+        root / "experts.bin",
+    )
+    plan = _plan(spec)
+    record = manifest.records[0]
+    reader = PositionalExpertReader(root, use_native=False)
+    original_readv = reader._readv_range_into
+    fail_down = threading.Event()
+    down_started = threading.Event()
+    calls = 0
+
+    def failing_readv(*args, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            down_started.set()
+            assert fail_down.wait(timeout=2)
+            raise ExpertIOError("injected down-projection read failure")
+        original_readv(*args, **kwargs)
+
+    reader._readv_range_into = failing_readv
+
+    def allocate(_size: int, _label: str) -> _ComponentDestination:
+        return _ComponentDestination(record)
+
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        reader,
+        buffer_allocator=allocate,
+        verify_hashes=False,
+        progressive_component_reads=True,
+    )
+    route_plan = _manual_plan(0, plan.slots_per_layer)
+    projection = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(pool.ensure_route, 1, route_plan)
+            projection = pool.wait_projection_route(
+                1,
+                route_plan,
+                load_future=pending,
+            )
+            projection.validate()
+            assert down_started.wait(timeout=2)
+            fail_down.set()
+            with pytest.raises(ExpertSlotError, match="injected down-projection"):
+                pending.result(timeout=2)
+        projection.release()
+        projection = None
+        snapshot = pool.snapshot()
+        assert snapshot["states"]["ready"] == 0
+        assert snapshot["states"]["failed"] == 1
+        assert snapshot["pins"] == 0
+        assert snapshot["metrics"]["load_failures"] == 1
+        assert snapshot["metrics"]["active_routes"] == 0
+    finally:
+        fail_down.set()
+        if projection is not None:
+            projection.release()
+        pool.close()
 
 
 def test_native_backend_failure_is_normalized_and_counted(tmp_path: Path) -> None:

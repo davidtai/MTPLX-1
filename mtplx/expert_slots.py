@@ -41,6 +41,9 @@ class ExpertSlotMetrics:
     generation_replacements: int = 0
     pin_waits: int = 0
     load_waits: int = 0
+    progressive_loads: int = 0
+    projection_ready_routes: int = 0
+    projection_waits: int = 0
     active_routes: int = 0
     active_routes_peak: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -65,6 +68,9 @@ class ExpertSlotMetrics:
                     "generation_replacements",
                     "pin_waits",
                     "load_waits",
+                    "progressive_loads",
+                    "projection_ready_routes",
+                    "projection_waits",
                     "active_routes",
                     "active_routes_peak",
                 )
@@ -82,6 +88,7 @@ class _PhysicalSlot:
     pins: int = 0
     digest: str | None = None
     error: BaseException | None = None
+    gate_up_ready: bool = False
     condition: threading.Condition = field(default_factory=threading.Condition)
 
 
@@ -177,6 +184,57 @@ class ReadyRoute:
         self.release()
 
 
+class ProjectionReadyRoute:
+    """Generation-pinned bindings whose gate/up components are complete."""
+
+    def __init__(
+        self,
+        pool: ExpertSlotPool,
+        bindings: tuple[ExpertSlotBinding, ...],
+        pinned: tuple[_PhysicalSlot, ...],
+    ) -> None:
+        self.pool = pool
+        self.bindings = bindings
+        self._pinned = pinned
+        self._released = False
+
+    def validate(self) -> None:
+        if self._released:
+            raise ExpertSlotError("projection-ready route has already been released")
+        for binding, slot in zip(self.bindings, self._binding_slots(), strict=True):
+            with slot.condition:
+                if (
+                    slot.state
+                    not in {ExpertSlotState.LOADING, ExpertSlotState.READY}
+                    or not slot.gate_up_ready
+                    or slot.layer != binding.layer
+                    or slot.expert != binding.expert
+                    or slot.generation != binding.generation
+                ):
+                    raise ExpertSlotError(
+                        "projection-ready route references a stale slot generation"
+                    )
+
+    def _binding_slots(self) -> tuple[_PhysicalSlot, ...]:
+        return tuple(
+            self.pool._physical(binding.layer, binding.logical_slot)
+            for binding in self.bindings
+        )
+
+    def release(self, *, synchronize: bool = True) -> None:
+        if self._released:
+            return
+        if synchronize and self.pool.device_synchronize is not None:
+            self.pool.device_synchronize()
+        for slot in self._pinned:
+            with slot.condition:
+                if slot.pins <= 0:
+                    raise ExpertSlotError("slot pin accounting underflow")
+                slot.pins -= 1
+                slot.condition.notify_all()
+        self._released = True
+
+
 class _CombinedCancel:
     def __init__(
         self, external: threading.Event | None, internal: threading.Event
@@ -206,6 +264,7 @@ class ExpertSlotPool:
         verify_hashes: bool = True,
         device_synchronize: Callable[[], None] | None = None,
         cache_scope: str = "layer",
+        progressive_component_reads: bool = False,
     ) -> None:
         if plan.model_key != spec.key or manifest.model_key != spec.key:
             raise ValueError("spec, memory plan, and manifest model keys must match")
@@ -235,6 +294,16 @@ class ExpertSlotPool:
         self.prefer_sidecar = prefer_sidecar
         self.verify_hashes = verify_hashes
         self.device_synchronize = device_synchronize
+        if not isinstance(progressive_component_reads, bool):
+            raise TypeError("progressive_component_reads must be bool")
+        if progressive_component_reads and (
+            verify_hashes or not prefer_sidecar or manifest.sidecar is None
+        ):
+            raise ValueError(
+                "progressive component reads require trusted sidecar reads "
+                "without per-record hashing"
+            )
+        self.progressive_component_reads = progressive_component_reads
         if cache_scope not in {"layer", "global"}:
             raise ValueError("cache_scope must be 'layer' or 'global'")
         self.cache_scope = cache_scope
@@ -413,10 +482,28 @@ class ExpertSlotPool:
                 slot.state = ExpertSlotState.LOADING
                 slot.digest = None
                 slot.error = None
+                slot.gate_up_ready = False
                 if replacing:
                     self.metrics.update(generation_replacements=1)
                 self.metrics.update(owned_loads=1)
+                slot.condition.notify_all()
                 return slot, slot.generation, True
+
+    @staticmethod
+    def _publish_gate_up_ready(
+        slot: _PhysicalSlot,
+        generation: int,
+    ) -> None:
+        with slot.condition:
+            if (
+                slot.generation != generation
+                or slot.state is not ExpertSlotState.LOADING
+            ):
+                raise ExpertSlotError(
+                    "slot generation changed during a progressive expert read"
+                )
+            slot.gate_up_ready = True
+            slot.condition.notify_all()
 
     def _fill(
         self,
@@ -426,17 +513,33 @@ class ExpertSlotPool:
         *,
         cancel_event: Any,
         deadline_ns: int | None,
+        progressive: bool = False,
     ) -> None:
         try:
-            digest = self.reader.read_record_into(
-                self.manifest,
-                record,
-                slot.buffer,
-                prefer_sidecar=self.prefer_sidecar,
-                verify_hash=self.verify_hashes,
-                cancel_event=cancel_event,
-                deadline_ns=deadline_ns,
-            )
+            if progressive:
+                self.metrics.update(progressive_loads=1)
+                digest = self.reader.read_record_projection_pipeline_into(
+                    self.manifest,
+                    record,
+                    slot.buffer,
+                    verified_sidecar=True,
+                    on_gate_up_ready=lambda: self._publish_gate_up_ready(
+                        slot,
+                        generation,
+                    ),
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                )
+            else:
+                digest = self.reader.read_record_into(
+                    self.manifest,
+                    record,
+                    slot.buffer,
+                    prefer_sidecar=self.prefer_sidecar,
+                    verify_hash=self.verify_hashes,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                )
         except BaseException as exc:
             with slot.condition:
                 if (
@@ -455,6 +558,7 @@ class ExpertSlotPool:
             ):
                 raise ExpertSlotError("slot generation changed during an expert read")
             slot.digest = digest
+            slot.gate_up_ready = True
             slot.state = ExpertSlotState.READY
             slot.error = None
             slot.condition.notify_all()
@@ -496,6 +600,7 @@ class ExpertSlotPool:
                         "slot generation changed during a batched expert read"
                     )
                 slot.digest = digest
+                slot.gate_up_ready = True
                 slot.state = ExpertSlotState.READY
                 slot.error = None
                 slot.condition.notify_all()
@@ -549,6 +654,92 @@ class ExpertSlotPool:
                 raise ExpertSlotError(
                     "expert slot did not reach the requested generation"
                 )
+
+    def wait_projection_route(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        *,
+        load_future: Future[ReadyRoute],
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+    ) -> ProjectionReadyRoute:
+        """Pin a miss route once gate/up bytes are safe for Metal execution."""
+
+        if not self.progressive_component_reads:
+            raise ExpertSlotError("projection pipeline is not enabled")
+        bindings: list[ExpertSlotBinding] = []
+        unique_pins: dict[int, _PhysicalSlot] = {}
+        try:
+            for expert, logical_slot in zip(plan.experts, plan.slots, strict=True):
+                slot = self._physical(layer, logical_slot)
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ExpertSlotError("projection-ready wait was cancelled")
+                    with slot.condition:
+                        matching = slot.layer == layer and slot.expert == expert
+                        if (
+                            matching
+                            and slot.gate_up_ready
+                            and slot.state
+                            in {ExpertSlotState.LOADING, ExpertSlotState.READY}
+                        ):
+                            generation = slot.generation
+                            if id(slot) not in unique_pins:
+                                slot.pins += 1
+                                unique_pins[id(slot)] = slot
+                            break
+                        if matching and slot.state is ExpertSlotState.FAILED:
+                            if slot.error is not None:
+                                raise ExpertSlotError(
+                                    f"expert projection load failed for "
+                                    f"({layer}, {expert}): {slot.error}"
+                                ) from slot.error
+                            raise ExpertSlotError("expert projection load failed")
+                        if slot.state is ExpertSlotState.CLOSED or self._closed:
+                            raise ExpertSlotError("expert slot pool is closed")
+                        wait_seconds = self._remaining(deadline_ns)
+                        # A manifest lookup can fail before a physical slot is
+                        # prepared and notified. Poll the coordinator future so
+                        # such errors still fail closed instead of hanging.
+                        if wait_seconds is None:
+                            wait_seconds = 0.01
+                        else:
+                            wait_seconds = min(wait_seconds, 0.01)
+                        self.metrics.update(projection_waits=1)
+                        slot.condition.wait(wait_seconds)
+                    if load_future.done():
+                        error = load_future.exception()
+                        if error is not None:
+                            raise error
+                try:
+                    record = self._record_map[(layer, expert)]
+                except KeyError as exc:
+                    raise ExpertSlotError(
+                        f"manifest has no expert record ({layer}, {expert})"
+                    ) from exc
+                bindings.append(
+                    ExpertSlotBinding(
+                        layer=layer,
+                        expert=expert,
+                        logical_slot=logical_slot,
+                        generation=generation,
+                        record=record,
+                        buffer=slot.buffer,
+                    )
+                )
+        except BaseException:
+            for slot in unique_pins.values():
+                with slot.condition:
+                    slot.pins -= 1
+                    slot.condition.notify_all()
+            raise
+        self.metrics.update(projection_ready_routes=1)
+        return ProjectionReadyRoute(
+            self,
+            tuple(bindings),
+            tuple(unique_pins.values()),
+        )
 
     def ensure_route(
         self,
@@ -619,6 +810,10 @@ class ExpertSlotPool:
                     )
                 )
             else:
+                progressive = (
+                    self.progressive_component_reads
+                    and plan.phase.value == "decode"
+                )
                 for slot, generation, record in owned_loads:
                     futures.append(
                         self._executor.submit(
@@ -628,6 +823,7 @@ class ExpertSlotPool:
                             record,
                             cancel_event=combined_cancel,
                             deadline_ns=deadline_ns,
+                            progressive=progressive,
                         )
                     )
             future_error: BaseException | None = None
@@ -748,6 +944,7 @@ class ExpertSlotPool:
             slot.expert = None
             slot.digest = None
             slot.error = None
+            slot.gate_up_ready = False
             slot.condition.notify_all()
             return True
 
@@ -763,6 +960,7 @@ class ExpertSlotPool:
             "io_cache_mode": self.reader.cache_mode,
             "allocated_bytes": self.allocated_bytes,
             "max_inflight_io_bytes": self.max_inflight_io_bytes,
+            "progressive_component_reads": self.progressive_component_reads,
             "persistent_slot_count": len(self._persistent),
             "cache_scope": self.cache_scope,
             "persistent_route_capacity": self._persistent_route_capacity,
@@ -786,6 +984,7 @@ class ExpertSlotPool:
                 slot.expert = None
                 slot.digest = None
                 slot.error = None
+                slot.gate_up_ready = False
                 slot.condition.notify_all()
 
     def close(self, *, timeout: float | None = None) -> None:

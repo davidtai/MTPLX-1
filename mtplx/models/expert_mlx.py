@@ -518,6 +518,24 @@ def _run_component_bank_q4(
 ) -> mx.array:
     """Execute assignment-aligned rows from one component-major slot bank."""
 
+    hidden = _run_component_bank_gate_up(
+        x,
+        bindings,
+        group_size=group_size,
+    )
+    return _run_component_bank_down(
+        hidden,
+        bindings,
+        group_size=group_size,
+    )
+
+
+def _component_bank_qmm_inputs(
+    x: mx.array,
+    bindings: tuple[ExpertSlotBinding, ...],
+) -> tuple[mx.array, MlxComponentBank, mx.array]:
+    """Validate bindings and build assignment-aligned gather-QMM inputs."""
+
     if not bindings or int(x.shape[0]) != len(bindings):
         raise ValueError("component-bank inputs and bindings must be non-empty and aligned")
     bank = getattr(bindings[0].buffer, "bank", None)
@@ -528,6 +546,18 @@ def _run_component_bank_q4(
         [int(binding.buffer.bank_index) for binding in bindings],
         dtype=mx.int32,
     ).reshape((-1, 1))
+    return selected, bank, slot_indices
+
+
+def _run_component_bank_gate_up(
+    x: mx.array,
+    bindings: tuple[ExpertSlotBinding, ...],
+    *,
+    group_size: int,
+) -> mx.array:
+    """Run gate/up/SwiGLU after the trusted prefix reaches its slot rows."""
+
+    selected, bank, slot_indices = _component_bank_qmm_inputs(x, bindings)
 
     def qmm(values: mx.array, projection: str) -> mx.array:
         return mx.gather_qmm(
@@ -544,7 +574,29 @@ def _run_component_bank_q4(
 
     gate = qmm(selected, "gate_proj")
     up = qmm(selected, "up_proj")
-    output = qmm(swiglu(gate, up), "down_proj")
+    return swiglu(gate, up)
+
+
+def _run_component_bank_down(
+    hidden: mx.array,
+    bindings: tuple[ExpertSlotBinding, ...],
+    *,
+    group_size: int,
+) -> mx.array:
+    """Run the down projection after the complete record becomes ready."""
+
+    selected, bank, slot_indices = _component_bank_qmm_inputs(hidden, bindings)
+    output = mx.gather_qmm(
+        selected,
+        bank.arrays["down_proj.weight"],
+        bank.arrays["down_proj.scales"],
+        bank.arrays["down_proj.biases"],
+        rhs_indices=slot_indices,
+        transpose=True,
+        group_size=group_size,
+        bits=4,
+        mode="affine",
+    )
     return output.reshape((len(bindings), int(output.shape[-1])))
 
 
@@ -714,6 +766,63 @@ class HotExpertSwitchGLU(nn.Module):
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
+        def stage_component_gate_up(
+            positions: tuple[int, ...] | list[int],
+            bindings: tuple[ExpertSlotBinding, ...],
+        ) -> list[tuple[list[int], tuple[ExpertSlotBinding, ...], mx.array]]:
+            """Evaluate trusted gate/up rows while down suffixes keep loading."""
+
+            by_bank: dict[int, list[tuple[int, ExpertSlotBinding]]] = {}
+            for global_position, binding in zip(positions, bindings, strict=True):
+                by_bank.setdefault(id(binding.buffer.bank), []).append(
+                    (global_position, binding)
+                )
+            staged: list[
+                tuple[list[int], tuple[ExpertSlotBinding, ...], mx.array]
+            ] = []
+            hidden_values: list[mx.array] = []
+            for assignments in by_bank.values():
+                grouped_positions = [
+                    position for position, _binding in assignments
+                ]
+                grouped_bindings = tuple(
+                    binding for _position, binding in assignments
+                )
+                token_positions = mx.array(
+                    [position // top_k for position in grouped_positions],
+                    dtype=mx.int32,
+                )
+                selected = mx.take(tokens, token_positions, axis=0)
+                hidden = _run_component_bank_gate_up(
+                    selected,
+                    grouped_bindings,
+                    group_size=self.group_size,
+                )
+                hidden_values.append(hidden)
+                staged.append((grouped_positions, grouped_bindings, hidden))
+            mx.eval(hidden_values)
+            return staged
+
+        def finish_component_down(
+            staged: list[
+                tuple[list[int], tuple[ExpertSlotBinding, ...], mx.array]
+            ],
+        ) -> None:
+            wave_outputs: list[mx.array] = []
+            wave_positions: list[int] = []
+            for grouped_positions, grouped_bindings, hidden in staged:
+                wave_outputs.append(
+                    _run_component_bank_down(
+                        hidden,
+                        grouped_bindings,
+                        group_size=self.group_size,
+                    )
+                )
+                wave_positions.extend(grouped_positions)
+            mx.eval(wave_outputs)
+            outputs.extend(wave_outputs)
+            output_positions.extend(wave_positions)
+
         def evaluate_direct_bindings(
             positions: tuple[int, ...] | list[int],
             bindings: tuple[ExpertSlotBinding, ...],
@@ -779,19 +888,36 @@ class HotExpertSwitchGLU(nn.Module):
                         pending.hit_ready.bindings,
                     )
                     pending.release_hits()
+                miss_positions = tuple(
+                    position
+                    for position, expert in zip(
+                        wave.positions, wave.experts, strict=True
+                    )
+                    if expert not in hit_set
+                )
+                staged_misses = None
+                if (
+                    self.runtime.config.slot_layout == "component-banks"
+                    and phase is RoutingPhase.DECODE
+                    and pending.misses_pending
+                ):
+                    gate_up_ready = pending.finish_gate_up()
+                    if gate_up_ready is not None:
+                        gate_up_ready.validate()
+                        staged_misses = stage_component_gate_up(
+                            miss_positions,
+                            gate_up_ready.bindings,
+                        )
                 miss_ready = pending.finish_misses()
                 if miss_ready is not None:
-                    miss_positions = tuple(
-                        position
-                        for position, expert in zip(
-                            wave.positions, wave.experts, strict=True
+                    if staged_misses is not None:
+                        finish_component_down(staged_misses)
+                        pending.release_gate_up()
+                    else:
+                        evaluate_bindings(
+                            miss_positions,
+                            miss_ready.bindings,
                         )
-                        if expert not in hit_set
-                    )
-                    evaluate_bindings(
-                        miss_positions,
-                        miss_ready.bindings,
-                    )
             finally:
                 pending.close()
 
