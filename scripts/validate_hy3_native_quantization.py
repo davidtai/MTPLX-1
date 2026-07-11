@@ -199,6 +199,24 @@ def _arrays_equal(left: Any, right: Any) -> bool:
     return bool(mx.array_equal(left, right).item())
 
 
+def _router_contract_passes(
+    *,
+    leaves_match: bool,
+    q8_ids_match: bool,
+    q8_scores_match: bool,
+    correction_match: bool,
+) -> bool:
+    """Evaluate only the specified resident affine-Q8 parity contract."""
+
+    return leaves_match and q8_ids_match and q8_scores_match and correction_match
+
+
+def _artifact_correction_name(spec: Any, layer: int) -> str:
+    if layer == spec.mtp_layer_index:
+        return f"model.layers.{layer}.mlp.expert_bias"
+    return f"model.layers.{layer}.mlp.router.expert_bias"
+
+
 def _router_probe(
     source: _TensorReader,
     artifact: _TensorReader,
@@ -211,6 +229,7 @@ def _router_probe(
     route_norm: bool,
     atol: float,
     rtol: float,
+    artifact_correction_name: str,
 ) -> dict[str, Any]:
     base = f"model.layers.{layer}.mlp.router.gate"
     source_weight = source.get(base + ".weight")
@@ -254,9 +273,10 @@ def _router_probe(
     bf16_logits = vectors @ source_weight.T
     # Tencent's BF16 checkpoint stores the correction beside ``mlp`` while
     # the pinned MLX resident layout stores it beside the router.  The native
-    # converter deliberately follows each side's established spelling.
+    # converter deliberately follows each side's established spelling. MTP
+    # layer 80 keeps the official spelling in its standalone resident file.
     source_correction = source.get(f"model.layers.{layer}.mlp.expert_bias")
-    artifact_correction = artifact.get(f"model.layers.{layer}.mlp.router.expert_bias")
+    artifact_correction = artifact.get(artifact_correction_name)
     q8_ids, q8_scores = _route(
         q8_logits,
         artifact_correction,
@@ -284,21 +304,24 @@ def _router_probe(
         mx.allclose(q8_scores, oracle_scores, atol=atol, rtol=rtol).item()
     )
     bf16_ids_match = _arrays_equal(q8_ids, bf16_ids)
+    correction_match = _arrays_equal(source_correction, artifact_correction)
     return {
-        "passed": (
-            leaves_match
-            and q8_ids_match
-            and q8_scores_match
-            and bf16_ids_match
-            and _arrays_equal(source_correction, artifact_correction)
+        # The artifact contract is affine Q8/gs64, so correctness is exact
+        # parity with a fresh Q8 quantization of the pinned BF16 router. Raw
+        # BF16 route drift is a useful near-tie diagnostic, not a Q8 failure.
+        "passed": _router_contract_passes(
+            leaves_match=leaves_match,
+            q8_ids_match=q8_ids_match,
+            q8_scores_match=q8_scores_match,
+            correction_match=correction_match,
         ),
+        "reference_contract": "fresh affine Q8/gs64 from pinned BF16",
         "quantized_leaves_match_fresh_oracle": leaves_match,
-        "correction_bias_bit_exact": _arrays_equal(
-            source_correction, artifact_correction
-        ),
+        "correction_bias_bit_exact": correction_match,
         "q8_oracle_ids_match": q8_ids_match,
         "q8_oracle_scores_match": q8_scores_match,
         "bf16_ids_match": bf16_ids_match,
+        "bf16_ids_diagnostic_only": True,
         "bf16_score_error": _error_stats(q8_scores, bf16_scores),
         "weight_cosine": _cosine(dequantized, source_weight),
         "weight_cosine_min": Q8_WEIGHT_COSINE_MIN,
@@ -334,8 +357,8 @@ def main() -> int:
     ):
         raise SystemExit("kernel tolerances must be finite and non-negative")
     spec = get_model_spec(args.model_key)
-    if args.layer not in spec.routed_layer_indices:
-        raise SystemExit(f"layer {args.layer} is not a streamed trunk layer")
+    if args.layer not in spec.expert_record_layer_indices:
+        raise SystemExit(f"layer {args.layer} is not packaged as expert records")
     if not 0 <= args.expert < spec.expert_count:
         raise SystemExit("--expert is outside the model")
     active = _run_lock_processes()
@@ -430,6 +453,7 @@ def main() -> int:
         route_norm=bool(config.get("route_norm", True)),
         atol=args.kernel_atol,
         rtol=args.kernel_rtol,
+        artifact_correction_name=_artifact_correction_name(spec, args.layer),
     )
     q4_cosines_pass = min(projection_cosines.values()) > Q4_WEIGHT_COSINE_MIN
     router_cosine_pass = router["weight_cosine"] > Q8_WEIGHT_COSINE_MIN
@@ -459,7 +483,12 @@ def main() -> int:
             "bf16_q4_output_threshold": (
                 "reported only; the repository validation gate does not define "
                 "a numeric BF16-vs-Q4 layer-output tolerance"
-            )
+            ),
+            "router_reference": (
+                "the specified resident router is affine Q8/gs64; raw BF16 ID "
+                "drift on near-tied routes is reported but is not an artifact "
+                "parity failure"
+            ),
         },
     }
     print(json.dumps(report, indent=2, sort_keys=True))

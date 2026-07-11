@@ -1,0 +1,22 @@
+{
+  "baseline": {
+    "mean_nll": 4.417746067047119,
+    "model_key": "hy3-q4",
+    "perplexity": 82.90920281746611,
+    "tokens": 24
+  },
+  "max_ppl": 1000.0,
+  "max_ppl_ratio": 2.0,
+  "max_tokens": 24,
+  "native": {
+    "mean_nll": 4.417746067047119,
+    "model_key": "hy3-q4-native",
+    "perplexity": 82.90920281746611,
+    "tokens": 24
+  },
+  "native_to_baseline_ppl_ratio": 1.0,
+  "passed": true,
+  "performance_claim": false,
+  "sample_sha256": "992601ada8fe594c39784d30b37d1ae07aec99cc8fbd767e20ee55d4ab951d25",
+  "schema": "mtplx-streamed-perplexity-sanity-v1"
+}

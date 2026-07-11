@@ -147,6 +147,44 @@ def test_router_helper_honors_route_norm() -> None:
     assert [float(value) for value in raw[0].tolist()] == pytest.approx([1.462117, 1.0])
 
 
+def test_router_gate_uses_the_resident_q8_contract() -> None:
+    module = _load_script("validate_hy3_native_quantization")
+
+    assert module._router_contract_passes(
+        leaves_match=True,
+        q8_ids_match=True,
+        q8_scores_match=True,
+        correction_match=True,
+    )
+    for failed in (
+        "leaves_match",
+        "q8_ids_match",
+        "q8_scores_match",
+        "correction_match",
+    ):
+        values = {
+            "leaves_match": True,
+            "q8_ids_match": True,
+            "q8_scores_match": True,
+            "correction_match": True,
+        }
+        values[failed] = False
+        assert not module._router_contract_passes(**values)
+
+
+def test_router_correction_spelling_covers_trunk_and_mtp() -> None:
+    module = _load_script("validate_hy3_native_quantization")
+    spec = SimpleNamespace(mtp_layer_index=80)
+
+    assert (
+        module._artifact_correction_name(spec, 1)
+        == "model.layers.1.mlp.router.expert_bias"
+    )
+    assert (
+        module._artifact_correction_name(spec, 80) == "model.layers.80.mlp.expert_bias"
+    )
+
+
 def test_perplexity_helper_fails_cleanly_for_non_finite_or_overflowing_nll() -> None:
     module = _load_script("evaluate_streamed_perplexity")
 

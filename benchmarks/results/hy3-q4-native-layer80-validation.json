@@ -1,0 +1,50 @@
+{
+  "fixed_vector": {
+    "bf16_output_error": {
+      "cosine": 0.9887162446975708,
+      "max_abs": 0.03809356689453125,
+      "mean_abs": 0.006682785227894783,
+      "p99_abs": 0.0216064453125
+    },
+    "expert": 0,
+    "kernel_atol": 1e-05,
+    "kernel_rtol": 1e-05,
+    "layer": 80,
+    "q4_kernel_match": true,
+    "q4_projection_weight_cosines": {
+      "down_proj": 0.9957853555679321,
+      "gate_proj": 0.9958695769309998,
+      "up_proj": 0.9958678483963013
+    },
+    "q4_weight_cosine_min": 0.99,
+    "seed": 20260711,
+    "vectors": 4
+  },
+  "model_key": "hy3-q4-native",
+  "notes": {
+    "bf16_q4_output_threshold": "reported only; the repository validation gate does not define a numeric BF16-vs-Q4 layer-output tolerance",
+    "router_reference": "the specified resident router is affine Q8/gs64; raw BF16 ID drift on near-tied routes is reported but is not an artifact parity failure"
+  },
+  "passed": true,
+  "router": {
+    "bf16_ids_diagnostic_only": true,
+    "bf16_ids_match": true,
+    "bf16_score_error": {
+      "cosine": 0.9999995231628418,
+      "max_abs": 0.0006690919399261475,
+      "mean_abs": 0.0003005852922797203,
+      "p99_abs": 0.0006558343884535134
+    },
+    "correction_bias_bit_exact": true,
+    "passed": true,
+    "q8_oracle_ids_match": true,
+    "q8_oracle_scores_match": true,
+    "quantized_leaves_match_fresh_oracle": true,
+    "reference_contract": "fresh affine Q8/gs64 from pinned BF16",
+    "weight_cosine": 0.99997478723526,
+    "weight_cosine_min": 0.999
+  },
+  "schema": "mtplx-hy3-native-quantization-validation-v1",
+  "source_repo": "tencent/Hy3",
+  "source_revision": "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+}
