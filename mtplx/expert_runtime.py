@@ -22,6 +22,7 @@ from .expert_slots import (
     ExpertCompletionFenceError,
     ExpertSlotError,
     ExpertSlotPool,
+    ProjectionReadyRoute,
     ReadyRoute,
     RouteIOAdmission,
 )
@@ -1141,6 +1142,10 @@ class ExpertStreamingRuntime:
                 ),
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
+                progressive_component_reads=(
+                    config.slot_layout == "component-banks"
+                    and config.verify_sidecar_hash_at_open
+                ),
             )
         except Exception:
             reader.close()

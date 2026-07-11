@@ -11,7 +11,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .expert_manifest import (
     ExpertManifest,
@@ -478,6 +478,93 @@ class PositionalExpertReader:
                     f"expert record hash mismatch: ({record.layer}, {record.expert})"
                 )
         return digest
+
+    def read_record_projection_pipeline_into(
+        self,
+        manifest: ExpertManifest,
+        record: ExpertRecord,
+        destination: Any,
+        *,
+        verified_sidecar: bool,
+        on_gate_up_ready: Callable[[], None],
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+    ) -> str:
+        """Read gate/up before down and publish one trusted partial boundary.
+
+        This path deliberately cannot perform record-level hashing: execution
+        may consume gate/up while the down suffix is still in flight.  The
+        caller must therefore have verified the complete sidecar at process
+        open.  All other trust modes use ``read_record_into`` and do
+        not expose partially filled slots.
+        """
+
+        if not verified_sidecar:
+            raise ExpertIOIntegrityError(
+                "projection-pipelined reads require a verified sidecar"
+            )
+        if manifest.sidecar is None:
+            raise ExpertIOError("projection-pipelined read requires a sidecar")
+        if record.sidecar_offset is None or record.sidecar_length is None:
+            raise ExpertIOError("manifest sidecar record is incomplete")
+        record_views = getattr(destination, "record_views", None)
+        if not callable(record_views):
+            raise TypeError("projection-pipelined read requires component slots")
+        views = tuple(record_views(record))
+        expected_components = (
+            "gate_proj.weight",
+            "gate_proj.scales",
+            "gate_proj.biases",
+            "up_proj.weight",
+            "up_proj.scales",
+            "up_proj.biases",
+            "down_proj.weight",
+            "down_proj.scales",
+            "down_proj.biases",
+        )
+        components = tuple(segment.component for segment in record.segments)
+        if components != expected_components:
+            raise ValueError(
+                "projection-pipelined record must use gate/up/down component order"
+            )
+        if len(views) != len(record.segments):
+            raise ValueError("component slot does not cover every record segment")
+        if sum(len(view) for view in views) != record.logical_bytes:
+            raise ValueError("component slot byte count differs from expert record")
+        if int(record.sidecar_length) != record.logical_bytes:
+            raise ExpertIOError("sidecar range differs from expert record")
+
+        gate_up_views = views[:6]
+        down_views = views[6:]
+        gate_up_bytes = sum(len(view) for view in gate_up_views)
+        self.metrics.update(record_requests=1, sidecar_record_requests=1)
+        try:
+            self._readv_range_into(
+                manifest.sidecar.file,
+                int(record.sidecar_offset),
+                gate_up_views,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+            # The callback publishes readiness only after every gate/up byte
+            # reached its generation-owned component-bank row.
+            on_gate_up_ready()
+            self._readv_range_into(
+                manifest.sidecar.file,
+                int(record.sidecar_offset) + gate_up_bytes,
+                down_views,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+        finally:
+            for view in views:
+                try:
+                    view.release()
+                except Exception:
+                    pass
+        # Match the existing trusted-sidecar lane: no per-record digest was
+        # computed, and telemetry must not imply otherwise.
+        return "unverified"
 
     def read_component_records_into(
         self,

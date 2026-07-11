@@ -15,6 +15,7 @@ from mlx_lm.models.deepseek_v32 import group_expert_select
 import mtplx.models.expert_mlx as expert_mlx
 from mtplx.expert_manifest import (
     build_expert_manifest,
+    build_expert_sidecar,
     load_expert_manifest,
     save_expert_manifest,
 )
@@ -1049,6 +1050,7 @@ def test_component_bank_hy3_executes_without_record_or_stack_copies(
         assert mx.all(mx.isfinite(logits)).item()
         snapshot = runtime.snapshot(mx_module=mx)
         assert snapshot["slots"]["buffer_backend"] == "mlx-metal-component-banks"
+        assert snapshot["slots"]["progressive_component_reads"] is False
         assert snapshot["slots"]["pins"] == 0
         assert snapshot["slots"]["io"]["integrity_errors"] == 0
     finally:
@@ -1390,6 +1392,242 @@ def test_slot_fence_all_hit_synchronous_eval_failure_blocks_replacement(
             runtime.close(timeout=2)
         except ExpertSlotError:
             pass
+
+
+def test_verified_sidecar_projection_pipeline_preserves_hy3_logits(
+    tmp_path: Path,
+) -> None:
+    root, config, spec, source_manifest_path = _integrated_hy3_artifact(tmp_path)
+    sidecar_manifest = build_expert_sidecar(
+        load_expert_manifest(source_manifest_path),
+        root,
+        root / "experts.bin",
+    )
+    sidecar_manifest_path = root / "expert-manifest-sidecar.json"
+    save_expert_manifest(sidecar_manifest, sidecar_manifest_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+
+    def run(*, verified_sidecar: bool) -> tuple[mx.array, dict]:
+        stream_config = ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            slot_layout="component-banks",
+            verify_sidecar_hash_at_open=verified_sidecar,
+        )
+        plan = stream_config.memory_plan(spec)
+        runtime = ExpertStreamingRuntime.open(
+            root,
+            sidecar_manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_component_bank_allocator(
+                plan,
+                spec,
+                sidecar_manifest,
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+        try:
+            resident = construct_resident_model(root, runtime, config=config)
+            logits = resident.model(mx.array([[1]], dtype=mx.int32))
+            mx.eval(logits)
+            return logits, runtime.snapshot(mx_module=mx)
+        finally:
+            runtime.close()
+
+    baseline, baseline_snapshot = run(verified_sidecar=False)
+    pipelined, pipelined_snapshot = run(verified_sidecar=True)
+
+    assert mx.array_equal(pipelined, baseline).item()
+    assert baseline_snapshot["slots"]["progressive_component_reads"] is False
+    assert pipelined_snapshot["slots"]["progressive_component_reads"] is True
+    assert pipelined_snapshot["integrity"]["sidecar_verified"] is True
+    assert pipelined_snapshot["slots"]["io"]["integrity_errors"] == 0
+
+
+class _ProjectionPending:
+    def __init__(
+        self,
+        events: list[str],
+        binding: SimpleNamespace,
+        *,
+        assignment_count: int = 1,
+    ) -> None:
+        self.events = events
+        self.plan = SimpleNamespace(hits=(), misses=(0,))
+        self.hit_ready = None
+        self.misses_pending = True
+        self._bindings = (binding,) * assignment_count
+
+    def release_hits(self) -> None:
+        raise AssertionError("all-miss projection fixture has no hits")
+
+    def finish_gate_up(self):
+        self.events.append("gate-up-ready")
+
+        class ProjectionRoute:
+            bindings = self._bindings
+
+            def validate(route_self) -> None:
+                self.events.append("validate-gate-up")
+
+        return ProjectionRoute()
+
+    def finish_misses(self):
+        self.events.append("record-ready")
+        return SimpleNamespace(bindings=self._bindings)
+
+    def release_gate_up(self) -> None:
+        self.events.append("release-gate-up")
+
+    def close(self) -> None:
+        self.events.append("close")
+
+
+def test_component_switch_runs_gate_up_before_waiting_for_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    bank = object()
+    binding = SimpleNamespace(
+        expert=0,
+        buffer=SimpleNamespace(bank=bank),
+    )
+
+    class Runtime:
+        spec = SimpleNamespace(top_k=1, hidden_size=2, quant_group_size=64)
+        manifest = SimpleNamespace(sidecar=object())
+        config = SimpleNamespace(slot_layout="component-banks")
+
+        def observe_route(self, *_args, **_kwargs) -> None:
+            return None
+
+        def prepare_prefill_seed(self, *_args, **_kwargs) -> tuple[int, ...]:
+            return ()
+
+        def route_waves(self, expert_ids, **_kwargs):
+            return (RouteWave(positions=(0,), experts=tuple(expert_ids)),)
+
+        def begin_split_route(self, *_args, **_kwargs):
+            events.append("begin-read")
+            return _ProjectionPending(events, binding)
+
+    def fake_gate_up(selected, bindings, *, group_size):
+        assert bindings == (binding,)
+        assert group_size == 64
+        events.append("gate-up-q4")
+        return selected
+
+    def fake_down(hidden, bindings, *, group_size):
+        assert bindings == (binding,)
+        assert group_size == 64
+        events.append("down-q4")
+        return hidden
+
+    monkeypatch.setattr(
+        "mtplx.models.expert_mlx._run_component_bank_gate_up",
+        fake_gate_up,
+    )
+    monkeypatch.setattr(
+        "mtplx.models.expert_mlx._run_component_bank_down",
+        fake_down,
+    )
+
+    switch = HotExpertSwitchGLU(Runtime(), 1)
+    output = switch(
+        mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        mx.zeros((1, 1, 1), dtype=mx.int32),
+    )
+    mx.eval(output)
+
+    assert events == [
+        "begin-read",
+        "gate-up-ready",
+        "validate-gate-up",
+        "gate-up-q4",
+        "record-ready",
+        "down-q4",
+        "release-gate-up",
+        "close",
+    ]
+
+
+def test_128k_prefill_keeps_projection_pipeline_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = 128 * 1024
+    events: list[str] = []
+    bank = object()
+    binding = SimpleNamespace(
+        expert=0,
+        buffer=SimpleNamespace(bank=bank),
+    )
+
+    class Runtime:
+        spec = SimpleNamespace(top_k=1, hidden_size=2, quant_group_size=64)
+        manifest = SimpleNamespace(sidecar=object())
+        config = SimpleNamespace(slot_layout="component-banks")
+
+        def observe_route(self, *_args, **_kwargs) -> None:
+            return None
+
+        def prepare_prefill_seed(self, *_args, **_kwargs) -> tuple[int, ...]:
+            events.append("prefill-seed")
+            return ()
+
+        def route_waves(self, expert_ids, **_kwargs):
+            experts = tuple(expert_ids)
+            return (
+                RouteWave(
+                    positions=tuple(range(len(experts))),
+                    experts=experts,
+                ),
+            )
+
+        def begin_split_route(self, _layer, experts, **_kwargs):
+            events.append("begin-read")
+            return _ProjectionPending(
+                events,
+                binding,
+                assignment_count=len(tuple(experts)),
+            )
+
+    def fake_full_q4(selected, bindings, *, group_size):
+        assert len(bindings) == tokens
+        assert group_size == 64
+        events.append("full-q4")
+        return selected
+
+    def forbid_progressive(*_args, **_kwargs):
+        raise AssertionError("128K prefill must not execute a partial record")
+
+    monkeypatch.setattr(
+        "mtplx.models.expert_mlx._run_component_bank_q4",
+        fake_full_q4,
+    )
+    monkeypatch.setattr(
+        "mtplx.models.expert_mlx._run_component_bank_gate_up",
+        forbid_progressive,
+    )
+
+    switch = HotExpertSwitchGLU(Runtime(), 1)
+    output = switch(
+        mx.zeros((1, tokens, 2), dtype=mx.bfloat16),
+        mx.zeros((1, tokens, 1), dtype=mx.int32),
+    )
+    mx.eval(output)
+
+    assert output.shape == (1, tokens, 1, 2)
+    assert events == [
+        "prefill-seed",
+        "begin-read",
+        "record-ready",
+        "full-q4",
+        "close",
+    ]
 
 
 def test_resident_loader_reads_extensionless_hugging_face_cache_blob(
