@@ -1292,6 +1292,60 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
         runtime.close()
 
 
+def test_experimental_metal_route_resolves_warm_hits_on_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION", "1")
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(4),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        slot_layout="component-banks",
+    )
+    plan = stream_config.memory_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.bfloat16)
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    try:
+        cold = switch(tokens, indices)
+        mx.eval(cold)
+
+        def unexpected(*_args, **_kwargs):
+            raise AssertionError("warm Metal-resolved route used the split path")
+
+        monkeypatch.setattr(runtime, "route_waves", unexpected)
+        monkeypatch.setattr(runtime, "begin_split_route", unexpected)
+        warm = switch(tokens, indices)
+        mx.eval(warm)
+
+        assert mx.array_equal(warm, cold).item()
+        stats = runtime.snapshot(mx_module=mx)["metal_route_resolution"]
+        assert stats["probes"] == 2
+        assert stats["all_hits"] == 1
+        assert stats["misses"] == 1
+        assert stats["speculative_misses"] == 1
+        assert runtime.snapshot(mx_module=mx)["slots"]["pins"] == 0
+    finally:
+        runtime.close()
+
+
 def test_slot_fence_all_hit_synchronous_eval_failure_blocks_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1390,7 +1444,6 @@ def test_slot_fence_all_hit_synchronous_eval_failure_blocks_replacement(
             runtime.close(timeout=2)
         except ExpertSlotError:
             pass
-
 
 def test_resident_loader_reads_extensionless_hugging_face_cache_blob(
     tmp_path: Path,
