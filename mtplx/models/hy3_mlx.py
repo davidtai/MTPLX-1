@@ -18,7 +18,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from .expert_mlx import UnboundExpertSwitch
+from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
 
 @dataclass
@@ -206,9 +206,13 @@ class SparseMLP(nn.Module):
         # target logits even though the selected experts are identical.
         if not self.enable_moe_fp32_combine:
             scores = scores.astype(x.dtype)
-        routed = self.switch_mlp(x, indices)
+        routed, shared = run_switch_with_shared_overlap(
+            self.switch_mlp,
+            x,
+            indices,
+            lambda: self.shared_mlp(x),
+        )
         routed = (routed * scores[..., None]).sum(axis=-2)
-        shared = self.shared_mlp(x)
         if self.enable_moe_fp32_combine:
             return (routed.astype(mx.float32) + shared.astype(mx.float32)).astype(
                 x.dtype

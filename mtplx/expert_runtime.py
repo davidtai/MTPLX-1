@@ -297,6 +297,12 @@ class PendingSplitRoute:
             self.hit_ready.release(synchronize=False)
             self.hit_ready = None
 
+    @property
+    def misses_pending(self) -> bool:
+        """Whether miss I/O still offers useful work-overlap headroom."""
+
+        return self._miss_future is not None and not self._miss_future.done()
+
     def finish_misses(self) -> ReadyRoute | None:
         if self._miss_ready is not None:
             return self._miss_ready

@@ -644,6 +644,36 @@ class HotExpertSwitchGLU(nn.Module):
         self.group_size = runtime.spec.quant_group_size
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        output, _overlap_result = self._run(
+            x,
+            indices,
+            shared_work=None,
+        )
+        return output
+
+    def run_with_shared_overlap(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        shared_work: Callable[[], mx.array],
+    ) -> tuple[mx.array, mx.array]:
+        """Evaluate resident shared work while decode misses stream from SSD."""
+
+        output, shared = self._run(
+            x,
+            indices,
+            shared_work=shared_work,
+        )
+        assert shared is not None
+        return output, shared
+
+    def _run(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        *,
+        shared_work: Callable[[], mx.array] | None,
+    ) -> tuple[mx.array, mx.array | None]:
         if indices.ndim < 1:
             raise ValueError("expert indices must include a top-k dimension")
         if int(indices.shape[-1]) != self.runtime.spec.top_k:
@@ -676,6 +706,7 @@ class HotExpertSwitchGLU(nn.Module):
 
         outputs: list[mx.array] = []
         output_positions: list[int] = []
+        shared: mx.array | None = None
 
         def evaluate_component_bindings(
             positions: tuple[int, ...] | list[int],
@@ -779,6 +810,20 @@ class HotExpertSwitchGLU(nn.Module):
                         pending.hit_ready.bindings,
                     )
                     pending.release_hits()
+                # The resident shared branch depends only on ``x``.  Force it
+                # on Metal while the native reader owns the miss future, so
+                # all-miss layers have useful GPU work instead of an empty
+                # device.  Keep prefill unchanged: at 128K, eagerly retaining
+                # the full shared output across routed waves would violate the
+                # bounded-memory execution contract.
+                if (
+                    shared_work is not None
+                    and shared is None
+                    and phase is RoutingPhase.DECODE
+                    and pending.misses_pending
+                ):
+                    shared = shared_work()
+                    mx.eval(shared)
                 miss_ready = pending.finish_misses()
                 if miss_ready is not None:
                     miss_positions = tuple(
@@ -800,7 +845,26 @@ class HotExpertSwitchGLU(nn.Module):
         joined = mx.concatenate(outputs, axis=0)
         order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
         joined = mx.take(joined, order, axis=0)
-        return joined.reshape((*indices.shape, hidden_size))
+        output = joined.reshape((*indices.shape, hidden_size))
+        if shared_work is not None and shared is None:
+            # No physical wait remained to hide, or this was a bounded-memory
+            # prefill. Preserve the original routed-then-shared ordering.
+            shared = shared_work()
+        return output, shared
+
+
+def run_switch_with_shared_overlap(
+    switch_mlp: Any,
+    x: mx.array,
+    indices: mx.array,
+    shared_work: Callable[[], mx.array],
+) -> tuple[mx.array, mx.array]:
+    """Use streamed miss overlap when supported, otherwise preserve ordering."""
+
+    overlap = getattr(switch_mlp, "run_with_shared_overlap", None)
+    if callable(overlap):
+        return overlap(x, indices, shared_work)
+    return switch_mlp(x, indices), shared_work()
 
 
 def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
