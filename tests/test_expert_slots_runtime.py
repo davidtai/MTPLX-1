@@ -580,3 +580,62 @@ def test_begin_split_route_rolls_back_when_executor_rejects(
         ready.release(synchronize=False)
     finally:
         runtime.close()
+
+
+def test_decode_split_route_yields_each_miss_in_completion_order(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(
+            spec.resident_bytes + 2 * spec.expert_record_bytes
+        ),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        expert_cache_limit_bytes=0,
+        transient_slots=2,
+        max_inflight_io_bytes=2 * spec.expert_record_bytes,
+        verify_artifact_headers=False,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    release_slow = threading.Event()
+    original_read = runtime.reader.read_record_into
+
+    def ordered_read(manifest, record, destination, **kwargs):
+        if record.expert == 0:
+            assert release_slow.wait(timeout=2)
+        return original_read(manifest, record, destination, **kwargs)
+
+    runtime.reader.read_record_into = ordered_read
+    try:
+        with runtime.begin_split_route(1, [0, 1], phase="decode") as pending:
+            assert len(pending._miss_futures) == 2
+            ready_iter = pending.iter_ready_misses()
+            first = next(ready_iter)
+            assert tuple(binding.expert for binding in first.bindings) == (1,)
+            first.release(synchronize=False)
+
+            release_slow.set()
+            second = next(ready_iter)
+            assert tuple(binding.expert for binding in second.bindings) == (0,)
+            second.release(synchronize=False)
+
+            combined = pending.finish_misses()
+            assert combined is not None
+            assert tuple(binding.expert for binding in combined.bindings) == (0, 1)
+    finally:
+        release_slow.set()
+        snapshot = runtime.snapshot(mx_module=object())
+        runtime.close()
+
+    assert snapshot["incremental_misses"] == {"routes": 1, "parts": 2}
+    assert runtime.slots.snapshot()["metrics"]["active_routes"] == 0

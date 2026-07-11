@@ -572,6 +572,29 @@ class ExpertSlotPool:
                 deadline_ns=deadline_ns,
             )
 
+    def ensure_route_part(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+    ) -> ReadyRoute:
+        """Load one disjoint part of a runtime-locked route transaction.
+
+        ``ExpertStreamingRuntime`` holds its layer transaction lock while all
+        parts are active. Each part owns distinct logical slots, so individual
+        slot conditions provide the remaining synchronization without forcing
+        completed records to wait behind the slowest read in the layer.
+        """
+
+        return self._ensure_route_locked(
+            layer,
+            plan,
+            cancel_event=cancel_event,
+            deadline_ns=deadline_ns,
+        )
+
     def _ensure_route_locked(
         self,
         layer: int,

@@ -779,19 +779,20 @@ class HotExpertSwitchGLU(nn.Module):
                         pending.hit_ready.bindings,
                     )
                     pending.release_hits()
-                miss_ready = pending.finish_misses()
-                if miss_ready is not None:
+                for miss_ready in pending.iter_ready_misses():
+                    ready_experts = set(miss_ready.plan.experts)
                     miss_positions = tuple(
                         position
                         for position, expert in zip(
                             wave.positions, wave.experts, strict=True
                         )
-                        if expert not in hit_set
+                        if expert not in hit_set and expert in ready_experts
                     )
                     evaluate_bindings(
                         miss_positions,
                         miss_ready.bindings,
                     )
+                    miss_ready.release(synchronize=False)
             finally:
                 pending.close()
 

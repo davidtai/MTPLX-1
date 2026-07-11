@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -271,6 +271,44 @@ class KVAdmission:
         self.release()
 
 
+class _ReadyRouteGroup:
+    """Several independently completed route parts in original route order."""
+
+    def __init__(self, plan: RoutePlan, parts: tuple[ReadyRoute, ...]) -> None:
+        self.plan = plan
+        self.parts = parts
+        binding_by_slot = {
+            (binding.expert, binding.logical_slot): binding
+            for part in parts
+            for binding in part.bindings
+        }
+        try:
+            self.bindings = tuple(
+                binding_by_slot[(expert, slot)]
+                for expert, slot in zip(plan.experts, plan.slots, strict=True)
+            )
+        except KeyError as exc:
+            raise ExpertSlotError(
+                "incremental miss parts do not cover the original route"
+            ) from exc
+
+    @property
+    def slots(self) -> tuple[int, ...]:
+        return self.plan.slots
+
+    @property
+    def generations(self) -> tuple[int, ...]:
+        return tuple(binding.generation for binding in self.bindings)
+
+    def validate(self) -> None:
+        for part in self.parts:
+            part.validate()
+
+    def release(self, *, synchronize: bool = True) -> None:
+        for index, part in enumerate(self.parts):
+            part.release(synchronize=synchronize and index == 0)
+
+
 class PendingSplitRoute:
     """One layer transaction with pinned hits and asynchronously loading misses."""
 
@@ -281,14 +319,15 @@ class PendingSplitRoute:
         plan: RoutePlan,
         layer_lock: threading.Lock,
         hit_ready: ReadyRoute | None,
-        miss_future: Future[ReadyRoute] | None,
+        miss_futures: dict[Future[ReadyRoute], RoutePlan],
     ) -> None:
         self.runtime = runtime
         self.layer = layer
         self.plan = plan
         self.hit_ready = hit_ready
-        self._miss_future = miss_future
-        self._miss_ready: ReadyRoute | None = None
+        self._miss_futures = miss_futures
+        self._miss_ready_parts: list[ReadyRoute] = []
+        self._miss_ready: _ReadyRouteGroup | None = None
         self._layer_lock = layer_lock
         self._closed = False
 
@@ -297,18 +336,53 @@ class PendingSplitRoute:
             self.hit_ready.release(synchronize=False)
             self.hit_ready = None
 
-    def finish_misses(self) -> ReadyRoute | None:
+    def _cancel_misses_and_rollback(self) -> None:
+        pending = tuple(self._miss_futures)
+        self._miss_futures.clear()
+        for future in pending:
+            future.cancel()
+        for future in pending:
+            try:
+                ready = future.result()
+            except BaseException:
+                continue
+            self._miss_ready_parts.append(ready)
+        for ready in self._miss_ready_parts:
+            ready.release(synchronize=False)
+        self._miss_ready_parts.clear()
+        self._miss_ready = None
+        self.runtime._rollback_route_loads(self.layer, self.plan)
+
+    def iter_ready_misses(self) -> Iterable[ReadyRoute]:
+        """Yield authoritative miss bindings in physical completion order."""
+
+        snapshot = tuple(self._miss_futures)
+        for future in as_completed(snapshot):
+            if future not in self._miss_futures:
+                continue
+            self._miss_futures.pop(future, None)
+            try:
+                ready = future.result()
+            except BaseException:
+                self._cancel_misses_and_rollback()
+                raise
+            self._miss_ready_parts.append(ready)
+            yield ready
+
+    def finish_misses(self) -> _ReadyRouteGroup | None:
         if self._miss_ready is not None:
             return self._miss_ready
-        if self._miss_future is None:
+        if not self._miss_futures and not self._miss_ready_parts:
             return None
-        try:
-            self._miss_ready = self._miss_future.result()
-        except BaseException:
-            self.runtime._rollback_route_loads(self.layer, self.plan)
-            raise
-        finally:
-            self._miss_future = None
+        for _ready in self.iter_ready_misses():
+            pass
+        miss_plan = self.runtime._subset_route_plan(self.plan, hits=False)
+        if miss_plan is None:
+            return None
+        self._miss_ready = _ReadyRouteGroup(
+            miss_plan,
+            tuple(self._miss_ready_parts),
+        )
         return self._miss_ready
 
     def close(self) -> None:
@@ -316,7 +390,7 @@ class PendingSplitRoute:
             return
         try:
             self.release_hits()
-            if self._miss_future is not None:
+            if self._miss_futures:
                 try:
                     self.finish_misses()
                 except BaseException:
@@ -324,6 +398,10 @@ class PendingSplitRoute:
             if self._miss_ready is not None:
                 self._miss_ready.release(synchronize=False)
                 self._miss_ready = None
+            else:
+                for ready in self._miss_ready_parts:
+                    ready.release(synchronize=False)
+            self._miss_ready_parts.clear()
         finally:
             self._closed = True
             self._layer_lock.release()
@@ -492,8 +570,10 @@ class ExpertStreamingRuntime:
         self._mapped_expert_store: Any | None = None
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
+        self._incremental_miss_routes = 0
+        self._incremental_miss_parts = 0
         self._split_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=max(1, plan.transient_slots),
             thread_name_prefix="mtplx-route-miss",
         )
 
@@ -710,6 +790,44 @@ class ExpertStreamingRuntime:
             evictions=() if hits else plan.evictions,
         )
 
+    @staticmethod
+    def _miss_route_parts(plan: RoutePlan) -> tuple[RoutePlan, ...]:
+        """Split a miss plan by expert while preserving assignment duplicates."""
+
+        parts: list[RoutePlan] = []
+        for expert in dict.fromkeys(plan.experts):
+            positions = tuple(
+                index
+                for index, candidate in enumerate(plan.experts)
+                if candidate == expert
+            )
+            loads = tuple(load for load in plan.loads if load.expert == expert)
+            if len(loads) != 1:
+                raise ExpertSlotError(
+                    "each incremental miss expert must own exactly one slot load"
+                )
+            parts.append(
+                RoutePlan(
+                    phase=plan.phase,
+                    experts=tuple(plan.experts[index] for index in positions),
+                    slots=tuple(plan.slots[index] for index in positions),
+                    hits=(),
+                    misses=(expert,),
+                    loads=loads,
+                    evictions=tuple(
+                        eviction
+                        for eviction in plan.evictions
+                        if eviction.next_expert == expert
+                    ),
+                    generations=(
+                        tuple(plan.generations[index] for index in positions)
+                        if plan.generations
+                        else ()
+                    ),
+                )
+            )
+        return tuple(parts)
+
     def _rollback_route_loads(self, layer: int, plan: RoutePlan) -> None:
         for load in plan.loads:
             if load.persistent:
@@ -738,7 +856,7 @@ class ExpertStreamingRuntime:
             raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
         lock.acquire()
         plan = None
-        miss_future = None
+        miss_futures: dict[Future[ReadyRoute], RoutePlan] = {}
         try:
             plan = self._plan_route(layer, expert_ids, phase=phase)
             hit_plan = self._subset_route_plan(plan, hits=True)
@@ -753,17 +871,29 @@ class ExpertStreamingRuntime:
                 if hit_plan is not None
                 else None
             )
-            miss_future = (
-                self._split_executor.submit(
-                    self.slots.ensure_route,
-                    layer,
-                    miss_plan,
-                    cancel_event=cancel_event,
-                    deadline_ns=deadline_ns,
+            if miss_plan is not None:
+                miss_parts = (
+                    self._miss_route_parts(miss_plan)
+                    if plan.phase is RoutingPhase.DECODE
+                    else (miss_plan,)
                 )
-                if miss_plan is not None
-                else None
-            )
+                if plan.phase is RoutingPhase.DECODE:
+                    self._incremental_miss_routes += 1
+                    self._incremental_miss_parts += len(miss_parts)
+                ensure = (
+                    self.slots.ensure_route_part
+                    if plan.phase is RoutingPhase.DECODE
+                    else self.slots.ensure_route
+                )
+                for miss_part in miss_parts:
+                    future = self._split_executor.submit(
+                        ensure,
+                        layer,
+                        miss_part,
+                        cancel_event=cancel_event,
+                        deadline_ns=deadline_ns,
+                    )
+                    miss_futures[future] = miss_part
             self._observe_plan(layer, plan)
             return PendingSplitRoute(
                 self,
@@ -771,18 +901,21 @@ class ExpertStreamingRuntime:
                 plan,
                 lock,
                 hit_ready,
-                miss_future,
+                miss_futures,
             )
         except BaseException:
             # Mirror the sync-path rollback: without it, a failed hit pin or
             # submit leaves the bank mapping experts to never-loaded slots,
             # wedging every later route on this layer until reset().
-            if miss_future is not None:
-                miss_future.cancel()
+            for future in miss_futures:
+                future.cancel()
+            for future in miss_futures:
                 try:
-                    miss_future.result()
+                    ready = future.result()
                 except BaseException:
                     pass
+                else:
+                    ready.release(synchronize=False)
             if plan is not None:
                 self._rollback_route_loads(layer, plan)
             lock.release()
@@ -855,6 +988,8 @@ class ExpertStreamingRuntime:
             self._phase_counters = {
                 phase: CacheCounters() for phase in RoutingPhase
             }
+            self._incremental_miss_routes = 0
+            self._incremental_miss_parts = 0
         finally:
             for lock in reversed(locks):
                 lock.release()
@@ -894,6 +1029,10 @@ class ExpertStreamingRuntime:
             "cache_by_phase": {
                 phase.value: counters.as_dict()
                 for phase, counters in self._phase_counters.items()
+            },
+            "incremental_misses": {
+                "routes": self._incremental_miss_routes,
+                "parts": self._incremental_miss_parts,
             },
             "slots": self.slots.snapshot(),
         }
