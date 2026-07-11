@@ -1,4 +1,4 @@
-# Hy3 native Q4 + MTP handoff
+# Hy3 Q4 MLX + MTP handoff
 
 - Date: 2026-07-11
 - Research branch: `codex/hy3-q4-native-serialized`
@@ -7,12 +7,14 @@
 
 ## Delivered artifact
 
-- Artifact root: `/Users/davidtai/.cache/huggingface/hy3-q4-native-716aa724`
-- Manifest: `/Users/davidtai/.cache/huggingface/hy3-q4-native-716aa724/expert-manifest.json`
+- Artifact name: `hy3-q4-mlx-mtp`
+- Intended Hugging Face repo: `davidtai/hy3-q4-mlx-mtp`
+- Artifact root: `/Users/davidtai/.cache/huggingface/hy3-q4-mlx-mtp`
+- Manifest: `/Users/davidtai/.cache/huggingface/hy3-q4-mlx-mtp/expert-manifest.json`
 - Manifest digest: `47767d76039f6b9058af2bb9192c3ebf3c447df6c9602d9ed719ca8a55961ec5`
-- Conversion provenance: `/Users/davidtai/.cache/huggingface/hy3-q4-native-716aa724/conversion-provenance.json`
+- Conversion provenance: `/Users/davidtai/.cache/huggingface/hy3-q4-mlx-mtp/conversion-provenance.json`
 - Conversion-provenance file digest: `5bffad3e9600bbe9e74c70587e32ef826e625181e2f90c6fd2e5ca96037e0187`
-- Runtime contract: `/Users/davidtai/.cache/huggingface/hy3-q4-native-716aa724/mtplx_runtime.json`
+- Runtime contract: `/Users/davidtai/.cache/huggingface/hy3-q4-mlx-mtp/mtplx_runtime.json`
 
 The source is `tencent/Hy3@716aa7241bd6d95896be4ebfc761162a9c4d49ef`.
 All 99 official files were downloaded with revision metadata and full LFS
