@@ -489,7 +489,7 @@ def test_partition_route_waves_rejects_non_integral_ids() -> None:
     assert ordered[1].experts == (3, 2, 3)
 
 
-def test_prefill_seeds_only_empty_persistent_slots_by_frequency() -> None:
+def test_prefill_seed_tracks_prompt_wide_heavy_hitters_across_chunks() -> None:
     bank = LayerExpertSlotBank(
         expert_count=6,
         persistent_slots=2,
@@ -506,11 +506,33 @@ def test_prefill_seeds_only_empty_persistent_slots_by_frequency() -> None:
     assert second.loads[0].persistent is True
     assert set(bank.resident_experts) == {2, 3}
 
-    assert bank.prepare_prefill_seed([4, 4, 4]) == ()
+    # Expert 4 becomes hotter only in a later chunk. It replaces expert 2 in
+    # a prefill-owned slot without requiring an end-of-prompt reload.
+    assert bank.prepare_prefill_seed([4, 4, 4, 4]) == (4,)
     third = bank.plan([4], phase="prefill")
-    assert third.loads[0].persistent is False
-    assert third.evictions == ()
-    assert set(bank.resident_experts) == {2, 3}
+    assert third.loads[0].persistent is True
+    assert third.evictions[0].previous_expert == 2
+    assert set(bank.resident_experts) == {3, 4}
+
+
+def test_prompt_wide_prefill_seed_never_evicts_decode_owned_resident() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=6,
+        persistent_slots=2,
+        transient_slots=2,
+        cache_policy="lru",
+    )
+    bank.plan([0], phase="decode")
+
+    bank.prepare_prefill_seed([1, 1])
+    bank.plan([1], phase="prefill")
+    assert set(bank.resident_experts) == {0, 1}
+
+    bank.prepare_prefill_seed([2, 2, 2])
+    replacement = bank.plan([2], phase="prefill")
+
+    assert replacement.evictions[0].previous_expert == 1
+    assert set(bank.resident_experts) == {0, 2}
 
 
 def test_reader_reports_unverified_digest_when_hashing_disabled(

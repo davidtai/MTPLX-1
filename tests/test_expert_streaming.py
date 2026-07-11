@@ -58,6 +58,29 @@ def test_global_cache_uses_total_capacity_as_transient_slot_base() -> None:
     assert all(not load.persistent for load in plan.loads)
 
 
+def test_global_prompt_wide_seed_protects_existing_decode_entry() -> None:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1,),
+        expert_count=4,
+        persistent_slots=2,
+        transient_slots=1,
+        prefill_slots_per_layer=2,
+        cache_policy="lru",
+    )
+    decode = bank.plan(1, [0], phase="decode")
+    bank.publish_ready(1, decode)
+
+    bank.prepare_prefill_seed(1, [1, 1])
+    first = bank.plan(1, [1], phase="prefill")
+    bank.publish_ready(1, first)
+
+    bank.prepare_prefill_seed(1, [2, 2, 2])
+    replacement = bank.plan(1, [2], phase="prefill")
+
+    assert replacement.evictions[0].previous_expert == 1
+    assert bank.resident_experts_by_layer[1] == (0, 2)
+
+
 def test_decode_fills_persistent_slots_and_then_hits() -> None:
     bank = LayerExpertSlotBank(
         expert_count=16,

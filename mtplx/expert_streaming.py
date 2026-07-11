@@ -188,6 +188,12 @@ class LayerExpertSlotBank:
         self._expert_to_slot: dict[int, int] = {}
         self._history = [_ExpertHistory() for _ in range(expert_count)]
         self._prefill_seed_candidates: set[int] = set()
+        self._prefill_active = False
+        self._prefill_counts: Counter[int] = Counter()
+        self._prefill_capacity = 0
+        self._prefill_protected_experts: set[int] = set()
+        self._prefill_owned_slots: set[int] = set()
+        self._prefill_desired_experts: set[int] = set()
 
     @property
     def resident_experts(self) -> tuple[int, ...]:
@@ -208,6 +214,8 @@ class LayerExpertSlotBank:
         slot = self._expert_to_slot.pop(expert, None)
         if slot is not None:
             self._slot_to_expert[slot] = None
+            self._prefill_owned_slots.discard(slot)
+            self._prefill_protected_experts.discard(expert)
         return slot
 
     def reset(self) -> None:
@@ -217,25 +225,81 @@ class LayerExpertSlotBank:
         self._slot_to_expert = [None] * self.persistent_slots
         self._expert_to_slot.clear()
         self._history = [_ExpertHistory() for _ in range(self.expert_count)]
+        self._clear_prefill_seed_state()
+
+    def _clear_prefill_seed_state(self) -> None:
+        self._prefill_active = False
+        self._prefill_counts.clear()
+        self._prefill_capacity = 0
+        self._prefill_protected_experts.clear()
+        self._prefill_owned_slots.clear()
+        self._prefill_desired_experts.clear()
         self._prefill_seed_candidates.clear()
 
-    def prepare_prefill_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
-        """Choose prompt-frequent experts for empty slots without eviction."""
+    def begin_prefill_seed(self) -> None:
+        """Start one prompt-wide seed window without exposing decode residents."""
 
-        empty = self.persistent_slots - self.occupancy
-        if empty <= 0:
+        self._clear_prefill_seed_state()
+        self._prefill_active = True
+        self._prefill_protected_experts = set(self._expert_to_slot)
+        self._prefill_capacity = max(
+            0,
+            self.persistent_slots - len(self._prefill_protected_experts),
+        )
+
+    def finalize_prefill_seed(self) -> None:
+        """Keep the learned residents and discard prompt-only bookkeeping."""
+
+        self._clear_prefill_seed_state()
+
+    def prepare_prefill_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
+        """Update the prompt-wide heavy hitters eligible for prefill-owned slots.
+
+        Existing residents are protected for the entire prompt. Only slots that
+        were empty when this prefill window began may be filled or replaced, so
+        later chunks can correct early-chunk bias without evicting a decode-hot
+        expert or requiring a second SSD pass at the prompt boundary.
+        """
+
+        if not self._prefill_active:
+            self.begin_prefill_seed()
+        experts = self._validate_experts_for_seed(expert_ids)
+        self._prefill_counts.update(experts)
+        if self._prefill_capacity <= 0:
             self._prefill_seed_candidates.clear()
             return ()
-        experts = self._validate_experts_for_seed(expert_ids)
-        counts = Counter(experts)
-        ranked = sorted(counts, key=lambda expert: (-counts[expert], expert))
+        ranked = sorted(
+            (
+                expert
+                for expert in self._prefill_counts
+                if expert not in self._prefill_protected_experts
+            ),
+            key=lambda expert: (-self._prefill_counts[expert], expert),
+        )
+        desired = tuple(ranked[: self._prefill_capacity])
+        self._prefill_desired_experts = set(desired)
+        current = set(experts)
         chosen = tuple(
             expert
-            for expert in ranked
+            for expert in desired
             if expert not in self._expert_to_slot
-        )[:empty]
+            and expert in current
+        )
         self._prefill_seed_candidates = set(chosen)
         return chosen
+
+    def _prefill_victim_slot(self, *, pinned: set[int]) -> int | None:
+        candidates: list[tuple[int, int, int]] = []
+        for slot in self._prefill_owned_slots:
+            expert = self._slot_to_expert[slot]
+            if (
+                expert is None
+                or expert in pinned
+                or expert in self._prefill_desired_experts
+            ):
+                continue
+            candidates.append((self._prefill_counts[expert], expert, slot))
+        return min(candidates)[2] if candidates else None
 
     def _validate_experts_for_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
         try:
@@ -336,6 +400,8 @@ class LayerExpertSlotBank:
         unique_experts = tuple(dict.fromkeys(experts))
 
         if phase is RoutingPhase.DECODE:
+            if self._prefill_active:
+                self.finalize_prefill_seed()
             self._decode_epoch += 1
             for expert in experts:
                 self._touch_decode(expert)
@@ -356,6 +422,8 @@ class LayerExpertSlotBank:
             persistent_slot: int | None = None
             if phase is RoutingPhase.PREFILL and expert in self._prefill_seed_candidates:
                 persistent_slot = self._empty_persistent_slot()
+                if persistent_slot is None:
+                    persistent_slot = self._prefill_victim_slot(pinned=pinned)
                 self._prefill_seed_candidates.discard(expert)
             elif phase is RoutingPhase.DECODE and self.persistent_slots:
                 persistent_slot = self._empty_persistent_slot()
@@ -382,6 +450,8 @@ class LayerExpertSlotBank:
                 expert=expert,
                 evictions=evictions,
             )
+            if phase is RoutingPhase.PREFILL:
+                self._prefill_owned_slots.add(persistent_slot)
             pinned.add(expert)
             resolved[expert] = persistent_slot
             loads.append(SlotLoad(expert=expert, slot=persistent_slot, persistent=True))
@@ -480,6 +550,18 @@ class GlobalExpertSlotBank:
         self._evictions = 0
         self._cross_layer_evictions = 0
         self._prefill_seed_candidates: dict[int, set[int]] = {
+            layer: set() for layer in self.layer_indices
+        }
+        self._prefill_active = False
+        self._prefill_counts: dict[int, Counter[int]] = {
+            layer: Counter() for layer in self.layer_indices
+        }
+        self._prefill_capacity_by_layer: dict[int, int] = {
+            layer: 0 for layer in self.layer_indices
+        }
+        self._prefill_protected_keys: set[tuple[int, int]] = set()
+        self._prefill_owned_slots: set[int] = set()
+        self._prefill_desired_experts: dict[int, set[int]] = {
             layer: set() for layer in self.layer_indices
         }
 
@@ -619,30 +701,90 @@ class GlobalExpertSlotBank:
     def prepare_prefill_seed(
         self, layer: int, expert_ids: Iterable[int]
     ) -> tuple[int, ...]:
+        if not self._prefill_active:
+            self.begin_prefill_seed()
         layer, experts = self._validate_experts(layer, expert_ids)
-        remaining_layer = max(
-            0, self.prefill_slots_per_layer - self._layer_occupancy[layer]
-        )
-        empty = self.persistent_slots - self.occupancy
-        available = min(remaining_layer, empty)
+        self._prefill_counts[layer].update(experts)
+        available = self._prefill_capacity_by_layer[layer]
         if available <= 0:
             self._prefill_seed_candidates[layer].clear()
             return ()
-        counts = Counter(experts)
-        ranked = sorted(counts, key=lambda expert: (-counts[expert], expert))
+        counts = self._prefill_counts[layer]
+        ranked = sorted(
+            (
+                expert
+                for expert in counts
+                if (layer, expert) not in self._prefill_protected_keys
+            ),
+            key=lambda expert: (-counts[expert], expert),
+        )
+        desired = tuple(ranked[:available])
+        self._prefill_desired_experts[layer] = set(desired)
+        current = set(experts)
         chosen = tuple(
             expert
-            for expert in ranked
+            for expert in desired
             if (layer, expert) not in self._key_to_slot
-        )[:available]
+            and expert in current
+        )
         self._prefill_seed_candidates[layer] = set(chosen)
         return chosen
+
+    def _clear_prefill_seed_state(self) -> None:
+        self._prefill_active = False
+        self._prefill_protected_keys.clear()
+        self._prefill_owned_slots.clear()
+        for layer in self.layer_indices:
+            self._prefill_counts[layer].clear()
+            self._prefill_capacity_by_layer[layer] = 0
+            self._prefill_desired_experts[layer].clear()
+            self._prefill_seed_candidates[layer].clear()
+
+    def begin_prefill_seed(self) -> None:
+        self._clear_prefill_seed_state()
+        self._prefill_active = True
+        self._prefill_protected_keys = set(self._key_to_slot)
+        global_empty = max(0, self.persistent_slots - len(self._prefill_protected_keys))
+        for layer in self.layer_indices:
+            layer_empty = max(
+                0,
+                self.prefill_slots_per_layer - self._layer_occupancy[layer],
+            )
+            capacity = min(layer_empty, global_empty)
+            self._prefill_capacity_by_layer[layer] = capacity
+            global_empty -= capacity
+
+    def finalize_prefill_seed(self) -> None:
+        self._clear_prefill_seed_state()
+
+    def _prefill_victim_slot(
+        self,
+        *,
+        layer: int,
+        pinned: set[tuple[int, int]],
+    ) -> int | None:
+        desired = self._prefill_desired_experts[layer]
+        counts = self._prefill_counts[layer]
+        candidates: list[tuple[int, int, int]] = []
+        for slot in self._prefill_owned_slots:
+            key = self._slot_to_key[slot]
+            if (
+                key is None
+                or key[0] != layer
+                or key in pinned
+                or key[1] in desired
+            ):
+                continue
+            candidates.append((counts[key[1]], key[1], slot))
+        return min(candidates)[2] if candidates else None
 
     def invalidate_expert(self, layer: int, expert_id: int) -> int | None:
         key = self._key(layer, expert_id)
         slot = self._key_to_slot.pop(key, None)
         if slot is not None:
             self._slot_to_key[slot] = None
+            self._prefill_owned_slots.discard(slot)
+            self._prefill_protected_keys.discard(key)
             self._directory.pop(key, None)
             self._lru.pop(key, None)
             self._layer_occupancy[layer] -= 1
@@ -709,6 +851,8 @@ class GlobalExpertSlotBank:
         keys = tuple((layer, expert) for expert in unique_experts)
 
         if phase is RoutingPhase.DECODE:
+            if self._prefill_active:
+                self.finalize_prefill_seed()
             self._decode_epoch += 1
             for expert in experts:
                 self._touch_decode((layer, expert))
@@ -742,6 +886,20 @@ class GlobalExpertSlotBank:
                 and self._layer_occupancy[layer] < self.prefill_slots_per_layer
             ):
                 persistent_slot = self._empty_slot()
+                if persistent_slot is None:
+                    persistent_slot = self._prefill_victim_slot(
+                        layer=layer,
+                        pinned=pinned,
+                    )
+                self._prefill_seed_candidates[layer].discard(expert)
+            elif (
+                phase is RoutingPhase.PREFILL
+                and expert in self._prefill_seed_candidates[layer]
+            ):
+                persistent_slot = self._prefill_victim_slot(
+                    layer=layer,
+                    pinned=pinned,
+                )
                 self._prefill_seed_candidates[layer].discard(expert)
             elif phase is RoutingPhase.DECODE and self.persistent_slots:
                 persistent_slot = self._empty_slot()
@@ -759,6 +917,8 @@ class GlobalExpertSlotBank:
                 transient_experts.append(expert)
                 continue
             self._assign(slot=persistent_slot, key=key, evictions=evictions)
+            if phase is RoutingPhase.PREFILL:
+                self._prefill_owned_slots.add(persistent_slot)
             pinned.add(key)
             resolved[expert] = persistent_slot
             loads.append(
@@ -812,8 +972,7 @@ class GlobalExpertSlotBank:
         self._layer_occupancy.clear()
         self._evictions = 0
         self._cross_layer_evictions = 0
-        for candidates in self._prefill_seed_candidates.values():
-            candidates.clear()
+        self._clear_prefill_seed_state()
 
     def snapshot(self) -> dict[str, object]:
         return {
