@@ -1555,6 +1555,103 @@ def test_component_switch_runs_gate_up_before_waiting_for_down(
     ]
 
 
+def test_suffix_failure_is_not_masked_by_projection_release_sync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    suffix_error = RuntimeError("injected suffix failure")
+    synchronization_error = RuntimeError("injected projection synchronization failure")
+    bank = object()
+    binding = SimpleNamespace(
+        expert=0,
+        logical_slot=0,
+        generation=1,
+        buffer=SimpleNamespace(bank=bank),
+    )
+
+    class Projection:
+        bindings = (binding,)
+
+        def validate(self) -> None:
+            events.append("projection-validate")
+
+        def release(self, *, synchronize: bool = True) -> None:
+            events.append(f"projection-release:{synchronize}")
+            if synchronize:
+                raise synchronization_error
+
+    projection = Projection()
+
+    class Pending:
+        plan = SimpleNamespace(hits=(), misses=(0,))
+        hit_ready = None
+        misses_pending = True
+
+        def release_hits(self) -> None:
+            raise AssertionError("all-miss fixture has no hits")
+
+        def iter_projection_misses(self):
+            events.append("projection-ready")
+            yield projection
+
+        def release_projection(self, route, *, synchronize: bool = True) -> None:
+            assert route is projection
+            route.release(synchronize=synchronize)
+
+        def iter_ready_misses(self):
+            events.append("suffix-wait")
+            raise suffix_error
+            yield  # pragma: no cover
+
+        def release_miss(self, _ready) -> None:
+            raise AssertionError("failed suffix produced no ready route")
+
+        def abort(self, error: BaseException) -> None:
+            assert error is suffix_error
+            events.append("abort-suffix")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class Runtime:
+        spec = SimpleNamespace(top_k=1, hidden_size=2, quant_group_size=64)
+        manifest = SimpleNamespace(sidecar=object())
+        config = SimpleNamespace(slot_layout="component-banks")
+
+        def observe_route(self, *_args, **_kwargs) -> None:
+            return None
+
+        def prepare_prefill_seed(self, *_args, **_kwargs) -> tuple[int, ...]:
+            return ()
+
+        def route_waves(self, expert_ids, **_kwargs):
+            return (RouteWave(positions=(0,), experts=tuple(expert_ids)),)
+
+        def try_all_hit_route(self, *_args, **_kwargs):
+            return None
+
+        def begin_split_route(self, *_args, **_kwargs):
+            return Pending()
+
+    monkeypatch.setattr(
+        expert_mlx,
+        "_run_component_bank_gate_up",
+        lambda selected, *_args, **_kwargs: selected,
+    )
+    switch = HotExpertSwitchGLU(Runtime(), 1)
+
+    with pytest.raises(RuntimeError, match="suffix failure") as failed:
+        switch(
+            mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 1), dtype=mx.int32),
+        )
+
+    assert failed.value is suffix_error
+    assert "projection-release:False" in events
+    assert "projection-release:True" not in events
+    assert events[-2:] == ["abort-suffix", "close"]
+
+
 def test_128k_prefill_keeps_projection_pipeline_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -368,8 +368,7 @@ class _ComponentDestination:
     def __init__(self, record: ExpertRecord) -> None:
         self.nbytes = record.logical_bytes
         self._components = {
-            segment.component: bytearray(segment.length)
-            for segment in record.segments
+            segment.component: bytearray(segment.length) for segment in record.segments
         }
 
     def record_views(self, record: ExpertRecord) -> tuple[memoryview, ...]:
@@ -441,10 +440,13 @@ def test_projection_reader_publishes_gate_up_before_down(
             bytes(2_048),
         )
     ]
-    assert b"".join(
-        bytes(destination.component_view(segment.component))
-        for segment in record.segments
-    ) == expected[0]
+    assert (
+        b"".join(
+            bytes(destination.component_view(segment.component))
+            for segment in record.segments
+        )
+        == expected[0]
+    )
     assert metrics["record_requests"] == 1
     assert metrics["sidecar_record_requests"] == 1
     assert metrics["read_operations"] == 2
@@ -523,10 +525,13 @@ def test_projection_slot_route_is_available_while_down_read_is_blocked(
         assert snapshot["metrics"]["progressive_loads"] == 1
         assert snapshot["metrics"]["projection_ready_routes"] == 1
         assert snapshot["io"]["read_operations"] == 2
-        assert b"".join(
-            bytes(ready.bindings[0].component_view(segment.component))
-            for segment in record.segments
-        ) == expected[0]
+        assert (
+            b"".join(
+                bytes(ready.bindings[0].component_view(segment.component))
+                for segment in record.segments
+            )
+            == expected[0]
+        )
     finally:
         allow_down.set()
         pool.close()
@@ -622,6 +627,203 @@ def test_projection_down_failure_never_publishes_a_ready_route(
         if projection is not None:
             projection.release()
         pool.close()
+
+
+def test_close_waits_for_projection_pin_after_suffix_failure(
+    tmp_path: Path,
+) -> None:
+    root, spec, source_manifest, _expected = _artifact(tmp_path)
+    manifest = build_expert_sidecar(
+        source_manifest,
+        root,
+        root / "experts.bin",
+    )
+    plan = _plan(spec)
+    record = manifest.records[0]
+    reader = PositionalExpertReader(root, use_native=False)
+    original_readv = reader._readv_range_into
+    fail_down = threading.Event()
+    down_started = threading.Event()
+    calls = 0
+
+    def failing_readv(*args, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            down_started.set()
+            assert fail_down.wait(timeout=2)
+            raise ExpertIOError("injected suffix read failure")
+        original_readv(*args, **kwargs)
+
+    reader._readv_range_into = failing_readv
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        reader,
+        buffer_allocator=lambda _size, _label: _ComponentDestination(record),
+        verify_hashes=False,
+        progressive_component_reads=True,
+    )
+    route_plan = _manual_plan(0, plan.slots_per_layer)
+    projection = None
+    closed = False
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            suffix = executor.submit(pool.ensure_route, 1, route_plan)
+            projection = pool.wait_projection_route(
+                1,
+                route_plan,
+                load_future=suffix,
+            )
+            assert down_started.wait(timeout=2)
+            fail_down.set()
+            with pytest.raises(ExpertSlotError, match="suffix read failure"):
+                suffix.result(timeout=2)
+
+        with pytest.raises(TimeoutError, match="active expert routes"):
+            pool.close(timeout=0.01)
+        assert pool._closed is False
+
+        projection.release(synchronize=False)
+        projection = None
+        pool.close(timeout=2)
+        closed = True
+    finally:
+        fail_down.set()
+        if projection is not None:
+            projection.release(synchronize=False)
+        if not closed:
+            pool.close(timeout=2)
+
+
+def test_projection_wait_honors_cancel_and_deadline() -> None:
+    part = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(0,),
+        slots=(0,),
+        hits=(),
+        misses=(0,),
+        loads=(),
+        evictions=(),
+    )
+    future: Future[ReadyRoute] = Future()
+    layer_lock = threading.Lock()
+    layer_lock.acquire()
+    external_cancel = threading.Event()
+    internal_cancel = threading.Event()
+
+    class CombinedCancel:
+        def is_set(self) -> bool:
+            return external_cancel.is_set() or internal_cancel.is_set()
+
+    combined_cancel = CombinedCancel()
+    deadline_ns = time.monotonic_ns() + 1_000_000_000
+    observed: list[tuple[object, int | None]] = []
+
+    class Projection:
+        def release(self, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+
+    class Slots:
+        progressive_component_reads = True
+
+        def wait_projection_route(self, _layer, observed_plan, **kwargs):
+            assert observed_plan is part
+            observed.append((kwargs["cancel_event"], kwargs["deadline_ns"]))
+            return Projection()
+
+    class Runtime:
+        slots = Slots()
+
+    pending = PendingSplitRoute(
+        runtime=Runtime(),  # type: ignore[arg-type]
+        layer=1,
+        plan=part,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures={future: part},
+        miss_cancel_event=internal_cancel,
+        wait_cancel_event=combined_cancel,
+        deadline_ns=deadline_ns,
+    )
+    try:
+        projection = next(pending.iter_projection_misses())
+        assert observed == [(combined_cancel, deadline_ns)]
+        pending.release_projection(projection, synchronize=False)
+    finally:
+        future.cancel()
+        layer_lock.release()
+
+
+def test_incremental_projection_parts_preserve_order_and_single_ownership() -> None:
+    experts = (2, 0, 1)
+    parts = tuple(
+        RoutePlan(
+            phase=RoutingPhase.DECODE,
+            experts=(expert,),
+            slots=(ordinal,),
+            hits=(),
+            misses=(expert,),
+            loads=(),
+            evictions=(),
+        )
+        for ordinal, expert in enumerate(experts)
+    )
+    futures: tuple[Future[ReadyRoute], ...] = tuple(Future() for _ in parts)
+    layer_lock = threading.Lock()
+    layer_lock.acquire()
+    releases: list[int] = []
+
+    class Projection:
+        def __init__(self, plan: RoutePlan) -> None:
+            self.plan = plan
+
+        def release(self, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+            releases.append(self.plan.experts[0])
+
+    class Slots:
+        progressive_component_reads = True
+
+        def wait_projection_route(self, _layer, plan, **_kwargs):
+            return Projection(plan)
+
+    class Runtime:
+        slots = Slots()
+
+    pending = PendingSplitRoute(
+        runtime=Runtime(),  # type: ignore[arg-type]
+        layer=1,
+        plan=RoutePlan(
+            phase=RoutingPhase.DECODE,
+            experts=experts,
+            slots=(0, 1, 2),
+            hits=(),
+            misses=experts,
+            loads=(),
+            evictions=(),
+        ),
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures=dict(zip(futures, parts, strict=True)),
+    )
+    try:
+        projections = tuple(pending.iter_projection_misses())
+        assert tuple(route.plan.experts for route in projections) == (
+            (2,),
+            (0,),
+            (1,),
+        )
+        for route in projections:
+            pending.release_projection(route, synchronize=False)
+            with pytest.raises(ExpertSlotError, match="not owned"):
+                pending.release_projection(route, synchronize=False)
+        assert releases == [2, 0, 1]
+    finally:
+        for future in futures:
+            future.cancel()
+        layer_lock.release()
 
 
 def test_native_backend_failure_is_normalized_and_counted(tmp_path: Path) -> None:
