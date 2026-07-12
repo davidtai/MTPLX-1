@@ -41,6 +41,6 @@
   "decision": {
     "gate": "investigation_hold_host_stability",
     "action": "quarantine_sustained_runs_pending_root_cause",
-    "reason": "The host kernel-panicked during the first candidate arm after the matched base completed normally. No candidate performance artifact exists, so throughput, parity, and runner-hook bandwidth gates are unmeasured. PR #18 remains open for bounded root-cause investigation."
+    "reason": "The host kernel-panicked during the first candidate arm after the matched base completed normally. No candidate performance artifact exists, so throughput, parity, and runner-hook bandwidth gates are unmeasured. PR #18 remains open on investigation hold rather than rejected."
   }
 }
