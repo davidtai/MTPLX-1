@@ -1,0 +1,77 @@
+{
+  "schema": "mtplx-runtime-host-incident-v1",
+  "run": {
+    "branch": "codex/moe-runtime-gated-integration",
+    "git_commit": "ab57b80",
+    "relationship_to_pr18": "retained base without PR18 code",
+    "run_label": "hy3-q4-gated-pr18-postupdate-base-p1",
+    "artifact_written": false,
+    "natural_completion": false,
+    "verified_sidecar": true,
+    "qwen_model_disabled": true,
+    "qwen_gateway_enabled": true,
+    "concurrency": 1,
+    "max_tokens": 2048,
+    "slot_layout": "component-banks"
+  },
+  "host": {
+    "macos_version": "26.5.2",
+    "macos_build": "25F84",
+    "boot_before_panic_local": "2026-07-12T11:40:38-05:00",
+    "panic_at_local": "2026-07-12T12:37:30-05:00",
+    "reboot_at_local": "2026-07-12T12:37:50-05:00"
+  },
+  "panic": {
+    "panic_string": "watchdog timeout: no checkins from watchdogd in 91 seconds",
+    "panic_report_sha256": "db1b77972f2a492862655ca6f14c933c38dfbe77b3a4b072c92e601844d6eb02",
+    "benchmark_process": {
+      "name": "python3.12",
+      "pid": 5772,
+      "resident_memory_bytes": 90314405112,
+      "metal_thread_queue": "com.Metal.CommandQueueDispatch",
+      "metal_thread_state": [
+        "TH_WAIT",
+        "TH_UNINT"
+      ],
+      "metal_thread_stall_seconds": 101.579419291
+    },
+    "blocked_driver_stack": [
+      {
+        "bundle": "com.apple.iokit.IOGPUFamily",
+        "version": "130.15.2",
+        "uuid": "B8F47BA6-A756-3D58-BF34-24DFDCC338E5"
+      },
+      {
+        "bundle": "com.apple.AGXG17X",
+        "version": "351.2",
+        "uuid": "48DBA7BD-0110-37E5-8F6E-545F608F748D"
+      }
+    ],
+    "memory_pressure": false,
+    "compressor_status": "OK",
+    "interpretation": "The retained base arm encountered the same Metal command-queue hang on macOS 26.5.2. The arm was not exclusive because another agent was reportedly running experiments, so it cannot establish whether the base alone reproduces the panic."
+  },
+  "static_root_cause_evidence": {
+    "confidence": "moderate",
+    "path": "begin_split_route submits component-bank miss reads before HotExpertSwitchGLU evaluates resident hits",
+    "resource_aliasing": "different logical slot rows share one Metal buffer per projection",
+    "hazard": "CPU preadv writes can overlap GPU reads of another row in the same Metal resource",
+    "scope": "retained component-bank base and PR18 candidate"
+  },
+  "co_tenant_confound": {
+    "reported_by_user": true,
+    "exclusive_gpu_window_attested": false,
+    "second_live_mlx_process_in_panic_stackshot": false,
+    "other_metal_queues_blocked": [
+      "NotificationCenter"
+    ],
+    "interpretation": "A concurrent experiment may have overlapped earlier and exited after wedging the global GPU. The panic stackshot cannot confirm or exclude that sequence."
+  },
+  "decision": {
+    "gate": "confounded_component_bank_host_stability_blocker",
+    "action": "stop_all_sustained_component_bank_runs",
+    "pr18_status": "open_and_unattributed",
+    "next_gate": "Add an exclusive-GPU preflight that rejects any competing Metal/MLX experiment, wait for a clean cooldown/reboot, then repeat bounded base and candidate canaries. Resource-level CPU-write/GPU-read isolation remains a separate software requirement.",
+    "reason": "The post-update base arm wrote no artifact and another agent was reportedly experimenting concurrently. The arm is invalid for both performance comparison and causal attribution."
+  }
+}
