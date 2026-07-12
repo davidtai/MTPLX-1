@@ -20,7 +20,7 @@ from mlx_lm.models.activations import swiglu
 
 from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
-from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
+from mtplx.expert_slots import ExpertSlotBinding, ExpertSlotError, ReadyRoute
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.expert_streaming_models import ExpertMemoryPlan, ExpertStreamingModelSpec
 from mtplx.mmap_mlx import mmap_u32
@@ -883,7 +883,7 @@ class HotExpertSwitchGLU(nn.Module):
         def stage_component_gate_up(
             positions: tuple[int, ...] | list[int],
             bindings: tuple[ExpertSlotBinding, ...],
-        ) -> list[tuple[list[int], tuple[ExpertSlotBinding, ...], mx.array]]:
+        ) -> list[tuple[int, list[int], mx.array]]:
             """Evaluate trusted gate/up rows while down suffixes keep loading."""
 
             by_bank: dict[int, list[tuple[int, ExpertSlotBinding]]] = {}
@@ -891,17 +891,11 @@ class HotExpertSwitchGLU(nn.Module):
                 by_bank.setdefault(id(binding.buffer.bank), []).append(
                     (global_position, binding)
                 )
-            staged: list[
-                tuple[list[int], tuple[ExpertSlotBinding, ...], mx.array]
-            ] = []
+            staged: list[tuple[int, list[int], mx.array]] = []
             hidden_values: list[mx.array] = []
             for assignments in by_bank.values():
-                grouped_positions = [
-                    position for position, _binding in assignments
-                ]
-                grouped_bindings = tuple(
-                    binding for _position, binding in assignments
-                )
+                grouped_positions = [position for position, _binding in assignments]
+                grouped_bindings = tuple(binding for _position, binding in assignments)
                 token_positions = mx.array(
                     [position // top_k for position in grouped_positions],
                     dtype=mx.int32,
@@ -913,18 +907,32 @@ class HotExpertSwitchGLU(nn.Module):
                     group_size=self.group_size,
                 )
                 hidden_values.append(hidden)
-                staged.append((grouped_positions, grouped_bindings, hidden))
+                staged.append(
+                    (id(grouped_bindings[0].buffer.bank), grouped_positions, hidden)
+                )
             mx.eval(hidden_values)
             return staged
 
         def finish_component_down(
-            staged: list[
-                tuple[list[int], tuple[ExpertSlotBinding, ...], mx.array]
-            ],
+            staged: list[tuple[int, list[int], mx.array]],
+            ready: ReadyRoute,
         ) -> None:
+            bindings_by_bank: dict[int, list[ExpertSlotBinding]] = {}
+            for binding in ready.bindings:
+                bindings_by_bank.setdefault(id(binding.buffer.bank), []).append(binding)
             wave_outputs: list[mx.array] = []
             wave_positions: list[int] = []
-            for grouped_positions, grouped_bindings, hidden in staged:
+            for bank_id, grouped_positions, hidden in staged:
+                try:
+                    grouped_bindings = tuple(bindings_by_bank.pop(bank_id))
+                except KeyError as exc:
+                    raise ExpertSlotError(
+                        "projection and suffix routes use different component banks"
+                    ) from exc
+                if len(grouped_positions) != len(grouped_bindings):
+                    raise ExpertSlotError(
+                        "projection and suffix assignment counts differ"
+                    )
                 wave_outputs.append(
                     _run_component_bank_down(
                         hidden,
@@ -933,9 +941,26 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(grouped_positions)
-            mx.eval(wave_outputs)
+            if bindings_by_bank:
+                raise ExpertSlotError(
+                    "suffix route contains an unstaged component bank"
+                )
+            fence_bindings(
+                ready,
+                ready.bindings,
+                wave_outputs,
+                force_sync=True,
+            )
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
+
+        def binding_key(
+            bindings: tuple[ExpertSlotBinding, ...],
+        ) -> tuple[tuple[int, int, int], ...]:
+            return tuple(
+                (binding.expert, binding.logical_slot, binding.generation)
+                for binding in bindings
+            )
 
         def evaluate_direct_bindings(
             positions: tuple[int, ...] | list[int],
@@ -1073,10 +1098,58 @@ class HotExpertSwitchGLU(nn.Module):
                 ):
                     shared = shared_work()
                     mx.eval(shared)
+                staged_misses: dict[
+                    tuple[tuple[int, int, int], ...],
+                    list[tuple[int, list[int], mx.array]],
+                ] = {}
+                if (
+                    self.runtime.config.slot_layout == "component-banks"
+                    and phase is RoutingPhase.DECODE
+                ):
+                    for projection in pending.iter_projection_misses():
+                        projection_error: BaseException | None = None
+                        try:
+                            projection.validate()
+                            projection_experts = {
+                                binding.expert for binding in projection.bindings
+                            }
+                            projection_positions = tuple(
+                                position
+                                for position, expert in zip(
+                                    wave.positions,
+                                    wave.experts,
+                                    strict=True,
+                                )
+                                if expert not in hit_set
+                                and expert in projection_experts
+                            )
+                            staged_misses[binding_key(projection.bindings)] = (
+                                stage_component_gate_up(
+                                    projection_positions,
+                                    projection.bindings,
+                                )
+                            )
+                        except BaseException as exc:
+                            projection_error = exc
+                            raise
+                        finally:
+                            try:
+                                pending.release_projection(
+                                    projection,
+                                    synchronize=False,
+                                )
+                            except BaseException:
+                                if projection_error is None:
+                                    raise
                 for miss_ready in pending.iter_ready_misses():
                     part_error: BaseException | None = None
                     try:
-                        ready_experts = set(miss_ready.plan.experts)
+                        ready_plan = getattr(miss_ready, "plan", None)
+                        ready_experts = set(
+                            ready_plan.experts
+                            if ready_plan is not None
+                            else pending.plan.misses
+                        )
                         miss_positions = tuple(
                             position
                             for position, expert in zip(
@@ -1084,12 +1157,23 @@ class HotExpertSwitchGLU(nn.Module):
                             )
                             if expert not in hit_set and expert in ready_experts
                         )
-                        evaluate_bindings(
-                            miss_positions,
-                            miss_ready.bindings,
-                            miss_ready,
-                            force_sync=True,
+                        staged = (
+                            staged_misses.pop(
+                                binding_key(miss_ready.bindings),
+                                None,
+                            )
+                            if staged_misses
+                            else None
                         )
+                        if staged is None:
+                            evaluate_bindings(
+                                miss_positions,
+                                miss_ready.bindings,
+                                miss_ready,
+                                force_sync=True,
+                            )
+                        else:
+                            finish_component_down(staged, miss_ready)
                     except BaseException as exc:
                         part_error = exc
                         raise

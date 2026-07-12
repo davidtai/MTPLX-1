@@ -334,7 +334,9 @@ class PositionalExpertReader:
                 while pending:
                     self._check_cancelled(cancel_event, deadline_ns)
                     try:
-                        read_now = int(os.preadv(fd, pending, source_offset + read_total))
+                        read_now = int(
+                            os.preadv(fd, pending, source_offset + read_total)
+                        )
                     except InterruptedError:
                         continue
                     if read_now <= 0:

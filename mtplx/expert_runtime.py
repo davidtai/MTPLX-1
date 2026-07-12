@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -348,6 +348,8 @@ class PendingSplitRoute:
         policy_txn: RoutePolicyTxn | None = None,
         io_admission: RouteIOAdmission | None = None,
         miss_cancel_event: threading.Event | None = None,
+        wait_cancel_event: Any | None = None,
+        deadline_ns: int | None = None,
         lifecycle_release: Callable[[], None] | None = None,
         miss_parts: tuple[RoutePlan, ...] | None = None,
     ) -> None:
@@ -380,7 +382,12 @@ class PendingSplitRoute:
         self._miss_ready: _ReadyRouteGroup | None = None
         self._aggregate_lease: _ReadyRouteGroup | None = None
         self._aggregate_lease_ordinals: set[int] = set()
+        self._projection_ready_parts: dict[int, ProjectionReadyRoute] = {}
+        self._projection_consumer_leases: set[int] = set()
+        self._releasing_projection_leases: set[int] = set()
         self._miss_cancel_event = miss_cancel_event or threading.Event()
+        self._wait_cancel_event = wait_cancel_event
+        self._deadline_ns = deadline_ns
         self._lifecycle_release = lifecycle_release
         self._layer_lock = layer_lock
         self._state_lock = threading.Lock()
@@ -414,6 +421,99 @@ class PendingSplitRoute:
 
         with self._state_lock:
             return any(not future.done() for future in self._miss_futures)
+
+    def iter_projection_misses(self) -> Iterable[ProjectionReadyRoute]:
+        """Yield gate/up-ready miss parts in stable route order."""
+
+        if not self.runtime.slots.progressive_component_reads:
+            return
+        with self._state_lock:
+            snapshot = tuple(
+                sorted(
+                    self._miss_futures,
+                    key=lambda future: self._miss_ordinals[future],
+                )
+            )
+        for future in snapshot:
+            with self._state_lock:
+                if self._failure is not None:
+                    raise self._failure
+                if self._close_requested:
+                    raise ExpertSlotError("split route closed before projection yield")
+                plan = self._miss_futures.get(future)
+                ordinal = self._miss_ordinals.get(future)
+            if plan is None or ordinal is None:
+                continue
+            try:
+                projection = self.runtime.slots.wait_projection_route(
+                    self.layer,
+                    plan,
+                    load_future=future,
+                    cancel_event=self._wait_cancel_event,
+                    deadline_ns=self._deadline_ns,
+                )
+            except BaseException as exc:
+                self.abort(exc)
+                raise
+            with self._state_lock:
+                failure = self._failure
+                if failure is None and not self._close_requested:
+                    self._projection_ready_parts[ordinal] = projection
+                    self._projection_consumer_leases.add(ordinal)
+                    leased = True
+                else:
+                    leased = False
+            if not leased:
+                try:
+                    projection.release(synchronize=False)
+                except BaseException as exc:
+                    self._record_cleanup_error(exc)
+                if failure is not None:
+                    raise failure
+                error = ExpertSlotError("split route closed before projection yield")
+                self.abort(error)
+                raise error
+            yield projection
+
+    def release_projection(
+        self,
+        projection: ProjectionReadyRoute,
+        *,
+        synchronize: bool = True,
+    ) -> None:
+        """Release one projection lease exactly once."""
+
+        with self._state_lock:
+            matches = tuple(
+                ordinal
+                for ordinal, candidate in self._projection_ready_parts.items()
+                if candidate is projection
+            )
+            if len(matches) != 1:
+                raise ExpertSlotError(
+                    "projection route is not owned by this split route"
+                )
+            ordinal = matches[0]
+            if ordinal not in self._projection_consumer_leases:
+                raise ExpertSlotError("projection route has no active consumer lease")
+            self._projection_consumer_leases.remove(ordinal)
+            self._releasing_projection_leases.add(ordinal)
+            self._projection_ready_parts.pop(ordinal)
+        release_error: BaseException | None = None
+        try:
+            projection.release(synchronize=synchronize)
+        except BaseException as exc:
+            release_error = exc
+            self._record_cleanup_error(exc)
+        with self._state_lock:
+            self._releasing_projection_leases.remove(ordinal)
+        success_error = self._finish_success_close_if_ready()
+        self._finish_failure_if_ready()
+        self._finalize_if_ready()
+        if release_error is not None:
+            raise release_error
+        if success_error is not None:
+            raise success_error
 
     def _attach_miss_future(
         self,
@@ -548,6 +648,8 @@ class PendingSplitRoute:
                 or self._claimed_miss_futures
                 or self._consumer_leases
                 or self._releasing_consumer_leases
+                or self._projection_consumer_leases
+                or self._releasing_projection_leases
                 or self._aggregate_lease is not None
                 or self._ready_cleanup_finalizing
                 or self._failure_finalizing
@@ -603,12 +705,51 @@ class PendingSplitRoute:
                 self._failure_finalizing = False
             self._finalize_if_ready()
 
+    def _raise_wait_boundary(self) -> None:
+        if self._wait_cancel_event is not None and self._wait_cancel_event.is_set():
+            raise ExpertSlotError("split route wait was cancelled")
+        if self._deadline_ns is not None and time.monotonic_ns() >= self._deadline_ns:
+            raise TimeoutError("split route deadline exceeded")
+
+    def _completed_miss_futures(
+        self,
+        futures: Iterable[Future[ReadyRoute]],
+    ) -> Iterable[Future[ReadyRoute]]:
+        remaining = set(futures)
+        while remaining:
+            try:
+                self._raise_wait_boundary()
+                timeout = 0.01
+                if self._deadline_ns is not None:
+                    timeout = min(
+                        timeout,
+                        max(
+                            0.0,
+                            (self._deadline_ns - time.monotonic_ns()) / 1e9,
+                        ),
+                    )
+                completed, _pending = wait(
+                    remaining,
+                    timeout=timeout,
+                    return_when=FIRST_COMPLETED,
+                )
+                self._raise_wait_boundary()
+            except BaseException as exc:
+                self.abort(exc)
+                raise
+            for future in sorted(
+                completed,
+                key=lambda candidate: self._miss_ordinals.get(candidate, 0),
+            ):
+                remaining.remove(future)
+                yield future
+
     def iter_ready_misses(self) -> Iterable[ReadyRoute]:
         """Yield authoritative miss bindings in physical completion order."""
 
         with self._state_lock:
             snapshot = tuple(self._miss_futures)
-        for future in as_completed(snapshot):
+        for future in self._completed_miss_futures(snapshot):
             with self._state_lock:
                 if future not in self._miss_futures:
                     continue
@@ -841,6 +982,8 @@ class PendingSplitRoute:
                 or self._claimed_miss_futures
                 or self._consumer_leases
                 or self._releasing_consumer_leases
+                or self._projection_consumer_leases
+                or self._releasing_projection_leases
                 or self._aggregate_lease is not None
                 or self._ready_cleanup_finalizing
                 or self._ready_cleanup_complete
@@ -1609,6 +1752,8 @@ class ExpertStreamingRuntime:
                 policy_txn=policy_txn,
                 io_admission=io_admission,
                 miss_cancel_event=miss_cancel_event,
+                wait_cancel_event=combined_cancel,
+                deadline_ns=deadline_ns,
                 miss_parts=miss_parts,
             )
             if miss_plan is not None:

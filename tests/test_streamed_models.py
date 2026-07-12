@@ -1465,7 +1465,7 @@ class _ProjectionPending:
     def release_hits(self) -> None:
         raise AssertionError("all-miss projection fixture has no hits")
 
-    def finish_gate_up(self):
+    def iter_projection_misses(self):
         self.events.append("gate-up-ready")
 
         class ProjectionRoute:
@@ -1474,14 +1474,22 @@ class _ProjectionPending:
             def validate(route_self) -> None:
                 self.events.append("validate-gate-up")
 
-        return ProjectionRoute()
+        yield ProjectionRoute()
 
-    def finish_misses(self):
-        self.events.append("record-ready")
-        return SimpleNamespace(bindings=self._bindings)
-
-    def release_gate_up(self) -> None:
+    def release_projection(self, route, *, synchronize: bool = True) -> None:
+        assert route.bindings == self._bindings
+        assert synchronize is False
         self.events.append("release-gate-up")
+
+    def iter_ready_misses(self):
+        self.events.append("record-ready")
+        yield SimpleNamespace(bindings=self._bindings)
+
+    def release_miss(self, ready) -> None:
+        assert ready.bindings == self._bindings
+
+    def abort(self, error: BaseException) -> None:
+        raise AssertionError("projection fixture unexpectedly aborted") from error
 
     def close(self) -> None:
         self.events.append("close")
@@ -1494,6 +1502,8 @@ def test_component_switch_runs_gate_up_before_waiting_for_down(
     bank = object()
     binding = SimpleNamespace(
         expert=0,
+        logical_slot=0,
+        generation=1,
         buffer=SimpleNamespace(bank=bank),
     )
 
@@ -1510,6 +1520,9 @@ def test_component_switch_runs_gate_up_before_waiting_for_down(
 
         def route_waves(self, expert_ids, **_kwargs):
             return (RouteWave(positions=(0,), experts=tuple(expert_ids)),)
+
+        def try_all_hit_route(self, *_args, **_kwargs):
+            return None
 
         def begin_split_route(self, *_args, **_kwargs):
             events.append("begin-read")
@@ -1548,9 +1561,9 @@ def test_component_switch_runs_gate_up_before_waiting_for_down(
         "gate-up-ready",
         "validate-gate-up",
         "gate-up-q4",
+        "release-gate-up",
         "record-ready",
         "down-q4",
-        "release-gate-up",
         "close",
     ]
 

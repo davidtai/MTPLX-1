@@ -751,9 +751,15 @@ def test_projection_wait_honors_cancel_and_deadline() -> None:
         projection = next(pending.iter_projection_misses())
         assert observed == [(combined_cancel, deadline_ns)]
         pending.release_projection(projection, synchronize=False)
-    finally:
-        future.cancel()
+        external_cancel.set()
+        with pytest.raises(ExpertSlotError, match="wait was cancelled"):
+            next(pending.iter_ready_misses())
+        pending.close()
+        assert layer_lock.acquire(blocking=False)
         layer_lock.release()
+    finally:
+        if layer_lock.locked():
+            layer_lock.release()
 
 
 def test_incremental_projection_parts_preserve_order_and_single_ownership() -> None:

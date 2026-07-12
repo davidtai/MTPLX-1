@@ -143,6 +143,7 @@ class _PreparedSlotState:
     generation: int
     digest: str | None
     error: BaseException | None
+    gate_up_ready: bool
 
 
 @dataclass(frozen=True)
@@ -377,11 +378,14 @@ class ProjectionReadyRoute:
         pool: ExpertSlotPool,
         bindings: tuple[ExpertSlotBinding, ...],
         pinned: tuple[_PhysicalSlot, ...],
+        lifecycle: _RouteLifecycle,
     ) -> None:
         self.pool = pool
         self.bindings = bindings
         self._pinned = pinned
+        self._lifecycle = lifecycle
         self._released = False
+        self._release_lock = threading.Lock()
 
     def validate(self) -> None:
         if self._released:
@@ -389,8 +393,7 @@ class ProjectionReadyRoute:
         for binding, slot in zip(self.bindings, self._binding_slots(), strict=True):
             with slot.condition:
                 if (
-                    slot.state
-                    not in {ExpertSlotState.LOADING, ExpertSlotState.READY}
+                    slot.state not in {ExpertSlotState.LOADING, ExpertSlotState.READY}
                     or not slot.gate_up_ready
                     or slot.layer != binding.layer
                     or slot.expert != binding.expert
@@ -407,17 +410,36 @@ class ProjectionReadyRoute:
         )
 
     def release(self, *, synchronize: bool = True) -> None:
-        if self._released:
-            return
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+        synchronize_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
         if synchronize and self.pool.device_synchronize is not None:
-            self.pool.device_synchronize()
+            try:
+                self.pool.device_synchronize()
+            except BaseException as exc:
+                synchronize_error = exc
         for slot in self._pinned:
-            with slot.condition:
-                if slot.pins <= 0:
-                    raise ExpertSlotError("slot pin accounting underflow")
-                slot.pins -= 1
-                slot.condition.notify_all()
-        self._released = True
+            try:
+                with slot.condition:
+                    if slot.pins <= 0:
+                        raise ExpertSlotError("slot pin accounting underflow")
+                    slot.pins -= 1
+                    slot.condition.notify_all()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        try:
+            self._lifecycle.release()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if synchronize_error is not None:
+            raise synchronize_error
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 class _CombinedCancel:
@@ -765,6 +787,7 @@ class ExpertSlotPool:
                     generation=previous_generation,
                     digest=previous_digest,
                     error=previous_error,
+                    gate_up_ready=slot.gate_up_ready,
                 )
                 slot.layer = layer
                 slot.expert = load.expert
@@ -794,6 +817,7 @@ class ExpertSlotPool:
                 slot.generation = previous.generation
                 slot.digest = previous.digest
                 slot.error = previous.error
+                slot.gate_up_ready = previous.gate_up_ready
                 slot.condition.notify_all()
 
     @staticmethod
@@ -978,6 +1002,7 @@ class ExpertSlotPool:
 
         if not self.progressive_component_reads:
             raise ExpertSlotError("projection pipeline is not enabled")
+        lifecycle = self.retain_split_lifecycle()
         bindings: list[ExpertSlotBinding] = []
         unique_pins: dict[int, _PhysicalSlot] = {}
         try:
@@ -986,6 +1011,8 @@ class ExpertSlotPool:
                 while True:
                     if cancel_event is not None and cancel_event.is_set():
                         raise ExpertSlotError("projection-ready wait was cancelled")
+                    if deadline_ns is not None:
+                        self._remaining(deadline_ns)
                     with slot.condition:
                         matching = slot.layer == layer and slot.expert == expert
                         if (
@@ -1043,12 +1070,14 @@ class ExpertSlotPool:
                 with slot.condition:
                     slot.pins -= 1
                     slot.condition.notify_all()
+            lifecycle.release()
             raise
         self.metrics.update(projection_ready_routes=1)
         return ProjectionReadyRoute(
             self,
             tuple(bindings),
             tuple(unique_pins.values()),
+            lifecycle,
         )
 
     def ensure_route(
@@ -1216,8 +1245,7 @@ class ExpertSlotPool:
                         assert previous is not None
                         prepared_states.append(previous)
                 progressive = (
-                    self.progressive_component_reads
-                    and plan.phase.value == "decode"
+                    self.progressive_component_reads and plan.phase.value == "decode"
                 )
                 use_batch = (
                     self._can_batch_component_sidecar(plan, owned_loads)
