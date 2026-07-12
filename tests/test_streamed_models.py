@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -1292,6 +1293,19 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
         runtime.close()
 
 
+def test_disabled_metal_route_requires_no_experimental_runtime_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION", raising=False)
+    runtime = SimpleNamespace(spec=SimpleNamespace(quant_group_size=64))
+
+    switch = HotExpertSwitchGLU(runtime, 1)
+
+    assert switch._metal_route_enabled is False
+    assert switch._metal_slot_table_host == ()
+    assert switch._metal_slot_table is None
+
+
 def test_experimental_metal_route_resolves_warm_hits_on_device(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1330,18 +1344,257 @@ def test_experimental_metal_route_resolves_warm_hits_on_device(
         def unexpected(*_args, **_kwargs):
             raise AssertionError("warm Metal-resolved route used the split path")
 
-        monkeypatch.setattr(runtime, "route_waves", unexpected)
+        route_waves: list[tuple[int, ...]] = []
+        original_route_waves = runtime.route_waves
+
+        def record_route_waves(expert_ids, **kwargs):
+            route_waves.append(tuple(expert_ids))
+            return original_route_waves(expert_ids, **kwargs)
+
+        monkeypatch.setattr(runtime, "route_waves", record_route_waves)
         monkeypatch.setattr(runtime, "begin_split_route", unexpected)
         warm = switch(tokens, indices)
         mx.eval(warm)
 
         assert mx.array_equal(warm, cold).item()
+        assert route_waves == [(2, 0, 2, 1)]
         stats = runtime.snapshot(mx_module=mx)["metal_route_resolution"]
         assert stats["probes"] == 2
         assert stats["all_hits"] == 1
         assert stats["misses"] == 1
         assert stats["speculative_misses"] == 1
         assert runtime.snapshot(mx_module=mx)["slots"]["pins"] == 0
+    finally:
+        runtime.close()
+
+
+def test_experimental_metal_route_preserves_waves_counters_and_lru_victims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(3),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        transient_slots=2,
+        slot_layout="component-banks",
+        cache_policy="lru",
+    )
+    plan = stream_config.memory_plan(spec)
+
+    def open_runtime() -> ExpertStreamingRuntime:
+        return ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_component_bank_allocator(
+                plan,
+                spec,
+                load_expert_manifest(manifest_path),
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+
+    monkeypatch.delenv("MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION", raising=False)
+    host_runtime = open_runtime()
+    host_switch = HotExpertSwitchGLU(host_runtime, 1)
+    monkeypatch.setenv("MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION", "1")
+    metal_runtime = open_runtime()
+    metal_switch = HotExpertSwitchGLU(metal_runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.bfloat16)
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    try:
+        host_cold = host_switch(tokens, indices)
+        metal_cold = metal_switch(tokens, indices)
+        mx.eval(host_cold, metal_cold)
+        assert host_runtime._banks[1].resident_experts == (2, 0, 1)
+        assert metal_runtime._banks[1].resident_experts == (2, 0, 1)
+
+        host_before = host_runtime.snapshot(mx_module=mx)["cache"]
+        metal_before = metal_runtime.snapshot(mx_module=mx)["cache"]
+        host_warm = host_switch(tokens, indices)
+        metal_warm = metal_switch(tokens, indices)
+        mx.eval(host_warm, metal_warm)
+
+        host_after = host_runtime.snapshot(mx_module=mx)["cache"]
+        metal_after = metal_runtime.snapshot(mx_module=mx)["cache"]
+        assert mx.array_equal(metal_warm, host_warm).item()
+        assert host_after["route_calls"] - host_before["route_calls"] == 2
+        assert metal_after["route_calls"] - metal_before["route_calls"] == 2
+        assert metal_after["expert_requests"] - metal_before["expert_requests"] == 4
+        assert metal_after["expert_hits"] - metal_before["expert_hits"] == 4
+
+        host_next = host_runtime._banks[1].plan([3], phase="decode")
+        metal_next = metal_runtime._banks[1].plan([3], phase="decode")
+        assert metal_next.evictions == host_next.evictions
+    finally:
+        metal_runtime.close()
+        host_runtime.close()
+
+
+def test_metal_probe_failure_fences_candidate_before_releasing_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION", "1")
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(4),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        slot_layout="component-banks",
+    )
+    plan = stream_config.memory_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.bfloat16)
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    original_eval = expert_mlx.mx.eval
+    try:
+        cold = switch(tokens, indices)
+        original_eval(cold)
+
+        events: list[str] = []
+        original_external_lifetime = runtime.slots.external_route_lifetime
+        original_metal_lease = runtime.metal_route_lease
+
+        @contextmanager
+        def observed_external_lifetime():
+            with original_external_lifetime():
+                events.append("external-enter")
+                try:
+                    yield
+                finally:
+                    events.append("external-exit")
+
+        @contextmanager
+        def observed_metal_lease(layer: int):
+            with original_metal_lease(layer):
+                events.append("lease-enter")
+                try:
+                    yield
+                finally:
+                    events.append("lease-exit")
+
+        candidate = mx.zeros((4, spec.hidden_size), dtype=mx.bfloat16)
+        probe_error = RuntimeError("injected Metal probe failure")
+        fence_error = RuntimeError("injected Metal candidate fence failure")
+
+        def run_candidate(*_args, **_kwargs):
+            return candidate
+
+        def record_async_eval(*_values) -> None:
+            events.append("candidate-launch")
+
+        def fail_probe_then_fence(*values) -> None:
+            if len(values) == 1 and values[0] is indices:
+                original_eval(indices)
+                return
+            if len(values) == 1 and values[0] is candidate:
+                events.append("candidate-fence")
+                raise fence_error
+            events.append("probe-failure")
+            raise probe_error
+
+        monkeypatch.setattr(
+            runtime.slots,
+            "external_route_lifetime",
+            observed_external_lifetime,
+        )
+        monkeypatch.setattr(runtime, "metal_route_lease", observed_metal_lease)
+        monkeypatch.setattr(expert_mlx, "_run_component_bank_q4_slots", run_candidate)
+        monkeypatch.setattr(expert_mlx.mx, "async_eval", record_async_eval)
+        monkeypatch.setattr(expert_mlx.mx, "eval", fail_probe_then_fence)
+
+        with pytest.raises(
+            RuntimeError, match="injected Metal probe failure"
+        ) as failed:
+            switch(tokens, indices)
+        assert failed.value is probe_error
+        assert any(
+            "candidate fence also failed" in note for note in failed.value.__notes__
+        )
+        assert events == [
+            "external-enter",
+            "lease-enter",
+            "candidate-launch",
+            "probe-failure",
+            "candidate-fence",
+            "lease-exit",
+            "external-exit",
+        ]
+    finally:
+        monkeypatch.setattr(expert_mlx.mx, "eval", original_eval)
+        runtime.close()
+
+
+@pytest.mark.parametrize("invalid_expert", [-1, 4])
+def test_experimental_metal_route_rejects_invalid_ids_before_device_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_expert: int,
+) -> None:
+    monkeypatch.setenv("MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION", "1")
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    assert spec.expert_count == 4
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(4),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        slot_layout="component-banks",
+    )
+    plan = stream_config.memory_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.bfloat16)
+    valid_indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    invalid_indices = mx.array(
+        [[2, 0], [2, invalid_expert]],
+        dtype=mx.int32,
+    )
+    try:
+        cold = switch(tokens, valid_indices)
+        mx.eval(cold)
+
+        def unexpected_take(*_args, **_kwargs):
+            raise AssertionError("invalid expert reached mx.take")
+
+        monkeypatch.setattr(expert_mlx.mx, "take", unexpected_take)
+        with pytest.raises(ValueError, match="outside"):
+            switch(tokens, invalid_indices)
     finally:
         runtime.close()
 
@@ -1444,6 +1697,7 @@ def test_slot_fence_all_hit_synchronous_eval_failure_blocks_replacement(
             runtime.close(timeout=2)
         except ExpertSlotError:
             pass
+
 
 def test_resident_loader_reads_extensionless_hugging_face_cache_blob(
     tmp_path: Path,

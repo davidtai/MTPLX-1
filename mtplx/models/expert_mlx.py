@@ -676,10 +676,14 @@ class HotExpertSwitchGLU(nn.Module):
         self.runtime = runtime
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
-        metal_route_mode = os.environ.get(
-            "MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION",
-            "",
-        ).strip().lower()
+        metal_route_mode = (
+            os.environ.get(
+                "MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION",
+                "",
+            )
+            .strip()
+            .lower()
+        )
         self._metal_route_enabled = (
             metal_route_mode in {"1", "true", "yes", "on", "speculative"}
             and runtime.config.slot_layout == "component-banks"
@@ -724,9 +728,25 @@ class HotExpertSwitchGLU(nn.Module):
         bank = self.runtime.slots.persistent_component_bank(self.layer_index)
         if bank is None:
             return None
+        mx.eval(indices)
+        expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
+        invalid_expert = next(
+            (
+                expert
+                for expert in expert_ids
+                if expert < 0 or expert >= self.runtime.spec.expert_count
+            ),
+            None,
+        )
+        if invalid_expert is not None:
+            raise ValueError(
+                f"expert ID {invalid_expert} is outside [0, "
+                f"{self.runtime.spec.expert_count})"
+            )
 
-        with self.runtime.slots.external_route_lifetime(), self.runtime.metal_route_lease(
-            self.layer_index
+        with (
+            self.runtime.slots.external_route_lifetime(),
+            self.runtime.metal_route_lease(self.layer_index),
         ):
             current_table = self.runtime.resident_slot_table_locked(self.layer_index)
             if current_table is None:
@@ -754,10 +774,25 @@ class HotExpertSwitchGLU(nn.Module):
             )
             mx.async_eval(candidate, miss_count)
             sync_started = time.perf_counter()
-            mx.eval(miss_count)
+            probe_error: BaseException | None = None
+            try:
+                mx.eval(miss_count)
+            except BaseException as exc:
+                probe_error = exc
+                raise
+            finally:
+                try:
+                    mx.eval(candidate)
+                except BaseException as fence_error:
+                    if probe_error is None:
+                        raise
+                    add_note = getattr(probe_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            f"Metal route candidate fence also failed: {fence_error!r}"
+                        )
             sync_time = time.perf_counter() - sync_started
             all_hit = int(miss_count.item()) == 0
-            mx.eval(candidate)
             self.runtime.observe_metal_route_probe(
                 all_hit=all_hit,
                 speculative=True,
@@ -766,20 +801,24 @@ class HotExpertSwitchGLU(nn.Module):
             if not all_hit:
                 return None
 
-            # Materialize IDs only after the Q4 graph has consumed the stable
-            # mapping. This keeps the eight-ID copy and Python policy update
-            # out of the pre-compute boundary while preserving exact LRU/LFU
-            # semantics for the next token.
-            expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
             resolved_slots = tuple(int(value) for value in resolved.tolist())
-            plan = self.runtime.commit_metal_resolved_all_hits_locked(
-                self.layer_index,
-                expert_ids,
-                resolved_slots,
-                phase=phase,
-            )
-            if plan is None:
-                raise RuntimeError("Metal route table changed under its layer lease")
+            for wave in self.runtime.route_waves(expert_ids):
+                wave_experts = tuple(
+                    expert_ids[position] for position in wave.positions
+                )
+                wave_slots = tuple(
+                    resolved_slots[position] for position in wave.positions
+                )
+                plan = self.runtime.commit_metal_resolved_all_hits_locked(
+                    self.layer_index,
+                    wave_experts,
+                    wave_slots,
+                    phase=phase,
+                )
+                if plan is None:
+                    raise RuntimeError(
+                        "Metal route table changed under its layer lease"
+                    )
             self.runtime.observe_route(
                 self.layer_index,
                 phase,
@@ -846,9 +885,7 @@ class HotExpertSwitchGLU(nn.Module):
             # A Metal-resolved route is all-hit, so there is no miss I/O left
             # to overlap. Preserve the normal routed-then-shared contract and
             # the tuple shape promised by _run().
-            return metal_output, (
-                shared_work() if shared_work is not None else None
-            )
+            return metal_output, (shared_work() if shared_work is not None else None)
         mx.eval(indices)
         expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
         # Batch size is not a generation phase. A batched decode has shape
@@ -1182,6 +1219,8 @@ def run_switch_with_shared_overlap(
     if callable(overlap):
         return overlap(x, indices, shared_work)
     return switch_mlp(x, indices), shared_work()
+
+
 def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
