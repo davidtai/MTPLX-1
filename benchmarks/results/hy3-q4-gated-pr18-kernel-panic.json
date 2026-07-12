@@ -1,0 +1,46 @@
+{
+  "schema": "mtplx-runtime-candidate-incident-v1",
+  "candidate": {
+    "git_commit": "efe1809fae256a63de39b621b8ec337e82244704",
+    "source_pr": 18,
+    "source_commit": "f37be96",
+    "run_label": "hy3-q4-gated-pr18-candidate-p1"
+  },
+  "base": {
+    "git_commit": "7fcc036117176cae60cc98de0a04dbdca5773737",
+    "artifact": "hy3-q4-gated-pr18-base-p1.json",
+    "completed_at_local": "2026-07-12T09:13:58-05:00",
+    "completion_tokens": 1905,
+    "finish_reason": "stop",
+    "decode_tokens_per_second": 6.530173695018349,
+    "end_to_end_tokens_per_second": 5.740804421453216,
+    "peak_memory_bytes": 89145802612,
+    "read_bytes": 1768689893376,
+    "read_operations": 165678,
+    "completion_fence_failures": 0,
+    "short_reads": 0,
+    "io_errors": 0,
+    "integrity_errors": 0
+  },
+  "candidate_run": {
+    "artifact_written": false,
+    "natural_completion": false,
+    "verified_sidecar": true,
+    "qwen_model_disabled": true,
+    "qwen_gateway_enabled": true,
+    "concurrency": 1,
+    "max_tokens": 2048,
+    "slot_layout": "component-banks"
+  },
+  "host": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "boot_after_incident_local": "2026-07-12T09:16:44-05:00",
+    "panicmedic_telemetry_present": true,
+    "panic_report_available_at_triage": false
+  },
+  "decision": {
+    "gate": "failed_catastrophic_host_stability",
+    "action": "reject_pr18_without_rerun",
+    "reason": "The host kernel-panicked during the first candidate arm after the matched base completed normally. No candidate performance artifact exists, so throughput, parity, and runner-hook bandwidth gates are unmeasured."
+  }
+}
