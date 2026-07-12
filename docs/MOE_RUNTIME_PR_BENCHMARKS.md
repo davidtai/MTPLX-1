@@ -25,7 +25,7 @@ auditable.
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
-| #18 | `f37be96` -> repaired `efe1809` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, and final fences repaired; 2,060 passed / 4 skipped | Base completed at 6.5302 decode tok/s; candidate arm 1 kernel-panicked the host before writing an artifact | **Investigate; sustained lane quarantined** |
+| #18 | `f37be96` -> repaired through `b5d2262` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, final fences, and cross-row prefix ordering repaired; 2,061 passed / 4 skipped | Base completed at 6.5302 decode tok/s. Repaired bounded lanes completed through 1,024 tokens at 6.2355 decode tok/s, but the next 2,048-token lane produced a second GPU-driver watchdog panic before writing an artifact. | **Investigate; no sustained rerun on macOS 26.5.1** |
 
 "Not run" is a gate result, not an estimated zero. Hardware performance was
 intentionally not measured after a candidate failed correctness, because a fast
@@ -408,18 +408,49 @@ The verified-sidecar base arm completed naturally with 1,905 tokens and
 `stop`: 6.5302 decode tok/s, 5.7408 end-to-end tok/s, 89,145,802,612 bytes peak
 MLX, 1,768,689,893,376 expert-read bytes, 165,678 read operations, and zero
 completion-fence, short-read, I/O, or integrity failures. During the first
-candidate arm the host kernel-panicked and rebooted at 09:16:44. The candidate
-wrote no artifact, so token parity, throughput, tail latency, SSD bandwidth,
-and routed-memory hooks are unmeasured. The candidate is neither retained nor
-rejected: sustained hardware runs are quarantined while bounded diagnostics
-isolate whether the failure comes from concurrent CPU writes into MLX-backed
-component storage, Metal command fencing, memory pressure, or an unrelated
-host fault.
+candidate arm the host kernel-panicked and rebooted at 09:16:44 before writing
+a candidate artifact.
+
+Static ordering analysis then found that sibling gate/up prefix readers wrote
+different rows of the same component-major Metal resources after the first
+prefix kernel had started. RED `b42a0f7` exposed that overlap; `b5d2262`
+collects every prefix-ready lease before launching the first gate/up kernel.
+The focused files then passed 108 tests and the full suite passed 2,061 tests
+with 4 skipped. Exact-prefix bounded lanes completed at 32, 256, 512, and
+1,024 tokens. The 1,024 lane ran 210.705 seconds at 6.2355 decode tok/s and
+4.8602 end-to-end tok/s, peaked at 88,894,111,604 bytes, read
+1,024,025,296,896 expert bytes, and reported no fence, I/O, integrity, or pin
+failures.
+
+The next 2,048-token candidate lane nevertheless panicked again at 09:59:21
+and rebooted at 09:59:43 without writing an artifact. The recovered stackshot
+is conclusive about the failing subsystem: the 90,410,104,920-byte benchmark
+`python3.12` process had its `com.Metal.CommandQueueDispatch` thread
+uninterruptibly blocked for 93.559 seconds in `IOGPUFamily` and `AGXG17X`, the
+same interval in which `watchdogd` stopped checking in. macOS reported no
+memory pressure and an OK compressor. This was a GPU command-queue hang, not
+an SSD-bandwidth or memory-pressure panic.
+
+The host is on macOS 26.5.1 build 25F80. macOS 26.5.2 build 25F84 is available,
+and [Apple's security advisory](https://support.apple.com/en-us/127595) says it
+fixes an `IOGPUFamily` race condition where an app may cause unexpected system
+termination. That directly matches the blocked driver family, so another
+sustained run on 26.5.1 is not an informative code gate. Separately, MTPLX
+still starts persistent miss writes before evaluating persistent hits; rows in
+one component bank share a Metal resource, so this pre-existing hit/miss
+overlap also needs isolation. PR #18 remains neither retained nor rejected:
+update the OS and remove or segregate same-bank CPU-write/GPU-read overlap
+before promoting bounded diagnostics back to a sustained lane.
 
 Raw evidence:
 
 - [`hy3-q4-gated-pr18-base-p1.json`](../benchmarks/results/hy3-q4-gated-pr18-base-p1.json)
 - [`hy3-q4-gated-pr18-kernel-panic.json`](../benchmarks/results/hy3-q4-gated-pr18-kernel-panic.json)
+- [`hy3-q4-gated-pr18-fixed-bounded32.json`](../benchmarks/results/hy3-q4-gated-pr18-fixed-bounded32.json)
+- [`hy3-q4-gated-pr18-fixed-bounded256.json`](../benchmarks/results/hy3-q4-gated-pr18-fixed-bounded256.json)
+- [`hy3-q4-gated-pr18-fixed-bounded512.json`](../benchmarks/results/hy3-q4-gated-pr18-fixed-bounded512.json)
+- [`hy3-q4-gated-pr18-fixed-bounded1024.json`](../benchmarks/results/hy3-q4-gated-pr18-fixed-bounded1024.json)
+- [`hy3-q4-gated-pr18-second-kernel-panic.json`](../benchmarks/results/hy3-q4-gated-pr18-second-kernel-panic.json)
 
 ## Memory and SSD bandwidth
 

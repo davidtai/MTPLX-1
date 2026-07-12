@@ -344,15 +344,20 @@ Count projection routes as active leases until exactly-once release. Forward com
 Run full pytest/Ruff/diff checks. Use `--verified-sidecar` for both arms. Require `progressive_loads > 0`, `projection_ready_routes > 0`, token/stop parity, positive mean+median decode gain, bounded peak memory, and no material tail/physical-SSD/co-tenant regression.
 
 **Result:** source transplant `883bda2`, RED regressions `eedb6aa`, and repair
-`efe1809` passed 53 focused checks plus the 2,060-passed / 4-skipped full suite;
-the six touched files passed Ruff/format/diff checks. The repository-wide Ruff
-command reproduces five unrelated failures on base `7fcc036`. The matched
-verified-sidecar base completed naturally at 6.5302 decode tok/s with zero
-fence/I/O/integrity failures. The host kernel-panicked during candidate arm 1
-and rebooted at 09:16:44 before a candidate artifact was written. Keep PR #18
-open on investigation hold and quarantine sustained runs until a bounded repro
-or safety fix isolates the cause; parity, throughput, SSD, and memory-hook
-results are unmeasured rather than zero.
+`efe1809` passed the initial software gate. After candidate arm 1 panicked the
+host, RED `b42a0f7` exposed sibling prefix writes continuing after a kernel had
+started reading another row of the same component resource; `b5d2262` collects
+all prefix-ready leases before the first gate/up kernel. The focused files then
+passed 108 tests and the full suite passed 2,061 / 4 skipped. Exact-prefix lanes
+completed through 1,024 tokens at 6.2355 decode tok/s with zero reported
+fence/I/O/integrity/pin failures. The next 2,048-token lane caused a second
+watchdog panic: its Metal command-queue thread was blocked for 93.559 seconds in
+`IOGPUFamily`/`AGXG17X`, while macOS reported no memory pressure. Installed
+macOS 26.5.1 lacks Apple's 26.5.2 fix for an `IOGPUFamily` race that can cause
+unexpected system termination. Keep PR #18 open on investigation hold; do not
+rerun the sustained lane on 26.5.1. After the OS update, also isolate the
+pre-existing persistent hit/miss same-bank CPU-write/GPU-read overlap before
+restoring a bounded-to-sustained gate.
 
 ### Task 6: Repair and gate PR #16 Metal-resident routing
 
