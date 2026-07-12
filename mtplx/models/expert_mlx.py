@@ -686,13 +686,19 @@ class HotExpertSwitchGLU(nn.Module):
             and runtime.config.cache_scope == "layer"
             and runtime.plan.slots_per_layer > 0
         )
-        self._metal_slot_table_host = tuple(
-            -1 for _ in range(runtime.spec.expert_count)
-        )
-        self._metal_slot_table = mx.array(
-            self._metal_slot_table_host,
-            dtype=mx.int32,
-        )
+        # Keep disabled behavior allocation-free. Default runs and lightweight
+        # runtime test doubles do not need to expose expert_count merely to
+        # construct the normal host-routed switch.
+        self._metal_slot_table_host: tuple[int, ...] = ()
+        self._metal_slot_table: mx.array | None = None
+        if self._metal_route_enabled:
+            self._metal_slot_table_host = tuple(
+                -1 for _ in range(runtime.spec.expert_count)
+            )
+            self._metal_slot_table = mx.array(
+                self._metal_slot_table_host,
+                dtype=mx.int32,
+            )
 
     def _refresh_metal_slot_table(self) -> None:
         if not self._metal_route_enabled:
