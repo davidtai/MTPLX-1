@@ -377,7 +377,7 @@ requirement.
 
 **Does NOT cover:** making this experiment the default; disabled behavior must remain identical and enabled results must pass a separate gate.
 
-- [ ] **Step 1: Transplant source and add RED tests**
+- [x] **Step 1: Transplant source and add RED tests**
 
 ```bash
 git cherry-pick -x 99f0c2b
@@ -385,13 +385,25 @@ git cherry-pick -x 99f0c2b
 
 Add `test_disabled_metal_route_requires_no_experimental_runtime_fields`, parameterized `test_experimental_metal_route_rejects_invalid_ids_before_device_work` for `-1` and `expert_count`, `test_experimental_metal_route_preserves_waves_counters_and_lru_victims`, and `test_metal_probe_failure_fences_candidate_before_releasing_lease`. The last test requires `lease-enter -> candidate-launch -> probe-failure -> candidate-fence -> lease-exit`.
 
-- [ ] **Step 2: Prove RED and repair**
+- [x] **Step 2: Prove RED and repair**
 
 ```bash
 uv run --extra dev --extra server pytest -q tests/test_expert_streaming.py tests/test_expert_slots_runtime.py tests/test_streamed_models.py
 ```
 
 When disabled, never access experimental runtime/spec fields. When enabled, materialize and range-check host IDs before `mx.take` or speculative Q4. Probe and commit inside each existing route wave, preserving per-wave epochs/counters/victims and one shared-work execution. Fence every launched candidate in `finally` before its mapping/route lifetime exits; preserve the primary error and fail closed on fence failure.
+
+**Software-gate result:** source transplant `2fe64c1`, tuple repair `041cad5`,
+disabled-allocation repair `de3ce1b`, and RED/GREEN safety/policy repair
+`6e4c593` pass 126 focused tests and the 2,056-passed / 4-skipped full suite.
+Invalid IDs are rejected before device lookup; probe failures fence the
+candidate before either lifetime exits; a secondary fence failure does not
+mask the probe error; and Metal all-hit commits now match host route-wave
+counters and next LRU victims. Changed-file Ruff check, Ruff format, and diff
+hygiene pass. The branch is published at `origin/eval/repaired-pr16`. Step 3
+remains unrun because exclusive GPU ownership is not attested after the
+confounded PR #18 base panic. The new pre-compute ID validation also weakens the
+performance premise and must be judged by the hardware gate.
 
 - [ ] **Step 3: Verify, commit, and gate**
 

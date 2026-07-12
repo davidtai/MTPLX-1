@@ -10,8 +10,9 @@ The original independent audit retained only PR #13. The approved sequential
 salvage is rebuilding and repairing each rejected candidate on the latest
 retained tip. Current count: **4 retained (#13, repaired #15, repaired #17, and
 repaired #14), 1 repaired but rejected on measurement (#12), 1 repaired
-candidate under host-stability investigation (#18), and 2 pending
-repair/re-gate**.
+candidate under host-stability investigation (#18), 1 repaired through the
+software gate and awaiting an exclusive hardware lane (#16), and 1 pending
+repair/re-gate (#11)**.
 This report will
 become the requested consolidated seven-PR report as each remaining gate
 completes; prior failure findings remain below so the repair delta stays
@@ -24,7 +25,7 @@ auditable.
 | #13 | `939fe57` | 43 focused passed; 1,978 passed / 4 skipped full suite; independent reviews approved | 6.0523 -> 6.5033 decode tok/s mean, **+7.45%** over two matched pairs; token-identical | **Retain** |
 | #14 | `a26da2e` + repairs through `cc659f9` | Shared cancellation, admission/rollback, lifecycle, ownership, health, generation, close/KV races, and cross-thread MLX evaluation repaired; 2,049 passed / 4 skipped; reviews approved | Six balanced pairs: decode mean 6.2868 -> 6.3648 tok/s, **+1.24%**; median +1.70%; 5/6 positive; both order strata positive; exact token/cache/I/O parity | **Retain at `cc659f9`** |
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
-| #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
+| #16 | `99f0c2b` -> repaired through `6e4c593` | Default-path tuple/allocation regressions, invalid-ID device access, speculative-candidate lifetime, and flattened route-wave/LRU accounting repaired; 126 focused passed; full suite exit 0 (2,056 passed / 4 skipped) | Not run: the host does not yet have an attested exclusive GPU window, and pre-compute host validation weakens the performance premise | **Software gate passed; hardware gate pending** |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
 | #18 | `f37be96` -> repaired through `b5d2262` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, final fences, and cross-row prefix ordering repaired; 2,061 passed / 4 skipped | On macOS 26.5.2 the repaired candidate completed a 1,280-token canary and a natural 1,905-token run at 5.3603 decode tok/s with exact token parity and zero reported failures. The immediately following base arm panicked, but another agent was reportedly experimenting, so the arm is invalid for both performance and causal comparison. | **Investigate; open and unattributed pending an exclusive GPU lane** |
 
@@ -385,12 +386,33 @@ realistic chunk cardinality before wave partitioning.
 
 ### PR #16: Metal-resident routing
 
-The exact clean candidate fails two PR #13 focused tests even with the feature
-disabled. On the enabled path, an exception during the speculative probe can
-release the mapping lease before candidate Q4 work is fenced. The shortcut also
-bypasses `route_waves`: a four-expert/two-transient probe changed two host route
-calls into one and changed the next LRU evictions from `(2->4, 3->5)` to
-`(0->4, 1->5)`. Invalid router IDs also reach `mx.take` before host validation.
+The clean candidate failed two PR #13 focused tests even with the feature
+disabled. On the enabled path, an exception during the speculative probe could
+release the mapping lease before candidate Q4 work was fenced. The shortcut
+also bypassed `route_waves`: a multi-wave all-hit route became one policy epoch
+and changed subsequent LRU choices. Invalid router IDs reached `mx.take` before
+host validation.
+
+Repairs `041cad5` and `de3ce1b` restore the `_run()` tuple/shared-work contract
+and keep the disabled path free of experimental table allocations and fields.
+RED tests in the final repair reproduce invalid IDs `-1` and `expert_count`
+reaching device lookup, probe failure releasing a speculative candidate before
+its lease, and one flattened route call where the host path records two. GREEN
+`6e4c593` validates IDs before device work, fences every launched candidate in
+`finally` while both lifetimes remain held, preserves the primary probe error
+when the fence also fails, and commits the authoritative policy once per
+`route_waves()` result. Host and Metal paths now record the same request/hit
+counters and select the same next LRU victim.
+
+The three focused files pass 126 tests; the full 2,060-test collection exits 0
+with 2,056 passed and 4 expected skips. Both changed files pass Ruff check,
+Ruff format, and diff hygiene. The repaired branch is published as
+`origin/eval/repaired-pr16@6e4c593`. No hardware result is recorded: the latest
+PR #18 base arm was confounded by another agent's possible GPU experiment, so
+the host does not yet have an exclusive lane. In addition, fail-closed host ID
+validation introduces a pre-compute synchronization point and may erase the
+prototype's intended gain; that is a measured-gate question, not a claimed
+improvement.
 
 ### PR #18: projection/read pipeline
 
