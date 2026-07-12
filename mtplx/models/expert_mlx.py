@@ -1106,41 +1106,67 @@ class HotExpertSwitchGLU(nn.Module):
                     self.runtime.config.slot_layout == "component-banks"
                     and phase is RoutingPhase.DECODE
                 ):
-                    for projection in pending.iter_projection_misses():
-                        projection_error: BaseException | None = None
-                        try:
-                            projection.validate()
-                            projection_experts = {
-                                binding.expert for binding in projection.bindings
-                            }
-                            projection_positions = tuple(
-                                position
-                                for position, expert in zip(
-                                    wave.positions,
-                                    wave.experts,
-                                    strict=True,
+                    # A component bank is one Metal buffer per projection.
+                    # Even different slot rows therefore share one CPU/GPU
+                    # resource. Collect every gate/up-ready lease before the
+                    # first kernel so no sibling prefix reader can still be
+                    # writing another row of a buffer the GPU is consuming.
+                    held_projections = []
+                    batch_error: BaseException | None = None
+                    try:
+                        held_projections.extend(pending.iter_projection_misses())
+                        while held_projections:
+                            projection = held_projections.pop(0)
+                            projection_error: BaseException | None = None
+                            try:
+                                projection.validate()
+                                projection_experts = {
+                                    binding.expert for binding in projection.bindings
+                                }
+                                projection_positions = tuple(
+                                    position
+                                    for position, expert in zip(
+                                        wave.positions,
+                                        wave.experts,
+                                        strict=True,
+                                    )
+                                    if expert not in hit_set
+                                    and expert in projection_experts
                                 )
-                                if expert not in hit_set
-                                and expert in projection_experts
-                            )
-                            staged_misses[binding_key(projection.bindings)] = (
-                                stage_component_gate_up(
-                                    projection_positions,
-                                    projection.bindings,
+                                staged_misses[binding_key(projection.bindings)] = (
+                                    stage_component_gate_up(
+                                        projection_positions,
+                                        projection.bindings,
+                                    )
                                 )
-                            )
-                        except BaseException as exc:
-                            projection_error = exc
-                            raise
-                        finally:
+                            except BaseException as exc:
+                                projection_error = exc
+                                raise
+                            finally:
+                                try:
+                                    pending.release_projection(
+                                        projection,
+                                        synchronize=False,
+                                    )
+                                except BaseException:
+                                    if projection_error is None:
+                                        raise
+                    except BaseException as exc:
+                        batch_error = exc
+                        raise
+                    finally:
+                        cleanup_error: BaseException | None = None
+                        for projection in held_projections:
                             try:
                                 pending.release_projection(
                                     projection,
                                     synchronize=False,
                                 )
-                            except BaseException:
-                                if projection_error is None:
-                                    raise
+                            except BaseException as exc:
+                                if cleanup_error is None:
+                                    cleanup_error = exc
+                        if batch_error is None and cleanup_error is not None:
+                            raise cleanup_error
                 for miss_ready in pending.iter_ready_misses():
                     part_error: BaseException | None = None
                     try:
