@@ -322,7 +322,7 @@ Retain `cc659f9`.
 
 **Does NOT cover:** unverified/trusted-only sidecars or prefill projection pipelining; the candidate gate uses verified sidecars and bounded full-record prefill.
 
-- [ ] **Step 1: Transplant source and add RED tests**
+- [x] **Step 1: Transplant source and add RED tests**
 
 ```bash
 git cherry-pick -x f37be96
@@ -330,7 +330,7 @@ git cherry-pick -x f37be96
 
 Add `test_close_waits_for_projection_pin_after_suffix_failure`, `test_suffix_failure_is_not_masked_by_projection_release_sync_failure`, `test_projection_wait_honors_cancel_and_deadline`, and `test_incremental_projection_parts_preserve_order_and_single_ownership`. Preserve existing logit-parity, sidecar-verification, shared-before-prefix, and 128K-prefill-disabled tests.
 
-- [ ] **Step 2: Prove RED and repair**
+- [x] **Step 2: Prove RED and repair**
 
 ```bash
 uv run pytest -q tests/test_expert_slots_runtime.py -k 'projection or incremental or completion_fence or close'
@@ -339,9 +339,19 @@ uv run pytest -q tests/test_streamed_models.py -k 'projection or slot_fence or s
 
 Count projection routes as active leases until exactly-once release. Forward combined cancellation/deadline through prefix and suffix waits. Adapt projection readiness to Task 4's per-expert futures rather than restoring one `_miss_future`. After `stage_component_gate_up()`, explicitly `mx.eval(hidden)` and release that projection lease with `synchronize=False`; down consumes the staged tensor. Preserve a suffix exception as primary and record any cleanup error for snapshot/close. Fence final down outputs through Task 3.
 
-- [ ] **Step 3: Verify, commit, and gate**
+- [x] **Step 3: Verify, commit, and gate**
 
 Run full pytest/Ruff/diff checks. Use `--verified-sidecar` for both arms. Require `progressive_loads > 0`, `projection_ready_routes > 0`, token/stop parity, positive mean+median decode gain, bounded peak memory, and no material tail/physical-SSD/co-tenant regression.
+
+**Result:** source transplant `883bda2`, RED regressions `eedb6aa`, and repair
+`efe1809` passed 53 focused checks plus the 2,060-passed / 4-skipped full suite;
+the six touched files passed Ruff/format/diff checks. The repository-wide Ruff
+command reproduces five unrelated failures on base `7fcc036`. The matched
+verified-sidecar base completed naturally at 6.5302 decode tok/s with zero
+fence/I/O/integrity failures. The host kernel-panicked during candidate arm 1
+and rebooted at 09:16:44 before a candidate artifact was written. Reject and
+quarantine PR #18 without a rerun; parity, throughput, SSD, and memory-hook
+results are unmeasured rather than zero.
 
 ### Task 6: Repair and gate PR #16 Metal-resident routing
 

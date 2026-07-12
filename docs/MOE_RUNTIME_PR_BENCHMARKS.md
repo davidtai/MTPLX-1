@@ -25,7 +25,7 @@ auditable.
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
-| #18 | `8743a93` | 36 focused passed; 1,985 passed / 4 skipped full suite; storage can close while partial Metal work remains pinned | Not run: correctness stopped the gate | Skip |
+| #18 | `f37be96` -> repaired `efe1809` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, and final fences repaired; 2,060 passed / 4 skipped | Base completed at 6.5302 decode tok/s; candidate arm 1 kernel-panicked the host before writing an artifact | **Skip and quarantine** |
 
 "Not run" is a gate result, not an estimated zero. Hardware performance was
 intentionally not measured after a candidate failed correctness, because a fast
@@ -393,11 +393,30 @@ calls into one and changed the next LRU evictions from `(2->4, 3->5)` to
 
 ### PR #18: projection/read pipeline
 
-After a down-suffix failure, slot-pool `active_routes` can reach zero while the
-projection generation remains pinned. `close()` then tears down component-bank
-storage still referenced by staged Metal work. If projection-release device
-synchronization raises, rollback is skipped and the original suffix failure is
-masked.
+The initial candidate allowed `active_routes` to reach zero with a projection
+generation pinned and could mask a suffix failure with projection cleanup. The
+sequential repair at `efe1809` added active projection leases, exactly-once
+ownership, combined cancellation/deadline handling across prefix and suffix
+waits, per-expert projection futures, explicit gate/up evaluation before a
+non-synchronizing release, sticky cleanup errors, and completion fences for the
+final down projection. Four RED regressions, 53 focused checks, and the full
+2,060-passed / 4-skipped suite passed; all six touched files passed Ruff,
+format, and diff checks. The repository-wide Ruff command still reports the
+same five unrelated errors on base `7fcc036`.
+
+The verified-sidecar base arm completed naturally with 1,905 tokens and
+`stop`: 6.5302 decode tok/s, 5.7408 end-to-end tok/s, 89,145,802,612 bytes peak
+MLX, 1,768,689,893,376 expert-read bytes, 165,678 read operations, and zero
+completion-fence, short-read, I/O, or integrity failures. During the first
+candidate arm the host kernel-panicked and rebooted at 09:16:44. The candidate
+wrote no artifact, so token parity, throughput, tail latency, SSD bandwidth,
+and routed-memory hooks are unmeasured. A catastrophic host-stability failure
+is sufficient to reject the candidate; it was quarantined without a rerun.
+
+Raw evidence:
+
+- [`hy3-q4-gated-pr18-base-p1.json`](../benchmarks/results/hy3-q4-gated-pr18-base-p1.json)
+- [`hy3-q4-gated-pr18-kernel-panic.json`](../benchmarks/results/hy3-q4-gated-pr18-kernel-panic.json)
 
 ## Memory and SSD bandwidth
 
