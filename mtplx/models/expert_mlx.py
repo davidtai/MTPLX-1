@@ -837,7 +837,12 @@ class HotExpertSwitchGLU(nn.Module):
             top_k=top_k,
         )
         if metal_output is not None:
-            return metal_output
+            # A Metal-resolved route is all-hit, so there is no miss I/O left
+            # to overlap. Preserve the normal routed-then-shared contract and
+            # the tuple shape promised by _run().
+            return metal_output, (
+                shared_work() if shared_work is not None else None
+            )
         mx.eval(indices)
         expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
         # Batch size is not a generation phase. A batched decode has shape
