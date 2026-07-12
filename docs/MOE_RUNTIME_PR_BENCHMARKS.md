@@ -2,14 +2,15 @@
 
 Date: 2026-07-12
 Remote base: `origin/codex/moe-ssd-hy3-glm52@4146f72`
-Current sequential tip: `992070df685020b33c46531f3b87ecbea19ce3bd`
+Current sequential tip: `cc659f93eea2c0f4ed5e5b0eff3aca126e4ecf28`
 
 ## Result
 
 The original independent audit retained only PR #13. The approved sequential
 salvage is rebuilding and repairing each rejected candidate on the latest
-retained tip. Current count: **3 retained (#13, repaired #15, and repaired #17),
-1 repaired but rejected on measurement (#12), and 4 pending repair/re-gate**.
+retained tip. Current count: **4 retained (#13, repaired #15, repaired #17, and
+repaired #14), 1 repaired but rejected on measurement (#12), and 3 pending
+repair/re-gate**.
 This report will
 become the requested consolidated seven-PR report as each remaining gate
 completes; prior failure findings remain below so the repair delta stays
@@ -20,7 +21,7 @@ auditable.
 | #11 | `3d7c158` | 50 focused passed; 1,980 passed / 4 skipped full suite; semantic hotset and request-lifecycle failures | Not run: correctness stopped the gate | Skip |
 | #12 | `a8ef882` -> repaired `124f4ce` | Exact 128K Q8 accounting and 80-cache attestation repaired; concurrency/env/close/server bypasses fail closed; 2,033 passed / 4 skipped; both reviews approved | Token-identical short lane: 4.7052 -> 0.9896 tok/s, **-78.97%**; reads -27.03% but peak MLX +20.97 GB. Runner hooks classify the candidate as serialized, not bandwidth-bound. | **Skip; do not promote the 100-slot plan** |
 | #13 | `939fe57` | 43 focused passed; 1,978 passed / 4 skipped full suite; independent reviews approved | 6.0523 -> 6.5033 decode tok/s mean, **+7.45%** over two matched pairs; token-identical | **Retain** |
-| #14 | `c424381` | 49 focused passed; 1,979 passed / 4 skipped full suite; miss failure can hang rollback and leak pins | Not run: correctness stopped the gate | Skip |
+| #14 | `a26da2e` + repairs through `cc659f9` | Shared cancellation, admission/rollback, lifecycle, ownership, health, generation, close/KV races, and cross-thread MLX evaluation repaired; 2,049 passed / 4 skipped; reviews approved | Six balanced pairs: decode mean 6.2868 -> 6.3648 tok/s, **+1.24%**; median +1.70%; 5/6 positive; both order strata positive; exact token/cache/I/O parity | **Retain at `cc659f9`** |
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
@@ -321,6 +322,56 @@ Decision: **retain repaired PR #17 at `992070d` under the explicit <=5%
 lifecycle-safety budget**. Its benefit is fail-closed slot reuse and lifecycle
 behavior; its measured cost is a 3.14% pooled decode slowdown.
 
+## PR #14: ready-miss streaming
+
+The original clean candidate failed before hardware because split futures had
+independent cancellation, partial admission could lose victims or pins, and
+streamed parts had ambiguous ownership. The sequential repair added shared
+cancellation, per-part admission, nonblocking failure cleanup, consumer leases,
+atomic health/policy commits, generation reconciliation, guarded KV admission,
+and close-safe lifecycle retention.
+
+The first repaired hardware candidate still failed 2/2 sustained runs with
+macOS `SIGTRAP` reports identifying `BUG IN CLIENT OF LIBMALLOC: memory
+corruption of free block` inside MLX graph evaluation. A test-first final repair
+keeps split-route MLX fences on the generation thread instead of evaluating the
+same lazy graph on the slot-fence executor. That repair is `cc659f9`; the RED
+regression test is `ccab0a3`.
+
+Six process-isolated balanced pairs ran in B->C, C->B, B->C, C->B, B->C,
+C->B order. The declared four-pair gate was extended to the six-pair hard cap
+because the four-pair mean was +0.44%, median was flat, and pair 4 reversed.
+
+| Metric | Base | Repaired PR #14 | Result |
+| --- | ---: | ---: | ---: |
+| Decode mean | 6.2868 tok/s | 6.3648 tok/s | **+1.2399%** |
+| Decode median | 6.3311 tok/s | 6.4388 tok/s | **+1.7011%** |
+| Base-first stratum | 6.22798 tok/s | 6.35092 tok/s | **+1.9739%** |
+| Candidate-first stratum | 6.34563 tok/s | 6.37860 tok/s | **+0.5196%** |
+| End-to-end mean | - | - | **+1.1084%** |
+| Rolling-window pooled p95 | - | - | **+0.4328%**; worst pair +9.5571% |
+| Peak MLX mean | 89,145,844,436 B | 89,145,802,612 B | -41,824 B |
+
+Five of six pair deltas were positive: +1.2505%, +1.7400%, +2.5408%,
+-3.7294%, +2.1121%, and +3.5429%. Every pair had exact token, stop, cache,
+physical-byte, and read-operation parity. Each candidate run exercised 153,158
+incremental miss parts across 87,913 routes, with zero fence failures, I/O or
+integrity errors, short reads, pins, loading slots, or failed slots.
+
+Raw headline artifacts (JSON / generated response):
+
+- Pair 1 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-base-cbank99-r1.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-base-cbank99-r1-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-candidate-cbank99-r1.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-candidate-cbank99-r1-repeat-0.md)
+- Pair 2 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-base-cbank99-r2.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-base-cbank99-r2-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-candidate-cbank99-r2.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-candidate-cbank99-r2-repeat-0.md)
+- Pair 3 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-base-cbank99-r3.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-base-cbank99-r3-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-candidate-cbank99-r3.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-candidate-cbank99-r3-repeat-0.md)
+- Pair 4 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-base-cbank99-r4.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-base-cbank99-r4-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-candidate-cbank99-r4.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-candidate-cbank99-r4-repeat-0.md)
+- Pair 5 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-base-cbank99-r5.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-base-cbank99-r5-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-candidate-cbank99-r5.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-candidate-cbank99-r5-repeat-0.md)
+- Pair 6 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-base-cbank99-r6.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-base-cbank99-r6-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-candidate-cbank99-r6.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-candidate-cbank99-r6-repeat-0.md)
+- Runner-hook replay: [`JSON`](../benchmarks/results/hy3-q4-gated-pr14-candidate-instrumented-cbank99-r1.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr14-candidate-instrumented-cbank99-r1-repeat-0.md)
+
+Decision: **retain repaired PR #14 at `cc659f9`**. The measured gain is modest,
+but mean, median, and both order strata are positive after the six-pair hard
+cap, while correctness, tail, memory, and exact parity gates pass.
+
 ## Correctness-gated candidates
 
 ### PR #11: prompt-wide hotset
@@ -330,13 +381,6 @@ The old resident is then pinned as a hit, so the new heavy hitter is served
 transiently and discarded; the first-decode hotset remains stale. Aborted
 prefills also leak counts into the next request, and global scope rejects
 realistic chunk cardinality before wave partitioning.
-
-### PR #14: ready-miss streaming
-
-Each miss part owns a separate cancellation signal. If one part fails while a
-sibling read is already running, `Future.cancel()` cannot stop the sibling and
-cleanup blocks before rollback. Mixed hit/miss submission failure also leaks a
-pinned hit, and streamed versus legacy completion APIs disagree on pin ownership.
 
 ### PR #16: Metal-resident routing
 
@@ -402,6 +446,17 @@ device-memory ceiling.
 Raw artifact:
 [`hy3-q4-gated-pr13-instrumented-cbank99-r1.json`](../benchmarks/results/hy3-q4-gated-pr13-instrumented-cbank99-r1.json).
 
+The repaired PR #14 runner-hook replay measured:
+
+- SSD: **5.235 GiB/s mean**, 5.094 p50, **7.094 p95**, 9.221 max
+- sampled physical reads: 1,766,407,274,496 bytes across 624 intervals
+- routed-weight unified-memory traffic floor: **47.28 GB/s mean**, **58.02 GB/s p95**
+- utilization floors: 42.0% of measured SSD ceiling and 7.70% of published memory peak
+- classification: `mixed: no single resource dominates`
+
+Raw artifact:
+[`hy3-q4-gated-pr14-candidate-instrumented-cbank99-r1.json`](../benchmarks/results/hy3-q4-gated-pr14-candidate-instrumented-cbank99-r1.json).
+
 ## Current branch verification
 
 The retained PR #13 tip `939fe57` collected 1,982 tests and completed with
@@ -409,6 +464,9 @@ The retained PR #13 tip `939fe57` collected 1,982 tests and completed with
 expected skips. At repaired PR #17 tip `992070d`, the full suite collected 2,022
 tests and completed with **2,018 passed / 4 expected skips**; 108 focused tests,
 Ruff check, Ruff format check, the stub scan, and `git diff --check` all pass.
+At repaired PR #14 tip `cc659f9`, the suite collected 2,053 tests and completed
+with **2,049 passed / 4 expected skips**. The changed-file Ruff check and the
+23-test streamed-model file pass, including the cross-thread MLX regression.
 The contaminated PR #15 merge/fix commits remain absent from ancestry.
 
 ## PR #19 dry merge

@@ -279,7 +279,7 @@ not a speedup, and the base-first margin is narrow.
 
 **Does NOT cover:** staged gate/up/down projection loading; Task 5 composes that behavior onto this per-expert future model.
 
-- [ ] **Step 1: Transplant source and add RED tests**
+- [x] **Step 1: Transplant source and add RED tests**
 
 ```bash
 git cherry-pick -x 87ea0b7
@@ -287,7 +287,7 @@ git cherry-pick -x 87ea0b7
 
 Add `test_incremental_miss_failure_cancels_running_sibling_without_blocking_primary`, `test_incremental_submit_failure_releases_pinned_hit`, `test_streamed_miss_parts_have_one_owner`, `test_streamed_miss_compute_failure_releases_current_part`, and `test_incremental_part_observes_sticky_completion_failure`. Use events/fake futures, bounded joins, and release counters; never rely on sleep-only timing.
 
-- [ ] **Step 2: Prove RED and repair**
+- [x] **Step 2: Prove RED and repair**
 
 ```bash
 uv run pytest -q tests/test_expert_slots_runtime.py -k 'split_route or incremental or pending_split or completion_fence'
@@ -296,9 +296,21 @@ uv run pytest -q tests/test_streamed_models.py -k 'streamed_decode_evaluates_sha
 
 Give all parts one internal cancellation event composed with caller cancellation/deadline. On failure, signal cancellation first, consume only completed futures, attach cleanup callbacks to running siblings, and preserve the primary error. `PendingSplitRoute` owns and releases every hit/miss route exactly once; model code never releases a part directly. Keep PR #17 sticky checks/fences and PR #13 shared overlap.
 
-- [ ] **Step 3: Verify, commit, and gate**
+- [x] **Step 3: Verify, commit, and gate**
 
 Run full pytest/Ruff/diff checks. Require exercised incremental-route/part counters, token parity, positive mean+median decode gain without systematic reversal, and no material tail latency, bytes/op, SSD, or peak-memory regression.
+
+**Result:** source transplant `a26da2e` plus test-first repairs through `cc659f9`
+passed the 2,049-passed / 4-skipped full suite and both final reviews. Two
+sustained pre-final-fix runs exposed cross-thread MLX heap corruption; RED
+`ccab0a3` and fix `cc659f9` serialize split-route MLX fences on the generation
+thread. Six balanced pairs against `c12cfba` measured +1.2399% mean and
++1.7011% median decode throughput; base-first and candidate-first strata were
++1.9739% and +0.5196%, with 5/6 pairs positive. Pooled rolling p95 was +0.4328%
+(worst pair +9.5571%), peak MLX was 41,824 bytes lower, and token/stop/cache/I/O
+parity was exact. Runner hooks measured SSD mean/p95 5.234870/7.094440 GiB/s
+and routed-memory floor mean/p95 47.279657/58.021482 GB/s, classified mixed.
+Retain `cc659f9`.
 
 ### Task 5: Repair and gate PR #18 projection/read pipelining
 
