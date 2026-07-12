@@ -9,7 +9,8 @@ Current sequential tip: `cc659f93eea2c0f4ed5e5b0eff3aca126e4ecf28`
 The original independent audit retained only PR #13. The approved sequential
 salvage is rebuilding and repairing each rejected candidate on the latest
 retained tip. Current count: **4 retained (#13, repaired #15, repaired #17, and
-repaired #14), 1 repaired but rejected on measurement (#12), and 3 pending
+repaired #14), 1 repaired but rejected on measurement (#12), 1 repaired
+candidate under host-stability investigation (#18), and 2 pending
 repair/re-gate**.
 This report will
 become the requested consolidated seven-PR report as each remaining gate
@@ -25,7 +26,7 @@ auditable.
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
-| #18 | `f37be96` -> repaired through `b5d2262` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, final fences, and cross-row prefix ordering repaired; 2,061 passed / 4 skipped | Base completed at 6.5302 decode tok/s. Repaired bounded lanes completed through 1,024 tokens at 6.2355 decode tok/s, but the next 2,048-token lane produced a second GPU-driver watchdog panic before writing an artifact. | **Investigate; no sustained rerun on macOS 26.5.1** |
+| #18 | `f37be96` -> repaired through `b5d2262` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, final fences, and cross-row prefix ordering repaired; 2,061 passed / 4 skipped | On macOS 26.5.2 the repaired candidate completed a 1,280-token canary and a natural 1,905-token run at 5.3603 decode tok/s with exact token parity and zero reported failures. The immediately following base arm panicked, but another agent was reportedly experimenting, so the arm is invalid for both performance and causal comparison. | **Investigate; open and unattributed pending an exclusive GPU lane** |
 
 "Not run" is a gate result, not an estimated zero. Hardware performance was
 intentionally not measured after a candidate failed correctness, because a fast
@@ -431,16 +432,42 @@ same interval in which `watchdogd` stopped checking in. macOS reported no
 memory pressure and an OK compressor. This was a GPU command-queue hang, not
 an SSD-bandwidth or memory-pressure panic.
 
-The host is on macOS 26.5.1 build 25F80. macOS 26.5.2 build 25F84 is available,
-and [Apple's security advisory](https://support.apple.com/en-us/127595) says it
-fixes an `IOGPUFamily` race condition where an app may cause unexpected system
-termination. That directly matches the blocked driver family, so another
-sustained run on 26.5.1 is not an informative code gate. Separately, MTPLX
-still starts persistent miss writes before evaluating persistent hits; rows in
-one component bank share a Metal resource, so this pre-existing hit/miss
-overlap also needs isolation. PR #18 remains neither retained nor rejected:
-update the OS and remove or segregate same-bank CPU-write/GPU-read overlap
-before promoting bounded diagnostics back to a sustained lane.
+After upgrading to macOS 26.5.2 build 25F84, the repaired candidate completed
+a 1,280-token canary in 235.712 seconds at 6.2306 decode tok/s and 5.4314
+end-to-end tok/s. It peaked at 88,978,030,452 bytes, read
+1,239,101,079,552 expert bytes, and reported zero fence, I/O, integrity, route,
+or pin failures. Its first 1,024 tokens exactly matched the pre-update bounded
+lane.
+
+The next repaired-candidate run completed naturally at 1,905 tokens in
+380.352 seconds: 5.3603 decode tok/s, 5.0087 end-to-end tok/s,
+89,145,802,612 bytes peak MLX, 1,768,689,893,376 expert-read bytes, and
+318,836 read operations. Its token IDs exactly matched the pre-update base and
+it ended with zero reported fence, I/O, integrity, route, or pin failures. This
+establishes post-update candidate completion, but it does not establish a
+throughput delta against the pre-update base.
+
+The immediately following retained-base arm wrote no artifact and triggered
+another watchdog panic on macOS 26.5.2. Its 90,314,405,112-byte benchmark
+process had a Metal command-queue thread blocked for 101.579 seconds in the
+updated `IOGPUFamily` 130.15.2 and `AGXG17X` stack; macOS again reported no
+memory pressure. However, the user reported that another agent was running
+experiments during this arm. No second large MLX process was live in the panic
+stackshot, but a competing experiment could have exited after wedging the
+global GPU. The base arm therefore lacks an exclusive-GPU attestation and is
+invalid for both performance comparison and causal attribution; it is not a
+base-alone reproduction.
+
+PR #18 remains neither retained nor rejected. Before another hardware gate,
+stop or coordinate every other GPU experiment, attest exclusive GPU ownership,
+and use a clean cooldown or reboot before repeating bounded base and candidate
+canaries. Separately, MTPLX still starts persistent miss writes before
+evaluating persistent hits; rows in one component bank share a Metal resource,
+so the pre-existing same-bank CPU-write/GPU-read overlap remains a software
+isolation requirement. Apple's
+[macOS 26.5.2 advisory](https://support.apple.com/en-us/127595) remains relevant
+to the two pre-update incidents, but the confounded post-update arm cannot prove
+that the OS fix succeeded or failed for this workload.
 
 Raw evidence:
 
@@ -451,6 +478,9 @@ Raw evidence:
 - [`hy3-q4-gated-pr18-fixed-bounded512.json`](../benchmarks/results/hy3-q4-gated-pr18-fixed-bounded512.json)
 - [`hy3-q4-gated-pr18-fixed-bounded1024.json`](../benchmarks/results/hy3-q4-gated-pr18-fixed-bounded1024.json)
 - [`hy3-q4-gated-pr18-second-kernel-panic.json`](../benchmarks/results/hy3-q4-gated-pr18-second-kernel-panic.json)
+- [`hy3-q4-gated-pr18-postupdate-bounded1280.json`](../benchmarks/results/hy3-q4-gated-pr18-postupdate-bounded1280.json)
+- [`hy3-q4-gated-pr18-postupdate-candidate-p1.json`](../benchmarks/results/hy3-q4-gated-pr18-postupdate-candidate-p1.json)
+- [`hy3-q4-gated-component-bank-postupdate-base-kernel-panic.json`](../benchmarks/results/hy3-q4-gated-component-bank-postupdate-base-kernel-panic.json)
 
 ## Memory and SSD bandwidth
 

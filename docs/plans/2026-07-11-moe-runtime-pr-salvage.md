@@ -352,12 +352,20 @@ passed 108 tests and the full suite passed 2,061 / 4 skipped. Exact-prefix lanes
 completed through 1,024 tokens at 6.2355 decode tok/s with zero reported
 fence/I/O/integrity/pin failures. The next 2,048-token lane caused a second
 watchdog panic: its Metal command-queue thread was blocked for 93.559 seconds in
-`IOGPUFamily`/`AGXG17X`, while macOS reported no memory pressure. Installed
-macOS 26.5.1 lacks Apple's 26.5.2 fix for an `IOGPUFamily` race that can cause
-unexpected system termination. Keep PR #18 open on investigation hold; do not
-rerun the sustained lane on 26.5.1. After the OS update, also isolate the
-pre-existing persistent hit/miss same-bank CPU-write/GPU-read overlap before
-restoring a bounded-to-sustained gate.
+`IOGPUFamily`/`AGXG17X`, while macOS reported no memory pressure. After the
+upgrade to macOS 26.5.2, the candidate completed a 1,280-token canary at 6.2306
+decode tok/s and a natural 1,905-token run at 5.3603 decode tok/s with exact
+token parity, the same expert-read bytes and peak memory as the pre-update
+base, 318,836 reads, and zero reported failures. The immediately following
+retained-base arm panicked in the updated driver stack, but another agent was
+reportedly experimenting. No second large MLX process was live in the panic
+stackshot, so overlap is possible but unproven. The arm is invalid for both
+performance comparison and causal attribution; do not call it a base-alone
+reproduction. Keep PR #18 open and unattributed. Before another hardware gate,
+require an exclusive-GPU preflight and a clean cooldown/reboot, then repeat
+bounded base and candidate canaries. The pre-existing persistent hit/miss
+same-bank CPU-write/GPU-read overlap remains a separate software-isolation
+requirement.
 
 ### Task 6: Repair and gate PR #16 Metal-resident routing
 
