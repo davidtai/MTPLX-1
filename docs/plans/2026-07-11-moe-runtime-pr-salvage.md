@@ -361,11 +361,20 @@ retained-base arm panicked in the updated driver stack, but another agent was
 reportedly experimenting. No second large MLX process was live in the panic
 stackshot, so overlap is possible but unproven. The arm is invalid for both
 performance comparison and causal attribution; do not call it a base-alone
-reproduction. Keep PR #18 open and unattributed. Before another hardware gate,
-require an exclusive-GPU preflight and a clean cooldown/reboot, then repeat
-bounded base and candidate canaries. The pre-existing persistent hit/miss
-same-bank CPU-write/GPU-read overlap remains a separate software-isolation
-requirement.
+reproduction. A later exclusive lane removed the confound: base256 and
+candidate256 passed with exact token/byte parity, but candidate decode was
+13.25% slower and read operations rose from 32,886 to 53,252. Candidate512
+also passed with 40,819 progressive routes and zero reported failures. After
+two consecutive 0% GPU-utilization samples, the retained-base512 arm panicked
+with no artifact. Its benchmark Metal queue and an ordinary Code Helper Metal
+queue were both uninterruptibly blocked for 118.026 seconds in the same
+`IOGPUFamily`/`AGXG17X` stack. No competing MLX process was present and macOS
+reported no memory pressure. This establishes that PR #18 is not required for
+the panic; the complete performance gate remains unavailable and the exclusive
+short-pair signal is negative. Do not promote PR #18 on current evidence, and
+do not run another
+large component-bank gate until the pre-existing persistent hit/miss same-bank
+CPU-write/GPU-read overlap is isolated at resource level.
 
 ### Task 6: Repair and gate PR #16 Metal-resident routing
 
@@ -401,9 +410,11 @@ candidate before either lifetime exits; a secondary fence failure does not
 mask the probe error; and Metal all-hit commits now match host route-wave
 counters and next LRU victims. Changed-file Ruff check, Ruff format, and diff
 hygiene pass. The branch is published at `origin/eval/repaired-pr16`. Step 3
-remains unrun because exclusive GPU ownership is not attested after the
-confounded PR #18 base panic. The new pre-compute ID validation also weakens the
-performance premise and must be judged by the hardware gate.
+remains unrun because the later exclusive retained-base512 canary kernel-panicked
+the host before the PR16 gate began. The new pre-compute ID validation also
+weakens the performance premise and must eventually be judged by a hardware
+gate, but no large-model gate is allowed until the retained component-bank base
+is made safe.
 
 - [ ] **Step 3: Verify, commit, and gate**
 

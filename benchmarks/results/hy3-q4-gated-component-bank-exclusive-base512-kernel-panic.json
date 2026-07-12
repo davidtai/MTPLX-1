@@ -1,0 +1,138 @@
+{
+  "schema": "mtplx-kernel-panic-evidence-v1",
+  "incident_id": "FE12B96F-DDA2-4774-96F8-3660D5092CCE",
+  "host": {
+    "macos_version": "26.5.2",
+    "macos_build": "25F84",
+    "boot_before_panic_local": "2026-07-12T12:37:50-05:00",
+    "panic_at_local": "2026-07-12T13:43:18-05:00",
+    "panic_report_created_local": "2026-07-12T13:49:38-05:00"
+  },
+  "run": {
+    "branch": "codex/moe-runtime-gated-integration",
+    "git_commit": "d09c37240633158857b288e3ab822f2397cc0ff6",
+    "relationship_to_pr18": "retained base without PR18 code",
+    "run_label": "hy3-q4-gated-pr18-exclusive-base-bounded512",
+    "artifact_written": false,
+    "natural_completion": false,
+    "verified_sidecar": true,
+    "qwen_model_disabled": true,
+    "qwen_gateway_enabled": true,
+    "concurrency": 1,
+    "max_tokens": 512,
+    "slot_layout": "component-banks"
+  },
+  "exclusive_preflight": {
+    "other_experiment_agent_paused_by_user": true,
+    "exclusive_lock_acquired": true,
+    "competing_benchmark_processes_found": 0,
+    "competing_qwen_model_processes_found": 0,
+    "gpu_device_utilization_percent_initial": 0,
+    "post_candidate_gpu_samples_percent": [
+      32,
+      29,
+      0,
+      0
+    ],
+    "two_consecutive_zero_utilization_samples_before_base": true,
+    "second_large_mlx_process_in_panic_stackshot": false,
+    "interpretation": "This arm had an attested exclusive GPU window. The only other python3.12 process in the stackshot was the 253674192-byte LiteLLM gateway and it had no Metal queue."
+  },
+  "completed_exclusive_canaries": [
+    {
+      "artifact": "hy3-q4-gated-pr18-exclusive-base-bounded256.json",
+      "relationship_to_pr18": "retained base",
+      "completion_tokens": 256,
+      "decode_tokens_per_second": 6.544855911823006,
+      "peak_memory_bytes": 88787469160,
+      "read_bytes": 358859538432,
+      "read_operations": 32886
+    },
+    {
+      "artifact": "hy3-q4-gated-pr18-exclusive-candidate-bounded256.json",
+      "relationship_to_pr18": "repaired candidate",
+      "completion_tokens": 256,
+      "decode_tokens_per_second": 5.677686151714797,
+      "peak_memory_bytes": 88787469160,
+      "read_bytes": 358859538432,
+      "read_operations": 53252,
+      "progressive_loads": 20366,
+      "projection_ready_routes": 20366
+    },
+    {
+      "artifact": "hy3-q4-gated-pr18-exclusive-candidate-bounded512.json",
+      "relationship_to_pr18": "repaired candidate",
+      "completion_tokens": 512,
+      "decode_tokens_per_second": 5.933664969172158,
+      "peak_memory_bytes": 88787469160,
+      "read_bytes": 576005603328,
+      "read_operations": 94158,
+      "progressive_loads": 40819,
+      "projection_ready_routes": 40819
+    }
+  ],
+  "panic": {
+    "panic_report": "/Library/Logs/DiagnosticReports/Retired/panic-full-2026-07-12-134938.0002.panic",
+    "panic_report_sha256": "6d79ff9b204f259109e47f039614548f4233ff9706b5816ab96037e95c36baa7",
+    "panic_summary_attachment": "/Users/davidtai/.codex/attachments/c8c9c384-cd88-4445-8d05-b050466fa0bc/pasted-text.txt",
+    "watchdog_no_checkins_seconds": 92,
+    "benchmark_process": {
+      "pid": 10574,
+      "procname": "python3.12",
+      "resident_memory_bytes": 90318125096,
+      "metal_thread_id": 74458,
+      "metal_queue": "com.Metal.CommandQueueDispatch",
+      "thread_state": [
+        "TH_WAIT",
+        "TH_UNINT"
+      ],
+      "last_run_time_seconds": 118.026207875
+    },
+    "other_globally_blocked_metal_queue": {
+      "pid": 903,
+      "procname": "Code Helper",
+      "resident_memory_bytes": 441107728,
+      "metal_thread_id": 72772,
+      "metal_queue": "com.Metal.CommandQueueDispatch",
+      "thread_state": [
+        "TH_WAIT",
+        "TH_UNINT"
+      ],
+      "last_run_time_seconds": 118.025330416
+    },
+    "driver_stack": [
+      {
+        "name": "com.apple.AGXG17X",
+        "version": "351.2",
+        "uuid": "48DBA7BD-0110-37E5-8F6E-545F608F748D",
+        "panic_binary_image_index": 19
+      },
+      {
+        "name": "com.apple.iokit.IOGPUFamily",
+        "version": "130.15.2",
+        "uuid": "B8F47BA6-A756-3D58-BF34-24DFDCC338E5",
+        "panic_binary_image_index": 55
+      }
+    ],
+    "memory_pressure": false,
+    "compressor_status": "6% of compressed pages limit and 24% of segments limit, both reported OK"
+  },
+  "attribution": {
+    "global_gpu_queue_hang_confidence": "high",
+    "pr18_required_to_trigger": false,
+    "pr18_contribution": "not established; retained-base reproduction disproves PR18 as a required cause but does not exclude an independent contribution",
+    "same_bank_cpu_write_gpu_read_hazard_confidence": "moderate",
+    "driver_or_mlx_interaction_confidence": "high",
+    "memory_pressure_cause_supported": false,
+    "ssd_bandwidth_cause_supported": false,
+    "explanation": "The exclusive retained base reproduced the same global Metal command-queue hang without PR18 code. This establishes that PR18 is not required for the panic. It does not by itself distinguish the pre-existing component-bank CPU-write/GPU-read resource hazard from another MLX/driver defect."
+  },
+  "decision": {
+    "gate": "exclusive_retained_base_gpu_panic",
+    "action": "stop_all_large_component_bank_hardware_gates",
+    "pr18_status": "open_performance_gate_blocked_by_unsafe_base",
+    "pr16_status": "hardware_gate_not_started",
+    "next_gate": "Implement and software-verify resource-level exclusion between component-bank CPU writes and GPU reads before any additional large-model hardware run. Then restart with a bounded retained-base canary under the same exclusive preflight.",
+    "reason": "A 512-token retained-base canary kernel-panicked the host despite an exclusive GPU window and two consecutive zero-utilization samples. Continuing the existing hardware matrix would expose the host to a known reproducible kernel failure."
+  }
+}

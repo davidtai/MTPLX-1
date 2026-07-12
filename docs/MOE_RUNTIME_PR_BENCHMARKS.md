@@ -10,9 +10,9 @@ The original independent audit retained only PR #13. The approved sequential
 salvage is rebuilding and repairing each rejected candidate on the latest
 retained tip. Current count: **4 retained (#13, repaired #15, repaired #17, and
 repaired #14), 1 repaired but rejected on measurement (#12), 1 repaired
-candidate under host-stability investigation (#18), 1 repaired through the
-software gate and awaiting an exclusive hardware lane (#16), and 1 pending
-repair/re-gate (#11)**.
+candidate whose performance gate is blocked by an unsafe retained base (#18),
+1 repaired through the software gate whose hardware gate is blocked by the same
+base failure (#16), and 1 pending repair/re-gate (#11)**.
 This report will
 become the requested consolidated seven-PR report as each remaining gate
 completes; prior failure findings remain below so the repair delta stays
@@ -25,9 +25,9 @@ auditable.
 | #13 | `939fe57` | 43 focused passed; 1,978 passed / 4 skipped full suite; independent reviews approved | 6.0523 -> 6.5033 decode tok/s mean, **+7.45%** over two matched pairs; token-identical | **Retain** |
 | #14 | `a26da2e` + repairs through `cc659f9` | Shared cancellation, admission/rollback, lifecycle, ownership, health, generation, close/KV races, and cross-thread MLX evaluation repaired; 2,049 passed / 4 skipped; reviews approved | Six balanced pairs: decode mean 6.2868 -> 6.3648 tok/s, **+1.24%**; median +1.70%; 5/6 positive; both order strata positive; exact token/cache/I/O parity | **Retain at `cc659f9`** |
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
-| #16 | `99f0c2b` -> repaired through `6e4c593` | Default-path tuple/allocation regressions, invalid-ID device access, speculative-candidate lifetime, and flattened route-wave/LRU accounting repaired; 126 focused passed; full suite exit 0 (2,056 passed / 4 skipped) | Not run: the host does not yet have an attested exclusive GPU window, and pre-compute host validation weakens the performance premise | **Software gate passed; hardware gate pending** |
+| #16 | `99f0c2b` -> repaired through `6e4c593` | Default-path tuple/allocation regressions, invalid-ID device access, speculative-candidate lifetime, and flattened route-wave/LRU accounting repaired; 126 focused passed; full suite exit 0 (2,056 passed / 4 skipped) | Not run: an exclusive retained-base512 canary kernel-panicked the host before the PR16 gate started; pre-compute host validation also weakens the performance premise | **Software gate passed; hardware blocked by unsafe base** |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
-| #18 | `f37be96` -> repaired through `b5d2262` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, final fences, and cross-row prefix ordering repaired; 2,061 passed / 4 skipped | On macOS 26.5.2 the repaired candidate completed a 1,280-token canary and a natural 1,905-token run at 5.3603 decode tok/s with exact token parity and zero reported failures. The immediately following base arm panicked, but another agent was reportedly experimenting, so the arm is invalid for both performance and causal comparison. | **Investigate; open and unattributed pending an exclusive GPU lane** |
+| #18 | `f37be96` -> repaired through `b5d2262` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, final fences, and cross-row prefix ordering repaired; 2,061 passed / 4 skipped | In a later exclusive lane, base256 and candidate256 passed with exact token/byte parity; candidate256 was 13.25% slower and used 53,252 vs 32,886 reads. Candidate512 also passed, but the following retained-base512 arm kernel-panicked with the same global `IOGPUFamily`/`AGXG17X` queue hang and no competing MLX process. | **Hold unintegrated; base safety fix required before a performance verdict** |
 
 "Not run" is a gate result, not an estimated zero. Hardware performance was
 intentionally not measured after a candidate failed correctness, because a fast
@@ -480,16 +480,38 @@ global GPU. The base arm therefore lacks an exclusive-GPU attestation and is
 invalid for both performance comparison and causal attribution; it is not a
 base-alone reproduction.
 
-PR #18 remains neither retained nor rejected. Before another hardware gate,
-stop or coordinate every other GPU experiment, attest exclusive GPU ownership,
-and use a clean cooldown or reboot before repeating bounded base and candidate
-canaries. Separately, MTPLX still starts persistent miss writes before
-evaluating persistent hits; rows in one component bank share a Metal resource,
-so the pre-existing same-bank CPU-write/GPU-read overlap remains a software
-isolation requirement. Apple's
-[macOS 26.5.2 advisory](https://support.apple.com/en-us/127595) remains relevant
-to the two pre-update incidents, but the confounded post-update arm cannot prove
-that the OS fix succeeded or failed for this workload.
+The follow-up lane removed that confound. The user paused the other experiment
+agent; Qwen was disabled; no competing benchmark process was present; an
+exclusive lock was acquired; and the GPU reached two consecutive 0% device-
+utilization samples before the matching base arm. The retained base completed
+256 tokens at 6.5449 decode tok/s. The repaired candidate completed the same
+256 tokens with exact token and expert-byte parity, zero failures/pins/routes,
+and 20,366 progressive/projection-ready routes, but decode was 5.6777 tok/s
+(-13.25%) and read operations increased from 32,886 to 53,252. With arm order
+reversed, the candidate completed 512 tokens at 5.9337 decode tok/s, exercised
+40,819 progressive/projection-ready routes, and ended with zero reported
+failures/pins/routes. Its first 256 tokens exactly matched the base.
+
+After the candidate exited, GPU utilization decayed from 32% to 29% to 0% and
+remained at 0% for a second sample. The exclusive retained-base512 arm then
+wrote no artifact and panicked at 13:43:18. Its 90,318,125,096-byte
+`python3.12` process had `com.Metal.CommandQueueDispatch` uninterruptibly
+blocked for 118.026 seconds in `IOGPUFamily` 130.15.2 and `AGXG17X` 351.2.
+VS Code's ordinary Metal queue was blocked for the same interval, confirming a
+global GPU wedge. The only other Python process was the 253,674,192-byte
+LiteLLM gateway with no Metal queue. macOS reported `memoryPressure: false` and
+an OK compressor.
+
+This exclusive retained-base reproduction establishes that PR #18 is not
+required to trigger the panic. It does not distinguish the known pre-existing
+same-bank CPU-write/GPU-read hazard from another MLX/driver defect. PR #18 is
+held unintegrated: its complete repeated performance gate is unavailable and the
+only exclusive matched short pair is negative. No further PR18, PR16, or other
+large component-bank hardware gate is permitted until resource-level exclusion
+between component-bank CPU writes and GPU reads is implemented and verified.
+Apple's [macOS 26.5.2 advisory](https://support.apple.com/en-us/127595) remains
+relevant to the pre-update incidents, but 26.5.2 alone does not make this
+workload safe.
 
 Raw evidence:
 
@@ -503,6 +525,10 @@ Raw evidence:
 - [`hy3-q4-gated-pr18-postupdate-bounded1280.json`](../benchmarks/results/hy3-q4-gated-pr18-postupdate-bounded1280.json)
 - [`hy3-q4-gated-pr18-postupdate-candidate-p1.json`](../benchmarks/results/hy3-q4-gated-pr18-postupdate-candidate-p1.json)
 - [`hy3-q4-gated-component-bank-postupdate-base-kernel-panic.json`](../benchmarks/results/hy3-q4-gated-component-bank-postupdate-base-kernel-panic.json)
+- [`hy3-q4-gated-pr18-exclusive-base-bounded256.json`](../benchmarks/results/hy3-q4-gated-pr18-exclusive-base-bounded256.json)
+- [`hy3-q4-gated-pr18-exclusive-candidate-bounded256.json`](../benchmarks/results/hy3-q4-gated-pr18-exclusive-candidate-bounded256.json)
+- [`hy3-q4-gated-pr18-exclusive-candidate-bounded512.json`](../benchmarks/results/hy3-q4-gated-pr18-exclusive-candidate-bounded512.json)
+- [`hy3-q4-gated-component-bank-exclusive-base512-kernel-panic.json`](../benchmarks/results/hy3-q4-gated-component-bank-exclusive-base512-kernel-panic.json)
 
 ## Memory and SSD bandwidth
 
