@@ -1,0 +1,116 @@
+{
+  "schema": "mtplx-runtime-candidate-incident-v2",
+  "candidate": {
+    "git_commit": "b5d226252c629ec718b5bcfe9981d6c71b66bfd1",
+    "source_pr": 18,
+    "source_commit": "f37be96f11ad0ec0a4801df2159ce281b35c9ecf",
+    "run_label": "hy3-q4-gated-pr18-fixed-candidate-p1",
+    "repair": "collect every gate/up-ready lease before launching the first prefix Metal kernel"
+  },
+  "bounded_stability_staircase": [
+    {
+      "artifact": "hy3-q4-gated-pr18-fixed-bounded32.json",
+      "max_tokens": 32,
+      "completion_tokens": 32,
+      "elapsed_seconds": 33.99,
+      "decode_tokens_per_second": 4.6592,
+      "peak_memory_bytes": 88787469160,
+      "result": "completed"
+    },
+    {
+      "artifact": "hy3-q4-gated-pr18-fixed-bounded256.json",
+      "max_tokens": 256,
+      "completion_tokens": 256,
+      "elapsed_seconds": 66.493,
+      "decode_tokens_per_second": 6.2242439,
+      "end_to_end_tokens_per_second": 3.850839,
+      "peak_memory_bytes": 88787469160,
+      "read_bytes": 358859538432,
+      "result": "completed"
+    },
+    {
+      "artifact": "hy3-q4-gated-pr18-fixed-bounded512.json",
+      "max_tokens": 512,
+      "completion_tokens": 512,
+      "elapsed_seconds": 108.639,
+      "decode_tokens_per_second": 6.03910169,
+      "end_to_end_tokens_per_second": 4.713425,
+      "peak_memory_bytes": 88787469160,
+      "read_bytes": 576005603328,
+      "result": "completed"
+    },
+    {
+      "artifact": "hy3-q4-gated-pr18-fixed-bounded1024.json",
+      "max_tokens": 1024,
+      "completion_tokens": 1024,
+      "elapsed_seconds": 210.705,
+      "decode_tokens_per_second": 6.23551556,
+      "end_to_end_tokens_per_second": 4.860171,
+      "peak_memory_bytes": 88894111604,
+      "read_bytes": 1024025296896,
+      "result": "completed"
+    }
+  ],
+  "sustained_candidate_run": {
+    "artifact_written": false,
+    "natural_completion": false,
+    "verified_sidecar": true,
+    "qwen_model_disabled": true,
+    "qwen_gateway_enabled": true,
+    "concurrency": 1,
+    "max_tokens": 2048,
+    "slot_layout": "component-banks"
+  },
+  "panic": {
+    "panic_at_local": "2026-07-12T09:59:21-05:00",
+    "reboot_at_local": "2026-07-12T09:59:43-05:00",
+    "panic_string": "watchdog timeout: no checkins from watchdogd in 93 seconds",
+    "panic_report_sha256": "545784d527caca874a19171a53eb1115c627500b55525b5362f25f9786fee2fa",
+    "benchmark_process": {
+      "name": "python3.12",
+      "pid": 6920,
+      "resident_memory_bytes": 90410104920,
+      "metal_thread_queue": "com.Metal.CommandQueueDispatch",
+      "metal_thread_state": [
+        "TH_WAIT",
+        "TH_UNINT"
+      ],
+      "metal_thread_stall_seconds": 93.558997625
+    },
+    "blocked_driver_stack": [
+      {
+        "bundle": "com.apple.iokit.IOGPUFamily",
+        "version": "130.13",
+        "uuid": "1CC2AF3D-E6EF-3DC2-B32B-8DBD8CAA09B7"
+      },
+      {
+        "bundle": "com.apple.AGXG17X",
+        "version": "351.2",
+        "uuid": "680ACC23-AB13-301C-B28A-3A2A257F7977"
+      }
+    ],
+    "memory_pressure": false,
+    "compressor_status": "OK",
+    "interpretation": "The benchmark Metal command-queue thread was blocked in IOGPUFamily and AGXG17X for the same interval that watchdogd stopped checking in. This is a GPU command-queue hang, not an SSD-bandwidth or compressor-pressure panic."
+  },
+  "environment": {
+    "macos_version": "26.5.1",
+    "macos_build": "25F80",
+    "mlx_version": "0.31.2",
+    "mlx_lm_version": "0.31.3",
+    "available_macos_update": "26.5.2 (25F84)",
+    "apple_security_advisory": "https://support.apple.com/en-us/127595",
+    "advisory_relevance": "Apple reports that 26.5.2 fixes an IOGPUFamily race condition where an app may cause unexpected system termination."
+  },
+  "remaining_software_hazard": {
+    "status": "confirmed_by_static_control_flow",
+    "description": "begin_split_route submits persistent miss reads before HotExpertSwitchGLU evaluates persistent hits. Component-bank rows share one Metal buffer per projection, so a CPU reader can write one row while a GPU kernel reads another row of the same resource.",
+    "scope": "pre-existing component-bank hit/miss overlap; not unique to PR #18"
+  },
+  "decision": {
+    "gate": "investigation_hold",
+    "action": "no_more_sustained_runs_on_macos_26_5_1",
+    "next_gate": "Update to macOS 26.5.2 or newer, preserve the PR as open, and separately remove or isolate same-bank CPU-write/GPU-read overlap before any bounded-to-sustained promotion.",
+    "reason": "The projection-prefix ordering repair passed through 1,024 bounded tokens but did not prevent a second GPU-driver watchdog panic. The installed OS is missing an IOGPUFamily race fix that directly matches the blocked driver stack, while MTPLX also retains an independently unsafe same-resource overlap."
+  }
+}
