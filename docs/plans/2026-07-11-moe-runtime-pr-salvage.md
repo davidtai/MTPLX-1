@@ -349,8 +349,9 @@ the six touched files passed Ruff/format/diff checks. The repository-wide Ruff
 command reproduces five unrelated failures on base `7fcc036`. The matched
 verified-sidecar base completed naturally at 6.5302 decode tok/s with zero
 fence/I/O/integrity failures. The host kernel-panicked during candidate arm 1
-and rebooted at 09:16:44 before a candidate artifact was written. Reject and
-quarantine PR #18 without a rerun; parity, throughput, SSD, and memory-hook
+and rebooted at 09:16:44 before a candidate artifact was written. Keep PR #18
+open on investigation hold and quarantine sustained runs until a bounded repro
+or safety fix isolates the cause; parity, throughput, SSD, and memory-hook
 results are unmeasured rather than zero.
 
 ### Task 6: Repair and gate PR #16 Metal-resident routing

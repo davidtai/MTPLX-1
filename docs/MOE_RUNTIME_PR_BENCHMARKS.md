@@ -25,7 +25,7 @@ auditable.
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
-| #18 | `f37be96` -> repaired `efe1809` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, and final fences repaired; 2,060 passed / 4 skipped | Base completed at 6.5302 decode tok/s; candidate arm 1 kernel-panicked the host before writing an artifact | **Skip and quarantine** |
+| #18 | `f37be96` -> repaired `efe1809` | Projection lifetime, ownership, cancellation/deadline, per-expert futures, error priority, and final fences repaired; 2,060 passed / 4 skipped | Base completed at 6.5302 decode tok/s; candidate arm 1 kernel-panicked the host before writing an artifact | **Investigate; sustained lane quarantined** |
 
 "Not run" is a gate result, not an estimated zero. Hardware performance was
 intentionally not measured after a candidate failed correctness, because a fast
@@ -410,8 +410,11 @@ MLX, 1,768,689,893,376 expert-read bytes, 165,678 read operations, and zero
 completion-fence, short-read, I/O, or integrity failures. During the first
 candidate arm the host kernel-panicked and rebooted at 09:16:44. The candidate
 wrote no artifact, so token parity, throughput, tail latency, SSD bandwidth,
-and routed-memory hooks are unmeasured. A catastrophic host-stability failure
-is sufficient to reject the candidate; it was quarantined without a rerun.
+and routed-memory hooks are unmeasured. The candidate is neither retained nor
+rejected: sustained hardware runs are quarantined while bounded diagnostics
+isolate whether the failure comes from concurrent CPU writes into MLX-backed
+component storage, Metal command fencing, memory pressure, or an unrelated
+host fault.
 
 Raw evidence:
 

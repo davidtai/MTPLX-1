@@ -39,8 +39,8 @@
     "panic_report_available_at_triage": false
   },
   "decision": {
-    "gate": "failed_catastrophic_host_stability",
-    "action": "reject_pr18_without_rerun",
-    "reason": "The host kernel-panicked during the first candidate arm after the matched base completed normally. No candidate performance artifact exists, so throughput, parity, and runner-hook bandwidth gates are unmeasured."
+    "gate": "investigation_hold_host_stability",
+    "action": "quarantine_sustained_runs_pending_root_cause",
+    "reason": "The host kernel-panicked during the first candidate arm after the matched base completed normally. No candidate performance artifact exists, so throughput, parity, and runner-hook bandwidth gates are unmeasured. PR #18 remains open for bounded root-cause investigation."
   }
 }
