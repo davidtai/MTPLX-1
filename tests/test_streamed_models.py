@@ -1665,6 +1665,104 @@ def test_suffix_failure_is_not_masked_by_projection_release_sync_failure(
     assert events[-2:] == ["abort-suffix", "close"]
 
 
+def test_projection_pipeline_stages_only_after_all_prefix_writes_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    bindings = tuple(
+        SimpleNamespace(
+            expert=expert,
+            logical_slot=expert,
+            generation=1,
+            buffer=SimpleNamespace(bank=object()),
+        )
+        for expert in (0, 1)
+    )
+
+    class Projection:
+        def __init__(self, binding) -> None:
+            self.bindings = (binding,)
+
+        def validate(self) -> None:
+            return None
+
+    projections = tuple(Projection(binding) for binding in bindings)
+
+    class Pending:
+        plan = SimpleNamespace(hits=(), misses=(0, 1))
+        hit_ready = None
+        misses_pending = True
+
+        def release_hits(self) -> None:
+            raise AssertionError("all-miss fixture has no hits")
+
+        def iter_projection_misses(self):
+            for projection in projections:
+                expert = projection.bindings[0].expert
+                events.append(f"prefix-ready:{expert}")
+                yield projection
+
+        def release_projection(self, projection, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+            events.append(f"projection-release:{projection.bindings[0].expert}")
+
+        def iter_ready_misses(self):
+            for expert, binding in enumerate(bindings):
+                yield SimpleNamespace(
+                    plan=SimpleNamespace(experts=(expert,)),
+                    bindings=(binding,),
+                )
+
+        def release_miss(self, ready) -> None:
+            events.append(f"suffix-release:{ready.bindings[0].expert}")
+
+        def abort(self, error: BaseException) -> None:
+            raise AssertionError(
+                "prefix ordering fixture unexpectedly aborted"
+            ) from error
+
+        def close(self) -> None:
+            events.append("close")
+
+    class Runtime:
+        spec = SimpleNamespace(top_k=2, hidden_size=2, quant_group_size=64)
+        manifest = SimpleNamespace(sidecar=object())
+        config = SimpleNamespace(slot_layout="component-banks")
+
+        def observe_route(self, *_args, **_kwargs) -> None:
+            return None
+
+        def route_waves(self, expert_ids, **_kwargs):
+            return (RouteWave(positions=(0, 1), experts=tuple(expert_ids)),)
+
+        def try_all_hit_route(self, *_args, **_kwargs):
+            return None
+
+        def begin_split_route(self, *_args, **_kwargs):
+            return Pending()
+
+    def fake_gate_up(selected, selected_bindings, *, group_size):
+        assert group_size == 64
+        events.append(f"gate-up:{selected_bindings[0].expert}")
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_gate_up", fake_gate_up)
+    monkeypatch.setattr(
+        expert_mlx,
+        "_run_component_bank_down",
+        lambda hidden, _bindings, **_kwargs: hidden,
+    )
+
+    output = HotExpertSwitchGLU(Runtime(), 1)(
+        mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        mx.array([[[0, 1]]], dtype=mx.int32),
+    )
+    mx.eval(output)
+
+    assert events.index("prefix-ready:1") < events.index("gate-up:0")
+    assert events[-1] == "close"
+
+
 def test_128k_prefill_keeps_projection_pipeline_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
