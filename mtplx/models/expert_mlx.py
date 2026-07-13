@@ -18,7 +18,7 @@ import numpy as np
 
 from mlx_lm.models.activations import swiglu
 
-from mtplx.expert_runtime import ExpertStreamingRuntime
+from mtplx.expert_runtime import ExpertStreamingRuntime, RouteWave
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
 from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
 from mtplx.expert_streaming import RoutingPhase
@@ -669,6 +669,173 @@ class HotExpertSwitchGLU(nn.Module):
         assert shared is not None
         return output, shared
 
+    @staticmethod
+    def _update_fence_metrics(ready: ReadyRoute, **values: int) -> None:
+        metrics = getattr(getattr(ready, "pool", None), "metrics", None)
+        update = getattr(metrics, "update", None)
+        if callable(update):
+            update(**values)
+
+    def _synchronous_fence(self, ready: ReadyRoute, values: Any) -> None:
+        try:
+            mx.eval(values)
+        except BaseException as exc:
+            self._update_fence_metrics(ready, completion_fence_failures=1)
+            record = getattr(
+                getattr(ready, "pool", None),
+                "_record_completion_error",
+                None,
+            )
+            if callable(record):
+                record(exc)
+            raise
+
+    def _fence_bindings(
+        self,
+        ready: ReadyRoute,
+        bindings: tuple[ExpertSlotBinding, ...],
+        wave_outputs: list[mx.array],
+        *,
+        force_sync: bool = False,
+    ) -> None:
+        raw = os.environ.get("MTPLX_EXPERT_SLOT_FENCES", "1")
+        enabled = raw.strip().lower() not in {"0", "false", "no", "off"}
+        async_eval = getattr(mx, "async_eval", None)
+        if not enabled:
+            self._synchronous_fence(ready, wave_outputs)
+            return
+        if not callable(async_eval):
+            self._update_fence_metrics(ready, completion_fence_fallbacks=1)
+            self._synchronous_fence(ready, wave_outputs)
+            return
+        if force_sync:
+            self._update_fence_metrics(
+                ready,
+                completion_fences=1,
+                completion_fence_slots=len(bindings),
+            )
+            self._synchronous_fence(ready, wave_outputs)
+            return
+        try:
+            async_eval(wave_outputs)
+        except Exception:
+            # Older/stripped MLX builds may expose the name without a usable
+            # asynchronous evaluator. Preserve the synchronous barrier.
+            self._update_fence_metrics(ready, completion_fence_fallbacks=1)
+            self._synchronous_fence(ready, wave_outputs)
+            return
+        roots = tuple(wave_outputs)
+        defer = getattr(ready, "defer_bindings_until", None)
+        if not callable(defer):
+            self._synchronous_fence(ready, roots)
+            return
+        try:
+            defer(bindings, lambda: mx.eval(roots))
+        except Exception:
+            # Never release the route on an async promise if the completion
+            # lane rejects or cannot represent this binding set.
+            self._update_fence_metrics(ready, completion_fence_fallbacks=1)
+            self._synchronous_fence(ready, roots)
+            raise_completion_error = getattr(
+                getattr(ready, "pool", None),
+                "_raise_completion_error",
+                None,
+            )
+            if callable(raise_completion_error):
+                raise_completion_error()
+
+    def _evaluate_bindings(
+        self,
+        positions: tuple[int, ...] | list[int],
+        bindings: tuple[ExpertSlotBinding, ...],
+        ready: ReadyRoute,
+        *,
+        tokens: mx.array,
+        top_k: int,
+        force_sync: bool = False,
+    ) -> tuple[list[mx.array], list[int]]:
+        if not positions:
+            return [], []
+
+        component_banks = self.runtime.config.slot_layout == "component-banks"
+        assignments_by_group: dict[int, list[tuple[int, ExpertSlotBinding]]] = {}
+        for position, binding in zip(positions, bindings, strict=True):
+            group = id(binding.buffer.bank) if component_banks else binding.expert
+            assignments_by_group.setdefault(group, []).append((position, binding))
+
+        wave_outputs: list[mx.array] = []
+        wave_positions: list[int] = []
+        for assignments in assignments_by_group.values():
+            grouped_positions = [position for position, _binding in assignments]
+            grouped_bindings = tuple(binding for _position, binding in assignments)
+            token_positions = mx.array(
+                [position // top_k for position in grouped_positions],
+                dtype=mx.int32,
+            )
+            selected = mx.take(tokens, token_positions, axis=0)
+            if component_banks:
+                output = _run_component_bank_q4(
+                    selected,
+                    grouped_bindings,
+                    group_size=self.group_size,
+                )
+            else:
+                output = _run_q4_expert(
+                    selected,
+                    grouped_bindings[0],
+                    group_size=self.group_size,
+                )
+            wave_outputs.append(output)
+            wave_positions.extend(grouped_positions)
+
+        self._fence_bindings(
+            ready,
+            bindings,
+            wave_outputs,
+            force_sync=force_sync,
+        )
+        return wave_outputs, wave_positions
+
+    def _try_component_all_hit_wave(
+        self,
+        wave: RouteWave,
+        *,
+        tokens: mx.array,
+        top_k: int,
+        hidden_size: int,
+        assignment_count: int,
+    ) -> mx.array | None:
+        ready = self.runtime.try_all_hit_route(
+            self.layer_index,
+            wave.experts,
+            phase=RoutingPhase.DECODE,
+        )
+        if ready is None:
+            return None
+        try:
+            if wave.positions == tuple(range(assignment_count)):
+                assignment_inputs = mx.broadcast_to(
+                    tokens[:, None, :],
+                    (int(tokens.shape[0]), top_k, hidden_size),
+                ).reshape((-1, hidden_size))
+            else:
+                token_positions = mx.array(
+                    [position // top_k for position in wave.positions],
+                    dtype=mx.int32,
+                )
+                assignment_inputs = mx.take(tokens, token_positions, axis=0)
+            output = _run_component_bank_q4(
+                assignment_inputs,
+                ready.bindings,
+                group_size=self.group_size,
+            )
+            # Slot pins may be released only after the lazy graph has consumed
+            # the currently bound bank generations.
+            self._synchronous_fence(ready, output)
+            return output
+        finally:
+            ready.release(synchronize=False)
+
     def _run(
         self,
         x: mx.array,
@@ -710,163 +877,6 @@ class HotExpertSwitchGLU(nn.Module):
         output_positions: list[int] = []
         shared: mx.array | None = None
 
-        def update_fence_metrics(ready: ReadyRoute, **values: int) -> None:
-            metrics = getattr(getattr(ready, "pool", None), "metrics", None)
-            update = getattr(metrics, "update", None)
-            if callable(update):
-                update(**values)
-
-        def synchronous_fence(ready: ReadyRoute, values: Any) -> None:
-            try:
-                mx.eval(values)
-            except BaseException as exc:
-                update_fence_metrics(ready, completion_fence_failures=1)
-                record = getattr(
-                    getattr(ready, "pool", None),
-                    "_record_completion_error",
-                    None,
-                )
-                if callable(record):
-                    record(exc)
-                raise
-
-        def fence_bindings(
-            ready: ReadyRoute,
-            bindings: tuple[ExpertSlotBinding, ...],
-            wave_outputs: list[mx.array],
-            *,
-            force_sync: bool = False,
-        ) -> None:
-            raw = os.environ.get("MTPLX_EXPERT_SLOT_FENCES", "1")
-            enabled = raw.strip().lower() not in {"0", "false", "no", "off"}
-            async_eval = getattr(mx, "async_eval", None)
-            if not enabled:
-                synchronous_fence(ready, wave_outputs)
-                return
-            if not callable(async_eval):
-                update_fence_metrics(ready, completion_fence_fallbacks=1)
-                synchronous_fence(ready, wave_outputs)
-                return
-            if force_sync:
-                update_fence_metrics(
-                    ready,
-                    completion_fences=1,
-                    completion_fence_slots=len(bindings),
-                )
-                synchronous_fence(ready, wave_outputs)
-                return
-            try:
-                async_eval(wave_outputs)
-            except Exception:
-                # Older/stripped MLX builds may expose the name without a
-                # usable asynchronous evaluator. Preserve the generation
-                # fence with the original synchronous barrier.
-                update_fence_metrics(ready, completion_fence_fallbacks=1)
-                synchronous_fence(ready, wave_outputs)
-                return
-            roots = tuple(wave_outputs)
-            defer = getattr(ready, "defer_bindings_until", None)
-            if not callable(defer):
-                synchronous_fence(ready, roots)
-                return
-            try:
-                defer(
-                    bindings,
-                    lambda: mx.eval(roots),
-                )
-            except Exception:
-                # If the completion lane rejects or cannot represent this
-                # binding set, do not release the route on an async promise.
-                update_fence_metrics(ready, completion_fence_fallbacks=1)
-                synchronous_fence(ready, roots)
-                raise_completion_error = getattr(
-                    getattr(ready, "pool", None),
-                    "_raise_completion_error",
-                    None,
-                )
-                if callable(raise_completion_error):
-                    raise_completion_error()
-
-        def evaluate_component_bindings(
-            positions: tuple[int, ...] | list[int],
-            bindings: tuple[ExpertSlotBinding, ...],
-            ready: ReadyRoute,
-            *,
-            force_sync: bool = False,
-        ) -> None:
-            if not positions:
-                return
-            by_bank: dict[int, list[tuple[int, ExpertSlotBinding]]] = {}
-            for global_position, binding in zip(positions, bindings, strict=True):
-                by_bank.setdefault(id(binding.buffer.bank), []).append(
-                    (global_position, binding)
-                )
-            wave_outputs: list[mx.array] = []
-            wave_positions: list[int] = []
-            for assignments in by_bank.values():
-                grouped_positions = [position for position, _binding in assignments]
-                grouped_bindings = tuple(binding for _position, binding in assignments)
-                token_positions = mx.array(
-                    [position // top_k for position in grouped_positions],
-                    dtype=mx.int32,
-                )
-                selected = mx.take(tokens, token_positions, axis=0)
-                wave_outputs.append(
-                    _run_component_bank_q4(
-                        selected,
-                        grouped_bindings,
-                        group_size=self.group_size,
-                    )
-                )
-                wave_positions.extend(grouped_positions)
-            fence_bindings(
-                ready,
-                bindings,
-                wave_outputs,
-                force_sync=force_sync,
-            )
-            outputs.extend(wave_outputs)
-            output_positions.extend(wave_positions)
-
-        def evaluate_direct_bindings(
-            positions: tuple[int, ...] | list[int],
-            bindings: tuple[ExpertSlotBinding, ...],
-            ready: ReadyRoute,
-            *,
-            force_sync: bool = False,
-        ) -> None:
-            if not positions:
-                return
-            by_expert: dict[int, list[int]] = {}
-            binding_by_expert: dict[int, ExpertSlotBinding] = {}
-            for global_position, binding in zip(positions, bindings, strict=True):
-                by_expert.setdefault(binding.expert, []).append(global_position)
-                binding_by_expert.setdefault(binding.expert, binding)
-            wave_outputs: list[mx.array] = []
-            wave_positions: list[int] = []
-            for expert, expert_positions in by_expert.items():
-                token_positions = mx.array(
-                    [position // top_k for position in expert_positions],
-                    dtype=mx.int32,
-                )
-                selected = mx.take(tokens, token_positions, axis=0)
-                wave_outputs.append(
-                    _run_q4_expert(
-                        selected,
-                        binding_by_expert[expert],
-                        group_size=self.group_size,
-                    )
-                )
-                wave_positions.extend(expert_positions)
-            fence_bindings(
-                ready,
-                bindings,
-                wave_outputs,
-                force_sync=force_sync,
-            )
-            outputs.extend(wave_outputs)
-            output_positions.extend(wave_positions)
-
         for wave in self.runtime.route_waves(
             expert_ids,
             sort_unique=(
@@ -882,49 +892,20 @@ class HotExpertSwitchGLU(nn.Module):
                 phase is RoutingPhase.DECODE
                 and self.runtime.config.slot_layout == "component-banks"
             ):
-                ready = self.runtime.try_all_hit_route(
-                    self.layer_index,
-                    wave.experts,
-                    phase=phase,
+                wave_output = self._try_component_all_hit_wave(
+                    wave,
+                    tokens=tokens,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    assignment_count=len(expert_ids),
                 )
-                if ready is not None:
-                    try:
-                        if wave.positions == tuple(range(len(expert_ids))):
-                            assignment_inputs = mx.broadcast_to(
-                                tokens[:, None, :],
-                                (int(tokens.shape[0]), top_k, hidden_size),
-                            ).reshape((-1, hidden_size))
-                        else:
-                            token_positions = mx.array(
-                                [position // top_k for position in wave.positions],
-                                dtype=mx.int32,
-                            )
-                            assignment_inputs = mx.take(
-                                tokens,
-                                token_positions,
-                                axis=0,
-                            )
-                        wave_output = _run_component_bank_q4(
-                            assignment_inputs,
-                            ready.bindings,
-                            group_size=self.group_size,
-                        )
-                        # Slot pins may be released only after the lazy graph
-                        # has consumed the currently bound bank generations.
-                        synchronous_fence(ready, wave_output)
-                        outputs.append(wave_output)
-                        output_positions.extend(wave.positions)
-                    finally:
-                        ready.release(synchronize=False)
+                if wave_output is not None:
+                    outputs.append(wave_output)
+                    output_positions.extend(wave.positions)
                     continue
 
             # Both layouts pin hits and start miss reads first, then run the
             # resident experts on the GPU while the misses stream from SSD.
-            evaluate_bindings = (
-                evaluate_component_bindings
-                if self.runtime.config.slot_layout == "component-banks"
-                else evaluate_direct_bindings
-            )
             pending = self.runtime.begin_split_route(
                 self.layer_index,
                 wave.experts,
@@ -943,12 +924,16 @@ class HotExpertSwitchGLU(nn.Module):
                     # Split parts feed one shared lazy graph. Keep every MLX
                     # eval on the generation thread; evaluating a fence on the
                     # completion lane can race the next part's graph traversal.
-                    evaluate_bindings(
+                    wave_outputs, wave_positions = self._evaluate_bindings(
                         hit_positions,
                         pending.hit_ready.bindings,
                         pending.hit_ready,
+                        tokens=tokens,
+                        top_k=top_k,
                         force_sync=True,
                     )
+                    outputs.extend(wave_outputs)
+                    output_positions.extend(wave_positions)
                     pending.release_hits()
                 # The resident shared branch depends only on ``x``.  Force it
                 # on Metal while the native readers own miss futures, so
@@ -975,12 +960,16 @@ class HotExpertSwitchGLU(nn.Module):
                             )
                             if expert not in hit_set and expert in ready_experts
                         )
-                        evaluate_bindings(
+                        wave_outputs, wave_positions = self._evaluate_bindings(
                             miss_positions,
                             miss_ready.bindings,
                             miss_ready,
+                            tokens=tokens,
+                            top_k=top_k,
                             force_sync=True,
                         )
+                        outputs.extend(wave_outputs)
+                        output_positions.extend(wave_positions)
                     except BaseException as exc:
                         part_error = exc
                         raise
