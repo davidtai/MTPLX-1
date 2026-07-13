@@ -48,4 +48,4 @@
 - [x] Run full pytest and changed-file Ruff.
 - [x] Save a machine-readable decision payload and a human-readable per-track evidence map.
 - [x] Document go/no-go independently; do not combine sub-5% arms into one claimed win or close the issue while open tracks remain.
-- [ ] Push `experiment/hy3-artifact-speculative` and open a draft PR against `experiment/hy3-record-native-exec`, linking #31.
+- [x] Push `experiment/hy3-artifact-speculative` and open draft PR #37 against `experiment/hy3-record-native-exec`, linking #31 without closing it.
