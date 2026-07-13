@@ -385,7 +385,7 @@ def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
 
     # Closed branch (2026-06-12): m8 ksplit is not routed by the dispatcher.
     lanes["qmm_m8_ksplit"] = _STATUS_SKIPPED
-    # lm_head_topk kernels exist but are not routed on the serve path.
+    # Preserve the historical health key after removing the unrouted probe.
     lanes["lm_head_topk"] = _STATUS_SKIPPED
 
     if _env_on("MTPLX_GQA_PACKED_SDPA"):

@@ -41,6 +41,7 @@ def test_selfcheck_passes_on_this_machine(monkeypatch, dtype, bits) -> None:
     assert lanes["qmm_m4"] == "ok"
     assert lanes["qmm_m6"] == "ok"
     assert lanes["gqa_packed_sdpa"] == "ok"
+    assert lanes["lm_head_topk"] == "skipped"
 
 
 def test_selfcheck_mismatch_disables_lane_and_surfaces_in_health(monkeypatch) -> None:
