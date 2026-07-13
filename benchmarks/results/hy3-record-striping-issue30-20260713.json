@@ -1,0 +1,374 @@
+{
+  "schema": "mtplx.hy3-record-striping.issue30.v1",
+  "issue": 30,
+  "base_branch": "experiment/moe-pr13-pr14-stack",
+  "base_commit": "1faa0f960fc8b73a2eb828a563f352f101d2cf6f",
+  "branch": "experiment/hy3-record-striping",
+  "measured_commit": "f51c727a2a5006b4022effd82e9c10b142dbf732",
+  "decision": {
+    "status": "reject_exact_demand_record_striping",
+    "selected_stripe_count": null,
+    "runtime_optimization_promoted": false,
+    "finding": "Exact-demand 2/4/8-way preadv striping within one 10,616,832-byte Hy3 expert record reduced useful bandwidth and increased p95 service time relative to the direct synchronous 1-way control in both selection and confirmation repeats.",
+    "authorization": "Microbenchmark evidence only; runtime integration remains unauthorized.",
+    "fixed_percent_gain_cutoff": null
+  },
+  "campaign": {
+    "id": "hy3-record-stripes-20260713T213238Z-f51c727a2a50",
+    "started_at_utc": "2026-07-13T21:32:38.993199Z",
+    "finished_at_utc": "2026-07-13T21:33:31.465141Z",
+    "status": "complete",
+    "measured_arms": 64,
+    "schedule": "deterministic balanced rotation",
+    "selection_repeats": 8,
+    "confirmation_repeats": 8,
+    "raw_artifacts_committed": false,
+    "raw_directory": "benchmarks/raw/hy3-record-stripes/hy3-record-stripes-20260713T213238Z-f51c727a2a50",
+    "raw_result_sha256": "c7725ed8db099ba625fce04eb72b5af7dccb160a8ef408350d390e1fbb54b29c",
+    "raw_campaign_sha256": "0787c83bdb56c981e364bd08ed8f38649f236ee526bf4a23bbb51089a9860f0b",
+    "machine_lifecycle_orchestration_location": "temporary external wrapper; not repository code or tests",
+    "qwen": {
+      "initial": {
+        "loaded": true,
+        "models": [
+          "mtplx-qwen36-27b-optimized-speed"
+        ]
+      },
+      "final": {
+        "loaded": true,
+        "models": [
+          "mtplx-qwen36-27b-optimized-speed"
+        ]
+      },
+      "exact_state_restored": true
+    },
+    "exclusive_lane_released": true
+  },
+  "environment": {
+    "machine": "MacBook Pro Mac17,6",
+    "chip": "Apple M5 Max",
+    "memory_bytes": 137438953472,
+    "os": "macOS 26.5.2 build 25F84 arm64",
+    "python": "3.12.13",
+    "thermal_warning": false,
+    "fan_mode": "unavailable",
+    "fan_coverage": "unavailable",
+    "relevant_environment_variables": {
+      "MLX_METAL_CACHE_LIMIT": null,
+      "MTPLX_MMAP_WORKERS": null,
+      "MTPLX_NATIVE_EXPERT_IO": null,
+      "PYTHONHASHSEED": null
+    }
+  },
+  "configuration": {
+    "model": "pipenetwork/Hy3-4bit",
+    "revision": "160619d3f96c8470350b6dac0ef033a8381551e3",
+    "model_key": "hy3-q4",
+    "quantization": "4-bit",
+    "benchmark_profile": "isolated exact-demand Hy3 expert-record reads",
+    "sampler_settings": null,
+    "prompt_suite": null,
+    "token_count": null,
+    "generation_not_applicable": true,
+    "expert_payload_sha256": "5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae",
+    "expert_payload_bytes": 161036107776,
+    "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+    "harness_source_sha256": "ee333991a9384b873cf11a0177365f648b8f3d3ab4b78fea8aea5ee2c8cfa335",
+    "workload_sha256": "e15b16f3b9163ef0512cdb51793a408dc0ae81ca196e8f08715c89ce27fd5f2c",
+    "record_bytes": 10616832,
+    "alignment_bytes": 16384,
+    "stripe_counts": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "operations_per_arm": 96,
+    "warmup_operations_per_arm": 32,
+    "repeats": 16,
+    "seed": 30,
+    "bootstrap_resamples": 20000,
+    "cache_mode": "F_NOCACHE",
+    "reproduction_command": [
+      ".venv/bin/python",
+      "scripts/benchmark_hy3_record_stripes.py",
+      "$MODEL_ROOT",
+      "$MODEL_ROOT/expert-manifest-sidecar.json",
+      "--stripe-counts",
+      "1,2,4,8",
+      "--operations",
+      "96",
+      "--warmup-operations",
+      "32",
+      "--repeats",
+      "16",
+      "--seed",
+      "30",
+      "--bootstrap-resamples",
+      "20000",
+      "--output-json",
+      "/tmp/hy3-record-stripes.json"
+    ]
+  },
+  "io_contract": {
+    "control": "direct synchronous preadv",
+    "candidates": "persistent executor with disjoint aligned preadv ranges",
+    "host_call_semantics": "actual preadv attempts",
+    "returned_byte_semantics": "actual positive bytes",
+    "full_record_hash_per_operation": true,
+    "one_logical_publication_per_validated_record": true,
+    "device_queue_depth_measured": false,
+    "physical_nand_bytes_measured": false
+  },
+  "validation": {
+    "measured_logical_records": 6144,
+    "measured_logical_bytes": 65229815808,
+    "measured_host_calls": 23040,
+    "measured_returned_bytes": 65229815808,
+    "all_hash_parity": true,
+    "all_publication_parity": true,
+    "all_byte_amplification_one": true,
+    "all_evictions_succeeded": true,
+    "all_cache_before_verified_cold": true,
+    "all_cache_after_verified_cold": true,
+    "maximum_resident_fraction_before": 0.0,
+    "maximum_resident_fraction_after": 0.0,
+    "pre_run_git_clean": true,
+    "post_run_git_clean": true,
+    "pre_run_git_commit": "f51c727a2a5006b4022effd82e9c10b142dbf732",
+    "post_run_git_commit": "f51c727a2a5006b4022effd82e9c10b142dbf732",
+    "pre_run_harness_sha256": "ee333991a9384b873cf11a0177365f648b8f3d3ab4b78fea8aea5ee2c8cfa335",
+    "post_run_harness_sha256": "ee333991a9384b873cf11a0177365f648b8f3d3ab4b78fea8aea5ee2c8cfa335"
+  },
+  "aggregate_by_stripe_count": [
+    {
+      "stripe_count": 1,
+      "repeats": 16,
+      "mean_useful_gib_per_second": 10.011221124759784,
+      "minimum_useful_gib_per_second": 9.774608589338683,
+      "maximum_useful_gib_per_second": 10.281924541978395,
+      "mean_p50_service_time_ms": 0.9612032500000001,
+      "mean_p95_service_time_ms": 0.9918750625000001,
+      "worst_max_service_time_ms": 3.282667,
+      "mean_validated_wall_gib_per_second": 2.412490264440401,
+      "host_calls_per_record": 1.0,
+      "byte_amplification": 1.0
+    },
+    {
+      "stripe_count": 2,
+      "repeats": 16,
+      "mean_useful_gib_per_second": 9.743736764707954,
+      "minimum_useful_gib_per_second": 9.059588524137046,
+      "maximum_useful_gib_per_second": 10.044779976361582,
+      "mean_p50_service_time_ms": 0.9885104375,
+      "mean_p95_service_time_ms": 1.0398203125,
+      "worst_max_service_time_ms": 4.066084,
+      "mean_validated_wall_gib_per_second": 2.3925747913944395,
+      "host_calls_per_record": 2.0,
+      "byte_amplification": 1.0
+    },
+    {
+      "stripe_count": 4,
+      "repeats": 16,
+      "mean_useful_gib_per_second": 9.713340144412788,
+      "minimum_useful_gib_per_second": 9.255098710815176,
+      "maximum_useful_gib_per_second": 10.036353996994187,
+      "mean_p50_service_time_ms": 0.9883255000000002,
+      "mean_p95_service_time_ms": 1.026012875,
+      "worst_max_service_time_ms": 4.146333,
+      "mean_validated_wall_gib_per_second": 2.3960168896106935,
+      "host_calls_per_record": 4.0,
+      "byte_amplification": 1.0
+    },
+    {
+      "stripe_count": 8,
+      "repeats": 16,
+      "mean_useful_gib_per_second": 9.610228381422996,
+      "minimum_useful_gib_per_second": 9.390743988068884,
+      "maximum_useful_gib_per_second": 9.892512038439717,
+      "mean_p50_service_time_ms": 1.0023829375,
+      "mean_p95_service_time_ms": 1.042375,
+      "worst_max_service_time_ms": 4.139,
+      "mean_validated_wall_gib_per_second": 2.3883871235802805,
+      "host_calls_per_record": 8.0,
+      "byte_amplification": 1.0
+    }
+  ],
+  "paired_bootstrap_95_percent": {
+    "method": "paired percentile bootstrap",
+    "repeatability_rule": "selection and confirmation intervals must both pass",
+    "candidates": [
+      {
+        "stripe_count": 2,
+        "decision": "reject",
+        "selection": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -2.969470122098962,
+            "low": -3.988903312292484,
+            "high": -2.1517325927009514
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.03009330468749999,
+            "low": -0.04081544921875002,
+            "high": -0.021519195312499975
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.047234374999999953,
+            "low": 0.026010499999999964,
+            "high": 0.07827087499999993
+          }
+        },
+        "confirmation": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -2.3597057452934043,
+            "low": -4.4462222288967785,
+            "high": -0.9973756408365037
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.02484591406249996,
+            "low": -0.04756932031249998,
+            "high": -0.01011753385416661
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.048656124999999995,
+            "low": 0.02705749999999997,
+            "high": 0.08107300000000002
+          }
+        },
+        "full": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -2.664587933696183,
+            "low": -3.790368718912545,
+            "high": -1.7583475256465753
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.027469609374999975,
+            "low": -0.03979496289062499,
+            "high": -0.017668725911458294
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.047945249999999974,
+            "low": 0.030463437499999954,
+            "high": 0.07030456249999997
+          }
+        }
+      },
+      {
+        "stripe_count": 4,
+        "decision": "reject",
+        "selection": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -3.374825879645904,
+            "low": -4.696788686753356,
+            "high": -2.404200581539591
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.03445361067708329,
+            "low": -0.0485337174479166,
+            "high": -0.023893748697916647
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.028624749999999963,
+            "low": 0.023791374999999948,
+            "high": 0.0329425
+          }
+        },
+        "confirmation": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -2.5483144177011487,
+            "low": -4.277547741987722,
+            "high": -0.9625412540579775
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.02655892447916669,
+            "low": -0.0452660156250001,
+            "high": -0.009808282552083367
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.03965087500000003,
+            "low": 0.02830212500000001,
+            "high": 0.05799962500000003
+          }
+        },
+        "full": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -2.9615701486735264,
+            "low": -4.026688205455984,
+            "high": -1.9474698819341003
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.03050626757812499,
+            "low": -0.04207853320312502,
+            "high": -0.019975402343750004
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.034137812499999996,
+            "low": 0.027481499999999992,
+            "high": 0.044158687499999995
+          }
+        }
+      },
+      {
+        "stripe_count": 8,
+        "decision": "reject",
+        "selection": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -4.394113960655105,
+            "low": -5.0700165712756275,
+            "high": -3.8118547952459325
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.0450532604166666,
+            "low": -0.05261591927083323,
+            "high": -0.03873695182291659
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.04873437500000001,
+            "low": 0.044562375000000015,
+            "high": 0.053104000000000026
+          }
+        },
+        "confirmation": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -3.5983010220249856,
+            "low": -4.759222829991205,
+            "high": -2.5161079932295607
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.037420476562500055,
+            "low": -0.049766571614583394,
+            "high": -0.02595504296875005
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.05226550000000005,
+            "low": 0.04187000000000006,
+            "high": 0.06531237500000003
+          }
+        },
+        "full": {
+          "relative_useful_gib_per_second_delta_percent": {
+            "mean": -3.996207491340045,
+            "low": -4.673610000036199,
+            "high": -3.319552618092509
+          },
+          "milliseconds_saved_per_record": {
+            "mean": -0.04123686848958333,
+            "low": -0.048469087239583326,
+            "high": -0.03423755208333336
+          },
+          "p95_service_time_delta_ms": {
+            "mean": 0.05049993750000003,
+            "low": 0.044864437500000034,
+            "high": 0.05746350000000006
+          }
+        }
+      }
+    ]
+  },
+  "limitations": [
+    "This is an isolated record-read microbenchmark, not an end-to-end decode benchmark.",
+    "Useful GiB/s uses measured service time; validated wall GiB/s includes full-record SHA-256 validation and cache-state checks.",
+    "Host preadv attempts and returned bytes are measured, but physical NAND bytes and device queue depth are not.",
+    "No scheduler, cache-policy, MLX/Metal, kernel, or runtime integration change was evaluated or authorized."
+  ]
+}
