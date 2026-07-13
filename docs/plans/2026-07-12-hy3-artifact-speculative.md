@@ -2,48 +2,50 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Provide isolated, reproducible experiments for GPU-oriented expert packing, KV/cache budget exchange, hint-only route prefetch, and a separately labeled lower-bit cold tier.
-**Architecture:** Build on PR 2 but keep each arm behind a separate selector and benchmark label. No arm may depend on another arm being enabled. Full artifact migration occurs only after a synthetic layout win.
-**Tech Stack:** Python binary codecs, manifest validation, MLX KV quantization, expert runtime hint API, pytest, quality/performance harnesses.
-**Assumptions:** Assumes the current sidecar remains authoritative v1 input; this plan will NOT rewrite 161 GB before a layer-local proof. Assumes lower-bit MLX affine kernels are available for the chosen bits; unsupported hardware will fail closed rather than dequantize silently.
+**Goal:** Decide independently whether GPU-oriented expert packing, KV/cache budget exchange, hint-only route prefetch, or a lower-bit cold tier justifies implementation.
+**Architecture:** Build on PR 2, but apply the promotion premise before writing selectors or runtime code. Existing isolated results count when their mechanism and claim boundary match #31. No sub-5% arms may be combined.
+**Tech Stack:** Checked-in route/kernel/runtime benchmark evidence, manifest contracts, MLX capability inspection, and pytest verification.
+**Premise update:** #29 and #30 now provide the required baseline. Existing evidence rejects the exact measured 75-to-100-slot reinvestment and the current MTP speed configuration. The trace-local route-recall data is insufficient to justify runtime promotion, not evidence that every hint-only predictor fails. The packed-stream layout still needs one bounded synthetic probe because the measured isolated floor leaves slightly more than 5% headroom. Track 4 lacks a valid quality/artifact contract. The detailed evidence map is `benchmarks/results/hy3-artifact-speculative-issue31-20260713.{md,json}`.
 
 ---
 
-### Task 1: Add a reversible synthetic v2 codec
+### Task 1: Gate a synthetic v2 codec with a packed-stream probe
 
-- [ ] Create failing property tests for packing/unpacking every v1 component, 144-byte four-group alignment, gate/up pairing, independently addressable down rows, corruption, truncation, and layout-ID mismatch.
-- [ ] Create `mtplx/expert_record_v2.py` with `pack_v1_record`, `unpack_v2_record`, a versioned header, and canonical reconstruction.
-- [ ] Add a layer-local benchmark that reports pack cost, stream count, bytes, and kernel time without building a full sidecar.
-- [ ] Promote a full exporter task only if the synthetic arm clears 5%; otherwise document no-go.
+- [x] Recover the measured same-byte stream floor and single-dispatch roofline from commit `2671ba7`.
+- [x] Correct the claim boundary: `0.1977 / 0.1871 - 1 = 5.665%` isolated headroom, while the direct `0.0106 ms/layer * 79` delta is only about 0.247% of the #30 end-to-end baseline.
+- [x] Record that the only unmeasured 144-byte packed layout reduces streams from nine to three but removes no bytes.
+- [x] Add behavior-locking tests for the exact four-group packed byte layout and benchmark result contract.
+- [ ] Run one standalone, raw-byte/checksum-equivalent, paired split-versus-packed Metal stream-floor probe at the production gate/up and down shapes.
+- [ ] Stop before an exact packed-QMV probe unless the packed stream floor's process-level 95% confidence-interval lower bound reaches +5% with no projection p95 regression above 2%; a floor win still does not authorize a codec or 161 GB sidecar.
 
-### Task 2: Add a KV-to-expert budget experiment
+### Task 2: Decide the KV-to-expert budget exchange
 
-- [ ] Write failing memory-plan tests for BF16 and Q8 KV byte accounting at 4K/16K/64K/128K while holding the total limit fixed.
-- [ ] Add an explicit KV storage descriptor to the expert memory plan; never infer savings from a label.
-- [ ] Reallocate only proven KV savings to persistent expert slots and expose both byte counts in telemetry.
-- [ ] Run attention parity/quality plus expert-hit/bytes benchmarks as an isolated `kv-q8` arm.
-- [ ] Do not evaluate Q4 KV until Q8 has an accepted quality method.
+- [x] Audit the repaired PR #12 Q8 accounting, attestation, memory, and performance evidence.
+- [x] Reject the 75-to-100-slot reinvestment arm: decode -78.97%, p95 +351.5%, peak MLX +20.97 GB.
+- [x] Preserve the claim boundary: both measured arms used physical Q8, so this is not Q8-versus-BF16 quality evidence.
+- [x] Keep fixed-slot BF16-versus-Q8 representation work open until it has a true long-context attention/quality method.
+- [x] Do not evaluate Q4 KV before that Q8 method exists.
 
-### Task 3: Add an authoritative-router-safe prefetch API
+### Task 3: Gate an authoritative-router-safe prefetch API offline
 
-- [ ] Write failing tests that predicted IDs may warm transient/prefetch state but cannot produce a hit unless the authoritative route later selects them, cannot evict pinned or decode-hot authoritative records, and yield identical tokens when wrong.
-- [ ] Add `ExpertStreamingRuntime.prefetch_hint(layer, expert_ids, source, deadline)` with separate counters for requested, loaded, useful, wasted, cancelled, and amplified bytes.
-- [ ] Give authoritative misses priority and cancellation over speculative reads.
-- [ ] Add offline prior-token/transition predictors first; make MTP guidance a separate adapter charged for head time and resident bytes.
-- [ ] Evaluate held-out recall and net latency; disable any predictor that misses the 5% gate or amplifies bytes.
+- [x] Audit prior-token and prompt-trained top-8/16/32 route analysis with byte amplification.
+- [x] Audit the isolated Hy3 Q4 MTP acceptance and AR/MTP speed gate.
+- [x] Record the boundary: same-trace top-16 recalls 52.72% at 2x nominal requests and top-32 recalls 67.91% at 4x, while only the current MTP configuration has a directly measured speed no-go (-37.05% decode).
+- [x] Keep the trunk router authoritative and stop before adding a runtime prefetch API.
+- [x] Leave the general hint-only track open and require a future predictor to clear an offline held-out, physical-byte-amplification-aware, net-latency premise before runtime TDD begins.
 
-### Task 4: Add a separately branded lower-bit cold tier
+### Task 4: Define the lower-bit prerequisite boundary
 
-- [ ] Write failing artifact-identity tests proving Q2/Q3 records cannot claim the Q4 model key or digest.
-- [ ] Extend the manifest/model descriptor with an explicit cold-tier quantization identity and supported-kernel check.
-- [ ] Keep hot records Q4 and apply lower bits only to the opt-in cold tier.
-- [ ] Add perplexity, deterministic continuation, reasoning/tool-use fixture, and long-generation quality reports.
-- [ ] Reject silent dequantization, unbounded promotion copies, or quality results without the matching performance artifact.
+- [x] Confirm local MLX affine kernel capability separately from the deployed Hy3 Q4-only runtime contract.
+- [x] Calculate, but do not present as measured, Q3 (-22.22%) and Q2 (-44.44%) record-size reductions.
+- [x] Record the missing artifact identity and perplexity/reasoning/tool-use/long-generation quality prerequisites.
+- [x] Defer implementation; no lower-bit artifact may claim the exact Q4 model identity or silently dequantize.
+- [x] Specify a one-layer Q3 held-out pilot as the smallest valid reopening gate.
 
-### Task 5: Verify and publish PR 3
+### Task 5: Verify and publish the stacked #31 experiment PR
 
-- [ ] Run each experiment alone against PR 2 with identical machine and memory settings.
+- [x] Reuse only independently labeled experiments whose mechanism matches the #31 arm.
 - [ ] Run full pytest and changed-file Ruff.
-- [ ] Save separate result files for layout, KV, prefetch, and precision.
-- [ ] Document go/no-go independently; do not combine sub-5% arms into one claimed win.
+- [x] Save a machine-readable decision payload and a human-readable per-track evidence map.
+- [ ] Document go/no-go independently; do not combine sub-5% arms into one claimed win or close the issue while open tracks remain.
 - [ ] Push `experiment/hy3-artifact-speculative` and open a draft PR against `experiment/hy3-record-native-exec`, linking #31.

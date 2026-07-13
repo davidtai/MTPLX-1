@@ -1,0 +1,129 @@
+{
+  "schema": "mtplx.hy3-artifact-speculative-decision.v1",
+  "issue": 31,
+  "base_commit": "dfbefe965ff0cd256247327e41fd5b555ad245f6",
+  "overall_decision": {
+        "status": "partial-no-go-open-tracks",
+    "production_changes": false,
+    "full_v2_sidecar": false,
+    "runtime_prefetch_api": false,
+    "lower_bit_artifact": false,
+        "reason": "The exact measured 75-to-100-slot reinvestment and current MTP speed configuration fail. Trace-local route recall is insufficient for runtime promotion, not proof that all hint-only predictors fail. Packed layout, fixed-slot Q8, and general hint-only prediction remain open; Track 4 lacks a valid artifact and quality contract."
+  },
+  "tracks": {
+    "gpu_oriented_layout": {
+            "status": "open-bounded-packed-probe",
+      "measured_source": {
+        "commit": "2671ba78c3e80e18d412787ffaa343d971ff7b1f",
+        "path": "docs/METAL_KERNEL_SPIKE.md"
+      },
+      "stock_gather_qmm_reported_gb_per_second": 482.6,
+      "single_dispatch_roofline_reported_gb_per_second": 504.6,
+            "roofline_ratio_context_percent": 4.558640696228756,
+            "same_byte_stream_floor_headroom_percent": 5.665419561731691,
+            "direct_stream_floor_delta_milliseconds_per_token": 0.8374,
+      "safe_baseline_milliseconds_per_token": 338.47214305194126,
+            "direct_stream_floor_delta_percent_of_safe_baseline": 0.24740588470570068,
+      "unmeasured_mechanism": "144-byte four-group weight/scale/bias packing that reduces projection streams from 9 to 3 without reducing bytes",
+            "decision": "Run one raw-byte/checksum-equivalent paired packed-versus-split Metal stream-floor probe. A lower 95% confidence bound of at least 5% authorizes only a later exact packed-QMV probe, not a codec or sidecar."
+    },
+    "kv_budget_exchange": {
+      "status": "no-go-exact-measured-full-75-to-100-slot-arm",
+      "measured_source": {
+        "source_commit": "a8ef88279112e919b18a4edc72dfebcb8be72829",
+        "implementation_branch": "eval/repaired-pr12-failed",
+        "control_commit": "1d3d52f",
+        "candidate_commit": "124f4ce",
+        "summary_path": "docs/MOE_RUNTIME_PR_BENCHMARKS.md"
+      },
+      "planner_slots_per_layer": {
+        "control": 75,
+        "candidate": 100
+      },
+      "physical_kv_bytes": {
+        "control_and_candidate": 21831680000,
+        "note": "Both benchmark arms intentionally used the same physical Q8 KV cache; the measured mechanism was reinvesting the accounting difference into expert slots."
+      },
+      "expert_read_bytes_change_percent": -27.03,
+      "decode_tokens_per_second": {
+        "control": 4.70517,
+        "candidate": 0.989612,
+        "change_percent": -78.97
+      },
+      "rolling_p95_change_percent": 351.5,
+      "peak_mlx_bytes_increase": 20968128440,
+      "candidate_memory_headroom_bytes": 376929700,
+            "open_followup": "Fixed-slot BF16-versus-Q8 attention and quality at true 4K/16K/64K/128K contexts.",
+            "decision": "Do not reintroduce the 100-slot Q8 reinvestment plan. Keep Q8-vs-BF16 at fixed expert capacity open as a separate representation/quality experiment."
+    },
+    "hint_only_prediction": {
+      "status": "current-mtp-speed-no-go-offline-predictors-deferred",
+      "route_source": {
+        "commit": "cd1c5b4",
+        "path": "benchmarks/results/hy3-q4-route-analysis-1k-64.json"
+      },
+      "predictors": {
+        "previous_token": {
+          "recall_percent": 29.50572634116938
+        },
+        "prompt_trained_top8": {
+          "recall_percent": 37.34975961538461,
+          "nominal_request_amplification_vs_top_k": 1.0
+        },
+        "prompt_trained_top16": {
+          "recall_percent": 52.7168469551282,
+          "nominal_request_amplification_vs_top_k": 2.0
+        },
+        "prompt_trained_top32": {
+          "recall_percent": 67.9111578525641,
+          "nominal_request_amplification_vs_top_k": 4.0
+        }
+      },
+      "mtp_source": {
+        "evidence_commit": "a2a1cb6",
+        "measured_runtime_commit": "9845f8641a587eba66c040d8512037ab5ed70549",
+        "ar_path": "benchmarks/results/hy3-q4-gate-ar-cbank99.json",
+        "mtp_path": "benchmarks/results/hy3-q4-gate-mtp-cbank99.json"
+      },
+      "mtp_q4": {
+        "draft_acceptance_percent": 20.786516853932584,
+        "ar_decode_tokens_per_second": 6.048113780100618,
+        "mtp_decode_tokens_per_second": 3.8072332339335753,
+        "decode_change_percent": -37.05089929921528
+      },
+            "open_followup": "Held-out and cross-session offline prediction with a zero-prediction scheduling control, physical cache amplification, interference, lead time, and net latency.",
+            "physical_byte_amplification": null,
+            "physical_byte_amplification_note": "Unmeasured after cache hits, deduplication, cancellation, contention, and interference.",
+            "decision": "Do not add a prefetch API from same-trace recall or a route adapter for the current MTP configuration. Keep the general offline hint-only experiment open; the authoritative trunk router remains the only routing authority."
+    },
+    "lower_bit_cold_tier": {
+      "status": "deferred",
+      "local_mlx_version": "0.31.2",
+      "local_affine_kernel_bits_supported": [2, 3, 4, 5, 6, 8],
+      "current_runtime_contract": "Pinned Hy3 affine Q4/group-64 only; non-Q4 record-native specifications fail closed.",
+      "arithmetic_only_record_sizes": {
+        "q4_bytes": 10616832,
+        "q3_bytes": 8257536,
+        "q3_reduction_percent": 22.22222222222222,
+        "q2_bytes": 5898240,
+        "q2_reduction_percent": 44.44444444444444
+      },
+      "quality_evidence": null,
+      "decision": "Do not create or label a lower-bit artifact without a pinned BF16-to-lower-bit conversion, explicit identity, native-kernel enforcement, and predeclared perplexity/reasoning/tool-use/long-generation quality gates."
+    }
+  },
+  "claim_boundaries": {
+    "new_hardware_benchmark_run": false,
+        "reason_no_new_hardware_run": "A bounded packed-stream hardware probe remains pending; other evidence is reused only within its measured claim boundary.",
+    "measured_vs_inferred": {
+      "track1_recorded_throughput_and_floor": "measured",
+            "track1_stream_floor_headroom": "calculated from directly comparable measured values; packed probe pending",
+      "track2_exact_full_75_to_100_slot_runtime_and_memory": "measured on the recorded host and configuration; fixed-slot Q8-vs-BF16 unmeasured",
+      "track3_same_trace_recall_mtp_acceptance_and_current_mtp_speed": "measured; physical byte amplification and general predictor net latency unmeasured",
+      "track4_record_sizes": "calculated only",
+      "track4_quality_or_performance": "not measured"
+    },
+    "dirty_research_worktree_modified": false,
+    "qwen_stopped_during_issue31_audit": false
+  }
+}
