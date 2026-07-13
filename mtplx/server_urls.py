@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 
+_LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
+
+
 def _clean_host(host: str | None) -> str:
     return str(host or "").strip()
 
@@ -16,6 +19,10 @@ def _unbracket_host(host: str | None) -> str:
 
 def is_wildcard_bind(host: str | None) -> bool:
     return _unbracket_host(host).lower() in {"0.0.0.0", "::"}
+
+
+def is_localhost_bind(host: str | None) -> bool:
+    return _clean_host(host).lower().strip("[]") in _LOCALHOST_BINDS
 
 
 def connect_host_for_bind(host: str | None) -> str:

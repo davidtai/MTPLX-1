@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from .artifacts import expected_mtp_file, text_config
+from .artifacts import (
+    candidate_mtp_weight_files,
+    model_type as _model_type,
+    text_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +26,6 @@ def _num_mtp_layers(config: dict[str, Any]) -> int:
         or config.get("mtp_num_hidden_layers")
         or 0
     )
-
-
-def _model_type(config: dict[str, Any]) -> str:
-    tcfg = text_config(config)
-    return str(tcfg.get("model_type") or config.get("model_type") or "").lower()
 
 
 def _mtp_pattern(config: dict[str, Any]) -> str:
@@ -68,33 +66,19 @@ def _load_weight_file(path: Path) -> dict[str, Any]:
 
 
 def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Path]:
-    mtp_file = expected_mtp_file(model_path, config)
-    if mtp_file.exists():
-        return [mtp_file]
-
-    index_path = model_path / "model.safetensors.index.json"
-    if index_path.exists():
-        try:
-            weight_map = json.loads(index_path.read_text(encoding="utf-8")).get("weight_map", {})
-        except Exception:
-            weight_map = {}
-        start = int(text_config(config).get("num_hidden_layers") or config.get("num_hidden_layers") or 0)
-        physical_layers = max(len(_mtp_pattern(config)), 1)
-        wanted_prefixes = tuple(
-            [f"model.layers.{start + i}." for i in range(physical_layers)]
-            + [f"backbone.layers.{start + i}." for i in range(physical_layers)]
-            + [f"mtp.layers.{i}." for i in range(physical_layers)]
-        )
-        selected = {
-            model_path / rel
-            for key, rel in weight_map.items()
-            if str(key).startswith(wanted_prefixes)
-            or str(key).startswith(("mtp.", "lm_head.", "backbone.embeddings."))
-        }
-        if selected:
-            return sorted(selected)
-
-    return sorted(model_path.glob("model*.safetensors"))
+    start = int(
+        text_config(config).get("num_hidden_layers")
+        or config.get("num_hidden_layers")
+        or 0
+    )
+    physical_layers = max(len(_mtp_pattern(config)), 1)
+    prefixes = tuple(
+        [f"model.layers.{start + i}." for i in range(physical_layers)]
+        + [f"backbone.layers.{start + i}." for i in range(physical_layers)]
+        + [f"mtp.layers.{i}." for i in range(physical_layers)]
+        + ["mtp.", "lm_head.", "backbone.embeddings."]
+    )
+    return candidate_mtp_weight_files(model_path, config, prefixes)
 
 
 def _num_routed_experts(config: dict[str, Any], args: Any) -> int:

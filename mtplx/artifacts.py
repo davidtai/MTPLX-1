@@ -292,6 +292,22 @@ def text_config(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("text_config", config)
 
 
+def model_type(config: dict[str, Any]) -> str:
+    tcfg = text_config(config)
+    return str(tcfg.get("model_type") or config.get("model_type") or "").lower()
+
+
+def runtime_mtp_layer_count(config: dict[str, Any]) -> int:
+    """Return the layer count precedence used by runtime MTP adapters."""
+    tcfg = text_config(config)
+    return int(
+        tcfg.get("num_nextn_predict_layers")
+        or tcfg.get("mtp_num_hidden_layers")
+        or config.get("num_nextn_predict_layers")
+        or 0
+    )
+
+
 def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = None) -> Path:
     model_path = Path(model_dir)
     config = config if config is not None else load_config(model_path)
@@ -303,6 +319,35 @@ def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = Non
         if candidate.exists():
             return candidate
     return model_path / "mtp.safetensors"
+
+
+def candidate_mtp_weight_files(
+    model_path: Path,
+    config: dict[str, Any],
+    key_prefixes: tuple[str, ...],
+) -> list[Path]:
+    """Resolve MTP weights with shared sidecar, index, and glob precedence."""
+    mtp_file = expected_mtp_file(model_path, config)
+    if mtp_file.exists():
+        return [mtp_file]
+
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            weight_map = json.loads(index_path.read_text(encoding="utf-8")).get(
+                "weight_map", {}
+            )
+        except Exception:
+            weight_map = {}
+        selected = {
+            model_path / rel
+            for key, rel in weight_map.items()
+            if str(key).startswith(key_prefixes)
+        }
+        if selected:
+            return sorted(selected)
+
+    return sorted(model_path.glob("model*.safetensors"))
 
 
 @dataclass(frozen=True)

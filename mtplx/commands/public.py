@@ -108,6 +108,7 @@ from mtplx.profiles import (
 from mtplx.server_urls import (
     bind_label,
     connect_host_for_bind,
+    is_localhost_bind as _is_localhost_bind,
     is_wildcard_bind,
     local_url_for_bind,
 )
@@ -197,7 +198,6 @@ EXTERNAL_RUNTIME_ENV_KEYS = (
     "MTPLX_EXPORT_VERIFY_DOT_INCLUDE_CACHE",
     "MTPLX_EXPORT_VERIFY_DOT_INCLUDE_CAPTURES",
 )
-LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
 MAX_PUBLIC_SPECULATIVE_DEPTH = 3
 MAX_GEMMA4_SPECULATIVE_DEPTH = 8
 TUNE_DEFAULT_DEPTHS = "1,2,3"
@@ -326,10 +326,6 @@ def _absolute_user_path(path: str | Path) -> Path:
 
 def _print(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
-
-
-def _is_localhost_bind(host: str | None) -> bool:
-    return str(host or "").strip().lower().strip("[]") in LOCALHOST_BINDS
 
 
 def _benchmark_seed(args: Any, *, runtime_profile: str, harness: str) -> int:

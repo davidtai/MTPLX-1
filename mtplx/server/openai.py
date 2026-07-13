@@ -126,7 +126,12 @@ from mtplx.server.omlx_bridge import (
     extract_tool_calls_with_thinking as omlx_extract_tool_calls_with_thinking,
     normalize_messages_for_template as omlx_normalize_messages_for_template,
 )
-from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
+from mtplx.server_urls import (
+    bind_label,
+    is_localhost_bind as _is_localhost_bind,
+    is_wildcard_bind,
+    local_url_for_bind,
+)
 
 LOGGER = logging.getLogger("mtplx.server.openai")
 
@@ -2601,13 +2606,6 @@ def _foreground_model_work_pending(state: Any) -> bool:
     if scheduler is not None and hasattr(scheduler, "has_foreground_pending"):
         return bool(scheduler.has_foreground_pending())
     return False
-
-
-LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
-
-
-def _is_localhost_bind(host: str | None) -> bool:
-    return str(host or "").strip().lower().strip("[]") in LOCALHOST_BINDS
 
 
 def validate_server_security_args(args: argparse.Namespace) -> None:

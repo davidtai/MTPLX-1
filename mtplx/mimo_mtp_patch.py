@@ -2,29 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from .artifacts import expected_mtp_file, text_config
+from .artifacts import (
+    candidate_mtp_weight_files,
+    model_type as _model_type,
+    runtime_mtp_layer_count as _num_mtp_layers,
+    text_config,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _num_mtp_layers(config: dict[str, Any]) -> int:
-    tcfg = text_config(config)
-    return int(
-        tcfg.get("num_nextn_predict_layers")
-        or tcfg.get("mtp_num_hidden_layers")
-        or config.get("num_nextn_predict_layers")
-        or 0
-    )
-
-
-def _model_type(config: dict[str, Any]) -> str:
-    tcfg = text_config(config)
-    return str(tcfg.get("model_type") or config.get("model_type") or "").lower()
 
 
 def is_mimo_mtp_config(config: dict[str, Any]) -> bool:
@@ -40,31 +29,18 @@ def _load_weight_file(path: Path) -> dict[str, Any]:
 
 
 def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Path]:
-    mtp_file = expected_mtp_file(model_path, config)
-    if mtp_file.exists():
-        return [mtp_file]
-
-    index_path = model_path / "model.safetensors.index.json"
-    if index_path.exists():
-        try:
-            weight_map = json.loads(index_path.read_text(encoding="utf-8")).get("weight_map", {})
-        except Exception:
-            weight_map = {}
-        start = int(text_config(config).get("num_hidden_layers") or config.get("num_hidden_layers") or 0)
-        count = _num_mtp_layers(config)
-        wanted_prefixes = tuple(
-            [f"model.layers.{start + i}." for i in range(count)]
-            + [f"model.mtp_layers.{i}." for i in range(count)]
-        )
-        selected = {
-            model_path / rel
-            for key, rel in weight_map.items()
-            if str(key).startswith(wanted_prefixes) or str(key).startswith("lm_head.")
-        }
-        if selected:
-            return sorted(selected)
-
-    return sorted(model_path.glob("model*.safetensors"))
+    start = int(
+        text_config(config).get("num_hidden_layers")
+        or config.get("num_hidden_layers")
+        or 0
+    )
+    count = _num_mtp_layers(config)
+    prefixes = tuple(
+        [f"model.layers.{start + i}." for i in range(count)]
+        + [f"model.mtp_layers.{i}." for i in range(count)]
+        + ["lm_head."]
+    )
+    return candidate_mtp_weight_files(model_path, config, prefixes)
 
 
 def _rewrite_mimo_mtp_weights(
