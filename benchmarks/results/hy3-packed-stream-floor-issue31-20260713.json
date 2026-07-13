@@ -1,0 +1,77 @@
+{
+  "schema": "mtplx.hy3-packed-stream-floor-summary.v1",
+  "issue": 31,
+  "decision": "no-go",
+  "claim_boundary": "This same-byte stream-floor result rejects the 144-byte packed layout premise. It does not measure an exact QMV or authorize a codec, sidecar, or runtime integration.",
+  "source": {
+    "benchmark_commit": "a55d5399b91d1f1086b275abc3177163c717c43a",
+    "harness_sha256": "a676f8f60341319ad458f2750c02d1395b483d8f290a2bffafb9e37b35bac357",
+    "raw_path": "benchmarks/raw/artifact-speculative/issue31-packed-stream-20260713T093116Z-a55d539/result.json",
+    "raw_sha256": "a33b40df2bd63c31989af5126e57e4f9126baebd44c2c266f7b76a05e8ca5078",
+    "git_status_at_run": "clean"
+  },
+  "machine": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "mlx": "0.31.2",
+    "python": "3.12.13"
+  },
+  "config": {
+    "capacity": 102,
+    "top_k": 8,
+    "group_size": 64,
+    "chunk_bytes": 144,
+    "per_eval": 16,
+    "warmup_samples_per_process": 25,
+    "measured_samples_per_process": 150,
+    "process_repeats": 4,
+    "flush_subtracted": false,
+    "promotion_gate_percent": 5.0,
+    "promotion_rule": "The weighted speedup lower 95% confidence bound must be at least 5%, and neither projection p95 may regress by more than 2%."
+  },
+  "layout": {
+    "chunk": "128 weight bytes, then 8 BF16 scale bytes, then 8 BF16 bias bytes",
+    "gate_up_row_bytes": 2304,
+    "down_row_bytes": 864,
+    "bytes_added": 0,
+    "bytes_per_projection_per_expert": 3538944,
+    "bytes_per_routed_record": 10616832,
+    "bytes_per_top8_layer": 84934656,
+    "bytes_per_capacity102_projection_representation": 360972288
+  },
+  "parity": {
+    "gate_up_checksum_equal_all_processes": true,
+    "down_checksum_equal_all_processes": true,
+    "scattered_repeated_slots": [101, 1, 101, 0, 100, 2, 3, 4]
+  },
+  "projections": {
+    "gate_up": {
+      "split_mean_process_median_ms": 0.055071296856112895,
+      "packed_mean_process_median_ms": 0.055172523445889965,
+      "speedup_percent": -0.18309341644810462,
+      "speedup_percent_ci95": [-0.785112724184396, 0.4189258912881868],
+      "split_mean_process_p95_ms": 0.05775515232357975,
+      "packed_mean_process_p95_ms": 0.05780224927320887,
+      "worst_process_p95_regression_percent": 0.3845236324436785,
+      "median_one_time_packing_ms_per_expert": 0.07982353430384584
+    },
+    "down": {
+      "split_mean_process_median_ms": 0.05622982027375656,
+      "packed_mean_process_median_ms": 0.05598925781669095,
+      "speedup_percent": 0.4295659562525589,
+      "speedup_percent_ci95": [-0.05514596876232675, 0.9142778812674446],
+      "split_mean_process_p95_ms": 0.05910859761968368,
+      "packed_mean_process_p95_ms": 0.05880693830420114,
+      "worst_process_p95_regression_percent": -0.01746885476224813,
+      "median_one_time_packing_ms_per_expert": 0.0762767598037802
+    }
+  },
+  "weighted_three_projection": {
+    "formula": "2 * gate_up_geometry + down_geometry",
+    "split_mean_process_median_ms": 0.16637241398598235,
+    "packed_mean_process_median_ms": 0.16633430470847088,
+    "speedup_percent": 0.02311890499462621,
+    "speedup_percent_ci95": [-0.4443313705532162, 0.4905691805424686],
+    "worst_projection_process_p95_regression_percent": 0.3845236324436785
+  },
+  "reason": "The upper 95% confidence bound is 0.491%, far below the fixed 5% gate. The same-byte packed stream layout is a statistical tie with split storage and stops before exact-QMV work."
+}

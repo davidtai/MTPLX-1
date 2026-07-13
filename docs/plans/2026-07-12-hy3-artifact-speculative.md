@@ -5,7 +5,7 @@
 **Goal:** Decide independently whether GPU-oriented expert packing, KV/cache budget exchange, hint-only route prefetch, or a lower-bit cold tier justifies implementation.
 **Architecture:** Build on PR 2, but apply the promotion premise before writing selectors or runtime code. Existing isolated results count when their mechanism and claim boundary match #31. No sub-5% arms may be combined.
 **Tech Stack:** Checked-in route/kernel/runtime benchmark evidence, manifest contracts, MLX capability inspection, and pytest verification.
-**Premise update:** #29 and #30 now provide the required baseline. Existing evidence rejects the exact measured 75-to-100-slot reinvestment and the current MTP speed configuration. The trace-local route-recall data is insufficient to justify runtime promotion, not evidence that every hint-only predictor fails. The packed-stream layout still needs one bounded synthetic probe because the measured isolated floor leaves slightly more than 5% headroom. Track 4 lacks a valid quality/artifact contract. The detailed evidence map is `benchmarks/results/hy3-artifact-speculative-issue31-20260713.{md,json}`.
+**Premise update:** #29 and #30 provide the required baseline. A clean-commit capacity-102 probe now rejects the 144-byte same-byte packed layout: +0.023% weighted speedup, 95% CI [-0.444%, +0.491%]. Existing evidence also rejects the exact measured 75-to-100-slot reinvestment and the current MTP speed configuration. The trace-local route-recall data is insufficient to justify runtime promotion, not evidence that every hint-only predictor fails. Track 4 lacks a valid quality/artifact contract. The detailed evidence map is `benchmarks/results/hy3-artifact-speculative-issue31-20260713.{md,json}`.
 
 ---
 
@@ -15,8 +15,8 @@
 - [x] Correct the claim boundary: `0.1977 / 0.1871 - 1 = 5.665%` isolated headroom, while the direct `0.0106 ms/layer * 79` delta is only about 0.247% of the #30 end-to-end baseline.
 - [x] Record that the only unmeasured 144-byte packed layout reduces streams from nine to three but removes no bytes.
 - [x] Add behavior-locking tests for the exact four-group packed byte layout and benchmark result contract.
-- [ ] Run one standalone, raw-byte/checksum-equivalent, paired split-versus-packed Metal stream-floor probe at the production gate/up and down shapes.
-- [ ] Stop before an exact packed-QMV probe unless the packed stream floor's process-level 95% confidence-interval lower bound reaches +5% with no projection p95 regression above 2%; a floor win still does not authorize a codec or 161 GB sidecar.
+- [x] Run one standalone, raw-byte/checksum-equivalent, paired split-versus-packed Metal stream-floor probe at the production gate/up and down shapes.
+- [x] Stop before an exact packed-QMV probe: the weighted upper 95% bound is +0.491%, so the floor cannot reach the fixed +5% gate. Do not build a codec or 161 GB sidecar.
 
 ### Task 2: Decide the KV-to-expert budget exchange
 
@@ -45,7 +45,7 @@
 ### Task 5: Verify and publish the stacked #31 experiment PR
 
 - [x] Reuse only independently labeled experiments whose mechanism matches the #31 arm.
-- [ ] Run full pytest and changed-file Ruff.
+- [x] Run full pytest and changed-file Ruff.
 - [x] Save a machine-readable decision payload and a human-readable per-track evidence map.
-- [ ] Document go/no-go independently; do not combine sub-5% arms into one claimed win or close the issue while open tracks remain.
+- [x] Document go/no-go independently; do not combine sub-5% arms into one claimed win or close the issue while open tracks remain.
 - [ ] Push `experiment/hy3-artifact-speculative` and open a draft PR against `experiment/hy3-record-native-exec`, linking #31.

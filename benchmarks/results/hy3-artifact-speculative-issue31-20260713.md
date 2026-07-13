@@ -2,7 +2,7 @@
 
 ## Decision
 
-**Partial no-go; issue #31 remains open.** Existing evidence rejects the exact measured 75-to-100-slot reinvestment and the current MTP speed configuration. Trace-local route recall is insufficient to justify runtime promotion, but does not establish that all hint-only prediction fails. The packed layout needs one bounded synthetic probe because the measured isolated stream floor leaves 5.665% headroom. The lower-bit arm has arithmetic capacity upside but no artifact identity or quality method, so any speed number today would be incomplete.
+**Partial no-go; issue #31 remains open.** The capacity-102 packed-stream probe rejects the same-byte v2 layout premise. Existing evidence also rejects the exact measured 75-to-100-slot reinvestment and the current MTP speed configuration. Trace-local route recall is insufficient to justify runtime promotion, but does not establish that all hint-only prediction fails. The lower-bit arm has arithmetic capacity upside but no artifact identity or quality method, so any speed number today would be incomplete.
 
 No sub-5% mechanisms are combined into a claimed win. No v2 sidecar, runtime prefetch API, MTP route adapter, or lower-bit artifact is added.
 
@@ -10,7 +10,7 @@ No sub-5% mechanisms are combined into a claimed win. No v2 sidecar, runtime pre
 
 | Track | Best applicable evidence | Decision | Repository action |
 |---|---|---|---|
-| GPU-oriented v2 layout | Stock `gather_qmm` measured 0.1977 ms/layer and the same-byte zero-arithmetic floor measured 0.1871 ms/layer: 5.665% isolated headroom. The direct delta is 0.8374 ms/token, about 0.247% of the #30 end-to-end baseline. | **Open for one probe.** The unmeasured 144-byte packing changes 9 projection streams to 3 without removing bytes. | Run a standalone packed-versus-split Metal probe; do not build the codec or 161 GB sidecar unless it clears +5%. |
+| GPU-oriented v2 layout | The capacity-102 packed stream floor measured +0.023% weighted speedup with a process-level 95% CI of [-0.444%, +0.491%]. Gate/up was -0.183%; down was +0.430%. | **No-go for the 144-byte same-byte packed layout.** Even the upper CI is far below +5%. | Stop before an exact packed QMV, codec, 161 GB sidecar, or runtime integration. |
 | Q8 KV budget exchange | The repaired 75-to-100-slot experiment cut expert bytes 27.03%, but decode fell 4.7052 to 0.9896 tok/s (-78.97%), rolling p95 rose 351.5%, and peak MLX grew 20.97 GB with only 376.9 MB headroom. | **No-go for the exact measured full 75-to-100-slot arm.** Fixed-slot BF16-versus-Q8 and other separately designed exchanges remain open. | Do not reintroduce the rejected 100-slot plan. Require a true long-context attention/quality method for fixed-slot Q8. |
 | Hint-only prediction | Prior-token same-trace recall is 29.51%. Prompt-trained top-16 reaches 52.72% at 2x nominal requests; top-32 reaches 67.91% at 4x. Physical byte amplification is unmeasured. Q4 MTP acceptance is 20.79%, and decode is 3.8072 versus 6.0481 tok/s AR (-37.05%). | **Current MTP speed no-go; offline predictors deferred.** Same-trace recall is insufficient for runtime promotion. | Do not add a runtime API until an offline held-out candidate passes physical byte amplification, cache, interference, lead-time, and net-latency gates. Router authority remains unchanged. |
 | Q3/Q2 cold tier | Group-64 arithmetic implies 8,257,536 bytes for Q3 (-22.22%) and 5,898,240 for Q2 (-44.44%) versus Q4, but no Hy3 lower-bit artifact or quality report exists. | **Deferred.** Byte arithmetic is not a quality or performance result. | Require pinned BF16 conversion, explicit artifact identity, native-kernel fail-closed behavior, and declared quality gates before a pilot. |
@@ -21,7 +21,9 @@ No sub-5% mechanisms are combined into a claimed win. No v2 sidecar, runtime pre
 
 The kernel spike at commit `2671ba78c3e80e18d412787ffaa343d971ff7b1f` measured top-8 stock at 0.1977 ms/layer and a zero-arithmetic same-byte floor at 0.1871 ms/layer. It also measured 482.6 GB/s for stock against a 504.6 GB/s single-dispatch roofline. The only unmeasured physical-layout idea is four-group 144-byte weight/scale/bias packing, which keeps the exact byte count while reducing projection streams from nine to three (`git show 2671ba7:docs/METAL_KERNEL_SPIKE.md`, sections 1 and S7).
 
-The roofline ratio `504.6 / 482.6 - 1 = 4.5586%` is useful context, but it is not a hard ceiling: the source reports about 20% run-to-run bandwidth variance and no confidence interval for that cross-run ratio. The directly comparable stream-floor values instead leave `0.1977 / 0.1871 - 1 = 5.665%` isolated headroom. Their direct delta is `0.0106 ms/layer * 79 = 0.8374 ms/token`, or about 0.247% of the resource-safe 338.4721 ms/token #30 baseline. That makes a full sidecar unjustified, but leaves one small packed-versus-split probe open.
+The roofline ratio `504.6 / 482.6 - 1 = 4.5586%` is useful context, but it was not a hard ceiling: the source reports about 20% run-to-run bandwidth variance and no confidence interval for that cross-run ratio. The directly comparable historical stream-floor values left `0.1977 / 0.1871 - 1 = 5.665%` isolated headroom. Their direct delta is `0.0106 ms/layer * 79 = 0.8374 ms/token`, or about 0.247% of the resource-safe 338.4721 ms/token #30 baseline. That justified one bounded probe, not a full sidecar.
+
+The clean-commit capacity-102 probe at `a55d539` compared two checksum-equivalent Metal stream floors whose only difference was split versus 144-byte packed addressing. It used four isolated processes, 25 warmups and 150 samples per process, 16 dispatches per `mx.eval`, and no flush subtraction. The weighted `2 * gate/up + down` result was 0.166372 ms split versus 0.166334 ms packed: +0.0231%, 95% CI [-0.4443%, +0.4906%]. Gate/up was -0.1831% and down was +0.4296%; all parity checks matched. The upper weighted bound cannot reach the fixed +5% gate, so this layout is closed before exact-QMV work. Full evidence is in `hy3-packed-stream-floor-issue31-20260713.{md,json}`.
 
 ### Track 2: KV exchange
 
@@ -45,4 +47,4 @@ If this track is reopened, the smallest defensible pilot is Q3, not Q2: quantize
 
 - The old `codex/moe-optimization-research` worktree remains untouched at `8eba442`; its six modified files and four untracked research artifacts were inspected read-only.
 - This decision branch starts from #30 commit `dfbefe965ff0cd256247327e41fd5b555ad245f6`.
-- Qwen remains up while the packed-stream harness is prepared. It will be stopped only for the bounded Metal timing window and restored and endpoint-verified afterward.
+- Qwen was stopped only for the packed-stream timing window. The benchmark completed and wrote its raw artifact; the outer zsh cleanup handler then hit a read-only-variable error, so Qwen was immediately restored explicitly and `/v1/models` verified `mtplx-qwen36-27b-optimized-speed` before work continued.

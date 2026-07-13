@@ -8,11 +8,11 @@
     "full_v2_sidecar": false,
     "runtime_prefetch_api": false,
     "lower_bit_artifact": false,
-        "reason": "The exact measured 75-to-100-slot reinvestment and current MTP speed configuration fail. Trace-local route recall is insufficient for runtime promotion, not proof that all hint-only predictors fail. Packed layout, fixed-slot Q8, and general hint-only prediction remain open; Track 4 lacks a valid artifact and quality contract."
+        "reason": "The capacity-102 same-byte packed layout, exact measured 75-to-100-slot reinvestment, and current MTP speed configuration fail. Trace-local route recall is insufficient for runtime promotion, not proof that all hint-only predictors fail. Fixed-slot Q8 and general hint-only prediction remain open; Track 4 lacks a valid artifact and quality contract."
   },
   "tracks": {
     "gpu_oriented_layout": {
-            "status": "open-bounded-packed-probe",
+            "status": "no-go-144-byte-same-byte-layout",
       "measured_source": {
         "commit": "2671ba78c3e80e18d412787ffaa343d971ff7b1f",
         "path": "docs/METAL_KERNEL_SPIKE.md"
@@ -24,8 +24,21 @@
             "direct_stream_floor_delta_milliseconds_per_token": 0.8374,
       "safe_baseline_milliseconds_per_token": 338.47214305194126,
             "direct_stream_floor_delta_percent_of_safe_baseline": 0.24740588470570068,
-      "unmeasured_mechanism": "144-byte four-group weight/scale/bias packing that reduces projection streams from 9 to 3 without reducing bytes",
-            "decision": "Run one raw-byte/checksum-equivalent paired packed-versus-split Metal stream-floor probe. A lower 95% confidence bound of at least 5% authorizes only a later exact packed-QMV probe, not a codec or sidecar."
+      "packed_stream_floor": {
+        "benchmark_commit": "a55d5399b91d1f1086b275abc3177163c717c43a",
+        "raw_path": "benchmarks/raw/artifact-speculative/issue31-packed-stream-20260713T093116Z-a55d539/result.json",
+        "raw_sha256": "a33b40df2bd63c31989af5126e57e4f9126baebd44c2c266f7b76a05e8ca5078",
+        "capacity": 102,
+        "process_repeats": 4,
+        "split_weighted_milliseconds": 0.16637241398598235,
+        "packed_weighted_milliseconds": 0.16633430470847088,
+        "weighted_speedup_percent": 0.02311890499462621,
+        "weighted_speedup_percent_ci95": [-0.4443313705532162, 0.4905691805424686],
+        "gate_up_speedup_percent": -0.18309341644810462,
+        "down_speedup_percent": 0.4295659562525589,
+        "checksum_parity": true
+      },
+            "decision": "Stop before an exact packed QMV, v2 codec, sidecar, or runtime integration because the upper 95% confidence bound is only 0.491%, below the fixed 5% gate."
     },
     "kv_budget_exchange": {
       "status": "no-go-exact-measured-full-75-to-100-slot-arm",
@@ -113,17 +126,18 @@
     }
   },
   "claim_boundaries": {
-    "new_hardware_benchmark_run": false,
-        "reason_no_new_hardware_run": "A bounded packed-stream hardware probe remains pending; other evidence is reused only within its measured claim boundary.",
+    "new_hardware_benchmark_run": true,
     "measured_vs_inferred": {
       "track1_recorded_throughput_and_floor": "measured",
-            "track1_stream_floor_headroom": "calculated from directly comparable measured values; packed probe pending",
+            "track1_stream_floor_headroom": "historical values calculated; capacity-102 packed-vs-split stream floor measured from a clean committed harness",
       "track2_exact_full_75_to_100_slot_runtime_and_memory": "measured on the recorded host and configuration; fixed-slot Q8-vs-BF16 unmeasured",
       "track3_same_trace_recall_mtp_acceptance_and_current_mtp_speed": "measured; physical byte amplification and general predictor net latency unmeasured",
       "track4_record_sizes": "calculated only",
       "track4_quality_or_performance": "not measured"
     },
     "dirty_research_worktree_modified": false,
-    "qwen_stopped_during_issue31_audit": false
+    "qwen_stopped_during_issue31_benchmark": true,
+    "qwen_restored_and_endpoint_verified": true,
+    "qwen_model_after_restore": "mtplx-qwen36-27b-optimized-speed"
   }
 }
