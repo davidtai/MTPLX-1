@@ -63,6 +63,45 @@
       "array_equal": false,
       "max_abs_difference": 0.125,
       "decision": "reject_behavior_change"
+    },
+    "projection_pipeline_probe": {
+      "verified_sidecar": true,
+      "max_tokens": 256,
+      "repeats": 3,
+      "token_ids_sha256": "238cb21e77899ff08f4a8fe6d0c251c3e860e8db6c68705853e8f3291119b39a",
+      "base_decode_tok_s": [
+        6.418722242809661,
+        6.662712770170981,
+        6.661580698647937
+      ],
+      "per_part_projection_decode_tok_s": [
+        6.308824247869355,
+        6.393009883153571,
+        6.447023115880144
+      ],
+      "batched_projection_decode_tok_s": [
+        6.185007316015558,
+        6.513496640878824,
+        6.452136102682047
+      ],
+      "base_mean_decode_tok_s": 6.581005237209527,
+      "batched_mean_decode_tok_s": 6.383546686525476,
+      "mean_delta_percent": -3.0004314472750204,
+      "base_median_decode_tok_s": 6.661580698647937,
+      "batched_median_decode_tok_s": 6.452136102682047,
+      "median_delta_percent": -3.144067533526984,
+      "final_base_read_operations": 86782,
+      "final_batched_read_operations": 148736,
+      "final_progressive_loads": 61954,
+      "final_projection_ready_routes": 61780,
+      "final_read_bytes_both_arms": 931085549568,
+      "peak_memory_bytes_both_arms": [
+        88787469160,
+        88787518312,
+        88787534696
+      ],
+      "sustained_gate": "skipped_after_negative_mean_and_median_screen",
+      "decision": "reject_extra_read_and_eval_overhead"
     }
   },
   "glm52": {

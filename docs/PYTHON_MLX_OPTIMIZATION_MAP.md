@@ -53,6 +53,7 @@ tok/s. GLM-5.2 used a three-repeat 64-token screen because its baseline is
 | Cache all GLM router weights in FP32 | Per-token BF16-to-FP32 router casts | 1.759 vs 1.812 tok/s (-2.96%) and +225 MiB resident | Revert |
 | Batched score-by-expert matmul | Score multiply plus top-k reduction | Not bit-exact; max BF16 difference 0.125 | Reject before timing |
 | Compile Hy3 selection subgraph | Python graph construction around sigmoid/top-k | About 2.9 us/layer, or 0.23 ms/token estimated | Reject below significance |
+| Read gate/up before down and stage the prefix | Suffix SSD wait behind gate/up QMM | 6.384 vs 6.581 mean tok/s (-3.00%); median -3.14% | Revert after short gate |
 
 The short Hy3 screens sometimes gave the scatter or broadcast arms an apparent
 sub-2% win. The sustained gates reversed those results. A short microbenchmark
@@ -62,6 +63,21 @@ GLM's `group_expert_select` is already compiled by `mlx_lm`. The visible
 `weight.astype(mx.float32)` also did not behave like 675 MiB/token of removable
 critical-path traffic in the end-to-end lane; MLX's lazy execution already
 handles it more efficiently than the source expression suggests.
+
+The projection/read pipeline was rebuilt on the repaired per-expert lease and
+completion-fence model, with behavior-locking tests for cancellation,
+deadlines, suffix failures, close, assignment order, single ownership, and
+exact Hy3/GLM logits. It activated on the real Hy3 lane: the final repeat had
+61,954 progressive loads and 61,780 consumed prefix routes. Batching every
+gate/up prefix into one assignment-aligned QMM and one `mx.eval` per routed wave
+did not recover the loss. The two arms read the same 931,085,549,568 bytes and
+used identical peak memory, but splitting each record at the prefix boundary
+raised cumulative read operations from 86,782 to 148,736. The 61,954 extra
+operations exactly match the progressive-load count, identifying the second
+`preadv` rather than payload bytes as the remaining cost. A viable revisit
+needs one I/O submission that can expose prefix completion, or a broader fused
+boundary that removes enough downstream work to pay for the extra completion
+barrier.
 
 ## Retained conclusions
 
