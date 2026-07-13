@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "base_commit": "f464011631e8",
+  "machine_policy": {
+    "exclusive_mlx_process": true,
+    "qwen_unloaded": true,
+    "deterministic_generation": true
+  },
+  "hy3": {
+    "model_revision": "160619d3f96c8470350b6dac0ef033a8381551e3",
+    "short_lane": {
+      "max_tokens": 256,
+      "repeats": 3,
+      "base_before_decode_tok_s": [
+        6.47740107666669,
+        6.374758658449974,
+        6.383055998328383
+      ],
+      "base_after_decode_tok_s": [
+        6.482191015361942,
+        6.429291672195599,
+        6.3727223718600765
+      ],
+      "single_token_broadcast_decode_tok_s": [
+        6.517863724619407,
+        6.441860572291154,
+        6.455528126371068
+      ],
+      "broadcast_plus_python_order_decode_tok_s": [
+        6.458725714575431,
+        6.240702689958664,
+        6.3491471541166495
+      ],
+      "broadcast_plus_scatter_decode_tok_s": [
+        6.553345079951593,
+        6.494162810659035,
+        6.504046505605088
+      ],
+      "base_after_scatter_decode_tok_s": [
+        6.546087758621445,
+        6.322882684710408,
+        6.382364549609274
+      ]
+    },
+    "sustained_lane": {
+      "max_tokens": 2048,
+      "completion_tokens": 1905,
+      "finish_reason": "stop",
+      "token_ids_sha256": "23066c16690e1e31cfb6c85245a8fbf64428038816e2ff7416df617464bf33d9",
+      "base_decode_tok_s": 6.442464394676637,
+      "single_token_broadcast_decode_tok_s": 6.358459233249847,
+      "single_token_broadcast_delta_percent": -1.3039,
+      "broadcast_plus_scatter_decode_tok_s": 6.1575731394601485,
+      "broadcast_plus_scatter_delta_percent": -4.4223
+    },
+    "router_compile_probe": {
+      "raw_median_us_per_layer": 178.86344531348186,
+      "compiled_median_us_per_layer": 175.92708593383577,
+      "estimated_savings_ms_per_79_layers": 0.2319,
+      "decision": "reject_below_end_to_end_significance"
+    },
+    "weighted_matmul_probe": {
+      "array_equal": false,
+      "max_abs_difference": 0.125,
+      "decision": "reject_behavior_change"
+    }
+  },
+  "glm52": {
+    "model_revision": "6b347a6472d46bf55de65ee34032136a3929d778",
+    "max_tokens": 64,
+    "repeats": 3,
+    "token_ids_sha256": "ea1bfe365cdf212a4a70695b3fe4be31481f2d5f1c8bdb504fc4380f01c32be5",
+    "base_before_decode_tok_s": [
+      1.797180765391981,
+      1.754360158024425,
+      1.7723702003798654
+    ],
+    "promoted_router_decode_tok_s": [
+      1.7787146251403192,
+      1.744752130072179,
+      1.7529572702832315
+    ],
+    "base_after_decode_tok_s": [
+      1.8179138738415304,
+      1.8083082155699204,
+      1.810891394092938
+    ],
+    "promoted_router_mean_decode_tok_s": 1.7588080084985764,
+    "base_after_mean_decode_tok_s": 1.8123711611681295,
+    "delta_percent_vs_immediate_base": -2.9554,
+    "additional_resident_bytes": 235929600,
+    "decision": "reject_regression_and_memory_cost"
+  },
+  "retained_runtime_changes": [],
+  "follow_up_issues": [
+    "https://github.com/davidtai/MTPLX/issues/27",
+    "https://github.com/davidtai/MTPLX/issues/30"
+  ]
+}
