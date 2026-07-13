@@ -1,0 +1,110 @@
+{
+  "schema": "mtplx.hy3-record-destination-layout.v1",
+  "issue": 30,
+  "decision": {
+    "status": "no-go",
+    "record_arena_runtime_integration": false,
+    "reopen_stage_b": false,
+    "reason": "The arena misses the independent loader headroom gate and the adjacent-batch p95 gate."
+  },
+  "raw_result": {
+    "path": "benchmarks/raw/expert-io/issue30-record-destinations-20260713T084805Z-9187e7b0cf9a/result.json",
+    "sha256": "c8f80ddffe67cd41fcb81ee3096bde9919040af4e259448089faa402f9374dc0",
+    "git_commit": "9187e7b0cf9a2c9caa78ced8fc876fc9e4393ac9",
+    "harness_sha256": "867ba8cf6faa292e4ac7d122c40139137e9ae25b025d4734ae3900f7593ab398",
+    "harness_git_dirty": false,
+    "mlx_version": "0.31.2",
+    "repeats": 4,
+    "operations_per_lane": 96,
+    "warmup_operations": 32,
+    "host_read_concurrencies": [1, 32],
+    "adjacent_batch_records": 32,
+    "seed": 30
+  },
+  "parity": {
+    "status": "pass",
+    "sentinel_records": 3,
+    "arena_component_and_manifest_hashes_match": true,
+    "full_sidecar_sha256_verified_in_this_run": false,
+    "declared_sidecar_sha256": "5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae",
+    "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+    "sidecar_bytes_verified_by_fstat": 161036107776
+  },
+  "paired_results": {
+    "definition": "Positive percentages mean the record arena has lower wall time or latency than component rows. Confidence intervals are paired two-sided 95% Student-t intervals with 3 degrees of freedom.",
+    "individual_host_concurrency_1": {
+      "wall_time_improvement_percent": {
+        "pairs": [1.8203767828858526, 1.1866103022611856, 1.2906543595208582, 1.5789423655298946],
+        "mean": 1.4691459525494477,
+        "median": 1.4347983625253764,
+        "ci95": [1.0124676883208534, 1.925824216778042]
+      },
+      "p50_improvement_percent": {
+        "mean": 1.338304500033278,
+        "ci95": [1.0224216211557942, 1.654187378910762]
+      },
+      "p95_improvement_percent": {
+        "mean": 1.9523079277989785,
+        "ci95": [0.9788317321393311, 2.925784123458626]
+      }
+    },
+    "individual_host_concurrency_32": {
+      "wall_time_improvement_percent": {
+        "pairs": [4.226561931941748, -0.02767263032600092, 0.9581052175660523, 0.0025826923798856244],
+        "mean": 1.2898943028904213,
+        "median": 0.48034395497296895,
+        "ci95": [-1.9093817030037241, 4.4891703087845665]
+      },
+      "p50_improvement_percent": {
+        "mean": 2.878820188427368,
+        "ci95": [-1.8775604919987527, 7.635200868853489]
+      },
+      "p95_improvement_percent": {
+        "mean": 4.969131034150081,
+        "ci95": [-3.803881393615992, 13.742143461916154]
+      }
+    },
+    "adjacent_batch_32_host_concurrency_1": {
+      "wall_time_improvement_percent": {
+        "pairs": [-8.505388482820624, 0.13424637290225092, 0.2754115722494854, 0.2008199369221435],
+        "mean": -1.973727650186686,
+        "median": 0.16753315491219722,
+        "ci95": [-8.9032217415849, 4.955766441211527]
+      },
+      "p50_improvement_percent": {
+        "mean": 0.21646569266095902,
+        "ci95": [0.17101672282288238, 0.26191466249903567]
+      },
+      "p95_improvement_percent": {
+        "pairs": [-25.89835303655838, 0.043559264503482256, 0.2539689370525458, 0.27086087207510323],
+        "mean": -6.332490990731812,
+        "median": 0.14876410077801402,
+        "ci95": [-27.08891156511722, 14.423929583653592]
+      }
+    }
+  },
+  "headroom_gate": {
+    "mean_saved_milliseconds_per_record_host_concurrency_1": 0.013774627584931901,
+    "saved_milliseconds_per_record_ci95": [0.009435391102087447, 0.018113864067776354],
+    "maximum_routed_assignments_per_token": 632,
+    "all_miss_mean_extrapolation_milliseconds_per_token": 8.70556463367696,
+    "all_miss_conservative_lower_ci_milliseconds_per_token": 5.963167176519267,
+    "loader_savings_required_to_reopen_stage_b_milliseconds_per_token": 8.983033777159687,
+    "impossible_stage_b_ceiling_milliseconds_per_token": 7.134687320551837,
+    "combined_mean_all_miss_and_impossible_stage_b_milliseconds_per_token": 15.840251954228798,
+    "required_end_to_end_savings_milliseconds_per_token": 16.117721097711524,
+    "combined_shortfall_milliseconds_per_token": 0.2774691434827261,
+    "combined_implied_end_to_end_gain_percent": 4.909698139366969
+  },
+  "claim_boundary": {
+    "metal_reads_issued": false,
+    "claims_runtime_fence_safety": false,
+    "claims_syscall_elimination": false,
+    "runtime_arena_was_integrated": false
+  },
+  "machine_hygiene": {
+    "qwen_unloaded_for_benchmark": true,
+    "qwen_restored_and_models_endpoint_verified": true,
+    "restored_model": "mtplx-qwen36-27b-optimized-speed"
+  }
+}

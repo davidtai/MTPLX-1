@@ -1,0 +1,737 @@
+{
+  "command": {
+    "argv": [
+      "/Users/davidtai/projects/OpenSourceWTF/.worktrees/30-record-native/.venv/bin/python3",
+      "/Users/davidtai/projects/OpenSourceWTF/.worktrees/30-record-native/scripts/benchmark_hy3_record_destinations.py",
+      "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3",
+      "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/expert-manifest-sidecar.json",
+      "--operations",
+      "96",
+      "--warmup-operations",
+      "32",
+      "--host-read-concurrencies",
+      "1,32",
+      "--batch-records",
+      "32",
+      "--repeats",
+      "4",
+      "--seed",
+      "30",
+      "--output",
+      "benchmarks/raw/expert-io/issue30-record-destinations-20260713T084805Z-9187e7b0cf9a/result.json"
+    ],
+    "shell": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/30-record-native/.venv/bin/python3 /Users/davidtai/projects/OpenSourceWTF/.worktrees/30-record-native/scripts/benchmark_hy3_record_destinations.py /Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3 /Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/expert-manifest-sidecar.json --operations 96 --warmup-operations 32 --host-read-concurrencies 1,32 --batch-records 32 --repeats 4 --seed 30 --output benchmarks/raw/expert-io/issue30-record-destinations-20260713T084805Z-9187e7b0cf9a/result.json"
+  },
+  "configuration": {
+    "batch_records": 32,
+    "component_lengths": [
+      3145728,
+      196608,
+      196608,
+      3145728,
+      196608,
+      196608,
+      3145728,
+      196608,
+      196608
+    ],
+    "host_read_concurrencies": [
+      1,
+      32
+    ],
+    "operations": 96,
+    "record_bytes": 10616832,
+    "repeats": 4,
+    "seed": 30,
+    "warmup_operations": 32
+  },
+  "io_contract": {
+    "cache_mode": "F_NOCACHE",
+    "claims_runtime_fence_safety": false,
+    "claims_syscall_elimination": false,
+    "metal_reads_issued": false,
+    "syscall": "os.preadv"
+  },
+  "mechanism": "destination/layout efficiency",
+  "parity_preflight": [
+    {
+      "arena_sha256": "b24e90da7cc1885ea066af671d77931d9431879c612a99bb5e77cd1140361c15",
+      "component_sha256": "b24e90da7cc1885ea066af671d77931d9431879c612a99bb5e77cd1140361c15",
+      "identity": "layer-1-expert-0",
+      "length": 10616832,
+      "offset": 0,
+      "sha256": "b24e90da7cc1885ea066af671d77931d9431879c612a99bb5e77cd1140361c15",
+      "trusted_sha256": "b24e90da7cc1885ea066af671d77931d9431879c612a99bb5e77cd1140361c15"
+    },
+    {
+      "arena_sha256": "584454eb10b8c8b6fef032a3d2a4c42dd52b51c6d78b11f398d4bd3c97599dfa",
+      "component_sha256": "584454eb10b8c8b6fef032a3d2a4c42dd52b51c6d78b11f398d4bd3c97599dfa",
+      "identity": "layer-40-expert-96",
+      "length": 10616832,
+      "offset": 80518053888,
+      "sha256": "584454eb10b8c8b6fef032a3d2a4c42dd52b51c6d78b11f398d4bd3c97599dfa",
+      "trusted_sha256": "584454eb10b8c8b6fef032a3d2a4c42dd52b51c6d78b11f398d4bd3c97599dfa"
+    },
+    {
+      "arena_sha256": "065ae2b85e0856106bdb48e3ed836cda3fb753af6aa4e59ba85492b619902c49",
+      "component_sha256": "065ae2b85e0856106bdb48e3ed836cda3fb753af6aa4e59ba85492b619902c49",
+      "identity": "layer-79-expert-191",
+      "length": 10616832,
+      "offset": 161025490944,
+      "sha256": "065ae2b85e0856106bdb48e3ed836cda3fb753af6aa4e59ba85492b619902c49",
+      "trusted_sha256": "065ae2b85e0856106bdb48e3ed836cda3fb753af6aa4e59ba85492b619902c49"
+    }
+  ],
+  "provenance": {
+    "declared_sidecar_sha256": "5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae",
+    "full_sidecar_sha256_verified": false,
+    "git_commit": "9187e7b0cf9a2c9caa78ced8fc876fc9e4393ac9",
+    "harness": {
+      "cwd": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/30-record-native",
+      "git_dirty": false,
+      "mlx_version": "0.31.2",
+      "path": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/30-record-native/scripts/benchmark_hy3_record_destinations.py",
+      "sha256": "867ba8cf6faa292e4ac7d122c40139137e9ae25b025d4734ae3900f7593ab398"
+    },
+    "host": {
+      "machine": "arm64",
+      "platform": "macOS-26.5.2-arm64-arm-64bit",
+      "python": "3.12.13"
+    },
+    "manifest": "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/expert-manifest-sidecar.json",
+    "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+    "model_key": "hy3-q4",
+    "sidecar": "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/experts.bin",
+    "sidecar_bytes": 161036107776,
+    "source_repo": "pipenetwork/Hy3-4bit",
+    "source_revision": "160619d3f96c8470350b6dac0ef033a8381551e3"
+  },
+  "results": [
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 0.983041,
+        "mean": 0.9233068125,
+        "p50": 0.921708,
+        "p95": 0.9405
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08869841700288816,
+      "gib_per_second": 10.701642510362861,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 0.945958,
+        "mean": 0.9112595208333333,
+        "p50": 0.910041,
+        "p95": 0.928375
+      },
+      "records": 96,
+      "records_per_second": 1082.319203023365,
+      "repeat": 0
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 24.645458,
+        "mean": 24.574958,
+        "p50": 24.630416,
+        "p95": 24.645458
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07404779200078337,
+      "gib_per_second": 12.819001409116398,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 23.501875,
+        "mean": 15.49830159375,
+        "p50": 15.513583,
+        "p95": 23.334458
+      },
+      "records": 96,
+      "records_per_second": 1296.4599943639696,
+      "repeat": 0
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 32.163042,
+        "mean": 27.702041666666663,
+        "p50": 25.480125,
+        "p95": 32.163042
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08311350000076345,
+      "gib_per_second": 11.42075294616736,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 32.163042,
+        "mean": 27.702041666666663,
+        "p50": 25.480125,
+        "p95": 32.163042
+      },
+      "records": 96,
+      "records_per_second": 1155.0470140123828,
+      "repeat": 0
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 1.264458,
+        "mean": 0.9407086770833333,
+        "p50": 0.93425,
+        "p95": 0.966042
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.09034299999984796,
+      "gib_per_second": 10.506832294716773,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 1.251583,
+        "mean": 0.9296457604166667,
+        "p50": 0.923458,
+        "p95": 0.955292
+      },
+      "records": 96,
+      "records_per_second": 1062.6169155348125,
+      "repeat": 0
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 27.869416,
+        "mean": 25.665430666666666,
+        "p50": 24.752959,
+        "p95": 27.869416
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.0773155829992902,
+      "gib_per_second": 12.277198375503607,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 26.927875,
+        "mean": 15.9440881875,
+        "p50": 15.845458,
+        "p95": 26.7785
+      },
+      "records": 96,
+      "records_per_second": 1241.6643097793278,
+      "repeat": 0
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.546833,
+        "mean": 25.527597,
+        "p50": 25.529,
+        "p95": 25.546833
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07659850000345614,
+      "gib_per_second": 12.392132351902076,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 25.546833,
+        "mean": 25.527597,
+        "p50": 25.529,
+        "p95": 25.546833
+      },
+      "records": 96,
+      "records_per_second": 1253.2882497133555,
+      "repeat": 0
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 0.985125,
+        "mean": 0.9344028125,
+        "p50": 0.932541,
+        "p95": 0.958875
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08974437500000931,
+      "gib_per_second": 10.576916380552001,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 0.95675,
+        "mean": 0.9226293229166668,
+        "p50": 0.920958,
+        "p95": 0.94675
+      },
+      "records": 96,
+      "records_per_second": 1069.704925796074,
+      "repeat": 1
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 24.775458,
+        "mean": 24.58343066666667,
+        "p50": 24.598834,
+        "p95": 24.775458
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07408041600137949,
+      "gib_per_second": 12.81335609646582,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 23.646292,
+        "mean": 15.58904815625,
+        "p50": 16.687958,
+        "p95": 23.504166
+      },
+      "records": 96,
+      "records_per_second": 1295.8890511388643,
+      "repeat": 1
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.539917,
+        "mean": 25.51805566666667,
+        "p50": 25.5375,
+        "p95": 25.539917
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07656966699869372,
+      "gib_per_second": 12.396798722086563,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 25.539917,
+        "mean": 25.51805566666667,
+        "p50": 25.5375,
+        "p95": 25.539917
+      },
+      "records": 96,
+      "records_per_second": 1253.7601868065817,
+      "repeat": 1
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 0.989625,
+        "mean": 0.9233272291666667,
+        "p50": 0.922,
+        "p95": 0.94125
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08867945900055929,
+      "gib_per_second": 10.703930320481696,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 0.957041,
+        "mean": 0.9123415,
+        "p50": 0.911083,
+        "p95": 0.931084
+      },
+      "records": 96,
+      "records_per_second": 1082.5505825356302,
+      "repeat": 1
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 24.793167,
+        "mean": 24.60069466666667,
+        "p50": 24.627375,
+        "p95": 24.793167
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07410091600104352,
+      "gib_per_second": 12.809811284743535,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 23.452458,
+        "mean": 15.549469572916665,
+        "p50": 15.480084,
+        "p95": 23.317792
+      },
+      "records": 96,
+      "records_per_second": 1295.530543760729,
+      "repeat": 1
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.528792,
+        "mean": 25.486722333333333,
+        "p50": 25.483458,
+        "p95": 25.528792
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07646687499800464,
+      "gib_per_second": 12.41346334638063,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 25.528792,
+        "mean": 25.486722333333333,
+        "p50": 25.483458,
+        "p95": 25.528792
+      },
+      "records": 96,
+      "records_per_second": 1255.4455769574088,
+      "repeat": 1
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 0.981292,
+        "mean": 0.924331125,
+        "p50": 0.922708,
+        "p95": 0.94225
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08877425000173389,
+      "gib_per_second": 10.692500922074368,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 0.950375,
+        "mean": 0.9135903125000001,
+        "p50": 0.912209,
+        "p95": 0.932041
+      },
+      "records": 96,
+      "records_per_second": 1081.3946611559657,
+      "repeat": 2
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 24.717375,
+        "mean": 24.679889000000003,
+        "p50": 24.6695,
+        "p95": 24.717375
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07432929199785576,
+      "gib_per_second": 12.770453269316528,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 23.447334,
+        "mean": 15.5760615625,
+        "p50": 16.059791,
+        "p95": 23.27
+      },
+      "records": 96,
+      "records_per_second": 1291.550039286926,
+      "repeat": 2
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.496083,
+        "mean": 25.47520833333333,
+        "p50": 25.487417,
+        "p95": 25.496083
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07643166699926951,
+      "gib_per_second": 12.419181567884317,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 25.496083,
+        "mean": 25.47520833333333,
+        "p50": 25.487417,
+        "p95": 25.496083
+      },
+      "records": 96,
+      "records_per_second": 1256.0238938778807,
+      "repeat": 2
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 1.009334,
+        "mean": 0.9365052187499999,
+        "p50": 0.935084,
+        "p95": 0.956
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08993499999996857,
+      "gib_per_second": 10.554497692781807,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 0.976916,
+        "mean": 0.9251275625000001,
+        "p50": 0.924291,
+        "p95": 0.945459
+      },
+      "records": 96,
+      "records_per_second": 1067.4375938181304,
+      "repeat": 2
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.542584,
+        "mean": 24.905597,
+        "p50": 24.619166,
+        "p95": 25.542584
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.0750483340016217,
+      "gib_per_second": 12.648098890236373,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 24.600917,
+        "mean": 15.866416229166667,
+        "p50": 16.341333,
+        "p95": 24.397542
+      },
+      "records": 96,
+      "records_per_second": 1279.1756309730415,
+      "repeat": 2
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.561,
+        "mean": 25.542291666666667,
+        "p50": 25.539875,
+        "p95": 25.561
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07664275000206544,
+      "gib_per_second": 12.384977704667689,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 25.561,
+        "mean": 25.542291666666667,
+        "p50": 25.539875,
+        "p95": 25.561
+      },
+      "records": 96,
+      "records_per_second": 1252.5646587239223,
+      "repeat": 2
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 0.989166,
+        "mean": 0.9358748854166666,
+        "p50": 0.934875,
+        "p95": 0.960125
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08988345800025854,
+      "gib_per_second": 10.560549973469753,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 0.962083,
+        "mean": 0.9246419479166667,
+        "p50": 0.923208,
+        "p95": 0.9495
+      },
+      "records": 96,
+      "records_per_second": 1068.0496960822743,
+      "repeat": 3
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 24.67,
+        "mean": 24.639875,
+        "p50": 24.628583,
+        "p95": 24.67
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07422487499934505,
+      "gib_per_second": 12.788418303276035,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 23.645333,
+        "mean": 15.497791729166666,
+        "p50": 15.9345,
+        "p95": 23.550375
+      },
+      "records": 96,
+      "records_per_second": 1293.366947412806,
+      "repeat": 3
+    },
+    {
+      "arm": "component-rows",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.551125,
+        "mean": 25.515208333333334,
+        "p50": 25.527667,
+        "p95": 25.551125
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.0765611250026268,
+      "gib_per_second": 12.39818184447306,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 25.551125,
+        "mean": 25.515208333333334,
+        "p50": 25.527667,
+        "p95": 25.551125
+      },
+      "records": 96,
+      "records_per_second": 1253.9000699990531,
+      "repeat": 3
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 96,
+        "max": 0.972792,
+        "mean": 0.9211805416666667,
+        "p50": 0.920125,
+        "p95": 0.942417
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.08846425000228919,
+      "gib_per_second": 10.729970015858802,
+      "host_read_concurrency": 1,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 0.959541,
+        "mean": 0.9100256145833333,
+        "p50": 0.909167,
+        "p95": 0.931292
+      },
+      "records": 96,
+      "records_per_second": 1085.1841280236458,
+      "repeat": 3
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 24.686375,
+        "mean": 24.639264,
+        "p50": 24.669,
+        "p95": 24.686375
+      },
+      "batch_records": 1,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07422295799915446,
+      "gib_per_second": 12.78874859731154,
+      "host_read_concurrency": 32,
+      "lane": "individual",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 23.519625,
+        "mean": 15.508921,
+        "p50": 15.861209,
+        "p95": 23.173375
+      },
+      "records": 96,
+      "records_per_second": 1293.4003519651376,
+      "repeat": 3
+    },
+    {
+      "arm": "record-arena",
+      "batch_latency_ms": {
+        "count": 3,
+        "max": 25.481917,
+        "mean": 25.467042000000003,
+        "p50": 25.461959,
+        "p95": 25.481917
+      },
+      "batch_records": 32,
+      "bytes": 1019215872,
+      "elapsed_seconds": 0.07640737499968964,
+      "gib_per_second": 12.42312996623501,
+      "host_read_concurrency": 1,
+      "lane": "adjacent-batch",
+      "record_latency_ms": {
+        "count": 96,
+        "max": 25.481917,
+        "mean": 25.467042000000003,
+        "p50": 25.461959,
+        "p95": 25.481917
+      },
+      "records": 96,
+      "records_per_second": 1256.4232183135457,
+      "repeat": 3
+    }
+  ],
+  "schema": "mtplx-hy3-record-destination-benchmark-v1",
+  "workload_sha256": "6c70908c8b55ffbc14a916e449a56b24d95fde6593f3962ca7c676140d88a435"
+}

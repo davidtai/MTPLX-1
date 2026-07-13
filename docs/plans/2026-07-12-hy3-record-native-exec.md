@@ -17,6 +17,7 @@
 - Modify `mtplx/models/hy3_mlx.py`: pass scores into a fused-combine-capable switch without changing the fallback.
 - Create `scripts/benchmark_hy3_record_q4.py` and `tests/test_moe_record_q4.py`.
 - Create `benchmarks/results/hy3-record-native-stageb-premise-20260713.{md,json}` for the evidence-first Stage B decision.
+- Create `scripts/benchmark_hy3_record_destinations.py`, its contract tests, and `benchmarks/results/hy3-record-destination-layout-issue30-20260713.{md,json}` for the independent loader gate.
 - Extend streamed model tests for cache, pin, repeated-expert, and fallback behavior.
 
 ### Task 1: Lock the v1 record and combine contracts
@@ -40,17 +41,19 @@ If Stage B is reopened, its first slice remains a component-bank weighted down r
 
 ### Task 3: Measure loader destination layout independently
 
-- [ ] Write tests for one fixed-stride record allocation, exact byte ownership, close behavior, and no duplicate component-bank allocation.
+- [x] Write tests for one fixed-stride record allocation, exact byte ownership, close behavior, and no duplicate component-bank allocation.
 - [ ] Add a failure-path regression proving any outstanding shared-arena row write blocks Metal reads from every sibling row, then releases aggregate ownership exactly once.
-- [ ] Preserve the resource-level safety rule from `058b40b`: all external writes into a shared arena must finish before Metal reads any sibling row, unless a proved event/fence mechanism replaces the barrier.
-- [ ] Compare a contiguous v1 record destination with the current one-`preadv` scatter into nine component rows. Describe the mechanism as destination/layout efficiency, not syscall elimination.
-- [ ] Hold sidecar offsets, record hashes, bytes, `F_NOCACHE`, and record sequence constant; measure QD1 and runtime-representative QD32 plus adjacent-record batches.
-- [ ] Run three repeats and report throughput plus p50/p95 record latency.
-- [ ] Kill the arena if service time has no significant improvement or p95 regresses.
+- [x] Preserve the resource-level safety rule from `058b40b`: the isolated harness materializes all MLX allocations before external writes and issues no Metal reads; no runtime arena is introduced.
+- [x] Compare a contiguous v1 record destination with the current one-`preadv` scatter into nine component rows. Describe the mechanism as destination/layout efficiency, not syscall elimination.
+- [x] Hold sidecar offsets, record hashes, bytes, `F_NOCACHE`, and record sequence constant; measure host read concurrency 1 and 32 plus adjacent-record batches.
+- [x] Run four balanced AB/BA repeats and report throughput plus p50/p95 record latency.
+- [x] Kill the arena: host concurrency 32 is inconclusive, adjacent p95 regresses, and the all-miss mean extrapolation cannot close the Stage B headroom gate.
+
+The sibling-row failure regression remains intentionally unchecked because the gate rejected the arena before runtime integration. The benchmark explicitly records `metal_reads_issued=false` and `claims_runtime_fence_safety=false`; it is not evidence for an unimplemented runtime fence.
 
 ### Task 4: Add Stage A only if combined headroom is plausible
 
-- [ ] Sum conservative Stage-B and loader upper bounds. Stop if they cannot plausibly save the freshly computed 5% end-to-end budget.
+- [x] Sum the Stage-B and loader bounds and stop. Even the mean 632-miss loader extrapolation plus the impossible Stage-B ceiling implies only +4.9097%; the conservative loader estimate is lower.
 - [ ] Write failing parity tests against `mx.gather_qmm` for BF16/FP16, scattered slot indices, repeated experts, and B=1/2/4/8.
 - [ ] Implement gate and up as two specialized QMV dispatches plus SwiGLU producing `[assignments,1536]`.
 - [ ] Keep one-dispatch gate/up fusion as a separate arm; the prior split-layout experiment regressed 10.5% because MLX already overlaps the independent dispatches.
@@ -73,5 +76,5 @@ If Stage B is reopened, its first slice remains a component-bank weighted down r
 - [ ] If still viable, run two alternating-order natural-stop B1 pairs with identical router IDs, 1,905-token output, and token SHA-256 `484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`.
 - [ ] Run B=2/4/8 and mixed prefill/decode secondary lanes with identical bytes/cache budget and no tail-latency regression above 2%.
 - [ ] Retain the arm only if every B1 pair and their mean improve by at least 5%, memory is bounded, and every parity/generation guard passes.
-- [ ] If it loses, leave only useful unwired test/benchmark scaffolding and document the negative result.
+- [x] If it loses, leave only useful unwired test/benchmark scaffolding and document the negative result.
 - [ ] Push `experiment/hy3-record-native-exec` and open a draft PR against `experiment/hy3-cache-scheduling`, linking #30.
