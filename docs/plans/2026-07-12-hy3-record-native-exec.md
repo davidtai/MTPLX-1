@@ -16,6 +16,7 @@
 - Modify `mtplx/models/expert_mlx.py`: opt-in execution arm and weighted reduction boundary.
 - Modify `mtplx/models/hy3_mlx.py`: pass scores into a fused-combine-capable switch without changing the fallback.
 - Create `scripts/benchmark_hy3_record_q4.py` and `tests/test_moe_record_q4.py`.
+- Create `benchmarks/results/hy3-record-native-stageb-premise-20260713.{md,json}` for the evidence-first Stage B decision.
 - Extend streamed model tests for cache, pin, repeated-expert, and fallback behavior.
 
 ### Task 1: Lock the v1 record and combine contracts
@@ -25,18 +26,17 @@
 - [x] Implement immutable `RecordQ4Layout` and `validate_hy3_record_q4(record, spec)`; no Metal code yet.
 - [x] Verify GREEN and commit `test(hy3): lock record-native Q4 contract`.
 
-### Task 2: Measure Stage B headroom before building an arena
+### Task 2: Bound Stage B headroom before writing a kernel
 
-**Premise update:** The prior kernel spike measured stock `mx.gather_qmm` at 95.6% of its single-dispatch memory roofline, the full custom Q4 arm as a statistical tie, and pure reassembly-tail removal at only about 1.4-1.5 ms/token. The resource-safe #29 layer control averages 2.9545 tok/s, or 338.472 ms/token, so a 5% throughput win now requires saving 16.118 ms/token. The previously measured tail-elision mechanism covers at most about 9.3% of that budget; Stage B must therefore show additional fused-QMV savings rather than being retained for tail removal alone.
+**Premise update:** The prior kernel spike measured stock `mx.gather_qmm` at 95.6% of its single-dispatch memory roofline, the full custom Q4 arm as a statistical tie, and pure reassembly-tail removal at 1.4862 ms/token. The resource-safe #29 layer control averages 2.9545 tok/s, or 338.472 ms/token, so a 5% throughput win requires saving 16.118 ms/token.
 
-- [ ] Write failing raw-bit parity tests for a Stage-B-only weighted reduction over existing component-bank down weights: BF16/FP16, permuted execution rows, adversarial score order, repeated experts, and B=1/2/4/8.
-- [ ] Add a device-side bounds/generation violation flag whose negative-index, `>=192`, and max-`uint32` mutation tests fail if the guard is removed. Routing data must never become an unchecked output address.
-- [ ] Keep precomputed Stage-A hidden inputs identical between stock and candidate arms.
-- [ ] Implement `component_down_weighted_reduce_q4` by selectively extracting the verified affine-Q4 dot-product/build-guard scaffold from the prior spike. Do not cherry-pick its divergent runtime integration.
-- [ ] Require zero raw-bit mismatches before printing any timing. Kernel/build failures after dispatch must propagate; they are not fallback eligibility.
-- [ ] Benchmark at least 150 paired, interleaved, rotated iterations with exactly one real `mx.eval` per arm and warm JIT state.
-- [ ] Kill Stage B if it is slower in two independent paired runs or its upper-confidence savings cannot contribute enough to the freshly computed 5% time budget.
-- [ ] Commit the parity harness, raw paired payload, exact commands, and measured go/no-go result before any arena work.
+- [x] Recompute the +5% time budget from the resource-safe #29 control.
+- [x] Bound the entire measured down projection at 5.6485 ms/token and the entire measured tail at 1.4862 ms/token.
+- [x] Record the deliberately impossible free-down-plus-free-tail ceiling: 7.1347 ms/token, only 44.27% of the requirement.
+- [x] Check in the exact evidence chain and go/no-go payload before adding kernel code.
+- [x] Defer Stage B until an independent loader/scheduling result supplies at least 8.983 ms/token of conservative headroom; the evidence-based realistic gap is about 13.2 ms/token.
+
+If Stage B is reopened, its first slice remains a component-bank weighted down reduction with raw-bit BF16/FP16 parity at B=1/2/4/8, permuted and repeated assignments, and a device-visible assignment/slot/generation guard. Negative, `>=192`, and max-`uint32` mutations must trip the guard. Routing data must never become an unchecked output address. Use precomputed identical Stage-A inputs, warm JIT, fallback disabled, at least 150 paired/interleaved/rotated iterations, and exactly one real `mx.eval` per arm.
 
 ### Task 3: Measure loader destination layout independently
 

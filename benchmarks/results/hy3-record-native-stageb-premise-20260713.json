@@ -1,0 +1,42 @@
+{
+  "schema": "mtplx.hy3-record-native.stageb-premise.v1",
+  "issue": 30,
+  "decision": {
+    "status": "no-go-as-standalone",
+    "next_step": "measure loader destination and resource-safe scheduling",
+    "reason": "Even a deliberately impossible free-down-plus-free-tail ceiling reaches only 44.27% of the 5% end-to-end savings requirement."
+  },
+  "safe_control": {
+    "commit": "058b40b28de97ddce23184e2c62ed1f41cb6ba2d",
+    "tokens_per_second": 2.9544528863828594,
+    "milliseconds_per_token": 338.47214305194126,
+    "target_gain_percent": 5.0,
+    "target_milliseconds_per_token": 322.35442195422974,
+    "required_savings_milliseconds_per_token": 16.117721097711524,
+    "token_ids_sha256": "484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c"
+  },
+  "prior_kernel_evidence": {
+    "commit": "2671ba78c3e80e18d412787ffaa343d971ff7b1f",
+    "stock_roofline_percent": 95.6,
+    "isolated_down_milliseconds_per_layer": 0.0715,
+    "routed_layers": 79,
+    "entire_down_milliseconds_per_token": 5.6485,
+    "component_with_tail_milliseconds_per_token": 27.68128368916223,
+    "component_fastpath_milliseconds_per_token": 26.195096368610393,
+    "tail_milliseconds_per_token": 1.486187320551837,
+    "all_three_specialized_qmv_savings_milliseconds_per_token": 1.4
+  },
+  "stage_b_upper_bound": {
+    "assumption": "The entire down projection and entire tail both become free; this is intentionally impossible and therefore conservative.",
+    "savings_milliseconds_per_token": 7.134687320551837,
+    "share_of_required_savings_percent": 44.26610485005139,
+    "best_case_tokens_per_second": 3.018071101537901,
+    "best_case_gain_percent": 2.153299362066652,
+    "remaining_savings_milliseconds_per_token": 8.983033777159687
+  },
+  "plausible_bound": {
+    "generous_savings_milliseconds_per_token": 2.9,
+    "remaining_savings_milliseconds_per_token": 13.217721097711525,
+    "note": "Adds the measured all-three-QMV saving to tail elision even though the estimates may overlap."
+  }
+}
