@@ -18,6 +18,14 @@ from .native_gdn_tail import (
     is_native_gdn_tail_eligible,
     native_gdn_norm_gate_out_qmv8,
 )
+from .moe_record_q4 import (
+    HY3_RECORD_Q4_LAYOUT,
+    RecordQ4ContractError,
+    is_hy3_record_q4_supported,
+    is_hy3_weighted_top8_statically_supported,
+    validate_hy3_record_q4,
+    validate_hy3_weighted_top8,
+)
 
 __all__ = [
     "fused_add_rmsnorm",
@@ -32,4 +40,10 @@ __all__ = [
     "native_gdn_norm_gate_out_qmv8",
     "is_small_m_qmm4_eligible",
     "small_m_qmm4_matmul",
+    "HY3_RECORD_Q4_LAYOUT",
+    "RecordQ4ContractError",
+    "is_hy3_record_q4_supported",
+    "is_hy3_weighted_top8_statically_supported",
+    "validate_hy3_record_q4",
+    "validate_hy3_weighted_top8",
 ]
