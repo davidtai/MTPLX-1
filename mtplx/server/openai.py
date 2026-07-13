@@ -9495,7 +9495,6 @@ def _encode_messages(
                         f"tool schemas: {schema_free_exc}"
                     ),
                 ) from schema_free_exc
-            pass
     prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized)
     if add_generation_prompt:
         prompt += "\nassistant:"
@@ -20618,7 +20617,6 @@ def create_app(state: ServerState) -> FastAPI:
             *,
             assistant_content: str,
             assistant_tool_calls: list[dict[str, Any]] | None = None,
-            stream_response: bool = False,
         ) -> None:
             if session is None:
                 return
