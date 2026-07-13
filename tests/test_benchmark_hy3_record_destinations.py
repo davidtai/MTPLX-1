@@ -234,7 +234,7 @@ def test_record_and_batch_latencies_include_destination_view_setup(
     fd = os.open(sidecar, os.O_RDONLY)
     try:
         record_ms, _batch_ms, _elapsed = module._measure_individual(
-            fd, records[:1], destination, queue_depth=1
+            fd, records[:1], destination, host_read_concurrency=1
         )
         adjacent_record_ms, adjacent_batch_ms, _elapsed = module._measure_adjacent(
             fd, (records,), destination
@@ -288,8 +288,8 @@ def test_read_helpers_fail_closed_on_short_nonadjacent_and_wrong_coverage(
     [
         (0, (1, 32), 32, "operations"),
         (31, (1, 32), 32, "operations"),
-        (32, (0, 32), 32, "queue depth"),
-        (32, (1, 33), 32, "queue depth"),
+        (32, (0, 32), 32, "host read concurrency"),
+        (32, (1, 33), 32, "host read concurrency"),
         (32, (1, 32), 0, "batch records"),
         (64, (1, 32), 64, "batch records"),
     ],
@@ -304,8 +304,23 @@ def test_config_rejects_invalid_operations_and_queue_depths(
     with pytest.raises(module.BenchmarkContractError, match=match):
         module.validate_config(
             operations=operations,
-            queue_depths=queue_depths,
+            host_read_concurrencies=queue_depths,
             batch_records=batch_records,
+            repeats=4,
+        )
+
+
+def test_config_requires_balanced_even_repeats_and_defaults_to_four() -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args(["/model", "/manifest"])
+    assert defaults.repeats == 4
+    assert defaults.host_read_concurrencies == "1,32"
+    with pytest.raises(module.BenchmarkContractError, match="even"):
+        module.validate_config(
+            operations=32,
+            host_read_concurrencies=(1, 32),
+            batch_records=32,
             repeats=3,
         )
 
@@ -355,15 +370,16 @@ def _manifest_fixture(module):
     )
     records = tuple(
         SimpleNamespace(
-            layer=1,
+            layer=layer,
             expert=expert,
             logical_bytes=module.HY3_RECORD_BYTES,
             segments=segments,
-            sidecar_offset=expert * module.HY3_RECORD_BYTES,
+            sidecar_offset=((layer - 1) * 192 + expert) * module.HY3_RECORD_BYTES,
             sidecar_length=module.HY3_RECORD_BYTES,
-            sha256=f"digest-{expert}",
+            sha256=f"digest-{layer}-{expert}",
         )
-        for expert in range(2)
+        for layer in range(1, 80)
+        for expert in range(192)
     )
     return SimpleNamespace(
         model_key="hy3-q4",
@@ -373,7 +389,13 @@ def _manifest_fixture(module):
         quant_group_size=64,
         quant_mode="affine",
         records=records,
-        sidecar=SimpleNamespace(file="experts.bin", sha256="sidecar", size=1),
+        manifest_sha256="8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+        sidecar=SimpleNamespace(
+            file="experts.bin",
+            alignment=16_384,
+            sha256="5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae",
+            size=161_036_107_776,
+        ),
     )
 
 
@@ -396,10 +418,40 @@ def test_manifest_contract_pins_revision_quantization_and_every_record() -> None
         }
     )
     bad_manifest = SimpleNamespace(
-        **{**vars(manifest), "records": (manifest.records[0], bad_record)}
+        **{
+            **vars(manifest),
+            "records": (manifest.records[0], bad_record, *manifest.records[2:]),
+        }
     )
     with pytest.raises(module.BenchmarkContractError, match="record geometry"):
         module.validate_manifest_contract(bad_manifest)
+
+    truncated = SimpleNamespace(**{**vars(manifest), "records": manifest.records[:-1]})
+    with pytest.raises(module.BenchmarkContractError, match="record corpus"):
+        module.validate_manifest_contract(truncated)
+
+    wrong_offset = SimpleNamespace(
+        **{**vars(manifest.records[1]), "sidecar_offset": module.HY3_RECORD_BYTES + 1}
+    )
+    bad_offsets = SimpleNamespace(
+        **{
+            **vars(manifest),
+            "records": (manifest.records[0], wrong_offset, *manifest.records[2:]),
+        }
+    )
+    with pytest.raises(
+        module.BenchmarkContractError, match="record identity or offset"
+    ):
+        module.validate_manifest_contract(bad_offsets)
+
+    wrong_digest = SimpleNamespace(
+        **{
+            **vars(manifest),
+            "sidecar": SimpleNamespace(**{**vars(manifest.sidecar), "sha256": "wrong"}),
+        }
+    )
+    with pytest.raises(module.BenchmarkContractError, match="pinned Hy3"):
+        module.validate_manifest_contract(wrong_digest)
 
 
 def test_harness_provenance_includes_source_and_environment_identity() -> None:
@@ -414,14 +466,31 @@ def test_harness_provenance_includes_source_and_environment_identity() -> None:
     assert provenance["mlx_version"]
 
 
-def test_result_distinguishes_io_queue_depth_from_batch_width() -> None:
+def test_artifact_provenance_marks_sidecar_digest_as_declared_not_fully_verified() -> (
+    None
+):
+    module = _load_module()
+    manifest = _manifest_fixture(module)
+
+    provenance = module.artifact_provenance(
+        manifest,
+        Path("/manifest.json"),
+        Path("/experts.bin"),
+    )
+
+    assert provenance["declared_sidecar_sha256"] == manifest.sidecar.sha256
+    assert provenance["full_sidecar_sha256_verified"] is False
+    assert "sidecar_sha256" not in provenance
+
+
+def test_result_distinguishes_host_read_concurrency_from_batch_width() -> None:
     module = _load_module()
 
     result = module._result(
         repeat=0,
         arm="record-arena",
         lane="adjacent-batch",
-        io_queue_depth=1,
+        host_read_concurrency=1,
         batch_records=32,
         record_count=32,
         record_bytes=4,
@@ -430,9 +499,9 @@ def test_result_distinguishes_io_queue_depth_from_batch_width() -> None:
         elapsed=1.0,
     )
 
-    assert result["io_queue_depth"] == 1
+    assert result["host_read_concurrency"] == 1
     assert result["batch_records"] == 32
-    assert "queue_depth" not in result
+    assert "io_queue_depth" not in result
 
 
 def test_payload_preserves_exact_command_config_provenance_and_latency_metrics() -> (
@@ -442,11 +511,14 @@ def test_payload_preserves_exact_command_config_provenance_and_latency_metrics()
     command = ["uv", "run", "scripts/benchmark_hy3_record_destinations.py", "/m", "/x"]
     config = {
         "operations": 64,
-        "queue_depths": [1, 32],
+        "host_read_concurrencies": [1, 32],
         "batch_records": 32,
-        "repeats": 3,
+        "repeats": 4,
     }
-    provenance = {"manifest_sha256": "manifest", "sidecar_sha256": "sidecar"}
+    provenance = {
+        "manifest_sha256": "manifest",
+        "declared_sidecar_sha256": "sidecar",
+    }
     results = [
         {
             "arm": "record-arena",
@@ -477,6 +549,8 @@ def test_payload_preserves_exact_command_config_provenance_and_latency_metrics()
     assert payload["mechanism"] == "destination/layout efficiency"
     assert payload["io_contract"]["syscall"] == "os.preadv"
     assert payload["io_contract"]["claims_syscall_elimination"] is False
+    assert payload["io_contract"]["metal_reads_issued"] is False
+    assert payload["io_contract"]["claims_runtime_fence_safety"] is False
     assert payload["results"][0]["record_latency_ms"]["p50"] == 2.0
     assert payload["results"][0]["record_latency_ms"]["p95"] == 3.0
 
@@ -495,10 +569,14 @@ def test_open_sidecar_requires_and_applies_f_nocache(
         lambda fd, command, value: calls.append((fd, command, value)),
     )
 
-    with module.open_sidecar_nocache(sidecar) as fd:
+    with module.open_sidecar_nocache(sidecar, expected_size=6) as fd:
         assert fd >= 0
     assert len(calls) == 1
     assert calls[0][1:] == (48, 1)
+
+    with pytest.raises(module.BenchmarkContractError, match="sidecar size"):
+        with module.open_sidecar_nocache(sidecar, expected_size=7):
+            pass
 
     monkeypatch.delattr(module.fcntl, "F_NOCACHE", raising=False)
     with pytest.raises(module.BenchmarkContractError, match="F_NOCACHE"):

@@ -45,9 +45,19 @@ HY3_COMPONENT_LENGTHS = tuple(
     component.length for component in HY3_RECORD_Q4_LAYOUT.components
 )
 _ARMS = ("record-arena", "component-rows")
-_ALLOWED_QUEUE_DEPTHS = (1, 32)
+_ALLOWED_HOST_READ_CONCURRENCIES = (1, 32)
 _PINNED_SOURCE_REPO = "pipenetwork/Hy3-4bit"
 _PINNED_SOURCE_REVISION = "160619d3f96c8470350b6dac0ef033a8381551e3"
+_PINNED_MANIFEST_SHA256 = (
+    "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4"
+)
+_PINNED_SIDECAR_SHA256 = (
+    "5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae"
+)
+_HY3_ROUTED_LAYERS = 79
+_HY3_EXPERTS = 192
+_HY3_RECORD_COUNT = _HY3_ROUTED_LAYERS * _HY3_EXPERTS
+_HY3_SIDECAR_BYTES = _HY3_RECORD_COUNT * HY3_RECORD_BYTES
 
 
 class BenchmarkContractError(ValueError):
@@ -362,7 +372,7 @@ def run_parity_preflight(
 def validate_config(
     *,
     operations: int,
-    queue_depths: Sequence[int],
+    host_read_concurrencies: Sequence[int],
     batch_records: int,
     repeats: int,
 ) -> None:
@@ -370,22 +380,26 @@ def validate_config(
     batch_records = _exact_positive("batch records", batch_records)
     if batch_records > 32:
         raise BenchmarkContractError("batch records must not exceed 32")
-    _exact_positive("repeats", repeats)
-    depths = tuple(queue_depths)
-    if not depths:
-        raise BenchmarkContractError("queue depths must not be empty")
-    if any(
-        isinstance(depth, bool)
-        or not isinstance(depth, int)
-        or depth not in _ALLOWED_QUEUE_DEPTHS
-        for depth in depths
-    ):
-        raise BenchmarkContractError("queue depth must be 1 or 32")
-    if len(set(depths)) != len(depths):
-        raise BenchmarkContractError("queue depths must be unique")
-    if operations % max(depths) or operations % batch_records:
+    repeats = _exact_positive("repeats", repeats)
+    if repeats < 4 or repeats % 2:
         raise BenchmarkContractError(
-            "operations must divide evenly across queue depth and batch records"
+            "repeats must be an even integer of at least 4 for balanced arm order"
+        )
+    concurrencies = tuple(host_read_concurrencies)
+    if not concurrencies:
+        raise BenchmarkContractError("host read concurrencies must not be empty")
+    if any(
+        isinstance(concurrency, bool)
+        or not isinstance(concurrency, int)
+        or concurrency not in _ALLOWED_HOST_READ_CONCURRENCIES
+        for concurrency in concurrencies
+    ):
+        raise BenchmarkContractError("host read concurrency must be 1 or 32")
+    if len(set(concurrencies)) != len(concurrencies):
+        raise BenchmarkContractError("host read concurrencies must be unique")
+    if operations % max(concurrencies) or operations % batch_records:
+        raise BenchmarkContractError(
+            "operations must divide evenly across host concurrency and batch records"
         )
 
 
@@ -478,14 +492,17 @@ def build_payload(
             "syscall": "os.preadv",
             "cache_mode": "F_NOCACHE",
             "claims_syscall_elimination": False,
-            "writes_complete_before_metal_reads": True,
+            "metal_reads_issued": False,
+            "claims_runtime_fence_safety": False,
         },
         "results": results,
     }
 
 
 @contextmanager
-def open_sidecar_nocache(path: Path) -> Iterator[int]:
+def open_sidecar_nocache(
+    path: Path, *, expected_size: int | None = None
+) -> Iterator[int]:
     command = getattr(fcntl, "F_NOCACHE", None)
     if command is None:
         raise BenchmarkContractError("F_NOCACHE is unavailable on this platform")
@@ -495,6 +512,10 @@ def open_sidecar_nocache(path: Path) -> Iterator[int]:
     except OSError as exc:
         raise BenchmarkContractError(f"could not open sidecar: {exc}") from exc
     try:
+        if expected_size is not None and os.fstat(fd).st_size != expected_size:
+            raise BenchmarkContractError(
+                f"sidecar size must equal {expected_size} bytes"
+            )
         try:
             fcntl.fcntl(fd, command, 1)
         except OSError as exc:
@@ -509,7 +530,7 @@ def _measure_individual(
     records: Sequence[RecordRange],
     destination: _Destination,
     *,
-    queue_depth: int,
+    host_read_concurrency: int,
 ) -> tuple[list[float], list[float], float]:
     record_latencies: list[float] = []
     batch_latencies: list[float] = []
@@ -526,9 +547,9 @@ def _measure_individual(
             release_views(views)
 
     wall_started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=queue_depth) as pool:
-        for start in range(0, len(records), queue_depth):
-            batch = records[start : start + queue_depth]
+    with ThreadPoolExecutor(max_workers=host_read_concurrency) as pool:
+        for start in range(0, len(records), host_read_concurrency):
+            batch = records[start : start + host_read_concurrency]
             batch_started = time.perf_counter_ns()
             record_latencies.extend(pool.map(read_one, tuple(enumerate(batch))))
             batch_latencies.append((time.perf_counter_ns() - batch_started) / 1e6)
@@ -566,9 +587,14 @@ def _warm_individual(
     records: Sequence[RecordRange],
     destination: _Destination,
     *,
-    queue_depth: int,
+    host_read_concurrency: int,
 ) -> None:
-    _measure_individual(fd, records, destination, queue_depth=queue_depth)
+    _measure_individual(
+        fd,
+        records,
+        destination,
+        host_read_concurrency=host_read_concurrency,
+    )
 
 
 def _result(
@@ -576,7 +602,7 @@ def _result(
     repeat: int,
     arm: str,
     lane: str,
-    io_queue_depth: int,
+    host_read_concurrency: int,
     batch_records: int,
     record_count: int,
     record_bytes: int,
@@ -589,7 +615,7 @@ def _result(
         "repeat": repeat,
         "arm": arm,
         "lane": lane,
-        "io_queue_depth": io_queue_depth,
+        "host_read_concurrency": host_read_concurrency,
         "batch_records": batch_records,
         "records": record_count,
         "bytes": total_bytes,
@@ -639,6 +665,24 @@ def harness_provenance() -> dict[str, Any]:
     }
 
 
+def artifact_provenance(
+    manifest: Any, manifest_path: Path, sidecar_path: Path
+) -> dict[str, Any]:
+    """Describe pinned artifacts without claiming a full sidecar rehash."""
+
+    return {
+        "model_key": manifest.model_key,
+        "source_repo": manifest.source_repo,
+        "source_revision": manifest.source_revision,
+        "manifest": str(manifest_path),
+        "manifest_sha256": manifest.manifest_sha256,
+        "sidecar": str(sidecar_path),
+        "declared_sidecar_sha256": manifest.sidecar.sha256,
+        "full_sidecar_sha256_verified": False,
+        "sidecar_bytes": manifest.sidecar.size,
+    }
+
+
 def validate_manifest_contract(manifest: Any) -> tuple[int, ...]:
     """Fail closed unless every record matches the pinned Hy3 v1 geometry."""
 
@@ -650,16 +694,37 @@ def validate_manifest_contract(manifest: Any) -> tuple[int, ...]:
         manifest.quant_group_size == 64,
         manifest.quant_mode == "affine",
         manifest.sidecar is not None,
-        bool(manifest.records),
+        manifest.manifest_sha256 == _PINNED_MANIFEST_SHA256,
     )
     if not all(pinned):
         raise BenchmarkContractError("benchmark requires the pinned Hy3 Q4 sidecar")
+    sidecar_pinned = (
+        manifest.sidecar.file == "experts.bin",
+        manifest.sidecar.alignment == HY3_RECORD_Q4_LAYOUT.alignment,
+        manifest.sidecar.sha256 == _PINNED_SIDECAR_SHA256,
+        manifest.sidecar.size == _HY3_SIDECAR_BYTES,
+    )
+    if not all(sidecar_pinned):
+        raise BenchmarkContractError("benchmark requires the pinned Hy3 Q4 sidecar")
+    if len(manifest.records) != _HY3_RECORD_COUNT:
+        raise BenchmarkContractError(
+            f"manifest record corpus must contain {_HY3_RECORD_COUNT} records"
+        )
 
     expected_segments = tuple(
         (component.name, component.length, component.dtype, component.shape)
         for component in HY3_RECORD_Q4_LAYOUT.components
     )
-    for record in manifest.records:
+    for index, record in enumerate(manifest.records):
+        expected_layer, expected_expert = divmod(index, _HY3_EXPERTS)
+        if (
+            record.layer != expected_layer + 1
+            or record.expert != expected_expert
+            or record.sidecar_offset != index * HY3_RECORD_BYTES
+        ):
+            raise BenchmarkContractError(
+                "manifest record identity or offset differs from pinned Hy3 v1"
+            )
         actual_segments = tuple(
             (segment.component, segment.length, segment.dtype, tuple(segment.shape))
             for segment in record.segments
@@ -689,35 +754,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--operations", type=_positive_argument, default=96)
     parser.add_argument("--warmup-operations", type=_positive_argument, default=32)
-    parser.add_argument("--queue-depths", default="1,32")
+    parser.add_argument(
+        "--host-read-concurrencies",
+        default="1,32",
+    )
     parser.add_argument("--batch-records", type=_positive_argument, default=32)
-    parser.add_argument("--repeats", type=_positive_argument, default=3)
+    parser.add_argument("--repeats", type=_positive_argument, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path)
     return parser
 
 
-def _parse_queue_depths(value: str) -> tuple[int, ...]:
+def _parse_host_read_concurrencies(value: str) -> tuple[int, ...]:
     try:
         return tuple(int(item) for item in value.split(",") if item)
     except ValueError as exc:
         raise BenchmarkContractError(
-            "queue depths must be comma-separated integers"
+            "host read concurrencies must be comma-separated integers"
         ) from exc
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    queue_depths = _parse_queue_depths(args.queue_depths)
+    host_read_concurrencies = _parse_host_read_concurrencies(
+        args.host_read_concurrencies
+    )
     validate_config(
         operations=args.operations,
-        queue_depths=queue_depths,
+        host_read_concurrencies=host_read_concurrencies,
         batch_records=args.batch_records,
         repeats=args.repeats,
     )
-    if args.warmup_operations % max(queue_depths):
+    if args.warmup_operations % max(host_read_concurrencies):
         raise BenchmarkContractError(
-            "warmup operations must divide evenly across the largest queue depth"
+            "warmup operations must divide evenly across the largest host concurrency"
         )
 
     root = args.model_root.expanduser().resolve()
@@ -735,7 +805,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import mlx.core as mx
 
-    capacity = max((*queue_depths, args.batch_records))
+    capacity = max((*host_read_concurrencies, args.batch_records))
     arena, rows = allocate_destinations(
         capacity=capacity,
         record_bytes=HY3_RECORD_BYTES,
@@ -747,7 +817,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sidecar_path = resolve_artifact_member(root, manifest.sidecar.file)
     results: list[dict[str, Any]] = []
     try:
-        with open_sidecar_nocache(sidecar_path) as fd:
+        with open_sidecar_nocache(sidecar_path, expected_size=_HY3_SIDECAR_BYTES) as fd:
             sentinels = (
                 ranges[0],
                 ranges[len(ranges) // 2],
@@ -758,25 +828,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             for repeat in range(args.repeats):
                 for arm in arm_order(repeat):
                     destination = destinations[arm]
-                    for depth in queue_depths:
+                    for concurrency in host_read_concurrencies:
                         _warm_individual(
                             fd,
                             warm_records,
                             destination,
-                            queue_depth=depth,
+                            host_read_concurrency=concurrency,
                         )
                         record_ms, batch_ms, elapsed = _measure_individual(
                             fd,
                             workload.individual,
                             destination,
-                            queue_depth=depth,
+                            host_read_concurrency=concurrency,
                         )
                         results.append(
                             _result(
                                 repeat=repeat,
                                 arm=arm,
                                 lane="individual",
-                                io_queue_depth=depth,
+                                host_read_concurrency=concurrency,
                                 batch_records=1,
                                 record_count=len(workload.individual),
                                 record_bytes=HY3_RECORD_BYTES,
@@ -798,7 +868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             repeat=repeat,
                             arm=arm,
                             lane="adjacent-batch",
-                            io_queue_depth=1,
+                            host_read_concurrency=1,
                             batch_records=args.batch_records,
                             record_count=args.operations,
                             record_bytes=HY3_RECORD_BYTES,
@@ -815,7 +885,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = {
         "operations": args.operations,
         "warmup_operations": args.warmup_operations,
-        "queue_depths": list(queue_depths),
+        "host_read_concurrencies": list(host_read_concurrencies),
         "batch_records": args.batch_records,
         "repeats": args.repeats,
         "seed": args.seed,
@@ -828,14 +898,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         provenance={
             "git_commit": _git_commit(),
             "harness": harness_provenance(),
-            "model_key": manifest.model_key,
-            "source_repo": manifest.source_repo,
-            "source_revision": manifest.source_revision,
-            "manifest": str(manifest_path),
-            "manifest_sha256": manifest.manifest_sha256,
-            "sidecar": str(sidecar_path),
-            "sidecar_sha256": manifest.sidecar.sha256,
-            "sidecar_bytes": manifest.sidecar.size,
+            **artifact_provenance(manifest, manifest_path, sidecar_path),
             "host": {
                 "platform": platform.platform(),
                 "python": platform.python_version(),
