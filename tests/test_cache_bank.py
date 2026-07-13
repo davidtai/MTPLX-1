@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 import mlx.core as mx
 
 from mtplx.cache_bank import SessionBankColdTier
+from mtplx.cache_bank import cold_tier as cold_tier_module
 from mtplx.cache_bank.codec import decode_payload, encode_payload
 from mtplx.cache_state import CacheSnapshot
 from mtplx.session_bank import SessionBank
@@ -49,6 +51,52 @@ def test_cache_bank_codec_round_trips_nested_snapshot():
     assert decoded.logits.tolist() == logits.tolist()
     assert decoded.hidden.dtype == mx.bfloat16
     assert decoded.hidden.shape == hidden.shape
+
+
+def test_cold_tier_serializes_mlx_payload_on_calling_thread(tmp_path, monkeypatch):
+    """SSD workers must never traverse MLX arrays owned by the model thread."""
+    caller_thread = threading.get_ident()
+    encoded_threads: list[int] = []
+    encoded = threading.Event()
+    original_encode = cold_tier_module.encode_payload
+
+    def tracked_encode_payload(**kwargs):
+        encoded_threads.append(threading.get_ident())
+        try:
+            return original_encode(**kwargs)
+        finally:
+            encoded.set()
+
+    monkeypatch.setattr(cold_tier_module, "encode_payload", tracked_encode_payload)
+    cold = SessionBankColdTier(
+        base_dir=tmp_path / "session-bank",
+        mode="on",
+        min_prefix_tokens=2,
+    )
+    try:
+        bank = SessionBank(
+            max_entries=1,
+            max_bytes=1024 * 1024,
+            per_session_max_bytes=1024 * 1024,
+            cold_tier=cold,
+        )
+        bank.put_snapshot(
+            runtime=FakeRuntime(),
+            token_ids=[1, 2, 3],
+            cache_snapshot=CacheSnapshot(
+                states=((mx.arange(16, dtype=mx.int32),),),
+                meta_states=(),
+            ),
+            logits=mx.zeros((1, 4)),
+            hidden=None,
+            snapshot_epoch=3,
+            nbytes_override=1024,
+        )
+
+        assert encoded.wait(timeout=2.0)
+        assert encoded_threads == [caller_thread]
+    finally:
+        cold.close()
 
 
 def test_cache_bank_codec_chunks_large_sequence_tensors():
