@@ -30,3 +30,12 @@ variation 0.0 and sample agreement 1.0 on every probed cell
 gate). Speculative acceptance remains mathematically exact with respect to
 the verify-computed target distribution. Do not use for bit-exactness QA
 (`mtplx qa exactness` reference runs, batch-equivalence gates).
+
+## Closed kernel experiments
+
+The standalone dense-logit top-k/logsumexp Metal probe is closed and is not a
+runtime dispatch option. It preserved sparse target distributions, but was
+slower than the stock batched MLX sampler on the 4x151936 verifier shape.
+Revisit only as part of a larger accept/reject or LM-head fusion that removes
+more than the standalone target-distribution boundary. The removed probe
+remains available in Git history before the default-branch cleanup.

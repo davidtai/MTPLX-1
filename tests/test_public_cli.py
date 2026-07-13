@@ -5102,11 +5102,16 @@ def test_debug_hotpath_reports_next_kernel_boundary(capsys):
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
     assert payload["action"] == "debug hotpath"
-    names = {row["name"] for row in payload["boundaries"]}
+    boundaries = {row["name"]: row for row in payload["boundaries"]}
+    names = set(boundaries)
     assert "verify_output_eval" in names
     assert "native_rowwise_mlp" in names
     assert "native_residual_mlp" in names
     assert "fused_logits_topk_distribution" in names
+    assert (
+        boundaries["fused_logits_topk_distribution"]["file"]
+        == "docs/turbo-verify.md"
+    )
     assert "external_vllm_partitioned_fallback" in names
     assert payload["raw_sync_markers"]["native_mlp_is_mlx_primitive"] is True
     assert (

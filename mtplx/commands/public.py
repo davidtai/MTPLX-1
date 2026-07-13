@@ -13555,7 +13555,7 @@ def _hotpath_boundary_report() -> dict[str, Any]:
         / "verify_mlp"
         / "gdn_tail"
         / "gdn_tail.cpp",
-        "logits_topk": root / "mtplx" / "kernels" / "logits_topk.py",
+        "logits_topk": root / "docs" / "turbo-verify.md",
     }
     boundaries = [
         {
