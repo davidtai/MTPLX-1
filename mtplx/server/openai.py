@@ -34,6 +34,7 @@ import uuid
 import webbrowser
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -82,6 +83,15 @@ from mtplx.gemma4_pair import (
     is_gemma4_pair_repo_id,
     resolve_gemma4_pair_paths,
 )
+from mtplx.hy3_q4_context import (
+    HY3_Q4_CONTEXT_WINDOW,
+    ContextAdmission,
+    ContextLimitExceeded,
+    SequenceBusyError,
+    SequenceLease,
+    SingleSequenceGate,
+    admit_hy3_q4_context,
+)
 from mtplx.model_scheduler import ModelWorkScheduler
 from mtplx.sampling import SamplerConfig
 from mtplx.profiles import (
@@ -97,6 +107,7 @@ from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
     normalize_paged_kv_quantization,
     resolve_api_key,
+    validate_hy3_q4_dynamic_context_options,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
 from mtplx.fan_mode import (
@@ -1441,6 +1452,13 @@ class ServerState:
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
         apply_paged_kv_quantization_env(args.paged_kv_quantization)
+        self.hy3_q4_dynamic_context = validate_hy3_q4_dynamic_context_options(
+            args,
+            self.expert_streaming_load_kwargs.get("expert_streaming_config"),
+        )
+        self.hy3_q4_sequence_gate = (
+            SingleSequenceGate() if self.hy3_q4_dynamic_context else None
+        )
         self.model_id = args.model_id
         self.started_at_s = time.time()
         self.lock = Lock()
@@ -1643,6 +1661,11 @@ class ServerState:
             max(4_096, min(int(self.model_context_window_max), requested_context_window))
             if requested_context_window > 0
             else int(self.model_context_window_max)
+        )
+        validate_hy3_q4_dynamic_context_options(
+            args,
+            self.expert_streaming_load_kwargs.get("expert_streaming_config"),
+            resolved_context_window=self.context_window,
         )
         _startup_line(f"[5/6] Context window: {self.context_window} tokens")
         self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
@@ -9773,6 +9796,31 @@ def _request_max_tokens(request: BaseModel) -> int | None:
     return None if alias is None else int(alias)
 
 
+async def _validate_hy3_q4_raw_max_tokens(
+    raw_request: Request,
+    state: Any,
+    *,
+    fields: tuple[str, ...] = ("max_tokens",),
+) -> None:
+    """Reject JSON numeric coercion before the strict lane does any work."""
+
+    if not _hy3_q4_dynamic_context_enabled(state):
+        return
+    payload = await raw_request.json()
+    if not isinstance(payload, Mapping):
+        return
+    for field in fields:
+        value = payload.get(field)
+        if value is not None and type(value) is not int:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{field} must be an exact integer in the Hy3 Q4 "
+                    "dynamic-context lane"
+                ),
+            )
+
+
 def _is_opencode_title_request(request: ChatCompletionRequest) -> bool:
     """Detect OpenCode's auxiliary thread-title call.
 
@@ -11799,7 +11847,10 @@ def _session_keep_live_refs_for_request(
     session_source: str | None,
     session_id: str | None,
     tool_names: list[str] | tuple[str, ...] | None = None,
+    allow_live_refs: bool = True,
 ) -> bool:
+    if not allow_live_refs:
+        return False
     if os.environ.get(
         "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", ""
     ).strip().lower() in {"1", "true", "yes", "on"}:
@@ -14083,6 +14134,51 @@ def _uncapped_response_lease_tokens_from_env() -> int | None:
         return None
 
 
+def _hy3_q4_dynamic_context_enabled(state: Any) -> bool:
+    return bool(getattr(getattr(state, "args", None), "hy3_q4_dynamic_context", False))
+
+
+def _hy3_q4_context_health(state: Any) -> dict[str, object]:
+    enabled = _hy3_q4_dynamic_context_enabled(state)
+    gate = getattr(state, "hy3_q4_sequence_gate", None)
+    if gate is not None:
+        snapshot = gate.snapshot()
+    else:
+        snapshot = {
+            "admission_state": "none",
+            "active_request_id": None,
+            "model_context_limit_tokens": HY3_Q4_CONTEXT_WINDOW,
+            "rendered_input_tokens": None,
+            "requested_output_tokens": None,
+            "admitted_total_tokens": None,
+            "active_admission": None,
+            "last_admission": None,
+        }
+    return {"enabled": enabled, **snapshot}
+
+
+def _admit_hy3_q4_request_context(
+    state: Any,
+    *,
+    prompt_token_count: int,
+    max_tokens: int | None,
+) -> ContextAdmission | None:
+    if not _hy3_q4_dynamic_context_enabled(state):
+        return None
+    rendered_input_tokens = prompt_token_count
+    remaining_context = max(0, int(state.context_window) - rendered_input_tokens)
+    requested_output_tokens = (
+        remaining_context if max_tokens is None else max_tokens
+    )
+    try:
+        return admit_hy3_q4_context(
+            rendered_input_tokens=rendered_input_tokens,
+            requested_output_tokens=requested_output_tokens,
+        )
+    except (ContextLimitExceeded, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _generation_params(
     state: ServerState,
     *,
@@ -14094,10 +14190,23 @@ def _generation_params(
     presence_penalty: float | None = None,
     frequency_penalty: float | None = None,
 ) -> tuple[int, SamplerConfig, dict[str, Any]]:
-    remaining_context = max(1, int(state.context_window) - int(prompt_token_count))
+    hy3_q4_dynamic_context = _hy3_q4_dynamic_context_enabled(state)
+    remaining_context = max(
+        0 if hy3_q4_dynamic_context else 1,
+        int(state.context_window) - int(prompt_token_count),
+    )
     request_max_tokens = None if max_tokens is None else int(max_tokens)
+    admission = _admit_hy3_q4_request_context(
+        state,
+        prompt_token_count=prompt_token_count,
+        max_tokens=request_max_tokens,
+    )
     semantic_requested_max = (
-        remaining_context if request_max_tokens is None else request_max_tokens
+        admission.requested_output_tokens
+        if admission is not None
+        else remaining_context
+        if request_max_tokens is None
+        else request_max_tokens
     )
     before_server_cap = semantic_requested_max
     server_max_response_tokens = state.args.max_response_tokens
@@ -14106,8 +14215,22 @@ def _generation_params(
             semantic_requested_max, int(state.args.max_response_tokens)
         )
     after_server_cap = semantic_requested_max
-    semantic_effective_max = max(1, min(after_server_cap, remaining_context))
+    semantic_effective_max = max(
+        0 if hy3_q4_dynamic_context else 1,
+        min(after_server_cap, remaining_context),
+    )
     decode_lease_tokens = semantic_effective_max
+    admission_limits = (
+        admission.to_dict()
+        if admission is not None
+        else {
+            "model_context_limit_tokens": int(state.context_window),
+            "rendered_input_tokens": int(prompt_token_count),
+            "requested_output_tokens": int(semantic_requested_max),
+            "admitted_total_tokens": int(prompt_token_count)
+            + int(semantic_effective_max),
+        }
+    )
     uncapped_response_requested = request_max_tokens is None
     uncapped_response_lease_tokens: int | None = None
     uncapped_response_lease_applied = False
@@ -14115,7 +14238,8 @@ def _generation_params(
         uncapped_response_lease_tokens = _uncapped_response_lease_tokens_from_env()
         if uncapped_response_lease_tokens is not None:
             decode_lease_tokens = max(
-                1, min(semantic_effective_max, uncapped_response_lease_tokens)
+                0 if hy3_q4_dynamic_context else 1,
+                min(semantic_effective_max, uncapped_response_lease_tokens),
             )
             uncapped_response_lease_applied = decode_lease_tokens < semantic_effective_max
     sampler_temperature = (
@@ -14147,6 +14271,7 @@ def _generation_params(
         decode_lease_tokens,
         sampler,
         {
+            **admission_limits,
             "request_max_tokens": request_max_tokens,
             "server_max_response_tokens": (
                 None
@@ -14264,6 +14389,8 @@ def _use_live_ar_batch(
     *,
     effective_mode: str,
 ) -> tuple[bool, str | None]:
+    if _hy3_q4_dynamic_context_enabled(state):
+        return False, "hy3_q4_dynamic_context"
     config = _scheduler_config_from_args(state.args)
     if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
         return False, None
@@ -14273,6 +14400,136 @@ def _use_live_ar_batch(
     if fallback_reason is None:
         return False, None
     return True, fallback_reason
+
+
+def _hy3_q4_session_bank_policy(
+    state: Any,
+    *,
+    session_bank: Any | None,
+    session_keep_live_ref: bool,
+) -> tuple[Any | None, bool]:
+    if _hy3_q4_dynamic_context_enabled(state):
+        return None, False
+    return session_bank, bool(session_keep_live_ref)
+
+
+def _acquire_hy3_q4_sequence(
+    state: Any,
+    *,
+    request_id: str,
+    admission: ContextAdmission,
+) -> SequenceLease | None:
+    if not _hy3_q4_dynamic_context_enabled(state):
+        return None
+    gate = getattr(state, "hy3_q4_sequence_gate", None)
+    if gate is None:
+        gate = SingleSequenceGate()
+        state.hy3_q4_sequence_gate = gate
+    try:
+        return gate.acquire(request_id, admission=admission)
+    except SequenceBusyError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="hy3_q4_dynamic_context sequence is busy",
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
+_HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY = "mtplx.hy3_q4_sequence_lease"
+
+
+def _bind_hy3_q4_http_sequence(
+    raw_request: Request,
+    state: Any,
+    *,
+    request_id: str,
+    admission: ContextAdmission | None,
+) -> SequenceLease | None:
+    if admission is None:
+        return None
+    scope_state = raw_request.scope.setdefault("state", {})
+    existing = scope_state.get(_HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY)
+    if existing is not None:
+        return existing
+    lease = _acquire_hy3_q4_sequence(
+        state,
+        request_id=request_id,
+        admission=admission,
+    )
+    scope_state[_HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY] = lease
+    return lease
+
+
+def _start_stream_generation_worker(
+    raw_request: Request,
+    target: Callable[[], None],
+    *,
+    name: str,
+) -> Thread:
+    """Start a stream worker while retaining any HTTP-owned sequence."""
+
+    scope_state = raw_request.scope.get("state") or {}
+    sequence_lease = scope_state.get(_HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY)
+    worker_hold = sequence_lease.hold() if sequence_lease is not None else None
+
+    def run_with_terminal_handoff() -> None:
+        try:
+            target()
+        finally:
+            if worker_hold is not None:
+                worker_hold.release("generation_worker_terminal")
+
+    thread = Thread(
+        target=run_with_terminal_handoff,
+        name=name,
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except BaseException:
+        if worker_hold is not None:
+            worker_hold.release("generation_worker_start_failed")
+        raise
+    return thread
+
+
+async def _run_nonstream_generation_offload(
+    raw_request: Request,
+    target: Callable[[], Any],
+) -> Any:
+    """Run non-stream work without cancelling its strict-lane ownership."""
+
+    scope_state = raw_request.scope.get("state") or {}
+    sequence_lease = scope_state.get(_HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY)
+    if sequence_lease is None:
+        return await asyncio.to_thread(target)
+
+    worker_hold = sequence_lease.hold()
+    try:
+        context = copy_context()
+
+        def run_with_terminal_handoff() -> Any:
+            try:
+                return context.run(target)
+            finally:
+                worker_hold.release("generation_worker_terminal")
+
+        worker_future = asyncio.get_running_loop().run_in_executor(
+            None,
+            run_with_terminal_handoff,
+        )
+    except BaseException:
+        worker_hold.release("generation_worker_submit_failed")
+        raise
+
+    def consume_late_exception(done: asyncio.Future[Any]) -> None:
+        try:
+            done.exception()
+        except BaseException:
+            pass
+
+    worker_future.add_done_callback(consume_late_exception)
+    return await asyncio.shield(worker_future)
 
 
 def _ar_batch_history_bypass_reason(
@@ -14504,6 +14761,22 @@ _SMART_FAN_ARRIVAL_PATHS = {
 }
 
 
+class _Hy3Q4SequenceLeaseMiddleware:
+    """Release an HTTP-owned lane lease after the complete response body."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            scope_state = scope.get("state") or {}
+            lease = scope_state.pop(_HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY, None)
+            if lease is not None:
+                lease.release("http_response_complete")
+
+
 class _SmartFanArrivalMiddleware:
     """Issue the Smart-mode fan ramp at HTTP request arrival.
 
@@ -14553,6 +14826,55 @@ def _runtime_kv_admission(runtime: Any, tokens: int):
 
 
 def _run_generation_dispatched(
+    state: ServerState,
+    prompt_ids: list[int],
+    *,
+    batch_key: str,
+    response_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    request_id = response_id or str(
+        (kwargs.get("request_observability") or {}).get("request_id")
+        or f"hy3-q4-{uuid.uuid4().hex}"
+    )
+    sequence_lease = None
+    owns_sequence_lease = False
+    if _hy3_q4_dynamic_context_enabled(state):
+        admission = _admit_hy3_q4_request_context(
+            state,
+            prompt_token_count=len(prompt_ids),
+            max_tokens=kwargs.get("max_tokens"),
+        )
+        assert admission is not None
+        gate = getattr(state, "hy3_q4_sequence_gate", None)
+        if gate is None or gate.active_request_id != request_id:
+            sequence_lease = _acquire_hy3_q4_sequence(
+                state,
+                request_id=request_id,
+                admission=admission,
+            )
+            owns_sequence_lease = sequence_lease is not None
+    kwargs["session_bank"], kwargs["session_keep_live_ref"] = (
+        _hy3_q4_session_bank_policy(
+            state,
+            session_bank=kwargs.get("session_bank"),
+            session_keep_live_ref=bool(kwargs.get("session_keep_live_ref", True)),
+        )
+    )
+    try:
+        return _run_generation_dispatched_inner(
+            state,
+            prompt_ids,
+            batch_key=batch_key,
+            response_id=response_id,
+            **kwargs,
+        )
+    finally:
+        if owns_sequence_lease and sequence_lease is not None:
+            sequence_lease.release("generation_terminal")
+
+
+def _run_generation_dispatched_inner(
     state: ServerState,
     prompt_ids: list[int],
     *,
@@ -14733,6 +15055,11 @@ def _run_generation(
     streaming_response: bool | None = None,
     vision_splice: Any | None = None,
 ) -> dict[str, Any]:
+    session_bank, session_keep_live_ref = _hy3_q4_session_bank_policy(
+        state,
+        session_bank=session_bank,
+        session_keep_live_ref=session_keep_live_ref,
+    )
     response_max, sampler, generation_limits = _generation_params(
         state,
         prompt_token_count=len(prompt_ids),
@@ -15281,6 +15608,23 @@ def _warmup_ladder_contexts(state: Any) -> list[int]:
     return sorted(contexts)
 
 
+def _run_warmup_generation(
+    state: Any,
+    prompt_ids: list[int],
+    *,
+    batch_key: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    if _hy3_q4_dynamic_context_enabled(state):
+        return _run_generation_dispatched(
+            state,
+            prompt_ids,
+            batch_key=batch_key,
+            **kwargs,
+        )
+    return _run_generation(state, prompt_ids, **kwargs)
+
+
 class _ForegroundYield:
     """Duck-typed cancel event that trips when foreground work is queued.
 
@@ -15447,9 +15791,10 @@ class _BackgroundWarmup:
     def _ladder_generation(self, context_tokens: int) -> dict[str, Any]:
         repeats = context_tokens // max(1, len(self.prompt_ids)) + 1
         prompt_ids = (list(self.prompt_ids) * repeats)[:context_tokens]
-        return _run_generation(
+        return _run_warmup_generation(
             self.state,
             prompt_ids,
+            batch_key="warmup.background",
             max_tokens=8,
             temperature=self.state.args.temperature,
             top_p=self.state.args.top_p,
@@ -15540,20 +15885,31 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
     warmup_heartbeat = _startup_heartbeat("warmup still running", interval_s=5.0)
     try:
         prompt_ids = _encode_prompt(state.runtime.tokenizer, "MTPLX warmup.")
-        generated = _submit_foreground_model_work(
-            state,
-            lambda: _run_generation(
+
+        def run_initial_warmup() -> dict[str, Any]:
+            return _run_warmup_generation(
                 state,
                 prompt_ids,
+                batch_key="startup.warmup.inner",
                 max_tokens=warmup_tokens,
                 temperature=state.args.temperature,
                 top_p=state.args.top_p,
                 top_k=state.args.top_k,
                 seed=0,
                 request_observability={"warmup": True},
-            ),
-            batch_key="startup.warmup",
-        ).result()
+            )
+
+        if _hy3_q4_dynamic_context_enabled(state):
+            # The lane dispatch acquires its single-sequence lease before it
+            # submits model work. Calling it from inside the scheduler would
+            # reverse that order relative to HTTP requests (scheduler -> lane).
+            generated = run_initial_warmup()
+        else:
+            generated = _submit_foreground_model_work(
+                state,
+                run_initial_warmup,
+                batch_key="startup.warmup",
+            ).result()
     except BaseException as exc:
         status.update(
             {
@@ -15579,7 +15935,15 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
         }
     )
     if _extended_warmup_enabled():
-        if _background_warmup_enabled():
+        if _hy3_q4_dynamic_context_enabled(state):
+            # Extended warmup runs from an idle scheduler callback in the
+            # legacy path. Skip it for the strict lane so every generation
+            # keeps the single authoritative lane -> scheduler lock order.
+            status["extended"] = {
+                "mode": "skipped",
+                "reason": "hy3_q4_single_sequence",
+            }
+        elif _background_warmup_enabled():
             # Lane E2: run the extended pass on the idle model lane instead
             # of blocking startup. The status key is created here — before
             # the server accepts requests — so /health readers never race a
@@ -15615,9 +15979,10 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
                 long_ids = (list(prompt_ids) * repeats)[:2560]
                 gen = _submit_foreground_model_work(
                     state,
-                    lambda: _run_generation(
+                    lambda: _run_warmup_generation(
                         state,
                         long_ids,
+                        batch_key="startup.warmup_extended.inner",
                         max_tokens=8,
                         temperature=state.args.temperature,
                         top_p=state.args.top_p,
@@ -18287,6 +18652,7 @@ def create_app(state: ServerState) -> FastAPI:
     # (the most recently added Starlette middleware runs first): fans only
     # ramp for requests that passed the API-key and rate-limit gates.
     app.add_middleware(_SmartFanArrivalMiddleware, state=state)
+    app.add_middleware(_Hy3Q4SequenceLeaseMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -18506,6 +18872,7 @@ def create_app(state: ServerState) -> FastAPI:
                 state.args.strip_assistant_reasoning_history
             ),
             "context_window": state.context_window,
+            "hy3_q4_dynamic_context": _hy3_q4_context_health(state),
             "max_response_tokens": state.args.max_response_tokens,
             "api_key_required": bool(state.args.api_key),
             "api_key_source": str(
@@ -19645,6 +20012,11 @@ def create_app(state: ServerState) -> FastAPI:
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+        await _validate_hy3_q4_raw_max_tokens(
+            raw_request,
+            state,
+            fields=("max_tokens", "max_completion_tokens"),
+        )
         headers = dict(raw_request.headers)
         metadata = _request_metadata(request)
         request_max_tokens = _request_max_tokens(request)
@@ -19951,6 +20323,17 @@ def create_app(state: ServerState) -> FastAPI:
             ]
             template_observability["aime_visible_working"] = True
             template_observability["aime_visible_working_prompt_close"] = True
+        hy3_q4_admission = _admit_hy3_q4_request_context(
+            state,
+            prompt_token_count=len(prompt_ids),
+            max_tokens=request_max_tokens,
+        )
+        _bind_hy3_q4_http_sequence(
+            raw_request,
+            state,
+            request_id=response_id,
+            admission=hy3_q4_admission,
+        )
         request_depth, short_depth_policy = _opencode_short_context_depth_policy(
             request,
             headers=headers,
@@ -20277,6 +20660,9 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
+            allow_live_refs=bool(
+                getattr(state.args, "session_bank_live_refs", True)
+            ),
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:
@@ -20339,6 +20725,19 @@ def create_app(state: ServerState) -> FastAPI:
             or vision_splice is not None
             else state.sessions.bank
         )
+        session_bank_for_generation, session_keep_live_ref = (
+            _hy3_q4_session_bank_policy(
+                state,
+                session_bank=session_bank_for_generation,
+                session_keep_live_ref=session_keep_live_ref,
+            )
+        )
+        if _hy3_q4_dynamic_context_enabled(state):
+            request_observability["request_session_keep_live_ref"] = False
+            request_observability["request_session_keep_live_ref_reason"] = (
+                "hy3_q4_dynamic_context"
+            )
+            request_observability["live_frontier_policy"] = "snapshot_disabled"
         request_observability["request_session_bank_bypass"] = (
             session_bank_for_generation is None
         )
@@ -21820,11 +22219,11 @@ def create_app(state: ServerState) -> FastAPI:
                         if not generation_future.done():
                             generation_future.set_result(None)
 
-                Thread(
-                    target=run_worker_thread,
+                _start_stream_generation_worker(
+                    raw_request,
+                    run_worker_thread,
                     name=f"mtplx-stream-worker-{response_id[-8:]}",
-                    daemon=True,
-                ).start()
+                )
 
                 def delta_payload_chunk(delta: dict[str, Any]) -> str:
                     payload = {
@@ -23127,7 +23526,10 @@ def create_app(state: ServerState) -> FastAPI:
             )
         )
         try:
-            generated = await asyncio.to_thread(run_nonstream_generation)
+            generated = await _run_nonstream_generation_offload(
+                raw_request,
+                run_nonstream_generation,
+            )
         except EngineSessionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except _StopSequenceHit:
@@ -23364,6 +23766,7 @@ def create_app(state: ServerState) -> FastAPI:
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+        await _validate_hy3_q4_raw_max_tokens(raw_request, state)
         chat_request = _anthropic_to_chat_request(request)
         chat_request.stream = bool(request.stream)
         response = await chat_completions(raw_request, chat_request)
@@ -23445,11 +23848,26 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw_request: Request, request: CompletionRequest) -> Any:
+        await _validate_hy3_q4_raw_max_tokens(raw_request, state)
         headers = dict(raw_request.headers)
         raw_metadata = _request_extra(request, "metadata", {})
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         client_controls_allowed = _client_controls_allowed(headers, metadata)
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
+        model = state.model_id
+        response_id = f"cmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        hy3_q4_admission = _admit_hy3_q4_request_context(
+            state,
+            prompt_token_count=len(prompt_ids),
+            max_tokens=request.max_tokens,
+        )
+        _bind_hy3_q4_http_sequence(
+            raw_request,
+            state,
+            request_id=response_id,
+            admission=hy3_q4_admission,
+        )
         request_generation_mode = _request_generation_mode_for_generation(
             state,
             request,
@@ -23508,9 +23926,6 @@ def create_app(state: ServerState) -> FastAPI:
                     }
                 ]
         stop_sequences = _normalize_stop_sequences(request.stop)
-        model = state.model_id
-        response_id = f"cmpl-{uuid.uuid4().hex}"
-        created = int(time.time())
 
         if request.stream:
             # Real incremental streaming: tokens flow through a queue from the
@@ -23573,11 +23988,11 @@ def create_app(state: ServerState) -> FastAPI:
                         if not generation_future.done():
                             generation_future.set_result(None)
 
-                Thread(
-                    target=run_worker_thread,
+                _start_stream_generation_worker(
+                    raw_request,
+                    run_worker_thread,
                     name=f"mtplx-completion-worker-{response_id[-8:]}",
-                    daemon=True,
-                ).start()
+                )
 
                 def text_chunk(text: str) -> str:
                     payload = {
@@ -23764,7 +24179,8 @@ def create_app(state: ServerState) -> FastAPI:
                 )
 
         try:
-            generated = await asyncio.to_thread(
+            generated = await _run_nonstream_generation_offload(
+                raw_request,
                 lambda: _run_generation_dispatched(
                     state,
                     prompt_ids,
@@ -24224,6 +24640,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Minimum committed prefix length before writing to the SSD SessionBank cache.",
     )
     parser.add_argument(
+        "--session-bank-live-refs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Permit SessionBank to retain live KV references. The Hy3 Q4 "
+            "dynamic-context lane requires --no-session-bank-live-refs."
+        ),
+    )
+    parser.add_argument(
         "--paged-kv-quantization",
         "--paged-kv-quant",
         "--kv-quant",
@@ -24233,6 +24658,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or os.environ.get("MTPLX_PAGED_KV_QUANT")
         or "off",
         help="Paged KV cache quantization mode: off, q8, or q4.",
+    )
+    parser.add_argument(
+        "--hy3-q4-dynamic-context",
+        action="store_true",
+        help=(
+            "Opt into the single-sequence Hy3 Q4 131072-token dynamic-memory "
+            "lane. Requires exact Q4, context, scheduler, and global "
+            "component-bank settings."
+        ),
     )
     parser.add_argument(
         "--warmup-tokens",

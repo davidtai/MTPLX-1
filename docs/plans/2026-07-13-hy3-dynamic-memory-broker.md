@@ -71,7 +71,7 @@
 
 **Does NOT cover:** This gate applies only when the explicit Hy3 Q4 dynamic-memory lane is enabled. Other models and ordinary server modes retain their existing context and batching behavior.
 
-- [ ] **Step 1: Write failing pure boundary tests**
+- [x] **Step 1: Write failing pure boundary tests**
 
 ```python
 import pytest
@@ -103,13 +103,13 @@ def test_hy3_q4_total_context_boundary(rendered, requested, accepted):
             admit_hy3_q4_context(rendered, requested)
 ```
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run: `uv run --frozen --extra dev --extra server pytest -q tests/test_hy3_q4_context.py`
 
 Expected: FAIL because `mtplx.hy3_q4_context` does not exist.
 
-- [ ] **Step 3: Implement the exact contract and lane validation**
+- [x] **Step 3: Implement the exact contract and lane validation**
 
 ```python
 HY3_Q4_TOTAL_CONTEXT_TOKENS = 131_072
@@ -142,15 +142,15 @@ def admit_hy3_q4_context(
 
 Add `Hy3Q4DynamicLaneConfig.validate()` requiring Hy3, q4 paged KV, `context_window == 131_072`, one active sequence, global component banks, and disabled SessionBank live references. Reject invalid combinations at startup instead of coercing them.
 
-- [ ] **Step 4: Add server RED tests for rendered template overhead and batching exclusion**
+- [x] **Step 4: Add server RED tests for rendered template overhead and batching exclusion**
 
 Test that `_generation_params` raises before generation for totals above 131,072, accepts exactly 131,072, does not force one output token when zero remain, and makes `_use_live_ar_batch` return false for the lane. Assert the lane is disabled by default and cannot be enabled with `q8`, `off`, concurrency greater than one, or live SessionBank cache references.
 
-- [ ] **Step 5: Integrate the admission into the post-template request path**
+- [x] **Step 5: Integrate the admission into the post-template request path**
 
 Call `admit_hy3_q4_context(prompt_token_count, requested_output_tokens)` after the request is fully rendered/tokenized and before response caps or generation. Preserve the caller's requested output reservation in admission accounting. Publish `model_context_limit_tokens`, `rendered_input_tokens`, `requested_output_tokens`, and `admitted_total_tokens` in generation limits and health telemetry.
 
-- [ ] **Step 6: Verify GREEN and commit the prerequisite layer**
+- [x] **Step 6: Verify GREEN and commit the prerequisite layer**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \

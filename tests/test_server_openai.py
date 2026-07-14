@@ -1,10 +1,12 @@
+import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
 import re
 import time
-from threading import Lock
+from threading import Event, Lock
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from mtplx.backends.gemma4_assistant import _gemma4_draft_position
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, get_profile
+from mtplx.hy3_q4_context import SingleSequenceGate, admit_hy3_q4_context
 from mtplx.server import openai
 from mtplx.server.openai import _RateLimiter, create_app, parse_args
 
@@ -22,6 +25,26 @@ def test_server_parser_default_model_is_public_hf_default():
     args = parse_args(["--warmup-tokens", "0"])
 
     assert args.model == DEFAULT_HF_MODEL_ID
+
+
+def test_server_parser_disables_hy3_q4_dynamic_context_by_default():
+    args = parse_args(["--warmup-tokens", "0"])
+
+    assert args.hy3_q4_dynamic_context is False
+
+
+def test_server_parser_accepts_hy3_q4_dynamic_context_opt_in():
+    args = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--hy3-q4-dynamic-context",
+            "--no-session-bank-live-refs",
+        ]
+    )
+
+    assert args.hy3_q4_dynamic_context is True
+    assert args.session_bank_live_refs is False
 
 
 def test_server_parser_accepts_native_app_launch_id():
@@ -1020,6 +1043,994 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         # Dashboard primitives mirror what ServerState.__init__ allocates.
         dashboard=DashboardState(),
     )
+
+
+def _enable_hy3_q4_dynamic_context(state):
+    state.args.hy3_q4_dynamic_context = True
+    state.args.session_bank_live_refs = False
+    state.context_window = 131_072
+    state.hy3_q4_sequence_gate = SingleSequenceGate()
+    return state
+
+
+def test_hy3_q4_generation_params_do_not_force_zero_remaining_output_to_one():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+
+    response_max, _sampler, limits = openai._generation_params(
+        state,
+        prompt_token_count=131_072,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+    )
+
+    assert response_max == 0
+    assert limits["remaining_context_tokens"] == 0
+    assert limits["effective_max_tokens"] == 0
+    assert limits["model_context_limit_tokens"] == 131_072
+    assert limits["rendered_input_tokens"] == 131_072
+    assert limits["requested_output_tokens"] == 0
+    assert limits["admitted_total_tokens"] == 131_072
+
+
+def test_hy3_q4_generation_limits_publish_exact_admission_numbers():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+
+    response_max, _sampler, limits = openai._generation_params(
+        state,
+        prompt_token_count=130_944,
+        max_tokens=128,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+    )
+
+    assert response_max == 128
+    assert {
+        key: limits[key]
+        for key in (
+            "model_context_limit_tokens",
+            "rendered_input_tokens",
+            "requested_output_tokens",
+            "admitted_total_tokens",
+        )
+    } == {
+        "model_context_limit_tokens": 131_072,
+        "rendered_input_tokens": 130_944,
+        "requested_output_tokens": 128,
+        "admitted_total_tokens": 131_072,
+    }
+
+
+def test_hy3_q4_generation_params_reject_explicit_output_above_remaining_context():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    state.args.max_response_tokens = 1
+
+    with pytest.raises(openai.HTTPException) as exc_info:
+        openai._generation_params(
+            state,
+            prompt_token_count=130_945,
+            max_tokens=128,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "131073" in str(exc_info.value.detail)
+    assert "131072" in str(exc_info.value.detail)
+
+
+def test_hy3_q4_dynamic_context_excludes_live_ar_batching():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    state.args.scheduler_mode = "ar_batch"
+
+    assert openai._use_live_ar_batch(state, effective_mode="ar") == (
+        False,
+        "hy3_q4_dynamic_context",
+    )
+
+
+def test_hy3_q4_dynamic_context_excludes_session_bank_and_live_refs():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    bank = object()
+
+    assert openai._hy3_q4_session_bank_policy(
+        state,
+        session_bank=bank,
+        session_keep_live_ref=True,
+    ) == (None, False)
+
+
+def test_hy3_q4_dynamic_context_reports_busy_sequence_as_429():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    admission = admit_hy3_q4_context(
+        rendered_input_tokens=4_000,
+        requested_output_tokens=96,
+    )
+    first = openai._acquire_hy3_q4_sequence(
+        state,
+        request_id="request-1",
+        admission=admission,
+    )
+
+    with pytest.raises(openai.HTTPException) as exc_info:
+        openai._acquire_hy3_q4_sequence(
+            state,
+            request_id="request-2",
+            admission=admission,
+        )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail == "hy3_q4_dynamic_context sequence is busy"
+    assert first is not None
+    assert first.release("complete") is True
+
+
+def test_hy3_q4_dynamic_context_releases_sequence_after_cancel(monkeypatch):
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+
+    def cancel_generation(*_args, **_kwargs):
+        raise openai._StreamCancelled("cancelled")
+
+    monkeypatch.setattr(openai, "_run_generation_dispatched_inner", cancel_generation)
+
+    with pytest.raises(openai._StreamCancelled, match="cancelled"):
+        openai._run_generation_dispatched(
+            state,
+            [1, 2, 3],
+            batch_key="test.hy3_q4.cancel",
+            response_id="request-cancelled",
+        )
+
+    assert state.hy3_q4_sequence_gate.active_request_id is None
+    next_lease = openai._acquire_hy3_q4_sequence(
+        state,
+        request_id="request-after-cancel",
+        admission=admit_hy3_q4_context(
+            rendered_input_tokens=3,
+            requested_output_tokens=1,
+        ),
+    )
+    assert next_lease is not None
+    assert next_lease.release("complete") is True
+
+
+def test_hy3_q4_health_reports_thread_safe_active_and_last_admission():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    admission = admit_hy3_q4_context(
+        rendered_input_tokens=130_944,
+        requested_output_tokens=128,
+    )
+    lease = state.hy3_q4_sequence_gate.acquire(
+        "health-active",
+        admission=admission,
+    )
+    client = TestClient(create_app(state))
+
+    active = client.get("/health").json()["hy3_q4_dynamic_context"]
+
+    assert active["enabled"] is True
+    assert active["admission_state"] == "active"
+    assert active["active_request_id"] == "health-active"
+    assert active["model_context_limit_tokens"] == 131_072
+    assert active["rendered_input_tokens"] == 130_944
+    assert active["requested_output_tokens"] == 128
+    assert active["admitted_total_tokens"] == 131_072
+
+    assert lease.release("complete") is True
+    last = client.get("/health").json()["hy3_q4_dynamic_context"]
+    assert last["admission_state"] == "last"
+    assert last["active_request_id"] is None
+    assert last["last_admission"] == admission.to_dict()
+
+
+class _RecordingSequenceLease:
+    def __init__(self):
+        self.release_reasons = []
+
+    def release(self, reason):
+        self.release_reasons.append(reason)
+        return len(self.release_reasons) == 1
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+def test_hy3_q4_dispatched_terminal_paths_release_exactly_once(
+    monkeypatch, outcome
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    lease = _RecordingSequenceLease()
+    monkeypatch.setattr(
+        openai,
+        "_acquire_hy3_q4_sequence",
+        lambda *_args, **_kwargs: lease,
+    )
+
+    def finish(*_args, **_kwargs):
+        if outcome == "error":
+            raise RuntimeError("ordinary failure")
+        if outcome == "cancel":
+            raise openai._StreamCancelled("cancelled")
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation_dispatched_inner", finish)
+
+    if outcome == "success":
+        openai._run_generation_dispatched(
+            state,
+            [1, 2, 3],
+            batch_key="test.hy3_q4.success",
+            response_id="dispatch-success",
+            max_tokens=1,
+        )
+    else:
+        expected = RuntimeError if outcome == "error" else openai._StreamCancelled
+        with pytest.raises(expected):
+            openai._run_generation_dispatched(
+                state,
+                [1, 2, 3],
+                batch_key=f"test.hy3_q4.{outcome}",
+                response_id=f"dispatch-{outcome}",
+                max_tokens=1,
+            )
+
+    assert lease.release_reasons == ["generation_terminal"]
+
+
+def test_hy3_q4_warmup_releases_sequence_exactly_once(monkeypatch):
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    lease = _RecordingSequenceLease()
+    monkeypatch.setattr(
+        openai,
+        "_acquire_hy3_q4_sequence",
+        lambda *_args, **_kwargs: lease,
+    )
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_dispatched_inner",
+        lambda *_args, **_kwargs: _fake_generation("ok"),
+    )
+
+    openai._run_warmup_generation(
+        state,
+        [1, 2, 3],
+        batch_key="test.hy3_q4.warmup",
+        max_tokens=1,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        seed=0,
+    )
+
+    assert lease.release_reasons == ["generation_terminal"]
+
+
+def test_hy3_q4_startup_warmup_acquires_before_scheduler_submission(monkeypatch):
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    state.args.warmup_tokens = 1
+    state.args.strict_warmup = True
+    state.draft_sampler = None
+    inside_scheduler_submission = False
+    lease = _RecordingSequenceLease()
+
+    def acquire_before_scheduler(*_args, **_kwargs):
+        assert inside_scheduler_submission is False
+        return lease
+
+    def submit(_state, fn, *_args, **_kwargs):
+        nonlocal inside_scheduler_submission
+        inside_scheduler_submission = True
+        try:
+            value = fn()
+        finally:
+            inside_scheduler_submission = False
+        return SimpleNamespace(result=lambda: value)
+
+    monkeypatch.setattr(openai, "_acquire_hy3_q4_sequence", acquire_before_scheduler)
+    monkeypatch.setattr(openai, "_submit_foreground_model_work", submit)
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_dispatched_inner",
+        lambda *_args, **_kwargs: _fake_generation("ok"),
+    )
+    monkeypatch.setattr(openai, "_extended_warmup_enabled", lambda: True)
+    monkeypatch.setattr(
+        openai,
+        "_background_warmup_enabled",
+        lambda: pytest.fail("strict lane must not enter background warmup"),
+    )
+    monkeypatch.setattr(openai, "_startup_heartbeat", lambda *_args, **_kwargs: Event())
+    monkeypatch.setattr(openai, "_encode_prompt", lambda *_args, **_kwargs: [1, 2, 3])
+
+    status = openai._run_startup_warmup(state)
+
+    assert status["ran"] is True
+    assert status["extended"] == {
+        "mode": "skipped",
+        "reason": "hy3_q4_single_sequence",
+    }
+    assert lease.release_reasons == ["generation_terminal"]
+
+
+def test_hy3_q4_chat_admission_counts_fully_rendered_prompt_tokens(monkeypatch):
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai,
+        "_encode_messages",
+        lambda *_args, **_kwargs: [7] * 130_945,
+    )
+
+    def fail_generation(*_args, **_kwargs):
+        raise AssertionError("over-limit request must fail before generation")
+
+    monkeypatch.setattr(openai, "_run_generation", fail_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "short source message"}],
+            "max_tokens": 128,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "131073" in response.text
+    assert "131072" in response.text
+
+
+@pytest.mark.parametrize("invalid_max_tokens", [True, 1.0, "1"])
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "chat"}]},
+        ),
+        ("/v1/completions", {"prompt": "completion"}),
+        (
+            "/v1/messages",
+            {"messages": [{"role": "user", "content": "message"}]},
+        ),
+    ],
+)
+def test_hy3_q4_generation_apis_reject_non_exact_raw_max_tokens_before_lease(
+    monkeypatch, path, payload, invalid_max_tokens
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+    generation_calls = []
+
+    def fake_generation(*_args, **_kwargs):
+        generation_calls.append(True)
+        return _fake_generation("unexpected")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_generation)
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1])
+    monkeypatch.setattr(openai, "_encode_prompt", lambda *_args, **_kwargs: [1])
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            path,
+            headers={"x-mtplx-cache-mode": "bypass"},
+            json={**payload, "max_tokens": invalid_max_tokens},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "max_tokens must be an exact integer in the Hy3 Q4 dynamic-context lane"
+    )
+    assert generation_calls == []
+    assert state.hy3_q4_sequence_gate.snapshot()["admission_state"] == "none"
+
+
+@pytest.mark.parametrize("invalid_max_tokens", [True, 1.0, "1"])
+def test_hy3_q4_chat_rejects_non_exact_max_completion_tokens_alias_before_lease(
+    monkeypatch, invalid_max_tokens
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+    generation_calls = []
+
+    def fake_generation(*_args, **_kwargs):
+        generation_calls.append(True)
+        return _fake_generation("unexpected")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_generation)
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1])
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass"},
+            json={
+                "messages": [{"role": "user", "content": "chat"}],
+                "max_completion_tokens": invalid_max_tokens,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "max_completion_tokens must be an exact integer in the Hy3 Q4 "
+        "dynamic-context lane"
+    )
+    assert generation_calls == []
+    assert state.hy3_q4_sequence_gate.snapshot()["admission_state"] == "none"
+
+
+def test_non_hy3_completion_preserves_pydantic_max_tokens_coercion(monkeypatch):
+    state = _fake_state()
+    seen_max_tokens = []
+
+    def fake_generation(_state, _prompt_ids, **kwargs):
+        seen_max_tokens.append(kwargs["max_tokens"])
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_generation)
+    monkeypatch.setattr(openai, "_encode_prompt", lambda *_args, **_kwargs: [1])
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/completions",
+            json={"prompt": "ordinary", "max_tokens": "1"},
+        )
+
+    assert response.status_code == 200
+    assert seen_max_tokens == [1]
+
+
+@pytest.mark.parametrize("second_stream", [False, True])
+def test_hy3_q4_concurrent_session_chat_is_http_429_before_kv_allocation(
+    monkeypatch, second_stream
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+    state.draft_sampler = None
+    state.requests_completed = 0
+    generation_started = Event()
+    allow_generation_to_finish = Event()
+    kv_allocations = []
+    session_resolutions = []
+
+    class KVAdmission:
+        def release(self):
+            return None
+
+    def admit_kv_tokens(tokens):
+        kv_allocations.append(tokens)
+        return KVAdmission()
+
+    def blocking_generate(*_args, **kwargs):
+        generation_started.set()
+        assert allow_generation_to_finish.wait(timeout=5.0)
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            token_callback([ord("O")])
+        return SimpleNamespace(
+            tokens=[ord("O")],
+            text="O",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 1,
+                    "elapsed_s": 0.1,
+                    "tok_s": 10.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    original_resolve = state.sessions.resolve_session_id
+
+    def record_session_resolution(*args, **kwargs):
+        session_resolutions.append(dict(kwargs.get("headers") or {}))
+        return original_resolve(*args, **kwargs)
+
+    state.runtime.admit_kv_tokens = admit_kv_tokens
+    monkeypatch.setattr(openai, "generate_mtpk", blocking_generate)
+    monkeypatch.setattr(
+        openai,
+        "_encode_messages",
+        lambda *_args, **_kwargs: [1, 2, 3],
+    )
+    monkeypatch.setattr(
+        state.sessions,
+        "resolve_session_id",
+        record_session_resolution,
+    )
+    client = TestClient(create_app(state))
+    executor = ThreadPoolExecutor(max_workers=1)
+    first_future = executor.submit(
+        lambda: client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass"},
+            json={
+                "messages": [{"role": "user", "content": "first"}],
+                "max_tokens": 1,
+                "stream": True,
+            },
+        )
+    )
+    assert generation_started.wait(timeout=5.0)
+
+    try:
+        second = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "session-backed-second"},
+            json={
+                "messages": [{"role": "user", "content": "second"}],
+                "max_tokens": 1,
+                "stream": second_stream,
+            },
+        )
+    finally:
+        allow_generation_to_finish.set()
+
+    first = first_future.result(timeout=5.0)
+    executor.shutdown(wait=True)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.json()["error"]["message"] == (
+        "hy3_q4_dynamic_context sequence is busy"
+    )
+    assert kv_allocations == [4]
+    assert session_resolutions == []
+    assert state.hy3_q4_sequence_gate.active_request_id is None
+
+
+def test_hy3_q4_asgi_lease_lives_through_streamed_response_body():
+    gate = SingleSequenceGate()
+    admission = admit_hy3_q4_context(
+        rendered_input_tokens=4_000,
+        requested_output_tokens=96,
+    )
+    lease = gate.acquire("streaming-request", admission=admission)
+
+    async def scenario():
+        response_started = asyncio.Event()
+        allow_response_body = asyncio.Event()
+
+        async def downstream(_scope, _receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            response_started.set()
+            await allow_response_body.wait()
+            await send({"type": "http.response.body", "body": b"done"})
+
+        middleware = openai._Hy3Q4SequenceLeaseMiddleware(downstream)
+        scope = {
+            "type": "http",
+            "state": {openai._HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY: lease},
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message):
+            return None
+
+        task = asyncio.create_task(middleware(scope, receive, send))
+        await response_started.wait()
+        assert gate.active_request_id == "streaming-request"
+        allow_response_body.set()
+        await task
+
+    asyncio.run(scenario())
+
+    assert gate.active_request_id is None
+    assert gate.snapshot()["admission_state"] == "last"
+
+
+def test_hy3_q4_stream_disconnect_holds_lease_until_stubborn_worker_terminal(
+    monkeypatch,
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+    state.draft_sampler = None
+    worker_started = Event()
+    allow_worker_terminal = Event()
+    kv_cleanup_complete = Event()
+
+    def stubborn_generation(*_args, **_kwargs):
+        worker_started.set()
+        assert allow_worker_terminal.wait(timeout=5.0)
+        try:
+            raise openai._StreamCancelled("client disconnected")
+        finally:
+            kv_cleanup_complete.set()
+
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_dispatched_inner",
+        stubborn_generation,
+    )
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1])
+    monkeypatch.setattr(openai, "_encode_prompt", lambda *_args, **_kwargs: [1])
+    app = create_app(state)
+    body = json.dumps(
+        {
+            "messages": [{"role": "user", "content": "disconnect"}],
+            "max_tokens": 1,
+            "stream": True,
+        }
+    ).encode()
+
+    async def scenario():
+        request_sent = False
+        disconnect_sent = False
+        response_status = None
+
+        async def receive():
+            nonlocal disconnect_sent, request_sent
+            if not request_sent:
+                request_sent = True
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+            if not disconnect_sent:
+                assert await asyncio.to_thread(worker_started.wait, 5.0)
+                disconnect_sent = True
+                return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
+
+        async def send(message):
+            nonlocal response_status
+            if message["type"] == "http.response.start":
+                response_status = message["status"]
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"x-mtplx-cache-mode", b"bypass"),
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": ("testserver", 80),
+            "root_path": "",
+            "state": {},
+        }
+
+        await asyncio.wait_for(app(scope, receive, send), timeout=5.0)
+        assert response_status == 200
+        assert worker_started.is_set()
+        assert not kv_cleanup_complete.is_set()
+
+        health = openai._hy3_q4_context_health(state)
+        assert health["admission_state"] == "active"
+        assert health["active_request_id"] is not None
+        second_body = json.dumps(
+            {"prompt": "second while draining", "max_tokens": 1}
+        ).encode()
+        second_request_sent = False
+        second_status = None
+        second_response_body = bytearray()
+
+        async def receive_second():
+            nonlocal second_request_sent
+            if not second_request_sent:
+                second_request_sent = True
+                return {
+                    "type": "http.request",
+                    "body": second_body,
+                    "more_body": False,
+                }
+            return {"type": "http.disconnect"}
+
+        async def send_second(message):
+            nonlocal second_status
+            if message["type"] == "http.response.start":
+                second_status = message["status"]
+            elif message["type"] == "http.response.body":
+                second_response_body.extend(message.get("body") or b"")
+
+        second_scope = {
+            **scope,
+            "path": "/v1/completions",
+            "raw_path": b"/v1/completions",
+            "headers": [(b"content-type", b"application/json")],
+            "state": {},
+        }
+        await app(second_scope, receive_second, send_second)
+        assert second_status == 429
+        assert json.loads(second_response_body)["error"]["message"] == (
+            "hy3_q4_dynamic_context sequence is busy"
+        )
+
+        second_admission = admit_hy3_q4_context(
+            rendered_input_tokens=1,
+            requested_output_tokens=1,
+        )
+
+        allow_worker_terminal.set()
+        assert await asyncio.to_thread(kv_cleanup_complete.wait, 5.0)
+        deadline = time.monotonic() + 5.0
+        while state.hy3_q4_sequence_gate.active_request_id is not None:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.01)
+
+        next_lease = openai._acquire_hy3_q4_sequence(
+            state,
+            request_id="second-after-worker-terminal",
+            admission=second_admission,
+        )
+        assert next_lease is not None
+        assert next_lease.release("complete") is True
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        allow_worker_terminal.set()
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "cancel chat"}]},
+        ),
+        ("/v1/completions", {"prompt": "cancel completion"}),
+        (
+            "/v1/messages",
+            {"messages": [{"role": "user", "content": "cancel message"}]},
+        ),
+    ],
+)
+def test_hy3_q4_nonstream_asgi_cancellation_holds_lease_until_worker_cleanup(
+    monkeypatch, path, payload
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+    state.draft_sampler = None
+    worker_started = Event()
+    allow_worker_terminal = Event()
+    kv_cleanup_complete = Event()
+    worker_call_lock = Lock()
+    worker_calls = 0
+
+    def stubborn_first_generation(*_args, **_kwargs):
+        nonlocal worker_calls
+        with worker_call_lock:
+            worker_calls += 1
+            call_number = worker_calls
+        if call_number != 1:
+            return _fake_generation("unsafe-second-owner")
+        worker_started.set()
+        assert allow_worker_terminal.wait(timeout=5.0)
+        try:
+            raise RuntimeError("late worker failure after handler cancellation")
+        finally:
+            kv_cleanup_complete.set()
+
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_dispatched_inner",
+        stubborn_first_generation,
+    )
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1])
+    monkeypatch.setattr(openai, "_encode_prompt", lambda *_args, **_kwargs: [1])
+    app = create_app(state)
+
+    async def scenario():
+        loop_errors = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, context: loop_errors.append(context)
+        )
+
+        async def invoke(
+            request_path, request_payload, *, keep_receive_open=False
+        ):
+            body = json.dumps({**request_payload, "max_tokens": 1}).encode()
+            request_sent = False
+            status = None
+            response_body = bytearray()
+
+            async def receive():
+                nonlocal request_sent
+                if not request_sent:
+                    request_sent = True
+                    return {
+                        "type": "http.request",
+                        "body": body,
+                        "more_body": False,
+                    }
+                if keep_receive_open:
+                    await asyncio.Event().wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                nonlocal status
+                if message["type"] == "http.response.start":
+                    status = message["status"]
+                elif message["type"] == "http.response.body":
+                    response_body.extend(message.get("body") or b"")
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": request_path,
+                "raw_path": request_path.encode(),
+                "query_string": b"",
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"x-mtplx-cache-mode", b"bypass"),
+                ],
+                "client": ("127.0.0.1", 50000),
+                "server": ("testserver", 80),
+                "root_path": "",
+                "state": {},
+            }
+            await app(scope, receive, send)
+            return status, bytes(response_body)
+
+        first_task = asyncio.create_task(
+            invoke(path, payload, keep_receive_open=True)
+        )
+        assert await asyncio.to_thread(worker_started.wait, 5.0)
+        first_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+
+        health_while_draining = openai._hy3_q4_context_health(state)
+        second_status, second_body = await invoke(
+            "/v1/completions",
+            {"prompt": "second while first drains"},
+        )
+        observed_before_cleanup = (
+            health_while_draining["admission_state"],
+            second_status,
+        )
+
+        allow_worker_terminal.set()
+        assert await asyncio.to_thread(kv_cleanup_complete.wait, 5.0)
+        deadline = time.monotonic() + 5.0
+        while state.hy3_q4_sequence_gate.active_request_id is not None:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+        assert observed_before_cleanup == ("active", 429)
+        assert json.loads(second_body)["error"]["message"] == (
+            "hy3_q4_dynamic_context sequence is busy"
+        )
+        assert worker_calls == 1
+        assert not [
+            context
+            for context in loop_errors
+            if "exception was never retrieved"
+            in str(context.get("message", "")).lower()
+        ]
+
+        next_admission = admit_hy3_q4_context(
+            rendered_input_tokens=1,
+            requested_output_tokens=1,
+        )
+        next_lease = openai._acquire_hy3_q4_sequence(
+            state,
+            request_id="after-nonstream-worker-cleanup",
+            admission=next_admission,
+        )
+        assert next_lease is not None
+        assert next_lease.release("complete") is True
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        allow_worker_terminal.set()
+
+
+def test_hy3_q4_nonstream_offload_preserves_contextvars_and_response_owner():
+    gate = SingleSequenceGate()
+    admission = admit_hy3_q4_context(
+        rendered_input_tokens=4_000,
+        requested_output_tokens=96,
+    )
+    owner = gate.acquire("contextvar-request", admission=admission)
+    marker = ContextVar("hy3_q4_offload_marker")
+    marker.set("request-context")
+    raw_request = openai.Request(
+        {
+            "type": "http",
+            "headers": [],
+            "state": {openai._HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY: owner},
+        }
+    )
+
+    result = asyncio.run(
+        openai._run_nonstream_generation_offload(
+            raw_request,
+            marker.get,
+        )
+    )
+
+    assert result == "request-context"
+    assert gate.active_request_id == "contextvar-request"
+    assert owner.release("http_response_complete") is True
+    assert gate.active_request_id is None
+
+
+def test_hy3_q4_nonstream_offload_submit_failure_releases_worker_hold(
+    monkeypatch,
+):
+    gate = SingleSequenceGate()
+    admission = admit_hy3_q4_context(
+        rendered_input_tokens=4_000,
+        requested_output_tokens=96,
+    )
+    owner = gate.acquire("offload-submit-failure", admission=admission)
+    raw_request = openai.Request(
+        {
+            "type": "http",
+            "headers": [],
+            "state": {openai._HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY: owner},
+        }
+    )
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+
+        def fail_submit(*_args, **_kwargs):
+            raise RuntimeError("executor submit failed")
+
+        monkeypatch.setattr(loop, "run_in_executor", fail_submit)
+        with pytest.raises(RuntimeError, match="executor submit failed"):
+            await openai._run_nonstream_generation_offload(
+                raw_request,
+                lambda: None,
+            )
+
+    asyncio.run(scenario())
+
+    assert gate.active_request_id == "offload-submit-failure"
+    assert owner.release("http_error_response_complete") is True
+    assert gate.active_request_id is None
+
+
+def test_hy3_q4_stream_worker_start_failure_releases_worker_hold(
+    monkeypatch,
+):
+    gate = SingleSequenceGate()
+    admission = admit_hy3_q4_context(
+        rendered_input_tokens=4_000,
+        requested_output_tokens=96,
+    )
+    owner = gate.acquire("stream-start-failure", admission=admission)
+    raw_request = openai.Request(
+        {
+            "type": "http",
+            "headers": [],
+            "state": {openai._HY3_Q4_SEQUENCE_LEASE_SCOPE_KEY: owner},
+        }
+    )
+
+    class StartFailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(openai, "Thread", StartFailingThread)
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        openai._start_stream_generation_worker(
+            raw_request,
+            lambda: None,
+            name="never-started",
+        )
+
+    assert gate.active_request_id == "stream-start-failure"
+    assert owner.release("http_error_response_complete") is True
+    assert gate.active_request_id is None
 
 
 def _fake_streaming_session_state():

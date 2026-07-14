@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from mtplx.hy3_q4_context import HY3_Q4_CONTEXT_WINDOW
+
 
 KV_QUANT_MODES = ("off", "q8", "q4")
 
@@ -50,6 +52,64 @@ def apply_paged_kv_quantization_env(mode: object | None, env: dict[str, str] | N
     target = os.environ if env is None else env
     target.update(paged_kv_quantization_env(canonical))
     return canonical
+
+
+def validate_hy3_q4_dynamic_context_options(
+    args: object,
+    expert_streaming_config: object | None,
+    *,
+    resolved_context_window: int | None = None,
+) -> bool:
+    """Validate the explicit, single-sequence Hy3 Q4 128K server lane."""
+
+    if not bool(getattr(args, "hy3_q4_dynamic_context", False)):
+        return False
+    if (
+        normalize_paged_kv_quantization(getattr(args, "paged_kv_quantization", "off"))
+        != "q4"
+    ):
+        raise ValueError("--hy3-q4-dynamic-context requires --paged-kv-quantization q4")
+    if int(getattr(args, "context_window", 0) or 0) != HY3_Q4_CONTEXT_WINDOW:
+        raise ValueError("--hy3-q4-dynamic-context requires --context-window 131072")
+    if (
+        resolved_context_window is not None
+        and int(resolved_context_window) != HY3_Q4_CONTEXT_WINDOW
+    ):
+        raise ValueError(
+            "--hy3-q4-dynamic-context requires the loaded model to resolve "
+            "a 131072-token context window"
+        )
+    if str(getattr(args, "scheduler_mode", "serial") or "serial") != "serial":
+        raise ValueError("--hy3-q4-dynamic-context requires --scheduler-mode serial")
+
+    max_active = getattr(args, "max_active_requests", None)
+    decode_max = getattr(args, "decode_batch_max", None)
+    if type(max_active) is not int or max_active != 1:
+        raise ValueError(
+            "--hy3-q4-dynamic-context requires --max-active-requests 1 exactly"
+        )
+    if type(decode_max) is not int or decode_max != 1:
+        raise ValueError(
+            "--hy3-q4-dynamic-context requires --decode-batch-max 1 exactly"
+        )
+    if bool(getattr(args, "session_bank_live_refs", True)):
+        raise ValueError(
+            "--hy3-q4-dynamic-context requires --no-session-bank-live-refs"
+        )
+
+    if (
+        expert_streaming_config is None
+        or getattr(expert_streaming_config, "model_key", None) != "hy3-q4"
+    ):
+        raise ValueError("--hy3-q4-dynamic-context requires Hy3 Q4 expert streaming")
+    if (
+        getattr(expert_streaming_config, "cache_scope", None) != "global"
+        or getattr(expert_streaming_config, "slot_layout", None) != "component-banks"
+    ):
+        raise ValueError(
+            "--hy3-q4-dynamic-context requires the global component-bank lane"
+        )
+    return True
 
 
 def resolve_api_key(
