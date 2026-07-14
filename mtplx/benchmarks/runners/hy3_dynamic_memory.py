@@ -12,22 +12,31 @@ import json
 import math
 import os
 import random
+import signal
 import statistics
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TypeVar
 
+from mtplx.memory_broker import (
+    HY3_Q4_KV_BLOCK_BYTES,
+    HY3_Q4_KV_BLOCK_TOKENS,
+    HY3_Q4_KV_BYTES_PER_TOKEN,
+)
 
 CONTEXT_MATRIX_TOKENS = (4_096, 32_768, 65_536, 131_072)
 HY3_Q4_TOTAL_CONTEXT_TOKENS = 131_072
-HY3_Q4_KV_BLOCK_SIZE_TOKENS = 16
-HY3_Q4_KV_BYTES_PER_TOKEN = 84_480
-HY3_Q4_KV_BLOCK_BYTES = HY3_Q4_KV_BLOCK_SIZE_TOKENS * HY3_Q4_KV_BYTES_PER_TOKEN
+HY3_Q4_KV_BLOCK_SIZE_TOKENS = HY3_Q4_KV_BLOCK_TOKENS
 HY3_Q4_MAX_BLOCKS = HY3_Q4_TOTAL_CONTEXT_TOKENS // HY3_Q4_KV_BLOCK_SIZE_TOKENS
 MIN_STABLE_HOLD_SAMPLES = 3
 MIN_STABLE_HOLD_DURATION_NS = 1_000_000_000
+OPERATING_TARGET_BYTES = 110 * 1024**3
+HARD_CEILING_BYTES = 112 * 1024**3
+MAX_PROCESS_COMPRESSED_GROWTH_BYTES = 512 * 1024**2
+MAX_128K_PERFORMANCE_REGRESSION = 0.05
 SCHEMA_OBSERVATION = "mtplx-hy3-dynamic-memory-observation-v1"
 SCHEMA_PROBE = "mtplx-hy3-allocator-release-probe-v1"
 SCHEMA_CAMPAIGN = "mtplx-hy3-dynamic-memory-campaign-v1"
@@ -42,6 +51,47 @@ _PROBE_BOUND_IDENTITY_FIELDS = (
     "kv_quantization",
     "kv_block_size_tokens",
     "total_context_tokens",
+)
+
+ISSUE46_RESOURCE_INTEGER_FIELDS = (
+    "operating_target_bytes",
+    "hard_ceiling_bytes",
+    "charged_bytes",
+    "resident_model_bytes",
+    "kv_logical_tokens",
+    "expert_logical_records",
+    "expert_active_records",
+    "expert_resident_records",
+    "expert_logical_slabs",
+    "expert_active_slabs",
+    "expert_draining_slabs",
+    "expert_released_slabs",
+    "pinned_expert_bytes",
+    "inflight_expert_bytes",
+    "speculative_expert_bytes",
+    "runtime_workspace_bytes",
+    "inflight_expert_staging_bytes",
+    "requested_reclaim_bytes",
+    "reclaimed_bytes",
+    "regrown_bytes",
+    "evicted_expert_records",
+    "evicted_expert_slabs",
+    "resize_duration_ns",
+    "total_resize_duration_ns",
+    "max_resize_duration_ns",
+    "blocked_by_pin_bytes",
+    "admission_failures",
+    "resize_failures",
+    "allocator_cache_charged_bytes",
+    "process_rss_bytes",
+    "process_compressed_bytes",
+)
+ISSUE46_RESOURCE_FIELDS = (
+    *ISSUE46_RESOURCE_INTEGER_FIELDS,
+    "system_swap_delta_bytes",
+    "kv_representation",
+    "failed_closed",
+    "failure_reason",
 )
 
 _T = TypeVar("_T")
@@ -61,6 +111,20 @@ def canonical_sha256(value: object) -> str:
         ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def normalize_arm_config(value: Mapping[str, object]) -> dict[str, object]:
+    """Remove only the declared static/dynamic intervention fields."""
+
+    normalized = dict(value)
+    normalized.pop("dynamic_memory", None)
+    normalized.pop("planned_persistent_slots", None)
+    raw_streaming = normalized.get("expert_streaming_config")
+    if isinstance(raw_streaming, Mapping):
+        streaming = dict(raw_streaming)
+        streaming.pop("dynamic_expert_slabs", None)
+        normalized["expert_streaming_config"] = streaming
+    return normalized
 
 
 def _exact_int(value: object, *, field: str, minimum: int = 0) -> int:
@@ -234,6 +298,7 @@ class MemoryTimelinePoint:
     kv_allocated_blocks: int
     slot_health: Mapping[str, int]
     slot_health_sha256: str
+    resource_evidence: Mapping[str, object]
 
     @property
     def charged_allocator_bytes(self) -> int:
@@ -260,6 +325,7 @@ class MemoryTimelinePoint:
                 "kv_allocated_blocks",
                 "slot_health",
                 "slot_health_sha256",
+                *ISSUE46_RESOURCE_FIELDS,
             ),
             context=prefix,
         )
@@ -283,6 +349,44 @@ class MemoryTimelinePoint:
         if canonical_sha256(health) != health_hash:
             raise BenchmarkGateError(
                 f"{prefix}.slot_health_sha256 does not match exact slot health"
+            )
+        resource_evidence: dict[str, object] = {
+            field: _exact_int(value[field], field=f"{prefix}.{field}")
+            for field in ISSUE46_RESOURCE_INTEGER_FIELDS
+        }
+        swap_delta = value["system_swap_delta_bytes"]
+        if isinstance(swap_delta, bool) or not isinstance(swap_delta, int):
+            raise BenchmarkGateError(
+                f"{prefix}.system_swap_delta_bytes must be an integer"
+            )
+        resource_evidence["system_swap_delta_bytes"] = swap_delta
+        representation = _nonempty_string(
+            value["kv_representation"], field=f"{prefix}.kv_representation"
+        )
+        if representation != "q4":
+            raise BenchmarkGateError(f"{prefix}.kv_representation must be q4")
+        resource_evidence["kv_representation"] = representation
+        failed_closed = value["failed_closed"]
+        if not isinstance(failed_closed, bool):
+            raise BenchmarkGateError(f"{prefix}.failed_closed must be a boolean")
+        resource_evidence["failed_closed"] = failed_closed
+        failure_reason = value["failure_reason"]
+        if failure_reason is not None:
+            failure_reason = _nonempty_string(
+                failure_reason, field=f"{prefix}.failure_reason"
+            )
+        resource_evidence["failure_reason"] = failure_reason
+        if resource_evidence["operating_target_bytes"] != OPERATING_TARGET_BYTES:
+            raise BenchmarkGateError(
+                f"{prefix}.operating_target_bytes must be exactly 110 GiB"
+            )
+        if resource_evidence["hard_ceiling_bytes"] != HARD_CEILING_BYTES:
+            raise BenchmarkGateError(
+                f"{prefix}.hard_ceiling_bytes must be exactly 112 GiB"
+            )
+        if failed_closed and failure_reason is None:
+            raise BenchmarkGateError(
+                f"{prefix}.failure_reason is required after a fail-closed event"
             )
         point = cls(
             phase=_nonempty_string(value["phase"], field=f"{prefix}.phase"),
@@ -314,6 +418,7 @@ class MemoryTimelinePoint:
             ),
             slot_health=health,
             slot_health_sha256=health_hash,
+            resource_evidence=resource_evidence,
         )
         if point.allocator_peak_bytes < point.allocator_active_bytes:
             raise BenchmarkGateError(
@@ -323,6 +428,31 @@ class MemoryTimelinePoint:
         if point.kv_physical_bytes != expected_kv_bytes:
             raise BenchmarkGateError(
                 f"{prefix}.kv_physical_bytes does not match exact Q4 geometry"
+            )
+        classified_bytes = (
+            int(resource_evidence["resident_model_bytes"])
+            + point.kv_physical_bytes
+            + point.expert_slab_physical_bytes
+            + int(resource_evidence["inflight_expert_staging_bytes"])
+            + int(resource_evidence["runtime_workspace_bytes"])
+        )
+        expected_charged = classified_bytes + int(
+            resource_evidence["allocator_cache_charged_bytes"]
+        )
+        if int(resource_evidence["charged_bytes"]) != expected_charged:
+            raise BenchmarkGateError(
+                f"{prefix}.charged_bytes does not match the six-pool additive ledger"
+            )
+        if (
+            int(resource_evidence["allocator_cache_charged_bytes"])
+            < point.allocator_cache_bytes
+        ):
+            raise BenchmarkGateError(
+                f"{prefix}.allocator_cache_charged_bytes is below raw MLX cache"
+            )
+        if int(resource_evidence["charged_bytes"]) < point.charged_allocator_bytes:
+            raise BenchmarkGateError(
+                f"{prefix}.charged_bytes is below the raw MLX allocator footprint"
             )
         return point
 
@@ -489,11 +619,10 @@ def _validate_identity(
         raise BenchmarkGateError(
             f"{context}.normalized_config_sha256 does not match normalized config"
         )
-    expected_normalized = dict(result["arm_config"])
-    expected_normalized.pop("dynamic_memory", None)
+    expected_normalized = normalize_arm_config(result["arm_config"])
     if expected_normalized != result["normalized_config"]:
         raise BenchmarkGateError(
-            f"{context}.normalized_config must remove only dynamic_memory"
+            f"{context}.normalized_config does not match arm intervention normalization"
         )
     return result
 
@@ -759,7 +888,9 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             "elapsed_seconds",
             "tokens_per_second",
             "peak_charged_bytes",
+            "stress_peak_charged_bytes",
             "hold_performance_samples",
+            "performance_samples",
         ),
         context="observation.metrics",
     )
@@ -794,10 +925,27 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
         raw_metrics["peak_charged_bytes"],
         field="observation.metrics.peak_charged_bytes",
     )
-    observed_peak = max(point.charged_allocator_bytes for point in timeline)
-    if peak_charged < observed_peak:
+    observed_peak = max(
+        int(point.resource_evidence["charged_bytes"]) for point in timeline
+    )
+    if peak_charged != observed_peak:
         raise BenchmarkGateError(
-            "observation.metrics.peak_charged_bytes is below timeline evidence"
+            "observation.metrics.peak_charged_bytes must equal timeline evidence"
+        )
+    stress_peak_charged = _exact_int(
+        raw_metrics["stress_peak_charged_bytes"],
+        field="observation.metrics.stress_peak_charged_bytes",
+    )
+    observed_stress_peak = max(
+        max(
+            point.allocator_peak_bytes + point.allocator_cache_bytes,
+            int(point.resource_evidence["charged_bytes"]),
+        )
+        for point in timeline
+    )
+    if stress_peak_charged != observed_stress_peak:
+        raise BenchmarkGateError(
+            "observation.metrics.stress_peak_charged_bytes must equal timeline evidence"
         )
     raw_hold_performance = _sequence(
         raw_metrics["hold_performance_samples"],
@@ -820,12 +968,139 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
         raise BenchmarkGateError(
             "observation.metrics.hold_performance_samples are not stable within 10%"
         )
+    raw_performance_samples = _sequence(
+        raw_metrics["performance_samples"],
+        field="observation.metrics.performance_samples",
+    )
+    if len(raw_performance_samples) != len(hold_performance):
+        raise BenchmarkGateError(
+            "observation.metrics.performance_samples must match hold_performance_samples"
+        )
+    performance_samples: list[dict[str, object]] = []
+    for index, raw_sample in enumerate(raw_performance_samples):
+        sample = _mapping(
+            raw_sample,
+            field=f"observation.metrics.performance_samples[{index}]",
+        )
+        required_sample_fields = (
+            "tokens_per_second",
+            "expert_hit_rate",
+            "ssd_bytes_per_token",
+            "p50_token_latency_ms",
+            "p95_token_latency_ms",
+            "generated_token_ids",
+            "generated_token_sha256",
+            "route_trace",
+            "route_trace_sha256",
+        )
+        _require_fields(
+            sample,
+            required_sample_fields,
+            context=f"observation.metrics.performance_samples[{index}]",
+        )
+        sample_prefix = f"observation.metrics.performance_samples[{index}]"
+        sample_tps = _finite_number(
+            sample["tokens_per_second"],
+            field=f"{sample_prefix}.tokens_per_second",
+            positive=True,
+        )
+        hit_rate = _finite_number(
+            sample["expert_hit_rate"],
+            field=f"{sample_prefix}.expert_hit_rate",
+        )
+        if not 0.0 <= hit_rate <= 1.0:
+            raise BenchmarkGateError(
+                f"{sample_prefix}.expert_hit_rate must be in [0, 1]"
+            )
+        ssd_bytes = _finite_number(
+            sample["ssd_bytes_per_token"],
+            field=f"{sample_prefix}.ssd_bytes_per_token",
+        )
+        if ssd_bytes < 0.0:
+            raise BenchmarkGateError(
+                f"{sample_prefix}.ssd_bytes_per_token must be nonnegative"
+            )
+        p50_ms = _finite_number(
+            sample["p50_token_latency_ms"],
+            field=f"{sample_prefix}.p50_token_latency_ms",
+            positive=True,
+        )
+        p95_ms = _finite_number(
+            sample["p95_token_latency_ms"],
+            field=f"{sample_prefix}.p95_token_latency_ms",
+            positive=True,
+        )
+        if p95_ms < p50_ms:
+            raise BenchmarkGateError(
+                f"{sample_prefix}.p95_token_latency_ms is below p50_token_latency_ms"
+            )
+        if not math.isclose(
+            sample_tps,
+            hold_performance[index],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise BenchmarkGateError(
+                f"{sample_prefix}.tokens_per_second differs from "
+                "hold_performance_samples"
+            )
+        raw_sample_tokens = _sequence(
+            sample["generated_token_ids"],
+            field=f"{sample_prefix}.generated_token_ids",
+        )
+        sample_tokens = [
+            _exact_int(token, field=f"{sample_prefix}.generated_token_ids[{offset}]")
+            for offset, token in enumerate(raw_sample_tokens)
+        ]
+        if not sample_tokens:
+            raise BenchmarkGateError(
+                f"{sample_prefix}.generated_token_ids must not be empty"
+            )
+        sample_token_hash = _sha256(
+            sample["generated_token_sha256"],
+            field=f"{sample_prefix}.generated_token_sha256",
+        )
+        if canonical_sha256(sample_tokens) != sample_token_hash:
+            raise BenchmarkGateError(
+                f"{sample_prefix}.generated_token_sha256 does not match exact tokens"
+            )
+        sample_route_trace = list(
+            _sequence(
+                sample["route_trace"],
+                field=f"{sample_prefix}.route_trace",
+            )
+        )
+        if not sample_route_trace:
+            raise BenchmarkGateError(f"{sample_prefix}.route_trace must not be empty")
+        sample_route_hash = _sha256(
+            sample["route_trace_sha256"],
+            field=f"{sample_prefix}.route_trace_sha256",
+        )
+        if canonical_sha256(sample_route_trace) != sample_route_hash:
+            raise BenchmarkGateError(
+                f"{sample_prefix}.route_trace_sha256 does not match exact routes"
+            )
+        performance_samples.append(
+            {
+                "tokens_per_second": sample_tps,
+                "expert_hit_rate": hit_rate,
+                "ssd_bytes_per_token": ssd_bytes,
+                "p50_token_latency_ms": p50_ms,
+                "p95_token_latency_ms": p95_ms,
+                "generated_token_ids": sample_tokens,
+                "generated_token_sha256": sample_token_hash,
+                "route_trace": sample_route_trace,
+                "route_trace_sha256": sample_route_hash,
+            }
+        )
     metrics: dict[str, object] = {
         "generated_tokens": generated_tokens,
         "elapsed_seconds": elapsed,
         "tokens_per_second": tokens_per_second,
         "peak_charged_bytes": peak_charged,
+        "stress_peak_charged_bytes": stress_peak_charged,
         "hold_performance_samples": list(hold_performance),
+        "performance_samples": performance_samples,
     }
     return CampaignObservation(
         arm=arm,
@@ -1062,6 +1337,194 @@ def _metric_summary(
     }
 
 
+_HOLD_PERFORMANCE_FIELDS = (
+    "tokens_per_second",
+    "expert_hit_rate",
+    "ssd_bytes_per_token",
+    "p50_token_latency_ms",
+    "p95_token_latency_ms",
+)
+
+
+def _hold_performance_means(
+    observation: CampaignObservation,
+) -> dict[str, float]:
+    raw_samples = _sequence(
+        observation.metrics["performance_samples"],
+        field="observation.metrics.performance_samples",
+    )
+    samples = [
+        _mapping(sample, field=f"performance_samples[{index}]")
+        for index, sample in enumerate(raw_samples)
+    ]
+    return {
+        field: statistics.fmean(float(sample[field]) for sample in samples)
+        for field in _HOLD_PERFORMANCE_FIELDS
+    }
+
+
+def _hold_expert_physical_bytes(observation: CampaignObservation) -> int:
+    holds = [point for point in observation.timeline if point.phase == "hold"]
+    if not holds:
+        raise BenchmarkGateError("observation has no stable hold timeline")
+    return holds[0].expert_slab_physical_bytes
+
+
+def _hold_expert_slab_bytes(observation: CampaignObservation) -> int:
+    holds = [point for point in observation.timeline if point.phase == "hold"]
+    if not holds:
+        raise BenchmarkGateError("observation has no stable hold timeline")
+    point = holds[0]
+    active_records = int(point.resource_evidence["expert_active_records"])
+    if active_records <= 0:
+        raise BenchmarkGateError("stable hold has no active expert record telemetry")
+    physical_bytes = point.expert_slab_physical_bytes
+    record_bytes, remainder = divmod(physical_bytes, active_records)
+    if record_bytes <= 0 or remainder:
+        raise BenchmarkGateError(
+            "stable hold expert bytes do not divide into active physical records"
+        )
+    arm_config = _mapping(
+        observation.identity["arm_config"], field="observation.identity.arm_config"
+    )
+    streaming = _mapping(
+        arm_config.get("expert_streaming_config"),
+        field="observation.identity.arm_config.expert_streaming_config",
+    )
+    slab_slots = _exact_int(
+        streaming.get("expert_slab_slots"),
+        field="expert_streaming_config.expert_slab_slots",
+        minimum=1,
+    )
+    return slab_slots * record_bytes
+
+
+def _campaign_acceptance_reasons(
+    *,
+    validated: Mapping[tuple[int, int, str], CampaignObservation],
+    summaries: Mapping[str, Mapping[str, object]],
+    repetitions: int,
+) -> list[str]:
+    reasons: list[str] = []
+    for key, observation in validated.items():
+        context_tokens, repetition, arm = key
+        prefix = f"{context_tokens}/{repetition}/{arm}"
+        if int(observation.metrics["peak_charged_bytes"]) > OPERATING_TARGET_BYTES:
+            reasons.append(f"{prefix}: normal charged memory exceeded 110 GiB")
+        if int(observation.metrics["stress_peak_charged_bytes"]) >= HARD_CEILING_BYTES:
+            reasons.append(f"{prefix}: stress charged memory reached 112 GiB")
+        compressed = [
+            int(point.resource_evidence["process_compressed_bytes"])
+            for point in observation.timeline
+        ]
+        if max(compressed) - min(compressed) > MAX_PROCESS_COMPRESSED_GROWTH_BYTES:
+            reasons.append(f"{prefix}: process compressor growth exceeded 512 MiB")
+        for point in observation.timeline:
+            resource = point.resource_evidence
+            if int(resource["charged_bytes"]) > OPERATING_TARGET_BYTES:
+                reasons.append(f"{prefix}: sampled charged memory exceeded 110 GiB")
+                break
+            if int(resource["system_swap_delta_bytes"]) > 0:
+                reasons.append(f"{prefix}: system swap grew during the arm")
+                break
+            if bool(resource["failed_closed"]):
+                reasons.append(f"{prefix}: runtime reported a fail-closed event")
+                break
+            if int(resource["admission_failures"]) > 0:
+                reasons.append(f"{prefix}: request admission failed")
+                break
+            if int(resource["resize_failures"]) > 0:
+                reasons.append(f"{prefix}: expert resize failed")
+                break
+
+    for context_tokens in CONTEXT_MATRIX_TOKENS:
+        summary = summaries[str(context_tokens)]
+        if context_tokens < HY3_Q4_TOTAL_CONTEXT_TOKENS:
+            for repetition in range(repetitions):
+                static = validated[(context_tokens, repetition, "static")]
+                dynamic = validated[(context_tokens, repetition, "dynamic")]
+                if _hold_expert_physical_bytes(dynamic) <= _hold_expert_physical_bytes(
+                    static
+                ):
+                    reasons.append(
+                        f"{context_tokens}/{repetition}: dynamic expert capacity "
+                        "did not exceed the static control"
+                    )
+            hit_summary = _mapping(
+                summary["dynamic_minus_static_expert_hit_rate"],
+                field="expert hit-rate summary",
+            )
+            hit_interval = _sequence(
+                hit_summary["confidence_interval_95"],
+                field="expert hit-rate confidence interval",
+            )
+            ssd_interval = _sequence(
+                _mapping(
+                    summary["dynamic_minus_static_ssd_bytes_per_token"],
+                    field="SSD summary",
+                )["confidence_interval_95"],
+                field="SSD confidence interval",
+            )
+            tps_interval = _sequence(
+                _mapping(
+                    summary["dynamic_vs_static_tps_ratio"],
+                    field="TPS summary",
+                )["confidence_interval_95"],
+                field="TPS confidence interval",
+            )
+            measurable = (
+                float(hit_interval[0]) > 0.0
+                or float(ssd_interval[1]) < 0.0
+                or float(tps_interval[0]) > 1.0
+            )
+            if not measurable:
+                reasons.append(
+                    f"{context_tokens}: extra expert capacity produced no "
+                    "measurable hit-rate, SSD, or TPS improvement"
+                )
+            continue
+
+        for repetition in range(repetitions):
+            static = validated[(context_tokens, repetition, "static")]
+            dynamic = validated[(context_tokens, repetition, "dynamic")]
+            capacity_delta = abs(
+                _hold_expert_physical_bytes(dynamic)
+                - _hold_expert_physical_bytes(static)
+            )
+            slab_tolerance = min(
+                _hold_expert_slab_bytes(static),
+                _hold_expert_slab_bytes(dynamic),
+            )
+            if capacity_delta >= slab_tolerance:
+                reasons.append(
+                    f"{context_tokens}/{repetition}: expert capacity did not "
+                    "converge to the static control"
+                )
+            static_perf = _hold_performance_means(static)
+            dynamic_perf = _hold_performance_means(dynamic)
+            if (
+                dynamic_perf["tokens_per_second"]
+                < (1.0 - MAX_128K_PERFORMANCE_REGRESSION)
+                * static_perf["tokens_per_second"]
+                or dynamic_perf["p50_token_latency_ms"]
+                > (1.0 + MAX_128K_PERFORMANCE_REGRESSION)
+                * static_perf["p50_token_latency_ms"]
+                or dynamic_perf["p95_token_latency_ms"]
+                > (1.0 + MAX_128K_PERFORMANCE_REGRESSION)
+                * static_perf["p95_token_latency_ms"]
+                or dynamic_perf["expert_hit_rate"]
+                < static_perf["expert_hit_rate"] - MAX_128K_PERFORMANCE_REGRESSION
+                or dynamic_perf["ssd_bytes_per_token"]
+                > (1.0 + MAX_128K_PERFORMANCE_REGRESSION)
+                * static_perf["ssd_bytes_per_token"]
+            ):
+                reasons.append(
+                    f"{context_tokens}/{repetition}: stable 128K decode performance "
+                    "regressed by more than 5%"
+                )
+    return list(dict.fromkeys(reasons))
+
+
 def _paired_equal(static: CampaignObservation, dynamic: CampaignObservation) -> None:
     common_identity_fields = (
         "model_key",
@@ -1090,6 +1553,34 @@ def _paired_equal(static: CampaignObservation, dynamic: CampaignObservation) -> 
         raise BenchmarkGateError("paired route hash differs")
     if static.expert_hashes != dynamic.expert_hashes:
         raise BenchmarkGateError("paired expert hashes differ")
+    static_samples = _sequence(
+        static.metrics["performance_samples"], field="static performance_samples"
+    )
+    dynamic_samples = _sequence(
+        dynamic.metrics["performance_samples"], field="dynamic performance_samples"
+    )
+    if len(static_samples) != len(dynamic_samples):
+        raise BenchmarkGateError("paired hold sample count differs")
+    for index, (static_raw, dynamic_raw) in enumerate(
+        zip(static_samples, dynamic_samples, strict=True)
+    ):
+        static_sample = _mapping(static_raw, field=f"static performance sample {index}")
+        dynamic_sample = _mapping(
+            dynamic_raw, field=f"dynamic performance sample {index}"
+        )
+        if (
+            static_sample["generated_token_ids"]
+            != dynamic_sample["generated_token_ids"]
+            or static_sample["generated_token_sha256"]
+            != dynamic_sample["generated_token_sha256"]
+        ):
+            raise BenchmarkGateError(f"paired hold tokens differ at sample {index}")
+        if (
+            static_sample["route_trace"] != dynamic_sample["route_trace"]
+            or static_sample["route_trace_sha256"]
+            != dynamic_sample["route_trace_sha256"]
+        ):
+            raise BenchmarkGateError(f"paired hold routes differ at sample {index}")
     if static.timeline[-1].slot_health != dynamic.timeline[-1].slot_health:
         raise BenchmarkGateError("paired final slot health differs")
 
@@ -1160,14 +1651,22 @@ def run_balanced_campaign(
     summaries: dict[str, dict[str, object]] = {}
     for context_index, context_tokens in enumerate(CONTEXT_MATRIX_TOKENS):
         context_pairs: list[dict[str, object]] = []
-        ratios: list[float] = []
-        deltas: list[float] = []
+        paired_metrics: dict[str, list[float]] = {
+            "dynamic_vs_static_tps_ratio": [],
+            "dynamic_minus_static_tps": [],
+            "dynamic_minus_static_expert_hit_rate": [],
+            "dynamic_minus_static_ssd_bytes_per_token": [],
+            "dynamic_minus_static_p50_token_latency_ms": [],
+            "dynamic_minus_static_p95_token_latency_ms": [],
+        }
         for repetition in range(repetitions):
             static = validated[(context_tokens, repetition, "static")]
             dynamic = validated[(context_tokens, repetition, "dynamic")]
             _paired_equal(static, dynamic)
-            static_tps = float(static.metrics["tokens_per_second"])
-            dynamic_tps = float(dynamic.metrics["tokens_per_second"])
+            static_performance = _hold_performance_means(static)
+            dynamic_performance = _hold_performance_means(dynamic)
+            static_tps = static_performance["tokens_per_second"]
+            dynamic_tps = dynamic_performance["tokens_per_second"]
             ratio = dynamic_tps / static_tps
             delta = dynamic_tps - static_tps
             pair = {
@@ -1182,6 +1681,46 @@ def run_balanced_campaign(
                 "dynamic_tokens_per_second": dynamic_tps,
                 "dynamic_vs_static_tps_ratio": ratio,
                 "dynamic_minus_static_tps": delta,
+                "static_expert_hit_rate": static_performance["expert_hit_rate"],
+                "dynamic_expert_hit_rate": dynamic_performance["expert_hit_rate"],
+                "dynamic_minus_static_expert_hit_rate": (
+                    dynamic_performance["expert_hit_rate"]
+                    - static_performance["expert_hit_rate"]
+                ),
+                "static_ssd_bytes_per_token": static_performance["ssd_bytes_per_token"],
+                "dynamic_ssd_bytes_per_token": dynamic_performance[
+                    "ssd_bytes_per_token"
+                ],
+                "dynamic_minus_static_ssd_bytes_per_token": (
+                    dynamic_performance["ssd_bytes_per_token"]
+                    - static_performance["ssd_bytes_per_token"]
+                ),
+                "static_p50_token_latency_ms": static_performance[
+                    "p50_token_latency_ms"
+                ],
+                "dynamic_p50_token_latency_ms": dynamic_performance[
+                    "p50_token_latency_ms"
+                ],
+                "dynamic_minus_static_p50_token_latency_ms": (
+                    dynamic_performance["p50_token_latency_ms"]
+                    - static_performance["p50_token_latency_ms"]
+                ),
+                "static_p95_token_latency_ms": static_performance[
+                    "p95_token_latency_ms"
+                ],
+                "dynamic_p95_token_latency_ms": dynamic_performance[
+                    "p95_token_latency_ms"
+                ],
+                "dynamic_minus_static_p95_token_latency_ms": (
+                    dynamic_performance["p95_token_latency_ms"]
+                    - static_performance["p95_token_latency_ms"]
+                ),
+                "static_expert_slab_physical_bytes": (
+                    _hold_expert_physical_bytes(static)
+                ),
+                "dynamic_expert_slab_physical_bytes": (
+                    _hold_expert_physical_bytes(dynamic)
+                ),
                 "static_peak_charged_bytes": static.metrics["peak_charged_bytes"],
                 "dynamic_peak_charged_bytes": dynamic.metrics["peak_charged_bytes"],
                 "generated_token_sha256": static.generated_token_sha256,
@@ -1190,25 +1729,40 @@ def run_balanced_campaign(
             }
             context_pairs.append(pair)
             paired_samples.append(pair)
-            ratios.append(ratio)
-            deltas.append(delta)
+            for metric in paired_metrics:
+                paired_metrics[metric].append(float(pair[metric]))
         summaries[str(context_tokens)] = {
             "sample_count": repetitions,
-            "dynamic_vs_static_tps_ratio": _metric_summary(
-                ratios,
-                resamples=bootstrap_resamples,
-                seed=bootstrap_seed + context_index * 2,
-            ),
-            "dynamic_minus_static_tps": _metric_summary(
-                deltas,
-                resamples=bootstrap_resamples,
-                seed=bootstrap_seed + context_index * 2 + 1,
-            ),
+            **{
+                metric: _metric_summary(
+                    values,
+                    resamples=bootstrap_resamples,
+                    seed=bootstrap_seed + context_index * 10 + metric_index,
+                )
+                for metric_index, (metric, values) in enumerate(paired_metrics.items())
+            },
             "raw_pairs": context_pairs,
         }
+    rejection_reasons = _campaign_acceptance_reasons(
+        validated=validated,
+        summaries=summaries,
+        repetitions=repetitions,
+    )
     return {
         "schema": SCHEMA_CAMPAIGN,
-        "status": "passed",
+        "status": "passed" if not rejection_reasons else "rejected",
+        "acceptance": {
+            "passed": not rejection_reasons,
+            "rejection_reasons": rejection_reasons,
+            "operating_target_bytes": OPERATING_TARGET_BYTES,
+            "hard_ceiling_bytes": HARD_CEILING_BYTES,
+            "max_process_compressed_growth_bytes": (
+                MAX_PROCESS_COMPRESSED_GROWTH_BYTES
+            ),
+            "max_128k_performance_regression": (MAX_128K_PERFORMANCE_REGRESSION),
+            "quality_gate_issue": 43,
+            "quality_gate_status": "required-separately",
+        },
         "contexts": list(CONTEXT_MATRIX_TOKENS),
         "repetitions": repetitions,
         "physical_arm_order": [entry.arm for entry in schedule],
@@ -1230,27 +1784,58 @@ def run_exclusive_hardware_window(
     is released only after restoration verification has run.
     """
 
-    lane_acquired = False
-    captured = False
-    state: object = None
-    try:
-        hooks.acquire_lane()
-        lane_acquired = True
-        state = hooks.capture()
-        captured = True
-        hooks.unload(state)
-        return workload()
-    finally:
+    with _termination_cleanup_scope():
+        lane_acquired = False
+        captured = False
+        state: object = None
         try:
-            if captured:
-                hooks.restore(state)
-                if hooks.verify_restored(state) is not True:
-                    raise BenchmarkGateError(
-                        "Qwen state does not exactly match its captured state"
-                    )
+            with _blocked_termination_signals():
+                hooks.acquire_lane()
+                lane_acquired = True
+            state = hooks.capture()
+            captured = True
+            hooks.unload(state)
+            return workload()
         finally:
-            if lane_acquired:
-                hooks.release_lane()
+            with _blocked_termination_signals():
+                if captured:
+                    hooks.restore(state)
+                    if hooks.verify_restored(state) is not True:
+                        raise BenchmarkGateError(
+                            "Qwen state does not exactly match its captured state"
+                        )
+                if lane_acquired:
+                    hooks.release_lane()
+
+
+@contextmanager
+def _termination_cleanup_scope():
+    previous_handlers: dict[int, object] = {}
+
+    def terminate_after_cleanup(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        previous_handlers[signum] = signal.signal(signum, terminate_after_cleanup)
+    try:
+        yield
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+@contextmanager
+def _blocked_termination_signals():
+    blocked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if pthread_sigmask is None:
+        yield
+        return
+    previous = pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        yield
+    finally:
+        pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def run_json_subprocess(
@@ -1368,6 +1953,7 @@ __all__ = [
     "balanced_campaign_schedule",
     "canonical_sha256",
     "format_arm_command",
+    "normalize_arm_config",
     "run_allocator_release_probe",
     "run_balanced_campaign",
     "run_exclusive_hardware_window",

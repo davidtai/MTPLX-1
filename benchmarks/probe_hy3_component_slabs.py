@@ -22,6 +22,7 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (  # noqa: E402
     AllocatorSample,
     ProbeSlab,
     canonical_sha256,
+    normalize_arm_config,
     run_allocator_release_probe,
 )
 from mtplx.expert_manifest import verify_expert_manifest  # noqa: E402
@@ -104,8 +105,7 @@ def build_probe_identity(
     arm_config: Mapping[str, object],
 ) -> dict[str, object]:
     exact_arm = dict(arm_config)
-    normalized = dict(exact_arm)
-    normalized.pop("dynamic_memory", None)
+    normalized = normalize_arm_config(exact_arm)
     return {
         "model_key": "hy3-q4",
         "model_artifact_id": model_artifact_id,

@@ -103,8 +103,24 @@ def test_expert_cli_json_and_flags_are_strict_and_forwarded(tmp_path: Path) -> N
 def test_expert_cli_requires_memory_and_kv_limits(tmp_path: Path) -> None:
     root = _model_root(tmp_path)
     args = _parser().parse_args(["--expert-streaming"])
-    with pytest.raises(ValueError, match="missing memory-limit-bytes, max-live-kv-tokens"):
+    with pytest.raises(
+        ValueError, match="missing memory-limit-bytes, max-live-kv-tokens"
+    ):
         expert_streaming_load_kwargs(args, root)
+
+
+def test_dynamic_memory_opt_in_is_forwarded_even_when_streaming_is_incomplete() -> None:
+    args = SimpleNamespace(
+        expert_streaming=False,
+        expert_streaming_config=None,
+        expert_manifest=None,
+        hy3_q4_dynamic_memory=True,
+    )
+    command: list[str] = []
+
+    append_expert_streaming_child_args(command, args)
+
+    assert command == ["--expert-streaming", "--hy3-q4-dynamic-memory"]
 
 
 class _PhaseModel:

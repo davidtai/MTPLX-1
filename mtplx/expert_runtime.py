@@ -134,6 +134,7 @@ class ExpertStreamingConfig:
     model_key: str
     memory_limit_bytes: int
     max_live_kv_tokens: int
+    kv_bytes_per_token_override: int | None = None
     runtime_reserve_bytes: int = 16 * 1024**3
     expert_cache_limit_bytes: int | None = None
     transient_slots: int | None = None
@@ -179,6 +180,7 @@ class ExpertStreamingConfig:
             )
         for name in (
             "expert_cache_limit_bytes",
+            "kv_bytes_per_token_override",
             "transient_slots",
             "max_inflight_io_bytes",
         ):
@@ -187,6 +189,10 @@ class ExpertStreamingConfig:
                 object.__setattr__(self, name, _integer(name, value, minimum=0))
         if self.max_inflight_io_bytes == 0:
             raise ValueError("max_inflight_io_bytes must be positive when supplied")
+        if self.kv_bytes_per_token_override == 0:
+            raise ValueError(
+                "kv_bytes_per_token_override must be positive when supplied"
+            )
         if isinstance(self.frequency_decay, bool):
             raise TypeError("frequency_decay must be numeric")
         decay = float(self.frequency_decay)
@@ -267,8 +273,16 @@ class ExpertStreamingConfig:
         if self.dynamic_expert_slabs:
             total_limit_bytes = min(total_limit_bytes, 110 * BINARY_GIB)
             context_tokens = 0
+        planning_spec = (
+            spec
+            if self.kv_bytes_per_token_override is None
+            else replace(
+                spec,
+                kv_bytes_per_token=self.kv_bytes_per_token_override,
+            )
+        )
         plan = plan_expert_memory(
-            spec,
+            planning_spec,
             total_limit_bytes=total_limit_bytes,
             context_tokens=context_tokens,
             runtime_reserve_bytes=self.runtime_reserve_bytes,
@@ -1609,9 +1623,7 @@ class ExpertStreamingRuntime:
                 except BaseException as exc:
                     if not getattr(cache, "_closed", False):
                         with condition:
-                            self._pending_physical_kv_caches.setdefault(
-                                identity, cache
-                            )
+                            self._pending_physical_kv_caches.setdefault(identity, cache)
                     if first_error is None:
                         first_error = exc
                     continue

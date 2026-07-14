@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .expert_runtime import ExpertStreamingConfig, parse_memory_bytes
+from .memory_broker import HY3_Q4_KV_BYTES_PER_TOKEN
 
 
 _BYTE_FIELDS = {
     "memory_limit_bytes",
+    "kv_bytes_per_token_override",
     "runtime_reserve_bytes",
     "expert_cache_limit_bytes",
     "io_staging_bytes",
@@ -66,8 +68,12 @@ def add_expert_streaming_args(
         type=int,
         help="Aggregate live KV-token admission ceiling reserved in the memory plan.",
     )
-    group.add_argument("--expert-runtime-reserve", help="Runtime/OS headroom (default 16GiB).")
-    group.add_argument("--expert-cache-limit", help="Optional persistent expert-cache cap.")
+    group.add_argument(
+        "--expert-runtime-reserve", help="Runtime/OS headroom (default 16GiB)."
+    )
+    group.add_argument(
+        "--expert-cache-limit", help="Optional persistent expert-cache cap."
+    )
     group.add_argument(
         "--expert-cache-policy",
         choices=["frequency", "lru"],
@@ -96,8 +102,12 @@ def add_expert_streaming_args(
             help="Minimum interval in milliseconds between expert-slab resizes.",
         )
     group.add_argument("--expert-io-staging", help="Host I/O staging reserve.")
-    group.add_argument("--expert-execution-workspace", help="Execution workspace reserve.")
-    group.add_argument("--expert-max-inflight-io", help="Bound concurrent expert-read bytes.")
+    group.add_argument(
+        "--expert-execution-workspace", help="Execution workspace reserve."
+    )
+    group.add_argument(
+        "--expert-max-inflight-io", help="Bound concurrent expert-read bytes."
+    )
     group.add_argument("--expert-max-open-files", type=int)
     group.add_argument("--expert-read-chunk", help="Maximum positional read chunk.")
     group.add_argument(
@@ -138,6 +148,10 @@ def expert_streaming_requested(args: Any) -> bool:
         getattr(args, "expert_streaming", False)
         or getattr(args, "expert_streaming_config", None)
         or getattr(args, "expert_manifest", None)
+        or getattr(args, "hy3_q4_dynamic_memory", False)
+        or getattr(args, "expert_slab_slots", None) is not None
+        or getattr(args, "expert_regrow_hysteresis_slabs", None) is not None
+        or getattr(args, "expert_resize_min_interval_ms", None) is not None
     )
 
 
@@ -164,7 +178,9 @@ def _load_config_object(path: str | None) -> dict[str, Any]:
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception as exc:
-        raise ValueError(f"could not read expert streaming config {path}: {exc}") from exc
+        raise ValueError(
+            f"could not read expert streaming config {path}: {exc}"
+        ) from exc
     if not isinstance(value, dict):
         raise ValueError("expert streaming config must contain one JSON object")
     return dict(value)
@@ -224,6 +240,7 @@ def expert_streaming_load_kwargs(
     if bool(getattr(args, "hy3_q4_dynamic_memory", False)):
         values["dynamic_expert_slabs"] = True
         values["resource_telemetry"] = True
+        values["kv_bytes_per_token_override"] = HY3_Q4_KV_BYTES_PER_TOKEN
     if "model_key" not in values:
         values["model_key"] = _read_model_key(root)
     values.setdefault("runtime_reserve_bytes", 16 * 1024**3)
@@ -295,13 +312,21 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
                 value = Path(value).expanduser().resolve()
             command.extend([flag, str(value)])
     for attribute, positive, negative in (
-        ("expert_prefer_sidecar", "--expert-prefer-sidecar", "--no-expert-prefer-sidecar"),
+        (
+            "expert_prefer_sidecar",
+            "--expert-prefer-sidecar",
+            "--no-expert-prefer-sidecar",
+        ),
         (
             "expert_verify_record_hashes",
             "--expert-verify-record-hashes",
             "--no-expert-verify-record-hashes",
         ),
-        ("expert_verify_headers", "--expert-verify-headers", "--no-expert-verify-headers"),
+        (
+            "expert_verify_headers",
+            "--expert-verify-headers",
+            "--no-expert-verify-headers",
+        ),
         (
             "expert_verify_sidecar_at_open",
             "--expert-verify-sidecar-at-open",

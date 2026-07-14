@@ -3,7 +3,10 @@
 The Hy3 Q4 dynamic-memory lane is experimental and off by default. It runs one
 full-attention sequence with a 131,072-token Q4 KV cache while a single broker
 shares physical memory with independently releasable expert slabs. The broker's
-normal operating target is 110 GiB and its hard ceiling is 112 GiB.
+normal operating target is 110 GiB and its hard ceiling is 112 GiB. Startup
+pins the physical Q4 geometry to 84,480 bytes per token including scales, or
+10.3125 GiB at 131,072 tokens before block rounding; wider analytical KV
+defaults are rejected for this lane.
 
 ## Exact launch command
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Mapping
 
 from mtplx.hy3_q4_context import HY3_Q4_CONTEXT_WINDOW
+from mtplx.memory_broker import HY3_Q4_KV_BYTES_PER_TOKEN
 
 
 KV_QUANT_MODES = ("off", "q8", "q4")
@@ -28,7 +29,9 @@ class ResolvedAPIKey:
         return bool(self.value)
 
 
-def normalize_paged_kv_quantization(value: object | None, *, allow_none: bool = False) -> str | None:
+def normalize_paged_kv_quantization(
+    value: object | None, *, allow_none: bool = False
+) -> str | None:
     if value is None:
         if allow_none:
             return None
@@ -43,7 +46,9 @@ def normalize_paged_kv_quantization(value: object | None, *, allow_none: bool = 
     if raw in ("4", "4bit", "int4", "uint4", "q4_0"):
         return "q4"
     choices = ", ".join(KV_QUANT_MODES)
-    raise ValueError(f"unsupported paged KV quantization mode {value!r}; expected one of: {choices}")
+    raise ValueError(
+        f"unsupported paged KV quantization mode {value!r}; expected one of: {choices}"
+    )
 
 
 def paged_kv_quantization_env(mode: object | None) -> dict[str, str]:
@@ -54,7 +59,9 @@ def paged_kv_quantization_env(mode: object | None) -> dict[str, str]:
     }
 
 
-def apply_paged_kv_quantization_env(mode: object | None, env: dict[str, str] | None = None) -> str:
+def apply_paged_kv_quantization_env(
+    mode: object | None, env: dict[str, str] | None = None
+) -> str:
     canonical = normalize_paged_kv_quantization(mode)
     target = os.environ if env is None else env
     target.update(paged_kv_quantization_env(canonical))
@@ -171,6 +178,13 @@ def validate_hy3_q4_dynamic_memory_options(
         raise ValueError("--hy3-q4-dynamic-memory requires dynamic_expert_slabs=True")
     if not bool(getattr(expert_streaming_config, "resource_telemetry", False)):
         raise ValueError("--hy3-q4-dynamic-memory requires resource_telemetry=True")
+    if (
+        getattr(expert_streaming_config, "kv_bytes_per_token_override", None)
+        != HY3_Q4_KV_BYTES_PER_TOKEN
+    ):
+        raise ValueError(
+            "--hy3-q4-dynamic-memory requires the exact 84,480-byte Q4 KV geometry"
+        )
     for attribute, flag in _HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS:
         requested = getattr(args, attribute, None)
         if (

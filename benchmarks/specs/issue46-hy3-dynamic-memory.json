@@ -1,0 +1,93 @@
+{
+  "arm_command_template": [
+    "uv",
+    "run",
+    "python",
+    "benchmarks/observe_hy3_dynamic_memory_arm.py",
+    "--repo-root",
+    ".",
+    "--hooks",
+    "mtplx.benchmarks.hy3_dynamic_memory_hardware:create_hooks",
+    "--hooks-config",
+    "benchmarks/specs/issue46-hy3-hardware-hooks.json",
+    "--arm",
+    "{arm}",
+    "--context-tokens",
+    "{context_tokens}",
+    "--repetition",
+    "{repetition}",
+    "--hold-samples",
+    "3",
+    "--hold-interval-seconds",
+    "0.5"
+  ],
+  "bootstrap_resamples": 10000,
+  "bootstrap_seed": 46,
+  "probe_command": [
+    "uv",
+    "run",
+    "python",
+    "benchmarks/probe_hy3_component_slabs.py",
+    "~/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3",
+    "~/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/expert-manifest-sidecar.json",
+    "--slab-slots",
+    "32"
+  ],
+  "qwen": {
+    "acquire_lane_command": [
+      "uv",
+      "run",
+      "python",
+      "benchmarks/hy3_qwen_isolation.py",
+      "acquire",
+      "--expected-model",
+      "mtplx-qwen36-27b-optimized-speed"
+    ],
+    "capture_command": [
+      "uv",
+      "run",
+      "python",
+      "benchmarks/hy3_qwen_isolation.py",
+      "capture",
+      "--expected-model",
+      "mtplx-qwen36-27b-optimized-speed"
+    ],
+    "release_lane_command": [
+      "uv",
+      "run",
+      "python",
+      "benchmarks/hy3_qwen_isolation.py",
+      "release",
+      "--expected-model",
+      "mtplx-qwen36-27b-optimized-speed"
+    ],
+    "restore_command": [
+      "uv",
+      "run",
+      "python",
+      "benchmarks/hy3_qwen_isolation.py",
+      "restore",
+      "--expected-model",
+      "mtplx-qwen36-27b-optimized-speed"
+    ],
+    "unload_command": [
+      "uv",
+      "run",
+      "python",
+      "benchmarks/hy3_qwen_isolation.py",
+      "unload",
+      "--expected-model",
+      "mtplx-qwen36-27b-optimized-speed"
+    ],
+    "verify_command": [
+      "uv",
+      "run",
+      "python",
+      "benchmarks/hy3_qwen_isolation.py",
+      "verify",
+      "--expected-model",
+      "mtplx-qwen36-27b-optimized-speed"
+    ]
+  },
+  "repetitions": 4
+}

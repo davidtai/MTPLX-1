@@ -37,6 +37,9 @@ EXPECTED_QWEN_MODELS = ("mtplx-qwen36-27b-optimized-speed",)
 EXCLUSIVE_LANE = Path("/tmp/mtplx-gpu-exclusive")
 BENCHMARK_PROCESS_PATTERNS = (
     "benchmark_streamed_generation.py",
+    "benchmark_hy3_dynamic_memory.py",
+    "observe_hy3_dynamic_memory_arm.py",
+    "probe_hy3_component_slabs.py",
     "probe_mtp",
     "probe_paged",
 )
@@ -598,7 +601,8 @@ def _assert_clean_sha(repo: Path, expected_sha: str | None = None) -> str:
     return sha
 
 
-def _matching_processes() -> tuple[int, ...]:
+def _matching_processes(*, exclude_pids: Sequence[int] = ()) -> tuple[int, ...]:
+    ignored = {os.getpid(), os.getppid(), *exclude_pids}
     matches: set[int] = set()
     for pattern in BENCHMARK_PROCESS_PATTERNS:
         output = _run_text(("pgrep", "-f", pattern), check=False)
@@ -607,14 +611,18 @@ def _matching_processes() -> tuple[int, ...]:
                 pid = int(item.strip())
             except ValueError:
                 continue
-            if pid != os.getpid():
+            if pid not in ignored:
                 matches.add(pid)
     return tuple(sorted(matches))
 
 
-def _acquire_lane(*, poll_seconds: float) -> None:
+def _acquire_lane(
+    *,
+    poll_seconds: float,
+    exclude_pids: Sequence[int] = (),
+) -> None:
     while True:
-        competitors = _matching_processes()
+        competitors = _matching_processes(exclude_pids=exclude_pids)
         if EXCLUSIVE_LANE.exists():
             if not competitors:
                 raise RuntimeError(
@@ -635,7 +643,7 @@ def _acquire_lane(*, poll_seconds: float) -> None:
             EXCLUSIVE_LANE.mkdir()
         except FileExistsError:
             continue
-        competitors = _matching_processes()
+        competitors = _matching_processes(exclude_pids=exclude_pids)
         if not competitors:
             return
         EXCLUSIVE_LANE.rmdir()

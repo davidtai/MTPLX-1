@@ -13,6 +13,18 @@ from mtplx.hy3_q4_context import SingleSequenceGate, admit_hy3_q4_context
 from mtplx.server import openai
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_environment() -> object:
+    """Keep ServerState's intentional process-wide env writes test-local."""
+
+    before = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(before)
+
+
 def _expert_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     add_expert_streaming_args(parser, include_hy3_dynamic_memory=True)
@@ -140,9 +152,31 @@ def test_dynamic_memory_opt_in_forces_instrumented_dynamic_expert_config(
     assert kwargs["mtp"] is False
     assert config.dynamic_expert_slabs is True
     assert config.resource_telemetry is True
+    assert config.kv_bytes_per_token_override == 84_480
     assert config.expert_slab_slots == 64
     assert config.expert_regrow_hysteresis_slabs == 2
     assert config.expert_resize_min_interval_ms == 250
+
+
+def test_dynamic_memory_attestation_rejects_non_q4_physical_kv_geometry() -> None:
+    args = SimpleNamespace(
+        hy3_q4_dynamic_memory=True,
+        hy3_q4_dynamic_context=True,
+        expert_streaming=True,
+        expert_streaming_config=None,
+        expert_manifest=None,
+        expert_slab_slots=None,
+        expert_regrow_hysteresis_slabs=None,
+        expert_resize_min_interval_ms=None,
+    )
+    config = SimpleNamespace(
+        dynamic_expert_slabs=True,
+        resource_telemetry=True,
+        kv_bytes_per_token_override=327_680,
+    )
+
+    with pytest.raises(ValueError, match="84,480-byte Q4 KV"):
+        openai.validate_hy3_q4_dynamic_memory_options(args, config)
 
 
 def test_dynamic_memory_requires_dynamic_context_before_model_load(

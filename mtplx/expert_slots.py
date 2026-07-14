@@ -2832,6 +2832,21 @@ class ExpertSlotPool:
             "completion_fences": self._completion_fence_telemetry.snapshot(),
         }
 
+    def health_telemetry_snapshot(self) -> dict[str, Any]:
+        """Return exact slot health without draining queued completion fences."""
+
+        states: dict[str, int] = {state.value: 0 for state in ExpertSlotState}
+        pins = 0
+        for slot in (*self._persistent.values(), *self._transient):
+            with slot.condition:
+                states[slot.state.value] += 1
+                pins += slot.pins
+        return {
+            "metrics": self.metrics.as_dict(),
+            "states": states,
+            "pins": pins,
+        }
+
     def reset(self) -> None:
         self._retry_cleanup_owners()
         self._raise_completion_error()

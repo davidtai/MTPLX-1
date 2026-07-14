@@ -1,0 +1,615 @@
+from __future__ import annotations
+
+import importlib
+import json
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+import mtplx.benchmarks.hy3_dynamic_memory_observation as observation_module
+from mtplx.benchmarks.hy3_dynamic_memory_observation import (
+    ArmObservationError,
+    ArmRequest,
+    load_tracked_hooks,
+    main,
+    produce_arm_observation,
+    require_clean_source,
+)
+from mtplx.benchmarks.runners.hy3_dynamic_memory import (
+    HY3_Q4_KV_BLOCK_BYTES,
+    HY3_Q4_MAX_BLOCKS,
+    canonical_sha256,
+    format_arm_command,
+    validate_campaign_observation,
+)
+
+
+SOURCE_COMMIT = "a" * 40
+
+
+class FakeLane:
+    def __init__(self, arm: str, calls: list[str]) -> None:
+        self.arm = arm
+        self.calls = calls
+        self.expert_bytes = 800
+        self.kv_blocks = HY3_Q4_MAX_BLOCKS if arm == "static" else 1
+        self.hold_tps: Iterator[float] = iter((15.9, 16.0, 16.1))
+        self.hold_sample_index = 0
+
+    def identity(self) -> dict[str, object]:
+        self.calls.append("identity")
+        return {
+            "model_key": "hy3-q4",
+            "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "model_artifact_sha256": "1" * 64,
+            "expert_manifest_id": "expert-manifest.json",
+            "expert_manifest_sha256": "2" * 64,
+            "source_git_commit": SOURCE_COMMIT,
+            "arm_config": {
+                "dynamic_memory": self.arm == "dynamic",
+                "context_window": 131_072,
+            },
+            "kv_quantization": "q4",
+            "kv_block_size_tokens": 16,
+            "total_context_tokens": 131_072,
+        }
+
+    def physical_ledger(self) -> dict[str, object]:
+        self.calls.append("ledger")
+        kv_bytes = self.kv_blocks * HY3_Q4_KV_BLOCK_BYTES
+        active_bytes = self.expert_bytes + kv_bytes
+        allocator_cache_bytes = 7
+        runtime_workspace_bytes = 64
+        return {
+            "allocator_active_bytes": active_bytes,
+            "allocator_cache_bytes": allocator_cache_bytes,
+            "allocator_peak_bytes": self.expert_bytes + kv_bytes,
+            "expert_slab_physical_bytes": self.expert_bytes,
+            "kv_physical_bytes": kv_bytes,
+            "kv_allocated_blocks": self.kv_blocks,
+            "slot_health": {
+                "active_routes": 0,
+                "pins": 0,
+                "loading": 0,
+                "failed": 0,
+                "integrity_errors": 0,
+                "completion_fence_failures": 0,
+            },
+            "operating_target_bytes": 110 * 1024**3,
+            "hard_ceiling_bytes": 112 * 1024**3,
+            "charged_bytes": (
+                active_bytes + runtime_workspace_bytes + allocator_cache_bytes
+            ),
+            "resident_model_bytes": 0,
+            "kv_representation": "q4",
+            "kv_logical_tokens": self.kv_blocks * 16,
+            "expert_logical_records": self.expert_bytes,
+            "expert_active_records": self.expert_bytes,
+            "expert_resident_records": self.expert_bytes,
+            "expert_logical_slabs": self.expert_bytes,
+            "expert_active_slabs": self.expert_bytes,
+            "expert_draining_slabs": 0,
+            "expert_released_slabs": 0,
+            "pinned_expert_bytes": 0,
+            "inflight_expert_bytes": 0,
+            "speculative_expert_bytes": 0,
+            "runtime_workspace_bytes": runtime_workspace_bytes,
+            "inflight_expert_staging_bytes": 0,
+            "requested_reclaim_bytes": 0,
+            "reclaimed_bytes": 0,
+            "regrown_bytes": 0,
+            "evicted_expert_records": 0,
+            "evicted_expert_slabs": 0,
+            "resize_duration_ns": 0,
+            "total_resize_duration_ns": 0,
+            "max_resize_duration_ns": 0,
+            "blocked_by_pin_bytes": 0,
+            "admission_failures": 0,
+            "resize_failures": 0,
+            "allocator_cache_charged_bytes": allocator_cache_bytes,
+            "process_rss_bytes": active_bytes,
+            "process_compressed_bytes": 0,
+            "system_swap_delta_bytes": 0,
+            "failed_closed": False,
+            "failure_reason": None,
+        }
+
+    def reclaim_experts_for_q4(self, context_tokens: int) -> None:
+        self.calls.append(f"reclaim:{context_tokens}")
+        self.expert_bytes = 600
+
+    def prepare_q4_context(self, context_tokens: int) -> None:
+        self.calls.append(f"prepare:{context_tokens}")
+        if self.arm == "dynamic":
+            self.kv_blocks = context_tokens // 16
+
+    def invoke_context(self, context_tokens: int) -> dict[str, object]:
+        self.calls.append(f"invoke:{context_tokens}")
+        return {
+            "prompt_token_ids": [11, context_tokens, 12],
+            "generated_token_ids": [101, 202, 303, 404],
+            "route_trace": [[0, 3, 7], [1, 2, 9]],
+            "expert_hashes": {"0:3": "3" * 64, "1:2": "4" * 64},
+            "elapsed_seconds": 0.25,
+        }
+
+    def sample_hold_performance(self) -> dict[str, object]:
+        self.calls.append("sample_hold")
+        sample_index = self.hold_sample_index
+        self.hold_sample_index += 1
+        return {
+            "tokens_per_second": next(self.hold_tps),
+            "expert_hit_rate": 0.75,
+            "ssd_bytes_per_token": 1024.0,
+            "p50_token_latency_ms": 62.0,
+            "p95_token_latency_ms": 70.0,
+            "generated_token_ids": [
+                500 + sample_index * 10 + offset for offset in range(8)
+            ],
+            "route_trace": [
+                {
+                    "phase": "ar_decode",
+                    "layer": sample_index + 1,
+                    "expert_ids": [3, 7, 11],
+                }
+            ],
+        }
+
+    def reset_q4_context(self) -> None:
+        self.calls.append("reset")
+        self.kv_blocks = 0
+
+    def trigger_future_expert_demand(self) -> None:
+        self.calls.append("future_demand")
+        self.expert_bytes = 800
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+
+class FakeHooks:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def load_static_lane(self, request: ArmRequest) -> FakeLane:
+        self.calls.append(f"load_static:{request.context_tokens}")
+        return FakeLane("static", self.calls)
+
+    def load_dynamic_lane(self, request: ArmRequest) -> FakeLane:
+        self.calls.append(f"load_dynamic:{request.context_tokens}")
+        return FakeLane("dynamic", self.calls)
+
+
+class FixedHoldHooks(FakeHooks):
+    hold_samples = 4
+
+
+class BrokenQ4LedgerLane(FakeLane):
+    def physical_ledger(self) -> dict[str, object]:
+        result = super().physical_ledger()
+        result["kv_physical_bytes"] = int(result["kv_physical_bytes"]) + 1
+        return result
+
+
+class BrokenQ4LedgerHooks(FakeHooks):
+    def load_dynamic_lane(self, request: ArmRequest) -> FakeLane:
+        self.calls.append(f"load_dynamic:{request.context_tokens}")
+        return BrokenQ4LedgerLane("dynamic", self.calls)
+
+
+class CapturedReclaimLane(FakeLane):
+    captured_reclaim_pending = False
+
+    def reclaim_experts_for_q4(self, context_tokens: int) -> None:
+        super().reclaim_experts_for_q4(context_tokens)
+        self.captured_reclaim_pending = True
+
+    def physical_ledger(self) -> dict[str, object]:
+        result = super().physical_ledger()
+        if self.captured_reclaim_pending:
+            result["captured_monotonic_ns"] = 200
+            self.captured_reclaim_pending = False
+        return result
+
+
+class CapturedReclaimHooks(FakeHooks):
+    def load_dynamic_lane(self, request: ArmRequest) -> FakeLane:
+        self.calls.append(f"load_dynamic:{request.context_tokens}")
+        return CapturedReclaimLane("dynamic", self.calls)
+
+
+def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
+    calls: list[str] = []
+    timestamps = iter(
+        (
+            1,
+            2,
+            3,
+            4_000_000_000,
+            4_500_000_000,
+            5_000_000_000,
+            6_000_000_000,
+            7_000_000_000,
+        )
+    )
+
+    result = produce_arm_observation(
+        hooks=FakeHooks(calls),
+        request=ArmRequest(arm="dynamic", context_tokens=4096, repetition=2),
+        source_git_commit=SOURCE_COMMIT,
+        monotonic_ns=lambda: next(timestamps),
+        sleep=lambda _seconds: None,
+    )
+
+    validated = validate_campaign_observation(result)
+    assert validated.arm == "dynamic"
+    assert result["schema"] == "mtplx-hy3-dynamic-memory-observation-v1"
+    assert result["prompt_sha256"] == canonical_sha256([11, 4096, 12])
+    assert result["generated_token_sha256"] == canonical_sha256([101, 202, 303, 404])
+    assert result["route_trace_sha256"] == canonical_sha256([[0, 3, 7], [1, 2, 9]])
+    assert [point["phase"] for point in result["timeline"]] == [
+        "pre_growth",
+        "post_expert_reclaim",
+        "post_kv_growth",
+        "hold",
+        "hold",
+        "hold",
+        "post_reset",
+        "post_regrow",
+    ]
+    assert result["lifecycle"] == {
+        "reset_observed": True,
+        "future_demand_invoked": True,
+        "post_regrow_observed": True,
+    }
+    assert result["metrics"]["hold_performance_samples"] == [15.9, 16.0, 16.1]
+    assert result["metrics"]["peak_charged_bytes"] == max(
+        point["charged_bytes"] for point in result["timeline"]
+    )
+    first_sample = result["metrics"]["performance_samples"][0]
+    assert first_sample["expert_hit_rate"] == 0.75
+    assert first_sample["generated_token_ids"] == list(range(500, 508))
+    assert first_sample["generated_token_sha256"] == canonical_sha256(
+        list(range(500, 508))
+    )
+    assert first_sample["route_trace"] == [
+        {"phase": "ar_decode", "layer": 1, "expert_ids": [3, 7, 11]}
+    ]
+    assert first_sample["route_trace_sha256"] == canonical_sha256(
+        [{"phase": "ar_decode", "layer": 1, "expert_ids": [3, 7, 11]}]
+    )
+    assert "load_static:4096" not in calls
+    assert calls[-3:] == ["future_demand", "ledger", "close"]
+
+
+def test_producer_rejects_hold_count_that_drifts_from_hardware_prompt_reserve() -> None:
+    calls: list[str] = []
+
+    with pytest.raises(ArmObservationError, match="hold sample count"):
+        produce_arm_observation(
+            hooks=FixedHoldHooks(calls),
+            request=ArmRequest(arm="dynamic", context_tokens=4096, repetition=0),
+            source_git_commit=SOURCE_COMMIT,
+            hold_samples=3,
+        )
+
+    assert calls == []
+
+
+def test_static_producer_uses_reserved_control_without_reclaim_or_regrow() -> None:
+    calls: list[str] = []
+    timestamps = iter(
+        (1, 2, 3_000_000_000, 3_500_000_000, 4_000_000_000, 5_000_000_000)
+    )
+
+    result = produce_arm_observation(
+        hooks=FakeHooks(calls),
+        request=ArmRequest(arm="static", context_tokens=32_768, repetition=1),
+        source_git_commit=SOURCE_COMMIT,
+        monotonic_ns=lambda: next(timestamps),
+        sleep=lambda _seconds: None,
+    )
+
+    validated = validate_campaign_observation(result)
+    assert validated.arm == "static"
+    assert result["cache_start_state"] == {
+        "kind": "static-128k-reserved-q4",
+        "kv_physical_bytes": HY3_Q4_MAX_BLOCKS * HY3_Q4_KV_BLOCK_BYTES,
+        "kv_blocks": HY3_Q4_MAX_BLOCKS,
+    }
+    assert [point["phase"] for point in result["timeline"]] == [
+        "pre_growth",
+        "post_kv_growth",
+        "hold",
+        "hold",
+        "hold",
+        "post_reset",
+    ]
+    assert result["lifecycle"] == {
+        "reset_observed": True,
+        "future_demand_invoked": False,
+        "post_regrow_observed": False,
+    }
+    assert "load_dynamic:32768" not in calls
+    assert not any(call.startswith("reclaim:") for call in calls)
+    assert "future_demand" not in calls
+    assert calls[-2:] == ["ledger", "close"]
+
+
+def test_contradictory_q4_ledger_fails_before_model_invocation_and_closes() -> None:
+    calls: list[str] = []
+
+    with pytest.raises(ArmObservationError, match="Q4 block geometry"):
+        produce_arm_observation(
+            hooks=BrokenQ4LedgerHooks(calls),
+            request=ArmRequest(arm="dynamic", context_tokens=4096, repetition=0),
+            source_git_commit=SOURCE_COMMIT,
+            monotonic_ns=lambda: 1,
+            sleep=lambda _seconds: None,
+        )
+
+    assert "invoke:4096" not in calls
+    assert calls[-1] == "close"
+
+
+def test_producer_preserves_timestamp_captured_inside_reclaim_allocation_gap() -> None:
+    timestamps = iter(
+        (
+            100,
+            300,
+            1_000_000_000,
+            2_000_000_000,
+            3_000_000_000,
+            4_000_000_000,
+            5_000_000_000,
+            6_000_000_000,
+        )
+    )
+
+    result = produce_arm_observation(
+        hooks=CapturedReclaimHooks([]),
+        request=ArmRequest(arm="dynamic", context_tokens=4096, repetition=0),
+        source_git_commit=SOURCE_COMMIT,
+        monotonic_ns=lambda: next(timestamps),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result["timeline"][1]["phase"] == "post_expert_reclaim"
+    assert result["timeline"][1]["monotonic_ns"] == 200
+    assert result["timeline"][2]["monotonic_ns"] == 300
+
+
+def test_clean_source_requires_exact_repo_root_full_commit_and_no_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path.resolve()
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git_output(repo_root: Path, *args: str) -> str:
+        assert repo_root == root
+        calls.append(args)
+        if args == ("rev-parse", "--show-toplevel"):
+            return str(root)
+        if args == ("rev-parse", "HEAD"):
+            return SOURCE_COMMIT
+        if args == ("ls-files", "-v"):
+            return "H tracked.py"
+        if args == ("status", "--porcelain=v1", "--untracked-files=all"):
+            return ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(observation_module, "_git_output", fake_git_output)
+
+    assert require_clean_source(root) == SOURCE_COMMIT
+    assert calls == [
+        ("rev-parse", "--show-toplevel"),
+        ("rev-parse", "HEAD"),
+        ("ls-files", "-v"),
+        ("status", "--porcelain=v1", "--untracked-files=all"),
+    ]
+
+    def dirty_git_output(repo_root: Path, *args: str) -> str:
+        if args == ("rev-parse", "--show-toplevel"):
+            return str(repo_root)
+        if args == ("rev-parse", "HEAD"):
+            return SOURCE_COMMIT
+        if args == ("ls-files", "-v"):
+            return "H tracked.py"
+        return "?? local_issue46_hooks.py"
+
+    monkeypatch.setattr(observation_module, "_git_output", dirty_git_output)
+    with pytest.raises(ArmObservationError, match="clean source worktree"):
+        require_clean_source(root)
+
+
+def test_hook_loader_checks_factory_source_is_tracked_and_passes_exact_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = tmp_path / "issue46_test_hooks.py"
+    module_path.write_text(
+        """
+class Hooks:
+    def __init__(self, config):
+        self.config = config
+    def load_static_lane(self, request):
+        raise AssertionError(request)
+    def load_dynamic_lane(self, request):
+        raise AssertionError(request)
+
+def create_hooks(config):
+    return Hooks(config)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    tracked: list[Path] = []
+    monkeypatch.setattr(
+        observation_module,
+        "_require_tracked_file",
+        lambda repo_root, path: tracked.append(path.resolve()),
+    )
+
+    hooks = load_tracked_hooks(
+        "issue46_test_hooks:create_hooks",
+        {"model": "/models/hy3", "slab_slots": 32},
+        repo_root=tmp_path,
+    )
+
+    assert hooks.config == {"model": "/models/hy3", "slab_slots": 32}
+    assert tracked == [module_path.resolve()]
+
+
+def test_hook_loader_fails_closed_when_factory_source_is_untracked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = tmp_path / "issue46_untracked_hooks.py"
+    module_path.write_text(
+        """
+class Hooks:
+    load_static_lane = lambda self, request: None
+    load_dynamic_lane = lambda self, request: None
+
+def create_hooks(config):
+    return Hooks()
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    def reject_untracked(_repo_root: Path, path: Path) -> None:
+        raise ArmObservationError(f"hook factory source is not tracked: {path.name}")
+
+    monkeypatch.setattr(
+        observation_module,
+        "_require_tracked_file",
+        reject_untracked,
+    )
+
+    with pytest.raises(ArmObservationError, match="not tracked"):
+        load_tracked_hooks(
+            "issue46_untracked_hooks:create_hooks",
+            {},
+            repo_root=tmp_path,
+        )
+
+
+def test_json_only_cli_is_direct_arm_command_template_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "arm-hooks.json"
+    config_path.write_text(json.dumps({"model_root": "/models/hy3"}), encoding="utf-8")
+    hooks = object()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        observation_module,
+        "require_clean_source",
+        lambda _repo_root: SOURCE_COMMIT,
+    )
+    monkeypatch.setattr(
+        observation_module,
+        "_require_tracked_file",
+        lambda _repo_root, _path: None,
+    )
+
+    def fake_load_hooks(spec: str, config: object, *, repo_root: Path) -> object:
+        print("hook factory diagnostic")
+        captured.update(spec=spec, config=config, repo_root=repo_root)
+        return hooks
+
+    def fake_produce(**kwargs: object) -> dict[str, object]:
+        print("lane diagnostic")
+        captured.update(kwargs)
+        request = kwargs["request"]
+        assert isinstance(request, ArmRequest)
+        return {
+            "schema": "mtplx-hy3-dynamic-memory-observation-v1",
+            "arm": request.arm,
+            "context_tokens": request.context_tokens,
+            "repetition": request.repetition,
+        }
+
+    monkeypatch.setattr(observation_module, "load_tracked_hooks", fake_load_hooks)
+    monkeypatch.setattr(observation_module, "produce_arm_observation", fake_produce)
+    command = format_arm_command(
+        (
+            "observe-hy3-arm",
+            "--repo-root",
+            str(tmp_path),
+            "--hooks",
+            "tracked_hooks:create_hooks",
+            "--hooks-config",
+            str(config_path),
+            "--arm",
+            "{arm}",
+            "--context-tokens",
+            "{context_tokens}",
+            "--repetition",
+            "{repetition}",
+        ),
+        arm="dynamic",
+        context_tokens=65_536,
+        repetition=3,
+    )
+
+    assert main(command[1:]) == 0
+
+    output = capsys.readouterr()
+    assert json.loads(output.out) == {
+        "schema": "mtplx-hy3-dynamic-memory-observation-v1",
+        "arm": "dynamic",
+        "context_tokens": 65_536,
+        "repetition": 3,
+    }
+    assert "hook factory diagnostic" in output.err
+    assert "lane diagnostic" in output.err
+    assert captured["spec"] == "tracked_hooks:create_hooks"
+    assert captured["config"] == {"model_root": "/models/hy3"}
+    request = captured["request"]
+    assert isinstance(request, ArmRequest)
+    assert request.context_tokens == 65_536
+
+
+def test_json_only_cli_emits_no_partial_json_when_source_is_dirty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "arm-hooks.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        observation_module,
+        "require_clean_source",
+        lambda _repo_root: (_ for _ in ()).throw(
+            ArmObservationError("clean source worktree required")
+        ),
+    )
+
+    exit_code = main(
+        (
+            "--repo-root",
+            str(tmp_path),
+            "--hooks",
+            "tracked_hooks:create_hooks",
+            "--hooks-config",
+            str(config_path),
+            "--arm",
+            "static",
+            "--context-tokens",
+            "4096",
+            "--repetition",
+            "0",
+        )
+    )
+
+    output = capsys.readouterr()
+    assert exit_code == 2
+    assert output.out == ""
+    assert "clean source worktree required" in output.err
