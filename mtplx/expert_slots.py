@@ -2291,7 +2291,7 @@ class ExpertSlotPool:
             physical_bytes = sum(
                 slab.physical_bytes
                 for slab in slabs
-                if slab.state is ExpertSlabState.ACTIVE
+                if slab.state is not ExpertSlabState.RELEASED
                 or slab.slab_id in self._slab_ambiguous_allocations
             )
             active_slot_ids = tuple(
@@ -2802,7 +2802,7 @@ class ExpertSlotPool:
                 "physical_bytes": sum(
                     slab.physical_bytes
                     for slab_id, slab in self._slabs.items()
-                    if slab.state is ExpertSlabState.ACTIVE
+                    if slab.state is not ExpertSlabState.RELEASED
                     or slab_id in self._slab_ambiguous_allocations
                 ),
             },

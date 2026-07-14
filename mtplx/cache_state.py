@@ -13,6 +13,7 @@ import time
 from typing import Any, Protocol
 
 from .attention_context import current_attention_phase
+from .memory_broker import TerminalizedKVReleaseError
 
 SUPPORTED_DETACH_MODES = {
     "eval_only",
@@ -959,6 +960,9 @@ class VllmMetalPagedKVCache:
         self._kv_allocations: list[Any] = []
         self._committed_physical_bytes = 0
         self._closed = False
+        self._close_started = False
+        self._close_arrays_dropped = False
+        self._close_allocator_before = None
         self._shape: tuple[int, int, int] | None = None
         self._dtypes: tuple[Any, Any] | None = None
         self.update_calls = 0
@@ -1383,8 +1387,8 @@ class VllmMetalPagedKVCache:
     def _ensure_allocated(self, keys: Any, values: Any) -> None:
         import mlx.core as mx
 
-        if self._closed:
-            raise RuntimeError("paged KV cache is closed")
+        if self._closed or self._close_started:
+            raise RuntimeError("paged KV cache is closed or closing")
         if int(keys.shape[0]) != 1:
             raise ValueError("VllmMetalPagedKVCache currently supports batch size 1")
         shape = (int(keys.shape[1]), int(keys.shape[3]), int(values.shape[3]))
@@ -2092,6 +2096,11 @@ class VllmMetalPagedKVCache:
 
     @keys.setter
     def keys(self, value) -> None:
+        if self.allocation_observer is not None:
+            raise RuntimeError(
+                "broker-owned paged KV state cannot be replaced; close its "
+                "physical ownership unit instead"
+            )
         if value is None:
             self.key_cache = None
             self.value_cache = None
@@ -2109,6 +2118,11 @@ class VllmMetalPagedKVCache:
 
     @values.setter
     def values(self, value) -> None:
+        if self.allocation_observer is not None:
+            raise RuntimeError(
+                "broker-owned paged KV state cannot be replaced; close its "
+                "physical ownership unit instead"
+            )
         if value is None:
             self.key_cache = None
             self.value_cache = None
@@ -2136,6 +2150,11 @@ class VllmMetalPagedKVCache:
 
     @state.setter
     def state(self, value) -> None:
+        if self.allocation_observer is not None:
+            raise RuntimeError(
+                "broker-owned paged KV state cannot be replaced; close its "
+                "physical ownership unit instead"
+            )
         keys, values = value
         self.key_cache = None
         self.value_cache = None
@@ -2156,6 +2175,11 @@ class VllmMetalPagedKVCache:
     def meta_state(self, value) -> None:
         if not value:
             return
+        if self.allocation_observer is not None:
+            raise RuntimeError(
+                "broker-owned paged KV meta state cannot be replaced; close its "
+                "physical ownership unit instead"
+            )
         self.block_size = int(value[0])
         self.num_blocks = int(value[1])
         self.offset = int(value[2])
@@ -2173,49 +2197,76 @@ class VllmMetalPagedKVCache:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        self._close_started = True
         observer = self.allocation_observer
         allocations = tuple(self._kv_allocations)
         released = self._committed_physical_bytes
-        allocator_before = None
-        allocator_after = None
-        first_error: BaseException | None = None
-        if observer is not None and allocations:
-            try:
-                allocator_before = observer.sample_allocator_memory()
-            except BaseException as exc:
-                first_error = exc
-        self._drop_physical_arrays()
-        try:
-            import mlx.core as mx
 
-            mx.clear_cache()
-        except BaseException as exc:
-            if first_error is None:
-                first_error = exc
-        if observer is not None and allocations:
+        if observer is None or not allocations:
+            self._drop_physical_arrays()
             try:
-                allocator_after = observer.sample_allocator_memory()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-            try:
-                observer.release_cache(
-                    cache_id=self.cache_id,
-                    allocations=allocations,
-                    released_physical_bytes=released,
-                    allocator_before=allocator_before,
-                    allocator_after=allocator_after,
-                )
-            except BaseException as accounting_error:
-                if first_error is not None:
-                    raise accounting_error from first_error
-                raise
+                import mlx.core as mx
+
+                mx.clear_cache()
             finally:
-                self._kv_allocations.clear()
-                self._committed_physical_bytes = 0
-        if first_error is not None:
-            raise first_error
+                self._closed = True
+            return
+
+        clear_error: BaseException | None = None
+        if not self._close_arrays_dropped:
+            # Do not cross the physical-release boundary until its baseline is
+            # known.  A telemetry failure here is retryable with pages and
+            # allocation handles still intact.
+            self._close_allocator_before = observer.sample_allocator_memory()
+            self._drop_physical_arrays()
+            self._close_arrays_dropped = True
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except BaseException as exc:
+                clear_error = exc
+
+        try:
+            allocator_after = observer.sample_allocator_memory()
+        except BaseException as sample_error:
+            if clear_error is not None:
+                raise sample_error from clear_error
+            raise
+
+        try:
+            observer.release_cache(
+                cache_id=self.cache_id,
+                allocations=allocations,
+                released_physical_bytes=released,
+                allocator_before=self._close_allocator_before,
+                allocator_after=allocator_after,
+            )
+        except TerminalizedKVReleaseError as terminal_error:
+            # The broker replaced these live handles with conservative
+            # residual accounting.  Retrying would be a duplicate release;
+            # finish the local close without claiming any memory credit.
+            self._kv_allocations.clear()
+            self._committed_physical_bytes = 0
+            self._close_allocator_before = None
+            self._closed = True
+            if clear_error is not None:
+                raise terminal_error from clear_error
+            raise
+        except BaseException as accounting_error:
+            # Keep the exact handles and the pre-release allocator sample: a
+            # transaction-busy or transient telemetry failure can be retried
+            # without double-dropping pages or inventing ownership.
+            if clear_error is not None:
+                raise accounting_error from clear_error
+            raise
+
+        self._kv_allocations.clear()
+        self._committed_physical_bytes = 0
+        self._close_allocator_before = None
+        self._closed = True
+        if clear_error is not None:
+            raise clear_error
 
     def __del__(self) -> None:
         try:

@@ -592,12 +592,6 @@ def load(
             mtp_enabled = inject_mtp_support(model, path, config, contract)
         if not mtp_enabled or not validate_mtp_support(model):
             raise RuntimeError(f"MTP injection failed for {path}")
-    if expert_runtime is not None and expert_runtime.memory_broker is not None:
-        try:
-            expert_runtime.reconcile_post_load_memory()
-        except BaseException:
-            expert_runtime.close()
-            raise
     from .attention_split import configure_split_full_attention
     from .native_mlp import configure_native_mlp
 
@@ -625,6 +619,12 @@ def load(
             adapter_merge_report = merge_installed_mtp_lora_adapters(model)
     elif merge_mtp_adapter:
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
+    if expert_runtime is not None and expert_runtime.memory_broker is not None:
+        try:
+            expert_runtime.reconcile_post_load_memory()
+        except BaseException:
+            expert_runtime.close()
+            raise
     return MTPLXRuntime(
         model,
         tokenizer,

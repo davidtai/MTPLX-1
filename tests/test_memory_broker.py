@@ -20,6 +20,7 @@ from mtplx.memory_broker import (
     MemoryBudget,
     MemoryTelemetryError,
     MemoryTransactionError,
+    TerminalizedKVReleaseError,
     UnifiedMemoryBroker,
     hy3_q4_kv_physical_geometry,
 )
@@ -239,6 +240,37 @@ def test_allocator_cache_reconciliation_cannot_interrupt_a_transaction() -> None
     snapshot = broker.snapshot()
     assert snapshot.pending_kv_ticket_id == ticket.ticket_id
     assert snapshot.allocator_cache_bytes == 5
+
+
+def test_post_load_classification_reconciliation_preserves_kv_owner_handles() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=40, experts=20, workspace=10),
+        expert_slab_bytes=10,
+    )
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=4,
+        transient_delta_bytes=0,
+        cache_id="target:existing",
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=4)
+
+    snapshot = broker.reconcile_post_load_classification(
+        resident_model_bytes=45,
+        expert_slab_physical_bytes=20,
+        in_flight_expert_staging_bytes=5,
+        runtime_workspace_bytes=5,
+    )
+
+    assert snapshot.owned_kv_physical_bytes == 4
+    broker.release_kv_batch(
+        cache_id="target:existing",
+        allocations=(allocation,),
+        registered_kv_bytes_after=0,
+        allocator_before=AllocatorMemorySample(4, 0, 4),
+        allocator_after=AllocatorMemorySample(0, 0, 4),
+    )
+    assert broker.snapshot().owned_kv_physical_bytes == 0
 
 
 def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:
@@ -855,7 +887,7 @@ def test_kv_release_size_mismatch_preserves_observed_truth_and_fails_closed() ->
         allocated_physical_bytes=GIB,
     )
 
-    with pytest.raises(MemoryTelemetryError, match="registered KV"):
+    with pytest.raises(TerminalizedKVReleaseError, match="registered KV"):
         broker.release_kv(
             allocation,
             registered_kv_bytes_after=GIB // 2,
@@ -866,6 +898,35 @@ def test_kv_release_size_mismatch_preserves_observed_truth_and_fails_closed() ->
     snapshot = broker.snapshot()
     assert snapshot.kv_physical_bytes == GIB // 2
     assert snapshot.failed_closed is True
+
+
+def test_kv_release_missing_telemetry_is_retryable_not_terminalized() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3()
+    _install(broker, _snapshot(resident=50 * GIB))
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=GIB,
+        transient_delta_bytes=0,
+        cache_id="cache-a",
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=GIB)
+
+    with pytest.raises(MemoryTelemetryError, match="unavailable") as caught:
+        broker.release_kv(
+            allocation,
+            registered_kv_bytes_after=0,
+            allocator_before=None,
+            allocator_after=None,
+        )
+
+    assert not isinstance(caught.value, TerminalizedKVReleaseError)
+    assert broker.snapshot().owned_kv_physical_bytes == GIB
+    broker.release_kv(
+        allocation,
+        registered_kv_bytes_after=0,
+        allocator_before=AllocatorMemorySample(GIB, 0, GIB),
+        allocator_after=AllocatorMemorySample(0, 0, GIB),
+    )
+    assert broker.snapshot().owned_kv_physical_bytes == 0
 
 
 def test_multi_growth_same_cache_releases_in_one_physical_close() -> None:
@@ -1380,6 +1441,36 @@ def test_commit_kv_growth_atomically_reclassifies_consumed_allocator_cache() -> 
     assert snapshot.kv_physical_bytes == GIB
     assert snapshot.allocator_cache_bytes == GIB
     assert snapshot.owned_kv_physical_bytes == GIB
+
+
+def test_commit_kv_growth_over_target_terminalizes_without_stranded_handle() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3()
+    _install(broker, _snapshot(resident=108 * GIB, cache=GIB))
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=GIB,
+        transient_delta_bytes=0,
+        cache_id="target:over-target",
+    )
+
+    with pytest.raises(MemoryTransactionError, match="operating target"):
+        broker.commit_kv_growth(
+            ticket,
+            allocated_physical_bytes=GIB,
+            allocator_before=AllocatorMemorySample(10 * GIB, GIB, 11 * GIB),
+            allocator_after=AllocatorMemorySample(
+                11 * GIB,
+                GIB + 1,
+                12 * GIB + 1,
+            ),
+        )
+
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.kv_physical_bytes == GIB
+    assert snapshot.allocator_cache_bytes == GIB + 1
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.unreconciled_kv_physical_bytes == GIB
+    assert snapshot.failed_closed is True
 
 
 def test_commit_kv_growth_missing_atomic_sample_terminalizes_unowned_bytes() -> None:

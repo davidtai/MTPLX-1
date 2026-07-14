@@ -239,6 +239,39 @@ def test_real_route_demand_regrows_one_clean_slab_before_policy_planning() -> No
     assert route_lock.acquisitions == 2
 
 
+def test_route_regrow_uses_actual_unique_demand_beyond_model_top_k() -> None:
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    broker.replace_snapshot(_snapshot(resident=36, experts=32))
+    slots = _FakeSlots(physical_bytes=32)
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1,),
+        expert_count=4,
+        persistent_slots=4,
+        transient_slots=1,
+        prefill_slots_per_layer=4,
+    )
+    bank.deactivate_slots((0, 1, 2))
+    runtime = _runtime(
+        broker,
+        slots=slots,
+        bank=bank,
+        samples=[
+            AllocatorMemorySample(32, 0, 32),
+            AllocatorMemorySample(64, 0, 64),
+        ],
+    )
+
+    assert tuple(runtime._regrow_for_route_demand((0, 1, 2))) == (0, 1, 2)
+
+    assert slots.regrown == [0]
+    assert bank.active_capacity == 3
+
+
 def test_split_route_demand_regrows_before_acquiring_non_reentrant_policy_lock() -> (
     None
 ):
@@ -381,6 +414,47 @@ def test_dynamic_broker_rejects_missing_or_mismatched_physical_slab_layout(
         )
 
 
+def test_dynamic_broker_rejects_aggregate_bytes_from_malformed_slab_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MalformedSlots(_FakeSlots):
+        def slab_layout(self) -> dict[int, tuple[int, ...]]:
+            return {0: (0, 1, 2, 3)}
+
+    config = SimpleNamespace(
+        expert_slab_slots=2,
+        expert_regrow_hysteresis_slabs=1,
+        expert_resize_min_interval_ms=1000,
+    )
+    spec = SimpleNamespace(expert_record_bytes=16)
+    plan = SimpleNamespace(
+        persistent_slots=4,
+        resident_bytes=10,
+        transient_bytes=0,
+        io_staging_bytes=0,
+        runtime_reserve_bytes=0,
+        execution_workspace_bytes=0,
+    )
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "mlx_memory_telemetry",
+        lambda _mx: {
+            "active_memory_bytes": 64,
+            "cache_memory_bytes": 0,
+            "peak_memory_bytes": 64,
+        },
+    )
+
+    with pytest.raises(ExpertStreamingConfigurationError, match="physical slab"):
+        ExpertStreamingRuntime._initialize_dynamic_memory_broker(
+            config=config,
+            spec=spec,
+            plan=plan,
+            slots=MalformedSlots(),
+            mx_module=object(),
+        )
+
+
 def test_dynamic_broker_rejects_additive_initial_pools_above_110_gib(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -452,6 +526,71 @@ def test_post_load_reconciliation_charges_measured_resident_and_mtp_memory() -> 
     assert snapshot.allocator_cache_bytes == 7
 
 
+def test_post_load_reconciliation_retains_unused_reserve_and_grants_no_credit() -> None:
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=BrokerSnapshot(
+            resident_model_bytes=10,
+            kv_physical_bytes=0,
+            expert_slab_physical_bytes=64,
+            in_flight_expert_staging_bytes=50,
+            runtime_workspace_bytes=30,
+            allocator_cache_bytes=5,
+        ),
+        expert_slab_bytes=32,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(99, 3, 102)],
+    )
+    runtime.plan = SimpleNamespace(
+        persistent_slots=4,
+        transient_bytes=20,
+        io_staging_bytes=30,
+        execution_workspace_bytes=4,
+    )
+
+    runtime.reconcile_post_load_memory()
+
+    snapshot = broker.snapshot()
+    assert snapshot.resident_model_bytes == 15
+    assert snapshot.in_flight_expert_staging_bytes == 50
+    assert snapshot.runtime_workspace_bytes == 25
+    assert snapshot.allocator_cache_bytes == 5
+
+
+def test_post_load_reconciliation_never_drops_planned_resident_bytes() -> None:
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=BrokerSnapshot(
+            resident_model_bytes=10,
+            kv_physical_bytes=0,
+            expert_slab_physical_bytes=64,
+            in_flight_expert_staging_bytes=20,
+            runtime_workspace_bytes=30,
+            allocator_cache_bytes=5,
+        ),
+        expert_slab_bytes=32,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(50, 5, 55)],
+    )
+    runtime.plan = SimpleNamespace(
+        persistent_slots=4,
+        transient_bytes=20,
+        execution_workspace_bytes=4,
+    )
+
+    runtime.reconcile_post_load_memory()
+
+    snapshot = broker.snapshot()
+    assert snapshot.resident_model_bytes == 10
+    assert snapshot.runtime_workspace_bytes == 30
+
+
 def test_post_load_reconciliation_rejects_resident_growth_beyond_reserve() -> None:
     broker = UnifiedMemoryBroker(
         initial_snapshot=BrokerSnapshot(
@@ -489,10 +628,24 @@ def test_runtime_load_calls_post_load_reconciliation_after_mtp_injection() -> No
     source = inspect.getsource(runtime_module.load)
 
     injection = source.index("mtp_enabled = inject_hy3_streamed_mtp_support")
+    attention_setup = source.index("configure_split_full_attention(model)")
+    native_setup = source.index("configure_native_mlp(model)")
+    selfcheck = source.index("maybe_run_model_selfcheck(model)")
+    adapter_setup = source.index("adapter_merge_report = merge_installed_mtp_lora")
     reconciliation = source.index("expert_runtime.reconcile_post_load_memory()")
     returned = source.index("return MTPLXRuntime")
 
-    assert injection < reconciliation < returned
+    assert (
+        max(
+            injection,
+            attention_setup,
+            native_setup,
+            selfcheck,
+            adapter_setup,
+        )
+        < reconciliation
+        < returned
+    )
 
 
 def test_dynamic_memory_telemetry_reports_complete_bounded_resize_state() -> None:

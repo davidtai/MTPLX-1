@@ -1037,6 +1037,80 @@ class _KVAllocationObserver:
         self.releases.append((cache_id, tuple(allocations), released_physical_bytes))
 
 
+class _BrokerKVAllocationObserver:
+    """Minimal real-broker adapter for cache/broker boundary regressions."""
+
+    def __init__(self, broker, *, allocator_samples) -> None:
+        self.broker = broker
+        self.allocator_samples = list(allocator_samples)
+
+    def reserve_growth(
+        self,
+        *,
+        cache_id: str,
+        steady_delta_bytes: int,
+        transient_delta_bytes: int,
+    ):
+        return self.broker.plan_kv_growth(
+            cache_id=cache_id,
+            steady_delta_bytes=steady_delta_bytes,
+            transient_delta_bytes=transient_delta_bytes,
+        )
+
+    def commit_growth(
+        self,
+        ticket,
+        *,
+        measured_physical_bytes: int,
+        allocator_before,
+        allocator_after,
+    ):
+        return self.broker.commit_kv_growth(
+            ticket,
+            allocated_physical_bytes=measured_physical_bytes,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+
+    def abort_growth(
+        self,
+        ticket,
+        *,
+        observed_physical_bytes: int | None,
+        allocator_before,
+        allocator_after,
+    ) -> None:
+        self.broker.abort_kv_growth(
+            ticket,
+            observed_kv_delta_bytes=observed_physical_bytes,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+
+    def sample_allocator_memory(self):
+        return self.allocator_samples.pop(0)
+
+    def release_cache(
+        self,
+        *,
+        cache_id: str,
+        allocations,
+        released_physical_bytes: int,
+        allocator_before,
+        allocator_after,
+    ) -> None:
+        registered_after = (
+            self.broker.snapshot().kv_physical_bytes - released_physical_bytes
+        )
+        self.broker.release_kv_batch(
+            cache_id=cache_id,
+            allocations=allocations,
+            registered_kv_bytes_after=registered_after,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+
+
 def test_q4_physical_allocation_is_reserved_and_committed_exactly() -> None:
     observer = _KVAllocationObserver()
     cache = VllmMetalPagedKVCache(
@@ -1098,6 +1172,79 @@ def test_q4_initial_allocation_failure_aborts_ticket_and_drops_arrays() -> None:
     assert observer.aborts[0][2] is not None
     assert observer.aborts[0][3] is not None
     assert cache.nbytes == 0
+
+
+def test_q4_initial_allocator_baseline_failure_aborts_without_allocating() -> None:
+    after = SimpleNamespace(active_bytes=0, cache_bytes=0, peak_bytes=0)
+    observer = _KVAllocationObserver(
+        allocator_samples=[RuntimeError("allocator baseline failed"), after]
+    )
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    with pytest.raises(RuntimeError, match="allocator baseline failed"):
+        cache.update_without_fetch(values, values)
+
+    assert cache.nbytes == 0
+    assert observer.commits == []
+    assert len(observer.aborts) == 1
+    assert observer.aborts[0][1] is None
+    assert observer.aborts[0][2] is None
+    assert observer.aborts[0][3] is after
+
+
+def test_q4_real_broker_commit_failure_has_no_pending_or_stranded_handle() -> None:
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        MemoryTransactionError,
+        UnifiedMemoryBroker,
+    )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=170,
+            hard_ceiling_bytes=1_000,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    observer = _BrokerKVAllocationObserver(
+        broker,
+        allocator_samples=[
+            AllocatorMemorySample(0, 0, 0),
+            AllocatorMemorySample(160, 32, 192),
+            AllocatorMemorySample(0, 32, 192),
+        ],
+    )
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:request-1:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    with pytest.raises(MemoryTransactionError, match="already consumed"):
+        cache.update_without_fetch(values, values)
+
+    snapshot = broker.snapshot()
+    assert cache.nbytes == 0
+    assert cache._kv_allocations == []
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.unreconciled_kv_physical_bytes == 160
+    assert snapshot.kv_physical_bytes == 160
+    assert snapshot.allocator_cache_bytes == 32
+    assert snapshot.failed_closed is True
 
 
 def test_q4_growth_reserves_steady_delta_and_full_concatenate_peak(
@@ -1273,7 +1420,8 @@ def test_q4_trim_never_reports_physical_release_and_close_is_exact_once() -> Non
     assert cache.nbytes == 0
 
 
-def test_q4_close_drops_pages_and_terminalizes_when_allocator_sample_fails() -> None:
+def test_q4_close_retries_before_sample_without_dropping_owned_pages() -> None:
+    before = SimpleNamespace(active_bytes=160, cache_bytes=0, peak_bytes=160)
     after = SimpleNamespace(active_bytes=0, cache_bytes=160, peak_bytes=160)
     observer = _KVAllocationObserver()
     cache = VllmMetalPagedKVCache(
@@ -1285,15 +1433,206 @@ def test_q4_close_drops_pages_and_terminalizes_when_allocator_sample_fails() -> 
     )
     values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
     cache.update_without_fetch(values, values)
-    observer.allocator_samples.extend([RuntimeError("allocator sample failed"), after])
+    observer.allocator_samples.extend(
+        [RuntimeError("allocator sample failed"), before, after]
+    )
 
     with pytest.raises(RuntimeError, match="allocator sample failed"):
         cache.close()
+
+    assert cache.nbytes == 160
+    assert len(cache._kv_allocations) == 1
+    assert observer.releases == []
+
+    cache.close()
     cache.close()
 
     assert cache.nbytes == 0
     assert len(observer.releases) == 1
-    assert observer.release_samples == [(None, after)]
+    assert observer.release_samples == [(before, after)]
+
+
+def test_q4_close_retries_after_sample_without_losing_allocation_handles() -> None:
+    before = SimpleNamespace(active_bytes=160, cache_bytes=0, peak_bytes=160)
+    after = SimpleNamespace(active_bytes=0, cache_bytes=160, peak_bytes=160)
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+    observer.allocator_samples.extend(
+        [before, RuntimeError("after sample failed"), after]
+    )
+
+    with pytest.raises(RuntimeError, match="after sample failed"):
+        cache.close()
+
+    assert cache.nbytes == 0
+    assert len(cache._kv_allocations) == 1
+    assert observer.releases == []
+
+    cache.close()
+
+    assert cache.nbytes == 0
+    assert cache._kv_allocations == []
+    assert observer.release_samples == [(before, after)]
+
+
+def test_q4_close_retries_accounting_failure_with_same_allocation_handles() -> None:
+    class RetryableReleaseObserver(_KVAllocationObserver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_attempts = []
+
+        def release_cache(self, *, allocations, **kwargs) -> None:
+            self.release_attempts.append(tuple(allocations))
+            if len(self.release_attempts) == 1:
+                raise RuntimeError("release transaction busy")
+            super().release_cache(allocations=allocations, **kwargs)
+
+    observer = RetryableReleaseObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+
+    with pytest.raises(RuntimeError, match="release transaction busy"):
+        cache.close()
+
+    handles = tuple(cache._kv_allocations)
+    assert cache.nbytes == 0
+    assert len(handles) == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        cache.update_without_fetch(values, values)
+
+    cache.close()
+    cache.close()
+
+    assert observer.release_attempts == [handles, handles]
+    assert cache._kv_allocations == []
+    assert len(observer.releases) == 1
+
+
+def test_q4_real_broker_active_transaction_release_is_retryable() -> None:
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        MemoryTransactionError,
+        UnifiedMemoryBroker,
+    )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    observer = _BrokerKVAllocationObserver(
+        broker,
+        allocator_samples=[
+            AllocatorMemorySample(0, 0, 0),
+            AllocatorMemorySample(160, 0, 160),
+            AllocatorMemorySample(160, 0, 160),
+            AllocatorMemorySample(0, 0, 160),
+            AllocatorMemorySample(0, 0, 160),
+        ],
+    )
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:request-1:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+    pending = broker.plan_kv_growth(
+        cache_id="target:other:0",
+        steady_delta_bytes=1,
+        transient_delta_bytes=0,
+    )
+
+    with pytest.raises(MemoryTransactionError, match="active memory transaction"):
+        cache.close()
+
+    handles = tuple(cache._kv_allocations)
+    assert cache.nbytes == 0
+    assert len(handles) == 1
+    assert broker.snapshot().owned_kv_physical_bytes == 160
+
+    broker.abort_kv_growth(pending, observed_kv_delta_bytes=0)
+    cache.close()
+    cache.close()
+
+    assert cache._kv_allocations == []
+    assert broker.snapshot().owned_kv_physical_bytes == 0
+    assert broker.snapshot().charged_bytes == 0
+
+
+def test_q4_real_broker_terminalized_release_closes_without_false_credit() -> None:
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        TerminalizedKVReleaseError,
+        UnifiedMemoryBroker,
+    )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    observer = _BrokerKVAllocationObserver(
+        broker,
+        allocator_samples=[
+            AllocatorMemorySample(0, 0, 0),
+            AllocatorMemorySample(160, 0, 160),
+            AllocatorMemorySample(160, 0, 160),
+            AllocatorMemorySample(160, 0, 160),
+        ],
+    )
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:request-1:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+
+    with pytest.raises(TerminalizedKVReleaseError, match="did not prove"):
+        cache.close()
+
+    snapshot = broker.snapshot()
+    assert cache.nbytes == 0
+    assert cache._kv_allocations == []
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.allocator_cache_bytes == 160
+    assert snapshot.charged_bytes == 160
+    assert snapshot.failed_closed is True
+
+    cache.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        cache.update_without_fetch(values, values)
 
 
 def test_paged_cache_install_propagates_allocation_observer_and_unique_ids() -> None:
@@ -1351,6 +1690,26 @@ def test_paged_cache_install_requires_nonempty_owner_prefix() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "kv_quant_config",
+    [None, PagedKVQuantConfig("q8")],
+)
+def test_paged_cache_install_requires_plain_q4_for_physical_brokering(
+    kv_quant_config,
+) -> None:
+    from mlx_lm.models.cache import KVCache
+
+    with pytest.raises(ValueError, match="plain paged Q4"):
+        install_vllm_metal_paged_attention_kv_cache(
+            [KVCache()],
+            block_size=4,
+            num_blocks=1,
+            kv_quant_config=kv_quant_config,
+            allocation_observer=_KVAllocationObserver(),
+            cache_id_prefix="target:request-1",
+        )
+
+
 def test_paged_cache_install_cannot_detach_live_broker_ownership() -> None:
     observer = _KVAllocationObserver()
     entry = VllmMetalPagedKVCache(
@@ -1388,6 +1747,33 @@ def test_closed_brokered_q4_cache_cannot_allocate_again() -> None:
 
     with pytest.raises(RuntimeError, match="closed"):
         cache.update_without_fetch(values, values)
+
+
+@pytest.mark.parametrize("mutation", ["keys", "values", "state", "meta_state"])
+def test_brokered_q4_cache_rejects_unaccounted_state_replacement(mutation) -> None:
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:request-1:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+
+    with pytest.raises(RuntimeError, match="broker-owned"):
+        if mutation == "keys":
+            cache.keys = None
+        elif mutation == "values":
+            cache.values = None
+        elif mutation == "state":
+            cache.state = (None, None)
+        else:
+            cache.meta_state = ("4", "1", "0")
+
+    assert cache.nbytes == 160
+    assert observer.releases == []
 
 
 def test_vllm_metal_paged_q8_kv_quant_attention_matches_stock_with_tolerance(

@@ -1299,12 +1299,40 @@ class ExpertStreamingRuntime:
             allocator_cache_bytes = int(telemetry["cache_memory_bytes"])
             slab_telemetry = slots.expert_slab_telemetry_snapshot()
             slab_bytes = int(slab_telemetry["physical_bytes"])
-        except (KeyError, TypeError, ValueError) as exc:
+            slab_slots = int(config.expert_slab_slots)
+            persistent_slots = int(plan.persistent_slots)
+            layout = slots.slab_layout()
+            layout_slot_ids = tuple(
+                int(slot_id)
+                for physical_slots in layout.values()
+                for slot_id in physical_slots
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise ExpertStreamingConfigurationError(
                 "dynamic expert slabs require allocator and physical slab telemetry"
             ) from exc
-        expected_slab_bytes = int(plan.persistent_slots) * int(spec.expert_record_bytes)
-        if slab_bytes <= 0 or slab_bytes != expected_slab_bytes:
+        expected_slab_bytes = persistent_slots * int(spec.expert_record_bytes)
+        if slab_slots <= 0 or persistent_slots % slab_slots:
+            raise ExpertStreamingConfigurationError(
+                "dynamic expert physical slab layout is not slab aligned"
+            )
+        expected_slab_count = persistent_slots // slab_slots
+        physical_layout_valid = (
+            slab_bytes > 0
+            and slab_bytes == expected_slab_bytes
+            and len(layout) == expected_slab_count
+            and all(len(slot_ids) == slab_slots for slot_ids in layout.values())
+            and len(layout_slot_ids) == persistent_slots
+            and len(set(layout_slot_ids)) == persistent_slots
+            and int(slab_telemetry["logical_slab_count"]) == expected_slab_count
+            and int(slab_telemetry["active_slab_count"]) == expected_slab_count
+            and int(slab_telemetry["draining_slab_count"]) == 0
+            and int(slab_telemetry["released_slab_count"]) == 0
+            and int(slab_telemetry["logical_slot_count"]) == persistent_slots
+            and int(slab_telemetry["active_slot_count"]) == persistent_slots
+            and int(slab_telemetry["logical_bytes"]) == expected_slab_bytes
+        )
+        if not physical_layout_valid:
             raise ExpertStreamingConfigurationError(
                 "dynamic expert physical slab bytes do not match the planned layout"
             )
@@ -1560,25 +1588,20 @@ class ExpertStreamingRuntime:
         self,
         expert_ids: Iterable[int],
     ) -> Iterable[int]:
-        """Restore one slab before planning when active capacity cannot cover top-k."""
+        """Restore only enough clean slabs to cover this route's unique demand."""
 
-        broker = self.memory_broker
+        broker = getattr(self, "memory_broker", None)
         bank = self._global_bank
         if broker is None or bank is None:
-            return expert_ids
-        required_fast = max(1, int(getattr(self.spec, "top_k", 1)))
-        if bank.active_capacity >= required_fast:
             return expert_ids
         normalized = tuple(expert_ids)
         required = max(1, len(set(normalized)))
         if bank.active_capacity >= required:
             return normalized
-        released = self.slots.released_slab_ids()
-        if not released:
+        if not self.slots.released_slab_ids():
             return normalized
-        layout = self.slots.slab_layout()
-        first_slab = layout[released[0]]
-        target_bytes = len(first_slab) * int(self.spec.expert_record_bytes)
+        shortfall_records = required - bank.active_capacity
+        target_bytes = shortfall_records * int(self.spec.expert_record_bytes)
         self.maybe_regrow_expert_slabs(target_bytes=target_bytes)
         return normalized
 
@@ -2105,7 +2128,7 @@ class ExpertStreamingRuntime:
         return sample
 
     def reconcile_post_load_memory(self) -> None:
-        """Replace startup estimates with measured post-injection physical truth."""
+        """Reclassify startup reserve into measured resident/MTP truth."""
 
         broker = self.memory_broker
         if broker is None:
@@ -2113,37 +2136,46 @@ class ExpertStreamingRuntime:
         before = broker.snapshot()
         sample = self._sample_allocator_memory()
         expert_bytes = self._registered_expert_slab_bytes()
-        staging_bytes = int(self.plan.transient_bytes) + int(
-            getattr(self.plan, "io_staging_bytes", 0)
-        )
+        transient_bytes = int(self.plan.transient_bytes)
+        staging_bytes = transient_bytes + int(getattr(self.plan, "io_staging_bytes", 0))
         execution_workspace = int(self.plan.execution_workspace_bytes)
         resident_bytes = max(
-            0,
-            int(sample.active_bytes) - expert_bytes - staging_bytes,
+            before.resident_model_bytes,
+            int(sample.active_bytes) - expert_bytes - transient_bytes,
         )
-        observed = BrokerSnapshot(
-            resident_model_bytes=resident_bytes,
-            kv_physical_bytes=before.kv_physical_bytes,
-            expert_slab_physical_bytes=expert_bytes,
-            in_flight_expert_staging_bytes=staging_bytes,
-            runtime_workspace_bytes=execution_workspace,
-            allocator_cache_bytes=sample.cache_bytes,
-            pinned_expert_bytes=min(before.pinned_expert_bytes, expert_bytes),
-            speculative_expert_bytes=min(
-                before.speculative_expert_bytes,
-                expert_bytes,
-            ),
-        )
-        broker.replace_snapshot(observed)
-        resident_growth = max(0, resident_bytes - before.resident_model_bytes)
-        runtime_reserve = max(
+        resident_growth = resident_bytes - before.resident_model_bytes
+        generic_runtime_reserve = max(
             0,
             before.runtime_workspace_bytes - execution_workspace,
         )
-        if resident_growth > runtime_reserve:
+        remaining_runtime_reserve = max(
+            0,
+            generic_runtime_reserve - resident_growth,
+        )
+        admission_error: MemoryAdmissionError | None = None
+        try:
+            broker.reconcile_post_load_classification(
+                resident_model_bytes=resident_bytes,
+                expert_slab_physical_bytes=expert_bytes,
+                in_flight_expert_staging_bytes=staging_bytes,
+                runtime_workspace_bytes=(
+                    execution_workspace + remaining_runtime_reserve
+                ),
+            )
+        except MemoryAdmissionError as exc:
+            admission_error = exc
+        try:
+            broker.reconcile_allocator_cache(sample)
+        except MemoryAdmissionError as exc:
+            admission_error = exc
+        if resident_growth > generic_runtime_reserve:
             raise ExpertStreamingConfigurationError(
                 "post-load resident growth exceeded the planned runtime reserve"
             )
+        if admission_error is not None:
+            raise ExpertStreamingConfigurationError(
+                "post-load physical pools exceeded the dynamic memory budget"
+            ) from admission_error
 
     def dynamic_memory_telemetry_snapshot(
         self,

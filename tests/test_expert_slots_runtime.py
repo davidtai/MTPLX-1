@@ -796,6 +796,9 @@ def test_slab_resize_owner_thread_and_failure_boundaries(
             with pytest.raises(ExpertSlotError, match="owner thread"):
                 rejected.result(timeout=2)
         assert pool._slabs[0].state is ExpertSlabState.DRAINING
+        physical_bytes = 2 * pool.spec.expert_record_bytes
+        assert pool.expert_slab_telemetry_snapshot()["physical_bytes"] == physical_bytes
+        assert pool.snapshot()["slabs"]["physical_bytes"] == physical_bytes
         assert physical.buffer is original_buffer
         pool.abort_slab_reclaim(ticket)
 

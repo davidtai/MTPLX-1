@@ -32,14 +32,27 @@ def _sha(value: object) -> str:
     ).hexdigest()
 
 
-def _identity() -> dict[str, object]:
+def _identity(arm: str = "dynamic") -> dict[str, object]:
+    arm_config = {
+        "dynamic_memory": arm == "dynamic",
+        "context_window": 131_072,
+        "kv_quantization": "q4",
+        "max_active_sequences": 1,
+    }
+    normalized_config = {
+        key: value for key, value in arm_config.items() if key != "dynamic_memory"
+    }
     return {
         "model_key": "hy3-q4",
+        "model_artifact_id": "pipenetwork/Hy3-4bit@160619d3",
         "model_artifact_sha256": "a" * 64,
+        "expert_manifest_id": "hy3-q4/component-banks/manifest.json",
         "expert_manifest_sha256": "b" * 64,
         "source_git_commit": "c" * 40,
-        "arm_config_sha256": "d" * 64,
-        "normalized_config_sha256": "e" * 64,
+        "arm_config": arm_config,
+        "arm_config_sha256": _sha(arm_config),
+        "normalized_config": normalized_config,
+        "normalized_config_sha256": _sha(normalized_config),
         "kv_quantization": "q4",
         "kv_block_size_tokens": 16,
         "total_context_tokens": 131_072,
@@ -63,6 +76,7 @@ def _point(
     *,
     expert: int,
     kv: int,
+    kv_blocks: int,
     active: int | None = None,
     cache: int = 0,
 ) -> dict[str, object]:
@@ -75,6 +89,7 @@ def _point(
         "allocator_peak_bytes": expert + kv + cache,
         "expert_slab_physical_bytes": expert,
         "kv_physical_bytes": kv,
+        "kv_allocated_blocks": kv_blocks,
         "slot_health": health,
         "slot_health_sha256": _sha(health),
     }
@@ -90,33 +105,33 @@ def _observation(
     tokens = [101, context_tokens, 202]
     routes = [[0, 3, 7], [1, 2, 9]]
     if arm == "dynamic":
+        final_blocks = context_tokens // 16
         timeline = [
-            _point("pre_growth", 1, expert=800, kv=100),
-            _point("post_expert_reclaim", 2, expert=600, kv=100),
-            _point("post_kv_growth", 3, expert=600, kv=300),
-            _point("hold", 4, expert=600, kv=300),
-            _point("hold", 5, expert=600, kv=300),
-            _point("hold", 6, expert=600, kv=300),
-            _point("post_reset", 7, expert=600, kv=0),
-            _point("post_regrow", 8, expert=800, kv=0),
+            _point("pre_growth", 1, expert=800, kv=100, kv_blocks=1),
+            _point("post_expert_reclaim", 2, expert=600, kv=100, kv_blocks=1),
+            _point("post_kv_growth", 3, expert=600, kv=300, kv_blocks=final_blocks),
+            _point("hold", 4_000_000_000, expert=600, kv=300, kv_blocks=final_blocks),
+            _point("hold", 4_500_000_000, expert=600, kv=300, kv_blocks=final_blocks),
+            _point("hold", 5_000_000_000, expert=600, kv=300, kv_blocks=final_blocks),
+            _point("post_reset", 6_000_000_000, expert=600, kv=0, kv_blocks=0),
+            _point("post_regrow", 7_000_000_000, expert=800, kv=0, kv_blocks=0),
         ]
         start = {"kind": "empty-q4", "kv_physical_bytes": 100, "kv_blocks": 1}
     else:
         timeline = [
-            _point("pre_growth", 1, expert=600, kv=300),
-            _point("post_kv_growth", 2, expert=600, kv=300),
-            _point("hold", 3, expert=600, kv=300),
-            _point("hold", 4, expert=600, kv=300),
-            _point("hold", 5, expert=600, kv=300),
-            _point("post_reset", 6, expert=600, kv=0),
+            _point("pre_growth", 1, expert=600, kv=300, kv_blocks=8192),
+            _point("post_kv_growth", 2, expert=600, kv=300, kv_blocks=8192),
+            _point("hold", 3_000_000_000, expert=600, kv=300, kv_blocks=8192),
+            _point("hold", 3_500_000_000, expert=600, kv=300, kv_blocks=8192),
+            _point("hold", 4_000_000_000, expert=600, kv=300, kv_blocks=8192),
+            _point("post_reset", 5_000_000_000, expert=600, kv=0, kv_blocks=0),
         ]
         start = {
             "kind": "static-128k-reserved-q4",
             "kv_physical_bytes": 300,
             "kv_blocks": 8192,
         }
-    identity = _identity()
-    identity["arm_config_sha256"] = ("d" if arm == "static" else "f") * 64
+    identity = _identity(arm)
     return {
         "schema": "mtplx-hy3-dynamic-memory-observation-v1",
         "arm": arm,
@@ -136,6 +151,7 @@ def _observation(
             "elapsed_seconds": len(tokens) / tok_s,
             "tokens_per_second": tok_s,
             "peak_charged_bytes": 900,
+            "hold_performance_samples": [tok_s * 0.99, tok_s, tok_s * 1.01],
         },
     }
 
@@ -149,6 +165,15 @@ def _probe_result(*, released: int = 128, untouched_executable: bool = True):
             "selected_registered_physical_bytes": 128,
             "untouched_slab_id": "slab-b",
             "allocated_slab_count": 2,
+            "slabs": [
+                {"slab_id": "slab-a", "registered_physical_bytes": 128},
+                {"slab_id": "slab-b", "registered_physical_bytes": 128},
+            ],
+        },
+        "before_allocation": {
+            "active_bytes": 700,
+            "cache_bytes": 200,
+            "peak_bytes": 700,
         },
         "before_release": {
             "active_bytes": 1_000,
@@ -220,9 +245,23 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
 
     no_boundary = _observation("dynamic", 4096, 0, tok_s=12.0)
     no_boundary["cache_start_state"]["kv_blocks"] = 255
+    no_boundary["timeline"][0]["kv_allocated_blocks"] = 255
+    no_boundary["timeline"][1]["kv_allocated_blocks"] = 255
     no_boundary["timeline"][2]["kv_physical_bytes"] = 110
+    no_boundary["timeline"][2]["kv_allocated_blocks"] = 256
     with pytest.raises(BenchmarkGateError, match="block boundaries"):
         validate_campaign_observation(no_boundary)
+
+    too_short = _observation("dynamic", 4096, 0, tok_s=12.0)
+    too_short["timeline"][4]["monotonic_ns"] = 4_100_000_000
+    too_short["timeline"][5]["monotonic_ns"] = 4_200_000_000
+    with pytest.raises(BenchmarkGateError, match="hold duration"):
+        validate_campaign_observation(too_short)
+
+    no_perf_samples = _observation("dynamic", 4096, 0, tok_s=12.0)
+    del no_perf_samples["metrics"]["hold_performance_samples"]
+    with pytest.raises(BenchmarkGateError, match="hold_performance_samples"):
+        validate_campaign_observation(no_perf_samples)
 
 
 def test_observation_recomputes_token_route_and_slot_health_hashes() -> None:
@@ -239,6 +278,11 @@ def test_observation_recomputes_token_route_and_slot_health_hashes() -> None:
     row = _observation("dynamic", 4096, 0, tok_s=12.0)
     row["timeline"][-1]["slot_health"]["failed"] = 1
     with pytest.raises(BenchmarkGateError, match="slot health"):
+        validate_campaign_observation(row)
+
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    row["identity"]["arm_config"]["context_window"] = 65_536
+    with pytest.raises(BenchmarkGateError, match="arm_config_sha256"):
         validate_campaign_observation(row)
 
 

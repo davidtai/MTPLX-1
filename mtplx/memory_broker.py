@@ -40,6 +40,12 @@ class MemoryTelemetryError(MemoryBrokerError):
     """Physical allocator telemetry did not prove a requested release."""
 
 
+class TerminalizedKVReleaseError(MemoryTelemetryError):
+    """A KV release failed after its selected handles became terminal."""
+
+    terminalized = True
+
+
 class MemoryTransactionError(MemoryBrokerError):
     """A two-phase memory transaction was invalid or interrupted."""
 
@@ -444,6 +450,71 @@ class UnifiedMemoryBroker:
                 raise MemoryAdmissionError(self._failed_reason)
             return self.snapshot()
 
+    def reconcile_post_load_classification(
+        self,
+        *,
+        resident_model_bytes: int,
+        expert_slab_physical_bytes: int,
+        in_flight_expert_staging_bytes: int,
+        runtime_workspace_bytes: int,
+    ) -> BrokerSnapshot:
+        """Publish post-load pool truth without invalidating KV ownership."""
+
+        resident = _exact_nonnegative_int(
+            "resident_model_bytes",
+            resident_model_bytes,
+        )
+        experts = _exact_nonnegative_int(
+            "expert_slab_physical_bytes",
+            expert_slab_physical_bytes,
+        )
+        staging = _exact_nonnegative_int(
+            "in_flight_expert_staging_bytes",
+            in_flight_expert_staging_bytes,
+        )
+        workspace = _exact_nonnegative_int(
+            "runtime_workspace_bytes",
+            runtime_workspace_bytes,
+        )
+        with self._lock:
+            if self._pending is not None or self._pending_regrow is not None:
+                raise MemoryTransactionError(
+                    "cannot reconcile post-load memory during an active transaction"
+                )
+            self._pools = replace(
+                self._pools,
+                resident_model_bytes=resident,
+                expert_slab_physical_bytes=experts,
+                in_flight_expert_staging_bytes=staging,
+                runtime_workspace_bytes=workspace,
+                pinned_expert_bytes=min(self._pools.pinned_expert_bytes, experts),
+                speculative_expert_bytes=min(
+                    self._pools.speculative_expert_bytes,
+                    experts,
+                ),
+            )
+            self._max_expert_slab_bytes = max(
+                self._max_expert_slab_bytes,
+                experts,
+            )
+            self._revision += 1
+            self._assert_kv_ledger_invariant()
+            self._record_hard_failure_if_needed()
+            charged = self._pools.charged_bytes
+            if charged >= self._budget.hard_ceiling_bytes:
+                self._admission_failure_count += 1
+                raise MemoryAdmissionError(
+                    "post-load memory reconciliation reached the hard ceiling"
+                )
+            if charged > self._budget.operating_target_bytes:
+                self._admission_failure_count += 1
+                self._transaction_failure_count += 1
+                self._failed_reason = (
+                    "post-load memory reconciliation exceeded the operating target"
+                )
+                raise MemoryAdmissionError(self._failed_reason)
+            return self.snapshot()
+
     def plan_kv_growth(
         self,
         *,
@@ -817,6 +888,15 @@ class UnifiedMemoryBroker:
                 kv_physical_bytes=(self._pools.kv_physical_bytes + allocated),
                 allocator_cache_bytes=cache_after,
             )
+            if self._pools.charged_bytes > self._budget.operating_target_bytes:
+                if allocated:
+                    self._unreconciled_kv_by_owner[
+                        f"failed-growth:{ticket.ticket_id}"
+                    ] = allocated
+                reason = "committed KV allocation exceeded the operating target"
+                self._fail_pending(reason, pools_already_updated=True)
+                self._assert_kv_ledger_invariant()
+                raise MemoryTransactionError(reason)
             allocation = KVPhysicalAllocation(
                 allocation_id=ticket.ticket_id,
                 cache_id=ticket.cache_id,
@@ -827,12 +907,6 @@ class UnifiedMemoryBroker:
             self._consume_pending()
             self._revision += 1
             self._record_hard_failure_if_needed()
-            if self._pools.charged_bytes > self._budget.operating_target_bytes:
-                self._failed_reason = (
-                    "committed KV allocation exceeded the operating target"
-                )
-                self._transaction_failure_count += 1
-                raise MemoryTransactionError(self._failed_reason)
             self._assert_kv_ledger_invariant()
             return allocation
 
@@ -1120,7 +1194,7 @@ class UnifiedMemoryBroker:
                 )
                 self._assert_kv_ledger_invariant()
                 self._fail_without_pending(failure, pools_already_updated=True)
-                raise MemoryTelemetryError(failure)
+                raise TerminalizedKVReleaseError(failure)
 
             for allocation in selected:
                 del self._allocations[allocation.allocation_id]
@@ -1582,6 +1656,7 @@ __all__ = [
     "MemoryBudget",
     "MemoryTelemetryError",
     "MemoryTransactionError",
+    "TerminalizedKVReleaseError",
     "UnifiedMemoryBroker",
     "hy3_q4_kv_physical_geometry",
 ]
