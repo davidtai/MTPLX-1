@@ -23,7 +23,7 @@ from typing import TypeVar
 CONTEXT_MATRIX_TOKENS = (4_096, 32_768, 65_536, 131_072)
 HY3_Q4_TOTAL_CONTEXT_TOKENS = 131_072
 HY3_Q4_KV_BLOCK_SIZE_TOKENS = 16
-HY3_Q4_KV_BYTES_PER_TOKEN = 80 * 2 * 8 * ((128 // 2) + 2)
+HY3_Q4_KV_BYTES_PER_TOKEN = 84_480
 HY3_Q4_KV_BLOCK_BYTES = HY3_Q4_KV_BLOCK_SIZE_TOKENS * HY3_Q4_KV_BYTES_PER_TOKEN
 HY3_Q4_MAX_BLOCKS = HY3_Q4_TOTAL_CONTEXT_TOKENS // HY3_Q4_KV_BLOCK_SIZE_TOKENS
 MIN_STABLE_HOLD_SAMPLES = 3
@@ -193,7 +193,7 @@ class CacheStartState:
             ("kind", "kv_physical_bytes", "kv_blocks"),
             context="cache_start_state",
         )
-        return cls(
+        state = cls(
             kind=_nonempty_string(value["kind"], field="cache_start_state.kind"),
             kv_physical_bytes=_exact_int(
                 value["kv_physical_bytes"],
@@ -203,6 +203,11 @@ class CacheStartState:
                 value["kv_blocks"], field="cache_start_state.kv_blocks"
             ),
         )
+        if state.kv_physical_bytes != state.kv_blocks * HY3_Q4_KV_BLOCK_BYTES:
+            raise BenchmarkGateError(
+                "cache_start_state.kv_physical_bytes does not match exact Q4 geometry"
+            )
+        return state
 
 
 @dataclass(frozen=True)

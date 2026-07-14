@@ -258,6 +258,11 @@ def test_observation_requires_exact_issue46_q4_physical_geometry() -> None:
     with pytest.raises(BenchmarkGateError, match="exact Q4 geometry"):
         validate_campaign_observation(bad_timeline)
 
+    with pytest.raises(BenchmarkGateError, match="exact Q4 geometry"):
+        CacheStartState.from_mapping(
+            {"kind": "impossible-q4", "kv_physical_bytes": 1, "kv_blocks": 0}
+        )
+
 
 def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> None:
     unstable = _observation("dynamic", 4096, 0, tok_s=12.0)
