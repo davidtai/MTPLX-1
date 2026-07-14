@@ -53,6 +53,7 @@ def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
         "verify_command": ("verify",),
     }
     spec = {
+        "legacy_exclusive_lane_lock": str(tmp_path / "legacy-gpu.lock"),
         "qwen": qwen,
         "artifact_verify_command": ("verify-artifact",),
         "probe_command": ("probe",),
@@ -141,6 +142,11 @@ def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
         "released": True,
         "owner": owner,
     }
+    assert evidence["legacy_exclusive_lane_lock"] == {
+        "path": str(tmp_path / "legacy-gpu.lock"),
+        "acquired": True,
+        "released": True,
+    }
     journal_evidence = evidence["recovery_journal"]
     assert journal_evidence["path"] == str(lane / "issue46-recovery.json")
     assert journal_evidence["durable_before_unload"] is True
@@ -175,6 +181,46 @@ def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
     assert workload_calls[0]["quality_command"] == ("quality",)
     assert workload_calls[0]["subprocess_timeout_seconds"] == 1234
     assert workload_calls[0]["subprocess_termination_grace_seconds"] == 5
+
+
+def test_run_spec_refuses_to_overlap_a_held_legacy_gpu_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = {
+        "legacy_exclusive_lane_lock": str(tmp_path / "legacy-gpu.lock"),
+        "qwen": {
+            "acquire_lane_command": ("acquire",),
+            "release_lane_command": ("release",),
+            "capture_command": ("capture",),
+            "unload_command": ("unload",),
+            "restore_command": ("restore",),
+            "verify_command": ("verify",),
+        },
+        "artifact_verify_command": ("verify-artifact",),
+        "probe_command": ("probe",),
+        "quality_command": ("quality",),
+        "arm_command_template": ("arm",),
+        "repetitions": 2,
+        "bootstrap_resamples": 100,
+        "bootstrap_seed": 46,
+    }
+
+    def reject_lock(_descriptor: int, operation: int) -> None:
+        assert operation & campaign_module.fcntl.LOCK_NB
+        raise BlockingIOError("legacy benchmark owns the GPU")
+
+    monkeypatch.setattr(campaign_module.fcntl, "flock", reject_lock)
+    monkeypatch.setattr(
+        campaign_module,
+        "run_json_subprocess",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Qwen transitions must not start while the legacy lane is held"
+        ),
+    )
+
+    with pytest.raises(BenchmarkGateError, match="legacy.*GPU lane is active"):
+        campaign_module.run_spec(spec, cwd=tmp_path)
 
 
 def test_run_spec_retains_durable_qwen_recovery_journal_when_verify_fails(
@@ -408,6 +454,7 @@ def _default_spec() -> dict[str, object]:
         )
     }
     return {
+        "legacy_exclusive_lane_lock": "/tmp/mtplx-gpu-exclusive.lock",
         "artifact_verify_command": [
             "uv",
             "run",
@@ -503,6 +550,17 @@ def _create_campaign_repo(
     return repo, spec_path
 
 
+def test_campaign_spec_rejects_a_decoy_legacy_gpu_lock() -> None:
+    spec = _default_spec()
+    spec["legacy_exclusive_lane_lock"] = "/tmp/not-the-shared-gpu-lane.lock"
+
+    with pytest.raises(BenchmarkGateError, match="shared MTPLX GPU lock"):
+        campaign_module._parse_spec_bytes(
+            json.dumps(spec).encode("utf-8"),
+            path=Path("issue46.json"),
+        )
+
+
 def _run_actual_main(
     repo: Path,
     spec_path: Path,
@@ -562,6 +620,7 @@ def test_plan_only_binds_frozen_sources_shared_hooks_and_exact_matrix_without_ha
     assert plan["workload_subprocess_timeout_seconds"] == 43_200
     assert plan["qwen_control_timeout_seconds"] == 300
     assert plan["subprocess_termination_grace_seconds"] == 30
+    assert plan["legacy_exclusive_lane_lock"] == "/tmp/mtplx-gpu-exclusive.lock"
     assert len(plan["schedule"]) == 16
     for command in (
         plan["artifact_verify_command"],

@@ -154,8 +154,12 @@ records, not the HTTP request, KV cache, or resident unified-memory payload.
 Only the broker-selected expert slabs are resident at a time; the full sidecar
 is hashed solely to bind the benchmark to exact model bytes.
 
-The campaign captures the exact Qwen state, acquires the exclusive GPU lane,
-unloads Qwen, and restores and verifies the captured state in a `finally` block.
+The campaign first takes the shared legacy `flock` at
+`/tmp/mtplx-gpu-exclusive.lock`, then acquires the owned directory lane at
+`/tmp/mtplx-gpu-exclusive`, and only then captures the exact Qwen state. It
+holds both for the entire GPU window, so older MTPLX benchmark wrappers and the
+owned Issue 46 lane cannot overlap. It unloads Qwen and restores and verifies
+the captured state in a `finally` block.
 `SIGINT`, `SIGTERM`, and `SIGHUP` therefore enter the cleanup path. `SIGKILL`, a
 machine reset, or a process crash that prevents Python cleanup cannot restore an
 external service and may leave `/tmp/mtplx-gpu-exclusive` with an

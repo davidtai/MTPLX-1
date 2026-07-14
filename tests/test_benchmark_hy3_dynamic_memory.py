@@ -2443,6 +2443,7 @@ def _tracked_cli_plan_repo(
     probe_command.extend(("--hooks-config", "benchmarks/hooks.json", "--json"))
     common_hooks = ["--hooks-config", "benchmarks/hooks.json"]
     spec = {
+        "legacy_exclusive_lane_lock": "/tmp/mtplx-gpu-exclusive.lock",
         "artifact_verify_command": [
             sys.executable,
             "benchmarks/probe.py",
@@ -2529,6 +2530,7 @@ def test_cli_plan_declares_exact_matrix_balanced_order_and_qwen_hooks(
     plan = json.loads(completed.stdout)
     assert plan["context_matrix_tokens"] == list(CONTEXT_MATRIX_TOKENS)
     assert plan["qwen_isolation_configured"] is True
+    assert plan["legacy_exclusive_lane_lock"] == "/tmp/mtplx-gpu-exclusive.lock"
     assert plan["quality_command"][-2:] == [
         "--hooks-config",
         "benchmarks/hooks.json",

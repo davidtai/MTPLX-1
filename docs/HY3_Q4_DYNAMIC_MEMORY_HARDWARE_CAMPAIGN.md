@@ -61,7 +61,10 @@ uv run python benchmarks/benchmark_hy3_dynamic_memory.py \
 
 Do not run an arm command by hand while Qwen is loaded. The campaign runner
 owns the exclusive window and restores Qwen in `finally`, including after probe
-or arm failure.
+or arm failure. It holds both `/tmp/mtplx-gpu-exclusive.lock` (the legacy
+advisory lock used by older benchmark wrappers) and the owned
+`/tmp/mtplx-gpu-exclusive` directory for that complete window. Failure to take
+the legacy lock rejects before capture or unload.
 
 Before and after the exclusive window, the runner proves that the campaign
 spec and every Python command source are tracked and the worktree is clean. The
@@ -82,6 +85,9 @@ can run, the runner creates and file-plus-directory-syncs
 `/tmp/mtplx-gpu-exclusive/issue46-recovery.json` with the owner identity and
 captured state. It removes the journal only after exact restoration is verified;
 failed restoration retains both the journal and exclusive lane for recovery.
+The campaign spec pins `legacy_exclusive_lane_lock` to
+`/tmp/mtplx-gpu-exclusive.lock`; the parent campaign holds that advisory lock
+from before directory acquisition until after verified restoration and release.
 
 ```json
 {
@@ -100,8 +106,9 @@ shutdown, exact-model restoration, and timeouts. Diagnostics are redirected to
 stderr so they cannot corrupt the runner's JSON channel. A missing plist,
 unexpected model, duplicate model ID, orphan process, API/service disagreement,
 stale exclusive lane, incomplete stop, or inexact restoration fails closed.
-Successful result JSON includes positive acquire, capture, unload, restore,
-verify, and release evidence plus the recovery-journal digest and lifecycle.
+Successful result JSON includes positive legacy-lock acquire/release, directory
+acquire, capture, unload, restore, verify, and release evidence plus the
+recovery-journal digest and lifecycle.
 
 ## Evidence ordering and interpretation
 

@@ -9,6 +9,7 @@ No command is evaluated through a shell.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -35,6 +36,7 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
 QWEN_RECOVERY_SCHEMA = "mtplx-issue46-qwen-recovery-v1"
 QWEN_EVIDENCE_SCHEMA = "mtplx-issue46-qwen-isolation-v1"
 QWEN_RECOVERY_NAME = "issue46-recovery.json"
+LEGACY_EXCLUSIVE_LANE_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, object]:
@@ -335,6 +337,7 @@ def _parse_spec_bytes(raw_bytes: bytes, *, path: Path) -> dict[str, object]:
         "probe_command",
         "quality_command",
         "arm_command_template",
+        "legacy_exclusive_lane_lock",
         "repetitions",
         "qwen",
     ):
@@ -350,6 +353,15 @@ def _parse_spec_bytes(raw_bytes: bytes, *, path: Path) -> dict[str, object]:
     spec["arm_command_template"] = _command(
         spec["arm_command_template"], field="spec.arm_command_template"
     )
+    legacy_lock = spec["legacy_exclusive_lane_lock"]
+    if not isinstance(legacy_lock, str) or not legacy_lock:
+        raise BenchmarkGateError(
+            "spec.legacy_exclusive_lane_lock must be a nonempty path"
+        )
+    if Path(legacy_lock) != LEGACY_EXCLUSIVE_LANE_LOCK:
+        raise BenchmarkGateError(
+            "spec.legacy_exclusive_lane_lock must use the shared MTPLX GPU lock"
+        )
     repetitions = _exact_int(spec["repetitions"], field="spec.repetitions", minimum=2)
     if repetitions % 2:
         raise BenchmarkGateError("spec.repetitions must be even for balanced ordering")
@@ -456,6 +468,7 @@ def _plan(spec: Mapping[str, object]) -> dict[str, object]:
         "quality_command": list(spec["quality_command"]),
         "artifact_verify_command": list(spec["artifact_verify_command"]),
         "arm_command_template": list(spec["arm_command_template"]),
+        "legacy_exclusive_lane_lock": str(spec["legacy_exclusive_lane_lock"]),
         "workload_subprocess_timeout_seconds": int(
             spec["workload_subprocess_timeout_seconds"]
         ),
@@ -675,6 +688,51 @@ def run_spec(
     captured_state: dict[str, object] | None = None
     acquired_lane: Path | None = None
     acquired_owner: dict[str, object] | None = None
+    legacy_lock_descriptor: int | None = None
+    legacy_lock_value = spec.get("legacy_exclusive_lane_lock")
+    legacy_lock_path = (
+        None
+        if legacy_lock_value is None
+        else Path(str(legacy_lock_value)).expanduser().resolve()
+    )
+
+    def acquire_legacy_lane_lock() -> None:
+        nonlocal legacy_lock_descriptor
+        if legacy_lock_path is None:
+            return
+        descriptor = os.open(
+            legacy_lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise BenchmarkGateError(
+                "legacy exclusive GPU lane is active; refusing overlapping hardware work"
+            ) from exc
+        except BaseException:
+            os.close(descriptor)
+            raise
+        legacy_lock_descriptor = descriptor
+        qwen_evidence["legacy_exclusive_lane_lock"] = {
+            "path": str(legacy_lock_path),
+            "acquired": True,
+            "released": False,
+        }
+
+    def release_legacy_lane_lock() -> None:
+        nonlocal legacy_lock_descriptor
+        descriptor = legacy_lock_descriptor
+        if descriptor is None:
+            return
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        legacy_lock_descriptor = None
+        evidence = qwen_evidence.get("legacy_exclusive_lane_lock")
+        if isinstance(evidence, dict):
+            evidence["released"] = True
 
     def command(field: str, *, payload: object | None = None) -> Mapping[str, object]:
         return run_json_subprocess(
@@ -688,20 +746,27 @@ def run_spec(
 
     def acquire_lane() -> None:
         nonlocal acquired_lane, acquired_owner
-        result = dict(command("acquire_lane_command"))
-        if result.get("acquired") is not True:
-            raise BenchmarkGateError("Qwen exclusive lane acquisition was not proven")
-        lane_value = result.get("lane")
-        if not isinstance(lane_value, str) or not lane_value:
-            raise BenchmarkGateError("Qwen acquire result omitted its lane path")
-        owner = dict(_mapping(result.get("owner"), field="Qwen acquire owner"))
-        acquired_lane = Path(lane_value).expanduser().resolve()
-        acquired_owner = owner
-        qwen_evidence["acquire"] = {
-            "acquired": True,
-            "lane": str(acquired_lane),
-            "owner": owner,
-        }
+        acquire_legacy_lane_lock()
+        try:
+            result = dict(command("acquire_lane_command"))
+            if result.get("acquired") is not True:
+                raise BenchmarkGateError(
+                    "Qwen exclusive lane acquisition was not proven"
+                )
+            lane_value = result.get("lane")
+            if not isinstance(lane_value, str) or not lane_value:
+                raise BenchmarkGateError("Qwen acquire result omitted its lane path")
+            owner = dict(_mapping(result.get("owner"), field="Qwen acquire owner"))
+            acquired_lane = Path(lane_value).expanduser().resolve()
+            acquired_owner = owner
+            qwen_evidence["acquire"] = {
+                "acquired": True,
+                "lane": str(acquired_lane),
+                "owner": owner,
+            }
+        except BaseException:
+            release_legacy_lane_lock()
+            raise
 
     def capture() -> dict[str, object]:
         nonlocal captured_state, journal_evidence
@@ -762,6 +827,7 @@ def run_spec(
         if acquired_owner is not None and result.get("owner") != acquired_owner:
             raise BenchmarkGateError("Qwen release owner differs from acquisition")
         qwen_evidence["release"] = result
+        release_legacy_lane_lock()
 
     hooks = QwenIsolationHooks(
         acquire_lane=acquire_lane,
@@ -804,6 +870,8 @@ def run_spec(
         "verify",
         "release",
     }
+    if legacy_lock_path is not None:
+        required_evidence.add("legacy_exclusive_lane_lock")
     if set(qwen_evidence) != required_evidence:
         raise BenchmarkGateError("Qwen isolation evidence is incomplete")
     result["qwen_isolation"] = qwen_evidence
