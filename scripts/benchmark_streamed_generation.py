@@ -44,6 +44,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def _positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
@@ -1220,6 +1227,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Global miss-service/I/O slots (default: model top-k).",
     )
     parser.add_argument(
+        "--hy3-q4-dynamic-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Opt into the Hy3 Q4 physical-memory broker and dynamically "
+            "releasable component-bank expert slabs. Requires the 131072-token "
+            "global component-bank lane and a 110-112 GiB memory limit."
+        ),
+    )
+    parser.add_argument(
+        "--expert-slab-slots",
+        type=_positive_int,
+        default=32,
+        help="Expert records per releasable component-bank slab (default: 32).",
+    )
+    parser.add_argument(
+        "--expert-regrow-hysteresis-slabs",
+        type=_nonnegative_int,
+        default=1,
+        help="Free slab equivalents required before lazy regrowth (default: 1).",
+    )
+    parser.add_argument(
+        "--expert-resize-min-interval-ms",
+        type=_nonnegative_int,
+        default=1000,
+        help="Minimum interval between expert-slab resizes (default: 1000 ms).",
+    )
+    parser.add_argument(
         "--read-chunk",
         default="8MiB",
         help="Maximum native positional-read chunk (default: 8MiB).",
@@ -1774,6 +1809,40 @@ def _run_concurrent_repeats(
 _active_evidence_reservations: JsonEvidenceReservations | None = None
 
 
+def build_expert_streaming_config(
+    args: argparse.Namespace,
+    *,
+    validated_manifest: object | None,
+) -> ExpertStreamingConfig:
+    """Resolve the exact runtime configuration before loading model bytes."""
+
+    return ExpertStreamingConfig(
+        model_key=args.model_key,
+        memory_limit_bytes=parse_memory_bytes(args.memory_limit),
+        max_live_kv_tokens=args.max_live_kv_tokens,
+        runtime_reserve_bytes=parse_memory_bytes(args.runtime_reserve),
+        expert_cache_limit_bytes=(
+            parse_memory_bytes(args.expert_cache_limit)
+            if args.expert_cache_limit
+            else None
+        ),
+        cache_policy=args.cache_policy,
+        cache_scope=args.cache_scope,
+        transient_slots=args.transient_slots,
+        max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
+        bypass_page_cache=args.f_nocache,
+        slot_layout=args.slot_layout,
+        verify_record_hashes=should_verify_source_records(args, validated_manifest),
+        verify_sidecar_hash_at_open=args.verified_sidecar,
+        trace_routes=args.route_trace_json is not None,
+        resource_telemetry=args.resource_telemetry,
+        dynamic_expert_slabs=args.hy3_q4_dynamic_memory,
+        expert_slab_slots=args.expert_slab_slots,
+        expert_regrow_hysteresis_slabs=args.expert_regrow_hysteresis_slabs,
+        expert_resize_min_interval_ms=args.expert_resize_min_interval_ms,
+    )
+
+
 def _main() -> int:
     global _active_evidence_reservations
     parser = build_parser()
@@ -1871,26 +1940,9 @@ def _main() -> int:
     )
     if validated_manifest is not None:
         validate_sidecar_flags(parser, args, validated_manifest)
-    config = ExpertStreamingConfig(
-        model_key=args.model_key,
-        memory_limit_bytes=parse_memory_bytes(args.memory_limit),
-        max_live_kv_tokens=args.max_live_kv_tokens,
-        runtime_reserve_bytes=parse_memory_bytes(args.runtime_reserve),
-        expert_cache_limit_bytes=(
-            parse_memory_bytes(args.expert_cache_limit)
-            if args.expert_cache_limit
-            else None
-        ),
-        cache_policy=args.cache_policy,
-        cache_scope=args.cache_scope,
-        transient_slots=args.transient_slots,
-        max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
-        bypass_page_cache=args.f_nocache,
-        slot_layout=args.slot_layout,
-        verify_record_hashes=should_verify_source_records(args, validated_manifest),
-        verify_sidecar_hash_at_open=args.verified_sidecar,
-        trace_routes=args.route_trace_json is not None,
-        resource_telemetry=args.resource_telemetry,
+    config = build_expert_streaming_config(
+        args,
+        validated_manifest=validated_manifest,
     )
     verification_receipt_dir = args.verification_receipt_dir.expanduser().resolve()
     model_artifact_identity = build_model_artifact_identity(

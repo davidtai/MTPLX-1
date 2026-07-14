@@ -70,6 +70,41 @@ def test_window_telemetry_can_be_disabled() -> None:
     assert args.window_telemetry is False
 
 
+def test_hy3_q4_dynamic_memory_flags_reach_runtime_config() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            "/model",
+            "/manifest",
+            "--model-key",
+            "hy3-q4",
+            "--memory-limit",
+            "110GiB",
+            "--max-live-kv-tokens",
+            "131072",
+            "--cache-scope",
+            "global",
+            "--slot-layout",
+            "component-banks",
+            "--hy3-q4-dynamic-memory",
+            "--expert-slab-slots",
+            "64",
+            "--expert-regrow-hysteresis-slabs",
+            "2",
+            "--expert-resize-min-interval-ms",
+            "250",
+        ]
+    )
+
+    config = module.build_expert_streaming_config(args, validated_manifest=None)
+
+    assert config.dynamic_expert_slabs is True
+    assert config.expert_slab_slots == 64
+    assert config.expert_regrow_hysteresis_slabs == 2
+    assert config.expert_resize_min_interval_ms == 250
+
+
 def test_configuration_summary_exports_explicit_cache_and_batch_identity() -> None:
     module = _load_module()
     settings = {
