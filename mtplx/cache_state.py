@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 import importlib
@@ -70,6 +70,8 @@ class KVPhysicalAllocationObserver(Protocol):
 
     def sample_allocator_memory(self) -> Any: ...
 
+    def physical_kv_release_context(self) -> Any: ...
+
     def release_cache(
         self,
         *,
@@ -120,6 +122,19 @@ def register_physical_kv_cache(cache: Any) -> None:
         scope.append(cache)
 
 
+def _retain_failed_physical_kv_cache(cache: Any) -> None:
+    """Transfer retryable close ownership to the allocation observer."""
+
+    entries = cache if isinstance(cache, (list, tuple)) else (cache,)
+    for entry in entries:
+        if getattr(entry, "_closed", False):
+            continue
+        observer = getattr(entry, "allocation_observer", None)
+        retain = getattr(observer, "retain_pending_physical_kv_cache", None)
+        if callable(retain):
+            retain(entry)
+
+
 @contextmanager
 def physical_kv_cache_lifecycle():
     """Close broker-owned caches on success, errors, and cancellation paths."""
@@ -140,6 +155,7 @@ def physical_kv_cache_lifecycle():
                 try:
                     close_physical_kv_cache(cache)
                 except BaseException as exc:
+                    _retain_failed_physical_kv_cache(cache)
                     if first_error is None:
                         first_error = exc
         finally:
@@ -2216,6 +2232,24 @@ class VllmMetalPagedKVCache:
                 self._closed = True
             return
 
+        guard_factory = getattr(observer, "physical_kv_release_context", None)
+        guard = guard_factory() if callable(guard_factory) else nullcontext()
+        with guard:
+            self._close_observed_cache(
+                observer,
+                allocations=allocations,
+                released_physical_bytes=released,
+            )
+
+    def _close_observed_cache(
+        self,
+        observer: KVPhysicalAllocationObserver,
+        *,
+        allocations: tuple[Any, ...],
+        released_physical_bytes: int,
+    ) -> None:
+        """Cross one physical release boundary while the observer serializes it."""
+
         clear_error: BaseException | None = None
         if not self._close_arrays_dropped:
             # Do not cross the physical-release boundary until its baseline is
@@ -2242,7 +2276,7 @@ class VllmMetalPagedKVCache:
             observer.release_cache(
                 cache_id=self.cache_id,
                 allocations=allocations,
-                released_physical_bytes=released,
+                released_physical_bytes=released_physical_bytes,
                 allocator_before=self._close_allocator_before,
                 allocator_after=allocator_after,
             )
