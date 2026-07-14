@@ -523,20 +523,19 @@ class UnifiedMemoryBroker:
                 raise MemoryTelemetryError(
                     "allocator telemetry is stale during post-load reconciliation"
                 )
-            classified_delta = (
-                resident
-                - self._pools.resident_model_bytes
-                + experts
-                - self._pools.expert_slab_physical_bytes
-                + staging
-                - self._pools.in_flight_expert_staging_bytes
+            if (
+                self._initial_allocator_sample is not None
+                and allocator_before != self._initial_allocator_sample
+            ):
+                raise MemoryTelemetryError(
+                    "allocator baseline drifted before post-load reconciliation"
+                )
+            classified_after = (
+                resident + experts + staging + workspace + self._pools.kv_physical_bytes
             )
-            footprint_delta = (
-                allocator_after.charged_footprint_bytes
-                - allocator_before.charged_footprint_bytes
-            )
-            residual_cache = (
-                self._pools.allocator_cache_bytes + footprint_delta - classified_delta
+            residual_cache = max(
+                0,
+                allocator_after.charged_footprint_bytes - classified_after,
             )
             cache_after = max(0, allocator_after.cache_bytes, residual_cache)
             self._pools = replace(

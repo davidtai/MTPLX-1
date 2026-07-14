@@ -302,6 +302,33 @@ def test_post_load_classification_atomically_reclassifies_consumed_cache() -> No
     assert snapshot.charged_bytes == 85
 
 
+def test_post_load_classification_does_not_double_charge_planned_resident() -> None:
+    initial_sample = AllocatorMemorySample(25, 0, 25)
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(
+            resident=40,
+            experts=20,
+            staging=5,
+            workspace=10,
+        ),
+        initial_allocator_sample=initial_sample,
+        expert_slab_bytes=10,
+    )
+
+    snapshot = broker.reconcile_post_load_classification(
+        resident_model_bytes=45,
+        expert_slab_physical_bytes=20,
+        in_flight_expert_staging_bytes=5,
+        runtime_workspace_bytes=5,
+        allocator_before=initial_sample,
+        allocator_after=AllocatorMemorySample(70, 0, 70),
+    )
+
+    assert snapshot.allocator_cache_bytes == 0
+    assert snapshot.charged_bytes == 75
+
+
 def test_post_load_classification_rejects_active_ticket_without_mutation() -> None:
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
