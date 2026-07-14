@@ -176,7 +176,7 @@ git commit -m "feat(hy3): enforce the single-sequence 128K Q4 contract"
 
 **Does NOT cover:** The broker performs authoritative byte accounting and reservations; it does not itself select expert victims or allocate MLX arrays.
 
-- [ ] **Step 1: Write failing 110/112 GiB boundary and reservation tests**
+- [x] **Step 1: Write failing 110/112 GiB boundary and reservation tests**
 
 ```python
 GIB = 1024**3
@@ -204,13 +204,13 @@ def test_operating_and_hard_boundaries(charged, allowed):
 
 Add RED tests for exact physical Q4 block rounding, steady plus transient allocation peak, logical eviction with zero physical release, pinned-byte shortfall, allocator-retained memory, duplicate release, interrupted allocation, and rollback before/after the destructive boundary.
 
-- [ ] **Step 2: Run the broker tests and confirm RED**
+- [x] **Step 2: Run the broker tests and confirm RED**
 
 Run: `uv run --frozen --extra dev pytest -q tests/test_memory_broker.py`
 
 Expected: FAIL because `mtplx.memory_broker` does not exist.
 
-- [ ] **Step 3: Implement immutable snapshots and two-phase tickets**
+- [x] **Step 3: Implement immutable snapshots and two-phase tickets**
 
 ```python
 @dataclass(frozen=True)
@@ -253,11 +253,11 @@ class KVAllocationTicket:
 
 Implement a lock-protected `UnifiedMemoryBroker` with `plan_kv_growth`, `confirm_expert_reclaim`, `commit_kv_growth`, `abort_kv_growth`, `release_kv`, `plan_expert_regrow`, and `snapshot`. Tickets are single-use and revision checked. Normal reservations must end at or below 110 GiB; every observed snapshot at or above 112 GiB records a hard failure and rejects further allocation.
 
-- [ ] **Step 4: Implement physical confirmation semantics**
+- [x] **Step 4: Implement physical confirmation semantics**
 
 Define allocator samples as active/cache/peak bytes. Credit expert reclaim only when the charged allocator footprint and registered slab bytes decrease by the requested amount. Moving bytes from MLX active memory into MLX cache is not reclaim. Missing telemetry, negative deltas, or allocator-cache retention fails closed.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 ```bash
 uv run --frozen --extra dev pytest -q tests/test_memory_broker.py
@@ -337,11 +337,11 @@ git commit -m "feat(hy3): make global expert policy slab-aware"
 
 **Does NOT cover:** Transient top-k service slots remain permanently allocated and charged; only persistent global component-bank slots are releasable.
 
-- [ ] **Step 1: Write failing slab lifetime and stale-generation tests**
+- [x] **Step 1: Write failing slab lifetime and stale-generation tests**
 
 Cover warm generation `g` followed by slab destroy/recreate and stale `g` rejection; pin/LOADING refusal without mutation; selected-fence waiting without a global drain; unrelated slab release while one is fenced; owner-thread enforcement; interrupted pre-destruction rollback; valid post-destruction released state; and multi-slab Q4 output/router-order parity.
 
-- [ ] **Step 2: Confirm RED against focused suites**
+- [x] **Step 2: Confirm RED against focused suites**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -351,7 +351,7 @@ uv run --frozen --extra dev --extra server pytest -q \
 
 Expected: FAIL because slab allocation/release APIs do not exist.
 
-- [ ] **Step 3: Implement stable logical slots and physical slab ownership**
+- [x] **Step 3: Implement stable logical slots and physical slab ownership**
 
 ```python
 class ExpertSlabState(str, Enum):
@@ -371,11 +371,11 @@ class ExpertSlab:
 
 Use one `MlxComponentBank` per persistent slab. Keep `_PhysicalSlot` objects stable and set `buffer=None` only after the destructive boundary. Add allocator methods `allocate_slab` and `release_slab`; add pool methods `prepare_slab_reclaim`, `commit_slab_reclaim`, `abort_slab_reclaim`, and `regrow_slab`. Capture the MLX owner thread at construction and reject slab allocate/destroy elsewhere.
 
-- [ ] **Step 4: Preserve selected ownership/fence lifecycle without a global drain**
+- [x] **Step 4: Preserve selected ownership/fence lifecycle without a global drain**
 
 Mark only selected slabs `DRAINING`, recheck each selected slot for `LOADING` and pins, wait only for completion owners attached to those slots, invalidate their exact generations, then release their component banks. Add poison assertions that `_drain_completion_fences` and device-wide synchronize are not called by reclaim.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \
