@@ -3641,6 +3641,12 @@ def install_vllm_metal_paged_attention_kv_cache(
     cache_id_prefix: str = "kv",
 ) -> dict[str, int | str]:
     """Replace stock full-attention KV caches with vLLM-Metal paged caches."""
+    if allocation_observer is not None:
+        if not isinstance(cache_id_prefix, str) or not cache_id_prefix.strip():
+            raise ValueError(
+                "cache_id_prefix must be a nonempty string for physical KV accounting"
+            )
+        cache_id_prefix = cache_id_prefix.strip()
     fallback_kv_quant_config = kv_quant_config
     if turboquant_config is not None:
         kv_quant_config = None
@@ -3714,7 +3720,27 @@ def install_vllm_metal_paged_attention_kv_cache(
             stats["skipped"] = int(stats["skipped"]) + 1
             continue
         if isinstance(entry, VllmMetalPagedKVCache):
-            if allocation_observer is not None and entry.key_cache is not None:
+            requested_cache_id = (
+                f"{cache_id_prefix}:{idx}" if allocation_observer is not None else ""
+            )
+            if entry.allocation_observer is not None and allocation_observer is None:
+                raise ValueError(
+                    "cannot detach physical KV accounting from a broker-owned cache"
+                )
+            if entry.allocation_observer is not None and (
+                entry.allocation_observer is not allocation_observer
+                or entry.cache_id != requested_cache_id
+            ):
+                raise ValueError(
+                    "cannot reassign physical KV ownership for an existing cache"
+                )
+            if entry._closed and allocation_observer is not None:
+                raise ValueError(
+                    "cannot attach physical KV accounting to a closed cache"
+                )
+            if allocation_observer is not None and (
+                entry.key_cache is not None or entry._kv_allocations
+            ):
                 raise ValueError(
                     "cannot attach physical KV accounting to an allocated cache"
                 )
@@ -3725,9 +3751,7 @@ def install_vllm_metal_paged_attention_kv_cache(
             entry.kv_quant_config = kv_quant_config
             entry.kv_quant = kv_quant_config is not None
             entry.allocation_observer = allocation_observer
-            entry.cache_id = (
-                f"{cache_id_prefix}:{idx}" if allocation_observer is not None else ""
-            )
+            entry.cache_id = requested_cache_id
             stats["entries"] = int(stats["entries"]) + 1
             continue
         if isinstance(entry, TailOwnedKVCache):

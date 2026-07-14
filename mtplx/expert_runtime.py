@@ -2325,20 +2325,9 @@ class ExpertStreamingRuntime:
         broker = self.memory_broker
         if broker is None:
             raise MemoryAdmissionError("dynamic KV allocation is not enabled")
-        observed_kv_bytes = observed_physical_bytes
-        if (
-            observed_kv_bytes is not None
-            and allocator_before is not None
-            and allocator_after is not None
-        ):
-            cache_growth = max(
-                0,
-                allocator_after.cache_bytes - allocator_before.cache_bytes,
-            )
-            observed_kv_bytes = max(0, observed_kv_bytes - cache_growth)
         broker.abort_kv_growth(
             ticket,
-            observed_kv_delta_bytes=observed_kv_bytes,
+            observed_kv_delta_bytes=observed_physical_bytes,
             allocator_before=allocator_before,
             allocator_after=allocator_after,
         )
@@ -2355,7 +2344,7 @@ class ExpertStreamingRuntime:
         allocator_before: AllocatorMemorySample,
         allocator_after: AllocatorMemorySample,
     ) -> None:
-        """Reconcile an exact cache-owner release, then opportunistically regrow."""
+        """Reconcile an exact cache-owner release."""
 
         broker = self.memory_broker
         if broker is None:
@@ -2370,8 +2359,6 @@ class ExpertStreamingRuntime:
             allocator_before=allocator_before,
             allocator_after=allocator_after,
         )
-        if released_physical_bytes:
-            self.maybe_regrow_expert_slabs(target_bytes=released_physical_bytes)
 
     def reclaim_expert_bytes(
         self,

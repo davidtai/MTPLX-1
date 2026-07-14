@@ -741,6 +741,9 @@ def test_kv_observer_release_reconciles_exact_owner_batch() -> None:
         transient_delta_bytes=0,
     )
     allocation = runtime.commit_growth(ticket, measured_physical_bytes=32)
+    runtime.maybe_regrow_expert_slabs = lambda **_kwargs: pytest.fail(
+        "KV release must not regrow expert slabs"
+    )
 
     runtime.release_cache(
         cache_id="target:0",
@@ -794,11 +797,15 @@ def test_runtime_passes_dynamic_kv_observer_to_target_and_mtp_cache(
     )
 
     runtime.make_cache()
+    runtime.make_cache()
+    runtime.make_mtp_cache()
     runtime.make_mtp_cache()
 
     assert calls == [
-        ("target", observer, "target"),
-        ("mtp", observer, "mtp"),
+        ("target", observer, "target:0"),
+        ("target", observer, "target:1"),
+        ("mtp", observer, "mtp:2"),
+        ("mtp", observer, "mtp:3"),
     ]
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect as py_inspect
 import json
 import logging
+import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,11 +41,23 @@ class MTPLXRuntime:
     _forward_ar_supports_logits_keep: bool | None = field(
         default=None, init=False, repr=False
     )
+    _cache_container_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _cache_container_serial: int = field(default=0, init=False, repr=False)
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(
             amount
         )
+
+    def _next_cache_id_prefix(self, kind: str) -> str:
+        with self._cache_container_lock:
+            serial = self._cache_container_serial
+            self._cache_container_serial += 1
+        return f"{kind}:{serial}"
 
     @staticmethod
     def _sequence_len(input_ids: Any) -> int:
@@ -326,7 +339,7 @@ class MTPLXRuntime:
             configure_tail_owned_attention_kv_cache(
                 cache,
                 allocation_observer=allocation_observer,
-                cache_id_prefix="target",
+                cache_id_prefix=self._next_cache_id_prefix("target"),
             )
         register_physical_kv_cache(cache)
         return cache
@@ -352,7 +365,7 @@ class MTPLXRuntime:
             configure_mtp_attention_kv_cache(
                 cache,
                 allocation_observer=allocation_observer,
-                cache_id_prefix="mtp",
+                cache_id_prefix=self._next_cache_id_prefix("mtp"),
             )
         register_physical_kv_cache(cache)
         return cache

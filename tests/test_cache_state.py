@@ -1285,9 +1285,7 @@ def test_q4_close_drops_pages_and_terminalizes_when_allocator_sample_fails() -> 
     )
     values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
     cache.update_without_fetch(values, values)
-    observer.allocator_samples.extend(
-        [RuntimeError("allocator sample failed"), after]
-    )
+    observer.allocator_samples.extend([RuntimeError("allocator sample failed"), after])
 
     with pytest.raises(RuntimeError, match="allocator sample failed"):
         cache.close()
@@ -1337,6 +1335,44 @@ def test_paged_cache_install_refuses_accounting_attach_after_allocation() -> Non
         )
 
     assert entry.allocation_observer is None
+
+
+def test_paged_cache_install_requires_nonempty_owner_prefix() -> None:
+    from mlx_lm.models.cache import KVCache
+
+    with pytest.raises(ValueError, match="cache_id_prefix"):
+        install_vllm_metal_paged_attention_kv_cache(
+            [KVCache()],
+            block_size=4,
+            num_blocks=1,
+            kv_quant_config=PagedKVQuantConfig("q4"),
+            allocation_observer=_KVAllocationObserver(),
+            cache_id_prefix="  ",
+        )
+
+
+def test_paged_cache_install_cannot_detach_live_broker_ownership() -> None:
+    observer = _KVAllocationObserver()
+    entry = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:request-1:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    entry.update_without_fetch(values, values)
+
+    with pytest.raises(ValueError, match="detach physical KV accounting"):
+        install_vllm_metal_paged_attention_kv_cache(
+            [entry],
+            block_size=4,
+            num_blocks=1,
+            kv_quant_config=PagedKVQuantConfig("q4"),
+        )
+
+    assert entry.allocation_observer is observer
+    assert entry.cache_id == "target:request-1:0"
 
 
 def test_closed_brokered_q4_cache_cannot_allocate_again() -> None:
