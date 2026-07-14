@@ -32,6 +32,18 @@ SCHEMA_OBSERVATION = "mtplx-hy3-dynamic-memory-observation-v1"
 SCHEMA_PROBE = "mtplx-hy3-allocator-release-probe-v1"
 SCHEMA_CAMPAIGN = "mtplx-hy3-dynamic-memory-campaign-v1"
 
+_PROBE_BOUND_IDENTITY_FIELDS = (
+    "model_key",
+    "model_artifact_id",
+    "model_artifact_sha256",
+    "expert_manifest_id",
+    "expert_manifest_sha256",
+    "source_git_commit",
+    "kv_quantization",
+    "kv_block_size_tokens",
+    "total_context_tokens",
+)
+
 _T = TypeVar("_T")
 
 
@@ -1082,6 +1094,15 @@ def _paired_equal(static: CampaignObservation, dynamic: CampaignObservation) -> 
         raise BenchmarkGateError("paired final slot health differs")
 
 
+def _require_probe_arm_identity(
+    probe_identity: Mapping[str, object],
+    arm_identity: Mapping[str, object],
+) -> None:
+    for field in _PROBE_BOUND_IDENTITY_FIELDS:
+        if probe_identity[field] != arm_identity[field]:
+            raise BenchmarkGateError(f"allocator probe identity drifted at {field}")
+
+
 def run_balanced_campaign(
     *,
     allocator_probe: Mapping[str, object],
@@ -1098,6 +1119,16 @@ def run_balanced_campaign(
             "allocator-release probe did not pass; refusing the full campaign"
         )
     validated_probe = validate_allocator_probe(allocator_probe)
+    probe_manifest = _mapping(
+        validated_probe["manifest"], field="allocator probe.manifest"
+    )
+    probe_identity = _validate_identity(
+        _mapping(
+            probe_manifest["identity"],
+            field="allocator probe.manifest.identity",
+        ),
+        context="allocator probe.manifest.identity",
+    )
     schedule = balanced_campaign_schedule(
         repetitions=repetitions,
         contexts=contexts,
@@ -1107,6 +1138,7 @@ def run_balanced_campaign(
     for campaign_order_index, entry in enumerate(schedule):
         raw = execute_arm(entry.arm, entry.context_tokens, entry.repetition)
         observation = validate_campaign_observation(raw)
+        _require_probe_arm_identity(probe_identity, observation.identity)
         if (
             observation.arm != entry.arm
             or observation.context_tokens != entry.context_tokens

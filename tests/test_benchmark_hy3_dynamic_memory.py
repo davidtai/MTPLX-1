@@ -438,6 +438,42 @@ def test_campaign_fails_before_arm_execution_when_probe_gate_did_not_pass() -> N
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("field", "different_value"),
+    [
+        ("model_artifact_id", "pipenetwork/Hy3-4bit@different"),
+        ("model_artifact_sha256", "d" * 64),
+        ("expert_manifest_id", "hy3-q4/component-banks/other-manifest.json"),
+        ("expert_manifest_sha256", "e" * 64),
+        ("source_git_commit", "d" * 40),
+    ],
+)
+def test_campaign_rejects_every_arm_whose_identity_differs_from_probe(
+    field: str,
+    different_value: str,
+) -> None:
+    probe = validate_allocator_probe(_probe_result())
+    calls: list[tuple[str, int, int]] = []
+
+    def execute(arm: str, context_tokens: int, repetition: int):
+        calls.append((arm, context_tokens, repetition))
+        row = _observation(arm, context_tokens, repetition, tok_s=10.0)
+        row["identity"][field] = different_value
+        return row
+
+    with pytest.raises(
+        BenchmarkGateError,
+        match=f"allocator probe identity drifted at {field}",
+    ):
+        run_balanced_campaign(
+            allocator_probe=probe,
+            execute_arm=execute,
+            repetitions=2,
+        )
+
+    assert calls == [("static", 4096, 0)]
+
+
 def test_campaign_rejects_pair_identity_or_output_drift() -> None:
     probe = validate_allocator_probe(_probe_result())
 
@@ -465,7 +501,7 @@ def test_campaign_rejects_pair_identity_or_output_drift() -> None:
         ("expert_manifest_id", "hy3-q4/component-banks/other-manifest.json"),
     ],
 )
-def test_campaign_rejects_pair_artifact_ids_even_when_hashes_match(
+def test_campaign_rejects_arm_artifact_ids_even_when_hashes_match(
     field: str,
     different_value: str,
 ) -> None:
@@ -477,7 +513,10 @@ def test_campaign_rejects_pair_artifact_ids_even_when_hashes_match(
             row["identity"][field] = different_value
         return row
 
-    with pytest.raises(BenchmarkGateError, match=f"paired identity drifted at {field}"):
+    with pytest.raises(
+        BenchmarkGateError,
+        match=f"allocator probe identity drifted at {field}",
+    ):
         run_balanced_campaign(
             allocator_probe=probe,
             execute_arm=execute,

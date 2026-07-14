@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -165,7 +166,12 @@ def _runtime(
         expert_resize_min_interval_ms=0,
     )
     runtime._dynamic_resize_lock = threading.RLock()
+    runtime._memory_transaction_lock = threading.RLock()
     runtime._dynamic_resize_metrics = {}
+    runtime._cleanup_error_lock = threading.Lock()
+    runtime._cleanup_error = None
+    runtime._pending_physical_kv_lock = threading.Lock()
+    runtime._pending_physical_kv_caches = {}
     snapshot = broker.snapshot()
     runtime._last_allocator_sample = initial_sample or AllocatorMemorySample(
         active_bytes=(
@@ -290,6 +296,43 @@ def test_route_regrow_uses_actual_unique_demand_beyond_model_top_k() -> None:
     assert bank.active_capacity == 3
 
 
+def test_route_pressure_lazily_regrows_after_large_kv_reclaim() -> None:
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    broker.replace_snapshot(_snapshot(resident=36, experts=32))
+    slots = _FakeSlots(physical_bytes=32)
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1,),
+        expert_count=4,
+        persistent_slots=4,
+        transient_slots=1,
+        prefill_slots_per_layer=4,
+    )
+    for expert in range(4):
+        plan, transaction = bank.plan_transaction(1, (expert,), phase="decode")
+        transaction.commit()
+    bank.deactivate_slots((0, 1))
+    assert bank.occupancy == bank.active_capacity == 2
+    runtime = _runtime(
+        broker,
+        slots=slots,
+        bank=bank,
+        samples=[
+            AllocatorMemorySample(32, 0, 32),
+            AllocatorMemorySample(64, 0, 64),
+        ],
+    )
+
+    assert tuple(runtime._regrow_for_route_demand((2,))) == (2,)
+
+    assert slots.regrown == [0]
+    assert bank.active_capacity == 4
+
+
 def test_split_route_demand_regrows_before_acquiring_non_reentrant_policy_lock() -> (
     None
 ):
@@ -393,6 +436,83 @@ def test_dynamic_broker_initialization_charges_all_pools_additively(
     assert snapshot.allocator_cache_bytes == 7
     assert snapshot.charged_bytes == 221
     assert broker.initial_allocator_sample == AllocatorMemorySample(64, 7, 71)
+
+
+def test_dynamic_broker_initialization_charges_unclassified_active_footprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        expert_slab_slots=2,
+        expert_regrow_hysteresis_slabs=1,
+        expert_resize_min_interval_ms=1000,
+    )
+    spec = SimpleNamespace(expert_record_bytes=16)
+    plan = SimpleNamespace(
+        persistent_slots=4,
+        resident_bytes=10,
+        transient_bytes=20,
+        io_staging_bytes=30,
+        runtime_reserve_bytes=40,
+        execution_workspace_bytes=50,
+    )
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "mlx_memory_telemetry",
+        lambda _mx: {
+            "active_memory_bytes": 300,
+            "cache_memory_bytes": 7,
+            "peak_memory_bytes": 307,
+        },
+    )
+
+    broker = ExpertStreamingRuntime._initialize_dynamic_memory_broker(
+        config=config,
+        spec=spec,
+        plan=plan,
+        slots=_FakeSlots(),
+        mx_module=object(),
+    )
+
+    snapshot = broker.snapshot()
+    assert snapshot.allocator_cache_bytes == 93
+    assert snapshot.charged_bytes == 307
+
+
+def test_dynamic_broker_rejects_initial_allocator_footprint_above_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        expert_slab_slots=2,
+        expert_regrow_hysteresis_slabs=1,
+        expert_resize_min_interval_ms=1000,
+    )
+    spec = SimpleNamespace(expert_record_bytes=16)
+    plan = SimpleNamespace(
+        persistent_slots=4,
+        resident_bytes=10,
+        transient_bytes=0,
+        io_staging_bytes=0,
+        runtime_reserve_bytes=0,
+        execution_workspace_bytes=0,
+    )
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "mlx_memory_telemetry",
+        lambda _mx: {
+            "active_memory_bytes": 112 * BINARY_GIB,
+            "cache_memory_bytes": 0,
+            "peak_memory_bytes": 112 * BINARY_GIB,
+        },
+    )
+
+    with pytest.raises(ExpertStreamingConfigurationError, match="110 GiB"):
+        ExpertStreamingRuntime._initialize_dynamic_memory_broker(
+            config=config,
+            spec=spec,
+            plan=plan,
+            slots=_FakeSlots(),
+            mx_module=object(),
+        )
 
 
 def test_dynamic_broker_rejects_missing_or_mismatched_physical_slab_layout(
@@ -746,6 +866,86 @@ def test_dynamic_memory_telemetry_reports_complete_bounded_resize_state() -> Non
     }
 
 
+def test_dynamic_memory_telemetry_uses_live_pin_and_speculation_truth() -> None:
+    class PinnedSlots(_FakeSlots):
+        def expert_slab_telemetry_snapshot(self) -> dict[str, int]:
+            telemetry = super().expert_slab_telemetry_snapshot()
+            telemetry["pinned_record_count"] = 1
+            telemetry["pin_count"] = 2
+            telemetry["pinned_bytes"] = 16
+            return telemetry
+
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+    )
+    bank = _FakeBank()
+    bank.active_capacity = 4
+    bank.occupancy = 2
+    bank.speculative_record_count = 1
+    runtime = _runtime(
+        broker,
+        slots=PinnedSlots(),
+        bank=bank,
+        samples=[],
+    )
+    runtime._dynamic_resize_metrics = {
+        "reclaim_requests": 0,
+        "regrow_requests": 0,
+        "requested_reclaim_bytes": 0,
+        "reclaimed_bytes": 0,
+        "regrown_bytes": 0,
+        "resize_operations": 0,
+        "resize_failures": 0,
+        "blocked_by_pin_bytes": 0,
+        "last_resize_duration_ns": 0,
+        "total_resize_duration_ns": 0,
+        "max_resize_duration_ns": 0,
+    }
+
+    telemetry = runtime.dynamic_memory_telemetry_snapshot()
+
+    assert broker.snapshot().pinned_expert_bytes == 0
+    assert broker.snapshot().speculative_expert_bytes == 0
+    assert telemetry["pinned_expert_bytes"] == 16
+    assert telemetry["speculative_expert_bytes"] == 16
+
+
+def test_kv_admission_reconciles_live_pinned_expert_bytes() -> None:
+    class PinnedSlots(_FakeSlots):
+        def expert_slab_telemetry_snapshot(self) -> dict[str, int]:
+            telemetry = super().expert_slab_telemetry_snapshot()
+            telemetry["pinned_record_count"] = 2
+            telemetry["pin_count"] = 2
+            telemetry["pinned_bytes"] = 32
+            return telemetry
+
+    target = 110 * BINARY_GIB
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=target - 64, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=PinnedSlots(),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(target, 0, target)],
+    )
+
+    with pytest.raises(MemoryAdmissionError, match="pinned expert bytes"):
+        runtime.reserve_growth(
+            cache_id="target:pinned",
+            steady_delta_bytes=64,
+            transient_delta_bytes=0,
+        )
+
+    snapshot = broker.snapshot()
+    assert snapshot.pinned_expert_bytes == 32
+    assert snapshot.pending_kv_ticket_id is None
+
+
 def test_dynamic_plan_is_zero_kv_slab_aligned_and_bounded_by_110_gib() -> None:
     config = ExpertStreamingConfig(
         model_key="hy3-q4",
@@ -1052,6 +1252,61 @@ def test_lazy_regrow_confirms_allocator_growth_before_reactivating_slots() -> No
     assert snapshot.expert_slab_physical_bytes == 64
     assert snapshot.pending_expert_regrow_ticket_id is None
     assert snapshot.last_expert_resize_ns == 5
+
+
+def test_dynamic_resize_metrics_are_mutated_only_under_resize_lock() -> None:
+    class GuardedLock:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+            self._owner: int | None = None
+            self._depth = 0
+
+        @property
+        def owned(self) -> bool:
+            return self._owner == threading.get_ident()
+
+        def __enter__(self):
+            self._lock.acquire()
+            self._owner = threading.get_ident()
+            self._depth += 1
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+            self._lock.release()
+
+    class GuardedMetrics(dict[str, int]):
+        def __init__(self, guard: GuardedLock) -> None:
+            super().__init__()
+            self.guard = guard
+
+        def get(self, key: str, default=None):
+            assert self.guard.owned, "resize metrics escaped the resize lock"
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: int) -> None:
+            assert self.guard.owned, "resize metrics escaped the resize lock"
+            super().__setitem__(key, value)
+
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(),
+        bank=_FakeBank(),
+        samples=[],
+    )
+    guard = GuardedLock()
+    runtime._dynamic_resize_lock = guard
+    runtime._dynamic_resize_metrics = GuardedMetrics(guard)
+
+    assert runtime.maybe_regrow_expert_slabs(target_bytes=32, now_ns=5) == 0
 
 
 def test_reclaim_fails_without_touching_policy_when_every_slab_is_protected() -> None:
@@ -1400,7 +1655,10 @@ def test_regrow_failure_before_allocation_aborts_the_broker_ticket() -> None:
         broker,
         slots=slots,
         bank=_FakeBank(),
-        samples=[AllocatorMemorySample(32, 0, 32)],
+        samples=[
+            AllocatorMemorySample(32, 0, 32),
+            AllocatorMemorySample(32, 0, 32),
+        ],
     )
 
     with pytest.raises(RuntimeError, match="injected allocation failure"):
@@ -1409,6 +1667,224 @@ def test_regrow_failure_before_allocation_aborts_the_broker_ticket() -> None:
     snapshot = broker.snapshot()
     assert snapshot.expert_slab_physical_bytes == 32
     assert snapshot.pending_expert_regrow_ticket_id is None
+
+
+def test_regrow_registry_failure_before_allocation_aborts_the_broker_ticket() -> None:
+    class FailingRegistrySlots(_FakeSlots):
+        def expert_slab_telemetry_snapshot(self) -> dict[str, int]:
+            raise MemoryTelemetryError("injected expert registry failure")
+
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    broker.replace_snapshot(_snapshot(resident=36, experts=32))
+    slots = FailingRegistrySlots(physical_bytes=32)
+    runtime = _runtime(
+        broker,
+        slots=slots,
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(32, 0, 32)],
+    )
+
+    with pytest.raises(MemoryTelemetryError, match="expert registry failure"):
+        runtime.maybe_regrow_expert_slabs(target_bytes=32, now_ns=5)
+
+    assert slots.regrown == []
+    assert broker.snapshot().pending_expert_regrow_ticket_id is None
+
+
+def test_regrow_allocator_baseline_failure_aborts_the_broker_ticket() -> None:
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    broker.replace_snapshot(_snapshot(resident=36, experts=32))
+    slots = _FakeSlots(physical_bytes=32)
+    runtime = _runtime(
+        broker,
+        slots=slots,
+        bank=_FakeBank(),
+        samples=[],
+    )
+
+    with pytest.raises(IndexError):
+        runtime.maybe_regrow_expert_slabs(target_bytes=32, now_ns=5)
+
+    assert slots.regrown == []
+    assert broker.snapshot().pending_expert_regrow_ticket_id is None
+
+
+def test_regrow_failure_after_ambiguous_allocation_publishes_physical_truth() -> None:
+    class AmbiguousSlots(_FakeSlots):
+        def regrow_slab(self, slab_id: int) -> None:
+            self.regrown.append(slab_id)
+            self._physical_bytes += 32
+            raise RuntimeError("injected post-allocation failure")
+
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    broker.replace_snapshot(_snapshot(resident=36, experts=32))
+    slots = AmbiguousSlots(physical_bytes=32)
+    runtime = _runtime(
+        broker,
+        slots=slots,
+        bank=_FakeBank(),
+        samples=[
+            AllocatorMemorySample(32, 0, 32),
+            AllocatorMemorySample(64, 0, 64),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="post-allocation failure"):
+        runtime.maybe_regrow_expert_slabs(target_bytes=32, now_ns=5)
+
+    snapshot = broker.snapshot()
+    assert snapshot.expert_slab_physical_bytes == 64
+    assert snapshot.pending_expert_regrow_ticket_id is None
+    assert snapshot.failed_closed is True
+
+
+def test_regrow_policy_activation_failure_terminalizes_physical_truth() -> None:
+    class FailingActivationBank(_FakeBank):
+        def activate_slots(self, slot_ids):
+            del slot_ids
+            raise RuntimeError("injected policy activation failure")
+
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    broker.replace_snapshot(_snapshot(resident=36, experts=32))
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(physical_bytes=32),
+        bank=FailingActivationBank(),
+        samples=[
+            AllocatorMemorySample(32, 0, 32),
+            AllocatorMemorySample(64, 0, 64),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="policy activation failure"):
+        runtime.maybe_regrow_expert_slabs(target_bytes=32, now_ns=5)
+
+    snapshot = broker.snapshot()
+    assert snapshot.expert_slab_physical_bytes == 64
+    assert snapshot.pending_expert_regrow_ticket_id is None
+    assert snapshot.failed_closed is True
+
+
+def test_reclaim_policy_failure_after_destruction_publishes_physical_truth() -> None:
+    class FailingPolicyBank(_FakeBank):
+        def deactivate_slots(self, slot_ids):
+            del slot_ids
+            raise RuntimeError("injected policy deactivation failure")
+
+    target = 110 * BINARY_GIB
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=target - 64, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=32,
+        transient_delta_bytes=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(),
+        bank=FailingPolicyBank(),
+        samples=[
+            AllocatorMemorySample(target, 0, target),
+            AllocatorMemorySample(target - 32, 0, target),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="policy deactivation failure"):
+        runtime.reclaim_expert_bytes(ticket, now_ns=1)
+
+    snapshot = broker.snapshot()
+    assert snapshot.expert_slab_physical_bytes == 32
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.failed_closed is True
+
+
+def test_q4_release_waits_for_growth_transaction_and_keeps_exact_owners() -> None:
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    existing_ticket = broker.plan_kv_growth(
+        cache_id="target:existing",
+        steady_delta_bytes=32,
+        transient_delta_bytes=0,
+    )
+    existing = broker.commit_kv_growth(
+        existing_ticket,
+        allocated_physical_bytes=32,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(132, 0, 132)],
+    )
+    growth = runtime.reserve_growth(
+        cache_id="target:growing",
+        steady_delta_bytes=32,
+        transient_delta_bytes=0,
+    )
+    started = threading.Event()
+    release_errors: list[BaseException] = []
+
+    def release_existing() -> None:
+        started.set()
+        try:
+            runtime.release_cache(
+                cache_id="target:existing",
+                allocations=(existing,),
+                released_physical_bytes=32,
+                allocator_before=AllocatorMemorySample(32, 0, 32),
+                allocator_after=AllocatorMemorySample(0, 0, 32),
+            )
+        except BaseException as exc:
+            release_errors.append(exc)
+
+    thread = threading.Thread(target=release_existing)
+    thread.start()
+    assert started.wait(timeout=1)
+    time.sleep(0.01)
+    assert thread.is_alive()
+
+    growing = runtime.commit_growth(growth, measured_physical_bytes=32)
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert release_errors == []
+    snapshot = broker.snapshot()
+    assert snapshot.kv_physical_bytes == 32
+    assert snapshot.owned_kv_physical_bytes == 32
+    assert snapshot.unreconciled_kv_physical_bytes == 0
+    broker.release_kv(
+        growing,
+        registered_kv_bytes_after=0,
+        allocator_before=AllocatorMemorySample(32, 0, 32),
+        allocator_after=AllocatorMemorySample(0, 0, 32),
+    )
 
 
 def test_regrow_allocator_telemetry_failure_consumes_ticket_with_physical_truth() -> (
@@ -1481,7 +1957,7 @@ def test_partial_regrow_is_published_and_fails_closed() -> None:
         ],
     )
 
-    with pytest.raises(MemoryTelemetryError, match="did not match"):
+    with pytest.raises(RuntimeError, match="second-slab failure"):
         runtime.maybe_regrow_expert_slabs(target_bytes=64, now_ns=5)
 
     snapshot = broker.snapshot()

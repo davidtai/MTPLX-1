@@ -24,6 +24,7 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (  # noqa: E402
     canonical_sha256,
     run_allocator_release_probe,
 )
+from mtplx.expert_manifest import verify_expert_manifest  # noqa: E402
 
 
 GIB = 1024**3
@@ -53,12 +54,21 @@ def load_sidecar_record(
         raise RuntimeError("probe record has no sidecar ownership range")
     if int(length) != int(record.logical_bytes):
         raise RuntimeError("probe sidecar range differs from logical record bytes")
+    expected_sha256 = getattr(record, "sha256", None)
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise RuntimeError("probe record has no valid payload hash")
     views = tuple(slot.record_views(record))
     if len(views) != len(record.segments):
         raise RuntimeError("probe component view count differs from record segments")
     descriptor = os.open(root / sidecar.file, os.O_RDONLY)
     try:
         cursor = 0
+        digest = hashlib.sha256()
+        payloads: list[bytes] = []
         for segment, view in zip(record.segments, views, strict=True):
             expected = int(segment.length)
             payload = os.pread(descriptor, expected, int(offset) + cursor)
@@ -69,10 +79,15 @@ def load_sidecar_record(
                 )
             if view.nbytes != expected:
                 raise RuntimeError("component view length differs from manifest")
-            view[:] = payload
+            digest.update(payload)
+            payloads.append(payload)
             cursor += expected
         if cursor != int(length):
             raise RuntimeError("component segments do not cover the sidecar record")
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError("probe sidecar record hash mismatch")
+        for view, payload in zip(views, payloads, strict=True):
+            view[:] = payload
     finally:
         os.close(descriptor)
         for view in views:
@@ -143,6 +158,12 @@ def _model_artifact_sha256(
     return canonical_sha256(artifact), manifest_sha256
 
 
+def _verify_probe_sidecar(root: Path, manifest: Any) -> None:
+    report = verify_expert_manifest(manifest, root, verify_sidecar_hash=True)
+    if report.get("sidecar_verified") is not True:
+        raise RuntimeError("probe sidecar payload was not fully verified")
+
+
 def run_real_probe(
     *,
     model_root: Path,
@@ -170,6 +191,7 @@ def run_real_probe(
         or manifest.source_revision != HY3_Q4.quant_revision
     ):
         raise RuntimeError("probe manifest is not the pinned Hy3 Q4 artifact")
+    _verify_probe_sidecar(model_root, manifest)
     artifact_sha256, manifest_sha256 = _model_artifact_sha256(
         model_root,
         manifest_path,
