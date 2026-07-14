@@ -37,7 +37,16 @@ from mtplx.expert_runtime import (
     partition_route_waves,
     reconcile_mlx_memory_cap,
 )
-from mtplx.expert_slots import ExpertSlotError, ExpertSlotPool, ReadyRoute
+from mtplx.expert_slots import (
+    ExpertSlabAllocatorError,
+    ExpertSlabReclaimError,
+    ExpertSlabReleaseResult,
+    ExpertSlabState,
+    ExpertSlotError,
+    ExpertSlotPool,
+    ExpertSlotState,
+    ReadyRoute,
+)
 from mtplx.expert_streaming import (
     LayerExpertSlotBank,
     RoutePlan,
@@ -500,6 +509,507 @@ def _global_plan(spec: ExpertStreamingModelSpec, *, persistent_slots: int = 2):
         context_tokens=0,
         runtime_reserve_bytes=0,
         cache_scope="global",
+    )
+
+
+class _SlabBufferAllocator:
+    backend = "test-owned-slabs"
+
+    def __init__(
+        self,
+        *,
+        record_bytes: int,
+        persistent_slots: int,
+        slab_slots: int,
+    ) -> None:
+        self.record_bytes = record_bytes
+        self._layout = {
+            slab_id: tuple(range(start, min(start + slab_slots, persistent_slots)))
+            for slab_id, start in enumerate(range(0, persistent_slots, slab_slots))
+        }
+        self._buffers: dict[int, dict[int, bytearray]] = {}
+        self._labels: dict[str, bytearray] = {}
+        self.fail_allocate_after_create: set[int] = set()
+        self.fail_allocation_status: set[int] = set()
+        self.fail_release_ambiguously: set[int] = set()
+        self.fail_release_before_destroy: set[int] = set()
+        self.fail_release_after_destroy: set[int] = set()
+
+    def slab_layout(self) -> dict[int, tuple[int, ...]]:
+        return dict(self._layout)
+
+    def slab_physical_bytes(self, slab_id: int) -> int:
+        return len(self._layout[slab_id]) * self.record_bytes
+
+    def allocate_slab(self, slab_id: int) -> dict[int, bytearray]:
+        if slab_id in self._buffers:
+            raise RuntimeError("slab is already allocated")
+        buffers = {
+            slot_id: bytearray(self.record_bytes) for slot_id in self._layout[slab_id]
+        }
+        self._buffers[slab_id] = buffers
+        if slab_id in self.fail_allocate_after_create:
+            raise RuntimeError("injected allocation failure after bank creation")
+        return dict(buffers)
+
+    def slab_is_allocated(self, slab_id: int) -> bool:
+        if slab_id in self.fail_allocation_status:
+            raise RuntimeError("injected allocation-status ambiguity")
+        return slab_id in self._buffers
+
+    def release_slab(self, slab_id: int) -> ExpertSlabReleaseResult:
+        if slab_id in self.fail_release_ambiguously:
+            raise RuntimeError("injected ambiguous release failure")
+        if slab_id in self.fail_release_before_destroy:
+            raise ExpertSlabAllocatorError(
+                "injected release failure before destruction",
+                destroyed=False,
+                physical_bytes=self.slab_physical_bytes(slab_id),
+            )
+        self._buffers.pop(slab_id)
+        if slab_id in self.fail_release_after_destroy:
+            raise ExpertSlabAllocatorError(
+                "injected post-destruction release failure",
+                destroyed=True,
+                physical_bytes=self.slab_physical_bytes(slab_id),
+            )
+        return ExpertSlabReleaseResult(
+            slab_id=slab_id,
+            physical_bytes=self.slab_physical_bytes(slab_id),
+            destroyed=True,
+        )
+
+    def __call__(self, size: int, label: str):
+        assert size == self.record_bytes
+        if label.startswith("global-persistent-"):
+            slot_id = int(label.rsplit("-", 1)[1])
+            slab_id = next(
+                slab for slab, slot_ids in self._layout.items() if slot_id in slot_ids
+            )
+            buffers = self._buffers.get(slab_id)
+            if buffers is None:
+                buffers = self.allocate_slab(slab_id)
+            buffer = buffers[slot_id]
+        else:
+            buffer = bytearray(size)
+        if label in self._labels:
+            raise RuntimeError("slot label was allocated twice")
+        self._labels[label] = buffer
+        return buffer
+
+    def close(self) -> None:
+        self._buffers.clear()
+        self._labels.clear()
+
+
+def _owned_slab_pool(
+    tmp_path: Path,
+    *,
+    persistent_slots: int = 2,
+    slab_slots: int = 1,
+) -> tuple[ExpertSlotPool, _SlabBufferAllocator, ExpertStreamingModelSpec]:
+    root, spec, manifest, _expected = _global_artifact(tmp_path)
+    plan = _global_plan(spec, persistent_slots=persistent_slots)
+    allocator = _SlabBufferAllocator(
+        record_bytes=spec.expert_record_bytes,
+        persistent_slots=plan.persistent_slots,
+        slab_slots=slab_slots,
+    )
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        PositionalExpertReader(root, use_native=False),
+        buffer_allocator=allocator,
+        cache_scope="global",
+    )
+    return pool, allocator, spec
+
+
+def _global_persistent_plan(
+    *,
+    expert: int,
+    slot: int,
+    generation: int,
+    layer: int = 1,
+) -> RoutePlan:
+    return RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(expert,),
+        slots=(slot,),
+        hits=(),
+        misses=(expert,),
+        loads=(
+            SlotLoad(
+                expert=expert,
+                slot=slot,
+                persistent=True,
+                generation=generation,
+            ),
+        ),
+        evictions=(),
+        generations=(generation,),
+    )
+
+
+def test_slab_destroy_regrow_preserves_slot_identity_and_generation_watermark(
+    tmp_path: Path,
+) -> None:
+    pool, _allocator, _spec_value = _owned_slab_pool(
+        tmp_path,
+        persistent_slots=2,
+    )
+    physical = pool._persistent[(-1, 0)]
+    original_buffer = physical.buffer
+    try:
+        warm = pool.ensure_route(
+            1,
+            _global_persistent_plan(expert=0, slot=0, generation=1),
+        )
+        warm.release(synchronize=False)
+
+        ticket = pool.prepare_slab_reclaim((0,))
+        result = pool.commit_slab_reclaim(ticket)
+
+        assert result.released_slot_ids == (0,)
+        assert pool.allocated_bytes == (
+            len(pool._transient) * pool.spec.expert_record_bytes
+            + pool._slabs[1].physical_bytes
+        )
+        assert pool._persistent[(-1, 0)] is physical
+        assert physical.buffer is None
+        assert physical.generation == 1
+        assert pool._slabs[0].state is ExpertSlabState.RELEASED
+
+        pool.regrow_slab(0)
+        assert pool._persistent[(-1, 0)] is physical
+        assert physical.buffer is not None
+        assert physical.buffer is not original_buffer
+        assert physical.generation == 1
+        assert pool._slabs[0].state is ExpertSlabState.ACTIVE
+        assert pool._slabs[0].incarnation == 1
+
+        with pytest.raises(ExpertSlotError, match="stale global cache generation"):
+            pool.ensure_route(
+                1,
+                _global_persistent_plan(expert=1, slot=0, generation=1),
+            )
+        fresh = pool.ensure_route(
+            1,
+            _global_persistent_plan(expert=1, slot=0, generation=2),
+        )
+        fresh.release(synchronize=False)
+    finally:
+        pool.close()
+
+
+def test_slab_prepare_rejects_pin_and_loading_without_mutation(tmp_path: Path) -> None:
+    pool, _allocator, _spec_value = _owned_slab_pool(tmp_path)
+    physical = pool._persistent[(-1, 0)]
+    original_buffer = physical.buffer
+    ready = pool.ensure_route(
+        1,
+        _global_persistent_plan(expert=0, slot=0, generation=1),
+    )
+    try:
+        with pytest.raises(ExpertSlotError, match="pinned"):
+            pool.prepare_slab_reclaim((0,))
+        assert pool._slabs[0].state is ExpertSlabState.ACTIVE
+        assert physical.buffer is original_buffer
+
+        ready.release(synchronize=False)
+        with physical.condition:
+            physical.state = ExpertSlotState.LOADING
+        with pytest.raises(ExpertSlotError, match="loading"):
+            pool.prepare_slab_reclaim((0,))
+        assert pool._slabs[0].state is ExpertSlabState.ACTIVE
+        assert physical.buffer is original_buffer
+    finally:
+        ready.release(synchronize=False)
+        pool.close()
+
+
+def test_slab_reclaim_waits_selected_fence_without_global_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, _allocator, _spec_value = _owned_slab_pool(tmp_path)
+    fenced = pool.ensure_route(
+        1,
+        _global_persistent_plan(expert=0, slot=0, generation=1),
+    )
+    unrelated = pool.ensure_route(
+        1,
+        _global_persistent_plan(expert=1, slot=1, generation=1),
+    )
+    unrelated.release(synchronize=False)
+    completed = threading.Event()
+    assert fenced.defer_bindings_until(fenced.bindings, completed.wait)
+    fenced.release(synchronize=False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("slab reclaim used a global completion drain")
+
+    monkeypatch.setattr(pool, "_drain_completion_fences", forbidden)
+    pool.device_synchronize = forbidden
+    try:
+        unrelated_ticket = pool.prepare_slab_reclaim((1,))
+        pool.commit_slab_reclaim(unrelated_ticket)
+        assert pool._slabs[1].state is ExpertSlabState.RELEASED
+        assert pool._slabs[0].state is ExpertSlabState.ACTIVE
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+
+            def release_selected_fence() -> None:
+                time.sleep(0.05)
+                completed.set()
+
+            selected_slot = pool._persistent[(-1, 0)]
+            with selected_slot.condition:
+                assert selected_slot.pins == 1
+            release_fence = executor.submit(release_selected_fence)
+            selected_ticket = pool.prepare_slab_reclaim(
+                (0,),
+                deadline_ns=time.monotonic_ns() + 2_000_000_000,
+            )
+            release_fence.result(timeout=2)
+            with selected_slot.condition:
+                assert selected_slot.pins == 0
+        pool.commit_slab_reclaim(selected_ticket)
+        assert pool._slabs[0].state is ExpertSlabState.RELEASED
+    finally:
+        completed.set()
+        pool.close()
+
+
+def test_slab_resize_owner_thread_and_failure_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, allocator, _spec_value = _owned_slab_pool(tmp_path)
+    physical = pool._persistent[(-1, 0)]
+    original_buffer = physical.buffer
+    ticket = pool.prepare_slab_reclaim((0,))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            rejected = executor.submit(pool.commit_slab_reclaim, ticket)
+            with pytest.raises(ExpertSlotError, match="owner thread"):
+                rejected.result(timeout=2)
+        assert pool._slabs[0].state is ExpertSlabState.DRAINING
+        assert physical.buffer is original_buffer
+        pool.abort_slab_reclaim(ticket)
+
+        def interrupt(phase: str, _slab_id: int) -> None:
+            if phase == "before_destroy":
+                raise RuntimeError("injected pre-destruction interruption")
+
+        pool._slab_reclaim_test_hook = interrupt
+        interrupted = pool.prepare_slab_reclaim((0,))
+        with pytest.raises(RuntimeError, match="pre-destruction"):
+            pool.commit_slab_reclaim(interrupted)
+        assert pool._slabs[0].state is ExpertSlabState.ACTIVE
+        assert physical.buffer is original_buffer
+
+        pool._slab_reclaim_test_hook = None
+        allocator.fail_release_after_destroy.add(0)
+        failed = pool.prepare_slab_reclaim((0,))
+        with pytest.raises(RuntimeError, match="post-destruction"):
+            pool.commit_slab_reclaim(failed)
+        assert pool._slabs[0].state is ExpertSlabState.RELEASED
+        assert physical.buffer is None
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            rejected_regrow = executor.submit(pool.regrow_slab, 0)
+            with pytest.raises(ExpertSlotError, match="owner thread"):
+                rejected_regrow.result(timeout=2)
+    finally:
+        monkeypatch.setattr(pool, "_slab_reclaim_test_hook", None, raising=False)
+        pool.close()
+
+
+def test_slab_release_failure_before_destroy_restores_live_mapping(
+    tmp_path: Path,
+) -> None:
+    pool, allocator, _spec_value = _owned_slab_pool(tmp_path)
+    ready = pool.ensure_route(
+        1,
+        _global_persistent_plan(expert=0, slot=0, generation=1),
+    )
+    ready.release(synchronize=False)
+    physical = pool._persistent[(-1, 0)]
+    original_buffer = physical.buffer
+    allocator.fail_release_before_destroy.add(0)
+    ticket = pool.prepare_slab_reclaim((0,))
+    try:
+        with pytest.raises(ExpertSlabReclaimError) as failed:
+            pool.commit_slab_reclaim(ticket)
+
+        assert failed.value.destructive_boundary_crossed is False
+        assert failed.value.result.slab_ids == ()
+        assert pool._slabs[0].state is ExpertSlabState.ACTIVE
+        assert physical.buffer is original_buffer
+        assert physical.state is ExpertSlotState.READY
+        assert physical.layer == 1
+        assert physical.expert == 0
+        assert physical.generation == 1
+        assert allocator.slab_is_allocated(0)
+    finally:
+        pool.close()
+
+
+def test_partial_multi_slab_release_reports_only_confirmed_destruction(
+    tmp_path: Path,
+) -> None:
+    pool, allocator, spec = _owned_slab_pool(tmp_path)
+    first = pool.ensure_route(
+        1,
+        _global_persistent_plan(expert=0, slot=0, generation=1),
+    )
+    first.release(synchronize=False)
+    second = pool.ensure_route(
+        1,
+        _global_persistent_plan(expert=1, slot=1, generation=1),
+    )
+    second.release(synchronize=False)
+    first_physical = pool._persistent[(-1, 0)]
+    second_physical = pool._persistent[(-1, 1)]
+    second_buffer = second_physical.buffer
+    allocator.fail_release_before_destroy.add(1)
+    ticket = pool.prepare_slab_reclaim((0, 1))
+    try:
+        with pytest.raises(ExpertSlabReclaimError) as failed:
+            pool.commit_slab_reclaim(ticket)
+
+        assert failed.value.result.slab_ids == (0,)
+        assert failed.value.result.released_slot_ids == (0,)
+        assert failed.value.result.physical_bytes == spec.expert_record_bytes
+        assert failed.value.failed_slab_id == 1
+        assert failed.value.destructive_boundary_crossed is False
+        assert pool._slabs[0].state is ExpertSlabState.RELEASED
+        assert first_physical.buffer is None
+        assert pool._slabs[1].state is ExpertSlabState.ACTIVE
+        assert second_physical.buffer is second_buffer
+        assert second_physical.state is ExpertSlotState.READY
+        assert second_physical.expert == 1
+        assert allocator.slab_is_allocated(1)
+    finally:
+        pool.close()
+
+
+def test_regrow_cleans_bank_when_allocator_raises_after_creation(
+    tmp_path: Path,
+) -> None:
+    pool, allocator, _spec_value = _owned_slab_pool(tmp_path)
+    ticket = pool.prepare_slab_reclaim((0,))
+    pool.commit_slab_reclaim(ticket)
+    allocated_before = pool.allocated_bytes
+    allocator.fail_allocate_after_create.add(0)
+    try:
+        with pytest.raises(RuntimeError, match="after bank creation"):
+            pool.regrow_slab(0)
+
+        assert pool._slabs[0].state is ExpertSlabState.RELEASED
+        assert pool._persistent[(-1, 0)].buffer is None
+        assert allocator.slab_is_allocated(0) is False
+        assert pool.allocated_bytes == allocated_before
+
+        allocator.fail_allocate_after_create.remove(0)
+        pool.regrow_slab(0)
+        assert pool._slabs[0].state is ExpertSlabState.ACTIVE
+    finally:
+        pool.close()
+
+
+def test_regrow_cleanup_failure_with_ambiguous_ownership_remains_charged(
+    tmp_path: Path,
+) -> None:
+    pool, allocator, spec = _owned_slab_pool(tmp_path)
+    ticket = pool.prepare_slab_reclaim((0,))
+    pool.commit_slab_reclaim(ticket)
+    allocated_before = pool.allocated_bytes
+    allocator.fail_allocate_after_create.add(0)
+    allocator.fail_allocation_status.add(0)
+    allocator.fail_release_ambiguously.add(0)
+    try:
+        with pytest.raises(ExpertSlotError, match="cleanup failed"):
+            pool.regrow_slab(0)
+
+        allocator.fail_allocation_status.remove(0)
+        assert allocator.slab_is_allocated(0)
+        assert pool._slabs[0].state is ExpertSlabState.RELEASED
+        assert pool._persistent[(-1, 0)].buffer is None
+        assert pool.allocated_bytes == allocated_before + spec.expert_record_bytes
+        assert pool.snapshot()["slabs"]["physical_bytes"] == sum(
+            slab.physical_bytes for slab in pool._slabs.values()
+        )
+        with pytest.raises(ExpertSlotError, match="disabled"):
+            pool.regrow_slab(0)
+    finally:
+        pool.close()
+
+
+def test_close_aborts_prepared_slab_ticket_before_allocator_shutdown(
+    tmp_path: Path,
+) -> None:
+    pool, _allocator, _spec_value = _owned_slab_pool(tmp_path)
+    ticket = pool.prepare_slab_reclaim((0,))
+    assert pool._slabs[0].state is ExpertSlabState.DRAINING
+
+    assert pool.close() is None
+
+    assert pool._slab_tickets == {}
+    assert all(
+        slab.state is not ExpertSlabState.DRAINING for slab in pool._slabs.values()
+    )
+    with pytest.raises(ExpertSlotError, match="not active"):
+        pool.abort_slab_reclaim(ticket)
+
+
+def test_prepare_close_race_cannot_publish_ticket_after_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, _allocator, _spec_value = _owned_slab_pool(tmp_path)
+    prepare_waiting = threading.Event()
+    continue_prepare = threading.Event()
+    prepare_thread_id: int | None = None
+    prepare_health_checks = 0
+    original_health_check = pool._raise_completion_error
+
+    def pause_second_prepare_health_check(*args, **kwargs) -> None:
+        nonlocal prepare_health_checks
+        if threading.get_ident() == prepare_thread_id:
+            prepare_health_checks += 1
+            if prepare_health_checks == 2:
+                prepare_waiting.set()
+                assert continue_prepare.wait(timeout=2)
+        original_health_check(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pool, "_raise_completion_error", pause_second_prepare_health_check
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+
+        def prepare():
+            nonlocal prepare_thread_id
+            prepare_thread_id = threading.get_ident()
+            return pool.prepare_slab_reclaim((0,))
+
+        prepared = executor.submit(prepare)
+        assert prepare_waiting.wait(timeout=2)
+
+        def release_prepare() -> None:
+            time.sleep(0.05)
+            continue_prepare.set()
+
+        releaser = executor.submit(release_prepare)
+        pool.close()
+        releaser.result(timeout=2)
+        ticket = prepared.result(timeout=2)
+
+    assert ticket.ticket_id not in pool._slab_tickets
+    assert pool._slab_tickets == {}
+    assert all(
+        slab.state is not ExpertSlabState.DRAINING for slab in pool._slabs.values()
     )
 
 

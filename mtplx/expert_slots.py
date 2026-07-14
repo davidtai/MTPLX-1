@@ -73,6 +73,90 @@ class ExpertSlotState(str, Enum):
     CLOSED = "closed"
 
 
+class ExpertSlabState(str, Enum):
+    ACTIVE = "active"
+    DRAINING = "draining"
+    RELEASED = "released"
+
+
+@dataclass
+class ExpertSlab:
+    slab_id: int
+    slot_ids: tuple[int, ...]
+    state: ExpertSlabState
+    incarnation: int
+    physical_bytes: int
+
+
+@dataclass(frozen=True)
+class _SlabSlotSnapshot:
+    slot_id: int
+    state: ExpertSlotState
+    layer: int | None
+    expert: int | None
+    generation: int
+    digest: str | None
+    error: BaseException | None
+
+
+@dataclass(frozen=True)
+class ExpertSlabReclaimTicket:
+    ticket_id: int
+    slab_ids: tuple[int, ...]
+    slot_ids: tuple[int, ...]
+    physical_bytes: int
+    incarnations: tuple[int, ...]
+    slots: tuple[_SlabSlotSnapshot, ...]
+
+
+@dataclass(frozen=True)
+class ExpertSlabReclaimResult:
+    slab_ids: tuple[int, ...]
+    released_slot_ids: tuple[int, ...]
+    physical_bytes: int
+
+
+@dataclass(frozen=True)
+class ExpertSlabReleaseResult:
+    """Allocator proof that one slab crossed the destructive boundary."""
+
+    slab_id: int
+    physical_bytes: int
+    destroyed: bool
+
+
+class ExpertSlabAllocatorError(RuntimeError):
+    """Allocator failure annotated with destructive-boundary truth."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        destroyed: bool,
+        physical_bytes: int,
+    ) -> None:
+        super().__init__(message)
+        self.destroyed = bool(destroyed)
+        self.physical_bytes = int(physical_bytes)
+
+
+class ExpertSlabReclaimError(ExpertSlotError):
+    """Partial reclaim result plus the failed slab's boundary state."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: ExpertSlabReclaimResult,
+        failed_slab_id: int,
+        destructive_boundary_crossed: bool | None,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+        self.failed_slab_id = int(failed_slab_id)
+        self.destructive_boundary_crossed = destructive_boundary_crossed
+
+
 @dataclass(eq=False)
 class _RouteReleaseClaim:
     released: bool = False
@@ -81,6 +165,7 @@ class _RouteReleaseClaim:
 @dataclass(eq=False)
 class _SlotPinClaim:
     active: bool = True
+    completion_owned: bool = False
 
 
 @dataclass
@@ -223,6 +308,7 @@ class ExpertSlotMetrics:
 class _PhysicalSlot:
     label: str
     buffer: Any
+    slab_id: int | None = None
     state: ExpertSlotState = ExpertSlotState.EMPTY
     layer: int | None = None
     expert: int | None = None
@@ -353,6 +439,8 @@ class ReadyRoute:
             if duplicate:
                 raise ExpertSlotError("slot already has a completion fence")
             self._scheduled_slots.update(selected)
+            for slot_id in selected:
+                self._pin_claims[slot_id].completion_owned = True
             self._registrations_in_progress += 1
         try:
             future = self.pool._submit_completion_fence(
@@ -363,6 +451,10 @@ class ReadyRoute:
         except BaseException:
             with self._release_condition:
                 self._scheduled_slots.difference_update(selected)
+                for slot_id in selected:
+                    claim = self._pin_claims.get(slot_id)
+                    if claim is not None:
+                        claim.completion_owned = False
                 self._registrations_in_progress -= 1
                 self._release_condition.notify_all()
             raise
@@ -663,9 +755,78 @@ class ExpertSlotPool:
         )
         self.metrics = ExpertSlotMetrics()
         self._allocator = buffer_allocator or (lambda size, _label: bytearray(size))
+        self._owner_thread_id = threading.get_ident()
         self.buffer_backend = str(
             getattr(self._allocator, "backend", "python-bytearray")
         )
+        self._slab_lock = threading.RLock()
+        self._slab_ticket_clock = 0
+        self._slab_tickets: dict[int, ExpertSlabReclaimTicket] = {}
+        self._slab_release_failures: dict[int, BaseException] = {}
+        self._slab_ambiguous_allocations: set[int] = set()
+        self._slab_reclaim_test_hook: Callable[[str, int], None] | None = None
+        slab_layout_provider = getattr(self._allocator, "slab_layout", None)
+        raw_slab_layout = (
+            slab_layout_provider()
+            if self.cache_scope == "global" and callable(slab_layout_provider)
+            else {}
+        )
+        slab_layout: dict[int, tuple[int, ...]] = {}
+        seen_slab_slots: set[int] = set()
+        for raw_slab_id, raw_slot_ids in raw_slab_layout.items():
+            if (
+                isinstance(raw_slab_id, bool)
+                or not isinstance(raw_slab_id, int)
+                or raw_slab_id < 0
+            ):
+                raise ValueError("expert slab ids must be nonnegative integers")
+            slot_ids = tuple(raw_slot_ids)
+            if not slot_ids:
+                raise ValueError("expert slabs must contain at least one slot")
+            if any(
+                isinstance(slot_id, bool)
+                or not isinstance(slot_id, int)
+                or not 0 <= slot_id < self.global_persistent_slots
+                for slot_id in slot_ids
+            ):
+                raise ValueError("expert slab slot is outside persistent capacity")
+            if len(set(slot_ids)) != len(slot_ids):
+                raise ValueError("expert slab contains duplicate slots")
+            if seen_slab_slots.intersection(slot_ids):
+                raise ValueError("persistent slots belong to multiple expert slabs")
+            seen_slab_slots.update(slot_ids)
+            slab_layout[raw_slab_id] = slot_ids
+        if slab_layout and seen_slab_slots != set(range(self.global_persistent_slots)):
+            raise ValueError("expert slab layout does not cover persistent capacity")
+        slab_bytes_provider = getattr(self._allocator, "slab_physical_bytes", None)
+        if slab_layout and (
+            not callable(getattr(self._allocator, "allocate_slab", None))
+            or not callable(getattr(self._allocator, "release_slab", None))
+            or not callable(getattr(self._allocator, "slab_is_allocated", None))
+            or not callable(slab_bytes_provider)
+        ):
+            raise ValueError("expert slab allocator lifecycle methods are incomplete")
+        self._slab_for_slot = {
+            slot_id: slab_id
+            for slab_id, slot_ids in slab_layout.items()
+            for slot_id in slot_ids
+        }
+        self._slabs = {
+            slab_id: ExpertSlab(
+                slab_id=slab_id,
+                slot_ids=slot_ids,
+                state=ExpertSlabState.ACTIVE,
+                incarnation=0,
+                physical_bytes=int(slab_bytes_provider(slab_id)),
+            )
+            for slab_id, slot_ids in slab_layout.items()
+        }
+        for slab in self._slabs.values():
+            expected_slab_bytes = len(slab.slot_ids) * spec.expert_record_bytes
+            if slab.physical_bytes != expected_slab_bytes:
+                raise ValueError(
+                    "expert slab physical bytes differ from its slot geometry"
+                )
         self._persistent: dict[tuple[int, int], _PhysicalSlot] = {}
         self._transient: tuple[_PhysicalSlot, ...]
         self._record_map = {
@@ -705,7 +866,12 @@ class ExpertSlotPool:
                 )
                 buffer = self._allocate_buffer(label)
                 key_layer = -1 if layer is None else layer
-                self._persistent[(key_layer, slot_index)] = _PhysicalSlot(label, buffer)
+                slab_id = self._slab_for_slot.get(slot_index) if layer is None else None
+                self._persistent[(key_layer, slot_index)] = _PhysicalSlot(
+                    label,
+                    buffer,
+                    slab_id=slab_id,
+                )
                 allocated += spec.expert_record_bytes
             transient: list[_PhysicalSlot] = []
             for slot_index in range(plan.transient_slots):
@@ -1031,6 +1197,9 @@ class ExpertSlotPool:
 
     def _allocate_buffer(self, label: str) -> Any:
         buffer = self._allocator(self.spec.expert_record_bytes, label)
+        return self._validate_allocated_buffer(buffer, label)
+
+    def _validate_allocated_buffer(self, buffer: Any, label: str) -> Any:
         direct_nbytes = getattr(buffer, "nbytes", None)
         record_views = getattr(buffer, "record_views", None)
         if callable(record_views):
@@ -1063,11 +1232,19 @@ class ExpertSlotPool:
         if logical_slot < self._persistent_route_capacity:
             try:
                 key_layer = -1 if self.cache_scope == "global" else layer
-                return self._persistent[(key_layer, logical_slot)]
+                slot = self._persistent[(key_layer, logical_slot)]
             except KeyError as exc:
                 raise ExpertSlotError(
                     "persistent slot is outside the memory plan"
                 ) from exc
+            if slot.slab_id is not None:
+                with self._slab_lock:
+                    slab = self._slabs[slot.slab_id]
+                    if slab.state is not ExpertSlabState.ACTIVE:
+                        raise ExpertSlotError(
+                            f"expert slab {slab.slab_id} is {slab.state.value}"
+                        )
+            return slot
         transient_index = logical_slot - self._persistent_route_capacity
         if not 0 <= transient_index < len(self._transient):
             raise ExpertSlotError("transient slot is outside the memory plan")
@@ -1102,6 +1279,8 @@ class ExpertSlotPool:
                         raise ExpertSlotError("expert slot pool is closed")
                     if self._closing:
                         raise ExpertSlotError("expert slot pool is closing")
+                    if slot.buffer is None:
+                        raise ExpertSlotError("expert slot has no physical buffer")
                     self._raise_completion_error()
                     if (
                         slot.layer == layer
@@ -2051,6 +2230,436 @@ class ExpertSlotPool:
             self.metrics.release_route(claim)
             self._lifecycle.notify_all()
 
+    def _require_slab_owner_thread(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise ExpertSlotError(
+                "expert slab allocation and destruction require the owner thread"
+            )
+
+    def _normalize_slab_ids(self, slab_ids: Iterable[int]) -> tuple[int, ...]:
+        normalized = tuple(slab_ids)
+        if not normalized:
+            raise ValueError("at least one expert slab is required")
+        if any(
+            isinstance(slab_id, bool)
+            or not isinstance(slab_id, int)
+            or slab_id not in self._slabs
+            for slab_id in normalized
+        ):
+            raise ValueError("unknown expert slab id")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("expert slab ids must be unique")
+        return normalized
+
+    def slab_layout(self) -> dict[int, tuple[int, ...]]:
+        with self._slab_lock:
+            return {slab_id: slab.slot_ids for slab_id, slab in self._slabs.items()}
+
+    def slot_ids_for_slab(self, slab_id: int) -> tuple[int, ...]:
+        with self._slab_lock:
+            try:
+                return self._slabs[slab_id].slot_ids
+            except KeyError as exc:
+                raise ValueError("unknown expert slab id") from exc
+
+    def prepare_slab_reclaim(
+        self,
+        slab_ids: Iterable[int],
+        *,
+        requested_bytes: int | None = None,
+        deadline_ns: int | None = None,
+    ) -> ExpertSlabReclaimTicket:
+        with self._close_lock:
+            return self._prepare_slab_reclaim_locked(
+                slab_ids,
+                requested_bytes=requested_bytes,
+                deadline_ns=deadline_ns,
+            )
+
+    def _prepare_slab_reclaim_locked(
+        self,
+        slab_ids: Iterable[int],
+        *,
+        requested_bytes: int | None,
+        deadline_ns: int | None,
+    ) -> ExpertSlabReclaimTicket:
+        """Drain selected completion owners without touching unrelated slabs."""
+
+        self._raise_completion_error()
+        if self._closed or self._closing:
+            raise ExpertSlotError("expert slot pool is closing")
+        candidates = self._normalize_slab_ids(slab_ids)
+        if requested_bytes is not None and (
+            isinstance(requested_bytes, bool)
+            or not isinstance(requested_bytes, int)
+            or requested_bytes <= 0
+        ):
+            raise ValueError("requested_bytes must be a positive integer")
+        selected: list[int] = []
+        selected_bytes = 0
+        with self._slab_lock:
+            for slab_id in candidates:
+                slab = self._slabs[slab_id]
+                if slab.state is not ExpertSlabState.ACTIVE:
+                    raise ExpertSlotError(
+                        f"expert slab {slab_id} is {slab.state.value}"
+                    )
+                if slab_id in self._slab_release_failures:
+                    raise ExpertSlotError("expert slab has a prior release failure")
+                selected.append(slab_id)
+                selected_bytes += slab.physical_bytes
+                if requested_bytes is not None and selected_bytes >= requested_bytes:
+                    break
+            if requested_bytes is not None and selected_bytes < requested_bytes:
+                raise ExpertSlotError("candidate slabs cannot satisfy requested bytes")
+
+            selected_slots = tuple(
+                (slot_id, self._persistent[(-1, slot_id)])
+                for slab_id in selected
+                for slot_id in self._slabs[slab_id].slot_ids
+            )
+            for _slot_id, slot in selected_slots:
+                with slot.condition:
+                    if slot.buffer is None:
+                        raise ExpertSlotError(
+                            "active expert slab has no physical buffer"
+                        )
+                    if slot.state is ExpertSlotState.LOADING:
+                        raise ExpertSlotError(
+                            "cannot reclaim an expert slab with a loading slot"
+                        )
+                    active_claims = tuple(
+                        claim for claim in slot.pin_claims if claim.active
+                    )
+                    if slot.pins != len(active_claims):
+                        raise ExpertSlotError("expert slot pin state is inconsistent")
+                    if active_claims and not all(
+                        claim.completion_owned for claim in active_claims
+                    ):
+                        raise ExpertSlotError(
+                            "cannot reclaim an expert slab with a pinned slot"
+                        )
+            for slab_id in selected:
+                self._slabs[slab_id].state = ExpertSlabState.DRAINING
+
+        try:
+            for _slot_id, slot in selected_slots:
+                with slot.condition:
+                    while slot.pins:
+                        active_claims = tuple(
+                            claim for claim in slot.pin_claims if claim.active
+                        )
+                        if not active_claims or not all(
+                            claim.completion_owned for claim in active_claims
+                        ):
+                            raise ExpertSlotError(
+                                "cannot reclaim an expert slab with a pinned slot"
+                            )
+                        slot.condition.wait(self._remaining(deadline_ns))
+                    if slot.state is ExpertSlotState.LOADING:
+                        raise ExpertSlotError(
+                            "cannot reclaim an expert slab with a loading slot"
+                        )
+            self._raise_completion_error()
+            snapshots: list[_SlabSlotSnapshot] = []
+            for slot_id, slot in selected_slots:
+                with slot.condition:
+                    snapshots.append(
+                        _SlabSlotSnapshot(
+                            slot_id=slot_id,
+                            state=slot.state,
+                            layer=slot.layer,
+                            expert=slot.expert,
+                            generation=slot.generation,
+                            digest=slot.digest,
+                            error=slot.error,
+                        )
+                    )
+        except BaseException:
+            with self._slab_lock:
+                for slab_id in selected:
+                    slab = self._slabs[slab_id]
+                    if slab.state is ExpertSlabState.DRAINING:
+                        slab.state = ExpertSlabState.ACTIVE
+            raise
+
+        with self._slab_lock:
+            if any(
+                self._slabs[slab_id].state is not ExpertSlabState.DRAINING
+                for slab_id in selected
+            ):
+                raise ExpertSlotError("expert slab state changed during preparation")
+            self._slab_ticket_clock += 1
+            ticket = ExpertSlabReclaimTicket(
+                ticket_id=self._slab_ticket_clock,
+                slab_ids=tuple(selected),
+                slot_ids=tuple(slot_id for slot_id, _slot in selected_slots),
+                physical_bytes=selected_bytes,
+                incarnations=tuple(
+                    self._slabs[slab_id].incarnation for slab_id in selected
+                ),
+                slots=tuple(snapshots),
+            )
+            self._slab_tickets[ticket.ticket_id] = ticket
+            return ticket
+
+    def _restore_undestroyed_ticket_slabs(
+        self,
+        ticket: ExpertSlabReclaimTicket,
+    ) -> None:
+        for slab_id in ticket.slab_ids:
+            slab = self._slabs[slab_id]
+            if slab.state is ExpertSlabState.DRAINING:
+                slab.state = ExpertSlabState.ACTIVE
+        self._slab_tickets.pop(ticket.ticket_id, None)
+
+    @staticmethod
+    def _reclaim_result(
+        slab_ids: list[int],
+        slot_ids: list[int],
+        physical_bytes: int,
+    ) -> ExpertSlabReclaimResult:
+        return ExpertSlabReclaimResult(
+            slab_ids=tuple(slab_ids),
+            released_slot_ids=tuple(slot_ids),
+            physical_bytes=physical_bytes,
+        )
+
+    def _allocator_destroyed_state(
+        self,
+        slab_id: int,
+        error: BaseException,
+    ) -> bool | None:
+        if isinstance(error, ExpertSlabAllocatorError):
+            return error.destroyed
+        try:
+            return not bool(getattr(self._allocator, "slab_is_allocated")(slab_id))
+        except BaseException:
+            return None
+
+    def _finalize_destroyed_slab(self, slab: ExpertSlab) -> None:
+        for slot_id in slab.slot_ids:
+            slot = self._persistent[(-1, slot_id)]
+            with slot.condition:
+                slot.state = ExpertSlotState.EMPTY
+                slot.layer = None
+                slot.expert = None
+                slot.digest = None
+                slot.error = None
+                slot.buffer = None
+                slot.condition.notify_all()
+        slab.state = ExpertSlabState.RELEASED
+        self.allocated_bytes -= slab.physical_bytes
+
+    def commit_slab_reclaim(
+        self,
+        ticket: ExpertSlabReclaimTicket,
+    ) -> ExpertSlabReclaimResult:
+        """Destroy prepared slabs, preserving released state after the boundary."""
+
+        self._require_slab_owner_thread()
+        self._raise_completion_error()
+        with self._slab_lock:
+            if self._slab_tickets.get(ticket.ticket_id) is not ticket:
+                raise ExpertSlotError("expert slab reclaim ticket is not active")
+            snapshots = {snapshot.slot_id: snapshot for snapshot in ticket.slots}
+            try:
+                for slab_id, incarnation in zip(
+                    ticket.slab_ids,
+                    ticket.incarnations,
+                    strict=True,
+                ):
+                    slab = self._slabs[slab_id]
+                    if (
+                        slab.state is not ExpertSlabState.DRAINING
+                        or slab.incarnation != incarnation
+                    ):
+                        raise ExpertSlotError(
+                            "expert slab changed during reclaim transaction"
+                        )
+                    for slot_id in slab.slot_ids:
+                        slot = self._persistent[(-1, slot_id)]
+                        snapshot = snapshots[slot_id]
+                        with slot.condition:
+                            if slot.state is ExpertSlotState.LOADING:
+                                raise ExpertSlotError(
+                                    "cannot destroy a slab with a loading slot"
+                                )
+                            if slot.pins:
+                                raise ExpertSlotError(
+                                    "cannot destroy a slab with a pinned slot"
+                                )
+                            if (
+                                slot.state is not snapshot.state
+                                or slot.layer != snapshot.layer
+                                or slot.expert != snapshot.expert
+                                or slot.generation != snapshot.generation
+                                or slot.digest != snapshot.digest
+                                or slot.error is not snapshot.error
+                            ):
+                                raise ExpertSlotError(
+                                    "expert slot changed during slab reclaim"
+                                )
+                hook = self._slab_reclaim_test_hook
+                if hook is not None:
+                    for slab_id in ticket.slab_ids:
+                        hook("before_destroy", slab_id)
+            except BaseException:
+                self._restore_undestroyed_ticket_slabs(ticket)
+                raise
+
+            release_slab = getattr(self._allocator, "release_slab")
+            released_slabs: list[int] = []
+            released_slots: list[int] = []
+            released_bytes = 0
+            for slab_id in ticket.slab_ids:
+                slab = self._slabs[slab_id]
+                try:
+                    outcome = release_slab(slab_id)
+                    if (
+                        not isinstance(outcome, ExpertSlabReleaseResult)
+                        or not outcome.destroyed
+                        or outcome.slab_id != slab_id
+                        or outcome.physical_bytes != slab.physical_bytes
+                    ):
+                        raise RuntimeError(
+                            "allocator did not confirm exact slab destruction"
+                        )
+                    self._finalize_destroyed_slab(slab)
+                    released_bytes += slab.physical_bytes
+                    released_slabs.append(slab_id)
+                    released_slots.extend(slab.slot_ids)
+                    if hook is not None:
+                        hook("after_destroy", slab_id)
+                except BaseException as exc:
+                    destroyed = self._allocator_destroyed_state(slab_id, exc)
+                    if destroyed is True and slab.state is not ExpertSlabState.RELEASED:
+                        self._finalize_destroyed_slab(slab)
+                        released_bytes += slab.physical_bytes
+                        released_slabs.append(slab_id)
+                        released_slots.extend(slab.slot_ids)
+                    elif destroyed is None:
+                        slab.state = ExpertSlabState.RELEASED
+                        self._slab_ambiguous_allocations.add(slab_id)
+                    if destroyed is not False:
+                        self._slab_release_failures[slab_id] = exc
+                    self._restore_undestroyed_ticket_slabs(ticket)
+                    result = self._reclaim_result(
+                        released_slabs,
+                        released_slots,
+                        released_bytes,
+                    )
+                    raise ExpertSlabReclaimError(
+                        str(exc),
+                        result=result,
+                        failed_slab_id=slab_id,
+                        destructive_boundary_crossed=destroyed,
+                    ) from exc
+            self._slab_tickets.pop(ticket.ticket_id, None)
+            return self._reclaim_result(
+                released_slabs,
+                released_slots,
+                released_bytes,
+            )
+
+    def abort_slab_reclaim(self, ticket: ExpertSlabReclaimTicket) -> None:
+        with self._slab_lock:
+            if self._slab_tickets.get(ticket.ticket_id) is not ticket:
+                raise ExpertSlotError("expert slab reclaim ticket is not active")
+            if any(
+                self._slabs[slab_id].state is ExpertSlabState.RELEASED
+                for slab_id in ticket.slab_ids
+            ):
+                raise ExpertSlotError(
+                    "cannot abort an expert slab reclaim after destruction"
+                )
+            self._restore_undestroyed_ticket_slabs(ticket)
+
+    def regrow_slab(self, slab_id: int) -> ExpertSlab:
+        """Recreate one slab without replacing its logical slot objects."""
+
+        self._require_slab_owner_thread()
+        with self._close_lock:
+            if self._closed or self._closing:
+                raise ExpertSlotError("expert slot pool is closing")
+            return self._regrow_slab_locked(slab_id)
+
+    def _regrow_slab_locked(self, slab_id: int) -> ExpertSlab:
+        self._raise_completion_error()
+        with self._slab_lock:
+            try:
+                slab = self._slabs[slab_id]
+            except KeyError as exc:
+                raise ValueError("unknown expert slab id") from exc
+            if slab.state is not ExpertSlabState.RELEASED:
+                raise ExpertSlotError("expert slab is not released")
+            if slab_id in self._slab_release_failures:
+                raise ExpertSlotError(
+                    "expert slab release failed; regrowth is disabled"
+                ) from self._slab_release_failures[slab_id]
+            allocate_slab = getattr(self._allocator, "allocate_slab")
+            try:
+                buffers = allocate_slab(slab_id)
+                if set(buffers) != set(slab.slot_ids):
+                    raise ExpertSlotError(
+                        "allocator returned an incomplete expert slab"
+                    )
+                validated = {
+                    slot_id: self._validate_allocated_buffer(
+                        buffers[slot_id],
+                        f"global-persistent-{slot_id}",
+                    )
+                    for slot_id in slab.slot_ids
+                }
+            except BaseException as allocation_error:
+                try:
+                    allocated = bool(
+                        getattr(self._allocator, "slab_is_allocated")(slab_id)
+                    )
+                except BaseException:
+                    allocated = True
+                if not allocated:
+                    raise
+                try:
+                    cleanup = getattr(self._allocator, "release_slab")(slab_id)
+                    if (
+                        not isinstance(cleanup, ExpertSlabReleaseResult)
+                        or not cleanup.destroyed
+                        or cleanup.slab_id != slab_id
+                        or cleanup.physical_bytes != slab.physical_bytes
+                    ):
+                        raise RuntimeError(
+                            "allocator did not confirm failed-regrow cleanup"
+                        )
+                except BaseException as cleanup_error:
+                    destroyed = self._allocator_destroyed_state(
+                        slab_id,
+                        cleanup_error,
+                    )
+                    if destroyed is not True:
+                        if slab_id not in self._slab_ambiguous_allocations:
+                            self._slab_ambiguous_allocations.add(slab_id)
+                            self.allocated_bytes += slab.physical_bytes
+                    self._slab_release_failures[slab_id] = cleanup_error
+                    raise ExpertSlotError(
+                        "expert slab allocation cleanup failed; regrowth is disabled"
+                    ) from allocation_error
+                raise
+            for slot_id in slab.slot_ids:
+                slot = self._persistent[(-1, slot_id)]
+                with slot.condition:
+                    slot.buffer = validated[slot_id]
+                    slot.state = ExpertSlotState.EMPTY
+                    slot.layer = None
+                    slot.expert = None
+                    slot.digest = None
+                    slot.error = None
+                    slot.condition.notify_all()
+            slab.incarnation += 1
+            slab.state = ExpertSlabState.ACTIVE
+            self.allocated_bytes += slab.physical_bytes
+            return slab
+
     def invalidate(
         self,
         layer: int,
@@ -2097,6 +2706,26 @@ class ExpertSlotPool:
             "transient_slot_count": len(self._transient),
             "states": states,
             "pins": pins,
+            "slabs": {
+                "active": sum(
+                    slab.state is ExpertSlabState.ACTIVE
+                    for slab in self._slabs.values()
+                ),
+                "draining": sum(
+                    slab.state is ExpertSlabState.DRAINING
+                    for slab in self._slabs.values()
+                ),
+                "released": sum(
+                    slab.state is ExpertSlabState.RELEASED
+                    for slab in self._slabs.values()
+                ),
+                "physical_bytes": sum(
+                    slab.physical_bytes
+                    for slab_id, slab in self._slabs.items()
+                    if slab.state is ExpertSlabState.ACTIVE
+                    or slab_id in self._slab_ambiguous_allocations
+                ),
+            },
             "metrics": self.metrics.as_dict(),
             "physical_read_latency_by_layer": (
                 self.metrics.physical_read_latency_by_layer()
@@ -2126,6 +2755,11 @@ class ExpertSlotPool:
     def reset(self) -> None:
         self._retry_cleanup_owners()
         self._raise_completion_error()
+        with self._slab_lock:
+            if any(
+                slab.state is ExpertSlabState.DRAINING for slab in self._slabs.values()
+            ):
+                raise ExpertSlotError("cannot reset while an expert slab is draining")
         with self._lifecycle:
             if self.metrics.as_dict()["active_routes"]:
                 raise ExpertSlotError("cannot reset while expert routes are active")
@@ -2141,6 +2775,8 @@ class ExpertSlotPool:
                 slot.condition.notify_all()
 
     def close(self, *, timeout: float | None = None) -> None:
+        if self._slabs:
+            self._require_slab_owner_thread()
         deadline = None if timeout is None else time.monotonic() + timeout
         if deadline is None:
             self._close_lock.acquire()
@@ -2149,6 +2785,15 @@ class ExpertSlotPool:
             if not self._close_lock.acquire(timeout=remaining):
                 raise TimeoutError("expert slot close already in progress at deadline")
         try:
+            with self._lifecycle:
+                if not self._closed:
+                    self._closing = True
+            with self._slab_lock:
+                for ticket in tuple(self._slab_tickets.values()):
+                    self._restore_undestroyed_ticket_slabs(ticket)
+                for slab in self._slabs.values():
+                    if slab.state is ExpertSlabState.DRAINING:
+                        slab.state = ExpertSlabState.ACTIVE
             while True:
                 self._retry_cleanup_owners()
                 if self._has_cleanup_owners():

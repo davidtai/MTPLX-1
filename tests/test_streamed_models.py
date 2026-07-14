@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1464,7 +1465,7 @@ def test_component_bank_hy3_executes_without_record_or_stack_copies(
         runtime.close()
 
 
-def test_global_component_bank_allocator_reuses_one_persistent_bank_and_accounts_exactly(
+def test_global_component_bank_allocator_owns_independent_persistent_slabs(
     tmp_path: Path,
 ) -> None:
     root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
@@ -1482,6 +1483,7 @@ def test_global_component_bank_allocator_reuses_one_persistent_bank_and_accounts
         plan,
         spec,
         load_expert_manifest(manifest_path),
+        persistent_slab_slots=2,
     )
     runtime = ExpertStreamingRuntime.open(
         root,
@@ -1504,12 +1506,72 @@ def test_global_component_bank_allocator_reuses_one_persistent_bank_and_accounts
 
         assert plan.persistent_slots == 3
         assert len(persistent_slots) == plan.persistent_slots
-        assert len(persistent_banks) == 1
-        assert allocator.banks[("global-persistent", -1)].capacity == 3
+        assert len(persistent_banks) == 2
+        assert allocator.slab_layout() == {0: (0, 1), 1: (2,)}
+        assert allocator.banks[("global-persistent", 0)].capacity == 2
+        assert allocator.banks[("global-persistent", 1)].capacity == 1
         assert runtime.slots.allocated_bytes == expected_slot_bytes
         assert physical_bank_bytes == expected_slot_bytes
+
+        stable_slot = runtime.slots._persistent[(-1, 0)]
+        original_buffer = stable_slot.buffer
+        original_bank = original_buffer.bank
+        ticket = runtime.slots.prepare_slab_reclaim((0,))
+        released = runtime.slots.commit_slab_reclaim(ticket)
+        assert released.physical_bytes == 2 * spec.expert_record_bytes
+        assert stable_slot.buffer is None
+        assert not original_bank.arrays
+        assert ("global-persistent", 0) not in allocator.banks
+
+        runtime.slots.regrow_slab(0)
+        assert runtime.slots._persistent[(-1, 0)] is stable_slot
+        assert stable_slot.buffer is not None
+        assert stable_slot.buffer is not original_buffer
+        assert stable_slot.buffer.bank is not original_bank
+        assert runtime.slots.allocated_bytes == expected_slot_bytes
     finally:
         runtime.close()
+
+
+def test_component_slab_allocator_enforces_construction_owner_thread(
+    tmp_path: Path,
+) -> None:
+    _root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + 2 * spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    ).memory_plan(spec)
+    allocator = make_mlx_component_bank_allocator(
+        plan,
+        spec,
+        load_expert_manifest(manifest_path),
+        persistent_slab_slots=1,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            rejected_allocate = executor.submit(allocator.allocate_slab, 0)
+            with pytest.raises(RuntimeError, match="owner thread"):
+                rejected_allocate.result(timeout=2)
+        assert allocator.banks == {}
+
+        allocated = allocator.allocate_slab(0)
+        assert tuple(allocated) == (0,)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            rejected_release = executor.submit(allocator.release_slab, 0)
+            with pytest.raises(RuntimeError, match="owner thread"):
+                rejected_release.result(timeout=2)
+        assert ("global-persistent", 0) in allocator.banks
+        released = allocator.release_slab(0)
+        assert released.destroyed is True
+        assert released.slab_id == 0
+        assert released.physical_bytes == spec.expert_record_bytes
+    finally:
+        allocator.close()
 
 
 def test_global_component_bank_runtime_close_releases_all_storage_owners(
@@ -1809,7 +1871,7 @@ def test_component_bank_all_hit_decode_keeps_router_order_without_split_route_op
         runtime.close()
 
 
-def test_global_component_bank_all_hit_decode_binds_without_reads(
+def test_multi_slab_component_bank_all_hit_preserves_router_order_without_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1836,6 +1898,7 @@ def test_global_component_bank_all_hit_decode_binds_without_reads(
             plan,
             spec,
             load_expert_manifest(manifest_path),
+            persistent_slab_slots=2,
         ),
         device_synchronize=mx.synchronize,
         apply_memory_cap=False,
@@ -1862,10 +1925,12 @@ def test_global_component_bank_all_hit_decode_binds_without_reads(
                     for binding in bindings
                 )
             )
-            assert len({id(binding.buffer.bank) for binding in bindings}) == 1
-            assert all(
-                binding.buffer.bank_index == binding.logical_slot
-                for binding in bindings
+            assert len({id(binding.buffer.bank) for binding in bindings}) == 2
+            assert tuple(binding.buffer.bank_index for binding in bindings) == (
+                0,
+                1,
+                0,
+                0,
             )
             return original_run(selected, bindings, group_size=group_size)
 

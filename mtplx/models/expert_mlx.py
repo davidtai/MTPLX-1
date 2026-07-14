@@ -21,7 +21,12 @@ from mlx_lm.models.activations import swiglu
 
 from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
-from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
+from mtplx.expert_slots import (
+    ExpertSlabAllocatorError,
+    ExpertSlabReleaseResult,
+    ExpertSlotBinding,
+    ReadyRoute,
+)
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.expert_streaming_models import ExpertMemoryPlan, ExpertStreamingModelSpec
 from mtplx.mmap_mlx import mmap_u32
@@ -248,6 +253,14 @@ class MlxComponentBank:
             self._views.clear()
             self.arrays.clear()
             raise
+        self.physical_bytes = sum(int(value.nbytes) for value in self.arrays.values())
+        expected_physical_bytes = self.capacity * self.record_bytes
+        if self.physical_bytes != expected_physical_bytes:
+            self.close()
+            raise RuntimeError(
+                f"component bank {label} owns {self.physical_bytes} bytes; "
+                f"expected {expected_physical_bytes}"
+            )
 
     def component_view(self, slot: int, component: str) -> memoryview:
         if not 0 <= int(slot) < self.capacity:
@@ -439,6 +452,8 @@ def make_mlx_component_bank_allocator(
     plan: ExpertMemoryPlan,
     spec: ExpertStreamingModelSpec,
     manifest: ExpertManifest,
+    *,
+    persistent_slab_slots: int = 32,
 ) -> Callable[[int, str], MlxComponentSlot]:
     """Allocate slot bytes as component-major banks usable by ``gather_qmm``.
 
@@ -447,6 +462,13 @@ def make_mlx_component_bank_allocator(
     kernels. No persistent slice or stacked weight copy is materialized.
     """
 
+    if (
+        isinstance(persistent_slab_slots, bool)
+        or not isinstance(persistent_slab_slots, int)
+        or persistent_slab_slots <= 0
+    ):
+        raise ValueError("persistent_slab_slots must be a positive integer")
+    owner_thread_id = threading.get_ident()
     record_by_key: dict[tuple[int, int], ExpertRecord] = {}
     duplicate_keys: set[tuple[int, int]] = set()
     record_by_layer: dict[int, ExpertRecord] = {}
@@ -548,23 +570,48 @@ def make_mlx_component_bank_allocator(
                 f"layer {exemplar_layer}"
             )
 
+    global_slab_layout = (
+        {
+            slab_id: tuple(
+                range(
+                    start,
+                    min(start + persistent_slab_slots, plan.persistent_slots),
+                )
+            )
+            for slab_id, start in enumerate(
+                range(0, plan.persistent_slots, persistent_slab_slots)
+            )
+        }
+        if plan.cache_scope == "global"
+        else {}
+    )
+    global_slot_to_slab = {
+        slot_id: slab_id
+        for slab_id, slot_ids in global_slab_layout.items()
+        for slot_id in slot_ids
+    }
     banks: dict[tuple[str, int], MlxComponentBank] = {}
     slots: dict[str, MlxComponentSlot] = {}
+    allocated_labels: set[str] = set()
     backend = "mlx-metal-component-banks"
 
-    def bank_for(kind: str, layer: int) -> MlxComponentBank:
-        key = (kind, layer if kind == "persistent" else -1)
+    def require_owner_thread() -> None:
+        if threading.get_ident() != owner_thread_id:
+            raise RuntimeError("component slab allocation requires its owner thread")
+
+    def bank_for(kind: str, owner: int) -> MlxComponentBank:
+        key = (kind, owner if kind in {"persistent", "global-persistent"} else -1)
         bank = banks.get(key)
         if bank is not None:
             return bank
         if kind == "persistent":
             capacity = plan.slots_per_layer
-            record = record_by_layer[layer]
-            label = f"layer-{layer}-persistent-bank"
+            record = record_by_layer[owner]
+            label = f"layer-{owner}-persistent-bank"
         elif kind == "global-persistent":
-            capacity = plan.persistent_slots
+            capacity = len(global_slab_layout[owner])
             record = record_by_layer[exemplar_layer]
-            label = "global-persistent-bank"
+            label = f"global-persistent-slab-{owner}-bank"
         else:
             capacity = plan.transient_slots
             record = record_by_layer[exemplar_layer]
@@ -574,6 +621,7 @@ def make_mlx_component_bank_allocator(
         return bank
 
     def allocate(size: int, label: str) -> MlxComponentSlot:
+        require_owner_thread()
         if int(size) != spec.expert_record_bytes:
             raise ValueError("slot allocator size differs from model descriptor")
         layer_persistent = _LAYER_PERSISTENT_LABEL.fullmatch(label)
@@ -591,6 +639,7 @@ def make_mlx_component_bank_allocator(
             if not 0 <= slot_index < plan.slots_per_layer:
                 raise ValueError("persistent slot is outside planned capacity")
             bank = bank_for("persistent", layer)
+            bank_index = slot_index
         elif label.startswith("layer-") and "-persistent-" in label:
             raise ValueError(f"unknown expert slot label {label!r}")
         elif global_persistent is not None:
@@ -601,7 +650,10 @@ def make_mlx_component_bank_allocator(
             slot_index = int(global_persistent.group(1))
             if not 0 <= slot_index < plan.persistent_slots:
                 raise ValueError("global persistent slot is outside planned capacity")
-            bank = bank_for("global-persistent", -1)
+            slab_id = global_slot_to_slab[slot_index]
+            slab_slots = global_slab_layout[slab_id]
+            bank = bank_for("global-persistent", slab_id)
+            bank_index = slot_index - slab_slots[0]
         elif label.startswith("global-persistent-"):
             raise ValueError(f"unknown expert slot label {label!r}")
         elif global_transient is not None:
@@ -609,26 +661,128 @@ def make_mlx_component_bank_allocator(
             if not 0 <= slot_index < plan.transient_slots:
                 raise ValueError("transient slot is outside planned capacity")
             bank = bank_for("transient", -1)
+            bank_index = slot_index
         elif label.startswith("global-transient-"):
             raise ValueError(f"unknown expert slot label {label!r}")
         else:
             raise ValueError(f"unknown expert slot label {label!r}")
-        if label in slots:
+        if label in allocated_labels:
             raise ValueError(f"slot {label} was allocated twice")
-        slot = MlxComponentSlot(bank, slot_index, label=label)
-        slots[label] = slot
+        slot = slots.get(label)
+        if slot is None:
+            slot = MlxComponentSlot(bank, bank_index, label=label)
+            slots[label] = slot
+        allocated_labels.add(label)
         return slot
 
+    def slab_layout() -> dict[int, tuple[int, ...]]:
+        return dict(global_slab_layout)
+
+    def normalize_slab_id(slab_id: object) -> int:
+        if (
+            isinstance(slab_id, bool)
+            or not isinstance(slab_id, int)
+            or slab_id not in global_slab_layout
+        ):
+            raise ValueError("unknown global persistent slab")
+        return slab_id
+
+    def slab_physical_bytes(slab_id: int) -> int:
+        slab_id = normalize_slab_id(slab_id)
+        slot_ids = global_slab_layout[slab_id]
+        return len(slot_ids) * spec.expert_record_bytes
+
+    def allocate_slab(slab_id: int) -> dict[int, MlxComponentSlot]:
+        require_owner_thread()
+        slab_id = normalize_slab_id(slab_id)
+        slot_ids = global_slab_layout[slab_id]
+        if ("global-persistent", slab_id) in banks:
+            raise RuntimeError("global persistent slab is already allocated")
+        bank: MlxComponentBank | None = None
+        try:
+            bank = bank_for("global-persistent", slab_id)
+            allocated: dict[int, MlxComponentSlot] = {}
+            for bank_index, slot_id in enumerate(slot_ids):
+                label = f"global-persistent-{slot_id}"
+                slot = MlxComponentSlot(bank, bank_index, label=label)
+                slots[label] = slot
+                allocated_labels.add(label)
+                allocated[slot_id] = slot
+            return allocated
+        except BaseException:
+            if bank is not None:
+                bank.close()
+            banks.pop(("global-persistent", slab_id), None)
+            for slot_id in slot_ids:
+                label = f"global-persistent-{slot_id}"
+                slots.pop(label, None)
+                allocated_labels.discard(label)
+            _release_mlx_cache()
+            raise
+
+    def slab_is_allocated(slab_id: int) -> bool:
+        slab_id = normalize_slab_id(slab_id)
+        return ("global-persistent", slab_id) in banks
+
+    def release_slab(slab_id: int) -> ExpertSlabReleaseResult:
+        require_owner_thread()
+        slab_id = normalize_slab_id(slab_id)
+        slot_ids = global_slab_layout[slab_id]
+        try:
+            bank = banks[("global-persistent", slab_id)]
+        except KeyError as exc:
+            raise ExpertSlabAllocatorError(
+                "global persistent slab is not allocated",
+                destroyed=False,
+                physical_bytes=slab_physical_bytes(slab_id),
+            ) from exc
+        physical_bytes = bank.physical_bytes
+        destroyed = False
+        try:
+            bank.close()
+            destroyed = True
+            banks.pop(("global-persistent", slab_id), None)
+            for slot_id in slot_ids:
+                label = f"global-persistent-{slot_id}"
+                slots.pop(label, None)
+                allocated_labels.discard(label)
+            _release_mlx_cache()
+        except BaseException as exc:
+            if destroyed:
+                banks.pop(("global-persistent", slab_id), None)
+                for slot_id in slot_ids:
+                    label = f"global-persistent-{slot_id}"
+                    slots.pop(label, None)
+                    allocated_labels.discard(label)
+            raise ExpertSlabAllocatorError(
+                "global persistent slab release failed",
+                destroyed=destroyed,
+                physical_bytes=physical_bytes,
+            ) from exc
+        return ExpertSlabReleaseResult(
+            slab_id=slab_id,
+            physical_bytes=physical_bytes,
+            destroyed=True,
+        )
+
     def close_banks() -> None:
+        require_owner_thread()
         for bank in tuple(banks.values()):
             bank.close()
         banks.clear()
         slots.clear()
+        allocated_labels.clear()
         _release_mlx_cache()
 
     setattr(allocate, "backend", backend)
     setattr(allocate, "slots", slots)
     setattr(allocate, "banks", banks)
+    setattr(allocate, "owner_thread_id", owner_thread_id)
+    setattr(allocate, "slab_layout", slab_layout)
+    setattr(allocate, "slab_physical_bytes", slab_physical_bytes)
+    setattr(allocate, "slab_is_allocated", slab_is_allocated)
+    setattr(allocate, "allocate_slab", allocate_slab)
+    setattr(allocate, "release_slab", release_slab)
     setattr(allocate, "close", close_banks)
     return allocate
 
@@ -689,40 +843,71 @@ def _run_component_bank_q4(
     *,
     group_size: int,
 ) -> mx.array:
-    """Execute assignment-aligned rows from one component-major slot bank."""
+    """Execute assignment-aligned rows from one or more component slabs."""
 
     if not bindings or int(x.shape[0]) != len(bindings):
         raise ValueError(
             "component-bank inputs and bindings must be non-empty and aligned"
         )
-    bank = getattr(bindings[0].buffer, "bank", None)
-    if bank is None or any(
-        getattr(binding.buffer, "bank", None) is not bank for binding in bindings
-    ):
-        raise ValueError("component-bank execution requires one shared bank")
-    selected = x.reshape((len(bindings), 1, 1, int(x.shape[-1])))
-    slot_indices = mx.array(
-        [int(binding.buffer.bank_index) for binding in bindings],
-        dtype=mx.int32,
-    ).reshape((-1, 1))
 
-    def qmm(values: mx.array, projection: str) -> mx.array:
-        return mx.gather_qmm(
-            values,
-            bank.arrays[f"{projection}.weight"],
-            bank.arrays[f"{projection}.scales"],
-            bank.arrays[f"{projection}.biases"],
-            rhs_indices=slot_indices,
-            transpose=True,
-            group_size=group_size,
-            bits=4,
-            mode="affine",
-        )
+    def run_one_bank(
+        values: mx.array,
+        bank_bindings: tuple[ExpertSlotBinding, ...],
+    ) -> mx.array:
+        bank = getattr(bank_bindings[0].buffer, "bank", None)
+        if bank is None or any(
+            getattr(binding.buffer, "bank", None) is not bank
+            for binding in bank_bindings
+        ):
+            raise ValueError("component-bank group does not share one bank")
+        selected = values.reshape((len(bank_bindings), 1, 1, int(values.shape[-1])))
+        slot_indices = mx.array(
+            [int(binding.buffer.bank_index) for binding in bank_bindings],
+            dtype=mx.int32,
+        ).reshape((-1, 1))
 
-    gate = qmm(selected, "gate_proj")
-    up = qmm(selected, "up_proj")
-    output = qmm(swiglu(gate, up), "down_proj")
-    return output.reshape((len(bindings), int(output.shape[-1])))
+        def qmm(qmm_values: mx.array, projection: str) -> mx.array:
+            return mx.gather_qmm(
+                qmm_values,
+                bank.arrays[f"{projection}.weight"],
+                bank.arrays[f"{projection}.scales"],
+                bank.arrays[f"{projection}.biases"],
+                rhs_indices=slot_indices,
+                transpose=True,
+                group_size=group_size,
+                bits=4,
+                mode="affine",
+            )
+
+        gate = qmm(selected, "gate_proj")
+        up = qmm(selected, "up_proj")
+        output = qmm(swiglu(gate, up), "down_proj")
+        return output.reshape((len(bank_bindings), int(output.shape[-1])))
+
+    by_bank: dict[int, list[tuple[int, ExpertSlotBinding]]] = {}
+    for position, binding in enumerate(bindings):
+        bank = getattr(binding.buffer, "bank", None)
+        if bank is None:
+            raise ValueError("component-bank binding has no component bank")
+        by_bank.setdefault(id(bank), []).append((position, binding))
+    if len(by_bank) > 1:
+        outputs: list[mx.array] = []
+        positions: list[int] = []
+        for assignments in by_bank.values():
+            group_positions = [position for position, _binding in assignments]
+            group_bindings = tuple(binding for _position, binding in assignments)
+            selected = mx.take(
+                x,
+                mx.array(group_positions, dtype=mx.int32),
+                axis=0,
+            )
+            outputs.append(run_one_bank(selected, group_bindings))
+            positions.extend(group_positions)
+        combined = mx.concatenate(outputs, axis=0)
+        restore = mx.argsort(mx.array(positions, dtype=mx.int32))
+        return mx.take(combined, restore, axis=0)
+
+    return run_one_bank(x, bindings)
 
 
 def _run_mapped_q4(
