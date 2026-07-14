@@ -260,6 +260,8 @@ def test_post_load_classification_reconciliation_preserves_kv_owner_handles() ->
         expert_slab_physical_bytes=20,
         in_flight_expert_staging_bytes=5,
         runtime_workspace_bytes=5,
+        allocator_before=AllocatorMemorySample(74, 0, 74),
+        allocator_after=AllocatorMemorySample(79, 0, 79),
     )
 
     assert snapshot.owned_kv_physical_bytes == 4
@@ -271,6 +273,59 @@ def test_post_load_classification_reconciliation_preserves_kv_owner_handles() ->
         allocator_after=AllocatorMemorySample(0, 0, 4),
     )
     assert broker.snapshot().owned_kv_physical_bytes == 0
+
+
+def test_post_load_classification_atomically_reclassifies_consumed_cache() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(
+            resident=40,
+            experts=20,
+            staging=5,
+            workspace=10,
+            cache=10,
+        ),
+        expert_slab_bytes=10,
+    )
+
+    snapshot = broker.reconcile_post_load_classification(
+        resident_model_bytes=45,
+        expert_slab_physical_bytes=20,
+        in_flight_expert_staging_bytes=5,
+        runtime_workspace_bytes=10,
+        allocator_before=AllocatorMemorySample(65, 10, 75),
+        allocator_after=AllocatorMemorySample(70, 5, 75),
+    )
+
+    assert snapshot.resident_model_bytes == 45
+    assert snapshot.allocator_cache_bytes == 5
+    assert snapshot.charged_bytes == 85
+
+
+def test_post_load_classification_preserves_active_ticket_revision() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=40, experts=20, workspace=10),
+        expert_slab_bytes=10,
+    )
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=4,
+        transient_delta_bytes=0,
+        cache_id="target:pending",
+    )
+
+    snapshot = broker.reconcile_post_load_classification(
+        resident_model_bytes=41,
+        expert_slab_physical_bytes=20,
+        in_flight_expert_staging_bytes=0,
+        runtime_workspace_bytes=10,
+        allocator_before=AllocatorMemorySample(60, 0, 60),
+        allocator_after=AllocatorMemorySample(61, 0, 61),
+    )
+
+    assert snapshot.pending_kv_ticket_id == ticket.ticket_id
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=4)
+    assert allocation.cache_id == "target:pending"
 
 
 def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:

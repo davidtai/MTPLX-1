@@ -1202,7 +1202,9 @@ class ExpertStreamingRuntime:
         self.memory_broker = memory_broker
         self._mx_module = mx_module
         self._dynamic_resize_lock = threading.RLock()
-        self._last_allocator_sample: AllocatorMemorySample | None = None
+        self._last_allocator_sample = (
+            None if memory_broker is None else memory_broker.initial_allocator_sample
+        )
         self._dynamic_resize_metrics = {
             "reclaim_requests": 0,
             "regrow_requests": 0,
@@ -1296,7 +1298,12 @@ class ExpertStreamingRuntime:
 
         telemetry = mlx_memory_telemetry(mx_module)
         try:
-            allocator_cache_bytes = int(telemetry["cache_memory_bytes"])
+            initial_allocator_sample = AllocatorMemorySample(
+                active_bytes=int(telemetry["active_memory_bytes"]),
+                cache_bytes=int(telemetry["cache_memory_bytes"]),
+                peak_bytes=int(telemetry["peak_memory_bytes"]),
+            )
+            allocator_cache_bytes = initial_allocator_sample.cache_bytes
             slab_telemetry = slots.expert_slab_telemetry_snapshot()
             slab_bytes = int(slab_telemetry["physical_bytes"])
             slab_slots = int(config.expert_slab_slots)
@@ -1354,6 +1361,7 @@ class ExpertStreamingRuntime:
             )
         return UnifiedMemoryBroker.standard_hy3(
             initial_snapshot=initial_snapshot,
+            initial_allocator_sample=initial_allocator_sample,
             expert_slab_bytes=(
                 int(config.expert_slab_slots) * int(spec.expert_record_bytes)
             ),
@@ -2134,6 +2142,7 @@ class ExpertStreamingRuntime:
         if broker is None:
             return
         before = broker.snapshot()
+        allocator_before = self._last_allocator_sample
         sample = self._sample_allocator_memory()
         expert_bytes = self._registered_expert_slab_bytes()
         transient_bytes = int(self.plan.transient_bytes)
@@ -2161,11 +2170,9 @@ class ExpertStreamingRuntime:
                 runtime_workspace_bytes=(
                     execution_workspace + remaining_runtime_reserve
                 ),
+                allocator_before=allocator_before,
+                allocator_after=sample,
             )
-        except MemoryAdmissionError as exc:
-            admission_error = exc
-        try:
-            broker.reconcile_allocator_cache(sample)
         except MemoryAdmissionError as exc:
             admission_error = exc
         if resident_growth > generic_runtime_reserve:

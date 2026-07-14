@@ -160,26 +160,43 @@ class CloseablePhysicalCache:
         self.close_calls += 1
 
 
-class LifecyclePhysicalCache:
-    allocation_observer = object()
+class LifecycleAllocationObserver:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.live_cache_ids: set[str] = set()
+        self.release_calls: list[str] = []
 
+    def register(self, cache_id: str) -> None:
+        self.live_cache_ids.add(cache_id)
+
+    def release(self, cache_id: str) -> None:
+        self.release_calls.append(cache_id)
+        self.live_cache_ids.remove(cache_id)
+        self.events.append(f"release:{cache_id}")
+
+
+class LifecyclePhysicalCache:
     def __init__(
         self,
-        kind: str,
+        cache_id: str,
         events: list[str],
+        allocation_observer: LifecycleAllocationObserver,
         *,
         fail_on_close: bool = False,
     ) -> None:
-        self.kind = kind
+        self.cache_id = cache_id
         self.events = events
+        self.allocation_observer = allocation_observer
         self.fail_on_close = fail_on_close
         self.close_calls = 0
+        self.allocation_observer.register(cache_id)
 
     def close(self) -> None:
         self.close_calls += 1
-        self.events.append(f"close:{self.kind}")
+        self.events.append(f"close:{self.cache_id}")
+        self.allocation_observer.release(self.cache_id)
         if self.fail_on_close:
-            raise RuntimeError(f"injected {self.kind} close failure")
+            raise RuntimeError(f"injected {self.cache_id} close failure")
 
 
 class CloseableTinyModel(TinyModel):
@@ -209,13 +226,18 @@ class LifecycleTinyMTPModel(AcceptingTinyMTPModel):
     ) -> None:
         super().__init__()
         self.events: list[str] = []
+        self.allocation_observer = LifecycleAllocationObserver(self.events)
         self.target_caches: list[LifecyclePhysicalCache] = []
         self.mtp_caches: list[LifecyclePhysicalCache] = []
         self.fail_after_target_calls = fail_after_target_calls
         self.fail_first_mtp_close = fail_first_mtp_close
 
     def make_cache(self):
-        entry = LifecyclePhysicalCache("target", self.events)
+        entry = LifecyclePhysicalCache(
+            f"target:{len(self.target_caches)}",
+            self.events,
+            self.allocation_observer,
+        )
         self.target_caches.append(entry)
         return [entry]
 
@@ -223,6 +245,7 @@ class LifecycleTinyMTPModel(AcceptingTinyMTPModel):
         entry = LifecyclePhysicalCache(
             f"mtp:{len(self.mtp_caches)}",
             self.events,
+            self.allocation_observer,
             fail_on_close=self.fail_first_mtp_close and not self.mtp_caches,
         )
         self.mtp_caches.append(entry)
@@ -709,7 +732,7 @@ def test_generate_mtpk_continues_closing_after_one_cache_close_fails() -> None:
     assert model.target_caches
     assert model.mtp_caches
     assert all(cache.close_calls == 1 for cache in model.physical_caches)
-    assert model.events[-1] == "close:target"
+    assert model.events[-2:] == ["close:target:0", "release:target:0"]
 
 
 def test_sequential_generate_mtpk_calls_leave_no_open_physical_caches() -> None:
@@ -726,11 +749,13 @@ def test_sequential_generate_mtpk_calls_leave_no_open_physical_caches() -> None:
             stop_token_ids=set(),
         )
         assert all(cache.close_calls == 1 for cache in model.physical_caches)
+        assert model.allocation_observer.live_cache_ids == set()
 
     assert len(model.target_caches) == 2
     assert len(model.physical_caches) == sum(
         cache.close_calls for cache in model.physical_caches
     )
+    assert len(model.allocation_observer.release_calls) == len(model.physical_caches)
 
 
 @pytest.mark.parametrize(

@@ -151,6 +151,7 @@ def _runtime(
     slots: _FakeSlots,
     bank: _FakeBank,
     samples: list[AllocatorMemorySample],
+    initial_sample: AllocatorMemorySample | None = None,
 ) -> ExpertStreamingRuntime:
     runtime = object.__new__(ExpertStreamingRuntime)
     runtime.memory_broker = broker
@@ -164,7 +165,23 @@ def _runtime(
     )
     runtime._dynamic_resize_lock = threading.RLock()
     runtime._dynamic_resize_metrics = {}
-    runtime._sample_allocator_memory = lambda: samples.pop(0)
+    snapshot = broker.snapshot()
+    runtime._last_allocator_sample = initial_sample or AllocatorMemorySample(
+        active_bytes=(
+            snapshot.resident_model_bytes
+            + snapshot.expert_slab_physical_bytes
+            + snapshot.in_flight_expert_staging_bytes
+        ),
+        cache_bytes=snapshot.allocator_cache_bytes,
+        peak_bytes=snapshot.charged_bytes,
+    )
+
+    def sample_allocator_memory() -> AllocatorMemorySample:
+        sample = samples.pop(0)
+        runtime._last_allocator_sample = sample
+        return sample
+
+    runtime._sample_allocator_memory = sample_allocator_memory
     return runtime
 
 
@@ -374,6 +391,7 @@ def test_dynamic_broker_initialization_charges_all_pools_additively(
     assert snapshot.runtime_workspace_bytes == 90
     assert snapshot.allocator_cache_bytes == 7
     assert snapshot.charged_bytes == 221
+    assert broker.initial_allocator_sample == AllocatorMemorySample(64, 7, 71)
 
 
 def test_dynamic_broker_rejects_missing_or_mismatched_physical_slab_layout(
@@ -526,7 +544,9 @@ def test_post_load_reconciliation_charges_measured_resident_and_mtp_memory() -> 
     assert snapshot.allocator_cache_bytes == 7
 
 
-def test_post_load_reconciliation_retains_unused_reserve_and_grants_no_credit() -> None:
+def test_post_load_reconciliation_retains_unused_reserve_and_reclassifies_cache() -> (
+    None
+):
     broker = UnifiedMemoryBroker(
         initial_snapshot=BrokerSnapshot(
             resident_model_bytes=10,
@@ -543,6 +563,7 @@ def test_post_load_reconciliation_retains_unused_reserve_and_grants_no_credit() 
         slots=_FakeSlots(),
         bank=_FakeBank(),
         samples=[AllocatorMemorySample(99, 3, 102)],
+        initial_sample=AllocatorMemorySample(94, 5, 99),
     )
     runtime.plan = SimpleNamespace(
         persistent_slots=4,
@@ -557,7 +578,7 @@ def test_post_load_reconciliation_retains_unused_reserve_and_grants_no_credit() 
     assert snapshot.resident_model_bytes == 15
     assert snapshot.in_flight_expert_staging_bytes == 50
     assert snapshot.runtime_workspace_bytes == 25
-    assert snapshot.allocator_cache_bytes == 5
+    assert snapshot.allocator_cache_bytes == 3
 
 
 def test_post_load_reconciliation_never_drops_planned_resident_bytes() -> None:

@@ -266,6 +266,7 @@ class UnifiedMemoryBroker:
         *,
         budget: MemoryBudget | None = None,
         initial_snapshot: BrokerSnapshot | None = None,
+        initial_allocator_sample: AllocatorMemorySample | None = None,
         expert_slab_bytes: int = (
             _DEFAULT_EXPERT_RECORD_BYTES * _DEFAULT_EXPERT_SLAB_SLOTS
         ),
@@ -302,6 +303,20 @@ class UnifiedMemoryBroker:
         self._released_allocation_ids: set[int] = set()
         self._ambiguous_allocation_ids: set[int] = set()
         self._unreconciled_kv_by_owner: dict[str, int] = {}
+        if initial_allocator_sample is not None:
+            self._validate_allocator_sample(
+                "initial_allocator_sample",
+                initial_allocator_sample,
+            )
+            if (
+                initial_snapshot is not None
+                and initial_allocator_sample.cache_bytes
+                != initial_snapshot.allocator_cache_bytes
+            ):
+                raise ValueError(
+                    "initial allocator sample cache must match the initial snapshot"
+                )
+        self._initial_allocator_sample = initial_allocator_sample
         if initial_snapshot is not None:
             self.replace_snapshot(initial_snapshot)
 
@@ -310,6 +325,7 @@ class UnifiedMemoryBroker:
         cls,
         *,
         initial_snapshot: BrokerSnapshot | None = None,
+        initial_allocator_sample: AllocatorMemorySample | None = None,
         expert_slab_bytes: int = (
             _DEFAULT_EXPERT_RECORD_BYTES * _DEFAULT_EXPERT_SLAB_SLOTS
         ),
@@ -319,6 +335,7 @@ class UnifiedMemoryBroker:
         return cls(
             budget=MemoryBudget(),
             initial_snapshot=initial_snapshot,
+            initial_allocator_sample=initial_allocator_sample,
             expert_slab_bytes=expert_slab_bytes,
             expert_regrow_hysteresis_slabs=(expert_regrow_hysteresis_slabs),
             expert_resize_min_interval_ns=expert_resize_min_interval_ns,
@@ -327,6 +344,10 @@ class UnifiedMemoryBroker:
     @property
     def budget(self) -> MemoryBudget:
         return self._budget
+
+    @property
+    def initial_allocator_sample(self) -> AllocatorMemorySample | None:
+        return self._initial_allocator_sample
 
     def snapshot(self) -> BrokerSnapshot:
         with self._lock:
@@ -457,8 +478,10 @@ class UnifiedMemoryBroker:
         expert_slab_physical_bytes: int,
         in_flight_expert_staging_bytes: int,
         runtime_workspace_bytes: int,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
     ) -> BrokerSnapshot:
-        """Publish post-load pool truth without invalidating KV ownership."""
+        """Atomically publish post-load truth without invalidating KV ownership."""
 
         resident = _exact_nonnegative_int(
             "resident_model_bytes",
@@ -476,17 +499,45 @@ class UnifiedMemoryBroker:
             "runtime_workspace_bytes",
             runtime_workspace_bytes,
         )
+        if allocator_before is None or allocator_after is None:
+            raise MemoryTelemetryError(
+                "allocator telemetry unavailable during post-load reconciliation"
+            )
+        try:
+            self._validate_allocator_sample("allocator_before", allocator_before)
+            self._validate_allocator_sample("allocator_after", allocator_after)
+        except (TypeError, ValueError) as exc:
+            raise MemoryTelemetryError(
+                f"invalid allocator telemetry during post-load reconciliation: {exc}"
+            ) from exc
         with self._lock:
-            if self._pending is not None or self._pending_regrow is not None:
-                raise MemoryTransactionError(
-                    "cannot reconcile post-load memory during an active transaction"
+            if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
+                raise MemoryTelemetryError(
+                    "allocator telemetry is stale during post-load reconciliation"
                 )
+            classified_delta = (
+                resident
+                - self._pools.resident_model_bytes
+                + experts
+                - self._pools.expert_slab_physical_bytes
+                + staging
+                - self._pools.in_flight_expert_staging_bytes
+            )
+            footprint_delta = (
+                allocator_after.charged_footprint_bytes
+                - allocator_before.charged_footprint_bytes
+            )
+            residual_cache = (
+                self._pools.allocator_cache_bytes + footprint_delta - classified_delta
+            )
+            cache_after = max(0, allocator_after.cache_bytes, residual_cache)
             self._pools = replace(
                 self._pools,
                 resident_model_bytes=resident,
                 expert_slab_physical_bytes=experts,
                 in_flight_expert_staging_bytes=staging,
                 runtime_workspace_bytes=workspace,
+                allocator_cache_bytes=cache_after,
                 pinned_expert_bytes=min(self._pools.pinned_expert_bytes, experts),
                 speculative_expert_bytes=min(
                     self._pools.speculative_expert_bytes,
@@ -498,6 +549,10 @@ class UnifiedMemoryBroker:
                 experts,
             )
             self._revision += 1
+            if self._pending is not None:
+                self._pending.expected_revision = self._revision
+            if self._pending_regrow is not None:
+                self._pending_regrow.expected_revision = self._revision
             self._assert_kv_ledger_invariant()
             self._record_hard_failure_if_needed()
             charged = self._pools.charged_bytes
