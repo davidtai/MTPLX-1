@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import importlib
 import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Protocol
 
 from .attention_context import current_attention_phase
 
@@ -36,12 +38,120 @@ class _PagedGQARouteDecision:
     max_q: int
 
 
+class KVPhysicalAllocationObserver(Protocol):
+    """Fail-closed ownership boundary for physical paged-Q4 allocations."""
+
+    def reserve_growth(
+        self,
+        *,
+        cache_id: str,
+        steady_delta_bytes: int,
+        transient_delta_bytes: int,
+    ) -> Any: ...
+
+    def commit_growth(
+        self,
+        ticket: Any,
+        *,
+        measured_physical_bytes: int,
+        allocator_before: Any,
+        allocator_after: Any,
+    ) -> Any: ...
+
+    def abort_growth(
+        self,
+        ticket: Any,
+        *,
+        observed_physical_bytes: int | None,
+        allocator_before: Any | None,
+        allocator_after: Any | None,
+    ) -> None: ...
+
+    def sample_allocator_memory(self) -> Any: ...
+
+    def release_cache(
+        self,
+        *,
+        cache_id: str,
+        allocations: tuple[Any, ...],
+        released_physical_bytes: int,
+        allocator_before: Any | None,
+        allocator_after: Any | None,
+    ) -> None: ...
+
+
+_PHYSICAL_KV_CACHE_SCOPE: ContextVar[list[Any] | None] = ContextVar(
+    "mtplx_physical_kv_cache_scope",
+    default=None,
+)
+
+
+def close_physical_kv_cache(cache: Any) -> None:
+    """Close all allocation-observed entries while preserving exact ownership."""
+
+    entries = cache if isinstance(cache, (list, tuple)) else (cache,)
+    first_error: BaseException | None = None
+    for entry in entries:
+        if getattr(entry, "allocation_observer", None) is None:
+            continue
+        close = getattr(entry, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def register_physical_kv_cache(cache: Any) -> None:
+    """Register a broker-owned cache with the active generation lifecycle."""
+
+    scope = _PHYSICAL_KV_CACHE_SCOPE.get()
+    if scope is None:
+        return
+    entries = cache if isinstance(cache, (list, tuple)) else (cache,)
+    if any(
+        getattr(entry, "allocation_observer", None) is not None for entry in entries
+    ):
+        scope.append(cache)
+
+
+@contextmanager
+def physical_kv_cache_lifecycle():
+    """Close broker-owned caches on success, errors, and cancellation paths."""
+
+    owned: list[Any] = []
+    token = _PHYSICAL_KV_CACHE_SCOPE.set(owned)
+    first_error: BaseException | None = None
+    try:
+        yield
+    finally:
+        try:
+            seen: set[int] = set()
+            for cache in reversed(owned):
+                identity = id(cache)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                try:
+                    close_physical_kv_cache(cache)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        finally:
+            _PHYSICAL_KV_CACHE_SCOPE.reset(token)
+        if first_error is not None:
+            raise first_error
+
+
 def _normalize_detach_mode(mode: str) -> str:
     normalized = mode.strip().lower().replace("-", "_")
     if normalized not in SUPPORTED_DETACH_MODES:
         raise ValueError(
-            "detach mode must be one of "
-            f"{sorted(SUPPORTED_DETACH_MODES)}; got {mode!r}"
+            f"detach mode must be one of {sorted(SUPPORTED_DETACH_MODES)}; got {mode!r}"
         )
     return normalized
 
@@ -75,7 +185,9 @@ class TailOwnedKVCache:
         self.tail_owner_time_s = 0.0
 
     @classmethod
-    def from_cache(cls, entry: Any, *, mode: str, step: int | None = None) -> "TailOwnedKVCache":
+    def from_cache(
+        cls, entry: Any, *, mode: str, step: int | None = None
+    ) -> "TailOwnedKVCache":
         return cls(
             mode=mode,
             step=int(step or getattr(entry, "step", 256)),
@@ -363,7 +475,9 @@ class BlockOwnedKVCache(TailOwnedKVCache):
             value_tail = values[..., cursor : cursor + take, :]
             key_tail, value_tail = self._own_tail(key_tail, value_tail)
             self.key_blocks[block_index][..., in_block : in_block + take, :] = key_tail
-            self.value_blocks[block_index][..., in_block : in_block + take, :] = value_tail
+            self.value_blocks[block_index][..., in_block : in_block + take, :] = (
+                value_tail
+            )
             self.offset += take
             cursor += take
             if in_block + take == self.block_size:
@@ -500,9 +614,13 @@ def _paged_gqa_sdpa_route_decision_from_env(
             "", "context_lt_min", route, min_context, min_q, max_q
         )
     if q_len < min_q:
-        return _PagedGQARouteDecision("", "q_len_lt_min", route, min_context, min_q, max_q)
+        return _PagedGQARouteDecision(
+            "", "q_len_lt_min", route, min_context, min_q, max_q
+        )
     if q_len > max_q:
-        return _PagedGQARouteDecision("", "q_len_gt_max", route, min_context, min_q, max_q)
+        return _PagedGQARouteDecision(
+            "", "q_len_gt_max", route, min_context, min_q, max_q
+        )
     if route == "auto":
         route = "async_per_head"
     return _PagedGQARouteDecision(route, "enabled", route, min_context, min_q, max_q)
@@ -578,7 +696,9 @@ def _paged_gqa_sdpa_streams_for(kv_heads: int) -> list[Any]:
     import mlx.core as mx
 
     if kv_heads not in _PAGED_GQA_SDPA_STREAMS:
-        _PAGED_GQA_SDPA_STREAMS[kv_heads] = [mx.new_stream(mx.gpu) for _ in range(kv_heads)]
+        _PAGED_GQA_SDPA_STREAMS[kv_heads] = [
+            mx.new_stream(mx.gpu) for _ in range(kv_heads)
+        ]
     return _PAGED_GQA_SDPA_STREAMS[kv_heads]
 
 
@@ -810,6 +930,8 @@ class VllmMetalPagedKVCache:
         offset: int = 0,
         turboquant_config: Any | None = None,
         kv_quant_config: Any | None = None,
+        allocation_observer: KVPhysicalAllocationObserver | None = None,
+        cache_id: str | None = None,
     ) -> None:
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
@@ -823,6 +945,20 @@ class VllmMetalPagedKVCache:
         self.turboquant = turboquant_config is not None
         self.kv_quant_config = kv_quant_config
         self.kv_quant = kv_quant_config is not None
+        self.allocation_observer = allocation_observer
+        self.cache_id = str(cache_id or "")
+        if allocation_observer is not None:
+            if not self.cache_id:
+                raise ValueError("allocation-observed paged KV requires cache_id")
+            if (
+                kv_quant_config is None
+                or str(getattr(kv_quant_config, "normalized_mode", "")) != "q4"
+                or turboquant_config is not None
+            ):
+                raise ValueError("physical KV brokering requires plain paged Q4")
+        self._kv_allocations: list[Any] = []
+        self._committed_physical_bytes = 0
+        self._closed = False
         self._shape: tuple[int, int, int] | None = None
         self._dtypes: tuple[Any, Any] | None = None
         self.update_calls = 0
@@ -865,6 +1001,8 @@ class VllmMetalPagedKVCache:
         num_blocks: int = 1024,
         turboquant_config: Any | None = None,
         kv_quant_config: Any | None = None,
+        allocation_observer: KVPhysicalAllocationObserver | None = None,
+        cache_id: str | None = None,
     ) -> "VllmMetalPagedKVCache":
         return cls(
             block_size=block_size,
@@ -874,16 +1012,165 @@ class VllmMetalPagedKVCache:
             offset=int(getattr(entry, "offset", 0)),
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config,
+            allocation_observer=allocation_observer,
+            cache_id=cache_id,
         )
 
     @property
     def capacity(self) -> int:
         return int(self.block_size) * int(self.num_blocks)
 
+    def _planned_capacity_bytes(
+        self,
+        *,
+        num_blocks: int,
+        shape: tuple[int, int, int],
+        dtypes: tuple[Any, Any],
+    ) -> int:
+        n_kv_heads, k_head_dim, v_head_dim = shape
+        tokens = int(num_blocks) * self.block_size * n_kv_heads
+        if self.kv_quant:
+            import mlx.core as mx
+
+            from .kv_quant import packed_dim
+
+            bits = int(self.kv_quant_config.bits)
+            packed = packed_dim(k_head_dim, bits) + packed_dim(v_head_dim, bits)
+            packed_bytes = tokens * packed * int(mx.uint8.size)
+            # Plain paged quantization owns one fp16 scale for K and one for V.
+            scale_bytes = tokens * 2 * int(mx.float16.size)
+            return packed_bytes + scale_bytes
+        return tokens * (
+            k_head_dim * int(dtypes[0].size) + v_head_dim * int(dtypes[1].size)
+        )
+
+    def _reserve_physical_growth(
+        self,
+        *,
+        steady_delta_bytes: int,
+        transient_delta_bytes: int,
+    ) -> Any | None:
+        if self.allocation_observer is None:
+            return None
+        return self.allocation_observer.reserve_growth(
+            cache_id=self.cache_id,
+            steady_delta_bytes=steady_delta_bytes,
+            transient_delta_bytes=transient_delta_bytes,
+        )
+
+    def _commit_physical_growth(
+        self,
+        ticket: Any | None,
+        measured: int,
+        *,
+        allocator_before: Any | None,
+        allocator_after: Any | None,
+    ) -> None:
+        if ticket is None:
+            return
+        allocation = self.allocation_observer.commit_growth(
+            ticket,
+            measured_physical_bytes=measured,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+        self._kv_allocations.append(allocation)
+        self._committed_physical_bytes += measured
+
+    def _abort_physical_growth(
+        self,
+        ticket: Any | None,
+        *,
+        observed_physical_bytes: int | None,
+        allocator_before: Any,
+        allocator_after: Any,
+    ) -> None:
+        if ticket is None:
+            return
+        self.allocation_observer.abort_growth(
+            ticket,
+            observed_physical_bytes=observed_physical_bytes,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+
+    def _sample_allocator_memory(self) -> Any | None:
+        if self.allocation_observer is None:
+            return None
+        return self.allocation_observer.sample_allocator_memory()
+
+    @staticmethod
+    def _allocator_footprint(sample: Any | None) -> int | None:
+        if sample is None:
+            return None
+        try:
+            return int(sample.active_bytes) + int(sample.cache_bytes)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _observed_retained_growth(
+        self,
+        allocator_before: Any | None,
+        allocator_after: Any | None,
+        *,
+        minimum_bytes: int = 0,
+    ) -> int | None:
+        before = self._allocator_footprint(allocator_before)
+        after = self._allocator_footprint(allocator_after)
+        if before is None or after is None:
+            return None
+        return max(int(minimum_bytes), after - before, 0)
+
+    def _materialize_grown_arrays(
+        self,
+        *,
+        extra_blocks: int,
+    ) -> tuple[Any, Any, Any | None, Any | None, Any | None]:
+        """Build and evaluate replacement pages without mutating cache ownership."""
+
+        import mlx.core as mx
+
+        key_extra = mx.zeros(
+            (extra_blocks, *self.key_cache.shape[1:]),
+            dtype=self.key_cache.dtype,
+        )
+        value_extra = mx.zeros(
+            (extra_blocks, *self.value_cache.shape[1:]),
+            dtype=self.value_cache.dtype,
+        )
+        key_cache = mx.concatenate([self.key_cache, key_extra], axis=0)
+        value_cache = mx.concatenate([self.value_cache, value_extra], axis=0)
+        evaluated = [key_extra, value_extra, key_cache, value_cache]
+
+        def grow_optional(array: Any | None) -> Any | None:
+            if array is None:
+                return None
+            extra = mx.zeros(
+                (extra_blocks, *array.shape[1:]),
+                dtype=array.dtype,
+            )
+            grown = mx.concatenate([array, extra], axis=0)
+            evaluated.extend((extra, grown))
+            return grown
+
+        key_scale_cache = grow_optional(self.key_scale_cache)
+        value_scale_cache = grow_optional(self.value_scale_cache)
+        key_zero_cache = grow_optional(self.key_zero_cache)
+        mx.eval(*evaluated)
+        return (
+            key_cache,
+            value_cache,
+            key_scale_cache,
+            value_scale_cache,
+            key_zero_cache,
+        )
+
     def _grow_to_capacity(self, required_tokens: int) -> bool:
         if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
             return False
-        required_blocks = (int(required_tokens) + self.block_size - 1) // self.block_size
+        required_blocks = (
+            int(required_tokens) + self.block_size - 1
+        ) // self.block_size
         grown_blocks = max(
             required_blocks,
             int((self.num_blocks * 3 + 1) // 2),
@@ -896,50 +1183,208 @@ class VllmMetalPagedKVCache:
             self.grow_events += 1
             return True
 
+        extra_blocks = int(grown_blocks) - int(self.num_blocks)
+        old_physical = self.nbytes
+        assert self._shape is not None and self._dtypes is not None
+        new_physical = self._planned_capacity_bytes(
+            num_blocks=grown_blocks,
+            shape=self._shape,
+            dtypes=self._dtypes,
+        )
+        steady_delta = new_physical - old_physical
+        ticket = self._reserve_physical_growth(
+            steady_delta_bytes=steady_delta,
+            transient_delta_bytes=new_physical,
+        )
+        allocator_before = None
+        grown_arrays = None
+        transitioned = False
+        try:
+            allocator_before = self._sample_allocator_memory()
+            grown_arrays = self._materialize_grown_arrays(
+                extra_blocks=extra_blocks,
+            )
+            grown_physical = sum(
+                int(array.nbytes) for array in grown_arrays if array is not None
+            )
+            if grown_physical != new_physical:
+                raise RuntimeError(
+                    "paged KV growth geometry drifted from its reservation "
+                    f"({grown_physical} observed, {new_physical} planned)"
+                )
+            (
+                self.key_cache,
+                self.value_cache,
+                self.key_scale_cache,
+                self.value_scale_cache,
+                self.key_zero_cache,
+            ) = grown_arrays
+            self.num_blocks = int(grown_blocks)
+            transitioned = True
+            # The helper frame (including every extra/concatenate temporary) is
+            # gone before cache telemetry is sampled.  Drop the returned tuple's
+            # duplicate references, then flush unowned allocator cache.
+            grown_arrays = None
+            if ticket is not None:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            measured = self.nbytes - old_physical
+            allocator_after = self._sample_allocator_memory()
+            self._commit_physical_growth(
+                ticket,
+                measured,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        except BaseException as operation_error:
+            operation_error = operation_error.with_traceback(None)
+            grown_arrays = None
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+            try:
+                allocator_after = self._sample_allocator_memory()
+            except BaseException:
+                allocator_after = None
+            try:
+                self._abort_physical_growth(
+                    ticket,
+                    observed_physical_bytes=self._observed_retained_growth(
+                        allocator_before,
+                        allocator_after,
+                        minimum_bytes=steady_delta if transitioned else 0,
+                    ),
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                )
+            except BaseException as accounting_error:
+                raise accounting_error from operation_error
+            raise operation_error
+        self.grow_events += 1
+        return True
+
+    def _materialize_brokered_q4_arrays(
+        self,
+        *,
+        shape: tuple[int, int, int],
+    ) -> tuple[Any, Any, Any, Any]:
+        """Create and evaluate the exact plain-Q4 page ownership unit."""
+
         import mlx.core as mx
 
-        extra_blocks = int(grown_blocks) - int(self.num_blocks)
-        key_extra = mx.zeros(
-            (extra_blocks, *self.key_cache.shape[1:]),
-            dtype=self.key_cache.dtype,
+        from .kv_quant import packed_dim
+
+        n_kv_heads, k_head_dim, v_head_dim = shape
+        bits = int(self.kv_quant_config.bits)
+        key_cache = mx.zeros(
+            (
+                self.num_blocks,
+                self.block_size,
+                n_kv_heads,
+                packed_dim(k_head_dim, bits),
+            ),
+            dtype=mx.uint8,
         )
-        value_extra = mx.zeros(
-            (extra_blocks, *self.value_cache.shape[1:]),
-            dtype=self.value_cache.dtype,
+        value_cache = mx.zeros(
+            (
+                self.num_blocks,
+                self.block_size,
+                n_kv_heads,
+                packed_dim(v_head_dim, bits),
+            ),
+            dtype=mx.uint8,
         )
-        grown_arrays = [key_extra, value_extra]
-        self.key_cache = mx.concatenate([self.key_cache, key_extra], axis=0)
-        self.value_cache = mx.concatenate([self.value_cache, value_extra], axis=0)
-        grown_arrays.extend([self.key_cache, self.value_cache])
-        if self.key_scale_cache is not None:
-            extra = mx.zeros(
-                (extra_blocks, *self.key_scale_cache.shape[1:]),
-                dtype=self.key_scale_cache.dtype,
+        scale_shape = (self.num_blocks, self.block_size, n_kv_heads, 1)
+        key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+        value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+        mx.eval(
+            key_cache,
+            value_cache,
+            key_scale_cache,
+            value_scale_cache,
+        )
+        return key_cache, value_cache, key_scale_cache, value_scale_cache
+
+    def _ensure_brokered_q4_allocated(
+        self,
+        *,
+        shape: tuple[int, int, int],
+        dtypes: tuple[Any, Any],
+    ) -> None:
+        planned_physical = self._planned_capacity_bytes(
+            num_blocks=self.num_blocks,
+            shape=shape,
+            dtypes=dtypes,
+        )
+        ticket = self._reserve_physical_growth(
+            steady_delta_bytes=planned_physical,
+            transient_delta_bytes=0,
+        )
+        allocator_before = None
+        arrays = None
+        try:
+            allocator_before = self._sample_allocator_memory()
+            arrays = self._materialize_brokered_q4_arrays(shape=shape)
+            measured = sum(int(array.nbytes) for array in arrays)
+            if measured != planned_physical:
+                raise RuntimeError(
+                    "paged Q4 allocation geometry drifted from its reservation "
+                    f"({measured} observed, {planned_physical} planned)"
+                )
+            (
+                self.key_cache,
+                self.value_cache,
+                self.key_scale_cache,
+                self.value_scale_cache,
+            ) = arrays
+            arrays = None
+            self.key_zero_cache = None
+            self._shape = shape
+            self._dtypes = dtypes
+            allocator_after = self._sample_allocator_memory()
+            self._commit_physical_growth(
+                ticket,
+                measured,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
             )
-            self.key_scale_cache = mx.concatenate([self.key_scale_cache, extra], axis=0)
-            grown_arrays.extend([extra, self.key_scale_cache])
-        if self.value_scale_cache is not None:
-            extra = mx.zeros(
-                (extra_blocks, *self.value_scale_cache.shape[1:]),
-                dtype=self.value_scale_cache.dtype,
-            )
-            self.value_scale_cache = mx.concatenate([self.value_scale_cache, extra], axis=0)
-            grown_arrays.extend([extra, self.value_scale_cache])
-        if self.key_zero_cache is not None:
-            extra = mx.zeros(
-                (extra_blocks, *self.key_zero_cache.shape[1:]),
-                dtype=self.key_zero_cache.dtype,
-            )
-            self.key_zero_cache = mx.concatenate([self.key_zero_cache, extra], axis=0)
-            grown_arrays.extend([extra, self.key_zero_cache])
-        self.num_blocks = int(grown_blocks)
-        self.grow_events += 1
-        mx.eval(*grown_arrays)
-        return True
+        except BaseException as operation_error:
+            operation_error = operation_error.with_traceback(None)
+            arrays = None
+            self._drop_physical_arrays()
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+            try:
+                allocator_after = self._sample_allocator_memory()
+            except BaseException:
+                allocator_after = None
+            try:
+                self._abort_physical_growth(
+                    ticket,
+                    observed_physical_bytes=self._observed_retained_growth(
+                        allocator_before,
+                        allocator_after,
+                    ),
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                )
+            except BaseException as accounting_error:
+                raise accounting_error from operation_error
+            raise operation_error
 
     def _ensure_allocated(self, keys: Any, values: Any) -> None:
         import mlx.core as mx
 
+        if self._closed:
+            raise RuntimeError("paged KV cache is closed")
         if int(keys.shape[0]) != 1:
             raise ValueError("VllmMetalPagedKVCache currently supports batch size 1")
         shape = (int(keys.shape[1]), int(keys.shape[3]), int(values.shape[3]))
@@ -958,107 +1403,153 @@ class VllmMetalPagedKVCache:
         # install-time path already drops turboquant_config when ops are
         # missing, but downstream callers (e.g. snapshot restore) may still
         # construct a TurboQuant cache without going through that gate.
-        if self.turboquant and _load_vllm_metal_ops_optional(
-            context="TurboQuant cache allocation"
-        ) is None:
+        if (
+            self.turboquant
+            and _load_vllm_metal_ops_optional(context="TurboQuant cache allocation")
+            is None
+        ):
             self.turboquant = False
             self.turboquant_config = None
-        if self.turboquant:
-            from .turboquant import (
-                SCALE_GROUP_SIZE,
-                packed_dim,
-                value_centroids,
-                validate_head_dim,
-            )
+        if self.allocation_observer is not None:
+            self._ensure_brokered_q4_allocated(shape=shape, dtypes=dtypes)
+            return
+        planned_physical = self._planned_capacity_bytes(
+            num_blocks=self.num_blocks,
+            shape=shape,
+            dtypes=dtypes,
+        )
+        allocation_ticket = self._reserve_physical_growth(
+            steady_delta_bytes=planned_physical,
+            transient_delta_bytes=0,
+        )
+        allocator_before = self._sample_allocator_memory()
+        try:
+            if self.turboquant:
+                from .turboquant import (
+                    SCALE_GROUP_SIZE,
+                    packed_dim,
+                    value_centroids,
+                    validate_head_dim,
+                )
 
-            validate_head_dim(k_head_dim)
-            validate_head_dim(v_head_dim)
-            cfg = self.turboquant_config
-            key_dtype = mx.int8 if cfg.key_dtype_name == "int8" else mx.uint8
-            self.key_cache = mx.zeros(
-                (
+                validate_head_dim(k_head_dim)
+                validate_head_dim(v_head_dim)
+                cfg = self.turboquant_config
+                key_dtype = mx.int8 if cfg.key_dtype_name == "int8" else mx.uint8
+                self.key_cache = mx.zeros(
+                    (
+                        self.num_blocks,
+                        self.block_size,
+                        n_kv_heads,
+                        packed_dim(k_head_dim, int(cfg.key_bits)),
+                    ),
+                    dtype=key_dtype,
+                )
+                self.value_cache = mx.zeros(
+                    (
+                        self.num_blocks,
+                        self.block_size,
+                        n_kv_heads,
+                        packed_dim(v_head_dim, int(cfg.value_bits)),
+                    ),
+                    dtype=mx.uint8,
+                )
+                scale_shape = (
                     self.num_blocks,
                     self.block_size,
                     n_kv_heads,
-                    packed_dim(k_head_dim, int(cfg.key_bits)),
-                ),
-                dtype=key_dtype,
-            )
-            self.value_cache = mx.zeros(
-                (
-                    self.num_blocks,
-                    self.block_size,
-                    n_kv_heads,
-                    packed_dim(v_head_dim, int(cfg.value_bits)),
-                ),
-                dtype=mx.uint8,
-            )
-            scale_shape = (
-                self.num_blocks,
-                self.block_size,
-                n_kv_heads,
-                k_head_dim // SCALE_GROUP_SIZE,
-            )
-            self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
-            self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
-            self.key_zero_cache = mx.zeros(scale_shape, dtype=mx.float16)
-            self._turboquant_v_centroids = mx.array(
-                value_centroids(int(cfg.value_bits)), dtype=mx.float32
-            )
-            mx.eval(
-                self.key_cache,
-                self.value_cache,
-                self.key_scale_cache,
-                self.value_scale_cache,
-                self.key_zero_cache,
-                self._turboquant_v_centroids,
-            )
-        elif self.kv_quant:
-            from .kv_quant import packed_dim
+                    k_head_dim // SCALE_GROUP_SIZE,
+                )
+                self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+                self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+                self.key_zero_cache = mx.zeros(scale_shape, dtype=mx.float16)
+                self._turboquant_v_centroids = mx.array(
+                    value_centroids(int(cfg.value_bits)), dtype=mx.float32
+                )
+                mx.eval(
+                    self.key_cache,
+                    self.value_cache,
+                    self.key_scale_cache,
+                    self.value_scale_cache,
+                    self.key_zero_cache,
+                    self._turboquant_v_centroids,
+                )
+            elif self.kv_quant:
+                from .kv_quant import packed_dim
 
-            cfg = self.kv_quant_config
-            bits = int(cfg.bits)
-            cache_dtype = mx.int8 if bits == 8 else mx.uint8
-            self.key_cache = mx.zeros(
-                (
-                    self.num_blocks,
-                    self.block_size,
-                    n_kv_heads,
-                    packed_dim(k_head_dim, bits),
-                ),
-                dtype=cache_dtype,
+                cfg = self.kv_quant_config
+                bits = int(cfg.bits)
+                cache_dtype = mx.int8 if bits == 8 else mx.uint8
+                self.key_cache = mx.zeros(
+                    (
+                        self.num_blocks,
+                        self.block_size,
+                        n_kv_heads,
+                        packed_dim(k_head_dim, bits),
+                    ),
+                    dtype=cache_dtype,
+                )
+                self.value_cache = mx.zeros(
+                    (
+                        self.num_blocks,
+                        self.block_size,
+                        n_kv_heads,
+                        packed_dim(v_head_dim, bits),
+                    ),
+                    dtype=cache_dtype,
+                )
+                scale_shape = (self.num_blocks, self.block_size, n_kv_heads, 1)
+                self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+                self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+                self.key_zero_cache = None
+                mx.eval(
+                    self.key_cache,
+                    self.value_cache,
+                    self.key_scale_cache,
+                    self.value_scale_cache,
+                )
+            else:
+                self.key_cache = mx.zeros(
+                    (self.num_blocks, self.block_size, n_kv_heads, k_head_dim),
+                    dtype=keys.dtype,
+                )
+                self.value_cache = mx.zeros(
+                    (self.num_blocks, self.block_size, n_kv_heads, v_head_dim),
+                    dtype=values.dtype,
+                )
+                mx.eval(self.key_cache, self.value_cache)
+            self._shape = shape
+            self._dtypes = dtypes
+            allocator_after = self._sample_allocator_memory()
+            self._commit_physical_growth(
+                allocation_ticket,
+                self.nbytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
             )
-            self.value_cache = mx.zeros(
-                (
-                    self.num_blocks,
-                    self.block_size,
-                    n_kv_heads,
-                    packed_dim(v_head_dim, bits),
-                ),
-                dtype=cache_dtype,
-            )
-            scale_shape = (self.num_blocks, self.block_size, n_kv_heads, 1)
-            self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
-            self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
-            self.key_zero_cache = None
-            mx.eval(
-                self.key_cache,
-                self.value_cache,
-                self.key_scale_cache,
-                self.value_scale_cache,
-            )
-        else:
-            self.key_cache = mx.zeros(
-                (self.num_blocks, self.block_size, n_kv_heads, k_head_dim),
-                dtype=keys.dtype,
-            )
-            self.value_cache = mx.zeros(
-                (self.num_blocks, self.block_size, n_kv_heads, v_head_dim),
-                dtype=values.dtype,
-            )
-            mx.eval(self.key_cache, self.value_cache)
-        self._shape = shape
-        self._dtypes = dtypes
+        except BaseException:
+            self._drop_physical_arrays()
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
+            try:
+                allocator_after = self._sample_allocator_memory()
+            except BaseException:
+                allocator_after = None
+            try:
+                self._abort_physical_growth(
+                    allocation_ticket,
+                    observed_physical_bytes=self._observed_retained_growth(
+                        allocator_before,
+                        allocator_after,
+                    ),
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                )
+            except BaseException:
+                pass
+            raise
 
     def _write_tail(self, keys: Any, values: Any) -> None:
         import mlx.core as mx
@@ -1092,9 +1583,7 @@ class VllmMetalPagedKVCache:
                 # so it is safe to re-allocate.
                 if ops is not None and not hasattr(ops, "tq_encode"):
                     _warn_vllm_metal_ops_unavailable(
-                        RuntimeError(
-                            "local vLLM-Metal ops do not expose tq_encode"
-                        ),
+                        RuntimeError("local vLLM-Metal ops do not expose tq_encode"),
                         context="TurboQuant tq_encode",
                     )
                 self.turboquant = False
@@ -1143,7 +1632,9 @@ class VllmMetalPagedKVCache:
             )
         elif self.kv_quant:
             if self.key_scale_cache is None or self.value_scale_cache is None:
-                raise RuntimeError("paged KV quantization scale caches were not allocated")
+                raise RuntimeError(
+                    "paged KV quantization scale caches were not allocated"
+                )
             from .kv_quant import quantize_symmetric
 
             bits = int(self.kv_quant_config.bits)
@@ -1179,7 +1670,9 @@ class VllmMetalPagedKVCache:
             self.value_scale_cache = flat_vs.reshape(self.value_scale_cache.shape)
         else:
             flat_k = self.key_cache.reshape(-1, int(keys.shape[1]), int(keys.shape[3]))
-            flat_v = self.value_cache.reshape(-1, int(values.shape[1]), int(values.shape[3]))
+            flat_v = self.value_cache.reshape(
+                -1, int(values.shape[1]), int(values.shape[3])
+            )
             flat_k[slot_mapping] = k_3d
             flat_v[slot_mapping] = v_3d
             self.key_cache = flat_k.reshape(self.key_cache.shape)
@@ -1277,7 +1770,9 @@ class VllmMetalPagedKVCache:
         if _env_truthy("MTPLX_PAGED_ATTENTION_TRACE"):
             print(
                 "mtplx_paged_attention_bailout "
-                + " ".join(f"{k}={v}" for k, v in self.paged_attention_last_bailout.items()),
+                + " ".join(
+                    f"{k}={v}" for k, v in self.paged_attention_last_bailout.items()
+                ),
                 file=sys.stderr,
             )
 
@@ -1382,7 +1877,9 @@ class VllmMetalPagedKVCache:
                 bits=bits,
                 head_dim=int(self._shape[2]),
             ).astype(self._dtypes[1])
-        return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
+        return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[
+            None, ...
+        ]
 
     def _large_q_split_sdpa_fallback(
         self,
@@ -1458,8 +1955,12 @@ class VllmMetalPagedKVCache:
                 ),
                 dtype=mx.float32,
             )
-            for k_start in range(key_start, min(int(self.offset), max_key_for_chunk), kv_chunk_size):
-                k_end = min(int(self.offset), max_key_for_chunk, k_start + kv_chunk_size)
+            for k_start in range(
+                key_start, min(int(self.offset), max_key_for_chunk), kv_chunk_size
+            ):
+                k_end = min(
+                    int(self.offset), max_key_for_chunk, k_start + kv_chunk_size
+                )
                 if k_end <= k_start:
                     continue
                 keys, values = self._paged_range(k_start, k_end)
@@ -1579,7 +2080,9 @@ class VllmMetalPagedKVCache:
                 int(self.value_cache.shape[2]),
                 int(self.value_cache.shape[3]),
             )[: self.offset]
-            return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
+            return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[
+                None, ...
+            ]
         finally:
             self.active_array_time_s += time.perf_counter() - started
 
@@ -1657,6 +2160,69 @@ class VllmMetalPagedKVCache:
         self.num_blocks = int(value[1])
         self.offset = int(value[2])
 
+    def _drop_physical_arrays(self) -> None:
+        self.key_cache = None
+        self.value_cache = None
+        self.key_scale_cache = None
+        self.value_scale_cache = None
+        self.key_zero_cache = None
+        self._shape = None
+        self._dtypes = None
+        self.offset = 0
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        observer = self.allocation_observer
+        allocations = tuple(self._kv_allocations)
+        released = self._committed_physical_bytes
+        allocator_before = None
+        allocator_after = None
+        first_error: BaseException | None = None
+        if observer is not None and allocations:
+            try:
+                allocator_before = observer.sample_allocator_memory()
+            except BaseException as exc:
+                first_error = exc
+        self._drop_physical_arrays()
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if observer is not None and allocations:
+            try:
+                allocator_after = observer.sample_allocator_memory()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            try:
+                observer.release_cache(
+                    cache_id=self.cache_id,
+                    allocations=allocations,
+                    released_physical_bytes=released,
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                )
+            except BaseException as accounting_error:
+                if first_error is not None:
+                    raise accounting_error from first_error
+                raise
+            finally:
+                self._kv_allocations.clear()
+                self._committed_physical_bytes = 0
+        if first_error is not None:
+            raise first_error
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
     def is_trimmable(self) -> bool:
         return True
 
@@ -1693,7 +2259,9 @@ class VllmMetalPagedKVCache:
             return int(requested)
         return int(raw)
 
-    def _active_attention_arrays(self, sliding_window: int) -> tuple[Any | None, Any | None]:
+    def _active_attention_arrays(
+        self, sliding_window: int
+    ) -> tuple[Any | None, Any | None]:
         keys, values = self._active_arrays()
         if keys is None or values is None or int(sliding_window) <= 0:
             return keys, values
@@ -1712,7 +2280,11 @@ class VllmMetalPagedKVCache:
         import mlx.core as mx
 
         started = time.perf_counter()
-        q_len = int(queries.shape[2]) if hasattr(queries, "shape") and len(queries.shape) >= 3 else 0
+        q_len = (
+            int(queries.shape[2])
+            if hasattr(queries, "shape") and len(queries.shape) >= 3
+            else 0
+        )
         sliding_window = self._effective_sliding_window(sliding_window)
         impl_source = (
             impl_override
@@ -1720,7 +2292,9 @@ class VllmMetalPagedKVCache:
             else os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "")
         )
         impl = impl_source.strip().lower().replace("-", "_")
-        max_q_len = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "16") or "16")
+        max_q_len = int(
+            os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "16") or "16"
+        )
         partitioned_enabled = self._partitioned_attention_enabled()
         partition_threshold = self._partition_threshold()
 
@@ -1767,7 +2341,9 @@ class VllmMetalPagedKVCache:
                 else self.value_cache
             )
             q_3d = mx.contiguous(kernel_queries[0].transpose(1, 0, 2))
-            used_blocks = (int(self.offset) + int(self.block_size) - 1) // int(self.block_size)
+            used_blocks = (int(self.offset) + int(self.block_size) - 1) // int(
+                self.block_size
+            )
             if used_blocks <= 0:
                 return bailout("blocks_invalid")
             block_tables = mx.arange(used_blocks, dtype=mx.int32)[None, :]
@@ -1920,9 +2496,17 @@ class VllmMetalPagedKVCache:
             return bailout("batch_not_1")
         if q_len <= 0:
             return bailout("q_len_invalid")
-        if self.turboquant and impl in {"fast_sdpa_gather", "sdpa_gather", "exact_gather"}:
+        if self.turboquant and impl in {
+            "fast_sdpa_gather",
+            "sdpa_gather",
+            "exact_gather",
+        }:
             raise ValueError("TurboQuant cannot use exact-gather attention")
-        if not self.turboquant and impl in {"fast_sdpa_gather", "sdpa_gather", "exact_gather"}:
+        if not self.turboquant and impl in {
+            "fast_sdpa_gather",
+            "sdpa_gather",
+            "exact_gather",
+        }:
             from mlx_lm.models.base import scaled_dot_product_attention
 
             keys, values = self._active_attention_arrays(sliding_window)
@@ -1939,7 +2523,11 @@ class VllmMetalPagedKVCache:
             self.paged_attention_calls += 1
             self.attention_time_s += time.perf_counter() - started
             return out
-        if not self.turboquant and not self.kv_quant and impl in {"sdpa_2pass_paged", "mlx_vector_paged"}:
+        if (
+            not self.turboquant
+            and not self.kv_quant
+            and impl in {"sdpa_2pass_paged", "mlx_vector_paged"}
+        ):
             from .kernels.sdpa_2pass_paged import sdpa_2pass_paged_tail
 
             two_pass_threshold = int(
@@ -2001,7 +2589,7 @@ class VllmMetalPagedKVCache:
                                 f"path=paged_gqa_sdpa route={gqa_route} phase={phase} "
                                 f"offset={int(self.offset)} q_len={q_len}",
                                 file=sys.stderr,
-                        )
+                            )
                         return out
             else:
                 self._record_gqa_route_miss(
@@ -2080,7 +2668,11 @@ class VllmMetalPagedKVCache:
                     query_heads=int(queries.shape[1]),
                     kv_heads=int(self._shape[0]) if self._shape is not None else 0,
                 )
-            if q_len > max_q_len and partitioned_enabled and int(self.offset) >= partition_threshold:
+            if (
+                q_len > max_q_len
+                and partitioned_enabled
+                and int(self.offset) >= partition_threshold
+            ):
                 return run_partitioned_paged(force_fp32_paged=False)
             out = scaled_dot_product_attention(
                 queries,
@@ -2100,7 +2692,9 @@ class VllmMetalPagedKVCache:
             self.key_cache.astype(mx.float32) if force_fp32_paged else self.key_cache
         )
         kernel_value_cache = (
-            self.value_cache.astype(mx.float32) if force_fp32_paged else self.value_cache
+            self.value_cache.astype(mx.float32)
+            if force_fp32_paged
+            else self.value_cache
         )
         q_3d = mx.contiguous(kernel_queries[0].transpose(1, 0, 2))
         used_blocks = (self.offset + self.block_size - 1) // self.block_size
@@ -2214,9 +2808,7 @@ class VllmMetalPagedKVCache:
             "gqa_sdpa_route_misses_by_phase_reason": dict(
                 self.gqa_sdpa_route_misses_by_phase_reason
             ),
-            "gqa_sdpa_route_misses_by_q_len": dict(
-                self.gqa_sdpa_route_misses_by_q_len
-            ),
+            "gqa_sdpa_route_misses_by_q_len": dict(self.gqa_sdpa_route_misses_by_q_len),
             "gqa_sdpa_last_route_miss": dict(self.gqa_sdpa_last_route_miss),
             "active_array_calls": int(self.active_array_calls),
             "active_array_time_s": float(self.active_array_time_s),
@@ -2306,7 +2898,9 @@ class TensorOffsetVllmMetalPagedKVCache:
         self.cache = [
             key_cache,
             value_cache,
-            offset if isinstance(offset, mx.array) else mx.array(offset, dtype=mx.int32),
+            offset
+            if isinstance(offset, mx.array)
+            else mx.array(offset, dtype=mx.int32),
         ]
         self.rollback_state = [None, None, None]
         self.block_size = int(block_size)
@@ -2322,7 +2916,13 @@ class TensorOffsetVllmMetalPagedKVCache:
         self.attention_time_s = 0.0
 
     @classmethod
-    def from_paged_cache(cls, entry: VllmMetalPagedKVCache) -> "TensorOffsetVllmMetalPagedKVCache":
+    def from_paged_cache(
+        cls, entry: VllmMetalPagedKVCache
+    ) -> "TensorOffsetVllmMetalPagedKVCache":
+        if entry.allocation_observer is not None:
+            raise ValueError(
+                "cannot promote broker-owned paged KV cache to tensor-offset cache"
+            )
         if entry.key_cache is None or entry.value_cache is None:
             raise ValueError("cannot promote empty paged KV cache")
         return cls(
@@ -2357,7 +2957,9 @@ class TensorOffsetVllmMetalPagedKVCache:
     def offset(self, value) -> None:
         import mlx.core as mx
 
-        self.cache[2] = value if isinstance(value, mx.array) else mx.array(value, dtype=mx.int32)
+        self.cache[2] = (
+            value if isinstance(value, mx.array) else mx.array(value, dtype=mx.int32)
+        )
 
     @property
     def capacity(self) -> int:
@@ -2368,10 +2970,14 @@ class TensorOffsetVllmMetalPagedKVCache:
         return [self.cache, self.rollback_state]
 
     def _flat_key_cache(self):
-        return self.cache[0].reshape(-1, int(self.cache[0].shape[2]), int(self.cache[0].shape[3]))
+        return self.cache[0].reshape(
+            -1, int(self.cache[0].shape[2]), int(self.cache[0].shape[3])
+        )
 
     def _flat_value_cache(self):
-        return self.cache[1].reshape(-1, int(self.cache[1].shape[2]), int(self.cache[1].shape[3]))
+        return self.cache[1].reshape(
+            -1, int(self.cache[1].shape[2]), int(self.cache[1].shape[3])
+        )
 
     def update_without_fetch(self, keys: Any, values: Any) -> None:
         import mlx.core as mx
@@ -2444,7 +3050,9 @@ class TensorOffsetVllmMetalPagedKVCache:
             block_size=int(self.block_size),
             scale=float(scale),
             mask=mask,
-            max_q_len=int(os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "16") or "16"),
+            max_q_len=int(
+                os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "16") or "16"
+            ),
             max_offset=static_max_offset,
         )
         if out is not None:
@@ -2582,7 +3190,11 @@ class TensorOffsetVllmMetalPagedKVCache:
     def nbytes(self) -> int:
         if self.key_cache is None or self.value_cache is None:
             return 0
-        return int(self.key_cache.nbytes) + int(self.value_cache.nbytes) + int(self.cache[2].nbytes)
+        return (
+            int(self.key_cache.nbytes)
+            + int(self.value_cache.nbytes)
+            + int(self.cache[2].nbytes)
+        )
 
     def paged_stats(self) -> dict[str, int | float | str]:
         return {
@@ -2591,7 +3203,9 @@ class TensorOffsetVllmMetalPagedKVCache:
             "num_blocks": int(self.num_blocks),
             "capacity": int(self.capacity),
             "offset": int(self.size()),
-            "static_max_offset": int(self._static_attention_max_offset() or self.capacity),
+            "static_max_offset": int(
+                self._static_attention_max_offset() or self.capacity
+            ),
             "updates": int(self.update_calls),
             "paged_attention_calls": int(self.paged_attention_calls),
             "bytes": int(self.nbytes),
@@ -2777,7 +3391,9 @@ class OwnedRecurrentStateCache:
         return OwnedRecurrentStateCache(
             len(self.cache),
             mode=self.mode,
-            initial=[item[idx : idx + 1] if item is not None else None for item in self.cache],
+            initial=[
+                item[idx : idx + 1] if item is not None else None for item in self.cache
+            ],
             left_padding=(
                 self.left_padding[idx : idx + 1]
                 if self.left_padding is not None
@@ -2835,7 +3451,9 @@ class OwnedRecurrentStateCache:
         }
 
 
-def replace_recurrent_cache_state(entry: Any, state: list[Any] | tuple[Any, ...]) -> None:
+def replace_recurrent_cache_state(
+    entry: Any, state: list[Any] | tuple[Any, ...]
+) -> None:
     if hasattr(entry, "replace_state"):
         entry.replace_state(state)
         return
@@ -2892,7 +3510,9 @@ def configure_owned_recurrent_state_cache(cache: list[Any]) -> dict[str, int | s
     return install_owned_recurrent_state_cache(cache, mode=mode)
 
 
-def owned_recurrent_state_stats(cache: list[Any] | None) -> dict[str, int | float | str]:
+def owned_recurrent_state_stats(
+    cache: list[Any] | None,
+) -> dict[str, int | float | str]:
     aggregate: dict[str, int | float | str] = {
         "enabled": 0,
         "entries": 0,
@@ -2912,7 +3532,9 @@ def owned_recurrent_state_stats(cache: list[Any] | None) -> dict[str, int | floa
         aggregate["entries"] = int(aggregate["entries"]) + 1
         aggregate["updates"] = int(aggregate["updates"]) + int(stats["updates"])
         aggregate["arrays"] = int(aggregate["arrays"]) + int(stats["arrays"])
-        aggregate["allocations"] = int(aggregate["allocations"]) + int(stats["allocations"])
+        aggregate["allocations"] = int(aggregate["allocations"]) + int(
+            stats["allocations"]
+        )
         aggregate["inplace_updates"] = int(aggregate["inplace_updates"]) + int(
             stats["inplace_updates"]
         )
@@ -3015,6 +3637,8 @@ def install_vllm_metal_paged_attention_kv_cache(
     num_blocks: int = 1024,
     turboquant_config: Any | None = None,
     kv_quant_config: Any | None = None,
+    allocation_observer: KVPhysicalAllocationObserver | None = None,
+    cache_id_prefix: str = "kv",
 ) -> dict[str, int | str]:
     """Replace stock full-attention KV caches with vLLM-Metal paged caches."""
     fallback_kv_quant_config = kv_quant_config
@@ -3062,9 +3686,7 @@ def install_vllm_metal_paged_attention_kv_cache(
             _load_vllm_metal_ops()
         except RuntimeError as exc:
             if turboquant_config is not None:
-                _warn_vllm_metal_ops_unavailable(
-                    exc, context="TurboQuant install"
-                )
+                _warn_vllm_metal_ops_unavailable(exc, context="TurboQuant install")
                 turboquant_config = None
                 kv_quant_config = fallback_kv_quant_config
                 stats["mode"] = (
@@ -3092,12 +3714,20 @@ def install_vllm_metal_paged_attention_kv_cache(
             stats["skipped"] = int(stats["skipped"]) + 1
             continue
         if isinstance(entry, VllmMetalPagedKVCache):
+            if allocation_observer is not None and entry.key_cache is not None:
+                raise ValueError(
+                    "cannot attach physical KV accounting to an allocated cache"
+                )
             entry.block_size = int(block_size)
             entry.num_blocks = int(num_blocks)
             entry.turboquant_config = turboquant_config
             entry.turboquant = turboquant_config is not None
             entry.kv_quant_config = kv_quant_config
             entry.kv_quant = kv_quant_config is not None
+            entry.allocation_observer = allocation_observer
+            entry.cache_id = (
+                f"{cache_id_prefix}:{idx}" if allocation_observer is not None else ""
+            )
             stats["entries"] = int(stats["entries"]) + 1
             continue
         if isinstance(entry, TailOwnedKVCache):
@@ -3118,19 +3748,30 @@ def install_vllm_metal_paged_attention_kv_cache(
             num_blocks=num_blocks,
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config,
+            allocation_observer=allocation_observer,
+            cache_id=(
+                f"{cache_id_prefix}:{idx}" if allocation_observer is not None else None
+            ),
         )
         stats["entries"] = int(stats["entries"]) + 1
     return stats
 
 
-def configure_tail_owned_attention_kv_cache(cache: list[Any]) -> dict[str, int | str]:
+def configure_tail_owned_attention_kv_cache(
+    cache: list[Any],
+    *,
+    allocation_observer: KVPhysicalAllocationObserver | None = None,
+    cache_id_prefix: str = "target",
+) -> dict[str, int | str]:
     paged_raw = os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN") or ""
     if paged_raw.strip().lower() in {"1", "true", "yes", "on"}:
         from .kv_quant import config_from_env as kv_quant_config_from_env
         from .turboquant import config_from_env as turboquant_config_from_env
 
         block_size = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE") or "16")
-        configured_blocks = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS") or "1024")
+        configured_blocks = int(
+            os.environ.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS") or "1024"
+        )
         num_blocks = _dynamic_paged_num_blocks(
             block_size=block_size,
             configured_blocks=configured_blocks,
@@ -3142,7 +3783,11 @@ def configure_tail_owned_attention_kv_cache(cache: list[Any]) -> dict[str, int |
             num_blocks=num_blocks,
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config_from_env(),
+            allocation_observer=allocation_observer,
+            cache_id_prefix=cache_id_prefix,
         )
+    if allocation_observer is not None:
+        raise ValueError("physical KV brokering requires paged target attention")
     raw = os.environ.get("MTPLX_OWNED_ATTN_KV") or ""
     normalized = raw.strip().lower().replace("-", "_")
     if normalized not in {
@@ -3173,7 +3818,12 @@ def configure_tail_owned_attention_kv_cache(cache: list[Any]) -> dict[str, int |
     return install_tail_owned_attention_kv_cache(cache, mode=mode, step=step)
 
 
-def configure_mtp_attention_kv_cache(cache: list[Any]) -> dict[str, int | str]:
+def configure_mtp_attention_kv_cache(
+    cache: list[Any],
+    *,
+    allocation_observer: KVPhysicalAllocationObserver | None = None,
+    cache_id_prefix: str = "mtp",
+) -> dict[str, int | str]:
     """Optionally put the native MTP layer on the vLLM-Metal paged KV path.
 
     Trunk paged attention is controlled by ``MTPLX_VLLM_METAL_PAGED_ATTN``.
@@ -3183,7 +3833,11 @@ def configure_mtp_attention_kv_cache(cache: list[Any]) -> dict[str, int | str]:
 
     raw = os.environ.get("MTPLX_VLLM_METAL_PAGED_MTP_ATTN") or ""
     if raw.strip().lower() not in {"1", "true", "yes", "on"}:
+        if allocation_observer is not None:
+            raise ValueError("physical KV brokering requires paged MTP attention")
         return {"enabled": 0, "entries": 0, "skipped": 0, "mode": "disabled"}
+    from .kv_quant import config_from_env as kv_quant_config_from_env
+
     block_size = int(
         os.environ.get("MTPLX_VLLM_METAL_PAGED_MTP_BLOCK_SIZE")
         or os.environ.get("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE")
@@ -3203,6 +3857,9 @@ def configure_mtp_attention_kv_cache(cache: list[Any]) -> dict[str, int | str]:
         block_size=block_size,
         num_blocks=num_blocks,
         turboquant_config=None,
+        kv_quant_config=kv_quant_config_from_env(),
+        allocation_observer=allocation_observer,
+        cache_id_prefix=cache_id_prefix,
     )
     stats["mode"] = "vllm_metal_paged_mtp"
     return stats
@@ -3228,9 +3885,11 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
                 stats["paged_attention_calls"]
             )
             aggregate["bytes"] = int(aggregate["bytes"]) + int(stats["bytes"])
-            aggregate["time_s"] = float(aggregate["time_s"]) + float(
-                stats["cache_write_time_s"]
-            ) + float(stats["attention_time_s"])
+            aggregate["time_s"] = (
+                float(aggregate["time_s"])
+                + float(stats["cache_write_time_s"])
+                + float(stats["attention_time_s"])
+            )
             aggregate["mode"] = str(stats["mode"])
             aggregate["block_size"] = int(stats["block_size"])
             aggregate["num_blocks"] = int(stats["num_blocks"])
@@ -3244,9 +3903,9 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
             aggregate["kv_quant_attention_calls"] = int(
                 aggregate.get("kv_quant_attention_calls", 0)
             ) + int(stats.get("kv_quant_attention_calls", 0))
-            aggregate["gqa_sdpa_calls"] = int(
-                aggregate.get("gqa_sdpa_calls", 0)
-            ) + int(stats.get("gqa_sdpa_calls", 0))
+            aggregate["gqa_sdpa_calls"] = int(aggregate.get("gqa_sdpa_calls", 0)) + int(
+                stats.get("gqa_sdpa_calls", 0)
+            )
             aggregate["active_array_calls"] = int(
                 aggregate.get("active_array_calls", 0)
             ) + int(stats.get("active_array_calls", 0))
@@ -3297,22 +3956,26 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
                 aggregate["gqa_sdpa_last_route_miss"] = dict(last_gqa_miss)
             bailouts = stats.get("paged_attention_bailouts_by_phase_reason") or {}
             if isinstance(bailouts, dict):
-                merged = dict(aggregate.get("paged_attention_bailouts_by_phase_reason") or {})
+                merged = dict(
+                    aggregate.get("paged_attention_bailouts_by_phase_reason") or {}
+                )
                 for reason_key, count in bailouts.items():
-                    merged[str(reason_key)] = int(merged.get(str(reason_key), 0)) + int(count)
+                    merged[str(reason_key)] = int(merged.get(str(reason_key), 0)) + int(
+                        count
+                    )
                 aggregate["paged_attention_bailouts_by_phase_reason"] = merged
             large_q_path = str(stats.get("paged_attention_large_q_path") or "")
             if large_q_path:
                 aggregate["paged_attention_large_q_path"] = large_q_path
-            aggregate["grow_events"] = int(
-                aggregate.get("grow_events", 0)
-            ) + int(stats.get("grow_events", 0))
-            aggregate["turboquant"] = int(
-                aggregate.get("turboquant", 0)
-            ) or int(stats.get("turboquant", 0))
-            aggregate["kv_quant"] = int(
-                aggregate.get("kv_quant", 0)
-            ) or int(stats.get("kv_quant", 0))
+            aggregate["grow_events"] = int(aggregate.get("grow_events", 0)) + int(
+                stats.get("grow_events", 0)
+            )
+            aggregate["turboquant"] = int(aggregate.get("turboquant", 0)) or int(
+                stats.get("turboquant", 0)
+            )
+            aggregate["kv_quant"] = int(aggregate.get("kv_quant", 0)) or int(
+                stats.get("kv_quant", 0)
+            )
             if stats.get("turboquant_k_quant"):
                 aggregate["turboquant_k_quant"] = str(stats["turboquant_k_quant"])
             if stats.get("turboquant_v_quant"):
@@ -3435,7 +4098,9 @@ def restore_cache(
             entry.meta_state = _clone_tree(meta_state)
 
 
-def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool = True) -> None:
+def _restore_state_preserving_container(
+    entry: Any, state: Any, *, clone: bool = True
+) -> None:
     # Lazy (view-based) snapshots install their states as-is into trimmable KV
     # containers: those containers only rebind or setitem (both COW-safe with
     # a retained reference), so the snapshot cannot be mutated through them.
@@ -3446,13 +4111,19 @@ def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool =
         entry.replace_state(cloned)
         return
     current = getattr(entry, "state", None)
-    if isinstance(current, list) and isinstance(cloned, list) and len(current) == len(cloned):
+    if (
+        isinstance(current, list)
+        and isinstance(cloned, list)
+        and len(current) == len(cloned)
+    ):
         current[:] = cloned
         return
     entry.state = cloned
 
 
-def rollback_after_verify(cache: list[Any], snapshot: CacheSnapshot, verified_tokens: int) -> None:
+def rollback_after_verify(
+    cache: list[Any], snapshot: CacheSnapshot, verified_tokens: int
+) -> None:
     """Undo a speculative target verify pass."""
     for entry in cache:
         if _is_trimmable(entry) and hasattr(entry, "trim"):

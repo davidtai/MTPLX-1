@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -46,7 +46,9 @@ from .memory_broker import (
     BINARY_GIB,
     AllocatorMemorySample,
     BrokerSnapshot,
+    ExpertRegrowTicket,
     KVAllocationTicket,
+    KVPhysicalAllocation,
     MemoryAdmissionError,
     MemoryTelemetryError,
     UnifiedMemoryBroker,
@@ -1200,6 +1202,20 @@ class ExpertStreamingRuntime:
         self.memory_broker = memory_broker
         self._mx_module = mx_module
         self._dynamic_resize_lock = threading.RLock()
+        self._last_allocator_sample: AllocatorMemorySample | None = None
+        self._dynamic_resize_metrics = {
+            "reclaim_requests": 0,
+            "regrow_requests": 0,
+            "requested_reclaim_bytes": 0,
+            "reclaimed_bytes": 0,
+            "regrown_bytes": 0,
+            "resize_operations": 0,
+            "resize_failures": 0,
+            "blocked_by_pin_bytes": 0,
+            "last_resize_duration_ns": 0,
+            "total_resize_duration_ns": 0,
+            "max_resize_duration_ns": 0,
+        }
         self.counters = CacheCounters()
         self._layer_counters = {
             layer: CacheCounters() for layer in spec.routed_layer_indices
@@ -1265,6 +1281,58 @@ class ExpertStreamingRuntime:
         self._split_executor = ThreadPoolExecutor(
             max_workers=max(1, plan.transient_slots),
             thread_name_prefix="mtplx-route-miss",
+        )
+
+    @staticmethod
+    def _initialize_dynamic_memory_broker(
+        *,
+        config: Any,
+        spec: Any,
+        plan: Any,
+        slots: Any,
+        mx_module: Any | None,
+    ) -> UnifiedMemoryBroker:
+        """Build the additive physical-memory ledger for the dynamic Hy3 lane."""
+
+        telemetry = mlx_memory_telemetry(mx_module)
+        try:
+            allocator_cache_bytes = int(telemetry["cache_memory_bytes"])
+            slab_telemetry = slots.expert_slab_telemetry_snapshot()
+            slab_bytes = int(slab_telemetry["physical_bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ExpertStreamingConfigurationError(
+                "dynamic expert slabs require allocator and physical slab telemetry"
+            ) from exc
+        expected_slab_bytes = int(plan.persistent_slots) * int(spec.expert_record_bytes)
+        if slab_bytes <= 0 or slab_bytes != expected_slab_bytes:
+            raise ExpertStreamingConfigurationError(
+                "dynamic expert physical slab bytes do not match the planned layout"
+            )
+        initial_snapshot = BrokerSnapshot(
+            resident_model_bytes=int(plan.resident_bytes),
+            kv_physical_bytes=0,
+            expert_slab_physical_bytes=slab_bytes,
+            in_flight_expert_staging_bytes=(
+                int(plan.transient_bytes) + int(plan.io_staging_bytes)
+            ),
+            runtime_workspace_bytes=(
+                int(plan.runtime_reserve_bytes) + int(plan.execution_workspace_bytes)
+            ),
+            allocator_cache_bytes=allocator_cache_bytes,
+        )
+        if initial_snapshot.charged_bytes > 110 * BINARY_GIB:
+            raise ExpertStreamingConfigurationError(
+                "dynamic expert physical pools exceed the 110 GiB operating target"
+            )
+        return UnifiedMemoryBroker.standard_hy3(
+            initial_snapshot=initial_snapshot,
+            expert_slab_bytes=(
+                int(config.expert_slab_slots) * int(spec.expert_record_bytes)
+            ),
+            expert_regrow_hysteresis_slabs=(int(config.expert_regrow_hysteresis_slabs)),
+            expert_resize_min_interval_ns=(
+                int(config.expert_resize_min_interval_ms) * 1_000_000
+            ),
         )
 
     @classmethod
@@ -1342,42 +1410,18 @@ class ExpertStreamingRuntime:
             raise
         memory_broker = None
         if config.dynamic_expert_slabs:
-            telemetry = mlx_memory_telemetry(mx_module)
             try:
-                allocator_cache_bytes = int(telemetry["cache_memory_bytes"])
-            except (KeyError, TypeError, ValueError) as exc:
+                memory_broker = cls._initialize_dynamic_memory_broker(
+                    config=config,
+                    spec=model_spec,
+                    plan=plan,
+                    slots=slots,
+                    mx_module=mx_module,
+                )
+            except BaseException:
                 slots.close()
                 reader.close()
-                raise ExpertStreamingConfigurationError(
-                    "dynamic expert slabs require MLX allocator cache telemetry"
-                ) from exc
-            slab_bytes = int(slots.snapshot()["slabs"]["physical_bytes"])
-            workspace_budget = (
-                plan.runtime_reserve_bytes + plan.execution_workspace_bytes
-            )
-            initial_snapshot = BrokerSnapshot(
-                resident_model_bytes=plan.resident_bytes,
-                kv_physical_bytes=0,
-                expert_slab_physical_bytes=slab_bytes,
-                in_flight_expert_staging_bytes=(
-                    plan.transient_bytes + plan.io_staging_bytes
-                ),
-                runtime_workspace_bytes=max(
-                    0,
-                    workspace_budget - allocator_cache_bytes,
-                ),
-                allocator_cache_bytes=allocator_cache_bytes,
-            )
-            memory_broker = UnifiedMemoryBroker.standard_hy3(
-                initial_snapshot=initial_snapshot,
-                expert_slab_bytes=(
-                    config.expert_slab_slots * model_spec.expert_record_bytes
-                ),
-                expert_regrow_hysteresis_slabs=(config.expert_regrow_hysteresis_slabs),
-                expert_resize_min_interval_ns=(
-                    config.expert_resize_min_interval_ms * 1_000_000
-                ),
-            )
+                raise
         return cls(
             artifact_root,
             model_spec,
@@ -1472,6 +1516,7 @@ class ExpertStreamingRuntime:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
             raise ExpertSlotError("expert streaming runtime is closing")
+        expert_ids = self._regrow_for_route_demand(expert_ids)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -1510,6 +1555,32 @@ class ExpertStreamingRuntime:
             self._observe_plan(layer, route_plan)
             assert ready is not None
             return ready
+
+    def _regrow_for_route_demand(
+        self,
+        expert_ids: Iterable[int],
+    ) -> Iterable[int]:
+        """Restore one slab before planning when active capacity cannot cover top-k."""
+
+        broker = self.memory_broker
+        bank = self._global_bank
+        if broker is None or bank is None:
+            return expert_ids
+        required_fast = max(1, int(getattr(self.spec, "top_k", 1)))
+        if bank.active_capacity >= required_fast:
+            return expert_ids
+        normalized = tuple(expert_ids)
+        required = max(1, len(set(normalized)))
+        if bank.active_capacity >= required:
+            return normalized
+        released = self.slots.released_slab_ids()
+        if not released:
+            return normalized
+        layout = self.slots.slab_layout()
+        first_slab = layout[released[0]]
+        target_bytes = len(first_slab) * int(self.spec.expert_record_bytes)
+        self.maybe_regrow_expert_slabs(target_bytes=target_bytes)
+        return normalized
 
     def try_all_hit_route(
         self,
@@ -1869,6 +1940,7 @@ class ExpertStreamingRuntime:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
             raise ExpertSlotError("expert streaming runtime is closing")
+        expert_ids = self._regrow_for_route_demand(expert_ids)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -2020,7 +2092,7 @@ class ExpertStreamingRuntime:
     def _sample_allocator_memory(self) -> AllocatorMemorySample:
         telemetry = mlx_memory_telemetry(self._mx_module)
         try:
-            return AllocatorMemorySample(
+            sample = AllocatorMemorySample(
                 active_bytes=int(telemetry["active_memory_bytes"]),
                 cache_bytes=int(telemetry["cache_memory_bytes"]),
                 peak_bytes=int(telemetry["peak_memory_bytes"]),
@@ -2029,11 +2101,114 @@ class ExpertStreamingRuntime:
             raise MemoryTelemetryError(
                 "MLX allocator active/cache/peak telemetry is unavailable"
             ) from exc
+        self._last_allocator_sample = sample
+        return sample
+
+    def reconcile_post_load_memory(self) -> None:
+        """Replace startup estimates with measured post-injection physical truth."""
+
+        broker = self.memory_broker
+        if broker is None:
+            return
+        before = broker.snapshot()
+        sample = self._sample_allocator_memory()
+        expert_bytes = self._registered_expert_slab_bytes()
+        staging_bytes = int(self.plan.transient_bytes) + int(
+            getattr(self.plan, "io_staging_bytes", 0)
+        )
+        execution_workspace = int(self.plan.execution_workspace_bytes)
+        resident_bytes = max(
+            0,
+            int(sample.active_bytes) - expert_bytes - staging_bytes,
+        )
+        observed = BrokerSnapshot(
+            resident_model_bytes=resident_bytes,
+            kv_physical_bytes=before.kv_physical_bytes,
+            expert_slab_physical_bytes=expert_bytes,
+            in_flight_expert_staging_bytes=staging_bytes,
+            runtime_workspace_bytes=execution_workspace,
+            allocator_cache_bytes=sample.cache_bytes,
+            pinned_expert_bytes=min(before.pinned_expert_bytes, expert_bytes),
+            speculative_expert_bytes=min(
+                before.speculative_expert_bytes,
+                expert_bytes,
+            ),
+        )
+        broker.replace_snapshot(observed)
+        resident_growth = max(0, resident_bytes - before.resident_model_bytes)
+        runtime_reserve = max(
+            0,
+            before.runtime_workspace_bytes - execution_workspace,
+        )
+        if resident_growth > runtime_reserve:
+            raise ExpertStreamingConfigurationError(
+                "post-load resident growth exceeded the planned runtime reserve"
+            )
+
+    def dynamic_memory_telemetry_snapshot(
+        self,
+        *,
+        now_ns: int | None = None,
+    ) -> dict[str, int | bool | str | None]:
+        """Return bounded broker, slab, allocator, and resize telemetry."""
+
+        del now_ns
+        broker = self.memory_broker
+        if broker is None:
+            return {}
+        snapshot = broker.snapshot()
+        slabs = self.slots.expert_slab_telemetry_snapshot()
+        bank = self._global_bank
+        allocator = self._last_allocator_sample
+        metrics = dict(self._dynamic_resize_metrics)
+        return {
+            "operating_target_bytes": broker.budget.operating_target_bytes,
+            "hard_ceiling_bytes": broker.budget.hard_ceiling_bytes,
+            "charged_bytes": snapshot.charged_bytes,
+            "logical_expert_records": int(slabs["logical_slot_count"]),
+            "active_expert_records": int(
+                getattr(bank, "active_capacity", slabs["active_slot_count"])
+            ),
+            "resident_expert_records": int(getattr(bank, "occupancy", 0)),
+            "logical_slab_count": int(slabs["logical_slab_count"]),
+            "active_slab_count": int(slabs["active_slab_count"]),
+            "draining_slab_count": int(slabs["draining_slab_count"]),
+            "released_slab_count": int(slabs["released_slab_count"]),
+            "expert_slab_physical_bytes": snapshot.expert_slab_physical_bytes,
+            "pinned_expert_bytes": snapshot.pinned_expert_bytes,
+            "in_flight_expert_bytes": int(slabs["in_flight_bytes"]),
+            "speculative_expert_bytes": snapshot.speculative_expert_bytes,
+            "requested_reclaim_bytes": int(metrics["requested_reclaim_bytes"]),
+            "reclaimed_bytes": int(metrics["reclaimed_bytes"]),
+            "regrown_bytes": int(metrics["regrown_bytes"]),
+            "resize_duration_ns": int(metrics["last_resize_duration_ns"]),
+            "total_resize_duration_ns": int(metrics["total_resize_duration_ns"]),
+            "max_resize_duration_ns": int(metrics["max_resize_duration_ns"]),
+            "blocked_by_pin_bytes": int(metrics["blocked_by_pin_bytes"]),
+            "resize_operations": int(metrics["resize_operations"]),
+            "resize_failures": int(metrics["resize_failures"]),
+            "reclaim_requests": int(metrics["reclaim_requests"]),
+            "regrow_requests": int(metrics["regrow_requests"]),
+            "hysteresis_slabs": int(self.config.expert_regrow_hysteresis_slabs),
+            "minimum_resize_interval_ns": int(self.config.expert_resize_min_interval_ms)
+            * 1_000_000,
+            "allocator_active_bytes": (
+                None if allocator is None else allocator.active_bytes
+            ),
+            "allocator_cache_bytes": (
+                None if allocator is None else allocator.cache_bytes
+            ),
+            "allocator_peak_bytes": (
+                None if allocator is None else allocator.peak_bytes
+            ),
+            "failed_closed": snapshot.failed_closed,
+            "failure_reason": snapshot.failure_reason,
+        }
 
     def _registered_expert_slab_bytes(self) -> int:
-        snapshot = self.slots.snapshot()
+        snapshot = self.slots.expert_slab_telemetry_snapshot()
         try:
-            return int(snapshot["slabs"]["physical_bytes"])
+            return int(snapshot["physical_bytes"])
         except (KeyError, TypeError, ValueError) as exc:
             raise MemoryTelemetryError(
                 "expert slab physical-byte telemetry is unavailable"
@@ -2043,6 +2218,160 @@ class ExpertStreamingRuntime:
         locks = getattr(self, "_layer_locks", {})
         route_lock = next(iter(locks.values()), None)
         return nullcontext() if route_lock is None else route_lock
+
+    def _terminalize_resize_with_physical_truth(
+        self,
+        ticket: KVAllocationTicket | ExpertRegrowTicket,
+        *,
+        expert_slab_physical_bytes: int,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
+        reason: str,
+    ) -> None:
+        """Consume only the interrupted resize while preserving KV owners."""
+
+        broker = self.memory_broker
+        if broker is None:
+            return
+        broker.terminalize_expert_resize(
+            ticket,
+            registered_slab_bytes_after=max(0, int(expert_slab_physical_bytes)),
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+            reason=reason,
+        )
+
+    @contextmanager
+    def _track_dynamic_resize(self, kind: str, requested_bytes: int):
+        metrics = self._dynamic_resize_metrics
+        request_key = "reclaim_requests" if kind == "reclaim" else "regrow_requests"
+        metrics[request_key] = int(metrics.get(request_key, 0)) + 1
+        if kind == "reclaim":
+            metrics["requested_reclaim_bytes"] = int(
+                metrics.get("requested_reclaim_bytes", 0)
+            ) + int(requested_bytes)
+        started = time.monotonic_ns()
+        try:
+            yield metrics
+        except BaseException:
+            metrics["resize_failures"] = int(metrics.get("resize_failures", 0)) + 1
+            raise
+        finally:
+            duration = max(0, time.monotonic_ns() - started)
+            metrics["last_resize_duration_ns"] = duration
+            metrics["total_resize_duration_ns"] = (
+                int(metrics.get("total_resize_duration_ns", 0)) + duration
+            )
+            metrics["max_resize_duration_ns"] = max(
+                int(metrics.get("max_resize_duration_ns", 0)),
+                duration,
+            )
+
+    def reserve_growth(
+        self,
+        *,
+        cache_id: str,
+        steady_delta_bytes: int,
+        transient_delta_bytes: int,
+    ) -> KVAllocationTicket:
+        """Reserve physical Q4 KV growth and reclaim expert slabs if required."""
+
+        broker = self.memory_broker
+        if broker is None:
+            raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        ticket = broker.plan_kv_growth(
+            cache_id=cache_id,
+            steady_delta_bytes=steady_delta_bytes,
+            transient_delta_bytes=transient_delta_bytes,
+        )
+        try:
+            if ticket.required_expert_reclaim_bytes:
+                self.reclaim_expert_bytes(ticket)
+        except BaseException:
+            try:
+                broker.abort_kv_growth(ticket, observed_kv_delta_bytes=0)
+            except BaseException:
+                pass
+            raise
+        return ticket
+
+    def commit_growth(
+        self,
+        ticket: KVAllocationTicket,
+        *,
+        measured_physical_bytes: int,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
+    ) -> KVPhysicalAllocation:
+        broker = self.memory_broker
+        if broker is None:
+            raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        allocation = broker.commit_kv_growth(
+            ticket,
+            allocated_physical_bytes=measured_physical_bytes,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+        return allocation
+
+    def abort_growth(
+        self,
+        ticket: KVAllocationTicket,
+        *,
+        observed_physical_bytes: int | None,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
+    ) -> None:
+        broker = self.memory_broker
+        if broker is None:
+            raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        observed_kv_bytes = observed_physical_bytes
+        if (
+            observed_kv_bytes is not None
+            and allocator_before is not None
+            and allocator_after is not None
+        ):
+            cache_growth = max(
+                0,
+                allocator_after.cache_bytes - allocator_before.cache_bytes,
+            )
+            observed_kv_bytes = max(0, observed_kv_bytes - cache_growth)
+        broker.abort_kv_growth(
+            ticket,
+            observed_kv_delta_bytes=observed_kv_bytes,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+
+    def sample_allocator_memory(self) -> AllocatorMemorySample:
+        return self._sample_allocator_memory()
+
+    def release_cache(
+        self,
+        *,
+        cache_id: str,
+        allocations: tuple[KVPhysicalAllocation, ...],
+        released_physical_bytes: int,
+        allocator_before: AllocatorMemorySample,
+        allocator_after: AllocatorMemorySample,
+    ) -> None:
+        """Reconcile an exact cache-owner release, then opportunistically regrow."""
+
+        broker = self.memory_broker
+        if broker is None:
+            raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        registered_after = int(broker.snapshot().kv_physical_bytes) - int(
+            released_physical_bytes
+        )
+        broker.release_kv_batch(
+            cache_id=cache_id,
+            allocations=allocations,
+            registered_kv_bytes_after=registered_after,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+        if released_physical_bytes:
+            self.maybe_regrow_expert_slabs(target_bytes=released_physical_bytes)
 
     def reclaim_expert_bytes(
         self,
@@ -2060,12 +2389,20 @@ class ExpertStreamingRuntime:
         if requested <= 0:
             return ExpertSlabReclaimResult((), (), 0)
         observed_at = time.monotonic_ns() if now_ns is None else int(now_ns)
-        with self._dynamic_resize_lock, self._route_resize_context():
+        with (
+            self._track_dynamic_resize("reclaim", requested) as resize_metrics,
+            self._dynamic_resize_lock,
+            self._route_resize_context(),
+        ):
+            registered_before = int(broker.snapshot().expert_slab_physical_bytes)
             candidates = self._global_bank.rank_reclaim_slabs(
                 self.slots.slab_layout(),
                 self.slots.protected_slot_ids(),
             )
             if not candidates:
+                resize_metrics["blocked_by_pin_bytes"] = (
+                    int(resize_metrics.get("blocked_by_pin_bytes", 0)) + requested
+                )
                 raise MemoryAdmissionError(
                     "no unprotected expert slab is available for reclaim"
                 )
@@ -2081,25 +2418,62 @@ class ExpertStreamingRuntime:
                 result = exc.result
                 if result.released_slot_ids:
                     self._global_bank.deactivate_slots(result.released_slot_ids)
-                    allocator_after = self._sample_allocator_memory()
-                    broker.confirm_expert_reclaim(
-                        ticket,
-                        registered_slab_bytes_after=(
-                            self._registered_expert_slab_bytes()
-                        ),
-                        allocator_before=allocator_before,
-                        allocator_after=allocator_after,
-                        now_ns=observed_at,
-                    )
+                registered_after = max(
+                    0,
+                    registered_before - int(result.physical_bytes),
+                )
+                allocator_after = None
+                if result.physical_bytes:
+                    try:
+                        allocator_after = self._sample_allocator_memory()
+                    except BaseException:
+                        allocator_after = None
+                self._terminalize_resize_with_physical_truth(
+                    ticket,
+                    expert_slab_physical_bytes=registered_after,
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                    reason=str(exc),
+                )
                 raise
             self._global_bank.deactivate_slots(result.released_slot_ids)
-            allocator_after = self._sample_allocator_memory()
+            derived_registered_after = max(
+                0,
+                registered_before - int(result.physical_bytes),
+            )
+            try:
+                allocator_after = self._sample_allocator_memory()
+            except BaseException as exc:
+                self._terminalize_resize_with_physical_truth(
+                    ticket,
+                    expert_slab_physical_bytes=derived_registered_after,
+                    allocator_before=allocator_before,
+                    reason=str(exc),
+                )
+                raise
+            try:
+                registered_after = self._registered_expert_slab_bytes()
+            except BaseException as exc:
+                self._terminalize_resize_with_physical_truth(
+                    ticket,
+                    expert_slab_physical_bytes=derived_registered_after,
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                    reason=str(exc),
+                )
+                raise
             broker.confirm_expert_reclaim(
                 ticket,
-                registered_slab_bytes_after=self._registered_expert_slab_bytes(),
+                registered_slab_bytes_after=registered_after,
                 allocator_before=allocator_before,
                 allocator_after=allocator_after,
                 now_ns=observed_at,
+            )
+            resize_metrics["reclaimed_bytes"] = int(
+                resize_metrics.get("reclaimed_bytes", 0)
+            ) + int(result.physical_bytes)
+            resize_metrics["resize_operations"] = (
+                int(resize_metrics.get("resize_operations", 0)) + 1
             )
             return result
 
@@ -2115,7 +2489,11 @@ class ExpertStreamingRuntime:
         if broker is None or self._global_bank is None:
             return 0
         observed_at = time.monotonic_ns() if now_ns is None else int(now_ns)
-        with self._dynamic_resize_lock, self._route_resize_context():
+        with (
+            self._track_dynamic_resize("regrow", int(target_bytes)) as resize_metrics,
+            self._dynamic_resize_lock,
+            self._route_resize_context(),
+        ):
             ticket = broker.plan_expert_regrow(
                 target_bytes=target_bytes,
                 now_ns=observed_at,
@@ -2130,27 +2508,33 @@ class ExpertStreamingRuntime:
                 )
             registered_before = self._registered_expert_slab_bytes()
             allocator_before = self._sample_allocator_memory()
+            completed_slab_ids: list[int] = []
             try:
                 for slab_id in slab_ids:
                     self.slots.regrow_slab(slab_id)
-                registered_after = self._registered_expert_slab_bytes()
-                allocator_after = self._sample_allocator_memory()
-                broker.confirm_expert_regrow(
-                    ticket,
-                    registered_slab_bytes_after=registered_after,
-                    allocator_before=allocator_before,
-                    allocator_after=allocator_after,
-                    now_ns=observed_at,
-                )
+                    completed_slab_ids.append(slab_id)
             except BaseException as allocation_error:
-                registered_after = self._registered_expert_slab_bytes()
+                registered_after = registered_before + sum(
+                    len(self.slots.slot_ids_for_slab(slab_id))
+                    * int(self.spec.expert_record_bytes)
+                    for slab_id in completed_slab_ids
+                )
                 if registered_after == registered_before:
                     try:
                         broker.abort_expert_regrow(ticket)
                     except BaseException:
                         pass
                 else:
-                    allocator_after = self._sample_allocator_memory()
+                    try:
+                        allocator_after = self._sample_allocator_memory()
+                    except BaseException as telemetry_error:
+                        self._terminalize_resize_with_physical_truth(
+                            ticket,
+                            expert_slab_physical_bytes=registered_after,
+                            allocator_before=allocator_before,
+                            reason=str(telemetry_error),
+                        )
+                        raise telemetry_error from allocation_error
                     try:
                         broker.confirm_expert_regrow(
                             ticket,
@@ -2162,8 +2546,46 @@ class ExpertStreamingRuntime:
                     except BaseException as accounting_error:
                         raise accounting_error from allocation_error
                 raise
+            derived_registered_after = registered_before + sum(
+                len(self.slots.slot_ids_for_slab(slab_id))
+                * int(self.spec.expert_record_bytes)
+                for slab_id in completed_slab_ids
+            )
+            try:
+                registered_after = self._registered_expert_slab_bytes()
+            except BaseException as exc:
+                self._terminalize_resize_with_physical_truth(
+                    ticket,
+                    expert_slab_physical_bytes=derived_registered_after,
+                    allocator_before=allocator_before,
+                    reason=str(exc),
+                )
+                raise
+            try:
+                allocator_after = self._sample_allocator_memory()
+            except BaseException as exc:
+                self._terminalize_resize_with_physical_truth(
+                    ticket,
+                    expert_slab_physical_bytes=registered_after,
+                    allocator_before=allocator_before,
+                    reason=str(exc),
+                )
+                raise
+            broker.confirm_expert_regrow(
+                ticket,
+                registered_slab_bytes_after=registered_after,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+                now_ns=observed_at,
+            )
             for slab_id in slab_ids:
                 self._global_bank.activate_slots(self.slots.slot_ids_for_slab(slab_id))
+            resize_metrics["regrown_bytes"] = int(
+                resize_metrics.get("regrown_bytes", 0)
+            ) + int(ticket.planned_physical_bytes)
+            resize_metrics["resize_operations"] = (
+                int(resize_metrics.get("resize_operations", 0)) + 1
+            )
             return len(slab_ids)
 
     def route_waves(
@@ -2336,6 +2758,7 @@ class ExpertStreamingRuntime:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         if self.memory_broker is not None:
             snapshot["memory_broker"] = asdict(self.memory_broker.snapshot())
+            snapshot["dynamic_memory"] = self.dynamic_memory_telemetry_snapshot()
         self._raise_if_unhealthy()
         return snapshot
 
@@ -2378,6 +2801,7 @@ class ExpertStreamingRuntime:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         if self.memory_broker is not None:
             snapshot["memory_broker"] = asdict(self.memory_broker.snapshot())
+            snapshot["dynamic_memory"] = self.dynamic_memory_telemetry_snapshot()
         return snapshot
 
     def close(self, *, timeout: float | None = None) -> None:

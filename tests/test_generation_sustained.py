@@ -146,6 +146,34 @@ class OffsetCache:
         return n
 
 
+class CloseablePhysicalCache:
+    allocation_observer = object()
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class CloseableTinyModel(TinyModel):
+    def __init__(self, *, fail_after_calls: int | None = None) -> None:
+        super().__init__()
+        self.cache_entry = CloseablePhysicalCache()
+        self.fail_after_calls = fail_after_calls
+
+    def make_cache(self):
+        return [self.cache_entry]
+
+    def __call__(self, *args, **kwargs):
+        if (
+            self.fail_after_calls is not None
+            and len(self.calls) >= self.fail_after_calls
+        ):
+            raise RuntimeError("injected generation failure")
+        return super().__call__(*args, **kwargs)
+
+
 class RejectingTinyMTPModel(AcceptingTinyMTPModel):
     def __init__(self):
         super().__init__()
@@ -216,6 +244,26 @@ def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
     assert os.environ["MTPLX_VLLM_METAL_PAGED_ATTN"] == "1"
     assert os.environ["MTPLX_OWNED_ATTN_KV"] == "1"
     assert os.environ["MTPLX_BLOCK_OWNED_ATTN_KV"] == "1"
+
+
+def test_dynamic_broker_prefill_keeps_paged_q4_enabled_from_cache_creation(
+    monkeypatch,
+):
+    events: list[str | None] = []
+
+    class Runtime:
+        expert_streaming = SimpleNamespace(memory_broker=object())
+
+        def make_cache(self):
+            events.append(os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN"))
+            return []
+
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_then_repage")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+
+    _make_target_prefill_cache(Runtime())
+
+    assert events == ["1"]
 
 
 def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
@@ -366,7 +414,9 @@ def test_auto_sustained_prefill_policy_keeps_dense_decode_through_128k(monkeypat
     assert _clear_cache_every() == 0
 
 
-def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(monkeypatch):
+def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(
+    monkeypatch,
+):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
     monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "131072")
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "65536")
@@ -443,6 +493,54 @@ def test_generate_ar_does_not_request_hidden_by_default(monkeypatch):
     )
     assert out.stats.end_to_end_tok_s <= out.stats.decode_tok_s
     assert all(call["return_hidden"] is False for call in model.calls)
+
+
+def test_generate_ar_closes_physical_kv_cache_on_success() -> None:
+    model = CloseableTinyModel()
+
+    generate_ar(
+        _runtime(model, mtp_enabled=False),
+        [0],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+    )
+
+    assert model.cache_entry.close_calls == 1
+
+
+def test_generate_ar_closes_physical_kv_cache_on_forward_error() -> None:
+    model = CloseableTinyModel(fail_after_calls=1)
+
+    with pytest.raises(RuntimeError, match="injected generation failure"):
+        generate_ar(
+            _runtime(model, mtp_enabled=False),
+            [0],
+            max_tokens=2,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            stop_token_ids=set(),
+        )
+
+    assert model.cache_entry.close_calls == 1
+
+
+def test_generate_ar_closes_physical_kv_cache_when_callback_cancels() -> None:
+    model = CloseableTinyModel()
+
+    def cancel(_tokens):
+        raise RuntimeError("cancelled")
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        generate_ar(
+            _runtime(model, mtp_enabled=False),
+            [0],
+            max_tokens=2,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            stop_token_ids=set(),
+            token_callback=cancel,
+        )
+
+    assert model.cache_entry.close_calls == 1
 
 
 def test_lazy_bonus_verify_shortens_full_accept_verify_input(monkeypatch):

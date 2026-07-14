@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import pytest
 
@@ -111,7 +113,9 @@ class TrimmableDummyCache:
 
     @state.setter
     def state(self, value):
-        raise AssertionError("trimmable cache should not be restored by state assignment")
+        raise AssertionError(
+            "trimmable cache should not be restored by state assignment"
+        )
 
     @property
     def meta_state(self):
@@ -501,7 +505,9 @@ def test_vllm_metal_paged_kv_cache_matches_stock_kv_cache_updates_and_trim():
     assert paged_v.tolist() == stock_v.tolist()
 
 
-def test_install_vllm_metal_paged_attention_kv_cache_replaces_stock_kv_only(monkeypatch):
+def test_install_vllm_metal_paged_attention_kv_cache_replaces_stock_kv_only(
+    monkeypatch,
+):
     from mlx_lm.models.cache import KVCache
 
     monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", lambda: object())
@@ -809,7 +815,9 @@ def test_configure_vllm_metal_paged_cache_mlx_vector_is_packaged(monkeypatch):
     def fail_if_external_ops_loads():
         raise AssertionError("mlx_vector_paged should not require vllm-metal checkout")
 
-    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads)
+    monkeypatch.setattr(
+        "mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads
+    )
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
     cache = [KVCache()]
@@ -852,7 +860,9 @@ def test_configure_vllm_metal_paged_cache_can_enable_plain_q8_kv_quant(monkeypat
     def fail_if_external_ops_loads():
         raise AssertionError("plain q8 paged KV must not require TurboQuant ops")
 
-    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads)
+    monkeypatch.setattr(
+        "mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads
+    )
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", "q8")
     cache = [KVCache()]
@@ -897,8 +907,12 @@ def test_vllm_metal_paged_q8_kv_quant_roundtrips_active_state():
     assert quant_capacity_bytes < plain_capacity_bytes
     assert restored_keys.shape == keys.shape
     assert restored_values.shape == values.shape
-    key_diff = mx.max(mx.abs(restored_keys.astype(mx.float32) - keys.astype(mx.float32)))
-    value_diff = mx.max(mx.abs(restored_values.astype(mx.float32) - values.astype(mx.float32)))
+    key_diff = mx.max(
+        mx.abs(restored_keys.astype(mx.float32) - keys.astype(mx.float32))
+    )
+    value_diff = mx.max(
+        mx.abs(restored_values.astype(mx.float32) - values.astype(mx.float32))
+    )
     mx.eval(key_diff, value_diff)
     assert float(key_diff.item()) <= 2e-2
     assert float(value_diff.item()) <= 2e-2
@@ -936,14 +950,413 @@ def test_vllm_metal_paged_q4_kv_quant_roundtrips_active_state():
         + cache.value_scale_cache.nbytes
     )
     assert quant_capacity_bytes < plain_capacity_bytes
-    key_diff = mx.max(mx.abs(restored_keys.astype(mx.float32) - keys.astype(mx.float32)))
-    value_diff = mx.max(mx.abs(restored_values.astype(mx.float32) - values.astype(mx.float32)))
+    key_diff = mx.max(
+        mx.abs(restored_keys.astype(mx.float32) - keys.astype(mx.float32))
+    )
+    value_diff = mx.max(
+        mx.abs(restored_values.astype(mx.float32) - values.astype(mx.float32))
+    )
     mx.eval(key_diff, value_diff)
     assert float(key_diff.item()) <= 0.25
     assert float(value_diff.item()) <= 0.25
 
 
-def test_vllm_metal_paged_q8_kv_quant_attention_matches_stock_with_tolerance(monkeypatch):
+class _KVAllocationObserver:
+    def __init__(self, *, allocator_samples=None) -> None:
+        self.reservations: list[tuple[str, int, int]] = []
+        self.commits: list[tuple[object, int, object, object]] = []
+        self.aborts: list[tuple[object, int | None, object, object]] = []
+        self.releases: list[tuple[str, tuple[object, ...], int]] = []
+        self.release_samples: list[tuple[object, object]] = []
+        self.events: list[str] = []
+        self.allocator_samples = list(allocator_samples or [])
+        self._ticket = 0
+
+    def reserve_growth(
+        self,
+        *,
+        cache_id: str,
+        steady_delta_bytes: int,
+        transient_delta_bytes: int,
+    ):
+        self.events.append("reserve")
+        self.reservations.append((cache_id, steady_delta_bytes, transient_delta_bytes))
+        self._ticket += 1
+        return SimpleNamespace(ticket_id=self._ticket, cache_id=cache_id)
+
+    def commit_growth(
+        self,
+        ticket,
+        *,
+        measured_physical_bytes: int,
+        allocator_before,
+        allocator_after,
+    ):
+        self.events.append("commit")
+        self.commits.append(
+            (ticket, measured_physical_bytes, allocator_before, allocator_after)
+        )
+        return SimpleNamespace(
+            allocation_id=ticket.ticket_id,
+            cache_id=ticket.cache_id,
+            physical_bytes=measured_physical_bytes,
+        )
+
+    def abort_growth(
+        self,
+        ticket,
+        *,
+        observed_physical_bytes: int | None,
+        allocator_before,
+        allocator_after,
+    ) -> None:
+        self.events.append("abort")
+        self.aborts.append(
+            (ticket, observed_physical_bytes, allocator_before, allocator_after)
+        )
+
+    def sample_allocator_memory(self):
+        self.events.append("sample")
+        if self.allocator_samples:
+            sample = self.allocator_samples.pop(0)
+            if isinstance(sample, BaseException):
+                raise sample
+            return sample
+        return SimpleNamespace(active_bytes=0, cache_bytes=0, peak_bytes=0)
+
+    def release_cache(
+        self,
+        *,
+        cache_id: str,
+        allocations,
+        released_physical_bytes: int,
+        allocator_before,
+        allocator_after,
+    ) -> None:
+        self.release_samples.append((allocator_before, allocator_after))
+        self.releases.append((cache_id, tuple(allocations), released_physical_bytes))
+
+
+def test_q4_physical_allocation_is_reserved_and_committed_exactly() -> None:
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=4,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    keys = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    cache.update_without_fetch(keys, values)
+
+    assert cache.nbytes == 640
+    assert cache.key_cache.nbytes == 256
+    assert cache.value_cache.nbytes == 256
+    assert cache.key_scale_cache.nbytes == 64
+    assert cache.value_scale_cache.nbytes == 64
+    assert observer.reservations == [("target:0", 640, 0)]
+    assert len(observer.commits) == 1
+    assert observer.commits[0][1] == 640
+    assert observer.events == ["reserve", "sample", "sample", "commit"]
+
+
+def test_q4_initial_allocation_failure_aborts_ticket_and_drops_arrays() -> None:
+    class FailingCommitObserver(_KVAllocationObserver):
+        def commit_growth(
+            self,
+            ticket,
+            *,
+            measured_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ):
+            super().commit_growth(
+                ticket,
+                measured_physical_bytes=measured_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+            raise RuntimeError("commit failed")
+
+    observer = FailingCommitObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        cache.update_without_fetch(values, values)
+
+    assert len(observer.aborts) == 1
+    assert observer.aborts[0][1] == 0
+    assert observer.aborts[0][2] is not None
+    assert observer.aborts[0][3] is not None
+    assert cache.nbytes == 0
+
+
+def test_q4_growth_reserves_steady_delta_and_full_concatenate_peak(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    first = mx.zeros((1, 2, 4, 16), dtype=mx.float16)
+    one = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    cache.update_without_fetch(first, first)
+    cache.update_without_fetch(one, one)
+
+    assert cache.num_blocks == 2
+    assert cache.nbytes == 320
+    assert observer.reservations == [
+        ("target:0", 160, 0),
+        ("target:0", 160, 320),
+    ]
+    assert [measured for _ticket, measured, _before, _after in observer.commits] == [
+        160,
+        160,
+    ]
+
+
+def test_q4_growth_uses_ceil_one_point_five_capacity(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=4,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    initial = mx.zeros((1, 2, 16, 16), dtype=mx.float16)
+    one = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    cache.update_without_fetch(initial, initial)
+    cache.update_without_fetch(one, one)
+
+    assert cache.num_blocks == 6
+    assert cache.nbytes == 960
+    assert observer.reservations[-1] == ("target:0", 320, 960)
+
+
+def test_q4_reservation_precedes_every_physical_allocation(monkeypatch) -> None:
+    class RejectingObserver(_KVAllocationObserver):
+        def reserve_growth(self, **kwargs):
+            super().reserve_growth(**kwargs)
+            raise RuntimeError("expert reclaim shortfall")
+
+    observer = RejectingObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.array([[[[0.0] * 16] * 2]], dtype=mx.float16)
+    original_zeros = mx.zeros
+
+    def record_zeros(*args, **kwargs):
+        observer.events.append("zeros")
+        return original_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "zeros", record_zeros)
+
+    with pytest.raises(RuntimeError, match="expert reclaim shortfall"):
+        cache.update_without_fetch(values, values)
+
+    assert observer.events == ["reserve"]
+    assert cache.nbytes == 0
+    assert observer.commits == []
+    assert observer.aborts == []
+
+
+def test_q4_growth_reserves_before_zeros_and_commits_after_eval(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    first = mx.zeros((1, 2, 4, 16), dtype=mx.float16)
+    one = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(first, first)
+    observer.events.clear()
+    original_zeros = mx.zeros
+    original_eval = mx.eval
+
+    def record_zeros(*args, **kwargs):
+        observer.events.append("zeros")
+        return original_zeros(*args, **kwargs)
+
+    def record_eval(*args, **kwargs):
+        observer.events.append("eval")
+        return original_eval(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "zeros", record_zeros)
+    monkeypatch.setattr(mx, "eval", record_eval)
+
+    cache.update_without_fetch(one, one)
+
+    assert observer.events[0:2] == ["reserve", "sample"]
+    assert observer.events.index("zeros") > observer.events.index("reserve")
+    assert observer.events.index("commit") > observer.events.index("eval")
+
+
+def test_q4_retained_allocator_cache_on_commit_failure_is_not_reported_zero() -> None:
+    before = SimpleNamespace(active_bytes=0, cache_bytes=0, peak_bytes=0)
+    after_eval = SimpleNamespace(active_bytes=160, cache_bytes=32, peak_bytes=192)
+    after_cleanup = SimpleNamespace(active_bytes=0, cache_bytes=32, peak_bytes=192)
+
+    class RejectingReconcileObserver(_KVAllocationObserver):
+        def commit_growth(self, ticket, **kwargs):
+            super().commit_growth(ticket, **kwargs)
+            raise RuntimeError("allocator cache reconciliation failed closed")
+
+    observer = RejectingReconcileObserver(
+        allocator_samples=[before, after_eval, after_cleanup]
+    )
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    with pytest.raises(RuntimeError, match="reconciliation failed closed"):
+        cache.update_without_fetch(values, values)
+
+    assert len(observer.aborts) == 1
+    assert observer.aborts[0][1] == 32
+    assert observer.aborts[0][2] is before
+    assert observer.aborts[0][3] is after_cleanup
+    assert cache.nbytes == 0
+
+
+def test_q4_trim_never_reports_physical_release_and_close_is_exact_once() -> None:
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.zeros((1, 2, 4, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+
+    assert cache.trim(2) == 2
+    assert observer.releases == []
+    cache.close()
+    cache.close()
+
+    assert len(observer.releases) == 1
+    assert observer.releases[0][0] == "target:0"
+    assert observer.releases[0][2] == 160
+    assert cache.nbytes == 0
+
+
+def test_q4_close_drops_pages_and_terminalizes_when_allocator_sample_fails() -> None:
+    after = SimpleNamespace(active_bytes=0, cache_bytes=160, peak_bytes=160)
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+    observer.allocator_samples.extend(
+        [RuntimeError("allocator sample failed"), after]
+    )
+
+    with pytest.raises(RuntimeError, match="allocator sample failed"):
+        cache.close()
+    cache.close()
+
+    assert cache.nbytes == 0
+    assert len(observer.releases) == 1
+    assert observer.release_samples == [(None, after)]
+
+
+def test_paged_cache_install_propagates_allocation_observer_and_unique_ids() -> None:
+    from mlx_lm.models.cache import KVCache
+
+    observer = _KVAllocationObserver()
+    cache = [KVCache(), KVCache()]
+
+    install_vllm_metal_paged_attention_kv_cache(
+        cache,
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id_prefix="target",
+    )
+
+    assert [entry.cache_id for entry in cache] == ["target:0", "target:1"]
+    assert all(entry.allocation_observer is observer for entry in cache)
+
+
+def test_paged_cache_install_refuses_accounting_attach_after_allocation() -> None:
+    entry = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    entry.update_without_fetch(values, values)
+
+    with pytest.raises(ValueError, match="allocated cache"):
+        install_vllm_metal_paged_attention_kv_cache(
+            [entry],
+            block_size=4,
+            num_blocks=1,
+            kv_quant_config=PagedKVQuantConfig("q4"),
+            allocation_observer=_KVAllocationObserver(),
+            cache_id_prefix="target:request-1",
+        )
+
+    assert entry.allocation_observer is None
+
+
+def test_closed_brokered_q4_cache_cannot_allocate_again() -> None:
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=_KVAllocationObserver(),
+        cache_id="target:0",
+    )
+    cache.close()
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    with pytest.raises(RuntimeError, match="closed"):
+        cache.update_without_fetch(values, values)
+
+
+def test_vllm_metal_paged_q8_kv_quant_attention_matches_stock_with_tolerance(
+    monkeypatch,
+):
     if not mx.metal.is_available():
         pytest.skip("Metal is unavailable")
 
@@ -952,7 +1365,9 @@ def test_vllm_metal_paged_q8_kv_quant_attention_matches_stock_with_tolerance(mon
     def fail_if_external_ops_loads():
         raise AssertionError("plain q8 attention must dequant through in-tree MLX SDPA")
 
-    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads)
+    monkeypatch.setattr(
+        "mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads
+    )
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
     mx.random.seed(97531)
     q_len = 4
@@ -1241,7 +1656,9 @@ def test_vllm_metal_paged_attention_exact_gather_matches_stock_attention(monkeyp
     assert float(diff.item()) == 0.0
 
 
-def test_vllm_metal_paged_attention_mlx_vector_paged_matches_stock_attention(monkeypatch):
+def test_vllm_metal_paged_attention_mlx_vector_paged_matches_stock_attention(
+    monkeypatch,
+):
     if not mx.metal.is_available():
         pytest.skip("Metal is unavailable")
 
@@ -1356,7 +1773,9 @@ def test_tensor_offset_vllm_metal_paged_cache_updates_offset_inside_compile():
         cache.update_without_fetch(keys, values)
         return cache.compile_state
 
-    compiled = mx.compile(update, inputs=cache.compile_state, outputs=cache.compile_state)
+    compiled = mx.compile(
+        update, inputs=cache.compile_state, outputs=cache.compile_state
+    )
     compiled(
         3 * mx.ones((1, 1, 2, 1), dtype=mx.float32),
         4 * mx.ones((1, 1, 2, 1), dtype=mx.float32),
@@ -1440,6 +1859,26 @@ def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
     assert cache[0] is quantized
 
 
+def test_tensor_offset_promotion_refuses_broker_owned_q4_pages() -> None:
+    observer = _KVAllocationObserver()
+    paged = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:request-1:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    paged.update_without_fetch(values, values)
+
+    with pytest.raises(ValueError, match="broker-owned"):
+        TensorOffsetVllmMetalPagedKVCache.from_paged_cache(paged)
+
+    assert paged.nbytes == 160
+    assert len(observer.commits) == 1
+    assert observer.releases == []
+
+
 def test_tensor_offset_paged_static_max_offset_attr_beats_env(monkeypatch):
     monkeypatch.setenv("MTPLX_GRAPHBANK_PAGED_STATIC_MAX_OFFSET", "32")
     adapter = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(
@@ -1483,13 +1922,18 @@ def test_tensor_offset_paged_demote_round_trips_offset_and_buffers():
     mx.eval(keys, values)
     assert keys[0, 0, :, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 100.0, 101.0]
     assert values[0, 0, :, 0].tolist() == [
-        10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 200.0, 201.0,
+        10.0,
+        11.0,
+        12.0,
+        13.0,
+        14.0,
+        15.0,
+        200.0,
+        201.0,
     ]
 
     # Shape metadata restored: the next write appends without re-allocating.
-    restored.update_without_fetch(
-        mx.array([[[[300.0]]]]), mx.array([[[[400.0]]]])
-    )
+    restored.update_without_fetch(mx.array([[[[300.0]]]]), mx.array([[[[400.0]]]]))
     assert restored.size() == 9
     keys, _ = restored.state
     mx.eval(keys)

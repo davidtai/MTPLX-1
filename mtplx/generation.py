@@ -28,6 +28,7 @@ from .cache_state import (
     detach_array_leaf,
     detach_cache_state,
     owned_recurrent_state_stats,
+    physical_kv_cache_lifecycle,
     restore_cache,
     rollback_after_verify,
     snapshot_cache,
@@ -97,7 +98,9 @@ def _resolve_runtime_base_hidden_variant(
     requested: str | None,
 ) -> str:
     if requested in {None, "auto", "contract"}:
-        return str(getattr(rt.contract, "base_hidden_variant", "post_norm") or "post_norm")
+        return str(
+            getattr(rt.contract, "base_hidden_variant", "post_norm") or "post_norm"
+        )
     return str(requested)
 
 
@@ -644,10 +647,15 @@ def _sustained_prefill_layout() -> str:
     if layout != "auto":
         return layout
     kv_quant = (
-        os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
-        or os.environ.get("MTPLX_PAGED_KV_QUANT")
-        or ""
-    ).strip().lower().replace("-", "_")
+        (
+            os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
+            or os.environ.get("MTPLX_PAGED_KV_QUANT")
+            or ""
+        )
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
     if kv_quant in {"q8", "q8_0", "int8", "q4", "q4_0", "int4"}:
         return "contiguous_then_repage"
     context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
@@ -737,11 +745,26 @@ def _target_prefill_cache_layout_scope():
 
 
 def _make_target_prefill_cache(rt: MTPLXRuntime):
+    if (
+        getattr(getattr(rt, "expert_streaming", None), "memory_broker", None)
+        is not None
+    ):
+        return rt.make_cache()
     with _target_prefill_cache_layout_scope():
         return rt.make_cache()
 
 
-def _maybe_repage_target_prefill_cache(cache: Any) -> float:
+def _maybe_repage_target_prefill_cache(
+    cache: Any,
+    *,
+    rt: MTPLXRuntime | None = None,
+) -> float:
+    if (
+        rt is not None
+        and getattr(getattr(rt, "expert_streaming", None), "memory_broker", None)
+        is not None
+    ):
+        return 0.0
     if not _contiguous_then_repage_prefill_enabled():
         return 0.0
     from .cache_state import configure_tail_owned_attention_kv_cache
@@ -1738,8 +1761,7 @@ def _detect_repeated_token_suffix(
         repeats = 1
         cursor = token_count - block_tokens
         while (
-            cursor >= block_tokens
-            and tokens[cursor - block_tokens : cursor] == block
+            cursor >= block_tokens and tokens[cursor - block_tokens : cursor] == block
         ):
             repeats += 1
             cursor -= block_tokens
@@ -1824,9 +1846,7 @@ def _prefill_restored_prompt_suffix(
                 else None
             )
             cumulative_tok_s = (
-                float(new_done) / elapsed
-                if elapsed > 0.0 and new_done > 0
-                else None
+                float(new_done) / elapsed if elapsed > 0.0 and new_done > 0 else None
             )
             chunk_callback(
                 {
@@ -1906,9 +1926,8 @@ def _prefill_restored_prompt_suffix(
             mtp_history_time,
         )
 
-    capture_boundaries = (
-        gdn_boundary_sink is not None
-        and _cache_has_recurrent_entries(restored.cache)
+    capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
+        restored.cache
     )
     if len(suffix) > 1:
         body = suffix[:-1]
@@ -1968,9 +1987,7 @@ def _prefill_restored_prompt_suffix(
                     cached_tokens + end,
                     restored.cache,
                     hidden_last=(
-                        hidden_chunk[:, -1:, :]
-                        if hidden_chunk is not None
-                        else None
+                        hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
                     ),
                 )
             if hidden_chunk is not None:
@@ -2297,22 +2314,22 @@ def _restore_near_prefix_prompt_state(
         boundary_restore = boundary_hidden is not None or restore_point < matched
         if committed_history_required and mtp_history_cache is None:
             continue
-        if (
-            boundary_restore
-            and committed_history_required
-            and boundary_hidden is None
-        ):
+        if boundary_restore and committed_history_required and boundary_hidden is None:
             # Without the boundary's hidden state the committed MTP history
             # cannot resume exactly at b; running a seed forward instead would
             # advance the recurrent state twice. Fail closed to the next
             # candidate (or cold).
             continue
         cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
-        ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
+        ssd_cache_hit = (
+            bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
+        )
         ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
         ssd_cached_tokens = restore_point if ssd_cache_hit else 0
         total_cache_restore_time_s = (
-            cache_restore_time_s + ssd_restore_s if ssd_cache_hit else cache_restore_time_s
+            cache_restore_time_s + ssd_restore_s
+            if ssd_cache_hit
+            else cache_restore_time_s
         )
 
         _check_postcommit_abort(abort_check)
@@ -2339,7 +2356,9 @@ def _restore_near_prefix_prompt_state(
             repair_time = time.perf_counter() - started
         _check_postcommit_abort(abort_check)
         restore_kind_base = (
-            "block_prefix" if int(entry.prefix_len) - matched > max_gap else "near_prefix"
+            "block_prefix"
+            if int(entry.prefix_len) - matched > max_gap
+            else "near_prefix"
         )
         if restore_point < matched:
             restore_kind_base = f"{restore_kind_base}_boundary"
@@ -2412,9 +2431,7 @@ def _restore_near_prefix_prompt_state(
                 gdn_boundaries=inherited_boundaries,
             )
         suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-            list(inherited_boundaries)
-            if _gdn_boundary_capture_enabled()
-            else None
+            list(inherited_boundaries) if _gdn_boundary_capture_enabled() else None
         )
         suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
             _prefill_restored_prompt_suffix(
@@ -2530,9 +2547,7 @@ def _capture_gdn_boundary(
         hidden_leaf = None
         if hidden_last is not None:
             hidden_leaf = detach_array_leaf(hidden_last, mode="contiguous_eval")
-        sink.append(
-            (int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf)
-        )
+        sink.append((int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf))
         cap = _gdn_boundary_max_count()
         while len(sink) > cap:
             sink.pop(1)
@@ -2599,7 +2614,9 @@ def _store_on_prefill_min_suffix() -> int:
         return 1024
 
 
-def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_bank: Any) -> None:
+def _debug_prefix_divergence(
+    rt: MTPLXRuntime, prompt_ids: list[int], session_bank: Any
+) -> None:
     """Env-gated diagnostic: report where the prompt diverges from each bank entry.
 
     For every bank entry that shares a non-trivial prefix with the incoming
@@ -2640,9 +2657,9 @@ def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_ba
                 f"[mtplx] prefix-diverge: entry_len={entry_len} matched={matched} "
                 f"prompt_len={len(prompt)}\n"
                 f"  entry [{lo}:{matched + 40}]: "
-                f"{_decode(toks[lo:matched + 40])!r}\n"
+                f"{_decode(toks[lo : matched + 40])!r}\n"
                 f"  prompt[{lo}:{matched + 40}]: "
-                f"{_decode(prompt[lo:matched + 40])!r}",
+                f"{_decode(prompt[lo : matched + 40])!r}",
                 file=sys.stderr,
             )
     except Exception as exc:  # diagnostic only - never break the request
@@ -2755,7 +2772,9 @@ def restore_or_prefill_prompt_state(
                 policy_fingerprint=policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,
                 snapshot_epoch=len(prompt_ids),
-                mtp_snapshot_epoch=len(prompt_ids) if mtp_snapshot is not None else None,
+                mtp_snapshot_epoch=len(prompt_ids)
+                if mtp_snapshot is not None
+                else None,
                 gdn_boundaries=list(getattr(state, "gdn_boundaries", None) or []),
             )
         except Exception:
@@ -2787,7 +2806,9 @@ def restore_or_prefill_prompt_state(
                     "new_prefill_tokens": new_tokens,
                     "elapsed_s": elapsed,
                     "prompt_eval_time_s": compute_elapsed,
-                    "prefill_tok_s": compute_tok_s if compute_tok_s is not None else wall_tok_s,
+                    "prefill_tok_s": compute_tok_s
+                    if compute_tok_s is not None
+                    else wall_tok_s,
                     "prefill_compute_tok_s": compute_tok_s,
                     "prefill_wall_tok_s": wall_tok_s,
                     "cache_hit": bool(state.cache_hit),
@@ -2820,9 +2841,7 @@ def restore_or_prefill_prompt_state(
             if callable(longest_prefix):
                 exact_entry = longest_prefix(prompt_ids)
                 if exact_entry is not None:
-                    exact_prefix_len = int(
-                        getattr(exact_entry, "prefix_len", 0) or 0
-                    )
+                    exact_prefix_len = int(getattr(exact_entry, "prefix_len", 0) or 0)
         except Exception:
             exact_prefix_len = 0
 
@@ -2896,26 +2915,32 @@ def restore_or_prefill_prompt_state(
             )
             if not suffix:
                 repage_time = _maybe_repage_target_prefill_cache(restored.cache)
-                return _emit_prefill_complete(PromptState(
-                    trunk_cache=restored.cache,
-                    logits=restored.logits,
-                    hidden=restored.hidden,
-                    committed_mtp_cache=restored.mtp_history_cache,
-                    token_prefix=tuple(int(token) for token in prompt_ids),
-                    prompt_eval_time_s=repage_time,
-                    cache_restore_time_s=restore_elapsed_s,
-                    mtp_history_policy=mtp_history_policy,
-                    mtp_history_window_tokens=mtp_history_window_tokens,
-                    cached_tokens=restored.entry.prefix_len,
-                    suffix_tokens=0,
-                    cache_hit=True,
-                    cache_source=getattr(restored, "cache_source", "ram"),
-                    ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
-                    ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
-                    ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
-                    restore_mode=restored.restore_mode,
-                    gdn_boundaries=inherited_boundaries,
-                ))
+                return _emit_prefill_complete(
+                    PromptState(
+                        trunk_cache=restored.cache,
+                        logits=restored.logits,
+                        hidden=restored.hidden,
+                        committed_mtp_cache=restored.mtp_history_cache,
+                        token_prefix=tuple(int(token) for token in prompt_ids),
+                        prompt_eval_time_s=repage_time,
+                        cache_restore_time_s=restore_elapsed_s,
+                        mtp_history_policy=mtp_history_policy,
+                        mtp_history_window_tokens=mtp_history_window_tokens,
+                        cached_tokens=restored.entry.prefix_len,
+                        suffix_tokens=0,
+                        cache_hit=True,
+                        cache_source=getattr(restored, "cache_source", "ram"),
+                        ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                        ssd_cached_tokens=int(
+                            getattr(restored, "ssd_cached_tokens", 0) or 0
+                        ),
+                        ssd_restore_s=float(
+                            getattr(restored, "ssd_restore_s", 0.0) or 0.0
+                        ),
+                        restore_mode=restored.restore_mode,
+                        gdn_boundaries=inherited_boundaries,
+                    )
+                )
 
             _check_postcommit_abort(abort_check)
             _emit_prefill_restore_progress(
@@ -2926,9 +2951,7 @@ def restore_or_prefill_prompt_state(
                 started_s=prefill_started_s,
                 cache_source=getattr(restored, "cache_source", "ram"),
                 ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
-                ssd_cached_tokens=int(
-                    getattr(restored, "ssd_cached_tokens", 0) or 0
-                ),
+                ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
                 ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
                 ssd_suffix_tokens=len(suffix),
             )
@@ -2955,31 +2978,35 @@ def restore_or_prefill_prompt_state(
                     gdn_boundary_sink=suffix_boundary_sink,
                 )
             )
-            return _emit_prefill_complete(PromptState(
-                trunk_cache=restored.cache,
-                logits=suffix_logits,
-                hidden=suffix_hidden,
-                committed_mtp_cache=restored.mtp_history_cache,
-                token_prefix=tuple(int(token) for token in prompt_ids),
-                prompt_eval_time_s=suffix_time + mtp_history_time,
-                prompt_mtp_history_time_s=mtp_history_time,
-                cache_restore_time_s=restore_elapsed_s,
-                mtp_history_policy=mtp_history_policy,
-                mtp_history_window_tokens=mtp_history_window_tokens,
-                cached_tokens=restored.entry.prefix_len,
-                suffix_tokens=len(suffix),
-                cache_hit=True,
-                cache_source=getattr(restored, "cache_source", "ram"),
-                ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
-                ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
-                ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
-                restore_mode=restored.restore_mode,
-                gdn_boundaries=(
-                    suffix_boundary_sink
-                    if suffix_boundary_sink is not None
-                    else inherited_boundaries
-                ),
-            ))
+            return _emit_prefill_complete(
+                PromptState(
+                    trunk_cache=restored.cache,
+                    logits=suffix_logits,
+                    hidden=suffix_hidden,
+                    committed_mtp_cache=restored.mtp_history_cache,
+                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    prompt_eval_time_s=suffix_time + mtp_history_time,
+                    prompt_mtp_history_time_s=mtp_history_time,
+                    cache_restore_time_s=restore_elapsed_s,
+                    mtp_history_policy=mtp_history_policy,
+                    mtp_history_window_tokens=mtp_history_window_tokens,
+                    cached_tokens=restored.entry.prefix_len,
+                    suffix_tokens=len(suffix),
+                    cache_hit=True,
+                    cache_source=getattr(restored, "cache_source", "ram"),
+                    ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                    ssd_cached_tokens=int(
+                        getattr(restored, "ssd_cached_tokens", 0) or 0
+                    ),
+                    ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
+                    restore_mode=restored.restore_mode,
+                    gdn_boundaries=(
+                        suffix_boundary_sink
+                        if suffix_boundary_sink is not None
+                        else inherited_boundaries
+                    ),
+                )
+            )
 
         near_prompt_state = _restore_near_prefix_prompt_state(
             rt,
@@ -3064,7 +3091,9 @@ def restore_or_prefill_prompt_state(
                     keep = min(len(history_token_ids), mtp_history_window_tokens)
                     dropped = len(history_token_ids) - keep
                     mtp_history_position_base = (
-                        dropped + 1 if mtp_position_mode == "absolute" else max(0, dropped)
+                        dropped + 1
+                        if mtp_position_mode == "absolute"
+                        else max(0, dropped)
                     )
                     history_token_ids = history_token_ids[-keep:]
                     history_hidden = history_hidden[:, -keep:, :]
@@ -3073,7 +3102,9 @@ def restore_or_prefill_prompt_state(
                 if vision_splice is not None:
                     pad_id = vision_splice.image_pad_token_id
                     rows_before = sum(
-                        1 for token in prompt_ids[:history_window_start] if token == pad_id
+                        1
+                        for token in prompt_ids[:history_window_start]
+                        if token == pad_id
                     )
                     if any(token == pad_id for token in history_token_ids):
                         from mtplx.vision.splice import spliced_embeddings_for_window
@@ -3092,7 +3123,8 @@ def restore_or_prefill_prompt_state(
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         mtp_history_position_base
-                        if mtp_position_mode == "absolute" or mtp_history_policy == "last_window"
+                        if mtp_position_mode == "absolute"
+                        or mtp_history_policy == "last_window"
                         else None
                     ),
                     input_embeddings=history_embeddings,
@@ -3109,23 +3141,25 @@ def restore_or_prefill_prompt_state(
             gdn_boundary_sink=gdn_boundary_sink,
         )
         prompt_eval_time = target_time
-    return _emit_prefill_complete(PromptState(
-        trunk_cache=cache,
-        logits=logits,
-        hidden=hidden,
-        committed_mtp_cache=mtp_history_cache,
-        token_prefix=tuple(int(token) for token in prompt_ids),
-        prompt_eval_time_s=prompt_eval_time,
-        prompt_mtp_history_time_s=prompt_history_time,
-        mtp_history_policy=mtp_history_policy,
-        mtp_history_window_tokens=mtp_history_window_tokens,
-        mtp_history_position_base=mtp_history_position_base,
-        suffix_tokens=len(prompt_ids),
-        cache_miss_reason=getattr(session_bank, "last_miss_reason", None)
-        if session_bank is not None
-        else None,
-        gdn_boundaries=list(gdn_boundary_sink or []),
-    ))
+    return _emit_prefill_complete(
+        PromptState(
+            trunk_cache=cache,
+            logits=logits,
+            hidden=hidden,
+            committed_mtp_cache=mtp_history_cache,
+            token_prefix=tuple(int(token) for token in prompt_ids),
+            prompt_eval_time_s=prompt_eval_time,
+            prompt_mtp_history_time_s=prompt_history_time,
+            mtp_history_policy=mtp_history_policy,
+            mtp_history_window_tokens=mtp_history_window_tokens,
+            mtp_history_position_base=mtp_history_position_base,
+            suffix_tokens=len(prompt_ids),
+            cache_miss_reason=getattr(session_bank, "last_miss_reason", None)
+            if session_bank is not None
+            else None,
+            gdn_boundaries=list(gdn_boundary_sink or []),
+        )
+    )
 
 
 def _decode(tokenizer, tokens: list[int]) -> str:
@@ -3497,8 +3531,8 @@ def _prefill(
     cache = _make_target_prefill_cache(rt)
     target_forward_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
-    capture_boundaries = (
-        gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
+    capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
+        cache
     )
 
     if len(prompt_ids) > 1:
@@ -3562,7 +3596,7 @@ def _prefill(
         hidden = None
         _eval(logits)
     target_forward_time += time.perf_counter() - started
-    target_forward_time += _maybe_repage_target_prefill_cache(cache)
+    target_forward_time += _maybe_repage_target_prefill_cache(cache, rt=rt)
     _check_postcommit_abort(abort_check)
     return cache, logits[:, -1, :], hidden, target_forward_time
 
@@ -3591,8 +3625,8 @@ def _prefill_committed_mtp_history_streaming(
     target_forward_time = 0.0
     prompt_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
-    capture_boundaries = (
-        gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
+    capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
+        cache
     )
     body = prompt_ids[:-1]
     history_start_token_index = 1
@@ -3602,7 +3636,9 @@ def _prefill_committed_mtp_history_streaming(
         window = max(1, int(history_window_tokens))
         history_start_token_index = max(1, len(prompt_ids) - window)
         mtp_history_position_base = (
-            history_start_token_index if use_absolute_positions else max(0, history_start_token_index - 1)
+            history_start_token_index
+            if use_absolute_positions
+            else max(0, history_start_token_index - 1)
         )
 
     cursor = 0
@@ -3673,14 +3709,14 @@ def _prefill_committed_mtp_history_streaming(
         if chunk_callback is not None:
             try:
                 now = time.perf_counter()
-                phase_start = chunk_started_s if chunk_started_s is not None else started
+                phase_start = (
+                    chunk_started_s if chunk_started_s is not None else started
+                )
                 chunk_elapsed = max(0.0, now - started)
                 elapsed = max(0.0, now - phase_start)
                 tokens_done = int(cursor + chunk_len)
                 chunk_tok_s = (
-                    float(chunk_len) / chunk_elapsed
-                    if chunk_elapsed > 0.0
-                    else None
+                    float(chunk_len) / chunk_elapsed if chunk_elapsed > 0.0 else None
                 )
                 cumulative_tok_s = (
                     float(tokens_done) / elapsed
@@ -3723,10 +3759,7 @@ def _prefill_committed_mtp_history_streaming(
                 if vision_splice is not None and pad_prefix_counts is not None:
                     window_start = token_start_index + slice_start
                     window_end = window_start + len(sliced_token_ids)
-                    if (
-                        pad_prefix_counts[window_end]
-                        > pad_prefix_counts[window_start]
-                    ):
+                    if pad_prefix_counts[window_end] > pad_prefix_counts[window_start]:
                         from mtplx.vision.splice import (
                             spliced_embeddings_for_window,
                         )
@@ -3755,9 +3788,7 @@ def _prefill_committed_mtp_history_streaming(
                 )
                 _check_postcommit_abort(abort_check)
         cursor += chunk_len
-        boundary_hidden = (
-            hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
-        )
+        boundary_hidden = hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
         del hidden_chunk
         del logits_chunk
         target_forward_time += _prefill_chunk_cache_cleanup(rt)
@@ -3947,6 +3978,7 @@ def _append_mtp_history(
     return time.perf_counter() - started
 
 
+@physical_kv_cache_lifecycle()
 def generate_ar(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -4017,11 +4049,7 @@ def generate_ar(
     if prefill_callback is not None:
         try:
             elapsed = max(0.0, time.perf_counter() - prefill_started_s)
-            tok_s = (
-                (len(prompt_ids) / elapsed)
-                if elapsed > 0 and prompt_ids
-                else None
-            )
+            tok_s = (len(prompt_ids) / elapsed) if elapsed > 0 and prompt_ids else None
             prefill_callback(
                 {
                     "phase": "completed",
@@ -5003,7 +5031,9 @@ def generate_mtpk(
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         from .backends.gemma4_assistant import generate_gemma4_assistant
 
-        runtime_block_size = int(getattr(getattr(rt, "config", None), "draft_block_size", 0) or 0)
+        runtime_block_size = int(
+            getattr(getattr(rt, "config", None), "draft_block_size", 0) or 0
+        )
         requested_block_size = int(speculative_depth or 0)
         effective_block_size = (
             runtime_block_size
@@ -5260,7 +5290,9 @@ def generate_mtpk(
     # every verified MTP position by its growing in-block prefix (per-position /
     # vLLM-exact). Counts are rebuilt from `tokens` at each sample point — simple
     # and drift-proof; an incremental counter is a documented perf follow-up.
-    _penalties_active = bool(sampler.presence_penalty) or bool(sampler.frequency_penalty)
+    _penalties_active = bool(sampler.presence_penalty) or bool(
+        sampler.frequency_penalty
+    )
     # Loop Guard: loop-armed DRY-style steering (see mtplx/loop_guard.py).
     # Disarmed = zero distribution impact (identity transform, fast paths kept).
     # Armed = target distributions get sparse anti-cycle penalties per position;
@@ -5342,7 +5374,9 @@ def generate_mtpk(
         int(
             position_base_env
             if position_base_env is not None
-            else (len(prompt_state.token_prefix) if mtp_position_mode == "absolute" else 0)
+            else (
+                len(prompt_state.token_prefix) if mtp_position_mode == "absolute" else 0
+            )
         ),
     )
     # Validate env spelling before a long generation starts.
@@ -5356,7 +5390,9 @@ def generate_mtpk(
 
     def mtp_position_offset_for_cache(mtp_cache) -> int | None:
         position_base = mtp_position_base
-        if mtp_cache is mtp_history_cache and _mtp_history_uses_committed_cache(mtp_history_policy):
+        if mtp_cache is mtp_history_cache and _mtp_history_uses_committed_cache(
+            mtp_history_policy
+        ):
             position_base = mtp_history_position_base
         return _mtp_position_offset(
             _mtp_cache_offset(mtp_cache),
@@ -6561,9 +6597,7 @@ def generate_mtpk(
                             _row, None, penalty_overlay=_row_overlay
                         )
                     _guarded_rows.append(_row)
-                target_distribution_logits = mx.stack(_guarded_rows, axis=0)[
-                    None, ...
-                ]
+                target_distribution_logits = mx.stack(_guarded_rows, axis=0)[None, ...]
             sampled_target_ids = sample_token_ids_from_mlx_logits(
                 target_distribution_logits,
                 sampler,
@@ -6739,7 +6773,10 @@ def generate_mtpk(
                     target_distribution_logits,
                     sampler,
                 )
-            if target_distribution_batch is not None or target_distributions is not None:
+            if (
+                target_distribution_batch is not None
+                or target_distributions is not None
+            ):
                 target_distribution_materialized_rows += int(target_distribution_rows)
                 target_distribution_materialized_windows += 1
                 event["target_distribution_materialized"] = {
@@ -7079,9 +7116,8 @@ def generate_mtpk(
                     continue
                 started_bonus = time.perf_counter()
                 bonus_target_distribution_time = 0.0
-                if (
-                    target_prefix_tokens is not None
-                    and len(target_prefix_tokens) > len(draft_tokens)
+                if target_prefix_tokens is not None and len(target_prefix_tokens) > len(
+                    draft_tokens
                 ):
                     bonus = int(target_prefix_tokens[len(draft_tokens)])
                 elif target_distribution_batch is not None and not lazy_bonus_verify:
@@ -7107,9 +7143,7 @@ def generate_mtpk(
                         rng,
                         token_counts=Counter(tokens) if _penalties_active else None,
                         penalty_overlay=(
-                            _loop_guard.penalties_for(tokens)
-                            if _guard_armed
-                            else None
+                            _loop_guard.penalties_for(tokens) if _guard_armed else None
                         ),
                     )
                     if sampler.temperature > 0:
@@ -7120,7 +7154,9 @@ def generate_mtpk(
                             target_distribution_materialized_windows += 1
                             lazy_target_distribution_window_counted = True
                         target_distribution_materialized_rows += 1
-                        verify_target_distribution_time += bonus_target_distribution_time
+                        verify_target_distribution_time += (
+                            bonus_target_distribution_time
+                        )
                         verify_logits_eval_time += bonus_target_distribution_time
                         verify_eval_time += bonus_target_distribution_time
                         verify_time += bonus_target_distribution_time
@@ -7130,7 +7166,9 @@ def generate_mtpk(
                             materialized.get("mode", "")
                         ).startswith("lazy"):
                             materialized["mode"] = "lazy_accept_bonus_path"
-                            materialized["rows"] = int(materialized.get("rows") or 0) + 1
+                            materialized["rows"] = (
+                                int(materialized.get("rows") or 0) + 1
+                            )
                             materialized["time_s"] = float(
                                 materialized.get("time_s") or 0.0
                             ) + float(bonus_target_distribution_time)
@@ -7149,7 +7187,9 @@ def generate_mtpk(
                         )
                 elapsed_bonus = max(
                     0.0,
-                    time.perf_counter() - started_bonus - bonus_target_distribution_time,
+                    time.perf_counter()
+                    - started_bonus
+                    - bonus_target_distribution_time,
                 )
                 bonus_time += elapsed_bonus
                 _add_timing(event, "bonus_sample", elapsed_bonus)
@@ -7481,7 +7521,9 @@ def generate_mtpk(
         ssd_cache_hit=prompt_state.ssd_cache_hit,
         ssd_cached_tokens=prompt_state.ssd_cached_tokens,
         ssd_restore_s=prompt_state.ssd_restore_s,
-        ssd_suffix_tokens=prompt_state.suffix_tokens if prompt_state.ssd_cache_hit else 0,
+        ssd_suffix_tokens=prompt_state.suffix_tokens
+        if prompt_state.ssd_cache_hit
+        else 0,
         cache_miss_reason=prompt_state.cache_miss_reason,
         session_restore_mode=prompt_state.restore_mode,
         session_prompt_prefix_bank_commit=prompt_prefix_bank_commit,

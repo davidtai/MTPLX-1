@@ -2282,6 +2282,59 @@ class ExpertSlotPool:
                 and slab_id not in self._slab_ambiguous_allocations
             )
 
+    def expert_slab_telemetry_snapshot(self) -> dict[str, int]:
+        """Return slab ownership telemetry without draining completion fences."""
+
+        with self._slab_lock:
+            slabs = tuple(self._slabs.values())
+            logical_bytes = sum(slab.physical_bytes for slab in slabs)
+            physical_bytes = sum(
+                slab.physical_bytes
+                for slab in slabs
+                if slab.state is ExpertSlabState.ACTIVE
+                or slab.slab_id in self._slab_ambiguous_allocations
+            )
+            active_slot_ids = tuple(
+                slot_id
+                for slab in slabs
+                if slab.state is ExpertSlabState.ACTIVE
+                for slot_id in slab.slot_ids
+            )
+            resident_records = 0
+            in_flight_records = 0
+            pinned_records = 0
+            pin_count = 0
+            for slot_id in active_slot_ids:
+                slot = self._persistent[(-1, slot_id)]
+                with slot.condition:
+                    resident_records += int(slot.state is ExpertSlotState.READY)
+                    in_flight_records += int(slot.state is ExpertSlotState.LOADING)
+                    pinned_records += int(slot.pins > 0)
+                    pin_count += int(slot.pins)
+            return {
+                "logical_slab_count": len(slabs),
+                "active_slab_count": sum(
+                    slab.state is ExpertSlabState.ACTIVE for slab in slabs
+                ),
+                "draining_slab_count": sum(
+                    slab.state is ExpertSlabState.DRAINING for slab in slabs
+                ),
+                "released_slab_count": sum(
+                    slab.state is ExpertSlabState.RELEASED for slab in slabs
+                ),
+                "logical_slot_count": sum(len(slab.slot_ids) for slab in slabs),
+                "active_slot_count": len(active_slot_ids),
+                "resident_record_count": resident_records,
+                "in_flight_record_count": in_flight_records,
+                "pinned_record_count": pinned_records,
+                "pin_count": pin_count,
+                "logical_bytes": logical_bytes,
+                "physical_bytes": physical_bytes,
+                "released_bytes": logical_bytes - physical_bytes,
+                "in_flight_bytes": (in_flight_records * self.spec.expert_record_bytes),
+                "pinned_bytes": pinned_records * self.spec.expert_record_bytes,
+            }
+
     def slot_ids_for_slab(self, slab_id: int) -> tuple[int, ...]:
         with self._slab_lock:
             try:

@@ -147,6 +147,100 @@ def test_hard_snapshot_rejects_all_later_allocation() -> None:
         broker.plan_kv_growth(steady_delta_bytes=1, transient_delta_bytes=0)
 
 
+def test_allocator_cache_reconciliation_updates_only_the_cache_pool() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(
+            resident=40,
+            kv=10,
+            experts=20,
+            staging=5,
+            workspace=10,
+            cache=5,
+        ),
+        expert_slab_bytes=10,
+    )
+
+    snapshot = broker.reconcile_allocator_cache(
+        AllocatorMemorySample(active_bytes=75, cache_bytes=9, peak_bytes=90)
+    )
+
+    assert snapshot.resident_model_bytes == 40
+    assert snapshot.kv_physical_bytes == 10
+    assert snapshot.expert_slab_physical_bytes == 20
+    assert snapshot.in_flight_expert_staging_bytes == 5
+    assert snapshot.runtime_workspace_bytes == 10
+    assert snapshot.allocator_cache_bytes == 9
+    assert snapshot.charged_bytes == 94
+
+
+def test_allocator_cache_reconciliation_grants_no_credit_for_cache_to_active_move() -> (
+    None
+):
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(
+            resident=40,
+            kv=10,
+            experts=20,
+            staging=5,
+            workspace=10,
+            cache=9,
+        ),
+        expert_slab_bytes=10,
+    )
+
+    snapshot = broker.reconcile_allocator_cache(
+        AllocatorMemorySample(active_bytes=79, cache_bytes=5, peak_bytes=90)
+    )
+
+    assert snapshot.allocator_cache_bytes == 9
+    assert snapshot.charged_bytes == 94
+
+
+def test_allocator_cache_reconciliation_retains_over_budget_truth_and_fails_closed() -> (
+    None
+):
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=90, cache=5),
+        expert_slab_bytes=10,
+    )
+
+    with pytest.raises(MemoryAdmissionError, match="operating target"):
+        broker.reconcile_allocator_cache(
+            AllocatorMemorySample(active_bytes=90, cache_bytes=11, peak_bytes=101)
+        )
+
+    snapshot = broker.snapshot()
+    assert snapshot.allocator_cache_bytes == 11
+    assert snapshot.charged_bytes == 101
+    with pytest.raises(MemoryAdmissionError, match="failed closed"):
+        broker.plan_kv_growth(steady_delta_bytes=1, transient_delta_bytes=0)
+
+
+def test_allocator_cache_reconciliation_cannot_interrupt_a_transaction() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=50, cache=5),
+        expert_slab_bytes=10,
+    )
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=1,
+        transient_delta_bytes=0,
+        cache_id="target:1:0",
+    )
+
+    with pytest.raises(MemoryTransactionError, match="active memory transaction"):
+        broker.reconcile_allocator_cache(
+            AllocatorMemorySample(active_bytes=50, cache_bytes=7, peak_bytes=57)
+        )
+
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id == ticket.ticket_id
+    assert snapshot.allocator_cache_bytes == 5
+
+
 def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:
     broker = UnifiedMemoryBroker.standard_hy3()
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
@@ -1262,4 +1356,98 @@ def test_failed_regrow_below_pins_preserves_physical_and_classification_invarian
     assert snapshot.allocator_cache_bytes == GIB
     assert snapshot.expert_slab_physical_bytes >= snapshot.pinned_expert_bytes
     assert snapshot.speculative_expert_bytes <= snapshot.expert_slab_physical_bytes
+    assert snapshot.failed_closed is True
+
+
+def test_commit_kv_growth_atomically_reclassifies_consumed_allocator_cache() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3()
+    _install(broker, _snapshot(resident=100 * GIB, cache=2 * GIB))
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=GIB,
+        transient_delta_bytes=0,
+        cache_id="target:atomic",
+    )
+
+    allocation = broker.commit_kv_growth(
+        ticket,
+        allocated_physical_bytes=GIB,
+        allocator_before=AllocatorMemorySample(10 * GIB, 2 * GIB, 12 * GIB),
+        allocator_after=AllocatorMemorySample(11 * GIB, GIB, 12 * GIB),
+    )
+
+    snapshot = broker.snapshot()
+    assert allocation.physical_bytes == GIB
+    assert snapshot.kv_physical_bytes == GIB
+    assert snapshot.allocator_cache_bytes == GIB
+    assert snapshot.owned_kv_physical_bytes == GIB
+
+
+def test_commit_kv_growth_missing_atomic_sample_terminalizes_unowned_bytes() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3()
+    _install(broker, _snapshot(resident=100 * GIB, cache=2 * GIB))
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=GIB,
+        transient_delta_bytes=0,
+        cache_id="target:ambiguous",
+    )
+
+    with pytest.raises(MemoryTelemetryError, match="allocator telemetry"):
+        broker.commit_kv_growth(
+            ticket,
+            allocated_physical_bytes=GIB,
+            allocator_before=AllocatorMemorySample(
+                10 * GIB,
+                2 * GIB,
+                12 * GIB,
+            ),
+            allocator_after=None,
+        )
+
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.kv_physical_bytes == GIB
+    assert snapshot.allocator_cache_bytes == 2 * GIB
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.unreconciled_kv_physical_bytes == GIB
+    assert snapshot.failed_closed is True
+
+
+def test_abort_kv_growth_atomically_charges_allocator_cache_retention() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3()
+    _install(broker, _snapshot(resident=100 * GIB))
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=GIB,
+        transient_delta_bytes=0,
+    )
+
+    snapshot = broker.abort_kv_growth(
+        ticket,
+        observed_kv_delta_bytes=0,
+        allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
+        allocator_after=AllocatorMemorySample(10 * GIB, GIB, 11 * GIB),
+    )
+
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.allocator_cache_bytes == GIB
+
+
+def test_abort_kv_growth_invalid_atomic_sample_consumes_ticket_fail_closed() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3()
+    _install(broker, _snapshot(resident=100 * GIB))
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=GIB,
+        transient_delta_bytes=0,
+    )
+
+    with pytest.raises(MemoryTelemetryError, match="allocator telemetry"):
+        broker.abort_kv_growth(
+            ticket,
+            observed_kv_delta_bytes=0,
+            allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
+            allocator_after=None,
+        )
+
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id is None
     assert snapshot.failed_closed is True

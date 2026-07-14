@@ -311,10 +311,24 @@ class MTPLXRuntime:
         from .cache_state import (
             configure_owned_recurrent_state_cache,
             configure_tail_owned_attention_kv_cache,
+            register_physical_kv_cache,
         )
 
         configure_owned_recurrent_state_cache(cache)
-        configure_tail_owned_attention_kv_cache(cache)
+        allocation_observer = (
+            self.expert_streaming
+            if getattr(self.expert_streaming, "memory_broker", None) is not None
+            else None
+        )
+        if allocation_observer is None:
+            configure_tail_owned_attention_kv_cache(cache)
+        else:
+            configure_tail_owned_attention_kv_cache(
+                cache,
+                allocation_observer=allocation_observer,
+                cache_id_prefix="target",
+            )
+        register_physical_kv_cache(cache)
         return cache
 
     def make_mtp_cache(self):
@@ -322,9 +336,25 @@ class MTPLXRuntime:
             raise RuntimeError("MTP is not enabled for this runtime")
         self._count("make_mtp_cache_calls")
         cache = self.model.make_mtp_cache()
-        from .cache_state import configure_mtp_attention_kv_cache
+        from .cache_state import (
+            configure_mtp_attention_kv_cache,
+            register_physical_kv_cache,
+        )
 
-        configure_mtp_attention_kv_cache(cache)
+        allocation_observer = (
+            self.expert_streaming
+            if getattr(self.expert_streaming, "memory_broker", None) is not None
+            else None
+        )
+        if allocation_observer is None:
+            configure_mtp_attention_kv_cache(cache)
+        else:
+            configure_mtp_attention_kv_cache(
+                cache,
+                allocation_observer=allocation_observer,
+                cache_id_prefix="mtp",
+            )
+        register_physical_kv_cache(cache)
         return cache
 
     def admit_kv_tokens(self, tokens: int):
@@ -549,6 +579,12 @@ def load(
             mtp_enabled = inject_mtp_support(model, path, config, contract)
         if not mtp_enabled or not validate_mtp_support(model):
             raise RuntimeError(f"MTP injection failed for {path}")
+    if expert_runtime is not None and expert_runtime.memory_broker is not None:
+        try:
+            expert_runtime.reconcile_post_load_memory()
+        except BaseException:
+            expert_runtime.close()
+            raise
     from .attention_split import configure_split_full_attention
     from .native_mlp import configure_native_mlp
 

@@ -400,6 +400,50 @@ class UnifiedMemoryBroker:
                     "observed memory is above the operating target"
                 )
 
+    def reconcile_allocator_cache(
+        self,
+        sample: AllocatorMemorySample,
+    ) -> BrokerSnapshot:
+        """Refresh allocator-cache truth without disturbing ownership ledgers.
+
+        Physical Q4 growth can consume or retain MLX allocator-cache bytes even
+        when its owned steady allocation is measured exactly.  Callers use
+        this boundary between transactions so the next admission never plans
+        from a stale cache value.  Classified resident, KV, and expert bytes
+        remain authoritative and are not inferred from allocator ``active``.
+        """
+
+        self._validate_allocator_sample("sample", sample)
+        with self._lock:
+            if self._pending is not None or self._pending_regrow is not None:
+                raise MemoryTransactionError(
+                    "cannot reconcile allocator cache during an active memory "
+                    "transaction"
+                )
+            self._pools = replace(
+                self._pools,
+                allocator_cache_bytes=max(
+                    self._pools.allocator_cache_bytes,
+                    sample.cache_bytes,
+                ),
+            )
+            self._revision += 1
+            self._record_hard_failure_if_needed()
+            charged = self._pools.charged_bytes
+            if charged >= self._budget.hard_ceiling_bytes:
+                self._admission_failure_count += 1
+                raise MemoryAdmissionError(
+                    "allocator cache reconciliation reached the hard ceiling"
+                )
+            if charged > self._budget.operating_target_bytes:
+                self._admission_failure_count += 1
+                self._transaction_failure_count += 1
+                self._failed_reason = (
+                    "allocator cache reconciliation exceeded the operating target"
+                )
+                raise MemoryAdmissionError(self._failed_reason)
+            return self.snapshot()
+
     def plan_kv_growth(
         self,
         *,
@@ -602,13 +646,126 @@ class UnifiedMemoryBroker:
             self._record_hard_failure_if_needed()
             return self.snapshot()
 
+    def terminalize_expert_resize(
+        self,
+        ticket: KVAllocationTicket | ExpertRegrowTicket,
+        *,
+        registered_slab_bytes_after: int,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
+        reason: str,
+    ) -> BrokerSnapshot:
+        """Fail one resize closed while preserving unrelated KV ownership.
+
+        Runtime slab destruction and allocation can cross their physical
+        boundary before registry or allocator telemetry fails.  This method
+        consumes only that active resize ticket and publishes conservative
+        expert/cache truth without replacing the snapshot or invalidating
+        already-authenticated KV allocation handles.
+        """
+
+        registered_after = _exact_nonnegative_int(
+            "registered_slab_bytes_after",
+            registered_slab_bytes_after,
+        )
+        if not isinstance(reason, str):
+            raise TypeError("reason must be a string")
+        failure = reason.strip()
+        if not failure:
+            raise ValueError("reason must not be empty")
+        with self._lock:
+            if isinstance(ticket, KVAllocationTicket):
+                self._require_ticket(ticket)
+                consume = self._consume_pending
+            elif isinstance(ticket, ExpertRegrowTicket):
+                self._require_regrow_ticket(ticket)
+                consume = self._consume_pending_regrow
+            else:
+                raise TypeError(
+                    "ticket must be a KVAllocationTicket or ExpertRegrowTicket"
+                )
+
+            registered_before = self._pools.expert_slab_physical_bytes
+            samples_valid = allocator_before is not None and allocator_after is not None
+            if samples_valid:
+                assert allocator_before is not None
+                assert allocator_after is not None
+                try:
+                    self._validate_allocator_sample(
+                        "allocator_before",
+                        allocator_before,
+                    )
+                    self._validate_allocator_sample(
+                        "allocator_after",
+                        allocator_after,
+                    )
+                except (TypeError, ValueError):
+                    samples_valid = False
+                else:
+                    samples_valid = (
+                        allocator_before.cache_bytes
+                        == self._pools.allocator_cache_bytes
+                    )
+
+            if samples_valid:
+                assert allocator_before is not None
+                assert allocator_after is not None
+                classified_delta = registered_after - registered_before
+                footprint_delta = (
+                    allocator_after.charged_footprint_bytes
+                    - allocator_before.charged_footprint_bytes
+                )
+                residual = (
+                    self._pools.allocator_cache_bytes
+                    + footprint_delta
+                    - classified_delta
+                )
+                conservative_cache = max(
+                    0,
+                    allocator_after.cache_bytes,
+                    residual,
+                )
+            else:
+                conservative_cache = self._pools.allocator_cache_bytes + max(
+                    0, registered_before - registered_after
+                )
+
+            self._pools = replace(
+                self._pools,
+                expert_slab_physical_bytes=registered_after,
+                allocator_cache_bytes=conservative_cache,
+                pinned_expert_bytes=min(
+                    self._pools.pinned_expert_bytes,
+                    registered_after,
+                ),
+                speculative_expert_bytes=min(
+                    self._pools.speculative_expert_bytes,
+                    registered_after,
+                ),
+            )
+            consume()
+            self._failed_reason = failure
+            self._transaction_failure_count += 1
+            self._revision += 1
+            self._assert_kv_ledger_invariant()
+            self._record_hard_failure_if_needed()
+            return self.snapshot()
+
     def commit_kv_growth(
         self,
         ticket: KVAllocationTicket,
         *,
         allocated_physical_bytes: int,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
     ) -> KVPhysicalAllocation:
-        """Commit an exactly measured steady KV allocation."""
+        """Commit an exactly measured steady KV allocation atomically.
+
+        When allocator samples are supplied, cache consumption is reclassified
+        in the same broker transaction as the new owned KV bytes.  Supplying
+        only one sample is ambiguous after the physical allocation boundary and
+        therefore terminalizes the bytes as unowned and fails closed.
+        """
 
         allocated = _exact_nonnegative_int(
             "allocated_physical_bytes", allocated_physical_bytes
@@ -619,10 +776,30 @@ class UnifiedMemoryBroker:
                 raise MemoryTransactionError(
                     "required expert reclaim has not been confirmed"
                 )
+            cache_after = self._pools.allocator_cache_bytes
+            samples_requested = (
+                allocator_before is not None or allocator_after is not None
+            )
+            if samples_requested:
+                try:
+                    cache_after = self._allocator_cache_after_growth(
+                        allocator_before=allocator_before,
+                        allocator_after=allocator_after,
+                        classified_delta_bytes=allocated,
+                        context="KV commit",
+                    )
+                except MemoryTelemetryError as exc:
+                    self._terminalize_unowned_kv_growth(
+                        ticket,
+                        allocated,
+                        reason=str(exc),
+                    )
+                    raise
             if allocated != ticket.steady_delta_bytes:
                 self._pools = replace(
                     self._pools,
                     kv_physical_bytes=(self._pools.kv_physical_bytes + allocated),
+                    allocator_cache_bytes=cache_after,
                 )
                 if allocated:
                     self._unreconciled_kv_by_owner[
@@ -638,6 +815,7 @@ class UnifiedMemoryBroker:
             self._pools = replace(
                 self._pools,
                 kv_physical_bytes=(self._pools.kv_physical_bytes + allocated),
+                allocator_cache_bytes=cache_after,
             )
             allocation = KVPhysicalAllocation(
                 allocation_id=ticket.ticket_id,
@@ -663,6 +841,8 @@ class UnifiedMemoryBroker:
         ticket: KVAllocationTicket,
         *,
         observed_kv_delta_bytes: int | None,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
     ) -> BrokerSnapshot:
         """Abort a ticket without restoring already destroyed expert slabs.
 
@@ -681,6 +861,29 @@ class UnifiedMemoryBroker:
                 reason = "interrupted KV allocation has an unknown physical delta"
                 self._fail_pending(reason)
                 raise MemoryTransactionError(reason)
+            cache_after = self._pools.allocator_cache_bytes
+            samples_requested = (
+                allocator_before is not None or allocator_after is not None
+            )
+            if samples_requested:
+                try:
+                    cache_after = self._allocator_cache_after_growth(
+                        allocator_before=allocator_before,
+                        allocator_after=allocator_after,
+                        classified_delta_bytes=observed_kv_delta_bytes,
+                        context="KV abort",
+                    )
+                except MemoryTelemetryError as exc:
+                    self._terminalize_unowned_kv_growth(
+                        ticket,
+                        observed_kv_delta_bytes,
+                        reason=str(exc),
+                    )
+                    raise
+            self._pools = replace(
+                self._pools,
+                allocator_cache_bytes=cache_after,
+            )
             if observed_kv_delta_bytes:
                 self._pools = replace(
                     self._pools,
@@ -699,6 +902,59 @@ class UnifiedMemoryBroker:
             self._revision += 1
             self._record_hard_failure_if_needed()
             return self.snapshot()
+
+    def _allocator_cache_after_growth(
+        self,
+        *,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
+        classified_delta_bytes: int,
+        context: str,
+    ) -> int:
+        """Conservatively reclassify one allocator transition under the lock."""
+
+        if allocator_before is None or allocator_after is None:
+            raise MemoryTelemetryError(
+                f"allocator telemetry unavailable during {context}"
+            )
+        try:
+            self._validate_allocator_sample("allocator_before", allocator_before)
+            self._validate_allocator_sample("allocator_after", allocator_after)
+        except (TypeError, ValueError) as exc:
+            raise MemoryTelemetryError(
+                f"invalid allocator telemetry during {context}: {exc}"
+            ) from exc
+        if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
+            raise MemoryTelemetryError(f"allocator telemetry is stale during {context}")
+
+        footprint_delta = (
+            allocator_after.charged_footprint_bytes
+            - allocator_before.charged_footprint_bytes
+        )
+        residual = (
+            self._pools.allocator_cache_bytes + footprint_delta - classified_delta_bytes
+        )
+        return max(0, allocator_after.cache_bytes, residual)
+
+    def _terminalize_unowned_kv_growth(
+        self,
+        ticket: KVAllocationTicket,
+        physical_bytes: int,
+        *,
+        reason: str,
+    ) -> None:
+        """Consume a crossed allocation boundary without inventing ownership."""
+
+        if physical_bytes:
+            self._pools = replace(
+                self._pools,
+                kv_physical_bytes=self._pools.kv_physical_bytes + physical_bytes,
+            )
+            self._unreconciled_kv_by_owner[f"ambiguous-growth:{ticket.ticket_id}"] = (
+                physical_bytes
+            )
+        self._fail_pending(reason, pools_already_updated=True)
+        self._assert_kv_ledger_invariant()
 
     def release_kv(
         self,
