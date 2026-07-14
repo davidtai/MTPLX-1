@@ -652,7 +652,13 @@ class UnifiedMemoryBroker:
         if cache_id is not None:
             cache_id = self._validate_cache_id(cache_id)
         with self._lock:
-            self._ensure_allocation_open()
+            try:
+                self._ensure_allocation_open()
+            except MemoryAdmissionError as exc:
+                owner = cache_id or "anonymous KV owner"
+                raise MemoryAdmissionError(
+                    f"{exc} while planning KV growth for {owner}"
+                ) from exc
             if self._pending is not None or self._pending_regrow is not None:
                 self._reject_admission(
                     "another memory allocation transaction is already active"
