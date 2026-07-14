@@ -1253,13 +1253,15 @@ class UnifiedMemoryBroker:
                 reason = f"invalid allocator telemetry during KV release: {exc}"
                 self._fail_without_pending(reason)
                 raise MemoryTelemetryError(reason) from exc
-            if (
-                self._allocator_residual_bytes(allocator_before)
-                > self._pools.allocator_cache_bytes
-            ):
+            observed_residual_before = self._allocator_residual_bytes(
+                allocator_before
+            )
+            if observed_residual_before > self._pools.allocator_cache_bytes:
                 reason = (
                     "allocator telemetry is stale relative to broker cache "
-                    "during KV release"
+                    f"during KV release for {owner_id}: observed residual "
+                    f"{observed_residual_before} exceeds charged cache "
+                    f"{self._pools.allocator_cache_bytes}"
                 )
                 self._fail_without_pending(reason)
                 raise MemoryTelemetryError(reason)
