@@ -8,11 +8,12 @@ performing MLX allocations on the correct owner thread.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
-from threading import RLock
+from dataclasses import dataclass, field, replace
+from threading import Lock, RLock
 
 
 BINARY_GIB = 1024**3
+HY3_Q4_ALLOCATOR_HEADROOM_BYTES = BINARY_GIB
 HY3_Q4_KV_BLOCK_TOKENS = 16
 HY3_Q4_KV_LAYERS = 80
 HY3_Q4_KV_HEADS = 8
@@ -75,14 +76,26 @@ class MemoryBudget:
 
     operating_target_bytes: int = 110 * BINARY_GIB
     hard_ceiling_bytes: int = 112 * BINARY_GIB
+    allocator_headroom_bytes: int = 0
 
     def __post_init__(self) -> None:
         operating = _exact_positive_int(
             "operating_target_bytes", self.operating_target_bytes
         )
         hard = _exact_positive_int("hard_ceiling_bytes", self.hard_ceiling_bytes)
+        headroom = _exact_nonnegative_int(
+            "allocator_headroom_bytes", self.allocator_headroom_bytes
+        )
         if operating >= hard:
             raise ValueError("operating_target_bytes must be below hard_ceiling_bytes")
+        if headroom >= operating:
+            raise ValueError(
+                "allocator_headroom_bytes must be below operating_target_bytes"
+            )
+
+    @property
+    def classified_target_bytes(self) -> int:
+        return self.operating_target_bytes - self.allocator_headroom_bytes
 
 
 @dataclass(frozen=True)
@@ -170,6 +183,16 @@ class BrokerSnapshot:
         )
 
     @property
+    def classified_bytes(self) -> int:
+        return (
+            self.resident_model_bytes
+            + self.kv_physical_bytes
+            + self.expert_slab_physical_bytes
+            + self.in_flight_expert_staging_bytes
+            + self.runtime_workspace_bytes
+        )
+
+    @property
     def reclaimable_expert_bytes(self) -> int:
         """Expert bytes not protected by a physical pin."""
 
@@ -230,6 +253,30 @@ class KVPhysicalAllocation:
 
 
 @dataclass(frozen=True)
+class KVAllocationGroupMember:
+    """One declared owner within an aggregate KV growth reservation."""
+
+    allocation_id: int
+    cache_id: str
+    steady_delta_bytes: int
+    transient_delta_bytes: int
+
+
+@dataclass(frozen=True)
+class KVAllocationGroupTicket:
+    """Single reclaim permit covering serialized growth by many KV owners."""
+
+    ticket_id: int
+    members: tuple[KVAllocationGroupMember, ...]
+    steady_delta_bytes: int
+    transient_delta_bytes: int
+    required_expert_reclaim_bytes: int
+    snapshot_revision: int
+    planned_steady_bytes: int
+    planned_peak_bytes: int
+
+
+@dataclass(frozen=True)
 class ExpertRegrowTicket:
     """Single-use reservation for a slab-aligned physical expert regrow."""
 
@@ -247,6 +294,15 @@ class _PendingKVTransaction:
     ticket: KVAllocationTicket
     expected_revision: int
     reclaim_confirmed: bool = False
+
+
+@dataclass
+class _PendingKVGroupTransaction:
+    ticket: KVAllocationGroupTicket
+    expected_revision: int
+    reclaim_confirmed: bool = False
+    committed_cache_ids: set[str] = field(default_factory=set)
+    last_allocator_sample: AllocatorMemorySample | None = None
 
 
 @dataclass
@@ -286,6 +342,7 @@ class UnifiedMemoryBroker:
             expert_resize_min_interval_ns,
         )
         self._lock = RLock()
+        self._group_commit_lock = Lock()
         self._pools = BrokerSnapshot.synthetic(charged_bytes=0)
         self._revision = 0
         self._hard_failure_count = 0
@@ -296,7 +353,7 @@ class UnifiedMemoryBroker:
         self._post_load_reconciled = False
         self._max_expert_slab_bytes = 0
         self._next_ticket_id = 1
-        self._pending: _PendingKVTransaction | None = None
+        self._pending: _PendingKVTransaction | _PendingKVGroupTransaction | None = None
         self._pending_regrow: _PendingExpertRegrow | None = None
         self._consumed_ticket_ids: set[int] = set()
         self._consumed_regrow_ticket_ids: set[int] = set()
@@ -342,9 +399,10 @@ class UnifiedMemoryBroker:
         ),
         expert_regrow_hysteresis_slabs: int = 1,
         expert_resize_min_interval_ns: int = 1_000_000_000,
+        allocator_headroom_bytes: int = 0,
     ) -> UnifiedMemoryBroker:
         return cls(
-            budget=MemoryBudget(),
+            budget=MemoryBudget(allocator_headroom_bytes=allocator_headroom_bytes),
             initial_snapshot=initial_snapshot,
             initial_allocator_sample=initial_allocator_sample,
             expert_slab_bytes=expert_slab_bytes,
@@ -431,6 +489,11 @@ class UnifiedMemoryBroker:
                 self._admission_failure_count += 1
                 raise MemoryAdmissionError(
                     "observed memory is at or above the hard ceiling"
+                )
+            if snapshot.classified_bytes > self._budget.classified_target_bytes:
+                self._admission_failure_count += 1
+                raise MemoryAdmissionError(
+                    "observed classified memory is above the allocator-headroom target"
                 )
             if snapshot.charged_bytes > self._budget.operating_target_bytes:
                 self._admission_failure_count += 1
@@ -627,6 +690,13 @@ class UnifiedMemoryBroker:
                 raise MemoryAdmissionError(
                     "post-load memory reconciliation reached the hard ceiling"
                 )
+            if self._pools.classified_bytes > self._budget.classified_target_bytes:
+                self._admission_failure_count += 1
+                self._transaction_failure_count += 1
+                self._failed_reason = (
+                    "post-load classified memory exceeded the allocator-headroom target"
+                )
+                raise MemoryAdmissionError(self._failed_reason)
             if charged > self._budget.operating_target_bytes:
                 self._admission_failure_count += 1
                 self._transaction_failure_count += 1
@@ -665,9 +735,11 @@ class UnifiedMemoryBroker:
                 )
 
             charged = self._pools.charged_bytes
+            classified = self._pools.classified_bytes
             target = self._budget.operating_target_bytes
             required_reclaim = max(
                 0,
+                classified + steady - self._budget.classified_target_bytes,
                 charged + steady + transient - target,
             )
             reclaimable = (
@@ -681,6 +753,11 @@ class UnifiedMemoryBroker:
 
             planned_steady = charged - required_reclaim + steady
             planned_peak = planned_steady + transient
+            planned_classified = classified - required_reclaim + steady
+            if planned_classified > self._budget.classified_target_bytes:
+                self._reject_admission(
+                    "KV steady allocation exceeds the allocator-headroom target"
+                )
             if planned_peak > target:
                 self._reject_admission(
                     "KV allocation peak exceeds the operating target"
@@ -709,9 +786,117 @@ class UnifiedMemoryBroker:
             )
             return ticket
 
+    def plan_kv_growth_group(
+        self,
+        *,
+        members: Sequence[tuple[str, int, int]],
+    ) -> KVAllocationGroupTicket:
+        """Reserve aggregate steady growth with serialized member transients."""
+
+        if isinstance(members, (str, bytes)) or not isinstance(members, Sequence):
+            raise TypeError("members must be a sequence of three-item tuples")
+        if not members:
+            raise ValueError("members must contain at least one KV owner")
+
+        parsed: list[tuple[str, int, int]] = []
+        seen_cache_ids: set[str] = set()
+        for index, member in enumerate(members):
+            if not isinstance(member, tuple) or len(member) != 3:
+                raise TypeError(f"members[{index}] must be a three-item tuple")
+            cache_id = self._validate_cache_id(member[0])
+            steady = _exact_positive_int(
+                f"members[{index}].steady_delta_bytes",
+                member[1],
+            )
+            transient = _exact_nonnegative_int(
+                f"members[{index}].transient_delta_bytes",
+                member[2],
+            )
+            if cache_id in seen_cache_ids:
+                raise ValueError(f"duplicate KV group cache_id: {cache_id}")
+            seen_cache_ids.add(cache_id)
+            parsed.append((cache_id, steady, transient))
+
+        total_steady = sum(member[1] for member in parsed)
+        serialized_transient = max(member[2] for member in parsed)
+        with self._lock:
+            self._ensure_allocation_open()
+            if self._pending is not None or self._pending_regrow is not None:
+                self._reject_admission(
+                    "another memory allocation transaction is already active"
+                )
+
+            charged = self._pools.charged_bytes
+            classified = self._pools.classified_bytes
+            required_reclaim = max(
+                0,
+                classified + total_steady - self._budget.classified_target_bytes,
+                charged
+                + total_steady
+                + serialized_transient
+                - self._budget.operating_target_bytes,
+            )
+            reclaimable = (
+                self._pools.expert_slab_physical_bytes - self._pools.pinned_expert_bytes
+            )
+            if required_reclaim > reclaimable:
+                self._reject_admission(
+                    "pinned expert bytes leave insufficient physical reclaim "
+                    f"({reclaimable} available, {required_reclaim} required)"
+                )
+
+            planned_steady = charged - required_reclaim + total_steady
+            planned_peak = planned_steady + serialized_transient
+            planned_classified = classified - required_reclaim + total_steady
+            if planned_classified > self._budget.classified_target_bytes:
+                self._reject_admission(
+                    "KV group steady allocation exceeds the allocator-headroom target"
+                )
+            if planned_peak > self._budget.operating_target_bytes:
+                self._reject_admission(
+                    "KV group allocation peak exceeds the operating target"
+                )
+            if planned_peak >= self._budget.hard_ceiling_bytes:
+                self._reject_admission(
+                    "KV group allocation peak reaches the hard ceiling"
+                )
+
+            ticket_id = self._next_ticket_id
+            self._next_ticket_id += 1
+            planned_members: list[KVAllocationGroupMember] = []
+            for cache_id, steady, transient in parsed:
+                allocation_id = self._next_ticket_id
+                self._next_ticket_id += 1
+                planned_members.append(
+                    KVAllocationGroupMember(
+                        allocation_id=allocation_id,
+                        cache_id=cache_id,
+                        steady_delta_bytes=steady,
+                        transient_delta_bytes=transient,
+                    )
+                )
+
+            self._revision += 1
+            ticket = KVAllocationGroupTicket(
+                ticket_id=ticket_id,
+                members=tuple(planned_members),
+                steady_delta_bytes=total_steady,
+                transient_delta_bytes=serialized_transient,
+                required_expert_reclaim_bytes=required_reclaim,
+                snapshot_revision=self._revision,
+                planned_steady_bytes=planned_steady,
+                planned_peak_bytes=planned_peak,
+            )
+            self._pending = _PendingKVGroupTransaction(
+                ticket=ticket,
+                expected_revision=self._revision,
+                reclaim_confirmed=required_reclaim == 0,
+            )
+            return ticket
+
     def confirm_expert_reclaim(
         self,
-        ticket: KVAllocationTicket,
+        ticket: KVAllocationTicket | KVAllocationGroupTicket,
         *,
         registered_slab_bytes_after: int,
         allocator_before: AllocatorMemorySample | None,
@@ -726,7 +911,10 @@ class UnifiedMemoryBroker:
         if now_ns is not None:
             now_ns = _exact_nonnegative_int("now_ns", now_ns)
         with self._lock:
-            transaction = self._require_ticket(ticket)
+            if isinstance(ticket, KVAllocationGroupTicket):
+                transaction = self._require_group_ticket(ticket)
+            else:
+                transaction = self._require_ticket(ticket)
             required = ticket.required_expert_reclaim_bytes
             if required == 0:
                 raise MemoryTransactionError(
@@ -831,7 +1019,20 @@ class UnifiedMemoryBroker:
                 + ticket.steady_delta_bytes
                 + ticket.transient_delta_bytes
             )
-            if failure is None and confirmed_peak > self._budget.operating_target_bytes:
+            confirmed_classified = (
+                self._pools.classified_bytes + ticket.steady_delta_bytes
+            )
+            if (
+                failure is None
+                and confirmed_classified > self._budget.classified_target_bytes
+            ):
+                failure = (
+                    "confirmed KV steady allocation exceeded the "
+                    "allocator-headroom target"
+                )
+            elif (
+                failure is None and confirmed_peak > self._budget.operating_target_bytes
+            ):
                 failure = (
                     "allocator cache retention leaves the confirmed allocation "
                     f"peak above the operating target ({confirmed_peak} bytes)"
@@ -846,12 +1047,14 @@ class UnifiedMemoryBroker:
             self._revision += 1
             transaction.reclaim_confirmed = True
             transaction.expected_revision = self._revision
+            if isinstance(transaction, _PendingKVGroupTransaction):
+                transaction.last_allocator_sample = allocator_after
             self._record_hard_failure_if_needed()
             return self.snapshot()
 
     def terminalize_expert_resize(
         self,
-        ticket: KVAllocationTicket | ExpertRegrowTicket,
+        ticket: KVAllocationTicket | KVAllocationGroupTicket | ExpertRegrowTicket,
         *,
         registered_slab_bytes_after: int,
         allocator_before: AllocatorMemorySample | None,
@@ -880,12 +1083,16 @@ class UnifiedMemoryBroker:
             if isinstance(ticket, KVAllocationTicket):
                 self._require_ticket(ticket)
                 consume = self._consume_pending
+            elif isinstance(ticket, KVAllocationGroupTicket):
+                self._require_group_ticket(ticket)
+                consume = self._consume_pending
             elif isinstance(ticket, ExpertRegrowTicket):
                 self._require_regrow_ticket(ticket)
                 consume = self._consume_pending_regrow
             else:
                 raise TypeError(
-                    "ticket must be a KVAllocationTicket or ExpertRegrowTicket"
+                    "ticket must be a KVAllocationTicket, KVAllocationGroupTicket, "
+                    "or ExpertRegrowTicket"
                 )
 
             registered_before = self._pools.expert_slab_physical_bytes
@@ -1023,6 +1230,19 @@ class UnifiedMemoryBroker:
                 kv_physical_bytes=(self._pools.kv_physical_bytes + allocated),
                 allocator_cache_bytes=cache_after,
             )
+            if self._pools.classified_bytes > self._budget.classified_target_bytes:
+                if allocated:
+                    self._unreconciled_kv_by_owner[
+                        f"failed-growth:{ticket.ticket_id}"
+                    ] = allocated
+                reason = (
+                    "committed KV allocation exceeded the allocator-headroom target"
+                )
+                self._fail_pending(reason, pools_already_updated=True)
+                self._assert_kv_ledger_invariant()
+                error = MemoryTransactionError(reason)
+                setattr(error, "transaction_terminalized", True)
+                raise error
             if self._pools.charged_bytes > self._budget.operating_target_bytes:
                 if allocated:
                     self._unreconciled_kv_by_owner[
@@ -1043,6 +1263,226 @@ class UnifiedMemoryBroker:
             self._allocations[allocation.allocation_id] = allocation
             self._consume_pending()
             self._revision += 1
+            self._record_hard_failure_if_needed()
+            self._assert_kv_ledger_invariant()
+            return allocation
+
+    def commit_kv_growth_group_member(
+        self,
+        ticket: KVAllocationGroupTicket,
+        *,
+        cache_id: str,
+        allocated_physical_bytes: int,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
+    ) -> KVPhysicalAllocation:
+        """Commit one member while rejecting overlapping commit windows."""
+
+        owner_id = self._validate_cache_id(cache_id)
+        allocated = _exact_nonnegative_int(
+            "allocated_physical_bytes",
+            allocated_physical_bytes,
+        )
+        if not self._group_commit_lock.acquire(blocking=False):
+            reason = "concurrent KV group member commits are not permitted"
+            with self._lock:
+                try:
+                    self._require_group_ticket(ticket)
+                except MemoryTransactionError:
+                    pass
+                else:
+                    self._terminalize_unowned_group_growth(
+                        ticket,
+                        allocated,
+                        reason=reason,
+                        owner=owner_id,
+                    )
+            error = MemoryTransactionError(reason)
+            setattr(error, "transaction_terminalized", True)
+            raise error
+        try:
+            return self._commit_kv_growth_group_member_serialized(
+                ticket,
+                cache_id=owner_id,
+                allocated_physical_bytes=allocated,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        finally:
+            self._group_commit_lock.release()
+
+    def _commit_kv_growth_group_member_serialized(
+        self,
+        ticket: KVAllocationGroupTicket,
+        *,
+        cache_id: str,
+        allocated_physical_bytes: int,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
+    ) -> KVPhysicalAllocation:
+        """Commit one declared group member against a serialized telemetry chain."""
+
+        owner_id = self._validate_cache_id(cache_id)
+        allocated = _exact_nonnegative_int(
+            "allocated_physical_bytes",
+            allocated_physical_bytes,
+        )
+        with self._lock:
+            transaction = self._require_group_ticket(ticket)
+            if not transaction.reclaim_confirmed:
+                raise MemoryTransactionError(
+                    "required expert reclaim has not been confirmed"
+                )
+            member = next(
+                (item for item in ticket.members if item.cache_id == owner_id),
+                None,
+            )
+            if member is None:
+                reason = f"unknown KV group member {owner_id}"
+                self._terminalize_unowned_group_growth(
+                    ticket,
+                    allocated,
+                    reason=reason,
+                    owner=owner_id,
+                )
+                raise MemoryTransactionError(reason)
+            if owner_id in transaction.committed_cache_ids:
+                reason = f"KV group member {owner_id} was already committed"
+                self._fail_pending(reason)
+                raise MemoryTransactionError(reason)
+            if allocated > member.steady_delta_bytes:
+                reason = (
+                    f"physical KV allocation {allocated} exceeds group member plan "
+                    f"of {member.steady_delta_bytes} bytes for {owner_id}"
+                )
+                self._terminalize_unowned_group_growth(
+                    ticket,
+                    allocated,
+                    reason=reason,
+                    owner=owner_id,
+                )
+                raise MemoryTransactionError(reason)
+            if allocator_before is None or allocator_after is None:
+                reason = (
+                    f"allocator telemetry unavailable during KV group commit for "
+                    f"{owner_id}"
+                )
+                self._terminalize_unowned_group_growth(
+                    ticket,
+                    allocated,
+                    reason=reason,
+                    owner=owner_id,
+                )
+                error = MemoryTelemetryError(reason)
+                setattr(error, "transaction_terminalized", True)
+                raise error
+            try:
+                self._validate_allocator_sample("allocator_before", allocator_before)
+                self._validate_allocator_sample("allocator_after", allocator_after)
+            except (TypeError, ValueError) as exc:
+                reason = f"invalid allocator telemetry during KV group commit: {exc}"
+                self._terminalize_unowned_group_growth(
+                    ticket,
+                    allocated,
+                    reason=reason,
+                    owner=owner_id,
+                )
+                raise MemoryTelemetryError(reason) from exc
+            if (
+                transaction.last_allocator_sample is not None
+                and not self._allocator_group_chain_has_no_unseen_growth(
+                    transaction.last_allocator_sample,
+                    allocator_before,
+                )
+            ):
+                reason = (
+                    "KV group member allocator telemetry is not serialized with "
+                    "the preceding reclaim or member commit"
+                )
+                self._terminalize_unowned_group_growth(
+                    ticket,
+                    allocated,
+                    reason=reason,
+                    owner=owner_id,
+                )
+                error = MemoryTelemetryError(reason)
+                setattr(error, "transaction_terminalized", True)
+                raise error
+            if (
+                transaction.last_allocator_sample is None
+                and self._allocator_residual_bytes(allocator_before)
+                > self._pools.allocator_cache_bytes
+            ):
+                reason = (
+                    "allocator telemetry is stale relative to broker cache during "
+                    "the first KV group member commit"
+                )
+                self._terminalize_unowned_group_growth(
+                    ticket,
+                    allocated,
+                    reason=reason,
+                    owner=owner_id,
+                )
+                raise MemoryTelemetryError(reason)
+            try:
+                cache_after = max(
+                    self._pools.allocator_cache_bytes,
+                    self._allocator_cache_after_growth(
+                        allocator_before=allocator_before,
+                        allocator_after=allocator_after,
+                        classified_delta_bytes=allocated,
+                        context=f"KV group commit for {owner_id}",
+                    ),
+                )
+            except MemoryTelemetryError as exc:
+                self._terminalize_unowned_group_growth(
+                    ticket,
+                    allocated,
+                    reason=str(exc),
+                    owner=owner_id,
+                )
+                setattr(exc, "transaction_terminalized", True)
+                raise
+
+            self._pools = replace(
+                self._pools,
+                kv_physical_bytes=self._pools.kv_physical_bytes + allocated,
+                allocator_cache_bytes=cache_after,
+            )
+            allocation = KVPhysicalAllocation(
+                allocation_id=member.allocation_id,
+                cache_id=member.cache_id,
+                physical_bytes=allocated,
+                committed_revision=self._revision + 1,
+            )
+            self._allocations[allocation.allocation_id] = allocation
+            transaction.committed_cache_ids.add(owner_id)
+            transaction.last_allocator_sample = allocator_after
+            self._revision += 1
+
+            failure: str | None = None
+            if self._pools.classified_bytes > self._budget.classified_target_bytes:
+                failure = (
+                    "committed KV group allocation exceeded the "
+                    "allocator-headroom target"
+                )
+            elif self._pools.charged_bytes > self._budget.operating_target_bytes:
+                failure = "committed KV group allocation exceeded the operating target"
+            if failure is not None:
+                del self._allocations[allocation.allocation_id]
+                self._unreconciled_kv_by_owner[
+                    f"failed-group-growth:{ticket.ticket_id}:{owner_id}"
+                ] = allocated
+                self._fail_pending(failure, pools_already_updated=True)
+                self._assert_kv_ledger_invariant()
+                error = MemoryTransactionError(failure)
+                setattr(error, "transaction_terminalized", True)
+                raise error
+
+            if len(transaction.committed_cache_ids) == len(ticket.members):
+                self._consume_pending()
+            else:
+                transaction.expected_revision = self._revision
             self._record_hard_failure_if_needed()
             self._assert_kv_ledger_invariant()
             return allocation
@@ -1114,6 +1554,95 @@ class UnifiedMemoryBroker:
             self._record_hard_failure_if_needed()
             return self.snapshot()
 
+    def abort_kv_growth_group(
+        self,
+        ticket: KVAllocationGroupTicket,
+        *,
+        observed_uncommitted_kv_delta_bytes: int | None,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
+    ) -> BrokerSnapshot:
+        """Consume a group permit without discarding committed member handles."""
+
+        observed = observed_uncommitted_kv_delta_bytes
+        if observed is not None:
+            observed = _exact_nonnegative_int(
+                "observed_uncommitted_kv_delta_bytes",
+                observed,
+            )
+        with self._lock:
+            transaction = self._require_group_ticket(ticket)
+            if observed is None:
+                reason = "interrupted KV group allocation has an unknown physical delta"
+                self._fail_pending(reason)
+                raise MemoryTransactionError(reason)
+
+            samples_requested = (
+                allocator_before is not None or allocator_after is not None
+            )
+            cache_after = self._pools.allocator_cache_bytes
+            telemetry_failure: MemoryTelemetryError | None = None
+            if samples_requested:
+                if (
+                    transaction.last_allocator_sample is not None
+                    and not self._allocator_group_chain_has_no_unseen_growth(
+                        transaction.last_allocator_sample,
+                        allocator_before,
+                    )
+                ):
+                    telemetry_failure = MemoryTelemetryError(
+                        "KV group abort allocator telemetry is not serialized with "
+                        "the preceding reclaim or member commit"
+                    )
+                else:
+                    try:
+                        cache_after = max(
+                            self._pools.allocator_cache_bytes,
+                            self._allocator_cache_after_growth(
+                                allocator_before=allocator_before,
+                                allocator_after=allocator_after,
+                                classified_delta_bytes=observed,
+                                context="KV group abort",
+                            ),
+                        )
+                    except MemoryTelemetryError as exc:
+                        telemetry_failure = exc
+                    else:
+                        if (
+                            transaction.last_allocator_sample is None
+                            and allocator_before is not None
+                            and self._allocator_residual_bytes(allocator_before)
+                            > self._pools.allocator_cache_bytes
+                        ):
+                            telemetry_failure = MemoryTelemetryError(
+                                "allocator telemetry is stale relative to broker "
+                                "cache during KV group abort"
+                            )
+                            cache_after = self._pools.allocator_cache_bytes
+
+            self._pools = replace(
+                self._pools,
+                allocator_cache_bytes=cache_after,
+                kv_physical_bytes=self._pools.kv_physical_bytes + observed,
+            )
+            if observed:
+                self._unreconciled_kv_by_owner[
+                    f"aborted-group-growth:{ticket.ticket_id}"
+                ] = observed
+                self._failed_reason = (
+                    "aborted KV group allocation retained observed physical bytes"
+                )
+            if telemetry_failure is not None:
+                self._failed_reason = str(telemetry_failure)
+            self._transaction_failure_count += 1
+            self._consume_pending()
+            self._revision += 1
+            self._record_hard_failure_if_needed()
+            self._assert_kv_ledger_invariant()
+            if telemetry_failure is not None:
+                raise telemetry_failure
+            return self.snapshot()
+
     def _allocator_cache_after_growth(
         self,
         *,
@@ -1149,6 +1678,19 @@ class UnifiedMemoryBroker:
         )
         return max(0, allocator_after.cache_bytes, residual)
 
+    @staticmethod
+    def _allocator_group_chain_has_no_unseen_growth(
+        previous: AllocatorMemorySample,
+        current: AllocatorMemorySample | None,
+    ) -> bool:
+        """Reject unseen growth while allowing conservatively charged retirement."""
+
+        return bool(
+            isinstance(current, AllocatorMemorySample)
+            and current.charged_footprint_bytes <= previous.charged_footprint_bytes
+            and current.peak_bytes == previous.peak_bytes
+        )
+
     def _terminalize_unowned_kv_growth(
         self,
         ticket: KVAllocationTicket,
@@ -1166,6 +1708,27 @@ class UnifiedMemoryBroker:
             self._unreconciled_kv_by_owner[f"ambiguous-growth:{ticket.ticket_id}"] = (
                 physical_bytes
             )
+        self._fail_pending(reason, pools_already_updated=True)
+        self._assert_kv_ledger_invariant()
+
+    def _terminalize_unowned_group_growth(
+        self,
+        ticket: KVAllocationGroupTicket,
+        physical_bytes: int,
+        *,
+        reason: str,
+        owner: str,
+    ) -> None:
+        """Consume a group permit while preserving prior owned member handles."""
+
+        if physical_bytes:
+            self._pools = replace(
+                self._pools,
+                kv_physical_bytes=self._pools.kv_physical_bytes + physical_bytes,
+            )
+            self._unreconciled_kv_by_owner[
+                f"ambiguous-group-growth:{ticket.ticket_id}:{owner}"
+            ] = physical_bytes
         self._fail_pending(reason, pools_already_updated=True)
         self._assert_kv_ledger_invariant()
 
@@ -1259,9 +1822,7 @@ class UnifiedMemoryBroker:
                 reason = f"invalid allocator telemetry during KV release: {exc}"
                 self._fail_without_pending(reason)
                 raise MemoryTelemetryError(reason) from exc
-            observed_residual_before = self._allocator_residual_bytes(
-                allocator_before
-            )
+            observed_residual_before = self._allocator_residual_bytes(allocator_before)
             if observed_residual_before > self._pools.allocator_cache_bytes:
                 reason = (
                     "allocator telemetry is stale relative to broker cache "
@@ -1391,7 +1952,10 @@ class UnifiedMemoryBroker:
             hysteresis_bytes = (
                 self._expert_regrow_hysteresis_slabs * self._expert_slab_bytes
             )
-            headroom = self._budget.operating_target_bytes - self._pools.charged_bytes
+            headroom = min(
+                self._budget.classified_target_bytes - self._pools.classified_bytes,
+                self._budget.operating_target_bytes - self._pools.charged_bytes,
+            )
             if planned_bytes + hysteresis_bytes > headroom:
                 return None
 
@@ -1530,6 +2094,13 @@ class UnifiedMemoryBroker:
                     self._expert_regrow_hysteresis_slabs * self._expert_slab_bytes
                 )
                 if (
+                    self._pools.classified_bytes + hysteresis_bytes
+                    > self._budget.classified_target_bytes
+                ):
+                    failure = (
+                        "confirmed expert regrow violated allocator-headroom hysteresis"
+                    )
+                elif (
                     self._pools.charged_bytes + hysteresis_bytes
                     > self._budget.operating_target_bytes
                 ):
@@ -1694,6 +2265,10 @@ class UnifiedMemoryBroker:
     def _ensure_allocation_open(self) -> None:
         if self._pools.charged_bytes >= self._budget.hard_ceiling_bytes:
             self._reject_admission("memory is at or above the hard ceiling")
+        if self._pools.classified_bytes > self._budget.classified_target_bytes:
+            self._reject_admission(
+                "classified memory is above the allocator-headroom target"
+            )
         if self._failed_reason is not None:
             self._reject_admission(
                 f"memory broker failed closed: {self._failed_reason}"
@@ -1723,6 +2298,33 @@ class UnifiedMemoryBroker:
             raise MemoryTransactionError(
                 f"KV ticket {ticket.ticket_id} revision changed during transaction"
             )
+        return transaction
+
+    def _require_group_ticket(
+        self,
+        ticket: KVAllocationGroupTicket,
+    ) -> _PendingKVGroupTransaction:
+        if not isinstance(ticket, KVAllocationGroupTicket):
+            raise TypeError("ticket must be a KVAllocationGroupTicket")
+        if ticket.ticket_id in self._consumed_ticket_ids:
+            raise MemoryTransactionError(
+                f"KV group ticket {ticket.ticket_id} was already consumed"
+            )
+        transaction = self._pending
+        if (
+            not isinstance(transaction, _PendingKVGroupTransaction)
+            or transaction.ticket is not ticket
+        ):
+            raise MemoryTransactionError(
+                f"KV group ticket {ticket.ticket_id} is not the active ticket"
+            )
+        if transaction.expected_revision != self._revision:
+            reason = (
+                f"KV group ticket {ticket.ticket_id} revision changed during "
+                "transaction"
+            )
+            self._fail_pending(reason)
+            raise MemoryTransactionError(reason)
         return transaction
 
     def _consume_pending(self) -> None:
@@ -1809,6 +2411,7 @@ class UnifiedMemoryBroker:
 __all__ = [
     "BINARY_GIB",
     "HY3_Q4_KV_BLOCK_BYTES",
+    "HY3_Q4_ALLOCATOR_HEADROOM_BYTES",
     "HY3_Q4_KV_BLOCK_TOKENS",
     "HY3_Q4_KV_BYTES_PER_TOKEN",
     "HY3_Q4_KV_HEAD_DIM",
@@ -1819,6 +2422,8 @@ __all__ = [
     "BrokerSnapshot",
     "DuplicateReleaseError",
     "ExpertRegrowTicket",
+    "KVAllocationGroupMember",
+    "KVAllocationGroupTicket",
     "KVAllocationTicket",
     "KVPhysicalAllocation",
     "Hy3Q4KVPhysicalGeometry",

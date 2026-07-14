@@ -13,6 +13,7 @@ from mtplx.expert_runtime import (
     ExpertStreamingConfig,
     ExpertStreamingConfigurationError,
     ExpertStreamingRuntime,
+    KVAdmission,
 )
 from mtplx.expert_slots import (
     ExpertSlabReclaimError,
@@ -29,6 +30,7 @@ from mtplx.memory_broker import (
     MemoryAdmissionError,
     MemoryBudget,
     MemoryTelemetryError,
+    MemoryTransactionError,
     UnifiedMemoryBroker,
 )
 from mtplx.mtp_patch import MTPContract
@@ -45,6 +47,24 @@ def _snapshot(*, resident: int, experts: int) -> BrokerSnapshot:
         runtime_workspace_bytes=0,
         allocator_cache_bytes=0,
     )
+
+
+def test_kv_admission_tracks_every_write_and_reports_page_capacity_changes() -> None:
+    calls: list[int] = []
+
+    class Runtime:
+        def _grow_kv_admission(self, admission, tokens: int) -> None:
+            calls.append(tokens)
+            admission.tokens = tokens
+
+    admission = KVAdmission(Runtime(), 17)
+
+    assert admission.grow_to_page_boundary(18, page_size_tokens=16) is False
+    assert admission.grow_to_page_boundary(32, page_size_tokens=16) is False
+    assert admission.grow_to_page_boundary(33, page_size_tokens=16) is True
+    assert admission.grow_to_page_boundary(47, page_size_tokens=16) is False
+    assert admission.grow_to_page_boundary(49, page_size_tokens=16) is True
+    assert calls == [18, 32, 33, 47, 49]
 
 
 class _FakeBank:
@@ -192,6 +212,99 @@ def _runtime(
 
     runtime._sample_allocator_memory = sample_allocator_memory
     return runtime
+
+
+def test_allocator_sample_stabilizes_equal_footprint_and_returns_latest_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = iter(
+        (
+            {
+                "active_memory_bytes": 16,
+                "cache_memory_bytes": 0,
+                "peak_memory_bytes": 100,
+            },
+            {
+                "active_memory_bytes": 10,
+                "cache_memory_bytes": 6,
+                "peak_memory_bytes": 100,
+            },
+        )
+    )
+    calls = 0
+
+    def telemetry(_mx):
+        nonlocal calls
+        calls += 1
+        return next(observations)
+
+    monkeypatch.setattr(expert_runtime_module, "mlx_memory_telemetry", telemetry)
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime._mx_module = object()
+    runtime._last_allocator_sample = AllocatorMemorySample(1, 0, 1)
+
+    sample = runtime._sample_allocator_memory()
+
+    assert calls == 2
+    assert sample == AllocatorMemorySample(10, 6, 100)
+    assert runtime._last_allocator_sample == sample
+
+
+def test_allocator_sample_fails_after_bounded_unstable_footprints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def telemetry(_mx):
+        nonlocal calls
+        calls += 1
+        return {
+            "active_memory_bytes": calls,
+            "cache_memory_bytes": 0,
+            "peak_memory_bytes": 100,
+        }
+
+    monkeypatch.setattr(expert_runtime_module, "mlx_memory_telemetry", telemetry)
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime._mx_module = object()
+    previous = AllocatorMemorySample(1, 0, 1)
+    runtime._last_allocator_sample = previous
+
+    with pytest.raises(MemoryTelemetryError, match="did not stabilize"):
+        runtime._sample_allocator_memory()
+
+    assert calls == 8
+    assert runtime._last_allocator_sample == previous
+
+
+def test_allocator_sample_rejects_regressing_peak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = iter(
+        (
+            {
+                "active_memory_bytes": 10,
+                "cache_memory_bytes": 0,
+                "peak_memory_bytes": 100,
+            },
+            {
+                "active_memory_bytes": 10,
+                "cache_memory_bytes": 0,
+                "peak_memory_bytes": 99,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "mlx_memory_telemetry",
+        lambda _mx: next(observations),
+    )
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime._mx_module = object()
+    runtime._last_allocator_sample = AllocatorMemorySample(1, 0, 1)
+
+    with pytest.raises(MemoryTelemetryError, match="peak regressed"):
+        runtime._sample_allocator_memory()
 
 
 class _StrictNonReentrantLock:
@@ -401,6 +514,7 @@ def test_dynamic_broker_initialization_charges_all_pools_additively(
         expert_slab_slots=2,
         expert_regrow_hysteresis_slabs=1,
         expert_resize_min_interval_ms=1000,
+        allocator_headroom_bytes=0,
     )
     spec = SimpleNamespace(expert_record_bytes=16)
     plan = SimpleNamespace(
@@ -447,6 +561,7 @@ def test_dynamic_broker_initialization_charges_unclassified_active_footprint(
         expert_slab_slots=2,
         expert_regrow_hysteresis_slabs=1,
         expert_resize_min_interval_ms=1000,
+        allocator_headroom_bytes=0,
     )
     spec = SimpleNamespace(expert_record_bytes=16)
     plan = SimpleNamespace(
@@ -794,6 +909,7 @@ def test_runtime_load_calls_post_load_reconciliation_after_mtp_injection() -> No
 
 def test_dynamic_memory_telemetry_reports_complete_bounded_resize_state() -> None:
     broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(allocator_headroom_bytes=1),
         initial_snapshot=_snapshot(resident=36, experts=64),
         expert_slab_bytes=32,
         expert_regrow_hysteresis_slabs=1,
@@ -833,6 +949,10 @@ def test_dynamic_memory_telemetry_reports_complete_bounded_resize_state() -> Non
 
     assert telemetry["operating_target_bytes"] == 110 * BINARY_GIB
     assert telemetry["hard_ceiling_bytes"] == 112 * BINARY_GIB
+    assert telemetry["allocator_headroom_bytes"] == 1
+    assert telemetry["classified_target_bytes"] == 110 * BINARY_GIB - 1
+    assert telemetry["classified_bytes"] == 68
+    assert telemetry["charged_residual_bytes"] == 110 * BINARY_GIB - 68
     assert telemetry["logical_expert_records"] == 4
     assert telemetry["active_expert_records"] == 2
     assert telemetry["resident_expert_records"] == 1
@@ -1030,6 +1150,24 @@ def test_dynamic_plan_is_zero_kv_slab_aligned_and_bounded_by_110_gib() -> None:
     assert plan.allocated_bytes <= 110 * BINARY_GIB
 
 
+def test_static_q4_plan_ceil_rounds_a_partial_physical_page() -> None:
+    config = ExpertStreamingConfig(
+        model_key="hy3-q4",
+        memory_limit_bytes=110 * BINARY_GIB,
+        max_live_kv_tokens=4_097,
+        kv_bytes_per_token_override=84_480,
+        runtime_reserve_bytes=8 * BINARY_GIB,
+        transient_slots=32,
+        cache_scope="global",
+        slot_layout="component-banks",
+    )
+
+    plan = config.memory_plan(HY3_Q4)
+
+    assert plan.context_tokens == 4_097
+    assert plan.kv_bytes == 257 * HY3_Q4_KV_BLOCK_BYTES
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -1128,6 +1266,337 @@ def test_kv_observer_reserves_reclaims_and_commits_exact_growth() -> None:
     assert snapshot.expert_slab_physical_bytes == 32
     assert snapshot.kv_physical_bytes == 32
     assert snapshot.pending_kv_ticket_id is None
+
+
+def test_kv_group_context_holds_one_transaction_until_all_members_commit() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        initial_snapshot=_snapshot(resident=10, experts=0),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(physical_bytes=0),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(10, 0, 10)],
+    )
+    transaction_lock = _StrictNonReentrantLock()
+    runtime._memory_transaction_lock = transaction_lock
+
+    group = runtime.reserve_growth_group(
+        members=(("target:0", 10, 2), ("mtp:1", 20, 3))
+    )
+
+    assert transaction_lock.acquisitions == 1
+    assert transaction_lock._owner == threading.get_ident()
+    assert group.remaining_cache_ids == ("target:0", "mtp:1")
+    assert broker.snapshot().pending_kv_ticket_id == group.ticket.ticket_id
+
+    first = group.commit_member(
+        cache_id="target:0",
+        measured_physical_bytes=7,
+        allocator_before=AllocatorMemorySample(10, 0, 10),
+        allocator_after=AllocatorMemorySample(17, 0, 17),
+    )
+    assert first.cache_id == "target:0"
+    assert first.physical_bytes == 7
+    assert group.remaining_cache_ids == ("mtp:1",)
+    assert transaction_lock.acquisitions == 1
+    assert transaction_lock._owner == threading.get_ident()
+
+    second = group.commit_member(
+        cache_id="mtp:1",
+        measured_physical_bytes=20,
+        allocator_before=AllocatorMemorySample(17, 0, 17),
+        allocator_after=AllocatorMemorySample(37, 0, 37),
+    )
+    assert second.cache_id == "mtp:1"
+    assert second.physical_bytes == 20
+    assert group.remaining_cache_ids == ()
+    assert group.completed is True
+    assert transaction_lock.acquisitions == 1
+    assert transaction_lock._owner is None
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.kv_physical_bytes == 27
+    assert snapshot.owned_kv_physical_bytes == 27
+    assert snapshot.unreconciled_kv_physical_bytes == 0
+
+
+def test_kv_group_reconciles_and_reclaims_once_under_the_outer_transaction() -> None:
+    target = 110 * BINARY_GIB
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=target - 64, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    slots = _FakeSlots()
+    bank = _FakeBank()
+    runtime = _runtime(
+        broker,
+        slots=slots,
+        bank=bank,
+        samples=[
+            AllocatorMemorySample(target, 0, target),
+            AllocatorMemorySample(64, 0, 64),
+            AllocatorMemorySample(32, 0, 64),
+        ],
+    )
+    transaction_lock = _StrictNonReentrantLock()
+    runtime._memory_transaction_lock = transaction_lock
+
+    group = runtime.reserve_growth_group(
+        members=(("target:0", 16, 0), ("mtp:1", 16, 0))
+    )
+
+    assert transaction_lock.acquisitions == 1
+    assert transaction_lock._owner == threading.get_ident()
+    assert slots.prepared == [((0,), 32)]
+    assert bank.deactivated == [(0, 1)]
+    assert broker.snapshot().expert_slab_physical_bytes == 32
+
+    group.commit_member(
+        cache_id="target:0",
+        measured_physical_bytes=16,
+        allocator_before=AllocatorMemorySample(32, 0, 64),
+        allocator_after=AllocatorMemorySample(48, 0, 64),
+    )
+    group.commit_member(
+        cache_id="mtp:1",
+        measured_physical_bytes=16,
+        allocator_before=AllocatorMemorySample(48, 0, 64),
+        allocator_after=AllocatorMemorySample(64, 0, 64),
+    )
+    assert transaction_lock.acquisitions == 1
+    assert transaction_lock._owner is None
+    assert group.completed is True
+
+
+def test_kv_group_zero_abort_preserves_committed_handles_and_releases_lock() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        initial_snapshot=_snapshot(resident=10, experts=0),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(physical_bytes=0),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(10, 0, 10)],
+    )
+    transaction_lock = _StrictNonReentrantLock()
+    runtime._memory_transaction_lock = transaction_lock
+    group = runtime.reserve_growth_group(
+        members=(("target:0", 10, 0), ("mtp:1", 20, 0))
+    )
+    allocation = group.commit_member(
+        cache_id="target:0",
+        measured_physical_bytes=7,
+        allocator_before=AllocatorMemorySample(10, 0, 10),
+        allocator_after=AllocatorMemorySample(17, 0, 17),
+    )
+
+    snapshot = group.abort(observed_uncommitted_physical_bytes=0)
+
+    assert allocation.cache_id == "target:0"
+    assert group.completed is False
+    assert group.aborted is True
+    assert group.remaining_cache_ids == ("mtp:1",)
+    assert transaction_lock._owner is None
+    assert snapshot.kv_physical_bytes == 7
+    assert snapshot.owned_kv_physical_bytes == 7
+    assert snapshot.unreconciled_kv_physical_bytes == 0
+    assert snapshot.failed_closed is False
+
+
+def test_runtime_close_waits_for_kv_group_transaction_to_finish() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        initial_snapshot=_snapshot(resident=10, experts=0),
+        expert_slab_bytes=32,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(physical_bytes=0),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(10, 0, 10)],
+    )
+    group = runtime.reserve_growth_group(
+        members=(("target:0", 10, 0), ("mtp:1", 10, 0))
+    )
+    close_lock_acquired = threading.Event()
+    slots_close_entered = threading.Event()
+    release_slots_close = threading.Event()
+
+    class SignalingCloseLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def acquire(self, *args, **kwargs) -> bool:
+            acquired = self._lock.acquire(*args, **kwargs)
+            if acquired:
+                close_lock_acquired.set()
+            return acquired
+
+        def release(self) -> None:
+            self._lock.release()
+
+    def close_slots(*, timeout: float | None = None) -> None:
+        del timeout
+        slots_close_entered.set()
+        assert release_slots_close.wait(timeout=2)
+
+    runtime._close_lock = SignalingCloseLock()
+    runtime._closed = True
+    runtime._closing = False
+    runtime.slots = SimpleNamespace(close=close_slots)
+    runtime._seal_physical_kv_handoffs = lambda **_kwargs: None
+    runtime._raise_cleanup_error = lambda: None
+    close_errors: list[BaseException] = []
+
+    def close_runtime() -> None:
+        try:
+            runtime.close(timeout=2)
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    thread = threading.Thread(target=close_runtime)
+    thread.start()
+    assert close_lock_acquired.wait(timeout=2)
+    try:
+        assert not slots_close_entered.wait(timeout=0.05)
+        group.abort(observed_uncommitted_physical_bytes=0)
+        assert slots_close_entered.wait(timeout=2)
+    finally:
+        if group._active:
+            group.abort(observed_uncommitted_physical_bytes=0)
+        release_slots_close.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert close_errors == []
+
+
+def test_kv_group_rejects_same_thread_release_boundary_until_finished() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        initial_snapshot=_snapshot(resident=10, experts=0),
+        expert_slab_bytes=32,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(physical_bytes=0),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(10, 0, 10)],
+    )
+    group = runtime.reserve_growth_group(
+        members=(("target:0", 10, 0), ("mtp:1", 10, 0))
+    )
+
+    with pytest.raises(RuntimeError, match="KV growth group is active"):
+        with runtime.physical_kv_release_context():
+            pass
+
+    group.abort(observed_uncommitted_physical_bytes=0)
+    with runtime.physical_kv_release_context():
+        pass
+
+
+def test_kv_group_known_partial_failure_is_unreconciled_and_releases_lock() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        initial_snapshot=_snapshot(resident=10, experts=0),
+        expert_slab_bytes=32,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(physical_bytes=0),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(10, 0, 10)],
+    )
+    transaction_lock = _StrictNonReentrantLock()
+    runtime._memory_transaction_lock = transaction_lock
+    group = runtime.reserve_growth_group(
+        members=(("target:0", 10, 0), ("mtp:1", 10, 0))
+    )
+    allocation = group.commit_member(
+        cache_id="target:0",
+        measured_physical_bytes=7,
+        allocator_before=AllocatorMemorySample(10, 0, 10),
+        allocator_after=AllocatorMemorySample(17, 0, 17),
+    )
+
+    snapshot = group.abort(observed_uncommitted_physical_bytes=3)
+
+    assert allocation.physical_bytes == 7
+    assert group.aborted is True
+    assert transaction_lock._owner is None
+    assert snapshot.kv_physical_bytes == 10
+    assert snapshot.owned_kv_physical_bytes == 7
+    assert snapshot.unreconciled_kv_physical_bytes == 3
+    assert snapshot.failed_closed is True
+
+
+def test_unfinished_kv_group_context_exit_fails_closed_and_releases_lock() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        initial_snapshot=_snapshot(resident=10, experts=0),
+        expert_slab_bytes=32,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(physical_bytes=0),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(10, 0, 10)],
+    )
+    transaction_lock = _StrictNonReentrantLock()
+    runtime._memory_transaction_lock = transaction_lock
+
+    with pytest.raises(MemoryTransactionError, match="unknown physical delta"):
+        with runtime.reserve_growth_group(
+            members=(("target:0", 10, 0), ("mtp:1", 10, 0))
+        ):
+            pass
+
+    assert transaction_lock._owner is None
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.failed_closed is True
+
+
+def test_kv_group_reclaim_preflight_failure_aborts_permit_and_releases_lock() -> None:
+    class ProtectedSlots(_FakeSlots):
+        def protected_slot_ids(self) -> tuple[int, ...]:
+            return (0, 1, 2, 3)
+
+    target = 110 * BINARY_GIB
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=target - 64, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=ProtectedSlots(),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(target, 0, target)],
+    )
+    transaction_lock = _StrictNonReentrantLock()
+    runtime._memory_transaction_lock = transaction_lock
+
+    with pytest.raises(MemoryAdmissionError, match="no unprotected"):
+        runtime.reserve_growth_group(members=(("target:0", 16, 0), ("mtp:1", 16, 0)))
+
+    assert transaction_lock.acquisitions == 1
+    assert transaction_lock._owner is None
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.failed_closed is False
 
 
 def test_kv_observer_reconciles_allocator_truth_before_planning_growth() -> None:

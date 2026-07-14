@@ -22,6 +22,8 @@ def _options(**overrides):
         "max_active_requests": 1,
         "decode_batch_max": 1,
         "session_bank_live_refs": False,
+        "generation_mode": "ar",
+        "load_mtp": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -167,6 +169,21 @@ def test_hy3_q4_dynamic_context_is_disabled_by_default():
 
 def test_hy3_q4_dynamic_context_accepts_only_the_pinned_lane():
     assert validate_hy3_q4_dynamic_context_options(_options(), _expert_config()) is True
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"generation_mode": "mtp"}, "generation-mode ar"),
+        ({"load_mtp": True}, "no-load-mtp"),
+    ],
+)
+def test_hy3_q4_dynamic_context_rejects_mtp_startup_options(override, message):
+    with pytest.raises(ValueError, match=message):
+        validate_hy3_q4_dynamic_context_options(
+            _options(**override),
+            _expert_config(),
+        )
 
 
 @pytest.mark.parametrize("mode", ["off", "q8"])

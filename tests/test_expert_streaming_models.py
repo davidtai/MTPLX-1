@@ -132,6 +132,51 @@ def test_memory_plan_turns_a_total_limit_into_whole_per_layer_slots(
     assert plan.allocated_bytes <= plan.total_limit_bytes
 
 
+def test_allocator_headroom_is_reserved_outside_fixed_and_expert_pools() -> None:
+    spec = get_model_spec("hy3-q4")
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    headroom = GIB
+    rounding = 12_345
+    total = fixed + headroom + 2 * spec.expert_record_bytes + rounding
+
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=total,
+        context_tokens=0,
+        allocator_headroom_bytes=headroom,
+        cache_scope="global",
+    )
+
+    assert plan.allocator_headroom_bytes == headroom
+    assert plan.fixed_bytes == fixed
+    assert plan.persistent_slots == 2
+    assert plan.persistent_cache_bytes == 2 * spec.expert_record_bytes
+    assert plan.unallocated_bytes == headroom + rounding
+    assert plan.rounding_residual_bytes == rounding
+    assert plan.fits_fixed is True
+    assert plan.fits_headroom is True
+    assert plan.allocated_bytes + plan.unallocated_bytes == total
+
+    no_room = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed,
+        context_tokens=0,
+        allocator_headroom_bytes=1,
+    )
+    assert no_room.fits_fixed is True
+    assert no_room.fits_headroom is False
+    assert no_room.unallocated_bytes == 0
+
+    for invalid in (-1, True):
+        with pytest.raises((TypeError, ValueError), match="allocator_headroom_bytes"):
+            plan_expert_memory(
+                spec,
+                total_limit_bytes=total,
+                context_tokens=0,
+                allocator_headroom_bytes=invalid,  # type: ignore[arg-type]
+            )
+
+
 def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None:
     spec = get_model_spec("glm52-q4")
     per_layer_bank_slot = spec.persistent_cache_bytes(1)
@@ -153,7 +198,9 @@ def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None
     assert plan.unallocated_bytes == spec.persistent_cache_bytes(28)
 
 
-def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding() -> None:
+def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding() -> (
+    None
+):
     spec = get_model_spec("hy3-q4")
     expert_cache_limit = 80 * GIB
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
@@ -174,7 +221,9 @@ def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding()
     )
 
     assert layer_plan.persistent_slots == 79 * 102
-    assert global_plan.persistent_slots == expert_cache_limit // spec.expert_record_bytes
+    assert (
+        global_plan.persistent_slots == expert_cache_limit // spec.expert_record_bytes
+    )
     assert global_plan.persistent_slots == 8_090
     assert global_plan.persistent_cache_bytes > layer_plan.persistent_cache_bytes
     assert 0 <= global_plan.unallocated_bytes < spec.expert_record_bytes
@@ -409,3 +458,35 @@ def test_memory_planner_cli_returns_json_and_exit_two_for_fixed_deficit() -> Non
     assert payload["plan"]["fits_fixed"] is False
     assert payload["plan"]["persistent_slots_per_layer"] == 0
     assert payload["plan"]["unallocated_bytes"] < 0
+
+
+def test_memory_planner_cli_reserves_allocator_headroom_explicitly() -> None:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "plan_expert_memory.py"),
+            "--model",
+            "hy3-q4",
+            "--memory-limit-gib",
+            "110",
+            "--context-tokens",
+            "131072",
+            "--runtime-reserve-gib",
+            "8",
+            "--allocator-headroom-gib",
+            "1",
+        ],
+        cwd=ROOT,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    plan = json.loads(proc.stdout)["plan"]
+    assert plan["allocator_headroom_bytes"] == GIB
+    assert plan["allocator_headroom_gib_input"] == "1"
+    assert plan["fits_headroom"] is True
+    assert plan["rounding_residual_bytes"] == plan["unallocated_bytes"] - GIB

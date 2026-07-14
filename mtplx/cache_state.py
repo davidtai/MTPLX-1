@@ -14,7 +14,14 @@ import time
 from typing import Any, Protocol
 
 from .attention_context import current_attention_phase
-from .memory_broker import TerminalizedKVReleaseError
+from .memory_broker import (
+    HY3_Q4_KV_BLOCK_BYTES,
+    HY3_Q4_KV_BLOCK_TOKENS,
+    HY3_Q4_KV_HEAD_DIM,
+    HY3_Q4_KV_HEADS,
+    HY3_Q4_KV_LAYERS,
+    TerminalizedKVReleaseError,
+)
 
 SUPPORTED_DETACH_MODES = {
     "eval_only",
@@ -51,6 +58,12 @@ class KVPhysicalAllocationObserver(Protocol):
         transient_delta_bytes: int,
     ) -> Any: ...
 
+    def reserve_growth_group(
+        self,
+        *,
+        members: tuple[tuple[str, int, int], ...],
+    ) -> Any: ...
+
     def commit_growth(
         self,
         ticket: Any,
@@ -82,6 +95,12 @@ class KVPhysicalAllocationObserver(Protocol):
         allocator_before: Any | None,
         allocator_after: Any | None,
     ) -> None: ...
+
+
+@dataclass(frozen=True)
+class _KVGroupMemberReservation:
+    group: Any
+    cache_id: str
 
 
 _PHYSICAL_KV_CACHE_SCOPE: ContextVar[list[Any] | None] = ContextVar(
@@ -975,6 +994,8 @@ class VllmMetalPagedKVCache:
             ):
                 raise ValueError("physical KV brokering requires plain paged Q4")
         self._kv_allocations: list[Any] = []
+        self._active_growth_group: Any | None = None
+        self._active_growth_spec: tuple[int, int] | None = None
         self._committed_physical_bytes = 0
         self._closed = False
         self._close_started = False
@@ -999,6 +1020,24 @@ class VllmMetalPagedKVCache:
         self.kv_quant_dequant_calls = 0
         self.kv_quant_dequant_time_s = 0.0
         self.kv_quant_dequant_tokens = 0
+        self.q4_chunked_dequant_attention_calls = 0
+        self.q4_chunked_dequant_attention_calls_by_phase: dict[str, int] = {}
+        self.q4_chunked_dequant_attention_path_by_phase: dict[str, str] = {}
+        self.q4_chunked_dequant_calls = 0
+        self.q4_chunked_dequant_time_s = 0.0
+        self.q4_chunked_dequant_tokens = 0
+        self.q4_chunked_dequant_expected_unique_tokens_by_phase: dict[str, int] = {}
+        self.q4_chunked_dequant_unique_tokens_by_phase: dict[str, int] = {}
+        self.q4_chunked_dequant_coverage_failures = 0
+        self.q4_chunked_dequant_realized_calls = 0
+        self.q4_chunked_dequant_configured_chunk_tokens = 0
+        self.q4_chunked_dequant_realized_peak_chunk_tokens = 0
+        self.q4_chunked_dequant_realized_peak_chunk_tokens_by_phase: dict[str, int] = {}
+        self.q4_chunked_dequant_realized_source_bytes_per_token = 0
+        self.q4_chunked_dequant_realized_compute_bytes_per_token = 0
+        self.q4_chunked_dequant_realized_bytes_per_token = 0
+        self.q4_chunked_dequant_realized_peak_chunk_bytes = 0
+        self.q4_chunked_dequant_realized_peak_chunk_bytes_by_phase: dict[str, int] = {}
         self.dense_fallback_calls = 0
         self.dense_fallback_calls_by_phase: dict[str, int] = {}
         self.paged_attention_bailouts_by_phase_reason: dict[str, int] = {}
@@ -1074,6 +1113,30 @@ class VllmMetalPagedKVCache:
     ) -> Any | None:
         if self.allocation_observer is None:
             return None
+        if self._active_growth_group is not None:
+            expected = self._active_growth_spec
+            actual = (int(steady_delta_bytes), int(transient_delta_bytes))
+            if expected != actual:
+                raise RuntimeError(
+                    "aggregate Q4 member growth drifted from its preflight "
+                    f"for {self.cache_id}: expected {expected}, got {actual}"
+                )
+            return _KVGroupMemberReservation(
+                group=self._active_growth_group,
+                cache_id=self.cache_id,
+            )
+        if (
+            _env_truthy("MTPLX_DYNAMIC_PAGED_KV")
+            and getattr(
+                self.allocation_observer,
+                "memory_broker",
+                None,
+            )
+            is not None
+        ):
+            raise RuntimeError(
+                "strict dynamic broker requires an aggregate Q4 growth group"
+            )
         return self.allocation_observer.reserve_growth(
             cache_id=self.cache_id,
             steady_delta_bytes=steady_delta_bytes,
@@ -1090,12 +1153,20 @@ class VllmMetalPagedKVCache:
     ) -> None:
         if ticket is None:
             return
-        allocation = self.allocation_observer.commit_growth(
-            ticket,
-            measured_physical_bytes=measured,
-            allocator_before=allocator_before,
-            allocator_after=allocator_after,
-        )
+        if isinstance(ticket, _KVGroupMemberReservation):
+            allocation = ticket.group.commit_member(
+                cache_id=ticket.cache_id,
+                measured_physical_bytes=measured,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        else:
+            allocation = self.allocation_observer.commit_growth(
+                ticket,
+                measured_physical_bytes=measured,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
         self._kv_allocations.append(allocation)
         self._committed_physical_bytes += measured
 
@@ -1109,12 +1180,19 @@ class VllmMetalPagedKVCache:
     ) -> None:
         if ticket is None:
             return
-        self.allocation_observer.abort_growth(
-            ticket,
-            observed_physical_bytes=observed_physical_bytes,
-            allocator_before=allocator_before,
-            allocator_after=allocator_after,
-        )
+        if isinstance(ticket, _KVGroupMemberReservation):
+            ticket.group.abort(
+                observed_uncommitted_physical_bytes=observed_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        else:
+            self.allocation_observer.abort_growth(
+                ticket,
+                observed_physical_bytes=observed_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
 
     def _sample_allocator_memory(self) -> Any | None:
         if self.allocation_observer is None:
@@ -1193,11 +1271,17 @@ class VllmMetalPagedKVCache:
         required_blocks = (
             int(required_tokens) + self.block_size - 1
         ) // self.block_size
-        grown_blocks = max(
-            required_blocks,
-            int((self.num_blocks * 3 + 1) // 2),
-            int(self.num_blocks) + 1,
-        )
+        if self.allocation_observer is not None:
+            # Broker-owned Q4 pages are authoritative charged memory. Allocate
+            # only the exact block-rounded demand so geometric spare capacity
+            # cannot silently consume expert-slab budget.
+            grown_blocks = required_blocks
+        else:
+            grown_blocks = max(
+                required_blocks,
+                int((self.num_blocks * 3 + 1) // 2),
+                int(self.num_blocks) + 1,
+            )
         if grown_blocks <= self.num_blocks:
             return True
         if self.key_cache is None or self.value_cache is None:
@@ -1907,6 +1991,343 @@ class VllmMetalPagedKVCache:
             None, ...
         ]
 
+    def _q4_streaming_attention(
+        self,
+        queries: Any,
+        *,
+        scale: float,
+        sliding_window: int,
+        mask: Any | None,
+    ):
+        """Run exact Q4 attention without a whole-history dequantized view.
+
+        Every K/V chunk is explicitly evaluated before use.  The online
+        softmax state is then evaluated before the chunk references are
+        released, bounding the realized dequantized K/V working set by the
+        configured chunk size instead of the total cache offset.
+        """
+
+        import mlx.core as mx
+
+        if (
+            not self.kv_quant
+            or getattr(self.kv_quant_config, "normalized_mode", "") != "q4"
+        ):
+            raise RuntimeError("Q4 streaming attention requires plain paged Q4")
+        q_len = int(queries.shape[2])
+        if self._shape is None or self._dtypes is None:
+            self._record_paged_bailout(
+                "kv_quant_shape_unavailable",
+                impl="q4_streaming_softmax",
+                offset=int(self.offset),
+                q_len=q_len,
+                sliding_window=int(sliding_window),
+            )
+            return None
+        if int(sliding_window) > 0:
+            self._record_paged_bailout(
+                "q4_sliding_window_unsupported",
+                impl="q4_streaming_softmax",
+                offset=int(self.offset),
+                q_len=q_len,
+                sliding_window=int(sliding_window),
+            )
+            return None
+        if mask is not None and mask != "causal":
+            self._record_paged_bailout(
+                "unsupported_mask",
+                impl="q4_streaming_softmax",
+                offset=int(self.offset),
+                q_len=q_len,
+                sliding_window=int(sliding_window),
+            )
+            return None
+
+        q_chunk_size = max(
+            1,
+            _env_int("MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE", 2048),
+        )
+        kv_chunk_size = max(
+            1,
+            _env_int("MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE", 1024),
+        )
+        if self.q4_chunked_dequant_configured_chunk_tokens not in {
+            0,
+            kv_chunk_size,
+        }:
+            self.q4_chunked_dequant_coverage_failures += 1
+            raise RuntimeError(
+                "Q4 streaming K/V chunk size changed while a cache was live"
+            )
+
+        cached_prefix_len = max(0, int(self.offset) - q_len)
+        query_heads = int(queries.shape[1])
+        value_head_dim = int(self._shape[2])
+        outputs: list[Any] = []
+        covered_ranges: list[tuple[int, int]] = []
+        realized_calls = 0
+        realized_tokens = 0
+        realized_time_s = 0.0
+        realized_peak_tokens = 0
+        realized_peak_bytes = 0
+        realized_source_bytes_per_token = 0
+        realized_compute_bytes_per_token = 0
+        realized_bytes_per_token = 0
+        very_negative = mx.array(-1.0e30, dtype=mx.float32)
+        eps = mx.array(1.0e-20, dtype=mx.float32)
+
+        for q_start in range(0, q_len, q_chunk_size):
+            q_end = min(q_len, q_start + q_chunk_size)
+            q = queries[:, :, q_start:q_end, :].astype(mx.float32)
+            q_positions = cached_prefix_len + mx.arange(q_start, q_end)
+            max_key_for_chunk = min(int(self.offset), cached_prefix_len + q_end)
+            running_max = mx.full(
+                (int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), 1),
+                very_negative,
+                dtype=mx.float32,
+            )
+            running_denom = mx.zeros_like(running_max)
+            running_acc = mx.zeros(
+                (
+                    int(q.shape[0]),
+                    int(q.shape[1]),
+                    int(q.shape[2]),
+                    value_head_dim,
+                ),
+                dtype=mx.float32,
+            )
+            for k_start in range(0, max_key_for_chunk, kv_chunk_size):
+                k_end = min(max_key_for_chunk, k_start + kv_chunk_size)
+                if k_end <= k_start:
+                    continue
+
+                dequant_started = time.perf_counter()
+                chunk_keys, chunk_values = self._paged_range(k_start, k_end)
+                k = chunk_keys.astype(mx.float32)
+                v = chunk_values.astype(mx.float32)
+                # Realize only this K/V chunk.  The subsequent eval realizes
+                # the online-softmax update before these references are
+                # dropped, preventing a cache-length lazy graph from forming.
+                mx.eval(k, v)
+                realized_time_s += time.perf_counter() - dequant_started
+                chunk_tokens = k_end - k_start
+                # Both representations are simultaneously live until the
+                # evaluated online-softmax state releases this chunk: the
+                # cache-dtype dequantized K/V returned by ``_paged_range`` and
+                # the FP32 K/V consumed by the stable accumulator.  Reporting
+                # only the latter undercounts the realized working set by the
+                # cache-dtype pair (50% for Hy3 BF16 -> FP32).
+                source_chunk_bytes = int(chunk_keys.nbytes) + int(chunk_values.nbytes)
+                compute_chunk_bytes = int(k.nbytes) + int(v.nbytes)
+                chunk_bytes = source_chunk_bytes + compute_chunk_bytes
+                if chunk_bytes % chunk_tokens:
+                    self.q4_chunked_dequant_coverage_failures += 1
+                    raise RuntimeError("Q4 realized chunk bytes are not token-exact")
+                source_bytes_per_token = source_chunk_bytes // chunk_tokens
+                compute_bytes_per_token = compute_chunk_bytes // chunk_tokens
+                bytes_per_token = chunk_bytes // chunk_tokens
+                if realized_source_bytes_per_token not in {
+                    0,
+                    source_bytes_per_token,
+                }:
+                    self.q4_chunked_dequant_coverage_failures += 1
+                    raise RuntimeError("Q4 source chunk byte geometry drifted")
+                if realized_compute_bytes_per_token not in {
+                    0,
+                    compute_bytes_per_token,
+                }:
+                    self.q4_chunked_dequant_coverage_failures += 1
+                    raise RuntimeError("Q4 compute chunk byte geometry drifted")
+                if realized_bytes_per_token not in {0, bytes_per_token}:
+                    self.q4_chunked_dequant_coverage_failures += 1
+                    raise RuntimeError("Q4 realized chunk byte geometry drifted")
+                realized_source_bytes_per_token = source_bytes_per_token
+                realized_compute_bytes_per_token = compute_bytes_per_token
+                realized_bytes_per_token = bytes_per_token
+                realized_calls += 1
+                realized_tokens += chunk_tokens
+                realized_peak_tokens = max(realized_peak_tokens, chunk_tokens)
+                realized_peak_bytes = max(realized_peak_bytes, chunk_bytes)
+                covered_ranges.append((k_start, k_end))
+
+                kv_heads = int(k.shape[1])
+                if kv_heads != query_heads and query_heads % kv_heads:
+                    self._record_paged_bailout(
+                        "q4_gqa_shape_unsupported",
+                        impl="q4_streaming_softmax",
+                        offset=int(self.offset),
+                        q_len=q_len,
+                        sliding_window=int(sliding_window),
+                    )
+                    return None
+                repeat = query_heads // kv_heads if kv_heads != query_heads else 1
+                if repeat > 1:
+                    q_for_scores = q.reshape(
+                        int(q.shape[0]),
+                        kv_heads,
+                        repeat,
+                        int(q.shape[2]),
+                        int(q.shape[3]),
+                    )
+                    scores = mx.matmul(
+                        q_for_scores,
+                        k[:, :, None, :, :].transpose(0, 1, 2, 4, 3),
+                    ).reshape(
+                        int(q.shape[0]),
+                        query_heads,
+                        int(q.shape[2]),
+                        int(k.shape[2]),
+                    ) * float(scale)
+                else:
+                    scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * float(scale)
+                if mask == "causal":
+                    key_positions = mx.arange(k_start, k_end)
+                    allowed = q_positions[:, None] >= key_positions[None, :]
+                    valid = mx.any(allowed, axis=-1, keepdims=True)
+                    scores = mx.where(allowed[None, None, :, :], scores, very_negative)
+                else:
+                    valid = mx.ones(scores.shape[:-1] + (1,), dtype=mx.bool_)
+                local_max = mx.max(scores, axis=-1, keepdims=True)
+                local_max = mx.where(valid, local_max, very_negative)
+                weights = mx.where(valid, mx.exp(scores - local_max), 0.0)
+                local_denom = mx.sum(weights, axis=-1, keepdims=True)
+                if repeat > 1:
+                    local_acc = mx.matmul(
+                        weights.reshape(
+                            int(q.shape[0]),
+                            kv_heads,
+                            repeat,
+                            int(q.shape[2]),
+                            int(k.shape[2]),
+                        ),
+                        v[:, :, None, :, :],
+                    ).reshape(
+                        int(q.shape[0]),
+                        query_heads,
+                        int(q.shape[2]),
+                        int(v.shape[3]),
+                    )
+                else:
+                    local_acc = mx.matmul(weights, v)
+                next_max = mx.maximum(running_max, local_max)
+                old_scale = mx.exp(running_max - next_max)
+                new_scale = mx.where(valid, mx.exp(local_max - next_max), 0.0)
+                next_acc = running_acc * old_scale + local_acc * new_scale
+                next_denom = running_denom * old_scale + local_denom * new_scale
+                # This is the lifetime boundary: once the evaluated online
+                # state replaces the prior state, no K/V chunk is retained by
+                # an unevaluated cache-length dependency graph.
+                mx.eval(next_acc, next_denom, next_max)
+                running_acc = next_acc
+                running_denom = next_denom
+                running_max = next_max
+                del (
+                    chunk_keys,
+                    chunk_values,
+                    k,
+                    local_acc,
+                    local_denom,
+                    local_max,
+                    next_acc,
+                    next_denom,
+                    next_max,
+                    old_scale,
+                    scores,
+                    v,
+                    valid,
+                    weights,
+                )
+                if mask == "causal":
+                    del allowed, key_positions
+                if repeat > 1:
+                    del q_for_scores
+
+            output_chunk = running_acc / mx.maximum(running_denom, eps)
+            mx.eval(output_chunk)
+            outputs.append(output_chunk)
+
+        if not outputs:
+            return None
+
+        merged_ranges: list[tuple[int, int]] = []
+        for range_start, range_end in sorted(covered_ranges):
+            if not merged_ranges or range_start > merged_ranges[-1][1]:
+                merged_ranges.append((range_start, range_end))
+                continue
+            prior_start, prior_end = merged_ranges[-1]
+            merged_ranges[-1] = (prior_start, max(prior_end, range_end))
+        unique_tokens = sum(end - start for start, end in merged_ranges)
+        expected_tokens = int(self.offset)
+        if merged_ranges != [(0, int(self.offset))] or unique_tokens != expected_tokens:
+            self.q4_chunked_dequant_coverage_failures += 1
+            raise RuntimeError(
+                "Q4 streaming attention did not cover the exact active key range"
+            )
+
+        output = mx.concatenate(outputs, axis=2).astype(queries.dtype)
+        mx.eval(output)
+        phase = current_attention_phase()
+        path = "q4_streaming_softmax"
+        self.q4_chunked_dequant_attention_calls += 1
+        self.q4_chunked_dequant_attention_calls_by_phase[phase] = (
+            int(self.q4_chunked_dequant_attention_calls_by_phase.get(phase, 0)) + 1
+        )
+        self.q4_chunked_dequant_attention_path_by_phase[phase] = path
+        self.q4_chunked_dequant_calls += realized_calls
+        self.q4_chunked_dequant_realized_calls += realized_calls
+        self.q4_chunked_dequant_time_s += realized_time_s
+        self.q4_chunked_dequant_tokens += realized_tokens
+        self.q4_chunked_dequant_expected_unique_tokens_by_phase[phase] = (
+            int(self.q4_chunked_dequant_expected_unique_tokens_by_phase.get(phase, 0))
+            + expected_tokens
+        )
+        self.q4_chunked_dequant_unique_tokens_by_phase[phase] = (
+            int(self.q4_chunked_dequant_unique_tokens_by_phase.get(phase, 0))
+            + unique_tokens
+        )
+        self.q4_chunked_dequant_configured_chunk_tokens = kv_chunk_size
+        self.q4_chunked_dequant_realized_peak_chunk_tokens = max(
+            self.q4_chunked_dequant_realized_peak_chunk_tokens,
+            realized_peak_tokens,
+        )
+        self.q4_chunked_dequant_realized_peak_chunk_tokens_by_phase[phase] = max(
+            int(
+                self.q4_chunked_dequant_realized_peak_chunk_tokens_by_phase.get(
+                    phase, 0
+                )
+            ),
+            realized_peak_tokens,
+        )
+        self.q4_chunked_dequant_realized_source_bytes_per_token = (
+            realized_source_bytes_per_token
+        )
+        self.q4_chunked_dequant_realized_compute_bytes_per_token = (
+            realized_compute_bytes_per_token
+        )
+        self.q4_chunked_dequant_realized_bytes_per_token = realized_bytes_per_token
+        self.q4_chunked_dequant_realized_peak_chunk_bytes = max(
+            self.q4_chunked_dequant_realized_peak_chunk_bytes,
+            realized_peak_bytes,
+        )
+        self.q4_chunked_dequant_realized_peak_chunk_bytes_by_phase[phase] = max(
+            int(
+                self.q4_chunked_dequant_realized_peak_chunk_bytes_by_phase.get(phase, 0)
+            ),
+            realized_peak_bytes,
+        )
+        # This legacy field describes only the large-query kernel.  Q4 now has
+        # phase-indexed truth for every query length, so do not leave a stale
+        # prefill claim after decode.
+        self.paged_attention_large_q_path = ""
+        if _env_truthy("MTPLX_PREFILL_ROUTE_TRACE"):
+            print(
+                "mtplx_prefill_route "
+                f"path={path} phase={phase} offset={int(self.offset)} "
+                f"q_len={q_len} q_chunk={q_chunk_size} kv_chunk={kv_chunk_size}",
+                file=sys.stderr,
+            )
+        return output
+
     def _large_q_split_sdpa_fallback(
         self,
         queries: Any,
@@ -1937,6 +2358,31 @@ class VllmMetalPagedKVCache:
             return None
 
         q_len = int(queries.shape[2])
+        q4_chunked_dequant = bool(
+            self.kv_quant
+            and getattr(self.kv_quant_config, "normalized_mode", "") == "q4"
+        )
+        if q4_chunked_dequant:
+            return self._q4_streaming_attention(
+                queries,
+                scale=scale,
+                sliding_window=sliding_window,
+                mask=mask,
+            )
+        if self.kv_quant and self._shape is None:
+            self._record_paged_bailout(
+                "kv_quant_shape_unavailable",
+                impl="large_q_split_sdpa",
+                offset=int(self.offset),
+                q_len=q_len,
+                sliding_window=int(sliding_window),
+            )
+            return None
+        value_head_dim = (
+            int(self._shape[2])
+            if self.kv_quant and self._shape is not None
+            else int(self.value_cache.shape[3])
+        )
         if _env_truthy("MTPLX_ASSERT_NO_LARGE_Q_SPLIT_FALLBACK"):
             raise RuntimeError(
                 "large-q split SDPA fallback was invoked while "
@@ -1977,7 +2423,7 @@ class VllmMetalPagedKVCache:
                     int(q.shape[0]),
                     int(q.shape[1]),
                     int(q.shape[2]),
-                    int(self.value_cache.shape[3]),
+                    value_head_dim,
                 ),
                 dtype=mx.float32,
             )
@@ -1989,7 +2435,14 @@ class VllmMetalPagedKVCache:
                 )
                 if k_end <= k_start:
                     continue
+                dequant_started = time.perf_counter()
                 keys, values = self._paged_range(k_start, k_end)
+                if q4_chunked_dequant:
+                    self.q4_chunked_dequant_calls += 1
+                    self.q4_chunked_dequant_time_s += (
+                        time.perf_counter() - dequant_started
+                    )
+                    self.q4_chunked_dequant_tokens += k_end - k_start
                 kv_heads = int(keys.shape[1])
                 if kv_heads != query_heads and query_heads % kv_heads:
                     return None
@@ -2061,11 +2514,15 @@ class VllmMetalPagedKVCache:
         self.large_q_split_sdpa_fallback_calls_by_phase[phase] = (
             int(self.large_q_split_sdpa_fallback_calls_by_phase.get(phase, 0)) + 1
         )
-        self.paged_attention_large_q_path = "large_q_split_sdpa_fallback"
+        if q4_chunked_dequant:
+            self.q4_chunked_dequant_attention_calls += 1
+            self.paged_attention_large_q_path = "q4_chunked_dequant_attention"
+        else:
+            self.paged_attention_large_q_path = "large_q_split_sdpa_fallback"
         if _env_truthy("MTPLX_PREFILL_ROUTE_TRACE"):
             print(
                 "mtplx_prefill_route "
-                f"path=large_q_split_sdpa_fallback phase={phase} "
+                f"path={self.paged_attention_large_q_path} phase={phase} "
                 f"offset={int(self.offset)} q_len={q_len} "
                 f"q_chunk={q_chunk_size} kv_chunk={kv_chunk_size}",
                 file=sys.stderr,
@@ -2619,6 +3076,24 @@ class VllmMetalPagedKVCache:
             return bailout("batch_not_1")
         if q_len <= 0:
             return bailout("q_len_invalid")
+        if (
+            self.kv_quant
+            and getattr(self.kv_quant_config, "normalized_mode", "") == "q4"
+        ):
+            q4_out = self._q4_streaming_attention(
+                queries,
+                scale=scale,
+                sliding_window=int(sliding_window),
+                mask=mask,
+            )
+            if q4_out is None:
+                raise RuntimeError(
+                    "Q4 paged attention has no bounded streaming-softmax path"
+                )
+            self.paged_attention_calls += 1
+            self.kv_quant_attention_calls += 1
+            self.attention_time_s += time.perf_counter() - started
+            return q4_out
         if self.turboquant and impl in {
             "fast_sdpa_gather",
             "sdpa_gather",
@@ -2938,6 +3413,54 @@ class VllmMetalPagedKVCache:
             "kv_quant_dequant_calls": int(self.kv_quant_dequant_calls),
             "kv_quant_dequant_time_s": float(self.kv_quant_dequant_time_s),
             "kv_quant_dequant_tokens": int(self.kv_quant_dequant_tokens),
+            "q4_chunked_dequant_attention_calls": int(
+                self.q4_chunked_dequant_attention_calls
+            ),
+            "q4_chunked_dequant_attention_calls_by_phase": dict(
+                self.q4_chunked_dequant_attention_calls_by_phase
+            ),
+            "q4_chunked_dequant_attention_path_by_phase": dict(
+                self.q4_chunked_dequant_attention_path_by_phase
+            ),
+            "q4_chunked_dequant_calls": int(self.q4_chunked_dequant_calls),
+            "q4_chunked_dequant_time_s": float(self.q4_chunked_dequant_time_s),
+            "q4_chunked_dequant_tokens": int(self.q4_chunked_dequant_tokens),
+            "q4_chunked_dequant_expected_unique_tokens_by_phase": dict(
+                self.q4_chunked_dequant_expected_unique_tokens_by_phase
+            ),
+            "q4_chunked_dequant_unique_tokens_by_phase": dict(
+                self.q4_chunked_dequant_unique_tokens_by_phase
+            ),
+            "q4_chunked_dequant_coverage_failures": int(
+                self.q4_chunked_dequant_coverage_failures
+            ),
+            "q4_chunked_dequant_realized_calls": int(
+                self.q4_chunked_dequant_realized_calls
+            ),
+            "q4_chunked_dequant_configured_chunk_tokens": int(
+                self.q4_chunked_dequant_configured_chunk_tokens
+            ),
+            "q4_chunked_dequant_realized_peak_chunk_tokens": int(
+                self.q4_chunked_dequant_realized_peak_chunk_tokens
+            ),
+            "q4_chunked_dequant_realized_peak_chunk_tokens_by_phase": dict(
+                self.q4_chunked_dequant_realized_peak_chunk_tokens_by_phase
+            ),
+            "q4_chunked_dequant_realized_source_bytes_per_token": int(
+                self.q4_chunked_dequant_realized_source_bytes_per_token
+            ),
+            "q4_chunked_dequant_realized_compute_bytes_per_token": int(
+                self.q4_chunked_dequant_realized_compute_bytes_per_token
+            ),
+            "q4_chunked_dequant_realized_bytes_per_token": int(
+                self.q4_chunked_dequant_realized_bytes_per_token
+            ),
+            "q4_chunked_dequant_realized_peak_chunk_bytes": int(
+                self.q4_chunked_dequant_realized_peak_chunk_bytes
+            ),
+            "q4_chunked_dequant_realized_peak_chunk_bytes_by_phase": dict(
+                self.q4_chunked_dequant_realized_peak_chunk_bytes_by_phase
+            ),
             "dense_fallback_calls": int(self.dense_fallback_calls),
             "prefill_dense_fallback_calls": int(
                 self.dense_fallback_calls_by_phase.get("prefill", 0)
@@ -3751,6 +4274,176 @@ def install_block_owned_attention_kv_cache(
         )
         stats["entries"] = int(stats["entries"]) + 1
     return stats
+
+
+def prepare_brokered_q4_cache_group(
+    cache: list[Any] | tuple[Any, ...],
+    *,
+    required_tokens: int | None = None,
+    append_tokens: int | None = None,
+) -> dict[str, int]:
+    """Allocate or grow all strict Hy3 target pages before model execution.
+
+    MLX allocator samples form one exact chain only while unrelated model and
+    expert allocations are excluded.  This helper therefore plans the full
+    80-entry cache as one broker transaction, then materializes every member
+    back-to-back before the forward pass may begin.
+    """
+
+    entries = tuple(
+        entry
+        for entry in cache or ()
+        if isinstance(entry, VllmMetalPagedKVCache)
+        and entry.allocation_observer is not None
+    )
+    if not entries:
+        return {
+            "entries": 0,
+            "allocated_entries": 0,
+            "grown_entries": 0,
+            "target_blocks": 0,
+        }
+    if len(entries) != HY3_Q4_KV_LAYERS:
+        raise RuntimeError(
+            "brokered Hy3 Q4 target cache must contain exactly "
+            f"{HY3_Q4_KV_LAYERS} attention entries; got {len(entries)}"
+        )
+    if any(not entry.cache_id.startswith("target:") for entry in entries):
+        raise RuntimeError(
+            "strict dynamic Q4 cache grouping supports target AR caches only"
+        )
+    observer = entries[0].allocation_observer
+    if any(entry.allocation_observer is not observer for entry in entries[1:]):
+        raise RuntimeError("brokered Q4 cache entries must share one observer")
+    if any(entry.block_size != HY3_Q4_KV_BLOCK_TOKENS for entry in entries):
+        raise RuntimeError("brokered Hy3 Q4 cache block geometry drifted")
+    if len({entry.cache_id for entry in entries}) != len(entries):
+        raise RuntimeError("brokered Hy3 Q4 cache ids must be unique")
+    if any(entry._active_growth_group is not None for entry in entries):
+        raise RuntimeError("brokered Hy3 Q4 cache growth groups cannot nest")
+
+    block_counts = {int(entry.num_blocks) for entry in entries}
+    offsets = {int(entry.offset) for entry in entries}
+    allocation_states = {
+        entry.key_cache is not None and entry.value_cache is not None
+        for entry in entries
+    }
+    if len(block_counts) != 1 or len(offsets) != 1 or len(allocation_states) != 1:
+        raise RuntimeError("brokered Hy3 Q4 cache entries have unequal physical state")
+    allocated = allocation_states.pop()
+    if any(
+        (entry.key_cache is None) is not (entry.value_cache is None)
+        for entry in entries
+    ):
+        raise RuntimeError("brokered Hy3 Q4 cache has a partial K/V allocation")
+
+    current_blocks = block_counts.pop()
+    current_offset = offsets.pop()
+    if required_tokens is not None and append_tokens is not None:
+        raise ValueError("required_tokens and append_tokens are mutually exclusive")
+    if append_tokens is not None:
+        if isinstance(append_tokens, bool) or not isinstance(append_tokens, int):
+            raise TypeError("append_tokens must be an exact integer")
+        if append_tokens <= 0:
+            raise ValueError("append_tokens must be positive")
+        required_tokens = current_offset + append_tokens
+    if required_tokens is None:
+        if allocated:
+            return {
+                "entries": len(entries),
+                "allocated_entries": 0,
+                "grown_entries": 0,
+                "target_blocks": current_blocks,
+            }
+        target_blocks = current_blocks
+    else:
+        if isinstance(required_tokens, bool) or not isinstance(required_tokens, int):
+            raise TypeError("required_tokens must be an exact integer")
+        if required_tokens <= 0:
+            raise ValueError("required_tokens must be positive")
+        target_blocks = (
+            int(required_tokens) + HY3_Q4_KV_BLOCK_TOKENS - 1
+        ) // HY3_Q4_KV_BLOCK_TOKENS
+        if not allocated:
+            raise RuntimeError(
+                "brokered Q4 pages must be initialized before forward growth"
+            )
+        if target_blocks <= current_blocks:
+            return {
+                "entries": len(entries),
+                "allocated_entries": 0,
+                "grown_entries": 0,
+                "target_blocks": current_blocks,
+            }
+
+    per_entry_block_bytes = HY3_Q4_KV_BLOCK_BYTES // HY3_Q4_KV_LAYERS
+    if per_entry_block_bytes * HY3_Q4_KV_LAYERS != HY3_Q4_KV_BLOCK_BYTES:
+        raise RuntimeError("Hy3 Q4 per-entry block geometry is not exact")
+    shape = (HY3_Q4_KV_HEADS, HY3_Q4_KV_HEAD_DIM, HY3_Q4_KV_HEAD_DIM)
+    members: list[tuple[str, int, int]] = []
+    specs: dict[str, tuple[int, int]] = {}
+    for entry in entries:
+        if allocated:
+            if entry._shape != shape:
+                raise RuntimeError(
+                    f"brokered Hy3 Q4 shape drifted for {entry.cache_id}"
+                )
+            target_bytes = target_blocks * per_entry_block_bytes
+            steady_delta = target_bytes - int(entry.nbytes)
+            transient_delta = target_bytes
+        else:
+            target_bytes = current_blocks * per_entry_block_bytes
+            steady_delta = target_bytes
+            transient_delta = 0
+        if steady_delta <= 0:
+            raise RuntimeError("brokered Q4 group contains a non-growth member")
+        planned = entry._planned_capacity_bytes(
+            num_blocks=target_blocks,
+            shape=shape,
+            dtypes=(None, None),
+        )
+        if planned != target_bytes:
+            raise RuntimeError(
+                f"brokered Hy3 Q4 bytes drifted for {entry.cache_id}: "
+                f"expected {target_bytes}, got {planned}"
+            )
+        spec = (steady_delta, transient_delta)
+        specs[entry.cache_id] = spec
+        members.append((entry.cache_id, *spec))
+
+    reserve_group = getattr(observer, "reserve_growth_group", None)
+    if not callable(reserve_group):
+        raise RuntimeError("physical KV observer lacks aggregate group admission")
+    group = reserve_group(members=tuple(members))
+    with group:
+        for entry in entries:
+            entry._active_growth_group = group
+            entry._active_growth_spec = specs[entry.cache_id]
+            try:
+                if allocated:
+                    if not entry._grow_to_capacity(
+                        target_blocks * HY3_Q4_KV_BLOCK_TOKENS
+                    ):
+                        raise RuntimeError("brokered Q4 cache refused exact growth")
+                else:
+                    import mlx.core as mx
+
+                    entry._ensure_brokered_q4_allocated(
+                        shape=shape,
+                        dtypes=(mx.bfloat16, mx.bfloat16),
+                    )
+            finally:
+                entry._active_growth_group = None
+                entry._active_growth_spec = None
+        if not bool(getattr(group, "completed", False)):
+            raise RuntimeError("aggregate Q4 cache transaction ended incomplete")
+
+    return {
+        "entries": len(entries),
+        "allocated_entries": 0 if allocated else len(entries),
+        "grown_entries": len(entries) if allocated else 0,
+        "target_blocks": target_blocks,
+    }
 
 
 def install_vllm_metal_paged_attention_kv_cache(

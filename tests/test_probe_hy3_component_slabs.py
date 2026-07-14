@@ -84,38 +84,125 @@ def test_load_sidecar_record_rejects_short_reads(tmp_path: Path) -> None:
         module.load_sidecar_record(tmp_path, manifest, record, _Slot((8,)))
 
 
-def test_verify_probe_sidecar_requests_full_payload_hash(
+def test_probe_artifact_attestation_hashes_payload_once_and_verifies_headers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module = _load_module()
     manifest = object()
-    calls: list[tuple[object, Path, bool]] = []
+    binding = {
+        "model_artifact_sha256": "a" * 64,
+        "manifest_file_sha256": "b" * 64,
+        "artifact_pins_sha256": "c" * 64,
+        "artifact_stat_sha256": "d" * 64,
+        "resident_payload_bytes": 1,
+        "resident_payload_sha256": "e" * 64,
+    }
+    attestation = SimpleNamespace(manifest=manifest, **binding)
+    final_attestation = SimpleNamespace(manifest=object(), **binding)
+    calls: list[object] = []
+    config = SimpleNamespace(
+        model_root=tmp_path,
+        manifest=tmp_path / "manifest.json",
+        artifact_pins=object(),
+    )
+
+    def attest(**kwargs):
+        calls.append(("attest", kwargs))
+        return attestation if kwargs["verify_payload_hash"] else final_attestation
 
     def verify(actual_manifest, actual_root, *, verify_sidecar_hash=False):
-        calls.append((actual_manifest, actual_root, verify_sidecar_hash))
-        return {"sidecar_verified": True}
+        calls.append(("verify", actual_manifest, actual_root, verify_sidecar_hash))
+        return {"valid": True, "checked_shards": 2}
 
+    monkeypatch.setattr(module, "attest_hy3_artifact", attest)
     monkeypatch.setattr(module, "verify_expert_manifest", verify, raising=False)
 
-    module._verify_probe_sidecar(tmp_path, manifest)
+    assert module._attest_probe_artifact(config) is attestation
 
-    assert calls == [(manifest, tmp_path, True)]
+    assert calls == [
+        (
+            "attest",
+            {
+                "model_root": tmp_path,
+                "manifest_path": tmp_path / "manifest.json",
+                "pins": config.artifact_pins,
+                "verify_payload_hash": True,
+                "require_f_nocache": True,
+            },
+        ),
+        ("verify", manifest, tmp_path, False),
+        (
+            "attest",
+            {
+                "model_root": tmp_path,
+                "manifest_path": tmp_path / "manifest.json",
+                "pins": config.artifact_pins,
+                "verify_payload_hash": False,
+            },
+        ),
+    ]
 
 
-def test_verify_probe_sidecar_rejects_unverified_payload(
+def test_probe_artifact_attestation_rejects_drift_during_header_scan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module = _load_module()
+    config = SimpleNamespace(
+        model_root=tmp_path,
+        manifest=tmp_path / "manifest.json",
+        artifact_pins=object(),
+    )
+    bindings = iter(("a" * 64, "f" * 64))
+
+    def attest(**kwargs):
+        return SimpleNamespace(
+            manifest=object(),
+            model_artifact_sha256=next(bindings),
+            manifest_file_sha256="b" * 64,
+            artifact_pins_sha256="c" * 64,
+            artifact_stat_sha256="d" * 64,
+            resident_payload_bytes=1,
+            resident_payload_sha256="e" * 64,
+        )
+
+    monkeypatch.setattr(module, "attest_hy3_artifact", attest)
     monkeypatch.setattr(
         module,
         "verify_expert_manifest",
-        lambda *_args, **_kwargs: {"sidecar_verified": False},
+        lambda *_args, **_kwargs: {"valid": True},
+        raising=False,
     )
 
-    with pytest.raises(RuntimeError, match="sidecar payload was not fully verified"):
-        module._verify_probe_sidecar(tmp_path, object())
+    with pytest.raises(RuntimeError, match="header verification"):
+        module._attest_probe_artifact(config)
+
+
+def test_probe_artifact_attestation_rejects_header_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    config = SimpleNamespace(
+        model_root=tmp_path,
+        manifest=tmp_path / "manifest.json",
+        artifact_pins=object(),
+    )
+    monkeypatch.setattr(
+        module,
+        "attest_hy3_artifact",
+        lambda **_kwargs: SimpleNamespace(manifest=object()),
+    )
+    monkeypatch.setattr(
+        module,
+        "verify_expert_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("bad header")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="bad header"):
+        module._attest_probe_artifact(config)
 
 
 def test_probe_identity_hashes_exact_dynamic_and_normalized_configs() -> None:
@@ -131,11 +218,17 @@ def test_probe_identity_hashes_exact_dynamic_and_normalized_configs() -> None:
         model_artifact_sha256="a" * 64,
         expert_manifest_id="expert-manifest-sidecar.json",
         expert_manifest_sha256="b" * 64,
+        artifact_pins_sha256="d" * 64,
+        artifact_stat_sha256="e" * 64,
+        resident_payload_bytes=3,
+        resident_payload_sha256="f" * 64,
         source_git_commit="c" * 40,
         arm_config=arm_config,
     )
 
     assert identity["arm_config"] == arm_config
+    assert identity["resident_payload_bytes"] == 3
+    assert identity["resident_payload_sha256"] == "f" * 64
     assert identity["normalized_config"] == {
         "expert_slab_slots": 32,
         "total_context_tokens": 131_072,

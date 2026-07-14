@@ -21,11 +21,24 @@ from mtplx.benchmarks.hy3_dynamic_memory_observation import (
     ArmRequest,
 )
 from mtplx.benchmarks.runners.hy3_dynamic_memory import (
-    CONTEXT_MATRIX_TOKENS,
     HY3_Q4_KV_BLOCK_BYTES,
     HY3_Q4_MAX_BLOCKS,
 )
 from mtplx.expert_streaming_models import HY3_Q4
+
+
+def _artifact_pins() -> dict[str, object]:
+    return {
+        "model_config_sha256": "a" * 64,
+        "manifest_file_sha256": "b" * 64,
+        "manifest_sha256": "c" * 64,
+        "sidecar_file": "experts.bin",
+        "sidecar_bytes": 1,
+        "sidecar_sha256": "d" * 64,
+        "resident_payload_bytes": 1,
+        "resident_payload_sha256": "e" * 64,
+        "source_revision": "revision",
+    }
 
 
 @dataclass
@@ -34,50 +47,70 @@ class FakeBrokerSnapshot:
     expert_slab_physical_bytes: int
 
 
-@dataclass
-class FakeTicket:
-    ticket_id: int = 7
+class FakeGrowthGroup:
+    def __init__(
+        self,
+        events: list[str],
+        members: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        self.events = events
+        self.members = members
+        self.commits: list[tuple[str, int]] = []
+        self.completed = False
+        self.aborted = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if not self.completed:
+            self.aborted = True
+
+    def commit_member(
+        self,
+        *,
+        cache_id: str,
+        measured_physical_bytes: int,
+        allocator_before: object,
+        allocator_after: object,
+    ) -> object:
+        assert allocator_before is None
+        assert allocator_after is None
+        self.commits.append((cache_id, measured_physical_bytes))
+        self.events.append(f"commit:{cache_id}")
+        self.completed = len(self.commits) == len(self.members)
+        return object()
+
+    def abort(self, **_kwargs: object) -> None:
+        self.aborted = True
+        self.events.append("group-abort")
 
 
 class FakeExpertRuntime:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.groups: list[FakeGrowthGroup] = []
+        self.single_reservations = 0
         self.snapshot = FakeBrokerSnapshot(
             kv_physical_bytes=HY3_Q4_KV_BLOCK_BYTES,
             expert_slab_physical_bytes=800,
         )
         self.memory_broker = self
 
-    def reserve_growth(self, **kwargs: int | str) -> FakeTicket:
-        self.events.append(
-            f"reserve:{kwargs['steady_delta_bytes']}:{kwargs['transient_delta_bytes']}"
-        )
+    def reserve_growth(self, **_kwargs: int | str) -> object:
+        self.single_reservations += 1
+        raise AssertionError("hardware preflight used a single-entry reservation")
+
+    def reserve_growth_group(
+        self,
+        *,
+        members: tuple[tuple[str, int, int], ...],
+    ) -> FakeGrowthGroup:
+        self.events.append(f"group-reserve:{len(members)}")
         self.snapshot.expert_slab_physical_bytes = 600
-        return FakeTicket()
-
-    def abort_growth(
-        self,
-        ticket: FakeTicket,
-        *,
-        observed_physical_bytes: int,
-    ) -> None:
-        assert ticket.ticket_id == 7
-        assert observed_physical_bytes == 0
-        self.events.append("abort")
-
-    def commit_growth(
-        self,
-        ticket: FakeTicket,
-        *,
-        measured_physical_bytes: int,
-        allocator_before: object,
-        allocator_after: object,
-    ) -> object:
-        assert ticket.ticket_id == 7
-        assert allocator_before is None
-        assert allocator_after is None
-        self.events.append(f"commit:{measured_physical_bytes}")
-        return object()
+        group = FakeGrowthGroup(self.events, members)
+        self.groups.append(group)
+        return group
 
 
 class FakeRuntime:
@@ -89,20 +122,25 @@ class FakeQ4Entry:
     def __init__(
         self,
         events: list[str],
-        label: str,
+        index: int,
         allocation_observer: object | None = None,
     ) -> None:
         self.events = events
-        self.label = label
+        self.index = index
         self.block_size = 16
         self.num_blocks = 1
-        self.nbytes = HY3_Q4_KV_BLOCK_BYTES // 2
+        self.nbytes = HY3_Q4_KV_BLOCK_BYTES // 80
+        self.offset = 0
         self.kv_quant = True
         self.kv_quant_config = type("Q4", (), {"normalized_mode": "q4"})()
-        self._shape = (1, 1, 1)
+        self._shape = (8, 128, 128)
         self._dtypes = (object(), object())
         self.allocation_observer = allocation_observer
-        self.cache_id = f"fake-{label}"
+        self.cache_id = f"target:fake:{index}"
+        self.key_cache = object()
+        self.value_cache = object()
+        self._active_growth_group = None
+        self._active_growth_spec = None
 
     def _planned_capacity_bytes(
         self,
@@ -111,26 +149,28 @@ class FakeQ4Entry:
         shape: object,
         dtypes: object,
     ) -> int:
-        assert shape is self._shape
-        assert dtypes is self._dtypes
-        return num_blocks * (HY3_Q4_KV_BLOCK_BYTES // 2)
+        del shape, dtypes
+        return num_blocks * (HY3_Q4_KV_BLOCK_BYTES // 80)
 
     def _grow_to_capacity(self, required_tokens: int) -> bool:
-        target_blocks = required_tokens // 16
-        target_bytes = target_blocks * (HY3_Q4_KV_BLOCK_BYTES // 2)
+        target_blocks = (required_tokens + self.block_size - 1) // self.block_size
+        target_bytes = target_blocks * (HY3_Q4_KV_BLOCK_BYTES // 80)
         old_bytes = self.nbytes
-        observer = self.allocation_observer
-        assert observer is not None
-        ticket = observer.reserve_growth(
-            cache_id=self.cache_id,
-            steady_delta_bytes=target_bytes - old_bytes,
-            transient_delta_bytes=target_bytes,
-        )
-        self.events.append(f"grow:{self.label}:{required_tokens}")
+        expected = (target_bytes - old_bytes, target_bytes)
+        if self._active_growth_spec != expected or self._active_growth_group is None:
+            observer = self.allocation_observer
+            assert observer is not None
+            observer.reserve_growth(
+                cache_id=self.cache_id,
+                steady_delta_bytes=expected[0],
+                transient_delta_bytes=expected[1],
+            )
+            raise AssertionError("single-entry growth unexpectedly returned")
+        self.events.append(f"grow:{self.index}:{required_tokens}")
         self.num_blocks = target_blocks
         self.nbytes = target_bytes
-        observer.commit_growth(
-            ticket,
+        self._active_growth_group.commit_member(
+            cache_id=self.cache_id,
             measured_physical_bytes=target_bytes - old_bytes,
             allocator_before=None,
             allocator_after=None,
@@ -138,21 +178,37 @@ class FakeQ4Entry:
         return True
 
 
-@pytest.mark.parametrize("context_tokens", CONTEXT_MATRIX_TOKENS)
+@pytest.mark.parametrize(
+    ("context_tokens", "target_blocks"),
+    (
+        (4_095, 256),
+        (4_096, 256),
+        (4_097, 257),
+        (32_768, 2_048),
+        (65_536, 4_096),
+        (131_072, 8_192),
+    ),
+)
 def test_dynamic_preflight_captures_real_reclaim_gap_before_any_q4_growth(
+    monkeypatch: pytest.MonkeyPatch,
     context_tokens: int,
+    target_blocks: int,
 ) -> None:
+    import mtplx.cache_state as cache_state_module
+
+    monkeypatch.setattr(cache_state_module, "VllmMetalPagedKVCache", FakeQ4Entry)
     events: list[str] = []
     runtime = FakeRuntime(events)
     cache = [
-        FakeQ4Entry(events, "a", runtime.expert_streaming),
-        FakeQ4Entry(events, "b", runtime.expert_streaming),
+        FakeQ4Entry(events, index, runtime.expert_streaming) for index in range(80)
     ]
 
     def ledger() -> dict[str, object]:
-        events.append("ledger")
+        block_counts = {entry.num_blocks for entry in cache}
+        assert len(block_counts) == 1, "ledger observed a partially committed group"
+        blocks = block_counts.pop()
+        events.append(f"ledger:{blocks}")
         broker = runtime.expert_streaming.snapshot
-        blocks = cache[0].num_blocks
         kv_physical_bytes = sum(entry.nbytes for entry in cache)
         return {
             "allocator_active_bytes": (
@@ -172,12 +228,15 @@ def test_dynamic_preflight_captures_real_reclaim_gap_before_any_q4_growth(
                 "failed": 0,
                 "integrity_errors": 0,
                 "completion_fence_failures": 0,
+                "global_device_synchronizations": 0,
             },
         }
 
+    ticks = iter(range(77, 100))
+
     def clock() -> int:
         events.append("clock")
-        return 77
+        return next(ticks)
 
     captured = preflight_and_grow_dynamic_q4(
         runtime=runtime,
@@ -187,24 +246,89 @@ def test_dynamic_preflight_captures_real_reclaim_gap_before_any_q4_growth(
         monotonic_ns=clock,
     )
 
-    target_blocks = context_tokens // 16
-    per_entry_delta = (target_blocks - 1) * (HY3_Q4_KV_BLOCK_BYTES // 2)
-    largest_replacement = target_blocks * (HY3_Q4_KV_BLOCK_BYTES // 2)
     assert captured["expert_slab_physical_bytes"] == 600
     assert captured["kv_physical_bytes"] == HY3_Q4_KV_BLOCK_BYTES
-    assert captured["captured_monotonic_ns"] == 77
-    assert events == [
-        "ledger",
-        f"reserve:{per_entry_delta}:{largest_replacement}",
-        "ledger",
-        "clock",
-        f"grow:a:{context_tokens}",
-        f"commit:{per_entry_delta}",
-        f"reserve:{per_entry_delta}:{largest_replacement}",
-        f"grow:b:{context_tokens}",
-        f"commit:{per_entry_delta}",
-        "ledger",
+    growth_steps = captured["kv_growth_steps"]
+    assert isinstance(growth_steps, list)
+    assert len(growth_steps) == 2
+    checkpoint_tokens = (target_blocks - 1) * 16
+    assert [step["requested_tokens"] for step in growth_steps] == [
+        checkpoint_tokens,
+        context_tokens,
     ]
+    assert [step["target_blocks"] for step in growth_steps] == [
+        target_blocks - 1,
+        target_blocks,
+    ]
+    assert all(
+        step["before_monotonic_ns"]
+        < step["reclaim_monotonic_ns"]
+        < step["after_monotonic_ns"]
+        for step in growth_steps
+    )
+    assert growth_steps[0]["reclaim_gap"]["kv_allocated_blocks"] == 1
+    assert growth_steps[0]["after"]["kv_allocated_blocks"] == target_blocks - 1
+    assert growth_steps[1]["before"]["kv_allocated_blocks"] == target_blocks - 1
+    assert growth_steps[1]["after"]["kv_allocated_blocks"] == target_blocks
+    assert growth_steps[0]["reclaimed_expert_bytes"] > 0
+    assert growth_steps[1]["kv_growth_bytes"] == HY3_Q4_KV_BLOCK_BYTES
+    assert all(entry.num_blocks == target_blocks for entry in cache)
+    assert all(entry.num_blocks * entry.block_size >= context_tokens for entry in cache)
+    assert sum(entry.nbytes for entry in cache) == (
+        target_blocks * HY3_Q4_KV_BLOCK_BYTES
+    )
+    assert runtime.expert_streaming.single_reservations == 0
+    assert len(runtime.expert_streaming.groups) == 2
+    first_group, second_group = runtime.expert_streaming.groups
+    assert len(first_group.members) == len(first_group.commits) == 80
+    assert len(second_group.members) == len(second_group.commits) == 80
+    assert first_group.completed is second_group.completed is True
+    assert first_group.aborted is second_group.aborted is False
+    assert [owner for owner, _measured in first_group.commits] == [
+        f"target:fake:{index}" for index in range(80)
+    ]
+    assert [owner for owner, _measured in second_group.commits] == [
+        f"target:fake:{index}" for index in range(80)
+    ]
+    assert (
+        sum(member[1] for member in first_group.members)
+        == growth_steps[0]["steady_delta_bytes"]
+    )
+    assert (
+        max(member[2] for member in first_group.members)
+        == growth_steps[0]["max_transient_delta_bytes"]
+    )
+    assert (
+        sum(member[1] for member in second_group.members)
+        == growth_steps[1]["steady_delta_bytes"]
+    )
+    assert (
+        max(member[2] for member in second_group.members)
+        == growth_steps[1]["max_transient_delta_bytes"]
+    )
+    first_grow = events.index(f"grow:0:{checkpoint_tokens}")
+    first_group_reserve = events.index("group-reserve:80")
+    assert (
+        first_group_reserve < events.index("ledger:1", first_group_reserve) < first_grow
+    )
+    second_group_reserve = events.index("group-reserve:80", first_group_reserve + 1)
+    second_grow = events.index(f"grow:0:{target_blocks * 16}")
+    assert (
+        second_group_reserve
+        < events.index(f"ledger:{target_blocks - 1}", second_group_reserve)
+        < second_grow
+    )
+
+
+def test_hardware_campaign_front_door_remains_the_exact_context_matrix() -> None:
+    assert ArmRequest(arm="dynamic", context_tokens=4_096, repetition=0)
+    for context_tokens in (4_095, 4_097):
+        with pytest.raises(ArmObservationError, match="context_tokens must be in"):
+            ArmRequest(
+                arm="dynamic",
+                context_tokens=context_tokens,
+                repetition=0,
+            )
 
 
 def test_host_memory_health_uses_exact_mach_ledgers_without_subprocess_fallback(
@@ -230,8 +354,8 @@ class FakeReadyRoute:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    def release(self) -> None:
-        self.events.append("release_route")
+    def release(self, *, synchronize: bool = True) -> None:
+        self.events.append(f"release_route:synchronize={synchronize}")
 
 
 class FakeDemandRuntime:
@@ -269,7 +393,10 @@ def test_regrow_is_triggered_only_by_a_real_future_route_demand() -> None:
         expert_physical_bytes=lambda: next(physical),
     )
 
-    assert events == ["ensure_route:7:(1, 4, 9):decode", "release_route"]
+    assert events == [
+        "ensure_route:7:(1, 4, 9):decode",
+        "release_route:synchronize=False",
+    ]
 
 
 def test_production_factory_builds_real_static_and_dynamic_hook_loader(
@@ -280,6 +407,7 @@ def test_production_factory_builds_real_static_and_dynamic_hook_loader(
         "model_root": str(tmp_path / "Hy3-4bit"),
         "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
         "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+        "artifact_pins": _artifact_pins(),
         "generated_tokens": 16,
         "hold_sample_count": 3,
         "hold_tokens": 8,
@@ -289,10 +417,68 @@ def test_production_factory_builds_real_static_and_dynamic_hook_loader(
 
     assert isinstance(hooks, ProductionHy3HardwareHooks)
     assert isinstance(hooks.config, Hy3HardwareConfig)
+    assert hooks.config.allocator_headroom_bytes == 1024**3
     assert hooks.config.model_root == tmp_path / "Hy3-4bit"
     assert hooks.hold_samples == 3
     assert callable(hooks.load_static_lane)
     assert callable(hooks.load_dynamic_lane)
+
+
+def test_hardware_config_requires_exact_external_artifact_pins(
+    tmp_path: Path,
+) -> None:
+    base = {
+        "repo_root": str(tmp_path),
+        "model_root": str(tmp_path / "Hy3-4bit"),
+        "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
+        "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+    }
+
+    with pytest.raises(ArmObservationError, match="artifact_pins"):
+        Hy3HardwareConfig.from_mapping(base)
+
+    parsed = Hy3HardwareConfig.from_mapping({**base, "artifact_pins": _artifact_pins()})
+    assert parsed.artifact_pins.sidecar_file == "experts.bin"
+    for invalid_headroom in (-1, 0, 2 * 1024**3):
+        with pytest.raises(ArmObservationError, match="allocator_headroom_bytes"):
+            Hy3HardwareConfig.from_mapping(
+                {
+                    **base,
+                    "artifact_pins": _artifact_pins(),
+                    "allocator_headroom_bytes": invalid_headroom,
+                }
+            )
+
+
+def test_hardware_arms_pin_one_gib_headroom_and_dynamic_slot_counts(
+    tmp_path: Path,
+) -> None:
+    config = Hy3HardwareConfig.from_mapping(
+        {
+            "repo_root": str(tmp_path),
+            "model_root": str(tmp_path / "Hy3-4bit"),
+            "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
+            "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "artifact_pins": _artifact_pins(),
+            "allocator_headroom_bytes": 1024**3,
+        }
+    )
+
+    static = hardware_module._build_runtime_config(config, arm="static").memory_plan(
+        HY3_Q4
+    )
+    dynamic = hardware_module._build_runtime_config(config, arm="dynamic").memory_plan(
+        HY3_Q4
+    )
+
+    assert (
+        static.allocator_headroom_bytes == dynamic.allocator_headroom_bytes == 1024**3
+    )
+    assert static.persistent_slots == 8_673
+    assert static.unallocated_bytes == 1_076_826_880
+    assert dynamic.persistent_slots == 9_696
+    assert dynamic.persistent_slots // config.expert_slab_slots == 303
+    assert dynamic.unallocated_bytes == 1_288_770_304
 
 
 def test_hardware_arm_environment_forces_full_history_attention(
@@ -305,11 +491,44 @@ def test_hardware_arm_environment_forces_full_history_attention(
             "model_root": str(tmp_path / "Hy3-4bit"),
             "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
             "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "artifact_pins": _artifact_pins(),
         }
     )
-    sliding_key = "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW"
-    monkeypatch.setenv(sliding_key, "2048")
-    observed: dict[str, str | None] = {}
+    expected = {
+        "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "0",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "mlx_vector_paged",
+        "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "1",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "off",
+        "MTPLX_PAGED_GQA_SDPA_ROUTE": "off",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA": "0",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT": "65536",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q": "4",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q": "5",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q": "16",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE": "2048",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE": "1024",
+    }
+    hostile = {
+        "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "2048",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "fast_sdpa_gather",
+        "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "0",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "1",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "64",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head",
+        "MTPLX_PAGED_GQA_SDPA_ROUTE": "grouped",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA": "1",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT": "1",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q": "1",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q": "4096",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q": "4096",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE": "64",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE": "32",
+    }
+    for name, value in hostile.items():
+        monkeypatch.setenv(name, value)
+    observed: dict[str, dict[str, str | None]] = {}
 
     for arm in ("static", "dynamic"):
         lease = hardware_module._EnvironmentLease(
@@ -317,19 +536,23 @@ def test_hardware_arm_environment_forces_full_history_attention(
         )
         lease.acquire()
         try:
-            observed[arm] = os.environ.get(sliding_key)
+            observed[arm] = {name: os.environ.get(name) for name in expected}
         finally:
             lease.release()
 
-    assert observed == {"static": "0", "dynamic": "0"}
-    assert os.environ[sliding_key] == "2048"
+    assert observed == {"static": expected, "dynamic": expected}
+    assert {name: os.environ[name] for name in hostile} == hostile
+
+
+def test_hardware_lane_stages_dynamic_logical_admission_until_q4_growth() -> None:
+    assert hardware_module._initial_kv_admission_tokens("static", 4096) == 4096
+    assert hardware_module._initial_kv_admission_tokens("dynamic", 4096) == 1
 
 
 def test_static_control_budget_charges_exact_physical_q4_geometry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mtplx.expert_manifest as expert_manifest_module
     import mtplx.runtime as runtime_module
 
     class ModelLoadBoundary(RuntimeError):
@@ -341,22 +564,25 @@ def test_static_control_budget_charges_exact_physical_q4_geometry(
             "model_root": str(tmp_path / "Hy3-4bit"),
             "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
             "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "artifact_pins": _artifact_pins(),
         }
     )
     observed: dict[str, object] = {}
-    monkeypatch.setattr(
-        expert_manifest_module,
-        "load_expert_manifest",
-        lambda *_args, **_kwargs: object(),
-    )
+    frozen_manifest = object()
+    frozen_model_config = {"model_type": "hy_v3"}
     monkeypatch.setattr(
         hardware_module,
-        "_artifact_identity",
-        lambda *_args, **_kwargs: ("1" * 64, "2" * 64),
+        "_attest_config_artifact",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            manifest=frozen_manifest,
+            model_config=frozen_model_config,
+        ),
     )
 
     def stop_at_model_load(*_args: object, **kwargs: object) -> object:
         observed["config"] = kwargs["expert_streaming_config"]
+        observed["expert_manifest"] = kwargs["expert_manifest"]
+        observed["model_config"] = kwargs["model_config"]
         raise ModelLoadBoundary
 
     monkeypatch.setattr(runtime_module, "load", stop_at_model_load)
@@ -368,6 +594,8 @@ def test_static_control_budget_charges_exact_physical_q4_geometry(
         )
 
     runtime_config = observed["config"]
+    assert observed["expert_manifest"] is frozen_manifest
+    assert observed["model_config"] is frozen_model_config
     plan = runtime_config.memory_plan(HY3_Q4)
     assert {
         "dynamic_expert_slabs": runtime_config.dynamic_expert_slabs,
@@ -393,6 +621,7 @@ def test_static_lane_keeps_full_q4_reservation_for_short_context(
             "model_root": str(tmp_path / "Hy3-4bit"),
             "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
             "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "artifact_pins": _artifact_pins(),
         }
     )
     cache = [FakeQ4Entry([], "a"), FakeQ4Entry([], "b")]
@@ -433,6 +662,9 @@ def test_static_lane_keeps_full_q4_reservation_for_short_context(
         model_artifact_sha256="1" * 64,
         manifest_file_sha256="2" * 64,
         source_git_commit="a" * 40,
+        artifact_pins_sha256="3" * 64,
+        artifact_stat_sha256="4" * 64,
+        initial_artifact_evidence={},
     )
 
     lane.prepare_q4_context(4096)
@@ -447,6 +679,79 @@ def test_static_lane_keeps_full_q4_reservation_for_short_context(
     }
 
 
+def test_dynamic_lane_extends_logical_admission_only_after_exact_q4_growth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Hy3HardwareConfig.from_mapping(
+        {
+            "repo_root": str(tmp_path),
+            "model_root": str(tmp_path / "Hy3-4bit"),
+            "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
+            "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "artifact_pins": _artifact_pins(),
+        }
+    )
+    cache = [FakeQ4Entry([], "a"), FakeQ4Entry([], "b")]
+    for entry in cache:
+        entry.num_blocks = 256
+        entry.nbytes = 256 * (HY3_Q4_KV_BLOCK_BYTES // 2)
+
+    class Admission:
+        def __init__(self, tokens: int) -> None:
+            self.tokens = tokens
+            self.growth_targets: list[int] = []
+            self.release_calls = 0
+
+        def grow_to(self, tokens: int) -> None:
+            assert all(entry.num_blocks == 256 for entry in cache)
+            self.tokens = tokens
+            self.growth_targets.append(tokens)
+
+        def release(self) -> None:
+            self.release_calls += 1
+
+    def admit(_tokens: int) -> Admission:
+        raise AssertionError("hardware lane must grow its existing KV admission")
+
+    runtime = SimpleNamespace(admit_kv_tokens=admit)
+    sentinel_logits = object()
+    monkeypatch.setattr(
+        hardware_module,
+        "_forward_prefill",
+        lambda *_args, **_kwargs: sentinel_logits,
+    )
+    admission = Admission(1)
+    lane = MlxHy3HardwareLane(
+        config=config,
+        request=ArmRequest(arm="dynamic", context_tokens=4096, repetition=0),
+        runtime=runtime,
+        runtime_config=object(),
+        manifest=object(),
+        prompt_ids=[11, 22],
+        cache=cache,
+        logits=object(),
+        admission=admission,
+        environment=object(),
+        model_artifact_sha256="1" * 64,
+        manifest_file_sha256="2" * 64,
+        source_git_commit="a" * 40,
+        artifact_pins_sha256="3" * 64,
+        artifact_stat_sha256="4" * 64,
+        initial_artifact_evidence={},
+    )
+
+    lane.prepare_q4_context(4096)
+
+    assert admission.tokens == 4096
+    assert admission.growth_targets == [4096]
+    assert lane.logits is sentinel_logits
+
+    lane._release_admission()
+    lane._release_admission()
+    assert admission.release_calls == 1
+
+
 def test_static_physical_ledger_does_not_require_dynamic_broker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -459,6 +764,7 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
             "model_root": str(tmp_path / "Hy3-4bit"),
             "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
             "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "artifact_pins": _artifact_pins(),
         }
     )
     cache = [FakeQ4Entry([], "a"), FakeQ4Entry([], "b")]
@@ -467,7 +773,11 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
         entry.nbytes = HY3_Q4_MAX_BLOCKS * (HY3_Q4_KV_BLOCK_BYTES // 2)
     slot_snapshot = {
         "slabs": {"physical_bytes": 800},
-        "metrics": {"active_routes": 0, "completion_fence_failures": 0},
+        "metrics": {
+            "active_routes": 0,
+            "completion_fence_failures": 0,
+            "global_device_synchronizations": 0,
+        },
         "states": {"loading": 0, "failed": 0},
         "pins": 0,
     }
@@ -486,6 +796,7 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
                 "resident_record_count": 0,
                 "in_flight_bytes": 0,
                 "pinned_bytes": 0,
+                "io": {"integrity_errors": 0},
             },
             health_telemetry_snapshot=lambda: {
                 "metrics": slot_snapshot["metrics"],
@@ -519,6 +830,9 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
         model_artifact_sha256="1" * 64,
         manifest_file_sha256="2" * 64,
         source_git_commit="a" * 40,
+        artifact_pins_sha256="3" * 64,
+        artifact_stat_sha256="4" * 64,
+        initial_artifact_evidence={},
     )
 
     ledger = lane._live_physical_ledger()
@@ -547,12 +861,17 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
             "model_root": str(tmp_path / "Hy3-4bit"),
             "manifest": str(tmp_path / "Hy3-4bit" / "expert-manifest.json"),
             "model_artifact_id": "pipenetwork/Hy3-4bit@revision",
+            "artifact_pins": _artifact_pins(),
         }
     )
-    cache = [FakeQ4Entry([], "a"), FakeQ4Entry([], "b")]
+    cache = [FakeQ4Entry([], index) for index in range(80)]
     slot_snapshot = {
         "slabs": {"physical_bytes": 800},
-        "metrics": {"active_routes": 0, "completion_fence_failures": 0},
+        "metrics": {
+            "active_routes": 0,
+            "completion_fence_failures": 0,
+            "global_device_synchronizations": 0,
+        },
         "states": {"loading": 0, "failed": 0},
         "pins": 0,
     }
@@ -592,6 +911,7 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
                 "resident_record_count": 80,
                 "in_flight_bytes": 60,
                 "pinned_bytes": 40,
+                "io": {"integrity_errors": 7},
             },
             health_telemetry_snapshot=lambda: {
                 "metrics": slot_snapshot["metrics"],
@@ -666,6 +986,9 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
         model_artifact_sha256="1" * 64,
         manifest_file_sha256="2" * 64,
         source_git_commit="a" * 40,
+        artifact_pins_sha256="3" * 64,
+        artifact_stat_sha256="4" * 64,
+        initial_artifact_evidence={},
     )
 
     ledger = lane._live_physical_ledger()
@@ -673,7 +996,13 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
     expected = {
         "operating_target_bytes": 110 * hardware_module.GIB,
         "hard_ceiling_bytes": 112 * hardware_module.GIB,
+        "allocator_headroom_bytes": hardware_module.GIB,
+        "classified_target_bytes": 109 * hardware_module.GIB,
+        "classified_bytes": 950 + HY3_Q4_KV_BLOCK_BYTES,
         "charged_bytes": 960 + HY3_Q4_KV_BLOCK_BYTES,
+        "charged_residual_bytes": (
+            110 * hardware_module.GIB - 960 - HY3_Q4_KV_BLOCK_BYTES
+        ),
         "resident_model_bytes": 100,
         "kv_representation": "q4",
         "kv_logical_tokens": 16,
@@ -710,3 +1039,4 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
     missing = set(expected) - set(ledger)
     assert not missing, f"physical ledger omitted issue #46 resource fields: {missing}"
     assert {field: ledger[field] for field in expected} == expected
+    assert ledger["slot_health"]["integrity_errors"] == 7

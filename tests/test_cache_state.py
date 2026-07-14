@@ -28,6 +28,7 @@ from mtplx.cache_state import (
     install_vllm_metal_paged_attention_kv_cache,
     owned_recurrent_state_stats,
     physical_kv_cache_lifecycle,
+    prepare_brokered_q4_cache_group,
     register_physical_kv_cache,
     rollback_after_verify,
     restore_cache,
@@ -37,6 +38,7 @@ from mtplx.cache_state import (
     trim_verified_window_to_prefix,
 )
 from mtplx.kv_quant import PagedKVQuantConfig
+from mtplx.runtime_options import HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV
 
 
 class DummyCache:
@@ -570,6 +572,31 @@ def test_dynamic_paged_kv_sizes_capacity_from_request(monkeypatch):
     assert cache[0].capacity >= 32768 + 128 + 3 + 128
 
 
+@pytest.mark.parametrize(
+    ("request_tokens", "expected_blocks"),
+    [(4095, 256), (4096, 256), (4097, 257)],
+)
+def test_hy3_q4_strict_runtime_env_ceil_sizes_exact_physical_pages(
+    monkeypatch,
+    request_tokens,
+    expected_blocks,
+):
+    from mlx_lm.models.cache import KVCache
+
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER", "131072")
+    for name, value in HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV_TOKENS", str(request_tokens))
+    cache = [KVCache()]
+
+    stats = configure_tail_owned_attention_kv_cache(cache)
+
+    assert stats["num_blocks"] == expected_blocks
+    assert isinstance(cache[0], VllmMetalPagedKVCache)
+    assert cache[0].num_blocks == expected_blocks
+
+
 def test_paged_kv_grows_on_dynamic_overflow(monkeypatch):
     monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
     paged = VllmMetalPagedKVCache(block_size=4, num_blocks=1)
@@ -753,6 +780,68 @@ def test_large_q_split_fallback_stays_in_paged_storage(monkeypatch):
     assert stats["large_q_split_sdpa_fallback_calls"] == 1
     assert stats["active_array_calls"] == 0
     assert stats["dense_fallback_calls"] == 0
+
+
+def test_q4_large_q_reports_chunked_dequant_attention_truthfully(
+    monkeypatch,
+    capsys,
+):
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "off")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE", "7")
+    monkeypatch.setenv("MTPLX_PREFILL_ROUTE_TRACE", "1")
+
+    paged = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=16,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+    )
+    queries = mx.zeros((1, 8, 4, 8), dtype=mx.float16)
+    keys = mx.zeros((1, 2, 32, 8), dtype=mx.float16)
+    values = mx.zeros((1, 2, 32, 8), dtype=mx.float16)
+    paged.update_without_fetch(keys, values)
+
+    actual = paged.paged_attention(queries, scale=8**-0.5, mask="causal")
+    assert actual is not None
+    mx.eval(actual)
+
+    stats = paged.paged_stats()
+    assert stats["q4_chunked_dequant_attention_calls"] == 1
+    assert stats["large_q_split_sdpa_fallback_calls"] == 0
+    assert stats["paged_attention_large_q_path"] == ""
+    assert sum(stats["q4_chunked_dequant_attention_calls_by_phase"].values()) == 1
+    assert set(stats["q4_chunked_dequant_attention_path_by_phase"].values()) == {
+        "q4_streaming_softmax"
+    }
+    assert stats["q4_chunked_dequant_calls"] > 0
+    assert (
+        stats["q4_chunked_dequant_realized_calls"] == stats["q4_chunked_dequant_calls"]
+    )
+    assert stats["q4_chunked_dequant_time_s"] > 0
+    assert stats["q4_chunked_dequant_tokens"] >= 32
+    assert (
+        sum(stats["q4_chunked_dequant_expected_unique_tokens_by_phase"].values()) == 32
+    )
+    assert sum(stats["q4_chunked_dequant_unique_tokens_by_phase"].values()) == 32
+    assert stats["q4_chunked_dequant_coverage_failures"] == 0
+    assert stats["q4_chunked_dequant_configured_chunk_tokens"] == 7
+    assert 0 < stats["q4_chunked_dequant_realized_peak_chunk_tokens"] <= 7
+    assert stats["q4_chunked_dequant_realized_peak_chunk_bytes"] == (
+        stats["q4_chunked_dequant_realized_peak_chunk_tokens"]
+        * stats["q4_chunked_dequant_realized_bytes_per_token"]
+    )
+    assert stats["active_array_calls"] == 0
+    assert stats["kv_quant_dequant_calls"] == 0
+    assert stats["kv_quant_dequant_time_s"] == 0.0
+    assert stats["kv_quant_dequant_tokens"] == 0
+    assert "path=q4_streaming_softmax" in capsys.readouterr().err
 
 
 def test_large_q_split_fallback_assertion_fails_release_qa(monkeypatch):
@@ -1039,6 +1128,147 @@ class _KVAllocationObserver:
     ) -> None:
         self.release_samples.append((allocator_before, allocator_after))
         self.releases.append((cache_id, tuple(allocations), released_physical_bytes))
+
+
+class _KVAllocationGroup:
+    def __init__(self, members) -> None:
+        self.members = tuple(members)
+        self.commits: list[tuple[str, int, object, object]] = []
+        self.aborts: list[tuple[int | None, object, object]] = []
+        self.completed = False
+        self.aborted = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, _exc, _tb) -> None:
+        if exc_type is not None and not self.completed and not self.aborted:
+            self.abort(observed_uncommitted_physical_bytes=None)
+
+    def commit_member(
+        self,
+        *,
+        cache_id: str,
+        measured_physical_bytes: int,
+        allocator_before,
+        allocator_after,
+    ):
+        self.commits.append(
+            (
+                cache_id,
+                measured_physical_bytes,
+                allocator_before,
+                allocator_after,
+            )
+        )
+        self.completed = len(self.commits) == len(self.members)
+        return SimpleNamespace(
+            allocation_id=len(self.commits),
+            cache_id=cache_id,
+            physical_bytes=measured_physical_bytes,
+        )
+
+    def abort(
+        self,
+        *,
+        observed_uncommitted_physical_bytes: int | None,
+        allocator_before=None,
+        allocator_after=None,
+    ) -> None:
+        self.aborted = True
+        self.aborts.append(
+            (
+                observed_uncommitted_physical_bytes,
+                allocator_before,
+                allocator_after,
+            )
+        )
+
+
+class _KVGroupAllocationObserver(_KVAllocationObserver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.groups: list[_KVAllocationGroup] = []
+
+    def reserve_growth(self, **_kwargs):
+        raise AssertionError("aggregate cache preparation used per-entry reservation")
+
+    def reserve_growth_group(self, *, members):
+        group = _KVAllocationGroup(members)
+        self.groups.append(group)
+        return group
+
+
+def _brokered_hy3_q4_cache_group(observer, *, num_blocks: int = 1):
+    return [
+        VllmMetalPagedKVCache(
+            block_size=16,
+            num_blocks=num_blocks,
+            kv_quant_config=PagedKVQuantConfig("q4"),
+            allocation_observer=observer,
+            cache_id=f"target:test-group:{index}",
+        )
+        for index in range(80)
+    ]
+
+
+def test_brokered_q4_initial_pages_are_one_aggregate_pre_model_transaction() -> None:
+    observer = _KVGroupAllocationObserver()
+    cache = _brokered_hy3_q4_cache_group(observer)
+
+    result = prepare_brokered_q4_cache_group(cache)
+
+    assert result == {
+        "entries": 80,
+        "allocated_entries": 80,
+        "grown_entries": 0,
+        "target_blocks": 1,
+    }
+    assert len(observer.groups) == 1
+    group = observer.groups[0]
+    per_entry_bytes = 16 * 2 * 8 * (64 + 2)
+    assert group.members == tuple(
+        (f"target:test-group:{index}", per_entry_bytes, 0) for index in range(80)
+    )
+    assert [commit[0] for commit in group.commits] == [
+        f"target:test-group:{index}" for index in range(80)
+    ]
+    assert all(commit[1] == per_entry_bytes for commit in group.commits)
+    assert group.completed is True
+    assert all(entry.nbytes == per_entry_bytes for entry in cache)
+
+
+def test_brokered_q4_page_boundary_grows_all_entries_before_model_forward(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    observer = _KVGroupAllocationObserver()
+    cache = _brokered_hy3_q4_cache_group(observer)
+    prepare_brokered_q4_cache_group(cache)
+    for entry in cache:
+        entry.offset = 16
+
+    result = prepare_brokered_q4_cache_group(cache, required_tokens=17)
+
+    assert result == {
+        "entries": 80,
+        "allocated_entries": 0,
+        "grown_entries": 80,
+        "target_blocks": 2,
+    }
+    assert len(observer.groups) == 2
+    growth = observer.groups[1]
+    per_entry_block_bytes = 16 * 2 * 8 * (64 + 2)
+    assert growth.members == tuple(
+        (
+            f"target:test-group:{index}",
+            per_entry_block_bytes,
+            2 * per_entry_block_bytes,
+        )
+        for index in range(80)
+    )
+    assert growth.completed is True
+    assert all(entry.num_blocks == 2 for entry in cache)
 
 
 def test_q4_close_waits_for_observer_guard_before_dropping_physical_arrays() -> None:
@@ -2329,6 +2559,102 @@ def test_q4_physical_allocation_is_reserved_and_committed_exactly() -> None:
     assert observer.events == ["reserve", "sample", "sample", "commit"]
 
 
+def test_strict_dynamic_broker_rejects_per_entry_q4_growth_before_allocation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    observer = _KVAllocationObserver()
+    observer.memory_broker = object()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:strict-group-required:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    materialization_calls: list[object] = []
+
+    def forbidden_materialization(*, shape):
+        materialization_calls.append(shape)
+        raise AssertionError("strict per-entry growth reached MLX materialization")
+
+    monkeypatch.setattr(
+        cache,
+        "_materialize_brokered_q4_arrays",
+        forbidden_materialization,
+    )
+
+    with pytest.raises(RuntimeError, match="aggregate Q4 growth group"):
+        cache.update_without_fetch(values, values)
+
+    assert observer.reservations == []
+    assert observer.events == []
+    assert materialization_calls == []
+    assert cache.nbytes == 0
+
+
+@pytest.mark.parametrize(
+    ("dynamic_value", "live_broker"),
+    [
+        pytest.param(None, True, id="dynamic-unset"),
+        pytest.param("", True, id="dynamic-empty"),
+        pytest.param("0", True, id="dynamic-zero"),
+        pytest.param("false", True, id="dynamic-false"),
+        pytest.param("no", True, id="dynamic-no"),
+        pytest.param("off", True, id="dynamic-off"),
+        pytest.param("1", False, id="dynamic-without-live-broker"),
+    ],
+)
+def test_per_entry_q4_growth_remains_available_outside_strict_dynamic_broker(
+    monkeypatch,
+    dynamic_value,
+    live_broker,
+) -> None:
+    if dynamic_value is None:
+        monkeypatch.delenv("MTPLX_DYNAMIC_PAGED_KV", raising=False)
+    else:
+        monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", dynamic_value)
+    observer = _KVAllocationObserver()
+    observer.memory_broker = object() if live_broker else None
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:per-entry-fallback:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+
+    cache.update_without_fetch(values, values)
+
+    assert cache.nbytes == 160
+    assert observer.reservations == [("target:per-entry-fallback:0", 160, 0)]
+    assert len(observer.commits) == 1
+    assert observer.commits[0][1] == 160
+    assert observer.events == ["reserve", "sample", "sample", "commit"]
+
+
+def test_broker_owned_q4_growth_uses_exact_required_page_count(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    observer = _KVAllocationObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=3,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:exact-dynamic-pages:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+
+    assert cache._grow_to_capacity(13) is True
+
+    assert cache.num_blocks == 4
+    assert cache.capacity == 16
+    assert cache.nbytes == 640
+
+
 def test_q4_initial_allocation_failure_aborts_ticket_and_drops_arrays() -> None:
     class FailingCommitObserver(_KVAllocationObserver):
         def commit_growth(
@@ -2472,7 +2798,7 @@ def test_q4_growth_reserves_steady_delta_and_full_concatenate_peak(
     ]
 
 
-def test_q4_growth_uses_ceil_one_point_five_capacity(monkeypatch) -> None:
+def test_broker_owned_q4_overflow_grows_to_exact_required_capacity(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
     observer = _KVAllocationObserver()
     cache = VllmMetalPagedKVCache(
@@ -2488,9 +2814,9 @@ def test_q4_growth_uses_ceil_one_point_five_capacity(monkeypatch) -> None:
     cache.update_without_fetch(initial, initial)
     cache.update_without_fetch(one, one)
 
-    assert cache.num_blocks == 6
-    assert cache.nbytes == 960
-    assert observer.reservations[-1] == ("target:0", 320, 960)
+    assert cache.num_blocks == 5
+    assert cache.nbytes == 800
+    assert observer.reservations[-1] == ("target:0", 160, 800)
 
 
 def test_q4_reservation_precedes_every_physical_allocation(monkeypatch) -> None:

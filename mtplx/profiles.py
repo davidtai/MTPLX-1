@@ -54,18 +54,12 @@ DEFAULT_FP16_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16"
 QUALITY_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality"
 QUALITY_FP16_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16"
 LEGACY_OPTIMIZED_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized"
-QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID = (
-    "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed"
-)
+QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID = "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed"
 QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID = (
     "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed-FP16"
 )
-QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = (
-    "mtplx-qwen35-9b-optimized-speed"
-)
-QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID = (
-    "mtplx-qwen35-9b-optimized-speed-fp16"
-)
+QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = "mtplx-qwen35-9b-optimized-speed"
+QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID = "mtplx-qwen35-9b-optimized-speed-fp16"
 QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID = (
     "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed"
 )
@@ -78,15 +72,11 @@ QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID = (
 QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID = (
     "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16"
 )
-QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = (
-    "mtplx-qwen36-35b-a3b-optimized-speed"
-)
+QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = "mtplx-qwen36-35b-a3b-optimized-speed"
 QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID = (
     "mtplx-qwen36-35b-a3b-optimized-speed-fp16"
 )
-QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID = (
-    "mtplx-qwen36-35b-a3b-optimized-balance"
-)
+QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID = "mtplx-qwen36-35b-a3b-optimized-balance"
 QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID = (
     "mtplx-qwen36-35b-a3b-optimized-balance-fp16"
 )
@@ -121,8 +111,27 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_COMPILED_VERIFY",
         "MTPLX_COMPILED_VERIFY_MAX_LEN",
         "MTPLX_DYNAMIC_PAGED_KV",
+        "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS",
+        "MTPLX_DYNAMIC_PAGED_KV_MARGIN",
+        "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS",
+        "MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER",
+        "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP",
+        "MTPLX_PAGED_GQA_SDPA_ROUTE",
         "MTPLX_VLLM_METAL_PAGED_ATTN",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q",
         "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE",
+        "MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS",
+        "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD",
         "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW",
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT",
     }
@@ -154,7 +163,9 @@ def normalize_runtime_env_overrides(raw: Any) -> dict[str, str]:
     return normalized
 
 
-def runtime_env_overrides_from_contract(contract: Mapping[str, Any] | None) -> dict[str, str]:
+def runtime_env_overrides_from_contract(
+    contract: Mapping[str, Any] | None,
+) -> dict[str, str]:
     if not isinstance(contract, Mapping):
         return {}
     return normalize_runtime_env_overrides(contract.get("runtime_env_overrides"))
@@ -167,6 +178,7 @@ def runtime_env_with_contract_overrides(
     merged = dict(runtime_env)
     merged.update(runtime_env_overrides_from_contract(contract))
     return merged
+
 
 EXACT_PAGED_ATTENTION_ENV = {
     "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
@@ -488,8 +500,7 @@ TURBO_PROFILE = RuntimeProfile(
         "4-bit (vk_k): argmax- and sampler-distribution-validated, not "
         "bit-exact vs stock. 8-bit (vk q8): ULP-exact vs stock.",
         "Prefill and non-speculative decode remain bit-identical to stock.",
-        "4-bit and 8-bit affine models; 6-bit models silently run the "
-        "stock path.",
+        "4-bit and 8-bit affine models; 6-bit models silently run the stock path.",
         "Compiled verify engages on 4-bit and 8-bit affine trunks at "
         "contexts <= 12288 (parity2-validated on both); other "
         "quantizations/contexts run the eager verify path unchanged.",
@@ -517,9 +528,7 @@ EXACT_PROFILE = RuntimeProfile(
 MAX_DIAGNOSTIC_PROFILE = RuntimeProfile(
     name="max-diagnostic",
     runtime_profile="max_diagnostic",
-    summary=(
-        "Diagnostic fan-control profile for QA-only experiments."
-    ),
+    summary=("Diagnostic fan-control profile for QA-only experiments."),
     env=_merge_env(EXACT_PAGED_ATTENTION_ENV, LONG_RESPONSE_STAGED_ENV),
     caveats=(
         "Requires explicit --max before fan control is allowed.",

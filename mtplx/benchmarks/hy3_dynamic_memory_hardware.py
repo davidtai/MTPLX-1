@@ -9,7 +9,6 @@ release from logical capacity.
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import math
 import os
 import statistics
@@ -21,6 +20,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from mtplx.cache_state import prepare_brokered_q4_cache_group
+from mtplx.benchmarks.hy3_dynamic_memory_artifacts import (
+    ArtifactAttestationError,
+    ArtifactPins,
+    Hy3ArtifactAttestation,
+    attest_hy3_artifact,
+)
 from mtplx.benchmarks.hy3_dynamic_memory_observation import (
     ArmObservationError,
     ArmRequest,
@@ -30,8 +36,12 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     HY3_Q4_KV_BLOCK_SIZE_TOKENS,
     HY3_Q4_KV_BYTES_PER_TOKEN,
     HY3_Q4_MAX_BLOCKS,
-    canonical_sha256,
 )
+from mtplx.memory_broker import (
+    HY3_Q4_ALLOCATOR_HEADROOM_BYTES,
+    hy3_q4_kv_physical_geometry,
+)
+from mtplx.runtime_options import HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV
 
 
 GIB = 1024**3
@@ -43,6 +53,7 @@ _SLOT_HEALTH_FIELDS = (
     "failed",
     "integrity_errors",
     "completion_fence_failures",
+    "global_device_synchronizations",
 )
 
 
@@ -243,8 +254,10 @@ class Hy3HardwareConfig:
     model_root: Path
     manifest: Path
     model_artifact_id: str
+    artifact_pins: ArtifactPins
     memory_limit_bytes: int = 110 * GIB
     runtime_reserve_bytes: int = 8 * GIB
+    allocator_headroom_bytes: int = GIB
     transient_slots: int = 32
     expert_slab_slots: int = 32
     expert_regrow_hysteresis_slabs: int = 1
@@ -263,10 +276,12 @@ class Hy3HardwareConfig:
             "model_root",
             "manifest",
             "model_artifact_id",
+            "artifact_pins",
         }
         allowed = required | {
             "memory_limit_bytes",
             "runtime_reserve_bytes",
+            "allocator_headroom_bytes",
             "transient_slots",
             "expert_slab_slots",
             "expert_regrow_hysteresis_slabs",
@@ -289,6 +304,10 @@ class Hy3HardwareConfig:
                 f"hardware hooks config has unknown keys {sorted(unknown)}"
             )
         root = _path(value["repo_root"], field="repo_root")
+        try:
+            artifact_pins = ArtifactPins.from_mapping(value["artifact_pins"])
+        except ArtifactAttestationError as exc:
+            raise ArmObservationError(str(exc)) from exc
         config = cls(
             repo_root=root,
             model_root=_path(value["model_root"], field="model_root", root=root),
@@ -296,6 +315,7 @@ class Hy3HardwareConfig:
             model_artifact_id=_string(
                 value["model_artifact_id"], field="model_artifact_id"
             ),
+            artifact_pins=artifact_pins,
             memory_limit_bytes=_exact_int(
                 value.get("memory_limit_bytes", 110 * GIB),
                 field="memory_limit_bytes",
@@ -304,6 +324,10 @@ class Hy3HardwareConfig:
             runtime_reserve_bytes=_exact_int(
                 value.get("runtime_reserve_bytes", 8 * GIB),
                 field="runtime_reserve_bytes",
+            ),
+            allocator_headroom_bytes=_exact_int(
+                value.get("allocator_headroom_bytes", GIB),
+                field="allocator_headroom_bytes",
             ),
             transient_slots=_exact_int(
                 value.get("transient_slots", 32),
@@ -355,6 +379,10 @@ class Hy3HardwareConfig:
         if config.memory_limit_bytes != 110 * GIB:
             raise ArmObservationError(
                 "issue #46 hardware arms require the 110 GiB operating target"
+            )
+        if config.allocator_headroom_bytes != HY3_Q4_ALLOCATOR_HEADROOM_BYTES:
+            raise ArmObservationError(
+                "allocator_headroom_bytes must be exactly 1 GiB for issue #46"
             )
         completion_reserve = config.generated_tokens + (
             config.hold_sample_count * config.hold_tokens
@@ -411,7 +439,7 @@ def _entry_target_bytes(entry: Any, *, blocks: int) -> int:
 
 
 class _CapturingGrowthObserver:
-    """Capture the reclaim gap inside the cache's real allocation ticket."""
+    """Capture the reclaim gap inside one aggregate cache transaction."""
 
     def __init__(
         self,
@@ -424,8 +452,9 @@ class _CapturingGrowthObserver:
         self.physical_ledger = physical_ledger
         self.monotonic_ns = monotonic_ns
         self.captured: dict[str, object] | None = None
-        self.steady_deltas: list[int] = []
-        self.transient_deltas: list[int] = []
+        self.group_reservations = 0
+        self.declared_steady_delta_bytes = 0
+        self.declared_max_transient_delta_bytes = 0
 
     def reserve_growth(
         self,
@@ -434,31 +463,41 @@ class _CapturingGrowthObserver:
         steady_delta_bytes: int,
         transient_delta_bytes: int,
     ) -> Any:
-        ticket = self.delegate.reserve_growth(
-            cache_id=cache_id,
-            steady_delta_bytes=steady_delta_bytes,
-            transient_delta_bytes=transient_delta_bytes,
+        del cache_id, steady_delta_bytes, transient_delta_bytes
+        raise ArmObservationError(
+            "dynamic Q4 hardware preflight attempted single-entry growth"
         )
-        self.steady_deltas.append(int(steady_delta_bytes))
-        self.transient_deltas.append(int(transient_delta_bytes))
-        if self.captured is None:
+
+    def reserve_growth_group(
+        self,
+        *,
+        members: tuple[tuple[str, int, int], ...],
+    ) -> Any:
+        if self.group_reservations:
+            raise ArmObservationError(
+                "dynamic Q4 hardware step opened multiple aggregate groups"
+            )
+        group = self.delegate.reserve_growth_group(members=members)
+        self.group_reservations = 1
+        self.declared_steady_delta_bytes = sum(int(member[1]) for member in members)
+        self.declared_max_transient_delta_bytes = max(
+            (int(member[2]) for member in members),
+            default=0,
+        )
+        try:
+            captured = dict(self.physical_ledger())
+            captured["captured_monotonic_ns"] = _exact_int(
+                self.monotonic_ns(),
+                field="captured reclaim monotonic_ns",
+            )
+            self.captured = captured
+        except BaseException as capture_error:
             try:
-                captured = dict(self.physical_ledger())
-                captured["captured_monotonic_ns"] = _exact_int(
-                    self.monotonic_ns(),
-                    field="captured reclaim monotonic_ns",
-                )
-                self.captured = captured
-            except BaseException as capture_error:
-                try:
-                    self.delegate.abort_growth(
-                        ticket,
-                        observed_physical_bytes=0,
-                    )
-                except BaseException as abort_error:
-                    raise abort_error from capture_error
-                raise
-        return ticket
+                group.abort(observed_uncommitted_physical_bytes=0)
+            except BaseException as abort_error:
+                raise abort_error from capture_error
+            raise
+        return group
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
@@ -472,24 +511,16 @@ def preflight_and_grow_dynamic_q4(
     physical_ledger: Callable[[], dict[str, object]],
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
 ) -> dict[str, object]:
-    """Reclaim for total Q4 growth, capture the gap, then allocate pages."""
+    """Reclaim, then exercise a near-final and final Q4 growth boundary."""
 
     tokens = _exact_int(context_tokens, field="context_tokens", minimum=1)
-    if tokens % HY3_Q4_KV_BLOCK_SIZE_TOKENS:
-        raise ArmObservationError("context_tokens must end on a Q4 block boundary")
-    target_blocks = tokens // HY3_Q4_KV_BLOCK_SIZE_TOKENS
+    geometry = hy3_q4_kv_physical_geometry(tokens)
+    target_blocks = geometry.physical_blocks
+    if target_blocks < 3:
+        raise ArmObservationError(
+            "dynamic Q4 campaign growth must cross multiple block boundaries"
+        )
     entries = _q4_cache_entries(cache)
-    before = physical_ledger()
-    target_bytes = [
-        _entry_target_bytes(entry, blocks=target_blocks) for entry in entries
-    ]
-    current_bytes = [int(entry.nbytes) for entry in entries]
-    steady_delta = sum(
-        target - current
-        for target, current in zip(target_bytes, current_bytes, strict=True)
-    )
-    if steady_delta <= 0:
-        raise ArmObservationError("dynamic Q4 arm did not require physical growth")
     expert_runtime = getattr(runtime, "expert_streaming", None)
     if expert_runtime is None or getattr(expert_runtime, "memory_broker", None) is None:
         raise ArmObservationError("dynamic Q4 arm has no physical memory broker")
@@ -500,58 +531,136 @@ def preflight_and_grow_dynamic_q4(
         raise ArmObservationError(
             "dynamic Q4 entries do not share the runtime memory broker"
         )
-    observer = _CapturingGrowthObserver(
-        expert_runtime,
-        physical_ledger=physical_ledger,
-        monotonic_ns=monotonic_ns,
-    )
-    for entry in entries:
-        entry.allocation_observer = observer
+    checkpoint_tokens = (target_blocks - 1) * HY3_Q4_KV_BLOCK_SIZE_TOKENS
+    growth_steps: list[dict[str, object]] = []
     try:
-        for entry in entries:
-            grow = getattr(entry, "_grow_to_capacity", None)
-            if not callable(grow) or grow(tokens) is not True:
-                raise ArmObservationError("paged Q4 cache refused exact dynamic growth")
+        for sequence_index, requested_tokens in enumerate((checkpoint_tokens, tokens)):
+            step_geometry = hy3_q4_kv_physical_geometry(requested_tokens)
+            before = dict(physical_ledger())
+            before_monotonic_ns = _exact_int(
+                monotonic_ns(), field="KV growth before monotonic_ns"
+            )
+            target_bytes = [
+                _entry_target_bytes(entry, blocks=step_geometry.physical_blocks)
+                for entry in entries
+            ]
+            current_bytes = [int(entry.nbytes) for entry in entries]
+            steady_delta = sum(
+                target - current
+                for target, current in zip(target_bytes, current_bytes, strict=True)
+            )
+            if steady_delta <= 0:
+                raise ArmObservationError(
+                    "dynamic Q4 campaign step did not require physical growth"
+                )
+            observer = _CapturingGrowthObserver(
+                expert_runtime,
+                physical_ledger=physical_ledger,
+                monotonic_ns=monotonic_ns,
+            )
+            for entry in entries:
+                entry.allocation_observer = observer
+            prepared = prepare_brokered_q4_cache_group(
+                list(cache),
+                required_tokens=requested_tokens,
+            )
+            if (
+                int(prepared.get("entries", 0)) != len(entries)
+                or int(prepared.get("grown_entries", 0)) != len(entries)
+                or int(prepared.get("target_blocks", 0))
+                != step_geometry.physical_blocks
+            ):
+                raise ArmObservationError(
+                    "aggregate Q4 cache preparation returned contradictory geometry"
+                )
+            reclaim_gap = observer.captured
+            if reclaim_gap is None:
+                raise ArmObservationError(
+                    "dynamic Q4 growth did not expose a real reservation gap"
+                )
+            if observer.group_reservations != 1:
+                raise ArmObservationError(
+                    "Q4 growth did not use exactly one aggregate reservation"
+                )
+            if observer.declared_steady_delta_bytes != steady_delta:
+                raise ArmObservationError(
+                    "Q4 growth reservations did not cover total bytes"
+                )
+            if observer.declared_max_transient_delta_bytes != max(target_bytes):
+                raise ArmObservationError(
+                    "Q4 growth reservations did not cover the largest replacement"
+                )
+            if reclaim_gap["kv_physical_bytes"] != before["kv_physical_bytes"]:
+                raise ArmObservationError("Q4 bytes changed inside a reservation gap")
+            if int(reclaim_gap["expert_slab_physical_bytes"]) > int(
+                before["expert_slab_physical_bytes"]
+            ):
+                raise ArmObservationError(
+                    "expert slabs regrew inside protected Q4 growth"
+                )
+            expert_release = int(before["expert_slab_physical_bytes"]) - int(
+                reclaim_gap["expert_slab_physical_bytes"]
+            )
+            allocator_release = (
+                int(before["allocator_active_bytes"])
+                + int(before["allocator_cache_bytes"])
+                - int(reclaim_gap["allocator_active_bytes"])
+                - int(reclaim_gap["allocator_cache_bytes"])
+            )
+            if allocator_release < expert_release:
+                raise ArmObservationError(
+                    "expert registration fell without matching allocator release"
+                )
+            after = dict(physical_ledger())
+            after_monotonic_ns = _exact_int(
+                monotonic_ns(), field="KV growth after monotonic_ns"
+            )
+            reclaim_monotonic_ns = int(reclaim_gap["captured_monotonic_ns"])
+            if not (before_monotonic_ns < reclaim_monotonic_ns < after_monotonic_ns):
+                raise ArmObservationError(
+                    "KV growth evidence timestamps are not strictly ordered"
+                )
+            if int(after["kv_allocated_blocks"]) != step_geometry.physical_blocks:
+                raise ArmObservationError("dynamic Q4 cache missed a growth checkpoint")
+            if int(after["kv_physical_bytes"]) != step_geometry.physical_bytes:
+                raise ArmObservationError(
+                    "dynamic Q4 checkpoint reached contradictory bytes"
+                )
+            growth_steps.append(
+                {
+                    "sequence_index": sequence_index,
+                    "requested_tokens": requested_tokens,
+                    "target_blocks": step_geometry.physical_blocks,
+                    "before_monotonic_ns": before_monotonic_ns,
+                    "reclaim_monotonic_ns": reclaim_monotonic_ns,
+                    "after_monotonic_ns": after_monotonic_ns,
+                    "before": before,
+                    "reclaim_gap": dict(reclaim_gap),
+                    "after": after,
+                    "steady_delta_bytes": steady_delta,
+                    "max_transient_delta_bytes": (
+                        observer.declared_max_transient_delta_bytes
+                    ),
+                    "reclaimed_expert_bytes": expert_release,
+                    "kv_growth_bytes": int(after["kv_physical_bytes"])
+                    - int(before["kv_physical_bytes"]),
+                }
+            )
     finally:
         for entry, original in zip(entries, original_observers, strict=True):
             entry.allocation_observer = original
-    reclaimed = observer.captured
-    if reclaimed is None:
-        raise ArmObservationError(
-            "dynamic Q4 growth did not expose a real reservation/reclaim gap"
-        )
-    if sum(observer.steady_deltas) != steady_delta:
-        raise ArmObservationError("Q4 growth reservations did not cover total bytes")
-    if max(observer.transient_deltas, default=0) != max(target_bytes):
-        raise ArmObservationError(
-            "Q4 growth reservations did not cover the largest replacement"
-        )
-    if reclaimed["kv_physical_bytes"] != before["kv_physical_bytes"]:
-        raise ArmObservationError("Q4 bytes changed inside the reclaim-only gap")
-    if int(reclaimed["expert_slab_physical_bytes"]) >= int(
-        before["expert_slab_physical_bytes"]
-    ):
+    first = growth_steps[0]
+    reclaimed = dict(_mapping(first["reclaim_gap"]))
+    if int(first["reclaimed_expert_bytes"]) <= 0:
         raise ArmObservationError(
             "preflight reservation did not physically reclaim an expert slab"
-        )
-    expert_release = int(before["expert_slab_physical_bytes"]) - int(
-        reclaimed["expert_slab_physical_bytes"]
-    )
-    allocator_release = (
-        int(before["allocator_active_bytes"])
-        + int(before["allocator_cache_bytes"])
-        - int(reclaimed["allocator_active_bytes"])
-        - int(reclaimed["allocator_cache_bytes"])
-    )
-    if allocator_release < expert_release:
-        raise ArmObservationError(
-            "expert registration fell without matching allocator release"
         )
     after = physical_ledger()
     if int(after["kv_allocated_blocks"]) != target_blocks:
         raise ArmObservationError("dynamic Q4 cache did not reach target blocks")
-    if int(after["kv_physical_bytes"]) != target_blocks * HY3_Q4_KV_BLOCK_BYTES:
+    if int(after["kv_physical_bytes"]) != geometry.physical_bytes:
         raise ArmObservationError("dynamic Q4 cache reached contradictory bytes")
+    reclaimed["kv_growth_steps"] = growth_steps
     return reclaimed
 
 
@@ -582,20 +691,12 @@ def trigger_future_demand_regrow(
     try:
         pass
     finally:
-        ready.release()
+        ready.release(synchronize=False)
     after = int(expert_physical_bytes())
     if after <= before:
         raise ArmObservationError(
             "future route demand did not physically regrow expert capacity"
         )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(8 * 1024**2):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _source_commit(root: Path) -> str:
@@ -643,9 +744,7 @@ class _EnvironmentLease:
 
 def _arm_environment(arm: str, config: Hy3HardwareConfig) -> dict[str, str]:
     return {
-        "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
-        "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
-        "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "0",
+        **HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV,
         "MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS": (
             str(HY3_Q4_MAX_BLOCKS) if arm == "static" else "1"
         ),
@@ -660,6 +759,15 @@ def _arm_environment(arm: str, config: Hy3HardwareConfig) -> dict[str, str]:
     }
 
 
+def _initial_kv_admission_tokens(arm: str, context_tokens: int) -> int:
+    """Keep dynamic pre-growth logical ownership inside its one-block cache."""
+
+    if arm not in {"static", "dynamic"}:
+        raise ArmObservationError("hardware arm must be static or dynamic")
+    tokens = _exact_int(context_tokens, field="context_tokens", minimum=1)
+    return tokens if arm == "static" else 1
+
+
 def _build_runtime_config(config: Hy3HardwareConfig, *, arm: str) -> Any:
     from mtplx.expert_runtime import ExpertStreamingConfig
 
@@ -669,6 +777,7 @@ def _build_runtime_config(config: Hy3HardwareConfig, *, arm: str) -> Any:
         max_live_kv_tokens=TOTAL_CONTEXT_TOKENS,
         kv_bytes_per_token_override=HY3_Q4_KV_BYTES_PER_TOKEN,
         runtime_reserve_bytes=config.runtime_reserve_bytes,
+        allocator_headroom_bytes=config.allocator_headroom_bytes,
         transient_slots=config.transient_slots,
         cache_policy="lru",
         cache_scope="global",
@@ -677,6 +786,8 @@ def _build_runtime_config(config: Hy3HardwareConfig, *, arm: str) -> Any:
         expert_slab_slots=config.expert_slab_slots,
         expert_regrow_hysteresis_slabs=config.expert_regrow_hysteresis_slabs,
         expert_resize_min_interval_ms=config.expert_resize_min_interval_ms,
+        verify_sidecar_hash_at_open=False,
+        verify_record_hashes=True,
         resource_telemetry=True,
     )
 
@@ -717,22 +828,25 @@ def _static_post_load_memory_pools(
     }
 
 
-def _artifact_identity(
+def _attest_config_artifact(
     config: Hy3HardwareConfig,
-    manifest: Any,
-) -> tuple[str, str]:
-    manifest_file_sha = _sha256_file(config.manifest)
-    sidecar = getattr(manifest, "sidecar", None)
-    if sidecar is None:
-        raise ArmObservationError("hardware arm requires the verified expert sidecar")
-    artifact = {
-        "config_sha256": _sha256_file(config.model_root / "config.json"),
-        "expert_manifest_sha256": manifest_file_sha,
-        "expert_payload_sha256": str(sidecar.sha256),
-        "expert_payload_bytes": int(sidecar.size),
-        "source_revision": str(manifest.source_revision),
-    }
-    return canonical_sha256(artifact), manifest_file_sha
+    *,
+    verify_payload_hash: bool = False,
+) -> Hy3ArtifactAttestation:
+    try:
+        return attest_hy3_artifact(
+            model_root=config.model_root,
+            manifest_path=config.manifest,
+            pins=config.artifact_pins,
+            verify_payload_hash=verify_payload_hash,
+        )
+    except ArtifactAttestationError as exc:
+        raise ArmObservationError(str(exc)) from exc
+
+
+def _require_loaded_manifest_identity(expected: Any, observed: Any) -> None:
+    if observed is not expected:
+        raise ArmObservationError("runtime-loaded manifest differs from attestation")
 
 
 def _build_prompt_ids(
@@ -856,6 +970,9 @@ class MlxHy3HardwareLane:
         model_artifact_sha256: str,
         manifest_file_sha256: str,
         source_git_commit: str,
+        artifact_pins_sha256: str,
+        artifact_stat_sha256: str,
+        initial_artifact_evidence: Mapping[str, object],
         initial_system_swap_bytes: int | None = None,
         fixed_memory_pools: Mapping[str, int] | None = None,
     ) -> None:
@@ -871,12 +988,16 @@ class MlxHy3HardwareLane:
         self.environment = environment
         self.model_artifact_sha256 = model_artifact_sha256
         self.manifest_file_sha256 = manifest_file_sha256
+        self.artifact_pins_sha256 = artifact_pins_sha256
+        self.artifact_stat_sha256 = artifact_stat_sha256
+        self.initial_artifact_evidence = dict(initial_artifact_evidence)
         self.source_git_commit = source_git_commit
         self.initial_system_swap_bytes = initial_system_swap_bytes
         self.fixed_memory_pools = dict(fixed_memory_pools or {})
         self._reclaim_ledger: dict[str, object] | None = None
         self._return_reclaim_ledger = False
         self._invocation_route_trace: list[dict[str, object]] = []
+        self._admission_released = False
         self._closed = False
 
     @classmethod
@@ -895,18 +1016,25 @@ class MlxHy3HardwareLane:
             import mlx.core as mx
 
             from mtplx.attention_context import attention_phase
-            from mtplx.expert_manifest import load_expert_manifest
             from mtplx.runtime import load
 
-            manifest = load_expert_manifest(config.manifest, verify_digest=True)
+            artifact_attestation = _attest_config_artifact(config)
+            manifest = artifact_attestation.manifest
             runtime_config = _build_runtime_config(config, arm=request.arm)
-            model_hash, manifest_hash = _artifact_identity(config, manifest)
             runtime = load(
                 config.model_root,
                 mtp=False,
                 expert_streaming_config=runtime_config,
-                expert_manifest=config.manifest,
+                expert_manifest=manifest,
+                model_config=artifact_attestation.model_config,
             )
+            _require_loaded_manifest_identity(
+                manifest,
+                runtime.expert_streaming.manifest,
+            )
+            post_load_attestation = _attest_config_artifact(config)
+            if post_load_attestation.evidence() != artifact_attestation.evidence():
+                raise ArmObservationError("artifact changed during runtime load")
             fixed_memory_pools = (
                 _static_post_load_memory_pools(runtime, runtime_config, mx)
                 if request.arm == "static"
@@ -919,7 +1047,9 @@ class MlxHy3HardwareLane:
                 request=request,
                 config=config,
             )
-            admission = runtime.admit_kv_tokens(request.context_tokens)
+            admission = runtime.admit_kv_tokens(
+                _initial_kv_admission_tokens(request.arm, request.context_tokens)
+            )
             admission.__enter__()
             cache = runtime.make_cache()
             with attention_phase("prefill"):
@@ -942,9 +1072,12 @@ class MlxHy3HardwareLane:
                 logits=logits,
                 admission=admission,
                 environment=environment,
-                model_artifact_sha256=model_hash,
-                manifest_file_sha256=manifest_hash,
+                model_artifact_sha256=(artifact_attestation.model_artifact_sha256),
+                manifest_file_sha256=(artifact_attestation.manifest_file_sha256),
                 source_git_commit=_source_commit(config.repo_root),
+                artifact_pins_sha256=(artifact_attestation.artifact_pins_sha256),
+                artifact_stat_sha256=(artifact_attestation.artifact_stat_sha256),
+                initial_artifact_evidence=artifact_attestation.evidence(),
                 initial_system_swap_bytes=initial_system_swap_bytes,
                 fixed_memory_pools=fixed_memory_pools,
             )
@@ -980,6 +1113,7 @@ class MlxHy3HardwareLane:
         plan = self.runtime_config.memory_plan(self.runtime.expert_streaming.spec)
         arm_config = {
             "dynamic_memory": self.request.arm == "dynamic",
+            "attention_runtime_env": dict(HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV),
             "expert_streaming_config": self.runtime_config.to_dict(),
             "planned_persistent_slots": int(plan.persistent_slots),
             "probe_slab_ids": [0, 1],
@@ -990,6 +1124,12 @@ class MlxHy3HardwareLane:
             "model_artifact_sha256": self.model_artifact_sha256,
             "expert_manifest_id": self.config.manifest.name,
             "expert_manifest_sha256": self.manifest_file_sha256,
+            "artifact_pins_sha256": self.artifact_pins_sha256,
+            "artifact_stat_sha256": self.artifact_stat_sha256,
+            "resident_payload_bytes": self.config.artifact_pins.resident_payload_bytes,
+            "resident_payload_sha256": (
+                self.config.artifact_pins.resident_payload_sha256
+            ),
             "source_git_commit": self.source_git_commit,
             "arm_config": arm_config,
             "kv_quantization": "q4",
@@ -1010,6 +1150,11 @@ class MlxHy3HardwareLane:
         expert_runtime._raise_if_unhealthy()
         slot_pool = expert_runtime.slots
         slab_details = _mapping(slot_pool.expert_slab_telemetry_snapshot())
+        io_health = _mapping(slab_details.get("io"))
+        if "integrity_errors" not in io_health:
+            raise ArmObservationError(
+                "expert reader telemetry omitted integrity_errors"
+            )
         health = _mapping(slot_pool.health_telemetry_snapshot())
         metrics = _mapping(health.get("metrics"))
         states = _mapping(health.get("states"))
@@ -1123,6 +1268,24 @@ class MlxHy3HardwareLane:
                 default=(reclaimed_bytes // slab_bytes if slab_bytes else 0),
             )
         )
+        budget = getattr(broker, "budget", None)
+        operating_target_bytes = int(
+            getattr(budget, "operating_target_bytes", self.config.memory_limit_bytes)
+        )
+        allocator_headroom_bytes = int(
+            getattr(
+                budget,
+                "allocator_headroom_bytes",
+                self.config.allocator_headroom_bytes,
+            )
+        )
+        classified_target_bytes = int(
+            getattr(
+                budget,
+                "classified_target_bytes",
+                operating_target_bytes - allocator_headroom_bytes,
+            )
+        )
         host = _host_memory_health_snapshot(
             initial_swap_bytes=self.initial_system_swap_bytes,
         )
@@ -1133,13 +1296,7 @@ class MlxHy3HardwareLane:
             "expert_slab_physical_bytes": expert_bytes,
             "kv_physical_bytes": kv_bytes,
             "kv_allocated_blocks": blocks,
-            "operating_target_bytes": int(
-                getattr(
-                    getattr(broker, "budget", None),
-                    "operating_target_bytes",
-                    self.config.memory_limit_bytes,
-                )
-            ),
+            "operating_target_bytes": operating_target_bytes,
             "hard_ceiling_bytes": int(
                 getattr(
                     getattr(broker, "budget", None),
@@ -1147,7 +1304,11 @@ class MlxHy3HardwareLane:
                     112 * GIB,
                 )
             ),
+            "allocator_headroom_bytes": allocator_headroom_bytes,
+            "classified_target_bytes": classified_target_bytes,
+            "classified_bytes": classified_bytes,
             "charged_bytes": charged_bytes,
+            "charged_residual_bytes": operating_target_bytes - charged_bytes,
             "resident_model_bytes": resident_model_bytes,
             "kv_representation": str(
                 _first((kv_resource,), "representation", default="q4")
@@ -1271,8 +1432,11 @@ class MlxHy3HardwareLane:
                 "pins": int(health["pins"]),
                 "loading": int(states["loading"]),
                 "failed": int(states["failed"]),
-                "integrity_errors": 0,
+                "integrity_errors": int(io_health["integrity_errors"]),
                 "completion_fence_failures": int(metrics["completion_fence_failures"]),
+                "global_device_synchronizations": int(
+                    metrics["global_device_synchronizations"]
+                ),
             },
         }
 
@@ -1302,16 +1466,30 @@ class MlxHy3HardwareLane:
         expected_blocks = (
             HY3_Q4_MAX_BLOCKS
             if self.request.arm == "static"
-            else context_tokens // HY3_Q4_KV_BLOCK_SIZE_TOKENS
+            else hy3_q4_kv_physical_geometry(context_tokens).physical_blocks
         )
         if any(int(entry.num_blocks) != expected_blocks for entry in entries):
             raise ArmObservationError("Q4 cache capacity was not prepared exactly")
+        if self.request.arm == "dynamic":
+            self.admission.grow_to(context_tokens)
         self.logits = _forward_prefill(
             self.runtime,
             self.cache,
             self.prompt_ids[1:],
             chunk_size=self.config.prefill_chunk_size,
         )
+
+    def kv_growth_steps(self) -> Sequence[Mapping[str, object]]:
+        if self.request.arm == "static":
+            return ()
+        if self._reclaim_ledger is None:
+            raise ArmObservationError("dynamic Q4 growth evidence is missing")
+        raw_steps = self._reclaim_ledger.get("kv_growth_steps")
+        if isinstance(raw_steps, (str, bytes, bytearray)) or not isinstance(
+            raw_steps, Sequence
+        ):
+            raise ArmObservationError("dynamic Q4 growth evidence is malformed")
+        return tuple(dict(_mapping(step)) for step in raw_steps)
 
     def _expert_hashes(
         self,
@@ -1387,6 +1565,7 @@ class MlxHy3HardwareLane:
             "p95_token_latency_ms": _percentile(latencies, 0.95),
             "generated_token_ids": tokens,
             "route_trace": route_trace,
+            "expert_hashes": self._expert_hashes(route_trace),
         }
 
     def reset_q4_context(self) -> None:
@@ -1396,7 +1575,13 @@ class MlxHy3HardwareLane:
 
         close_physical_kv_cache(self.cache)
         self.cache = None
+        self._release_admission()
+
+    def _release_admission(self) -> None:
+        if self._admission_released:
+            return
         self.admission.release()
+        self._admission_released = True
 
     def trigger_future_expert_demand(self) -> None:
         if self.request.arm != "dynamic":
@@ -1422,12 +1607,19 @@ class MlxHy3HardwareLane:
             except BaseException as exc:
                 first_error = exc
         try:
-            self.admission.release()
+            self._release_admission()
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
         try:
             self.runtime.close(timeout=10.0)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            final_attestation = _attest_config_artifact(self.config)
+            if final_attestation.evidence() != self.initial_artifact_evidence:
+                raise ArmObservationError("artifact changed during hardware arm")
         except BaseException as exc:
             if first_error is None:
                 first_error = exc

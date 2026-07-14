@@ -8,13 +8,17 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .expert_runtime import ExpertStreamingConfig, parse_memory_bytes
-from .memory_broker import HY3_Q4_KV_BYTES_PER_TOKEN
+from .memory_broker import (
+    HY3_Q4_ALLOCATOR_HEADROOM_BYTES,
+    HY3_Q4_KV_BYTES_PER_TOKEN,
+)
 
 
 _BYTE_FIELDS = {
     "memory_limit_bytes",
     "kv_bytes_per_token_override",
     "runtime_reserve_bytes",
+    "allocator_headroom_bytes",
     "expert_cache_limit_bytes",
     "io_staging_bytes",
     "execution_workspace_bytes",
@@ -70,6 +74,10 @@ def add_expert_streaming_args(
     )
     group.add_argument(
         "--expert-runtime-reserve", help="Runtime/OS headroom (default 16GiB)."
+    )
+    group.add_argument(
+        "--expert-allocator-headroom",
+        help="Unclassified allocator/transient allowance retained outside steady pools.",
     )
     group.add_argument(
         "--expert-cache-limit", help="Optional persistent expert-cache cap."
@@ -210,6 +218,7 @@ def expert_streaming_load_kwargs(
         "memory_limit_bytes": getattr(args, "expert_memory_limit", None),
         "max_live_kv_tokens": getattr(args, "expert_max_live_kv_tokens", None),
         "runtime_reserve_bytes": getattr(args, "expert_runtime_reserve", None),
+        "allocator_headroom_bytes": getattr(args, "expert_allocator_headroom", None),
         "expert_cache_limit_bytes": getattr(args, "expert_cache_limit", None),
         "cache_policy": getattr(args, "expert_cache_policy", None),
         "cache_scope": getattr(args, "expert_cache_scope", None),
@@ -241,6 +250,17 @@ def expert_streaming_load_kwargs(
         values["dynamic_expert_slabs"] = True
         values["resource_telemetry"] = True
         values["kv_bytes_per_token_override"] = HY3_Q4_KV_BYTES_PER_TOKEN
+        values.setdefault(
+            "allocator_headroom_bytes",
+            HY3_Q4_ALLOCATOR_HEADROOM_BYTES,
+        )
+        # Keep the no-override serving lane identical to the frozen issue #46
+        # hardware identity. Explicit experimental flags/config may still
+        # override these values, but the documented path must not silently use
+        # the generic expert-streaming defaults.
+        values.setdefault("runtime_reserve_bytes", 8 * 1024**3)
+        values.setdefault("transient_slots", 32)
+        values.setdefault("cache_policy", "lru")
     if "model_key" not in values:
         values["model_key"] = _read_model_key(root)
     values.setdefault("runtime_reserve_bytes", 16 * 1024**3)
@@ -287,6 +307,7 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
         ("expert_memory_limit", "--expert-memory-limit"),
         ("expert_max_live_kv_tokens", "--expert-max-live-kv-tokens"),
         ("expert_runtime_reserve", "--expert-runtime-reserve"),
+        ("expert_allocator_headroom", "--expert-allocator-headroom"),
         ("expert_cache_limit", "--expert-cache-limit"),
         ("expert_cache_policy", "--expert-cache-policy"),
         ("expert_cache_scope", "--expert-cache-scope"),

@@ -23,15 +23,33 @@
   ],
   "bootstrap_resamples": 10000,
   "bootstrap_seed": 46,
+  "workload_subprocess_timeout_seconds": 43200,
+  "qwen_control_timeout_seconds": 300,
+  "subprocess_termination_grace_seconds": 30,
+  "artifact_verify_command": [
+    "uv",
+    "run",
+    "python",
+    "benchmarks/probe_hy3_component_slabs.py",
+    "--hooks-config",
+    "benchmarks/specs/issue46-hy3-hardware-hooks.json",
+    "--verify-artifact-only"
+  ],
   "probe_command": [
     "uv",
     "run",
     "python",
     "benchmarks/probe_hy3_component_slabs.py",
-    "~/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3",
-    "~/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/expert-manifest-sidecar.json",
-    "--slab-slots",
-    "32"
+    "--hooks-config",
+    "benchmarks/specs/issue46-hy3-hardware-hooks.json"
+  ],
+  "quality_command": [
+    "uv",
+    "run",
+    "python",
+    "benchmarks/benchmark_hy3_kv_quality.py",
+    "--hooks-config",
+    "benchmarks/specs/issue46-hy3-hardware-hooks.json"
   ],
   "qwen": {
     "acquire_lane_command": [

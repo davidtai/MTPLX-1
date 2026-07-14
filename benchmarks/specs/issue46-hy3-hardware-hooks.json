@@ -1,4 +1,16 @@
 {
+  "artifact_pins": {
+    "manifest_file_sha256": "978d6e44e253c3b916a71a2ea6db3d4c0ae5091e05e696380b6c975fdc26a7bb",
+    "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+    "model_config_sha256": "b8b21bda1aeddf9e32fccd7fdd54e914f9c8f6f74f8399c8a15cf9e636381b3a",
+    "resident_payload_bytes": 4952354048,
+    "resident_payload_sha256": "8bdff85e5d5863e5b71f0f58b22a8bc8db7264cb895f5acabae113de8bce68b7",
+    "sidecar_bytes": 161036107776,
+    "sidecar_file": "experts.bin",
+    "sidecar_sha256": "5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae",
+    "source_revision": "160619d3f96c8470350b6dac0ef033a8381551e3"
+  },
+  "allocator_headroom_bytes": 1073741824,
   "expert_regrow_hysteresis_slabs": 1,
   "expert_resize_min_interval_ms": 1000,
   "expert_slab_slots": 32,

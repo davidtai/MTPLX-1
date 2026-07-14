@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from mtplx.benchmarks.runners.hy3_dynamic_memory import (
+    BenchmarkGateError,
     CONTEXT_MATRIX_TOKENS,
     HY3_Q4_KV_BLOCK_BYTES,
     ISSUE46_RESOURCE_FIELDS,
     ISSUE46_RESOURCE_INTEGER_FIELDS,
+    ISSUE46_RESOURCE_SIGNED_INTEGER_FIELDS,
     SCHEMA_OBSERVATION,
+    bind_expert_route_evidence,
     canonical_sha256,
     normalize_arm_config,
     validate_campaign_observation,
@@ -69,6 +72,8 @@ class HardwareArmLane(Protocol):
     def reclaim_experts_for_q4(self, context_tokens: int) -> None: ...
 
     def prepare_q4_context(self, context_tokens: int) -> None: ...
+
+    def kv_growth_steps(self) -> Sequence[Mapping[str, object]]: ...
 
     def invoke_context(self, context_tokens: int) -> Mapping[str, object]: ...
 
@@ -282,6 +287,10 @@ def _build_identity(
         "model_artifact_sha256",
         "expert_manifest_id",
         "expert_manifest_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
+        "resident_payload_bytes",
+        "resident_payload_sha256",
         "source_git_commit",
         "arm_config",
         "kv_quantization",
@@ -306,6 +315,10 @@ def _build_identity(
         "model_artifact_sha256": raw["model_artifact_sha256"],
         "expert_manifest_id": raw["expert_manifest_id"],
         "expert_manifest_sha256": raw["expert_manifest_sha256"],
+        "artifact_pins_sha256": raw["artifact_pins_sha256"],
+        "artifact_stat_sha256": raw["artifact_stat_sha256"],
+        "resident_payload_bytes": raw["resident_payload_bytes"],
+        "resident_payload_sha256": raw["resident_payload_sha256"],
         "source_git_commit": raw["source_git_commit"],
         "arm_config": arm_config,
         "arm_config_sha256": canonical_sha256(arm_config),
@@ -343,6 +356,7 @@ def _timeline_point(
         "failed",
         "integrity_errors",
         "completion_fence_failures",
+        "global_device_synchronizations",
     }
     if set(slot_health) != expected_health:
         raise ArmObservationError(
@@ -362,6 +376,11 @@ def _timeline_point(
             *ISSUE46_RESOURCE_INTEGER_FIELDS,
         )
     }
+    for field in ISSUE46_RESOURCE_SIGNED_INTEGER_FIELDS:
+        value = raw[field]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ArmObservationError(f"{phase}.{field} must be an integer")
+        numeric[field] = value
     swap_delta = raw["system_swap_delta_bytes"]
     if isinstance(swap_delta, bool) or not isinstance(swap_delta, int):
         raise ArmObservationError(f"{phase}.system_swap_delta_bytes must be an integer")
@@ -400,10 +419,26 @@ def _timeline_point(
         + numeric["inflight_expert_staging_bytes"]
         + numeric["runtime_workspace_bytes"]
     )
+    if numeric["classified_bytes"] != classified_bytes:
+        raise ArmObservationError(
+            f"{phase}.classified_bytes must equal the five steady pools"
+        )
+    if numeric["classified_target_bytes"] != (
+        numeric["operating_target_bytes"] - numeric["allocator_headroom_bytes"]
+    ):
+        raise ArmObservationError(
+            f"{phase}.classified_target_bytes must preserve allocator headroom"
+        )
     expected_charged = classified_bytes + numeric["allocator_cache_charged_bytes"]
     if numeric["charged_bytes"] != expected_charged:
         raise ArmObservationError(
             f"{phase}.charged_bytes must equal the six-pool additive ledger"
+        )
+    if numeric["charged_residual_bytes"] != (
+        numeric["operating_target_bytes"] - numeric["charged_bytes"]
+    ):
+        raise ArmObservationError(
+            f"{phase}.charged_residual_bytes must match charged memory"
         )
     if numeric["allocator_cache_charged_bytes"] < numeric["allocator_cache_bytes"]:
         raise ArmObservationError(
@@ -439,7 +474,29 @@ def _timeline_point(
     return point
 
 
-def _invocation_evidence(raw_value: object) -> dict[str, object]:
+def _bound_expert_routes(
+    *,
+    route_trace: object,
+    expert_hashes: object,
+    expert_manifest_sha256: object,
+    field: str,
+) -> tuple[list[dict[str, object]], dict[str, str], dict[str, object]]:
+    try:
+        return bind_expert_route_evidence(
+            route_trace=route_trace,
+            expert_hashes=expert_hashes,
+            expert_manifest_sha256=expert_manifest_sha256,
+            field=field,
+        )
+    except BenchmarkGateError as exc:
+        raise ArmObservationError(str(exc)) from exc
+
+
+def _invocation_evidence(
+    raw_value: object,
+    *,
+    expert_manifest_sha256: object,
+) -> dict[str, object]:
     raw = _mapping(raw_value, field="lane invocation")
     fields = (
         "prompt_token_ids",
@@ -463,10 +520,12 @@ def _invocation_evidence(raw_value: object) -> dict[str, object]:
     ]
     if not generated_tokens:
         raise ArmObservationError("generated_token_ids must not be empty")
-    route_trace = list(_sequence(raw["route_trace"], field="route_trace"))
-    expert_hashes = dict(_mapping(raw["expert_hashes"], field="expert_hashes"))
-    if not expert_hashes:
-        raise ArmObservationError("expert_hashes must not be empty")
+    route_trace, expert_hashes, expert_route_binding = _bound_expert_routes(
+        route_trace=raw["route_trace"],
+        expert_hashes=raw["expert_hashes"],
+        expert_manifest_sha256=expert_manifest_sha256,
+        field="lane invocation",
+    )
     elapsed = _finite_number(
         raw["elapsed_seconds"],
         field="elapsed_seconds",
@@ -480,11 +539,17 @@ def _invocation_evidence(raw_value: object) -> dict[str, object]:
         "route_trace": route_trace,
         "route_trace_sha256": canonical_sha256(route_trace),
         "expert_hashes": expert_hashes,
+        "expert_route_binding": expert_route_binding,
         "elapsed_seconds": elapsed,
     }
 
 
-def _performance_sample(raw_value: object, *, index: int) -> dict[str, object]:
+def _performance_sample(
+    raw_value: object,
+    *,
+    index: int,
+    expert_manifest_sha256: object,
+) -> dict[str, object]:
     raw = _mapping(raw_value, field=f"performance sample {index}")
     fields = (
         "tokens_per_second",
@@ -494,6 +559,7 @@ def _performance_sample(raw_value: object, *, index: int) -> dict[str, object]:
         "p95_token_latency_ms",
         "generated_token_ids",
         "route_trace",
+        "expert_hashes",
     )
     _required(raw, fields, context=f"performance sample {index}")
     generated_tokens = [
@@ -507,16 +573,12 @@ def _performance_sample(raw_value: object, *, index: int) -> dict[str, object]:
         raise ArmObservationError(
             f"performance sample {index}.generated_token_ids must not be empty"
         )
-    route_trace = list(
-        _sequence(
-            raw["route_trace"],
-            field=f"performance sample {index}.route_trace",
-        )
+    route_trace, expert_hashes, expert_route_binding = _bound_expert_routes(
+        route_trace=raw["route_trace"],
+        expert_hashes=raw["expert_hashes"],
+        expert_manifest_sha256=expert_manifest_sha256,
+        field=f"performance sample {index}",
     )
-    if not route_trace:
-        raise ArmObservationError(
-            f"performance sample {index}.route_trace must not be empty"
-        )
     result: dict[str, object] = {
         "tokens_per_second": _finite_number(
             raw["tokens_per_second"],
@@ -547,6 +609,8 @@ def _performance_sample(raw_value: object, *, index: int) -> dict[str, object]:
         "generated_token_sha256": canonical_sha256(generated_tokens),
         "route_trace": route_trace,
         "route_trace_sha256": canonical_sha256(route_trace),
+        "expert_hashes": expert_hashes,
+        "expert_route_binding": expert_route_binding,
     }
     if float(result["expert_hit_rate"]) > 1.0:
         raise ArmObservationError(
@@ -614,6 +678,7 @@ def produce_arm_observation(
                 )
             )
         lane.prepare_q4_context(request.context_tokens)
+        kv_growth_steps = [dict(step) for step in lane.kv_growth_steps()]
         timeline.append(
             _timeline_point(
                 lane,
@@ -621,10 +686,17 @@ def produce_arm_observation(
                 monotonic_ns=monotonic_ns,
             )
         )
-        invocation = _invocation_evidence(lane.invoke_context(request.context_tokens))
+        invocation = _invocation_evidence(
+            lane.invoke_context(request.context_tokens),
+            expert_manifest_sha256=identity["expert_manifest_sha256"],
+        )
         for index in range(count):
             performance_samples.append(
-                _performance_sample(lane.sample_hold_performance(), index=index)
+                _performance_sample(
+                    lane.sample_hold_performance(),
+                    index=index,
+                    expert_manifest_sha256=identity["expert_manifest_sha256"],
+                )
             )
             timeline.append(
                 _timeline_point(lane, phase="hold", monotonic_ns=monotonic_ns)
@@ -666,6 +738,8 @@ def produce_arm_observation(
             "route_trace": invocation["route_trace"],
             "route_trace_sha256": invocation["route_trace_sha256"],
             "expert_hashes": invocation["expert_hashes"],
+            "expert_route_binding": invocation["expert_route_binding"],
+            "kv_growth_steps": kv_growth_steps,
             "timeline": timeline,
             "lifecycle": {
                 "reset_observed": True,

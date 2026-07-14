@@ -88,6 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Headroom for activations, Metal, MTPLX, and macOS (default: 16).",
     )
     parser.add_argument(
+        "--allocator-headroom-gib",
+        type=_nonnegative_decimal,
+        default=Decimal("0"),
+        help=(
+            "Unclassified MLX allocator allowance withheld from expert slots "
+            "(default: 0)."
+        ),
+    )
+    parser.add_argument(
         "--expert-cache-limit-gib",
         type=_nonnegative_decimal,
         help="Optional stricter cap for persistent experts alone.",
@@ -126,6 +135,7 @@ def main() -> int:
             total_limit_bytes=_gib_to_bytes(args.memory_limit_gib),
             context_tokens=args.context_tokens,
             runtime_reserve_bytes=_gib_to_bytes(args.runtime_reserve_gib),
+            allocator_headroom_bytes=_gib_to_bytes(args.allocator_headroom_gib),
             expert_cache_limit_bytes=cache_cap,
             transient_slots=args.transient_slots,
             io_staging_bytes=_gib_to_bytes(args.io_staging_gib),
@@ -150,6 +160,7 @@ def main() -> int:
         },
         "plan": {
             "fits_fixed": plan.fits_fixed,
+            "fits_headroom": plan.fits_headroom,
             "scope": (
                 "planned MTPLX buffers and explicit reserves; runtime must also "
                 "enforce the MLX cap and reject unplanned context growth"
@@ -166,6 +177,9 @@ def main() -> int:
             "runtime_reserve_bytes": plan.runtime_reserve_bytes,
             "runtime_reserve_gib": _as_gib(plan.runtime_reserve_bytes),
             "runtime_reserve_gib_input": str(args.runtime_reserve_gib),
+            "allocator_headroom_bytes": plan.allocator_headroom_bytes,
+            "allocator_headroom_gib": _as_gib(plan.allocator_headroom_bytes),
+            "allocator_headroom_gib_input": str(args.allocator_headroom_gib),
             "io_staging_bytes": plan.io_staging_bytes,
             "io_staging_gib": _as_gib(plan.io_staging_bytes),
             "io_staging_gib_input": str(args.io_staging_gib),
@@ -195,10 +209,12 @@ def main() -> int:
             "accounted_gib": _as_gib(plan.allocated_bytes),
             "unallocated_bytes": plan.unallocated_bytes,
             "unallocated_gib": _as_gib(plan.unallocated_bytes),
+            "rounding_residual_bytes": plan.rounding_residual_bytes,
+            "rounding_residual_gib": _as_gib(plan.rounding_residual_bytes),
         },
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if plan.fits_fixed else 2
+    return 0 if plan.fits_headroom else 2
 
 
 if __name__ == "__main__":

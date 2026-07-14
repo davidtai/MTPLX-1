@@ -185,6 +185,7 @@ class ExpertSlotMetrics:
     completion_fence_slots: int = 0
     completion_fence_fallbacks: int = 0
     completion_fence_failures: int = 0
+    global_device_synchronizations: int = 0
     _physical_reads_by_layer: dict[int, dict[str, int]] = field(
         default_factory=dict, repr=False
     )
@@ -298,6 +299,7 @@ class ExpertSlotMetrics:
                     "completion_fence_slots",
                     "completion_fence_fallbacks",
                     "completion_fence_failures",
+                    "global_device_synchronizations",
                     "synchronous_fences",
                     "synchronous_fence_slots",
                 )
@@ -587,6 +589,7 @@ class ReadyRoute:
         future_error: BaseException | None = None
         if first_release and synchronize and self.pool.device_synchronize is not None:
             try:
+                self.pool.metrics.update(global_device_synchronizations=1)
                 self.pool.device_synchronize()
             except BaseException as exc:
                 self.pool.metrics.update(completion_fence_failures=1)

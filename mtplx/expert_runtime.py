@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -45,19 +45,23 @@ from .expert_streaming_models import (
 from .memory_broker import (
     BINARY_GIB,
     HY3_Q4_KV_BLOCK_BYTES,
+    HY3_Q4_KV_BYTES_PER_TOKEN,
     AllocatorMemorySample,
     BrokerSnapshot,
     ExpertRegrowTicket,
+    KVAllocationGroupTicket,
     KVAllocationTicket,
     KVPhysicalAllocation,
     MemoryAdmissionError,
     MemoryTelemetryError,
     UnifiedMemoryBroker,
+    hy3_q4_kv_physical_geometry,
 )
 from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
 
 
 _MEMORY_RE = re.compile(r"^([0-9]+)([kmgt]i?b?|b)?$", re.IGNORECASE)
+_ALLOCATOR_STABLE_SAMPLE_READS = 8
 
 
 class ExpertStreamingConfigurationError(ValueError):
@@ -136,6 +140,7 @@ class ExpertStreamingConfig:
     max_live_kv_tokens: int
     kv_bytes_per_token_override: int | None = None
     runtime_reserve_bytes: int = 16 * 1024**3
+    allocator_headroom_bytes: int = 0
     expert_cache_limit_bytes: int | None = None
     transient_slots: int | None = None
     io_staging_bytes: int = 0
@@ -167,6 +172,7 @@ class ExpertStreamingConfig:
             ("memory_limit_bytes", 1),
             ("max_live_kv_tokens", 0),
             ("runtime_reserve_bytes", 0),
+            ("allocator_headroom_bytes", 0),
             ("io_staging_bytes", 0),
             ("execution_workspace_bytes", 0),
             ("max_open_files", 1),
@@ -273,6 +279,14 @@ class ExpertStreamingConfig:
         if self.dynamic_expert_slabs:
             total_limit_bytes = min(total_limit_bytes, 110 * BINARY_GIB)
             context_tokens = 0
+        requested_context_tokens = context_tokens
+        if (
+            self.model_key == "hy3-q4"
+            and self.kv_bytes_per_token_override == HY3_Q4_KV_BYTES_PER_TOKEN
+        ):
+            context_tokens = hy3_q4_kv_physical_geometry(
+                context_tokens
+            ).physical_capacity_tokens
         planning_spec = (
             spec
             if self.kv_bytes_per_token_override is None
@@ -286,12 +300,15 @@ class ExpertStreamingConfig:
             total_limit_bytes=total_limit_bytes,
             context_tokens=context_tokens,
             runtime_reserve_bytes=self.runtime_reserve_bytes,
+            allocator_headroom_bytes=self.allocator_headroom_bytes,
             expert_cache_limit_bytes=expert_cache_limit_bytes,
             transient_slots=transient_slots,
             io_staging_bytes=self.io_staging_bytes,
             execution_workspace_bytes=self.execution_workspace_bytes,
             cache_scope=self.cache_scope,
         )
+        if plan.context_tokens != requested_context_tokens:
+            plan = replace(plan, context_tokens=requested_context_tokens)
         if not self.dynamic_expert_slabs:
             return plan
         aligned_slots = (
@@ -371,17 +388,112 @@ class KVAdmission:
     tokens: int
     released: bool = False
 
+    def grow_to(self, tokens: int) -> None:
+        """Monotonically extend this lease without changing its identity."""
+
+        self.runtime._grow_kv_admission(self, tokens)
+
+    def grow_to_page_boundary(self, tokens: int, *, page_size_tokens: int) -> bool:
+        """Track exact logical progress and report physical page crossings."""
+
+        target = _integer("tokens", tokens, minimum=1)
+        page_size = _integer("page_size_tokens", page_size_tokens, minimum=1)
+        current = int(self.tokens)
+        if target <= current:
+            return False
+        current_pages = (current + page_size - 1) // page_size
+        target_pages = (target + page_size - 1) // page_size
+        self.grow_to(target)
+        return target_pages > current_pages
+
     def release(self) -> None:
-        if self.released:
-            return
-        self.runtime.release_kv_tokens(self.tokens)
-        self.released = True
+        self.runtime._release_kv_admission(self)
 
     def __enter__(self) -> KVAdmission:
         return self
 
     def __exit__(self, *_exc: object) -> None:
         self.release()
+
+
+@dataclass
+class KVGroupGrowthContext:
+    """One aggregate physical-KV transaction held across serial member growth."""
+
+    runtime: ExpertStreamingRuntime
+    ticket: KVAllocationGroupTicket
+    completed: bool = False
+    aborted: bool = False
+    _owner_thread_id: int = field(default_factory=threading.get_ident, repr=False)
+    _allocations: dict[str, KVPhysicalAllocation] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _active: bool = field(default=True, init=False, repr=False)
+
+    @property
+    def remaining_cache_ids(self) -> tuple[str, ...]:
+        return tuple(
+            member.cache_id
+            for member in self.ticket.members
+            if member.cache_id not in self._allocations
+        )
+
+    @property
+    def allocations(self) -> tuple[KVPhysicalAllocation, ...]:
+        return tuple(
+            self._allocations[member.cache_id]
+            for member in self.ticket.members
+            if member.cache_id in self._allocations
+        )
+
+    def commit_member(
+        self,
+        *,
+        cache_id: str,
+        measured_physical_bytes: int,
+        allocator_before: AllocatorMemorySample,
+        allocator_after: AllocatorMemorySample,
+    ) -> KVPhysicalAllocation:
+        return self.runtime._commit_growth_group_member(
+            self,
+            cache_id=cache_id,
+            measured_physical_bytes=measured_physical_bytes,
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+
+    def abort(
+        self,
+        *,
+        observed_uncommitted_physical_bytes: int | None,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
+    ) -> BrokerSnapshot:
+        return self.runtime._abort_growth_group(
+            self,
+            observed_uncommitted_physical_bytes=(observed_uncommitted_physical_bytes),
+            allocator_before=allocator_before,
+            allocator_after=allocator_after,
+        )
+
+    def __enter__(self) -> KVGroupGrowthContext:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        if not self._active:
+            return
+        try:
+            self.abort(observed_uncommitted_physical_bytes=None)
+        except BaseException:
+            if exc_type is None:
+                raise
 
 
 class _ReadyRouteGroup:
@@ -1217,6 +1329,7 @@ class ExpertStreamingRuntime:
         self.memory_broker = memory_broker
         self._mx_module = mx_module
         self._memory_transaction_lock = threading.RLock()
+        self._active_kv_growth_group: KVGroupGrowthContext | None = None
         self._dynamic_resize_lock = threading.RLock()
         self._last_allocator_sample = (
             None if memory_broker is None else memory_broker.initial_allocator_sample
@@ -1392,6 +1505,12 @@ class ExpertStreamingRuntime:
             raise ExpertStreamingConfigurationError(
                 "dynamic expert physical pools exceed the 110 GiB operating target"
             )
+        if initial_snapshot.classified_bytes > (
+            110 * BINARY_GIB - int(config.allocator_headroom_bytes)
+        ):
+            raise ExpertStreamingConfigurationError(
+                "dynamic expert physical pools exceed the allocator-headroom target"
+            )
         return UnifiedMemoryBroker.standard_hy3(
             initial_snapshot=initial_snapshot,
             initial_allocator_sample=initial_allocator_sample,
@@ -1402,13 +1521,14 @@ class ExpertStreamingRuntime:
             expert_resize_min_interval_ns=(
                 int(config.expert_resize_min_interval_ms) * 1_000_000
             ),
+            allocator_headroom_bytes=int(config.allocator_headroom_bytes),
         )
 
     @classmethod
     def open(
         cls,
         root: Path | str,
-        manifest_path: Path | str,
+        manifest_source: ExpertManifest | Path | str,
         config: ExpertStreamingConfig,
         *,
         spec: ExpertStreamingModelSpec | None = None,
@@ -1422,7 +1542,11 @@ class ExpertStreamingRuntime:
         model_spec = get_model_spec(config.model_key) if spec is None else spec
         if model_spec.key != config.model_key:
             raise ExpertStreamingConfigurationError("config and spec model keys differ")
-        manifest = load_expert_manifest(manifest_path)
+        manifest = (
+            manifest_source
+            if isinstance(manifest_source, ExpertManifest)
+            else load_expert_manifest(manifest_source)
+        )
         cls._validate_manifest_identity(manifest, model_spec)
         integrity_report = None
         if config.verify_artifact_headers or config.verify_sidecar_hash_at_open:
@@ -1439,6 +1563,12 @@ class ExpertStreamingRuntime:
         if not plan.fits_fixed:
             raise ExpertStreamingConfigurationError(
                 f"fixed expert-streaming footprint exceeds limit by {-plan.unallocated_bytes} bytes"
+            )
+        if not plan.fits_headroom:
+            shortfall = plan.allocator_headroom_bytes - plan.unallocated_bytes
+            raise ExpertStreamingConfigurationError(
+                "expert-streaming allocator headroom exceeds the remaining "
+                f"memory limit by {shortfall} bytes"
             )
         cap_report = (
             apply_mlx_memory_cap(plan, mx_module=mx_module, env=env)
@@ -1676,6 +1806,52 @@ class ExpertStreamingRuntime:
                 self._live_kv_tokens = requested
                 self._live_kv_peak = max(self._live_kv_peak, requested)
             return KVAdmission(self, count)
+
+    def _grow_kv_admission(self, admission: KVAdmission, tokens: int) -> None:
+        """Atomically extend one live logical-KV lease up to its planned limit."""
+
+        if not isinstance(admission, KVAdmission) or admission.runtime is not self:
+            raise TypeError("KV admission does not belong to this runtime")
+        target = _integer("tokens", tokens, minimum=1)
+        with self._close_lock:
+            if self._closed:
+                raise ExpertSlotError("expert streaming runtime is closed")
+            if self._closing:
+                raise ExpertSlotError("expert streaming runtime is closing")
+            self._raise_if_unhealthy()
+            self._drain_pending_physical_kv_caches()
+            with self._kv_lock:
+                if admission.released:
+                    raise RuntimeError("released KV admission cannot grow")
+                current = int(admission.tokens)
+                if target < current:
+                    raise ValueError("KV admission growth must be monotonic")
+                delta = target - current
+                if delta == 0:
+                    return
+                requested = self._live_kv_tokens + delta
+                if requested > self.config.max_live_kv_tokens:
+                    raise ExpertStreamingConfigurationError(
+                        f"live KV admission {requested} exceeds planned "
+                        f"{self.config.max_live_kv_tokens} tokens"
+                    )
+                self._live_kv_tokens = requested
+                self._live_kv_peak = max(self._live_kv_peak, requested)
+                admission.tokens = target
+
+    def _release_kv_admission(self, admission: KVAdmission) -> None:
+        """Release a possibly grown lease exactly once under the KV lock."""
+
+        if not isinstance(admission, KVAdmission) or admission.runtime is not self:
+            raise TypeError("KV admission does not belong to this runtime")
+        with self._kv_lock:
+            if admission.released:
+                return
+            count = int(admission.tokens)
+            if count > self._live_kv_tokens:
+                raise RuntimeError("KV admission accounting underflow")
+            self._live_kv_tokens -= count
+            admission.released = True
 
     def release_kv_tokens(self, tokens: int) -> None:
         count = _integer("tokens", tokens, minimum=1)
@@ -2268,19 +2444,41 @@ class ExpertStreamingRuntime:
             raise
 
     def _sample_allocator_memory(self) -> AllocatorMemorySample:
-        telemetry = mlx_memory_telemetry(self._mx_module)
-        try:
-            sample = AllocatorMemorySample(
-                active_bytes=int(telemetry["active_memory_bytes"]),
-                cache_bytes=int(telemetry["cache_memory_bytes"]),
-                peak_bytes=int(telemetry["peak_memory_bytes"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise MemoryTelemetryError(
-                "MLX allocator active/cache/peak telemetry is unavailable"
-            ) from exc
-        self._last_allocator_sample = sample
-        return sample
+        previous: AllocatorMemorySample | None = None
+        for _ in range(_ALLOCATOR_STABLE_SAMPLE_READS):
+            telemetry = mlx_memory_telemetry(self._mx_module)
+            try:
+                sample = AllocatorMemorySample(
+                    active_bytes=int(telemetry["active_memory_bytes"]),
+                    cache_bytes=int(telemetry["cache_memory_bytes"]),
+                    peak_bytes=int(telemetry["peak_memory_bytes"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MemoryTelemetryError(
+                    "MLX allocator active/cache/peak telemetry is unavailable"
+                ) from exc
+            if min(sample.active_bytes, sample.cache_bytes, sample.peak_bytes) < 0:
+                raise MemoryTelemetryError(
+                    "MLX allocator active/cache/peak telemetry is invalid"
+                )
+            if sample.peak_bytes < sample.active_bytes:
+                raise MemoryTelemetryError("MLX allocator peak is below active memory")
+            if previous is not None:
+                if sample.peak_bytes < previous.peak_bytes:
+                    raise MemoryTelemetryError(
+                        "MLX allocator peak regressed during telemetry sampling"
+                    )
+                if (
+                    sample.charged_footprint_bytes == previous.charged_footprint_bytes
+                    and sample.peak_bytes == previous.peak_bytes
+                ):
+                    self._last_allocator_sample = sample
+                    return sample
+            previous = sample
+        raise MemoryTelemetryError(
+            "MLX allocator telemetry did not stabilize after "
+            f"{_ALLOCATOR_STABLE_SAMPLE_READS} reads"
+        )
 
     def reconcile_post_load_memory(self) -> None:
         """Reclassify startup reserve into measured resident/MTP truth."""
@@ -2355,7 +2553,13 @@ class ExpertStreamingRuntime:
         return {
             "operating_target_bytes": broker.budget.operating_target_bytes,
             "hard_ceiling_bytes": broker.budget.hard_ceiling_bytes,
+            "allocator_headroom_bytes": broker.budget.allocator_headroom_bytes,
+            "classified_target_bytes": broker.budget.classified_target_bytes,
+            "classified_bytes": snapshot.classified_bytes,
             "charged_bytes": snapshot.charged_bytes,
+            "charged_residual_bytes": (
+                broker.budget.operating_target_bytes - snapshot.charged_bytes
+            ),
             "logical_expert_records": int(slabs["logical_slot_count"]),
             "active_expert_records": int(
                 getattr(bank, "active_capacity", slabs["active_slot_count"])
@@ -2412,7 +2616,7 @@ class ExpertStreamingRuntime:
 
     def _terminalize_resize_with_physical_truth(
         self,
-        ticket: KVAllocationTicket | ExpertRegrowTicket,
+        ticket: KVAllocationTicket | KVAllocationGroupTicket | ExpertRegrowTicket,
         *,
         expert_slab_physical_bytes: int,
         allocator_before: AllocatorMemorySample | None = None,
@@ -2513,6 +2717,181 @@ class ExpertStreamingRuntime:
             if not handed_off:
                 transaction_lock.release()
 
+    def reserve_growth_group(
+        self,
+        *,
+        members: Iterable[tuple[str, int, int]],
+    ) -> KVGroupGrowthContext:
+        """Reserve one aggregate KV permit across a known set of cache owners."""
+
+        broker = self.memory_broker
+        if broker is None:
+            raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        active_group = getattr(self, "_active_kv_growth_group", None)
+        if active_group is not None and active_group._active:
+            raise RuntimeError("another KV growth group is active")
+        member_specs = tuple(members)
+        transaction_lock = self._memory_transaction_lock
+        transaction_lock.acquire()
+        ticket: KVAllocationGroupTicket | None = None
+        handed_off = False
+        try:
+            if getattr(self, "_closed", False) or getattr(self, "_closing", False):
+                raise ExpertSlotError("expert streaming runtime is closing")
+            self._drain_pending_physical_kv_caches()
+            broker.reconcile_allocator_cache(self._sample_allocator_memory())
+            slab_telemetry = self.slots.expert_slab_telemetry_snapshot()
+            bank = self._global_bank
+            broker.reconcile_expert_protection(
+                pinned_expert_bytes=int(slab_telemetry["pinned_bytes"]),
+                speculative_expert_bytes=(
+                    int(getattr(bank, "speculative_record_count", 0))
+                    * int(self.spec.expert_record_bytes)
+                ),
+            )
+            ticket = broker.plan_kv_growth_group(members=member_specs)
+            if ticket.required_expert_reclaim_bytes:
+                self.reclaim_expert_bytes(
+                    ticket,
+                    _transaction_lock_held=True,
+                )
+            context = KVGroupGrowthContext(runtime=self, ticket=ticket)
+            self._active_kv_growth_group = context
+            handed_off = True
+            return context
+        except BaseException as reservation_error:
+            if (
+                ticket is not None
+                and broker.snapshot().pending_kv_ticket_id == ticket.ticket_id
+            ):
+                try:
+                    broker.abort_kv_growth_group(
+                        ticket,
+                        observed_uncommitted_kv_delta_bytes=0,
+                    )
+                except BaseException as abort_error:
+                    raise abort_error from reservation_error
+            raise
+        finally:
+            if not handed_off:
+                transaction_lock.release()
+
+    def _require_growth_group_context(
+        self,
+        context: KVGroupGrowthContext,
+    ) -> None:
+        if not isinstance(context, KVGroupGrowthContext) or context.runtime is not self:
+            raise TypeError("KV growth group does not belong to this runtime")
+        if context._owner_thread_id != threading.get_ident():
+            raise RuntimeError("KV growth group must remain on its reserving thread")
+        if not context._active:
+            raise RuntimeError("KV growth group is already finalized")
+
+    def _finish_growth_group(
+        self,
+        context: KVGroupGrowthContext,
+        *,
+        completed: bool,
+    ) -> None:
+        if not context._active:
+            return
+        context._active = False
+        context.completed = completed
+        context.aborted = not completed
+        if getattr(self, "_active_kv_growth_group", None) is context:
+            self._active_kv_growth_group = None
+        self._memory_transaction_lock.release()
+
+    def _ensure_no_active_growth_group(self) -> None:
+        active_group = getattr(self, "_active_kv_growth_group", None)
+        if active_group is not None and active_group._active:
+            raise RuntimeError(
+                "physical KV release or expert regrow is unavailable while a "
+                "KV growth group is active"
+            )
+
+    def _commit_growth_group_member(
+        self,
+        context: KVGroupGrowthContext,
+        *,
+        cache_id: str,
+        measured_physical_bytes: int,
+        allocator_before: AllocatorMemorySample,
+        allocator_after: AllocatorMemorySample,
+    ) -> KVPhysicalAllocation:
+        """Commit one measured member and release the permit after the last."""
+
+        self._require_growth_group_context(context)
+        measured = _integer(
+            "measured_physical_bytes",
+            measured_physical_bytes,
+            minimum=0,
+        )
+        broker = self.memory_broker
+        if broker is None:
+            self._finish_growth_group(context, completed=False)
+            raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        try:
+            allocation = broker.commit_kv_growth_group_member(
+                context.ticket,
+                cache_id=cache_id,
+                allocated_physical_bytes=measured,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        except BaseException as commit_error:
+            if broker.snapshot().pending_kv_ticket_id == context.ticket.ticket_id:
+                try:
+                    broker.abort_kv_growth_group(
+                        context.ticket,
+                        observed_uncommitted_kv_delta_bytes=measured,
+                        allocator_before=allocator_before,
+                        allocator_after=allocator_after,
+                    )
+                except BaseException as abort_error:
+                    self._finish_growth_group(context, completed=False)
+                    raise abort_error from commit_error
+            self._finish_growth_group(context, completed=False)
+            raise
+        context._allocations[allocation.cache_id] = allocation
+        if not context.remaining_cache_ids:
+            self._finish_growth_group(context, completed=True)
+        return allocation
+
+    def _abort_growth_group(
+        self,
+        context: KVGroupGrowthContext,
+        *,
+        observed_uncommitted_physical_bytes: int | None,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
+    ) -> BrokerSnapshot:
+        """Abort remaining members while preserving prior owned handles."""
+
+        self._require_growth_group_context(context)
+        observed = (
+            None
+            if observed_uncommitted_physical_bytes is None
+            else _integer(
+                "observed_uncommitted_physical_bytes",
+                observed_uncommitted_physical_bytes,
+                minimum=0,
+            )
+        )
+        broker = self.memory_broker
+        if broker is None:
+            self._finish_growth_group(context, completed=False)
+            raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        try:
+            return broker.abort_kv_growth_group(
+                context.ticket,
+                observed_uncommitted_kv_delta_bytes=observed,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        finally:
+            self._finish_growth_group(context, completed=False)
+
     def commit_growth(
         self,
         ticket: KVAllocationTicket,
@@ -2558,10 +2937,13 @@ class ExpertStreamingRuntime:
     def sample_allocator_memory(self) -> AllocatorMemorySample:
         return self._sample_allocator_memory()
 
+    @contextmanager
     def physical_kv_release_context(self):
         """Serialize the complete Q4 release boundary with growth transactions."""
 
-        return self._memory_transaction_lock
+        with self._memory_transaction_lock:
+            self._ensure_no_active_growth_group()
+            yield
 
     def release_cache(
         self,
@@ -2578,7 +2960,7 @@ class ExpertStreamingRuntime:
         if broker is None:
             raise MemoryAdmissionError("dynamic KV allocation is not enabled")
         del released_physical_bytes
-        with self._memory_transaction_lock:
+        with self.physical_kv_release_context():
             broker.release_kv_batch(
                 cache_id=cache_id,
                 allocations=allocations,
@@ -2589,10 +2971,11 @@ class ExpertStreamingRuntime:
 
     def reclaim_expert_bytes(
         self,
-        ticket: KVAllocationTicket,
+        ticket: KVAllocationTicket | KVAllocationGroupTicket,
         *,
         deadline_ns: int | None = None,
         now_ns: int | None = None,
+        _transaction_lock_held: bool = False,
     ) -> ExpertSlabReclaimResult:
         """Destroy ranked slabs and publish the measured reduction to a KV ticket."""
 
@@ -2603,8 +2986,11 @@ class ExpertStreamingRuntime:
         if requested <= 0:
             return ExpertSlabReclaimResult((), (), 0)
         observed_at = time.monotonic_ns() if now_ns is None else int(now_ns)
+        transaction_context = (
+            nullcontext() if _transaction_lock_held else self._memory_transaction_lock
+        )
         with (
-            self._memory_transaction_lock,
+            transaction_context,
             self._dynamic_resize_lock,
             self._track_dynamic_resize("reclaim", requested) as resize_metrics,
             self._route_resize_context(),
@@ -2752,6 +3138,7 @@ class ExpertStreamingRuntime:
             self._track_dynamic_resize("regrow", int(target_bytes)) as resize_metrics,
             self._route_resize_context(),
         ):
+            self._ensure_no_active_growth_group()
             released_slab_ids = self.slots.released_slab_ids()
             if not released_slab_ids:
                 return 0
@@ -3031,6 +3418,9 @@ class ExpertStreamingRuntime:
                 "transient_slots": self.plan.transient_slots,
                 "allocated_bytes": self.plan.allocated_bytes,
                 "unallocated_bytes": self.plan.unallocated_bytes,
+                "allocator_headroom_bytes": self.plan.allocator_headroom_bytes,
+                "rounding_residual_bytes": self.plan.rounding_residual_bytes,
+                "fits_headroom": self.plan.fits_headroom,
             },
             "memory_cap": self.memory_cap_report,
             "integrity": self.integrity_report,
@@ -3129,7 +3519,24 @@ class ExpertStreamingRuntime:
                 raise TimeoutError(
                     "expert streaming runtime close already in progress at deadline"
                 )
+        memory_transaction_acquired = False
         try:
+            if deadline is None:
+                self._memory_transaction_lock.acquire()
+                memory_transaction_acquired = True
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                if not self._memory_transaction_lock.acquire(timeout=remaining):
+                    raise TimeoutError(
+                        "expert streaming runtime memory transaction did not "
+                        "finish before close deadline"
+                    )
+                memory_transaction_acquired = True
+            self._ensure_no_active_growth_group()
+            if not self._closed:
+                self._closing = True
+            self._memory_transaction_lock.release()
+            memory_transaction_acquired = False
             self._drain_pending_physical_kv_caches(
                 wait_for_inflight=True,
                 deadline=deadline,
@@ -3148,7 +3555,6 @@ class ExpertStreamingRuntime:
                     raise slots_error
                 self._raise_cleanup_error()
                 return
-            self._closing = True
             slots_error: BaseException | None = None
             try:
                 self.slots.close(timeout=remaining)
@@ -3173,6 +3579,8 @@ class ExpertStreamingRuntime:
                 raise slots_error
             self._raise_cleanup_error()
         finally:
+            if memory_transaction_acquired:
+                self._memory_transaction_lock.release()
             self._close_lock.release()
 
     def __enter__(self) -> ExpertStreamingRuntime:
@@ -3184,11 +3592,11 @@ class ExpertStreamingRuntime:
 
 def load_configured_expert_runtime(
     root: Path | str,
-    manifest_path: Path | str,
+    manifest_source: ExpertManifest | Path | str,
     config: ExpertStreamingConfig,
     **kwargs: Any,
 ) -> ExpertStreamingRuntime:
     try:
-        return ExpertStreamingRuntime.open(root, manifest_path, config, **kwargs)
+        return ExpertStreamingRuntime.open(root, manifest_source, config, **kwargs)
     except ExpertManifestError as exc:
         raise ExpertStreamingConfigurationError(str(exc)) from exc

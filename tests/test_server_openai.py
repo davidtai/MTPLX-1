@@ -167,6 +167,40 @@ def test_capture_commit_keeps_fast_snapshot_skip_override():
     assert overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"
 
 
+def test_hy3_q4_dynamic_context_pins_exact_dynamic_page_floor():
+    args = SimpleNamespace(
+        generation_mode="ar",
+        verify_strategy="capture_commit",
+        hy3_q4_dynamic_context=True,
+    )
+
+    overrides = openai._server_runtime_env_overrides(args, None)
+
+    assert overrides["MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS"] == "1"
+    assert overrides["MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS"] == "1"
+    assert overrides["MTPLX_DYNAMIC_PAGED_KV_MARGIN"] == "0"
+    assert overrides["MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER"] == "0"
+
+
+def test_hy3_q4_dynamic_context_pins_sync_free_prefill_and_bounded_runway():
+    args = SimpleNamespace(
+        generation_mode="ar",
+        verify_strategy="capture_commit",
+        hy3_q4_dynamic_context=True,
+    )
+
+    overrides = openai._server_runtime_env_overrides(
+        args,
+        {
+            "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP": "1",
+            "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "off",
+        },
+    )
+
+    assert overrides["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] == "0"
+    assert overrides["MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS"] == "16384"
+
+
 def test_server_parser_accepts_tool_prompt_and_template_profile():
     args = parse_args(
         [
@@ -340,6 +374,7 @@ def test_chat_request_accepts_ai_sdk_camel_sampler_aliases():
 
 def test_dynamic_paged_kv_reservation_caps_oversized_response_budget(monkeypatch):
     monkeypatch.delenv("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS", raising=False)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE", "32")
 
     reservation = openai._dynamic_paged_kv_reservation(
         prompt_tokens=181,
@@ -352,6 +387,10 @@ def test_dynamic_paged_kv_reservation_caps_oversized_response_budget(monkeypatch
     assert reservation["reserved_new_tokens"] == 16384
     assert reservation["initial_new_token_cap"] == 16384
     assert reservation["reservation_capped"] is True
+    assert reservation["logical_ownership_scope"] == "startup_reserved"
+    assert reservation["logical_ownership_growth"] == "post_physical_write"
+    assert reservation["startup_reserved_logical_tokens"] == 181 + 16384
+    assert reservation["block_size_tokens"] == 32
 
 
 def test_dynamic_paged_kv_reservation_can_disable_initial_cap(monkeypatch):
@@ -924,7 +963,9 @@ def test_vision_splice_kwargs_always_match_callee_signatures():
     problems = []
     for filename, lineno, func in calls:
         if not isinstance(func, ast.Name):
-            problems.append(f"{filename}:{lineno} passes vision_splice to a non-plain callee")
+            problems.append(
+                f"{filename}:{lineno} passes vision_splice to a non-plain callee"
+            )
             continue
         declared, has_kwargs = defs.get(func.id, (False, False))
         if not (declared or has_kwargs):
@@ -1048,6 +1089,9 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
 def _enable_hy3_q4_dynamic_context(state):
     state.args.hy3_q4_dynamic_context = True
     state.args.session_bank_live_refs = False
+    state.args.generation_mode = "ar"
+    state.args.load_mtp = False
+    state.runtime.mtp_enabled = False
     state.context_window = 131_072
     state.hy3_q4_sequence_gate = SingleSequenceGate()
     return state
@@ -1236,9 +1280,7 @@ class _RecordingSequenceLease:
 
 
 @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
-def test_hy3_q4_dispatched_terminal_paths_release_exactly_once(
-    monkeypatch, outcome
-):
+def test_hy3_q4_dispatched_terminal_paths_release_exactly_once(monkeypatch, outcome):
     state = _enable_hy3_q4_dynamic_context(_fake_state())
     lease = _RecordingSequenceLease()
     monkeypatch.setattr(
@@ -1526,7 +1568,7 @@ def test_hy3_q4_concurrent_session_chat_is_http_429_before_kv_allocation(
         return original_resolve(*args, **kwargs)
 
     state.runtime.admit_kv_tokens = admit_kv_tokens
-    monkeypatch.setattr(openai, "generate_mtpk", blocking_generate)
+    monkeypatch.setattr(openai, "generate_ar", blocking_generate)
     monkeypatch.setattr(
         openai,
         "_encode_messages",
@@ -1823,9 +1865,7 @@ def test_hy3_q4_nonstream_asgi_cancellation_holds_lease_until_worker_cleanup(
             lambda _loop, context: loop_errors.append(context)
         )
 
-        async def invoke(
-            request_path, request_payload, *, keep_receive_open=False
-        ):
+        async def invoke(request_path, request_payload, *, keep_receive_open=False):
             body = json.dumps({**request_payload, "max_tokens": 1}).encode()
             request_sent = False
             status = None
@@ -1872,9 +1912,7 @@ def test_hy3_q4_nonstream_asgi_cancellation_holds_lease_until_worker_cleanup(
             await app(scope, receive, send)
             return status, bytes(response_body)
 
-        first_task = asyncio.create_task(
-            invoke(path, payload, keep_receive_open=True)
-        )
+        first_task = asyncio.create_task(invoke(path, payload, keep_receive_open=True))
         assert await asyncio.to_thread(worker_started.wait, 5.0)
         first_task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2059,6 +2097,186 @@ def _fake_final_state(tokens):
         safe_to_commit=True,
         finish_reason="stop",
     )
+
+
+def test_issue46_server_starts_with_one_page_and_admits_growth_after_writes(
+    monkeypatch,
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+    state.args.hy3_q4_dynamic_memory = True
+    state.draft_sampler = None
+    state.requests_completed = 0
+    admitted: list[int] = []
+    released: list[int] = []
+    growth_order: list[str] = []
+    page_sizes: list[int] = []
+    prompt_ids = [1] * 181
+
+    class Admission:
+        def __init__(self, tokens: int) -> None:
+            self.tokens = tokens
+
+        def release(self) -> None:
+            released.append(self.tokens)
+
+        def grow_to_page_boundary(
+            self,
+            tokens: int,
+            *,
+            page_size_tokens: int,
+        ) -> bool:
+            page_sizes.append(page_size_tokens)
+            current_pages = (self.tokens + page_size_tokens - 1) // page_size_tokens
+            target_pages = (tokens + page_size_tokens - 1) // page_size_tokens
+            crossed_page = target_pages > current_pages
+            self.tokens = tokens
+            growth_order.append(f"logical_grow:{tokens}")
+            return crossed_page
+
+    def admit_kv_tokens(tokens: int):
+        admitted.append(tokens)
+        return Admission(tokens)
+
+    def fake_generate_ar(*_args, **kwargs):
+        assert admitted == [1]
+        assert os.environ["MTPLX_DYNAMIC_PAGED_KV_TOKENS"] == "16"
+        # The real callback is issued by generate_ar only after the cache write
+        # and its broker transaction commit. Prove prompt/decode ownership
+        # follows physical page growth instead of reserving request capacity.
+        growth_order.append("physical_growth:prefill")
+        kwargs["kv_progress_callback"](181)
+        growth_order.append("physical_write:192")
+        kwargs["kv_progress_callback"](192)
+        growth_order.append("physical_growth:decode")
+        kwargs["kv_progress_callback"](193)
+        return SimpleNamespace(
+            tokens=[ord("O")],
+            text="O",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 1,
+                    "elapsed_s": 0.1,
+                    "tok_s": 10.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    state.runtime.admit_kv_tokens = admit_kv_tokens
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS", "16384")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE", "16")
+    monkeypatch.setattr(openai, "generate_ar", fake_generate_ar)
+
+    generated = openai._run_generation(
+        state,
+        prompt_ids,
+        max_tokens=65_536,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        seed=42,
+        generation_mode="ar",
+    )
+
+    assert admitted == [1]
+    assert growth_order == [
+        "physical_growth:prefill",
+        "logical_grow:181",
+        "physical_write:192",
+        "logical_grow:192",
+        "physical_growth:decode",
+        "logical_grow:193",
+    ]
+    assert page_sizes == [16, 16, 16]
+    assert released == [193]
+    assert generated["stats"]["dynamic_paged_kv"] == {
+        "requested_new_tokens": 65_536,
+        "reserved_new_tokens": 0,
+        "initial_new_token_cap": None,
+        "reservation_capped": False,
+        "reservation_policy": "incremental_pages",
+        "incremental_pages": True,
+        "reserved_total_tokens": 16,
+        "initial_physical_tokens": 16,
+        "logical_ownership_scope": "evaluated_tokens",
+        "logical_ownership_growth": "post_physical_write",
+        "startup_reserved_logical_tokens": 1,
+        "block_size_tokens": 16,
+    }
+
+
+def test_issue46_server_threads_ar_prefill_cancel_and_releases_logical_lease(
+    monkeypatch,
+):
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+    state.args.hy3_q4_dynamic_memory = True
+    state.draft_sampler = None
+    state.requests_completed = 0
+    admitted: list[int] = []
+    released: list[int] = []
+    cancel_event = Event()
+
+    class Admission:
+        def __init__(self, tokens: int) -> None:
+            self.tokens = tokens
+
+        def release(self) -> None:
+            released.append(self.tokens)
+
+        def grow_to_page_boundary(self, tokens: int, *, page_size_tokens: int) -> bool:
+            self.tokens = tokens
+            return False
+
+    def admit_kv_tokens(tokens: int):
+        admitted.append(tokens)
+        return Admission(tokens)
+
+    def fake_generate_ar(*_args, **kwargs):
+        abort_check = kwargs["abort_check"]
+        assert callable(abort_check)
+        cancel_event.set()
+        assert abort_check() is True
+        raise openai.PostcommitAbort("foreground_preempted_postcommit")
+
+    state.runtime.admit_kv_tokens = admit_kv_tokens
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE", "16")
+    monkeypatch.setattr(openai, "generate_ar", fake_generate_ar)
+
+    with pytest.raises(openai._StreamCancelled, match="disconnected during generation"):
+        openai._run_generation(
+            state,
+            [1] * 181,
+            max_tokens=65_536,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            seed=42,
+            generation_mode="ar",
+            cancel_event=cancel_event,
+        )
+
+    assert admitted == [1]
+    assert released == [1]
+
+
+def test_issue46_internal_generation_rejects_mtp_growth_bypass():
+    state = _enable_hy3_q4_dynamic_context(_fake_streaming_session_state())
+
+    with pytest.raises(
+        RuntimeError,
+        match="hy3_q4_dynamic_context requires generation_mode 'ar'",
+    ):
+        openai._run_generation(
+            state,
+            [1, 2, 3],
+            max_tokens=4,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            seed=42,
+            generation_mode="mtp",
+        )
 
 
 def test_mtplx_settings_endpoint_controls_server_reasoning():
@@ -2310,7 +2528,10 @@ def test_settings_emit_gemma_block_controls_and_tune_policy():
         "Block 8",
     ]
     assert controls["kv_quant"]["supported"] is False
-    assert controls["kv_quant"]["disabled_reason"] == "KV quantization is not supported for Gemma."
+    assert (
+        controls["kv_quant"]["disabled_reason"]
+        == "KV quantization is not supported for Gemma."
+    )
     assert controls["context_window"]["maximum"] == 262144
     assert response.json()["context_window_policy"]["maximum"] == 262144
 
@@ -2334,7 +2555,10 @@ def test_step_descriptor_is_experimental_and_not_qwen_tune():
     assert controls["reasoning"]["default_effort"] == "low"
     assert controls["tune"]["supported"] is False
     assert controls["kv_quant"]["supported"] is False
-    assert controls["kv_quant"]["disabled_reason"] == "KV quantization is not supported for Step."
+    assert (
+        controls["kv_quant"]["disabled_reason"]
+        == "KV quantization is not supported for Step."
+    )
 
 
 def test_step_backend_chat_policy_injects_language_anchor():
@@ -2350,7 +2574,9 @@ def test_step_backend_chat_policy_injects_language_anchor():
     assert [message.role for message in messages] == ["system", "user"]
     assert "MTPLX Step language policy:" in messages[0].content
     assert "Use English by default" in messages[0].content
-    assert "Never answer in Chinese for English or ambiguous input." in messages[0].content
+    assert (
+        "Never answer in Chinese for English or ambiguous input." in messages[0].content
+    )
     assert messages[1].content == "hi"
 
 
@@ -2368,7 +2594,9 @@ def test_step_backend_chat_policy_preserves_existing_system_prompt():
 
     assert changed is True
     assert [message.role for message in messages] == ["system", "user"]
-    assert messages[0].content.startswith("Client policy\n\nMTPLX Step language policy:")
+    assert messages[0].content.startswith(
+        "Client policy\n\nMTPLX Step language policy:"
+    )
     assert messages[1].content == "hi"
 
 
@@ -2485,7 +2713,10 @@ def test_openai_server_health_metrics_and_models_fake_state():
     assert "refreshDaemonSettings" in root.text
     assert "window.setInterval(() => refreshDaemonSettings(), 1500)" in root.text
     assert "JSON.stringify({system:" in root.text
-    assert 'const rawMode = payload.generation_mode == null ? "" : String(payload.generation_mode);' in root.text
+    assert (
+        'const rawMode = payload.generation_mode == null ? "" : String(payload.generation_mode);'
+        in root.text
+    )
     assert "Settings mirror the running MTPLX app." in root.text
     # Auto-detect of context length must be hooked up so the slider isn't
     # capped at a stale 32k for a 256k-context model.
@@ -2602,7 +2833,11 @@ def test_health_exposes_enabled_hy3_q4_dynamic_memory_resource_snapshot(monkeypa
         "dynamic_memory": {
             "operating_target_bytes": 110 * 1024**3,
             "hard_ceiling_bytes": 112 * 1024**3,
+            "allocator_headroom_bytes": 1024**3,
+            "classified_target_bytes": 109 * 1024**3,
+            "classified_bytes": 100 * 1024**3,
             "charged_bytes": 100 * 1024**3,
+            "charged_residual_bytes": 10 * 1024**3,
             "logical_expert_records": 256,
             "active_expert_records": 224,
             "resident_expert_records": 200,
@@ -2633,6 +2868,10 @@ def test_health_exposes_enabled_hy3_q4_dynamic_memory_resource_snapshot(monkeypa
     assert payload["enabled"] is True
     assert payload["kv_representation"] == "q4"
     assert payload["charged_bytes"] == 100 * 1024**3
+    assert payload["allocator_headroom_bytes"] == 1024**3
+    assert payload["classified_target_bytes"] == 109 * 1024**3
+    assert payload["classified_bytes"] == 100 * 1024**3
+    assert payload["charged_residual_bytes"] == 10 * 1024**3
     assert payload["expert_active_slabs"] == 7
     assert payload["expert_cache_hit_rate"] == 0.9
     assert payload["process_rss_bytes"] is None
@@ -2995,6 +3234,31 @@ def test_chat_generation_mode_request_override_routes_mtp_depth(monkeypatch):
     assert response.json()["mtplx_stats"]["mtp_depth"] == 1
 
 
+def test_hy3_q4_dynamic_context_rejects_mtp_request_override():
+    state = _enable_hy3_q4_dynamic_context(_fake_state())
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-allow-client-controls": "1",
+        },
+        json={
+            "messages": [{"role": "user", "content": "Say READY"}],
+            "max_tokens": 4,
+            "generation_mode": "mtp",
+            "depth": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert (
+        response.json()["error"]["message"]
+        == "hy3_q4_dynamic_context requires generation_mode 'ar'"
+    )
+
+
 def test_chat_request_controls_are_server_owned_without_override(monkeypatch):
     captured: dict[str, object] = {}
     state = _fake_state()
@@ -3132,7 +3396,9 @@ def test_opencode_chitchat_history_reaches_model_with_tools_kept(monkeypatch):
     assert stats["request_filtered_tool_names"] == ["session_status"]
     assert stats["request_hidden_tool_names"] == []
     assert stats["request_tools_hidden_by_bridge"] is False
-    assert stats["tool_contract_policy_version"] == "compact_tool_contract:schema_free:v1"
+    assert (
+        stats["tool_contract_policy_version"] == "compact_tool_contract:schema_free:v1"
+    )
     assert stats["tool_contract_active"] is True
     assert stats["no_tools_contract_active"] is False
     assert stats["transcript_replaced_client_system_messages"] == 0
@@ -3183,7 +3449,10 @@ def test_opencode_initial_coding_request_uses_compact_mtplx_agent_prompt(monkeyp
         json={
             "messages": [
                 {"role": "system", "content": opencode_system_prompt},
-                {"role": "user", "content": "Inspect this project and read package files."},
+                {
+                    "role": "user",
+                    "content": "Inspect this project and read package files.",
+                },
             ],
             "tools": [_tool_schema()],
             "max_tokens": 16,
@@ -3214,7 +3483,9 @@ def test_chat_long_context_depth_cap_resolves_runtime_depth(monkeypatch):
     monkeypatch.setenv("MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY", "auto")
     monkeypatch.setenv("MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD", "12000")
     monkeypatch.setenv("MTPLX_LONG_CONTEXT_MTP_DEPTH", "2")
-    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 12506)
+    monkeypatch.setattr(
+        openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 12506
+    )
 
     def fake_run_generation(_state, _prompt_ids, **kwargs):
         captured.update(kwargs)
@@ -3262,7 +3533,9 @@ def test_opencode_short_context_preserves_depth3(monkeypatch):
     captured: dict[str, object] = {}
     client = TestClient(create_app(_fake_state()))
 
-    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 5000)
+    monkeypatch.setattr(
+        openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 5000
+    )
 
     def fake_run_generation(_state, _prompt_ids, **kwargs):
         captured["depth"] = kwargs["depth"]
@@ -3300,7 +3573,9 @@ def test_opencode_short_context_depth_policy_respects_explicit_depth(monkeypatch
     captured: dict[str, object] = {}
     client = TestClient(create_app(_fake_state()))
 
-    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 5000)
+    monkeypatch.setattr(
+        openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 5000
+    )
 
     def fake_run_generation(_state, _prompt_ids, **kwargs):
         captured["depth"] = kwargs["depth"]
@@ -3339,7 +3614,9 @@ def test_opencode_short_context_depth_policy_keeps_depth3_above_threshold(monkey
     captured: dict[str, object] = {}
     client = TestClient(create_app(_fake_state()))
 
-    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 8000)
+    monkeypatch.setattr(
+        openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 8000
+    )
 
     def fake_run_generation(_state, _prompt_ids, **kwargs):
         captured["depth"] = kwargs["depth"]
@@ -3454,9 +3731,7 @@ def test_streaming_session_uses_generation_final_postcommit_without_retokenized_
             if streaming_response is None
             else bool(streaming_response)
         )
-        expected_batch_key = (
-            "chat.stream" if is_streaming else "chat.nonstream"
-        )
+        expected_batch_key = "chat.stream" if is_streaming else "chat.nonstream"
         assert scheduler.current_batch_key == expected_batch_key
         captured.setdefault(
             "commit_final_state_to_bank",
@@ -3610,9 +3885,10 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         if metric.get("session_prompt_prefix_commit")
     ]
     assert metrics_with_frontier
-    assert metrics_with_frontier[-1]["session_prompt_prefix_commit"][
-        "boundary_kind"
-    ] == "postcommit_prompt_prefix"
+    assert (
+        metrics_with_frontier[-1]["session_prompt_prefix_commit"]["boundary_kind"]
+        == "postcommit_prompt_prefix"
+    )
     assert metrics_with_frontier[-1]["session_postcommit_snapshot"] == {
         "stored": False,
         "mode": "async_pending",
@@ -4041,7 +4317,9 @@ class StepTemplateIgnoringThinkingTokenizer(CaptureTokenizer):
         rendered = "<｜begin▁of▁sentence｜>"
         reasoning_effort = kwargs.get("reasoning_effort")
         if reasoning_effort:
-            rendered += f"<|im_start|>system\nReasoning: {reasoning_effort}\n\n<|im_end|>\n"
+            rendered += (
+                f"<|im_start|>system\nReasoning: {reasoning_effort}\n\n<|im_end|>\n"
+            )
         for message in messages:
             role = str(message.get("role") or "user")
             content = str(message.get("content") or "")
@@ -4391,9 +4669,7 @@ def test_chat_tools_hide_task_when_latest_user_disallows_subagents(monkeypatch):
         "/v1/chat/completions",
         headers={"x-mtplx-cache-mode": "bypass"},
         json={
-            "messages": [
-                {"role": "user", "content": "Make the change. No subagents."}
-            ],
+            "messages": [{"role": "user", "content": "Make the change. No subagents."}],
             "tools": [_tool_schema(), _task_tool_schema(), _todowrite_tool_schema()],
             "tool_choice": "auto",
             "max_tokens": 8,
@@ -4586,7 +4862,9 @@ def test_chat_tools_opencode_client_toolset_passes_through(monkeypatch):
     assert stats["tool_prompt_mode"] == "compact"
 
 
-def test_chat_tools_keep_task_when_latest_user_explicitly_requests_subagent(monkeypatch):
+def test_chat_tools_keep_task_when_latest_user_explicitly_requests_subagent(
+    monkeypatch,
+):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -4621,7 +4899,9 @@ def test_chat_tools_keep_task_when_latest_user_explicitly_requests_subagent(monk
     assert tool_names == ["session_status", "Task"]
 
 
-def test_chat_tools_keep_todowrite_when_latest_user_explicitly_requests_plan(monkeypatch):
+def test_chat_tools_keep_todowrite_when_latest_user_explicitly_requests_plan(
+    monkeypatch,
+):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -5216,7 +5496,9 @@ def test_opencode_simple_chitchat_streams_reasoning_when_app_reasoning_on(monkey
     assert "visible_reasoning_policy" not in final[-1]["mtplx_stats"]
     # Chitchat keeps client tools (band-aid removal, 2026-06-09).
     assert final[-1]["mtplx_stats"]["request_tools_hidden_by_bridge"] is False
-    assert final[-1]["mtplx_stats"]["opencode_prompt_contract_profile"] == "opencode_agent"
+    assert (
+        final[-1]["mtplx_stats"]["opencode_prompt_contract_profile"] == "opencode_agent"
+    )
 
 
 def test_opencode_simple_chitchat_does_not_retry_or_cook_a_reply(monkeypatch):
@@ -5293,10 +5575,14 @@ def test_opencode_simple_chitchat_does_not_retry_or_cook_a_reply(monkeypatch):
     assert final[-1]["mtplx_stats"]["request_reasoning_mode"] == "off"
     # Chitchat keeps client tools (band-aid removal, 2026-06-09).
     assert final[-1]["mtplx_stats"]["request_tools_hidden_by_bridge"] is False
-    assert final[-1]["mtplx_stats"]["opencode_prompt_contract_profile"] == "opencode_agent"
+    assert (
+        final[-1]["mtplx_stats"]["opencode_prompt_contract_profile"] == "opencode_agent"
+    )
 
 
-def test_step_chat_request_encodes_language_policy_without_replacing_user_turn(monkeypatch):
+def test_step_chat_request_encodes_language_policy_without_replacing_user_turn(
+    monkeypatch,
+):
     captured: dict[str, object] = {}
     state = _fake_streaming_session_state()
     state.backend_descriptor = openai.descriptor_for_backend_id("step3p5_mtp")
@@ -5592,7 +5878,7 @@ def test_pi_tool_result_empty_template_sentinel_retries_final_answer(monkeypatch
                             "type": "function",
                             "function": {
                                 "name": "read",
-                                "arguments": "{\"filePath\":\"package.json\"}",
+                                "arguments": '{"filePath":"package.json"}',
                             },
                         }
                     ],
@@ -5600,7 +5886,7 @@ def test_pi_tool_result_empty_template_sentinel_retries_final_answer(monkeypatch
                 {
                     "role": "tool",
                     "tool_call_id": "call_read",
-                    "content": "{\"scripts\":{\"dev\":\"vite\"}}",
+                    "content": '{"scripts":{"dev":"vite"}}',
                 },
             ],
             "tools": [_tool_schema()],
@@ -5689,7 +5975,7 @@ def test_pi_tool_result_orphan_tool_tail_retries_without_stream_leak(monkeypatch
                             "type": "function",
                             "function": {
                                 "name": "read",
-                                "arguments": "{\"filePath\":\"src/Game.ts\"}",
+                                "arguments": '{"filePath":"src/Game.ts"}',
                             },
                         }
                     ],
@@ -5697,7 +5983,7 @@ def test_pi_tool_result_orphan_tool_tail_retries_without_stream_leak(monkeypatch
                 {
                     "role": "tool",
                     "tool_call_id": "call_read",
-                    "content": "{\"content\":\"export const score = 0\"}",
+                    "content": '{"content":"export const score = 0"}',
                 },
             ],
             "tools": [_tool_schema()],
@@ -5797,7 +6083,7 @@ def test_pi_tool_result_reasoning_only_final_turn_repairs_without_visible_leak(
                             "type": "function",
                             "function": {
                                 "name": "read",
-                                "arguments": "{\"filePath\":\"src/Game.ts\"}",
+                                "arguments": '{"filePath":"src/Game.ts"}',
                             },
                         }
                     ],
@@ -5805,7 +6091,7 @@ def test_pi_tool_result_reasoning_only_final_turn_repairs_without_visible_leak(
                 {
                     "role": "tool",
                     "tool_call_id": "call_read",
-                    "content": "{\"content\":\"export class Game {}\"}",
+                    "content": '{"content":"export class Game {}"}',
                 },
             ],
             "tools": [_tool_schema()],
@@ -5951,7 +6237,9 @@ def test_streaming_unclosed_tool_call_errors_instead_of_hidden_runaway(monkeypat
     monkeypatch.setattr(
         openai,
         "_run_generation",
-        _fake_streaming_generation("<tool_call>\n<function=session_status>\n" + "x" * 32),
+        _fake_streaming_generation(
+            "<tool_call>\n<function=session_status>\n" + "x" * 32
+        ),
     )
 
     with client.stream(
@@ -5981,7 +6269,9 @@ def test_streaming_long_content_first_write_survives_hidden_tool_guard(monkeypat
     client = TestClient(create_app(state))
     monkeypatch.setattr(openai, "STREAM_HIDDEN_TOOL_GUARD_TOKENS", 80)
     monkeypatch.setattr(openai, "STREAM_HIDDEN_TOOL_GUARD_S", 0.0)
-    long_content = "\n".join(["<!DOCTYPE html>", "<html>", "<body>", "x" * 80, "</body>", "</html>"] * 24)
+    long_content = "\n".join(
+        ["<!DOCTYPE html>", "<html>", "<body>", "x" * 80, "</body>", "</html>"] * 24
+    )
     text = (
         "<tool_call>\n<function=write>\n"
         f"<parameter=content>\n{long_content}\n</parameter>\n"
@@ -6152,9 +6442,7 @@ def test_gemma4_encoder_renders_assistant_tool_call_before_tool_result():
         "type": "function",
         "function": {
             "name": "bash",
-            "arguments": json.dumps(
-                {"command": "ls", "description": "List files"}
-            ),
+            "arguments": json.dumps({"command": "ls", "description": "List files"}),
         },
     }
 
@@ -6217,7 +6505,9 @@ def test_agent_transcript_canonicalization_preserves_tool_history_text():
         tools_active=True,
     )
 
-    assert canonical[1].content == "Let me continue:\nWrite the Sky, Game, and utils files"
+    assert (
+        canonical[1].content == "Let me continue:\nWrite the Sky, Game, and utils files"
+    )
     assert canonical[1].tool_calls == [tool_call]
     assert stats.stripped_tool_preamble_messages == 0
     assert stats.stripped_tool_preamble_chars == 0
@@ -6333,7 +6623,10 @@ def test_agent_transcript_canonicalization_compacts_digested_large_tool_results(
     assert stats.compacted_tool_result_chars == len(large_output) - len(compacted)
     metrics = stats.to_metrics()
     assert metrics["transcript_canonicalized"] is True
-    assert metrics["transcript_canonical_message_chars"] < metrics["transcript_raw_message_chars"]
+    assert (
+        metrics["transcript_canonical_message_chars"]
+        < metrics["transcript_raw_message_chars"]
+    )
 
 
 def test_agent_transcript_canonicalization_keeps_followup_tool_digests_small():
@@ -6508,7 +6801,10 @@ def test_agent_transcript_canonicalization_compacts_current_large_glob_output():
     assert "src/game/ObstacleManager.ts" in compacted
     assert "read_hint_count=2" in compacted
     assert "<next_read_hints>" in compacted
-    assert 'filePath="/Users/youssof/Documents/bow masters 3d/src/game/Arrow.ts"' in compacted
+    assert (
+        'filePath="/Users/youssof/Documents/bow masters 3d/src/game/Arrow.ts"'
+        in compacted
+    )
     assert "Avoid broad list/glob/grep repeats" in compacted
     assert len(compacted) < 6_000
     assert len(compacted) < len(large_output)
@@ -6567,12 +6863,17 @@ def test_agent_transcript_canonicalization_adds_read_ranges_for_build_output():
     assert "<next_read_hints>" in compacted
     assert 'filePath="src/game/ObstacleManager.ts" start="220" end="273"' in compacted
     assert 'filePath="src/game/HUD.ts" start="68" end="108"' in compacted
-    assert 'filePath="/Users/youssof/Documents/bow masters 3d/scripts/check.py" start="22" end="62"' in compacted
+    assert (
+        'filePath="/Users/youssof/Documents/bow masters 3d/scripts/check.py" start="22" end="62"'
+        in compacted
+    )
     assert "Do not rerun the broad tool command unchanged" in compacted
     assert "error TS2322" in compacted
     assert "error TS2554" in compacted
     assert stats.compacted_active_tool_result_messages == 1
-    assert stats.compacted_active_tool_result_chars == len(large_output) - len(compacted)
+    assert stats.compacted_active_tool_result_chars == len(large_output) - len(
+        compacted
+    )
     assert stats.to_metrics()["transcript_compacted_active_tool_result_read_hints"] == 3
 
 
@@ -6591,15 +6892,21 @@ def test_agent_transcript_canonicalization_compacts_current_large_read_outputs()
     ]
     for line_no in range(3, 380):
         if line_no == 240:
-            body_lines.append("240:   public checkArrowCollisions(arrow: Arrow): void {")
+            body_lines.append(
+                "240:   public checkArrowCollisions(arrow: Arrow): void {"
+            )
         elif line_no == 241:
             body_lines.append("241:     if (arrow.isEmbedded()) return;")
         elif line_no == 248:
-            body_lines.append("248:       const dist = arrowPos.distanceTo(obstacle.position);")
+            body_lines.append(
+                "248:       const dist = arrowPos.distanceTo(obstacle.position);"
+            )
         elif line_no == 252:
             body_lines.append("252:       if (dist < hitRadius) {")
         elif line_no == 253:
-            body_lines.append("253:         arrow.embedInTerrain(obstacle.position.y - 0.5);")
+            body_lines.append(
+                "253:         arrow.embedInTerrain(obstacle.position.y - 0.5);"
+            )
         elif line_no == 320:
             body_lines.append("320:   window.addEventListener('touchstart', flap);")
         elif line_no == 321:
@@ -6614,9 +6921,7 @@ def test_agent_transcript_canonicalization_compacts_current_large_read_outputs()
     large_read_output = (
         "<path>src/game/ObstacleManager.ts</path>\n"
         "<type>file</type>\n"
-        "<content>\n"
-        + "\n".join(body_lines)
-        + "\n</content>"
+        "<content>\n" + "\n".join(body_lines) + "\n</content>"
     )
 
     canonical, stats = openai._canonicalize_agent_transcript(
@@ -6686,9 +6991,7 @@ def test_agent_transcript_canonicalization_uses_inspection_digest_for_review_rea
     read_output = (
         "<path>index.html</path>\n"
         "<type>file</type>\n"
-        "<content>\n"
-        + "\n".join(body_lines)
-        + "\n</content>"
+        "<content>\n" + "\n".join(body_lines) + "\n</content>"
     )
 
     canonical, stats = openai._canonicalize_agent_transcript(
@@ -6799,9 +7102,7 @@ def test_agent_transcript_canonicalization_spreads_full_file_inspection_anchors(
     read_output = (
         "<path>index.html</path>\n"
         "<type>file</type>\n"
-        "<content>\n"
-        + "\n".join(body_lines)
-        + "\n</content>"
+        "<content>\n" + "\n".join(body_lines) + "\n</content>"
     )
 
     canonical, stats = openai._canonicalize_agent_transcript(
@@ -6825,15 +7126,24 @@ def test_agent_transcript_canonicalization_spreads_full_file_inspection_anchors(
 
     compacted = str(canonical[2].content)
     assert compacted.startswith("<mtplx_read_inspection_digest")
-    assert 'line 5: <meta name="viewport" content="width=device-width, initial-scale=1.0">' in compacted
+    assert (
+        'line 5: <meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        in compacted
+    )
     assert "line 6: <title>Flappy Bird 3D</title>" in compacted
     assert "line 185: const relZ = Math.abs(birdZ - pipe.position.z);" in compacted
-    assert "line 188: if (Math.abs(birdY - pipe.userData.gapCenter) > pipe.userData.halfGap + 0.05) {" in compacted
+    assert (
+        "line 188: if (Math.abs(birdY - pipe.userData.gapCenter) > pipe.userData.halfGap + 0.05) {"
+        in compacted
+    )
     assert "line 189: return true;" in compacted
     assert "line 443: pipes.forEach(p => scene.remove(p));" in compacted
     assert "line 447: particles.forEach(p => scene.remove(p));" in compacted
     assert "line 448: particles.length = 0;" in compacted
-    assert "line 120: renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));" in compacted
+    assert (
+        "line 120: renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));"
+        in compacted
+    )
     assert 'line 222: window.addEventListener("keydown", (e) => {' in compacted
     assert 'line 223: if (e.code === "Space" || e.code === "ArrowUp") {' in compacted
     assert "line 224: e.preventDefault();" in compacted
@@ -6843,7 +7153,9 @@ def test_agent_transcript_canonicalization_spreads_full_file_inspection_anchors(
     assert "line 501: flap();" in compacted
     assert "line 502: }, { passive: false });" in compacted
     assert 'line 505: window.addEventListener("resize", () => {' in compacted
-    assert "line 506: camera.aspect = window.innerWidth / window.innerHeight;" in compacted
+    assert (
+        "line 506: camera.aspect = window.innerWidth / window.innerHeight;" in compacted
+    )
     assert "line 507: camera.updateProjectionMatrix();" in compacted
     assert "line 514: const dt = Math.min(clock.getDelta(), 0.05);" in compacted
     assert "line 553: for (let i = pipes.length - 1; i >= 0; i--) {" in compacted
@@ -6911,7 +7223,7 @@ def test_agent_transcript_canonicalization_compacts_plain_read_tool_output():
     compacted = str(canonical[2].content)
     assert compacted.startswith("<mtplx_read_inspection_digest")
     assert "<path>index.html</path>" in compacted
-    assert "line 81: \"three\": \"https://cdn.jsdelivr.net/npm/three@0.160.0" in compacted
+    assert 'line 81: "three": "https://cdn.jsdelivr.net/npm/three@0.160.0' in compacted
     assert "line 499: window.addEventListener" in compacted
     assert "line 514: const dt = Math.min(clock.getDelta(), 0.05);" in compacted
     assert len(compacted) < len(plain_read_output)
@@ -6951,16 +7263,12 @@ def test_agent_transcript_canonicalization_collapses_repeated_inspection_reads()
     full_read = (
         "<path>index.html</path>\n"
         "<type>file</type>\n"
-        "<content>\n"
-        + "\n".join(full_lines)
-        + "\n</content>"
+        "<content>\n" + "\n".join(full_lines) + "\n</content>"
     )
     repeated_read = (
         "<path>index.html</path>\n"
         "<type>file</type>\n"
-        "<content>\n"
-        + "\n".join(full_lines[249:340])
-        + "\n</content>"
+        "<content>\n" + "\n".join(full_lines[249:340]) + "\n</content>"
     )
 
     canonical, stats = openai._canonicalize_agent_transcript(
@@ -7060,9 +7368,7 @@ def test_agent_transcript_canonicalization_budgets_multi_file_inspection_reads()
                 content=(
                     f"<path>{path}</path>\n"
                     "<type>file</type>\n"
-                    "<content>\n"
-                    + "\n".join(body_lines)
-                    + "\n</content>"
+                    "<content>\n" + "\n".join(body_lines) + "\n</content>"
                 ),
             )
         )
@@ -7080,8 +7386,7 @@ def test_agent_transcript_canonicalization_budgets_multi_file_inspection_reads()
     assert len(digests) == 6
     assert all(digest.startswith("<mtplx_read_inspection_digest") for digest in digests)
     evidence_counts = [
-        int(re.search(r'evidence_lines="(\d+)"', digest).group(1))
-        for digest in digests
+        int(re.search(r'evidence_lines="(\d+)"', digest).group(1)) for digest in digests
     ]
     assert all(3 <= count <= 16 for count in evidence_counts)
     assert all("requestAnimationFrame" in digest for digest in digests)
@@ -7242,8 +7547,7 @@ def test_agent_transcript_canonicalization_skips_stalled_tool_preamble():
         "function": {"name": "todowrite", "arguments": '{"todos":[]}'},
     }
     duplicate = (
-        "Almost there - just strict TypeScript checks. "
-        "Let me fix all remaining errors:"
+        "Almost there - just strict TypeScript checks. Let me fix all remaining errors:"
     )
 
     canonical, stats = openai._canonicalize_agent_transcript(
@@ -7283,7 +7587,9 @@ def test_agent_transcript_canonicalization_skips_stalled_tool_preamble():
         "tool",
         "user",
     ]
-    assert canonical[1].content == "Let me check what's left to fix and get this running."
+    assert (
+        canonical[1].content == "Let me check what's left to fix and get this running."
+    )
     assert canonical[3].content == duplicate
     assert stats.stripped_tool_preamble_messages == 0
     assert stats.skipped_repeated_assistant_messages == 0
@@ -7451,7 +7757,9 @@ def test_agent_transcript_canonicalization_marks_repeated_shell_timeouts():
                 tool_call_id="call_tsc_1",
                 content=timeout_output,
             ),
-            openai.ChatMessage(role="assistant", content="", tool_calls=[repeated_call]),
+            openai.ChatMessage(
+                role="assistant", content="", tool_calls=[repeated_call]
+            ),
             openai.ChatMessage(
                 role="tool",
                 tool_call_id="call_tsc_2",
@@ -7482,7 +7790,10 @@ def test_tool_contract_stabilizes_tool_schema_with_agent_tail_guardrail():
     assert "file content as tool arguments" in with_contract[0]["content"]
     assert "MTPLX coding-agent tool protocol reminder:" in with_contract[0]["content"]
     assert "emit one declared <tool_call> now" in with_contract[0]["content"]
-    assert "implementation payloads in the declared tool call arguments" in with_contract[0]["content"]
+    assert (
+        "implementation payloads in the declared tool call arguments"
+        in with_contract[0]["content"]
+    )
     assert "let me fix this" in with_contract[0]["content"]
     assert [message["role"] for message in with_contract] == ["system", "user"]
 
@@ -7502,7 +7813,9 @@ def test_native_tool_prompt_mode_keeps_template_tools_and_adds_agent_tail():
     )
 
     messages, kwargs = tokenizer.calls[-1]
-    rendered_content = "\n".join(str(message.get("content") or "") for message in messages)
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
     assert kwargs["tools"] == [_bash_tool_schema(), _tool_schema()]
     assert "MTPLX tool contract:" not in rendered_content
     assert "MTPLX coding-agent tool protocol reminder:" in rendered_content
@@ -7526,7 +7839,9 @@ def test_native_tool_prompt_mode_suppresses_agent_tail_for_chitchat():
     )
 
     messages, kwargs = tokenizer.calls[-1]
-    rendered_content = "\n".join(str(message.get("content") or "") for message in messages)
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
     assert kwargs["tools"] == [_bash_tool_schema(), _tool_schema()]
     assert "MTPLX tool contract:" not in rendered_content
     assert "MTPLX coding-agent tool protocol reminder:" not in rendered_content
@@ -7569,7 +7884,9 @@ def test_native_tool_prompt_mode_uses_continuation_hint_after_tool_result():
     )
 
     messages, kwargs = tokenizer.calls[-1]
-    rendered_content = "\n".join(str(message.get("content") or "") for message in messages)
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
     assert kwargs["tools"] == [_bash_tool_schema(), _tool_schema()]
     assert messages[-2]["role"] == "tool"
     assert "MTPLX tool-result continuation:" not in messages[-2]["content"]
@@ -7602,7 +7919,9 @@ def test_hybrid_tool_prompt_mode_keeps_legacy_contract_for_rollback():
     )
 
     messages, kwargs = tokenizer.calls[-1]
-    rendered_content = "\n".join(str(message.get("content") or "") for message in messages)
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
     assert kwargs["tools"] == [_bash_tool_schema(), _tool_schema()]
     assert "MTPLX tool contract:" in rendered_content
     assert "MTPLX coding-agent tool protocol reminder:" in rendered_content
@@ -7623,12 +7942,16 @@ def test_compact_tool_prompt_mode_omits_native_template_tools():
     )
 
     messages, kwargs = tokenizer.calls[-1]
-    rendered_content = "\n".join(str(message.get("content") or "") for message in messages)
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
     assert "tools" not in kwargs
     assert "MTPLX tool contract:" in rendered_content
     assert "MTPLX coding-agent tool protocol reminder:" in rendered_content
     assert "<function=" in rendered_content
-    assert "bash(command:string, description:string, timeout?:number)" in rendered_content
+    assert (
+        "bash(command:string, description:string, timeout?:number)" in rendered_content
+    )
     assert "read()" in rendered_content
 
 
@@ -7645,16 +7968,21 @@ def test_compact_tool_prompt_mode_still_validates_real_tool_schema():
         tools_active=True,
         tool_prompt_mode="compact",
     )
-    assert openai._template_tools_for_prompt_mode(
-        tools,
-        tool_prompt_mode="compact",
-    ) is None
+    assert (
+        openai._template_tools_for_prompt_mode(
+            tools,
+            tool_prompt_mode="compact",
+        )
+        is None
+    )
     assert [tool["function"]["name"] for tool in tools] == ["bash", "read"]
 
 
 def test_froggeric_template_profile_applies_from_vendored_file():
     tokenizer = SimpleNamespace(chat_template="official")
-    args = SimpleNamespace(chat_template_profile="froggeric_v19", chat_template_path=None)
+    args = SimpleNamespace(
+        chat_template_profile="froggeric_v19", chat_template_path=None
+    )
 
     report = openai._apply_chat_template_profile(tokenizer, args)
 
@@ -7672,7 +8000,9 @@ def test_tool_contract_suppresses_agent_tail_for_simple_chitchat():
     )
 
     assert "MTPLX tool contract:" in with_contract[0]["content"]
-    assert "MTPLX coding-agent tool protocol reminder:" not in with_contract[0]["content"]
+    assert (
+        "MTPLX coding-agent tool protocol reminder:" not in with_contract[0]["content"]
+    )
 
 
 def test_filter_tool_specs_preserves_tools_for_simple_chitchat():
@@ -7929,7 +8259,11 @@ def test_filter_tool_specs_keeps_mutating_tools_for_direct_upgrade_request():
 
 
 def test_filter_tool_specs_keeps_bash_when_static_review_requests_tests():
-    tools = [_bash_tool_schema(), _named_tool_schema("read"), _named_tool_schema("glob")]
+    tools = [
+        _bash_tool_schema(),
+        _named_tool_schema("read"),
+        _named_tool_schema("glob"),
+    ]
 
     filtered = openai._filter_tool_specs_for_request(
         tools,
@@ -8135,12 +8469,16 @@ def test_opencode_agent_tool_client_uses_compact_prompt_mode(monkeypatch):
     assert stats["tool_prompt_mode_source"] == "client:opencode"
     assert stats["tool_prompt_mode_client_repaired"] is True
     assert stats["tool_contract_active"] is True
-    assert stats["tool_contract_policy_version"] == "compact_tool_contract:schema_free:v1"
+    assert (
+        stats["tool_contract_policy_version"] == "compact_tool_contract:schema_free:v1"
+    )
     assert "tool_prompt_mode=compact" in seen["session_policy_fingerprint"]
 
 
 @pytest.mark.parametrize("client_hint", ["pi", "hermes"])
-def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(monkeypatch, client_hint):
+def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(
+    monkeypatch, client_hint
+):
     seen: dict[str, object] = {}
     state = _fake_state()
     foreground = ForegroundState()
@@ -8176,9 +8514,7 @@ def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(monkeypatch, cli
     messages, kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert [tool["function"]["name"] for tool in kwargs["tools"]] == [
-        "session_status"
-    ]
+    assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["session_status"]
     assert "MTPLX tool contract:" in rendered
     assert stats["tool_prompt_mode"] == "hybrid"
     assert stats["tool_prompt_mode_launch"] == "native"
@@ -8188,7 +8524,8 @@ def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(monkeypatch, cli
     assert stats["tool_contract_active"] is True
     assert (
         stats["tool_contract_policy_version"].startswith("soft_schema_contract:")
-        or stats["tool_contract_policy_version"] == "compact_tool_contract:schema_free:v1"
+        or stats["tool_contract_policy_version"]
+        == "compact_tool_contract:schema_free:v1"
     )
     assert "tool_prompt_mode=hybrid" in seen["session_policy_fingerprint"]
 
@@ -8257,7 +8594,8 @@ def test_opencode_chitchat_preserves_agent_tools_without_direct_reply_contract(
     assert stats["no_tools_contract_active"] is False
     assert (
         stats["tool_contract_policy_version"].startswith("soft_schema_contract:")
-        or stats["tool_contract_policy_version"] == "compact_tool_contract:schema_free:v1"
+        or stats["tool_contract_policy_version"]
+        == "compact_tool_contract:schema_free:v1"
     )
     assert stats["tool_contract_active"] is True
     assert stats["opencode_prompt_contract_profile"] == "opencode_agent"
@@ -8297,7 +8635,10 @@ def test_chat_tools_add_no_tool_contract_when_non_chitchat_disables_tools(monkey
         json={
             "messages": [
                 {"role": "system", "content": "You are OpenCode."},
-                {"role": "user", "content": "Summarize the project status without tools."},
+                {
+                    "role": "user",
+                    "content": "Summarize the project status without tools.",
+                },
             ],
             "tools": [_bash_tool_schema(), _tool_schema()],
             "tool_choice": "none",
@@ -8355,7 +8696,7 @@ def test_final_round_after_tools_gets_post_tool_answer_contract(monkeypatch):
                             "type": "function",
                             "function": {
                                 "name": "web_search",
-                                "arguments": "{\"query\": \"X vs Y\"}",
+                                "arguments": '{"query": "X vs Y"}',
                             },
                         }
                     ],
@@ -8363,7 +8704,7 @@ def test_final_round_after_tools_gets_post_tool_answer_contract(monkeypatch):
                 {
                     "role": "tool",
                     "tool_call_id": "call_1",
-                    "content": "{\"results\": [{\"title\": \"X vs Y\"}]}",
+                    "content": '{"results": [{"title": "X vs Y"}]}',
                 },
             ],
             "tools": [
@@ -8505,9 +8846,12 @@ def test_chat_tools_add_read_only_force_answer_contract_after_read_budget(monkey
     # loop — the old hybrid/schema switch rewrote the system prompt and forced
     # a fully cold re-prefill of the largest prompt in the session. The
     # conditioning lives in the appended user contract message only.
-    assert "tools" not in kwargs or kwargs["tools"] is None or [
-        tool["function"]["name"] for tool in kwargs["tools"]
-    ] == ["bash", "read", "glob", "grep"]
+    assert (
+        "tools" not in kwargs
+        or kwargs["tools"] is None
+        or [tool["function"]["name"] for tool in kwargs["tools"]]
+        == ["bash", "read", "glob", "grep"]
+    )
     assert "MTPLX read-only answer turn:" in rendered
     assert "MTPLX read-only final answer instruction:" in rendered
     assert "MTPLX direct reply turn:" not in rendered
@@ -8550,9 +8894,7 @@ def test_explicit_single_tool_then_answer_forces_final_after_tool_result(monkeyp
 
     def fake_run_generation(*_args, **kwargs):
         seen["request_observability"] = dict(kwargs["request_observability"])
-        return _fake_generation(
-            "opencode_project=/tmp/example; check=package.json"
-        )
+        return _fake_generation("opencode_project=/tmp/example; check=package.json")
 
     monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
 
@@ -9065,8 +9407,7 @@ def test_read_only_force_answer_stream_starts_after_internal_marker(monkeypatch)
     assert response.status_code == 200
     payloads = _stream_payloads(response.text)
     content = "".join(
-        payload["choices"][0]["delta"].get("content", "")
-        for payload in payloads
+        payload["choices"][0]["delta"].get("content", "") for payload in payloads
     )
     final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
     assert "QUALITY1321: final answer from gathered evidence." in content
@@ -9131,8 +9472,7 @@ def test_read_only_force_answer_stream_fallback_emits_without_marker(monkeypatch
     assert response.status_code == 200
     payloads = _stream_payloads(response.text)
     content = "".join(
-        payload["choices"][0]["delta"].get("content", "")
-        for payload in payloads
+        payload["choices"][0]["delta"].get("content", "") for payload in payloads
     )
     final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
@@ -9266,27 +9606,25 @@ def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatc
         "read_only_force_answer_contract=0"
         in captured["generation_final_policy_fingerprint"]
     )
-    assert (
-        "tool_prompt_mode=compact"
-        in captured["generation_final_policy_fingerprint"]
-    )
+    assert "tool_prompt_mode=compact" in captured["generation_final_policy_fingerprint"]
     assert (
         "tool_contract=compact_tool_contract:schema_free:v1"
         in captured["generation_final_policy_fingerprint"]
     )
-    assert "read_only_force_answer:v1" not in captured[
-        "generation_final_policy_fingerprint"
-    ]
+    assert (
+        "read_only_force_answer:v1"
+        not in captured["generation_final_policy_fingerprint"]
+    )
     assert (
         "read_only_force_answer_contract=0"
         in captured["generation_session_policy_fingerprint"]
     )
-    assert "read_only_force_answer:v1" not in captured[
-        "generation_session_policy_fingerprint"
-    ]
     assert (
-        "read_only_force_answer_contract=0"
-        in captured["scheduled_policy_fingerprint"]
+        "read_only_force_answer:v1"
+        not in captured["generation_session_policy_fingerprint"]
+    )
+    assert (
+        "read_only_force_answer_contract=0" in captured["scheduled_policy_fingerprint"]
     )
     assert "tool_prompt_mode=compact" in captured["scheduled_policy_fingerprint"]
     assert (
@@ -9665,11 +10003,15 @@ def test_postcommit_recanonicalizes_raw_active_read_as_next_turn_history():
     ]
     for line_no in range(3, 380):
         if line_no == 240:
-            body_lines.append("240:   public checkArrowCollisions(arrow: Arrow): void {")
+            body_lines.append(
+                "240:   public checkArrowCollisions(arrow: Arrow): void {"
+            )
         elif line_no == 252:
             body_lines.append("252:       if (dist < hitRadius) {")
         elif line_no == 253:
-            body_lines.append("253:         arrow.embedInTerrain(obstacle.position.y - 0.5);")
+            body_lines.append(
+                "253:         arrow.embedInTerrain(obstacle.position.y - 0.5);"
+            )
         else:
             body_lines.append(
                 f"{line_no}:     filler line {line_no} with enough body text to "
@@ -9678,9 +10020,7 @@ def test_postcommit_recanonicalizes_raw_active_read_as_next_turn_history():
     large_read_output = (
         "<path>src/game/ObstacleManager.ts</path>\n"
         "<type>file</type>\n"
-        "<content>\n"
-        + "\n".join(body_lines)
-        + "\n</content>"
+        "<content>\n" + "\n".join(body_lines) + "\n</content>"
     )
     raw_messages = [
         openai.ChatMessage(role="system", content="You are opencode."),
@@ -9766,9 +10106,7 @@ def test_postcommit_read_only_final_matches_next_turn_history_boundary():
     large_read_output = (
         "<path>src/game/Game.ts</path>\n"
         "<type>file</type>\n"
-        "<content>\n"
-        + "\n".join(body_lines)
-        + "\n</content>"
+        "<content>\n" + "\n".join(body_lines) + "\n</content>"
     )
     raw_messages = [
         openai.ChatMessage(role="system", content="You are OpenCode."),
@@ -10467,13 +10805,13 @@ def test_chat_stream_tool_call_preamble_is_stored_for_postcommit(monkeypatch):
     )
 
     with TestClient(create_app(state)) as client:
-            response = client.post(
-                "/v1/chat/completions",
-                headers={
-                    "x-mtplx-session-id": "stream-tool-preamble",
-                    "x-mtplx-allow-client-controls": "1",
-                },
-                json={
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-session-id": "stream-tool-preamble",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
                 "messages": [{"role": "user", "content": "Status."}],
                 "tools": [_tool_schema()],
                 "tool_choice": "auto",
@@ -11099,7 +11437,9 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     monkeypatch.setattr(
         openai, "_resolve_context_window", lambda _tokenizer, _model: 32768
     )
-    monkeypatch.setattr(openai, "EngineSessionManager", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        openai, "EngineSessionManager", lambda **_kwargs: SimpleNamespace()
+    )
 
     args = parse_args(["--model", "models/example", "--warmup-tokens", "0"])
     state = openai.ServerState(args)
@@ -11154,7 +11494,9 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
         "_resolve_context_window",
         lambda _tokenizer, _model: 32768,
     )
-    monkeypatch.setattr(openai, "EngineSessionManager", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        openai, "EngineSessionManager", lambda **_kwargs: SimpleNamespace()
+    )
 
     args = parse_args(
         [
@@ -11246,7 +11588,10 @@ def test_server_state_passes_step_adapter_quant_contract_to_load(monkeypatch):
     assert captured["contract"].mtp_quant_bits == 4
     assert captured["contract"].mtp_quant_group_size == 64
     assert captured["contract"].mtp_quant_mode == "affine"
-    assert captured["kwargs"]["mtp_adapter"] == "outputs/adapters/c4-mtp-adapter-20260603-134243-r4.npz"
+    assert (
+        captured["kwargs"]["mtp_adapter"]
+        == "outputs/adapters/c4-mtp-adapter-20260603-134243-r4.npz"
+    )
     assert captured["kwargs"]["merge_mtp_adapter"] is True
 
 
@@ -11327,9 +11672,7 @@ def test_chat_stream_stop_sequence_trims_and_cancels_generation(monkeypatch):
     )
     assert content == "Hello "
     final = [
-        payload
-        for payload in payloads
-        if payload["choices"][0].get("finish_reason")
+        payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["stop_sequence_hit"] is True
@@ -11387,9 +11730,7 @@ def test_chat_stream_stop_sequence_handles_generation_done_race(monkeypatch):
     )
     assert content == "Hello "
     final = [
-        payload
-        for payload in payloads
-        if payload["choices"][0].get("finish_reason")
+        payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["stop_sequence_hit"] is True
@@ -11508,9 +11849,7 @@ def test_anthropic_stop_sequences_trim_nonstream(monkeypatch):
 
     assert response.status_code == 200
     body = response.json()
-    text_blocks = [
-        block for block in body["content"] if block.get("type") == "text"
-    ]
+    text_blocks = [block for block in body["content"] if block.get("type") == "text"]
     assert text_blocks
     assert text_blocks[0]["text"] == "Hello "
     # A stop_sequences match must surface per the Anthropic wire contract
@@ -11564,14 +11903,10 @@ def test_completions_stream_is_incremental_with_terminal_finish_reason(monkeypat
     # the final text (the old pseudo-stream behavior).
     assert texts == [first_batch, second_batch]
     final = [
-        payload
-        for payload in payloads
-        if payload["choices"][0].get("finish_reason")
+        payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
     assert final[-1]["choices"][0]["finish_reason"] == "length"
-    assert final[-1]["usage"]["completion_tokens"] == len(
-        first_batch + second_batch
-    )
+    assert final[-1]["usage"]["completion_tokens"] == len(first_batch + second_batch)
     assert "data: [DONE]" in response.text
 
 
@@ -11611,9 +11946,7 @@ def test_completions_stream_honors_stop_sequence(monkeypatch):
     ]
     assert texts == ["Hello "]
     final = [
-        payload
-        for payload in payloads
-        if payload["choices"][0].get("finish_reason")
+        payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["stop_sequence_hit"] is True

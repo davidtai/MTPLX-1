@@ -5,13 +5,16 @@ from __future__ import annotations
 import inspect as py_inspect
 import json
 import logging
+import os
 import threading
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .artifacts import inspect_model, load_config
+from .expert_manifest import ExpertManifest
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -20,6 +23,54 @@ from .mtp_adapters import (
 from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
 
 logger = logging.getLogger(__name__)
+
+_STRICT_DYNAMIC_Q4_MTP_ERROR = (
+    "strict dynamic Q4 grouping is qualified for target AR caches only"
+)
+
+
+def _reject_strict_dynamic_q4_mtp(expert_streaming: Any | None) -> None:
+    """Reject MTP only when dynamic paged KV and its live broker are both active."""
+
+    dynamic = (os.environ.get("MTPLX_DYNAMIC_PAGED_KV") or "").strip().lower()
+    if (
+        dynamic in {"1", "true", "yes", "on"}
+        and getattr(
+            expert_streaming,
+            "memory_broker",
+            None,
+        )
+        is not None
+    ):
+        raise RuntimeError(_STRICT_DYNAMIC_Q4_MTP_ERROR)
+
+
+def _attest_strict_dynamic_q4_cache_group(
+    result: object,
+    *,
+    context: str,
+) -> None:
+    """Fail closed unless every Hy3 target-attention owner joined the group."""
+
+    from .memory_broker import HY3_Q4_KV_LAYERS
+
+    if not isinstance(result, Mapping):
+        raise RuntimeError(
+            "aggregate Q4 cache attestation failed during "
+            f"{context}: preparation did not return a mapping"
+        )
+    entries = result.get("entries")
+    if isinstance(entries, bool) or not isinstance(entries, int):
+        raise RuntimeError(
+            "aggregate Q4 cache attestation failed during "
+            f"{context}: entries must be an exact integer"
+        )
+    if entries != HY3_Q4_KV_LAYERS:
+        raise RuntimeError(
+            "aggregate Q4 cache attestation failed during "
+            f"{context}: expected exactly {HY3_Q4_KV_LAYERS} Hy3 target "
+            f"attention owners, got {entries}"
+        )
 
 
 @dataclass
@@ -91,6 +142,27 @@ class MTPLXRuntime:
         return (
             bool(self._forward_ar_supports_emit_logits),
             bool(self._forward_ar_supports_logits_keep),
+        )
+
+    def prepare_ar_cache_growth(self, input_ids: Any, cache: Any) -> None:
+        """Materialize brokered target pages before model/expert allocations."""
+
+        if cache is None or self.expert_streaming is None:
+            return
+        dynamic = (os.environ.get("MTPLX_DYNAMIC_PAGED_KV") or "").strip().lower()
+        if dynamic not in {"1", "true", "yes", "on"}:
+            return
+        if getattr(self.expert_streaming, "memory_broker", None) is None:
+            return
+        from .cache_state import prepare_brokered_q4_cache_group
+
+        result = prepare_brokered_q4_cache_group(
+            cache,
+            append_tokens=self._sequence_len(input_ids),
+        )
+        _attest_strict_dynamic_q4_cache_group(
+            result,
+            context="AR cache growth",
         )
 
     def embed_tokens(self, input_ids):
@@ -177,6 +249,7 @@ class MTPLXRuntime:
                 self._count("final_logits_tokens_emitted", 1)
             else:
                 self._count("full_logits_tokens_emitted", emitted)
+        self.prepare_ar_cache_growth(input_ids, cache)
         with self._expert_routing_context(input_ids):
             if not return_hidden and hidden_variant is None and not kwargs:
                 return self.model(input_ids, cache=cache)
@@ -197,6 +270,7 @@ class MTPLXRuntime:
     ):
         from .gdn_capture import forward_with_gdn_capture
 
+        self.prepare_ar_cache_growth(input_ids, cache)
         with self._expert_routing_context(input_ids):
             return forward_with_gdn_capture(
                 self.model,
@@ -220,6 +294,7 @@ class MTPLXRuntime:
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
+        _reject_strict_dynamic_q4_mtp(self.expert_streaming)
         self._count("draft_mtp_calls")
         resolved_hidden_variant = (
             self.contract.hidden_variant
@@ -259,6 +334,7 @@ class MTPLXRuntime:
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
+        _reject_strict_dynamic_q4_mtp(self.expert_streaming)
         self._count("update_mtp_cache_calls")
         resolved_hidden_variant = (
             self.contract.hidden_variant
@@ -322,8 +398,10 @@ class MTPLXRuntime:
         inner = getattr(self.model, "language_model", self.model)
         cache = inner.make_cache()
         from .cache_state import (
+            close_physical_kv_cache,
             configure_owned_recurrent_state_cache,
             configure_tail_owned_attention_kv_cache,
+            prepare_brokered_q4_cache_group,
             register_physical_kv_cache,
         )
 
@@ -341,12 +419,27 @@ class MTPLXRuntime:
                 allocation_observer=allocation_observer,
                 cache_id_prefix=self._next_cache_id_prefix("target"),
             )
+            dynamic = (os.environ.get("MTPLX_DYNAMIC_PAGED_KV") or "").strip().lower()
+            if dynamic in {"1", "true", "yes", "on"}:
+                try:
+                    result = prepare_brokered_q4_cache_group(cache)
+                    _attest_strict_dynamic_q4_cache_group(
+                        result,
+                        context="initial cache construction",
+                    )
+                except BaseException as preparation_error:
+                    try:
+                        close_physical_kv_cache(cache)
+                    except BaseException as close_error:
+                        raise close_error from preparation_error
+                    raise
         register_physical_kv_cache(cache)
         return cache
 
     def make_mtp_cache(self):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
+        _reject_strict_dynamic_q4_mtp(self.expert_streaming)
         self._count("make_mtp_cache_calls")
         cache = self.model.make_mtp_cache()
         from .cache_state import (
@@ -402,7 +495,8 @@ def load(
     gemma4_draft_block_size: int | None = None,
     gemma4_target_distribution_mode: str | None = None,
     expert_streaming_config: Any | None = None,
-    expert_manifest: Path | str | None = None,
+    expert_manifest: Path | str | ExpertManifest | None = None,
+    model_config: Mapping[str, Any] | None = None,
     mtp_artifacts: Path | str | None = None,
     mtp_precision: str = "bf16",
 ) -> MTPLXRuntime:
@@ -471,7 +565,9 @@ def load(
             runtime.bundle_path = path
             return runtime
         path = Path(gemma4_pair["target_model"])
-    config = load_config(path)
+    if model_config is not None and not isinstance(model_config, Mapping):
+        raise TypeError("model_config must be a mapping")
+    config = load_config(path) if model_config is None else dict(model_config)
     from .step3p5_mtp_patch import is_step3p5_mtp_config
 
     expert_runtime = None
@@ -486,23 +582,6 @@ def load(
         from .resident_loader import construct_resident_model
 
         import mlx.core as mx
-
-        streaming_spec = get_model_spec(expert_streaming_config.model_key)
-        streaming_plan = expert_streaming_config.memory_plan(streaming_spec)
-        if expert_streaming_config.slot_layout == "component-banks":
-            from .expert_manifest import load_expert_manifest
-
-            streaming_manifest = load_expert_manifest(expert_manifest)
-            slot_allocator = make_mlx_component_bank_allocator(
-                streaming_plan,
-                streaming_spec,
-                streaming_manifest,
-                persistent_slab_slots=(expert_streaming_config.expert_slab_slots),
-            )
-        else:
-            slot_allocator = make_mlx_slot_buffer_allocator(
-                streaming_plan, streaming_spec
-            )
 
         if not isinstance(expert_streaming_config, ExpertStreamingConfig):
             raise TypeError("expert_streaming_config must be an ExpertStreamingConfig")
@@ -519,9 +598,31 @@ def load(
             )
         if mtp_adapter is not None or merge_mtp_adapter:
             raise RuntimeError("MTP adapters are unavailable for streamed loading")
+
+        streaming_spec = get_model_spec(expert_streaming_config.model_key)
+        streaming_plan = expert_streaming_config.memory_plan(streaming_spec)
+        from .expert_manifest import load_expert_manifest
+
+        streaming_manifest = (
+            expert_manifest
+            if isinstance(expert_manifest, ExpertManifest)
+            else load_expert_manifest(expert_manifest)
+        )
+        if expert_streaming_config.slot_layout == "component-banks":
+            slot_allocator = make_mlx_component_bank_allocator(
+                streaming_plan,
+                streaming_spec,
+                streaming_manifest,
+                persistent_slab_slots=(expert_streaming_config.expert_slab_slots),
+            )
+        else:
+            slot_allocator = make_mlx_slot_buffer_allocator(
+                streaming_plan, streaming_spec
+            )
+
         expert_runtime = ExpertStreamingRuntime.open(
             path,
-            expert_manifest,
+            streaming_manifest,
             expert_streaming_config,
             spec=streaming_spec,
             buffer_allocator=slot_allocator,
@@ -530,6 +631,8 @@ def load(
             mx_module=mx,
         )
         try:
+            if mtp:
+                _reject_strict_dynamic_q4_mtp(expert_runtime)
             resident = construct_resident_model(path, expert_runtime, config=config)
             model = resident.model
             resident_load_report = resident.report.as_dict()

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+import mtplx.generation as generation_module
 from mtplx.cache_state import register_physical_kv_cache
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.generation import (
@@ -30,6 +31,7 @@ from mtplx.generation import (
 from mtplx.models.expert_mlx import current_expert_routing_phase
 from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import MTPLXRuntime
+from mtplx.runtime_options import HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV
 from mtplx.sampling import SamplerConfig
 
 
@@ -585,6 +587,58 @@ def test_generate_ar_does_not_request_hidden_by_default(monkeypatch):
     assert all(call["return_hidden"] is False for call in model.calls)
 
 
+def test_generate_ar_reports_logical_kv_after_each_evaluated_prefill_chunk(
+    monkeypatch,
+):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP", "0")
+    model = TinyModel()
+    progress: list[tuple[int, int]] = []
+    order: list[str] = []
+    original_eval = generation_module._eval
+    original_eval_cache_roots = generation_module._eval_cache_roots
+
+    def recording_eval(*values):
+        result = original_eval(*values)
+        order.append("eval")
+        return result
+
+    def record_progress(tokens: int) -> None:
+        order.append(f"progress:{tokens}")
+        progress.append((tokens, len(model.calls)))
+
+    def recording_eval_cache_roots(cache) -> None:
+        original_eval_cache_roots(cache)
+        order.append("eval")
+
+    monkeypatch.setattr(generation_module, "_eval", recording_eval)
+    monkeypatch.setattr(
+        generation_module,
+        "_eval_cache_roots",
+        recording_eval_cache_roots,
+    )
+
+    generate_ar(
+        _runtime(model, mtp_enabled=False),
+        [0, 1, 2, 3, 4],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+        kv_progress_callback=record_progress,
+    )
+
+    # Every callback follows the evaluation that physically wrote those cache
+    # rows: two body chunks, the final prompt token, then one decode token. The
+    # final sampled token is not written because no next-token logits are needed.
+    assert progress == [(2, 1), (4, 2), (5, 3), (6, 4)]
+    cursor = 0
+    for progress_event in ("progress:2", "progress:4", "progress:5", "progress:6"):
+        progress_index = order.index(progress_event, cursor)
+        assert "eval" in order[cursor:progress_index]
+        cursor = progress_index + 1
+
+
 def test_generate_ar_closes_physical_kv_cache_on_success() -> None:
     model = CloseableTinyModel()
 
@@ -630,6 +684,31 @@ def test_generate_ar_closes_physical_kv_cache_when_callback_cancels() -> None:
             token_callback=cancel,
         )
 
+    assert model.cache_entry.close_calls == 1
+
+
+def test_generate_ar_cancels_and_closes_between_evaluated_prefill_chunks(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP", "0")
+    model = CloseableTinyModel()
+    progress: list[int] = []
+
+    with pytest.raises(PostcommitAbort, match="foreground_preempted_postcommit"):
+        generate_ar(
+            _runtime(model, mtp_enabled=False),
+            [0, 1, 2, 3, 4],
+            max_tokens=2,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            stop_token_ids=set(),
+            kv_progress_callback=progress.append,
+            abort_check=lambda: len(model.calls) >= 1,
+        )
+
+    assert [call["tokens"] for call in model.calls] == [2]
+    assert progress == [2]
     assert model.cache_entry.close_calls == 1
 
 
@@ -1668,6 +1747,26 @@ def test_sustained_prefill_chunk_cache_cleanup_is_explicit(monkeypatch):
     assert rt.diagnostic_counters["prefill_chunk_cache_cleanup_events"] == 2
 
 
+def test_issue46_strict_runtime_never_runs_syncing_prefill_cleanup(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP", "1")
+    for key, value in HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV.items():
+        monkeypatch.setenv(key, value)
+    calls: list[str] = []
+    monkeypatch.setattr("mtplx.generation.mx.synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(
+        "mtplx.generation.mx.clear_cache", lambda: calls.append("clear")
+    )
+    rt = _runtime(TinyModel(), mtp_enabled=False)
+
+    _prefill(rt, [10, 11, 12, 13, 14], return_hidden=False)
+
+    assert calls == []
+    assert rt.diagnostic_counters.get("prefill_chunk_cache_cleanup_events", 0) == 0
+
+
 def test_sustained_prefill_stock_cache_only_requires_unsafe_allow(monkeypatch):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
@@ -1758,6 +1857,35 @@ def test_legacy_external_prefill_routes_streamed_experts_as_prefill(monkeypatch)
 
     assert rt.diagnostic_counters["prefill_omlx_external_calls"] == 2
     assert model.phases == [RoutingPhase.PREFILL, RoutingPhase.PREFILL]
+
+
+def test_legacy_external_prefill_prepares_brokered_pages_before_direct_model(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_PREFILL_OMLX_EXTERNAL", "1")
+    events: list[object] = []
+
+    class RecordingModel(TinyModel):
+        def __call__(self, input_ids, *, cache=None, **kwargs):
+            events.append(("model", cache, int(input_ids.shape[1])))
+            return super().__call__(input_ids, cache=cache, **kwargs)
+
+    rt = MTPLXRuntime(
+        model=RecordingModel(),
+        tokenizer=TinyTokenizer(),
+        model_path=Path("tiny"),
+        mtp_enabled=False,
+        contract=MTPContract(),
+        expert_streaming=SimpleNamespace(),
+    )
+    cache = [object()]
+    rt.prepare_ar_cache_growth = lambda input_ids, actual_cache: events.append(
+        ("prepare", actual_cache, int(input_ids.shape[1]))
+    )
+
+    assert _prefill_cache_only_forward(rt, mx.array([[7, 8]]), cache=cache) is None
+
+    assert events == [("prepare", cache, 2), ("model", cache, 2)]
 
 
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(

@@ -15,31 +15,45 @@ import random
 import signal
 import statistics
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TypeVar
 
 from mtplx.memory_broker import (
+    HY3_Q4_ALLOCATOR_HEADROOM_BYTES,
     HY3_Q4_KV_BLOCK_BYTES,
     HY3_Q4_KV_BLOCK_TOKENS,
     HY3_Q4_KV_BYTES_PER_TOKEN,
+    HY3_Q4_KV_LAYERS,
+    hy3_q4_kv_physical_geometry,
 )
+from mtplx.runtime_options import HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV
 
 CONTEXT_MATRIX_TOKENS = (4_096, 32_768, 65_536, 131_072)
 HY3_Q4_TOTAL_CONTEXT_TOKENS = 131_072
 HY3_Q4_KV_BLOCK_SIZE_TOKENS = HY3_Q4_KV_BLOCK_TOKENS
-HY3_Q4_MAX_BLOCKS = HY3_Q4_TOTAL_CONTEXT_TOKENS // HY3_Q4_KV_BLOCK_SIZE_TOKENS
+HY3_Q4_MAX_BLOCKS = hy3_q4_kv_physical_geometry(
+    HY3_Q4_TOTAL_CONTEXT_TOKENS
+).physical_blocks
 MIN_STABLE_HOLD_SAMPLES = 3
 MIN_STABLE_HOLD_DURATION_NS = 1_000_000_000
 OPERATING_TARGET_BYTES = 110 * 1024**3
 HARD_CEILING_BYTES = 112 * 1024**3
 MAX_PROCESS_COMPRESSED_GROWTH_BYTES = 512 * 1024**2
 MAX_128K_PERFORMANCE_REGRESSION = 0.05
+DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS = 12 * 60 * 60
+DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS = 30
 SCHEMA_OBSERVATION = "mtplx-hy3-dynamic-memory-observation-v1"
 SCHEMA_PROBE = "mtplx-hy3-allocator-release-probe-v1"
 SCHEMA_CAMPAIGN = "mtplx-hy3-dynamic-memory-campaign-v1"
+SCHEMA_ARTIFACT_ATTESTATION = "mtplx-hy3-artifact-attestation-v1"
+SCHEMA_EXPERT_ROUTE_BINDING = "mtplx-hy3-expert-route-binding-v1"
+EXPERT_ROUTE_PRODUCER_SCOPE = "route-map-from-loaded-manifest"
+EXPERT_ROUTE_OFFLINE_SCOPE = "structural-binding-only"
 
 _PROBE_BOUND_IDENTITY_FIELDS = (
     "model_key",
@@ -47,6 +61,10 @@ _PROBE_BOUND_IDENTITY_FIELDS = (
     "model_artifact_sha256",
     "expert_manifest_id",
     "expert_manifest_sha256",
+    "artifact_pins_sha256",
+    "artifact_stat_sha256",
+    "resident_payload_bytes",
+    "resident_payload_sha256",
     "source_git_commit",
     "kv_quantization",
     "kv_block_size_tokens",
@@ -56,6 +74,9 @@ _PROBE_BOUND_IDENTITY_FIELDS = (
 ISSUE46_RESOURCE_INTEGER_FIELDS = (
     "operating_target_bytes",
     "hard_ceiling_bytes",
+    "allocator_headroom_bytes",
+    "classified_target_bytes",
+    "classified_bytes",
     "charged_bytes",
     "resident_model_bytes",
     "kv_logical_tokens",
@@ -86,8 +107,10 @@ ISSUE46_RESOURCE_INTEGER_FIELDS = (
     "process_rss_bytes",
     "process_compressed_bytes",
 )
+ISSUE46_RESOURCE_SIGNED_INTEGER_FIELDS = ("charged_residual_bytes",)
 ISSUE46_RESOURCE_FIELDS = (
     *ISSUE46_RESOURCE_INTEGER_FIELDS,
+    *ISSUE46_RESOURCE_SIGNED_INTEGER_FIELDS,
     "system_swap_delta_bytes",
     "kv_representation",
     "failed_closed",
@@ -99,6 +122,21 @@ _T = TypeVar("_T")
 
 class BenchmarkGateError(RuntimeError):
     """Raised when evidence is incomplete, ambiguous, or physically invalid."""
+
+
+class _SubprocessCleanupNotProven(BenchmarkGateError):
+    """Raised when an isolated subprocess group may still own the GPU lane."""
+
+
+_SUBPROCESS_CLEANUP_UNPROVEN: ContextVar[bool] = ContextVar(
+    "mtplx_issue46_subprocess_cleanup_unproven",
+    default=False,
+)
+
+
+def _subprocess_cleanup_not_proven(message: str) -> _SubprocessCleanupNotProven:
+    _SUBPROCESS_CLEANUP_UNPROVEN.set(True)
+    return _SubprocessCleanupNotProven(message)
 
 
 def canonical_sha256(value: object) -> str:
@@ -197,6 +235,172 @@ def _require_fields(
         raise BenchmarkGateError(
             f"{context} is missing required field(s): {', '.join(missing)}"
         )
+
+
+def _normalize_route_trace(
+    value: object,
+    *,
+    field: str,
+) -> tuple[list[dict[str, object]], set[str]]:
+    raw_routes = _sequence(value, field=field)
+    if not raw_routes:
+        raise BenchmarkGateError(f"{field} must not be empty")
+    normalized: list[dict[str, object]] = []
+    routed_pairs: set[str] = set()
+    routed_fields = {
+        "phase",
+        "layer",
+        "expert_ids",
+        "trace_epoch",
+        "token_count",
+        "decode_step",
+    }
+    reset_fields = {"phase", "previous_trace_epoch", "trace_epoch"}
+    for index, raw_route in enumerate(raw_routes):
+        prefix = f"{field}[{index}]"
+        route = _mapping(raw_route, field=prefix)
+        has_layer = "layer" in route
+        has_experts = "expert_ids" in route
+        if has_layer or has_experts:
+            if not has_layer or not has_experts:
+                raise BenchmarkGateError(f"{prefix} is an incomplete routed entry")
+            unknown = set(route) - routed_fields
+            if unknown:
+                raise BenchmarkGateError(
+                    f"{prefix} has unvalidated field(s): {', '.join(sorted(unknown))}"
+                )
+            phase = _nonempty_string(route.get("phase"), field=f"{prefix}.phase")
+            layer = _exact_int(route["layer"], field=f"{prefix}.layer")
+            raw_experts = _sequence(route["expert_ids"], field=f"{prefix}.expert_ids")
+            if not raw_experts:
+                raise BenchmarkGateError(f"{prefix}.expert_ids must not be empty")
+            experts = [
+                _exact_int(expert, field=f"{prefix}.expert_ids[{expert_index}]")
+                for expert_index, expert in enumerate(raw_experts)
+            ]
+            result: dict[str, object] = {
+                "phase": phase,
+                "layer": layer,
+                "expert_ids": experts,
+            }
+            for optional in ("trace_epoch", "token_count", "decode_step"):
+                if optional in route:
+                    result[optional] = _exact_int(
+                        route[optional], field=f"{prefix}.{optional}"
+                    )
+            normalized.append(result)
+            routed_pairs.update(f"{layer}:{expert}" for expert in experts)
+            continue
+        if set(route) != reset_fields or route.get("phase") != "reset":
+            raise BenchmarkGateError(
+                f"{prefix} must be a routed expert object or exact reset object"
+            )
+        normalized.append(
+            {
+                "phase": "reset",
+                "previous_trace_epoch": _exact_int(
+                    route["previous_trace_epoch"],
+                    field=f"{prefix}.previous_trace_epoch",
+                ),
+                "trace_epoch": _exact_int(
+                    route["trace_epoch"], field=f"{prefix}.trace_epoch"
+                ),
+            }
+        )
+    if not routed_pairs:
+        raise BenchmarkGateError(f"{field} has no routed expert pairs")
+    return normalized, routed_pairs
+
+
+def _normalize_expert_hashes(
+    value: object,
+    *,
+    field: str,
+    routed_pairs: set[str],
+) -> dict[str, str]:
+    raw_hashes = _mapping(value, field=field)
+    if not raw_hashes:
+        raise BenchmarkGateError(f"{field} must not be empty")
+    normalized: dict[str, str] = {}
+    for raw_key, raw_hash in raw_hashes.items():
+        key = _nonempty_string(raw_key, field=f"{field} key")
+        parts = key.split(":")
+        if (
+            len(parts) != 2
+            or not all(part.isdecimal() for part in parts)
+            or f"{int(parts[0])}:{int(parts[1])}" != key
+        ):
+            raise BenchmarkGateError(f"{field} key {key!r} must be layer:expert")
+        digest = _sha256(raw_hash, field=f"{field}[{key!r}]")
+        if digest == "0" * 64:
+            raise BenchmarkGateError(f"{field}[{key!r}] has a zero SHA-256")
+        normalized[key] = digest
+    if set(normalized) != routed_pairs:
+        raise BenchmarkGateError(
+            f"{field} expert hashes do not exactly cover routed expert pairs"
+        )
+    return normalized
+
+
+def bind_expert_route_evidence(
+    *,
+    route_trace: object,
+    expert_hashes: object,
+    expert_manifest_sha256: object,
+    field: str,
+) -> tuple[list[dict[str, object]], dict[str, str], dict[str, object]]:
+    """Validate live route evidence and bind it to the loaded expert manifest."""
+
+    routes, routed_pairs = _normalize_route_trace(
+        route_trace, field=f"{field}.route_trace"
+    )
+    hashes = _normalize_expert_hashes(
+        expert_hashes,
+        field=f"{field}.expert_hashes",
+        routed_pairs=routed_pairs,
+    )
+    manifest_hash = _sha256(
+        expert_manifest_sha256,
+        field=f"{field}.expert_manifest_sha256",
+    )
+    if manifest_hash == "0" * 64:
+        raise BenchmarkGateError(f"{field}.expert_manifest_sha256 is zero")
+    binding: dict[str, object] = {
+        "schema": SCHEMA_EXPERT_ROUTE_BINDING,
+        "producer_verification_scope": EXPERT_ROUTE_PRODUCER_SCOPE,
+        "offline_verification_scope": EXPERT_ROUTE_OFFLINE_SCOPE,
+        "expert_manifest_sha256": manifest_hash,
+        "route_trace_sha256": canonical_sha256(routes),
+        "expert_hashes_sha256": canonical_sha256(hashes),
+    }
+    return routes, hashes, binding
+
+
+def _validate_expert_route_binding(
+    *,
+    route_trace: object,
+    expert_hashes: object,
+    binding: object,
+    expert_manifest_sha256: object,
+    field: str,
+) -> tuple[list[dict[str, object]], dict[str, str], dict[str, object]]:
+    routes, hashes, expected = bind_expert_route_evidence(
+        route_trace=route_trace,
+        expert_hashes=expert_hashes,
+        expert_manifest_sha256=expert_manifest_sha256,
+        field=field,
+    )
+    raw_binding = _mapping(binding, field=f"{field}.expert_route_binding")
+    if set(raw_binding) != set(expected):
+        raise BenchmarkGateError(
+            f"{field}.expert_route_binding must contain the exact binding schema"
+        )
+    for name, expected_value in expected.items():
+        if raw_binding[name] != expected_value:
+            raise BenchmarkGateError(
+                f"{field}.expert_route_binding.{name} differs from bound evidence"
+            )
+    return routes, hashes, expected
 
 
 @dataclass(frozen=True)
@@ -337,6 +541,7 @@ class MemoryTimelinePoint:
             "failed",
             "integrity_errors",
             "completion_fence_failures",
+            "global_device_synchronizations",
         )
         _require_fields(raw_health, required_health, context=f"{prefix}.slot_health")
         health = {
@@ -354,6 +559,11 @@ class MemoryTimelinePoint:
             field: _exact_int(value[field], field=f"{prefix}.{field}")
             for field in ISSUE46_RESOURCE_INTEGER_FIELDS
         }
+        for field in ISSUE46_RESOURCE_SIGNED_INTEGER_FIELDS:
+            signed = value[field]
+            if isinstance(signed, bool) or not isinstance(signed, int):
+                raise BenchmarkGateError(f"{prefix}.{field} must be an integer")
+            resource_evidence[field] = signed
         swap_delta = value["system_swap_delta_bytes"]
         if isinstance(swap_delta, bool) or not isinstance(swap_delta, int):
             raise BenchmarkGateError(
@@ -383,6 +593,13 @@ class MemoryTimelinePoint:
         if resource_evidence["hard_ceiling_bytes"] != HARD_CEILING_BYTES:
             raise BenchmarkGateError(
                 f"{prefix}.hard_ceiling_bytes must be exactly 112 GiB"
+            )
+        if (
+            resource_evidence["allocator_headroom_bytes"]
+            != HY3_Q4_ALLOCATOR_HEADROOM_BYTES
+        ):
+            raise BenchmarkGateError(
+                f"{prefix}.allocator_headroom_bytes must be exactly 1 GiB"
             )
         if failed_closed and failure_reason is None:
             raise BenchmarkGateError(
@@ -436,12 +653,34 @@ class MemoryTimelinePoint:
             + int(resource_evidence["inflight_expert_staging_bytes"])
             + int(resource_evidence["runtime_workspace_bytes"])
         )
+        if int(resource_evidence["classified_bytes"]) != classified_bytes:
+            raise BenchmarkGateError(
+                f"{prefix}.classified_bytes does not match the five steady pools"
+            )
+        if int(resource_evidence["classified_target_bytes"]) != (
+            int(resource_evidence["operating_target_bytes"])
+            - int(resource_evidence["allocator_headroom_bytes"])
+        ):
+            raise BenchmarkGateError(
+                f"{prefix}.classified_target_bytes does not preserve allocator headroom"
+            )
+        if classified_bytes > int(resource_evidence["classified_target_bytes"]):
+            raise BenchmarkGateError(
+                f"{prefix}.classified_bytes exceeds the classified target"
+            )
         expected_charged = classified_bytes + int(
             resource_evidence["allocator_cache_charged_bytes"]
         )
         if int(resource_evidence["charged_bytes"]) != expected_charged:
             raise BenchmarkGateError(
                 f"{prefix}.charged_bytes does not match the six-pool additive ledger"
+            )
+        if int(resource_evidence["charged_residual_bytes"]) != (
+            int(resource_evidence["operating_target_bytes"])
+            - int(resource_evidence["charged_bytes"])
+        ):
+            raise BenchmarkGateError(
+                f"{prefix}.charged_residual_bytes does not match charged memory"
             )
         if (
             int(resource_evidence["allocator_cache_charged_bytes"])
@@ -470,6 +709,7 @@ class CampaignObservation:
     route_trace: object
     route_trace_sha256: str
     expert_hashes: Mapping[str, str]
+    kv_growth_steps: tuple[Mapping[str, object], ...]
     timeline: tuple[MemoryTimelinePoint, ...]
     metrics: Mapping[str, object]
 
@@ -544,6 +784,10 @@ def _validate_identity(
         "model_artifact_sha256",
         "expert_manifest_id",
         "expert_manifest_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
+        "resident_payload_bytes",
+        "resident_payload_sha256",
         "source_git_commit",
         "arm_config",
         "arm_config_sha256",
@@ -569,6 +813,23 @@ def _validate_identity(
         "expert_manifest_sha256": _sha256(
             value["expert_manifest_sha256"],
             field=f"{context}.expert_manifest_sha256",
+        ),
+        "artifact_pins_sha256": _sha256(
+            value["artifact_pins_sha256"],
+            field=f"{context}.artifact_pins_sha256",
+        ),
+        "artifact_stat_sha256": _sha256(
+            value["artifact_stat_sha256"],
+            field=f"{context}.artifact_stat_sha256",
+        ),
+        "resident_payload_bytes": _exact_int(
+            value["resident_payload_bytes"],
+            field=f"{context}.resident_payload_bytes",
+            minimum=1,
+        ),
+        "resident_payload_sha256": _sha256(
+            value["resident_payload_sha256"],
+            field=f"{context}.resident_payload_sha256",
         ),
         "source_git_commit": _git_commit(
             value["source_git_commit"], field=f"{context}.source_git_commit"
@@ -624,6 +885,68 @@ def _validate_identity(
         raise BenchmarkGateError(
             f"{context}.normalized_config does not match arm intervention normalization"
         )
+    arm_config = _mapping(result["arm_config"], field=f"{context}.arm_config")
+    attention_runtime_env = _mapping(
+        arm_config.get("attention_runtime_env"),
+        field=f"{context}.arm_config.attention_runtime_env",
+    )
+    if dict(attention_runtime_env) != HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV:
+        raise BenchmarkGateError(
+            f"{context}.arm_config.attention_runtime_env must pin the exact "
+            "full-history Q4 attention route"
+        )
+    streaming = _mapping(
+        arm_config.get("expert_streaming_config"),
+        field=f"{context}.arm_config.expert_streaming_config",
+    )
+    if (
+        _exact_int(
+            streaming.get("allocator_headroom_bytes"),
+            field=f"{context}.arm_config.expert_streaming_config.allocator_headroom_bytes",
+        )
+        != HY3_Q4_ALLOCATOR_HEADROOM_BYTES
+    ):
+        raise BenchmarkGateError(
+            f"{context} must pin exactly 1 GiB of allocator headroom"
+        )
+    if (
+        _exact_int(
+            streaming.get("kv_bytes_per_token_override"),
+            field=(
+                f"{context}.arm_config.expert_streaming_config."
+                "kv_bytes_per_token_override"
+            ),
+        )
+        != HY3_Q4_KV_BYTES_PER_TOKEN
+    ):
+        raise BenchmarkGateError(f"{context} must pin exact Q4 KV physical geometry")
+    expected_streaming = {
+        "memory_limit_bytes": OPERATING_TARGET_BYTES,
+        "max_live_kv_tokens": HY3_Q4_TOTAL_CONTEXT_TOKENS,
+        "runtime_reserve_bytes": 8 * 1024**3,
+        "transient_slots": 32,
+        "cache_scope": "global",
+        "slot_layout": "component-banks",
+        "expert_slab_slots": 32,
+    }
+    for field, expected in expected_streaming.items():
+        if streaming.get(field) != expected:
+            raise BenchmarkGateError(
+                f"{context}.arm_config.expert_streaming_config.{field} "
+                f"must be {expected!r}"
+            )
+    dynamic_memory = arm_config.get("dynamic_memory")
+    if not isinstance(dynamic_memory, bool):
+        raise BenchmarkGateError(f"{context}.arm_config.dynamic_memory must be boolean")
+    if streaming.get("dynamic_expert_slabs") is not dynamic_memory:
+        raise BenchmarkGateError(
+            f"{context}.arm_config dynamic expert mode contradicts the selected arm"
+        )
+    expected_slots = 9_696 if dynamic_memory else 8_673
+    if arm_config.get("planned_persistent_slots") != expected_slots:
+        raise BenchmarkGateError(
+            f"{context}.arm_config.planned_persistent_slots must be {expected_slots}"
+        )
     return result
 
 
@@ -638,9 +961,13 @@ def _phase_once(
 
 
 def _assert_final_slot_health(point: MemoryTimelinePoint) -> None:
-    if any(point.slot_health.values()):
+    nonzero = tuple(
+        field for field, value in point.slot_health.items() if int(value) != 0
+    )
+    if nonzero:
         raise BenchmarkGateError(
-            f"{point.phase} slot health is not quiescent and failure-free"
+            f"{point.phase} slot health is not quiescent and failure-free: "
+            + ", ".join(nonzero)
         )
 
 
@@ -670,9 +997,43 @@ def _validate_timeline(
         raise BenchmarkGateError(
             f"timeline needs at least {MIN_STABLE_HOLD_SAMPLES} stable hold samples"
         )
-    if not (growth.monotonic_ns < holds[0].monotonic_ns < reset.monotonic_ns):
+    if not (
+        pre.monotonic_ns
+        < growth.monotonic_ns
+        < holds[0].monotonic_ns
+        <= holds[-1].monotonic_ns
+        < reset.monotonic_ns
+    ):
         raise BenchmarkGateError(
-            "stable hold samples must follow growth and precede reset"
+            "timeline must order pre-growth, growth, every hold, then reset"
+        )
+    fixed_pool_fields = (
+        "resident_model_bytes",
+        "inflight_expert_staging_bytes",
+        "runtime_workspace_bytes",
+    )
+    fixed_pool_baseline = tuple(
+        timeline[0].resource_evidence[field] for field in fixed_pool_fields
+    )
+    if any(
+        tuple(point.resource_evidence[field] for field in fixed_pool_fields)
+        != fixed_pool_baseline
+        for point in timeline
+    ):
+        raise BenchmarkGateError("fixed physical memory pools changed during the arm")
+    for point in timeline:
+        logical_tokens = int(point.resource_evidence["kv_logical_tokens"])
+        physical_capacity = point.kv_allocated_blocks * HY3_Q4_KV_BLOCK_SIZE_TOKENS
+        if logical_tokens > physical_capacity:
+            raise BenchmarkGateError(
+                f"{point.phase} logical KV tokens exceed physical Q4 capacity"
+            )
+    if any(
+        int(point.resource_evidence["kv_logical_tokens"]) < context_tokens
+        for point in (growth, *holds)
+    ):
+        raise BenchmarkGateError(
+            "post-growth and hold logical KV tokens do not cover the requested context"
         )
     stable_fields = (
         "allocator_active_bytes",
@@ -689,6 +1050,37 @@ def _validate_timeline(
     ):
         raise BenchmarkGateError(
             "stable hold samples changed physical memory or slot health"
+        )
+    stable_resource_fields = (
+        "allocator_headroom_bytes",
+        "classified_target_bytes",
+        "classified_bytes",
+        "charged_bytes",
+        "charged_residual_bytes",
+        "resident_model_bytes",
+        "inflight_expert_staging_bytes",
+        "runtime_workspace_bytes",
+        "allocator_cache_charged_bytes",
+        "requested_reclaim_bytes",
+        "reclaimed_bytes",
+        "regrown_bytes",
+        "evicted_expert_records",
+        "evicted_expert_slabs",
+        "resize_duration_ns",
+        "total_resize_duration_ns",
+        "max_resize_duration_ns",
+        "blocked_by_pin_bytes",
+    )
+    resource_baseline = tuple(
+        holds[0].resource_evidence[field] for field in stable_resource_fields
+    )
+    if any(
+        tuple(point.resource_evidence[field] for field in stable_resource_fields)
+        != resource_baseline
+        for point in holds
+    ):
+        raise BenchmarkGateError(
+            "stable hold samples changed the classified or charged memory ledger"
         )
     if holds[-1].monotonic_ns - holds[0].monotonic_ns < MIN_STABLE_HOLD_DURATION_NS:
         raise BenchmarkGateError("stable hold duration is shorter than one second")
@@ -733,8 +1125,26 @@ def _validate_timeline(
             )
         return
 
+    if cache_start_state.kind != "dynamic-declared-q4":
+        raise BenchmarkGateError(
+            "dynamic arm must declare dynamic-declared-q4 cache start"
+        )
+    if cache_start_state.kv_blocks != 1:
+        raise BenchmarkGateError(
+            "dynamic arm must start from exactly one physical Q4 block"
+        )
     reclaim = _phase_once(timeline, "post_expert_reclaim")
     regrow = _phase_once(timeline, "post_regrow")
+    for point in (pre, reclaim):
+        if int(point.resource_evidence["kv_logical_tokens"]) != 1:
+            raise BenchmarkGateError(
+                f"{point.phase} logical KV ownership must remain exactly 1 "
+                "before physical growth completes"
+            )
+    if int(growth.resource_evidence["kv_logical_tokens"]) != context_tokens:
+        raise BenchmarkGateError(
+            "post_kv_growth logical KV ownership must equal the requested context"
+        )
     if not (pre.monotonic_ns < reclaim.monotonic_ns < growth.monotonic_ns):
         raise BenchmarkGateError(
             "physical expert decrease must be observed before KV increase"
@@ -762,9 +1172,11 @@ def _validate_timeline(
         raise BenchmarkGateError("post_kv_growth did not allocate Q4 KV blocks")
     if growth.expert_slab_physical_bytes > reclaim.expert_slab_physical_bytes:
         raise BenchmarkGateError("expert slabs regrew during the protected KV growth")
-    minimum_final_blocks = math.ceil(context_tokens / HY3_Q4_KV_BLOCK_SIZE_TOKENS)
-    if growth.kv_allocated_blocks < minimum_final_blocks:
-        raise BenchmarkGateError("post_kv_growth does not cover the requested context")
+    required_final_blocks = hy3_q4_kv_physical_geometry(context_tokens).physical_blocks
+    if growth.kv_allocated_blocks != required_final_blocks:
+        raise BenchmarkGateError(
+            "post_kv_growth does not exactly cover the requested context"
+        )
     if growth.kv_allocated_blocks - pre.kv_allocated_blocks < 2:
         raise BenchmarkGateError(
             "dynamic growth did not cross multiple KV block boundaries"
@@ -780,6 +1192,303 @@ def _validate_timeline(
             "post_regrow did not physically restore expert capacity"
         )
     _assert_final_slot_health(regrow)
+
+
+def _validate_kv_growth_steps(
+    value: object,
+    *,
+    arm: str,
+    context_tokens: int,
+    cache_start_state: CacheStartState,
+    timeline: Sequence[MemoryTimelinePoint],
+) -> tuple[Mapping[str, object], ...]:
+    raw_steps = _sequence(value, field="observation.kv_growth_steps")
+    if arm == "static":
+        if raw_steps:
+            raise BenchmarkGateError("static control must not report KV growth steps")
+        return ()
+    if len(raw_steps) != 2:
+        raise BenchmarkGateError(
+            "dynamic arm must retain exactly two physical KV growth steps"
+        )
+    final_blocks = hy3_q4_kv_physical_geometry(context_tokens).physical_blocks
+    expected_tokens = ((final_blocks - 1) * HY3_Q4_KV_BLOCK_SIZE_TOKENS, context_tokens)
+    expected_blocks = (final_blocks - 1, final_blocks)
+    normalized: list[Mapping[str, object]] = []
+    prior_after: MemoryTimelinePoint | None = None
+    prior_after_ns: int | None = None
+    step_ledgers: list[
+        tuple[MemoryTimelinePoint, MemoryTimelinePoint, MemoryTimelinePoint]
+    ] = []
+    step_timestamps: list[tuple[int, int, int]] = []
+
+    def ledger(
+        raw: object,
+        *,
+        field: str,
+        monotonic_ns: int,
+        captured: bool,
+    ) -> MemoryTimelinePoint:
+        item = _mapping(raw, field=field)
+        _require_fields(
+            item,
+            (
+                "allocator_active_bytes",
+                "allocator_cache_bytes",
+                "allocator_peak_bytes",
+                "expert_slab_physical_bytes",
+                "kv_physical_bytes",
+                "kv_allocated_blocks",
+                "slot_health",
+                *ISSUE46_RESOURCE_FIELDS,
+            ),
+            context=field,
+        )
+        if captured:
+            captured_ns = _exact_int(
+                item.get("captured_monotonic_ns"),
+                field=f"{field}.captured_monotonic_ns",
+            )
+            if captured_ns != monotonic_ns:
+                raise BenchmarkGateError(
+                    f"{field}.captured_monotonic_ns differs from growth timestamp"
+                )
+        candidate = dict(item)
+        candidate.update(
+            phase=field,
+            monotonic_ns=monotonic_ns,
+            slot_health_sha256=canonical_sha256(item["slot_health"]),
+        )
+        try:
+            point = MemoryTimelinePoint.from_mapping(candidate, index=0)
+        except BenchmarkGateError as exc:
+            raise BenchmarkGateError(f"{field}: {exc}") from exc
+        classified = int(point.resource_evidence["classified_bytes"])
+        charged = int(point.resource_evidence["charged_bytes"])
+        hard_ceiling = int(point.resource_evidence["hard_ceiling_bytes"])
+        transient = max(
+            point.allocator_peak_bytes + point.allocator_cache_bytes,
+            charged,
+        )
+        if classified >= hard_ceiling:
+            raise BenchmarkGateError(f"{field} classified memory reached 112 GiB")
+        if charged >= hard_ceiling:
+            raise BenchmarkGateError(f"{field} charged memory reached 112 GiB")
+        if transient >= hard_ceiling:
+            raise BenchmarkGateError(f"{field} transient memory reached 112 GiB")
+        return point
+
+    for index, raw_step in enumerate(raw_steps):
+        field = f"observation.kv_growth_steps[{index}]"
+        step = _mapping(raw_step, field=field)
+        if (
+            _exact_int(step.get("sequence_index"), field=f"{field}.sequence_index")
+            != index
+        ):
+            raise BenchmarkGateError("KV growth step sequence is not exact")
+        if (
+            _exact_int(
+                step.get("requested_tokens"),
+                field=f"{field}.requested_tokens",
+                minimum=1,
+            )
+            != expected_tokens[index]
+        ):
+            raise BenchmarkGateError("KV growth step token checkpoint differs")
+        if (
+            _exact_int(
+                step.get("target_blocks"),
+                field=f"{field}.target_blocks",
+                minimum=1,
+            )
+            != expected_blocks[index]
+        ):
+            raise BenchmarkGateError("KV growth step block checkpoint differs")
+        before_ns = _exact_int(
+            step.get("before_monotonic_ns"), field=f"{field}.before_monotonic_ns"
+        )
+        reclaim_ns = _exact_int(
+            step.get("reclaim_monotonic_ns"), field=f"{field}.reclaim_monotonic_ns"
+        )
+        after_ns = _exact_int(
+            step.get("after_monotonic_ns"), field=f"{field}.after_monotonic_ns"
+        )
+        if not before_ns < reclaim_ns < after_ns:
+            raise BenchmarkGateError(
+                "KV growth step ordering is not strictly monotonic"
+            )
+        if prior_after_ns is not None and before_ns <= prior_after_ns:
+            raise BenchmarkGateError("KV growth steps overlap or run out of order")
+        before = ledger(
+            step.get("before"),
+            field=f"{field}.before",
+            monotonic_ns=before_ns,
+            captured=False,
+        )
+        reclaim = ledger(
+            step.get("reclaim_gap"),
+            field=f"{field}.reclaim_gap",
+            monotonic_ns=reclaim_ns,
+            captured=True,
+        )
+        after = ledger(
+            step.get("after"),
+            field=f"{field}.after",
+            monotonic_ns=after_ns,
+            captured=False,
+        )
+        for ledger_name, point in (
+            ("before", before),
+            ("reclaim_gap", reclaim),
+            ("after", after),
+        ):
+            if int(point.resource_evidence["kv_logical_tokens"]) != 1:
+                raise BenchmarkGateError(
+                    f"{field}.{ledger_name} logical KV ownership must remain "
+                    "exactly 1 until physical growth completes"
+                )
+        if index == 0 and (
+            before.kv_allocated_blocks != cache_start_state.kv_blocks
+            or before.kv_physical_bytes != cache_start_state.kv_physical_bytes
+        ):
+            raise BenchmarkGateError("first KV growth step differs from cache start")
+        if prior_after is not None and any(
+            getattr(before, name) != getattr(prior_after, name)
+            for name in (
+                "expert_slab_physical_bytes",
+                "kv_physical_bytes",
+                "kv_allocated_blocks",
+            )
+        ):
+            raise BenchmarkGateError("KV growth steps do not form one physical chain")
+        if (
+            reclaim.kv_physical_bytes != before.kv_physical_bytes
+            or reclaim.kv_allocated_blocks != before.kv_allocated_blocks
+        ):
+            raise BenchmarkGateError("KV rose before the reclaim gap was captured")
+        if reclaim.expert_slab_physical_bytes > before.expert_slab_physical_bytes:
+            raise BenchmarkGateError("expert slabs regrew inside KV growth")
+        if after.kv_allocated_blocks != expected_blocks[index]:
+            raise BenchmarkGateError("KV growth step missed its exact block target")
+        if after.kv_physical_bytes <= before.kv_physical_bytes:
+            raise BenchmarkGateError("KV growth step did not increase physical bytes")
+        if after.expert_slab_physical_bytes > reclaim.expert_slab_physical_bytes:
+            raise BenchmarkGateError("expert slabs regrew before KV growth committed")
+        reclaimed = (
+            before.expert_slab_physical_bytes - reclaim.expert_slab_physical_bytes
+        )
+        kv_growth = after.kv_physical_bytes - before.kv_physical_bytes
+        if (
+            _exact_int(
+                step.get("reclaimed_expert_bytes"),
+                field=f"{field}.reclaimed_expert_bytes",
+            )
+            != reclaimed
+        ):
+            raise BenchmarkGateError("KV growth step reclaimed-byte evidence differs")
+        if index == 0 and reclaimed <= 0:
+            raise BenchmarkGateError(
+                "first KV growth step did not reclaim expert memory"
+            )
+        if (
+            _exact_int(
+                step.get("kv_growth_bytes"), field=f"{field}.kv_growth_bytes", minimum=1
+            )
+            != kv_growth
+        ):
+            raise BenchmarkGateError("KV growth step physical-byte evidence differs")
+        if (
+            _exact_int(
+                step.get("steady_delta_bytes"),
+                field=f"{field}.steady_delta_bytes",
+                minimum=1,
+            )
+            != kv_growth
+        ):
+            raise BenchmarkGateError(
+                "KV growth reservation differs from physical growth"
+            )
+        transient_delta = _exact_int(
+            step.get("max_transient_delta_bytes"),
+            field=f"{field}.max_transient_delta_bytes",
+            minimum=1,
+        )
+        if HY3_Q4_KV_BLOCK_BYTES % HY3_Q4_KV_LAYERS:
+            raise BenchmarkGateError("Q4 transient geometry is not layer-exact")
+        expected_transient_delta = expected_blocks[index] * (
+            HY3_Q4_KV_BLOCK_BYTES // HY3_Q4_KV_LAYERS
+        )
+        if transient_delta != expected_transient_delta:
+            raise BenchmarkGateError(
+                "KV growth transient does not match exact per-entry Q4 geometry"
+            )
+        if (
+            int(reclaim.resource_evidence["charged_bytes"]) + transient_delta
+            >= HARD_CEILING_BYTES
+        ):
+            raise BenchmarkGateError(
+                "KV growth charged transient reached the 112 GiB hard ceiling"
+            )
+        normalized.append(dict(step))
+        step_ledgers.append((before, reclaim, after))
+        step_timestamps.append((before_ns, reclaim_ns, after_ns))
+        prior_after = after
+        prior_after_ns = after_ns
+
+    pre = _phase_once(timeline, "pre_growth")
+    timeline_reclaim = _phase_once(timeline, "post_expert_reclaim")
+    timeline_growth = _phase_once(timeline, "post_kv_growth")
+    first_before, first_reclaim, _first_after = step_ledgers[0]
+    _last_before, _last_reclaim, final_after = step_ledgers[-1]
+    first_before_ns, first_reclaim_ns, _first_after_ns = step_timestamps[0]
+    _last_before_ns, _last_reclaim_ns, final_after_ns = step_timestamps[-1]
+    if not pre.monotonic_ns < first_before_ns:
+        raise BenchmarkGateError(
+            "timeline pre_growth does not precede first growth ledger"
+        )
+    if timeline_reclaim.monotonic_ns != first_reclaim_ns:
+        raise BenchmarkGateError(
+            "timeline reclaim timestamp differs from captured growth ledger"
+        )
+    if not final_after_ns < timeline_growth.monotonic_ns:
+        raise BenchmarkGateError(
+            "final growth ledger does not precede timeline post_kv_growth"
+        )
+    physical_fields = (
+        "expert_slab_physical_bytes",
+        "kv_physical_bytes",
+        "kv_allocated_blocks",
+    )
+    if any(
+        getattr(first_before, name) != getattr(pre, name) for name in physical_fields
+    ):
+        raise BenchmarkGateError(
+            "first growth ledger differs from timeline pre_growth physical state"
+        )
+    reclaim_fields = (
+        "allocator_active_bytes",
+        "allocator_cache_bytes",
+        "allocator_peak_bytes",
+        *physical_fields,
+    )
+    if (
+        any(
+            getattr(first_reclaim, name) != getattr(timeline_reclaim, name)
+            for name in reclaim_fields
+        )
+        or first_reclaim.resource_evidence != timeline_reclaim.resource_evidence
+    ):
+        raise BenchmarkGateError(
+            "captured growth reclaim ledger differs from timeline reclaim state"
+        )
+    if any(
+        getattr(final_after, name) != getattr(timeline_growth, name)
+        for name in physical_fields
+    ):
+        raise BenchmarkGateError(
+            "final growth ledger differs from timeline post_kv_growth physical state"
+        )
+    return tuple(normalized)
 
 
 def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObservation:
@@ -800,6 +1509,8 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             "route_trace",
             "route_trace_sha256",
             "expert_hashes",
+            "expert_route_binding",
+            "kv_growth_steps",
             "timeline",
             "metrics",
         ),
@@ -848,27 +1559,24 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             "observation.generated_token_sha256 does not match exact generated tokens"
         )
 
-    route_trace = value["route_trace"]
-    _sequence(route_trace, field="observation.route_trace")
     route_hash = _sha256(
         value["route_trace_sha256"], field="observation.route_trace_sha256"
+    )
+    if canonical_sha256(value["route_trace"]) != route_hash:
+        raise BenchmarkGateError(
+            "observation.route_trace_sha256 does not match exact routes"
+        )
+    route_trace, expert_hashes, _expert_route_binding = _validate_expert_route_binding(
+        route_trace=value["route_trace"],
+        expert_hashes=value["expert_hashes"],
+        binding=value["expert_route_binding"],
+        expert_manifest_sha256=identity["expert_manifest_sha256"],
+        field="observation",
     )
     if canonical_sha256(route_trace) != route_hash:
         raise BenchmarkGateError(
             "observation.route_trace_sha256 does not match exact routes"
         )
-
-    raw_expert_hashes = _mapping(
-        value["expert_hashes"], field="observation.expert_hashes"
-    )
-    if not raw_expert_hashes:
-        raise BenchmarkGateError("observation.expert_hashes must not be empty")
-    expert_hashes = {
-        _nonempty_string(key, field="expert hash key"): _sha256(
-            item, field=f"observation.expert_hashes[{key!r}]"
-        )
-        for key, item in raw_expert_hashes.items()
-    }
 
     raw_timeline = _sequence(value["timeline"], field="observation.timeline")
     timeline = tuple(
@@ -879,6 +1587,13 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
         for index, item in enumerate(raw_timeline)
     )
     _validate_timeline(arm, context_tokens, cache_start_state, timeline)
+    kv_growth_steps = _validate_kv_growth_steps(
+        value["kv_growth_steps"],
+        arm=arm,
+        context_tokens=context_tokens,
+        cache_start_state=cache_start_state,
+        timeline=timeline,
+    )
 
     raw_metrics = _mapping(value["metrics"], field="observation.metrics")
     _require_fields(
@@ -992,6 +1707,8 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             "generated_token_sha256",
             "route_trace",
             "route_trace_sha256",
+            "expert_hashes",
+            "expert_route_binding",
         )
         _require_fields(
             sample,
@@ -1064,17 +1781,24 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             raise BenchmarkGateError(
                 f"{sample_prefix}.generated_token_sha256 does not match exact tokens"
             )
-        sample_route_trace = list(
-            _sequence(
-                sample["route_trace"],
-                field=f"{sample_prefix}.route_trace",
-            )
-        )
-        if not sample_route_trace:
-            raise BenchmarkGateError(f"{sample_prefix}.route_trace must not be empty")
         sample_route_hash = _sha256(
             sample["route_trace_sha256"],
             field=f"{sample_prefix}.route_trace_sha256",
+        )
+        if canonical_sha256(sample["route_trace"]) != sample_route_hash:
+            raise BenchmarkGateError(
+                f"{sample_prefix}.route_trace_sha256 does not match exact routes"
+            )
+        (
+            sample_route_trace,
+            sample_expert_hashes,
+            sample_expert_route_binding,
+        ) = _validate_expert_route_binding(
+            route_trace=sample["route_trace"],
+            expert_hashes=sample["expert_hashes"],
+            binding=sample["expert_route_binding"],
+            expert_manifest_sha256=identity["expert_manifest_sha256"],
+            field=sample_prefix,
         )
         if canonical_sha256(sample_route_trace) != sample_route_hash:
             raise BenchmarkGateError(
@@ -1091,6 +1815,8 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
                 "generated_token_sha256": sample_token_hash,
                 "route_trace": sample_route_trace,
                 "route_trace_sha256": sample_route_hash,
+                "expert_hashes": sample_expert_hashes,
+                "expert_route_binding": sample_expert_route_binding,
             }
         )
     metrics: dict[str, object] = {
@@ -1114,6 +1840,7 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
         route_trace=route_trace,
         route_trace_sha256=route_hash,
         expert_hashes=expert_hashes,
+        kv_growth_steps=kv_growth_steps,
         timeline=timeline,
         metrics=metrics,
     )
@@ -1241,6 +1968,171 @@ def validate_allocator_probe(value: Mapping[str, object]) -> dict[str, object]:
     result["charged_release_bytes"] = charged_release
     result["gate_passed"] = True
     return result
+
+
+def _validate_artifact_attestation(value: Mapping[str, object]) -> dict[str, object]:
+    """Validate the independent full-payload attestation after the campaign."""
+
+    fields = (
+        "schema",
+        "model_artifact_sha256",
+        "expert_manifest_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
+        "sidecar_fingerprint",
+        "resident_payload_bytes",
+        "resident_payload_sha256",
+        "resident_shard_fingerprints",
+        "payload_hash_verified",
+        "payload_hash_io_mode",
+    )
+    _require_fields(value, fields, context="post-campaign artifact attestation")
+    if set(value) != set(fields):
+        raise BenchmarkGateError(
+            "post-campaign artifact attestation has unknown fields"
+        )
+    if value["schema"] != SCHEMA_ARTIFACT_ATTESTATION:
+        raise BenchmarkGateError(
+            "post-campaign artifact attestation.schema must be "
+            f"{SCHEMA_ARTIFACT_ATTESTATION}"
+        )
+    if value["payload_hash_verified"] is not True:
+        raise BenchmarkGateError(
+            "post-campaign artifact attestation.payload_hash_verified must be true"
+        )
+    if value["payload_hash_io_mode"] != "f-nocache":
+        raise BenchmarkGateError(
+            "post-campaign artifact attestation.payload_hash_io_mode must be f-nocache"
+        )
+    fingerprint = _mapping(
+        value["sidecar_fingerprint"],
+        field="post-campaign artifact attestation.sidecar_fingerprint",
+    )
+    fingerprint_fields = ("device", "inode", "size", "mtime_ns", "ctime_ns")
+    _require_fields(
+        fingerprint,
+        fingerprint_fields,
+        context="post-campaign artifact attestation.sidecar_fingerprint",
+    )
+    if set(fingerprint) != set(fingerprint_fields):
+        raise BenchmarkGateError(
+            "post-campaign artifact attestation.sidecar_fingerprint has unknown fields"
+        )
+    parsed_fingerprint = {
+        field: _exact_int(
+            fingerprint[field],
+            field=(f"post-campaign artifact attestation.sidecar_fingerprint.{field}"),
+            minimum=0,
+        )
+        for field in fingerprint_fields
+    }
+    resident_payload_bytes = _exact_int(
+        value["resident_payload_bytes"],
+        field="post-campaign artifact attestation.resident_payload_bytes",
+        minimum=1,
+    )
+    resident_payload_sha256 = _sha256(
+        value["resident_payload_sha256"],
+        field="post-campaign artifact attestation.resident_payload_sha256",
+    )
+    raw_resident_fingerprints = _sequence(
+        value["resident_shard_fingerprints"],
+        field="post-campaign artifact attestation.resident_shard_fingerprints",
+    )
+    if not raw_resident_fingerprints:
+        raise BenchmarkGateError(
+            "post-campaign artifact attestation.resident_shard_fingerprints "
+            "must not be empty"
+        )
+    resident_fingerprints: list[dict[str, int | str]] = []
+    for index, item in enumerate(raw_resident_fingerprints):
+        raw = _mapping(
+            item,
+            field=(
+                "post-campaign artifact attestation."
+                f"resident_shard_fingerprints[{index}]"
+            ),
+        )
+        fields_with_name = ("name", *fingerprint_fields)
+        _require_fields(
+            raw,
+            fields_with_name,
+            context=(
+                "post-campaign artifact attestation."
+                f"resident_shard_fingerprints[{index}]"
+            ),
+        )
+        if set(raw) != set(fields_with_name):
+            raise BenchmarkGateError(
+                "post-campaign artifact attestation resident fingerprint has "
+                "unknown fields"
+            )
+        resident_fingerprints.append(
+            {
+                "name": _nonempty_string(
+                    raw["name"],
+                    field=(
+                        "post-campaign artifact attestation."
+                        f"resident_shard_fingerprints[{index}].name"
+                    ),
+                ),
+                **{
+                    field: _exact_int(
+                        raw[field],
+                        field=(
+                            "post-campaign artifact attestation."
+                            f"resident_shard_fingerprints[{index}].{field}"
+                        ),
+                        minimum=0,
+                    )
+                    for field in fingerprint_fields
+                },
+            }
+        )
+    names = [str(item["name"]) for item in resident_fingerprints]
+    if names != sorted(set(names)):
+        raise BenchmarkGateError(
+            "post-campaign resident shard fingerprints must be sorted and unique"
+        )
+    artifact_stat_sha256 = _sha256(
+        value["artifact_stat_sha256"],
+        field="post-campaign artifact attestation.artifact_stat_sha256",
+    )
+    if (
+        canonical_sha256(
+            {
+                "sidecar": parsed_fingerprint,
+                "resident_shards": resident_fingerprints,
+            }
+        )
+        != artifact_stat_sha256
+    ):
+        raise BenchmarkGateError(
+            "post-campaign artifact attestation.artifact_stat_sha256 differs "
+            "from the payload fingerprints"
+        )
+    return {
+        "schema": SCHEMA_ARTIFACT_ATTESTATION,
+        "model_artifact_sha256": _sha256(
+            value["model_artifact_sha256"],
+            field="post-campaign artifact attestation.model_artifact_sha256",
+        ),
+        "expert_manifest_sha256": _sha256(
+            value["expert_manifest_sha256"],
+            field="post-campaign artifact attestation.expert_manifest_sha256",
+        ),
+        "artifact_pins_sha256": _sha256(
+            value["artifact_pins_sha256"],
+            field="post-campaign artifact attestation.artifact_pins_sha256",
+        ),
+        "artifact_stat_sha256": artifact_stat_sha256,
+        "sidecar_fingerprint": parsed_fingerprint,
+        "resident_payload_bytes": resident_payload_bytes,
+        "resident_payload_sha256": resident_payload_sha256,
+        "resident_shard_fingerprints": resident_fingerprints,
+        "payload_hash_verified": True,
+        "payload_hash_io_mode": "f-nocache",
+    }
 
 
 def run_allocator_release_probe(
@@ -1421,6 +2313,11 @@ def _campaign_acceptance_reasons(
             reasons.append(f"{prefix}: process compressor growth exceeded 512 MiB")
         for point in observation.timeline:
             resource = point.resource_evidence
+            if int(resource["classified_bytes"]) > int(
+                resource["classified_target_bytes"]
+            ):
+                reasons.append(f"{prefix}: classified memory exceeded 109 GiB")
+                break
             if int(resource["charged_bytes"]) > OPERATING_TARGET_BYTES:
                 reasons.append(f"{prefix}: sampled charged memory exceeded 110 GiB")
                 break
@@ -1439,6 +2336,26 @@ def _campaign_acceptance_reasons(
 
     for context_tokens in CONTEXT_MATRIX_TOKENS:
         summary = summaries[str(context_tokens)]
+        for repetition in range(repetitions):
+            static = validated[(context_tokens, repetition, "static")]
+            dynamic = validated[(context_tokens, repetition, "dynamic")]
+            fixed_fields = (
+                "resident_model_bytes",
+                "inflight_expert_staging_bytes",
+                "runtime_workspace_bytes",
+            )
+            static_fixed = sum(
+                int(static.timeline[0].resource_evidence[field])
+                for field in fixed_fields
+            )
+            dynamic_fixed = sum(
+                int(dynamic.timeline[0].resource_evidence[field])
+                for field in fixed_fields
+            )
+            if static_fixed != dynamic_fixed:
+                reasons.append(
+                    f"{context_tokens}/{repetition}: paired fixed physical pools differ"
+                )
         if context_tokens < HY3_Q4_TOTAL_CONTEXT_TOKENS:
             for repetition in range(repetitions):
                 static = validated[(context_tokens, repetition, "static")]
@@ -1532,6 +2449,8 @@ def _paired_equal(static: CampaignObservation, dynamic: CampaignObservation) -> 
         "model_artifact_sha256",
         "expert_manifest_id",
         "expert_manifest_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
         "source_git_commit",
         "normalized_config_sha256",
         "kv_quantization",
@@ -1780,32 +2699,39 @@ def run_exclusive_hardware_window(
 ) -> _T:
     """Run work with exact Qwen restoration guaranteed in ``finally``.
 
-    Restoration is attempted after both unload and workload failures.  The lane
-    is released only after restoration verification has run.
+    Restoration is attempted after ordinary unload and workload failures.  If
+    subprocess-group cleanup cannot prove the GPU workload absent, Qwen stays
+    unloaded and the recovery journal and exclusive lane are retained.  The
+    lane is released only after restoration verification has run.
     """
 
-    with _termination_cleanup_scope():
-        lane_acquired = False
-        captured = False
-        state: object = None
-        try:
-            with _blocked_termination_signals():
-                hooks.acquire_lane()
-                lane_acquired = True
-            state = hooks.capture()
-            captured = True
-            hooks.unload(state)
-            return workload()
-        finally:
-            with _blocked_termination_signals():
-                if captured:
-                    hooks.restore(state)
-                    if hooks.verify_restored(state) is not True:
-                        raise BenchmarkGateError(
-                            "Qwen state does not exactly match its captured state"
-                        )
-                if lane_acquired:
-                    hooks.release_lane()
+    cleanup_state = _SUBPROCESS_CLEANUP_UNPROVEN.set(False)
+    try:
+        with _termination_cleanup_scope():
+            lane_acquired = False
+            captured = False
+            state: object = None
+            try:
+                with _blocked_termination_signals():
+                    hooks.acquire_lane()
+                    lane_acquired = True
+                state = hooks.capture()
+                captured = True
+                hooks.unload(state)
+                return workload()
+            finally:
+                if not _SUBPROCESS_CLEANUP_UNPROVEN.get():
+                    with _blocked_termination_signals():
+                        if captured:
+                            hooks.restore(state)
+                            if hooks.verify_restored(state) is not True:
+                                raise BenchmarkGateError(
+                                    "Qwen state does not exactly match its captured state"
+                                )
+                        if lane_acquired:
+                            hooks.release_lane()
+    finally:
+        _SUBPROCESS_CLEANUP_UNPROVEN.reset(cleanup_state)
 
 
 @contextmanager
@@ -1838,45 +2764,242 @@ def _blocked_termination_signals():
         pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(
+    process_group: int,
+    *,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + float(timeout_seconds)
+    while _process_group_exists(process_group):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        time.sleep(min(0.05, remaining))
+    return True
+
+
+def _signal_process_group(process_group: int, signum: int) -> None:
+    try:
+        os.killpg(process_group, signum)
+    except ProcessLookupError:
+        pass
+
+
+def _terminate_json_subprocess_group(
+    process: subprocess.Popen[str],
+    *,
+    grace_seconds: float,
+) -> tuple[str, str]:
+    """Boundedly reap the leader and prove its isolated group is gone."""
+
+    process_group = int(process.pid)
+    stdout = ""
+    stderr = ""
+    _signal_process_group(process_group, signal.SIGTERM)
+    leader_reaped = process.returncode is not None
+    if not leader_reaped:
+        try:
+            stdout, stderr = process.communicate(timeout=grace_seconds)
+            leader_reaped = True
+        except subprocess.TimeoutExpired:
+            pass
+
+    group_exists = _process_group_exists(process_group)
+    if group_exists and leader_reaped:
+        group_exists = not _wait_for_process_group_exit(
+            process_group,
+            timeout_seconds=grace_seconds,
+        )
+    if not leader_reaped or group_exists:
+        _signal_process_group(process_group, signal.SIGKILL)
+        if not leader_reaped:
+            try:
+                stdout, stderr = process.communicate(timeout=grace_seconds)
+                leader_reaped = True
+            except subprocess.TimeoutExpired:
+                pass
+        if not _wait_for_process_group_exit(
+            process_group,
+            timeout_seconds=grace_seconds,
+        ):
+            raise _subprocess_cleanup_not_proven(
+                "JSON subprocess process group survived SIGKILL"
+            )
+    if not leader_reaped:
+        try:
+            stdout, stderr = process.communicate(timeout=grace_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise _subprocess_cleanup_not_proven(
+                "JSON subprocess leader could not be reaped after SIGKILL"
+            ) from exc
+    if _process_group_exists(process_group):
+        raise _subprocess_cleanup_not_proven(
+            "JSON subprocess process group remained after cleanup"
+        )
+    return stdout, stderr
+
+
+def _terminate_surviving_json_subprocess_descendants(
+    process_group: int,
+    *,
+    grace_seconds: float,
+) -> None:
+    """Remove descendants that outlived an already-reaped group leader."""
+
+    _signal_process_group(process_group, signal.SIGTERM)
+    if _wait_for_process_group_exit(
+        process_group,
+        timeout_seconds=grace_seconds,
+    ):
+        return
+    _signal_process_group(process_group, signal.SIGKILL)
+    if not _wait_for_process_group_exit(
+        process_group,
+        timeout_seconds=grace_seconds,
+    ):
+        raise _subprocess_cleanup_not_proven(
+            "JSON subprocess descendants survived SIGKILL"
+        )
+
+
+def _run_json_subprocess(
+    command: Sequence[str],
+    *,
+    cwd: Path | str | None = None,
+    input_payload: object | None = None,
+    env: Mapping[str, str] | None = None,
+    allowed_returncodes: Sequence[int] = (0,),
+    timeout_seconds: float = DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS,
+    termination_grace_seconds: float = (
+        DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS
+    ),
+) -> tuple[Mapping[str, object], int]:
+    """Run argv, retaining the exact code alongside its single JSON object."""
+
+    argv = tuple(_nonempty_string(item, field="command argv") for item in command)
+    if not argv:
+        raise BenchmarkGateError("JSON subprocess command must not be empty")
+    accepted_codes = tuple(
+        _exact_int(code, field="allowed subprocess return code")
+        for code in allowed_returncodes
+    )
+    if not accepted_codes or len(set(accepted_codes)) != len(accepted_codes):
+        raise BenchmarkGateError(
+            "allowed subprocess return codes must be nonempty and unique"
+        )
+    encoded_input = (
+        None
+        if input_payload is None
+        else json.dumps(input_payload, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    timeout = _finite_number(
+        timeout_seconds,
+        field="JSON subprocess timeout_seconds",
+        positive=True,
+    )
+    grace = _finite_number(
+        termination_grace_seconds,
+        field="JSON subprocess termination_grace_seconds",
+        positive=True,
+    )
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=None if env is None else {**os.environ, **env},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input=encoded_input, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            with _blocked_termination_signals():
+                cleanup_stdout, cleanup_stderr = _terminate_json_subprocess_group(
+                    process,
+                    grace_seconds=grace,
+                )
+        except BaseException as cleanup_error:
+            raise cleanup_error from exc
+        detail = cleanup_stderr.strip() or cleanup_stdout.strip()
+        suffix = f": {detail}" if detail else ""
+        raise BenchmarkGateError(
+            f"JSON subprocess timed out after {timeout:g} seconds: {argv!r}{suffix}"
+        ) from exc
+    except BaseException as exc:
+        try:
+            with _blocked_termination_signals():
+                _terminate_json_subprocess_group(process, grace_seconds=grace)
+        except BaseException as cleanup_error:
+            raise cleanup_error from exc
+        raise
+    if _process_group_exists(process.pid):
+        with _blocked_termination_signals():
+            _terminate_surviving_json_subprocess_descendants(
+                process.pid,
+                grace_seconds=grace,
+            )
+        raise BenchmarkGateError(
+            "JSON subprocess descendants remained after the leader exited"
+        )
+    returncode = process.returncode
+    if returncode is None:
+        raise BenchmarkGateError("JSON subprocess leader was not reaped")
+    if returncode not in accepted_codes:
+        detail = stderr.strip() or stdout.strip()
+        raise BenchmarkGateError(f"JSON subprocess failed ({returncode}): {detail}")
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise BenchmarkGateError(
+            "JSON subprocess stdout is not one JSON value"
+        ) from exc
+    return _mapping(value, field="JSON subprocess stdout"), returncode
+
+
 def run_json_subprocess(
     command: Sequence[str],
     *,
     cwd: Path | str | None = None,
     input_payload: object | None = None,
     env: Mapping[str, str] | None = None,
+    allowed_returncodes: Sequence[int] = (0,),
+    timeout_seconds: float = DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS,
+    termination_grace_seconds: float = (
+        DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS
+    ),
 ) -> Mapping[str, object]:
     """Run an argv-only command and parse exactly one JSON object from stdout."""
 
-    argv = tuple(_nonempty_string(item, field="command argv") for item in command)
-    if not argv:
-        raise BenchmarkGateError("JSON subprocess command must not be empty")
-    encoded_input = (
-        None
-        if input_payload is None
-        else json.dumps(input_payload, sort_keys=True, separators=(",", ":")) + "\n"
-    )
-    completed = subprocess.run(
-        argv,
+    value, _returncode = _run_json_subprocess(
+        command,
         cwd=cwd,
-        env=None if env is None else {**os.environ, **env},
-        input=encoded_input,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+        input_payload=input_payload,
+        env=env,
+        allowed_returncodes=allowed_returncodes,
+        timeout_seconds=timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    return value
+
+
+def _require_quality_returncode(returncode: int, *, passed: bool) -> None:
+    expected = 0 if passed else 2
+    if returncode != expected:
         raise BenchmarkGateError(
-            f"JSON subprocess failed ({completed.returncode}): {detail}"
+            "KV quality subprocess return code contradicts recomputed acceptance"
         )
-    try:
-        value = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise BenchmarkGateError(
-            "JSON subprocess stdout is not one JSON value"
-        ) from exc
-    return _mapping(value, field="JSON subprocess stdout")
 
 
 def format_arm_command(
@@ -1907,17 +3030,40 @@ def format_arm_command(
 def run_subprocess_campaign(
     *,
     probe_command: Sequence[str],
+    artifact_verify_command: Sequence[str],
     arm_command_template: Sequence[str],
     repetitions: int,
+    quality_command: Sequence[str] | None = None,
     cwd: Path | str | None = None,
     command_runner: Callable[[Sequence[str]], Mapping[str, object]] | None = None,
     bootstrap_resamples: int = 10_000,
     bootstrap_seed: int = 46,
+    subprocess_timeout_seconds: float = DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS,
+    subprocess_termination_grace_seconds: float = (
+        DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS
+    ),
 ) -> dict[str, object]:
     """Bridge JSON-emitting hardware commands into the pure campaign runner."""
 
-    runner = command_runner or (lambda command: run_json_subprocess(command, cwd=cwd))
-    probe = runner(probe_command)
+    runner = command_runner or (
+        lambda command: run_json_subprocess(
+            command,
+            cwd=cwd,
+            timeout_seconds=subprocess_timeout_seconds,
+            termination_grace_seconds=subprocess_termination_grace_seconds,
+        )
+    )
+    probe = validate_allocator_probe(runner(probe_command))
+    probe_identity = _validate_identity(
+        _mapping(
+            _mapping(
+                probe["manifest"],
+                field="allocator probe.manifest",
+            )["identity"],
+            field="allocator probe.manifest.identity",
+        ),
+        context="allocator probe.manifest.identity",
+    )
 
     def execute(arm: str, context_tokens: int, repetition: int) -> Mapping[str, object]:
         return runner(
@@ -1929,17 +3075,101 @@ def run_subprocess_campaign(
             )
         )
 
-    return run_balanced_campaign(
+    result = run_balanced_campaign(
         allocator_probe=probe,
         execute_arm=execute,
         repetitions=repetitions,
         bootstrap_resamples=bootstrap_resamples,
         bootstrap_seed=bootstrap_seed,
     )
+    if quality_command is not None:
+        quality_returncode: int | None = None
+        if command_runner is None:
+            raw_quality, quality_returncode = _run_json_subprocess(
+                quality_command,
+                cwd=cwd,
+                allowed_returncodes=(0, 2),
+                timeout_seconds=subprocess_timeout_seconds,
+                termination_grace_seconds=subprocess_termination_grace_seconds,
+            )
+        else:
+            raw_quality = runner(quality_command)
+        from mtplx.benchmarks.hy3_kv_quality import validate_quality_result
+
+        quality = dict(raw_quality)
+        quality_acceptance = dict(validate_quality_result(quality))
+        quality_identity = _mapping(quality.get("identity"), field="quality identity")
+        for field in (
+            "model_artifact_id",
+            "model_artifact_sha256",
+            "expert_manifest_sha256",
+            "artifact_pins_sha256",
+            "artifact_stat_sha256",
+            "resident_payload_bytes",
+            "resident_payload_sha256",
+            "source_git_commit",
+        ):
+            if quality_identity.get(field) != probe_identity[field]:
+                raise BenchmarkGateError(
+                    f"quality identity drifted from allocator probe at {field}"
+                )
+        quality_passed = quality_acceptance.get("passed")
+        if not isinstance(quality_passed, bool):
+            raise BenchmarkGateError("KV quality acceptance must declare passed")
+        if quality_returncode is not None:
+            _require_quality_returncode(quality_returncode, passed=quality_passed)
+        result["kv_quality"] = quality
+        campaign_acceptance = dict(
+            _mapping(result.get("acceptance"), field="campaign acceptance")
+        )
+        campaign_acceptance["quality_gate_status"] = (
+            "passed" if quality_passed else "rejected"
+        )
+        if not quality_passed:
+            raw_reasons = quality_acceptance.get("rejection_reasons", ())
+            quality_reasons = tuple(
+                _nonempty_string(reason, field="KV quality rejection reason")
+                for reason in _sequence(
+                    raw_reasons,
+                    field="KV quality rejection reasons",
+                )
+            )
+            if not quality_reasons:
+                quality_reasons = ("KV quality gate rejected",)
+            existing_reasons = tuple(
+                _nonempty_string(reason, field="campaign rejection reason")
+                for reason in _sequence(
+                    campaign_acceptance.get("rejection_reasons", ()),
+                    field="campaign rejection reasons",
+                )
+            )
+            campaign_acceptance["passed"] = False
+            campaign_acceptance["rejection_reasons"] = list(
+                dict.fromkeys((*existing_reasons, *quality_reasons))
+            )
+            result["status"] = "rejected"
+        result["acceptance"] = campaign_acceptance
+    post_attestation = _validate_artifact_attestation(runner(artifact_verify_command))
+    for field in (
+        "model_artifact_sha256",
+        "expert_manifest_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
+        "resident_payload_bytes",
+        "resident_payload_sha256",
+    ):
+        if post_attestation[field] != probe_identity[field]:
+            raise BenchmarkGateError(
+                f"post-campaign artifact attestation drifted at {field}"
+            )
+    result["post_campaign_artifact_attestation"] = post_attestation
+    return result
 
 
 __all__ = [
     "CONTEXT_MATRIX_TOKENS",
+    "DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS",
+    "DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS",
     "HY3_Q4_KV_BLOCK_BYTES",
     "HY3_Q4_KV_BYTES_PER_TOKEN",
     "HY3_Q4_MAX_BLOCKS",

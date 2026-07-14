@@ -4,13 +4,14 @@
 
 **Goal:** Keep the complete single-sequence Hy3 Q4 inference working set at or below a 110 GiB operating target and strictly below a 112 GiB hard unified-memory ceiling while preserving a fully attendable 131,072-token Q4 KV history and dynamically lending unused KV budget to physically releasable expert-cache slabs.
 
-**Architecture:** The first stack layer establishes an explicit Hy3 Q4, one-active-sequence, 131,072-token admission contract. The second layer adds a pure fail-closed byte broker, stable logical expert slots backed by independently releasable component-bank slabs, and physical Q4 KV allocation observers. Every KV allocation uses a two-phase reservation that reclaims and confirms expert bytes before MLX allocation; every release credits bytes only after allocator telemetry confirms the physical reduction. The entire dynamic lane remains off by default until software, allocator-release, quality, memory, and paired-performance gates pass.
+**Architecture:** The first stack layer establishes an explicit Hy3 Q4, one-active-sequence, 131,072-token admission contract. The second layer adds a pure fail-closed byte broker, stable logical expert slots backed by independently releasable component-bank slabs, and physical Q4 KV allocation observers. Each target-cache boundary is one aggregate transaction across the 80 discovered attention owners: it sums steady growth, reserves the largest serialized replacement transient, reclaims and confirms expert bytes once, then materializes every member back-to-back before MLX model execution resumes. Every release credits bytes only after allocator telemetry confirms the physical reduction. The entire dynamic lane remains off by default until software, allocator-release, quality, memory, and paired-performance gates pass.
 
 **Tech Stack:** Python 3.12, pytest, MLX, FastAPI server runtime, existing Hy3 paged-Q4 cache and global component-bank expert runtime, `uv`, Ruff, authenticated `gh`.
 
 **Assumptions:**
 
 - Assumes one active Hy3 sequence and a fully attendable 131,072-token history — it will NOT enable AR batching, multiple live KV stores, sliding-window attention, or SSD-backed active KV.
+- Assumes target-only AR generation — MTP and its additional KV cache are rejected until target-plus-draft allocation, rollback, and lifecycle accounting receive their own qualification.
 - Assumes `model_key="hy3-q4"`, `cache_scope="global"`, `slot_layout="component-banks"`, and paged KV quantization `q4` — it will NOT silently enable the broker for other models, Q8/BF16 KV, layer-local caches, direct slots, or Metal mmap.
 - Assumes binary GiB, a 110 GiB normal target, and a strict `<112 GiB` stress bound — decimal GB and the machine wired limit are NOT substitutes.
 - Assumes request completion, reset, and cancellation release live Q4 arrays rather than transferring them into SessionBank live references — the dynamic lane will NOT retain unmetered live cache objects between requests.
@@ -39,7 +40,7 @@
 - `mtplx/runtime_options.py` — normalize and attest the opt-in Q4 dynamic lane.
 - `mtplx/server/openai.py` — exact context admission, one-sequence enforcement, lifecycle cleanup, and health telemetry.
 - `mtplx/cache_state.py` — physical-byte geometry, two-phase Q4 allocation callbacks, close/release, and stats.
-- `mtplx/runtime.py` — pass the broker into target and MTP cache construction.
+- `mtplx/runtime.py` — preallocate and grow the brokered target-cache group before model execution and reject MTP cache construction in the strict lane.
 - `mtplx/generation.py` — close or transfer Q4 cache ownership explicitly on all terminal paths.
 - `mtplx/expert_streaming.py` — stable active-slot masks, residency class, slab candidate ranking, and generation preservation.
 - `mtplx/expert_slots.py` — stable physical slot metadata plus slab reclaim/regrow transactions.
@@ -403,7 +404,7 @@ git commit -m "feat(hy3): allocate releasable expert component slabs"
 
 **Does NOT cover:** Dynamic behavior is rejected unless every attestation for the Hy3 Q4 global component-bank lane is true; existing static plans remain unchanged.
 
-- [ ] **Step 1: Write failing configuration, reclaim, and hysteresis tests**
+- [x] **Step 1: Write failing configuration, reclaim, and hysteresis tests**
 
 Use these opt-in defaults:
 
@@ -416,13 +417,13 @@ expert_resize_min_interval_ms: int = 1000
 
 Test speculative-first and cold-ordinary reclaim, pinned/current-demand exclusion, zero credit for logical-only eviction, allocator-retention failure, no unrelated fence wait, lazy on-demand regrowth, hysteresis, minimum interval, allocation failure, interrupted resize, and exact restoration to a valid capacity.
 
-- [ ] **Step 2: Confirm RED**
+- [x] **Step 2: Confirm RED**
 
 Run: `uv run --frozen --extra dev --extra server pytest -q tests/test_dynamic_expert_slabs.py`
 
 Expected: FAIL because runtime reclaim/regrow and telemetry do not exist.
 
-- [ ] **Step 3: Implement runtime transactions**
+- [x] **Step 3: Implement runtime transactions**
 
 ```python
 def reclaim_expert_bytes(
@@ -470,11 +471,11 @@ def maybe_regrow_expert_slabs(
 
 Run candidate ranking under the existing global policy lock, prepare physical reclaim, invalidate exact policy generations, cross the physical destruction boundary, sample allocator memory, and confirm with the broker. Before destruction, abort restores policy and physical state. After destruction, failures leave a valid released capacity and never republish old mappings. On expert demand, regrow only enough slabs to satisfy the route after hysteresis and interval gates.
 
-- [ ] **Step 4: Replace analytical KV planning in the dynamic lane**
+- [x] **Step 4: Replace analytical KV planning in the dynamic lane**
 
 Retain analytical `kv_bytes_per_token` only for static diagnostics. When dynamic Q4 is enabled, initialize the broker from resident model, transient service bank, staging, workspace, measured allocator cache, and zero physical KV; never pre-advertise expert capacity that exceeds allocated active slabs.
 
-- [ ] **Step 5: Add telemetry and verify GREEN**
+- [x] **Step 5: Add telemetry and verify GREEN**
 
 Snapshot must report target/ceiling; expert logical capacity, resident records, active/released slab count, physical bytes; pinned/in-flight/speculative bytes; requested/reclaimed bytes; resize duration; blocked-by-pin bytes; admission failures; hysteresis state; and allocator active/cache/peak.
 
@@ -504,13 +505,13 @@ git commit -m "feat(hy3): reclaim and regrow expert slabs under the broker"
 
 **Security flag:** none
 
-**Does NOT cover:** Lowering a logical offset with `trim()` releases no physical bytes and must never produce broker credit.
+**Does NOT cover:** Lowering a logical offset with `trim()` releases no physical bytes and must never produce broker credit. MTP KV ownership is outside the qualified AR-only lane.
 
-- [ ] **Step 1: Write failing geometry and lifecycle tests**
+- [x] **Step 1: Write failing geometry and lifecycle tests**
 
-Test actual q4 key/value/scales byte counts from block shapes and dtypes; block rounding; first allocation; 1.5x growth; the concatenate peak (`old + extra + new`) reserved before any `mx.zeros`; no allocation when expert reclaim is short; commit only after `mx.eval`; abort on allocation failure; no credit from `trim`; exact-once physical release on success/reset/cancel; target and MTP cache inclusion; and stale-cache absence on a second sequential request.
+Test actual q4 key/value/scales byte counts from block shapes and dtypes; block rounding; aggregate 80-owner first allocation and growth; one reclaim before member 0; the complete steady sum and largest serialized replacement transient reserved before any `mx.zeros`; no allocation when expert reclaim is short; commit only after `mx.eval`; abort on allocation failure; no credit from `trim`; exact-once physical release on success/reset/cancel; explicit MTP rejection; and stale-cache absence on a second sequential request.
 
-- [ ] **Step 2: Confirm RED**
+- [x] **Step 2: Confirm RED**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -520,7 +521,7 @@ uv run --frozen --extra dev --extra server pytest -q \
 
 Expected: FAIL because physical allocation observers and explicit release are absent.
 
-- [ ] **Step 3: Add the observer contract and actual byte geometry**
+- [x] **Step 3: Add the observer contract and actual byte geometry**
 
 ```python
 class KVPhysicalAllocationObserver(Protocol):
@@ -551,13 +552,13 @@ class KVPhysicalAllocationObserver(Protocol):
         raise NotImplementedError
 ```
 
-Pass the runtime broker to every target and MTP `VllmMetalPagedKVCache`. Calculate bytes from concrete shapes and dtype widths before allocation. In `_grow_to_capacity`, reserve the steady-state extra blocks plus the full transient concatenate allocation; reclaim and confirm expert slabs before creating any MLX array.
+Pass the runtime broker to every target `VllmMetalPagedKVCache`. Calculate page counts dynamically from exact token demand and block size, declare all member byte deltas before allocation, reclaim once, then allocate and commit the group serially. The strict lane fails closed if an owner is missing, block counts disagree, a per-entry reservation occurs, or allocator samples do not form one chain.
 
-- [ ] **Step 4: Add deterministic close/ownership transfer**
+- [x] **Step 4: Add deterministic close/ownership transfer**
 
-Implement `VllmMetalPagedKVCache.close()` as idempotent. Generation owns the cache until it either transfers ownership to an allowed holder or closes it on every success/error/cancellation path. The dynamic lane disallows SessionBank live-reference transfer, so request completion closes target and MTP caches before releasing the admission. `trim()` changes logical tokens only.
+Implement `VllmMetalPagedKVCache.close()` as idempotent. Generation owns the target cache until it either transfers ownership to an allowed holder or closes it on every success/error/cancellation path. The dynamic lane disallows SessionBank live-reference transfer, so request completion closes target caches before releasing the admission. `trim()` changes logical tokens only.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -585,25 +586,25 @@ git commit -m "feat(hy3): broker physical Q4 KV block lifetimes"
 
 **Does NOT cover:** The feature remains off by default and never treats OS pressure, swap, compressor activity, allocation failure, or process termination as a resizing signal.
 
-- [ ] **Step 1: Write failing server lifecycle and telemetry tests**
+- [x] **Step 1: Write failing server lifecycle and telemetry tests**
 
 Cover startup attestation, disabled default, speculative admission stop before reclaim, request rejection before oversubscription, exact-once cancellation/reset release, no SessionBank live reference, normal charged memory at/below 110 GiB, stress snapshots strictly below 112 GiB, and every telemetry field named in issue #46.
 
-- [ ] **Step 2: Confirm RED**
+- [x] **Step 2: Confirm RED**
 
 Run: `uv run --frozen --extra dev --extra server pytest -q tests/test_hy3_dynamic_memory_server.py tests/test_server_openai.py`
 
 Expected: FAIL because dynamic lane wiring and telemetry are absent.
 
-- [ ] **Step 3: Wire explicit flags and fail-closed flow**
+- [x] **Step 3: Wire explicit flags and fail-closed flow**
 
 Add `--hy3-q4-dynamic-memory`, slab-size, hysteresis, and minimum-resize-interval options. Validate the lane before model load. Before KV growth, stop speculative admission, request selected expert reclaim, confirm allocator reduction, then authorize Q4 allocation. On reset/cancel/completion, close KV, confirm release, and permit lazy expert regrowth only on future demand.
 
-- [ ] **Step 4: Publish complete resource telemetry**
+- [x] **Step 4: Publish complete resource telemetry**
 
 Include operating target/hard ceiling; resident model; KV representation/logical tokens/physical blocks/bytes; expert capacity/residents/slabs/bytes; pinned/in-flight/speculative bytes; workspace/staging reserves; allocator active/cache/peak; process resident/compressed memory and swap delta where available; requested/reclaimed bytes; evicted records/slabs; resize duration; blocked-by-pin bytes; admission failures; hit rate; SSD bytes/token; decode TPS; and p50/p95 latency.
 
-- [ ] **Step 5: Document exact operator contract and verify**
+- [x] **Step 5: Document exact operator contract and verify**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -631,25 +632,25 @@ git commit -m "feat(server): expose the opt-in Hy3 Q4 memory broker"
 
 **Does NOT cover:** The runner records evidence; it does not automatically promote the broker or change default configuration.
 
-- [ ] **Step 1: Write failing manifest, pairing, and restoration tests**
+- [x] **Step 1: Write failing manifest, pairing, and restoration tests**
 
 Test declared cache starting state, context matrix `(4096, 32768, 65536, 131072)`, static/dynamic balanced ordering, multiple block boundaries, physical expert decrease before KV increase, stable hold samples, reset/regrow samples, intervals, exact model/artifact/config identity, exact tokens/routes/expert hashes/slot health, and Qwen capture/unload/restore hooks that restore on exceptions.
 
-- [ ] **Step 2: Confirm RED**
+- [x] **Step 2: Confirm RED**
 
 Run: `uv run --frozen --extra dev --extra server pytest -q tests/test_benchmark_hy3_dynamic_memory.py`
 
 Expected: FAIL because the runner and CLI do not exist.
 
-- [ ] **Step 3: Implement the focused allocator-release probe**
+- [x] **Step 3: Implement the focused allocator-release probe**
 
 Allocate at least two real Hy3 component slabs, evaluate them, release one selected slab, sample MLX active/cache memory before and after, and emit a fail-closed JSON result. Do not run the full matrix unless charged allocator bytes fall by at least the slab's registered physical bytes and the untouched slab remains executable.
 
-- [ ] **Step 4: Implement the paired 4K/32K/64K/128K campaign**
+- [x] **Step 4: Implement the paired 4K/32K/64K/128K campaign**
 
 Compare the dynamic lane against a correctly budgeted static 128K-reserved Q4 control. At every point grow across block boundaries, prove expert bytes fall before KV bytes rise, hold long enough for stable cache/performance samples, reset and prove KV release plus lazy expert regrow, and retain raw paired samples plus confidence intervals.
 
-- [ ] **Step 5: Verify runner tests and commit**
+- [x] **Step 5: Verify runner tests and commit**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -678,7 +679,7 @@ git commit -m "bench(hy3): add issue 46 dynamic-memory gates"
 
 **Does NOT cover:** A failed allocator, quality, memory, or benefit gate leaves the feature off and records rejection; it must not be reframed as successful implementation.
 
-- [ ] **Step 1: Run changed-file and full repository verification**
+- [x] **Step 1: Run changed-file and full repository verification**
 
 ```bash
 files="mtplx/hy3_q4_context.py mtplx/memory_broker.py mtplx/runtime_options.py mtplx/cache_state.py mtplx/runtime.py mtplx/generation.py mtplx/expert_streaming.py mtplx/expert_slots.py mtplx/models/expert_mlx.py mtplx/expert_runtime.py mtplx/expert_streaming_models.py mtplx/server/openai.py mtplx/benchmarks/runners/hy3_dynamic_memory.py benchmarks/benchmark_hy3_dynamic_memory.py tests/test_hy3_q4_context.py tests/test_memory_broker.py tests/test_expert_slab_policy.py tests/test_dynamic_expert_slabs.py tests/test_hy3_dynamic_memory_server.py tests/test_benchmark_hy3_dynamic_memory.py"

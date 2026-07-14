@@ -6,16 +6,47 @@ from pathlib import Path
 from typing import Mapping
 
 from mtplx.hy3_q4_context import HY3_Q4_CONTEXT_WINDOW
-from mtplx.memory_broker import HY3_Q4_KV_BYTES_PER_TOKEN
+from mtplx.memory_broker import (
+    HY3_Q4_ALLOCATOR_HEADROOM_BYTES,
+    HY3_Q4_KV_BYTES_PER_TOKEN,
+)
 
 
 KV_QUANT_MODES = ("off", "q8", "q4")
-HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV = {
-    "MTPLX_DYNAMIC_PAGED_KV": "1",
+HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV = {
     "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
     "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
     "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "0",
     "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "0",
+    "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "mlx_vector_paged",
+    "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "1",
+    "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
+    "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "off",
+    "MTPLX_PAGED_GQA_SDPA_ROUTE": "off",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA": "0",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT": "65536",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q": "4",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q": "5",
+    "MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q": "16",
+    "MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE": "2048",
+    "MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE": "1024",
+}
+HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV = {
+    **HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV,
+    "MTPLX_DYNAMIC_PAGED_KV": "1",
+    "MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS": "1",
+    "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS": "1",
+    "MTPLX_DYNAMIC_PAGED_KV_MARGIN": "0",
+    "MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER": "0",
+    # The issue #46 production lane cannot use the sustained profile's
+    # synchronize-before-clear prefill cleanup.  Memory reclamation belongs to
+    # the broker and its measured allocation transactions instead.
+    "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP": "0",
+    # The context-only lane retains a bounded decode runway. The stricter
+    # issue #46 dynamic-memory broker overrides this at request time with one
+    # page and grows from live evaluated context instead.
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "16384",
 }
 
 
@@ -78,6 +109,10 @@ def validate_hy3_q4_dynamic_context_options(
 
     if not bool(getattr(args, "hy3_q4_dynamic_context", False)):
         return False
+    if str(getattr(args, "generation_mode", "mtp") or "mtp").strip().lower() != "ar":
+        raise ValueError("--hy3-q4-dynamic-context requires --generation-mode ar")
+    if bool(getattr(args, "load_mtp", True)):
+        raise ValueError("--hy3-q4-dynamic-context requires --no-load-mtp")
     if (
         normalize_paged_kv_quantization(getattr(args, "paged_kv_quantization", "off"))
         != "q4"
@@ -184,6 +219,13 @@ def validate_hy3_q4_dynamic_memory_options(
     ):
         raise ValueError(
             "--hy3-q4-dynamic-memory requires the exact 84,480-byte Q4 KV geometry"
+        )
+    if (
+        getattr(expert_streaming_config, "allocator_headroom_bytes", None)
+        != HY3_Q4_ALLOCATOR_HEADROOM_BYTES
+    ):
+        raise ValueError(
+            "--hy3-q4-dynamic-memory requires exactly 1 GiB allocator headroom"
         )
     for attribute, flag in _HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS:
         requested = getattr(args, attribute, None)

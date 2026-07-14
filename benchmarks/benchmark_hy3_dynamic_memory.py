@@ -21,6 +21,8 @@ from pathlib import Path
 
 from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     CONTEXT_MATRIX_TOKENS,
+    DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS,
+    DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS,
     BenchmarkGateError,
     QwenIsolationHooks,
     balanced_campaign_schedule,
@@ -28,6 +30,11 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     run_json_subprocess,
     run_subprocess_campaign,
 )
+
+
+QWEN_RECOVERY_SCHEMA = "mtplx-issue46-qwen-recovery-v1"
+QWEN_EVIDENCE_SCHEMA = "mtplx-issue46-qwen-isolation-v1"
+QWEN_RECOVERY_NAME = "issue46-recovery.json"
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, object]:
@@ -108,6 +115,21 @@ def _require_clean_source(repo_root: Path) -> str:
     return commit
 
 
+def _source_commit(repo_root: Path) -> str:
+    root = repo_root.expanduser().resolve()
+    actual = Path(_git(root, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+    if actual != root:
+        raise BenchmarkGateError(
+            f"campaign cwd must be the exact source worktree root: {actual}"
+        )
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    if len(commit) not in (40, 64) or any(
+        character not in "0123456789abcdef" for character in commit
+    ):
+        raise BenchmarkGateError("source Git commit is not a full hexadecimal hash")
+    return commit
+
+
 def _require_tracked_file(
     repo_root: Path,
     path: Path,
@@ -176,8 +198,19 @@ def _campaign_commands(
 ) -> list[tuple[str, tuple[str, ...]]]:
     commands: list[tuple[str, tuple[str, ...]]] = [
         (
+            "spec.artifact_verify_command",
+            _command(
+                spec["artifact_verify_command"],
+                field="spec.artifact_verify_command",
+            ),
+        ),
+        (
             "spec.probe_command",
             _command(spec["probe_command"], field="spec.probe_command"),
+        ),
+        (
+            "spec.quality_command",
+            _command(spec["quality_command"], field="spec.quality_command"),
         ),
         (
             "spec.arm_command_template",
@@ -229,6 +262,59 @@ def _require_campaign_sources(
             )
 
 
+def _command_option(command: Sequence[str], option: str, *, field: str) -> str:
+    positions = [index for index, item in enumerate(command) if item == option]
+    if len(positions) != 1 or positions[0] + 1 >= len(command):
+        raise BenchmarkGateError(f"{field} must declare exactly one {option}")
+    value = command[positions[0] + 1]
+    if not value or value.startswith("-"):
+        raise BenchmarkGateError(f"{field} has no value for {option}")
+    return value
+
+
+def _hardware_hooks_config_path(
+    spec: Mapping[str, object],
+    *,
+    repo_root: Path,
+) -> Path:
+    fields = (
+        "artifact_verify_command",
+        "probe_command",
+        "quality_command",
+        "arm_command_template",
+    )
+    paths = []
+    for field in fields:
+        command = _command(spec[field], field=f"spec.{field}")
+        raw_path = _command_option(command, "--hooks-config", field=f"spec.{field}")
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        paths.append(candidate.resolve())
+    if len(set(paths)) != 1:
+        raise BenchmarkGateError(
+            "artifact verification, probe, quality, and arm commands must use "
+            "the same hardware hooks config"
+        )
+    return paths[0]
+
+
+def _load_frozen_tracked_file(
+    repo_root: Path,
+    path: Path,
+    *,
+    description: str,
+) -> tuple[Path, bytes, str]:
+    resolved = _require_tracked_file(repo_root, path, description=description)
+    try:
+        raw_bytes = resolved.read_bytes()
+    except OSError as exc:
+        raise BenchmarkGateError(f"cannot read {description}: {exc}") from exc
+    if raw_bytes != _head_file_bytes(repo_root, resolved):
+        raise BenchmarkGateError(f"{description} differs from its tracked HEAD bytes")
+    return resolved, raw_bytes, hashlib.sha256(raw_bytes).hexdigest()
+
+
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -244,10 +330,23 @@ def _parse_spec_bytes(raw_bytes: bytes, *, path: Path) -> dict[str, object]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BenchmarkGateError(f"cannot load benchmark spec {path}: {exc}") from exc
     spec = dict(_mapping(raw, field="spec"))
-    for field in ("probe_command", "arm_command_template", "repetitions", "qwen"):
+    for field in (
+        "artifact_verify_command",
+        "probe_command",
+        "quality_command",
+        "arm_command_template",
+        "repetitions",
+        "qwen",
+    ):
         if field not in spec:
             raise BenchmarkGateError(f"spec is missing required field {field}")
     spec["probe_command"] = _command(spec["probe_command"], field="spec.probe_command")
+    spec["quality_command"] = _command(
+        spec["quality_command"], field="spec.quality_command"
+    )
+    spec["artifact_verify_command"] = _command(
+        spec["artifact_verify_command"], field="spec.artifact_verify_command"
+    )
     spec["arm_command_template"] = _command(
         spec["arm_command_template"], field="spec.arm_command_template"
     )
@@ -262,6 +361,27 @@ def _parse_spec_bytes(raw_bytes: bytes, *, path: Path) -> dict[str, object]:
     )
     spec["bootstrap_seed"] = _exact_int(
         spec.get("bootstrap_seed", 46), field="spec.bootstrap_seed", minimum=0
+    )
+    spec["workload_subprocess_timeout_seconds"] = _exact_int(
+        spec.get(
+            "workload_subprocess_timeout_seconds",
+            DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS,
+        ),
+        field="spec.workload_subprocess_timeout_seconds",
+        minimum=1,
+    )
+    spec["qwen_control_timeout_seconds"] = _exact_int(
+        spec.get("qwen_control_timeout_seconds", 300),
+        field="spec.qwen_control_timeout_seconds",
+        minimum=1,
+    )
+    spec["subprocess_termination_grace_seconds"] = _exact_int(
+        spec.get(
+            "subprocess_termination_grace_seconds",
+            DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS,
+        ),
+        field="spec.subprocess_termination_grace_seconds",
+        minimum=1,
     )
     qwen = dict(_mapping(spec["qwen"], field="spec.qwen"))
     for field in (
@@ -301,9 +421,7 @@ def _head_file_bytes(repo_root: Path, path: Path) -> bytes:
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise BenchmarkGateError(
-            f"cannot read tracked campaign spec from HEAD: {detail}"
-        )
+        raise BenchmarkGateError(f"cannot read tracked source file from HEAD: {detail}")
     return completed.stdout
 
 
@@ -335,7 +453,16 @@ def _plan(spec: Mapping[str, object]) -> dict[str, object]:
             for entry in balanced_campaign_schedule(repetitions=repetitions)
         ],
         "probe_command": list(spec["probe_command"]),
+        "quality_command": list(spec["quality_command"]),
+        "artifact_verify_command": list(spec["artifact_verify_command"]),
         "arm_command_template": list(spec["arm_command_template"]),
+        "workload_subprocess_timeout_seconds": int(
+            spec["workload_subprocess_timeout_seconds"]
+        ),
+        "qwen_control_timeout_seconds": int(spec["qwen_control_timeout_seconds"]),
+        "subprocess_termination_grace_seconds": int(
+            spec["subprocess_termination_grace_seconds"]
+        ),
         "qwen_isolation_configured": True,
     }
 
@@ -358,9 +485,156 @@ def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
+        _fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _invalidate_output(path: Path) -> None:
+    """Remove prior evidence before any new actual-run validation can fail."""
+
+    try:
+        existed = path.exists() or path.is_symlink()
+        path.unlink(missing_ok=True)
+        if existed:
+            _fsync_directory(path.parent)
+    except OSError as exc:
+        raise BenchmarkGateError(
+            f"cannot invalidate prior campaign output: {exc}"
+        ) from exc
+
+
+def _campaign_rejected(value: Mapping[str, object]) -> bool:
+    acceptance = value.get("acceptance")
+    return value.get("status") == "rejected" or (
+        isinstance(acceptance, Mapping) and acceptance.get("passed") is False
+    )
+
+
+def _qwen_state(value: object, *, field: str) -> dict[str, object]:
+    raw = _mapping(value, field=field)
+    if set(raw) != {"loaded", "models"} or not isinstance(raw["loaded"], bool):
+        raise BenchmarkGateError(f"{field} must contain exact loaded/models state")
+    models = raw["models"]
+    if (
+        isinstance(models, (str, bytes, bytearray))
+        or not isinstance(models, Sequence)
+        or any(not isinstance(model, str) or not model for model in models)
+    ):
+        raise BenchmarkGateError(f"{field}.models must be an array of model IDs")
+    normalized = list(models)
+    if len(normalized) != len(set(normalized)):
+        raise BenchmarkGateError(f"{field}.models contains duplicates")
+    if raw["loaded"] is False and normalized:
+        raise BenchmarkGateError(f"{field} has models while Qwen is unloaded")
+    return {"loaded": raw["loaded"], "models": normalized}
+
+
+def _qwen_transition(
+    value: object,
+    *,
+    field: str,
+    marker: str,
+    expected_state: Mapping[str, object],
+) -> dict[str, object]:
+    raw = dict(_mapping(value, field=field))
+    if raw.pop(marker, None) is not True:
+        raise BenchmarkGateError(f"{field}.{marker} must be true")
+    state = _qwen_state(raw, field=field)
+    if state != dict(expected_state):
+        raise BenchmarkGateError(f"{field} differs from the captured state")
+    return {**state, marker: True}
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    cursor = 0
+    while cursor < len(payload):
+        try:
+            written = os.write(descriptor, payload[cursor:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("short write while persisting Qwen recovery journal")
+        cursor += written
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_qwen_recovery_journal(
+    *,
+    lane: Path,
+    owner: Mapping[str, object],
+    captured_state: Mapping[str, object],
+) -> dict[str, object]:
+    if not lane.is_dir():
+        raise BenchmarkGateError("Qwen acquire did not create its exclusive lane")
+    payload_value = {
+        "schema": QWEN_RECOVERY_SCHEMA,
+        "owner": dict(owner),
+        "captured_state": dict(captured_state),
+    }
+    payload = (
+        json.dumps(payload_value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    journal = lane / QWEN_RECOVERY_NAME
+    descriptor: int | None = None
+    created = False
+    try:
+        descriptor = os.open(
+            journal,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        created = True
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        _fsync_directory(lane)
+    except BaseException as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            journal.unlink(missing_ok=True)
+        if not isinstance(exc, Exception):
+            raise
+        if isinstance(exc, BenchmarkGateError):
+            raise
+        raise BenchmarkGateError(
+            f"cannot persist Qwen recovery journal before unload: {exc}"
+        ) from exc
+    return {
+        "path": str(journal),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "durable_before_unload": True,
+        "removed_after_restore_verification": False,
+    }
+
+
+def _remove_qwen_recovery_journal(evidence: dict[str, object]) -> None:
+    journal = Path(str(evidence["path"]))
+    try:
+        journal.unlink()
+        _fsync_directory(journal.parent)
+    except OSError as exc:
+        raise BenchmarkGateError(
+            f"cannot remove verified Qwen recovery journal: {exc}"
+        ) from exc
+    evidence["removed_after_restore_verification"] = True
 
 
 def run_spec(
@@ -371,10 +645,36 @@ def run_spec(
     """Execute a validated command spec inside the exact-Qwen restore window."""
 
     qwen = _mapping(spec["qwen"], field="spec.qwen")
+    workload_timeout_seconds = _exact_int(
+        spec.get(
+            "workload_subprocess_timeout_seconds",
+            DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS,
+        ),
+        field="spec.workload_subprocess_timeout_seconds",
+        minimum=1,
+    )
+    qwen_control_timeout_seconds = _exact_int(
+        spec.get("qwen_control_timeout_seconds", 300),
+        field="spec.qwen_control_timeout_seconds",
+        minimum=1,
+    )
+    termination_grace_seconds = _exact_int(
+        spec.get(
+            "subprocess_termination_grace_seconds",
+            DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS,
+        ),
+        field="spec.subprocess_termination_grace_seconds",
+        minimum=1,
+    )
     owner_env = {
         "MTPLX_ISSUE46_CAMPAIGN_OWNER_TOKEN": secrets.token_hex(32),
         "MTPLX_ISSUE46_CAMPAIGN_PID": str(os.getpid()),
     }
+    qwen_evidence: dict[str, object] = {"schema": QWEN_EVIDENCE_SCHEMA}
+    journal_evidence: dict[str, object] | None = None
+    captured_state: dict[str, object] | None = None
+    acquired_lane: Path | None = None
+    acquired_owner: dict[str, object] | None = None
 
     def command(field: str, *, payload: object | None = None) -> Mapping[str, object]:
         return run_json_subprocess(
@@ -382,22 +682,106 @@ def run_spec(
             cwd=cwd,
             input_payload=payload,
             env=owner_env,
+            timeout_seconds=qwen_control_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
         )
 
+    def acquire_lane() -> None:
+        nonlocal acquired_lane, acquired_owner
+        result = dict(command("acquire_lane_command"))
+        if result.get("acquired") is not True:
+            raise BenchmarkGateError("Qwen exclusive lane acquisition was not proven")
+        lane_value = result.get("lane")
+        if not isinstance(lane_value, str) or not lane_value:
+            raise BenchmarkGateError("Qwen acquire result omitted its lane path")
+        owner = dict(_mapping(result.get("owner"), field="Qwen acquire owner"))
+        acquired_lane = Path(lane_value).expanduser().resolve()
+        acquired_owner = owner
+        qwen_evidence["acquire"] = {
+            "acquired": True,
+            "lane": str(acquired_lane),
+            "owner": owner,
+        }
+
+    def capture() -> dict[str, object]:
+        nonlocal captured_state, journal_evidence
+        if acquired_lane is None or acquired_owner is None:
+            raise BenchmarkGateError("Qwen capture ran before lane acquisition")
+        captured_state = _qwen_state(command("capture_command"), field="Qwen capture")
+        journal_evidence = _write_qwen_recovery_journal(
+            lane=acquired_lane,
+            owner=acquired_owner,
+            captured_state=captured_state,
+        )
+        qwen_evidence["capture"] = dict(captured_state)
+        qwen_evidence["recovery_journal"] = journal_evidence
+        return captured_state
+
+    def unload(state: object) -> None:
+        if captured_state is None or dict(_mapping(state, field="Qwen state")) != (
+            captured_state
+        ):
+            raise BenchmarkGateError("Qwen unload state differs from captured state")
+        stopped = {"loaded": False, "models": []}
+        qwen_evidence["unload"] = _qwen_transition(
+            command("unload_command", payload=state),
+            field="Qwen unload",
+            marker="unloaded",
+            expected_state=stopped,
+        )
+
+    def restore(state: object) -> None:
+        if captured_state is None:
+            raise BenchmarkGateError("Qwen restore has no captured state")
+        qwen_evidence["restore"] = _qwen_transition(
+            command("restore_command", payload=state),
+            field="Qwen restore",
+            marker="restored",
+            expected_state=captured_state,
+        )
+
+    def verify_restored(state: object) -> bool:
+        if captured_state is None:
+            raise BenchmarkGateError("Qwen verification has no captured state")
+        qwen_evidence["verify"] = _qwen_transition(
+            command("verify_command", payload=state),
+            field="Qwen verify",
+            marker="restored",
+            expected_state=captured_state,
+        )
+        return True
+
+    def release_lane() -> None:
+        if journal_evidence is not None:
+            _remove_qwen_recovery_journal(journal_evidence)
+        result = dict(command("release_lane_command"))
+        if result.get("released") is not True:
+            raise BenchmarkGateError("Qwen exclusive lane release was not proven")
+        if acquired_lane is not None and result.get("lane") != str(acquired_lane):
+            raise BenchmarkGateError("Qwen release lane differs from acquisition")
+        if acquired_owner is not None and result.get("owner") != acquired_owner:
+            raise BenchmarkGateError("Qwen release owner differs from acquisition")
+        qwen_evidence["release"] = result
+
     hooks = QwenIsolationHooks(
-        acquire_lane=lambda: command("acquire_lane_command"),
-        release_lane=lambda: command("release_lane_command"),
-        capture=lambda: command("capture_command"),
-        unload=lambda state: command("unload_command", payload=state),
-        restore=lambda state: command("restore_command", payload=state),
-        verify_restored=lambda state: (
-            command("verify_command", payload=state).get("restored") is True
-        ),
+        acquire_lane=acquire_lane,
+        release_lane=release_lane,
+        capture=capture,
+        unload=unload,
+        restore=restore,
+        verify_restored=verify_restored,
     )
 
     def workload() -> dict[str, object]:
         return run_subprocess_campaign(
             probe_command=_command(spec["probe_command"], field="spec.probe_command"),
+            quality_command=_command(
+                spec["quality_command"], field="spec.quality_command"
+            ),
+            artifact_verify_command=_command(
+                spec["artifact_verify_command"],
+                field="spec.artifact_verify_command",
+            ),
             arm_command_template=_command(
                 spec["arm_command_template"], field="spec.arm_command_template"
             ),
@@ -405,9 +789,25 @@ def run_spec(
             cwd=cwd,
             bootstrap_resamples=int(spec["bootstrap_resamples"]),
             bootstrap_seed=int(spec["bootstrap_seed"]),
+            subprocess_timeout_seconds=workload_timeout_seconds,
+            subprocess_termination_grace_seconds=termination_grace_seconds,
         )
 
-    return run_exclusive_hardware_window(workload, hooks=hooks)
+    result = dict(run_exclusive_hardware_window(workload, hooks=hooks))
+    required_evidence = {
+        "schema",
+        "acquire",
+        "capture",
+        "recovery_journal",
+        "unload",
+        "restore",
+        "verify",
+        "release",
+    }
+    if set(qwen_evidence) != required_evidence:
+        raise BenchmarkGateError("Qwen isolation evidence is incomplete")
+    result["qwen_isolation"] = qwen_evidence
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -430,12 +830,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     spec_path = args.spec.expanduser().resolve()
     repo_root = args.cwd.expanduser().resolve()
     if args.plan_only:
-        spec = _load_spec(spec_path)
-        _require_campaign_command_shapes(spec)
+        if args.output_json is not None:
+            raise BenchmarkGateError("--output-json cannot be used with --plan-only")
+        _require_tracked_file(repo_root, spec_path, description="campaign spec")
+        source_commit = _source_commit(repo_root)
+        spec, _frozen_spec_bytes, spec_sha256 = _load_frozen_spec(
+            spec_path,
+            repo_root=repo_root,
+        )
+        _require_campaign_sources(spec, repo_root=repo_root)
+        hooks_config_path = _hardware_hooks_config_path(spec, repo_root=repo_root)
+        _hooks_path, _hooks_bytes, hooks_config_sha256 = _load_frozen_tracked_file(
+            repo_root,
+            hooks_config_path,
+            description="hardware hooks config",
+        )
         result = _plan(spec)
+        result["campaign_spec_sha256"] = spec_sha256
+        result["hardware_hooks_config_sha256"] = hooks_config_sha256
+        result["source_git_commit"] = source_commit
+        exit_code = 0
     else:
         if args.output_json is None:
             raise BenchmarkGateError("--output-json is required unless --plan-only")
+        output_path = args.output_json.expanduser().resolve()
+        _invalidate_output(output_path)
         _require_tracked_file(
             repo_root,
             spec_path,
@@ -447,6 +866,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=repo_root,
         )
         _require_campaign_sources(spec, repo_root=repo_root)
+        hooks_config_path = _hardware_hooks_config_path(spec, repo_root=repo_root)
+        (
+            hooks_config_path,
+            frozen_hooks_config_bytes,
+            hooks_config_sha256,
+        ) = _load_frozen_tracked_file(
+            repo_root,
+            hooks_config_path,
+            description="hardware hooks config",
+        )
         result = dict(run_spec(spec, cwd=repo_root))
         post_commit = _require_clean_source(repo_root)
         _require_tracked_file(
@@ -455,6 +884,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             description="campaign spec",
         )
         _require_campaign_sources(spec, repo_root=repo_root)
+        post_hooks_path, post_hooks_bytes, _post_hooks_sha256 = (
+            _load_frozen_tracked_file(
+                repo_root,
+                _hardware_hooks_config_path(spec, repo_root=repo_root),
+                description="hardware hooks config",
+            )
+        )
         if post_commit != source_commit:
             raise BenchmarkGateError("source Git commit changed during the campaign")
         if (
@@ -462,11 +898,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             or _head_file_bytes(repo_root, spec_path) != frozen_spec_bytes
         ):
             raise BenchmarkGateError("campaign spec changed during the campaign")
+        if (
+            post_hooks_path != hooks_config_path
+            or post_hooks_bytes != frozen_hooks_config_bytes
+        ):
+            raise BenchmarkGateError(
+                "hardware hooks config changed during the campaign"
+            )
         result["campaign_spec_sha256"] = spec_sha256
+        result["hardware_hooks_config_sha256"] = hooks_config_sha256
         result["source_git_commit"] = source_commit
-        _atomic_write_json(args.output_json.expanduser().resolve(), result)
+        _atomic_write_json(output_path, result)
+        exit_code = 2 if _campaign_rejected(result) else 0
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -16,7 +16,11 @@ from mtplx.expert_streaming import RoutingPhase
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec
 from mtplx.generation import generate_ar, generate_mtp1
 from mtplx.hy3_mtp_patch import Hy3MTPLoadError, inject_hy3_streamed_mtp_support
-from mtplx.expert_manifest import build_expert_manifest, save_expert_manifest
+from mtplx.expert_manifest import (
+    build_expert_manifest,
+    load_expert_manifest,
+    save_expert_manifest,
+)
 from mtplx.models.expert_mlx import (
     current_expert_routing_phase,
     make_mlx_slot_buffer_allocator,
@@ -155,6 +159,44 @@ def _open_streamed_runtime(root, spec, manifest_path):
         device_synchronize=mx.synchronize,
         apply_memory_cap=False,
     )
+
+
+def test_streaming_runtime_reuses_a_preloaded_manifest_without_path_reread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mtplx.expert_runtime as expert_runtime_module
+
+    root, _config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
+    manifest = load_expert_manifest(manifest_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "load_expert_manifest",
+        lambda *_args, **_kwargs: pytest.fail("preloaded manifest must not be reread"),
+    )
+
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    try:
+        assert runtime.manifest is manifest
+    finally:
+        runtime.close()
 
 
 def _mtplx_runtime(model, streaming, *, mtp_enabled: bool) -> MTPLXRuntime:
@@ -299,9 +341,7 @@ def test_rejected_drafts_fall_back_to_target_tokens_exactly(tmp_path: Path) -> N
         ar = generate_ar(rt_ar, prompt, max_tokens=8, sampler=sampler, seed=0)
         model = rt_mtp.model
         vocab = 128
-        wrong = next(
-            token for token in range(vocab) if token not in set(ar.tokens)
-        )
+        wrong = next(token for token in range(vocab) if token not in set(ar.tokens))
         one_hot = (mx.arange(vocab) == wrong).astype(mx.float32)
         original_forward = model.mtp_forward
 
@@ -422,8 +462,12 @@ def test_return_hidden_defaults_to_post_norm_for_the_nextn_head(tmp_path: Path) 
 
         post_ref, pre_ref = model.model(prompt, return_pre_norm=True)
         _logits, hidden_default = model(prompt, return_hidden=True)
-        _logits2, hidden_pre = model(prompt, return_hidden=True, hidden_variant="pre_norm")
-        _logits3, hidden_post = model(prompt, return_hidden=True, hidden_variant="post_norm")
+        _logits2, hidden_pre = model(
+            prompt, return_hidden=True, hidden_variant="pre_norm"
+        )
+        _logits3, hidden_post = model(
+            prompt, return_hidden=True, hidden_variant="post_norm"
+        )
         mx.eval(post_ref, pre_ref, hidden_default, hidden_pre, hidden_post)
 
         assert mx.array_equal(hidden_default, post_ref).item()

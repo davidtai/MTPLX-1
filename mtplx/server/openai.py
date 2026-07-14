@@ -37,6 +37,7 @@ from contextlib import asynccontextmanager, contextmanager, nullcontext, suppres
 from contextvars import copy_context
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
+from functools import wraps
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Condition, Event, Lock, Thread, Timer
@@ -172,6 +173,7 @@ def _safe_stdout_print(*values: Any, **kwargs: Any) -> bool:
         return False
     except Exception:
         return False
+
 
 try:
     from mtplx.generation import (
@@ -534,7 +536,10 @@ def _server_runtime_env_overrides(
         .lower()
         .replace("-", "_")
     )
-    if generation_mode == "mtp" and verify_strategy in VERIFY_SNAPSHOT_REQUIRED_STRATEGIES:
+    if (
+        generation_mode == "mtp"
+        and verify_strategy in VERIFY_SNAPSHOT_REQUIRED_STRATEGIES
+    ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
     if bool(getattr(args, "hy3_q4_dynamic_context", False)):
         overrides.update(HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV)
@@ -1231,7 +1236,14 @@ class _StartupHeartbeat:
             "    print(f'      {label}... {elapsed:.0f}s elapsed', flush=True)\n"
         )
         self.proc = subprocess.Popen(
-            [sys.executable, "-c", script, label, str(float(interval_s)), str(os.getpid())],
+            [
+                sys.executable,
+                "-c",
+                script,
+                label,
+                str(float(interval_s)),
+                str(os.getpid()),
+            ],
             stdout=None,
             stderr=subprocess.DEVNULL,
             close_fds=True,
@@ -1427,7 +1439,44 @@ def _apply_metal_memory_caps(
     return applied
 
 
+def _cleanup_failed_server_state_initialization(
+    initializer: Callable[..., None],
+) -> Callable[..., None]:
+    """Close model ownership if any part of startup rejects after loading."""
+
+    @wraps(initializer)
+    def guarded(self: Any, *args: Any, **kwargs: Any) -> None:
+        try:
+            initializer(self, *args, **kwargs)
+        except BaseException:
+            runtime = getattr(self, "runtime", None)
+            close_runtime = getattr(runtime, "close", None)
+            if callable(close_runtime):
+                try:
+                    close_runtime(timeout=10.0)
+                except BaseException as cleanup_error:
+                    LOGGER.error(
+                        "failed to close runtime after rejected startup: %s: %s",
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
+            scheduler = getattr(self, "model_scheduler", None)
+            if scheduler is not None:
+                try:
+                    scheduler.shutdown(wait=False, cancel_futures=True)
+                except BaseException as cleanup_error:
+                    LOGGER.error(
+                        "failed to stop scheduler after rejected startup: %s: %s",
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
+            raise
+
+    return guarded
+
+
 class ServerState:
+    @_cleanup_failed_server_state_initialization
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         validate_hy3_q4_dynamic_memory_request_options(args)
@@ -1440,12 +1489,12 @@ class ServerState:
             args,
             self.expert_streaming_load_kwargs.get("expert_streaming_config"),
         )
-        if self.expert_streaming_load_kwargs:
+        if self.expert_streaming_load_kwargs and not bool(
+            getattr(args, "hy3_q4_dynamic_context", False)
+        ):
             args.load_mtp = False
             args.generation_mode = "ar"
-            stream_config = self.expert_streaming_load_kwargs[
-                "expert_streaming_config"
-            ]
+            stream_config = self.expert_streaming_load_kwargs["expert_streaming_config"]
             from mtplx.expert_runtime import reconcile_mlx_memory_cap
             from mtplx.expert_streaming_models import get_model_spec
 
@@ -1611,14 +1660,14 @@ class ServerState:
         else:
             self.draft_lm_head = {"installed": False, "reason": "mtp_disabled"}
         if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
-            self.draft_head_identity = (
-                self.model_scheduler.submit_foreground(
-                    _draft_head_identity,
-                    self.runtime,
-                    batch_key="startup.draft_head_identity",
-                ).result()
-            )
-        elif self.backend_descriptor.uses_external_assistant and self.runtime.mtp_enabled:
+            self.draft_head_identity = self.model_scheduler.submit_foreground(
+                _draft_head_identity,
+                self.runtime,
+                batch_key="startup.draft_head_identity",
+            ).result()
+        elif (
+            self.backend_descriptor.uses_external_assistant and self.runtime.mtp_enabled
+        ):
             runtime_config = getattr(self.runtime, "config", None)
             assistant_path = getattr(runtime_config, "assistant_model_path", None)
             draft_block_size = getattr(runtime_config, "draft_block_size", None)
@@ -1642,7 +1691,9 @@ class ServerState:
             self.chat_template_profile = _CHAT_TEMPLATE_PROFILE_CUSTOM
         _startup_line(
             "[5/6] Chat template profile: "
-            + str(self.chat_template_report.get("profile") or self.chat_template_profile)
+            + str(
+                self.chat_template_report.get("profile") or self.chat_template_profile
+            )
         )
         self.template_hash = (
             self.model_scheduler.submit_foreground(
@@ -1675,7 +1726,9 @@ class ServerState:
         )
         requested_context_window = int(getattr(args, "context_window", None) or 0)
         self.context_window = (
-            max(4_096, min(int(self.model_context_window_max), requested_context_window))
+            max(
+                4_096, min(int(self.model_context_window_max), requested_context_window)
+            )
             if requested_context_window > 0
             else int(self.model_context_window_max)
         )
@@ -1711,9 +1764,7 @@ class ServerState:
         self.args.fan_mode = self.fan_mode
         from mtplx.thermal import SmartFanController
 
-        self.smart_fans = SmartFanController(
-            log=lambda line: LOGGER.info("%s", line)
-        )
+        self.smart_fans = SmartFanController(log=lambda line: LOGGER.info("%s", line))
         # Dashboard primitives: pub/sub bus, in-flight registry, 5-min rolling
         # TPS window, lifetime counters, prefill history. Created before
         # warmup so the optional warmup metrics can flow through the same
@@ -2228,8 +2279,9 @@ class _BatchedARGenerationService:
         self, jobs: list[_BatchedARJob]
     ) -> tuple[list[_BatchedARJob], list[_BatchedARJob]]:
         for job in jobs:
-            if job.insert_cache is not None and not self._cache_supports_batch_history_merge(
-                job.insert_cache
+            if (
+                job.insert_cache is not None
+                and not self._cache_supports_batch_history_merge(job.insert_cache)
             ):
                 job.insert_cache = None
                 job.insert_all_tokens = []
@@ -2309,7 +2361,11 @@ class _BatchedARGenerationService:
         job.completed_s = completed
         elapsed_s = max(0.0, completed - job.created_s)
         prompt_eval_time_s = (
-            max(0.0, (job.prefill_done_s or completed) - (job.prefill_started_s or job.created_s))
+            max(
+                0.0,
+                (job.prefill_done_s or completed)
+                - (job.prefill_started_s or job.created_s),
+            )
             if job.prefill_started_s is not None
             else 0.0
         )
@@ -2340,7 +2396,8 @@ class _BatchedARGenerationService:
             ),
             "prompt_target_prefill_time_s": float(prompt_eval_time_s),
             "prompt_target_prefill_tok_s": (
-                max(0, len(job.prompt_ids) - int(job.cached_tokens)) / prompt_eval_time_s
+                max(0, len(job.prompt_ids) - int(job.cached_tokens))
+                / prompt_eval_time_s
                 if prompt_eval_time_s > 0 and job.prompt_ids
                 else 0.0
             ),
@@ -2380,9 +2437,7 @@ class _BatchedARGenerationService:
             "ar_batch_max_observed": int(job.max_batch_size_observed),
             "active_batch_size": int(job.max_batch_size_observed),
             "mtp_disabled_reason": job.mtp_disabled_reason,
-            "queue_wait_s": max(
-                0.0, (job.admitted_s or job.created_s) - job.created_s
-            ),
+            "queue_wait_s": max(0.0, (job.admitted_s or job.created_s) - job.created_s),
             "request_started_s": float(job.created_s),
             "server_seed": int(job.seed),
         }
@@ -2404,9 +2459,7 @@ class _BatchedARGenerationService:
                 ),
                 "session_restore_mode": job.effective_restore_mode,
                 "ar_batch_shared_prefix_tokens": int(job.shared_prefix_tokens),
-                "ar_batch_shared_prefix_prefill_s": float(
-                    job.shared_prefix_prefill_s
-                ),
+                "ar_batch_shared_prefix_prefill_s": float(job.shared_prefix_prefill_s),
                 "ar_batch_shared_prefix_snapshot_s": float(
                     job.shared_prefix_snapshot_s
                 ),
@@ -2654,7 +2707,9 @@ def validate_server_security_args(args: argparse.Namespace) -> None:
     if not _is_localhost_bind(getattr(args, "host", None)) and not getattr(
         args, "api_key", None
     ):
-        raise SystemExit("--api-key or --api-key-file is required when --host is not localhost")
+        raise SystemExit(
+            "--api-key or --api-key-file is required when --host is not localhost"
+        )
     if int(getattr(args, "stream_interval", 1)) < 1:
         raise SystemExit("--stream-interval must be >= 1")
     if int(getattr(args, "rate_limit", 0)) < 0:
@@ -2842,9 +2897,7 @@ def _vision_extract_and_flatten(
     for message in messages:
         is_mapping = isinstance(message, dict)
         content = (
-            message.get("content")
-            if is_mapping
-            else getattr(message, "content", None)
+            message.get("content") if is_mapping else getattr(message, "content", None)
         )
         if not isinstance(content, list):
             flattened.append(message)
@@ -2860,11 +2913,7 @@ def _vision_extract_and_flatten(
             item_type = str(item.get("type") or "")
             if item_type == "image_url" or "image_url" in item:
                 image_url = item.get("image_url")
-                url = (
-                    image_url.get("url")
-                    if isinstance(image_url, dict)
-                    else image_url
-                )
+                url = image_url.get("url") if isinstance(image_url, dict) else image_url
                 images.append(_image_bytes_from_url(str(url or "")))
                 parts.append(_VISION_PLACEHOLDER)
             elif item_type == "text" or "text" in item:
@@ -2887,9 +2936,7 @@ def _expand_image_pads(
     for token in prompt_ids:
         if token == image_pad_id:
             if image_index >= len(pad_counts):
-                raise ValueError(
-                    "prompt contains more image placeholders than images"
-                )
+                raise ValueError("prompt contains more image placeholders than images")
             expanded.extend([token] * pad_counts[image_index])
             image_index += 1
         else:
@@ -3755,9 +3802,7 @@ _MTPLX_TOOL_RESULT_CONTINUATION_TAG_RE = re.compile(
 _OPENAI_BRIDGE_POLICY_VERSION = (
     "omlx_style:preserve_history:parse_at_completion:tool_digest:v4"
 )
-_MTPLX_TOOL_CONTRACT_POLICY_VERSION = (
-    "soft_schema_contract:native_xml:targeted_reads:post_tool_continue:agent_tail:dated:v12"
-)
+_MTPLX_TOOL_CONTRACT_POLICY_VERSION = "soft_schema_contract:native_xml:targeted_reads:post_tool_continue:agent_tail:dated:v12"
 _MTPLX_NO_TOOL_CONTRACT_POLICY_VERSION = "no_tool_direct_reply:v1"
 _MTPLX_POST_TOOL_ANSWER_POLICY_VERSION = "post_tool_full_answer:dated:v2"
 _MTPLX_OPENCODE_AGENT_CONTRACT_PROFILE = "opencode_agent"
@@ -3805,7 +3850,9 @@ def _tool_protocol_error(message: str) -> HTTPException:
     return HTTPException(status_code=422, detail=f"malformed tool_call: {message}")
 
 
-def _normalize_tool_prompt_mode(value: Any, *, default: str = _TOOL_PROMPT_MODE_HYBRID) -> str:
+def _normalize_tool_prompt_mode(
+    value: Any, *, default: str = _TOOL_PROMPT_MODE_HYBRID
+) -> str:
     mode = str(value or default).strip().lower()
     if mode not in _TOOL_PROMPT_MODES:
         allowed = ", ".join(sorted(_TOOL_PROMPT_MODES))
@@ -4058,19 +4105,14 @@ def _initial_orphan_tool_control_state(text: str) -> str:
     stripped = text.lstrip()
     if not stripped:
         return "hold"
-    if (
-        _ORPHAN_TOOL_CONTROL_INITIAL_TAG_RE.match(stripped)
-        or _ORPHAN_TOOL_CONTROL_INITIAL_BARE_RE.match(stripped)
-    ):
+    if _ORPHAN_TOOL_CONTROL_INITIAL_TAG_RE.match(
+        stripped
+    ) or _ORPHAN_TOOL_CONTROL_INITIAL_BARE_RE.match(stripped):
         return "orphan"
     lowered = stripped.lower()
     partial_markers = [
-        f"</{name.lower()}>"
-        for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
-    ] + [
-        f"<{name.lower()}"
-        for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
-    ]
+        f"</{name.lower()}>" for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
+    ] + [f"<{name.lower()}" for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES]
     if lowered.startswith("<"):
         if any(marker.startswith(lowered) for marker in partial_markers):
             return "hold"
@@ -4451,12 +4493,7 @@ def _tool_example_value(schema: Any) -> str:
 
 def _tool_call_example(tools: list[dict[str, Any]]) -> str:
     if not tools:
-        return (
-            "<tool_call>\n"
-            "<function=tool_name>\n"
-            "</function>\n"
-            "</tool_call>"
-        )
+        return "<tool_call>\n<function=tool_name>\n</function>\n</tool_call>"
     tool = tools[0]
     name = _tool_spec_name(tool) or "tool_name"
     schema = _tool_json_schema(tool)
@@ -4713,7 +4750,9 @@ def _request_should_add_pi_convergence_contract(
 ) -> bool:
     if not tools_active:
         return False
-    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "").lower()
+    client_hint = str(
+        _request_client_hint_from_headers(headers, metadata) or ""
+    ).lower()
     if "pi" not in client_hint:
         return False
     limit = _pi_convergence_after_tools()
@@ -4949,9 +4988,7 @@ _READ_ONLY_FINAL_ANSWER_START_RE = re.compile(
 
 
 def _read_only_force_answer_after_stream_marker(content: str) -> tuple[str, int]:
-    match = _MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE.search(
-        str(content or "")
-    )
+    match = _MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE.search(str(content or ""))
     if match is None:
         return str(content or ""), 0
     return str(content or "")[match.end() :].lstrip(), match.end()
@@ -4981,11 +5018,14 @@ def _read_only_force_answer_visible_text(content: str) -> tuple[str, int]:
             marker_stripped_chars,
         )
     reasoning_text, content_text = omlx_extract_thinking(cleaned)
-    visible = "\n\n".join(
-        part.strip()
-        for part in (reasoning_text, content_text)
-        if part and part.strip()
-    ) or cleaned
+    visible = (
+        "\n\n".join(
+            part.strip()
+            for part in (reasoning_text, content_text)
+            if part and part.strip()
+        )
+        or cleaned
+    )
     visible = _strip_read_only_force_answer_visible_control_tags(visible)
     marker_match = re.search(r"(?im)^[ \t]*marker\s*=[^\n\r]+", visible)
     search_end = marker_match.start() if marker_match else len(visible)
@@ -5050,10 +5090,7 @@ def _with_mtplx_tool_contract(
         additions: list[str] = []
         if _MTPLX_TOOL_CONTRACT_SENTINEL not in content:
             additions.append(contract)
-        if (
-            tail_contract
-            and _MTPLX_CODING_AGENT_TAIL_SENTINEL not in content
-        ):
+        if tail_contract and _MTPLX_CODING_AGENT_TAIL_SENTINEL not in content:
             additions.append(tail_contract)
         if additions:
             first["content"] = (
@@ -5253,6 +5290,8 @@ def _mentions_active_read_only_phase(text: str) -> bool:
         if not _READ_ONLY_NEGATION_TAIL_RE.search(prefix):
             return True
     return False
+
+
 _NO_TOOL_USE_RE = re.compile(
     r"\b(?:do\s+not|don['’]?t|dont|never)\s+"
     r"(?:use|call|invoke)\s+(?:any\s+)?tools?\b"
@@ -5302,8 +5341,7 @@ def _request_disallows_file_mutation(messages: list[ChatMessage]) -> bool:
             # mode-switch reminders describe the phase they LEFT.
             return False
         return bool(
-            _NO_FILE_MUTATION_RE.search(text)
-            or _mentions_active_read_only_phase(text)
+            _NO_FILE_MUTATION_RE.search(text) or _mentions_active_read_only_phase(text)
         )
     return False
 
@@ -5370,10 +5408,9 @@ def _request_explicit_single_tool_then_answer(messages: list[ChatMessage]) -> bo
 def _request_should_force_answer_for_read_only_inspection(
     messages: list[ChatMessage],
 ) -> bool:
-    if (
-        _tool_result_message_count(messages) > 0
-        and _request_explicit_single_tool_then_answer(messages)
-    ):
+    if _tool_result_message_count(
+        messages
+    ) > 0 and _request_explicit_single_tool_then_answer(messages):
         return True
     if not _request_is_static_read_only_inspection(messages):
         return False
@@ -5461,8 +5498,7 @@ def _filter_tool_specs_for_request(
         hidden_tools.update(_MUTATING_FILE_TOOL_NAMES)
     if _request_is_narrow_read_only_tool_choreography(messages):
         requested_names = {
-            (_tool_spec_name(tool) or "").strip().lower()
-            for tool in tools
+            (_tool_spec_name(tool) or "").strip().lower() for tool in tools
         }
         if requested_names & _NARROW_READ_ONLY_TOOL_NAMES:
             hidden_tools.update(
@@ -5473,8 +5509,7 @@ def _filter_tool_specs_for_request(
             )
     elif _request_is_local_read_only_project_workflow(messages):
         requested_names = {
-            (_tool_spec_name(tool) or "").strip().lower()
-            for tool in tools
+            (_tool_spec_name(tool) or "").strip().lower() for tool in tools
         }
         if requested_names & _LOCAL_READ_ONLY_TOOL_NAMES:
             hidden_tools.update(
@@ -5495,8 +5530,7 @@ def _filter_tool_specs_for_request(
         # at least one safe-set tool to be present before enforcing the
         # lockdown.
         requested_names = {
-            (_tool_spec_name(tool) or "").strip().lower()
-            for tool in tools
+            (_tool_spec_name(tool) or "").strip().lower() for tool in tools
         }
         static_read_only_tool_names = _static_read_only_inspection_tool_names(messages)
         if requested_names & static_read_only_tool_names:
@@ -5755,9 +5789,8 @@ def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
             "value": "string",
         }
         normalized_tag = aliases.get(tag, tag)
-        if (
-            tag in placeholder_tags
-            and (not expected or normalized_tag in expected or tag == "value")
+        if tag in placeholder_tags and (
+            not expected or normalized_tag in expected or tag == "value"
         ):
             text = wrapper.group(2).strip()
     text = html.unescape(text)
@@ -6452,9 +6485,14 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         deltas = self.feed("")
         if self._done or self._fallback_reason:
             return deltas
-        if self._repair_unclosed_complete and self._started and self._name and (
-            self._stage == "after_function"
-            or (self._stage == "find_parameter" and bool(self._params))
+        if (
+            self._repair_unclosed_complete
+            and self._started
+            and self._name
+            and (
+                self._stage == "after_function"
+                or (self._stage == "find_parameter" and bool(self._params))
+            )
         ):
             return self._finish_call(deltas)
         if self._started:
@@ -7100,7 +7138,9 @@ def _collapse_repeated_simple_chitchat_text(text: str) -> str | None:
     if not compact or len(compact) > 160:
         return None
     for key, canonical in sorted(
-        _SIMPLE_CHITCHAT_COMPACT_CANONICAL.items(), key=lambda item: len(item[0]), reverse=True
+        _SIMPLE_CHITCHAT_COMPACT_CANONICAL.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
     ):
         if not key or len(compact) <= len(key) or len(compact) % len(key) != 0:
             continue
@@ -7153,13 +7193,11 @@ def _canonicalize_user_retry_pollution(
             if collapsed is not None:
                 candidate = _copy_chat_message(candidate, content=collapsed)
                 stats.collapsed_repeated_user_messages += 1
-                stats.collapsed_repeated_user_chars += max(0, len(text) - len(collapsed))
+                stats.collapsed_repeated_user_chars += max(
+                    0, len(text) - len(collapsed)
+                )
 
-        if (
-            role == "user"
-            and canonical
-            and str(canonical[-1].role).lower() == "user"
-        ):
+        if role == "user" and canonical and str(canonical[-1].role).lower() == "user":
             previous = canonical[-1]
             previous_text = _content_to_text(previous.content).strip()
             current_text = _content_to_text(candidate.content).strip()
@@ -7261,7 +7299,10 @@ def _replace_client_system_prompt(
         and _content_to_text(leading_system[0].content) == replacement
     ):
         return messages
-    updated = [ChatMessage(role="system", content=replacement), *messages[first_non_system:]]
+    updated = [
+        ChatMessage(role="system", content=replacement),
+        *messages[first_non_system:],
+    ]
     stats.replaced_client_system_messages += len(leading_system)
     stats.replaced_client_system_chars += sum(
         len(_content_to_text(message.content)) for message in leading_system
@@ -7288,10 +7329,15 @@ def _with_backend_chat_policy(
             return messages, False
         updated[0] = _copy_chat_message(
             first,
-            content=f"{content}\n\n{_MTPLX_STEP_LANGUAGE_POLICY}" if content else _MTPLX_STEP_LANGUAGE_POLICY,
+            content=f"{content}\n\n{_MTPLX_STEP_LANGUAGE_POLICY}"
+            if content
+            else _MTPLX_STEP_LANGUAGE_POLICY,
         )
         return updated, True
-    return [ChatMessage(role="system", content=_MTPLX_STEP_LANGUAGE_POLICY), *updated], True
+    return [
+        ChatMessage(role="system", content=_MTPLX_STEP_LANGUAGE_POLICY),
+        *updated,
+    ], True
 
 
 def _message_declares_aborted_assistant_turn(message: ChatMessage) -> bool:
@@ -7385,6 +7431,8 @@ _ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS = 150
 _ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS = 4_000
 _ACTIVE_TOOL_RESULT_COMPACT_HEAD_LINES = 8
 _ACTIVE_TOOL_RESULT_COMPACT_TAIL_LINES = 4
+
+
 def _historical_read_budget() -> tuple[int, int]:
     """Fixed prefix-stable budget for HISTORICAL inspection-segment reads.
 
@@ -7439,6 +7487,8 @@ def _segment_inspection_flags(messages: list[ChatMessage]) -> list[bool]:
                 current = _is_read_only_inspection_request(text)
         flags.append(current)
     return flags
+
+
 _ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES = 48
 _ACTIVE_TOOL_RESULT_LINE_MAX_CHARS = 280
 _LINE_NUMBERED_CONTENT_RE = re.compile(r"^\s*(\d+):\s?(.*)$")
@@ -7682,9 +7732,7 @@ def _looks_like_verbatim_tool_output_assistant_dump(content: str) -> bool:
     if len(lines) < 24:
         return False
     sampled = lines[: min(96, len(lines))]
-    numbered_count = sum(
-        1 for line in sampled if _LINE_NUMBERED_CONTENT_RE.match(line)
-    )
+    numbered_count = sum(1 for line in sampled if _LINE_NUMBERED_CONTENT_RE.match(line))
     if numbered_count < 20:
         return False
     first_is_numbered = bool(_LINE_NUMBERED_CONTENT_RE.match(sampled[0]))
@@ -7698,7 +7746,10 @@ def _is_read_only_inspection_request(text: str) -> bool:
     recommendation_request = bool(
         _READ_ONLY_RECOMMENDATION_REQUEST_RE.search(normalized)
     )
-    if not _READ_ONLY_INSPECTION_REQUEST_RE.search(normalized) and not recommendation_request:
+    if (
+        not _READ_ONLY_INSPECTION_REQUEST_RE.search(normalized)
+        and not recommendation_request
+    ):
         return False
     if _MUTATING_REQUEST_RE.search(normalized):
         return recommendation_request or bool(
@@ -7831,11 +7882,15 @@ def _compact_tool_result_text(text: str) -> str | None:
         return None
     head_chars = max(
         0,
-        _env_int("MTPLX_TOOL_RESULT_COMPACT_HEAD_CHARS", _TOOL_RESULT_COMPACT_HEAD_CHARS),
+        _env_int(
+            "MTPLX_TOOL_RESULT_COMPACT_HEAD_CHARS", _TOOL_RESULT_COMPACT_HEAD_CHARS
+        ),
     )
     tail_chars = max(
         0,
-        _env_int("MTPLX_TOOL_RESULT_COMPACT_TAIL_CHARS", _TOOL_RESULT_COMPACT_TAIL_CHARS),
+        _env_int(
+            "MTPLX_TOOL_RESULT_COMPACT_TAIL_CHARS", _TOOL_RESULT_COMPACT_TAIL_CHARS
+        ),
     )
     head = text[:head_chars].rstrip() if head_chars else ""
     tail = text[-tail_chars:].lstrip() if tail_chars else ""
@@ -7895,7 +7950,7 @@ def _render_next_read_hints(
         return ""
     safe_path = html.escape(path)
     lines = ["<next_read_hints>"]
-    for start, end in ranges[:max(1, max_hints)]:
+    for start, end in ranges[: max(1, max_hints)]:
         limit = max(1, end - start + 1)
         lines.append(
             f'<range start="{start}" end="{end}" limit="{limit}">'
@@ -7960,7 +8015,9 @@ def _compressed_int_ranges(values: Iterable[int], *, max_ranges: int = 4) -> str
     return ",".join(parts)
 
 
-def _cluster_source_lines(lines: Iterable[int], *, max_gap: int = 80) -> list[list[int]]:
+def _cluster_source_lines(
+    lines: Iterable[int], *, max_gap: int = 80
+) -> list[list[int]]:
     clusters: list[list[int]] = []
     for line_no in sorted({int(line) for line in lines if int(line) > 0}):
         if not clusters or line_no > clusters[-1][-1] + max_gap:
@@ -8257,7 +8314,9 @@ def _read_tool_content_meta(text: str) -> _ReadToolContentMeta | None:
     )
 
 
-def _inspection_read_budget_for_count(candidate_count: int) -> tuple[int | None, int | None]:
+def _inspection_read_budget_for_count(
+    candidate_count: int,
+) -> tuple[int | None, int | None]:
     if candidate_count <= 1:
         return None, None
     total_lines = max(
@@ -8429,7 +8488,9 @@ def _compact_active_read_tool_result_text(
             ),
         )
         if inspection_line_max_chars is not None:
-            line_max_chars = min(line_max_chars, max(120, int(inspection_line_max_chars)))
+            line_max_chars = min(
+                line_max_chars, max(120, int(inspection_line_max_chars))
+            )
     else:
         head_lines = max(
             0,
@@ -8534,9 +8595,7 @@ def _compact_active_read_tool_result_text(
         else _ACTIVE_READ_PRIORITY_ANCHOR_RE
     )
     priority_anchor_lines = [
-        line_no
-        for line_no, line in numbered
-        if priority_anchor_re.search(line)
+        line_no for line_no, line in numbered if priority_anchor_re.search(line)
     ]
     generic_anchor_lines = [
         line_no for line_no, line in numbered if _ACTIVE_READ_ANCHOR_RE.search(line)
@@ -8557,12 +8616,16 @@ def _compact_active_read_tool_result_text(
     previous: int | None = None
     for line_no in kept:
         if previous is not None and line_no > previous + 1:
-            excerpt.append(f"... [MTPLX omitted lines {previous + 1}-{line_no - 1}] ...")
+            excerpt.append(
+                f"... [MTPLX omitted lines {previous + 1}-{line_no - 1}] ..."
+            )
         line = _compact_tool_excerpt_line(line_by_no[line_no], line_max_chars)
         excerpt.append(f"{line_no}: {line}")
         previous = line_no
     if previous is not None and previous < numbered[-1][0]:
-        excerpt.append(f"... [MTPLX omitted lines {previous + 1}-{numbered[-1][0]}] ...")
+        excerpt.append(
+            f"... [MTPLX omitted lines {previous + 1}-{numbered[-1][0]}] ..."
+        )
 
     omitted_lines = max(0, len(numbered) - len(kept))
     if inspection_request:
@@ -8673,7 +8736,9 @@ def _assistant_reasoning_history_stats(
                 chars += len(thinking)
                 structured_blocks += 1
     elif isinstance(content, str):
-        chars += sum(len(match.group(0)) for match in _REASONING_TAG_RE.finditer(content))
+        chars += sum(
+            len(match.group(0)) for match in _REASONING_TAG_RE.finditer(content)
+        )
     return (1 if chars > 0 else 0), chars, structured_blocks
 
 
@@ -8789,7 +8854,9 @@ def _canonicalize_agent_transcript(
                 if not message.tool_calls:
                     if _looks_like_verbatim_tool_output_assistant_dump(content):
                         stats.skipped_verbatim_tool_output_assistant_messages += 1
-                        stats.skipped_verbatim_tool_output_assistant_chars += len(content)
+                        stats.skipped_verbatim_tool_output_assistant_chars += len(
+                            content
+                        )
                         continue
                     if _looks_like_repeated_agent_preamble(content):
                         stats.skipped_repeated_assistant_messages += 1
@@ -8865,11 +8932,13 @@ def _canonicalize_agent_transcript(
                             int(len(read_meta.line_numbers) * 0.08),
                         )
                         if prior_lines and len(new_lines) <= duplicate_threshold:
-                            compacted = _compact_repeated_inspection_read_tool_result_text(
-                                read_text,
-                                meta=read_meta,
-                                prior_covered_lines=len(prior_lines),
-                                new_lines=len(new_lines),
+                            compacted = (
+                                _compact_repeated_inspection_read_tool_result_text(
+                                    read_text,
+                                    meta=read_meta,
+                                    prior_covered_lines=len(prior_lines),
+                                    new_lines=len(new_lines),
+                                )
                             )
                             prior_lines.update(read_meta.line_numbers)
                             canonical.append(
@@ -8881,7 +8950,9 @@ def _canonicalize_agent_transcript(
                             stats.compacted_active_read_inspection_messages += 1
                             stats.compacted_active_read_inspection_chars += saved_chars
                             stats.compacted_repeated_read_inspection_messages += 1
-                            stats.compacted_repeated_read_inspection_chars += saved_chars
+                            stats.compacted_repeated_read_inspection_chars += (
+                                saved_chars
+                            )
                             continue
                         prior_lines.update(read_meta.line_numbers)
                     historical_max_lines, historical_line_chars = (
@@ -8924,11 +8995,13 @@ def _canonicalize_agent_transcript(
                             int(len(read_meta.line_numbers) * 0.08),
                         )
                         if prior_lines and len(new_lines) <= duplicate_threshold:
-                            compacted = _compact_repeated_inspection_read_tool_result_text(
-                                read_text,
-                                meta=read_meta,
-                                prior_covered_lines=len(prior_lines),
-                                new_lines=len(new_lines),
+                            compacted = (
+                                _compact_repeated_inspection_read_tool_result_text(
+                                    read_text,
+                                    meta=read_meta,
+                                    prior_covered_lines=len(prior_lines),
+                                    new_lines=len(new_lines),
+                                )
                             )
                             prior_lines.update(read_meta.line_numbers)
                             canonical.append(
@@ -8940,7 +9013,9 @@ def _canonicalize_agent_transcript(
                             stats.compacted_active_read_inspection_messages += 1
                             stats.compacted_active_read_inspection_chars += saved_chars
                             stats.compacted_repeated_read_inspection_messages += 1
-                            stats.compacted_repeated_read_inspection_chars += saved_chars
+                            stats.compacted_repeated_read_inspection_chars += (
+                                saved_chars
+                            )
                             continue
                         prior_lines.update(read_meta.line_numbers)
                     inspection_max_lines, inspection_line_max_chars = (
@@ -9008,7 +9083,9 @@ def _canonicalize_agent_transcript(
                 if compacted is not None:
                     canonical.append(_copy_chat_message(message, content=compacted))
                     stats.compacted_active_tool_result_messages += 1
-                    stats.compacted_active_tool_result_chars += len(text) - len(compacted)
+                    stats.compacted_active_tool_result_chars += len(text) - len(
+                        compacted
+                    )
                     stats.compacted_active_tool_result_read_hints += (
                         _active_tool_result_read_hint_count(compacted)
                     )
@@ -9113,9 +9190,7 @@ _QWEN_IM_END = "<|im_end|>"
 _DISABLED_THINK_GENERATION_PROMPT_RE = re.compile(
     r"(?is)(<\|im_start\|>assistant[^\n\r]*[\r\n]+)<think>\s*$"
 )
-_DISABLED_THINK_GENERATION_PROMPT_REPLACEMENT = (
-    r"\1<think>\n\n</think>\n\n"
-)
+_DISABLED_THINK_GENERATION_PROMPT_REPLACEMENT = r"\1<think>\n\n</think>\n\n"
 
 
 def _render_messages_with_chat_template(
@@ -10002,6 +10077,11 @@ def _request_generation_mode_for_generation(
         _request_generation_mode_value(request) if allow_client_controls else None,
         default=default,
     )
+    if _hy3_q4_dynamic_context_enabled(state) and mode != "ar":
+        raise HTTPException(
+            status_code=400,
+            detail="hy3_q4_dynamic_context requires generation_mode 'ar'",
+        )
     if mode == "mtp" and not bool(getattr(state.runtime, "mtp_enabled", False)):
         raise HTTPException(
             status_code=400,
@@ -10198,7 +10278,9 @@ def _request_depth_for_generation(
     try:
         depth = int(value)
     except (TypeError, ValueError) as exc:
-        detail = f"{descriptor.draft_semantics.display_label.lower()} must be an integer"
+        detail = (
+            f"{descriptor.draft_semantics.display_label.lower()} must be an integer"
+        )
         raise HTTPException(status_code=400, detail=detail) from exc
     minimum = descriptor.draft_semantics.minimum
     maximum = descriptor.draft_semantics.maximum
@@ -10335,11 +10417,7 @@ MAINTENANCE_TIMING_STATS_KEYS = (
 
 
 def _maintenance_timing_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: stats[key]
-        for key in MAINTENANCE_TIMING_STATS_KEYS
-        if key in stats
-    }
+    return {key: stats[key] for key in MAINTENANCE_TIMING_STATS_KEYS if key in stats}
 
 
 def _metrics_envelope(
@@ -10386,7 +10464,9 @@ def _metrics_envelope(
         "prompt_tokens": int(prompt_tokens),
         "cached_tokens": cached_tokens,
         "new_prefill_tokens": max(0, new_prefill_tokens),
-        "cache_source": str(stats.get("cache_source") or ("ram" if session_cache_hit else "none")),
+        "cache_source": str(
+            stats.get("cache_source") or ("ram" if session_cache_hit else "none")
+        ),
         "ssd_cache_hit": bool(stats.get("ssd_cache_hit") or False),
         "ssd_cached_tokens": int(stats.get("ssd_cached_tokens") or 0),
         "ssd_restore_s": float(stats.get("ssd_restore_s") or 0.0),
@@ -10449,9 +10529,7 @@ def _metrics_envelope(
             stats.get("target_distribution_share") or 0.0
         ),
         "lazy_bonus_verify_calls": int(stats.get("lazy_bonus_verify_calls") or 0),
-        "lazy_bonus_commit_time_s": float(
-            stats.get("lazy_bonus_commit_time_s") or 0.0
-        ),
+        "lazy_bonus_commit_time_s": float(stats.get("lazy_bonus_commit_time_s") or 0.0),
         "verify_eval_unattributed_time_s": float(
             stats.get("verify_eval_unattributed_time_s") or 0.0
         ),
@@ -10460,12 +10538,8 @@ def _metrics_envelope(
         "accept_time_s": float(stats.get("accept_time_s") or 0.0),
         "repair_time_s": float(stats.get("repair_time_s") or 0.0),
         "mtp_history_policy": str(stats.get("mtp_history_policy") or ""),
-        "mtp_history_window_tokens": int(
-            stats.get("mtp_history_window_tokens") or 0
-        ),
-        "mtp_history_position_base": int(
-            stats.get("mtp_history_position_base") or 0
-        ),
+        "mtp_history_window_tokens": int(stats.get("mtp_history_window_tokens") or 0),
+        "mtp_history_position_base": int(stats.get("mtp_history_position_base") or 0),
         **_maintenance_timing_stats(stats),
         "session_cache_hit": bool(session_cache_hit),
         "cache_miss_reason": cache_miss_reason,
@@ -10482,9 +10556,7 @@ def _metrics_envelope(
         "repetition_stop_trimmed_tokens": int(
             stats.get("repetition_stop_trimmed_tokens") or 0
         ),
-        "repetition_stop_raw_tokens": int(
-            stats.get("repetition_stop_raw_tokens") or 0
-        ),
+        "repetition_stop_raw_tokens": int(stats.get("repetition_stop_raw_tokens") or 0),
         "loop_guard": dict(stats.get("loop_guard") or {}),
         "lock_wait_time_s": lock_wait_time_s,
         "session_id": session_id,
@@ -10545,23 +10617,29 @@ def _machine_info() -> dict[str, Any]:
     model: str | None = None
     mem_bytes: int | None = None
     try:
-        chip = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=1.0,
-        ).stdout.strip() or None
+        chip = (
+            subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=1.0,
+            ).stdout.strip()
+            or None
+        )
     except Exception:
         pass
     try:
-        model = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "hw.model"],
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=1.0,
-        ).stdout.strip() or None
+        model = (
+            subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "hw.model"],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=1.0,
+            ).stdout.strip()
+            or None
+        )
     except Exception:
         pass
     try:
@@ -10912,12 +10990,8 @@ def _dashboard_publish_progress(
             bus_publish_time_s=bus_publish_time_s,
         )
         enriched["dashboard_progress_decision_time_s"] = decision_time_s
-        enriched["dashboard_progress_registry_update_time_s"] = (
-            registry_update_time_s
-        )
-        enriched["dashboard_progress_rolling_update_time_s"] = (
-            rolling_update_time_s
-        )
+        enriched["dashboard_progress_registry_update_time_s"] = registry_update_time_s
+        enriched["dashboard_progress_rolling_update_time_s"] = rolling_update_time_s
         enriched["dashboard_progress_bus_publish_time_s"] = bus_publish_time_s
         return enriched
     except Exception as exc:
@@ -11226,11 +11300,14 @@ def _smart_fan_status(state: Any) -> dict[str, Any]:
         }
 
 
-def _thermal_health_payload(*, fan_mode: str, smart_status: dict[str, Any] | None = None) -> dict[str, Any]:
+def _thermal_health_payload(
+    *, fan_mode: str, smart_status: dict[str, Any] | None = None
+) -> dict[str, Any]:
     max_verified = _json_env("MTPLX_MAX_VERIFIED_JSON")
     fan_summary = (
         max_verified.get("after")
-        if isinstance(max_verified, dict) and isinstance(max_verified.get("after"), dict)
+        if isinstance(max_verified, dict)
+        and isinstance(max_verified.get("after"), dict)
         else None
     )
     actual_ramp_verified = os.environ.get("MTPLX_MAX_ACTUAL_RAMP_VERIFIED") == "1"
@@ -11242,7 +11319,8 @@ def _thermal_health_payload(*, fan_mode: str, smart_status: dict[str, Any] | Non
         "max_requested": fan_mode == FAN_MODE_MAX
         or smart_boost_active
         or os.environ.get("MTPLX_MAX_REQUESTED") == "1",
-        "max_verified": fan_mode == FAN_MODE_MAX and bool(max_verified is None or max_verified.get("ok", True)),
+        "max_verified": fan_mode == FAN_MODE_MAX
+        and bool(max_verified is None or max_verified.get("ok", True)),
         "actual_ramp_verified": actual_ramp_verified,
         "smart": smart,
         "fan_summary": fan_summary,
@@ -11396,7 +11474,9 @@ def _mtplx_apply_settings_payload(
             if (
                 key == "generation_mode"
                 and value == "mtp"
-                and not bool(getattr(getattr(state, "runtime", None), "mtp_enabled", False))
+                and not bool(
+                    getattr(getattr(state, "runtime", None), "mtp_enabled", False)
+                )
             ):
                 raise HTTPException(
                     status_code=400,
@@ -11507,7 +11587,9 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
 
     args = state.args
     backend = _backend_descriptor(state)
-    model_ref = str(getattr(args, "model", None) or getattr(state, "model_id", None) or "")
+    model_ref = str(
+        getattr(args, "model", None) or getattr(state, "model_id", None) or ""
+    )
     model_context_window_max = getattr(state, "model_context_window_max", None)
     model_controls = model_controls_for_descriptor(
         backend,
@@ -11634,8 +11716,7 @@ def _scheduler_config_from_args(args: Any) -> BatchSchedulerConfig:
 
 def _scheduler_policy_label(config: BatchSchedulerConfig) -> str:
     if (
-        config.mode
-        in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
+        config.mode in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
         and config.preset == SchedulerPreset.AGENT
     ):
         return "open_code_fair"
@@ -11864,24 +11945,66 @@ def _dynamic_paged_kv_initial_new_token_budget(
     return min(requested, cap), cap
 
 
+def _dynamic_paged_kv_block_size_tokens() -> int:
+    raw = (os.environ.get("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE") or "16").strip()
+    try:
+        block_size = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("dynamic Q4 page size must be an integer") from exc
+    if block_size <= 0:
+        raise RuntimeError("dynamic Q4 page size must be positive")
+    return block_size
+
+
 def _dynamic_paged_kv_reservation(
     *,
     prompt_tokens: int,
     max_new_tokens: int,
     mtp_depth: int,
+    incremental_pages: bool = False,
 ) -> dict[str, Any]:
     requested_new = max(0, int(max_new_tokens))
-    reserved_new, cap = _dynamic_paged_kv_initial_new_token_budget(requested_new)
-    reserved_tokens = (
-        max(0, int(prompt_tokens)) + max(0, int(reserved_new)) + max(0, int(mtp_depth))
-    )
+    block_size_tokens = _dynamic_paged_kv_block_size_tokens()
+    if incremental_pages:
+        # Issue #46 keeps the request/context gate separate from live KV
+        # ownership. Start with one physical page; brokered AR preflight grows
+        # the cache immediately before each evaluated write, and the callback
+        # below advances logical ownership only after that write completes.
+        reserved_new = 0
+        cap = None
+        initial_physical_tokens = block_size_tokens
+        startup_reserved_logical_tokens = 1
+        reserved_tokens = block_size_tokens
+        logical_ownership_scope = "evaluated_tokens"
+        reservation_capped = False
+        reservation_policy = "incremental_pages"
+    else:
+        reserved_new, cap = _dynamic_paged_kv_initial_new_token_budget(requested_new)
+        startup_reserved_logical_tokens = max(0, int(prompt_tokens)) + max(
+            0, int(reserved_new)
+        )
+        reserved_tokens = startup_reserved_logical_tokens + max(0, int(mtp_depth))
+        initial_physical_tokens = reserved_tokens
+        logical_ownership_scope = "startup_reserved"
+        reservation_capped = bool(reserved_new < requested_new)
+        reservation_policy = "startup_runway"
     return {
         "env": {"MTPLX_DYNAMIC_PAGED_KV_TOKENS": str(reserved_tokens)},
         "requested_new_tokens": int(requested_new),
         "reserved_new_tokens": int(reserved_new),
         "initial_new_token_cap": cap,
-        "reservation_capped": bool(reserved_new < requested_new),
+        "reservation_capped": reservation_capped,
+        "reservation_policy": reservation_policy,
+        "incremental_pages": bool(incremental_pages),
         "reserved_total_tokens": int(reserved_tokens),
+        "initial_physical_tokens": int(initial_physical_tokens),
+        # This is the logical ownership backed by the startup page allocation,
+        # not the full request limit.  The Hy3 context gate owns the latter;
+        # later physical growth remains broker-admitted from measured bytes.
+        "logical_ownership_scope": logical_ownership_scope,
+        "logical_ownership_growth": "post_physical_write",
+        "startup_reserved_logical_tokens": int(startup_reserved_logical_tokens),
+        "block_size_tokens": block_size_tokens,
     }
 
 
@@ -11952,9 +12075,7 @@ def _commit_prompt_prefix_for_request(
     tier = getattr(state, "session_bank_cold_tier", None)
     if tier is None or not bool(getattr(tier, "enabled", False)):
         return False
-    min_prefix_tokens = int(
-        getattr(tier, "min_prefix_tokens", 512) or 512
-    )
+    min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
     return len(prompt_ids) >= max(512, min_prefix_tokens)
 
 
@@ -12002,9 +12123,7 @@ def _tool_result_ids_from_messages(messages: list[ChatMessage]) -> set[str]:
         if str(message.role).lower() != "tool":
             continue
         tool_call_id = str(
-            message.tool_call_id
-            or _message_extra(message, "tool_call_id")
-            or ""
+            message.tool_call_id or _message_extra(message, "tool_call_id") or ""
         ).strip()
         if tool_call_id:
             ids.add(tool_call_id)
@@ -12100,19 +12219,14 @@ def _live_frontier_envelope_fields(
             if frontier_hit
             else _live_frontier_miss_reason_from_counts(
                 assistant_tool_call_count=int(
-                    request_observability.get(
-                        "live_frontier_assistant_tool_call_count"
-                    )
+                    request_observability.get("live_frontier_assistant_tool_call_count")
                     or 0
                 ),
                 tool_result_count=int(
-                    request_observability.get("live_frontier_tool_result_count")
-                    or 0
+                    request_observability.get("live_frontier_tool_result_count") or 0
                 ),
                 unknown_tool_result_count=int(
-                    request_observability.get(
-                        "live_frontier_unknown_tool_result_count"
-                    )
+                    request_observability.get("live_frontier_unknown_tool_result_count")
                     or 0
                 ),
                 cache_miss_reason=cache_miss_reason,
@@ -12920,10 +13034,7 @@ def _opencode_default_sampler_override(
     opencode_default_sampler = (
         (request_temperature is None or abs(float(request_temperature) - 0.55) < 1e-9)
         and (request_top_p is None or abs(float(request_top_p) - 1.0) < 1e-9)
-        and (
-            request_top_k is None
-            or int(request_top_k) == int(default_top_k)
-        )
+        and (request_top_k is None or int(request_top_k) == int(default_top_k))
     )
     if not tools_active and not simple_chitchat:
         return None
@@ -13189,9 +13300,7 @@ def _opencode_tool_history_restore_policy(
         tool_result_history_present=tool_result_history_present,
     )
     live_frontier_restore = (
-        eligible
-        and not cache_bypass
-        and _opencode_tool_history_live_frontier_enabled()
+        eligible and not cache_bypass and _opencode_tool_history_live_frontier_enabled()
     )
     return {
         "eligible": bool(eligible),
@@ -13365,9 +13474,7 @@ def _make_adaptive_policy(
             min_extra_accept_probability=float(
                 args.adaptive_ev_min_extra_accept_probability
             ),
-            warmup_full_depth_cycles=int(
-                args.adaptive_ev_warmup_full_depth_cycles
-            ),
+            warmup_full_depth_cycles=int(args.adaptive_ev_warmup_full_depth_cycles),
             exploration_interval=int(args.adaptive_ev_exploration_interval),
         )
     raise ValueError(f"unknown adaptive policy: {policy}")
@@ -14199,7 +14306,11 @@ HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS = frozenset(
         "enabled",
         "operating_target_bytes",
         "hard_ceiling_bytes",
+        "allocator_headroom_bytes",
+        "classified_target_bytes",
+        "classified_bytes",
         "charged_bytes",
+        "charged_residual_bytes",
         "resident_model_bytes",
         "kv_representation",
         "kv_logical_tokens",
@@ -14298,7 +14409,20 @@ def _hy3_q4_dynamic_memory_health(state: Any) -> dict[str, Any]:
     ] = {
         "operating_target_bytes": (general_sources, ("operating_target_bytes",)),
         "hard_ceiling_bytes": (general_sources, ("hard_ceiling_bytes",)),
+        "allocator_headroom_bytes": (
+            general_sources,
+            ("allocator_headroom_bytes",),
+        ),
+        "classified_target_bytes": (
+            general_sources,
+            ("classified_target_bytes",),
+        ),
+        "classified_bytes": (general_sources, ("classified_bytes",)),
         "charged_bytes": (general_sources, ("charged_bytes",)),
+        "charged_residual_bytes": (
+            general_sources,
+            ("charged_residual_bytes",),
+        ),
         "resident_model_bytes": (general_sources, ("resident_model_bytes",)),
         "kv_logical_tokens": (
             (kv, resource),
@@ -14451,9 +14575,7 @@ def _admit_hy3_q4_request_context(
         return None
     rendered_input_tokens = prompt_token_count
     remaining_context = max(0, int(state.context_window) - rendered_input_tokens)
-    requested_output_tokens = (
-        remaining_context if max_tokens is None else max_tokens
-    )
+    requested_output_tokens = remaining_context if max_tokens is None else max_tokens
     try:
         return admit_hy3_q4_context(
             rendered_input_tokens=rendered_input_tokens,
@@ -14525,7 +14647,9 @@ def _generation_params(
                 0 if hy3_q4_dynamic_context else 1,
                 min(semantic_effective_max, uncapped_response_lease_tokens),
             )
-            uncapped_response_lease_applied = decode_lease_tokens < semantic_effective_max
+            uncapped_response_lease_applied = (
+                decode_lease_tokens < semantic_effective_max
+            )
     sampler_temperature = (
         state.args.temperature if temperature is None else float(temperature)
     )
@@ -14570,9 +14694,7 @@ def _generation_params(
                 if uncapped_response_lease_tokens is None
                 else int(uncapped_response_lease_tokens)
             ),
-            "uncapped_response_lease_applied": bool(
-                uncapped_response_lease_applied
-            ),
+            "uncapped_response_lease_applied": bool(uncapped_response_lease_applied),
             "remaining_context_tokens": int(remaining_context),
             "server_cap_applied": bool(
                 server_max_response_tokens is not None
@@ -14640,7 +14762,10 @@ def _dashboard_in_flight_count(state: ServerState) -> int:
 
 def _ar_batch_mtp_fallback_reason(state: ServerState) -> str | None:
     config = _scheduler_config_from_args(state.args)
-    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+    if config.mode not in {
+        SchedulerMode.AR_BATCH,
+        SchedulerMode.MTP_COHORT_EXPERIMENTAL,
+    }:
         return None
     burst_reason = (
         "open_code_fair_burst"
@@ -14676,7 +14801,10 @@ def _use_live_ar_batch(
     if _hy3_q4_dynamic_context_enabled(state):
         return False, "hy3_q4_dynamic_context"
     config = _scheduler_config_from_args(state.args)
-    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+    if config.mode not in {
+        SchedulerMode.AR_BATCH,
+        SchedulerMode.MTP_COHORT_EXPERIMENTAL,
+    }:
         return False, None
     if effective_mode == "ar":
         return True, "generation_mode_ar"
@@ -14956,9 +15084,7 @@ def _finalize_batched_ar_generation(
     stats.update(envelope)
     stats.update(_generation_truth_stats(state, "ar"))
     stats["server_elapsed_s"] = elapsed_s
-    stats["server_tok_s"] = (
-        completion_tokens / elapsed_s if elapsed_s > 0 else 0.0
-    )
+    stats["server_tok_s"] = completion_tokens / elapsed_s if elapsed_s > 0 else 0.0
     state.last_metrics.append(dict(envelope))
     state.last_metrics = state.last_metrics[-100:]
     state.last_request_at = time.time()
@@ -14968,7 +15094,9 @@ def _finalize_batched_ar_generation(
     generated["completion_tokens"] = completion_tokens
     generated["tok_s"] = stats.get("decode_tok_s") or generated.get("tok_s") or 0.0
     generated["end_to_end_tok_s"] = stats["server_tok_s"]
-    if not bool((request_observability or {}).get("warmup")) and not _server_console_enabled(state):
+    if not bool(
+        (request_observability or {}).get("warmup")
+    ) and not _server_console_enabled(state):
         _safe_stdout_print(
             json.dumps(
                 {
@@ -15185,9 +15313,7 @@ def _run_generation_dispatched_inner(
             if history_bypass_reason == "generic_openai_solo_mtp"
             else "solo_mtp_history"
         )
-        request_observability_for_lane["ar_batch_bypass_reason"] = (
-            history_bypass_reason
-        )
+        request_observability_for_lane["ar_batch_bypass_reason"] = history_bypass_reason
     else:
         use_ar_batch, mtp_disabled_reason = _use_live_ar_batch(
             state,
@@ -15258,8 +15384,7 @@ def _run_generation_dispatched_inner(
         kv_admission = None
         try:
             kv_admission = _runtime_kv_admission(
-                state.runtime,
-                len(prompt_ids) + response_max
+                state.runtime, len(prompt_ids) + response_max
             )
             future = state.ar_batch_service.submit(job)
             generated = future.result()
@@ -15296,7 +15421,11 @@ def _run_generation_dispatched_inner(
         return _run_generation(state, prompt_ids, **kwargs)
 
     scheduler = getattr(state, "model_scheduler", None)
-    if scheduler is not None and hasattr(scheduler, "is_owner_thread") and scheduler.is_owner_thread():
+    if (
+        scheduler is not None
+        and hasattr(scheduler, "is_owner_thread")
+        and scheduler.is_owner_thread()
+    ):
         return run()
     return _submit_foreground_model_work(
         state,
@@ -15358,10 +15487,14 @@ def _run_generation(
     generation_limits["uncapped_repetition_stop_enabled"] = bool(
         uncapped_repetition_stop
     )
-    effective_draft_sampler = draft_sampler if draft_sampler is not None else state.draft_sampler
     effective_mode = _normalize_generation_mode(
         generation_mode,
         default=getattr(state.args, "generation_mode", "mtp"),
+    )
+    if _hy3_q4_dynamic_context_enabled(state) and effective_mode != "ar":
+        raise RuntimeError("hy3_q4_dynamic_context requires generation_mode 'ar'")
+    effective_draft_sampler = (
+        draft_sampler if draft_sampler is not None else state.draft_sampler
     )
     requested_depth = (
         0
@@ -15430,7 +15563,9 @@ def _run_generation(
                     headers={"Retry-After": "1"},
                 )
         else:
-            smart_request_id = str((request_observability or {}).get("request_id") or "")
+            smart_request_id = str(
+                (request_observability or {}).get("request_id") or ""
+            )
             smart_fan_lease = _begin_smart_fan_request(
                 state,
                 request_id=_smart_fan_request_id(
@@ -15446,19 +15581,40 @@ def _run_generation(
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
-            kv_admission = _runtime_kv_admission(
-                state.runtime,
-                len(prompt_ids) + response_max
-            )
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
+                incremental_pages=_hy3_q4_dynamic_memory_enabled(state),
             )
+            runtime_kv_admission_tokens = (
+                dynamic_kv_reservation["startup_reserved_logical_tokens"]
+                if _hy3_q4_dynamic_context_enabled(state)
+                else len(prompt_ids) + response_max
+            )
+            kv_admission = _runtime_kv_admission(
+                state.runtime, int(runtime_kv_admission_tokens)
+            )
+
+            def advance_runtime_kv_ownership(logical_tokens: int) -> None:
+                current = getattr(kv_admission, "tokens", None)
+                if current is not None and int(logical_tokens) <= int(current):
+                    return
+                grow_to_page = getattr(kv_admission, "grow_to_page_boundary", None)
+                if not callable(grow_to_page):
+                    raise RuntimeError(
+                        "dynamic Q4 logical KV ownership cannot follow page growth"
+                    )
+                grow_to_page(
+                    int(logical_tokens),
+                    page_size_tokens=int(dynamic_kv_reservation["block_size_tokens"]),
+                )
+
             prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
-            with _temporary_env(
-                dynamic_kv_reservation["env"]
-            ), prefill_chunk_size_override(prefill_chunk_tokens):
+            with (
+                _temporary_env(dynamic_kv_reservation["env"]),
+                prefill_chunk_size_override(prefill_chunk_tokens),
+            ):
                 if effective_mode == "ar":
                     out = generate_ar(
                         state.runtime,
@@ -15467,6 +15623,17 @@ def _run_generation(
                         sampler=sampler,
                         seed=generation_seed,
                         token_callback=record_tokens,
+                        kv_progress_callback=(
+                            advance_runtime_kv_ownership
+                            if _hy3_q4_dynamic_context_enabled(state)
+                            else None
+                        ),
+                        abort_check=(
+                            (lambda: bool(cancel_event.is_set()))
+                            if cancel_event is not None
+                            and _hy3_q4_dynamic_context_enabled(state)
+                            else None
+                        ),
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
                         prefill_callback=prefill_callback,
@@ -15557,10 +15724,10 @@ def _run_generation(
                         ),
                     )
         except PostcommitAbort:
-            # abort_check tripped inside the prefill: the client disconnected
-            # mid-prompt-processing. Reuse the exact cancellation path client
-            # disconnects already take during decode.
-            raise _StreamCancelled("client disconnected during prefill")
+            # The request-local abort check is polled between evaluated
+            # prefill chunks and decode steps. Reuse the normal terminal
+            # cancellation path so cache and logical ownership both drain.
+            raise _StreamCancelled("client disconnected during generation")
         finally:
             if kv_admission is not None:
                 release_kv = getattr(kv_admission, "release", None)
@@ -16036,9 +16203,7 @@ class _BackgroundWarmup:
         yielded = False
         try:
             if step["kind"] == "gqa_packed_pipelines":
-                step["state"] = (
-                    "ok" if _prewarm_gqa_packed_pipelines() else "skipped"
-                )
+                step["state"] = "ok" if _prewarm_gqa_packed_pipelines() else "skipped"
             else:
                 generated = self._ladder_generation(int(step["context"]))
                 tok_s = generated.get("tok_s")
@@ -16108,7 +16273,13 @@ class _BackgroundWarmup:
                         "steps": [
                             {
                                 key: step.get(key)
-                                for key in ("kind", "context", "state", "elapsed_s", "tok_s")
+                                for key in (
+                                    "kind",
+                                    "context",
+                                    "state",
+                                    "elapsed_s",
+                                    "tok_s",
+                                )
                                 if key in step
                             }
                             for step in snapshot["steps"]
@@ -16375,7 +16546,9 @@ def _split_thinking_segments(text: str, *, thinking_enabled: bool) -> tuple[str,
                 segment = _clean_generated_assistant_text(text[position:])
                 append_reasoning(segment)
                 break
-            segment = _clean_generated_assistant_text(text[position : close_match.start()])
+            segment = _clean_generated_assistant_text(
+                text[position : close_match.start()]
+            )
             append_reasoning(segment)
             position = close_match.end()
             inside_thinking = False
@@ -16650,9 +16823,9 @@ class _ThinkingContentStreamSplitter:
                 self._reasoning_accumulated.append(cleaned)
             elif field == "content":
                 self._content_emitted = True
-                self._content_history_tail = (
-                    self._content_history_tail + cleaned
-                )[-2048:]
+                self._content_history_tail = (self._content_history_tail + cleaned)[
+                    -2048:
+                ]
             chunks.append((field, cleaned))
 
     @classmethod
@@ -16668,7 +16841,9 @@ class _ThinkingContentStreamSplitter:
     @classmethod
     def _tool_control_marker_has_partial_prefix(cls, text: str) -> bool:
         text_lower = text.lower()
-        return any(marker.startswith(text_lower) for marker in cls._TOOL_CONTROL_MARKERS)
+        return any(
+            marker.startswith(text_lower) for marker in cls._TOOL_CONTROL_MARKERS
+        )
 
     @staticmethod
     def _reasoning_control_marker_has_partial_prefix(text: str) -> bool:
@@ -16742,10 +16917,7 @@ class _ThinkingContentStreamSplitter:
                 return True
             common = 0
             max_common = min(len(self._pending), len(target))
-            while (
-                common < max_common
-                and self._pending[common] == target[common]
-            ):
+            while common < max_common and self._pending[common] == target[common]:
                 common += 1
             if common:
                 self._pending = self._pending[common:]
@@ -16832,8 +17004,7 @@ class _ThinkingContentStreamSplitter:
                     not (stripped := self._pending.lstrip())
                     or (
                         stripped.startswith("<")
-                        and self._disabled_reasoning_tail_len(stripped)
-                        >= len(stripped)
+                        and self._disabled_reasoning_tail_len(stripped) >= len(stripped)
                     )
                 )
             ):
@@ -16857,7 +17028,9 @@ class _ThinkingContentStreamSplitter:
             len(marker) + len("assistant") + 2
             for marker in CHAT_TEMPLATE_SENTINEL_MARKERS
         )
-        tag_keep = max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>")
+        tag_keep = max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len(
+            "</>"
+        )
         keep = max(
             tag_keep,
             sentinel_keep,
@@ -16904,9 +17077,8 @@ class _ThinkingContentStreamSplitter:
                     self._pending = self._pending[open_match_at_start.end() :]
                     self._reentry_count += 1
                     continue
-                if (
-                    not final
-                    and self._reasoning_control_marker_has_partial_prefix(self._pending)
+                if not final and self._reasoning_control_marker_has_partial_prefix(
+                    self._pending
                 ):
                     break
                 if close_match is None:
@@ -16934,8 +17106,7 @@ class _ThinkingContentStreamSplitter:
                 pending_lower = self._pending.lower()
                 tool_close_index = pending_lower.find(self._TOOL_CALL_CLOSE_MARKER)
                 tool_passthrough = (
-                    self._inside_tool_call
-                    or self._TOOL_CALL_MARKER in pending_lower
+                    self._inside_tool_call or self._TOOL_CALL_MARKER in pending_lower
                 )
                 emit_len = (
                     len(self._pending)
@@ -16950,9 +17121,9 @@ class _ThinkingContentStreamSplitter:
                     break
                 emitted = self._pending[:emit_len]
                 if tool_passthrough:
-                    self._tool_call_tail = (
-                        self._tool_call_tail + emitted.lower()
-                    )[-len(self._TOOL_CALL_CLOSE_MARKER) :]
+                    self._tool_call_tail = (self._tool_call_tail + emitted.lower())[
+                        -len(self._TOOL_CALL_CLOSE_MARKER) :
+                    ]
                 if self._TOOL_CALL_CLOSE_MARKER in emitted.lower() or (
                     tool_passthrough
                     and self._tool_call_tail.endswith(self._TOOL_CALL_CLOSE_MARKER)
@@ -16999,7 +17170,9 @@ def _stream_splitter_for_state(
     )
 
 
-def _finish_stream_splitter(splitter: Any, *, recover_unclosed_reasoning: bool) -> list[tuple[str, str]]:
+def _finish_stream_splitter(
+    splitter: Any, *, recover_unclosed_reasoning: bool
+) -> list[tuple[str, str]]:
     try:
         return splitter.finish(
             recover_unclosed_reasoning_as_content=recover_unclosed_reasoning
@@ -17133,7 +17306,11 @@ def _nonstream_chat_message_parts(
             )
             stats["nonstream_reasoning_content_routed"] = bool(reasoning_text)
             stats["visible_reasoning_stripped"] = bool(display_text != raw_text)
-    elif thinking_enabled and parser_enabled and (THINK_OPEN in raw_text or THINK_CLOSE in raw_text):
+    elif (
+        thinking_enabled
+        and parser_enabled
+        and (THINK_OPEN in raw_text or THINK_CLOSE in raw_text)
+    ):
         reasoning_text, display_text = _split_thinking_segments(
             raw_text,
             thinking_enabled=True,
@@ -18900,7 +19077,9 @@ def create_app(state: ServerState) -> FastAPI:
         if dashboard is not None:
             dashboard.bus.attach_loop(asyncio.get_running_loop())
         bg_tasks: list[asyncio.Task[Any]] = []
-        if dashboard is not None and bool(getattr(state.args, "enable_thermal_poll", False)):
+        if dashboard is not None and bool(
+            getattr(state.args, "enable_thermal_poll", False)
+        ):
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         try:
             yield
@@ -19022,7 +19201,9 @@ def create_app(state: ServerState) -> FastAPI:
                         getattr(state.args, "default_presence_penalty", 0.0) or 0.0
                     ),
                     "depth": int(state.args.depth),
-                    "depth_max": int(_backend_descriptor(state).draft_semantics.maximum),
+                    "depth_max": int(
+                        _backend_descriptor(state).draft_semantics.maximum
+                    ),
                     "mtp_enabled": str(getattr(state.args, "generation_mode", "mtp"))
                     == "mtp",
                     "max_tokens": int(state.args.max_response_tokens or 16384),
@@ -19101,8 +19282,7 @@ def create_app(state: ServerState) -> FastAPI:
             "ok": True,
             "model": state.model_id,
             "model_path": str(
-                getattr(runtime, "model_path", None)
-                or getattr(state.args, "model", "")
+                getattr(runtime, "model_path", None) or getattr(state.args, "model", "")
             ),
             "vision": {
                 "enabled": _server_vision_spec(state) is not None,
@@ -19578,9 +19758,11 @@ def create_app(state: ServerState) -> FastAPI:
     def _aime_release_parent_runtime_enabled(body: "_AIMEStartBody | None") -> bool:
         if _aime_process_isolation_mode(body) != "per_question":
             return False
-        raw = str(
-            os.environ.get("MTPLX_AIME_RELEASE_PARENT_RUNTIME") or "auto"
-        ).strip().lower()
+        raw = (
+            str(os.environ.get("MTPLX_AIME_RELEASE_PARENT_RUNTIME") or "auto")
+            .strip()
+            .lower()
+        )
         return raw not in {"0", "false", "no", "off", "never"}
 
     def _release_parent_runtime_for_aime() -> dict[str, Any]:
@@ -19599,7 +19781,9 @@ def create_app(state: ServerState) -> FastAPI:
                 "allocator_after": _mlx_allocator_public_stats(),
             }
         started = time.perf_counter()
-        model_path = str(getattr(runtime, "model_path", getattr(state.args, "model", "")))
+        model_path = str(
+            getattr(runtime, "model_path", getattr(state.args, "model", ""))
+        )
         mtp_enabled = bool(getattr(runtime, "mtp_enabled", False))
         lock = getattr(state, "lock", None)
         acquired = False
@@ -19705,7 +19889,9 @@ def create_app(state: ServerState) -> FastAPI:
                         f"AIME worker exited before health check: returncode={returncode}"
                     )
                 try:
-                    response = await client.get(base_url.rstrip("/") + "/health", headers=headers)
+                    response = await client.get(
+                        base_url.rstrip("/") + "/health", headers=headers
+                    )
                     if response.status_code == 200:
                         payload = response.json()
                         if isinstance(payload, dict) and payload.get("ok"):
@@ -19756,11 +19942,12 @@ def create_app(state: ServerState) -> FastAPI:
         from mtplx.benchmarks.runners.aime import AIMEQuestionRuntime
 
         port = _free_loopback_port()
-        idx = int(getattr(runner, "current_idx", None) or getattr(problem, "index", 0) or 0)
+        idx = int(
+            getattr(runner, "current_idx", None) or getattr(problem, "index", 0) or 0
+        )
         attempt = int(getattr(runner, "current_attempt", None) or 1)
         parent_launch_id = (
-            str(getattr(state.args, "app_launch_id", None) or "").strip()
-            or "mtplx"
+            str(getattr(state.args, "app_launch_id", None) or "").strip() or "mtplx"
         )
         app_launch_id = (
             f"{parent_launch_id}-aime-q{idx}-a{attempt}-{uuid.uuid4().hex[:6]}"
@@ -19918,9 +20105,7 @@ def create_app(state: ServerState) -> FastAPI:
             "question_isolation_factory": _aime_question_isolation_cleanup,
         }
         if _aime_process_isolation_mode(body) == "per_question":
-            kwargs["question_runtime_factory"] = (
-                _aime_question_process_runtime_factory
-            )
+            kwargs["question_runtime_factory"] = _aime_question_process_runtime_factory
         if body is not None:
             if body.temperature is not None:
                 kwargs["temperature"] = body.temperature
@@ -20047,7 +20232,9 @@ def create_app(state: ServerState) -> FastAPI:
                         if isinstance(obj, dict) and "summary" in obj:
                             last_summary = obj["summary"]
                 if last_summary is not None:
-                    runs.append({"run_id": path.stem, "path": str(path), **last_summary})
+                    runs.append(
+                        {"run_id": path.stem, "path": str(path), **last_summary}
+                    )
             except OSError:
                 continue
         return {"runs": runs}
@@ -20161,16 +20348,12 @@ def create_app(state: ServerState) -> FastAPI:
         async def event_stream():
             try:
                 snapshot = _mtplx_dashboard_snapshot(state)
-                yield (
-                    "event: snapshot\n"
-                    f"data: {json.dumps(_json_safe(snapshot))}\n\n"
-                )
+                yield (f"event: snapshot\ndata: {json.dumps(_json_safe(snapshot))}\n\n")
                 last_snapshot_s = time.perf_counter()
                 while True:
                     timeout_s = max(
                         0.01,
-                        snapshot_interval_s
-                        - (time.perf_counter() - last_snapshot_s),
+                        snapshot_interval_s - (time.perf_counter() - last_snapshot_s),
                     )
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=timeout_s)
@@ -20180,9 +20363,7 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     except asyncio.TimeoutError:
                         pass
-                    if (
-                        time.perf_counter() - last_snapshot_s
-                    ) >= snapshot_interval_s:
+                    if (time.perf_counter() - last_snapshot_s) >= snapshot_interval_s:
                         snapshot = _mtplx_dashboard_snapshot(state)
                         yield (
                             "event: snapshot\n"
@@ -20355,10 +20536,9 @@ def create_app(state: ServerState) -> FastAPI:
             _request_should_force_answer_for_read_only_inspection(request.messages)
         )
         if read_only_force_answer_contract_active:
-            if (
-                _tool_result_message_count(request.messages) > 0
-                and _request_explicit_single_tool_then_answer(request.messages)
-            ):
+            if _tool_result_message_count(
+                request.messages
+            ) > 0 and _request_explicit_single_tool_then_answer(request.messages):
                 # Explicit "use one tool then answer": the forced final turn
                 # generates tool-free, and turn-level tool state/observability
                 # must agree (zero remaining tools, read_only_force_answer:v1
@@ -20727,7 +20907,9 @@ def create_app(state: ServerState) -> FastAPI:
             )
             request_observability[
                 "request_session_restore_policy_matches_postcommit"
-            ] = bool(session_restore_policy_fingerprint == postcommit_policy_fingerprint)
+            ] = bool(
+                session_restore_policy_fingerprint == postcommit_policy_fingerprint
+            )
         opencode_tool_history_policy = (
             _opencode_tool_history_restore_policy(
                 headers=headers,
@@ -20817,17 +20999,13 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["mtplx_control_owner"] = (
             "client" if client_controls_allowed else "server"
         )
-        request_observability["client_controls_allowed"] = bool(
-            client_controls_allowed
-        )
+        request_observability["client_controls_allowed"] = bool(client_controls_allowed)
         if not client_controls_allowed:
             ignored_fields = _ignored_client_control_fields(request)
             if ignored_fields:
-                request_observability["client_control_fields_ignored"] = (
-                    ignored_fields
-                )
-        request_observability["request_reasoning_parser"] = (
-            _reasoning_parser_for_state(state)
+                request_observability["client_control_fields_ignored"] = ignored_fields
+        request_observability["request_reasoning_parser"] = _reasoning_parser_for_state(
+            state
         )
         request_observability["request_read_only_inspection_force_answer"] = bool(
             read_only_force_answer_contract_active
@@ -20872,9 +21050,7 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["preserve_thinking_effective"] = (
             _preserve_thinking_effective(state.args)
         )
-        request_observability["reasoning_history_mode"] = _reasoning_history_mode(
-            state
-        )
+        request_observability["reasoning_history_mode"] = _reasoning_history_mode(state)
         request_observability["strip_assistant_reasoning_history"] = bool(
             state.args.strip_assistant_reasoning_history
         )
@@ -20902,7 +21078,9 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["opencode_tool_history_live_frontier_restore"] = bool(
             opencode_tool_history_live_frontier_restore
         )
-        requested_tool_names = list(request_observability.get("request_tool_names") or [])
+        requested_tool_names = list(
+            request_observability.get("request_tool_names") or []
+        )
         filtered_tool_names = _tool_names(tool_specs) if tools_active else []
         hidden_tool_names = [
             name for name in requested_tool_names if name not in filtered_tool_names
@@ -20920,7 +21098,9 @@ def create_app(state: ServerState) -> FastAPI:
             {
                 "chat_template_profile": str(
                     chat_template_report.get("profile")
-                    or getattr(state, "chat_template_profile", _CHAT_TEMPLATE_PROFILE_LOCAL)
+                    or getattr(
+                        state, "chat_template_profile", _CHAT_TEMPLATE_PROFILE_LOCAL
+                    )
                 ),
                 "chat_template_source": chat_template_report.get("source"),
                 "chat_template_path": chat_template_report.get("path"),
@@ -20945,16 +21125,12 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
-            allow_live_refs=bool(
-                getattr(state.args, "session_bank_live_refs", True)
-            ),
+            allow_live_refs=bool(getattr(state.args, "session_bank_live_refs", True)),
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:
             live_frontier_policy = (
-                "live_reference_lease"
-                if session_keep_live_ref
-                else "snapshot_only"
+                "live_reference_lease" if session_keep_live_ref else "snapshot_only"
             )
         if (
             _is_opencode_client(headers=headers, metadata=metadata)
@@ -21055,9 +21231,7 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["request_top_p"] = request.top_p
         request_observability["request_top_k"] = request.top_k
         if request.presence_penalty is not None:
-            request_observability["request_presence_penalty"] = (
-                request.presence_penalty
-            )
+            request_observability["request_presence_penalty"] = request.presence_penalty
         if request.frequency_penalty is not None:
             request_observability["request_frequency_penalty"] = (
                 request.frequency_penalty
@@ -21151,9 +21325,7 @@ def create_app(state: ServerState) -> FastAPI:
         nonstream_stop_reasoning_chunks: list[str] = []
         if stop_sequences and not request.stream:
             nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
-            nonstream_stop_decoder = _IncrementalTokenDecoder(
-                state.runtime.tokenizer
-            )
+            nonstream_stop_decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
             nonstream_stop_splitter = _stream_splitter_for_state(
                 state,
                 thinking_enabled=thinking_enabled,
@@ -21180,9 +21352,7 @@ def create_app(state: ServerState) -> FastAPI:
                 if nonstream_client_disconnected
                 else "request cancelled"
             )
-            _raise_if_stream_cancelled(
-                nonstream_cancel_event, cancel_message
-            )
+            _raise_if_stream_cancelled(nonstream_cancel_event, cancel_message)
             if nonstream_stop_monitor is not None:
                 delta = nonstream_stop_decoder.feed(
                     [int(token) for token in new_tokens]
@@ -21479,8 +21649,7 @@ def create_app(state: ServerState) -> FastAPI:
                 # completion surface).
                 stop_monitor: _StopSequenceStreamMonitor | None = (
                     _StopSequenceStreamMonitor(stop_sequences)
-                    if stop_sequences
-                    and not read_only_force_answer_contract_active
+                    if stop_sequences and not read_only_force_answer_contract_active
                     else None
                 )
                 stop_sequence_cancel_fired = False
@@ -21512,13 +21681,10 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_client_hint = str(
                     request_observability.get("request_client_hint") or ""
                 ).lower()
-                single_tool_call_stream = (
-                    "pi" in stream_client_hint
-                    or (
-                        "opencode" in stream_client_hint
-                        and _request_explicit_single_tool_then_answer(
-                            messages_for_generation
-                        )
+                single_tool_call_stream = "pi" in stream_client_hint or (
+                    "opencode" in stream_client_hint
+                    and _request_explicit_single_tool_then_answer(
+                        messages_for_generation
                     )
                 )
                 orphan_stream_guard_enabled = bool(
@@ -21797,7 +21963,8 @@ def create_app(state: ServerState) -> FastAPI:
                         or not tool_result_history_present
                         or not thinking_enabled
                         or request.seed is not None
-                        or _reasoning_parser_for_state(state) not in {"qwen3", "step3p5"}
+                        or _reasoning_parser_for_state(state)
+                        not in {"qwen3", "step3p5"}
                         # Forced final-answer turns intentionally rehearse
                         # before the visible marker; the buffered marker
                         # stream owns visibility, so a reasoning-shaped first
@@ -21916,9 +22083,9 @@ def create_app(state: ServerState) -> FastAPI:
                     ).strip()
                     retry_stats = retry_generated.setdefault("stats", {})
                     retry_stats.update(retry_observability)
-                    retry_succeeded = bool(
-                        retry_extraction.tool_calls
-                    ) or bool(retry_visible_text)
+                    retry_succeeded = bool(retry_extraction.tool_calls) or bool(
+                        retry_visible_text
+                    )
                     retry_stats["reasoning_completion_repair_succeeded"] = (
                         retry_succeeded
                     )
@@ -21983,11 +22150,14 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                     if extraction.tool_calls:
                         return generated
-                    visible_candidate = "\n\n".join(
-                        part.strip()
-                        for part in (raw_reasoning_text, raw_content_text)
-                        if part and part.strip()
-                    ) or raw_text
+                    visible_candidate = (
+                        "\n\n".join(
+                            part.strip()
+                            for part in (raw_reasoning_text, raw_content_text)
+                            if part and part.strip()
+                        )
+                        or raw_text
+                    )
                     if not _looks_like_stalled_agent_tool_promise(visible_candidate):
                         return generated
 
@@ -22001,7 +22171,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 "check more work, but it did not include a tool call. "
                                 "If more work is needed, emit exactly one declared "
                                 "tool call now. If no more tool is needed, answer "
-                                "with concrete final results. Do not say \"let me\" "
+                                'with concrete final results. Do not say "let me" '
                                 "and do not quote MTPLX internal notes."
                             ),
                         )
@@ -22032,9 +22202,7 @@ def create_app(state: ServerState) -> FastAPI:
                             "stalled_agent_retry_first_decode_tok_s": first_stats.get(
                                 "decode_tok_s"
                             ),
-                            "stalled_agent_retry_prompt_tokens": len(
-                                repair_prompt_ids
-                            ),
+                            "stalled_agent_retry_prompt_tokens": len(repair_prompt_ids),
                         }
                     )
                     retry_generated = _run_generation_dispatched(
@@ -22139,11 +22307,14 @@ def create_app(state: ServerState) -> FastAPI:
                         raw_text,
                         thinking_enabled=thinking_enabled,
                     )
-                    visible_candidate = "\n\n".join(
-                        part.strip()
-                        for part in (raw_reasoning_text, raw_content_text)
-                        if part and part.strip()
-                    ) or raw_text
+                    visible_candidate = (
+                        "\n\n".join(
+                            part.strip()
+                            for part in (raw_reasoning_text, raw_content_text)
+                            if part and part.strip()
+                        )
+                        or raw_text
+                    )
                     if not _looks_like_read_only_force_answer_failure(
                         visible_candidate
                     ):
@@ -22311,8 +22482,10 @@ def create_app(state: ServerState) -> FastAPI:
                             generated = maybe_retry_degenerate_read_only_inspection(
                                 generated
                             )
-                            generated = maybe_retry_degenerate_tool_fed_empty_completion(
-                                generated
+                            generated = (
+                                maybe_retry_degenerate_tool_fed_empty_completion(
+                                    generated
+                                )
                             )
                             generated = maybe_repair_tool_fed_reasoning_only_completion(
                                 generated
@@ -22361,11 +22534,15 @@ def create_app(state: ServerState) -> FastAPI:
                                 generated = maybe_retry_degenerate_read_only_inspection(
                                     generated
                                 )
-                                generated = maybe_retry_degenerate_tool_fed_empty_completion(
-                                    generated
+                                generated = (
+                                    maybe_retry_degenerate_tool_fed_empty_completion(
+                                        generated
+                                    )
                                 )
-                                generated = maybe_repair_tool_fed_reasoning_only_completion(
-                                    generated
+                                generated = (
+                                    maybe_repair_tool_fed_reasoning_only_completion(
+                                        generated
+                                    )
                                 )
                                 generated = maybe_retry_read_only_force_answer(
                                     generated
@@ -22419,24 +22596,26 @@ def create_app(state: ServerState) -> FastAPI:
                                     else:
                                         postcommit = _submit_foreground_model_work(
                                             state,
-                                            lambda: _store_generation_final_history_snapshot(
-                                                state,
-                                                session_id=session_id,
-                                                prompt_ids=prompt_ids,
-                                                generated=generated,
-                                                messages=raw_messages_for_postcommit,
-                                                assistant_content=(
-                                                    assistant_history_content
-                                                ),
-                                                assistant_tool_calls=(
-                                                    assistant_tool_calls
-                                                ),
-                                                thinking_enabled=thinking_enabled,
-                                                policy_fingerprint=postcommit_policy_fingerprint,
-                                                tool_specs=postcommit_tool_specs,
-                                                keep_live_ref=session_keep_live_ref,
-                                                tool_prompt_mode=postcommit_tool_prompt_mode,
-                                                strip_tool_call_preamble_text=opencode_client,
+                                            lambda: (
+                                                _store_generation_final_history_snapshot(
+                                                    state,
+                                                    session_id=session_id,
+                                                    prompt_ids=prompt_ids,
+                                                    generated=generated,
+                                                    messages=raw_messages_for_postcommit,
+                                                    assistant_content=(
+                                                        assistant_history_content
+                                                    ),
+                                                    assistant_tool_calls=(
+                                                        assistant_tool_calls
+                                                    ),
+                                                    thinking_enabled=thinking_enabled,
+                                                    policy_fingerprint=postcommit_policy_fingerprint,
+                                                    tool_specs=postcommit_tool_specs,
+                                                    keep_live_ref=session_keep_live_ref,
+                                                    tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                    strip_tool_call_preamble_text=opencode_client,
+                                                )
                                             ),
                                             batch_key=(
                                                 f"postcommit.stream.final:"
@@ -22663,9 +22842,7 @@ def create_app(state: ServerState) -> FastAPI:
                     orphan_reasoning_stream_guard = (
                         _InitialOrphanToolControlStreamGuard()
                     )
-                    orphan_content_stream_guard = (
-                        _InitialOrphanToolControlStreamGuard()
-                    )
+                    orphan_content_stream_guard = _InitialOrphanToolControlStreamGuard()
 
                 def apply_orphan_stream_guard(field: str, text: str) -> str:
                     nonlocal stream_orphan_tool_markup_suppressed
@@ -22703,11 +22880,7 @@ def create_app(state: ServerState) -> FastAPI:
                     if field == "reasoning_content" and suppress_visible_reasoning:
                         remember_stream_delta({field: text})
                         return []
-                    if (
-                        field == "content"
-                        and monitor_stop
-                        and stop_monitor is not None
-                    ):
+                    if field == "content" and monitor_stop and stop_monitor is not None:
                         if stop_monitor.stopped:
                             return []
                         text = stop_monitor.feed(text)
@@ -22773,7 +22946,10 @@ def create_app(state: ServerState) -> FastAPI:
                                 content_tool_translator.tool_calls
                                 or streamed_assistant_tool_calls
                             )
-                            if single_tool_call_stream and streamed_assistant_tool_calls:
+                            if (
+                                single_tool_call_stream
+                                and streamed_assistant_tool_calls
+                            ):
                                 streamed_assistant_tool_calls = (
                                     streamed_assistant_tool_calls[:1]
                                 )
@@ -22785,7 +22961,10 @@ def create_app(state: ServerState) -> FastAPI:
                                 content_tool_translator.tool_calls
                                 or streamed_assistant_tool_calls
                             )
-                            if single_tool_call_stream and streamed_assistant_tool_calls:
+                            if (
+                                single_tool_call_stream
+                                and streamed_assistant_tool_calls
+                            ):
                                 streamed_assistant_tool_calls = (
                                     streamed_assistant_tool_calls[:1]
                                 )
@@ -23192,7 +23371,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 if tail:
                                     for _field, text in splitter.feed(tail):
                                         if text:
-                                            for chunk in stream_read_only_force_answer_text(
+                                            for (
+                                                chunk
+                                            ) in stream_read_only_force_answer_text(
                                                 text
                                             ):
                                                 yield mark_sse_sent(chunk)
@@ -23236,10 +23417,14 @@ def create_app(state: ServerState) -> FastAPI:
                                                 len(streamed_visible_text) :
                                             ]
                                         if missing_visible_text:
-                                            for part in read_only_force_answer_text_slices(
+                                            for (
+                                                part
+                                            ) in read_only_force_answer_text_slices(
                                                 missing_visible_text
                                             ):
-                                                for chunk in stream_content_delta_chunks(
+                                                for (
+                                                    chunk
+                                                ) in stream_content_delta_chunks(
                                                     "content",
                                                     part,
                                                     use_orphan_guard=False,
@@ -23247,7 +23432,9 @@ def create_app(state: ServerState) -> FastAPI:
                                                 ):
                                                     yield mark_sse_sent(chunk)
                                     else:
-                                        for chunk in emit_read_only_force_answer_visible_text(
+                                        for (
+                                            chunk
+                                        ) in emit_read_only_force_answer_visible_text(
                                             visible_text
                                         ):
                                             yield mark_sse_sent(chunk)
@@ -23305,9 +23492,11 @@ def create_app(state: ServerState) -> FastAPI:
                                             yield mark_sse_sent(chunk)
                                 for chunk in finish_translated_stream_chunks():
                                     yield mark_sse_sent(chunk)
-                            raw_generated_text = _strip_mtplx_internal_continuation_markers(
-                                _strip_generated_chat_template_sentinels(
-                                    str(generated.get("text") or "")
+                            raw_generated_text = (
+                                _strip_mtplx_internal_continuation_markers(
+                                    _strip_generated_chat_template_sentinels(
+                                        str(generated.get("text") or "")
+                                    )
                                 )
                             )
                             raw_reasoning_text, raw_content_text = (
@@ -23329,11 +23518,14 @@ def create_app(state: ServerState) -> FastAPI:
                                 # marker path; running tool extraction over the
                                 # raw rehearsal text would re-emit it as a
                                 # malformed-as-content fallback.
-                                if tools_active and not read_only_force_answer_contract_active
+                                if tools_active
+                                and not read_only_force_answer_contract_active
                                 else None
                             )
                             assistant_tool_calls = streamed_assistant_tool_calls or (
-                                extraction.tool_calls if extraction is not None else None
+                                extraction.tool_calls
+                                if extraction is not None
+                                else None
                             )
                             stats = generated.setdefault("stats", {})
                             stats["openai_bridge_mode"] = "omlx_style"
@@ -23369,7 +23561,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     extraction.status == "malformed_as_content"
                                     and extraction.cleaned_text
                                     and (
-                                        fallback_visible_text := _visible_malformed_tool_content(
+                                        fallback_visible_text
+                                        := _visible_malformed_tool_content(
                                             extraction.cleaned_text,
                                             state.runtime.tokenizer,
                                         )
@@ -23401,12 +23594,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 and extraction.status == "malformed_as_content"
                             ):
                                 fallback_reason = (
-                                    extraction.malformed_reason
-                                    or "malformed_tool_call"
+                                    extraction.malformed_reason or "malformed_tool_call"
                                 )
-                                fallback_kind = _tool_parse_counter_key(
-                                    fallback_reason
-                                )
+                                fallback_kind = _tool_parse_counter_key(fallback_reason)
                                 _record_tool_parse_event(
                                     state,
                                     event=fallback_kind,
@@ -23417,9 +23607,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 stats["tool_parse_fallback"] = True
                                 stats["tool_parse_fallback_reason"] = fallback_reason
                                 stats["tool_parse_fallback_kind"] = fallback_kind
-                            _merge_final_bridge_stats_into_latest_metrics(
-                                state, stats
-                            )
+                            _merge_final_bridge_stats_into_latest_metrics(state, stats)
                             if session is not None:
                                 assistant_history_content = streamed_history_content()
                                 commit_state["assistant_history_content"] = (
@@ -23502,9 +23690,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             state=state,
                                             unsafe_reason=unsafe_reason,
                                             assistant_tool_calls=assistant_tool_calls,
-                                            prompt_prefix_len=(
-                                                prompt_prefix_len
-                                            ),
+                                            prompt_prefix_len=(prompt_prefix_len),
                                         )
                                     )
                                     if postcommit_snapshot is not None:
@@ -23591,7 +23777,10 @@ def create_app(state: ServerState) -> FastAPI:
                             reset_orphan_stream_guards()
                             continue
                         elif kind == "close_unclosed_reasoning_for_repair":
-                            if _reasoning_parser_for_state(state) not in {"qwen3", "step3p5"}:
+                            if _reasoning_parser_for_state(state) not in {
+                                "qwen3",
+                                "step3p5",
+                            }:
                                 continue
                             for field, text in drain_stream_tokens([], force=True):
                                 for chunk in stream_content_delta_chunks(field, text):
@@ -23606,7 +23795,9 @@ def create_app(state: ServerState) -> FastAPI:
                                             yield mark_sse_sent(chunk)
                             for field, text in splitter.feed(THINK_CLOSE):
                                 if text:
-                                    for chunk in stream_content_delta_chunks(field, text):
+                                    for chunk in stream_content_delta_chunks(
+                                        field, text
+                                    ):
                                         yield mark_sse_sent(chunk)
                             decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                             continue
@@ -23624,9 +23815,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     "text": streamed_history_content(),
                                     "tokens": list(streamed_token_ids),
                                     "prompt_tokens": len(prompt_ids),
-                                    "completion_tokens": int(
-                                        streamed_progress_tokens
-                                    ),
+                                    "completion_tokens": int(streamed_progress_tokens),
                                     "finish_reason": "stop",
                                     "stats": {
                                         "generation_mode": request_generation_mode,
@@ -23645,9 +23834,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         "early_tool_cancel_used": False,
                                     },
                                 }
-                                generated = attach_response_observability(
-                                    generated
-                                )
+                                generated = attach_response_observability(generated)
                                 _attach_dashboard_progress_stats(
                                     state,
                                     request_id=response_id,
@@ -23675,9 +23862,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         "tool_call_count": len(
                                             streamed_assistant_tool_calls
                                         ),
-                                        "tool_parser_source": (
-                                            "streaming_translator"
-                                        ),
+                                        "tool_parser_source": ("streaming_translator"),
                                         "tool_parse_status": "success",
                                         "tool_calls_emitted": len(
                                             streamed_assistant_tool_calls
@@ -23836,9 +24021,7 @@ def create_app(state: ServerState) -> FastAPI:
                     "prompt_tokens": len(prompt_ids),
                     "completion_tokens": int(nonstream_completion_tokens),
                     "stop_sequence_hit": True,
-                    "stop_sequence_matched": (
-                        nonstream_stop_monitor.matched_stop
-                    ),
+                    "stop_sequence_matched": (nonstream_stop_monitor.matched_stop),
                     "openai_bridge_mode": "omlx_style",
                     "legacy_bridge_used": False,
                     "hidden_generation_repair_used": False,
@@ -23943,9 +24126,7 @@ def create_app(state: ServerState) -> FastAPI:
                 response_id=response_id,
                 stream=False,
             )
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             assistant_content = (
                 extraction.cleaned_text.strip()
                 if extraction is not None and extraction.cleaned_text
@@ -23956,9 +24137,7 @@ def create_app(state: ServerState) -> FastAPI:
                 assistant_content=assistant_content,
                 assistant_tool_calls=tool_calls,
             )
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             message: dict[str, Any] = {
                 "role": "assistant",
                 "content": assistant_content or None,
@@ -23967,17 +24146,12 @@ def create_app(state: ServerState) -> FastAPI:
             finish_reason = "tool_calls"
         else:
             reasoning_text = ""
-            if (
-                extraction is not None
-                and extraction.status == "malformed_as_content"
-            ):
+            if extraction is not None and extraction.status == "malformed_as_content":
                 display_text = _visible_malformed_tool_content(
                     extraction.cleaned_text,
                     state.runtime.tokenizer,
                 )
-                display_text = _strip_mtplx_internal_continuation_markers(
-                    display_text
-                )
+                display_text = _strip_mtplx_internal_continuation_markers(display_text)
                 fallback_reason = extraction.malformed_reason or "malformed_tool_call"
                 fallback_kind = _tool_parse_counter_key(fallback_reason)
                 generated["stats"]["tool_parse_fallback"] = True
@@ -24013,16 +24187,12 @@ def create_app(state: ServerState) -> FastAPI:
                     generated["finish_reason"] = "stop"
                     generated["stats"]["stop_sequence_hit"] = True
                     generated["stats"]["stop_sequence_matched"] = matched_stop
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             await store_postcommit_snapshot(
                 generated,
                 assistant_content=display_text,
             )
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             message = {"role": "assistant", "content": display_text}
             if reasoning_text:
                 message["reasoning_content"] = reasoning_text
@@ -24096,9 +24266,11 @@ def create_app(state: ServerState) -> FastAPI:
             chat_request.messages,
             tools_active=tools_active,
         )
-        messages_for_generation, _backend_chat_policy_active = _with_backend_chat_policy(
-            state,
-            messages_for_generation,
+        messages_for_generation, _backend_chat_policy_active = (
+            _with_backend_chat_policy(
+                state,
+                messages_for_generation,
+            )
         )
         client_controls_allowed = _client_controls_allowed(headers, metadata)
         thinking_enabled = _thinking_enabled_for_request(
@@ -24189,9 +24361,7 @@ def create_app(state: ServerState) -> FastAPI:
             "request_temperature": request.temperature,
             "request_top_p": request.top_p,
             "request_top_k": request.top_k,
-            "mtplx_control_owner": (
-                "client" if client_controls_allowed else "server"
-            ),
+            "mtplx_control_owner": ("client" if client_controls_allowed else "server"),
             "client_controls_allowed": bool(client_controls_allowed),
         }
         if not client_controls_allowed:
@@ -24285,9 +24455,7 @@ def create_app(state: ServerState) -> FastAPI:
                         "object": "text_completion",
                         "created": created,
                         "model": model,
-                        "choices": [
-                            {"index": 0, "text": text, "finish_reason": None}
-                        ],
+                        "choices": [{"index": 0, "text": text, "finish_reason": None}],
                     }
                     return f"data: {json.dumps(payload)}\n\n"
 
@@ -24303,9 +24471,7 @@ def create_app(state: ServerState) -> FastAPI:
                         "object": "text_completion",
                         "created": created,
                         "model": model,
-                        "choices": [
-                            {"index": 0, "text": "", "finish_reason": "error"}
-                        ],
+                        "choices": [{"index": 0, "text": "", "finish_reason": "error"}],
                         **_openai_error_content(
                             message,
                             status_code=status_code,
@@ -24324,9 +24490,7 @@ def create_app(state: ServerState) -> FastAPI:
                         text = stop_monitor.feed(text)
                         if stop_monitor.stopped and not stop_hit:
                             stop_hit = True
-                            _cancel_stream_generation(
-                                cancel_event, generation_future
-                            )
+                            _cancel_stream_generation(cancel_event, generation_future)
                         if not text:
                             return []
                     return [text_chunk(text)]
@@ -24334,9 +24498,7 @@ def create_app(state: ServerState) -> FastAPI:
                 try:
                     while True:
                         try:
-                            kind, item = await asyncio.to_thread(
-                                queue.get, True, 0.25
-                            )
+                            kind, item = await asyncio.to_thread(queue.get, True, 0.25)
                         except Empty:
                             if (
                                 cancel_event.is_set() and not stop_hit
@@ -24400,9 +24562,7 @@ def create_app(state: ServerState) -> FastAPI:
                     _cancel_stream_generation(cancel_event, generation_future)
 
                 if generated is None:
-                    yield error_chunk(
-                        RuntimeError("generation ended without a result")
-                    )
+                    yield error_chunk(RuntimeError("generation ended without a result"))
                     yield "data: [DONE]\n\n"
                     return
                 finish_reason = str(generated.get("finish_reason") or "stop")
@@ -24443,25 +24603,19 @@ def create_app(state: ServerState) -> FastAPI:
         nonstream_completion_tokens = 0
         if stop_sequences:
             nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
-            nonstream_stop_decoder = _IncrementalTokenDecoder(
-                state.runtime.tokenizer
-            )
+            nonstream_stop_decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
 
         def nonstream_stop_on_tokens(new_tokens: list[int]) -> None:
             nonlocal nonstream_completion_tokens
             nonstream_completion_tokens += len(new_tokens)
             if nonstream_stop_monitor is None or nonstream_stop_decoder is None:
                 return
-            delta = nonstream_stop_decoder.feed(
-                [int(token) for token in new_tokens]
-            )
+            delta = nonstream_stop_decoder.feed([int(token) for token in new_tokens])
             if not delta:
                 return
             nonstream_stop_monitor.feed(delta)
             if nonstream_stop_monitor.stopped:
-                raise _StopSequenceHit(
-                    nonstream_stop_monitor.matched_stop or ""
-                )
+                raise _StopSequenceHit(nonstream_stop_monitor.matched_stop or "")
 
         try:
             generated = await _run_nonstream_generation_offload(
@@ -24487,7 +24641,7 @@ def create_app(state: ServerState) -> FastAPI:
                         if nonstream_stop_monitor is not None
                         else None
                     ),
-                )
+                ),
             )
         except _StopSequenceHit:
             # A stop string matched mid-generation: return the text before
@@ -24506,15 +24660,11 @@ def create_app(state: ServerState) -> FastAPI:
                     "prompt_tokens": len(prompt_ids),
                     "completion_tokens": int(nonstream_completion_tokens),
                     "stop_sequence_hit": True,
-                    "stop_sequence_matched": (
-                        nonstream_stop_monitor.matched_stop
-                    ),
+                    "stop_sequence_matched": (nonstream_stop_monitor.matched_stop),
                 },
             }
         finish_reason = str(generated.get("finish_reason") or "stop")
-        if stop_sequences and not generated.get("stats", {}).get(
-            "stop_sequence_hit"
-        ):
+        if stop_sequences and not generated.get("stats", {}).get("stop_sequence_hit"):
             # Post-trim safety net for matches the incremental monitor cannot
             # see (e.g. completed only by the decoder's held-back tail).
             trimmed_text, matched_stop = _trim_text_at_stop_sequences(
@@ -24687,7 +24837,9 @@ def _model_ref_is_gemma4_pair(model_ref: str | None) -> bool:
         return False
 
 
-def _gemma4_bundle_defaults(model_ref: str | None) -> tuple[dict[str, Any] | None, int | None]:
+def _gemma4_bundle_defaults(
+    model_ref: str | None,
+) -> tuple[dict[str, Any] | None, int | None]:
     if not model_ref:
         return None, None
     pair = resolve_gemma4_pair_paths(model_ref)
@@ -24713,10 +24865,9 @@ def _apply_backend_server_defaults(
     *,
     explicit_flags: set[str],
 ) -> None:
-    if (
-        not _server_flag_present(explicit_flags, "backend-id")
-        and _model_ref_is_gemma4_pair(getattr(args, "model", None))
-    ):
+    if not _server_flag_present(
+        explicit_flags, "backend-id"
+    ) and _model_ref_is_gemma4_pair(getattr(args, "model", None)):
         args.backend_id = GEMMA4_BACKEND
 
     sync_backend_arg_aliases(args)
@@ -25286,7 +25437,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fan-mode",
         choices=FAN_MODE_CHOICES,
-        default=normalize_fan_mode(os.environ.get("MTPLX_FAN_MODE") or FAN_MODE_DEFAULT),
+        default=normalize_fan_mode(
+            os.environ.get("MTPLX_FAN_MODE") or FAN_MODE_DEFAULT
+        ),
         help=(
             "Fan policy: default leaves Apple fan control alone, smart boosts "
             "only while visible requests generate, max reports sustained max mode."

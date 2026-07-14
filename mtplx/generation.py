@@ -568,6 +568,7 @@ def _prefill_cache_only_forward(
     # forward_ar, so streamed experts would classify one-token tail chunks
     # by shape as decode. Declare the phase like the other prefill call
     # sites so the routing context resolves it as prefill traffic.
+    rt.prepare_ar_cache_growth(token_array, cache)
     with attention_phase("prefill"), rt._expert_routing_context(token_array):
         if input_embeddings is not None:
             unused_logits = rt.model(
@@ -3523,6 +3524,7 @@ def _prefill(
     abort_check: Callable[[], bool] | None = None,
     vision_splice: Any | None = None,
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
+    kv_progress_callback: Callable[[int], None] | None = None,
 ):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
@@ -3564,6 +3566,8 @@ def _prefill(
                 _eval_cache_roots(cache)
             else:
                 _eval(prefill)
+            if kv_progress_callback is not None:
+                kv_progress_callback(end)
             _runtime_count(rt, "prefill_chunks")
             target_forward_time += time.perf_counter() - started
             target_forward_time += _prefill_chunk_cache_cleanup(rt)
@@ -3597,6 +3601,8 @@ def _prefill(
         _eval(logits)
     target_forward_time += time.perf_counter() - started
     target_forward_time += _maybe_repage_target_prefill_cache(cache, rt=rt)
+    if kv_progress_callback is not None:
+        kv_progress_callback(len(prompt_ids))
     _check_postcommit_abort(abort_check)
     return cache, logits[:, -1, :], hidden, target_forward_time
 
@@ -3988,6 +3994,8 @@ def generate_ar(
     seed: int = 0,
     stop_token_ids: set[int] | None = None,
     token_callback: Callable[[list[int]], None] | None = None,
+    kv_progress_callback: Callable[[int], None] | None = None,
+    abort_check: Callable[[], bool] | None = None,
     trace_label: str | None = None,
     trace_metadata: dict[str, Any] | None = None,
     prefill_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -3995,6 +4003,10 @@ def generate_ar(
     loop_guard: bool = False,
 ) -> GenerationOutput:
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
+        if kv_progress_callback is not None:
+            raise RuntimeError(
+                "logical KV progress callbacks require the native target runtime"
+            )
         from .backends.gemma4_assistant import generate_gemma4_ar
 
         return generate_gemma4_ar(
@@ -4045,6 +4057,8 @@ def generate_ar(
         rt,
         prompt_ids,
         return_hidden=ar_return_hidden,
+        kv_progress_callback=kv_progress_callback,
+        abort_check=abort_check,
     )
     if prefill_callback is not None:
         try:
@@ -4158,6 +4172,7 @@ def generate_ar(
         emit_trace()
 
     for step in range(max_tokens):
+        _check_postcommit_abort(abort_check)
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
             if _guard_transition is not None:
@@ -4222,6 +4237,8 @@ def generate_ar(
             _eval(logits_next)
         else:
             _eval(logits_next, hidden_next)
+        if kv_progress_callback is not None:
+            kv_progress_callback(len(prompt_ids) + len(tokens))
         eval_elapsed = time.perf_counter() - eval_started
         elapsed_decode = time.perf_counter() - started
         target_decode_time += elapsed_decode

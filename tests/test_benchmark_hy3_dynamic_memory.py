@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
 import subprocess
 import sys
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -40,23 +42,81 @@ def _sha(value: object) -> str:
     ).hexdigest()
 
 
+def _expert_route_binding(
+    *,
+    manifest_sha256: str,
+    route_trace: object,
+    expert_hashes: object,
+) -> dict[str, object]:
+    return {
+        "schema": "mtplx-hy3-expert-route-binding-v1",
+        "producer_verification_scope": "route-map-from-loaded-manifest",
+        "offline_verification_scope": "structural-binding-only",
+        "expert_manifest_sha256": manifest_sha256,
+        "route_trace_sha256": _sha(route_trace),
+        "expert_hashes_sha256": _sha(expert_hashes),
+    }
+
+
+_ARTIFACT_FINGERPRINT = {
+    "device": 1,
+    "inode": 2,
+    "size": 3,
+    "mtime_ns": 4,
+    "ctime_ns": 5,
+}
+_RESIDENT_SHARD_FINGERPRINTS = [
+    {
+        "name": "model-00001-of-00001.safetensors",
+        "device": 6,
+        "inode": 7,
+        "size": 8,
+        "mtime_ns": 9,
+        "ctime_ns": 10,
+    }
+]
+_ARTIFACT_STAT_SHA256 = _sha(
+    {
+        "sidecar": _ARTIFACT_FINGERPRINT,
+        "resident_shards": _RESIDENT_SHARD_FINGERPRINTS,
+    }
+)
+
+
 def _identity(arm: str = "dynamic") -> dict[str, object]:
     arm_config = {
         "dynamic_memory": arm == "dynamic",
+        "attention_runtime_env": dict(
+            runner_module.HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV
+        ),
         "context_window": 131_072,
         "kv_quantization": "q4",
         "max_active_sequences": 1,
-        "expert_streaming_config": {"expert_slab_slots": 32},
+        "expert_streaming_config": {
+            "expert_slab_slots": 32,
+            "allocator_headroom_bytes": 1024**3,
+            "kv_bytes_per_token_override": 84_480,
+            "memory_limit_bytes": 110 * 1024**3,
+            "max_live_kv_tokens": 131_072,
+            "runtime_reserve_bytes": 8 * 1024**3,
+            "transient_slots": 32,
+            "cache_scope": "global",
+            "slot_layout": "component-banks",
+            "dynamic_expert_slabs": arm == "dynamic",
+        },
+        "planned_persistent_slots": 9_696 if arm == "dynamic" else 8_673,
     }
-    normalized_config = {
-        key: value for key, value in arm_config.items() if key != "dynamic_memory"
-    }
+    normalized_config = runner_module.normalize_arm_config(arm_config)
     return {
         "model_key": "hy3-q4",
         "model_artifact_id": "pipenetwork/Hy3-4bit@160619d3",
         "model_artifact_sha256": "a" * 64,
         "expert_manifest_id": "hy3-q4/component-banks/manifest.json",
         "expert_manifest_sha256": "b" * 64,
+        "artifact_pins_sha256": "d" * 64,
+        "artifact_stat_sha256": _ARTIFACT_STAT_SHA256,
+        "resident_payload_bytes": 3,
+        "resident_payload_sha256": "e" * 64,
         "source_git_commit": "c" * 40,
         "arm_config": arm_config,
         "arm_config_sha256": _sha(arm_config),
@@ -68,22 +128,45 @@ def _identity(arm: str = "dynamic") -> dict[str, object]:
     }
 
 
+def _quality_identity() -> dict[str, object]:
+    identity = _identity()
+    return {
+        field: identity[field]
+        for field in (
+            "model_artifact_id",
+            "model_artifact_sha256",
+            "expert_manifest_sha256",
+            "artifact_pins_sha256",
+            "artifact_stat_sha256",
+            "resident_payload_bytes",
+            "resident_payload_sha256",
+            "source_git_commit",
+        )
+    }
+
+
 def _production_lane_identity(arm: str) -> dict[str, object]:
     identity = _identity(arm)
     identity["arm_config"] = {
         "dynamic_memory": arm == "dynamic",
+        "attention_runtime_env": dict(
+            runner_module.HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV
+        ),
         "expert_streaming_config": {
             "model_key": "hy3-q4",
             "memory_limit_bytes": 110 * 1024**3,
             "max_live_kv_tokens": 131_072,
+            "kv_bytes_per_token_override": 84_480,
             "runtime_reserve_bytes": 8 * 1024**3,
+            "allocator_headroom_bytes": 1024**3,
+            "transient_slots": 32,
             "cache_policy": "lru",
             "cache_scope": "global",
             "slot_layout": "component-banks",
             "dynamic_expert_slabs": arm == "dynamic",
             "expert_slab_slots": 32,
         },
-        "planned_persistent_slots": 9_792 if arm == "dynamic" else 5_771,
+        "planned_persistent_slots": 9_696 if arm == "dynamic" else 8_673,
         "probe_slab_ids": [0, 1],
     }
     return identity
@@ -97,6 +180,7 @@ def _slot_health() -> dict[str, int]:
         "failed": 0,
         "integrity_errors": 0,
         "completion_fence_failures": 0,
+        "global_device_synchronizations": 0,
     }
 
 
@@ -117,6 +201,11 @@ def _performance_samples(tok_s: float) -> list[dict[str, object]]:
                 "expert_ids": [3, 7, 11],
             }
         ]
+        expert_hashes = {
+            f"{index + 1}:3": "2" * 64,
+            f"{index + 1}:7": "3" * 64,
+            f"{index + 1}:11": "4" * 64,
+        }
         result.append(
             {
                 "tokens_per_second": tok_s * multiplier,
@@ -128,6 +217,12 @@ def _performance_samples(tok_s: float) -> list[dict[str, object]]:
                 "generated_token_sha256": _sha(generated_tokens),
                 "route_trace": route_trace,
                 "route_trace_sha256": _sha(route_trace),
+                "expert_hashes": expert_hashes,
+                "expert_route_binding": _expert_route_binding(
+                    manifest_sha256="b" * 64,
+                    route_trace=route_trace,
+                    expert_hashes=expert_hashes,
+                ),
             }
         )
     return result
@@ -139,6 +234,7 @@ def _point(
     *,
     expert: int,
     kv_blocks: int,
+    kv_logical_tokens: int | None = None,
     active: int | None = None,
     cache: int = 0,
 ) -> dict[str, object]:
@@ -162,10 +258,18 @@ def _point(
         "slot_health_sha256": _sha(health),
         "operating_target_bytes": 110 * 1024**3,
         "hard_ceiling_bytes": 112 * 1024**3,
+        "allocator_headroom_bytes": 1024**3,
+        "classified_target_bytes": 109 * 1024**3,
+        "classified_bytes": expert + kv,
         "charged_bytes": expert + kv + allocator_cache_charged_bytes,
+        "charged_residual_bytes": (
+            110 * 1024**3 - expert - kv - allocator_cache_charged_bytes
+        ),
         "resident_model_bytes": 0,
         "kv_representation": "q4",
-        "kv_logical_tokens": kv_blocks * 16,
+        "kv_logical_tokens": (
+            kv_blocks * 16 if kv_logical_tokens is None else kv_logical_tokens
+        ),
         "expert_logical_records": expert,
         "expert_active_records": expert,
         "expert_resident_records": expert,
@@ -206,25 +310,124 @@ def _observation(
     tok_s: float,
 ) -> dict[str, object]:
     tokens = [101, context_tokens, 202]
-    routes = [[0, 3, 7], [1, 2, 9]]
+    routes = [
+        {"phase": "ar_decode", "layer": 0, "expert_ids": [3, 7]},
+        {"phase": "ar_decode", "layer": 1, "expert_ids": [2, 9]},
+    ]
     if arm == "dynamic":
         final_blocks = context_tokens // 16
         timeline = [
-            _point("pre_growth", 1, expert=800, kv_blocks=1),
-            _point("post_expert_reclaim", 2, expert=600, kv_blocks=1),
-            _point("post_kv_growth", 3, expert=600, kv_blocks=final_blocks),
-            _point("hold", 4_000_000_000, expert=600, kv_blocks=final_blocks),
-            _point("hold", 4_500_000_000, expert=600, kv_blocks=final_blocks),
-            _point("hold", 5_000_000_000, expert=600, kv_blocks=final_blocks),
+            _point("pre_growth", 1, expert=800, kv_blocks=1, kv_logical_tokens=1),
+            _point(
+                "post_expert_reclaim",
+                20,
+                expert=600,
+                kv_blocks=1,
+                kv_logical_tokens=1,
+            ),
+            _point(
+                "post_kv_growth",
+                70,
+                expert=600,
+                kv_blocks=final_blocks,
+                kv_logical_tokens=context_tokens,
+            ),
+            _point(
+                "hold",
+                4_000_000_000,
+                expert=600,
+                kv_blocks=final_blocks,
+                kv_logical_tokens=context_tokens,
+            ),
+            _point(
+                "hold",
+                4_500_000_000,
+                expert=600,
+                kv_blocks=final_blocks,
+                kv_logical_tokens=context_tokens,
+            ),
+            _point(
+                "hold",
+                5_000_000_000,
+                expert=600,
+                kv_blocks=final_blocks,
+                kv_logical_tokens=context_tokens,
+            ),
             _point("post_reset", 6_000_000_000, expert=600, kv_blocks=0),
             _point("post_regrow", 7_000_000_000, expert=800, kv_blocks=0),
         ]
+
+        def growth_ledger(point: Mapping[str, object]) -> dict[str, object]:
+            return {
+                key: value
+                for key, value in point.items()
+                if key not in {"phase", "monotonic_ns", "slot_health_sha256"}
+            }
+
+        first_before = growth_ledger(timeline[0])
+        first_gap = growth_ledger(timeline[1])
+        first_gap["captured_monotonic_ns"] = 20
+        first_after = growth_ledger(
+            _point(
+                "growth_step_0_after",
+                30,
+                expert=600,
+                kv_blocks=final_blocks - 1,
+                kv_logical_tokens=1,
+            )
+        )
+        second_gap = dict(first_after)
+        second_gap["captured_monotonic_ns"] = 50
+        second_after = growth_ledger(
+            _point(
+                "growth_step_1_after",
+                60,
+                expert=600,
+                kv_blocks=final_blocks,
+                kv_logical_tokens=1,
+            )
+        )
+        kv_growth_steps = [
+            {
+                "sequence_index": 0,
+                "requested_tokens": (final_blocks - 1) * 16,
+                "target_blocks": final_blocks - 1,
+                "before_monotonic_ns": 10,
+                "reclaim_monotonic_ns": 20,
+                "after_monotonic_ns": 30,
+                "before": first_before,
+                "reclaim_gap": first_gap,
+                "after": first_after,
+                "steady_delta_bytes": (final_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
+                "max_transient_delta_bytes": (final_blocks - 1)
+                * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "reclaimed_expert_bytes": 200,
+                "kv_growth_bytes": (final_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
+            },
+            {
+                "sequence_index": 1,
+                "requested_tokens": context_tokens,
+                "target_blocks": final_blocks,
+                "before_monotonic_ns": 40,
+                "reclaim_monotonic_ns": 50,
+                "after_monotonic_ns": 60,
+                "before": first_after,
+                "reclaim_gap": second_gap,
+                "after": second_after,
+                "steady_delta_bytes": HY3_Q4_KV_BLOCK_BYTES,
+                "max_transient_delta_bytes": final_blocks
+                * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "reclaimed_expert_bytes": 0,
+                "kv_growth_bytes": HY3_Q4_KV_BLOCK_BYTES,
+            },
+        ]
         start = {
-            "kind": "empty-q4",
+            "kind": "dynamic-declared-q4",
             "kv_physical_bytes": HY3_Q4_KV_BLOCK_BYTES,
             "kv_blocks": 1,
         }
     else:
+        kv_growth_steps = []
         timeline = [
             _point("pre_growth", 1, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
             _point("post_kv_growth", 2, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
@@ -239,6 +442,12 @@ def _observation(
             "kv_blocks": HY3_Q4_MAX_BLOCKS,
         }
     identity = _identity(arm)
+    expert_hashes = {
+        "0:3": "2" * 64,
+        "0:7": "3" * 64,
+        "1:2": "4" * 64,
+        "1:9": "5" * 64,
+    }
     return {
         "schema": "mtplx-hy3-dynamic-memory-observation-v1",
         "arm": arm,
@@ -251,7 +460,13 @@ def _observation(
         "generated_token_sha256": _sha(tokens),
         "route_trace": routes,
         "route_trace_sha256": _sha(routes),
-        "expert_hashes": {"0:3": "2" * 64, "1:2": "3" * 64},
+        "expert_hashes": expert_hashes,
+        "expert_route_binding": _expert_route_binding(
+            manifest_sha256=str(identity["expert_manifest_sha256"]),
+            route_trace=routes,
+            expert_hashes=expert_hashes,
+        ),
+        "kv_growth_steps": kv_growth_steps,
         "timeline": timeline,
         "metrics": {
             "generated_tokens": len(tokens),
@@ -305,6 +520,26 @@ def _probe_result(*, released: int = 128, untouched_executable: bool = True):
     }
 
 
+def _artifact_attestation(**overrides: object) -> dict[str, object]:
+    result: dict[str, object] = {
+        "schema": "mtplx-hy3-artifact-attestation-v1",
+        "model_artifact_sha256": "a" * 64,
+        "expert_manifest_sha256": "b" * 64,
+        "artifact_pins_sha256": "d" * 64,
+        "artifact_stat_sha256": _ARTIFACT_STAT_SHA256,
+        "sidecar_fingerprint": dict(_ARTIFACT_FINGERPRINT),
+        "resident_payload_bytes": 3,
+        "resident_payload_sha256": "e" * 64,
+        "resident_shard_fingerprints": [
+            dict(value) for value in _RESIDENT_SHARD_FINGERPRINTS
+        ],
+        "payload_hash_verified": True,
+        "payload_hash_io_mode": "f-nocache",
+    }
+    result.update(overrides)
+    return result
+
+
 def test_context_matrix_and_schedule_balance_both_physical_orders() -> None:
     assert CONTEXT_MATRIX_TOKENS == (4096, 32768, 65536, 131072)
 
@@ -336,12 +571,19 @@ def test_observation_requires_declared_start_and_physical_ordering() -> None:
     assert isinstance(validated.cache_start_state, CacheStartState)
     assert validated.context_tokens == 4096
 
+    stale_kind = _observation("dynamic", 4096, 0, tok_s=12.0)
+    stale_kind["cache_start_state"]["kind"] = "empty-q4"
+    with pytest.raises(BenchmarkGateError, match="dynamic-declared-q4"):
+        validate_campaign_observation(stale_kind)
+
     reordered = _observation("dynamic", 4096, 0, tok_s=12.0)
     reordered["timeline"][1]["kv_allocated_blocks"] = 2
     reordered["timeline"][1]["kv_physical_bytes"] = 2 * HY3_Q4_KV_BLOCK_BYTES
     reordered["timeline"][1]["allocator_active_bytes"] += HY3_Q4_KV_BLOCK_BYTES
     reordered["timeline"][1]["allocator_peak_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+    reordered["timeline"][1]["classified_bytes"] += HY3_Q4_KV_BLOCK_BYTES
     reordered["timeline"][1]["charged_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+    reordered["timeline"][1]["charged_residual_bytes"] -= HY3_Q4_KV_BLOCK_BYTES
     with pytest.raises(BenchmarkGateError, match="before KV"):
         validate_campaign_observation(reordered)
 
@@ -353,6 +595,95 @@ def test_observation_requires_exact_issue46_q4_physical_geometry() -> None:
 
     static = validate_campaign_observation(_observation("static", 4096, 0, tok_s=12.0))
     assert static.cache_start_state.kv_physical_bytes == int(10.3125 * 1024**3)
+
+
+def test_dynamic_observation_rejects_overallocated_q4_blocks() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    for point in row["timeline"]:
+        if point["phase"] not in {"post_kv_growth", "hold"}:
+            continue
+        point["kv_allocated_blocks"] += 1
+        point["kv_physical_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+        point["allocator_active_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+        point["allocator_peak_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+        point["classified_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+        point["charged_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+        point["charged_residual_bytes"] -= HY3_Q4_KV_BLOCK_BYTES
+        point["process_rss_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+    row["metrics"]["peak_charged_bytes"] = max(
+        point["charged_bytes"] for point in row["timeline"]
+    )
+    row["metrics"]["stress_peak_charged_bytes"] = max(
+        max(
+            point["allocator_peak_bytes"] + point["allocator_cache_bytes"],
+            point["charged_bytes"],
+        )
+        for point in row["timeline"]
+    )
+
+    with pytest.raises(BenchmarkGateError, match="exactly cover"):
+        validate_campaign_observation(row)
+
+
+def test_production_identity_pins_every_q4_attention_route_control() -> None:
+    expected = {
+        "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
+        "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
+        "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "0",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "0",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "mlx_vector_paged",
+        "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "1",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "off",
+        "MTPLX_PAGED_GQA_SDPA_ROUTE": "off",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA": "0",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT": "65536",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q": "4",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q": "5",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q": "16",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE": "2048",
+        "MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE": "1024",
+    }
+
+    for arm in ("static", "dynamic"):
+        identity = _production_lane_identity(arm)
+        assert identity["arm_config"]["attention_runtime_env"] == expected
+
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    arm_config = row["identity"]["arm_config"]
+    arm_config["attention_runtime_env"]["MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q"] = "4096"
+    row["identity"]["arm_config_sha256"] = _sha(arm_config)
+    normalized = runner_module.normalize_arm_config(arm_config)
+    row["identity"]["normalized_config"] = normalized
+    row["identity"]["normalized_config_sha256"] = _sha(normalized)
+
+    with pytest.raises(
+        BenchmarkGateError, match="exact full-history Q4 attention route"
+    ):
+        validate_campaign_observation(row)
+
+
+def test_observation_requires_exact_headroom_and_classified_limit() -> None:
+    wrong_headroom = _observation("dynamic", 4096, 0, tok_s=12.0)
+    point = wrong_headroom["timeline"][0]
+    point["allocator_headroom_bytes"] = 0
+    point["classified_target_bytes"] = 110 * 1024**3
+    with pytest.raises(BenchmarkGateError, match="exactly 1 GiB"):
+        validate_campaign_observation(wrong_headroom)
+
+    overclassified = _observation("dynamic", 4096, 0, tok_s=12.0)
+    point = overclassified["timeline"][0]
+    delta = int(point["classified_target_bytes"]) + 1 - int(point["classified_bytes"])
+    point["expert_slab_physical_bytes"] += delta
+    point["allocator_active_bytes"] += delta
+    point["allocator_peak_bytes"] += delta
+    point["classified_bytes"] += delta
+    point["charged_bytes"] += delta
+    point["charged_residual_bytes"] -= delta
+    point["process_rss_bytes"] += delta
+    with pytest.raises(BenchmarkGateError, match="exceeds the classified target"):
+        validate_campaign_observation(overclassified)
 
     bad_start = _observation("dynamic", 4096, 0, tok_s=12.0)
     bad_start["cache_start_state"]["kv_physical_bytes"] += 1
@@ -375,6 +706,7 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     unstable["timeline"][4]["allocator_cache_bytes"] = 1
     unstable["timeline"][4]["allocator_cache_charged_bytes"] = 1
     unstable["timeline"][4]["charged_bytes"] += 1
+    unstable["timeline"][4]["charged_residual_bytes"] -= 1
     with pytest.raises(BenchmarkGateError, match="stable hold"):
         validate_campaign_observation(unstable)
 
@@ -400,6 +732,10 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
         800 + 255 * HY3_Q4_KV_BLOCK_BYTES
     )
     no_boundary["timeline"][0]["charged_bytes"] = 800 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    no_boundary["timeline"][0]["classified_bytes"] = 800 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    no_boundary["timeline"][0]["charged_residual_bytes"] = (
+        110 * 1024**3 - 800 - 255 * HY3_Q4_KV_BLOCK_BYTES
+    )
     no_boundary["timeline"][1]["kv_allocated_blocks"] = 255
     no_boundary["timeline"][1]["kv_physical_bytes"] = 255 * HY3_Q4_KV_BLOCK_BYTES
     no_boundary["timeline"][1]["allocator_active_bytes"] = (
@@ -409,8 +745,14 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
         600 + 255 * HY3_Q4_KV_BLOCK_BYTES
     )
     no_boundary["timeline"][1]["charged_bytes"] = 600 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    no_boundary["timeline"][1]["classified_bytes"] = 600 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    no_boundary["timeline"][1]["charged_residual_bytes"] = (
+        110 * 1024**3 - 600 - 255 * HY3_Q4_KV_BLOCK_BYTES
+    )
     no_boundary["timeline"][2]["kv_allocated_blocks"] = 256
-    with pytest.raises(BenchmarkGateError, match="block boundaries"):
+    with pytest.raises(
+        BenchmarkGateError, match="one physical Q4 block|first KV growth"
+    ):
         validate_campaign_observation(no_boundary)
 
     too_short = _observation("dynamic", 4096, 0, tok_s=12.0)
@@ -423,6 +765,116 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     del no_perf_samples["metrics"]["hold_performance_samples"]
     with pytest.raises(BenchmarkGateError, match="hold_performance_samples"):
         validate_campaign_observation(no_perf_samples)
+
+
+def test_observation_requires_exact_phase_order_and_logical_kv_bounds() -> None:
+    static_reordered = _observation("static", 4096, 0, tok_s=12.0)
+    static_reordered["timeline"][0]["phase"] = "post_kv_growth"
+    static_reordered["timeline"][1]["phase"] = "pre_growth"
+    with pytest.raises(BenchmarkGateError, match="order pre-growth"):
+        validate_campaign_observation(static_reordered)
+
+    reset_between_holds = _observation("dynamic", 4096, 0, tok_s=12.0)
+    reset = reset_between_holds["timeline"].pop(6)
+    reset["monotonic_ns"] = 4_250_000_000
+    reset_between_holds["timeline"].insert(4, reset)
+    with pytest.raises(BenchmarkGateError, match="every hold"):
+        validate_campaign_observation(reset_between_holds)
+
+    no_logical_context = _observation("dynamic", 4096, 0, tok_s=12.0)
+    no_logical_context["timeline"][2]["kv_logical_tokens"] = 0
+    with pytest.raises(BenchmarkGateError, match="requested context"):
+        validate_campaign_observation(no_logical_context)
+
+    impossible_logical_capacity = _observation("dynamic", 4096, 0, tok_s=12.0)
+    impossible_logical_capacity["timeline"][0]["kv_logical_tokens"] = 17
+    with pytest.raises(BenchmarkGateError, match="physical Q4 capacity"):
+        validate_campaign_observation(impossible_logical_capacity)
+
+
+@pytest.mark.parametrize("phase", ("pre_growth", "post_expert_reclaim"))
+def test_dynamic_observation_rejects_pre_growth_logical_page_capacity(
+    phase: str,
+) -> None:
+    observation = _observation("dynamic", 4096, 0, tok_s=12.0)
+    target = next(point for point in observation["timeline"] if point["phase"] == phase)
+    target["kv_logical_tokens"] = 16
+
+    with pytest.raises(BenchmarkGateError, match="logical KV ownership.*exactly 1"):
+        validate_campaign_observation(observation)
+
+
+@pytest.mark.parametrize(
+    ("step_index", "ledger_name"),
+    tuple(
+        (step_index, ledger_name)
+        for step_index in (0, 1)
+        for ledger_name in ("before", "reclaim_gap", "after")
+    ),
+)
+def test_dynamic_observation_rejects_growth_ledger_logical_page_capacity(
+    step_index: int,
+    ledger_name: str,
+) -> None:
+    observation = _observation("dynamic", 4096, 0, tok_s=12.0)
+    observation["kv_growth_steps"][step_index][ledger_name]["kv_logical_tokens"] = 16
+
+    with pytest.raises(BenchmarkGateError, match="logical KV ownership.*exactly 1"):
+        validate_campaign_observation(observation)
+
+
+def test_observation_rejects_hold_resize_churn_and_fixed_pool_drift() -> None:
+    churn = _observation("dynamic", 4096, 0, tok_s=12.0)
+    cumulative_fields = (
+        "requested_reclaim_bytes",
+        "reclaimed_bytes",
+        "regrown_bytes",
+        "evicted_expert_records",
+        "evicted_expert_slabs",
+        "resize_duration_ns",
+        "total_resize_duration_ns",
+        "max_resize_duration_ns",
+        "blocked_by_pin_bytes",
+    )
+    for increment, point in enumerate(churn["timeline"][4:6], start=1):
+        for field in cumulative_fields:
+            point[field] += increment
+    with pytest.raises(BenchmarkGateError, match="classified or charged memory ledger"):
+        validate_campaign_observation(churn)
+
+    fixed_drift = _observation("dynamic", 4096, 0, tok_s=12.0)
+    point = fixed_drift["timeline"][1]
+    point["resident_model_bytes"] += 1
+    point["classified_bytes"] += 1
+    point["charged_bytes"] += 1
+    point["charged_residual_bytes"] -= 1
+    with pytest.raises(BenchmarkGateError, match="fixed physical memory pools"):
+        validate_campaign_observation(fixed_drift)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("memory_limit_bytes", 1, "memory_limit_bytes"),
+        ("dynamic_expert_slabs", False, "contradicts"),
+    ),
+)
+def test_observation_identity_binds_the_resolved_runtime_lane(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    identity = row["identity"]
+    arm_config = identity["arm_config"]
+    arm_config["expert_streaming_config"][field] = value
+    identity["arm_config_sha256"] = _sha(arm_config)
+    normalized = runner_module.normalize_arm_config(arm_config)
+    identity["normalized_config"] = normalized
+    identity["normalized_config_sha256"] = _sha(normalized)
+
+    with pytest.raises(BenchmarkGateError, match=match):
+        validate_campaign_observation(row)
 
 
 def test_production_arm_interventions_normalize_to_one_paired_identity() -> None:
@@ -440,8 +892,8 @@ def test_production_arm_interventions_normalize_to_one_paired_identity() -> None
     static = validated_identities["static"]
     dynamic = validated_identities["dynamic"]
     assert static["arm_config"] != dynamic["arm_config"]
-    assert static["arm_config"]["planned_persistent_slots"] == 5_771
-    assert dynamic["arm_config"]["planned_persistent_slots"] == 9_792
+    assert static["arm_config"]["planned_persistent_slots"] == 8_673
+    assert dynamic["arm_config"]["planned_persistent_slots"] == 9_696
     assert static["normalized_config"] == dynamic["normalized_config"]
     assert static["normalized_config_sha256"] == dynamic["normalized_config_sha256"]
 
@@ -474,6 +926,8 @@ def test_observation_requires_and_preserves_detailed_performance_samples() -> No
         "generated_token_sha256",
         "route_trace",
         "route_trace_sha256",
+        "expert_hashes",
+        "expert_route_binding",
     ),
 )
 def test_observation_requires_every_detailed_performance_field(field: str) -> None:
@@ -555,7 +1009,7 @@ def test_observation_recomputes_token_route_and_slot_health_hashes() -> None:
         validate_campaign_observation(row)
 
     row = _observation("dynamic", 4096, 0, tok_s=12.0)
-    row["route_trace"][0].append(11)
+    row["route_trace"][0]["expert_ids"].append(11)
     with pytest.raises(BenchmarkGateError, match="route_trace_sha256"):
         validate_campaign_observation(row)
 
@@ -567,6 +1021,191 @@ def test_observation_recomputes_token_route_and_slot_health_hashes() -> None:
     row = _observation("dynamic", 4096, 0, tok_s=12.0)
     row["identity"]["arm_config"]["context_window"] = 65_536
     with pytest.raises(BenchmarkGateError, match="arm_config_sha256"):
+        validate_campaign_observation(row)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "wrong_route"))
+def test_observation_expert_hashes_cover_exact_routed_pairs(mutation: str) -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    if mutation == "missing":
+        del row["expert_hashes"]["0:7"]
+    elif mutation == "extra":
+        row["expert_hashes"]["2:11"] = "6" * 64
+    else:
+        row["route_trace"][0]["expert_ids"] = [3, 11]
+        row["route_trace_sha256"] = canonical_sha256(row["route_trace"])
+
+    with pytest.raises(BenchmarkGateError, match="expert hashes.*routed"):
+        validate_campaign_observation(row)
+
+
+def test_observation_rejects_zeroed_expert_hash_with_unchanged_binding() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    row["expert_hashes"]["0:3"] = "0" * 64
+
+    with pytest.raises(BenchmarkGateError, match=r"expert.*SHA-256|zero"):
+        validate_campaign_observation(row)
+
+
+@pytest.mark.parametrize("mutation", ("malformed_route", "missing_hash", "extra_hash"))
+def test_observation_rejects_unbound_hold_route_payload(
+    mutation: str,
+) -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    sample = row["metrics"]["performance_samples"][0]
+    if mutation == "malformed_route":
+        sample["route_trace"] = [{"phase": "ar_decode", "layer": 1}]
+        sample["route_trace_sha256"] = canonical_sha256(sample["route_trace"])
+    elif mutation == "missing_hash":
+        del sample["expert_hashes"]["1:7"]
+    else:
+        sample["expert_hashes"]["9:9"] = "9" * 64
+
+    with pytest.raises(BenchmarkGateError, match=r"route|expert hashes|binding"):
+        validate_campaign_observation(row)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("expert_manifest_sha256", "f" * 64),
+        ("route_trace_sha256", "f" * 64),
+        ("expert_hashes_sha256", "f" * 64),
+        ("producer_verification_scope", "unverified"),
+        ("offline_verification_scope", "content-verified"),
+    ),
+)
+def test_observation_rejects_false_expert_route_binding(
+    field: str,
+    value: str,
+) -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    row["expert_route_binding"][field] = value
+
+    with pytest.raises(BenchmarkGateError, match=r"expert_route_binding|binding"):
+        validate_campaign_observation(row)
+
+
+def test_observation_rejects_hold_zeroed_hash_even_if_binding_is_recomputed() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    sample = row["metrics"]["performance_samples"][0]
+    sample["expert_hashes"]["1:3"] = "0" * 64
+    sample["expert_route_binding"]["expert_hashes_sha256"] = canonical_sha256(
+        sample["expert_hashes"]
+    )
+
+    with pytest.raises(BenchmarkGateError, match=r"expert.*SHA-256|zero"):
+        validate_campaign_observation(row)
+
+
+def test_observation_recomputes_exact_per_entry_growth_transient() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    row["kv_growth_steps"][0]["max_transient_delta_bytes"] += 1
+
+    with pytest.raises(BenchmarkGateError, match="transient.*geometry"):
+        validate_campaign_observation(row)
+
+
+def test_observation_requires_complete_growth_resource_ledgers() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    del row["kv_growth_steps"][0]["reclaim_gap"]["charged_bytes"]
+
+    with pytest.raises(BenchmarkGateError, match=r"reclaim_gap.*charged_bytes"):
+        validate_campaign_observation(row)
+
+
+def test_observation_rejects_unaccounted_two_tib_growth_allocator_footprint() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    gap = row["kv_growth_steps"][0]["reclaim_gap"]
+    gap["allocator_active_bytes"] = 1024**4
+    gap["allocator_cache_bytes"] = 1024**4
+
+    with pytest.raises(BenchmarkGateError, match=r"charged|allocator"):
+        validate_campaign_observation(row)
+
+
+@pytest.mark.parametrize("ledger_kind", ("charged", "classified", "transient"))
+def test_observation_growth_ledgers_stay_strictly_below_hard_ceiling(
+    ledger_kind: str,
+) -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    gap = row["kv_growth_steps"][0]["reclaim_gap"]
+    hard_ceiling = 112 * 1024**3
+    if ledger_kind == "charged":
+        gap["charged_bytes"] = hard_ceiling
+        gap["charged_residual_bytes"] = 110 * 1024**3 - hard_ceiling
+        gap["allocator_cache_charged_bytes"] = hard_ceiling - gap["classified_bytes"]
+    elif ledger_kind == "classified":
+        increase = hard_ceiling - gap["classified_bytes"]
+        gap["runtime_workspace_bytes"] += increase
+        gap["classified_bytes"] = hard_ceiling
+        gap["charged_bytes"] += increase
+        gap["charged_residual_bytes"] -= increase
+        gap["allocator_active_bytes"] += increase
+        gap["allocator_peak_bytes"] += increase
+    else:
+        gap["allocator_peak_bytes"] = hard_ceiling
+
+    with pytest.raises(BenchmarkGateError, match=r"112 GiB|hard ceiling|classified"):
+        validate_campaign_observation(row)
+
+
+def _adjust_growth_expert_ledger(ledger: dict[str, object], delta: int) -> None:
+    ledger["expert_slab_physical_bytes"] += delta
+    ledger["allocator_active_bytes"] += delta
+    ledger["allocator_peak_bytes"] += delta
+    ledger["classified_bytes"] += delta
+    ledger["charged_bytes"] += delta
+    ledger["charged_residual_bytes"] -= delta
+    ledger["process_rss_bytes"] += delta
+
+
+@pytest.mark.parametrize("checkpoint", ("first_before", "reclaim", "final_after"))
+def test_observation_cross_links_growth_ledgers_to_timeline(checkpoint: str) -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    steps = row["kv_growth_steps"]
+    if checkpoint == "first_before":
+        _adjust_growth_expert_ledger(steps[0]["before"], 1)
+        steps[0]["reclaimed_expert_bytes"] += 1
+    elif checkpoint == "reclaim":
+        gap = steps[0]["reclaim_gap"]
+        gap["allocator_cache_bytes"] += 1
+        gap["allocator_cache_charged_bytes"] += 1
+        gap["charged_bytes"] += 1
+        gap["charged_residual_bytes"] -= 1
+    else:
+        _adjust_growth_expert_ledger(steps[-1]["after"], -1)
+
+    with pytest.raises(BenchmarkGateError, match=r"timeline.*growth|growth.*timeline"):
+        validate_campaign_observation(row)
+
+
+@pytest.mark.parametrize("checkpoint", ("pre", "reclaim", "growth"))
+def test_observation_cross_links_growth_timestamps_to_timeline(
+    checkpoint: str,
+) -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    if checkpoint == "pre":
+        row["timeline"][0]["monotonic_ns"] = 11
+    elif checkpoint == "reclaim":
+        row["timeline"][1]["monotonic_ns"] = 21
+    else:
+        row["timeline"][2]["monotonic_ns"] = 59
+
+    with pytest.raises(BenchmarkGateError, match=r"timeline.*growth|growth.*timeline"):
+        validate_campaign_observation(row)
+
+
+def test_observation_rejects_a_global_device_synchronization() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=10.0)
+    for point in row["timeline"]:
+        point["slot_health"]["global_device_synchronizations"] = 1
+        point["slot_health_sha256"] = _sha(point["slot_health"])
+
+    with pytest.raises(
+        BenchmarkGateError,
+        match="global_device_synchronizations",
+    ):
         validate_campaign_observation(row)
 
 
@@ -660,6 +1299,807 @@ def test_balanced_campaign_retains_raw_pairs_and_confidence_intervals() -> None:
         assert low <= 1.1 <= high
 
 
+def test_subprocess_campaign_attests_artifact_after_every_arm() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        calls.append(command)
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            return _artifact_attestation()
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    result = runner_module.run_subprocess_campaign(
+        probe_command=("probe",),
+        artifact_verify_command=("verify-artifact",),
+        arm_command_template=("arm", "{arm}", "{context_tokens}", "{repetition}"),
+        repetitions=2,
+        command_runner=run,
+        bootstrap_resamples=100,
+    )
+
+    assert calls[0] == ("probe",)
+    assert calls[-1] == ("verify-artifact",)
+    assert len(calls[1:-1]) == len(CONTEXT_MATRIX_TOKENS) * 2 * 2
+    assert result["post_campaign_artifact_attestation"] == _artifact_attestation()
+
+
+def test_subprocess_campaign_runs_kv_quality_before_final_artifact_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.benchmarks import hy3_kv_quality
+
+    calls: list[tuple[str, ...]] = []
+    quality = {
+        "schema": "mtplx-hy3-kv-quality-v1",
+        "identity": _quality_identity(),
+        "acceptance": {"passed": True, "gates": {"retrieval": True}},
+    }
+
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        calls.append(command)
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("quality",):
+            return quality
+        if command == ("verify-artifact",):
+            return _artifact_attestation()
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    monkeypatch.setattr(
+        hy3_kv_quality,
+        "validate_quality_result",
+        lambda value: value["acceptance"],
+    )
+    result = runner_module.run_subprocess_campaign(
+        probe_command=("probe",),
+        quality_command=("quality",),
+        artifact_verify_command=("verify-artifact",),
+        arm_command_template=("arm", "{arm}", "{context_tokens}", "{repetition}"),
+        repetitions=2,
+        command_runner=run,
+        bootstrap_resamples=100,
+    )
+
+    assert calls[-2:] == [("quality",), ("verify-artifact",)]
+    assert result["kv_quality"] == quality
+    assert result["acceptance"]["quality_gate_status"] == "passed"
+
+
+def test_subprocess_campaign_wires_outer_deadline_to_every_actual_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.benchmarks import hy3_kv_quality
+
+    calls: list[tuple[tuple[str, ...], float, float]] = []
+    quality = {
+        "schema": "mtplx-hy3-kv-quality-v1",
+        "identity": _quality_identity(),
+        "acceptance": {"passed": True, "gates": {"retrieval": True}},
+    }
+
+    def run_json(command, *, timeout_seconds, termination_grace_seconds, **_kwargs):
+        actual = tuple(command)
+        calls.append((actual, timeout_seconds, termination_grace_seconds))
+        if actual == ("probe",):
+            return _probe_result()
+        if actual == ("verify-artifact",):
+            return _artifact_attestation()
+        _, arm, context_tokens, repetition = actual
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    def run_quality(
+        command,
+        *,
+        timeout_seconds,
+        termination_grace_seconds,
+        **_kwargs,
+    ):
+        calls.append((tuple(command), timeout_seconds, termination_grace_seconds))
+        return quality, 0
+
+    monkeypatch.setattr(runner_module, "run_json_subprocess", run_json)
+    monkeypatch.setattr(runner_module, "_run_json_subprocess", run_quality)
+    monkeypatch.setattr(
+        hy3_kv_quality,
+        "validate_quality_result",
+        lambda value: value["acceptance"],
+    )
+
+    runner_module.run_subprocess_campaign(
+        probe_command=("probe",),
+        quality_command=("quality",),
+        artifact_verify_command=("verify-artifact",),
+        arm_command_template=("arm", "{arm}", "{context_tokens}", "{repetition}"),
+        repetitions=2,
+        bootstrap_resamples=100,
+        subprocess_timeout_seconds=123.0,
+        subprocess_termination_grace_seconds=4.0,
+    )
+
+    assert calls[0][0] == ("probe",)
+    assert calls[-2][0] == ("quality",)
+    assert calls[-1][0] == ("verify-artifact",)
+    assert len(calls) == 1 + len(CONTEXT_MATRIX_TOKENS) * 2 * 2 + 2
+    assert all(timeout == 123.0 for _command, timeout, _grace in calls)
+    assert all(grace == 4.0 for _command, _timeout, grace in calls)
+
+
+def test_subprocess_campaign_retains_quality_rejection_and_still_hashes_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.benchmarks import hy3_kv_quality
+
+    calls: list[tuple[str, ...]] = []
+    quality = {
+        "schema": "mtplx-hy3-kv-quality-v1",
+        "identity": _quality_identity(),
+        "acceptance": {
+            "passed": False,
+            "rejection_reasons": ["128K earliest marker retrieval failed"],
+        },
+    }
+
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        calls.append(command)
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("quality",):
+            return quality
+        if command == ("verify-artifact",):
+            return _artifact_attestation()
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    monkeypatch.setattr(
+        hy3_kv_quality,
+        "validate_quality_result",
+        lambda value: value["acceptance"],
+    )
+    result = runner_module.run_subprocess_campaign(
+        probe_command=("probe",),
+        quality_command=("quality",),
+        artifact_verify_command=("verify-artifact",),
+        arm_command_template=("arm", "{arm}", "{context_tokens}", "{repetition}"),
+        repetitions=2,
+        command_runner=run,
+        bootstrap_resamples=100,
+    )
+
+    assert calls[-2:] == [("quality",), ("verify-artifact",)]
+    assert result["status"] == "rejected"
+    assert result["acceptance"]["passed"] is False
+    assert result["acceptance"]["quality_gate_status"] == "rejected"
+    assert (
+        "128K earliest marker retrieval failed"
+        in result["acceptance"]["rejection_reasons"]
+    )
+
+
+def test_subprocess_campaign_rejects_quality_identity_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.benchmarks import hy3_kv_quality
+
+    quality_identity = _quality_identity()
+    quality_identity["source_git_commit"] = "f" * 40
+    quality = {
+        "schema": "mtplx-hy3-kv-quality-v1",
+        "identity": quality_identity,
+        "acceptance": {"passed": True, "gates": {"retrieval": True}},
+    }
+
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("quality",):
+            return quality
+        if command == ("verify-artifact",):
+            return _artifact_attestation()
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    monkeypatch.setattr(
+        hy3_kv_quality,
+        "validate_quality_result",
+        lambda value: value["acceptance"],
+    )
+    with pytest.raises(BenchmarkGateError, match="quality identity.*source_git_commit"):
+        runner_module.run_subprocess_campaign(
+            probe_command=("probe",),
+            quality_command=("quality",),
+            artifact_verify_command=("verify-artifact",),
+            arm_command_template=(
+                "arm",
+                "{arm}",
+                "{context_tokens}",
+                "{repetition}",
+            ),
+            repetitions=2,
+            command_runner=run,
+            bootstrap_resamples=100,
+        )
+
+
+def test_json_subprocess_retains_a_structured_rejection_return_code() -> None:
+    command = (
+        sys.executable,
+        "-c",
+        (
+            "import json,sys; "
+            "print(json.dumps({'acceptance': {'passed': False}})); "
+            "sys.exit(2)"
+        ),
+    )
+
+    value, returncode = runner_module._run_json_subprocess(
+        command,
+        allowed_returncodes=(0, 2),
+    )
+
+    assert returncode == 2
+    assert value == {"acceptance": {"passed": False}}
+    with pytest.raises(BenchmarkGateError, match=r"failed \(2\)"):
+        runner_module.run_json_subprocess(command)
+
+
+def test_json_subprocess_timeout_terminates_and_reaps_its_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ("hung-arm", "--context-tokens", "131072")
+    communicate_calls: list[tuple[str | None, float | None]] = []
+    termination_signals: list[tuple[int, int]] = []
+    popen_kwargs: dict[str, object] = {}
+
+    class HungProcess:
+        pid = 2468
+        returncode = None
+
+        def communicate(self, input=None, timeout=None):
+            communicate_calls.append((input, timeout))
+            if len(communicate_calls) == 1:
+                raise subprocess.TimeoutExpired(command, timeout)
+            self.returncode = -signal.SIGTERM
+            return ("", "terminated during cleanup")
+
+    def fake_popen(argv, **kwargs):
+        assert argv == command
+        popen_kwargs.update(kwargs)
+        return HungProcess()
+
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("timeout-safe path must use Popen"),
+    )
+    monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        runner_module.os,
+        "killpg",
+        lambda pgid, signum: termination_signals.append((pgid, signum)),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_process_group_exists",
+        lambda _pgid: False,
+    )
+
+    with pytest.raises(BenchmarkGateError, match=r"timed out after 0\.25 seconds"):
+        runner_module._run_json_subprocess(
+            command,
+            timeout_seconds=0.25,
+            termination_grace_seconds=0.1,
+        )
+
+    assert popen_kwargs["start_new_session"] is True
+    assert termination_signals == [(2468, signal.SIGTERM)]
+    assert communicate_calls == [(None, 0.25), (None, 0.1)]
+
+
+def test_json_subprocess_timeout_escalates_stubborn_child_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ("stubborn-probe",)
+    communicate_timeouts: list[float | None] = []
+    termination_signals: list[tuple[int, int]] = []
+
+    class StubbornProcess:
+        pid = 8642
+        returncode = None
+
+        def communicate(self, input=None, timeout=None):
+            del input
+            communicate_timeouts.append(timeout)
+            if len(communicate_timeouts) < 3:
+                raise subprocess.TimeoutExpired(command, timeout)
+            self.returncode = -signal.SIGKILL
+            return ("", "killed after grace period")
+
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("timeout-safe path must use Popen"),
+    )
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: StubbornProcess(),
+    )
+    monkeypatch.setattr(
+        runner_module.os,
+        "killpg",
+        lambda pgid, signum: termination_signals.append((pgid, signum)),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_process_group_exists",
+        lambda _pgid: False,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_wait_for_process_group_exit",
+        lambda _pgid, *, timeout_seconds: timeout_seconds == 0.05,
+    )
+
+    with pytest.raises(BenchmarkGateError, match="stubborn-probe"):
+        runner_module._run_json_subprocess(
+            command,
+            timeout_seconds=0.2,
+            termination_grace_seconds=0.05,
+        )
+
+    assert termination_signals == [
+        (8642, signal.SIGTERM),
+        (8642, signal.SIGKILL),
+    ]
+    assert communicate_timeouts == [0.2, 0.05, 0.05]
+
+
+def test_json_subprocess_interrupt_cleans_process_group_before_reraising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ("interrupted-quality",)
+    termination_signals: list[tuple[int, int]] = []
+
+    class InterruptedProcess:
+        pid = 9753
+        returncode = None
+
+        def communicate(self, input=None, timeout=None):
+            del input, timeout
+            if self.returncode is None:
+                self.returncode = -signal.SIGTERM
+                raise KeyboardInterrupt
+            return ("", "interrupted")
+
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: InterruptedProcess(),
+    )
+    monkeypatch.setattr(
+        runner_module.os,
+        "killpg",
+        lambda pgid, signum: termination_signals.append((pgid, signum)),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_process_group_exists",
+        lambda _pgid: False,
+        raising=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        runner_module._run_json_subprocess(
+            command,
+            timeout_seconds=1.0,
+            termination_grace_seconds=0.1,
+        )
+
+    assert termination_signals == [(9753, signal.SIGTERM)]
+
+
+def test_json_subprocess_masks_repeated_termination_while_reaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ("interrupted-arm",)
+    cleanup_signal_masked = False
+    mask_events: list[str] = []
+
+    class InterruptedProcess:
+        pid = 9864
+        returncode = None
+
+        @staticmethod
+        def communicate(input=None, timeout=None):
+            del input, timeout
+            raise SystemExit(128 + signal.SIGTERM)
+
+    @contextmanager
+    def blocked_termination_signals():
+        nonlocal cleanup_signal_masked
+        mask_events.append("block")
+        cleanup_signal_masked = True
+        try:
+            yield
+        finally:
+            cleanup_signal_masked = False
+            mask_events.append("unblock")
+
+    def terminate_group(process, *, grace_seconds):
+        del process, grace_seconds
+        assert cleanup_signal_masked is True
+        mask_events.append("cleanup")
+        return "", ""
+
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: InterruptedProcess(),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_blocked_termination_signals",
+        blocked_termination_signals,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_terminate_json_subprocess_group",
+        terminate_group,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        runner_module._run_json_subprocess(command)
+
+    assert raised.value.code == 128 + signal.SIGTERM
+    assert mask_events == ["block", "cleanup", "unblock"]
+
+
+def test_qwen_isolation_retains_lane_when_subprocess_group_cleanup_is_unproven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ("unkillable-arm",)
+    calls: list[object] = []
+    captured = {"loaded": True, "models": ["qwen"]}
+
+    class UnkillableProcess:
+        pid = 9975
+        returncode = None
+
+        @staticmethod
+        def communicate(input=None, timeout=None):
+            del input
+            raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: UnkillableProcess(),
+    )
+    monkeypatch.setattr(runner_module, "_signal_process_group", lambda *_args: None)
+    monkeypatch.setattr(runner_module, "_process_group_exists", lambda _pgid: True)
+    monkeypatch.setattr(
+        runner_module,
+        "_wait_for_process_group_exit",
+        lambda _pgid, *, timeout_seconds: False,
+    )
+    hooks = QwenIsolationHooks(
+        acquire_lane=lambda: calls.append("acquire"),
+        release_lane=lambda: calls.append("release"),
+        capture=lambda: calls.append("capture") or captured,
+        unload=lambda state: calls.append(("unload", state)),
+        restore=lambda state: calls.append(("restore", state)),
+        verify_restored=lambda state: calls.append(("verify", state)) or True,
+    )
+
+    with pytest.raises(BenchmarkGateError, match="survived SIGKILL"):
+        run_exclusive_hardware_window(
+            lambda: runner_module._run_json_subprocess(
+                command,
+                timeout_seconds=0.1,
+                termination_grace_seconds=0.01,
+            ),
+            hooks=hooks,
+        )
+
+    assert calls == ["acquire", "capture", ("unload", captured)]
+
+
+def test_json_subprocess_rejects_descendants_after_clean_leader_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ("leader-exits-before-child",)
+    termination_signals: list[tuple[int, int]] = []
+    group_waits: list[float] = []
+    group_exit_results = iter((False, True))
+
+    class ExitedLeader:
+        pid = 7531
+        returncode = 0
+
+        @staticmethod
+        def communicate(input=None, timeout=None):
+            del input, timeout
+            return ('{"ok": true}', "")
+
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: ExitedLeader(),
+    )
+    monkeypatch.setattr(
+        runner_module.os,
+        "killpg",
+        lambda pgid, signum: termination_signals.append((pgid, signum)),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_process_group_exists",
+        lambda _pgid: True,
+        raising=False,
+    )
+
+    def wait_for_group(_pgid, *, timeout_seconds):
+        group_waits.append(timeout_seconds)
+        return next(group_exit_results)
+
+    monkeypatch.setattr(
+        runner_module,
+        "_wait_for_process_group_exit",
+        wait_for_group,
+        raising=False,
+    )
+
+    with pytest.raises(BenchmarkGateError, match="descendants remained"):
+        runner_module._run_json_subprocess(
+            command,
+            timeout_seconds=1.0,
+            termination_grace_seconds=0.1,
+        )
+
+    assert termination_signals == [
+        (7531, signal.SIGTERM),
+        (7531, signal.SIGKILL),
+    ]
+    assert group_waits == [0.1, 0.1]
+
+
+@pytest.mark.parametrize(("returncode", "passed"), ((0, False), (2, True)))
+def test_quality_subprocess_return_code_must_match_recomputed_acceptance(
+    returncode: int,
+    passed: bool,
+) -> None:
+    with pytest.raises(BenchmarkGateError, match="return code.*acceptance"):
+        runner_module._require_quality_returncode(returncode, passed=passed)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "model_artifact_sha256",
+        "expert_manifest_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
+        "resident_payload_sha256",
+    ),
+)
+def test_subprocess_campaign_rejects_post_campaign_artifact_drift(field: str) -> None:
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            return _artifact_attestation(**{field: "f" * 64})
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    with pytest.raises(BenchmarkGateError, match=field):
+        runner_module.run_subprocess_campaign(
+            probe_command=("probe",),
+            artifact_verify_command=("verify-artifact",),
+            arm_command_template=(
+                "arm",
+                "{arm}",
+                "{context_tokens}",
+                "{repetition}",
+            ),
+            repetitions=2,
+            command_runner=run,
+            bootstrap_resamples=100,
+        )
+
+
+def test_subprocess_campaign_requires_a_full_post_campaign_payload_hash() -> None:
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            return _artifact_attestation(payload_hash_verified=False)
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    with pytest.raises(BenchmarkGateError, match="payload_hash_verified"):
+        runner_module.run_subprocess_campaign(
+            probe_command=("probe",),
+            artifact_verify_command=("verify-artifact",),
+            arm_command_template=(
+                "arm",
+                "{arm}",
+                "{context_tokens}",
+                "{repetition}",
+            ),
+            repetitions=2,
+            command_runner=run,
+            bootstrap_resamples=100,
+        )
+
+
+def test_subprocess_campaign_requires_f_nocache_payload_verification() -> None:
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            return _artifact_attestation(payload_hash_io_mode="buffered")
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    with pytest.raises(BenchmarkGateError, match="f-nocache"):
+        runner_module.run_subprocess_campaign(
+            probe_command=("probe",),
+            artifact_verify_command=("verify-artifact",),
+            arm_command_template=(
+                "arm",
+                "{arm}",
+                "{context_tokens}",
+                "{repetition}",
+            ),
+            repetitions=2,
+            command_runner=run,
+            bootstrap_resamples=100,
+        )
+
+
+def test_subprocess_campaign_rejects_post_campaign_resident_byte_drift() -> None:
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            return _artifact_attestation(resident_payload_bytes=4)
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    with pytest.raises(BenchmarkGateError, match="resident_payload_bytes"):
+        runner_module.run_subprocess_campaign(
+            probe_command=("probe",),
+            artifact_verify_command=("verify-artifact",),
+            arm_command_template=(
+                "arm",
+                "{arm}",
+                "{context_tokens}",
+                "{repetition}",
+            ),
+            repetitions=2,
+            command_runner=run,
+            bootstrap_resamples=100,
+        )
+
+
+def test_subprocess_campaign_recomputes_post_campaign_artifact_stat_hash() -> None:
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            attestation = _artifact_attestation()
+            attestation["sidecar_fingerprint"] = {
+                **_ARTIFACT_FINGERPRINT,
+                "size": 99,
+            }
+            return attestation
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    with pytest.raises(BenchmarkGateError, match="artifact_stat_sha256"):
+        runner_module.run_subprocess_campaign(
+            probe_command=("probe",),
+            artifact_verify_command=("verify-artifact",),
+            arm_command_template=(
+                "arm",
+                "{arm}",
+                "{context_tokens}",
+                "{repetition}",
+            ),
+            repetitions=2,
+            command_runner=run,
+            bootstrap_resamples=100,
+        )
+
+
+def test_subprocess_campaign_recomputes_resident_fingerprint_stat_hash() -> None:
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            attestation = _artifact_attestation()
+            fingerprints = attestation["resident_shard_fingerprints"]
+            assert isinstance(fingerprints, list)
+            fingerprints[0] = {**fingerprints[0], "size": 99}
+            return attestation
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    with pytest.raises(BenchmarkGateError, match="artifact_stat_sha256"):
+        runner_module.run_subprocess_campaign(
+            probe_command=("probe",),
+            artifact_verify_command=("verify-artifact",),
+            arm_command_template=(
+                "arm",
+                "{arm}",
+                "{context_tokens}",
+                "{repetition}",
+            ),
+            repetitions=2,
+            command_runner=run,
+            bootstrap_resamples=100,
+        )
+
+
 def test_campaign_fails_before_arm_execution_when_probe_gate_did_not_pass() -> None:
     calls: list[object] = []
     with pytest.raises(BenchmarkGateError, match="allocator-release probe"):
@@ -692,6 +2132,12 @@ def test_campaign_rejects_every_arm_whose_identity_differs_from_probe(
         calls.append((arm, context_tokens, repetition))
         row = _observation(arm, context_tokens, repetition, tok_s=10.0)
         row["identity"][field] = different_value
+        if field == "expert_manifest_sha256":
+            row["expert_route_binding"]["expert_manifest_sha256"] = different_value
+            for sample in row["metrics"]["performance_samples"]:
+                sample["expert_route_binding"]["expert_manifest_sha256"] = (
+                    different_value
+                )
         return row
 
     with pytest.raises(
@@ -761,6 +2207,16 @@ def test_campaign_rejects_paired_hold_workload_drift(
                     }
                 ]
                 sample["route_trace_sha256"] = canonical_sha256(sample[field])
+                sample["expert_hashes"] = {
+                    "70:2": "2" * 64,
+                    "70:5": "3" * 64,
+                    "70:13": "4" * 64,
+                }
+                sample["expert_route_binding"] = _expert_route_binding(
+                    manifest_sha256="b" * 64,
+                    route_trace=sample[field],
+                    expert_hashes=sample["expert_hashes"],
+                )
         return row
 
     with pytest.raises(BenchmarkGateError, match=error_pattern):
@@ -962,6 +2418,87 @@ def test_qwen_isolation_turns_sigterm_into_cleanup_before_exit(
     ]
 
 
+def _tracked_cli_plan_repo(
+    tmp_path: Path,
+    *,
+    decoy_probe: bool = False,
+) -> tuple[Path, Path]:
+    repo = tmp_path / "plan-repo"
+    repo.mkdir()
+    sources = (
+        "benchmarks/probe.py",
+        "benchmarks/quality.py",
+        "benchmarks/arm.py",
+        "benchmarks/qwen.py",
+    )
+    for relative in sources:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# frozen campaign source\n", encoding="utf-8")
+    hooks_path = repo / "benchmarks/hooks.json"
+    hooks_path.write_text('{"frozen":true}\n', encoding="utf-8")
+    probe_command = [sys.executable, "benchmarks/probe.py"]
+    if decoy_probe:
+        probe_command.append("decoy.py")
+    probe_command.extend(("--hooks-config", "benchmarks/hooks.json", "--json"))
+    common_hooks = ["--hooks-config", "benchmarks/hooks.json"]
+    spec = {
+        "artifact_verify_command": [
+            sys.executable,
+            "benchmarks/probe.py",
+            *common_hooks,
+            "--verify-artifact-only",
+        ],
+        "probe_command": probe_command,
+        "quality_command": [
+            sys.executable,
+            "benchmarks/quality.py",
+            *common_hooks,
+        ],
+        "arm_command_template": [
+            sys.executable,
+            "benchmarks/arm.py",
+            *common_hooks,
+            "--arm",
+            "{arm}",
+            "--context",
+            "{context_tokens}",
+            "--repetition",
+            "{repetition}",
+        ],
+        "repetitions": 2,
+        "qwen": {
+            field: [sys.executable, "benchmarks/qwen.py", field]
+            for field in (
+                "acquire_lane_command",
+                "release_lane_command",
+                "capture_command",
+                "unload_command",
+                "restore_command",
+                "verify_command",
+            )
+        },
+    }
+    spec_path = repo / "benchmarks/spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    subprocess.run(("git", "init", "-q"), cwd=repo, check=True)
+    subprocess.run(
+        ("git", "config", "user.name", "Issue 46 Test"), cwd=repo, check=True
+    )
+    subprocess.run(
+        ("git", "config", "user.email", "issue46@example.invalid"),
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(("git", "add", "."), cwd=repo, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "frozen plan"),
+        cwd=repo,
+        check=True,
+    )
+    return repo, spec_path
+
+
 def test_cli_plan_declares_exact_matrix_balanced_order_and_qwen_hooks(
     tmp_path: Path,
 ) -> None:
@@ -970,38 +2507,19 @@ def test_cli_plan_declares_exact_matrix_balanced_order_and_qwen_hooks(
         / "benchmarks"
         / "benchmark_hy3_dynamic_memory.py"
     )
-    spec_path = tmp_path / "spec.json"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "probe_command": [sys.executable, "benchmarks/probe.py", "--json"],
-                "arm_command_template": [
-                    sys.executable,
-                    "benchmarks/arm.py",
-                    "--arm",
-                    "{arm}",
-                    "--context",
-                    "{context_tokens}",
-                    "--repetition",
-                    "{repetition}",
-                ],
-                "repetitions": 2,
-                "qwen": {
-                    "acquire_lane_command": [sys.executable, "qwen.py", "acquire"],
-                    "release_lane_command": [sys.executable, "qwen.py", "release"],
-                    "capture_command": [sys.executable, "qwen.py", "capture"],
-                    "unload_command": [sys.executable, "qwen.py", "unload"],
-                    "restore_command": [sys.executable, "qwen.py", "restore"],
-                    "verify_command": [sys.executable, "qwen.py", "verify"],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    repo, spec_path = _tracked_cli_plan_repo(tmp_path)
 
     completed = subprocess.run(
-        [sys.executable, str(script), "--spec", str(spec_path), "--plan-only"],
-        cwd=script.parent.parent,
+        [
+            sys.executable,
+            str(script),
+            "--spec",
+            str(spec_path),
+            "--cwd",
+            str(repo),
+            "--plan-only",
+        ],
+        cwd=repo,
         check=False,
         text=True,
         capture_output=True,
@@ -1011,6 +2529,10 @@ def test_cli_plan_declares_exact_matrix_balanced_order_and_qwen_hooks(
     plan = json.loads(completed.stdout)
     assert plan["context_matrix_tokens"] == list(CONTEXT_MATRIX_TOKENS)
     assert plan["qwen_isolation_configured"] is True
+    assert plan["quality_command"][-2:] == [
+        "--hooks-config",
+        "benchmarks/hooks.json",
+    ]
     assert [row["arm"] for row in plan["schedule"][:4]] == [
         "static",
         "dynamic",
@@ -1025,28 +2547,19 @@ def test_cli_plan_rejects_a_decoy_command_shape(tmp_path: Path) -> None:
         / "benchmarks"
         / "benchmark_hy3_dynamic_memory.py"
     )
-    spec = {
-        "probe_command": [sys.executable, "probe.py", "decoy.py"],
-        "arm_command_template": [sys.executable, "arm.py"],
-        "repetitions": 2,
-        "qwen": {
-            field: [sys.executable, "qwen.py", field]
-            for field in (
-                "acquire_lane_command",
-                "release_lane_command",
-                "capture_command",
-                "unload_command",
-                "restore_command",
-                "verify_command",
-            )
-        },
-    }
-    spec_path = tmp_path / "spec.json"
-    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    repo, spec_path = _tracked_cli_plan_repo(tmp_path, decoy_probe=True)
 
     completed = subprocess.run(
-        [sys.executable, str(script), "--spec", str(spec_path), "--plan-only"],
-        cwd=script.parent.parent,
+        [
+            sys.executable,
+            str(script),
+            "--spec",
+            str(spec_path),
+            "--cwd",
+            str(repo),
+            "--plan-only",
+        ],
+        cwd=repo,
         check=False,
         text=True,
         capture_output=True,

@@ -16,6 +16,7 @@ from mtplx.profiles import (
     resolve_profile_name,
     runtime_env_with_contract_overrides,
 )
+from mtplx.runtime_options import HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV
 
 
 def test_profile_registry_default_is_sustained() -> None:
@@ -64,9 +65,12 @@ def test_apply_and_restore_profile_env() -> None:
 
     previous = apply_profile_env("performance-cold", environ=environ)
     assert previous == {key: None for key in NATIVE_MTP_60_FAST_PATH_ENV}
-    assert profile_env_status("performance-cold", environ=environ)[
-        "MTPLX_LAZY_VERIFY_LOGITS"
-    ]["ok"] is True
+    assert (
+        profile_env_status("performance-cold", environ=environ)[
+            "MTPLX_LAZY_VERIFY_LOGITS"
+        ]["ok"]
+        is True
+    )
 
     restore_profile_env(previous, environ=environ)
     assert environ == {}
@@ -101,6 +105,37 @@ def test_model_runtime_env_overrides_can_disable_fast_path_flags() -> None:
     assert environ == {}
 
 
+def test_issue46_runtime_overrides_freeze_and_attest_sync_free_startup_policy() -> None:
+    environ = {
+        "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP": "1",
+        "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "off",
+    }
+
+    apply_profile_env(
+        "sustained",
+        environ=environ,
+        runtime_env_overrides=HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV,
+    )
+
+    assert environ["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] == "0"
+    assert environ["MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS"] == "16384"
+    status = profile_env_status(
+        "sustained",
+        environ=environ,
+        runtime_env_overrides=HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV,
+    )
+    for key in (
+        "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP",
+        "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS",
+    ):
+        assert status[key] == {
+            "expected": HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV[key],
+            "observed": HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV[key],
+            "override_allowed": False,
+            "ok": True,
+        }
+
+
 def test_contract_runtime_env_overrides_are_normalized_and_restricted() -> None:
     contract = {
         "runtime_env_overrides": {
@@ -133,9 +168,12 @@ def test_apply_profile_env_preserves_mtp_history_policy_override() -> None:
 
     assert previous["MTPLX_MTP_HISTORY_POLICY"] == "committed"
     assert environ["MTPLX_MTP_HISTORY_POLICY"] == "committed"
-    assert profile_env_status("sustained", environ=environ)["MTPLX_MTP_HISTORY_POLICY"][
-        "ok"
-    ] is True
+    assert (
+        profile_env_status("sustained", environ=environ)["MTPLX_MTP_HISTORY_POLICY"][
+            "ok"
+        ]
+        is True
+    )
 
     restore_profile_env(previous, environ=environ)
     assert environ["MTPLX_MTP_HISTORY_POLICY"] == "committed"
@@ -178,7 +216,14 @@ def test_apply_profile_env_preserves_long_context_depth_overrides() -> None:
 def test_list_profiles_includes_all_public_modes() -> None:
     names = [profile["name"] for profile in list_profiles()]
 
-    assert names == ["stable", "performance-cold", "sustained", "turbo", "exact", "max-diagnostic"]
+    assert names == [
+        "stable",
+        "performance-cold",
+        "sustained",
+        "turbo",
+        "exact",
+        "max-diagnostic",
+    ]
 
 
 def test_sustained_profile_is_native_mtp_long_context_path() -> None:
@@ -203,7 +248,9 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert profile.env_dict()["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
     assert profile.env_dict()["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
     assert profile.env_dict()["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "1"
-    assert profile.env_dict()["MTPLX_VERIFY_HIDDEN_MODE"] == "logits_first_committed_slice"
+    assert (
+        profile.env_dict()["MTPLX_VERIFY_HIDDEN_MODE"] == "logits_first_committed_slice"
+    )
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "off"
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"] == "98304"
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "3"

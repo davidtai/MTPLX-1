@@ -25,19 +25,66 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (  # noqa: E402
     normalize_arm_config,
     run_allocator_release_probe,
 )
-from mtplx.expert_manifest import verify_expert_manifest  # noqa: E402
+from mtplx.benchmarks.hy3_dynamic_memory_artifacts import (  # noqa: E402
+    ArtifactAttestationError,
+    attest_hy3_artifact,
+)
+from mtplx.benchmarks.hy3_dynamic_memory_hardware import (  # noqa: E402
+    Hy3HardwareConfig,
+    _build_runtime_config,
+)
+from mtplx.expert_manifest import (  # noqa: E402
+    ExpertManifestError,
+    verify_expert_manifest,
+)
 
 
-GIB = 1024**3
 TOTAL_CONTEXT_TOKENS = 131_072
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(8 * 1024**2):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _attest_probe_artifact(config: Hy3HardwareConfig):
+    """Full-hash the sidecar once, then verify every source-shard header."""
+
+    try:
+        attestation = attest_hy3_artifact(
+            model_root=config.model_root,
+            manifest_path=config.manifest,
+            pins=config.artifact_pins,
+            verify_payload_hash=True,
+            require_f_nocache=True,
+        )
+        report = verify_expert_manifest(
+            attestation.manifest,
+            config.model_root,
+            verify_sidecar_hash=False,
+        )
+    except (ArtifactAttestationError, ExpertManifestError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    if report.get("valid") is not True:
+        raise RuntimeError("expert shard-header verification did not pass")
+    try:
+        final_attestation = attest_hy3_artifact(
+            model_root=config.model_root,
+            manifest_path=config.manifest,
+            pins=config.artifact_pins,
+            verify_payload_hash=False,
+        )
+    except ArtifactAttestationError as exc:
+        raise RuntimeError(str(exc)) from exc
+    binding_fields = (
+        "model_artifact_sha256",
+        "manifest_file_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
+        "resident_payload_bytes",
+        "resident_payload_sha256",
+    )
+    if any(
+        getattr(final_attestation, field) != getattr(attestation, field)
+        for field in binding_fields
+    ):
+        raise RuntimeError("artifact changed during shard-header verification")
+    return attestation
 
 
 def load_sidecar_record(
@@ -101,6 +148,10 @@ def build_probe_identity(
     model_artifact_sha256: str,
     expert_manifest_id: str,
     expert_manifest_sha256: str,
+    artifact_pins_sha256: str,
+    artifact_stat_sha256: str,
+    resident_payload_bytes: int,
+    resident_payload_sha256: str,
     source_git_commit: str,
     arm_config: Mapping[str, object],
 ) -> dict[str, object]:
@@ -112,6 +163,10 @@ def build_probe_identity(
         "model_artifact_sha256": model_artifact_sha256,
         "expert_manifest_id": expert_manifest_id,
         "expert_manifest_sha256": expert_manifest_sha256,
+        "artifact_pins_sha256": artifact_pins_sha256,
+        "artifact_stat_sha256": artifact_stat_sha256,
+        "resident_payload_bytes": resident_payload_bytes,
+        "resident_payload_sha256": resident_payload_sha256,
         "source_git_commit": source_git_commit,
         "arm_config": exact_arm,
         "arm_config_sha256": canonical_sha256(exact_arm),
@@ -139,44 +194,13 @@ def _require_clean_source() -> str:
     return commit
 
 
-def _model_artifact_sha256(
-    root: Path,
-    manifest_path: Path,
-    manifest: Any,
-) -> tuple[str, str]:
-    manifest_sha256 = _sha256_file(manifest_path)
-    sidecar = getattr(manifest, "sidecar", None)
-    if sidecar is None:
-        raise RuntimeError("Hy3 allocator probe requires the verified sidecar")
-    artifact = {
-        "config_sha256": _sha256_file(root / "config.json"),
-        "expert_manifest_sha256": manifest_sha256,
-        "expert_payload_sha256": str(sidecar.sha256),
-        "expert_payload_bytes": int(sidecar.size),
-        "source_revision": str(manifest.source_revision),
-    }
-    return canonical_sha256(artifact), manifest_sha256
-
-
-def _verify_probe_sidecar(root: Path, manifest: Any) -> None:
-    report = verify_expert_manifest(manifest, root, verify_sidecar_hash=True)
-    if report.get("sidecar_verified") is not True:
-        raise RuntimeError("probe sidecar payload was not fully verified")
-
-
 def run_real_probe(
     *,
-    model_root: Path,
-    manifest_path: Path,
-    slab_slots: int,
+    config: Hy3HardwareConfig,
 ) -> dict[str, object]:
     import mlx.core as mx
 
-    from mtplx.expert_manifest import load_expert_manifest
-    from mtplx.expert_runtime import (
-        ExpertStreamingConfig,
-        mlx_memory_telemetry,
-    )
+    from mtplx.expert_runtime import mlx_memory_telemetry
     from mtplx.expert_slots import ExpertSlotBinding
     from mtplx.expert_streaming_models import HY3_Q4
     from mtplx.models.expert_mlx import (
@@ -185,42 +209,25 @@ def run_real_probe(
     )
 
     source_commit = _require_clean_source()
-    manifest = load_expert_manifest(manifest_path, verify_digest=True)
-    if (
-        manifest.model_key != "hy3-q4"
-        or manifest.source_revision != HY3_Q4.quant_revision
-    ):
-        raise RuntimeError("probe manifest is not the pinned Hy3 Q4 artifact")
-    _verify_probe_sidecar(model_root, manifest)
-    artifact_sha256, manifest_sha256 = _model_artifact_sha256(
-        model_root,
-        manifest_path,
-        manifest,
-    )
-    config = ExpertStreamingConfig(
-        model_key="hy3-q4",
-        memory_limit_bytes=110 * GIB,
-        max_live_kv_tokens=TOTAL_CONTEXT_TOKENS,
-        runtime_reserve_bytes=8 * GIB,
-        transient_slots=32,
-        cache_policy="lru",
-        cache_scope="global",
-        slot_layout="component-banks",
-        dynamic_expert_slabs=True,
-        expert_slab_slots=slab_slots,
-    )
-    plan = config.memory_plan(HY3_Q4)
+    attestation = _attest_probe_artifact(config)
+    manifest = attestation.manifest
+    runtime_config = _build_runtime_config(config, arm="dynamic")
+    plan = runtime_config.memory_plan(HY3_Q4)
     arm_config = {
         "dynamic_memory": True,
-        "expert_streaming_config": config.to_dict(),
+        "expert_streaming_config": runtime_config.to_dict(),
         "planned_persistent_slots": int(plan.persistent_slots),
         "probe_slab_ids": [0, 1],
     }
     identity = build_probe_identity(
-        model_artifact_id=(f"pipenetwork/Hy3-4bit@{HY3_Q4.quant_revision}"),
-        model_artifact_sha256=artifact_sha256,
-        expert_manifest_id=manifest_path.name,
-        expert_manifest_sha256=manifest_sha256,
+        model_artifact_id=config.model_artifact_id,
+        model_artifact_sha256=attestation.model_artifact_sha256,
+        expert_manifest_id=config.manifest.name,
+        expert_manifest_sha256=attestation.manifest_file_sha256,
+        artifact_pins_sha256=attestation.artifact_pins_sha256,
+        artifact_stat_sha256=attestation.artifact_stat_sha256,
+        resident_payload_bytes=attestation.resident_payload_bytes,
+        resident_payload_sha256=attestation.resident_payload_sha256,
         source_git_commit=source_commit,
         arm_config=arm_config,
     )
@@ -228,7 +235,7 @@ def run_real_probe(
         plan,
         HY3_Q4,
         manifest,
-        persistent_slab_slots=slab_slots,
+        persistent_slab_slots=config.expert_slab_slots,
     )
     layout = allocator.slab_layout()
     if 0 not in layout or 1 not in layout:
@@ -273,7 +280,7 @@ def run_real_probe(
     def evaluate_slabs(_slabs: Sequence[ProbeSlab]) -> None:
         if untouched_slot is None:
             raise RuntimeError("untouched probe slot was not allocated")
-        load_sidecar_record(model_root, manifest, record, untouched_slot)
+        load_sidecar_record(config.model_root, manifest, record, untouched_slot)
         arrays = [
             value for bank in allocator.banks.values() for value in bank.arrays.values()
         ]
@@ -321,23 +328,48 @@ def run_real_probe(
         allocator.close()
 
 
+def _strict_config_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError(f"hooks config has duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _load_hardware_config(path: Path) -> Hy3HardwareConfig:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_config_pairs,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load hardware hooks config {path}: {exc}") from exc
+    if not isinstance(value, Mapping):
+        raise RuntimeError("hardware hooks config must be an object")
+    return Hy3HardwareConfig.from_mapping(value)
+
+
+def verify_artifact_only(config: Hy3HardwareConfig) -> dict[str, object]:
+    _require_clean_source()
+    return _attest_probe_artifact(config).evidence()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("model_root", type=Path)
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument("--slab-slots", type=int, default=32)
+    parser.add_argument("--hooks-config", type=Path, required=True)
+    parser.add_argument("--verify-artifact-only", action="store_true")
     parser.add_argument("--output-json", type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.slab_slots <= 0:
-        raise SystemExit("--slab-slots must be positive")
-    result = run_real_probe(
-        model_root=args.model_root.expanduser().resolve(),
-        manifest_path=args.manifest.expanduser().resolve(),
-        slab_slots=args.slab_slots,
+    config = _load_hardware_config(args.hooks_config.expanduser().resolve())
+    result = (
+        verify_artifact_only(config)
+        if args.verify_artifact_only
+        else run_real_probe(config=config)
     )
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output_json is not None:
@@ -345,6 +377,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(encoded, encoding="utf-8")
     print(encoded, end="")
+    if args.verify_artifact_only:
+        return 0 if result.get("payload_hash_verified") is True else 1
     return 0 if result.get("gate_passed") is True else 1
 
 

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import mtplx.benchmarks.hy3_dynamic_memory_observation as observation_module
+from mtplx.runtime_options import HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV
 from mtplx.benchmarks.hy3_dynamic_memory_observation import (
     ArmObservationError,
     ArmRequest,
@@ -34,8 +35,10 @@ class FakeLane:
         self.calls = calls
         self.expert_bytes = 800
         self.kv_blocks = HY3_Q4_MAX_BLOCKS if arm == "static" else 1
+        self.logical_tokens = HY3_Q4_MAX_BLOCKS * 16 if arm == "static" else 1
         self.hold_tps: Iterator[float] = iter((15.9, 16.0, 16.1))
         self.hold_sample_index = 0
+        self.prepared_context_tokens: int | None = None
 
     def identity(self) -> dict[str, object]:
         self.calls.append("identity")
@@ -45,29 +48,52 @@ class FakeLane:
             "model_artifact_sha256": "1" * 64,
             "expert_manifest_id": "expert-manifest.json",
             "expert_manifest_sha256": "2" * 64,
+            "artifact_pins_sha256": "5" * 64,
+            "artifact_stat_sha256": "6" * 64,
+            "resident_payload_bytes": 3,
+            "resident_payload_sha256": "7" * 64,
             "source_git_commit": SOURCE_COMMIT,
             "arm_config": {
                 "dynamic_memory": self.arm == "dynamic",
+                "attention_runtime_env": dict(HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV),
                 "context_window": 131_072,
+                "expert_streaming_config": {
+                    "allocator_headroom_bytes": 1024**3,
+                    "kv_bytes_per_token_override": 84_480,
+                    "memory_limit_bytes": 110 * 1024**3,
+                    "max_live_kv_tokens": 131_072,
+                    "runtime_reserve_bytes": 8 * 1024**3,
+                    "transient_slots": 32,
+                    "cache_scope": "global",
+                    "slot_layout": "component-banks",
+                    "dynamic_expert_slabs": self.arm == "dynamic",
+                    "expert_slab_slots": 32,
+                },
+                "planned_persistent_slots": (9_696 if self.arm == "dynamic" else 8_673),
             },
             "kv_quantization": "q4",
             "kv_block_size_tokens": 16,
             "total_context_tokens": 131_072,
         }
 
-    def physical_ledger(self) -> dict[str, object]:
-        self.calls.append("ledger")
-        kv_bytes = self.kv_blocks * HY3_Q4_KV_BLOCK_BYTES
-        active_bytes = self.expert_bytes + kv_bytes
+    def _ledger(
+        self,
+        *,
+        blocks: int,
+        experts: int,
+        logical_tokens: int | None = None,
+    ) -> dict[str, object]:
+        kv_bytes = blocks * HY3_Q4_KV_BLOCK_BYTES
+        active_bytes = experts + kv_bytes
         allocator_cache_bytes = 7
         runtime_workspace_bytes = 64
         return {
             "allocator_active_bytes": active_bytes,
             "allocator_cache_bytes": allocator_cache_bytes,
-            "allocator_peak_bytes": self.expert_bytes + kv_bytes,
-            "expert_slab_physical_bytes": self.expert_bytes,
+            "allocator_peak_bytes": active_bytes,
+            "expert_slab_physical_bytes": experts,
             "kv_physical_bytes": kv_bytes,
-            "kv_allocated_blocks": self.kv_blocks,
+            "kv_allocated_blocks": blocks,
             "slot_health": {
                 "active_routes": 0,
                 "pins": 0,
@@ -75,20 +101,32 @@ class FakeLane:
                 "failed": 0,
                 "integrity_errors": 0,
                 "completion_fence_failures": 0,
+                "global_device_synchronizations": 0,
             },
             "operating_target_bytes": 110 * 1024**3,
             "hard_ceiling_bytes": 112 * 1024**3,
+            "allocator_headroom_bytes": 1024**3,
+            "classified_target_bytes": 109 * 1024**3,
+            "classified_bytes": active_bytes + runtime_workspace_bytes,
             "charged_bytes": (
                 active_bytes + runtime_workspace_bytes + allocator_cache_bytes
             ),
+            "charged_residual_bytes": (
+                110 * 1024**3
+                - active_bytes
+                - runtime_workspace_bytes
+                - allocator_cache_bytes
+            ),
             "resident_model_bytes": 0,
             "kv_representation": "q4",
-            "kv_logical_tokens": self.kv_blocks * 16,
-            "expert_logical_records": self.expert_bytes,
-            "expert_active_records": self.expert_bytes,
-            "expert_resident_records": self.expert_bytes,
-            "expert_logical_slabs": self.expert_bytes,
-            "expert_active_slabs": self.expert_bytes,
+            "kv_logical_tokens": (
+                self.logical_tokens if logical_tokens is None else logical_tokens
+            ),
+            "expert_logical_records": experts,
+            "expert_active_records": experts,
+            "expert_resident_records": experts,
+            "expert_logical_slabs": experts,
+            "expert_active_slabs": experts,
             "expert_draining_slabs": 0,
             "expert_released_slabs": 0,
             "pinned_expert_bytes": 0,
@@ -115,22 +153,93 @@ class FakeLane:
             "failure_reason": None,
         }
 
+    def physical_ledger(self) -> dict[str, object]:
+        self.calls.append("ledger")
+        return self._ledger(blocks=self.kv_blocks, experts=self.expert_bytes)
+
     def reclaim_experts_for_q4(self, context_tokens: int) -> None:
         self.calls.append(f"reclaim:{context_tokens}")
         self.expert_bytes = 600
 
     def prepare_q4_context(self, context_tokens: int) -> None:
         self.calls.append(f"prepare:{context_tokens}")
+        self.prepared_context_tokens = context_tokens
         if self.arm == "dynamic":
             self.kv_blocks = context_tokens // 16
+            self.logical_tokens = context_tokens
+
+    def kv_growth_steps(self) -> list[dict[str, object]]:
+        self.calls.append("kv_growth_steps")
+        if self.arm == "static":
+            return []
+        assert self.prepared_context_tokens is not None
+        target_blocks = self.prepared_context_tokens // 16
+
+        first_before = self._ledger(blocks=1, experts=800, logical_tokens=1)
+        first_gap = self._ledger(blocks=1, experts=600, logical_tokens=1)
+        first_gap["captured_monotonic_ns"] = 20
+        first_after = self._ledger(
+            blocks=target_blocks - 1,
+            experts=600,
+            logical_tokens=1,
+        )
+        second_gap = dict(first_after)
+        second_gap["captured_monotonic_ns"] = 50
+        second_after = self._ledger(
+            blocks=target_blocks,
+            experts=600,
+            logical_tokens=1,
+        )
+        return [
+            {
+                "sequence_index": 0,
+                "requested_tokens": (target_blocks - 1) * 16,
+                "target_blocks": target_blocks - 1,
+                "before_monotonic_ns": 10,
+                "reclaim_monotonic_ns": 20,
+                "after_monotonic_ns": 30,
+                "before": first_before,
+                "reclaim_gap": first_gap,
+                "after": first_after,
+                "steady_delta_bytes": (target_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
+                "max_transient_delta_bytes": (target_blocks - 1)
+                * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "reclaimed_expert_bytes": 200,
+                "kv_growth_bytes": (target_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
+            },
+            {
+                "sequence_index": 1,
+                "requested_tokens": self.prepared_context_tokens,
+                "target_blocks": target_blocks,
+                "before_monotonic_ns": 40,
+                "reclaim_monotonic_ns": 50,
+                "after_monotonic_ns": 60,
+                "before": first_after,
+                "reclaim_gap": second_gap,
+                "after": second_after,
+                "steady_delta_bytes": HY3_Q4_KV_BLOCK_BYTES,
+                "max_transient_delta_bytes": target_blocks
+                * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "reclaimed_expert_bytes": 0,
+                "kv_growth_bytes": HY3_Q4_KV_BLOCK_BYTES,
+            },
+        ]
 
     def invoke_context(self, context_tokens: int) -> dict[str, object]:
         self.calls.append(f"invoke:{context_tokens}")
         return {
             "prompt_token_ids": [11, context_tokens, 12],
             "generated_token_ids": [101, 202, 303, 404],
-            "route_trace": [[0, 3, 7], [1, 2, 9]],
-            "expert_hashes": {"0:3": "3" * 64, "1:2": "4" * 64},
+            "route_trace": [
+                {"phase": "ar_decode", "layer": 0, "expert_ids": [3, 7]},
+                {"phase": "ar_decode", "layer": 1, "expert_ids": [2, 9]},
+            ],
+            "expert_hashes": {
+                "0:3": "3" * 64,
+                "0:7": "4" * 64,
+                "1:2": "5" * 64,
+                "1:9": "6" * 64,
+            },
             "elapsed_seconds": 0.25,
         }
 
@@ -138,6 +247,13 @@ class FakeLane:
         self.calls.append("sample_hold")
         sample_index = self.hold_sample_index
         self.hold_sample_index += 1
+        route_trace = [
+            {
+                "phase": "ar_decode",
+                "layer": sample_index + 1,
+                "expert_ids": [3, 7, 11],
+            }
+        ]
         return {
             "tokens_per_second": next(self.hold_tps),
             "expert_hit_rate": 0.75,
@@ -147,18 +263,18 @@ class FakeLane:
             "generated_token_ids": [
                 500 + sample_index * 10 + offset for offset in range(8)
             ],
-            "route_trace": [
-                {
-                    "phase": "ar_decode",
-                    "layer": sample_index + 1,
-                    "expert_ids": [3, 7, 11],
-                }
-            ],
+            "route_trace": route_trace,
+            "expert_hashes": {
+                f"{sample_index + 1}:3": "3" * 64,
+                f"{sample_index + 1}:7": "4" * 64,
+                f"{sample_index + 1}:11": "5" * 64,
+            },
         }
 
     def reset_q4_context(self) -> None:
         self.calls.append("reset")
         self.kv_blocks = 0
+        self.logical_tokens = 0
 
     def trigger_future_expert_demand(self) -> None:
         self.calls.append("future_demand")
@@ -198,6 +314,39 @@ class BrokenQ4LedgerHooks(FakeHooks):
         return BrokenQ4LedgerLane("dynamic", self.calls)
 
 
+class BrokenInvocationRouteLane(FakeLane):
+    def invoke_context(self, context_tokens: int) -> dict[str, object]:
+        result = super().invoke_context(context_tokens)
+        result["route_trace"] = [[0, 3, 7]]
+        return result
+
+
+class BrokenHoldRouteLane(FakeLane):
+    def sample_hold_performance(self) -> dict[str, object]:
+        result = super().sample_hold_performance()
+        result["route_trace"] = [{"phase": "ar_decode", "layer": 1}]
+        return result
+
+
+class ZeroExpertHashLane(FakeLane):
+    def invoke_context(self, context_tokens: int) -> dict[str, object]:
+        result = super().invoke_context(context_tokens)
+        hashes = result["expert_hashes"]
+        assert isinstance(hashes, dict)
+        hashes["0:3"] = "0" * 64
+        return result
+
+
+class SingleLaneHooks(FakeHooks):
+    def __init__(self, calls: list[str], lane_type: type[FakeLane]) -> None:
+        super().__init__(calls)
+        self.lane_type = lane_type
+
+    def load_dynamic_lane(self, request: ArmRequest) -> FakeLane:
+        self.calls.append(f"load_dynamic:{request.context_tokens}")
+        return self.lane_type("dynamic", self.calls)
+
+
 class CapturedReclaimLane(FakeLane):
     captured_reclaim_pending = False
 
@@ -212,6 +361,22 @@ class CapturedReclaimLane(FakeLane):
             self.captured_reclaim_pending = False
         return result
 
+    def kv_growth_steps(self) -> list[dict[str, object]]:
+        steps = super().kv_growth_steps()
+        steps[0].update(
+            before_monotonic_ns=150,
+            reclaim_monotonic_ns=200,
+            after_monotonic_ns=250,
+        )
+        steps[0]["reclaim_gap"]["captured_monotonic_ns"] = 200
+        steps[1].update(
+            before_monotonic_ns=260,
+            reclaim_monotonic_ns=270,
+            after_monotonic_ns=280,
+        )
+        steps[1]["reclaim_gap"]["captured_monotonic_ns"] = 270
+        return steps
+
 
 class CapturedReclaimHooks(FakeHooks):
     def load_dynamic_lane(self, request: ArmRequest) -> FakeLane:
@@ -224,8 +389,8 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
     timestamps = iter(
         (
             1,
-            2,
-            3,
+            20,
+            70,
             4_000_000_000,
             4_500_000_000,
             5_000_000_000,
@@ -247,7 +412,19 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
     assert result["schema"] == "mtplx-hy3-dynamic-memory-observation-v1"
     assert result["prompt_sha256"] == canonical_sha256([11, 4096, 12])
     assert result["generated_token_sha256"] == canonical_sha256([101, 202, 303, 404])
-    assert result["route_trace_sha256"] == canonical_sha256([[0, 3, 7], [1, 2, 9]])
+    expected_routes = [
+        {"phase": "ar_decode", "layer": 0, "expert_ids": [3, 7]},
+        {"phase": "ar_decode", "layer": 1, "expert_ids": [2, 9]},
+    ]
+    assert result["route_trace_sha256"] == canonical_sha256(expected_routes)
+    assert result["expert_route_binding"] == {
+        "schema": "mtplx-hy3-expert-route-binding-v1",
+        "producer_verification_scope": "route-map-from-loaded-manifest",
+        "offline_verification_scope": "structural-binding-only",
+        "expert_manifest_sha256": "2" * 64,
+        "route_trace_sha256": canonical_sha256(expected_routes),
+        "expert_hashes_sha256": canonical_sha256(result["expert_hashes"]),
+    }
     assert [point["phase"] for point in result["timeline"]] == [
         "pre_growth",
         "post_expert_reclaim",
@@ -258,12 +435,31 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
         "post_reset",
         "post_regrow",
     ]
+    assert [point["kv_logical_tokens"] for point in result["timeline"]] == [
+        1,
+        1,
+        4096,
+        4096,
+        4096,
+        4096,
+        0,
+        0,
+    ]
+    assert {
+        step[ledger_name]["kv_logical_tokens"]
+        for step in result["kv_growth_steps"]
+        for ledger_name in ("before", "reclaim_gap", "after")
+    } == {1}
     assert result["lifecycle"] == {
         "reset_observed": True,
         "future_demand_invoked": True,
         "post_regrow_observed": True,
     }
     assert result["metrics"]["hold_performance_samples"] == [15.9, 16.0, 16.1]
+    assert [step["target_blocks"] for step in result["kv_growth_steps"]] == [
+        255,
+        256,
+    ]
     assert result["metrics"]["peak_charged_bytes"] == max(
         point["charged_bytes"] for point in result["timeline"]
     )
@@ -278,6 +474,11 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
     ]
     assert first_sample["route_trace_sha256"] == canonical_sha256(
         [{"phase": "ar_decode", "layer": 1, "expert_ids": [3, 7, 11]}]
+    )
+    assert first_sample["expert_route_binding"]["expert_manifest_sha256"] == "2" * 64
+    assert (
+        first_sample["expert_route_binding"]["offline_verification_scope"]
+        == "structural-binding-only"
     )
     assert "load_static:4096" not in calls
     assert calls[-3:] == ["future_demand", "ledger", "close"]
@@ -331,6 +532,7 @@ def test_static_producer_uses_reserved_control_without_reclaim_or_regrow() -> No
         "future_demand_invoked": False,
         "post_regrow_observed": False,
     }
+    assert result["kv_growth_steps"] == []
     assert "load_dynamic:32768" not in calls
     assert not any(call.startswith("reclaim:") for call in calls)
     assert "future_demand" not in calls
@@ -350,6 +552,44 @@ def test_contradictory_q4_ledger_fails_before_model_invocation_and_closes() -> N
         )
 
     assert "invoke:4096" not in calls
+    assert calls[-1] == "close"
+
+
+@pytest.mark.parametrize(
+    ("lane_type", "match"),
+    (
+        (BrokenInvocationRouteLane, "route_trace.*object"),
+        (BrokenHoldRouteLane, "route_trace.*incomplete"),
+        (ZeroExpertHashLane, "expert.*SHA-256|zero"),
+    ),
+)
+def test_producer_rejects_unverified_route_or_expert_map_evidence(
+    lane_type: type[FakeLane],
+    match: str,
+) -> None:
+    calls: list[str] = []
+    timestamps = iter(
+        (
+            1,
+            20,
+            70,
+            4_000_000_000,
+            4_500_000_000,
+            5_000_000_000,
+            6_000_000_000,
+            7_000_000_000,
+        )
+    )
+
+    with pytest.raises(ArmObservationError, match=match):
+        produce_arm_observation(
+            hooks=SingleLaneHooks(calls, lane_type),
+            request=ArmRequest(arm="dynamic", context_tokens=4096, repetition=0),
+            source_git_commit=SOURCE_COMMIT,
+            monotonic_ns=lambda: next(timestamps),
+            sleep=lambda _seconds: None,
+        )
+
     assert calls[-1] == "close"
 
 

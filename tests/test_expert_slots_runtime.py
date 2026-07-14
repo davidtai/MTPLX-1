@@ -3762,6 +3762,7 @@ def test_completion_fence_synchronous_failure_releases_route_and_blocks_replacem
             assert slot.expert == 0
             assert slot.generation == generation
         assert pool.metrics.as_dict()["active_routes"] == 0
+        assert pool.metrics.as_dict()["global_device_synchronizations"] == 1
 
         with pytest.raises(ExpertSlotError, match="completion fence failed") as blocked:
             pool.ensure_route(1, _manual_plan(1, transient_slot))
@@ -4212,10 +4213,15 @@ def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> 
         apply_memory_cap=False,
     )
     try:
-        admission = runtime.admit_kv_tokens(4)
+        admission = runtime.admit_kv_tokens(2)
+        admission.grow_to(4)
+        assert admission.tokens == 4
+        assert runtime._live_kv_tokens == 4
+        assert runtime._live_kv_peak == 4
         with pytest.raises(ExpertStreamingConfigurationError, match="exceeds"):
-            runtime.admit_kv_tokens(1)
+            admission.grow_to(5)
         admission.release()
+        assert runtime._live_kv_tokens == 0
 
         ready = runtime.ensure_route(1, [0], phase="decode")
         assert bytes(ready.bindings[0].buffer) == expected[0]

@@ -23,10 +23,10 @@ The checked-in campaign spec is
   0.5-second gaps so the stable physical hold spans at least one second;
 - four balanced repetitions and 10,000 paired bootstrap resamples.
 
-The model snapshot, `expert-manifest-sidecar.json`, and its verified 150 GiB
-`experts.bin` payload must exist under the pinned Hugging Face cache path in the
-hook config; the campaign deliberately rejects the non-sidecar manifest. The
-Qwen launch agent must be
+The model snapshot, `expert-manifest-sidecar.json`, its verified 150 GiB
+`experts.bin` payload, and every resident tensor payload must exist under the
+pinned Hugging Face cache path in the hook config; the campaign deliberately
+rejects the non-sidecar manifest. The Qwen launch agent must be
 `~/Library/LaunchAgents/com.tea.qwen.plist`, and a loaded service must expose
 exactly `mtplx-qwen36-27b-optimized-speed` at
 `http://127.0.0.1:8080/v1/models`.
@@ -46,7 +46,9 @@ uv run python benchmarks/benchmark_hy3_dynamic_memory.py \
 
 The hardware run requires a committed, completely clean worktree, including no
 untracked files. Put the result outside the repository so it cannot dirty later
-arms:
+arms. The runner invalidates an existing output path before any actual-run
+provenance check, so a failed rerun cannot leave stale successful evidence at
+the requested path:
 
 ```bash
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
@@ -63,15 +65,23 @@ or arm failure.
 
 Before and after the exclusive window, the runner proves that the campaign
 spec and every Python command source are tracked and the worktree is clean. The
-result binds the raw spec bytes as `campaign_spec_sha256` and the full source
-commit as `source_git_commit`; any mid-run source or spec change rejects the
-result before it is written.
+artifact-verification, allocator-probe, quality, and performance-arm commands
+must also reference one tracked hardware-hooks JSON. The result binds the raw
+spec bytes as `campaign_spec_sha256`, that hooks JSON as
+`hardware_hooks_config_sha256`, and the full source commit as
+`source_git_commit`; any mid-run source, spec, or hooks-config change rejects
+the result before it is written. A completed campaign whose acceptance status
+is `rejected` still writes its rejection evidence, but exits with status 2.
 
 ## Exact Qwen subprocess contract
 
 All commands below emit exactly one JSON object on stdout. `capture` records
 both the launchd loaded state and the exact `/v1/models` IDs. The runner passes
-that same object on stdin to `unload`, `restore`, and `verify`.
+that same object on stdin to `unload`, `restore`, and `verify`. Before `unload`
+can run, the runner creates and file-plus-directory-syncs
+`/tmp/mtplx-gpu-exclusive/issue46-recovery.json` with the owner identity and
+captured state. It removes the journal only after exact restoration is verified;
+failed restoration retains both the journal and exclusive lane for recovery.
 
 ```json
 {
@@ -90,6 +100,8 @@ shutdown, exact-model restoration, and timeouts. Diagnostics are redirected to
 stderr so they cannot corrupt the runner's JSON channel. A missing plist,
 unexpected model, duplicate model ID, orphan process, API/service disagreement,
 stale exclusive lane, incomplete stop, or inexact restoration fails closed.
+Successful result JSON includes positive acquire, capture, unload, restore,
+verify, and release evidence plus the recovery-journal digest and lifecycle.
 
 ## Evidence ordering and interpretation
 
@@ -99,14 +111,14 @@ Each arm emits one schema-v1 observation directly consumable by
 - Static starts with and retains all 8,192 Q4 blocks through prefill,
   invocation, and the stable hold; no expert reclaim or future-demand regrow is
   allowed.
-- Dynamic starts with one physical Q4 block. The adapter computes the complete
-  steady Q4 delta and largest replacement transient, then wraps the cache's
-  real broker observer. It captures the physical post-reclaim ledger and
-  monotonic timestamp after the first real reservation returns, while that same
-  ticket still owns the transaction and before the cache allocates its Q4
-  replacement arrays. It also proves that the cache's per-entry reservations
-  sum to the complete steady delta and cover the largest replacement. The
-  timestamp is never reconstructed from a later sample.
+- Dynamic starts with one physical Q4 block. At both the near-final and final
+  boundaries, the adapter declares all 80 target-cache members in one real
+  broker group. The broker sums steady deltas, reserves only the largest
+  serialized replacement transient, reclaims once, and captures the physical
+  post-reclaim ledger before member 0 allocates. Every member then commits
+  back-to-back before model execution resumes. Any per-entry reservation,
+  missing owner, unequal block count, or reconstructed timestamp rejects the
+  observation.
 - Every dynamic ledger cross-checks retained Q4 arrays against broker KV bytes
   and expert slab registration against broker expert bytes. Both arms report
   MLX active/cache/peak, process RSS/compressed bytes, swap delta, all budget
@@ -118,6 +130,11 @@ Each arm emits one schema-v1 observation directly consumable by
   token latency are preserved in the observation. Each timed hold sample also
   retains and hashes its own generated token IDs and route trace, and paired
   arms must match those workloads exactly.
+- The integrated quality command runs BF16, static Q4, and dynamic Q4
+  full-history retrieval at exact 4K/32K/64K/128K total contexts. It attests
+  live storage dtypes and scales, earliest/latest markers, reset and later
+  requests, and bounded Q4 streaming attention with zero whole-history
+  dequantization, dense fallback, or paging bailout.
 - Reset closes the retained physical Q4 cache and releases admission exactly
   once. Dynamic regrow is caused only by a real subsequent `ensure_route`
   demand; the observer never calls the slab-regrow method directly.
@@ -134,8 +151,7 @@ dynamic expert capacity plus a confidence-bounded improvement in hit rate, SSD
 bytes/token, or TPS. At 128K, expert capacity must converge within one slab and
 stable TPS/p50/p95 may not regress by more than 5%.
 
-This campaign establishes issue #46's memory and paired-performance evidence.
-Promotion at 128K still also requires the separate issue #43 full-history
-quality/retrieval gate; memory arithmetic or static/dynamic token parity is not
-a substitute for that test. The dynamic broker remains off by default until
-that separate gate and this campaign both pass.
+This campaign establishes issue #46's memory, paired-performance, and integrated
+issue-#43-style full-history quality evidence. Memory arithmetic or
+static/dynamic token parity is not a substitute for the BF16/Q4 retrieval gate.
+The dynamic broker remains off by default unless every integrated gate passes.

@@ -48,6 +48,9 @@ def _valid_dynamic_server_argv(root: Path) -> list[str]:
         str(root),
         "--warmup-tokens",
         "0",
+        "--generation-mode",
+        "ar",
+        "--no-load-mtp",
         "--expert-streaming",
         "--expert-memory-limit",
         "110GiB",
@@ -91,6 +94,77 @@ def _assert_server_rejects_before_load(
     assert load_calls == []
 
 
+def test_dynamic_memory_post_load_rejection_closes_runtime_and_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class ImmediateScheduler:
+        def __init__(self, **_kwargs: object) -> None:
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+
+        def submit_foreground(
+            self,
+            function: object,
+            *args: object,
+            batch_key: str | None = None,
+            **kwargs: object,
+        ) -> object:
+            del batch_key
+            from concurrent.futures import Future
+
+            future: Future[object] = Future()
+            try:
+                future.set_result(function(*args, **kwargs))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+        def shutdown(
+            self,
+            wait: bool = True,
+            *,
+            cancel_futures: bool = False,
+        ) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    root = _hy3_model_root(tmp_path)
+    runtime = SimpleNamespace(
+        model_path=root,
+        mtp_enabled=False,
+        tokenizer=SimpleNamespace(),
+        close_calls=[],
+    )
+
+    def close(*, timeout: float | None = None) -> None:
+        runtime.close_calls.append(timeout)
+
+    runtime.close = close
+    scheduler = ImmediateScheduler()
+    monkeypatch.setattr(openai, "ModelWorkScheduler", lambda **_kwargs: scheduler)
+    monkeypatch.setattr(openai, "apply_profile_env", lambda *_a, **_k: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda *_a, **_k: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai,
+        "_configure_mlx_cache_limit",
+        lambda _args: {"configured": False},
+    )
+    monkeypatch.setattr(openai, "load", lambda *_a, **_k: runtime)
+    monkeypatch.setattr(openai, "_template_hash", lambda _tokenizer: "template")
+    monkeypatch.setattr(
+        openai,
+        "_resolve_context_window",
+        lambda _tokenizer, _model: 32_768,
+    )
+
+    with pytest.raises(ValueError, match="loaded model.*131072-token"):
+        openai.ServerState(openai.parse_args(_valid_dynamic_server_argv(root)))
+
+    assert runtime.close_calls == [10.0]
+    assert scheduler.shutdown_calls[-1] == (False, True)
+
+
 def test_server_parser_keeps_dynamic_memory_disabled_by_default() -> None:
     args = openai.parse_args(["--warmup-tokens", "0"])
 
@@ -98,6 +172,7 @@ def test_server_parser_keeps_dynamic_memory_disabled_by_default() -> None:
     assert args.expert_slab_slots is None
     assert args.expert_regrow_hysteresis_slabs is None
     assert args.expert_resize_min_interval_ms is None
+    assert args.expert_allocator_headroom is None
 
 
 def test_server_parser_accepts_explicit_dynamic_memory_tuning() -> None:
@@ -112,6 +187,8 @@ def test_server_parser_accepts_explicit_dynamic_memory_tuning() -> None:
             "2",
             "--expert-resize-min-interval-ms",
             "250",
+            "--expert-allocator-headroom",
+            "1GiB",
         ]
     )
 
@@ -119,6 +196,7 @@ def test_server_parser_accepts_explicit_dynamic_memory_tuning() -> None:
     assert args.expert_slab_slots == 64
     assert args.expert_regrow_hysteresis_slabs == 2
     assert args.expert_resize_min_interval_ms == 250
+    assert args.expert_allocator_headroom == "1GiB"
 
 
 def test_dynamic_memory_opt_in_forces_instrumented_dynamic_expert_config(
@@ -153,6 +231,10 @@ def test_dynamic_memory_opt_in_forces_instrumented_dynamic_expert_config(
     assert config.dynamic_expert_slabs is True
     assert config.resource_telemetry is True
     assert config.kv_bytes_per_token_override == 84_480
+    assert config.allocator_headroom_bytes == 1024**3
+    assert config.runtime_reserve_bytes == 8 * 1024**3
+    assert config.transient_slots == 32
+    assert config.cache_policy == "lru"
     assert config.expert_slab_slots == 64
     assert config.expert_regrow_hysteresis_slabs == 2
     assert config.expert_resize_min_interval_ms == 250
@@ -179,6 +261,46 @@ def test_dynamic_memory_attestation_rejects_non_q4_physical_kv_geometry() -> Non
         openai.validate_hy3_q4_dynamic_memory_options(args, config)
 
 
+def test_dynamic_memory_attestation_requires_one_gib_allocator_headroom() -> None:
+    args = SimpleNamespace(
+        hy3_q4_dynamic_memory=True,
+        hy3_q4_dynamic_context=True,
+        expert_streaming=True,
+        expert_streaming_config=None,
+        expert_manifest=None,
+        expert_slab_slots=None,
+        expert_regrow_hysteresis_slabs=None,
+        expert_resize_min_interval_ms=None,
+        expert_allocator_headroom=None,
+    )
+    config = SimpleNamespace(
+        dynamic_expert_slabs=True,
+        resource_telemetry=True,
+        kv_bytes_per_token_override=84_480,
+        allocator_headroom_bytes=0,
+    )
+
+    with pytest.raises(ValueError, match="1 GiB allocator headroom"):
+        openai.validate_hy3_q4_dynamic_memory_options(args, config)
+
+
+def test_dynamic_memory_rejects_non_one_gib_cli_headroom_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _hy3_model_root(tmp_path)
+
+    _assert_server_rejects_before_load(
+        monkeypatch,
+        [
+            *_valid_dynamic_server_argv(root),
+            "--expert-allocator-headroom",
+            "2GiB",
+        ],
+        match="1 GiB allocator headroom",
+    )
+
+
 def test_dynamic_memory_requires_dynamic_context_before_model_load(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -191,6 +313,36 @@ def test_dynamic_memory_requires_dynamic_context_before_model_load(
         monkeypatch,
         argv,
         match="hy3-q4-dynamic-memory requires --hy3-q4-dynamic-context",
+    )
+
+
+def test_dynamic_memory_rejects_mtp_generation_mode_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _hy3_model_root(tmp_path)
+    argv = _valid_dynamic_server_argv(root)
+    argv[argv.index("--generation-mode") + 1] = "mtp"
+
+    _assert_server_rejects_before_load(
+        monkeypatch,
+        argv,
+        match="generation-mode ar",
+    )
+
+
+def test_dynamic_memory_rejects_loaded_mtp_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _hy3_model_root(tmp_path)
+    argv = _valid_dynamic_server_argv(root)
+    argv.remove("--no-load-mtp")
+
+    _assert_server_rejects_before_load(
+        monkeypatch,
+        argv,
+        match="no-load-mtp",
     )
 
 
@@ -329,15 +481,31 @@ def test_dynamic_memory_diagnostic_ablation_still_pins_exact_q4_before_model_loa
         "MTPLX_DYNAMIC_PAGED_KV": "1",
         "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
         "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
+        "MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS": "1",
         "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "0",
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "0",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "mlx_vector_paged",
+        "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "1",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
+        "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS": "1",
+        "MTPLX_DYNAMIC_PAGED_KV_MARGIN": "0",
+        "MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER": "0",
     }
     unsafe = {
         "MTPLX_DYNAMIC_PAGED_KV": "0",
         "MTPLX_VLLM_METAL_PAGED_ATTN": "0",
         "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "64",
+        "MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS": "1024",
         "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "2048",
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "1",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "fast_sdpa_gather",
+        "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "0",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "1",
+        "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "64",
+        "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS": "1024",
+        "MTPLX_DYNAMIC_PAGED_KV_MARGIN": "128",
+        "MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER": "131072",
     }
     for key, value in unsafe.items():
         monkeypatch.setenv(key, value)
@@ -445,7 +613,11 @@ def test_dynamic_memory_health_maps_runtime_data_without_inventing_os_metrics(
         "dynamic_memory": {
             "operating_target_bytes": 110,
             "hard_ceiling_bytes": 112,
+            "allocator_headroom_bytes": 1,
+            "classified_target_bytes": 109,
+            "classified_bytes": 91,
             "charged_bytes": 99,
+            "charged_residual_bytes": 11,
             "logical_expert_records": 128,
             "active_expert_records": 96,
             "resident_expert_records": 80,
@@ -512,7 +684,11 @@ def test_dynamic_memory_health_maps_runtime_data_without_inventing_os_metrics(
     assert payload["enabled"] is True
     assert payload["operating_target_bytes"] == 110
     assert payload["hard_ceiling_bytes"] == 112
+    assert payload["allocator_headroom_bytes"] == 1
+    assert payload["classified_target_bytes"] == 109
+    assert payload["classified_bytes"] == 91
     assert payload["resident_model_bytes"] == 40
+    assert payload["charged_residual_bytes"] == 11
     assert payload["kv_representation"] == "q4"
     assert payload["kv_logical_tokens"] == 4096
     assert payload["kv_physical_blocks"] == 64
@@ -537,3 +713,41 @@ def test_dynamic_memory_health_maps_runtime_data_without_inventing_os_metrics(
     assert payload["process_compressed_bytes"] is None
     assert payload["system_swap_delta_bytes"] is None
     assert set(payload) == openai.HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS
+
+
+def test_dynamic_memory_health_keeps_startup_logical_ownership_separate_from_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource_snapshot = {
+        "kv": {
+            "representation": "q4",
+            "logical_tokens": 1,
+            "physical_blocks": 1,
+            "physical_bytes": 1_351_680,
+        }
+    }
+    state = SimpleNamespace(
+        args=SimpleNamespace(
+            hy3_q4_dynamic_memory=True,
+            paged_kv_quantization="q4",
+        ),
+        runtime=SimpleNamespace(
+            expert_resource_telemetry_snapshot=lambda: resource_snapshot
+        ),
+        last_metrics=[],
+    )
+    monkeypatch.setattr(
+        openai,
+        "_process_memory_health_snapshot",
+        lambda _state: {
+            "process_rss_bytes": None,
+            "process_compressed_bytes": None,
+            "system_swap_delta_bytes": None,
+        },
+    )
+
+    payload = openai._hy3_q4_dynamic_memory_health(state)
+
+    assert payload["kv_logical_tokens"] == 1
+    assert payload["kv_physical_blocks"] == 1
+    assert payload["kv_physical_bytes"] == 1_351_680

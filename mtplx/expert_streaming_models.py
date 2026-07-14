@@ -191,6 +191,7 @@ class ExpertMemoryPlan:
     model_key: str
     total_limit_bytes: int
     runtime_reserve_bytes: int
+    allocator_headroom_bytes: int
     io_staging_bytes: int
     execution_workspace_bytes: int
     context_tokens: int
@@ -221,6 +222,16 @@ class ExpertMemoryPlan:
     @property
     def allocated_bytes(self) -> int:
         return self.fixed_bytes + self.persistent_cache_bytes
+
+    @property
+    def fits_headroom(self) -> bool:
+        return (
+            self.fits_fixed and self.unallocated_bytes >= self.allocator_headroom_bytes
+        )
+
+    @property
+    def rounding_residual_bytes(self) -> int:
+        return self.unallocated_bytes - self.allocator_headroom_bytes
 
 
 HY3_Q4 = ExpertStreamingModelSpec(
@@ -299,6 +310,7 @@ def plan_expert_memory(
     total_limit_bytes: int,
     context_tokens: int,
     runtime_reserve_bytes: int = 0,
+    allocator_headroom_bytes: int = 0,
     expert_cache_limit_bytes: int | None = None,
     transient_slots: int | None = None,
     io_staging_bytes: int = 0,
@@ -324,6 +336,9 @@ def plan_expert_memory(
     context_tokens = _integer("context_tokens", context_tokens, minimum=0)
     runtime_reserve_bytes = _integer(
         "runtime_reserve_bytes", runtime_reserve_bytes, minimum=0
+    )
+    allocator_headroom_bytes = _integer(
+        "allocator_headroom_bytes", allocator_headroom_bytes, minimum=0
     )
     io_staging_bytes = _integer("io_staging_bytes", io_staging_bytes, minimum=0)
     execution_workspace_bytes = _integer(
@@ -351,7 +366,10 @@ def plan_expert_memory(
         + io_staging_bytes
         + execution_workspace_bytes
     )
-    available_bytes = max(0, total_limit_bytes - fixed_bytes)
+    available_bytes = max(
+        0,
+        total_limit_bytes - fixed_bytes - allocator_headroom_bytes,
+    )
     persistent_budget_bytes = min(available_bytes, spec.routed_expert_bytes)
     if expert_cache_limit_bytes is not None:
         persistent_budget_bytes = min(persistent_budget_bytes, expert_cache_limit_bytes)
@@ -380,6 +398,7 @@ def plan_expert_memory(
         model_key=spec.key,
         total_limit_bytes=total_limit_bytes,
         runtime_reserve_bytes=runtime_reserve_bytes,
+        allocator_headroom_bytes=allocator_headroom_bytes,
         io_staging_bytes=io_staging_bytes,
         execution_workspace_bytes=execution_workspace_bytes,
         context_tokens=context_tokens,
