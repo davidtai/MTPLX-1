@@ -1199,7 +1199,7 @@ def test_q4_initial_allocator_baseline_failure_aborts_without_allocating() -> No
     assert observer.aborts[0][3] is after
 
 
-def test_q4_real_broker_commit_failure_has_no_pending_or_stranded_handle() -> None:
+def test_q4_real_broker_commit_failure_preserves_original_terminal_error() -> None:
     from mtplx.memory_broker import (
         AllocatorMemorySample,
         BrokerSnapshot,
@@ -1233,8 +1233,10 @@ def test_q4_real_broker_commit_failure_has_no_pending_or_stranded_handle() -> No
     )
     values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
 
-    with pytest.raises(MemoryTransactionError, match="already consumed"):
+    with pytest.raises(MemoryTransactionError, match="operating target") as caught:
         cache.update_without_fetch(values, values)
+
+    assert "already consumed" not in str(caught.value)
 
     snapshot = broker.snapshot()
     assert cache.nbytes == 0

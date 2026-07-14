@@ -1254,6 +1254,8 @@ class VllmMetalPagedKVCache:
                 allocator_after = self._sample_allocator_memory()
             except BaseException:
                 allocator_after = None
+            if getattr(operation_error, "transaction_terminalized", False):
+                raise operation_error
             try:
                 self._abort_physical_growth(
                     ticket,
@@ -1370,6 +1372,8 @@ class VllmMetalPagedKVCache:
                 allocator_after = self._sample_allocator_memory()
             except BaseException:
                 allocator_after = None
+            if getattr(operation_error, "transaction_terminalized", False):
+                raise operation_error
             try:
                 self._abort_physical_growth(
                     ticket,

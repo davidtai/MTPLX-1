@@ -1551,6 +1551,28 @@ def test_commit_kv_growth_atomically_reclassifies_consumed_allocator_cache() -> 
     assert snapshot.owned_kv_physical_bytes == GIB
 
 
+def test_commit_kv_growth_reconciles_allocator_cache_from_absolute_pools() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3()
+    _install(broker, _snapshot(resident=100 * GIB, cache=2 * GIB))
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=GIB,
+        transient_delta_bytes=0,
+        cache_id="target:absolute",
+    )
+
+    allocation = broker.commit_kv_growth(
+        ticket,
+        allocated_physical_bytes=GIB,
+        allocator_before=AllocatorMemorySample(10 * GIB, GIB, 11 * GIB),
+        allocator_after=AllocatorMemorySample(11 * GIB, 0, 11 * GIB),
+    )
+
+    snapshot = broker.snapshot()
+    assert allocation.physical_bytes == GIB
+    assert snapshot.allocator_cache_bytes == 0
+    assert snapshot.charged_bytes == 101 * GIB
+
+
 def test_commit_kv_growth_over_target_terminalizes_without_stranded_handle() -> None:
     broker = UnifiedMemoryBroker.standard_hy3()
     _install(broker, _snapshot(resident=108 * GIB, cache=GIB))

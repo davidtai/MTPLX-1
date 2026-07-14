@@ -924,6 +924,7 @@ class UnifiedMemoryBroker:
                         allocated,
                         reason=str(exc),
                     )
+                    setattr(exc, "transaction_terminalized", True)
                     raise
             if allocated != ticket.steady_delta_bytes:
                 self._pools = replace(
@@ -940,7 +941,9 @@ class UnifiedMemoryBroker:
                     f"{ticket.steady_delta_bytes} bytes"
                 )
                 self._fail_pending(reason, pools_already_updated=True)
-                raise MemoryTransactionError(reason)
+                error = MemoryTransactionError(reason)
+                setattr(error, "transaction_terminalized", True)
+                raise error
 
             self._pools = replace(
                 self._pools,
@@ -955,7 +958,9 @@ class UnifiedMemoryBroker:
                 reason = "committed KV allocation exceeded the operating target"
                 self._fail_pending(reason, pools_already_updated=True)
                 self._assert_kv_ledger_invariant()
-                raise MemoryTransactionError(reason)
+                error = MemoryTransactionError(reason)
+                setattr(error, "transaction_terminalized", True)
+                raise error
             allocation = KVPhysicalAllocation(
                 allocation_id=ticket.ticket_id,
                 cache_id=ticket.cache_id,
@@ -1057,15 +1062,17 @@ class UnifiedMemoryBroker:
             raise MemoryTelemetryError(
                 f"invalid allocator telemetry during {context}: {exc}"
             ) from exc
-        if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
-            raise MemoryTelemetryError(f"allocator telemetry is stale during {context}")
-
-        footprint_delta = (
-            allocator_after.charged_footprint_bytes
-            - allocator_before.charged_footprint_bytes
+        classified_after = (
+            self._pools.resident_model_bytes
+            + self._pools.kv_physical_bytes
+            + classified_delta_bytes
+            + self._pools.expert_slab_physical_bytes
+            + self._pools.in_flight_expert_staging_bytes
+            + self._pools.runtime_workspace_bytes
         )
-        residual = (
-            self._pools.allocator_cache_bytes + footprint_delta - classified_delta_bytes
+        residual = max(
+            0,
+            allocator_after.charged_footprint_bytes - classified_after,
         )
         return max(0, allocator_after.cache_bytes, residual)
 
