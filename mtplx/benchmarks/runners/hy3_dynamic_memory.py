@@ -23,6 +23,8 @@ from typing import TypeVar
 CONTEXT_MATRIX_TOKENS = (4_096, 32_768, 65_536, 131_072)
 HY3_Q4_TOTAL_CONTEXT_TOKENS = 131_072
 HY3_Q4_KV_BLOCK_SIZE_TOKENS = 16
+HY3_Q4_KV_BYTES_PER_TOKEN = 80 * 2 * 8 * ((128 // 2) + 2)
+HY3_Q4_KV_BLOCK_BYTES = HY3_Q4_KV_BLOCK_SIZE_TOKENS * HY3_Q4_KV_BYTES_PER_TOKEN
 HY3_Q4_MAX_BLOCKS = HY3_Q4_TOTAL_CONTEXT_TOKENS // HY3_Q4_KV_BLOCK_SIZE_TOKENS
 MIN_STABLE_HOLD_SAMPLES = 3
 MIN_STABLE_HOLD_DURATION_NS = 1_000_000_000
@@ -300,6 +302,11 @@ class MemoryTimelinePoint:
             raise BenchmarkGateError(
                 f"{prefix}.allocator_peak_bytes is below active bytes"
             )
+        expected_kv_bytes = point.kv_allocated_blocks * HY3_Q4_KV_BLOCK_BYTES
+        if point.kv_physical_bytes != expected_kv_bytes:
+            raise BenchmarkGateError(
+                f"{prefix}.kv_physical_bytes does not match exact Q4 geometry"
+            )
         return point
 
 
@@ -508,6 +515,10 @@ def _validate_timeline(
     pre = _phase_once(timeline, "pre_growth")
     growth = _phase_once(timeline, "post_kv_growth")
     reset = _phase_once(timeline, "post_reset")
+    if cache_start_state.kv_physical_bytes != (
+        cache_start_state.kv_blocks * HY3_Q4_KV_BLOCK_BYTES
+    ):
+        raise BenchmarkGateError("cache_start_state does not match exact Q4 geometry")
     holds = [point for point in timeline if point.phase == "hold"]
     if len(holds) < MIN_STABLE_HOLD_SAMPLES:
         raise BenchmarkGateError(
@@ -1037,7 +1048,9 @@ def _metric_summary(
 def _paired_equal(static: CampaignObservation, dynamic: CampaignObservation) -> None:
     common_identity_fields = (
         "model_key",
+        "model_artifact_id",
         "model_artifact_sha256",
+        "expert_manifest_id",
         "expert_manifest_sha256",
         "source_git_commit",
         "normalized_config_sha256",
@@ -1305,6 +1318,9 @@ def run_subprocess_campaign(
 
 __all__ = [
     "CONTEXT_MATRIX_TOKENS",
+    "HY3_Q4_KV_BLOCK_BYTES",
+    "HY3_Q4_KV_BYTES_PER_TOKEN",
+    "HY3_Q4_MAX_BLOCKS",
     "AllocatorSample",
     "BenchmarkGateError",
     "CacheStartState",

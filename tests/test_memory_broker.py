@@ -468,7 +468,7 @@ def test_expert_reclaim_requires_registered_and_allocator_reduction() -> None:
         transient_delta_bytes=GIB,
     )
 
-    with pytest.raises(MemoryTelemetryError, match="allocator footprint"):
+    with pytest.raises(MemoryTelemetryError, match="allocator footprint") as caught:
         broker.confirm_expert_reclaim(
             ticket,
             registered_slab_bytes_after=8 * GIB,
@@ -484,6 +484,7 @@ def test_expert_reclaim_requires_registered_and_allocator_reduction() -> None:
             ),
             now_ns=1,
         )
+    assert not isinstance(caught.value, TerminalizedKVReleaseError)
 
     # Active-to-cache movement is reclassification, not physical reclaim.
     snapshot = broker.snapshot()

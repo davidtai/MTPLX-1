@@ -11,6 +11,9 @@ import pytest
 
 from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     CONTEXT_MATRIX_TOKENS,
+    HY3_Q4_KV_BLOCK_BYTES,
+    HY3_Q4_KV_BYTES_PER_TOKEN,
+    HY3_Q4_MAX_BLOCKS,
     AllocatorSample,
     BenchmarkGateError,
     CacheStartState,
@@ -75,12 +78,12 @@ def _point(
     timestamp_ns: int,
     *,
     expert: int,
-    kv: int,
     kv_blocks: int,
     active: int | None = None,
     cache: int = 0,
 ) -> dict[str, object]:
     health = _slot_health()
+    kv = kv_blocks * HY3_Q4_KV_BLOCK_BYTES
     return {
         "phase": phase,
         "monotonic_ns": timestamp_ns,
@@ -107,29 +110,33 @@ def _observation(
     if arm == "dynamic":
         final_blocks = context_tokens // 16
         timeline = [
-            _point("pre_growth", 1, expert=800, kv=100, kv_blocks=1),
-            _point("post_expert_reclaim", 2, expert=600, kv=100, kv_blocks=1),
-            _point("post_kv_growth", 3, expert=600, kv=300, kv_blocks=final_blocks),
-            _point("hold", 4_000_000_000, expert=600, kv=300, kv_blocks=final_blocks),
-            _point("hold", 4_500_000_000, expert=600, kv=300, kv_blocks=final_blocks),
-            _point("hold", 5_000_000_000, expert=600, kv=300, kv_blocks=final_blocks),
-            _point("post_reset", 6_000_000_000, expert=600, kv=0, kv_blocks=0),
-            _point("post_regrow", 7_000_000_000, expert=800, kv=0, kv_blocks=0),
+            _point("pre_growth", 1, expert=800, kv_blocks=1),
+            _point("post_expert_reclaim", 2, expert=600, kv_blocks=1),
+            _point("post_kv_growth", 3, expert=600, kv_blocks=final_blocks),
+            _point("hold", 4_000_000_000, expert=600, kv_blocks=final_blocks),
+            _point("hold", 4_500_000_000, expert=600, kv_blocks=final_blocks),
+            _point("hold", 5_000_000_000, expert=600, kv_blocks=final_blocks),
+            _point("post_reset", 6_000_000_000, expert=600, kv_blocks=0),
+            _point("post_regrow", 7_000_000_000, expert=800, kv_blocks=0),
         ]
-        start = {"kind": "empty-q4", "kv_physical_bytes": 100, "kv_blocks": 1}
+        start = {
+            "kind": "empty-q4",
+            "kv_physical_bytes": HY3_Q4_KV_BLOCK_BYTES,
+            "kv_blocks": 1,
+        }
     else:
         timeline = [
-            _point("pre_growth", 1, expert=600, kv=300, kv_blocks=8192),
-            _point("post_kv_growth", 2, expert=600, kv=300, kv_blocks=8192),
-            _point("hold", 3_000_000_000, expert=600, kv=300, kv_blocks=8192),
-            _point("hold", 3_500_000_000, expert=600, kv=300, kv_blocks=8192),
-            _point("hold", 4_000_000_000, expert=600, kv=300, kv_blocks=8192),
-            _point("post_reset", 5_000_000_000, expert=600, kv=0, kv_blocks=0),
+            _point("pre_growth", 1, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
+            _point("post_kv_growth", 2, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
+            _point("hold", 3_000_000_000, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
+            _point("hold", 3_500_000_000, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
+            _point("hold", 4_000_000_000, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
+            _point("post_reset", 5_000_000_000, expert=600, kv_blocks=0),
         ]
         start = {
             "kind": "static-128k-reserved-q4",
-            "kv_physical_bytes": 300,
-            "kv_blocks": 8192,
+            "kv_physical_bytes": HY3_Q4_MAX_BLOCKS * HY3_Q4_KV_BLOCK_BYTES,
+            "kv_blocks": HY3_Q4_MAX_BLOCKS,
         }
     identity = _identity(arm)
     return {
@@ -150,7 +157,10 @@ def _observation(
             "generated_tokens": len(tokens),
             "elapsed_seconds": len(tokens) / tok_s,
             "tokens_per_second": tok_s,
-            "peak_charged_bytes": 900,
+            "peak_charged_bytes": max(
+                point["allocator_active_bytes"] + point["allocator_cache_bytes"]
+                for point in timeline
+            ),
             "hold_performance_samples": [tok_s * 0.99, tok_s, tok_s * 1.01],
         },
     }
@@ -222,9 +232,31 @@ def test_observation_requires_declared_start_and_physical_ordering() -> None:
     assert validated.context_tokens == 4096
 
     reordered = _observation("dynamic", 4096, 0, tok_s=12.0)
-    reordered["timeline"][1]["kv_physical_bytes"] = 200
+    reordered["timeline"][1]["kv_allocated_blocks"] = 2
+    reordered["timeline"][1]["kv_physical_bytes"] = 2 * HY3_Q4_KV_BLOCK_BYTES
+    reordered["timeline"][1]["allocator_active_bytes"] += HY3_Q4_KV_BLOCK_BYTES
+    reordered["timeline"][1]["allocator_peak_bytes"] += HY3_Q4_KV_BLOCK_BYTES
     with pytest.raises(BenchmarkGateError, match="before KV"):
         validate_campaign_observation(reordered)
+
+
+def test_observation_requires_exact_issue46_q4_physical_geometry() -> None:
+    assert HY3_Q4_KV_BYTES_PER_TOKEN == 84_480
+    assert HY3_Q4_KV_BLOCK_BYTES == 16 * 84_480
+    assert HY3_Q4_MAX_BLOCKS * HY3_Q4_KV_BLOCK_BYTES == int(10.3125 * 1024**3)
+
+    static = validate_campaign_observation(_observation("static", 4096, 0, tok_s=12.0))
+    assert static.cache_start_state.kv_physical_bytes == int(10.3125 * 1024**3)
+
+    bad_start = _observation("dynamic", 4096, 0, tok_s=12.0)
+    bad_start["cache_start_state"]["kv_physical_bytes"] += 1
+    with pytest.raises(BenchmarkGateError, match="exact Q4 geometry"):
+        validate_campaign_observation(bad_start)
+
+    bad_timeline = _observation("dynamic", 4096, 0, tok_s=12.0)
+    bad_timeline["timeline"][3]["kv_physical_bytes"] += 1
+    with pytest.raises(BenchmarkGateError, match="exact Q4 geometry"):
+        validate_campaign_observation(bad_timeline)
 
 
 def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> None:
@@ -245,9 +277,23 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
 
     no_boundary = _observation("dynamic", 4096, 0, tok_s=12.0)
     no_boundary["cache_start_state"]["kv_blocks"] = 255
+    no_boundary["cache_start_state"]["kv_physical_bytes"] = 255 * HY3_Q4_KV_BLOCK_BYTES
     no_boundary["timeline"][0]["kv_allocated_blocks"] = 255
+    no_boundary["timeline"][0]["kv_physical_bytes"] = 255 * HY3_Q4_KV_BLOCK_BYTES
+    no_boundary["timeline"][0]["allocator_active_bytes"] = (
+        800 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    )
+    no_boundary["timeline"][0]["allocator_peak_bytes"] = (
+        800 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    )
     no_boundary["timeline"][1]["kv_allocated_blocks"] = 255
-    no_boundary["timeline"][2]["kv_physical_bytes"] = 110
+    no_boundary["timeline"][1]["kv_physical_bytes"] = 255 * HY3_Q4_KV_BLOCK_BYTES
+    no_boundary["timeline"][1]["allocator_active_bytes"] = (
+        600 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    )
+    no_boundary["timeline"][1]["allocator_peak_bytes"] = (
+        600 + 255 * HY3_Q4_KV_BLOCK_BYTES
+    )
     no_boundary["timeline"][2]["kv_allocated_blocks"] = 256
     with pytest.raises(BenchmarkGateError, match="block boundaries"):
         validate_campaign_observation(no_boundary)
@@ -400,6 +446,33 @@ def test_campaign_rejects_pair_identity_or_output_drift() -> None:
         return row
 
     with pytest.raises(BenchmarkGateError, match="paired generated tokens"):
+        run_balanced_campaign(
+            allocator_probe=probe,
+            execute_arm=execute,
+            repetitions=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "different_value"),
+    [
+        ("model_artifact_id", "pipenetwork/Hy3-4bit@different"),
+        ("expert_manifest_id", "hy3-q4/component-banks/other-manifest.json"),
+    ],
+)
+def test_campaign_rejects_pair_artifact_ids_even_when_hashes_match(
+    field: str,
+    different_value: str,
+) -> None:
+    probe = validate_allocator_probe(_probe_result())
+
+    def execute(arm: str, context_tokens: int, repetition: int):
+        row = _observation(arm, context_tokens, repetition, tok_s=10.0)
+        if arm == "dynamic" and context_tokens == 4096 and repetition == 0:
+            row["identity"][field] = different_value
+        return row
+
+    with pytest.raises(BenchmarkGateError, match=f"paired identity drifted at {field}"):
         run_balanced_campaign(
             allocator_probe=probe,
             execute_arm=execute,
