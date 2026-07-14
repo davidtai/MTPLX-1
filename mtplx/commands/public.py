@@ -8112,6 +8112,10 @@ def cmd_serve_public(args: Any) -> int:
     from mtplx.expert_cli import append_expert_streaming_child_args
 
     append_expert_streaming_child_args(cmd, args)
+    if bool(getattr(args, "hy3_q4_dynamic_context", False)):
+        cmd.append("--hy3-q4-dynamic-context")
+    if not bool(getattr(args, "session_bank_live_refs", True)):
+        cmd.append("--no-session-bank-live-refs")
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
         ("decode_batch_max", "--decode-batch-max"),

@@ -614,10 +614,17 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
+def _add_expert_streaming_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_hy3_dynamic_memory: bool = False,
+) -> None:
     from .expert_cli import add_expert_streaming_args
 
-    add_expert_streaming_args(parser)
+    add_expert_streaming_args(
+        parser,
+        include_hy3_dynamic_memory=include_hy3_dynamic_memory,
+    )
 
 
 SCHEDULER_MODE_CHOICES = (
@@ -2522,7 +2529,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--port", type=int, default=8000)
     serve_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(serve_p)
-    _add_expert_streaming_args(serve_p)
+    _add_expert_streaming_args(serve_p, include_hy3_dynamic_memory=True)
     serve_p.add_argument(
         "--generation-mode",
         choices=["mtp", "ar", "auto"],
@@ -2568,6 +2575,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_batching_args(serve_p)
     _add_ssd_session_cache_args(serve_p)
     _add_paged_kv_quant_args(serve_p)
+    serve_p.add_argument(
+        "--hy3-q4-dynamic-context",
+        action="store_true",
+        help="Use the exact single-sequence Hy3 Q4 131072-token context lane.",
+    )
+    serve_p.add_argument(
+        "--session-bank-live-refs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Permit SessionBank live KV references. Dynamic Hy3 Q4 memory "
+            "requires --no-session-bank-live-refs."
+        ),
+    )
     _add_adaptive_args(serve_p)
     serve_p.add_argument(
         "--max-tokens",

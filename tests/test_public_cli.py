@@ -391,6 +391,44 @@ def test_serve_cli_accepts_native_app_thermal_poll_flag():
     assert args.enable_thermal_poll is True
 
 
+def test_serve_parser_exposes_explicit_hy3_q4_dynamic_memory_lane() -> None:
+    parser = build_parser()
+
+    defaults = parser.parse_args(["serve", "--yes"])
+    enabled = parser.parse_args(
+        [
+            "serve",
+            "--yes",
+            "--hy3-q4-dynamic-memory",
+            "--hy3-q4-dynamic-context",
+            "--no-session-bank-live-refs",
+            "--expert-slab-slots",
+            "64",
+            "--expert-regrow-hysteresis-slabs",
+            "2",
+            "--expert-resize-min-interval-ms",
+            "250",
+        ]
+    )
+
+    assert defaults.hy3_q4_dynamic_memory is False
+    assert defaults.hy3_q4_dynamic_context is False
+    assert defaults.session_bank_live_refs is True
+    assert enabled.hy3_q4_dynamic_memory is True
+    assert enabled.hy3_q4_dynamic_context is True
+    assert enabled.session_bank_live_refs is False
+    assert enabled.expert_slab_slots == 64
+    assert enabled.expert_regrow_hysteresis_slabs == 2
+    assert enabled.expert_resize_min_interval_ms == 250
+
+
+def test_hy3_q4_dynamic_memory_flag_is_scoped_to_serving() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "hello", "--hy3-q4-dynamic-memory"])
+
+
 def test_shell_banner_env_suppresses_compact_help_ascii(monkeypatch, capsys):
     monkeypatch.setenv("MTPLX_SHELL_BANNER_SHOWN", "1")
 
@@ -1057,6 +1095,65 @@ def _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir, extra_args=
     code = public.cmd_serve_public(args)
     assert code == 0
     return json.loads(capsys.readouterr().out)
+
+
+def test_serve_forwards_complete_hy3_q4_dynamic_memory_lane(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    model_dir = tmp_path / "hy3"
+    model_dir.mkdir()
+    manifest = model_dir / "expert-manifest.json"
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        (
+            "--expert-streaming",
+            "--expert-model-key",
+            "hy3-q4",
+            "--expert-manifest",
+            str(manifest),
+            "--expert-memory-limit",
+            "110GiB",
+            "--expert-max-live-kv-tokens",
+            "131072",
+            "--expert-cache-scope",
+            "global",
+            "--expert-slot-layout",
+            "component-banks",
+            "--hy3-q4-dynamic-memory",
+            "--hy3-q4-dynamic-context",
+            "--no-session-bank-live-refs",
+            "--expert-slab-slots",
+            "64",
+            "--expert-regrow-hysteresis-slabs",
+            "2",
+            "--expert-resize-min-interval-ms",
+            "250",
+            "--paged-kv-quantization",
+            "q4",
+            "--context-window",
+            "131072",
+            "--max-active-requests",
+            "1",
+            "--decode-batch-max",
+            "1",
+        ),
+    )
+
+    argv = payload["argv"]
+    assert "--hy3-q4-dynamic-memory" in argv
+    assert "--hy3-q4-dynamic-context" in argv
+    assert "--no-session-bank-live-refs" in argv
+    assert argv[argv.index("--expert-slab-slots") + 1] == "64"
+    assert argv[argv.index("--expert-regrow-hysteresis-slabs") + 1] == "2"
+    assert argv[argv.index("--expert-resize-min-interval-ms") + 1] == "250"
+    assert argv[argv.index("--paged-kv-quantization") + 1] == "q4"
+    assert argv[argv.index("--context-window") + 1] == "131072"
+    assert argv[argv.index("--max-active-requests") + 1] == "1"
+    assert argv[argv.index("--decode-batch-max") + 1] == "1"
 
 
 def test_serve_defaults_quantized_27b_flagships_to_turbo(

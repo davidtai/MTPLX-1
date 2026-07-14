@@ -21,7 +21,11 @@ _BYTE_FIELDS = {
 }
 
 
-def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
+def add_expert_streaming_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_hy3_dynamic_memory: bool = False,
+) -> None:
     group = parser.add_argument_group("SSD expert streaming")
     group.add_argument(
         "--expert-streaming",
@@ -31,6 +35,15 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
             "This selects target-only AR for the pinned Hy3/GLM artifacts."
         ),
     )
+    if include_hy3_dynamic_memory:
+        group.add_argument(
+            "--hy3-q4-dynamic-memory",
+            action="store_true",
+            help=(
+                "Experimentally share the Hy3 Q4 single-sequence memory budget "
+                "between physical KV blocks and releasable expert slabs. Off by default."
+            ),
+        )
     group.add_argument(
         "--expert-streaming-config",
         help="JSON ExpertStreamingConfig; explicit flags below override its values.",
@@ -66,6 +79,22 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
         help="Use fixed per-layer banks or one global expert-record pool.",
     )
     group.add_argument("--expert-transient-slots", type=int)
+    if include_hy3_dynamic_memory:
+        group.add_argument(
+            "--expert-slab-slots",
+            type=int,
+            help="Physical expert records per independently releasable slab.",
+        )
+        group.add_argument(
+            "--expert-regrow-hysteresis-slabs",
+            type=int,
+            help="Additional free-slab margin required before lazy expert regrowth.",
+        )
+        group.add_argument(
+            "--expert-resize-min-interval-ms",
+            type=int,
+            help="Minimum interval in milliseconds between expert-slab resizes.",
+        )
     group.add_argument("--expert-io-staging", help="Host I/O staging reserve.")
     group.add_argument("--expert-execution-workspace", help="Execution workspace reserve.")
     group.add_argument("--expert-max-inflight-io", help="Bound concurrent expert-read bytes.")
@@ -169,6 +198,13 @@ def expert_streaming_load_kwargs(
         "cache_policy": getattr(args, "expert_cache_policy", None),
         "cache_scope": getattr(args, "expert_cache_scope", None),
         "transient_slots": getattr(args, "expert_transient_slots", None),
+        "expert_slab_slots": getattr(args, "expert_slab_slots", None),
+        "expert_regrow_hysteresis_slabs": getattr(
+            args, "expert_regrow_hysteresis_slabs", None
+        ),
+        "expert_resize_min_interval_ms": getattr(
+            args, "expert_resize_min_interval_ms", None
+        ),
         "io_staging_bytes": getattr(args, "expert_io_staging", None),
         "execution_workspace_bytes": getattr(args, "expert_execution_workspace", None),
         "max_inflight_io_bytes": getattr(args, "expert_max_inflight_io", None),
@@ -185,6 +221,9 @@ def expert_streaming_load_kwargs(
         ),
     }
     values.update({key: value for key, value in overrides.items() if value is not None})
+    if bool(getattr(args, "hy3_q4_dynamic_memory", False)):
+        values["dynamic_expert_slabs"] = True
+        values["resource_telemetry"] = True
     if "model_key" not in values:
         values["model_key"] = _read_model_key(root)
     values.setdefault("runtime_reserve_bytes", 16 * 1024**3)
@@ -235,6 +274,12 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
         ("expert_cache_policy", "--expert-cache-policy"),
         ("expert_cache_scope", "--expert-cache-scope"),
         ("expert_transient_slots", "--expert-transient-slots"),
+        ("expert_slab_slots", "--expert-slab-slots"),
+        (
+            "expert_regrow_hysteresis_slabs",
+            "--expert-regrow-hysteresis-slabs",
+        ),
+        ("expert_resize_min_interval_ms", "--expert-resize-min-interval-ms"),
         ("expert_io_staging", "--expert-io-staging"),
         ("expert_execution_workspace", "--expert-execution-workspace"),
         ("expert_max_inflight_io", "--expert-max-inflight-io"),
@@ -271,3 +316,5 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
         value = getattr(args, attribute, None)
         if value is not None:
             command.append(positive if value else negative)
+    if bool(getattr(args, "hy3_q4_dynamic_memory", False)):
+        command.append("--hy3-q4-dynamic-memory")

@@ -112,6 +112,68 @@ def validate_hy3_q4_dynamic_context_options(
     return True
 
 
+_HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS = (
+    ("expert_slab_slots", "--expert-slab-slots"),
+    (
+        "expert_regrow_hysteresis_slabs",
+        "--expert-regrow-hysteresis-slabs",
+    ),
+    ("expert_resize_min_interval_ms", "--expert-resize-min-interval-ms"),
+)
+
+
+def validate_hy3_q4_dynamic_memory_request_options(args: object) -> bool:
+    """Reject ambiguous serving requests before reading or loading model weights."""
+
+    enabled = bool(getattr(args, "hy3_q4_dynamic_memory", False))
+    if not enabled:
+        for attribute, flag in _HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS:
+            if getattr(args, attribute, None) is not None:
+                raise ValueError(f"{flag} requires --hy3-q4-dynamic-memory")
+        return False
+    if not bool(getattr(args, "hy3_q4_dynamic_context", False)):
+        raise ValueError("--hy3-q4-dynamic-memory requires --hy3-q4-dynamic-context")
+    if not bool(
+        getattr(args, "expert_streaming", False)
+        or getattr(args, "expert_streaming_config", None)
+        or getattr(args, "expert_manifest", None)
+    ):
+        raise ValueError("--hy3-q4-dynamic-memory requires expert streaming")
+    return True
+
+
+def validate_hy3_q4_dynamic_memory_options(
+    args: object,
+    expert_streaming_config: object | None,
+) -> bool:
+    """Attest the explicit serving opt-in and its resolved runtime config."""
+
+    enabled = validate_hy3_q4_dynamic_memory_request_options(args)
+    config_is_dynamic = bool(
+        getattr(expert_streaming_config, "dynamic_expert_slabs", False)
+    )
+    if not enabled:
+        if config_is_dynamic:
+            raise ValueError(
+                "dynamic expert slabs in serving require --hy3-q4-dynamic-memory"
+            )
+        return False
+    if expert_streaming_config is None:
+        raise ValueError("--hy3-q4-dynamic-memory requires expert streaming")
+    if not config_is_dynamic:
+        raise ValueError("--hy3-q4-dynamic-memory requires dynamic_expert_slabs=True")
+    if not bool(getattr(expert_streaming_config, "resource_telemetry", False)):
+        raise ValueError("--hy3-q4-dynamic-memory requires resource_telemetry=True")
+    for attribute, flag in _HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS:
+        requested = getattr(args, attribute, None)
+        if (
+            requested is not None
+            and getattr(expert_streaming_config, attribute, None) != requested
+        ):
+            raise ValueError(f"{flag} was not applied to ExpertStreamingConfig")
+    return True
+
+
 def resolve_api_key(
     *,
     explicit_api_key: str | None = None,

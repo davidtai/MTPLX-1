@@ -2585,6 +2585,60 @@ def test_openai_server_health_profile_sampler_reports_active_override():
     }
 
 
+def test_health_exposes_stable_disabled_hy3_q4_dynamic_memory_shape():
+    response = TestClient(create_app(_fake_state())).get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()["hy3_q4_dynamic_memory"]
+    assert payload["enabled"] is False
+    assert set(payload) == openai.HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS
+
+
+def test_health_exposes_enabled_hy3_q4_dynamic_memory_resource_snapshot(monkeypatch):
+    state = _fake_state()
+    state.args.hy3_q4_dynamic_memory = True
+    state.args.paged_kv_quantization = "q4"
+    state.runtime.expert_resource_telemetry_snapshot = lambda: {
+        "dynamic_memory": {
+            "operating_target_bytes": 110 * 1024**3,
+            "hard_ceiling_bytes": 112 * 1024**3,
+            "charged_bytes": 100 * 1024**3,
+            "logical_expert_records": 256,
+            "active_expert_records": 224,
+            "resident_expert_records": 200,
+            "active_slab_count": 7,
+            "expert_slab_physical_bytes": 90 * 1024**3,
+        },
+        "memory_broker": {
+            "resident_model_bytes": 5 * 1024**3,
+            "kv_physical_bytes": 5 * 1024**3,
+        },
+        "cache": {"hit_rate": 0.9},
+    }
+    monkeypatch.setattr(
+        openai,
+        "_process_memory_health_snapshot",
+        lambda _state: {
+            "process_rss_bytes": None,
+            "process_compressed_bytes": None,
+            "system_swap_delta_bytes": None,
+        },
+    )
+
+    response = TestClient(create_app(state)).get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()["hy3_q4_dynamic_memory"]
+    assert payload["enabled"] is True
+    assert payload["kv_representation"] == "q4"
+    assert payload["charged_bytes"] == 100 * 1024**3
+    assert payload["expert_active_slabs"] == 7
+    assert payload["expert_cache_hit_rate"] == 0.9
+    assert payload["process_rss_bytes"] is None
+    assert payload["process_compressed_bytes"] is None
+    assert payload["system_swap_delta_bytes"] is None
+
+
 def test_chat_completion_response_reports_served_model_when_request_model_is_stale(
     monkeypatch,
 ):

@@ -108,6 +108,8 @@ from mtplx.runtime_options import (
     normalize_paged_kv_quantization,
     resolve_api_key,
     validate_hy3_q4_dynamic_context_options,
+    validate_hy3_q4_dynamic_memory_options,
+    validate_hy3_q4_dynamic_memory_request_options,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
 from mtplx.fan_mode import (
@@ -1425,10 +1427,15 @@ def _apply_metal_memory_caps(
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        validate_hy3_q4_dynamic_memory_request_options(args)
         from mtplx.expert_cli import expert_streaming_load_kwargs
 
         self.expert_streaming_load_kwargs = expert_streaming_load_kwargs(
             args, args.model
+        )
+        self.hy3_q4_dynamic_memory = validate_hy3_q4_dynamic_memory_options(
+            args,
+            self.expert_streaming_load_kwargs.get("expert_streaming_config"),
         )
         if self.expert_streaming_load_kwargs:
             args.load_mtp = False
@@ -1455,6 +1462,9 @@ class ServerState:
         self.hy3_q4_dynamic_context = validate_hy3_q4_dynamic_context_options(
             args,
             self.expert_streaming_load_kwargs.get("expert_streaming_config"),
+        )
+        self.hy3_dynamic_memory_initial_swap_bytes = (
+            _system_swap_used_bytes() if self.hy3_q4_dynamic_memory else None
         )
         self.hy3_q4_sequence_gate = (
             SingleSequenceGate() if self.hy3_q4_dynamic_context else None
@@ -10601,6 +10611,45 @@ def _mlx_memory_stats_live() -> dict[str, Any]:
     return snapshot
 
 
+def _system_swap_used_bytes() -> int | None:
+    try:
+        import psutil
+
+        return int(psutil.swap_memory().used)
+    except Exception:
+        return None
+
+
+def _process_memory_health_snapshot(state: Any) -> dict[str, int | None]:
+    """Best-effort process and system memory values without shelling out."""
+
+    rss_bytes: int | None = None
+    compressed_bytes: int | None = None
+    try:
+        import psutil
+
+        memory_info = psutil.Process(os.getpid()).memory_full_info()
+        rss = getattr(memory_info, "rss", None)
+        compressed = getattr(memory_info, "compressed", None)
+        rss_bytes = None if rss is None else int(rss)
+        compressed_bytes = None if compressed is None else int(compressed)
+    except Exception:
+        pass
+
+    initial_swap = getattr(state, "hy3_dynamic_memory_initial_swap_bytes", None)
+    current_swap = _system_swap_used_bytes()
+    swap_delta = (
+        int(current_swap) - int(initial_swap)
+        if current_swap is not None and isinstance(initial_swap, int)
+        else None
+    )
+    return {
+        "process_rss_bytes": rss_bytes,
+        "process_compressed_bytes": compressed_bytes,
+        "system_swap_delta_bytes": swap_delta,
+    }
+
+
 def _dashboard_prompt_preview(
     request: Any, tokenizer: Any, *, max_chars: int = 96
 ) -> str:
@@ -14136,6 +14185,234 @@ def _uncapped_response_lease_tokens_from_env() -> int | None:
 
 def _hy3_q4_dynamic_context_enabled(state: Any) -> bool:
     return bool(getattr(getattr(state, "args", None), "hy3_q4_dynamic_context", False))
+
+
+HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS = frozenset(
+    {
+        "enabled",
+        "operating_target_bytes",
+        "hard_ceiling_bytes",
+        "charged_bytes",
+        "resident_model_bytes",
+        "kv_representation",
+        "kv_logical_tokens",
+        "kv_physical_blocks",
+        "kv_physical_bytes",
+        "expert_logical_records",
+        "expert_active_records",
+        "expert_resident_records",
+        "expert_logical_slabs",
+        "expert_active_slabs",
+        "expert_draining_slabs",
+        "expert_released_slabs",
+        "expert_physical_bytes",
+        "pinned_expert_bytes",
+        "inflight_expert_bytes",
+        "speculative_expert_bytes",
+        "runtime_workspace_bytes",
+        "inflight_expert_staging_bytes",
+        "allocator_active_bytes",
+        "allocator_cache_bytes",
+        "allocator_peak_bytes",
+        "requested_reclaim_bytes",
+        "reclaimed_bytes",
+        "regrown_bytes",
+        "evicted_expert_records",
+        "evicted_expert_slabs",
+        "resize_duration_ns",
+        "total_resize_duration_ns",
+        "max_resize_duration_ns",
+        "blocked_by_pin_bytes",
+        "admission_failures",
+        "resize_failures",
+        "expert_cache_hit_rate",
+        "ssd_bytes_per_token",
+        "decode_tps",
+        "token_latency_p50_ms",
+        "token_latency_p95_ms",
+        "process_rss_bytes",
+        "process_compressed_bytes",
+        "system_swap_delta_bytes",
+        "failed_closed",
+        "failure_reason",
+        "sampling_error",
+    }
+)
+
+
+def _hy3_q4_dynamic_memory_enabled(state: Any) -> bool:
+    return bool(getattr(getattr(state, "args", None), "hy3_q4_dynamic_memory", False))
+
+
+def _health_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _health_first(
+    sources: Iterable[Mapping[str, Any]],
+    *keys: str,
+) -> Any | None:
+    for source in sources:
+        for key in keys:
+            if key in source and source[key] is not None:
+                return source[key]
+    return None
+
+
+def _hy3_q4_dynamic_memory_health(state: Any) -> dict[str, Any]:
+    """Return a cheap, stable resource view for the experimental broker lane."""
+
+    enabled = _hy3_q4_dynamic_memory_enabled(state)
+    payload = {key: None for key in HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS}
+    payload["enabled"] = enabled
+    if not enabled:
+        return payload
+
+    runtime = getattr(state, "runtime", None)
+    resource: Mapping[str, Any] = {}
+    try:
+        sampler = getattr(runtime, "expert_resource_telemetry_snapshot", None)
+        if callable(sampler):
+            resource = _health_mapping(sampler())
+    except Exception as exc:
+        payload["sampling_error"] = f"{type(exc).__name__}: {exc}"
+
+    dynamic = _health_mapping(resource.get("dynamic_memory"))
+    broker = _health_mapping(resource.get("memory_broker"))
+    cache = _health_mapping(resource.get("cache"))
+    kv = _health_mapping(resource.get("kv"))
+    latest = _health_mapping(
+        state.last_metrics[-1] if getattr(state, "last_metrics", None) else None
+    )
+    general_sources = (dynamic, broker, resource)
+    field_sources: dict[
+        str,
+        tuple[Iterable[Mapping[str, Any]], tuple[str, ...]],
+    ] = {
+        "operating_target_bytes": (general_sources, ("operating_target_bytes",)),
+        "hard_ceiling_bytes": (general_sources, ("hard_ceiling_bytes",)),
+        "charged_bytes": (general_sources, ("charged_bytes",)),
+        "resident_model_bytes": (general_sources, ("resident_model_bytes",)),
+        "kv_logical_tokens": (
+            (kv, resource),
+            ("logical_tokens", "kv_logical_tokens", "live_kv_tokens"),
+        ),
+        "kv_physical_blocks": (
+            (kv, resource),
+            ("physical_blocks", "kv_physical_blocks"),
+        ),
+        "kv_physical_bytes": (
+            (kv, broker, resource),
+            ("physical_bytes", "kv_physical_bytes"),
+        ),
+        "expert_logical_records": (
+            general_sources,
+            ("logical_expert_records", "expert_logical_records"),
+        ),
+        "expert_active_records": (
+            general_sources,
+            ("active_expert_records", "expert_active_records"),
+        ),
+        "expert_resident_records": (
+            general_sources,
+            ("resident_expert_records", "expert_resident_records"),
+        ),
+        "expert_logical_slabs": (
+            general_sources,
+            ("logical_slab_count", "expert_logical_slabs"),
+        ),
+        "expert_active_slabs": (
+            general_sources,
+            ("active_slab_count", "expert_active_slabs"),
+        ),
+        "expert_draining_slabs": (
+            general_sources,
+            ("draining_slab_count", "expert_draining_slabs"),
+        ),
+        "expert_released_slabs": (
+            general_sources,
+            ("released_slab_count", "expert_released_slabs"),
+        ),
+        "expert_physical_bytes": (
+            general_sources,
+            ("expert_slab_physical_bytes", "expert_physical_bytes"),
+        ),
+        "pinned_expert_bytes": (general_sources, ("pinned_expert_bytes",)),
+        "inflight_expert_bytes": (
+            general_sources,
+            ("in_flight_expert_bytes", "inflight_expert_bytes"),
+        ),
+        "speculative_expert_bytes": (
+            general_sources,
+            ("speculative_expert_bytes",),
+        ),
+        "runtime_workspace_bytes": (
+            general_sources,
+            ("runtime_workspace_bytes",),
+        ),
+        "inflight_expert_staging_bytes": (
+            general_sources,
+            ("in_flight_expert_staging_bytes", "inflight_expert_staging_bytes"),
+        ),
+        "allocator_active_bytes": (general_sources, ("allocator_active_bytes",)),
+        "allocator_cache_bytes": (general_sources, ("allocator_cache_bytes",)),
+        "allocator_peak_bytes": (general_sources, ("allocator_peak_bytes",)),
+        "requested_reclaim_bytes": (
+            general_sources,
+            ("requested_reclaim_bytes",),
+        ),
+        "reclaimed_bytes": (general_sources, ("reclaimed_bytes",)),
+        "regrown_bytes": (general_sources, ("regrown_bytes",)),
+        "evicted_expert_records": (
+            (dynamic, resource, cache),
+            ("evicted_expert_records", "evictions"),
+        ),
+        "evicted_expert_slabs": (
+            (dynamic, resource),
+            ("evicted_expert_slabs", "expert_evicted_slabs"),
+        ),
+        "resize_duration_ns": (general_sources, ("resize_duration_ns",)),
+        "total_resize_duration_ns": (
+            general_sources,
+            ("total_resize_duration_ns",),
+        ),
+        "max_resize_duration_ns": (
+            general_sources,
+            ("max_resize_duration_ns",),
+        ),
+        "blocked_by_pin_bytes": (general_sources, ("blocked_by_pin_bytes",)),
+        "admission_failures": (
+            general_sources,
+            ("admission_failures", "admission_failure_count"),
+        ),
+        "resize_failures": (general_sources, ("resize_failures",)),
+        "expert_cache_hit_rate": (
+            (resource, cache),
+            ("expert_cache_hit_rate", "hit_rate"),
+        ),
+        "ssd_bytes_per_token": (
+            (resource, dynamic, latest),
+            ("ssd_bytes_per_token",),
+        ),
+        "decode_tps": ((resource, latest), ("decode_tps", "decode_tok_s")),
+        "token_latency_p50_ms": (
+            (resource, latest),
+            ("token_latency_p50_ms",),
+        ),
+        "token_latency_p95_ms": (
+            (resource, latest),
+            ("token_latency_p95_ms",),
+        ),
+        "failed_closed": (general_sources, ("failed_closed",)),
+        "failure_reason": (general_sources, ("failure_reason",)),
+    }
+    for field, (sources, aliases) in field_sources.items():
+        payload[field] = _health_first(sources, *aliases)
+    payload["kv_representation"] = _health_first(
+        (kv, resource), "representation", "kv_representation"
+    ) or getattr(getattr(state, "args", None), "paged_kv_quantization", None)
+    payload.update(_process_memory_health_snapshot(state))
+    return payload
 
 
 def _hy3_q4_context_health(state: Any) -> dict[str, object]:
@@ -18873,6 +19150,7 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "context_window": state.context_window,
             "hy3_q4_dynamic_context": _hy3_q4_context_health(state),
+            "hy3_q4_dynamic_memory": _hy3_q4_dynamic_memory_health(state),
             "max_response_tokens": state.args.max_response_tokens,
             "api_key_required": bool(state.args.api_key),
             "api_key_source": str(
@@ -24535,7 +24813,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_HF_MODEL_ID)
     from mtplx.expert_cli import add_expert_streaming_args
 
-    add_expert_streaming_args(parser)
+    add_expert_streaming_args(parser, include_hy3_dynamic_memory=True)
     parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(
