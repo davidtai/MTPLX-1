@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -221,6 +222,110 @@ def test_dynamic_config_cannot_bypass_serving_opt_in(
     )
 
 
+@pytest.mark.parametrize(
+    ("profile", "unsafe_key", "unsafe_value", "rejection_term"),
+    [
+        (
+            "performance-cold",
+            "MTPLX_VLLM_METAL_PAGED_ATTN",
+            "0",
+            "paged",
+        ),
+        (
+            "sustained",
+            "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW",
+            "2048",
+            "sliding",
+        ),
+    ],
+    ids=("non-paged-profile", "sliding-window-override"),
+)
+def test_dynamic_memory_rejects_or_pins_exact_paged_attention_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    profile: str,
+    unsafe_key: str,
+    unsafe_value: str,
+    rejection_term: str,
+) -> None:
+    class ModelLoadBoundary(RuntimeError):
+        pass
+
+    paged_key = "MTPLX_VLLM_METAL_PAGED_ATTN"
+    sliding_key = "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW"
+    monkeypatch.delenv(paged_key, raising=False)
+    monkeypatch.delenv(sliding_key, raising=False)
+    monkeypatch.setenv(unsafe_key, unsafe_value)
+    observed: dict[str, str | None] = {}
+
+    def stop_at_model_load(*_args: object, **_kwargs: object) -> object:
+        observed[paged_key] = os.environ.get(paged_key)
+        observed[sliding_key] = os.environ.get(sliding_key)
+        raise ModelLoadBoundary
+
+    monkeypatch.setattr(openai, "load", stop_at_model_load)
+    root = _hy3_model_root(tmp_path)
+    argv = [*_valid_dynamic_server_argv(root), "--profile", profile]
+
+    try:
+        openai.ServerState(openai.parse_args(argv))
+    except ValueError as exc:
+        assert rejection_term in str(exc).lower()
+        return
+    except ModelLoadBoundary:
+        pass
+    else:
+        pytest.fail("test model load boundary was not reached")
+
+    if unsafe_key == paged_key:
+        assert observed[paged_key] == "1"
+    else:
+        raw_window = observed[sliding_key]
+        assert raw_window is None or not raw_window.strip() or int(raw_window) <= 0
+
+
+def test_dynamic_memory_diagnostic_ablation_still_pins_exact_q4_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class ModelLoadBoundary(RuntimeError):
+        pass
+
+    expected = {
+        "MTPLX_DYNAMIC_PAGED_KV": "1",
+        "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
+        "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
+        "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "0",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "0",
+    }
+    unsafe = {
+        "MTPLX_DYNAMIC_PAGED_KV": "0",
+        "MTPLX_VLLM_METAL_PAGED_ATTN": "0",
+        "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "64",
+        "MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW": "2048",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "1",
+    }
+    for key, value in unsafe.items():
+        monkeypatch.setenv(key, value)
+    observed: dict[str, str | None] = {}
+
+    def stop_at_model_load(*_args: object, **_kwargs: object) -> object:
+        observed.update({key: os.environ.get(key) for key in expected})
+        raise ModelLoadBoundary
+
+    monkeypatch.setattr(openai, "load", stop_at_model_load)
+    root = _hy3_model_root(tmp_path)
+    argv = [
+        *_valid_dynamic_server_argv(root),
+        "--diagnostic-env-ablation",
+    ]
+
+    with pytest.raises(ModelLoadBoundary):
+        openai.ServerState(openai.parse_args(argv))
+
+    assert observed == expected
+
+
 def test_dynamic_memory_disabled_health_shape_is_stable() -> None:
     state = SimpleNamespace(
         args=SimpleNamespace(hy3_q4_dynamic_memory=False),
@@ -237,6 +342,32 @@ def test_dynamic_memory_disabled_health_shape_is_stable() -> None:
     assert payload["enabled"] is False
     assert set(payload) == openai.HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS
     assert all(value is None for key, value in payload.items() if key != "enabled")
+
+
+def test_dynamic_memory_health_does_not_invent_kv_representation_from_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = SimpleNamespace(
+        args=SimpleNamespace(
+            hy3_q4_dynamic_memory=True,
+            paged_kv_quantization="q4",
+        ),
+        runtime=SimpleNamespace(expert_resource_telemetry_snapshot=lambda: {}),
+        last_metrics=[],
+    )
+    monkeypatch.setattr(
+        openai,
+        "_process_memory_health_snapshot",
+        lambda _state: {
+            "process_rss_bytes": None,
+            "process_compressed_bytes": None,
+            "system_swap_delta_bytes": None,
+        },
+    )
+
+    payload = openai._hy3_q4_dynamic_memory_health(state)
+
+    assert payload["kv_representation"] is None
 
 
 def test_dynamic_memory_serving_reuses_single_sequence_and_no_live_ref_lane() -> None:

@@ -22,6 +22,8 @@ from mtplx.expert_streaming import GlobalExpertSlotBank
 from mtplx.expert_streaming_models import HY3_Q4
 from mtplx.memory_broker import (
     BINARY_GIB,
+    HY3_Q4_KV_BLOCK_BYTES,
+    HY3_Q4_KV_BLOCK_TOKENS,
     AllocatorMemorySample,
     BrokerSnapshot,
     MemoryAdmissionError,
@@ -909,6 +911,65 @@ def test_dynamic_memory_telemetry_uses_live_pin_and_speculation_truth() -> None:
     assert broker.snapshot().speculative_expert_bytes == 0
     assert telemetry["pinned_expert_bytes"] == 16
     assert telemetry["speculative_expert_bytes"] == 16
+
+
+def test_resource_telemetry_publishes_q4_kv_geometry_for_health() -> None:
+    class ResourceSlots(_FakeSlots):
+        def resource_telemetry_snapshot(self) -> dict[str, object]:
+            return {}
+
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+    )
+    ticket = broker.plan_kv_growth(
+        cache_id="target:telemetry",
+        steady_delta_bytes=HY3_Q4_KV_BLOCK_BYTES,
+        transient_delta_bytes=0,
+    )
+    broker.commit_kv_growth(
+        ticket,
+        allocated_physical_bytes=HY3_Q4_KV_BLOCK_BYTES,
+    )
+    runtime = _runtime(
+        broker,
+        slots=ResourceSlots(),
+        bank=_FakeBank(),
+        samples=[],
+    )
+    runtime.spec = HY3_Q4
+    runtime._counter_lock = threading.Lock()
+    runtime.counters = SimpleNamespace(as_dict=lambda: {})
+    runtime._layer_counters = {}
+    runtime._phase_counters = {}
+    runtime._incremental_miss_routes = 0
+    runtime._incremental_miss_parts = 0
+    runtime._pipeline_ledger = None
+    runtime._kv_lock = threading.Lock()
+    runtime._live_kv_tokens = HY3_Q4_KV_BLOCK_TOKENS
+    runtime._live_kv_peak = HY3_Q4_KV_BLOCK_TOKENS
+    runtime._dynamic_resize_metrics = {
+        "reclaim_requests": 0,
+        "regrow_requests": 0,
+        "requested_reclaim_bytes": 0,
+        "reclaimed_bytes": 0,
+        "regrown_bytes": 0,
+        "resize_operations": 0,
+        "resize_failures": 0,
+        "blocked_by_pin_bytes": 0,
+        "last_resize_duration_ns": 0,
+        "total_resize_duration_ns": 0,
+        "max_resize_duration_ns": 0,
+    }
+
+    telemetry = runtime.resource_telemetry_snapshot(mx_module=object())
+
+    assert telemetry["kv"] == {
+        "representation": "q4",
+        "logical_tokens": HY3_Q4_KV_BLOCK_TOKENS,
+        "physical_blocks": 1,
+        "physical_bytes": HY3_Q4_KV_BLOCK_BYTES,
+    }
 
 
 def test_kv_admission_reconciles_live_pinned_expert_bytes() -> None:

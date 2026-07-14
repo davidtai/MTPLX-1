@@ -2613,6 +2613,7 @@ def test_health_exposes_enabled_hy3_q4_dynamic_memory_resource_snapshot(monkeypa
             "resident_model_bytes": 5 * 1024**3,
             "kv_physical_bytes": 5 * 1024**3,
         },
+        "kv": {"representation": "q4"},
         "cache": {"hit_rate": 0.9},
     }
     monkeypatch.setattr(

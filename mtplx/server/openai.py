@@ -104,6 +104,7 @@ from mtplx.profiles import (
     resolve_long_context_mtp_depth,
 )
 from mtplx.runtime_options import (
+    HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV,
     apply_paged_kv_quantization_env,
     normalize_paged_kv_quantization,
     resolve_api_key,
@@ -535,6 +536,8 @@ def _server_runtime_env_overrides(
     )
     if generation_mode == "mtp" and verify_strategy in VERIFY_SNAPSHOT_REQUIRED_STRATEGIES:
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if bool(getattr(args, "hy3_q4_dynamic_context", False)):
+        overrides.update(HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV)
     return overrides
 
 
@@ -1463,6 +1466,10 @@ class ServerState:
             args,
             self.expert_streaming_load_kwargs.get("expert_streaming_config"),
         )
+        if self.hy3_q4_dynamic_context:
+            # Diagnostic env ablation may skip profile application, but it
+            # must never bypass the Q4/full-history safety boundary.
+            os.environ.update(HY3_Q4_DYNAMIC_CONTEXT_RUNTIME_ENV)
         self.hy3_dynamic_memory_initial_swap_bytes = (
             _system_swap_used_bytes() if self.hy3_q4_dynamic_memory else None
         )
@@ -14410,7 +14417,7 @@ def _hy3_q4_dynamic_memory_health(state: Any) -> dict[str, Any]:
         payload[field] = _health_first(sources, *aliases)
     payload["kv_representation"] = _health_first(
         (kv, resource), "representation", "kv_representation"
-    ) or getattr(getattr(state, "args", None), "paged_kv_quantization", None)
+    )
     payload.update(_process_memory_health_snapshot(state))
     return payload
 

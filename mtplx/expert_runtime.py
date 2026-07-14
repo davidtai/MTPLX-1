@@ -44,6 +44,7 @@ from .expert_streaming_models import (
 )
 from .memory_broker import (
     BINARY_GIB,
+    HY3_Q4_KV_BLOCK_BYTES,
     AllocatorMemorySample,
     BrokerSnapshot,
     ExpertRegrowTicket,
@@ -3086,7 +3087,23 @@ class ExpertStreamingRuntime:
         if self._pipeline_ledger is not None:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         if self.memory_broker is not None:
-            snapshot["memory_broker"] = asdict(self.memory_broker.snapshot())
+            broker_snapshot = self.memory_broker.snapshot()
+            physical_bytes = int(broker_snapshot.kv_physical_bytes)
+            physical_blocks, partial_block_bytes = divmod(
+                physical_bytes,
+                HY3_Q4_KV_BLOCK_BYTES,
+            )
+            with self._kv_lock:
+                logical_tokens = int(self._live_kv_tokens)
+            snapshot["kv"] = {
+                "representation": "q4",
+                "logical_tokens": logical_tokens,
+                "physical_blocks": (
+                    physical_blocks if partial_block_bytes == 0 else None
+                ),
+                "physical_bytes": physical_bytes,
+            }
+            snapshot["memory_broker"] = asdict(broker_snapshot)
             snapshot["dynamic_memory"] = self.dynamic_memory_telemetry_snapshot()
         return snapshot
 
