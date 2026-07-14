@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
-import threading
 
 import pytest
 
@@ -1093,53 +1092,6 @@ def test_multi_growth_same_cache_releases_in_one_physical_close() -> None:
     )
 
     assert broker.snapshot().kv_physical_bytes == 0
-
-
-def test_concurrent_cache_closes_derive_each_release_from_locked_owner_truth() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
-    _install(broker, _snapshot(resident=50 * GIB))
-    handles = {}
-    for cache_id in ("cache-a", "cache-b"):
-        ticket = broker.plan_kv_growth(
-            steady_delta_bytes=GIB,
-            transient_delta_bytes=0,
-            cache_id=cache_id,
-        )
-        handles[cache_id] = broker.commit_kv_growth(
-            ticket,
-            allocated_physical_bytes=GIB,
-        )
-    barrier = threading.Barrier(2)
-    errors: list[BaseException] = []
-
-    def release(cache_id: str) -> None:
-        try:
-            barrier.wait(timeout=1)
-            broker.release_kv_batch(
-                cache_id=cache_id,
-                allocations=(handles[cache_id],),
-                registered_kv_bytes_after=None,
-                allocator_before=AllocatorMemorySample(2 * GIB, 0, 2 * GIB),
-                allocator_after=AllocatorMemorySample(0, 0, 2 * GIB),
-            )
-        except BaseException as exc:
-            errors.append(exc)
-
-    threads = [
-        threading.Thread(target=release, args=(cache_id,)) for cache_id in handles
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=1)
-
-    assert all(not thread.is_alive() for thread in threads)
-    assert errors == []
-    snapshot = broker.snapshot()
-    assert snapshot.kv_physical_bytes == 0
-    assert snapshot.owned_kv_physical_bytes == 0
-    assert snapshot.unreconciled_kv_physical_bytes == 0
-    assert snapshot.failed_closed is False
 
 
 def test_partial_same_cache_close_preserves_observed_truth_and_fails() -> None:

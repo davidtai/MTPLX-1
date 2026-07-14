@@ -311,21 +311,11 @@ class UnifiedMemoryBroker:
             )
             if (
                 initial_snapshot is not None
-                and max(
-                    initial_allocator_sample.cache_bytes,
-                    initial_allocator_sample.charged_footprint_bytes
-                    - (
-                        initial_snapshot.resident_model_bytes
-                        + initial_snapshot.kv_physical_bytes
-                        + initial_snapshot.expert_slab_physical_bytes
-                        + initial_snapshot.in_flight_expert_staging_bytes
-                        + initial_snapshot.runtime_workspace_bytes
-                    ),
-                )
+                and initial_allocator_sample.cache_bytes
                 != initial_snapshot.allocator_cache_bytes
             ):
                 raise ValueError(
-                    "initial allocator residual must match the initial snapshot"
+                    "initial allocator sample cache must match the initial snapshot"
                 )
         self._initial_allocator_sample = initial_allocator_sample
         if initial_snapshot is not None:
@@ -495,42 +485,6 @@ class UnifiedMemoryBroker:
                 raise MemoryAdmissionError(self._failed_reason)
             return self.snapshot()
 
-    def reconcile_expert_protection(
-        self,
-        *,
-        pinned_expert_bytes: int,
-        speculative_expert_bytes: int,
-    ) -> BrokerSnapshot:
-        """Publish live expert protection classes before KV admission."""
-
-        pinned = _exact_nonnegative_int("pinned_expert_bytes", pinned_expert_bytes)
-        speculative = _exact_nonnegative_int(
-            "speculative_expert_bytes",
-            speculative_expert_bytes,
-        )
-        with self._lock:
-            if self._pending is not None or self._pending_regrow is not None:
-                raise MemoryTransactionError(
-                    "cannot reconcile expert protection during an active memory "
-                    "transaction"
-                )
-            experts = self._pools.expert_slab_physical_bytes
-            if pinned > experts:
-                raise MemoryTelemetryError(
-                    "live pinned expert bytes exceed physical expert slabs"
-                )
-            if speculative > experts:
-                raise MemoryTelemetryError(
-                    "live speculative expert bytes exceed physical expert slabs"
-                )
-            self._pools = replace(
-                self._pools,
-                pinned_expert_bytes=pinned,
-                speculative_expert_bytes=speculative,
-            )
-            self._revision += 1
-            return self.snapshot()
-
     def reconcile_post_load_classification(
         self,
         *,
@@ -578,10 +532,7 @@ class UnifiedMemoryBroker:
                     "cannot reconcile post-load memory during an active memory "
                     "transaction"
                 )
-            if (
-                self._allocator_residual_bytes(allocator_before)
-                != self._pools.allocator_cache_bytes
-            ):
+            if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
                 raise MemoryTelemetryError(
                     "allocator telemetry is stale during post-load reconciliation"
                 )
@@ -756,10 +707,7 @@ class UnifiedMemoryBroker:
                 raise MemoryTelemetryError(
                     f"invalid allocator telemetry: {exc}"
                 ) from exc
-            if (
-                self._allocator_residual_bytes(allocator_before)
-                != self._pools.allocator_cache_bytes
-            ):
+            if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
                 self._fail_pending(
                     "allocator telemetry is stale relative to broker cache"
                 )
@@ -898,7 +846,7 @@ class UnifiedMemoryBroker:
                     samples_valid = False
                 else:
                     samples_valid = (
-                        self._allocator_residual_bytes(allocator_before)
+                        allocator_before.cache_bytes
                         == self._pools.allocator_cache_bytes
                     )
 
@@ -1186,9 +1134,9 @@ class UnifiedMemoryBroker:
         *,
         cache_id: str,
         allocations: Sequence[KVPhysicalAllocation],
-        registered_kv_bytes_after: int | None = None,
-        allocator_before: AllocatorMemorySample | None = None,
-        allocator_after: AllocatorMemorySample | None = None,
+        registered_kv_bytes_after: int,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
     ) -> BrokerSnapshot:
         """Reconcile one cache's complete ownership set with one physical close.
 
@@ -1198,6 +1146,9 @@ class UnifiedMemoryBroker:
         """
 
         owner_id = self._validate_cache_id(cache_id)
+        registered_after = _exact_nonnegative_int(
+            "registered_kv_bytes_after", registered_kv_bytes_after
+        )
         selected = tuple(allocations)
         if not selected:
             raise ValueError("allocations must contain at least one handle")
@@ -1251,27 +1202,16 @@ class UnifiedMemoryBroker:
                 reason = f"invalid allocator telemetry during KV release: {exc}"
                 self._fail_without_pending(reason)
                 raise MemoryTelemetryError(reason) from exc
-            if (
-                self._allocator_residual_bytes(allocator_before)
-                != self._pools.allocator_cache_bytes
-            ):
+            if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
                 reason = "allocator telemetry is stale relative to broker cache"
                 self._fail_without_pending(reason)
                 raise MemoryTelemetryError(reason)
 
             registered_before = self._pools.kv_physical_bytes
+            registered_drop = registered_before - registered_after
             selected_physical_bytes = sum(
                 allocation.physical_bytes for allocation in selected
             )
-            registered_after = (
-                registered_before - selected_physical_bytes
-                if registered_kv_bytes_after is None
-                else _exact_nonnegative_int(
-                    "registered_kv_bytes_after",
-                    registered_kv_bytes_after,
-                )
-            )
-            registered_drop = registered_before - registered_after
             allocator_drop = (
                 allocator_before.charged_footprint_bytes
                 - allocator_after.charged_footprint_bytes
@@ -1446,10 +1386,7 @@ class UnifiedMemoryBroker:
                 reason = f"invalid allocator telemetry during expert regrow: {exc}"
                 self._fail_pending_regrow(reason)
                 raise MemoryTelemetryError(reason) from exc
-            if (
-                self._allocator_residual_bytes(allocator_before)
-                != self._pools.allocator_cache_bytes
-            ):
+            if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
                 reason = "allocator telemetry is stale relative to broker cache"
                 self._fail_pending_regrow(reason)
                 raise MemoryTelemetryError(reason)
@@ -1582,19 +1519,6 @@ class UnifiedMemoryBroker:
         _exact_nonnegative_int(f"{name}.active_bytes", sample.active_bytes)
         _exact_nonnegative_int(f"{name}.cache_bytes", sample.cache_bytes)
         _exact_nonnegative_int(f"{name}.peak_bytes", sample.peak_bytes)
-
-    def _allocator_residual_bytes(self, sample: AllocatorMemorySample) -> int:
-        classified_bytes = (
-            self._pools.resident_model_bytes
-            + self._pools.kv_physical_bytes
-            + self._pools.expert_slab_physical_bytes
-            + self._pools.in_flight_expert_staging_bytes
-            + self._pools.runtime_workspace_bytes
-        )
-        return max(
-            sample.cache_bytes,
-            sample.charged_footprint_bytes - classified_bytes,
-        )
 
     @staticmethod
     def _validate_cache_id(cache_id: object) -> str:

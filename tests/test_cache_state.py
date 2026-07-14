@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import threading
-import time
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -27,8 +25,6 @@ from mtplx.cache_state import (
     install_tail_owned_attention_kv_cache,
     install_vllm_metal_paged_attention_kv_cache,
     owned_recurrent_state_stats,
-    physical_kv_cache_lifecycle,
-    register_physical_kv_cache,
     rollback_after_verify,
     restore_cache,
     snapshot_cache,
@@ -1039,90 +1035,6 @@ class _KVAllocationObserver:
     ) -> None:
         self.release_samples.append((allocator_before, allocator_after))
         self.releases.append((cache_id, tuple(allocations), released_physical_bytes))
-
-
-def test_q4_close_waits_for_observer_guard_before_dropping_physical_arrays() -> None:
-    class GuardedObserver(_KVAllocationObserver):
-        def __init__(self) -> None:
-            super().__init__()
-            self.release_lock = threading.RLock()
-
-        def physical_kv_release_context(self):
-            return self.release_lock
-
-    observer = GuardedObserver()
-    cache = VllmMetalPagedKVCache(
-        block_size=4,
-        num_blocks=1,
-        kv_quant_config=PagedKVQuantConfig("q4"),
-        allocation_observer=observer,
-        cache_id="target:guarded-close:0",
-    )
-    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
-    cache.update_without_fetch(values, values)
-    started = threading.Event()
-
-    def close_cache() -> None:
-        started.set()
-        cache.close()
-
-    observer.release_lock.acquire()
-    try:
-        thread = threading.Thread(target=close_cache)
-        thread.start()
-        assert started.wait(timeout=1)
-        time.sleep(0.01)
-        assert thread.is_alive()
-        assert cache.key_cache is not None
-        assert cache._close_arrays_dropped is False
-    finally:
-        observer.release_lock.release()
-    thread.join(timeout=1)
-
-    assert not thread.is_alive()
-    assert cache._closed is True
-    assert cache.key_cache is None
-    assert len(observer.releases) == 1
-
-
-def test_generation_lifecycle_hands_retryable_q4_close_to_observer() -> None:
-    class RetainingObserver(_KVAllocationObserver):
-        def __init__(self) -> None:
-            super().__init__()
-            self.attempts = 0
-            self.retained: list[object] = []
-
-        def release_cache(self, **kwargs) -> None:
-            self.attempts += 1
-            if self.attempts == 1:
-                raise RuntimeError("injected retryable release failure")
-            super().release_cache(**kwargs)
-
-        def retain_pending_physical_kv_cache(self, cache) -> None:
-            self.retained.append(cache)
-
-    observer = RetainingObserver()
-    cache = VllmMetalPagedKVCache(
-        block_size=4,
-        num_blocks=1,
-        kv_quant_config=PagedKVQuantConfig("q4"),
-        allocation_observer=observer,
-        cache_id="target:retained-close:0",
-    )
-    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
-    cache.update_without_fetch(values, values)
-
-    with pytest.raises(RuntimeError, match="retryable release failure"):
-        with physical_kv_cache_lifecycle():
-            register_physical_kv_cache(cache)
-
-    assert observer.retained == [cache]
-    assert len(cache._kv_allocations) == 1
-    cache.close()
-
-    assert cache._closed is True
-    assert cache._kv_allocations == []
-    assert len(observer.releases) == 1
 
 
 class _BrokerKVAllocationObserver:

@@ -675,13 +675,6 @@ class GlobalExpertSlotBank:
         return self._active_capacity
 
     @property
-    def speculative_record_count(self) -> int:
-        return sum(
-            entry.residency_class is ExpertResidencyClass.SPECULATIVE
-            for entry in self._directory.values()
-        )
-
-    @property
     def resident_experts_by_layer(self) -> dict[int, tuple[int, ...]]:
         grouped: dict[int, list[int]] = {layer: [] for layer in self.layer_indices}
         for key in self._slot_to_key:
@@ -1026,26 +1019,6 @@ class GlobalExpertSlotBank:
             self._active_capacity -= 1
         return tuple(evicted)
 
-    def preflight_deactivate_slots(self, slot_ids: Iterable[int]) -> None:
-        """Prove a later locked deactivation cannot fail before destruction."""
-
-        normalized = self._validate_slot_ids(slot_ids)
-        affected_layers: set[int] = set()
-        for slot in normalized:
-            key, entry = self._preflight_slot_state(slot)
-            if entry is not None and entry.state != "ready":
-                raise RuntimeError(
-                    f"cannot deactivate non-ready resident in slot {slot}"
-                )
-            if key is not None:
-                affected_layers.add(key[0])
-        for layer in affected_layers:
-            resident_count = sum(
-                key is not None and key[0] == layer for key in self._slot_to_key
-            )
-            if self._layer_occupancy.get(layer, 0) != resident_count:
-                raise RuntimeError("global resident layer occupancy is inconsistent")
-
     def activate_slots(self, slot_ids: Iterable[int]) -> None:
         """Restore empty logical slots without changing generation watermarks."""
 
@@ -1060,13 +1033,6 @@ class GlobalExpertSlotBank:
             self._active_capacity += 1
             self._free_slots.append(slot)
             self._free_slot_set.add(slot)
-
-    def preflight_activate_slots(self, slot_ids: Iterable[int]) -> None:
-        """Prove a later locked activation cannot fail after slab allocation."""
-
-        normalized = self._validate_slot_ids(slot_ids)
-        for slot in normalized:
-            self._preflight_slot_state(slot)
 
     def rank_reclaim_slabs(
         self,
