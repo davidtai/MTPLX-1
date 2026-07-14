@@ -293,6 +293,7 @@ class UnifiedMemoryBroker:
         self._transaction_failure_count = 0
         self._failed_reason: str | None = None
         self._last_expert_resize_ns: int | None = None
+        self._post_load_reconciled = False
         self._max_expert_slab_bytes = 0
         self._next_ticket_id = 1
         self._pending: _PendingKVTransaction | None = None
@@ -511,6 +512,13 @@ class UnifiedMemoryBroker:
                 f"invalid allocator telemetry during post-load reconciliation: {exc}"
             ) from exc
         with self._lock:
+            if self._post_load_reconciled:
+                raise MemoryTransactionError("post-load memory was already reconciled")
+            if self._pending is not None or self._pending_regrow is not None:
+                raise MemoryTransactionError(
+                    "cannot reconcile post-load memory during an active memory "
+                    "transaction"
+                )
             if allocator_before.cache_bytes != self._pools.allocator_cache_bytes:
                 raise MemoryTelemetryError(
                     "allocator telemetry is stale during post-load reconciliation"
@@ -549,10 +557,7 @@ class UnifiedMemoryBroker:
                 experts,
             )
             self._revision += 1
-            if self._pending is not None:
-                self._pending.expected_revision = self._revision
-            if self._pending_regrow is not None:
-                self._pending_regrow.expected_revision = self._revision
+            self._post_load_reconciled = True
             self._assert_kv_ledger_invariant()
             self._record_hard_failure_if_needed()
             charged = self._pools.charged_bytes

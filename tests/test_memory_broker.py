@@ -302,7 +302,7 @@ def test_post_load_classification_atomically_reclassifies_consumed_cache() -> No
     assert snapshot.charged_bytes == 85
 
 
-def test_post_load_classification_preserves_active_ticket_revision() -> None:
+def test_post_load_classification_rejects_active_ticket_without_mutation() -> None:
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
         initial_snapshot=_snapshot(resident=40, experts=20, workspace=10),
@@ -314,18 +314,43 @@ def test_post_load_classification_preserves_active_ticket_revision() -> None:
         cache_id="target:pending",
     )
 
-    snapshot = broker.reconcile_post_load_classification(
-        resident_model_bytes=41,
-        expert_slab_physical_bytes=20,
-        in_flight_expert_staging_bytes=0,
-        runtime_workspace_bytes=10,
-        allocator_before=AllocatorMemorySample(60, 0, 60),
-        allocator_after=AllocatorMemorySample(61, 0, 61),
-    )
+    before = broker.snapshot()
+    with pytest.raises(MemoryTransactionError, match="active memory transaction"):
+        broker.reconcile_post_load_classification(
+            resident_model_bytes=41,
+            expert_slab_physical_bytes=20,
+            in_flight_expert_staging_bytes=0,
+            runtime_workspace_bytes=10,
+            allocator_before=AllocatorMemorySample(60, 0, 60),
+            allocator_after=AllocatorMemorySample(61, 0, 61),
+        )
 
-    assert snapshot.pending_kv_ticket_id == ticket.ticket_id
-    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=4)
-    assert allocation.cache_id == "target:pending"
+    after = broker.snapshot()
+    assert after.pending_kv_ticket_id == ticket.ticket_id
+    assert after.revision == before.revision
+
+
+def test_post_load_classification_consumes_startup_baseline_once() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=40, experts=20, workspace=10),
+        expert_slab_bytes=10,
+    )
+    kwargs = {
+        "resident_model_bytes": 41,
+        "expert_slab_physical_bytes": 20,
+        "in_flight_expert_staging_bytes": 0,
+        "runtime_workspace_bytes": 9,
+        "allocator_before": AllocatorMemorySample(60, 0, 60),
+        "allocator_after": AllocatorMemorySample(61, 0, 61),
+    }
+    broker.reconcile_post_load_classification(**kwargs)
+    before = broker.snapshot()
+
+    with pytest.raises(MemoryTransactionError, match="already reconciled"):
+        broker.reconcile_post_load_classification(**kwargs)
+
+    assert broker.snapshot().revision == before.revision
 
 
 def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:
