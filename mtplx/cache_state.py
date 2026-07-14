@@ -2157,11 +2157,13 @@ class VllmMetalPagedKVCache:
             self._load_contiguous_state(self.keys, value, int(value.shape[2]))
 
     def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
-        self.update_without_fetch(keys, values)
-        return self._active_arrays()
+        with self._close_lock:
+            self._write_tail(keys, values)
+            return self._active_arrays()
 
     def update_without_fetch(self, keys: Any, values: Any) -> None:
-        self._write_tail(keys, values)
+        with self._close_lock:
+            self._write_tail(keys, values)
 
     def size(self) -> int:
         return int(self.offset)

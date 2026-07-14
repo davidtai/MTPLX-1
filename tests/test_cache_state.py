@@ -1254,6 +1254,312 @@ class _BrokerKVAllocationObserver:
         )
 
 
+def test_q4_concurrent_first_growth_and_close_leaves_no_post_close_ownership(
+    monkeypatch,
+) -> None:
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        UnifiedMemoryBroker,
+    )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    observer = _BrokerKVAllocationObserver(
+        broker,
+        allocator_samples=[
+            AllocatorMemorySample(0, 0, 0),
+            AllocatorMemorySample(160, 0, 160),
+            AllocatorMemorySample(160, 0, 160),
+            AllocatorMemorySample(0, 0, 160),
+        ],
+    )
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:concurrent-first-growth:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    materialize_started = threading.Event()
+    allow_materialize = threading.Event()
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    growth_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    original_materialize = cache._materialize_brokered_q4_arrays
+
+    def paused_materialize(*, shape):
+        materialize_started.set()
+        if not allow_materialize.wait(timeout=2):
+            raise TimeoutError("concurrent close did not release Q4 materialization")
+        return original_materialize(shape=shape)
+
+    monkeypatch.setattr(cache, "_materialize_brokered_q4_arrays", paused_materialize)
+
+    def grow_cache() -> None:
+        try:
+            cache.update_without_fetch(values, values)
+        except BaseException as exc:
+            growth_errors.append(exc)
+
+    def close_cache() -> None:
+        close_started.set()
+        try:
+            cache.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            close_finished.set()
+
+    growth_thread = threading.Thread(target=grow_cache)
+    growth_thread.start()
+    assert materialize_started.wait(timeout=2)
+
+    close_thread = threading.Thread(target=close_cache)
+    close_thread.start()
+    assert close_started.wait(timeout=2)
+    # Current close returns immediately because no allocation handle has been
+    # committed yet. A serialized implementation may instead wait for growth;
+    # release materialization after the bounded observation window either way.
+    close_finished.wait(timeout=1)
+    allow_materialize.set()
+    growth_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert not growth_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    assert all(
+        isinstance(error, RuntimeError) and "clos" in str(error).lower()
+        for error in growth_errors
+    )
+    snapshot = broker.snapshot()
+    assert cache._closed is True
+    assert {
+        "cache_nbytes": cache.nbytes,
+        "local_allocation_handles": len(cache._kv_allocations),
+        "broker_owned_kv_bytes": snapshot.owned_kv_physical_bytes,
+        "broker_kv_bytes": snapshot.kv_physical_bytes,
+        "pending_ticket_id": snapshot.pending_kv_ticket_id,
+    } == {
+        "cache_nbytes": 0,
+        "local_allocation_handles": 0,
+        "broker_owned_kv_bytes": 0,
+        "broker_kv_bytes": 0,
+        "pending_ticket_id": None,
+    }
+
+
+def test_q4_concurrent_dynamic_growth_and_close_releases_latest_ownership(
+    monkeypatch,
+) -> None:
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        UnifiedMemoryBroker,
+    )
+
+    class LockedBrokerObserver:
+        def __init__(self, broker: UnifiedMemoryBroker) -> None:
+            self.broker = broker
+            self.transaction_lock = threading.RLock()
+            self.ticket = None
+            self.growth_sample = 0
+            self.close_sample = 0
+            self.closing = False
+            self.close_waiting = threading.Event()
+
+        def reserve_growth(
+            self,
+            *,
+            cache_id: str,
+            steady_delta_bytes: int,
+            transient_delta_bytes: int,
+        ):
+            self.transaction_lock.acquire()
+            self.ticket = self.broker.plan_kv_growth(
+                cache_id=cache_id,
+                steady_delta_bytes=steady_delta_bytes,
+                transient_delta_bytes=transient_delta_bytes,
+            )
+            self.growth_sample = 0
+            return self.ticket
+
+        def sample_allocator_memory(self) -> AllocatorMemorySample:
+            registered = self.broker.snapshot().kv_physical_bytes
+            if self.ticket is not None:
+                if self.growth_sample == 0:
+                    self.growth_sample = 1
+                    return AllocatorMemorySample(registered, 0, registered)
+                active = registered + self.ticket.steady_delta_bytes
+                return AllocatorMemorySample(active, 0, active)
+            if self.closing:
+                if self.close_sample == 0:
+                    self.close_sample = 1
+                    return AllocatorMemorySample(registered, 0, registered)
+                return AllocatorMemorySample(0, 0, registered)
+            return AllocatorMemorySample(registered, 0, registered)
+
+        def commit_growth(
+            self,
+            ticket,
+            *,
+            measured_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ):
+            try:
+                return self.broker.commit_kv_growth(
+                    ticket,
+                    allocated_physical_bytes=measured_physical_bytes,
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                )
+            finally:
+                self.ticket = None
+                self.transaction_lock.release()
+
+        def abort_growth(
+            self,
+            ticket,
+            *,
+            observed_physical_bytes: int | None,
+            allocator_before,
+            allocator_after,
+        ) -> None:
+            try:
+                self.broker.abort_kv_growth(
+                    ticket,
+                    observed_kv_delta_bytes=observed_physical_bytes,
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                )
+            finally:
+                self.ticket = None
+                self.transaction_lock.release()
+
+        def physical_kv_release_context(self):
+            self.closing = True
+            self.close_sample = 0
+            self.close_waiting.set()
+            return self.transaction_lock
+
+        def release_cache(
+            self,
+            *,
+            cache_id: str,
+            allocations,
+            released_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ) -> None:
+            del released_physical_bytes
+            try:
+                self.broker.release_kv_batch(
+                    cache_id=cache_id,
+                    allocations=allocations,
+                    registered_kv_bytes_after=None,
+                    allocator_before=allocator_before,
+                    allocator_after=allocator_after,
+                )
+            finally:
+                self.closing = False
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=10_000,
+            hard_ceiling_bytes=11_000,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    observer = LockedBrokerObserver(broker)
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:concurrent-dynamic-growth:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+    assert cache.nbytes == 160
+
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    materialize_started = threading.Event()
+    allow_materialize = threading.Event()
+    close_started = threading.Event()
+    growth_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+
+    def paused_materialize(*, extra_blocks: int):
+        del extra_blocks
+        materialize_started.set()
+        if not allow_materialize.wait(timeout=2):
+            raise TimeoutError("concurrent close did not release Q4 growth")
+        return tuple(SimpleNamespace(nbytes=80) for _ in range(4)) + (None,)
+
+    def grow_only(_keys, _values) -> None:
+        assert cache._grow_to_capacity(5) is True
+
+    monkeypatch.setattr(cache, "_materialize_grown_arrays", paused_materialize)
+    monkeypatch.setattr(cache, "_write_tail", grow_only)
+
+    def grow_cache() -> None:
+        try:
+            cache.update_without_fetch(values, values)
+        except BaseException as exc:
+            growth_errors.append(exc)
+
+    def close_cache() -> None:
+        close_started.set()
+        try:
+            cache.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    growth_thread = threading.Thread(target=grow_cache)
+    growth_thread.start()
+    assert materialize_started.wait(timeout=2)
+
+    close_thread = threading.Thread(target=close_cache)
+    close_thread.start()
+    assert close_started.wait(timeout=2)
+    # Without cache-local lifecycle serialization, close reaches the observer
+    # here and captures only the pre-growth handle. With serialization, it
+    # waits for growth and then releases the complete ownership set.
+    observer.close_waiting.wait(timeout=1)
+    allow_materialize.set()
+    growth_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert not growth_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert growth_errors == []
+    assert close_errors == []
+    snapshot = broker.snapshot()
+    assert cache._closed is True
+    assert cache.nbytes == 0
+    assert cache._kv_allocations == []
+    assert cache._committed_physical_bytes == 0
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.unreconciled_kv_physical_bytes == 0
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.failed_closed is False
+
+
 def test_q4_physical_allocation_is_reserved_and_committed_exactly() -> None:
     observer = _KVAllocationObserver()
     cache = VllmMetalPagedKVCache(
