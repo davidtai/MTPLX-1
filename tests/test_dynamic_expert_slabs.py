@@ -1538,6 +1538,44 @@ def test_ambiguous_reclaim_consumes_pending_without_claiming_freed_bytes() -> No
     assert snapshot.failed_closed is True
 
 
+def test_empty_message_ambiguous_reclaim_still_terminalizes_ticket() -> None:
+    class EmptyMessageAmbiguousFailureSlots(_FakeSlots):
+        def commit_slab_reclaim(self, _ticket) -> ExpertSlabReclaimResult:
+            raise ExpertSlabReclaimError(
+                "",
+                result=ExpertSlabReclaimResult((), (), 0),
+                failed_slab_id=0,
+                destructive_boundary_crossed=None,
+            )
+
+    target = 110 * BINARY_GIB
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=target - 64, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=32,
+        transient_delta_bytes=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=EmptyMessageAmbiguousFailureSlots(),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(64, 0, 64)],
+    )
+
+    with pytest.raises(ExpertSlabReclaimError):
+        runtime.reclaim_expert_bytes(ticket, now_ns=1)
+
+    snapshot = broker.snapshot()
+    assert snapshot.expert_slab_physical_bytes == 64
+    assert snapshot.allocator_cache_bytes == 0
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.failed_closed is True
+
+
 def test_resize_terminalization_preserves_existing_kv_owner_handles() -> None:
     target = 110 * BINARY_GIB
     broker = UnifiedMemoryBroker(
@@ -1745,6 +1783,39 @@ def test_regrow_failure_after_ambiguous_allocation_publishes_physical_truth() ->
     )
 
     with pytest.raises(RuntimeError, match="post-allocation failure"):
+        runtime.maybe_regrow_expert_slabs(target_bytes=32, now_ns=5)
+
+    snapshot = broker.snapshot()
+    assert snapshot.expert_slab_physical_bytes == 64
+    assert snapshot.pending_expert_regrow_ticket_id is None
+    assert snapshot.failed_closed is True
+
+
+def test_empty_message_ambiguous_regrow_still_terminalizes_ticket() -> None:
+    class EmptyMessageAmbiguousSlots(_FakeSlots):
+        def regrow_slab(self, slab_id: int) -> None:
+            self.regrown.append(slab_id)
+            self._physical_bytes += 32
+            raise MemoryError()
+
+    broker = UnifiedMemoryBroker(
+        initial_snapshot=_snapshot(resident=36, experts=64),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    broker.replace_snapshot(_snapshot(resident=36, experts=32))
+    runtime = _runtime(
+        broker,
+        slots=EmptyMessageAmbiguousSlots(physical_bytes=32),
+        bank=_FakeBank(),
+        samples=[
+            AllocatorMemorySample(32, 0, 32),
+            AllocatorMemorySample(64, 0, 64),
+        ],
+    )
+
+    with pytest.raises(MemoryError):
         runtime.maybe_regrow_expert_slabs(target_bytes=32, now_ns=5)
 
     snapshot = broker.snapshot()

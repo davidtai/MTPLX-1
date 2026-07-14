@@ -9,6 +9,7 @@ import importlib
 import os
 from pathlib import Path
 import sys
+from threading import Lock
 import time
 from typing import Any, Protocol
 
@@ -977,6 +978,7 @@ class VllmMetalPagedKVCache:
         self._committed_physical_bytes = 0
         self._closed = False
         self._close_started = False
+        self._close_lock = Lock()
         self._close_arrays_dropped = False
         self._close_allocator_before = None
         self._shape: tuple[int, int, int] | None = None
@@ -2215,31 +2217,32 @@ class VllmMetalPagedKVCache:
         self.offset = 0
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._close_started = True
-        observer = self.allocation_observer
-        allocations = tuple(self._kv_allocations)
-        released = self._committed_physical_bytes
+        with self._close_lock:
+            if self._closed:
+                return
+            self._close_started = True
+            observer = self.allocation_observer
+            allocations = tuple(self._kv_allocations)
+            released = self._committed_physical_bytes
 
-        if observer is None or not allocations:
-            self._drop_physical_arrays()
-            try:
-                import mlx.core as mx
+            if observer is None or not allocations:
+                self._drop_physical_arrays()
+                try:
+                    import mlx.core as mx
 
-                mx.clear_cache()
-            finally:
-                self._closed = True
-            return
+                    mx.clear_cache()
+                finally:
+                    self._closed = True
+                return
 
-        guard_factory = getattr(observer, "physical_kv_release_context", None)
-        guard = guard_factory() if callable(guard_factory) else nullcontext()
-        with guard:
-            self._close_observed_cache(
-                observer,
-                allocations=allocations,
-                released_physical_bytes=released,
-            )
+            guard_factory = getattr(observer, "physical_kv_release_context", None)
+            guard = guard_factory() if callable(guard_factory) else nullcontext()
+            with guard:
+                self._close_observed_cache(
+                    observer,
+                    allocations=allocations,
+                    released_physical_bytes=released,
+                )
 
     def _close_observed_cache(
         self,

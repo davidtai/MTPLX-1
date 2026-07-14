@@ -1085,6 +1085,61 @@ def test_q4_close_waits_for_observer_guard_before_dropping_physical_arrays() -> 
     assert len(observer.releases) == 1
 
 
+def test_q4_close_is_idempotent_when_same_cache_closes_concurrently() -> None:
+    class ConcurrentCloseObserver(_KVAllocationObserver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_lock = threading.RLock()
+            self.factory_lock = threading.Lock()
+            self.guard_factory_calls = 0
+            self.both_closes_started = threading.Event()
+            self.concurrent_close_started = False
+
+        def physical_kv_release_context(self):
+            with self.factory_lock:
+                self.guard_factory_calls += 1
+                if self.guard_factory_calls == 2:
+                    self.both_closes_started.set()
+            return self.release_lock
+
+        def sample_allocator_memory(self):
+            if self.concurrent_close_started:
+                self.both_closes_started.wait(timeout=0.1)
+            return super().sample_allocator_memory()
+
+    observer = ConcurrentCloseObserver()
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:concurrent-close:0",
+    )
+    values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
+    cache.update_without_fetch(values, values)
+    observer.concurrent_close_started = True
+    errors: list[BaseException] = []
+    start_barrier = threading.Barrier(2)
+
+    def close_cache() -> None:
+        try:
+            start_barrier.wait(timeout=1)
+            cache.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=close_cache) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert cache._closed is True
+    assert len(observer.releases) == 1
+
+
 def test_generation_lifecycle_hands_retryable_q4_close_to_observer() -> None:
     class RetainingObserver(_KVAllocationObserver):
         def __init__(self) -> None:

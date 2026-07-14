@@ -2322,12 +2322,13 @@ class ExpertStreamingRuntime:
         broker = self.memory_broker
         if broker is None:
             return
+        failure_reason = str(reason).strip() or "expert resize failed without details"
         broker.terminalize_expert_resize(
             ticket,
             registered_slab_bytes_after=max(0, int(expert_slab_physical_bytes)),
             allocator_before=allocator_before,
             allocator_after=allocator_after,
-            reason=reason,
+            reason=failure_reason,
         )
 
     @contextmanager
