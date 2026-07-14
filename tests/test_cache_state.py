@@ -1697,11 +1697,9 @@ def test_paged_cache_install_requires_nonempty_owner_prefix() -> None:
 def test_paged_cache_install_requires_plain_q4_for_physical_brokering(
     kv_quant_config,
 ) -> None:
-    from mlx_lm.models.cache import KVCache
-
     with pytest.raises(ValueError, match="plain paged Q4"):
         install_vllm_metal_paged_attention_kv_cache(
-            [KVCache()],
+            [VllmMetalPagedKVCache(block_size=4, num_blocks=1)],
             block_size=4,
             num_blocks=1,
             kv_quant_config=kv_quant_config,

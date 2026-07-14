@@ -3697,6 +3697,12 @@ def install_vllm_metal_paged_attention_kv_cache(
             raise ValueError(
                 "cache_id_prefix must be a nonempty string for physical KV accounting"
             )
+        if (
+            turboquant_config is not None
+            or kv_quant_config is None
+            or str(getattr(kv_quant_config, "normalized_mode", "")) != "q4"
+        ):
+            raise ValueError("physical KV brokering requires plain paged Q4")
         cache_id_prefix = cache_id_prefix.strip()
     fallback_kv_quant_config = kv_quant_config
     if turboquant_config is not None:
