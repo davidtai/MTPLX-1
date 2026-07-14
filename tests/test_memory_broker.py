@@ -200,6 +200,45 @@ def test_allocator_cache_reconciliation_grants_no_credit_for_cache_to_active_mov
     assert snapshot.charged_bytes == 94
 
 
+def test_reclaim_accepts_conservative_allocator_cache_overcharge() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=50, experts=40, cache=10),
+        expert_slab_bytes=10,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+
+    reconciled = broker.reconcile_allocator_cache(
+        AllocatorMemorySample(active_bytes=95, cache_bytes=0, peak_bytes=95)
+    )
+    assert reconciled.allocator_cache_bytes == 10
+
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=10,
+        transient_delta_bytes=0,
+    )
+    snapshot = broker.confirm_expert_reclaim(
+        ticket,
+        registered_slab_bytes_after=30,
+        allocator_before=AllocatorMemorySample(
+            active_bytes=95,
+            cache_bytes=0,
+            peak_bytes=95,
+        ),
+        allocator_after=AllocatorMemorySample(
+            active_bytes=85,
+            cache_bytes=0,
+            peak_bytes=95,
+        ),
+        now_ns=1,
+    )
+
+    assert snapshot.expert_slab_physical_bytes == 30
+    assert snapshot.allocator_cache_bytes == 10
+    assert snapshot.failed_closed is False
+
+
 def test_allocator_cache_reconciliation_charges_unclassified_active_drift() -> None:
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),

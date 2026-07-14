@@ -758,7 +758,7 @@ class UnifiedMemoryBroker:
                 ) from exc
             if (
                 self._allocator_residual_bytes(allocator_before)
-                != self._pools.allocator_cache_bytes
+                > self._pools.allocator_cache_bytes
             ):
                 self._fail_pending(
                     "allocator telemetry is stale relative to broker cache"
@@ -1253,7 +1253,7 @@ class UnifiedMemoryBroker:
                 raise MemoryTelemetryError(reason) from exc
             if (
                 self._allocator_residual_bytes(allocator_before)
-                != self._pools.allocator_cache_bytes
+                > self._pools.allocator_cache_bytes
             ):
                 reason = "allocator telemetry is stale relative to broker cache"
                 self._fail_without_pending(reason)
@@ -1448,7 +1448,7 @@ class UnifiedMemoryBroker:
                 raise MemoryTelemetryError(reason) from exc
             if (
                 self._allocator_residual_bytes(allocator_before)
-                != self._pools.allocator_cache_bytes
+                > self._pools.allocator_cache_bytes
             ):
                 reason = "allocator telemetry is stale relative to broker cache"
                 self._fail_pending_regrow(reason)
