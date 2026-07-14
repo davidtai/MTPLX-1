@@ -454,6 +454,7 @@ def load(
                 streaming_plan,
                 streaming_spec,
                 streaming_manifest,
+                persistent_slab_slots=(expert_streaming_config.expert_slab_slots),
             )
         else:
             slot_allocator = make_mlx_slot_buffer_allocator(

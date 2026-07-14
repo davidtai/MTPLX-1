@@ -2255,6 +2255,33 @@ class ExpertSlotPool:
         with self._slab_lock:
             return {slab_id: slab.slot_ids for slab_id, slab in self._slabs.items()}
 
+    def protected_slot_ids(self) -> tuple[int, ...]:
+        """Return global persistent slots that cannot enter a resize ticket."""
+
+        protected: list[int] = []
+        with self._slab_lock:
+            for slab in self._slabs.values():
+                if slab.state is not ExpertSlabState.ACTIVE:
+                    continue
+                for slot_id in slab.slot_ids:
+                    slot = self._persistent[(-1, slot_id)]
+                    with slot.condition:
+                        if slot.state is ExpertSlotState.LOADING or slot.pins:
+                            protected.append(slot_id)
+        return tuple(protected)
+
+    def released_slab_ids(self) -> tuple[int, ...]:
+        """Return cleanly released slabs that remain eligible for regrowth."""
+
+        with self._slab_lock:
+            return tuple(
+                slab_id
+                for slab_id, slab in self._slabs.items()
+                if slab.state is ExpertSlabState.RELEASED
+                and slab_id not in self._slab_release_failures
+                and slab_id not in self._slab_ambiguous_allocations
+            )
+
     def slot_ids_for_slab(self, slab_id: int) -> tuple[int, ...]:
         with self._slab_lock:
             try:
