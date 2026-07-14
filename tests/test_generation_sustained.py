@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from mtplx.cache_state import register_physical_kv_cache
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.generation import (
+    PostcommitAbort,
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
     _make_target_prefill_cache,
@@ -20,7 +22,9 @@ from mtplx.generation import (
     _prefill_committed_mtp_history_streaming,
     _sustained_prefill_layout,
     generate_ar,
+    generate_mtp1,
     generate_mtpk,
+    generate_mtpa,
     restore_or_prefill_prompt_state,
 )
 from mtplx.models.expert_mlx import current_expert_routing_phase
@@ -156,6 +160,28 @@ class CloseablePhysicalCache:
         self.close_calls += 1
 
 
+class LifecyclePhysicalCache:
+    allocation_observer = object()
+
+    def __init__(
+        self,
+        kind: str,
+        events: list[str],
+        *,
+        fail_on_close: bool = False,
+    ) -> None:
+        self.kind = kind
+        self.events = events
+        self.fail_on_close = fail_on_close
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.events.append(f"close:{self.kind}")
+        if self.fail_on_close:
+            raise RuntimeError(f"injected {self.kind} close failure")
+
+
 class CloseableTinyModel(TinyModel):
     def __init__(self, *, fail_after_calls: int | None = None) -> None:
         super().__init__()
@@ -172,6 +198,47 @@ class CloseableTinyModel(TinyModel):
         ):
             raise RuntimeError("injected generation failure")
         return super().__call__(*args, **kwargs)
+
+
+class LifecycleTinyMTPModel(AcceptingTinyMTPModel):
+    def __init__(
+        self,
+        *,
+        fail_after_target_calls: int | None = None,
+        fail_first_mtp_close: bool = False,
+    ) -> None:
+        super().__init__()
+        self.events: list[str] = []
+        self.target_caches: list[LifecyclePhysicalCache] = []
+        self.mtp_caches: list[LifecyclePhysicalCache] = []
+        self.fail_after_target_calls = fail_after_target_calls
+        self.fail_first_mtp_close = fail_first_mtp_close
+
+    def make_cache(self):
+        entry = LifecyclePhysicalCache("target", self.events)
+        self.target_caches.append(entry)
+        return [entry]
+
+    def make_mtp_cache(self):
+        entry = LifecyclePhysicalCache(
+            f"mtp:{len(self.mtp_caches)}",
+            self.events,
+            fail_on_close=self.fail_first_mtp_close and not self.mtp_caches,
+        )
+        self.mtp_caches.append(entry)
+        return [entry]
+
+    def __call__(self, *args, **kwargs):
+        if (
+            self.fail_after_target_calls is not None
+            and len(self.calls) >= self.fail_after_target_calls
+        ):
+            raise RuntimeError("injected generation failure")
+        return super().__call__(*args, **kwargs)
+
+    @property
+    def physical_caches(self) -> list[LifecyclePhysicalCache]:
+        return [*self.target_caches, *self.mtp_caches]
 
 
 class RejectingTinyMTPModel(AcceptingTinyMTPModel):
@@ -541,6 +608,198 @@ def test_generate_ar_closes_physical_kv_cache_when_callback_cancels() -> None:
         )
 
     assert model.cache_entry.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("generator", "kwargs"),
+    [
+        (generate_mtp1, {}),
+        (generate_mtpk, {"speculative_depth": 1}),
+        (generate_mtpa, {"max_depth": 1}),
+    ],
+)
+def test_native_mtp_generators_close_target_and_mtp_physical_caches_on_success(
+    generator,
+    kwargs,
+) -> None:
+    model = LifecycleTinyMTPModel()
+
+    generator(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+        **kwargs,
+    )
+
+    assert model.target_caches
+    assert model.mtp_caches
+    assert all(cache.close_calls == 1 for cache in model.physical_caches)
+
+
+@pytest.mark.parametrize(
+    ("generator", "kwargs"),
+    [
+        (generate_mtp1, {}),
+        (generate_mtpk, {"speculative_depth": 1}),
+        (generate_mtpa, {"max_depth": 1}),
+    ],
+)
+def test_native_mtp_generators_close_all_physical_caches_on_forward_error(
+    generator,
+    kwargs,
+) -> None:
+    model = LifecycleTinyMTPModel(fail_after_target_calls=1)
+
+    with pytest.raises(RuntimeError, match="injected generation failure"):
+        generator(
+            _runtime(model, mtp_enabled=True),
+            [0],
+            max_tokens=2,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            stop_token_ids=set(),
+            **kwargs,
+        )
+
+    assert model.target_caches
+    assert model.mtp_caches
+    assert all(cache.close_calls == 1 for cache in model.physical_caches)
+
+
+def test_generate_mtpk_closes_target_and_mtp_caches_on_postcommit_abort() -> None:
+    model = LifecycleTinyMTPModel()
+    callback_calls = 0
+
+    def cancel(_tokens):
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls >= 2:
+            raise PostcommitAbort("foreground_preempted_postcommit")
+
+    with pytest.raises(PostcommitAbort, match="foreground_preempted_postcommit"):
+        generate_mtpk(
+            _runtime(model, mtp_enabled=True),
+            [0],
+            max_tokens=3,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            speculative_depth=1,
+            stop_token_ids=set(),
+            token_callback=cancel,
+        )
+
+    assert model.target_caches
+    assert model.mtp_caches
+    assert all(cache.close_calls == 1 for cache in model.physical_caches)
+
+
+def test_generate_mtpk_continues_closing_after_one_cache_close_fails() -> None:
+    model = LifecycleTinyMTPModel(fail_first_mtp_close=True)
+
+    with pytest.raises(RuntimeError, match="injected mtp:0 close failure"):
+        generate_mtpk(
+            _runtime(model, mtp_enabled=True),
+            [0],
+            max_tokens=2,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            speculative_depth=1,
+            stop_token_ids=set(),
+        )
+
+    assert model.target_caches
+    assert model.mtp_caches
+    assert all(cache.close_calls == 1 for cache in model.physical_caches)
+    assert model.events[-1] == "close:target"
+
+
+def test_sequential_generate_mtpk_calls_leave_no_open_physical_caches() -> None:
+    model = LifecycleTinyMTPModel()
+    rt = _runtime(model, mtp_enabled=True)
+
+    for _ in range(2):
+        generate_mtpk(
+            rt,
+            [0],
+            max_tokens=2,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            speculative_depth=1,
+            stop_token_ids=set(),
+        )
+        assert all(cache.close_calls == 1 for cache in model.physical_caches)
+
+    assert len(model.target_caches) == 2
+    assert len(model.physical_caches) == sum(
+        cache.close_calls for cache in model.physical_caches
+    )
+
+
+@pytest.mark.parametrize(
+    "forbidden_kwargs",
+    [
+        {"session_bank": object()},
+        {"capture_final_state": True},
+        {"commit_prompt_state_to_bank": True},
+        {"commit_prompt_state_keep_live_ref": True},
+        {"session_restore_mode": "reference"},
+    ],
+)
+def test_dynamic_broker_generate_mtpk_rejects_cache_ownership_transfer_before_alloc(
+    forbidden_kwargs,
+) -> None:
+    model = LifecycleTinyMTPModel()
+    rt = _runtime(model, mtp_enabled=True)
+    rt.expert_streaming = SimpleNamespace(memory_broker=object())
+
+    with pytest.raises(RuntimeError, match="physical Q4 memory broker"):
+        generate_mtpk(
+            rt,
+            [0],
+            max_tokens=2,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            speculative_depth=1,
+            stop_token_ids=set(),
+            **forbidden_kwargs,
+        )
+
+    assert model.target_caches == []
+    assert model.mtp_caches == []
+    assert model.calls == []
+
+
+def test_dynamic_broker_generate_mtpk_disables_state_rebase(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_STATE_REBASE_EVERY", "1")
+    model = LifecycleTinyMTPModel()
+    rt = _runtime(model, mtp_enabled=True)
+    rt.expert_streaming = SimpleNamespace(memory_broker=object())
+
+    def make_target_cache():
+        cache = model.make_cache()
+        register_physical_kv_cache(cache)
+        return cache
+
+    def make_mtp_cache():
+        cache = model.make_mtp_cache()
+        register_physical_kv_cache(cache)
+        return cache
+
+    # Keep the production runtime's generation behavior while substituting
+    # allocation-observed cache entries that do not require a real Q4 kernel.
+    rt.make_cache = make_target_cache
+    rt.make_mtp_cache = make_mtp_cache
+
+    out = generate_mtpk(
+        rt,
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=1,
+        stop_token_ids=set(),
+    )
+
+    assert out.stats.state_rebase_every == 0
+    assert out.stats.state_rebase_events == 0
+    assert len(model.target_caches) == 1
+    assert all(cache.close_calls == 1 for cache in model.physical_caches)
 
 
 def test_lazy_bonus_verify_shortens_full_accept_verify_input(monkeypatch):

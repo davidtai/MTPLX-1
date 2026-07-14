@@ -720,6 +720,13 @@ def _contiguous_prefill_cache_layout_enabled() -> bool:
     )
 
 
+def _dynamic_memory_broker_enabled(rt: MTPLXRuntime) -> bool:
+    return (
+        getattr(getattr(rt, "expert_streaming", None), "memory_broker", None)
+        is not None
+    )
+
+
 @contextmanager
 def _target_prefill_cache_layout_scope():
     if not _contiguous_prefill_cache_layout_enabled():
@@ -745,10 +752,7 @@ def _target_prefill_cache_layout_scope():
 
 
 def _make_target_prefill_cache(rt: MTPLXRuntime):
-    if (
-        getattr(getattr(rt, "expert_streaming", None), "memory_broker", None)
-        is not None
-    ):
+    if _dynamic_memory_broker_enabled(rt):
         return rt.make_cache()
     with _target_prefill_cache_layout_scope():
         return rt.make_cache()
@@ -759,11 +763,7 @@ def _maybe_repage_target_prefill_cache(
     *,
     rt: MTPLXRuntime | None = None,
 ) -> float:
-    if (
-        rt is not None
-        and getattr(getattr(rt, "expert_streaming", None), "memory_broker", None)
-        is not None
-    ):
+    if rt is not None and _dynamic_memory_broker_enabled(rt):
         return 0.0
     if not _contiguous_then_repage_prefill_enabled():
         return 0.0
@@ -4298,6 +4298,7 @@ def generate_ar(
     )
 
 
+@physical_kv_cache_lifecycle()
 def generate_mtp1(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -4969,6 +4970,7 @@ def generate_mtp1(
     )
 
 
+@physical_kv_cache_lifecycle()
 def generate_mtpk(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -5028,6 +5030,24 @@ def generate_mtpk(
     target cache snapshot and re-forwards only the committed prefix. This keeps
     the hybrid GDN/attention cache contract exact while we measure depth.
     """
+    if _dynamic_memory_broker_enabled(rt):
+        ownership_transfers = []
+        if session_bank is not None:
+            ownership_transfers.append("session_bank")
+        if capture_final_state:
+            ownership_transfers.append("capture_final_state")
+        if commit_prompt_state_to_bank:
+            ownership_transfers.append("commit_prompt_state_to_bank")
+        if commit_prompt_state_keep_live_ref:
+            ownership_transfers.append("commit_prompt_state_keep_live_ref")
+        if str(session_restore_mode).replace("-", "_") != "clone":
+            ownership_transfers.append("session_restore_mode")
+        if ownership_transfers:
+            raise RuntimeError(
+                "the physical Q4 memory broker requires generation-scoped cache "
+                "ownership; cache transfer options are unsupported: "
+                + ", ".join(ownership_transfers)
+            )
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         from .backends.gemma4_assistant import generate_gemma4_assistant
 
@@ -5417,9 +5437,13 @@ def generate_mtpk(
     trunk_cache_materialize_observed_tokens = 0
     trunk_cache_materialize_events = 0
     trunk_cache_materialize_time_s = 0.0
-    state_rebase_every = max(
-        0,
-        int(os.environ.get("MTPLX_STATE_REBASE_EVERY") or 0),
+    state_rebase_every = (
+        0
+        if _dynamic_memory_broker_enabled(rt)
+        else max(
+            0,
+            int(os.environ.get("MTPLX_STATE_REBASE_EVERY") or 0),
+        )
     )
     state_rebase_tokens_since = 0
     state_rebase_observed_tokens = 0
@@ -7678,6 +7702,7 @@ def generate_mtpk(
     )
 
 
+@physical_kv_cache_lifecycle()
 def generate_mtpa(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
