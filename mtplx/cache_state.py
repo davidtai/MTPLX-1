@@ -2218,8 +2218,14 @@ class VllmMetalPagedKVCache:
         self._dtypes = None
         self.offset = 0
 
-    def close(self) -> None:
-        with self._close_lock:
+    def close(self, *, deadline: float | None = None) -> None:
+        if deadline is None:
+            self._close_lock.acquire()
+        else:
+            remaining = max(0.0, float(deadline) - time.monotonic())
+            if remaining == 0.0 or not self._close_lock.acquire(timeout=remaining):
+                raise TimeoutError("paged Q4 cache close exceeded its deadline")
+        try:
             if self._closed:
                 return
             self._close_started = True
@@ -2239,12 +2245,35 @@ class VllmMetalPagedKVCache:
 
             guard_factory = getattr(observer, "physical_kv_release_context", None)
             guard = guard_factory() if callable(guard_factory) else nullcontext()
-            with guard:
-                self._close_observed_cache(
-                    observer,
-                    allocations=allocations,
-                    released_physical_bytes=released,
-                )
+            acquire_guard = getattr(guard, "acquire", None)
+            release_guard = getattr(guard, "release", None)
+            if (
+                deadline is not None
+                and callable(acquire_guard)
+                and callable(release_guard)
+            ):
+                remaining = max(0.0, float(deadline) - time.monotonic())
+                if remaining == 0.0 or not acquire_guard(timeout=remaining):
+                    raise TimeoutError(
+                        "paged Q4 cache release transaction exceeded its deadline"
+                    )
+                try:
+                    self._close_observed_cache(
+                        observer,
+                        allocations=allocations,
+                        released_physical_bytes=released,
+                    )
+                finally:
+                    release_guard()
+            else:
+                with guard:
+                    self._close_observed_cache(
+                        observer,
+                        allocations=allocations,
+                        released_physical_bytes=released,
+                    )
+        finally:
+            self._close_lock.release()
 
     def _close_observed_cache(
         self,

@@ -1560,6 +1560,750 @@ def test_q4_concurrent_dynamic_growth_and_close_releases_latest_ownership(
     assert snapshot.failed_closed is False
 
 
+def test_retained_q4_close_retry_does_not_deadlock_runtime_close_and_reserve() -> None:
+    from mtplx.expert_runtime import ExpertStreamingRuntime
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        UnifiedMemoryBroker,
+    )
+
+    class SignalingRLock:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+            self.signal_acquire = False
+            self.acquired = threading.Event()
+
+        def acquire(self, *args, **kwargs):
+            acquired = self._lock.acquire(*args, **kwargs)
+            if acquired and self.signal_acquire:
+                self.acquired.set()
+            return acquired
+
+        def release(self) -> None:
+            self._lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            self.release()
+
+    class Slots:
+        def __init__(self) -> None:
+            self._closed = False
+
+        def expert_slab_telemetry_snapshot(self) -> dict[str, int]:
+            return {"pinned_bytes": 0}
+
+        def close(self, *, timeout=None) -> None:
+            del timeout
+            self._closed = True
+
+    class RetainedCloseObserver:
+        def __init__(self, runtime, broker: UnifiedMemoryBroker) -> None:
+            self.runtime = runtime
+            self.broker = broker
+            self.guard_factory_entered = threading.Event()
+            self.allow_guard_return = threading.Event()
+
+        def physical_kv_release_context(self):
+            self.guard_factory_entered.set()
+            if not self.allow_guard_return.wait(timeout=2):
+                raise TimeoutError("reserve did not enter the memory transaction")
+            return self.runtime._memory_transaction_lock
+
+        @staticmethod
+        def sample_allocator_memory() -> AllocatorMemorySample:
+            return AllocatorMemorySample(0, 0, 160)
+
+        def release_cache(
+            self,
+            *,
+            cache_id: str,
+            allocations,
+            released_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ) -> None:
+            del released_physical_bytes
+            self.broker.release_kv_batch(
+                cache_id=cache_id,
+                allocations=allocations,
+                registered_kv_bytes_after=None,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    ticket = broker.plan_kv_growth(
+        cache_id="target:retained-close:0",
+        steady_delta_bytes=160,
+        transient_delta_bytes=0,
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=160)
+
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime.memory_broker = broker
+    runtime._memory_transaction_lock = SignalingRLock()
+    runtime._close_lock = threading.Lock()
+    runtime._closed = False
+    runtime._closing = False
+    runtime._cleanup_error_lock = threading.Lock()
+    runtime._cleanup_error = None
+    runtime._pending_physical_kv_lock = threading.Lock()
+    runtime._pending_physical_kv_caches = {}
+    runtime.slots = Slots()
+    runtime._global_bank = SimpleNamespace(speculative_record_count=0)
+    runtime.spec = SimpleNamespace(expert_record_bytes=16)
+    runtime._sample_allocator_memory = lambda: AllocatorMemorySample(0, 0, 160)
+    runtime._split_executor = SimpleNamespace(shutdown=lambda **_kwargs: None)
+    runtime._mapped_expert_store = None
+
+    observer = RetainedCloseObserver(runtime, broker)
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:retained-close:0",
+    )
+    cache._kv_allocations.append(allocation)
+    cache._committed_physical_bytes = 160
+    cache._close_started = True
+    cache._close_arrays_dropped = True
+    cache._close_allocator_before = AllocatorMemorySample(160, 0, 160)
+    runtime._pending_physical_kv_caches[id(cache)] = cache
+
+    close_errors: list[BaseException] = []
+    reserve_errors: list[BaseException] = []
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    def reserve_growth() -> None:
+        try:
+            growth_ticket = runtime.reserve_growth(
+                cache_id="target:new-request:0",
+                steady_delta_bytes=1,
+                transient_delta_bytes=0,
+            )
+            runtime.abort_growth(
+                growth_ticket,
+                observed_physical_bytes=0,
+            )
+        except BaseException as exc:
+            reserve_errors.append(exc)
+
+    close_thread = threading.Thread(target=close_runtime, daemon=True)
+    close_thread.start()
+    assert observer.guard_factory_entered.wait(timeout=2)
+
+    runtime._memory_transaction_lock.signal_acquire = True
+    reserve_thread = threading.Thread(target=reserve_growth, daemon=True)
+    reserve_thread.start()
+    assert runtime._memory_transaction_lock.acquired.wait(timeout=2)
+    observer.allow_guard_return.set()
+    close_thread.join(timeout=1)
+    reserve_thread.join(timeout=1)
+
+    snapshot = broker.snapshot()
+    assert {
+        "close_thread_alive": close_thread.is_alive(),
+        "reserve_thread_alive": reserve_thread.is_alive(),
+        "close_errors": close_errors,
+        "reserve_errors": reserve_errors,
+        "cache_closed": cache._closed,
+        "local_allocation_handles": len(cache._kv_allocations),
+        "broker_owned_kv_bytes": snapshot.owned_kv_physical_bytes,
+        "broker_kv_bytes": snapshot.kv_physical_bytes,
+        "pending_ticket_id": snapshot.pending_kv_ticket_id,
+    } == {
+        "close_thread_alive": False,
+        "reserve_thread_alive": False,
+        "close_errors": [],
+        "reserve_errors": [],
+        "cache_closed": True,
+        "local_allocation_handles": 0,
+        "broker_owned_kv_bytes": 0,
+        "broker_kv_bytes": 0,
+        "pending_ticket_id": None,
+    }
+
+
+def test_runtime_close_waits_for_claimed_retained_q4_retry_to_settle() -> None:
+    from mtplx.expert_runtime import ExpertStreamingRuntime
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        UnifiedMemoryBroker,
+    )
+
+    class Slots:
+        def __init__(self) -> None:
+            self._closed = False
+
+        def close(self, *, timeout=None) -> None:
+            del timeout
+            self._closed = True
+
+    class FailOnceRetainedCloseObserver:
+        def __init__(self, runtime, broker: UnifiedMemoryBroker) -> None:
+            self.runtime = runtime
+            self.broker = broker
+            self.sample_calls = 0
+            self.first_sample_entered = threading.Event()
+            self.allow_first_failure = threading.Event()
+
+        def physical_kv_release_context(self):
+            return self.runtime._memory_transaction_lock
+
+        def sample_allocator_memory(self) -> AllocatorMemorySample:
+            self.sample_calls += 1
+            if self.sample_calls == 1:
+                self.first_sample_entered.set()
+                if not self.allow_first_failure.wait(timeout=2):
+                    raise TimeoutError("runtime close did not release retained retry")
+                raise RuntimeError("injected first retained close failure")
+            return AllocatorMemorySample(0, 0, 160)
+
+        def release_cache(
+            self,
+            *,
+            cache_id: str,
+            allocations,
+            released_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ) -> None:
+            del released_physical_bytes
+            self.broker.release_kv_batch(
+                cache_id=cache_id,
+                allocations=allocations,
+                registered_kv_bytes_after=None,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    ticket = broker.plan_kv_growth(
+        cache_id="target:claimed-retained-close:0",
+        steady_delta_bytes=160,
+        transient_delta_bytes=0,
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=160)
+
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime.memory_broker = broker
+    runtime._memory_transaction_lock = threading.RLock()
+    runtime._close_lock = threading.Lock()
+    runtime._closed = False
+    runtime._closing = False
+    runtime._cleanup_error_lock = threading.Lock()
+    runtime._cleanup_error = None
+    runtime._pending_physical_kv_lock = threading.Lock()
+    runtime._pending_physical_kv_caches = {}
+    runtime.slots = Slots()
+    runtime._split_executor = SimpleNamespace(shutdown=lambda **_kwargs: None)
+    runtime._mapped_expert_store = None
+
+    observer = FailOnceRetainedCloseObserver(runtime, broker)
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=observer,
+        cache_id="target:claimed-retained-close:0",
+    )
+    cache._kv_allocations.append(allocation)
+    cache._committed_physical_bytes = 160
+    cache._close_started = True
+    cache._close_arrays_dropped = True
+    cache._close_allocator_before = AllocatorMemorySample(160, 0, 160)
+    runtime._pending_physical_kv_caches[id(cache)] = cache
+
+    reserve_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    close_finished = threading.Event()
+
+    def reserve_growth() -> None:
+        try:
+            runtime.reserve_growth(
+                cache_id="target:new-request:0",
+                steady_delta_bytes=1,
+                transient_delta_bytes=0,
+            )
+        except BaseException as exc:
+            reserve_errors.append(exc)
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            close_finished.set()
+
+    reserve_thread = threading.Thread(target=reserve_growth, daemon=True)
+    reserve_thread.start()
+    assert observer.first_sample_entered.wait(timeout=2)
+    with runtime._pending_physical_kv_lock:
+        assert runtime._pending_physical_kv_caches == {}
+
+    close_thread = threading.Thread(target=close_runtime, daemon=True)
+    close_thread.start()
+    close_returned_before_claim_settled = close_finished.wait(timeout=1)
+    observer.allow_first_failure.set()
+    reserve_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert close_returned_before_claim_settled is False
+    assert not reserve_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert len(reserve_errors) == 1
+    assert str(reserve_errors[0]) == "injected first retained close failure"
+    assert close_errors == []
+    snapshot = broker.snapshot()
+    with runtime._pending_physical_kv_lock:
+        pending_after = dict(runtime._pending_physical_kv_caches)
+    assert runtime._closed is True
+    assert cache._closed is True
+    assert cache._kv_allocations == []
+    assert pending_after == {}
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.pending_kv_ticket_id is None
+
+
+def test_runtime_close_does_not_miss_q4_owner_retained_during_shutdown() -> None:
+    from mtplx.expert_runtime import ExpertStreamingRuntime
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        UnifiedMemoryBroker,
+    )
+
+    class PausedSlots:
+        def __init__(self) -> None:
+            self._closed = False
+            self.close_entered = threading.Event()
+            self.allow_close = threading.Event()
+
+        def close(self, *, timeout=None) -> None:
+            del timeout
+            self.close_entered.set()
+            if not self.allow_close.wait(timeout=2):
+                raise TimeoutError("test did not release expert-slot close")
+            self._closed = True
+
+    class RetainedCloseObserver:
+        def __init__(self, runtime, broker: UnifiedMemoryBroker) -> None:
+            self.runtime = runtime
+            self.broker = broker
+
+        def physical_kv_release_context(self):
+            return self.runtime._memory_transaction_lock
+
+        @staticmethod
+        def sample_allocator_memory() -> AllocatorMemorySample:
+            return AllocatorMemorySample(0, 0, 160)
+
+        def release_cache(
+            self,
+            *,
+            cache_id: str,
+            allocations,
+            released_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ) -> None:
+            del released_physical_bytes
+            self.broker.release_kv_batch(
+                cache_id=cache_id,
+                allocations=allocations,
+                registered_kv_bytes_after=None,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    ticket = broker.plan_kv_growth(
+        cache_id="target:retained-during-shutdown:0",
+        steady_delta_bytes=160,
+        transient_delta_bytes=0,
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=160)
+
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime.memory_broker = broker
+    runtime._memory_transaction_lock = threading.RLock()
+    runtime._close_lock = threading.Lock()
+    runtime._closed = False
+    runtime._closing = False
+    runtime._cleanup_error_lock = threading.Lock()
+    runtime._cleanup_error = None
+    runtime._pending_physical_kv_lock = threading.Lock()
+    runtime._pending_physical_kv_condition = threading.Condition(
+        runtime._pending_physical_kv_lock
+    )
+    runtime._pending_physical_kv_drainers = 0
+    runtime._pending_physical_kv_caches = {}
+    runtime.slots = PausedSlots()
+    runtime._split_executor = SimpleNamespace(shutdown=lambda **_kwargs: None)
+    runtime._mapped_expert_store = None
+
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=RetainedCloseObserver(runtime, broker),
+        cache_id="target:retained-during-shutdown:0",
+    )
+    cache._kv_allocations.append(allocation)
+    cache._committed_physical_bytes = 160
+    cache._close_started = True
+    cache._close_arrays_dropped = True
+    cache._close_allocator_before = AllocatorMemorySample(160, 0, 160)
+
+    close_errors: list[BaseException] = []
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    close_thread = threading.Thread(target=close_runtime, daemon=True)
+    close_thread.start()
+    assert runtime.slots.close_entered.wait(timeout=2)
+    runtime.retain_pending_physical_kv_cache(cache)
+    runtime.slots.allow_close.set()
+    close_thread.join(timeout=2)
+
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    snapshot = broker.snapshot()
+    with runtime._pending_physical_kv_lock:
+        pending_after = dict(runtime._pending_physical_kv_caches)
+    assert runtime._closed is True
+    assert cache._closed is True
+    assert cache._kv_allocations == []
+    assert pending_after == {}
+    assert runtime._pending_physical_kv_drainers == 0
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.owned_kv_physical_bytes == 0
+
+
+def test_runtime_close_does_not_miss_q4_owner_retained_after_final_drain() -> None:
+    from mtplx.expert_runtime import ExpertStreamingRuntime
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        UnifiedMemoryBroker,
+    )
+
+    class Slots:
+        def __init__(self) -> None:
+            self._closed = False
+
+        def close(self, *, timeout=None) -> None:
+            del timeout
+            self._closed = True
+
+    class PausedExecutor:
+        def __init__(self) -> None:
+            self.shutdown_entered = threading.Event()
+            self.allow_shutdown = threading.Event()
+
+        def shutdown(self, **_kwargs) -> None:
+            self.shutdown_entered.set()
+            if not self.allow_shutdown.wait(timeout=2):
+                raise TimeoutError("test did not release executor shutdown")
+
+    class RetainedCloseObserver:
+        def __init__(self, runtime, broker: UnifiedMemoryBroker) -> None:
+            self.runtime = runtime
+            self.broker = broker
+
+        def physical_kv_release_context(self):
+            return self.runtime._memory_transaction_lock
+
+        @staticmethod
+        def sample_allocator_memory() -> AllocatorMemorySample:
+            return AllocatorMemorySample(0, 0, 160)
+
+        def release_cache(
+            self,
+            *,
+            cache_id: str,
+            allocations,
+            released_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ) -> None:
+            del released_physical_bytes
+            self.broker.release_kv_batch(
+                cache_id=cache_id,
+                allocations=allocations,
+                registered_kv_bytes_after=None,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    ticket = broker.plan_kv_growth(
+        cache_id="target:retained-after-final-drain:0",
+        steady_delta_bytes=160,
+        transient_delta_bytes=0,
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=160)
+
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime.memory_broker = broker
+    runtime._memory_transaction_lock = threading.RLock()
+    runtime._close_lock = threading.Lock()
+    runtime._closed = False
+    runtime._closing = False
+    runtime._cleanup_error_lock = threading.Lock()
+    runtime._cleanup_error = None
+    runtime._pending_physical_kv_lock = threading.Lock()
+    runtime._pending_physical_kv_condition = threading.Condition(
+        runtime._pending_physical_kv_lock
+    )
+    runtime._pending_physical_kv_drainers = 0
+    runtime._pending_physical_kv_caches = {}
+    runtime.slots = Slots()
+    runtime._split_executor = PausedExecutor()
+    runtime._mapped_expert_store = None
+
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=RetainedCloseObserver(runtime, broker),
+        cache_id="target:retained-after-final-drain:0",
+    )
+    cache._kv_allocations.append(allocation)
+    cache._committed_physical_bytes = 160
+    cache._close_started = True
+    cache._close_arrays_dropped = True
+    cache._close_allocator_before = AllocatorMemorySample(160, 0, 160)
+
+    close_errors: list[BaseException] = []
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    close_thread = threading.Thread(target=close_runtime, daemon=True)
+    close_thread.start()
+    assert runtime._split_executor.shutdown_entered.wait(timeout=2)
+    runtime.retain_pending_physical_kv_cache(cache)
+    runtime._split_executor.allow_shutdown.set()
+    close_thread.join(timeout=2)
+
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    snapshot = broker.snapshot()
+    with runtime._pending_physical_kv_lock:
+        pending_after = dict(runtime._pending_physical_kv_caches)
+    assert runtime._closed is True
+    assert cache._closed is True
+    assert cache._kv_allocations == []
+    assert pending_after == {}
+    assert runtime._pending_physical_kv_drainers == 0
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.owned_kv_physical_bytes == 0
+
+
+def test_runtime_close_timeout_applies_to_owned_pending_q4_close() -> None:
+    from mtplx.expert_runtime import ExpertStreamingRuntime
+    from mtplx.memory_broker import (
+        AllocatorMemorySample,
+        BrokerSnapshot,
+        MemoryBudget,
+        UnifiedMemoryBroker,
+    )
+
+    class Slots:
+        def __init__(self) -> None:
+            self._closed = False
+
+        def close(self, *, timeout=None) -> None:
+            del timeout
+            self._closed = True
+
+    class RetainedCloseObserver:
+        def __init__(self, runtime, broker: UnifiedMemoryBroker) -> None:
+            self.runtime = runtime
+            self.broker = broker
+
+        def physical_kv_release_context(self):
+            return self.runtime._memory_transaction_lock
+
+        @staticmethod
+        def sample_allocator_memory() -> AllocatorMemorySample:
+            return AllocatorMemorySample(0, 0, 160)
+
+        def release_cache(
+            self,
+            *,
+            cache_id: str,
+            allocations,
+            released_physical_bytes: int,
+            allocator_before,
+            allocator_after,
+        ) -> None:
+            del released_physical_bytes
+            self.broker.release_kv_batch(
+                cache_id=cache_id,
+                allocations=allocations,
+                registered_kv_bytes_after=None,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=1_000,
+            hard_ceiling_bytes=1_100,
+        ),
+        initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
+        expert_slab_bytes=16,
+    )
+    ticket = broker.plan_kv_growth(
+        cache_id="target:retained-close-timeout:0",
+        steady_delta_bytes=160,
+        transient_delta_bytes=0,
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=160)
+
+    runtime = object.__new__(ExpertStreamingRuntime)
+    runtime.memory_broker = broker
+    runtime._memory_transaction_lock = threading.RLock()
+    runtime._close_lock = threading.Lock()
+    runtime._closed = False
+    runtime._closing = False
+    runtime._cleanup_error_lock = threading.Lock()
+    runtime._cleanup_error = None
+    runtime._pending_physical_kv_lock = threading.Lock()
+    runtime._pending_physical_kv_condition = threading.Condition(
+        runtime._pending_physical_kv_lock
+    )
+    runtime._pending_physical_kv_drainers = 0
+    runtime._pending_physical_kv_caches = {}
+    runtime.slots = Slots()
+    runtime._split_executor = SimpleNamespace(shutdown=lambda **_kwargs: None)
+    runtime._mapped_expert_store = None
+
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=1,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+        allocation_observer=RetainedCloseObserver(runtime, broker),
+        cache_id="target:retained-close-timeout:0",
+    )
+    cache._kv_allocations.append(allocation)
+    cache._committed_physical_bytes = 160
+    cache._close_started = True
+    cache._close_arrays_dropped = True
+    cache._close_allocator_before = AllocatorMemorySample(160, 0, 160)
+    runtime._pending_physical_kv_caches[id(cache)] = cache
+
+    memory_lock_held = threading.Event()
+    release_memory_lock = threading.Event()
+
+    def hold_memory_transaction() -> None:
+        with runtime._memory_transaction_lock:
+            memory_lock_held.set()
+            release_memory_lock.wait(timeout=2)
+
+    holder_thread = threading.Thread(target=hold_memory_transaction, daemon=True)
+    holder_thread.start()
+    assert memory_lock_held.wait(timeout=2)
+
+    close_errors: list[BaseException] = []
+    close_finished = threading.Event()
+
+    def close_runtime() -> None:
+        try:
+            runtime.close(timeout=0.05)
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            close_finished.set()
+
+    close_thread = threading.Thread(target=close_runtime, daemon=True)
+    close_thread.start()
+    finished_promptly = close_finished.wait(timeout=0.5)
+    with runtime._pending_physical_kv_lock:
+        retained_before_retry = (
+            runtime._pending_physical_kv_caches.get(id(cache)) is cache
+        )
+        drainers_before_retry = runtime._pending_physical_kv_drainers
+    snapshot_before_retry = broker.snapshot()
+    local_handles_before_retry = tuple(cache._kv_allocations)
+    cache_closed_before_retry = cache._closed
+    close_errors_before_retry = tuple(close_errors)
+
+    release_memory_lock.set()
+    holder_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+    assert not holder_thread.is_alive()
+    assert not close_thread.is_alive()
+    if not runtime._closed:
+        runtime.close()
+
+    assert finished_promptly is True
+    assert len(close_errors_before_retry) == 1
+    assert isinstance(close_errors_before_retry[0], TimeoutError)
+    assert retained_before_retry is True
+    assert drainers_before_retry == 0
+    assert cache_closed_before_retry is False
+    assert local_handles_before_retry == (allocation,)
+    assert snapshot_before_retry.kv_physical_bytes == 160
+    assert snapshot_before_retry.owned_kv_physical_bytes == 160
+    assert snapshot_before_retry.pending_kv_ticket_id is None
+
+
 def test_q4_physical_allocation_is_reserved_and_committed_exactly() -> None:
     observer = _KVAllocationObserver()
     cache = VllmMetalPagedKVCache(

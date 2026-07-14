@@ -1274,6 +1274,10 @@ class ExpertStreamingRuntime:
         self._cleanup_error_lock = threading.Lock()
         self._cleanup_error: BaseException | None = None
         self._pending_physical_kv_lock = threading.Lock()
+        self._pending_physical_kv_condition = threading.Condition(
+            self._pending_physical_kv_lock
+        )
+        self._pending_physical_kv_drainers = 0
         self._pending_physical_kv_caches: dict[int, Any] = {}
         self._mapped_expert_store: Any | None = None
         self._route_trace_lock = threading.Lock()
@@ -1530,28 +1534,113 @@ class ExpertStreamingRuntime:
 
         if getattr(cache, "_closed", False):
             return
-        with self._pending_physical_kv_lock:
-            self._pending_physical_kv_caches[id(cache)] = cache
+        condition = self._physical_kv_drain_condition()
+        with condition:
+            if not self._closed:
+                self._pending_physical_kv_caches[id(cache)] = cache
+                return
 
-    def _drain_pending_physical_kv_caches(self) -> None:
+        # The terminal handoff gate is already sealed.  Retry synchronously so
+        # a generation unwinding after shutdown cannot silently attach a new
+        # owner to a closed runtime.  A second failure remains retained for an
+        # explicit close retry and makes runtime health fail closed.
+        try:
+            cache.close()
+        except BaseException as exc:
+            with condition:
+                self._pending_physical_kv_caches.setdefault(id(cache), cache)
+            self._record_cleanup_error(exc)
+
+    def _physical_kv_drain_condition(self) -> threading.Condition:
+        """Return the drain condition, including for lightweight test runtimes."""
+
+        condition = getattr(self, "_pending_physical_kv_condition", None)
+        if condition is not None:
+            return condition
+        lock = self._pending_physical_kv_lock
+        with lock:
+            condition = getattr(self, "_pending_physical_kv_condition", None)
+            if condition is None:
+                condition = threading.Condition(lock)
+                self._pending_physical_kv_condition = condition
+                self._pending_physical_kv_drainers = 0
+        return condition
+
+    def _drain_pending_physical_kv_caches(
+        self,
+        *,
+        wait_for_inflight: bool = False,
+        deadline: float | None = None,
+    ) -> None:
         lock = getattr(self, "_pending_physical_kv_lock", None)
         if lock is None:
             return
-        with lock:
+        condition = self._physical_kv_drain_condition()
+        with condition:
+            while wait_for_inflight and self._pending_physical_kv_drainers:
+                if deadline is None:
+                    condition.wait()
+                    continue
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining == 0.0:
+                    raise TimeoutError(
+                        "pending physical KV cache drain exceeded close deadline"
+                    )
+                condition.wait(timeout=remaining)
             pending = tuple(self._pending_physical_kv_caches.items())
+            # Transfer retry ownership to this drainer before touching a
+            # cache.  Close, admission, and growth may all arrive here at the
+            # same time; letting two callers snapshot the same cache can
+            # invert cache-close and memory-transaction locks.
+            self._pending_physical_kv_caches.clear()
+            if pending:
+                self._pending_physical_kv_drainers += 1
+        if not pending:
+            return
         first_error: BaseException | None = None
-        for identity, cache in pending:
-            try:
-                cache.close()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-                continue
-            with lock:
-                if self._pending_physical_kv_caches.get(identity) is cache:
-                    self._pending_physical_kv_caches.pop(identity, None)
+        try:
+            for identity, cache in pending:
+                try:
+                    if deadline is None:
+                        cache.close()
+                    else:
+                        cache.close(deadline=deadline)
+                except BaseException as exc:
+                    if not getattr(cache, "_closed", False):
+                        with condition:
+                            self._pending_physical_kv_caches.setdefault(
+                                identity, cache
+                            )
+                    if first_error is None:
+                        first_error = exc
+                    continue
+                with condition:
+                    if self._pending_physical_kv_caches.get(identity) is cache:
+                        self._pending_physical_kv_caches.pop(identity, None)
+        finally:
+            with condition:
+                self._pending_physical_kv_drainers -= 1
+                condition.notify_all()
         if first_error is not None:
             raise first_error
+
+    def _seal_physical_kv_handoffs(self, *, deadline: float | None) -> None:
+        """Drain and atomically close the retained-cache ownership gate."""
+
+        condition = self._physical_kv_drain_condition()
+        while True:
+            self._drain_pending_physical_kv_caches(
+                wait_for_inflight=True,
+                deadline=deadline,
+            )
+            with condition:
+                if (
+                    self._pending_physical_kv_drainers
+                    or self._pending_physical_kv_caches
+                ):
+                    continue
+                self._closed = True
+                return
 
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
         # Lifecycle order is close -> slot/runtime health -> KV accounting.
@@ -3012,7 +3101,10 @@ class ExpertStreamingRuntime:
                     "expert streaming runtime close already in progress at deadline"
                 )
         try:
-            self._drain_pending_physical_kv_caches()
+            self._drain_pending_physical_kv_caches(
+                wait_for_inflight=True,
+                deadline=deadline,
+            )
             remaining = (
                 None if deadline is None else max(0.0, deadline - time.monotonic())
             )
@@ -3022,6 +3114,7 @@ class ExpertStreamingRuntime:
                     self.slots.close(timeout=remaining)
                 except BaseException as exc:
                     slots_error = exc
+                self._seal_physical_kv_handoffs(deadline=deadline)
                 if slots_error is not None:
                     raise slots_error
                 self._raise_cleanup_error()
@@ -3034,6 +3127,10 @@ class ExpertStreamingRuntime:
                 if not self.slots._closed:
                     raise
                 slots_error = exc
+            self._drain_pending_physical_kv_caches(
+                wait_for_inflight=True,
+                deadline=deadline,
+            )
             self._split_executor.shutdown(
                 wait=deadline is None,
                 cancel_futures=True,
@@ -3041,7 +3138,7 @@ class ExpertStreamingRuntime:
             if self._mapped_expert_store is not None:
                 self._mapped_expert_store.close()
                 self._mapped_expert_store = None
-            self._closed = True
+            self._seal_physical_kv_handoffs(deadline=deadline)
             self._closing = False
             if slots_error is not None:
                 raise slots_error
