@@ -24,6 +24,7 @@
   "bootstrap_resamples": 10000,
   "bootstrap_seed": 46,
   "legacy_exclusive_lane_lock": "/tmp/mtplx-gpu-exclusive.lock",
+  "legacy_exclusive_lane_wait_seconds": 7200,
   "workload_subprocess_timeout_seconds": 43200,
   "qwen_control_timeout_seconds": 300,
   "subprocess_termination_grace_seconds": 30,

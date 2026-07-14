@@ -16,6 +16,7 @@ import os
 import secrets
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -43,6 +44,38 @@ def _mapping(value: object, *, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise BenchmarkGateError(f"{field} must be an object")
     return value
+
+
+def _acquire_legacy_lane_lock(path: Path, *, wait_seconds: float) -> int:
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        deadline = time.monotonic() + float(wait_seconds)
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return descriptor
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise BenchmarkGateError(
+                        "legacy exclusive GPU lane is active; refusing overlapping "
+                        "hardware work"
+                    ) from exc
+                time.sleep(min(0.25, remaining))
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _release_legacy_lane_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _command(value: object, *, field: str) -> tuple[str, ...]:
@@ -338,6 +371,7 @@ def _parse_spec_bytes(raw_bytes: bytes, *, path: Path) -> dict[str, object]:
         "quality_command",
         "arm_command_template",
         "legacy_exclusive_lane_lock",
+        "legacy_exclusive_lane_wait_seconds",
         "repetitions",
         "qwen",
     ):
@@ -362,6 +396,11 @@ def _parse_spec_bytes(raw_bytes: bytes, *, path: Path) -> dict[str, object]:
         raise BenchmarkGateError(
             "spec.legacy_exclusive_lane_lock must use the shared MTPLX GPU lock"
         )
+    spec["legacy_exclusive_lane_wait_seconds"] = _exact_int(
+        spec["legacy_exclusive_lane_wait_seconds"],
+        field="spec.legacy_exclusive_lane_wait_seconds",
+        minimum=0,
+    )
     repetitions = _exact_int(spec["repetitions"], field="spec.repetitions", minimum=2)
     if repetitions % 2:
         raise BenchmarkGateError("spec.repetitions must be even for balanced ordering")
@@ -469,6 +508,9 @@ def _plan(spec: Mapping[str, object]) -> dict[str, object]:
         "artifact_verify_command": list(spec["artifact_verify_command"]),
         "arm_command_template": list(spec["arm_command_template"]),
         "legacy_exclusive_lane_lock": str(spec["legacy_exclusive_lane_lock"]),
+        "legacy_exclusive_lane_wait_seconds": int(
+            spec["legacy_exclusive_lane_wait_seconds"]
+        ),
         "workload_subprocess_timeout_seconds": int(
             spec["workload_subprocess_timeout_seconds"]
         ),
@@ -695,27 +737,20 @@ def run_spec(
         if legacy_lock_value is None
         else Path(str(legacy_lock_value)).expanduser().resolve()
     )
+    legacy_lock_wait_seconds = _exact_int(
+        spec.get("legacy_exclusive_lane_wait_seconds", 0),
+        field="spec.legacy_exclusive_lane_wait_seconds",
+        minimum=0,
+    )
 
     def acquire_legacy_lane_lock() -> None:
         nonlocal legacy_lock_descriptor
         if legacy_lock_path is None:
             return
-        descriptor = os.open(
+        legacy_lock_descriptor = _acquire_legacy_lane_lock(
             legacy_lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
-            0o600,
+            wait_seconds=legacy_lock_wait_seconds,
         )
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(descriptor)
-            raise BenchmarkGateError(
-                "legacy exclusive GPU lane is active; refusing overlapping hardware work"
-            ) from exc
-        except BaseException:
-            os.close(descriptor)
-            raise
-        legacy_lock_descriptor = descriptor
         qwen_evidence["legacy_exclusive_lane_lock"] = {
             "path": str(legacy_lock_path),
             "acquired": True,
@@ -727,9 +762,8 @@ def run_spec(
         descriptor = legacy_lock_descriptor
         if descriptor is None:
             return
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
         legacy_lock_descriptor = None
+        _release_legacy_lane_lock(descriptor)
         evidence = qwen_evidence.get("legacy_exclusive_lane_lock")
         if isinstance(evidence, dict):
             evidence["released"] = True
@@ -746,8 +780,11 @@ def run_spec(
 
     def acquire_lane() -> None:
         nonlocal acquired_lane, acquired_owner
-        acquire_legacy_lane_lock()
         try:
+            if legacy_lock_path is not None and legacy_lock_descriptor is None:
+                raise BenchmarkGateError(
+                    "legacy exclusive GPU lane was not acquired before Qwen handoff"
+                )
             result = dict(command("acquire_lane_command"))
             if result.get("acquired") is not True:
                 raise BenchmarkGateError(
@@ -859,7 +896,13 @@ def run_spec(
             subprocess_termination_grace_seconds=termination_grace_seconds,
         )
 
-    result = dict(run_exclusive_hardware_window(workload, hooks=hooks))
+    acquire_legacy_lane_lock()
+    try:
+        result = dict(run_exclusive_hardware_window(workload, hooks=hooks))
+    except BaseException:
+        if "acquire" not in qwen_evidence:
+            release_legacy_lane_lock()
+        raise
     required_evidence = {
         "schema",
         "acquire",

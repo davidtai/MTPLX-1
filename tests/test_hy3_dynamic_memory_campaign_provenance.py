@@ -223,6 +223,92 @@ def test_run_spec_refuses_to_overlap_a_held_legacy_gpu_lane(
         campaign_module.run_spec(spec, cwd=tmp_path)
 
 
+def test_legacy_gpu_lane_wait_retries_before_qwen_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations: list[int] = []
+    sleeps: list[float] = []
+
+    def flock(_descriptor: int, operation: int) -> None:
+        operations.append(operation)
+        if len(operations) == 1:
+            raise BlockingIOError("legacy lane is busy")
+
+    monotonic_values = iter((10.0, 10.0, 10.25))
+    monkeypatch.setattr(campaign_module.fcntl, "flock", flock)
+    monkeypatch.setattr(
+        campaign_module.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(campaign_module.time, "sleep", sleeps.append)
+
+    descriptor = campaign_module._acquire_legacy_lane_lock(
+        tmp_path / "legacy-gpu.lock",
+        wait_seconds=1.0,
+    )
+    os.close(descriptor)
+
+    assert operations == [
+        campaign_module.fcntl.LOCK_EX | campaign_module.fcntl.LOCK_NB,
+        campaign_module.fcntl.LOCK_EX | campaign_module.fcntl.LOCK_NB,
+    ]
+    assert sleeps == [0.25]
+
+
+def test_legacy_gpu_lane_wait_closes_descriptor_when_deadline_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_open = campaign_module.os.open
+    real_close = campaign_module.os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def tracked_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(campaign_module.os, "open", tracked_open)
+    monkeypatch.setattr(campaign_module.os, "close", tracked_close)
+    monkeypatch.setattr(
+        campaign_module.time,
+        "monotonic",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        campaign_module._acquire_legacy_lane_lock(
+            tmp_path / "legacy-gpu.lock",
+            wait_seconds=1.0,
+        )
+
+    assert opened == closed
+
+
+def test_legacy_gpu_lane_release_closes_descriptor_when_unlock_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(
+        campaign_module.fcntl,
+        "flock",
+        lambda _descriptor, _operation: (_ for _ in ()).throw(OSError("unlock")),
+    )
+    monkeypatch.setattr(campaign_module.os, "close", closed.append)
+
+    with pytest.raises(OSError, match="unlock"):
+        campaign_module._release_legacy_lane_lock(2468)
+
+    assert closed == [2468]
+
+
 def test_run_spec_retains_durable_qwen_recovery_journal_when_verify_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -455,6 +541,7 @@ def _default_spec() -> dict[str, object]:
     }
     return {
         "legacy_exclusive_lane_lock": "/tmp/mtplx-gpu-exclusive.lock",
+        "legacy_exclusive_lane_wait_seconds": 0,
         "artifact_verify_command": [
             "uv",
             "run",
@@ -621,6 +708,7 @@ def test_plan_only_binds_frozen_sources_shared_hooks_and_exact_matrix_without_ha
     assert plan["qwen_control_timeout_seconds"] == 300
     assert plan["subprocess_termination_grace_seconds"] == 30
     assert plan["legacy_exclusive_lane_lock"] == "/tmp/mtplx-gpu-exclusive.lock"
+    assert plan["legacy_exclusive_lane_wait_seconds"] == 0
     assert len(plan["schedule"]) == 16
     for command in (
         plan["artifact_verify_command"],

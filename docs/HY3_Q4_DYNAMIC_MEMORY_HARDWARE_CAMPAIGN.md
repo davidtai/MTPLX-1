@@ -64,7 +64,9 @@ owns the exclusive window and restores Qwen in `finally`, including after probe
 or arm failure. It holds both `/tmp/mtplx-gpu-exclusive.lock` (the legacy
 advisory lock used by older benchmark wrappers) and the owned
 `/tmp/mtplx-gpu-exclusive` directory for that complete window. Failure to take
-the legacy lock rejects before capture or unload.
+the legacy lock within the spec-pinned wait rejects before directory
+acquisition, capture, or unload. Waiting occurs before termination cleanup is
+installed, so an operator can still interrupt a queued campaign safely.
 
 Before and after the exclusive window, the runner proves that the campaign
 spec and every Python command source are tracked and the worktree is clean. The
