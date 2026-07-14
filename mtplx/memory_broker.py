@@ -761,10 +761,12 @@ class UnifiedMemoryBroker:
                 > self._pools.allocator_cache_bytes
             ):
                 self._fail_pending(
-                    "allocator telemetry is stale relative to broker cache"
+                    "allocator telemetry is stale relative to broker cache "
+                    "during expert reclaim"
                 )
                 raise MemoryTelemetryError(
-                    "allocator telemetry is stale relative to broker cache"
+                    "allocator telemetry is stale relative to broker cache "
+                    "during expert reclaim"
                 )
 
             registered_before = self._pools.expert_slab_physical_bytes
@@ -1255,7 +1257,10 @@ class UnifiedMemoryBroker:
                 self._allocator_residual_bytes(allocator_before)
                 > self._pools.allocator_cache_bytes
             ):
-                reason = "allocator telemetry is stale relative to broker cache"
+                reason = (
+                    "allocator telemetry is stale relative to broker cache "
+                    "during KV release"
+                )
                 self._fail_without_pending(reason)
                 raise MemoryTelemetryError(reason)
 
@@ -1450,7 +1455,10 @@ class UnifiedMemoryBroker:
                 self._allocator_residual_bytes(allocator_before)
                 > self._pools.allocator_cache_bytes
             ):
-                reason = "allocator telemetry is stale relative to broker cache"
+                reason = (
+                    "allocator telemetry is stale relative to broker cache "
+                    "during expert regrow"
+                )
                 self._fail_pending_regrow(reason)
                 raise MemoryTelemetryError(reason)
 
