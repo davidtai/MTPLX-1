@@ -147,6 +147,25 @@ def test_deactivated_slots_are_neither_empty_candidates_nor_victims() -> None:
     assert bank.active_slot_mask == (True, True, True)
 
 
+def test_active_capacity_is_constant_time_and_tracks_idempotent_resizes() -> None:
+    class IterationForbiddenMask(list[bool]):
+        def __iter__(self):
+            raise AssertionError("active_capacity must not scan the slot mask")
+
+    bank = _bank(persistent_slots=3)
+    bank._active_slot_mask = IterationForbiddenMask(bank._active_slot_mask)
+
+    assert bank.active_capacity == 3
+    bank.deactivate_slots((0, 2))
+    assert bank.active_capacity == 1
+    bank.deactivate_slots((0,))
+    assert bank.active_capacity == 1
+    bank.activate_slots((2,))
+    assert bank.active_capacity == 2
+    bank.activate_slots((2,))
+    assert bank.active_capacity == 2
+
+
 def test_deactivate_rejects_loading_resident_before_rollback_and_reuse() -> None:
     bank = _bank(persistent_slots=1)
     loading_plan, loading_txn = bank.plan_transaction(

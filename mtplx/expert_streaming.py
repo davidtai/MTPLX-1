@@ -647,6 +647,7 @@ class GlobalExpertSlotBank:
         self._directory: dict[tuple[int, int], _GlobalDirectoryEntry] = {}
         self._slot_generations: list[int] = [0] * self.persistent_slots
         self._active_slot_mask: list[bool] = [True] * self.persistent_slots
+        self._active_capacity = self.persistent_slots
         self._free_slots = deque(range(self.persistent_slots))
         self._free_slot_set = set(range(self.persistent_slots))
         self._lru: OrderedDict[tuple[int, int], int] = OrderedDict()
@@ -671,7 +672,7 @@ class GlobalExpertSlotBank:
 
     @property
     def active_capacity(self) -> int:
-        return sum(self._active_slot_mask)
+        return self._active_capacity
 
     @property
     def resident_experts_by_layer(self) -> dict[int, tuple[int, ...]]:
@@ -1015,6 +1016,7 @@ class GlobalExpertSlotBank:
                 self._free_slot_set.remove(slot)
                 self._free_slots.remove(slot)
             self._active_slot_mask[slot] = False
+            self._active_capacity -= 1
         return tuple(evicted)
 
     def activate_slots(self, slot_ids: Iterable[int]) -> None:
@@ -1028,6 +1030,7 @@ class GlobalExpertSlotBank:
             if self._active_slot_mask[slot]:
                 continue
             self._active_slot_mask[slot] = True
+            self._active_capacity += 1
             self._free_slots.append(slot)
             self._free_slot_set.add(slot)
 
