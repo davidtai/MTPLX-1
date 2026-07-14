@@ -281,17 +281,17 @@ git commit -m "feat(hy3): add fail-closed unified-memory accounting"
 
 **Does NOT cover:** Policy deactivation changes eligibility only; it does not claim physical bytes were released.
 
-- [ ] **Step 1: Write failing active-slot, generation, and priority tests**
+- [x] **Step 1: Write failing active-slot, generation, and priority tests**
 
 Create tests proving deactivated slots are never selected as empty slots or victims; destroy/recreate retains generation watermarks; explicit speculative residents rank before ordinary residents; cold ordinary slabs rank by their hottest member; pinned/current-demand slots exclude their slab; and MTP verify demand is ordinary unless explicitly marked speculative.
 
-- [ ] **Step 2: Confirm RED**
+- [x] **Step 2: Confirm RED**
 
 Run: `uv run --frozen --extra dev pytest -q tests/test_expert_slab_policy.py`
 
 Expected: FAIL because active-slot and slab-ranking APIs are absent.
 
-- [ ] **Step 3: Add stable policy metadata and APIs**
+- [x] **Step 3: Add stable policy metadata and APIs**
 
 ```python
 class ExpertResidencyClass(str, Enum):
@@ -310,7 +310,7 @@ class EvictedResident:
 
 Add `_active_slots` and per-slot residency class to `GlobalExpertSlotBank`. Implement `deactivate_slots`, `activate_slots`, and `rank_reclaim_slabs`. Keep `_slot_to_key`, `_slot_generations`, and history arrays at maximum logical capacity; never resize or renumber them. Deactivation returns exact `(slot, key, generation)` eviction records for the physical transaction.
 
-- [ ] **Step 4: Verify policy regression coverage and commit**
+- [x] **Step 4: Verify policy regression coverage and commit**
 
 ```bash
 uv run --frozen --extra dev pytest -q \

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
 from operator import index
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 
 def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
@@ -35,6 +35,28 @@ class RoutingPhase(str, Enum):
     DECODE = "decode"
 
 
+class ExpertResidencyClass(str, Enum):
+    """Eviction priority for one persistent expert record.
+
+    Ordinary is the authoritative default. Callers must opt in explicitly to
+    speculative residency; decode width or MTP verification never implies it.
+    """
+
+    ORDINARY = "ordinary"
+    SPECULATIVE = "speculative"
+
+
+@dataclass(frozen=True)
+class EvictedResident:
+    """One logical resident removed when its physical slot is deactivated."""
+
+    slot: int
+    layer: int
+    expert: int
+    generation: int
+    residency_class: ExpertResidencyClass
+
+
 @dataclass(frozen=True)
 class SlotLoad:
     """One expert record that must be loaded before dispatch."""
@@ -43,6 +65,7 @@ class SlotLoad:
     slot: int
     persistent: bool
     generation: int | None = None
+    residency_class: ExpertResidencyClass = ExpertResidencyClass.ORDINARY
 
 
 @dataclass(frozen=True)
@@ -179,6 +202,7 @@ class _GlobalDirectoryEntry:
     generation: int
     state: str
     lru_rank: int
+    residency_class: ExpertResidencyClass = ExpertResidencyClass.ORDINARY
 
 
 class LayerExpertSlotBank:
@@ -622,6 +646,7 @@ class GlobalExpertSlotBank:
         self._key_to_slot: dict[tuple[int, int], int] = {}
         self._directory: dict[tuple[int, int], _GlobalDirectoryEntry] = {}
         self._slot_generations: list[int] = [0] * self.persistent_slots
+        self._active_slot_mask: list[bool] = [True] * self.persistent_slots
         self._free_slots = deque(range(self.persistent_slots))
         self._free_slot_set = set(range(self.persistent_slots))
         self._lru: OrderedDict[tuple[int, int], int] = OrderedDict()
@@ -637,6 +662,16 @@ class GlobalExpertSlotBank:
     @property
     def occupancy(self) -> int:
         return len(self._key_to_slot)
+
+    @property
+    def active_slot_mask(self) -> tuple[bool, ...]:
+        """Stable logical-slot eligibility without exposing mutable state."""
+
+        return tuple(self._active_slot_mask)
+
+    @property
+    def active_capacity(self) -> int:
+        return sum(self._active_slot_mask)
 
     @property
     def resident_experts_by_layer(self) -> dict[int, tuple[int, ...]]:
@@ -708,11 +743,12 @@ class GlobalExpertSlotBank:
         history.last_used = self._decode_epoch
 
     def _empty_slot(self) -> int | None:
-        if not self._free_slots:
-            return None
-        slot = self._free_slots.popleft()
-        self._free_slot_set.remove(slot)
-        return slot
+        while self._free_slots:
+            slot = self._free_slots.popleft()
+            self._free_slot_set.remove(slot)
+            if self._active_slot_mask[slot]:
+                return slot
+        return None
 
     def _touch_lru(self, key: tuple[int, int]) -> None:
         entry = self._directory[key]
@@ -735,12 +771,12 @@ class GlobalExpertSlotBank:
     def _victim_slot(self, *, pinned: set[tuple[int, int]]) -> int | None:
         if self.cache_policy == "lru":
             for key, slot in self._lru.items():
-                if key not in pinned:
+                if self._active_slot_mask[slot] and key not in pinned:
                     return slot
             return None
         candidates: list[tuple[float, int, int]] = []
         for slot, key in enumerate(self._slot_to_key):
-            if key is None or key in pinned:
+            if not self._active_slot_mask[slot] or key is None or key in pinned:
                 continue
             history = self._history_for(key)
             if self.cache_policy == "lru":
@@ -754,11 +790,14 @@ class GlobalExpertSlotBank:
         *,
         slot: int,
         key: tuple[int, int],
+        residency_class: ExpertResidencyClass,
         evictions: list[SlotEviction],
         evicted_entries: dict[int, tuple[tuple[int, int], _GlobalDirectoryEntry]]
         | None = None,
         occupancy_before: dict[int, tuple[bool, int]] | None = None,
     ) -> None:
+        if not self._active_slot_mask[slot]:
+            raise RuntimeError("cannot assign an inactive global expert slot")
         previous = self._slot_to_key[slot]
         if previous is not None:
             previous_entry = self._directory.get(previous)
@@ -774,6 +813,7 @@ class GlobalExpertSlotBank:
                         previous_entry.generation,
                         previous_entry.state,
                         previous_entry.lru_rank,
+                        previous_entry.residency_class,
                     ),
                 )
             if occupancy_before is not None:
@@ -818,6 +858,7 @@ class GlobalExpertSlotBank:
             generation=self._slot_generations[slot],
             state="loading",
             lru_rank=0,
+            residency_class=residency_class,
         )
         self._touch_lru(key)
         self._layer_occupancy[key[0]] += 1
@@ -829,7 +870,7 @@ class GlobalExpertSlotBank:
         remaining_layer = max(
             0, self.prefill_slots_per_layer - self._layer_occupancy[layer]
         )
-        empty = self.persistent_slots - self.occupancy
+        empty = self.active_capacity - self.occupancy
         available = min(remaining_layer, empty)
         if available <= 0:
             self._prefill_seed_candidates[layer].clear()
@@ -850,10 +891,216 @@ class GlobalExpertSlotBank:
             self._directory.pop(key, None)
             self._discard_lru(key)
             self._layer_occupancy[layer] -= 1
-            if slot not in self._free_slot_set:
+            if self._active_slot_mask[slot] and slot not in self._free_slot_set:
                 self._free_slots.append(slot)
                 self._free_slot_set.add(slot)
         return slot
+
+    def _validate_slot_ids(self, slot_ids: Iterable[int]) -> tuple[int, ...]:
+        normalized = tuple(_integer("slot", slot, minimum=0) for slot in slot_ids)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("slot ids must be unique")
+        if any(slot >= self.persistent_slots for slot in normalized):
+            raise ValueError("slot is outside the persistent global cache")
+        return normalized
+
+    def _preflight_slot_state(
+        self,
+        slot: int,
+    ) -> tuple[tuple[int, int] | None, _GlobalDirectoryEntry | None]:
+        """Validate one logical slot without changing policy state."""
+
+        active = self._active_slot_mask[slot]
+        key = self._slot_to_key[slot]
+        free_occurrences = self._free_slots.count(slot)
+        in_free_set = slot in self._free_slot_set
+        if free_occurrences > 1 or bool(free_occurrences) != in_free_set:
+            raise RuntimeError("global expert free-slot bookkeeping is inconsistent")
+
+        mapped_keys = tuple(
+            mapped_key
+            for mapped_key, mapped_slot in self._key_to_slot.items()
+            if mapped_slot == slot
+        )
+        directory_keys = tuple(
+            directory_key
+            for directory_key, entry in self._directory.items()
+            if entry.slot == slot
+        )
+        if not active:
+            if key is not None or mapped_keys or directory_keys:
+                raise RuntimeError(
+                    "inactive global expert slot is unexpectedly resident"
+                )
+            if in_free_set:
+                raise RuntimeError("inactive global expert slot is unexpectedly free")
+            return None, None
+
+        if key is None:
+            if mapped_keys or directory_keys:
+                raise RuntimeError("empty global expert slot has resident mappings")
+            if not in_free_set:
+                raise RuntimeError(
+                    "empty global expert slot is missing from free slots"
+                )
+            return None, None
+
+        if in_free_set:
+            raise RuntimeError("resident global expert slot is unexpectedly free")
+        if mapped_keys != (key,) or self._key_to_slot.get(key) != slot:
+            raise RuntimeError("global resident slot has inconsistent key mapping")
+        entry = self._directory.get(key)
+        if entry is None or entry.slot != slot or directory_keys != (key,):
+            raise RuntimeError("global resident slot is missing its directory entry")
+        if entry.state not in {"loading", "ready"}:
+            raise RuntimeError("global resident slot has an invalid state")
+        return key, entry
+
+    def deactivate_slots(
+        self,
+        slot_ids: Iterable[int],
+    ) -> tuple[EvictedResident, ...]:
+        """Remove slots from policy eligibility without rewinding generations."""
+
+        normalized = self._validate_slot_ids(slot_ids)
+        prepared: list[
+            tuple[
+                int,
+                bool,
+                tuple[int, int] | None,
+                EvictedResident | None,
+            ]
+        ] = []
+        for slot in normalized:
+            active = self._active_slot_mask[slot]
+            key, entry = self._preflight_slot_state(slot)
+            if entry is not None and entry.state != "ready":
+                raise RuntimeError(
+                    f"cannot deactivate non-ready resident in slot {slot}"
+                )
+            record = (
+                None
+                if key is None or entry is None
+                else EvictedResident(
+                    slot=slot,
+                    layer=key[0],
+                    expert=key[1],
+                    generation=entry.generation,
+                    residency_class=entry.residency_class,
+                )
+            )
+            prepared.append((slot, active, key, record))
+
+        affected_layers = {key[0] for _slot, _active, key, _record in prepared if key}
+        for layer in affected_layers:
+            resident_count = sum(
+                key is not None and key[0] == layer for key in self._slot_to_key
+            )
+            if self._layer_occupancy.get(layer, 0) != resident_count:
+                raise RuntimeError("global resident layer occupancy is inconsistent")
+
+        evicted: list[EvictedResident] = []
+        for slot, active, key, record in prepared:
+            if not active:
+                continue
+            if key is not None:
+                if record is not None:
+                    evicted.append(record)
+                self._slot_to_key[slot] = None
+                self._key_to_slot.pop(key, None)
+                self._directory.pop(key, None)
+                self._discard_lru(key)
+                self._layer_occupancy[key[0]] -= 1
+            if slot in self._free_slot_set:
+                self._free_slot_set.remove(slot)
+                self._free_slots.remove(slot)
+            self._active_slot_mask[slot] = False
+        return tuple(evicted)
+
+    def activate_slots(self, slot_ids: Iterable[int]) -> None:
+        """Restore empty logical slots without changing generation watermarks."""
+
+        normalized = self._validate_slot_ids(slot_ids)
+        for slot in normalized:
+            self._preflight_slot_state(slot)
+
+        for slot in normalized:
+            if self._active_slot_mask[slot]:
+                continue
+            self._active_slot_mask[slot] = True
+            self._free_slots.append(slot)
+            self._free_slot_set.add(slot)
+
+    def rank_reclaim_slabs(
+        self,
+        slabs: Mapping[int, Iterable[int]],
+        protected_slots: Iterable[int] = (),
+    ) -> tuple[int, ...]:
+        """Rank releasable active slabs by residency class and coldness.
+
+        Empty slabs rank first, followed by slabs containing only speculative
+        residents. Slabs with any ordinary resident rank last, using their
+        hottest ordinary member so one hot record protects its whole slab.
+        A protected or in-flight slot excludes the complete slab.
+        """
+
+        protected = set(self._validate_slot_ids(protected_slots))
+        seen_slots: set[int] = set()
+        candidates: list[tuple[int, float, int, int]] = []
+        for raw_slab_id, raw_slots in slabs.items():
+            slab_id = _integer("slab id", raw_slab_id, minimum=0)
+            slot_ids = self._validate_slot_ids(raw_slots)
+            overlap = seen_slots.intersection(slot_ids)
+            if overlap:
+                raise ValueError(f"slots belong to multiple slabs: {sorted(overlap)}")
+            seen_slots.update(slot_ids)
+            active_slots = tuple(
+                slot for slot in slot_ids if self._active_slot_mask[slot]
+            )
+            if not active_slots or protected.intersection(slot_ids):
+                continue
+
+            entries: list[tuple[tuple[int, int], _GlobalDirectoryEntry]] = []
+            excluded = False
+            for slot in active_slots:
+                key = self._slot_to_key[slot]
+                if key is None:
+                    continue
+                entry = self._directory.get(key)
+                if entry is None or entry.slot != slot:
+                    raise RuntimeError(
+                        "global resident slot is missing its directory entry"
+                    )
+                if entry.state != "ready":
+                    excluded = True
+                    break
+                entries.append((key, entry))
+            if excluded:
+                continue
+            if not entries:
+                candidates.append((0, -1.0, -1, slab_id))
+                continue
+
+            ordinary = tuple(
+                (key, entry)
+                for key, entry in entries
+                if entry.residency_class is ExpertResidencyClass.ORDINARY
+            )
+            ranked_entries = ordinary or tuple(entries)
+            if self.cache_policy == "lru":
+                hottest_score, hottest_recency = max(
+                    (float(entry.lru_rank), entry.lru_rank)
+                    for _key, entry in ranked_entries
+                )
+            else:
+                hottest_score, hottest_recency = max(
+                    (self._score(key), self._history_for(key).last_used)
+                    for key, _entry in ranked_entries
+                )
+            residency_rank = 2 if ordinary else 1
+            candidates.append((residency_rank, hottest_score, hottest_recency, slab_id))
+        candidates.sort()
+        return tuple(slab_id for _class, _score, _recency, slab_id in candidates)
 
     def reconcile_slot_generation(self, slot: int, generation: int) -> None:
         """Advance policy state to a generation already used physically."""
@@ -906,7 +1153,10 @@ class GlobalExpertSlotBank:
             if self._slot_to_key[load.slot] == key:
                 self._slot_to_key[load.slot] = None
                 self._layer_occupancy[layer] -= 1
-                if load.slot not in self._free_slot_set:
+                if (
+                    self._active_slot_mask[load.slot]
+                    and load.slot not in self._free_slot_set
+                ):
                     self._free_slots.append(load.slot)
                     self._free_slot_set.add(load.slot)
             removed.append((load.slot, load.generation))
@@ -918,12 +1168,14 @@ class GlobalExpertSlotBank:
         expert_ids: Iterable[int],
         *,
         phase: RoutingPhase | str,
+        residency_class: ExpertResidencyClass | str = ExpertResidencyClass.ORDINARY,
         _evicted_entries: dict[int, tuple[tuple[int, int], _GlobalDirectoryEntry]]
         | None = None,
         _occupancy_before: dict[int, tuple[bool, int]] | None = None,
     ) -> RoutePlan:
         layer, experts = self._validate_experts(layer, expert_ids)
         phase = RoutingPhase(phase)
+        residency_class = ExpertResidencyClass(residency_class)
         unique_experts = tuple(dict.fromkeys(experts))
         keys = tuple((layer, expert) for expert in unique_experts)
 
@@ -938,6 +1190,9 @@ class GlobalExpertSlotBank:
             if (entry := self._directory.get(key)) is not None
             and entry.state == "ready"
         }
+        if residency_class is ExpertResidencyClass.ORDINARY:
+            for key in hit_keys:
+                self._directory[key].residency_class = ExpertResidencyClass.ORDINARY
         if self.cache_policy == "lru":
             for key in keys:
                 if key in hit_keys:
@@ -960,7 +1215,7 @@ class GlobalExpertSlotBank:
             ):
                 persistent_slot = self._empty_slot()
                 self._prefill_seed_candidates[layer].discard(expert)
-            elif phase is RoutingPhase.DECODE and self.persistent_slots:
+            elif phase is RoutingPhase.DECODE and self.active_capacity:
                 persistent_slot = self._empty_slot()
                 if persistent_slot is None:
                     victim_slot = self._victim_slot(pinned=pinned)
@@ -978,6 +1233,7 @@ class GlobalExpertSlotBank:
             self._assign(
                 slot=persistent_slot,
                 key=key,
+                residency_class=residency_class,
                 evictions=evictions,
                 evicted_entries=_evicted_entries,
                 occupancy_before=_occupancy_before,
@@ -990,6 +1246,7 @@ class GlobalExpertSlotBank:
                     slot=persistent_slot,
                     persistent=True,
                     generation=self._directory[key].generation,
+                    residency_class=residency_class,
                 )
             )
 
@@ -1028,9 +1285,15 @@ class GlobalExpertSlotBank:
         expert_ids: Iterable[int],
         *,
         phase: RoutingPhase | str,
+        residency_class: ExpertResidencyClass | str = ExpertResidencyClass.ORDINARY,
     ) -> tuple[RoutePlan, RoutePolicyTxn]:
         layer, experts = self._validate_experts(layer, expert_ids)
         route_keys = {(layer, expert) for expert in experts}
+        route_residency_classes = {
+            key: entry.residency_class
+            for key in route_keys
+            if (entry := self._directory.get(key)) is not None
+        }
         history_keys = set(route_keys)
         if self.cache_policy == "frequency":
             # Frequency victim selection inherently scans every resident and
@@ -1062,6 +1325,7 @@ class GlobalExpertSlotBank:
             layer,
             experts,
             phase=phase,
+            residency_class=residency_class,
             _evicted_entries=evicted_entries,
             _occupancy_before=occupancy_before,
         )
@@ -1086,16 +1350,18 @@ class GlobalExpertSlotBank:
                 evicted = evicted_entries.get(load.slot)
                 if evicted is None:
                     self._slot_to_key[load.slot] = None
-                    self._free_slot_set.add(load.slot)
+                    if self._active_slot_mask[load.slot]:
+                        self._free_slot_set.add(load.slot)
                 else:
                     previous_key, previous_entry = evicted
                     self._slot_to_key[load.slot] = previous_key
                     self._key_to_slot[previous_key] = load.slot
                     self._directory[previous_key] = _GlobalDirectoryEntry(
-                        previous_entry.slot,
-                        previous_entry.generation,
-                        previous_entry.state,
-                        previous_entry.lru_rank,
+                        slot=previous_entry.slot,
+                        generation=previous_entry.generation,
+                        state=previous_entry.state,
+                        lru_rank=previous_entry.lru_rank,
+                        residency_class=previous_entry.residency_class,
                     )
                 self._slot_generations[load.slot] = load.generation - 1
             # Restore empty slots at the exact front positions consumed by
@@ -1107,13 +1373,18 @@ class GlobalExpertSlotBank:
                 except ValueError:
                     pass
             for slot in reversed(empty_slots):
-                self._free_slots.appendleft(slot)
+                if self._active_slot_mask[slot]:
+                    self._free_slots.appendleft(slot)
             for key, rank in route_lru_ranks.items():
                 entry = self._directory.get(key)
                 if entry is not None:
                     entry.lru_rank = rank
             self._lru_clock = lru_clock
             self._rebuild_lru()
+            for key, previous_class in route_residency_classes.items():
+                entry = self._directory.get(key)
+                if entry is not None:
+                    entry.residency_class = previous_class
             for affected_layer, (was_present, value) in occupancy_before.items():
                 if was_present:
                     self._layer_occupancy[affected_layer] = value
@@ -1143,11 +1414,13 @@ class GlobalExpertSlotBank:
         expert_ids: Iterable[int],
         *,
         phase: RoutingPhase | str,
+        residency_class: ExpertResidencyClass | str = ExpertResidencyClass.ORDINARY,
     ) -> tuple[RoutePlan, RoutePolicyTxn] | None:
         """Plan a ready global route and defer policy updates until commit."""
 
         layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
         phase = RoutingPhase(phase)
+        residency_class = ExpertResidencyClass(residency_class)
         unique_experts = tuple(dict.fromkeys(experts))
         keys = tuple((layer, expert) for expert in unique_experts)
         entries = tuple(self._directory.get(key) for key in keys)
@@ -1166,6 +1439,7 @@ class GlobalExpertSlotBank:
         decode_epoch = self._decode_epoch
         lru_clock = self._lru_clock
         lru_ranks = {key: self._directory[key].lru_rank for key in keys}
+        residency_classes = {key: self._directory[key].residency_class for key in keys}
 
         resolved = {
             expert: entry.slot
@@ -1189,6 +1463,9 @@ class GlobalExpertSlotBank:
         )
 
         def commit() -> None:
+            if residency_class is ExpertResidencyClass.ORDINARY:
+                for key in keys:
+                    self._directory[key].residency_class = ExpertResidencyClass.ORDINARY
             if phase is RoutingPhase.DECODE:
                 self._decode_epoch += 1
                 for expert in experts:
@@ -1203,6 +1480,7 @@ class GlobalExpertSlotBank:
             self._decode_epoch = decode_epoch
             for key, rank in lru_ranks.items():
                 self._directory[key].lru_rank = rank
+                self._directory[key].residency_class = residency_classes[key]
             self._lru_clock = lru_clock
             self._rebuild_lru()
             for key, values in histories.items():
@@ -1222,13 +1500,16 @@ class GlobalExpertSlotBank:
 
     def reset(self) -> None:
         self._decode_epoch = 0
-        self._slot_to_key = [None] * self.persistent_slots
+        self._slot_to_key[:] = [None] * self.persistent_slots
         self._key_to_slot.clear()
         self._directory.clear()
         # Physical reset empties slots without rewinding their generations.
         # Preserve the matching policy watermarks for the next assignment.
-        self._free_slots = deque(range(self.persistent_slots))
-        self._free_slot_set = set(range(self.persistent_slots))
+        active_slots = tuple(
+            slot for slot, active in enumerate(self._active_slot_mask) if active
+        )
+        self._free_slots = deque(active_slots)
+        self._free_slot_set = set(active_slots)
         self._lru.clear()
         self._lru_clock = 0
         self._history.clear()
@@ -1241,6 +1522,8 @@ class GlobalExpertSlotBank:
     def snapshot(self) -> dict[str, object]:
         return {
             "capacity": self.persistent_slots,
+            "active_capacity": self.active_capacity,
+            "active_slot_mask": self.active_slot_mask,
             "occupancy": self.occupancy,
             "occupancy_by_layer": self.occupancy_by_layer,
             "evictions": self._evictions,
