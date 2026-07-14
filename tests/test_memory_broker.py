@@ -199,6 +199,28 @@ def test_allocator_cache_reconciliation_grants_no_credit_for_cache_to_active_mov
     assert snapshot.charged_bytes == 94
 
 
+def test_allocator_cache_reconciliation_charges_unclassified_active_drift() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(
+            resident=40,
+            kv=10,
+            experts=20,
+            staging=5,
+            workspace=10,
+            cache=5,
+        ),
+        expert_slab_bytes=10,
+    )
+
+    snapshot = broker.reconcile_allocator_cache(
+        AllocatorMemorySample(active_bytes=90, cache_bytes=5, peak_bytes=95)
+    )
+
+    assert snapshot.allocator_cache_bytes == 10
+    assert snapshot.charged_bytes == 95
+
+
 def test_allocator_cache_reconciliation_retains_over_budget_truth_and_fails_closed() -> (
     None
 ):

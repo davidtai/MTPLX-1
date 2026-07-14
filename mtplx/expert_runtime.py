@@ -2318,6 +2318,10 @@ class ExpertStreamingRuntime:
         broker = self.memory_broker
         if broker is None:
             raise MemoryAdmissionError("dynamic KV allocation is not enabled")
+        # Reconcile upward allocator drift before planning.  Sampling only
+        # after MLX allocation would discover an unsafe transition after the
+        # 110/112 GiB boundary had already been crossed.
+        broker.reconcile_allocator_cache(self._sample_allocator_memory())
         ticket = broker.plan_kv_growth(
             cache_id=cache_id,
             steady_delta_bytes=steady_delta_bytes,

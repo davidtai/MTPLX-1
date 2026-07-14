@@ -24,6 +24,7 @@ from mtplx.memory_broker import (
     AllocatorMemorySample,
     BrokerSnapshot,
     MemoryAdmissionError,
+    MemoryBudget,
     MemoryTelemetryError,
     UnifiedMemoryBroker,
 )
@@ -846,6 +847,7 @@ def test_kv_observer_reserves_reclaims_and_commits_exact_growth() -> None:
         slots=slots,
         bank=bank,
         samples=[
+            AllocatorMemorySample(target, 0, target),
             AllocatorMemorySample(64, 0, 64),
             AllocatorMemorySample(32, 0, 64),
         ],
@@ -867,6 +869,44 @@ def test_kv_observer_reserves_reclaims_and_commits_exact_growth() -> None:
     assert snapshot.pending_kv_ticket_id is None
 
 
+def test_kv_observer_reconciles_allocator_truth_before_planning_growth() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(
+            operating_target_bytes=100,
+            hard_ceiling_bytes=112,
+        ),
+        initial_snapshot=BrokerSnapshot(
+            resident_model_bytes=90,
+            kv_physical_bytes=0,
+            expert_slab_physical_bytes=0,
+            in_flight_expert_staging_bytes=0,
+            runtime_workspace_bytes=0,
+            allocator_cache_bytes=5,
+        ),
+        expert_slab_bytes=32,
+        expert_regrow_hysteresis_slabs=0,
+        expert_resize_min_interval_ns=0,
+    )
+    runtime = _runtime(
+        broker,
+        slots=_FakeSlots(),
+        bank=_FakeBank(),
+        samples=[AllocatorMemorySample(90, 11, 101)],
+    )
+
+    with pytest.raises(MemoryAdmissionError, match="operating target"):
+        runtime.reserve_growth(
+            cache_id="target:stale-before-plan",
+            steady_delta_bytes=1,
+            transient_delta_bytes=0,
+        )
+
+    snapshot = broker.snapshot()
+    assert snapshot.pending_kv_ticket_id is None
+    assert snapshot.allocator_cache_bytes == 11
+    assert snapshot.charged_bytes == 101
+
+
 def test_kv_observer_aborts_ticket_when_reclaim_cannot_start() -> None:
     class ProtectedSlots(_FakeSlots):
         def protected_slot_ids(self) -> tuple[int, ...]:
@@ -883,7 +923,7 @@ def test_kv_observer_aborts_ticket_when_reclaim_cannot_start() -> None:
         broker,
         slots=ProtectedSlots(),
         bank=_FakeBank(),
-        samples=[],
+        samples=[AllocatorMemorySample(target, 0, target)],
     )
 
     with pytest.raises(MemoryAdmissionError, match="no unprotected"):
@@ -907,7 +947,7 @@ def test_kv_observer_release_reconciles_exact_owner_batch() -> None:
         broker,
         slots=_FakeSlots(),
         bank=_FakeBank(),
-        samples=[],
+        samples=[AllocatorMemorySample(100, 0, 100)],
     )
     ticket = runtime.reserve_growth(
         cache_id="target:0",

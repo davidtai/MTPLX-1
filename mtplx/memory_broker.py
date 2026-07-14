@@ -432,13 +432,14 @@ class UnifiedMemoryBroker:
         self,
         sample: AllocatorMemorySample,
     ) -> BrokerSnapshot:
-        """Refresh allocator-cache truth without disturbing ownership ledgers.
+        """Refresh unclassified allocator truth without disturbing ownership.
 
         Physical Q4 growth can consume or retain MLX allocator-cache bytes even
         when its owned steady allocation is measured exactly.  Callers use
         this boundary between transactions so the next admission never plans
-        from a stale cache value.  Classified resident, KV, and expert bytes
-        remain authoritative and are not inferred from allocator ``active``.
+        from stale allocator truth.  Known resident, KV, expert, staging, and
+        workspace pools remain authoritative; any charged footprint above
+        those pools is conservatively retained in the allocator-cache pool.
         """
 
         self._validate_allocator_sample("sample", sample)
@@ -448,11 +449,23 @@ class UnifiedMemoryBroker:
                     "cannot reconcile allocator cache during an active memory "
                     "transaction"
                 )
+            classified_bytes = (
+                self._pools.resident_model_bytes
+                + self._pools.kv_physical_bytes
+                + self._pools.expert_slab_physical_bytes
+                + self._pools.in_flight_expert_staging_bytes
+                + self._pools.runtime_workspace_bytes
+            )
+            unclassified_footprint = max(
+                0,
+                sample.charged_footprint_bytes - classified_bytes,
+            )
             self._pools = replace(
                 self._pools,
                 allocator_cache_bytes=max(
                     self._pools.allocator_cache_bytes,
                     sample.cache_bytes,
+                    unclassified_footprint,
                 ),
             )
             self._revision += 1
