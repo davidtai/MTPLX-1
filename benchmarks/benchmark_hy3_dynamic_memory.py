@@ -692,6 +692,17 @@ def _remove_qwen_recovery_journal(evidence: dict[str, object]) -> None:
     evidence["removed_after_restore_verification"] = True
 
 
+def _canonical_release_lane(value: object, *, acquired_lane: Path | None) -> Path:
+    if not isinstance(value, str) or not value:
+        raise BenchmarkGateError("Qwen release result omitted its lane path")
+    if acquired_lane is None:
+        raise BenchmarkGateError("Qwen release ran before lane acquisition")
+    released_lane = Path(value).expanduser().resolve()
+    if released_lane != acquired_lane:
+        raise BenchmarkGateError("Qwen release lane differs from acquisition")
+    return released_lane
+
+
 def run_spec(
     spec: Mapping[str, object],
     *,
@@ -859,10 +870,13 @@ def run_spec(
         result = dict(command("release_lane_command"))
         if result.get("released") is not True:
             raise BenchmarkGateError("Qwen exclusive lane release was not proven")
-        if acquired_lane is not None and result.get("lane") != str(acquired_lane):
-            raise BenchmarkGateError("Qwen release lane differs from acquisition")
+        released_lane = _canonical_release_lane(
+            result.get("lane"),
+            acquired_lane=acquired_lane,
+        )
         if acquired_owner is not None and result.get("owner") != acquired_owner:
             raise BenchmarkGateError("Qwen release owner differs from acquisition")
+        result["lane"] = str(released_lane)
         qwen_evidence["release"] = result
         release_legacy_lane_lock()
 

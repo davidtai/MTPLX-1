@@ -67,7 +67,12 @@ def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
         "subprocess_termination_grace_seconds": 5,
     }
     calls: list[tuple[str, dict[str, str] | None, object, object]] = []
-    lane = tmp_path / "exclusive-lane"
+    real_lane_parent = tmp_path / "real-lanes"
+    real_lane_parent.mkdir()
+    lane_alias = tmp_path / "lane-alias"
+    lane_alias.symlink_to(real_lane_parent, target_is_directory=True)
+    lane = real_lane_parent / "exclusive-lane"
+    reported_lane = lane_alias / lane.name
     owner = {"uid": 501, "campaign_pid": 1234, "owner_token_sha256": "c" * 64}
     captured = {"loaded": False, "models": []}
     journal_payloads: list[dict[str, object]] = []
@@ -92,7 +97,7 @@ def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
             lane.mkdir()
             return {
                 "acquired": True,
-                "lane": str(lane),
+                "lane": str(reported_lane),
                 "owner": owner,
             }
         if action == "capture":
@@ -108,7 +113,7 @@ def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
         if action == "release":
             assert not (lane / "issue46-recovery.json").exists()
             lane.rmdir()
-            return {"lane": str(lane), "released": True, "owner": owner}
+            return {"lane": str(reported_lane), "released": True, "owner": owner}
         raise AssertionError(action)
 
     monkeypatch.setattr(campaign_module.secrets, "token_hex", lambda _size: "b" * 64)
@@ -181,6 +186,34 @@ def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
     assert workload_calls[0]["quality_command"] == ("quality",)
     assert workload_calls[0]["subprocess_timeout_seconds"] == 1234
     assert workload_calls[0]["subprocess_termination_grace_seconds"] == 5
+
+
+@pytest.mark.parametrize("value", (None, "", 46))
+def test_release_lane_rejects_a_missing_or_non_string_path(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(BenchmarkGateError, match="release result omitted its lane"):
+        campaign_module._canonical_release_lane(
+            value,
+            acquired_lane=tmp_path / "acquired-lane",
+        )
+
+
+def test_release_lane_rejects_a_different_canonical_path(tmp_path: Path) -> None:
+    with pytest.raises(BenchmarkGateError, match="differs from acquisition"):
+        campaign_module._canonical_release_lane(
+            str(tmp_path / "released-lane"),
+            acquired_lane=(tmp_path / "acquired-lane").resolve(),
+        )
+
+
+def test_release_lane_rejects_release_before_acquisition(tmp_path: Path) -> None:
+    with pytest.raises(BenchmarkGateError, match="before lane acquisition"):
+        campaign_module._canonical_release_lane(
+            str(tmp_path / "released-lane"),
+            acquired_lane=None,
+        )
 
 
 def test_run_spec_refuses_to_overlap_a_held_legacy_gpu_lane(
