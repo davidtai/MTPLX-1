@@ -891,7 +891,9 @@ class GlobalExpertSlotBank:
         remaining_layer = max(
             0, self.prefill_slots_per_layer - self._layer_occupancy[layer]
         )
-        empty = self.active_capacity - self.occupancy
+        # Inactive lazy records are eligible seed capacity even though their
+        # physical buffers will be allocated only after this demand is known.
+        empty = self.persistent_slots - self.occupancy
         available = min(remaining_layer, empty)
         if available <= 0:
             self._prefill_seed_candidates[layer].clear()
@@ -1091,18 +1093,17 @@ class GlobalExpertSlotBank:
         """Return the exact inactive-record demand for one route."""
 
         layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
+        unique_experts = tuple(dict.fromkeys(experts))
         missing = sum(
-            (layer, expert) not in self._key_to_slot
-            for expert in dict.fromkeys(experts)
+            (layer, expert) not in self._key_to_slot for expert in unique_experts
         )
         inactive = self.persistent_slots - self.active_capacity
         if RoutingPhase(phase) is RoutingPhase.PREFILL:
-            missing = min(
-                missing,
-                max(
-                    0,
-                    self.prefill_slots_per_layer - self._layer_occupancy[layer],
-                ),
+            seed_candidates = self._prefill_seed_candidates[layer]
+            missing = sum(
+                expert in seed_candidates
+                and (layer, expert) not in self._key_to_slot
+                for expert in unique_experts
             )
         return min(missing, inactive)
 

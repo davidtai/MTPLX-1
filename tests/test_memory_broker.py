@@ -1464,7 +1464,11 @@ def test_missing_allocator_telemetry_fails_closed() -> None:
             allocator_after=None,
         )
 
-    assert broker.snapshot().failed_closed is True
+    snapshot = broker.snapshot()
+    assert snapshot.expert_cache_physical_bytes == 9 * GIB
+    assert snapshot.allocator_cache_bytes == GIB
+    assert snapshot.charged_bytes == 110 * GIB
+    assert snapshot.failed_closed is True
     with pytest.raises(MemoryAdmissionError, match="failed closed"):
         broker.plan_kv_growth(steady_delta_bytes=1, transient_delta_bytes=0)
 

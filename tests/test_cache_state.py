@@ -1496,11 +1496,10 @@ def test_q4_concurrent_first_growth_and_close_leaves_no_post_close_ownership(
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     observer = _BrokerKVAllocationObserver(
         broker,
@@ -1707,11 +1706,10 @@ def test_q4_concurrent_dynamic_growth_and_close_releases_latest_ownership(
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=10_000,
-            hard_ceiling_bytes=11_000,
+            memory_limit_bytes=10_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     observer = LockedBrokerObserver(broker)
     cache = VllmMetalPagedKVCache(
@@ -1825,8 +1823,8 @@ def test_retained_q4_close_retry_does_not_deadlock_runtime_close_and_reserve() -
         def __init__(self) -> None:
             self._closed = False
 
-        def expert_slab_telemetry_snapshot(self) -> dict[str, int]:
-            return {"pinned_bytes": 0}
+        def persistent_cache_telemetry_snapshot(self) -> dict[str, int]:
+            return {"pinned_record_count": 0}
 
         def close(self, *, timeout=None) -> None:
             del timeout
@@ -1869,11 +1867,10 @@ def test_retained_q4_close_retry_does_not_deadlock_runtime_close_and_reserve() -
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     ticket = broker.plan_kv_growth(
         cache_id="target:retained-close:0",
@@ -2030,11 +2027,10 @@ def test_runtime_close_waits_for_claimed_retained_q4_retry_to_settle() -> None:
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     ticket = broker.plan_kv_growth(
         cache_id="target:claimed-retained-close:0",
@@ -2179,11 +2175,10 @@ def test_runtime_close_does_not_miss_q4_owner_retained_during_shutdown() -> None
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     ticket = broker.plan_kv_growth(
         cache_id="target:retained-during-shutdown:0",
@@ -2311,11 +2306,10 @@ def test_runtime_close_does_not_miss_q4_owner_retained_after_final_drain() -> No
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     ticket = broker.plan_kv_growth(
         cache_id="target:retained-after-final-drain:0",
@@ -2433,11 +2427,10 @@ def test_runtime_close_timeout_applies_to_owned_pending_q4_close() -> None:
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     ticket = broker.plan_kv_growth(
         cache_id="target:retained-close-timeout:0",
@@ -2729,11 +2722,10 @@ def test_q4_real_broker_commit_failure_preserves_original_terminal_error() -> No
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=170,
-            hard_ceiling_bytes=1_000,
+            memory_limit_bytes=170,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     observer = _BrokerKVAllocationObserver(
         broker,
@@ -2752,7 +2744,7 @@ def test_q4_real_broker_commit_failure_preserves_original_terminal_error() -> No
     )
     values = mx.zeros((1, 2, 1, 16), dtype=mx.float16)
 
-    with pytest.raises(MemoryTransactionError, match="operating target") as caught:
+    with pytest.raises(MemoryTransactionError, match="memory limit") as caught:
         cache.update_without_fetch(values, values)
 
     assert "already consumed" not in str(caught.value)
@@ -3055,11 +3047,10 @@ def test_q4_real_broker_active_transaction_release_is_retryable() -> None:
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     observer = _BrokerKVAllocationObserver(
         broker,
@@ -3114,11 +3105,10 @@ def test_q4_real_broker_terminalized_release_closes_without_false_credit() -> No
 
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=1_000,
-            hard_ceiling_bytes=1_100,
+            memory_limit_bytes=1_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
     observer = _BrokerKVAllocationObserver(
         broker,

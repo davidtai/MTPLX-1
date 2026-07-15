@@ -1274,7 +1274,7 @@ class VllmMetalPagedKVCache:
         if self.allocation_observer is not None:
             # Broker-owned Q4 pages are authoritative charged memory. Allocate
             # only the exact block-rounded demand so geometric spare capacity
-            # cannot silently consume expert-slab budget.
+            # cannot silently consume expert-cache budget.
             grown_blocks = required_blocks
         else:
             grown_blocks = max(

@@ -12,7 +12,7 @@ from mtplx.cache_state import (
     prepare_brokered_q4_cache_group,
 )
 from mtplx.expert_runtime import ExpertStreamingRuntime, KVGroupGrowthContext
-from mtplx.expert_slots import ExpertSlabReclaimResult
+from mtplx.expert_slots import ExpertRecordReleaseResult
 from mtplx.kv_quant import PagedKVQuantConfig
 from mtplx.memory_broker import (
     HY3_Q4_KV_BLOCK_BYTES,
@@ -24,7 +24,7 @@ from mtplx.memory_broker import (
 )
 
 
-_EXPERT_SLAB_BYTES = 2 * 1024 * 1024
+_EXPERT_RECORD_BYTES = 2 * 1024 * 1024
 _INITIAL_SLACK_BYTES = 700_000
 
 
@@ -78,85 +78,41 @@ class _TrackingRLock:
         self.release()
 
 
-class _RealExpertSlab:
-    """One registry slab backed by a real evaluated MLX allocation."""
+class _RealExpertRecord:
+    """One cache record backed by a real evaluated MLX allocation."""
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
-        self.prepared: list[tuple[tuple[int, ...], int]] = []
-        self.commit_calls = 0
-        self.abort_calls = 0
-        self._physical_bytes = _EXPERT_SLAB_BYTES
-        self._array = mx.zeros((_EXPERT_SLAB_BYTES,), dtype=mx.uint8)
+        self.release_calls: list[tuple[int, ...]] = []
+        self._physical_bytes = _EXPERT_RECORD_BYTES
+        self._array = mx.zeros((_EXPERT_RECORD_BYTES,), dtype=mx.uint8)
         mx.eval(self._array)
-
-    def slab_layout(self) -> dict[int, tuple[int, ...]]:
-        return {0: (0,)}
 
     def protected_slot_ids(self) -> tuple[int, ...]:
         return ()
 
-    def prepare_slab_reclaim(
-        self,
-        slab_ids,
-        *,
-        requested_bytes: int,
-        deadline_ns: int | None = None,
-    ):
-        del deadline_ns
-        selected = tuple(int(slab_id) for slab_id in slab_ids)
+    def release_persistent_slots(self, slot_ids) -> ExpertRecordReleaseResult:
+        selected = tuple(int(slot_id) for slot_id in slot_ids)
         assert selected == (0,)
-        assert 0 < requested_bytes <= self._physical_bytes
-        self.prepared.append((selected, int(requested_bytes)))
-        return SimpleNamespace(slab_ids=(0,))
-
-    def commit_slab_reclaim(self, ticket) -> ExpertSlabReclaimResult:
-        assert ticket.slab_ids == (0,)
         assert self._array is not None
         released = self._physical_bytes
         self._array = None
         self._physical_bytes = 0
         gc.collect()
         mx.clear_cache()
-        self.commit_calls += 1
+        self.release_calls.append(selected)
         self.events.append("expert-reclaim-complete")
-        return ExpertSlabReclaimResult(
-            slab_ids=(0,),
-            released_slot_ids=(0,),
-            physical_bytes=released,
-        )
+        return ExpertRecordReleaseResult(selected, released)
 
-    def abort_slab_reclaim(self, _ticket) -> None:
-        self.abort_calls += 1
-
-    def slot_ids_for_slab(self, slab_id: int) -> tuple[int, ...]:
-        assert slab_id == 0
-        return (0,)
-
-    def released_slab_ids(self) -> tuple[int, ...]:
-        return (0,) if self._physical_bytes == 0 else ()
-
-    def snapshot(self) -> dict[str, object]:
-        return {"slabs": {"physical_bytes": self._physical_bytes}}
-
-    def expert_slab_telemetry_snapshot(self) -> dict[str, int]:
+    def persistent_cache_telemetry_snapshot(self) -> dict[str, int]:
         active = int(self._physical_bytes > 0)
         return {
-            "logical_slab_count": 1,
-            "active_slab_count": active,
-            "draining_slab_count": 0,
-            "released_slab_count": 1 - active,
-            "logical_slot_count": 1,
-            "active_slot_count": active,
-            "resident_record_count": 0,
+            "logical_record_capacity": 1,
+            "allocated_record_count": active,
+            "resident_record_count": active,
             "in_flight_record_count": 0,
             "pinned_record_count": 0,
-            "pin_count": 0,
-            "logical_bytes": _EXPERT_SLAB_BYTES,
             "physical_bytes": self._physical_bytes,
-            "released_bytes": _EXPERT_SLAB_BYTES - self._physical_bytes,
-            "in_flight_bytes": 0,
-            "pinned_bytes": 0,
         }
 
 
@@ -166,9 +122,12 @@ class _ExpertBank:
     def __init__(self) -> None:
         self.deactivated: list[tuple[int, ...]] = []
 
-    def rank_reclaim_slabs(self, slabs, protected_slots=()):
+    def rank_reclaim_slots(self, protected_slots=()):
         assert tuple(protected_slots) == ()
-        return tuple(int(slab_id) for slab_id in slabs)
+        return (0,)
+
+    def preflight_deactivate_slots(self, slot_ids) -> None:
+        assert tuple(slot_ids) == (0,)
 
     def deactivate_slots(self, slot_ids):
         selected = tuple(int(slot_id) for slot_id in slot_ids)
@@ -180,10 +139,10 @@ def _runtime_harness(events: list[str]):
     gc.collect()
     mx.clear_cache()
     baseline_allocator = _allocator_sample()
-    slots = _RealExpertSlab(events)
+    slots = _RealExpertRecord(events)
     initial_allocator = _allocator_sample()
     resident_bytes = baseline_allocator.active_bytes
-    classified_bytes = resident_bytes + _EXPERT_SLAB_BYTES
+    classified_bytes = resident_bytes + _EXPERT_RECORD_BYTES
     allocator_cache_bytes = max(
         initial_allocator.cache_bytes,
         initial_allocator.charged_footprint_bytes - classified_bytes,
@@ -191,7 +150,7 @@ def _runtime_harness(events: list[str]):
     initial_snapshot = BrokerSnapshot(
         resident_model_bytes=resident_bytes,
         kv_physical_bytes=0,
-        expert_slab_physical_bytes=_EXPERT_SLAB_BYTES,
+        expert_cache_physical_bytes=_EXPERT_RECORD_BYTES,
         in_flight_expert_staging_bytes=0,
         runtime_workspace_bytes=0,
         allocator_cache_bytes=allocator_cache_bytes,
@@ -199,33 +158,32 @@ def _runtime_harness(events: list[str]):
     operating_target = initial_snapshot.charged_bytes + _INITIAL_SLACK_BYTES
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=operating_target,
-            hard_ceiling_bytes=operating_target + 4 * 1024 * 1024,
+            memory_limit_bytes=operating_target,
         ),
         initial_snapshot=initial_snapshot,
         initial_allocator_sample=initial_allocator,
-        expert_slab_bytes=_EXPERT_SLAB_BYTES,
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ns=0,
+        expert_record_bytes=_EXPERT_RECORD_BYTES,
     )
 
     runtime = object.__new__(ExpertStreamingRuntime)
     runtime.memory_broker = broker
     runtime.slots = slots
     runtime._global_bank = _ExpertBank()
-    runtime.spec = SimpleNamespace(expert_record_bytes=_EXPERT_SLAB_BYTES)
+    runtime.spec = SimpleNamespace(expert_record_bytes=_EXPERT_RECORD_BYTES)
     runtime.plan = SimpleNamespace(persistent_slots=1)
-    runtime.config = SimpleNamespace(
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ms=0,
-    )
+    runtime.config = SimpleNamespace(expert_cache_limit_bytes=None)
     runtime._closed = False
     runtime._closing = False
     runtime._active_kv_growth_group = None
     runtime._layer_locks = {}
-    runtime._dynamic_resize_lock = threading.RLock()
+    runtime._dynamic_cache_lock = threading.Lock()
     runtime._memory_transaction_lock = _TrackingRLock()
-    runtime._dynamic_resize_metrics = {}
+    runtime._dynamic_cache_metrics = {
+        "record_allocations": 0,
+        "record_reuses": 0,
+        "record_evictions": 0,
+        "record_releases": 0,
+    }
     runtime._cleanup_error_lock = threading.Lock()
     runtime._cleanup_error = None
     runtime._pending_physical_kv_lock = threading.Lock()
@@ -318,10 +276,7 @@ def test_real_q4_group_reclaims_once_grows_by_exact_page_and_closes(
     initial_group = harness.groups[0]
     assert initial_group.completed is True
     assert 0 < initial_group.ticket.required_expert_reclaim_bytes
-    assert harness.slots.prepared == [
-        ((0,), initial_group.ticket.required_expert_reclaim_bytes)
-    ]
-    assert harness.slots.commit_calls == 1
+    assert harness.slots.release_calls == [(0,)]
     assert harness.runtime._global_bank.deactivated == [(0,)]
     assert events.index("expert-reclaim-complete") < events.index(
         "member-0-allocation-start"
@@ -359,7 +314,7 @@ def test_real_q4_group_reclaims_once_grows_by_exact_page_and_closes(
         2 * HY3_Q4_KV_BLOCK_BYTES // HY3_Q4_KV_LAYERS
     )
     assert growth_group.ticket.required_expert_reclaim_bytes == 0
-    assert harness.slots.commit_calls == 1
+    assert harness.slots.release_calls == [(0,)]
     assert all(entry.num_blocks == 2 for entry in cache)
     assert all(len(entry._kv_allocations) == 2 for entry in cache)
     _assert_exact_owner_handles(cache)
@@ -411,7 +366,7 @@ def test_real_q4_group_member_failure_preserves_releasable_partial_handles(
     group = harness.groups[0]
     assert group.aborted is True
     assert group.completed is False
-    assert harness.slots.commit_calls == 1
+    assert harness.slots.release_calls == [(0,)]
     committed = cache[:failed_index]
     uncommitted = cache[failed_index:]
     assert all(len(entry._kv_allocations) == 1 for entry in committed)

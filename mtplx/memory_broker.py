@@ -982,41 +982,56 @@ class UnifiedMemoryBroker:
                 raise MemoryTransactionError(
                     "expert reclaim was already confirmed for this ticket"
                 )
+            registered_before = self._pools.expert_cache_physical_bytes
+            registered_drop = registered_before - registered_after
+            registry_failure: str | None = None
+            if registered_drop < 0:
+                registry_failure = (
+                    "registered cache bytes increased during expert reclaim"
+                )
+            elif registered_drop % self._expert_record_bytes:
+                registry_failure = "registered cache reclaim is not record granular"
+            elif registered_after < self._pools.pinned_expert_bytes:
+                registry_failure = (
+                    "physical reclaim destroyed registered pinned expert bytes"
+                )
+            elif registered_drop < required:
+                registry_failure = (
+                    "registered cache reduction is smaller than requested "
+                    f"({registered_drop} observed, {required} required)"
+                )
             if allocator_before is None or allocator_after is None:
-                self._fail_pending(
+                reason = registry_failure or (
                     "allocator telemetry unavailable during expert reclaim"
                 )
-                raise MemoryTelemetryError(
-                    "allocator telemetry unavailable during expert reclaim"
-                )
+                self._retain_unproven_expert_reclaim(registered_after)
+                self._fail_pending(reason, pools_already_updated=True)
+                raise MemoryTelemetryError(reason)
             try:
                 self._validate_allocator_sample("allocator_before", allocator_before)
                 self._validate_allocator_sample("allocator_after", allocator_after)
             except (TypeError, ValueError) as exc:
-                self._fail_pending(f"invalid allocator telemetry: {exc}")
-                raise MemoryTelemetryError(
-                    f"invalid allocator telemetry: {exc}"
-                ) from exc
+                reason = registry_failure or f"invalid allocator telemetry: {exc}"
+                self._retain_unproven_expert_reclaim(registered_after)
+                self._fail_pending(reason, pools_already_updated=True)
+                raise MemoryTelemetryError(reason) from exc
             if (
                 self._allocator_residual_bytes(allocator_before)
                 > self._pools.allocator_cache_bytes
             ):
-                self._fail_pending(
+                reason = registry_failure or (
                     "allocator telemetry is stale relative to broker cache "
                     "during expert reclaim"
                 )
-                raise MemoryTelemetryError(
-                    "allocator telemetry is stale relative to broker cache "
-                    "during expert reclaim"
-                )
+                self._retain_unproven_expert_reclaim(registered_after)
+                self._fail_pending(reason, pools_already_updated=True)
+                raise MemoryTelemetryError(reason)
 
-            registered_before = self._pools.expert_cache_physical_bytes
-            registered_drop = registered_before - registered_after
             allocator_drop = (
                 allocator_before.charged_footprint_bytes
                 - allocator_after.charged_footprint_bytes
             )
-            failure: str | None = None
+            failure = registry_failure
             pinned_after = min(
                 self._pools.pinned_expert_bytes,
                 registered_after,
@@ -1025,18 +1040,7 @@ class UnifiedMemoryBroker:
                 self._pools.speculative_expert_bytes,
                 registered_after,
             )
-            if registered_drop < 0:
-                failure = "registered cache bytes increased during expert reclaim"
-            elif registered_drop % self._expert_record_bytes:
-                failure = "registered cache reclaim is not record granular"
-            elif registered_after < self._pools.pinned_expert_bytes:
-                failure = "physical reclaim destroyed registered pinned expert bytes"
-            elif registered_drop < required:
-                failure = (
-                    "registered cache reduction is smaller than requested "
-                    f"({registered_drop} observed, {required} required)"
-                )
-            elif allocator_drop < required:
+            if failure is None and allocator_drop < required:
                 failure = (
                     "allocator footprint did not fall with registered records "
                     f"({allocator_drop} observed, {required} required)"
@@ -1939,6 +1943,31 @@ class UnifiedMemoryBroker:
             - classified_bytes_after
         )
         return max(0, observed_cache_bytes_after, residual)
+
+    def _retain_unproven_expert_reclaim(self, registered_after: int) -> None:
+        """Publish registry truth while granting no unproven memory credit."""
+
+        registered_before = self._pools.expert_cache_physical_bytes
+        conservative_cache = self._conservative_cache_after_release(
+            classified_bytes_before=registered_before,
+            classified_bytes_after=registered_after,
+            cache_bytes_before=self._pools.allocator_cache_bytes,
+            observed_cache_bytes_after=self._pools.allocator_cache_bytes,
+            allocator_footprint_drop=0,
+        )
+        self._pools = replace(
+            self._pools,
+            expert_cache_physical_bytes=registered_after,
+            allocator_cache_bytes=conservative_cache,
+            pinned_expert_bytes=min(
+                self._pools.pinned_expert_bytes,
+                registered_after,
+            ),
+            speculative_expert_bytes=min(
+                self._pools.speculative_expert_bytes,
+                registered_after,
+            ),
+        )
 
     def _terminalize_ambiguous_kv_release(
         self,

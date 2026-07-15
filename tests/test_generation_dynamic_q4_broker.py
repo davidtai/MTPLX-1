@@ -253,11 +253,10 @@ def _runtime(
 def _broker() -> UnifiedMemoryBroker:
     return UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=100_000,
-            hard_ceiling_bytes=110_000,
+            memory_limit_bytes=100_000,
         ),
         initial_snapshot=BrokerSnapshot.synthetic(charged_bytes=0),
-        expert_slab_bytes=16,
+        expert_record_bytes=16,
     )
 
 
