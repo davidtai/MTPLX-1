@@ -1885,6 +1885,7 @@ def test_retained_q4_close_retry_does_not_deadlock_runtime_close_and_reserve() -
     runtime._close_lock = threading.Lock()
     runtime._closed = False
     runtime._closing = False
+    runtime._python_control_ledger = None
     runtime._cleanup_error_lock = threading.Lock()
     runtime._cleanup_error = None
     runtime._pending_physical_kv_lock = threading.Lock()
@@ -2045,6 +2046,7 @@ def test_runtime_close_waits_for_claimed_retained_q4_retry_to_settle() -> None:
     runtime._close_lock = threading.Lock()
     runtime._closed = False
     runtime._closing = False
+    runtime._python_control_ledger = None
     runtime._cleanup_error_lock = threading.Lock()
     runtime._cleanup_error = None
     runtime._pending_physical_kv_lock = threading.Lock()
@@ -2193,6 +2195,7 @@ def test_runtime_close_does_not_miss_q4_owner_retained_during_shutdown() -> None
     runtime._close_lock = threading.Lock()
     runtime._closed = False
     runtime._closing = False
+    runtime._python_control_ledger = None
     runtime._cleanup_error_lock = threading.Lock()
     runtime._cleanup_error = None
     runtime._pending_physical_kv_lock = threading.Lock()
@@ -2324,6 +2327,7 @@ def test_runtime_close_does_not_miss_q4_owner_retained_after_final_drain() -> No
     runtime._close_lock = threading.Lock()
     runtime._closed = False
     runtime._closing = False
+    runtime._python_control_ledger = None
     runtime._cleanup_error_lock = threading.Lock()
     runtime._cleanup_error = None
     runtime._pending_physical_kv_lock = threading.Lock()
@@ -2445,6 +2449,7 @@ def test_runtime_close_timeout_applies_to_owned_pending_q4_close() -> None:
     runtime._close_lock = threading.Lock()
     runtime._closed = False
     runtime._closing = False
+    runtime._python_control_ledger = None
     runtime._cleanup_error_lock = threading.Lock()
     runtime._cleanup_error = None
     runtime._pending_physical_kv_lock = threading.Lock()

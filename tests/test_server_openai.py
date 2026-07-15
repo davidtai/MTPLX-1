@@ -2831,18 +2831,21 @@ def test_health_exposes_enabled_hy3_q4_dynamic_memory_resource_snapshot(monkeypa
     state.args.paged_kv_quantization = "q4"
     state.runtime.expert_resource_telemetry_snapshot = lambda: {
         "dynamic_memory": {
-            "operating_target_bytes": 110 * 1024**3,
-            "hard_ceiling_bytes": 112 * 1024**3,
+            "memory_limit_bytes": 100 * 1024**3,
             "allocator_headroom_bytes": 1024**3,
-            "classified_target_bytes": 109 * 1024**3,
+            "classified_limit_bytes": 99 * 1024**3,
             "classified_bytes": 100 * 1024**3,
             "charged_bytes": 100 * 1024**3,
             "charged_residual_bytes": 10 * 1024**3,
             "logical_expert_records": 256,
+            "allocated_record_count": 224,
             "active_expert_records": 224,
             "resident_expert_records": 200,
-            "active_slab_count": 7,
-            "expert_slab_physical_bytes": 90 * 1024**3,
+            "expert_cache_physical_bytes": 90 * 1024**3,
+            "record_allocations": 240,
+            "record_reuses": 16,
+            "record_evictions": 12,
+            "record_releases": 4,
         },
         "memory_broker": {
             "resident_model_bytes": 5 * 1024**3,
@@ -2869,10 +2872,16 @@ def test_health_exposes_enabled_hy3_q4_dynamic_memory_resource_snapshot(monkeypa
     assert payload["kv_representation"] == "q4"
     assert payload["charged_bytes"] == 100 * 1024**3
     assert payload["allocator_headroom_bytes"] == 1024**3
-    assert payload["classified_target_bytes"] == 109 * 1024**3
+    assert payload["memory_limit_bytes"] == 100 * 1024**3
+    assert payload["classified_limit_bytes"] == 99 * 1024**3
     assert payload["classified_bytes"] == 100 * 1024**3
     assert payload["charged_residual_bytes"] == 10 * 1024**3
-    assert payload["expert_active_slabs"] == 7
+    assert payload["expert_allocated_records"] == 224
+    assert payload["expert_physical_bytes"] == 90 * 1024**3
+    assert payload["record_allocations"] == 240
+    assert payload["record_reuses"] == 16
+    assert payload["record_evictions"] == 12
+    assert payload["record_releases"] == 4
     assert payload["expert_cache_hit_rate"] == 0.9
     assert payload["process_rss_bytes"] is None
     assert payload["process_compressed_bytes"] is None

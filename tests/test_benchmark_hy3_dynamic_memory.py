@@ -24,11 +24,10 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     AllocatorSample,
     BenchmarkGateError,
     CacheStartState,
-    ProbeSlab,
     QwenIsolationHooks,
     balanced_campaign_schedule,
     canonical_sha256,
-    run_allocator_release_probe,
+    run_direct_cache_probe,
     run_balanced_campaign,
     run_exclusive_hardware_window,
     validate_allocator_probe,
@@ -93,25 +92,26 @@ def _identity(arm: str = "dynamic") -> dict[str, object]:
         "kv_quantization": "q4",
         "max_active_sequences": 1,
         "expert_streaming_config": {
-            "expert_slab_slots": 32,
             "allocator_headroom_bytes": 1024**3,
             "kv_bytes_per_token_override": 84_480,
-            "memory_limit_bytes": 110 * 1024**3,
+            "memory_limit_bytes": 100 * 1024**3,
             "max_live_kv_tokens": 131_072,
             "runtime_reserve_bytes": 8 * 1024**3,
             "transient_slots": 32,
+            "cache_policy": "lru",
             "cache_scope": "global",
-            "slot_layout": "component-banks",
-            "dynamic_expert_slabs": arm == "dynamic",
+            "slot_layout": "direct-slots",
+            "dynamic_expert_cache": arm == "dynamic",
+            "resource_telemetry": True,
         },
-        "planned_persistent_slots": 9_696 if arm == "dynamic" else 8_673,
+        "planned_persistent_slots": 8_673,
     }
     normalized_config = runner_module.normalize_arm_config(arm_config)
     return {
         "model_key": "hy3-q4",
         "model_artifact_id": "pipenetwork/Hy3-4bit@160619d3",
         "model_artifact_sha256": "a" * 64,
-        "expert_manifest_id": "hy3-q4/component-banks/manifest.json",
+        "expert_manifest_id": "hy3-q4/direct-slots/manifest.json",
         "expert_manifest_sha256": "b" * 64,
         "artifact_pins_sha256": "d" * 64,
         "artifact_stat_sha256": _ARTIFACT_STAT_SHA256,
@@ -154,7 +154,7 @@ def _production_lane_identity(arm: str) -> dict[str, object]:
         ),
         "expert_streaming_config": {
             "model_key": "hy3-q4",
-            "memory_limit_bytes": 110 * 1024**3,
+            "memory_limit_bytes": 100 * 1024**3,
             "max_live_kv_tokens": 131_072,
             "kv_bytes_per_token_override": 84_480,
             "runtime_reserve_bytes": 8 * 1024**3,
@@ -162,12 +162,11 @@ def _production_lane_identity(arm: str) -> dict[str, object]:
             "transient_slots": 32,
             "cache_policy": "lru",
             "cache_scope": "global",
-            "slot_layout": "component-banks",
-            "dynamic_expert_slabs": arm == "dynamic",
-            "expert_slab_slots": 32,
+            "slot_layout": "direct-slots",
+            "dynamic_expert_cache": arm == "dynamic",
+            "resource_telemetry": True,
         },
-        "planned_persistent_slots": 9_696 if arm == "dynamic" else 8_673,
-        "probe_slab_ids": [0, 1],
+        "planned_persistent_slots": 8_673,
     }
     return identity
 
@@ -269,25 +268,45 @@ def _point(
         cache,
         active_bytes + cache - expert - kv,
     )
+    python_control_cpu = {
+        category: {
+            f"{phase}_{metric}": (
+                1 if phase == "decode" and metric == "calls" else 0
+            )
+            for phase in ("decode", "prefill", "unscoped")
+            for metric in ("calls", "cpu_ns")
+        }
+        for category in (
+            "route_control",
+            "cache_policy",
+            "cache_budget",
+            "kv_broker",
+            "reader_thread",
+        )
+    }
+    python_control_cpu["inclusive_relationships"] = {
+        "cache_policy": "subset_of_route_control",
+        "reader_thread": "separate_worker",
+    }
+    python_control_cpu["clock"] = "thread_time_ns"
     return {
         "phase": phase,
         "monotonic_ns": timestamp_ns,
         "allocator_active_bytes": active_bytes,
         "allocator_cache_bytes": cache,
         "allocator_peak_bytes": expert + kv + cache,
-        "expert_slab_physical_bytes": expert,
+        "expert_cache_physical_bytes": expert,
         "kv_physical_bytes": kv,
         "kv_allocated_blocks": kv_blocks,
         "slot_health": health,
         "slot_health_sha256": _sha(health),
-        "operating_target_bytes": 110 * 1024**3,
-        "hard_ceiling_bytes": 112 * 1024**3,
+        "memory_limit_bytes": 100 * 1024**3,
         "allocator_headroom_bytes": 1024**3,
-        "classified_target_bytes": 109 * 1024**3,
+        "classified_limit_bytes": 99 * 1024**3,
         "classified_bytes": expert + kv,
         "charged_bytes": expert + kv + allocator_cache_charged_bytes,
         "charged_residual_bytes": (
-            110 * 1024**3 - expert - kv - allocator_cache_charged_bytes
+            100 * 1024**3 - expert - kv - allocator_cache_charged_bytes
         ),
         "resident_model_bytes": 0,
         "kv_representation": "q4",
@@ -295,32 +314,25 @@ def _point(
             kv_blocks * 16 if kv_logical_tokens is None else kv_logical_tokens
         ),
         "expert_logical_records": expert,
+        "expert_allocated_records": expert,
         "expert_active_records": expert,
         "expert_resident_records": expert,
-        "expert_logical_slabs": expert,
-        "expert_active_slabs": expert,
-        "expert_draining_slabs": 0,
-        "expert_released_slabs": 0,
+        "record_allocations": 0,
+        "record_reuses": 0,
+        "record_evictions": 0,
+        "record_releases": 0,
         "pinned_expert_bytes": 0,
         "inflight_expert_bytes": 0,
         "speculative_expert_bytes": 0,
         "runtime_workspace_bytes": 0,
         "inflight_expert_staging_bytes": 0,
-        "requested_reclaim_bytes": 0,
-        "reclaimed_bytes": 0,
-        "regrown_bytes": 0,
-        "evicted_expert_records": 0,
-        "evicted_expert_slabs": 0,
-        "resize_duration_ns": 0,
-        "total_resize_duration_ns": 0,
-        "max_resize_duration_ns": 0,
-        "blocked_by_pin_bytes": 0,
         "admission_failures": 0,
-        "resize_failures": 0,
         "allocator_cache_charged_bytes": allocator_cache_charged_bytes,
         "process_rss_bytes": active_bytes,
         "process_compressed_bytes": 0,
         "system_swap_delta_bytes": 0,
+        "gpu_utilization_percent": 20.0,
+        "python_control_cpu": python_control_cpu,
         "failed_closed": False,
         "failure_reason": None,
     }
@@ -385,7 +397,7 @@ def _observation(
                 kv_logical_tokens=context_tokens,
             ),
             _point("post_reset", 6_000_000_000, expert=600, kv_blocks=0),
-            _point("post_regrow", 7_000_000_000, expert=800, kv_blocks=0),
+            _point("post_record_rewarm", 7_000_000_000, expert=800, kv_blocks=0),
         ]
 
         def growth_ledger(point: Mapping[str, object]) -> dict[str, object]:
@@ -524,20 +536,17 @@ def _observation(
     }
 
 
-def _probe_result(*, released: int = 128, untouched_executable: bool = True):
+def _probe_result(*, released: int = 128, replacement_executable: bool = True):
     return {
-        "schema": "mtplx-hy3-allocator-release-probe-v1",
-        "manifest": {
-            "identity": _identity(),
-            "selected_slab_id": "slab-a",
-            "selected_registered_physical_bytes": 128,
-            "untouched_slab_id": "slab-b",
-            "allocated_slab_count": 2,
-            "slabs": [
-                {"slab_id": "slab-a", "registered_physical_bytes": 128},
-                {"slab_id": "slab-b", "registered_physical_bytes": 128},
-            ],
-        },
+        "schema": "mtplx-hy3-direct-cache-probe-v1",
+        "identity": _identity(),
+        "backend": "mlx-metal-direct-slots",
+        "startup_persistent_bytes": 0,
+        "first_record_allocated_bytes": 128,
+        "first_record_executable": True,
+        "replacement_buffer_identity_preserved": True,
+        "replacement_record_executable": replacement_executable,
+        "released_record_bytes": 128,
         "before_allocation": {
             "active_bytes": 700,
             "cache_bytes": 200,
@@ -553,7 +562,7 @@ def _probe_result(*, released: int = 128, untouched_executable: bool = True):
             "cache_bytes": 200,
             "peak_bytes": 1_200,
         },
-        "untouched_slab_executable": untouched_executable,
+        "allocator_charged_drop_bytes": released,
         "error": None,
     }
 
@@ -599,6 +608,23 @@ def test_context_matrix_and_schedule_balance_both_physical_orders() -> None:
 def test_schedule_rejects_an_unbalanced_repetition_count() -> None:
     with pytest.raises(ValueError, match="positive even"):
         balanced_campaign_schedule(repetitions=3)
+
+
+def test_schedule_allows_an_ordered_context_subset_for_staged_foreground_runs() -> None:
+    schedule = balanced_campaign_schedule(repetitions=2, contexts=(4_096,))
+
+    assert [(row.context_tokens, row.arm) for row in schedule] == [
+        (4_096, "static"),
+        (4_096, "dynamic"),
+        (4_096, "dynamic"),
+        (4_096, "static"),
+    ]
+
+
+@pytest.mark.parametrize("contexts", ((), (4_096, 4_096), (32_768, 4_096), (8_192,)))
+def test_schedule_rejects_invalid_context_subsets(contexts: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="ordered subset"):
+        balanced_campaign_schedule(repetitions=2, contexts=contexts)
 
 
 def test_observation_requires_declared_start_and_physical_ordering() -> None:
@@ -706,21 +732,21 @@ def test_observation_requires_exact_headroom_and_classified_limit() -> None:
     wrong_headroom = _observation("dynamic", 4096, 0, tok_s=12.0)
     point = wrong_headroom["timeline"][0]
     point["allocator_headroom_bytes"] = 0
-    point["classified_target_bytes"] = 110 * 1024**3
+    point["classified_limit_bytes"] = 100 * 1024**3
     with pytest.raises(BenchmarkGateError, match="exactly 1 GiB"):
         validate_campaign_observation(wrong_headroom)
 
     overclassified = _observation("dynamic", 4096, 0, tok_s=12.0)
     point = overclassified["timeline"][0]
-    delta = int(point["classified_target_bytes"]) + 1 - int(point["classified_bytes"])
-    point["expert_slab_physical_bytes"] += delta
+    delta = int(point["classified_limit_bytes"]) + 1 - int(point["classified_bytes"])
+    point["expert_cache_physical_bytes"] += delta
     point["allocator_active_bytes"] += delta
     point["allocator_peak_bytes"] += delta
     point["classified_bytes"] += delta
     point["charged_bytes"] += delta
     point["charged_residual_bytes"] -= delta
     point["process_rss_bytes"] += delta
-    with pytest.raises(BenchmarkGateError, match="exceeds the classified target"):
+    with pytest.raises(BenchmarkGateError, match="exceeds the classified limit"):
         validate_campaign_observation(overclassified)
 
     bad_start = _observation("dynamic", 4096, 0, tok_s=12.0)
@@ -739,7 +765,7 @@ def test_observation_requires_exact_headroom_and_classified_limit() -> None:
         )
 
 
-def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> None:
+def test_observation_requires_stable_hold_reset_rewarm_and_block_crossing() -> None:
     unstable = _observation("dynamic", 4096, 0, tok_s=12.0)
     unstable["timeline"][4]["allocator_cache_bytes"] = 1
     unstable["timeline"][4]["allocator_cache_charged_bytes"] = 1
@@ -749,8 +775,8 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
         validate_campaign_observation(unstable)
 
     unstable_resource = _observation("dynamic", 4096, 0, tok_s=12.0)
-    unstable_resource["timeline"][4]["requested_reclaim_bytes"] += 1
-    with pytest.raises(BenchmarkGateError, match="requested_reclaim_bytes"):
+    unstable_resource["timeline"][4]["record_allocations"] += 1
+    with pytest.raises(BenchmarkGateError, match="record_allocations"):
         validate_campaign_observation(unstable_resource)
 
     no_reset = _observation("dynamic", 4096, 0, tok_s=12.0)
@@ -758,10 +784,10 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     with pytest.raises(BenchmarkGateError, match="post_reset"):
         validate_campaign_observation(no_reset)
 
-    no_regrow = _observation("dynamic", 4096, 0, tok_s=12.0)
-    no_regrow["timeline"] = no_regrow["timeline"][:-1]
-    with pytest.raises(BenchmarkGateError, match="post_regrow"):
-        validate_campaign_observation(no_regrow)
+    no_rewarm = _observation("dynamic", 4096, 0, tok_s=12.0)
+    no_rewarm["timeline"] = no_rewarm["timeline"][:-1]
+    with pytest.raises(BenchmarkGateError, match="post_record_rewarm"):
+        validate_campaign_observation(no_rewarm)
 
     no_boundary = _observation("dynamic", 4096, 0, tok_s=12.0)
     no_boundary["cache_start_state"]["kv_blocks"] = 255
@@ -777,7 +803,7 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     no_boundary["timeline"][0]["charged_bytes"] = 800 + 255 * HY3_Q4_KV_BLOCK_BYTES
     no_boundary["timeline"][0]["classified_bytes"] = 800 + 255 * HY3_Q4_KV_BLOCK_BYTES
     no_boundary["timeline"][0]["charged_residual_bytes"] = (
-        110 * 1024**3 - 800 - 255 * HY3_Q4_KV_BLOCK_BYTES
+            100 * 1024**3 - 800 - 255 * HY3_Q4_KV_BLOCK_BYTES
     )
     no_boundary["timeline"][1]["kv_allocated_blocks"] = 255
     no_boundary["timeline"][1]["kv_physical_bytes"] = 255 * HY3_Q4_KV_BLOCK_BYTES
@@ -790,7 +816,7 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     no_boundary["timeline"][1]["charged_bytes"] = 600 + 255 * HY3_Q4_KV_BLOCK_BYTES
     no_boundary["timeline"][1]["classified_bytes"] = 600 + 255 * HY3_Q4_KV_BLOCK_BYTES
     no_boundary["timeline"][1]["charged_residual_bytes"] = (
-        110 * 1024**3 - 600 - 255 * HY3_Q4_KV_BLOCK_BYTES
+            100 * 1024**3 - 600 - 255 * HY3_Q4_KV_BLOCK_BYTES
     )
     no_boundary["timeline"][2]["kv_allocated_blocks"] = 256
     with pytest.raises(
@@ -907,17 +933,11 @@ def test_dynamic_observation_rejects_growth_ledger_logical_page_capacity(
         validate_campaign_observation(observation)
 
 
-def test_observation_rejects_hold_resize_churn_and_fixed_pool_drift() -> None:
+def test_observation_rejects_hold_physical_record_churn_and_fixed_pool_drift() -> None:
     churn = _observation("dynamic", 4096, 0, tok_s=12.0)
     cumulative_fields = (
-        "requested_reclaim_bytes",
-        "reclaimed_bytes",
-        "regrown_bytes",
-        "evicted_expert_slabs",
-        "resize_duration_ns",
-        "total_resize_duration_ns",
-        "max_resize_duration_ns",
-        "blocked_by_pin_bytes",
+        "record_allocations",
+        "record_releases",
     )
     for increment, point in enumerate(churn["timeline"][4:6], start=1):
         for field in cumulative_fields:
@@ -939,7 +959,7 @@ def test_observation_allows_ordinary_hold_record_eviction_churn() -> None:
     observation = _observation("dynamic", 4096, 0, tok_s=12.0)
     holds = [point for point in observation["timeline"] if point["phase"] == "hold"]
     for point, evictions in zip(holds, (3242, 4027, 4674), strict=True):
-        point["evicted_expert_records"] = evictions
+        point["record_evictions"] = evictions
 
     validated = validate_campaign_observation(observation)
 
@@ -993,9 +1013,9 @@ def test_observation_rejects_hold_record_eviction_counter_regression() -> None:
         if point["phase"] in {"hold_warmup", "hold"}
     ]
     for point, evictions in zip(hold_window, (3200, 3242, 3100, 4674), strict=True):
-        point["evicted_expert_records"] = evictions
+        point["record_evictions"] = evictions
 
-    with pytest.raises(BenchmarkGateError, match="evicted_expert_records.*decreased"):
+    with pytest.raises(BenchmarkGateError, match="record_evictions.*decreased"):
         validate_campaign_observation(observation)
 
 
@@ -1003,7 +1023,7 @@ def test_observation_rejects_hold_record_eviction_counter_regression() -> None:
     ("field", "value", "match"),
     (
         ("memory_limit_bytes", 1, "memory_limit_bytes"),
-        ("dynamic_expert_slabs", False, "contradicts"),
+        ("dynamic_expert_cache", False, "contradicts"),
     ),
 )
 def test_observation_identity_binds_the_resolved_runtime_lane(
@@ -1040,7 +1060,7 @@ def test_production_arm_interventions_normalize_to_one_paired_identity() -> None
     dynamic = validated_identities["dynamic"]
     assert static["arm_config"] != dynamic["arm_config"]
     assert static["arm_config"]["planned_persistent_slots"] == 8_673
-    assert dynamic["arm_config"]["planned_persistent_slots"] == 9_696
+    assert dynamic["arm_config"]["planned_persistent_slots"] == 8_673
     assert static["normalized_config"] == dynamic["normalized_config"]
     assert static["normalized_config_sha256"] == dynamic["normalized_config_sha256"]
 
@@ -1272,33 +1292,38 @@ def test_observation_rejects_unaccounted_two_tib_growth_allocator_footprint() ->
 
 
 @pytest.mark.parametrize("ledger_kind", ("charged", "classified", "transient"))
-def test_observation_growth_ledgers_stay_strictly_below_hard_ceiling(
+def test_observation_growth_ledgers_stay_within_the_configured_limit(
     ledger_kind: str,
 ) -> None:
     row = _observation("dynamic", 4096, 0, tok_s=12.0)
     gap = row["kv_growth_steps"][0]["reclaim_gap"]
-    hard_ceiling = 112 * 1024**3
+    memory_limit = 100 * 1024**3
     if ledger_kind == "charged":
-        gap["charged_bytes"] = hard_ceiling
-        gap["charged_residual_bytes"] = 110 * 1024**3 - hard_ceiling
-        gap["allocator_cache_charged_bytes"] = hard_ceiling - gap["classified_bytes"]
+        gap["charged_bytes"] = memory_limit + 1
+        gap["charged_residual_bytes"] = -1
+        gap["allocator_cache_charged_bytes"] = (
+            memory_limit + 1 - gap["classified_bytes"]
+        )
     elif ledger_kind == "classified":
-        increase = hard_ceiling - gap["classified_bytes"]
+        increase = gap["classified_limit_bytes"] + 1 - gap["classified_bytes"]
         gap["runtime_workspace_bytes"] += increase
-        gap["classified_bytes"] = hard_ceiling
+        gap["classified_bytes"] += increase
         gap["charged_bytes"] += increase
         gap["charged_residual_bytes"] -= increase
         gap["allocator_active_bytes"] += increase
         gap["allocator_peak_bytes"] += increase
     else:
-        gap["allocator_peak_bytes"] = hard_ceiling
+        gap["allocator_peak_bytes"] = memory_limit + 1
 
-    with pytest.raises(BenchmarkGateError, match=r"112 GiB|hard ceiling|classified"):
+    with pytest.raises(
+        BenchmarkGateError,
+        match=r"100 GiB|configured memory limit|classified limit",
+    ):
         validate_campaign_observation(row)
 
 
 def _adjust_growth_expert_ledger(ledger: dict[str, object], delta: int) -> None:
-    ledger["expert_slab_physical_bytes"] += delta
+    ledger["expert_cache_physical_bytes"] += delta
     ledger["allocator_active_bytes"] += delta
     ledger["allocator_peak_bytes"] += delta
     ledger["classified_bytes"] += delta
@@ -1356,7 +1381,7 @@ def test_observation_rejects_a_global_device_synchronization() -> None:
         validate_campaign_observation(row)
 
 
-def test_allocator_probe_requires_real_charged_release_and_untouched_execution() -> (
+def test_allocator_probe_requires_direct_record_release_and_replacement_execution() -> (
     None
 ):
     passed = validate_allocator_probe(_probe_result())
@@ -1365,11 +1390,11 @@ def test_allocator_probe_requires_real_charged_release_and_untouched_execution()
 
     with pytest.raises(BenchmarkGateError, match="charged allocator"):
         validate_allocator_probe(_probe_result(released=127))
-    with pytest.raises(BenchmarkGateError, match="untouched slab"):
-        validate_allocator_probe(_probe_result(untouched_executable=False))
+    with pytest.raises(BenchmarkGateError, match="replacement_record_executable"):
+        validate_allocator_probe(_probe_result(replacement_executable=False))
 
 
-def test_allocator_probe_samples_two_evaluated_slabs_and_releases_one() -> None:
+def test_allocator_probe_allocates_replaces_and_releases_one_direct_record() -> None:
     calls: list[object] = []
     samples = iter(
         (
@@ -1378,37 +1403,43 @@ def test_allocator_probe_samples_two_evaluated_slabs_and_releases_one() -> None:
             AllocatorSample(active_bytes=200, cache_bytes=20, peak_bytes=320),
         )
     )
-    slabs = (
-        ProbeSlab("slab-a", registered_physical_bytes=100),
-        ProbeSlab("slab-b", registered_physical_bytes=100),
-    )
-
-    result = run_allocator_release_probe(
+    result = run_direct_cache_probe(
         identity=_identity(),
-        allocate_slabs=lambda: calls.append("allocate") or slabs,
-        evaluate_slabs=lambda actual: calls.append(("evaluate", actual)),
+        backend="mlx-metal-direct-slots",
+        startup_persistent_bytes=0,
         sample_allocator=lambda: next(samples),
-        release_slab=lambda slab: calls.append(("release", slab.slab_id)),
-        execute_slab=lambda slab: calls.append(("execute", slab.slab_id)) or True,
+        allocate_first_record=lambda: calls.append("allocate") or 100,
+        execute_first_record=lambda: calls.append("execute-first") or True,
+        replace_record=lambda: calls.append("replace") or True,
+        execute_replacement_record=(
+            lambda: calls.append("execute-replacement") or True
+        ),
+        release_record=lambda: calls.append("release") or 100,
     )
 
     assert result["gate_passed"] is True
     assert calls == [
         "allocate",
-        ("evaluate", slabs),
-        ("release", "slab-a"),
-        ("execute", "slab-b"),
+        "execute-first",
+        "replace",
+        "execute-replacement",
+        "release",
     ]
 
 
 def test_allocator_probe_fails_closed_on_injected_errors() -> None:
-    result = run_allocator_release_probe(
+    result = run_direct_cache_probe(
         identity=_identity(),
-        allocate_slabs=lambda: (_ for _ in ()).throw(RuntimeError("injected")),
-        evaluate_slabs=lambda _slabs: None,
+        backend="mlx-metal-direct-slots",
+        startup_persistent_bytes=0,
         sample_allocator=lambda: AllocatorSample(0, 0, 0),
-        release_slab=lambda _slab: None,
-        execute_slab=lambda _slab: True,
+        allocate_first_record=lambda: (_ for _ in ()).throw(
+            RuntimeError("injected")
+        ),
+        execute_first_record=lambda: True,
+        replace_record=lambda: True,
+        execute_replacement_record=lambda: True,
+        release_record=lambda: 1,
     )
 
     assert result["gate_passed"] is False
@@ -1444,6 +1475,32 @@ def test_balanced_campaign_retains_raw_pairs_and_confidence_intervals() -> None:
         assert summary["dynamic_vs_static_tps_ratio"]["mean"] == pytest.approx(1.1)
         low, high = summary["dynamic_vs_static_tps_ratio"]["confidence_interval_95"]
         assert low <= 1.1 <= high
+
+
+def test_balanced_campaign_runs_only_the_selected_context_subset() -> None:
+    probe = validate_allocator_probe(_probe_result())
+    calls: list[tuple[str, int, int]] = []
+
+    def execute(arm: str, context_tokens: int, repetition: int) -> Mapping[str, object]:
+        calls.append((arm, context_tokens, repetition))
+        return _observation(
+            arm,
+            context_tokens,
+            repetition,
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+
+    result = run_balanced_campaign(
+        allocator_probe=probe,
+        execute_arm=execute,
+        repetitions=2,
+        contexts=(4_096,),
+        bootstrap_resamples=100,
+    )
+
+    assert result["contexts"] == [4_096]
+    assert set(result["paired_metrics_by_context"]) == {"4096"}
+    assert len(calls) == 4
 
 
 def test_subprocess_campaign_attests_artifact_after_every_arm() -> None:
@@ -2776,6 +2833,40 @@ def test_cli_plan_declares_exact_matrix_balanced_order_and_qwen_hooks(
         "dynamic",
         "static",
     ]
+    assert plan["execution_mode"] == "foreground-synchronous"
+    assert plan["background_workloads"] is False
+
+
+def test_cli_plan_selects_4k_before_any_hardware_or_lock_work(tmp_path: Path) -> None:
+    script = (
+        Path(__file__).resolve().parent.parent
+        / "benchmarks"
+        / "benchmark_hy3_dynamic_memory.py"
+    )
+    repo, spec_path = _tracked_cli_plan_repo(tmp_path)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--spec",
+            str(spec_path),
+            "--cwd",
+            str(repo),
+            "--contexts",
+            "4096",
+            "--plan-only",
+        ],
+        cwd=repo,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    plan = json.loads(completed.stdout)
+    assert plan["context_matrix_tokens"] == [4_096]
+    assert len(plan["schedule"]) == 4
 
 
 def test_cli_plan_rejects_a_decoy_command_shape(tmp_path: Path) -> None:

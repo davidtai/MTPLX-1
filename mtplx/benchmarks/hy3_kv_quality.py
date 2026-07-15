@@ -629,8 +629,6 @@ def build_quality_runtime_config(
     from mtplx.expert_runtime import ExpertStreamingConfig
 
     mode = _representation(representation)
-    if hardware_config.memory_limit_bytes != 110 * GIB:
-        raise QualityGateError("quality lane requires the 110 GiB operating target")
     if hardware_config.runtime_reserve_bytes != 8 * GIB:
         raise QualityGateError("quality lane requires the 8 GiB runtime reserve")
     if hardware_config.allocator_headroom_bytes != GIB:
@@ -646,11 +644,8 @@ def build_quality_runtime_config(
         transient_slots=hardware_config.transient_slots,
         cache_policy="lru",
         cache_scope="global",
-        slot_layout="component-banks",
-        dynamic_expert_slabs=mode == "q4_dynamic",
-        expert_slab_slots=hardware_config.expert_slab_slots,
-        expert_regrow_hysteresis_slabs=(hardware_config.expert_regrow_hysteresis_slabs),
-        expert_resize_min_interval_ms=hardware_config.expert_resize_min_interval_ms,
+        slot_layout="direct-slots",
+        dynamic_expert_cache=mode == "q4_dynamic",
         verify_sidecar_hash_at_open=False,
         verify_record_hashes=True,
         resource_telemetry=True,
@@ -1703,7 +1698,7 @@ def _validate_runtime_config_binding(
     value: object,
     *,
     representation: str,
-) -> tuple[tuple[int, int], bool, bool]:
+) -> tuple[tuple[int, int, int], bool, bool]:
     from mtplx.expert_runtime import ExpertStreamingConfig
     from mtplx.expert_streaming_models import HY3_Q4
 
@@ -1724,7 +1719,7 @@ def _validate_runtime_config_binding(
     except (TypeError, ValueError) as exc:
         raise QualityGateError(f"runtime config is invalid: {exc}") from exc
     plan = runtime_config.memory_plan(HY3_Q4)
-    summary = (
+    reported_summary = (
         _exact_int(
             rep_config.get("planned_persistent_slots"),
             field=f"{field}.planned_persistent_slots",
@@ -1736,8 +1731,12 @@ def _validate_runtime_config_binding(
             minimum=1,
         ),
     )
-    if summary != (int(plan.persistent_slots), int(plan.persistent_cache_bytes)):
+    if reported_summary != (
+        int(plan.persistent_slots),
+        int(plan.persistent_cache_bytes),
+    ):
         raise QualityGateError("runtime config memory plan contradicts its summary")
+    summary = (*reported_summary, int(runtime_config.memory_limit_bytes))
     if (
         _exact_int(
             rep_config.get("kv_bytes_per_token"),
@@ -1758,7 +1757,7 @@ def _validate_runtime_config_binding(
         raise QualityGateError("runtime config expert cap contradicts its summary")
     fixed_expert_passed = (
         runtime_config.model_key == "hy3-q4"
-        and runtime_config.memory_limit_bytes == 110 * GIB
+        and runtime_config.memory_limit_bytes > EXPERT_CACHE_LIMIT_BYTES
         and runtime_config.max_live_kv_tokens == max(QUALITY_CONTEXTS)
         and runtime_config.kv_bytes_per_token_override
         == _bytes_per_token(representation)
@@ -1767,8 +1766,8 @@ def _validate_runtime_config_binding(
         and runtime_config.expert_cache_limit_bytes == EXPERT_CACHE_LIMIT_BYTES
         and runtime_config.cache_policy == "lru"
         and runtime_config.cache_scope == "global"
-        and runtime_config.slot_layout == "component-banks"
-        and runtime_config.dynamic_expert_slabs is dynamic
+        and runtime_config.slot_layout == "direct-slots"
+        and runtime_config.dynamic_expert_cache is dynamic
         and runtime_config.verify_sidecar_hash_at_open is False
         and runtime_config.verify_record_hashes is True
         and runtime_config.resource_telemetry is True
@@ -1970,7 +1969,7 @@ def validate_quality_result(value: object) -> dict[str, object]:
     )
     if set(representation_configs) != set(_REPRESENTATIONS):
         raise QualityGateError("quality representations differ")
-    plan_identities: list[tuple[int, int]] = []
+    plan_identities: list[tuple[int, int, int]] = []
     fixed_config_results: list[bool] = []
     attention_config_results: list[bool] = []
     for representation in _REPRESENTATIONS:
@@ -1985,7 +1984,7 @@ def validate_quality_result(value: object) -> dict[str, object]:
         top_expert_cap == EXPERT_CACHE_LIMIT_BYTES
         and all(fixed_config_results)
         and len(plan_identities) == len(_REPRESENTATIONS)
-        and plan_identities[0] == plan_identities[1]
+        and len(set(plan_identities)) == 1
     )
 
     prompt_values = _sequence(result.get("prompts"), field="prompts")

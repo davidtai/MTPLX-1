@@ -80,29 +80,52 @@ def test_hy3_q4_dynamic_memory_flags_reach_runtime_config() -> None:
             "--model-key",
             "hy3-q4",
             "--memory-limit",
-            "110GiB",
+            "100GiB",
             "--max-live-kv-tokens",
             "131072",
             "--cache-scope",
             "global",
             "--slot-layout",
-            "component-banks",
+            "direct-slots",
             "--hy3-q4-dynamic-memory",
-            "--expert-slab-slots",
-            "64",
-            "--expert-regrow-hysteresis-slabs",
-            "2",
-            "--expert-resize-min-interval-ms",
-            "250",
         ]
     )
 
     config = module.build_expert_streaming_config(args, validated_manifest=None)
 
-    assert config.dynamic_expert_slabs is True
-    assert config.expert_slab_slots == 64
-    assert config.expert_regrow_hysteresis_slabs == 2
-    assert config.expert_resize_min_interval_ms == 250
+    assert config.dynamic_expert_cache is True
+    assert config.memory_limit_bytes == 100 * 1024**3
+    assert config.slot_layout == "direct-slots"
+    assert not hasattr(config, "dynamic_expert_slabs")
+    assert not hasattr(config, "expert_slab_slots")
+
+
+@pytest.mark.parametrize(
+    "removed_flag",
+    (
+        "--expert-slab-slots",
+        "--expert-regrow-hysteresis-slabs",
+        "--expert-resize-min-interval-ms",
+    ),
+)
+def test_grouped_dynamic_memory_flags_are_removed(removed_flag: str) -> None:
+    parser = _load_module().build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "/model",
+                "/manifest",
+                "--model-key",
+                "hy3-q4",
+                "--memory-limit",
+                "100GiB",
+                "--max-live-kv-tokens",
+                "131072",
+                removed_flag,
+                "1",
+            ]
+        )
 
 
 def test_packed_projection_layout_reports_requested_and_loaded_c2(

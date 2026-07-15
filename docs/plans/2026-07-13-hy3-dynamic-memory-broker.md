@@ -1,5 +1,10 @@
 # Hy3 Q4 Dynamic Unified-Memory Broker Implementation Plan
 
+> Superseded on 2026-07-15 by
+> `2026-07-15-hy3-demand-loaded-direct-pread-cache.md`. This file is retained
+> only as the record of the discarded grouped-allocation experiment; none of
+> its allocator shape, thresholds, or benchmark acceptance rules are current.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Keep the complete single-sequence Hy3 Q4 inference working set at or below a 110 GiB operating target and strictly below a 112 GiB hard unified-memory ceiling while preserving a fully attendable 131,072-token Q4 KV history and dynamically lending unused KV budget to physically releasable expert-cache slabs.

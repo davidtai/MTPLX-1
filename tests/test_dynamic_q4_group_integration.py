@@ -178,6 +178,7 @@ def _runtime_harness(events: list[str]):
     runtime._layer_locks = {}
     runtime._dynamic_cache_lock = threading.Lock()
     runtime._memory_transaction_lock = _TrackingRLock()
+    runtime._python_control_ledger = None
     runtime._dynamic_cache_metrics = {
         "record_allocations": 0,
         "record_reuses": 0,

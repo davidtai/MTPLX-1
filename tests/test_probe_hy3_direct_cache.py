@@ -11,13 +11,13 @@ import pytest
 _SCRIPT = (
     Path(__file__).resolve().parent.parent
     / "benchmarks"
-    / "probe_hy3_component_slabs.py"
+    / "probe_hy3_direct_cache.py"
 )
 
 
 def _load_module():
     spec = importlib.util.spec_from_file_location(
-        "probe_hy3_component_slabs",
+        "probe_hy3_direct_cache",
         _SCRIPT,
     )
     module = importlib.util.module_from_spec(spec)
@@ -25,15 +25,7 @@ def _load_module():
     return module
 
 
-class _Slot:
-    def __init__(self, sizes: tuple[int, ...]) -> None:
-        self.parts = tuple(bytearray(size) for size in sizes)
-
-    def record_views(self, _record):
-        return tuple(memoryview(part) for part in self.parts)
-
-
-def test_load_sidecar_record_copies_every_component_exactly(tmp_path: Path) -> None:
+def test_load_sidecar_record_copies_one_contiguous_record_exactly(tmp_path: Path) -> None:
     module = _load_module()
     (tmp_path / "experts.bin").write_bytes(b"prefix" + b"abcdefgh")
     manifest = SimpleNamespace(sidecar=SimpleNamespace(file="experts.bin"))
@@ -44,12 +36,11 @@ def test_load_sidecar_record_copies_every_component_exactly(tmp_path: Path) -> N
         sha256=hashlib.sha256(b"abcdefgh").hexdigest(),
         segments=(SimpleNamespace(length=3), SimpleNamespace(length=5)),
     )
-    slot = _Slot((3, 5))
+    buffer = bytearray(8)
 
-    module.load_sidecar_record(tmp_path, manifest, record, slot)
+    module.load_sidecar_record(tmp_path, manifest, record, buffer)
 
-    assert bytes(slot.parts[0]) == b"abc"
-    assert bytes(slot.parts[1]) == b"defgh"
+    assert bytes(buffer) == b"abcdefgh"
 
 
 def test_load_sidecar_record_rejects_payload_hash_mismatch(tmp_path: Path) -> None:
@@ -65,7 +56,7 @@ def test_load_sidecar_record_rejects_payload_hash_mismatch(tmp_path: Path) -> No
     )
 
     with pytest.raises(RuntimeError, match="record hash mismatch"):
-        module.load_sidecar_record(tmp_path, manifest, record, _Slot((8,)))
+        module.load_sidecar_record(tmp_path, manifest, record, bytearray(8))
 
 
 def test_load_sidecar_record_rejects_short_reads(tmp_path: Path) -> None:
@@ -81,7 +72,7 @@ def test_load_sidecar_record_rejects_short_reads(tmp_path: Path) -> None:
     )
 
     with pytest.raises(RuntimeError, match="short sidecar read"):
-        module.load_sidecar_record(tmp_path, manifest, record, _Slot((8,)))
+        module.load_sidecar_record(tmp_path, manifest, record, bytearray(8))
 
 
 def test_probe_artifact_attestation_hashes_payload_once_and_verifies_headers(
@@ -208,7 +199,11 @@ def test_probe_artifact_attestation_rejects_header_verification_failure(
 def test_probe_arm_config_pins_exact_full_history_q4_attention() -> None:
     module = _load_module()
     runtime_config = SimpleNamespace(
-        to_dict=lambda: {"expert_slab_slots": 32},
+        to_dict=lambda: {
+            "memory_limit_bytes": 100 * 1024**3,
+            "slot_layout": "direct-slots",
+            "dynamic_expert_cache": True,
+        },
     )
 
     arm_config = module._probe_arm_config(
@@ -219,9 +214,12 @@ def test_probe_arm_config_pins_exact_full_history_q4_attention() -> None:
     assert arm_config == {
         "dynamic_memory": True,
         "attention_runtime_env": dict(module.HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV),
-        "expert_streaming_config": {"expert_slab_slots": 32},
+        "expert_streaming_config": {
+            "memory_limit_bytes": 100 * 1024**3,
+            "slot_layout": "direct-slots",
+            "dynamic_expert_cache": True,
+        },
         "planned_persistent_slots": 9_792,
-        "probe_slab_ids": [0, 1],
     }
 
 
@@ -229,7 +227,10 @@ def test_probe_identity_hashes_exact_dynamic_and_normalized_configs() -> None:
     module = _load_module()
     arm_config = {
         "dynamic_memory": True,
-        "expert_slab_slots": 32,
+        "expert_streaming_config": {
+            "slot_layout": "direct-slots",
+            "dynamic_expert_cache": True,
+        },
         "total_context_tokens": 131_072,
     }
 
@@ -250,7 +251,7 @@ def test_probe_identity_hashes_exact_dynamic_and_normalized_configs() -> None:
     assert identity["resident_payload_bytes"] == 3
     assert identity["resident_payload_sha256"] == "f" * 64
     assert identity["normalized_config"] == {
-        "expert_slab_slots": 32,
+        "expert_streaming_config": {"slot_layout": "direct-slots"},
         "total_context_tokens": 131_072,
     }
     assert identity["arm_config_sha256"] == module.canonical_sha256(arm_config)

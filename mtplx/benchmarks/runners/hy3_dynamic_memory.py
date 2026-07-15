@@ -42,14 +42,15 @@ HY3_Q4_MAX_BLOCKS = hy3_q4_kv_physical_geometry(
 MIN_STABLE_HOLD_SAMPLES = 3
 MIN_STABLE_HOLD_DURATION_NS = 1_000_000_000
 MAX_STABLE_RAW_ALLOCATOR_CACHE_DRIFT_BYTES = 8 * 1024
-OPERATING_TARGET_BYTES = 110 * 1024**3
-HARD_CEILING_BYTES = 112 * 1024**3
+MEMORY_LIMIT_BYTES = 100 * 1024**3
+OPERATING_TARGET_BYTES = MEMORY_LIMIT_BYTES
 MAX_PROCESS_COMPRESSED_GROWTH_BYTES = 512 * 1024**2
-MAX_128K_PERFORMANCE_REGRESSION = 0.05
+MAX_4K_PERFORMANCE_REGRESSION = 0.20
+MIN_ACTIVE_GPU_UTILIZATION_PERCENT = 1.0
 DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS = 12 * 60 * 60
 DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS = 30
 SCHEMA_OBSERVATION = "mtplx-hy3-dynamic-memory-observation-v1"
-SCHEMA_PROBE = "mtplx-hy3-allocator-release-probe-v1"
+SCHEMA_PROBE = "mtplx-hy3-direct-cache-probe-v1"
 SCHEMA_CAMPAIGN = "mtplx-hy3-dynamic-memory-campaign-v1"
 SCHEMA_ARTIFACT_ATTESTATION = "mtplx-hy3-artifact-attestation-v1"
 SCHEMA_EXPERT_ROUTE_BINDING = "mtplx-hy3-expert-route-binding-v1"
@@ -73,37 +74,27 @@ _PROBE_BOUND_IDENTITY_FIELDS = (
 )
 
 ISSUE46_RESOURCE_INTEGER_FIELDS = (
-    "operating_target_bytes",
-    "hard_ceiling_bytes",
+    "memory_limit_bytes",
     "allocator_headroom_bytes",
-    "classified_target_bytes",
+    "classified_limit_bytes",
     "classified_bytes",
     "charged_bytes",
     "resident_model_bytes",
     "kv_logical_tokens",
     "expert_logical_records",
+    "expert_allocated_records",
     "expert_active_records",
     "expert_resident_records",
-    "expert_logical_slabs",
-    "expert_active_slabs",
-    "expert_draining_slabs",
-    "expert_released_slabs",
+    "record_allocations",
+    "record_reuses",
+    "record_evictions",
+    "record_releases",
     "pinned_expert_bytes",
     "inflight_expert_bytes",
     "speculative_expert_bytes",
     "runtime_workspace_bytes",
     "inflight_expert_staging_bytes",
-    "requested_reclaim_bytes",
-    "reclaimed_bytes",
-    "regrown_bytes",
-    "evicted_expert_records",
-    "evicted_expert_slabs",
-    "resize_duration_ns",
-    "total_resize_duration_ns",
-    "max_resize_duration_ns",
-    "blocked_by_pin_bytes",
     "admission_failures",
-    "resize_failures",
     "allocator_cache_charged_bytes",
     "process_rss_bytes",
     "process_compressed_bytes",
@@ -114,6 +105,8 @@ ISSUE46_RESOURCE_FIELDS = (
     *ISSUE46_RESOURCE_SIGNED_INTEGER_FIELDS,
     "system_swap_delta_bytes",
     "kv_representation",
+    "gpu_utilization_percent",
+    "python_control_cpu",
     "failed_closed",
     "failure_reason",
 )
@@ -161,7 +154,7 @@ def normalize_arm_config(value: Mapping[str, object]) -> dict[str, object]:
     raw_streaming = normalized.get("expert_streaming_config")
     if isinstance(raw_streaming, Mapping):
         streaming = dict(raw_streaming)
-        streaming.pop("dynamic_expert_slabs", None)
+        streaming.pop("dynamic_expert_cache", None)
         normalized["expert_streaming_config"] = streaming
     return normalized
 
@@ -444,22 +437,6 @@ class AllocatorSample:
 
 
 @dataclass(frozen=True)
-class ProbeSlab:
-    """A real, independently releasable component slab used by the probe."""
-
-    slab_id: str
-    registered_physical_bytes: int
-
-    def __post_init__(self) -> None:
-        _nonempty_string(self.slab_id, field="probe slab id")
-        _exact_int(
-            self.registered_physical_bytes,
-            field=f"probe slab {self.slab_id}.registered_physical_bytes",
-            minimum=1,
-        )
-
-
-@dataclass(frozen=True)
 class CacheStartState:
     """Declared physical KV state immediately before one arm observation."""
 
@@ -498,7 +475,7 @@ class MemoryTimelinePoint:
     allocator_active_bytes: int
     allocator_cache_bytes: int
     allocator_peak_bytes: int
-    expert_slab_physical_bytes: int
+    expert_cache_physical_bytes: int
     kv_physical_bytes: int
     kv_allocated_blocks: int
     slot_health: Mapping[str, int]
@@ -517,6 +494,15 @@ class MemoryTimelinePoint:
         index: int,
     ) -> MemoryTimelinePoint:
         prefix = f"timeline[{index}]"
+        grouped_fields = sorted(
+            str(field)
+            for field in value
+            if any(token in str(field).lower() for token in ("slab", "hysteresis"))
+        )
+        if grouped_fields:
+            raise BenchmarkGateError(
+                f"{prefix} contains grouped expert fields {grouped_fields}"
+            )
         _require_fields(
             value,
             (
@@ -525,7 +511,7 @@ class MemoryTimelinePoint:
                 "allocator_active_bytes",
                 "allocator_cache_bytes",
                 "allocator_peak_bytes",
-                "expert_slab_physical_bytes",
+                "expert_cache_physical_bytes",
                 "kv_physical_bytes",
                 "kv_allocated_blocks",
                 "slot_health",
@@ -577,6 +563,53 @@ class MemoryTimelinePoint:
         if representation != "q4":
             raise BenchmarkGateError(f"{prefix}.kv_representation must be q4")
         resource_evidence["kv_representation"] = representation
+        gpu_utilization = _finite_number(
+            value["gpu_utilization_percent"],
+            field=f"{prefix}.gpu_utilization_percent",
+        )
+        if not 0.0 <= gpu_utilization <= 100.0:
+            raise BenchmarkGateError(
+                f"{prefix}.gpu_utilization_percent must be between 0 and 100"
+            )
+        resource_evidence["gpu_utilization_percent"] = gpu_utilization
+        python_control = _mapping(
+            value["python_control_cpu"],
+            field=f"{prefix}.python_control_cpu",
+        )
+        for category in (
+            "route_control",
+            "cache_policy",
+            "cache_budget",
+            "kv_broker",
+            "reader_thread",
+        ):
+            category_values = _mapping(
+                python_control.get(category),
+                field=f"{prefix}.python_control_cpu.{category}",
+            )
+            for phase in ("decode", "prefill", "unscoped"):
+                for metric in ("calls", "cpu_ns"):
+                    field = f"{phase}_{metric}"
+                    _exact_int(
+                        category_values.get(field),
+                        field=f"{prefix}.python_control_cpu.{category}.{field}",
+                    )
+        if python_control.get("clock") != "thread_time_ns":
+            raise BenchmarkGateError(
+                f"{prefix}.python_control_cpu.clock must be thread_time_ns"
+            )
+        relationships = _mapping(
+            python_control.get("inclusive_relationships"),
+            field=f"{prefix}.python_control_cpu.inclusive_relationships",
+        )
+        if dict(relationships) != {
+            "cache_policy": "subset_of_route_control",
+            "reader_thread": "separate_worker",
+        }:
+            raise BenchmarkGateError(
+                f"{prefix}.python_control_cpu inclusive relationships drifted"
+            )
+        resource_evidence["python_control_cpu"] = dict(python_control)
         failed_closed = value["failed_closed"]
         if not isinstance(failed_closed, bool):
             raise BenchmarkGateError(f"{prefix}.failed_closed must be a boolean")
@@ -587,13 +620,9 @@ class MemoryTimelinePoint:
                 failure_reason, field=f"{prefix}.failure_reason"
             )
         resource_evidence["failure_reason"] = failure_reason
-        if resource_evidence["operating_target_bytes"] != OPERATING_TARGET_BYTES:
+        if resource_evidence["memory_limit_bytes"] != MEMORY_LIMIT_BYTES:
             raise BenchmarkGateError(
-                f"{prefix}.operating_target_bytes must be exactly 110 GiB"
-            )
-        if resource_evidence["hard_ceiling_bytes"] != HARD_CEILING_BYTES:
-            raise BenchmarkGateError(
-                f"{prefix}.hard_ceiling_bytes must be exactly 112 GiB"
+                f"{prefix}.memory_limit_bytes must be exactly 100 GiB"
             )
         if (
             resource_evidence["allocator_headroom_bytes"]
@@ -623,9 +652,9 @@ class MemoryTimelinePoint:
                 value["allocator_peak_bytes"],
                 field=f"{prefix}.allocator_peak_bytes",
             ),
-            expert_slab_physical_bytes=_exact_int(
-                value["expert_slab_physical_bytes"],
-                field=f"{prefix}.expert_slab_physical_bytes",
+            expert_cache_physical_bytes=_exact_int(
+                value["expert_cache_physical_bytes"],
+                field=f"{prefix}.expert_cache_physical_bytes",
             ),
             kv_physical_bytes=_exact_int(
                 value["kv_physical_bytes"], field=f"{prefix}.kv_physical_bytes"
@@ -650,7 +679,7 @@ class MemoryTimelinePoint:
         classified_bytes = (
             int(resource_evidence["resident_model_bytes"])
             + point.kv_physical_bytes
-            + point.expert_slab_physical_bytes
+            + point.expert_cache_physical_bytes
             + int(resource_evidence["inflight_expert_staging_bytes"])
             + int(resource_evidence["runtime_workspace_bytes"])
         )
@@ -658,16 +687,16 @@ class MemoryTimelinePoint:
             raise BenchmarkGateError(
                 f"{prefix}.classified_bytes does not match the five steady pools"
             )
-        if int(resource_evidence["classified_target_bytes"]) != (
-            int(resource_evidence["operating_target_bytes"])
+        if int(resource_evidence["classified_limit_bytes"]) != (
+            int(resource_evidence["memory_limit_bytes"])
             - int(resource_evidence["allocator_headroom_bytes"])
         ):
             raise BenchmarkGateError(
-                f"{prefix}.classified_target_bytes does not preserve allocator headroom"
+                f"{prefix}.classified_limit_bytes does not preserve allocator headroom"
             )
-        if classified_bytes > int(resource_evidence["classified_target_bytes"]):
+        if classified_bytes > int(resource_evidence["classified_limit_bytes"]):
             raise BenchmarkGateError(
-                f"{prefix}.classified_bytes exceeds the classified target"
+                f"{prefix}.classified_bytes exceeds the classified limit"
             )
         expected_charged = classified_bytes + int(
             resource_evidence["allocator_cache_charged_bytes"]
@@ -677,7 +706,7 @@ class MemoryTimelinePoint:
                 f"{prefix}.charged_bytes does not match the six-pool additive ledger"
             )
         if int(resource_evidence["charged_residual_bytes"]) != (
-            int(resource_evidence["operating_target_bytes"])
+            int(resource_evidence["memory_limit_bytes"])
             - int(resource_evidence["charged_bytes"])
         ):
             raise BenchmarkGateError(
@@ -754,9 +783,15 @@ def balanced_campaign_schedule(
     normalized_contexts = tuple(
         _exact_int(value, field="context_tokens", minimum=1) for value in contexts
     )
-    if normalized_contexts != CONTEXT_MATRIX_TOKENS:
+    expected_order = tuple(
+        context
+        for context in CONTEXT_MATRIX_TOKENS
+        if context in set(normalized_contexts)
+    )
+    if not normalized_contexts or normalized_contexts != expected_order:
         raise ValueError(
-            f"contexts must be the issue #46 matrix {CONTEXT_MATRIX_TOKENS}"
+            "contexts must be a nonempty ordered subset of the issue #46 matrix "
+            f"{CONTEXT_MATRIX_TOKENS}"
         )
     entries: list[CampaignScheduleEntry] = []
     for context_tokens in normalized_contexts:
@@ -921,14 +956,26 @@ def _validate_identity(
         != HY3_Q4_KV_BYTES_PER_TOKEN
     ):
         raise BenchmarkGateError(f"{context} must pin exact Q4 KV physical geometry")
+    grouped_fields = {
+        "dynamic_expert_slabs",
+        "expert_slab_slots",
+        "expert_regrow_hysteresis_slabs",
+        "expert_resize_min_interval_ms",
+    }
+    present_grouped = sorted(grouped_fields & set(streaming))
+    if present_grouped:
+        raise BenchmarkGateError(
+            f"{context}.arm_config contains grouped expert fields {present_grouped}"
+        )
     expected_streaming = {
-        "memory_limit_bytes": OPERATING_TARGET_BYTES,
+        "memory_limit_bytes": MEMORY_LIMIT_BYTES,
         "max_live_kv_tokens": HY3_Q4_TOTAL_CONTEXT_TOKENS,
         "runtime_reserve_bytes": 8 * 1024**3,
         "transient_slots": 32,
+        "cache_policy": "lru",
         "cache_scope": "global",
-        "slot_layout": "component-banks",
-        "expert_slab_slots": 32,
+        "slot_layout": "direct-slots",
+        "resource_telemetry": True,
     }
     for field, expected in expected_streaming.items():
         if streaming.get(field) != expected:
@@ -939,15 +986,15 @@ def _validate_identity(
     dynamic_memory = arm_config.get("dynamic_memory")
     if not isinstance(dynamic_memory, bool):
         raise BenchmarkGateError(f"{context}.arm_config.dynamic_memory must be boolean")
-    if streaming.get("dynamic_expert_slabs") is not dynamic_memory:
+    if streaming.get("dynamic_expert_cache") is not dynamic_memory:
         raise BenchmarkGateError(
             f"{context}.arm_config dynamic expert mode contradicts the selected arm"
         )
-    expected_slots = 9_696 if dynamic_memory else 8_673
-    if arm_config.get("planned_persistent_slots") != expected_slots:
-        raise BenchmarkGateError(
-            f"{context}.arm_config.planned_persistent_slots must be {expected_slots}"
-        )
+    _exact_int(
+        arm_config.get("planned_persistent_slots"),
+        field=f"{context}.arm_config.planned_persistent_slots",
+        minimum=1,
+    )
     return result
 
 
@@ -1040,7 +1087,7 @@ def _validate_timeline(
             "post-growth and hold logical KV tokens do not cover the requested context"
         )
     record_evictions = [
-        int(point.resource_evidence["evicted_expert_records"])
+        int(point.resource_evidence["record_evictions"])
         for point in (warmup, *holds)
     ]
     if any(
@@ -1048,12 +1095,12 @@ def _validate_timeline(
         for earlier, later in zip(record_evictions, record_evictions[1:], strict=False)
     ):
         raise BenchmarkGateError(
-            "evicted_expert_records decreased during the hold window: "
+            "record_evictions decreased during the hold window: "
             f"{record_evictions}"
         )
     stable_fields = (
         "allocator_active_bytes",
-        "expert_slab_physical_bytes",
+        "expert_cache_physical_bytes",
         "kv_physical_bytes",
         "kv_allocated_blocks",
         "slot_health_sha256",
@@ -1080,8 +1127,9 @@ def _validate_timeline(
             f"bookkeeping buffer: {allocator_cache_values}"
         )
     stable_resource_fields = (
+        "memory_limit_bytes",
         "allocator_headroom_bytes",
-        "classified_target_bytes",
+        "classified_limit_bytes",
         "classified_bytes",
         "charged_bytes",
         "charged_residual_bytes",
@@ -1089,16 +1137,9 @@ def _validate_timeline(
         "inflight_expert_staging_bytes",
         "runtime_workspace_bytes",
         "allocator_cache_charged_bytes",
-        "requested_reclaim_bytes",
-        "reclaimed_bytes",
-        "regrown_bytes",
-        # Ordinary record-level LRU churn is expected while physical slabs,
-        # charged bytes, and resize telemetry remain stable.
-        "evicted_expert_slabs",
-        "resize_duration_ns",
-        "total_resize_duration_ns",
-        "max_resize_duration_ns",
-        "blocked_by_pin_bytes",
+        "expert_allocated_records",
+        "record_allocations",
+        "record_releases",
     )
     resource_drift = {
         field: [point.resource_evidence[field] for point in holds]
@@ -1165,7 +1206,7 @@ def _validate_timeline(
             "dynamic arm must start from exactly one physical Q4 block"
         )
     reclaim = _phase_once(timeline, "post_expert_reclaim")
-    regrow = _phase_once(timeline, "post_regrow")
+    rewarm = _phase_once(timeline, "post_record_rewarm")
     for point in (pre, reclaim):
         if int(point.resource_evidence["kv_logical_tokens"]) != 1:
             raise BenchmarkGateError(
@@ -1180,7 +1221,7 @@ def _validate_timeline(
         raise BenchmarkGateError(
             "physical expert decrease must be observed before KV increase"
         )
-    if reclaim.expert_slab_physical_bytes >= pre.expert_slab_physical_bytes:
+    if reclaim.expert_cache_physical_bytes >= pre.expert_cache_physical_bytes:
         raise BenchmarkGateError(
             "physical expert decrease must be observed before KV increase"
         )
@@ -1192,7 +1233,7 @@ def _validate_timeline(
         raise BenchmarkGateError(
             "physical expert decrease must be observed before KV block allocation"
         )
-    expert_release = pre.expert_slab_physical_bytes - reclaim.expert_slab_physical_bytes
+    expert_release = pre.expert_cache_physical_bytes - reclaim.expert_cache_physical_bytes
     if pre.charged_allocator_bytes - reclaim.charged_allocator_bytes < expert_release:
         raise BenchmarkGateError(
             "expert registration fell without the same charged allocator release"
@@ -1201,8 +1242,10 @@ def _validate_timeline(
         raise BenchmarkGateError("post_kv_growth did not physically grow Q4 KV")
     if growth.kv_allocated_blocks <= reclaim.kv_allocated_blocks:
         raise BenchmarkGateError("post_kv_growth did not allocate Q4 KV blocks")
-    if growth.expert_slab_physical_bytes > reclaim.expert_slab_physical_bytes:
-        raise BenchmarkGateError("expert slabs regrew during the protected KV growth")
+    if growth.expert_cache_physical_bytes > reclaim.expert_cache_physical_bytes:
+        raise BenchmarkGateError(
+            "expert records reallocated during the protected KV growth"
+        )
     required_final_blocks = hy3_q4_kv_physical_geometry(context_tokens).physical_blocks
     if growth.kv_allocated_blocks != required_final_blocks:
         raise BenchmarkGateError(
@@ -1212,17 +1255,17 @@ def _validate_timeline(
         raise BenchmarkGateError(
             "dynamic growth did not cross multiple KV block boundaries"
         )
-    if not (reset.monotonic_ns < regrow.monotonic_ns):
-        raise BenchmarkGateError("post_regrow must follow post_reset")
-    if regrow.kv_physical_bytes != reset.kv_physical_bytes:
-        raise BenchmarkGateError("lazy expert regrow changed reset KV bytes")
-    if regrow.kv_allocated_blocks != reset.kv_allocated_blocks:
-        raise BenchmarkGateError("lazy expert regrow changed reset KV blocks")
-    if regrow.expert_slab_physical_bytes <= reset.expert_slab_physical_bytes:
+    if not (reset.monotonic_ns < rewarm.monotonic_ns):
+        raise BenchmarkGateError("post_record_rewarm must follow post_reset")
+    if rewarm.kv_physical_bytes != reset.kv_physical_bytes:
+        raise BenchmarkGateError("record rewarm changed reset KV bytes")
+    if rewarm.kv_allocated_blocks != reset.kv_allocated_blocks:
+        raise BenchmarkGateError("record rewarm changed reset KV blocks")
+    if rewarm.expert_cache_physical_bytes <= reset.expert_cache_physical_bytes:
         raise BenchmarkGateError(
-            "post_regrow did not physically restore expert capacity"
+            "post_record_rewarm did not allocate expert cache capacity"
         )
-    _assert_final_slot_health(regrow)
+    _assert_final_slot_health(rewarm)
 
 
 def _validate_kv_growth_steps(
@@ -1267,7 +1310,7 @@ def _validate_kv_growth_steps(
                 "allocator_active_bytes",
                 "allocator_cache_bytes",
                 "allocator_peak_bytes",
-                "expert_slab_physical_bytes",
+                "expert_cache_physical_bytes",
                 "kv_physical_bytes",
                 "kv_allocated_blocks",
                 "slot_health",
@@ -1296,17 +1339,18 @@ def _validate_kv_growth_steps(
             raise BenchmarkGateError(f"{field}: {exc}") from exc
         classified = int(point.resource_evidence["classified_bytes"])
         charged = int(point.resource_evidence["charged_bytes"])
-        hard_ceiling = int(point.resource_evidence["hard_ceiling_bytes"])
+        memory_limit = int(point.resource_evidence["memory_limit_bytes"])
+        classified_limit = int(point.resource_evidence["classified_limit_bytes"])
         transient = max(
             point.allocator_peak_bytes + point.allocator_cache_bytes,
             charged,
         )
-        if classified >= hard_ceiling:
-            raise BenchmarkGateError(f"{field} classified memory reached 112 GiB")
-        if charged >= hard_ceiling:
-            raise BenchmarkGateError(f"{field} charged memory reached 112 GiB")
-        if transient >= hard_ceiling:
-            raise BenchmarkGateError(f"{field} transient memory reached 112 GiB")
+        if classified > classified_limit:
+            raise BenchmarkGateError(f"{field} classified memory exceeded its limit")
+        if charged > memory_limit:
+            raise BenchmarkGateError(f"{field} charged memory exceeded 100 GiB")
+        if transient > memory_limit:
+            raise BenchmarkGateError(f"{field} transient memory exceeded 100 GiB")
         return point
 
     for index, raw_step in enumerate(raw_steps):
@@ -1386,7 +1430,7 @@ def _validate_kv_growth_steps(
         if prior_after is not None and any(
             getattr(before, name) != getattr(prior_after, name)
             for name in (
-                "expert_slab_physical_bytes",
+                "expert_cache_physical_bytes",
                 "kv_physical_bytes",
                 "kv_allocated_blocks",
             )
@@ -1397,16 +1441,18 @@ def _validate_kv_growth_steps(
             or reclaim.kv_allocated_blocks != before.kv_allocated_blocks
         ):
             raise BenchmarkGateError("KV rose before the reclaim gap was captured")
-        if reclaim.expert_slab_physical_bytes > before.expert_slab_physical_bytes:
-            raise BenchmarkGateError("expert slabs regrew inside KV growth")
+        if reclaim.expert_cache_physical_bytes > before.expert_cache_physical_bytes:
+            raise BenchmarkGateError("expert records reallocated inside KV growth")
         if after.kv_allocated_blocks != expected_blocks[index]:
             raise BenchmarkGateError("KV growth step missed its exact block target")
         if after.kv_physical_bytes <= before.kv_physical_bytes:
             raise BenchmarkGateError("KV growth step did not increase physical bytes")
-        if after.expert_slab_physical_bytes > reclaim.expert_slab_physical_bytes:
-            raise BenchmarkGateError("expert slabs regrew before KV growth committed")
+        if after.expert_cache_physical_bytes > reclaim.expert_cache_physical_bytes:
+            raise BenchmarkGateError(
+                "expert records reallocated before KV growth committed"
+            )
         reclaimed = (
-            before.expert_slab_physical_bytes - reclaim.expert_slab_physical_bytes
+            before.expert_cache_physical_bytes - reclaim.expert_cache_physical_bytes
         )
         kv_growth = after.kv_physical_bytes - before.kv_physical_bytes
         if (
@@ -1455,10 +1501,10 @@ def _validate_kv_growth_steps(
             )
         if (
             int(reclaim.resource_evidence["charged_bytes"]) + transient_delta
-            >= HARD_CEILING_BYTES
+            > int(reclaim.resource_evidence["memory_limit_bytes"])
         ):
             raise BenchmarkGateError(
-                "KV growth charged transient reached the 112 GiB hard ceiling"
+                "KV growth charged transient exceeded the configured memory limit"
             )
         normalized.append(dict(step))
         step_ledgers.append((before, reclaim, after))
@@ -1486,7 +1532,7 @@ def _validate_kv_growth_steps(
             "final growth ledger does not precede timeline post_kv_growth"
         )
     physical_fields = (
-        "expert_slab_physical_bytes",
+        "expert_cache_physical_bytes",
         "kv_physical_bytes",
         "kv_allocated_blocks",
     )
@@ -1914,17 +1960,24 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
 
 
 def validate_allocator_probe(value: Mapping[str, object]) -> dict[str, object]:
-    """Require registered slab bytes to disappear from active plus cache memory."""
+    """Require one direct record to allocate, replace in place, and release."""
 
     _require_fields(
         value,
         (
             "schema",
-            "manifest",
+            "identity",
+            "backend",
+            "startup_persistent_bytes",
+            "first_record_allocated_bytes",
+            "first_record_executable",
+            "replacement_buffer_identity_preserved",
+            "replacement_record_executable",
+            "released_record_bytes",
             "before_allocation",
             "before_release",
             "after_release",
-            "untouched_slab_executable",
+            "allocator_charged_drop_bytes",
             "error",
         ),
         context="allocator probe",
@@ -1933,80 +1986,44 @@ def validate_allocator_probe(value: Mapping[str, object]) -> dict[str, object]:
         raise BenchmarkGateError(f"allocator probe.schema must be {SCHEMA_PROBE}")
     if value["error"] is not None:
         raise BenchmarkGateError(f"allocator-release probe failed: {value['error']}")
-    manifest = _mapping(value["manifest"], field="allocator probe.manifest")
-    _require_fields(
-        manifest,
-        (
-            "identity",
-            "selected_slab_id",
-            "selected_registered_physical_bytes",
-            "untouched_slab_id",
-            "allocated_slab_count",
-            "slabs",
-        ),
-        context="allocator probe.manifest",
+    if any("slab" in str(field).lower() for field in value):
+        raise BenchmarkGateError("allocator probe contains grouped slab fields")
+    identity = _validate_identity(
+        _mapping(value["identity"], field="allocator probe.identity"),
+        context="allocator probe.identity",
     )
-    _validate_identity(
-        _mapping(manifest["identity"], field="allocator probe.manifest.identity"),
-        context="allocator probe.manifest.identity",
-    )
-    selected = _nonempty_string(
-        manifest["selected_slab_id"],
-        field="allocator probe.manifest.selected_slab_id",
-    )
-    untouched = _nonempty_string(
-        manifest["untouched_slab_id"],
-        field="allocator probe.manifest.untouched_slab_id",
-    )
-    if selected == untouched:
+    backend = _nonempty_string(value["backend"], field="allocator probe.backend")
+    if backend != "mlx-metal-direct-slots":
         raise BenchmarkGateError(
-            "allocator probe selected and untouched slab are identical"
+            "allocator probe.backend must be mlx-metal-direct-slots"
         )
-    slab_bytes = _exact_int(
-        manifest["selected_registered_physical_bytes"],
-        field="allocator probe.manifest.selected_registered_physical_bytes",
+    startup_bytes = _exact_int(
+        value["startup_persistent_bytes"],
+        field="allocator probe.startup_persistent_bytes",
+    )
+    if startup_bytes != 0:
+        raise BenchmarkGateError("allocator probe must start with no persistent bytes")
+    allocated_bytes = _exact_int(
+        value["first_record_allocated_bytes"],
+        field="allocator probe.first_record_allocated_bytes",
         minimum=1,
     )
-    if (
-        _exact_int(
-            manifest["allocated_slab_count"],
-            field="allocator probe.manifest.allocated_slab_count",
-        )
-        < 2
-    ):
-        raise BenchmarkGateError(
-            "allocator probe must allocate at least two real slabs"
-        )
-    raw_slabs = _sequence(manifest["slabs"], field="allocator probe.manifest.slabs")
-    slabs = tuple(
-        ProbeSlab(
-            slab_id=_nonempty_string(
-                _mapping(item, field=f"allocator probe.manifest.slabs[{index}]").get(
-                    "slab_id"
-                ),
-                field=f"allocator probe.manifest.slabs[{index}].slab_id",
-            ),
-            registered_physical_bytes=_exact_int(
-                _mapping(item, field=f"allocator probe.manifest.slabs[{index}]").get(
-                    "registered_physical_bytes"
-                ),
-                field=(
-                    f"allocator probe.manifest.slabs[{index}].registered_physical_bytes"
-                ),
-                minimum=1,
-            ),
-        )
-        for index, item in enumerate(raw_slabs)
+    released_bytes = _exact_int(
+        value["released_record_bytes"],
+        field="allocator probe.released_record_bytes",
+        minimum=1,
     )
-    if len(slabs) != manifest["allocated_slab_count"] or len(slabs) < 2:
-        raise BenchmarkGateError("allocator probe slab manifest count differs")
-    if len({slab.slab_id for slab in slabs}) != len(slabs):
-        raise BenchmarkGateError("allocator probe slab IDs must be unique")
-    slab_by_id = {slab.slab_id: slab for slab in slabs}
-    if selected not in slab_by_id or untouched not in slab_by_id:
-        raise BenchmarkGateError("allocator probe selected slab IDs are not manifested")
-    if slab_by_id[selected].registered_physical_bytes != slab_bytes:
-        raise BenchmarkGateError("allocator probe selected slab byte count drifted")
+    if released_bytes != allocated_bytes:
+        raise BenchmarkGateError(
+            "allocator probe released bytes differ from the allocated record"
+        )
+    for field in (
+        "first_record_executable",
+        "replacement_buffer_identity_preserved",
+        "replacement_record_executable",
+    ):
+        if value[field] is not True:
+            raise BenchmarkGateError(f"allocator probe.{field} must be true")
     before_allocation = AllocatorSample.from_mapping(
         _mapping(value["before_allocation"], field="allocator probe.before_allocation"),
         field="allocator probe.before_allocation",
@@ -2015,23 +2032,30 @@ def validate_allocator_probe(value: Mapping[str, object]) -> dict[str, object]:
         _mapping(value["before_release"], field="allocator probe.before_release"),
         field="allocator probe.before_release",
     )
-    registered_total = sum(slab.registered_physical_bytes for slab in slabs)
-    if before.charged_bytes - before_allocation.charged_bytes < registered_total:
+    if before.charged_bytes - before_allocation.charged_bytes < allocated_bytes:
         raise BenchmarkGateError(
-            "allocator probe allocation did not add all registered slab bytes"
+            "allocator probe allocation did not add the direct record bytes"
         )
     after = AllocatorSample.from_mapping(
         _mapping(value["after_release"], field="allocator probe.after_release"),
         field="allocator probe.after_release",
     )
     charged_release = before.charged_bytes - after.charged_bytes
-    if charged_release < slab_bytes:
+    reported_release = _exact_int(
+        value["allocator_charged_drop_bytes"],
+        field="allocator probe.allocator_charged_drop_bytes",
+    )
+    if reported_release != charged_release:
         raise BenchmarkGateError(
-            "charged allocator bytes did not fall by the selected registered slab bytes"
+            "allocator probe charged-drop evidence differs from allocator samples"
         )
-    if value["untouched_slab_executable"] is not True:
-        raise BenchmarkGateError("allocator probe untouched slab is not executable")
+    if charged_release < released_bytes:
+        raise BenchmarkGateError(
+            "charged allocator bytes did not fall by the released direct record"
+        )
     result = dict(value)
+    result["identity"] = identity
+    result["backend"] = backend
     result["charged_release_bytes"] = charged_release
     result["gate_passed"] = True
     return result
@@ -2202,55 +2226,52 @@ def _validate_artifact_attestation(value: Mapping[str, object]) -> dict[str, obj
     }
 
 
-def run_allocator_release_probe(
+def run_direct_cache_probe(
     *,
     identity: Mapping[str, object],
-    allocate_slabs: Callable[[], Sequence[ProbeSlab]],
-    evaluate_slabs: Callable[[Sequence[ProbeSlab]], None],
+    backend: str,
+    startup_persistent_bytes: int,
     sample_allocator: Callable[[], AllocatorSample],
-    release_slab: Callable[[ProbeSlab], None],
-    execute_slab: Callable[[ProbeSlab], bool],
+    allocate_first_record: Callable[[], int],
+    execute_first_record: Callable[[], bool],
+    replace_record: Callable[[], bool],
+    execute_replacement_record: Callable[[], bool],
+    release_record: Callable[[], int],
 ) -> dict[str, object]:
-    """Run the focused two-slab physical-release gate and emit JSON-safe evidence."""
+    """Run one exact direct-record allocation, replacement, and release gate."""
 
     validated_identity = _validate_identity(identity, context="probe identity")
     result: dict[str, object] = {
         "schema": SCHEMA_PROBE,
-        "manifest": {"identity": validated_identity},
+        "identity": validated_identity,
+        "backend": backend,
+        "startup_persistent_bytes": startup_persistent_bytes,
         "gate_passed": False,
         "error": None,
     }
     try:
         before_allocation = sample_allocator()
-        slabs = tuple(allocate_slabs())
-        if len(slabs) < 2:
-            raise BenchmarkGateError(
-                "allocator probe must allocate at least two real slabs"
-            )
-        if len({slab.slab_id for slab in slabs}) != len(slabs):
-            raise BenchmarkGateError("allocator probe slab IDs must be unique")
-        evaluate_slabs(slabs)
+        allocated_bytes = allocate_first_record()
+        first_record_executable = execute_first_record() is True
+        replacement_identity_preserved = replace_record() is True
+        replacement_record_executable = execute_replacement_record() is True
         before_release = sample_allocator()
-        selected, untouched = slabs[:2]
-        release_slab(selected)
+        released_bytes = release_record()
         after_release = sample_allocator()
-        untouched_executable = execute_slab(untouched) is True
+        charged_drop = before_release.charged_bytes - after_release.charged_bytes
         result.update(
             {
-                "manifest": {
-                    "identity": validated_identity,
-                    "selected_slab_id": selected.slab_id,
-                    "selected_registered_physical_bytes": (
-                        selected.registered_physical_bytes
-                    ),
-                    "untouched_slab_id": untouched.slab_id,
-                    "allocated_slab_count": len(slabs),
-                    "slabs": [asdict(slab) for slab in slabs],
-                },
+                "first_record_allocated_bytes": allocated_bytes,
+                "first_record_executable": first_record_executable,
+                "replacement_buffer_identity_preserved": (
+                    replacement_identity_preserved
+                ),
+                "replacement_record_executable": replacement_record_executable,
+                "released_record_bytes": released_bytes,
                 "before_allocation": asdict(before_allocation),
                 "before_release": asdict(before_release),
                 "after_release": asdict(after_release),
-                "untouched_slab_executable": untouched_executable,
+                "allocator_charged_drop_bytes": charged_drop,
             }
         )
         return validate_allocator_probe(result)
@@ -2326,36 +2347,7 @@ def _hold_expert_physical_bytes(observation: CampaignObservation) -> int:
     holds = [point for point in observation.timeline if point.phase == "hold"]
     if not holds:
         raise BenchmarkGateError("observation has no stable hold timeline")
-    return holds[0].expert_slab_physical_bytes
-
-
-def _hold_expert_slab_bytes(observation: CampaignObservation) -> int:
-    holds = [point for point in observation.timeline if point.phase == "hold"]
-    if not holds:
-        raise BenchmarkGateError("observation has no stable hold timeline")
-    point = holds[0]
-    active_records = int(point.resource_evidence["expert_active_records"])
-    if active_records <= 0:
-        raise BenchmarkGateError("stable hold has no active expert record telemetry")
-    physical_bytes = point.expert_slab_physical_bytes
-    record_bytes, remainder = divmod(physical_bytes, active_records)
-    if record_bytes <= 0 or remainder:
-        raise BenchmarkGateError(
-            "stable hold expert bytes do not divide into active physical records"
-        )
-    arm_config = _mapping(
-        observation.identity["arm_config"], field="observation.identity.arm_config"
-    )
-    streaming = _mapping(
-        arm_config.get("expert_streaming_config"),
-        field="observation.identity.arm_config.expert_streaming_config",
-    )
-    slab_slots = _exact_int(
-        streaming.get("expert_slab_slots"),
-        field="expert_streaming_config.expert_slab_slots",
-        minimum=1,
-    )
-    return slab_slots * record_bytes
+    return holds[0].expert_cache_physical_bytes
 
 
 def _campaign_acceptance_reasons(
@@ -2368,10 +2360,10 @@ def _campaign_acceptance_reasons(
     for key, observation in validated.items():
         context_tokens, repetition, arm = key
         prefix = f"{context_tokens}/{repetition}/{arm}"
-        if int(observation.metrics["peak_charged_bytes"]) > OPERATING_TARGET_BYTES:
-            reasons.append(f"{prefix}: normal charged memory exceeded 110 GiB")
-        if int(observation.metrics["stress_peak_charged_bytes"]) >= HARD_CEILING_BYTES:
-            reasons.append(f"{prefix}: stress charged memory reached 112 GiB")
+        if int(observation.metrics["peak_charged_bytes"]) > MEMORY_LIMIT_BYTES:
+            reasons.append(f"{prefix}: charged memory exceeded 100 GiB")
+        if int(observation.metrics["stress_peak_charged_bytes"]) > MEMORY_LIMIT_BYTES:
+            reasons.append(f"{prefix}: transient memory exceeded 100 GiB")
         compressed = [
             int(point.resource_evidence["process_compressed_bytes"])
             for point in observation.timeline
@@ -2381,12 +2373,12 @@ def _campaign_acceptance_reasons(
         for point in observation.timeline:
             resource = point.resource_evidence
             if int(resource["classified_bytes"]) > int(
-                resource["classified_target_bytes"]
+                resource["classified_limit_bytes"]
             ):
-                reasons.append(f"{prefix}: classified memory exceeded 109 GiB")
+                reasons.append(f"{prefix}: classified memory exceeded its limit")
                 break
-            if int(resource["charged_bytes"]) > OPERATING_TARGET_BYTES:
-                reasons.append(f"{prefix}: sampled charged memory exceeded 110 GiB")
+            if int(resource["charged_bytes"]) > MEMORY_LIMIT_BYTES:
+                reasons.append(f"{prefix}: sampled charged memory exceeded 100 GiB")
                 break
             if int(resource["system_swap_delta_bytes"]) > 0:
                 reasons.append(f"{prefix}: system swap grew during the arm")
@@ -2397,12 +2389,16 @@ def _campaign_acceptance_reasons(
             if int(resource["admission_failures"]) > 0:
                 reasons.append(f"{prefix}: request admission failed")
                 break
-            if int(resource["resize_failures"]) > 0:
-                reasons.append(f"{prefix}: expert resize failed")
-                break
+        holds = [point for point in observation.timeline if point.phase == "hold"]
+        if not holds or max(
+            float(point.resource_evidence["gpu_utilization_percent"])
+            for point in holds
+        ) < MIN_ACTIVE_GPU_UTILIZATION_PERCENT:
+            reasons.append(f"{prefix}: GPU activity stalled during decode")
 
-    for context_tokens in CONTEXT_MATRIX_TOKENS:
-        summary = summaries[str(context_tokens)]
+    del summaries
+    contexts = sorted({context_tokens for context_tokens, _rep, _arm in validated})
+    for context_tokens in contexts:
         for repetition in range(repetitions):
             static = validated[(context_tokens, repetition, "static")]
             dynamic = validated[(context_tokens, repetition, "dynamic")]
@@ -2423,89 +2419,19 @@ def _campaign_acceptance_reasons(
                 reasons.append(
                     f"{context_tokens}/{repetition}: paired fixed physical pools differ"
                 )
-        if context_tokens < HY3_Q4_TOTAL_CONTEXT_TOKENS:
+        if context_tokens == 4_096:
             for repetition in range(repetitions):
                 static = validated[(context_tokens, repetition, "static")]
                 dynamic = validated[(context_tokens, repetition, "dynamic")]
-                if _hold_expert_physical_bytes(dynamic) <= _hold_expert_physical_bytes(
-                    static
-                ):
+                static_perf = _hold_performance_means(static)
+                dynamic_perf = _hold_performance_means(dynamic)
+                if dynamic_perf["tokens_per_second"] < (
+                    1.0 - MAX_4K_PERFORMANCE_REGRESSION
+                ) * static_perf["tokens_per_second"]:
                     reasons.append(
-                        f"{context_tokens}/{repetition}: dynamic expert capacity "
-                        "did not exceed the static control"
+                        f"{context_tokens}/{repetition}: candidate decode throughput "
+                        "regressed by more than 20%"
                     )
-            hit_summary = _mapping(
-                summary["dynamic_minus_static_expert_hit_rate"],
-                field="expert hit-rate summary",
-            )
-            hit_interval = _sequence(
-                hit_summary["confidence_interval_95"],
-                field="expert hit-rate confidence interval",
-            )
-            ssd_interval = _sequence(
-                _mapping(
-                    summary["dynamic_minus_static_ssd_bytes_per_token"],
-                    field="SSD summary",
-                )["confidence_interval_95"],
-                field="SSD confidence interval",
-            )
-            tps_interval = _sequence(
-                _mapping(
-                    summary["dynamic_vs_static_tps_ratio"],
-                    field="TPS summary",
-                )["confidence_interval_95"],
-                field="TPS confidence interval",
-            )
-            measurable = (
-                float(hit_interval[0]) > 0.0
-                or float(ssd_interval[1]) < 0.0
-                or float(tps_interval[0]) > 1.0
-            )
-            if not measurable:
-                reasons.append(
-                    f"{context_tokens}: extra expert capacity produced no "
-                    "measurable hit-rate, SSD, or TPS improvement"
-                )
-            continue
-
-        for repetition in range(repetitions):
-            static = validated[(context_tokens, repetition, "static")]
-            dynamic = validated[(context_tokens, repetition, "dynamic")]
-            capacity_delta = abs(
-                _hold_expert_physical_bytes(dynamic)
-                - _hold_expert_physical_bytes(static)
-            )
-            slab_tolerance = min(
-                _hold_expert_slab_bytes(static),
-                _hold_expert_slab_bytes(dynamic),
-            )
-            if capacity_delta >= slab_tolerance:
-                reasons.append(
-                    f"{context_tokens}/{repetition}: expert capacity did not "
-                    "converge to the static control"
-                )
-            static_perf = _hold_performance_means(static)
-            dynamic_perf = _hold_performance_means(dynamic)
-            if (
-                dynamic_perf["tokens_per_second"]
-                < (1.0 - MAX_128K_PERFORMANCE_REGRESSION)
-                * static_perf["tokens_per_second"]
-                or dynamic_perf["p50_token_latency_ms"]
-                > (1.0 + MAX_128K_PERFORMANCE_REGRESSION)
-                * static_perf["p50_token_latency_ms"]
-                or dynamic_perf["p95_token_latency_ms"]
-                > (1.0 + MAX_128K_PERFORMANCE_REGRESSION)
-                * static_perf["p95_token_latency_ms"]
-                or dynamic_perf["expert_hit_rate"]
-                < static_perf["expert_hit_rate"] - MAX_128K_PERFORMANCE_REGRESSION
-                or dynamic_perf["ssd_bytes_per_token"]
-                > (1.0 + MAX_128K_PERFORMANCE_REGRESSION)
-                * static_perf["ssd_bytes_per_token"]
-            ):
-                reasons.append(
-                    f"{context_tokens}/{repetition}: stable 128K decode performance "
-                    "regressed by more than 5%"
-                )
     return list(dict.fromkeys(reasons))
 
 
@@ -2612,22 +2538,16 @@ def run_balanced_campaign(
     bootstrap_resamples: int = 10_000,
     bootstrap_seed: int = 46,
 ) -> dict[str, object]:
-    """Run the exact issue #46 matrix only after the allocator probe passes."""
+    """Run a selected issue #46 matrix subset after the allocator probe passes."""
 
     if allocator_probe.get("gate_passed") is not True:
         raise BenchmarkGateError(
             "allocator-release probe did not pass; refusing the full campaign"
         )
     validated_probe = validate_allocator_probe(allocator_probe)
-    probe_manifest = _mapping(
-        validated_probe["manifest"], field="allocator probe.manifest"
-    )
     probe_identity = _validate_identity(
-        _mapping(
-            probe_manifest["identity"],
-            field="allocator probe.manifest.identity",
-        ),
-        context="allocator probe.manifest.identity",
+        _mapping(validated_probe["identity"], field="allocator probe.identity"),
+        context="allocator probe.identity",
     )
     schedule = balanced_campaign_schedule(
         repetitions=repetitions,
@@ -2658,7 +2578,8 @@ def run_balanced_campaign(
 
     paired_samples: list[dict[str, object]] = []
     summaries: dict[str, dict[str, object]] = {}
-    for context_index, context_tokens in enumerate(CONTEXT_MATRIX_TOKENS):
+    normalized_contexts = tuple(entry for entry in contexts)
+    for context_index, context_tokens in enumerate(normalized_contexts):
         context_pairs: list[dict[str, object]] = []
         paired_metrics: dict[str, list[float]] = {
             "dynamic_vs_static_tps_ratio": [],
@@ -2724,10 +2645,10 @@ def run_balanced_campaign(
                     dynamic_performance["p95_token_latency_ms"]
                     - static_performance["p95_token_latency_ms"]
                 ),
-                "static_expert_slab_physical_bytes": (
+                "static_expert_cache_physical_bytes": (
                     _hold_expert_physical_bytes(static)
                 ),
-                "dynamic_expert_slab_physical_bytes": (
+                "dynamic_expert_cache_physical_bytes": (
                     _hold_expert_physical_bytes(dynamic)
                 ),
                 "static_peak_charged_bytes": static.metrics["peak_charged_bytes"],
@@ -2763,16 +2684,18 @@ def run_balanced_campaign(
         "acceptance": {
             "passed": not rejection_reasons,
             "rejection_reasons": rejection_reasons,
-            "operating_target_bytes": OPERATING_TARGET_BYTES,
-            "hard_ceiling_bytes": HARD_CEILING_BYTES,
+            "memory_limit_bytes": MEMORY_LIMIT_BYTES,
             "max_process_compressed_growth_bytes": (
                 MAX_PROCESS_COMPRESSED_GROWTH_BYTES
             ),
-            "max_128k_performance_regression": (MAX_128K_PERFORMANCE_REGRESSION),
+            "max_4k_performance_regression": MAX_4K_PERFORMANCE_REGRESSION,
+            "minimum_gpu_utilization_percent": (
+                MIN_ACTIVE_GPU_UTILIZATION_PERCENT
+            ),
             "quality_gate_issue": 43,
             "quality_gate_status": "required-separately",
         },
-        "contexts": list(CONTEXT_MATRIX_TOKENS),
+        "contexts": list(contexts),
         "repetitions": repetitions,
         "physical_arm_order": [entry.arm for entry in schedule],
         "allocator_release_probe": validated_probe,
@@ -3124,6 +3047,7 @@ def run_subprocess_campaign(
     artifact_verify_command: Sequence[str],
     arm_command_template: Sequence[str],
     repetitions: int,
+    contexts: Sequence[int] = CONTEXT_MATRIX_TOKENS,
     quality_command: Sequence[str] | None = None,
     cwd: Path | str | None = None,
     command_runner: Callable[[Sequence[str]], Mapping[str, object]] | None = None,
@@ -3146,14 +3070,8 @@ def run_subprocess_campaign(
     )
     probe = validate_allocator_probe(runner(probe_command))
     probe_identity = _validate_identity(
-        _mapping(
-            _mapping(
-                probe["manifest"],
-                field="allocator probe.manifest",
-            )["identity"],
-            field="allocator probe.manifest.identity",
-        ),
-        context="allocator probe.manifest.identity",
+        _mapping(probe["identity"], field="allocator probe.identity"),
+        context="allocator probe.identity",
     )
 
     def execute(arm: str, context_tokens: int, repetition: int) -> Mapping[str, object]:
@@ -3170,6 +3088,7 @@ def run_subprocess_campaign(
         allocator_probe=probe,
         execute_arm=execute,
         repetitions=repetitions,
+        contexts=contexts,
         bootstrap_resamples=bootstrap_resamples,
         bootstrap_seed=bootstrap_seed,
     )
@@ -3269,13 +3188,12 @@ __all__ = [
     "CacheStartState",
     "CampaignObservation",
     "CampaignScheduleEntry",
-    "ProbeSlab",
     "QwenIsolationHooks",
     "balanced_campaign_schedule",
     "canonical_sha256",
     "format_arm_command",
     "normalize_arm_config",
-    "run_allocator_release_probe",
+    "run_direct_cache_probe",
     "run_balanced_campaign",
     "run_exclusive_hardware_window",
     "run_json_subprocess",

@@ -1,6 +1,6 @@
 # Hy3 Demand-Loaded Direct-Pread Cache Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development (recommended) or superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development (recommended) or superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (- [x]) syntax for tracking.
 
 **Goal:** Replace issue 46's eager grouped expert storage with a machine-configurable, demand-loaded direct-pread cache that evicts individual experts to keep Hy3 Q4 under its unified-memory limit, while measuring Python control-plane CPU cost.
 
@@ -63,7 +63,7 @@
 
 **Does NOT cover:** This task changes configuration and analytical planning only. Dynamic runtime opening remains blocked until Tasks 2-4 provide physical record lifetimes and broker integration.
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 ~~~python
 def test_dynamic_cache_is_direct_machine_configurable_and_record_granular():
@@ -103,7 +103,7 @@ def test_dynamic_cache_rejects_nonqualified_contract(field, value, message):
 
 Add CLI tests asserting --hy3-q4-dynamic-memory sets dynamic_expert_cache=True, accepts --expert-memory-limit 100GiB, and rejects the removed --expert-slab-slots, --expert-regrow-hysteresis-slabs, and --expert-resize-min-interval-ms flags.
 
-- [ ] **Step 2: Run the tests and confirm RED**
+- [x] **Step 2: Run the tests and confirm RED**
 
 ~~~bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -116,7 +116,7 @@ uv run --frozen --extra dev --extra server pytest -q \
 
 Expected: FAIL because dynamic_expert_cache does not exist, component banks remain mandatory, and grouped allocator flags remain registered.
 
-- [ ] **Step 3: Replace configuration fields and validation**
+- [x] **Step 3: Replace configuration fields and validation**
 
 Use this dynamic surface:
 
@@ -139,7 +139,7 @@ if self.dynamic_expert_cache:
 
 Delete dynamic_expert_slabs, expert_slab_slots, expert_regrow_hysteresis_slabs, and expert_resize_min_interval_ms. In memory_plan, use context_tokens=0 only to calculate maximum logical cache capacity for the dynamic lane. Do not clamp memory_limit_bytes to 110 GiB and do not align persistent_slots to a multi-record unit. Preserve expert_cache_limit_bytes as an optional stricter ceiling.
 
-- [ ] **Step 4: Route dynamic mode to the direct allocator**
+- [x] **Step 4: Route dynamic mode to the direct allocator**
 
 ~~~python
 if expert_streaming_config.dynamic_expert_cache:
@@ -156,7 +156,7 @@ else:
 
 Remove grouped flags from CLI registration, runtime-option attestation, profiles, and server serialization. Do not add compatibility aliases; stale grouped options must fail rather than be ignored.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ~~~bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -192,7 +192,7 @@ Expected: tests and lint PASS; commit succeeds.
 
 **Does NOT cover:** This task provides record primitives but does not connect them to the broker or KV transactions. Static pools continue allocating all planned buffers.
 
-- [ ] **Step 1: Write failing policy and pool tests**
+- [x] **Step 1: Write failing policy and pool tests**
 
 ~~~python
 def test_global_lazy_cache_activates_and_ranks_individual_lru_records():
@@ -230,7 +230,7 @@ def test_lazy_pool_allocates_no_persistent_buffers_at_open(tmp_path):
 
 Add a replacement test that loads expert 0, replaces it with expert 1 in the same slot, and asserts identical id(binding.buffer), incremented generation, exact payload, and zero allocator calls during replacement. Add release tests proving loading, pinned, and Metal-in-flight records are rejected, while an unpinned record releases exactly expert_record_bytes.
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
 ~~~bash
 uv run --frozen --extra dev pytest -q \
@@ -242,7 +242,7 @@ uv run --frozen --extra dev pytest -q \
 
 Expected: FAIL because global capacity always starts active, persistent buffers allocate eagerly, and individual release APIs do not exist.
 
-- [ ] **Step 3: Add individual direct allocator release**
+- [x] **Step 3: Add individual direct allocator release**
 
 Keep make_mlx_slot_buffer_allocator callable-compatible and attach:
 
@@ -272,7 +272,7 @@ setattr(allocate, "close", close)
 
 Do not change component-bank construction or execution for static configurations.
 
-- [ ] **Step 4: Make physical slots lazy and individually releasable**
+- [x] **Step 4: Make physical slots lazy and individually releasable**
 
 Change _PhysicalSlot.buffer to Any | None and add lazy_persistent_buffers: bool = False to ExpertSlotPool.__init__. For global lazy pools, construct logical persistent slots with buffer=None, allocate only transient buffers, and set allocated_bytes to actual physical bytes.
 
@@ -357,7 +357,7 @@ allocate_persistent_slot runs on the allocator owner thread, accepts only an ina
 
 Delete ExpertSlabState, ExpertSlab, grouped tickets/results/errors, grouped registries, prepare/commit/abort/regrow methods, and grouped snapshot sections. Keep logical slot generation watermarks across release and reallocation.
 
-- [ ] **Step 5: Add initially inactive policy capacity and record ranking**
+- [x] **Step 5: Add initially inactive policy capacity and record ranking**
 
 Add initial_active_slots: int | None = None to GlobalExpertSlotBank. None preserves static behavior; zero creates an all-false mask and empty free deque.
 
@@ -414,7 +414,7 @@ def inactive_slot_ids(self) -> tuple[int, ...]:
 
 rank_reclaim_slots runs only at KV boundaries. It returns active empty slots first, then ready residents in oldest-to-newest LRU order, excluding protected IDs and non-ready entries. Remove rank_reclaim_slabs; retain existing activate/deactivate generation and rollback invariants.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ~~~bash
 uv run --frozen --extra dev pytest -q \
@@ -444,7 +444,7 @@ Expected: PASS, including existing static direct-slot and component-bank tests.
 
 **Does NOT cover:** The broker remains allocator-agnostic and does not choose LRU victims or mutate MLX buffers. Runtime integration follows in Task 4.
 
-- [ ] **Step 1: Write failing one-limit and record-transaction tests**
+- [x] **Step 1: Write failing one-limit and record-transaction tests**
 
 ~~~python
 def _snapshot(*, resident=0, kv=0, experts=0, cache=0, pinned=0):
@@ -487,13 +487,13 @@ def test_cache_record_growth_is_single_use_and_cap_bounded():
 
 Also cover total-limit refusal returning None, active KV transaction exclusion, failed allocation abort, duplicate ticket rejection, exact record reclaim, pinned refusal, allocator retention remaining charged, grouped-growth APIs absent, and snapshots containing no grouped fields.
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
 Run: uv run --frozen --extra dev pytest -q tests/test_memory_broker.py
 
 Expected: FAIL because the broker exposes fixed 110/112 GiB limits, grouped fields, and no one-record growth reservation.
 
-- [ ] **Step 3: Replace budget and snapshot contracts**
+- [x] **Step 3: Replace budget and snapshot contracts**
 
 ~~~python
 @dataclass(frozen=True)
@@ -538,7 +538,7 @@ def _require_cache_growth_ticket(
 
 Rename BrokerSnapshot.expert_slab_physical_bytes to expert_cache_physical_bytes. Remove pending grouped-growth IDs, last-resize timestamps, grouped hysteresis, and grouped maximum-capacity state. Replace hard/operating threshold branches with charged_bytes <= memory_limit_bytes; allocator headroom continues to reserve space from classified pools.
 
-- [ ] **Step 4: Add one-record miss reservations**
+- [x] **Step 4: Add one-record miss reservations**
 
 ~~~python
 def plan_expert_cache_growth(self) -> ExpertCacheAllocationTicket | None:
@@ -632,7 +632,7 @@ Planning returns None when one more exact record crosses the optional expert cap
 
 Keep existing KV single/group ownership, but compute required reclaim from expert_cache_physical_bytes. Rename confirm_expert_reclaim's parameter to registered_cache_bytes_after; accept any record-multiple reduction at least as large as the ticket requirement, retaining unproven allocator bytes as charged cache. Delete grouped expert-growth plan/confirm/abort methods.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ~~~bash
 uv run --frozen --extra dev pytest -q tests/test_memory_broker.py
@@ -662,7 +662,7 @@ Expected: PASS.
 
 **Does NOT cover:** Hardware performance and Python CPU attribution are separate gates. This task preserves Q4 block geometry, aggregate target-cache ownership, attention semantics, and exact-once KV ownership.
 
-- [ ] **Step 1: Write failing runtime lifecycle tests**
+- [x] **Step 1: Write failing runtime lifecycle tests**
 
 ~~~python
 def test_dynamic_runtime_starts_empty_warms_reuses_and_gives_records_to_kv(runtime):
@@ -694,7 +694,7 @@ Use a constructor parameter in the fixture instead of mutating production intern
 
 Also test: hits never call the broker; prefill growth is limited to actual seed demand; a miss grows only policy-requested records; no safe victim uses transient service; KV reclaim rounds only to one record; selected pins block without global drain; KV release/reset/cancel do not warm; allocator-retained bytes fail KV admission; split routes share the path; and dynamic snapshots contain no grouped fields.
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
 ~~~bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -706,13 +706,13 @@ uv run --frozen --extra dev --extra server pytest -q \
 
 Expected: FAIL because dynamic open and route/KV paths still call grouped lifecycle methods.
 
-- [ ] **Step 3: Initialize an empty cache and generic broker**
+- [x] **Step 3: Initialize an empty cache and generic broker**
 
 Pass lazy_persistent_buffers=config.dynamic_expert_cache to ExpertSlotPool and initial_active_slots=0 to GlobalExpertSlotBank. Build the initial snapshot with expert_cache_physical_bytes=0 and charge resident model, transient service, staging, workspace, and allocator residual additively. Construct MemoryBudget from config.memory_limit_bytes and allocator_headroom_bytes; pass the exact record size and optional expert cap to UnifiedMemoryBroker.
 
 Remove grouped-layout attestation. Assert the pool has planned logical record capacity, zero allocated persistent records, expected transient bytes, and the direct allocator backend.
 
-- [ ] **Step 4: Add miss-only cache warming**
+- [x] **Step 4: Add miss-only cache warming**
 
 ~~~python
 def _warm_direct_cache_records(
@@ -767,7 +767,7 @@ Preserve lock ordering as _memory_transaction_lock then shared global route lock
 
 Delete _regrow_for_route_demand and all grouped-growth calls. Full-cache misses use existing LRU replacement and overwrite one direct buffer without broker activity.
 
-- [ ] **Step 5: Replace grouped reclaim with individual eviction**
+- [x] **Step 5: Replace grouped reclaim with individual eviction**
 
 ~~~python
 def reclaim_expert_records(
@@ -811,7 +811,7 @@ Under the existing memory transaction and route-resize exclusion, compute ceil(r
 
 Update Q4 single/group growth callbacks to reclaim once before any target cache member allocates. Preserve aggregate declarations, per-member commits, abort, exact block bytes, reset, cancellation, and close behavior.
 
-- [ ] **Step 6: Replace telemetry and remove superseded tests**
+- [x] **Step 6: Replace telemetry and remove superseded tests**
 
 Dynamic telemetry must report:
 
@@ -839,7 +839,7 @@ result = {
 
 Remove grouped counts, group size, hysteresis, growth, and interval fields. Delete grouped test files only after every ownership, failure, KV, and route case has replacement coverage.
 
-- [ ] **Step 7: Verify and commit**
+- [x] **Step 7: Verify and commit**
 
 ~~~bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -878,7 +878,7 @@ Expected: tests/lint PASS; commit succeeds.
 
 **Does NOT cover:** Counters attribute CPU time in measured Python threads. They do not label SSD wait, Metal wait, or every same-thread native call as rewrite-removable Python work.
 
-- [ ] **Step 1: Write failing disabled/enabled tests**
+- [x] **Step 1: Write failing disabled/enabled tests**
 
 ~~~python
 def test_python_control_cpu_is_absent_when_resource_telemetry_is_disabled(runtime):
@@ -898,7 +898,7 @@ def test_python_control_cpu_uses_injected_thread_clock(runtime_with_clock):
 
 Also cover prefill/decode separation, cache-budget and KV-broker calls, inclusive-subset metadata, nonnegative serialization, and zero clock reads when disabled.
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
 ~~~bash
 uv run --frozen --extra dev pytest -q \
@@ -910,7 +910,7 @@ uv run --frozen --extra dev pytest -q \
 
 Expected: FAIL because only reader-worker CPU exists.
 
-- [ ] **Step 3: Add an opt-in ledger**
+- [x] **Step 3: Add an opt-in ledger**
 
 ~~~python
 PYTHON_CONTROL_CATEGORIES = (
@@ -932,7 +932,7 @@ def measure(self, category: str, phase: RoutingPhase | str):
 
 Construct ExpertPythonControlLedger only when resource_telemetry=True. The disabled path stores None, branches once before scopes, and never calls time.thread_time_ns. Accept an injected thread_cpu_clock for deterministic tests; default to time.thread_time_ns when enabled.
 
-- [ ] **Step 4: Instrument exact boundaries**
+- [x] **Step 4: Instrument exact boundaries**
 
 Measure route setup/commit/cleanup as route_control; only LRU planning/mutation as cache_policy (a subset); miss growth, record reservation, and eviction as cache_budget; and KV plan/commit/abort/release bookkeeping as kv_broker. Reuse existing reader-worker CPU and expose it in the same phase schema without summing it into route control.
 
@@ -948,7 +948,7 @@ Publish:
 }
 ~~~
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ~~~bash
 uv run --frozen --extra dev pytest -q \
@@ -993,7 +993,7 @@ Expected: PASS.
 
 **Does NOT cover:** This task updates evidence producers and validators but performs no hardware run. The campaign remains a foreground parent that awaits every child and restores Qwen in finally.
 
-- [ ] **Step 1: Write failing direct-cache schema/probe tests**
+- [x] **Step 1: Write failing direct-cache schema/probe tests**
 
 ~~~python
 assert result["backend"] == "mlx-metal-direct-slots"
@@ -1007,7 +1007,7 @@ assert "slabs" not in result
 
 Observation tests must require record counts/bytes, allocations/reuses/evictions/releases, Python CPU, GPU utilization, process compression, and configured limit. Reject grouped fields in candidate observations.
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
 ~~~bash
 uv run --frozen --extra dev pytest -q \
@@ -1022,11 +1022,11 @@ uv run --frozen --extra dev pytest -q \
 
 Expected: FAIL because the probe and schemas require grouped storage.
 
-- [ ] **Step 3: Build the real direct-cache probe**
+- [x] **Step 3: Build the real direct-cache probe**
 
 Reuse artifact attestation and exclusive-safe JSON I/O. Instantiate the direct allocator and lazy pool; sample allocator; assert zero persistent bytes; allocate and pread one verified record; execute deterministic Q4; overwrite the same buffer with another verified record and re-execute; release the record; call one allocator-cache flush; resample; emit Step 1 fields. Never construct component banks or invoke grouped lifecycle methods.
 
-- [ ] **Step 4: Update campaign identity and gates**
+- [x] **Step 4: Update campaign identity and gates**
 
 Use this candidate identity:
 
@@ -1068,11 +1068,11 @@ The selected contexts filter the balanced schedule before any lock acquisition. 
 
 Require token/route/hash parity, healthy ownership, no material compression or swap growth, non-stalled GPU activity, and candidate 4K decode no more than 20% below control. Report Python CPU per token, route, miss, eviction, and streamed byte, plus telemetry-on/off perturbation.
 
-- [ ] **Step 5: Update docs and foreground guarantees**
+- [x] **Step 5: Update docs and foreground guarantees**
 
 Document the exact 100 GiB candidate command using --expert-slot-layout direct-slots and no grouped flags. State that the benchmark stays foreground: its parent holds the lock, synchronously awaits every child, restores/verifies Qwen, then exits. Retain recovery-journal instructions and never recommend stealing a live lock.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ~~~bash
 uv run --frozen --extra dev pytest -q \
@@ -1113,7 +1113,7 @@ Expected: tests, lint, and plan-only validation PASS without touching Qwen or th
 
 **Does NOT cover:** A failed hardware gate does not authorize lowering correctness thresholds, terminating the lock owner, changing another issue's process, or publishing a performance claim.
 
-- [ ] **Step 1: Run complete CPU-safe verification**
+- [x] **Step 1: Run complete CPU-safe verification**
 
 ~~~bash
 uv run --frozen --extra dev --extra server pytest -q

@@ -22,8 +22,6 @@ from mlx_lm.models.activations import swiglu
 from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
 from mtplx.expert_slots import (
-    ExpertSlabAllocatorError,
-    ExpertSlabReleaseResult,
     ExpertSlotBinding,
     ReadyRoute,
 )
@@ -617,7 +615,7 @@ def make_mlx_component_bank_allocator(
 
     def require_owner_thread() -> None:
         if threading.get_ident() != owner_thread_id:
-            raise RuntimeError("component slab allocation requires its owner thread")
+            raise RuntimeError("component bank allocation requires its owner thread")
 
     def bank_for(kind: str, owner: int) -> MlxComponentBank:
         key = (kind, owner if kind in {"persistent", "global-persistent"} else -1)
@@ -698,93 +696,6 @@ def make_mlx_component_bank_allocator(
     def slab_layout() -> dict[int, tuple[int, ...]]:
         return dict(global_slab_layout)
 
-    def normalize_slab_id(slab_id: object) -> int:
-        if (
-            isinstance(slab_id, bool)
-            or not isinstance(slab_id, int)
-            or slab_id not in global_slab_layout
-        ):
-            raise ValueError("unknown global persistent slab")
-        return slab_id
-
-    def slab_physical_bytes(slab_id: int) -> int:
-        slab_id = normalize_slab_id(slab_id)
-        slot_ids = global_slab_layout[slab_id]
-        return len(slot_ids) * spec.expert_record_bytes
-
-    def allocate_slab(slab_id: int) -> dict[int, MlxComponentSlot]:
-        require_owner_thread()
-        slab_id = normalize_slab_id(slab_id)
-        slot_ids = global_slab_layout[slab_id]
-        if ("global-persistent", slab_id) in banks:
-            raise RuntimeError("global persistent slab is already allocated")
-        bank: MlxComponentBank | None = None
-        try:
-            bank = bank_for("global-persistent", slab_id)
-            allocated: dict[int, MlxComponentSlot] = {}
-            for bank_index, slot_id in enumerate(slot_ids):
-                label = f"global-persistent-{slot_id}"
-                slot = MlxComponentSlot(bank, bank_index, label=label)
-                slots[label] = slot
-                allocated_labels.add(label)
-                allocated[slot_id] = slot
-            return allocated
-        except BaseException:
-            if bank is not None:
-                bank.close()
-            banks.pop(("global-persistent", slab_id), None)
-            for slot_id in slot_ids:
-                label = f"global-persistent-{slot_id}"
-                slots.pop(label, None)
-                allocated_labels.discard(label)
-            _release_mlx_cache()
-            raise
-
-    def slab_is_allocated(slab_id: int) -> bool:
-        slab_id = normalize_slab_id(slab_id)
-        return ("global-persistent", slab_id) in banks
-
-    def release_slab(slab_id: int) -> ExpertSlabReleaseResult:
-        require_owner_thread()
-        slab_id = normalize_slab_id(slab_id)
-        slot_ids = global_slab_layout[slab_id]
-        try:
-            bank = banks[("global-persistent", slab_id)]
-        except KeyError as exc:
-            raise ExpertSlabAllocatorError(
-                "global persistent slab is not allocated",
-                destroyed=False,
-                physical_bytes=slab_physical_bytes(slab_id),
-            ) from exc
-        physical_bytes = bank.physical_bytes
-        destroyed = False
-        try:
-            bank.close()
-            destroyed = True
-            banks.pop(("global-persistent", slab_id), None)
-            for slot_id in slot_ids:
-                label = f"global-persistent-{slot_id}"
-                slots.pop(label, None)
-                allocated_labels.discard(label)
-            _release_mlx_cache()
-        except BaseException as exc:
-            if destroyed:
-                banks.pop(("global-persistent", slab_id), None)
-                for slot_id in slot_ids:
-                    label = f"global-persistent-{slot_id}"
-                    slots.pop(label, None)
-                    allocated_labels.discard(label)
-            raise ExpertSlabAllocatorError(
-                "global persistent slab release failed",
-                destroyed=destroyed,
-                physical_bytes=physical_bytes,
-            ) from exc
-        return ExpertSlabReleaseResult(
-            slab_id=slab_id,
-            physical_bytes=physical_bytes,
-            destroyed=True,
-        )
-
     def close_banks() -> None:
         require_owner_thread()
         for bank in tuple(banks.values()):
@@ -799,10 +710,6 @@ def make_mlx_component_bank_allocator(
     setattr(allocate, "banks", banks)
     setattr(allocate, "owner_thread_id", owner_thread_id)
     setattr(allocate, "slab_layout", slab_layout)
-    setattr(allocate, "slab_physical_bytes", slab_physical_bytes)
-    setattr(allocate, "slab_is_allocated", slab_is_allocated)
-    setattr(allocate, "allocate_slab", allocate_slab)
-    setattr(allocate, "release_slab", release_slab)
     setattr(allocate, "close", close_banks)
     return allocate
 

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
 from operator import index
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable
 
 
 def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
@@ -1136,77 +1136,6 @@ class GlobalExpertSlotBank:
             for slot, active in enumerate(self._active_slot_mask)
             if not active
         )
-
-    def rank_reclaim_slabs(
-        self,
-        slabs: Mapping[int, Iterable[int]],
-        protected_slots: Iterable[int] = (),
-    ) -> tuple[int, ...]:
-        """Rank releasable active slabs by residency class and coldness.
-
-        Empty slabs rank first, followed by slabs containing only speculative
-        residents. Slabs with any ordinary resident rank last, using their
-        hottest ordinary member so one hot record protects its whole slab.
-        A protected or in-flight slot excludes the complete slab.
-        """
-
-        protected = set(self._validate_slot_ids(protected_slots))
-        seen_slots: set[int] = set()
-        candidates: list[tuple[int, float, int, int]] = []
-        for raw_slab_id, raw_slots in slabs.items():
-            slab_id = _integer("slab id", raw_slab_id, minimum=0)
-            slot_ids = self._validate_slot_ids(raw_slots)
-            overlap = seen_slots.intersection(slot_ids)
-            if overlap:
-                raise ValueError(f"slots belong to multiple slabs: {sorted(overlap)}")
-            seen_slots.update(slot_ids)
-            active_slots = tuple(
-                slot for slot in slot_ids if self._active_slot_mask[slot]
-            )
-            if not active_slots or protected.intersection(slot_ids):
-                continue
-
-            entries: list[tuple[tuple[int, int], _GlobalDirectoryEntry]] = []
-            excluded = False
-            for slot in active_slots:
-                key = self._slot_to_key[slot]
-                if key is None:
-                    continue
-                entry = self._directory.get(key)
-                if entry is None or entry.slot != slot:
-                    raise RuntimeError(
-                        "global resident slot is missing its directory entry"
-                    )
-                if entry.state != "ready":
-                    excluded = True
-                    break
-                entries.append((key, entry))
-            if excluded:
-                continue
-            if not entries:
-                candidates.append((0, -1.0, -1, slab_id))
-                continue
-
-            ordinary = tuple(
-                (key, entry)
-                for key, entry in entries
-                if entry.residency_class is ExpertResidencyClass.ORDINARY
-            )
-            ranked_entries = ordinary or tuple(entries)
-            if self.cache_policy == "lru":
-                hottest_score, hottest_recency = max(
-                    (float(entry.lru_rank), entry.lru_rank)
-                    for _key, entry in ranked_entries
-                )
-            else:
-                hottest_score, hottest_recency = max(
-                    (self._score(key), self._history_for(key).last_used)
-                    for key, _entry in ranked_entries
-                )
-            residency_rank = 2 if ordinary else 1
-            candidates.append((residency_rank, hottest_score, hottest_recency, slab_id))
-        candidates.sort()
-        return tuple(slab_id for _class, _score, _recency, slab_id in candidates)
 
     def reconcile_slot_generation(self, slot: int, generation: int) -> None:
         """Advance policy state to a generation already used physically."""

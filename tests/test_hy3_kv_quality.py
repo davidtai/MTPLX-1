@@ -387,8 +387,8 @@ def test_dynamic_q4_quality_uses_same_expert_cap_and_enables_broker(
 
     assert dynamic.expert_cache_limit_bytes == EXPERT_CACHE_LIMIT_BYTES
     assert dynamic.kv_bytes_per_token_override == Q4_KV_BYTES_PER_TOKEN
-    assert dynamic.dynamic_expert_slabs is True
-    assert dynamic.expert_slab_slots == hardware.expert_slab_slots
+    assert dynamic.dynamic_expert_cache is True
+    assert dynamic.slot_layout == "direct-slots"
 
 
 def test_representation_runner_restores_environment_on_early_attestation_error(

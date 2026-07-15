@@ -93,6 +93,22 @@ def _exact_int(value: object, *, field: str, minimum: int) -> int:
     return value
 
 
+def _parse_contexts(value: str) -> tuple[int, ...]:
+    try:
+        contexts = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("contexts must be comma-separated integers") from exc
+    expected = tuple(
+        context for context in CONTEXT_MATRIX_TOKENS if context in set(contexts)
+    )
+    if not contexts or contexts != expected or contexts[0] != 4_096:
+        raise argparse.ArgumentTypeError(
+            "contexts must start with 4096 and be an ordered subset of "
+            + ",".join(str(context) for context in CONTEXT_MATRIX_TOKENS)
+        )
+    return contexts
+
+
 def _git(
     repo_root: Path,
     *args: str,
@@ -493,15 +509,23 @@ def _load_frozen_spec(
     )
 
 
-def _plan(spec: Mapping[str, object]) -> dict[str, object]:
+def _plan(
+    spec: Mapping[str, object],
+    *,
+    contexts: Sequence[int] = CONTEXT_MATRIX_TOKENS,
+) -> dict[str, object]:
     repetitions = int(spec["repetitions"])
     return {
         "schema": "mtplx-hy3-dynamic-memory-campaign-plan-v1",
-        "context_matrix_tokens": list(CONTEXT_MATRIX_TOKENS),
+        "context_matrix_tokens": list(contexts),
+        "available_context_matrix_tokens": list(CONTEXT_MATRIX_TOKENS),
         "repetitions": repetitions,
         "schedule": [
             asdict(entry)
-            for entry in balanced_campaign_schedule(repetitions=repetitions)
+            for entry in balanced_campaign_schedule(
+                repetitions=repetitions,
+                contexts=contexts,
+            )
         ],
         "probe_command": list(spec["probe_command"]),
         "quality_command": list(spec["quality_command"]),
@@ -519,6 +543,8 @@ def _plan(spec: Mapping[str, object]) -> dict[str, object]:
             spec["subprocess_termination_grace_seconds"]
         ),
         "qwen_isolation_configured": True,
+        "execution_mode": "foreground-synchronous",
+        "background_workloads": False,
     }
 
 
@@ -707,6 +733,7 @@ def run_spec(
     spec: Mapping[str, object],
     *,
     cwd: Path,
+    contexts: Sequence[int] = CONTEXT_MATRIX_TOKENS,
 ) -> dict[str, object]:
     """Execute a validated command spec inside the exact-Qwen restore window."""
 
@@ -903,6 +930,7 @@ def run_spec(
                 spec["arm_command_template"], field="spec.arm_command_template"
             ),
             repetitions=int(spec["repetitions"]),
+            contexts=contexts,
             cwd=cwd,
             bootstrap_resamples=int(spec["bootstrap_resamples"]),
             bootstrap_seed=int(spec["bootstrap_seed"]),
@@ -943,6 +971,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
     parser.add_argument(
+        "--contexts",
+        type=_parse_contexts,
+        default=CONTEXT_MATRIX_TOKENS,
+        help="comma-separated ordered subset: 4096,32768,65536,131072",
+    )
+    parser.add_argument(
         "--plan-only",
         action="store_true",
         help="validate and print the exact schedule without running commands",
@@ -970,7 +1004,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hooks_config_path,
             description="hardware hooks config",
         )
-        result = _plan(spec)
+        result = _plan(spec, contexts=args.contexts)
         result["campaign_spec_sha256"] = spec_sha256
         result["hardware_hooks_config_sha256"] = hooks_config_sha256
         result["source_git_commit"] = source_commit
@@ -1001,7 +1035,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hooks_config_path,
             description="hardware hooks config",
         )
-        result = dict(run_spec(spec, cwd=repo_root))
+        result = dict(run_spec(spec, cwd=repo_root, contexts=args.contexts))
         post_commit = _require_clean_source(repo_root)
         _require_tracked_file(
             repo_root,

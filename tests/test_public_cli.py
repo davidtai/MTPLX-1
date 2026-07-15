@@ -401,12 +401,10 @@ def test_serve_parser_exposes_explicit_hy3_q4_dynamic_memory_lane() -> None:
             "--hy3-q4-dynamic-memory",
             "--hy3-q4-dynamic-context",
             "--no-session-bank-live-refs",
-            "--expert-slab-slots",
-            "64",
-            "--expert-regrow-hysteresis-slabs",
-            "2",
-            "--expert-resize-min-interval-ms",
-            "250",
+            "--expert-memory-limit",
+            "100GiB",
+            "--expert-slot-layout",
+            "direct-slots",
             "--expert-allocator-headroom",
             "1GiB",
         ]
@@ -419,9 +417,10 @@ def test_serve_parser_exposes_explicit_hy3_q4_dynamic_memory_lane() -> None:
     assert enabled.hy3_q4_dynamic_memory is True
     assert enabled.hy3_q4_dynamic_context is True
     assert enabled.session_bank_live_refs is False
-    assert enabled.expert_slab_slots == 64
-    assert enabled.expert_regrow_hysteresis_slabs == 2
-    assert enabled.expert_resize_min_interval_ms == 250
+    assert enabled.expert_memory_limit == "100GiB"
+    assert enabled.expert_slot_layout == "direct-slots"
+    assert not hasattr(enabled, "expert_slab_slots")
+    assert not hasattr(enabled, "expert_regrow_hysteresis_slabs")
     assert enabled.expert_allocator_headroom == "1GiB"
 
 
@@ -1117,22 +1116,16 @@ def test_serve_forwards_complete_hy3_q4_dynamic_memory_lane(
             "--expert-manifest",
             str(manifest),
             "--expert-memory-limit",
-            "110GiB",
+            "100GiB",
             "--expert-max-live-kv-tokens",
             "131072",
             "--expert-cache-scope",
             "global",
             "--expert-slot-layout",
-            "component-banks",
+            "direct-slots",
             "--hy3-q4-dynamic-memory",
             "--hy3-q4-dynamic-context",
             "--no-session-bank-live-refs",
-            "--expert-slab-slots",
-            "64",
-            "--expert-regrow-hysteresis-slabs",
-            "2",
-            "--expert-resize-min-interval-ms",
-            "250",
             "--expert-allocator-headroom",
             "1GiB",
             "--paged-kv-quantization",
@@ -1150,9 +1143,11 @@ def test_serve_forwards_complete_hy3_q4_dynamic_memory_lane(
     assert "--hy3-q4-dynamic-memory" in argv
     assert "--hy3-q4-dynamic-context" in argv
     assert "--no-session-bank-live-refs" in argv
-    assert argv[argv.index("--expert-slab-slots") + 1] == "64"
-    assert argv[argv.index("--expert-regrow-hysteresis-slabs") + 1] == "2"
-    assert argv[argv.index("--expert-resize-min-interval-ms") + 1] == "250"
+    assert argv[argv.index("--expert-memory-limit") + 1] == "100GiB"
+    assert argv[argv.index("--expert-slot-layout") + 1] == "direct-slots"
+    assert "--expert-slab-slots" not in argv
+    assert "--expert-regrow-hysteresis-slabs" not in argv
+    assert "--expert-resize-min-interval-ms" not in argv
     assert argv[argv.index("--expert-allocator-headroom") + 1] == "1GiB"
     assert argv[argv.index("--paged-kv-quantization") + 1] == "q4"
     assert argv[argv.index("--context-window") + 1] == "131072"

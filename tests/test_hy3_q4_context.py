@@ -33,7 +33,7 @@ def _expert_config(**overrides):
     values = {
         "model_key": "hy3-q4",
         "cache_scope": "global",
-        "slot_layout": "component-banks",
+        "slot_layout": "direct-slots",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -242,11 +242,11 @@ def test_hy3_q4_dynamic_context_rejects_session_bank_live_refs_at_startup():
     ("config_override", "message"),
     [
         ({"model_key": "glm52-q4"}, "Hy3 Q4 expert streaming"),
-        ({"cache_scope": "layer"}, "global component-bank"),
-        ({"slot_layout": "direct-slots"}, "global component-bank"),
+        ({"cache_scope": "layer"}, "global direct-slot"),
+        ({"slot_layout": "component-banks"}, "global direct-slot"),
     ],
 )
-def test_hy3_q4_dynamic_context_rejects_non_global_component_bank_lane(
+def test_hy3_q4_dynamic_context_rejects_non_global_direct_slot_lane(
     config_override, message
 ):
     with pytest.raises(ValueError, match=message):

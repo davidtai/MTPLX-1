@@ -39,7 +39,7 @@ BENCHMARK_PROCESS_PATTERNS = (
     "benchmark_streamed_generation.py",
     "benchmark_hy3_dynamic_memory.py",
     "observe_hy3_dynamic_memory_arm.py",
-    "probe_hy3_component_slabs.py",
+    "probe_hy3_direct_cache.py",
     "probe_mtp",
     "probe_paged",
 )

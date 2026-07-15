@@ -53,13 +53,13 @@ def _valid_dynamic_server_argv(root: Path) -> list[str]:
         "--no-load-mtp",
         "--expert-streaming",
         "--expert-memory-limit",
-        "110GiB",
+        "100GiB",
         "--expert-max-live-kv-tokens",
         "131072",
         "--expert-cache-scope",
         "global",
         "--expert-slot-layout",
-        "component-banks",
+        "direct-slots",
         "--hy3-q4-dynamic-memory",
         "--hy3-q4-dynamic-context",
         "--paged-kv-quantization",
@@ -169,34 +169,40 @@ def test_server_parser_keeps_dynamic_memory_disabled_by_default() -> None:
     args = openai.parse_args(["--warmup-tokens", "0"])
 
     assert args.hy3_q4_dynamic_memory is False
-    assert args.expert_slab_slots is None
-    assert args.expert_regrow_hysteresis_slabs is None
-    assert args.expert_resize_min_interval_ms is None
     assert args.expert_allocator_headroom is None
 
 
-def test_server_parser_accepts_explicit_dynamic_memory_tuning() -> None:
+def test_server_parser_accepts_configurable_memory_limit_and_headroom() -> None:
     args = openai.parse_args(
         [
             "--warmup-tokens",
             "0",
             "--hy3-q4-dynamic-memory",
-            "--expert-slab-slots",
-            "64",
-            "--expert-regrow-hysteresis-slabs",
-            "2",
-            "--expert-resize-min-interval-ms",
-            "250",
+            "--expert-memory-limit",
+            "100GiB",
             "--expert-allocator-headroom",
             "1GiB",
         ]
     )
 
     assert args.hy3_q4_dynamic_memory is True
-    assert args.expert_slab_slots == 64
-    assert args.expert_regrow_hysteresis_slabs == 2
-    assert args.expert_resize_min_interval_ms == 250
+    assert args.expert_memory_limit == "100GiB"
     assert args.expert_allocator_headroom == "1GiB"
+
+
+@pytest.mark.parametrize(
+    "removed_flag",
+    (
+        "--expert-slab-slots",
+        "--expert-regrow-hysteresis-slabs",
+        "--expert-resize-min-interval-ms",
+    ),
+)
+def test_server_parser_rejects_removed_grouped_allocator_flags(
+    removed_flag: str,
+) -> None:
+    with pytest.raises(SystemExit):
+        openai.parse_args(["--warmup-tokens", "0", removed_flag, "1"])
 
 
 def test_dynamic_memory_opt_in_forces_instrumented_dynamic_expert_config(
@@ -207,20 +213,14 @@ def test_dynamic_memory_opt_in_forces_instrumented_dynamic_expert_config(
         [
             "--expert-streaming",
             "--expert-memory-limit",
-            "110GiB",
+            "100GiB",
             "--expert-max-live-kv-tokens",
             "131072",
             "--expert-cache-scope",
             "global",
             "--expert-slot-layout",
-            "component-banks",
+            "direct-slots",
             "--hy3-q4-dynamic-memory",
-            "--expert-slab-slots",
-            "64",
-            "--expert-regrow-hysteresis-slabs",
-            "2",
-            "--expert-resize-min-interval-ms",
-            "250",
         ]
     )
 
@@ -228,16 +228,15 @@ def test_dynamic_memory_opt_in_forces_instrumented_dynamic_expert_config(
     config = kwargs["expert_streaming_config"]
 
     assert kwargs["mtp"] is False
-    assert config.dynamic_expert_slabs is True
+    assert config.dynamic_expert_cache is True
     assert config.resource_telemetry is True
     assert config.kv_bytes_per_token_override == 84_480
     assert config.allocator_headroom_bytes == 1024**3
     assert config.runtime_reserve_bytes == 8 * 1024**3
     assert config.transient_slots == 32
     assert config.cache_policy == "lru"
-    assert config.expert_slab_slots == 64
-    assert config.expert_regrow_hysteresis_slabs == 2
-    assert config.expert_resize_min_interval_ms == 250
+    assert config.cache_scope == "global"
+    assert config.slot_layout == "direct-slots"
 
 
 def test_dynamic_memory_attestation_rejects_non_q4_physical_kv_geometry() -> None:
@@ -247,12 +246,9 @@ def test_dynamic_memory_attestation_rejects_non_q4_physical_kv_geometry() -> Non
         expert_streaming=True,
         expert_streaming_config=None,
         expert_manifest=None,
-        expert_slab_slots=None,
-        expert_regrow_hysteresis_slabs=None,
-        expert_resize_min_interval_ms=None,
     )
     config = SimpleNamespace(
-        dynamic_expert_slabs=True,
+        dynamic_expert_cache=True,
         resource_telemetry=True,
         kv_bytes_per_token_override=327_680,
     )
@@ -268,13 +264,10 @@ def test_dynamic_memory_attestation_requires_one_gib_allocator_headroom() -> Non
         expert_streaming=True,
         expert_streaming_config=None,
         expert_manifest=None,
-        expert_slab_slots=None,
-        expert_regrow_hysteresis_slabs=None,
-        expert_resize_min_interval_ms=None,
         expert_allocator_headroom=None,
     )
     config = SimpleNamespace(
-        dynamic_expert_slabs=True,
+        dynamic_expert_cache=True,
         resource_telemetry=True,
         kv_bytes_per_token_override=84_480,
         allocator_headroom_bytes=0,
@@ -361,22 +354,6 @@ def test_dynamic_memory_requires_explicit_expert_streaming_before_model_load(
     )
 
 
-def test_dynamic_memory_tuning_requires_explicit_opt_in_before_model_load(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    root = _hy3_model_root(tmp_path)
-    argv = _valid_dynamic_server_argv(root)
-    argv.remove("--hy3-q4-dynamic-memory")
-    argv.extend(["--expert-slab-slots", "64"])
-
-    _assert_server_rejects_before_load(
-        monkeypatch,
-        argv,
-        match="--expert-slab-slots requires --hy3-q4-dynamic-memory",
-    )
-
-
 def test_dynamic_config_cannot_bypass_serving_opt_in(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -387,11 +364,12 @@ def test_dynamic_config_cannot_bypass_serving_opt_in(
         json.dumps(
             {
                 "model_key": "hy3-q4",
-                "memory_limit_bytes": "110GiB",
+                "memory_limit_bytes": "100GiB",
                 "max_live_kv_tokens": 131072,
                 "cache_scope": "global",
-                "slot_layout": "component-banks",
-                "dynamic_expert_slabs": True,
+                "slot_layout": "direct-slots",
+                "cache_policy": "lru",
+                "dynamic_expert_cache": True,
                 "resource_telemetry": True,
             }
         ),
@@ -404,7 +382,7 @@ def test_dynamic_config_cannot_bypass_serving_opt_in(
     _assert_server_rejects_before_load(
         monkeypatch,
         argv,
-        match="dynamic expert slabs in serving require --hy3-q4-dynamic-memory",
+        match="dynamic expert cache in serving requires --hy3-q4-dynamic-memory",
     )
 
 
@@ -611,27 +589,24 @@ def test_dynamic_memory_health_maps_runtime_data_without_inventing_os_metrics(
 ) -> None:
     resource_snapshot = {
         "dynamic_memory": {
-            "operating_target_bytes": 110,
-            "hard_ceiling_bytes": 112,
+            "memory_limit_bytes": 100,
             "allocator_headroom_bytes": 1,
-            "classified_target_bytes": 109,
+            "classified_limit_bytes": 99,
             "classified_bytes": 91,
             "charged_bytes": 99,
-            "charged_residual_bytes": 11,
+            "charged_residual_bytes": 1,
             "logical_expert_records": 128,
+            "allocated_record_count": 96,
             "active_expert_records": 96,
             "resident_expert_records": 80,
-            "logical_slab_count": 4,
-            "active_slab_count": 3,
-            "expert_slab_physical_bytes": 50,
+            "expert_cache_physical_bytes": 50,
             "pinned_expert_bytes": 7,
             "in_flight_expert_bytes": 5,
             "speculative_expert_bytes": 3,
-            "requested_reclaim_bytes": 20,
-            "reclaimed_bytes": 18,
-            "regrown_bytes": 4,
-            "resize_duration_ns": 900,
-            "blocked_by_pin_bytes": 2,
+            "record_allocations": 11,
+            "record_reuses": 5,
+            "record_evictions": 9,
+            "record_releases": 3,
             "allocator_active_bytes": 88,
             "allocator_cache_bytes": 6,
             "allocator_peak_bytes": 101,
@@ -654,7 +629,7 @@ def test_dynamic_memory_health_maps_runtime_data_without_inventing_os_metrics(
             "physical_blocks": 64,
             "physical_bytes": 11,
         },
-        "expert_evicted_slabs": 2,
+        "python_control_cpu": {"clock": "thread_time_ns"},
         "ssd_bytes_per_token": 1.5,
         "token_latency_p50_ms": 12.0,
         "token_latency_p95_ms": 20.0,
@@ -682,33 +657,34 @@ def test_dynamic_memory_health_maps_runtime_data_without_inventing_os_metrics(
     payload = openai._hy3_q4_dynamic_memory_health(state)
 
     assert payload["enabled"] is True
-    assert payload["operating_target_bytes"] == 110
-    assert payload["hard_ceiling_bytes"] == 112
+    assert payload["memory_limit_bytes"] == 100
     assert payload["allocator_headroom_bytes"] == 1
-    assert payload["classified_target_bytes"] == 109
+    assert payload["classified_limit_bytes"] == 99
     assert payload["classified_bytes"] == 91
     assert payload["resident_model_bytes"] == 40
-    assert payload["charged_residual_bytes"] == 11
+    assert payload["charged_residual_bytes"] == 1
     assert payload["kv_representation"] == "q4"
     assert payload["kv_logical_tokens"] == 4096
     assert payload["kv_physical_blocks"] == 64
     assert payload["kv_physical_bytes"] == 11
     assert payload["expert_logical_records"] == 128
+    assert payload["expert_allocated_records"] == 96
     assert payload["expert_active_records"] == 96
     assert payload["expert_resident_records"] == 80
-    assert payload["expert_logical_slabs"] == 4
-    assert payload["expert_active_slabs"] == 3
     assert payload["expert_physical_bytes"] == 50
     assert payload["inflight_expert_staging_bytes"] == 2
     assert payload["runtime_workspace_bytes"] == 8
-    assert payload["evicted_expert_records"] == 9
-    assert payload["evicted_expert_slabs"] == 2
+    assert payload["record_allocations"] == 11
+    assert payload["record_reuses"] == 5
+    assert payload["record_evictions"] == 9
+    assert payload["record_releases"] == 3
     assert payload["admission_failures"] == 1
     assert payload["expert_cache_hit_rate"] == 0.75
     assert payload["ssd_bytes_per_token"] == 1.5
     assert payload["decode_tps"] == 33.5
     assert payload["token_latency_p50_ms"] == 12.0
     assert payload["token_latency_p95_ms"] == 20.0
+    assert payload["python_control_cpu"] == {"clock": "thread_time_ns"}
     assert payload["process_rss_bytes"] == 123
     assert payload["process_compressed_bytes"] is None
     assert payload["system_swap_delta_bytes"] is None

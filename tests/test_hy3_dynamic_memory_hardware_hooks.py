@@ -14,7 +14,7 @@ from mtplx.benchmarks.hy3_dynamic_memory_hardware import (
     ProductionHy3HardwareHooks,
     create_hooks,
     preflight_and_grow_dynamic_q4,
-    trigger_future_demand_regrow,
+    trigger_future_demand_record_rewarm,
 )
 from mtplx.benchmarks.hy3_dynamic_memory_observation import (
     ArmObservationError,
@@ -25,6 +25,28 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     HY3_Q4_MAX_BLOCKS,
 )
 from mtplx.expert_streaming_models import HY3_Q4
+
+
+def _python_control_cpu() -> dict[str, object]:
+    result: dict[str, object] = {
+        category: {
+            phase: {"calls": 1, "cpu_ns": 2}
+            for phase in ("decode", "prefill", "unscoped")
+        }
+        for category in (
+            "route_control",
+            "cache_policy",
+            "cache_budget",
+            "kv_broker",
+            "reader_thread",
+        )
+    }
+    result["inclusive_relationships"] = {
+        "cache_policy": "subset_of_route_control",
+        "reader_thread": "separate_worker",
+    }
+    result["clock"] = "thread_time_ns"
+    return result
 
 
 def _artifact_pins() -> dict[str, object]:
@@ -44,7 +66,7 @@ def _artifact_pins() -> dict[str, object]:
 @dataclass
 class FakeBrokerSnapshot:
     kv_physical_bytes: int
-    expert_slab_physical_bytes: int
+    expert_cache_physical_bytes: int
 
 
 class FakeGrowthGroup:
@@ -93,7 +115,7 @@ class FakeExpertRuntime:
         self.single_reservations = 0
         self.snapshot = FakeBrokerSnapshot(
             kv_physical_bytes=HY3_Q4_KV_BLOCK_BYTES,
-            expert_slab_physical_bytes=800,
+            expert_cache_physical_bytes=800,
         )
         self.memory_broker = self
 
@@ -107,7 +129,7 @@ class FakeExpertRuntime:
         members: tuple[tuple[str, int, int], ...],
     ) -> FakeGrowthGroup:
         self.events.append(f"group-reserve:{len(members)}")
-        self.snapshot.expert_slab_physical_bytes = 600
+        self.snapshot.expert_cache_physical_bytes = 600
         group = FakeGrowthGroup(self.events, members)
         self.groups.append(group)
         return group
@@ -212,13 +234,13 @@ def test_dynamic_preflight_captures_real_reclaim_gap_before_any_q4_growth(
         kv_physical_bytes = sum(entry.nbytes for entry in cache)
         return {
             "allocator_active_bytes": (
-                broker.expert_slab_physical_bytes + kv_physical_bytes
+                broker.expert_cache_physical_bytes + kv_physical_bytes
             ),
             "allocator_cache_bytes": 0,
             "allocator_peak_bytes": (
-                broker.expert_slab_physical_bytes + kv_physical_bytes
+                broker.expert_cache_physical_bytes + kv_physical_bytes
             ),
-            "expert_slab_physical_bytes": broker.expert_slab_physical_bytes,
+            "expert_cache_physical_bytes": broker.expert_cache_physical_bytes,
             "kv_physical_bytes": kv_physical_bytes,
             "kv_allocated_blocks": blocks,
             "slot_health": {
@@ -246,7 +268,7 @@ def test_dynamic_preflight_captures_real_reclaim_gap_before_any_q4_growth(
         monotonic_ns=clock,
     )
 
-    assert captured["expert_slab_physical_bytes"] == 600
+    assert captured["expert_cache_physical_bytes"] == 600
     assert captured["kv_physical_bytes"] == HY3_Q4_KV_BLOCK_BYTES
     growth_steps = captured["kv_growth_steps"]
     assert isinstance(growth_steps, list)
@@ -350,6 +372,19 @@ def test_host_memory_health_uses_exact_mach_ledgers_without_subprocess_fallback(
     assert isinstance(snapshot["system_swap_delta_bytes"], int)
 
 
+def test_gpu_utilization_parser_reads_agx_performance_statistics() -> None:
+    output = (
+        '"PerformanceStatistics" = {'
+        '"Device Utilization %"=23,'
+        '"Renderer Utilization %"=19}'
+    )
+
+    assert hardware_module._parse_gpu_utilization_percent(output) == 23.0
+
+    with pytest.raises(ArmObservationError, match="GPU utilization"):
+        hardware_module._parse_gpu_utilization_percent('"PerformanceStatistics" = {}')
+
+
 class FakeReadyRoute:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -372,16 +407,13 @@ class FakeDemandRuntime:
         self.events.append(f"ensure_route:{layer}:{expert_ids}:{phase}")
         return FakeReadyRoute(self.events)
 
-    def maybe_regrow_expert_slabs(self, **_kwargs: object) -> None:
-        raise AssertionError("regrow must be caused by route demand")
 
-
-def test_regrow_is_triggered_only_by_a_real_future_route_demand() -> None:
+def test_record_rewarm_is_triggered_only_by_a_real_future_route_demand() -> None:
     events: list[str] = []
     runtime = FakeDemandRuntime(events)
     physical = iter((600, 800))
 
-    trigger_future_demand_regrow(
+    trigger_future_demand_record_rewarm(
         expert_runtime=runtime,
         route_trace=[
             {
@@ -419,6 +451,7 @@ def test_production_factory_builds_real_static_and_dynamic_hook_loader(
     assert isinstance(hooks, ProductionHy3HardwareHooks)
     assert isinstance(hooks.config, Hy3HardwareConfig)
     assert hooks.config.allocator_headroom_bytes == 1024**3
+    assert hooks.config.memory_limit_bytes == 100 * 1024**3
     assert hooks.config.model_root == tmp_path / "Hy3-4bit"
     assert hooks.config.hold_warmup_tokens == 32
     assert hooks.config.completion_reserve_tokens == 72
@@ -481,6 +514,15 @@ def test_hardware_config_requires_exact_external_artifact_pins(
                 }
             )
 
+    with pytest.raises(ArmObservationError, match="unknown keys"):
+        Hy3HardwareConfig.from_mapping(
+            {
+                **base,
+                "artifact_pins": _artifact_pins(),
+                "expert_slab_slots": 32,
+            }
+        )
+
     with pytest.raises(ArmObservationError, match="generated plus warm-up"):
         Hy3HardwareConfig.from_mapping(
             {
@@ -493,7 +535,7 @@ def test_hardware_config_requires_exact_external_artifact_pins(
         )
 
 
-def test_hardware_arms_pin_one_gib_headroom_and_dynamic_slot_counts(
+def test_hardware_arms_pin_one_gib_headroom_and_direct_record_counts(
     tmp_path: Path,
 ) -> None:
     config = Hy3HardwareConfig.from_mapping(
@@ -517,11 +559,15 @@ def test_hardware_arms_pin_one_gib_headroom_and_dynamic_slot_counts(
     assert (
         static.allocator_headroom_bytes == dynamic.allocator_headroom_bytes == 1024**3
     )
-    assert static.persistent_slots == 8_673
-    assert static.unallocated_bytes == 1_076_826_880
-    assert dynamic.persistent_slots == 9_696
-    assert dynamic.persistent_slots // config.expert_slab_slots == 303
-    assert dynamic.unallocated_bytes == 1_288_770_304
+    assert static.persistent_slots == 7_661
+    assert static.unallocated_bytes == 1_083_642_624
+    assert dynamic.persistent_slots == 8_704
+    assert dynamic.unallocated_bytes == 1_083_249_408
+    static_config = hardware_module._build_runtime_config(config, arm="static")
+    dynamic_config = hardware_module._build_runtime_config(config, arm="dynamic")
+    assert static_config.slot_layout == dynamic_config.slot_layout == "direct-slots"
+    assert static_config.dynamic_expert_cache is False
+    assert dynamic_config.dynamic_expert_cache is True
 
 
 def test_hardware_arm_environment_forces_full_history_attention(
@@ -641,11 +687,13 @@ def test_static_control_budget_charges_exact_physical_q4_geometry(
     assert observed["model_config"] is frozen_model_config
     plan = runtime_config.memory_plan(HY3_Q4)
     assert {
-        "dynamic_expert_slabs": runtime_config.dynamic_expert_slabs,
+        "dynamic_expert_cache": runtime_config.dynamic_expert_cache,
+        "slot_layout": runtime_config.slot_layout,
         "planned_context_tokens": plan.context_tokens,
         "planned_kv_bytes": plan.kv_bytes,
     } == {
-        "dynamic_expert_slabs": False,
+        "dynamic_expert_cache": False,
+        "slot_layout": "direct-slots",
         "planned_context_tokens": hardware_module.TOTAL_CONTEXT_TOKENS,
         "planned_kv_bytes": HY3_Q4_MAX_BLOCKS * HY3_Q4_KV_BLOCK_BYTES,
     }
@@ -815,7 +863,6 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
         entry.num_blocks = HY3_Q4_MAX_BLOCKS
         entry.nbytes = HY3_Q4_MAX_BLOCKS * (HY3_Q4_KV_BLOCK_BYTES // 2)
     slot_snapshot = {
-        "slabs": {"physical_bytes": 800},
         "metrics": {
             "active_routes": 0,
             "completion_fence_failures": 0,
@@ -828,17 +875,13 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
         _raise_if_unhealthy=lambda: None,
         slots=SimpleNamespace(
             snapshot=lambda: pytest.fail("physical ledger must not globally drain"),
-            expert_slab_telemetry_snapshot=lambda: {
-                "physical_bytes": 800,
-                "logical_slab_count": 1,
-                "active_slab_count": 1,
-                "draining_slab_count": 0,
-                "released_slab_count": 0,
-                "logical_slot_count": 1,
-                "active_slot_count": 1,
+            persistent_cache_telemetry_snapshot=lambda: {
+                "logical_record_capacity": 1,
+                "allocated_record_count": 1,
                 "resident_record_count": 0,
-                "in_flight_bytes": 0,
-                "pinned_bytes": 0,
+                "in_flight_record_count": 0,
+                "pinned_record_count": 0,
+                "physical_bytes": 800,
             },
             health_telemetry_snapshot=lambda: {
                 "metrics": slot_snapshot["metrics"],
@@ -849,7 +892,12 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
         ),
         memory_broker=None,
     )
-    runtime = SimpleNamespace(expert_streaming=expert_runtime)
+    runtime = SimpleNamespace(
+        expert_streaming=expert_runtime,
+        expert_resource_telemetry_snapshot=lambda: {
+            "python_control_cpu": _python_control_cpu(),
+        },
+    )
     monkeypatch.setattr(
         expert_runtime_module,
         "mlx_memory_telemetry",
@@ -858,6 +906,20 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
             "cache_memory_bytes": 100,
             "peak_memory_bytes": 1_000,
         },
+    )
+    monkeypatch.setattr(
+        hardware_module,
+        "_host_memory_health_snapshot",
+        lambda **_kwargs: {
+            "process_rss_bytes": 1_000,
+            "process_compressed_bytes": 0,
+            "system_swap_delta_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(
+        hardware_module,
+        "_gpu_utilization_percent",
+        lambda: 20.0,
     )
     lane = MlxHy3HardwareLane(
         config=config,
@@ -882,7 +944,7 @@ def test_static_physical_ledger_does_not_require_dynamic_broker(
 
     assert ledger["kv_allocated_blocks"] == HY3_Q4_MAX_BLOCKS
     assert ledger["kv_physical_bytes"] == (HY3_Q4_MAX_BLOCKS * HY3_Q4_KV_BLOCK_BYTES)
-    assert ledger["expert_slab_physical_bytes"] == 800
+    assert ledger["expert_cache_physical_bytes"] == 800
     assert ledger["allocator_cache_bytes"] == 100
     assert ledger["allocator_cache_charged_bytes"] == 100
     assert ledger["charged_bytes"] == (ledger["kv_physical_bytes"] + 800 + 100)
@@ -909,7 +971,6 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
     )
     cache = [FakeQ4Entry([], index) for index in range(80)]
     slot_snapshot = {
-        "slabs": {"physical_bytes": 800},
         "metrics": {
             "active_routes": 0,
             "completion_fence_failures": 0,
@@ -921,7 +982,7 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
     broker_snapshot = SimpleNamespace(
         resident_model_bytes=100,
         kv_physical_bytes=HY3_Q4_KV_BLOCK_BYTES,
-        expert_slab_physical_bytes=800,
+        expert_cache_physical_bytes=800,
         in_flight_expert_staging_bytes=20,
         runtime_workspace_bytes=30,
         allocator_cache_bytes=10,
@@ -934,8 +995,9 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
     )
     broker = SimpleNamespace(
         budget=SimpleNamespace(
-            operating_target_bytes=110 * hardware_module.GIB,
-            hard_ceiling_bytes=112 * hardware_module.GIB,
+            memory_limit_bytes=100 * hardware_module.GIB,
+            allocator_headroom_bytes=hardware_module.GIB,
+            classified_limit_bytes=99 * hardware_module.GIB,
         ),
         snapshot=lambda: broker_snapshot,
     )
@@ -943,17 +1005,13 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
         _raise_if_unhealthy=lambda: None,
         slots=SimpleNamespace(
             snapshot=lambda: pytest.fail("physical ledger must not globally drain"),
-            expert_slab_telemetry_snapshot=lambda: {
-                "physical_bytes": 800,
-                "logical_slab_count": 4,
-                "active_slab_count": 3,
-                "draining_slab_count": 0,
-                "released_slab_count": 1,
-                "logical_slot_count": 128,
-                "active_slot_count": 96,
+            persistent_cache_telemetry_snapshot=lambda: {
+                "logical_record_capacity": 128,
+                "allocated_record_count": 96,
                 "resident_record_count": 80,
-                "in_flight_bytes": 60,
-                "pinned_bytes": 40,
+                "in_flight_record_count": 6,
+                "pinned_record_count": 4,
+                "physical_bytes": 800,
             },
             health_telemetry_snapshot=lambda: {
                 "metrics": slot_snapshot["metrics"],
@@ -969,19 +1027,11 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
             "logical_expert_records": 128,
             "active_expert_records": 96,
             "resident_expert_records": 80,
-            "logical_slab_count": 4,
-            "active_slab_count": 3,
-            "draining_slab_count": 0,
-            "released_slab_count": 1,
             "in_flight_expert_bytes": 60,
-            "requested_reclaim_bytes": 70,
-            "reclaimed_bytes": 64,
-            "regrown_bytes": 32,
-            "resize_duration_ns": 900,
-            "total_resize_duration_ns": 1_800,
-            "max_resize_duration_ns": 1_000,
-            "blocked_by_pin_bytes": 16,
-            "resize_failures": 1,
+            "record_allocations": 11,
+            "record_reuses": 5,
+            "record_evictions": 7,
+            "record_releases": 3,
         },
         "cache": {"evictions": 7},
         "kv": {
@@ -990,7 +1040,7 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
             "physical_blocks": 1,
             "physical_bytes": HY3_Q4_KV_BLOCK_BYTES,
         },
-        "expert_evicted_slabs": 2,
+        "python_control_cpu": _python_control_cpu(),
     }
     runtime = SimpleNamespace(
         expert_streaming=expert_runtime,
@@ -1015,6 +1065,11 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
         },
         raising=False,
     )
+    monkeypatch.setattr(
+        hardware_module,
+        "_gpu_utilization_percent",
+        lambda: 20.0,
+    )
     lane = MlxHy3HardwareLane(
         config=config,
         request=ArmRequest(arm="dynamic", context_tokens=4096, repetition=0),
@@ -1037,49 +1092,42 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
     ledger = lane._live_physical_ledger()
 
     expected = {
-        "operating_target_bytes": 110 * hardware_module.GIB,
-        "hard_ceiling_bytes": 112 * hardware_module.GIB,
+        "memory_limit_bytes": 100 * hardware_module.GIB,
         "allocator_headroom_bytes": hardware_module.GIB,
-        "classified_target_bytes": 109 * hardware_module.GIB,
+        "classified_limit_bytes": 99 * hardware_module.GIB,
         "classified_bytes": 950 + HY3_Q4_KV_BLOCK_BYTES,
         "charged_bytes": 960 + HY3_Q4_KV_BLOCK_BYTES,
         "charged_residual_bytes": (
-            110 * hardware_module.GIB - 960 - HY3_Q4_KV_BLOCK_BYTES
+            100 * hardware_module.GIB - 960 - HY3_Q4_KV_BLOCK_BYTES
         ),
         "resident_model_bytes": 100,
         "kv_representation": "q4",
         "kv_logical_tokens": 16,
         "expert_logical_records": 128,
+        "expert_allocated_records": 96,
         "expert_active_records": 96,
         "expert_resident_records": 80,
-        "expert_logical_slabs": 4,
-        "expert_active_slabs": 3,
-        "expert_draining_slabs": 0,
-        "expert_released_slabs": 1,
+        "record_allocations": 11,
+        "record_reuses": 5,
+        "record_evictions": 7,
+        "record_releases": 3,
         "pinned_expert_bytes": 40,
         "inflight_expert_bytes": 60,
         "speculative_expert_bytes": 50,
         "runtime_workspace_bytes": 30,
         "inflight_expert_staging_bytes": 20,
-        "requested_reclaim_bytes": 70,
-        "reclaimed_bytes": 64,
-        "regrown_bytes": 32,
-        "evicted_expert_records": 7,
-        "evicted_expert_slabs": 2,
-        "resize_duration_ns": 900,
-        "total_resize_duration_ns": 1_800,
-        "max_resize_duration_ns": 1_000,
-        "blocked_by_pin_bytes": 16,
         "admission_failures": 2,
-        "resize_failures": 1,
         "allocator_cache_charged_bytes": 10,
         "process_rss_bytes": 1_200,
         "process_compressed_bytes": 300,
         "system_swap_delta_bytes": 10,
+        "gpu_utilization_percent": 20.0,
+        "python_control_cpu": _python_control_cpu(),
         "failed_closed": False,
         "failure_reason": None,
     }
     missing = set(expected) - set(ledger)
     assert not missing, f"physical ledger omitted issue #46 resource fields: {missing}"
     assert {field: ledger[field] for field in expected} == expected
+    assert not any("slab" in field or "resize" in field for field in ledger)
     assert ledger["slot_health"]["integrity_errors"] == 7

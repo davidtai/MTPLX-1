@@ -60,16 +60,17 @@ class FakeLane:
                 "expert_streaming_config": {
                     "allocator_headroom_bytes": 1024**3,
                     "kv_bytes_per_token_override": 84_480,
-                    "memory_limit_bytes": 110 * 1024**3,
+                    "memory_limit_bytes": 100 * 1024**3,
                     "max_live_kv_tokens": 131_072,
                     "runtime_reserve_bytes": 8 * 1024**3,
                     "transient_slots": 32,
+                    "cache_policy": "lru",
                     "cache_scope": "global",
-                    "slot_layout": "component-banks",
-                    "dynamic_expert_slabs": self.arm == "dynamic",
-                    "expert_slab_slots": 32,
+                    "slot_layout": "direct-slots",
+                    "dynamic_expert_cache": self.arm == "dynamic",
+                    "resource_telemetry": True,
                 },
-                "planned_persistent_slots": (9_696 if self.arm == "dynamic" else 8_673),
+                "planned_persistent_slots": 8_673,
             },
             "kv_quantization": "q4",
             "kv_block_size_tokens": 16,
@@ -87,11 +88,32 @@ class FakeLane:
         active_bytes = experts + kv_bytes
         allocator_cache_bytes = 7
         runtime_workspace_bytes = 64
+        python_control_cpu = {
+            category: {
+                f"{phase}_{metric}": (
+                    1 if phase == "decode" and metric == "calls" else 0
+                )
+                for phase in ("decode", "prefill", "unscoped")
+                for metric in ("calls", "cpu_ns")
+            }
+            for category in (
+                "route_control",
+                "cache_policy",
+                "cache_budget",
+                "kv_broker",
+                "reader_thread",
+            )
+        }
+        python_control_cpu["inclusive_relationships"] = {
+            "cache_policy": "subset_of_route_control",
+            "reader_thread": "separate_worker",
+        }
+        python_control_cpu["clock"] = "thread_time_ns"
         return {
             "allocator_active_bytes": active_bytes,
             "allocator_cache_bytes": allocator_cache_bytes,
             "allocator_peak_bytes": active_bytes,
-            "expert_slab_physical_bytes": experts,
+            "expert_cache_physical_bytes": experts,
             "kv_physical_bytes": kv_bytes,
             "kv_allocated_blocks": blocks,
             "slot_health": {
@@ -103,16 +125,15 @@ class FakeLane:
                 "completion_fence_failures": 0,
                 "global_device_synchronizations": 0,
             },
-            "operating_target_bytes": 110 * 1024**3,
-            "hard_ceiling_bytes": 112 * 1024**3,
+            "memory_limit_bytes": 100 * 1024**3,
             "allocator_headroom_bytes": 1024**3,
-            "classified_target_bytes": 109 * 1024**3,
+            "classified_limit_bytes": 99 * 1024**3,
             "classified_bytes": active_bytes + runtime_workspace_bytes,
             "charged_bytes": (
                 active_bytes + runtime_workspace_bytes + allocator_cache_bytes
             ),
             "charged_residual_bytes": (
-                110 * 1024**3
+                100 * 1024**3
                 - active_bytes
                 - runtime_workspace_bytes
                 - allocator_cache_bytes
@@ -123,32 +144,25 @@ class FakeLane:
                 self.logical_tokens if logical_tokens is None else logical_tokens
             ),
             "expert_logical_records": experts,
+            "expert_allocated_records": experts,
             "expert_active_records": experts,
             "expert_resident_records": experts,
-            "expert_logical_slabs": experts,
-            "expert_active_slabs": experts,
-            "expert_draining_slabs": 0,
-            "expert_released_slabs": 0,
+            "record_allocations": 0,
+            "record_reuses": 0,
+            "record_evictions": 0,
+            "record_releases": 0,
             "pinned_expert_bytes": 0,
             "inflight_expert_bytes": 0,
             "speculative_expert_bytes": 0,
             "runtime_workspace_bytes": runtime_workspace_bytes,
             "inflight_expert_staging_bytes": 0,
-            "requested_reclaim_bytes": 0,
-            "reclaimed_bytes": 0,
-            "regrown_bytes": 0,
-            "evicted_expert_records": 0,
-            "evicted_expert_slabs": 0,
-            "resize_duration_ns": 0,
-            "total_resize_duration_ns": 0,
-            "max_resize_duration_ns": 0,
-            "blocked_by_pin_bytes": 0,
             "admission_failures": 0,
-            "resize_failures": 0,
             "allocator_cache_charged_bytes": allocator_cache_bytes,
             "process_rss_bytes": active_bytes,
             "process_compressed_bytes": 0,
             "system_swap_delta_bytes": 0,
+            "gpu_utilization_percent": 20.0,
+            "python_control_cpu": python_control_cpu,
             "failed_closed": False,
             "failure_reason": None,
         }
@@ -459,7 +473,7 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
         "hold",
         "hold",
         "post_reset",
-        "post_regrow",
+        "post_record_rewarm",
     ]
     assert [point["kv_logical_tokens"] for point in result["timeline"]] == [
         1,
@@ -480,7 +494,7 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
     assert result["lifecycle"] == {
         "reset_observed": True,
         "future_demand_invoked": True,
-        "post_regrow_observed": True,
+        "post_record_rewarm_observed": True,
     }
     assert result["metrics"]["hold_performance_samples"] == [15.9, 16.0, 16.1]
     assert result["metrics"]["hold_warmup_sample"]["generated_token_ids"] == list(
@@ -529,7 +543,7 @@ def test_producer_rejects_hold_count_that_drifts_from_hardware_prompt_reserve() 
     assert calls == []
 
 
-def test_static_producer_uses_reserved_control_without_reclaim_or_regrow() -> None:
+def test_static_producer_uses_reserved_control_without_reclaim_or_rewarm() -> None:
     calls: list[str] = []
     timestamps = iter(
         (
@@ -570,7 +584,7 @@ def test_static_producer_uses_reserved_control_without_reclaim_or_regrow() -> No
     assert result["lifecycle"] == {
         "reset_observed": True,
         "future_demand_invoked": False,
-        "post_regrow_observed": False,
+        "post_record_rewarm_observed": False,
     }
     assert result["kv_growth_steps"] == []
     assert "load_dynamic:32768" not in calls

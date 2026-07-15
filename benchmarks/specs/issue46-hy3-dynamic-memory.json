@@ -32,7 +32,7 @@
     "uv",
     "run",
     "python",
-    "benchmarks/probe_hy3_component_slabs.py",
+    "benchmarks/probe_hy3_direct_cache.py",
     "--hooks-config",
     "benchmarks/specs/issue46-hy3-hardware-hooks.json",
     "--verify-artifact-only"
@@ -41,7 +41,7 @@
     "uv",
     "run",
     "python",
-    "benchmarks/probe_hy3_component_slabs.py",
+    "benchmarks/probe_hy3_direct_cache.py",
     "--hooks-config",
     "benchmarks/specs/issue46-hy3-hardware-hooks.json"
   ],

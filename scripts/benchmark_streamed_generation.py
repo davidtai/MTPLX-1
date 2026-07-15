@@ -119,13 +119,6 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _nonnegative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("value must be non-negative")
-    return parsed
-
-
 def _positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
@@ -1306,28 +1299,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Opt into the Hy3 Q4 physical-memory broker and dynamically "
-            "releasable component-bank expert slabs. Requires the 131072-token "
-            "global component-bank lane and a 110-112 GiB memory limit."
+            "Opt into the Hy3 Q4 single-limit broker and demand-loaded direct "
+            "expert records. Requires the 131072-token global direct-slot lane."
         ),
-    )
-    parser.add_argument(
-        "--expert-slab-slots",
-        type=_positive_int,
-        default=32,
-        help="Expert records per releasable component-bank slab (default: 32).",
-    )
-    parser.add_argument(
-        "--expert-regrow-hysteresis-slabs",
-        type=_nonnegative_int,
-        default=1,
-        help="Free slab equivalents required before lazy regrowth (default: 1).",
-    )
-    parser.add_argument(
-        "--expert-resize-min-interval-ms",
-        type=_nonnegative_int,
-        default=1000,
-        help="Minimum interval between expert-slab resizes (default: 1000 ms).",
     )
     parser.add_argument(
         "--read-chunk",
@@ -1901,7 +1875,7 @@ def build_expert_streaming_config(
             if args.expert_cache_limit
             else None
         ),
-        cache_policy=args.cache_policy,
+        cache_policy=("lru" if args.hy3_q4_dynamic_memory else args.cache_policy),
         cache_scope=args.cache_scope,
         transient_slots=args.transient_slots,
         max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
@@ -1910,11 +1884,10 @@ def build_expert_streaming_config(
         verify_record_hashes=should_verify_source_records(args, validated_manifest),
         verify_sidecar_hash_at_open=args.verified_sidecar,
         trace_routes=args.route_trace_json is not None,
-        resource_telemetry=args.resource_telemetry,
-        dynamic_expert_slabs=args.hy3_q4_dynamic_memory,
-        expert_slab_slots=args.expert_slab_slots,
-        expert_regrow_hysteresis_slabs=args.expert_regrow_hysteresis_slabs,
-        expert_resize_min_interval_ms=args.expert_resize_min_interval_ms,
+        resource_telemetry=(
+            args.resource_telemetry or args.hy3_q4_dynamic_memory
+        ),
+        dynamic_expert_cache=args.hy3_q4_dynamic_memory,
     )
 
 

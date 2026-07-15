@@ -13,7 +13,7 @@ import pytest
 from mtplx.benchmarks.runners.hy3_dynamic_memory import BenchmarkGateError
 
 
-PROBE_SOURCE = "benchmarks/probe_hy3_component_slabs.py"
+PROBE_SOURCE = "benchmarks/probe_hy3_direct_cache.py"
 ARM_SOURCE = "benchmarks/observe_hy3_dynamic_memory_arm.py"
 QUALITY_SOURCE = "benchmarks/benchmark_hy3_kv_quality.py"
 QWEN_SOURCE = "benchmarks/hy3_qwen_isolation.py"
@@ -875,7 +875,13 @@ def test_actual_run_binds_clean_tracked_spec_and_command_sources(
     ).hexdigest()
     calls: list[tuple[Path, dict[str, object]]] = []
 
-    def fake_run_spec(spec: dict[str, object], *, cwd: Path) -> dict[str, object]:
+    def fake_run_spec(
+        spec: dict[str, object],
+        *,
+        cwd: Path,
+        contexts: tuple[int, ...],
+    ) -> dict[str, object]:
+        assert contexts == (4_096, 32_768, 65_536, 131_072)
         calls.append((cwd, spec))
         return {
             "schema": "mtplx-hy3-dynamic-memory-campaign-v1",
@@ -976,7 +982,9 @@ def test_actual_run_rechecks_hardware_hooks_config_after_the_workload(
         _spec: dict[str, object],
         *,
         cwd: Path,
+        contexts: tuple[int, ...],
     ) -> dict[str, object]:
+        del contexts
         (cwd / HOOKS_CONFIG_SOURCE).write_text(
             '{"frozen":"changed-during-run"}\n',
             encoding="utf-8",
@@ -1167,7 +1175,9 @@ def test_actual_run_rechecks_clean_provenance_after_the_workload(
         _spec: dict[str, object],
         *,
         cwd: Path,
+        contexts: tuple[int, ...],
     ) -> dict[str, object]:
+        del contexts
         (cwd / ARM_SOURCE).write_text("# changed during campaign\n", encoding="utf-8")
         return {
             "schema": "mtplx-hy3-dynamic-memory-campaign-v1",
@@ -1202,8 +1212,13 @@ def test_actual_run_executes_the_same_spec_bytes_it_hashes(
         finally:
             path.write_bytes(frozen_bytes)
 
-    def fake_run_spec(spec: dict[str, object], *, cwd: Path) -> dict[str, object]:
-        del cwd
+    def fake_run_spec(
+        spec: dict[str, object],
+        *,
+        cwd: Path,
+        contexts: tuple[int, ...],
+    ) -> dict[str, object]:
+        del cwd, contexts
         executed_seeds.append(int(spec["bootstrap_seed"]))
         return {"status": "passed"}
 

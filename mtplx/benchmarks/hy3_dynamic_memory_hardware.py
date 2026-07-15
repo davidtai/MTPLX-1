@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -209,6 +210,34 @@ def _host_memory_health_snapshot(
     }
 
 
+_GPU_UTILIZATION_PATTERN = re.compile(
+    r'"Device Utilization %"\s*=\s*([0-9]+(?:\.[0-9]+)?)'
+)
+
+
+def _parse_gpu_utilization_percent(output: str) -> float:
+    values = [float(match) for match in _GPU_UTILIZATION_PATTERN.findall(output)]
+    if not values or any(not 0.0 <= value <= 100.0 for value in values):
+        raise ArmObservationError("AGX GPU utilization evidence is unavailable")
+    return max(values)
+
+
+def _gpu_utilization_percent() -> float:
+    completed = subprocess.run(
+        ("/usr/sbin/ioreg", "-r", "-d", "1", "-w", "0", "-c", "AGXAccelerator"),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise ArmObservationError(
+            f"AGX GPU utilization sampling failed ({completed.returncode})"
+        )
+    return _parse_gpu_utilization_percent(completed.stdout)
+
+
 def _mapping(value: object) -> Mapping[str, object]:
     if isinstance(value, Mapping):
         return value
@@ -256,13 +285,10 @@ class Hy3HardwareConfig:
     manifest: Path
     model_artifact_id: str
     artifact_pins: ArtifactPins
-    memory_limit_bytes: int = 110 * GIB
+    memory_limit_bytes: int = 100 * GIB
     runtime_reserve_bytes: int = 8 * GIB
     allocator_headroom_bytes: int = GIB
     transient_slots: int = 32
-    expert_slab_slots: int = 32
-    expert_regrow_hysteresis_slabs: int = 1
-    expert_resize_min_interval_ms: int = 1000
     generated_tokens: int = 16
     hold_sample_count: int = 3
     hold_tokens: int = 8
@@ -289,9 +315,6 @@ class Hy3HardwareConfig:
             "runtime_reserve_bytes",
             "allocator_headroom_bytes",
             "transient_slots",
-            "expert_slab_slots",
-            "expert_regrow_hysteresis_slabs",
-            "expert_resize_min_interval_ms",
             "generated_tokens",
             "hold_sample_count",
             "hold_tokens",
@@ -324,7 +347,7 @@ class Hy3HardwareConfig:
             ),
             artifact_pins=artifact_pins,
             memory_limit_bytes=_exact_int(
-                value.get("memory_limit_bytes", 110 * GIB),
+                value.get("memory_limit_bytes", 100 * GIB),
                 field="memory_limit_bytes",
                 minimum=1,
             ),
@@ -340,19 +363,6 @@ class Hy3HardwareConfig:
                 value.get("transient_slots", 32),
                 field="transient_slots",
                 minimum=1,
-            ),
-            expert_slab_slots=_exact_int(
-                value.get("expert_slab_slots", 32),
-                field="expert_slab_slots",
-                minimum=1,
-            ),
-            expert_regrow_hysteresis_slabs=_exact_int(
-                value.get("expert_regrow_hysteresis_slabs", 1),
-                field="expert_regrow_hysteresis_slabs",
-            ),
-            expert_resize_min_interval_ms=_exact_int(
-                value.get("expert_resize_min_interval_ms", 1000),
-                field="expert_resize_min_interval_ms",
             ),
             generated_tokens=_exact_int(
                 value.get("generated_tokens", 16),
@@ -388,10 +398,6 @@ class Hy3HardwareConfig:
                 minimum=1,
             ),
         )
-        if config.memory_limit_bytes != 110 * GIB:
-            raise ArmObservationError(
-                "issue #46 hardware arms require the 110 GiB operating target"
-            )
         if config.allocator_headroom_bytes != HY3_Q4_ALLOCATOR_HEADROOM_BYTES:
             raise ArmObservationError(
                 "allocator_headroom_bytes must be exactly 1 GiB for issue #46"
@@ -606,14 +612,14 @@ def preflight_and_grow_dynamic_q4(
                 )
             if reclaim_gap["kv_physical_bytes"] != before["kv_physical_bytes"]:
                 raise ArmObservationError("Q4 bytes changed inside a reservation gap")
-            if int(reclaim_gap["expert_slab_physical_bytes"]) > int(
-                before["expert_slab_physical_bytes"]
+            if int(reclaim_gap["expert_cache_physical_bytes"]) > int(
+                before["expert_cache_physical_bytes"]
             ):
                 raise ArmObservationError(
-                    "expert slabs regrew inside protected Q4 growth"
+                    "expert records reallocated inside protected Q4 growth"
                 )
-            expert_release = int(before["expert_slab_physical_bytes"]) - int(
-                reclaim_gap["expert_slab_physical_bytes"]
+            expert_release = int(before["expert_cache_physical_bytes"]) - int(
+                reclaim_gap["expert_cache_physical_bytes"]
             )
             allocator_release = (
                 int(before["allocator_active_bytes"])
@@ -667,7 +673,7 @@ def preflight_and_grow_dynamic_q4(
     reclaimed = dict(_mapping(first["reclaim_gap"]))
     if int(first["reclaimed_expert_bytes"]) <= 0:
         raise ArmObservationError(
-            "preflight reservation did not physically reclaim an expert slab"
+            "preflight reservation did not physically evict an expert record"
         )
     after = physical_ledger()
     if int(after["kv_allocated_blocks"]) != target_blocks:
@@ -678,13 +684,13 @@ def preflight_and_grow_dynamic_q4(
     return reclaimed
 
 
-def trigger_future_demand_regrow(
+def trigger_future_demand_record_rewarm(
     *,
     expert_runtime: Any,
     route_trace: Sequence[Mapping[str, object]],
     expert_physical_bytes: Callable[[], int],
 ) -> None:
-    """Cause lazy regrow only through a real post-reset route demand."""
+    """Warm a released record only through real post-reset route demand."""
 
     route = next(
         (
@@ -709,7 +715,7 @@ def trigger_future_demand_regrow(
     after = int(expert_physical_bytes())
     if after <= before:
         raise ArmObservationError(
-            "future route demand did not physically regrow expert capacity"
+            "future route demand did not allocate an expert record"
         )
 
 
@@ -795,11 +801,8 @@ def _build_runtime_config(config: Hy3HardwareConfig, *, arm: str) -> Any:
         transient_slots=config.transient_slots,
         cache_policy="lru",
         cache_scope="global",
-        slot_layout="component-banks",
-        dynamic_expert_slabs=arm == "dynamic",
-        expert_slab_slots=config.expert_slab_slots,
-        expert_regrow_hysteresis_slabs=config.expert_regrow_hysteresis_slabs,
-        expert_resize_min_interval_ms=config.expert_resize_min_interval_ms,
+        slot_layout="direct-slots",
+        dynamic_expert_cache=arm == "dynamic",
         verify_sidecar_hash_at_open=False,
         verify_record_hashes=True,
         resource_telemetry=True,
@@ -819,7 +822,7 @@ def _static_post_load_memory_pools(
     plan = runtime_config.memory_plan(expert_runtime.spec)
     allocator = mlx_memory_telemetry(mx)
     expert_bytes = int(
-        expert_runtime.slots.expert_slab_telemetry_snapshot()["physical_bytes"]
+        expert_runtime.slots.persistent_cache_telemetry_snapshot()["physical_bytes"]
     )
     transient_bytes = int(plan.transient_bytes)
     staging_bytes = transient_bytes + int(plan.io_staging_bytes)
@@ -1130,7 +1133,6 @@ class MlxHy3HardwareLane:
             "attention_runtime_env": dict(HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV),
             "expert_streaming_config": self.runtime_config.to_dict(),
             "planned_persistent_slots": int(plan.persistent_slots),
-            "probe_slab_ids": [0, 1],
         }
         return {
             "model_key": "hy3-q4",
@@ -1152,7 +1154,9 @@ class MlxHy3HardwareLane:
         }
 
     def _expert_physical_bytes(self) -> int:
-        snapshot = self.runtime.expert_streaming.slots.expert_slab_telemetry_snapshot()
+        snapshot = (
+            self.runtime.expert_streaming.slots.persistent_cache_telemetry_snapshot()
+        )
         return int(snapshot["physical_bytes"])
 
     def _live_physical_ledger(self) -> dict[str, object]:
@@ -1163,7 +1167,7 @@ class MlxHy3HardwareLane:
         expert_runtime = self.runtime.expert_streaming
         expert_runtime._raise_if_unhealthy()
         slot_pool = expert_runtime.slots
-        slab_details = _mapping(slot_pool.expert_slab_telemetry_snapshot())
+        cache_details = _mapping(slot_pool.persistent_cache_telemetry_snapshot())
         health = _mapping(slot_pool.health_telemetry_snapshot())
         io_health = _mapping(health.get("io"))
         if "integrity_errors" not in io_health:
@@ -1187,7 +1191,7 @@ class MlxHy3HardwareLane:
             raise ArmObservationError(
                 f"Q4 physical ledger has {kv_bytes} bytes for {blocks} blocks"
             )
-        expert_bytes = int(slab_details["physical_bytes"])
+        expert_bytes = int(cache_details["physical_bytes"])
         broker = getattr(expert_runtime, "memory_broker", None)
         broker_snapshot = None
         if broker is None:
@@ -1197,15 +1201,17 @@ class MlxHy3HardwareLane:
             broker_snapshot = broker.snapshot()
             if int(broker_snapshot.kv_physical_bytes) != kv_bytes:
                 raise ArmObservationError("broker KV bytes differ from retained cache")
-            if int(broker_snapshot.expert_slab_physical_bytes) != expert_bytes:
+            if int(broker_snapshot.expert_cache_physical_bytes) != expert_bytes:
                 raise ArmObservationError(
-                    "broker expert bytes differ from slab registry"
+                    "broker expert bytes differ from direct-record registry"
                 )
         allocator = mlx_memory_telemetry(mx)
         sampler = getattr(self.runtime, "expert_resource_telemetry_snapshot", None)
         resource = _mapping(sampler()) if callable(sampler) else {}
+        python_control_cpu = _mapping(resource.get("python_control_cpu"))
+        if not python_control_cpu:
+            raise ArmObservationError("runtime omitted Python control CPU telemetry")
         dynamic = _mapping(resource.get("dynamic_memory"))
-        cache_resource = _mapping(resource.get("cache"))
         kv_resource = _mapping(resource.get("kv"))
         resource_broker = _mapping(resource.get("memory_broker"))
         broker_values = _mapping(broker_snapshot) or resource_broker
@@ -1270,21 +1276,9 @@ class MlxHy3HardwareLane:
                 raise ArmObservationError(
                     "broker charged bytes differ from the six-pool additive ledger"
                 )
-        reclaimed_bytes = int(_first((dynamic,), "reclaimed_bytes"))
-        slab_bytes = int(self.config.expert_slab_slots) * int(
-            getattr(spec, "expert_record_bytes", 0)
-        )
-        evicted_slabs = int(
-            _first(
-                (resource, dynamic),
-                "expert_evicted_slabs",
-                "evicted_expert_slabs",
-                default=(reclaimed_bytes // slab_bytes if slab_bytes else 0),
-            )
-        )
         budget = getattr(broker, "budget", None)
-        operating_target_bytes = int(
-            getattr(budget, "operating_target_bytes", self.config.memory_limit_bytes)
+        memory_limit_bytes = int(
+            getattr(budget, "memory_limit_bytes", self.config.memory_limit_bytes)
         )
         allocator_headroom_bytes = int(
             getattr(
@@ -1293,11 +1287,11 @@ class MlxHy3HardwareLane:
                 self.config.allocator_headroom_bytes,
             )
         )
-        classified_target_bytes = int(
+        classified_limit_bytes = int(
             getattr(
                 budget,
-                "classified_target_bytes",
-                operating_target_bytes - allocator_headroom_bytes,
+                "classified_limit_bytes",
+                memory_limit_bytes - allocator_headroom_bytes,
             )
         )
         host = _host_memory_health_snapshot(
@@ -1307,22 +1301,15 @@ class MlxHy3HardwareLane:
             "allocator_active_bytes": active_bytes,
             "allocator_cache_bytes": allocator_cache_bytes,
             "allocator_peak_bytes": int(allocator["peak_memory_bytes"]),
-            "expert_slab_physical_bytes": expert_bytes,
+            "expert_cache_physical_bytes": expert_bytes,
             "kv_physical_bytes": kv_bytes,
             "kv_allocated_blocks": blocks,
-            "operating_target_bytes": operating_target_bytes,
-            "hard_ceiling_bytes": int(
-                getattr(
-                    getattr(broker, "budget", None),
-                    "hard_ceiling_bytes",
-                    112 * GIB,
-                )
-            ),
+            "memory_limit_bytes": memory_limit_bytes,
             "allocator_headroom_bytes": allocator_headroom_bytes,
-            "classified_target_bytes": classified_target_bytes,
+            "classified_limit_bytes": classified_limit_bytes,
             "classified_bytes": classified_bytes,
             "charged_bytes": charged_bytes,
-            "charged_residual_bytes": operating_target_bytes - charged_bytes,
+            "charged_residual_bytes": memory_limit_bytes - charged_bytes,
             "resident_model_bytes": resident_model_bytes,
             "kv_representation": str(
                 _first((kv_resource,), "representation", default="q4")
@@ -1337,66 +1324,51 @@ class MlxHy3HardwareLane:
             ),
             "expert_logical_records": int(
                 _first(
-                    (dynamic, slab_details),
+                    (dynamic, cache_details),
                     "logical_expert_records",
-                    "logical_slot_count",
+                    "logical_record_capacity",
                     default=int(plan_values.get("persistent_slots", 0)),
                 )
             ),
+            "expert_allocated_records": int(
+                _first((cache_details,), "allocated_record_count")
+            ),
             "expert_active_records": int(
                 _first(
-                    (dynamic, slab_details),
+                    (dynamic, cache_details),
                     "active_expert_records",
-                    "active_slot_count",
+                    "allocated_record_count",
                 )
             ),
             "expert_resident_records": int(
                 _first(
-                    (dynamic, slab_details),
+                    (dynamic, cache_details),
                     "resident_expert_records",
                     "resident_record_count",
                 )
             ),
-            "expert_logical_slabs": int(
-                _first(
-                    (dynamic, slab_details),
-                    "logical_slab_count",
-                    default=int(slab_details.get("logical_slab_count", 0)),
-                )
-            ),
-            "expert_active_slabs": int(
-                _first(
-                    (dynamic, slab_details),
-                    "active_slab_count",
-                    default=int(slab_details.get("active_slab_count", 0)),
-                )
-            ),
-            "expert_draining_slabs": int(
-                _first(
-                    (dynamic, slab_details),
-                    "draining_slab_count",
-                    default=int(slab_details.get("draining_slab_count", 0)),
-                )
-            ),
-            "expert_released_slabs": int(
-                _first(
-                    (dynamic, slab_details),
-                    "released_slab_count",
-                    default=int(slab_details.get("released_slab_count", 0)),
-                )
-            ),
+            "record_allocations": int(_first((dynamic,), "record_allocations")),
+            "record_reuses": int(_first((dynamic,), "record_reuses")),
+            "record_evictions": int(_first((dynamic,), "record_evictions")),
+            "record_releases": int(_first((dynamic,), "record_releases")),
             "pinned_expert_bytes": int(
                 _first(
-                    (broker_values, dynamic, slab_details),
+                    (broker_values, dynamic),
                     "pinned_expert_bytes",
-                    "pinned_bytes",
+                    default=(
+                        int(cache_details.get("pinned_record_count", 0))
+                        * int(getattr(spec, "expert_record_bytes", 0))
+                    ),
                 )
             ),
             "inflight_expert_bytes": int(
                 _first(
-                    (dynamic, slab_details),
+                    (dynamic,),
                     "in_flight_expert_bytes",
-                    "in_flight_bytes",
+                    default=(
+                        int(cache_details.get("in_flight_record_count", 0))
+                        * int(getattr(spec, "expert_record_bytes", 0))
+                    ),
                 )
             ),
             "speculative_expert_bytes": int(
@@ -1404,25 +1376,6 @@ class MlxHy3HardwareLane:
             ),
             "runtime_workspace_bytes": runtime_workspace_bytes,
             "inflight_expert_staging_bytes": inflight_staging_bytes,
-            "requested_reclaim_bytes": int(
-                _first((dynamic,), "requested_reclaim_bytes")
-            ),
-            "reclaimed_bytes": reclaimed_bytes,
-            "regrown_bytes": int(_first((dynamic,), "regrown_bytes")),
-            "evicted_expert_records": int(
-                _first(
-                    (resource, dynamic, cache_resource),
-                    "evicted_expert_records",
-                    "evictions",
-                )
-            ),
-            "evicted_expert_slabs": evicted_slabs,
-            "resize_duration_ns": int(_first((dynamic,), "resize_duration_ns")),
-            "total_resize_duration_ns": int(
-                _first((dynamic,), "total_resize_duration_ns")
-            ),
-            "max_resize_duration_ns": int(_first((dynamic,), "max_resize_duration_ns")),
-            "blocked_by_pin_bytes": int(_first((dynamic,), "blocked_by_pin_bytes")),
             "admission_failures": int(
                 _first(
                     (broker_values, dynamic),
@@ -1430,9 +1383,10 @@ class MlxHy3HardwareLane:
                     "admission_failure_count",
                 )
             ),
-            "resize_failures": int(_first((dynamic,), "resize_failures")),
             "allocator_cache_charged_bytes": charged_allocator_cache_bytes,
             **host,
+            "gpu_utilization_percent": _gpu_utilization_percent(),
+            "python_control_cpu": dict(python_control_cpu),
             "failed_closed": bool(
                 _first((broker_values, dynamic), "failed_closed", default=False)
             ),
@@ -1610,9 +1564,9 @@ class MlxHy3HardwareLane:
     def trigger_future_expert_demand(self) -> None:
         if self.request.arm != "dynamic":
             raise ArmObservationError(
-                "future-demand regrow applies only to dynamic arm"
+                "future-demand record rewarm applies only to dynamic arm"
             )
-        trigger_future_demand_regrow(
+        trigger_future_demand_record_rewarm(
             expert_runtime=self.runtime.expert_streaming,
             route_trace=self._invocation_route_trace,
             expert_physical_bytes=self._expert_physical_bytes,
@@ -1683,5 +1637,5 @@ __all__ = [
     "ProductionHy3HardwareHooks",
     "create_hooks",
     "preflight_and_grow_dynamic_q4",
-    "trigger_future_demand_regrow",
+    "trigger_future_demand_record_rewarm",
 ]

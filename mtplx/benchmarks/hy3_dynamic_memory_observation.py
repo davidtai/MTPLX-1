@@ -344,7 +344,7 @@ def _timeline_point(
         "allocator_active_bytes",
         "allocator_cache_bytes",
         "allocator_peak_bytes",
-        "expert_slab_physical_bytes",
+        "expert_cache_physical_bytes",
         "kv_physical_bytes",
         "kv_allocated_blocks",
         "slot_health",
@@ -373,7 +373,7 @@ def _timeline_point(
             "allocator_active_bytes",
             "allocator_cache_bytes",
             "allocator_peak_bytes",
-            "expert_slab_physical_bytes",
+            "expert_cache_physical_bytes",
             "kv_physical_bytes",
             "kv_allocated_blocks",
             *ISSUE46_RESOURCE_INTEGER_FIELDS,
@@ -390,6 +390,18 @@ def _timeline_point(
     representation = raw["kv_representation"]
     if representation != "q4":
         raise ArmObservationError(f"{phase}.kv_representation must be q4")
+    gpu_utilization = raw["gpu_utilization_percent"]
+    if (
+        isinstance(gpu_utilization, bool)
+        or not isinstance(gpu_utilization, (int, float))
+        or not 0.0 <= float(gpu_utilization) <= 100.0
+    ):
+        raise ArmObservationError(
+            f"{phase}.gpu_utilization_percent must be between 0 and 100"
+        )
+    python_control_cpu = dict(
+        _mapping(raw["python_control_cpu"], field=f"{phase}.python_control_cpu")
+    )
     failed_closed = raw["failed_closed"]
     if not isinstance(failed_closed, bool):
         raise ArmObservationError(f"{phase}.failed_closed must be a boolean")
@@ -418,7 +430,7 @@ def _timeline_point(
     classified_bytes = (
         numeric["resident_model_bytes"]
         + numeric["kv_physical_bytes"]
-        + numeric["expert_slab_physical_bytes"]
+        + numeric["expert_cache_physical_bytes"]
         + numeric["inflight_expert_staging_bytes"]
         + numeric["runtime_workspace_bytes"]
     )
@@ -426,11 +438,11 @@ def _timeline_point(
         raise ArmObservationError(
             f"{phase}.classified_bytes must equal the five steady pools"
         )
-    if numeric["classified_target_bytes"] != (
-        numeric["operating_target_bytes"] - numeric["allocator_headroom_bytes"]
+    if numeric["classified_limit_bytes"] != (
+        numeric["memory_limit_bytes"] - numeric["allocator_headroom_bytes"]
     ):
         raise ArmObservationError(
-            f"{phase}.classified_target_bytes must preserve allocator headroom"
+            f"{phase}.classified_limit_bytes must preserve allocator headroom"
         )
     expected_charged = classified_bytes + numeric["allocator_cache_charged_bytes"]
     if numeric["charged_bytes"] != expected_charged:
@@ -438,7 +450,7 @@ def _timeline_point(
             f"{phase}.charged_bytes must equal the six-pool additive ledger"
         )
     if numeric["charged_residual_bytes"] != (
-        numeric["operating_target_bytes"] - numeric["charged_bytes"]
+        numeric["memory_limit_bytes"] - numeric["charged_bytes"]
     ):
         raise ArmObservationError(
             f"{phase}.charged_residual_bytes must match charged memory"
@@ -469,6 +481,8 @@ def _timeline_point(
         **numeric,
         "system_swap_delta_bytes": swap_delta,
         "kv_representation": representation,
+        "gpu_utilization_percent": float(gpu_utilization),
+        "python_control_cpu": python_control_cpu,
         "failed_closed": failed_closed,
         "failure_reason": failure_reason,
         "slot_health": slot_health,
@@ -722,7 +736,11 @@ def produce_arm_observation(
         if request.arm == "dynamic":
             lane.trigger_future_expert_demand()
             timeline.append(
-                _timeline_point(lane, phase="post_regrow", monotonic_ns=monotonic_ns)
+                _timeline_point(
+                    lane,
+                    phase="post_record_rewarm",
+                    monotonic_ns=monotonic_ns,
+                )
             )
 
         generated_tokens = invocation["generated_token_ids"]
@@ -756,7 +774,7 @@ def produce_arm_observation(
             "lifecycle": {
                 "reset_observed": True,
                 "future_demand_invoked": request.arm == "dynamic",
-                "post_regrow_observed": request.arm == "dynamic",
+                "post_record_rewarm_observed": request.arm == "dynamic",
             },
             "metrics": {
                 "generated_tokens": len(generated_tokens),

@@ -295,7 +295,7 @@ def test_issue30_exclusive_guard_recognizes_issue46_campaign_processes() -> None
     assert (
         "observe_hy3_dynamic_memory_arm.py" in issue30_module.BENCHMARK_PROCESS_PATTERNS
     )
-    assert "probe_hy3_component_slabs.py" in issue30_module.BENCHMARK_PROCESS_PATTERNS
+    assert "probe_hy3_direct_cache.py" in issue30_module.BENCHMARK_PROCESS_PATTERNS
 
 
 @pytest.mark.parametrize("invalid", (math.nan, math.inf, -math.inf))

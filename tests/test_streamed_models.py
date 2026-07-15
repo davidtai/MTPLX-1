@@ -1501,7 +1501,7 @@ def test_component_bank_hy3_executes_without_record_or_stack_copies(
         runtime.close()
 
 
-def test_global_component_bank_allocator_owns_independent_persistent_slabs(
+def test_global_component_bank_allocator_owns_independent_static_persistent_banks(
     tmp_path: Path,
 ) -> None:
     root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
@@ -1548,28 +1548,14 @@ def test_global_component_bank_allocator_owns_independent_persistent_slabs(
         assert allocator.banks[("global-persistent", 1)].capacity == 1
         assert runtime.slots.allocated_bytes == expected_slot_bytes
         assert physical_bank_bytes == expected_slot_bytes
-
-        stable_slot = runtime.slots._persistent[(-1, 0)]
-        original_buffer = stable_slot.buffer
-        original_bank = original_buffer.bank
-        ticket = runtime.slots.prepare_slab_reclaim((0,))
-        released = runtime.slots.commit_slab_reclaim(ticket)
-        assert released.physical_bytes == 2 * spec.expert_record_bytes
-        assert stable_slot.buffer is None
-        assert not original_bank.arrays
-        assert ("global-persistent", 0) not in allocator.banks
-
-        runtime.slots.regrow_slab(0)
-        assert runtime.slots._persistent[(-1, 0)] is stable_slot
-        assert stable_slot.buffer is not None
-        assert stable_slot.buffer is not original_buffer
-        assert stable_slot.buffer.bank is not original_bank
-        assert runtime.slots.allocated_bytes == expected_slot_bytes
+        assert not hasattr(allocator, "allocate_slab")
+        assert not hasattr(allocator, "release_slab")
+        assert not hasattr(allocator, "slab_is_allocated")
     finally:
         runtime.close()
 
 
-def test_component_slab_allocator_enforces_construction_owner_thread(
+def test_component_bank_allocator_enforces_construction_owner_thread(
     tmp_path: Path,
 ) -> None:
     _root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
@@ -1590,22 +1576,25 @@ def test_component_slab_allocator_enforces_construction_owner_thread(
     )
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            rejected_allocate = executor.submit(allocator.allocate_slab, 0)
+            rejected_allocate = executor.submit(
+                allocator,
+                spec.expert_record_bytes,
+                "global-persistent-0",
+            )
             with pytest.raises(RuntimeError, match="owner thread"):
                 rejected_allocate.result(timeout=2)
         assert allocator.banks == {}
 
-        allocated = allocator.allocate_slab(0)
-        assert tuple(allocated) == (0,)
+        allocated = allocator(
+            spec.expert_record_bytes,
+            "global-persistent-0",
+        )
+        assert allocated.label == "global-persistent-0"
         with ThreadPoolExecutor(max_workers=1) as executor:
-            rejected_release = executor.submit(allocator.release_slab, 0)
+            rejected_release = executor.submit(allocator.close)
             with pytest.raises(RuntimeError, match="owner thread"):
                 rejected_release.result(timeout=2)
         assert ("global-persistent", 0) in allocator.banks
-        released = allocator.release_slab(0)
-        assert released.destroyed is True
-        assert released.slab_id == 0
-        assert released.physical_bytes == spec.expert_record_bytes
     finally:
         allocator.close()
 

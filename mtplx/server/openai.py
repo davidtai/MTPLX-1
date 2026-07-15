@@ -14304,10 +14304,9 @@ def _hy3_q4_dynamic_context_enabled(state: Any) -> bool:
 HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS = frozenset(
     {
         "enabled",
-        "operating_target_bytes",
-        "hard_ceiling_bytes",
+        "memory_limit_bytes",
         "allocator_headroom_bytes",
-        "classified_target_bytes",
+        "classified_limit_bytes",
         "classified_bytes",
         "charged_bytes",
         "charged_residual_bytes",
@@ -14317,13 +14316,14 @@ HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS = frozenset(
         "kv_physical_blocks",
         "kv_physical_bytes",
         "expert_logical_records",
+        "expert_allocated_records",
         "expert_active_records",
         "expert_resident_records",
-        "expert_logical_slabs",
-        "expert_active_slabs",
-        "expert_draining_slabs",
-        "expert_released_slabs",
         "expert_physical_bytes",
+        "record_allocations",
+        "record_reuses",
+        "record_evictions",
+        "record_releases",
         "pinned_expert_bytes",
         "inflight_expert_bytes",
         "speculative_expert_bytes",
@@ -14332,17 +14332,7 @@ HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS = frozenset(
         "allocator_active_bytes",
         "allocator_cache_bytes",
         "allocator_peak_bytes",
-        "requested_reclaim_bytes",
-        "reclaimed_bytes",
-        "regrown_bytes",
-        "evicted_expert_records",
-        "evicted_expert_slabs",
-        "resize_duration_ns",
-        "total_resize_duration_ns",
-        "max_resize_duration_ns",
-        "blocked_by_pin_bytes",
         "admission_failures",
-        "resize_failures",
         "expert_cache_hit_rate",
         "ssd_bytes_per_token",
         "decode_tps",
@@ -14351,6 +14341,7 @@ HY3_Q4_DYNAMIC_MEMORY_HEALTH_KEYS = frozenset(
         "process_rss_bytes",
         "process_compressed_bytes",
         "system_swap_delta_bytes",
+        "python_control_cpu",
         "failed_closed",
         "failure_reason",
         "sampling_error",
@@ -14407,15 +14398,14 @@ def _hy3_q4_dynamic_memory_health(state: Any) -> dict[str, Any]:
         str,
         tuple[Iterable[Mapping[str, Any]], tuple[str, ...]],
     ] = {
-        "operating_target_bytes": (general_sources, ("operating_target_bytes",)),
-        "hard_ceiling_bytes": (general_sources, ("hard_ceiling_bytes",)),
+        "memory_limit_bytes": (general_sources, ("memory_limit_bytes",)),
         "allocator_headroom_bytes": (
             general_sources,
             ("allocator_headroom_bytes",),
         ),
-        "classified_target_bytes": (
+        "classified_limit_bytes": (
             general_sources,
-            ("classified_target_bytes",),
+            ("classified_limit_bytes",),
         ),
         "classified_bytes": (general_sources, ("classified_bytes",)),
         "charged_bytes": (general_sources, ("charged_bytes",)),
@@ -14448,26 +14438,18 @@ def _hy3_q4_dynamic_memory_health(state: Any) -> dict[str, Any]:
             general_sources,
             ("resident_expert_records", "expert_resident_records"),
         ),
-        "expert_logical_slabs": (
+        "expert_allocated_records": (
             general_sources,
-            ("logical_slab_count", "expert_logical_slabs"),
-        ),
-        "expert_active_slabs": (
-            general_sources,
-            ("active_slab_count", "expert_active_slabs"),
-        ),
-        "expert_draining_slabs": (
-            general_sources,
-            ("draining_slab_count", "expert_draining_slabs"),
-        ),
-        "expert_released_slabs": (
-            general_sources,
-            ("released_slab_count", "expert_released_slabs"),
+            ("allocated_record_count", "expert_allocated_records"),
         ),
         "expert_physical_bytes": (
             general_sources,
-            ("expert_slab_physical_bytes", "expert_physical_bytes"),
+            ("expert_cache_physical_bytes", "expert_physical_bytes"),
         ),
+        "record_allocations": (general_sources, ("record_allocations",)),
+        "record_reuses": (general_sources, ("record_reuses",)),
+        "record_evictions": (general_sources, ("record_evictions",)),
+        "record_releases": (general_sources, ("record_releases",)),
         "pinned_expert_bytes": (general_sources, ("pinned_expert_bytes",)),
         "inflight_expert_bytes": (
             general_sources,
@@ -14488,35 +14470,10 @@ def _hy3_q4_dynamic_memory_health(state: Any) -> dict[str, Any]:
         "allocator_active_bytes": (general_sources, ("allocator_active_bytes",)),
         "allocator_cache_bytes": (general_sources, ("allocator_cache_bytes",)),
         "allocator_peak_bytes": (general_sources, ("allocator_peak_bytes",)),
-        "requested_reclaim_bytes": (
-            general_sources,
-            ("requested_reclaim_bytes",),
-        ),
-        "reclaimed_bytes": (general_sources, ("reclaimed_bytes",)),
-        "regrown_bytes": (general_sources, ("regrown_bytes",)),
-        "evicted_expert_records": (
-            (dynamic, resource, cache),
-            ("evicted_expert_records", "evictions"),
-        ),
-        "evicted_expert_slabs": (
-            (dynamic, resource),
-            ("evicted_expert_slabs", "expert_evicted_slabs"),
-        ),
-        "resize_duration_ns": (general_sources, ("resize_duration_ns",)),
-        "total_resize_duration_ns": (
-            general_sources,
-            ("total_resize_duration_ns",),
-        ),
-        "max_resize_duration_ns": (
-            general_sources,
-            ("max_resize_duration_ns",),
-        ),
-        "blocked_by_pin_bytes": (general_sources, ("blocked_by_pin_bytes",)),
         "admission_failures": (
             general_sources,
             ("admission_failures", "admission_failure_count"),
         ),
-        "resize_failures": (general_sources, ("resize_failures",)),
         "expert_cache_hit_rate": (
             (resource, cache),
             ("expert_cache_hit_rate", "hit_rate"),
@@ -14536,6 +14493,7 @@ def _hy3_q4_dynamic_memory_health(state: Any) -> dict[str, Any]:
         ),
         "failed_closed": (general_sources, ("failed_closed",)),
         "failure_reason": (general_sources, ("failure_reason",)),
+        "python_control_cpu": ((resource,), ("python_control_cpu",)),
     }
     for field, (sources, aliases) in field_sources.items():
         payload[field] = _health_first(sources, *aliases)

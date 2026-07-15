@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Prove that real Hy3 component slabs release charged MLX memory."""
+"""Prove Hy3 direct expert records allocate lazily, replace, and release."""
 
 from __future__ import annotations
 
 import argparse
-import gc
 import hashlib
 import json
 import os
@@ -21,10 +20,9 @@ if str(_ROOT) not in sys.path:
 from mtplx.benchmarks.runners.hy3_dynamic_memory import (  # noqa: E402
     HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV,
     AllocatorSample,
-    ProbeSlab,
     canonical_sha256,
     normalize_arm_config,
-    run_allocator_release_probe,
+    run_direct_cache_probe,
 )
 from mtplx.benchmarks.hy3_dynamic_memory_artifacts import (  # noqa: E402
     ArtifactAttestationError,
@@ -92,9 +90,9 @@ def load_sidecar_record(
     root: Path,
     manifest: Any,
     record: Any,
-    slot: Any,
+    buffer: Any,
 ) -> None:
-    """Copy one exact sidecar record into component-major slot views."""
+    """Copy one verified sidecar record into a contiguous direct slot."""
 
     sidecar = getattr(manifest, "sidecar", None)
     offset = getattr(record, "sidecar_offset", None)
@@ -110,37 +108,23 @@ def load_sidecar_record(
         or any(character not in "0123456789abcdef" for character in expected_sha256)
     ):
         raise RuntimeError("probe record has no valid payload hash")
-    views = tuple(slot.record_views(record))
-    if len(views) != len(record.segments):
-        raise RuntimeError("probe component view count differs from record segments")
+    view = memoryview(buffer)
+    if view.readonly or not view.c_contiguous or view.nbytes != int(length):
+        view.release()
+        raise RuntimeError("probe direct record buffer is not writable and contiguous")
     descriptor = os.open(root / sidecar.file, os.O_RDONLY)
     try:
-        cursor = 0
-        digest = hashlib.sha256()
-        payloads: list[bytes] = []
-        for segment, view in zip(record.segments, views, strict=True):
-            expected = int(segment.length)
-            payload = os.pread(descriptor, expected, int(offset) + cursor)
-            if len(payload) != expected:
-                raise RuntimeError(
-                    f"short sidecar read at component offset {cursor}: "
-                    f"expected {expected}, got {len(payload)}"
-                )
-            if view.nbytes != expected:
-                raise RuntimeError("component view length differs from manifest")
-            digest.update(payload)
-            payloads.append(payload)
-            cursor += expected
-        if cursor != int(length):
-            raise RuntimeError("component segments do not cover the sidecar record")
-        if digest.hexdigest() != expected_sha256:
+        payload = os.pread(descriptor, int(length), int(offset))
+        if len(payload) != int(length):
+            raise RuntimeError(
+                f"short sidecar read: expected {int(length)}, got {len(payload)}"
+            )
+        if hashlib.sha256(payload).hexdigest() != expected_sha256:
             raise RuntimeError("probe sidecar record hash mismatch")
-        for view, payload in zip(views, payloads, strict=True):
-            view[:] = payload
+        view[:] = payload
     finally:
         os.close(descriptor)
-        for view in views:
-            view.release()
+        view.release()
 
 
 def build_probe_identity(
@@ -185,7 +169,6 @@ def _probe_arm_config(runtime_config: Any, plan: Any) -> dict[str, object]:
         "attention_runtime_env": dict(HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV),
         "expert_streaming_config": runtime_config.to_dict(),
         "planned_persistent_slots": int(plan.persistent_slots),
-        "probe_slab_ids": [0, 1],
     }
 
 
@@ -211,12 +194,13 @@ def run_real_probe(
 ) -> dict[str, object]:
     import mlx.core as mx
 
+    from mtplx.expert_io import PositionalExpertReader
     from mtplx.expert_runtime import mlx_memory_telemetry
-    from mtplx.expert_slots import ExpertSlotBinding
+    from mtplx.expert_slots import ExpertSlotBinding, ExpertSlotPool
     from mtplx.expert_streaming_models import HY3_Q4
     from mtplx.models.expert_mlx import (
-        _run_component_bank_q4,
-        make_mlx_component_bank_allocator,
+        _run_q4_expert,
+        make_mlx_slot_buffer_allocator,
     )
 
     source_commit = _require_clean_source()
@@ -237,22 +221,36 @@ def run_real_probe(
         source_git_commit=source_commit,
         arm_config=arm_config,
     )
-    allocator = make_mlx_component_bank_allocator(
-        plan,
-        HY3_Q4,
-        manifest,
-        persistent_slab_slots=config.expert_slab_slots,
+    allocator = make_mlx_slot_buffer_allocator(plan, HY3_Q4)
+    reader = PositionalExpertReader(
+        config.model_root,
+        max_open_files=runtime_config.max_open_files,
+        max_read_chunk_bytes=runtime_config.max_read_chunk_bytes,
+        bypass_page_cache=runtime_config.bypass_page_cache,
     )
-    layout = allocator.slab_layout()
-    if 0 not in layout or 1 not in layout:
-        raise RuntimeError("planned component-bank layout has fewer than two slabs")
-    record = next(
+    pool = ExpertSlotPool(
+        HY3_Q4,
+        plan,
+        manifest,
+        reader,
+        buffer_allocator=allocator,
+        max_inflight_io_bytes=runtime_config.max_inflight_io_bytes,
+        prefer_sidecar=runtime_config.prefer_sidecar,
+        verify_hashes=True,
+        cache_scope="global",
+        lazy_persistent_buffers=True,
+    )
+    records = tuple(
         record
         for record in manifest.records
-        if record.layer == HY3_Q4.routed_layer_start and record.expert == 0
+        if record.layer == HY3_Q4.routed_layer_start and record.expert in {0, 1}
     )
-    untouched_slot: Any | None = None
-    untouched_slot_id = int(layout[1][0])
+    if len(records) != 2:
+        raise RuntimeError("probe requires experts 0 and 1 in the first routed layer")
+    first_record, replacement_record = sorted(records, key=lambda item: item.expert)
+    label = "global-persistent-0"
+    buffer: Any | None = None
+    original_buffer: Any | None = None
 
     def sample_allocator() -> AllocatorSample:
         report = mlx_memory_telemetry(mx)
@@ -265,73 +263,62 @@ def run_real_probe(
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("MLX allocator telemetry is incomplete") from exc
 
-    def allocate_slabs() -> Sequence[ProbeSlab]:
-        nonlocal untouched_slot
-        result = []
-        for slab_id in (0, 1):
-            allocated = allocator.allocate_slab(slab_id)
-            if slab_id == 1:
-                untouched_slot = allocated[untouched_slot_id]
-            result.append(
-                ProbeSlab(
-                    slab_id=str(slab_id),
-                    registered_physical_bytes=int(
-                        allocator.slab_physical_bytes(slab_id)
-                    ),
-                )
-            )
-            del allocated
-        return tuple(result)
+    def allocate_first_record() -> int:
+        nonlocal buffer, original_buffer
+        allocated_bytes = pool.allocate_persistent_slot(0)
+        buffer = allocator.slots[label]
+        original_buffer = buffer
+        load_sidecar_record(config.model_root, manifest, first_record, buffer)
+        return allocated_bytes
 
-    def evaluate_slabs(_slabs: Sequence[ProbeSlab]) -> None:
-        if untouched_slot is None:
-            raise RuntimeError("untouched probe slot was not allocated")
-        load_sidecar_record(config.model_root, manifest, record, untouched_slot)
-        arrays = [
-            value for bank in allocator.banks.values() for value in bank.arrays.values()
-        ]
-        mx.eval(*arrays)
-
-    def release_slab(slab: ProbeSlab) -> None:
-        release = allocator.release_slab(int(slab.slab_id))
-        if not release.destroyed or release.physical_bytes != (
-            slab.registered_physical_bytes
-        ):
-            raise RuntimeError("component slab release receipt differs from manifest")
-        gc.collect()
-
-    def execute_slab(slab: ProbeSlab) -> bool:
-        if slab.slab_id != "1" or untouched_slot is None:
+    def execute(record: Any) -> bool:
+        if buffer is None:
             return False
         binding = ExpertSlotBinding(
             layer=int(record.layer),
             expert=int(record.expert),
-            logical_slot=untouched_slot_id,
+            logical_slot=0,
             generation=1,
             record=record,
-            buffer=untouched_slot,
+            buffer=buffer,
         )
         values = mx.ones((1, HY3_Q4.hidden_size), dtype=mx.bfloat16)
-        output = _run_component_bank_q4(
+        output = _run_q4_expert(
             values,
-            (binding,),
+            binding,
             group_size=HY3_Q4.quant_group_size,
         )
         finite = mx.all(mx.isfinite(output))
         mx.eval(output, finite)
         return tuple(output.shape) == (1, HY3_Q4.hidden_size) and bool(finite.item())
 
+    def replace_record() -> bool:
+        if buffer is None:
+            return False
+        load_sidecar_record(config.model_root, manifest, replacement_record, buffer)
+        return allocator.slots.get(label) is original_buffer is buffer
+
+    def release_record() -> int:
+        released = pool.release_persistent_slots((0,))
+        return int(released.physical_bytes)
+
     try:
-        return run_allocator_release_probe(
+        startup_bytes = int(
+            pool.persistent_cache_telemetry_snapshot()["physical_bytes"]
+        )
+        return run_direct_cache_probe(
             identity=identity,
-            allocate_slabs=allocate_slabs,
-            evaluate_slabs=evaluate_slabs,
+            backend=str(allocator.backend),
+            startup_persistent_bytes=startup_bytes,
             sample_allocator=sample_allocator,
-            release_slab=release_slab,
-            execute_slab=execute_slab,
+            allocate_first_record=allocate_first_record,
+            execute_first_record=lambda: execute(first_record),
+            replace_record=replace_record,
+            execute_replacement_record=lambda: execute(replacement_record),
+            release_record=release_record,
         )
     finally:
-        allocator.close()
+        pool.close()
 
 
 def _strict_config_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
