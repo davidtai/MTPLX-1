@@ -105,6 +105,93 @@ def test_hy3_q4_dynamic_memory_flags_reach_runtime_config() -> None:
     assert config.expert_resize_min_interval_ms == 250
 
 
+def test_packed_projection_layout_reports_requested_and_loaded_c2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    monkeypatch.setenv("MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS", "1")
+    attention = SimpleNamespace(q_proj=object(), k_proj=object(), v_proj=object())
+    layer = SimpleNamespace(
+        self_attn=attention,
+        mlp=SimpleNamespace(
+            shared_mlp=SimpleNamespace(gate_up_proj=object()),
+        ),
+    )
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    summary = module.packed_projection_layout_summary(model)
+
+    assert summary["requested"] == {"shared_gate_up": True}
+    assert summary["layer_count"] == 1
+    assert summary["attention"] == {"packed": 0, "separate": 1, "other": 0}
+    assert summary["shared_mlp"] == {
+        "eligible": 1,
+        "packed": 1,
+        "separate": 0,
+        "other": 0,
+    }
+
+
+def test_packed_projection_layout_handles_nested_wrappers_and_none_aliases() -> None:
+    module = _load_module()
+    packed_layer = SimpleNamespace(
+        self_attn=SimpleNamespace(qkv_proj=object()),
+        mlp=SimpleNamespace(
+            shared_mlp=SimpleNamespace(gate_up_proj=object()),
+        ),
+    )
+    separate_layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            qkv_proj=None,
+            q_proj=object(),
+            k_proj=object(),
+            v_proj=object(),
+        ),
+        mlp=SimpleNamespace(
+            shared_mlp=SimpleNamespace(
+                gate_up_proj=None,
+                gate_proj=object(),
+                up_proj=object(),
+            ),
+        ),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            language_model=SimpleNamespace(
+                model=SimpleNamespace(layers=[packed_layer, separate_layer]),
+            ),
+        ),
+    )
+
+    summary = module.packed_projection_layout_summary(model)
+
+    assert summary["layer_count"] == 2
+    assert summary["attention"] == {"packed": 1, "separate": 1, "other": 0}
+    assert summary["shared_mlp"] == {
+        "eligible": 2,
+        "packed": 1,
+        "separate": 1,
+        "other": 0,
+    }
+
+
+def test_packed_projection_layout_handles_wrapper_cycles_without_layers() -> None:
+    module = _load_module()
+    model = SimpleNamespace()
+    model.model = model
+
+    summary = module.packed_projection_layout_summary(model)
+
+    assert summary["layer_count"] == 0
+    assert summary["attention"] == {"packed": 0, "separate": 0, "other": 0}
+    assert summary["shared_mlp"] == {
+        "eligible": 0,
+        "packed": 0,
+        "separate": 0,
+        "other": 0,
+    }
+
+
 def test_configuration_summary_exports_explicit_cache_and_batch_identity() -> None:
     module = _load_module()
     settings = {

@@ -37,6 +37,81 @@ from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
 from mtplx.runtime import load  # noqa: E402
 
 
+SHARED_GATE_UP_FUSION_ENV = "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _model_layers(model: object) -> list[object]:
+    """Find layers through supported model wrappers without following cycles."""
+
+    pending = [model]
+    seen: set[int] = set()
+    while pending and len(seen) < 16:
+        candidate = pending.pop(0)
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        layers = getattr(candidate, "layers", None)
+        if layers is not None:
+            try:
+                return list(layers)
+            except TypeError:
+                pass
+        for attribute in ("language_model", "model"):
+            child = getattr(candidate, attribute, None)
+            if child is not None and id(child) not in seen:
+                pending.append(child)
+    return []
+
+
+def _active_projection(module: object, name: str) -> bool:
+    return module is not None and getattr(module, name, None) is not None
+
+
+def packed_projection_layout_summary(model: object) -> dict[str, object]:
+    """Report the requested C2 flag and the projection classes actually loaded."""
+
+    layers = _model_layers(model)
+    attention = {"packed": 0, "separate": 0, "other": 0}
+    shared = {"eligible": 0, "packed": 0, "separate": 0, "other": 0}
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if _active_projection(attn, "qkv_proj"):
+            attention["packed"] += 1
+        elif attn is not None and all(
+            _active_projection(attn, projection)
+            for projection in ("q_proj", "k_proj", "v_proj")
+        ):
+            attention["separate"] += 1
+        else:
+            attention["other"] += 1
+
+        mlp = getattr(layer, "mlp", None)
+        shared_mlp = getattr(mlp, "shared_mlp", None)
+        if shared_mlp is None:
+            continue
+        shared["eligible"] += 1
+        if _active_projection(shared_mlp, "gate_up_proj"):
+            shared["packed"] += 1
+        elif _active_projection(shared_mlp, "gate_proj") and _active_projection(
+            shared_mlp, "up_proj"
+        ):
+            shared["separate"] += 1
+        else:
+            shared["other"] += 1
+    return {
+        "schema": "mtplx-packed-projection-layout-v1",
+        "requested": {"shared_gate_up": _env_enabled(SHARED_GATE_UP_FUSION_ENV)},
+        "layer_count": len(layers),
+        "attention": attention,
+        "shared_mlp": shared,
+    }
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -1984,6 +2059,7 @@ def _main() -> int:
     except BaseException:
         evidence_reservations.cleanup()
         raise
+    packed_projection_layout = packed_projection_layout_summary(runtime.model)
     rows = []
     try:
         from mtplx.generation import generate_ar, generate_mtp1
@@ -2285,6 +2361,7 @@ def _main() -> int:
         "saturation_valid": evidence_summary["saturation_valid"],
         "undersubscribed": evidence_summary["undersubscribed"],
         "configuration_summary": configuration_summary,
+        "packed_projection_layout": packed_projection_layout,
         "artifact_verification": {
             "model": model_artifact_identity,
             "mtp": mtp_artifact_identity,
