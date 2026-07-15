@@ -30,6 +30,7 @@ from mtplx.benchmarks.hy3_dynamic_memory_artifacts import (
 from mtplx.benchmarks.hy3_dynamic_memory_observation import (
     ArmObservationError,
     ArmRequest,
+    HOLD_WARMUP_SAMPLES,
 )
 from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     HY3_Q4_KV_BLOCK_BYTES,
@@ -384,12 +385,10 @@ class Hy3HardwareConfig:
             raise ArmObservationError(
                 "allocator_headroom_bytes must be exactly 1 GiB for issue #46"
             )
-        completion_reserve = config.generated_tokens + (
-            config.hold_sample_count * config.hold_tokens
-        )
-        if completion_reserve >= 4096:
+        if config.completion_reserve_tokens >= 4096:
             raise ArmObservationError(
-                "generated plus hold tokens must fit the smallest 4K context"
+                "generated plus warm-up and measured hold tokens must fit "
+                "the smallest 4K context"
             )
         if config.prompt_style not in {"coding-agent", "legacy-repeat"}:
             raise ArmObservationError(
@@ -399,7 +398,9 @@ class Hy3HardwareConfig:
 
     @property
     def completion_reserve_tokens(self) -> int:
-        return self.generated_tokens + self.hold_sample_count * self.hold_tokens
+        return self.generated_tokens + (
+            (self.hold_sample_count + HOLD_WARMUP_SAMPLES) * self.hold_tokens
+        )
 
 
 def _q4_cache_entries(cache: Sequence[object]) -> tuple[Any, ...]:
@@ -1567,6 +1568,13 @@ class MlxHy3HardwareLane:
             "route_trace": route_trace,
             "expert_hashes": self._expert_hashes(route_trace),
         }
+
+    def stabilize_hold(self) -> Mapping[str, object]:
+        # The first hold exercises the complete measurement path and lets MLX
+        # settle allocator-cache bookkeeping before the three gated samples.
+        # Its tokens are included in completion_reserve_tokens and its physical
+        # state remains visible as the hold_warmup timeline point.
+        return self.sample_hold_performance()
 
     def reset_q4_context(self) -> None:
         if self.cache is None:

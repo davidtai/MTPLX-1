@@ -228,6 +228,30 @@ def _performance_samples(tok_s: float) -> list[dict[str, object]]:
     return result
 
 
+def _hold_warmup_sample(tok_s: float) -> dict[str, object]:
+    sample = _performance_samples(tok_s)[0]
+    generated_tokens = list(range(400, 408))
+    route_trace = [{"phase": "ar_decode", "layer": 0, "expert_ids": [3, 7, 11]}]
+    expert_hashes = {
+        "0:3": "2" * 64,
+        "0:7": "3" * 64,
+        "0:11": "4" * 64,
+    }
+    sample.update(
+        generated_token_ids=generated_tokens,
+        generated_token_sha256=_sha(generated_tokens),
+        route_trace=route_trace,
+        route_trace_sha256=_sha(route_trace),
+        expert_hashes=expert_hashes,
+        expert_route_binding=_expert_route_binding(
+            manifest_sha256="b" * 64,
+            route_trace=route_trace,
+            expert_hashes=expert_hashes,
+        ),
+    )
+    return sample
+
+
 def _point(
     phase: str,
     timestamp_ns: int,
@@ -333,6 +357,13 @@ def _observation(
                 kv_logical_tokens=context_tokens,
             ),
             _point(
+                "hold_warmup",
+                3_000_000_000,
+                expert=600,
+                kv_blocks=final_blocks,
+                kv_logical_tokens=context_tokens,
+            ),
+            _point(
                 "hold",
                 4_000_000_000,
                 expert=600,
@@ -431,6 +462,12 @@ def _observation(
         timeline = [
             _point("pre_growth", 1, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
             _point("post_kv_growth", 2, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
+            _point(
+                "hold_warmup",
+                2_500_000_000,
+                expert=600,
+                kv_blocks=HY3_Q4_MAX_BLOCKS,
+            ),
             _point("hold", 3_000_000_000, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
             _point("hold", 3_500_000_000, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
             _point("hold", 4_000_000_000, expert=600, kv_blocks=HY3_Q4_MAX_BLOCKS),
@@ -481,6 +518,7 @@ def _observation(
                 for point in timeline
             ),
             "hold_performance_samples": [tok_s * 0.99, tok_s, tok_s * 1.01],
+            "hold_warmup_sample": _hold_warmup_sample(tok_s),
             "performance_samples": _performance_samples(tok_s),
         },
     }
@@ -780,9 +818,9 @@ def test_observation_requires_exact_phase_order_and_logical_kv_bounds() -> None:
         validate_campaign_observation(static_reordered)
 
     reset_between_holds = _observation("dynamic", 4096, 0, tok_s=12.0)
-    reset = reset_between_holds["timeline"].pop(6)
+    reset = reset_between_holds["timeline"].pop(7)
     reset["monotonic_ns"] = 4_250_000_000
-    reset_between_holds["timeline"].insert(4, reset)
+    reset_between_holds["timeline"].insert(5, reset)
     with pytest.raises(BenchmarkGateError, match="every hold"):
         validate_campaign_observation(reset_between_holds)
 
@@ -795,6 +833,29 @@ def test_observation_requires_exact_phase_order_and_logical_kv_bounds() -> None:
     impossible_logical_capacity["timeline"][0]["kv_logical_tokens"] = 17
     with pytest.raises(BenchmarkGateError, match="physical Q4 capacity"):
         validate_campaign_observation(impossible_logical_capacity)
+
+
+def test_observation_requires_exactly_one_ordered_hold_warmup() -> None:
+    missing = _observation("dynamic", 4096, 0, tok_s=12.0)
+    missing["timeline"] = [
+        point for point in missing["timeline"] if point["phase"] != "hold_warmup"
+    ]
+    with pytest.raises(BenchmarkGateError, match="hold_warmup"):
+        validate_campaign_observation(missing)
+
+    duplicate = _observation("dynamic", 4096, 0, tok_s=12.0)
+    extra = dict(duplicate["timeline"][3])
+    extra["monotonic_ns"] = 3_500_000_000
+    duplicate["timeline"].insert(4, extra)
+    with pytest.raises(BenchmarkGateError, match="hold_warmup"):
+        validate_campaign_observation(duplicate)
+
+    misplaced = _observation("dynamic", 4096, 0, tok_s=12.0)
+    warmup = misplaced["timeline"].pop(3)
+    warmup["monotonic_ns"] = 4_250_000_000
+    misplaced["timeline"].insert(4, warmup)
+    with pytest.raises(BenchmarkGateError, match="hold_warmup"):
+        validate_campaign_observation(misplaced)
 
 
 @pytest.mark.parametrize("phase", ("pre_growth", "post_expert_reclaim"))
@@ -2156,6 +2217,9 @@ def test_campaign_rejects_every_arm_whose_identity_differs_from_probe(
         row["identity"][field] = different_value
         if field == "expert_manifest_sha256":
             row["expert_route_binding"]["expert_manifest_sha256"] = different_value
+            row["metrics"]["hold_warmup_sample"]["expert_route_binding"][
+                "expert_manifest_sha256"
+            ] = different_value
             for sample in row["metrics"]["performance_samples"]:
                 sample["expert_route_binding"]["expert_manifest_sha256"] = (
                     different_value
@@ -2200,6 +2264,7 @@ def test_campaign_rejects_pair_identity_or_output_drift() -> None:
     (
         ("generated_token_ids", r"paired.*tokens"),
         ("route_trace", r"paired.*routes"),
+        ("expert_hashes", r"paired hold expert hashes"),
     ),
 )
 def test_campaign_rejects_paired_hold_workload_drift(
@@ -2220,7 +2285,7 @@ def test_campaign_rejects_paired_hold_workload_drift(
             if field == "generated_token_ids":
                 sample[field] = [900, 901, 902, 903, 904, 905, 906, 907]
                 sample["generated_token_sha256"] = canonical_sha256(sample[field])
-            else:
+            elif field == "route_trace":
                 sample[field] = [
                     {
                         "phase": "ar_decode",
@@ -2239,6 +2304,71 @@ def test_campaign_rejects_paired_hold_workload_drift(
                     route_trace=sample[field],
                     expert_hashes=sample["expert_hashes"],
                 )
+            else:
+                sample[field]["2:3"] = "9" * 64
+                sample["expert_route_binding"] = _expert_route_binding(
+                    manifest_sha256="b" * 64,
+                    route_trace=sample["route_trace"],
+                    expert_hashes=sample[field],
+                )
+        return row
+
+    with pytest.raises(BenchmarkGateError, match=error_pattern):
+        run_balanced_campaign(
+            allocator_probe=probe,
+            execute_arm=execute,
+            repetitions=2,
+            bootstrap_resamples=100,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "error_pattern"),
+    (
+        ("generated_token_ids", r"paired warm-up tokens"),
+        ("route_trace", r"paired warm-up routes"),
+        ("expert_hashes", r"paired warm-up expert hashes"),
+    ),
+)
+def test_campaign_rejects_paired_hold_warmup_workload_drift(
+    field: str,
+    error_pattern: str,
+) -> None:
+    probe = validate_allocator_probe(_probe_result())
+
+    def execute(arm: str, context_tokens: int, repetition: int):
+        row = _observation(
+            arm,
+            context_tokens,
+            repetition,
+            tok_s=11.0 if arm == "dynamic" else 10.0,
+        )
+        if arm == "dynamic" and context_tokens == 4096 and repetition == 0:
+            sample = row["metrics"]["hold_warmup_sample"]
+            if field == "generated_token_ids":
+                sample[field] = list(range(900, 908))
+                sample["generated_token_sha256"] = canonical_sha256(sample[field])
+            elif field == "route_trace":
+                sample[field] = [
+                    {
+                        "phase": "ar_decode",
+                        "layer": 70,
+                        "expert_ids": [2, 5, 13],
+                    }
+                ]
+                sample["route_trace_sha256"] = canonical_sha256(sample[field])
+                sample["expert_hashes"] = {
+                    "70:2": "2" * 64,
+                    "70:5": "3" * 64,
+                    "70:13": "4" * 64,
+                }
+            else:
+                sample[field]["0:3"] = "9" * 64
+            sample["expert_route_binding"] = _expert_route_binding(
+                manifest_sha256="b" * 64,
+                route_trace=sample["route_trace"],
+                expert_hashes=sample["expert_hashes"],
+            )
         return row
 
     with pytest.raises(BenchmarkGateError, match=error_pattern):

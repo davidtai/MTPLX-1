@@ -37,6 +37,7 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
 
 
 MIN_HOLD_SAMPLES = 3
+HOLD_WARMUP_SAMPLES = 1
 DEFAULT_HOLD_INTERVAL_SECONDS = 0.5
 
 
@@ -76,6 +77,8 @@ class HardwareArmLane(Protocol):
     def kv_growth_steps(self) -> Sequence[Mapping[str, object]]: ...
 
     def invoke_context(self, context_tokens: int) -> Mapping[str, object]: ...
+
+    def stabilize_hold(self) -> Mapping[str, object]: ...
 
     def sample_hold_performance(self) -> Mapping[str, object]: ...
 
@@ -690,6 +693,15 @@ def produce_arm_observation(
             lane.invoke_context(request.context_tokens),
             expert_manifest_sha256=identity["expert_manifest_sha256"],
         )
+        hold_warmup_sample = _performance_sample(
+            lane.stabilize_hold(),
+            index=-1,
+            expert_manifest_sha256=identity["expert_manifest_sha256"],
+        )
+        timeline.append(
+            _timeline_point(lane, phase="hold_warmup", monotonic_ns=monotonic_ns)
+        )
+        sleep(interval)
         for index in range(count):
             performance_samples.append(
                 _performance_sample(
@@ -764,6 +776,7 @@ def produce_arm_observation(
                 "hold_performance_samples": [
                     sample["tokens_per_second"] for sample in performance_samples
                 ],
+                "hold_warmup_sample": hold_warmup_sample,
                 "performance_samples": performance_samples,
             },
         }

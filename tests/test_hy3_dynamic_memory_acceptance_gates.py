@@ -261,6 +261,34 @@ def _performance_samples(
     return result
 
 
+def _hold_warmup_sample(
+    *,
+    tokens_per_second: float,
+    expert_hit_rate: float,
+    ssd_bytes_per_token: float,
+) -> dict[str, object]:
+    sample = _performance_samples(
+        tokens_per_second=tokens_per_second,
+        expert_hit_rate=expert_hit_rate,
+        ssd_bytes_per_token=ssd_bytes_per_token,
+    )[0]
+    generated_tokens = list(range(400, 408))
+    route_trace = [{"phase": "ar_decode", "layer": 70, "expert_ids": [3, 7]}]
+    expert_hashes = {"70:3": "2" * 64, "70:7": "3" * 64}
+    sample.update(
+        generated_token_ids=generated_tokens,
+        generated_token_sha256=canonical_sha256(generated_tokens),
+        route_trace=route_trace,
+        route_trace_sha256=canonical_sha256(route_trace),
+        expert_hashes=expert_hashes,
+        expert_route_binding=_expert_route_binding(
+            route_trace=route_trace,
+            expert_hashes=expert_hashes,
+        ),
+    )
+    return sample
+
+
 def _observation(
     arm: str,
     context_tokens: int,
@@ -320,6 +348,13 @@ def _observation(
             _point(
                 "post_kv_growth",
                 2,
+                expert_bytes=expert_bytes,
+                kv_blocks=HY3_Q4_MAX_BLOCKS,
+                **point_kwargs,
+            ),
+            _point(
+                "hold_warmup",
+                2_500_000_000,
                 expert_bytes=expert_bytes,
                 kv_blocks=HY3_Q4_MAX_BLOCKS,
                 **point_kwargs,
@@ -385,6 +420,14 @@ def _observation(
             _point(
                 "post_kv_growth",
                 70,
+                expert_bytes=expert_bytes,
+                kv_blocks=final_blocks,
+                kv_logical_tokens=context_tokens,
+                **point_kwargs,
+            ),
+            _point(
+                "hold_warmup",
+                3_000_000_000,
                 expert_bytes=expert_bytes,
                 kv_blocks=final_blocks,
                 kv_logical_tokens=context_tokens,
@@ -556,6 +599,11 @@ def _observation(
             "hold_performance_samples": [
                 sample["tokens_per_second"] for sample in detailed_samples
             ],
+            "hold_warmup_sample": _hold_warmup_sample(
+                tokens_per_second=tps,
+                expert_hit_rate=hit_rate,
+                ssd_bytes_per_token=ssd_bytes_per_token,
+            ),
             "performance_samples": detailed_samples,
         },
     }

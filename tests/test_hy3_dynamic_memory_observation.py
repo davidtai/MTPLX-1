@@ -271,6 +271,30 @@ class FakeLane:
             },
         }
 
+    def stabilize_hold(self) -> dict[str, object]:
+        self.calls.append("stabilize_hold")
+        route_trace = [
+            {
+                "phase": "ar_decode",
+                "layer": 0,
+                "expert_ids": [3, 7, 11],
+            }
+        ]
+        return {
+            "tokens_per_second": 15.8,
+            "expert_hit_rate": 0.70,
+            "ssd_bytes_per_token": 1280.0,
+            "p50_token_latency_ms": 63.0,
+            "p95_token_latency_ms": 71.0,
+            "generated_token_ids": list(range(400, 408)),
+            "route_trace": route_trace,
+            "expert_hashes": {
+                "0:3": "3" * 64,
+                "0:7": "4" * 64,
+                "0:11": "5" * 64,
+            },
+        }
+
     def reset_q4_context(self) -> None:
         self.calls.append("reset")
         self.kv_blocks = 0
@@ -396,6 +420,7 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
             5_000_000_000,
             6_000_000_000,
             7_000_000_000,
+            8_000_000_000,
         )
     )
 
@@ -429,6 +454,7 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
         "pre_growth",
         "post_expert_reclaim",
         "post_kv_growth",
+        "hold_warmup",
         "hold",
         "hold",
         "hold",
@@ -438,6 +464,7 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
     assert [point["kv_logical_tokens"] for point in result["timeline"]] == [
         1,
         1,
+        4096,
         4096,
         4096,
         4096,
@@ -456,6 +483,10 @@ def test_dynamic_producer_tracks_full_lifecycle_and_emits_schema_v1() -> None:
         "post_regrow_observed": True,
     }
     assert result["metrics"]["hold_performance_samples"] == [15.9, 16.0, 16.1]
+    assert result["metrics"]["hold_warmup_sample"]["generated_token_ids"] == list(
+        range(400, 408)
+    )
+    assert calls.index("stabilize_hold") < calls.index("sample_hold")
     assert [step["target_blocks"] for step in result["kv_growth_steps"]] == [
         255,
         256,
@@ -501,7 +532,15 @@ def test_producer_rejects_hold_count_that_drifts_from_hardware_prompt_reserve() 
 def test_static_producer_uses_reserved_control_without_reclaim_or_regrow() -> None:
     calls: list[str] = []
     timestamps = iter(
-        (1, 2, 3_000_000_000, 3_500_000_000, 4_000_000_000, 5_000_000_000)
+        (
+            1,
+            2,
+            3_000_000_000,
+            3_500_000_000,
+            4_000_000_000,
+            5_000_000_000,
+            6_000_000_000,
+        )
     )
 
     result = produce_arm_observation(
@@ -522,6 +561,7 @@ def test_static_producer_uses_reserved_control_without_reclaim_or_regrow() -> No
     assert [point["phase"] for point in result["timeline"]] == [
         "pre_growth",
         "post_kv_growth",
+        "hold_warmup",
         "hold",
         "hold",
         "hold",

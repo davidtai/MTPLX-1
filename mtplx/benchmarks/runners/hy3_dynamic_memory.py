@@ -987,6 +987,7 @@ def _validate_timeline(
 
     pre = _phase_once(timeline, "pre_growth")
     growth = _phase_once(timeline, "post_kv_growth")
+    warmup = _phase_once(timeline, "hold_warmup")
     reset = _phase_once(timeline, "post_reset")
     if cache_start_state.kv_physical_bytes != (
         cache_start_state.kv_blocks * HY3_Q4_KV_BLOCK_BYTES
@@ -1000,12 +1001,14 @@ def _validate_timeline(
     if not (
         pre.monotonic_ns
         < growth.monotonic_ns
+        < warmup.monotonic_ns
         < holds[0].monotonic_ns
         <= holds[-1].monotonic_ns
         < reset.monotonic_ns
     ):
         raise BenchmarkGateError(
-            "timeline must order pre-growth, growth, every hold, then reset"
+            "timeline must order pre-growth, growth, hold_warmup, every hold, "
+            "then reset"
         )
     fixed_pool_fields = (
         "resident_model_bytes",
@@ -1030,7 +1033,7 @@ def _validate_timeline(
             )
     if any(
         int(point.resource_evidence["kv_logical_tokens"]) < context_tokens
-        for point in (growth, *holds)
+        for point in (growth, warmup, *holds)
     ):
         raise BenchmarkGateError(
             "post-growth and hold logical KV tokens do not cover the requested context"
@@ -1609,6 +1612,7 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             "peak_charged_bytes",
             "stress_peak_charged_bytes",
             "hold_performance_samples",
+            "hold_warmup_sample",
             "performance_samples",
         ),
         context="observation.metrics",
@@ -1695,31 +1699,47 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
         raise BenchmarkGateError(
             "observation.metrics.performance_samples must match hold_performance_samples"
         )
-    performance_samples: list[dict[str, object]] = []
-    for index, raw_sample in enumerate(raw_performance_samples):
-        sample = _mapping(
+    raw_warmup_sample = _mapping(
+        raw_metrics["hold_warmup_sample"],
+        field="observation.metrics.hold_warmup_sample",
+    )
+    samples_to_validate: list[tuple[object, str, float | None]] = [
+        (
+            raw_warmup_sample,
+            "observation.metrics.hold_warmup_sample",
+            None,
+        )
+    ]
+    samples_to_validate.extend(
+        (
             raw_sample,
-            field=f"observation.metrics.performance_samples[{index}]",
+            f"observation.metrics.performance_samples[{index}]",
+            hold_performance[index],
         )
-        required_sample_fields = (
-            "tokens_per_second",
-            "expert_hit_rate",
-            "ssd_bytes_per_token",
-            "p50_token_latency_ms",
-            "p95_token_latency_ms",
-            "generated_token_ids",
-            "generated_token_sha256",
-            "route_trace",
-            "route_trace_sha256",
-            "expert_hashes",
-            "expert_route_binding",
-        )
+        for index, raw_sample in enumerate(raw_performance_samples)
+    )
+    required_sample_fields = (
+        "tokens_per_second",
+        "expert_hit_rate",
+        "ssd_bytes_per_token",
+        "p50_token_latency_ms",
+        "p95_token_latency_ms",
+        "generated_token_ids",
+        "generated_token_sha256",
+        "route_trace",
+        "route_trace_sha256",
+        "expert_hashes",
+        "expert_route_binding",
+    )
+    hold_warmup_sample: dict[str, object] | None = None
+    performance_samples: list[dict[str, object]] = []
+    for raw_sample, sample_prefix, expected_tps in samples_to_validate:
+        sample = _mapping(raw_sample, field=sample_prefix)
         _require_fields(
             sample,
             required_sample_fields,
-            context=f"observation.metrics.performance_samples[{index}]",
+            context=sample_prefix,
         )
-        sample_prefix = f"observation.metrics.performance_samples[{index}]"
         sample_tps = _finite_number(
             sample["tokens_per_second"],
             field=f"{sample_prefix}.tokens_per_second",
@@ -1755,11 +1775,8 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             raise BenchmarkGateError(
                 f"{sample_prefix}.p95_token_latency_ms is below p50_token_latency_ms"
             )
-        if not math.isclose(
-            sample_tps,
-            hold_performance[index],
-            rel_tol=1e-9,
-            abs_tol=1e-12,
+        if expected_tps is not None and not math.isclose(
+            sample_tps, expected_tps, rel_tol=1e-9, abs_tol=1e-12
         ):
             raise BenchmarkGateError(
                 f"{sample_prefix}.tokens_per_second differs from "
@@ -1808,21 +1825,25 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             raise BenchmarkGateError(
                 f"{sample_prefix}.route_trace_sha256 does not match exact routes"
             )
-        performance_samples.append(
-            {
-                "tokens_per_second": sample_tps,
-                "expert_hit_rate": hit_rate,
-                "ssd_bytes_per_token": ssd_bytes,
-                "p50_token_latency_ms": p50_ms,
-                "p95_token_latency_ms": p95_ms,
-                "generated_token_ids": sample_tokens,
-                "generated_token_sha256": sample_token_hash,
-                "route_trace": sample_route_trace,
-                "route_trace_sha256": sample_route_hash,
-                "expert_hashes": sample_expert_hashes,
-                "expert_route_binding": sample_expert_route_binding,
-            }
-        )
+        normalized_sample = {
+            "tokens_per_second": sample_tps,
+            "expert_hit_rate": hit_rate,
+            "ssd_bytes_per_token": ssd_bytes,
+            "p50_token_latency_ms": p50_ms,
+            "p95_token_latency_ms": p95_ms,
+            "generated_token_ids": sample_tokens,
+            "generated_token_sha256": sample_token_hash,
+            "route_trace": sample_route_trace,
+            "route_trace_sha256": sample_route_hash,
+            "expert_hashes": sample_expert_hashes,
+            "expert_route_binding": sample_expert_route_binding,
+        }
+        if expected_tps is None:
+            hold_warmup_sample = normalized_sample
+        else:
+            performance_samples.append(normalized_sample)
+    if hold_warmup_sample is None:
+        raise BenchmarkGateError("observation.metrics.hold_warmup_sample is missing")
     metrics: dict[str, object] = {
         "generated_tokens": generated_tokens,
         "elapsed_seconds": elapsed,
@@ -1830,6 +1851,7 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
         "peak_charged_bytes": peak_charged,
         "stress_peak_charged_bytes": stress_peak_charged,
         "hold_performance_samples": list(hold_performance),
+        "hold_warmup_sample": hold_warmup_sample,
         "performance_samples": performance_samples,
     }
     return CampaignObservation(
@@ -2476,6 +2498,25 @@ def _paired_equal(static: CampaignObservation, dynamic: CampaignObservation) -> 
         raise BenchmarkGateError("paired route hash differs")
     if static.expert_hashes != dynamic.expert_hashes:
         raise BenchmarkGateError("paired expert hashes differ")
+    static_warmup = _mapping(
+        static.metrics["hold_warmup_sample"], field="static hold warm-up sample"
+    )
+    dynamic_warmup = _mapping(
+        dynamic.metrics["hold_warmup_sample"], field="dynamic hold warm-up sample"
+    )
+    if (
+        static_warmup["generated_token_ids"] != dynamic_warmup["generated_token_ids"]
+        or static_warmup["generated_token_sha256"]
+        != dynamic_warmup["generated_token_sha256"]
+    ):
+        raise BenchmarkGateError("paired warm-up tokens differ")
+    if (
+        static_warmup["route_trace"] != dynamic_warmup["route_trace"]
+        or static_warmup["route_trace_sha256"] != dynamic_warmup["route_trace_sha256"]
+    ):
+        raise BenchmarkGateError("paired warm-up routes differ")
+    if static_warmup["expert_hashes"] != dynamic_warmup["expert_hashes"]:
+        raise BenchmarkGateError("paired warm-up expert hashes differ")
     static_samples = _sequence(
         static.metrics["performance_samples"], field="static performance_samples"
     )
@@ -2504,6 +2545,10 @@ def _paired_equal(static: CampaignObservation, dynamic: CampaignObservation) -> 
             != dynamic_sample["route_trace_sha256"]
         ):
             raise BenchmarkGateError(f"paired hold routes differ at sample {index}")
+        if static_sample["expert_hashes"] != dynamic_sample["expert_hashes"]:
+            raise BenchmarkGateError(
+                f"paired hold expert hashes differ at sample {index}"
+            )
     if static.timeline[-1].slot_health != dynamic.timeline[-1].slot_health:
         raise BenchmarkGateError("paired final slot health differs")
 

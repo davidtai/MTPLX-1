@@ -419,9 +419,26 @@ def test_production_factory_builds_real_static_and_dynamic_hook_loader(
     assert isinstance(hooks.config, Hy3HardwareConfig)
     assert hooks.config.allocator_headroom_bytes == 1024**3
     assert hooks.config.model_root == tmp_path / "Hy3-4bit"
+    assert hooks.config.completion_reserve_tokens == 48
     assert hooks.hold_samples == 3
     assert callable(hooks.load_static_lane)
     assert callable(hooks.load_dynamic_lane)
+
+
+def test_hold_warmup_exercises_the_full_performance_sample_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lane = object.__new__(MlxHy3HardwareLane)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        lane,
+        "sample_hold_performance",
+        lambda: calls.append("sample_hold") or {},
+    )
+
+    lane.stabilize_hold()
+
+    assert calls == ["sample_hold"]
 
 
 def test_hardware_config_requires_exact_external_artifact_pins(
@@ -448,6 +465,17 @@ def test_hardware_config_requires_exact_external_artifact_pins(
                     "allocator_headroom_bytes": invalid_headroom,
                 }
             )
+
+    with pytest.raises(ArmObservationError, match="generated plus warm-up"):
+        Hy3HardwareConfig.from_mapping(
+            {
+                **base,
+                "artifact_pins": _artifact_pins(),
+                "generated_tokens": 1,
+                "hold_sample_count": 3,
+                "hold_tokens": 1024,
+            }
+        )
 
 
 def test_hardware_arms_pin_one_gib_headroom_and_dynamic_slot_counts(
