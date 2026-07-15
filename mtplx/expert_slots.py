@@ -2848,6 +2848,7 @@ class ExpertSlotPool:
             "metrics": self.metrics.as_dict(),
             "states": states,
             "pins": pins,
+            "io": self.reader.metrics.as_dict(),
         }
 
     def reset(self) -> None:

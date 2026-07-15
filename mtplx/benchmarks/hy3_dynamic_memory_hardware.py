@@ -1150,12 +1150,12 @@ class MlxHy3HardwareLane:
         expert_runtime._raise_if_unhealthy()
         slot_pool = expert_runtime.slots
         slab_details = _mapping(slot_pool.expert_slab_telemetry_snapshot())
-        io_health = _mapping(slab_details.get("io"))
+        health = _mapping(slot_pool.health_telemetry_snapshot())
+        io_health = _mapping(health.get("io"))
         if "integrity_errors" not in io_health:
             raise ArmObservationError(
                 "expert reader telemetry omitted integrity_errors"
             )
-        health = _mapping(slot_pool.health_telemetry_snapshot())
         metrics = _mapping(health.get("metrics"))
         states = _mapping(health.get("states"))
         if self.cache is None:

@@ -652,6 +652,18 @@ def _global_persistent_plan(
     )
 
 
+def test_health_telemetry_reports_reader_integrity_errors(tmp_path: Path) -> None:
+    pool, _allocator, _spec = _owned_slab_pool(tmp_path)
+    try:
+        pool.reader.metrics.update(integrity_errors=2)
+
+        health = pool.health_telemetry_snapshot()
+
+        assert health["io"]["integrity_errors"] == 2
+    finally:
+        pool.close()
+
+
 def test_slab_destroy_regrow_preserves_slot_identity_and_generation_watermark(
     tmp_path: Path,
 ) -> None:
