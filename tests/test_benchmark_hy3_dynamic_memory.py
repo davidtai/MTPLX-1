@@ -895,7 +895,6 @@ def test_observation_rejects_hold_resize_churn_and_fixed_pool_drift() -> None:
         "requested_reclaim_bytes",
         "reclaimed_bytes",
         "regrown_bytes",
-        "evicted_expert_records",
         "evicted_expert_slabs",
         "resize_duration_ns",
         "total_resize_duration_ns",
@@ -916,6 +915,31 @@ def test_observation_rejects_hold_resize_churn_and_fixed_pool_drift() -> None:
     point["charged_residual_bytes"] -= 1
     with pytest.raises(BenchmarkGateError, match="fixed physical memory pools"):
         validate_campaign_observation(fixed_drift)
+
+
+def test_observation_allows_ordinary_hold_record_eviction_churn() -> None:
+    observation = _observation("dynamic", 4096, 0, tok_s=12.0)
+    holds = [point for point in observation["timeline"] if point["phase"] == "hold"]
+    for point, evictions in zip(holds, (3242, 4027, 4674), strict=True):
+        point["evicted_expert_records"] = evictions
+
+    validated = validate_campaign_observation(observation)
+
+    assert validated.arm == "dynamic"
+
+
+def test_observation_rejects_hold_record_eviction_counter_regression() -> None:
+    observation = _observation("dynamic", 4096, 0, tok_s=12.0)
+    hold_window = [
+        point
+        for point in observation["timeline"]
+        if point["phase"] in {"hold_warmup", "hold"}
+    ]
+    for point, evictions in zip(hold_window, (3200, 3242, 3100, 4674), strict=True):
+        point["evicted_expert_records"] = evictions
+
+    with pytest.raises(BenchmarkGateError, match="evicted_expert_records.*decreased"):
+        validate_campaign_observation(observation)
 
 
 @pytest.mark.parametrize(

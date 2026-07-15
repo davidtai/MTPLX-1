@@ -1038,6 +1038,18 @@ def _validate_timeline(
         raise BenchmarkGateError(
             "post-growth and hold logical KV tokens do not cover the requested context"
         )
+    record_evictions = [
+        int(point.resource_evidence["evicted_expert_records"])
+        for point in (warmup, *holds)
+    ]
+    if any(
+        later < earlier
+        for earlier, later in zip(record_evictions, record_evictions[1:], strict=False)
+    ):
+        raise BenchmarkGateError(
+            "evicted_expert_records decreased during the hold window: "
+            f"{record_evictions}"
+        )
     stable_fields = (
         "allocator_active_bytes",
         "allocator_cache_bytes",
@@ -1069,7 +1081,8 @@ def _validate_timeline(
         "requested_reclaim_bytes",
         "reclaimed_bytes",
         "regrown_bytes",
-        "evicted_expert_records",
+        # Ordinary record-level LRU churn is expected while physical slabs,
+        # charged bytes, and resize telemetry remain stable.
         "evicted_expert_slabs",
         "resize_duration_ns",
         "total_resize_duration_ns",
