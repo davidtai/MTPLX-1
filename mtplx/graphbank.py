@@ -1201,6 +1201,8 @@ class CompiledVerifyBank:
             "traces": 0,
             "initial_trace_calls": 0,
             "retrace_calls": 0,
+            "last_exception": None,
+            "exception_history": [],
             "parity_checks": 0,
             "parity_failures": 0,
             "parity2_calls": 0,
@@ -1401,6 +1403,7 @@ class CompiledVerifyBank:
                 if len(self._held_state_refs) > 3:
                     self._held_state_refs.pop(0)
         except Exception as exc:
+            self._record_dispatch_exception(exc, phase="initial_dispatch")
             self._exception_failures += 1
             if self._exception_failures >= 3:
                 self.permanent_eager = True
@@ -1729,6 +1732,14 @@ class CompiledVerifyBank:
         data["target_plan_invalidations"] = dict(
             self.stats["target_plan_invalidations"]
         )
+        data["last_exception"] = (
+            dict(self.stats["last_exception"])
+            if isinstance(self.stats["last_exception"], dict)
+            else None
+        )
+        data["exception_history"] = [
+            dict(item) for item in self.stats["exception_history"]
+        ]
         first_divergence = self.stats.get("parity2_first_divergence")
         data["parity2_first_divergence"] = (
             dict(first_divergence) if isinstance(first_divergence, dict) else None
@@ -1771,6 +1782,18 @@ class CompiledVerifyBank:
         reasons = self.stats["target_plan_invalidations"]
         reasons[reason] = int(reasons.get(reason, 0)) + 1
         self._target_plan = None
+
+    def _record_dispatch_exception(self, exc: Exception, *, phase: str) -> None:
+        message = " ".join(str(exc).split())[:512]
+        evidence = {
+            "phase": str(phase),
+            "type": type(exc).__name__,
+            "message": message,
+        }
+        self.stats["last_exception"] = evidence
+        history = self.stats["exception_history"]
+        history.append(evidence)
+        del history[:-3]
 
     def _sync_target_offsets(self, cache: Any) -> dict[int, int] | None:
         offsets: dict[int, int] = {}
@@ -1947,7 +1970,8 @@ class CompiledVerifyBank:
                 state_in = None
                 self._held_state_refs.clear()
                 mx.async_eval(*outputs)
-        except Exception:
+        except Exception as exc:
+            self._record_dispatch_exception(exc, phase="fixed_target_dispatch")
             self._exception_failures += 1
             if self._exception_failures >= 3:
                 self.permanent_eager = True

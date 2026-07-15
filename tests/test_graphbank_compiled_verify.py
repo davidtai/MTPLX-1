@@ -540,6 +540,12 @@ def test_permanent_eager_after_three_repeated_failures():
         assert logits is not None
     assert bank.stats["fallback_reasons"]["exception:RuntimeError"] == 3
     assert bank.permanent_eager is True
+    assert bank.stats["last_exception"] == {
+        "phase": "initial_dispatch",
+        "type": "RuntimeError",
+        "message": "boom inside compiled trace",
+    }
+    assert bank.stats["exception_history"] == [bank.stats["last_exception"]] * 3
 
     bank.forward_ar_capture(mx.array([[1, 2]]), cache=cache)
     assert bank.stats["fallback_reasons"]["permanent_eager"] == 1
