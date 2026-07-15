@@ -45,7 +45,7 @@ def _snapshot(
     return BrokerSnapshot(
         resident_model_bytes=resident,
         kv_physical_bytes=kv,
-        expert_slab_physical_bytes=experts,
+        expert_cache_physical_bytes=experts,
         in_flight_expert_staging_bytes=staging,
         runtime_workspace_bytes=workspace,
         allocator_cache_bytes=cache,
@@ -58,12 +58,141 @@ def _install(broker: UnifiedMemoryBroker, snapshot: BrokerSnapshot) -> None:
     broker.replace_snapshot(snapshot)
 
 
+def test_budget_has_one_machine_configurable_limit() -> None:
+    budget = MemoryBudget(memory_limit_bytes=100, allocator_headroom_bytes=10)
+
+    assert budget.memory_limit_bytes == 100
+    assert budget.classified_limit_bytes == 90
+    assert not hasattr(budget, "hard_ceiling_bytes")
+    assert not hasattr(budget, "operating_target_bytes")
+
+
+def test_cache_record_growth_is_single_use_and_cap_bounded() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(memory_limit_bytes=100),
+        initial_snapshot=BrokerSnapshot(
+            resident_model_bytes=50,
+            kv_physical_bytes=0,
+            expert_cache_physical_bytes=20,
+            in_flight_expert_staging_bytes=0,
+            runtime_workspace_bytes=0,
+            allocator_cache_bytes=0,
+        ),
+        expert_record_bytes=10,
+        expert_cache_limit_bytes=30,
+    )
+
+    ticket = broker.plan_expert_cache_growth()
+
+    assert ticket is not None
+    after = broker.commit_expert_cache_growth(
+        ticket,
+        registered_cache_bytes_after=30,
+        allocator_before=AllocatorMemorySample(70, 0, 70),
+        allocator_after=AllocatorMemorySample(80, 0, 80),
+    )
+    assert after.expert_cache_physical_bytes == 30
+    with pytest.raises(MemoryTransactionError, match="consumed"):
+        broker.commit_expert_cache_growth(
+            ticket,
+            registered_cache_bytes_after=30,
+            allocator_before=AllocatorMemorySample(70, 0, 70),
+            allocator_after=AllocatorMemorySample(80, 0, 80),
+        )
+    assert broker.plan_expert_cache_growth() is None
+
+
+def test_cache_record_growth_returns_none_at_total_limit() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(memory_limit_bytes=100),
+        initial_snapshot=_snapshot(resident=91),
+        expert_record_bytes=10,
+    )
+
+    assert broker.plan_expert_cache_growth() is None
+
+
+def test_cache_record_growth_excludes_active_kv_transaction() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(memory_limit_bytes=100),
+        initial_snapshot=_snapshot(resident=50),
+        expert_record_bytes=10,
+    )
+    kv_ticket = broker.plan_kv_growth(
+        steady_delta_bytes=10,
+        transient_delta_bytes=0,
+    )
+
+    with pytest.raises(MemoryTransactionError, match="already active"):
+        broker.plan_expert_cache_growth()
+
+    broker.abort_kv_growth(kv_ticket, observed_kv_delta_bytes=0)
+
+
+def test_failed_cache_record_allocation_can_be_aborted_once() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(memory_limit_bytes=100),
+        initial_snapshot=_snapshot(resident=50),
+        expert_record_bytes=10,
+    )
+    ticket = broker.plan_expert_cache_growth()
+    assert ticket is not None
+
+    with pytest.raises(MemoryTelemetryError, match="exactly one"):
+        broker.commit_expert_cache_growth(
+            ticket,
+            registered_cache_bytes_after=9,
+            allocator_before=AllocatorMemorySample(50, 0, 50),
+            allocator_after=AllocatorMemorySample(59, 0, 59),
+        )
+
+    snapshot = broker.abort_expert_cache_growth(ticket)
+    assert snapshot.expert_cache_physical_bytes == 0
+    assert snapshot.transaction_failure_count == 1
+    with pytest.raises(MemoryTransactionError, match="consumed"):
+        broker.abort_expert_cache_growth(ticket)
+
+
+def test_cache_record_growth_retains_allocator_residual_charge() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(memory_limit_bytes=100),
+        initial_snapshot=_snapshot(resident=50, cache=10),
+        expert_record_bytes=10,
+    )
+    ticket = broker.plan_expert_cache_growth()
+    assert ticket is not None
+
+    snapshot = broker.commit_expert_cache_growth(
+        ticket,
+        registered_cache_bytes_after=10,
+        allocator_before=AllocatorMemorySample(50, 10, 60),
+        allocator_after=AllocatorMemorySample(75, 5, 80),
+    )
+
+    assert snapshot.expert_cache_physical_bytes == 10
+    assert snapshot.allocator_cache_bytes == 20
+    assert snapshot.charged_bytes == 80
+
+
+def test_grouped_expert_growth_state_and_apis_are_absent() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(memory_limit_bytes=100),
+        expert_record_bytes=10,
+    )
+    snapshot = broker.snapshot()
+
+    assert not hasattr(snapshot, "pending_expert_regrow_ticket_id")
+    assert not hasattr(snapshot, "last_expert_resize_ns")
+    assert not hasattr(broker, "plan_expert_regrow")
+    assert not hasattr(broker, "terminalize_expert_resize")
+
+
 def test_binary_gib_budget_and_immutable_pool_accounting() -> None:
     assert BINARY_GIB == GIB
-    assert MemoryBudget().operating_target_bytes == 110 * GIB
-    assert MemoryBudget().hard_ceiling_bytes == 112 * GIB
-    assert MemoryBudget().allocator_headroom_bytes == 0
-    assert MemoryBudget().classified_target_bytes == 110 * GIB
+    budget = MemoryBudget(memory_limit_bytes=110 * GIB)
+    assert budget.memory_limit_bytes == 110 * GIB
+    assert budget.allocator_headroom_bytes == 0
+    assert budget.classified_limit_bytes == 110 * GIB
 
     snapshot = _snapshot(
         resident=1,
@@ -83,12 +212,11 @@ def test_binary_gib_budget_and_immutable_pool_accounting() -> None:
 
 def test_allocator_headroom_rejects_steady_classified_pool_overcommit() -> None:
     budget = MemoryBudget(
-        operating_target_bytes=100,
-        hard_ceiling_bytes=112,
+        memory_limit_bytes=100,
         allocator_headroom_bytes=10,
     )
-    assert budget.classified_target_bytes == 90
-    broker = UnifiedMemoryBroker(budget=budget, expert_slab_bytes=10)
+    assert budget.classified_limit_bytes == 90
+    broker = UnifiedMemoryBroker(budget=budget, expert_record_bytes=10)
 
     with pytest.raises(MemoryAdmissionError, match="classified"):
         broker.replace_snapshot(_snapshot(resident=91))
@@ -96,14 +224,13 @@ def test_allocator_headroom_rejects_steady_classified_pool_overcommit() -> None:
 
 def test_kv_growth_enforces_classified_headroom_and_total_transition_peak() -> None:
     budget = MemoryBudget(
-        operating_target_bytes=100,
-        hard_ceiling_bytes=112,
+        memory_limit_bytes=100,
         allocator_headroom_bytes=10,
     )
     classified_only = UnifiedMemoryBroker(
         budget=budget,
         initial_snapshot=_snapshot(resident=50, experts=40),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = classified_only.plan_kv_growth(
         steady_delta_bytes=10,
@@ -115,7 +242,7 @@ def test_kv_growth_enforces_classified_headroom_and_total_transition_peak() -> N
     total_peak = UnifiedMemoryBroker(
         budget=budget,
         initial_snapshot=_snapshot(resident=40, experts=50, cache=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = total_peak.plan_kv_growth(
         steady_delta_bytes=10,
@@ -125,34 +252,9 @@ def test_kv_growth_enforces_classified_headroom_and_total_transition_peak() -> N
     total_peak.abort_kv_growth(ticket, observed_kv_delta_bytes=0)
 
 
-def test_expert_regrow_preserves_allocator_headroom_and_hysteresis() -> None:
-    broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(
-            operating_target_bytes=100,
-            hard_ceiling_bytes=112,
-            allocator_headroom_bytes=10,
-        ),
-        initial_snapshot=_snapshot(resident=40, experts=50),
-        expert_slab_bytes=10,
-        expert_regrow_hysteresis_slabs=1,
-        expert_resize_min_interval_ns=0,
-    )
-    broker.replace_snapshot(_snapshot(resident=40, experts=20))
-
-    ticket = broker.plan_expert_regrow(target_bytes=20, now_ns=1)
-    assert ticket is not None
-    assert ticket.planned_physical_bytes == 20
-    broker.abort_expert_regrow(ticket)
-
-    broker.replace_snapshot(_snapshot(resident=50, experts=20))
-    assert broker.plan_expert_regrow(target_bytes=20, now_ns=2) is None
-    ticket = broker.plan_expert_regrow(target_bytes=10, now_ns=2)
-    assert ticket is not None
-    broker.abort_expert_regrow(ticket)
-
 
 def test_group_kv_growth_admits_aggregate_and_reclaims_before_member_one() -> None:
-    slab_bytes = 10_616_832 * 32
+    record_batch_bytes = 10_616_832 * 32
     member_bytes = 4_500_000
     member_count = 80
     slack_bytes = 215 * 1024**2
@@ -160,14 +262,13 @@ def test_group_kv_growth_admits_aggregate_and_reclaims_before_member_one() -> No
     initial_charged = target_bytes - slack_bytes
     broker = UnifiedMemoryBroker(
         budget=MemoryBudget(
-            operating_target_bytes=target_bytes,
-            hard_ceiling_bytes=3 * GIB,
+            memory_limit_bytes=target_bytes,
         ),
         initial_snapshot=_snapshot(
-            resident=initial_charged - slab_bytes,
-            experts=slab_bytes,
+            resident=initial_charged - record_batch_bytes,
+            experts=record_batch_bytes,
         ),
-        expert_slab_bytes=slab_bytes,
+        expert_record_bytes=record_batch_bytes,
     )
 
     ticket = broker.plan_kv_growth_group(
@@ -188,33 +289,32 @@ def test_group_kv_growth_admits_aggregate_and_reclaims_before_member_one() -> No
 
     reclaimed = broker.confirm_expert_reclaim(
         ticket,
-        registered_slab_bytes_after=0,
+        registered_cache_bytes_after=0,
         allocator_before=AllocatorMemorySample(
             active_bytes=initial_charged,
             cache_bytes=0,
             peak_bytes=initial_charged,
         ),
         allocator_after=AllocatorMemorySample(
-            active_bytes=initial_charged - slab_bytes,
+            active_bytes=initial_charged - record_batch_bytes,
             cache_bytes=0,
             peak_bytes=initial_charged,
         ),
-        now_ns=1,
     )
-    assert reclaimed.expert_slab_physical_bytes == 0
-    assert initial_charged - reclaimed.charged_bytes == slab_bytes
+    assert reclaimed.expert_cache_physical_bytes == 0
+    assert initial_charged - reclaimed.charged_bytes == record_batch_bytes
 
     allocation = broker.commit_kv_growth_group_member(
         ticket,
         cache_id="layer-0",
         allocated_physical_bytes=member_bytes,
         allocator_before=AllocatorMemorySample(
-            active_bytes=initial_charged - slab_bytes,
+            active_bytes=initial_charged - record_batch_bytes,
             cache_bytes=0,
             peak_bytes=initial_charged,
         ),
         allocator_after=AllocatorMemorySample(
-            active_bytes=initial_charged - slab_bytes + member_bytes,
+            active_bytes=initial_charged - record_batch_bytes + member_bytes,
             cache_bytes=0,
             peak_bytes=initial_charged,
         ),
@@ -230,9 +330,9 @@ def test_group_kv_growth_admits_aggregate_and_reclaims_before_member_one() -> No
 
 def test_group_kv_zero_abort_preserves_commits_and_confirmed_reclaim() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=60, experts=30),
-        expert_slab_bytes=30,
+        expert_record_bytes=30,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 20, 0))
@@ -240,10 +340,9 @@ def test_group_kv_zero_abort_preserves_commits_and_confirmed_reclaim() -> None:
     assert ticket.required_expert_reclaim_bytes == 20
     broker.confirm_expert_reclaim(
         ticket,
-        registered_slab_bytes_after=0,
+        registered_cache_bytes_after=0,
         allocator_before=AllocatorMemorySample(90, 0, 90),
         allocator_after=AllocatorMemorySample(60, 0, 90),
-        now_ns=1,
     )
     allocation = broker.commit_kv_growth_group_member(
         ticket,
@@ -259,7 +358,7 @@ def test_group_kv_zero_abort_preserves_commits_and_confirmed_reclaim() -> None:
     )
 
     assert allocation.physical_bytes == 7
-    assert snapshot.expert_slab_physical_bytes == 0
+    assert snapshot.expert_cache_physical_bytes == 0
     assert snapshot.kv_physical_bytes == 7
     assert snapshot.owned_kv_physical_bytes == 7
     assert snapshot.unreconciled_kv_physical_bytes == 0
@@ -269,9 +368,9 @@ def test_group_kv_zero_abort_preserves_commits_and_confirmed_reclaim() -> None:
 
 def test_group_kv_finalizes_only_after_every_member_commits_measured_bytes() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=50),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 2), ("cache-b", 20, 5))
@@ -319,9 +418,9 @@ def test_group_kv_known_abort_residual_is_charged_and_fails_closed(
     retained: int,
 ) -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=1_000),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 20, 0))
@@ -351,9 +450,9 @@ def test_group_kv_known_abort_residual_is_charged_and_fails_closed(
 
 def test_group_kv_unknown_abort_fails_closed_without_inventing_bytes() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 20, 0))
@@ -375,9 +474,9 @@ def test_group_kv_unknown_abort_fails_closed_without_inventing_bytes() -> None:
 
 def test_group_kv_rejects_stale_first_member_allocator_baseline() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=50),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -404,9 +503,9 @@ def test_group_kv_rejects_overlapping_member_commits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=50),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -485,36 +584,12 @@ def test_group_kv_rejects_overlapping_member_commits(
     assert snapshot.failed_closed is True
 
 
-def test_group_kv_can_terminalize_crossed_expert_reclaim_boundary() -> None:
-    broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
-        initial_snapshot=_snapshot(resident=60, experts=30),
-        expert_slab_bytes=30,
-    )
-    ticket = broker.plan_kv_growth_group(
-        members=(("cache-a", 10, 0), ("cache-b", 20, 0))
-    )
-
-    snapshot = broker.terminalize_expert_resize(
-        ticket,
-        registered_slab_bytes_after=0,
-        allocator_before=AllocatorMemorySample(90, 0, 90),
-        allocator_after=AllocatorMemorySample(60, 0, 90),
-        reason="group reclaim callback failed",
-    )
-
-    assert snapshot.expert_slab_physical_bytes == 0
-    assert snapshot.kv_physical_bytes == 0
-    assert snapshot.failed_closed is True
-    assert snapshot.failure_reason == "group reclaim callback failed"
-    assert snapshot.pending_kv_ticket_id is None
-
 
 def test_group_kv_rejects_duplicate_owners_and_aggregate_pinned_overcommit() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=50, experts=30, pinned=30),
-        expert_slab_bytes=30,
+        expert_record_bytes=30,
     )
 
     with pytest.raises(ValueError, match="duplicate.*cache-a"):
@@ -525,9 +600,9 @@ def test_group_kv_rejects_duplicate_owners_and_aggregate_pinned_overcommit() -> 
 
 def test_group_kv_uses_serialized_peak_instead_of_summing_member_transients() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=70),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
 
     ticket = broker.plan_kv_growth_group(
@@ -557,9 +632,9 @@ def test_group_kv_unknown_or_oversize_member_is_unreconciled_fail_closed(
     error_pattern: str,
 ) -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -584,9 +659,9 @@ def test_group_kv_unknown_or_oversize_member_is_unreconciled_fail_closed(
 
 def test_group_kv_duplicate_member_commit_is_rejected_without_double_charge() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -618,9 +693,9 @@ def test_group_kv_duplicate_member_commit_is_rejected_without_double_charge() ->
 
 def test_group_kv_accepts_active_cache_reclassification_at_equal_footprint() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -653,9 +728,9 @@ def test_group_kv_accepts_active_cache_reclassification_at_equal_footprint() -> 
 
 def test_group_kv_downward_footprint_drift_never_credits_allocator_cache() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -703,9 +778,9 @@ def test_group_kv_reclassification_rejects_upward_drift_or_peak_contradiction(
     allocator_before: AllocatorMemorySample,
 ) -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -737,9 +812,9 @@ def test_group_kv_abort_accepts_active_cache_reclassification_at_equal_footprint
     None
 ):
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -772,9 +847,9 @@ def test_group_kv_abort_rejects_ambiguous_allocator_chain_after_partial_commit()
     None
 ):
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=200),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth_group(
         members=(("cache-a", 10, 0), ("cache-b", 10, 0))
@@ -847,13 +922,10 @@ def test_hy3_q4_full_context_physical_geometry() -> None:
         (110 * GIB - 1, True),
         (110 * GIB, True),
         (110 * GIB + 1, False),
-        (112 * GIB - 1, False),
-        (112 * GIB, False),
-        (112 * GIB + 1, False),
     ],
 )
-def test_operating_and_hard_boundaries(charged: int, allowed: bool) -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+def test_configured_memory_limit_boundary(charged: int, allowed: bool) -> None:
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
 
     if allowed:
         broker.replace_snapshot(BrokerSnapshot.synthetic(charged_bytes=charged))
@@ -863,22 +935,21 @@ def test_operating_and_hard_boundaries(charged: int, allowed: bool) -> None:
             broker.replace_snapshot(BrokerSnapshot.synthetic(charged_bytes=charged))
         assert broker.snapshot().charged_bytes == charged
 
-    expected_hard_failures = int(charged >= 112 * GIB)
-    assert broker.snapshot().hard_failure_count == expected_hard_failures
+    assert broker.snapshot().hard_failure_count == int(not allowed)
 
 
-def test_hard_snapshot_rejects_all_later_allocation() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+def test_over_limit_snapshot_rejects_all_later_allocation() -> None:
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     with pytest.raises(MemoryAdmissionError):
         broker.replace_snapshot(BrokerSnapshot.synthetic(charged_bytes=112 * GIB))
 
-    with pytest.raises(MemoryAdmissionError, match="hard ceiling"):
+    with pytest.raises(MemoryAdmissionError, match="configured limit"):
         broker.plan_kv_growth(steady_delta_bytes=1, transient_delta_bytes=0)
 
 
 def test_allocator_cache_reconciliation_updates_only_the_cache_pool() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(
             resident=40,
             kv=10,
@@ -887,7 +958,7 @@ def test_allocator_cache_reconciliation_updates_only_the_cache_pool() -> None:
             workspace=10,
             cache=5,
         ),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
 
     snapshot = broker.reconcile_allocator_cache(
@@ -896,7 +967,7 @@ def test_allocator_cache_reconciliation_updates_only_the_cache_pool() -> None:
 
     assert snapshot.resident_model_bytes == 40
     assert snapshot.kv_physical_bytes == 10
-    assert snapshot.expert_slab_physical_bytes == 20
+    assert snapshot.expert_cache_physical_bytes == 20
     assert snapshot.in_flight_expert_staging_bytes == 5
     assert snapshot.runtime_workspace_bytes == 10
     assert snapshot.allocator_cache_bytes == 9
@@ -907,7 +978,7 @@ def test_allocator_cache_reconciliation_grants_no_credit_for_cache_to_active_mov
     None
 ):
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(
             resident=40,
             kv=10,
@@ -916,7 +987,7 @@ def test_allocator_cache_reconciliation_grants_no_credit_for_cache_to_active_mov
             workspace=10,
             cache=9,
         ),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
 
     snapshot = broker.reconcile_allocator_cache(
@@ -929,11 +1000,9 @@ def test_allocator_cache_reconciliation_grants_no_credit_for_cache_to_active_mov
 
 def test_reclaim_accepts_conservative_allocator_cache_overcharge() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=50, experts=40, cache=10),
-        expert_slab_bytes=10,
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ns=0,
+        expert_record_bytes=10,
     )
 
     reconciled = broker.reconcile_allocator_cache(
@@ -947,7 +1016,7 @@ def test_reclaim_accepts_conservative_allocator_cache_overcharge() -> None:
     )
     snapshot = broker.confirm_expert_reclaim(
         ticket,
-        registered_slab_bytes_after=30,
+        registered_cache_bytes_after=30,
         allocator_before=AllocatorMemorySample(
             active_bytes=95,
             cache_bytes=0,
@@ -958,17 +1027,16 @@ def test_reclaim_accepts_conservative_allocator_cache_overcharge() -> None:
             cache_bytes=0,
             peak_bytes=95,
         ),
-        now_ns=1,
     )
 
-    assert snapshot.expert_slab_physical_bytes == 30
+    assert snapshot.expert_cache_physical_bytes == 30
     assert snapshot.allocator_cache_bytes == 10
     assert snapshot.failed_closed is False
 
 
 def test_allocator_cache_reconciliation_charges_unclassified_active_drift() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(
             resident=40,
             kv=10,
@@ -977,7 +1045,7 @@ def test_allocator_cache_reconciliation_charges_unclassified_active_drift() -> N
             workspace=10,
             cache=5,
         ),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
 
     snapshot = broker.reconcile_allocator_cache(
@@ -992,12 +1060,12 @@ def test_allocator_cache_reconciliation_retains_over_budget_truth_and_fails_clos
     None
 ):
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=90, cache=5),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
 
-    with pytest.raises(MemoryAdmissionError, match="operating target"):
+    with pytest.raises(MemoryAdmissionError, match="memory limit"):
         broker.reconcile_allocator_cache(
             AllocatorMemorySample(active_bytes=90, cache_bytes=11, peak_bytes=101)
         )
@@ -1005,15 +1073,15 @@ def test_allocator_cache_reconciliation_retains_over_budget_truth_and_fails_clos
     snapshot = broker.snapshot()
     assert snapshot.allocator_cache_bytes == 11
     assert snapshot.charged_bytes == 101
-    with pytest.raises(MemoryAdmissionError, match="failed closed"):
+    with pytest.raises(MemoryAdmissionError, match="configured limit"):
         broker.plan_kv_growth(steady_delta_bytes=1, transient_delta_bytes=0)
 
 
 def test_allocator_cache_reconciliation_cannot_interrupt_a_transaction() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=50, cache=5),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=1,
@@ -1033,9 +1101,9 @@ def test_allocator_cache_reconciliation_cannot_interrupt_a_transaction() -> None
 
 def test_post_load_classification_reconciliation_preserves_kv_owner_handles() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=40, experts=20, workspace=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=4,
@@ -1046,7 +1114,7 @@ def test_post_load_classification_reconciliation_preserves_kv_owner_handles() ->
 
     snapshot = broker.reconcile_post_load_classification(
         resident_model_bytes=45,
-        expert_slab_physical_bytes=20,
+        expert_cache_physical_bytes=20,
         in_flight_expert_staging_bytes=5,
         runtime_workspace_bytes=5,
         allocator_before=AllocatorMemorySample(74, 0, 74),
@@ -1066,7 +1134,7 @@ def test_post_load_classification_reconciliation_preserves_kv_owner_handles() ->
 
 def test_post_load_classification_atomically_reclassifies_consumed_cache() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(
             resident=40,
             experts=20,
@@ -1074,12 +1142,12 @@ def test_post_load_classification_atomically_reclassifies_consumed_cache() -> No
             workspace=10,
             cache=10,
         ),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
 
     snapshot = broker.reconcile_post_load_classification(
         resident_model_bytes=45,
-        expert_slab_physical_bytes=20,
+        expert_cache_physical_bytes=20,
         in_flight_expert_staging_bytes=5,
         runtime_workspace_bytes=10,
         allocator_before=AllocatorMemorySample(65, 10, 75),
@@ -1094,7 +1162,7 @@ def test_post_load_classification_atomically_reclassifies_consumed_cache() -> No
 def test_post_load_classification_does_not_double_charge_planned_resident() -> None:
     initial_sample = AllocatorMemorySample(25, 0, 25)
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(
             resident=40,
             experts=20,
@@ -1102,12 +1170,12 @@ def test_post_load_classification_does_not_double_charge_planned_resident() -> N
             workspace=10,
         ),
         initial_allocator_sample=initial_sample,
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
 
     snapshot = broker.reconcile_post_load_classification(
         resident_model_bytes=45,
-        expert_slab_physical_bytes=20,
+        expert_cache_physical_bytes=20,
         in_flight_expert_staging_bytes=5,
         runtime_workspace_bytes=5,
         allocator_before=initial_sample,
@@ -1120,9 +1188,9 @@ def test_post_load_classification_does_not_double_charge_planned_resident() -> N
 
 def test_post_load_classification_rejects_active_ticket_without_mutation() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=40, experts=20, workspace=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=4,
@@ -1134,7 +1202,7 @@ def test_post_load_classification_rejects_active_ticket_without_mutation() -> No
     with pytest.raises(MemoryTransactionError, match="active memory transaction"):
         broker.reconcile_post_load_classification(
             resident_model_bytes=41,
-            expert_slab_physical_bytes=20,
+            expert_cache_physical_bytes=20,
             in_flight_expert_staging_bytes=0,
             runtime_workspace_bytes=10,
             allocator_before=AllocatorMemorySample(60, 0, 60),
@@ -1148,13 +1216,13 @@ def test_post_load_classification_rejects_active_ticket_without_mutation() -> No
 
 def test_post_load_classification_consumes_startup_baseline_once() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=40, experts=20, workspace=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     kwargs = {
         "resident_model_bytes": 41,
-        "expert_slab_physical_bytes": 20,
+        "expert_cache_physical_bytes": 20,
         "in_flight_expert_staging_bytes": 0,
         "runtime_workspace_bytes": 9,
         "allocator_before": AllocatorMemorySample(60, 0, 60),
@@ -1170,7 +1238,7 @@ def test_post_load_classification_consumes_startup_baseline_once() -> None:
 
 
 def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
 
     ticket = broker.plan_kv_growth(
@@ -1184,7 +1252,7 @@ def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:
 
     broker.confirm_expert_reclaim(
         ticket,
-        registered_slab_bytes_after=8 * GIB,
+        registered_cache_bytes_after=8 * GIB,
         allocator_before=AllocatorMemorySample(
             active_bytes=10 * GIB,
             cache_bytes=0,
@@ -1195,7 +1263,6 @@ def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:
             cache_bytes=0,
             peak_bytes=10 * GIB,
         ),
-        now_ns=10,
     )
     allocation = broker.commit_kv_growth(
         ticket,
@@ -1208,7 +1275,7 @@ def test_two_phase_ticket_accounts_steady_and_transient_peak() -> None:
 
 
 def test_transient_peak_requires_reclaim_even_when_steady_state_fits() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=108 * GIB, experts=2 * GIB))
 
     ticket = broker.plan_kv_growth(
@@ -1222,7 +1289,7 @@ def test_transient_peak_requires_reclaim_even_when_steady_state_fits() -> None:
 
 
 def test_pinned_expert_shortfall_rejects_without_reserving() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(
         broker,
         _snapshot(
@@ -1245,7 +1312,7 @@ def test_pinned_expert_shortfall_rejects_without_reserving() -> None:
 
 
 def test_speculative_experts_remain_in_pool_and_reclaimable() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(
         broker,
         _snapshot(
@@ -1277,7 +1344,7 @@ def test_speculative_experts_remain_in_pool_and_reclaimable() -> None:
 
 
 def test_expert_reclaim_requires_registered_and_allocator_reduction() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1287,7 +1354,7 @@ def test_expert_reclaim_requires_registered_and_allocator_reduction() -> None:
     with pytest.raises(MemoryTelemetryError, match="allocator footprint") as caught:
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=8 * GIB,
+            registered_cache_bytes_after=8 * GIB,
             allocator_before=AllocatorMemorySample(
                 active_bytes=10 * GIB,
                 cache_bytes=0,
@@ -1298,20 +1365,19 @@ def test_expert_reclaim_requires_registered_and_allocator_reduction() -> None:
                 cache_bytes=2 * GIB,
                 peak_bytes=10 * GIB,
             ),
-            now_ns=1,
         )
     assert not isinstance(caught.value, TerminalizedKVReleaseError)
 
     # Active-to-cache movement is reclassification, not physical reclaim.
     snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 8 * GIB
+    assert snapshot.expert_cache_physical_bytes == 8 * GIB
     assert snapshot.allocator_cache_bytes == 2 * GIB
     assert snapshot.charged_bytes == 110 * GIB
     assert snapshot.failed_closed is True
 
 
 def test_reclaim_below_pinned_bytes_preserves_physical_truth_and_invariant() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(
         broker,
         _snapshot(
@@ -1328,36 +1394,34 @@ def test_reclaim_below_pinned_bytes_preserves_physical_truth_and_invariant() -> 
     with pytest.raises(MemoryTelemetryError, match="pinned"):
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=8 * GIB,
+            registered_cache_bytes_after=8 * GIB,
             allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
             allocator_after=AllocatorMemorySample(8 * GIB, 0, 10 * GIB),
-            now_ns=1,
         )
 
     snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 8 * GIB
+    assert snapshot.expert_cache_physical_bytes == 8 * GIB
     assert snapshot.pinned_expert_bytes == 8 * GIB
-    assert snapshot.expert_slab_physical_bytes >= snapshot.pinned_expert_bytes
+    assert snapshot.expert_cache_physical_bytes >= snapshot.pinned_expert_bytes
     assert snapshot.failed_closed is True
 
 
 def test_allocator_cache_retention_must_leave_the_ticket_peak_within_target() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
         transient_delta_bytes=GIB,
     )
 
-    # The total allocator footprint fell by the two registered slab GiB, but
+    # The total allocator footprint fell by the two registered cache GiB, but
     # one additional GiB is now allocator cache and remains charged.
     with pytest.raises(MemoryTelemetryError, match="cache retention"):
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=8 * GIB,
+            registered_cache_bytes_after=8 * GIB,
             allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
             allocator_after=AllocatorMemorySample(7 * GIB, GIB, 10 * GIB),
-            now_ns=1,
         )
 
     snapshot = broker.snapshot()
@@ -1366,26 +1430,26 @@ def test_allocator_cache_retention_must_leave_the_ticket_peak_within_target() ->
 
 
 def test_logical_only_expert_eviction_gets_zero_credit() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
         transient_delta_bytes=0,
     )
 
-    with pytest.raises(MemoryTelemetryError, match="registered slab"):
+    with pytest.raises(MemoryTelemetryError, match="registered cache"):
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=10 * GIB,
+            registered_cache_bytes_after=10 * GIB,
             allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
             allocator_after=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
         )
 
-    assert broker.snapshot().expert_slab_physical_bytes == 10 * GIB
+    assert broker.snapshot().expert_cache_physical_bytes == 10 * GIB
 
 
 def test_missing_allocator_telemetry_fails_closed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1395,7 +1459,7 @@ def test_missing_allocator_telemetry_fails_closed() -> None:
     with pytest.raises(MemoryTelemetryError, match="unavailable"):
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=9 * GIB,
+            registered_cache_bytes_after=9 * GIB,
             allocator_before=None,
             allocator_after=None,
         )
@@ -1405,75 +1469,10 @@ def test_missing_allocator_telemetry_fails_closed() -> None:
         broker.plan_kv_growth(steady_delta_bytes=1, transient_delta_bytes=0)
 
 
-def test_physical_reclaim_without_timestamp_cannot_bypass_regrow_interval() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_resize_min_interval_ns=1_000,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    ticket = broker.plan_kv_growth(
-        steady_delta_bytes=GIB,
-        transient_delta_bytes=0,
-    )
-
-    with pytest.raises(MemoryTelemetryError, match="now_ns"):
-        broker.confirm_expert_reclaim(
-            ticket,
-            registered_slab_bytes_after=9 * GIB,
-            allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
-            allocator_after=AllocatorMemorySample(9 * GIB, 0, 10 * GIB),
-        )
-
-    snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 9 * GIB
-    assert snapshot.last_expert_resize_ns is None
-    assert snapshot.failed_closed is True
-    with pytest.raises(MemoryAdmissionError, match="failed closed"):
-        broker.plan_expert_regrow(target_bytes=GIB, now_ns=0)
-
-
-def test_reclaim_timestamp_rollback_rejects_before_physical_mutation() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_resize_min_interval_ns=1_000,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    first = broker.plan_kv_growth(
-        steady_delta_bytes=GIB,
-        transient_delta_bytes=0,
-    )
-    broker.confirm_expert_reclaim(
-        first,
-        registered_slab_bytes_after=9 * GIB,
-        allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
-        allocator_after=AllocatorMemorySample(9 * GIB, 0, 10 * GIB),
-        now_ns=100,
-    )
-    broker.abort_kv_growth(first, observed_kv_delta_bytes=0)
-    second = broker.plan_kv_growth(
-        steady_delta_bytes=2 * GIB,
-        transient_delta_bytes=0,
-    )
-
-    with pytest.raises(MemoryTransactionError, match="before last resize"):
-        broker.confirm_expert_reclaim(
-            second,
-            registered_slab_bytes_after=8 * GIB,
-            allocator_before=AllocatorMemorySample(9 * GIB, 0, 9 * GIB),
-            allocator_after=AllocatorMemorySample(8 * GIB, 0, 9 * GIB),
-            now_ns=99,
-        )
-
-    snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 9 * GIB
-    assert snapshot.last_expert_resize_ns == 100
-    assert snapshot.failed_closed is True
-    with pytest.raises(MemoryAdmissionError, match="failed closed"):
-        broker.plan_expert_regrow(target_bytes=GIB, now_ns=1_100)
 
 
 def test_negative_allocator_delta_preserves_a_conservative_charge() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1483,20 +1482,19 @@ def test_negative_allocator_delta_preserves_a_conservative_charge() -> None:
     with pytest.raises(MemoryTelemetryError, match="allocator footprint"):
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=9 * GIB,
+            registered_cache_bytes_after=9 * GIB,
             allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
             allocator_after=AllocatorMemorySample(11 * GIB, 0, 11 * GIB),
-            now_ns=1,
         )
 
     snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 9 * GIB
+    assert snapshot.expert_cache_physical_bytes == 9 * GIB
     assert snapshot.charged_bytes >= 110 * GIB
     assert snapshot.failed_closed is True
 
 
 def test_expert_release_allocator_growth_is_charged_and_records_hard_failure() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1506,14 +1504,13 @@ def test_expert_release_allocator_growth_is_charged_and_records_hard_failure() -
     with pytest.raises(MemoryTelemetryError, match="allocator footprint"):
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=9 * GIB,
+            registered_cache_bytes_after=9 * GIB,
             allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
             allocator_after=AllocatorMemorySample(12 * GIB, 0, 12 * GIB),
-            now_ns=1,
         )
 
     snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 9 * GIB
+    assert snapshot.expert_cache_physical_bytes == 9 * GIB
     assert snapshot.allocator_cache_bytes == 3 * GIB
     assert snapshot.charged_bytes == 112 * GIB
     assert snapshot.hard_failure_count == 1
@@ -1521,7 +1518,7 @@ def test_expert_release_allocator_growth_is_charged_and_records_hard_failure() -
 
 
 def test_expert_registry_growth_is_published_before_hard_failure() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1531,14 +1528,13 @@ def test_expert_registry_growth_is_published_before_hard_failure() -> None:
     with pytest.raises(MemoryTelemetryError, match="increased"):
         broker.confirm_expert_reclaim(
             ticket,
-            registered_slab_bytes_after=11 * GIB,
+            registered_cache_bytes_after=11 * GIB,
             allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
             allocator_after=AllocatorMemorySample(12 * GIB, 0, 12 * GIB),
-            now_ns=1,
         )
 
     snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 11 * GIB
+    assert snapshot.expert_cache_physical_bytes == 11 * GIB
     assert snapshot.allocator_cache_bytes == GIB
     assert snapshot.charged_bytes == 112 * GIB
     assert snapshot.hard_failure_count == 1
@@ -1546,7 +1542,7 @@ def test_expert_registry_growth_is_published_before_hard_failure() -> None:
 
 
 def test_ticket_is_revision_checked_and_single_use() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1561,7 +1557,7 @@ def test_ticket_is_revision_checked_and_single_use() -> None:
 
 
 def test_ticket_revision_mismatch_branch_fails_closed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1579,7 +1575,7 @@ def test_ticket_revision_mismatch_branch_fails_closed() -> None:
 
 
 def test_safe_pre_destructive_abort_restores_exact_snapshot() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     original = _snapshot(resident=100 * GIB, experts=10 * GIB)
     _install(broker, original)
     ticket = broker.plan_kv_growth(
@@ -1591,7 +1587,7 @@ def test_safe_pre_destructive_abort_restores_exact_snapshot() -> None:
 
     snapshot = broker.snapshot()
     assert snapshot.resident_model_bytes == original.resident_model_bytes
-    assert snapshot.expert_slab_physical_bytes == original.expert_slab_physical_bytes
+    assert snapshot.expert_cache_physical_bytes == original.expert_cache_physical_bytes
     assert snapshot.kv_physical_bytes == original.kv_physical_bytes
     assert snapshot.allocator_cache_bytes == original.allocator_cache_bytes
     assert snapshot.pending_kv_ticket_id is None
@@ -1599,7 +1595,7 @@ def test_safe_pre_destructive_abort_restores_exact_snapshot() -> None:
 
 
 def test_known_zero_allocation_failure_preserves_confirmed_reclaim() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1607,16 +1603,15 @@ def test_known_zero_allocation_failure_preserves_confirmed_reclaim() -> None:
     )
     broker.confirm_expert_reclaim(
         ticket,
-        registered_slab_bytes_after=9 * GIB,
+        registered_cache_bytes_after=9 * GIB,
         allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
         allocator_after=AllocatorMemorySample(9 * GIB, 0, 10 * GIB),
-        now_ns=1,
     )
 
     broker.abort_kv_growth(ticket, observed_kv_delta_bytes=0)
 
     snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 9 * GIB
+    assert snapshot.expert_cache_physical_bytes == 9 * GIB
     assert snapshot.kv_physical_bytes == 0
     assert snapshot.charged_bytes == 109 * GIB
     assert snapshot.transaction_failure_count == 1
@@ -1626,7 +1621,7 @@ def test_known_zero_allocation_failure_preserves_confirmed_reclaim() -> None:
 
 
 def test_unknown_interrupted_allocation_fails_closed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1641,7 +1636,7 @@ def test_unknown_interrupted_allocation_fails_closed() -> None:
 
 
 def test_allocation_size_mismatch_is_charged_and_fails_closed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1659,7 +1654,7 @@ def test_allocation_size_mismatch_is_charged_and_fails_closed() -> None:
 
 
 def test_release_is_exact_and_duplicate_release_cannot_credit_twice() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1691,7 +1686,7 @@ def test_release_is_exact_and_duplicate_release_cannot_credit_twice() -> None:
 
 
 def test_kv_release_active_to_cache_gets_zero_credit() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1718,9 +1713,9 @@ def test_kv_release_active_to_cache_gets_zero_credit() -> None:
 
 def test_kv_release_absorbs_new_allocator_residual_before_crediting_release() -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=40, cache=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=10,
@@ -1744,21 +1739,19 @@ def test_kv_release_absorbs_new_allocator_residual_before_crediting_release() ->
 
 
 @pytest.mark.parametrize(
-    ("allocator_before_bytes", "expected_hard_failures", "reason"),
+    "allocator_before_bytes",
     [
-        (105, 0, "operating target"),
-        (115, 1, "hard ceiling"),
+        105,
+        115,
     ],
 )
 def test_kv_release_latches_pre_release_allocator_limit_violation(
     allocator_before_bytes: int,
-    expected_hard_failures: int,
-    reason: str,
 ) -> None:
     broker = UnifiedMemoryBroker(
-        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        budget=MemoryBudget(memory_limit_bytes=100),
         initial_snapshot=_snapshot(resident=40, cache=10),
-        expert_slab_bytes=10,
+        expert_record_bytes=10,
     )
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=10,
@@ -1783,13 +1776,13 @@ def test_kv_release_latches_pre_release_allocator_limit_violation(
     assert snapshot.charged_bytes == 90
     assert snapshot.admission_failure_count == 1
     assert snapshot.transaction_failure_count == 1
-    assert snapshot.hard_failure_count == expected_hard_failures
+    assert snapshot.hard_failure_count == 0
     assert snapshot.failed_closed is True
-    assert reason in (snapshot.failure_reason or "")
+    assert "memory limit" in (snapshot.failure_reason or "")
 
 
 def test_kv_release_without_allocator_reduction_retains_charge_and_fails() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1817,7 +1810,7 @@ def test_kv_release_without_allocator_reduction_retains_charge_and_fails() -> No
 
 
 def test_kv_release_allocator_growth_is_charged_and_records_hard_failure() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=109 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1845,7 +1838,7 @@ def test_kv_release_allocator_growth_is_charged_and_records_hard_failure() -> No
 
 
 def test_kv_release_size_mismatch_preserves_observed_truth_and_fails_closed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1870,7 +1863,7 @@ def test_kv_release_size_mismatch_preserves_observed_truth_and_fails_closed() ->
 
 
 def test_kv_release_missing_telemetry_is_retryable_not_terminalized() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1899,7 +1892,7 @@ def test_kv_release_missing_telemetry_is_retryable_not_terminalized() -> None:
 
 
 def test_multi_growth_same_cache_releases_in_one_physical_close() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     first_ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -1934,7 +1927,7 @@ def test_multi_growth_same_cache_releases_in_one_physical_close() -> None:
 
 
 def test_concurrent_cache_closes_derive_each_release_from_locked_owner_truth() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     handles = {}
     for cache_id in ("cache-a", "cache-b"):
@@ -1981,7 +1974,7 @@ def test_concurrent_cache_closes_derive_each_release_from_locked_owner_truth() -
 
 
 def test_partial_same_cache_close_preserves_observed_truth_and_fails() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     allocations = []
     for _ in range(2):
@@ -2011,7 +2004,7 @@ def test_partial_same_cache_close_preserves_observed_truth_and_fails() -> None:
 
 
 def test_wrong_aggregate_cache_close_preserves_partial_physical_truth() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     allocations = []
     for _ in range(2):
@@ -2041,7 +2034,7 @@ def test_wrong_aggregate_cache_close_preserves_partial_physical_truth() -> None:
 
 
 def test_cross_cache_batch_close_fails_without_combining_ownership() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     handles = []
     for cache_id in ("cache-a", "cache-b"):
@@ -2069,7 +2062,7 @@ def test_cross_cache_batch_close_fails_without_combining_ownership() -> None:
 
 
 def test_batch_release_handles_cannot_be_replayed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -2097,7 +2090,7 @@ def test_batch_release_handles_cannot_be_replayed() -> None:
 
 
 def test_larger_than_selected_drop_terminalizes_affected_ownership() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     handles = {}
     for cache_id in ("cache-a", "cache-b"):
@@ -2134,7 +2127,7 @@ def test_larger_than_selected_drop_terminalizes_affected_ownership() -> None:
 
 
 def test_cross_cache_partial_drop_becomes_terminal_unreconciled_residual() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     handles = []
     for cache_id in ("cache-a", "cache-b"):
@@ -2168,7 +2161,7 @@ def test_cross_cache_partial_drop_becomes_terminal_unreconciled_residual() -> No
 
 
 def test_value_equal_forged_handle_is_rejected_before_physical_mutation() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=50 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -2198,246 +2191,15 @@ def test_value_equal_forged_handle_is_rejected_before_physical_mutation() -> Non
     )
 
 
-def test_expert_regrow_hysteresis_and_minimum_interval() -> None:
-    interval_ns = 1_000
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_regrow_hysteresis_slabs=1,
-        expert_resize_min_interval_ns=interval_ns,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    ticket = broker.plan_kv_growth(
-        steady_delta_bytes=GIB,
-        transient_delta_bytes=0,
-    )
-    broker.confirm_expert_reclaim(
-        ticket,
-        registered_slab_bytes_after=7 * GIB,
-        allocator_before=AllocatorMemorySample(10 * GIB, 0, 10 * GIB),
-        allocator_after=AllocatorMemorySample(7 * GIB, 0, 10 * GIB),
-        now_ns=100,
-    )
-    broker.abort_kv_growth(ticket, observed_kv_delta_bytes=0)
-
-    assert (
-        broker.plan_expert_regrow(
-            target_bytes=GIB,
-            now_ns=100 + interval_ns - 1,
-        )
-        is None
-    )
-    regrow = broker.plan_expert_regrow(
-        target_bytes=GIB,
-        now_ns=100 + interval_ns,
-    )
-    assert regrow is not None
-    assert regrow.planned_physical_bytes == GIB
-
-    # Planning reserves a transaction but does not publish physical bytes or
-    # advance the resize clock.
-    assert broker.snapshot().expert_slab_physical_bytes == 7 * GIB
-    assert broker.snapshot().last_expert_resize_ns == 100
-    assert (
-        broker.plan_expert_regrow(
-            target_bytes=GIB,
-            now_ns=100 + interval_ns,
-        )
-        is None
-    )
-
-    broker.confirm_expert_regrow(
-        regrow,
-        registered_slab_bytes_after=8 * GIB,
-        allocator_before=AllocatorMemorySample(7 * GIB, 0, 7 * GIB),
-        allocator_after=AllocatorMemorySample(8 * GIB, 0, 8 * GIB),
-        now_ns=100 + interval_ns,
-    )
-    snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 8 * GIB
-    assert snapshot.last_expert_resize_ns == 100 + interval_ns
-
-    # A physically confirmed resize, not the earlier plan, gates another
-    # otherwise-admissible same-time regrow.
-    assert (
-        broker.plan_expert_regrow(
-            target_bytes=GIB,
-            now_ns=100 + interval_ns,
-        )
-        is None
-    )
 
 
-def test_non_slab_aligned_regrow_rounds_up_and_preserves_hysteresis() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_regrow_hysteresis_slabs=1,
-        expert_resize_min_interval_ns=0,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    broker.replace_snapshot(_snapshot(resident=100 * GIB, experts=7 * GIB))
-
-    regrow = broker.plan_expert_regrow(
-        target_bytes=GIB + 1,
-        now_ns=1,
-    )
-    assert regrow is not None
-    assert regrow.planned_slabs == 2
-    assert regrow.planned_physical_bytes == 2 * GIB
-    assert regrow.planned_peak_bytes + GIB == 110 * GIB
-    broker.abort_expert_regrow(regrow)
-
-    broker.replace_snapshot(_snapshot(resident=101 * GIB, experts=7 * GIB))
-    assert broker.plan_expert_regrow(target_bytes=2 * GIB, now_ns=2) is None
 
 
-def test_expert_regrow_ticket_is_single_use() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ns=0,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    broker.replace_snapshot(_snapshot(resident=100 * GIB, experts=7 * GIB))
-    ticket = broker.plan_expert_regrow(target_bytes=GIB, now_ns=10)
-    assert ticket is not None
 
-    broker.confirm_expert_regrow(
-        ticket,
-        registered_slab_bytes_after=8 * GIB,
-        allocator_before=AllocatorMemorySample(7 * GIB, 0, 7 * GIB),
-        allocator_after=AllocatorMemorySample(8 * GIB, 0, 8 * GIB),
-        now_ns=10,
-    )
-
-    with pytest.raises(MemoryTransactionError, match="consumed"):
-        broker.confirm_expert_regrow(
-            ticket,
-            registered_slab_bytes_after=8 * GIB,
-            allocator_before=AllocatorMemorySample(8 * GIB, 0, 8 * GIB),
-            allocator_after=AllocatorMemorySample(8 * GIB, 0, 8 * GIB),
-            now_ns=10,
-        )
-
-
-def test_expert_regrow_ticket_revision_mismatch_fails_closed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ns=0,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    broker.replace_snapshot(_snapshot(resident=100 * GIB, experts=7 * GIB))
-    ticket = broker.plan_expert_regrow(target_bytes=GIB, now_ns=10)
-    assert ticket is not None
-    with pytest.raises(MemoryAdmissionError, match="already active"):
-        broker.plan_kv_growth(
-            steady_delta_bytes=GIB,
-            transient_delta_bytes=0,
-        )
-
-    with pytest.raises(MemoryTransactionError, match="revision changed"):
-        broker.confirm_expert_regrow(
-            ticket,
-            registered_slab_bytes_after=7 * GIB,
-            allocator_before=AllocatorMemorySample(7 * GIB, 0, 7 * GIB),
-            allocator_after=AllocatorMemorySample(7 * GIB, 0, 7 * GIB),
-            now_ns=10,
-        )
-    assert broker.snapshot().failed_closed is True
-
-
-def test_expert_regrow_timestamp_before_plan_rejects_before_mutation() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ns=0,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    broker.replace_snapshot(_snapshot(resident=100 * GIB, experts=7 * GIB))
-    ticket = broker.plan_expert_regrow(target_bytes=GIB, now_ns=1_000)
-    assert ticket is not None
-
-    with pytest.raises(MemoryTransactionError, match="before ticket plan"):
-        broker.confirm_expert_regrow(
-            ticket,
-            registered_slab_bytes_after=8 * GIB,
-            allocator_before=AllocatorMemorySample(7 * GIB, 0, 7 * GIB),
-            allocator_after=AllocatorMemorySample(8 * GIB, 0, 8 * GIB),
-            now_ns=999,
-        )
-
-    snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 7 * GIB
-    assert snapshot.last_expert_resize_ns is None
-    assert snapshot.failed_closed is True
-
-
-def test_expert_regrow_timestamp_omission_preserves_physical_without_clock() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ns=0,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    broker.replace_snapshot(_snapshot(resident=100 * GIB, experts=7 * GIB))
-    ticket = broker.plan_expert_regrow(target_bytes=GIB, now_ns=10)
-    assert ticket is not None
-
-    with pytest.raises(MemoryTelemetryError, match="now_ns"):
-        broker.confirm_expert_regrow(
-            ticket,
-            registered_slab_bytes_after=8 * GIB,
-            allocator_before=AllocatorMemorySample(7 * GIB, 0, 7 * GIB),
-            allocator_after=AllocatorMemorySample(8 * GIB, 0, 8 * GIB),
-        )
-
-    snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 8 * GIB
-    assert snapshot.last_expert_resize_ns is None
-    assert snapshot.failed_closed is True
-
-
-def test_failed_regrow_below_pins_preserves_physical_and_classification_invariants() -> (
-    None
-):
-    broker = UnifiedMemoryBroker.standard_hy3(
-        expert_slab_bytes=GIB,
-        expert_regrow_hysteresis_slabs=0,
-        expert_resize_min_interval_ns=0,
-    )
-    _install(broker, _snapshot(resident=100 * GIB, experts=10 * GIB))
-    broker.replace_snapshot(
-        _snapshot(
-            resident=100 * GIB,
-            experts=7 * GIB,
-            pinned=7 * GIB,
-            speculative=5 * GIB,
-        )
-    )
-    ticket = broker.plan_expert_regrow(target_bytes=GIB, now_ns=10)
-    assert ticket is not None
-
-    with pytest.raises(MemoryTelemetryError, match="did not match"):
-        broker.confirm_expert_regrow(
-            ticket,
-            registered_slab_bytes_after=6 * GIB,
-            allocator_before=AllocatorMemorySample(7 * GIB, 0, 7 * GIB),
-            allocator_after=AllocatorMemorySample(6 * GIB, 0, 7 * GIB),
-            now_ns=10,
-        )
-
-    snapshot = broker.snapshot()
-    assert snapshot.expert_slab_physical_bytes == 6 * GIB
-    assert snapshot.pinned_expert_bytes == 6 * GIB
-    assert snapshot.speculative_expert_bytes == 5 * GIB
-    assert snapshot.allocator_cache_bytes == GIB
-    assert snapshot.expert_slab_physical_bytes >= snapshot.pinned_expert_bytes
-    assert snapshot.speculative_expert_bytes <= snapshot.expert_slab_physical_bytes
-    assert snapshot.failed_closed is True
 
 
 def test_commit_kv_growth_atomically_reclassifies_consumed_allocator_cache() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, cache=2 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -2460,7 +2222,7 @@ def test_commit_kv_growth_atomically_reclassifies_consumed_allocator_cache() -> 
 
 
 def test_commit_kv_growth_reconciles_allocator_cache_from_absolute_pools() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, cache=2 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -2482,7 +2244,7 @@ def test_commit_kv_growth_reconciles_allocator_cache_from_absolute_pools() -> No
 
 
 def test_commit_kv_growth_over_target_terminalizes_without_stranded_handle() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=108 * GIB, cache=GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -2490,7 +2252,7 @@ def test_commit_kv_growth_over_target_terminalizes_without_stranded_handle() -> 
         cache_id="target:over-target",
     )
 
-    with pytest.raises(MemoryTransactionError, match="operating target"):
+    with pytest.raises(MemoryTransactionError, match="memory limit"):
         broker.commit_kv_growth(
             ticket,
             allocated_physical_bytes=GIB,
@@ -2512,7 +2274,7 @@ def test_commit_kv_growth_over_target_terminalizes_without_stranded_handle() -> 
 
 
 def test_commit_kv_growth_missing_atomic_sample_terminalizes_unowned_bytes() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB, cache=2 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -2542,7 +2304,7 @@ def test_commit_kv_growth_missing_atomic_sample_terminalizes_unowned_bytes() -> 
 
 
 def test_abort_kv_growth_atomically_charges_allocator_cache_retention() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,
@@ -2562,7 +2324,7 @@ def test_abort_kv_growth_atomically_charges_allocator_cache_retention() -> None:
 
 
 def test_abort_kv_growth_invalid_atomic_sample_consumes_ticket_fail_closed() -> None:
-    broker = UnifiedMemoryBroker.standard_hy3()
+    broker = UnifiedMemoryBroker.standard_hy3(expert_record_bytes=GIB)
     _install(broker, _snapshot(resident=100 * GIB))
     ticket = broker.plan_kv_growth(
         steady_delta_bytes=GIB,

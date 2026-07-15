@@ -1,7 +1,7 @@
 """Fail-closed unified-memory accounting for the Hy3 dynamic-memory lane.
 
 The broker is deliberately allocator-agnostic.  It serializes byte-accounting
-transactions, but callers remain responsible for choosing expert slabs and for
+transactions, but callers remain responsible for choosing expert records and for
 performing MLX allocations on the correct owner thread.
 """
 
@@ -72,30 +72,24 @@ def _exact_positive_int(name: str, value: object) -> int:
 
 @dataclass(frozen=True)
 class MemoryBudget:
-    """Binary-byte limits for normal operation and the stress ceiling."""
+    """One machine-configurable limit plus reserved allocator headroom."""
 
-    operating_target_bytes: int = 110 * BINARY_GIB
-    hard_ceiling_bytes: int = 112 * BINARY_GIB
+    memory_limit_bytes: int
     allocator_headroom_bytes: int = 0
 
     def __post_init__(self) -> None:
-        operating = _exact_positive_int(
-            "operating_target_bytes", self.operating_target_bytes
-        )
-        hard = _exact_positive_int("hard_ceiling_bytes", self.hard_ceiling_bytes)
+        limit = _exact_positive_int("memory_limit_bytes", self.memory_limit_bytes)
         headroom = _exact_nonnegative_int(
             "allocator_headroom_bytes", self.allocator_headroom_bytes
         )
-        if operating >= hard:
-            raise ValueError("operating_target_bytes must be below hard_ceiling_bytes")
-        if headroom >= operating:
+        if headroom >= limit:
             raise ValueError(
-                "allocator_headroom_bytes must be below operating_target_bytes"
+                "allocator_headroom_bytes must be below memory_limit_bytes"
             )
 
     @property
-    def classified_target_bytes(self) -> int:
-        return self.operating_target_bytes - self.allocator_headroom_bytes
+    def classified_limit_bytes(self) -> int:
+        return self.memory_limit_bytes - self.allocator_headroom_bytes
 
 
 @dataclass(frozen=True)
@@ -153,7 +147,7 @@ class BrokerSnapshot:
 
     resident_model_bytes: int
     kv_physical_bytes: int
-    expert_slab_physical_bytes: int
+    expert_cache_physical_bytes: int
     in_flight_expert_staging_bytes: int
     runtime_workspace_bytes: int
     allocator_cache_bytes: int
@@ -166,8 +160,6 @@ class BrokerSnapshot:
     failed_closed: bool = False
     failure_reason: str | None = None
     pending_kv_ticket_id: int | None = None
-    pending_expert_regrow_ticket_id: int | None = None
-    last_expert_resize_ns: int | None = None
     owned_kv_physical_bytes: int = 0
     unreconciled_kv_physical_bytes: int = 0
 
@@ -176,7 +168,7 @@ class BrokerSnapshot:
         return (
             self.resident_model_bytes
             + self.kv_physical_bytes
-            + self.expert_slab_physical_bytes
+            + self.expert_cache_physical_bytes
             + self.in_flight_expert_staging_bytes
             + self.runtime_workspace_bytes
             + self.allocator_cache_bytes
@@ -187,7 +179,7 @@ class BrokerSnapshot:
         return (
             self.resident_model_bytes
             + self.kv_physical_bytes
-            + self.expert_slab_physical_bytes
+            + self.expert_cache_physical_bytes
             + self.in_flight_expert_staging_bytes
             + self.runtime_workspace_bytes
         )
@@ -198,7 +190,7 @@ class BrokerSnapshot:
 
         return max(
             0,
-            self.expert_slab_physical_bytes - self.pinned_expert_bytes,
+            self.expert_cache_physical_bytes - self.pinned_expert_bytes,
         )
 
     @property
@@ -217,7 +209,7 @@ class BrokerSnapshot:
         return cls(
             resident_model_bytes=charged_bytes,
             kv_physical_bytes=0,
-            expert_slab_physical_bytes=0,
+            expert_cache_physical_bytes=0,
             in_flight_expert_staging_bytes=0,
             runtime_workspace_bytes=0,
             allocator_cache_bytes=0,
@@ -277,16 +269,13 @@ class KVAllocationGroupTicket:
 
 
 @dataclass(frozen=True)
-class ExpertRegrowTicket:
-    """Single-use reservation for a slab-aligned physical expert regrow."""
+class ExpertCacheAllocationTicket:
+    """Single-use reservation for one direct expert-record allocation."""
 
     ticket_id: int
-    requested_target_bytes: int
-    planned_slabs: int
-    planned_physical_bytes: int
+    physical_bytes: int
     snapshot_revision: int
-    planned_peak_bytes: int
-    planned_at_ns: int
+    planned_charged_bytes: int
 
 
 @dataclass
@@ -306,16 +295,15 @@ class _PendingKVGroupTransaction:
 
 
 @dataclass
-class _PendingExpertRegrow:
-    ticket: ExpertRegrowTicket
-    expected_revision: int
+class _PendingExpertCacheGrowth:
+    ticket: ExpertCacheAllocationTicket
+    registered_cache_bytes_before: int
 
 
 class UnifiedMemoryBroker:
     """Lock-protected authoritative accounting and two-phase reservations."""
 
     _DEFAULT_EXPERT_RECORD_BYTES = 10_616_832
-    _DEFAULT_EXPERT_SLAB_SLOTS = 32
 
     def __init__(
         self,
@@ -323,23 +311,19 @@ class UnifiedMemoryBroker:
         budget: MemoryBudget | None = None,
         initial_snapshot: BrokerSnapshot | None = None,
         initial_allocator_sample: AllocatorMemorySample | None = None,
-        expert_slab_bytes: int = (
-            _DEFAULT_EXPERT_RECORD_BYTES * _DEFAULT_EXPERT_SLAB_SLOTS
-        ),
-        expert_regrow_hysteresis_slabs: int = 1,
-        expert_resize_min_interval_ns: int = 1_000_000_000,
+        expert_record_bytes: int = _DEFAULT_EXPERT_RECORD_BYTES,
+        expert_cache_limit_bytes: int | None = None,
     ) -> None:
-        self._budget = budget or MemoryBudget()
-        self._expert_slab_bytes = _exact_positive_int(
-            "expert_slab_bytes", expert_slab_bytes
+        self._budget = budget or MemoryBudget(memory_limit_bytes=110 * BINARY_GIB)
+        self._expert_record_bytes = _exact_positive_int(
+            "expert_record_bytes", expert_record_bytes
         )
-        self._expert_regrow_hysteresis_slabs = _exact_nonnegative_int(
-            "expert_regrow_hysteresis_slabs",
-            expert_regrow_hysteresis_slabs,
-        )
-        self._expert_resize_min_interval_ns = _exact_nonnegative_int(
-            "expert_resize_min_interval_ns",
-            expert_resize_min_interval_ns,
+        self._expert_cache_limit_bytes = (
+            None
+            if expert_cache_limit_bytes is None
+            else _exact_nonnegative_int(
+                "expert_cache_limit_bytes", expert_cache_limit_bytes
+            )
         )
         self._lock = RLock()
         self._group_commit_lock = Lock()
@@ -349,14 +333,11 @@ class UnifiedMemoryBroker:
         self._admission_failure_count = 0
         self._transaction_failure_count = 0
         self._failed_reason: str | None = None
-        self._last_expert_resize_ns: int | None = None
         self._post_load_reconciled = False
-        self._max_expert_slab_bytes = 0
         self._next_ticket_id = 1
         self._pending: _PendingKVTransaction | _PendingKVGroupTransaction | None = None
-        self._pending_regrow: _PendingExpertRegrow | None = None
+        self._pending_cache_growth: _PendingExpertCacheGrowth | None = None
         self._consumed_ticket_ids: set[int] = set()
-        self._consumed_regrow_ticket_ids: set[int] = set()
         self._allocations: dict[int, KVPhysicalAllocation] = {}
         self._released_allocation_ids: set[int] = set()
         self._ambiguous_allocation_ids: set[int] = set()
@@ -374,7 +355,7 @@ class UnifiedMemoryBroker:
                     - (
                         initial_snapshot.resident_model_bytes
                         + initial_snapshot.kv_physical_bytes
-                        + initial_snapshot.expert_slab_physical_bytes
+                        + initial_snapshot.expert_cache_physical_bytes
                         + initial_snapshot.in_flight_expert_staging_bytes
                         + initial_snapshot.runtime_workspace_bytes
                     ),
@@ -394,20 +375,20 @@ class UnifiedMemoryBroker:
         *,
         initial_snapshot: BrokerSnapshot | None = None,
         initial_allocator_sample: AllocatorMemorySample | None = None,
-        expert_slab_bytes: int = (
-            _DEFAULT_EXPERT_RECORD_BYTES * _DEFAULT_EXPERT_SLAB_SLOTS
-        ),
-        expert_regrow_hysteresis_slabs: int = 1,
-        expert_resize_min_interval_ns: int = 1_000_000_000,
+        memory_limit_bytes: int = 110 * BINARY_GIB,
+        expert_record_bytes: int = _DEFAULT_EXPERT_RECORD_BYTES,
+        expert_cache_limit_bytes: int | None = None,
         allocator_headroom_bytes: int = 0,
     ) -> UnifiedMemoryBroker:
         return cls(
-            budget=MemoryBudget(allocator_headroom_bytes=allocator_headroom_bytes),
+            budget=MemoryBudget(
+                memory_limit_bytes=memory_limit_bytes,
+                allocator_headroom_bytes=allocator_headroom_bytes,
+            ),
             initial_snapshot=initial_snapshot,
             initial_allocator_sample=initial_allocator_sample,
-            expert_slab_bytes=expert_slab_bytes,
-            expert_regrow_hysteresis_slabs=(expert_regrow_hysteresis_slabs),
-            expert_resize_min_interval_ns=expert_resize_min_interval_ns,
+            expert_record_bytes=expert_record_bytes,
+            expert_cache_limit_bytes=expert_cache_limit_bytes,
         )
 
     @property
@@ -424,11 +405,6 @@ class UnifiedMemoryBroker:
             pending_id = (
                 None if self._pending is None else self._pending.ticket.ticket_id
             )
-            pending_regrow_id = (
-                None
-                if self._pending_regrow is None
-                else self._pending_regrow.ticket.ticket_id
-            )
             return replace(
                 self._pools,
                 revision=self._revision,
@@ -438,8 +414,6 @@ class UnifiedMemoryBroker:
                 failed_closed=self._failed_reason is not None,
                 failure_reason=self._failed_reason,
                 pending_kv_ticket_id=pending_id,
-                pending_expert_regrow_ticket_id=pending_regrow_id,
-                last_expert_resize_ns=self._last_expert_resize_ns,
                 owned_kv_physical_bytes=sum(
                     allocation.physical_bytes
                     for allocation in self._allocations.values()
@@ -450,7 +424,7 @@ class UnifiedMemoryBroker:
             )
 
     def replace_snapshot(self, snapshot: BrokerSnapshot) -> None:
-        """Install an observed classified snapshot and enforce both limits.
+        """Install an observed classified snapshot and enforce the limit.
 
         An observation is retained even when it violates a limit: discarding an
         over-budget physical measurement would undercount reality.
@@ -458,10 +432,13 @@ class UnifiedMemoryBroker:
 
         with self._lock:
             self._validate_snapshot(snapshot)
-            interrupted = self._pending is not None or self._pending_regrow is not None
+            interrupted = (
+                self._pending is not None
+                or self._pending_cache_growth is not None
+            )
             if interrupted:
                 self._consume_pending()
-                self._consume_pending_regrow()
+                self._consume_pending_cache_growth()
                 self._transaction_failure_count += 1
                 self._failed_reason = (
                     "snapshot replacement interrupted an active KV transaction"
@@ -474,10 +451,6 @@ class UnifiedMemoryBroker:
                     snapshot.kv_physical_bytes
                 )
             self._copy_pool_fields(snapshot)
-            self._max_expert_slab_bytes = max(
-                self._max_expert_slab_bytes,
-                snapshot.expert_slab_physical_bytes,
-            )
             self._revision += 1
             self._assert_kv_ledger_invariant()
             self._record_hard_failure_if_needed()
@@ -485,20 +458,15 @@ class UnifiedMemoryBroker:
                 raise MemoryTransactionError(
                     "snapshot replacement interrupted an active KV transaction"
                 )
-            if snapshot.charged_bytes >= self._budget.hard_ceiling_bytes:
-                self._admission_failure_count += 1
-                raise MemoryAdmissionError(
-                    "observed memory is at or above the hard ceiling"
-                )
-            if snapshot.classified_bytes > self._budget.classified_target_bytes:
+            if snapshot.classified_bytes > self._budget.classified_limit_bytes:
                 self._admission_failure_count += 1
                 raise MemoryAdmissionError(
                     "observed classified memory is above the allocator-headroom target"
                 )
-            if snapshot.charged_bytes > self._budget.operating_target_bytes:
+            if snapshot.charged_bytes > self._budget.memory_limit_bytes:
                 self._admission_failure_count += 1
                 raise MemoryAdmissionError(
-                    "observed memory is above the operating target"
+                    "observed memory is above the configured limit"
                 )
 
     def reconcile_allocator_cache(
@@ -517,7 +485,7 @@ class UnifiedMemoryBroker:
 
         self._validate_allocator_sample("sample", sample)
         with self._lock:
-            if self._pending is not None or self._pending_regrow is not None:
+            if self._pending is not None or self._pending_cache_growth is not None:
                 raise MemoryTransactionError(
                     "cannot reconcile allocator cache during an active memory "
                     "transaction"
@@ -525,7 +493,7 @@ class UnifiedMemoryBroker:
             classified_bytes = (
                 self._pools.resident_model_bytes
                 + self._pools.kv_physical_bytes
-                + self._pools.expert_slab_physical_bytes
+                + self._pools.expert_cache_physical_bytes
                 + self._pools.in_flight_expert_staging_bytes
                 + self._pools.runtime_workspace_bytes
             )
@@ -544,16 +512,11 @@ class UnifiedMemoryBroker:
             self._revision += 1
             self._record_hard_failure_if_needed()
             charged = self._pools.charged_bytes
-            if charged >= self._budget.hard_ceiling_bytes:
-                self._admission_failure_count += 1
-                raise MemoryAdmissionError(
-                    "allocator cache reconciliation reached the hard ceiling"
-                )
-            if charged > self._budget.operating_target_bytes:
+            if charged > self._budget.memory_limit_bytes:
                 self._admission_failure_count += 1
                 self._transaction_failure_count += 1
                 self._failed_reason = (
-                    "allocator cache reconciliation exceeded the operating target"
+                    "allocator cache reconciliation exceeded the memory limit"
                 )
                 raise MemoryAdmissionError(self._failed_reason)
             return self.snapshot()
@@ -572,19 +535,19 @@ class UnifiedMemoryBroker:
             speculative_expert_bytes,
         )
         with self._lock:
-            if self._pending is not None or self._pending_regrow is not None:
+            if self._pending is not None or self._pending_cache_growth is not None:
                 raise MemoryTransactionError(
                     "cannot reconcile expert protection during an active memory "
                     "transaction"
                 )
-            experts = self._pools.expert_slab_physical_bytes
+            experts = self._pools.expert_cache_physical_bytes
             if pinned > experts:
                 raise MemoryTelemetryError(
-                    "live pinned expert bytes exceed physical expert slabs"
+                    "live pinned expert bytes exceed the physical expert cache"
                 )
             if speculative > experts:
                 raise MemoryTelemetryError(
-                    "live speculative expert bytes exceed physical expert slabs"
+                    "live speculative expert bytes exceed the physical expert cache"
                 )
             self._pools = replace(
                 self._pools,
@@ -598,7 +561,7 @@ class UnifiedMemoryBroker:
         self,
         *,
         resident_model_bytes: int,
-        expert_slab_physical_bytes: int,
+        expert_cache_physical_bytes: int,
         in_flight_expert_staging_bytes: int,
         runtime_workspace_bytes: int,
         allocator_before: AllocatorMemorySample | None,
@@ -611,8 +574,8 @@ class UnifiedMemoryBroker:
             resident_model_bytes,
         )
         experts = _exact_nonnegative_int(
-            "expert_slab_physical_bytes",
-            expert_slab_physical_bytes,
+            "expert_cache_physical_bytes",
+            expert_cache_physical_bytes,
         )
         staging = _exact_nonnegative_int(
             "in_flight_expert_staging_bytes",
@@ -636,7 +599,7 @@ class UnifiedMemoryBroker:
         with self._lock:
             if self._post_load_reconciled:
                 raise MemoryTransactionError("post-load memory was already reconciled")
-            if self._pending is not None or self._pending_regrow is not None:
+            if self._pending is not None or self._pending_cache_growth is not None:
                 raise MemoryTransactionError(
                     "cannot reconcile post-load memory during an active memory "
                     "transaction"
@@ -666,7 +629,7 @@ class UnifiedMemoryBroker:
             self._pools = replace(
                 self._pools,
                 resident_model_bytes=resident,
-                expert_slab_physical_bytes=experts,
+                expert_cache_physical_bytes=experts,
                 in_flight_expert_staging_bytes=staging,
                 runtime_workspace_bytes=workspace,
                 allocator_cache_bytes=cache_after,
@@ -676,34 +639,138 @@ class UnifiedMemoryBroker:
                     experts,
                 ),
             )
-            self._max_expert_slab_bytes = max(
-                self._max_expert_slab_bytes,
-                experts,
-            )
             self._revision += 1
             self._post_load_reconciled = True
             self._assert_kv_ledger_invariant()
             self._record_hard_failure_if_needed()
             charged = self._pools.charged_bytes
-            if charged >= self._budget.hard_ceiling_bytes:
-                self._admission_failure_count += 1
-                raise MemoryAdmissionError(
-                    "post-load memory reconciliation reached the hard ceiling"
-                )
-            if self._pools.classified_bytes > self._budget.classified_target_bytes:
+            if self._pools.classified_bytes > self._budget.classified_limit_bytes:
                 self._admission_failure_count += 1
                 self._transaction_failure_count += 1
                 self._failed_reason = (
                     "post-load classified memory exceeded the allocator-headroom target"
                 )
                 raise MemoryAdmissionError(self._failed_reason)
-            if charged > self._budget.operating_target_bytes:
+            if charged > self._budget.memory_limit_bytes:
                 self._admission_failure_count += 1
                 self._transaction_failure_count += 1
                 self._failed_reason = (
-                    "post-load memory reconciliation exceeded the operating target"
+                    "post-load memory reconciliation exceeded the memory limit"
                 )
                 raise MemoryAdmissionError(self._failed_reason)
+            return self.snapshot()
+
+    def plan_expert_cache_growth(self) -> ExpertCacheAllocationTicket | None:
+        """Reserve exactly one direct expert-record allocation on a real miss."""
+
+        with self._lock:
+            self._ensure_allocation_open()
+            if self._pending is not None or self._pending_cache_growth is not None:
+                raise MemoryTransactionError(
+                    "another memory allocation transaction is already active"
+                )
+            registered = self._pools.expert_cache_physical_bytes
+            planned_cache = registered + self._expert_record_bytes
+            if (
+                self._expert_cache_limit_bytes is not None
+                and planned_cache > self._expert_cache_limit_bytes
+            ):
+                return None
+            planned_charged = (
+                self._pools.charged_bytes + self._expert_record_bytes
+            )
+            planned_classified = (
+                self._pools.classified_bytes + self._expert_record_bytes
+            )
+            if (
+                planned_charged > self._budget.memory_limit_bytes
+                or planned_classified > self._budget.classified_limit_bytes
+            ):
+                return None
+
+            self._revision += 1
+            ticket = ExpertCacheAllocationTicket(
+                ticket_id=self._next_ticket_id,
+                physical_bytes=self._expert_record_bytes,
+                snapshot_revision=self._revision,
+                planned_charged_bytes=planned_charged,
+            )
+            self._next_ticket_id += 1
+            self._pending_cache_growth = _PendingExpertCacheGrowth(
+                ticket=ticket,
+                registered_cache_bytes_before=registered,
+            )
+            return ticket
+
+    def commit_expert_cache_growth(
+        self,
+        ticket: ExpertCacheAllocationTicket,
+        *,
+        registered_cache_bytes_after: int,
+        allocator_before: AllocatorMemorySample,
+        allocator_after: AllocatorMemorySample,
+    ) -> BrokerSnapshot:
+        """Publish one measured record allocation and allocator residual."""
+
+        registered_after = _exact_nonnegative_int(
+            "registered_cache_bytes_after",
+            registered_cache_bytes_after,
+        )
+        self._validate_allocator_sample("allocator_before", allocator_before)
+        self._validate_allocator_sample("allocator_after", allocator_after)
+        with self._lock:
+            pending = self._require_cache_growth_ticket(ticket)
+            expected = (
+                pending.registered_cache_bytes_before + ticket.physical_bytes
+            )
+            if registered_after != expected:
+                raise MemoryTelemetryError(
+                    "registered cache growth is not exactly one expert record"
+                )
+            if (
+                self._allocator_residual_bytes(allocator_before)
+                > self._pools.allocator_cache_bytes
+            ):
+                raise MemoryTelemetryError(
+                    "allocator telemetry is stale during expert cache growth"
+                )
+            classified_after = (
+                self._pools.classified_bytes
+                - self._pools.expert_cache_physical_bytes
+                + registered_after
+            )
+            allocator_cache_after = max(
+                allocator_after.cache_bytes,
+                allocator_after.charged_footprint_bytes - classified_after,
+            )
+            pools = replace(
+                self._pools,
+                expert_cache_physical_bytes=registered_after,
+                allocator_cache_bytes=allocator_cache_after,
+            )
+            if (
+                pools.charged_bytes > self._budget.memory_limit_bytes
+                or pools.classified_bytes > self._budget.classified_limit_bytes
+            ):
+                raise MemoryAdmissionError(
+                    "expert record allocation exceeds the configured memory limit"
+                )
+            self._pools = pools
+            self._consume_pending_cache_growth()
+            self._revision += 1
+            return self.snapshot()
+
+    def abort_expert_cache_growth(
+        self,
+        ticket: ExpertCacheAllocationTicket,
+    ) -> BrokerSnapshot:
+        """Cancel a one-record reservation before physical allocation."""
+
+        with self._lock:
+            self._require_cache_growth_ticket(ticket)
+            self._consume_pending_cache_growth()
+            self._transaction_failure_count += 1
+            self._revision += 1
             return self.snapshot()
 
     def plan_kv_growth(
@@ -729,21 +796,21 @@ class UnifiedMemoryBroker:
                 raise MemoryAdmissionError(
                     f"{exc} while planning KV growth for {owner}"
                 ) from exc
-            if self._pending is not None or self._pending_regrow is not None:
+            if self._pending is not None or self._pending_cache_growth is not None:
                 self._reject_admission(
                     "another memory allocation transaction is already active"
                 )
 
             charged = self._pools.charged_bytes
             classified = self._pools.classified_bytes
-            target = self._budget.operating_target_bytes
+            target = self._budget.memory_limit_bytes
             required_reclaim = max(
                 0,
-                classified + steady - self._budget.classified_target_bytes,
+                classified + steady - self._budget.classified_limit_bytes,
                 charged + steady + transient - target,
             )
             reclaimable = (
-                self._pools.expert_slab_physical_bytes - self._pools.pinned_expert_bytes
+                self._pools.expert_cache_physical_bytes - self._pools.pinned_expert_bytes
             )
             if required_reclaim > reclaimable:
                 self._reject_admission(
@@ -754,16 +821,14 @@ class UnifiedMemoryBroker:
             planned_steady = charged - required_reclaim + steady
             planned_peak = planned_steady + transient
             planned_classified = classified - required_reclaim + steady
-            if planned_classified > self._budget.classified_target_bytes:
+            if planned_classified > self._budget.classified_limit_bytes:
                 self._reject_admission(
                     "KV steady allocation exceeds the allocator-headroom target"
                 )
             if planned_peak > target:
                 self._reject_admission(
-                    "KV allocation peak exceeds the operating target"
+                    "KV allocation peak exceeds the memory limit"
                 )
-            if planned_peak >= self._budget.hard_ceiling_bytes:
-                self._reject_admission("KV allocation peak reaches the hard ceiling")
 
             ticket_id = self._next_ticket_id
             self._next_ticket_id += 1
@@ -821,7 +886,7 @@ class UnifiedMemoryBroker:
         serialized_transient = max(member[2] for member in parsed)
         with self._lock:
             self._ensure_allocation_open()
-            if self._pending is not None or self._pending_regrow is not None:
+            if self._pending is not None or self._pending_cache_growth is not None:
                 self._reject_admission(
                     "another memory allocation transaction is already active"
                 )
@@ -830,14 +895,14 @@ class UnifiedMemoryBroker:
             classified = self._pools.classified_bytes
             required_reclaim = max(
                 0,
-                classified + total_steady - self._budget.classified_target_bytes,
+                classified + total_steady - self._budget.classified_limit_bytes,
                 charged
                 + total_steady
                 + serialized_transient
-                - self._budget.operating_target_bytes,
+                - self._budget.memory_limit_bytes,
             )
             reclaimable = (
-                self._pools.expert_slab_physical_bytes - self._pools.pinned_expert_bytes
+                self._pools.expert_cache_physical_bytes - self._pools.pinned_expert_bytes
             )
             if required_reclaim > reclaimable:
                 self._reject_admission(
@@ -848,17 +913,13 @@ class UnifiedMemoryBroker:
             planned_steady = charged - required_reclaim + total_steady
             planned_peak = planned_steady + serialized_transient
             planned_classified = classified - required_reclaim + total_steady
-            if planned_classified > self._budget.classified_target_bytes:
+            if planned_classified > self._budget.classified_limit_bytes:
                 self._reject_admission(
                     "KV group steady allocation exceeds the allocator-headroom target"
                 )
-            if planned_peak > self._budget.operating_target_bytes:
+            if planned_peak > self._budget.memory_limit_bytes:
                 self._reject_admission(
-                    "KV group allocation peak exceeds the operating target"
-                )
-            if planned_peak >= self._budget.hard_ceiling_bytes:
-                self._reject_admission(
-                    "KV group allocation peak reaches the hard ceiling"
+                    "KV group allocation peak exceeds the memory limit"
                 )
 
             ticket_id = self._next_ticket_id
@@ -898,18 +959,15 @@ class UnifiedMemoryBroker:
         self,
         ticket: KVAllocationTicket | KVAllocationGroupTicket,
         *,
-        registered_slab_bytes_after: int,
+        registered_cache_bytes_after: int,
         allocator_before: AllocatorMemorySample | None,
         allocator_after: AllocatorMemorySample | None,
-        now_ns: int | None = None,
     ) -> BrokerSnapshot:
         """Credit reclaim only after registry and allocator footprint agree."""
 
         registered_after = _exact_nonnegative_int(
-            "registered_slab_bytes_after", registered_slab_bytes_after
+            "registered_cache_bytes_after", registered_cache_bytes_after
         )
-        if now_ns is not None:
-            now_ns = _exact_nonnegative_int("now_ns", now_ns)
         with self._lock:
             if isinstance(ticket, KVAllocationGroupTicket):
                 transaction = self._require_group_ticket(ticket)
@@ -924,17 +982,6 @@ class UnifiedMemoryBroker:
                 raise MemoryTransactionError(
                     "expert reclaim was already confirmed for this ticket"
                 )
-            if (
-                now_ns is not None
-                and self._last_expert_resize_ns is not None
-                and now_ns < self._last_expert_resize_ns
-            ):
-                reason = (
-                    f"expert reclaim timestamp {now_ns} is before last resize "
-                    f"{self._last_expert_resize_ns}"
-                )
-                self._fail_pending(reason)
-                raise MemoryTransactionError(reason)
             if allocator_before is None or allocator_after is None:
                 self._fail_pending(
                     "allocator telemetry unavailable during expert reclaim"
@@ -963,7 +1010,7 @@ class UnifiedMemoryBroker:
                     "during expert reclaim"
                 )
 
-            registered_before = self._pools.expert_slab_physical_bytes
+            registered_before = self._pools.expert_cache_physical_bytes
             registered_drop = registered_before - registered_after
             allocator_drop = (
                 allocator_before.charged_footprint_bytes
@@ -979,19 +1026,19 @@ class UnifiedMemoryBroker:
                 registered_after,
             )
             if registered_drop < 0:
-                failure = "registered slab bytes increased during expert reclaim"
-            elif registered_drop > 0 and now_ns is None:
-                failure = "now_ns is required when physical expert bytes decrease"
+                failure = "registered cache bytes increased during expert reclaim"
+            elif registered_drop % self._expert_record_bytes:
+                failure = "registered cache reclaim is not record granular"
             elif registered_after < self._pools.pinned_expert_bytes:
                 failure = "physical reclaim destroyed registered pinned expert bytes"
             elif registered_drop < required:
                 failure = (
-                    "registered slab reduction is smaller than requested "
+                    "registered cache reduction is smaller than requested "
                     f"({registered_drop} observed, {required} required)"
                 )
             elif allocator_drop < required:
                 failure = (
-                    "allocator footprint did not fall with registered slabs "
+                    "allocator footprint did not fall with registered records "
                     f"({allocator_drop} observed, {required} required)"
                 )
 
@@ -999,7 +1046,7 @@ class UnifiedMemoryBroker:
             # classification even when it proves zero reclaim.  Any footprint
             # not proven released remains conservatively charged as allocator
             # retention.  This prevents stale active references from creating
-            # apparent headroom merely because the slab registry changed.
+            # apparent headroom merely because the cache registry changed.
             conservative_cache = self._conservative_cache_after_release(
                 classified_bytes_before=registered_before,
                 classified_bytes_after=registered_after,
@@ -1009,7 +1056,7 @@ class UnifiedMemoryBroker:
             )
             self._pools = replace(
                 self._pools,
-                expert_slab_physical_bytes=registered_after,
+                expert_cache_physical_bytes=registered_after,
                 allocator_cache_bytes=conservative_cache,
                 pinned_expert_bytes=pinned_after,
                 speculative_expert_bytes=speculative_after,
@@ -1024,140 +1071,28 @@ class UnifiedMemoryBroker:
             )
             if (
                 failure is None
-                and confirmed_classified > self._budget.classified_target_bytes
+                and confirmed_classified > self._budget.classified_limit_bytes
             ):
                 failure = (
                     "confirmed KV steady allocation exceeded the "
                     "allocator-headroom target"
                 )
             elif (
-                failure is None and confirmed_peak > self._budget.operating_target_bytes
+                failure is None and confirmed_peak > self._budget.memory_limit_bytes
             ):
                 failure = (
                     "allocator cache retention leaves the confirmed allocation "
-                    f"peak above the operating target ({confirmed_peak} bytes)"
+                    f"peak above the memory limit ({confirmed_peak} bytes)"
                 )
             if failure is not None:
                 self._fail_pending(failure, pools_already_updated=True)
                 raise MemoryTelemetryError(failure)
 
-            if registered_drop > 0:
-                assert now_ns is not None
-                self._last_expert_resize_ns = now_ns
             self._revision += 1
             transaction.reclaim_confirmed = True
             transaction.expected_revision = self._revision
             if isinstance(transaction, _PendingKVGroupTransaction):
                 transaction.last_allocator_sample = allocator_after
-            self._record_hard_failure_if_needed()
-            return self.snapshot()
-
-    def terminalize_expert_resize(
-        self,
-        ticket: KVAllocationTicket | KVAllocationGroupTicket | ExpertRegrowTicket,
-        *,
-        registered_slab_bytes_after: int,
-        allocator_before: AllocatorMemorySample | None,
-        allocator_after: AllocatorMemorySample | None,
-        reason: str,
-    ) -> BrokerSnapshot:
-        """Fail one resize closed while preserving unrelated KV ownership.
-
-        Runtime slab destruction and allocation can cross their physical
-        boundary before registry or allocator telemetry fails.  This method
-        consumes only that active resize ticket and publishes conservative
-        expert/cache truth without replacing the snapshot or invalidating
-        already-authenticated KV allocation handles.
-        """
-
-        registered_after = _exact_nonnegative_int(
-            "registered_slab_bytes_after",
-            registered_slab_bytes_after,
-        )
-        if not isinstance(reason, str):
-            raise TypeError("reason must be a string")
-        failure = reason.strip()
-        if not failure:
-            raise ValueError("reason must not be empty")
-        with self._lock:
-            if isinstance(ticket, KVAllocationTicket):
-                self._require_ticket(ticket)
-                consume = self._consume_pending
-            elif isinstance(ticket, KVAllocationGroupTicket):
-                self._require_group_ticket(ticket)
-                consume = self._consume_pending
-            elif isinstance(ticket, ExpertRegrowTicket):
-                self._require_regrow_ticket(ticket)
-                consume = self._consume_pending_regrow
-            else:
-                raise TypeError(
-                    "ticket must be a KVAllocationTicket, KVAllocationGroupTicket, "
-                    "or ExpertRegrowTicket"
-                )
-
-            registered_before = self._pools.expert_slab_physical_bytes
-            samples_valid = allocator_before is not None and allocator_after is not None
-            if samples_valid:
-                assert allocator_before is not None
-                assert allocator_after is not None
-                try:
-                    self._validate_allocator_sample(
-                        "allocator_before",
-                        allocator_before,
-                    )
-                    self._validate_allocator_sample(
-                        "allocator_after",
-                        allocator_after,
-                    )
-                except (TypeError, ValueError):
-                    samples_valid = False
-                else:
-                    samples_valid = (
-                        self._allocator_residual_bytes(allocator_before)
-                        == self._pools.allocator_cache_bytes
-                    )
-
-            if samples_valid:
-                assert allocator_before is not None
-                assert allocator_after is not None
-                classified_delta = registered_after - registered_before
-                footprint_delta = (
-                    allocator_after.charged_footprint_bytes
-                    - allocator_before.charged_footprint_bytes
-                )
-                residual = (
-                    self._pools.allocator_cache_bytes
-                    + footprint_delta
-                    - classified_delta
-                )
-                conservative_cache = max(
-                    0,
-                    allocator_after.cache_bytes,
-                    residual,
-                )
-            else:
-                conservative_cache = self._pools.allocator_cache_bytes + max(
-                    0, registered_before - registered_after
-                )
-
-            self._pools = replace(
-                self._pools,
-                expert_slab_physical_bytes=registered_after,
-                allocator_cache_bytes=conservative_cache,
-                pinned_expert_bytes=min(
-                    self._pools.pinned_expert_bytes,
-                    registered_after,
-                ),
-                speculative_expert_bytes=min(
-                    self._pools.speculative_expert_bytes,
-                    registered_after,
-                ),
-            )
-            consume()
-            self._failed_reason = failure
-            self._transaction_failure_count += 1
-            self._revision += 1
-            self._assert_kv_ledger_invariant()
             self._record_hard_failure_if_needed()
             return self.snapshot()
 
@@ -1230,7 +1165,7 @@ class UnifiedMemoryBroker:
                 kv_physical_bytes=(self._pools.kv_physical_bytes + allocated),
                 allocator_cache_bytes=cache_after,
             )
-            if self._pools.classified_bytes > self._budget.classified_target_bytes:
+            if self._pools.classified_bytes > self._budget.classified_limit_bytes:
                 if allocated:
                     self._unreconciled_kv_by_owner[
                         f"failed-growth:{ticket.ticket_id}"
@@ -1243,12 +1178,12 @@ class UnifiedMemoryBroker:
                 error = MemoryTransactionError(reason)
                 setattr(error, "transaction_terminalized", True)
                 raise error
-            if self._pools.charged_bytes > self._budget.operating_target_bytes:
+            if self._pools.charged_bytes > self._budget.memory_limit_bytes:
                 if allocated:
                     self._unreconciled_kv_by_owner[
                         f"failed-growth:{ticket.ticket_id}"
                     ] = allocated
-                reason = "committed KV allocation exceeded the operating target"
+                reason = "committed KV allocation exceeded the memory limit"
                 self._fail_pending(reason, pools_already_updated=True)
                 self._assert_kv_ledger_invariant()
                 error = MemoryTransactionError(reason)
@@ -1461,13 +1396,13 @@ class UnifiedMemoryBroker:
             self._revision += 1
 
             failure: str | None = None
-            if self._pools.classified_bytes > self._budget.classified_target_bytes:
+            if self._pools.classified_bytes > self._budget.classified_limit_bytes:
                 failure = (
                     "committed KV group allocation exceeded the "
                     "allocator-headroom target"
                 )
-            elif self._pools.charged_bytes > self._budget.operating_target_bytes:
-                failure = "committed KV group allocation exceeded the operating target"
+            elif self._pools.charged_bytes > self._budget.memory_limit_bytes:
+                failure = "committed KV group allocation exceeded the memory limit"
             if failure is not None:
                 del self._allocations[allocation.allocation_id]
                 self._unreconciled_kv_by_owner[
@@ -1495,7 +1430,7 @@ class UnifiedMemoryBroker:
         allocator_before: AllocatorMemorySample | None = None,
         allocator_after: AllocatorMemorySample | None = None,
     ) -> BrokerSnapshot:
-        """Abort a ticket without restoring already destroyed expert slabs.
+        """Abort a ticket without restoring already released expert records.
 
         ``None`` means an interruption left the physical KV delta unknown; that
         poisons further allocation.  A measured zero is a safe allocation
@@ -1668,7 +1603,7 @@ class UnifiedMemoryBroker:
             self._pools.resident_model_bytes
             + self._pools.kv_physical_bytes
             + classified_delta_bytes
-            + self._pools.expert_slab_physical_bytes
+            + self._pools.expert_cache_physical_bytes
             + self._pools.in_flight_expert_staging_bytes
             + self._pools.runtime_workspace_bytes
         )
@@ -1807,7 +1742,7 @@ class UnifiedMemoryBroker:
                     raise MemoryTransactionError(
                         f"unknown KV allocation {allocation.allocation_id}"
                     )
-            if self._pending is not None or self._pending_regrow is not None:
+            if self._pending is not None or self._pending_cache_growth is not None:
                 raise MemoryTransactionError(
                     "cannot release KV during an active memory transaction"
                 )
@@ -1829,17 +1764,10 @@ class UnifiedMemoryBroker:
             )
             observed_charged_before = self._pools.classified_bytes + cache_bytes_before
             pre_release_limit_failure: str | None = None
-            if observed_charged_before >= self._budget.hard_ceiling_bytes:
-                self._hard_failure_count += 1
+            if observed_charged_before > self._budget.memory_limit_bytes:
                 self._admission_failure_count += 1
                 pre_release_limit_failure = (
-                    "allocator telemetry reached the hard ceiling during KV "
-                    f"release for {owner_id}"
-                )
-            elif observed_charged_before > self._budget.operating_target_bytes:
-                self._admission_failure_count += 1
-                pre_release_limit_failure = (
-                    "allocator telemetry exceeded the operating target during "
+                    "allocator telemetry exceeded the memory limit during "
                     f"KV release for {owner_id}"
                 )
 
@@ -1930,223 +1858,11 @@ class UnifiedMemoryBroker:
             self._record_hard_failure_if_needed()
             return self.snapshot()
 
-    def plan_expert_regrow(
-        self, *, target_bytes: int, now_ns: int
-    ) -> ExpertRegrowTicket | None:
-        """Reserve a slab-aligned regrow without publishing physical bytes."""
-
-        target = _exact_nonnegative_int("target_bytes", target_bytes)
-        now = _exact_nonnegative_int("now_ns", now_ns)
-        if target == 0:
-            return None
-        with self._lock:
-            self._ensure_allocation_open()
-            if self._pending is not None or self._pending_regrow is not None:
-                return None
-            if (
-                self._last_expert_resize_ns is not None
-                and now - self._last_expert_resize_ns
-                < self._expert_resize_min_interval_ns
-            ):
-                return None
-
-            missing = max(
-                0,
-                self._max_expert_slab_bytes - self._pools.expert_slab_physical_bytes,
-            )
-            if missing < self._expert_slab_bytes:
-                return None
-            requested_slabs = (
-                target + self._expert_slab_bytes - 1
-            ) // self._expert_slab_bytes
-            missing_slabs = missing // self._expert_slab_bytes
-            planned_slabs = min(requested_slabs, missing_slabs)
-            planned_bytes = planned_slabs * self._expert_slab_bytes
-            hysteresis_bytes = (
-                self._expert_regrow_hysteresis_slabs * self._expert_slab_bytes
-            )
-            headroom = min(
-                self._budget.classified_target_bytes - self._pools.classified_bytes,
-                self._budget.operating_target_bytes - self._pools.charged_bytes,
-            )
-            if planned_bytes + hysteresis_bytes > headroom:
-                return None
-
-            ticket_id = self._next_ticket_id
-            self._next_ticket_id += 1
-            self._revision += 1
-            ticket = ExpertRegrowTicket(
-                ticket_id=ticket_id,
-                requested_target_bytes=target,
-                planned_slabs=planned_slabs,
-                planned_physical_bytes=planned_bytes,
-                snapshot_revision=self._revision,
-                planned_peak_bytes=self._pools.charged_bytes + planned_bytes,
-                planned_at_ns=now,
-            )
-            self._pending_regrow = _PendingExpertRegrow(
-                ticket=ticket,
-                expected_revision=self._revision,
-            )
-            return ticket
-
-    def confirm_expert_regrow(
-        self,
-        ticket: ExpertRegrowTicket,
-        *,
-        registered_slab_bytes_after: int,
-        allocator_before: AllocatorMemorySample | None,
-        allocator_after: AllocatorMemorySample | None,
-        now_ns: int | None = None,
-    ) -> BrokerSnapshot:
-        """Publish a measured expert regrow and then advance its resize clock."""
-
-        registered_after = _exact_nonnegative_int(
-            "registered_slab_bytes_after", registered_slab_bytes_after
-        )
-        now = None if now_ns is None else _exact_nonnegative_int("now_ns", now_ns)
-        with self._lock:
-            self._require_regrow_ticket(ticket)
-            if now is not None and now < ticket.planned_at_ns:
-                reason = (
-                    f"expert regrow timestamp {now} is before ticket plan "
-                    f"{ticket.planned_at_ns}"
-                )
-                self._fail_pending_regrow(reason)
-                raise MemoryTransactionError(reason)
-            if (
-                now is not None
-                and self._last_expert_resize_ns is not None
-                and now < self._last_expert_resize_ns
-            ):
-                reason = (
-                    f"expert regrow timestamp {now} is before last resize "
-                    f"{self._last_expert_resize_ns}"
-                )
-                self._fail_pending_regrow(reason)
-                raise MemoryTransactionError(reason)
-            if allocator_before is None or allocator_after is None:
-                reason = "allocator telemetry unavailable during expert regrow"
-                self._fail_pending_regrow(reason)
-                raise MemoryTelemetryError(reason)
-            try:
-                self._validate_allocator_sample("allocator_before", allocator_before)
-                self._validate_allocator_sample("allocator_after", allocator_after)
-            except (TypeError, ValueError) as exc:
-                reason = f"invalid allocator telemetry during expert regrow: {exc}"
-                self._fail_pending_regrow(reason)
-                raise MemoryTelemetryError(reason) from exc
-            if (
-                self._allocator_residual_bytes(allocator_before)
-                > self._pools.allocator_cache_bytes
-            ):
-                reason = (
-                    "allocator telemetry is stale relative to broker cache "
-                    "during expert regrow"
-                )
-                self._fail_pending_regrow(reason)
-                raise MemoryTelemetryError(reason)
-
-            registered_before = self._pools.expert_slab_physical_bytes
-            registered_delta = registered_after - registered_before
-            allocator_delta = (
-                allocator_after.charged_footprint_bytes
-                - allocator_before.charged_footprint_bytes
-            )
-            observed_pair_delta = (
-                registered_after
-                + allocator_after.cache_bytes
-                - registered_before
-                - allocator_before.cache_bytes
-            )
-            minimum_pair_after = (
-                registered_before
-                + self._pools.allocator_cache_bytes
-                + max(0, allocator_delta)
-            )
-            conservative_cache = max(
-                allocator_after.cache_bytes,
-                minimum_pair_after - registered_after,
-            )
-            pinned_after = min(
-                self._pools.pinned_expert_bytes,
-                registered_after,
-            )
-            speculative_after = min(
-                self._pools.speculative_expert_bytes,
-                registered_after,
-            )
-            self._pools = replace(
-                self._pools,
-                expert_slab_physical_bytes=registered_after,
-                allocator_cache_bytes=conservative_cache,
-                pinned_expert_bytes=pinned_after,
-                speculative_expert_bytes=speculative_after,
-            )
-
-            failure: str | None = None
-            if registered_delta != ticket.planned_physical_bytes:
-                failure = (
-                    "registered expert regrow did not match the reservation "
-                    f"({registered_delta} observed, "
-                    f"{ticket.planned_physical_bytes} planned)"
-                )
-            elif registered_after > self._max_expert_slab_bytes:
-                failure = "registered expert regrow exceeded original capacity"
-            elif now is None:
-                failure = "now_ns is required to confirm physical expert regrow"
-            elif allocator_delta < 0:
-                failure = "allocator footprint fell during expert regrow"
-            elif allocator_delta != observed_pair_delta:
-                failure = (
-                    "allocator footprint did not match the registered expert "
-                    "regrow classification"
-                )
-            else:
-                hysteresis_bytes = (
-                    self._expert_regrow_hysteresis_slabs * self._expert_slab_bytes
-                )
-                if (
-                    self._pools.classified_bytes + hysteresis_bytes
-                    > self._budget.classified_target_bytes
-                ):
-                    failure = (
-                        "confirmed expert regrow violated allocator-headroom hysteresis"
-                    )
-                elif (
-                    self._pools.charged_bytes + hysteresis_bytes
-                    > self._budget.operating_target_bytes
-                ):
-                    failure = "confirmed expert regrow violated operating hysteresis"
-            if failure is not None:
-                self._fail_pending_regrow(
-                    failure,
-                    pools_already_updated=True,
-                )
-                raise MemoryTelemetryError(failure)
-
-            self._consume_pending_regrow()
-            assert now is not None
-            self._last_expert_resize_ns = now
-            self._revision += 1
-            self._record_hard_failure_if_needed()
-            return self.snapshot()
-
-    def abort_expert_regrow(self, ticket: ExpertRegrowTicket) -> BrokerSnapshot:
-        """Cancel a regrow reservation before any physical allocation."""
-
-        with self._lock:
-            self._require_regrow_ticket(ticket)
-            self._consume_pending_regrow()
-            self._transaction_failure_count += 1
-            self._revision += 1
-            return self.snapshot()
-
     def _copy_pool_fields(self, snapshot: BrokerSnapshot) -> None:
         self._pools = BrokerSnapshot(
             resident_model_bytes=snapshot.resident_model_bytes,
             kv_physical_bytes=snapshot.kv_physical_bytes,
-            expert_slab_physical_bytes=(snapshot.expert_slab_physical_bytes),
+            expert_cache_physical_bytes=(snapshot.expert_cache_physical_bytes),
             in_flight_expert_staging_bytes=(snapshot.in_flight_expert_staging_bytes),
             runtime_workspace_bytes=snapshot.runtime_workspace_bytes,
             allocator_cache_bytes=snapshot.allocator_cache_bytes,
@@ -2160,7 +1876,7 @@ class UnifiedMemoryBroker:
         for name in (
             "resident_model_bytes",
             "kv_physical_bytes",
-            "expert_slab_physical_bytes",
+            "expert_cache_physical_bytes",
             "in_flight_expert_staging_bytes",
             "runtime_workspace_bytes",
             "allocator_cache_bytes",
@@ -2168,11 +1884,11 @@ class UnifiedMemoryBroker:
             "speculative_expert_bytes",
         ):
             _exact_nonnegative_int(name, getattr(snapshot, name))
-        if snapshot.pinned_expert_bytes > snapshot.expert_slab_physical_bytes:
-            raise ValueError("pinned_expert_bytes cannot exceed physical expert slabs")
-        if snapshot.speculative_expert_bytes > snapshot.expert_slab_physical_bytes:
+        if snapshot.pinned_expert_bytes > snapshot.expert_cache_physical_bytes:
+            raise ValueError("pinned_expert_bytes cannot exceed the expert cache")
+        if snapshot.speculative_expert_bytes > snapshot.expert_cache_physical_bytes:
             raise ValueError(
-                "speculative_expert_bytes cannot exceed physical expert slabs"
+                "speculative_expert_bytes cannot exceed the expert cache"
             )
 
     @staticmethod
@@ -2187,7 +1903,7 @@ class UnifiedMemoryBroker:
         classified_bytes = (
             self._pools.resident_model_bytes
             + self._pools.kv_physical_bytes
-            + self._pools.expert_slab_physical_bytes
+            + self._pools.expert_cache_physical_bytes
             + self._pools.in_flight_expert_staging_bytes
             + self._pools.runtime_workspace_bytes
         )
@@ -2276,9 +1992,9 @@ class UnifiedMemoryBroker:
             )
 
     def _ensure_allocation_open(self) -> None:
-        if self._pools.charged_bytes >= self._budget.hard_ceiling_bytes:
-            self._reject_admission("memory is at or above the hard ceiling")
-        if self._pools.classified_bytes > self._budget.classified_target_bytes:
+        if self._pools.charged_bytes > self._budget.memory_limit_bytes:
+            self._reject_admission("memory is above the configured limit")
+        if self._pools.classified_bytes > self._budget.classified_limit_bytes:
             self._reject_admission(
                 "classified memory is above the allocator-headroom target"
             )
@@ -2340,40 +2056,41 @@ class UnifiedMemoryBroker:
             raise MemoryTransactionError(reason)
         return transaction
 
+    def _require_cache_growth_ticket(
+        self,
+        ticket: ExpertCacheAllocationTicket,
+    ) -> _PendingExpertCacheGrowth:
+        if not isinstance(ticket, ExpertCacheAllocationTicket):
+            raise TypeError("ticket must be an ExpertCacheAllocationTicket")
+        if ticket.ticket_id in self._consumed_ticket_ids:
+            raise MemoryTransactionError(
+                f"expert cache ticket {ticket.ticket_id} was already consumed"
+            )
+        pending = self._pending_cache_growth
+        if pending is None or pending.ticket is not ticket:
+            raise MemoryTransactionError(
+                f"expert cache ticket {ticket.ticket_id} is not active"
+            )
+        if ticket.snapshot_revision != self._revision:
+            raise MemoryTransactionError(
+                f"expert cache ticket {ticket.ticket_id} revision changed "
+                "during transaction"
+            )
+        return pending
+
     def _consume_pending(self) -> None:
         if self._pending is None:
             return
         self._consumed_ticket_ids.add(self._pending.ticket.ticket_id)
         self._pending = None
 
-    def _require_regrow_ticket(
-        self, ticket: ExpertRegrowTicket
-    ) -> _PendingExpertRegrow:
-        if not isinstance(ticket, ExpertRegrowTicket):
-            raise TypeError("ticket must be an ExpertRegrowTicket")
-        if ticket.ticket_id in self._consumed_regrow_ticket_ids:
-            raise MemoryTransactionError(
-                f"expert regrow ticket {ticket.ticket_id} was already consumed"
-            )
-        transaction = self._pending_regrow
-        if transaction is None or transaction.ticket is not ticket:
-            raise MemoryTransactionError(
-                f"expert regrow ticket {ticket.ticket_id} is not active"
-            )
-        if transaction.expected_revision != self._revision:
-            reason = (
-                f"expert regrow ticket {ticket.ticket_id} revision changed "
-                "during transaction"
-            )
-            self._fail_pending_regrow(reason)
-            raise MemoryTransactionError(reason)
-        return transaction
-
-    def _consume_pending_regrow(self) -> None:
-        if self._pending_regrow is None:
+    def _consume_pending_cache_growth(self) -> None:
+        if self._pending_cache_growth is None:
             return
-        self._consumed_regrow_ticket_ids.add(self._pending_regrow.ticket.ticket_id)
-        self._pending_regrow = None
+        self._consumed_ticket_ids.add(
+            self._pending_cache_growth.ticket.ticket_id
+        )
+        self._pending_cache_growth = None
 
     def _fail_pending(
         self,
@@ -2385,19 +2102,6 @@ class UnifiedMemoryBroker:
         self._failed_reason = reason
         self._transaction_failure_count += 1
         self._consume_pending()
-        self._revision += 1
-        self._record_hard_failure_if_needed()
-
-    def _fail_pending_regrow(
-        self,
-        reason: str,
-        *,
-        pools_already_updated: bool = False,
-    ) -> None:
-        del pools_already_updated
-        self._failed_reason = reason
-        self._transaction_failure_count += 1
-        self._consume_pending_regrow()
         self._revision += 1
         self._record_hard_failure_if_needed()
 
@@ -2414,11 +2118,11 @@ class UnifiedMemoryBroker:
         self._record_hard_failure_if_needed()
 
     def _record_hard_failure_if_needed(self) -> None:
-        if self._pools.charged_bytes < self._budget.hard_ceiling_bytes:
+        if self._pools.charged_bytes <= self._budget.memory_limit_bytes:
             return
         self._hard_failure_count += 1
         if self._failed_reason is None:
-            self._failed_reason = "observed memory reached the hard ceiling"
+            self._failed_reason = "observed memory exceeded the configured limit"
 
 
 __all__ = [
@@ -2434,7 +2138,7 @@ __all__ = [
     "AllocatorMemorySample",
     "BrokerSnapshot",
     "DuplicateReleaseError",
-    "ExpertRegrowTicket",
+    "ExpertCacheAllocationTicket",
     "KVAllocationGroupMember",
     "KVAllocationGroupTicket",
     "KVAllocationTicket",
