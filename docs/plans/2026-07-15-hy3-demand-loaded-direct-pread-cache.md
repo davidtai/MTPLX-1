@@ -1117,17 +1117,21 @@ Expected: tests, lint, and plan-only validation PASS without touching Qwen or th
 
 ~~~bash
 uv run --frozen --extra dev --extra server pytest -q
-uv run --frozen --extra dev --extra server ruff check .
-uv run --frozen --extra dev --extra server ruff format --check .
+git show --pretty= --name-only --diff-filter=ACMR HEAD -- '*.py' \
+  | sort -u \
+  | xargs uv run --frozen --extra dev --extra server ruff check
 git diff --check
 rg -n "dynamic_expert_slabs|expert_slab_slots|expert_regrow|slab_physical|active_slab|released_slab" \
   mtplx benchmarks tests docs/HY3_Q4_DYNAMIC_MEMORY.md \
   docs/HY3_Q4_DYNAMIC_MEMORY_HARDWARE_CAMPAIGN.md
 ~~~
 
-Expected: tests/lint/format/diff PASS; the search has no live dynamic-lane code, test, schema, or operator-doc match. Historical plans/specs may retain contextual references.
+Expected: tests, task-scoped lint, and diff checks PASS. The repository is not
+globally Ruff-formatted, so this task does not rewrite unrelated files. Search
+matches are limited to explicit rejection/absence checks and historical raw
+evidence; there is no live grouped dynamic-lane path or operator contract.
 
-- [ ] **Step 2: Require a committed clean worktree**
+- [x] **Step 2: Require a committed clean worktree**
 
 ~~~bash
 git status --short
