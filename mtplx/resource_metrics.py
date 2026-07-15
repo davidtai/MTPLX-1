@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import time
 from bisect import bisect_left
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from operator import index
 from typing import Callable
 
@@ -320,6 +322,84 @@ def _phase_name(phase: object) -> str:
 
 def _zeroes(names: tuple[str, ...]) -> dict[str, int]:
     return dict.fromkeys(names, 0)
+
+
+_PYTHON_CONTROL_CATEGORIES = (
+    "route_control",
+    "cache_policy",
+    "cache_budget",
+    "kv_broker",
+)
+
+
+class ExpertPythonControlLedger:
+    """Attribute opt-in Python control-plane CPU by phase.
+
+    The reader worker is supplied at snapshot time because its CPU counters
+    already live in ``ExpertPipelineLedger``.  Keeping it separate avoids
+    double-counting worker CPU as route-control CPU.
+    """
+
+    def __init__(
+        self,
+        *,
+        thread_cpu_clock: Callable[[], int] = time.thread_time_ns,
+    ) -> None:
+        if not callable(thread_cpu_clock):
+            raise TypeError("thread_cpu_clock must be callable")
+        self._thread_cpu_clock = thread_cpu_clock
+        self._lock = threading.Lock()
+        self._values = {
+            category: {
+                phase: {"calls": 0, "cpu_ns": 0} for phase in _PIPELINE_PHASES
+            }
+            for category in _PYTHON_CONTROL_CATEGORIES
+        }
+
+    @contextmanager
+    def measure(self, category: str, phase: object) -> Iterator[None]:
+        if category not in self._values:
+            raise ValueError(f"unknown Python control category: {category}")
+        phase_name = _phase_name(phase)
+        started_ns = int(self._thread_cpu_clock())
+        try:
+            yield
+        finally:
+            duration_ns = max(0, int(self._thread_cpu_clock()) - started_ns)
+            with self._lock:
+                value = self._values[category][phase_name]
+                value["calls"] += 1
+                value["cpu_ns"] += duration_ns
+
+    def snapshot(
+        self,
+        *,
+        reader_thread: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        with self._lock:
+            result: dict[str, object] = {
+                category: {
+                    f"{phase}_{metric}": value
+                    for phase in _PIPELINE_PHASES
+                    for metric, value in self._values[category][phase].items()
+                }
+                for category in _PYTHON_CONTROL_CATEGORIES
+            }
+        reader_thread = reader_thread or {}
+        result["reader_thread"] = {
+            f"{phase}_{metric}": max(
+                0,
+                int(reader_thread.get(phase, {}).get(metric, 0)),
+            )
+            for phase in _PIPELINE_PHASES
+            for metric in ("calls", "cpu_ns")
+        }
+        result["inclusive_relationships"] = {
+            "cache_policy": "subset_of_route_control",
+            "reader_thread": "separate_worker",
+        }
+        result["clock"] = "thread_time_ns"
+        return result
 
 
 class _FixedHistogram:

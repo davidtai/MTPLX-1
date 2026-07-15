@@ -54,7 +54,11 @@ from .memory_broker import (
     UnifiedMemoryBroker,
     hy3_q4_kv_physical_geometry,
 )
-from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
+from .resource_metrics import (
+    ExpertPipelineLedger,
+    ExpertPipelineRoute,
+    ExpertPythonControlLedger,
+)
 
 
 _MEMORY_RE = re.compile(r"^([0-9]+)([kmgt]i?b?|b)?$", re.IGNORECASE)
@@ -311,6 +315,16 @@ def _pipeline_ledger_for_config(
     if not config.resource_telemetry or config.slot_layout == "metal-mmap":
         return None
     return ExpertPipelineLedger(strict=False)
+
+
+def _python_control_ledger_for_config(
+    config: ExpertStreamingConfig,
+) -> ExpertPythonControlLedger | None:
+    """Keep Python CPU attribution off the production hot path by default."""
+
+    if not config.resource_telemetry or config.slot_layout == "metal-mmap":
+        return None
+    return ExpertPythonControlLedger()
 
 
 @dataclass(frozen=True)
@@ -1285,6 +1299,7 @@ class ExpertStreamingRuntime:
         memory_cap_report: dict[str, Any] | None = None,
         integrity_report: dict[str, Any] | None = None,
         pipeline_ledger: ExpertPipelineLedger | None = None,
+        python_control_ledger: ExpertPythonControlLedger | None = None,
         memory_broker: UnifiedMemoryBroker | None = None,
         mx_module: Any | None = None,
     ) -> None:
@@ -1298,6 +1313,7 @@ class ExpertStreamingRuntime:
         self.memory_cap_report = memory_cap_report
         self.integrity_report = integrity_report
         self._pipeline_ledger = pipeline_ledger
+        self._python_control_ledger = python_control_ledger
         self.memory_broker = memory_broker
         self._mx_module = mx_module
         self._memory_transaction_lock = threading.RLock()
@@ -1523,8 +1539,14 @@ class ExpertStreamingRuntime:
             else None
         )
         pipeline_ledger = _pipeline_ledger_for_config(config)
+        python_control_ledger = _python_control_ledger_for_config(config)
         pipeline_kwargs = (
             {} if pipeline_ledger is None else {"pipeline_ledger": pipeline_ledger}
+        )
+        python_control_kwargs = (
+            {}
+            if python_control_ledger is None
+            else {"python_control_ledger": python_control_ledger}
         )
         reader = PositionalExpertReader(
             artifact_root,
@@ -1582,6 +1604,7 @@ class ExpertStreamingRuntime:
             memory_broker=memory_broker,
             mx_module=mx_module,
             **pipeline_kwargs,
+            **python_control_kwargs,
         )
 
     @staticmethod
@@ -1817,6 +1840,33 @@ class ExpertStreamingRuntime:
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
     ) -> ReadyRoute:
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._ensure_route_control(
+                layer,
+                expert_ids,
+                phase=phase,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+        with ledger.measure("route_control", phase):
+            return self._ensure_route_control(
+                layer,
+                expert_ids,
+                phase=phase,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+
+    def _ensure_route_control(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+    ) -> ReadyRoute:
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
@@ -1875,11 +1925,20 @@ class ExpertStreamingRuntime:
     ) -> ReadyRoute:
         """Execute a route while its policy lock is already held."""
 
-        route_plan, policy_txn = self._plan_route_transaction(
-            layer,
-            expert_ids,
-            phase=phase,
-        )
+        ledger = self._python_control_ledger
+        if ledger is None:
+            route_plan, policy_txn = self._plan_route_transaction(
+                layer,
+                expert_ids,
+                phase=phase,
+            )
+        else:
+            with ledger.measure("cache_policy", phase):
+                route_plan, policy_txn = self._plan_route_transaction(
+                    layer,
+                    expert_ids,
+                    phase=phase,
+                )
         ready: ReadyRoute | None = None
         io_admission = RouteIOAdmission()
         try:
@@ -1890,7 +1949,11 @@ class ExpertStreamingRuntime:
                 deadline_ns=deadline_ns,
                 io_admission=io_admission,
             )
-            policy_txn.commit()
+            if ledger is None:
+                policy_txn.commit()
+            else:
+                with ledger.measure("cache_policy", route_plan.phase):
+                    policy_txn.commit()
         except BaseException as exc:
             if ready is not None:
                 ready.release(synchronize=False)
@@ -1915,6 +1978,29 @@ class ExpertStreamingRuntime:
         phase: RoutingPhase | str,
     ) -> int:
         """Allocate only the inactive direct records demanded by one miss."""
+
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._warm_direct_cache_records_unmeasured(
+                layer=layer,
+                expert_ids=expert_ids,
+                phase=phase,
+            )
+        with ledger.measure("cache_budget", phase):
+            return self._warm_direct_cache_records_unmeasured(
+                layer=layer,
+                expert_ids=expert_ids,
+                phase=phase,
+            )
+
+    def _warm_direct_cache_records_unmeasured(
+        self,
+        *,
+        layer: int,
+        expert_ids: tuple[int, ...],
+        phase: RoutingPhase | str,
+    ) -> int:
+        """Perform one miss-driven sequence of direct-record allocations."""
 
         bank = self._global_bank
         broker = self.memory_broker
@@ -1999,18 +2085,32 @@ class ExpertStreamingRuntime:
             ) from exc
         with lock:
             self._raise_if_unhealthy()
-            planned = (
-                self._global_bank.try_plan_all_hits_transaction(
-                    layer,
+            ledger = self._python_control_ledger
+            if self._global_bank is not None:
+                if ledger is None:
+                    planned = self._global_bank.try_plan_all_hits_transaction(
+                        layer,
+                        expert_ids,
+                        phase=phase,
+                    )
+                else:
+                    with ledger.measure("cache_policy", phase):
+                        planned = self._global_bank.try_plan_all_hits_transaction(
+                            layer,
+                            expert_ids,
+                            phase=phase,
+                        )
+            elif ledger is None:
+                planned = self._banks[layer].try_plan_all_hits_transaction(
                     expert_ids,
                     phase=phase,
                 )
-                if self._global_bank is not None
-                else self._banks[layer].try_plan_all_hits_transaction(
-                    expert_ids,
-                    phase=phase,
-                )
-            )
+            else:
+                with ledger.measure("cache_policy", phase):
+                    planned = self._banks[layer].try_plan_all_hits_transaction(
+                        expert_ids,
+                        phase=phase,
+                    )
             if planned is None:
                 return None
             route_plan, policy_txn = planned
@@ -2101,7 +2201,12 @@ class ExpertStreamingRuntime:
                 # Deferring the commit also means an all-hit global route does
                 # not need to copy the entire LRU merely to undo a later
                 # counter failure.
-                policy_txn.commit()
+                ledger = self._python_control_ledger
+                if ledger is None:
+                    policy_txn.commit()
+                else:
+                    with ledger.measure("cache_policy", plan.phase):
+                        policy_txn.commit()
             except BaseException:
                 for counter, snapshot in zip(counters, counter_snapshots, strict=True):
                     counter.__dict__.clear()
@@ -2136,11 +2241,7 @@ class ExpertStreamingRuntime:
         phase: RoutingPhase | str,
     ) -> tuple[RoutePlan, RoutePolicyTxn]:
         if self._global_bank is not None:
-            return self._global_bank.plan_transaction(
-                layer,
-                expert_ids,
-                phase=phase,
-            )
+            return self._global_bank.plan_transaction(layer, expert_ids, phase=phase)
         return self._banks[layer].plan_transaction(expert_ids, phase=phase)
 
     def _invalidate_policy_expert(self, layer: int, expert: int) -> int | None:
@@ -2327,6 +2428,35 @@ class ExpertStreamingRuntime:
     ) -> PendingSplitRoute:
         """Pin hits now and load misses while the caller evaluates hit work."""
 
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._begin_split_route_control(
+                layer,
+                expert_ids,
+                phase=phase,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+        with ledger.measure("route_control", phase):
+            return self._begin_split_route_control(
+                layer,
+                expert_ids,
+                phase=phase,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+
+    def _begin_split_route_control(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+    ) -> PendingSplitRoute:
+        """Implement split-route setup with optional timing outside this path."""
+
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
@@ -2344,11 +2474,20 @@ class ExpertStreamingRuntime:
             lock.acquire()
             try:
                 self._raise_if_unhealthy()
-                planned = self._global_bank.try_plan_all_hits_transaction(
-                    layer,
-                    normalized_experts,
-                    phase=phase,
-                )
+                ledger = self._python_control_ledger
+                if ledger is None:
+                    planned = self._global_bank.try_plan_all_hits_transaction(
+                        layer,
+                        normalized_experts,
+                        phase=phase,
+                    )
+                else:
+                    with ledger.measure("cache_policy", phase):
+                        planned = self._global_bank.try_plan_all_hits_transaction(
+                            layer,
+                            normalized_experts,
+                            phase=phase,
+                        )
             except BaseException:
                 lock.release()
                 raise
@@ -2380,15 +2519,21 @@ class ExpertStreamingRuntime:
         combined_cancel = _RouteCancel(cancel_event, miss_cancel_event)
         try:
             self._raise_if_unhealthy()
-            plan, policy_txn = (
-                planned
-                if planned is not None
-                else self._plan_route_transaction(
+            if planned is not None:
+                plan, policy_txn = planned
+            elif self._python_control_ledger is None:
+                plan, policy_txn = self._plan_route_transaction(
                     layer,
                     normalized_experts,
                     phase=phase,
                 )
-            )
+            else:
+                with self._python_control_ledger.measure("cache_policy", phase):
+                    plan, policy_txn = self._plan_route_transaction(
+                        layer,
+                        normalized_experts,
+                        phase=phase,
+                    )
             hit_plan = self._subset_route_plan(plan, hits=True)
             miss_plan = self._subset_route_plan(plan, hits=False)
             miss_parts = (
@@ -2688,6 +2833,29 @@ class ExpertStreamingRuntime:
     ) -> KVAllocationTicket:
         """Reserve physical Q4 KV growth and release expert records if required."""
 
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._reserve_growth_unmeasured(
+                cache_id=cache_id,
+                steady_delta_bytes=steady_delta_bytes,
+                transient_delta_bytes=transient_delta_bytes,
+            )
+        with ledger.measure("kv_broker", "unscoped"):
+            return self._reserve_growth_unmeasured(
+                cache_id=cache_id,
+                steady_delta_bytes=steady_delta_bytes,
+                transient_delta_bytes=transient_delta_bytes,
+            )
+
+    def _reserve_growth_unmeasured(
+        self,
+        *,
+        cache_id: str,
+        steady_delta_bytes: int,
+        transient_delta_bytes: int,
+    ) -> KVAllocationTicket:
+        """Implement one KV reservation outside optional timing machinery."""
+
         broker = self.memory_broker
         if broker is None:
             raise MemoryAdmissionError("dynamic KV allocation is not enabled")
@@ -2742,6 +2910,19 @@ class ExpertStreamingRuntime:
         members: Iterable[tuple[str, int, int]],
     ) -> KVGroupGrowthContext:
         """Reserve one aggregate KV permit across a known set of cache owners."""
+
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._reserve_growth_group_unmeasured(members=members)
+        with ledger.measure("kv_broker", "unscoped"):
+            return self._reserve_growth_group_unmeasured(members=members)
+
+    def _reserve_growth_group_unmeasured(
+        self,
+        *,
+        members: Iterable[tuple[str, int, int]],
+    ) -> KVGroupGrowthContext:
+        """Implement grouped KV admission outside optional timing machinery."""
 
         broker = self.memory_broker
         if broker is None:
@@ -2840,6 +3021,35 @@ class ExpertStreamingRuntime:
     ) -> KVPhysicalAllocation:
         """Commit one measured member and release the permit after the last."""
 
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._commit_growth_group_member_unmeasured(
+                context,
+                cache_id=cache_id,
+                measured_physical_bytes=measured_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        with ledger.measure("kv_broker", "unscoped"):
+            return self._commit_growth_group_member_unmeasured(
+                context,
+                cache_id=cache_id,
+                measured_physical_bytes=measured_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    def _commit_growth_group_member_unmeasured(
+        self,
+        context: KVGroupGrowthContext,
+        *,
+        cache_id: str,
+        measured_physical_bytes: int,
+        allocator_before: AllocatorMemorySample,
+        allocator_after: AllocatorMemorySample,
+    ) -> KVPhysicalAllocation:
+        """Commit grouped KV bookkeeping without telemetry dispatch."""
+
         self._require_growth_group_context(context)
         measured = _integer(
             "measured_physical_bytes",
@@ -2887,6 +3097,36 @@ class ExpertStreamingRuntime:
     ) -> BrokerSnapshot:
         """Abort remaining members while preserving prior owned handles."""
 
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._abort_growth_group_unmeasured(
+                context,
+                observed_uncommitted_physical_bytes=(
+                    observed_uncommitted_physical_bytes
+                ),
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        with ledger.measure("kv_broker", "unscoped"):
+            return self._abort_growth_group_unmeasured(
+                context,
+                observed_uncommitted_physical_bytes=(
+                    observed_uncommitted_physical_bytes
+                ),
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    def _abort_growth_group_unmeasured(
+        self,
+        context: KVGroupGrowthContext,
+        *,
+        observed_uncommitted_physical_bytes: int | None,
+        allocator_before: AllocatorMemorySample | None,
+        allocator_after: AllocatorMemorySample | None,
+    ) -> BrokerSnapshot:
+        """Abort grouped KV bookkeeping without telemetry dispatch."""
+
         self._require_growth_group_context(context)
         observed = (
             None
@@ -2919,6 +3159,30 @@ class ExpertStreamingRuntime:
         allocator_before: AllocatorMemorySample | None = None,
         allocator_after: AllocatorMemorySample | None = None,
     ) -> KVPhysicalAllocation:
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._commit_growth_unmeasured(
+                ticket,
+                measured_physical_bytes=measured_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+        with ledger.measure("kv_broker", "unscoped"):
+            return self._commit_growth_unmeasured(
+                ticket,
+                measured_physical_bytes=measured_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    def _commit_growth_unmeasured(
+        self,
+        ticket: KVAllocationTicket,
+        *,
+        measured_physical_bytes: int,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
+    ) -> KVPhysicalAllocation:
         broker = self.memory_broker
         if broker is None:
             raise MemoryAdmissionError("dynamic KV allocation is not enabled")
@@ -2933,6 +3197,31 @@ class ExpertStreamingRuntime:
             self._memory_transaction_lock.release()
 
     def abort_growth(
+        self,
+        ticket: KVAllocationTicket,
+        *,
+        observed_physical_bytes: int | None,
+        allocator_before: AllocatorMemorySample | None = None,
+        allocator_after: AllocatorMemorySample | None = None,
+    ) -> None:
+        ledger = self._python_control_ledger
+        if ledger is None:
+            self._abort_growth_unmeasured(
+                ticket,
+                observed_physical_bytes=observed_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+            return
+        with ledger.measure("kv_broker", "unscoped"):
+            self._abort_growth_unmeasured(
+                ticket,
+                observed_physical_bytes=observed_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    def _abort_growth_unmeasured(
         self,
         ticket: KVAllocationTicket,
         *,
@@ -2975,6 +3264,36 @@ class ExpertStreamingRuntime:
     ) -> None:
         """Reconcile an exact cache-owner release."""
 
+        ledger = self._python_control_ledger
+        if ledger is None:
+            self._release_cache_unmeasured(
+                cache_id=cache_id,
+                allocations=allocations,
+                released_physical_bytes=released_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+            return
+        with ledger.measure("kv_broker", "unscoped"):
+            self._release_cache_unmeasured(
+                cache_id=cache_id,
+                allocations=allocations,
+                released_physical_bytes=released_physical_bytes,
+                allocator_before=allocator_before,
+                allocator_after=allocator_after,
+            )
+
+    def _release_cache_unmeasured(
+        self,
+        *,
+        cache_id: str,
+        allocations: tuple[KVPhysicalAllocation, ...],
+        released_physical_bytes: int,
+        allocator_before: AllocatorMemorySample,
+        allocator_after: AllocatorMemorySample,
+    ) -> None:
+        """Reconcile an exact cache-owner release without telemetry dispatch."""
+
         broker = self.memory_broker
         if broker is None:
             raise MemoryAdmissionError("dynamic KV allocation is not enabled")
@@ -2996,6 +3315,29 @@ class ExpertStreamingRuntime:
         _transaction_lock_held: bool = False,
     ) -> ExpertRecordReleaseResult:
         """Release the coldest exact records needed by one KV reservation."""
+
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return self._reclaim_expert_records_unmeasured(
+                ticket,
+                deadline_ns=deadline_ns,
+                _transaction_lock_held=_transaction_lock_held,
+            )
+        with ledger.measure("cache_budget", "unscoped"):
+            return self._reclaim_expert_records_unmeasured(
+                ticket,
+                deadline_ns=deadline_ns,
+                _transaction_lock_held=_transaction_lock_held,
+            )
+
+    def _reclaim_expert_records_unmeasured(
+        self,
+        ticket: KVAllocationTicket | KVAllocationGroupTicket,
+        *,
+        deadline_ns: int | None = None,
+        _transaction_lock_held: bool = False,
+    ) -> ExpertRecordReleaseResult:
+        """Release exact cold records without telemetry dispatch."""
 
         del deadline_ns
         broker = self.memory_broker
@@ -3173,6 +3515,28 @@ class ExpertStreamingRuntime:
             for lock in reversed(locks):
                 lock.release()
 
+    def _python_control_cpu_snapshot(
+        self,
+        pipeline_snapshot: Mapping[str, Any] | None,
+    ) -> dict[str, object] | None:
+        ledger = self._python_control_ledger
+        if ledger is None:
+            return None
+        by_phase = (
+            pipeline_snapshot.get("by_phase", {})
+            if pipeline_snapshot is not None
+            else {}
+        )
+        reader_thread: dict[str, dict[str, int]] = {}
+        for phase in ("decode", "prefill", "unscoped"):
+            phase_snapshot = by_phase.get(phase, {})
+            counters = phase_snapshot.get("counters", {})
+            reader_thread[phase] = {
+                "calls": int(counters.get("started_reader_tasks", 0)),
+                "cpu_ns": int(counters.get("reader_thread_cpu_ns", 0)),
+            }
+        return ledger.snapshot(reader_thread=reader_thread)
+
     def snapshot(self, *, mx_module: Any | None = None) -> dict[str, Any]:
         with self._kv_lock:
             live_kv = self._live_kv_tokens
@@ -3235,8 +3599,16 @@ class ExpertStreamingRuntime:
             }
         if self._mapped_expert_store is not None:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
-        if self._pipeline_ledger is not None:
-            snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
+        pipeline_snapshot = (
+            None
+            if self._pipeline_ledger is None
+            else self._pipeline_ledger.snapshot()
+        )
+        if pipeline_snapshot is not None:
+            snapshot["expert_pipeline"] = pipeline_snapshot
+        python_control = self._python_control_cpu_snapshot(pipeline_snapshot)
+        if python_control is not None:
+            snapshot["python_control_cpu"] = python_control
         if self.memory_broker is not None:
             snapshot["memory_broker"] = asdict(self.memory_broker.snapshot())
             snapshot["dynamic_memory"] = self.dynamic_memory_telemetry_snapshot()
@@ -3278,8 +3650,16 @@ class ExpertStreamingRuntime:
             "incremental_misses": incremental_misses,
             **slots,
         }
-        if self._pipeline_ledger is not None:
-            snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
+        pipeline_snapshot = (
+            None
+            if self._pipeline_ledger is None
+            else self._pipeline_ledger.snapshot()
+        )
+        if pipeline_snapshot is not None:
+            snapshot["expert_pipeline"] = pipeline_snapshot
+        python_control = self._python_control_cpu_snapshot(pipeline_snapshot)
+        if python_control is not None:
+            snapshot["python_control_cpu"] = python_control
         if self.memory_broker is not None:
             broker_snapshot = self.memory_broker.snapshot()
             physical_bytes = int(broker_snapshot.kv_physical_bytes)

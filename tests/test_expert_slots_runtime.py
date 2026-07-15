@@ -26,7 +26,11 @@ from mtplx.expert_manifest import (
     TensorSegment,
     save_expert_manifest,
 )
-from mtplx.resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
+from mtplx.resource_metrics import (
+    ExpertPipelineLedger,
+    ExpertPipelineRoute,
+    ExpertPythonControlLedger,
+)
 from mtplx.expert_runtime import (
     ExpertStreamingConfig,
     ExpertStreamingConfigurationError,
@@ -4526,19 +4530,65 @@ def test_resource_snapshot_holds_counter_lock_while_copying(
         runtime.close()
 
 
+def test_resource_snapshot_attributes_python_control_and_reader_cpu(
+    tmp_path: Path,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    try:
+        ready = runtime.ensure_route(1, [0], phase="decode")
+        ready.release(synchronize=False)
+
+        snapshot = runtime.resource_telemetry_snapshot(mx_module=object())
+        control = snapshot["python_control_cpu"]
+        pipeline_decode = snapshot["expert_pipeline"]["by_phase"]["decode"]
+        assert isinstance(runtime._python_control_ledger, ExpertPythonControlLedger)
+        assert control["route_control"]["decode_calls"] == 1
+        assert control["cache_policy"]["decode_calls"] >= 1
+        assert control["reader_thread"]["decode_calls"] == pipeline_decode[
+            "counters"
+        ]["started_reader_tasks"]
+        assert control["reader_thread"]["decode_cpu_ns"] == pipeline_decode[
+            "counters"
+        ]["reader_thread_cpu_ns"]
+    finally:
+        runtime.close()
+
+
 def test_resource_telemetry_is_off_the_runtime_hot_path_by_default(
     tmp_path: Path,
 ) -> None:
     runtime = _open_tiny_runtime(tmp_path)
     try:
         assert runtime.config.resource_telemetry is False
+        assert runtime._python_control_ledger is None
         assert runtime.slots._reader_pool_telemetry is None
         assert runtime.slots._completion_fence_telemetry is None
         snapshot = runtime.snapshot(mx_module=object())
+        assert "python_control_cpu" not in snapshot
         assert "reader_pool" not in snapshot["slots"]
         assert "completion_fences" not in snapshot["slots"]
         with pytest.raises(ExpertSlotError, match="resource telemetry is disabled"):
             runtime.resource_telemetry_snapshot(mx_module=object())
+    finally:
+        runtime.close()
+
+
+def test_disabled_resource_telemetry_never_constructs_python_cpu_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_constructed(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("disabled telemetry must not construct a CPU ledger")
+
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "ExpertPythonControlLedger",
+        fail_if_constructed,
+    )
+    runtime = _open_tiny_runtime(tmp_path)
+    try:
+        ready = runtime.ensure_route(1, [0], phase="decode")
+        ready.release(synchronize=False)
     finally:
         runtime.close()
 

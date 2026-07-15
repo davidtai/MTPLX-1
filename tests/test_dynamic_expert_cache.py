@@ -15,6 +15,16 @@ from mtplx.memory_broker import (
     MemoryTelemetryError,
     UnifiedMemoryBroker,
 )
+from mtplx.resource_metrics import ExpertPythonControlLedger
+
+
+class _StepClock:
+    def __init__(self) -> None:
+        self.now = 0
+
+    def __call__(self) -> int:
+        self.now += 10
+        return self.now
 
 
 class _Ready:
@@ -456,5 +466,33 @@ def test_dynamic_telemetry_contains_records_and_no_grouped_fields() -> None:
         assert "logical_slab_count" not in telemetry
         assert "hysteresis_slabs" not in telemetry
         assert "regrow_requests" not in telemetry
+    finally:
+        runtime._split_executor.shutdown(wait=True)
+
+
+def test_dynamic_runtime_attributes_route_cache_budget_and_kv_control_cpu() -> None:
+    runtime = _runtime()
+    runtime._python_control_ledger = ExpertPythonControlLedger(
+        thread_cpu_clock=_StepClock()
+    )
+    try:
+        miss = runtime.ensure_route(1, [0], phase="decode")
+        miss.release(synchronize=False)
+        hit = runtime.ensure_route(1, [0], phase="decode")
+        hit.release(synchronize=False)
+
+        ticket = runtime.reserve_growth(
+            cache_id="telemetry-test",
+            steady_delta_bytes=10,
+            transient_delta_bytes=0,
+        )
+        runtime.abort_growth(ticket, observed_physical_bytes=0)
+
+        control = runtime._python_control_ledger.snapshot()
+        assert control["route_control"]["decode_calls"] == 2
+        assert control["cache_policy"]["decode_calls"] >= 2
+        assert control["cache_budget"]["decode_calls"] == 1
+        assert control["cache_budget"]["unscoped_calls"] == 1
+        assert control["kv_broker"]["unscoped_calls"] == 2
     finally:
         runtime._split_executor.shutdown(wait=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from mtplx.resource_metrics import (
+    ExpertPythonControlLedger,
     ExpertPipelineLedger,
     PoolOccupancy,
 )
@@ -17,6 +18,60 @@ class FakeClock:
 
     def advance(self, nanoseconds: int) -> None:
         self.now_ns += int(nanoseconds)
+
+
+class SequenceClock:
+    def __init__(self, values: list[int]) -> None:
+        self.values = iter(values)
+        self.calls = 0
+
+    def __call__(self) -> int:
+        self.calls += 1
+        return next(self.values)
+
+
+def test_python_control_ledger_tracks_nested_phase_cpu_and_reader_separately() -> None:
+    clock = SequenceClock([10, 20, 30, 50, 60, 90])
+    ledger = ExpertPythonControlLedger(thread_cpu_clock=clock)
+
+    with ledger.measure("route_control", "decode"):
+        with ledger.measure("cache_policy", "decode"):
+            pass
+    with ledger.measure("kv_broker", "prefill"):
+        pass
+
+    snapshot = ledger.snapshot(
+        reader_thread={
+            "decode": {"calls": 2, "cpu_ns": 7},
+            "prefill": {"calls": 1, "cpu_ns": 3},
+        }
+    )
+    assert clock.calls == 6
+    assert snapshot["route_control"]["decode_calls"] == 1
+    assert snapshot["route_control"]["decode_cpu_ns"] == 40
+    assert snapshot["cache_policy"]["decode_cpu_ns"] == 10
+    assert snapshot["kv_broker"]["prefill_calls"] == 1
+    assert snapshot["kv_broker"]["prefill_cpu_ns"] == 30
+    assert snapshot["reader_thread"]["decode_cpu_ns"] == 7
+    assert snapshot["reader_thread"]["prefill_cpu_ns"] == 3
+    assert snapshot["inclusive_relationships"] == {
+        "cache_policy": "subset_of_route_control",
+        "reader_thread": "separate_worker",
+    }
+    assert snapshot["clock"] == "thread_time_ns"
+
+
+def test_python_control_ledger_serializes_regressing_clock_as_nonnegative() -> None:
+    ledger = ExpertPythonControlLedger(
+        thread_cpu_clock=SequenceClock([20, 10]),
+    )
+
+    with ledger.measure("cache_budget", "decode"):
+        pass
+
+    snapshot = ledger.snapshot()
+    assert snapshot["cache_budget"]["decode_calls"] == 1
+    assert snapshot["cache_budget"]["decode_cpu_ns"] == 0
 
 
 def test_pool_occupancy_integrates_queue_workers_and_units() -> None:
