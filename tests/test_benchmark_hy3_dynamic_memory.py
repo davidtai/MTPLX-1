@@ -766,14 +766,6 @@ def test_observation_requires_exact_headroom_and_classified_limit() -> None:
 
 
 def test_observation_requires_stable_hold_reset_rewarm_and_block_crossing() -> None:
-    unstable = _observation("dynamic", 4096, 0, tok_s=12.0)
-    unstable["timeline"][4]["allocator_cache_bytes"] = 1
-    unstable["timeline"][4]["allocator_cache_charged_bytes"] = 1
-    unstable["timeline"][4]["charged_bytes"] += 1
-    unstable["timeline"][4]["charged_residual_bytes"] -= 1
-    with pytest.raises(BenchmarkGateError, match="allocator_cache"):
-        validate_campaign_observation(unstable)
-
     unstable_resource = _observation("dynamic", 4096, 0, tok_s=12.0)
     unstable_resource["timeline"][4]["record_allocations"] += 1
     with pytest.raises(BenchmarkGateError, match="record_allocations"):
@@ -992,16 +984,41 @@ def test_observation_allows_one_raw_allocator_bookkeeping_buffer_of_hold_jitter(
     assert validated.arm == "dynamic"
 
 
-def test_observation_rejects_raw_allocator_hold_jitter_above_one_buffer() -> None:
+def test_observation_allows_measured_raw_allocator_cache_churn_when_fully_charged() -> (
+    None
+):
     observation = _observation("dynamic", 4096, 0, tok_s=12.0)
     holds = [point for point in observation["timeline"] if point["phase"] == "hold"]
-    for point in holds:
-        point["allocator_cache_charged_bytes"] = 8 * 1024 + 1
-        point["charged_bytes"] += 8 * 1024 + 1
-        point["charged_residual_bytes"] -= 8 * 1024 + 1
+    measured_cache_bytes = (1_079_101_220, 1_076_971_300, 1_080_870_692)
+    for point, cache_bytes in zip(holds, measured_cache_bytes, strict=True):
+        point["allocator_cache_bytes"] = cache_bytes
+        point["allocator_cache_charged_bytes"] = cache_bytes
+        point["charged_bytes"] = point["classified_bytes"] + cache_bytes
+        point["charged_residual_bytes"] = (
+            point["memory_limit_bytes"] - point["charged_bytes"]
+        )
+    observation["metrics"]["peak_charged_bytes"] = max(
+        point["charged_bytes"] for point in observation["timeline"]
+    )
+    observation["metrics"]["stress_peak_charged_bytes"] = max(
+        max(
+            point["allocator_peak_bytes"] + point["allocator_cache_bytes"],
+            point["charged_bytes"],
+        )
+        for point in observation["timeline"]
+    )
+
+    validated = validate_campaign_observation(observation)
+
+    assert validated.arm == "dynamic"
+
+
+def test_observation_rejects_raw_allocator_cache_churn_that_is_not_charged() -> None:
+    observation = _observation("dynamic", 4096, 0, tok_s=12.0)
+    holds = [point for point in observation["timeline"] if point["phase"] == "hold"]
     holds[1]["allocator_cache_bytes"] = 8 * 1024 + 1
 
-    with pytest.raises(BenchmarkGateError, match="raw allocator cache.*8 KiB"):
+    with pytest.raises(BenchmarkGateError, match="charged.*below raw MLX"):
         validate_campaign_observation(observation)
 
 
