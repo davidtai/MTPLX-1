@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,6 +42,22 @@ def test_load_sidecar_record_copies_one_contiguous_record_exactly(tmp_path: Path
     module.load_sidecar_record(tmp_path, manifest, record, buffer)
 
     assert bytes(buffer) == b"abcdefgh"
+
+
+def test_probe_buffer_identity_does_not_retain_the_record() -> None:
+    module = _load_module()
+
+    class RecordBuffer:
+        pass
+
+    buffer = RecordBuffer()
+    reference = weakref.ref(buffer)
+    identity = module._buffer_identity(buffer)
+
+    del buffer
+
+    assert reference() is None
+    assert isinstance(identity, int)
 
 
 def test_load_sidecar_record_rejects_payload_hash_mismatch(tmp_path: Path) -> None:

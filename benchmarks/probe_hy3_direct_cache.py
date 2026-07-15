@@ -41,6 +41,12 @@ from mtplx.expert_manifest import (  # noqa: E402
 TOTAL_CONTEXT_TOKENS = 131_072
 
 
+def _buffer_identity(buffer: object) -> int:
+    """Track record identity without keeping the MLX buffer alive."""
+
+    return id(buffer)
+
+
 def _attest_probe_artifact(config: Hy3HardwareConfig):
     """Full-hash the sidecar once, then verify every source-shard header."""
 
@@ -249,8 +255,7 @@ def run_real_probe(
         raise RuntimeError("probe requires experts 0 and 1 in the first routed layer")
     first_record, replacement_record = sorted(records, key=lambda item: item.expert)
     label = "global-persistent-0"
-    buffer: Any | None = None
-    original_buffer: Any | None = None
+    original_buffer_identity: int | None = None
 
     def sample_allocator() -> AllocatorSample:
         report = mlx_memory_telemetry(mx)
@@ -264,14 +269,15 @@ def run_real_probe(
             raise RuntimeError("MLX allocator telemetry is incomplete") from exc
 
     def allocate_first_record() -> int:
-        nonlocal buffer, original_buffer
+        nonlocal original_buffer_identity
         allocated_bytes = pool.allocate_persistent_slot(0)
         buffer = allocator.slots[label]
-        original_buffer = buffer
+        original_buffer_identity = _buffer_identity(buffer)
         load_sidecar_record(config.model_root, manifest, first_record, buffer)
         return allocated_bytes
 
     def execute(record: Any) -> bool:
+        buffer = allocator.slots.get(label)
         if buffer is None:
             return False
         binding = ExpertSlotBinding(
@@ -293,10 +299,14 @@ def run_real_probe(
         return tuple(output.shape) == (1, HY3_Q4.hidden_size) and bool(finite.item())
 
     def replace_record() -> bool:
+        buffer = allocator.slots.get(label)
         if buffer is None:
             return False
         load_sidecar_record(config.model_root, manifest, replacement_record, buffer)
-        return allocator.slots.get(label) is original_buffer is buffer
+        return (
+            original_buffer_identity is not None
+            and _buffer_identity(buffer) == original_buffer_identity
+        )
 
     def release_record() -> int:
         released = pool.release_persistent_slots((0,))
