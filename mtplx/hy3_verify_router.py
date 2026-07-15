@@ -157,6 +157,10 @@ def _compiled_router(
         and linear_weight is not None
         and expert_bias is not None
     ):
+        cached_shared = getattr(router, "_mtplx_verify_router_shared_record", None)
+        if isinstance(cached_shared, _CompiledRouter):
+            cached_shared.host["stats"] = _STATS
+            return cached_shared, (linear_weight, expert_bias), True
         key = (
             "fp32-linear-router",
             rows,
@@ -169,6 +173,11 @@ def _compiled_router(
         shared_record = shared_group.get(key)
         if isinstance(shared_record, _CompiledRouter):
             shared_record.host["stats"] = _STATS
+            object.__setattr__(
+                router,
+                "_mtplx_verify_router_shared_record",
+                shared_record,
+            )
             return shared_record, (linear_weight, expert_bias), True
 
         host: dict[str, Any] = {"stats": _STATS, "trace_count": 0}
@@ -203,6 +212,7 @@ def _compiled_router(
 
         record = _CompiledRouter(mx.compile(fixed_linear_router), host)
         shared_group[key] = record
+        object.__setattr__(router, "_mtplx_verify_router_shared_record", record)
         return record, (linear_weight, expert_bias), True
 
     records = getattr(router, "_mtplx_verify_router_compiled", None)

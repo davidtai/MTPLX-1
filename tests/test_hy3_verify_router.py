@@ -9,7 +9,7 @@ from mtplx.hy3_verify_router import (
     reset_hy3_verify_router_stats,
     hy3_verify_router_stats,
 )
-from mtplx.models.hy3_mlx import Model, ModelArgs
+from mtplx.models.hy3_mlx import Model, ModelArgs, Router
 
 
 @pytest.fixture(autouse=True)
@@ -163,6 +163,42 @@ def test_fixed_m4_linear_routers_share_one_weight_parameterized_graph(
     assert stats["retraces"] == 0
     assert stats["shared_graph_calls"] == 2
     assert stats["per_router_graph_calls"] == 0
+
+
+def test_fixed_m4_router_caches_shared_record_after_first_layer_dispatch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "1")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+
+    class CountingGroup(dict):
+        def __init__(self):
+            super().__init__()
+            self.lookups = 0
+
+        def get(self, key, default=None):
+            self.lookups += 1
+            return super().get(key, default)
+
+    group = CountingGroup()
+    routers = [
+        Router(_args(), verify_router_group=group),
+        Router(_args(), verify_router_group=group),
+    ]
+    hidden = mx.full((1, 4, 64), 0.125, dtype=mx.bfloat16)
+    reset_hy3_verify_router_stats()
+
+    with attention_phase("decode_verify"):
+        for router in routers:
+            for _ in range(2):
+                output = router(hidden)
+                mx.eval(*output)
+
+    assert group.lookups == 2
+    stats = hy3_verify_router_stats()
+    assert stats["compiled_calls"] == 4
+    assert stats["compiled_graph_count"] == 1
+    assert stats["traces"] == 1
 
 
 def test_fixed_m4_wrapped_router_preserves_wrapper_on_per_router_graph(
