@@ -1,0 +1,149 @@
+{
+  "schema": "mtplx-issue65-hy3-q2-e1-r2-summary-v1",
+  "issues": {
+    "e1_arithmetic": 65,
+    "component_layout": 68
+  },
+  "decision": "packed_qmm_r2_not_positive_keep_issue65_open_no_integration",
+  "r1_attribution": {
+    "classification": "arithmetic_reduction_order",
+    "rows_classified": 8,
+    "decoded_q2_values_match_mx_dequantize_f32": true,
+    "r1_matches_simulated_reduction_after_bf16": true,
+    "inline_silu_multiply_matches_r1_preactivation_graph": true,
+    "artifact": "../20260715T175953Z-r1-stage-diagnostic-r3/result.json",
+    "sha256": "e77bbc1a85bcd50d78018c360aa5eb5372681f0415d88ea3eccbe03c1e92d6f9"
+  },
+  "r2_contract": {
+    "model": "/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2",
+    "layer": 1,
+    "experts": [0, 1, 2, 3, 4, 5, 6, 7],
+    "manifest_sha256": "086fcce170efdc1b6840bd1f9f1003e4bbebbe812641bd5a1a9c76c562cc4950",
+    "hardware": "Apple M5 Max (applegpu_g17s)",
+    "rows": [1, 2, 3, 4, 5, 6, 7, 8],
+    "primary_row": "R4 corresponding to K3",
+    "projection": "one MLX gather_qmm to packed N=3072 then split and exact SwiGLU",
+    "steady_source_bytes": 31457280,
+    "steady_packed_bytes": 31457280,
+    "steady_duplicate_bytes": 0,
+    "layouts": [
+      "gate_then_up",
+      "output_interleaved",
+      "block_interleaved_16",
+      "block_interleaved_32",
+      "block_interleaved_64",
+      "block_interleaved_128",
+      "block_interleaved_256"
+    ],
+    "execution_modes": ["eager", "compiled"],
+    "assignment_orders": ["original", "slot_sorted"]
+  },
+  "correctness": {
+    "all_direct_order_layouts_bit_exact_r1_to_r8": true,
+    "direct_order_compile_failures": 0,
+    "direct_order_dispatch_failures": 0,
+    "direct_order_correctness_failures": 0,
+    "slot_sorted_status": "rejected_after_correctness_drift_from_r4_through_r8"
+  },
+  "r4_refinement": {
+    "paired_interleaved_repeats": 50,
+    "bootstrap_resamples": 10000,
+    "complete_e1_control_over_candidate": [
+      {
+        "candidate": "packed_halves_direct_eager",
+        "ratio_of_means": 0.968089,
+        "ci95": [0.934542, 1.003230]
+      },
+      {
+        "candidate": "packed_halves_direct_compiled",
+        "ratio_of_means": 0.972721,
+        "ci95": [0.938856, 1.008512]
+      },
+      {
+        "candidate": "packed_interleaved_direct_eager",
+        "ratio_of_means": 0.990223,
+        "ci95": [0.968117, 1.014950]
+      },
+      {
+        "candidate": "packed_interleaved_direct_compiled",
+        "ratio_of_means": 0.962867,
+        "ci95": [0.935748, 0.990783]
+      },
+      {
+        "candidate": "packed_block16_direct_eager",
+        "ratio_of_means": 0.974249,
+        "ci95": [0.942227, 1.008858]
+      },
+      {
+        "candidate": "packed_block16_direct_compiled",
+        "ratio_of_means": 0.991349,
+        "ci95": [0.963244, 1.022431]
+      },
+      {
+        "candidate": "packed_block256_direct_eager",
+        "ratio_of_means": 0.969224,
+        "ci95": [0.935825, 1.003198]
+      },
+      {
+        "candidate": "packed_block256_direct_compiled",
+        "ratio_of_means": 0.994909,
+        "ci95": [0.968042, 1.024931]
+      }
+    ],
+    "positive_r4_intervals": 0
+  },
+  "component_attribution_r4": {
+    "packed_halves_qmm_only": {
+      "ratio_of_means": 0.990358,
+      "ci95": [0.953214, 1.028659]
+    },
+    "packed_halves_split_exact_swiglu_only": {
+      "ratio_of_means": 1.003812,
+      "ci95": [0.968154, 1.042043]
+    },
+    "packed_interleaved_qmm_only": {
+      "ratio_of_means": 0.953846,
+      "ci95": [0.923419, 0.986587]
+    },
+    "packed_interleaved_split_exact_swiglu_only": {
+      "ratio_of_means": 0.966341,
+      "ci95": [0.938130, 0.995487]
+    },
+    "packed_block16_qmm_only": {
+      "ratio_of_means": 0.991556,
+      "ci95": [0.957979, 1.027863]
+    },
+    "packed_block256_qmm_only": {
+      "ratio_of_means": 0.979766,
+      "ci95": [0.945108, 1.015560]
+    }
+  },
+  "artifacts": [
+    {
+      "role": "packed direct 50-pair refinement",
+      "path": "../20260715T181000Z-packed-direct-refine-r2/result.json",
+      "sha256": "6ac443bbe079a9b75facbabbb93c22f277c5d629858ee17af093d253840f39a5"
+    },
+    {
+      "role": "packed block 50-pair refinement",
+      "path": "../20260715T182500Z-packed-block-refine-r4/result.json",
+      "sha256": "d577859e126c6d2d6e5c90b8a741dd9bb8a248e91534e905f3c9ded3a65d6b21"
+    },
+    {
+      "role": "full layout/order/execution screen",
+      "path": "../20260715T180500Z-packed-screen-r1/result.json",
+      "sha256": "077e9889b6b9f68ab7e78109dc867a4264239817fe5608f845c5314338917fa9"
+    },
+    {
+      "role": "block tile screen",
+      "path": "../20260715T182000Z-packed-block-screen-r3/result.json",
+      "sha256": "facbfbe3eab98f7645663b69d5270329262b7654374dae26a9c88e3f29d17490"
+    }
+  ],
+  "qwen": {
+    "captured_loaded": false,
+    "captured_models": [],
+    "restored_before_lock_release": true
+  },
+  "integration": "not performed"
+}
