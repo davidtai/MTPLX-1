@@ -45,7 +45,7 @@ _FIXED_DEPTH_ENV_KEYS = (
 MODEL_SPECS = {
     "hy3-q2": {
         "model_key": "hy3-expert-q2",
-        "depths": (1, 2, 3, 4, 5, 6),
+        "depths": (1, 2, 3, 4, 5, 6, 7),
         "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-mtp-layer80"),
         "prompt_tail": None,
@@ -1401,6 +1401,7 @@ def _run_observation(
     verify_strategy: str,
     compiled_verify_mode: str,
     draft_observer: Callable[[Mapping[str, Any]], None] | None,
+    retained_measurement: bool = False,
 ) -> tuple[dict[str, Any], list[int], str | None]:
     _reset_expert_streaming(runtime)
     resource_telemetry_enabled = bool(resource_options["resource_telemetry"])
@@ -1581,6 +1582,7 @@ def _run_observation(
             calls = _optional_int(compiled_verify, "calls")
             compiled_calls = _optional_int(compiled_verify, "compiled_calls")
             fallback_calls = _optional_int(compiled_verify, "fallback_calls")
+            retrace_calls = _optional_int(compiled_verify, "retrace_calls")
             if calls is None or calls <= 0:
                 raise BenchmarkGateError("compiled verifier emitted no calls")
             if fallback_calls != 0:
@@ -1589,6 +1591,38 @@ def _run_observation(
                 raise BenchmarkGateError(
                     "compiled verifier calls were not fully compiled"
                 )
+            if retrace_calls != 0:
+                raise BenchmarkGateError(
+                    "compiled verifier retraced during retained measurement"
+                )
+            if retained_measurement and _optional_int(compiled_verify, "traces") != 0:
+                raise BenchmarkGateError(
+                    "compiled verifier traced during retained measurement"
+                )
+            if retained_measurement and depth == 3:
+                if _optional_int(compiled_verify, "target_rows") != 4:
+                    raise BenchmarkGateError(
+                        "K3 compiled verifier did not select fixed Rows=4"
+                    )
+                if (_optional_int(compiled_verify, "target_forward_calls") or 0) <= 0:
+                    raise BenchmarkGateError(
+                        "K3 fixed-R4 target plan emitted no forward calls"
+                    )
+                if (_optional_int(compiled_verify, "target_plan_hits") or 0) <= 0:
+                    raise BenchmarkGateError(
+                        "K3 fixed-R4 target plan emitted no replay calls"
+                    )
+                if (_optional_int(compiled_verify, "target_commit_calls") or 0) <= 0:
+                    raise BenchmarkGateError(
+                        "K3 fixed-R4 target plan emitted no commit calls"
+                    )
+                if (
+                    _optional_int(compiled_verify, "target_offset_syncs_avoided")
+                    or 0
+                ) <= 0:
+                    raise BenchmarkGateError(
+                        "K3 fixed-R4 target plan avoided no offset synchronizations"
+                    )
             if compiled_verify.get("mode") != compiled_verify_mode:
                 raise BenchmarkGateError("compiled verifier mode evidence disagrees")
             compiled_verify_evidence = True
@@ -2283,6 +2317,7 @@ def _run_depth_matrix_impl(
                     verify_strategy=verify_strategy,
                     compiled_verify_mode=compiled_verify_mode,
                     draft_observer=draft_observer,
+                    retained_measurement=True,
                 )
                 hard_peak_memory_bytes = max(
                     hard_peak_memory_bytes,
@@ -2355,6 +2390,7 @@ def _run_depth_matrix_impl(
                         verify_strategy=verify_strategy,
                         compiled_verify_mode=compiled_verify_mode,
                         draft_observer=draft_observer,
+                        retained_measurement=True,
                     )
                     _record_token_divergence(
                         model_payload,

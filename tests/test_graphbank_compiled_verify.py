@@ -26,6 +26,7 @@ from mtplx.graphbank import (
     build_verify_state_spec,
     compare_verify_outputs,
     compiled_verify_mode,
+    compiled_verify_target_rows,
     promote_kv_cache_offsets,
 )
 
@@ -154,6 +155,19 @@ def test_compiled_verify_mode_env(monkeypatch):
     assert compiled_verify_mode() == "parity"
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "parity2")
     assert compiled_verify_mode() == "parity2"
+
+
+def test_compiled_verify_target_rows_env(monkeypatch):
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY_TARGET_ROWS", raising=False)
+    assert compiled_verify_target_rows() == 4
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_TARGET_ROWS", "off")
+    assert compiled_verify_target_rows() is None
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_TARGET_ROWS", "0")
+    assert compiled_verify_target_rows() is None
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_TARGET_ROWS", "6")
+    assert compiled_verify_target_rows() == 6
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_TARGET_ROWS", "99")
+    assert compiled_verify_target_rows() == 4
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY", " PARITY2 ")
     assert compiled_verify_mode() == "parity2"
 
@@ -418,7 +432,9 @@ def test_fallback_matrix_reasons(monkeypatch):
     cache = _prefill(rt, [0, 1, 2])
 
     # Length above the bank ceiling.
-    bank.forward_ar_capture(mx.array([[0, 1, 2, 3, 4, 0, 1]]), cache=cache)
+    bank.forward_ar_capture(
+        mx.array([[0, 1, 2, 3, 4, 0, 1, 2, 3]]), cache=cache
+    )
     assert bank.stats["fallback_reasons"]["length_outside_bank"] == 1
 
     # Owned-state env wrappers force eager.
@@ -562,7 +578,7 @@ def test_to_dict_exposes_stats_and_buckets():
     assert data["calls"] == 1
     assert data["compiled_calls"] == 1
     assert data["mode"] == "on"
-    assert data["max_verify_len"] == 6
+    assert data["max_verify_len"] == 8
     assert data["permanent_eager"] is False
     assert data["promoted"] == 1
     assert data["compiled_entry_count"] == 1
@@ -1073,6 +1089,34 @@ def test_generation_flag_on_attaches_stats_and_matches_flag_off(monkeypatch):
     assert bank_stats["demotions"] == 0
 
 
+def test_generation_reports_lazy_bonus_cache_advance_to_compiled_bank(monkeypatch):
+    from mtplx.generation import generate_mtpk
+    from mtplx.sampling import SamplerConfig
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_TARGET_ROWS", "3")
+    monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
+    monkeypatch.setenv("MTPLX_DEFER_VERIFY_HIDDEN_EVAL", "1")
+    rt, _model = _tiny_mtpk_runtime()
+
+    out = generate_mtpk(
+        rt,
+        [0],
+        max_tokens=5,
+        sampler=SamplerConfig(temperature=0.6, top_p=0.95, top_k=20),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="capture_commit",
+        stop_token_ids=set(),
+    )
+
+    bank_stats = out.stats.graphbank["compiled_verify"]
+    assert bank_stats["target_rows"] == 3
+    assert bank_stats["target_external_cache_advances"] == 1
+    assert bank_stats["target_plan_invalidations"] == {}
+
+
 def test_generation_flag_parity_double_runs_each_verify(monkeypatch):
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "parity")
 
@@ -1132,12 +1176,18 @@ def test_profiles_accept_compiled_verify_env_keys():
 
     assert "MTPLX_COMPILED_VERIFY" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
     assert "MTPLX_COMPILED_VERIFY_MAX_LEN" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
+    assert "MTPLX_COMPILED_VERIFY_TARGET_ROWS" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
     normalized = normalize_runtime_env_overrides(
-        {"MTPLX_COMPILED_VERIFY": "parity", "MTPLX_COMPILED_VERIFY_MAX_LEN": 6}
+        {
+            "MTPLX_COMPILED_VERIFY": "parity",
+            "MTPLX_COMPILED_VERIFY_MAX_LEN": 8,
+            "MTPLX_COMPILED_VERIFY_TARGET_ROWS": 4,
+        }
     )
     assert normalized == {
         "MTPLX_COMPILED_VERIFY": "parity",
-        "MTPLX_COMPILED_VERIFY_MAX_LEN": "6",
+        "MTPLX_COMPILED_VERIFY_MAX_LEN": "8",
+        "MTPLX_COMPILED_VERIFY_TARGET_ROWS": "4",
     }
     # parity2 is a VALUE of the exact-match MTPLX_COMPILED_VERIFY key, so the
     # existing key list already carries it through contract overrides.
@@ -1465,6 +1515,248 @@ def test_donation_snapshot_views_survive_later_calls(monkeypatch):
 
     assert np.array_equal(np.array(snap_keys), expected_keys)
     assert np.array_equal(np.array(snap_vals), expected_vals)
+
+
+# -- Issue #63 fixed Rows=4 target verifier ---------------------------------
+
+
+def test_fixed_rows4_target_plan_tracks_capture_commit_without_offset_resync(
+    monkeypatch,
+):
+    """After one fail-closed setup, R4 replays must not materialize offsets.
+
+    The explicit commit call is the ownership boundary: it tells the bank how
+    many of the four verified rows remain authoritative, so the next dispatch
+    can prove its capacity/bucket from host-tracked offsets instead of calling
+    ``TensorOffsetKVCache.size()`` on every full-attention layer.
+    """
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, target_rows=4)
+    cache = _prefill(rt, [0, 1, 2])
+    rows4_a = mx.array([[3, 4, 0, 1]])
+    rows4_b = mx.array([[1, 2, 3, 4]])
+
+    _logits, _hidden, captures = bank.forward_ar_capture(rows4_a, cache=cache)
+    assert bank.commit_captured_prefix(
+        cache,
+        captures,
+        keep_tokens=2,
+        verified_tokens=4,
+    )
+    assert int(cache[1].size()) == 5
+
+    def unexpected_offset_sync():
+        raise AssertionError("fixed R4 replay materialized a cache offset")
+
+    cache[1].size = unexpected_offset_sync
+    _logits, _hidden, captures = bank.forward_ar_capture(rows4_b, cache=cache)
+    assert bank.commit_captured_prefix(
+        cache,
+        captures,
+        keep_tokens=4,
+        verified_tokens=4,
+    )
+
+    stats = bank.to_dict()
+    assert stats["target_rows"] == 4
+    assert stats["target_forward_calls"] == 2
+    assert stats["target_plan_builds"] == 1
+    assert stats["target_plan_hits"] == 1
+    assert stats["target_commit_calls"] == 2
+    assert stats["offset_syncs"] == 1
+    assert stats["target_offset_syncs"] == 1
+    assert stats["target_offset_syncs_avoided"] >= 1
+    assert stats["fallback_calls"] == 0
+    assert stats["retrace_calls"] == 0
+
+
+def test_fixed_rows4_target_plan_fails_closed_when_commit_is_not_reported(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, target_rows=4)
+    cache = _prefill(rt, [0, 1, 2])
+    rows4 = mx.array([[3, 4, 0, 1]])
+
+    bank.forward_ar_capture(rows4, cache=cache)
+    # Deliberately omit bank.commit_captured_prefix(). The next R4 call must
+    # rebuild from authoritative cache state, never trust the stale host plan.
+    bank.forward_ar_capture(rows4, cache=cache)
+
+    stats = bank.to_dict()
+    assert stats["target_plan_hits"] == 0
+    assert stats["target_plan_invalidations"]["unfinalized_window"] == 1
+    assert stats["compiled_calls"] == 2
+    assert stats["fallback_calls"] == 0
+
+
+def test_fixed_rows4_target_plan_tracks_external_lazy_bonus_cache_advance(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, target_rows=4)
+    cache = _prefill(rt, [0, 1, 2])
+    rows4 = mx.array([[3, 4, 0, 1]])
+
+    bank.forward_ar_capture(rows4, cache=cache)
+    assert bank.finalize_verified_window(cache, verified_tokens=4)
+    # K4 lazy-bonus mode verifies four rows, then eagerly commits its final
+    # draft token outside the compiled bank before the next target window.
+    rt.forward_ar_capture(mx.array([[2]]), cache=cache, return_hidden=True)
+    assert bank.note_external_cache_advance(cache, tokens=1)
+
+    def unexpected_offset_sync():
+        raise AssertionError("external cache advance invalidated fixed R4 proof")
+
+    cache[1].size = unexpected_offset_sync
+    _logits, _hidden, captures = bank.forward_ar_capture(rows4, cache=cache)
+    assert bank.commit_captured_prefix(
+        cache,
+        captures,
+        keep_tokens=2,
+        verified_tokens=4,
+    )
+    stats = bank.to_dict()
+    assert stats["target_external_cache_advances"] == 1
+    assert stats["target_plan_hits"] == 1
+    assert stats["target_plan_invalidations"] == {}
+
+
+def test_fixed_rows4_target_matches_eager_logits_hidden_captures_and_state(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    windows = (
+        [3, 4, 0, 1],
+        [1, 2, 3, 4],
+        [4, 4, 1, 0],
+        [0, 2, 4, 3],
+    )
+    keep_plan = (4, 2, 1, 3)
+
+    def run(compiled: bool):
+        rt = ToyHybridRuntime(seed=17)
+        cache = _prefill(rt, [0, 1, 2])
+        bank = CompiledVerifyBank(rt, target_rows=4) if compiled else None
+        if not compiled:
+            promoted, failures = promote_kv_cache_offsets(
+                cache,
+                reserve_tokens=64,
+                initial_reserve_tokens=64,
+            )
+            assert promoted == 1 and failures == {}
+        observations = []
+        for window, keep in zip(windows, keep_plan):
+            ids = mx.array([window])
+            if bank is None:
+                logits, hidden, captures = rt.forward_ar_capture(
+                    ids,
+                    cache=cache,
+                    return_hidden=True,
+                )
+                committed = commit_captured_prefix(
+                    cache,
+                    captures,
+                    keep_tokens=keep,
+                    verified_tokens=4,
+                )
+            else:
+                logits, hidden, captures = bank.forward_ar_capture(ids, cache=cache)
+                committed = bank.commit_captured_prefix(
+                    cache,
+                    captures,
+                    keep_tokens=keep,
+                    verified_tokens=4,
+                )
+            assert committed
+            offset = int(cache[1].size())
+            observations.append(
+                {
+                    "logits": np.array(logits),
+                    "hidden": np.array(hidden),
+                    "conv_states": np.array(captures[0]["conv_states"]),
+                    "states": np.array(captures[0]["states"]),
+                    "gdn_conv": np.array(cache[0].cache[0]),
+                    "gdn_state": np.array(cache[0].cache[1]),
+                    "offset": offset,
+                    "kv_prefix": np.array(cache[1].cache[0][..., :offset, :]),
+                    "v_prefix": np.array(cache[1].cache[1][..., :offset, :]),
+                }
+            )
+        return bank, observations
+
+    bank, candidate = run(compiled=True)
+    _unused, reference = run(compiled=False)
+
+    for step, (got, want) in enumerate(zip(candidate, reference)):
+        assert got["offset"] == want["offset"], f"step {step}: offset"
+        for name in (
+            "logits",
+            "hidden",
+            "conv_states",
+            "states",
+            "gdn_conv",
+            "gdn_state",
+            "kv_prefix",
+            "v_prefix",
+        ):
+            assert np.array_equal(got[name], want[name]), f"step {step}: {name}"
+    assert bank is not None
+    assert bank.stats["target_plan_hits"] == 3
+    assert bank.stats["fallback_calls"] == 0
+    assert bank.stats["retrace_calls"] == 0
+
+
+def test_compiled_target_supports_rows2_through_rows8(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, target_rows=4)
+    cache = _prefill(rt, [0, 1, 2])
+
+    for rows in range(2, 9):
+        ids = mx.array([[index % rt.V for index in range(rows)]])
+        _logits, _hidden, captures = bank.forward_ar_capture(ids, cache=cache)
+        assert bank.commit_captured_prefix(
+            cache,
+            captures,
+            keep_tokens=rows,
+            verified_tokens=rows,
+        )
+
+    stats = bank.to_dict()
+    assert stats["max_verify_len"] == 8
+    assert stats["compiled_calls"] == 7
+    assert stats["fallback_calls"] == 0
+    assert {key.split(":", 1)[0] for key in stats["compiled_keys"]} == {
+        "m2",
+        "m3",
+        "m4",
+        "m5",
+        "m6",
+        "m7",
+        "m8",
+    }
+
+
+def test_shared_trace_telemetry_distinguishes_initial_trace_from_retrace(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_SHARED_TRACES", "0")
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, target_rows=4)
+    cache = _prefill(rt, [0, 1, 2])
+    rows4 = mx.array([[3, 4, 0, 1]])
+
+    for _ in range(2):
+        _logits, _hidden, captures = bank.forward_ar_capture(rows4, cache=cache)
+        assert bank.commit_captured_prefix(
+            cache,
+            captures,
+            keep_tokens=4,
+            verified_tokens=4,
+        )
+
+    stats = bank.to_dict()
+    assert stats["traces"] == 1
+    assert stats["initial_trace_calls"] == 1
+    assert stats["retrace_calls"] == 0
 
 
 def test_extended_warmup_env_and_packed_prewarm(monkeypatch):

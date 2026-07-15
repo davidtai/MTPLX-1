@@ -49,6 +49,7 @@ from .graphbank import (
     SpecDecodeGraphBank,
     cache_array_tree,
     compiled_verify_mode,
+    compiled_verify_target_rows,
     promote_kv_cache_offsets,
 )
 from .native_mlp import set_native_mlp_context
@@ -5385,6 +5386,7 @@ def generate_mtpk(
     compiled_verify_bank = (
         CompiledVerifyBank(
             rt,
+            target_rows=compiled_verify_target_rows(),
             capture_backend=verify_core_backend,
             parity=_compiled_verify_mode == "parity",
             parity2=_compiled_verify_mode == "parity2",
@@ -7178,6 +7180,11 @@ def generate_mtpk(
                 _add_timing(event, "online_hidden_corrector_update", elapsed_online)
 
         if accepted_count == len(draft_tokens):
+            if compiled_verify_bank is not None:
+                compiled_verify_bank.finalize_verified_window(
+                    cache,
+                    verified_tokens=len(verify_input),
+                )
             committed = [primary] + draft_tokens
             tokens.extend(draft_tokens)
             if _mtp_history_uses_committed_cache(mtp_history_policy):
@@ -7202,6 +7209,11 @@ def generate_mtpk(
                 )
                 started_bonus_commit_eval = time.perf_counter()
                 _eval(bonus_commit_logits, bonus_commit_hidden)
+                if compiled_verify_bank is not None:
+                    compiled_verify_bank.note_external_cache_advance(
+                        cache,
+                        tokens=1,
+                    )
                 elapsed_bonus_commit_eval = (
                     time.perf_counter() - started_bonus_commit_eval
                 )
@@ -7376,15 +7388,28 @@ def generate_mtpk(
 
             started_commit = time.perf_counter()
             commit_detach_stats = {"arrays": 0, "bytes": 0}
-            committed_from_capture = commit_captured_prefix(
-                cache,
-                captures,
-                keep_tokens=committed_prefix_len,
-                verified_tokens=len(verify_input),
-                detach_components=capture_commit_detach_components,
-                detach_mode=capture_commit_detach_mode,
-                detach_stats=commit_detach_stats,
-            )
+            if compiled_verify_bank is not None:
+                committed_from_capture = (
+                    compiled_verify_bank.commit_captured_prefix(
+                        cache,
+                        captures,
+                        keep_tokens=committed_prefix_len,
+                        verified_tokens=len(verify_input),
+                        detach_components=capture_commit_detach_components,
+                        detach_mode=capture_commit_detach_mode,
+                        detach_stats=commit_detach_stats,
+                    )
+                )
+            else:
+                committed_from_capture = commit_captured_prefix(
+                    cache,
+                    captures,
+                    keep_tokens=committed_prefix_len,
+                    verified_tokens=len(verify_input),
+                    detach_components=capture_commit_detach_components,
+                    detach_mode=capture_commit_detach_mode,
+                    detach_stats=commit_detach_stats,
+                )
             elapsed_commit = time.perf_counter() - started_commit
             capture_commit_time += elapsed_commit
             if int(commit_detach_stats.get("arrays", 0)) > 0:

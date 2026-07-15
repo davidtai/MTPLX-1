@@ -378,7 +378,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.models is None
     assert args.contexts == (1024, 2048)
     assert args.output_tokens == 128
-    assert args.hy3_depths == (1, 2, 3, 4, 5, 6)
+    assert args.hy3_depths == (1, 2, 3, 4, 5, 6, 7)
     assert args.glm52_depths == (1, 2, 3, 4, 5)
     assert args.memory_limit == "112GiB"
     assert args.runtime_reserve == "12GiB"
@@ -541,6 +541,8 @@ def test_compiled_verify_records_candidate_and_forwards_diagnostic_inputs(
             "calls": 4,
             "compiled_calls": 4,
             "fallback_calls": 0,
+            "traces": 0,
+            "retrace_calls": 0,
             "fallback_reasons": {},
             "mode": "on",
         }
@@ -570,6 +572,143 @@ def test_compiled_verify_records_candidate_and_forwards_diagnostic_inputs(
     assert all(call[2]["draft_observer"] is observer for call in calls.mtpk)
     d1 = payload["models"][0]["observations"][1]
     assert d1["compiled_verify"] == evidence["compiled_verify"]
+
+
+def test_compiled_verify_rejects_retained_retrace_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "compiled_verify": {
+            "calls": 4,
+            "compiled_calls": 4,
+            "fallback_calls": 0,
+            "traces": 0,
+            "retrace_calls": 1,
+            "fallback_reasons": {},
+            "mode": "on",
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="compiled verifier retraced during retained measurement",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            compiled_verify_mode="on",
+            apis=apis,
+        )
+
+
+def test_compiled_verify_requires_prewarmed_retained_shape(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "compiled_verify": {
+            "calls": 4,
+            "compiled_calls": 4,
+            "fallback_calls": 0,
+            "traces": 1,
+            "retrace_calls": 0,
+            "fallback_reasons": {},
+            "mode": "on",
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="compiled verifier traced during retained measurement",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            compiled_verify_mode="on",
+            apis=apis,
+        )
+
+
+def test_k3_compiled_verify_requires_fixed_rows4_plan_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "compiled_verify": {
+            "calls": 4,
+            "compiled_calls": 4,
+            "fallback_calls": 0,
+            "traces": 0,
+            "retrace_calls": 0,
+            "fallback_reasons": {},
+            "mode": "on",
+            "target_rows": 4,
+            "target_forward_calls": 4,
+            "target_plan_hits": 0,
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="K3 fixed-R4 target plan emitted no replay calls",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            compiled_verify_mode="on",
+            apis=apis,
+        )
+
+
+def test_k3_compiled_verify_accepts_complete_fixed_rows4_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "compiled_verify": {
+            "calls": 40,
+            "compiled_calls": 40,
+            "fallback_calls": 0,
+            "traces": 0,
+            "retrace_calls": 0,
+            "fallback_reasons": {},
+            "mode": "on",
+            "target_rows": 4,
+            "target_forward_calls": 40,
+            "target_plan_hits": 39,
+            "target_commit_calls": 40,
+            "target_offset_syncs_avoided": 312,
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (3,)}],
+        contexts=(1024,),
+        verify_strategy="capture_commit",
+        compiled_verify_mode="on",
+        apis=apis,
+    )
+
+    assert payload["passed"] is True
+    assert payload["models"][0]["observations"][1]["compiled_verify"] == evidence[
+        "compiled_verify"
+    ]
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])
@@ -654,12 +793,12 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
     assert all(kwargs["mtp"] is True for _root, kwargs in calls.loads)
     assert all(kwargs["mtp_precision"] == "bf16" for _root, kwargs in calls.loads)
     assert len(calls.ar) == 8
-    assert len(calls.mtpk) == 44
-    assert calls.peak_resets == 52
-    assert calls.synchronizations >= 52
-    assert [len(model["observations"]) for model in payload["models"]] == [14, 12]
+    assert len(calls.mtpk) == 48
+    assert calls.peak_resets == 56
+    assert calls.synchronizations >= 56
+    assert [len(model["observations"]) for model in payload["models"]] == [16, 12]
     assert [model["discarded_warmup_count"] for model in payload["models"]] == [
-        14,
+        16,
         12,
     ]
     assert all(
@@ -684,7 +823,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
             row for row in payload["models"] if row["model_key"] == runtime.model_key
         )
         assert runtime.expert_streaming.reset_calls == 2 * len(model["observations"])
-        cells = 7 if runtime.model_key == "hy3-expert-q2" else 6
+        cells = 8 if runtime.model_key == "hy3-expert-q2" else 6
         assert runtime.admissions == [
             tokens
             for context in (1024, 2048)
@@ -706,7 +845,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         assert kwargs["repetition_stop"] is False
         assert kwargs["loop_guard"] is False
     assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.ar) == 4
-    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 22
+    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 24
 
     assert len(calls.prompt_builds) == 4
     assert all(

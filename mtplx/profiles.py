@@ -46,6 +46,7 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # Compiled-verify commit-first donation (speed-war Lane A2): same
         # A/B requirement — an explicit env must beat the profile default.
         "MTPLX_COMPILED_VERIFY_DONATION",
+        "MTPLX_COMPILED_VERIFY_TARGET_ROWS",
     }
 )
 
@@ -120,6 +121,7 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_CLEAR_CACHE_EVERY",
         "MTPLX_COMPILED_VERIFY",
         "MTPLX_COMPILED_VERIFY_MAX_LEN",
+        "MTPLX_COMPILED_VERIFY_TARGET_ROWS",
     }
 )
 

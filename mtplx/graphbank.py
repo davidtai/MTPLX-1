@@ -741,6 +741,26 @@ _PREWARM_DONE = False
 _SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
 
 
+@dataclass
+class _FixedTargetPlan:
+    """Host-side ownership proof for one repeatedly dispatched verify shape.
+
+    ``offsets`` mirrors the authoritative tensor offsets without reading them
+    back on every call.  The plan is usable only while the exact cache
+    containers remain installed and every verified window has been finalized
+    through :meth:`CompiledVerifyBank.commit_captured_prefix`.
+    """
+
+    cache: Any
+    entries: tuple[tuple[int, str, int, Any], ...]
+    full_attention_entries: tuple[tuple[int, Any], ...]
+    offsets: dict[int, int]
+    window_open: bool = False
+
+
+_FIXED_TARGET_MISS = object()
+
+
 def _prewarm_enabled() -> bool:
     raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_PREWARM", "1")).strip().lower()
     return raw not in {"0", "false", "off", ""}
@@ -761,6 +781,19 @@ def compiled_verify_mode() -> str:
     if raw in {"parity", "parity2"}:
         return raw
     return "on"
+
+
+def compiled_verify_target_rows() -> int | None:
+    """Fixed-shape host specialization target (default M=4 / K=3)."""
+
+    raw = (os.environ.get("MTPLX_COMPILED_VERIFY_TARGET_ROWS") or "4").strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return None
+    try:
+        rows = int(raw)
+    except ValueError:
+        return 4
+    return rows if 2 <= rows <= 8 else 4
 
 
 def _next_pow2(value: int) -> int:
@@ -1104,6 +1137,8 @@ class CompiledVerifyBank:
         runtime: Any,
         *,
         max_verify_len: int | None = None,
+        target_rows: int | None = 4,
+        growth_reserve_tokens: int | None = None,
         capture_backend: str | None = None,
         parity: bool = False,
         parity2: bool = False,
@@ -1111,8 +1146,20 @@ class CompiledVerifyBank:
         self.runtime = runtime
         if max_verify_len is None:
             raw = os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN", "").strip()
-            max_verify_len = int(raw) if raw else 6
+            max_verify_len = int(raw) if raw else 8
         self.max_verify_len = int(max_verify_len)
+        self.target_rows = None if target_rows is None else int(target_rows)
+        if self.target_rows is not None and not (
+            2 <= self.target_rows <= self.max_verify_len
+        ):
+            raise ValueError(
+                "CompiledVerifyBank target_rows must be within [2, max_verify_len]"
+            )
+        self.growth_reserve_tokens = int(
+            _compiled_verify_growth_reserve()
+            if growth_reserve_tokens is None
+            else max(0, int(growth_reserve_tokens))
+        )
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self.parity = bool(parity)
         self.parity2 = bool(parity2)
@@ -1142,6 +1189,7 @@ class CompiledVerifyBank:
         # long chat generations pay zero retraces and zero padded-mask tax.
         self._growth_demoted = False
         self._dense_capacity_grant: dict[int, int] | None = None
+        self._target_plan: _FixedTargetPlan | None = None
         self.stats: dict[str, Any] = {
             "calls": 0,
             "compiled_calls": 0,
@@ -1151,11 +1199,26 @@ class CompiledVerifyBank:
             "promoted": 0,
             "demotions": 0,
             "traces": 0,
+            "initial_trace_calls": 0,
+            "retrace_calls": 0,
             "parity_checks": 0,
             "parity_failures": 0,
             "parity2_calls": 0,
             "parity2_divergent_calls": 0,
             "parity2_first_divergence": None,
+            "target_forward_calls": 0,
+            "target_plan_builds": 0,
+            "target_plan_hits": 0,
+            "target_plan_invalidations": {},
+            "target_commit_calls": 0,
+            "target_full_commit_noops": 0,
+            "target_external_cache_advances": 0,
+            "target_offset_syncs": 0,
+            "target_offset_syncs_avoided": 0,
+            "offset_syncs": 0,
+            "target_plan_build_time_s": 0.0,
+            "target_dispatch_time_s": 0.0,
+            "target_commit_time_s": 0.0,
         }
 
     # -- public API ---------------------------------------------------------
@@ -1200,6 +1263,27 @@ class CompiledVerifyBank:
             except Exception:
                 pass
         self.stats["calls"] += 1
+        shape = getattr(input_ids, "shape", None)
+        is_target_shape = bool(
+            self.target_rows is not None
+            and shape is not None
+            and len(shape) == 2
+            and int(shape[0]) == 1
+            and int(shape[1]) == self.target_rows
+        )
+        if self._target_plan is not None and not is_target_shape:
+            self._invalidate_target_plan("non_target_rows")
+        if is_target_shape:
+            self.stats["target_forward_calls"] += 1
+            if self._target_plan is not None and not self.parity and not self.parity2:
+                prepared = self._forward_fixed_target(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                )
+                if prepared is not _FIXED_TARGET_MISS:
+                    return prepared
         reason = self._fallback_reason(input_ids, cache, return_hidden)
         if reason is not None:
             return self._fallback(
@@ -1210,8 +1294,15 @@ class CompiledVerifyBank:
                 reason=reason,
             )
         length = _decode_length(input_ids)
+        target_offsets_before = (
+            self._sync_target_offsets(cache) if is_target_shape else None
+        )
         try:
-            bucket = self._resolve_bucket(cache, length)
+            bucket = self._resolve_bucket(
+                cache,
+                length,
+                known_offsets=target_offsets_before,
+            )
             if bucket is None:
                 return self._fallback(
                     input_ids,
@@ -1348,6 +1439,12 @@ class CompiledVerifyBank:
                 compiled_state_out=state_out,
             )
         self._mirror_commit(cache, state_out)
+        if is_target_shape and not self.parity and not self.parity2:
+            self._build_target_plan(
+                cache,
+                offsets_before=target_offsets_before,
+                verified_tokens=length,
+            )
         if donate:
             # A2.1 commit-first ownership handoff: the real cache is already
             # rebound to the output leaves, so dropping the dispatcher's
@@ -1368,6 +1465,119 @@ class CompiledVerifyBank:
             self._held_state_refs.clear()
             mx.async_eval(*outputs)
         return logits, hidden, captures
+
+    def finalize_verified_window(self, cache: Any, *, verified_tokens: int) -> bool:
+        """Close an all-accepted target window without rewriting cache state."""
+
+        started = time.perf_counter()
+        plan = self._target_plan
+        if (
+            plan is None
+            or not plan.window_open
+            or int(verified_tokens) != self.target_rows
+        ):
+            return False
+        if not self._target_plan_matches(plan, cache):
+            self._invalidate_target_plan("finalize_container_change")
+            return False
+        self.stats["target_commit_calls"] += 1
+        self.stats["target_full_commit_noops"] += 1
+        plan.window_open = False
+        self.stats["target_commit_time_s"] += time.perf_counter() - started
+        return True
+
+    def note_external_cache_advance(self, cache: Any, *, tokens: int) -> bool:
+        """Advance the R4 host proof after an authoritative eager cache write.
+
+        Lazy-bonus verification can commit one token through ``forward_ar``
+        after the compiled verify window has been finalized.  That write is
+        outside this bank, so its tensor offsets must be reflected explicitly
+        before the next fixed-shape replay.  Any ambiguous ownership state
+        invalidates the plan and sends the next call through the ordinary
+        synchronized path.
+        """
+
+        plan = self._target_plan
+        advance = int(tokens)
+        if plan is None or advance <= 0:
+            return False
+        if plan.window_open:
+            self._invalidate_target_plan("external_advance_before_finalize")
+            return False
+        if not self._target_plan_matches(plan, cache):
+            self._invalidate_target_plan("external_advance_container_change")
+            return False
+        for idx in plan.offsets:
+            plan.offsets[idx] = int(plan.offsets[idx]) + advance
+        self.stats["target_external_cache_advances"] += 1
+        return True
+
+    def commit_captured_prefix(
+        self,
+        cache: list[Any],
+        captures: dict[int, dict[str, mx.array]],
+        keep_tokens: int,
+        verified_tokens: int,
+        *,
+        detach_components: set[str] | None = None,
+        detach_mode: str = "selected_slice_contiguous_eval",
+        detach_stats: dict[str, int] | None = None,
+    ) -> bool:
+        """Finalize one capture/commit window and update the R4 host proof.
+
+        The generic capture helper remains authoritative for partial commits.
+        A full commit needs no recurrent-state rewrite: the compiled mirror
+        commit already installed the final captured state.  Reporting even
+        that no-op is required before the fixed path may reuse host offsets.
+        """
+
+        from .gdn_capture import commit_captured_prefix
+
+        started = time.perf_counter()
+        plan = self._target_plan
+        target_window = bool(
+            plan is not None
+            and plan.window_open
+            and int(verified_tokens) == self.target_rows
+        )
+        if target_window and not self._target_plan_matches(plan, cache):
+            self._invalidate_target_plan("commit_container_change")
+            plan = None
+            target_window = False
+        if target_window:
+            self.stats["target_commit_calls"] += 1
+        try:
+            if (
+                target_window
+                and int(keep_tokens) == int(verified_tokens)
+                and not detach_components
+            ):
+                committed = True
+                self.stats["target_full_commit_noops"] += 1
+            else:
+                committed = commit_captured_prefix(
+                    cache,
+                    captures,
+                    keep_tokens=keep_tokens,
+                    verified_tokens=verified_tokens,
+                    detach_components=detach_components,
+                    detach_mode=detach_mode,
+                    detach_stats=detach_stats,
+                )
+        except Exception:
+            if target_window:
+                self._invalidate_target_plan("commit_exception")
+            raise
+        if target_window and plan is not None:
+            if not committed:
+                self._invalidate_target_plan("commit_failed")
+            else:
+                trim_tokens = int(verified_tokens) - int(keep_tokens)
+                for idx in plan.offsets:
+                    plan.offsets[idx] = max(0, int(plan.offsets[idx]) - trim_tokens)
+                plan.window_open = False
+        self.stats["target_commit_time_s"] += time.perf_counter() - started
+        return bool(committed)
 
     def prewarm_ladder(
         self,
@@ -1509,12 +1719,16 @@ class CompiledVerifyBank:
             self._shadow_signature = None
             self._spec = None
             self._compiled.clear()
+            self._target_plan = None
         return count
 
     def to_dict(self) -> dict[str, Any]:
         data = dict(self.stats)
         data["fallback_reasons"] = dict(self.stats["fallback_reasons"])
         data["buckets"] = dict(self.stats["buckets"])
+        data["target_plan_invalidations"] = dict(
+            self.stats["target_plan_invalidations"]
+        )
         first_divergence = self.stats.get("parity2_first_divergence")
         data["parity2_first_divergence"] = (
             dict(first_divergence) if isinstance(first_divergence, dict) else None
@@ -1524,6 +1738,8 @@ class CompiledVerifyBank:
         else:
             data["mode"] = "parity" if self.parity else "on"
         data["max_verify_len"] = self.max_verify_len
+        data["target_rows"] = self.target_rows
+        data["growth_reserve_tokens"] = self.growth_reserve_tokens
         data["capture_backend"] = self.capture_backend
         data["permanent_eager"] = self.permanent_eager
         data["compiled_entry_count"] = len(self._compiled)
@@ -1531,7 +1747,225 @@ class CompiledVerifyBank:
             f"m{length}:{variant or 'default'}:b{bucket}"
             for length, variant, bucket in sorted(self._compiled)
         ]
+        data["target_plan_active"] = self._target_plan is not None
+        data["target_window_open"] = bool(
+            self._target_plan is not None and self._target_plan.window_open
+        )
         return data
+
+    # -- fixed target fast path ---------------------------------------------
+
+    def _target_plan_matches(self, plan: _FixedTargetPlan, cache: Any) -> bool:
+        if cache is not plan.cache:
+            return False
+        try:
+            if len(cache) < len(plan.entries):
+                return False
+            return all(cache[idx] is entry for idx, _kind, _n, entry in plan.entries)
+        except (IndexError, TypeError):
+            return False
+
+    def _invalidate_target_plan(self, reason: str) -> None:
+        if self._target_plan is None:
+            return
+        reasons = self.stats["target_plan_invalidations"]
+        reasons[reason] = int(reasons.get(reason, 0)) + 1
+        self._target_plan = None
+
+    def _sync_target_offsets(self, cache: Any) -> dict[int, int] | None:
+        offsets: dict[int, int] = {}
+        try:
+            for idx, kind, _n in self._spec or []:
+                if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                    continue
+                offsets[idx] = int(cache[idx].size())
+                self.stats["target_offset_syncs"] += 1
+                self.stats["offset_syncs"] += 1
+        except Exception:
+            return None
+        return offsets
+
+    def _build_target_plan(
+        self,
+        cache: Any,
+        *,
+        offsets_before: dict[int, int] | None,
+        verified_tokens: int,
+    ) -> None:
+        started = time.perf_counter()
+        entries = tuple(
+            (idx, kind, n_leaves, cache[idx])
+            for idx, kind, n_leaves in self._spec or []
+        )
+        full_attention_entries = tuple(
+            (idx, entry)
+            for idx, kind, _n, entry in entries
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN
+        )
+        if offsets_before is None or set(offsets_before) != {
+            idx for idx, _entry in full_attention_entries
+        }:
+            self._target_plan = None
+            reasons = self.stats["target_plan_invalidations"]
+            reasons["initial_offset_sync"] = int(
+                reasons.get("initial_offset_sync", 0)
+            ) + 1
+            return
+        offsets = {
+            idx: int(offset) + int(verified_tokens)
+            for idx, offset in offsets_before.items()
+        }
+        self._target_plan = _FixedTargetPlan(
+            cache=cache,
+            entries=entries,
+            full_attention_entries=full_attention_entries,
+            offsets=offsets,
+            window_open=True,
+        )
+        self.stats["target_plan_builds"] += 1
+        self.stats["target_plan_build_time_s"] += time.perf_counter() - started
+
+    def _resolve_target_bucket(self, plan: _FixedTargetPlan, length: int) -> int | None:
+        max_needed = 0
+        min_paged_capacity: int | None = None
+        for idx, entry in plan.full_attention_entries:
+            needed = int(plan.offsets[idx]) + int(length)
+            max_needed = max(max_needed, needed)
+            if hasattr(entry, "capacity"):
+                capacity = int(entry.capacity)
+                min_paged_capacity = (
+                    capacity
+                    if min_paged_capacity is None
+                    else min(min_paged_capacity, capacity)
+                )
+            else:
+                keys = entry.cache[0]
+                if keys is None or needed > int(keys.shape[2]):
+                    return None
+        self._last_context_estimate = max_needed
+        if min_paged_capacity is None:
+            return 0
+        if max_needed > min_paged_capacity:
+            return None
+        bucket = min(min_paged_capacity, _next_pow2(max_needed + 512))
+        if max_needed > bucket:
+            bucket = min_paged_capacity
+        return bucket
+
+    def _read_target_state_leaves(self, plan: _FixedTargetPlan) -> list[Any] | None:
+        leaves: list[Any] = []
+        for _idx, kind, _n, entry in plan.entries:
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                layer_leaves = (entry.cache[0], entry.cache[1], entry.cache[2])
+            else:
+                layer_leaves = (entry.cache[0], entry.cache[1])
+            if any(leaf is None for leaf in layer_leaves):
+                return None
+            leaves.extend(layer_leaves)
+        return leaves
+
+    def _forward_fixed_target(
+        self,
+        input_ids,
+        *,
+        cache: Any,
+        return_hidden: bool,
+        hidden_variant: str | None,
+    ):
+        """Replay the prepared M=4 graph without tensor-offset readbacks."""
+
+        started = time.perf_counter()
+        plan = self._target_plan
+        if plan is None:
+            return _FIXED_TARGET_MISS
+        if plan.window_open:
+            self._invalidate_target_plan("unfinalized_window")
+            return _FIXED_TARGET_MISS
+        if not self._target_plan_matches(plan, cache):
+            self._invalidate_target_plan("container_change")
+            return _FIXED_TARGET_MISS
+        if (
+            self.permanent_eager
+            or not return_hidden
+            or self._growth_demoted
+            or _owned_state_env_active("MTPLX_OWNED_ATTN_KV")
+            or _owned_state_env_active("MTPLX_OWNED_RECURRENT_STATE")
+        ):
+            self._invalidate_target_plan("precondition_change")
+            return _FIXED_TARGET_MISS
+        length = int(self.target_rows or 0)
+        bucket = self._resolve_target_bucket(plan, length)
+        if bucket is None:
+            self._invalidate_target_plan("capacity_change")
+            return _FIXED_TARGET_MISS
+        max_ctx = _compiled_verify_max_context()
+        if max_ctx and getattr(self, "_last_context_estimate", 0) > max_ctx:
+            self._invalidate_target_plan("context_above_threshold")
+            return _FIXED_TARGET_MISS
+        if self._paged_ineligibility(cache, length, bucket) is not None:
+            self._invalidate_target_plan("paged_kernel_ineligible")
+            return _FIXED_TARGET_MISS
+        if self._shadow is None:
+            self._invalidate_target_plan("missing_shadow")
+            return _FIXED_TARGET_MISS
+
+        try:
+            self._apply_bucket(cache, bucket)
+            boundary = _compiled_verify_boundary()
+            donate = (
+                _compiled_verify_donation_enabled()
+                and boundary in ("both", "post")
+            )
+            if donate:
+                self._clear_shadow_leaf_refs()
+            key = (length, str(hidden_variant or ""), int(bucket))
+            fn = self._compiled.get(key)
+            if fn is None:
+                fn = self._shared_or_new_verify_step(key, length, hidden_variant)
+                self._compiled[key] = fn
+            state_in = self._read_target_state_leaves(plan)
+            if state_in is None:
+                self._invalidate_target_plan("empty_state_leaf")
+                return _FIXED_TARGET_MISS
+            if boundary in ("both", "pre"):
+                mx.async_eval(*state_in)
+            outputs = fn(input_ids, *state_in)
+            logits, hidden, captures_flat, state_out = self._unpack_outputs(outputs)
+            if not donate and boundary in ("both", "post"):
+                mx.async_eval(*outputs)
+                self._held_state_refs.clear()
+            elif not donate:
+                self._held_state_refs.append(state_in)
+                if len(self._held_state_refs) > 3:
+                    self._held_state_refs.pop(0)
+            captures = self._rebuild_captures(captures_flat)
+            self._mirror_commit(cache, state_out)
+            for idx in plan.offsets:
+                plan.offsets[idx] = int(plan.offsets[idx]) + length
+            plan.window_open = True
+            if donate:
+                state_in = None
+                self._held_state_refs.clear()
+                mx.async_eval(*outputs)
+        except Exception:
+            self._exception_failures += 1
+            if self._exception_failures >= 3:
+                self.permanent_eager = True
+            self._invalidate_target_plan("dispatch_exception")
+            return _FIXED_TARGET_MISS
+
+        self._exception_failures = 0
+        self.stats["compiled_calls"] += 1
+        bucket_key = str(int(bucket))
+        self.stats["buckets"][bucket_key] = (
+            self.stats["buckets"].get(bucket_key, 0) + 1
+        )
+        self.stats["target_plan_hits"] += 1
+        self.stats["target_offset_syncs_avoided"] += len(
+            plan.full_attention_entries
+        )
+        self.stats["target_dispatch_time_s"] += time.perf_counter() - started
+        return logits, hidden, captures
 
     # -- dispatch preconditions ----------------------------------------------
 
@@ -1562,12 +1996,16 @@ class CompiledVerifyBank:
             # Cache was demoted back to stock entries when the growth budget
             # tripped; the plain eager path owns the rest of this request.
             return "growth_budget_exhausted"
+        existing_dense_adapters = sum(
+            isinstance(entry, TensorOffsetKVCache) for entry in cache
+        )
         promoted, failures = promote_kv_cache_offsets(
             cache,
             reserve_tokens=length,
             preserve_paged=True,
-            initial_reserve_tokens=max(length, _compiled_verify_growth_reserve()),
+            initial_reserve_tokens=max(length, self.growth_reserve_tokens),
         )
+        self.stats["offset_syncs"] += existing_dense_adapters
         self.stats["promoted"] += promoted
         for entry in cache:
             if isinstance(entry, TensorOffsetKVCache) and entry.growth_after_grant:
@@ -1600,7 +2038,13 @@ class CompiledVerifyBank:
                     return "gdn_meta_unavailable"
         return None
 
-    def _resolve_bucket(self, cache: Any, length: int) -> int | None:
+    def _resolve_bucket(
+        self,
+        cache: Any,
+        length: int,
+        *,
+        known_offsets: dict[int, int] | None = None,
+    ) -> int | None:
         """Static paged-attention ceiling for this call, or None on overflow."""
         max_needed = 0
         min_capacity: int | None = None
@@ -1610,7 +2054,11 @@ class CompiledVerifyBank:
             entry = cache[idx]
             if not hasattr(entry, "capacity"):
                 continue  # dense adapter: grows via ensure_capacity instead
-            offset = int(entry.size())
+            if known_offsets is not None and idx in known_offsets:
+                offset = int(known_offsets[idx])
+            else:
+                offset = int(entry.size())
+                self.stats["offset_syncs"] += 1
             capacity = int(entry.capacity)
             max_needed = max(max_needed, offset + length)
             min_capacity = capacity if min_capacity is None else min(min_capacity, capacity)
@@ -1745,7 +2193,7 @@ class CompiledVerifyBank:
                 host["bank"] = self
                 return fn
             _SHARED_VERIFY_STEPS.pop(global_key, None)
-        host = {"bank": self}
+        host = {"bank": self, "trace_count": 0}
         fn = mx.compile(
             self._make_verify_step(length, hidden_variant, trace_host=host)
         )
@@ -1761,7 +2209,7 @@ class CompiledVerifyBank:
         spec = list(self._spec or [])
         layout = self._capture_layout()
         bank = self
-        static_host = {"bank": self}
+        static_host = {"bank": self, "trace_count": 0}
         host = trace_host if trace_host is not None else static_host
 
         del bank
@@ -1771,6 +2219,12 @@ class CompiledVerifyBank:
             live = host["bank"]
             shadow = live._shadow
             live.stats["traces"] += 1
+            previous_traces = int(host.get("trace_count", 0))
+            host["trace_count"] = previous_traces + 1
+            if previous_traces:
+                live.stats["retrace_calls"] += 1
+            else:
+                live.stats["initial_trace_calls"] += 1
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
             # (1) Re-seed firewall: every shadow leaf is assigned from the
