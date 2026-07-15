@@ -266,9 +266,14 @@ class Hy3HardwareConfig:
     generated_tokens: int = 16
     hold_sample_count: int = 3
     hold_tokens: int = 8
+    hold_warmup_tokens: int | None = None
     prompt_style: str = "coding-agent"
     prompt_tail: str = "State the earliest and latest marker exactly."
     prefill_chunk_size: int = 2048
+
+    def __post_init__(self) -> None:
+        if self.hold_warmup_tokens is None:
+            object.__setattr__(self, "hold_warmup_tokens", self.hold_tokens)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> Hy3HardwareConfig:
@@ -290,6 +295,7 @@ class Hy3HardwareConfig:
             "generated_tokens",
             "hold_sample_count",
             "hold_tokens",
+            "hold_warmup_tokens",
             "prompt_style",
             "prompt_tail",
             "prefill_chunk_size",
@@ -361,6 +367,11 @@ class Hy3HardwareConfig:
             hold_tokens=_exact_int(
                 value.get("hold_tokens", 8), field="hold_tokens", minimum=1
             ),
+            hold_warmup_tokens=_exact_int(
+                value.get("hold_warmup_tokens", value.get("hold_tokens", 8)),
+                field="hold_warmup_tokens",
+                minimum=1,
+            ),
             prompt_style=_string(
                 value.get("prompt_style", "coding-agent"), field="prompt_style"
             ),
@@ -398,8 +409,10 @@ class Hy3HardwareConfig:
 
     @property
     def completion_reserve_tokens(self) -> int:
-        return self.generated_tokens + (
-            (self.hold_sample_count + HOLD_WARMUP_SAMPLES) * self.hold_tokens
+        return (
+            self.generated_tokens
+            + (self.hold_sample_count * self.hold_tokens)
+            + (HOLD_WARMUP_SAMPLES * self.hold_warmup_tokens)
         )
 
 
@@ -1535,6 +1548,9 @@ class MlxHy3HardwareLane:
         }
 
     def sample_hold_performance(self) -> Mapping[str, object]:
+        return self._sample_hold_performance(count=self.config.hold_tokens)
+
+    def _sample_hold_performance(self, *, count: int) -> Mapping[str, object]:
         if self.cache is None:
             raise ArmObservationError("hold sample has no retained Q4 cache")
         before = self.runtime.expert_streaming.snapshot()["cache"]
@@ -1543,7 +1559,7 @@ class MlxHy3HardwareLane:
             self.runtime,
             self.cache,
             self.logits,
-            count=self.config.hold_tokens,
+            count=count,
         )
         after = self.runtime.expert_streaming.snapshot()["cache"]
         hits = int(after["expert_hits"]) - int(before["expert_hits"])
@@ -1574,7 +1590,7 @@ class MlxHy3HardwareLane:
         # settle allocator-cache bookkeeping before the three gated samples.
         # Its tokens are included in completion_reserve_tokens and its physical
         # state remains visible as the hold_warmup timeline point.
-        return self.sample_hold_performance()
+        return self._sample_hold_performance(count=self.config.hold_warmup_tokens)
 
     def reset_q4_context(self) -> None:
         if self.cache is None:

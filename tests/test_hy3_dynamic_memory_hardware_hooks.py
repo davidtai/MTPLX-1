@@ -411,6 +411,7 @@ def test_production_factory_builds_real_static_and_dynamic_hook_loader(
         "generated_tokens": 16,
         "hold_sample_count": 3,
         "hold_tokens": 8,
+        "hold_warmup_tokens": 32,
     }
 
     hooks = create_hooks(config)
@@ -419,7 +420,8 @@ def test_production_factory_builds_real_static_and_dynamic_hook_loader(
     assert isinstance(hooks.config, Hy3HardwareConfig)
     assert hooks.config.allocator_headroom_bytes == 1024**3
     assert hooks.config.model_root == tmp_path / "Hy3-4bit"
-    assert hooks.config.completion_reserve_tokens == 48
+    assert hooks.config.hold_warmup_tokens == 32
+    assert hooks.config.completion_reserve_tokens == 72
     assert hooks.hold_samples == 3
     assert callable(hooks.load_static_lane)
     assert callable(hooks.load_dynamic_lane)
@@ -429,16 +431,19 @@ def test_hold_warmup_exercises_the_full_performance_sample_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lane = object.__new__(MlxHy3HardwareLane)
-    calls: list[str] = []
+    lane.config = SimpleNamespace(hold_tokens=8, hold_warmup_tokens=32)
+    calls: list[int] = []
     monkeypatch.setattr(
         lane,
-        "sample_hold_performance",
-        lambda: calls.append("sample_hold") or {},
+        "_sample_hold_performance",
+        lambda *, count: calls.append(count) or {},
+        raising=False,
     )
 
     lane.stabilize_hold()
+    lane.sample_hold_performance()
 
-    assert calls == ["sample_hold"]
+    assert calls == [32, 8]
 
 
 def test_hardware_config_requires_exact_external_artifact_pins(
@@ -456,6 +461,16 @@ def test_hardware_config_requires_exact_external_artifact_pins(
 
     parsed = Hy3HardwareConfig.from_mapping({**base, "artifact_pins": _artifact_pins()})
     assert parsed.artifact_pins.sidecar_file == "experts.bin"
+    direct = Hy3HardwareConfig(
+        repo_root=tmp_path,
+        model_root=tmp_path / "Hy3-4bit",
+        manifest=tmp_path / "Hy3-4bit" / "expert-manifest.json",
+        model_artifact_id="pipenetwork/Hy3-4bit@revision",
+        artifact_pins=parsed.artifact_pins,
+        hold_tokens=32,
+    )
+    assert direct.hold_warmup_tokens == 32
+    assert direct.completion_reserve_tokens == 144
     for invalid_headroom in (-1, 0, 2 * 1024**3):
         with pytest.raises(ArmObservationError, match="allocator_headroom_bytes"):
             Hy3HardwareConfig.from_mapping(
