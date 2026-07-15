@@ -1,0 +1,350 @@
+{
+  "candidates": [
+    {
+      "activation_mode": "exact",
+      "classification": "exact_e2_candidate",
+      "k_tile": 96,
+      "name": "n64_k96_sg4_exact",
+      "output_n_tile": 64,
+      "promotion_eligible": true,
+      "resources": {
+        "accumulator_floats_per_lane": 16,
+        "avoided_intermediate_bytes": 229376,
+        "expert_order": "router slot 0 through 7",
+        "fused_down_output_bytes": 32768,
+        "outputs_per_simdgroup": 16,
+        "packed_values_per_vector": 32,
+        "packed_weight_vector": "uint2",
+        "stock_down_output_bytes": 262144,
+        "threadgroup_activation_bytes": 192,
+        "threads_per_threadgroup": 128
+      },
+      "simd_groups": 4,
+      "supported": true,
+      "unsupported_reason": null
+    }
+  ],
+  "component_bank": {
+    "component_bytes": {
+      "down_proj.biases": 1572864,
+      "down_proj.scales": 1572864,
+      "down_proj.weight": 12582912,
+      "gate_proj.biases": 1572864,
+      "gate_proj.scales": 1572864,
+      "gate_proj.weight": 12582912,
+      "up_proj.biases": 1572864,
+      "up_proj.scales": 1572864,
+      "up_proj.weight": 12582912
+    },
+    "component_shapes": {
+      "down_proj.biases": [
+        8,
+        4096,
+        24
+      ],
+      "down_proj.scales": [
+        8,
+        4096,
+        24
+      ],
+      "down_proj.weight": [
+        8,
+        4096,
+        96
+      ],
+      "gate_proj.biases": [
+        8,
+        1536,
+        64
+      ],
+      "gate_proj.scales": [
+        8,
+        1536,
+        64
+      ],
+      "gate_proj.weight": [
+        8,
+        1536,
+        256
+      ],
+      "up_proj.biases": [
+        8,
+        1536,
+        64
+      ],
+      "up_proj.scales": [
+        8,
+        1536,
+        64
+      ],
+      "up_proj.weight": [
+        8,
+        1536,
+        256
+      ]
+    },
+    "experts": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "layer": 1,
+    "manifest": "/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2/expert-manifest.json",
+    "manifest_sha256": "086fcce170efdc1b6840bd1f9f1003e4bbebbe812641bd5a1a9c76c562cc4950",
+    "model_key": "hy3-expert-q2",
+    "records": [
+      {
+        "expert": 0,
+        "logical_bytes": 5898240,
+        "record_sha256": "4285e724a491d270b453dd6a4e1bd7ab1b29fadfd93c8043ffa079b611f9097c"
+      },
+      {
+        "expert": 1,
+        "logical_bytes": 5898240,
+        "record_sha256": "ff864a458b6471c91dd2ed15dbb95328d336bd28a5b35330b994215bda1a5d0f"
+      },
+      {
+        "expert": 2,
+        "logical_bytes": 5898240,
+        "record_sha256": "b2e76a29dee45b903c971b2e13823f5c72c7f9d48476dbc693bb8fc8afabdf34"
+      },
+      {
+        "expert": 3,
+        "logical_bytes": 5898240,
+        "record_sha256": "c416e12f1c0d83376dd65fb4e143d6e3156515f91dc3c80a89043a790a6c240a"
+      },
+      {
+        "expert": 4,
+        "logical_bytes": 5898240,
+        "record_sha256": "29a4f6572d60529c8136ae379f64e09926da7898c009664d71dc5d9c1c4121e1"
+      },
+      {
+        "expert": 5,
+        "logical_bytes": 5898240,
+        "record_sha256": "344a7054725bc895ebc0c5251b3dff51c3e0a214281dafecdb5498100b2ee2ab"
+      },
+      {
+        "expert": 6,
+        "logical_bytes": 5898240,
+        "record_sha256": "14da4b824e65e56b997f8117aeeb6b175462d8aa99151098aec630bb08b10bde"
+      },
+      {
+        "expert": 7,
+        "logical_bytes": 5898240,
+        "record_sha256": "e284b7c0dbba240cd0dc3c6d125e0293535c6e37818746718e967077a37320be"
+      }
+    ],
+    "total_component_bytes": 47185920
+  },
+  "contract": {
+    "accumulation_order": "existing router slot order 0 through 7",
+    "e1_output": "BF16 [R,8,1536]",
+    "fast_math_policy": "ablation only; never promotion eligible",
+    "fused_output": "BF16 [R,4096]",
+    "multiply_boundary": "BF16",
+    "per_expert_down_reference": "BF16 [R,8,4096]",
+    "route_weights": "BF16 [R,8]"
+  },
+  "environment": {
+    "device": {
+      "architecture": "applegpu_g17s",
+      "device_name": "Apple M5 Max",
+      "max_buffer_length": 86586540032,
+      "max_recommended_working_set_size": 107374182400,
+      "memory_size": 137438953472,
+      "resource_limit": 499000
+    }
+  },
+  "exclusive_window": {
+    "captured_qwen_loaded": false,
+    "captured_qwen_models": [],
+    "lock_path": "/tmp/mtplx-gpu-exclusive.lock"
+  },
+  "failures": [],
+  "families": [
+    "stock_eager",
+    "fused_e2"
+  ],
+  "geometry": {
+    "hidden_size": 4096,
+    "intermediate_size": 1536,
+    "quantization": {
+      "bits": 2,
+      "group_size": 64,
+      "mode": "affine"
+    },
+    "rows": [
+      4
+    ],
+    "selected_experts_per_token": 8
+  },
+  "issue": 66,
+  "measurement": {
+    "adversarial_fixtures_run_at": "R4 only",
+    "bootstrap_resamples": 100,
+    "correctness_fixtures": [
+      "router_like"
+    ],
+    "paired_interleaved_repeats": 1,
+    "primary_row": "R4 corresponding to K3/M4",
+    "warmups": 1
+  },
+  "model": "/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2",
+  "phase": "screen",
+  "rows": [
+    {
+      "candidates": [
+        {
+          "activation_mode": "exact",
+          "classification": "exact_e2_candidate",
+          "correctness": [
+            {
+              "activation": {
+                "all_finite": true,
+                "array_equal": true,
+                "dtype": "mlx.core.bfloat16",
+                "max_abs_error": 0.0,
+                "normalized_rmse": 0.0,
+                "shape_exact": true
+              },
+              "final": {
+                "all_finite": true,
+                "array_equal": false,
+                "dtype": "mlx.core.bfloat16",
+                "max_abs_error": 0.0625,
+                "normalized_rmse": 0.007892958384637662,
+                "shape_exact": true
+              },
+              "fixture": "router_like",
+              "passes": true,
+              "per_expert": {
+                "all_finite": true,
+                "array_equal": false,
+                "dtype": "mlx.core.bfloat16",
+                "max_abs_error": 0.125,
+                "normalized_rmse": 0.006324787978255345,
+                "shape_exact": true
+              },
+              "route_weights": {
+                "dtype": "mlx.core.bfloat16",
+                "max": 0.2294921875,
+                "min": 0.0115966796875,
+                "row_sum_max_abs_from_one": 0.00048828125
+              }
+            }
+          ],
+          "e2_only_timing": {
+            "candidate": {
+              "max_ms": 6.447625,
+              "mean_ms": 6.447625,
+              "median_ms": 6.447625,
+              "min_ms": 6.447625,
+              "p95_ms": 6.447625,
+              "samples_ms": [
+                6.447625
+              ]
+            },
+            "speedup": {
+              "bootstrap_mean_ratio_95_ci": [
+                0.15163862662608324,
+                0.15163862662608324
+              ],
+              "control_over_candidate_ratio_of_means": 0.15163862662608324,
+              "paired_ratio_mean": 0.15163862662608324,
+              "paired_ratio_median": 0.15163862662608324
+            },
+            "stock": {
+              "max_ms": 0.977709,
+              "mean_ms": 0.977709,
+              "median_ms": 0.977709,
+              "min_ms": 0.977709,
+              "p95_ms": 0.977709,
+              "samples_ms": [
+                0.977709
+              ]
+            }
+          },
+          "full_core_timing": {
+            "candidate": {
+              "max_ms": 2.00675,
+              "mean_ms": 2.00675,
+              "median_ms": 2.00675,
+              "min_ms": 2.00675,
+              "p95_ms": 2.00675,
+              "samples_ms": [
+                2.00675
+              ]
+            },
+            "speedup": {
+              "bootstrap_mean_ratio_95_ci": [
+                0.2960009966363523,
+                0.2960009966363523
+              ],
+              "control_over_candidate_ratio_of_means": 0.2960009966363523,
+              "paired_ratio_mean": 0.2960009966363523,
+              "paired_ratio_median": 0.2960009966363523
+            },
+            "stock": {
+              "max_ms": 0.594,
+              "mean_ms": 0.594,
+              "median_ms": 0.594,
+              "min_ms": 0.594,
+              "p95_ms": 0.594,
+              "samples_ms": [
+                0.594
+              ]
+            }
+          },
+          "k_tile": 96,
+          "name": "n64_k96_sg4_exact",
+          "output_n_tile": 64,
+          "promotion_eligible": true,
+          "resources": {
+            "accumulator_floats_per_lane": 16,
+            "avoided_intermediate_bytes": 229376,
+            "expert_order": "router slot 0 through 7",
+            "fused_down_output_bytes": 32768,
+            "outputs_per_simdgroup": 16,
+            "packed_values_per_vector": 32,
+            "packed_weight_vector": "uint2",
+            "stock_down_output_bytes": 262144,
+            "threadgroup_activation_bytes": 192,
+            "threads_per_threadgroup": 128
+          },
+          "simd_groups": 4,
+          "status": "correctness_pass",
+          "supported": true,
+          "unsupported_reason": null
+        }
+      ],
+      "families": [],
+      "primary_target": true,
+      "rows": 4,
+      "stock": {
+        "dtype": "mlx.core.bfloat16",
+        "final_shape": [
+          4,
+          4096
+        ],
+        "intermediate_bytes": 262144,
+        "per_expert_shape": [
+          4,
+          8,
+          4096
+        ]
+      }
+    }
+  ],
+  "schema": "mtplx-issue66-hy3-q2-e2-full-v1",
+  "scope": "full expert core gate+up -> exact/fast SwiGLU -> Q2 down -> BF16 router-order weighted reduce; benchmark-only, no runtime integration",
+  "source_sha256": {
+    "benchmarks/hy3_expert_e2_full.py": "8d029240a76aedb102245dee165aca6f82cc1ea7de10a1727d536b19bbe7949a",
+    "mtplx/hy3_expert_e2_full.py": "81dece6283c3878296480012182bc1c21f60d8cc0d39eae1f96b0d5d6f208e27",
+    "tests/test_hy3_expert_e2_full.py": "6d185008e3062ddaa963df2fe5058c97cf91d17289c1406640d15556f60aedc8"
+  }
+}
