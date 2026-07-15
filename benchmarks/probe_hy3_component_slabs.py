@@ -19,6 +19,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from mtplx.benchmarks.runners.hy3_dynamic_memory import (  # noqa: E402
+    HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV,
     AllocatorSample,
     ProbeSlab,
     canonical_sha256,
@@ -178,6 +179,16 @@ def build_probe_identity(
     }
 
 
+def _probe_arm_config(runtime_config: Any, plan: Any) -> dict[str, object]:
+    return {
+        "dynamic_memory": True,
+        "attention_runtime_env": dict(HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV),
+        "expert_streaming_config": runtime_config.to_dict(),
+        "planned_persistent_slots": int(plan.persistent_slots),
+        "probe_slab_ids": [0, 1],
+    }
+
+
 def _require_clean_source() -> str:
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
@@ -213,12 +224,7 @@ def run_real_probe(
     manifest = attestation.manifest
     runtime_config = _build_runtime_config(config, arm="dynamic")
     plan = runtime_config.memory_plan(HY3_Q4)
-    arm_config = {
-        "dynamic_memory": True,
-        "expert_streaming_config": runtime_config.to_dict(),
-        "planned_persistent_slots": int(plan.persistent_slots),
-        "probe_slab_ids": [0, 1],
-    }
+    arm_config = _probe_arm_config(runtime_config, plan)
     identity = build_probe_identity(
         model_artifact_id=config.model_artifact_id,
         model_artifact_sha256=attestation.model_artifact_sha256,

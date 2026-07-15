@@ -205,6 +205,26 @@ def test_probe_artifact_attestation_rejects_header_verification_failure(
         module._attest_probe_artifact(config)
 
 
+def test_probe_arm_config_pins_exact_full_history_q4_attention() -> None:
+    module = _load_module()
+    runtime_config = SimpleNamespace(
+        to_dict=lambda: {"expert_slab_slots": 32},
+    )
+
+    arm_config = module._probe_arm_config(
+        runtime_config,
+        SimpleNamespace(persistent_slots=9_792),
+    )
+
+    assert arm_config == {
+        "dynamic_memory": True,
+        "attention_runtime_env": dict(module.HY3_Q4_EXACT_PAGED_ATTENTION_RUNTIME_ENV),
+        "expert_streaming_config": {"expert_slab_slots": 32},
+        "planned_persistent_slots": 9_792,
+        "probe_slab_ids": [0, 1],
+    }
+
+
 def test_probe_identity_hashes_exact_dynamic_and_normalized_configs() -> None:
     module = _load_module()
     arm_config = {
