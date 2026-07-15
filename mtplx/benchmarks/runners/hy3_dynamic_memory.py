@@ -1699,12 +1699,6 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
         raise BenchmarkGateError(
             "observation.metrics.hold_performance_samples needs at least three samples"
         )
-    median_performance = statistics.median(hold_performance)
-    if (max(hold_performance) - min(hold_performance)) / median_performance > 0.10:
-        raise BenchmarkGateError(
-            "observation.metrics.hold_performance_samples are not stable within 10%: "
-            f"{json.dumps(list(hold_performance))}"
-        )
     raw_performance_samples = _sequence(
         raw_metrics["performance_samples"],
         field="observation.metrics.performance_samples",
@@ -1858,6 +1852,28 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
             performance_samples.append(normalized_sample)
     if hold_warmup_sample is None:
         raise BenchmarkGateError("observation.metrics.hold_warmup_sample is missing")
+    median_performance = statistics.median(hold_performance)
+    if (max(hold_performance) - min(hold_performance)) / median_performance > 0.10:
+        diagnostic_fields = (
+            "tokens_per_second",
+            "expert_hit_rate",
+            "ssd_bytes_per_token",
+            "p50_token_latency_ms",
+            "p95_token_latency_ms",
+        )
+        diagnostic = {
+            "hold_warmup": {
+                field: hold_warmup_sample[field] for field in diagnostic_fields
+            },
+            "hold_samples": [
+                {field: sample[field] for field in diagnostic_fields}
+                for sample in performance_samples
+            ],
+        }
+        raise BenchmarkGateError(
+            "observation.metrics.hold_performance_samples are not stable within 10%: "
+            f"{json.dumps(diagnostic, sort_keys=True)}"
+        )
     metrics: dict[str, object] = {
         "generated_tokens": generated_tokens,
         "elapsed_seconds": elapsed,

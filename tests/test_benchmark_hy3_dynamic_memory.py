@@ -810,12 +810,22 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
         validate_campaign_observation(no_perf_samples)
 
     unstable_perf = _observation("dynamic", 4096, 0, tok_s=12.0)
-    unstable_perf["metrics"]["hold_performance_samples"] = [6.0, 10.0, 12.0]
-    with pytest.raises(
-        BenchmarkGateError,
-        match=r"not stable within 10%: \[6\.0, 10\.0, 12\.0\]",
+    unstable_values = [6.0, 10.0, 12.0]
+    unstable_perf["metrics"]["hold_performance_samples"] = unstable_values
+    for sample, value in zip(
+        unstable_perf["metrics"]["performance_samples"],
+        unstable_values,
+        strict=True,
     ):
+        sample["tokens_per_second"] = value
+    with pytest.raises(BenchmarkGateError, match="not stable within 10%") as exc_info:
         validate_campaign_observation(unstable_perf)
+    diagnostic = str(exc_info.value)
+    assert '"hold_warmup"' in diagnostic
+    assert '"hold_samples"' in diagnostic
+    assert '"tokens_per_second": 6.0' in diagnostic
+    assert '"expert_hit_rate": 0.7' in diagnostic
+    assert '"ssd_bytes_per_token": 1024.0' in diagnostic
 
 
 def test_observation_requires_exact_phase_order_and_logical_kv_bounds() -> None:
