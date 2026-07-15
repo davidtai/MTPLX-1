@@ -809,6 +809,14 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     with pytest.raises(BenchmarkGateError, match="hold_performance_samples"):
         validate_campaign_observation(no_perf_samples)
 
+    unstable_perf = _observation("dynamic", 4096, 0, tok_s=12.0)
+    unstable_perf["metrics"]["hold_performance_samples"] = [6.0, 10.0, 12.0]
+    with pytest.raises(
+        BenchmarkGateError,
+        match=r"not stable within 10%: \[6\.0, 10\.0, 12\.0\]",
+    ):
+        validate_campaign_observation(unstable_perf)
+
 
 def test_observation_requires_exact_phase_order_and_logical_kv_bounds() -> None:
     static_reordered = _observation("static", 4096, 0, tok_s=12.0)

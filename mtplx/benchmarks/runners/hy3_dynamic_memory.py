@@ -1702,7 +1702,8 @@ def validate_campaign_observation(value: Mapping[str, object]) -> CampaignObserv
     median_performance = statistics.median(hold_performance)
     if (max(hold_performance) - min(hold_performance)) / median_performance > 0.10:
         raise BenchmarkGateError(
-            "observation.metrics.hold_performance_samples are not stable within 10%"
+            "observation.metrics.hold_performance_samples are not stable within 10%: "
+            f"{json.dumps(list(hold_performance))}"
         )
     raw_performance_samples = _sequence(
         raw_metrics["performance_samples"],
