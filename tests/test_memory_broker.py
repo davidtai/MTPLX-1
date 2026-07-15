@@ -1716,6 +1716,78 @@ def test_kv_release_active_to_cache_gets_zero_credit() -> None:
     assert snapshot.charged_bytes == before_charged
 
 
+def test_kv_release_absorbs_new_allocator_residual_before_crediting_release() -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=40, cache=10),
+        expert_slab_bytes=10,
+    )
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=10,
+        transient_delta_bytes=0,
+        cache_id="cache-a",
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=10)
+
+    snapshot = broker.release_kv(
+        allocation,
+        registered_kv_bytes_after=0,
+        allocator_before=AllocatorMemorySample(65, 0, 65),
+        allocator_after=AllocatorMemorySample(55, 0, 65),
+    )
+
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.allocator_cache_bytes == 15
+    assert snapshot.charged_bytes == 55
+    assert snapshot.failed_closed is False
+
+
+@pytest.mark.parametrize(
+    ("allocator_before_bytes", "expected_hard_failures", "reason"),
+    [
+        (105, 0, "operating target"),
+        (115, 1, "hard ceiling"),
+    ],
+)
+def test_kv_release_latches_pre_release_allocator_limit_violation(
+    allocator_before_bytes: int,
+    expected_hard_failures: int,
+    reason: str,
+) -> None:
+    broker = UnifiedMemoryBroker(
+        budget=MemoryBudget(operating_target_bytes=100, hard_ceiling_bytes=112),
+        initial_snapshot=_snapshot(resident=40, cache=10),
+        expert_slab_bytes=10,
+    )
+    ticket = broker.plan_kv_growth(
+        steady_delta_bytes=10,
+        transient_delta_bytes=0,
+        cache_id="cache-a",
+    )
+    allocation = broker.commit_kv_growth(ticket, allocated_physical_bytes=10)
+
+    snapshot = broker.release_kv(
+        allocation,
+        registered_kv_bytes_after=0,
+        allocator_before=AllocatorMemorySample(
+            allocator_before_bytes,
+            0,
+            allocator_before_bytes,
+        ),
+        allocator_after=AllocatorMemorySample(90, 0, allocator_before_bytes),
+    )
+
+    assert snapshot.kv_physical_bytes == 0
+    assert snapshot.owned_kv_physical_bytes == 0
+    assert snapshot.charged_bytes == 90
+    assert snapshot.admission_failure_count == 1
+    assert snapshot.transaction_failure_count == 1
+    assert snapshot.hard_failure_count == expected_hard_failures
+    assert snapshot.failed_closed is True
+    assert reason in (snapshot.failure_reason or "")
+
+
 def test_kv_release_without_allocator_reduction_retains_charge_and_fails() -> None:
     broker = UnifiedMemoryBroker.standard_hy3()
     _install(broker, _snapshot(resident=50 * GIB))

@@ -1823,15 +1823,25 @@ class UnifiedMemoryBroker:
                 self._fail_without_pending(reason)
                 raise MemoryTelemetryError(reason) from exc
             observed_residual_before = self._allocator_residual_bytes(allocator_before)
-            if observed_residual_before > self._pools.allocator_cache_bytes:
-                reason = (
-                    "allocator telemetry is stale relative to broker cache "
-                    f"during KV release for {owner_id}: observed residual "
-                    f"{observed_residual_before} exceeds charged cache "
-                    f"{self._pools.allocator_cache_bytes}"
+            cache_bytes_before = max(
+                self._pools.allocator_cache_bytes,
+                observed_residual_before,
+            )
+            observed_charged_before = self._pools.classified_bytes + cache_bytes_before
+            pre_release_limit_failure: str | None = None
+            if observed_charged_before >= self._budget.hard_ceiling_bytes:
+                self._hard_failure_count += 1
+                self._admission_failure_count += 1
+                pre_release_limit_failure = (
+                    "allocator telemetry reached the hard ceiling during KV "
+                    f"release for {owner_id}"
                 )
-                self._fail_without_pending(reason)
-                raise MemoryTelemetryError(reason)
+            elif observed_charged_before > self._budget.operating_target_bytes:
+                self._admission_failure_count += 1
+                pre_release_limit_failure = (
+                    "allocator telemetry exceeded the operating target during "
+                    f"KV release for {owner_id}"
+                )
 
             registered_before = self._pools.kv_physical_bytes
             selected_physical_bytes = sum(
@@ -1853,7 +1863,7 @@ class UnifiedMemoryBroker:
             conservative_cache = self._conservative_cache_after_release(
                 classified_bytes_before=registered_before,
                 classified_bytes_after=registered_after,
-                cache_bytes_before=self._pools.allocator_cache_bytes,
+                cache_bytes_before=cache_bytes_before,
                 observed_cache_bytes_after=allocator_after.cache_bytes,
                 allocator_footprint_drop=allocator_drop,
             )
@@ -1912,6 +1922,9 @@ class UnifiedMemoryBroker:
             for allocation in selected:
                 del self._allocations[allocation.allocation_id]
                 self._released_allocation_ids.add(allocation.allocation_id)
+            if pre_release_limit_failure is not None:
+                self._failed_reason = pre_release_limit_failure
+                self._transaction_failure_count += 1
             self._assert_kv_ledger_invariant()
             self._revision += 1
             self._record_hard_failure_if_needed()
