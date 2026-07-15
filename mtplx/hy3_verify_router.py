@@ -31,6 +31,9 @@ def _fresh_stats() -> dict[str, Any]:
         "eligible_calls": 0,
         "compiled_calls": 0,
         "compiled_router_count": 0,
+        "compiled_graph_count": 0,
+        "shared_graph_calls": 0,
+        "per_router_graph_calls": 0,
         "traces": 0,
         "initial_traces": 0,
         "retraces": 0,
@@ -45,12 +48,25 @@ def _fresh_stats() -> dict[str, Any]:
 
 _STATS = _fresh_stats()
 _ROUTER_IDS: set[int] = set()
+_GRAPH_IDS: set[int] = set()
 
 
 @dataclass
 class _CompiledRouter:
-    function: Callable[[mx.array], tuple[mx.array, mx.array]]
+    function: Callable[..., tuple[mx.array, mx.array]]
     host: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Hy3VerifyRouterConfig:
+    """Immutable model-load selector used by every routed-layer hot call."""
+
+    mode: str
+    target_rows: int
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
 
 
 def _mode() -> str:
@@ -95,6 +111,7 @@ def reset_hy3_verify_router_stats() -> None:
     global _STATS
     _STATS = _fresh_stats()
     _ROUTER_IDS.clear()
+    _GRAPH_IDS.clear()
 
 
 def hy3_verify_router_enabled() -> bool:
@@ -104,6 +121,14 @@ def hy3_verify_router_enabled() -> bool:
     if enabled:
         _target_rows()
     return enabled
+
+
+def hy3_verify_router_config() -> Hy3VerifyRouterConfig:
+    """Read and validate the selector once while constructing the model."""
+
+    mode = _mode()
+    rows = _target_rows() if mode != "off" else 4
+    return Hy3VerifyRouterConfig(mode=mode, target_rows=rows)
 
 
 def hy3_verify_router_stats() -> dict[str, Any]:
@@ -123,7 +148,63 @@ def _compiled_router(
     stock_forward: Callable[[mx.array], tuple[mx.array, mx.array]],
     *,
     rows: int,
-) -> _CompiledRouter:
+    shared_group: dict[object, object] | None,
+    linear_weight: mx.array | None,
+    expert_bias: mx.array | None,
+) -> tuple[_CompiledRouter, tuple[mx.array, ...], bool]:
+    if (
+        shared_group is not None
+        and linear_weight is not None
+        and expert_bias is not None
+    ):
+        key = (
+            "fp32-linear-router",
+            rows,
+            int(linear_weight.shape[0]),
+            int(linear_weight.shape[1]),
+            int(router.top_k),
+            bool(router.route_norm),
+            float(router.router_scaling_factor),
+        )
+        shared_record = shared_group.get(key)
+        if isinstance(shared_record, _CompiledRouter):
+            shared_record.host["stats"] = _STATS
+            return shared_record, (linear_weight, expert_bias), True
+
+        host: dict[str, Any] = {"stats": _STATS, "trace_count": 0}
+        top_k = int(router.top_k)
+        route_norm = bool(router.route_norm)
+        scaling = float(router.router_scaling_factor)
+
+        def fixed_linear_router(value, weight, bias):
+            # One architecture-specialized graph is shared by all 79 trunk
+            # routers. Weights remain dynamic inputs, so each layer keeps its
+            # own parameters without retracing an otherwise identical graph.
+            stats = host["stats"]
+            traces = int(host["trace_count"])
+            stats["traces"] = int(stats["traces"]) + 1
+            if traces:
+                stats["retraces"] = int(stats["retraces"]) + 1
+            else:
+                stats["initial_traces"] = int(stats["initial_traces"]) + 1
+            host["trace_count"] = traces + 1
+            logits = (value.astype(mx.float32) @ weight.T).astype(mx.float32)
+            scores = mx.sigmoid(logits)
+            selection_scores = scores + bias.astype(mx.float32)
+            indices = mx.argpartition(
+                selection_scores,
+                kth=-top_k,
+                axis=-1,
+            )[..., -top_k:]
+            weights = mx.take_along_axis(scores, indices, axis=-1)
+            if route_norm:
+                weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+            return indices, weights * scaling
+
+        record = _CompiledRouter(mx.compile(fixed_linear_router), host)
+        shared_group[key] = record
+        return record, (linear_weight, expert_bias), True
+
     records = getattr(router, "_mtplx_verify_router_compiled", None)
     if not isinstance(records, dict):
         records = {}
@@ -131,7 +212,7 @@ def _compiled_router(
     record = records.get(rows)
     if isinstance(record, _CompiledRouter):
         record.host["stats"] = _STATS
-        return record
+        return record, (), False
 
     host: dict[str, Any] = {"stats": _STATS, "trace_count": 0}
 
@@ -149,17 +230,22 @@ def _compiled_router(
 
     record = _CompiledRouter(mx.compile(fixed_router), host)
     records[rows] = record
-    return record
+    return record, (), False
 
 
 def maybe_compile_hy3_verify_router(
     router: Any,
     x: mx.array,
     stock_forward: Callable[[mx.array], tuple[mx.array, mx.array]],
+    *,
+    mode: str,
+    rows: int,
+    shared_group: dict[object, object] | None = None,
+    linear_weight: mx.array | None = None,
+    expert_bias: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Dispatch one pure Hy3 router through the fixed verification seam."""
 
-    mode = _mode()
     if mode == "off":
         return stock_forward(x)
     phase = current_attention_phase()
@@ -170,7 +256,6 @@ def maybe_compile_hy3_verify_router(
     if shape is None or len(shape) != 3 or int(shape[0]) != 1:
         _record_fallback("shape")
         return stock_forward(x)
-    rows = _target_rows()
     actual_rows = int(shape[-2])
     if actual_rows != rows:
         _record_fallback(f"rows:{actual_rows}")
@@ -178,11 +263,22 @@ def maybe_compile_hy3_verify_router(
 
     _STATS["eligible_calls"] = int(_STATS["eligible_calls"]) + 1
     try:
-        record = _compiled_router(router, stock_forward, rows=rows)
+        record, dynamic_inputs, shared = _compiled_router(
+            router,
+            stock_forward,
+            rows=rows,
+            shared_group=shared_group,
+            linear_weight=linear_weight,
+            expert_bias=expert_bias,
+        )
         record.host["stats"] = _STATS
-        compiled_indices, compiled_weights = record.function(x)
+        compiled_indices, compiled_weights = record.function(x, *dynamic_inputs)
         _ROUTER_IDS.add(id(router))
+        _GRAPH_IDS.add(id(record))
         _STATS["compiled_router_count"] = len(_ROUTER_IDS)
+        _STATS["compiled_graph_count"] = len(_GRAPH_IDS)
+        call_key = "shared_graph_calls" if shared else "per_router_graph_calls"
+        _STATS[call_key] = int(_STATS[call_key]) + 1
         _STATS["compiled_calls"] = int(_STATS["compiled_calls"]) + 1
         if mode != "parity":
             return compiled_indices, compiled_weights

@@ -1722,10 +1722,33 @@ def _run_observation(
                     raise BenchmarkGateError(
                         "Hy3 router seam did not cover all 79 sparse layers"
                     )
-                if retained_measurement and _optional_int(
-                    hy3_verify_router,
-                    "traces",
-                ) != 0:
+                if _optional_int(hy3_verify_router, "compiled_graph_count") != 1:
+                    raise BenchmarkGateError(
+                        "Hy3 router seam did not use one shared architecture graph"
+                    )
+                if (
+                    _optional_int(
+                        hy3_verify_router,
+                        "shared_graph_calls",
+                    )
+                    != router_compiled_calls
+                    or _optional_int(
+                        hy3_verify_router,
+                        "per_router_graph_calls",
+                    )
+                    != 0
+                ):
+                    raise BenchmarkGateError(
+                        "Hy3 router seam did not route every call through the shared graph"
+                    )
+                if (
+                    retained_measurement
+                    and _optional_int(
+                        hy3_verify_router,
+                        "traces",
+                    )
+                    != 0
+                ):
                     raise BenchmarkGateError(
                         "Hy3 router seam traced during retained measurement"
                     )

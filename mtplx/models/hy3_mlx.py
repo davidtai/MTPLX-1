@@ -274,9 +274,17 @@ def _router_storage_module(module: nn.Module) -> nn.Module:
 
 
 class Router(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(
+        self,
+        args: ModelArgs,
+        *,
+        verify_router_group: dict[object, object] | None = None,
+    ):
         super().__init__()
-        from ..hy3_verify_router import hy3_verify_router_enabled
+        from ..hy3_verify_router import (
+            hy3_verify_router_config,
+            maybe_compile_hy3_verify_router,
+        )
 
         self.top_k = args.num_experts_per_tok
         self.num_experts = args.num_experts
@@ -284,7 +292,21 @@ class Router(nn.Module):
         self.router_scaling_factor = args.router_scaling_factor
         self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.expert_bias = mx.zeros((args.num_experts,), dtype=mx.float32)
-        self._verify_router_compile = hy3_verify_router_enabled()
+        verify_config = hy3_verify_router_config()
+        self._verify_router_compile = verify_config.enabled
+        self._verify_router_mode = verify_config.mode
+        self._verify_router_rows = verify_config.target_rows
+        object.__setattr__(
+            self,
+            "_verify_router_dispatch",
+            maybe_compile_hy3_verify_router if verify_config.enabled else None,
+        )
+        object.__setattr__(
+            self,
+            "_verify_router_group",
+            verify_router_group if verify_router_group is not None else {},
+        )
+        object.__setattr__(self, "_verify_router_shared_linear", None)
 
     def _forward_stock(self, x: mx.array) -> tuple[mx.array, mx.array]:
         storage_gate = _router_storage_module(self.gate)
@@ -317,9 +339,26 @@ class Router(nn.Module):
         if not self._verify_router_compile:
             return self._forward_stock(x)
 
-        from ..hy3_verify_router import maybe_compile_hy3_verify_router
+        shared_linear = self._verify_router_shared_linear
+        if shared_linear is None:
+            storage_gate = _router_storage_module(self.gate)
+            shared_linear = (
+                type(storage_gate) is nn.Linear
+                and storage_gate is self.gate
+                and "bias" not in storage_gate
+            )
+            object.__setattr__(self, "_verify_router_shared_linear", shared_linear)
 
-        return maybe_compile_hy3_verify_router(self, x, self._forward_stock)
+        return self._verify_router_dispatch(
+            self,
+            x,
+            self._forward_stock,
+            mode=self._verify_router_mode,
+            rows=self._verify_router_rows,
+            shared_group=self._verify_router_group if shared_linear else None,
+            linear_weight=self.gate.weight if shared_linear else None,
+            expert_bias=self.expert_bias if shared_linear else None,
+        )
 
 
 class SparseMLP(nn.Module):
@@ -329,9 +368,10 @@ class SparseMLP(nn.Module):
         layer_index: int,
         *,
         fuse_shared_gate_up: bool = False,
+        verify_router_group: dict[object, object] | None = None,
     ):
         super().__init__()
-        self.router = Router(args)
+        self.router = Router(args, verify_router_group=verify_router_group)
         self.switch_mlp = UnboundExpertSwitch(layer_index)
         shared_width = args.moe_intermediate_size * args.num_shared_experts
         shared_cls = FusedSharedMLP if fuse_shared_gate_up else MLP
@@ -371,6 +411,7 @@ class DecoderLayer(nn.Module):
         *,
         mlp_type: str | None = None,
         fuse_shared_gate_up: bool = False,
+        verify_router_group: dict[object, object] | None = None,
     ):
         super().__init__()
         self.self_attn = Attention(args)
@@ -380,6 +421,7 @@ class DecoderLayer(nn.Module):
                 args,
                 layer_index,
                 fuse_shared_gate_up=fuse_shared_gate_up,
+                verify_router_group=verify_router_group,
             )
             if resolved_mlp_type == "sparse"
             else MLP(args)
@@ -483,12 +525,15 @@ class Hy3Model(nn.Module):
         fuse_shared_gate_up: bool = False,
     ):
         super().__init__()
+        verify_router_group: dict[object, object] = {}
+        object.__setattr__(self, "_verify_router_group", verify_router_group)
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             DecoderLayer(
                 args,
                 layer_index,
                 fuse_shared_gate_up=fuse_shared_gate_up,
+                verify_router_group=verify_router_group,
             )
             for layer_index in range(args.num_hidden_layers)
         ]

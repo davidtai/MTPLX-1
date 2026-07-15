@@ -746,6 +746,9 @@ def test_k3_router_seam_accepts_prewarmed_complete_m4_evidence(
             "eligible_calls": 3160,
             "compiled_calls": 3160,
             "compiled_router_count": 79,
+            "compiled_graph_count": 1,
+            "shared_graph_calls": 3160,
+            "per_router_graph_calls": 0,
             "traces": 0,
             "initial_traces": 0,
             "retraces": 0,
@@ -785,6 +788,9 @@ def test_k3_router_seam_rejects_retained_trace(
             "eligible_calls": 79,
             "compiled_calls": 79,
             "compiled_router_count": 79,
+            "compiled_graph_count": 1,
+            "shared_graph_calls": 79,
+            "per_router_graph_calls": 0,
             "traces": 1,
             "initial_traces": 1,
             "retraces": 0,
@@ -803,6 +809,48 @@ def test_k3_router_seam_rejects_retained_trace(
     with pytest.raises(
         module.BenchmarkGateError,
         match="router seam traced during retained measurement",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            apis=apis,
+        )
+
+
+def test_k3_router_seam_rejects_per_router_graphs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "hy3_verify_router": {
+            "mode": "on",
+            "target_rows": 4,
+            "eligible_calls": 3160,
+            "compiled_calls": 3160,
+            "compiled_router_count": 79,
+            "compiled_graph_count": 79,
+            "shared_graph_calls": 0,
+            "per_router_graph_calls": 3160,
+            "traces": 0,
+            "initial_traces": 0,
+            "retraces": 0,
+            "failures": 0,
+            "fallback_reasons": {},
+            "parity_checks": 0,
+            "parity_failures": 0,
+            "max_route_weight_error": 0.0,
+            "last_failure": None,
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "on")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="one shared architecture graph",
     ):
         module.run_depth_matrix(
             [{**_requests(tmp_path)[0], "depths": (3,)}],

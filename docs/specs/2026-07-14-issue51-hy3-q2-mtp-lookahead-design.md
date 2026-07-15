@@ -156,6 +156,19 @@ evidence additionally requires all 79 sparse-layer routers, zero failures,
 zero retraces, and zero retained traces. Calls at every other row count remain
 stock, so a K0-K7 matrix keeps non-K3 behavior independently attributable.
 
+All 79 trunk routers have the same official-Hy3 shape and arithmetic contract:
+an FP32-promoted M-by-4,096 input multiplied by a distinct BF16 192-by-4,096
+gate, followed by FP32 sigmoid, bias, top-8 selection, normalization, and
+scaling. The refined M=4 path therefore uses one weight-parameterized compiled
+graph for the entire trunk rather than 79 closure-specialized graphs. Each
+layer's gate and expert bias remain dynamic inputs; only shape and router
+arithmetic are shared. Wrapped, adapted, or quantized router modules retain a
+per-router stock-body graph instead of bypassing wrapper semantics. Promotion
+evidence must show 79 routers, exactly one shared graph, every eligible call on
+that graph, and zero per-router fallbacks. The selector mode and row count are
+also frozen at model construction so the hot path performs no environment
+lookups or integer parsing.
+
 The selector is intentionally evidence-only and off by default:
 
 - `MTPLX_HY3_VERIFY_ROUTER_COMPILE=off|on|parity`
