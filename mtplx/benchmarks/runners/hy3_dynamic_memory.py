@@ -1043,13 +1043,15 @@ def _validate_timeline(
         "kv_allocated_blocks",
         "slot_health_sha256",
     )
-    baseline = tuple(getattr(holds[0], field) for field in stable_fields)
-    if any(
-        tuple(getattr(point, field) for field in stable_fields) != baseline
-        for point in holds
-    ):
+    stable_drift = {
+        field: [getattr(point, field) for point in holds]
+        for field in stable_fields
+        if any(getattr(point, field) != getattr(holds[0], field) for point in holds[1:])
+    }
+    if stable_drift:
         raise BenchmarkGateError(
-            "stable hold samples changed physical memory or slot health"
+            "stable hold samples changed physical memory or slot health: "
+            f"{json.dumps(stable_drift, sort_keys=True)}"
         )
     stable_resource_fields = (
         "allocator_headroom_bytes",
@@ -1071,16 +1073,18 @@ def _validate_timeline(
         "max_resize_duration_ns",
         "blocked_by_pin_bytes",
     )
-    resource_baseline = tuple(
-        holds[0].resource_evidence[field] for field in stable_resource_fields
-    )
-    if any(
-        tuple(point.resource_evidence[field] for field in stable_resource_fields)
-        != resource_baseline
-        for point in holds
-    ):
+    resource_drift = {
+        field: [point.resource_evidence[field] for point in holds]
+        for field in stable_resource_fields
+        if any(
+            point.resource_evidence[field] != holds[0].resource_evidence[field]
+            for point in holds[1:]
+        )
+    }
+    if resource_drift:
         raise BenchmarkGateError(
-            "stable hold samples changed the classified or charged memory ledger"
+            "stable hold samples changed the classified or charged memory ledger: "
+            f"{json.dumps(resource_drift, sort_keys=True)}"
         )
     if holds[-1].monotonic_ns - holds[0].monotonic_ns < MIN_STABLE_HOLD_DURATION_NS:
         raise BenchmarkGateError("stable hold duration is shorter than one second")

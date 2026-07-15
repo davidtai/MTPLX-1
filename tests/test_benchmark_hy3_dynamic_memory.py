@@ -707,8 +707,13 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     unstable["timeline"][4]["allocator_cache_charged_bytes"] = 1
     unstable["timeline"][4]["charged_bytes"] += 1
     unstable["timeline"][4]["charged_residual_bytes"] -= 1
-    with pytest.raises(BenchmarkGateError, match="stable hold"):
+    with pytest.raises(BenchmarkGateError, match="allocator_cache_bytes"):
         validate_campaign_observation(unstable)
+
+    unstable_resource = _observation("dynamic", 4096, 0, tok_s=12.0)
+    unstable_resource["timeline"][4]["requested_reclaim_bytes"] += 1
+    with pytest.raises(BenchmarkGateError, match="requested_reclaim_bytes"):
+        validate_campaign_observation(unstable_resource)
 
     no_reset = _observation("dynamic", 4096, 0, tok_s=12.0)
     no_reset["timeline"] = no_reset["timeline"][:-2]
