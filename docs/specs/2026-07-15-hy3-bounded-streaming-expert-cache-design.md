@@ -1,249 +1,281 @@
-# Hy3 Bounded Streaming Expert Cache Design
+# Hy3 Demand-Loaded Direct-Pread Expert Cache Design
 
-**Status:** Pending user review
+**Status:** Pending user approval
+
+## Decision
+
+The issue-46 dynamic Hy3 lane will not use expert slabs or component banks.
+It will use the existing direct-record execution path: load one routed expert
+with positional `pread` into one writable MLX record buffer, cache that record
+under `(layer, expert)`, and evict individual records under a byte budget.
+
+The cache starts empty. It does not allocate its configured capacity at model
+open. It grows one expert record at a time on real misses, reuses an evicted
+record buffer when capacity is unchanged, and releases individual record
+buffers only when KV growth reduces the cache's allowed bytes.
 
 ## Problem
 
-Hy3 is a streaming MoE model. Routed expert tensors are read from SSD into a
-bounded set of reusable MLX component-bank buffers. A full expert cache is a
-normal replacement condition, not evidence that more physical memory is needed.
+Hy3 is a streaming MoE model. The issue-46 implementation replaced the simple
+record-streaming cache with independently allocated groups of component-bank
+storage. It materialized nearly the entire planned expert allowance and then
+allowed route pressure to add back storage that KV accounting had removed.
 
-The issue-46 implementation violates that invariant. It plans expert capacity
-against unused KV budget, physically materializes the planned slabs, and later
-regrows released slabs from route pressure. A long prefill therefore turns a
-streaming cache into an accumulating anonymous-memory cache. macOS compresses
-the oversized dirty working set, and later expert hits pay decompression and
-residency stalls before Metal can execute.
-
-## Premise Decision
-
-The work is necessary and proportional:
-
-- The same 4K workload fell from 1.239 tok/s with 75 active slabs and no
-  compression to 0.303 tok/s with 243 active slabs and 76.9 GB of process
-  compression.
-- Existing LRU/frequency replacement and slab-safe release machinery already
-  provide most of the required behavior.
-- Leaving route-demand regrowth in place makes longer prompts converge toward
-  the same compression cliff regardless of the startup seed.
+On the measured 4K workload, that turned a bounded streaming cache into a large
+dirty anonymous-memory allocation. The 77 GiB eager arm reached 76.9 GB of
+process compression and 0.303 decode tok/s. A demand-bounded arm using about
+23.7 GiB of expert storage had no compression and reached 1.239 decode tok/s.
+The regression is therefore the allocation architecture, not 4K attention and
+not `pread` throughput.
 
 ## Scope
 
 This change will:
 
-1. Make `expert_cache_limit_bytes` the explicit, user-overridable physical
-   expert-cache ceiling for the dynamic Hy3 lane. It remains a cap, never an
-   allocation request inferred from the 110 GiB broker budget.
-2. Require an explicit expert-cache limit when dynamic expert slabs are enabled,
-   so different machines choose their own qualified value and omission fails
-   closed.
-3. Allocate only the slab-aligned pool covered by that cap at model open.
-4. Remove route-demand slab regrowth from prefill, decode, and split-route hot
-   paths.
-5. Reuse or evict an unpinned expert slot whenever the active cache is full.
-6. Continue releasing cold, unpinned whole slabs when KV growth lowers the
-   currently admissible expert capacity.
-7. Permit restoration toward the configured cap only after KV release at an
-   explicit reset/request lifecycle boundary, never because an expert route
-   missed.
-8. Add opt-in Python control-plane CPU attribution suitable for deciding what a
-   Rust rewrite should replace.
+1. Route the issue-46 dynamic lane through `direct-slots`, not
+   `component-banks`.
+2. Remove the issue-46 grouped expert allocator, grouped lifecycle methods,
+   route-demand capacity growth, and their configuration and telemetry fields.
+3. Start the persistent expert cache with zero allocated record buffers.
+4. Load cache misses directly from the sidecar with the existing checked
+   `pread`/`preadv` reader.
+5. Account cached expert memory as an exact count of individual record buffers.
+6. Enforce a user-configurable total-memory limit and an optional explicit
+   expert-cache ceiling; neither value is hard-coded for one Mac.
+7. Evict the least-recently-used unpinned expert records until the cache fits
+   the current byte allowance.
+8. Reuse an evicted direct buffer for ordinary full-cache replacement so the
+   hot path does not allocate and free memory repeatedly.
+9. Add opt-in Python control-plane CPU attribution for a possible Rust rewrite.
+
+The existing small transient service bank remains fixed and separately
+charged. It bounds in-flight top-k misses when every cached record is pinned;
+it is not persistent cache capacity.
 
 ## Non-goals
 
-- No automatic compressor-feedback controller in this change. Each machine's
-  explicit cap is qualified by the hardware benchmark; compression remains a
-  failed qualification signal.
-- No per-expert MLX allocation or destruction. Expert replacement reuses an
-  existing slot; physical shrink remains whole-slab.
-- No change to expert tensor format, `pread`/`preadv`, QMM kernels, cache policy,
-  or output semantics.
-- No route-time background allocator, detached benchmark process, or GPU-lane
-  behavior change.
-- No Rust implementation. The added telemetry defines the measured boundary for
-  a later rewrite.
+- No eager allocation of the expert-cache limit.
+- No grouped expert storage, grouped release, grouped growth, or group-size
+  rounding in the dynamic lane.
+- No `mmap` expert execution or reliance on macOS page faults as the loader.
+- No automatic compressor-feedback controller in this change. The total-memory
+  limit is explicitly set per machine and qualified by compression telemetry.
+- No new cache-policy experiment. The dynamic lane uses the existing global
+  O(1) LRU directory.
+- No background allocator, detached benchmark, or GPU-lane behavior change.
+- No Rust implementation yet; the telemetry identifies what is worth moving.
 
 ## Alternatives Considered
 
-### A. Bounded pool with lifecycle-only resize — selected
+### A. Demand-loaded direct record cache — selected
 
-The configured expert-cache limit determines the maximum physical slab pool.
-Misses reuse the pool. KV growth may shrink it; reset after confirmed KV release
-may restore it. This keeps the hot route simple and makes memory use predictable.
+Each cached expert owns one direct MLX record buffer filled by `pread`. The
+cache is empty at startup, is byte-accounted exactly, replaces individual LRU
+records, and gives bytes back to KV at individual-record granularity. This is
+the smallest change that preserves the proven direct-slot data path and the
+dynamic-memory goal.
 
-### B. Lazy route-driven growth up to a cap — rejected
+### B. Preallocate a fixed direct-slot cache — rejected
 
-This avoids startup allocation but preserves allocation in the route path,
-creates cold-start decode variance, and risks rebuilding the same demand-growth
-controller under a different ceiling.
+This is simpler than grouped storage and is a useful control benchmark, but it
+cannot lend unused expert memory to a growing KV cache.
 
-### C. Per-expert allocation — rejected
+### C. Grouped component storage — rejected
 
-This gives finer memory granularity but loses the component-major slab geometry,
-adds allocator traffic to the hot path, and requires a broad QMM/storage rewrite.
+It creates large dirty allocations, coarse reclamation, extra ownership state,
+and the measured compression regression. Its small execution benefit does not
+justify using it in the dynamic-memory lane.
+
+### D. Fully adaptive OS-pressure controller — deferred
+
+Reacting continuously to compressor and system-wide pressure may eventually
+improve portability, but it adds feedback-loop behavior before the simple
+byte-bounded design is qualified. This version exposes the measurements needed
+to evaluate that follow-up.
 
 ## Architecture and Invariants
 
-### Physical cache contract
+### Budget
 
 Let:
 
 ```text
-slab_bytes = expert_slab_slots * expert_record_bytes
-configured_expert_cap = floor(expert_cache_limit_bytes / slab_bytes) * slab_bytes
-admissible_expert_bytes = min(configured_expert_cap, broker_available_expert_bytes)
+record_bytes = exact manifest bytes for one routed expert
+configured_cache_cap = optional expert_cache_limit_bytes, or infinity
+noncache_bytes = resident model + current physical KV + transient service
+                 + in-flight I/O + workspace + charged allocator overhead
+available_cache_bytes = max(0, memory_limit_bytes - noncache_bytes)
+allowed_cache_bytes = floor(
+    min(configured_cache_cap, available_cache_bytes) / record_bytes
+) * record_bytes
+allocated_cache_bytes = allocated_record_count * record_bytes
 ```
 
-The runtime continuously preserves:
+At every completed memory transaction:
 
 ```text
-expert_slab_physical_bytes <= configured_expert_cap
-expert_slab_physical_bytes <= admissible_expert_bytes after a completed resize
+allocated_cache_bytes <= allowed_cache_bytes
+total_charged_bytes <= memory_limit_bytes
 ```
 
-The cap may be zero; transient slots still cover model top-k and preserve
-correct streaming execution. A non-aligned cap rounds down and is reported in
-telemetry.
+`memory_limit_bytes` is a required, user-overridable value for the dynamic
+lane. The first hardware experiment will use 100 GiB on this 128 GB Mac; that
+number is a qualification input, not a source-code constant. The existing
+expert-cache option remains an optional stricter ceiling.
 
 ### Model open
 
-The memory plan uses the explicit expert cap rather than lending all initially
-unused KV budget to expert slabs. `ExpertSlotPool` therefore constructs only the
-bounded persistent pool plus the existing transient service bank. The broker's
-registered physical expert bytes must exactly match that pool.
+The runtime allocates only resident model state, the small transient service
+bank, and bounded I/O workspace. It creates an empty LRU directory and zero
+persistent expert record buffers. Maximum KV is not preallocated and expert
+capacity is not materialized from unused KV budget.
 
-There is no allocate-everything-then-release startup sequence.
+### Cache hit
 
-### Route miss
+A hit validates the record generation, pins the direct buffer, moves the key to
+the LRU tail, executes Q4 from that buffer, and releases the pin only after its
+Metal completion fence. Hits perform no memory allocation, allocator sampling,
+or budget recomputation. With telemetry disabled, the hit path is only the
+existing O(1) directory/LRU operation and ownership bookkeeping.
 
-`ensure_route` and `begin_split_route` never call a slab-regrowth function.
-Within the active pool:
+### Cache miss while below the current allowance
 
-- a hit pins the existing slot;
-- an empty slot accepts the streamed expert;
-- a full pool selects an eligible LRU/frequency victim and overwrites that slot;
-- pinned, loading, current-demand, or Metal-in-flight slots remain ineligible;
-- if no persistent victim is safe, the existing transient streaming path serves
-  the route.
+The broker reserves exactly one `record_bytes` increment. The owner thread
+allocates one direct writable MLX buffer, the reader fills it with checked
+positional I/O, and the directory publishes it only after the load and hash
+checks succeed. A failed load destroys the unpublished buffer and rolls back
+the reservation.
 
-Prefill may seed empty persistent slots but cannot change physical capacity.
+### Cache miss at the current allowance
 
-### KV growth and shrink
+The LRU directory selects the oldest record that is not loading, pinned,
+current route demand, or Metal-in-flight. After the previous generation is no
+longer observable, the reader overwrites that same direct buffer and publishes
+a new generation. This is an individual expert replacement with zero net
+allocation.
 
-Before KV growth, the existing broker transaction computes required expert
-reclaim. Candidate ranking selects cold whole slabs, excludes protected slots,
-waits only for their completion owners, invalidates their exact generations,
-and confirms allocator reduction before KV allocation proceeds.
+If no cached record is safe to replace, the existing transient service bank
+serves the miss. The runtime never exceeds the memory limit to create a
+temporary persistent entry.
 
-If the target is temporarily below pinned capacity, admission fails closed and
-reports blocked bytes; it never evicts an unsafe slot.
+### KV growth
 
-### KV release and cache restoration
+Before allocating a physical Q4 KV block, the broker computes the post-growth
+`allowed_cache_bytes`. If the cache is too large, it removes individual LRU
+records until the exact byte requirement is met. Pinned, loading, demanded, and
+Metal-in-flight records are ineligible.
 
-Confirmed KV release raises the admissible expert capacity. Restoration, when
-requested, occurs once at reset/request-boundary cleanup under the existing
-memory transaction and owner-thread locks. It restores only enough whole slabs
-to reach the lower of the configured cap and current broker headroom.
+Released buffers are batched, MLX allocator cache clearing occurs once for the
+batch, and allocator telemetry confirms the charged-byte reduction before KV
+allocation commits. If safe records or confirmed physical bytes are
+insufficient, KV admission waits or fails closed; it never crosses the limit.
 
-No restoration occurs in prefill, decode, route planning, or reader workers.
+### KV release and later cache warming
+
+KV release increases the logical cache allowance but allocates nothing.
+Subsequent real misses may add one record buffer at a time. Reset, cancellation,
+and request completion never prefill or preallocate the newly available space.
+
+Budget recomputation therefore occurs only at model open, a persistent cache
+miss, and a physical KV growth or release transaction. There is no polling loop,
+background memory controller, or per-hit memory query.
 
 ## Python Overhead Attribution
 
-Python overhead is measured as thread CPU time, not wall time. This excludes
-time sleeping on SSD, completion fences, and Metal, while retaining Python and
-same-thread native bookkeeping cost.
+Python overhead is measured with `time.thread_time_ns()`, not wall time. This
+excludes time sleeping on SSD, Metal, and completion fences while retaining
+Python and same-thread native bookkeeping cost.
 
-The existing `resource_telemetry` opt-in controls collection. When disabled,
-the hot path performs no clock reads and publishes no Python attribution block.
-When enabled, `time.thread_time_ns()` scopes accumulate:
+The existing `resource_telemetry` opt-in controls collection. Disabled means
+no clock reads and no Python-attribution output. Enabled collection reports
+prefill/decode totals and call counts for:
 
-- `route_control_cpu_ns`: generation-thread CPU inside route setup, commit, and
-  cleanup;
-- `route_policy_cpu_ns`: the subset spent in LRU/frequency policy planning;
-- `slot_control_cpu_ns`: slot selection, pin/generation bookkeeping, and task
-  orchestration outside policy planning;
-- `resize_control_cpu_ns`: broker and slab resize orchestration CPU;
-- `reader_thread_cpu_ns`: the existing reader-worker CPU counter.
+- `route_control_cpu_ns`: route setup, commit, and cleanup;
+- `cache_policy_cpu_ns`: LRU lookup, touch, victim selection, and directory
+  mutation; this is a subset of route control;
+- `cache_budget_cpu_ns`: byte-budget calculation, individual eviction, and
+  allocation reservation;
+- `kv_broker_cpu_ns`: KV growth/release transaction bookkeeping;
+- `reader_thread_cpu_ns`: existing reader-worker CPU attribution.
 
-Each category includes call counts and prefill/decode phase totals. The schema
-labels policy and slot counters as subsets of route control so consumers do not
-sum inclusive values incorrectly.
-
-The hardware artifact also reports:
-
-```text
-python_route_cpu_ns_per_generated_token
-python_policy_cpu_ns_per_route
-python_slot_cpu_ns_per_route
-python_reader_cpu_ns_per_streamed_byte
-python_control_cpu_fraction_of_decode_wall
-```
-
-A matched telemetry-off/telemetry-on run measures instrumentation cost. These
-numbers are control-plane CPU attribution, not a claim that every native call
-inside the measured thread would disappear in Rust.
+The benchmark derives CPU time per generated token, per route, per cache miss,
+per evicted record, and per streamed byte. A paired telemetry-off/on run reports
+instrumentation cost. Inclusive subsets are labeled so they are not summed.
 
 ## Error Handling
 
-- Dynamic mode without `expert_cache_limit_bytes` is rejected before model load.
-- A cap smaller than one slab creates zero persistent slabs and uses transient
-  streaming only.
-- Reclaim that cannot cross a pin/fence boundary fails closed without changing
-  published ownership.
-- Allocator release/regrow telemetry remains conservative; unexplained negative
-  ownership fails closed. Positive allocator residual is retained as charged
-  overhead rather than requiring byte-perfect equality.
-- A failed lifecycle-boundary restore leaves the smaller released capacity valid
-  and does not poison ordinary transient streaming unless ownership is ambiguous.
+- Missing or invalid `memory_limit_bytes` rejects the dynamic lane before model
+  load.
+- An expert-cache ceiling below one record means persistent caching is disabled;
+  transient `pread` service remains correct.
+- Failed or short reads never publish a cache entry.
+- A record is never evicted while loading, pinned, demanded, or Metal-in-flight.
+- Insufficient safe cache bytes blocks or rejects KV growth without corrupting
+  cache ownership.
+- Allocator retention is charged as memory; logical eviction is not reported as
+  physical reclamation until telemetry confirms it.
 
 ## Testing Strategy
 
 ### Deterministic tests
 
-- Dynamic configuration requires an explicit expert cap and rounds it down.
-- The opened pool never exceeds the configured cap.
-- Prefill on a full cache does not allocate a slab.
-- Decode on a full cache reuses/evicts or falls back to transient slots without
-  allocating a slab.
-- KV growth releases enough whole slabs and confirms physical reduction.
-- KV release alone does not regrow; reset-boundary restoration does and stops at
-  the cap.
-- Pinned/in-flight slabs block shrink without corrupting policy generations.
-- Python counters are absent with telemetry disabled, phase-correct when
-  enabled, and use deterministic injected clocks in tests.
-- Benchmark serialization rejects missing, negative, overlapping, or
-  semantically inconsistent Python counters.
+- Dynamic model open allocates zero persistent expert records.
+- The first miss allocates exactly one direct record and reads it with the
+  positional reader.
+- Repeated hits allocate nothing and update LRU order.
+- A miss below allowance grows by exactly one record.
+- A miss at allowance reuses exactly one unpinned LRU buffer with a new
+  generation and zero net bytes.
+- A fully pinned cache uses bounded transient service without exceeding budget.
+- KV growth evicts the exact number of individual records needed, with no
+  group-size rounding.
+- KV release, reset, and cancellation do not eagerly warm the cache.
+- Dynamic-lane configuration and telemetry contain no grouped allocator fields
+  or lifecycle operations.
+- Python counters are absent when disabled and phase-correct with deterministic
+  injected clocks when enabled.
 
 ### Hardware qualification
 
 Using the existing foreground exclusive-lane runner:
 
-1. Wait for the shared GPU lock; never terminate or overlap its owner.
+1. Wait for the shared GPU lock and never terminate or overlap its owner.
 2. Capture and unload Qwen only for the measurement window, then restore and
-   verify it before releasing the lane.
-3. Run matched 4K control/candidate arms with identical prompt, cache geometry,
-   generated tokens, and correctness checks.
-4. Require identical tokens/routes/hashes and healthy final slot ownership.
-5. Record prefill, decode TPS, active slab bytes, process compression growth,
-   allocator footprint, and Python CPU attribution.
-6. Reject a cap that causes sustained compression growth or more than the
-   previously accepted 10-20% 4K slowdown.
+   verify its exact prior state before releasing the lane.
+3. Run a same-geometry 4K control using the proven direct-slot path and a
+   candidate using the demand-loaded direct-pread cache at a 100 GiB total
+   limit.
+4. Require identical generated tokens, routes, hashes, and healthy final
+   ownership.
+5. Record prefill/decode TPS, GPU utilization, cache records/bytes, allocations,
+   buffer reuses, individual evictions, SSD bytes/token, MLX active/cache bytes,
+   process resident/compressed bytes, swap, and Python CPU attribution.
+6. Reject the candidate if compression grows materially, GPU activity stalls,
+   or the 4K slowdown exceeds the previously observed 10-20% range.
+7. Only after the 4K gate passes, repeat at longer contexts to demonstrate that
+   KV growth reduces expert bytes without crossing the configured total limit.
 
 ## Failure-mode Check
 
-1. **Configured cap is still above the machine's residency knee.** Critical for
-   that machine. Qualification rejects the cap; the operator lowers the explicit
-   value. Automatic pressure feedback is intentionally deferred.
-2. **Target falls below protected slab bytes during KV growth.** Critical to
-   correctness but handled fail-closed: KV admission waits/fails and reports
-   blocked bytes rather than evicting active Metal ownership.
-3. **Instrumentation perturbs the Python hot path.** Minor if bounded. Collection
-   is opt-in and a paired telemetry-off/on run quantifies the perturbation before
-   using the figures for a Rust rewrite decision.
+1. **The configured total is above this Mac's no-compression knee.** The hardware
+   gate rejects it and the operator lowers the per-machine value. The first
+   candidate is 100 GiB.
+2. **Pinned records prevent enough eviction for KV growth.** KV admission waits
+   or fails closed. It does not allocate through the limit or globally drain
+   unrelated Metal work.
+3. **MLX retains released buffers in its allocator cache.** The retained bytes
+   remain charged; KV growth fails closed if the single batched cache clear does
+   not make enough physical room.
+4. **Lazy allocation adds miss-path variance.** Full-cache replacement reuses
+   direct buffers, so allocation occurs only while warming into newly available
+   budget. The matched hardware gate measures the remaining cost.
+5. **Instrumentation perturbs the control plane.** Collection is opt-in and the
+   paired telemetry-off/on arm quantifies the perturbation.
 
 ## Rollout
 
-The behavior remains confined to the opt-in Hy3 Q4 dynamic-memory lane. Static
-streaming configurations retain their existing pool construction and policy.
-The issue-46 hardware gate must pass before publication or merge; unit-test
-success alone is insufficient.
+The change remains confined to the opt-in Hy3 Q4 dynamic-memory lane. Existing
+static direct-slot and component-bank configurations remain unchanged. The
+issue-46 dynamic grouped-storage code and flags are removed rather than kept as
+an alternate runtime path. Unit tests are necessary but the foreground 4K
+hardware gate must pass before publication or merge.
