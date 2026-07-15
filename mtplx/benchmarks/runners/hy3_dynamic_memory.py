@@ -2917,6 +2917,7 @@ def _run_json_subprocess(
         cwd=cwd,
         env=None if env is None else {**os.environ, **env},
         text=True,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,

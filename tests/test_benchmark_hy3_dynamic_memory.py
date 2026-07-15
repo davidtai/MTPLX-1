@@ -1571,6 +1571,23 @@ def test_json_subprocess_retains_a_structured_rejection_return_code() -> None:
         runner_module.run_json_subprocess(command)
 
 
+def test_json_subprocess_delivers_the_input_payload_on_stdin() -> None:
+    command = (
+        sys.executable,
+        "-c",
+        (
+            "import json,sys; "
+            "value=json.load(sys.stdin); "
+            "print(json.dumps({'received': value}))"
+        ),
+    )
+    payload = {"loaded": False, "models": []}
+
+    result = runner_module.run_json_subprocess(command, input_payload=payload)
+
+    assert result == {"received": payload}
+
+
 def test_json_subprocess_timeout_terminates_and_reaps_its_process_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
