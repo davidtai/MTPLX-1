@@ -108,6 +108,33 @@ def test_verify_router_compile_is_inactive_outside_fixed_decode_verify(
     }
 
 
+def test_fixed_m4_router_retained_stats_reset_keeps_prewarmed_graph(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "1")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+    router = _router()
+    hidden = mx.full((1, 4, 64), 0.125, dtype=mx.bfloat16)
+
+    reset_hy3_verify_router_stats()
+    with attention_phase("decode_verify"):
+        warmup = router(hidden)
+        mx.eval(*warmup)
+    assert hy3_verify_router_stats()["traces"] == 1
+
+    reset_hy3_verify_router_stats()
+    with attention_phase("decode_verify"):
+        retained = router(hidden)
+        mx.eval(*retained)
+
+    stats = hy3_verify_router_stats()
+    assert stats["compiled_calls"] == 1
+    assert stats["compiled_router_count"] == 1
+    assert stats["traces"] == 0
+    assert stats["initial_traces"] == 0
+    assert stats["retraces"] == 0
+
+
 def test_verify_router_parity_fails_closed_on_changed_route_weights(
     monkeypatch,
 ) -> None:
