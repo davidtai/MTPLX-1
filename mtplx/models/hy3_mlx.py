@@ -296,6 +296,7 @@ class Router(nn.Module):
         self._verify_router_compile = verify_config.enabled
         self._verify_router_mode = verify_config.mode
         self._verify_router_rows = verify_config.target_rows
+        self._verify_router_topology = verify_config.topology
         object.__setattr__(
             self,
             "_verify_router_dispatch",
@@ -340,7 +341,9 @@ class Router(nn.Module):
             return self._forward_stock(x)
 
         shared_linear = self._verify_router_shared_linear
-        if shared_linear is None:
+        if self._verify_router_topology == "per-router":
+            shared_linear = False
+        elif shared_linear is None:
             storage_gate = _router_storage_module(self.gate)
             shared_linear = (
                 type(storage_gate) is nn.Linear

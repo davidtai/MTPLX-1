@@ -24,6 +24,7 @@ from .attention_context import current_attention_phase
 
 _COMPILE_ENV = "MTPLX_HY3_VERIFY_ROUTER_COMPILE"
 _ROWS_ENV = "MTPLX_HY3_VERIFY_ROUTER_ROWS"
+_TOPOLOGY_ENV = "MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY"
 
 
 def _fresh_stats() -> dict[str, Any]:
@@ -63,6 +64,7 @@ class Hy3VerifyRouterConfig:
 
     mode: str
     target_rows: int
+    topology: str
 
     @property
     def enabled(self) -> bool:
@@ -89,6 +91,13 @@ def _target_rows() -> int:
     if not 2 <= rows <= 8:
         raise ValueError(f"{_ROWS_ENV} must be within [2, 8]")
     return rows
+
+
+def _topology() -> str:
+    raw = (os.environ.get(_TOPOLOGY_ENV) or "shared").strip().lower()
+    if raw in {"shared", "per-router"}:
+        return raw
+    raise ValueError(f"{_TOPOLOGY_ENV} must be shared or per-router")
 
 
 def _record_fallback(reason: str) -> None:
@@ -128,7 +137,12 @@ def hy3_verify_router_config() -> Hy3VerifyRouterConfig:
 
     mode = _mode()
     rows = _target_rows() if mode != "off" else 4
-    return Hy3VerifyRouterConfig(mode=mode, target_rows=rows)
+    topology = _topology() if mode != "off" else "shared"
+    return Hy3VerifyRouterConfig(
+        mode=mode,
+        target_rows=rows,
+        topology=topology,
+    )
 
 
 def hy3_verify_router_stats() -> dict[str, Any]:
@@ -140,6 +154,7 @@ def hy3_verify_router_stats() -> dict[str, Any]:
     result["last_failure"] = dict(failure) if isinstance(failure, dict) else None
     result["mode"] = _mode()
     result["target_rows"] = _target_rows()
+    result["topology"] = _topology()
     return result
 
 

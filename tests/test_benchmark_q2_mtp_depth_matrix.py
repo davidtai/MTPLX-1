@@ -743,6 +743,7 @@ def test_k3_router_seam_accepts_prewarmed_complete_m4_evidence(
         "hy3_verify_router": {
             "mode": "on",
             "target_rows": 4,
+            "topology": "shared",
             "eligible_calls": 3160,
             "compiled_calls": 3160,
             "compiled_router_count": 79,
@@ -785,6 +786,7 @@ def test_k3_router_seam_rejects_retained_trace(
         "hy3_verify_router": {
             "mode": "on",
             "target_rows": 4,
+            "topology": "shared",
             "eligible_calls": 79,
             "compiled_calls": 79,
             "compiled_router_count": 79,
@@ -827,6 +829,7 @@ def test_k3_router_seam_rejects_per_router_graphs(
         "hy3_verify_router": {
             "mode": "on",
             "target_rows": 4,
+            "topology": "shared",
             "eligible_calls": 3160,
             "compiled_calls": 3160,
             "compiled_router_count": 79,
@@ -858,6 +861,94 @@ def test_k3_router_seam_rejects_per_router_graphs(
             verify_strategy="capture_commit",
             apis=apis,
         )
+
+
+def test_k3_router_seam_rejects_topology_evidence_mismatch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "hy3_verify_router": {
+            "mode": "on",
+            "target_rows": 4,
+            "topology": "shared",
+            "eligible_calls": 3160,
+            "compiled_calls": 3160,
+            "compiled_router_count": 79,
+            "compiled_graph_count": 1,
+            "shared_graph_calls": 3160,
+            "per_router_graph_calls": 0,
+            "traces": 0,
+            "initial_traces": 0,
+            "retraces": 0,
+            "failures": 0,
+            "fallback_reasons": {},
+            "parity_checks": 0,
+            "parity_failures": 0,
+            "max_route_weight_error": 0.0,
+            "last_failure": None,
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "on")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY", "per-router")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="topology evidence disagrees",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            apis=apis,
+        )
+
+
+def test_k3_router_seam_accepts_per_router_topology_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "hy3_verify_router": {
+            "mode": "on",
+            "target_rows": 4,
+            "topology": "per-router",
+            "eligible_calls": 3160,
+            "compiled_calls": 3160,
+            "compiled_router_count": 79,
+            "compiled_graph_count": 79,
+            "shared_graph_calls": 0,
+            "per_router_graph_calls": 3160,
+            "traces": 0,
+            "initial_traces": 0,
+            "retraces": 0,
+            "failures": 0,
+            "fallback_reasons": {},
+            "parity_checks": 0,
+            "parity_failures": 0,
+            "max_route_weight_error": 0.0,
+            "last_failure": None,
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "on")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY", "per-router")
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (3,)}],
+        contexts=(1024,),
+        verify_strategy="capture_commit",
+        apis=apis,
+    )
+
+    row = payload["models"][0]["observations"][1]
+    assert row["hy3_verify_router"] == evidence["hy3_verify_router"]
+    assert row["gates"]["hy3_verify_router_evidence"] is True
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])
@@ -896,6 +987,7 @@ def test_matrix_requires_and_records_sustained_prefill(
         "MTPLX_SUSTAINED_PREFILL_LAYOUT": "auto",
         "MTPLX_HY3_VERIFY_ROUTER_COMPILE": None,
         "MTPLX_HY3_VERIFY_ROUTER_ROWS": None,
+        "MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY": None,
         "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS": None,
         "MTPLX_LATE_DEPTH_BEFORE": None,
         "MTPLX_LATE_DEPTH_AFTER": None,

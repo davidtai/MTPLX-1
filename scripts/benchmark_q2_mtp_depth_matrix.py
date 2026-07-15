@@ -114,6 +114,9 @@ def _generation_environment() -> dict[str, str | None]:
         "MTPLX_HY3_VERIFY_ROUTER_ROWS": os.environ.get(
             "MTPLX_HY3_VERIFY_ROUTER_ROWS"
         ),
+        "MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY": os.environ.get(
+            "MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY"
+        ),
         **{name: os.environ.get(name) for name in _FIXED_DEPTH_ENV_KEYS},
     }
 
@@ -155,6 +158,17 @@ def _hy3_verify_router_environment_rows() -> int:
             "MTPLX_HY3_VERIFY_ROUTER_ROWS must be within [2, 8]"
         )
     return rows
+
+
+def _hy3_verify_router_environment_topology() -> str:
+    topology = (
+        os.environ.get("MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY") or "shared"
+    ).strip().lower()
+    if topology not in {"shared", "per-router"}:
+        raise BenchmarkConfigurationError(
+            "MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY must be shared or per-router"
+        )
+    return topology
 
 
 Checkpoint = Callable[[Mapping[str, Any]], None]
@@ -1695,6 +1709,11 @@ def _run_observation(
                 raise BenchmarkGateError(
                     "Hy3 router seam target-row evidence disagrees"
                 )
+            topology = _hy3_verify_router_environment_topology()
+            if hy3_verify_router.get("topology") != topology:
+                raise BenchmarkGateError(
+                    "Hy3 router seam topology evidence disagrees"
+                )
             failures = _optional_int(hy3_verify_router, "failures")
             parity_failures = _optional_int(
                 hy3_verify_router,
@@ -1722,24 +1741,37 @@ def _run_observation(
                     raise BenchmarkGateError(
                         "Hy3 router seam did not cover all 79 sparse layers"
                     )
-                if _optional_int(hy3_verify_router, "compiled_graph_count") != 1:
-                    raise BenchmarkGateError(
-                        "Hy3 router seam did not use one shared architecture graph"
-                    )
-                if (
-                    _optional_int(
-                        hy3_verify_router,
-                        "shared_graph_calls",
-                    )
-                    != router_compiled_calls
-                    or _optional_int(
-                        hy3_verify_router,
-                        "per_router_graph_calls",
-                    )
-                    != 0
+                compiled_graph_count = _optional_int(
+                    hy3_verify_router,
+                    "compiled_graph_count",
+                )
+                shared_graph_calls = _optional_int(
+                    hy3_verify_router,
+                    "shared_graph_calls",
+                )
+                per_router_graph_calls = _optional_int(
+                    hy3_verify_router,
+                    "per_router_graph_calls",
+                )
+                if topology == "shared":
+                    if compiled_graph_count != 1:
+                        raise BenchmarkGateError(
+                            "Hy3 router seam did not use one shared architecture graph"
+                        )
+                    if (
+                        shared_graph_calls != router_compiled_calls
+                        or per_router_graph_calls != 0
+                    ):
+                        raise BenchmarkGateError(
+                            "Hy3 router seam did not route every call through the shared graph"
+                        )
+                elif (
+                    compiled_graph_count != 79
+                    or shared_graph_calls != 0
+                    or per_router_graph_calls != router_compiled_calls
                 ):
                     raise BenchmarkGateError(
-                        "Hy3 router seam did not route every call through the shared graph"
+                        "Hy3 router seam did not route every call through 79 per-router graphs"
                     )
                 if (
                     retained_measurement
@@ -2160,6 +2192,7 @@ def _run_depth_matrix_impl(
     router_mode = _hy3_verify_router_environment_mode()
     if router_mode != "off":
         _hy3_verify_router_environment_rows()
+        _hy3_verify_router_environment_topology()
         if verify_strategy != "capture_commit":
             raise BenchmarkConfigurationError(
                 "Hy3 router seam requires capture_commit verify strategy"

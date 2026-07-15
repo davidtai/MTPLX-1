@@ -201,6 +201,51 @@ def test_fixed_m4_router_caches_shared_record_after_first_layer_dispatch(
     assert stats["traces"] == 1
 
 
+def test_fixed_m4_per_router_topology_uses_distinct_captured_graphs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "1")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY", "per-router")
+    args = _args()
+    args.num_hidden_layers = 3
+    args.mlp_layer_types = ["dense", "sparse", "sparse"]
+    model = Model(args)
+    routers = [
+        model.model.layers[1].mlp.router,
+        model.model.layers[2].mlp.router,
+    ]
+    hidden = mx.full((1, 4, 64), 0.125, dtype=mx.bfloat16)
+    expected = [router._forward_stock(hidden) for router in routers]
+    mx.eval(*(item for output in expected for item in output))
+    reset_hy3_verify_router_stats()
+
+    with attention_phase("decode_verify"):
+        actual = [router(hidden) for router in routers]
+        mx.eval(*(item for output in actual for item in output))
+
+    for observed, stock in zip(actual, expected, strict=True):
+        assert mx.array_equal(observed[0], stock[0]).item()
+        assert mx.array_equal(observed[1], stock[1]).item()
+    stats = hy3_verify_router_stats()
+    assert stats["topology"] == "per-router"
+    assert stats["compiled_router_count"] == 2
+    assert stats["compiled_graph_count"] == 2
+    assert stats["shared_graph_calls"] == 0
+    assert stats["per_router_graph_calls"] == 2
+    assert stats["traces"] == 2
+    assert stats["retraces"] == 0
+
+
+def test_verify_router_rejects_unknown_topology_at_model_load(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "1")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY", "unknown")
+
+    with pytest.raises(ValueError, match="TOPOLOGY.*shared.*per-router"):
+        Model(_args())
+
+
 def test_fixed_m4_wrapped_router_preserves_wrapper_on_per_router_graph(
     monkeypatch,
 ) -> None:

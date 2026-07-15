@@ -173,6 +173,15 @@ The selector is intentionally evidence-only and off by default:
 
 - `MTPLX_HY3_VERIFY_ROUTER_COMPILE=off|on|parity`
 - `MTPLX_HY3_VERIFY_ROUTER_ROWS=2..8` (Issue #63 tunes Rows=4 first)
+- `MTPLX_HY3_VERIFY_ROUTER_TOPOLOGY=shared|per-router` (default `shared`)
+
+The topology selector is an explicit supporting-experiment control. `shared`
+uses one weight-parameterized fixed-M router graph across all 79 sparse layers;
+`per-router` captures one fixed-M graph per sparse layer. Retained evidence must
+name the selected topology and prove either one shared graph with every compiled
+call routed through it, or 79 per-router graphs with every compiled call routed
+through those graphs. Both paths retain the same zero-retrace, zero-retained-
+trace, exact-routing, and full-layer-coverage gates.
 
 ### A1 correctness gate
 
