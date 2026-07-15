@@ -138,6 +138,29 @@ generations, or falls back on every call, do not weaken the gates. Narrow the
 compiled region around pure resident computation or reject A1 if that boundary
 cannot be isolated without excessive complexity.
 
+#### Confirmed Hy3 boundary and fixed-M4 refinement (2026-07-15)
+
+The whole-window attempt is not a legal streamed-Hy3 boundary. A real Hy3-Q2
+trace failed on all three attempts with MLX's explicit `eval`-during-`compile`
+guard. Every sparse layer must materialize its dynamic router indices before
+authoritative expert-cache admission, SSD reads, slot-generation binding,
+pins, counters, and completion fences; those host effects cannot be captured
+inside one outer graph.
+
+The architecture-specific refinement compiles only the pure router array
+function for batch 1, fixed M=4 (`K=3`) `decode_verify` calls. It returns to
+the unchanged streamed expert runtime immediately after producing route IDs
+and weights. `parity` mode double-runs that pure seam and fails closed unless
+route identity/order and route weights are bit-exact. Retained performance
+evidence additionally requires all 79 sparse-layer routers, zero failures,
+zero retraces, and zero retained traces. Calls at every other row count remain
+stock, so a K0-K7 matrix keeps non-K3 behavior independently attributable.
+
+The selector is intentionally evidence-only and off by default:
+
+- `MTPLX_HY3_VERIFY_ROUTER_COMPILE=off|on|parity`
+- `MTPLX_HY3_VERIFY_ROUTER_ROWS=2..8` (Issue #63 tunes Rows=4 first)
+
 ### A1 correctness gate
 
 For every authorized D1 or D2 cell:
