@@ -276,14 +276,17 @@ def _router_storage_module(module: nn.Module) -> nn.Module:
 class Router(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        from ..hy3_verify_router import hy3_verify_router_enabled
+
         self.top_k = args.num_experts_per_tok
         self.num_experts = args.num_experts
         self.route_norm = args.route_norm
         self.router_scaling_factor = args.router_scaling_factor
         self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.expert_bias = mx.zeros((args.num_experts,), dtype=mx.float32)
+        self._verify_router_compile = hy3_verify_router_enabled()
 
-    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+    def _forward_stock(self, x: mx.array) -> tuple[mx.array, mx.array]:
         storage_gate = _router_storage_module(self.gate)
         if isinstance(storage_gate, nn.QuantizedLinear):
             # Preserve the pinned community-Q4 affine-Q8 execution contract.
@@ -306,6 +309,17 @@ class Router(nn.Module):
         if self.route_norm:
             weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
         return indices, weights * self.router_scaling_factor
+
+    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        # A streamed sparse layer must return to Python after routing so the
+        # authoritative expert runtime can perform cache/slot/SSD decisions.
+        # The opt-in Issue #63 experiment compiles only this pure router body.
+        if not self._verify_router_compile:
+            return self._forward_stock(x)
+
+        from ..hy3_verify_router import maybe_compile_hy3_verify_router
+
+        return maybe_compile_hy3_verify_router(self, x, self._forward_stock)
 
 
 class SparseMLP(nn.Module):

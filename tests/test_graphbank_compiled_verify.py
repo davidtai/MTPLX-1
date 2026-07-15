@@ -1075,6 +1075,20 @@ def test_generation_flag_off_instantiates_no_bank(monkeypatch):
     assert out.stats.verify_calls >= 1
 
 
+def test_generation_attaches_fixed_hy3_router_seam_evidence(monkeypatch):
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY", raising=False)
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "1")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+
+    out, _model = _run_tiny_mtpk()
+
+    evidence = out.stats.graphbank["hy3_verify_router"]
+    assert evidence["mode"] == "on"
+    assert evidence["target_rows"] == 4
+    assert evidence["compiled_calls"] == 0
+    assert "compiled_verify" not in out.stats.graphbank
+
+
 def test_generation_flag_on_attaches_stats_and_matches_flag_off(monkeypatch):
     monkeypatch.delenv("MTPLX_COMPILED_VERIFY", raising=False)
     baseline, _ = _run_tiny_mtpk()

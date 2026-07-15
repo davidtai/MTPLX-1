@@ -745,6 +745,8 @@ def test_matrix_requires_and_records_sustained_prefill(
     assert payload["configuration"]["generation_environment"] == {
         "MTPLX_SUSTAINED_PREFILL": "yes",
         "MTPLX_SUSTAINED_PREFILL_LAYOUT": "auto",
+        "MTPLX_HY3_VERIFY_ROUTER_COMPILE": None,
+        "MTPLX_HY3_VERIFY_ROUTER_ROWS": None,
         "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS": None,
         "MTPLX_LATE_DEPTH_BEFORE": None,
         "MTPLX_LATE_DEPTH_AFTER": None,

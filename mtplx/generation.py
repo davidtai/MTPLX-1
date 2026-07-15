@@ -52,6 +52,11 @@ from .graphbank import (
     compiled_verify_target_rows,
     promote_kv_cache_offsets,
 )
+from .hy3_verify_router import (
+    hy3_verify_router_enabled,
+    hy3_verify_router_stats,
+    reset_hy3_verify_router_stats,
+)
 from .native_mlp import set_native_mlp_context
 from .loop_guard import LoopGuard, loop_guard_config_from_env
 from .profiles import resolve_long_context_mtp_depth
@@ -5395,6 +5400,11 @@ def generate_mtpk(
         and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
         else None
     )
+    hy3_verify_router_active = hy3_verify_router_enabled()
+    if hy3_verify_router_active:
+        # Prompt prefill is deliberately outside this fixed decode-only seam;
+        # retained evidence starts at the first speculative verify window.
+        reset_hy3_verify_router_stats()
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
     commit_time = capture_commit_time = 0.0
     bonus_time = 0.0
@@ -7599,6 +7609,9 @@ def generate_mtpk(
 
     emit_trace(force=True, final=True)
     elapsed = time.perf_counter() - started_all
+    hy3_router_compile_evidence = (
+        hy3_verify_router_stats() if hy3_verify_router_active else None
+    )
     if compiled_verify_bank is not None:
         if _env_truthy("MTPLX_COMPILED_VERIFY_STATS"):
             try:
@@ -7775,6 +7788,11 @@ def generate_mtpk(
             **(
                 {"compiled_verify": compiled_verify_bank.to_dict()}
                 if compiled_verify_bank is not None
+                else {}
+            ),
+            **(
+                {"hy3_verify_router": hy3_router_compile_evidence}
+                if hy3_router_compile_evidence is not None
                 else {}
             ),
         },

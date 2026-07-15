@@ -108,6 +108,12 @@ def _generation_environment() -> dict[str, str | None]:
         "MTPLX_SUSTAINED_PREFILL_LAYOUT": os.environ.get(
             "MTPLX_SUSTAINED_PREFILL_LAYOUT"
         ),
+        "MTPLX_HY3_VERIFY_ROUTER_COMPILE": os.environ.get(
+            "MTPLX_HY3_VERIFY_ROUTER_COMPILE"
+        ),
+        "MTPLX_HY3_VERIFY_ROUTER_ROWS": os.environ.get(
+            "MTPLX_HY3_VERIFY_ROUTER_ROWS"
+        ),
         **{name: os.environ.get(name) for name in _FIXED_DEPTH_ENV_KEYS},
     }
 
