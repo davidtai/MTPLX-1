@@ -41,6 +41,7 @@ HY3_Q4_MAX_BLOCKS = hy3_q4_kv_physical_geometry(
 ).physical_blocks
 MIN_STABLE_HOLD_SAMPLES = 3
 MIN_STABLE_HOLD_DURATION_NS = 1_000_000_000
+MAX_STABLE_RAW_ALLOCATOR_CACHE_DRIFT_BYTES = 8 * 1024
 OPERATING_TARGET_BYTES = 110 * 1024**3
 HARD_CEILING_BYTES = 112 * 1024**3
 MAX_PROCESS_COMPRESSED_GROWTH_BYTES = 512 * 1024**2
@@ -1052,7 +1053,6 @@ def _validate_timeline(
         )
     stable_fields = (
         "allocator_active_bytes",
-        "allocator_cache_bytes",
         "expert_slab_physical_bytes",
         "kv_physical_bytes",
         "kv_allocated_blocks",
@@ -1067,6 +1067,17 @@ def _validate_timeline(
         raise BenchmarkGateError(
             "stable hold samples changed physical memory or slot health: "
             f"{json.dumps(stable_drift, sort_keys=True)}"
+        )
+    # MLX may retain or release one 8 KiB bookkeeping buffer between otherwise
+    # identical snapshots. The authoritative charged allocator pool and every
+    # classified physical pool remain byte-exact in stable_resource_fields.
+    allocator_cache_values = [point.allocator_cache_bytes for point in holds]
+    if max(allocator_cache_values) - min(allocator_cache_values) > (
+        MAX_STABLE_RAW_ALLOCATOR_CACHE_DRIFT_BYTES
+    ):
+        raise BenchmarkGateError(
+            "stable hold raw allocator cache drift exceeded one 8 KiB "
+            f"bookkeeping buffer: {allocator_cache_values}"
         )
     stable_resource_fields = (
         "allocator_headroom_bytes",

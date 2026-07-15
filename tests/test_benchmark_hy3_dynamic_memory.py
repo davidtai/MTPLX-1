@@ -745,7 +745,7 @@ def test_observation_requires_stable_hold_reset_regrow_and_block_crossing() -> N
     unstable["timeline"][4]["allocator_cache_charged_bytes"] = 1
     unstable["timeline"][4]["charged_bytes"] += 1
     unstable["timeline"][4]["charged_residual_bytes"] -= 1
-    with pytest.raises(BenchmarkGateError, match="allocator_cache_bytes"):
+    with pytest.raises(BenchmarkGateError, match="allocator_cache"):
         validate_campaign_observation(unstable)
 
     unstable_resource = _observation("dynamic", 4096, 0, tok_s=12.0)
@@ -944,6 +944,45 @@ def test_observation_allows_ordinary_hold_record_eviction_churn() -> None:
     validated = validate_campaign_observation(observation)
 
     assert validated.arm == "dynamic"
+
+
+def test_observation_allows_one_raw_allocator_bookkeeping_buffer_of_hold_jitter() -> (
+    None
+):
+    observation = _observation("dynamic", 4096, 0, tok_s=12.0)
+    holds = [point for point in observation["timeline"] if point["phase"] == "hold"]
+    for point in holds:
+        point["allocator_cache_charged_bytes"] = 8 * 1024
+        point["charged_bytes"] += 8 * 1024
+        point["charged_residual_bytes"] -= 8 * 1024
+    holds[1]["allocator_cache_bytes"] = 8 * 1024
+    observation["metrics"]["peak_charged_bytes"] = max(
+        point["charged_bytes"] for point in observation["timeline"]
+    )
+    observation["metrics"]["stress_peak_charged_bytes"] = max(
+        max(
+            point["allocator_peak_bytes"] + point["allocator_cache_bytes"],
+            point["charged_bytes"],
+        )
+        for point in observation["timeline"]
+    )
+
+    validated = validate_campaign_observation(observation)
+
+    assert validated.arm == "dynamic"
+
+
+def test_observation_rejects_raw_allocator_hold_jitter_above_one_buffer() -> None:
+    observation = _observation("dynamic", 4096, 0, tok_s=12.0)
+    holds = [point for point in observation["timeline"] if point["phase"] == "hold"]
+    for point in holds:
+        point["allocator_cache_charged_bytes"] = 8 * 1024 + 1
+        point["charged_bytes"] += 8 * 1024 + 1
+        point["charged_residual_bytes"] -= 8 * 1024 + 1
+    holds[1]["allocator_cache_bytes"] = 8 * 1024 + 1
+
+    with pytest.raises(BenchmarkGateError, match="raw allocator cache.*8 KiB"):
+        validate_campaign_observation(observation)
 
 
 def test_observation_rejects_hold_record_eviction_counter_regression() -> None:
