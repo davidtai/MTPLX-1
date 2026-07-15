@@ -608,12 +608,15 @@ def load(
             if isinstance(expert_manifest, ExpertManifest)
             else load_expert_manifest(expert_manifest)
         )
-        if expert_streaming_config.slot_layout == "component-banks":
+        if expert_streaming_config.dynamic_expert_cache:
+            slot_allocator = make_mlx_slot_buffer_allocator(
+                streaming_plan, streaming_spec
+            )
+        elif expert_streaming_config.slot_layout == "component-banks":
             slot_allocator = make_mlx_component_bank_allocator(
                 streaming_plan,
                 streaming_spec,
                 streaming_manifest,
-                persistent_slab_slots=(expert_streaming_config.expert_slab_slots),
             )
         else:
             slot_allocator = make_mlx_slot_buffer_allocator(

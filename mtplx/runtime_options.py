@@ -153,22 +153,12 @@ def validate_hy3_q4_dynamic_context_options(
         raise ValueError("--hy3-q4-dynamic-context requires Hy3 Q4 expert streaming")
     if (
         getattr(expert_streaming_config, "cache_scope", None) != "global"
-        or getattr(expert_streaming_config, "slot_layout", None) != "component-banks"
+        or getattr(expert_streaming_config, "slot_layout", None) != "direct-slots"
     ):
         raise ValueError(
-            "--hy3-q4-dynamic-context requires the global component-bank lane"
+            "--hy3-q4-dynamic-context requires the global direct-slot lane"
         )
     return True
-
-
-_HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS = (
-    ("expert_slab_slots", "--expert-slab-slots"),
-    (
-        "expert_regrow_hysteresis_slabs",
-        "--expert-regrow-hysteresis-slabs",
-    ),
-    ("expert_resize_min_interval_ms", "--expert-resize-min-interval-ms"),
-)
 
 
 def validate_hy3_q4_dynamic_memory_request_options(args: object) -> bool:
@@ -176,9 +166,6 @@ def validate_hy3_q4_dynamic_memory_request_options(args: object) -> bool:
 
     enabled = bool(getattr(args, "hy3_q4_dynamic_memory", False))
     if not enabled:
-        for attribute, flag in _HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS:
-            if getattr(args, attribute, None) is not None:
-                raise ValueError(f"{flag} requires --hy3-q4-dynamic-memory")
         return False
     if not bool(getattr(args, "hy3_q4_dynamic_context", False)):
         raise ValueError("--hy3-q4-dynamic-memory requires --hy3-q4-dynamic-context")
@@ -199,18 +186,18 @@ def validate_hy3_q4_dynamic_memory_options(
 
     enabled = validate_hy3_q4_dynamic_memory_request_options(args)
     config_is_dynamic = bool(
-        getattr(expert_streaming_config, "dynamic_expert_slabs", False)
+        getattr(expert_streaming_config, "dynamic_expert_cache", False)
     )
     if not enabled:
         if config_is_dynamic:
             raise ValueError(
-                "dynamic expert slabs in serving require --hy3-q4-dynamic-memory"
+                "dynamic expert cache in serving requires --hy3-q4-dynamic-memory"
             )
         return False
     if expert_streaming_config is None:
         raise ValueError("--hy3-q4-dynamic-memory requires expert streaming")
     if not config_is_dynamic:
-        raise ValueError("--hy3-q4-dynamic-memory requires dynamic_expert_slabs=True")
+        raise ValueError("--hy3-q4-dynamic-memory requires dynamic_expert_cache=True")
     if not bool(getattr(expert_streaming_config, "resource_telemetry", False)):
         raise ValueError("--hy3-q4-dynamic-memory requires resource_telemetry=True")
     if (
@@ -227,13 +214,6 @@ def validate_hy3_q4_dynamic_memory_options(
         raise ValueError(
             "--hy3-q4-dynamic-memory requires exactly 1 GiB allocator headroom"
         )
-    for attribute, flag in _HY3_Q4_DYNAMIC_MEMORY_TUNING_FLAGS:
-        requested = getattr(args, attribute, None)
-        if (
-            requested is not None
-            and getattr(expert_streaming_config, attribute, None) != requested
-        ):
-            raise ValueError(f"{flag} was not applied to ExpertStreamingConfig")
     return True
 
 

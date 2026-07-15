@@ -12,11 +12,15 @@ from mtplx.expert_cli import (
     append_expert_streaming_child_args,
     expert_streaming_load_kwargs,
 )
+from mtplx.expert_runtime import ExpertStreamingConfig
+from mtplx.expert_streaming_models import HY3_Q4
 from mtplx.attention_context import attention_phase
 from mtplx.expert_streaming import RoutingPhase
+from mtplx.memory_broker import BINARY_GIB
 from mtplx.models.expert_mlx import current_expert_routing_phase
 from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import MTPLXRuntime
+from mtplx.runtime_options import validate_hy3_q4_dynamic_memory_options
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -33,6 +37,97 @@ def _model_root(tmp_path: Path, model_type: str = "hy_v3") -> Path:
     )
     (root / "expert-manifest.json").write_text("{}", encoding="utf-8")
     return root
+
+
+def test_dynamic_cache_is_direct_machine_configurable_and_record_granular() -> None:
+    config = ExpertStreamingConfig(
+        model_key="hy3-q4",
+        memory_limit_bytes=100 * BINARY_GIB,
+        max_live_kv_tokens=131_072,
+        runtime_reserve_bytes=8 * BINARY_GIB,
+        transient_slots=32,
+        cache_policy="lru",
+        cache_scope="global",
+        slot_layout="direct-slots",
+        dynamic_expert_cache=True,
+    )
+
+    plan = config.memory_plan(HY3_Q4)
+
+    assert config.memory_limit_bytes == 100 * BINARY_GIB
+    assert plan.persistent_slots > 0
+    assert plan.persistent_cache_bytes % HY3_Q4.expert_record_bytes == 0
+    assert not hasattr(config, "dynamic_expert_slabs")
+    assert not hasattr(config, "expert_slab_slots")
+
+
+def test_dynamic_memory_cli_builds_direct_cache_config(tmp_path: Path) -> None:
+    root = _model_root(tmp_path)
+    parser = argparse.ArgumentParser()
+    add_expert_streaming_args(parser, include_hy3_dynamic_memory=True)
+    args = parser.parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "100GiB",
+            "--expert-max-live-kv-tokens",
+            "131072",
+            "--expert-cache-scope",
+            "global",
+            "--expert-slot-layout",
+            "direct-slots",
+            "--hy3-q4-dynamic-memory",
+        ]
+    )
+
+    config = expert_streaming_load_kwargs(args, root)["expert_streaming_config"]
+
+    assert config.dynamic_expert_cache is True
+    assert config.memory_limit_bytes == 100 * BINARY_GIB
+    assert config.slot_layout == "direct-slots"
+    assert not hasattr(config, "dynamic_expert_slabs")
+
+
+@pytest.mark.parametrize(
+    "removed_flag",
+    [
+        "--expert-slab-slots",
+        "--expert-regrow-hysteresis-slabs",
+        "--expert-resize-min-interval-ms",
+    ],
+)
+def test_dynamic_memory_cli_rejects_removed_slab_flags(removed_flag: str) -> None:
+    parser = argparse.ArgumentParser()
+    add_expert_streaming_args(parser, include_hy3_dynamic_memory=True)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--hy3-q4-dynamic-memory", removed_flag, "1"])
+
+
+def test_dynamic_memory_attestation_uses_direct_cache_capability() -> None:
+    args = SimpleNamespace(
+        hy3_q4_dynamic_memory=True,
+        hy3_q4_dynamic_context=True,
+        expert_streaming=True,
+        expert_streaming_config=None,
+        expert_manifest=None,
+    )
+    config = ExpertStreamingConfig(
+        model_key="hy3-q4",
+        memory_limit_bytes=100 * BINARY_GIB,
+        max_live_kv_tokens=131_072,
+        kv_bytes_per_token_override=84_480,
+        runtime_reserve_bytes=8 * BINARY_GIB,
+        allocator_headroom_bytes=BINARY_GIB,
+        transient_slots=32,
+        cache_policy="lru",
+        cache_scope="global",
+        slot_layout="direct-slots",
+        resource_telemetry=True,
+        dynamic_expert_cache=True,
+    )
+
+    assert validate_hy3_q4_dynamic_memory_options(args, config) is True
 
 
 def test_expert_cli_builds_explicit_bounded_config(tmp_path: Path) -> None:
@@ -713,6 +808,52 @@ def _patch_streamed_load_to_live_broker(
         resident_boundary,
     )
     return runtime
+
+
+def test_programmatic_load_preserves_static_component_bank_allocator(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import mtplx.models.expert_mlx as expert_mlx_module
+    from mtplx.runtime import load
+
+    class ResidentLoadBoundary(RuntimeError):
+        pass
+
+    calls: list[tuple[object, ...]] = []
+
+    def resident_boundary(*_args, **_kwargs):
+        raise ResidentLoadBoundary
+
+    _patch_streamed_load_to_live_broker(
+        monkeypatch,
+        resident_boundary=resident_boundary,
+    )
+    monkeypatch.setattr(
+        expert_mlx_module,
+        "make_mlx_component_bank_allocator",
+        lambda *args, **kwargs: calls.append((*args, kwargs)) or object(),
+    )
+    config = ExpertStreamingConfig(
+        model_key="hy3-q4",
+        memory_limit_bytes=16 * BINARY_GIB,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    )
+
+    with pytest.raises(ResidentLoadBoundary):
+        load(
+            tmp_path,
+            mtp=False,
+            expert_streaming_config=config,
+            expert_manifest=tmp_path / "expert-manifest.json",
+            model_config={"model_type": "hy_v3"},
+        )
+
+    assert len(calls) == 1
+    assert calls[0][-1] == {}
 
 
 def test_programmatic_load_rejects_mtp_when_strict_dynamic_q4_is_live(

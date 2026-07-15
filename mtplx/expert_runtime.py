@@ -160,10 +160,7 @@ class ExpertStreamingConfig:
     cache_scope: str = "layer"
     bypass_page_cache: bool = False
     resource_telemetry: bool = False
-    dynamic_expert_slabs: bool = False
-    expert_slab_slots: int = 32
-    expert_regrow_hysteresis_slabs: int = 1
-    expert_resize_min_interval_ms: int = 1000
+    dynamic_expert_cache: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -177,9 +174,6 @@ class ExpertStreamingConfig:
             ("execution_workspace_bytes", 0),
             ("max_open_files", 1),
             ("max_read_chunk_bytes", 1),
-            ("expert_slab_slots", 1),
-            ("expert_regrow_hysteresis_slabs", 0),
-            ("expert_resize_min_interval_ms", 0),
         ):
             object.__setattr__(
                 self, name, _integer(name, getattr(self, name), minimum=minimum)
@@ -226,7 +220,7 @@ class ExpertStreamingConfig:
             "trace_routes",
             "bypass_page_cache",
             "resource_telemetry",
-            "dynamic_expert_slabs",
+            "dynamic_expert_cache",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be bool")
@@ -248,20 +242,18 @@ class ExpertStreamingConfig:
             raise ValueError(
                 "prefill admission is not implemented; prefill must use transient slots"
             )
-        if self.dynamic_expert_slabs:
+        if self.dynamic_expert_cache:
             if self.model_key != "hy3-q4":
-                raise ValueError("dynamic expert slabs require model_key='hy3-q4'")
-            if self.cache_scope != "global" or self.slot_layout != "component-banks":
-                raise ValueError(
-                    "dynamic expert slabs require global component-bank caching"
-                )
+                raise ValueError("dynamic expert cache requires model_key='hy3-q4'")
+            if self.cache_scope != "global":
+                raise ValueError("dynamic expert cache requires global caching")
+            if self.slot_layout != "direct-slots":
+                raise ValueError("dynamic expert cache requires direct-slots")
+            if self.cache_policy != "lru":
+                raise ValueError("dynamic expert cache requires cache_policy='lru'")
             if self.max_live_kv_tokens != 131_072:
                 raise ValueError(
-                    "dynamic expert slabs require max_live_kv_tokens=131072"
-                )
-            if not 110 * BINARY_GIB <= self.memory_limit_bytes <= 112 * BINARY_GIB:
-                raise ValueError(
-                    "dynamic expert slabs require a memory limit between 110 and 112 GiB"
+                    "dynamic expert cache requires max_live_kv_tokens=131072"
                 )
 
     def memory_plan(self, spec: ExpertStreamingModelSpec) -> ExpertMemoryPlan:
@@ -276,8 +268,7 @@ class ExpertStreamingConfig:
             transient_slots = spec.top_k
         total_limit_bytes = self.memory_limit_bytes
         context_tokens = self.max_live_kv_tokens
-        if self.dynamic_expert_slabs:
-            total_limit_bytes = min(total_limit_bytes, 110 * BINARY_GIB)
+        if self.dynamic_expert_cache:
             context_tokens = 0
         requested_context_tokens = context_tokens
         if (
@@ -309,23 +300,7 @@ class ExpertStreamingConfig:
         )
         if plan.context_tokens != requested_context_tokens:
             plan = replace(plan, context_tokens=requested_context_tokens)
-        if not self.dynamic_expert_slabs:
-            return plan
-        aligned_slots = (
-            plan.persistent_slots // self.expert_slab_slots
-        ) * self.expert_slab_slots
-        removed_slots = plan.persistent_slots - aligned_slots
-        removed_bytes = removed_slots * spec.expert_record_bytes
-        return replace(
-            plan,
-            persistent_slots=aligned_slots,
-            slots_per_layer=min(
-                spec.expert_count,
-                aligned_slots // spec.routed_layer_count,
-            ),
-            persistent_cache_bytes=(aligned_slots * spec.expert_record_bytes),
-            unallocated_bytes=plan.unallocated_bytes + removed_bytes,
-        )
+        return plan
 
     def to_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
