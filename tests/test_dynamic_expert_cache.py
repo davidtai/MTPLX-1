@@ -226,6 +226,34 @@ def test_dynamic_runtime_starts_empty_warms_reuses_and_gives_record_to_kv(
         runtime._split_executor.shutdown(wait=True)
 
 
+def test_record_growth_reconciles_post_setup_allocator_drift_before_planning() -> None:
+    runtime = _runtime(memory_limit_bytes=70)
+    peak = 55
+
+    def sample_allocator_memory() -> AllocatorMemorySample:
+        nonlocal peak
+        active = (
+            55
+            + runtime.slots.persistent_cache_telemetry_snapshot()["physical_bytes"]
+        )
+        peak = max(peak, active)
+        sample = AllocatorMemorySample(active, 0, peak)
+        runtime._last_allocator_sample = sample
+        return sample
+
+    runtime._sample_allocator_memory = sample_allocator_memory
+    try:
+        ready = runtime.ensure_route(1, [0], phase="decode")
+        ready.release(synchronize=False)
+
+        snapshot = runtime.memory_broker.snapshot()
+        assert snapshot.expert_cache_physical_bytes == 10
+        assert snapshot.allocator_cache_bytes == 5
+        assert snapshot.charged_bytes == 65
+    finally:
+        runtime._split_executor.shutdown(wait=True)
+
+
 def test_split_route_uses_same_miss_warming_and_hit_fast_path(monkeypatch) -> None:
     runtime = _runtime()
     broker_calls = 0

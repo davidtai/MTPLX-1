@@ -2009,11 +2009,12 @@ class ExpertStreamingRuntime:
         demand = bank.growth_demand(layer, expert_ids, phase=phase)
         grown = 0
         for slot_id in bank.inactive_slot_ids()[:demand]:
+            allocator_before = self._sample_allocator_memory()
+            broker.reconcile_allocator_cache(allocator_before)
             ticket = broker.plan_expert_cache_growth()
             if ticket is None:
                 break
             bank.preflight_activate_slots((slot_id,))
-            allocator_before = self._sample_allocator_memory()
             allocated = False
             committed = False
             try:
