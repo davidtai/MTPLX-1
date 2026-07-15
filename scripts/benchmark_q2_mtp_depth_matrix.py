@@ -127,6 +127,36 @@ def _compiled_verify_environment_mode() -> str:
     return raw
 
 
+def _hy3_verify_router_environment_mode() -> str:
+    raw = (
+        os.environ.get("MTPLX_HY3_VERIFY_ROUTER_COMPILE") or "off"
+    ).strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return "off"
+    if raw in _TRUTHY_ENV_VALUES:
+        return "on"
+    if raw == "parity":
+        return raw
+    raise BenchmarkConfigurationError(
+        "MTPLX_HY3_VERIFY_ROUTER_COMPILE must be off, on, or parity"
+    )
+
+
+def _hy3_verify_router_environment_rows() -> int:
+    raw = (os.environ.get("MTPLX_HY3_VERIFY_ROUTER_ROWS") or "4").strip()
+    try:
+        rows = int(raw)
+    except ValueError as exc:
+        raise BenchmarkConfigurationError(
+            "MTPLX_HY3_VERIFY_ROUTER_ROWS must be an integer"
+        ) from exc
+    if not 2 <= rows <= 8:
+        raise BenchmarkConfigurationError(
+            "MTPLX_HY3_VERIFY_ROUTER_ROWS must be within [2, 8]"
+        )
+    return rows
+
+
 Checkpoint = Callable[[Mapping[str, Any]], None]
 
 
@@ -1576,11 +1606,15 @@ def _run_observation(
         committed_history = depth == 0 or history_policy == "committed"
         guards_disabled = _guards_disabled(stats)
         compiled_verify = None
+        hy3_verify_router = None
         graphbank = _field(stats, "graphbank", {})
         if isinstance(graphbank, Mapping):
             candidate_evidence = graphbank.get("compiled_verify")
             if isinstance(candidate_evidence, Mapping):
                 compiled_verify = dict(candidate_evidence)
+            router_evidence = graphbank.get("hy3_verify_router")
+            if isinstance(router_evidence, Mapping):
+                hy3_verify_router = dict(router_evidence)
         compiled_verify_evidence = depth == 0
         if depth > 0 and compiled_verify_mode in {"parity", "on"}:
             if compiled_verify is None:
@@ -1643,6 +1677,93 @@ def _run_observation(
                     "compiled verifier ran while declared mode was off"
                 )
             compiled_verify_evidence = True
+        hy3_verify_router_evidence = depth == 0
+        router_mode = _hy3_verify_router_environment_mode()
+        if depth > 0 and router_mode in {"on", "parity"}:
+            if model != "hy3-q2":
+                raise BenchmarkGateError(
+                    "Hy3 router seam is enabled for a non-Hy3 model"
+                )
+            if hy3_verify_router is None:
+                raise BenchmarkGateError("Hy3 router seam emitted no evidence")
+            if hy3_verify_router.get("mode") != router_mode:
+                raise BenchmarkGateError("Hy3 router seam mode evidence disagrees")
+            target_rows = _optional_int(hy3_verify_router, "target_rows")
+            if target_rows is None or not 2 <= target_rows <= 8:
+                raise BenchmarkGateError("Hy3 router seam target rows are invalid")
+            if target_rows != _hy3_verify_router_environment_rows():
+                raise BenchmarkGateError(
+                    "Hy3 router seam target-row evidence disagrees"
+                )
+            failures = _optional_int(hy3_verify_router, "failures")
+            parity_failures = _optional_int(
+                hy3_verify_router,
+                "parity_failures",
+            )
+            retraces = _optional_int(hy3_verify_router, "retraces")
+            if failures != 0 or parity_failures != 0:
+                raise BenchmarkGateError("Hy3 router seam reported a failure")
+            if retraces != 0:
+                raise BenchmarkGateError("Hy3 router seam retraced")
+            eligible_calls = _optional_int(hy3_verify_router, "eligible_calls")
+            router_compiled_calls = _optional_int(
+                hy3_verify_router,
+                "compiled_calls",
+            )
+            target_depth = target_rows - 1
+            if depth == target_depth:
+                if eligible_calls is None or eligible_calls <= 0:
+                    raise BenchmarkGateError("Hy3 router seam emitted no M4 calls")
+                if router_compiled_calls != eligible_calls:
+                    raise BenchmarkGateError(
+                        "Hy3 router seam calls were not fully compiled"
+                    )
+                if _optional_int(hy3_verify_router, "compiled_router_count") != 79:
+                    raise BenchmarkGateError(
+                        "Hy3 router seam did not cover all 79 sparse layers"
+                    )
+                if retained_measurement and _optional_int(
+                    hy3_verify_router,
+                    "traces",
+                ) != 0:
+                    raise BenchmarkGateError(
+                        "Hy3 router seam traced during retained measurement"
+                    )
+                parity_checks = _optional_int(
+                    hy3_verify_router,
+                    "parity_checks",
+                )
+                if router_mode == "parity":
+                    if parity_checks != router_compiled_calls:
+                        raise BenchmarkGateError(
+                            "Hy3 router seam did not parity-check every call"
+                        )
+                    if float(
+                        hy3_verify_router.get("max_route_weight_error", -1.0)
+                    ) != 0.0:
+                        raise BenchmarkGateError(
+                            "Hy3 router seam route-weight parity was not exact"
+                        )
+                elif parity_checks not in {None, 0}:
+                    raise BenchmarkGateError(
+                        "Hy3 router seam parity ran in performance mode"
+                    )
+            elif router_compiled_calls not in {None, 0}:
+                raise BenchmarkGateError(
+                    "Hy3 router seam compiled outside its fixed target depth"
+                )
+            hy3_verify_router_evidence = True
+        elif depth > 0:
+            router_compiled_calls = (
+                _optional_int(hy3_verify_router, "compiled_calls")
+                if hy3_verify_router is not None
+                else 0
+            )
+            if router_compiled_calls not in {None, 0}:
+                raise BenchmarkGateError(
+                    "Hy3 router seam ran while declared mode was off"
+                )
+            hy3_verify_router_evidence = True
         if not ar_finish_parity:
             raise BenchmarkGateError(f"{model} d{depth} finish reason diverged from AR")
         if not requested_exact or not effective_exact:
@@ -1730,6 +1851,7 @@ def _run_observation(
         "token_ids": tokens,
         "generation_events": _jsonable(_field(stats, "events", [])),
         "compiled_verify": _jsonable(compiled_verify),
+        "hy3_verify_router": _jsonable(hy3_verify_router),
         "ar_comparison": ar_comparison,
         "speculative_event_contract": speculative_event_contract,
         "final_state_contract": final_state_contract,
@@ -1758,6 +1880,7 @@ def _run_observation(
             or speculative_event_contract is not None,
             "final_state_contract": depth == 0 or final_state_contract is not None,
             "compiled_verify_evidence": compiled_verify_evidence,
+            "hy3_verify_router_evidence": hy3_verify_router_evidence,
         },
     }
     if not row["gates"]["new_prefill_tokens_exact"]:
@@ -2011,6 +2134,13 @@ def _run_depth_matrix_impl(
         raise BenchmarkConfigurationError(
             "compiled verify requires capture_commit verify strategy"
         )
+    router_mode = _hy3_verify_router_environment_mode()
+    if router_mode != "off":
+        _hy3_verify_router_environment_rows()
+        if verify_strategy != "capture_commit":
+            raise BenchmarkConfigurationError(
+                "Hy3 router seam requires capture_commit verify strategy"
+            )
     observed_compiled_mode = _compiled_verify_environment_mode()
     if observed_compiled_mode != compiled_verify_mode:
         raise BenchmarkConfigurationError(
@@ -2026,6 +2156,10 @@ def _run_depth_matrix_impl(
     names = [request["model"] for request in normalized]
     if len(set(names)) != len(names):
         raise BenchmarkConfigurationError("models must not repeat")
+    if router_mode != "off" and any(name != "hy3-q2" for name in names):
+        raise BenchmarkConfigurationError(
+            "Hy3 router seam supports only the hy3-q2 model"
+        )
     context_values = tuple(int(value) for value in contexts)
     if (
         not context_values

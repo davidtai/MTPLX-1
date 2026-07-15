@@ -510,6 +510,29 @@ def test_compiled_verify_requires_capture_commit_before_model_load(
     assert calls.loads == []
 
 
+def test_hy3_router_seam_requires_capture_commit_before_model_load(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "on")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+
+    with pytest.raises(
+        module.BenchmarkConfigurationError,
+        match="Hy3 router seam requires capture_commit",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            verify_strategy="batched",
+            apis=apis,
+        )
+
+    assert calls.loads == []
+
+
 def test_compiled_verify_requires_complete_per_row_evidence(
     tmp_path: Path,
     monkeypatch,
@@ -709,6 +732,84 @@ def test_k3_compiled_verify_accepts_complete_fixed_rows4_evidence(
     assert payload["models"][0]["observations"][1]["compiled_verify"] == evidence[
         "compiled_verify"
     ]
+
+
+def test_k3_router_seam_accepts_prewarmed_complete_m4_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "hy3_verify_router": {
+            "mode": "on",
+            "target_rows": 4,
+            "eligible_calls": 3160,
+            "compiled_calls": 3160,
+            "compiled_router_count": 79,
+            "traces": 0,
+            "initial_traces": 0,
+            "retraces": 0,
+            "failures": 0,
+            "fallback_reasons": {"rows:1": 79},
+            "parity_checks": 0,
+            "parity_failures": 0,
+            "max_route_weight_error": 0.0,
+            "last_failure": None,
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "on")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (3,)}],
+        contexts=(1024,),
+        verify_strategy="capture_commit",
+        apis=apis,
+    )
+
+    row = payload["models"][0]["observations"][1]
+    assert row["hy3_verify_router"] == evidence["hy3_verify_router"]
+    assert row["gates"]["hy3_verify_router_evidence"] is True
+
+
+def test_k3_router_seam_rejects_retained_trace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "hy3_verify_router": {
+            "mode": "on",
+            "target_rows": 4,
+            "eligible_calls": 79,
+            "compiled_calls": 79,
+            "compiled_router_count": 79,
+            "traces": 1,
+            "initial_traces": 1,
+            "retraces": 0,
+            "failures": 0,
+            "fallback_reasons": {},
+            "parity_checks": 0,
+            "parity_failures": 0,
+            "max_route_weight_error": 0.0,
+            "last_failure": None,
+        }
+    }
+    apis, _calls = _fake_apis(module, compiled_evidence=evidence)
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_COMPILE", "on")
+    monkeypatch.setenv("MTPLX_HY3_VERIFY_ROUTER_ROWS", "4")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="router seam traced during retained measurement",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            apis=apis,
+        )
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])
@@ -1778,9 +1879,10 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "guards_disabled": True,
         "decode_expert_cache_metrics": True,
         "speculative_event_contract": True,
-        "final_state_contract": True,
-        "compiled_verify_evidence": True,
-    }
+            "final_state_contract": True,
+            "compiled_verify_evidence": True,
+            "hy3_verify_router_evidence": True,
+        }
 
 
 def test_exact_prompt_and_output_gates_fail_closed(tmp_path: Path) -> None:
