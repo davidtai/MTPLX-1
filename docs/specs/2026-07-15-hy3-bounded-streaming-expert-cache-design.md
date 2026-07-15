@@ -1,6 +1,6 @@
 # Hy3 Demand-Loaded Direct-Pread Expert Cache Design
 
-**Status:** Pending user approval
+**Status:** Approved for implementation
 
 ## Decision
 
