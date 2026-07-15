@@ -40,6 +40,14 @@ def _closed_allocator(_size: int, _label: str) -> Any:
     raise ExpertSlotError("expert slot pool is closed; its allocator was released")
 
 
+def _nonnegative_integer(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an exact integer")
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return value
+
+
 @dataclass
 class RouteIOAdmission:
     """Per-route record of executor work accepted past the rollback boundary."""
@@ -113,6 +121,12 @@ class ExpertSlabReclaimTicket:
 class ExpertSlabReclaimResult:
     slab_ids: tuple[int, ...]
     released_slot_ids: tuple[int, ...]
+    physical_bytes: int
+
+
+@dataclass(frozen=True)
+class ExpertRecordReleaseResult:
+    slot_ids: tuple[int, ...]
     physical_bytes: int
 
 
@@ -309,7 +323,7 @@ class ExpertSlotMetrics:
 @dataclass
 class _PhysicalSlot:
     label: str
-    buffer: Any
+    buffer: Any | None
     slab_id: int | None = None
     state: ExpertSlotState = ExpertSlotState.EMPTY
     layer: int | None = None
@@ -710,6 +724,7 @@ class ExpertSlotPool:
         verify_hashes: bool = True,
         device_synchronize: Callable[[], None] | None = None,
         cache_scope: str = "layer",
+        lazy_persistent_buffers: bool = False,
         resource_telemetry: bool = False,
         pipeline_ledger: ExpertPipelineLedger | None = None,
     ) -> None:
@@ -745,9 +760,24 @@ class ExpertSlotPool:
             raise TypeError("resource_telemetry must be bool")
         self.resource_telemetry_enabled = resource_telemetry
         self._pipeline_ledger = pipeline_ledger
+        self._allocator = buffer_allocator or (lambda size, _label: bytearray(size))
         if cache_scope not in {"layer", "global"}:
             raise ValueError("cache_scope must be 'layer' or 'global'")
         self.cache_scope = cache_scope
+        if not isinstance(lazy_persistent_buffers, bool):
+            raise TypeError("lazy_persistent_buffers must be bool")
+        if lazy_persistent_buffers and cache_scope != "global":
+            raise ValueError("lazy persistent buffers require global caching")
+        self.lazy_persistent_buffers = lazy_persistent_buffers
+        if lazy_persistent_buffers and (
+            not callable(getattr(self._allocator, "release_record", None))
+            or not callable(
+                getattr(self._allocator, "flush_released_records", None)
+            )
+        ):
+            raise ValueError(
+                "lazy persistent buffers require individual allocator release"
+            )
         self.global_persistent_slots = (
             plan.persistent_slots if cache_scope == "global" else 0
         )
@@ -757,7 +787,6 @@ class ExpertSlotPool:
             else plan.slots_per_layer
         )
         self.metrics = ExpertSlotMetrics()
-        self._allocator = buffer_allocator or (lambda size, _label: bytearray(size))
         self._owner_thread_id = threading.get_ident()
         self.buffer_backend = str(
             getattr(self._allocator, "backend", "python-bytearray")
@@ -867,7 +896,11 @@ class ExpertSlotPool:
                     if layer is None
                     else f"layer-{layer}-persistent-{slot_index}"
                 )
-                buffer = self._allocate_buffer(label)
+                buffer = (
+                    None
+                    if self.lazy_persistent_buffers
+                    else self._allocate_buffer(label)
+                )
                 key_layer = -1 if layer is None else layer
                 slab_id = self._slab_for_slot.get(slot_index) if layer is None else None
                 self._persistent[(key_layer, slot_index)] = _PhysicalSlot(
@@ -875,7 +908,8 @@ class ExpertSlotPool:
                     buffer,
                     slab_id=slab_id,
                 )
-                allocated += spec.expert_record_bytes
+                if buffer is not None:
+                    allocated += spec.expert_record_bytes
             transient: list[_PhysicalSlot] = []
             for slot_index in range(plan.transient_slots):
                 label = f"global-transient-{slot_index}"
@@ -887,7 +921,10 @@ class ExpertSlotPool:
             self._persistent.clear()
             self._transient = ()
             raise
-        expected = plan.persistent_cache_bytes + plan.transient_bytes
+        expected = (
+            (0 if self.lazy_persistent_buffers else plan.persistent_cache_bytes)
+            + plan.transient_bytes
+        )
         if allocated != expected:
             raise ExpertSlotError(
                 f"allocated slot bytes {allocated} do not match memory plan {expected}"
@@ -1229,6 +1266,110 @@ class ExpertSlotPool:
             )
         return buffer
 
+    def _global_persistent_slot(self, slot_id: int) -> _PhysicalSlot:
+        normalized = _nonnegative_integer("slot_id", slot_id)
+        try:
+            return self._persistent[(-1, normalized)]
+        except KeyError as exc:
+            raise ExpertSlotError(
+                "persistent slot is outside the memory plan"
+            ) from exc
+
+    def allocate_persistent_slot(self, slot_id: int) -> int:
+        """Allocate one inactive global direct-record buffer on demand."""
+
+        if threading.get_ident() != self._owner_thread_id:
+            raise ExpertSlotError("direct record allocation requires its owner thread")
+        if not self.lazy_persistent_buffers:
+            raise ExpertSlotError("persistent buffers are not lazy")
+        slot = self._global_persistent_slot(slot_id)
+        with slot.condition:
+            if slot.buffer is not None or slot.state is not ExpertSlotState.EMPTY:
+                raise ExpertSlotError(
+                    "persistent slot is already allocated or active"
+                )
+            buffer = self._allocate_buffer(slot.label)
+            slot.buffer = buffer
+            self.allocated_bytes += self.spec.expert_record_bytes
+            return self.spec.expert_record_bytes
+
+    def release_persistent_slots(
+        self,
+        slot_ids: Iterable[int],
+    ) -> ExpertRecordReleaseResult:
+        """Release exact unpinned global records and flush allocator cache once."""
+
+        if threading.get_ident() != self._owner_thread_id:
+            raise ExpertSlotError("direct record release requires its owner thread")
+        if not self.lazy_persistent_buffers:
+            raise ExpertSlotError("persistent buffers are not individually releasable")
+        normalized = tuple(
+            dict.fromkeys(
+                _nonnegative_integer("slot_id", value) for value in slot_ids
+            )
+        )
+        if not normalized:
+            raise ValueError("at least one persistent slot is required")
+        slots = tuple(
+            self._global_persistent_slot(slot_id) for slot_id in normalized
+        )
+        for slot in slots:
+            with slot.condition:
+                if slot.buffer is None:
+                    raise ExpertSlotError("persistent slot is not allocated")
+                if (
+                    slot.state is ExpertSlotState.LOADING
+                    or slot.pins
+                    or any(
+                        claim.active and claim.completion_owned
+                        for claim in slot.pin_claims
+                    )
+                ):
+                    raise ExpertSlotError("cannot release an active expert record")
+
+        release_record = getattr(self._allocator, "release_record")
+        released_bytes = 0
+        for slot in slots:
+            with slot.condition:
+                confirmed = release_record(slot.label)
+                if confirmed != self.spec.expert_record_bytes:
+                    raise ExpertSlotError(
+                        "allocator did not confirm exact direct-record release"
+                    )
+                slot.state = ExpertSlotState.EMPTY
+                slot.layer = None
+                slot.expert = None
+                slot.digest = None
+                slot.error = None
+                slot.buffer = None
+                slot.condition.notify_all()
+                released_bytes += self.spec.expert_record_bytes
+                self.allocated_bytes -= self.spec.expert_record_bytes
+        getattr(self._allocator, "flush_released_records")()
+        return ExpertRecordReleaseResult(normalized, released_bytes)
+
+    def persistent_cache_telemetry_snapshot(self) -> dict[str, int]:
+        allocated = 0
+        resident = 0
+        loading = 0
+        pinned = 0
+        for slot in self._persistent.values():
+            with slot.condition:
+                allocated += slot.buffer is not None
+                resident += (
+                    slot.buffer is not None and slot.state is ExpertSlotState.READY
+                )
+                loading += slot.state is ExpertSlotState.LOADING
+                pinned += slot.pins > 0
+        return {
+            "logical_record_capacity": len(self._persistent),
+            "allocated_record_count": allocated,
+            "resident_record_count": resident,
+            "in_flight_record_count": loading,
+            "pinned_record_count": pinned,
+            "physical_bytes": allocated * self.spec.expert_record_bytes,
+        }
+
     def _physical(self, layer: int, logical_slot: int) -> _PhysicalSlot:
         if layer not in self.spec.routed_layer_indices:
             raise ExpertSlotError(f"layer {layer} is not a routed model layer")
@@ -1247,6 +1388,8 @@ class ExpertSlotPool:
                         raise ExpertSlotError(
                             f"expert slab {slab.slab_id} is {slab.state.value}"
                         )
+            if self.lazy_persistent_buffers and slot.buffer is None:
+                raise ExpertSlotError("persistent slot has no physical buffer")
             return slot
         transient_index = logical_slot - self._persistent_route_capacity
         if not 0 <= transient_index < len(self._transient):

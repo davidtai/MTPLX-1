@@ -1583,7 +1583,7 @@ class ExpertStreamingRuntime:
             reader.close()
             raise
         memory_broker = None
-        if config.dynamic_expert_slabs:
+        if config.dynamic_expert_cache:
             try:
                 memory_broker = cls._initialize_dynamic_memory_broker(
                     config=config,

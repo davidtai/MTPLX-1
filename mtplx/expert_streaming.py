@@ -606,6 +606,7 @@ class GlobalExpertSlotBank:
         prefill_slots_per_layer: int,
         frequency_decay: float = 0.995,
         cache_policy: str = "lru",
+        initial_active_slots: int | None = None,
     ) -> None:
         self.layer_indices = tuple(
             _integer("layer index", layer, minimum=0) for layer in layer_indices
@@ -646,10 +647,22 @@ class GlobalExpertSlotBank:
         self._key_to_slot: dict[tuple[int, int], int] = {}
         self._directory: dict[tuple[int, int], _GlobalDirectoryEntry] = {}
         self._slot_generations: list[int] = [0] * self.persistent_slots
-        self._active_slot_mask: list[bool] = [True] * self.persistent_slots
-        self._active_capacity = self.persistent_slots
-        self._free_slots = deque(range(self.persistent_slots))
-        self._free_slot_set = set(range(self.persistent_slots))
+        if initial_active_slots is None:
+            active_slots = self.persistent_slots
+        else:
+            active_slots = _integer(
+                "initial_active_slots", initial_active_slots, minimum=0
+            )
+            if active_slots > self.persistent_slots:
+                raise ValueError(
+                    "initial_active_slots cannot exceed persistent_slots"
+                )
+        self._active_slot_mask = [
+            slot < active_slots for slot in range(self.persistent_slots)
+        ]
+        self._active_capacity = active_slots
+        self._free_slots = deque(range(active_slots))
+        self._free_slot_set = set(range(active_slots))
         self._lru: OrderedDict[tuple[int, int], int] = OrderedDict()
         self._lru_clock = 0
         self._history: dict[tuple[int, int], _ExpertHistory] = {}
@@ -1067,6 +1080,61 @@ class GlobalExpertSlotBank:
         normalized = self._validate_slot_ids(slot_ids)
         for slot in normalized:
             self._preflight_slot_state(slot)
+
+    def growth_demand(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> int:
+        """Return the exact inactive-record demand for one route."""
+
+        layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
+        missing = sum(
+            (layer, expert) not in self._key_to_slot
+            for expert in dict.fromkeys(experts)
+        )
+        inactive = self.persistent_slots - self.active_capacity
+        if RoutingPhase(phase) is RoutingPhase.PREFILL:
+            missing = min(
+                missing,
+                max(
+                    0,
+                    self.prefill_slots_per_layer - self._layer_occupancy[layer],
+                ),
+            )
+        return min(missing, inactive)
+
+    def rank_reclaim_slots(
+        self,
+        protected_slots: Iterable[int] = (),
+    ) -> tuple[int, ...]:
+        """Rank active direct records for individual release at a KV boundary."""
+
+        protected = set(self._validate_slot_ids(protected_slots))
+        empty = tuple(
+            slot
+            for slot, key in enumerate(self._slot_to_key)
+            if self._active_slot_mask[slot]
+            and key is None
+            and slot not in protected
+        )
+        residents = tuple(
+            slot
+            for key, slot in self._lru.items()
+            if slot not in protected
+            and self._active_slot_mask[slot]
+            and self._directory[key].state == "ready"
+        )
+        return empty + residents
+
+    def inactive_slot_ids(self) -> tuple[int, ...]:
+        return tuple(
+            slot
+            for slot, active in enumerate(self._active_slot_mask)
+            if not active
+        )
 
     def rank_reclaim_slabs(
         self,

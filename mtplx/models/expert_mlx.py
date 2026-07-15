@@ -195,8 +195,28 @@ def make_mlx_slot_buffer_allocator(
         slots[label] = value
         return value
 
+    def release_record(label: str) -> int:
+        try:
+            value = slots.pop(label)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"direct expert record is not allocated: {label}"
+            ) from exc
+        del value
+        return spec.expert_record_bytes
+
+    def flush_released_records() -> None:
+        _release_mlx_cache()
+
+    def close() -> None:
+        slots.clear()
+        _release_mlx_cache()
+
     setattr(allocate, "backend", backend)
     setattr(allocate, "slots", slots)
+    setattr(allocate, "release_record", release_record)
+    setattr(allocate, "flush_released_records", flush_released_records)
+    setattr(allocate, "close", close)
     return allocate
 
 

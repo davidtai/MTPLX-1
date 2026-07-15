@@ -13,6 +13,29 @@ from mtplx.expert_streaming import (
 )
 
 
+def test_global_lazy_cache_activates_and_ranks_individual_lru_records() -> None:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1, 2),
+        expert_count=4,
+        persistent_slots=4,
+        transient_slots=2,
+        prefill_slots_per_layer=2,
+        cache_policy="lru",
+        initial_active_slots=0,
+    )
+
+    assert bank.active_capacity == 0
+    assert bank.growth_demand(1, [0, 1], phase="decode") == 2
+
+    bank.activate_slots((0, 1))
+    plan, transaction = bank.plan_transaction(1, [0, 1], phase="decode")
+    transaction.commit()
+
+    assert tuple(load.slot for load in plan.loads) == (0, 1)
+    assert bank.rank_reclaim_slots(protected_slots=(1,)) == (0,)
+    assert bank.inactive_slot_ids() == (2, 3)
+
+
 def test_global_cache_lends_fixed_slots_between_layers() -> None:
     bank = GlobalExpertSlotBank(
         layer_indices=(1, 2),

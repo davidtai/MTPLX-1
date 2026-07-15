@@ -1203,6 +1203,42 @@ def _integrated_hy3_artifact(tmp_path: Path):
     return root, config, spec, manifest_path
 
 
+def test_direct_buffer_allocator_releases_individual_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, _config, spec, _manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    allocator = make_mlx_slot_buffer_allocator(
+        stream_config.memory_plan(spec),
+        spec,
+    )
+    cache_flushes: list[None] = []
+    monkeypatch.setattr(
+        expert_mlx,
+        "_release_mlx_cache",
+        lambda: cache_flushes.append(None),
+    )
+    label = "layer-1-persistent-0"
+
+    first = allocator(spec.expert_record_bytes, label)
+    assert allocator.release_record(label) == spec.expert_record_bytes
+    allocator.flush_released_records()
+    second = allocator(spec.expert_record_bytes, label)
+
+    assert first is not second
+    assert cache_flushes == [None]
+    allocator.close()
+    assert allocator.slots == {}
+    assert cache_flushes == [None, None]
+
+
 def test_resident_loader_runs_hy3_without_materializing_routed_parameters(
     tmp_path: Path,
 ) -> None:

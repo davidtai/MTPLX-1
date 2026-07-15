@@ -512,6 +512,128 @@ def _global_plan(spec: ExpertStreamingModelSpec, *, persistent_slots: int = 2):
     )
 
 
+class _DirectRecordAllocator:
+    backend = "test-direct-records"
+
+    def __init__(self, record_bytes: int) -> None:
+        self.record_bytes = record_bytes
+        self.buffers: dict[str, bytearray] = {}
+        self.allocation_calls: list[str] = []
+        self.release_calls: list[str] = []
+        self.flush_calls = 0
+
+    @property
+    def allocated_labels(self) -> set[str]:
+        return set(self.buffers)
+
+    def __call__(self, size: int, label: str) -> bytearray:
+        assert size == self.record_bytes
+        if label in self.buffers:
+            raise RuntimeError(f"duplicate direct record {label}")
+        self.allocation_calls.append(label)
+        buffer = bytearray(size)
+        self.buffers[label] = buffer
+        return buffer
+
+    def release_record(self, label: str) -> int:
+        self.release_calls.append(label)
+        del self.buffers[label]
+        return self.record_bytes
+
+    def flush_released_records(self) -> None:
+        self.flush_calls += 1
+
+    def close(self) -> None:
+        self.buffers.clear()
+
+
+def _lazy_global_direct_pool(
+    tmp_path: Path,
+    *,
+    persistent_slots: int = 2,
+) -> tuple[ExpertSlotPool, _DirectRecordAllocator, ExpertStreamingModelSpec]:
+    root, spec, manifest, _expected = _global_artifact(tmp_path)
+    plan = _global_plan(spec, persistent_slots=persistent_slots)
+    allocator = _DirectRecordAllocator(spec.expert_record_bytes)
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        PositionalExpertReader(root, use_native=False),
+        buffer_allocator=allocator,
+        cache_scope="global",
+        lazy_persistent_buffers=True,
+    )
+    return pool, allocator, spec
+
+
+def test_lazy_pool_allocates_no_persistent_buffers_at_open(tmp_path: Path) -> None:
+    pool, allocator, spec = _lazy_global_direct_pool(
+        tmp_path,
+        persistent_slots=2,
+    )
+    try:
+        assert allocator.allocated_labels == {"global-transient-0"}
+        assert pool.persistent_cache_telemetry_snapshot()["physical_bytes"] == 0
+
+        assert pool.allocate_persistent_slot(0) == spec.expert_record_bytes
+        assert allocator.allocated_labels == {
+            "global-persistent-0",
+            "global-transient-0",
+        }
+    finally:
+        pool.close()
+
+
+def test_direct_buffer_replacement_reuses_allocation_and_release_is_exact(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, expected = _global_artifact(tmp_path)
+    plan = _global_plan(spec, persistent_slots=1)
+    allocator = _DirectRecordAllocator(spec.expert_record_bytes)
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        PositionalExpertReader(root, use_native=False),
+        buffer_allocator=allocator,
+        cache_scope="global",
+        lazy_persistent_buffers=True,
+    )
+    try:
+        pool.allocate_persistent_slot(0)
+        allocation_count = len(allocator.allocation_calls)
+        first = pool.ensure_route(
+            1,
+            _global_persistent_plan(expert=0, slot=0, generation=1),
+        )
+        first_buffer_id = id(first.bindings[0].buffer)
+        assert bytes(first.bindings[0].buffer) == expected[(1, 0)]
+        first.release(synchronize=False)
+
+        second = pool.ensure_route(
+            1,
+            _global_persistent_plan(expert=1, slot=0, generation=2),
+        )
+        assert id(second.bindings[0].buffer) == first_buffer_id
+        assert second.bindings[0].generation == 2
+        assert bytes(second.bindings[0].buffer) == expected[(1, 1)]
+        assert len(allocator.allocation_calls) == allocation_count
+
+        with pytest.raises(ExpertSlotError, match="active expert record"):
+            pool.release_persistent_slots((0,))
+        second.release(synchronize=False)
+
+        released = pool.release_persistent_slots((0,))
+        assert released.slot_ids == (0,)
+        assert released.physical_bytes == spec.expert_record_bytes
+        assert allocator.release_calls == ["global-persistent-0"]
+        assert allocator.flush_calls == 1
+        assert pool.persistent_cache_telemetry_snapshot()["physical_bytes"] == 0
+    finally:
+        pool.close()
+
+
 class _SlabBufferAllocator:
     backend = "test-owned-slabs"
 
