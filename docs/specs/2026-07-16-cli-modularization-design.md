@@ -1,6 +1,6 @@
 # CLI and Command Modularization Design
 
-Date: 2026-07-16  
+Date: 2026-07-16
 Parent: [Repository Settings Cleanup](2026-07-16-repository-settings-cleanup-design.md)
 
 ## Purpose
@@ -149,4 +149,3 @@ After each extraction:
 - Settings-native runtime commands expose two generic configuration options.
 - Existing scripts keep parsing during the compatibility period.
 - The full suite remains green after every structural move.
-

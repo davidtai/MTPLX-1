@@ -57,6 +57,28 @@ def test_resolver_redacts_secret_provenance():
         (SettingSpec("server.api_key", SettingType.STRING, "", secret=True),)
     )
     resolved = SettingsResolver(catalog).resolve(
-        {SettingSource.CLI_SET: {"server.api_key": "top-secret"}}
+        {
+            SettingSource.USER: {"server.api_key": "old-secret"},
+            SettingSource.CLI_SET: {"server.api_key": "top-secret"},
+        }
     )
-    assert resolved.provenance["server.api_key"].display_value == "[redacted]"
+    record = resolved.provenance["server.api_key"]
+    assert resolved["server.api_key"] == "top-secret"
+    assert record.display_value == "[redacted]"
+    assert [item.value for item in record.shadowed] == [
+        "[redacted]",
+        "",
+    ]
+
+    constrained = resolved.with_constraints(
+        {"server.api_key": ("policy-secret", "test policy")}
+    )
+    constrained_record = constrained.provenance["server.api_key"]
+    assert constrained["server.api_key"] == "policy-secret"
+    assert constrained_record.display_value == "[redacted]"
+    assert constrained_record.requested_value == "[redacted]"
+    assert [item.value for item in constrained_record.shadowed] == [
+        "[redacted]",
+        "[redacted]",
+        "",
+    ]

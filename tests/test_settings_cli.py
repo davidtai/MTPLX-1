@@ -98,6 +98,46 @@ def test_settings_user_set_and_unset_round_trip(capsys, tmp_path):
     assert "removed: runtime.profile" in capsys.readouterr().out
 
 
+def test_settings_user_output_redacts_secret_values(capsys, tmp_path):
+    path = tmp_path / "config.toml"
+    secret_path = "/private/secret-api-key-location"
+
+    assert (
+        main(
+            [
+                "settings",
+                "user",
+                "set",
+                f"server.api_key_file={secret_path}",
+                "--config",
+                str(path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert secret_path not in output
+    assert json.loads(output)["settings"]["server.api_key_file"] == "[redacted]"
+
+    assert (
+        main(
+            [
+                "settings",
+                "user",
+                "show",
+                "--config",
+                str(path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert secret_path not in output
+    assert json.loads(output)["settings"]["server.api_key_file"] == "[redacted]"
+
+
 def test_bare_legacy_settings_pair_still_means_live_set(monkeypatch):
     calls = []
 

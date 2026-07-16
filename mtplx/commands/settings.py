@@ -71,6 +71,15 @@ def _emit(payload: Any, *, json_output: bool) -> None:
             print(f"{name} = {json.dumps(value, default=str)}")
 
 
+def _redact_user_settings(catalog: Any, settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: "[redacted]"
+        if catalog.require(name).secret and value
+        else value
+        for name, value in settings.items()
+    }
+
+
 def _show_effective(args: Any) -> int:
     _, resolved = _effective_settings(args)
     payload = {
@@ -160,7 +169,9 @@ def _user(args: Any) -> int:
     path = _config_path(args)
     operation = args.settings_operation
     if operation == "show":
-        settings = load_user_settings(path, catalog=catalog)
+        settings = _redact_user_settings(
+            catalog, load_user_settings(path, catalog=catalog)
+        )
         _emit(
             {"settings": settings} if getattr(args, "json", False) else settings,
             json_output=bool(getattr(args, "json", False)),
@@ -176,7 +187,9 @@ def _user(args: Any) -> int:
         }
         for name, value in validated.items():
             update_user_setting(path, name, value, catalog=catalog)
-        settings = load_user_settings(path, catalog=catalog)
+        settings = _redact_user_settings(
+            catalog, load_user_settings(path, catalog=catalog)
+        )
         if getattr(args, "json", False):
             _emit({"settings": settings}, json_output=True)
         else:
@@ -191,7 +204,11 @@ def _user(args: Any) -> int:
         unset_user_setting(path, name, catalog=catalog)
     if getattr(args, "json", False):
         _emit(
-            {"settings": load_user_settings(path, catalog=catalog)},
+            {
+                "settings": _redact_user_settings(
+                    catalog, load_user_settings(path, catalog=catalog)
+                )
+            },
             json_output=True,
         )
     else:

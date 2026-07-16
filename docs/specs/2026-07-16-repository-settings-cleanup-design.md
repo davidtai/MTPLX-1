@@ -1,7 +1,7 @@
 # Repository Settings Cleanup Design
 
-Date: 2026-07-16  
-Status: Design complete; awaiting user review  
+Date: 2026-07-16
+Status: Design complete; awaiting user review
 Base commit: `f3e08cb0693fcd4938ab5834b2b9422ececbb6e3`
 
 ## Problem

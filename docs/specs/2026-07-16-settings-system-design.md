@@ -1,6 +1,6 @@
 # Hierarchical Settings System Design
 
-Date: 2026-07-16  
+Date: 2026-07-16
 Parent: [Repository Settings Cleanup](2026-07-16-repository-settings-cleanup-design.md)
 
 ## Purpose
@@ -182,4 +182,3 @@ Automated checks enforce:
 - Existing flags and environment names still produce characterized results.
 - Effective values and their sources are inspectable before MLX loads.
 - Invalid settings cannot partially mutate user or live state.
-

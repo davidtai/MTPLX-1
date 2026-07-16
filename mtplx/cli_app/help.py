@@ -423,5 +423,3 @@ def _print_unknown_command(command: str) -> int:
         print(f"  mtplx {_command_cell(name, 10)} {summary}")
     print("\nFor the full lab surface: mtplx help advanced")
     return 2
-
-

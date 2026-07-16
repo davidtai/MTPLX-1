@@ -1,6 +1,6 @@
 # Experiment Settings Bundles Design
 
-Date: 2026-07-16  
+Date: 2026-07-16
 Parent: [Repository Settings Cleanup](2026-07-16-repository-settings-cleanup-design.md)
 
 ## Purpose

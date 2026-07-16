@@ -1,6 +1,6 @@
 # Documentation Information Architecture Design
 
-Date: 2026-07-16  
+Date: 2026-07-16
 Parent: [Repository Settings Cleanup](2026-07-16-repository-settings-cleanup-design.md)
 
 ## Purpose
@@ -124,4 +124,3 @@ or removed, never silently updated from unrelated measurements.
   product path.
 - Public settings and compatibility aliases have complete generated coverage.
 - All documented no-model commands are freshly verified.
-

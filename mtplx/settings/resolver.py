@@ -42,10 +42,12 @@ class ResolvedSettings:
         provenance: dict[str, ProvenanceRecord],
         *,
         bundle_provenance: tuple[Any, ...] = (),
+        secret_names: frozenset[str] = frozenset(),
     ):
         self._values = MappingProxyType(dict(values))
         self.provenance = MappingProxyType(dict(provenance))
         self.bundle_provenance = tuple(bundle_provenance)
+        self._secret_names = frozenset(secret_names)
 
     def __getitem__(self, name: str) -> Any:
         return self._values[name]
@@ -75,18 +77,25 @@ class ResolvedSettings:
             if effective_value == requested_value:
                 continue
             previous = provenance[name]
+            secret = name in self._secret_names
+            display_requested = (
+                "[redacted]" if secret and requested_value else requested_value
+            )
+            display_effective = (
+                "[redacted]" if secret and effective_value else effective_value
+            )
             values[name] = effective_value
             provenance[name] = ProvenanceRecord(
                 SettingSource.CONSTRAINT,
-                effective_value,
+                display_effective,
                 (
-                    SourceValue(previous.source, requested_value),
+                    SourceValue(previous.source, display_requested),
                     *previous.shadowed,
                 ),
                 requested_value=(
                     previous.requested_value
                     if previous.source is SettingSource.CONSTRAINT
-                    else requested_value
+                    else display_requested
                 ),
                 reason=reason,
             )
@@ -94,6 +103,7 @@ class ResolvedSettings:
             values,
             provenance,
             bundle_provenance=self.bundle_provenance,
+            secret_names=self._secret_names,
         )
 
 
@@ -123,13 +133,25 @@ class SettingsResolver:
             winner = ordered[0]
             spec = self.catalog.require(name)
             values[name] = winner.value
+            shadowed = tuple(
+                SourceValue(
+                    item.source,
+                    "[redacted]" if spec.secret and item.value else item.value,
+                )
+                for item in ordered[1:]
+            )
             provenance[name] = ProvenanceRecord(
                 winner.source,
                 "[redacted]" if spec.secret and winner.value else winner.value,
-                tuple(ordered[1:]),
+                shadowed,
             )
         return ResolvedSettings(
             values,
             provenance,
             bundle_provenance=bundle_provenance,
+            secret_names=frozenset(
+                spec.name
+                for spec in self.catalog.by_name.values()
+                if spec.secret
+            ),
         )
