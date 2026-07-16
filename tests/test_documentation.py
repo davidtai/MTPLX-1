@@ -75,3 +75,31 @@ def test_streamed_moe_commands_live_in_advanced_guide_not_root_readme():
     assert "scripts/build_expert_manifest.py" not in root_readme
     assert "scripts/build_expert_manifest.py" in advanced
     assert "--expert-memory-limit 104GiB" in advanced
+
+
+def test_root_readme_has_settings_native_normal_path():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    required = (
+        "mtplx start",
+        "mtplx settings user set runtime.profile=sustained",
+        "mtplx start --set generation.temperature=0.7",
+        "mtplx settings explain runtime.profile",
+        "docs/settings.md",
+        "docs/experiments.md",
+    )
+    for phrase in required:
+        assert phrase in text
+
+
+def test_root_readme_normal_sections_do_not_teach_legacy_runtime_flags():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    normal = text.split("## Advanced and compatibility", 1)[0]
+    forbidden = (
+        "--profile sustained",
+        "--default-temperature",
+        "--default-top-p",
+        "--adaptive-policy",
+        "MTPLX_COMPILED_VERIFY=",
+        "MTPLX_NAX_VERIFY=",
+    )
+    assert not [item for item in forbidden if item in normal]
