@@ -60,6 +60,7 @@ from mtplx.kpi import (
     write_json,
 )
 from mtplx.kpi.runtime_kpis import (
+    build_settings_envelope,
     distribution_suite_names,
     repo_root,
 )
@@ -4837,6 +4838,41 @@ def cmd_remove_public(args: Any) -> int:
     return 0 if result["removed"] or args.missing_ok else 1
 
 
+def _benchmark_settings_kwargs(args: Any) -> dict[str, Any]:
+    from mtplx.settings.builtins import default_setting_catalog
+    from mtplx.settings.resolver import ResolvedSettings
+
+    resolved = getattr(args, "mtplx_settings", None)
+    if not isinstance(resolved, ResolvedSettings):
+        return {}
+    catalog = default_setting_catalog()
+    provenance: dict[str, Any] = {}
+    for name, record in resolved.provenance.items():
+        spec = catalog.require(name)
+        requested = record.requested_value
+        if spec.secret and requested:
+            requested = "[redacted]"
+        provenance[name] = {
+            "source": record.source.name,
+            "requested_value": requested,
+            "reason": record.reason,
+            "shadowed_sources": [item.source.name for item in record.shadowed],
+        }
+    bundles = [
+        {
+            "id": getattr(bundle, "id", None),
+            "sha256": getattr(bundle, "sha256", None),
+            "source": str(getattr(bundle, "source", "")),
+        }
+        for bundle in resolved.bundle_provenance
+    ]
+    return {
+        "settings": resolved.to_dict(redact=True),
+        "settings_provenance": provenance,
+        "settings_bundles": bundles,
+    }
+
+
 def _cmd_bench_run(args: Any) -> int:
     model = args.model or DEFAULT_CHAMPION
     suite = args.suite or "default"
@@ -5011,6 +5047,7 @@ def _cmd_bench_run(args: Any) -> int:
             "deep_smc_trace_attached": False,
         },
         decode_trace_path=decode_trace,
+        **_benchmark_settings_kwargs(args),
     )
     envelope["artifacts"] = {
         "depth_sweep": str(output),
@@ -5317,6 +5354,9 @@ def _cmd_bench_run_direct_http(
         "direct_returncode": proc.returncode,
         "error": row_error,
     }
+    settings_kwargs = _benchmark_settings_kwargs(args)
+    if settings_kwargs:
+        envelope["settings"] = build_settings_envelope(**settings_kwargs)
     (output_dir / "direct-http-command.log").write_text(proc.stdout, encoding="utf-8")
     write_json(envelope_output, envelope)
     _print(_bench_run_console_summary(envelope))

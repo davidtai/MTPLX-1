@@ -183,7 +183,7 @@ def resolve_args_settings(
     source_environ = os.environ if environ is None else environ
     path = user_config_path(user_path)
     sources: dict[SettingSource, Mapping[str, Any]] = {}
-    if hasattr(args, "profile"):
+    if getattr(args, "profile", None) is not None:
         sources[SettingSource.PROFILE] = {
             "runtime.profile": getattr(args, "profile")
         }

@@ -2822,6 +2822,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_p.set_defaults(func=_cmd_inspect_model)
 
     bench_p = sub.add_parser("bench", help="Run benchmark harness")
+    _add_generic_settings_args(bench_p)
     bench_p.add_argument(
         "bench_action",
         nargs="?",
