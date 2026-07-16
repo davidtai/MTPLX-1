@@ -4,7 +4,8 @@ This is the hardware evidence producer for issue #46. It compares the static
 131,072-token Q4 reservation with the demand-loaded direct-record cache at 4K,
 32K, 64K, and 128K total context. The issue experiment pins a 100 GiB process
 limit, 1 GiB allocator headroom, an 8 GiB runtime reserve, and 32 transient
-slots.
+slots. Both arms use `F_NOCACHE` positional expert reads so sidecar pages do not
+accumulate in the OS page cache outside the broker's charged record ownership.
 
 The checked-in inputs are:
 
@@ -86,6 +87,7 @@ Every memory point reports:
 - individual record allocations, reuse, eviction, and release counts;
 - pinned, in-flight, and speculative expert bytes;
 - process RSS, compressed memory, system swap delta, and AGX GPU utilization;
+- the exact expert-streaming configuration, including `bypass_page_cache=true`;
 - Python thread CPU for routing, policy, budgeting, broker, and reader work.
 
 The result is rejected if charged or transient memory exceeds 100 GiB,

@@ -974,6 +974,7 @@ def _validate_identity(
         "cache_policy": "lru",
         "cache_scope": "global",
         "slot_layout": "direct-slots",
+        "bypass_page_cache": True,
         "resource_telemetry": True,
     }
     for field, expected in expected_streaming.items():

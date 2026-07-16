@@ -11,6 +11,7 @@
     "source_revision": "160619d3f96c8470350b6dac0ef033a8381551e3"
   },
   "allocator_headroom_bytes": 1073741824,
+  "bypass_page_cache": true,
   "generated_tokens": 16,
   "hold_sample_count": 3,
   "hold_tokens": 8,

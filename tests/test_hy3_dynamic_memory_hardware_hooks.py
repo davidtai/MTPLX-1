@@ -545,6 +545,7 @@ def test_production_factory_builds_real_static_and_dynamic_hook_loader(
     assert isinstance(hooks.config, Hy3HardwareConfig)
     assert hooks.config.allocator_headroom_bytes == 1024**3
     assert hooks.config.memory_limit_bytes == 100 * 1024**3
+    assert hooks.config.bypass_page_cache is True
     assert hooks.config.model_root == tmp_path / "Hy3-4bit"
     assert hooks.config.hold_warmup_tokens == 32
     assert hooks.config.completion_reserve_tokens == 72
@@ -607,6 +608,15 @@ def test_hardware_config_requires_exact_external_artifact_pins(
                 }
             )
 
+    with pytest.raises(ArmObservationError, match="bypass_page_cache"):
+        Hy3HardwareConfig.from_mapping(
+            {
+                **base,
+                "artifact_pins": _artifact_pins(),
+                "bypass_page_cache": False,
+            }
+        )
+
     with pytest.raises(ArmObservationError, match="unknown keys"):
         Hy3HardwareConfig.from_mapping(
             {
@@ -659,6 +669,8 @@ def test_hardware_arms_pin_one_gib_headroom_and_direct_record_counts(
     static_config = hardware_module._build_runtime_config(config, arm="static")
     dynamic_config = hardware_module._build_runtime_config(config, arm="dynamic")
     assert static_config.slot_layout == dynamic_config.slot_layout == "direct-slots"
+    assert static_config.bypass_page_cache is True
+    assert dynamic_config.bypass_page_cache is True
     assert static_config.dynamic_expert_cache is False
     assert dynamic_config.dynamic_expert_cache is True
 

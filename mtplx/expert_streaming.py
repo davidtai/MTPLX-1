@@ -586,14 +586,16 @@ class LayerExpertSlotBank:
 
 
 class GlobalExpertSlotBank:
-    """One fixed expert-record cache shared by every routed model layer.
+    """One logical expert-record cache shared by every routed model layer.
 
     Keys include both layer and expert ID because equal expert IDs in different
-    layers name unrelated weights.  The physical buffers are allocated once;
-    this policy only changes the generation-safe indirection from a key to a
-    global slot.  Prefill initially admits at most the legacy uniform quota per
-    layer so early layers cannot consume the entire empty pool.  Decode then
-    allows the replacement policy to move capacity between layers.
+    layers name unrelated weights.  This policy owns the generation-safe
+    indirection from a key to a global slot.  Static runtimes activate every
+    slot at startup; the dynamic runtime activates and releases individually
+    allocated direct-record slots without renumbering them.  Prefill initially
+    admits at most the legacy uniform quota per layer so early layers cannot
+    consume the entire empty pool.  Decode then allows the replacement policy
+    to move capacity between layers.
     """
 
     def __init__(
@@ -800,10 +802,7 @@ class GlobalExpertSlotBank:
             if not self._active_slot_mask[slot] or key is None or key in pinned:
                 continue
             history = self._history_for(key)
-            if self.cache_policy == "lru":
-                candidates.append((float(history.last_used), 0, slot))
-            else:
-                candidates.append((self._score(key), history.last_used, slot))
+            candidates.append((self._score(key), history.last_used, slot))
         return min(candidates)[2] if candidates else None
 
     def _assign(
@@ -1077,7 +1076,7 @@ class GlobalExpertSlotBank:
             self._free_slot_set.add(slot)
 
     def preflight_activate_slots(self, slot_ids: Iterable[int]) -> None:
-        """Prove a later locked activation cannot fail after slab allocation."""
+        """Prove locked activation cannot fail after direct-record allocation."""
 
         normalized = self._validate_slot_ids(slot_ids)
         for slot in normalized:

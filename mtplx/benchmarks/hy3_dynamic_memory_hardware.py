@@ -263,6 +263,12 @@ def _exact_int(value: object, *, field: str, minimum: int = 0) -> int:
     return value
 
 
+def _exact_bool(value: object, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ArmObservationError(f"{field} must be boolean")
+    return value
+
+
 def _string(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ArmObservationError(f"{field} must be a nonempty string")
@@ -289,6 +295,7 @@ class Hy3HardwareConfig:
     runtime_reserve_bytes: int = 8 * GIB
     allocator_headroom_bytes: int = GIB
     transient_slots: int = 32
+    bypass_page_cache: bool = True
     generated_tokens: int = 16
     hold_sample_count: int = 3
     hold_tokens: int = 8
@@ -315,6 +322,7 @@ class Hy3HardwareConfig:
             "runtime_reserve_bytes",
             "allocator_headroom_bytes",
             "transient_slots",
+            "bypass_page_cache",
             "generated_tokens",
             "hold_sample_count",
             "hold_tokens",
@@ -364,6 +372,9 @@ class Hy3HardwareConfig:
                 field="transient_slots",
                 minimum=1,
             ),
+            bypass_page_cache=_exact_bool(
+                value.get("bypass_page_cache", True), field="bypass_page_cache"
+            ),
             generated_tokens=_exact_int(
                 value.get("generated_tokens", 16),
                 field="generated_tokens",
@@ -401,6 +412,10 @@ class Hy3HardwareConfig:
         if config.allocator_headroom_bytes != HY3_Q4_ALLOCATOR_HEADROOM_BYTES:
             raise ArmObservationError(
                 "allocator_headroom_bytes must be exactly 1 GiB for issue #46"
+            )
+        if not config.bypass_page_cache:
+            raise ArmObservationError(
+                "bypass_page_cache must be true for the issue #46 campaign"
             )
         if config.completion_reserve_tokens >= 4096:
             raise ArmObservationError(
@@ -822,6 +837,7 @@ def _build_runtime_config(config: Hy3HardwareConfig, *, arm: str) -> Any:
         cache_scope="global",
         slot_layout="direct-slots",
         dynamic_expert_cache=arm == "dynamic",
+        bypass_page_cache=config.bypass_page_cache,
         verify_sidecar_hash_at_open=False,
         verify_record_hashes=True,
         resource_telemetry=True,

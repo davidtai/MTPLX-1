@@ -101,6 +101,7 @@ def _identity(arm: str = "dynamic") -> dict[str, object]:
             "cache_policy": "lru",
             "cache_scope": "global",
             "slot_layout": "direct-slots",
+            "bypass_page_cache": True,
             "dynamic_expert_cache": arm == "dynamic",
             "resource_telemetry": True,
         },
@@ -163,6 +164,7 @@ def _production_lane_identity(arm: str) -> dict[str, object]:
             "cache_policy": "lru",
             "cache_scope": "global",
             "slot_layout": "direct-slots",
+            "bypass_page_cache": True,
             "dynamic_expert_cache": arm == "dynamic",
             "resource_telemetry": True,
         },
@@ -1042,6 +1044,7 @@ def test_observation_rejects_hold_record_eviction_counter_regression() -> None:
     ("field", "value", "match"),
     (
         ("memory_limit_bytes", 1, "memory_limit_bytes"),
+        ("bypass_page_cache", False, "bypass_page_cache"),
         ("dynamic_expert_cache", False, "contradicts"),
     ),
 )

@@ -47,6 +47,7 @@ uv run mtplx serve --model "$MODEL" --yes \
   --expert-cache-policy lru \
   --expert-cache-scope global \
   --expert-slot-layout direct-slots \
+  --expert-f-nocache \
   --hy3-q4-dynamic-memory \
   --hy3-q4-dynamic-context \
   --paged-kv-quantization q4 \
@@ -61,9 +62,11 @@ uv run mtplx serve --model "$MODEL" --yes \
 ```
 
 The dynamic opt-in forces record-level telemetry, exact 84,480-byte Q4 KV
-geometry, global LRU caching, and direct slots. Contradictory combinations are
-rejected before model load. A JSON expert config cannot enable the dynamic
-cache without the separate serving opt-in.
+geometry, global LRU caching, and direct slots. The qualified issue #46 campaign
+also pins `F_NOCACHE` expert reads so streamed sidecar pages do not accumulate in
+the OS page cache outside the broker's charged expert-record ownership.
+Contradictory combinations are rejected before model load. A JSON expert config
+cannot enable the dynamic cache without the separate serving opt-in.
 
 ## Memory and request contract
 

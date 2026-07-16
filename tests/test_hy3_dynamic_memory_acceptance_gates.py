@@ -101,6 +101,7 @@ def _identity(arm: str = "static") -> dict[str, object]:
             "cache_policy": "lru",
             "cache_scope": "global",
             "slot_layout": "direct-slots",
+            "bypass_page_cache": True,
             "dynamic_expert_cache": arm == "dynamic",
             "resource_telemetry": True,
         },
