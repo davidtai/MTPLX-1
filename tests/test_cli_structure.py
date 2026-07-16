@@ -28,3 +28,33 @@ def test_cli_app_help_and_parsing_are_runtime_free():
             if any(name == item or name.startswith(item + ".") for item in FORBIDDEN)
         }
         assert not forbidden
+
+
+def test_product_and_model_groups_own_expected_commands():
+    from mtplx.cli_app.groups.models import COMMANDS as model_commands
+    from mtplx.cli_app.groups.product import COMMANDS as product_commands
+
+    assert product_commands == (
+        "hardware",
+        "start",
+        "setup",
+        "status",
+        "stop",
+        "settings",
+        "ask",
+        "quickstart",
+        "connect",
+        "openwebui",
+        "models",
+    )
+    assert model_commands == (
+        "inspect",
+        "forge",
+        "init",
+        "profiles",
+        "pull",
+        "list",
+        "remove",
+        "model",
+        "config",
+    )

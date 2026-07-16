@@ -3496,6 +3496,12 @@ def build_parser() -> argparse.ArgumentParser:
     session_p.add_argument("--output")
     session_p.set_defaults(func=_cmd_session_bank)
 
+    from .cli_app.groups.models import ModelGroupContext, register_model_commands
+    from .cli_app.groups.product import ProductGroupContext, register_product_commands
+
+    register_product_commands(sub, ProductGroupContext(default_model=default_model))
+    register_model_commands(sub, ModelGroupContext(default_model=default_model))
+
     return parser
 
 
