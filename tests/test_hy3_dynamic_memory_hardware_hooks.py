@@ -499,7 +499,23 @@ def test_record_demand_preserves_capacity_when_no_reclaim_was_required() -> None
         expert_runtime=runtime,
         route_trace=[{"phase": "decode", "layer": 7, "expert_ids": [1, 4, 9]}],
         expert_physical_bytes=lambda: next(physical),
-        require_allocation=False,
+    )
+
+    assert events == [
+        "ensure_route:7:(1, 4, 9):decode",
+        "release_route:synchronize=False",
+    ]
+
+
+def test_record_demand_may_hit_after_an_unrelated_record_was_reclaimed() -> None:
+    events: list[str] = []
+    runtime = FakeDemandRuntime(events)
+    physical = iter((600, 600))
+
+    trigger_future_demand_record_rewarm(
+        expert_runtime=runtime,
+        route_trace=[{"phase": "decode", "layer": 7, "expert_ids": [1, 4, 9]}],
+        expert_physical_bytes=lambda: next(physical),
     )
 
     assert events == [

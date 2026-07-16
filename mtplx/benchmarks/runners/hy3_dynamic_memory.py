@@ -1235,10 +1235,10 @@ def _validate_timeline(
         raise BenchmarkGateError("post_kv_growth did not physically grow Q4 KV")
     if growth.kv_allocated_blocks <= reclaim.kv_allocated_blocks:
         raise BenchmarkGateError("post_kv_growth did not allocate Q4 KV blocks")
-    if growth.expert_cache_physical_bytes > reclaim.expert_cache_physical_bytes:
-        raise BenchmarkGateError(
-            "expert records reallocated during the protected KV growth"
-        )
+    # post_kv_growth is sampled after the protected KV transaction commits and
+    # the real context prefill runs. Demand-loaded expert records may therefore
+    # grow here; the nested growth-step ledgers below guard the actual
+    # reservation gap and pre-commit boundary.
     required_final_blocks = hy3_q4_kv_physical_geometry(context_tokens).physical_blocks
     if growth.kv_allocated_blocks != required_final_blocks:
         raise BenchmarkGateError(
@@ -1254,17 +1254,9 @@ def _validate_timeline(
         raise BenchmarkGateError("record rewarm changed reset KV bytes")
     if rewarm.kv_allocated_blocks != reset.kv_allocated_blocks:
         raise BenchmarkGateError("record rewarm changed reset KV blocks")
-    if expert_release > 0 and (
-        rewarm.expert_cache_physical_bytes <= reset.expert_cache_physical_bytes
-    ):
+    if rewarm.expert_cache_physical_bytes < reset.expert_cache_physical_bytes:
         raise BenchmarkGateError(
-            "post_record_rewarm did not allocate expert cache capacity"
-        )
-    if expert_release == 0 and (
-        rewarm.expert_cache_physical_bytes != reset.expert_cache_physical_bytes
-    ):
-        raise BenchmarkGateError(
-            "post_record_rewarm changed expert capacity without prior reclaim"
+            "post_record_rewarm unexpectedly reduced expert cache capacity"
         )
     _assert_final_slot_health(rewarm)
 
@@ -1448,9 +1440,9 @@ def _validate_kv_growth_steps(
             raise BenchmarkGateError("KV growth step missed its exact block target")
         if after.kv_physical_bytes <= before.kv_physical_bytes:
             raise BenchmarkGateError("KV growth step did not increase physical bytes")
-        if after.expert_cache_physical_bytes > reclaim.expert_cache_physical_bytes:
+        if after.expert_cache_physical_bytes != reclaim.expert_cache_physical_bytes:
             raise BenchmarkGateError(
-                "expert records reallocated before KV growth committed"
+                "expert registry changed before KV growth committed"
             )
         reclaimed = (
             before.expert_cache_physical_bytes - reclaim.expert_cache_physical_bytes
@@ -1569,10 +1561,17 @@ def _validate_kv_growth_steps(
         )
     if any(
         getattr(final_after, name) != getattr(timeline_growth, name)
-        for name in physical_fields
+        for name in ("kv_physical_bytes", "kv_allocated_blocks")
     ):
         raise BenchmarkGateError(
-            "final growth ledger differs from timeline post_kv_growth physical state"
+            "final growth ledger differs from timeline post_kv_growth KV state"
+        )
+    if (
+        timeline_growth.expert_cache_physical_bytes
+        < final_after.expert_cache_physical_bytes
+    ):
+        raise BenchmarkGateError(
+            "expert cache shrank after the committed KV growth ledger"
         )
     return tuple(normalized)
 

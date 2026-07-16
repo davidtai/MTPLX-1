@@ -662,6 +662,12 @@ def preflight_and_grow_dynamic_q4(
                 raise ArmObservationError(
                     "dynamic Q4 checkpoint reached contradictory bytes"
                 )
+            if int(after["expert_cache_physical_bytes"]) != int(
+                reclaim_gap["expert_cache_physical_bytes"]
+            ):
+                raise ArmObservationError(
+                    "expert registry changed during protected Q4 materialization"
+                )
             growth_steps.append(
                 {
                     "sequence_index": sequence_index,
@@ -702,7 +708,6 @@ def trigger_future_demand_record_rewarm(
     expert_runtime: Any,
     route_trace: Sequence[Mapping[str, object]],
     expert_physical_bytes: Callable[[], int],
-    require_allocation: bool = True,
 ) -> None:
     """Exercise post-reset demand and verify its expected cache transition."""
 
@@ -727,13 +732,9 @@ def trigger_future_demand_record_rewarm(
     finally:
         ready.release(synchronize=False)
     after = int(expert_physical_bytes())
-    if require_allocation and after <= before:
+    if after < before:
         raise ArmObservationError(
-            "future route demand did not allocate an expert record"
-        )
-    if not require_allocation and after != before:
-        raise ArmObservationError(
-            "future route demand changed expert capacity without prior reclaim"
+            "future route demand unexpectedly reduced expert capacity"
         )
 
 
@@ -1031,7 +1032,6 @@ class MlxHy3HardwareLane:
         self.fixed_memory_pools = dict(fixed_memory_pools or {})
         self._reclaim_ledger: dict[str, object] | None = None
         self._return_reclaim_ledger = False
-        self._expert_reclaim_observed = False
         self._invocation_route_trace: list[dict[str, object]] = []
         self._admission_released = False
         self._closed = False
@@ -1462,10 +1462,6 @@ class MlxHy3HardwareLane:
             context_tokens=context_tokens,
             physical_ledger=self._live_physical_ledger,
         )
-        self._expert_reclaim_observed = any(
-            int(step["reclaimed_expert_bytes"]) > 0
-            for step in self._reclaim_ledger["kv_growth_steps"]
-        )
         self._return_reclaim_ledger = True
 
     def prepare_q4_context(self, context_tokens: int) -> None:
@@ -1611,7 +1607,6 @@ class MlxHy3HardwareLane:
             expert_runtime=self.runtime.expert_streaming,
             route_trace=self._invocation_route_trace,
             expert_physical_bytes=self._expert_physical_bytes,
-            require_allocation=self._expert_reclaim_observed,
         )
 
     def close(self) -> None:

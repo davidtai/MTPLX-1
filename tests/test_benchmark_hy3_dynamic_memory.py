@@ -1371,6 +1371,29 @@ def test_observation_accepts_zero_reclaim_when_ticket_requires_none() -> None:
             _adjust_growth_expert_ledger(point, reclaimed)
     steps[0]["required_expert_reclaim_bytes"] = 0
     steps[0]["reclaimed_expert_bytes"] = 0
+    post_commit_demand_bytes = 100
+    for point in row["timeline"][2:]:
+        _adjust_growth_expert_ledger(point, post_commit_demand_bytes)
+    row["metrics"]["peak_charged_bytes"] = max(
+        point["charged_bytes"] for point in row["timeline"]
+    )
+    row["metrics"]["stress_peak_charged_bytes"] = max(
+        max(
+            point["allocator_peak_bytes"] + point["allocator_cache_bytes"],
+            point["charged_bytes"],
+        )
+        for point in row["timeline"]
+    )
+
+    validate_campaign_observation(row)
+
+
+def test_post_reset_demand_may_hit_after_an_unrelated_reclaim() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    reset = row["timeline"][-2]
+    demand = row["timeline"][-1]
+    delta = reset["expert_cache_physical_bytes"] - demand["expert_cache_physical_bytes"]
+    _adjust_growth_expert_ledger(demand, delta)
     row["metrics"]["peak_charged_bytes"] = max(
         point["charged_bytes"] for point in row["timeline"]
     )
@@ -1401,7 +1424,10 @@ def test_observation_cross_links_growth_ledgers_to_timeline(checkpoint: str) -> 
     else:
         _adjust_growth_expert_ledger(steps[-1]["after"], -1)
 
-    with pytest.raises(BenchmarkGateError, match=r"timeline.*growth|growth.*timeline"):
+    with pytest.raises(
+        BenchmarkGateError,
+        match=r"timeline.*growth|growth.*timeline|before KV growth committed",
+    ):
         validate_campaign_observation(row)
 
 
