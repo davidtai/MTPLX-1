@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Issue 51 K3 response comparison</title>
+<style>
+body{margin:0;font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:#111827;color:#e5e7eb}
+header{position:sticky;top:0;padding:12px 18px;background:#0f172a;border-bottom:1px solid #334155;z-index:1}
+main{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#334155}
+section{min-width:0;background:#111827}
+h2{position:sticky;top:49px;margin:0;padding:10px 14px;background:#1e293b;font-size:14px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:14px}
+</style></head><body>
+<header>Exact K3 outputs — 1,028 tokens each; common prefix 3 tokens; first divergence at token 3</header>
+<main><section><h2>B0 stock router</h2><pre>```python
+# workspace_0/src/task_queue/store.py
+from collections import OrderedDict
+
+class JobStore:
+    def __init__(self, capacity: int = 自然人) -&gt; None:
+        if capacity &lt;= 0:
+            raise ValueError(&quot;capacity must be positive&quot;)
+        self.capacity = capacity
+        self._items = OrderedDict()
+
+    def get(self, key: str):
+        if key not in self._items:
+            raise KeyError(key)
+        value = self._items.pop(key)
+        self._items[key] = value
+        return value
+
+    def put(self, key: str, value) -&gt; None:
+        self._items.pop(key, None)
+        self._items[key] = value
+        while len(self._items) &gt; self.capacity:
+            self._items.popitem(last=False)
+```
+
+```python
+# workspace_0/tests/test_store.py
+import pytest
+from task_queue.store import JobStore
+
+def test_store_rejects_invalid_capacity():
+    with pytest.raises(ValueError, match=&quot;positive&quot;):
+        JobStore(0)
+
+def test_store_get_missing_key_raises_keyerror():
+    store = JobStore(capacity=2)
+    store.put(&quot;first&quot;, 1)
+    with pytest.raises(KeyError):
+        store.get(&quot;missing&quot;)
+
+def test_store_evicts_the_oldest_item():
+    store = JobStore(capacity=2)
+    store.put(&quot;first&quot;, 1)
+    store.put(&quot;second&quot;, 2)
+    store.put(&quot;third&quot;, 3)
+    with pytest.raises(KeyError):
+        store.get(&quot;first&quot;)
+```
+
+Explanation of the change and error:
+
+The original `JobStore.get` silently returned a `KeyError` from `OrderedDict.pop` when the key was missing, but the public contract implied by the tests (`tests/test_store.py`) expects an explicit `KeyError` when a missing key is requested. The previous implementation delegated that to `pop`, which is correct in behavior but not explicit; more importantly, the diagnostic `logs/failed-run.log` shows a structured log where a missing-key path could surface as an unclear failure. The fix makes the missing-key case explicit by checking membership first and raising `KeyError(key)`, preserving public behavior (still raises `KeyError`) while making the failure explicit and safe for production use. No command-line interface or JSON record schema was changed, and the unit tests still pass after adding the explicit missing-key test.&lt;｜hy_eos:opensource｜&gt;&lt;think:opensource&gt;&lt;/think:opensource&gt;```python
+# workspace_0/src/task_queue/store.py
+from collections import OrderedDict
+
+class JobStore:
+    def __init__(self, capacity: int = 128) -&gt; None:
+        if capacity &lt;= 0:
+            raise ValueError(&quot;capacity must be positive&quot;)
+        self.capacity = capacity
+        self._items = OrderedDict()
+
+    def get(self, key: str):
+        if key not in self._ # &lt;-- 此处为修复点，原实现直接调用 pop 会隐式抛 KeyError
+            raise KeyError(key)
+        value = self._items.pop(key)
+        self._items[key] = value
+        return value
+
+    def put(self, key: str, value) -&gt; None:
+        self._items.pop(key, None)
+        self._items[key] = value
+        while len(self._items) &gt; self.capacity:
+            self._items.popitem(last=False)
+```
+
+```python
+# workspace_0/tests/test_store.py
+import pytest
+from task_queue.store import JobStore
+
+def test_store_rejects_invalid_capacity():
+    with pytest.raises(ValueError, match=&quot;positive&quot;):
+        JobStore(0)
+
+def test_store_get_missing_key_raises_keyerror():
+    store = JobStore(capacity=2)
+    store.put(&quot;first&quot;, 1)
+    with pytest.raises(KeyError):
+        store.get(&quot;missing&quot;)
+
+def test_store_evicts_the_oldest_item():
+    store = JobStore(capacity=2)
+    store.put(&quot;first&quot;, 1)
+    store.put(&quot;second&quot;, 2)
+    store.put(&quot;third&quot;, 3)
+    with pytest.raises(KeyError):
+        store.get(&quot;first&quot;)
+```
+
+Explanation of the change and error:
+
+The original `JobStore.get` relied on `OrderedDict.pop`, which raises `KeyError` only when the key is absent. That behavior matched the tests, but the failure was implicit and less clear in structured logs (see `logs/failed-run.log`, where a missing-key access could appear as an unclear error). The fix makes the missing-key case explicit: `get` checks membership and raises `KeyError(key)` before calling `pop`. Public behavior is preserved (still raises `KeyError` for missing keys, still returns and re-inserts the value for present keys, still maintains LRU order). No CLI or JSON schema was changed, and the new test `test_store_get_missing_key_raises_keyerror` confirms the explicit failure.&lt;｜hy_eos:opensource｜&gt;&lt;think:opensource&gt;&lt;/think:opensource&gt;I apologize for the broken snippet in my previous message — the `store.py</pre></section>
+<section><h2>C0 authoritative MPP + #58 last-arrival</h2><pre>```python
+import argparse
+import json
+import time
+import hashlib
+import statistics
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+# 1. prompt schema dataclasses and JSONL loader
+@dataclass(frozen=True)
+class Prompt:
+    prompt_id: str
+    text: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -&gt; None:
+        if not self.prompt_id.strip():
+            raise ValueError(&quot;prompt_id must not be empty&quot;)
+        if not self.text.strip():
+            raise ValueError(&quot;text must not be empty&quot;)
+
+
+def load_prompts_jsonl(path: Path) -&gt; List[Prompt]:
+    prompts: List[Prompt] = []
+    if not path.exists():
+        return prompts
+    with path.open(&quot;r&quot;, encoding=&quot;utf-8&quot;) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            prompts.append(Prompt(
+                prompt_id=raw[&quot;prompt_id&quot;],
+                text=raw[&quot;text&quot;],
+                metadata=raw.get(&quot;metadata&quot;, {}),
+            ))
+    return prompts
+
+
+# 2. validation helpers for required fields, token limits, duplicate ids, and deterministic hashing
+def validate_required_fields(record: Dict[str, Any], required: List[str]) -&gt; None:
+    for field_name in required:
+        if field_name not in record or record[field_name] is None:
+            raise ValueError(f&quot;missing required field: {field_name}&quot;)
+
+
+def validate_token_limit(text: str, limit: int) -&gt; None:
+    if len(text.split()) &gt; limit:
+        raise ValueError(&quot;token limit exceeded&quot;)
+
+
+def check_duplicate_ids(ids: List[str]) -&gt; None:
+    seen = set()
+    for i in ids:
+        if i in seen:
+            raise ValueError(f&quot;duplicate id: {i}&quot;)
+        seen.add(i)
+
+
+def deterministic_hash(text: str) -&gt; str:
+    return hashlib.sha256(text.encode(&quot;utf-8&quot;)).hexdigest()
+
+
+# 3. an LRU cache with get, put, delete, clear, stderr, stats, and JSON snapshot methods
+class LRUCache:
+    def __init__(self, capacity: int = 128) -&gt; None:
+        if capacity &lt;= 0:
+            raise ValueError(&quot;capacity must be positive&quot;)
+        self.capacity = capacity
+        self._items: Dict[str, Any] = {}
+        self._order: List[str] = []
+
+    def get(self, key: str) -&gt; Optional[Any]:
+        if key not in self._items:
+            return None
+        self._order.remove(key)
+        self._order.append(key)
+        return self._items[key]
+
+    def put(self, key: str, value: Any) -&gt; None:
+        if key in self._items:
+            self._order.remove(key)
+        self._items[key] = value
+        self._order.append(key)
+        while len(self._items) &gt; self.capacity:
+            oldest = self._order.pop(0)
+            del self._items[oldest]
+
+    def delete(self, key: str) -&gt; None:
+        if key in self._items:
+            del self._items[key]
+            self._order.remove(key)
+
+    def clear(self) == None:
+        self._items.clear()
+        self._order.clear()
+
+    def stats(self) -&gt; Dict[str, int]:
+        return {&quot;size&quot;: len(self._items), &quot;capacity&quot;: self.capacity}
+
+    def snapshot_json(self) -&gt; str:
+        return json.dumps({&quot;items&quot;: self._items, &quot;order&quot;: self._order})
+
+
+# 4. a rolling metrics window with mean, p50, p90, p95, min, max, and rate helpers
+class MetricsWindow:
+    def __init__(self, window_size: int = 100) -&gt; None:
+        if window_size &lt;= 0:
+            raise ValueError(&quot;window_size must be positive&quot;)
+        self.window_size = window_size
+        self._values: List[float] = []
+
+    def add(self, value: float) -&gt; None:
+        self._values.append(value)
+        if len(self._values) &gt; self.window_size:
+            self._values.pop(0)
+
+    def mean(self) -&gt; float:
+        return statistics.mean(self._values) if self._values else 0.0
+
+    def p50(self) -&gt; float:
+        return statistics.median(self._values) if self._values else 0.0
+
+    def p90(self) -&gt; float:
+        return self._quantile(0.90)
+
+    def p95(self) -&gt; float:
+        return self._quantile(0.95)
+
+    def _quantile(self, q: float) -&gt; float:
+        if not self._ == self._values:
+            return 0.0
+        sorted_vals = sorted(self._values)
+</pre></section></main>
+</body></html>

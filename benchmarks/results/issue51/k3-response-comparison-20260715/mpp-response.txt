@@ -1,0 +1,137 @@
+```python
+import argparse
+import json
+import time
+import hashlib
+import statistics
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+# 1. prompt schema dataclasses and JSONL loader
+@dataclass(frozen=True)
+class Prompt:
+    prompt_id: str
+    text: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not self.prompt_id.strip():
+            raise ValueError("prompt_id must not be empty")
+        if not self.text.strip():
+            raise ValueError("text must not be empty")
+
+
+def load_prompts_jsonl(path: Path) -> List[Prompt]:
+    prompts: List[Prompt] = []
+    if not path.exists():
+        return prompts
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            prompts.append(Prompt(
+                prompt_id=raw["prompt_id"],
+                text=raw["text"],
+                metadata=raw.get("metadata", {}),
+            ))
+    return prompts
+
+
+# 2. validation helpers for required fields, token limits, duplicate ids, and deterministic hashing
+def validate_required_fields(record: Dict[str, Any], required: List[str]) -> None:
+    for field_name in required:
+        if field_name not in record or record[field_name] is None:
+            raise ValueError(f"missing required field: {field_name}")
+
+
+def validate_token_limit(text: str, limit: int) -> None:
+    if len(text.split()) > limit:
+        raise ValueError("token limit exceeded")
+
+
+def check_duplicate_ids(ids: List[str]) -> None:
+    seen = set()
+    for i in ids:
+        if i in seen:
+            raise ValueError(f"duplicate id: {i}")
+        seen.add(i)
+
+
+def deterministic_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# 3. an LRU cache with get, put, delete, clear, stderr, stats, and JSON snapshot methods
+class LRUCache:
+    def __init__(self, capacity: int = 128) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self._items: Dict[str, Any] = {}
+        self._order: List[str] = []
+
+    def get(self, key: str) -> Optional[Any]:
+        if key not in self._items:
+            return None
+        self._order.remove(key)
+        self._order.append(key)
+        return self._items[key]
+
+    def put(self, key: str, value: Any) -> None:
+        if key in self._items:
+            self._order.remove(key)
+        self._items[key] = value
+        self._order.append(key)
+        while len(self._items) > self.capacity:
+            oldest = self._order.pop(0)
+            del self._items[oldest]
+
+    def delete(self, key: str) -> None:
+        if key in self._items:
+            del self._items[key]
+            self._order.remove(key)
+
+    def clear(self) == None:
+        self._items.clear()
+        self._order.clear()
+
+    def stats(self) -> Dict[str, int]:
+        return {"size": len(self._items), "capacity": self.capacity}
+
+    def snapshot_json(self) -> str:
+        return json.dumps({"items": self._items, "order": self._order})
+
+
+# 4. a rolling metrics window with mean, p50, p90, p95, min, max, and rate helpers
+class MetricsWindow:
+    def __init__(self, window_size: int = 100) -> None:
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        self.window_size = window_size
+        self._values: List[float] = []
+
+    def add(self, value: float) -> None:
+        self._values.append(value)
+        if len(self._values) > self.window_size:
+            self._values.pop(0)
+
+    def mean(self) -> float:
+        return statistics.mean(self._values) if self._values else 0.0
+
+    def p50(self) -> float:
+        return statistics.median(self._values) if self._values else 0.0
+
+    def p90(self) -> float:
+        return self._quantile(0.90)
+
+    def p95(self) -> float:
+        return self._quantile(0.95)
+
+    def _quantile(self, q: float) -> float:
+        if not self._ == self._values:
+            return 0.0
+        sorted_vals = sorted(self._values)

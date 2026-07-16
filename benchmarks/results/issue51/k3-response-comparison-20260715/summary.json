@@ -1,0 +1,88 @@
+{
+  "common_token_count": 3,
+  "common_prefix": "```python\n",
+  "first_divergence_index": 3,
+  "stock_first_divergent_piece": "#",
+  "mpp_first_divergent_piece": "import",
+  "responses": [
+    {
+      "slug": "stock",
+      "label": "B0 stock router",
+      "artifact": "/tmp/issue51-b0-rebased-device-k-k0to7-c1024-o1028-r1.json",
+      "tokens": 1028,
+      "characters": 4453,
+      "lines": 103,
+      "python_blocks": 4,
+      "syntax": [
+        {
+          "block": 1,
+          "status": "pass"
+        },
+        {
+          "block": 2,
+          "status": "pass"
+        },
+        {
+          "block": 3,
+          "status": "fail",
+          "line": 12,
+          "message": "expected ':'"
+        },
+        {
+          "block": 4,
+          "status": "pass"
+        }
+      ],
+      "markers": [
+        {
+          "index": 500,
+          "token_id": 120025,
+          "piece": "<｜hy_eos:opensource｜>"
+        },
+        {
+          "index": 501,
+          "token_id": 120029,
+          "piece": "<think:opensource>"
+        },
+        {
+          "index": 502,
+          "token_id": 120030,
+          "piece": "</think:opensource>"
+        },
+        {
+          "index": 1010,
+          "token_id": 120025,
+          "piece": "<｜hy_eos:opensource｜>"
+        },
+        {
+          "index": 1011,
+          "token_id": 120029,
+          "piece": "<think:opensource>"
+        },
+        {
+          "index": 1012,
+          "token_id": 120030,
+          "piece": "</think:opensource>"
+        }
+      ]
+    },
+    {
+      "slug": "mpp",
+      "label": "C0 authoritative MPP + #58 last-arrival",
+      "artifact": "/tmp/issue51-c0-router58-devicek-k0to7-c1024-o1028-r1.json",
+      "tokens": 1028,
+      "characters": 4171,
+      "lines": 137,
+      "python_blocks": 1,
+      "syntax": [
+        {
+          "block": 1,
+          "status": "fail",
+          "line": 97,
+          "message": "expected ':'"
+        }
+      ],
+      "markers": []
+    }
+  ]
+}
