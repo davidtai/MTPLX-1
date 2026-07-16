@@ -270,6 +270,8 @@ def test_configure_router_kernels_uses_splitk_m1_only_for_mtp_path(
     )
 
     assert report["router_count"] == 2
+    assert report["target_router_count"] == 1
+    assert report["mtp_router_count"] == 1
     assert report["m1_splitk_count"] == 1
     assert root.target_router._mtplx_router_kernel_state.splitk_m1 is False
     assert root.mtp.router._mtplx_router_kernel_state.splitk_m1 is True
@@ -475,6 +477,8 @@ def test_configure_hy3_router_kernels_reports_incremental_memory() -> None:
     assert report == {
         "selector": "steel-r1-fused-r2",
         "router_count": 1,
+        "target_router_count": 1,
+        "mtp_router_count": 0,
         "enabled_count": 1,
         "source_weight_bytes": 192 * 4096 * 2,
         "prepared_weight_bytes": 192 * 4096 * 4,

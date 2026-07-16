@@ -60,6 +60,21 @@ class SpecDecodeGraphBank:
         self.promote_tensor_offsets = promote_tensor_offsets
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self._capture_accepts_backend = _accepts_capture_backend(runtime)
+        enabled = getattr(runtime, "_hy3_target_router_epoch_enabled", None)
+        if not callable(enabled):
+            enabled = getattr(runtime, "_hy3_last_arrival_enabled", None)
+        self._hy3_router_epoch_enabled = bool(callable(enabled) and enabled())
+        self._hy3_router_epoch_allocator = (
+            getattr(runtime, "_new_hy3_router_epoch_block", None)
+            if self._hy3_router_epoch_enabled
+            else None
+        )
+        if self._hy3_router_epoch_enabled and (
+            not callable(self._hy3_router_epoch_allocator)
+        ):
+            raise RuntimeError(
+                "compiled graphbank cannot supply dynamic Hy3 router epochs"
+            )
         self.stats = GraphBankStats()
         self._compiled: dict[tuple[str, int, tuple[int, ...]], Any] = {}
 
@@ -120,7 +135,12 @@ class SpecDecodeGraphBank:
             )
 
         try:
-            key = (kind, length, str(hidden_variant or ""), _cache_container_signature(cache))
+            key = (
+                kind,
+                length,
+                str(hidden_variant or ""),
+                _cache_container_signature(cache),
+            )
             fn = self._compiled.get(key)
             if fn is None:
                 if kind == "capture":
@@ -138,11 +158,16 @@ class SpecDecodeGraphBank:
                         hidden_variant=hidden_variant,
                     )
                 self._compiled[key] = fn
-            result = fn(input_ids)
+            if self._hy3_router_epoch_enabled:
+                result = fn(input_ids, self._hy3_router_epoch_allocator())
+            else:
+                result = fn(input_ids)
             self.stats.compiled_calls += 1
             self.stats.elapsed_s += time.perf_counter() - started
             return result
-        except Exception as exc:  # pragma: no cover - exercised by real MLX cache probes
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - exercised by real MLX cache probes
             key = type(exc).__name__
             self.stats.compile_errors[key] = self.stats.compile_errors.get(key, 0) + 1
             return self._fallback(
@@ -178,10 +203,14 @@ class SpecDecodeGraphBank:
         data["allow_python_cache_capture"] = self.allow_python_cache_capture
         data["promote_tensor_offsets"] = self.promote_tensor_offsets
         data["capture_backend"] = self.capture_backend
-        data["compiled_lengths"] = sorted({length for _, length, _, _ in self._compiled})
+        data["compiled_lengths"] = sorted(
+            {length for _, length, _, _ in self._compiled}
+        )
         data["compiled_paths"] = [
             f"{kind}:{length}"
-            for kind, length in sorted({(kind, length) for kind, length, _, _ in self._compiled})
+            for kind, length in sorted(
+                {(kind, length) for kind, length, _, _ in self._compiled}
+            )
         ]
         data["compiled_entry_count"] = len(self._compiled)
         return data
@@ -222,7 +251,9 @@ class SpecDecodeGraphBank:
         started: float,
     ):
         self.stats.fallback_calls += 1
-        self.stats.fallback_reasons[reason] = self.stats.fallback_reasons.get(reason, 0) + 1
+        self.stats.fallback_reasons[reason] = (
+            self.stats.fallback_reasons.get(reason, 0) + 1
+        )
         if kind == "capture":
             result = self._runtime_forward_ar_capture(
                 input_ids,
@@ -248,9 +279,19 @@ class SpecDecodeGraphBank:
         return_hidden: bool,
         hidden_variant: str | None,
     ):
-        def verify_fn(input_ids):
+        router_epoch_enabled = self._hy3_router_epoch_enabled
+
+        def verify_fn(input_ids, router_epoch_block=None):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
+            if router_epoch_enabled:
+                return self.runtime.forward_ar(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                    _hy3_router_epoch_block=router_epoch_block,
+                )
             return self.runtime.forward_ar(
                 input_ids,
                 cache=cache,
@@ -272,9 +313,19 @@ class SpecDecodeGraphBank:
         return_hidden: bool,
         hidden_variant: str | None,
     ):
-        def verify_fn(input_ids):
+        router_epoch_enabled = self._hy3_router_epoch_enabled
+
+        def verify_fn(input_ids, router_epoch_block=None):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
+            if router_epoch_enabled:
+                return self._runtime_forward_ar_capture(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                    router_epoch_block=router_epoch_block,
+                )
             return self._runtime_forward_ar_capture(
                 input_ids,
                 cache=cache,
@@ -295,7 +346,13 @@ class SpecDecodeGraphBank:
         cache=None,
         return_hidden: bool = True,
         hidden_variant: str | None = None,
+        router_epoch_block=None,
     ):
+        epoch_kwargs = (
+            {"_hy3_router_epoch_block": router_epoch_block}
+            if router_epoch_block is not None
+            else {}
+        )
         if self._capture_accepts_backend:
             return self.runtime.forward_ar_capture(
                 input_ids,
@@ -303,12 +360,14 @@ class SpecDecodeGraphBank:
                 return_hidden=return_hidden,
                 hidden_variant=hidden_variant,
                 capture_backend=self.capture_backend,
+                **epoch_kwargs,
             )
         return self.runtime.forward_ar_capture(
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
             hidden_variant=hidden_variant,
+            **epoch_kwargs,
         )
 
 
@@ -383,9 +442,7 @@ class TensorOffsetKVCache:
         step: int = 256,
     ) -> None:
         offset_array = (
-            offset
-            if isinstance(offset, mx.array)
-            else mx.array(offset, dtype=mx.int32)
+            offset if isinstance(offset, mx.array) else mx.array(offset, dtype=mx.int32)
         )
         self.cache = [keys, values, offset_array]
         self.rollback_state = [None, None, None]
@@ -432,9 +489,7 @@ class TensorOffsetKVCache:
     @offset.setter
     def offset(self, value):
         self.cache[2] = (
-            value
-            if isinstance(value, mx.array)
-            else mx.array(value, dtype=mx.int32)
+            value if isinstance(value, mx.array) else mx.array(value, dtype=mx.int32)
         )
 
     @property
@@ -617,16 +672,17 @@ def promote_kv_cache_offsets(
             except Exception:  # pragma: no cover - import guard for minimal test envs
                 TensorOffsetVllmMetalPagedKVCache = None
                 VllmMetalPagedKVCache = None
-            if (
-                VllmMetalPagedKVCache is not None
-                and isinstance(entry, VllmMetalPagedKVCache)
+            if VllmMetalPagedKVCache is not None and isinstance(
+                entry, VllmMetalPagedKVCache
             ):
                 if entry.key_cache is None or entry.value_cache is None:
                     failures["empty_paged_kv_cache"] = (
                         failures.get("empty_paged_kv_cache", 0) + 1
                     )
                     continue
-                if getattr(entry, "turboquant", False) or getattr(entry, "kv_quant", False):
+                if getattr(entry, "turboquant", False) or getattr(
+                    entry, "kv_quant", False
+                ):
                     # The tensor-offset adapter only understands plain bf16/fp16
                     # pages; promoting quantized pages would corrupt them.
                     failures["quantized_paged_kv_cache"] = (
@@ -653,7 +709,9 @@ def promote_kv_cache_offsets(
             len(getattr(keys, "shape", ())) != 4
             or len(getattr(values, "shape", ())) != 4
         ):
-            failures["unsupported_kv_shape"] = failures.get("unsupported_kv_shape", 0) + 1
+            failures["unsupported_kv_shape"] = (
+                failures.get("unsupported_kv_shape", 0) + 1
+            )
             continue
         cache[idx] = TensorOffsetKVCache.from_kv_cache(
             entry,
@@ -778,7 +836,9 @@ def _owned_state_env_active(name: str) -> bool:
     return raw not in {"", "0", "false", "no", "off"}
 
 
-def build_verify_state_spec(cache: Any) -> tuple[list[tuple[int, str, int]] | None, str | None]:
+def build_verify_state_spec(
+    cache: Any,
+) -> tuple[list[tuple[int, str, int]] | None, str | None]:
     """Ordered (layer_idx, kind, n_leaves) spec over the cache list.
 
     Full-attention tensor-offset entries contribute their three ``cache[0..2]``
@@ -1050,7 +1110,9 @@ def compare_verify_outputs(
         cand = candidate[name]
         if ref is None or cand is None:
             if ref is not cand:
-                add(f"{name}: one side is None ({type(ref).__name__} vs {type(cand).__name__})")
+                add(
+                    f"{name}: one side is None ({type(ref).__name__} vs {type(cand).__name__})"
+                )
             continue
         if not hasattr(ref, "shape") and not hasattr(cand, "shape"):
             if ref != cand:
@@ -1065,7 +1127,9 @@ def compare_verify_outputs(
             add(f"{name}: dtype mismatch ({ref_np.dtype} vs {cand_np.dtype})")
             continue
         if not np.array_equal(ref_np, cand_np):
-            both = np.asarray(ref_np, dtype=np.float64) - np.asarray(cand_np, dtype=np.float64)
+            both = np.asarray(ref_np, dtype=np.float64) - np.asarray(
+                cand_np, dtype=np.float64
+            )
             with np.errstate(invalid="ignore"):
                 max_abs = float(np.nanmax(np.abs(both))) if both.size else 0.0
             mismatched = int(np.sum(ref_np != cand_np))
@@ -1081,20 +1145,20 @@ class CompiledVerifyParityError(RuntimeError):
 
     def __init__(self, report: list[str]) -> None:
         self.report = list(report)
-        super().__init__(
-            "compiled verify parity mismatch:\n" + "\n".join(self.report)
-        )
+        super().__init__("compiled verify parity mismatch:\n" + "\n".join(self.report))
 
 
 class CompiledVerifyBank:
     """Compiled speculative-verify dispatcher with a shadow-cache firewall.
 
-    ``verify_step(input_ids, *state_in) -> (logits, hidden, *captures_flat,
-    *state_out)`` is a pure function: every piece of cache state enters as an
-    explicit input leaf and leaves as an explicit output leaf.  The dispatch
-    wrapper reads the leaves from the real (promoted) cache entries, calls the
-    compiled function, and mirror-commits the outputs back into the real
-    entries with ``rollback_state`` cleared so the untouched accept
+    ``verify_step(input_ids, *explicit_inputs) -> (logits, hidden,
+    *captures_flat, *state_out)`` is a pure function: every piece of cache
+    state enters as an explicit input leaf and leaves as an explicit output
+    leaf. Hy3 last-arrival models prepend one replay-varying router epoch block
+    to those state leaves. The dispatch wrapper reads the leaves from the real
+    (promoted) cache entries, calls the compiled function, and mirror-commits
+    the outputs back into the real entries with ``rollback_state`` cleared so
+    the untouched accept
     (``commit_captured_prefix``) and reject (``rollback_after_verify`` ->
     offset-only ``trim``) paths keep working unchanged.
     """
@@ -1286,9 +1350,10 @@ class CompiledVerifyBank:
                     hidden_variant=hidden_variant,
                     reason="empty_state_leaf",
                 )
+            explicit_inputs = self._compiled_explicit_inputs(state_in)
             if boundary in ("both", "pre"):
-                mx.async_eval(*state_in)
-            outputs = fn(input_ids, *state_in)
+                mx.async_eval(*explicit_inputs)
+            outputs = fn(input_ids, *explicit_inputs)
             logits, hidden, captures_flat, state_out = self._unpack_outputs(outputs)
             if donate:
                 # A2.1 commit-first ownership handoff — commit + schedule
@@ -1306,7 +1371,7 @@ class CompiledVerifyBank:
                 # buffers the allocator then reuses. Three generations covers
                 # the deepest deferred chain the serve path produces
                 # (experiment probe; production would release on evidence).
-                self._held_state_refs.append(state_in)
+                self._held_state_refs.append(explicit_inputs)
                 if len(self._held_state_refs) > 3:
                     self._held_state_refs.pop(0)
         except Exception as exc:
@@ -1460,7 +1525,8 @@ class CompiledVerifyBank:
                     fn = mx.compile(self._make_verify_step(length, hidden_variant))
                     self._compiled[key] = fn
                 bucket_started = time.perf_counter()
-                outputs = fn(input_ids, *state_in)
+                explicit_inputs = self._compiled_explicit_inputs(state_in)
+                outputs = fn(input_ids, *explicit_inputs)
                 # Synchronous eval: the compile cost is paid HERE, and no
                 # graph is left pending, so no held-reference bookkeeping
                 # is needed. Outputs are dropped, never committed.
@@ -1613,7 +1679,9 @@ class CompiledVerifyBank:
             offset = int(entry.size())
             capacity = int(entry.capacity)
             max_needed = max(max_needed, offset + length)
-            min_capacity = capacity if min_capacity is None else min(min_capacity, capacity)
+            min_capacity = (
+                capacity if min_capacity is None else min(min_capacity, capacity)
+            )
         self._last_context_estimate = max_needed
         if min_capacity is None:
             return 0  # no paged entries; bucket unused
@@ -1746,9 +1814,7 @@ class CompiledVerifyBank:
                 return fn
             _SHARED_VERIFY_STEPS.pop(global_key, None)
         host = {"bank": self}
-        fn = mx.compile(
-            self._make_verify_step(length, hidden_variant, trace_host=host)
-        )
+        fn = mx.compile(self._make_verify_step(length, hidden_variant, trace_host=host))
         _SHARED_VERIFY_STEPS[global_key] = (fn, host, weakref.ref(self.runtime))
         return fn
 
@@ -1763,16 +1829,26 @@ class CompiledVerifyBank:
         bank = self
         static_host = {"bank": self}
         host = trace_host if trace_host is not None else static_host
+        router_epoch_enabled = self._hy3_router_epoch_enabled()
 
         del bank
 
-        def verify_step(input_ids, *state_in):
+        def verify_step(input_ids, *explicit_inputs):
             # Python body executes at trace time only; replays skip it.
             live = host["bank"]
             shadow = live._shadow
             live.stats["traces"] += 1
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
+            router_epoch_block = None
+            state_in = explicit_inputs
+            if router_epoch_enabled:
+                if not explicit_inputs:
+                    raise ValueError(
+                        "compiled Hy3 verify requires a router epoch block"
+                    )
+                router_epoch_block = explicit_inputs[0]
+                state_in = explicit_inputs[1:]
             # (1) Re-seed firewall: every shadow leaf is assigned from the
             # explicit inputs BEFORE any read, so nothing stale and no tracer
             # from a previous trace can leak into this graph.
@@ -1797,6 +1873,7 @@ class CompiledVerifyBank:
                     cache=shadow,
                     return_hidden=True,
                     hidden_variant=hidden_variant,
+                    router_epoch_block=router_epoch_block,
                 )
             logits, hidden, captures = result
             # (3) Read every leaf back out and return it explicitly.
@@ -1817,6 +1894,22 @@ class CompiledVerifyBank:
             return (logits, hidden, *captures_flat, *state_out)
 
         return verify_step
+
+    def _hy3_router_epoch_enabled(self) -> bool:
+        enabled = getattr(self.runtime, "_hy3_target_router_epoch_enabled", None)
+        if not callable(enabled):
+            enabled = getattr(self.runtime, "_hy3_last_arrival_enabled", None)
+        return bool(callable(enabled) and enabled())
+
+    def _compiled_explicit_inputs(self, state_in: list[Any]) -> list[Any]:
+        if not self._hy3_router_epoch_enabled():
+            return state_in
+        allocate = getattr(self.runtime, "_new_hy3_router_epoch_block", None)
+        if not callable(allocate):
+            raise RuntimeError(
+                "compiled Hy3 verify cannot supply a dynamic epoch block"
+            )
+        return [allocate(), *state_in]
 
     def _capture_layout(self) -> tuple[str, ...]:
         if self.capture_backend == "linear_gdn_from_conv_tape":
@@ -1940,7 +2033,13 @@ class CompiledVerifyBank:
         cache,
         return_hidden: bool,
         hidden_variant: str | None,
+        router_epoch_block=None,
     ):
+        epoch_kwargs = (
+            {"_hy3_router_epoch_block": router_epoch_block}
+            if router_epoch_block is not None
+            else {}
+        )
         if self._capture_accepts_backend:
             return self.runtime.forward_ar_capture(
                 input_ids,
@@ -1948,12 +2047,14 @@ class CompiledVerifyBank:
                 return_hidden=return_hidden,
                 hidden_variant=hidden_variant,
                 capture_backend=self.capture_backend,
+                **epoch_kwargs,
             )
         return self.runtime.forward_ar_capture(
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
             hidden_variant=hidden_variant,
+            **epoch_kwargs,
         )
 
     def _fallback(
@@ -2004,7 +2105,9 @@ class CompiledVerifyBank:
                 eager_state.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
             else:
                 eager_state.extend((entry.cache[0], entry.cache[1]))
-        reference = self._named_outputs(eager_logits, eager_hidden, eager_captures, eager_state)
+        reference = self._named_outputs(
+            eager_logits, eager_hidden, eager_captures, eager_state
+        )
         candidate = self._named_outputs(
             compiled_logits, compiled_hidden, compiled_captures, compiled_state_out
         )

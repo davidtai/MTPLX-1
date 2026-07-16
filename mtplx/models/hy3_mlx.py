@@ -20,8 +20,11 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from mtplx.attention_context import current_attention_phase
-from mtplx.hy3_router_last_arrival import hy3_router_last_arrival_route
+from mtplx.hy3_router_last_arrival import (
+    _dispatch_hy3_router_last_arrival,
+    _validate_router_residents,
+    current_hy3_router_forward_epoch,
+)
 from mtplx.hy3_router_fp32 import (
     Hy3RouterFP32Ineligible,
     hy3_router_fp32_available,
@@ -294,6 +297,7 @@ class _RouterKernelState:
     selector: str = "stock"
     prepared_weight: mx.array | None = None
     splitk_m1: bool = False
+    epoch_slot: int = 0
 
 
 class Router(nn.Module):
@@ -316,11 +320,18 @@ class Router(nn.Module):
         *,
         available: bool | None = None,
         splitk_m1: bool = False,
+        epoch_slot: int = 0,
     ) -> dict[str, int | bool | str]:
         """Select and prepare one router implementation at model load time."""
 
         if not isinstance(splitk_m1, bool):
             raise TypeError("splitk_m1 must be bool")
+        if (
+            not isinstance(epoch_slot, int)
+            or isinstance(epoch_slot, bool)
+            or epoch_slot < 0
+        ):
+            raise TypeError("epoch_slot must be a nonnegative int")
 
         if selector not in {
             "stock",
@@ -393,11 +404,15 @@ class Router(nn.Module):
             # continues to use the source row-major gate.
             state_weight = prepared_weight
 
+        if selector == "mpp-r1-last-arrival-fused-r2":
+            _validate_router_residents(prepared_weight, self.expert_bias)
+
         prepared_bytes = int(prepared_weight.nbytes)
         self._mtplx_router_kernel_state = _RouterKernelState(
             selector=selector,
             prepared_weight=state_weight,
             splitk_m1=splitk_m1,
+            epoch_slot=epoch_slot,
         )
         report: dict[str, int | bool | str] = {
             "selector": selector,
@@ -421,24 +436,38 @@ class Router(nn.Module):
             report["sigmoid_mode"] = "precise"
             report["topology"] = "n16-p16-sg4-in-kernel-pad"
             report["threadgroups"] = 48
-            report["attention_phase"] = "decode_verify"
+            report["authority_phases"] = "all"
         return report
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
         state = self._mtplx_router_kernel_state
+        if state.selector == "mpp-r1-last-arrival-fused-r2":
+            rows = math.prod(int(dimension) for dimension in x.shape[:-1])
+            if 1 <= rows <= 8:
+                forward_epoch = current_hy3_router_forward_epoch()
+                if forward_epoch is None:
+                    raise RuntimeError(
+                        "Hy3 fused last-arrival routing requires a forward epoch block"
+                    )
+                output = _dispatch_hy3_router_last_arrival(
+                    x.reshape(1, rows, 4096).astype(mx.float32),
+                    state.prepared_weight,
+                    self.expert_bias,
+                    forward_epoch[state.epoch_slot],
+                    scaling_factor=self.router_scaling_factor,
+                )
+                output_shape = (*x.shape[:-1], 8)
+                return (
+                    output.expert_ids.reshape(output_shape),
+                    output.route_weights.reshape(output_shape),
+                )
+
         storage_gate = _router_storage_module(self.gate)
         rows = math.prod(int(dimension) for dimension in x.shape[:-1])
-        last_arrival_eligible = state.selector != ("mpp-r1-last-arrival-fused-r2") or (
-            x.ndim == 3
-            and int(x.shape[0]) == 1
-            and 1 <= int(x.shape[1]) <= 8
-            and int(x.shape[2]) == 4096
-            and current_attention_phase() == "decode_verify"
-        )
         if (
             state.selector != "stock"
+            and state.selector != "mpp-r1-last-arrival-fused-r2"
             and 1 <= rows <= 8
-            and last_arrival_eligible
             and not (
                 state.selector == "mpp-fp32-splitk-r1-fused-r2"
                 and rows == 1
@@ -473,17 +502,6 @@ class Router(nn.Module):
                     finalizer_mode="simd",
                     sigmoid_mode="precise",
                 )
-            if state.selector == "mpp-r1-last-arrival-fused-r2":
-                output = hy3_router_last_arrival_route(
-                    value,
-                    state.prepared_weight,
-                    self.expert_bias,
-                    top_k=self.top_k,
-                    route_norm=self.route_norm,
-                    scaling_factor=self.router_scaling_factor,
-                    sigmoid_mode="precise",
-                )
-                return output.expert_ids, output.route_weights
             return hy3_router_fp32_route(
                 value,
                 state.prepared_weight,
@@ -529,22 +547,31 @@ def configure_hy3_router_kernels(
     """Configure every Hy3 router and return explicit model memory accounting."""
 
     reports = []
+    target_router_count = 0
+    mtp_router_count = 0
     for name, module in root.named_modules():
         if not isinstance(module, Router):
             continue
-        splitk_m1 = selector == "mpp-fp32-splitk-r1-fused-r2" and "mtp" in name.split(
-            "."
-        )
+        is_mtp_router = "mtp" in name.split(".")
+        splitk_m1 = selector == "mpp-fp32-splitk-r1-fused-r2" and is_mtp_router
+        epoch_slot = mtp_router_count if is_mtp_router else target_router_count
         reports.append(
             module.configure_kernel(
                 selector,
                 available=available,
                 splitk_m1=splitk_m1,
+                epoch_slot=epoch_slot,
             )
         )
+        if is_mtp_router:
+            mtp_router_count += 1
+        else:
+            target_router_count += 1
     summary: dict[str, int | str] = {
         "selector": selector,
         "router_count": len(reports),
+        "target_router_count": target_router_count,
+        "mtp_router_count": mtp_router_count,
         "enabled_count": sum(bool(report["enabled"]) for report in reports),
         "source_weight_bytes": sum(
             int(report["source_weight_bytes"]) for report in reports
@@ -569,7 +596,7 @@ def configure_hy3_router_kernels(
         summary["sigmoid_mode"] = "precise"
         summary["topology"] = "n16-p16-sg4-in-kernel-pad"
         summary["threadgroups"] = 48
-        summary["attention_phase"] = "decode_verify"
+        summary["authority_phases"] = "all"
     return summary
 
 

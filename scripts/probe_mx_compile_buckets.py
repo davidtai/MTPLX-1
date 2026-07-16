@@ -61,7 +61,9 @@ def _eval_tree(value: Any) -> None:
         mx.eval(value)
 
 
-def _time_samples(fn: Callable[[Any], Any], input_ids: Any, *, repeats: int) -> dict[str, Any]:
+def _time_samples(
+    fn: Callable[[Any], Any], input_ids: Any, *, repeats: int
+) -> dict[str, Any]:
     samples: list[float] = []
     for _ in range(max(1, repeats)):
         started = time.perf_counter()
@@ -102,12 +104,26 @@ def _probe_prefill_chunks(
 
     for chunk in chunks:
         input_ids = mx.array([tokens[:chunk]], dtype=mx.int32)
+        router_epoch_slots = int(getattr(rt, "_hy3_target_router_epoch_slots", 0))
+        router_epoch_enabled = router_epoch_slots > 0 and 1 <= int(chunk) <= 8
 
         def eager_fn(ids):
             return rt.forward_ar(ids, cache=None, return_hidden=False)
 
-        def compiled_body(ids):
-            return rt.forward_ar(ids, cache=None, return_hidden=False)
+        if router_epoch_enabled:
+
+            def compiled_body(ids, router_epoch_block):
+                return rt.forward_ar(
+                    ids,
+                    cache=None,
+                    return_hidden=False,
+                    _hy3_router_epoch_block=router_epoch_block,
+                )
+
+        else:
+
+            def compiled_body(ids):
+                return rt.forward_ar(ids, cache=None, return_hidden=False)
 
         compiled_error = None
         compile_time_s = None
@@ -115,15 +131,25 @@ def _probe_prefill_chunks(
         try:
             started = time.perf_counter()
             compiled_fn = mx.compile(compiled_body)
+            if router_epoch_enabled:
+
+                def compiled_call(ids):
+                    return compiled_fn(
+                        ids,
+                        rt._new_hy3_router_epoch_block(router_epoch_slots),
+                    )
+
+            else:
+                compiled_call = compiled_fn
             for _ in range(max(1, warmup)):
-                _eval_tree(compiled_fn(input_ids))
+                _eval_tree(compiled_call(input_ids))
             compile_time_s = time.perf_counter() - started
         except Exception as exc:  # pragma: no cover - depends on local MLX compiler
             compiled_error = repr(exc)
 
         eager = _time_samples(eager_fn, input_ids, repeats=repeats)
         compiled = (
-            _time_samples(compiled_fn, input_ids, repeats=repeats)
+            _time_samples(compiled_call, input_ids, repeats=repeats)
             if compiled_fn is not None and compiled_error is None
             else None
         )
@@ -133,6 +159,7 @@ def _probe_prefill_chunks(
                 "synthetic_repeat": synthetic_repeat,
                 "compile_time_s": compile_time_s,
                 "compiled_error": compiled_error,
+                "dynamic_router_epoch_input": router_epoch_enabled,
                 "eager": eager,
                 "compiled": compiled,
                 "speedup_compiled_vs_eager": (
@@ -193,10 +220,14 @@ def _probe_verify_buckets(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="models/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP")
+    parser.add_argument(
+        "--model", default="models/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP"
+    )
     parser.add_argument("--prompts", default="mtplx/benchmarks/prompts/long_code.jsonl")
     parser.add_argument("--prompt-index", type=int, default=0)
-    parser.add_argument("--prefill-chunks", type=_csv_ints, default=[128, 256, 512, 1024])
+    parser.add_argument(
+        "--prefill-chunks", type=_csv_ints, default=[128, 256, 512, 1024]
+    )
     parser.add_argument("--depths", default="3,4")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=2)
@@ -234,14 +265,18 @@ def main() -> int:
         "prompt_tokens": len(prompt_ids),
         "fast_path_env": {key: os.environ.get(key) for key in FAST_PATH_ENV},
         "draft_lm_head": draft_lm_head,
-        "prefill_chunks": [] if args.skip_prefill else _probe_prefill_chunks(
+        "prefill_chunks": []
+        if args.skip_prefill
+        else _probe_prefill_chunks(
             rt,
             prompt_ids,
             chunks=list(args.prefill_chunks),
             repeats=args.repeats,
             warmup=args.warmup,
         ),
-        "verify_buckets": [] if args.skip_verify else _probe_verify_buckets(
+        "verify_buckets": []
+        if args.skip_verify
+        else _probe_verify_buckets(
             rt,
             prompt_ids,
             depths=_parse_depths(args.depths),

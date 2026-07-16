@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect as py_inspect
 import json
 import logging
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,11 +65,91 @@ class MTPLXRuntime:
     _forward_ar_supports_logits_keep: bool | None = field(
         default=None, init=False, repr=False
     )
+    _hy3_target_router_epoch_slots: int = field(default=0, init=False, repr=False)
+    _hy3_mtp_router_epoch_slots: int = field(default=0, init=False, repr=False)
+    _hy3_router_epoch_allocator: Any | None = field(
+        default=None, init=False, repr=False
+    )
+    _hy3_router_epoch_scope: Any | None = field(default=None, init=False, repr=False)
+    _hy3_router_epoch_current: Any | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        report = getattr(self.model, "_mtplx_hy3_router_kernel_report", None)
+        if not isinstance(report, dict) or report.get("selector") != (
+            "mpp-r1-last-arrival-fused-r2"
+        ):
+            return
+        total = report.get("router_count")
+        if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+            raise RuntimeError("Hy3 last-arrival router report has no router count")
+        target = report.get("target_router_count")
+        mtp = report.get("mtp_router_count")
+        if (
+            not isinstance(target, int)
+            or isinstance(target, bool)
+            or target < 0
+            or not isinstance(mtp, int)
+            or isinstance(mtp, bool)
+            or mtp < 0
+            or target + mtp != total
+        ):
+            raise RuntimeError(
+                "Hy3 last-arrival router report has invalid phase counts"
+            )
+        from .hy3_router_last_arrival import (
+            current_hy3_router_forward_epoch,
+            hy3_router_forward_epoch,
+            new_hy3_router_forward_epoch,
+        )
+
+        self._hy3_target_router_epoch_slots = target
+        self._hy3_mtp_router_epoch_slots = mtp
+        self._hy3_router_epoch_allocator = new_hy3_router_forward_epoch
+        self._hy3_router_epoch_scope = hy3_router_forward_epoch
+        self._hy3_router_epoch_current = current_hy3_router_forward_epoch
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(
             amount
         )
+
+    def _hy3_last_arrival_enabled(self) -> bool:
+        return self._hy3_router_epoch_allocator is not None
+
+    def _hy3_target_router_epoch_enabled(self) -> bool:
+        return self._hy3_target_router_epoch_slots > 0
+
+    def _hy3_mtp_router_epoch_enabled(self) -> bool:
+        return self._hy3_mtp_router_epoch_slots > 0
+
+    def _new_hy3_router_epoch_block(self, slots: int | None = None):
+        allocator = self._hy3_router_epoch_allocator
+        if allocator is None:
+            raise RuntimeError("Hy3 last-arrival router has no valid model report")
+        count = self._hy3_target_router_epoch_slots if slots is None else int(slots)
+        return allocator(count)
+
+    def _hy3_router_forward_context(
+        self,
+        epoch_block=None,
+        *,
+        slots: int | None = None,
+    ):
+        current = self._hy3_router_epoch_current
+        scope = self._hy3_router_epoch_scope
+        if current is None or scope is None:
+            raise RuntimeError("Hy3 last-arrival router context is not configured")
+        active = current()
+        if active is not None:
+            raise RuntimeError(
+                "nested Hy3 router forward would reuse static epoch slots"
+            )
+        block = (
+            self._new_hy3_router_epoch_block(slots)
+            if epoch_block is None
+            else epoch_block
+        )
+        return scope(block)
 
     @staticmethod
     def _sequence_len(input_ids: Any) -> int:
@@ -78,6 +159,11 @@ class MTPLXRuntime:
         if shape:
             return int(shape[0])
         return 1
+
+    @staticmethod
+    def _token_rows(input_ids: Any) -> int:
+        shape = getattr(input_ids, "shape", ())
+        return math.prod(int(dimension) for dimension in shape) if shape else 1
 
     def _forward_ar_capabilities(self) -> tuple[bool, bool]:
         if (
@@ -123,7 +209,7 @@ class MTPLXRuntime:
             # width heuristic below would classify it as decode and pollute
             # the persistent decode hot set.
             return expert_routing_phase(RoutingPhase.PREFILL)
-        if attention in {"ar_decode", "decode_verify", "postcommit"}:
+        if attention in {"ar_decode", "mtp_draft", "decode_verify", "postcommit"}:
             # MTP verify batches are decode traffic regardless of width.
             return expert_routing_phase(RoutingPhase.DECODE)
 
@@ -153,6 +239,7 @@ class MTPLXRuntime:
         emit_logits: bool = True,
         logits_keep: int | None = None,
         input_embeddings=None,
+        _hy3_router_epoch_block=None,
     ):
         self._count(
             "forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls"
@@ -189,6 +276,21 @@ class MTPLXRuntime:
             else:
                 self._count("full_logits_tokens_emitted", emitted)
         with self._expert_routing_context(input_ids):
+            if (
+                self._hy3_target_router_epoch_slots > 0
+                and 1 <= self._token_rows(input_ids) <= 8
+            ):
+                with self._hy3_router_forward_context(
+                    _hy3_router_epoch_block, slots=self._hy3_target_router_epoch_slots
+                ):
+                    if not return_hidden and hidden_variant is None and not kwargs:
+                        return self.model(input_ids, cache=cache)
+                    return self.model(
+                        input_ids,
+                        cache=cache,
+                        return_hidden=return_hidden,
+                        **kwargs,
+                    )
             if not return_hidden and hidden_variant is None and not kwargs:
                 return self.model(input_ids, cache=cache)
             return self.model(
@@ -205,10 +307,26 @@ class MTPLXRuntime:
         return_hidden: bool = False,
         hidden_variant: str | None = None,
         capture_backend: str | None = None,
+        _hy3_router_epoch_block=None,
     ):
         from .gdn_capture import forward_with_gdn_capture
 
         with self._expert_routing_context(input_ids):
+            if (
+                self._hy3_target_router_epoch_slots > 0
+                and 1 <= self._token_rows(input_ids) <= 8
+            ):
+                with self._hy3_router_forward_context(
+                    _hy3_router_epoch_block, slots=self._hy3_target_router_epoch_slots
+                ):
+                    return forward_with_gdn_capture(
+                        self.model,
+                        input_ids,
+                        cache=cache,
+                        return_hidden=return_hidden,
+                        hidden_variant=hidden_variant,
+                        capture_backend=capture_backend,
+                    )
             return forward_with_gdn_capture(
                 self.model,
                 input_ids,
@@ -228,6 +346,7 @@ class MTPLXRuntime:
         mtp_hidden_variant: str | None = None,
         mtp_depth: int | None = None,
         position_offset: int | None = None,
+        _hy3_router_epoch_block=None,
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
@@ -242,7 +361,9 @@ class MTPLXRuntime:
             if concat_order in {None, "auto", "contract"}
             else concat_order
         )
-        with mtp_adapter_depth(self.model, mtp_depth):
+        from .attention_context import attention_phase
+
+        with attention_phase("mtp_draft"), mtp_adapter_depth(self.model, mtp_depth):
             kwargs = {
                 "mtp_cache": mtp_cache,
                 "concat_order": resolved_concat_order,
@@ -256,6 +377,18 @@ class MTPLXRuntime:
                 params = {}
             if "mtp_depth" in params:
                 kwargs["mtp_depth"] = mtp_depth
+            if (
+                self._hy3_mtp_router_epoch_slots > 0
+                and 1 <= self._token_rows(next_token_ids) <= 8
+            ):
+                with self._hy3_router_forward_context(
+                    _hy3_router_epoch_block, slots=self._hy3_mtp_router_epoch_slots
+                ):
+                    return self.model.mtp_forward(
+                        hidden_states,
+                        next_token_ids,
+                        **kwargs,
+                    )
             return self.model.mtp_forward(hidden_states, next_token_ids, **kwargs)
 
     def update_mtp_cache(
@@ -267,6 +400,7 @@ class MTPLXRuntime:
         mtp_hidden_variant: str | None = None,
         position_offset: int | None = None,
         input_embeddings=None,
+        _hy3_router_epoch_block=None,
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
@@ -281,53 +415,80 @@ class MTPLXRuntime:
             if concat_order in {None, "auto", "contract"}
             else concat_order
         )
-        update = getattr(self.model, "mtp_update_cache", None)
-        if update is not None:
-            try:
-                params = py_inspect.signature(update).parameters
-            except Exception:
-                params = {}
-            accepts_kwargs = any(
-                param.kind == py_inspect.Parameter.VAR_KEYWORD
-                for param in params.values()
-            )
-            candidates = {
-                "mtp_cache": mtp_cache,
-                "concat_order": resolved_concat_order,
-                "mtp_hidden_variant": resolved_hidden_variant,
-                "position_offset": position_offset,
-                "input_embeddings": input_embeddings,
-            }
-            kwargs = {
-                key: value
-                for key, value in candidates.items()
-                if accepts_kwargs or key in params
-            }
-            if input_embeddings is not None and "input_embeddings" not in kwargs:
-                # Silently dropping the spliced vision rows would rebuild the
-                # exact draft-history corruption this parameter fixes (#103).
+        from .attention_context import attention_phase
+
+        with attention_phase("mtp_draft"):
+            update = getattr(self.model, "mtp_update_cache", None)
+            if update is not None:
+                try:
+                    params = py_inspect.signature(update).parameters
+                except Exception:
+                    params = {}
+                accepts_kwargs = any(
+                    param.kind == py_inspect.Parameter.VAR_KEYWORD
+                    for param in params.values()
+                )
+                candidates = {
+                    "mtp_cache": mtp_cache,
+                    "concat_order": resolved_concat_order,
+                    "mtp_hidden_variant": resolved_hidden_variant,
+                    "position_offset": position_offset,
+                    "input_embeddings": input_embeddings,
+                }
+                kwargs = {
+                    key: value
+                    for key, value in candidates.items()
+                    if accepts_kwargs or key in params
+                }
+                if input_embeddings is not None and "input_embeddings" not in kwargs:
+                    # Silently dropping the spliced vision rows would rebuild the
+                    # exact draft-history corruption this parameter fixes (#103).
+                    raise RuntimeError(
+                        "this MTP backend does not accept input_embeddings; "
+                        "vision history append is unsupported for it"
+                    )
+                if "mtp_depth" in params:
+                    kwargs["mtp_depth"] = None
+                if (
+                    self._hy3_mtp_router_epoch_slots > 0
+                    and 1 <= self._token_rows(next_token_ids) <= 8
+                ):
+                    with self._hy3_router_forward_context(
+                        _hy3_router_epoch_block, slots=self._hy3_mtp_router_epoch_slots
+                    ):
+                        return update(hidden_states, next_token_ids, **kwargs)
+                return update(hidden_states, next_token_ids, **kwargs)
+            if input_embeddings is not None:
                 raise RuntimeError(
-                    "this MTP backend does not accept input_embeddings; "
+                    "mtp_forward fallback does not accept input_embeddings; "
                     "vision history append is unsupported for it"
                 )
-            if "mtp_depth" in params:
-                kwargs["mtp_depth"] = None
-            return update(hidden_states, next_token_ids, **kwargs)
-        if input_embeddings is not None:
-            raise RuntimeError(
-                "mtp_forward fallback does not accept input_embeddings; "
-                "vision history append is unsupported for it"
-            )
-        _logits, hidden = self.model.mtp_forward(
-            hidden_states,
-            next_token_ids,
-            mtp_cache=mtp_cache,
-            concat_order=resolved_concat_order,
-            return_hidden=True,
-            mtp_hidden_variant=resolved_hidden_variant,
-            position_offset=position_offset,
-        )
-        return hidden
+            fallback_kwargs = {
+                "mtp_cache": mtp_cache,
+                "concat_order": resolved_concat_order,
+                "return_hidden": True,
+                "mtp_hidden_variant": resolved_hidden_variant,
+                "position_offset": position_offset,
+            }
+            if (
+                self._hy3_mtp_router_epoch_slots > 0
+                and 1 <= self._token_rows(next_token_ids) <= 8
+            ):
+                with self._hy3_router_forward_context(
+                    _hy3_router_epoch_block, slots=self._hy3_mtp_router_epoch_slots
+                ):
+                    _logits, hidden = self.model.mtp_forward(
+                        hidden_states,
+                        next_token_ids,
+                        **fallback_kwargs,
+                    )
+            else:
+                _logits, hidden = self.model.mtp_forward(
+                    hidden_states,
+                    next_token_ids,
+                    **fallback_kwargs,
+                )
+            return hidden
 
     def make_cache(self):
         inner = getattr(self.model, "language_model", self.model)

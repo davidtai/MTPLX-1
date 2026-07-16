@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from mtplx.generation import (
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
     _make_target_prefill_cache,
+    _make_device_d2_draft_core,
     _maybe_repage_target_prefill_cache,
     _prefill,
     _prefill_cache_only_forward,
@@ -20,11 +22,16 @@ from mtplx.generation import (
     _prefill_committed_mtp_history_streaming,
     _prefill_with_hidden_sequence,
     _sustained_prefill_layout,
+    _run_device_d2_draft_core,
     generate_ar,
     generate_mtpk,
     restore_or_prefill_prompt_state,
 )
 from mtplx.models.expert_mlx import current_expert_routing_phase
+from mtplx.hy3_router_last_arrival import (
+    current_hy3_router_forward_epoch,
+    hy3_router_forward_epoch,
+)
 from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig
@@ -401,6 +408,72 @@ def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
         mtp_enabled=mtp_enabled,
         contract=MTPContract(),
     )
+
+
+def test_compiled_device_d2_uses_distinct_mtp_epochs_within_and_across_replays():
+    class EpochDraftRuntime:
+        _hy3_mtp_router_epoch_slots = 1
+
+        def __init__(self) -> None:
+            self.counter = 0
+
+        def make_mtp_cache(self):
+            return []
+
+        def _new_hy3_router_epoch_block(self, slots=None):
+            count = 1 if slots is None else int(slots)
+            start = self.counter + 1
+            self.counter += count
+            return mx.array(list(range(start, start + count)), dtype=mx.uint32)
+
+        def _hy3_router_forward_context(self, epoch_block=None, *, slots=None):
+            active = current_hy3_router_forward_epoch()
+            if active is not None:
+                if epoch_block is not None and epoch_block is not active:
+                    raise RuntimeError("mismatched nested MTP epoch")
+                return nullcontext(active)
+            block = (
+                self._new_hy3_router_epoch_block(slots)
+                if epoch_block is None
+                else epoch_block
+            )
+            return hy3_router_forward_epoch(block)
+
+        def draft_mtp(
+            self,
+            hidden_states,
+            _next_token_ids,
+            *,
+            return_hidden=False,
+            **_kwargs,
+        ):
+            epoch_block = _kwargs.pop("_hy3_router_epoch_block", None)
+            with self._hy3_router_forward_context(epoch_block, slots=1):
+                block = current_hy3_router_forward_epoch()
+                assert block is not None
+                center = block[0].astype(mx.float32)
+                vocabulary = mx.arange(16, dtype=mx.float32)
+                logits = -((vocabulary - center) ** 2).reshape(1, 1, 16)
+                if return_hidden:
+                    return logits, hidden_states
+                return logits
+
+    runtime = EpochDraftRuntime()
+    hidden = mx.zeros((1, 1, 1), dtype=mx.float32)
+    tokens = mx.zeros((1, 1), dtype=mx.int32)
+    core = _make_device_d2_draft_core(
+        runtime,
+        hidden,
+        tokens,
+        mtp_hidden_variant="post_norm",
+    )
+
+    first = _run_device_d2_draft_core(core, hidden, primary=0)
+    second = _run_device_d2_draft_core(core, hidden, primary=0)
+
+    assert first[0] != first[1]
+    assert second[0] != second[1]
+    assert set(first).isdisjoint(second)
 
 
 def _run_cycle_tracking_mtpk(
@@ -1887,6 +1960,49 @@ def test_legacy_external_prefill_routes_streamed_experts_as_prefill(monkeypatch)
 
     assert rt.diagnostic_counters["prefill_omlx_external_calls"] == 2
     assert model.phases == [RoutingPhase.PREFILL, RoutingPhase.PREFILL]
+
+
+def test_legacy_external_prefill_supplies_issue58_epoch_scope(monkeypatch):
+    monkeypatch.setenv("MTPLX_PREFILL_OMLX_EXTERNAL", "1")
+
+    class EpochRecordingModel(TinyModel):
+        _mtplx_hy3_router_kernel_report = {
+            "selector": "mpp-r1-last-arrival-fused-r2",
+            "router_count": 1,
+            "target_router_count": 1,
+            "mtp_router_count": 0,
+        }
+
+        def __init__(self):
+            super().__init__()
+            self.epochs: list[mx.array | None] = []
+
+        def __call__(self, input_ids, *, cache=None, **kwargs):
+            self.epochs.append(current_hy3_router_forward_epoch())
+            return super().__call__(input_ids, cache=cache, **kwargs)
+
+    model = EpochRecordingModel()
+    rt = MTPLXRuntime(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        model_path=Path("tiny-issue58-prefill"),
+        mtp_enabled=False,
+        contract=MTPContract(),
+    )
+
+    assert _prefill_cache_only_forward(rt, mx.array([[7]]), cache=[]) is None
+    assert (
+        _prefill_cache_only_forward(
+            rt,
+            mx.zeros((1, 9), dtype=mx.int32),
+            cache=[],
+        )
+        is None
+    )
+    assert len(model.epochs) == 2
+    assert model.epochs[0] is not None
+    assert tuple(model.epochs[0].shape) == (1,)
+    assert model.epochs[1] is None
 
 
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(

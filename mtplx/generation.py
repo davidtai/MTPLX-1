@@ -567,13 +567,20 @@ def _prefill_cache_only_forward(
     # forward_ar, so streamed experts would classify one-token tail chunks
     # by shape as decode. Declare the phase like the other prefill call
     # sites so the routing context resolves it as prefill traffic.
+    model_kwargs = {"cache": cache}
+    if input_embeddings is not None:
+        model_kwargs["input_embeddings"] = input_embeddings
     with attention_phase("prefill"), rt._expert_routing_context(token_array):
-        if input_embeddings is not None:
-            unused_logits = rt.model(
-                token_array, cache=cache, input_embeddings=input_embeddings
-            )
+        if (
+            rt._hy3_target_router_epoch_slots > 0
+            and 1 <= rt._token_rows(token_array) <= 8
+        ):
+            with rt._hy3_router_forward_context(
+                slots=rt._hy3_target_router_epoch_slots
+            ):
+                unused_logits = rt.model(token_array, **model_kwargs)
         else:
-            unused_logits = rt.model(token_array, cache=cache)
+            unused_logits = rt.model(token_array, **model_kwargs)
     del unused_logits
     return None
 
@@ -3467,8 +3474,22 @@ def _make_device_d2_draft_core(
     _eval(logits, draft_hidden)
     promoted, failures = promote_kv_cache_offsets(mtp_cache, reserve_tokens=4)
     _reset_tensor_offset_cache(mtp_cache)
+    router_epoch_slots = int(getattr(rt, "_hy3_mtp_router_epoch_slots", 0))
+    router_epoch_count = 2 * router_epoch_slots
+    router_epoch_allocator = (
+        getattr(rt, "_new_hy3_router_epoch_block", None)
+        if router_epoch_count > 0
+        else None
+    )
+    if router_epoch_count > 0 and not callable(router_epoch_allocator):
+        raise RuntimeError("compiled D2 cannot supply dynamic MTP router epochs")
 
-    def draft2_fn(hidden_states, first_token_ids):
+    def draft2_fn(hidden_states, first_token_ids, router_epoch_block=None):
+        first_epoch_block = None
+        second_epoch_block = None
+        if router_epoch_count > 0:
+            first_epoch_block = router_epoch_block[:router_epoch_slots]
+            second_epoch_block = router_epoch_block[router_epoch_slots:]
         logits1, hidden1 = rt.draft_mtp(
             hidden_states,
             first_token_ids,
@@ -3476,6 +3497,7 @@ def _make_device_d2_draft_core(
             return_hidden=True,
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_depth=1,
+            _hy3_router_epoch_block=first_epoch_block,
         )
         token1 = mx.argmax(logits1[:, -1, :], axis=-1).reshape(1, 1)
         logits2, _hidden2 = rt.draft_mtp(
@@ -3485,6 +3507,7 @@ def _make_device_d2_draft_core(
             return_hidden=True,
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_depth=2,
+            _hy3_router_epoch_block=second_epoch_block,
         )
         token2 = mx.argmax(logits2[:, -1, :], axis=-1).reshape(1, 1)
         return token1, token2
@@ -3494,7 +3517,14 @@ def _make_device_d2_draft_core(
         inputs=cache_array_tree(mtp_cache),
         outputs=cache_array_tree(mtp_cache),
     )
-    smoke = compiled(hidden, token_ids)
+    if router_epoch_count > 0:
+        smoke = compiled(
+            hidden,
+            token_ids,
+            router_epoch_allocator(router_epoch_count),
+        )
+    else:
+        smoke = compiled(hidden, token_ids)
     _eval(smoke)
     _reset_tensor_offset_cache(mtp_cache)
     return {
@@ -3502,6 +3532,8 @@ def _make_device_d2_draft_core(
         "cache": mtp_cache,
         "promoted": promoted,
         "promotion_failures": failures,
+        "router_epoch_count": router_epoch_count,
+        "router_epoch_allocator": router_epoch_allocator,
     }
 
 
@@ -3511,7 +3543,15 @@ def _run_device_d2_draft_core(
     primary: int,
 ) -> list[int]:
     _reset_tensor_offset_cache(core["cache"])
-    result = core["fn"](hidden, mx.array([[primary]]))
+    primary_ids = mx.array([[primary]])
+    if core.get("router_epoch_count", 0) > 0:
+        result = core["fn"](
+            hidden,
+            primary_ids,
+            core["router_epoch_allocator"](core["router_epoch_count"]),
+        )
+    else:
+        result = core["fn"](hidden, primary_ids)
     _eval(result)
     token1, token2 = result
     return [

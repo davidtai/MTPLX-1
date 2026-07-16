@@ -10,6 +10,7 @@ VALID_ATTENTION_PHASES = {
     "prefill",
     "decode_verify",
     "ar_decode",
+    "mtp_draft",
     "postcommit",
     "unknown",
 }

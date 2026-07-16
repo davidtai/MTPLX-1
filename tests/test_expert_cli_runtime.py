@@ -374,6 +374,8 @@ def test_attention_phase_context_overrides_routing_shape_heuristic() -> None:
         runtime.forward_ar(SimpleNamespace(shape=(1, 1)))
     with attention_phase("postcommit"):
         runtime.forward_ar(SimpleNamespace(shape=(1, 2)))
+    with attention_phase("mtp_draft"):
+        runtime.forward_ar(SimpleNamespace(shape=(1, 3)))
     # Unrecognized phases normalize to unknown and keep the heuristic.
     with attention_phase("ar_batch_shared_prefill"):
         runtime.forward_ar(SimpleNamespace(shape=(1, 3)))
@@ -381,6 +383,7 @@ def test_attention_phase_context_overrides_routing_shape_heuristic() -> None:
 
     assert model.phases == [
         RoutingPhase.PREFILL,
+        RoutingPhase.DECODE,
         RoutingPhase.DECODE,
         RoutingPhase.DECODE,
         RoutingPhase.DECODE,

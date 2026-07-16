@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Literal
+from typing import Iterator, Literal
 
 import mlx.core as mx
 
@@ -38,6 +40,12 @@ _ROUTER_SCRATCH_WORDS = _ROUTER_PARTIAL_WORDS + _ROUTER_FLAG_WORDS
 
 _ROUTER_EPOCH_LOCK = threading.Lock()
 _ROUTER_EPOCH = 0
+
+
+_ROUTER_FORWARD_EPOCH: ContextVar[mx.array | None] = ContextVar(
+    "mtplx_hy3_router_forward_epoch",
+    default=None,
+)
 
 
 def _lcg_coefficients(limit: int = 287) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -270,15 +278,61 @@ def tagged_arrival_litmus_source(layout: TaggedArrivalLayout) -> str:
     """
 
 
-def _next_router_epoch() -> int:
-    """Return one process-lifetime-unique epoch for reusable output storage."""
+def _validate_router_epoch(epoch: mx.array) -> mx.array:
+    if getattr(epoch, "ndim", None) != 0 or getattr(epoch, "dtype", None) != mx.uint32:
+        raise Hy3RouterFP32Ineligible(
+            "Hy3 last-arrival router requires one scalar uint32 epoch array"
+        )
+    return epoch
 
+
+def new_hy3_router_forward_epoch(slots: int) -> mx.array:
+    """Reserve one disjoint uint32 block at the model-forward boundary."""
+
+    count = int(slots)
+    if count <= 0:
+        raise ValueError("Hy3 router epoch block must reserve at least one slot")
     global _ROUTER_EPOCH
     with _ROUTER_EPOCH_LOCK:
-        if _ROUTER_EPOCH >= _UINT32_MASK:
+        if _ROUTER_EPOCH > _UINT32_MASK - count:
             raise RuntimeError("Hy3 last-arrival router epoch space is exhausted")
-        _ROUTER_EPOCH += 1
-        return _ROUTER_EPOCH
+        start = _ROUTER_EPOCH + 1
+        _ROUTER_EPOCH += count
+        stop = _ROUTER_EPOCH + 1
+    # One explicit forward input. Each router indexes its load-time static slot,
+    # so there is no per-layer allocator, lock, counter, or bounds branch.
+    return mx.array(list(range(start, stop)), dtype=mx.uint32)
+
+
+def current_hy3_router_forward_epoch() -> mx.array | None:
+    """Return the active forward-scoped epoch, if the caller supplied one."""
+
+    return _ROUTER_FORWARD_EPOCH.get()
+
+
+@contextmanager
+def hy3_router_forward_epoch(
+    epoch_block: mx.array,
+) -> Iterator[mx.array]:
+    """Scope one replay-visible epoch over all routers in a model forward."""
+
+    active = current_hy3_router_forward_epoch()
+    if active is not None:
+        raise RuntimeError("nested Hy3 router forward would reuse static epoch slots")
+
+    if (
+        getattr(epoch_block, "ndim", None) != 1
+        or getattr(epoch_block, "dtype", None) != mx.uint32
+        or int(epoch_block.shape[0]) < 1
+    ):
+        raise Hy3RouterFP32Ineligible(
+            "Hy3 router forward requires a nonempty uint32 epoch block"
+        )
+    token = _ROUTER_FORWARD_EPOCH.set(epoch_block)
+    try:
+        yield epoch_block
+    finally:
+        _ROUTER_FORWARD_EPOCH.reset(token)
 
 
 def _router_scaling_literal(scaling_factor: float) -> str:
@@ -593,34 +647,6 @@ class Hy3RouterLastArrivalOutput:
     dispatch_count: int = 1
     _scratch: mx.array | None = field(default=None, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        ids_shape = tuple(int(dimension) for dimension in self.expert_ids.shape)
-        if (
-            len(ids_shape) != 3
-            or ids_shape[0] != 1
-            or ids_shape[2] != _ROUTER_TOP_K
-            or not 1 <= ids_shape[1] <= _ROUTER_PADDED_ROWS
-        ):
-            raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival expert IDs must have shape [1, M, 8] with 1 <= M <= 8"
-            )
-        if self.expert_ids.dtype != mx.int32:
-            raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival expert IDs must have int32 dtype"
-            )
-        if tuple(int(dimension) for dimension in self.route_weights.shape) != ids_shape:
-            raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival route weights must match expert IDs shape"
-            )
-        if self.route_weights.dtype != mx.float32:
-            raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival route weights must have FP32 dtype"
-            )
-        if int(self.dispatch_count) != 1:
-            raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival router requires exactly one dispatch"
-            )
-
     @property
     def batch_shape(self) -> tuple[int, ...]:
         return (1,)
@@ -638,11 +664,42 @@ class Hy3RouterLastArrivalOutput:
         return self.rows * _ROUTER_TOP_K
 
 
+def _dispatch_hy3_router_last_arrival(
+    value: mx.array,
+    weight: mx.array,
+    expert_bias: mx.array,
+    epoch: mx.array,
+    *,
+    scaling_factor: float,
+) -> Hy3RouterLastArrivalOutput:
+    """Dispatch a configuration-qualified precise M1-M8 router call."""
+
+    rows = int(value.shape[1])
+    kernel = _build_hy3_router_last_arrival_kernel(
+        rows,
+        float(scaling_factor),
+        "precise",
+    )
+    expert_ids, route_weights, scratch = kernel(
+        inputs=[value.reshape(rows, 4096), weight, expert_bias, epoch],
+        grid=(_ROUTER_THREADGROUPS * _ROUTER_THREADS, 1, 1),
+        threadgroup=(_ROUTER_THREADS, 1, 1),
+        output_shapes=[(rows, 8), (rows, 8), (_ROUTER_SCRATCH_WORDS,)],
+        output_dtypes=[mx.int32, mx.float32, mx.float32],
+    )
+    return Hy3RouterLastArrivalOutput(
+        expert_ids=expert_ids.reshape(1, rows, 8),
+        route_weights=route_weights.reshape(1, rows, 8),
+        _scratch=scratch,
+    )
+
+
 def hy3_router_last_arrival_route(
     value: mx.array,
     weight: mx.array,
     expert_bias: mx.array,
     *,
+    epoch: mx.array,
     available: bool | None = None,
     top_k: int = 8,
     route_norm: bool = True,
@@ -665,7 +722,6 @@ def hy3_router_last_arrival_route(
             "Hy3 last-arrival router requires FP32 hidden rows shaped [1, M, 4096] "
             "with 1 <= M <= 8 on the qualified Metal device"
         )
-    rows = value_shape[1]
     _validate_router_residents(weight, expert_bias)
     if int(top_k) != 8:
         raise Hy3RouterFP32Ineligible("Hy3 last-arrival router requires top-8")
@@ -675,25 +731,14 @@ def hy3_router_last_arrival_route(
         )
     _router_scaling_literal(scaling_factor)
     _router_exp_call(sigmoid_mode, "-total")
+    _validate_router_epoch(epoch)
 
-    kernel = _build_hy3_router_last_arrival_kernel(
-        rows,
-        float(scaling_factor),
-        sigmoid_mode,
-    )
-    epoch = mx.array(_next_router_epoch(), dtype=mx.uint32)
-    expert_ids, route_weights, scratch = kernel(
-        inputs=[value.reshape(rows, 4096), weight, expert_bias, epoch],
-        grid=(_ROUTER_THREADGROUPS * _ROUTER_THREADS, 1, 1),
-        threadgroup=(_ROUTER_THREADS, 1, 1),
-        output_shapes=[(rows, 8), (rows, 8), (_ROUTER_SCRATCH_WORDS,)],
-        output_dtypes=[mx.int32, mx.float32, mx.float32],
-    )
-    return Hy3RouterLastArrivalOutput(
-        expert_ids=expert_ids.reshape(1, rows, 8),
-        route_weights=route_weights.reshape(1, rows, 8),
-        dispatch_count=1,
-        _scratch=scratch,
+    return _dispatch_hy3_router_last_arrival(
+        value,
+        weight,
+        expert_bias,
+        epoch,
+        scaling_factor=scaling_factor,
     )
 
 
@@ -720,7 +765,12 @@ class Hy3RouterLastArrival:
         _router_scaling_literal(self.scaling_factor)
         _router_exp_call(self.sigmoid_mode, "-total")
 
-    def __call__(self, hidden_rows: mx.array) -> Hy3RouterLastArrivalOutput:
+    def __call__(
+        self,
+        hidden_rows: mx.array,
+        *,
+        epoch: mx.array,
+    ) -> Hy3RouterLastArrivalOutput:
         return hy3_router_last_arrival_route(
             hidden_rows,
             self.weight,
@@ -730,4 +780,5 @@ class Hy3RouterLastArrival:
             route_norm=self.route_norm,
             scaling_factor=self.scaling_factor,
             sigmoid_mode=self.sigmoid_mode,
+            epoch=epoch,
         )

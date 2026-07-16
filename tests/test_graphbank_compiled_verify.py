@@ -11,6 +11,8 @@ returning ``(logits, hidden, captures)`` in the standard capture layout.
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -22,11 +24,16 @@ from mtplx.gdn_capture import commit_captured_prefix
 from mtplx.graphbank import (
     CompiledVerifyBank,
     CompiledVerifyParityError,
+    SpecDecodeGraphBank,
     TensorOffsetKVCache,
     build_verify_state_spec,
     compare_verify_outputs,
     compiled_verify_mode,
     promote_kv_cache_offsets,
+)
+from mtplx.hy3_router_last_arrival import (
+    current_hy3_router_forward_epoch,
+    hy3_router_forward_epoch,
 )
 
 
@@ -141,6 +148,104 @@ def _leaf_arrays(cache) -> list[mx.array]:
 
 
 VERIFY_WINDOWS = [[3, 4, 0], [1, 2, 3], [4, 4, 1], [0, 2, 4]]
+
+
+@pytest.mark.parametrize("kind", ("forward", "capture"))
+def test_legacy_graphbank_replay_receives_a_dynamic_router_epoch_input(
+    kind: str,
+) -> None:
+    class EpochRuntime:
+        def __init__(self) -> None:
+            self.counter = 0
+
+        def _hy3_last_arrival_enabled(self) -> bool:
+            return True
+
+        def _new_hy3_router_epoch_block(self):
+            self.counter += 1
+            return mx.array([self.counter], dtype=mx.uint32)
+
+        def _hy3_router_forward_context(self, epoch_block=None):
+            active = current_hy3_router_forward_epoch()
+            if active is not None:
+                if epoch_block is not None and epoch_block is not active:
+                    raise RuntimeError("mismatched nested router epoch")
+                return nullcontext(active)
+            block = (
+                self._new_hy3_router_epoch_block()
+                if epoch_block is None
+                else epoch_block
+            )
+            return hy3_router_forward_epoch(block)
+
+        def _forward(self, input_ids, **kwargs):
+            epoch_block = kwargs.pop("_hy3_router_epoch_block", None)
+            with self._hy3_router_forward_context(epoch_block):
+                epoch_block = current_hy3_router_forward_epoch()
+                assert epoch_block is not None
+                return input_ids.astype(mx.float32) + epoch_block[0].astype(mx.float32)
+
+        def forward_ar(self, input_ids, **kwargs):
+            return self._forward(input_ids, **kwargs)
+
+        def forward_ar_capture(self, input_ids, **kwargs):
+            return self._forward(input_ids, **kwargs)
+
+    runtime = EpochRuntime()
+    bank = SpecDecodeGraphBank(runtime, max_verify_len=1)
+    dispatch = bank.forward_ar if kind == "forward" else bank.forward_ar_capture
+    input_ids = mx.array([[0]], dtype=mx.int32)
+
+    first = dispatch(input_ids, cache=None, return_hidden=False)
+    second = dispatch(input_ids, cache=None, return_hidden=False)
+    mx.eval(first, second)
+
+    assert float(second.item() - first.item()) == 1.0
+
+
+def test_compiled_verify_replay_receives_a_dynamic_router_epoch_input() -> None:
+    class EpochRuntime(ToyHybridRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = SimpleNamespace(
+                _mtplx_hy3_router_kernel_report={
+                    "selector": "mpp-r1-last-arrival-fused-r2"
+                }
+            )
+
+        def _hy3_last_arrival_enabled(self) -> bool:
+            return True
+
+        def _hy3_router_forward_context(self, epoch=None):
+            return hy3_router_forward_epoch(epoch)
+
+        def forward_ar_capture(self, *args, **kwargs):
+            epoch_block = kwargs.pop("_hy3_router_epoch_block", None)
+            with hy3_router_forward_epoch(epoch_block):
+                logits, hidden, captures = super().forward_ar_capture(*args, **kwargs)
+                context = current_hy3_router_forward_epoch()
+                assert context is not None
+                # Making the epoch observable in an output proves replay consumes
+                # every supplied slot instead of retaining a trace-time constant.
+                observed = context[0] + context[1]
+                return logits + observed.astype(mx.float32), hidden, captures
+
+    runtime = EpochRuntime()
+    cache = _prefill(ToyHybridRuntime(), [0, 1, 2])
+    bank = CompiledVerifyBank(runtime)
+    input_ids = mx.array([VERIFY_WINDOWS[0]])
+    assert bank._fallback_reason(input_ids, cache, True) is None
+    bank._ensure_shadow(cache)
+    state_in = bank._read_state_leaves(cache)
+    assert state_in is not None
+    compiled = mx.compile(bank._make_verify_step(3, None))
+
+    first = compiled(input_ids, mx.array([101, 102], dtype=mx.uint32), *state_in)
+    second = compiled(input_ids, mx.array([103, 104], dtype=mx.uint32), *state_in)
+    mx.eval(*first, *second)
+
+    difference = second[0] - first[0]
+    assert bool(mx.all(difference == 4.0).item())
 
 
 def test_compiled_verify_mode_env(monkeypatch):
