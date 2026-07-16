@@ -183,6 +183,36 @@ call routed through it, or 79 per-router graphs with every compiled call routed
 through those graphs. Both paths retain the same zero-retrace, zero-retained-
 trace, exact-routing, and full-layer-coverage gates.
 
+#### Fixed-K3 engine ownership contract (post-release)
+
+The compiled-router experiment above is scaffolding, not the complete Issue
+#63 engine. `mtplx.hy3_fixed_k3` now freezes the dependency boundary before
+additional kernels are introduced:
+
+- one `[1,4]` token window represents the authoritative current row plus three
+  drafts and invokes the target capture exactly once;
+- the #59 projection/finalizer produces `[1,4,8]` expert IDs and route weights,
+  while the #58 promotion seam must report one projection-to-R2 dispatch;
+- the #65 expert-wave request contains all 32 row/expert assignments and its
+  complete gate/up/SwiGLU/down/route-reduced result is `[1,4,4096]`;
+- the captured payload retains `[1,4,V]` logits, `[1,4,4096]` final hidden rows,
+  cache capture state, and optional per-layer route/expert evidence; and
+- #64 receives a one-shot commit request that identifies the accepted prefix,
+  correction row, and original capture objects. It has no ordinary target
+  forward callback and cannot consume the same sweep twice.
+
+The behavior lock includes an actual rejection through `generate_mtpk`: one
+M=4 `forward_ar_capture`, zero repair re-forwards, and a pending correction
+selected from the captured row. Accept-all and invalid/non-M4 contracts are
+covered separately. The correct-by-construction prefill/cache changes from
+`749baa1` remain upstream and are not replaced by this interface.
+
+The shape-only contract intentionally imports no MLX implementation. #58 and
+#65 do not yet expose promoted runtime callables: #58 currently retains the
+tagged last-arrival memory-order proof, and #65 retains benchmark-only E1 code
+that stops before down/reduce. The next implementation step must satisfy these
+interfaces rather than embedding either experimental module into the verifier.
+
 ### A1 correctness gate
 
 For every authorized D1 or D2 cell:

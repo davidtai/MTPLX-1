@@ -972,6 +972,7 @@ def _tiny_mtpk_runtime():
         def __init__(self):
             self.mtp = SimpleNamespace(_mtplx_lora_targets=[])
             self.capture_calls: list[int] = []
+            self.forward_calls: list[int] = []
 
         def make_cache(self):
             return []
@@ -993,6 +994,7 @@ def _tiny_mtpk_runtime():
             **_kwargs,
         ):
             length = int(input_ids.shape[1])
+            self.forward_calls.append(length)
             hidden = mx.zeros((1, length, 2), dtype=mx.float32)
             if return_hidden:
                 return self._logits(length), hidden
@@ -1107,6 +1109,50 @@ def test_generation_flag_on_attaches_stats_and_matches_flag_off(monkeypatch):
     assert out.stats.events[0]["graphbank"]["compiled_verify"]["calls"] >= 1
     # No adapters existed in the empty stub cache, so nothing to demote.
     assert bank_stats["demotions"] == 0
+
+
+def test_capture_commit_rejection_consumes_one_m4_sweep_without_reforward(
+    monkeypatch,
+):
+    """#64 must consume #63's capture; rejection cannot rerun target rows."""
+
+    from mtplx.generation import generate_mtpk
+    from mtplx.sampling import SamplerConfig
+
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY", raising=False)
+    rt, model = _tiny_mtpk_runtime()
+    capture = rt.forward_ar_capture
+
+    def rejecting_capture(input_ids, **kwargs):
+        _logits, hidden, captures = capture(input_ids, **kwargs)
+        length = int(input_ids.shape[1])
+        logits = mx.zeros((1, length, 4), dtype=mx.float32)
+        logits = logits + mx.array([0.0, 0.0, 2.0, 0.0], dtype=mx.float32)
+        return logits, hidden, captures
+
+    rt.forward_ar_capture = rejecting_capture
+    out = generate_mtpk(
+        rt,
+        [0],
+        max_tokens=5,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=20),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="capture_commit",
+        stop_token_ids={2},
+    )
+
+    assert out.tokens == [1, 2]
+    assert out.stats.verify_calls == 1
+    assert model.capture_calls == [4]
+    # The one ordinary target call is prompt prefill.  The rejected M4 target
+    # rows are not replayed and the correction becomes the next pending primary.
+    assert model.forward_calls == [1]
+    event = out.stats.events[0]
+    assert event["accepted_depths"] == 0
+    assert event["capture_repair"] == "captured_prefix_pending_correction"
+    assert event["pending_primary"] == 2
+    assert "repair_forward" not in event["timing_s"]
 
 
 def test_generation_reports_lazy_bonus_cache_advance_to_compiled_bank(monkeypatch):
