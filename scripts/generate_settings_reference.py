@@ -17,6 +17,9 @@ if str(REPO_ROOT) not in sys.path:
 
 MARKDOWN_PATH = REPO_ROOT / "docs" / "reference" / "settings.md"
 JSON_PATH = REPO_ROOT / "docs" / "reference" / "settings.json"
+MIGRATION_PATH = REPO_ROOT / "docs" / "migration-settings.md"
+ALIAS_BEGIN = "<!-- BEGIN GENERATED SETTINGS ALIASES -->"
+ALIAS_END = "<!-- END GENERATED SETTINGS ALIASES -->"
 
 
 def _setting_payload(spec: Any) -> dict[str, Any]:
@@ -111,6 +114,47 @@ def render_reference() -> tuple[str, dict[str, Any]]:
     return "\n".join(lines), payload
 
 
+def render_alias_tables() -> str:
+    from mtplx.settings.builtins import default_setting_catalog
+
+    rows: dict[str, list[tuple[str, str]]] = {"cli": [], "env": []}
+    for spec in default_setting_catalog().list():
+        for alias in spec.aliases:
+            if alias.source in rows:
+                rows[alias.source].append((alias.name, spec.name))
+    lines: list[str] = []
+    for source, title in (("cli", "CLI flag aliases"), ("env", "Environment aliases")):
+        lines.extend(
+            [
+                f"## {title}",
+                "",
+                "| Compatibility name | Canonical setting |",
+                "|---|---|",
+            ]
+        )
+        for alias, canonical in sorted(rows[source]):
+            rendered = f"--{alias}" if source == "cli" else alias
+            lines.append(f"| `{rendered}` | `{canonical}` |")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _render_migration(current: str) -> str:
+    if ALIAS_BEGIN not in current or ALIAS_END not in current:
+        raise ValueError(f"{MIGRATION_PATH}: missing generated alias markers")
+    before, remainder = current.split(ALIAS_BEGIN, 1)
+    _, after = remainder.split(ALIAS_END, 1)
+    return (
+        before
+        + ALIAS_BEGIN
+        + "\n\n"
+        + render_alias_tables()
+        + "\n\n"
+        + ALIAS_END
+        + after
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -119,10 +163,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     markdown, payload = render_reference()
     json_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    migration_current = (
+        MIGRATION_PATH.read_text(encoding="utf-8") if MIGRATION_PATH.exists() else None
+    )
+    migration_expected = (
+        _render_migration(migration_current) if migration_current is not None else None
+    )
     if args.write:
         MARKDOWN_PATH.parent.mkdir(parents=True, exist_ok=True)
         MARKDOWN_PATH.write_text(markdown, encoding="utf-8")
         JSON_PATH.write_text(json_text, encoding="utf-8")
+        if migration_expected is not None:
+            MIGRATION_PATH.write_text(migration_expected, encoding="utf-8")
         print(f"wrote {MARKDOWN_PATH} and {JSON_PATH}")
         return 0
     stale = (
@@ -130,6 +182,10 @@ def main(argv: list[str] | None = None) -> int:
         or MARKDOWN_PATH.read_text(encoding="utf-8") != markdown
         or not JSON_PATH.exists()
         or JSON_PATH.read_text(encoding="utf-8") != json_text
+        or (
+            migration_expected is not None
+            and migration_current != migration_expected
+        )
     )
     if stale:
         print("error: stale generated settings reference")
