@@ -52,3 +52,26 @@ def test_migration_guide_maps_every_compatibility_alias():
         for alias in spec.aliases:
             if alias.source in {"cli", "env"}:
                 assert alias.name in text
+
+
+def test_docs_index_links_required_user_journeys():
+    text = _text("README.md")
+    for target in (
+        "getting-started.md",
+        "settings.md",
+        "cli.md",
+        "experiments.md",
+        "migration-settings.md",
+        "advanced/ssd-streamed-moe.md",
+    ):
+        assert f"]({target})" in text
+
+
+def test_streamed_moe_commands_live_in_advanced_guide_not_root_readme():
+    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    advanced = (ROOT / "docs/advanced/ssd-streamed-moe.md").read_text(
+        encoding="utf-8"
+    )
+    assert "scripts/build_expert_manifest.py" not in root_readme
+    assert "scripts/build_expert_manifest.py" in advanced
+    assert "--expert-memory-limit 104GiB" in advanced
