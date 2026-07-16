@@ -40,6 +40,64 @@ def _load_campaign_module():
 campaign_module = _load_campaign_module()
 
 
+def test_run_spec_selects_one_diagnostic_arm_inside_the_exclusive_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = {
+        "legacy_exclusive_lane_lock": None,
+        "qwen": {},
+        "artifact_verify_command": ("verify-artifact",),
+        "probe_command": ("probe",),
+        "quality_command": ("quality",),
+        "arm_command_template": ("arm",),
+        "repetitions": 4,
+        "bootstrap_resamples": 100,
+        "bootstrap_seed": 46,
+        "workload_subprocess_timeout_seconds": 1234,
+        "qwen_control_timeout_seconds": 67,
+        "subprocess_termination_grace_seconds": 5,
+    }
+    diagnostic_calls: list[dict[str, object]] = []
+
+    class StopAfterWorkload(Exception):
+        pass
+
+    def run_window(workload, *, hooks):
+        del hooks
+        workload()
+        raise StopAfterWorkload
+
+    monkeypatch.setattr(campaign_module, "run_exclusive_hardware_window", run_window)
+    monkeypatch.setattr(
+        campaign_module,
+        "run_subprocess_campaign",
+        lambda **_kwargs: pytest.fail(
+            "paired campaign must not run in diagnostic mode"
+        ),
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "run_subprocess_diagnostic_arm",
+        lambda **kwargs: (
+            diagnostic_calls.append(kwargs) or {"status": "diagnostic-only"}
+        ),
+    )
+
+    with pytest.raises(StopAfterWorkload):
+        campaign_module.run_spec(
+            spec,
+            cwd=tmp_path,
+            contexts=(4_096,),
+            diagnostic_arm="dynamic",
+        )
+
+    assert len(diagnostic_calls) == 1
+    assert diagnostic_calls[0]["arm"] == "dynamic"
+    assert diagnostic_calls[0]["context_tokens"] == 4_096
+    assert "quality_command" not in diagnostic_calls[0]
+
+
 def test_run_spec_reuses_one_explicit_owner_for_every_qwen_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -899,6 +957,58 @@ def test_actual_run_binds_clean_tracked_spec_and_command_sources(
     assert stdout_result["hardware_hooks_config_sha256"] == expected_hooks_sha
     assert stdout_result["source_git_commit"] == expected_commit
     assert calls and calls[0][0] == repo.resolve()
+
+
+def test_actual_run_selects_one_explicit_nonqualifying_diagnostic_arm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, spec_path = _create_campaign_repo(tmp_path)
+    output_path = tmp_path / "diagnostic.json"
+    calls: list[tuple[tuple[int, ...], str | None]] = []
+
+    def fake_run_spec(
+        _spec: dict[str, object],
+        *,
+        cwd: Path,
+        contexts: tuple[int, ...],
+        diagnostic_arm: str | None = None,
+    ) -> dict[str, object]:
+        assert cwd == repo.resolve()
+        calls.append((contexts, diagnostic_arm))
+        return {
+            "schema": "mtplx-hy3-dynamic-memory-diagnostic-v1",
+            "status": "diagnostic-only",
+            "acceptance_eligible": False,
+        }
+
+    monkeypatch.setattr(campaign_module, "run_spec", fake_run_spec)
+
+    assert (
+        campaign_module.main(
+            [
+                "--spec",
+                str(spec_path),
+                "--cwd",
+                str(repo),
+                "--output-json",
+                str(output_path),
+                "--contexts",
+                "4096",
+                "--diagnostic-arm",
+                "dynamic",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [((4_096,), "dynamic")]
+    assert json.loads(capsys.readouterr().out)["acceptance_eligible"] is False
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["acceptance_eligible"]
+        is False
+    )
 
 
 def test_actual_run_rejects_an_ignored_untracked_hardware_hooks_config(

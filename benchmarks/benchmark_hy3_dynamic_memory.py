@@ -31,6 +31,7 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     run_exclusive_hardware_window,
     run_json_subprocess,
     run_subprocess_campaign,
+    run_subprocess_diagnostic_arm,
 )
 
 
@@ -734,8 +735,17 @@ def run_spec(
     *,
     cwd: Path,
     contexts: Sequence[int] = CONTEXT_MATRIX_TOKENS,
+    diagnostic_arm: str | None = None,
 ) -> dict[str, object]:
     """Execute a validated command spec inside the exact-Qwen restore window."""
+
+    if diagnostic_arm is not None:
+        if diagnostic_arm not in {"static", "dynamic"}:
+            raise BenchmarkGateError("diagnostic arm must be static or dynamic")
+        if len(contexts) != 1:
+            raise BenchmarkGateError(
+                "diagnostic mode requires exactly one selected context"
+            )
 
     qwen = _mapping(spec["qwen"], field="spec.qwen")
     workload_timeout_seconds = _exact_int(
@@ -917,6 +927,24 @@ def run_spec(
     )
 
     def workload() -> dict[str, object]:
+        if diagnostic_arm is not None:
+            return run_subprocess_diagnostic_arm(
+                probe_command=_command(
+                    spec["probe_command"], field="spec.probe_command"
+                ),
+                artifact_verify_command=_command(
+                    spec["artifact_verify_command"],
+                    field="spec.artifact_verify_command",
+                ),
+                arm_command_template=_command(
+                    spec["arm_command_template"], field="spec.arm_command_template"
+                ),
+                arm=diagnostic_arm,
+                context_tokens=int(contexts[0]),
+                cwd=cwd,
+                subprocess_timeout_seconds=workload_timeout_seconds,
+                subprocess_termination_grace_seconds=termination_grace_seconds,
+            )
         return run_subprocess_campaign(
             probe_command=_command(spec["probe_command"], field="spec.probe_command"),
             quality_command=_command(
@@ -981,6 +1009,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate and print the exact schedule without running commands",
     )
+    parser.add_argument(
+        "--diagnostic-arm",
+        choices=("static", "dynamic"),
+        help=(
+            "run exactly one non-qualifying arm under the normal lock and Qwen "
+            "lifecycle; requires one --contexts value"
+        ),
+    )
     return parser
 
 
@@ -989,6 +1025,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     spec_path = args.spec.expanduser().resolve()
     repo_root = args.cwd.expanduser().resolve()
     if args.plan_only:
+        if args.diagnostic_arm is not None:
+            raise BenchmarkGateError(
+                "--diagnostic-arm cannot be combined with --plan-only"
+            )
         if args.output_json is not None:
             raise BenchmarkGateError("--output-json cannot be used with --plan-only")
         _require_tracked_file(repo_root, spec_path, description="campaign spec")
@@ -1035,7 +1075,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             hooks_config_path,
             description="hardware hooks config",
         )
-        result = dict(run_spec(spec, cwd=repo_root, contexts=args.contexts))
+        if args.diagnostic_arm is None:
+            result = dict(run_spec(spec, cwd=repo_root, contexts=args.contexts))
+        else:
+            result = dict(
+                run_spec(
+                    spec,
+                    cwd=repo_root,
+                    contexts=args.contexts,
+                    diagnostic_arm=args.diagnostic_arm,
+                )
+            )
         post_commit = _require_clean_source(repo_root)
         _require_tracked_file(
             repo_root,

@@ -1617,6 +1617,46 @@ def test_subprocess_campaign_attests_artifact_after_every_arm() -> None:
     assert result["post_campaign_artifact_attestation"] == _artifact_attestation()
 
 
+def test_subprocess_diagnostic_runs_exactly_one_nonqualifying_arm() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...]) -> Mapping[str, object]:
+        calls.append(command)
+        if command == ("probe",):
+            return _probe_result()
+        if command == ("verify-artifact",):
+            return _artifact_attestation()
+        _, arm, context_tokens, repetition = command
+        return _observation(
+            arm,
+            int(context_tokens),
+            int(repetition),
+            tok_s=5.8,
+        )
+
+    result = runner_module.run_subprocess_diagnostic_arm(
+        probe_command=("probe",),
+        artifact_verify_command=("verify-artifact",),
+        arm_command_template=("arm", "{arm}", "{context_tokens}", "{repetition}"),
+        arm="dynamic",
+        context_tokens=4_096,
+        command_runner=run,
+    )
+
+    assert calls == [
+        ("probe",),
+        ("arm", "dynamic", "4096", "0"),
+        ("verify-artifact",),
+    ]
+    assert result["schema"] == "mtplx-hy3-dynamic-memory-diagnostic-v1"
+    assert result["status"] == "diagnostic-only"
+    assert result["acceptance_eligible"] is False
+    assert result["arm"] == "dynamic"
+    assert result["context_tokens"] == 4_096
+    assert result["observation"]["arm"] == "dynamic"
+    assert result["post_diagnostic_artifact_attestation"] == _artifact_attestation()
+
+
 def test_subprocess_campaign_runs_kv_quality_before_final_artifact_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

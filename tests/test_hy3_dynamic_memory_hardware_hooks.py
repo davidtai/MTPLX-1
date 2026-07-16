@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,19 @@ from mtplx.benchmarks.runners.hy3_dynamic_memory import (
     HY3_Q4_MAX_BLOCKS,
 )
 from mtplx.expert_streaming_models import HY3_Q4
+
+
+def test_issue46_hardware_config_uses_stable_hold_windows() -> None:
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "benchmarks"
+        / "specs"
+        / "issue46-hy3-hardware-hooks.json"
+    )
+    config = json.loads(path.read_text(encoding="utf-8"))
+
+    assert config["hold_warmup_tokens"] == 64
+    assert config["hold_tokens"] == 32
 
 
 def _python_control_cpu() -> dict[str, object]:

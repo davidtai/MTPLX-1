@@ -3050,6 +3050,88 @@ def format_arm_command(
         ) from exc
 
 
+def run_subprocess_diagnostic_arm(
+    *,
+    probe_command: Sequence[str],
+    artifact_verify_command: Sequence[str],
+    arm_command_template: Sequence[str],
+    arm: str,
+    context_tokens: int,
+    cwd: Path | str | None = None,
+    command_runner: Callable[[Sequence[str]], Mapping[str, object]] | None = None,
+    subprocess_timeout_seconds: float = DEFAULT_JSON_SUBPROCESS_TIMEOUT_SECONDS,
+    subprocess_termination_grace_seconds: float = (
+        DEFAULT_JSON_SUBPROCESS_TERMINATION_GRACE_SECONDS
+    ),
+) -> dict[str, object]:
+    """Run one validated, explicitly non-qualifying hardware arm."""
+
+    if arm not in {"static", "dynamic"}:
+        raise BenchmarkGateError("diagnostic arm must be static or dynamic")
+    context = _exact_int(context_tokens, field="context_tokens", minimum=1)
+    if context not in CONTEXT_MATRIX_TOKENS:
+        raise BenchmarkGateError(
+            f"diagnostic context must be one of {CONTEXT_MATRIX_TOKENS}"
+        )
+    runner = command_runner or (
+        lambda command: run_json_subprocess(
+            command,
+            cwd=cwd,
+            timeout_seconds=subprocess_timeout_seconds,
+            termination_grace_seconds=subprocess_termination_grace_seconds,
+        )
+    )
+    probe = validate_allocator_probe(runner(probe_command))
+    probe_identity = _validate_identity(
+        _mapping(probe["identity"], field="allocator probe.identity"),
+        context="allocator probe.identity",
+    )
+    raw_observation = dict(
+        runner(
+            format_arm_command(
+                arm_command_template,
+                arm=arm,
+                context_tokens=context,
+                repetition=0,
+            )
+        )
+    )
+    observation = validate_campaign_observation(raw_observation)
+    _require_probe_arm_identity(probe_identity, observation.identity)
+    if (
+        observation.arm != arm
+        or observation.context_tokens != context
+        or observation.repetition != 0
+    ):
+        raise BenchmarkGateError(
+            "diagnostic arm returned observation metadata for a different request"
+        )
+    post_attestation = _validate_artifact_attestation(runner(artifact_verify_command))
+    for field in (
+        "model_artifact_sha256",
+        "expert_manifest_sha256",
+        "artifact_pins_sha256",
+        "artifact_stat_sha256",
+        "resident_payload_bytes",
+        "resident_payload_sha256",
+    ):
+        if post_attestation[field] != probe_identity[field]:
+            raise BenchmarkGateError(
+                f"post-diagnostic artifact attestation drifted at {field}"
+            )
+    return {
+        "schema": "mtplx-hy3-dynamic-memory-diagnostic-v1",
+        "status": "diagnostic-only",
+        "acceptance_eligible": False,
+        "arm": arm,
+        "context_tokens": context,
+        "repetition": 0,
+        "allocator_release_probe": probe,
+        "observation": raw_observation,
+        "post_diagnostic_artifact_attestation": post_attestation,
+    }
+
+
 def run_subprocess_campaign(
     *,
     probe_command: Sequence[str],
@@ -3206,6 +3288,7 @@ __all__ = [
     "run_balanced_campaign",
     "run_exclusive_hardware_window",
     "run_json_subprocess",
+    "run_subprocess_diagnostic_arm",
     "run_subprocess_campaign",
     "validate_allocator_probe",
     "validate_campaign_observation",
