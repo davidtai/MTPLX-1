@@ -330,13 +330,13 @@ def _add_adaptive_args(parser: argparse.ArgumentParser) -> None:
 
 
 def cmd_bench_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_bench_public as handler
+    from .commands.benchmarks import cmd_bench_public as handler
 
     return handler(args)
 
 
 def cmd_tune_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_tune_public as handler
+    from .commands.benchmarks import cmd_tune_public as handler
 
     return handler(args)
 
@@ -390,13 +390,13 @@ def cmd_hardware_public(args: argparse.Namespace) -> int:
 
 
 def cmd_chat_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_chat_public as handler
+    from .commands.runtime import cmd_chat_public as handler
 
     return handler(args)
 
 
 def cmd_quickstart_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_quickstart_public as handler
+    from .commands.runtime import cmd_quickstart_public as handler
 
     return handler(args)
 
@@ -414,7 +414,7 @@ def cmd_inspect_model_public(args: argparse.Namespace) -> int:
 
 
 def cmd_profile_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_profile_public as handler
+    from .commands.benchmarks import cmd_profile_public as handler
 
     return handler(args)
 
@@ -438,31 +438,31 @@ def cmd_remove_public(args: argparse.Namespace) -> int:
 
 
 def cmd_run_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_run_public as handler
+    from .commands.runtime import cmd_run_public as handler
 
     return handler(args)
 
 
 def cmd_qa_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_qa_public as handler
+    from .commands.benchmarks import cmd_qa_public as handler
 
     return handler(args)
 
 
 def cmd_serve_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_serve_public as handler
+    from .commands.runtime import cmd_serve_public as handler
 
     return handler(args)
 
 
 def cmd_thermal_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_thermal_public as handler
+    from .commands.benchmarks import cmd_thermal_public as handler
 
     return handler(args)
 
 
 def cmd_max_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_max_public as handler
+    from .commands.benchmarks import cmd_max_public as handler
 
     return handler(args)
 

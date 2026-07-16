@@ -253,8 +253,8 @@ Active bundles are data-only controls; this inventory does not authorize hardwar
 | `MTPLX_NATIVE_MLP_MIN_M` | `MTPLX_NATIVE_MLP_MIN_M` | internal | compatibility | — | `mtplx/server/openai.py` | explicit | investigate for archive |
 | `MTPLX_NATIVE_MLP_ROWWISE` | `MTPLX_NATIVE_MLP_ROWWISE` | internal | compatibility | `test` | `mtplx/server/openai.py` | explicit | retain as internal |
 | `MTPLX_NAX_M4_IMPL` | `MTPLX_NAX_M4_IMPL` | internal | compatibility | `profile` | `mtplx/nax_verify.py` | explicit | retain as internal |
-| `MTPLX_NO_BANNER` | `MTPLX_NO_BANNER` | internal | compatibility | — | `mtplx/cli.py`<br>`mtplx/ui/banner.py` | explicit | investigate for archive |
-| `MTPLX_NO_COLOR` | `MTPLX_NO_COLOR` | internal | compatibility | — | `mtplx/cli.py` | explicit | investigate for archive |
+| `MTPLX_NO_BANNER` | `MTPLX_NO_BANNER` | internal | compatibility | — | `mtplx/cli_app/help.py`<br>`mtplx/ui/banner.py` | explicit | investigate for archive |
+| `MTPLX_NO_COLOR` | `MTPLX_NO_COLOR` | internal | compatibility | — | `mtplx/cli.py`<br>`mtplx/cli_app/help.py` | explicit | investigate for archive |
 | `MTPLX_OMIT_SPECULATIVE_BONUS` | `MTPLX_OMIT_SPECULATIVE_BONUS` | internal | compatibility | `test` | — | explicit | retain as internal |
 | `MTPLX_OPTIMIZED_QUALITY_MODEL` | `MTPLX_OPTIMIZED_QUALITY_MODEL` | internal | compatibility | — | — | explicit | investigate for archive |
 | `MTPLX_OPTIMIZED_SPEED_MODEL` | `MTPLX_OPTIMIZED_SPEED_MODEL` | internal | compatibility | `test` | — | explicit | retain as internal |
@@ -279,7 +279,7 @@ Active bundles are data-only controls; this inventory does not authorize hardwar
 | `MTPLX_SDPA_2PASS_THRESHOLD` | `MTPLX_SDPA_2PASS_THRESHOLD` | internal | compatibility | `test` | `mtplx/attention_split.py`<br>`mtplx/server/openai.py` | explicit | retain as internal |
 | `MTPLX_SDPA_DYNAMIC_OFFSET_ACTIVE_BLOCKS` | `MTPLX_SDPA_DYNAMIC_OFFSET_ACTIVE_BLOCKS` | internal | compatibility | `test` | — | explicit | retain as internal |
 | `MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS` | `MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS` | internal | compatibility | `test` | `mtplx/server/openai.py` | explicit | retain as internal |
-| `MTPLX_SHELL_BANNER_SHOWN` | `MTPLX_SHELL_BANNER_SHOWN` | internal | compatibility | `test` | `mtplx/cli.py`<br>`mtplx/ui/banner.py` | explicit | retain as internal |
+| `MTPLX_SHELL_BANNER_SHOWN` | `MTPLX_SHELL_BANNER_SHOWN` | internal | compatibility | `test` | `mtplx/cli_app/help.py`<br>`mtplx/ui/banner.py` | explicit | retain as internal |
 | `MTPLX_SKIP_VERIFY_SNAPSHOT` | `MTPLX_SKIP_VERIFY_SNAPSHOT` | internal | compatibility | `profile`<br>`test` | — | explicit | retain as internal |
 | `MTPLX_SMALL_SUFFIX_FUSED_MAX` | `MTPLX_SMALL_SUFFIX_FUSED_MAX` | internal | compatibility | `test` | `mtplx/generation.py` | explicit | retain as internal |
 | `MTPLX_SMC_PATH` | `MTPLX_SMC_PATH` | internal | compatibility | — | `mtplx/cli.py` | explicit | investigate for archive |

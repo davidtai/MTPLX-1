@@ -29,3 +29,18 @@ def test_public_reexports_model_and_integration_handlers():
     assert cmd_inspect_model_public is inspect_impl
     assert cmd_model_public is model_impl
     assert cmd_integrate_public is integrate_impl
+
+
+def test_public_reexports_runtime_and_benchmark_handlers():
+    from mtplx.commands.benchmarks import cmd_bench_public as bench_impl
+    from mtplx.commands.public import (
+        cmd_bench_public,
+        cmd_run_public,
+        cmd_serve_public,
+    )
+    from mtplx.commands.runtime import cmd_run_public as run_impl
+    from mtplx.commands.runtime import cmd_serve_public as serve_impl
+
+    assert cmd_bench_public is bench_impl
+    assert cmd_run_public is run_impl
+    assert cmd_serve_public is serve_impl
