@@ -345,22 +345,67 @@ def test_router_arms_fail_loudly_if_explicit_epoch_api_is_missing(
         )
 
 
-def test_config_names_implementations_without_claiming_runtime_selectors() -> None:
+def test_config_records_selected_m1_m8_shape() -> None:
     module = _load_script()
     args = module._parser().parse_args(
-        ["--output-json", "/tmp/result.json", "--warmups", "4", "--repeats", "60"]
+        [
+            "--output-json",
+            "/tmp/result.json",
+            "--rows",
+            "7",
+            "--warmups",
+            "4",
+            "--repeats",
+            "60",
+        ]
     )
 
     config = module._config(args)
 
+    assert module.SCHEMA == "mtplx-issue58-router-paired-timing-v4"
+    assert module.CONTROL_ARM == (
+        "issue59-r41-topology-n16-p16-sg4-grouped-direct-precise-g6"
+    )
+    assert module.CANDIDATE_ARM == ("issue58-m1-m8-last-arrival-one-dispatch-precise")
+    assert config["shape"]["hidden"] == [1, 7, 4096]
+    assert config["shape"]["logical_rows"] == 7
+    assert config["shape"]["physical_mpp_rows"] == 8
     assert config["control"]["arm"] == module.CONTROL_ARM
     assert config["control"]["issue59_candidate"] == (
         "n16_p16_sg4_grouped_direct_precise_g6"
     )
     assert config["control"]["finalizer_simd_groups"] == 6
     assert config["candidate"]["arm"] == module.CANDIDATE_ARM
+    assert config["candidate"]["logical_m"] == 7
+    assert config["candidate"]["supported_logical_m_range"] == [1, 8]
+    assert "fixed_m" not in config["candidate"]
     assert "selector" not in config["control"]
     assert "selector" not in config["candidate"]
+
+
+def test_activation_uses_explicit_logical_rows_and_records_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    sentinel = object()
+    captured_shapes: list[tuple[int, ...]] = []
+
+    def fake_array(value, *, dtype):
+        assert dtype == module.mx.float32
+        captured_shapes.append(tuple(np.asarray(value).shape))
+        return sentinel
+
+    monkeypatch.setattr(module.mx, "array", fake_array)
+    monkeypatch.setattr(module.mx, "eval", lambda value: None)
+    monkeypatch.setattr(module.mx, "synchronize", lambda: None)
+
+    value, metadata = module._activation(58, rows=6)
+
+    assert value is sentinel
+    assert captured_shapes == [(1, 6, 4096)]
+    assert metadata["shape"] == [1, 6, 4096]
+    assert metadata["logical_rows"] == 6
+    assert metadata["physical_mpp_rows"] == 8
 
 
 def test_route_weight_parity_is_bitwise_not_numeric_equality() -> None:
@@ -545,7 +590,29 @@ def test_parser_requires_checkpoint_and_exposes_reproducibility_controls() -> No
     assert args.activation_seed == 5804
     assert args.bootstrap_seed == 5859
     assert args.bootstrap_resamples == 10_000
+    assert args.rows == 4
     assert str(args.lock_path) == "/tmp/mtplx-gpu-exclusive.lock"
+
+
+@pytest.mark.parametrize("rows", (1, 8))
+def test_parser_accepts_m1_m8_boundaries(rows: int) -> None:
+    module = _load_script()
+
+    args = module._parser().parse_args(
+        ["--output-json", "/tmp/result.json", "--rows", str(rows)]
+    )
+
+    assert args.rows == rows
+
+
+@pytest.mark.parametrize("rows", (0, 9))
+def test_parser_rejects_rows_outside_m1_m8(rows: int) -> None:
+    module = _load_script()
+
+    with pytest.raises(SystemExit):
+        module._parser().parse_args(
+            ["--output-json", "/tmp/result.json", "--rows", str(rows)]
+        )
 
 
 def test_parser_rejects_nonpositive_measurement_counts() -> None:
@@ -600,7 +667,7 @@ def test_result_record_separates_execution_status_from_full_matrix_advance() -> 
         config={"repeats": 60},
     )
 
-    assert observed["schema"] == "mtplx-issue58-router-paired-timing-v3"
+    assert observed["schema"] == "mtplx-issue58-router-paired-timing-v4"
     assert observed["status"] == "complete"
     assert observed["advance_to_full_matrix"]["passed"] is True
     assert observed["advance_to_full_matrix"]["decision"] == "advance"
@@ -734,16 +801,18 @@ def test_correctness_failure_rejects_before_any_timing(
 ) -> None:
     module = _load_script()
     correctness = {**_passing_correctness(), "ids_exact": False}
+    activation_calls: list[tuple[int, int]] = []
     monkeypatch.setattr(
         module,
         "_load_router",
         lambda *args, **kwargs: (object(), object(), {"router": "metadata"}),
     )
-    monkeypatch.setattr(
-        module,
-        "_activation",
-        lambda *args, **kwargs: (object(), {"activation": "metadata"}),
-    )
+
+    def activation(seed: int, *, rows: int):
+        activation_calls.append((seed, rows))
+        return object(), {"activation": "metadata", "logical_rows": rows}
+
+    monkeypatch.setattr(module, "_activation", activation)
     monkeypatch.setattr(
         module,
         "_router_arms",
@@ -759,6 +828,7 @@ def test_correctness_failure_rejects_before_any_timing(
     observed = module.run_benchmark(
         model=Path("/model"),
         layer=1,
+        rows=6,
         warmups=4,
         repeats=module.MIN_PAIRED_REPEATS,
         activation_seed=1,
@@ -780,6 +850,92 @@ def test_correctness_failure_rejects_before_any_timing(
     }
     assert observed["advance_to_full_matrix"]["passed"] is False
     assert observed["advance_to_full_matrix"]["decision"] == "hold"
+    assert activation_calls == [(1, 6)]
+
+
+@pytest.mark.parametrize("rows", (1, 8))
+def test_run_benchmark_threads_rows_without_changing_unique_epoch_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+) -> None:
+    module = _load_script()
+    observations: dict[str, object] = {}
+    monkeypatch.setattr(
+        module,
+        "_load_router",
+        lambda *args, **kwargs: (object(), object(), {"router": "metadata"}),
+    )
+
+    def activation(seed: int, *, rows: int):
+        observations["activation"] = (seed, rows)
+        return object(), {"logical_rows": rows}
+
+    def router_arms(*args, candidate_invocations: int):
+        observations["candidate_invocations"] = candidate_invocations
+        return {"control": object(), "candidate": object()}
+
+    def measure_pairs(functions, *, warmups: int, repeats: int):
+        observations["measurement"] = (warmups, repeats)
+        return ["raw-pairs"]
+
+    monkeypatch.setattr(module, "_activation", activation)
+    monkeypatch.setattr(module, "_router_arms", router_arms)
+    monkeypatch.setattr(module, "_correctness", lambda *args: _passing_correctness())
+    monkeypatch.setattr(module, "_measure_pairs", measure_pairs)
+    monkeypatch.setattr(
+        module,
+        "paired_timing_statistics",
+        lambda *args, **kwargs: _passing_timing(),
+    )
+
+    observed = module.run_benchmark(
+        model=Path("/model"),
+        layer=1,
+        rows=rows,
+        warmups=4,
+        repeats=module.MIN_PAIRED_REPEATS,
+        activation_seed=58,
+        bootstrap_seed=59,
+        bootstrap_resamples=module.MIN_BOOTSTRAP_RESAMPLES,
+        provenance=_valid_provenance(module),
+        config={"shape": {"logical_rows": rows}},
+        device={"qualified": True},
+    )
+
+    assert observed["status"] == "complete"
+    assert observations == {
+        "activation": (58, rows),
+        "candidate_invocations": 2 + 4 + module.MIN_PAIRED_REPEATS,
+        "measurement": (4, module.MIN_PAIRED_REPEATS),
+    }
+
+
+@pytest.mark.parametrize("rows", (0, 9))
+def test_run_benchmark_rejects_rows_outside_m1_m8_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+) -> None:
+    module = _load_script()
+    monkeypatch.setattr(
+        module,
+        "_load_router",
+        lambda *args, **kwargs: pytest.fail("invalid rows must fail before model load"),
+    )
+
+    with pytest.raises(ValueError, match="between 1 and 8"):
+        module.run_benchmark(
+            model=Path("/model"),
+            layer=1,
+            rows=rows,
+            warmups=4,
+            repeats=module.MIN_PAIRED_REPEATS,
+            activation_seed=58,
+            bootstrap_seed=59,
+            bootstrap_resamples=module.MIN_BOOTSTRAP_RESAMPLES,
+            provenance=_valid_provenance(module),
+            config={"shape": {"logical_rows": rows}},
+            device={"qualified": True},
+        )
 
 
 @pytest.mark.parametrize(
@@ -879,6 +1035,8 @@ def test_main_gates_device_inside_window_and_audits_successful_exit(
     def run_benchmark(**kwargs):
         assert state["inside"] is True
         assert kwargs["device"] == {"qualified": True}
+        assert kwargs["rows"] == 8
+        assert kwargs["config"]["shape"]["hidden"] == [1, 8, 4096]
         return {
             "schema": module.SCHEMA,
             "status": "complete",
@@ -900,6 +1058,8 @@ def test_main_gates_device_inside_window_and_audits_successful_exit(
         [
             "--output-json",
             str(destination),
+            "--rows",
+            "8",
             "--warmups",
             "4",
             "--repeats",

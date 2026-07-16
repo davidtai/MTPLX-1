@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired complete-router timing for the Issue #58 fixed-M4 candidate."""
+"""Paired complete-router timing for the Issue #58 M1-M8 candidate family."""
 
 from __future__ import annotations
 
@@ -51,10 +51,13 @@ from mtplx.qwen_guard import (  # noqa: E402
 )
 
 
-SCHEMA = "mtplx-issue58-router-paired-timing-v3"
-CONTROL_ARM = "issue59-r41-n16-p16-sg4-grouped-direct-precise-g6"
-CANDIDATE_ARM = "issue58-m4-last-arrival-one-dispatch-precise"
-ROWS = 4
+SCHEMA = "mtplx-issue58-router-paired-timing-v4"
+CONTROL_ARM = "issue59-r41-topology-n16-p16-sg4-grouped-direct-precise-g6"
+CANDIDATE_ARM = "issue58-m1-m8-last-arrival-one-dispatch-precise"
+MIN_ROWS = 1
+MAX_ROWS = 8
+DEFAULT_ROWS = 4
+PHYSICAL_MPP_ROWS = 8
 HIDDEN_SIZE = 4096
 EXPERTS = 192
 TOP_K = 8
@@ -678,16 +681,30 @@ def _load_router(
     )
 
 
-def _activation(seed: int) -> tuple[mx.array, dict[str, Any]]:
+def _validate_rows(rows: int) -> int:
+    logical_rows = int(rows)
+    if isinstance(rows, bool) or logical_rows != rows:
+        raise ValueError("router rows must be an integer")
+    if not MIN_ROWS <= logical_rows <= MAX_ROWS:
+        raise ValueError(
+            f"router rows must be between {MIN_ROWS} and {MAX_ROWS} inclusive"
+        )
+    return logical_rows
+
+
+def _activation(seed: int, *, rows: int) -> tuple[mx.array, dict[str, Any]]:
+    logical_rows = _validate_rows(rows)
     rng = np.random.default_rng(int(seed))
-    host = rng.standard_normal((1, ROWS, HIDDEN_SIZE), dtype=np.float32)
+    host = rng.standard_normal((1, logical_rows, HIDDEN_SIZE), dtype=np.float32)
     value = mx.array(np.ascontiguousarray(host), dtype=mx.float32)
     mx.eval(value)
     mx.synchronize()
     return value, {
         "seed": int(seed),
         "generator": "numpy.random.default_rng.standard_normal",
-        "shape": [1, ROWS, HIDDEN_SIZE],
+        "shape": [1, logical_rows, HIDDEN_SIZE],
+        "logical_rows": logical_rows,
+        "physical_mpp_rows": PHYSICAL_MPP_ROWS,
         "dtype": "FP32",
         "payload_sha256": _sha256_bytes(host.tobytes(order="C")),
         "shared_by_both_arms": True,
@@ -914,6 +931,7 @@ def run_benchmark(
     *,
     model: Path,
     layer: int,
+    rows: int,
     warmups: int,
     repeats: int,
     activation_seed: int,
@@ -925,6 +943,7 @@ def run_benchmark(
 ) -> dict[str, Any]:
     """Execute the paired gate; the caller owns the exclusive MLX window."""
 
+    logical_rows = _validate_rows(rows)
     if (
         min(int(warmups), int(repeats), int(bootstrap_resamples)) <= 0
         or int(warmups) % 2
@@ -943,7 +962,10 @@ def run_benchmark(
         model,
         layer=int(layer),
     )
-    value, activation_metadata = _activation(int(activation_seed))
+    value, activation_metadata = _activation(
+        int(activation_seed),
+        rows=logical_rows,
+    )
 
     functions = _router_arms(
         value,
@@ -1022,6 +1044,13 @@ def _positive_float(value: str) -> float:
     return result
 
 
+def _logical_rows(value: str) -> int:
+    try:
+        return _validate_rows(int(value))
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1030,6 +1059,7 @@ def _parser() -> argparse.ArgumentParser:
         default=Path.home() / ".cache/huggingface/hy3-expert-only-mlx-q2",
     )
     parser.add_argument("--layer", type=int, default=1)
+    parser.add_argument("--rows", type=_logical_rows, default=DEFAULT_ROWS)
     parser.add_argument("--warmups", type=_positive_even_int, default=12)
     parser.add_argument("--repeats", type=_sufficient_paired_repeats, default=100)
     parser.add_argument("--activation-seed", type=int, default=58_590_004)
@@ -1055,11 +1085,14 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _config(args: argparse.Namespace) -> dict[str, Any]:
+    rows = int(args.rows)
     return {
         "model": str(args.model.expanduser().resolve()),
         "layer": int(args.layer),
         "shape": {
-            "hidden": [1, ROWS, HIDDEN_SIZE],
+            "hidden": [1, rows, HIDDEN_SIZE],
+            "logical_rows": rows,
+            "physical_mpp_rows": PHYSICAL_MPP_ROWS,
             "resident_weight": [HIDDEN_SIZE, EXPERTS],
             "expert_bias": [EXPERTS],
             "top_k": TOP_K,
@@ -1087,7 +1120,8 @@ def _config(args: argparse.Namespace) -> dict[str, Any]:
             "arm": CANDIDATE_ARM,
             "implementation": "hy3_router_last_arrival_route",
             "dispatches": 1,
-            "fixed_m": ROWS,
+            "logical_m": rows,
+            "supported_logical_m_range": [MIN_ROWS, MAX_ROWS],
         },
         "measurement": {
             "order": "balanced ABBA paired interleave in complete even blocks",
@@ -1225,6 +1259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = run_benchmark(
                     model=args.model.expanduser().resolve(),
                     layer=int(args.layer),
+                    rows=int(args.rows),
                     warmups=int(args.warmups),
                     repeats=int(args.repeats),
                     activation_seed=int(args.activation_seed),
