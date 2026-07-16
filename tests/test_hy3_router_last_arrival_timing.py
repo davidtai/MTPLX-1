@@ -286,6 +286,7 @@ def test_router_arms_use_actual_issue59_r41_precise_g6_control(
         object(),
         object(),
         candidate_invocations=2,
+        candidate_arm="last-arrival",
     )
 
     assert arms["control"]() == (sentinel_ids, sentinel_weights)
@@ -342,6 +343,57 @@ def test_router_arms_fail_loudly_if_explicit_epoch_api_is_missing(
             object(),
             object(),
             candidate_invocations=2,
+            candidate_arm="last-arrival",
+        )
+
+
+def test_router_arms_row_owned_candidate_needs_no_epoch_machinery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    sentinel_ids = object()
+    sentinel_weights = object()
+    candidate_calls: list[dict[str, object]] = []
+
+    def row_owned_route(*args, **kwargs):
+        candidate_calls.append(kwargs)
+        return sentinel_ids, sentinel_weights
+
+    monkeypatch.setattr(module, "hy3_router_row_owned_route", row_owned_route)
+    monkeypatch.setattr(
+        module,
+        "new_hy3_router_forward_epoch",
+        None,
+        raising=False,
+    )
+
+    arms = module._router_arms(
+        object(),
+        object(),
+        object(),
+        candidate_invocations=2,
+    )
+
+    assert arms["candidate"]() == (sentinel_ids, sentinel_weights)
+    assert candidate_calls == [
+        {
+            "top_k": 8,
+            "route_norm": True,
+            "scaling_factor": 2.826,
+            "sigmoid_mode": "precise",
+        }
+    ]
+
+
+def test_router_arms_reject_unknown_candidate_arm() -> None:
+    module = _load_script()
+    with pytest.raises(ValueError, match="candidate arm"):
+        module._router_arms(
+            object(),
+            object(),
+            object(),
+            candidate_invocations=2,
+            candidate_arm="bogus",
         )
 
 
@@ -376,12 +428,34 @@ def test_config_records_selected_m1_m8_shape() -> None:
         "n16_p16_sg4_grouped_direct_precise_g6"
     )
     assert config["control"]["finalizer_simd_groups"] == 6
-    assert config["candidate"]["arm"] == module.CANDIDATE_ARM
+    assert module.ROW_OWNED_ARM == ("issue58-m1-m8-row-owned-one-dispatch-precise-g6")
+    assert config["candidate"]["arm"] == module.ROW_OWNED_ARM
+    assert config["candidate"]["implementation"] == "hy3_router_row_owned_route"
+    assert config["candidate"]["threadgroups_per_dispatch"] == 7
+    assert config["candidate"]["threads_per_threadgroup"] == 384
     assert config["candidate"]["logical_m"] == 7
     assert config["candidate"]["supported_logical_m_range"] == [1, 8]
     assert "fixed_m" not in config["candidate"]
     assert "selector" not in config["control"]
     assert "selector" not in config["candidate"]
+    assert config["measurement"]["queued_block_invocations"] == 64
+    assert config["measurement"]["queued_paired_repeats"] == 60
+
+    last_arrival_args = module._parser().parse_args(
+        [
+            "--output-json",
+            "/tmp/result.json",
+            "--rows",
+            "7",
+            "--candidate-arm",
+            "last-arrival",
+        ]
+    )
+    last_arrival_config = module._config(last_arrival_args)
+    assert last_arrival_config["candidate"]["arm"] == module.CANDIDATE_ARM
+    assert last_arrival_config["candidate"]["implementation"] == (
+        "hy3_router_last_arrival_route"
+    )
 
 
 def test_activation_uses_explicit_logical_rows_and_records_shape(
@@ -872,8 +946,9 @@ def test_run_benchmark_threads_rows_without_changing_unique_epoch_budget(
         observations["activation"] = (seed, rows)
         return object(), {"logical_rows": rows}
 
-    def router_arms(*args, candidate_invocations: int):
+    def router_arms(*args, candidate_invocations: int, candidate_arm: str):
         observations["candidate_invocations"] = candidate_invocations
+        observations["candidate_arm"] = candidate_arm
         return {"control": object(), "candidate": object()}
 
     def measure_pairs(functions, *, warmups: int, repeats: int):
@@ -907,6 +982,7 @@ def test_run_benchmark_threads_rows_without_changing_unique_epoch_budget(
     assert observed["status"] == "complete"
     assert observations == {
         "activation": (58, rows),
+        "candidate_arm": "row-owned",
         "candidate_invocations": 2 + 4 + module.MIN_PAIRED_REPEATS,
         "measurement": (4, module.MIN_PAIRED_REPEATS),
     }

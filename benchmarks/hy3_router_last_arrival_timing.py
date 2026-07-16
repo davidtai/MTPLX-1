@@ -36,6 +36,9 @@ from mtplx.hy3_router_fp32 import (  # noqa: E402
 from mtplx.hy3_router_last_arrival import (  # noqa: E402
     hy3_router_last_arrival_route,
 )
+from mtplx.hy3_router_row_owned import (  # noqa: E402
+    hy3_router_row_owned_route,
+)
 
 try:  # Stacked #58 API; fail loudly at benchmark construction if absent.
     from mtplx.hy3_router_last_arrival import (  # noqa: E402
@@ -54,6 +57,8 @@ from mtplx.qwen_guard import (  # noqa: E402
 SCHEMA = "mtplx-issue58-router-paired-timing-v4"
 CONTROL_ARM = "issue59-r41-topology-n16-p16-sg4-grouped-direct-precise-g6"
 CANDIDATE_ARM = "issue58-m1-m8-last-arrival-one-dispatch-precise"
+ROW_OWNED_ARM = "issue58-m1-m8-row-owned-one-dispatch-precise-g6"
+CANDIDATE_ARMS = ("row-owned", "last-arrival")
 MIN_ROWS = 1
 MAX_ROWS = 8
 DEFAULT_ROWS = 4
@@ -75,6 +80,7 @@ REQUIRED_PROVENANCE_SOURCES = (
     "benchmarks/hy3_router_last_arrival_timing.py",
     "mtplx/hy3_router_fp32.py",
     "mtplx/hy3_router_last_arrival.py",
+    "mtplx/hy3_router_row_owned.py",
     "mtplx/nax_verify.py",
     "mtplx/qwen_guard.py",
 )
@@ -318,6 +324,17 @@ def timing_gate(timing: Mapping[str, Any]) -> dict[str, Any]:
     return {"passed": not failures, "failures": failures}
 
 
+def _candidate_arm_label(config: Mapping[str, Any]) -> str:
+    """Read the configured candidate arm; legacy payloads keep the old label."""
+
+    candidate = config.get("candidate") if isinstance(config, Mapping) else None
+    if isinstance(candidate, Mapping):
+        arm = candidate.get("arm")
+        if isinstance(arm, str) and arm:
+            return arm
+    return CANDIDATE_ARM
+
+
 def completed_result(
     *,
     correctness: dict[str, Any],
@@ -342,7 +359,7 @@ def completed_result(
         "status": "complete",
         "scope": "complete Hy3 router only; no experts, SSD reads, or full model",
         "control_arm": CONTROL_ARM,
-        "candidate_arm": CANDIDATE_ARM,
+        "candidate_arm": _candidate_arm_label(config),
         "config": config,
         "correctness": correctness,
         "timing": timing,
@@ -384,7 +401,7 @@ def rejected_result(
         "status": "rejected",
         "scope": "complete Hy3 router only; no experts, SSD reads, or full model",
         "control_arm": CONTROL_ARM,
-        "candidate_arm": CANDIDATE_ARM,
+        "candidate_arm": _candidate_arm_label(config),
         "config": config,
         "correctness": correctness,
         "rejection": {"phase": "correctness", "reasons": reasons},
@@ -415,7 +432,7 @@ def failure_result(
         "status": "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
         "scope": "complete Hy3 router only; no experts, SSD reads, or full model",
         "control_arm": CONTROL_ARM,
-        "candidate_arm": CANDIDATE_ARM,
+        "candidate_arm": _candidate_arm_label(config),
         "config": config,
         "failure": {
             "phase": str(phase),
@@ -844,18 +861,15 @@ def _router_arms(
     expert_bias: mx.array,
     *,
     candidate_invocations: int,
+    candidate_arm: str = "row-owned",
 ) -> dict[str, Callable[[], tuple[mx.array, mx.array]]]:
-    """Build the exact #59 r41 G6 control and #58 one-dispatch candidate."""
+    """Build the exact #59 r41 G6 control and the selected #58 candidate."""
 
+    if candidate_arm not in CANDIDATE_ARMS:
+        raise ValueError(f"candidate arm must be one of {CANDIDATE_ARMS}")
     invocation_count = int(candidate_invocations)
     if invocation_count <= 0:
         raise ValueError("candidate invocation count must be positive")
-    if not callable(new_hy3_router_forward_epoch):
-        raise RuntimeError("Issue #58 timing requires the explicit forward-epoch API")
-    epoch_block = new_hy3_router_forward_epoch(invocation_count)
-    mx.eval(epoch_block)
-    mx.synchronize()
-    epoch_cursor = 0
 
     def control() -> tuple[mx.array, mx.array]:
         return hy3_router_fp32_route(
@@ -873,6 +887,28 @@ def _router_arms(
             simd_groups=6,
             sigmoid_mode="precise",
         )
+
+    if candidate_arm == "row-owned":
+
+        def candidate() -> tuple[mx.array, mx.array]:
+            return hy3_router_row_owned_route(
+                value,
+                resident_weight,
+                expert_bias,
+                top_k=TOP_K,
+                route_norm=True,
+                scaling_factor=ROUTER_SCALING,
+                sigmoid_mode="precise",
+            )
+
+        return {"control": control, "candidate": candidate}
+
+    if not callable(new_hy3_router_forward_epoch):
+        raise RuntimeError("Issue #58 timing requires the explicit forward-epoch API")
+    epoch_block = new_hy3_router_forward_epoch(invocation_count)
+    mx.eval(epoch_block)
+    mx.synchronize()
+    epoch_cursor = 0
 
     def candidate() -> tuple[mx.array, mx.array]:
         nonlocal epoch_cursor
@@ -927,6 +963,50 @@ def _measure_pairs(
     return raw_pairs
 
 
+def _measure_queued_blocks(
+    functions: Mapping[str, Callable[[], tuple[mx.array, mx.array]]],
+    *,
+    repeats: int,
+    block: int,
+) -> list[dict[str, Any]]:
+    """Time N back-to-back dispatches per arm with one eval/synchronize.
+
+    Per-call host synchronization dominates the eager microsecond lane, so a
+    candidate must also hold its ratio when kernels are queued back to back.
+    """
+
+    if set(functions) != {"control", "candidate"}:
+        raise ValueError("queued timing requires exactly control and candidate arms")
+    if min(int(repeats), int(block)) <= 0 or int(repeats) % 2:
+        raise ValueError("queued timing requires a positive block and even repeats")
+    for warmup in range(2):
+        for name in paired_arm_order(warmup):
+            outputs: list[mx.array] = []
+            for _ in range(int(block)):
+                outputs.extend(functions[name]())
+            mx.eval(*outputs)
+            mx.synchronize()
+    samples: list[dict[str, Any]] = []
+    for repeat in range(int(repeats)):
+        order = paired_arm_order(repeat)
+        sample: dict[str, Any] = {
+            "repeat": repeat,
+            "order": list(order),
+            "block_invocations": int(block),
+        }
+        for name in order:
+            started = time.perf_counter_ns()
+            outputs = []
+            for _ in range(int(block)):
+                outputs.extend(functions[name]())
+            mx.eval(*outputs)
+            mx.synchronize()
+            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+            sample[f"{name}_ms"] = elapsed_ms / int(block)
+        samples.append(sample)
+    return samples
+
+
 def run_benchmark(
     *,
     model: Path,
@@ -940,6 +1020,9 @@ def run_benchmark(
     provenance: dict[str, Any],
     config: dict[str, Any],
     device: dict[str, Any],
+    candidate_arm: str = "row-owned",
+    queued_block: int = 0,
+    queued_repeats: int = 60,
 ) -> dict[str, Any]:
     """Execute the paired gate; the caller owns the exclusive MLX window."""
 
@@ -967,11 +1050,15 @@ def run_benchmark(
         rows=logical_rows,
     )
 
+    queued_invocations = (
+        (2 + int(queued_repeats)) * int(queued_block) if int(queued_block) else 0
+    )
     functions = _router_arms(
         value,
         resident_weight,
         expert_bias,
-        candidate_invocations=2 + int(warmups) + int(repeats),
+        candidate_invocations=2 + int(warmups) + int(repeats) + queued_invocations,
+        candidate_arm=candidate_arm,
     )
     correctness = _correctness(functions["control"], functions["candidate"])
     complete_provenance = {
@@ -996,6 +1083,18 @@ def run_benchmark(
         bootstrap_resamples=int(bootstrap_resamples),
         bootstrap_seed=int(bootstrap_seed),
     )
+    if int(queued_block):
+        queued_samples = _measure_queued_blocks(
+            functions,
+            repeats=int(queued_repeats),
+            block=int(queued_block),
+        )
+        timing["queued"] = paired_timing_statistics(
+            queued_samples,
+            bootstrap_resamples=int(bootstrap_resamples),
+            bootstrap_seed=int(bootstrap_seed),
+        )
+        timing["queued"]["block_invocations"] = int(queued_block)
     return completed_result(
         correctness=correctness,
         timing=timing,
@@ -1061,6 +1160,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--rows", type=_logical_rows, default=DEFAULT_ROWS)
     parser.add_argument("--warmups", type=_positive_even_int, default=12)
+    parser.add_argument(
+        "--candidate-arm",
+        choices=list(CANDIDATE_ARMS),
+        default="row-owned",
+    )
+    parser.add_argument("--queued-block", type=int, default=64)
+    parser.add_argument("--queued-repeats", type=_positive_even_int, default=60)
     parser.add_argument("--repeats", type=_sufficient_paired_repeats, default=100)
     parser.add_argument("--activation-seed", type=int, default=58_590_004)
     parser.add_argument("--bootstrap-seed", type=int, default=58_051)
@@ -1117,13 +1223,25 @@ def _config(args: argparse.Namespace) -> dict[str, Any]:
             "finalizer_mode": "simd",
             "finalizer_simd_groups": 6,
         },
-        "candidate": {
-            "arm": CANDIDATE_ARM,
-            "implementation": "hy3_router_last_arrival_route",
-            "dispatches": 1,
-            "logical_m": rows,
-            "supported_logical_m_range": [MIN_ROWS, MAX_ROWS],
-        },
+        "candidate": (
+            {
+                "arm": ROW_OWNED_ARM,
+                "implementation": "hy3_router_row_owned_route",
+                "dispatches": 1,
+                "logical_m": rows,
+                "supported_logical_m_range": [MIN_ROWS, MAX_ROWS],
+                "threadgroups_per_dispatch": rows,
+                "threads_per_threadgroup": 384,
+            }
+            if args.candidate_arm == "row-owned"
+            else {
+                "arm": CANDIDATE_ARM,
+                "implementation": "hy3_router_last_arrival_route",
+                "dispatches": 1,
+                "logical_m": rows,
+                "supported_logical_m_range": [MIN_ROWS, MAX_ROWS],
+            }
+        ),
         "measurement": {
             "order": "balanced ABBA paired interleave in complete even blocks",
             "warmups_per_arm": int(args.warmups),
@@ -1133,6 +1251,8 @@ def _config(args: argparse.Namespace) -> dict[str, Any]:
             "bootstrap_resamples": int(args.bootstrap_resamples),
             "percentile_method": "numpy.quantile(method='linear')",
             "synchronization": "mx.eval(ids, weights) then mx.synchronize for both arms",
+            "queued_block_invocations": int(args.queued_block),
+            "queued_paired_repeats": int(args.queued_repeats),
         },
     }
 
@@ -1269,6 +1389,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     provenance=provenance,
                     config=config,
                     device=qualified_device,
+                    candidate_arm=str(args.candidate_arm),
+                    queued_block=int(args.queued_block),
+                    queued_repeats=int(args.queued_repeats),
                 )
             except BaseException as error:
                 body_error = error
