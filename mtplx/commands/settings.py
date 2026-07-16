@@ -201,8 +201,6 @@ def _user(args: Any) -> int:
 
 
 def _live(args: Any) -> int:
-    from mtplx.commands.public import cmd_settings_public
-
     args.settings_action = "get" if args.settings_operation == "show" else "set"
     if not hasattr(args, "pairs"):
         args.pairs = []
@@ -228,3 +226,111 @@ def cmd_settings(args: Any) -> int:
     except (OSError, ValueError) as exc:
         print(f"error: {exc}")
         return 2
+
+
+def _parse_settings_pairs(pairs: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """Parse ``key=value`` pairs; values decode as JSON with string fallback."""
+
+    parsed: dict[str, Any] = {}
+    errors: list[str] = []
+    for pair in pairs:
+        key, separator, raw_value = str(pair).partition("=")
+        key = key.strip()
+        if not separator or not key:
+            errors.append(pair)
+            continue
+        value_text = raw_value.strip()
+        try:
+            parsed[key] = json.loads(value_text)
+        except json.JSONDecodeError:
+            parsed[key] = value_text
+    return parsed, errors
+
+
+def cmd_settings_public(args: Any) -> int:
+    """Read or change live server settings over /v1/mtplx/settings."""
+
+    from mtplx.commands import public as compatibility
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    base = compatibility._server_url(host, port)
+    json_output = bool(getattr(args, "json", False))
+    action = str(getattr(args, "settings_action", None) or "get")
+    pairs = list(getattr(args, "pairs", None) or [])
+    if action == "get" and pairs:
+        action = "set"
+
+    def fail_unreachable() -> int:
+        print(f"No MTPLX server is responding on {base}.")
+        print("Start one with the MTPLX app or: mtplx start")
+        return 1
+
+    if action == "get":
+        payload = compatibility._http_json(
+            base + "/v1/mtplx/settings", timeout=5.0
+        )
+        if not payload.get("ok"):
+            return fail_unreachable()
+        if json_output:
+            compatibility._print(payload)
+            return 0
+        print(f"MTPLX server settings  ·  {base}")
+        for key in sorted(payload):
+            if key != "ok":
+                print(f"  {key} = {json.dumps(payload[key], default=str)}")
+        return 0
+
+    update, malformed = _parse_settings_pairs(pairs)
+    if malformed or not update:
+        for pair in malformed:
+            print(f"error: not a key=value pair: {pair!r}")
+        if not update:
+            print("usage: mtplx settings set key=value [key=value ...]")
+            print("example: mtplx settings set depth=2 reasoning=off")
+        return 2
+    response = compatibility._http_post_json(
+        base + "/v1/mtplx/settings", update, timeout=10.0
+    )
+    if response.get("ok"):
+        body = response.get("json") or {}
+        applied = body.get("applied") or {}
+        if json_output:
+            compatibility._print(body)
+            return 0
+        if applied:
+            for key in sorted(applied):
+                print(f"applied: {key} = {json.dumps(applied[key], default=str)}")
+        else:
+            print("nothing to apply")
+        return 0
+    error = response.get("error")
+    if isinstance(error, dict) and isinstance(error.get("error"), dict):
+        error = error["error"]
+    detail = error.get("detail") if isinstance(error, dict) else None
+    if isinstance(detail, dict):
+        kind = detail.get("error")
+        keys = detail.get("keys") or []
+        if kind == "restart_required":
+            print(
+                "error: these settings need a server restart: "
+                + ", ".join(str(key) for key in keys)
+            )
+            print(
+                "Change them in the MTPLX app's settings, or restart "
+                "`mtplx serve` with the matching flags."
+            )
+            return 2
+        if kind == "unknown_settings":
+            print("error: unknown settings: " + ", ".join(map(str, keys)))
+            supported = detail.get("supported") or []
+            if supported:
+                print("supported: " + ", ".join(map(str, supported)))
+            return 2
+    if isinstance(detail, str) and detail:
+        print(f"error: {detail}")
+        return 2
+    if response.get("status") is None:
+        return fail_unreachable()
+    print(f"error: settings update failed ({response.get('status')})")
+    return 1
