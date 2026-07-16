@@ -342,13 +342,13 @@ def cmd_tune_public(args: argparse.Namespace) -> int:
 
 
 def cmd_stop_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_stop_public as handler
+    from .commands.support import cmd_stop_public as handler
 
     return handler(args)
 
 
 def cmd_settings_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_settings_public as handler
+    from .commands.settings import cmd_settings_public as handler
 
     return handler(args)
 
@@ -402,13 +402,13 @@ def cmd_quickstart_public(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_doctor as handler
+    from .commands.support import cmd_doctor as handler
 
     return handler(args)
 
 
 def cmd_inspect_model_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_inspect_model_public as handler
+    from .commands.models import cmd_inspect_model_public as handler
 
     return handler(args)
 
@@ -420,19 +420,19 @@ def cmd_profile_public(args: argparse.Namespace) -> int:
 
 
 def cmd_pull_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_pull_public as handler
+    from .commands.models import cmd_pull_public as handler
 
     return handler(args)
 
 
 def cmd_list_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_list_public as handler
+    from .commands.models import cmd_list_public as handler
 
     return handler(args)
 
 
 def cmd_remove_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_remove_public as handler
+    from .commands.models import cmd_remove_public as handler
 
     return handler(args)
 
@@ -468,19 +468,19 @@ def cmd_max_public(args: argparse.Namespace) -> int:
 
 
 def cmd_debug_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_debug_public as handler
+    from .commands.support import cmd_debug_public as handler
 
     return handler(args)
 
 
 def cmd_openwebui_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_openwebui_public as handler
+    from .commands.integrations import cmd_openwebui_public as handler
 
     return handler(args)
 
 
 def cmd_dashboard_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_dashboard_public as handler
+    from .commands.integrations import cmd_dashboard_public as handler
 
     return handler(args)
 
@@ -492,19 +492,19 @@ def cmd_metrics_public(args: argparse.Namespace) -> int:
 
 
 def cmd_integrate_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_integrate_public as handler
+    from .commands.integrations import cmd_integrate_public as handler
 
     return handler(args)
 
 
 def cmd_model_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_model_public as handler
+    from .commands.models import cmd_model_public as handler
 
     return handler(args)
 
 
 def cmd_config_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_config_public as handler
+    from .commands.models import cmd_config_public as handler
 
     return handler(args)
 
