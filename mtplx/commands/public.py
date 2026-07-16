@@ -464,6 +464,8 @@ def _record_model_gate_constraint(args: Any, inspection: dict[str, Any]) -> None
     """Explain an existing failed model gate in the settings snapshot."""
 
     compatibility = inspection.get("compatibility") or {}
+    if not isinstance(compatibility, dict):
+        return
     if compatibility.get("can_run") is not False:
         return
     reason = str(

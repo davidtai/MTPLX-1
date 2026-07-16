@@ -40,7 +40,7 @@
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Add characterization tests for current precedence and live settings parsing**
+- [x] **Step 1: Add characterization tests for current precedence and live settings parsing**
 
 ```python
 from __future__ import annotations
@@ -72,13 +72,13 @@ def test_historical_settings_set_shape_remains_live_daemon_compatible():
     assert args.func.__name__ == "cmd_settings_public"
 ```
 
-- [ ] **Step 2: Run the characterization tests**
+- [x] **Step 2: Run the characterization tests**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_compatibility_baseline.py tests/test_config.py tests/test_config_profile_precedence.py tests/test_cli_parity_tools.py`
 
 Expected: PASS; these tests capture behavior rather than introduce new behavior.
 
-- [ ] **Step 3: Commit the behavior lock**
+- [x] **Step 3: Commit the behavior lock**
 
 ```bash
 git add tests/test_settings_compatibility_baseline.py
@@ -97,7 +97,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 1 complete: lega
 
 **Does NOT cover:** Source precedence, persistence, CLI application, live mutation, or environment discovery.
 
-- [ ] **Step 1: Write failing schema tests**
+- [x] **Step 1: Write failing schema tests**
 
 ```python
 from __future__ import annotations
@@ -148,13 +148,13 @@ def test_alias_metadata_is_orthogonal_to_visibility_and_lifecycle():
     assert spec.visibility is Visibility.PUBLIC
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_schema.py`
 
 Expected: FAIL with `ModuleNotFoundError: No module named 'mtplx.settings'`.
 
-- [ ] **Step 3: Implement schema primitives**
+- [x] **Step 3: Implement schema primitives**
 
 ```python
 # mtplx/settings/schema.py
@@ -239,13 +239,13 @@ class SettingSpec:
 
 `mtplx/settings/__init__.py` re-exports the five public schema types.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_schema.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add mtplx/settings tests/test_settings_schema.py
@@ -266,7 +266,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 2 complete: type
 
 **Does NOT cover:** TOML I/O, argparse wiring, environment source scanning, model safety constraints, or live daemon writes.
 
-- [ ] **Step 1: Write failing catalog and precedence tests**
+- [x] **Step 1: Write failing catalog and precedence tests**
 
 ```python
 from __future__ import annotations
@@ -323,13 +323,13 @@ def test_resolver_redacts_secret_provenance():
     assert resolved.provenance["server.api_key"].display_value == "[redacted]"
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_resolver.py`
 
 Expected: FAIL because catalog, builtins, and resolver do not exist.
 
-- [ ] **Step 3: Implement catalog lookup and suggestions**
+- [x] **Step 3: Implement catalog lookup and suggestions**
 
 `SettingCatalog` stores `by_name` and `by_alias`, rejects collisions in its
 constructor, resolves aliases to a canonical spec, returns domain/visibility
@@ -372,7 +372,7 @@ class SettingCatalog:
         return get_close_matches(name, self.by_name, n=3, cutoff=0.55)
 ```
 
-- [ ] **Step 4: Define the product settings used by current `UserConfig`**
+- [x] **Step 4: Define the product settings used by current `UserConfig`**
 
 `BUILTIN_SETTINGS` must contain canonical entries and aliases for all existing
 `CONFIG_VALUE_KEYS`: model/model_dir/profile/thermal control, paged KV,
@@ -413,7 +413,7 @@ def default_setting_catalog() -> SettingCatalog:
     return SettingCatalog(BUILTIN_SETTINGS)
 ```
 
-- [ ] **Step 5: Implement resolver and provenance**
+- [x] **Step 5: Implement resolver and provenance**
 
 ```python
 # mtplx/settings/resolver.py
@@ -493,13 +493,13 @@ class SettingsResolver:
         return ResolvedSettings(values, provenance)
 ```
 
-- [ ] **Step 6: Verify GREEN and broader config tests**
+- [x] **Step 6: Verify GREEN and broader config tests**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_schema.py tests/test_settings_resolver.py tests/test_config.py tests/test_profiles.py`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit and update issue**
+- [x] **Step 7: Commit and update issue**
 
 ```bash
 git add mtplx/settings tests/test_settings_resolver.py
@@ -518,7 +518,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 3 complete: cano
 
 **Does NOT cover:** Lab URIs, arrays, arbitrary nested payloads, shell expansion, secrets, or live daemon settings.
 
-- [ ] **Step 1: Write failing storage and bundle tests**
+- [x] **Step 1: Write failing storage and bundle tests**
 
 ```python
 from __future__ import annotations
@@ -563,20 +563,20 @@ def test_api_key_file_reference_can_be_persisted_but_raw_key_cannot(tmp_path):
         update_user_setting(path, "server.api_key", "top-secret")
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_storage.py`
 
 Expected: FAIL because bundle/storage modules do not exist.
 
-- [ ] **Step 3: Implement strict bundle loading**
+- [x] **Step 3: Implement strict bundle loading**
 
 `load_settings_bundle` uses `tomllib`, requires exactly the top-level
 `settings` table, requires string keys and scalar bool/int/float/string values,
 and returns a plain dictionary. It never expands environment variables or
 executes content.
 
-- [ ] **Step 4: Implement deterministic TOML and atomic writes**
+- [x] **Step 4: Implement deterministic TOML and atomic writes**
 
 `load_user_settings` reads canonical `[settings]` first and maps existing flat
 config aliases through `SettingCatalog.by_alias`. `update_user_setting` and
@@ -587,13 +587,13 @@ legacy config keys until their canonical replacement is written. These
 functions use `default_setting_catalog()` unless a catalog is explicitly
 injected by a test.
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_storage.py tests/test_config.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/settings tests/test_settings_storage.py
@@ -613,7 +613,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 4 complete: stri
 
 **Does NOT cover:** Applying settings to runtime commands or changing the live server API's mutable-key policy.
 
-- [ ] **Step 1: Write failing parser and handler tests**
+- [x] **Step 1: Write failing parser and handler tests**
 
 ```python
 from __future__ import annotations
@@ -651,13 +651,13 @@ def test_settings_user_rejects_unknown_key_without_writing(capsys, tmp_path):
     assert "runtime.profile" in capsys.readouterr().out
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_cli.py`
 
 Expected: FAIL because new settings subcommands are not registered.
 
-- [ ] **Step 3: Register the settings command tree**
+- [x] **Step 3: Register the settings command tree**
 
 Add parsers for `show`, `list`, `explain NAME`, `user show`, `user set PAIR...`,
 `user unset NAME...`, `live show`, and `live set PAIR...`. Keep root `get` and
@@ -665,7 +665,7 @@ Add parsers for `show`, `list`, `explain NAME`, `user show`, `user set PAIR...`,
 use `mtplx.commands.settings.cmd_settings`; live parsers adapt their namespace
 and call the existing `cmd_settings_public`.
 
-- [ ] **Step 4: Implement no-MLX handlers**
+- [x] **Step 4: Implement no-MLX handlers**
 
 `cmd_settings` loads catalog, user storage, environment aliases, and profiles;
 resolves effective values; renders human tables or JSON; mutates user storage
@@ -673,13 +673,13 @@ only for the explicit user scope. `explain` includes canonical name, effective
 and requested values, source, shadowed sources, type, visibility, lifecycle,
 aliases, and restart/live metadata with secrets redacted.
 
-- [ ] **Step 5: Verify GREEN and compatibility**
+- [x] **Step 5: Verify GREEN and compatibility**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_cli.py tests/test_cli_parity_tools.py tests/test_settings_compatibility_baseline.py`
 
 Expected: PASS, including historical `settings get/set` parsing.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/cli.py mtplx/commands/public.py mtplx/commands/settings.py tests/test_settings_cli.py
@@ -700,7 +700,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 5 complete: no-M
 
 **Does NOT cover:** Benchmark lab URIs, model contract constraints, live daemon mutation, or removal of legacy flags.
 
-- [ ] **Step 1: Write failing runtime adapter tests**
+- [x] **Step 1: Write failing runtime adapter tests**
 
 ```python
 from __future__ import annotations
@@ -742,13 +742,13 @@ def test_settings_bundle_applies_without_mutating_user_config(tmp_path):
     assert args.depth == 2
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_runtime_settings_args.py`
 
 Expected: FAIL because generic settings options are not registered.
 
-- [ ] **Step 3: Add shared parser options and canonical-to-namespace mapping**
+- [x] **Step 3: Add shared parser options and canonical-to-namespace mapping**
 
 `add_settings_options(parser)` registers repeatable `--set` into
 `setting_overrides` and repeatable `--settings` into `settings_bundles`.
@@ -763,20 +763,20 @@ name-shape guessing. It applies only values whose winning source is explicit
 (`USER`, `ENV`, `BUNDLE`, `LEGACY_CLI`, `CLI_SET`, or `CONSTRAINT`); catalog
 defaults never overwrite a command's existing argparse default.
 
-- [ ] **Step 4: Call resolution from `main` after legacy config loading**
+- [x] **Step 4: Call resolution from `main` after legacy config loading**
 
 Keep `apply_user_config(args)` for compatibility, then call
 `resolve_args_settings(args)` for commands that registered settings options.
 Settings-native sources may override compatibility values according to the
 documented order; legacy-only invocations retain characterized values.
 
-- [ ] **Step 5: Verify GREEN and runtime parser compatibility**
+- [x] **Step 5: Verify GREEN and runtime parser compatibility**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_runtime_settings_args.py tests/test_settings_compatibility_baseline.py tests/test_public_cli.py tests/test_config.py tests/test_config_profile_precedence.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/settings/argparse.py mtplx/settings/builtins.py mtplx/cli.py mtplx/config.py tests/test_runtime_settings_args.py
@@ -796,7 +796,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 6 complete: runt
 
 **Does NOT cover:** Relaxing existing model gates, forcing unsupported MTP, or changing profile defaults.
 
-- [ ] **Step 1: Write failing constraint tests**
+- [x] **Step 1: Write failing constraint tests**
 
 ```python
 from __future__ import annotations
@@ -829,20 +829,20 @@ def test_compatible_value_is_not_relabelled_as_constraint():
     assert constrained.provenance["runtime.mtp.depth"].source is SettingSource.CLI_SET
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_constraints.py`
 
 Expected: FAIL because `with_constraints` and requested/reason provenance do not exist.
 
-- [ ] **Step 3: Implement immutable constraint application**
+- [x] **Step 3: Implement immutable constraint application**
 
 `ResolvedSettings.with_constraints` returns a new snapshot. For each changed
 value it creates a `CONSTRAINT` provenance record with effective value,
 requested value, reason, and the previous winner in `shadowed`. Equal values
 preserve their original source.
 
-- [ ] **Step 4: Integrate existing model decisions**
+- [x] **Step 4: Integrate existing model decisions**
 
 After existing inspection/backend checks resolve whether MTP is loadable and
 the effective maximum depth, update `args.mtplx_settings` with constraints for
@@ -851,13 +851,13 @@ remains authoritative; the settings snapshot only explains it. Add assertions
 to the existing public CLI model-gate tests that requested/effective values and
 reasons are present.
 
-- [ ] **Step 5: Verify GREEN and model gates**
+- [x] **Step 5: Verify GREEN and model gates**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_constraints.py tests/test_public_cli.py tests/test_model_catalog.py`
 
 Expected: PASS with unchanged model-gate exit behavior.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/settings/resolver.py mtplx/settings/argparse.py mtplx/commands/public.py tests/test_settings_constraints.py tests/test_public_cli.py
@@ -877,7 +877,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 7 complete: hard
 
 **Does NOT cover:** Migrating all direct environment reads in one change or deciding that every discovered name is user-settable.
 
-- [ ] **Step 1: Write failing inventory audit**
+- [x] **Step 1: Write failing inventory audit**
 
 ```python
 from __future__ import annotations
@@ -900,13 +900,13 @@ def test_new_direct_setting_reads_are_confined_to_compatibility_boundary():
     assert report.unauthorized_direct_reads == ()
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_audit.py`
 
 Expected: FAIL because the audit script and classification inventory do not exist.
 
-- [ ] **Step 3: Implement deterministic source scanning**
+- [x] **Step 3: Implement deterministic source scanning**
 
 The audit script scans Python text with `MTPLX_[A-Z0-9_]+`, reports source
 paths/lines, compares names against catalog environment aliases and
@@ -920,7 +920,7 @@ Classify all discovered names into domains using reviewed prefix groups:
 `BENCH`, `TRACE`/`DEBUG`, and `PROCESS`. Names without a reviewed prefix are
 listed explicitly. Every classification records visibility and lifecycle.
 
-- [ ] **Step 4: Generate and review the inventory**
+- [x] **Step 4: Generate and review the inventory**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/audit_settings_catalog.py --write mtplx/settings/legacy_env.py`
 
@@ -930,7 +930,7 @@ name, then exits 0 after a second `--check` run.
 Review each `public` or `advanced` classification manually; experimental and
 internal names must not appear in public settings help.
 
-- [ ] **Step 5: Verify GREEN and catalog drift**
+- [x] **Step 5: Verify GREEN and catalog drift**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_audit.py tests/test_settings_resolver.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/audit_settings_catalog.py --check`
 
@@ -938,7 +938,7 @@ Expected: PASS with zero unclassified names, duplicate aliases, or unauthorized
 new direct reads. Pre-existing direct reads are enumerated in the compatibility
 boundary rather than hidden.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/settings/legacy_env.py mtplx/settings/builtins.py scripts/audit_settings_catalog.py tests/test_settings_audit.py
@@ -954,31 +954,31 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Settings task 8 complete: ever
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Run focused settings/config/CLI verification**
+- [x] **Step 1: Run focused settings/config/CLI verification**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_schema.py tests/test_settings_resolver.py tests/test_settings_storage.py tests/test_settings_cli.py tests/test_runtime_settings_args.py tests/test_settings_constraints.py tests/test_settings_audit.py tests/test_settings_compatibility_baseline.py tests/test_config.py tests/test_config_profile_precedence.py tests/test_cli_parity_tools.py tests/test_public_cli.py`
 
 Expected: PASS.
 
-- [ ] **Step 2: Run Ruff and stub scan**
+- [x] **Step 2: Run Ruff and stub scan**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/ruff check mtplx/settings mtplx/commands/settings.py scripts/audit_settings_catalog.py tests/test_settings_*.py tests/test_runtime_settings_args.py && ! rg -n 'TODO|FIXME|placeholder|NotImplementedError' mtplx/settings mtplx/commands/settings.py scripts/audit_settings_catalog.py`
 
 Expected: PASS and no stub matches.
 
-- [ ] **Step 3: Run full suite**
+- [x] **Step 3: Run full suite**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q`
 
 Expected: exit 0 with no new skips or failures.
 
-- [ ] **Step 4: Smoke the no-MLX interface**
+- [x] **Step 4: Smoke the no-MLX interface**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -c 'import sys; from mtplx.cli import main; code = main(["settings", "list", "--json"]); assert code == 0; assert "mlx" not in sys.modules'`
 
 Expected: exit 0 and JSON output without importing `mlx`.
 
-- [ ] **Step 5: Record checkpoint**
+- [x] **Step 5: Record checkpoint**
 
 ```bash
 gh issue comment 90 --repo davidtai/MTPLX --body "Settings system phase verified: focused settings/config/CLI suite, Ruff, source audit, no-MLX smoke, and full repository suite all pass on $(git rev-parse --short HEAD)."
