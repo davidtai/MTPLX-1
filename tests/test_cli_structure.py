@@ -58,3 +58,46 @@ def test_product_and_model_groups_own_expected_commands():
         "model",
         "config",
     )
+
+
+def test_operations_and_benchmark_groups_own_expected_commands():
+    from mtplx.cli_app.groups.benchmarks import COMMANDS as benchmark_commands
+    from mtplx.cli_app.groups.operations import COMMANDS as operation_commands
+
+    assert operation_commands == (
+        "env",
+        "doctor",
+        "report",
+        "profile",
+        "thermal",
+        "max",
+        "debug",
+        "metrics",
+        "dashboard",
+        "integrate",
+    )
+    assert benchmark_commands == (
+        "bench-preflight",
+        "inspect-model",
+        "bench",
+        "qa",
+        "runtime-smoke",
+        "probe-contract",
+        "verify-ratio",
+        "verify-profile",
+        "verify-qmm-probe",
+        "multi-qmv-probe",
+        "batch-equivalence",
+        "capture-commit-equivalence",
+        "mtp1-greedy-gate",
+        "mtp1-sampler-smoke",
+        "mtp-depth-sweep",
+        "mtp-chain-probe",
+        "mtp-tree-probe",
+        "mtp-depth-grid",
+        "mtp-adaptive",
+        "dflash-mlx-baseline",
+        "ddtree-mlx-baseline",
+        "truth-report",
+        "session-bank",
+    )
