@@ -431,10 +431,11 @@ class Router(nn.Module):
             report["other_grid_k_parts"] = 16
         elif selector == "mpp-r1-last-arrival-fused-r2":
             report["supported_rows"] = "1-8"
-            report["physical_rows"] = 8
+            report["mpp_descriptor_rows"] = 8
+            report["logical_extent_rows"] = "exact-logical-m"
             report["dispatch_count"] = 1
             report["sigmoid_mode"] = "precise"
-            report["topology"] = "n16-p16-sg4-in-kernel-pad"
+            report["topology"] = "n16-p16-sg4-logical-extents"
             report["threadgroups"] = 48
             report["authority_phases"] = "all"
         return report

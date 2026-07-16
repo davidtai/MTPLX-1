@@ -57,7 +57,6 @@ CANDIDATE_ARM = "issue58-m1-m8-last-arrival-one-dispatch-precise"
 MIN_ROWS = 1
 MAX_ROWS = 8
 DEFAULT_ROWS = 4
-PHYSICAL_MPP_ROWS = 8
 HIDDEN_SIZE = 4096
 EXPERTS = 192
 TOP_K = 8
@@ -704,7 +703,8 @@ def _activation(seed: int, *, rows: int) -> tuple[mx.array, dict[str, Any]]:
         "generator": "numpy.random.default_rng.standard_normal",
         "shape": [1, logical_rows, HIDDEN_SIZE],
         "logical_rows": logical_rows,
-        "physical_mpp_rows": PHYSICAL_MPP_ROWS,
+        "mpp_descriptor_rows": 8,
+        "logical_extent_rows": logical_rows,
         "dtype": "FP32",
         "payload_sha256": _sha256_bytes(host.tobytes(order="C")),
         "shared_by_both_arms": True,
@@ -1092,7 +1092,8 @@ def _config(args: argparse.Namespace) -> dict[str, Any]:
         "shape": {
             "hidden": [1, rows, HIDDEN_SIZE],
             "logical_rows": rows,
-            "physical_mpp_rows": PHYSICAL_MPP_ROWS,
+            "mpp_descriptor_rows": 8,
+            "logical_extent_rows": int(args.rows),
             "resident_weight": [HIDDEN_SIZE, EXPERTS],
             "expert_bias": [EXPERTS],
             "top_k": TOP_K,

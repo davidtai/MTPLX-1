@@ -34,9 +34,7 @@ _ROUTER_K_PARTS = 16
 _ROUTER_SIMD_GROUPS = 4
 _ROUTER_THREADGROUPS = 48
 _ROUTER_THREADS = _ROUTER_SIMD_GROUPS * 32
-_ROUTER_PARTIAL_WORDS = _ROUTER_K_PARTS * _ROUTER_PADDED_ROWS * _ROUTER_EXPERTS
 _ROUTER_FLAG_WORDS = _ROUTER_THREADGROUPS * 2
-_ROUTER_SCRATCH_WORDS = _ROUTER_PARTIAL_WORDS + _ROUTER_FLAG_WORDS
 
 _ROUTER_EPOCH_LOCK = threading.Lock()
 _ROUTER_EPOCH = 0
@@ -363,6 +361,11 @@ def _validate_router_rows(rows: int) -> int:
     return logical_rows
 
 
+def _router_scratch_words(rows: int) -> int:
+    logical_rows = _validate_router_rows(rows)
+    return _ROUTER_K_PARTS * logical_rows * _ROUTER_EXPERTS + _ROUTER_FLAG_WORDS
+
+
 def hy3_router_last_arrival_source(
     *,
     rows: int = 4,
@@ -381,7 +384,7 @@ def hy3_router_last_arrival_source(
         using namespace mpp::tensor_ops;
 
         constexpr int ROWS = {logical_rows};
-        constexpr int PADDED_ROWS = 8;
+        constexpr int MPP_ROWS = 8;
         constexpr int BN = 16;
         constexpr int K = 4096;
         constexpr int N = 192;
@@ -393,10 +396,10 @@ def hy3_router_last_arrival_source(
         constexpr int R2_WAVES = {r2_waves};
         constexpr int GROUPS_PER_PART = 3;
         constexpr int THREADGROUPS = 48;
-        constexpr int STRIDE = PADDED_ROWS * N;
-        constexpr int PARTIAL_WORDS = P * STRIDE;
-        constexpr int READY_OFFSET = PARTIAL_WORDS;
+        constexpr int STRIDE = ROWS * N;
+        constexpr int READY_OFFSET = 0;
         constexpr int CHECK_OFFSET = READY_OFFSET + THREADGROUPS;
+        constexpr int PARTIAL_OFFSET = CHECK_OFFSET + THREADGROUPS;
         constexpr uint TAG_MULTIPLIER = {_TAG_MULTIPLIER}u;
         constexpr uint TAG_OFFSET = {_TAG_OFFSET}u;
         constexpr int CANDIDATES_PER_LANE = 6;
@@ -412,45 +415,43 @@ def hy3_router_last_arrival_source(
         int n0 = n_tile_index * BN;
         int k0 = part * KS;
 
-        device float* partials = scratch;
+        device float* partials = scratch + PARTIAL_OFFSET;
         device atomic_uint* ready =
             reinterpret_cast<device atomic_uint*>(scratch + READY_OFFSET);
         device atomic_uint* checks =
             reinterpret_cast<device atomic_uint*>(scratch + CHECK_OFFSET);
 
-        threadgroup float A_tile[PADDED_ROWS * KS];
+        threadgroup float A_tile[ROWS * KS];
         threadgroup uint elected;
         if (tid == 0) {{
             elected = 0u;
         }}
         for (
             int offset = int(tid);
-            offset < PADDED_ROWS * KS;
+            offset < ROWS * KS;
             offset += SGPTG * 32
         ) {{
             int row = offset / KS;
             int column = offset - row * KS;
-            A_tile[offset] = row < ROWS
-                ? x[row * K + k0 + column]
-                : 0.0f;
+            A_tile[offset] = x[row * K + k0 + column];
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         tensor<threadgroup float, dextents<int, 2>, tensor_inline> A(
             A_tile,
-            dextents<int, 2>{{KS, PADDED_ROWS}},
+            dextents<int, 2>{{KS, ROWS}},
             array<int, 2>{{1, KS}});
         tensor<device bfloat, dextents<int, 2>, tensor_inline> B(
             (device bfloat*)weight + k0 * N + n0,
             dextents<int, 2>{{BN, KS}},
             array<int, 2>{{1, N}});
         tensor<device float, dextents<int, 2>, tensor_inline> C(
-            partials + part * PADDED_ROWS * N + n0,
-            dextents<int, 2>{{BN, PADDED_ROWS}},
+            partials + part * ROWS * N + n0,
+            dextents<int, 2>{{BN, ROWS}},
             array<int, 2>{{1, N}});
 
         constexpr auto desc = matmul2d_descriptor(
-            PADDED_ROWS,
+            MPP_ROWS,
             BN,
             KS,
             false,
@@ -684,7 +685,7 @@ def _dispatch_hy3_router_last_arrival(
         inputs=[value.reshape(rows, 4096), weight, expert_bias, epoch],
         grid=(_ROUTER_THREADGROUPS * _ROUTER_THREADS, 1, 1),
         threadgroup=(_ROUTER_THREADS, 1, 1),
-        output_shapes=[(rows, 8), (rows, 8), (_ROUTER_SCRATCH_WORDS,)],
+        output_shapes=[(rows, 8), (rows, 8), (_router_scratch_words(rows),)],
         output_dtypes=[mx.int32, mx.float32, mx.float32],
     )
     return Hy3RouterLastArrivalOutput(

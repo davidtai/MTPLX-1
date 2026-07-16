@@ -369,7 +369,8 @@ def test_config_records_selected_m1_m8_shape() -> None:
     assert module.CANDIDATE_ARM == ("issue58-m1-m8-last-arrival-one-dispatch-precise")
     assert config["shape"]["hidden"] == [1, 7, 4096]
     assert config["shape"]["logical_rows"] == 7
-    assert config["shape"]["physical_mpp_rows"] == 8
+    assert config["shape"]["mpp_descriptor_rows"] == 8
+    assert config["shape"]["logical_extent_rows"] == 7
     assert config["control"]["arm"] == module.CONTROL_ARM
     assert config["control"]["issue59_candidate"] == (
         "n16_p16_sg4_grouped_direct_precise_g6"
@@ -405,7 +406,8 @@ def test_activation_uses_explicit_logical_rows_and_records_shape(
     assert captured_shapes == [(1, 6, 4096)]
     assert metadata["shape"] == [1, 6, 4096]
     assert metadata["logical_rows"] == 6
-    assert metadata["physical_mpp_rows"] == 8
+    assert metadata["mpp_descriptor_rows"] == 8
+    assert metadata["logical_extent_rows"] == 6
 
 
 def test_route_weight_parity_is_bitwise_not_numeric_equality() -> None:

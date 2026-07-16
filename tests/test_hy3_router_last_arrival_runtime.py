@@ -70,7 +70,7 @@ def _runtime_inputs(rows: int = 4):
 
 
 @pytest.mark.parametrize("rows", tuple(range(1, 9)))
-def test_last_arrival_source_specializes_logical_rows_over_one_physical_m8_tile(
+def test_last_arrival_source_specializes_exact_logical_extents(
     rows: int,
 ) -> None:
     source = last_arrival.hy3_router_last_arrival_source(
@@ -80,13 +80,19 @@ def test_last_arrival_source_specializes_logical_rows_over_one_physical_m8_tile(
     )
 
     assert f"constexpr int ROWS = {rows};" in source
-    assert "constexpr int PADDED_ROWS = 8;" in source
+    assert "constexpr int MPP_ROWS = 8;" in source
     assert f"constexpr int R2_WAVES = {1 if rows <= 4 else 2};" in source
     assert "constexpr int P = 16;" in source
     assert "constexpr int SGPTG = 4;" in source
     assert "constexpr int THREADGROUPS = 48;" in source
-    assert "threadgroup float A_tile[PADDED_ROWS * KS];" in source
-    assert "row < ROWS" in source
+    assert "constexpr int READY_OFFSET = 0;" in source
+    assert "constexpr int CHECK_OFFSET = READY_OFFSET + THREADGROUPS;" in source
+    assert "constexpr int PARTIAL_OFFSET = CHECK_OFFSET + THREADGROUPS;" in source
+    assert "device float* partials = scratch + PARTIAL_OFFSET;" in source
+    assert "threadgroup float A_tile[ROWS * KS];" in source
+    assert "row < ROWS" not in source
+    assert "A_tile[offset] = x[row * K + k0 + column];" in source
+    assert "matmul2d_descriptor(\n            MPP_ROWS," in source
     assert "partials[15 * STRIDE + index]" in source
     assert "uint row = simd_gid + uint(wave) * SGPTG;" in source
     assert "if (row >= uint(ROWS))" in source
@@ -115,7 +121,7 @@ def test_last_arrival_runtime_calls_one_kernel_and_returns_logical_m_contract(
             return (
                 mx.zeros((rows, 8), dtype=mx.int32),
                 mx.ones((rows, 8), dtype=mx.float32),
-                mx.zeros((24_672,), dtype=mx.float32),
+                mx.zeros((16 * rows * 192 + 96,), dtype=mx.float32),
             )
 
     def fake_build(logical_rows: int, *_args, **_kwargs):
@@ -151,7 +157,11 @@ def test_last_arrival_runtime_calls_one_kernel_and_returns_logical_m_contract(
     assert build_rows == [rows]
     assert captured["grid"] == (48 * 128, 1, 1)
     assert captured["threadgroup"] == (128, 1, 1)
-    assert captured["output_shapes"] == [(rows, 8), (rows, 8), (24_672,)]
+    assert captured["output_shapes"] == [
+        (rows, 8),
+        (rows, 8),
+        (16 * rows * 192 + 96,),
+    ]
     assert captured["output_dtypes"] == [mx.int32, mx.float32, mx.float32]
     assert "init_value" not in captured
     inputs = captured["inputs"]
@@ -199,7 +209,9 @@ def test_last_arrival_kernel_cache_key_includes_logical_m(
     assert calls[0]["name"].startswith("mtplx_hy3_router_last_arrival_m1_")
     assert calls[1]["name"].startswith("mtplx_hy3_router_last_arrival_m8_")
     assert "constexpr int ROWS = 1;" in calls[0]["source"]
+    assert "constexpr int MPP_ROWS = 8;" in calls[0]["source"]
     assert "constexpr int ROWS = 8;" in calls[1]["source"]
+    assert "constexpr int MPP_ROWS = 8;" in calls[1]["source"]
 
 
 @pytest.mark.parametrize("rows", tuple(range(1, 9)))
@@ -454,9 +466,10 @@ def test_issue58_selector_reuses_one_issue59_weight_and_dispatches_m1_to_m8(
     assert report["selector"] == _SELECTOR
     assert report["dispatch_count"] == 1
     assert report["supported_rows"] == "1-8"
-    assert report["physical_rows"] == 8
+    assert report["mpp_descriptor_rows"] == 8
+    assert report["logical_extent_rows"] == "exact-logical-m"
     assert report["sigmoid_mode"] == "precise"
-    assert report["topology"] == "n16-p16-sg4-in-kernel-pad"
+    assert report["topology"] == "n16-p16-sg4-logical-extents"
     assert report["threadgroups"] == 48
     assert report["authority_phases"] == "all"
     assert report["prepared_weight_bytes"] == 192 * 4096 * 2
