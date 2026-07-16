@@ -415,7 +415,8 @@ class Router(nn.Module):
             report["m4_grid_k_parts"] = 32
             report["other_grid_k_parts"] = 16
         elif selector == "mpp-r1-last-arrival-fused-r2":
-            report["supported_rows"] = 4
+            report["supported_rows"] = "1-8"
+            report["physical_rows"] = 8
             report["dispatch_count"] = 1
             report["sigmoid_mode"] = "precise"
             report["topology"] = "n16-p16-sg4-in-kernel-pad"
@@ -429,7 +430,9 @@ class Router(nn.Module):
         rows = math.prod(int(dimension) for dimension in x.shape[:-1])
         last_arrival_eligible = state.selector != ("mpp-r1-last-arrival-fused-r2") or (
             x.ndim == 3
-            and tuple(int(dimension) for dimension in x.shape) == (1, 4, 4096)
+            and int(x.shape[0]) == 1
+            and 1 <= int(x.shape[1]) <= 8
+            and int(x.shape[2]) == 4096
             and current_attention_phase() == "decode_verify"
         )
         if (
@@ -560,7 +563,8 @@ def configure_hy3_router_kernels(
         summary["m4_grid_k_parts"] = 32
         summary["other_grid_k_parts"] = 16
     elif selector == "mpp-r1-last-arrival-fused-r2":
-        summary["supported_rows"] = 4
+        summary["supported_rows"] = "1-8"
+        summary["physical_rows"] = 8
         summary["dispatch_count"] = 1
         summary["sigmoid_mode"] = "precise"
         summary["topology"] = "n16-p16-sg4-in-kernel-pad"

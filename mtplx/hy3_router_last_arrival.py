@@ -1,4 +1,4 @@
-"""Tagged last-arrival primitives and the Hy3 fixed-M4 one-dispatch router."""
+"""Tagged last-arrival primitives and the Hy3 M1-M8 one-dispatch router."""
 
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ _LCG_MULTIPLIER = 1_664_525
 _LCG_INCREMENT = 1_013_904_223
 _SUPPORTED_THREADGROUPS = frozenset((16, 24, 32, 48))
 
-_ROUTER_ROWS = 4
 _ROUTER_PADDED_ROWS = 8
 _ROUTER_EXPERTS = 192
 _ROUTER_TOP_K = 8
@@ -301,13 +300,25 @@ def _router_exp_call(sigmoid_mode: str, operand: str) -> str:
     )
 
 
+def _validate_router_rows(rows: int) -> int:
+    logical_rows = int(rows)
+    if logical_rows < 1 or logical_rows > _ROUTER_PADDED_ROWS:
+        raise Hy3RouterFP32Ineligible(
+            "Hy3 last-arrival router logical rows must be between 1 and 8"
+        )
+    return logical_rows
+
+
 def hy3_router_last_arrival_source(
     *,
+    rows: int = 4,
     scaling_factor: float = 2.826,
     sigmoid_mode: Literal["precise"] = "precise",
 ) -> str:
-    """Emit the fixed-M4 one-dispatch MPP R1, election, and precise R2 body."""
+    """Emit one logical-M-specialized MPP R1, election, and precise R2 body."""
 
+    logical_rows = _validate_router_rows(rows)
+    r2_waves = 1 if logical_rows <= _ROUTER_SIMD_GROUPS else 2
     scaling_literal = _router_scaling_literal(scaling_factor)
     exp_call = _router_exp_call(sigmoid_mode, "-total")
     reduction = _balanced_splitk_reduction_source(_ROUTER_K_PARTS)
@@ -315,7 +326,7 @@ def hy3_router_last_arrival_source(
         using namespace metal;
         using namespace mpp::tensor_ops;
 
-        constexpr int ROWS = 4;
+        constexpr int ROWS = {logical_rows};
         constexpr int PADDED_ROWS = 8;
         constexpr int BN = 16;
         constexpr int K = 4096;
@@ -325,6 +336,7 @@ def hy3_router_last_arrival_source(
         constexpr int NT = 12;
         constexpr int KS = 256;
         constexpr int SGPTG = 4;
+        constexpr int R2_WAVES = {r2_waves};
         constexpr int GROUPS_PER_PART = 3;
         constexpr int THREADGROUPS = 48;
         constexpr int STRIDE = PADDED_ROWS * N;
@@ -449,93 +461,102 @@ def hy3_router_last_arrival_source(
             memory_order_seq_cst,
             thread_scope_device);
 
-        uint row = simd_gid;
-        float candidate_selection[CANDIDATES_PER_LANE];
-        float candidate_unbiased[CANDIDATES_PER_LANE];
-        int candidate_indices[CANDIDATES_PER_LANE];
-        float merged_unbiased[TOPK];
-        int merged_indices[TOPK];
-
         _Pragma("unroll")
-        for (int slot = 0; slot < CANDIDATES_PER_LANE; ++slot) {{
-            uint expert = lane + uint(slot) * 32;
-            uint index = row * N + expert;
-            {reduction}
-            float score = 1.0f / (1.0f + {exp_call});
-            candidate_selection[slot] = score + expert_bias[expert];
-            candidate_unbiased[slot] = score;
-            candidate_indices[slot] = int(expert);
-        }}
+        for (int wave = 0; wave < R2_WAVES; ++wave) {{
+            uint row = simd_gid + uint(wave) * SGPTG;
+            if (row >= uint(ROWS)) {{
+                continue;
+            }}
+            float candidate_selection[CANDIDATES_PER_LANE];
+            float candidate_unbiased[CANDIDATES_PER_LANE];
+            int candidate_indices[CANDIDATES_PER_LANE];
+            float merged_unbiased[TOPK];
+            int merged_indices[TOPK];
 
-        _Pragma("unroll")
-        for (int rank = 0; rank < TOPK; ++rank) {{
-            float lane_selection = -INFINITY;
-            float lane_unbiased = 0.0f;
-            int lane_index = -1;
             _Pragma("unroll")
             for (int slot = 0; slot < CANDIDATES_PER_LANE; ++slot) {{
-                float selection = candidate_selection[slot];
-                int index = candidate_indices[slot];
-                bool higher = selection > lane_selection;
-                bool later_equal = selection == lane_selection
-                    && index > lane_index;
-                if (higher || later_equal) {{
-                    lane_selection = selection;
-                    lane_unbiased = candidate_unbiased[slot];
-                    lane_index = index;
+                uint expert = lane + uint(slot) * 32;
+                uint index = row * N + expert;
+                {reduction}
+                float score = 1.0f / (1.0f + {exp_call});
+                candidate_selection[slot] = score + expert_bias[expert];
+                candidate_unbiased[slot] = score;
+                candidate_indices[slot] = int(expert);
+            }}
+
+            _Pragma("unroll")
+            for (int rank = 0; rank < TOPK; ++rank) {{
+                float lane_selection = -INFINITY;
+                float lane_unbiased = 0.0f;
+                int lane_index = -1;
+                _Pragma("unroll")
+                for (int slot = 0; slot < CANDIDATES_PER_LANE; ++slot) {{
+                    float selection = candidate_selection[slot];
+                    int index = candidate_indices[slot];
+                    bool higher = selection > lane_selection;
+                    bool later_equal = selection == lane_selection
+                        && index > lane_index;
+                    if (higher || later_equal) {{
+                        lane_selection = selection;
+                        lane_unbiased = candidate_unbiased[slot];
+                        lane_index = index;
+                    }}
+                }}
+
+                float winner_selection = simd_max(lane_selection);
+                float winner_index_value = simd_max(
+                    lane_selection == winner_selection
+                        ? float(lane_index)
+                        : -1.0f);
+                int winner_index = int(winner_index_value);
+                float winner_unbiased = simd_sum(
+                    lane_index == winner_index ? lane_unbiased : 0.0f);
+                if (lane == 0) {{
+                    merged_unbiased[rank] = winner_unbiased;
+                    merged_indices[rank] = winner_index;
+                }}
+                _Pragma("unroll")
+                for (int slot = 0; slot < CANDIDATES_PER_LANE; ++slot) {{
+                    if (candidate_indices[slot] == winner_index) {{
+                        candidate_selection[slot] = -INFINITY;
+                    }}
                 }}
             }}
 
-            float winner_selection = simd_max(lane_selection);
-            float winner_index_value = simd_max(
-                lane_selection == winner_selection
-                    ? float(lane_index)
-                    : -1.0f);
-            int winner_index = int(winner_index_value);
-            float winner_unbiased = simd_sum(
-                lane_index == winner_index ? lane_unbiased : 0.0f);
             if (lane == 0) {{
-                merged_unbiased[rank] = winner_unbiased;
-                merged_indices[rank] = winner_index;
-            }}
-            _Pragma("unroll")
-            for (int slot = 0; slot < CANDIDATES_PER_LANE; ++slot) {{
-                if (candidate_indices[slot] == winner_index) {{
-                    candidate_selection[slot] = -INFINITY;
+                float score_sum = 0.0f;
+                for (int output = 0; output < TOPK; ++output) {{
+                    score_sum += merged_unbiased[TOPK - 1 - output];
                 }}
-            }}
-        }}
-
-        if (lane == 0) {{
-            float score_sum = 0.0f;
-            for (int output = 0; output < TOPK; ++output) {{
-                score_sum += merged_unbiased[TOPK - 1 - output];
-            }}
-            float scale = ROUTING_SCALE / (score_sum + 1e-20f);
-            for (int output = 0; output < TOPK; ++output) {{
-                int source = TOPK - 1 - output;
-                uint output_index = row * TOPK + output;
-                expert_ids[output_index] = merged_indices[source];
-                router_scores[output_index] = merged_unbiased[source] * scale;
+                float scale = ROUTING_SCALE / (score_sum + 1e-20f);
+                for (int output = 0; output < TOPK; ++output) {{
+                    int source = TOPK - 1 - output;
+                    uint output_index = row * TOPK + output;
+                    expert_ids[output_index] = merged_indices[source];
+                    router_scores[output_index] = merged_unbiased[source] * scale;
+                }}
             }}
         }}
     """
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=32)
 def _build_hy3_router_last_arrival_kernel(
+    rows: int,
     scaling_factor: float,
     sigmoid_mode: str,
 ):
+    logical_rows = _validate_router_rows(rows)
     return mx.fast.metal_kernel(
         name=(
-            "mtplx_hy3_router_last_arrival_m4_n16_p16_sg4_"
+            f"mtplx_hy3_router_last_arrival_m{logical_rows}_n16_p16_sg4_"
             f"{sigmoid_mode.replace('-', '_')}"
         ),
         input_names=["x", "weight", "expert_bias", "epoch"],
         output_names=["expert_ids", "router_scores", "scratch"],
         header="#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n",
         source=hy3_router_last_arrival_source(
+            rows=logical_rows,
             scaling_factor=scaling_factor,
             sigmoid_mode=sigmoid_mode,
         ),
@@ -565,7 +586,7 @@ def _validate_router_residents(weight: mx.array, expert_bias: mx.array) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Hy3RouterLastArrivalOutput:
-    """Rows4 result matching the fixed-K3 router contract without importing it."""
+    """Logical M1-M8 result matching the authoritative router contract."""
 
     expert_ids: mx.array
     route_weights: mx.array
@@ -573,17 +594,23 @@ class Hy3RouterLastArrivalOutput:
     _scratch: mx.array | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if tuple(int(dimension) for dimension in self.expert_ids.shape) != (1, 4, 8):
+        ids_shape = tuple(int(dimension) for dimension in self.expert_ids.shape)
+        if (
+            len(ids_shape) != 3
+            or ids_shape[0] != 1
+            or ids_shape[2] != _ROUTER_TOP_K
+            or not 1 <= ids_shape[1] <= _ROUTER_PADDED_ROWS
+        ):
             raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival expert IDs must have shape [1, 4, 8]"
+                "Hy3 last-arrival expert IDs must have shape [1, M, 8] with 1 <= M <= 8"
             )
         if self.expert_ids.dtype != mx.int32:
             raise Hy3RouterFP32Ineligible(
                 "Hy3 last-arrival expert IDs must have int32 dtype"
             )
-        if tuple(int(dimension) for dimension in self.route_weights.shape) != (1, 4, 8):
+        if tuple(int(dimension) for dimension in self.route_weights.shape) != ids_shape:
             raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival route weights must have shape [1, 4, 8]"
+                "Hy3 last-arrival route weights must match expert IDs shape"
             )
         if self.route_weights.dtype != mx.float32:
             raise Hy3RouterFP32Ineligible(
@@ -591,7 +618,7 @@ class Hy3RouterLastArrivalOutput:
             )
         if int(self.dispatch_count) != 1:
             raise Hy3RouterFP32Ineligible(
-                "Hy3 last-arrival Rows4 router requires exactly one dispatch"
+                "Hy3 last-arrival router requires exactly one dispatch"
             )
 
     @property
@@ -600,7 +627,7 @@ class Hy3RouterLastArrivalOutput:
 
     @property
     def rows(self) -> int:
-        return _ROUTER_ROWS
+        return int(self.expert_ids.shape[1])
 
     @property
     def top_k(self) -> int:
@@ -608,7 +635,7 @@ class Hy3RouterLastArrivalOutput:
 
     @property
     def assignment_count(self) -> int:
-        return _ROUTER_ROWS * _ROUTER_TOP_K
+        return self.rows * _ROUTER_TOP_K
 
 
 def hy3_router_last_arrival_route(
@@ -622,19 +649,23 @@ def hy3_router_last_arrival_route(
     scaling_factor: float = 2.826,
     sigmoid_mode: Literal["precise"] = "precise",
 ) -> Hy3RouterLastArrivalOutput:
-    """Route fixed `[1, 4, 4096]` hidden rows through one Metal dispatch."""
+    """Route FP32 `[1, M, 4096]`, M1-M8, through one Metal dispatch."""
 
     supported = hy3_router_fp32_available() if available is None else bool(available)
+    value_shape = tuple(int(dimension) for dimension in value.shape)
     if (
         not supported
         or value.ndim != 3
-        or tuple(int(dimension) for dimension in value.shape) != (1, 4, 4096)
+        or value_shape[0] != 1
+        or not 1 <= value_shape[1] <= _ROUTER_PADDED_ROWS
+        or value_shape[2] != 4096
         or value.dtype != mx.float32
     ):
         raise Hy3RouterFP32Ineligible(
-            "Hy3 last-arrival router requires FP32 hidden rows shaped [1, 4, 4096] "
-            "on the qualified Metal device"
+            "Hy3 last-arrival router requires FP32 hidden rows shaped [1, M, 4096] "
+            "with 1 <= M <= 8 on the qualified Metal device"
         )
+    rows = value_shape[1]
     _validate_router_residents(weight, expert_bias)
     if int(top_k) != 8:
         raise Hy3RouterFP32Ineligible("Hy3 last-arrival router requires top-8")
@@ -646,20 +677,21 @@ def hy3_router_last_arrival_route(
     _router_exp_call(sigmoid_mode, "-total")
 
     kernel = _build_hy3_router_last_arrival_kernel(
+        rows,
         float(scaling_factor),
         sigmoid_mode,
     )
     epoch = mx.array(_next_router_epoch(), dtype=mx.uint32)
     expert_ids, route_weights, scratch = kernel(
-        inputs=[value.reshape(4, 4096), weight, expert_bias, epoch],
+        inputs=[value.reshape(rows, 4096), weight, expert_bias, epoch],
         grid=(_ROUTER_THREADGROUPS * _ROUTER_THREADS, 1, 1),
         threadgroup=(_ROUTER_THREADS, 1, 1),
-        output_shapes=[(4, 8), (4, 8), (_ROUTER_SCRATCH_WORDS,)],
+        output_shapes=[(rows, 8), (rows, 8), (_ROUTER_SCRATCH_WORDS,)],
         output_dtypes=[mx.int32, mx.float32, mx.float32],
     )
     return Hy3RouterLastArrivalOutput(
-        expert_ids=expert_ids.reshape(1, 4, 8),
-        route_weights=route_weights.reshape(1, 4, 8),
+        expert_ids=expert_ids.reshape(1, rows, 8),
+        route_weights=route_weights.reshape(1, rows, 8),
         dispatch_count=1,
         _scratch=scratch,
     )
@@ -667,7 +699,7 @@ def hy3_router_last_arrival_route(
 
 @dataclass(frozen=True, slots=True)
 class Hy3RouterLastArrival:
-    """Resident-parameter callable implementing the fixed-K3 Rows4 protocol."""
+    """Resident-parameter callable implementing the logical M1-M8 protocol."""
 
     weight: mx.array
     expert_bias: mx.array

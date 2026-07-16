@@ -65,21 +65,27 @@ def _runtime_inputs(rows: int = 4):
     )
 
 
-def test_last_arrival_source_is_the_complete_authoritative_m4_boundary() -> None:
+@pytest.mark.parametrize("rows", tuple(range(1, 9)))
+def test_last_arrival_source_specializes_logical_rows_over_one_physical_m8_tile(
+    rows: int,
+) -> None:
     source = last_arrival.hy3_router_last_arrival_source(
+        rows=rows,
         scaling_factor=2.826,
         sigmoid_mode="precise",
     )
 
-    assert "constexpr int ROWS = 4;" in source
+    assert f"constexpr int ROWS = {rows};" in source
     assert "constexpr int PADDED_ROWS = 8;" in source
+    assert f"constexpr int R2_WAVES = {1 if rows <= 4 else 2};" in source
     assert "constexpr int P = 16;" in source
     assert "constexpr int SGPTG = 4;" in source
     assert "constexpr int THREADGROUPS = 48;" in source
     assert "threadgroup float A_tile[PADDED_ROWS * KS];" in source
     assert "row < ROWS" in source
     assert "partials[15 * STRIDE + index]" in source
-    assert "uint row = simd_gid;" in source
+    assert "uint row = simd_gid + uint(wave) * SGPTG;" in source
+    assert "if (row >= uint(ROWS))" in source
     assert "atomic_store_explicit(&ready[tg], tag" in source
     assert "atomic_store_explicit(&checks[tg], ~tag" in source
     assert "atomic_compare_exchange_weak_explicit(" in source
@@ -89,26 +95,33 @@ def test_last_arrival_source_is_the_complete_authoritative_m4_boundary() -> None
     assert "while (atomic_load" not in source
 
 
-def test_last_arrival_runtime_calls_one_kernel_and_returns_rows4_contract(
+@pytest.mark.parametrize("rows", tuple(range(1, 9)))
+def test_last_arrival_runtime_calls_one_kernel_and_returns_logical_m_contract(
+    rows: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    value, weight, expert_bias = _runtime_inputs()
+    value, weight, expert_bias = _runtime_inputs(rows)
     captured: dict[str, object] = {}
+    build_rows: list[int] = []
 
     class FakeKernel:
         def __call__(self, **kwargs: object):
             assert not captured
             captured.update(kwargs)
             return (
-                mx.zeros((4, 8), dtype=mx.int32),
-                mx.ones((4, 8), dtype=mx.float32),
+                mx.zeros((rows, 8), dtype=mx.int32),
+                mx.ones((rows, 8), dtype=mx.float32),
                 mx.zeros((24_672,), dtype=mx.float32),
             )
+
+    def fake_build(logical_rows: int, *_args, **_kwargs):
+        build_rows.append(logical_rows)
+        return FakeKernel()
 
     monkeypatch.setattr(
         last_arrival,
         "_build_hy3_router_last_arrival_kernel",
-        lambda *_args, **_kwargs: FakeKernel(),
+        fake_build,
     )
     monkeypatch.setattr(last_arrival, "_next_router_epoch", lambda: 73)
 
@@ -120,33 +133,77 @@ def test_last_arrival_runtime_calls_one_kernel_and_returns_rows4_contract(
         sigmoid_mode="precise",
     )
 
-    assert tuple(output.expert_ids.shape) == (1, 4, 8)
+    assert tuple(output.expert_ids.shape) == (1, rows, 8)
     assert output.expert_ids.dtype == mx.int32
-    assert tuple(output.route_weights.shape) == (1, 4, 8)
+    assert tuple(output.route_weights.shape) == (1, rows, 8)
     assert output.route_weights.dtype == mx.float32
     assert output.dispatch_count == 1
     assert output.batch_shape == (1,)
-    assert output.rows == 4
+    assert output.rows == rows
     assert output.top_k == 8
-    assert output.assignment_count == 32
+    assert output.assignment_count == rows * 8
+    assert build_rows == [rows]
     assert captured["grid"] == (48 * 128, 1, 1)
     assert captured["threadgroup"] == (128, 1, 1)
-    assert captured["output_shapes"] == [(4, 8), (4, 8), (24_672,)]
+    assert captured["output_shapes"] == [(rows, 8), (rows, 8), (24_672,)]
     assert captured["output_dtypes"] == [mx.int32, mx.float32, mx.float32]
     assert "init_value" not in captured
     inputs = captured["inputs"]
     assert isinstance(inputs, list)
+    assert len(inputs) == 4
+    assert tuple(inputs[0].shape) == (rows, 4096)
     assert inputs[1] is weight
     assert inputs[2] is expert_bias
 
 
-def test_resident_rows4_callable_structurally_satisfies_fixed_k3_contract(
+def test_last_arrival_kernel_cache_key_includes_logical_m(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    value, weight, expert_bias = _runtime_inputs()
+    calls: list[dict[str, object]] = []
+
+    def fake_metal_kernel(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", fake_metal_kernel)
+    last_arrival._build_hy3_router_last_arrival_kernel.cache_clear()
+    try:
+        m1_first = last_arrival._build_hy3_router_last_arrival_kernel(
+            1,
+            2.826,
+            "precise",
+        )
+        m1_second = last_arrival._build_hy3_router_last_arrival_kernel(
+            1,
+            2.826,
+            "precise",
+        )
+        m8 = last_arrival._build_hy3_router_last_arrival_kernel(
+            8,
+            2.826,
+            "precise",
+        )
+    finally:
+        last_arrival._build_hy3_router_last_arrival_kernel.cache_clear()
+
+    assert m1_first is m1_second
+    assert m8 is not m1_first
+    assert len(calls) == 2
+    assert calls[0]["name"].startswith("mtplx_hy3_router_last_arrival_m1_")
+    assert calls[1]["name"].startswith("mtplx_hy3_router_last_arrival_m8_")
+    assert "constexpr int ROWS = 1;" in calls[0]["source"]
+    assert "constexpr int ROWS = 8;" in calls[1]["source"]
+
+
+@pytest.mark.parametrize("rows", tuple(range(1, 9)))
+def test_resident_callable_structurally_satisfies_logical_m_contract(
+    rows: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value, weight, expert_bias = _runtime_inputs(rows)
     expected = last_arrival.Hy3RouterLastArrivalOutput(
-        expert_ids=mx.zeros((1, 4, 8), dtype=mx.int32),
-        route_weights=mx.ones((1, 4, 8), dtype=mx.float32),
+        expert_ids=mx.zeros((1, rows, 8), dtype=mx.int32),
+        route_weights=mx.ones((1, rows, 8), dtype=mx.float32),
     )
     calls: list[tuple[object, object, object, dict[str, object]]] = []
 
@@ -193,9 +250,17 @@ def test_last_arrival_runtime_fails_before_dispatch_outside_exact_contract(
     )
     value, weight, expert_bias = _runtime_inputs()
 
-    with pytest.raises(Hy3RouterFP32Ineligible, match=r"\[1, 4, 4096\]"):
+    for invalid_shape in ((1, 0, 4096), (1, 9, 4096), (2, 2, 4096)):
+        with pytest.raises(Hy3RouterFP32Ineligible, match=r"\[1, M, 4096\]"):
+            last_arrival.hy3_router_last_arrival_route(
+                mx.zeros(invalid_shape, dtype=mx.float32),
+                weight,
+                expert_bias,
+                available=True,
+            )
+    with pytest.raises(Hy3RouterFP32Ineligible, match=r"\[1, M, 4096\]"):
         last_arrival.hy3_router_last_arrival_route(
-            mx.zeros((1, 3, 4096), dtype=mx.float32),
+            mx.zeros((4, 4096), dtype=mx.float32),
             weight,
             expert_bias,
             available=True,
@@ -241,12 +306,15 @@ def test_last_arrival_runtime_epochs_do_not_repeat_with_reused_scratch(
     os.environ.get("MTPLX_RUN_ISSUE58_HARDWARE_PARITY") != "1",
     reason="Issue #58 parity requires an explicitly locked Metal hardware gate",
 )
-def test_last_arrival_runtime_matches_issue59_authoritative_m4_routes() -> None:
-    mx.random.seed(58_590_004)
+@pytest.mark.parametrize("rows", tuple(range(1, 9)))
+def test_last_arrival_runtime_matches_issue59_authoritative_m1_to_m8_routes(
+    rows: int,
+) -> None:
+    mx.random.seed(58_590_000 + rows)
     source_weight = mx.random.normal((192, 4096)).astype(mx.bfloat16)
     resident_weight = prepare_hy3_router_fp32_weight(source_weight)
     expert_bias = (mx.random.normal((192,)) * 0.01).astype(mx.float32)
-    value = mx.random.normal((1, 4, 4096)).astype(mx.float32)
+    value = mx.random.normal((1, rows, 4096)).astype(mx.float32)
 
     expected_ids, expected_weights = hy3_router_fp32_route(
         value,
@@ -291,7 +359,9 @@ def test_last_arrival_runtime_matches_issue59_authoritative_m4_routes() -> None:
     assert bool(mx.array_equal(second.route_weights, first.route_weights).item())
 
 
-def test_issue58_selector_reuses_one_issue59_weight_and_dispatches_only_m4(
+@pytest.mark.parametrize("rows", tuple(range(1, 9)))
+def test_issue58_selector_reuses_one_issue59_weight_and_dispatches_m1_to_m8(
+    rows: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     router = _router()
@@ -301,19 +371,20 @@ def test_issue58_selector_reuses_one_issue59_weight_and_dispatches_only_m4(
     def fake_route(value, weight, expert_bias, **kwargs):
         calls.append((value, weight, expert_bias, kwargs))
         return last_arrival.Hy3RouterLastArrivalOutput(
-            expert_ids=mx.zeros((1, 4, 8), dtype=mx.int32),
-            route_weights=mx.ones((1, 4, 8), dtype=mx.float32),
+            expert_ids=mx.zeros((1, rows, 8), dtype=mx.int32),
+            route_weights=mx.ones((1, rows, 8), dtype=mx.float32),
         )
 
     monkeypatch.setattr(hy3_mlx, "hy3_router_last_arrival_route", fake_route)
 
     report = router.configure_kernel(_SELECTOR, available=True)
     with attention_phase("decode_verify"):
-        indices, weights = router(mx.zeros((1, 4, 4096), dtype=mx.bfloat16))
+        indices, weights = router(mx.zeros((1, rows, 4096), dtype=mx.bfloat16))
 
     assert report["selector"] == _SELECTOR
     assert report["dispatch_count"] == 1
-    assert report["supported_rows"] == 4
+    assert report["supported_rows"] == "1-8"
+    assert report["physical_rows"] == 8
     assert report["sigmoid_mode"] == "precise"
     assert report["topology"] == "n16-p16-sg4-in-kernel-pad"
     assert report["threadgroups"] == 48
@@ -321,8 +392,8 @@ def test_issue58_selector_reuses_one_issue59_weight_and_dispatches_only_m4(
     assert report["prepared_weight_bytes"] == 192 * 4096 * 2
     assert report["incremental_bytes"] == 192 * 4096 * 2
     assert router.gate.weight is source_weight
-    assert tuple(indices.shape) == (1, 4, 8)
-    assert tuple(weights.shape) == (1, 4, 8)
+    assert tuple(indices.shape) == (1, rows, 8)
+    assert tuple(weights.shape) == (1, rows, 8)
     assert len(calls) == 1
     value, resident_weight, resident_bias, kwargs = calls[0]
     assert value.dtype == mx.float32
@@ -338,7 +409,9 @@ def test_issue58_selector_reuses_one_issue59_weight_and_dispatches_only_m4(
     }
 
 
+@pytest.mark.parametrize("shape", ((1, 9, 4096), (2, 2, 4096), (4, 4096)))
 def test_issue58_selector_falls_back_to_stock_without_hybrid_check(
+    shape: tuple[int, ...],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RecordingGate(nn.Linear):
@@ -357,7 +430,7 @@ def test_issue58_selector_falls_back_to_stock_without_hybrid_check(
     router.configure_kernel(_SELECTOR, available=True)
 
     def forbidden_route(*_args, **_kwargs):
-        raise AssertionError("unsupported Rows3 must fail closed to stock")
+        raise AssertionError("input outside [1,M,4096] M1-M8 must use stock")
 
     monkeypatch.setattr(hy3_mlx, "hy3_router_last_arrival_route", forbidden_route)
     monkeypatch.setattr(
@@ -366,14 +439,18 @@ def test_issue58_selector_falls_back_to_stock_without_hybrid_check(
         lambda *_args, **_kwargs: pytest.fail("#59 checker must not double-run"),
     )
 
-    indices, weights = router(mx.zeros((1, 3, 4096), dtype=mx.bfloat16))
+    indices, weights = router(mx.zeros(shape, dtype=mx.bfloat16))
 
     assert gate.calls == 1
-    assert tuple(indices.shape) == (1, 3, 8)
-    assert tuple(weights.shape) == (1, 3, 8)
+    assert tuple(indices.shape) == (*shape[:-1], 8)
+    assert tuple(weights.shape) == (*shape[:-1], 8)
 
 
+@pytest.mark.parametrize("rows", tuple(range(1, 9)))
+@pytest.mark.parametrize("phase", ("prefill", "ar_decode"))
 def test_issue58_selector_falls_back_to_stock_outside_decode_verify(
+    rows: int,
+    phase: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RecordingGate(nn.Linear):
@@ -396,12 +473,12 @@ def test_issue58_selector_falls_back_to_stock_outside_decode_verify(
         lambda *_args, **_kwargs: pytest.fail("prefill must stay on stock routing"),
     )
 
-    with attention_phase("prefill"):
-        indices, weights = router(mx.zeros((1, 4, 4096), dtype=mx.bfloat16))
+    with attention_phase(phase):
+        indices, weights = router(mx.zeros((1, rows, 4096), dtype=mx.bfloat16))
 
     assert gate.calls == 1
-    assert tuple(indices.shape) == (1, 4, 8)
-    assert tuple(weights.shape) == (1, 4, 8)
+    assert tuple(indices.shape) == (1, rows, 8)
+    assert tuple(weights.shape) == (1, rows, 8)
 
 
 def test_issue58_selector_does_not_admit_the_issue60_fast_mode() -> None:
