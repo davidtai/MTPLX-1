@@ -774,6 +774,12 @@ def cmd_settings(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_lab(args: argparse.Namespace) -> int:
+    from .commands.lab import cmd_lab as handler
+
+    return handler(args)
+
+
 def cmd_hardware_public(args: argparse.Namespace) -> int:
     from .hardware import inspect_hardware
 
@@ -1888,6 +1894,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     advanced_p = sub.add_parser("advanced", help=argparse.SUPPRESS)
     advanced_p.set_defaults(func=lambda _args: (print(_format_advanced_help()) or 0))
+
+    lab_p = sub.add_parser("lab", help="Inspect validated experiment settings recipes")
+    lab_sub = lab_p.add_subparsers(dest="lab_action", required=True)
+    lab_list_p = lab_sub.add_parser("list", help="List active experiment recipes")
+    lab_list_p.add_argument("--all", action="store_true")
+    lab_list_p.add_argument("--json", action="store_true")
+    lab_list_p.set_defaults(func=cmd_lab)
+    lab_show_p = lab_sub.add_parser("show", help="Show an active experiment recipe")
+    lab_show_p.add_argument("experiment_id")
+    lab_show_p.add_argument("--json", action="store_true")
+    lab_show_p.set_defaults(func=cmd_lab)
+    lab_validate_p = lab_sub.add_parser(
+        "validate", help="Validate a data-only experiment recipe file"
+    )
+    lab_validate_p.add_argument("path")
+    lab_validate_p.add_argument("--json", action="store_true")
+    lab_validate_p.set_defaults(func=cmd_lab)
 
     hardware_p = sub.add_parser("hardware", help="Inspect local Apple Silicon hardware")
     hardware_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")

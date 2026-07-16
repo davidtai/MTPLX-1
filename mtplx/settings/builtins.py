@@ -92,6 +92,16 @@ BUILTIN_SETTINGS = (
         live_mutable=True,
     ),
     _setting(
+        "verify.compiled.mode",
+        SettingType.STRING,
+        "off",
+        domain="verify",
+        config_key=None,
+        env=("MTPLX_COMPILED_VERIFY",),
+        choices=("off", "on", "parity", "parity2"),
+        visibility=Visibility.EXPERIMENTAL,
+    ),
+    _setting(
         "thermal.control",
         SettingType.STRING,
         "",

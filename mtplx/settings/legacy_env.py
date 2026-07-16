@@ -74,7 +74,6 @@ INTERNAL_ENV_SPECS: dict[str, LegacyEnvSpec] = {
     "MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD": LegacyEnvSpec("cache", classification="prefix:CACHE"),
     "MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT": LegacyEnvSpec("cache", classification="prefix:CACHE"),
     "MTPLX_CLIENT": LegacyEnvSpec("internal", classification="explicit"),
-    "MTPLX_COMPILED_VERIFY": LegacyEnvSpec("verify", classification="prefix:VERIFY_COMPILED"),
     "MTPLX_COMPILED_VERIFY_BOUNDARY": LegacyEnvSpec("verify", classification="prefix:VERIFY_COMPILED"),
     "MTPLX_COMPILED_VERIFY_DONATION": LegacyEnvSpec("verify", classification="prefix:VERIFY_COMPILED"),
     "MTPLX_COMPILED_VERIFY_FORCE": LegacyEnvSpec("verify", classification="prefix:VERIFY_COMPILED"),
