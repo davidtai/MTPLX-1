@@ -28,6 +28,20 @@ an exact match for both benchmark artifacts.
 
 The benchmark intentionally disabled stop-token termination to force exactly 1,028 output tokens. The stock response would normally stop at token 500; everything after that first EOS is forced continuation. The MPP response never emitted EOS and ends at the hard token limit.
 
+## Prompt-aware interpretation
+
+The final request asks for one code-only Python file implementing ten ordered
+sections: prompt loading, validation, an LRU cache, metrics, records, sampling,
+an event log, a run registry, a CLI, and a self-test. The authoritative-MPP
+response follows that requested structure directly and does not loop, although
+it remains incomplete and contains syntax errors at the hard token cutoff.
+
+The stock response instead latches onto the filler repository's `JobStore`,
+adds prose despite the code-only instruction, emits EOS at token 500, and then
+repeats the same answer because the throughput benchmark deliberately ignores
+stop tokens. On instruction following and repetition behavior, the MPP response
+is the better of these two samples.
+
 ## Source artifacts
 
 - B0: `/tmp/issue51-b0-rebased-device-k-k0to7-c1024-o1028-r1.json`
