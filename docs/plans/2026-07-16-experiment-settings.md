@@ -39,7 +39,7 @@
 
 **Does NOT cover:** Built-in discovery, CLI, settings resolution, or benchmark execution.
 
-- [ ] **Step 1: Write failing schema tests**
+- [x] **Step 1: Write failing schema tests**
 
 ```python
 from __future__ import annotations
@@ -116,13 +116,13 @@ purpose = "Expired fixture."
         load_experiment(path, today=date(2026, 7, 16))
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_schema.py`
 
 Expected: FAIL because `mtplx.experiments` does not exist.
 
-- [ ] **Step 3: Implement schema and strict loader**
+- [x] **Step 3: Implement schema and strict loader**
 
 Define `ExperimentStatus` with `active`, `retained`, `rejected`, `superseded`,
 and `expired`; an immutable `ExperimentRecipe`; required metadata validation;
@@ -130,13 +130,13 @@ ISO date parsing; scalar settings only; exact allowed top-level tables
 `experiment` and `settings`; and active review-date enforcement. Archived
 statuses may include `replacement` and `result` but are never executable.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_schema.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add mtplx/experiments tests/test_experiment_schema.py
@@ -156,7 +156,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Experiment task 1 complete: st
 
 **Does NOT cover:** Applying recipes to runtime commands or model loading.
 
-- [ ] **Step 1: Write failing catalog tests**
+- [x] **Step 1: Write failing catalog tests**
 
 ```python
 from __future__ import annotations
@@ -212,32 +212,32 @@ def test_catalog_refuses_archived_recipe(tmp_path):
         catalog.resolve("lab:compiled-verify-control")
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_catalog.py`
 
 Expected: FAIL because catalog does not exist.
 
-- [ ] **Step 3: Implement catalog and normalized hashing**
+- [x] **Step 3: Implement catalog and normalized hashing**
 
 Discover sorted `*.toml`, reject duplicate ids, list by lifecycle, resolve only
 named `lab:` URIs such as `lab:compiled-verify-control`, and hash canonical JSON consisting of sorted metadata and settings
 with compact separators. `resolve` returns an immutable object containing
 recipe, hash, and source path.
 
-- [ ] **Step 4: Package recipes**
+- [x] **Step 4: Package recipes**
 
 Add `"mtplx.experiments" = ["recipes/*.toml"]` under
 `[tool.setuptools.package-data]` and add an installation test that uses
 `importlib.resources.files("mtplx.experiments").joinpath("recipes")`.
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_catalog.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/experiments pyproject.toml tests/test_experiment_catalog.py
@@ -256,7 +256,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Experiment task 2 complete: bu
 
 **Does NOT cover:** Executing a benchmark, mutating settings, or enabling archived recipes.
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 ```python
 from __future__ import annotations
@@ -303,26 +303,26 @@ def test_lab_validate_rejects_unknown_setting(capsys, tmp_path):
     assert "unknown setting" in capsys.readouterr().out
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_lab_cli.py`
 
 Expected: FAIL because the lab command is unknown.
 
-- [ ] **Step 3: Implement parser and handlers**
+- [x] **Step 3: Implement parser and handlers**
 
 Register `lab list [--all] [--json]`, `lab show ID [--json]`, and
 `lab validate PATH [--json]`. Handlers load schema/catalog/settings catalog,
 validate every setting name/type/tier, produce human or JSON output, and import
 no runtime/model modules.
 
-- [ ] **Step 4: Verify GREEN and no-MLX import**
+- [x] **Step 4: Verify GREEN and no-MLX import**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_lab_cli.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -c 'import sys; from mtplx.cli import main; assert main(["lab", "list", "--json"]) == 0; assert "mlx" not in sys.modules'`
 
 Expected: PASS and no `mlx` module in `sys.modules`.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add mtplx/cli.py mtplx/commands/lab.py tests/test_lab_cli.py
@@ -341,7 +341,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Experiment task 3 complete: no
 
 **Does NOT cover:** Automatic model loading or bypassing recipe model constraints.
 
-- [ ] **Step 1: Write failing integration tests**
+- [x] **Step 1: Write failing integration tests**
 
 ```python
 from __future__ import annotations
@@ -373,14 +373,14 @@ def test_lab_uri_refuses_incompatible_model_family():
         raise AssertionError("model-incompatible recipe should fail")
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_settings_integration.py`
 
 Expected: FAIL because `lab:` is treated as a missing filesystem path and
 bundle provenance is absent.
 
-- [ ] **Step 3: Implement lab URI delegation and provenance**
+- [x] **Step 3: Implement lab URI delegation and provenance**
 
 `load_settings_bundle` returns a `LoadedSettingsBundle` with settings, source,
 optional id/hash, and experiment metadata. For `lab:` sources it delegates to
@@ -388,13 +388,13 @@ optional id/hash, and experiment metadata. For `lab:` sources it delegates to
 metadata in `ResolvedSettings.bundle_provenance`. File bundles keep source path
 and a normalized settings hash.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_settings_integration.py tests/test_settings_storage.py tests/test_runtime_settings_args.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add mtplx/settings tests/test_experiment_settings_integration.py
@@ -416,7 +416,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Experiment task 4 complete: la
 
 **Does NOT cover:** Promoting candidates, assigning performance claims, or creating executable recipes for rejected experiments.
 
-- [ ] **Step 1: Write failing built-in recipe tests**
+- [x] **Step 1: Write failing built-in recipe tests**
 
 ```python
 from __future__ import annotations
@@ -439,13 +439,13 @@ def test_builtin_controls_are_active_typed_and_owned():
         assert recipe.tracking.endswith("/90")
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_builtin_experiment_recipes.py`
 
 Expected: FAIL because built-in recipes do not exist.
 
-- [ ] **Step 3: Add the three control recipes**
+- [x] **Step 3: Add the three control recipes**
 
 Each recipe uses issue #90 as tracking, creation date 2026-07-16, review date
 2026-08-16, model family `qwen3-next`, status `active`, owner `runtime`, and a
@@ -458,7 +458,7 @@ verify.nax.enabled                 <- MTPLX_NAX_VERIFY
 attention.gqa_packed_sdpa.enabled <- MTPLX_GQA_PACKED_SDPA
 ```
 
-- [ ] **Step 4: Generate the complete grouped inventory**
+- [x] **Step 4: Generate the complete grouped inventory**
 
 `generate_experiment_inventory.py` reads the settings catalog and built-in lab
 catalog, groups experimental/compatibility environment aliases by domain and
@@ -470,20 +470,20 @@ Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scri
 Expected: creates `docs/experiments/inventory.md` with every experimental or
 compatibility setting classified; no setting is silently omitted.
 
-- [ ] **Step 5: Verify GREEN and generated drift**
+- [x] **Step 5: Verify GREEN and generated drift**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_builtin_experiment_recipes.py tests/test_experiment_catalog.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/generate_experiment_inventory.py --check`
 
 Expected: PASS.
 
-- [ ] **Step 6: Comment newly identified cleanup candidates**
+- [x] **Step 6: Comment newly identified cleanup candidates**
 
 For each inventory row with no active bundle/profile/test and lifecycle
 `compatibility`, add one consolidated issue #90 comment listing the setting,
 source locations, apparent last purpose, and recommendation: archive, retain as
 internal, or investigate. Do not remove it in this task.
 
-- [ ] **Step 7: Commit and update issue**
+- [x] **Step 7: Commit and update issue**
 
 ```bash
 git add mtplx/experiments/recipes mtplx/settings/builtins.py scripts/generate_experiment_inventory.py docs/experiments/inventory.md tests/test_builtin_experiment_recipes.py
@@ -502,7 +502,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Experiment task 5 complete: ac
 
 **Does NOT cover:** Changing benchmark scoring, hardware isolation, model loading, or benchmark claims.
 
-- [ ] **Step 1: Write failing provenance test**
+- [x] **Step 1: Write failing provenance test**
 
 ```python
 from __future__ import annotations
@@ -533,13 +533,13 @@ def test_benchmark_envelope_records_redacted_bundle_provenance():
     assert envelope["settings"]["effective"]["generation.temperature"] == 0.6
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_provenance.py`
 
 Expected: FAIL because the envelope has no settings provenance fields.
 
-- [ ] **Step 3: Extend envelope schema and benchmark call sites**
+- [x] **Step 3: Extend envelope schema and benchmark call sites**
 
 Add optional `settings`, `settings_provenance`, and `settings_bundles` keyword
 arguments. Emit a sorted `settings` object only when provided, redact schema-
@@ -547,13 +547,13 @@ marked secrets before the call, and pass `args.mtplx_settings` from product
 benchmark actions. Preserve the byte shape of envelopes from callers that do
 not supply settings.
 
-- [ ] **Step 4: Verify GREEN and existing KPI tests**
+- [x] **Step 4: Verify GREEN and existing KPI tests**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_provenance.py tests/test_runtime_kpis.py tests/test_public_cli.py`
 
 Expected: PASS and unchanged payloads for no-settings callers.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add mtplx/kpi/runtime_kpis.py mtplx/commands/public.py tests/test_experiment_provenance.py
@@ -569,25 +569,25 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Experiment task 6 complete: be
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Run focused verification**
+- [x] **Step 1: Run focused verification**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_experiment_schema.py tests/test_experiment_catalog.py tests/test_lab_cli.py tests/test_experiment_settings_integration.py tests/test_builtin_experiment_recipes.py tests/test_experiment_provenance.py tests/test_runtime_settings_args.py`
 
 Expected: PASS.
 
-- [ ] **Step 2: Run generated checks and Ruff**
+- [x] **Step 2: Run generated checks and Ruff**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/audit_settings_catalog.py --check && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/generate_experiment_inventory.py --check && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/ruff check mtplx/experiments mtplx/commands/lab.py tests/test_experiment_*.py tests/test_lab_cli.py scripts/generate_experiment_inventory.py`
 
 Expected: PASS.
 
-- [ ] **Step 3: Run full suite and stub scan**
+- [x] **Step 3: Run full suite and stub scan**
 
 Run: `! rg -n 'TODO|FIXME|placeholder|NotImplementedError' mtplx/experiments mtplx/commands/lab.py scripts/generate_experiment_inventory.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q`
 
 Expected: exit 0 with no new skips or failures.
 
-- [ ] **Step 4: Record checkpoint**
+- [x] **Step 4: Record checkpoint**
 
 ```bash
 gh issue comment 90 --repo davidtai/MTPLX --body "Experiment settings phase verified: schema/catalog/lab/bundle/provenance tests, generated inventory checks, Ruff, and full repository suite pass on $(git rev-parse --short HEAD)."
