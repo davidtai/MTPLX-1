@@ -43,7 +43,7 @@
 
 **Does NOT cover:** Internal-only settings, secret values, or migration prose.
 
-- [ ] **Step 1: Write failing generator tests**
+- [x] **Step 1: Write failing generator tests**
 
 ```python
 from __future__ import annotations
@@ -71,13 +71,13 @@ def test_checked_in_reference_matches_renderer():
     assert json.loads((root / "docs/reference/settings.json").read_text(encoding="utf-8")) == payload
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_reference.py`
 
 Expected: FAIL because generator/reference files do not exist.
 
-- [ ] **Step 3: Implement deterministic renderer**
+- [x] **Step 3: Implement deterministic renderer**
 
 Render sorted domains and canonical names. Markdown columns are setting, type,
 default description, visibility, lifecycle, live/restart behavior, and legacy
@@ -85,13 +85,13 @@ aliases. JSON contains the same fields plus descriptions. Exclude internal
 settings and secret values. Support `--write` and `--check`; JSON uses indent 2,
 sorted keys, UTF-8, and a trailing newline.
 
-- [ ] **Step 4: Generate files and verify GREEN**
+- [x] **Step 4: Generate files and verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/generate_settings_reference.py --write && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_settings_reference.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/generate_settings_reference.py --check`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add scripts/generate_settings_reference.py docs/reference tests/test_settings_reference.py
@@ -112,7 +112,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Documentation task 1 complete:
 
 **Does NOT cover:** Root README, installation troubleshooting, or advanced streamed-MoE details.
 
-- [ ] **Step 1: Add failing content-contract tests**
+- [x] **Step 1: Add failing content-contract tests**
 
 ```python
 from __future__ import annotations
@@ -158,40 +158,40 @@ def test_migration_guide_maps_every_compatibility_alias():
                 assert alias.name in text
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py`
 
 Expected: FAIL because the four guides do not exist.
 
-- [ ] **Step 3: Write `docs/settings.md`**
+- [x] **Step 3: Write `docs/settings.md`**
 
 Document user, per-run, bundle, live, environment compatibility, model/default,
 profile, and constraint sources; the exact precedence; atomic TOML behavior;
 secret-file rules; `show/list/explain`; and goal-oriented examples for profile,
 sampling, context, cache, server, and streamed experts.
 
-- [ ] **Step 4: Write `docs/cli.md` and `docs/experiments.md`**
+- [x] **Step 4: Write `docs/cli.md` and `docs/experiments.md`**
 
 The CLI guide lists public/advanced/lab command maps and explains settings
 versus operands/mechanics. The experiment guide documents data-only recipes,
 `lab list/show/validate`, `lab:` application, lifecycle, model constraints,
 hashes, evidence, and archive behavior.
 
-- [ ] **Step 5: Write generated alias migration sections**
+- [x] **Step 5: Write generated alias migration sections**
 
 `docs/migration-settings.md` explains the compatibility window and explicit
 live/user scope change. Generate its CLI/environment mapping tables from the
 catalog inside `generate_settings_reference.py` so every alias test is stable;
 keep surrounding migration prose hand-authored.
 
-- [ ] **Step 6: Verify GREEN**
+- [x] **Step 6: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/generate_settings_reference.py --write && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py tests/test_settings_reference.py`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit and update issue**
+- [x] **Step 7: Commit and update issue**
 
 ```bash
 git add docs/settings.md docs/cli.md docs/experiments.md docs/migration-settings.md docs/reference scripts/generate_settings_reference.py tests/test_documentation.py
@@ -212,7 +212,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Documentation task 2 complete:
 
 **Does NOT cover:** Changing streamed-MoE commands, memory recommendations, benchmark claims, or artifact contracts.
 
-- [ ] **Step 1: Add failing index and advanced-guide tests**
+- [x] **Step 1: Add failing index and advanced-guide tests**
 
 ```python
 def test_docs_index_links_required_user_journeys():
@@ -232,34 +232,34 @@ def test_streamed_moe_commands_live_in_advanced_guide_not_root_readme():
     assert "--expert-memory-limit 104GiB" in advanced
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py`
 
 Expected: FAIL because the advanced guide/index do not exist and README still
 contains the detailed commands.
 
-- [ ] **Step 3: Move the streamed-MoE section without factual edits**
+- [x] **Step 3: Move the streamed-MoE section without factual edits**
 
 Move the full `Experimental SSD-streamed MoE` content, both command blocks,
 memory guidance, model restrictions, and guide link into
 `docs/advanced/ssd-streamed-moe.md`. Update its relative links. Replace the root
 section with a three-to-five sentence capability/status summary and one link.
 
-- [ ] **Step 4: Write getting-started and docs index**
+- [x] **Step 4: Write getting-started and docs index**
 
 `getting-started.md` covers app and CLI installation, `mtplx start`, one
 persistent setting, one per-run setting, server start, and client connection.
 `docs/README.md` groups links under Start, Configure, Operate, Experiment, and
 Develop/Reference.
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add README.md docs/README.md docs/getting-started.md docs/advanced/ssd-streamed-moe.md tests/test_documentation.py
@@ -277,7 +277,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Documentation task 3 complete:
 
 **Does NOT cover:** New product claims, installation methods, model support tiers, or measured performance numbers.
 
-- [ ] **Step 1: Add failing README contract tests**
+- [x] **Step 1: Add failing README contract tests**
 
 ```python
 def test_root_readme_has_settings_native_normal_path():
@@ -304,13 +304,13 @@ def test_root_readme_normal_sections_do_not_teach_legacy_runtime_flags():
     assert not [item for item in forbidden if item in normal]
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py`
 
 Expected: FAIL because the README does not contain the settings-native journey.
 
-- [ ] **Step 3: Rewrite and preserve verified facts**
+- [x] **Step 3: Rewrite and preserve verified facts**
 
 Use this section order: product outcome, Get it, Start in 60 seconds, Configure
 with settings, App, Connect clients/API, Tune and benchmark, Modes, Forge,
@@ -318,13 +318,13 @@ Advanced and compatibility, What MTPLX is not, License and credit. Keep current
 measured performance numbers and citations verbatim; do not invent updated
 claims. Use settings-native commands in normal sections and link full details.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py tests/test_public_cli.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add README.md tests/test_documentation.py
@@ -343,7 +343,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "Documentation task 4 complete:
 
 **Does NOT cover:** Commands requiring a model or privileged hardware; those receive parser-path validation only.
 
-- [ ] **Step 1: Add failing checker tests**
+- [x] **Step 1: Add failing checker tests**
 
 ```python
 from scripts.check_documentation import check_documentation
@@ -357,13 +357,13 @@ def test_documentation_checker_accepts_repository_docs():
     assert report.legacy_normal_path_flags == ()
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py`
 
 Expected: FAIL because the checker does not exist.
 
-- [ ] **Step 3: Implement checker**
+- [x] **Step 3: Implement checker**
 
 Parse local Markdown links and verify targets; extract fenced `bash` blocks;
 parse lines with `shlex` after removing comments and variable assignments;
@@ -372,20 +372,20 @@ documented placeholders such as filesystem/model paths from existence checks;
 and enforce the README legacy-flag policy before the Advanced section. Return a
 frozen report and expose `--json`/exit status CLI.
 
-- [ ] **Step 4: Verify focused docs and generated references**
+- [x] **Step 4: Verify focused docs and generated references**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/generate_settings_reference.py --check && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/generate_experiment_inventory.py --check && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python scripts/check_documentation.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_documentation.py tests/test_settings_reference.py`
 
 Expected: PASS with zero missing links, invalid shell blocks, unknown no-model
 commands, or legacy normal-path flags.
 
-- [ ] **Step 5: Run Ruff, stub scan, and full suite**
+- [x] **Step 5: Run Ruff, stub scan, and full suite**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/ruff check scripts/generate_settings_reference.py scripts/generate_experiment_inventory.py scripts/check_documentation.py tests/test_documentation.py tests/test_settings_reference.py && ! rg -n 'TODO|FIXME|placeholder|NotImplementedError' scripts/generate_settings_reference.py scripts/generate_experiment_inventory.py scripts/check_documentation.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q`
 
 Expected: exit 0 with no new skips or failures.
 
-- [ ] **Step 6: Commit and record final documentation checkpoint**
+- [x] **Step 6: Commit and record final documentation checkpoint**
 
 ```bash
 git add scripts/check_documentation.py tests/test_documentation.py docs/plans/2026-07-16-documentation-refresh.md

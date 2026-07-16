@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from scripts.check_documentation import check_documentation
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -103,3 +105,11 @@ def test_root_readme_normal_sections_do_not_teach_legacy_runtime_flags():
         "MTPLX_NAX_VERIFY=",
     )
     assert not [item for item in forbidden if item in normal]
+
+
+def test_documentation_checker_accepts_repository_docs():
+    report = check_documentation(ROOT)
+    assert report.missing_links == ()
+    assert report.invalid_shell_blocks == ()
+    assert report.unknown_commands == ()
+    assert report.legacy_normal_path_flags == ()
