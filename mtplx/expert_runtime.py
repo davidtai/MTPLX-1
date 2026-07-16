@@ -2704,13 +2704,23 @@ class ExpertStreamingRuntime:
     def reconcile_allocator_memory(
         self,
     ) -> tuple[BrokerSnapshot, AllocatorMemorySample]:
-        """Return one safe-boundary broker snapshot and its allocator sample."""
+        """Return one serialized broker snapshot and its allocator sample.
+
+        A reclaim-gap observation can re-enter this method while its own KV
+        transaction holds the runtime lock.  Reconciliation is forbidden at
+        that protected midpoint, so preserve the transaction's already
+        confirmed broker snapshot.  Ordinary observation boundaries still
+        reconcile post-dispatch allocator drift before returning.
+        """
 
         broker = self.memory_broker
         if broker is None:
             raise MemoryAdmissionError("dynamic expert cache is not enabled")
         with self._memory_transaction_lock:
             sample = self._sample_allocator_memory()
+            snapshot = broker.snapshot()
+            if snapshot.pending_kv_ticket_id is not None:
+                return snapshot, sample
             return broker.reconcile_allocator_cache(sample), sample
 
     def reconcile_post_load_memory(self) -> None:

@@ -268,6 +268,29 @@ def test_safe_observation_reconciles_post_dispatch_allocator_drift() -> None:
         runtime._split_executor.shutdown(wait=True)
 
 
+def test_safe_observation_preserves_an_owned_kv_transaction() -> None:
+    runtime = _runtime(expert_cache_limit_bytes=20, memory_limit_bytes=70)
+    for expert in (0, 1):
+        ready = runtime.ensure_route(1, [expert], phase="decode")
+        ready.release(synchronize=False)
+    group = runtime.reserve_growth_group(
+        members=(("target:observation-gap", 1, 0),),
+    )
+    try:
+        before = runtime.memory_broker.snapshot()
+
+        snapshot, observed = runtime.reconcile_allocator_memory()
+
+        after = runtime.memory_broker.snapshot()
+        assert snapshot == before == after
+        assert snapshot.pending_kv_ticket_id == group.ticket.ticket_id
+        assert snapshot.expert_cache_physical_bytes == 10
+        assert observed.charged_footprint_bytes == 60
+    finally:
+        group.abort(observed_uncommitted_physical_bytes=0)
+        runtime._split_executor.shutdown(wait=True)
+
+
 def test_split_route_uses_same_miss_warming_and_hit_fast_path(monkeypatch) -> None:
     runtime = _runtime()
     broker_calls = 0
