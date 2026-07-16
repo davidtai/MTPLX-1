@@ -73,6 +73,30 @@ def _attest_strict_dynamic_q4_cache_group(
         )
 
 
+def _streamed_mtp_backend(model_key: str, precision: str) -> str:
+    """Resolve the strict external MTP adapter before model allocation."""
+
+    support = {
+        "hy3-q4": ("hy3", {"bf16", "q4"}),
+        "hy3-expert-q2": ("hy3", {"bf16"}),
+        "glm52-expert-q2": ("glm52", {"bf16"}),
+        "glm52-q4": ("glm52", {"bf16"}),
+    }
+    selected = support.get(str(model_key))
+    if selected is None:
+        raise RuntimeError(f"streamed MTP is not supported for model key {model_key!r}")
+    backend, precisions = selected
+    if precision not in precisions:
+        if precisions == {"bf16"}:
+            raise RuntimeError(
+                f"streamed MTP for {model_key!r} requires the validated BF16 head"
+            )
+        raise RuntimeError(
+            f"streamed MTP precision {precision!r} is not supported for {model_key!r}"
+        )
+    return backend
+
+
 @dataclass
 class MTPLXRuntime:
     model: Any
@@ -463,6 +487,13 @@ class MTPLXRuntime:
         register_physical_kv_cache(cache)
         return cache
 
+    def finish_mtp_cycle(self, mtp_cache) -> None:
+        """Discard backend-owned speculative cache state, if any."""
+
+        finish = getattr(self.model, "finish_mtp_cycle", None)
+        if callable(finish):
+            finish(mtp_cache)
+
     def admit_kv_tokens(self, tokens: int):
         """Reserve request KV capacity under the streamed memory plan."""
 
@@ -485,7 +516,7 @@ class MTPLXRuntime:
             self.expert_streaming.close(timeout=timeout)
 
 
-def load(
+def _load_impl(
     model_path: Path | str,
     *,
     mtp: bool = True,
@@ -499,14 +530,13 @@ def load(
     model_config: Mapping[str, Any] | None = None,
     mtp_artifacts: Path | str | None = None,
     mtp_precision: str = "bf16",
+    _expert_runtime_owner: list[Any],
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
-    ``mtp_precision`` selects the streamed Hy3 layer-80 head build: ``"bf16"``
-    (default, per docs/FORGE_BACKEND_CONTRACT.md section 6 — quantized MTP
-    heads collapse acceptance) loads the bit-exact BF16 artifact (~7.5 GB
-    resident; budget it against the expert cache), ``"q4"`` loads the pinned
-    quantized artifacts (~1.94 GiB expert bank).
+    ``mtp_precision`` selects the streamed external draft head. Both expert-Q2
+    lanes and GLM-5.2 Q4 require their exact BF16 head; the legacy Hy3-Q4 lane
+    also retains its explicit Q4 diagnostic mode.
     """
     from .hy3_mtp_patch import HY3_MTP_PRECISIONS
 
@@ -568,12 +598,26 @@ def load(
     if model_config is not None and not isinstance(model_config, Mapping):
         raise TypeError("model_config must be a mapping")
     config = load_config(path) if model_config is None else dict(model_config)
+    runtime_metadata = _load_runtime_metadata(path)
+    contract = (
+        (contract or MTPContract())
+        .with_runtime_metadata(runtime_metadata, preserve_explicit=True)
+        .with_config_defaults(config)
+    )
     from .step3p5_mtp_patch import is_step3p5_mtp_config
 
     expert_runtime = None
     resident_load_report = None
+    streamed_mtp_backend = None
+    streamed_mtp_resident_bytes = 0
+    mtp_enabled = False
     if streaming_requested:
-        from .expert_runtime import ExpertStreamingConfig, ExpertStreamingRuntime
+        from .expert_runtime import (
+            ExpertStreamingConfig,
+            ExpertStreamingConfigurationError,
+            ExpertStreamingRuntime,
+            apply_mlx_memory_cap,
+        )
         from .expert_streaming_models import get_model_spec
         from .models.expert_mlx import (
             make_mlx_component_bank_allocator,
@@ -585,64 +629,177 @@ def load(
 
         if not isinstance(expert_streaming_config, ExpertStreamingConfig):
             raise TypeError("expert_streaming_config must be an ExpertStreamingConfig")
-        if mtp and mtp_artifacts is None:
-            raise RuntimeError(
-                "the pinned Hy3-4bit and GLM-5.2-4bit artifacts omit MTP weights; "
-                "pass mtp_artifacts=<layer-80 artifact directory> to enable "
-                "streamed Hy3 MTP or load with mtp=False"
-            )
-        if mtp and expert_streaming_config.model_key != "hy3-q4":
-            raise RuntimeError(
-                "streamed MTP artifacts are packaged for hy3-q4 only; "
-                f"got {expert_streaming_config.model_key!r}"
-            )
-        if mtp_adapter is not None or merge_mtp_adapter:
-            raise RuntimeError("MTP adapters are unavailable for streamed loading")
-
         streaming_spec = get_model_spec(expert_streaming_config.model_key)
-        streaming_plan = expert_streaming_config.memory_plan(streaming_spec)
-        from .expert_manifest import load_expert_manifest
-
-        streaming_manifest = (
-            expert_manifest
-            if isinstance(expert_manifest, ExpertManifest)
-            else load_expert_manifest(expert_manifest)
-        )
-        if expert_streaming_config.dynamic_expert_cache:
-            slot_allocator = make_mlx_slot_buffer_allocator(
-                streaming_plan, streaming_spec
+        verified_artifact_context = nullcontext(None)
+        if mtp:
+            streamed_mtp_backend = _streamed_mtp_backend(
+                expert_streaming_config.model_key,
+                mtp_precision,
             )
-        elif expert_streaming_config.slot_layout == "component-banks":
-            slot_allocator = make_mlx_component_bank_allocator(
-                streaming_plan,
+            if mtp_artifacts is None:
+                raise RuntimeError(
+                    "this streamed checkpoint omits its trained MTP layer; pass "
+                    "mtp_artifacts=<validated external artifact directory> or "
+                    "load with mtp=False"
+                )
+            if streamed_mtp_backend == "glm52":
+                from .glm52_mtp_artifact import open_verified_glm52_mtp_layer78
+                from .glm52_mtp_patch import _validate_glm52_mtp_contract
+
+                _validate_glm52_mtp_contract(contract)
+                verified_artifact_context = open_verified_glm52_mtp_layer78(
+                    Path(mtp_artifacts), deep=True
+                )
+            elif streamed_mtp_backend == "hy3":
+                from .hy3_mtp_patch import open_verified_hy3_mtp_artifacts
+
+                verified_artifact_context = open_verified_hy3_mtp_artifacts(
+                    Path(mtp_artifacts),
+                    precision=mtp_precision,
+                    expected_revision=streaming_spec.source_revision,
+                )
+        with verified_artifact_context as verified_streamed_artifact:
+            if streamed_mtp_backend == "glm52":
+                receipt = verified_streamed_artifact.manifest
+                inventory = receipt.get("inventory")
+                if not isinstance(inventory, dict):
+                    raise RuntimeError("GLM-5.2 MTP manifest inventory is missing")
+                payload_bytes = inventory.get("payload_bytes")
+                if (
+                    isinstance(payload_bytes, bool)
+                    or not isinstance(payload_bytes, int)
+                    or payload_bytes <= 0
+                ):
+                    raise RuntimeError(
+                        "GLM-5.2 MTP manifest payload byte count is invalid"
+                    )
+                streamed_mtp_resident_bytes = payload_bytes
+            elif streamed_mtp_backend == "hy3":
+                streamed_mtp_resident_bytes = verified_streamed_artifact.payload_bytes
+                if (
+                    isinstance(streamed_mtp_resident_bytes, bool)
+                    or not isinstance(streamed_mtp_resident_bytes, int)
+                    or streamed_mtp_resident_bytes <= 0
+                ):
+                    raise RuntimeError("Hy3 MTP artifact payload byte count is invalid")
+
+            plan_kwargs = (
+                {"additional_resident_bytes": streamed_mtp_resident_bytes}
+                if streamed_mtp_resident_bytes
+                else {}
+            )
+            streaming_plan = expert_streaming_config.memory_plan(
                 streaming_spec,
-                streaming_manifest,
+                **plan_kwargs,
             )
-        else:
-            slot_allocator = make_mlx_slot_buffer_allocator(
-                streaming_plan, streaming_spec
-            )
+            if not streaming_plan.fits_fixed:
+                raise ExpertStreamingConfigurationError(
+                    "fixed expert-streaming footprint exceeds limit by "
+                    f"{-streaming_plan.unallocated_bytes} bytes"
+                )
+            from .expert_manifest import load_expert_manifest
 
-        expert_runtime = ExpertStreamingRuntime.open(
-            path,
-            streaming_manifest,
-            expert_streaming_config,
-            spec=streaming_spec,
-            buffer_allocator=slot_allocator,
-            device_synchronize=mx.synchronize,
-            apply_memory_cap=True,
-            mx_module=mx,
-        )
-        try:
+            streaming_manifest = (
+                expert_manifest
+                if isinstance(expert_manifest, ExpertManifest)
+                else load_expert_manifest(expert_manifest)
+            )
+            prebuilt_glm_mtp = None
+            prebuilt_hy3_mtp = None
             if mtp:
-                _reject_strict_dynamic_q4_mtp(expert_runtime)
-            resident = construct_resident_model(path, expert_runtime, config=config)
-            model = resident.model
-            resident_load_report = resident.report.as_dict()
-            tokenizer = _load_tokenizer_resilient(path, config)
-        except BaseException:
-            expert_runtime.close()
-            raise
+                # Materialize external MTP heads before allocating expert-cache
+                # banks. Stacking their routed experts has a large transient
+                # footprint that can breach an otherwise-valid steady-state plan.
+                apply_mlx_memory_cap(streaming_plan, mx_module=mx)
+            if streamed_mtp_backend == "glm52":
+                from .glm52_mtp_patch import build_glm52_mtp_module
+                from .models.glm52_mlx import ModelArgs as Glm52ModelArgs
+
+                prebuilt_glm_mtp = build_glm52_mtp_module(
+                    mtp_artifacts,
+                    Glm52ModelArgs.from_dict(config),
+                    expected_revision=streaming_spec.source_revision,
+                    verified_artifact=verified_streamed_artifact,
+                )
+            elif streamed_mtp_backend == "hy3":
+                from .hy3_mtp_patch import build_hy3_mtp_module
+                from .models.hy3_mlx import ModelArgs as Hy3ModelArgs
+
+                prebuilt_hy3_mtp = build_hy3_mtp_module(
+                    mtp_artifacts,
+                    Hy3ModelArgs.from_dict(config),
+                    expected_revision=streaming_spec.source_revision,
+                    precision=mtp_precision,
+                    verified_artifacts=verified_streamed_artifact,
+                )
+            if expert_streaming_config.slot_layout == "component-banks":
+                slot_allocator = make_mlx_component_bank_allocator(
+                    streaming_plan,
+                    streaming_spec,
+                    streaming_manifest,
+                )
+            else:
+                slot_allocator = make_mlx_slot_buffer_allocator(
+                    streaming_plan, streaming_spec
+                )
+
+            if mtp_adapter is not None or merge_mtp_adapter:
+                raise RuntimeError("MTP adapters are unavailable for streamed loading")
+            expert_runtime = ExpertStreamingRuntime.open(
+                path,
+                streaming_manifest,
+                expert_streaming_config,
+                spec=streaming_spec,
+                buffer_allocator=slot_allocator,
+                device_synchronize=mx.synchronize,
+                apply_memory_cap=True,
+                mx_module=mx,
+                **plan_kwargs,
+            )
+            _expert_runtime_owner[:] = [expert_runtime]
+            try:
+                if mtp:
+                    _reject_strict_dynamic_q4_mtp(expert_runtime)
+                resident = construct_resident_model(path, expert_runtime, config=config)
+                model = resident.model
+                resident_load_report = resident.report.as_dict()
+                tokenizer = _load_tokenizer_resilient(path, config)
+                if mtp:
+                    if streamed_mtp_backend == "hy3":
+                        from .hy3_mtp_patch import inject_hy3_streamed_mtp_support
+
+                        mtp_enabled = inject_hy3_streamed_mtp_support(
+                            model,
+                            mtp_artifacts,
+                            config,
+                            contract,
+                            expected_revision=streaming_spec.source_revision,
+                            mtp_precision=mtp_precision,
+                            mtp_module=prebuilt_hy3_mtp,
+                        )
+                    elif streamed_mtp_backend == "glm52":
+                        from .glm52_mtp_patch import (
+                            inject_glm52_streamed_mtp_support,
+                        )
+
+                        mtp_enabled = inject_glm52_streamed_mtp_support(
+                            model,
+                            mtp_artifacts,
+                            config,
+                            contract,
+                            expected_revision=streaming_spec.source_revision,
+                            verified_artifact=verified_streamed_artifact,
+                            mtp_module=prebuilt_glm_mtp,
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"unresolved streamed MTP backend {streamed_mtp_backend!r}"
+                        )
+                    if not mtp_enabled or not validate_mtp_support(model):
+                        raise RuntimeError(f"streamed MTP injection failed for {path}")
+            except BaseException:
+                expert_runtime.close()
+                raise
     elif is_step3p5_mtp_config(config):
         from mlx_lm.utils import load_model
 
@@ -652,26 +809,7 @@ def load(
         from mlx_lm.utils import load as mlx_lm_load
 
         model, tokenizer = mlx_lm_load(str(path))
-    runtime_metadata = _load_runtime_metadata(path)
-    contract = (
-        (contract or MTPContract())
-        .with_runtime_metadata(runtime_metadata, preserve_explicit=True)
-        .with_config_defaults(config)
-    )
-    mtp_enabled = False
-    if mtp and expert_runtime is not None:
-        from .hy3_mtp_patch import inject_hy3_streamed_mtp_support
-
-        try:
-            mtp_enabled = inject_hy3_streamed_mtp_support(
-                model, mtp_artifacts, config, contract, mtp_precision=mtp_precision
-            )
-            if not mtp_enabled or not validate_mtp_support(model):
-                raise RuntimeError(f"streamed Hy3 MTP injection failed for {path}")
-        except BaseException:
-            expert_runtime.close()
-            raise
-    elif mtp:
+    if mtp and expert_runtime is None:
         from .deepseek_mtp_patch import (
             inject_deepseek_mtp_support,
             is_deepseek_mtp_config,
@@ -743,6 +881,48 @@ def load(
         expert_streaming=expert_runtime,
         resident_load_report=resident_load_report,
     )
+
+
+def load(
+    model_path: Path | str,
+    *,
+    mtp: bool = True,
+    contract: MTPContract | None = None,
+    mtp_adapter: Path | str | None = None,
+    merge_mtp_adapter: bool = False,
+    gemma4_draft_block_size: int | None = None,
+    gemma4_target_distribution_mode: str | None = None,
+    expert_streaming_config: Any | None = None,
+    expert_manifest: Path | str | ExpertManifest | None = None,
+    model_config: Mapping[str, Any] | None = None,
+    mtp_artifacts: Path | str | None = None,
+    mtp_precision: str = "bf16",
+) -> MTPLXRuntime:
+    """Load a model and transfer streamed-runtime ownership only on success."""
+
+    expert_runtime_owner: list[Any] = []
+    try:
+        runtime = _load_impl(
+            model_path,
+            mtp=mtp,
+            contract=contract,
+            mtp_adapter=mtp_adapter,
+            merge_mtp_adapter=merge_mtp_adapter,
+            gemma4_draft_block_size=gemma4_draft_block_size,
+            gemma4_target_distribution_mode=gemma4_target_distribution_mode,
+            expert_streaming_config=expert_streaming_config,
+            expert_manifest=expert_manifest,
+            model_config=model_config,
+            mtp_artifacts=mtp_artifacts,
+            mtp_precision=mtp_precision,
+            _expert_runtime_owner=expert_runtime_owner,
+        )
+    except BaseException:
+        if expert_runtime_owner:
+            expert_runtime_owner[0].close()
+        raise
+    expert_runtime_owner.clear()
+    return runtime
 
 
 def inspect(path: Path | str):

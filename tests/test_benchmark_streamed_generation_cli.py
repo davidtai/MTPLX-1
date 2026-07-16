@@ -52,6 +52,69 @@ def test_unflagged_runs_are_reproducible_and_bounded() -> None:
     assert args.seed == 0
 
 
+@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
+def test_benchmark_accepts_explicit_hy3_expert_lanes_with_hy3_defaults(
+    model_key: str,
+) -> None:
+    module = _load_module()
+    args = module.build_parser().parse_args(
+        [
+            "/model",
+            "/manifest",
+            "--model-key",
+            model_key,
+            "--memory-limit",
+            "112GiB",
+            "--max-live-kv-tokens",
+            "2048",
+        ]
+    )
+
+    assert args.model_key == model_key
+    assert module.model_defaults_for_key(model_key) == (
+        module.model_defaults_for_key("hy3-q4")
+    )
+    assert module.model_defaults_for_key(model_key) == {
+        "max_tokens": 65_536,
+        "max_output_tokens": 262_144,
+        "temperature": 0.9,
+        "top_p": 1.0,
+        "top_k": 0,
+        "enable_thinking": False,
+        "reasoning_effort": None,
+    }
+
+
+def test_glm52_expert_q2_benchmark_uses_glm52_q4_defaults() -> None:
+    module = _load_module()
+    args = module.build_parser().parse_args(
+        [
+            "/model",
+            "/manifest",
+            "--model-key",
+            "glm52-expert-q2",
+            "--memory-limit",
+            "112GiB",
+            "--max-live-kv-tokens",
+            "2048",
+        ]
+    )
+
+    assert args.model_key == "glm52-expert-q2"
+    assert module.model_defaults_for_key("glm52-expert-q2") == (
+        module.model_defaults_for_key("glm52-q4")
+    )
+    assert module.model_defaults_for_key("glm52-expert-q2") == {
+        "max_tokens": 65_536,
+        "max_output_tokens": 131_072,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 0,
+        "enable_thinking": True,
+        "reasoning_effort": "max",
+    }
+
+
 def test_window_telemetry_can_be_disabled() -> None:
     parser = _load_module().build_parser()
     args = parser.parse_args(
@@ -997,7 +1060,52 @@ def test_enable_mtp_parses_with_artifacts_for_hy3() -> None:
     assert str(args.mtp_artifacts) == "/artifacts"
 
 
-def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
+def test_enable_mtp_parses_with_bf16_artifacts_for_glm52_q4() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "glm52-q4",
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+            "--mtp-precision",
+            "bf16",
+        ]
+    )
+
+    module.validate_mtp_flags(parser, args)
+
+    assert args.enable_mtp is True
+    assert args.mtp_precision == "bf16"
+    assert str(args.mtp_artifacts) == "/artifacts"
+
+
+def test_glm52_q4_rejects_q4_mtp_precision_before_load(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "glm52-q4",
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+            "--mtp-precision",
+            "q4",
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+
+    assert "BF16" in capsys.readouterr().err
+
+
+def test_enable_mtp_requires_artifacts(capsys) -> None:
     import pytest
 
     module = _load_module()
@@ -1009,25 +1117,35 @@ def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
     assert "--mtp-artifacts" in capsys.readouterr().err
 
     args = parser.parse_args(
-        [
-            *_BASE_ARGS,
-            "--model-key",
-            "glm52-q4",
-            "--enable-mtp",
-            "--mtp-artifacts",
-            "/artifacts",
-        ]
-    )
-    with pytest.raises(SystemExit):
-        module.validate_mtp_flags(parser, args)
-    assert "hy3-q4" in capsys.readouterr().err
-
-    args = parser.parse_args(
         [*_BASE_ARGS, "--model-key", "hy3-q4", "--mtp-artifacts", "/artifacts"]
     )
     with pytest.raises(SystemExit):
         module.validate_mtp_flags(parser, args)
     assert "--enable-mtp" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
+def test_benchmark_rejects_mtp_for_explicit_hy3_expert_lanes_before_load(
+    model_key: str,
+    capsys,
+) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            model_key,
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+
+    assert "hy3-q4 or glm52-q4" in capsys.readouterr().err
 
 
 def test_sidecar_trust_requires_validated_sidecar_and_preserves_source_hashes(

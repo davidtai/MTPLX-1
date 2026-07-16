@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,8 +15,20 @@ from mtplx.expert_cli import (
     append_expert_streaming_child_args,
     expert_streaming_load_kwargs,
 )
-from mtplx.expert_runtime import ExpertStreamingConfig
-from mtplx.expert_streaming_models import HY3_Q4
+from mtplx.expert_manifest import (
+    ExpertManifest,
+    ExpertRecord,
+    ResidentTensor,
+    ShardInfo,
+    TensorSegment,
+    save_expert_manifest,
+)
+from mtplx.expert_runtime import (
+    ExpertStreamingConfig,
+    ExpertStreamingConfigurationError,
+    ExpertStreamingRuntime,
+)
+from mtplx.expert_streaming_models import ExpertStreamingModelSpec, HY3_Q4
 from mtplx.attention_context import attention_phase
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.memory_broker import BINARY_GIB
@@ -161,6 +176,188 @@ def test_expert_cli_builds_explicit_bounded_config(tmp_path: Path) -> None:
     assert config.runtime_reserve_bytes == 8 * 1024**3
     assert config.allocator_headroom_bytes == 1024**3
     assert config.prefer_sidecar is False
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_model_key"),
+    [("hy_v3", "hy3-q4"), ("glm_moe_dsa", "glm52-q4")],
+)
+def test_hy3_default_and_glm_default_stay_on_production_q4(
+    tmp_path: Path,
+    model_type: str,
+    expected_model_key: str,
+) -> None:
+    root = _model_root(tmp_path, model_type)
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].model_key == expected_model_key
+
+
+@pytest.mark.parametrize(
+    "model_key",
+    ["hy3-expert-only-q4", "hy3-expert-q2", "glm52-expert-q2"],
+)
+def test_expert_cli_accepts_explicit_expert_only_model_keys(
+    model_key: str,
+) -> None:
+    args = _parser().parse_args(["--expert-model-key", model_key])
+
+    assert args.expert_model_key == model_key
+
+
+def _tiny_affine_spec(*, bits: int) -> ExpertStreamingModelSpec:
+    key = "hy3-expert-q2" if bits == 2 else "hy3-expert-only-q4"
+    weight_bytes = 64 * 64 * bits // 8
+    parameter_bytes = 64 * 2
+    record_bytes = 3 * (weight_bytes + 2 * parameter_bytes)
+    return ExpertStreamingModelSpec(
+        key=key,
+        display_name=f"Tiny affine Q{bits}",
+        source_model="test/tiny-hy3",
+        source_revision="source",
+        quant_model="local/tiny-hy3",
+        quant_revision="quant",
+        total_tensor_bytes=record_bytes + 1,
+        total_layers=2,
+        routed_layer_start=1,
+        routed_layer_count=1,
+        expert_count=1,
+        top_k=1,
+        hidden_size=64,
+        expert_hidden_size=64,
+        quant_bits=bits,
+        quant_group_size=64,
+        quant_parameter_bytes=2,
+        router_storage="bfloat16",
+        router_matmul_dtype="float32",
+        router_bytes=0,
+        kv_bytes_per_token=0,
+        mtp_layer_index=2,
+        mtp_included=False,
+    )
+
+
+def _write_tiny_affine_manifest(
+    root: Path,
+    spec: ExpertStreamingModelSpec,
+) -> Path:
+    root.mkdir()
+    cursor = 1
+    segments = []
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        output_size = 64
+        input_size = 64
+        for leaf, dtype, shape, length in (
+            (
+                "weight",
+                "U32",
+                (output_size, input_size * spec.quant_bits // 32),
+                output_size * input_size * spec.quant_bits // 8,
+            ),
+            ("scales", "BF16", (output_size, 1), output_size * 2),
+            ("biases", "BF16", (output_size, 1), output_size * 2),
+        ):
+            component = f"{projection}.{leaf}"
+            segments.append(
+                TensorSegment(
+                    component=component,
+                    tensor=f"model.layers.1.mlp.switch_mlp.{component}",
+                    shard="source.safetensors",
+                    offset=cursor,
+                    length=length,
+                    dtype=dtype,
+                    shape=shape,
+                )
+            )
+            cursor += length
+    record = ExpertRecord(
+        layer=1,
+        expert=0,
+        logical_bytes=spec.expert_record_bytes,
+        segments=tuple(segments),
+    )
+    shard = root / "source.safetensors"
+    shard.write_bytes(b"\0" * (cursor + 1))
+    manifest = ExpertManifest(
+        model_key=spec.key,
+        source_repo=spec.quant_model,
+        source_revision=spec.quant_revision,
+        quant_bits=spec.quant_bits,
+        quant_group_size=spec.quant_group_size,
+        quant_mode="affine",
+        artifact_tensor_bytes=spec.total_tensor_bytes,
+        resident_tensor_bytes=1,
+        routed_expert_bytes=spec.routed_expert_bytes,
+        shards=(
+            ShardInfo(
+                name=shard.name,
+                size=cursor + 1,
+                header_bytes=1,
+                header_sha256=hashlib.sha256(b"\0").hexdigest(),
+            ),
+        ),
+        resident_tensors=(
+            ResidentTensor(
+                tensor="model.norm.flag",
+                shard=shard.name,
+                offset=cursor,
+                length=1,
+                dtype="U8",
+                shape=(1,),
+            ),
+        ),
+        records=(record,),
+    ).with_digest()
+    path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, path)
+    return path
+
+
+@pytest.mark.parametrize(("manifest_bits", "descriptor_bits"), [(2, 4), (4, 2)])
+def test_expert_q2_and_expert_only_q4_manifest_descriptor_mismatch_is_exact(
+    tmp_path: Path,
+    manifest_bits: int,
+    descriptor_bits: int,
+) -> None:
+    manifest_spec = _tiny_affine_spec(bits=manifest_bits)
+    descriptor = replace(
+        _tiny_affine_spec(bits=descriptor_bits),
+        quant_model=manifest_spec.quant_model,
+        quant_revision=manifest_spec.quant_revision,
+    )
+    root = tmp_path / f"q{manifest_bits}"
+    manifest_path = _write_tiny_affine_manifest(root, manifest_spec)
+    config = ExpertStreamingConfig(
+        model_key=descriptor.key,
+        memory_limit_bytes=1,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+    )
+
+    with pytest.raises(ExpertStreamingConfigurationError) as failed:
+        ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            config,
+            spec=descriptor,
+            apply_memory_cap=False,
+        )
+
+    assert str(failed.value) == (
+        "manifest does not match pinned model descriptor: "
+        f"manifest bits {manifest_bits} do not match descriptor bits {descriptor_bits}"
+    )
 
 
 def test_expert_cli_json_and_flags_are_strict_and_forwarded(tmp_path: Path) -> None:
@@ -774,7 +971,9 @@ def _patch_streamed_load_to_live_broker(
 ):
     import mtplx.expert_manifest as expert_manifest_module
     import mtplx.expert_runtime as expert_runtime_module
+    import mtplx.hy3_mtp_patch as hy3_mtp_patch_module
     import mtplx.models.expert_mlx as expert_mlx_module
+    import mtplx.models.hy3_mlx as hy3_mlx_module
     import mtplx.resident_loader as resident_loader_module
 
     runtime = SimpleNamespace(
@@ -787,6 +986,22 @@ def _patch_streamed_load_to_live_broker(
         runtime.closed = True
 
     runtime.close = close
+    verified_mtp = SimpleNamespace(payload_bytes=1)
+    monkeypatch.setattr(
+        hy3_mtp_patch_module,
+        "open_verified_hy3_mtp_artifacts",
+        lambda *_args, **_kwargs: contextlib.nullcontext(verified_mtp),
+    )
+    monkeypatch.setattr(
+        hy3_mtp_patch_module,
+        "build_hy3_mtp_module",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        hy3_mlx_module.ModelArgs,
+        "from_dict",
+        lambda _config: object(),
+    )
     monkeypatch.setattr(
         expert_manifest_module,
         "load_expert_manifest",
@@ -874,7 +1089,7 @@ def test_programmatic_load_rejects_mtp_when_strict_dynamic_q4_is_live(
     )
     config = ExpertStreamingConfig(
         model_key="hy3-q4",
-        memory_limit_bytes=1,
+        memory_limit_bytes=100 * BINARY_GIB,
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
     )
@@ -913,7 +1128,7 @@ def test_programmatic_load_does_not_reject_brokered_mtp_when_dynamic_kv_is_off(
     )
     config = ExpertStreamingConfig(
         model_key="hy3-q4",
-        memory_limit_bytes=1,
+        memory_limit_bytes=100 * BINARY_GIB,
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
     )

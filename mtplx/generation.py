@@ -953,6 +953,8 @@ class _DecodeTrace:
             "accepted_drafts": 0,
             "rejected_drafts": 0,
             "drafted_tokens": 0,
+            "evaluated_drafts": 0,
+            "fully_accepted_verify_calls": 0,
             "verify_calls": 0,
             "correction_tokens": 0,
             "bonus_tokens": 0,
@@ -998,6 +1000,7 @@ class _DecodeTrace:
             "trace_accounting_time_s": 0.0,
             "accepted_by_depth": [0 for _ in range(speculative_depth)],
             "drafted_by_depth": [0 for _ in range(speculative_depth)],
+            "evaluated_by_depth": [0 for _ in range(speculative_depth)],
             "accept_probability_sum_by_depth": [0.0 for _ in range(speculative_depth)],
         }
         if self.enabled and self.path is not None:
@@ -1031,6 +1034,9 @@ class _DecodeTrace:
         drafted_by_depth_delta = [
             int(item) for item in self._delta(totals, "drafted_by_depth")
         ]
+        evaluated_by_depth_delta = [
+            int(item) for item in self._delta(totals, "evaluated_by_depth")
+        ]
         accepted_by_depth_delta = [
             int(item) for item in self._delta(totals, "accepted_by_depth")
         ]
@@ -1039,20 +1045,24 @@ class _DecodeTrace:
             for item in self._delta(totals, "accept_probability_sum_by_depth")
         ]
         acceptance_rate_by_depth_delta = [
-            (float(accepted) / int(drafted) if drafted else None)
-            for accepted, drafted in zip(
-                accepted_by_depth_delta, drafted_by_depth_delta
+            (float(accepted) / int(evaluated) if evaluated else None)
+            for accepted, evaluated in zip(
+                accepted_by_depth_delta, evaluated_by_depth_delta
             )
         ]
         mean_accept_probability_by_depth_delta = [
-            (float(total) / int(drafted) if drafted else None)
-            for total, drafted in zip(
-                accept_probability_sum_delta, drafted_by_depth_delta
+            (float(total) / int(evaluated) if evaluated else None)
+            for total, evaluated in zip(
+                accept_probability_sum_delta, evaluated_by_depth_delta
             )
         ]
         verify_calls_delta = int(self._delta(totals, "verify_calls"))
         accepted_drafts_delta = int(self._delta(totals, "accepted_drafts"))
         drafted_tokens_delta = int(self._delta(totals, "drafted_tokens"))
+        evaluated_drafts_delta = int(self._delta(totals, "evaluated_drafts"))
+        fully_accepted_verify_calls_delta = int(
+            self._delta(totals, "fully_accepted_verify_calls")
+        )
         verify_time_delta = float(self._delta(totals, "verify_time_s"))
         verify_forward_time_delta = float(self._delta(totals, "verify_forward_time_s"))
         verify_eval_time_delta = float(self._delta(totals, "verify_eval_time_s"))
@@ -1156,6 +1166,12 @@ class _DecodeTrace:
             "accepted_drafts_delta": accepted_drafts_delta,
             "drafted_tokens_total": int(totals["drafted_tokens"]),
             "drafted_tokens_delta": drafted_tokens_delta,
+            "evaluated_drafts_total": int(totals["evaluated_drafts"]),
+            "evaluated_drafts_delta": evaluated_drafts_delta,
+            "fully_accepted_verify_calls_total": int(
+                totals["fully_accepted_verify_calls"]
+            ),
+            "fully_accepted_verify_calls_delta": fully_accepted_verify_calls_delta,
             "accepted_per_verify_delta": (
                 accepted_drafts_delta / verify_calls_delta
                 if verify_calls_delta
@@ -1174,6 +1190,10 @@ class _DecodeTrace:
                 int(item) for item in totals["drafted_by_depth"]
             ],
             "drafted_by_depth_delta": drafted_by_depth_delta,
+            "evaluated_by_depth_total": [
+                int(item) for item in totals["evaluated_by_depth"]
+            ],
+            "evaluated_by_depth_delta": evaluated_by_depth_delta,
             "acceptance_rate_by_depth_delta": acceptance_rate_by_depth_delta,
             "mean_accept_probability_by_depth_delta": mean_accept_probability_by_depth_delta,
             "rejected_drafts_delta": int(self._delta(totals, "rejected_drafts")),
@@ -1496,6 +1516,8 @@ class GenerationStats:
     accepted_drafts: int = 0
     rejected_drafts: int = 0
     drafted_tokens: int = 0
+    evaluated_drafts: int = 0
+    fully_accepted_verify_calls: int = 0
     verify_time_s: float = 0.0
     verify_forward_time_s: float = 0.0
     verify_eval_time_s: float = 0.0
@@ -1516,6 +1538,7 @@ class GenerationStats:
     prompt_tps: float = 0.0
     prompt_target_prefill_time_s: float = 0.0
     prompt_mtp_history_time_s: float = 0.0
+    prompt_mtp_history_tokens: int = 0
     prompt_target_prefill_tok_s: float = 0.0
     prompt_mtp_history_tok_s: float = 0.0
     cache_restore_time_s: float = 0.0
@@ -1538,6 +1561,7 @@ class GenerationStats:
     repair_time_s: float = 0.0
     commit_time_s: float = 0.0
     capture_commit_time_s: float = 0.0
+    final_state_capture_time_s: float = 0.0
     mtp_history_materialize_every: int = 0
     mtp_history_materialize_events: int = 0
     clear_cache_every: int = 0
@@ -1588,6 +1612,7 @@ class GenerationStats:
     long_context_mtp_depth_policy: dict[str, object] = field(default_factory=dict)
     accepted_by_depth: list[int] = field(default_factory=list)
     drafted_by_depth: list[int] = field(default_factory=list)
+    evaluated_by_depth: list[int] = field(default_factory=list)
     accept_probability_sum_by_depth: list[float] = field(default_factory=list)
     mean_accept_probability_by_depth: list[float | None] = field(default_factory=list)
     skipped_drafts: int = 0
@@ -1685,6 +1710,7 @@ class PromptState:
     token_prefix: tuple[int, ...]
     prompt_eval_time_s: float
     prompt_mtp_history_time_s: float = 0.0
+    prompt_mtp_history_tokens: int = 0
     cache_restore_time_s: float = 0.0
     mtp_history_policy: str = "cycle"
     mtp_history_window_tokens: int = 0
@@ -1807,7 +1833,7 @@ def _prefill_restored_prompt_suffix(
     cached_tokens: int = 0,
     chunk_started_s: float | None = None,
     gdn_boundary_sink: list[tuple[int, Any, Any]] | None = None,
-) -> tuple[Any, Any, float, float]:
+) -> tuple[Any, Any, float, float, int]:
     """Extend a restored SessionBank prefix without one giant suffix forward.
 
     The old warm-prefix path sent the entire suffix through `forward_ar` with
@@ -1823,6 +1849,7 @@ def _prefill_restored_prompt_suffix(
     _check_postcommit_abort(abort_check)
     target_forward_time = 0.0
     mtp_history_time = 0.0
+    mtp_history_tokens = 0
     final_logits_only = _final_logits_prefill_enabled()
     tokens_total = int(tokens_total if tokens_total is not None else len(suffix))
     cached_tokens = max(0, int(cached_tokens))
@@ -1872,7 +1899,7 @@ def _prefill_restored_prompt_suffix(
             pass
 
     def append_history(hidden_states: Any, token_ids: list[int]) -> None:
-        nonlocal mtp_history_time
+        nonlocal mtp_history_time, mtp_history_tokens
         if not use_committed_mtp or not token_ids:
             return
         mtp_history_time += _append_mtp_history(
@@ -1883,6 +1910,7 @@ def _prefill_restored_prompt_suffix(
             mtp_hidden_variant=mtp_hidden_variant,
             force_eval=True,
         )
+        mtp_history_tokens += len(token_ids)
         _check_postcommit_abort(abort_check)
 
     if use_committed_mtp and restored.hidden is not None:
@@ -1925,6 +1953,7 @@ def _prefill_restored_prompt_suffix(
             suffix_hidden[:, -1:, :],
             target_forward_time,
             mtp_history_time,
+            mtp_history_tokens,
         )
 
     capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
@@ -2024,6 +2053,7 @@ def _prefill_restored_prompt_suffix(
         suffix_hidden[:, -1:, :],
         target_forward_time,
         mtp_history_time,
+        mtp_history_tokens,
     )
 
 
@@ -2434,21 +2464,25 @@ def _restore_near_prefix_prompt_state(
         suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
             list(inherited_boundaries) if _gdn_boundary_capture_enabled() else None
         )
-        suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-            _prefill_restored_prompt_suffix(
-                rt,
-                restored,
-                suffix,
-                base_hidden_variant=base_hidden_variant,
-                mtp_hidden_variant=mtp_hidden_variant,
-                mtp_history_policy=mtp_history_policy,
-                abort_check=abort_check,
-                chunk_callback=chunk_callback,
-                tokens_total=len(prompt_ids),
-                cached_tokens=restore_point,
-                chunk_started_s=chunk_started_s,
-                gdn_boundary_sink=suffix_boundary_sink,
-            )
+        (
+            suffix_logits,
+            suffix_hidden,
+            suffix_time,
+            mtp_history_time,
+            mtp_history_tokens,
+        ) = _prefill_restored_prompt_suffix(
+            rt,
+            restored,
+            suffix,
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            abort_check=abort_check,
+            chunk_callback=chunk_callback,
+            tokens_total=len(prompt_ids),
+            cached_tokens=restore_point,
+            chunk_started_s=chunk_started_s,
+            gdn_boundary_sink=suffix_boundary_sink,
         )
         entry.hits += 1
         entry.last_access_s = time.time()
@@ -2460,6 +2494,7 @@ def _restore_near_prefix_prompt_state(
             token_prefix=tuple(int(token) for token in prompt_ids),
             prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
             prompt_mtp_history_time_s=mtp_history_time,
+            prompt_mtp_history_tokens=mtp_history_tokens,
             cache_restore_time_s=total_cache_restore_time_s,
             mtp_history_policy=mtp_history_policy,
             cached_tokens=restore_point,
@@ -2963,21 +2998,25 @@ def restore_or_prefill_prompt_state(
                 and _gdn_boundary_capture_enabled()
                 else None
             )
-            suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-                _prefill_restored_prompt_suffix(
-                    rt,
-                    restored,
-                    suffix,
-                    base_hidden_variant=base_hidden_variant,
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    mtp_history_policy=mtp_history_policy,
-                    abort_check=abort_check,
-                    chunk_callback=prefill_callback,
-                    tokens_total=len(prompt_ids),
-                    cached_tokens=restored.entry.prefix_len,
-                    chunk_started_s=prefill_started_s,
-                    gdn_boundary_sink=suffix_boundary_sink,
-                )
+            (
+                suffix_logits,
+                suffix_hidden,
+                suffix_time,
+                mtp_history_time,
+                mtp_history_tokens,
+            ) = _prefill_restored_prompt_suffix(
+                rt,
+                restored,
+                suffix,
+                base_hidden_variant=base_hidden_variant,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                abort_check=abort_check,
+                chunk_callback=prefill_callback,
+                tokens_total=len(prompt_ids),
+                cached_tokens=restored.entry.prefix_len,
+                chunk_started_s=prefill_started_s,
+                gdn_boundary_sink=suffix_boundary_sink,
             )
             return _emit_prefill_complete(
                 PromptState(
@@ -2988,6 +3027,7 @@ def restore_or_prefill_prompt_state(
                     token_prefix=tuple(int(token) for token in prompt_ids),
                     prompt_eval_time_s=suffix_time + mtp_history_time,
                     prompt_mtp_history_time_s=mtp_history_time,
+                    prompt_mtp_history_tokens=mtp_history_tokens,
                     cache_restore_time_s=restore_elapsed_s,
                     mtp_history_policy=mtp_history_policy,
                     mtp_history_window_tokens=mtp_history_window_tokens,
@@ -3008,7 +3048,6 @@ def restore_or_prefill_prompt_state(
                     ),
                 )
             )
-
         near_prompt_state = _restore_near_prefix_prompt_state(
             rt,
             prompt_ids,
@@ -3030,6 +3069,7 @@ def restore_or_prefill_prompt_state(
 
     mtp_history_cache = None
     prompt_history_time = 0.0
+    prompt_history_tokens = 0
     mtp_history_position_base = 1 if mtp_position_mode == "absolute" else 0
     # kvcache-v2: capture interior recurrent boundaries during the cold prefill
     # whenever the result will be banked — they are what make sub-prefix
@@ -3050,6 +3090,7 @@ def restore_or_prefill_prompt_state(
                 mtp_history_cache,
                 target_time,
                 prompt_history_time,
+                prompt_history_tokens,
                 mtp_history_position_base,
             ) = _prefill_committed_mtp_history_streaming(
                 rt,
@@ -3128,8 +3169,10 @@ def restore_or_prefill_prompt_state(
                         or mtp_history_policy == "last_window"
                         else None
                     ),
+                    force_eval=True,
                     input_embeddings=history_embeddings,
                 )
+                prompt_history_tokens = len(history_token_ids)
                 prompt_eval_time += prompt_history_time
     else:
         cache, logits, hidden, target_time = _prefill(
@@ -3151,6 +3194,7 @@ def restore_or_prefill_prompt_state(
             token_prefix=tuple(int(token) for token in prompt_ids),
             prompt_eval_time_s=prompt_eval_time,
             prompt_mtp_history_time_s=prompt_history_time,
+            prompt_mtp_history_tokens=prompt_history_tokens,
             mtp_history_policy=mtp_history_policy,
             mtp_history_window_tokens=mtp_history_window_tokens,
             mtp_history_position_base=mtp_history_position_base,
@@ -3630,6 +3674,7 @@ def _prefill_committed_mtp_history_streaming(
     mtp_history_cache = rt.make_mtp_cache()
     target_forward_time = 0.0
     prompt_history_time = 0.0
+    prompt_history_tokens = 0
     final_logits_only = _final_logits_prefill_enabled()
     capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
         cache
@@ -3792,6 +3837,7 @@ def _prefill_committed_mtp_history_streaming(
                     force_eval=True,
                     input_embeddings=history_embeddings,
                 )
+                prompt_history_tokens += len(sliced_token_ids)
                 _check_postcommit_abort(abort_check)
         cursor += chunk_len
         boundary_hidden = hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
@@ -3827,6 +3873,7 @@ def _prefill_committed_mtp_history_streaming(
         mtp_history_cache,
         target_forward_time,
         prompt_history_time,
+        prompt_history_tokens,
         mtp_history_position_base,
     )
 
@@ -3838,33 +3885,91 @@ def _prefill_with_hidden_sequence(
     hidden_variant: str,
     vision_splice: Any | None = None,
 ):
+    """Prefill once while retaining every target hidden row for MTP history.
+
+    Keep the target call shapes identical to ordinary AR prefill. A single
+    full-prompt BF16 call can leave a numerically different final cache row
+    from the canonical body-chunks-plus-final-token schedule, which makes a
+    later batched verifier condition on a different target state.
+    """
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
 
     cache = _make_target_prefill_cache(rt)
-    prompt_array = mx.array([prompt_ids])
-    prompt_embeddings = None
+    target_forward_time = 0.0
+    hidden_chunks: list[mx.array] = []
+    final_logits_only = _final_logits_prefill_enabled()
+
+    if len(prompt_ids) > 1:
+        body = prompt_ids[:-1]
+        body_array = mx.array([body])
+        for start, end in _iter_prefill_chunk_spans(len(body)):
+            chunk_array = body_array[:, start:end]
+            chunk_embeddings = None
+            if vision_splice is not None:
+                from mtplx.vision.splice import spliced_chunk_embeddings
+
+                chunk_embeddings = spliced_chunk_embeddings(
+                    rt.embed_tokens,
+                    chunk_array,
+                    vision_splice,
+                )
+            started = time.perf_counter()
+            with attention_phase("prefill"):
+                chunk_logits, chunk_hidden = rt.forward_ar(
+                    chunk_array,
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=hidden_variant,
+                    emit_logits=not final_logits_only,
+                    input_embeddings=chunk_embeddings,
+                )
+            if chunk_logits is None:
+                _eval(chunk_hidden)
+            else:
+                _eval(chunk_logits, chunk_hidden)
+            hidden_chunks.append(chunk_hidden)
+            target_forward_time += time.perf_counter() - started
+            _runtime_count(rt, "prefill_chunks")
+            target_forward_time += _prefill_chunk_cache_cleanup(rt)
+    final_array = mx.array([[prompt_ids[-1]]])
+    final_embeddings = None
     if vision_splice is not None:
         from mtplx.vision.splice import spliced_chunk_embeddings
 
-        prompt_embeddings = spliced_chunk_embeddings(
-            rt.embed_tokens, prompt_array, vision_splice
+        final_embeddings = spliced_chunk_embeddings(
+            rt.embed_tokens,
+            final_array,
+            vision_splice,
         )
+        if vision_splice.remaining() > 0:
+            raise ValueError(
+                "vision splice overflow: request supplied more vision rows "
+                f"({vision_splice.total_rows}) than image pad tokens in the prompt"
+            )
     started = time.perf_counter()
     with attention_phase("prefill"):
-        logits, hidden = rt.forward_ar(
-            prompt_array,
+        logits, final_hidden = rt.forward_ar(
+            final_array,
             cache=cache,
             return_hidden=True,
             hidden_variant=hidden_variant,
             emit_logits=True,
-            logits_keep=1 if _final_logits_prefill_enabled() else None,
-            input_embeddings=prompt_embeddings,
+            logits_keep=1 if final_logits_only else None,
+            input_embeddings=final_embeddings,
         )
-    _eval(logits, hidden)
-    target_forward_time = time.perf_counter() - started
+    _eval(logits, final_hidden)
+    target_forward_time += time.perf_counter() - started
+    hidden_chunks.append(final_hidden)
     target_forward_time += _maybe_repage_target_prefill_cache(cache)
-    return cache, logits[:, -1, :], hidden[:, -1:, :], hidden, target_forward_time
+    prompt_hidden = mx.concatenate(hidden_chunks, axis=1)
+    return (
+        cache,
+        logits[:, -1, :],
+        final_hidden[:, -1:, :],
+        prompt_hidden,
+        target_forward_time,
+    )
 
 
 def _mtp_cache_offset(mtp_cache) -> int:
@@ -3912,6 +4017,12 @@ def _rollback_mtp_cache(mtp_cache, offset: int) -> None:
     if not mtp_cache:
         return
     for cache in mtp_cache:
+        rollback_to = getattr(cache, "rollback_to", None)
+        if callable(rollback_to):
+            # Backend-owned cycle metadata may need committing even when the
+            # physical offset is already at the requested boundary.
+            rollback_to(offset)
+            continue
         current = int(getattr(cache, "offset", 0))
         trim = max(0, current - offset)
         if trim and hasattr(cache, "trim"):
@@ -3943,11 +4054,11 @@ def _reject_repair_breakdown(
 
 def _mean_accept_probability_by_depth(
     sums: list[float],
-    drafted: list[int],
+    evaluated: list[int],
 ) -> list[float | None]:
     return [
         (float(total) / int(count) if count else None)
-        for total, count in zip(sums, drafted)
+        for total, count in zip(sums, evaluated)
     ]
 
 
@@ -4111,6 +4222,8 @@ def generate_ar(
             "accepted_drafts": 0,
             "rejected_drafts": 0,
             "drafted_tokens": 0,
+            "evaluated_drafts": 0,
+            "fully_accepted_verify_calls": 0,
             "verify_calls": verify_calls,
             "correction_tokens": 0,
             "bonus_tokens": 0,
@@ -4152,6 +4265,7 @@ def generate_ar(
             "trace_accounting_time_s": 0.0,
             "accepted_by_depth": [],
             "drafted_by_depth": [],
+            "evaluated_by_depth": [],
             "accept_probability_sum_by_depth": [],
         }
 
@@ -4267,6 +4381,7 @@ def generate_ar(
         prompt_target_prefill_tok_s=(
             len(prompt_ids) / prompt_eval_time if prompt_eval_time > 0 else 0.0
         ),
+        new_prefill_tokens=len(prompt_ids),
         verify_time_s=target_decode_time,
         verify_forward_time_s=target_forward_graph_time,
         verify_eval_time_s=target_eval_time,
@@ -5119,6 +5234,20 @@ def generate_mtpk(
         raise ValueError("min_speculative_depth cannot exceed speculative_depth")
     if mtp_cache_policy not in {"persistent", "fresh"}:
         raise ValueError("mtp_cache_policy must be 'persistent' or 'fresh'")
+    if (
+        speculative_depth > 1
+        and mtp_cache_policy == "fresh"
+        and bool(
+            getattr(
+                rt.model,
+                "mtp_recurrent_requires_persistent_cache",
+                False,
+            )
+        )
+    ):
+        raise ValueError(
+            "this MTP backend requires a persistent cache for recurrent depths"
+        )
     mtp_history_policy = _normalize_mtp_history_policy(mtp_history_policy)
     if online_hidden_corrector_alpha < 0:
         raise ValueError("online_hidden_corrector_alpha must be >= 0")
@@ -5342,10 +5471,12 @@ def generate_mtpk(
     events: list[dict] = []
     record_events = not _env_truthy("MTPLX_DROP_EVENTS")
     append_event = events.append if record_events else (lambda _event: None)
-    accepted = rejected = drafted = 0
+    accepted = rejected = drafted = evaluated = 0
     bonus_tokens = correction_tokens = verify_calls = 0
+    fully_accepted_verify_calls = 0
     accepted_by_depth = [0 for _ in range(speculative_depth)]
     drafted_by_depth = [0 for _ in range(speculative_depth)]
+    evaluated_by_depth = [0 for _ in range(speculative_depth)]
     accept_probability_sum_by_depth = [0.0 for _ in range(speculative_depth)]
     deferred_correction_repairs = 0
     pending_primary: int | None = None
@@ -5900,6 +6031,8 @@ def generate_mtpk(
             "accepted_drafts": accepted,
             "rejected_drafts": rejected,
             "drafted_tokens": drafted,
+            "evaluated_drafts": evaluated,
+            "fully_accepted_verify_calls": fully_accepted_verify_calls,
             "verify_calls": verify_calls,
             "correction_tokens": correction_tokens,
             "bonus_tokens": bonus_tokens,
@@ -5949,6 +6082,7 @@ def generate_mtpk(
             "trace_accounting_time_s": trace_accounting_time_s,
             "accepted_by_depth": list(accepted_by_depth),
             "drafted_by_depth": list(drafted_by_depth),
+            "evaluated_by_depth": list(evaluated_by_depth),
             "accept_probability_sum_by_depth": list(accept_probability_sum_by_depth),
         }
 
@@ -6096,6 +6230,12 @@ def generate_mtpk(
             event["mtp_topk_reranker"] = mtp_topk_reranker.to_dict()
         step += 1
         if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
+            # The primary has been emitted but has not yet been consumed by
+            # either the target cache or committed MTP history.  Preserve it
+            # for the final-state synchronization path before advertising the
+            # captured state as safe for a resumed request.
+            pending_primary = primary
+            event["pending_primary"] = int(primary)
             append_event(event)
             emit_trace()
             break
@@ -6202,175 +6342,190 @@ def generate_mtpk(
                     "requested": "device-d2",
                     "reason": "ineligible_contract",
                 }
-        for depth_index in range(0 if used_device_d2_core else cycle_depth):
-            source_token = int(next_token)
-            step_mtp_cache = (
-                mtp_cache if mtp_cache_policy == "persistent" else rt.make_mtp_cache()
-            )
-            draft_position_offset = mtp_position_offset_for_cache(step_mtp_cache)
-            started = time.perf_counter()
-            cache_depth = depth_index + 1
-            ensemble_info: dict[str, Any] | None = None
-            ensemble_base_logits = None
-            ensemble_adapter_logits = None
-            ensemble_base_hidden = None
-            ensemble_adapter_hidden = None
-            ensemble_eligible = (
-                adapter_ensemble_q
-                and rt.mtp_adapter_path is not None
-                and sampler.temperature > 0
-                and draft_sampler.temperature <= 0
-                and cache_depth >= adapter_ensemble_min_depth
-                and cache_depth == cycle_depth
-                and mtp_cache_policy == "persistent"
-                and mtp_history_policy == "cycle"
-                and step_mtp_cache is not None
-            )
-            if ensemble_eligible:
-                cache_offset = _mtp_cache_offset(step_mtp_cache)
-                base_result = rt.draft_mtp(
-                    draft_hidden,
-                    mx.array([[next_token]]),
-                    mtp_cache=step_mtp_cache,
-                    return_hidden=True,
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    mtp_depth=0,
-                    position_offset=draft_position_offset,
+        step_mtp_cache = None
+        try:
+            for depth_index in range(0 if used_device_d2_core else cycle_depth):
+                source_token = int(next_token)
+                step_mtp_cache = (
+                    mtp_cache
+                    if mtp_cache_policy == "persistent"
+                    else rt.make_mtp_cache()
                 )
-                ensemble_base_logits, ensemble_base_hidden = base_result
-                _eval(ensemble_base_logits, ensemble_base_hidden)
-                _rollback_mtp_cache(step_mtp_cache, cache_offset)
-                adapter_result = rt.draft_mtp(
-                    draft_hidden,
-                    mx.array([[next_token]]),
-                    mtp_cache=step_mtp_cache,
-                    return_hidden=True,
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    mtp_depth=cache_depth,
-                    position_offset=draft_position_offset,
-                )
-                ensemble_adapter_logits, ensemble_adapter_hidden = adapter_result
-                draft_logits, draft_hidden_next = adapter_result
-            else:
-                if adapter_ensemble_q and cache_depth >= adapter_ensemble_min_depth:
-                    adapter_ensemble_fallbacks += 1
-                draft_result = rt.draft_mtp(
-                    draft_hidden,
-                    mx.array([[next_token]]),
-                    mtp_cache=step_mtp_cache,
-                    return_hidden=True,
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    mtp_depth=cache_depth,
-                    position_offset=draft_position_offset,
-                )
-                draft_logits, draft_hidden_next = draft_result
-            wants_policy_metrics = bool(
-                getattr(adaptive_policy, "wants_draft_metrics", False)
-            )
-            draft_metrics = (
-                _draft_confidence_metrics(draft_logits[:, -1, :][0])
-                if draft_margin_threshold is not None or wants_policy_metrics
-                else {}
-            )
-            margin = draft_metrics.get("top2_margin")
-            if (
-                draft_margin_threshold is not None
-                and margin is not None
-                and margin < draft_margin_threshold
-                and depth_index >= min_speculative_depth
-            ):
-                event["gated_stop_depth"] = depth_index + 1
-                event["drafts"].append(
-                    {
-                        "depth": depth_index + 1,
-                        "top2_margin": margin,
-                        "speculation_skipped": True,
-                    }
-                )
-                draft_time += time.perf_counter() - started
-                break
-            cache_key = _online_correction_cache_key(
-                online_correction_cache_key,
-                depth=cache_depth,
-                primary=int(primary),
-                source_token=source_token,
-                draft_prefix=draft_tokens,
-            )
-            cache_enabled_for_depth = correction_cache_enabled and (
-                (
-                    online_correction_cache
-                    and cache_depth >= online_correction_cache_min_depth
-                )
-                or (
-                    prompt_correction_cache
-                    and cache_depth >= prompt_correction_cache_min_depth
-                )
-            )
-            reranker_info = None
-            cached_token = (
-                correction_cache.get(cache_key) if cache_enabled_for_depth else None
-            )
-            if cached_token is not None:
-                draft_token = int(cached_token)
-                draft_q = (
-                    SparseDistribution.one_hot(draft_token, int(draft_logits.shape[-1]))
-                    if sampler.temperature > 0
-                    else None
-                )
-                correction_cache_hits += 1
-                if cache_key in prompt_seeded_cache_keys:
-                    prompt_correction_cache_hits += 1
-            elif (
-                ensemble_eligible
-                and ensemble_base_logits is not None
-                and ensemble_adapter_logits is not None
-            ):
-                draft_token, draft_q, ensemble_info = _sample_adapter_ensemble_q(
-                    ensemble_base_logits[:, -1, :][0],
-                    ensemble_adapter_logits[:, -1, :][0],
-                    epsilon=adapter_ensemble_epsilon,
-                    rng=rng,
-                )
-                adapter_ensemble_calls += 1
-                if bool(ensemble_info["changed"]):
-                    adapter_ensemble_changed += 1
-                selected = str(ensemble_info["selected"])
-                if selected == "adapter":
-                    adapter_ensemble_adapter_selected += 1
-                    draft_hidden_next = ensemble_adapter_hidden
-                    draft_logits = ensemble_adapter_logits
-                elif selected == "base":
-                    adapter_ensemble_base_selected += 1
-                    draft_hidden_next = ensemble_base_hidden
-                    draft_logits = ensemble_base_logits
-                else:
-                    adapter_ensemble_shared_selected += 1
-                    draft_hidden_next = ensemble_adapter_hidden
-                    draft_logits = ensemble_adapter_logits
-            else:
-                if (
-                    mtp_topk_reranker is not None
+                draft_position_offset = mtp_position_offset_for_cache(step_mtp_cache)
+                started = time.perf_counter()
+                cache_depth = depth_index + 1
+                ensemble_info: dict[str, Any] | None = None
+                ensemble_base_logits = None
+                ensemble_adapter_logits = None
+                ensemble_base_hidden = None
+                ensemble_adapter_hidden = None
+                ensemble_eligible = (
+                    adapter_ensemble_q
+                    and rt.mtp_adapter_path is not None
                     and sampler.temperature > 0
-                    and cache_depth in mtp_topk_reranker.depth_priors
-                ):
-                    reranked = mtp_topk_reranker.select(
-                        draft_logits[:, -1, :][0],
-                        depth=cache_depth,
+                    and draft_sampler.temperature <= 0
+                    and cache_depth >= adapter_ensemble_min_depth
+                    and cache_depth == cycle_depth
+                    and mtp_cache_policy == "persistent"
+                    and mtp_history_policy == "cycle"
+                    and step_mtp_cache is not None
+                )
+                if ensemble_eligible:
+                    cache_offset = _mtp_cache_offset(step_mtp_cache)
+                    base_result = rt.draft_mtp(
+                        draft_hidden,
+                        mx.array([[next_token]]),
+                        mtp_cache=step_mtp_cache,
+                        return_hidden=True,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        mtp_depth=0,
+                        position_offset=draft_position_offset,
                     )
-                    if reranked is not None:
-                        draft_token, reranker_info = reranked
-                        draft_q = SparseDistribution.one_hot(
-                            draft_token,
-                            int(draft_logits.shape[-1]),
+                    ensemble_base_logits, ensemble_base_hidden = base_result
+                    _eval(ensemble_base_logits, ensemble_base_hidden)
+                    _rollback_mtp_cache(step_mtp_cache, cache_offset)
+                    adapter_result = rt.draft_mtp(
+                        draft_hidden,
+                        mx.array([[next_token]]),
+                        mtp_cache=step_mtp_cache,
+                        return_hidden=True,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        mtp_depth=cache_depth,
+                        position_offset=draft_position_offset,
+                    )
+                    ensemble_adapter_logits, ensemble_adapter_hidden = adapter_result
+                    draft_logits, draft_hidden_next = adapter_result
+                else:
+                    if adapter_ensemble_q and cache_depth >= adapter_ensemble_min_depth:
+                        adapter_ensemble_fallbacks += 1
+                    draft_result = rt.draft_mtp(
+                        draft_hidden,
+                        mx.array([[next_token]]),
+                        mtp_cache=step_mtp_cache,
+                        return_hidden=True,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        mtp_depth=cache_depth,
+                        position_offset=draft_position_offset,
+                    )
+                    draft_logits, draft_hidden_next = draft_result
+                wants_policy_metrics = bool(
+                    getattr(adaptive_policy, "wants_draft_metrics", False)
+                )
+                draft_metrics = (
+                    _draft_confidence_metrics(draft_logits[:, -1, :][0])
+                    if draft_margin_threshold is not None or wants_policy_metrics
+                    else {}
+                )
+                margin = draft_metrics.get("top2_margin")
+                if (
+                    draft_margin_threshold is not None
+                    and margin is not None
+                    and margin < draft_margin_threshold
+                    and depth_index >= min_speculative_depth
+                ):
+                    event["gated_stop_depth"] = depth_index + 1
+                    event["drafts"].append(
+                        {
+                            "depth": depth_index + 1,
+                            "top2_margin": margin,
+                            "speculation_skipped": True,
+                        }
+                    )
+                    draft_time += time.perf_counter() - started
+                    break
+                cache_key = _online_correction_cache_key(
+                    online_correction_cache_key,
+                    depth=cache_depth,
+                    primary=int(primary),
+                    source_token=source_token,
+                    draft_prefix=draft_tokens,
+                )
+                cache_enabled_for_depth = correction_cache_enabled and (
+                    (
+                        online_correction_cache
+                        and cache_depth >= online_correction_cache_min_depth
+                    )
+                    or (
+                        prompt_correction_cache
+                        and cache_depth >= prompt_correction_cache_min_depth
+                    )
+                )
+                reranker_info = None
+                cached_token = (
+                    correction_cache.get(cache_key) if cache_enabled_for_depth else None
+                )
+                if cached_token is not None:
+                    draft_token = int(cached_token)
+                    draft_q = (
+                        SparseDistribution.one_hot(
+                            draft_token, int(draft_logits.shape[-1])
                         )
-                        topk_reranker_calls += 1
-                        if bool(reranker_info["changed"]):
-                            topk_reranker_changed += 1
-                        topk_reranker_selected_rank_sum += int(
-                            reranker_info["selected_rank"]
-                        )
+                        if sampler.temperature > 0
+                        else None
+                    )
+                    correction_cache_hits += 1
+                    if cache_key in prompt_seeded_cache_keys:
+                        prompt_correction_cache_hits += 1
+                elif (
+                    ensemble_eligible
+                    and ensemble_base_logits is not None
+                    and ensemble_adapter_logits is not None
+                ):
+                    draft_token, draft_q, ensemble_info = _sample_adapter_ensemble_q(
+                        ensemble_base_logits[:, -1, :][0],
+                        ensemble_adapter_logits[:, -1, :][0],
+                        epsilon=adapter_ensemble_epsilon,
+                        rng=rng,
+                    )
+                    adapter_ensemble_calls += 1
+                    if bool(ensemble_info["changed"]):
+                        adapter_ensemble_changed += 1
+                    selected = str(ensemble_info["selected"])
+                    if selected == "adapter":
+                        adapter_ensemble_adapter_selected += 1
+                        draft_hidden_next = ensemble_adapter_hidden
+                        draft_logits = ensemble_adapter_logits
+                    elif selected == "base":
+                        adapter_ensemble_base_selected += 1
+                        draft_hidden_next = ensemble_base_hidden
+                        draft_logits = ensemble_base_logits
                     else:
-                        topk_reranker_fallbacks += 1
+                        adapter_ensemble_shared_selected += 1
+                        draft_hidden_next = ensemble_adapter_hidden
+                        draft_logits = ensemble_adapter_logits
+                else:
+                    if (
+                        mtp_topk_reranker is not None
+                        and sampler.temperature > 0
+                        and cache_depth in mtp_topk_reranker.depth_priors
+                    ):
+                        reranked = mtp_topk_reranker.select(
+                            draft_logits[:, -1, :][0],
+                            depth=cache_depth,
+                        )
+                        if reranked is not None:
+                            draft_token, reranker_info = reranked
+                            draft_q = SparseDistribution.one_hot(
+                                draft_token,
+                                int(draft_logits.shape[-1]),
+                            )
+                            topk_reranker_calls += 1
+                            if bool(reranker_info["changed"]):
+                                topk_reranker_changed += 1
+                            topk_reranker_selected_rank_sum += int(
+                                reranker_info["selected_rank"]
+                            )
+                        else:
+                            topk_reranker_fallbacks += 1
+                            draft_token, draft_q = _sample_draft_from_logits(
+                                draft_logits[:, -1, :][0],
+                                draft_sampler,
+                                rng,
+                                need_distribution=(
+                                    sampler.temperature > 0 and not target_prefix_verify
+                                ),
+                            )
+                    else:
                         draft_token, draft_q = _sample_draft_from_logits(
                             draft_logits[:, -1, :][0],
                             draft_sampler,
@@ -6379,136 +6534,133 @@ def generate_mtpk(
                                 sampler.temperature > 0 and not target_prefix_verify
                             ),
                         )
-                else:
-                    draft_token, draft_q = _sample_draft_from_logits(
-                        draft_logits[:, -1, :][0],
-                        draft_sampler,
-                        rng,
-                        need_distribution=(
-                            sampler.temperature > 0 and not target_prefix_verify
-                        ),
+                elapsed_draft = time.perf_counter() - started
+                draft_time += elapsed_draft
+                if trace.enabled:
+                    trace_accounting_started = time.perf_counter()
+                    trace_draft_output_nbytes += _tree_nbytes(
+                        draft_logits
+                    ) + _tree_nbytes(draft_hidden_next)
+                    if (
+                        ensemble_base_logits is not None
+                        and ensemble_base_logits is not draft_logits
+                    ):
+                        trace_draft_output_nbytes += _tree_nbytes(ensemble_base_logits)
+                    if (
+                        ensemble_base_hidden is not None
+                        and ensemble_base_hidden is not draft_hidden_next
+                    ):
+                        trace_draft_output_nbytes += _tree_nbytes(ensemble_base_hidden)
+                    trace_accounting_time_s += (
+                        time.perf_counter() - trace_accounting_started
                     )
-            elapsed_draft = time.perf_counter() - started
-            draft_time += elapsed_draft
-            if trace.enabled:
-                trace_accounting_started = time.perf_counter()
-                trace_draft_output_nbytes += _tree_nbytes(draft_logits) + _tree_nbytes(
-                    draft_hidden_next
+                draft_tokens.append(draft_token)
+                draft_probs.append(draft_q)
+                draft_cache_keys.append(cache_key)
+                draft_hidden_base = draft_hidden_next[:, -1:, :]
+                if mtp_corrector is not None:
+                    draft_hidden_base = mtp_corrector.apply_mlx(
+                        draft_hidden_base,
+                        depth=depth_index + 1,
+                    )
+                feed_depth = depth_index + 1
+                draft_hidden_for_update.append(draft_hidden_base)
+                online_key: object = (
+                    (feed_depth, source_token)
+                    if online_hidden_corrector_key == "token"
+                    else feed_depth
                 )
+                draft_hidden_update_keys.append(online_key)
+                draft_hidden = draft_hidden_base
+                online_draft_event: dict[str, object] | None = None
                 if (
-                    ensemble_base_logits is not None
-                    and ensemble_base_logits is not draft_logits
+                    online_hidden_enabled
+                    and feed_depth <= online_hidden_max_feed_depth
+                    and feed_depth < cycle_depth
                 ):
-                    trace_draft_output_nbytes += _tree_nbytes(ensemble_base_logits)
-                if (
-                    ensemble_base_hidden is not None
-                    and ensemble_base_hidden is not draft_hidden_next
-                ):
-                    trace_draft_output_nbytes += _tree_nbytes(ensemble_base_hidden)
-                trace_accounting_time_s += (
-                    time.perf_counter() - trace_accounting_started
-                )
-            draft_tokens.append(draft_token)
-            draft_probs.append(draft_q)
-            draft_cache_keys.append(cache_key)
-            draft_hidden_base = draft_hidden_next[:, -1:, :]
-            if mtp_corrector is not None:
-                draft_hidden_base = mtp_corrector.apply_mlx(
-                    draft_hidden_base,
-                    depth=depth_index + 1,
-                )
-            feed_depth = depth_index + 1
-            draft_hidden_for_update.append(draft_hidden_base)
-            online_key: object = (
-                (feed_depth, source_token)
-                if online_hidden_corrector_key == "token"
-                else feed_depth
-            )
-            draft_hidden_update_keys.append(online_key)
-            draft_hidden = draft_hidden_base
-            online_draft_event: dict[str, object] | None = None
-            if (
-                online_hidden_enabled
-                and feed_depth <= online_hidden_max_feed_depth
-                and feed_depth < cycle_depth
-            ):
-                started_online = time.perf_counter()
-                update_count = online_hidden_update_counts.get(online_key, 0)
-                delta = online_hidden_deltas.get(online_key)
-                if delta is not None and update_count >= online_hidden_corrector_warmup:
-                    draft_hidden = draft_hidden + (
-                        float(online_hidden_corrector_alpha)
-                        * delta.astype(draft_hidden.dtype)
-                    )
-                    online_hidden_apply_counts[online_key] = (
-                        online_hidden_apply_counts.get(online_key, 0) + 1
-                    )
-                    online_draft_event = {
-                        "feed_depth": feed_depth,
-                        "key": online_hidden_corrector_key,
-                        "source_token": source_token
-                        if online_hidden_corrector_key == "token"
-                        else None,
-                        "applied": True,
-                        "updates": update_count,
-                        "apply_count": online_hidden_apply_counts[online_key],
-                    }
-                else:
-                    online_draft_event = {
-                        "feed_depth": feed_depth,
-                        "key": online_hidden_corrector_key,
-                        "source_token": source_token
-                        if online_hidden_corrector_key == "token"
-                        else None,
-                        "applied": False,
-                        "updates": update_count,
-                    }
-                online_hidden_corrector_time += time.perf_counter() - started_online
-            next_token = draft_token
-            drafted += 1
-            drafted_by_depth[depth_index] += 1
-            draft_event = {
-                "depth": depth_index + 1,
-                "token": draft_token,
-                "timing_s": {"draft": elapsed_draft},
-                "mtp_corrector": getattr(mtp_corrector, "kind", None)
-                if mtp_corrector is not None
-                else None,
-                **draft_metrics,
-            }
-            if draft_position_offset is not None:
-                draft_event["position_offset"] = int(draft_position_offset)
-            if correction_cache_enabled:
-                draft_event["online_correction_cache"] = {
-                    "hit": cached_token is not None,
-                    "enabled_for_depth": cache_enabled_for_depth,
-                    "key_policy": online_correction_cache_key,
-                    "key": list(cache_key),
-                    "cached_token": int(cached_token)
-                    if cached_token is not None
+                    started_online = time.perf_counter()
+                    update_count = online_hidden_update_counts.get(online_key, 0)
+                    delta = online_hidden_deltas.get(online_key)
+                    if (
+                        delta is not None
+                        and update_count >= online_hidden_corrector_warmup
+                    ):
+                        draft_hidden = draft_hidden + (
+                            float(online_hidden_corrector_alpha)
+                            * delta.astype(draft_hidden.dtype)
+                        )
+                        online_hidden_apply_counts[online_key] = (
+                            online_hidden_apply_counts.get(online_key, 0) + 1
+                        )
+                        online_draft_event = {
+                            "feed_depth": feed_depth,
+                            "key": online_hidden_corrector_key,
+                            "source_token": source_token
+                            if online_hidden_corrector_key == "token"
+                            else None,
+                            "applied": True,
+                            "updates": update_count,
+                            "apply_count": online_hidden_apply_counts[online_key],
+                        }
+                    else:
+                        online_draft_event = {
+                            "feed_depth": feed_depth,
+                            "key": online_hidden_corrector_key,
+                            "source_token": source_token
+                            if online_hidden_corrector_key == "token"
+                            else None,
+                            "applied": False,
+                            "updates": update_count,
+                        }
+                    online_hidden_corrector_time += time.perf_counter() - started_online
+                next_token = draft_token
+                drafted += 1
+                drafted_by_depth[depth_index] += 1
+                draft_event = {
+                    "depth": depth_index + 1,
+                    "token": draft_token,
+                    "timing_s": {"draft": elapsed_draft},
+                    "mtp_corrector": getattr(mtp_corrector, "kind", None)
+                    if mtp_corrector is not None
                     else None,
-                    "prompt_seeded": cache_key in prompt_seeded_cache_keys,
+                    **draft_metrics,
                 }
-            if ensemble_info is not None:
-                draft_event["adapter_ensemble_q"] = ensemble_info
-            if reranker_info is not None:
-                draft_event["mtp_topk_reranker"] = reranker_info
-            if online_draft_event is not None:
-                draft_event["online_hidden_corrector"] = online_draft_event
-            event["drafts"].append(draft_event)
-            if adaptive_policy is not None and hasattr(
-                adaptive_policy, "should_continue_after_draft"
-            ):
-                policy_continue = adaptive_policy.should_continue_after_draft(
-                    drafted_depth=depth_index + 1,
-                    max_depth=cycle_depth,
-                    draft_metrics=event["drafts"][-1],
-                )
-                event["drafts"][-1]["policy_continue"] = policy_continue
-                if not bool(policy_continue.get("continue", True)):
-                    event["gated_stop_depth"] = depth_index + 1
-                    event["policy_stop"] = policy_continue
-                    break
+                if draft_position_offset is not None:
+                    draft_event["position_offset"] = int(draft_position_offset)
+                if correction_cache_enabled:
+                    draft_event["online_correction_cache"] = {
+                        "hit": cached_token is not None,
+                        "enabled_for_depth": cache_enabled_for_depth,
+                        "key_policy": online_correction_cache_key,
+                        "key": list(cache_key),
+                        "cached_token": int(cached_token)
+                        if cached_token is not None
+                        else None,
+                        "prompt_seeded": cache_key in prompt_seeded_cache_keys,
+                    }
+                if ensemble_info is not None:
+                    draft_event["adapter_ensemble_q"] = ensemble_info
+                if reranker_info is not None:
+                    draft_event["mtp_topk_reranker"] = reranker_info
+                if online_draft_event is not None:
+                    draft_event["online_hidden_corrector"] = online_draft_event
+                event["drafts"].append(draft_event)
+                if adaptive_policy is not None and hasattr(
+                    adaptive_policy, "should_continue_after_draft"
+                ):
+                    policy_continue = adaptive_policy.should_continue_after_draft(
+                        drafted_depth=depth_index + 1,
+                        max_depth=cycle_depth,
+                        draft_metrics=event["drafts"][-1],
+                    )
+                    event["drafts"][-1]["policy_continue"] = policy_continue
+                    if not bool(policy_continue.get("continue", True)):
+                        event["gated_stop_depth"] = depth_index + 1
+                        event["policy_stop"] = policy_continue
+                        break
+
+        finally:
+            rt.finish_mtp_cycle(step_mtp_cache)
 
         before_verify = None
         if _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
@@ -6843,6 +6995,7 @@ def generate_mtpk(
             # the target_prefix pre-sample above already carried the overlay
             # (and its lane has no draft distributions to fall back on).
             target_distribution_batch = None
+        evaluated_this_call = 0
         for depth_index, draft_token in enumerate(draft_tokens):
             target_logits_for_draft = verify_logits[:, depth_index, :]
             if _guard_armed:
@@ -6859,6 +7012,9 @@ def generate_mtpk(
                 _working_counts: Counter[int] = Counter(tokens)
                 _working_counts.update(draft_tokens[:depth_index])
             target_p_for_cache = None
+            evaluated += 1
+            evaluated_this_call += 1
+            evaluated_by_depth[depth_index] += 1
             if sampler.temperature <= 0:
                 _greedy_row = target_logits_for_draft[0]
                 if _penalties_active or _row_guard_overlay:
@@ -6993,9 +7149,14 @@ def generate_mtpk(
                 event["drafts"][depth_index]["online_correction_cache"][
                     "stored_token"
                 ] = cached_target
-            if sampler.temperature > 0:
-                rejection_correction = int(correction)
+            rejection_correction = int(correction)
             break
+        if (
+            draft_tokens
+            and evaluated_this_call == len(draft_tokens)
+            and accepted_count == len(draft_tokens)
+        ):
+            fully_accepted_verify_calls += 1
         elapsed_accept = max(
             0.0,
             time.perf_counter() - started_accept - lazy_target_distribution_time,
@@ -7424,12 +7585,14 @@ def generate_mtpk(
         emit_trace()
 
     final_state: GenerationFinalState | None = None
+    final_state_capture_time = 0.0
     if (
         capture_final_state
         and pending_primary is not None
         and tokens
         and repetition_result is None
     ):
+        final_state_capture_started = time.perf_counter()
         pending_token = int(pending_primary)
         if (
             _mtp_history_uses_committed_cache(mtp_history_policy)
@@ -7464,6 +7627,7 @@ def generate_mtpk(
         maybe_detach_dirty_state(len(tokens))
         maybe_rebase_decode_state(len(tokens))
         maybe_eval_state_roots({"final_pending_commit": True}, len(tokens))
+        final_state_capture_time = time.perf_counter() - final_state_capture_started
 
     emit_trace(force=True, final=True)
     elapsed = time.perf_counter() - started_all
@@ -7515,6 +7679,8 @@ def generate_mtpk(
         accepted_drafts=accepted,
         rejected_drafts=rejected,
         drafted_tokens=drafted,
+        evaluated_drafts=evaluated,
+        fully_accepted_verify_calls=fully_accepted_verify_calls,
         verify_time_s=verify_time,
         verify_forward_time_s=verify_forward_time,
         verify_eval_time_s=verify_eval_time,
@@ -7541,6 +7707,7 @@ def generate_mtpk(
         ),
         prompt_target_prefill_time_s=prompt_target_prefill_time,
         prompt_mtp_history_time_s=prompt_state.prompt_mtp_history_time_s,
+        prompt_mtp_history_tokens=prompt_state.prompt_mtp_history_tokens,
         cache_restore_time_s=prompt_state.cache_restore_time_s,
         prompt_target_prefill_tok_s=(
             prompt_state.suffix_tokens / prompt_target_prefill_time
@@ -7548,7 +7715,8 @@ def generate_mtpk(
             else 0.0
         ),
         prompt_mtp_history_tok_s=(
-            prompt_state.suffix_tokens / prompt_state.prompt_mtp_history_time_s
+            prompt_state.prompt_mtp_history_tokens
+            / prompt_state.prompt_mtp_history_time_s
             if prompt_state.prompt_mtp_history_time_s > 0
             else 0.0
         ),
@@ -7574,6 +7742,7 @@ def generate_mtpk(
         repair_time_s=repair_time,
         commit_time_s=commit_time,
         capture_commit_time_s=capture_commit_time,
+        final_state_capture_time_s=final_state_capture_time,
         mtp_history_materialize_every=mtp_history_materialize_every,
         mtp_history_materialize_events=mtp_history_materialize_events,
         clear_cache_every=clear_cache_every,
@@ -7624,10 +7793,11 @@ def generate_mtpk(
         long_context_mtp_depth_policy=long_context_depth_policy,
         accepted_by_depth=accepted_by_depth,
         drafted_by_depth=drafted_by_depth,
+        evaluated_by_depth=evaluated_by_depth,
         accept_probability_sum_by_depth=accept_probability_sum_by_depth,
         mean_accept_probability_by_depth=_mean_accept_probability_by_depth(
             accept_probability_sum_by_depth,
-            drafted_by_depth,
+            evaluated_by_depth,
         ),
         bonus_tokens=bonus_tokens,
         correction_tokens=correction_tokens,

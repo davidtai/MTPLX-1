@@ -37,7 +37,7 @@ def add_expert_streaming_args(
         "--expert-streaming",
         action="store_true",
         help=(
-            "Load only resident weights and stream routed Q4 experts from SSD. "
+            "Load only resident weights and stream routed quantized experts from SSD. "
             "This selects target-only AR for the pinned Hy3/GLM artifacts."
         ),
     )
@@ -61,7 +61,13 @@ def add_expert_streaming_args(
     )
     group.add_argument(
         "--expert-model-key",
-        choices=["hy3-q4", "glm52-q4"],
+        choices=[
+            "hy3-q4",
+            "glm52-q4",
+            "hy3-expert-only-q4",
+            "hy3-expert-q2",
+            "glm52-expert-q2",
+        ],
         help="Pinned streamed model descriptor; inferred from config.json by default.",
     )
     group.add_argument(
