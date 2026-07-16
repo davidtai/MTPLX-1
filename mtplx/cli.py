@@ -762,6 +762,12 @@ def cmd_settings_public(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_settings(args: argparse.Namespace) -> int:
+    from .commands.settings import cmd_settings as handler
+
+    return handler(args)
+
+
 def cmd_hardware_public(args: argparse.Namespace) -> int:
     from .hardware import inspect_hardware
 
@@ -2046,24 +2052,107 @@ def build_parser() -> argparse.ArgumentParser:
 
     settings_p = sub.add_parser(
         "settings",
-        help="Read or change live MTPLX server settings",
-    )
-    settings_p.add_argument(
-        "settings_action",
-        nargs="?",
-        choices=["get", "set"],
-        default="get",
-        help="get prints current settings; set applies key=value pairs.",
-    )
-    settings_p.add_argument(
-        "pairs",
-        nargs="*",
-        help="key=value pairs for set, e.g. depth=2 reasoning=off",
+        help="Inspect and change MTPLX settings",
     )
     settings_p.add_argument("--host", default="127.0.0.1")
     settings_p.add_argument("--port", type=int, default=8000)
     settings_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    settings_p.set_defaults(func=cmd_settings_public)
+    settings_p.set_defaults(
+        func=cmd_settings_public,
+        settings_action="get",
+        pairs=[],
+    )
+    settings_sub = settings_p.add_subparsers(dest="settings_command")
+
+    settings_show_p = settings_sub.add_parser(
+        "show", help="Show effective settings and their winning sources"
+    )
+    settings_show_p.add_argument("--config")
+    settings_show_p.add_argument("--json", action="store_true")
+    settings_show_p.set_defaults(
+        func=cmd_settings,
+        settings_scope="effective",
+        settings_operation="show",
+    )
+
+    settings_list_p = settings_sub.add_parser(
+        "list", help="List canonical settings and metadata"
+    )
+    settings_list_p.add_argument("--group", dest="settings_group")
+    settings_list_p.add_argument(
+        "--visibility",
+        choices=["public", "advanced", "experimental", "internal"],
+    )
+    settings_list_p.add_argument("--json", action="store_true")
+    settings_list_p.set_defaults(
+        func=cmd_settings,
+        settings_scope="catalog",
+        settings_operation="list",
+    )
+
+    settings_explain_p = settings_sub.add_parser(
+        "explain", help="Explain one effective setting and its provenance"
+    )
+    settings_explain_p.add_argument("name")
+    settings_explain_p.add_argument("--config")
+    settings_explain_p.add_argument("--json", action="store_true")
+    settings_explain_p.set_defaults(
+        func=cmd_settings,
+        settings_scope="effective",
+        settings_operation="explain",
+    )
+
+    settings_user_p = settings_sub.add_parser(
+        "user", help="Read or change persisted user settings"
+    )
+    settings_user_sub = settings_user_p.add_subparsers(
+        dest="settings_operation", required=True
+    )
+    settings_user_show_p = settings_user_sub.add_parser("show")
+    settings_user_show_p.add_argument("--config")
+    settings_user_show_p.add_argument("--json", action="store_true")
+    settings_user_show_p.set_defaults(func=cmd_settings, settings_scope="user")
+    settings_user_set_p = settings_user_sub.add_parser("set")
+    settings_user_set_p.add_argument("pairs", nargs="+")
+    settings_user_set_p.add_argument("--config")
+    settings_user_set_p.add_argument("--json", action="store_true")
+    settings_user_set_p.set_defaults(func=cmd_settings, settings_scope="user")
+    settings_user_unset_p = settings_user_sub.add_parser("unset")
+    settings_user_unset_p.add_argument("names", nargs="+")
+    settings_user_unset_p.add_argument("--config")
+    settings_user_unset_p.add_argument("--json", action="store_true")
+    settings_user_unset_p.set_defaults(func=cmd_settings, settings_scope="user")
+
+    settings_live_p = settings_sub.add_parser(
+        "live", help="Read or change a running daemon"
+    )
+    settings_live_sub = settings_live_p.add_subparsers(
+        dest="settings_operation", required=True
+    )
+    settings_live_show_p = settings_live_sub.add_parser("show")
+    settings_live_show_p.add_argument("--host", default="127.0.0.1")
+    settings_live_show_p.add_argument("--port", type=int, default=8000)
+    settings_live_show_p.add_argument("--json", action="store_true")
+    settings_live_show_p.set_defaults(func=cmd_settings, settings_scope="live")
+    settings_live_set_p = settings_live_sub.add_parser("set")
+    settings_live_set_p.add_argument("pairs", nargs="+")
+    settings_live_set_p.add_argument("--host", default="127.0.0.1")
+    settings_live_set_p.add_argument("--port", type=int, default=8000)
+    settings_live_set_p.add_argument("--json", action="store_true")
+    settings_live_set_p.set_defaults(func=cmd_settings, settings_scope="live")
+
+    # Compatibility commands intentionally keep their historical Namespace
+    # shape because callers may invoke the live handler programmatically.
+    for action in ("get", "set"):
+        legacy_p = settings_sub.add_parser(action, help=argparse.SUPPRESS)
+        legacy_p.add_argument("pairs", nargs="*")
+        legacy_p.add_argument("--host", default="127.0.0.1")
+        legacy_p.add_argument("--port", type=int, default=8000)
+        legacy_p.add_argument("--json", action="store_true")
+        legacy_p.set_defaults(
+            func=cmd_settings_public,
+            settings_action=action,
+        )
 
     ask_p = sub.add_parser("ask", help="Ask the verified local MTPLX model one question")
     ask_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
@@ -3815,6 +3904,12 @@ def main(argv: list[str] | None = None) -> int:
     if not raw_args or raw_args[0] in ("-h", "--help"):
         print(_format_public_help())
         return 0
+    if (
+        len(raw_args) > 1
+        and raw_args[0] == "settings"
+        and "=" in raw_args[1]
+    ):
+        raw_args.insert(1, "set")
     parser = build_parser()
     if raw_args[0] == "help":
         return _print_help_topic(raw_args[1] if len(raw_args) > 1 else None, parser)
