@@ -22,6 +22,7 @@ from mlx_lm.models.switch_layers import SwitchGLU
 
 from mtplx.hy3_router_row_owned import (
     hy3_router_row_owned_route,
+    prepare_hy3_router_row_owned_weight,
 )
 from mtplx.hy3_router_last_arrival import (
     _dispatch_hy3_router_last_arrival,
@@ -301,6 +302,7 @@ class _RouterKernelState:
     prepared_weight: mx.array | None = None
     splitk_m1: bool = False
     epoch_slot: int = 0
+    sigmoid_mode: str = "precise"
 
 
 class Router(nn.Module):
@@ -324,6 +326,7 @@ class Router(nn.Module):
         available: bool | None = None,
         splitk_m1: bool = False,
         epoch_slot: int = 0,
+        sigmoid_mode: str = "precise",
     ) -> dict[str, int | bool | str]:
         """Select and prepare one router implementation at model load time."""
 
@@ -335,6 +338,10 @@ class Router(nn.Module):
             or epoch_slot < 0
         ):
             raise TypeError("epoch_slot must be a nonnegative int")
+        if sigmoid_mode not in ("precise", "fast"):
+            raise ValueError("router sigmoid_mode must be 'precise' or 'fast'")
+        if sigmoid_mode == "fast" and selector != "mpp-row-owned-fused":
+            raise ValueError("fast sigmoid is selectable only on the row-owned router")
 
         if selector not in {
             "stock",
@@ -402,6 +409,11 @@ class Router(nn.Module):
             # MTP-head M1 and all M2..M8 calls consume this K-major FP32
             # split-K layout so K>=1 draft and verification use one R1 order.
             state_weight = prepared_weight
+        elif selector == "mpp-row-owned-fused":
+            prepared_weight = prepare_hy3_router_row_owned_weight(source_weight)
+            # Tile-major layout: each SIMD group streams one contiguous
+            # 16-expert block; stock M1 keeps the source row-major gate.
+            state_weight = prepared_weight
         else:
             prepared_weight = prepare_hy3_router_fp32_weight(source_weight)
             # MPP consumes a K-major BF16 layout while stock large-M fallback
@@ -417,6 +429,7 @@ class Router(nn.Module):
             prepared_weight=state_weight,
             splitk_m1=splitk_m1,
             epoch_slot=epoch_slot,
+            sigmoid_mode=sigmoid_mode,
         )
         report: dict[str, int | bool | str] = {
             "selector": selector,
@@ -447,9 +460,11 @@ class Router(nn.Module):
             report["mpp_descriptor_rows"] = 8
             report["dispatch_count"] = 1
             report["sigmoid_mode"] = "precise"
-            report["topology"] = "row-owned-g12-p16-precise-g6"
+            report["topology"] = "row-owned-g12-p16-tiled-g6"
+            report["weight_layout"] = "tile-major-12x4096x16"
             report["threadgroups_per_dispatch"] = "one-per-row"
             report["device_synchronization"] = "none"
+            report["sigmoid_mode"] = sigmoid_mode
             report["authority_phases"] = "all"
         return report
 
@@ -489,7 +504,7 @@ class Router(nn.Module):
                     top_k=self.top_k,
                     route_norm=self.route_norm,
                     scaling_factor=self.router_scaling_factor,
-                    sigmoid_mode="precise",
+                    sigmoid_mode=state.sigmoid_mode,
                 )
                 output_shape = (*x.shape[:-1], 8)
                 return (
@@ -579,6 +594,7 @@ def configure_hy3_router_kernels(
     selector: str,
     *,
     available: bool | None = None,
+    sigmoid_mode: str = "precise",
 ) -> dict[str, int | str]:
     """Configure every Hy3 router and return explicit model memory accounting."""
 
@@ -597,6 +613,7 @@ def configure_hy3_router_kernels(
                 available=available,
                 splitk_m1=splitk_m1,
                 epoch_slot=epoch_slot,
+                sigmoid_mode=sigmoid_mode,
             )
         )
         if is_mtp_router:
@@ -634,6 +651,8 @@ def configure_hy3_router_kernels(
         summary["threadgroups"] = 48
         summary["authority_phases"] = "all"
     elif selector == "mpp-row-owned-fused":
+        summary["sigmoid_mode"] = sigmoid_mode
+        summary["weight_layout"] = "tile-major-12x4096x16"
         summary["supported_rows"] = "1-8"
         summary["dispatch_count"] = 1
         summary["sigmoid_mode"] = "precise"

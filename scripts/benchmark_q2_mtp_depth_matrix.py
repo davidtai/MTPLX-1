@@ -70,6 +70,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "transient_slots": 8,
     "q2_expert_kernel": "stock",
     "hy3_router_kernel": "mpp-r1-fused-r2",
+    "hy3_router_sigmoid": "precise",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -321,6 +322,15 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: mpp-r1-fused-r2)."
         ),
     )
+    parser.add_argument(
+        "--hy3-router-sigmoid",
+        choices=("precise", "fast"),
+        default="precise",
+        help=(
+            "Row-owned router finalizer exponential "
+            "(fast is a selectable experiment; default: precise)."
+        ),
+    )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
         "--f-nocache",
@@ -447,6 +457,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "transient_slots": args.transient_slots,
         "q2_expert_kernel": args.q2_expert_kernel,
         "hy3_router_kernel": args.hy3_router_kernel,
+        "hy3_router_sigmoid": args.hy3_router_sigmoid,
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
@@ -1777,6 +1788,7 @@ def _runtime_config(
         transient_slots=int(options["transient_slots"]),
         q2_expert_kernel=str(options["q2_expert_kernel"]),
         hy3_router_kernel=str(options["hy3_router_kernel"]),
+        hy3_router_sigmoid=str(options["hy3_router_sigmoid"]),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),
         resource_telemetry=bool(options["resource_telemetry"]),
