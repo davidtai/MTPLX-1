@@ -254,6 +254,20 @@ def test_record_growth_reconciles_post_setup_allocator_drift_before_planning() -
         runtime._split_executor.shutdown(wait=True)
 
 
+def test_safe_observation_reconciles_post_dispatch_allocator_drift() -> None:
+    runtime = _runtime(memory_limit_bytes=70)
+    sample = AllocatorMemorySample(active_bytes=55, cache_bytes=0, peak_bytes=55)
+    runtime._sample_allocator_memory = lambda: sample
+    try:
+        snapshot, observed = runtime.reconcile_allocator_memory()
+
+        assert observed is sample
+        assert snapshot.allocator_cache_bytes == 5
+        assert snapshot.charged_bytes == 55
+    finally:
+        runtime._split_executor.shutdown(wait=True)
+
+
 def test_split_route_uses_same_miss_warming_and_hit_fast_path(monkeypatch) -> None:
     runtime = _runtime()
     broker_calls = 0

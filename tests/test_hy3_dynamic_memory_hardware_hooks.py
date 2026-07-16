@@ -993,14 +993,30 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
         failed_closed=False,
         failure_reason=None,
     )
+    stale_broker_snapshot = SimpleNamespace(
+        **{
+            **vars(broker_snapshot),
+            "allocator_cache_bytes": 0,
+            "charged_bytes": 950 + HY3_Q4_KV_BLOCK_BYTES,
+        }
+    )
     broker = SimpleNamespace(
         budget=SimpleNamespace(
             memory_limit_bytes=100 * hardware_module.GIB,
             allocator_headroom_bytes=hardware_module.GIB,
             classified_limit_bytes=99 * hardware_module.GIB,
         ),
-        snapshot=lambda: broker_snapshot,
+        snapshot=lambda: stale_broker_snapshot,
     )
+    reconciliation_calls: list[object] = []
+
+    def reconcile_allocator_memory():
+        reconciliation_calls.append(True)
+        return (
+            broker_snapshot,
+            SimpleNamespace(active_bytes=900, cache_bytes=10, peak_bytes=1_000),
+        )
+
     expert_runtime = SimpleNamespace(
         _raise_if_unhealthy=lambda: None,
         slots=SimpleNamespace(
@@ -1021,6 +1037,7 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
             },
         ),
         memory_broker=broker,
+        reconcile_allocator_memory=reconcile_allocator_memory,
     )
     resource_snapshot = {
         "dynamic_memory": {
@@ -1131,3 +1148,4 @@ def test_dynamic_physical_ledger_emits_complete_issue46_resource_accounting(
     assert {field: ledger[field] for field in expected} == expected
     assert not any("slab" in field or "resize" in field for field in ledger)
     assert ledger["slot_health"]["integrity_errors"] == 7
+    assert reconciliation_calls == [True]

@@ -1194,18 +1194,30 @@ class MlxHy3HardwareLane:
         expert_bytes = int(cache_details["physical_bytes"])
         broker = getattr(expert_runtime, "memory_broker", None)
         broker_snapshot = None
+        allocator_sample = None
         if broker is None:
             if self.request.arm == "dynamic":
                 raise ArmObservationError("dynamic arm lost the unified-memory broker")
         else:
-            broker_snapshot = broker.snapshot()
+            reconcile = getattr(expert_runtime, "reconcile_allocator_memory", None)
+            if not callable(reconcile):
+                raise ArmObservationError(
+                    "dynamic arm cannot reconcile allocator telemetry"
+                )
+            reconciled = reconcile()
+            try:
+                broker_snapshot, allocator_sample = reconciled
+            except (TypeError, ValueError) as exc:
+                raise ArmObservationError(
+                    "dynamic allocator reconciliation is malformed"
+                ) from exc
             if int(broker_snapshot.kv_physical_bytes) != kv_bytes:
                 raise ArmObservationError("broker KV bytes differ from retained cache")
             if int(broker_snapshot.expert_cache_physical_bytes) != expert_bytes:
                 raise ArmObservationError(
                     "broker expert bytes differ from direct-record registry"
                 )
-        allocator = mlx_memory_telemetry(mx)
+        allocator = None if allocator_sample is not None else mlx_memory_telemetry(mx)
         sampler = getattr(self.runtime, "expert_resource_telemetry_snapshot", None)
         resource = _mapping(sampler()) if callable(sampler) else {}
         python_control_cpu = _mapping(resource.get("python_control_cpu"))
@@ -1222,8 +1234,14 @@ class MlxHy3HardwareLane:
         if callable(memory_plan) and spec is not None:
             plan = memory_plan(spec)
         plan_values = _mapping(plan)
-        active_bytes = int(allocator["active_memory_bytes"])
-        allocator_cache_bytes = int(allocator["cache_memory_bytes"])
+        if allocator_sample is None:
+            active_bytes = int(allocator["active_memory_bytes"])
+            allocator_cache_bytes = int(allocator["cache_memory_bytes"])
+            allocator_peak_bytes = int(allocator["peak_memory_bytes"])
+        else:
+            active_bytes = int(allocator_sample.active_bytes)
+            allocator_cache_bytes = int(allocator_sample.cache_bytes)
+            allocator_peak_bytes = int(allocator_sample.peak_bytes)
         resident_model_bytes = int(
             _first(
                 (broker_values, fixed_values, plan_values),
@@ -1300,7 +1318,7 @@ class MlxHy3HardwareLane:
         return {
             "allocator_active_bytes": active_bytes,
             "allocator_cache_bytes": allocator_cache_bytes,
-            "allocator_peak_bytes": int(allocator["peak_memory_bytes"]),
+            "allocator_peak_bytes": allocator_peak_bytes,
             "expert_cache_physical_bytes": expert_bytes,
             "kv_physical_bytes": kv_bytes,
             "kv_allocated_blocks": blocks,

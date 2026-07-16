@@ -2701,6 +2701,18 @@ class ExpertStreamingRuntime:
             f"{_ALLOCATOR_STABLE_SAMPLE_READS} reads"
         )
 
+    def reconcile_allocator_memory(
+        self,
+    ) -> tuple[BrokerSnapshot, AllocatorMemorySample]:
+        """Return one safe-boundary broker snapshot and its allocator sample."""
+
+        broker = self.memory_broker
+        if broker is None:
+            raise MemoryAdmissionError("dynamic expert cache is not enabled")
+        with self._memory_transaction_lock:
+            sample = self._sample_allocator_memory()
+            return broker.reconcile_allocator_cache(sample), sample
+
     def reconcile_post_load_memory(self) -> None:
         """Reclassify startup reserve into measured resident/MTP truth."""
 
