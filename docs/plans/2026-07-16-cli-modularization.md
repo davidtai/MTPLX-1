@@ -41,7 +41,7 @@
 
 **Security flag:** `none`
 
-- [ ] **Step 1: Add characterization snapshots and namespace checks**
+- [x] **Step 1: Add characterization snapshots and namespace checks**
 
 ```python
 from __future__ import annotations
@@ -94,13 +94,13 @@ NO_COLOR=1 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python
 NO_COLOR=1 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -c 'from mtplx.cli import main; raise SystemExit(main(["help", "start"]))' > tests/snapshots/cli/start-help.txt
 ```
 
-- [ ] **Step 2: Run behavior locks**
+- [x] **Step 2: Run behavior locks**
 
 Run: `NO_COLOR=1 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_behavior_lock.py tests/test_public_cli.py tests/test_cli_parity_tools.py`
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit and update issue**
+- [x] **Step 3: Commit and update issue**
 
 ```bash
 git add tests/test_cli_behavior_lock.py tests/snapshots/cli
@@ -119,7 +119,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "CLI task 1 complete: public/ad
 
 **Security flag:** `none`
 
-- [ ] **Step 1: Add a failing layering test**
+- [x] **Step 1: Add a failing layering test**
 
 ```python
 from __future__ import annotations
@@ -149,13 +149,13 @@ def test_cli_app_help_and_parsing_are_runtime_free():
         assert not {name for name in imports if any(name == item or name.startswith(item + ".") for item in FORBIDDEN)}
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_structure.py`
 
 Expected: FAIL because `mtplx/cli_app/help.py` does not exist.
 
-- [ ] **Step 3: Move help symbols unchanged**
+- [x] **Step 3: Move help symbols unchanged**
 
 Move `PUBLIC_COMMANDS`, `ADVANCED_COMMANDS`, color/banner helpers,
 `_format_public_help`, `_format_advanced_help`, `_format_start_help`,
@@ -166,19 +166,19 @@ Pass `build_parser` into `_format_flags_help` and `_print_help_topic` to avoid a
 cycle. Re-export the historical private names from `mtplx.cli` while tests and
 callers migrate.
 
-- [ ] **Step 4: Move parser primitives unchanged**
+- [x] **Step 4: Move parser primitives unchanged**
 
 Move `_FlagRecordingArgumentParser`, `_explicit_cli_flags`, `_profile_arg`,
 `_comma_floats`, `_positive_int`, and `_kv_quant_arg` to
 `cli_app/parsing.py`. Import/re-export them from `mtplx.cli`.
 
-- [ ] **Step 5: Verify snapshots, structure, and public imports**
+- [x] **Step 5: Verify snapshots, structure, and public imports**
 
 Run: `NO_COLOR=1 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_structure.py tests/test_cli_behavior_lock.py tests/test_public_cli.py tests/test_cli_parity_tools.py`
 
 Expected: PASS with byte-identical snapshots.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/cli.py mtplx/cli_app tests/test_cli_structure.py
@@ -197,7 +197,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "CLI task 2 complete: no-MLX he
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Add failing group ownership assertions**
+- [x] **Step 1: Add failing group ownership assertions**
 
 ```python
 def test_product_and_model_groups_own_expected_commands():
@@ -214,13 +214,13 @@ def test_product_and_model_groups_own_expected_commands():
     )
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_structure.py`
 
 Expected: FAIL because group modules do not exist.
 
-- [ ] **Step 3: Extract parser registration functions**
+- [x] **Step 3: Extract parser registration functions**
 
 Create `register_product_commands(sub, context)` and
 `register_model_commands(sub, context)`. `context` is a frozen dataclass
@@ -228,18 +228,18 @@ containing the default model and lightweight handler callables required by the
 registrations. Move parser declarations only; keep handler wrappers in
 `mtplx.cli`. Export exact `COMMANDS` tuples from the test.
 
-- [ ] **Step 4: Compose groups from `build_parser`**
+- [x] **Step 4: Compose groups from `build_parser`**
 
 Replace the moved inline declarations with the two registration calls. Parser
 objects and defaults must remain identical for the behavior-lock argv matrix.
 
-- [ ] **Step 5: Verify snapshots and focused parser suites**
+- [x] **Step 5: Verify snapshots and focused parser suites**
 
 Run: `NO_COLOR=1 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_structure.py tests/test_cli_behavior_lock.py tests/test_public_cli.py tests/test_settings_cli.py tests/test_forge_cli.py tests/test_config.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/cli.py mtplx/cli_app/groups tests/test_cli_structure.py
@@ -257,7 +257,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "CLI task 3 complete: product a
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Add failing command ownership assertions**
+- [x] **Step 1: Add failing command ownership assertions**
 
 ```python
 def test_operations_and_benchmark_groups_own_expected_commands():
@@ -278,32 +278,32 @@ def test_operations_and_benchmark_groups_own_expected_commands():
     )
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_structure.py`
 
 Expected: FAIL because group modules do not exist.
 
-- [ ] **Step 3: Extract operations registration**
+- [x] **Step 3: Extract operations registration**
 
 Move only the parser declarations for the exact operations tuple into
 `register_operations_commands(sub, context)`. Keep lazy handler wrappers and
 all command behavior unchanged.
 
-- [ ] **Step 4: Extract benchmark registration**
+- [x] **Step 4: Extract benchmark registration**
 
 Move only the parser declarations for the exact benchmark tuple into
 `register_benchmark_commands(sub, context)`. Move shared option helper
 definitions used exclusively by benchmark parsers into that module; leave
 runtime handler functions in place.
 
-- [ ] **Step 5: Verify all parser behavior**
+- [x] **Step 5: Verify all parser behavior**
 
 Run: `NO_COLOR=1 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_structure.py tests/test_cli_behavior_lock.py tests/test_public_cli.py tests/test_cli_parity_tools.py tests/test_benchmark_streamed_generation_cli.py tests/test_probe_mtp_draft_rank_cli.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/cli.py mtplx/cli_app/groups tests/test_cli_structure.py
@@ -321,7 +321,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "CLI task 4 complete: operation
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Add failing import-boundary tests**
+- [x] **Step 1: Add failing import-boundary tests**
 
 ```python
 def test_public_reexports_support_and_settings_handlers():
@@ -335,13 +335,13 @@ def test_public_reexports_support_and_settings_handlers():
     assert cmd_doctor is doctor_impl
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_command_module_boundaries.py`
 
 Expected: FAIL because support handlers remain in `commands.public`.
 
-- [ ] **Step 3: Move support symbols unchanged**
+- [x] **Step 3: Move support symbols unchanged**
 
 Move doctor/report helpers and handlers from `_redact_secret_value` through
 `cmd_doctor`, plus `cmd_stop_public`, `cmd_debug_public`, `_hotpath_boundary_report`,
@@ -350,14 +350,14 @@ and the existing support-bundle helpers they directly use, into
 `cmd_settings_public` into `commands/settings.py` beside native settings
 handlers. Re-export all moved public/tested symbols from `commands.public`.
 
-- [ ] **Step 4: Audit imports and verify**
+- [x] **Step 4: Audit imports and verify**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_command_module_boundaries.py tests/test_cli_parity_tools.py tests/test_public_cli.py tests/test_diagnostics.py tests/test_settings_cli.py`
 
 Expected: PASS. Then run separate searches for direct imports, string names,
 re-exports, tests/mocks, and docs references to every moved public symbol.
 
-- [ ] **Step 5: Commit and update issue**
+- [x] **Step 5: Commit and update issue**
 
 ```bash
 git add mtplx/commands tests/test_command_module_boundaries.py
@@ -375,7 +375,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "CLI task 5 complete: support a
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Add failing re-export assertions**
+- [x] **Step 1: Add failing re-export assertions**
 
 ```python
 def test_public_reexports_model_and_integration_handlers():
@@ -389,32 +389,32 @@ def test_public_reexports_model_and_integration_handlers():
     assert cmd_integrate_public is integrate_impl
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_command_module_boundaries.py`
 
 Expected: FAIL because domain modules do not exist.
 
-- [ ] **Step 3: Move model handler families unchanged**
+- [x] **Step 3: Move model handler families unchanged**
 
 Move model inspection/gating, pull/list/remove, architecture QA, and
 `cmd_model_public` families into `commands/models.py`. Preserve helper function
 names imported by tests. Keep Forge in `commands/forge.py`.
 
-- [ ] **Step 4: Move integration handler families unchanged**
+- [x] **Step 4: Move integration handler families unchanged**
 
 Move OpenWebUI command construction, dashboard/connect/integrate handlers, and
 Pi/OpenCode/Swival/Hermes configuration/launch helpers into
 `commands/integrations.py`. Runtime generation and daemon startup remain in
 `commands.public` until Task 7.
 
-- [ ] **Step 5: Re-export and verify**
+- [x] **Step 5: Re-export and verify**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_command_module_boundaries.py tests/test_model_catalog.py tests/test_public_cli.py tests/test_cli_parity_tools.py tests/test_server_openai.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and update issue**
+- [x] **Step 6: Commit and update issue**
 
 ```bash
 git add mtplx/commands tests/test_command_module_boundaries.py
@@ -432,7 +432,7 @@ gh issue comment 90 --repo davidtai/MTPLX --body "CLI task 6 complete: model and
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Add failing re-export assertions**
+- [x] **Step 1: Add failing re-export assertions**
 
 ```python
 def test_public_reexports_runtime_and_benchmark_handlers():
@@ -446,20 +446,20 @@ def test_public_reexports_runtime_and_benchmark_handlers():
     assert cmd_serve_public is serve_impl
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_command_module_boundaries.py`
 
 Expected: FAIL because runtime/benchmark modules do not exist.
 
-- [ ] **Step 3: Move benchmark families unchanged**
+- [x] **Step 3: Move benchmark families unchanged**
 
 Move AIME, tune, bench run/suite/nightly/compare/reference, QA, profile, and
 thermal benchmark families into `commands/benchmarks.py`. Preserve subprocess,
 telemetry, HTTP/SSH, and result serialization behavior exactly. Re-export all
 tested helper symbols from `commands.public` during compatibility.
 
-- [ ] **Step 4: Move runtime/server families unchanged**
+- [x] **Step 4: Move runtime/server families unchanged**
 
 Move serve/start banners and option resolution, `cmd_serve_public`, server-child
 watchdogs, one-shot/run/chat generation, quickstart terminal/server flows, and
@@ -467,20 +467,20 @@ watchdogs, one-shot/run/chat generation, quickstart terminal/server flows, and
 already moved in Task 6 are imported through explicit functions; do not create
 a reverse import from integrations to runtime.
 
-- [ ] **Step 5: Re-export and run focused suites**
+- [x] **Step 5: Re-export and run focused suites**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_command_module_boundaries.py tests/test_public_cli.py tests/test_cli_parity_tools.py tests/test_benchmark_streamed_generation_cli.py tests/test_benchmark_streamed_generation_concurrency_cli.py tests/test_daemon_client.py tests/test_server_openai.py`
 
 Expected: PASS.
 
-- [ ] **Step 6: Run full suite before commit**
+- [x] **Step 6: Run full suite before commit**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q`
 
 Expected: exit 0. If a move changes behavior, restore the original body and
 split the extraction at the dependency boundary rather than adjusting tests.
 
-- [ ] **Step 7: Commit and update issue**
+- [x] **Step 7: Commit and update issue**
 
 ```bash
 git add mtplx/commands tests/test_command_module_boundaries.py
@@ -496,32 +496,32 @@ gh issue comment 90 --repo davidtai/MTPLX --body "CLI task 7 complete: runtime/s
 
 **Security flag:** `security`
 
-- [ ] **Step 1: Run focused CLI/command verification**
+- [x] **Step 1: Run focused CLI/command verification**
 
 Run: `NO_COLOR=1 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q tests/test_cli_behavior_lock.py tests/test_cli_structure.py tests/test_command_module_boundaries.py tests/test_public_cli.py tests/test_cli_parity_tools.py tests/test_settings_cli.py tests/test_lab_cli.py tests/test_forge_cli.py`
 
 Expected: PASS with byte-identical help snapshots.
 
-- [ ] **Step 2: Audit references by category**
+- [x] **Step 2: Audit references by category**
 
 Run separate `rg` searches for each moved handler's direct imports/type
 references, string literals, dynamic imports, re-exports, tests/mocks, and docs.
 Every old public path either resolves through `commands.public` or is migrated;
 no dynamic import points to a removed implementation.
 
-- [ ] **Step 3: Run Ruff and cycle check**
+- [x] **Step 3: Run Ruff and cycle check**
 
 Run: `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/ruff check mtplx/cli.py mtplx/cli_app mtplx/commands tests/test_cli_*.py tests/test_command_module_boundaries.py && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -c 'import mtplx.cli; import mtplx.commands.public; print("imports-ok")'`
 
 Expected: PASS and `imports-ok`.
 
-- [ ] **Step 4: Run stub scan and full suite**
+- [x] **Step 4: Run stub scan and full suite**
 
 Run: `! rg -n 'TODO|FIXME|placeholder|NotImplementedError' mtplx/cli_app mtplx/commands && /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python -m pytest -q`
 
 Expected: exit 0 with no new skips or failures.
 
-- [ ] **Step 5: Record checkpoint**
+- [x] **Step 5: Record checkpoint**
 
 ```bash
 gh issue comment 90 --repo davidtai/MTPLX --body "CLI modularization verified: help snapshots, parser/handler boundaries, compatibility imports, Ruff, cycle smoke, reference audit, and full suite pass on $(git rev-parse --short HEAD)."
