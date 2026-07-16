@@ -1,0 +1,129 @@
+<｜hy_begin_of_sentence:opensource｜>You are MTPLX, a precise coding agent. Follow the user's instructions, preserve exact behavior, and prefer production-safe patches.<｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_User:opensource｜>You are reviewing a normal Python repository. Read the source, tests, configuration, documentation, and diagnostics before making a small, production-safe change. Preserve public behavior and explain errors clearly.
+
+## Repository artifact: workspace_0/README.md
+Artifact type: documentation.
+```text
+# Task Queue
+A small Python service accepts jobs, validates input, stores state, and writes
+structured logs. Keep public behavior stable and make failures explicit.
+
+Development uses Python 3.11 and pytest. Run the unit tests before changing the
+command line interface or the JSON record schema.
+```
+
+
+## Repository artifact: workspace_0/src/task_queue/models.py
+Artifact type: source.
+```text
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass(frozen=True)
+class Job:
+    job_id: str
+    command: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not self.job_id.strip():
+            raise ValueError("job_id must not be empty")
+        if not self.command.strip():
+            raise ValueError("command must not be empty")
+```
+
+
+## Repository artifact: workspace_0/src/task_queue/store.py
+Artifact type: source.
+```text
+from collections import OrderedDict
+
+class JobStore:
+    def __init__(self, capacity: int = 128) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self._items = OrderedDict()
+
+    def get(self, key: str):
+        value = self._items.pop(key)
+        self._items[key] = value
+        return value
+
+    def put(self, key: str, value) -> None:
+        self._items.pop(key, None)
+        self._items[key] = value
+        while len(self._items) > self.capacity:
+            self._items.popitem(last=False)
+```
+
+
+## Repository artifact: workspace_0/tests/test_store.py
+Artifact type: test.
+```text
+import pytest
+from task_queue.store import JobStore
+
+def test_store_rejects_invalid_capacity():
+    with pytest.raises(ValueError, match="positive"):
+        JobStore(0)
+
+def test_store_evicts_the_oldest_item():
+    store = JobStore(capacity=2)
+    store.put("first", 1)
+    store.put("second", 2)
+    store.put("third", 3)
+    with pytest.raises(KeyError):
+        store.get("first")
+```
+
+
+## Repository artifact: workspace_0/pyproject.toml
+Artifact type: config.
+```text
+[project]
+name = "task-queue"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+task-queue = "task_queue.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+```
+
+
+## Repository artifact: workspace_0/logs/failed-run.log
+Artifact type: diagnostic.
+```text
+INFO request accepted job_id=demo-17
+INFO state loaded records=42 elapsed_ms=3
+WARNING retry scheduled attempt=2 delay_ms=50
+ERROR state write failed reason=temporary_io_error
+INFO request finished status=failed elapsed_ms=61
+```
+
+
+## Repository artifact: workspace_0/docs/review-notes.md
+Artifact type: review.
+```text
+The patch must preserve
+
+# Final user request
+Write code only. Create a single Python file that behaves like a small production package for deterministic benchmark runs. No prose outside code. Use Python 3.11, dataclasses, pathlib, json, argparse, time, hashlib, statistics, and typing. Keep it compact but complete.
+
+Implement these sections in order, separated by short comments:
+1. prompt schema dataclasses and JSONL loader
+2. validation helpers for required fields, token limits, duplicate ids, and deterministic hashing
+3. an LRU cache with get, put, delete, clear, stats, and JSON snapshot methods
+4. a rolling metrics window with mean, p50, p90, p95, min, max, and rate helpers
+5. benchmark record dataclasses with serialization and summary methods
+6. a deterministic sampler config object with top_k/top_p/temperature validation
+7. a tiny event log writer that appends JSONL rows atomically
+8. a run registry that stores run metadata, artifacts, git hash, model path, and environment flags
+9. a CLI with subcommands validate-prompts, summarize-runs, inspect-cache, and write-demo
+10. a small self-test function that exercises every component and returns a structured dict
+
+Start now with imports and implement the full file through the CLI entrypoint.
+<｜hy_Assistant:opensource｜><think:opensource></think:opensource>

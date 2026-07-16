@@ -2,10 +2,16 @@
 
 Both files contain the exact decoded 1,028-token K3 output, including special tokens.
 
+- [Exact original 1,024-token prompt](./original-prompt.txt)
+- [Prompt builder metadata and token hash](./prompt-metadata.json)
 - [B0 stock-router response](./stock-response.txt)
 - [C0 authoritative-MPP response](./mpp-response.txt)
 - [Side-by-side HTML view](./comparison.html)
 - [Machine-readable summary](./summary.json)
+
+The reconstructed prompt token SHA-256 is
+`2a269f7f7b17b10fdca1bd72d61fa7b50f329744ac2023da1086f6ac13a44829`,
+an exact match for both benchmark artifacts.
 
 ## Headline comparison
 

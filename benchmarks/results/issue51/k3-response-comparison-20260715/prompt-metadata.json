@@ -1,0 +1,23 @@
+{
+  "token_count": 1024,
+  "token_sha256": "2a269f7f7b17b10fdca1bd72d61fa7b50f329744ac2023da1086f6ac13a44829",
+  "expected_artifact_token_sha256": "2a269f7f7b17b10fdca1bd72d61fa7b50f329744ac2023da1086f6ac13a44829",
+  "exact_match": true,
+  "builder_metadata": {
+    "prompt_policy": "realistic_programming_v1",
+    "prompt_style": "coding-agent",
+    "prompt_format": "chat",
+    "prompt_enable_thinking": false,
+    "prompt_release_valid": true,
+    "prompt_tail_sha256": "887573dd262ed624eccb39f8b833f5711dd36889d2ea16e68837e2985a1f71b1",
+    "prompt_tail_tokens": 319,
+    "prompt_tail_preserved": true,
+    "prompt_tail_truncated": false,
+    "prompt_filler_tokens": 705,
+    "prompt_artifact_kinds": 6,
+    "prompt_head_trimmed_tokens": 0,
+    "prompt_context_tokens": 1024,
+    "prompt_actual_tokens": 1024,
+    "prompt_filler_sha256": "7c6678378c5d238427ce2b0be6d8bab93a7535a08b722c5f7ece1058b973807e"
+  }
+}
