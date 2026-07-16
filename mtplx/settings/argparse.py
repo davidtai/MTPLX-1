@@ -133,11 +133,16 @@ def _legacy_cli_values(args: Any) -> dict[str, Any]:
     return values
 
 
-def _bundle_values(paths: list[str]) -> dict[str, Any]:
+def _bundle_values(
+    paths: list[str], *, model_family: str | None
+) -> tuple[dict[str, Any], tuple[Any, ...]]:
     values: dict[str, Any] = {}
+    provenance: list[Any] = []
     for path in paths:
-        values.update(load_settings_bundle(path))
-    return values
+        loaded = load_settings_bundle(path, model_family=model_family)
+        values.update(loaded.settings)
+        provenance.append(loaded)
+    return values, tuple(provenance)
 
 
 def _apply_to_namespace(args: Any, resolved: ResolvedSettings) -> None:
@@ -170,6 +175,7 @@ def resolve_args_settings(
     *,
     environ: Mapping[str, str] | None = None,
     user_path: str | Path | None = None,
+    model_family: str | None = None,
 ) -> ResolvedSettings:
     """Resolve registered sources and apply explicit winners to ``args``."""
 
@@ -187,7 +193,10 @@ def resolve_args_settings(
     environment = _environment_values(source_environ)
     if environment:
         sources[SettingSource.ENV] = environment
-    bundles = _bundle_values(list(getattr(args, "settings_bundles", []) or []))
+    bundles, bundle_provenance = _bundle_values(
+        list(getattr(args, "settings_bundles", []) or []),
+        model_family=model_family,
+    )
     if bundles:
         sources[SettingSource.BUNDLE] = bundles
     legacy = _legacy_cli_values(args)
@@ -199,7 +208,10 @@ def resolve_args_settings(
     if overrides:
         sources[SettingSource.CLI_SET] = overrides
 
-    resolved = SettingsResolver(catalog).resolve(sources)
+    resolved = SettingsResolver(catalog).resolve(
+        sources,
+        bundle_provenance=bundle_provenance,
+    )
     args.mtplx_settings = resolved
     _apply_to_namespace(args, resolved)
     return resolved

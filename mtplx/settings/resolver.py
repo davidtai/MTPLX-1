@@ -37,10 +37,15 @@ class ProvenanceRecord:
 
 class ResolvedSettings:
     def __init__(
-        self, values: dict[str, Any], provenance: dict[str, ProvenanceRecord]
+        self,
+        values: dict[str, Any],
+        provenance: dict[str, ProvenanceRecord],
+        *,
+        bundle_provenance: tuple[Any, ...] = (),
     ):
         self._values = MappingProxyType(dict(values))
         self.provenance = MappingProxyType(dict(provenance))
+        self.bundle_provenance = tuple(bundle_provenance)
 
     def __getitem__(self, name: str) -> Any:
         return self._values[name]
@@ -85,7 +90,11 @@ class ResolvedSettings:
                 ),
                 reason=reason,
             )
-        return ResolvedSettings(values, provenance)
+        return ResolvedSettings(
+            values,
+            provenance,
+            bundle_provenance=self.bundle_provenance,
+        )
 
 
 class SettingsResolver:
@@ -93,7 +102,10 @@ class SettingsResolver:
         self.catalog = catalog
 
     def resolve(
-        self, sources: Mapping[SettingSource, Mapping[str, Any]]
+        self,
+        sources: Mapping[SettingSource, Mapping[str, Any]],
+        *,
+        bundle_provenance: tuple[Any, ...] = (),
     ) -> ResolvedSettings:
         candidates: dict[str, list[SourceValue]] = {}
         for spec in self.catalog.by_name.values():
@@ -116,4 +128,8 @@ class SettingsResolver:
                 "[redacted]" if spec.secret and winner.value else winner.value,
                 tuple(ordered[1:]),
             )
-        return ResolvedSettings(values, provenance)
+        return ResolvedSettings(
+            values,
+            provenance,
+            bundle_provenance=bundle_provenance,
+        )
