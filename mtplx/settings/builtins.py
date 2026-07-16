@@ -14,13 +14,13 @@ def _setting(
     default: object,
     *,
     domain: str,
-    config_key: str,
+    config_key: str | None,
     cli: tuple[str, ...] = (),
     env: tuple[str, ...] = (),
     **kwargs: object,
 ) -> SettingSpec:
     aliases = (
-        SettingAlias(config_key, "config"),
+        *((SettingAlias(config_key, "config"),) if config_key else ()),
         *(SettingAlias(value, "cli") for value in cli),
         *(SettingAlias(value, "env") for value in env),
     )
@@ -69,6 +69,27 @@ BUILTIN_SETTINGS = (
             "max-diagnostic",
         ),
         visibility=Visibility.PUBLIC,
+    ),
+    _setting(
+        "runtime.mtp.enabled",
+        SettingType.BOOL,
+        True,
+        domain="runtime",
+        config_key=None,
+        cli=("mtp", "no-mtp"),
+        visibility=Visibility.PUBLIC,
+        live_mutable=True,
+    ),
+    _setting(
+        "runtime.mtp.depth",
+        SettingType.INT,
+        3,
+        domain="runtime",
+        config_key=None,
+        cli=("depth",),
+        minimum=1,
+        visibility=Visibility.PUBLIC,
+        live_mutable=True,
     ),
     _setting(
         "thermal.control",

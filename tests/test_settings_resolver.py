@@ -27,7 +27,7 @@ def test_product_catalog_covers_every_legacy_config_key_once():
         for alias in spec.aliases
         if alias.source == "config"
     }
-    assert len(BUILTIN_SETTINGS) == 28
+    assert len(BUILTIN_SETTINGS) == 30
     assert config_aliases == set(CONFIG_VALUE_KEYS)
 
 

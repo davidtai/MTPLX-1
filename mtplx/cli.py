@@ -614,6 +614,12 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_generic_settings_args(parser: argparse.ArgumentParser) -> None:
+    from .settings.argparse import add_settings_options
+
+    add_settings_options(parser)
+
+
 def _add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     from .expert_cli import add_expert_streaming_args
 
@@ -1900,6 +1906,7 @@ def build_parser() -> argparse.ArgumentParser:
         usage="mtplx start [cli|web|pi|opencode|swival|hermes|dashboard] [--fresh] [--max] [--profile sustained] [--model PATH_OR_REPO] [--prompt TEXT]",
         description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi|opencode|swival|hermes|dashboard to skip it entirely.",
     )
+    _add_generic_settings_args(start_flow_p)
     start_flow_p.add_argument(
         "target",
         nargs="?",
@@ -2155,6 +2162,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     ask_p = sub.add_parser("ask", help="Ask the verified local MTPLX model one question")
+    _add_generic_settings_args(ask_p)
     ask_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     ask_p.add_argument("--model", default=default_model)
     ask_p.add_argument("--cache-dir")
@@ -2190,6 +2198,7 @@ def build_parser() -> argparse.ArgumentParser:
         aliases=["quick-start"],
         help="Start the local MTPLX server",
     )
+    _add_generic_settings_args(quickstart_server_p)
     quickstart_server_p.add_argument("--model", default=default_model)
     quickstart_server_p.add_argument("--cache-dir")
     quickstart_server_p.add_argument(
@@ -2527,6 +2536,7 @@ def build_parser() -> argparse.ArgumentParser:
     remove_p.set_defaults(func=cmd_remove_public)
 
     run_p = sub.add_parser("run", help="Run a one-shot verified MTPLX completion")
+    _add_generic_settings_args(run_p)
     run_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     run_p.add_argument("--model", default=default_model)
     run_p.add_argument("--cache-dir")
@@ -2559,6 +2569,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.set_defaults(func=cmd_run_public)
 
     chat_p = sub.add_parser("chat", help="Run one native-MTP chat smoke generation")
+    _add_generic_settings_args(chat_p)
     chat_p.add_argument("--model", default=default_model)
     chat_p.add_argument("--cache-dir")
     chat_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
@@ -2588,6 +2599,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p.set_defaults(func=cmd_chat_public)
 
     serve_p = sub.add_parser("serve", help="Choose model/mode, then start the OpenAI-compatible MTPLX server")
+    _add_generic_settings_args(serve_p)
     serve_p.add_argument("--model", default=default_model)
     serve_p.add_argument("--cache-dir")
     serve_p.add_argument(
@@ -3924,6 +3936,14 @@ def main(argv: list[str] | None = None) -> int:
     from .config import apply_user_config
 
     apply_user_config(args)
+    if hasattr(args, "setting_overrides"):
+        from .settings.argparse import resolve_args_settings
+
+        try:
+            resolve_args_settings(args)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}")
+            return 2
     return int(args.func(args))
 
 
