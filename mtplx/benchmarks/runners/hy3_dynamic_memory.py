@@ -1208,11 +1208,11 @@ def _validate_timeline(
         )
     if not (pre.monotonic_ns < reclaim.monotonic_ns < growth.monotonic_ns):
         raise BenchmarkGateError(
-            "physical expert decrease must be observed before KV increase"
+            "expert reclaim decision must be observed before KV increase"
         )
-    if reclaim.expert_cache_physical_bytes >= pre.expert_cache_physical_bytes:
+    if reclaim.expert_cache_physical_bytes > pre.expert_cache_physical_bytes:
         raise BenchmarkGateError(
-            "physical expert decrease must be observed before KV increase"
+            "expert cache grew during the protected reclaim decision"
         )
     if reclaim.kv_physical_bytes != pre.kv_physical_bytes:
         raise BenchmarkGateError(
@@ -1223,7 +1223,11 @@ def _validate_timeline(
             "physical expert decrease must be observed before KV block allocation"
         )
     expert_release = pre.expert_cache_physical_bytes - reclaim.expert_cache_physical_bytes
-    if pre.charged_allocator_bytes - reclaim.charged_allocator_bytes < expert_release:
+    if (
+        expert_release > 0
+        and pre.charged_allocator_bytes - reclaim.charged_allocator_bytes
+        < expert_release
+    ):
         raise BenchmarkGateError(
             "expert registration fell without the same charged allocator release"
         )
@@ -1250,9 +1254,17 @@ def _validate_timeline(
         raise BenchmarkGateError("record rewarm changed reset KV bytes")
     if rewarm.kv_allocated_blocks != reset.kv_allocated_blocks:
         raise BenchmarkGateError("record rewarm changed reset KV blocks")
-    if rewarm.expert_cache_physical_bytes <= reset.expert_cache_physical_bytes:
+    if expert_release > 0 and (
+        rewarm.expert_cache_physical_bytes <= reset.expert_cache_physical_bytes
+    ):
         raise BenchmarkGateError(
             "post_record_rewarm did not allocate expert cache capacity"
+        )
+    if expert_release == 0 and (
+        rewarm.expert_cache_physical_bytes != reset.expert_cache_physical_bytes
+    ):
+        raise BenchmarkGateError(
+            "post_record_rewarm changed expert capacity without prior reclaim"
         )
     _assert_final_slot_health(rewarm)
 
@@ -1443,6 +1455,10 @@ def _validate_kv_growth_steps(
         reclaimed = (
             before.expert_cache_physical_bytes - reclaim.expert_cache_physical_bytes
         )
+        required_reclaim = _exact_int(
+            step.get("required_expert_reclaim_bytes"),
+            field=f"{field}.required_expert_reclaim_bytes",
+        )
         kv_growth = after.kv_physical_bytes - before.kv_physical_bytes
         if (
             _exact_int(
@@ -1452,9 +1468,13 @@ def _validate_kv_growth_steps(
             != reclaimed
         ):
             raise BenchmarkGateError("KV growth step reclaimed-byte evidence differs")
-        if index == 0 and reclaimed <= 0:
+        if required_reclaim == 0 and reclaimed != 0:
             raise BenchmarkGateError(
-                "first KV growth step did not reclaim expert memory"
+                "KV growth step reclaimed experts without a broker requirement"
+            )
+        if reclaimed < required_reclaim:
+            raise BenchmarkGateError(
+                "KV growth step reclaimed fewer expert bytes than required"
             )
         if (
             _exact_int(

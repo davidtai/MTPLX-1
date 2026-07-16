@@ -218,6 +218,7 @@ class FakeLane:
                 "steady_delta_bytes": (target_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
                 "max_transient_delta_bytes": (target_blocks - 1)
                 * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "required_expert_reclaim_bytes": 200,
                 "reclaimed_expert_bytes": 200,
                 "kv_growth_bytes": (target_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
             },
@@ -234,6 +235,7 @@ class FakeLane:
                 "steady_delta_bytes": HY3_Q4_KV_BLOCK_BYTES,
                 "max_transient_delta_bytes": target_blocks
                 * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "required_expert_reclaim_bytes": 0,
                 "reclaimed_expert_bytes": 0,
                 "kv_growth_bytes": HY3_Q4_KV_BLOCK_BYTES,
             },

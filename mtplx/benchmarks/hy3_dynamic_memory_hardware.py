@@ -475,6 +475,7 @@ class _CapturingGrowthObserver:
         self.group_reservations = 0
         self.declared_steady_delta_bytes = 0
         self.declared_max_transient_delta_bytes = 0
+        self.required_expert_reclaim_bytes = 0
 
     def reserve_growth(
         self,
@@ -505,6 +506,12 @@ class _CapturingGrowthObserver:
             default=0,
         )
         try:
+            ticket = getattr(group, "ticket", None)
+            self.required_expert_reclaim_bytes = _exact_int(
+                getattr(ticket, "required_expert_reclaim_bytes", None),
+                field="group required expert reclaim bytes",
+                minimum=0,
+            )
             captured = dict(self.physical_ledger())
             captured["captured_monotonic_ns"] = _exact_int(
                 self.monotonic_ns(),
@@ -621,6 +628,15 @@ def preflight_and_grow_dynamic_q4(
             expert_release = int(before["expert_cache_physical_bytes"]) - int(
                 reclaim_gap["expert_cache_physical_bytes"]
             )
+            required_expert_reclaim = observer.required_expert_reclaim_bytes
+            if required_expert_reclaim == 0 and expert_release != 0:
+                raise ArmObservationError(
+                    "Q4 reservation evicted experts without requiring reclaim"
+                )
+            if expert_release < required_expert_reclaim:
+                raise ArmObservationError(
+                    "Q4 reservation reclaimed fewer expert bytes than required"
+                )
             allocator_release = (
                 int(before["allocator_active_bytes"])
                 + int(before["allocator_cache_bytes"])
@@ -661,6 +677,7 @@ def preflight_and_grow_dynamic_q4(
                     "max_transient_delta_bytes": (
                         observer.declared_max_transient_delta_bytes
                     ),
+                    "required_expert_reclaim_bytes": required_expert_reclaim,
                     "reclaimed_expert_bytes": expert_release,
                     "kv_growth_bytes": int(after["kv_physical_bytes"])
                     - int(before["kv_physical_bytes"]),
@@ -671,10 +688,6 @@ def preflight_and_grow_dynamic_q4(
             entry.allocation_observer = original
     first = growth_steps[0]
     reclaimed = dict(_mapping(first["reclaim_gap"]))
-    if int(first["reclaimed_expert_bytes"]) <= 0:
-        raise ArmObservationError(
-            "preflight reservation did not physically evict an expert record"
-        )
     after = physical_ledger()
     if int(after["kv_allocated_blocks"]) != target_blocks:
         raise ArmObservationError("dynamic Q4 cache did not reach target blocks")
@@ -689,8 +702,9 @@ def trigger_future_demand_record_rewarm(
     expert_runtime: Any,
     route_trace: Sequence[Mapping[str, object]],
     expert_physical_bytes: Callable[[], int],
+    require_allocation: bool = True,
 ) -> None:
-    """Warm a released record only through real post-reset route demand."""
+    """Exercise post-reset demand and verify its expected cache transition."""
 
     route = next(
         (
@@ -713,9 +727,13 @@ def trigger_future_demand_record_rewarm(
     finally:
         ready.release(synchronize=False)
     after = int(expert_physical_bytes())
-    if after <= before:
+    if require_allocation and after <= before:
         raise ArmObservationError(
             "future route demand did not allocate an expert record"
+        )
+    if not require_allocation and after != before:
+        raise ArmObservationError(
+            "future route demand changed expert capacity without prior reclaim"
         )
 
 
@@ -1013,6 +1031,7 @@ class MlxHy3HardwareLane:
         self.fixed_memory_pools = dict(fixed_memory_pools or {})
         self._reclaim_ledger: dict[str, object] | None = None
         self._return_reclaim_ledger = False
+        self._expert_reclaim_observed = False
         self._invocation_route_trace: list[dict[str, object]] = []
         self._admission_released = False
         self._closed = False
@@ -1443,6 +1462,10 @@ class MlxHy3HardwareLane:
             context_tokens=context_tokens,
             physical_ledger=self._live_physical_ledger,
         )
+        self._expert_reclaim_observed = any(
+            int(step["reclaimed_expert_bytes"]) > 0
+            for step in self._reclaim_ledger["kv_growth_steps"]
+        )
         self._return_reclaim_ledger = True
 
     def prepare_q4_context(self, context_tokens: int) -> None:
@@ -1588,6 +1611,7 @@ class MlxHy3HardwareLane:
             expert_runtime=self.runtime.expert_streaming,
             route_trace=self._invocation_route_trace,
             expert_physical_bytes=self._expert_physical_bytes,
+            require_allocation=self._expert_reclaim_observed,
         )
 
     def close(self) -> None:

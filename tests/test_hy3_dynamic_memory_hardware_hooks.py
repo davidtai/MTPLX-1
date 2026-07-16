@@ -74,9 +74,14 @@ class FakeGrowthGroup:
         self,
         events: list[str],
         members: tuple[tuple[str, int, int], ...],
+        *,
+        required_expert_reclaim_bytes: int,
     ) -> None:
         self.events = events
         self.members = members
+        self.ticket = SimpleNamespace(
+            required_expert_reclaim_bytes=required_expert_reclaim_bytes,
+        )
         self.commits: list[tuple[str, int]] = []
         self.completed = False
         self.aborted = False
@@ -109,8 +114,9 @@ class FakeGrowthGroup:
 
 
 class FakeExpertRuntime:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], *, reclaim_first: bool = True) -> None:
         self.events = events
+        self.reclaim_first = reclaim_first
         self.groups: list[FakeGrowthGroup] = []
         self.single_reservations = 0
         self.snapshot = FakeBrokerSnapshot(
@@ -129,15 +135,26 @@ class FakeExpertRuntime:
         members: tuple[tuple[str, int, int], ...],
     ) -> FakeGrowthGroup:
         self.events.append(f"group-reserve:{len(members)}")
-        self.snapshot.expert_cache_physical_bytes = 600
-        group = FakeGrowthGroup(self.events, members)
+        before = self.snapshot.expert_cache_physical_bytes
+        if self.reclaim_first:
+            self.snapshot.expert_cache_physical_bytes = 600
+        group = FakeGrowthGroup(
+            self.events,
+            members,
+            required_expert_reclaim_bytes=(
+                before - self.snapshot.expert_cache_physical_bytes
+            ),
+        )
         self.groups.append(group)
         return group
 
 
 class FakeRuntime:
-    def __init__(self, events: list[str]) -> None:
-        self.expert_streaming = FakeExpertRuntime(events)
+    def __init__(self, events: list[str], *, reclaim_first: bool = True) -> None:
+        self.expert_streaming = FakeExpertRuntime(
+            events,
+            reclaim_first=reclaim_first,
+        )
 
 
 class FakeQ4Entry:
@@ -342,6 +359,48 @@ def test_dynamic_preflight_captures_real_reclaim_gap_before_any_q4_growth(
     )
 
 
+def test_dynamic_preflight_preserves_experts_when_broker_requires_no_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mtplx.cache_state as cache_state_module
+
+    monkeypatch.setattr(cache_state_module, "VllmMetalPagedKVCache", FakeQ4Entry)
+    events: list[str] = []
+    runtime = FakeRuntime(events, reclaim_first=False)
+    cache = [
+        FakeQ4Entry(events, index, runtime.expert_streaming) for index in range(80)
+    ]
+
+    def ledger() -> dict[str, object]:
+        blocks = cache[0].num_blocks
+        kv_physical_bytes = sum(entry.nbytes for entry in cache)
+        expert_bytes = runtime.expert_streaming.snapshot.expert_cache_physical_bytes
+        return {
+            "allocator_active_bytes": expert_bytes + kv_physical_bytes,
+            "allocator_cache_bytes": 0,
+            "allocator_peak_bytes": expert_bytes + kv_physical_bytes,
+            "expert_cache_physical_bytes": expert_bytes,
+            "kv_physical_bytes": kv_physical_bytes,
+            "kv_allocated_blocks": blocks,
+            "slot_health": {},
+        }
+
+    captured = preflight_and_grow_dynamic_q4(
+        runtime=runtime,
+        cache=cache,
+        context_tokens=4096,
+        physical_ledger=ledger,
+        monotonic_ns=iter(range(1, 20)).__next__,
+    )
+
+    assert captured["expert_cache_physical_bytes"] == 800
+    assert all(
+        step["required_expert_reclaim_bytes"] == 0
+        and step["reclaimed_expert_bytes"] == 0
+        for step in captured["kv_growth_steps"]
+    )
+
+
 def test_hardware_campaign_front_door_remains_the_exact_context_matrix() -> None:
     assert ArmRequest(arm="dynamic", context_tokens=4_096, repetition=0)
     for context_tokens in (4_095, 4_097):
@@ -423,6 +482,24 @@ def test_record_rewarm_is_triggered_only_by_a_real_future_route_demand() -> None
             }
         ],
         expert_physical_bytes=lambda: next(physical),
+    )
+
+    assert events == [
+        "ensure_route:7:(1, 4, 9):decode",
+        "release_route:synchronize=False",
+    ]
+
+
+def test_record_demand_preserves_capacity_when_no_reclaim_was_required() -> None:
+    events: list[str] = []
+    runtime = FakeDemandRuntime(events)
+    physical = iter((800, 800))
+
+    trigger_future_demand_record_rewarm(
+        expert_runtime=runtime,
+        route_trace=[{"phase": "decode", "layer": 7, "expert_ids": [1, 4, 9]}],
+        expert_physical_bytes=lambda: next(physical),
+        require_allocation=False,
     )
 
     assert events == [

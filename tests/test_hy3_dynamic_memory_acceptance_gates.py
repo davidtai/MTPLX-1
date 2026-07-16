@@ -542,6 +542,7 @@ def _observation(
                 "steady_delta_bytes": (final_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
                 "max_transient_delta_bytes": (final_blocks - 1)
                 * (HY3_Q4_KV_BLOCK_BYTES // HY3_Q4_KV_LAYERS),
+                "required_expert_reclaim_bytes": EXPERT_CACHE_STEP_BYTES,
                 "reclaimed_expert_bytes": EXPERT_CACHE_STEP_BYTES,
                 "kv_growth_bytes": (final_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
             },
@@ -558,6 +559,7 @@ def _observation(
                 "steady_delta_bytes": HY3_Q4_KV_BLOCK_BYTES,
                 "max_transient_delta_bytes": final_blocks
                 * (HY3_Q4_KV_BLOCK_BYTES // HY3_Q4_KV_LAYERS),
+                "required_expert_reclaim_bytes": 0,
                 "reclaimed_expert_bytes": 0,
                 "kv_growth_bytes": HY3_Q4_KV_BLOCK_BYTES,
             },

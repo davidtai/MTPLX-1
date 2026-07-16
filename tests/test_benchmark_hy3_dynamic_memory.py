@@ -444,6 +444,7 @@ def _observation(
                 "steady_delta_bytes": (final_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
                 "max_transient_delta_bytes": (final_blocks - 1)
                 * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "required_expert_reclaim_bytes": 200,
                 "reclaimed_expert_bytes": 200,
                 "kv_growth_bytes": (final_blocks - 2) * HY3_Q4_KV_BLOCK_BYTES,
             },
@@ -460,6 +461,7 @@ def _observation(
                 "steady_delta_bytes": HY3_Q4_KV_BLOCK_BYTES,
                 "max_transient_delta_bytes": final_blocks
                 * (HY3_Q4_KV_BLOCK_BYTES // 80),
+                "required_expert_reclaim_bytes": 0,
                 "reclaimed_expert_bytes": 0,
                 "kv_growth_bytes": HY3_Q4_KV_BLOCK_BYTES,
             },
@@ -1347,6 +1349,40 @@ def _adjust_growth_expert_ledger(ledger: dict[str, object], delta: int) -> None:
     ledger["charged_bytes"] += delta
     ledger["charged_residual_bytes"] -= delta
     ledger["process_rss_bytes"] += delta
+
+
+def test_observation_accepts_zero_reclaim_when_ticket_requires_none() -> None:
+    row = _observation("dynamic", 4096, 0, tok_s=12.0)
+    steps = row["kv_growth_steps"]
+    reclaimed = steps[0]["reclaimed_expert_bytes"]
+
+    for point in row["timeline"][1:-1]:
+        _adjust_growth_expert_ledger(point, reclaimed)
+    unique_growth_ledgers: list[dict[str, object]] = []
+    for point in (
+        steps[0]["reclaim_gap"],
+        steps[0]["after"],
+        steps[1]["before"],
+        steps[1]["reclaim_gap"],
+        steps[1]["after"],
+    ):
+        if all(point is not seen for seen in unique_growth_ledgers):
+            unique_growth_ledgers.append(point)
+            _adjust_growth_expert_ledger(point, reclaimed)
+    steps[0]["required_expert_reclaim_bytes"] = 0
+    steps[0]["reclaimed_expert_bytes"] = 0
+    row["metrics"]["peak_charged_bytes"] = max(
+        point["charged_bytes"] for point in row["timeline"]
+    )
+    row["metrics"]["stress_peak_charged_bytes"] = max(
+        max(
+            point["allocator_peak_bytes"] + point["allocator_cache_bytes"],
+            point["charged_bytes"],
+        )
+        for point in row["timeline"]
+    )
+
+    validate_campaign_observation(row)
 
 
 @pytest.mark.parametrize("checkpoint", ("first_before", "reclaim", "final_after"))
