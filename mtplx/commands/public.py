@@ -460,6 +460,25 @@ def _model_gate(
     return inspection, exit_code
 
 
+def _record_model_gate_constraint(args: Any, inspection: dict[str, Any]) -> None:
+    """Explain an existing failed model gate in the settings snapshot."""
+
+    compatibility = inspection.get("compatibility") or {}
+    if compatibility.get("can_run") is not False:
+        return
+    reason = str(
+        compatibility.get("message")
+        or inspection.get("detail")
+        or "model failed the MTPLX compatibility gate"
+    )
+    from mtplx.settings.argparse import apply_args_constraints
+
+    apply_args_constraints(
+        args,
+        {"runtime.mtp.enabled": (False, reason)},
+    )
+
+
 def _compact_model_summary(inspection: dict[str, Any]) -> dict[str, Any]:
     compatibility = inspection.get("compatibility") or {}
     return {
@@ -822,10 +841,22 @@ def _apply_model_contract_depth_default(
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     if "depth" in cli_flags:
         return
-    args.depth = _model_contract_depth(
+    depth = _model_contract_depth(
         inspection,
         profile=profile,
         fallback=int(getattr(args, "depth", 3)),
+    )
+    args.depth = depth
+    from mtplx.settings.argparse import apply_args_constraints
+
+    apply_args_constraints(
+        args,
+        {
+            "runtime.mtp.depth": (
+                depth,
+                f"model maximum MTP depth is {depth}",
+            )
+        },
     )
 
 
@@ -1996,7 +2027,6 @@ def cmd_stop_public(args: Any) -> int:
     """Stop a running MTPLX server via its health-reported pid."""
 
     from mtplx.daemon_client import (
-        DAEMON_PROBE_PORTS,
         probe_running_daemons,
         stop_daemon,
     )
@@ -2982,6 +3012,7 @@ def _cmd_tune_candidate(args: Any) -> int:
             ),
             yes=True,
         )
+    _record_model_gate_constraint(args, inspection or {})
     if gate_exit is not None or inspection is None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit or 1
@@ -4885,6 +4916,7 @@ def _cmd_bench_run(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     if gate_exit is not None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit
@@ -6839,6 +6871,7 @@ def _cmd_profile_thermal(args: Any) -> int:
 
 def _cmd_profile_compile_audit(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    _record_model_gate_constraint(args, inspection)
     output = (
         Path(args.output)
         if args.output
@@ -6929,6 +6962,7 @@ def _cmd_profile_compile_audit(args: Any) -> int:
 
 def _cmd_profile_eval_attribution(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    _record_model_gate_constraint(args, inspection)
     output = (
         Path(args.output)
         if args.output
@@ -8034,6 +8068,7 @@ def cmd_serve_public(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     if streaming_requested:
         gate_exit = None
     if gate_exit is not None:
@@ -8669,6 +8704,7 @@ def _generate_one_shot_public(
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     if streaming_requested:
         gate_exit = None
     if gate_exit is not None:
@@ -10952,6 +10988,7 @@ def _quickstart_apply_local_model_defaults(
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     _apply_model_contract_depth_default(args, inspection, profile)
     _apply_backend_serve_defaults(args, inspection)
@@ -12373,6 +12410,7 @@ def cmd_quickstart_public(args: Any) -> int:
                 ),
                 yes=bool(getattr(args, "yes", False)),
             )
+            _record_model_gate_constraint(args, inspection)
             if gate_exit is not None:
                 _print_model_gate_error(
                     inspection,
@@ -12446,6 +12484,7 @@ def cmd_quickstart_public(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     if gate_exit is not None:
         _print_model_gate_error(
             inspection,

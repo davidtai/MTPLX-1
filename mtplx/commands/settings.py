@@ -128,12 +128,19 @@ def _explain(args: Any) -> int:
     payload = {
         "name": spec.name,
         "value": record.display_value,
+        "requested_value": record.requested_value,
         "source": record.source.name,
+        "reason": record.reason,
         "type": spec.value_type.value,
         "group": spec.domain,
         "visibility": spec.visibility.value,
         "lifecycle": spec.lifecycle.value,
         "description": spec.description,
+        "aliases": [
+            {"source": alias.source, "name": alias.name}
+            for alias in spec.aliases
+        ],
+        "live_mutable": spec.live_mutable,
         "shadowed": [
             {"source": item.source.name, "value": item.value}
             for item in record.shadowed

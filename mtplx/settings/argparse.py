@@ -151,6 +151,20 @@ def _apply_to_namespace(args: Any, resolved: ResolvedSettings) -> None:
         setattr(args, dest, value)
 
 
+def apply_args_constraints(
+    args: Any, constraints: Mapping[str, tuple[Any, str]]
+) -> ResolvedSettings | None:
+    """Attach explanatory constraints to an existing settings snapshot."""
+
+    resolved = getattr(args, "mtplx_settings", None)
+    if not isinstance(resolved, ResolvedSettings):
+        return None
+    constrained = resolved.with_constraints(constraints)
+    args.mtplx_settings = constrained
+    _apply_to_namespace(args, constrained)
+    return constrained
+
+
 def resolve_args_settings(
     args: Any,
     *,

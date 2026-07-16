@@ -56,6 +56,37 @@ class ResolvedSettings:
             for name, record in self.provenance.items()
         }
 
+    def with_constraints(
+        self, constraints: Mapping[str, tuple[Any, str]]
+    ) -> ResolvedSettings:
+        """Return a snapshot with changed values attributed to constraints."""
+
+        values = dict(self._values)
+        provenance = dict(self.provenance)
+        for name, (effective_value, reason) in constraints.items():
+            if name not in values:
+                raise ValueError(f"unknown resolved setting: {name}")
+            requested_value = values[name]
+            if effective_value == requested_value:
+                continue
+            previous = provenance[name]
+            values[name] = effective_value
+            provenance[name] = ProvenanceRecord(
+                SettingSource.CONSTRAINT,
+                effective_value,
+                (
+                    SourceValue(previous.source, requested_value),
+                    *previous.shadowed,
+                ),
+                requested_value=(
+                    previous.requested_value
+                    if previous.source is SettingSource.CONSTRAINT
+                    else requested_value
+                ),
+                reason=reason,
+            )
+        return ResolvedSettings(values, provenance)
+
 
 class SettingsResolver:
     def __init__(self, catalog: SettingCatalog):
