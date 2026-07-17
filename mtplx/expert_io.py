@@ -48,6 +48,22 @@ class ExpertIOIntegrityError(ExpertIOError):
     pass
 
 
+def _record_sidecar_file(manifest: ExpertManifest, record: ExpertRecord) -> str | None:
+    """Resolve the file holding a record's sidecar bytes, if any.
+
+    Sharded sidecar layouts name the shard on the record itself; the classic
+    layout uses the manifest's single sidecar file for every record.  Record
+    fakes without the field keep the classic behavior.
+    """
+
+    sidecar_shard = getattr(record, "sidecar_shard", None)
+    if sidecar_shard is not None:
+        return str(sidecar_shard)
+    if manifest.sidecar is not None:
+        return manifest.sidecar.file
+    return None
+
+
 @dataclass
 class ExpertIOMetrics:
     record_requests: int = 0
@@ -504,6 +520,64 @@ class PositionalExpertReader:
                 read_ns=read_elapsed_ns,
             )
 
+    def _coalesced_scatter_into(
+        self,
+        relative_name: str,
+        source_offset: int,
+        destinations: tuple[memoryview, ...],
+        *,
+        chunk_bytes: int,
+        cancel_event: threading.Event | None,
+        deadline_ns: int | None,
+        pipeline_phase: str | None = None,
+    ) -> None:
+        """Read one contiguous range in large chunks, then slice into views.
+
+        Byte-for-byte equivalent to ``_readv_range_into`` over the same range:
+        the kernel sees a few large sequential reads (native backend eligible)
+        and the scatter into component-bank rows happens as host memcpys.
+        """
+
+        total = sum(len(destination) for destination in destinations)
+        if not total:
+            return
+        bounce = bytearray(min(int(chunk_bytes), total))
+        bounce_view = memoryview(bounce)
+        pending = [
+            destination for destination in destinations if len(destination)
+        ]
+        destination_index = 0
+        destination_offset = 0
+        position = 0
+        try:
+            while position < total:
+                count = min(len(bounce), total - position)
+                chunk_view = bounce_view[:count]
+                self._read_range_into(
+                    relative_name,
+                    source_offset + position,
+                    chunk_view,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    pipeline_phase=pipeline_phase,
+                )
+                consumed = 0
+                while consumed < count:
+                    destination = pending[destination_index]
+                    available = len(destination) - destination_offset
+                    take = min(available, count - consumed)
+                    destination[
+                        destination_offset : destination_offset + take
+                    ] = chunk_view[consumed : consumed + take]
+                    consumed += take
+                    destination_offset += take
+                    if destination_offset == len(destination):
+                        destination_index += 1
+                        destination_offset = 0
+                position += count
+        finally:
+            bounce_view.release()
+
     def read_record_into(
         self,
         manifest: ExpertManifest,
@@ -534,15 +608,16 @@ class PositionalExpertReader:
                     f"slot buffer has {len(view)} bytes; record needs {record.logical_bytes}"
                 )
         self.metrics.update(record_requests=1)
+        sidecar_file = _record_sidecar_file(manifest, record)
         try:
-            if prefer_sidecar and manifest.sidecar is not None:
+            if prefer_sidecar and sidecar_file is not None:
                 if record.sidecar_offset is None or record.sidecar_length is None:
                     raise ExpertIOError("manifest sidecar record is incomplete")
                 self.metrics.update(sidecar_record_requests=1)
                 if component_views is None:
                     assert view is not None
                     self._read_range_into(
-                        manifest.sidecar.file,
+                        sidecar_file,
                         record.sidecar_offset,
                         view,
                         cancel_event=cancel_event,
@@ -551,7 +626,7 @@ class PositionalExpertReader:
                     )
                 else:
                     self._readv_range_into(
-                        manifest.sidecar.file,
+                        sidecar_file,
                         record.sidecar_offset,
                         component_views,
                         cancel_event=cancel_event,
@@ -621,14 +696,28 @@ class PositionalExpertReader:
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
         pipeline_phase: str | None = None,
+        coalesce_chunk_bytes: int | None = None,
     ) -> tuple[str, ...]:
-        """Read offset-ordered adjacent sidecar records with scatter preadv."""
+        """Read offset-ordered adjacent sidecar records with scatter preadv.
+
+        With ``coalesce_chunk_bytes`` set, each adjacent group is instead read
+        as large sequential ranges into a bounce buffer and sliced into the
+        component views (single-range reads can use the native backend).  The
+        destination bytes and returned digests are identical either way.
+        """
 
         if not items:
             return ()
-        if manifest.sidecar is None:
-            raise ExpertIOError("component record batch requires a sidecar")
-        prepared: list[tuple[int, ExpertRecord, tuple[memoryview, ...]]] = []
+        if coalesce_chunk_bytes is not None:
+            if isinstance(coalesce_chunk_bytes, bool) or not isinstance(
+                coalesce_chunk_bytes, int
+            ):
+                raise TypeError("coalesce_chunk_bytes must be an integer")
+            if coalesce_chunk_bytes <= 0:
+                raise ValueError("coalesce_chunk_bytes must be positive")
+        prepared: list[
+            tuple[int, ExpertRecord, tuple[memoryview, ...], str]
+        ] = []
         for index, (record, destination) in enumerate(items):
             record_views = getattr(destination, "record_views", None)
             if not callable(record_views):
@@ -638,15 +727,20 @@ class PositionalExpertReader:
                 raise ValueError("component slot byte count differs from expert record")
             if record.sidecar_offset is None or record.sidecar_length is None:
                 raise ExpertIOError("manifest sidecar record is incomplete")
-            prepared.append((index, record, views))
-        prepared.sort(key=lambda item: int(item[1].sidecar_offset or 0))
+            sidecar_file = _record_sidecar_file(manifest, record)
+            if sidecar_file is None:
+                raise ExpertIOError("component record batch requires a sidecar")
+            prepared.append((index, record, views, sidecar_file))
+        prepared.sort(key=lambda item: (item[3], int(item[1].sidecar_offset or 0)))
         self.metrics.update(
             record_requests=len(prepared),
             sidecar_record_requests=len(prepared),
         )
         digests = [""] * len(prepared)
         try:
-            groups: list[list[tuple[int, ExpertRecord, tuple[memoryview, ...]]]] = []
+            groups: list[
+                list[tuple[int, ExpertRecord, tuple[memoryview, ...], str]]
+            ] = []
             for item in prepared:
                 if not groups:
                     groups.append([item])
@@ -655,23 +749,37 @@ class PositionalExpertReader:
                 expected = int(previous.sidecar_offset or 0) + int(
                     previous.sidecar_length or 0
                 )
-                if int(item[1].sidecar_offset or 0) == expected:
+                if (
+                    item[3] == groups[-1][-1][3]
+                    and int(item[1].sidecar_offset or 0) == expected
+                ):
                     groups[-1].append(item)
                 else:
                     groups.append([item])
             for group in groups:
                 flat_views = tuple(
-                    view for _index, _record, views in group for view in views
+                    view for _index, _record, views, _file in group for view in views
                 )
-                self._readv_range_into(
-                    manifest.sidecar.file,
-                    int(group[0][1].sidecar_offset or 0),
-                    flat_views,
-                    cancel_event=cancel_event,
-                    deadline_ns=deadline_ns,
-                    pipeline_phase=pipeline_phase,
-                )
-                for original_index, record, views in group:
+                if coalesce_chunk_bytes is not None:
+                    self._coalesced_scatter_into(
+                        group[0][3],
+                        int(group[0][1].sidecar_offset or 0),
+                        flat_views,
+                        chunk_bytes=coalesce_chunk_bytes,
+                        cancel_event=cancel_event,
+                        deadline_ns=deadline_ns,
+                        pipeline_phase=pipeline_phase,
+                    )
+                else:
+                    self._readv_range_into(
+                        group[0][3],
+                        int(group[0][1].sidecar_offset or 0),
+                        flat_views,
+                        cancel_event=cancel_event,
+                        deadline_ns=deadline_ns,
+                        pipeline_phase=pipeline_phase,
+                    )
+                for original_index, record, views, _file in group:
                     if verify_hash:
                         hasher = hashlib.sha256()
                         for view in views:
@@ -693,7 +801,7 @@ class PositionalExpertReader:
                         digest = "unverified"
                     digests[original_index] = digest
         finally:
-            for _index, _record, views in prepared:
+            for _index, _record, views, _file in prepared:
                 for view in views:
                     try:
                         view.release()

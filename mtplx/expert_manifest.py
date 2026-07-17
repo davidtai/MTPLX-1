@@ -439,6 +439,9 @@ class ExpertRecord:
     sha256: str | None = None
     sidecar_offset: int | None = None
     sidecar_length: int | None = None
+    # Sharded sidecar layout only: the sidecar shard file holding this
+    # record.  ``sidecar_offset`` is then relative to that shard file.
+    sidecar_shard: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -452,6 +455,8 @@ class ExpertRecord:
         if self.sidecar_offset is not None:
             result["sidecar_offset"] = self.sidecar_offset
             result["sidecar_length"] = self.sidecar_length
+        if self.sidecar_shard is not None:
+            result["sidecar_shard"] = self.sidecar_shard
         return result
 
     @classmethod
@@ -461,7 +466,7 @@ class ExpertRecord:
             obj,
             label="expert record",
             required=("layer", "expert", "logical_bytes", "segments"),
-            optional=("sha256", "sidecar_offset", "sidecar_length"),
+            optional=("sha256", "sidecar_offset", "sidecar_length", "sidecar_shard"),
         )
         raw_segments = obj["segments"]
         if not isinstance(raw_segments, list):
@@ -482,6 +487,15 @@ class ExpertRecord:
             raise ExpertManifestError(
                 "sidecar_offset and sidecar_length must appear together"
             )
+        sidecar_shard = obj.get("sidecar_shard")
+        if sidecar_shard is not None:
+            sidecar_shard = _safe_relative_name(
+                sidecar_shard, label="record sidecar_shard"
+            )
+            if sidecar_offset is None:
+                raise ExpertManifestError(
+                    "record sidecar_shard requires sidecar_offset and sidecar_length"
+                )
         return cls(
             layer=_integer(obj["layer"], label="record layer"),
             expert=_integer(obj["expert"], label="record expert"),
@@ -500,6 +514,7 @@ class ExpertRecord:
                 if sidecar_length is None
                 else _integer(sidecar_length, label="record sidecar_length", minimum=1)
             ),
+            sidecar_shard=sidecar_shard,
         )
 
 
@@ -552,6 +567,10 @@ class ExpertManifest:
     sidecar: SidecarInfo | None = None
     manifest_sha256: str | None = None
     format: str = MANIFEST_FORMAT
+    # Sharded sidecar layout only: the record alignment shared by every
+    # sidecar shard (records carry ``sidecar_shard`` and shard-relative
+    # offsets; there is no single-file ``sidecar`` entry).
+    sidecar_alignment: int | None = None
 
     def to_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -577,6 +596,8 @@ class ExpertManifest:
         }
         if self.sidecar is not None:
             result["sidecar"] = self.sidecar.to_dict()
+        if self.sidecar_alignment is not None:
+            result["sidecar_alignment"] = self.sidecar_alignment
         if include_digest and self.manifest_sha256 is not None:
             result["manifest_sha256"] = self.manifest_sha256
         return result
@@ -608,7 +629,7 @@ class ExpertManifest:
                 "resident_tensors",
                 "records",
             ),
-            optional=("sidecar", "manifest_sha256"),
+            optional=("sidecar", "sidecar_alignment", "manifest_sha256"),
         )
         if obj["format"] != MANIFEST_FORMAT:
             raise ExpertManifestError(f"unsupported manifest format {obj['format']!r}")
@@ -685,6 +706,11 @@ class ExpertManifest:
             sidecar=None
             if obj.get("sidecar") is None
             else SidecarInfo.from_dict(obj["sidecar"]),
+            sidecar_alignment=None
+            if obj.get("sidecar_alignment") is None
+            else _integer(
+                obj["sidecar_alignment"], label="sidecar_alignment", minimum=1
+            ),
             manifest_sha256=None
             if digest is None
             else _string(digest, label="manifest_sha256"),
@@ -829,8 +855,21 @@ class ExpertManifest:
                     f"resident tensor {tensor.tensor} exceeds its shard"
                 )
             resident_shard_names.add(tensor.shard)
-        if self.sidecar is None and any(
-            record.sidecar_offset is not None for record in self.records
+        sharded_records = [
+            record for record in self.records if record.sidecar_shard is not None
+        ]
+        if sharded_records and self.sidecar is not None:
+            raise ExpertManifestError(
+                "sharded sidecar records conflict with single-file sidecar metadata"
+            )
+        if self.sidecar_alignment is not None and not sharded_records:
+            raise ExpertManifestError(
+                "sidecar_alignment requires sharded sidecar records"
+            )
+        if (
+            self.sidecar is None
+            and not sharded_records
+            and any(record.sidecar_offset is not None for record in self.records)
         ):
             raise ExpertManifestError("record sidecar offsets require sidecar metadata")
         if self.sidecar is not None:
@@ -860,6 +899,9 @@ class ExpertManifest:
                 raise ExpertManifestError("sidecar records overlap or are unsorted")
 
         sidecar_shards = [shard for shard in self.shards if shard.kind == "sidecar"]
+        if sharded_records:
+            self._validate_sharded_sidecar(sidecar_shards, sharded_records)
+            return
         if len(sidecar_shards) > 1:
             raise ExpertManifestError(
                 "an authoritative manifest requires exactly one sidecar shard"
@@ -911,6 +953,76 @@ class ExpertManifest:
                     raise ExpertManifestError(
                         "authoritative record components do not cover the record"
                     )
+
+    def _validate_sharded_sidecar(
+        self,
+        sidecar_shards: list[ShardInfo],
+        sharded_records: list[ExpertRecord],
+    ) -> None:
+        """Validate the sharded sidecar layout (per-record sidecar shards)."""
+
+        if len(sharded_records) != len(self.records):
+            raise ExpertManifestError(
+                "sharded sidecar layout requires sidecar_shard on every record"
+            )
+        alignment = self.sidecar_alignment
+        if alignment is None:
+            raise ExpertManifestError(
+                "sharded sidecar records require sidecar_alignment"
+            )
+        if alignment & (alignment - 1):
+            raise ExpertManifestError("sidecar_alignment must be a power of two")
+        shard_map = {shard.name: shard for shard in sidecar_shards}
+        for shard in sidecar_shards:
+            if shard.sha256 is None:
+                raise ExpertManifestError(
+                    f"sidecar shard {shard.name} requires a full-file hash"
+                )
+            _sha256(shard.sha256, label=f"sidecar shard {shard.name} sha256")
+        ranges_by_shard: dict[str, list[tuple[int, int]]] = {}
+        for record in self.records:
+            assert record.sidecar_shard is not None
+            shard = shard_map.get(record.sidecar_shard)
+            if shard is None:
+                raise ExpertManifestError(
+                    f"record sidecar shard {record.sidecar_shard!r} is not a "
+                    "sidecar shard of this manifest"
+                )
+            if record.sha256 is None:
+                raise ExpertManifestError(
+                    "sharded sidecar records require record hashes"
+                )
+            _sha256(record.sha256, label="sharded record sha256")
+            if record.sidecar_offset is None or record.sidecar_length is None:
+                raise ExpertManifestError(
+                    "every sharded record requires a sidecar offset"
+                )
+            if record.sidecar_offset % alignment:
+                raise ExpertManifestError("sidecar record is not aligned")
+            end = record.sidecar_offset + record.sidecar_length
+            if end > shard.size:
+                raise ExpertManifestError(
+                    f"sidecar record exceeds shard {shard.name}"
+                )
+            cursor = record.sidecar_offset
+            for segment in record.segments:
+                if segment.shard != record.sidecar_shard or segment.offset != cursor:
+                    raise ExpertManifestError(
+                        "sharded record components must be contiguous in their "
+                        "sidecar shard"
+                    )
+                cursor += segment.length
+            if cursor != end:
+                raise ExpertManifestError(
+                    "sharded record components do not cover the record"
+                )
+            ranges_by_shard.setdefault(record.sidecar_shard, []).append(
+                (record.sidecar_offset, end)
+            )
+        for name, ranges in ranges_by_shard.items():
+            ordered = sorted(ranges)
+            if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
+                raise ExpertManifestError(f"sidecar shard {name} records overlap")
 
 
 @dataclass(frozen=True)
@@ -1867,3 +1979,226 @@ def build_expert_sidecar(
 def iter_record_keys(manifest: ExpertManifest) -> Iterator[tuple[int, int]]:
     for record in manifest.records:
         yield record.layer, record.expert
+
+
+DEFAULT_SIDECAR_SHARD_TEMPLATE = "experts-{index:05d}-of-{count:05d}.bin"
+DEFAULT_MAX_SIDECAR_SHARD_BYTES = 16 * 1024**3
+
+
+@dataclass(frozen=True)
+class SidecarShardPlan:
+    """One planned sidecar shard: a record-aligned slice of ``experts.bin``."""
+
+    name: str
+    source_offset: int
+    length: int
+    record_indices: tuple[int, ...]
+
+
+def plan_sidecar_shards(
+    manifest: ExpertManifest,
+    *,
+    max_shard_bytes: int = DEFAULT_MAX_SIDECAR_SHARD_BYTES,
+    name_template: str = DEFAULT_SIDECAR_SHARD_TEMPLATE,
+) -> tuple[SidecarShardPlan, ...]:
+    """Cut the single sidecar into record-boundary shards (never mid-record).
+
+    Every shard starts exactly at a record's ``sidecar_offset`` (which is
+    aligned), so shard-relative record offsets keep the sidecar alignment.
+    Records are never split across shards; a shard may exceed
+    ``max_shard_bytes`` only when a single record is larger than the limit,
+    which is rejected instead.
+    """
+
+    if isinstance(max_shard_bytes, bool) or not isinstance(max_shard_bytes, int):
+        raise ExpertManifestError("max_shard_bytes must be an integer")
+    if max_shard_bytes <= 0:
+        raise ExpertManifestError("max_shard_bytes must be positive")
+    if manifest.sidecar is None:
+        raise ExpertManifestError("sidecar sharding requires a single-file sidecar")
+    manifest.validate_structure()
+    for record in manifest.records:
+        if record.sidecar_offset is None or record.sidecar_length is None:
+            raise ExpertManifestError("every record requires a sidecar offset")
+        if record.sidecar_length > max_shard_bytes:
+            raise ExpertManifestError(
+                f"record ({record.layer}, {record.expert}) is larger than "
+                f"max_shard_bytes {max_shard_bytes}"
+            )
+
+    boundaries: list[list[int]] = []
+    current: list[int] = []
+    current_start = 0
+    for index, record in enumerate(manifest.records):
+        offset = int(record.sidecar_offset or 0)
+        end = offset + int(record.sidecar_length or 0)
+        if not current:
+            current = [index]
+            current_start = offset
+            continue
+        if end - current_start > max_shard_bytes:
+            boundaries.append(current)
+            current = [index]
+            current_start = offset
+        else:
+            current.append(index)
+    if current:
+        boundaries.append(current)
+
+    count = len(boundaries)
+    plans: list[SidecarShardPlan] = []
+    for shard_index, record_indices in enumerate(boundaries, start=1):
+        first = manifest.records[record_indices[0]]
+        last = manifest.records[record_indices[-1]]
+        start = int(first.sidecar_offset or 0)
+        end = int(last.sidecar_offset or 0) + int(last.sidecar_length or 0)
+        name = _safe_relative_name(
+            name_template.format(index=shard_index, count=count),
+            label="sidecar shard name",
+        )
+        plans.append(
+            SidecarShardPlan(
+                name=name,
+                source_offset=start,
+                length=end - start,
+                record_indices=tuple(record_indices),
+            )
+        )
+    if len({plan.name for plan in plans}) != len(plans):
+        raise ExpertManifestError("sidecar shard name template repeats names")
+    return tuple(plans)
+
+
+def write_sidecar_shards(
+    manifest: ExpertManifest,
+    root: Path | str,
+    plans: tuple[SidecarShardPlan, ...],
+    *,
+    output_dir: Path | str | None = None,
+    chunk_bytes: int = 8 * 1024 * 1024,
+) -> ExpertManifest:
+    """Copy planned shard byte ranges out of the sidecar and re-manifest.
+
+    Returns a sharded-layout manifest: records carry ``sidecar_shard`` and
+    shard-relative offsets, segments are rebased into their shard file, the
+    single ``sidecar`` entry is replaced by one ``kind="sidecar"`` shard per
+    output file, and ``sidecar_alignment`` preserves the record alignment.
+    The copy is byte-exact (interior alignment padding included) and every
+    shard is hashed while it is written.
+    """
+
+    if manifest.sidecar is None:
+        raise ExpertManifestError("sidecar sharding requires a single-file sidecar")
+    if not plans:
+        raise ExpertManifestError("sidecar sharding requires at least one shard plan")
+    for record in manifest.records:
+        if record.sha256 is None:
+            raise ExpertManifestError(
+                "sharded sidecar records require record hashes; rebuild the "
+                "manifest with hash_records=True"
+            )
+    planned_indices = [index for plan in plans for index in plan.record_indices]
+    if planned_indices != list(range(len(manifest.records))):
+        raise ExpertManifestError("shard plans must cover every record exactly once")
+    artifact_root = Path(root).resolve()
+    source_path = _resolve_member(artifact_root, manifest.sidecar.file)
+    target_root = (
+        artifact_root if output_dir is None else Path(output_dir).resolve()
+    )
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    shard_infos: list[ShardInfo] = []
+    updated_records: dict[int, ExpertRecord] = {}
+    source_fd = os.open(source_path, _readonly_flags())
+    try:
+        for plan in plans:
+            digest = hashlib.sha256()
+            final_path = target_root / plan.name
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            partial = final_path.with_name(f".{final_path.name}.partial")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            out_fd = os.open(partial, flags, 0o644)
+            try:
+                remaining = plan.length
+                position = plan.source_offset
+                write_position = 0
+                while remaining:
+                    payload = _pread_exact(
+                        source_fd, position, min(chunk_bytes, remaining)
+                    )
+                    digest.update(payload)
+                    view = memoryview(payload)
+                    while view:
+                        try:
+                            written = os.pwrite(out_fd, view, write_position)
+                        except InterruptedError:
+                            continue
+                        if written <= 0:
+                            raise ExpertManifestError(
+                                "short positional sidecar shard write"
+                            )
+                        write_position += written
+                        view = view[written:]
+                    position += len(payload)
+                    remaining -= len(payload)
+                os.fsync(out_fd)
+            except OSError as exc:
+                raise ExpertManifestError(
+                    f"sidecar shard write failed: {exc}"
+                ) from exc
+            finally:
+                os.close(out_fd)
+            try:
+                os.replace(partial, final_path)
+            except OSError as exc:
+                raise ExpertManifestError(
+                    f"could not publish sidecar shard {plan.name}: {exc}"
+                ) from exc
+            shard_infos.append(
+                ShardInfo(
+                    name=plan.name,
+                    size=plan.length,
+                    header_bytes=0,
+                    header_sha256=EMPTY_SHA256,
+                    sha256=digest.hexdigest(),
+                    kind="sidecar",
+                )
+            )
+            for index in plan.record_indices:
+                record = manifest.records[index]
+                assert record.sidecar_offset is not None
+                new_offset = record.sidecar_offset - plan.source_offset
+                cursor = new_offset
+                segments: list[TensorSegment] = []
+                for segment in record.segments:
+                    segments.append(
+                        replace(segment, shard=plan.name, offset=cursor)
+                    )
+                    cursor += segment.length
+                updated_records[index] = replace(
+                    record,
+                    segments=tuple(segments),
+                    sidecar_offset=new_offset,
+                    sidecar_shard=plan.name,
+                )
+    finally:
+        os.close(source_fd)
+
+    retained_shards = tuple(
+        shard
+        for shard in manifest.shards
+        if not (shard.kind == "sidecar" and shard.name == manifest.sidecar.file)
+    )
+    sharded = replace(
+        manifest,
+        shards=retained_shards + tuple(shard_infos),
+        records=tuple(
+            updated_records[index] for index in range(len(manifest.records))
+        ),
+        sidecar=None,
+        sidecar_alignment=manifest.sidecar.alignment,
+        manifest_sha256=None,
+    ).with_digest()
+    sharded.validate_structure()
+    return sharded
