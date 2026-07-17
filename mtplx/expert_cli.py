@@ -99,6 +99,26 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
         "--expert-slot-layout",
         choices=["direct-slots", "component-banks", "metal-mmap"],
     )
+    group.add_argument(
+        "--expert-hy3-router-kernel",
+        choices=[
+            "stock",
+            "steel-r1-fused-r2",
+            "mpp-r1-fused-r2",
+            "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
+            "mpp-row-owned-fused",
+        ],
+        help="Experimental Hy3 authoritative router kernel selector.",
+    )
+    group.add_argument(
+        "--expert-hy3-router-sigmoid",
+        choices=["precise", "fast"],
+        help=(
+            "Experimental Hy3 row-owned router sigmoid mode; fast requires "
+            "mpp-row-owned-fused."
+        ),
+    )
     group.add_argument("--expert-frequency-decay", type=float)
     group.add_argument(
         "--expert-prefer-sidecar",
@@ -196,6 +216,8 @@ def expert_streaming_load_kwargs(
         "max_read_chunk_bytes": getattr(args, "expert_read_chunk", None),
         "bypass_page_cache": getattr(args, "expert_f_nocache", None),
         "slot_layout": getattr(args, "expert_slot_layout", None),
+        "hy3_router_kernel": getattr(args, "expert_hy3_router_kernel", None),
+        "hy3_router_sigmoid": getattr(args, "expert_hy3_router_sigmoid", None),
         "frequency_decay": getattr(args, "expert_frequency_decay", None),
         "prefer_sidecar": getattr(args, "expert_prefer_sidecar", None),
         "verify_record_hashes": getattr(args, "expert_verify_record_hashes", None),
@@ -266,6 +288,8 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
         ("expert_max_open_files", "--expert-max-open-files"),
         ("expert_read_chunk", "--expert-read-chunk"),
         ("expert_slot_layout", "--expert-slot-layout"),
+        ("expert_hy3_router_kernel", "--expert-hy3-router-kernel"),
+        ("expert_hy3_router_sigmoid", "--expert-hy3-router-sigmoid"),
         ("expert_frequency_decay", "--expert-frequency-decay"),
     )
     for attribute, flag in mappings:

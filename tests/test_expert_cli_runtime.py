@@ -298,6 +298,80 @@ def test_expert_cli_json_and_flags_are_strict_and_forwarded(tmp_path: Path) -> N
     assert "--no-expert-verify-record-hashes" in command
 
 
+def _router_config_path(tmp_path: Path, **overrides: object) -> Path:
+    values: dict[str, object] = {
+        "model_key": "hy3-q4",
+        "memory_limit_bytes": "96GiB",
+        "max_live_kv_tokens": 4096,
+    }
+    values.update(overrides)
+    path = tmp_path / "router-stream.json"
+    path.write_text(json.dumps(values), encoding="utf-8")
+    return path
+
+
+def test_public_hy3_router_flags_override_json_and_forward(
+    tmp_path: Path,
+) -> None:
+    root = _model_root(tmp_path)
+    config_path = _router_config_path(
+        tmp_path,
+        hy3_router_kernel="stock",
+        hy3_router_sigmoid="precise",
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-streaming-config",
+            str(config_path),
+            "--expert-hy3-router-kernel",
+            "mpp-row-owned-fused",
+            "--expert-hy3-router-sigmoid",
+            "fast",
+        ]
+    )
+
+    config = expert_streaming_load_kwargs(args, root)["expert_streaming_config"]
+    assert config.hy3_router_kernel == "mpp-row-owned-fused"
+    assert config.hy3_router_sigmoid == "fast"
+
+    command = ["python", "-m", "mtplx.server.openai"]
+    append_expert_streaming_child_args(command, args)
+    assert command[command.index("--expert-hy3-router-kernel") + 1] == (
+        "mpp-row-owned-fused"
+    )
+    assert command[command.index("--expert-hy3-router-sigmoid") + 1] == "fast"
+
+
+def test_omitted_public_hy3_router_flags_preserve_json(tmp_path: Path) -> None:
+    root = _model_root(tmp_path)
+    config_path = _router_config_path(
+        tmp_path,
+        hy3_router_kernel="mpp-row-owned-fused",
+        hy3_router_sigmoid="fast",
+    )
+    args = _parser().parse_args(["--expert-streaming-config", str(config_path)])
+
+    config = expert_streaming_load_kwargs(args, root)["expert_streaming_config"]
+    assert config.hy3_router_kernel == "mpp-row-owned-fused"
+    assert config.hy3_router_sigmoid == "fast"
+
+
+def test_public_fast_sigmoid_rejects_incompatible_router(tmp_path: Path) -> None:
+    root = _model_root(tmp_path)
+    config_path = _router_config_path(tmp_path, hy3_router_kernel="stock")
+    args = _parser().parse_args(
+        [
+            "--expert-streaming-config",
+            str(config_path),
+            "--expert-hy3-router-sigmoid",
+            "fast",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="fast router sigmoid"):
+        expert_streaming_load_kwargs(args, root)
+
+
 def test_expert_cli_requires_memory_and_kv_limits(tmp_path: Path) -> None:
     root = _model_root(tmp_path)
     args = _parser().parse_args(["--expert-streaming"])
