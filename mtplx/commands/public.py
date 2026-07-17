@@ -8176,6 +8176,10 @@ def cmd_serve_public(args: Any) -> int:
         )
     if bool(getattr(args, "experimental_mtp_cohorts", False)):
         cmd.append("--experimental-mtp-cohorts")
+    if bool(getattr(args, "experimental_qwen_row_traversal", False)):
+        cmd.append("--experimental-qwen-row-traversal")
+    if bool(getattr(args, "experimental_qwen_fast_sigmoid", False)):
+        cmd.append("--experimental-qwen-fast-sigmoid")
     ssd_session_cache = str(getattr(args, "ssd_session_cache", "on") or "on")
     cmd.extend(["--ssd-session-cache", ssd_session_cache])
     ssd_dir = getattr(args, "ssd_session_cache_dir", None)
@@ -11023,6 +11027,8 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("adaptive_ev_min_extra_accept_probability", 0.18),
         ("adaptive_ev_warmup_full_depth_cycles", 4),
         ("adaptive_ev_exploration_interval", 32),
+        ("experimental_qwen_row_traversal", False),
+        ("experimental_qwen_fast_sigmoid", False),
     ):
         setattr(target, attr, getattr(source, attr, default))
     return target

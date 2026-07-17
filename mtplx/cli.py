@@ -655,6 +655,28 @@ def _add_batching_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_qwen_experimental_kernel_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--experimental-qwen-row-traversal",
+        action="store_true",
+        help=(
+            "Experimental Qwen dense-MLP gate/up traversal: fuse the original "
+            "Q4 arrays in output-tile order and apply precise SwiGLU in-kernel. "
+            "Default off; preserves dtypes but changes the FP32 reduction tree."
+        ),
+    )
+    group.add_argument(
+        "--experimental-qwen-fast-sigmoid",
+        action="store_true",
+        help=(
+            "Experimental standalone Qwen SwiGLU fast-sigmoid A/B. Default "
+            "off; keeps stock projections but uses approximate fast exp and "
+            "must be benchmarked separately from row traversal."
+        ),
+    )
+
+
 def _add_ssd_session_cache_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ssd-session-cache",
@@ -1926,6 +1948,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROFILE_NAME,
         help="Runtime profile; start defaults to Sustained. Use --profile turbo for the verify-kernel fast path (4/8-bit affine), or --profile performance-cold --max for Burst.",
     )
+    _add_qwen_experimental_kernel_args(start_flow_p)
     start_flow_p.add_argument("--download", action="store_true", help="Download the selected/default model if it is missing")
     start_flow_p.add_argument("--yes", action="store_true", help="Use defaults without interactive model prompts")
     start_flow_p.add_argument("--unsafe-force-unverified", action="store_true")
@@ -2108,6 +2131,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROFILE_NAME,
         help="Runtime profile. Direct server quickstart defaults to Sustained; use --profile performance-cold --max for Burst.",
     )
+    _add_qwen_experimental_kernel_args(quickstart_server_p)
     quickstart_server_p.add_argument("--unsafe-force-unverified", action="store_true")
     quickstart_server_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     quickstart_server_p.add_argument("--host", default="127.0.0.1")
@@ -2557,6 +2581,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Committed-token batch size per chat SSE chunk.",
     )
     _add_batching_args(serve_p)
+    _add_qwen_experimental_kernel_args(serve_p)
     _add_ssd_session_cache_args(serve_p)
     _add_paged_kv_quant_args(serve_p)
     _add_adaptive_args(serve_p)

@@ -30,6 +30,36 @@ def test_server_parser_accepts_native_app_launch_id():
     assert args.app_launch_id == "native-123"
 
 
+def test_server_parser_maps_qwen_experimental_flags_to_runtime_variants(
+    monkeypatch,
+):
+    monkeypatch.delenv("MTPLX_MLP_CALL_VARIANT", raising=False)
+    row = parse_args(
+        ["--warmup-tokens", "0", "--experimental-qwen-row-traversal"]
+    )
+    assert row.experimental_qwen_row_traversal is True
+    assert row.experimental_qwen_fast_sigmoid is False
+    assert os.environ["MTPLX_MLP_CALL_VARIANT"] == "fused_gateup_vk_k_bn2"
+
+    monkeypatch.delenv("MTPLX_MLP_CALL_VARIANT", raising=False)
+    fast = parse_args(
+        ["--warmup-tokens", "0", "--experimental-qwen-fast-sigmoid"]
+    )
+    assert fast.experimental_qwen_row_traversal is False
+    assert fast.experimental_qwen_fast_sigmoid is True
+    assert os.environ["MTPLX_MLP_CALL_VARIANT"] == "fast_sigmoid"
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--warmup-tokens",
+                "0",
+                "--experimental-qwen-row-traversal",
+                "--experimental-qwen-fast-sigmoid",
+            ]
+        )
+
+
 def test_server_parser_resolves_api_key_file_before_env(monkeypatch, tmp_path):
     api_key_file = tmp_path / "api-key"
     api_key_file.write_text("file-secret\n", encoding="utf-8")

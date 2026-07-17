@@ -5553,6 +5553,35 @@ def test_cli_parses_api_key_file_and_kv_quant_flags():
     assert serve.paged_kv_quantization == "off"
 
 
+def test_cli_parses_qwen_experimental_kernel_flags():
+    parser = build_parser()
+
+    start = parser.parse_args(
+        ["start", "opencode", "--experimental-qwen-row-traversal"]
+    )
+    quickstart = parser.parse_args(
+        ["quickstart", "--experimental-qwen-fast-sigmoid"]
+    )
+    serve = parser.parse_args(
+        ["serve", "--experimental-qwen-row-traversal"]
+    )
+
+    assert start.experimental_qwen_row_traversal is True
+    assert start.experimental_qwen_fast_sigmoid is False
+    assert quickstart.experimental_qwen_row_traversal is False
+    assert quickstart.experimental_qwen_fast_sigmoid is True
+    assert serve.experimental_qwen_row_traversal is True
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "quickstart",
+                "--experimental-qwen-row-traversal",
+                "--experimental-qwen-fast-sigmoid",
+            ]
+        )
+
+
 def test_quickstart_dry_run_json_previews_server_without_side_effects(
     monkeypatch, capsys
 ):
@@ -5591,6 +5620,7 @@ def test_quickstart_dry_run_json_previews_server_without_side_effects(
             "secret-value",
             "--warmup-tokens",
             "0",
+            "--experimental-qwen-row-traversal",
         ]
     )
 
@@ -5605,6 +5635,7 @@ def test_quickstart_dry_run_json_previews_server_without_side_effects(
     assert payload["port"] == 18191
     assert payload["api_base_url"] == "http://127.0.0.1:18191/v1"
     assert "--api-key" in payload["argv"]
+    assert "--experimental-qwen-row-traversal" in payload["argv"]
     assert payload["argv"][payload["argv"].index("--api-key") + 1] == "[redacted]"
     assert "secret-value" not in payload["server_command"]
 

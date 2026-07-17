@@ -24824,6 +24824,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME
     )
+    qwen_kernel_group = parser.add_mutually_exclusive_group()
+    qwen_kernel_group.add_argument(
+        "--experimental-qwen-row-traversal",
+        action="store_true",
+        help=(
+            "Experimental Qwen dense-MLP gate/up output-tile traversal. "
+            "Preserves Q4/BF16/FP32 precision but changes the FP32 reduction tree."
+        ),
+    )
+    qwen_kernel_group.add_argument(
+        "--experimental-qwen-fast-sigmoid",
+        action="store_true",
+        help=(
+            "Experimental standalone Qwen fast-sigmoid A/B using approximate "
+            "fast exp; mutually exclusive with row traversal."
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -25302,6 +25319,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(raw_args)
     args._raw_args = list(raw_args)
     args._cli_flags = _explicit_server_flags(raw_args)
+    if args.experimental_qwen_row_traversal:
+        os.environ["MTPLX_MLP_CALL_VARIANT"] = "fused_gateup_vk_k_bn2"
+    elif args.experimental_qwen_fast_sigmoid:
+        os.environ["MTPLX_MLP_CALL_VARIANT"] = "fast_sigmoid"
     try:
         resolved_key = resolve_api_key(
             explicit_api_key=getattr(args, "api_key", None),
