@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -441,6 +441,50 @@ class MappedExpertStore:
         gc.collect()
 
 
+def _island_fill_workers_default() -> int:
+    """Load-time island-fill parallelism (``MTPLX_ISLAND_FILL_WORKERS``).
+
+    Island layers are independent contiguous sidecar ranges; both the
+    positional reads and the SHA-256 verification release the GIL, so a few
+    layer-fill threads overlap SSD streams with hashing.  The default of 6
+    aims at saturating the measured ~12 GiB/s SSD ceiling with ~2 GiB/s
+    per-stream reads and per-core hashing; it is a load-time-only knob.
+    """
+
+    raw = os.environ.get("MTPLX_ISLAND_FILL_WORKERS", "").strip()
+    if not raw:
+        return 6
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("MTPLX_ISLAND_FILL_WORKERS must be an integer") from exc
+    return max(1, min(value, 64))
+
+
+def _island_fill_coalesce_default() -> int | None:
+    """Optional bounce-buffer chunk size (``MTPLX_ISLAND_FILL_COALESCE_MB``).
+
+    Unset or ``0`` keeps the proven scatter-``preadv`` fill path.  A positive
+    value reads each contiguous layer range as large sequential chunks (native
+    backend eligible) and slices them into the component banks; the bank bytes
+    are bitwise-identical either way.  Off by default until the two paths are
+    compared in a guarded benchmark window (``scripts/bench_island_fill.py``).
+    """
+
+    raw = os.environ.get("MTPLX_ISLAND_FILL_COALESCE_MB", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "MTPLX_ISLAND_FILL_COALESCE_MB must be an integer"
+        ) from exc
+    if value <= 0:
+        return None
+    return value * 1024 * 1024
+
+
 class DenseIslandStore:
     """Capacity-guaranteed dense per-layer expert banks (issue #63, C5).
 
@@ -504,15 +548,42 @@ class DenseIslandStore:
         reader: PositionalExpertReader,
         *,
         verify_hash: bool = True,
+        max_workers: int | None = None,
+        coalesce_chunk_bytes: int | None = None,
     ) -> None:
-        """Bulk-read every island expert into its bank row (one-time cost)."""
+        """Bulk-read every island expert into its bank row (one-time cost).
+
+        Pending layers fill on a load-time thread pool: each layer is one
+        independent contiguous sidecar range, its bank rows are written by
+        exactly one worker, and the reader is safe for concurrent positional
+        use, so the bank bytes are bitwise-identical to a serial fill.  The
+        pool exists only inside this call; decode-path execution never sees
+        these threads.  ``max_workers=1`` restores the serial fill;
+        ``coalesce_chunk_bytes`` selects the sequential bounce-buffer read
+        path.  Both default to the environment knobs documented on
+        ``_island_fill_workers_default`` / ``_island_fill_coalesce_default``.
+        A layer is marked filled only after its read verifies, so a failed
+        parallel fill can be retried and completes the remaining layers.
+        """
 
         if self._closed:
             raise RuntimeError("dense island store is closed")
+        if max_workers is None:
+            max_workers = _island_fill_workers_default()
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int):
+            raise TypeError("max_workers must be an integer")
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        if coalesce_chunk_bytes is None:
+            coalesce_chunk_bytes = _island_fill_coalesce_default()
+        pending = [
+            layer for layer in self.layers if layer not in self._filled_layers
+        ]
+        if not pending:
+            return
         started = time.perf_counter()
-        for layer in self.layers:
-            if layer in self._filled_layers:
-                continue
+
+        def fill_layer(layer: int) -> int:
             bank = self._banks[layer]
             items = tuple(
                 (
@@ -529,8 +600,31 @@ class DenseIslandStore:
                 manifest,
                 items,
                 verify_hash=verify_hash,
+                coalesce_chunk_bytes=coalesce_chunk_bytes,
             )
-            self._filled_layers.add(layer)
+            return layer
+
+        workers = min(max_workers, len(pending))
+        if workers == 1:
+            for layer in pending:
+                fill_layer(layer)
+                self._filled_layers.add(layer)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="mtplx-island-fill",
+            ) as executor:
+                futures = tuple(
+                    executor.submit(fill_layer, layer) for layer in pending
+                )
+                try:
+                    for future in as_completed(futures):
+                        # Store state mutates only on the caller thread.
+                        self._filled_layers.add(future.result())
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
         self._fill_seconds += time.perf_counter() - started
 
     def bank_for_layer(self, layer: int) -> MlxComponentBank:

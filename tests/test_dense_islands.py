@@ -316,6 +316,166 @@ def test_island_store_fill_places_expert_bytes_in_expert_rows(
         reader.close()
 
 
+def _assert_banks_match_expected(store, spec, manifest, expected) -> None:
+    for layer in spec.routed_layer_indices:
+        bank = store.bank_for_layer(layer)
+        for expert in range(spec.expert_count):
+            payload = bytearray()
+            record = next(
+                r
+                for r in manifest.records
+                if r.layer == layer and r.expert == expert
+            )
+            for segment in record.segments:
+                payload.extend(bank.component_view(expert, segment.component))
+            assert bytes(payload) == expected[(layer, expert)]
+
+
+@pytest.mark.parametrize(
+    ("max_workers", "coalesce_chunk_bytes"),
+    [
+        (1, None),
+        (4, None),
+        (1, 1_000),
+        (4, 1_000),
+    ],
+)
+def test_island_store_fill_paths_are_bitwise_identical(
+    tmp_path, mlx, max_workers, coalesce_chunk_bytes
+) -> None:
+    """Parallel and coalesced fills land the exact serial bank bytes."""
+
+    from mtplx.models.expert_mlx import DenseIslandStore
+
+    root, spec, manifest, expected = _sidecar_artifact(tmp_path)
+    store = DenseIslandStore(
+        manifest,
+        spec.routed_layer_indices,
+        expert_count=spec.expert_count,
+    )
+    reader = PositionalExpertReader(root)
+    try:
+        store.fill(
+            manifest,
+            reader,
+            verify_hash=True,
+            max_workers=max_workers,
+            coalesce_chunk_bytes=coalesce_chunk_bytes,
+        )
+        _assert_banks_match_expected(store, spec, manifest, expected)
+        assert store.snapshot()["filled_layers"] == len(spec.routed_layer_indices)
+    finally:
+        store.close()
+        reader.close()
+
+
+def test_island_store_fill_reads_sharded_sidecar_layout(tmp_path, mlx) -> None:
+    """The island fill works directly on a sharded sidecar (no reassembly)."""
+
+    from mtplx.expert_manifest import plan_sidecar_shards, write_sidecar_shards
+    from mtplx.models.expert_mlx import DenseIslandStore
+
+    root, spec, manifest, expected = _sidecar_artifact(tmp_path)
+    plans = plan_sidecar_shards(manifest, max_shard_bytes=24_000)
+    assert len(plans) > 1
+    sharded = write_sidecar_shards(manifest, root, plans)
+    store = DenseIslandStore(
+        sharded,
+        spec.routed_layer_indices,
+        expert_count=spec.expert_count,
+    )
+    reader = PositionalExpertReader(root)
+    try:
+        store.fill(sharded, reader, verify_hash=True, max_workers=3)
+        _assert_banks_match_expected(store, spec, sharded, expected)
+    finally:
+        store.close()
+        reader.close()
+
+
+def test_island_fill_worker_env_knobs(monkeypatch) -> None:
+    from mtplx.models.expert_mlx import (
+        _island_fill_coalesce_default,
+        _island_fill_workers_default,
+    )
+
+    monkeypatch.delenv("MTPLX_ISLAND_FILL_WORKERS", raising=False)
+    monkeypatch.delenv("MTPLX_ISLAND_FILL_COALESCE_MB", raising=False)
+    assert _island_fill_workers_default() == 6
+    assert _island_fill_coalesce_default() is None
+    monkeypatch.setenv("MTPLX_ISLAND_FILL_WORKERS", "12")
+    assert _island_fill_workers_default() == 12
+    monkeypatch.setenv("MTPLX_ISLAND_FILL_WORKERS", "0")
+    assert _island_fill_workers_default() == 1
+    monkeypatch.setenv("MTPLX_ISLAND_FILL_WORKERS", "banana")
+    with pytest.raises(ValueError, match="MTPLX_ISLAND_FILL_WORKERS"):
+        _island_fill_workers_default()
+    monkeypatch.setenv("MTPLX_ISLAND_FILL_COALESCE_MB", "32")
+    assert _island_fill_coalesce_default() == 32 * 1024 * 1024
+    monkeypatch.setenv("MTPLX_ISLAND_FILL_COALESCE_MB", "0")
+    assert _island_fill_coalesce_default() is None
+    monkeypatch.setenv("MTPLX_ISLAND_FILL_COALESCE_MB", "banana")
+    with pytest.raises(ValueError, match="MTPLX_ISLAND_FILL_COALESCE_MB"):
+        _island_fill_coalesce_default()
+
+
+def test_island_fill_validates_worker_arguments(tmp_path, mlx) -> None:
+    from mtplx.models.expert_mlx import DenseIslandStore
+
+    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
+    store = DenseIslandStore(
+        manifest,
+        spec.routed_layer_indices[:1],
+        expert_count=spec.expert_count,
+    )
+    reader = PositionalExpertReader(root)
+    try:
+        with pytest.raises(TypeError, match="max_workers"):
+            store.fill(manifest, reader, max_workers=True)
+        with pytest.raises(ValueError, match="max_workers"):
+            store.fill(manifest, reader, max_workers=0)
+    finally:
+        store.close()
+        reader.close()
+
+
+def test_island_parallel_fill_failure_leaves_layers_retryable(
+    tmp_path, mlx
+) -> None:
+    """A failed layer stays unfilled; a retry completes it."""
+
+    from mtplx.expert_io import ExpertIOError
+    from mtplx.models.expert_mlx import DenseIslandStore
+
+    root, spec, manifest, expected = _sidecar_artifact(tmp_path)
+    store = DenseIslandStore(
+        manifest,
+        spec.routed_layer_indices,
+        expert_count=spec.expert_count,
+    )
+    reader = PositionalExpertReader(root)
+    poisoned_layer = spec.routed_layer_indices[0]
+    original = reader.read_component_records_into
+    fail_once = {"armed": True}
+
+    def flaky(manifest_arg, items, **kwargs):
+        if fail_once["armed"] and items[0][0].layer == poisoned_layer:
+            fail_once["armed"] = False
+            raise ExpertIOError("injected island fill failure")
+        return original(manifest_arg, items, **kwargs)
+
+    reader.read_component_records_into = flaky
+    try:
+        with pytest.raises(ExpertIOError, match="injected"):
+            store.fill(manifest, reader, verify_hash=True, max_workers=2)
+        assert poisoned_layer not in store._filled_layers
+        store.fill(manifest, reader, verify_hash=True, max_workers=2)
+        _assert_banks_match_expected(store, spec, manifest, expected)
+    finally:
+        store.close()
+        reader.close()
+
+
 def test_island_store_requires_complete_layer(tmp_path, mlx) -> None:
     from mtplx.models.expert_mlx import DenseIslandStore
 
