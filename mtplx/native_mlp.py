@@ -89,6 +89,10 @@ def _normalized_variant() -> str:
         "tiled_gateup": "tiled_gateup",
         "rowwise_sg4": "rowwise_sg4",
         "split_gateup": "split_gateup",
+        "fused_gateup_vk_k": "fused_gateup_vk_k",
+        "fused_gateup_vkk": "fused_gateup_vk_k",
+        "fused_gateup_vk_k_bn2": "fused_gateup_vk_k_bn2",
+        "fast_sigmoid": "fast_sigmoid",
         "native_rowwise": "native_rowwise",
         "native_full_rowwise": "native_full_rowwise",
     }
@@ -218,6 +222,29 @@ def configure_native_mlp(model: Any | None = None) -> dict[str, int | bool | str
                 x,
                 self.gate_proj,
                 self.up_proj,
+            )
+            _STATS["variant_calls"] = int(_STATS["variant_calls"]) + 1
+            return self.down_proj(act)
+
+        if variant in {"fused_gateup_vk_k", "fused_gateup_vk_k_bn2"}:
+            from .kernels.qwen_verify_mlp_fused_k import qwen_gate_up_swiglu_vk_k
+
+            act = qwen_gate_up_swiglu_vk_k(
+                x,
+                self.gate_proj,
+                self.up_proj,
+                tile_cols=2 if variant.endswith("_bn2") else 4,
+            )
+            _STATS["variant_calls"] = int(_STATS["variant_calls"]) + 1
+            return self.down_proj(act)
+
+        if variant == "fast_sigmoid":
+            from .kernels.qwen_fast_sigmoid import qwen_swiglu
+
+            act = qwen_swiglu(
+                self.gate_proj(x),
+                self.up_proj(x),
+                fast=True,
             )
             _STATS["variant_calls"] = int(_STATS["variant_calls"]) + 1
             return self.down_proj(act)
