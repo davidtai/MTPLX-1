@@ -1,7 +1,7 @@
 # Hy3 Router Public CLI Flags
 
 Date: 2026-07-17
-Status: Proposed for user review
+Status: Approved for experimental implementation
 Base: `origin/experiment/issue51-stack-69` at `9bf92ad`
 
 ## Problem
@@ -71,6 +71,34 @@ The PR body must explicitly discuss floating-point non-associativity:
 
 This PR only exposes already-existing modes. It does not modify arithmetic,
 reduction order, sigmoid code, or model precision.
+
+## Experimental Status and Tradeoffs
+
+The public controls are explicitly experimental and opt-in. The PR must not
+change defaults or describe either mode as generally promoted.
+
+Pros:
+
+- Makes the existing row-owned, protocol-free MPP router selectable in a
+  production-style server launch without a hand-written JSON override.
+- Preserves the tile-major prepared-weight layout and its measured queued-lane
+  locality benefits.
+- Makes the existing FP32 fast-exponential experiment reproducible through the
+  same public launch surface.
+- Keeps rollback immediate: omit the flags or select the prior precise router.
+
+Cons and limits:
+
+- The row-owned kernel is Hy3-specific and dispatches only the eligible M2-M8
+  decode shapes; M1 and out-of-contract shapes retain their established path.
+- The prepared tile-major router weight has an incremental memory cost and
+  requires compatible Apple Metal MPP support.
+- Fast sigmoid uses an approximate FP32 exponential. It keeps tensor precision
+  unchanged but can change low bits and, around close routing boundaries,
+  potentially selection or normalized weights.
+- Re-associated FP32 partial reductions are non-associative. Same precision is
+  not a bitwise-equivalence proof, so measured routing and end-to-end gates are
+  mandatory.
 
 ## Test Strategy
 
