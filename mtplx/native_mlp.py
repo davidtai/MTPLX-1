@@ -227,8 +227,11 @@ def configure_native_mlp(model: Any | None = None) -> dict[str, int | bool | str
             return self.down_proj(act)
 
         if variant in {"fused_gateup_vk_k", "fused_gateup_vk_k_bn2"}:
+            from .kernel_selfcheck import lane_disabled
             from .kernels.qwen_verify_mlp_fused_k import qwen_gate_up_swiglu_vk_k
 
+            if lane_disabled("qwen_rt_gateup"):
+                return _fallback(self, x)
             act = qwen_gate_up_swiglu_vk_k(
                 x,
                 self.gate_proj,

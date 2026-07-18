@@ -69,7 +69,11 @@ def selfcheck_enabled() -> bool:
         return False
     if raw in {"1", "true", "on", "yes"}:
         return True
-    return _env_on("MTPLX_NAX_VERIFY") or _env_on("MTPLX_GQA_PACKED_SDPA")
+    if _env_on("MTPLX_NAX_VERIFY") or _env_on("MTPLX_GQA_PACKED_SDPA"):
+        return True
+    from .qwen_row_traversal import qwen_row_traversal_qlinear_enabled
+
+    return _qwen_rt_mlp_variant_active() or qwen_row_traversal_qlinear_enabled()
 
 
 def lane_disabled(lane: str) -> bool:
@@ -165,6 +169,48 @@ def _check_gqa_packed(mx, dtype) -> float:
         mask=mask,
     )
     return _max_abs_diff(mx, out, ref)
+
+
+def _qwen_rt_mlp_variant_active() -> bool:
+    variant = os.environ.get("MTPLX_MLP_CALL_VARIANT", "").strip().lower()
+    return variant.replace("-", "_") in {
+        "fused_gateup_vk_k",
+        "fused_gateup_vkk",
+        "fused_gateup_vk_k_bn2",
+    }
+
+
+def _check_qwen_rt_gateup_lane(mx, group_size: int, dtype) -> float:
+    """Fused gate/up+SwiGLU tile vs the stock two-projection reference.
+
+    Uses the widest verify tile (M6) at an eligible shape (N >= 4096); the
+    per-row accumulators are independent, so one tile validates the family.
+    """
+    import mlx.nn as nn
+
+    from .kernels.qwen_verify_mlp_fused_k import qwen_gate_up_swiglu_vk_k
+
+    k, n = _K, 4096
+    mx.random.seed(7)
+    gate = nn.QuantizedLinear(k, n, bias=False, group_size=group_size, bits=4)
+    up = nn.QuantizedLinear(k, n, bias=False, group_size=group_size, bits=4)
+    gate.scales = gate.scales.astype(dtype)
+    gate.biases = gate.biases.astype(dtype)
+    up.scales = up.scales.astype(dtype)
+    up.biases = up.biases.astype(dtype)
+    x = (mx.random.normal((6, k), dtype=mx.float32) * 0.5).astype(dtype)
+    candidate = qwen_gate_up_swiglu_vk_k(x, gate, up, tile_cols=2)
+    gate_ref = _qmm_reference(
+        mx, x, gate.weight, gate.scales, gate.biases, bits=4, group_size=group_size
+    )
+    up_ref = _qmm_reference(
+        mx, x, up.weight, up.scales, up.biases, bits=4, group_size=group_size
+    )
+    gate_f = gate_ref.astype(mx.float32)
+    reference = gate_f * mx.sigmoid(gate_f) * up_ref.astype(mx.float32)
+    if tuple(candidate.shape) != tuple(reference.shape):
+        return float("inf")
+    return _max_abs_diff(mx, candidate, reference)
 
 
 def _check_fused_add_rmsnorm(mx, dtype) -> float:
@@ -387,6 +433,44 @@ def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
     lanes["qmm_m8_ksplit"] = _STATUS_SKIPPED
     # lm_head_topk kernels exist but are not routed on the serve path.
     lanes["lm_head_topk"] = _STATUS_SKIPPED
+
+    # Experimental Qwen row-traversal lanes (default off): exact-M2/M3/M5
+    # QuantizedLinear routing and the fused gate/up+SwiGLU MLP tile. Same
+    # vk-family ULP band and same disable-on-mismatch contract as the NAX
+    # lanes above.
+    from .qwen_row_traversal import (
+        qwen_qmm_exact_m,
+        qwen_row_traversal_qlinear_enabled,
+    )
+
+    if qwen_row_traversal_qlinear_enabled() and bits == 4:
+        for rows in (2, 3, 5):
+            _record(
+                f"qwen_rt_qmm_m{rows}",
+                _QMM_TOLERANCE,
+                lambda rows=rows: _check_qmm_lane(
+                    mx,
+                    lambda x, w, s, b: qwen_qmm_exact_m(
+                        x, w, s, b, group_size=group_size
+                    ),
+                    rows,
+                    4,
+                    group_size,
+                    dtype,
+                ),
+            )
+    else:
+        for rows in (2, 3, 5):
+            lanes[f"qwen_rt_qmm_m{rows}"] = _STATUS_SKIPPED
+
+    if _qwen_rt_mlp_variant_active() and bits == 4:
+        _record(
+            "qwen_rt_gateup",
+            _QMM_TOLERANCE,
+            lambda: _check_qwen_rt_gateup_lane(mx, group_size, dtype),
+        )
+    else:
+        lanes["qwen_rt_gateup"] = _STATUS_SKIPPED
 
     if _env_on("MTPLX_GQA_PACKED_SDPA"):
         _record("gqa_packed_sdpa", _SDPA_TOLERANCE, lambda: _check_gqa_packed(mx, dtype))

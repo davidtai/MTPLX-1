@@ -415,6 +415,17 @@ def load(
     if nax_env_enabled():
         nax_report = install_nax_qlinear_patch()
         logger.info("[nax-verify] %s", nax_report)
+    from .qwen_row_traversal import (
+        install_qwen_exact_m_qlinear_patch,
+        qwen_row_traversal_qlinear_enabled,
+    )
+
+    # Experimental exact-M2/M3/M5 verify routing (default off); must install
+    # after the NAX patch so the exact-M5 tile takes precedence over the
+    # padded-M6 NAX route.
+    if qwen_row_traversal_qlinear_enabled():
+        rt_report = install_qwen_exact_m_qlinear_patch()
+        logger.info("[qwen-row-traversal] %s", rt_report)
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     # Turbo lanes validate themselves once per load on the model's actual
