@@ -47,7 +47,7 @@ MODEL_SPECS = {
         "model_key": "hy3-expert-q2",
         "depths": (1, 2, 3, 4, 5, 6),
         "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q2"),
-        "mtp_artifacts": Path("~/.cache/huggingface/hy3-mtp-layer80"),
+        "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
         "prompt_tail": None,
     },
     "glm52-q2": {
