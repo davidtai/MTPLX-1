@@ -7,12 +7,28 @@ cannot be run unattended.
 
 ## Why this needed work at all
 
-`experts.bin` is one file: **89.46 GB** for hy3 q2, **226 GB** for glm52 q2.
-Hugging Face's hard per-file limit is **50 GB** (~20 GB is the practical
-recommendation), so these artifacts could not be uploaded at all. The
-single-file layout was never a technical requirement — `pread` does not care
-how many files there are — it was `SidecarInfo.file` being a scalar plus a
-`validate_structure` rule rejecting more than one sidecar shard.
+**Correction (2026-07-19): the "50 GB hard limit" premise was wrong.**
+`AngelSlim/Hy3-GGUF` hosts a **182.33 GB single file** that serves byte-range
+requests today (`x-linked-size: 182328371648`, HTTP 200 on a range fetch).
+Xet-backed repos lifted the old LFS ceiling, so an 89.46 GB `experts.bin`
+could have been uploaded as-is. Sharding was **not required** to publish.
+
+It is still worth doing, for reasons that survive the correction:
+
+- **Resumability.** `forge publish` wraps a single blocking `upload_folder`
+  with no chunking or retry. A failed 90 GB upload restarts 90 GB; a failed
+  15 GB part restarts 15 GB.
+- **Per-file verification.** Each part carries its own `size` + `sha256`, so a
+  corrupt download is localized instead of invalidating the whole bank.
+- **Parallel transfer**, in both directions.
+- **Interop.** The parts are ordinary safetensors — verified with plain
+  `mlx.core.load` — so the artifact is readable without MTPLX at all. A raw
+  `.bin` never would be.
+
+The single-file layout was never a *technical* requirement either — `pread`
+does not care how many files there are. It was `SidecarInfo.file` being a
+scalar plus a `validate_structure` rule rejecting more than one sidecar
+shard.
 
 Both are lifted. A bank can now span parts, and a one-part manifest still
 parses byte-identically, so unconverted artifacts keep loading unchanged.
@@ -47,7 +63,9 @@ python3 scripts/shard_expert_bank.py ~/.cache/huggingface/hy3-expert-only-mlx-q2
   is. No weight is touched.
 - Per-record sha256 is re-verified during the copy; the converter aborts if a
   digest changes.
-- Needs ~90 GB free for hy3 (~226 GB for glm52). Do not run it while a
+- Needs ~90 GB free for hy3 (~226 GB for glm52). Optional now that the
+  size ceiling is known to be higher than assumed, but still recommended for
+  resumable uploads. Do not run it while a
   benchmark holds the machine — it is I/O heavy and will distort timings.
 
 ## Step 3 — copy the rest of the artifact
