@@ -30,6 +30,20 @@ BLOCK_MLX = textwrap.dedent(
     sys.meta_path.insert(0, _BlockMLX())
     """
 )
+BLOCK_NUMPY = textwrap.dedent(
+    """
+    import importlib.abc
+    import sys
+
+    class _BlockNumPy(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "numpy" or fullname.startswith("numpy."):
+                raise ModuleNotFoundError(f"blocked {fullname}")
+            return None
+
+    sys.meta_path.insert(0, _BlockNumPy())
+    """
+)
 
 
 def _run_no_mlx(
@@ -38,10 +52,12 @@ def _run_no_mlx(
     *,
     cwd: Path | None = None,
     env_extra: dict[str, str] | None = None,
+    block_numpy: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     blocker = tmp_path / "blocker"
     blocker.mkdir(exist_ok=True)
-    (blocker / "sitecustomize.py").write_text(BLOCK_MLX, encoding="utf-8")
+    sitecustomize = BLOCK_MLX + (BLOCK_NUMPY if block_numpy else "")
+    (blocker / "sitecustomize.py").write_text(sitecustomize, encoding="utf-8")
     pythonpath_parts = [str(blocker), str(ROOT)]
     if os.environ.get("PYTHONPATH"):
         pythonpath_parts.append(os.environ["PYTHONPATH"])
@@ -104,6 +120,19 @@ def test_doctor_json_reports_missing_mlx_without_traceback(tmp_path: Path) -> No
     assert "resource.memory" in check_ids
     assert "resource.model_cache_disk" in check_ids
     assert "model.default_repo" in check_ids
+
+
+def test_doctor_json_does_not_import_numpy(tmp_path: Path) -> None:
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-m", "mtplx.cli", "doctor", "--json"],
+        block_numpy=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Traceback" not in proc.stderr
+    payload = json.loads(proc.stdout)
+    assert "environment" in payload
 
 
 def test_doctor_json_reports_non_git_cwd_without_raw_git_error(tmp_path: Path) -> None:

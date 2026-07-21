@@ -7,13 +7,6 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .expert_runtime import (
-    ExpertStreamingConfig,
-    parse_memory_bytes,
-    resolve_island_placement,
-)
-
-
 _BYTE_FIELDS = {
     "memory_limit_bytes",
     "runtime_reserve_bytes",
@@ -169,6 +162,8 @@ def _load_config_object(path: str | None) -> dict[str, Any]:
 
 
 def _normalize_byte_fields(values: Mapping[str, Any]) -> dict[str, Any]:
+    from .expert_runtime import parse_memory_bytes
+
     normalized = dict(values)
     for field in _BYTE_FIELDS:
         value = normalized.get(field)
@@ -185,6 +180,8 @@ def expert_streaming_load_kwargs(
 
     if not expert_streaming_requested(args):
         return {}
+    from .expert_runtime import ExpertStreamingConfig, resolve_island_placement
+
     root = Path(model_path).resolve()
     values = _load_config_object(getattr(args, "expert_streaming_config", None))
     overrides = {
