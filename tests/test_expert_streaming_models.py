@@ -59,6 +59,83 @@ def test_hy3_q4_exact_expert_layout() -> None:
     assert spec.full_indexer_layers == ()
 
 
+@pytest.mark.parametrize(
+    ("model_key", "kv_mode", "expected_bytes_per_token"),
+    (
+        # bf16 baseline (off / no cache requant): untouched spec value.
+        ("hy3-q4", None, 327_680),
+        # Real mlx_lm.models.cache.QuantizedKVCache(group_size=64) layout,
+        # as constructed by Hy3Model.make_cache when _mtplx_kv_quant is set
+        # (mtplx/models/hy3_mlx.py). Hy3's real config.json (tencent/Hy3
+        # 716aa7241bd6d95896be4ebfc761162a9c4d49ef): num_key_value_heads=8,
+        # head_dim=128, num_hidden_layers=80 (all 80 layers are full GQA
+        # attention -- no linear/hybrid layers -- which is exactly what makes
+        # 327_680 == 2 * 8 * 128 * 2 bytes(bf16) * 80 layers).
+        #
+        # Per token, per layer, per K-or-V, per kv-head: head_dim=128 splits
+        # into 128/64 == 2 quant groups; each group carries one bf16 scale
+        # AND one bf16 bias (2 * 2 bytes == 4 bytes/group), independent of
+        # bits. Packed payload is bits/8 bytes/element.
+        #   q8: packed = 8 heads * 128 * 1 byte      = 1_024
+        #       scale+bias = 8 heads * 2 groups * 4 B =   64
+        #       -> 1_088 B / (K or V) / layer / token
+        #   q4: packed = 8 heads * 128 * 4/8 byte     =   512
+        #       scale+bias (unchanged by bits)        =    64
+        #       -> 576 B / (K or V) / layer / token
+        # K + V doubles each, then all 80 layers sum (MTP layer 80 excluded,
+        # mtp_included=False, stays in the runtime reserve):
+        #   q8: (1_088 * 2) * 80 == 174_080
+        #   q4: (576   * 2) * 80 ==  92_160
+        # These are EXACT (no rounding): both numbers are the affine
+        # weight-quant fraction (17/32, 9/32) applied to 327_680, because
+        # QuantizedKVCache uses the identical group-64/bf16-scale-and-bias
+        # layout as the resident *_proj quant pass. 327_680 / 32 == 10_240
+        # divides evenly, so ceiling rounding in affine_quant_kept_bytes
+        # never triggers for this spec.
+        ("hy3-q4", "q8", 174_080),
+        ("hy3-q4", "q4", 92_160),
+    ),
+)
+def test_hy3_kv_bytes_per_token_for_matches_quantized_kv_cache_layout(
+    model_key: str, kv_mode: str | None, expected_bytes_per_token: int
+) -> None:
+    spec = get_model_spec(model_key)
+    assert spec.kv_bytes_per_token_for(kv_mode) == expected_bytes_per_token
+
+
+def test_hy3_kv_bytes_per_token_for_matches_affine_quant_kept_bytes_formula() -> None:
+    """The spec-owned per-mode pricing must agree with the shared
+    ``AFFINE_QUANT_KEEP_NUMERATOR`` fraction used for resident weights --
+    they describe the exact same group-64/bf16-scale-and-bias layout."""
+
+    from mtplx.expert_streaming_models import affine_quant_kept_bytes
+
+    spec = get_model_spec("hy3-q4")
+    for mode in ("q8", "q4"):
+        assert spec.kv_bytes_per_token_for(mode) == affine_quant_kept_bytes(
+            spec.kv_bytes_per_token, mode
+        )
+
+
+@pytest.mark.parametrize("kv_mode", (None, "q8", "q4"))
+def test_plan_expert_memory_kv_bytes_matches_spec_pricing_method(
+    kv_mode: str | None,
+) -> None:
+    """plan_expert_memory's kv_bytes must be context_tokens * the spec's own
+    per-mode price -- one source of truth, not two formulas that could
+    drift apart."""
+
+    spec = get_model_spec("hy3-q4")
+    context_tokens = 4096
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=200 * GIB,
+        context_tokens=context_tokens,
+        kv_quant=kv_mode,
+    )
+    assert plan.kv_bytes == context_tokens * spec.kv_bytes_per_token_for(kv_mode)
+
+
 def test_hy3_expert_only_q4_control_exact_layout() -> None:
     q4 = get_model_spec("hy3-expert-only-q4")
 
