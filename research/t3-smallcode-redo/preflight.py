@@ -3,8 +3,27 @@
 (2026-07-22): the small-code arm of record run against the THREE
 already-done envelopes in one guarded window -- `hy3-oq2e-rq4-88e` (islands
 79, full residency), `hy3-oq2e-rq4-80` (islands 69, 10 streamed),
-`hy3-oq2e-rq4-64-cachelru` (ZERO islands, cache-heavy LRU) -- contexts=256,
+`hy3-oq2e-rq4-64-cachelru` (ZERO islands, cache-heavy LRU) -- contexts=320,
 output-tokens=256, K1 (+free AR), bf16 KV, 3 reps each.
+
+contexts=320: minimum viable N that preserves the standard coding-agent
+tail (mtplx/prefill_bench.py DEFAULT_FINAL_REQUEST, no custom prompt_tail);
+David's "256 is fine" honored as close as the gate allows. contexts=256 FAILED the
+release gate 2026-07-22 -- the fixed "Final user request" tail
+chat-templates to 319 tokens on hy3-oq2e (prompt_style="coding-agent",
+prompt_format="chat", enable_thinking=False), so at 256 the
+`len(tail_ids) >= context_tokens` truncation branch fires
+(prefill_bench.py:199-217), stamping prompt_release_valid=False and
+prompt_tail_preserved=False, and the release gate
+(scripts/benchmark_q2_mtp_depth_matrix.py:2992-3004) raised
+BenchmarkGateError -- all 9 reps failed at contexts=256 in ~15s each (see
+evals/tier2/t3_smallcode_*_rep*.failed-ctx256.json/.log). Direct-probed
+CPU-only (same method documented in research/t3-88col-1024-nat/
+run_naturalistic_rep.py's header for the custom naturalistic tail,
+replicated here for the STANDARD builder): ascending N from 257, first N
+where prompt_release_valid=True AND prompt_tail_preserved=True is N=320
+(== tail length 319 + 1 structural filler token, same shape as the
+naturalistic 264+1=265 case).
 
 David's correction (live, 2026-07-22): the per-envelope "small naturalistic
 prompt" arm that already ran at 88/80/64 (t3_88col_naturalistic_*,
@@ -13,12 +32,14 @@ SMALL CODE prompt, not prose -- this is a coding LLM, prose is out of
 distribution. Those prose arms are downgraded to "prose reference --
 incidental, not of record". The arm of record here uses the SAME
 release-valid realistic_programming_v1 builder every context cell already
-uses -- plain `--contexts 256`, NO custom prompt_tail, NO library-call
+uses -- plain `--contexts 320`, NO custom prompt_tail, NO library-call
 mechanics/monkeypatching (unlike research/t3-*/run_naturalistic_*_rep.py,
 which exists ONLY because hy3-oq2e has no --prompt-tail CLI flag for a
 genuinely custom prose tail; the small-code arm needs no such workaround --
 it is just a smaller `--contexts` value against the SAME builder every
-other matrix cell uses).
+other matrix cell uses). (contexts was originally 256; raised to the
+minimum viable 320 -- see the note above -- after 256 failed the tail-
+preserve gate 2026-07-22.)
 
 Sub-1024-contexts sanity check (cited, not assumed): scripts/
 benchmark_q2_mtp_depth_matrix.py's `--contexts` uses `_integer_csv`
@@ -30,12 +51,15 @@ same bound, no floor either. The ONLY other structural gate that touches
 `contexts` is ~line 2803-2806:
     if max(context_values) + output_tokens > int(options["max_live_kv_tokens"]):
         raise BenchmarkConfigurationError(...)
-At contexts=256, output-tokens=256, that is 512 tokens against the CLI's
+At contexts=320, output-tokens=256, that is 576 tokens against the CLI's
 own `--max-live-kv-tokens` default of 4096 (~line 382) -- comfortably
 inside, gate does not fire, no override needed. Confirmed live (this
 script, CPU only) against the REAL per-preset admission gate below: all
 three presets ADMIT at the shared default kv=4096, byte-for-byte the same
-control point every sibling column's own "1024" arm already clears.
+control point every sibling column's own "1024" arm already clears. This
+admission math does not depend on `contexts` beyond this bound check --
+raising contexts 256->320 does not change any of the fixed/limit GiB
+figures below.
 
 Sibling of research/t3-64col/preflight.py and research/t3-80col/preflight.py
 (same gate machinery, generalized here to 3 presets x 1 arm each instead of
@@ -87,7 +111,10 @@ from envelope_admission_sweep import (  # noqa: E402
 GIB = 1024**3
 WIRED_KNOB_LIMIT_GIB = 112.0  # 114688 MiB, sanctioned ceiling; never exceeded
 SIGNOFF_CEILING_GIB = 90.0  # David's rule: >~90 GiB projected peak here needs a fresh ask
-CONTEXTS = 256
+# contexts=320: minimum viable N that preserves the standard coding-agent
+# tail (256 failed the prompt_tail_preserved gate 2026-07-22; see module
+# docstring above).
+CONTEXTS = 320
 OUTPUT_TOKENS = 256
 
 # (arm_name, preset, contexts, output_tokens, max_live_kv_tokens or None-for-default)
@@ -187,7 +214,7 @@ def main() -> int:
         "generated": "2026-07-22",
         "note": (
             "CPU-only admission preflight for the small-code arm of record "
-            "(contexts=256, output-tokens=256, K1+AR, bf16 KV) run against the "
+            "(contexts=320, output-tokens=256, K1+AR, bf16 KV) run against the "
             "three already-done envelopes: hy3-oq2e-rq4-88e, hy3-oq2e-rq4-80, "
             "hy3-oq2e-rq4-64-cachelru. Supersedes the prose-naturalistic arm "
             "(David correction 2026-07-22) -- prose receipts already collected "

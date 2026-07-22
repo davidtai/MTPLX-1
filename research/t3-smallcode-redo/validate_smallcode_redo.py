@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """CPU-only, targeted-field validator + aggregator for the T3 small-code
-arm-of-record receipts (2026-07-22): contexts=256, output-tokens=256, K1
+arm-of-record receipts (2026-07-22): contexts=320, output-tokens=256, K1
 (+free AR), bf16 KV, 3 reps each, against the three already-done envelopes --
+
+contexts=320: minimum viable N that preserves the standard coding-agent
+tail (mtplx/prefill_bench.py DEFAULT_FINAL_REQUEST, no custom prompt_tail);
+David's "256 is fine" honored as close as the gate allows. contexts=256
+FAILED the release gate 2026-07-22 -- the fixed "Final user request" tail
+chat-templates to 319 tokens on hy3-oq2e (prompt_style="coding-agent",
+prompt_format="chat", enable_thinking=False), truncating below the tail
+length and stamping prompt_tail_preserved=False; the release gate
+(scripts/benchmark_q2_mtp_depth_matrix.py:2992-3004) raised
+BenchmarkGateError -- all 9 reps failed at contexts=256 in ~15s each (see
+evals/tier2/t3_smallcode_*_rep*.failed-ctx256.json/.log). Direct-probed
+CPU-only (same method documented in research/t3-88col-1024-nat/
+run_naturalistic_rep.py's header): minimum N clearing both
+prompt_release_valid=True and prompt_tail_preserved=True is N=320 (== tail
+length 319 + 1 structural filler token).
 
   ARM 88e: hy3-oq2e-rq4-88e (islands 79, full residency).
            evals/tier2/t3_smallcode_88e_rep{1,2,3}.json.
@@ -17,7 +32,7 @@ research/t3-80col/validate_80col.py, research/t3-64col/validate_64col.py,
 and research/t3-88col-1024-nat/validate_88col.py.
 
 Validates per row:
-  1. prompt_identity.token_count == 256.
+  1. prompt_identity.token_count == 320.
   2. prompt_release_valid is True.
   3. The mandatory metrics emitted: ingestion_tok_s, prompt_eval_time_s,
      decode_tok_s, conditional_hit_rate + acceptance_by_depth (null on AR
@@ -50,7 +65,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTDIR = REPO_ROOT / "evals" / "tier2"
 GIB = 1024**3
 EXPECTED_KV_QUANT = None  # bf16 / off
-EXPECTED_TOKEN_COUNT = 256
+# contexts=320: minimum viable N that preserves the standard coding tail
+# (256 failed the preserve gate 2026-07-22); David's "256 is fine" honored
+# as close as the gate allows.
+EXPECTED_TOKEN_COUNT = 320
 REPS = (1, 2, 3)
 LANE_NAMES = {0: "AR", 1: "K1"}
 

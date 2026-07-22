@@ -6,13 +6,18 @@
 # SMALL CODE prompt, not prose -- this is a coding LLM, prose is out of
 # distribution. Those prose arms are downgraded to "prose reference --
 # incidental, not of record". This window runs the arm of record instead:
-# contexts=256, output-tokens=256, K1 (--hy3-depths 1; AR row auto-runs
+# contexts=320, output-tokens=256, K1 (--hy3-depths 1; AR row auto-runs
 # alongside for free), bf16, greedy, the SAME release-valid
 # realistic_programming_v1 builder every context cell already uses (plain
-# `--contexts 256`, NO custom prompt_tail, NO library-call mechanics), 3
+# `--contexts 320`, NO custom prompt_tail, NO library-call mechanics), 3
 # reps each, against the THREE already-done envelopes, SERIALLY, in ONE
 # guarded window (one qwen-stop/flock hold covering all nine process
 # invocations):
+#
+# contexts=320: minimum viable N that preserves the standard coding tail
+# (256 failed the preserve gate 2026-07-22 -- see research/t3-smallcode-redo/
+# preflight.py and run_smallcode_redo_inner.sh headers for the full probe);
+# David's "256 is fine" honored as close as the gate allows.
 #
 #   ARM 88e: hy3-oq2e-rq4-88e (islands 79, full residency).
 #   ARM 80:  hy3-oq2e-rq4-80  (islands 69, 10 streamed).
@@ -21,11 +26,13 @@
 #
 # Memory-limit overrides (harness-derived by research/t3-smallcode-redo/
 # preflight.py, never hand-derived): NONE needed for any of the three arms
-# -- 256+256=512 tokens sits well under the shared 4096-token control point
+# -- 320+256=576 tokens sits well under the shared 4096-token control point
 # every preset already declares as its own default; all three ADMIT
 # directly at their own declared limit (88e 96.0000 GiB margin +0.3706 GiB,
 # 80 87.0000 GiB margin +0.0223 GiB, 64-cachelru 71.0000 GiB margin
-# +0.3667 GiB).
+# +0.3667 GiB). This admission math does not depend on contexts beyond the
+# kv-sum bound check -- raising contexts 256->320 does not change these
+# figures.
 #
 # Sign-off (David's rule 7): every limit here (96 / 87 / 71 GiB) sits well
 # under the sub-85/90 GiB sign-off band (88e is the one exception already
