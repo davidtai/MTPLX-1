@@ -691,6 +691,52 @@ against.
 Knob remains default OFF; the stock path is untouched and the in-window
 control confirms it unchanged.
 
+## T3 envelope-matrix cell 88x16k (2026-07-21 23:40): preset hy3-oq2e-rq4-88 FAILS CLOSED at its own memory-limit — zero GPU touched
+
+Guarded window, `--preset hy3-oq2e-rq4-88 --max-live-kv-tokens 16384
+--hy3-depths 2,3` (AR+K2+K3). The runtime's own admission preflight
+rejected the load before any MLX allocation: `ExpertStreamingConfigurationError:
+fixed expert-streaming footprint exceeds limit by 4702360064 bytes`
+(4.38 GiB over the preset's declared 95 GiB memory-limit).
+`load_count=0`, `hard_peak_memory_bytes=null` — genuinely zero GPU work,
+zero risk, box laws intact. Receipt: `oq2e_rq4_88_16k.{json,log}`.
+
+Root cause (code-verified, not guessed): a CPU-only dry run against
+`plan_expert_memory` with island_layer_count=79 + the proj-requant q4
+discount predicted `fits_fixed=True` (+2.84 GiB margin at 95 GiB), but
+that call omits `additional_resident_bytes` — the externally-resident
+bf16 MTP head (`hy3-bf16-and-mtp-layer80/layer80-bf16.safetensors`,
+~7.0 GiB) plus the non-stock splitk router kernel's incremental bytes,
+which `mtplx/runtime.py` adds via `streamed_mtp_resident_bytes +
+hy3_router_incremental_bytes` before the real preflight gate. That
+~7.22 GiB (99.379 - 92.155 GiB) is present regardless of context size.
+
+Consequence: **the preset's own numbers already overshoot at ITS
+DEFAULT max-live-kv-tokens=4096**, not just at 16k. Its own description
+text ("20.64 GiB fixed w/ requant credit, 0.949 GiB/island") is
+internally consistent with this — 20.64 + 79*0.949 = 95.61 GiB, ~0.61
+GiB over the declared 95 GiB — and that 20.64 GiB figure already
+correctly includes the MTP head (13.42 GiB non-island/non-MTP fixed +
+7.22 GiB MTP/router = 20.64). Commit 004571a0 (David, 2026-07-21 12:56)
+bumped island-layer-count 78->79 and shrank expert-cache-limit 2GiB->1GiB
+"true full residency" without re-verifying the new total still fit; no
+receipt under this preset name exists anywhere before this attempt — it
+was never GPU-tested until now.
+
+Fixing to admit 88x16k needs memory-limit >= ~99.4 GiB (fixed_bytes at
+16k KV), leaving under 0.6 GiB of headroom against the hard 100 GiB
+wired knob — far short of the 7-8+ GiB headroom every other full-
+residency (79-island) receipt in this campaign has run with (champion41/
+parity: limit 103, hard peak ~94.9 GiB). Per the box laws (never exceed
+the 100 GiB knob; stop on any mismatch rather than improvise), this cell
+was NOT attempted at a razor-thin margin. No K1/K2/K3 measurement exists
+for this cell. Options for whoever picks this up: drop back to
+islands=78 (1 streamed layer, restores the pre-004571a0 margin) for the
+KV-heavy context columns, or size a dedicated `-88-16k` preset variant
+with memory-limit computed from the real fixed_bytes formula (envelope +
+context KV + MTP/router + reserve), not the stock 95 GiB carried over
+from the 4k-KV baseline.
+
 OPS NOTES: (1) the campaign venv's editable mtplx resolves script-mode
 children to the PARENT checkout (mtplx-hy3-ssd root, a different
 branch) — the first two launches died pre-lock on the wrapper import
