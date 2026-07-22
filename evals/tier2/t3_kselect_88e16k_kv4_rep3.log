@@ -1,0 +1,4 @@
+[run_kselect_rep3_inner] === preset=hy3-oq2e-rq4-88e rep=3 (RETRY) starting 2026-07-22T14:36:19Z ===
+[preset] hy3-oq2e-rq4-88e (hy3-oq2e-rq4-88 -> hy3-oq2e-rq4-88r -> hy3-oq2e-rq4-88e)
+[profile:hy3-expert-oq2e] profile suggests split_route_release='deferred' (default_on); configured 'fenced' — inherited from hy3-expert-q2; NOTE: inert at island-layer-count 79 (DenseIslandSwitchGLU never consults it) — load-bearing only at reduced islands, e.g. the 88 GiB islands-74 configuration [advisory only]
+[tokenizer] AutoTokenizer parse failed (No module named 'mlx_lm.tool_parsers.hy_v3_opensource'); using tokenizer.json fallback

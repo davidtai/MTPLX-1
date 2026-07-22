@@ -1,0 +1,26 @@
+{
+  "cell": {
+    "additional_resident_bytes": 7756883200,
+    "excess_bytes": 0,
+    "fits_fixed": true,
+    "fixed_bytes": 102872666624,
+    "hy3_router_incremental_bytes": 251658240,
+    "implied_admission_total_bytes": 102872666624,
+    "implied_admission_total_gib": 95.80763673782349,
+    "island_layer_count": 79,
+    "kv_quant": "q4",
+    "max_live_kv_tokens": 16640,
+    "memory_limit_bytes": 103079215104,
+    "memory_limit_override_applied": false,
+    "persistent_cache_bytes": 0,
+    "preset": "hy3-oq2e-rq4-88e",
+    "resident_discount_bytes": 3847225344,
+    "status": "ADMIT",
+    "streamed_mtp_resident_bytes": 7505224960,
+    "unallocated_bytes": 206548480
+  },
+  "generated": "2026-07-22",
+  "note": "CPU-only admission preflight for the K-SELECTION window (88-efficient x 16k real-prefill kv4, AR+K1/K2/K3 x 3 reps). Gate replica of mtplx/runtime.py's _load_impl, via research/t3-cachelru/sweep.py's evaluate_admission_kv().",
+  "preset": "hy3-oq2e-rq4-88e",
+  "schema": "mtplx-t3-kselect-88e16k-admission-preflight-v1"
+}
