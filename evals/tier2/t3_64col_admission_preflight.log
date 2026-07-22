@@ -1,0 +1,4 @@
+[preflight] arm=1024         contexts=  1024 kv=  4096 override=False -> ADMIT  fixed= 20.6411 GiB limit= 71.0000 GiB knob_exceeded=False
+[preflight] arm=16384        contexts= 16384 kv= 16640 override=True  -> ADMIT  fixed= 24.4693 GiB limit= 71.0000 GiB knob_exceeded=False
+[preflight] arm=65536        contexts= 65536 kv= 65792 override=True  -> ADMIT  fixed= 39.4693 GiB limit= 71.0000 GiB knob_exceeded=False
+[preflight] arm=naturalistic contexts=   265 kv=  4096 override=False -> ADMIT  fixed= 20.6411 GiB limit= 71.0000 GiB knob_exceeded=False
