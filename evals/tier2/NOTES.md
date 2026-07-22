@@ -1580,3 +1580,201 @@ bash research/t3-88/run_88_ladder.sh 88r   # window B, run_in_background, standa
    projection's scaling assumption (peak grows with KV token count) held
    for the -96 preset's precedent measurement but is much weaker at -88r's
    observed shape.
+
+---
+
+## T3 80 GiB envelope: bench-shape (1024/1024) KV-BUDGET cells, "x16k"/"x32k" (2026-07-22, two guarded windows): peak byte-identical 79.76 GiB both cells; relabeled mid-campaign -- NOT context receipts
+
+**Evidence class: MEASURED** (6 reps total -- 3 per KV-budget cell -- CPU-
+admission-gated, guarded-window `benchmark_q2_mtp_depth_matrix.py` harness
+output; every numeric field below is read straight off the receipts, not
+estimated) for tok/s, acceptance, hit-rate, loads/token, per-miss service,
+and hard peak. The "real-prefill projected peak" figures in the caveat
+section below are **PROJECTED, not measured** -- flagged explicitly.
+
+**Sign-off**: both cells (effective admitted memory-limit >85 GiB once the
+KV-budget override is applied -- 90.75 GiB at the 16k knob, 95.75 GiB at
+the 32k knob) granted live by David 2026-07-22. Preset `hy3-oq2e-rq4-80`
+(islands 69) used AS-IS -- David's no-islands-change directive applies only
+to <=64 GiB presets, so this campaign did not touch it.
+
+**MID-CAMPAIGN PROTOCOL CORRECTION (David, live, 2026-07-22), applied
+before this entry was written**: the mission brief specified these cells as
+"context cells" at 16k/32k, but the harness invocation this campaign copied
+from the `research/t3-88/` pattern only raises `--max-live-kv-tokens` (a
+memory-BUDGET knob consumed by the admission-gate `memory_plan()` sizing
+computation) -- it never touches the preset's own `contexts = "1024"` /
+`output-tokens = 1024` fields, which is what actually determines prompt and
+generation length. Confirmed directly from the receipts: every one of the
+24 AR/K1/K2/K3 observations across all 6 reps shows `context_tokens=1024`,
+`prompt_tokens=1024`, `generated_tokens=1024`, `finish_reason="length"` --
+identical regardless of whether the 16384 or 32768 KV-budget knob was in
+effect. **Relabel: both cells below are bench-shape (1024 prompt / 1024
+output) KV-BUDGET cells, NOT real 16k/32k-token context/prefill receipts.**
+Real-prefill re-runs (actual 16k/32k-token prompts) are QUEUED, not yet
+run, as of this entry. Nothing below is deleted or discarded -- the
+measured numbers are valid bench-lane data in their own right (short-
+context decode behavior of the -80 envelope, partial-residency streaming
+telemetry, K-optimum shape) and are reported as-is; only the "these
+represent 16k/32k context" reading is retracted.
+
+This is NOT this campaign's error -- the mission brief specified the
+KV-budget-only shape, matching the `research/t3-88/` precedent it was
+modeled on exactly (that campaign's x16k cell has the identical
+context=1024/output=1024 shape, never flagged as a context receipt itself
+because the -88r campaign never claimed otherwise). The correction is
+scoped to how these two -80 cells get READ, not to any script or harness
+bug.
+
+### Peak caveat (read this before citing the hard-peak numbers below)
+
+The hard peak recorded for both cells **EXCLUDES materialized KV**: the
+16384/32768-token `max-live-kv-tokens` budget is reserved into the
+admission-gate memory plan (it sizes the KV cache allocation) but is never
+actually FILLED, since live tokens never exceed prompt+generated =
+1024+1024 = 2048 in any rep. A real-prefill run that genuinely fills the
+budget will peak **HIGHER** than the figure recorded here by roughly the
+live-KV delta -- **not by zero**, which is what the byte-identical peak
+across the x16k and x32k lanes below might otherwise suggest to a reader
+who takes the labels at face value.
+
+Projected (not measured) real-prefill peaks, using the same
+`kv_bytes_per_token=327,680 B/token` constant the admission harness itself
+uses (`research/envelope_admission_sweep.py`), scaling from the measured
+79.75565 GiB bench-shape peak at its own ~2048 live tokens:
+
+| KV-budget knob | delta tokens (knob − 2048) | delta bytes | projected real-prefill peak |
+|---|---|---|---|
+| 16384 | 14,336 | 4,697,620,480 B (4.3750 GiB) | **~84.13 GiB** |
+| 32768 | 30,720 | 10,066,329,600 B (9.3750 GiB) | **~89.13 GiB** |
+
+Both projections remain comfortably under the 98 GiB hard-stop line, but
+neither has been measured -- do not cite them as receipts.
+
+### Per-K x rep table -- both cells (identical shape; KV-budget knob had no
+effect on prompt/output length, so the two lanes' numbers are near-
+identical up to per-rep timing noise, which is itself further confirmation
+of the relabel above)
+
+Every rep shows real partial-residency streaming telemetry (islands=69,
+10 of ~79 layers streamed) -- `hit_rate` 0.44-0.47, `loads_per_token` in
+the 46-62 range, **not** the -88r full-residency `loads=0` signature. Per-
+cell `accepted_per_verify`, `decode_expert_cache_hit_rate`, and
+`loads_per_token` are bit-identical across all 3 reps of each lane
+(deterministic, exact-lane env holding); only `decode_tok_s` varies
+rep-to-rep (measurement noise).
+
+| lane (KV-budget) | rep | cell | decode tok/s | accepted/verify | hit_rate | loads/tok | svc ms/load | AR-parity | hash (16) |
+|---|---|---|---|---|---|---|---|---|---|
+| 16k | 1 | AR | 19.407 | -- | 0.4406 | 46.56 | 1.107 | ref | 2c1e0641f0fb8aa2 |
+| 16k | 1 | K1 | 21.071 | 0.9102 | 0.4441 | 46.24 | 1.039 | **True** | 2c1e0641f0fb8aa2 |
+| 16k | 1 | K2 | 19.072 | 1.5637 | 0.4548 | 52.79 | 0.996 | **True** | 2c1e0641f0fb8aa2 |
+| 16k | 1 | K3 | 16.269 | 1.9038 | 0.4666 | 61.66 | 1.006 | False | 86be119755962790 |
+| 16k | 2 | AR | 19.421 | -- | 0.4406 | 46.56 | 1.107 | ref | 2c1e0641f0fb8aa2 |
+| 16k | 2 | K1 | 20.353 | 0.9102 | 0.4441 | 46.24 | 1.039 | **True** | 2c1e0641f0fb8aa2 |
+| 16k | 2 | K2 | 19.087 | 1.5637 | 0.4548 | 52.79 | 0.996 | **True** | 2c1e0641f0fb8aa2 |
+| 16k | 2 | K3 | 16.281 | 1.9038 | 0.4666 | 61.66 | 1.006 | False | 86be119755962790 |
+| 16k | 3 | AR | 19.382 | -- | 0.4406 | 46.56 | 1.107 | ref | 2c1e0641f0fb8aa2 |
+| 16k | 3 | K1 | 21.024 | 0.9102 | 0.4441 | 46.24 | 1.039 | **True** | 2c1e0641f0fb8aa2 |
+| 16k | 3 | K2 | 18.929 | 1.5637 | 0.4548 | 52.79 | 0.996 | **True** | 2c1e0641f0fb8aa2 |
+| 16k | 3 | K3 | 15.819 | 1.9038 | 0.4666 | 61.66 | 1.006 | False | 86be119755962790 |
+| 32k | 1 | AR | 19.088 | -- | 0.4406 | 46.56 | 1.126 | ref | 2c1e0641f0fb8aa2 |
+| 32k | 1 | K1 | 20.656 | 0.9102 | 0.4441 | 46.24 | 1.039 | **True** | 2c1e0641f0fb8aa2 |
+| 32k | 1 | K2 | 18.885 | 1.5637 | 0.4548 | 52.79 | 0.997 | **True** | 2c1e0641f0fb8aa2 |
+| 32k | 1 | K3 | 16.144 | 1.9038 | 0.4666 | 61.66 | 1.003 | False | 86be119755962790 |
+| 32k | 2 | AR | 19.279 | -- | 0.4406 | 46.56 | 1.126 | ref | 2c1e0641f0fb8aa2 |
+| 32k | 2 | K1 | 20.940 | 0.9102 | 0.4441 | 46.24 | 1.039 | **True** | 2c1e0641f0fb8aa2 |
+| 32k | 2 | K2 | 19.043 | 1.5637 | 0.4548 | 52.79 | 0.997 | **True** | 2c1e0641f0fb8aa2 |
+| 32k | 2 | K3 | 16.247 | 1.9038 | 0.4666 | 61.66 | 1.003 | False | 86be119755962790 |
+| 32k | 3 | AR | 18.870 | -- | 0.4406 | 46.56 | 1.126 | ref | 2c1e0641f0fb8aa2 |
+| 32k | 3 | K1 | 20.871 | 0.9102 | 0.4441 | 46.24 | 1.039 | **True** | 2c1e0641f0fb8aa2 |
+| 32k | 3 | K2 | 19.064 | 1.5637 | 0.4548 | 52.79 | 0.997 | **True** | 2c1e0641f0fb8aa2 |
+| 32k | 3 | K3 | 16.107 | 1.9038 | 0.4666 | 61.66 | 1.003 | False | 86be119755962790 |
+
+Hard peak: **85,636,977,160 B = 79.75565 GiB, byte-identical across all 6
+reps in both lanes** (both cells, all 3 reps each) -- direct confirmation
+of the relabel: a genuine 16k-vs-32k context difference would show a
+measurable peak delta between the two lanes (see the projected-peak table
+above), and none exists here because neither lane ever materialized more
+than ~2048 live KV tokens.
+
+**K-optimum** (bench-shape, short-context decode): K1 is the fastest cell
+in both lanes (20.35-21.07 tok/s), ahead of AR itself (18.87-19.42 tok/s)
+and of K2 (18.89-19.09 tok/s); K3 is slowest (15.82-16.28 tok/s) as
+`accepted_per_verify` yield (0.91 -> 1.56 -> 1.90) no longer outpaces
+verify-call cost at this depth -- same qualitative K1-fastest shape as the
+-88r ladder, though absolute tok/s here (~19-21) is roughly half -88r's
+(~40-47) since partial residency (islands 69, streaming ~62 loads/token at
+K3) pays real per-token expert-fetch cost that -88r's full residency
+(loads=0 everywhere) never does.
+
+### Token-hash outcomes
+
+K1/K2: bit-exact vs the AR reference in all 6 reps across both lanes
+(`2c1e0641f0fb8aa2...`, identical to the -88r campaign's own AR/K1/K2 hash
+-- same prompt/model/greedy-decode, independent of island count, a useful
+cross-campaign consistency check). K3: diverges from AR in all 6 reps, but
+the divergent hash itself is deterministic and reproducible
+(`86be119755962790...`) -- **identical to the -88r campaign's own K3
+divergent hash**, despite islands 69 here vs islands 79 there. This is
+recorded as an anomaly below (not necessarily a defect): the late-flip
+divergence appears router/sampling-path structural rather than sensitive
+to which expert layers are resident vs streamed.
+
+### Commands (exact)
+
+```
+bash research/t3-80/run_80x16k.sh      # window 1, run_in_background, standalone, no timeout param
+bash research/t3-80/run_80x32k.sh      # window 2, launched only after window 1's wrapper fully exited
+python3 research/t3-80/aggregate.py    # CPU-only, post-hoc: canonical per-lane receipts + summary table
+```
+
+CPU-only preflight (`research/t3-80/preflight.py`, same gate as
+`research/envelope_admission_sweep.py`'s `evaluate_admission()`) covering
+both cells (4096/16384/32768/65536 KV sweep) ran BEFORE window 1 opened:
+all four ADMIT. At 16384: fixed=89.8872 GiB, override limit=90.7500 GiB,
+implied admission total (fixed+cache)=90.7277 GiB ("the 90.73 GiB" figure),
+margin +0.0223 GiB. At 32768: fixed=94.8872 GiB, override limit=95.7500
+GiB, implied admission total=95.7277 GiB ("the 95.73 GiB" figure), margin
++0.0223 GiB -- same constant margin at both KV levels, confirming the
+fixed islands=69 footprint (not the KV override) sets the margin, same
+pattern as the -88r campaign.
+
+### Receipts
+
+(The KV-BUDGET relabel and peak caveat above apply to every file in this
+list -- none of these are real-context receipts.)
+
+- `research/envelope-admission-sweep-2026-07-22-80.json` -- full 4-point KV
+  sweep for `hy3-oq2e-rq4-80`, CPU-only, generated before window 1
+- `evals/tier2/t3_80x16k_admission_preflight.json` / `.log`
+- `evals/tier2/t3_80x32k_admission_preflight.json` / `.log`
+- `evals/tier2/t3_80x16k_bf16_rep{1,2,3}.json` / `.log` (raw harness output,
+  unmodified)
+- `evals/tier2/t3_80x32k_bf16_rep{1,2,3}.json` / `.log` (raw harness output,
+  unmodified)
+- `evals/tier2/t3_80x16k.json` / `.log` -- canonical aggregate (via
+  `research/t3-80/aggregate.py`), carries the `label`/`peak_caveat`/
+  `real_prefill_status` fields
+- `evals/tier2/t3_80x32k.json` / `.log` -- same, x32k lane
+
+### Anomalies
+
+1. **Mislabeled cell shape, corrected mid-campaign.** See the protocol
+   correction above -- root cause is that this campaign copied the
+   `research/t3-88/` invocation pattern exactly (only `--max-live-kv-tokens`
+   varies; `contexts`/`output-tokens` come from the preset unchanged), which
+   is the campaign-normal shape for that harness, not a script defect. Both
+   guarded windows had already been launched and window 2 had already
+   started before the correction arrived; per explicit instruction, window 2
+   was let finish naturally (never killed) and both windows' data are kept
+   in full, just relabeled.
+2. K3's divergent hash (`86be119755962790...`) is identical between this
+   campaign (islands 69) and the -88r campaign (islands 79) despite the
+   different island count and different envelope -- flagged for anyone
+   later investigating the K3 late-flip mechanism as a data point (the
+   divergence source is likely independent of residency/island placement).
+3. Hard peak is byte-identical to 9 significant digits across all 6 reps in
+   both lanes -- expected given the relabel (identical bench shape every
+   rep, deterministic greedy decode, exact-lane env holding), not a
+   measurement anomaly.
