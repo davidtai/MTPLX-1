@@ -331,6 +331,129 @@ def test_hy3_attention_matches_between_stock_and_quantized_cache() -> None:
     assert drift < 0.05, f"quantized-KV forward drifted: {drift}"
 
 
+def test_hy3_attention_matches_between_stock_and_quantized_cache_q4() -> None:
+    """Same decode-shaped forward parity as the q8 test above, at q4 --
+    the coarser mode the pricing (kv_bytes_per_token_for) and the
+    presets.toml championship lane both need to actually be usable, not
+    just cheap on paper."""
+
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    args = _tiny_args()
+    args.head_dim = 32
+    model = Hy3Model(args)
+
+    class _NullMoE(nn.Module):
+        def __call__(self, x: mx.array) -> mx.array:
+            return x * 0
+
+    model.model.layers[1].mlp = _NullMoE()
+    tokens = mx.array([[3, 5, 7, 11, 2, 9, 4, 8]], dtype=mx.int32)
+    step = mx.array([[6]], dtype=mx.int32)
+
+    stock = [KVCache() for _ in model.layers]
+    quant = [QuantizedKVCache(group_size=32, bits=4) for _ in model.layers]
+    mx.eval(model(tokens, cache=stock))
+    mx.eval(model(tokens, cache=quant))
+    a = model(step, cache=stock).astype(mx.float32)
+    b = model(step, cache=quant).astype(mx.float32)
+    mx.eval(a, b)
+    scale = float(mx.abs(a).mean().item()) + 1e-6
+    drift = float(mx.abs(a - b).mean().item()) / scale
+    # q4 has 4x fewer codes than q8 (test above): a looser but still tight
+    # bound. Empirically observed drift for this fixture is well under 0.3;
+    # 1.0 (bounded by _NullMoE's exact-zero second layer) would mean the
+    # cache silently returned garbage, not merely coarser codes.
+    assert drift < 0.3, f"quantized-KV (q4) forward drifted: {drift}"
+
+
+@pytest.mark.parametrize("kv_quant", (None, "q8", "q4"))
+def test_quantized_kv_cache_round_trip_write_read_parity(kv_quant: str | None) -> None:
+    """Direct write/read parity through the SAME cache classes
+    Hy3Model.make_cache constructs (mlx_lm KVCache / QuantizedKVCache,
+    group_size=64), shaped like the real Hy3 GQA config (num_key_value_heads=8,
+    head_dim=128, bf16 activations): 'off' must be bit-exact; q8/q4 must
+    recover the source K/V within their quantization step, not merely
+    "close enough to not crash"."""
+
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    mx.random.seed(1234)
+    batch, n_kv_heads, seq, head_dim = 1, 8, 6, 128
+    keys = mx.random.normal((batch, n_kv_heads, seq, head_dim)).astype(mx.bfloat16)
+    values = mx.random.normal((batch, n_kv_heads, seq, head_dim)).astype(mx.bfloat16)
+    mx.eval(keys, values)
+
+    if kv_quant is None:
+        cache = KVCache()
+        out_keys, out_values = cache.update_and_fetch(keys, values)
+        assert mx.array_equal(out_keys, keys).item()
+        assert mx.array_equal(out_values, values).item()
+        return
+
+    bits = {"q8": 8, "q4": 4}[kv_quant]
+    # Empirically measured max abs error for this exact shape/seed/dtype:
+    # q8 ~0.031, q4 ~0.344 (group_size=64, bf16 scale+bias). Thresholds
+    # below carry real margin while still catching a broken round trip.
+    max_abs_error = {"q8": 0.2, "q4": 0.75}[kv_quant]
+    cache = QuantizedKVCache(group_size=64, bits=bits)
+    (packed_k, scale_k, bias_k), (packed_v, scale_v, bias_v) = (
+        cache.update_and_fetch(keys, values)
+    )
+    dequant_k = mx.dequantize(
+        packed_k, scales=scale_k, biases=bias_k, group_size=64, bits=bits
+    )
+    dequant_v = mx.dequantize(
+        packed_v, scales=scale_v, biases=bias_v, group_size=64, bits=bits
+    )
+    mx.eval(dequant_k, dequant_v)
+    err_k = float(mx.abs(dequant_k.astype(mx.float32) - keys.astype(mx.float32)).max().item())
+    err_v = float(mx.abs(dequant_v.astype(mx.float32) - values.astype(mx.float32)).max().item())
+    assert err_k < max_abs_error, f"{kv_quant} K round-trip error too large: {err_k}"
+    assert err_v < max_abs_error, f"{kv_quant} V round-trip error too large: {err_v}"
+    # Not exact -- a quantized round trip must actually introduce some loss,
+    # or this test would silently stop meaning anything if bits were ignored.
+    assert err_k > 0.0 or err_v > 0.0
+
+
+def test_mtp_draft_cache_stays_stock_kvcache_when_trunk_kv_quant_is_set() -> None:
+    """Constraint check (acceptance law): kv_bits must apply to the trunk KV
+    cache ONLY. The MTP NextN draft/verify head builds its own cache via a
+    SEPARATE make_mtp_cache closure (mtplx/hy3_mtp_patch.py) that is
+    hardcoded to stock KVCache and never reads _mtplx_kv_quant -- assert
+    that stays true even when the trunk is actively running quantized KV."""
+
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    from mtplx.hy3_mtp_patch import inject_hy3_streamed_mtp_support
+    from mtplx.models.hy3_mlx import Hy3MTP
+
+    args = _tiny_args()
+    args.num_nextn_predict_layers = 1
+    model = Hy3Model(args)
+    model._mtplx_kv_quant = "q4"
+
+    mtp = Hy3MTP(args, num_mtp_layers=1)
+    injected = inject_hy3_streamed_mtp_support(
+        model,
+        Path("/unused-mtp-module-is-prebuilt"),
+        {"model_type": "hy_v3"},
+        mtp_module=mtp,
+    )
+    assert injected is True
+
+    # The trunk DOES honor _mtplx_kv_quant (established by
+    # test_make_cache_honors_kv_quant_attribute above) ...
+    trunk_cache = model.make_cache()
+    assert all(type(entry) is QuantizedKVCache for entry in trunk_cache)
+
+    # ... but the MTP draft cache never does, regardless of the trunk's
+    # kv_quant setting.
+    mtp_cache = model.make_mtp_cache()
+    assert len(mtp_cache) == len(mtp.layers) == 1
+    assert all(type(entry) is KVCache for entry in mtp_cache)
+
+
 def test_proj_quant_survives_benchmark_option_pipeline() -> None:
     """CLI vector -> parser -> runtime options -> config factory, mirroring
     the island-count guard (option keys have silently dropped between
