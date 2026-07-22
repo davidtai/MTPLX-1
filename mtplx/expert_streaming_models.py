@@ -288,6 +288,30 @@ class ExpertStreamingModelSpec:
             raise ValueError(f"slots_per_layer must be inside [0, {self.expert_count}]")
         return self.routed_layer_count * slots_per_layer * self.expert_record_bytes
 
+    def kv_bytes_per_token_for(self, kv_quant: str | None) -> int:
+        """Trunk KV bytes for one token after an optional cache requant.
+
+        ``kv_quant`` mirrors :class:`mtplx.expert_runtime.ExpertStreamingConfig`'s
+        ``kv_quant`` field and the ``mlx_lm.models.cache.QuantizedKVCache``
+        construction in ``Hy3Model.make_cache`` (``group_size=64``): ``None``
+        is the loaded bf16 baseline (``kv_bytes_per_token`` unchanged); "q8"
+        and "q4" apply the SAME group-64-affine-with-bf16-scale-and-bias
+        discount used for resident ``*_proj`` weights (``AFFINE_QUANT_KEEP_NUMERATOR``),
+        because ``QuantizedKVCache`` packs K/V through that identical layout:
+        one bf16 scale and one bf16 bias per 64-element group, elements packed
+        ``bits`` per value. This is not an approximation of the real cache —
+        the two mechanisms share the exact group size and parameter dtype, so
+        the generic weight-quant fraction (9/32 for q4, 17/32 for q8) is the
+        real per-token KV fraction too. See
+        ``tests/test_expert_streaming_models.py`` for the from-scratch,
+        element-level derivation (num_key_value_heads/head_dim/layer count)
+        that this value matches exactly for the pinned Hy3 revision.
+        """
+
+        if kv_quant is None:
+            return self.kv_bytes_per_token
+        return affine_quant_kept_bytes(self.kv_bytes_per_token, kv_quant)
+
 
 @dataclass(frozen=True)
 class ExpertMemoryPlan:
@@ -829,14 +853,14 @@ def plan_expert_memory(
     if service_slots < spec.top_k:
         raise ValueError(f"transient_slots must be at least top_k ({spec.top_k})")
 
-    kv_bytes = context_tokens * spec.kv_bytes_per_token
-    if kv_quant is not None:
-        if kv_quant not in AFFINE_QUANT_KEEP_NUMERATOR:
-            raise ValueError("kv_quant must be None, 'q8', or 'q4'")
-        # QuantizedKVCache uses the same group-64 affine layout as the
-        # resident pass; the MTP layer's stock cache is not in
-        # kv_bytes_per_token (mtp_included=False) and stays in reserve.
-        kv_bytes = affine_quant_kept_bytes(kv_bytes, kv_quant)
+    if kv_quant is not None and kv_quant not in AFFINE_QUANT_KEEP_NUMERATOR:
+        raise ValueError("kv_quant must be None, 'q8', or 'q4'")
+    # QuantizedKVCache uses the same group-64 affine layout as the resident
+    # pass; the MTP layer's stock cache is not in kv_bytes_per_token
+    # (mtp_included=False) and stays in reserve. kv_bytes_per_token_for is
+    # the single source of truth for this per-mode fraction (spec-owned, unit
+    # tested against the real cache layout).
+    kv_bytes = context_tokens * spec.kv_bytes_per_token_for(kv_quant)
     # The transient service tier holds one bank per distinct record geometry
     # (mixed: one t158-geometry, one affine2-geometry; both reused per layer
     # fence), so it serves partial-residency misses on EITHER tier class.
