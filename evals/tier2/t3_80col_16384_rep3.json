@@ -1,8 +1,3 @@
-[run_80col_resume_inner] === arm=16384 preset=hy3-oq2e-rq4-80 rep=2 starting 2026-07-22T17:50:37Z ===
-[preset] hy3-oq2e-rq4-80
-[profile:hy3-expert-oq2e] profile suggests island_layer_count=79 (default_on); configured 69 — 2026-07-21: fully resident fits at memory-limit 103GiB (hard peak 91.9 GiB): AR 30.17 / K2 36.82 (1 unclassified divergence) / K3 31.81 bit-exact. At 95GiB limit the fixed footprint exceeds by 4.21 GiB; islands 74 measured K3 22.15 [advisory only]
-[profile:hy3-expert-oq2e] profile suggests mtp_depth=3 (default_on); configured (1,) — 2026-07-21: K3 31.81 tok/s bit-exact vs AR at both envelopes; K2 is faster (36.82) but carried one unclassified token divergence per run — K3 is the exact-parity default until K2's divergence is attributed [advisory only]
-[tokenizer] AutoTokenizer parse failed (No module named 'mlx_lm.tool_parsers.hy_v3_opensource'); using tokenizer.json fallback
 {
   "active_cell": null,
   "configuration": {
@@ -139,14 +134,14 @@
           "conditional_hit_rate": null,
           "context_tokens": 16384,
           "cumulative_accepted_drafted_yield": null,
-          "decode_elapsed_s": 16.062231499963673,
+          "decode_elapsed_s": 16.032222788984654,
           "decode_expert_cache_hit_rate": 0.4902941176470588,
-          "decode_tok_s": 15.938009609721973,
+          "decode_tok_s": 15.967841974844019,
           "draft_core": null,
           "drafted_tokens": 0,
           "effective_depth": 0,
-          "elapsed_s": 142.52447412497713,
-          "end_to_end_tok_s": 1.7961827368366097,
+          "elapsed_s": 142.00475166598335,
+          "end_to_end_tok_s": 1.8027565767809708,
           "evaluated_drafts": 0,
           "expert_resource_telemetry": null,
           "expert_streaming_counters": {
@@ -1452,7 +1447,7 @@
             "island_experts": {
               "backend": "dense-island-banks",
               "expert_count": 192,
-              "fill_seconds": 6.296612833015388,
+              "fill_seconds": 6.272286624996923,
               "filled_layers": 69,
               "island_bytes": 70325895168,
               "layers": [
@@ -1549,7 +1544,7 @@
             },
             "mlx_memory": {
               "active_memory_bytes": 84530147848,
-              "cache_memory_bytes": 5474165472,
+              "cache_memory_bytes": 5474171744,
               "peak_memory_bytes": 90159108628
             },
             "model_key": "hy3-expert-oq2e",
@@ -1572,8 +1567,8 @@
                 "preadv_bytes_returned": 272295198720,
                 "python_preadv_invocations": 25161,
                 "read_bytes": 272295198720,
-                "read_mib_per_second": 4439.064969936772,
-                "read_ns": 58499017081,
+                "read_mib_per_second": 4479.3338242291165,
+                "read_ns": 57973115577,
                 "read_operations": 25092,
                 "record_requests": 51295,
                 "requested_bytes": 272295198720,
@@ -1611,72 +1606,72 @@
               "persistent_slot_count": 170,
               "physical_read_latency_by_layer": {
                 "36": {
-                  "elapsed_ns": 6028555973,
-                  "mean_operation_ms": 2.3222480635593223,
-                  "mean_record_ms": 1.5355466054508404,
+                  "elapsed_ns": 5993469908,
+                  "mean_operation_ms": 2.3087326302003084,
+                  "mean_record_ms": 1.5266097575140092,
                   "operations": 2596,
                   "records": 3926
                 },
                 "37": {
-                  "elapsed_ns": 5259693756,
-                  "mean_operation_ms": 2.0781089514026077,
-                  "mean_record_ms": 1.323193397735849,
+                  "elapsed_ns": 5251973194,
+                  "mean_operation_ms": 2.075058551560648,
+                  "mean_record_ms": 1.3212511179874213,
                   "operations": 2531,
                   "records": 3975
                 },
                 "39": {
-                  "elapsed_ns": 5752739234,
-                  "mean_operation_ms": 2.144144328736489,
-                  "mean_record_ms": 1.5468510981446626,
+                  "elapsed_ns": 5684571493,
+                  "mean_operation_ms": 2.118737045471487,
+                  "mean_record_ms": 1.528521509276687,
                   "operations": 2683,
                   "records": 3719
                 },
                 "40": {
-                  "elapsed_ns": 4938983158,
-                  "mean_operation_ms": 2.0266652269183423,
-                  "mean_record_ms": 1.3344996373952986,
+                  "elapsed_ns": 4918492817,
+                  "mean_operation_ms": 2.018257208453016,
+                  "mean_record_ms": 1.328963203728722,
                   "operations": 2437,
                   "records": 3701
                 },
                 "41": {
-                  "elapsed_ns": 5343679046,
-                  "mean_operation_ms": 2.0325899756561427,
-                  "mean_record_ms": 1.388329188360613,
+                  "elapsed_ns": 5324723393,
+                  "mean_operation_ms": 2.0253797615062763,
+                  "mean_record_ms": 1.3834043629514161,
                   "operations": 2629,
                   "records": 3849
                 },
                 "42": {
-                  "elapsed_ns": 5231721822,
-                  "mean_operation_ms": 2.053266021193093,
-                  "mean_record_ms": 1.42865150791917,
+                  "elapsed_ns": 5175676311,
+                  "mean_operation_ms": 2.031270137755102,
+                  "mean_record_ms": 1.4133468899508466,
                   "operations": 2548,
                   "records": 3662
                 },
                 "43": {
-                  "elapsed_ns": 4561827179,
-                  "mean_operation_ms": 2.0356212311468096,
-                  "mean_record_ms": 1.2359325871037659,
+                  "elapsed_ns": 4474840292,
+                  "mean_operation_ms": 1.996805128067827,
+                  "mean_record_ms": 1.2123652917908425,
                   "operations": 2241,
                   "records": 3691
                 },
                 "44": {
-                  "elapsed_ns": 4993498625,
-                  "mean_operation_ms": 2.02905267167818,
-                  "mean_record_ms": 1.320681995503835,
+                  "elapsed_ns": 4920955323,
+                  "mean_operation_ms": 1.9995755071109305,
+                  "mean_record_ms": 1.3014957215022482,
                   "operations": 2461,
                   "records": 3781
                 },
                 "55": {
-                  "elapsed_ns": 5422159285,
-                  "mean_operation_ms": 2.1978756728820428,
-                  "mean_record_ms": 1.3814418560509554,
+                  "elapsed_ns": 5327761186,
+                  "mean_operation_ms": 2.159611344142683,
+                  "mean_record_ms": 1.357391384968153,
                   "operations": 2467,
                   "records": 3925
                 },
                 "56": {
-                  "elapsed_ns": 4971699641,
-                  "mean_operation_ms": 2.045966930452675,
-                  "mean_record_ms": 1.3021738190151912,
+                  "elapsed_ns": 4920657714,
+                  "mean_operation_ms": 2.024962022222222,
+                  "mean_record_ms": 1.2888050586694604,
                   "operations": 2430,
                   "records": 3818
                 }
@@ -2746,7 +2741,7 @@
               "token": 11535
             }
           ],
-          "ingestion_tok_s": 129.5564562189675,
+          "ingestion_tok_s": 130.0601023576939,
           "model": "hy3-oq2e",
           "mtp_cache_policy": null,
           "mtp_history_policy": null,
@@ -2760,7 +2755,7 @@
           },
           "pair_id": "hy3-oq2e-c16384-ar",
           "peak_memory_bytes": 90159108628,
-          "prompt_eval_time_s": 126.46224262501346,
+          "prompt_eval_time_s": 125.9725288769987,
           "prompt_identity": {
             "prompt_artifact_kinds": 6,
             "prompt_filler_sha256": "3f73f761161a37ec1727f2a72dc5cdf5c6032c04bdde83e0319854a16513b003",
@@ -2773,14 +2768,14 @@
           },
           "prompt_mtp_history_time_s": 0.0,
           "prompt_mtp_history_tokens": 0,
-          "prompt_target_prefill_time_s": 126.46224262501346,
-          "prompt_target_prefill_tok_s": 129.5564562189675,
+          "prompt_target_prefill_time_s": 125.9725288769987,
+          "prompt_target_prefill_tok_s": 130.0601023576939,
           "prompt_tokens": 16384,
-          "raw_decode_elapsed_s": 16.062231499963673,
-          "raw_elapsed_s": 142.52447412497713,
+          "raw_decode_elapsed_s": 16.032222788984654,
+          "raw_elapsed_s": 142.00475166598335,
           "replicate": 1,
-          "reported_decode_tok_s": 15.938009609721973,
-          "reported_prompt_target_prefill_tok_s": 129.5564562189675,
+          "reported_decode_tok_s": 15.967841974844019,
+          "reported_prompt_target_prefill_tok_s": 130.0601023576939,
           "requested_depth": 0,
           "resource_telemetry": null,
           "speculative_event_contract": null,
@@ -3122,14 +3117,14 @@
           "conditional_hit_rate": 0.8984375,
           "context_tokens": 16384,
           "cumulative_accepted_drafted_yield": 0.8984375,
-          "decode_elapsed_s": 42.126451791031286,
+          "decode_elapsed_s": 46.669473125075456,
           "decode_expert_cache_hit_rate": 0.4946808510638298,
-          "decode_tok_s": 6.076941900302706,
+          "decode_tok_s": 5.485384403503186,
           "draft_core": "stock",
           "drafted_tokens": 128,
           "effective_depth": 1,
-          "elapsed_s": 169.68337324997992,
-          "end_to_end_tok_s": 1.5086923078954662,
+          "elapsed_s": 174.01058487498085,
+          "end_to_end_tok_s": 1.471174872401728,
           "evaluated_drafts": 128,
           "expert_resource_telemetry": null,
           "expert_streaming_counters": {
@@ -4435,7 +4430,7 @@
             "island_experts": {
               "backend": "dense-island-banks",
               "expert_count": 192,
-              "fill_seconds": 6.296612833015388,
+              "fill_seconds": 6.272286624996923,
               "filled_layers": 69,
               "island_bytes": 70325895168,
               "layers": [
@@ -4555,8 +4550,8 @@
                 "preadv_bytes_returned": 473861062656,
                 "python_preadv_invocations": 50108,
                 "read_bytes": 473861062656,
-                "read_mib_per_second": 4094.7189655035263,
-                "read_ns": 110363892811,
+                "read_mib_per_second": 4109.586049922489,
+                "read_ns": 109964633788,
                 "read_operations": 50039,
                 "record_requests": 89266,
                 "requested_bytes": 473861062656,
@@ -4594,72 +4589,72 @@
               "persistent_slot_count": 170,
               "physical_read_latency_by_layer": {
                 "36": {
-                  "elapsed_ns": 12620609410,
-                  "mean_operation_ms": 2.435470746815901,
-                  "mean_record_ms": 1.6093610571282837,
+                  "elapsed_ns": 13534180009,
+                  "mean_operation_ms": 2.6117676590119645,
+                  "mean_record_ms": 1.725858200586585,
                   "operations": 5182,
                   "records": 7842
                 },
                 "37": {
-                  "elapsed_ns": 10390868996,
-                  "mean_operation_ms": 2.0555626104846687,
-                  "mean_record_ms": 1.308179402744555,
+                  "elapsed_ns": 10247280034,
+                  "mean_operation_ms": 2.0271572767556876,
+                  "mean_record_ms": 1.2901019808636536,
                   "operations": 5055,
                   "records": 7943
                 },
                 "39": {
-                  "elapsed_ns": 11454024943,
-                  "mean_operation_ms": 2.1421404419300543,
-                  "mean_record_ms": 1.5438771994878016,
+                  "elapsed_ns": 11180070514,
+                  "mean_operation_ms": 2.090905276603703,
+                  "mean_record_ms": 1.5069511408545626,
                   "operations": 5347,
                   "records": 7419
                 },
                 "40": {
-                  "elapsed_ns": 9793729368,
-                  "mean_operation_ms": 2.006911755737705,
-                  "mean_record_ms": 1.3220477008639309,
+                  "elapsed_ns": 9777918225,
+                  "mean_operation_ms": 2.003671767418033,
+                  "mean_record_ms": 1.3199133673056154,
                   "operations": 4880,
                   "records": 7408
                 },
                 "41": {
-                  "elapsed_ns": 10549853596,
-                  "mean_operation_ms": 2.0129466887998473,
-                  "mean_record_ms": 1.3735000124983727,
+                  "elapsed_ns": 10442014500,
+                  "mean_operation_ms": 1.9923706353749284,
+                  "mean_record_ms": 1.3594602916286942,
                   "operations": 5241,
                   "records": 7681
                 },
                 "42": {
-                  "elapsed_ns": 10364801299,
-                  "mean_operation_ms": 2.039111016919142,
-                  "mean_record_ms": 1.4176995348105594,
+                  "elapsed_ns": 10237936776,
+                  "mean_operation_ms": 2.014152424945898,
+                  "mean_record_ms": 1.4003469807139926,
                   "operations": 5083,
                   "records": 7311
                 },
                 "43": {
-                  "elapsed_ns": 9029933523,
-                  "mean_operation_ms": 2.0210236175022382,
-                  "mean_record_ms": 1.2255610101791532,
+                  "elapsed_ns": 8842415367,
+                  "mean_operation_ms": 1.9790544688898837,
+                  "mean_record_ms": 1.2001106632736156,
                   "operations": 4468,
                   "records": 7368
                 },
                 "44": {
-                  "elapsed_ns": 9875568901,
-                  "mean_operation_ms": 2.0080457301748678,
-                  "mean_record_ms": 1.3066378540619212,
+                  "elapsed_ns": 9679953362,
+                  "mean_operation_ms": 1.9682703054087027,
+                  "mean_record_ms": 1.2807559356972744,
                   "operations": 4918,
                   "records": 7558
                 },
                 "55": {
-                  "elapsed_ns": 10759768135,
-                  "mean_operation_ms": 2.1913988054989817,
-                  "mean_record_ms": 1.3748745380782008,
+                  "elapsed_ns": 10519792631,
+                  "mean_operation_ms": 2.1425239574338084,
+                  "mean_record_ms": 1.3442106607462305,
                   "operations": 4910,
                   "records": 7826
                 },
                 "56": {
-                  "elapsed_ns": 9818684893,
-                  "mean_operation_ms": 2.0095548286942284,
-                  "mean_record_ms": 1.2814780596450013,
+                  "elapsed_ns": 9773854031,
+                  "mean_operation_ms": 2.000379457838723,
+                  "mean_record_ms": 1.2756269943878884,
                   "operations": 4886,
                   "records": 7662
                 }
@@ -4808,7 +4803,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00273108301917091
+                    "draft": 0.0026392499858047813
                   },
                   "token": 6515
                 }
@@ -4833,15 +4828,15 @@
               },
               "step": 0,
               "timing_s": {
-                "accept": 0.0002125839819200337,
-                "bonus_sample": 0.0003995420120190829,
-                "snapshot": 1.0832998668774962e-05,
-                "verify_eval": 0.0012320419773459435,
+                "accept": 0.0002355419856030494,
+                "bonus_sample": 0.00036895801895298064,
+                "snapshot": 1.0082992957904935e-05,
+                "verify_eval": 0.0013037919998168945,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0012277500063646585,
+                "verify_eval_joint": 0.001299124996876344,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.291970981284976e-06,
-                "verify_forward": 0.28474054200341925,
+                "verify_eval_unattributed": 4.6670029405504465e-06,
+                "verify_forward": 0.28610574998310767,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -4860,7 +4855,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004151707980781794
+                    "draft": 0.004406291991472244
                   },
                   "token": 1655
                 }
@@ -4885,16 +4880,16 @@
               },
               "step": 1,
               "timing_s": {
-                "accept": 0.00018137498409487307,
-                "repair_forward": 0.2130463749927003,
+                "accept": 0.00022170800366438925,
+                "repair_forward": 0.2175392089993693,
                 "rollback": 1.60830095410347e-05,
-                "snapshot": 9.99998883344233e-06,
-                "verify_eval": 0.0015425420133396983,
+                "snapshot": 9.417010005563498e-06,
+                "verify_eval": 0.001550667016999796,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015357499942183495,
+                "verify_eval_joint": 0.0015454590029548854,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 6.792019121348858e-06,
-                "verify_forward": 0.2420240830106195,
+                "verify_eval_unattributed": 5.208014044910669e-06,
+                "verify_forward": 0.2320081250218209,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -4913,7 +4908,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004520207992754877
+                    "draft": 0.004692208021879196
                   },
                   "token": 58035
                 }
@@ -4938,15 +4933,15 @@
               },
               "step": 2,
               "timing_s": {
-                "accept": 0.00035916699562221766,
-                "bonus_sample": 0.0006713340117130429,
-                "snapshot": 9.915995178744197e-06,
-                "verify_eval": 0.0026488339935895056,
+                "accept": 0.00036387500585988164,
+                "bonus_sample": 0.0005189589865040034,
+                "snapshot": 9.041978046298027e-06,
+                "verify_eval": 0.00261199998203665,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026451250014360994,
+                "verify_eval_joint": 0.002607083006296307,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.708992153406143e-06,
-                "verify_forward": 0.29419091701856814,
+                "verify_eval_unattributed": 4.916975740343332e-06,
+                "verify_forward": 0.32975199999054894,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -4965,7 +4960,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006067207985324785
+                    "draft": 0.006239375012228265
                   },
                   "token": 1661
                 }
@@ -4990,15 +4985,15 @@
               },
               "step": 3,
               "timing_s": {
-                "accept": 0.0003223750100005418,
-                "bonus_sample": 0.0005678749876096845,
-                "snapshot": 1.0499992640689015e-05,
-                "verify_eval": 0.002676709002116695,
+                "accept": 0.0002961660211440176,
+                "bonus_sample": 0.0004835410218220204,
+                "snapshot": 1.2541015166789293e-05,
+                "verify_eval": 0.00267537499894388,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.00267220800742507,
+                "verify_eval_joint": 0.002671166992513463,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.5009946916252375e-06,
-                "verify_forward": 0.35598166700219736,
+                "verify_eval_unattributed": 4.208006430417299e-06,
+                "verify_forward": 0.3592314579873346,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5017,7 +5012,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006197792012244463
+                    "draft": 0.006258208013605326
                   },
                   "token": 286
                 }
@@ -5042,15 +5037,15 @@
               },
               "step": 4,
               "timing_s": {
-                "accept": 0.0003670410078484565,
-                "bonus_sample": 0.0004953339812345803,
-                "snapshot": 1.0249990737065673e-05,
-                "verify_eval": 0.002659208024851978,
+                "accept": 0.0004656249948311597,
+                "bonus_sample": 0.0005337079928722233,
+                "snapshot": 1.2374977814033628e-05,
+                "verify_eval": 0.002624499989906326,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026557080273050815,
+                "verify_eval_joint": 0.0026209999923594296,
                 "verify_eval_logits": 0.0,
                 "verify_eval_unattributed": 3.4999975468963385e-06,
-                "verify_forward": 0.3544495830137748,
+                "verify_forward": 0.3558169169991743,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5069,7 +5064,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006225999997695908
+                    "draft": 0.006361708015901968
                   },
                   "token": 55814
                 }
@@ -5094,15 +5089,15 @@
               },
               "step": 5,
               "timing_s": {
-                "accept": 0.00022095799795351923,
-                "bonus_sample": 0.0003817919932771474,
-                "snapshot": 1.2958014849573374e-05,
-                "verify_eval": 0.0015382500132545829,
+                "accept": 0.00022120799985714257,
+                "bonus_sample": 0.00040779198752716184,
+                "snapshot": 1.0832998668774962e-05,
+                "verify_eval": 0.0015320829988922924,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015347920125350356,
+                "verify_eval_joint": 0.0015271670126821846,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.4580007195472717e-06,
-                "verify_forward": 0.32504279099521227,
+                "verify_eval_unattributed": 4.915986210107803e-06,
+                "verify_forward": 0.3311083329899702,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5121,7 +5116,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004587292001815513
+                    "draft": 0.004581790999509394
                   },
                   "token": 1655
                 }
@@ -5146,15 +5141,15 @@
               },
               "step": 6,
               "timing_s": {
-                "accept": 0.0002340420032851398,
-                "bonus_sample": 0.00045612500980496407,
-                "snapshot": 1.0249990737065673e-05,
-                "verify_eval": 0.0017571250209584832,
+                "accept": 0.0002174580004066229,
+                "bonus_sample": 0.0004230419872328639,
+                "snapshot": 1.0207993909716606e-05,
+                "verify_eval": 0.0017020420054905117,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0017523749847896397,
+                "verify_eval_joint": 0.0016968749987427145,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.750036168843508e-06,
-                "verify_forward": 0.22285487499902956,
+                "verify_eval_unattributed": 5.1670067477971315e-06,
+                "verify_forward": 0.22522262501297519,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5173,7 +5168,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004707542015239596
+                    "draft": 0.004907249996904284
                   },
                   "token": 8563
                 }
@@ -5198,15 +5193,15 @@
               },
               "step": 7,
               "timing_s": {
-                "accept": 0.00022191600874066353,
-                "bonus_sample": 0.000398541014874354,
-                "snapshot": 1.1540978448465466e-05,
-                "verify_eval": 0.0015017080004327,
+                "accept": 0.00023283300106413662,
+                "bonus_sample": 0.0004090839938726276,
+                "snapshot": 1.1374999303370714e-05,
+                "verify_eval": 0.0015515419945586473,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014968339819461107,
+                "verify_eval_joint": 0.0015476249973289669,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.874018486589193e-06,
-                "verify_forward": 0.3097678750054911,
+                "verify_eval_unattributed": 3.916997229680419e-06,
+                "verify_forward": 0.3137539160088636,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5225,7 +5220,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004604624991770834
+                    "draft": 0.0046906250063329935
                   },
                   "token": 1655
                 }
@@ -5250,15 +5245,15 @@
               },
               "step": 8,
               "timing_s": {
-                "accept": 0.0002189170045312494,
-                "bonus_sample": 0.0003989590040873736,
-                "snapshot": 1.3374985428526998e-05,
-                "verify_eval": 0.0016191250178962946,
+                "accept": 0.0002372089948039502,
+                "bonus_sample": 0.00039308299892582,
+                "snapshot": 1.0000017937272787e-05,
+                "verify_eval": 0.0016674170037731528,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001615042012417689,
+                "verify_eval_joint": 0.0016640409885440022,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.083005478605628e-06,
-                "verify_forward": 0.21918650000588968,
+                "verify_eval_unattributed": 3.376015229150653e-06,
+                "verify_forward": 0.2221808749891352,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5277,7 +5272,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004597749997628853
+                    "draft": 0.004768582992255688
                   },
                   "token": 185
                 }
@@ -5302,15 +5297,15 @@
               },
               "step": 9,
               "timing_s": {
-                "accept": 0.0002235839783679694,
-                "bonus_sample": 0.00039266698877327144,
-                "snapshot": 9.99998883344233e-06,
-                "verify_eval": 0.0017092920024879277,
+                "accept": 0.00034374999813735485,
+                "bonus_sample": 0.0006252499879337847,
+                "snapshot": 9.832991054281592e-06,
+                "verify_eval": 0.0027282910014037043,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001705875009065494,
+                "verify_eval_joint": 0.002724708989262581,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.416993422433734e-06,
-                "verify_forward": 0.22837587501271628,
+                "verify_eval_unattributed": 3.582012141123414e-06,
+                "verify_forward": 0.30332454197923653,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5329,7 +5324,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004776959016453475
+                    "draft": 0.006217875023139641
                   },
                   "token": 11535
                 }
@@ -5354,16 +5349,16 @@
               },
               "step": 10,
               "timing_s": {
-                "accept": 0.0004914590099360794,
-                "repair_forward": 0.35804387502139434,
-                "rollback": 4.279200220480561e-05,
-                "snapshot": 9.832991054281592e-06,
-                "verify_eval": 0.002621167019242421,
+                "accept": 0.00030166699434630573,
+                "repair_forward": 0.36087983299512416,
+                "rollback": 1.737498678267002e-05,
+                "snapshot": 1.2625008821487427e-05,
+                "verify_eval": 0.0026603330043144524,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002617582998936996,
+                "verify_eval_joint": 0.002656917000422254,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.5840203054249287e-06,
-                "verify_forward": 0.3442954999918584,
+                "verify_eval_unattributed": 3.416003892198205e-06,
+                "verify_forward": 0.3649517919984646,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5382,7 +5377,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006260833004489541
+                    "draft": 0.006318458006717265
                   },
                   "token": 1655
                 }
@@ -5407,15 +5402,15 @@
               },
               "step": 11,
               "timing_s": {
-                "accept": 0.0004990829911548644,
-                "bonus_sample": 0.0005838749930262566,
-                "snapshot": 1.2083997717127204e-05,
-                "verify_eval": 0.0026244589826092124,
+                "accept": 0.00029783399077132344,
+                "bonus_sample": 0.0005689999961759895,
+                "snapshot": 1.4541990822181106e-05,
+                "verify_eval": 0.0026172080251853913,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002619875012896955,
+                "verify_eval_joint": 0.00261183301336132,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.583969712257385e-06,
-                "verify_forward": 0.35051170899532735,
+                "verify_eval_unattributed": 5.375011824071407e-06,
+                "verify_forward": 0.3587149580125697,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5434,7 +5429,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006260916998144239
+                    "draft": 0.006345292000332847
                   },
                   "token": 4725
                 }
@@ -5459,15 +5454,15 @@
               },
               "step": 12,
               "timing_s": {
-                "accept": 0.0002206670178566128,
-                "bonus_sample": 0.00042808300349861383,
-                "snapshot": 1.016599708236754e-05,
-                "verify_eval": 0.0015610420086886734,
+                "accept": 0.00019454199355095625,
+                "bonus_sample": 0.00043016698327846825,
+                "snapshot": 1.1374999303370714e-05,
+                "verify_eval": 0.001549542008433491,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015561250038444996,
+                "verify_eval_joint": 0.0015465000178664923,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.917004844173789e-06,
-                "verify_forward": 0.325089999998454,
+                "verify_eval_unattributed": 3.04199056699872e-06,
+                "verify_forward": 0.32597545799217187,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5486,7 +5481,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004619582992745563
+                    "draft": 0.004763208999065682
                   },
                   "token": 1655
                 }
@@ -5511,15 +5506,15 @@
               },
               "step": 13,
               "timing_s": {
-                "accept": 0.00020854099420830607,
-                "bonus_sample": 0.0004140830133110285,
-                "snapshot": 1.1416996130719781e-05,
-                "verify_eval": 0.0016892919957172126,
+                "accept": 0.00023220799630507827,
+                "bonus_sample": 0.000418790994444862,
+                "snapshot": 9.95901064015925e-06,
+                "verify_eval": 0.0017574169905856252,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0016858750022947788,
+                "verify_eval_joint": 0.0017532090132590383,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.416993422433734e-06,
-                "verify_forward": 0.22932279200176708,
+                "verify_eval_unattributed": 4.2079773265868425e-06,
+                "verify_forward": 0.2261515409918502,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5538,7 +5533,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0049041250022128224
+                    "draft": 0.004771958017954603
                   },
                   "token": 185
                 }
@@ -5563,15 +5558,15 @@
               },
               "step": 14,
               "timing_s": {
-                "accept": 0.00029429199639707804,
-                "bonus_sample": 0.0005072079948149621,
-                "snapshot": 9.957992006093264e-06,
-                "verify_eval": 0.002584416011814028,
+                "accept": 0.0004707499756477773,
+                "bonus_sample": 0.000674333015922457,
+                "snapshot": 1.0417017620056868e-05,
+                "verify_eval": 0.002656917000422254,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002579708001576364,
+                "verify_eval_joint": 0.0026535829820204526,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.708010237663984e-06,
-                "verify_forward": 0.3314091250067577,
+                "verify_eval_unattributed": 3.334018401801586e-06,
+                "verify_forward": 0.3284475420077797,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5590,7 +5585,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006105083011789247
+                    "draft": 0.006278791988734156
                   },
                   "token": 3043
                 }
@@ -5615,16 +5610,16 @@
               },
               "step": 15,
               "timing_s": {
-                "accept": 0.00022237500525079668,
-                "repair_forward": 0.229780000023311,
-                "rollback": 1.633400097489357e-05,
-                "snapshot": 1.3165990822017193e-05,
-                "verify_eval": 0.0015612919814884663,
+                "accept": 0.0002499579859431833,
+                "repair_forward": 0.22894237498985603,
+                "rollback": 1.9041995983570814e-05,
+                "snapshot": 1.0124989785254002e-05,
+                "verify_eval": 0.0016178750083781779,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015574999852105975,
+                "verify_eval_joint": 0.0016130840231198817,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.7919962778687477e-06,
-                "verify_forward": 0.32406891699065454,
+                "verify_eval_unattributed": 4.790985258296132e-06,
+                "verify_forward": 0.3270685000170488,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5643,7 +5638,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004992208007024601
+                    "draft": 0.004986332991393283
                   },
                   "token": 93863
                 }
@@ -5668,15 +5663,15 @@
               },
               "step": 16,
               "timing_s": {
-                "accept": 0.000300458021229133,
-                "bonus_sample": 0.0005137920088600367,
-                "snapshot": 1.0624993592500687e-05,
-                "verify_eval": 0.0026112920022569597,
+                "accept": 0.0002963750157505274,
+                "bonus_sample": 0.0005527919856831431,
+                "snapshot": 1.170899486169219e-05,
+                "verify_eval": 0.002652875002240762,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026075830101035535,
+                "verify_eval_joint": 0.002649166010087356,
                 "verify_eval_logits": 0.0,
                 "verify_eval_unattributed": 3.708992153406143e-06,
-                "verify_forward": 0.3480465419997927,
+                "verify_forward": 0.3456554999866057,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5695,7 +5690,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0060363750089891255
+                    "draft": 0.0061938330181874335
                   },
                   "token": 185
                 }
@@ -5720,15 +5715,15 @@
               },
               "step": 17,
               "timing_s": {
-                "accept": 0.0003477080026641488,
-                "bonus_sample": 0.000608125003054738,
-                "snapshot": 1.0832998668774962e-05,
-                "verify_eval": 0.002667083026608452,
+                "accept": 0.00031308300094679,
+                "bonus_sample": 0.0005654580018017441,
+                "snapshot": 1.1041993275284767e-05,
+                "verify_eval": 0.002608749986393377,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026626659964676946,
+                "verify_eval_joint": 0.0026040000084321946,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.417030140757561e-06,
-                "verify_forward": 0.35445908398833126,
+                "verify_eval_unattributed": 4.749977961182594e-06,
+                "verify_forward": 0.3581633750000037,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5747,7 +5742,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006651333998888731
+                    "draft": 0.0063834999746177346
                   },
                   "token": 3107
                 }
@@ -5772,15 +5767,15 @@
               },
               "step": 18,
               "timing_s": {
-                "accept": 0.0003032080130651593,
-                "bonus_sample": 0.0006342910055536777,
-                "snapshot": 1.2874981621280313e-05,
-                "verify_eval": 0.002596250007627532,
+                "accept": 0.0004685829917434603,
+                "bonus_sample": 0.000575875019421801,
+                "snapshot": 1.2082979083061218e-05,
+                "verify_eval": 0.0027150829846505076,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002592583012301475,
+                "verify_eval_joint": 0.0027115829871036112,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.6669953260570765e-06,
-                "verify_forward": 0.35918100000708364,
+                "verify_eval_unattributed": 3.4999975468963385e-06,
+                "verify_forward": 0.35953608399722725,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5799,7 +5794,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006503292010165751
+                    "draft": 0.006218791997525841
                   },
                   "token": 20076
                 }
@@ -5824,15 +5819,15 @@
               },
               "step": 19,
               "timing_s": {
-                "accept": 0.00025933299912139773,
-                "bonus_sample": 0.0005640420131385326,
-                "snapshot": 1.0333984391763806e-05,
-                "verify_eval": 0.002632874995470047,
+                "accept": 0.0003194170130882412,
+                "bonus_sample": 0.000629457994364202,
+                "snapshot": 1.2957985745742917e-05,
+                "verify_eval": 0.0027315829938743263,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026294580020476133,
+                "verify_eval_joint": 0.0027272090082988143,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.416993422433734e-06,
-                "verify_forward": 0.3630082919844426,
+                "verify_eval_unattributed": 4.373985575512052e-06,
+                "verify_forward": 0.3714287909970153,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5851,7 +5846,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006137041986221448
+                    "draft": 0.006162832985864952
                   },
                   "token": 3107
                 }
@@ -5876,15 +5871,15 @@
               },
               "step": 20,
               "timing_s": {
-                "accept": 0.00024458300322294235,
-                "bonus_sample": 0.0003962499904446304,
-                "snapshot": 1.2417003745213151e-05,
-                "verify_eval": 0.001565540995215997,
+                "accept": 0.00045666698133572936,
+                "bonus_sample": 0.0005715840088669211,
+                "snapshot": 1.0957999620586634e-05,
+                "verify_eval": 0.0026382080104667693,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015602079802192748,
+                "verify_eval_joint": 0.002634832984767854,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.333014996722341e-06,
-                "verify_forward": 0.32510345900664106,
+                "verify_eval_unattributed": 3.375025698915124e-06,
+                "verify_forward": 0.3648266660165973,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5903,7 +5898,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004561250010738149
+                    "draft": 0.006430000008549541
                   },
                   "token": 11
                 }
@@ -5928,15 +5923,15 @@
               },
               "step": 21,
               "timing_s": {
-                "accept": 0.0002017499937210232,
-                "bonus_sample": 0.000457499991171062,
-                "snapshot": 1.0124989785254002e-05,
-                "verify_eval": 0.001881875010440126,
+                "accept": 0.0002252910053357482,
+                "bonus_sample": 0.0004138750082347542,
+                "snapshot": 1.0000017937272787e-05,
+                "verify_eval": 0.0015568749804515392,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0018782920087687671,
+                "verify_eval_joint": 0.0015520410088356584,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.583001671358943e-06,
-                "verify_forward": 0.2253435000020545,
+                "verify_eval_unattributed": 4.833971615880728e-06,
+                "verify_forward": 0.3015508749813307,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -5955,7 +5950,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004806374985491857
+                    "draft": 0.0046793750079814345
                   },
                   "token": 11
                 }
@@ -5980,16 +5975,16 @@
               },
               "step": 22,
               "timing_s": {
-                "accept": 0.0004745420010294765,
-                "repair_forward": 0.31890741700772196,
-                "rollback": 4.3167005060240626e-05,
-                "snapshot": 1.1500000255182385e-05,
-                "verify_eval": 0.002743332996033132,
+                "accept": 0.00020549999317154288,
+                "repair_forward": 0.30584191699745134,
+                "rollback": 1.837499439716339e-05,
+                "snapshot": 1.0791991371661425e-05,
+                "verify_eval": 0.0019032500276807696,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002739292016485706,
+                "verify_eval_joint": 0.0018997080042026937,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.0409795474261045e-06,
-                "verify_forward": 0.3361515410069842,
+                "verify_eval_unattributed": 3.542023478075862e-06,
+                "verify_forward": 0.23307883300003596,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6008,7 +6003,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00461633299710229
+                    "draft": 0.004875082988291979
                   },
                   "token": 3043
                 }
@@ -6033,15 +6028,15 @@
               },
               "step": 23,
               "timing_s": {
-                "accept": 0.00021512500825338066,
-                "bonus_sample": 0.0003911669773515314,
-                "snapshot": 9.917013812810183e-06,
-                "verify_eval": 0.00147237500641495,
+                "accept": 0.00021129200467839837,
+                "bonus_sample": 0.0004165419959463179,
+                "snapshot": 1.1916999937966466e-05,
+                "verify_eval": 0.001558625022880733,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014678750012535602,
+                "verify_eval_joint": 0.0015545409987680614,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.5000051613897085e-06,
-                "verify_forward": 0.2145168750139419,
+                "verify_eval_unattributed": 4.084024112671614e-06,
+                "verify_forward": 0.22536595902056433,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6060,7 +6055,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004473292006878182
+                    "draft": 0.004754583002068102
                   },
                   "token": 1661
                 }
@@ -6085,15 +6080,15 @@
               },
               "step": 24,
               "timing_s": {
-                "accept": 0.0002115829847753048,
-                "bonus_sample": 0.000406457984354347,
-                "snapshot": 1.0916992323473096e-05,
-                "verify_eval": 0.0014329589903354645,
+                "accept": 0.00024441699497401714,
+                "bonus_sample": 0.0004241670249029994,
+                "snapshot": 1.1666998034343123e-05,
+                "verify_eval": 0.0020518329984042794,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014289169921539724,
+                "verify_eval_joint": 0.002047999994829297,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.04199818149209e-06,
-                "verify_forward": 0.20584666699869558,
+                "verify_eval_unattributed": 3.8330035749822855e-06,
+                "verify_forward": 0.238779458013596,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6112,7 +6107,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004508041980443522
+                    "draft": 0.004730124986963347
                   },
                   "token": 185
                 }
@@ -6137,15 +6132,15 @@
               },
               "step": 25,
               "timing_s": {
-                "accept": 0.00019141699885949492,
-                "bonus_sample": 0.0004328330105636269,
-                "snapshot": 1.0457995813339949e-05,
-                "verify_eval": 0.0014452089963015169,
+                "accept": 0.0003640419745352119,
+                "bonus_sample": 0.0006680420192424208,
+                "snapshot": 1.0583025868982077e-05,
+                "verify_eval": 0.002635665994603187,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014415839978028089,
+                "verify_eval_joint": 0.0026311249821446836,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.6249984987080097e-06,
-                "verify_forward": 0.19049450001330115,
+                "verify_eval_unattributed": 4.541012458503246e-06,
+                "verify_forward": 0.34414662499330007,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6164,7 +6159,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004480250005144626
+                    "draft": 0.006503499986138195
                   },
                   "token": 25274
                 }
@@ -6189,15 +6184,15 @@
               },
               "step": 26,
               "timing_s": {
-                "accept": 0.00020362497889436781,
-                "bonus_sample": 0.00037595798494294286,
-                "snapshot": 9.415991371497512e-06,
-                "verify_eval": 0.0013057079922873527,
+                "accept": 0.0003563750069588423,
+                "bonus_sample": 0.0005564999883063138,
+                "snapshot": 1.3124983524903655e-05,
+                "verify_eval": 0.0026652910164557397,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0013019589823670685,
+                "verify_eval_joint": 0.0026605839957483113,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.749009920284152e-06,
-                "verify_forward": 0.18066841599647887,
+                "verify_eval_unattributed": 4.707020707428455e-06,
+                "verify_forward": 0.3561240000126418,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6216,7 +6211,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004198959009954706
+                    "draft": 0.006277583015616983
                   },
                   "token": 9849
                 }
@@ -6241,15 +6236,15 @@
               },
               "step": 27,
               "timing_s": {
-                "accept": 0.00018104200717061758,
-                "bonus_sample": 0.00038287497591227293,
-                "snapshot": 9.792012860998511e-06,
-                "verify_eval": 0.0012956660066265613,
+                "accept": 0.00029979099053889513,
+                "bonus_sample": 0.0006929170049261302,
+                "snapshot": 1.704200985841453e-05,
+                "verify_eval": 0.0026043750112876296,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0012915419938508421,
+                "verify_eval_joint": 0.0025996670010499656,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.124012775719166e-06,
-                "verify_forward": 0.1752338329970371,
+                "verify_eval_unattributed": 4.708010237663984e-06,
+                "verify_forward": 0.35661662500933744,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6268,7 +6263,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004256832995451987
+                    "draft": 0.006542791990796104
                   },
                   "token": 46284
                 }
@@ -6293,15 +6288,15 @@
               },
               "step": 28,
               "timing_s": {
-                "accept": 0.00018545900820754468,
-                "bonus_sample": 0.00038616597885265946,
-                "snapshot": 1.1666008504107594e-05,
-                "verify_eval": 0.0012839999981224537,
+                "accept": 0.0002796249755192548,
+                "bonus_sample": 0.0005025000136811286,
+                "snapshot": 1.1666998034343123e-05,
+                "verify_eval": 0.0026161659916397184,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0012799579999409616,
+                "verify_eval_joint": 0.002611957985209301,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.04199818149209e-06,
-                "verify_forward": 0.17658712499542162,
+                "verify_eval_unattributed": 4.208006430417299e-06,
+                "verify_forward": 0.35958529100753367,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6320,7 +6315,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00416737500927411
+                    "draft": 0.006254749983781949
                   },
                   "token": 5465
                 }
@@ -6345,15 +6340,15 @@
               },
               "step": 29,
               "timing_s": {
-                "accept": 0.00022166600683704019,
-                "bonus_sample": 0.00037533300928771496,
-                "snapshot": 9.832991054281592e-06,
-                "verify_eval": 0.0013158750080037862,
+                "accept": 0.0003450829826761037,
+                "bonus_sample": 0.0006608749972656369,
+                "snapshot": 1.0458985343575478e-05,
+                "verify_eval": 0.002632958989124745,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.00131216601585038,
+                "verify_eval_joint": 0.002629249996971339,
                 "verify_eval_logits": 0.0,
                 "verify_eval_unattributed": 3.708992153406143e-06,
-                "verify_forward": 0.17007833300158381,
+                "verify_forward": 0.3522155410028063,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6372,7 +6367,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004114582989132032
+                    "draft": 0.006544375006342307
                   },
                   "token": 24708
                 }
@@ -6397,15 +6392,15 @@
               },
               "step": 30,
               "timing_s": {
-                "accept": 0.00018733300385065377,
-                "bonus_sample": 0.0003789579786825925,
-                "snapshot": 9.99998883344233e-06,
-                "verify_eval": 0.0012984169879928231,
+                "accept": 0.00029879200155846775,
+                "bonus_sample": 0.0006935839774087071,
+                "snapshot": 1.2792006600648165e-05,
+                "verify_eval": 0.0026112500054296106,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0012947919894941151,
+                "verify_eval_joint": 0.0026072500040754676,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.6249984987080097e-06,
-                "verify_forward": 0.169224542012671,
+                "verify_eval_unattributed": 4.0000013541430235e-06,
+                "verify_forward": 0.35204229201190174,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6424,7 +6419,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004168165993178263
+                    "draft": 0.006382083985954523
                   },
                   "token": 4140
                 }
@@ -6449,16 +6444,16 @@
               },
               "step": 31,
               "timing_s": {
-                "accept": 0.00019895800505764782,
-                "repair_forward": 0.1733740409836173,
-                "rollback": 1.691601937636733e-05,
-                "snapshot": 1.0374991688877344e-05,
-                "verify_eval": 0.0013026669912505895,
+                "accept": 0.00026687499484978616,
+                "repair_forward": 0.3582604999828618,
+                "rollback": 1.8207996618002653e-05,
+                "snapshot": 1.1249998351559043e-05,
+                "verify_eval": 0.0026133749925065786,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0012992080010008067,
+                "verify_eval_joint": 0.0026080420066136867,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.4589902497828007e-06,
-                "verify_forward": 0.17194133301381953,
+                "verify_eval_unattributed": 5.332985892891884e-06,
+                "verify_forward": 0.3559067080204841,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6477,7 +6472,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004103792016394436
+                    "draft": 0.006380792008712888
                   },
                   "token": 185
                 }
@@ -6502,15 +6497,15 @@
               },
               "step": 32,
               "timing_s": {
-                "accept": 0.00020012498134747148,
-                "bonus_sample": 0.0004158749943599105,
-                "snapshot": 1.1500000255182385e-05,
-                "verify_eval": 0.001308082981267944,
+                "accept": 0.0003712920006364584,
+                "bonus_sample": 0.0006402919825632125,
+                "snapshot": 1.2375006917864084e-05,
+                "verify_eval": 0.002648666995810345,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0013029170222580433,
+                "verify_eval_joint": 0.0026447080017533153,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.165959009900689e-06,
-                "verify_forward": 0.17979475000174716,
+                "verify_eval_unattributed": 3.958994057029486e-06,
+                "verify_forward": 0.36072579098981805,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6529,7 +6524,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004072082985658199
+                    "draft": 0.006526791024953127
                   },
                   "token": 16943
                 }
@@ -6554,15 +6549,15 @@
               },
               "step": 33,
               "timing_s": {
-                "accept": 0.0001931660226546228,
-                "bonus_sample": 0.00037762499414384365,
-                "snapshot": 1.070898724719882e-05,
-                "verify_eval": 0.0013420829782262444,
+                "accept": 0.00035958297667093575,
+                "bonus_sample": 0.0005019159871153533,
+                "snapshot": 1.1500000255182385e-05,
+                "verify_eval": 0.002636916993651539,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0013375830021686852,
+                "verify_eval_joint": 0.0026326249935664237,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.499976057559252e-06,
-                "verify_forward": 0.1789756660000421,
+                "verify_eval_unattributed": 4.292000085115433e-06,
+                "verify_forward": 0.3601863750081975,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6581,7 +6576,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004305707989260554
+                    "draft": 0.006254416017327458
                   },
                   "token": 2
                 }
@@ -6606,15 +6601,15 @@
               },
               "step": 34,
               "timing_s": {
-                "accept": 0.00033237499883398414,
-                "bonus_sample": 0.0006514170090667903,
-                "snapshot": 1.2291973689571023e-05,
-                "verify_eval": 0.00263762500253506,
+                "accept": 0.00021650001872330904,
+                "bonus_sample": 0.0004000409971922636,
+                "snapshot": 1.333298860117793e-05,
+                "verify_eval": 0.0015783330018166453,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002633833995787427,
+                "verify_eval_joint": 0.0015742910036351532,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.7910067476332188e-06,
-                "verify_forward": 0.23474733301554807,
+                "verify_eval_unattributed": 4.04199818149209e-06,
+                "verify_forward": 0.3223707500146702,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6633,7 +6628,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006068457994842902
+                    "draft": 0.004524582996964455
                   },
                   "token": 16
                 }
@@ -6658,15 +6653,15 @@
               },
               "step": 35,
               "timing_s": {
-                "accept": 0.00018954099505208433,
-                "bonus_sample": 0.0004419579927343875,
-                "snapshot": 9.583018254488707e-06,
-                "verify_eval": 0.0015471669903490692,
+                "accept": 0.00020637499983422458,
+                "bonus_sample": 0.0004261670110281557,
+                "snapshot": 1.0499992640689015e-05,
+                "verify_eval": 0.0019662079866975546,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015437499969266355,
+                "verify_eval_joint": 0.0019621250103227794,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.416993422433734e-06,
-                "verify_forward": 0.32839137499104254,
+                "verify_eval_unattributed": 4.082976374775171e-06,
+                "verify_forward": 0.23921987498761155,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6685,7 +6680,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004557167005259544
+                    "draft": 0.004978832992492244
                   },
                   "token": 12059
                 }
@@ -6710,15 +6705,15 @@
               },
               "step": 36,
               "timing_s": {
-                "accept": 0.00021245802054181695,
-                "bonus_sample": 0.0004355839919298887,
-                "snapshot": 9.37501317821443e-06,
-                "verify_eval": 0.0019284579902887344,
+                "accept": 0.0002145000034943223,
+                "bonus_sample": 0.00039900001138448715,
+                "snapshot": 1.0749994544312358e-05,
+                "verify_eval": 0.001541875011753291,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019236670050304383,
+                "verify_eval_joint": 0.0015372080088127404,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.790985258296132e-06,
-                "verify_forward": 0.24919004199909978,
+                "verify_eval_unattributed": 4.6670029405504465e-06,
+                "verify_forward": 0.33247316599590704,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6737,7 +6732,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0056429170072078705
+                    "draft": 0.004636541998479515
                   },
                   "token": 3107
                 }
@@ -6762,15 +6757,15 @@
               },
               "step": 37,
               "timing_s": {
-                "accept": 0.00025424998602829874,
-                "bonus_sample": 0.0007082079828251153,
-                "snapshot": 1.0082992957904935e-05,
-                "verify_eval": 0.002622083993628621,
+                "accept": 0.00024354198831133544,
+                "bonus_sample": 0.0004982920072507113,
+                "snapshot": 1.1791998986154795e-05,
+                "verify_eval": 0.001952749997144565,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002617917023599148,
+                "verify_eval_joint": 0.0019493750005494803,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.166970029473305e-06,
-                "verify_forward": 0.36399612500099465,
+                "verify_eval_unattributed": 3.374996595084667e-06,
+                "verify_forward": 0.24529008398531005,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6789,7 +6784,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00603229200351052
+                    "draft": 0.005106374999741092
                   },
                   "token": 20076
                 }
@@ -6814,15 +6809,15 @@
               },
               "step": 38,
               "timing_s": {
-                "accept": 0.00020829201093874872,
-                "bonus_sample": 0.0004089580033905804,
-                "snapshot": 9.917013812810183e-06,
-                "verify_eval": 0.0015601670020259917,
+                "accept": 0.00023341699852608144,
+                "bonus_sample": 0.0003982500056736171,
+                "snapshot": 1.0249990737065673e-05,
+                "verify_eval": 0.0015616249875165522,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001556792005430907,
+                "verify_eval_joint": 0.0015572499833069742,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.374996595084667e-06,
-                "verify_forward": 0.3340877080045175,
+                "verify_eval_unattributed": 4.375004209578037e-06,
+                "verify_forward": 0.3353807919775136,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6841,7 +6836,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0045154170074965805
+                    "draft": 0.004505250020883977
                   },
                   "token": 9355
                 }
@@ -6866,15 +6861,15 @@
               },
               "step": 39,
               "timing_s": {
-                "accept": 0.00035099999513477087,
-                "bonus_sample": 0.0004535829939413816,
-                "snapshot": 9.167008101940155e-06,
-                "verify_eval": 0.0020215830008964986,
+                "accept": 0.00019008401432074606,
+                "bonus_sample": 0.00039062497671693563,
+                "snapshot": 1.2165983207523823e-05,
+                "verify_eval": 0.001558874995680526,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0020170419884379953,
+                "verify_eval_joint": 0.0015540829917881638,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.541012458503246e-06,
-                "verify_forward": 0.2630537500081118,
+                "verify_eval_unattributed": 4.792003892362118e-06,
+                "verify_forward": 0.2422195830149576,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6893,7 +6888,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005479416984599084
+                    "draft": 0.004606417001923546
                   },
                   "token": 42279
                 }
@@ -6918,15 +6913,15 @@
               },
               "step": 40,
               "timing_s": {
-                "accept": 0.0002159999858122319,
-                "bonus_sample": 0.0004065830144099891,
-                "snapshot": 1.3833981938660145e-05,
-                "verify_eval": 0.0015398750256281346,
+                "accept": 0.00020383301307447255,
+                "bonus_sample": 0.00040324998553842306,
+                "snapshot": 1.0208983439952135e-05,
+                "verify_eval": 0.0020321249903645366,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015362499980255961,
+                "verify_eval_joint": 0.002028500020969659,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.6250276025384665e-06,
-                "verify_forward": 0.33306708399322815,
+                "verify_eval_unattributed": 3.624969394877553e-06,
+                "verify_forward": 0.2392719159834087,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6945,7 +6940,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00456420800765045
+                    "draft": 0.004905458015855402
                   },
                   "token": 31
                 }
@@ -6970,15 +6965,15 @@
               },
               "step": 41,
               "timing_s": {
-                "accept": 0.00019029100076295435,
-                "bonus_sample": 0.0004370829847175628,
-                "snapshot": 1.1124997399747372e-05,
-                "verify_eval": 0.0015688329876866192,
+                "accept": 0.0002674999996088445,
+                "bonus_sample": 0.0006420419958885759,
+                "snapshot": 9.458017302677035e-06,
+                "verify_eval": 0.0026666250196285546,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015652499860152602,
+                "verify_eval_joint": 0.002663124992977828,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.583001671358943e-06,
-                "verify_forward": 0.2193003749998752,
+                "verify_eval_unattributed": 3.500026650726795e-06,
+                "verify_forward": 0.339336834003916,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -6997,7 +6992,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004674708005040884
+                    "draft": 0.006207750004250556
                   },
                   "token": 103071
                 }
@@ -7022,15 +7017,15 @@
               },
               "step": 42,
               "timing_s": {
-                "accept": 0.0003027500060852617,
-                "bonus_sample": 0.0007209579925984144,
-                "snapshot": 1.0374991688877344e-05,
-                "verify_eval": 0.002655791991855949,
+                "accept": 0.000352165981894359,
+                "bonus_sample": 0.0005424579721875489,
+                "snapshot": 1.170899486169219e-05,
+                "verify_eval": 0.0026360419869888574,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026506250142119825,
+                "verify_eval_joint": 0.0026307090010959655,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.166977643966675e-06,
-                "verify_forward": 0.3330767500156071,
+                "verify_eval_unattributed": 5.332985892891884e-06,
+                "verify_forward": 0.36616900001536123,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7049,7 +7044,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00645995800732635
+                    "draft": 0.006271457998082042
                   },
                   "token": 73415
                 }
@@ -7074,15 +7069,15 @@
               },
               "step": 43,
               "timing_s": {
-                "accept": 0.00028208299772813916,
-                "bonus_sample": 0.0006122920021880418,
-                "snapshot": 1.2250005966052413e-05,
-                "verify_eval": 0.002634082979056984,
+                "accept": 0.00025933299912139773,
+                "bonus_sample": 0.000570834003156051,
+                "snapshot": 1.1124997399747372e-05,
+                "verify_eval": 0.0026436249900143594,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002630207978654653,
+                "verify_eval_joint": 0.002640124992467463,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.875000402331352e-06,
-                "verify_forward": 0.3712655419949442,
+                "verify_eval_unattributed": 3.4999975468963385e-06,
+                "verify_forward": 0.3707582499773707,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7101,7 +7096,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0061384580039884895
+                    "draft": 0.0063610830111429095
                   },
                   "token": 584
                 }
@@ -7126,15 +7121,15 @@
               },
               "step": 44,
               "timing_s": {
-                "accept": 0.00020662500173784792,
-                "bonus_sample": 0.0003625410026870668,
-                "snapshot": 1.09999964479357e-05,
-                "verify_eval": 0.0015012079966254532,
+                "accept": 0.0003358749963808805,
+                "bonus_sample": 0.0006043750036042184,
+                "snapshot": 1.2333999620750546e-05,
+                "verify_eval": 0.002663374994881451,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014962079876568168,
+                "verify_eval_joint": 0.002659334015334025,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.0000089686363935e-06,
-                "verify_forward": 0.33868962500127964,
+                "verify_eval_unattributed": 4.0409795474261045e-06,
+                "verify_forward": 0.36363016700488515,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7153,7 +7148,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004742334014736116
+                    "draft": 0.006615541991777718
                   },
                   "token": 69669
                 }
@@ -7178,15 +7173,15 @@
               },
               "step": 45,
               "timing_s": {
-                "accept": 0.00032958301017060876,
-                "bonus_sample": 0.00043654098408296704,
-                "snapshot": 1.1791998986154795e-05,
-                "verify_eval": 0.002332500007469207,
+                "accept": 0.00028991600265726447,
+                "bonus_sample": 0.0006803330034017563,
+                "snapshot": 2.733300789259374e-05,
+                "verify_eval": 0.0026969159953296185,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0023276249994523823,
+                "verify_eval_joint": 0.0026920420059468597,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.875008016824722e-06,
-                "verify_forward": 0.24935770797310397,
+                "verify_eval_unattributed": 4.873989382758737e-06,
+                "verify_forward": 0.37193304201355204,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7205,7 +7200,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005302208999637514
+                    "draft": 0.006164749996969476
                   },
                   "token": 300
                 }
@@ -7230,15 +7225,15 @@
               },
               "step": 46,
               "timing_s": {
-                "accept": 0.0002824580005835742,
-                "bonus_sample": 0.0006388330075424165,
-                "snapshot": 1.116600469686091e-05,
-                "verify_eval": 0.002633541007526219,
+                "accept": 0.0003589999978430569,
+                "bonus_sample": 0.0006834579980932176,
+                "snapshot": 1.0916992323473096e-05,
+                "verify_eval": 0.002644708991283551,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002629416005220264,
+                "verify_eval_joint": 0.002640042017446831,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.125002305954695e-06,
-                "verify_forward": 0.3537685839983169,
+                "verify_eval_unattributed": 4.66697383671999e-06,
+                "verify_forward": 0.36108975001843646,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7257,7 +7252,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006215749977855012
+                    "draft": 0.006002958019962534
                   },
                   "token": 3692
                 }
@@ -7282,15 +7277,15 @@
               },
               "step": 47,
               "timing_s": {
-                "accept": 0.0002907919988501817,
-                "bonus_sample": 0.0005239579768385738,
-                "snapshot": 1.229101326316595e-05,
-                "verify_eval": 0.0026254580006934702,
+                "accept": 0.0002688329841475934,
+                "bonus_sample": 0.0006015420076437294,
+                "snapshot": 1.1334021110087633e-05,
+                "verify_eval": 0.002591875003417954,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026211249933112413,
+                "verify_eval_joint": 0.002587208990007639,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.3330073822289705e-06,
-                "verify_forward": 0.3715334999724291,
+                "verify_eval_unattributed": 4.6660134103149176e-06,
+                "verify_forward": 0.3752321249921806,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7309,7 +7304,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006231624982319772
+                    "draft": 0.006450916989706457
                   },
                   "token": 2002
                 }
@@ -7334,15 +7329,15 @@
               },
               "step": 48,
               "timing_s": {
-                "accept": 0.00020941600087098777,
-                "bonus_sample": 0.0004370829847175628,
-                "snapshot": 1.2749980669468641e-05,
-                "verify_eval": 0.0015644169761799276,
+                "accept": 0.00018470900249667466,
+                "bonus_sample": 0.00040087499655783176,
+                "snapshot": 1.1458003427833319e-05,
+                "verify_eval": 0.0015501250163652003,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015591249975841492,
+                "verify_eval_joint": 0.0015462080191355199,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.291978595778346e-06,
-                "verify_forward": 0.30824629100970924,
+                "verify_eval_unattributed": 3.916997229680419e-06,
+                "verify_forward": 0.3135877909953706,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7361,7 +7356,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00454029202228412
+                    "draft": 0.004507791978539899
                   },
                   "token": 300
                 }
@@ -7386,15 +7381,15 @@
               },
               "step": 49,
               "timing_s": {
-                "accept": 0.0002214580017607659,
-                "bonus_sample": 0.0004164160054642707,
-                "snapshot": 1.0750023648142815e-05,
-                "verify_eval": 0.0015780419926159084,
+                "accept": 0.0002433749905321747,
+                "bonus_sample": 0.0005468339950311929,
+                "snapshot": 1.1750002158805728e-05,
+                "verify_eval": 0.0020043750118929893,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015737920184619725,
+                "verify_eval_joint": 0.0020001660159323364,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.249974153935909e-06,
-                "verify_forward": 0.23887983299209736,
+                "verify_eval_unattributed": 4.208995960652828e-06,
+                "verify_forward": 0.249600167007884,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7413,7 +7408,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00448662499547936
+                    "draft": 0.005262457998469472
                   },
                   "token": 25
                 }
@@ -7438,15 +7433,15 @@
               },
               "step": 50,
               "timing_s": {
-                "accept": 0.0002995000104419887,
-                "bonus_sample": 0.0006683329993393272,
-                "snapshot": 1.1417025234550238e-05,
-                "verify_eval": 0.001982040994334966,
+                "accept": 0.000351458991644904,
+                "bonus_sample": 0.0006067920185159892,
+                "snapshot": 1.2375006917864084e-05,
+                "verify_eval": 0.0026437089836690575,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019765830074902624,
+                "verify_eval_joint": 0.002638790989294648,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.457986844703555e-06,
-                "verify_forward": 0.2546744160063099,
+                "verify_eval_unattributed": 4.917994374409318e-06,
+                "verify_forward": 0.3726753329974599,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7465,7 +7460,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005629916995530948
+                    "draft": 0.006281875015702099
                   },
                   "token": 185
                 }
@@ -7490,15 +7485,15 @@
               },
               "step": 51,
               "timing_s": {
-                "accept": 0.0003332079795654863,
-                "bonus_sample": 0.0006013340025674552,
-                "snapshot": 1.129100564867258e-05,
-                "verify_eval": 0.0026467499847058207,
+                "accept": 0.0004612079937942326,
+                "bonus_sample": 0.0006570830009877682,
+                "snapshot": 1.1750002158805728e-05,
+                "verify_eval": 0.0026519579987507313,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026422909868415445,
+                "verify_eval_joint": 0.0026484169939067215,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.458997864276171e-06,
-                "verify_forward": 0.37051112498738803,
+                "verify_eval_unattributed": 3.5410048440098763e-06,
+                "verify_forward": 0.37168224999913946,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7517,7 +7512,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0061120000027585775
+                    "draft": 0.00625487498473376
                   },
                   "token": 18125
                 }
@@ -7542,16 +7537,16 @@
               },
               "step": 52,
               "timing_s": {
-                "accept": 0.00023083301493898034,
-                "repair_forward": 0.2545503749861382,
-                "rollback": 1.7749989638105035e-05,
-                "snapshot": 1.4500023098662496e-05,
-                "verify_eval": 0.0016217080119531602,
+                "accept": 0.00020854099420830607,
+                "repair_forward": 0.2528669580060523,
+                "rollback": 1.8916005501523614e-05,
+                "snapshot": 9.957992006093264e-06,
+                "verify_eval": 0.0015512090176343918,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0016168750007636845,
+                "verify_eval_joint": 0.001547042018501088,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.8330111894756556e-06,
-                "verify_forward": 0.313675792014692,
+                "verify_eval_unattributed": 4.1669991333037615e-06,
+                "verify_forward": 0.3111640000133775,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7570,7 +7565,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004743625002447516
+                    "draft": 0.005367834004573524
                   },
                   "token": 694
                 }
@@ -7595,15 +7590,15 @@
               },
               "step": 53,
               "timing_s": {
-                "accept": 0.00020124998991377652,
-                "bonus_sample": 0.0003857080009765923,
-                "snapshot": 1.1415977496653795e-05,
-                "verify_eval": 0.0015639589983038604,
+                "accept": 0.000211750011658296,
+                "bonus_sample": 0.000396334013203159,
+                "snapshot": 1.0707997716963291e-05,
+                "verify_eval": 0.0014102080021984875,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015598339959979057,
+                "verify_eval_joint": 0.0014056670188438147,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.125002305954695e-06,
-                "verify_forward": 0.2558520829770714,
+                "verify_eval_unattributed": 4.5409833546727896e-06,
+                "verify_forward": 0.2965317500056699,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7622,7 +7617,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004664709005737677
+                    "draft": 0.004362417006632313
                   },
                   "token": 206
                 }
@@ -7647,15 +7642,15 @@
               },
               "step": 54,
               "timing_s": {
-                "accept": 0.0002278749889228493,
-                "bonus_sample": 0.0004529999860096723,
-                "snapshot": 1.0916992323473096e-05,
-                "verify_eval": 0.001976957981241867,
+                "accept": 0.00018587501836009324,
+                "bonus_sample": 0.0003861250006593764,
+                "snapshot": 1.0040996130555868e-05,
+                "verify_eval": 0.0015706669946666807,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019725000020116568,
+                "verify_eval_joint": 0.0015674580063205212,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.457979230210185e-06,
-                "verify_forward": 0.24761695897905156,
+                "verify_eval_unattributed": 3.208988346159458e-06,
+                "verify_forward": 0.2188323330192361,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7674,7 +7669,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0054489169851876795
+                    "draft": 0.004394792020320892
                   },
                   "token": 185
                 }
@@ -7699,15 +7694,15 @@
               },
               "step": 55,
               "timing_s": {
-                "accept": 0.0003164589870721102,
-                "bonus_sample": 0.0005225839850027114,
-                "snapshot": 1.1416996130719781e-05,
-                "verify_eval": 0.0027054169913753867,
+                "accept": 0.0003393749939277768,
+                "bonus_sample": 0.0006023340101819485,
+                "snapshot": 1.966700074262917e-05,
+                "verify_eval": 0.0025764579768292606,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002701040997635573,
+                "verify_eval_joint": 0.0025719160039443523,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.375993739813566e-06,
-                "verify_forward": 0.36241879098815843,
+                "verify_eval_unattributed": 4.5419728849083185e-06,
+                "verify_forward": 0.3278347500017844,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7726,7 +7721,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006144333019619808
+                    "draft": 0.006307665986241773
                   },
                   "token": 18125
                 }
@@ -7751,15 +7746,15 @@
               },
               "step": 56,
               "timing_s": {
-                "accept": 0.00019633298506960273,
-                "bonus_sample": 0.0004034999874420464,
-                "snapshot": 1.5833007637411356e-05,
-                "verify_eval": 0.0015108340012375265,
+                "accept": 0.0003286669962108135,
+                "bonus_sample": 0.0004971669986844063,
+                "snapshot": 1.12500274553895e-05,
+                "verify_eval": 0.0027100410079583526,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015070000081323087,
+                "verify_eval_joint": 0.002705792023334652,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.8339931052178144e-06,
-                "verify_forward": 0.3208721250121016,
+                "verify_eval_unattributed": 4.24898462370038e-06,
+                "verify_forward": 0.36428004200570285,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7778,7 +7773,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0045443749986588955
+                    "draft": 0.006449542008340359
                   },
                   "token": 13520
                 }
@@ -7803,16 +7798,16 @@
               },
               "step": 57,
               "timing_s": {
-                "accept": 0.0002081669808831066,
-                "repair_forward": 0.2948200000100769,
-                "rollback": 1.845901715569198e-05,
-                "snapshot": 1.0707997716963291e-05,
-                "verify_eval": 0.0018014999805018306,
+                "accept": 0.0003242499951738864,
+                "repair_forward": 0.3107346670003608,
+                "rollback": 2.083400613628328e-05,
+                "snapshot": 1.2250005966052413e-05,
+                "verify_eval": 0.002661499980604276,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001797542005078867,
+                "verify_eval_joint": 0.002657625009305775,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.9579754229635e-06,
-                "verify_forward": 0.23627395799849182,
+                "verify_eval_unattributed": 3.8749712985008955e-06,
+                "verify_forward": 0.3615017499832902,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7831,7 +7826,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004558709013508633
+                    "draft": 0.004626584006473422
                   },
                   "token": 11
                 }
@@ -7856,15 +7851,15 @@
               },
               "step": 58,
               "timing_s": {
-                "accept": 0.00023429197608493268,
-                "bonus_sample": 0.0003841659927275032,
-                "snapshot": 1.1208001524209976e-05,
-                "verify_eval": 0.0016652919875923544,
+                "accept": 0.00019979098578915,
+                "bonus_sample": 0.00044624999281950295,
+                "snapshot": 1.1249998351559043e-05,
+                "verify_eval": 0.0017244580085389316,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0016619169909972697,
+                "verify_eval_joint": 0.001720375003060326,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.374996595084667e-06,
-                "verify_forward": 0.23833058300078847,
+                "verify_eval_unattributed": 4.083005478605628e-06,
+                "verify_forward": 0.24159254200640135,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7883,7 +7878,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0045295000018086284
+                    "draft": 0.004644833010388538
                   },
                   "token": 60
                 }
@@ -7908,15 +7903,15 @@
               },
               "step": 59,
               "timing_s": {
-                "accept": 0.00020620899158529937,
-                "bonus_sample": 0.0004449170082807541,
-                "snapshot": 1.0124989785254002e-05,
-                "verify_eval": 0.0015115000132936984,
+                "accept": 0.0002312909928150475,
+                "bonus_sample": 0.0003913750115316361,
+                "snapshot": 9.624985978007317e-06,
+                "verify_eval": 0.001554915972519666,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015077500138431787,
+                "verify_eval_joint": 0.0015509579970967025,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.749999450519681e-06,
-                "verify_forward": 0.28997950002667494,
+                "verify_eval_unattributed": 3.9579754229635e-06,
+                "verify_forward": 0.29523958300706,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7935,7 +7930,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004504334006924182
+                    "draft": 0.004668000008678064
                   },
                   "token": 3065
                 }
@@ -7960,15 +7955,15 @@
               },
               "step": 60,
               "timing_s": {
-                "accept": 0.00022633300977759063,
-                "bonus_sample": 0.0004937909834552556,
-                "snapshot": 1.0624993592500687e-05,
-                "verify_eval": 0.0015065410116221756,
+                "accept": 0.00028633399051614106,
+                "bonus_sample": 0.000479959009680897,
+                "snapshot": 1.0791001841425896e-05,
+                "verify_eval": 0.0025744579907041043,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015018749982118607,
+                "verify_eval_joint": 0.0025707919849082828,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.6660134103149176e-06,
-                "verify_forward": 0.23433379098423757,
+                "verify_eval_unattributed": 3.6660057958215475e-06,
+                "verify_forward": 0.24748779099900275,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -7987,7 +7982,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0044137499935459346
+                    "draft": 0.005819459009217098
                   },
                   "token": 72809
                 }
@@ -8012,15 +8007,15 @@
               },
               "step": 61,
               "timing_s": {
-                "accept": 0.00021408300381153822,
-                "bonus_sample": 0.0004771249950863421,
-                "snapshot": 1.0834017302840948e-05,
-                "verify_eval": 0.001910082995891571,
+                "accept": 0.0003663749957922846,
+                "bonus_sample": 0.00044037497718818486,
+                "snapshot": 1.0167015716433525e-05,
+                "verify_eval": 0.002342958003282547,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019046670058742166,
+                "verify_eval_joint": 0.002338624995900318,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.415990017354488e-06,
-                "verify_forward": 0.24957395798992366,
+                "verify_eval_unattributed": 4.3330073822289705e-06,
+                "verify_forward": 0.3615285000123549,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8039,7 +8034,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005139708984643221
+                    "draft": 0.005756041995482519
                   },
                   "token": 17010
                 }
@@ -8064,15 +8059,15 @@
               },
               "step": 62,
               "timing_s": {
-                "accept": 0.00024479100829921663,
-                "bonus_sample": 0.0005519580154214054,
-                "snapshot": 1.1458003427833319e-05,
-                "verify_eval": 0.0026166669849772006,
+                "accept": 0.0002622499887365848,
+                "bonus_sample": 0.0006524170166812837,
+                "snapshot": 1.1249998351559043e-05,
+                "verify_eval": 0.002619957987917587,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002611542004160583,
+                "verify_eval_joint": 0.002616084006149322,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.124980816617608e-06,
-                "verify_forward": 0.35860129198408686,
+                "verify_eval_unattributed": 3.8739817682653666e-06,
+                "verify_forward": 0.34999454198987223,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8091,7 +8086,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006099541002186015
+                    "draft": 0.0068312910152599216
                   },
                   "token": 300
                 }
@@ -8116,15 +8111,15 @@
               },
               "step": 63,
               "timing_s": {
-                "accept": 0.00019316698308102787,
-                "bonus_sample": 0.0004074580210726708,
-                "snapshot": 1.1458003427833319e-05,
-                "verify_eval": 0.0015019999991636723,
+                "accept": 0.00027266700635664165,
+                "bonus_sample": 0.0006233339954633266,
+                "snapshot": 1.0457995813339949e-05,
+                "verify_eval": 0.002613666991237551,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014974170189816505,
+                "verify_eval_joint": 0.0026086249854415655,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.582980182021856e-06,
-                "verify_forward": 0.29724437498953193,
+                "verify_eval_unattributed": 5.04200579598546e-06,
+                "verify_forward": 0.3603322919807397,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8143,7 +8138,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0046167919936124235
+                    "draft": 0.006282707996433601
                   },
                   "token": 16756
                 }
@@ -8168,15 +8163,15 @@
               },
               "step": 64,
               "timing_s": {
-                "accept": 0.00020354200387373567,
-                "bonus_sample": 0.00040012499084696174,
-                "snapshot": 1.2625008821487427e-05,
-                "verify_eval": 0.00148154201451689,
+                "accept": 0.00021141697652637959,
+                "bonus_sample": 0.0004007499956060201,
+                "snapshot": 1.229200279340148e-05,
+                "verify_eval": 0.0015637500036973506,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014769999834243208,
+                "verify_eval_joint": 0.001559666998218745,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.542031092569232e-06,
-                "verify_forward": 0.225365749996854,
+                "verify_eval_unattributed": 4.083005478605628e-06,
+                "verify_forward": 0.33235612499993294,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8195,7 +8190,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004449333006050438
+                    "draft": 0.004661915998440236
                   },
                   "token": 8
                 }
@@ -8220,15 +8215,15 @@
               },
               "step": 65,
               "timing_s": {
-                "accept": 0.00032687498605810106,
-                "bonus_sample": 0.000391249981475994,
-                "snapshot": 1.0125018889084458e-05,
-                "verify_eval": 0.00167183400481008,
+                "accept": 0.00017954097711481154,
+                "bonus_sample": 0.00039104200550355017,
+                "snapshot": 1.1374999303370714e-05,
+                "verify_eval": 0.0015907080087345093,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0016670830082148314,
+                "verify_eval_joint": 0.0015869579801801592,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.75099659524858e-06,
-                "verify_forward": 0.2419712080154568,
+                "verify_eval_unattributed": 3.7500285543501377e-06,
+                "verify_forward": 0.24453799999901094,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8247,7 +8242,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004780000017490238
+                    "draft": 0.004680625017499551
                   },
                   "token": 5953
                 }
@@ -8272,15 +8267,15 @@
               },
               "step": 66,
               "timing_s": {
-                "accept": 0.0003039159928448498,
-                "bonus_sample": 0.0005905000143684447,
-                "snapshot": 1.0249990737065673e-05,
-                "verify_eval": 0.0026864579995162785,
+                "accept": 0.00021033300436101854,
+                "bonus_sample": 0.0003783749998547137,
+                "snapshot": 1.108401920646429e-05,
+                "verify_eval": 0.00156079200678505,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026815839810296893,
+                "verify_eval_joint": 0.0015570000105071813,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.874018486589193e-06,
-                "verify_forward": 0.3411142499826383,
+                "verify_eval_unattributed": 3.7919962778687477e-06,
+                "verify_forward": 0.27363262500148267,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8299,7 +8294,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006197166978381574
+                    "draft": 0.004543959017610177
                   },
                   "token": 408
                 }
@@ -8324,15 +8319,15 @@
               },
               "step": 67,
               "timing_s": {
-                "accept": 0.0003777499950956553,
-                "bonus_sample": 0.0004995829949621111,
-                "snapshot": 1.0166026186197996e-05,
-                "verify_eval": 0.002652417024364695,
+                "accept": 0.00020383400260470808,
+                "bonus_sample": 0.0004215410153847188,
+                "snapshot": 1.0666000889614224e-05,
+                "verify_eval": 0.0018500419973861426,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026473330217413604,
+                "verify_eval_joint": 0.0018457910045981407,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.084002623334527e-06,
-                "verify_forward": 0.3641019159986172,
+                "verify_eval_unattributed": 4.250992788001895e-06,
+                "verify_forward": 0.23844187500071712,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8351,7 +8346,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00627433301997371
+                    "draft": 0.004891499993391335
                   },
                   "token": 575
                 }
@@ -8376,15 +8371,15 @@
               },
               "step": 68,
               "timing_s": {
-                "accept": 0.00020129201584495604,
-                "bonus_sample": 0.00036408400046639144,
-                "snapshot": 1.2625008821487427e-05,
-                "verify_eval": 0.001555042021209374,
+                "accept": 0.0001930419821292162,
+                "bonus_sample": 0.00044529198203235865,
+                "snapshot": 1.0750023648142815e-05,
+                "verify_eval": 0.0019250419863965362,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015508339856751263,
+                "verify_eval_joint": 0.001920500013511628,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.208035534247756e-06,
-                "verify_forward": 0.3356294590048492,
+                "verify_eval_unattributed": 4.5419728849083185e-06,
+                "verify_forward": 0.26364445898798294,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8403,7 +8398,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004580500011797994
+                    "draft": 0.0051069160108454525
                   },
                   "token": 2648
                 }
@@ -8428,15 +8423,15 @@
               },
               "step": 69,
               "timing_s": {
-                "accept": 0.00022479199105873704,
-                "bonus_sample": 0.00040529199759475887,
+                "accept": 0.00027845799922943115,
+                "bonus_sample": 0.0006987499946262687,
                 "snapshot": 1.1083000572398305e-05,
-                "verify_eval": 0.0015149580140132457,
+                "verify_eval": 0.002662915998371318,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015098330040927976,
+                "verify_eval_joint": 0.002659667021362111,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.125009920448065e-06,
-                "verify_forward": 0.2320624589920044,
+                "verify_eval_unattributed": 3.2489770092070103e-06,
+                "verify_forward": 0.35992637497838587,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8455,7 +8450,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004562916001304984
+                    "draft": 0.006213291984749958
                   },
                   "token": 3692
                 }
@@ -8480,15 +8475,15 @@
               },
               "step": 70,
               "timing_s": {
-                "accept": 0.00020433298777788877,
-                "bonus_sample": 0.0004423749924171716,
-                "snapshot": 1.2500007869675756e-05,
-                "verify_eval": 0.0015114170091692358,
+                "accept": 0.000537124986294657,
+                "bonus_sample": 0.0006827909965068102,
+                "snapshot": 1.2833013897761703e-05,
+                "verify_eval": 0.002619207982206717,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015063750033732504,
+                "verify_eval_joint": 0.002614542027004063,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.04200579598546e-06,
-                "verify_forward": 0.23582229201565497,
+                "verify_eval_unattributed": 4.665955202654004e-06,
+                "verify_forward": 0.37406658299732953,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8507,7 +8502,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004528000019490719
+                    "draft": 0.0062165840063244104
                   },
                   "token": 10438
                 }
@@ -8532,15 +8527,15 @@
               },
               "step": 71,
               "timing_s": {
-                "accept": 0.00021716702030971646,
-                "bonus_sample": 0.0004097920027561486,
-                "snapshot": 1.1833006283268332e-05,
-                "verify_eval": 0.0019798749999608845,
+                "accept": 0.0006174159934744239,
+                "bonus_sample": 0.0006642499938607216,
+                "snapshot": 1.4416000340133905e-05,
+                "verify_eval": 0.0026265420019626617,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019753749947994947,
+                "verify_eval_joint": 0.0026229170034639537,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.5000051613897085e-06,
-                "verify_forward": 0.2545155829866417,
+                "verify_eval_unattributed": 3.6249984987080097e-06,
+                "verify_forward": 0.3769820000161417,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8559,7 +8554,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004992124973796308
+                    "draft": 0.006209375016624108
                   },
                   "token": 8494
                 }
@@ -8584,15 +8579,15 @@
               },
               "step": 72,
               "timing_s": {
-                "accept": 0.00021829199977219105,
-                "bonus_sample": 0.000415165995946154,
-                "snapshot": 1.737498678267002e-05,
-                "verify_eval": 0.001557416981086135,
+                "accept": 0.00028583299717865884,
+                "bonus_sample": 0.000509292003698647,
+                "snapshot": 1.1083000572398305e-05,
+                "verify_eval": 0.0026309170061722398,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015533329860772938,
+                "verify_eval_joint": 0.002626000001328066,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.083995008841157e-06,
-                "verify_forward": 0.33639295800821856,
+                "verify_eval_unattributed": 4.917004844173789e-06,
+                "verify_forward": 0.3757926250109449,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8611,7 +8606,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004556583997327834
+                    "draft": 0.006218707974767312
                   },
                   "token": 1164
                 }
@@ -8636,15 +8631,15 @@
               },
               "step": 73,
               "timing_s": {
-                "accept": 0.0002386250125709921,
-                "bonus_sample": 0.00067683300585486,
-                "snapshot": 1.1124997399747372e-05,
-                "verify_eval": 0.0020325419900473207,
+                "accept": 0.00037104199873283505,
+                "bonus_sample": 0.0005413340113591403,
+                "snapshot": 1.1333002476021647e-05,
+                "verify_eval": 0.0026479170192033052,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002027084003202617,
+                "verify_eval_joint": 0.0026442079979460686,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.457986844703555e-06,
-                "verify_forward": 0.25672979099908844,
+                "verify_eval_unattributed": 3.7090212572366e-06,
+                "verify_forward": 0.38188483301200904,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8663,7 +8658,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005722291010897607
+                    "draft": 0.00637433398514986
                   },
                   "token": 3692
                 }
@@ -8688,15 +8683,15 @@
               },
               "step": 74,
               "timing_s": {
-                "accept": 0.00030324998078867793,
-                "bonus_sample": 0.0005075420194771141,
-                "snapshot": 1.1208001524209976e-05,
-                "verify_eval": 0.0026213329983875155,
+                "accept": 0.00029308299417607486,
+                "bonus_sample": 0.0006577910098712891,
+                "snapshot": 1.1957978131249547e-05,
+                "verify_eval": 0.0026266659842804074,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002616250014398247,
+                "verify_eval_joint": 0.002623334003146738,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.082983989268541e-06,
-                "verify_forward": 0.3790221660165116,
+                "verify_eval_unattributed": 3.331981133669615e-06,
+                "verify_forward": 0.37077758298255503,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8715,7 +8710,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006078333011828363
+                    "draft": 0.00615825000568293
                   },
                   "token": 575
                 }
@@ -8740,15 +8735,15 @@
               },
               "step": 75,
               "timing_s": {
-                "accept": 0.00018508397624827921,
-                "bonus_sample": 0.00043858299613930285,
-                "snapshot": 1.200000406242907e-05,
-                "verify_eval": 0.0015029999776743352,
+                "accept": 0.00021179101895540953,
+                "bonus_sample": 0.00044495900510810316,
+                "snapshot": 2.733300789259374e-05,
+                "verify_eval": 0.0015952500107232481,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014993749791756272,
+                "verify_eval_joint": 0.0015915840049274266,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.6249984987080097e-06,
-                "verify_forward": 0.3462465000047814,
+                "verify_eval_unattributed": 3.6660057958215475e-06,
+                "verify_forward": 0.33444937501917593,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8767,7 +8762,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004408207983942702
+                    "draft": 0.004581249988405034
                   },
                   "token": 7070
                 }
@@ -8792,15 +8787,15 @@
               },
               "step": 76,
               "timing_s": {
-                "accept": 0.00021050000214017928,
-                "bonus_sample": 0.0004123339895159006,
-                "snapshot": 1.0791991371661425e-05,
-                "verify_eval": 0.0015712089953012764,
+                "accept": 0.00036624999484047294,
+                "bonus_sample": 0.00040800002170726657,
+                "snapshot": 1.0916992323473096e-05,
+                "verify_eval": 0.0023602090077474713,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015670410066377372,
+                "verify_eval_joint": 0.0023564999864902347,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.1679886635392904e-06,
-                "verify_forward": 0.24060424999333918,
+                "verify_eval_unattributed": 3.7090212572366e-06,
+                "verify_forward": 0.2623295829980634,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8819,7 +8814,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004667083005188033
+                    "draft": 0.005584333004662767
                   },
                   "token": 408
                 }
@@ -8844,15 +8839,15 @@
               },
               "step": 77,
               "timing_s": {
-                "accept": 0.00018354199710302055,
-                "bonus_sample": 0.0003724999842233956,
-                "snapshot": 1.0749994544312358e-05,
-                "verify_eval": 0.0015146670048125088,
+                "accept": 0.00031154099269770086,
+                "bonus_sample": 0.0005225000204518437,
+                "snapshot": 2.6875000912696123e-05,
+                "verify_eval": 0.0026154170045629144,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015107500075828284,
+                "verify_eval_joint": 0.0026117920060642064,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.916997229680419e-06,
-                "verify_forward": 0.23582312499638647,
+                "verify_eval_unattributed": 3.6249984987080097e-06,
+                "verify_forward": 0.37586495900177397,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8871,7 +8866,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0044904579990543425
+                    "draft": 0.006557624990819022
                   },
                   "token": 575
                 }
@@ -8896,15 +8891,15 @@
               },
               "step": 78,
               "timing_s": {
-                "accept": 0.00024029100313782692,
-                "bonus_sample": 0.00045920899719931185,
-                "snapshot": 1.0416988516226411e-05,
-                "verify_eval": 0.001960749999852851,
+                "accept": 0.00018720899242907763,
+                "bonus_sample": 0.0003815829986706376,
+                "snapshot": 1.1833995813503861e-05,
+                "verify_eval": 0.001524249993963167,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019562499946914613,
+                "verify_eval_joint": 0.0015189579862635583,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.5000051613897085e-06,
-                "verify_forward": 0.25123633301700465,
+                "verify_eval_unattributed": 5.292007699608803e-06,
+                "verify_forward": 0.30583279198617674,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8923,7 +8918,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005303415993694216
+                    "draft": 0.00465933300438337
                   },
                   "token": 14238
                 }
@@ -8948,15 +8943,15 @@
               },
               "step": 79,
               "timing_s": {
-                "accept": 0.0002777499903459102,
-                "bonus_sample": 0.0006508329825010151,
-                "snapshot": 2.5249988539144397e-05,
-                "verify_eval": 0.0026330830005463213,
+                "accept": 0.0003579170152079314,
+                "bonus_sample": 0.0006487079954240471,
+                "snapshot": 1.1374999303370714e-05,
+                "verify_eval": 0.0026362090138718486,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026276249845977873,
+                "verify_eval_joint": 0.0026317500160075724,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.458015948534012e-06,
-                "verify_forward": 0.3792148750217166,
+                "verify_eval_unattributed": 4.458997864276171e-06,
+                "verify_forward": 0.25950825001928024,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -8975,7 +8970,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006400874990504235
+                    "draft": 0.006281583016971126
                   },
                   "token": 26197
                 }
@@ -9000,16 +8995,16 @@
               },
               "step": 80,
               "timing_s": {
-                "accept": 0.0002910839975811541,
-                "repair_forward": 0.38529104099143296,
-                "rollback": 1.7999991541728377e-05,
-                "snapshot": 1.1208001524209976e-05,
-                "verify_eval": 0.0026162499852944165,
+                "accept": 0.00033416697988286614,
+                "repair_forward": 0.3885299999965355,
+                "rollback": 1.8959020962938666e-05,
+                "snapshot": 9.99998883344233e-06,
+                "verify_eval": 0.0026106250006705523,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002611125004477799,
+                "verify_eval_joint": 0.0026060410018544644,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.124980816617608e-06,
-                "verify_forward": 0.38562304101651534,
+                "verify_eval_unattributed": 4.583998816087842e-06,
+                "verify_forward": 0.380766666989075,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9028,7 +9023,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006447874999139458
+                    "draft": 0.006215332978172228
                   },
                   "token": 8494
                 }
@@ -9053,15 +9048,15 @@
               },
               "step": 81,
               "timing_s": {
-                "accept": 0.00036120801814831793,
-                "bonus_sample": 0.00046666699927300215,
-                "snapshot": 1.1374999303370714e-05,
-                "verify_eval": 0.0025883750058710575,
+                "accept": 0.0003070840029977262,
+                "bonus_sample": 0.0006955830031074584,
+                "snapshot": 1.3042008504271507e-05,
+                "verify_eval": 0.002701958001125604,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0025837910070549697,
+                "verify_eval_joint": 0.0026977919915225357,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.583998816087842e-06,
-                "verify_forward": 0.3837576670048293,
+                "verify_eval_unattributed": 4.1660096030682325e-06,
+                "verify_forward": 0.3816722499905154,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9080,7 +9075,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006064790999516845
+                    "draft": 0.0062134170148056
                   },
                   "token": 1164
                 }
@@ -9105,15 +9100,15 @@
               },
               "step": 82,
               "timing_s": {
-                "accept": 0.0003002920129802078,
-                "bonus_sample": 0.0005580830038525164,
-                "snapshot": 1.0541989468038082e-05,
-                "verify_eval": 0.002620499988552183,
+                "accept": 0.0002906249719671905,
+                "bonus_sample": 0.0006730410095769912,
+                "snapshot": 1.1124997399747372e-05,
+                "verify_eval": 0.002707416017074138,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002615917008370161,
+                "verify_eval_joint": 0.0027037920081056654,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.582980182021856e-06,
-                "verify_forward": 0.3866056670085527,
+                "verify_eval_unattributed": 3.6240089684724808e-06,
+                "verify_forward": 0.38681391699356027,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9132,7 +9127,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006240291026188061
+                    "draft": 0.006068791990401223
                   },
                   "token": 2379
                 }
@@ -9157,15 +9152,15 @@
               },
               "step": 83,
               "timing_s": {
-                "accept": 0.0002202920150011778,
-                "bonus_sample": 0.00041116701322607696,
-                "snapshot": 1.3541983207687736e-05,
-                "verify_eval": 0.0015744169941172004,
+                "accept": 0.00019266700837761164,
+                "bonus_sample": 0.00042570900404825807,
+                "snapshot": 1.1458003427833319e-05,
+                "verify_eval": 0.0015310000162571669,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015702079981565475,
+                "verify_eval_joint": 0.001527124986751005,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.208995960652828e-06,
-                "verify_forward": 0.32863833400188014,
+                "verify_eval_unattributed": 3.875029506161809e-06,
+                "verify_forward": 0.3274584590108134,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9184,7 +9179,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004543957998976111
+                    "draft": 0.004627625021385029
                   },
                   "token": 362
                 }
@@ -9209,15 +9204,15 @@
               },
               "step": 84,
               "timing_s": {
-                "accept": 0.00018937498680315912,
-                "bonus_sample": 0.0003897499991580844,
-                "snapshot": 1.2333010090515018e-05,
-                "verify_eval": 0.001471666997531429,
+                "accept": 0.00021233299048617482,
+                "bonus_sample": 0.0006550420075654984,
+                "snapshot": 9.874987881630659e-06,
+                "verify_eval": 0.002015790989389643,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014668750227428973,
+                "verify_eval_joint": 0.00201254099374637,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.791974788531661e-06,
-                "verify_forward": 0.24194549999083392,
+                "verify_eval_unattributed": 3.249995643272996e-06,
+                "verify_forward": 0.25179391700658016,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9236,7 +9231,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004485249985009432
+                    "draft": 0.00504833398736082
                   },
                   "token": 3646
                 }
@@ -9261,15 +9256,15 @@
               },
               "step": 85,
               "timing_s": {
-                "accept": 0.00020129198674112558,
-                "bonus_sample": 0.00044450000859797,
-                "snapshot": 1.1209020158275962e-05,
-                "verify_eval": 0.0019034580036532134,
+                "accept": 0.0002361249935347587,
+                "bonus_sample": 0.000466583005618304,
+                "snapshot": 1.0000017937272787e-05,
+                "verify_eval": 0.0026232080126646906,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0018983750196639448,
+                "verify_eval_joint": 0.0026193750090897083,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.082983989268541e-06,
-                "verify_forward": 0.24004595799488015,
+                "verify_eval_unattributed": 3.8330035749822855e-06,
+                "verify_forward": 0.3507174159749411,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9288,7 +9283,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004984625003999099
+                    "draft": 0.005469249997986481
                   },
                   "token": 682
                 }
@@ -9313,15 +9308,15 @@
               },
               "step": 86,
               "timing_s": {
-                "accept": 0.00021833300706930459,
-                "bonus_sample": 0.0004093750030733645,
-                "snapshot": 1.1666998034343123e-05,
-                "verify_eval": 0.00152058299863711,
+                "accept": 0.0002860829990822822,
+                "bonus_sample": 0.0005650409730151296,
+                "snapshot": 1.2957985745742917e-05,
+                "verify_eval": 0.002616958023281768,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001516958000138402,
+                "verify_eval_joint": 0.0026120000111404806,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.6249984987080097e-06,
-                "verify_forward": 0.30349116600700654,
+                "verify_eval_unattributed": 4.958012141287327e-06,
+                "verify_forward": 0.3260838749993127,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9340,7 +9335,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004724458995042369
+                    "draft": 0.006374458025675267
                   },
                   "token": 3054
                 }
@@ -9365,15 +9360,15 @@
               },
               "step": 87,
               "timing_s": {
-                "accept": 0.00034066601074300706,
-                "bonus_sample": 0.000646415981464088,
-                "snapshot": 1.2417003745213151e-05,
-                "verify_eval": 0.002164125005947426,
+                "accept": 0.00036741700023412704,
+                "bonus_sample": 0.0005817500059492886,
+                "snapshot": 1.087499549612403e-05,
+                "verify_eval": 0.002639749989612028,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0021594580030068755,
+                "verify_eval_joint": 0.002634333010064438,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.6670029405504465e-06,
-                "verify_forward": 0.2640690830012318,
+                "verify_eval_unattributed": 5.416979547590017e-06,
+                "verify_forward": 0.3780081250006333,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9392,7 +9387,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00555224998970516
+                    "draft": 0.006368125003064051
                   },
                   "token": 707
                 }
@@ -9417,15 +9412,15 @@
               },
               "step": 88,
               "timing_s": {
-                "accept": 0.0003768750175368041,
-                "bonus_sample": 0.0005375839828047901,
-                "snapshot": 1.4374993043020368e-05,
-                "verify_eval": 0.002613249991554767,
+                "accept": 0.00025454198475927114,
+                "bonus_sample": 0.0005945829907432199,
+                "snapshot": 1.0083022061735392e-05,
+                "verify_eval": 0.0026068750012200326,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026085840072482824,
+                "verify_eval_joint": 0.0026028340216726065,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.665984306484461e-06,
-                "verify_forward": 0.3774959580041468,
+                "verify_eval_unattributed": 4.0409795474261045e-06,
+                "verify_forward": 0.37190345901763067,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9444,7 +9439,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006418541015591472
+                    "draft": 0.006228916987311095
                   },
                   "token": 15
                 }
@@ -9469,15 +9464,15 @@
               },
               "step": 89,
               "timing_s": {
-                "accept": 0.0003499590093269944,
-                "bonus_sample": 0.0005272089911159128,
-                "snapshot": 1.129100564867258e-05,
-                "verify_eval": 0.0026262920000590384,
+                "accept": 0.0003338750102557242,
+                "bonus_sample": 0.0007072500011418015,
+                "snapshot": 1.2124975910410285e-05,
+                "verify_eval": 0.002631875016959384,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002621291991090402,
+                "verify_eval_joint": 0.002627915993798524,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.0000089686363935e-06,
-                "verify_forward": 0.37921837499015965,
+                "verify_eval_unattributed": 3.9590231608599424e-06,
+                "verify_forward": 0.377398542012088,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9496,7 +9491,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006369333015754819
+                    "draft": 0.006203458993695676
                   },
                   "token": 723
                 }
@@ -9521,15 +9516,15 @@
               },
               "step": 90,
               "timing_s": {
-                "accept": 0.00019395799608901143,
-                "bonus_sample": 0.00041112498729489744,
-                "snapshot": 1.1083000572398305e-05,
-                "verify_eval": 0.00151291600195691,
+                "accept": 0.00018591698608361185,
+                "bonus_sample": 0.0004077909979969263,
+                "snapshot": 1.3707991456612945e-05,
+                "verify_eval": 0.0015466249897144735,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001508375018602237,
+                "verify_eval_joint": 0.0015432499931193888,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.5409833546727896e-06,
-                "verify_forward": 0.3476967910246458,
+                "verify_eval_unattributed": 3.374996595084667e-06,
+                "verify_forward": 0.31355675001395866,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9548,7 +9543,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004627666989108548
+                    "draft": 0.004629208007827401
                   },
                   "token": 23144
                 }
@@ -9573,15 +9568,15 @@
               },
               "step": 91,
               "timing_s": {
-                "accept": 0.00021491700317710638,
-                "bonus_sample": 0.0006167090032249689,
-                "snapshot": 1.1208991054445505e-05,
-                "verify_eval": 0.0020313749846536666,
+                "accept": 0.00022745801834389567,
+                "bonus_sample": 0.0006101249891798943,
+                "snapshot": 1.095802872441709e-05,
+                "verify_eval": 0.0021973749971948564,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002027042006375268,
+                "verify_eval_joint": 0.0021931670198682696,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.332978278398514e-06,
-                "verify_forward": 0.2672574580064975,
+                "verify_eval_unattributed": 4.2079773265868425e-06,
+                "verify_forward": 0.266383375012083,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9600,7 +9595,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006089124974096194
+                    "draft": 0.006492042011814192
                   },
                   "token": 101815
                 }
@@ -9625,15 +9620,15 @@
               },
               "step": 92,
               "timing_s": {
-                "accept": 0.00020129201584495604,
-                "bonus_sample": 0.00040737498784437776,
-                "snapshot": 1.5166995581239462e-05,
-                "verify_eval": 0.0015190830163192004,
+                "accept": 0.00018579198513180017,
+                "bonus_sample": 0.0004588330048136413,
+                "snapshot": 1.2874981621280313e-05,
+                "verify_eval": 0.0015979169984348118,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015146660152822733,
+                "verify_eval_joint": 0.001594041008502245,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.417001036927104e-06,
-                "verify_forward": 0.34610550000797957,
+                "verify_eval_unattributed": 3.875989932566881e-06,
+                "verify_forward": 0.341972916998202,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9652,7 +9647,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004625166009645909
+                    "draft": 0.004707250016508624
                   },
                   "token": 362
                 }
@@ -9677,16 +9672,16 @@
               },
               "step": 93,
               "timing_s": {
-                "accept": 0.0002563330053817481,
-                "repair_forward": 0.2415169170126319,
-                "rollback": 1.85410026460886e-05,
-                "snapshot": 9.875016985461116e-06,
-                "verify_eval": 0.0015940000012051314,
+                "accept": 0.0003477080026641488,
+                "repair_forward": 0.35981579098734073,
+                "rollback": 2.1499989088624716e-05,
+                "snapshot": 1.0416988516226411e-05,
+                "verify_eval": 0.0022596669732593,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015884169843047857,
+                "verify_eval_joint": 0.002254958002595231,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.583016900345683e-06,
-                "verify_forward": 0.23675541699049063,
+                "verify_eval_unattributed": 4.7089706640690565e-06,
+                "verify_forward": 0.2522567080159206,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9705,7 +9700,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004666875000111759
+                    "draft": 0.005615040980046615
                   },
                   "token": 4071
                 }
@@ -9730,15 +9725,15 @@
               },
               "step": 94,
               "timing_s": {
-                "accept": 0.00023379101185128093,
-                "bonus_sample": 0.0004372919793240726,
-                "snapshot": 1.1541007552295923e-05,
-                "verify_eval": 0.0015168329991865903,
+                "accept": 0.0002670419926289469,
+                "bonus_sample": 0.00048049999168142676,
+                "snapshot": 1.0791001841425896e-05,
+                "verify_eval": 0.0026145839947275817,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015119579911697656,
+                "verify_eval_joint": 0.002610583003843203,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.875008016824722e-06,
-                "verify_forward": 0.234739957988495,
+                "verify_eval_unattributed": 4.0009908843785524e-06,
+                "verify_forward": 0.33495741701335646,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9757,7 +9752,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004423750011483207
+                    "draft": 0.006254417006857693
                   },
                   "token": 300
                 }
@@ -9782,16 +9777,16 @@
               },
               "step": 95,
               "timing_s": {
-                "accept": 0.00023137498646974564,
-                "repair_forward": 0.22423029199126177,
-                "rollback": 1.737498678267002e-05,
-                "snapshot": 1.1124997399747372e-05,
-                "verify_eval": 0.0015488749777432531,
+                "accept": 0.0004644170112442225,
+                "repair_forward": 0.3629525420255959,
+                "rollback": 4.73329855594784e-05,
+                "snapshot": 1.304197940044105e-05,
+                "verify_eval": 0.002667540975380689,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015441249997820705,
+                "verify_eval_joint": 0.0026635840185917914,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.749977961182594e-06,
-                "verify_forward": 0.22380645800149068,
+                "verify_eval_unattributed": 3.956956788897514e-06,
+                "verify_forward": 0.357376458006911,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9810,7 +9805,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004582708002999425
+                    "draft": 0.004609374998835847
                   },
                   "token": 33392
                 }
@@ -9835,16 +9830,16 @@
               },
               "step": 96,
               "timing_s": {
-                "accept": 0.00018962498870678246,
-                "repair_forward": 0.27332983299857005,
-                "rollback": 2.0209001377224922e-05,
-                "snapshot": 1.1208001524209976e-05,
-                "verify_eval": 0.0015517919964622706,
+                "accept": 0.0001928329875227064,
+                "repair_forward": 0.2953379589889664,
+                "rollback": 1.750001683831215e-05,
+                "snapshot": 9.834009688347578e-06,
+                "verify_eval": 0.0016707909817341715,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001535457995487377,
+                "verify_eval_joint": 0.001666875003138557,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 1.633400097489357e-05,
-                "verify_forward": 0.22720429199398495,
+                "verify_eval_unattributed": 3.915978595614433e-06,
+                "verify_forward": 0.23561329100630246,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9863,7 +9858,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005958624999038875
+                    "draft": 0.004546333017060533
                   },
                   "token": 33607
                 }
@@ -9888,15 +9883,15 @@
               },
               "step": 97,
               "timing_s": {
-                "accept": 0.0002736660244408995,
-                "bonus_sample": 0.0006196670001372695,
-                "snapshot": 1.1833995813503861e-05,
-                "verify_eval": 0.0026125420117750764,
+                "accept": 0.00036070801434107125,
+                "bonus_sample": 0.0005878749943803996,
+                "snapshot": 1.0415998985990882e-05,
+                "verify_eval": 0.002660833008121699,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002607875008834526,
+                "verify_eval_joint": 0.0026571670023258775,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.6670029405504465e-06,
-                "verify_forward": 0.3709423750115093,
+                "verify_eval_unattributed": 3.6660057958215475e-06,
+                "verify_forward": 0.30216254098922946,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9915,7 +9910,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0061869169876445085
+                    "draft": 0.006243749987334013
                   },
                   "token": 75
                 }
@@ -9940,15 +9935,15 @@
               },
               "step": 98,
               "timing_s": {
-                "accept": 0.00021150000975467265,
-                "bonus_sample": 0.000442666991148144,
-                "snapshot": 1.1041003745049238e-05,
-                "verify_eval": 0.0015678330091759562,
+                "accept": 0.00019887500093318522,
+                "bonus_sample": 0.0004210420011077076,
+                "snapshot": 1.0749994544312358e-05,
+                "verify_eval": 0.0015225840033963323,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015630839916411787,
+                "verify_eval_joint": 0.0015179170004557818,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.749017534777522e-06,
-                "verify_forward": 0.3282121670199558,
+                "verify_eval_unattributed": 4.6670029405504465e-06,
+                "verify_forward": 0.30713816700153984,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -9967,7 +9962,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004533792001893744
+                    "draft": 0.0047529170115012676
                   },
                   "token": 25
                 }
@@ -9992,15 +9987,15 @@
               },
               "step": 99,
               "timing_s": {
-                "accept": 0.00019062499632127583,
-                "bonus_sample": 0.000426042010076344,
-                "snapshot": 1.1249998351559043e-05,
-                "verify_eval": 0.0015307920111808926,
+                "accept": 0.0001939999929163605,
+                "bonus_sample": 0.0004719159915111959,
+                "snapshot": 1.0041985660791397e-05,
+                "verify_eval": 0.0017075419891625643,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015262090018950403,
+                "verify_eval_joint": 0.0017035000200849026,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.583009285852313e-06,
-                "verify_forward": 0.22633316699648276,
+                "verify_eval_unattributed": 4.0419690776616335e-06,
+                "verify_forward": 0.2364272500271909,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10019,7 +10014,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0046902500034775585
+                    "draft": 0.004711541987489909
                   },
                   "token": 8
                 }
@@ -10044,15 +10039,15 @@
               },
               "step": 100,
               "timing_s": {
-                "accept": 0.00023695899290032685,
-                "bonus_sample": 0.0004133750044275075,
-                "snapshot": 1.1249998351559043e-05,
-                "verify_eval": 0.0020010420121252537,
+                "accept": 0.0002905840228777379,
+                "bonus_sample": 0.0006364169821608812,
+                "snapshot": 9.374984074383974e-06,
+                "verify_eval": 0.002731749991653487,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019959999772254378,
+                "verify_eval_joint": 0.002726624981733039,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.042034899815917e-06,
-                "verify_forward": 0.23794204200385138,
+                "verify_eval_unattributed": 5.125009920448065e-06,
+                "verify_forward": 0.35040779199334793,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10071,7 +10066,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005028250016039237
+                    "draft": 0.006306791998213157
                   },
                   "token": 1703
                 }
@@ -10096,16 +10091,16 @@
               },
               "step": 101,
               "timing_s": {
-                "accept": 0.0002922080166172236,
-                "repair_forward": 0.3649441659799777,
-                "rollback": 2.13750172406435e-05,
-                "snapshot": 1.1708005331456661e-05,
-                "verify_eval": 0.002631125011248514,
+                "accept": 0.0002946660097222775,
+                "repair_forward": 0.36583741701906547,
+                "rollback": 1.7417012713849545e-05,
+                "snapshot": 1.1833006283268332e-05,
+                "verify_eval": 0.0026837920013349503,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026265420019626617,
+                "verify_eval_joint": 0.002679083001567051,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.583009285852313e-06,
-                "verify_forward": 0.35485991701716557,
+                "verify_eval_unattributed": 4.708999767899513e-06,
+                "verify_forward": 0.36206737501197495,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10124,7 +10119,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006277000007685274
+                    "draft": 0.006199916999321431
                   },
                   "token": 98446
                 }
@@ -10149,15 +10144,15 @@
               },
               "step": 102,
               "timing_s": {
-                "accept": 0.00020537502132356167,
-                "bonus_sample": 0.000399959011701867,
-                "snapshot": 1.0249990737065673e-05,
-                "verify_eval": 0.0015486670017708093,
+                "accept": 0.00019570899894461036,
+                "bonus_sample": 0.0004053340235259384,
+                "snapshot": 1.2499978765845299e-05,
+                "verify_eval": 0.0015558750019408762,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015436660032719374,
+                "verify_eval_joint": 0.0015516249986831099,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.0009984988719225e-06,
-                "verify_forward": 0.3312880830198992,
+                "verify_eval_unattributed": 4.250003257766366e-06,
+                "verify_forward": 0.3324505000200588,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10176,7 +10171,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004648250003810972
+                    "draft": 0.004648290982004255
                   },
                   "token": 300
                 }
@@ -10201,15 +10196,15 @@
               },
               "step": 103,
               "timing_s": {
-                "accept": 0.0001915419998113066,
-                "bonus_sample": 0.0004190829931758344,
-                "snapshot": 1.0957999620586634e-05,
-                "verify_eval": 0.0016570829902775586,
+                "accept": 0.00020333300926722586,
+                "bonus_sample": 0.0004239999980200082,
+                "snapshot": 1.1041003745049238e-05,
+                "verify_eval": 0.0016811250243335962,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0016529159911442548,
+                "verify_eval_joint": 0.0016768749919719994,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.1669991333037615e-06,
-                "verify_forward": 0.22807029201067053,
+                "verify_eval_unattributed": 4.250032361596823e-06,
+                "verify_forward": 0.22858975001145154,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10228,7 +10223,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005009083019103855
+                    "draft": 0.004865625000093132
                   },
                   "token": 25
                 }
@@ -10253,15 +10248,15 @@
               },
               "step": 104,
               "timing_s": {
-                "accept": 0.00022583300597034395,
-                "bonus_sample": 0.0004046250251121819,
-                "snapshot": 1.200000406242907e-05,
-                "verify_eval": 0.0015152500127442181,
+                "accept": 0.00020366700482554734,
+                "bonus_sample": 0.00039770800503902137,
+                "snapshot": 1.0540999937802553e-05,
+                "verify_eval": 0.0015577499871142209,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001510833011707291,
+                "verify_eval_joint": 0.0015528749790973961,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.417001036927104e-06,
-                "verify_forward": 0.2968127499916591,
+                "verify_eval_unattributed": 4.875008016824722e-06,
+                "verify_forward": 0.29655237498809583,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10280,7 +10275,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004657958983443677
+                    "draft": 0.004529208003077656
                   },
                   "token": 58
                 }
@@ -10305,15 +10300,15 @@
               },
               "step": 105,
               "timing_s": {
-                "accept": 0.000238874985370785,
-                "bonus_sample": 0.00046099998871795833,
-                "snapshot": 1.0334013495594263e-05,
-                "verify_eval": 0.0017758330213837326,
+                "accept": 0.00023637499543838203,
+                "bonus_sample": 0.00043408299097791314,
+                "snapshot": 1.0415998985990882e-05,
+                "verify_eval": 0.0017028329893946648,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0017717079899739474,
+                "verify_eval_joint": 0.0016986249829642475,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.1250314097851515e-06,
-                "verify_forward": 0.24599858300643973,
+                "verify_eval_unattributed": 4.208006430417299e-06,
+                "verify_forward": 0.24395545799052343,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10332,7 +10327,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005143957998370752
+                    "draft": 0.0050200410187244415
                   },
                   "token": 60
                 }
@@ -10357,15 +10352,15 @@
               },
               "step": 106,
               "timing_s": {
-                "accept": 0.00020879102521575987,
-                "bonus_sample": 0.00042104197200387716,
-                "snapshot": 1.0666990419849753e-05,
-                "verify_eval": 0.0015456660185009241,
+                "accept": 0.00020183398737572134,
+                "bonus_sample": 0.00041912501910701394,
+                "snapshot": 1.0124989785254002e-05,
+                "verify_eval": 0.0015558339946437627,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015418330149259418,
+                "verify_eval_joint": 0.0015524580085184425,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.8330035749822855e-06,
-                "verify_forward": 0.30763312499038875,
+                "verify_eval_unattributed": 3.375986125320196e-06,
+                "verify_forward": 0.3049193750193808,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10384,7 +10379,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0047710000071674585
+                    "draft": 0.004563916998449713
                   },
                   "token": 13524
                 }
@@ -10409,15 +10404,15 @@
               },
               "step": 107,
               "timing_s": {
-                "accept": 0.00022425001952797174,
-                "bonus_sample": 0.00041649999911896884,
-                "snapshot": 1.2582982890307903e-05,
-                "verify_eval": 0.0015155000146478415,
+                "accept": 0.0002346669789403677,
+                "bonus_sample": 0.0005334169836714864,
+                "snapshot": 9.916984708979726e-06,
+                "verify_eval": 0.0019509579869918525,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.001510833011707291,
+                "verify_eval_joint": 0.0019465829827822745,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.6670029405504465e-06,
-                "verify_forward": 0.22629720802069642,
+                "verify_eval_unattributed": 4.375004209578037e-06,
+                "verify_forward": 0.2346622080076486,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10436,7 +10431,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004665249987738207
+                    "draft": 0.0048900409892667085
                   },
                   "token": 413
                 }
@@ -10461,15 +10456,15 @@
               },
               "step": 108,
               "timing_s": {
-                "accept": 0.00019570798031054437,
-                "bonus_sample": 0.00040420799632556736,
-                "snapshot": 1.1124997399747372e-05,
-                "verify_eval": 0.00150320801185444,
+                "accept": 0.00028483400819823146,
+                "bonus_sample": 0.0006400000129360706,
+                "snapshot": 1.0832998668774962e-05,
+                "verify_eval": 0.002639083017129451,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0014987500035203993,
+                "verify_eval_joint": 0.0026350420084781945,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.458008334040642e-06,
-                "verify_forward": 0.23182941699633375,
+                "verify_eval_unattributed": 4.041008651256561e-06,
+                "verify_forward": 0.34948779200203717,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10488,7 +10483,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004584290989441797
+                    "draft": 0.006030457996530458
                   },
                   "token": 21725
                 }
@@ -10513,15 +10508,15 @@
               },
               "step": 109,
               "timing_s": {
-                "accept": 0.00031262499396689236,
-                "bonus_sample": 0.0005803749954793602,
-                "snapshot": 1.1292024282738566e-05,
-                "verify_eval": 0.002640375023474917,
+                "accept": 0.00019245900330133736,
+                "bonus_sample": 0.0004014169971924275,
+                "snapshot": 1.008401159197092e-05,
+                "verify_eval": 0.0015378749812953174,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002636042016092688,
+                "verify_eval_joint": 0.001533583999844268,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.3330073822289705e-06,
-                "verify_forward": 0.2831072910048533,
+                "verify_eval_unattributed": 4.290981451049447e-06,
+                "verify_forward": 0.3099156660027802,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10540,7 +10535,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.00634216598700732
+                    "draft": 0.004647750000003725
                   },
                   "token": 81
                 }
@@ -10565,15 +10560,15 @@
               },
               "step": 110,
               "timing_s": {
-                "accept": 0.00047741702292114496,
-                "bonus_sample": 0.0005767499969806522,
-                "snapshot": 1.0334013495594263e-05,
-                "verify_eval": 0.002664958010427654,
+                "accept": 0.00023750000400468707,
+                "bonus_sample": 0.0005026659928262234,
+                "snapshot": 9.082985343411565e-06,
+                "verify_eval": 0.0019503339717630297,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002659166988451034,
+                "verify_eval_joint": 0.0019449999963399023,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.791021976619959e-06,
-                "verify_forward": 0.3764254580019042,
+                "verify_eval_unattributed": 5.333975423127413e-06,
+                "verify_forward": 0.24955166698782705,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10592,7 +10587,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0066027909924741834
+                    "draft": 0.005266583000775427
                   },
                   "token": 17189
                 }
@@ -10617,15 +10612,15 @@
               },
               "step": 111,
               "timing_s": {
-                "accept": 0.0002657499862834811,
-                "bonus_sample": 0.0005719999899156392,
-                "snapshot": 1.1958996765315533e-05,
-                "verify_eval": 0.002667208987986669,
+                "accept": 0.00028225002461113036,
+                "bonus_sample": 0.000525874987943098,
+                "snapshot": 1.2042000889778137e-05,
+                "verify_eval": 0.0026369580009486526,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002663374994881451,
+                "verify_eval_joint": 0.0026325409999117255,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 3.8339931052178144e-06,
-                "verify_forward": 0.37731999999959953,
+                "verify_eval_unattributed": 4.417001036927104e-06,
+                "verify_forward": 0.3708670420164708,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10644,7 +10639,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006142874975921586
+                    "draft": 0.0065796669805422425
                   },
                   "token": 23793
                 }
@@ -10669,15 +10664,15 @@
               },
               "step": 112,
               "timing_s": {
-                "accept": 0.0004745420010294765,
-                "bonus_sample": 0.0006678339850623161,
-                "snapshot": 1.7999991541728377e-05,
-                "verify_eval": 0.00261799999861978,
+                "accept": 0.00034337499528191984,
+                "bonus_sample": 0.0005982499860692769,
+                "snapshot": 1.2375006917864084e-05,
+                "verify_eval": 0.002650042006280273,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026131249906029552,
+                "verify_eval_joint": 0.002646167005877942,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.875008016824722e-06,
-                "verify_forward": 0.3724872080201749,
+                "verify_eval_unattributed": 3.875000402331352e-06,
+                "verify_forward": 0.37101350000011735,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10696,7 +10691,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006262667011469603
+                    "draft": 0.0062387090001720935
                   },
                   "token": 23
                 }
@@ -10721,15 +10716,15 @@
               },
               "step": 113,
               "timing_s": {
-                "accept": 0.0003209169954061508,
-                "bonus_sample": 0.0006432080117519945,
-                "snapshot": 1.129199517890811e-05,
-                "verify_eval": 0.002586083021014929,
+                "accept": 0.00033312500454485416,
+                "bonus_sample": 0.0005429169978015125,
+                "snapshot": 1.0249990737065673e-05,
+                "verify_eval": 0.002701624995097518,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002581459004431963,
+                "verify_eval_joint": 0.002697042014915496,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.624016582965851e-06,
-                "verify_forward": 0.38869408299797215,
+                "verify_eval_unattributed": 4.582980182021856e-06,
+                "verify_forward": 0.3857269160216674,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10748,7 +10743,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006449292006436735
+                    "draft": 0.006213249987922609
                   },
                   "token": 402
                 }
@@ -10773,15 +10768,15 @@
               },
               "step": 114,
               "timing_s": {
-                "accept": 0.00021937501151114702,
-                "bonus_sample": 0.0003996670129708946,
-                "snapshot": 1.200000406242907e-05,
-                "verify_eval": 0.0015348749875556678,
+                "accept": 0.0003583340148907155,
+                "bonus_sample": 0.0006030410004314035,
+                "snapshot": 1.1041003745049238e-05,
+                "verify_eval": 0.0026431249862071127,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015304999833460897,
+                "verify_eval_joint": 0.002638708974700421,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.375004209578037e-06,
-                "verify_forward": 0.32047316699754447,
+                "verify_eval_unattributed": 4.416011506691575e-06,
+                "verify_forward": 0.3766686249873601,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10800,7 +10795,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004658999998355284
+                    "draft": 0.006266459007747471
                   },
                   "token": 592
                 }
@@ -10825,15 +10820,15 @@
               },
               "step": 115,
               "timing_s": {
-                "accept": 0.00023929198505356908,
-                "bonus_sample": 0.0006376249948516488,
-                "snapshot": 9.791983757168055e-06,
-                "verify_eval": 0.001997874991502613,
+                "accept": 0.0002955840027425438,
+                "bonus_sample": 0.0005697919987142086,
+                "snapshot": 1.2707983842119575e-05,
+                "verify_eval": 0.002672333997907117,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0019920420018024743,
+                "verify_eval_joint": 0.0026673339889384806,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 5.832989700138569e-06,
-                "verify_forward": 0.25386587501270697,
+                "verify_eval_unattributed": 5.0000089686363935e-06,
+                "verify_forward": 0.37307674999465235,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10852,7 +10847,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.005430249992059544
+                    "draft": 0.006556083011673763
                   },
                   "token": 356
                 }
@@ -10877,15 +10872,15 @@
               },
               "step": 116,
               "timing_s": {
-                "accept": 0.0002921669802162796,
-                "bonus_sample": 0.0005919579998590052,
-                "snapshot": 1.2750009773299098e-05,
-                "verify_eval": 0.002618458995129913,
+                "accept": 0.00021195801673457026,
+                "bonus_sample": 0.00044691600487567484,
+                "snapshot": 1.0666000889614224e-05,
+                "verify_eval": 0.0015425409947056323,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002613624994410202,
+                "verify_eval_joint": 0.001537959004053846,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.8340007197111845e-06,
-                "verify_forward": 0.36788412497844547,
+                "verify_eval_unattributed": 4.581990651786327e-06,
+                "verify_forward": 0.30716504200245254,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10904,7 +10899,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.0062499170016963035
+                    "draft": 0.004577583022182807
                   },
                   "token": 280
                 }
@@ -10929,15 +10924,15 @@
               },
               "step": 117,
               "timing_s": {
-                "accept": 0.0002887499867938459,
-                "bonus_sample": 0.0005837079952470958,
-                "snapshot": 1.258301199413836e-05,
-                "verify_eval": 0.00259462499525398,
+                "accept": 0.00021212498540990055,
+                "bonus_sample": 0.0004383340128697455,
+                "snapshot": 9.95802110992372e-06,
+                "verify_eval": 0.0018752920150291175,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0025903329951688647,
+                "verify_eval_joint": 0.00187162499059923,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.292000085115433e-06,
-                "verify_forward": 0.37472887500189245,
+                "verify_eval_unattributed": 3.667024429887533e-06,
+                "verify_forward": 0.2413103750150185,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -10956,7 +10951,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006206875026691705
+                    "draft": 0.005027667008107528
                   },
                   "token": 592
                 }
@@ -10981,15 +10976,15 @@
               },
               "step": 118,
               "timing_s": {
-                "accept": 0.00033895799424499273,
-                "bonus_sample": 0.0005159580032341182,
-                "snapshot": 1.0707997716963291e-05,
-                "verify_eval": 0.0026084590062964708,
+                "accept": 0.00031720902188681066,
+                "bonus_sample": 0.0004772500251419842,
+                "snapshot": 9.792012860998511e-06,
+                "verify_eval": 0.002599999977974221,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.002603875007480383,
+                "verify_eval_joint": 0.0025949169939849526,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.583998816087842e-06,
-                "verify_forward": 0.3715450409799814,
+                "verify_eval_unattributed": 5.082983989268541e-06,
+                "verify_forward": 0.3620451249880716,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11008,7 +11003,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006161208002595231
+                    "draft": 0.006226583995157853
                   },
                   "token": 2178
                 }
@@ -11033,15 +11028,15 @@
               },
               "step": 119,
               "timing_s": {
-                "accept": 0.00025441599427722394,
-                "bonus_sample": 0.0006104579952079803,
-                "snapshot": 1.0749994544312358e-05,
-                "verify_eval": 0.0026344580110162497,
+                "accept": 0.0003967500233557075,
+                "bonus_sample": 0.0005747500108554959,
+                "snapshot": 1.1582975275814533e-05,
+                "verify_eval": 0.0027363749977666885,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0026298750017303973,
+                "verify_eval_joint": 0.002731749991653487,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.583009285852313e-06,
-                "verify_forward": 0.371434708009474,
+                "verify_eval_unattributed": 4.62500611320138e-06,
+                "verify_forward": 0.3687530840106774,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11060,7 +11055,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.006270041980315
+                    "draft": 0.00634537500445731
                   },
                   "token": 2178
                 }
@@ -11085,15 +11080,15 @@
               },
               "step": 120,
               "timing_s": {
-                "accept": 0.0002172499953303486,
-                "bonus_sample": 0.0003964999923482537,
-                "snapshot": 1.1583993909880519e-05,
-                "verify_eval": 0.0016927499964367598,
+                "accept": 0.00019737501861527562,
+                "bonus_sample": 0.0004004589864052832,
+                "snapshot": 1.129199517890811e-05,
+                "verify_eval": 0.0015337920049205422,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0016880420153029263,
+                "verify_eval_joint": 0.0015300420054700226,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.7079811338335276e-06,
-                "verify_forward": 0.31564337501185946,
+                "verify_eval_unattributed": 3.749999450519681e-06,
+                "verify_forward": 0.30881658400176093,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11112,7 +11107,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004618957987986505
+                    "draft": 0.004495417000725865
                   },
                   "token": 2874
                 }
@@ -11137,15 +11132,15 @@
               },
               "step": 121,
               "timing_s": {
-                "accept": 0.00022179100778885186,
-                "bonus_sample": 0.00044429200352169573,
-                "snapshot": 1.0624993592500687e-05,
-                "verify_eval": 0.0015582919877488166,
+                "accept": 0.0002136249968316406,
+                "bonus_sample": 0.00041529201553203166,
+                "snapshot": 9.750016033649445e-06,
+                "verify_eval": 0.0017970420012716204,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015536670107394457,
+                "verify_eval_joint": 0.0017933750059455633,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.624977009370923e-06,
-                "verify_forward": 0.22821991599630564,
+                "verify_eval_unattributed": 3.6669953260570765e-06,
+                "verify_forward": 0.23980233300244436,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11164,7 +11159,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004649333015549928
+                    "draft": 0.005172000004677102
                   },
                   "token": 682
                 }
@@ -11189,15 +11184,15 @@
               },
               "step": 122,
               "timing_s": {
-                "accept": 0.00021120798191986978,
-                "bonus_sample": 0.0004011669952888042,
-                "snapshot": 1.095901825465262e-05,
-                "verify_eval": 0.0015804999857209623,
+                "accept": 0.0004774999979417771,
+                "bonus_sample": 0.0005368329875636846,
+                "snapshot": 9.791983757168055e-06,
+                "verify_eval": 0.0026826249959412962,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015762090042699128,
+                "verify_eval_joint": 0.0026780829939525574,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.290981451049447e-06,
-                "verify_forward": 0.2246568329865113,
+                "verify_eval_unattributed": 4.542001988738775e-06,
+                "verify_forward": 0.35692204101360403,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11216,7 +11211,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004657542012864724
+                    "draft": 0.006528875004732981
                   },
                   "token": 2178
                 }
@@ -11241,15 +11236,15 @@
               },
               "step": 123,
               "timing_s": {
-                "accept": 0.00019024999346584082,
-                "bonus_sample": 0.000423833989771083,
-                "snapshot": 1.0583986295387149e-05,
-                "verify_eval": 0.001659250003285706,
+                "accept": 0.00032691602245904505,
+                "bonus_sample": 0.0007461250061169267,
+                "snapshot": 1.4290999388322234e-05,
+                "verify_eval": 0.0026450000004842877,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0016551250009797513,
+                "verify_eval_joint": 0.0026415000029373914,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.125002305954695e-06,
-                "verify_forward": 0.24252854200312868,
+                "verify_eval_unattributed": 3.4999975468963385e-06,
+                "verify_forward": 0.3715952909842599,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11268,7 +11263,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004606125003192574
+                    "draft": 0.006596833001822233
                   },
                   "token": 1194
                 }
@@ -11293,15 +11288,15 @@
               },
               "step": 124,
               "timing_s": {
-                "accept": 0.00019470800179988146,
-                "bonus_sample": 0.00041491701267659664,
-                "snapshot": 1.087499549612403e-05,
-                "verify_eval": 0.001536209019832313,
+                "accept": 0.0002097910037264228,
+                "bonus_sample": 0.0004389160021673888,
+                "snapshot": 1.4165998436510563e-05,
+                "verify_eval": 0.0015380839759018272,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015319579979404807,
+                "verify_eval_joint": 0.0015336250071413815,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.251021891832352e-06,
-                "verify_forward": 0.29821012500906363,
+                "verify_eval_unattributed": 4.458968760445714e-06,
+                "verify_forward": 0.329979457979789,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11320,7 +11315,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004662834020564333
+                    "draft": 0.004544166993582621
                   },
                   "token": 185
                 }
@@ -11345,15 +11340,15 @@
               },
               "step": 125,
               "timing_s": {
-                "accept": 0.00021083300816826522,
-                "bonus_sample": 0.00042779199429787695,
-                "snapshot": 1.0791001841425896e-05,
-                "verify_eval": 0.0015537090075667948,
+                "accept": 0.00019645801512524486,
+                "bonus_sample": 0.00042795902118086815,
+                "snapshot": 9.833980584517121e-06,
+                "verify_eval": 0.0017360839992761612,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015492920065298676,
+                "verify_eval_joint": 0.0017327090026810765,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.417001036927104e-06,
-                "verify_forward": 0.22328370899776928,
+                "verify_eval_unattributed": 3.374996595084667e-06,
+                "verify_forward": 0.23288608400616795,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11372,7 +11367,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004476250003790483
+                    "draft": 0.004748458013636991
                   },
                   "token": 1364
                 }
@@ -11397,16 +11392,16 @@
               },
               "step": 126,
               "timing_s": {
-                "accept": 0.00021554197883233428,
-                "repair_forward": 0.22125141698052175,
-                "rollback": 2.0208011846989393e-05,
-                "snapshot": 1.1500000255182385e-05,
-                "verify_eval": 0.001562499994179234,
+                "accept": 0.00033591702231206,
+                "repair_forward": 0.3580523750279099,
+                "rollback": 1.883300137706101e-05,
+                "snapshot": 1.0791991371661425e-05,
+                "verify_eval": 0.0026636249967850745,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015580420149490237,
+                "verify_eval_joint": 0.0026599580014590174,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.457979230210185e-06,
-                "verify_forward": 0.22045495800557546,
+                "verify_eval_unattributed": 3.6669953260570765e-06,
+                "verify_forward": 0.34072841599117965,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
@@ -11424,7 +11419,7 @@
                   "depth": 1,
                   "mtp_corrector": null,
                   "timing_s": {
-                    "draft": 0.004690542002208531
+                    "draft": 0.004504375014221296
                   },
                   "token": 11535
                 }
@@ -11449,21 +11444,21 @@
               },
               "step": 127,
               "timing_s": {
-                "accept": 0.000213916995562613,
-                "snapshot": 9.457988198846579e-06,
-                "verify_eval": 0.001528583001345396,
+                "accept": 0.0002307920076418668,
+                "snapshot": 1.1416996130719781e-05,
+                "verify_eval": 0.0018242080113850534,
                 "verify_eval_hidden": 0.0,
-                "verify_eval_joint": 0.0015237079933285713,
+                "verify_eval_joint": 0.0018206250097136945,
                 "verify_eval_logits": 0.0,
-                "verify_eval_unattributed": 4.875008016824722e-06,
-                "verify_forward": 0.26934270799392834,
+                "verify_eval_unattributed": 3.583001671358943e-06,
+                "verify_forward": 0.2393797499826178,
                 "verify_target_distribution": 0.0
               },
               "verify_core": "stock",
               "verify_strategy": "batched"
             }
           ],
-          "ingestion_tok_s": 128.44461760762098,
+          "ingestion_tok_s": 128.66229746900393,
           "model": "hy3-oq2e",
           "mtp_cache_policy": "persistent",
           "mtp_history_policy": "committed",
@@ -11477,7 +11472,7 @@
           },
           "pair_id": "hy3-oq2e-c16384-ar",
           "peak_memory_bytes": 90287854092,
-          "prompt_eval_time_s": 127.55692145894864,
+          "prompt_eval_time_s": 127.3411117499054,
           "prompt_identity": {
             "prompt_artifact_kinds": 6,
             "prompt_filler_sha256": "3f73f761161a37ec1727f2a72dc5cdf5c6032c04bdde83e0319854a16513b003",
@@ -11488,16 +11483,16 @@
             "token_count": 16384,
             "token_sha256": "44954631fd4b4d01d631e8db141e223795804c83a3289f968138b4a776dc599f"
           },
-          "prompt_mtp_history_time_s": 0.7409923760278616,
+          "prompt_mtp_history_time_s": 0.7426157079753466,
           "prompt_mtp_history_tokens": 16383,
-          "prompt_target_prefill_time_s": 126.81592908292077,
-          "prompt_target_prefill_tok_s": 129.1951264993457,
+          "prompt_target_prefill_time_s": 126.59849604193005,
+          "prompt_target_prefill_tok_s": 129.41701925569114,
           "prompt_tokens": 16384,
-          "raw_decode_elapsed_s": 42.126451791031286,
-          "raw_elapsed_s": 169.68337324997992,
+          "raw_decode_elapsed_s": 46.669473125075456,
+          "raw_elapsed_s": 174.01058487498085,
           "replicate": 1,
-          "reported_decode_tok_s": 6.076941900302706,
-          "reported_prompt_target_prefill_tok_s": 129.1951264993457,
+          "reported_decode_tok_s": 5.485384403503186,
+          "reported_prompt_target_prefill_tok_s": 129.41701925569114,
           "requested_depth": 1,
           "resource_telemetry": null,
           "speculative_event_contract": {
@@ -11929,4 +11924,3 @@
   "schema": "mtplx-q2-bf16-mtp-depth-matrix-v3",
   "status": "passed"
 }
-[run_80col_resume_inner] === arm=16384 preset=hy3-oq2e-rq4-80 rep=2 exit=0 2026-07-22T18:00:23Z ===

@@ -1,1 +1,1 @@
-[run_80col] iogpu.wired_limit_mb=114688
+[run_80col_resume] iogpu.wired_limit_mb=114688
