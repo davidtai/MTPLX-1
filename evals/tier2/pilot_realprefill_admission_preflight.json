@@ -1,0 +1,26 @@
+{
+  "cell": {
+    "additional_resident_bytes": 7756883200,
+    "excess_bytes": 0,
+    "fits_fixed": true,
+    "fixed_bytes": 22354612736,
+    "hy3_router_incremental_bytes": 251658240,
+    "implied_admission_total_bytes": 41645396480,
+    "implied_admission_total_gib": 38.785297870635986,
+    "island_layer_count": 0,
+    "kv_quant": "q4",
+    "max_live_kv_tokens": 16640,
+    "memory_limit_bytes": 41875931136,
+    "memory_limit_override_applied": false,
+    "persistent_cache_bytes": 19290783744,
+    "preset": "hy3-oq2e-rq4-32-cachelru",
+    "resident_discount_bytes": 3847225344,
+    "status": "ADMIT",
+    "streamed_mtp_resident_bytes": 7505224960,
+    "unallocated_bytes": 230534656
+  },
+  "generated": "2026-07-22",
+  "note": "CPU-only admission preflight for the ONE 1-rep real-prefill pilot window (mechanics validation, NOT a cell of record). Gate replica of mtplx/runtime.py's _load_impl, via research/t3-cachelru/sweep.py's evaluate_admission_kv().",
+  "preset": "hy3-oq2e-rq4-32-cachelru",
+  "schema": "mtplx-t3-pilot-realprefill-admission-preflight-v1"
+}
