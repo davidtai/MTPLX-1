@@ -1,0 +1,83 @@
+[
+  {
+    "adjustment": "none (natural margin already inside 0.3-1.0 GiB band)",
+    "final_cache_limit_bytes": 53678702592,
+    "final_cache_limit_gib": 49.9921875,
+    "in_band_without_adjustment": true,
+    "label": "64",
+    "memory_limit_bytes": 76235669504,
+    "memory_limit_gib": 71,
+    "pass1_natural_cache_bytes": 53678702592,
+    "pass1_natural_margin_gib": 0.36667966842651367,
+    "pass2": {
+      "expert_cache_limit_bytes": 53678702592,
+      "fits_fixed": true,
+      "fixed_bytes": 22163247616,
+      "fixed_bytes_gib": 20.641132831573486,
+      "implied_admission_total_bytes": 75841950208,
+      "implied_admission_total_gib": 70.63332033157349,
+      "island_layer_count": 0,
+      "memory_limit_bytes": 76235669504,
+      "memory_limit_gib": 71.0,
+      "persistent_cache_bytes": 53678702592,
+      "persistent_cache_bytes_gib": 49.9921875,
+      "status": "ADMIT",
+      "unallocated_bytes": 393719296,
+      "unallocated_gib": 0.36667966842651367
+    }
+  },
+  {
+    "adjustment": "none (natural margin already inside 0.3-1.0 GiB band)",
+    "final_cache_limit_bytes": 36484743168,
+    "final_cache_limit_gib": 33.97906494140625,
+    "in_band_without_adjustment": true,
+    "label": "48",
+    "memory_limit_bytes": 59055800320,
+    "memory_limit_gib": 55,
+    "pass1_natural_cache_bytes": 36484743168,
+    "pass1_natural_margin_gib": 0.37980222702026367,
+    "pass2": {
+      "expert_cache_limit_bytes": 36484743168,
+      "fits_fixed": true,
+      "fixed_bytes": 22163247616,
+      "fixed_bytes_gib": 20.641132831573486,
+      "implied_admission_total_bytes": 58647990784,
+      "implied_admission_total_gib": 54.620197772979736,
+      "island_layer_count": 0,
+      "memory_limit_bytes": 59055800320,
+      "memory_limit_gib": 55.0,
+      "persistent_cache_bytes": 36484743168,
+      "persistent_cache_bytes_gib": 33.97906494140625,
+      "status": "ADMIT",
+      "unallocated_bytes": 407809536,
+      "unallocated_gib": 0.37980222702026367
+    }
+  },
+  {
+    "adjustment": "trimmed down by 319587635 B to reach 0.3 GiB margin",
+    "final_cache_limit_bytes": 19390560973,
+    "final_cache_limit_gib": 18.058867168612778,
+    "in_band_without_adjustment": false,
+    "label": "32",
+    "memory_limit_bytes": 41875931136,
+    "memory_limit_gib": 39,
+    "pass1_natural_cache_bytes": 19710148608,
+    "pass1_natural_margin_gib": 0.002360820770263672,
+    "pass2": {
+      "expert_cache_limit_bytes": 19390560973,
+      "fits_fixed": true,
+      "fixed_bytes": 22163247616,
+      "fixed_bytes_gib": 20.641132831573486,
+      "implied_admission_total_bytes": 41454031360,
+      "implied_admission_total_gib": 38.607075214385986,
+      "island_layer_count": 0,
+      "memory_limit_bytes": 41875931136,
+      "memory_limit_gib": 39.0,
+      "persistent_cache_bytes": 19290783744,
+      "persistent_cache_bytes_gib": 17.9659423828125,
+      "status": "ADMIT",
+      "unallocated_bytes": 421899776,
+      "unallocated_gib": 0.39292478561401367
+    }
+  }
+]

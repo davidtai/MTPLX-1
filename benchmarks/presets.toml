@@ -198,6 +198,30 @@ deferred-pin-release = true
 MTPLX_SUSTAINED_PREFILL = "1"
 MTPLX_HY3_SUBMIT_CADENCE = "8"
 
+[preset.hy3-oq2e-rq4-32-cachelru]
+description = "oQ2e + proj-requant q4 at the 32 GiB envelope, cache-heavy LRU (David directive 2026-07-22: envelopes <=64 GiB never use islands, cache-heavy LRU is the config). ZERO islands (island-layer-count intentionally UNSET -- ExpertStreamingConfig rejects island_layer_count=0 outright, minimum 1, so omission is the only way to reach a genuine zero-island static plan; all 79 routed layers stream through one shared LRU pool). expert-cache-limit derived CPU-only via research/t3-cachelru/derive.py's two-pass method (same method as the hy3-oq2e-rq4-64-cachehvy A/B's arm B: oversized placeholder cache-limit -> read the naturally budget-bound persistent_cache_bytes -> re-plan with that exact byte count): natural pass-1 margin was only 0.0024 GiB (out of the family's healthy 0.3-1.0 GiB band), so cache-limit was trimmed down from the natural 18.3565 GiB to 18.0589 GiB (19,390,560,973 B), landing the self-consistent pass-2 margin at 0.3929 GiB. fixed_bytes 20.6411 GiB (island-free baseline, matches the family's own 20.64 GiB constant), cache 17.9659 GiB used, implied total 38.6071 GiB against the 39 GiB family memory-limit (same envelope label as the island sibling hy3-oq2e-rq4-32)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "39GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "19390560973"
+max-live-kv-tokens = 4096
+cache-policy = "lru"
+cache-scope = "layer"
+slot-layout = "component-banks"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-32-cachelru.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
 [preset.hy3-oq2e-rq4-48]
 description = "oQ2e + proj-requant q4 at the 48 GiB envelope: islands 36 (43 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
 models = ["hy3-oq2e"]
@@ -220,6 +244,30 @@ split-route-release = "deferred"
 deferred-pin-release = true
 
 [preset.hy3-oq2e-rq4-48.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-48-cachelru]
+description = "oQ2e + proj-requant q4 at the 48 GiB envelope, cache-heavy LRU (David directive 2026-07-22: envelopes <=64 GiB never use islands, cache-heavy LRU is the config). ZERO islands (island-layer-count intentionally UNSET, same reasoning as hy3-oq2e-rq4-64-cachehvy: island_layer_count=0 is rejected outright, so omission is the only route to zero islands). expert-cache-limit derived CPU-only via research/t3-cachelru/derive.py's two-pass method: natural pass-1 margin was 0.3798 GiB, already inside the family's healthy 0.3-1.0 GiB band, so no trim was needed -- cache-limit is exactly the naturally budget-bound value, 33.9791 GiB (36,484,743,168 B). fixed_bytes 20.6411 GiB (island-free baseline), cache 33.9791 GiB used, implied total 54.6202 GiB against the 55 GiB family memory-limit (same envelope label as the island sibling hy3-oq2e-rq4-48)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "55GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "36484743168"
+max-live-kv-tokens = 4096
+cache-policy = "lru"
+cache-scope = "layer"
+slot-layout = "component-banks"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-48-cachelru.env]
 MTPLX_SUSTAINED_PREFILL = "1"
 MTPLX_HY3_SUBMIT_CADENCE = "8"
 
@@ -297,6 +345,30 @@ deferred-pin-release = true
 MTPLX_SUSTAINED_PREFILL = "1"
 MTPLX_HY3_SUBMIT_CADENCE = "8"
 
+[preset.hy3-oq2e-rq4-64-cachelru]
+description = "oQ2e + proj-requant q4 at the 64 GiB envelope, cache-heavy LRU (David directive 2026-07-22: envelopes <=64 GiB never use islands, cache-heavy LRU is the config). Same ZERO-island config and SAME cache-limit as hy3-oq2e-rq4-64-cachehvy's own 'lru' A/B arm (evals/tier2/t3_64x16k_armB_lru_rep1.log, research/t3-64-ab/preflight.py's evaluate_arm_b('lru'), byte-identical two-pass derivation: 53,678,702,592 B = 49.9922 GiB, natural pass-1 margin 0.3667 GiB, already inside the family's healthy 0.3-1.0 GiB band, no trim needed) -- reconfirmed independently via research/t3-cachelru/derive.py. This preset differs from hy3-oq2e-rq4-64-cachehvy only in cache-policy (lru here vs cachehvy's frequency default): the A/B measured frequency edging lru at AR/K1 (+7.7%/+7.5%, above noise) and a statistical wash at K2/K3 (+2-3%, inside the cross-window band), so this is a genuinely distinct, directive-driven default rather than a duplicate of cachehvy. fixed_bytes 20.6411 GiB (island-free baseline), cache 49.9922 GiB used, implied total 70.6333 GiB against the 71 GiB family memory-limit (same envelope label as the island sibling hy3-oq2e-rq4-64)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "71GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "53678702592"
+max-live-kv-tokens = 4096
+cache-policy = "lru"
+cache-scope = "layer"
+slot-layout = "component-banks"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-64-cachelru.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
 [preset.hy3-oq2e-rq4-72]
 description = "oQ2e + proj-requant q4 at the 72 GiB envelope: islands 61 (18 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
 models = ["hy3-oq2e"]
@@ -367,6 +439,24 @@ expert-integrity = "headers-only"
 proj-requant = "q4"
 
 [preset.hy3-oq2e-rq4-88.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-88r]
+description = "Fix candidate 'r' (re-derived limit) for the T4 envelope-admission anomaly: hy3-oq2e-rq4-88 REJECTs at every swept KV level (own fixed footprint over-books its declared 95 GiB limit by a constant 0.629 GiB, per NOTES.md T4 + evals/tier2/oq2e_rq4_88_16k.json). This preset keeps islands=79 (true full residency preserved, unlike the 'f' fallback) and re-derives memory-limit from the admission harness's own fixed_bytes at this exact config (islands 79, proj-requant q4, splitk router, kv=4096 control): fixed_bytes = 102,681,301,504 B = 95.629 GiB. + a family-healthy margin (0.371 GiB, inside the family's observed 0.19-1.00 GiB healthy band, e.g. -32's 0.32 GiB), rounded up to a clean GiB -> memory-limit = 96 GiB. Precedent note: the 96-envelope champion receipt (hy3-oq2e-rq4-96, same islands-79 full residency; evals/tier2/NOTES.md line 132) measured 91.9 GiB ACTUAL hard peak at its natural ~2048 live-token shape; scaling that peak by the KV delta from 2048 to 16384 ((16384-2048)*327,680 B/tok = +4.375 GiB, i.e. +~4.4 GiB) projects an ACTUAL peak of ~96.3 GiB at 16k -- comfortably under the ~99.75 GiB admission KNOB this preset implies at 16k (96 GiB + (16384-4096)*327,680 B KV-override = +3.75 GiB), confirming the knob has ~3.5 GiB of real headroom above the projected actual working set, not just a paper margin. CPU-admission-validated (research/envelope_admission_sweep.py's evaluate_admission()) at 4096/16384/32768/65536; ADMIT at all four with a constant ~0.371 GiB fits_fixed margin (mirrors -88's constant-REJECT signature, now on the ADMIT side)."
+extends = "hy3-oq2e-rq4-88"
+memory-limit = "96GiB"
+
+[preset.hy3-oq2e-rq4-88r.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-88f]
+description = "Fix candidate 'f' (family-formula fallback) for the T4 envelope-admission anomaly: hy3-oq2e-rq4-88 REJECTs at every swept KV level (own fixed footprint over-books its declared 95 GiB limit by a constant 0.629 GiB). This preset keeps memory-limit at 95 GiB (as originally shipped) and instead drops one island (islands=78, one fewer than -88's full-residency 79 -- the 79th layer streams instead of being wired resident) so the fixed footprint fits back under the family's own sizing formula: 20.64 GiB fixed w/ requant credit + 78 islands * 0.949 GiB/island = 94.66 GiB, margin 0.34 GiB. CPU-admission-validated (research/envelope_admission_sweep.py's evaluate_admission()) against the harness's own fixed_bytes computation (not just the description-arithmetic estimate above) at 4096/16384/32768/65536; see research/envelope-admission-sweep-2026-07-22-88rf.json for the exact byte-level receipt."
+extends = "hy3-oq2e-rq4-88"
+island-layer-count = 78
+
+[preset.hy3-oq2e-rq4-88f.env]
 MTPLX_SUSTAINED_PREFILL = "1"
 MTPLX_HY3_SUBMIT_CADENCE = "8"
 
