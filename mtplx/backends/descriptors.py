@@ -509,6 +509,48 @@ GLM_MTP_DESCRIPTOR = BackendDescriptor(
 )
 
 
+HY3_MTP_DESCRIPTOR = BackendDescriptor(
+    backend_id="hy_v3_mtp",
+    architecture_id="hy-v3-mtp",
+    model_family="hy3",
+    display_name="Hy3 native MTP",
+    artifact_layout="single_mlx_folder_native_mtp",
+    runtime_capabilities=NATIVE_CONTRACT_DESCRIPTOR.runtime_capabilities,
+    sampler_defaults=NATIVE_CONTRACT_DESCRIPTOR.sampler_defaults,
+    reasoning_codec=NATIVE_CONTRACT_DESCRIPTOR.reasoning_codec,
+    draft_semantics=NATIVE_CONTRACT_DESCRIPTOR.draft_semantics,
+    uses_external_assistant=False,
+    uses_draft_lm_head=True,
+    hidden_variant="post_norm",
+    tune_policy=NATIVE_CONTRACT_DESCRIPTOR.tune_policy,
+    kv_quant_policy=KVQuantPolicy(
+        supported=True,
+        modes=("off", "q8", "q4"),
+        restart_required=True,
+        proof_level="unit_validated_perf_unmeasured",
+        disabled_reason=None,
+    ),
+    context_window_policy=ContextWindowPolicy(
+        maximum=262_144,
+        default=262_144,
+        source="hy3_config",
+    ),
+    validation_status="native_contract_gated",
+    status="experimental_contract_gated",
+    notes=(
+        "Hy3 trunk KV honors _mtplx_kv_quant via mlx_lm QuantizedKVCache "
+        "(group_size=64 affine, wired in Model.make_cache); the MTP NextN "
+        "draft cache is built separately (make_mtp_cache) and always stays "
+        "a stock KVCache, so this knob cannot change draft-head precision.",
+        "kv_quant is code-validated here (unit + cache round-trip tests, "
+        "plus a load-time _verify_kv_quant_honored guard) but has no "
+        "serving-side tok/s or quality A/B yet -- see optimization_profiles "
+        "(hy3 kv_quant state=unvalidated) before treating a mode as a "
+        "product default.",
+    ),
+)
+
+
 GEMMA4_TARGET_DISTRIBUTION_POLICY = TargetDistributionPolicy(
     modes=("gemma4_target_prefix_exact",),
     default_mode="gemma4_target_prefix_exact",
@@ -633,6 +675,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
+    HY3_MTP_DESCRIPTOR.backend_id: HY3_MTP_DESCRIPTOR,
     "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
     "nemotron_h_mtp": NATIVE_CONTRACT_DESCRIPTOR,
 }
@@ -721,6 +764,13 @@ def model_family_from_inspection(
         return "deepseek"
     if backend_id == GLM_MTP_DESCRIPTOR.backend_id or "glm" in text:
         return "glm"
+    if (
+        backend_id == HY3_MTP_DESCRIPTOR.backend_id
+        or "hy_v3" in text
+        or "hy-v3" in text
+        or "hy3" in text
+    ):
+        return "hy3"
     family = _explicit_qwen_family_marker(text)
     if family is not None:
         return family
@@ -775,6 +825,8 @@ def kv_quant_policy_for_model(
         return GLM_MTP_DESCRIPTOR.kv_quant_policy
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.kv_quant_policy
+    if family == "hy3":
+        return HY3_MTP_DESCRIPTOR.kv_quant_policy
     return KVQuantPolicy(supported=False)
 
 
@@ -819,6 +871,8 @@ def context_window_policy_for_model(
         base = GLM_MTP_DESCRIPTOR.context_window_policy
     elif family == "deepseek":
         base = DEEPSEEK_MTP_DESCRIPTOR.context_window_policy
+    elif family == "hy3":
+        base = HY3_MTP_DESCRIPTOR.context_window_policy
     else:
         base = descriptor.context_window_policy
     return base.with_resolved_max(_context_window_from_inspection(inspection))
@@ -845,6 +899,8 @@ def reasoning_policy_for_model(
         return GLM_MTP_DESCRIPTOR.reasoning_codec
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.reasoning_codec
+    if family == "hy3":
+        return HY3_MTP_DESCRIPTOR.reasoning_codec
     return ReasoningCodec(
         parser="none",
         display_name="No verified reasoning parser",
