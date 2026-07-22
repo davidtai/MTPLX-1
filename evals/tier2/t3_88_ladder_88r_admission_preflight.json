@@ -1,0 +1,23 @@
+{
+  "base": {
+    "additional_resident_bytes": 7756883200,
+    "excess_bytes": 0,
+    "fits_fixed": true,
+    "fixed_bytes": 102681301504,
+    "hy3_router_incremental_bytes": 251658240,
+    "implied_admission_total_bytes": 102681301504,
+    "implied_admission_total_gib": 95.62941408157349,
+    "island_layer_count": 79,
+    "max_live_kv_tokens": 4096,
+    "memory_limit_bytes": 103079215104,
+    "memory_limit_override_applied": false,
+    "persistent_cache_bytes": 0,
+    "preset": "hy3-oq2e-rq4-88r",
+    "resident_discount_bytes": 3847225344,
+    "status": "ADMIT",
+    "streamed_mtp_resident_bytes": 7505224960,
+    "unallocated_bytes": 397913600
+  },
+  "max_live_kv_tokens": 4096,
+  "preset": "hy3-oq2e-rq4-88r"
+}

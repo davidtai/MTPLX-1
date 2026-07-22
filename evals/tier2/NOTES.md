@@ -1416,3 +1416,167 @@ screen used it -- see `research/t3-64x32k/run_kv4_humaneval_n20.sh`), full
 974 tasks, same greedy/seed/harness settings as this control. To be launched
 in its own guarded window when called for; will land at
 `evals/tier2/mbpp_oq2e_full_rq4.json` labeled "rq4 + kv4 KV".
+
+---
+
+## T3 88r fix-candidate: x16k AR+K1/K2/K3 (3 reps) + K1-K7 ladder (2026-07-22, two guarded windows): peak 88.41 GiB, ~7.9 GiB UNDER the 96.3 GiB projection; K1/K2 bit-exact, K3 late-flip confirmed reproducible
+
+Two strictly-serial guarded windows exercising `hy3-oq2e-rq4-88r` (David-approved
+2026-07-22, precedent note baked into the preset description in
+`benchmarks/presets.toml`: islands=79 full residency kept, memory-limit
+re-derived to 96 GiB base; 96-envelope champion receipt measured 91.9 GiB
+ACTUAL peak at ~2048 tokens, scaled by the KV delta to 16384 projects ~96.3
+GiB ACTUAL vs the 99.75 GiB admission knob at 16k -- ~3.5 GiB of knob
+headroom above the projected actual, not just paper margin). Both windows
+via the pre-staged `research/t3-88/run_88x16k.sh 88r` and
+`research/t3-88/run_88_ladder.sh 88r`; both inner scripts already carried
+the exact-lane env `MTPLX_HY3_ROUTER_SPLITK_M1=all` process-wide (no edit
+needed).
+
+**CPU-only preflight** (`research/t3-88/preflight.py`, zero GPU touch, same
+gate as T4): x16k cell ADMITs at fixed=99.3794 GiB, limit=99.7500 GiB
+(96 GiB base + (16384-4096)*327,680 B KV delta), margin +0.3706 GiB. Ladder
+cell (natural 4096 KV, no override) ADMITs at fixed=95.6294 GiB, limit=96.0000
+GiB, margin +0.3706 GiB -- identical margin, confirming the +0.3706 GiB
+family-healthy headroom is a fixed-footprint property of islands=79,
+independent of the KV column.
+
+### Per-K x rep table -- x16k cell (16384 max-live-kv-tokens, memory-limit override 107,105,746,944 B = 99.75 GiB)
+
+Expert-streaming counters read `expert_requests=0, persistent_loads=0,
+transient_loads=0, hit_rate=0.0` on EVERY cell of EVERY rep -- this is the
+full-residency signature (islands=79 == everything wired resident, so the
+streaming/LRU path is never entered at all), not a cache miss. The "hit
+rate ~1" anchor from the brief doesn't literally apply here: there is no
+cache being exercised to hit -- **loads/token = 0 exactly** is the stronger
+and correct confirmation of full residency.
+
+| rep | cell | decode tok/s | e2e tok/s | accepted/verify | hit_rate | loads (p+t) | AR-parity | observed hash (16) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | AR | 40.41 | 31.72 | -- | 0.0 | 0+0 | ref | 2c1e0641f0fb8aa2 |
+| 1 | K1 | 45.27 | 32.92 | 0.9102 | 0.0 | 0+0 | **True** | 2c1e0641f0fb8aa2 |
+| 1 | K2 | 40.52 | 30.79 | 1.5637 | 0.0 | 0+0 | **True** | 2c1e0641f0fb8aa2 |
+| 1 | K3 | 34.29 | 27.13 | 1.9038 | 0.0 | 0+0 | False | 86be119755962790 |
+| 2 | AR | 39.81 | 30.81 | -- | 0.0 | 0+0 | ref | 2c1e0641f0fb8aa2 |
+| 2 | K1 | 47.19 | 35.27 | 0.9102 | 0.0 | 0+0 | **True** | 2c1e0641f0fb8aa2 |
+| 2 | K2 | 42.09 | 31.87 | 1.5637 | 0.0 | 0+0 | **True** | 2c1e0641f0fb8aa2 |
+| 2 | K3 | 35.55 | 28.15 | 1.9038 | 0.0 | 0+0 | False | 86be119755962790 |
+| 3 | AR | 40.61 | 31.50 | -- | 0.0 | 0+0 | ref | 2c1e0641f0fb8aa2 |
+| 3 | K1 | 46.77 | 35.09 | 0.9102 | 0.0 | 0+0 | **True** | 2c1e0641f0fb8aa2 |
+| 3 | K2 | 42.53 | 32.60 | 1.5637 | 0.0 | 0+0 | **True** | 2c1e0641f0fb8aa2 |
+| 3 | K3 | 35.94 | 28.53 | 1.9038 | 0.0 | 0+0 | False | 86be119755962790 |
+
+Hard peak: **88.40732 GiB, byte-identical across all 3 reps** (differs only
+past the 9th significant digit, i.e. the same integer byte count every
+time). K2 mean decode tok/s across reps = 41.71 (40.52/42.09/42.53) --
+inside the ~42.33 champion-class anchor band. K1 is consistently the
+single fastest bit-exact cell (45.27/47.19/46.77), faster than K2 and
+faster than AR itself in every rep. K1/K2 hashes are IDENTICAL across all
+3 reps (`2c1e0641f0fb8aa2...`) and IDENTICAL to the AR reference hash --
+fully deterministic, bit-exact, exactly as the exact-lane env promises. K3
+hashes are also IDENTICAL across all 3 reps (`86be119755962790...`) but
+differ from the AR reference -- the late-flip is a **reproducible,
+deterministic divergence**, not run-to-run noise; matches the brief's
+"K3 late-flip signature is campaign-normal."
+
+### Ladder table K1-K7 (natural 4096 KV, no memory-limit override, 1 rep -- exploratory per the harness's own single-load-per-process design)
+
+| depth | cell | decode tok/s | e2e tok/s | accepted/verify | AR-parity | observed hash (16) |
+|---|---|---|---|---|---|---|
+| 0 (AR) | ar | 40.38 | 31.76 | -- | ref | 2c1e0641f0fb8aa2 |
+| 1 | d1 | **44.59** | **32.88** | 0.9102 | **True** | 2c1e0641f0fb8aa2 |
+| 2 | d2 | 40.56 | 30.96 | 1.5637 | **True** | 2c1e0641f0fb8aa2 |
+| 3 | d3 | 34.83 | 27.67 | 1.9038 | False | 86be119755962790 |
+| 4 | d4 | 30.81 | 25.19 | 2.2227 | False | c6ec96d776085e33 |
+| 5 | d5 | 27.14 | 22.75 | 2.2056 | False | 6b49c2a5dca50dc1 |
+| 6 | d6 | 25.06 | 21.26 | 2.2562 | False | d3f5899acc0afe05 |
+| 7 | d7 | 23.38 | 20.05 | 2.2614 | False | cadf57d34c747a1b |
+
+Ladder hard peak: **88.40732 GiB** -- byte-identical (to 9 significant
+digits) to the x16k window's peak despite the 4x smaller KV budget (4096 vs
+16384 tokens), confirming the fixed islands=79 footprint dominates the hard
+peak and the KV-token delta barely registers against it at this scale.
+
+**K-optimum**: by raw decode tok/s (and by end-to-end tok/s), **K1 is the
+single fastest cell in this ladder** (44.59 tok/s, still bit-exact vs AR),
+narrowly ahead of K2 (40.56) and AR itself (40.38); tok/s falls
+monotonically from K3 onward as `accepted_per_verify` yield keeps climbing
+(1.90 -> 2.26) but plateaus past K4 (2.22-2.26) while verify-call cost keeps
+growing -- deeper drafts buy no further yield past ~K4 but keep costing
+wall-clock. This is the measured shape, reported as-is; it does not by
+itself relabel the campaign's K2 champion-class designation, which the
+brief's ~42.33 anchor already tracks separately.
+
+### Peak-vs-projection verdict
+
+**Actual measured hard peak: 88.41 GiB.** Projected actual (precedent note):
+~96.3 GiB. **Actual came in ~7.9 GiB (8.9%) UNDER the projection** -- the
+88r fix has substantially MORE real headroom than the precedent-note
+scaling estimated, not less. Against the 99.75 GiB admission knob at 16k,
+measured peak leaves **~11.3 GiB** of real headroom (vs the knob's own
+paper margin of +0.3706 GiB at the fixed-footprint level) -- comfortably
+clear of the 100 GiB hard ceiling in every rep and in the ladder. No rep
+approached, let alone exceeded, 98 GiB; the "stop everything" trigger in
+the brief was never in play.
+
+### Token-hash outcomes
+
+K1/K2: bit-exact vs the AR reference in all 3 x16k reps and in the ladder
+(4 independent processes, same hash both times) -- the exact-lane env
+(`MTPLX_HY3_ROUTER_SPLITK_M1=all`) is holding as designed. K3+: diverges
+from AR starting at K3, but the divergent hash itself is deterministic and
+reproducible across every rep/window at K3 (`86be119755962790...`) and
+distinct-but-deterministic at each deeper K in the ladder (K4-K7 each have
+their own stable hash) -- consistent with prior "K3 late-flip" campaign
+findings, not a new regression.
+
+### Commands (exact)
+
+```
+bash research/t3-88/run_88x16k.sh 88r      # window A, run_in_background, standalone, no timeout param
+bash research/t3-88/run_88_ladder.sh 88r   # window B, run_in_background, standalone, no timeout param
+```
+
+### Receipts
+
+- `evals/tier2/t3_88x16k_88r_admission_preflight.json` / `.log`
+- `evals/tier2/t3_88x16k_bf16_88r_rep{1,2,3}.json` / `.log`
+- `evals/tier2/t3_88_ladder_88r_admission_preflight.json` / `.log`
+- `evals/tier2/t3_88_ladder_88r.json` / `.log`
+
+### Anomalies
+
+1. **Window B first attempt failed closed on a guard-level race, zero GPU
+   touched.** Between window A's clean teardown and window B's launch, an
+   unrelated process (`bench/a3b/run_a3b_174_replay_serving_ab.py --smoke
+   --draft-replay --device-state`, a different project's smoke test, not
+   part of this campaign) queued in and correctly held the same exclusive
+   `/tmp/mtplx-gpu-exclusive.lock` -- textbook queue-behind-holder behavior,
+   not touched. Window B's own guard then acquired the freed lock but its
+   qwen pre-flight observation (`mtplx/qwen_guard.py::_QwenObservation`,
+   raised from the `_is_exact_loaded`/`_is_stopped` fallthrough at line
+   ~977) caught qwen mid-restart from that OTHER process's teardown
+   (`loaded=True` per the API check but `processes=()` per the process-list
+   check -- the two signals briefly disagreed) and raised
+   `RuntimeError("...ambiguous...")` before stopping qwen or touching any
+   GPU/weight byte -- confirmed by the flock releasing cleanly (`lsof`
+   showed no holder immediately after) and by no `run_88_ladder_inner`
+   lines ever appearing in that attempt's log. Verified qwen (API +
+   `launchctl print`) and the lock were both independently clean before
+   retrying; the retry succeeded on the first attempt with an identical
+   command. No fix needed here -- this is the guard failing closed exactly
+   as designed under a genuine cross-project race, not a bug in this
+   campaign's scripts.
+2. `hit_rate=0.0` with zero streaming requests (not zero hits out of many
+   requests) is the correct full-residency reading, not a defect -- see the
+   per-K table note above; flagged since the brief's anchor language
+   ("hit rate ~1") could otherwise be misread against the raw field.
+3. Hard peak is essentially IDENTICAL (to 9 significant digits) across all
+   4 independent processes in this campaign (3 x16k reps + the ladder),
+   despite a 4x KV-budget difference between the two windows -- the fixed
+   islands=79 footprint totally dominates; KV-token scaling barely
+   perturbs the measured peak in this range. This is WHY the actual peak
+   landed so far under the KV-scaled projection (see verdict above): the
+   projection's scaling assumption (peak grows with KV token count) held
+   for the -96 preset's precedent measurement but is much weaker at -88r's
+   observed shape.
