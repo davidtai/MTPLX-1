@@ -744,3 +744,111 @@ branch) — the first two launches died pre-lock on the wrapper import
 PYTHONPATH=<worktree> and assert mtplx.__file__ in-window (driver does
 both now). (2) The 51-c6-mmap-band lane queued windows before and after
 this one; flock launch-order coordination worked as designed both times.
+
+## T4 envelope-admission sweep (2026-07-22 00:02): full {preset x
+max-live-kv-tokens} feasibility table, hy3-oq2e-rq4-32 added — CPU-only,
+zero GPU touched, zero weights loaded
+
+Follow-up to T3. Built `research/envelope_admission_sweep.py`, a CPU-only
+harness that drives the SAME preset-resolution/argparse machinery
+`scripts/benchmark_q2_mtp_depth_matrix.py` uses for `--preset NAME
+--max-live-kv-tokens N`, then replicates the CPU-only prefix of
+`mtplx/runtime.py`'s `_load_impl` (`ExpertStreamingConfig` construction ->
+open the verified bf16 MTP artifact for its header-declared `payload_bytes`
+-> `estimate_hy3_router_kernel_incremental_bytes` -> `resolve_island_placement`
+-> `proj_requant_plan_discount` -> `config.memory_plan(...)`) and stops at the
+`if not streaming_plan.fits_fixed: raise ExpertStreamingConfigurationError(...)`
+check (mtplx/runtime.py, `_load_impl`, the block immediately following the
+`streaming_plan = expert_streaming_config.memory_plan(...)` call — same
+function/line region T3 already identified as the gate that actually fired;
+this is the SAME gate, not the internal duplicate inside
+`ExpertStreamingRuntime.open`, since T3's receipt had `load_count=0`, meaning
+`.open()` was never reached). `apply_mlx_memory_cap` /
+`ExpertStreamingRuntime.open` / `apis.load()` are never called — no MLX
+buffer is ever allocated, no weight byte is ever read (the MTP artifact is
+opened only far enough to read its safetensors HEADER via `os.pread`, per
+`open_verified_hy3_mtp_artifacts`'s own docstring: "Consumers must pass the
+yielded file objects directly to mx.load ... "; this script never does).
+
+**Parity proof**: re-run against the exact failing cell from T3
+(`--preset hy3-oq2e-rq4-88 --max-live-kv-tokens 16384`) reproduces the
+receipt's error BIT-FOR-BIT: `ExpertStreamingConfigurationError: fixed
+expert-streaming footprint exceeds limit by 4702360064 bytes` — same error
+class, same message template, same byte count as `oq2e_rq4_88_16k.json`.
+
+### Corrected feasibility table
+
+Override rule (per envelope accounting: the envelope is the WEIGHTS budget,
+KV stacks on top; the override touches nothing else): `override_bytes =
+(kv_tokens - 4096) * 327_680` (`HY3_EXPERT_OQ2E.kv_bytes_per_token`),
+`override_limit = preset_memory_limit_bytes + override_bytes`. At this
+preset family's fixed 4096-token control, the delta is exact and identical
+across every preset: +3.75 GiB at 16384, +8.75 GiB at 32768, +18.75 GiB at
+65536.
+
+| envelope (preset) | 4096 (control) | 16384 | 32768 | 65536 |
+|---|---|---|---|---|
+| **88** (`hy3-oq2e-rq4-88`) | REJECT, excess 0.629 GiB (own footprint over-books its 95 GiB limit before any KV is counted) | REJECT even w/ +3.75 GiB override — excess still 0.629 GiB | REJECT even w/ +8.75 GiB override — excess still 0.629 GiB | REJECT even w/ +18.75 GiB override — excess still 0.629 GiB |
+| **80** (`hy3-oq2e-rq4-80`) | ADMIT as-is — implied 86.98 GiB | ADMIT w/ +3.75 GiB override (limit 90.75 GiB) — implied 90.73 GiB | ADMIT w/ +8.75 GiB override (limit 95.75 GiB) — implied 95.73 GiB | ADMIT w/ +18.75 GiB override (limit 105.75 GiB) — implied 105.73 GiB |
+| **64** (`hy3-oq2e-rq4-64`) | ADMIT as-is — implied 70.93 GiB | ADMIT w/ +3.75 GiB override (limit 74.75 GiB) — implied 74.68 GiB | ADMIT w/ +8.75 GiB override (limit 79.75 GiB) — implied 79.68 GiB | ADMIT w/ +18.75 GiB override (limit 89.75 GiB) — implied 89.68 GiB |
+| **48** (`hy3-oq2e-rq4-48`) | ADMIT as-is — implied 54.81 GiB | ADMIT w/ +3.75 GiB override (limit 58.75 GiB) — implied 58.56 GiB | ADMIT w/ +8.75 GiB override (limit 63.75 GiB) — implied 63.56 GiB | ADMIT w/ +18.75 GiB override (limit 73.75 GiB) — implied 73.56 GiB |
+| **32** (`hy3-oq2e-rq4-32`, NEW) | ADMIT as-is — implied 38.97 GiB | ADMIT w/ +3.75 GiB override (limit 42.75 GiB) — implied 42.72 GiB | ADMIT w/ +8.75 GiB override (limit 47.75 GiB) — implied 47.72 GiB | ADMIT w/ +18.75 GiB override (limit 57.75 GiB) — implied 57.72 GiB |
+
+Full byte-exact numbers per cell (fixed_bytes, resident/router/discount
+breakdown, override amounts, `unallocated_bytes`) are in
+`research/envelope-admission-sweep-2026-07-22.json`.
+
+**88 anomaly (confirms + extends T3)**: every kv column for `hy3-oq2e-rq4-88`
+rejects even after the KV-delta override, at a CONSTANT excess of 0.629 GiB
+regardless of context size — proof the preset's fixed footprint (islands=79,
+independent of KV) over-books its own declared 95 GiB limit, exactly as T3
+found at the 16k cell alone. No `-88` cell in this matrix is servable without
+first fixing the preset itself (raise memory-limit past ~95.63 GiB fixed, or
+drop back to islands=78 per T3's suggested options) — a KV-token override
+alone can never rescue it.
+
+**<85 GiB vs >=85 GiB split (box law: ask David before any real GPU attempt
+above 85 GiB; the 100 GiB wired knob is never exceeded, full stop):**
+
+- **<85 GiB (11 cells, clear to attempt without asking):** all four `-32`
+  cells (38.97 / 42.72 / 47.72 / 57.72 GiB), all four `-48` cells (54.81 /
+  58.56 / 63.56 / 73.56 GiB), and the `-64` cells at 4096/16384/32768 (70.93 /
+  74.68 / 79.68 GiB).
+- **>=85 GiB (5 cells, ASK FIRST):** `-64` at 65536 (89.68 GiB); every `-80`
+  cell (86.98 / 90.73 / 95.73 / 105.73 GiB) — note `-80` at its OWN 4096
+  control already implies 86.98 GiB, over 85 GiB before any KV override is
+  even applied, because the ~7.76 GiB `additional_resident_bytes` (MTP head +
+  splitk router) sits outside the "80 GiB" envelope label entirely.
+- **Categorically excluded, not just "ask" (>100 GiB hard knob, per the
+  never-exceed-the-memory-knob rule):** `-80` at 65536 implies 105.73 GiB —
+  this is disqualified outright regardless of who is asked; the admission
+  gate itself has no opinion on the 100 GiB physical ceiling (the override is
+  a bookkeeping knob, not a hardware check), so passing this gate is NOT
+  license to attempt this cell on real GPU.
+- All `-88` cells are REJECT (see anomaly above) and contribute to neither
+  bucket.
+
+**Sign-off**: 11 of 20 swept cells are clear under 85 GiB with no further
+review; 5 are servable only above 85 GiB and require asking David first
+(one of those 5, `-80`x65536, is disqualified outright above the 100 GiB
+knob); 4 are permanently infeasible under this preset (`-88`, all contexts)
+until the preset's own fixed footprint is fixed. The new `hy3-oq2e-rq4-32`
+preset (islands=19, 60 streamed) admits at every swept KV level with a
+family-consistent margin (0.32 GiB fits_fixed margin at its own 4096
+default — inside the family's healthy band of 0.19-1.00 GiB, i.e. neither
+88's negative-margin bug nor an oversized, un-verified guess).
+
+**Anomalies**: (1) `-88` is broken across its ENTIRE kv sweep, not just the
+16k cell T3 found — see above. (2) `-80`'s own 4096-token default already
+implies >85 GiB of real footprint despite its "80 GiB" envelope name, purely
+from the externally-resident MTP head + router bytes that the envelope
+naming convention doesn't account for; anyone reading "hy3-oq2e-rq4-80" as
+"an 80ish GiB run" is off by ~7 GiB before touching KV at all. (3) None of
+this required a memory-limit override for `-32`/`-48`/`-64`/`-80` at the
+4096 control — those four admit at their preset defaults exactly as
+shipped; only the `>4096` KV columns needed the override (15 cells across
+all 5 presets: 3 non-control kv levels x 5 presets). 12 of those 15 admit
+cleanly once applied (`-32`/`-48`/`-64`/`-80`, 3 each); the exception is
+`-88`'s 3 non-control cells, which remain rejected by the same
+fixed-footprint over-book as its own control cell — `-88` is the sole
+preset where the override is structurally powerless.

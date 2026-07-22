@@ -173,6 +173,31 @@ deferred-pin-release = true
 MTPLX_SUSTAINED_PREFILL = "1"
 MTPLX_HY3_SUBMIT_CADENCE = "8"
 
+[preset.hy3-oq2e-rq4-32]
+description = "oQ2e + proj-requant q4 at the 32 GiB envelope: islands 19 (60 streamed). Extends the sweep family (48-96/8) one 16 GiB step below 48; counts sized from the same measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island). 19 is the exact-fit maximum at memory-limit 39GiB: fixed_bytes admits with a ~0.32 GiB fits_fixed margin (memory_limit - fixed_bytes), inside the family's healthy band (48: ~0.19 GiB, 80: ~0.86 GiB, 64: ~1.00 GiB) and nowhere near the 88 preset's negative-margin over-book (-0.63 GiB at its own default). 20 islands rejects (-0.63 GiB, the same failure mode as 88). Admission verified 2026-07-21 via research/envelope_admission_sweep.py (CPU-only gate replica, zero GPU touch)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "39GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 19
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-32.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
 [preset.hy3-oq2e-rq4-48]
 description = "oQ2e + proj-requant q4 at the 48 GiB envelope: islands 36 (43 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
 models = ["hy3-oq2e"]
