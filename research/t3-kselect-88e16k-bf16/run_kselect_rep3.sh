@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# OUTER launcher: T3 bf16-KV K-SELECTION window, REP 2 ONLY (recovery run,
+# OUTER launcher: T3 bf16-KV K-SELECTION window, REP 3 ONLY (recovery run,
 # 2026-07-22).
 #
 # The original 3-rep window (run_kselect.sh) had its background wrapper
-# process (and rep2's benchmark_q2_mtp_depth_matrix.py child) terminated
-# ~7 minutes into rep 2 (10:29:33-10:36:39 CDT). Root-cause investigated
+# process (and rep3's benchmark_q2_mtp_depth_matrix.py child) terminated
+# ~7 minutes into rep 3 (10:29:33-10:36:39 CDT). Root-cause investigated
 # (log show, DiagnosticReports, vm_stat/vm.swapusage) -- NOT a box/memory/
 # GPU fault: no crash report generated anywhere near the exit timestamp, no
 # jetsam/memorystatus kill naming the PID, clean swap/no memory pressure
@@ -51,29 +51,29 @@ WT="/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-
 PY="/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python"
 cd "$WT" || exit 9
 
-echo "[run_kselect_rep2_bf16] wired-knob preflight..." >&2
+echo "[run_kselect_rep3_bf16] wired-knob preflight..." >&2
 ACTUAL_WIRED_LIMIT_MB="$(sysctl -n iogpu.wired_limit_mb 2>/dev/null)"
 if [[ "$ACTUAL_WIRED_LIMIT_MB" != "$EXPECTED_WIRED_LIMIT_MB" ]]; then
-  echo "[run_kselect_rep2_bf16] WIRED-KNOB MISMATCH: expected $EXPECTED_WIRED_LIMIT_MB, got '$ACTUAL_WIRED_LIMIT_MB' -- NOT launching" >&2
+  echo "[run_kselect_rep3_bf16] WIRED-KNOB MISMATCH: expected $EXPECTED_WIRED_LIMIT_MB, got '$ACTUAL_WIRED_LIMIT_MB' -- NOT launching" >&2
   exit 3
 fi
-echo "[run_kselect_rep2_bf16] wired-knob OK: iogpu.wired_limit_mb=$ACTUAL_WIRED_LIMIT_MB" >&2
+echo "[run_kselect_rep3_bf16] wired-knob OK: iogpu.wired_limit_mb=$ACTUAL_WIRED_LIMIT_MB" >&2
 
-echo "[run_kselect_rep2_bf16] CPU-only admission preflight for $PRESET @ kv=$KV bf16 (zero GPU touch)..." >&2
+echo "[run_kselect_rep3_bf16] CPU-only admission preflight for $PRESET @ kv=$KV bf16 (zero GPU touch)..." >&2
 PYTHONPATH="$WT" "$PY" research/t3-kselect-88e16k-bf16/preflight.py --kv "$KV" \
-  > "$WT/evals/tier2/kselect_88e16k_bf16_rep2_admission_preflight.json" \
-  2> "$WT/evals/tier2/kselect_88e16k_bf16_rep2_admission_preflight.log"
+  > "$WT/evals/tier2/kselect_88e16k_bf16_rep3_admission_preflight.json" \
+  2> "$WT/evals/tier2/kselect_88e16k_bf16_rep3_admission_preflight.log"
 PREFLIGHT_RC=$?
 if [[ "$PREFLIGHT_RC" != 0 ]]; then
-  echo "[run_kselect_rep2_bf16] PREFLIGHT FAILED (rc=$PREFLIGHT_RC) -- not opening a window" >&2
-  cat "$WT/evals/tier2/kselect_88e16k_bf16_rep2_admission_preflight.log" >&2
+  echo "[run_kselect_rep3_bf16] PREFLIGHT FAILED (rc=$PREFLIGHT_RC) -- not opening a window" >&2
+  cat "$WT/evals/tier2/kselect_88e16k_bf16_rep3_admission_preflight.log" >&2
   exit 2
 fi
-echo "[run_kselect_rep2_bf16] preflight OK; $PRESET ADMITs at kv=$KV bf16 with the derived override" >&2
+echo "[run_kselect_rep3_bf16] preflight OK; $PRESET ADMITs at kv=$KV bf16 with the derived override" >&2
 
 exec env PYTHONPATH="$WT" "$PY" scripts/run_with_qwen_stopped.py \
   --plist "$HOME/Library/LaunchAgents/com.tea.qwen.plist" \
   --lock-timeout-seconds 3600 \
   --child-timeout-seconds 3600 \
   -- \
-  bash "$WT/research/t3-kselect-88e16k-bf16/run_kselect_rep2_inner.sh"
+  bash "$WT/research/t3-kselect-88e16k-bf16/run_kselect_rep3_inner.sh"

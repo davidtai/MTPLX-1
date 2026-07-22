@@ -1,0 +1,3 @@
+[phase1 no-override] hy3-oq2e-rq4-88e kv=16640 kv_quant=off(bf16): REJECT (fixed=99.4575 GiB, declared_limit=96.0000 GiB, margin=-3.4575 GiB)
+[derive] override_bytes = declared_limit(103079215104) + (kv=16640 - control=4096) * 327680 B/token = 107189633024 B (99.8281 GiB)
+[phase2 overridden] hy3-oq2e-rq4-88e kv=16640 kv_quant=off(bf16) memory-limit=107189633024: ADMIT (fixed=99.4575 GiB, limit=99.8281 GiB, margin=+0.3706 GiB)
