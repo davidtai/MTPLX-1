@@ -1,0 +1,30 @@
+{
+  "arm1_contexts": 1024,
+  "arm2_contexts": 265,
+  "control_kv_tokens": 4096,
+  "generated": "2026-07-22",
+  "note": "CPU-only admission preflight covering BOTH 88-column completion arms (fresh 1024 cell + naturalistic ~265 cell) -- both leave max-live-kv-tokens at the preset default (4096), so this single check covers both arms' byte budget identically.",
+  "output_tokens": 256,
+  "preset": "hy3-oq2e-rq4-88e",
+  "result": {
+    "additional_resident_bytes": 7756883200,
+    "excess_bytes": 0,
+    "fits_fixed": true,
+    "fixed_bytes": 102681301504,
+    "hy3_router_incremental_bytes": 251658240,
+    "implied_admission_total_bytes": 102681301504,
+    "implied_admission_total_gib": 95.62941408157349,
+    "island_layer_count": 79,
+    "kv_quant": null,
+    "max_live_kv_tokens": 4096,
+    "memory_limit_bytes": 103079215104,
+    "memory_limit_override_applied": false,
+    "persistent_cache_bytes": 0,
+    "preset": "hy3-oq2e-rq4-88e",
+    "resident_discount_bytes": 3847225344,
+    "status": "ADMIT",
+    "streamed_mtp_resident_bytes": 7505224960,
+    "unallocated_bytes": 397913600
+  },
+  "schema": "mtplx-t3-88col-1024-nat-admission-preflight-v1"
+}

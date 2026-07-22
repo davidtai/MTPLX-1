@@ -1,0 +1,1 @@
+[run_88col_1024_nat] iogpu.wired_limit_mb=114688

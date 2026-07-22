@@ -1,0 +1,1 @@
+[preflight] hy3-oq2e-rq4-88e kv=4096 kv_quant=off(bf16): ADMIT (fixed=95.6294 GiB, declared_limit=96.0000 GiB, margin=+0.3706 GiB)
