@@ -1352,3 +1352,67 @@ Receipts: `t3_64_ab_admission_preflight{,_window2,_window3}.{json,log}`,
 run_window_inner.sh,run_window2.sh,run_window2_armBlru_inner.sh,
 run_window3.sh,run_window3_patch_inner.sh}`. Preset:
 `benchmarks/presets.toml` `[preset.hy3-oq2e-rq4-64-cachehvy]`.
+
+## MBPP full-974 stock-q8: INCIDENTAL CONTROL -- NOT AN ARM OF RECORD (David 2026-07-22)
+
+MBPP is the dual-suite completion T2 owes alongside full-164 HumanEval
+(f5a30d8): same champion identity (`MTPLX_HY3_MODEL_KEY=hy3-expert-oq2e`,
+`MTPLX_HY3_MODEL_ROOT=~/.cache/huggingface/hy3-oq2e-mlx`,
+`MTPLX_HY3_ISLAND_LAYER_COUNT=79`, `MTPLX_HY3_PROJ_QUANT=none`,
+`MTPLX_HY3_ROUTER_SPLITK_M1` unset), served through the same litellm lane
+(`evals/litellm_hy3/{config.yaml,handler.py}`) that produced the HumanEval
+receipts, scored via `scripts/code_eval_gate.py --suite mbpp` (the harness's
+existing, previously-unused MBPP path -- `mtplx/benchmarks/code_eval.py`
+already had `load_mbpp`/suite plumbing, nothing added there). Dataset:
+`benchmark-archive/datasets/mbpp.jsonl`, the 974-task full split (task_id
+1-974), sha256 `ccf64ceae9c5403bf50a044cb6d505bfd2a2963ee58338ba268fd65beab92a9f`.
+Greedy, seed 42, 1 sample/task, max-tokens 1024, chat endpoint, one guarded
+window, zero request errors, zero retries.
+
+**This run (stock q8 projections, no `MTPLX_HY3_PROJ_REQUANT`, bf16 KV
+default) was in flight when David's live order arrived: q8 is NOT an arm of
+record for MBPP -- "we aren't doing q8; champion q4-requant only." It ran to
+natural completion (never killed, per flock law) and is kept here as an
+incidental control / provenance receipt only, not a verdict input.**
+
+pass@1 **0.7988** (778/974 raw). MBPP/180 and MBPP/493 are upstream-broken
+(180: exact float-equality asserts on a haversine-style computation, fails
+`AssertionError` as expected; 493: reference solution overflows the 1024-token
+budget, `finish_reason=length` -> truncated mid-function ->
+`IndentationError`) -- confirmed broken in this arm exactly as anticipated,
+so the honest ceiling is 972/974, not 974/974. **Effective pass@1 (excl.
+180/493): 778/972 = 0.8004.** Neither task passed, so raw and effective
+numerator are identical (778); scoring below 100% on either denominator is
+not degradation.
+
+Other non-pass statuses (for context, not part of the broken-task set):
+MBPP/430 and MBPP/597 are ordinary generation failures (430 also
+length-truncated into an IndentationError; 597 a genuine malformed-indent
+completion, `finish_reason=stop`); MBPP/218 is a real 15s execution timeout
+in the generated candidate. `by_status`: passed 778, failed 192,
+syntax_error 3, timeout 1.
+
+Runtime: wall 3342.4s (55.7 min) for all 974 generate+score units, workers=4/
+score-workers=4 (harness defaults, unchanged). 66,464 completion tokens total
+(avg 68.2/task -- MBPP completions are much shorter than HumanEval's), giving
+an aggregate observed throughput of **~19.9 tok/s** (completion tokens /
+total wall time). This undershoots the ~35-40 tok/s decode-speed budget
+because MBPP's short completions are prompt/round-trip-overhead-bound at
+4-way concurrency against one serialized GPU stream, not a decode
+regression -- HumanEval's longer completions amortize that overhead better.
+
+No McNemar here: there is no paired arm yet (rq4+kv4 is queued separately,
+see below). Any future comparison against these q8 numbers is a footnote
+only, never the verdict -- q8 was never in scope for this suite.
+
+Receipt: `evals/tier2/mbpp_oq2e_full_q8.json` (schema
+`mtplx.code_eval_gate/1`) + `evals/tier2/mbpp_q8_proxy.log`.
+
+**MBPP arm of record is queued, not yet run**: champion q4-requant
+(`MTPLX_HY3_PROJ_REQUANT=q4`) **+ kv4** (`MTPLX_HY3_KV_QUANT=q4`, the
+shipping-config KV mode, reached through `evals/litellm_hy3/handler.py`'s
+`_champion_overrides()` exactly as the T3-pre 64x32k kv4 n=20 HumanEval
+screen used it -- see `research/t3-64x32k/run_kv4_humaneval_n20.sh`), full
+974 tasks, same greedy/seed/harness settings as this control. To be launched
+in its own guarded window when called for; will land at
+`evals/tier2/mbpp_oq2e_full_rq4.json` labeled "rq4 + kv4 KV".
