@@ -1,0 +1,5 @@
+[run_80col_inner] === arm=16384 preset=hy3-oq2e-rq4-80 rep=2 starting 2026-07-22T17:00:01Z ===
+[preset] hy3-oq2e-rq4-80
+[profile:hy3-expert-oq2e] profile suggests island_layer_count=79 (default_on); configured 69 — 2026-07-21: fully resident fits at memory-limit 103GiB (hard peak 91.9 GiB): AR 30.17 / K2 36.82 (1 unclassified divergence) / K3 31.81 bit-exact. At 95GiB limit the fixed footprint exceeds by 4.21 GiB; islands 74 measured K3 22.15 [advisory only]
+[profile:hy3-expert-oq2e] profile suggests mtp_depth=3 (default_on); configured (1,) — 2026-07-21: K3 31.81 tok/s bit-exact vs AR at both envelopes; K2 is faster (36.82) but carried one unclassified token divergence per run — K3 is the exact-parity default until K2's divergence is attributed [advisory only]
+[tokenizer] AutoTokenizer parse failed (No module named 'mlx_lm.tool_parsers.hy_v3_opensource'); using tokenizer.json fallback
