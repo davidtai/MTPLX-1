@@ -1,0 +1,7 @@
+armA             status=ADMIT  islands= 52 fixed_gib=73.7505 cache_gib=0.9344 implied_total_gib=74.6849 limit_gib=74.7500
+armB_frequency   status=ADMIT  islands=  0 fixed_gib=24.3911 cache_gib=49.9922 implied_total_gib=74.3833 limit_gib=74.7500
+armB_lru         status=ADMIT  islands=  0 fixed_gib=24.3911 cache_gib=49.9922 implied_total_gib=74.3833 limit_gib=74.7500
+patch_k3exact    status=ADMIT  islands= 52 fixed_gib=78.7505 cache_gib=0.9344 implied_total_gib=79.6849 limit_gib=79.7500
+manifest: extra=['layer80-bf16.safetensors', 'layer80-residents-q.safetensors'] missing=[] matches_expected=True validator_error=None
+
+GO: True

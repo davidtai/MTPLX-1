@@ -1099,3 +1099,256 @@ Receipts: `t3_64x32k_admission_preflight.{json,log}`,
 `humaneval_t3_64x32k_kv4_n20.json` + `_proxy.log`. Drivers:
 `research/t3-64x32k/{preflight_kv_arms.py,run_speed_arms.sh,
 run_speed_arms_inner.sh,run_kv4_humaneval_n20.sh}`.
+
+---
+
+# T3 64 GiB envelope: island-vs-cache A/B (2026-07-22) -- CACHE WINS CLEARLY at every K; new preset `hy3-oq2e-rq4-64-cachehvy` committed; K3 bit-exact patch PARTIALLY succeeds (K1/K2 now fully bit-exact, K3 improved 298->805 but not fully bit-exact)
+
+Three-part mission on the `hy3-oq2e-rq4-64` envelope (islands 52, proj-requant
+q4): (1) Arm A -- the preset as shipped, 16k KV, doubling as the official T3
+matrix 64x16k bf16 cell; (2) Arm B -- the SAME 64 GiB / 16k-KV envelope with
+ZERO islands and the freed budget reallocated to an explicit expert-cache,
+two cache-policy sub-arms (frequency, lru), per 0157fae's "cache beats
+islands on missing banks" motivation; (3) a patch lane re-running Arm A's
+config at 32k KV WITH `MTPLX_HY3_ROUTER_SPLITK_M1=all` set, to test whether
+that cures the bit-exact caveat on the existing (unpatched)
+`t3_64x32k_bf16.json` receipt. AR + K1/K2/K3, natural 1024/1024, 3 reps per
+cell (this harness has no `--reps` flag -- 3 full separate process
+invocations per lane, aggregated post-hoc by `research/t3-64-ab/aggregate.py`,
+not the campaign's usual 1-retained-measurement convention; the mission
+explicitly asked for 3 reps here and the window budget supported it).
+
+## Exact-lane convention confirmed: `MTPLX_HY3_ROUTER_SPLITK_M1=all` is PROCESS-WIDE, not K3-only
+
+Checked the receipts before touching GPU (`mtplx/runtime.py` reads
+`os.environ.get("MTPLX_HY3_ROUTER_SPLITK_M1", "mtp")` exactly once inside
+`_load_impl`, at model load; `benchmark_q2_mtp_depth_matrix.py` loads the
+model ONCE per process and reuses it for every requested depth -- AR/K1/K2/K3
+all share one `load_model` call). "PARITY-STAMPED CHAMPION" shows AR 40.18
+(parity True) AND K2 42.18 (parity True) together, under one `M1=all`
+setting -- proof it was applied to the whole load, not scoped to K2/K3 only
+(there is no mechanism to scope it narrower within one process). Set here as
+`export MTPLX_HY3_ROUTER_SPLITK_M1=all` once per guarded-window inner script,
+covering every lane, every depth, matching that convention exactly.
+
+## Admission: all 4 lane configs ADMIT, sub-85 GiB, manifest diff matches expected state
+
+CPU-only preflight (`research/t3-64-ab/preflight.py`, the same
+`_load_impl`-replica machinery as T4/T3-pre) evaluated Arm A, both Arm B
+sub-arms, and the patch lane before any GPU touch:
+
+| lane | islands | fixed GiB | cache GiB | implied total GiB | limit GiB |
+|---|---:|---:|---:|---:|---:|
+| armA | 52 | 73.7505 | 0.9344 | 74.6849 | 74.7500 |
+| armB_frequency | 0 | 24.3911 | 49.9922 | 74.3833 | 74.7500 |
+| armB_lru | 0 | 24.3911 | 49.9922 | 74.3833 | 74.7500 |
+| patch_k3exact | 52 | 78.7505 | 0.9344 | 79.6849 | 79.7500 |
+
+Arm B's expert-cache-limit (53,678,702,592 B = 49.9921875 GiB) was DERIVED,
+not guessed: a two-pass plan (oversized placeholder cache-limit to read off
+the naturally budget-capped `persistent_cache_bytes`, then a self-consistency
+re-plan with that exact byte count as the real limit) confirms islands
+52 -> 0 frees exactly 49.359375 GiB (52 * 0.949 GiB/island, matching the
+family's own documented island cost to 5 decimal places) and that the cache
+absorbs essentially all of it (49.9922 of 49.9922 GiB available, the ~0.37
+GiB gap being persistent-cache slot-count floor-division quantization, not a
+deliberate margin). `verify_expert_manifest` passed on the `hy3-oq2e-mlx`
+root (no error); the independent, non-truncated root-vs-manifest diff found
+exactly 2 extra `*.safetensors` (`layer80-bf16.safetensors`,
+`layer80-residents-q.safetensors`, both accounted for) and 0 missing --
+matches the state the T3-pre validation window already established. All 4
+lanes sub-85 GiB; no sign-off needed; the 100 GiB knob untouched.
+
+**Why Arm B needed zero islands reached without `--preset`**:
+`ExpertStreamingConfig.__post_init__` rejects `island_layer_count=0` outright
+(`minimum=1`); the ONLY way to reach a genuine zero-island static plan is to
+never set `--island-layer-count`/`--island-layers` at all, so the hardcoded
+argparse defaults (`None` / `""`) apply. Since `--preset hy3-oq2e-rq4-64`
+pushes `island-layer-count=52` in as an argparse DEFAULT (there is no CLI
+value that resets a preset-set default back to `None`), Arm B's CLI
+necessarily bypasses `--preset` and passes every other `hy3-oq2e-rq4-64` flag
+explicitly instead (verified byte-identical admission math either way).
+
+## Guarded-window disruption (operational note, not a box-law violation)
+
+Window 1 (`research/t3-64-ab/run_window.sh`) ran Arm A (3/3 reps) and Arm B
+frequency (3/3 reps) cleanly, then the BACKGROUND BASH TASK itself was
+killed by the harness (~60 minutes of wall time; likely an out-of-range
+`timeout` parameter on the launching Bash call -- 18,000,000 ms was passed,
+10x the tool's documented 600,000 ms max -- rather than anything in the
+guarded-window design) just as Arm B lru rep 1 started loading. Verified
+safe before continuing: `/private/tmp/mtplx-gpu-exclusive.lock` was free,
+qwen had already been restored to a fresh PID by `run_with_qwen_stopped.py`'s
+`finally` block, and the one partial output file
+(`t3_64x16k_armB_lru_rep1.json`) was a setup-phase-only checkpoint (`"status":
+"running"`, `"models": []`, no measurement) -- deleted, not counted. No
+foreign lock holder was ever touched. Split the remainder into two further
+guarded windows with an in-range `timeout` (window 2: Arm B lru, 3/3 reps
+clean; window 3: the K3-exact patch lane, 3/3 reps clean), each independently
+CPU-preflighted before opening. All three windows' `run_with_qwen_stopped.py`
+wrappers exited cleanly (flock released, qwen restored, verified by health
+check before the next window opened).
+
+## Per-lane x per-cell table (mean of 3 reps; K3-only patch lane also gets an AR reference row)
+
+| lane | cell | tok/s | accept | hit rate | loads/tok | svc ms/load | peak hard GiB |
+|---|---|---:|---:|---:|---:|---:|---:|
+| armA | AR | 8.731 | 0.0000 | 0.2309 | 171.06 | 0.670 | 63.73 |
+| armA | K1 | 8.788 | 0.9102 | 0.2329 | 168.79 | 0.675 | 63.73 |
+| armA | K2 | 7.933 | 1.5637 | 0.2406 | 193.12 | 0.653 | 63.73 |
+| armA | K3 | 6.831 | 1.9038 | 0.2475 | 227.70 | 0.643 | 63.73 |
+| armB_frequency | AR | 9.311 | 0.0000 | 0.9286 | 59.69 | 1.799 | 63.12 |
+| armB_frequency | K1 | **11.592** | 0.9102 | 0.9292 | 61.61 | 1.400 | 63.12 |
+| armB_frequency | K2 | 11.151 | 1.5637 | 0.9332 | 68.43 | 1.311 | 63.12 |
+| armB_frequency | K3 | 9.632 | 1.9038 | 0.9364 | 78.05 | 1.330 | 63.12 |
+| armB_lru | AR | 8.645 | 0.0000 | 0.9238 | 62.73 | 1.844 | 63.12 |
+| armB_lru | K1 | 10.785 | 0.9102 | 0.9252 | 64.01 | 1.448 | 63.12 |
+| armB_lru | K2 | 10.822 | 1.5637 | 0.9326 | 68.25 | 1.354 | 63.12 |
+| armB_lru | K3 | 9.446 | 1.9038 | 0.9389 | 74.45 | 1.422 | 63.12 |
+| patch_k3exact | AR | 8.507 | 0.0000 | 0.2309 | 171.06 | 0.687 | 63.73 |
+| patch_k3exact | K3 | 6.796 | 1.9038 | 0.2475 | 227.70 | 0.646 | 63.73 |
+
+Every rep within every lane/cell agreed on token-parity status and
+`observed_token_sha256` (see per-lane JSON `*_consistent` flags) -- fully
+deterministic, no rep-to-rep flake anywhere in this mission. `accepted_per_verify`
+is identical across armA/armB/patch at matching K (0.9102/1.5637/1.9038): MTP
+acceptance is a property of the model+draft head, unaffected by island vs
+cache placement, exactly as the campaign's prior receipts establish.
+
+## A/B verdict: Arm B (cache-heavy) wins CLEARLY and CONSISTENTLY at every K -- margin far exceeds the 4% band
+
+| cell | armA | armB_freq | freq margin | armB_lru | lru margin | freq vs lru |
+|---|---:|---:|---:|---:|---:|---:|
+| AR | 8.731 | 9.311 | **+6.7%** | 8.645 | -1.0% (in-noise) | +7.7% |
+| K1 (both arms' own optimum) | 8.788 | **11.592** | **+31.9%** | 10.785 | +22.7% | +7.5% |
+| K2 | 7.933 | 11.151 | **+40.6%** | 10.822 | +36.4% | +3.0% (in-noise) |
+| K3 | 6.831 | 9.632 | **+41.0%** | 9.446 | +38.3% | +2.0% (in-noise) |
+
+Arm A/B genuinely shares one window (Arm A + Arm B frequency both ran in
+window 1), so the <1% in-window band applies to that pair directly -- every
+margin (+6.7% to +41.0%) is 7-40x that band. Arm B lru ran in window 2 (a
+separate, cross-window measurement vs Arm A), so the ~4% cross-window band is
+the right comparison there: the AR margin (-1.0%) is inside that band (not
+distinguishable from noise -- lru is a wash with islands at AR only), but
+K1/K2/K3 (+22.7% to +38.3%) are 5-9x the cross-window band and stand as real.
+frequency-vs-lru is also cross-window (freq in window 1, lru in window 2):
+the AR/K1 edge (+7.5%/+7.7%) exceeds the 4% band and looks real; K2/K3
+(+2-3%) sit inside it and are not distinguishable from cross-window drift --
+reported as a wash, not a frequency win, at deeper K.
+
+**Why**: hit rate 0.93-0.94 (Arm B, both policies) vs 0.23-0.25 (Arm A);
+loads/tok 60-78 (Arm B) vs 169-228 (Arm A). Arm A's tiny 2 GiB cache serves
+only its 27 streamed layers and churns hard; Arm B's ~50 GiB shared pool
+spans all 79 routed layers and, once warm, serves the large majority of
+requests without a fresh load -- fewer loads/token even though it covers 3x
+the layers. This is the SAME mechanism 0157fae found on the q4/bf16-KV stack
+at ~80 GiB ("cache beats islands on missing banks... K1 > AR in every arm");
+it reproduces cleanly on the oQ2e/proj-requant-q4 streaming stack at 64 GiB.
+K1 is the optimum K for BOTH arms (K2+ monotonically worse), also matching
+0157fae's finding.
+
+**Preset committed**: `hy3-oq2e-rq4-64-cachehvy`
+(`benchmarks/presets.toml`) -- same envelope family, zero islands, explicit
+`--expert-cache-limit 53678702592`, `cache-policy=frequency` (default,
+matching 0157fae's precedent and this measurement's AR/K1 edge; lru is
+within noise at K2/K3 so not clearly worse, but frequency was never clearly
+worse anywhere either). Verified via the same CPU-only harness: admits at
+its own 4096-token default (implied 70.63/71 GiB) AND, overridden exactly
+like this mission's Arm B test (`--max-live-kv-tokens 16384 --memory-limit
+80262201344`), reproduces the measured admission numbers bit-for-bit
+(24.3911 GiB fixed / 49.9922 GiB cache / 74.3833 GiB implied). Does NOT
+overwrite `hy3-oq2e-rq4-64` -- both exist side by side; making cache-heavy
+the committed DEFAULT for this envelope is David's call, not made here.
+
+## K3-exact patch lane outcome: PARTIAL fix -- K1/K2 now fully bit-exact, K3 improved but still diverges
+
+The mission asked whether `MTPLX_HY3_ROUTER_SPLITK_M1=all` cures the
+bit-exact caveat on the existing (unpatched) `t3_64x32k_bf16.json` receipt,
+which showed K1/K2/K3 all diverging from AR at the SAME early point (token
+298, `differing_tokens` 694/694/697) because AR used the stock host router
+path at rows==1 while K1/K2/K3's batched verify always used the split-K
+kernel -- a router-numerics mismatch, per the "Router M1 scope A/B" entry's
+attribution.
+
+With the env set (this mission's Arm A AND the dedicated 32k-KV patch lane,
+both showing byte-identical results): **K1 and K2 are now fully bit-exact**
+(`token_parity=True` on every rep) -- the fix worked completely for those two
+depths, exactly as "PARITY-STAMPED CHAMPION" predicted for a full-residency
+config, now confirmed on this streamed/proj-requant-q4 config too. **K3 is
+NOT fully bit-exact**: `token_parity=False`, but first divergence moved from
+token 298 (unpatched) to **token 805** (patched), and `differing_token_count`
+dropped from 697/1024 to 213/1024 -- the divergence region shrank from
+"most of the sequence" to "the last ~21%". This is the "normal" late,
+single-region campaign signature (batched-verify reassociation / near-tie
+logit), NOT the early token-2 divergence the mission flagged as a
+stop-and-report condition -- nothing anomalous observed, just an incomplete
+fix at K3 specifically.
+
+**Independent cross-check (unplanned, strong evidence)**: all four lanes in
+this mission (armA, armB_frequency, armB_lru, patch_k3exact) produced the
+EXACT SAME K3 `observed_token_sha256`
+(`86be1197559627900a928b581edf6b01fc9238f019d0a68c8c9bc4e8206b5da1`), same
+`first_divergence=805`, same `differing_token_count=213` -- across two
+different KV budgets (16k, 32k) and two different memory placements (52
+islands vs 0 islands + cache). Confirms the campaign's own principle
+("cache hit/miss returns bit-identical weights either way") holds here:
+island vs cache placement and KV ceiling do not affect model output at all,
+only which layers pay a read-vs-cache-hit cost. Also: the patched run's AR
+`observed_token_sha256` (`2c1e0641f0fb8aa2...`) exactly equals the
+UNPATCHED run's K1/K2 sha256 from the original receipt -- consistent
+mechanistic explanation: `M1=all` makes AR use the same split-K router path
+K1/K2/K3 always used, so patched-AR now walks the identical numeric path
+old-K1/K2 already computed, and the only remaining AR-vs-K3 gap is genuine
+speculative-verify reassociation, which surfaces far later (805 vs 298).
+
+**Receipt updated**: `t3_64x32k_k3exact.json` is the mission's stated patch
+receipt; `t3_64x32k_bf16.json` (the original, unpatched 64x32k T3-pre
+receipt, env NOT set) is left as-is/untouched -- it remains the correct
+record of what that specific run measured, now with this entry as the
+documented follow-up rather than an in-place rewrite.
+
+## Commands (exact)
+
+Window 1 (Arm A 3 reps + Arm B frequency 3 reps, interrupted after Arm B
+frequency completed -- see disruption note):
+```
+bash research/t3-64-ab/run_window.sh
+```
+Window 2 (Arm B lru 3 reps, continuation):
+```
+bash research/t3-64-ab/run_window2.sh
+```
+Window 3 (K3-exact patch lane 3 reps, continuation):
+```
+bash research/t3-64-ab/run_window3.sh
+```
+Each ultimately invokes, per rep, inside `run_with_qwen_stopped.py`:
+```
+# Arm A / patch lane (via preset):
+python scripts/benchmark_q2_mtp_depth_matrix.py \
+  --preset hy3-oq2e-rq4-64 --max-live-kv-tokens {16384|32768} \
+  --memory-limit {80262201344|85630910464} --hy3-depths {1,2,3|3} \
+  --output-json evals/tier2/t3_64x{16k,32k}_{armA,k3exact}_rep{1,2,3}.json
+
+# Arm B (explicit flags, no --preset -- see "Why Arm B needed zero islands"):
+python scripts/benchmark_q2_mtp_depth_matrix.py \
+  --model hy3-oq2e --contexts 1024 --output-tokens 1024 \
+  --memory-limit 80262201344 --runtime-reserve 7GiB \
+  --expert-cache-limit 53678702592 --max-live-kv-tokens 16384 \
+  --cache-policy {frequency|lru} --cache-scope layer --slot-layout component-banks \
+  --hy3-router-kernel mpp-fp32-splitk-r1-fused-r2 --verify-strategy batched \
+  --expert-integrity headers-only --proj-requant q4 \
+  --split-route-release deferred --hy3-depths 1,2,3 \
+  --output-json evals/tier2/t3_64x16k_armB_{frequency,lru}_rep{1,2,3}.json
+```
+`MTPLX_HY3_ROUTER_SPLITK_M1=all MTPLX_SUSTAINED_PREFILL=1
+MTPLX_HY3_SUBMIT_CADENCE=8` exported once per inner script, before any rep.
+
+Receipts: `t3_64_ab_admission_preflight{,_window2,_window3}.{json,log}`,
+`t3_64x16k_armA.json` (+ `_rep{1,2,3}.json/.log`),
+`t3_64x16k_armB_{frequency,lru}.json` (+ `_rep{1,2,3}.json/.log`),
+`t3_64x32k_k3exact.json` (+ `_rep{1,2,3}.json/.log`). Drivers:
+`research/t3-64-ab/{preflight.py,aggregate.py,run_window.sh,
+run_window_inner.sh,run_window2.sh,run_window2_armBlru_inner.sh,
+run_window3.sh,run_window3_patch_inner.sh}`. Preset:
+`benchmarks/presets.toml` `[preset.hy3-oq2e-rq4-64-cachehvy]`.

@@ -273,6 +273,30 @@ deferred-pin-release = true
 MTPLX_SUSTAINED_PREFILL = "1"
 MTPLX_HY3_SUBMIT_CADENCE = "8"
 
+[preset.hy3-oq2e-rq4-64-cachehvy]
+description = "oQ2e + proj-requant q4 at the SAME 64 GiB envelope as hy3-oq2e-rq4-64, but ZERO islands with the freed ~49.36 GiB (52 islands * 0.949 GiB/island) reallocated to an explicitly-sized 49.9921875 GiB frequency expert-cache (all 79 routed layers streamed through one shared pool instead of 27). Measured 2026-07-22, T3 64 GiB island-vs-cache A/B (evals/tier2/NOTES.md, evals/tier2/t3_64x16k_arm{A,B_frequency,B_lru}.json), one guarded-window-family, 3 reps/cell: cache-heavy wins at EVERY K vs the island preset -- AR +6.6%, K1 +31.9% (11.59 vs 8.79, both arms' own optimum), K2 +40.6%, K3 +41.0%; hit rate 0.93 vs 0.23-0.25, loads/tok 60-78 vs 169-228. Margins vastly exceed the campaign's 4% cross-window noise band. cache-policy=frequency edged lru at AR/K1 (+7.7%/+7.5%, above noise) and was a statistical wash at K2/K3 (+2-3%, inside the cross-window band) -- frequency kept as the default per this measurement and per the 0157fae q4-optimal cache-heavy precedent, which also used frequency. --island-layer-count/--island-layers are intentionally UNSET here (the hardcoded argparse defaults None/\"\" apply): ExpertStreamingConfig rejects island_layer_count=0 outright (minimum 1), so a genuine zero-island static plan can only be reached by never setting either flag, not by an explicit --island-layer-count 0."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "71GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "53678702592"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-64-cachehvy.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
 [preset.hy3-oq2e-rq4-72]
 description = "oQ2e + proj-requant q4 at the 72 GiB envelope: islands 61 (18 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
 models = ["hy3-oq2e"]
