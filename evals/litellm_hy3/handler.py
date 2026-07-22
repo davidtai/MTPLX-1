@@ -134,6 +134,15 @@ def _champion_overrides() -> dict[str, Any]:
             if _env("MTPLX_HY3_PROJ_REQUANT", "none") == "none"
             else _env("MTPLX_HY3_PROJ_REQUANT", "none")
         ),
+        # Quantized trunk KV cache (--kv-quant q8|q4 in the benchmark harness,
+        # commit 8aed1942). Default unset/None (BF16 trunk KV, the champion
+        # baseline). Requires VERIFY_STRATEGY == "batched" (the module default
+        # below), matching the CLI's own capture_commit rejection.
+        "kv_quant": (
+            None
+            if _env("MTPLX_HY3_KV_QUANT", "none") == "none"
+            else _env("MTPLX_HY3_KV_QUANT", "none")
+        ),
         "expert_integrity": _env("MTPLX_HY3_EXPERT_INTEGRITY", "headers-only"),
         "split_route_release": _env("MTPLX_HY3_SPLIT_ROUTE_RELEASE", "deferred"),
         "deferred_pin_release": True,

@@ -1,0 +1,9 @@
+preset=hy3-oq2e-rq4-64 kv_tokens=32768
+preset_memory_limit_bytes=76235669504 (71.0 GiB)
+kv_delta_tokens=28672 override_bytes=9395240960 (8.75 GiB)
+OVERRIDE_LIMIT_BYTES=85630910464 (79.75 GiB)
+kv_quant=None   status=ADMIT  kv_bytes=10,737,418,240 fixed_bytes=84,557,713,920 implied_total_gib=79.6849 islands=52
+kv_quant='q8'   status=ADMIT  kv_bytes= 5,704,253,440 fixed_bytes=79,524,549,120 implied_total_gib=75.9318 islands=52
+kv_quant='q4'   status=ADMIT  kv_bytes= 3,019,898,880 fixed_bytes=76,840,194,560 implied_total_gib=73.4318 islands=52
+
+ALL ARMS ADMIT: True

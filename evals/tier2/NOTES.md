@@ -852,3 +852,250 @@ cleanly once applied (`-32`/`-48`/`-64`/`-80`, 3 each); the exception is
 `-88`'s 3 non-control cells, which remain rejected by the same
 fixed-footprint over-book as its own control cell — `-88` is the sole
 preset where the override is structurally powerless.
+
+---
+
+# T3-pre 64x32k paired kv-mode arms (2026-07-22): kv4 and kv8 KILLED on the acceptance law — MTP draft/trunk calibration breaks almost immediately under KV quantization, even though kv4's HumanEval n=20 screen is untouched (0.95, identical failure to the bf16/q8-KV baseline)
+
+Mid-envelope T3 matrix cell, preset `hy3-oq2e-rq4-64` (islands 52, 27
+streamed; proj-requant q4; hy3-router-kernel
+`mpp-fp32-splitk-r1-fused-r2`), `--max-live-kv-tokens 32768`, shared
+memory-limit override **79.75 GiB** (85,630,910,464 B = 71 GiB preset +
+(32768-4096)*327,680 B KV delta — a ceiling identical across all three arms
+per the envelope-accounting rule; island/cache sizing never changed) — three
+paired arms in ONE guarded window, bf16 KV first as the in-window control
+(this row also serves as the T3 matrix-cell receipt for 64x32k bf16 KV),
+then kv8, then kv4, `--hy3-depths 1,2,3` (AR auto-runs as depth=0 regardless;
+K1/K2/K3 = d1/d2/d3), natural 1024/1024 shape.
+
+**CPU-only preflight** (`research/t3-64x32k/preflight_kv_arms.py`, the exact
+`mtplx/runtime.py` `_load_impl` admission-gate replica T4 already validated,
+extended to vary `kv_quant`): all three arms ADMIT under the shared 79.75
+GiB ceiling — bf16 implied 79.68 GiB, kv8 75.93 GiB, kv4 73.43 GiB, all under
+the 85 GiB ask-first line, nowhere near the 100 GiB knob. `verify_expert_manifest`
+passed on the `hy3-oq2e-mlx` serving root (`checked_shards=18`); an
+independent root-vs-manifest diff (the validator's own truncated-to-4 extras
+list is not authoritative) found 2 extra `*.safetensors` files
+(`layer80-bf16.safetensors`, `layer80-residents-q.safetensors` — both
+accounted for by the checkpoint's own resident/MTP-head layout, not orphans)
+and 0 missing. Receipt: `t3_64x32k_admission_preflight.json`.
+
+**Rep protocol**: this harness has no `--reps`/replicate flag
+(`retained_replicates` is hardcoded 1 everywhere in this campaign, including
+every prior champion receipt) — one retained measurement per cell, matching
+established convention, used in place of the brief's suggested 3 reps.
+
+## Per-arm x per-K table
+
+`loads` = `persistent_loads + transient_loads` (verified against `bytes_read`:
+loads x ~5.31 MB/expert-record matches `bytes_read` to <0.1%); `svc_ms/load`
+= `decode_elapsed_s / loads x 1000`, a blended (read+overhead) per-load cost,
+same convention as the campaign's R3/R4 ms/miss figures.
+
+| arm | cell | tok/s | acceptance | hit rate | loads/tok | svc ms/load | peak (hard) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| bf16 | AR | 8.639 | 0.0000 | 0.1164 | 170.6 | 0.678 | 63.73 GiB |
+| bf16 | K1 (d1) | 9.074 | 0.9102 | 0.1216 | 168.8 | 0.653 | 63.73 GiB |
+| bf16 | K2 (d2) | 7.995 | 1.5637 | 0.1382 | 193.1 | 0.648 | 63.73 GiB |
+| bf16 | K3 (d3) | 6.721 | 1.9038 | 0.1558 | 227.7 | 0.653 | 63.73 GiB |
+| kv8 | AR | 9.520 | 0.0000 | 0.2002 | 134.5 | 0.781 | 64.49 GiB |
+| kv8 | K1 (d1) | 7.418 | **0.3184** | 0.3397 | 168.3 | 0.801 | 64.49 GiB |
+| kv8 | K2 (d2) | 5.771 | **0.1070** | 0.4234 | 207.8 | 0.834 | 64.49 GiB |
+| kv8 | K3 (d3) | 7.356 | 1.0160 | 0.3706 | 174.0 | 0.781 | 64.49 GiB |
+| kv4 | AR | 9.338 | 0.0000 | 0.1867 | 140.3 | 0.764 | 64.41 GiB |
+| kv4 | K1 (d1) | 6.876 | **0.2070** | 0.3465 | 180.0 | 0.808 | 64.41 GiB |
+| kv4 | K2 (d2) | 5.741 | **0.1157** | 0.4169 | 211.6 | 0.823 | 64.41 GiB |
+| kv4 | K3 (d3) | 12.809 | 2.1667 | 0.3486 | 97.0 | 0.805 | 64.41 GiB |
+
+Peaks are all far under the 79.75 GiB override (the override is a ceiling on
+a *static worst-case* KV reservation at 32768 tokens; the benchmark only
+ever uses 1024-2048 live tokens, so measured hard peak is dominated by the
+fixed island/resident footprint, not KV — expected, not a discrepancy).
+
+## Token-hash / divergence outcomes
+
+Every arm's own depth>0 cells are compared against **that arm's own** AR
+(depth=0) row (`ar_comparison`, not cross-arm). All hard gates
+(`speculative_event_contract`, `final_state_contract`, `committed_history`,
+etc.) are `True` on every row in every arm — no structural/harness fault.
+
+| arm | cell | parity | first_divergence | differing_tokens | observed_token_sha256 (16) |
+|---|---|---|---:|---:|---|
+| bf16 | AR | True | — | 0 | dcbabe7c2861357b |
+| bf16 | K1 | False | 298 | 694 | 2c1e0641f0fb8aa2 |
+| bf16 | K2 | False | 298 | 694 | 2c1e0641f0fb8aa2 |
+| bf16 | K3 | False | 298 | 697 | 86be119755962790 |
+| kv8 | AR | True | — | 0 | 511583febfbe0d13 |
+| kv8 | K1 | False | **2** | 1022 | c23ff8fec8b6e79f |
+| kv8 | K2 | False | **2** | 1017 | 1f5204b38efaa196 |
+| kv8 | K3 | False | **2** | 1017 | 0fb3128aa39be227 |
+| kv4 | AR | True | — | 0 | 94b933e405d1dc22 |
+| kv4 | K1 | False | **2** | 1015 | 9b9b718e3f7174f6 |
+| kv4 | K2 | False | **2** | 1010 | f5edf30a3d9aae8b |
+| kv4 | K3 | False | **11** | 1011 | 2bf36ae4f99b426d |
+
+**This cell does not reproduce the "K3 bit-exact" property** the campaign's
+full-residency champion/parity-stamped configs established — bf16's own K3
+diverges from its own AR at token 298 (differing_tokens 697/1024). That
+prior property required `MTPLX_HY3_ROUTER_SPLITK_M1=all` (see "PARITY-STAMPED
+CHAMPION"), which neither the `hy3-oq2e-rq4-64` preset nor this mission set;
+absent it, this streamed/proj-requant cell shows the same
+router-numerics-driven single-region divergence documented there. This is
+new information for this specific cell/preset combination, reported as
+measured — not the target property.
+
+The bf16 control's divergence pattern (late, single-region, position 298) is
+the *normal* campaign signature (batched-verify reassociation / near-tie
+logit). kv8 and kv4's pattern is categorically different: **first divergence
+at token 2 (kv8, kv4-K1/K2) or 11 (kv4-K3)** — the MTP draft essentially
+never matches even that arm's own quantized-trunk AR continuation past the
+first couple of tokens, at every depth. AR-vs-AR token sequences also differ
+across all three arms (three different sha256), confirming KV quantization
+measurably perturbs the trunk's greedy continuation even with **zero**
+speculation involved — expected for any argmax-sensitive greedy decode under
+numerical perturbation, and the necessary (if not sufficient) precondition
+for the acceptance collapse below.
+
+## Acceptance A/B vs the bf16 in-window control
+
+| K | bf16 (control) | kv8 | kv8 delta | kv4 | kv4 delta |
+|---|---:|---:|---:|---:|---:|
+| K1 | 0.9102 | 0.3184 | **-65.0%** | 0.2070 | **-77.3%** |
+| K2 | 1.5637 | 0.1070 | **-93.2%** | 0.1157 | **-92.6%** |
+| K3 | 1.9038 | 1.0160 | -46.6% | 2.1667 | +13.8% |
+
+**Noise assessment**: this campaign's established noise bands are sub-1%
+in-window (paired, same window: K2 compile-island A/B +0.3%, router M1 AR
++4.6% "as predicted") and ~4% cross-window under sustained load. K1/K2
+deltas here are 46-93 percentage points — two orders of magnitude beyond any
+noise band this campaign has ever measured. This is **not noise**.
+
+K3's partial "recovery" (kv4 K3 even beats the bf16 control) does not save
+the arms: K3's own divergence signature (first_divergence=2 or 11, ~99% of
+the sequence differing) shows the SAME broken draft/trunk calibration as
+K1/K2, just landing on a higher accepted-per-verify count by chance on this
+one 1024-token sample; it is not evidence of a repaired mechanism. AR/K1/K2/K3
+run sequentially inside one model load per arm (shared, cumulatively-warmed
+frequency cache — hit rate climbs AR->K2 within every arm, matching every
+prior receipt in this campaign; this does not affect token content, since
+cache hit/miss returns bit-identical weights either way).
+
+## Verdict — acceptance law fires; ALU/speed comparison reported per the brief anyway
+
+**kv4 is KILLED for MTP-speculative serving. kv8 is KILLED too**, by the
+same law, at the same severity. Acceptance collapse at K1/K2 is 65-93
+percentage points below the in-window bf16 control — far beyond any noise
+this campaign has ever measured — so per the acceptance law ("if kv4
+acceptance drops beyond noise vs the in-window bf16 control, kv4 is KILLED
+for serving regardless of speed"), speed is moot for the K>0 (MTP) serving
+path. Root cause (mechanistic, not proven at the tensor level): the MTP
+draft head is bf16 and was calibrated against a bf16 trunk; quantizing trunk
+KV (even at q8, 17/32 of bf16 bytes) perturbs the trunk's hidden state
+enough that under exact-match greedy verify, the draft's proposals miss
+almost immediately — this is a draft/trunk calibration break, not a
+harness bug (every structural gate passes; the pattern is consistent and
+reproducible across both quantization levels and three depths).
+
+**Sub-4-bit ALU-risk framing does not directly apply** (this is trunk-KV
+precision, not expert-weight precision), but the requested kv8-vs-kv4 speed
+comparison is reported anyway: K1/K2 kv4 is 5-7% slower than kv8 (matching
+directionally with "more dequant work"); K3 inverts (kv4 12.81 vs kv8 7.36,
+kv4 the fastest cell in the entire sweep) — plausibly the smaller KV
+footprint's bandwidth saving outweighing verify overhead at that specific
+depth, though this is under-powered (n=1 cell) and moot given both arms are
+already killed on acceptance.
+
+**AR-only note** (not gated by the acceptance law, which is specifically
+about the MTP mechanism): kv8 (9.52) and kv4 (9.34) AR tok/s both *beat*
+the bf16 control's AR (8.64) — plain non-speculative KV quantization is a
+real, if modest, win here. If a future serving mode ever runs AR-only (no
+MTP), kv-quant remains worth a dedicated look; it must not be paired with
+MTP under the current (bf16) draft-head calibration.
+
+## kv4 HumanEval n=20 screen: pass@1 = 0.95 (19/20) — task competence UNTOUCHED despite the acceptance collapse
+
+Run as its own standalone guarded window (window 2), immediately after
+window 1 released the flock — never overlapped, per box law. Same runtime
+identity as the kv4 speed arm (`hy3-expert-oq2e`, islands 52, proj-requant
+q4, `mpp-fp32-splitk-r1-fused-r2`, same 79.75 GiB memory-limit override,
+same 32768-token KV admission envelope), `--kv-quant q4`, reached through
+`evals/litellm_hy3/handler.py`'s `MTPLX_HY3_*` env overrides. Same
+20-task HumanEvalPlus-v0.1.10 gate as every prior screen in this campaign
+(greedy, seed 42, chat endpoint, `no_think`, dataset sha256 `42526ec0…`).
+
+- **pass@1 = 0.95 (19/20)**, `request_errors=0`, all 20 completions
+  `finish_reason=stop` (77-237 completion tokens). Sole failure:
+  **HumanEval/10** (AssertionError) — the SAME task every prior HumanEval
+  run in this campaign fails (shipped-q2 0.80, oQ2e 0.95, proj_requant 0.95,
+  full-164 both arms).
+- **Identical score and identical sole failure to the bf16/q8-KV oQ2e
+  baseline** ("oQ2e HumanEval" above: 0.95, HumanEval/10). At n=20
+  resolution, kv4's task competence is indistinguishable from the
+  non-KV-quantized baseline, even though its MTP acceptance collapsed by
+  65-93 points in the paired speed arm above. This is the same pattern this
+  campaign has repeatedly found for weight quantization (PPL/exact-token-
+  agreement collapses while HumanEval survives): **exact-match speculative
+  /calibration metrics are far more sensitive than actual task quality.**
+  It does not overturn the acceptance-law verdict — the law gates the
+  *speculative-serving mechanism*, not raw model quality, and those are
+  measurably different things here.
+- "proxy" in `humaneval_t3_64x32k_kv4_n20_proxy.log` = the LiteLLM
+  OpenAI-API-compatible proxy server process (`litellm --config config.yaml
+  --port 18183`) that fronts `handler.py`'s `Hy3StreamedLLM`, so the generic
+  `code_eval_gate.py` harness can hit a normal `/v1/chat/completions`
+  endpoint; that file is the proxy SERVER's own stdout/stderr (startup,
+  request handling), distinct from the harness's result receipt
+  (`humaneval_t3_64x32k_kv4_n20.json`) and distinct from the speed arms'
+  `.log` files (those call the runtime in-process via the CLI, no proxy
+  involved).
+- First request wall time 97.96 s = cold model load (islands 52, 27
+  streamed) + first generation; provenance `wall_s=406.76` for all 20 tasks.
+
+## `evals/litellm_hy3/handler.py` change (load-bearing, kept)
+
+`_champion_overrides()` had no `kv_quant` key — every other quant knob
+(`proj_quant`, `proj_requant`) was already `MTPLX_HY3_*`-overridable but
+`--kv-quant` (commit `8aed1942`, benchmark-CLI-only) was never plumbed into
+the LiteLLM lane. Added `"kv_quant"` following the exact `proj_requant`
+"none"-sentinel pattern (`MTPLX_HY3_KV_QUANT`, default unset/None = bf16).
+Required for the n=20 screen above — without it, kv4's HumanEval run would
+silently serve bf16 KV regardless of the env var, which would test the
+wrong arm. Verified against `evals/litellm_hy3/test_handler_offline.py`
+(12/12 pass, no MLX/mtplx needed) before use.
+
+## Commands (exact)
+
+Window 1 (bf16/kv8/kv4 speed arms), single guarded window:
+```
+bash research/t3-64x32k/run_speed_arms.sh
+```
+which (after the CPU-only preflight) runs, per arm, inside
+`run_with_qwen_stopped.py --plist ~/Library/LaunchAgents/com.tea.qwen.plist
+--lock-timeout-seconds 7200 --child-timeout-seconds 10800`:
+```
+python scripts/benchmark_q2_mtp_depth_matrix.py \
+  --preset hy3-oq2e-rq4-64 --max-live-kv-tokens 32768 \
+  --memory-limit 85630910464 --hy3-depths 1,2,3 \
+  [--kv-quant q8 | --kv-quant q4] \
+  --output-json evals/tier2/t3_64x32k_{bf16,kv8,kv4}.json
+```
+
+Window 2 (kv4 HumanEval n=20), standalone, launched only after window 1's
+flock was released:
+```
+bash research/t3-64x32k/run_kv4_humaneval_n20.sh
+```
+which exports `MTPLX_HY3_MODEL_KEY=hy3-expert-oq2e
+MTPLX_HY3_MODEL_ROOT=~/.cache/huggingface/hy3-oq2e-mlx
+MTPLX_HY3_ISLAND_LAYER_COUNT=52 MTPLX_HY3_PROJ_QUANT=none
+MTPLX_HY3_PROJ_REQUANT=q4 MTPLX_HY3_KV_QUANT=q4
+MTPLX_HY3_ROUTER_KERNEL=mpp-fp32-splitk-r1-fused-r2
+MTPLX_HY3_MEMORY_LIMIT=85630910464 MTPLX_HY3_MAX_LIVE_KV_TOKENS=32768` then
+runs `run_with_qwen_stopped.py -- bash evals/litellm_hy3/serve_and_eval.sh`
+(`HUMANEVAL_LIMIT` defaults to 20).
+
+Receipts: `t3_64x32k_admission_preflight.{json,log}`,
+`t3_64x32k_{bf16,kv8,kv4}.{json,log}`,
+`humaneval_t3_64x32k_kv4_n20.json` + `_proxy.log`. Drivers:
+`research/t3-64x32k/{preflight_kv_arms.py,run_speed_arms.sh,
+run_speed_arms_inner.sh,run_kv4_humaneval_n20.sh}`.
