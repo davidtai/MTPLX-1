@@ -1,0 +1,1 @@
+[run_64col] iogpu.wired_limit_mb=114688
