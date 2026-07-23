@@ -327,54 +327,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=MODEL_SPECS["glm52-q2"]["depths"],
     )
 
-    parser.add_argument(
-        "--hy3-q2-model-root",
-        type=Path,
-        default=MODEL_SPECS["hy3-q2"]["model_root"],
-    )
-    parser.add_argument("--hy3-q2-manifest", type=Path)
-    parser.add_argument(
-        "--hy3-q2-mtp-artifacts",
-        type=Path,
-        default=MODEL_SPECS["hy3-q2"]["mtp_artifacts"],
-    )
-    parser.add_argument(
-        "--hy3-q2-prompt-tail",
-        type=Path,
-        default=MODEL_SPECS["hy3-q2"]["prompt_tail"],
-    )
-    parser.add_argument(
-        "--glm52-q2-model-root",
-        type=Path,
-        default=MODEL_SPECS["glm52-q2"]["model_root"],
-    )
-    parser.add_argument("--glm52-q2-manifest", type=Path)
-    parser.add_argument(
-        "--glm52-q2-mtp-artifacts",
-        type=Path,
-        default=MODEL_SPECS["glm52-q2"]["mtp_artifacts"],
-    )
-    parser.add_argument(
-        "--glm52-q2-prompt-tail",
-        type=Path,
-        default=MODEL_SPECS["glm52-q2"]["prompt_tail"],
-    )
-    parser.add_argument(
-        "--glm52-q1t-model-root",
-        type=Path,
-        default=MODEL_SPECS["glm52-q1t"]["model_root"],
-    )
-    parser.add_argument("--glm52-q1t-manifest", type=Path)
-    parser.add_argument(
-        "--glm52-q1t-mtp-artifacts",
-        type=Path,
-        default=MODEL_SPECS["glm52-q1t"]["mtp_artifacts"],
-    )
-    parser.add_argument(
-        "--glm52-q1t-prompt-tail",
-        type=Path,
-        default=MODEL_SPECS["glm52-q1t"]["prompt_tail"],
-    )
+    # Per-entry artifact overrides for every campaign key. Regression
+    # tests/test_depth_matrix_requests.py: hand-written per-model flags left
+    # later-added keys (hy3-oq2e, hy3-oq4e) without overrides, so clean-room
+    # clones could not be benchmarked without editing MODEL_SPECS.
+    for model, spec_entry in MODEL_SPECS.items():
+        parser.add_argument(
+            f"--{model}-model-root",
+            type=Path,
+            default=spec_entry["model_root"],
+        )
+        parser.add_argument(f"--{model}-manifest", type=Path)
+        parser.add_argument(
+            f"--{model}-mtp-artifacts",
+            type=Path,
+            default=spec_entry["mtp_artifacts"],
+        )
+        parser.add_argument(
+            f"--{model}-prompt-tail",
+            type=Path,
+            default=spec_entry["prompt_tail"],
+        )
 
     parser.add_argument("--memory-limit", default="112GiB")
     parser.add_argument("--runtime-reserve", default="12GiB")
@@ -756,34 +729,16 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
     requests: list[dict[str, Any]] = []
     for model in selected:
         spec_entry = MODEL_SPECS[model]
-        if model == "hy3-q2":
-            model_root = args.hy3_q2_model_root
-            manifest = args.hy3_q2_manifest
-            mtp_artifacts = args.hy3_q2_mtp_artifacts
-            prompt_tail = args.hy3_q2_prompt_tail
-            depths = args.hy3_depths
-        elif model == "glm52-q2":
-            model_root = args.glm52_q2_model_root
-            manifest = args.glm52_q2_manifest
-            mtp_artifacts = args.glm52_q2_mtp_artifacts
-            prompt_tail = args.glm52_q2_prompt_tail
-            depths = args.glm52_depths
-        elif model == "glm52-q1t":
-            model_root = args.glm52_q1t_model_root
-            manifest = args.glm52_q1t_manifest
-            mtp_artifacts = args.glm52_q1t_mtp_artifacts
-            prompt_tail = args.glm52_q1t_prompt_tail
-            depths = args.glm52_depths
-        else:
-            model_root = spec_entry["model_root"]
-            manifest = None
-            mtp_artifacts = spec_entry["mtp_artifacts"]
-            prompt_tail = spec_entry["prompt_tail"]
-            depths = (
-                args.hy3_depths
-                if spec_entry["model_key"].startswith("hy3")
-                else args.glm52_depths
-            )
+        ns = model.replace("-", "_")
+        model_root = getattr(args, f"{ns}_model_root")
+        manifest = getattr(args, f"{ns}_manifest")
+        mtp_artifacts = getattr(args, f"{ns}_mtp_artifacts")
+        prompt_tail = getattr(args, f"{ns}_prompt_tail")
+        depths = (
+            args.hy3_depths
+            if spec_entry["model_key"].startswith("hy3")
+            else args.glm52_depths
+        )
         model_root = _expand(model_root)
         request = {
             "model": model,

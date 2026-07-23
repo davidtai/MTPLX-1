@@ -42,6 +42,23 @@ def test_oq2e_request_uses_its_own_entry_not_glm52():
     assert request["depths"] == (2, 3)
 
 
+def test_every_campaign_key_accepts_artifact_overrides():
+    module = _load_runner()
+    for model in module.MODEL_SPECS:
+        args = module.build_parser().parse_args(
+            [
+                "--model", model,
+                f"--{model}-model-root", "/tmp/clean-room-root",
+                f"--{model}-manifest", "/tmp/clean-room-root/expert-manifest.json",
+                f"--{model}-mtp-artifacts", "/tmp/clean-room-root",
+            ]
+        )
+        (request,) = module._requests_from_args(args)
+        assert str(request["model_root"]).endswith("clean-room-root"), model
+        assert str(request["manifest"]).endswith("expert-manifest.json"), model
+        assert str(request["mtp_artifacts"]).endswith("clean-room-root"), model
+
+
 def test_known_keys_still_resolve_their_flag_overrides():
     module = _load_runner()
     args = module.build_parser().parse_args(
