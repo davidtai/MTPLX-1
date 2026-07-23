@@ -28,28 +28,27 @@ Quantization: omlx oQe level-2 imatrix experts (2.44 bpw, 2.50 bpw
 effective with q8 residents), from
 [mlx-community/Hy3-oQ2e](https://huggingface.co/mlx-community/Hy3-oQ2e).
 
-## Repo contents
+## Repo contents (~91 GiB)
 
 | files | size | what |
 |---|---|---|
-| `model-resident-*.safetensors` (2) | 8.7 GiB | attention, routers, shared experts, embeddings, dense layer 0 (q8-gs64) |
-| `model-expert-*.safetensors` (16) | 75 GiB | routed expert tensors, 2-bit gs128 — needed for plain-MLX resident serving only |
-| `experts.bin` + `expert-manifest.json` | 75 GiB | the same expert bytes as an aligned, hash-pinned bank for streamed serving |
-| `layer80-bf16.safetensors`, `layer80-residents-q.safetensors` | 7.1 GiB | Hy3 MTP head (speculative decoding) |
+| `model-resident-*.safetensors` (2) + `model.safetensors.index.json` | 8.7 GiB | attention, routers, shared experts, embeddings, dense layer 0 (q8-gs64); the index covers exactly these resident tensors |
+| `experts.bin` + `expert-manifest.json` | 75 GiB | all 15,168 routed expert records (2-bit gs128) as an aligned, hash-pinned bank; the manifest is sidecar-authoritative (references resident shards + the bank only) |
+| `expert-manifest.shards.json` | — | provenance manifest pinning sha256 for the pre-repack safetensors shards and every expert record |
+| `mtp/layer80-bf16.safetensors`, `mtp/layer80-residents-q.safetensors` | 7.1 GiB | Hy3 MTP head (speculative decoding) |
 | `island-placement.json`, `route-census.json` | — | per-machine seeds; MTPLX regenerates them on first serve |
 
-## Who downloads what
-
-**MTPLX streaming (48–96 GiB envelopes):** skip the expert safetensors —
-the streamed engine reads experts only from `experts.bin`. This halves the
-download to ~91 GiB:
+This is the MTPLX streaming layout: routed experts ship only in
+`experts.bin`, so nothing is downloaded twice. Download everything:
 
 ```bash
-hf download <REPO_ID> --exclude "model-expert-*"
+hf download <REPO_ID>
 ```
 
-**Plain MLX (resident-only, 128 GB Mac):** download the safetensors
-checkpoint (resident + expert shards); `experts.bin` is not used.
+**Plain-MLX resident serving (128 GB Mac):** use the upstream safetensors
+checkpoint at
+[mlx-community/Hy3-oQ2e](https://huggingface.co/mlx-community/Hy3-oQ2e);
+this repo packages the same bytes for streaming.
 
 **llama.cpp:** not served. MLX affine quantization does not convert to
 GGML blocks in either direction.
@@ -97,8 +96,11 @@ so the crossover is a decode-cost effect, not an acceptance effect.
   (Apache-2.0); quantized bank mlx-community/Hy3-oQ2e rev `1979c306`.
 - Re-sharded here into resident/expert groups for selective download.
   Tensor bytes are unchanged; every tensor was sha256-verified at repack.
-- `expert-manifest.json` pins sha256 for all 18 shards, all 15,168 expert
-  records, and `experts.bin`.
+- `expert-manifest.json` (sidecar-authoritative, what the engine loads)
+  pins the resident shards and `experts.bin`; it is what makes the
+  expert-shard-free selective download servable.
+- `expert-manifest.shards.json` pins sha256 for all 18 safetensors
+  shards, all 15,168 expert records, and `experts.bin`.
 - Two metadata corrections vs the published checkpoint (originals kept as
   `*.orig-published`): index `total_size` (overstated upstream by
   345,252 B) and config `num_nextn_predict_layers` 0→1, which the bundled

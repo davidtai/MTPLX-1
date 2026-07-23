@@ -35,7 +35,7 @@ echo "[publish-rehearsal] === selective-clone 64-envelope K1 starting $(date -u 
   --hy3-depths 1 \
   --hy3-oq2e-model-root "$SEL" \
   --hy3-oq2e-manifest "$SEL/expert-manifest.json" \
-  --hy3-oq2e-mtp-artifacts "$SEL" \
+  --hy3-oq2e-mtp-artifacts "$SEL/mtp" \
   --output-json "$out" \
   >> "$log" 2>&1
 rc=$?
