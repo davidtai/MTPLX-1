@@ -23,7 +23,7 @@
         "streamed_mtp_resident_bytes": 7505224960,
         "unallocated_bytes": 397913600
       },
-      "contexts": 256,
+      "contexts": 320,
       "final_memory_limit_bytes": 103079215104,
       "final_status": "ADMIT",
       "knob_exceeded": false,
@@ -53,7 +53,7 @@
         "streamed_mtp_resident_bytes": 7505224960,
         "unallocated_bytes": 23965184
       },
-      "contexts": 256,
+      "contexts": 320,
       "final_memory_limit_bytes": 93415538688,
       "final_status": "ADMIT",
       "knob_exceeded": false,
@@ -83,7 +83,7 @@
         "streamed_mtp_resident_bytes": 7505224960,
         "unallocated_bytes": 393719296
       },
-      "contexts": 256,
+      "contexts": 320,
       "final_memory_limit_bytes": 76235669504,
       "final_status": "ADMIT",
       "knob_exceeded": false,
@@ -93,11 +93,11 @@
       "preset": "hy3-oq2e-rq4-64-cachelru"
     }
   ],
-  "contexts": 256,
+  "contexts": 320,
   "control_kv_tokens": 4096,
   "generated": "2026-07-22",
   "kv_bytes_per_token": 327680,
-  "note": "CPU-only admission preflight for the small-code arm of record (contexts=256, output-tokens=256, K1+AR, bf16 KV) run against the three already-done envelopes: hy3-oq2e-rq4-88e, hy3-oq2e-rq4-80, hy3-oq2e-rq4-64-cachelru. Supersedes the prose-naturalistic arm (David correction 2026-07-22) -- prose receipts already collected at these three envelopes are downgraded to incidental reference. Arms whose derived KV-delta override would exceed the 112 GiB wired knob, or that still REJECT even at that override, are marked SKIP and MUST NOT be run.",
+  "note": "CPU-only admission preflight for the small-code arm of record (contexts=320, output-tokens=256, K1+AR, bf16 KV) run against the three already-done envelopes: hy3-oq2e-rq4-88e, hy3-oq2e-rq4-80, hy3-oq2e-rq4-64-cachelru. Supersedes the prose-naturalistic arm (David correction 2026-07-22) -- prose receipts already collected at these three envelopes are downgraded to incidental reference. Arms whose derived KV-delta override would exceed the 112 GiB wired knob, or that still REJECT even at that override, are marked SKIP and MUST NOT be run.",
   "output_tokens": 256,
   "schema": "mtplx-t3-smallcode-redo-admission-preflight-v1",
   "signoff_ceiling_gib": 90.0,

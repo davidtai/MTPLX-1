@@ -1,0 +1,4 @@
+[preflight] arm=88e          preset=hy3-oq2e-rq4-88e         contexts=   320 kv=  4096 override=False -> ADMIT  fixed= 95.6294 GiB limit= 96.0000 GiB knob_exceeded=False
+[preflight] WARNING: arm=88e limit 96.0000 GiB exceeds the 90.0 GiB sub-85/90 sign-off band -- confirm with David before launching this arm.
+[preflight] arm=80           preset=hy3-oq2e-rq4-80          contexts=   320 kv=  4096 override=False -> ADMIT  fixed= 86.1372 GiB limit= 87.0000 GiB knob_exceeded=False
+[preflight] arm=64-cachelru  preset=hy3-oq2e-rq4-64-cachelru contexts=   320 kv=  4096 override=False -> ADMIT  fixed= 20.6411 GiB limit= 71.0000 GiB knob_exceeded=False
