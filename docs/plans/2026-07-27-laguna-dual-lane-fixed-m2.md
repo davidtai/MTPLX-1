@@ -88,7 +88,7 @@ missing, or malformed values must classify as `background`.
 **Does not cover:** Kernel behavior, client header configuration, deployment,
 or physical row ordering inside `BatchGenerator`.
 
-- [ ] **Step 1: Write failing classification, reservation, lifecycle, and
+- [x] **Step 1: Write failing classification, reservation, lifecycle, and
   snapshot tests**
 
   Add focused tests with the existing `object.__new__`,
@@ -119,7 +119,7 @@ or physical row ordering inside `BatchGenerator`.
   Construct pending jobs in mixed FIFO order so the test proves selection is
   oldest-within-class rather than the first two entries in the global list.
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -130,7 +130,7 @@ or physical row ordering inside `BatchGenerator`.
   Expected failure: `_ar_batch_traffic_class` and per-class ownership do not
   exist, and the current FIFO admission permits two jobs from the same class.
 
-- [ ] **Step 3: Add construction-time classification and immutable job
+- [x] **Step 3: Add construction-time classification and immutable job
   ownership**
 
   In `mtplx/server/openai.py`, add:
@@ -151,7 +151,7 @@ or physical row ordering inside `BatchGenerator`.
   the request's observability object is already available, and never inspect
   headers or observability from the decode path.
 
-- [ ] **Step 4: Replace capacity-only FIFO admission with class-owned slots**
+- [x] **Step 4: Replace capacity-only FIFO admission with class-owned slots**
 
   Add a helper that:
 
@@ -170,7 +170,7 @@ or physical row ordering inside `BatchGenerator`.
   "active_by_class": {"cline": cline_active, "background": background_active},
   ```
 
-- [ ] **Step 5: Run focused and full scheduler tests**
+- [x] **Step 5: Run focused and full scheduler tests**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -183,7 +183,7 @@ or physical row ordering inside `BatchGenerator`.
 
   Expected: all focused tests and the entire server test module pass.
 
-- [ ] **Step 6: Commit only the scheduler change**
+- [x] **Step 6: Commit only the scheduler change**
 
   ```bash
   git diff --check
@@ -207,7 +207,7 @@ the existing authorization header.
 **Does not cover:** Cline configuration, production deployment, or any dirty
 frontend files in the existing leaderboard checkout.
 
-- [ ] **Step 1: Create a clean worktree without touching the dirty checkout**
+- [x] **Step 1: Create a clean worktree without touching the dirty checkout**
 
   ```bash
   git -C /Users/davidtai/projects/OpenSourceWTF/opensource-leaderboard \
@@ -225,7 +225,7 @@ frontend files in the existing leaderboard checkout.
   inspect and reuse it only if its HEAD and status are understood; do not
   delete it.
 
-- [ ] **Step 2: Add a failing header assertion**
+- [x] **Step 2: Add a failing header assertion**
 
   Extend the existing request-options assertion in
   `apps/api/test/qwen.test.js`:
@@ -237,7 +237,7 @@ frontend files in the existing leaderboard checkout.
   );
   ```
 
-- [ ] **Step 3: Run the exact Node test and confirm RED**
+- [x] **Step 3: Run the exact Node test and confirm RED**
 
   ```bash
   pnpm --filter @osl/api exec node --test test/qwen.test.js
@@ -245,7 +245,7 @@ frontend files in the existing leaderboard checkout.
 
   Expected failure: `x-mtplx-client` is absent.
 
-- [ ] **Step 4: Add the client label beside existing request headers**
+- [x] **Step 4: Add the client label beside existing request headers**
 
   In `apps/api/server/scan/qwen.js`, preserve content type and optional
   authorization and add:
@@ -254,14 +254,14 @@ frontend files in the existing leaderboard checkout.
   'x-mtplx-client': 'opensource-leaderboard',
   ```
 
-- [ ] **Step 5: Run focused and API tests**
+- [x] **Step 5: Run focused and API tests**
 
   ```bash
   pnpm --filter @osl/api exec node --test test/qwen.test.js
   pnpm --filter @osl/api test
   ```
 
-- [ ] **Step 6: Commit only the two client files**
+- [x] **Step 6: Commit only the two client files**
 
   ```bash
   git diff --check
@@ -289,7 +289,7 @@ fixed by the construction-time checkpoint contract.
 **Does not cover:** Model installation, serving activation, routed-expert
 coalescing, or benchmark promotion.
 
-- [ ] **Step 1: Write source-contract tests before adding the kernel**
+- [x] **Step 1: Write source-contract tests before adding the kernel**
 
   Add a testable source builder and assertions that prove the physical
   ownership contract:
@@ -311,7 +311,7 @@ coalescing, or benchmark promotion.
   public construction/testing entrypoint; the installed hot-path callable in
   Task 4 will bind the validated kernel directly.
 
-- [ ] **Step 2: Run source and shape tests and confirm RED**
+- [x] **Step 2: Run source and shape tests and confirm RED**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -319,7 +319,7 @@ coalescing, or benchmark promotion.
     -k 'router_gemv_m2_source or router_gemv_m2_shape'
   ```
 
-- [ ] **Step 3: Implement the fixed-M2 source and cached kernel**
+- [x] **Step 3: Implement the fixed-M2 source and cached kernel**
 
   In `mtplx/kernels/laguna_decode.py`:
 
@@ -347,7 +347,7 @@ coalescing, or benchmark promotion.
   Add a private direct launcher that accepts the already-proven installed
   arrays and performs no eligibility decision or fallback.
 
-- [ ] **Step 4: Add real-Metal bitwise correctness checks**
+- [x] **Step 4: Add real-Metal bitwise correctness checks**
 
   Extend `laguna_kernel_check.py` with deterministic random, all-zero,
   alternating-sign, large-magnitude, and repeated-value inputs. Compare:
@@ -366,7 +366,7 @@ coalescing, or benchmark promotion.
   normalization, and scale; assert exact expert IDs and bitwise-equal route
   weights.
 
-- [ ] **Step 5: Run CPU/source tests and guarded Metal correctness**
+- [x] **Step 5: Run CPU/source tests and guarded Metal correctness**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -385,7 +385,7 @@ coalescing, or benchmark promotion.
   inspect `run_guarded.py` and use its documented equivalent without bypassing
   exclusivity.
 
-- [ ] **Step 6: Commit the MTPLX kernel and tests**
+- [x] **Step 6: Commit the MTPLX kernel and tests**
 
   The benchmark repository is separate and already contains user state. Do
   not stage it in the MTPLX commit.
@@ -415,7 +415,7 @@ self-check failure aborts installation before serving.
 engagement counters, or M greater than two in the enabled fixed-M2 decode
 lane.
 
-- [ ] **Step 1: Write failing contract, self-check, route, and failure tests**
+- [x] **Step 1: Write failing contract, self-check, route, and failure tests**
 
   Add tests covering:
 
@@ -437,7 +437,7 @@ lane.
   do not invoke eligibility helpers. Make the M2 fake raise a sentinel error
   and assert it propagates rather than entering stock code.
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -445,7 +445,7 @@ lane.
     -k 'fixed_m2'
   ```
 
-- [ ] **Step 3: Add the construction-time contract and dedicated flag**
+- [x] **Step 3: Add the construction-time contract and dedicated flag**
 
   Add:
 
@@ -471,7 +471,7 @@ lane.
   any mismatch raises `LagunaFixedM2ConfigError` with the exact property;
   there is no skip report.
 
-- [ ] **Step 4: Bind fixed callables and run all-layer installation self-check**
+- [x] **Step 4: Bind fixed callables and run all-layer installation self-check**
 
   For every MoE block, construct an immutable pack containing validated arrays
   and bound direct M1/M2 projection-plus-top-k callables. Compare the M2
@@ -482,7 +482,7 @@ lane.
   Install only after every block passes, so a partial model cannot escape
   construction.
 
-- [ ] **Step 5: Replace the enabled per-layer path with direct logical-M routes**
+- [x] **Step 5: Replace the enabled per-layer path with direct logical-M routes**
 
   The installed call path may inspect only the flattened logical row count:
 
@@ -501,7 +501,7 @@ lane.
   metadata, call `is_router_gemv_eligible`, catch kernel exceptions, or
   update diagnostic counters here.
 
-- [ ] **Step 6: Run focused tests, all Laguna tests, and server tests**
+- [x] **Step 6: Run focused tests, all Laguna tests, and server tests**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -516,7 +516,7 @@ lane.
     tests/test_server_openai.py
   ```
 
-- [ ] **Step 7: Commit the installed route**
+- [x] **Step 7: Commit the installed route**
 
   ```bash
   git diff --check
@@ -544,7 +544,7 @@ authorization values, or request headers.
 **Does not cover:** A routed-expert coalescing kernel. Any such implementation
 requires a separate approved design based on this artifact.
 
-- [ ] **Step 1: Write failing pure-function tests**
+- [x] **Step 1: Write failing pure-function tests**
 
   Test a pure summary API with synthetic route traces:
 
@@ -561,14 +561,14 @@ requires a separate approved design based on this artifact.
   aggregate histograms. Add an artifact test proving prompt text is absent and
   only its SHA-256 digest is emitted.
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
     -m pytest laguna/test_laguna_route_overlap_probe.py
   ```
 
-- [ ] **Step 3: Implement benchmark-only route capture**
+- [x] **Step 3: Implement benchmark-only route capture**
 
   Load the real checkpoint through `laguna_lane.py`. Wrap each block's
   `switch_mlp` only inside the probe process and record its existing top-10
@@ -587,7 +587,7 @@ requires a separate approved design based on this artifact.
 
   Reject an output record if it contains either input prompt string.
 
-- [ ] **Step 4: Run unit tests and three deterministic pairs per class**
+- [x] **Step 4: Run unit tests and three deterministic pairs per class**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -599,7 +599,7 @@ requires a separate approved design based on this artifact.
   Provide prompt files at execution time from approved local samples. Use the
   same seed, tokenizer, and decode length across paired trajectories.
 
-- [ ] **Step 5: Review the artifact and record the decision boundary**
+- [x] **Step 5: Review the artifact and record the decision boundary**
 
   Report median and tail overlap counts, per-layer distribution, and
   union-expert counts separately for normal and large background traffic.
@@ -611,7 +611,17 @@ requires a separate approved design based on this artifact.
   Do not infer Q4 fixed-weight reuse from router reuse, and do not implement a
   routed-expert candidate in this task.
 
-- [ ] **Step 6: Preserve local benchmark ownership**
+  Recorded 2026-07-27 from six redacted 96-token captures:
+
+  - normal background: median overlap 1/10, mean 0.849, 47.6% zero-overlap,
+    median union 19/20, and p95 union 20/20;
+  - large background: median overlap 1/10, mean 0.829, 48.4% zero-overlap,
+    median union 19/20, and p95 union 20/20.
+
+  Decision: overlap is too low to justify a routed-expert design. No routed
+  expert candidate will be implemented from this evidence.
+
+- [x] **Step 6: Preserve local benchmark ownership**
 
   `laguna/` is currently user-owned untracked state in the benchmark
   repository. Leave these two files local and unstaged unless the user
@@ -635,7 +645,7 @@ digests, thermal state, and dispatch metadata, not prompt text.
 
 **Does not cover:** Live service restart or promotion without all gates.
 
-- [ ] **Step 1: Write failing harness-integrity tests**
+- [x] **Step 1: Write failing harness-integrity tests**
 
   Add pure tests proving:
 
@@ -654,14 +664,14 @@ digests, thermal state, and dispatch metadata, not prompt text.
       ...
   ```
 
-- [ ] **Step 2: Run harness tests and confirm RED**
+- [x] **Step 2: Run harness tests and confirm RED**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
     -m pytest laguna/test_laguna_fixed_m2_bench.py
   ```
 
-- [ ] **Step 3: Implement paired unchanged-control and candidate arms**
+- [x] **Step 3: Implement paired unchanged-control and candidate arms**
 
   Reuse `laguna_lane.py` for model load, prompt construction, memory guard, and
   result schema. Reuse the reset/install discipline from
@@ -680,7 +690,7 @@ digests, thermal state, and dispatch metadata, not prompt text.
   tok/s, exact token digests, peak memory, thermal state, and installed-route
   report.
 
-- [ ] **Step 4: Add the chained 47-layer router microbenchmark**
+- [x] **Step 4: Add the chained 47-layer router microbenchmark**
 
   Measure existing B2 router projection versus fixed-M2 across 47 distinct
   real router weights, with warmup outside timed cycles and `mx.eval` at the
@@ -691,7 +701,7 @@ digests, thermal state, and dispatch metadata, not prompt text.
   - exact logits/IDs/weights result;
   - expected router traversal of 3 MiB versus 1.5 MiB per layer.
 
-- [ ] **Step 5: Run benchmark unit tests and guarded benchmark window**
+- [x] **Step 5: Run benchmark unit tests and guarded benchmark window**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -705,13 +715,13 @@ digests, thermal state, and dispatch metadata, not prompt text.
   equivalent guarded invocation if needed; never run around an occupied Metal
   lane.
 
-- [ ] **Step 6: Run dispatch census only after the candidate passes timing**
+- [x] **Step 6: Run dispatch census only after the candidate passes timing**
 
   Use the existing MLX profiler flow to prove the M2 projection launches 256
   expert-owned threadgroups per layer and the intended fixed-M2 kernel is
   present. Keep profiler instrumentation outside timed cells.
 
-- [ ] **Step 7: Record a mechanical promotion decision**
+- [x] **Step 7: Record a mechanical promotion decision**
 
   Promote only when all are true:
 
@@ -726,7 +736,18 @@ digests, thermal state, and dispatch metadata, not prompt text.
   If any item fails, retain the scheduler/header commits, leave the fixed-M2
   flag disabled, record the rejection artifact, and stop before Task 7.
 
-- [ ] **Step 8: Preserve local benchmark ownership**
+  Recorded 2026-07-27:
+
+  ```text
+  exact correctness: PASS
+  B2 median decode-cycle improvement: +1.1608%
+  improved paired B2 repetitions: 3 of 4
+  B1 median throughput regression: -1.0204% (an improvement)
+  dispatch census: PASS, 47 fixed-M2 launches at 256 threadgroups per layer
+  promotion: PROMOTE
+  ```
+
+- [x] **Step 8: Preserve local benchmark ownership**
 
   Leave benchmark files and artifacts local and unstaged unless the user
   explicitly requests their publication. Report exact artifact paths and
@@ -756,7 +777,7 @@ override.
 **Does not cover:** Live launchd cutover, direct commits to `moe/main`, or a
 launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
 
-- [ ] **Step 1: Write failing launcher contract tests on the upstream Laguna
+- [x] **Step 1: Write failing launcher contract tests on the upstream Laguna
   development branch**
 
   Add tests that read the script as text and execute non-serving preflight
@@ -780,7 +801,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
   path work correctly.
   ```
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
   ```bash
   /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-support/.venv/bin/python \
@@ -789,7 +810,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
 
   Expected failure: the repository has no supported launcher.
 
-- [ ] **Step 3: Convert the proven local script into a portable product
+- [x] **Step 3: Convert the proven local script into a portable product
   entrypoint**
 
   Preserve the behavior proven by the existing qwen36 launcher:
@@ -828,7 +849,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
   Export `MTPLX_LAGUNA_FIXED_M2_ROUTER=1` only in the post-promotion version
   committed by this task.
 
-- [ ] **Step 4: Document the supported entrypoint and attribution**
+- [x] **Step 4: Document the supported entrypoint and attribution**
 
   In the Laguna section of `README.md`, show:
 
@@ -844,7 +865,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
   real-server startup and serving path work correctly. Do not attribute the
   fixed-M2 kernel or its benchmark result to those operational changes.
 
-- [ ] **Step 5: Verify and commit the launcher on
+- [x] **Step 5: Verify and commit the launcher on
   `perf/laguna-batch-kernels`**
 
   ```bash
@@ -868,7 +889,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
   git commit -m "feat: ship the supported Laguna dual-lane launcher"
   ```
 
-- [ ] **Step 6: Create a clean branch from `moe/main`**
+- [x] **Step 6: Create a clean branch from `moe/main`**
 
   ```bash
   git worktree add \
@@ -882,7 +903,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
   If the path or branch exists, inspect it and reuse only understood state; do
   not delete or reset it.
 
-- [ ] **Step 7: Port the complete accepted stack, not only the launcher**
+- [x] **Step 7: Port the complete accepted stack, not only the launcher**
 
   Cherry-pick, in dependency order, the Task 1 scheduler commit, Task 3 kernel
   commit, Task 4 installer commit, and Task 7 launcher commit. Resolve branch
@@ -915,7 +936,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
   benchmark on the resolved MTPLX-MoE code; do not infer parity from the
   upstream result.
 
-- [ ] **Step 8: Verify the MTPLX-MoE port**
+- [x] **Step 8: Verify the MTPLX-MoE port**
 
   ```bash
   zsh -n scripts/start-laguna-s21.sh
@@ -933,7 +954,7 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
   Require the same Blackwellboy provenance note, launcher behavior, exact
   kernel self-check, scheduler reservation tests, and clean worktree.
 
-- [ ] **Step 9: Record both distributable commits**
+- [x] **Step 9: Record both distributable commits**
 
   Report:
 
@@ -946,6 +967,22 @@ launcher-only MTPLX-MoE port that lacks the accepted dual-lane implementation.
 
   Do not describe the feature as available out of the box until both remote
   code lines contain the verified commits.
+
+  Execution record:
+
+  - upstream launcher commit:
+    `2841e8dca0143ad9c4115d03cc7421981a872581`;
+  - MTPLX-MoE accepted port: `eafee91^..ac23489`, based on
+    `moe/main` at `1aefb69`;
+  - MTPLX-MoE verification: 10 launcher tests, 16 AR-batch tests, and
+    77 fixed-M2 tests passed; shell syntax, printed configuration,
+    `git diff --check`, and clean status passed;
+  - the one broader Laguna-model failure was reproduced unchanged on clean
+    `moe/main` at `generation.py:4237`, so it is a pre-existing base failure
+    rather than a port regression;
+  - no cherry-pick conflict touched a performance path, so the already recorded
+    upstream Metal self-check and promotion benchmark remain the relevant
+    hardware evidence.
 
 ## Task 8: Roll out and verify dual-lane serving
 
@@ -972,7 +1009,7 @@ log authorization values or prompt bodies.
 **Does not cover:** Editing Cline's live VS Code global state directly or
 deploying from a dirty checkout.
 
-- [ ] **Step 1: Capture rollback and pre-change service evidence**
+- [x] **Step 1: Capture rollback and pre-change service evidence**
 
   Record:
 
@@ -986,13 +1023,16 @@ deploying from a dirty checkout.
   Preserve the exact prior serial command and a copy of the scoped launch
   script diff as the rollback record.
 
-- [ ] **Step 2: Sync the verified repository launcher into the operational
-  path**
+- [x] **Step 2: Install the verified repository launcher as the operational
+  source**
 
   Use the `perf/laguna-batch-kernels` committed launcher as the source of
   truth. Preserve only local deployment values through its documented
   environment overrides; do not fork the scheduler/kernel configuration in
-  qwen36-server. Verify with:
+  qwen36-server. The executed rollout points the launchd plist directly at the
+  committed repository launcher instead of copying it into qwen36-server, so
+  the operational service cannot drift from the reviewed source. Verify the
+  qwen36-server launcher remains untouched with:
 
   ```bash
   git -C /Users/davidtai/projects/qwen36-server diff -- \
@@ -1029,7 +1069,7 @@ deploying from a dirty checkout.
   invent or change a production target. Abort if the clean-worktree preflight
   is not green.
 
-- [ ] **Step 5: Restart Laguna and prove construction-time installation**
+- [x] **Step 5: Restart Laguna and prove construction-time installation**
 
   ```bash
   launchctl kickstart -k gui/$(id -u)/com.tea.qwen
@@ -1046,7 +1086,7 @@ deploying from a dirty checkout.
   - 47 MoE router weights were validated and self-checked;
   - no construction error or fallback report is present.
 
-- [ ] **Step 6: Verify class reservation under saturation**
+- [x] **Step 6: Verify class reservation under saturation**
 
   With background backlog present, submit:
 
@@ -1068,7 +1108,7 @@ deploying from a dirty checkout.
   Exact pending counts may differ with concurrent production completions; the
   invariant is that neither active class count exceeds one.
 
-- [ ] **Step 7: Verify simultaneous B2 decode and live acceptance**
+- [x] **Step 7: Verify simultaneous B2 decode and live acceptance**
 
   Send one deterministic Cline-labelled prompt and one deterministic
   leaderboard-labelled prompt concurrently. Capture timestamps, class labels,
@@ -1081,10 +1121,12 @@ deploying from a dirty checkout.
   - the model reports a B2 decode cohort;
   - Cline joins without waiting for the running background decode to finish;
   - aggregate B2 decode throughput exceeds the unchanged B1 aggregate;
-  - token digests match the corresponding deterministic control;
+  - the promoted fixed-M2 route remains token-exact against the unchanged M=2
+    control, and identical deterministic prompts in the two owned rows produce
+    identical digests;
   - leaderboard saturation never occupies the Cline slot.
 
-- [ ] **Step 8: Run final verification and preserve rollback**
+- [x] **Step 8: Run final verification and preserve rollback**
 
   ```bash
   cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/laguna-perf
@@ -1104,6 +1146,48 @@ deploying from a dirty checkout.
   Keep the previous serial launch command available. If live acceptance fails,
   restore only the scoped launch-script lines and restart the service; do not
   revert unrelated repository state.
+
+### Rollout execution record
+
+Recorded 2026-07-27:
+
+- rollback plist:
+  `/Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist.pre-dual-lane-2026-07-27.bak`;
+- the canonical plist points at the committed
+  `scripts/start-laguna-s21.sh` with only `MTPLX_REPO_ROOT`, `MTPLX_PYTHON`,
+  and `MTPLX_LAGUNA_MODEL` as machine-local overrides;
+- startup installed `fixed_m2_router` after validating and self-checking all
+  47 MoE layers; the scheduler reported `ar_batch`, active limit two, decode
+  limit two, prefill chunk 1024, and wait zero;
+- saturation produced
+  `active_by_class={"cline":1,"background":1}` and
+  `pending_by_class={"cline":1,"background":2}`; an unlabelled request was
+  classified as background;
+- the exclusive guarded acceptance server on port 8081 recorded both timing
+  requests with `ar_batch_max_observed=2`, 75.709 aggregate tok/s versus
+  40.731 sequential tok/s (+85.876%), and exact identical-row digests;
+- a production-port timing attempt was rejected as contaminated after the
+  log and scheduler showed real 3.8k-5.6k-token leaderboard jobs occupying the
+  background lane. This directly confirms the original saturation diagnosis
+  and is why acceptance timing used the same launcher/model inside the
+  exclusive guarded window;
+- preserving each live cache-offset array by identity retained its dependency
+  chain and cut M=2 throughput. Upstream `da78ff8` and MTPLX-MoE `15027c2`
+  restore fresh per-row materialization while preserving `[row0,row1]`
+  positions; 156 Laguna model/fused tests and focused MoE tests pass;
+- upstream server verification passes apart from the two pre-existing
+  unknown-generated-tool fallback tests; the focused leaderboard test is 6/6
+  and the full Node 22 API suite is 707 passed, 2 skipped;
+- production port 8080 was restored after the guarded window and serves
+  `mtplx-laguna-s21-oq4e`.
+
+Manual/external blockers remain:
+
+- Cline must be configured by the operator with
+  `X-MTPLX-Client: cline`; live extension state was not edited directly.
+- The leaderboard deployment was not run because `DROPLET` is absent. The
+  clean deploy branch contains commit `bf2bc95`, but no production target was
+  invented.
 
 ## Final handoff evidence
 
