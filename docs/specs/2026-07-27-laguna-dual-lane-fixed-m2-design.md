@@ -53,7 +53,10 @@ This design delivers:
    pairs.
 6. A separately gated routed-expert coalescing experiment if the measured
    overlap supports it.
-7. Focused correctness, dispatch, microbenchmark, full-model, and live-serving
+7. A portable, repository-owned Laguna launcher in the upstream MTPLX Laguna
+   line and `mtplx-moe`, including the dual-lane configuration and operational
+   startup hardening.
+8. Focused correctness, dispatch, microbenchmark, full-model, and live-serving
    gates before deployment.
 
 ## Non-goals
@@ -153,6 +156,27 @@ At one active request, decode uses the installed B1 route. At two active
 requests, one model invocation consumes both rows and uses the installed M2
 route. Prefill remains chunked and may run at up to two rows through
 `BatchGenerator`.
+
+### 2a. Repository-owned launcher and provenance
+
+The working Laguna launch configuration is a product artifact, not
+machine-local state. A portable `scripts/start-laguna-s21.sh` is committed on
+both:
+
+- the upstream MTPLX Laguna development line descended from
+  `agent/laguna-support` / `upstream/pr-195`; and
+- the `OpenSourceWTF/mtplx-moe` line after the accepted scheduler and kernel
+  stack is ported there.
+
+The launcher derives the repository root from its own location, accepts model,
+Python, host, port, and memory-policy overrides through documented environment
+variables, and contains no `/Users/davidtai`, qwen36-server, or private
+worktree assumptions.
+
+The launcher and its documentation explicitly note that Blackwellboy's
+operational changes were applied to make the real Laguna serving path work
+correctly. The note preserves attribution without treating those operational
+changes as evidence for the new fixed-M2 kernel.
 
 ### 3. Fixed-M2 expert-axis router projection
 
@@ -402,6 +426,11 @@ The serving feature promotes only if:
 7. Retain the previous serial launch command as the rollback path.
 8. Run the routed-expert overlap probe and decide independently whether a
    coalescing kernel merits implementation and promotion.
+9. Commit the portable launcher and its tests on the upstream MTPLX Laguna
+   development branch.
+10. Port the accepted dual-lane commits and the same launcher to a clean
+    branch based on `mtplx-moe/main`, verify it there, and preserve both
+    repository copies as supported entrypoints.
 
 ## Acceptance criteria
 
@@ -414,3 +443,5 @@ The serving feature promotes only if:
 - The unchanged B2 benchmark is beaten by the defined promotion gate.
 - No production hot-path validation, fallback, or diagnostic counters are
   added.
+- The portable launcher, Blackwellboy provenance note, and launcher tests are
+  committed in both the upstream MTPLX Laguna line and `mtplx-moe`.
