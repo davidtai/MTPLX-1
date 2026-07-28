@@ -1,0 +1,3251 @@
+{
+  "background_words": 4096,
+  "base_url": "http://127.0.0.1:8081",
+  "chip": "Apple M5 Max",
+  "chunks": [
+    1024,
+    512,
+    256,
+    128,
+    1024
+  ],
+  "command": [
+    "scripts/bench_laguna_prefill_admission.py",
+    "--chunks",
+    "1024",
+    "512",
+    "256",
+    "128",
+    "1024",
+    "--trials",
+    "5",
+    "--port",
+    "8081",
+    "--model",
+    "/Users/davidtai/.mtplx/models/mlx-community--Laguna-S-2.1-oQ4e",
+    "--output",
+    "benchmarks/results/laguna-prefill-admission-m5max-2026-07-27.json"
+  ],
+  "created_at": "2026-07-27T19:42:32.741-05:00",
+  "git_commit": "f90c7a6665be3719e69ec1e83f277e7bf2c4dd2c",
+  "machine": "Mac17,6",
+  "model": "mtplx-laguna-s21-oq4e",
+  "rows": [
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 35.95055615688662,
+      "background_prefill_tok_s": 935.0465276761464,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 21.575382757328377,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.459671124990564,
+        "prompt_prefill_tok_s": 935.0465276761464,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 1.3798548750055488,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.973599666991504,
+        "ttft_server_s": 5.894778792018769,
+        "wall_s": 16.36246391700115
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 0,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:36:23.888-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 0,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6161971249966882,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 14.375173399558246,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.5603415410150774,
+        "prompt_prefill_tok_s": 23.434373515735054,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6161971249966882,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.338031333027175,
+        "ttft_server_s": 4.009599832992535,
+        "wall_s": 14.91464016601094
+      },
+      "cline_time_to_active_s": 0.6423195829847828,
+      "cline_ttft_client_s": 4.338031333027175,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:36:38.169-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:36:21.798-05:00",
+      "trial": 0
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 37.21820473266978,
+      "background_prefill_tok_s": 886.0772639733171,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 23.3767945630209,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.706135874992469,
+        "prompt_prefill_tok_s": 886.0772639733171,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.29910987499170005,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.1442787909763865,
+        "ttft_server_s": 5.062059832998784,
+        "wall_s": 15.695459790993482
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:36:39.186-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6221100830007344,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 13.841410169648883,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.675108666997403,
+        "prompt_prefill_tok_s": 22.428995405014795,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6221100830007344,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.581532874988625,
+        "ttft_server_s": 4.226168583001709,
+        "wall_s": 15.327355207991786
+      },
+      "cline_time_to_active_s": 0.6478046659904066,
+      "cline_ttft_client_s": 4.581532874988625,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:36:53.873-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:36:38.169-05:00",
+      "trial": 1
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 37.514602731626425,
+      "background_prefill_tok_s": 858.3745245438639,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 23.63084793965609,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.858019292005338,
+        "prompt_prefill_tok_s": 858.3745245438639,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.3121856669895351,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.311204707977595,
+        "ttft_server_s": 5.225525459012715,
+        "wall_s": 15.734077957982663
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:36:54.953-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6590426250186283,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 13.88375479197034,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.8016829589905683,
+        "prompt_prefill_tok_s": 21.415699377212075,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6590426250186283,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.730291375017259,
+        "ttft_server_s": 4.391163084015716,
+        "wall_s": 15.343404292012565
+      },
+      "cline_time_to_active_s": 0.6879337079881225,
+      "cline_ttft_client_s": 4.730291375017259,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:37:09.616-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:36:53.873-05:00",
+      "trial": 2
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 37.00341184521184,
+      "background_prefill_tok_s": 817.9505157381307,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 23.42516368670241,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.098107917001471,
+        "prompt_prefill_tok_s": 817.9505157381307,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.34132425001007505,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.5820138749841135,
+        "ttft_server_s": 5.494698583002901,
+        "wall_s": 16.071014374989318
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:37:10.783-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.7129545829957351,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 13.578248158509439,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.9520078339846805,
+        "prompt_prefill_tok_s": 20.32514931337793,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.7129545829957351,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.970673167001223,
+        "ttft_server_s": 4.626691041979939,
+        "wall_s": 15.649605459009763
+      },
+      "cline_time_to_active_s": 0.7447910409828182,
+      "cline_ttft_client_s": 4.970673167001223,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:37:25.696-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:37:09.616-05:00",
+      "trial": 3
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 37.86672393119377,
+      "background_prefill_tok_s": 857.1359785617157,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.16489843580686,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.865039041993441,
+        "prompt_prefill_tok_s": 857.1359785617157,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.00018195802113041282,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.98876070897677,
+        "ttft_server_s": 4.921324666007422,
+        "wall_s": 15.48268183399341
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:37:26.452-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.678093833004823,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 13.701825495386906,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.7894180830044206,
+        "prompt_prefill_tok_s": 21.509862707771408,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.678093833004823,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.74061166701722,
+        "ttft_server_s": 4.391788915992947,
+        "wall_s": 15.427097375009907
+      },
+      "cline_time_to_active_s": 0.6979560419858899,
+      "cline_ttft_client_s": 4.74061166701722,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:37:41.192-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:37:25.696-05:00",
+      "trial": 4
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 32.172356431906024,
+      "background_prefill_tok_s": 825.1713542109113,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 70,
+        "content_sha256": "1c936354085ca5146821fe04fc449719d4b412b498fd717666dcc667ee1793b8",
+        "decode_tok_s": 21.193806231103967,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.053495832980843,
+        "prompt_prefill_tok_s": 825.1713542109113,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.31608150000101887,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.549722625000868,
+        "ttft_server_s": 5.426215832994785,
+        "wall_s": 8.392602709005587
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:37:42.079-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.4658897499903105,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 10.97855020080206,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 1.6286809170269407,
+        "prompt_prefill_tok_s": 36.8396285440161,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.4658897499903105,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 3.0892149999854155,
+        "ttft_server_s": 2.586096874991199,
+        "wall_s": 8.005332458007615
+      },
+      "cline_time_to_active_s": 0.4906780410092324,
+      "cline_ttft_client_s": 3.0892149999854155,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:37:49.600-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 512,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:37:41.198-05:00",
+      "trial": 0
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 33.825635891970315,
+      "background_prefill_tok_s": 822.3459529520777,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 70,
+        "content_sha256": "1c936354085ca5146821fe04fc449719d4b412b498fd717666dcc667ee1793b8",
+        "decode_tok_s": 22.97712283509524,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.070858541992493,
+        "prompt_prefill_tok_s": 822.3459529520777,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.00016008300008252263,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.236382750008488,
+        "ttft_server_s": 5.126796708005713,
+        "wall_s": 8.140227666997816
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:37:50.155-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.4621571669995319,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 10.848513056875074,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 1.6300039159832522,
+        "prompt_prefill_tok_s": 36.809727517621795,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.4621571669995319,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 3.0889061659981962,
+        "ttft_server_s": 2.5832507079758216,
+        "wall_s": 8.08583912497852
+      },
+      "cline_time_to_active_s": 0.49777937500039116,
+      "cline_ttft_client_s": 3.0889061659981962,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:37:57.751-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 512,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:37:49.601-05:00",
+      "trial": 1
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 31.51229377786243,
+      "background_prefill_tok_s": 789.3649261044309,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 70,
+        "content_sha256": "1c936354085ca5146821fe04fc449719d4b412b498fd717666dcc667ee1793b8",
+        "decode_tok_s": 20.799548768572656,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.282727749989135,
+        "prompt_prefill_tok_s": 789.3649261044309,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.31151033300557174,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.783443708001869,
+        "ttft_server_s": 5.651480291009648,
+        "wall_s": 8.690788624982815
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:37:58.610-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.43829816702054814,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 10.712745009289772,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 1.769188749982277,
+        "prompt_prefill_tok_s": 33.91384893251274,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.43829816702054814,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 3.2439146250253543,
+        "ttft_server_s": 2.7287766250083223,
+        "wall_s": 8.30130545902648
+      },
+      "cline_time_to_active_s": 0.46705837501212955,
+      "cline_ttft_client_s": 3.2439146250253543,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:38:06.452-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 512,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:37:57.751-05:00",
+      "trial": 2
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 31.613740541655794,
+      "background_prefill_tok_s": 781.7168794400146,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 70,
+        "content_sha256": "1c936354085ca5146821fe04fc449719d4b412b498fd717666dcc667ee1793b8",
+        "decode_tok_s": 21.066028045998696,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.3344121249974705,
+        "prompt_prefill_tok_s": 781.7168794400146,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.31604974999208935,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.836933583021164,
+        "ttft_server_s": 5.707030165998731,
+        "wall_s": 8.699552041012794
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:38:07.358-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.4850340829871129,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 10.5477124956571,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 1.690008833014872,
+        "prompt_prefill_tok_s": 35.50277301980942,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.4850340829871129,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 3.270062666008016,
+        "ttft_server_s": 2.7025784160068724,
+        "wall_s": 8.307959625002695
+      },
+      "cline_time_to_active_s": 0.5122706659894902,
+      "cline_ttft_client_s": 3.270062666008016,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:38:15.161-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 512,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:38:06.452-05:00",
+      "trial": 3
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 34.50817391859196,
+      "background_prefill_tok_s": 823.497490493692,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 70,
+        "content_sha256": "1c936354085ca5146821fe04fc449719d4b412b498fd717666dcc667ee1793b8",
+        "decode_tok_s": 23.494491511294406,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.063767708023079,
+        "prompt_prefill_tok_s": 823.497490493692,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.0012434999807737768,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.24277929100208,
+        "ttft_server_s": 5.120672332996037,
+        "wall_s": 8.07858120801393
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:38:15.708-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 512,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.450440290995175,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 11.013682407297553,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 1.6504935420234688,
+        "prompt_prefill_tok_s": 36.35276265694522,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.450440290995175,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 3.1031855840119533,
+        "ttft_server_s": 2.5973757909960113,
+        "wall_s": 8.009337041992694
+      },
+      "cline_time_to_active_s": 0.4748540409782436,
+      "cline_ttft_client_s": 3.1031855840119533,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:38:23.249-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 512,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:38:15.161-05:00",
+      "trial": 4
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 33.88373873075544,
+      "background_prefill_tok_s": 724.7824167307825,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.413810270196652,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.753450833988609,
+        "prompt_prefill_tok_s": 724.7824167307825,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.0010769579967018217,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.887545792007586,
+        "ttft_server_s": 5.810515707999002,
+        "wall_s": 16.27351929200813
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:38:23.705-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.3574535000079777,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 9.469928460558783,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 1.0311841669899877,
+        "prompt_prefill_tok_s": 58.18553263394178,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.3574535000079777,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 2.009428499994101,
+        "ttft_server_s": 1.6946718340041116,
+        "wall_s": 16.2074053339893
+      },
+      "cline_time_to_active_s": 0.3804842079989612,
+      "cline_ttft_client_s": 2.009428499994101,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:38:39.540-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 256,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:38:23.256-05:00",
+      "trial": 0
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 34.09790825895688,
+      "background_prefill_tok_s": 751.5752666132489,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.429176447727027,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.548346499999752,
+        "prompt_prefill_tok_s": 751.5752666132489,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.001404417009325698,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.687055624992354,
+        "ttft_server_s": 5.605193083989434,
+        "wall_s": 16.06596241699299
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:38:39.992-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.35042008399614133,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 9.668731811229854,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.9755253750190604,
+        "prompt_prefill_tok_s": 61.5053196323342,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.35042008399614133,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.9332026669871993,
+        "ttft_server_s": 1.62218100001337,
+        "wall_s": 15.993994249991374
+      },
+      "cline_time_to_active_s": 0.378401166992262,
+      "cline_ttft_client_s": 1.9332026669871993,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:38:55.616-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 256,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:38:39.540-05:00",
+      "trial": 1
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 34.25502947017279,
+      "background_prefill_tok_s": 756.2092234591919,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.51552852803552,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.514346917014336,
+        "prompt_prefill_tok_s": 756.2092234591919,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.0012258749920874834,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.6504613750148565,
+        "ttft_server_s": 5.571299957984593,
+        "wall_s": 15.993070916010765
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:38:56.059-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.3509889999986626,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 9.739500942137274,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.9671438749937806,
+        "prompt_prefill_tok_s": 62.03833943567687,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.3509889999986626,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.9127776249952149,
+        "ttft_server_s": 1.611153874982847,
+        "wall_s": 15.923560165974777
+      },
+      "cline_time_to_active_s": 0.372166000015568,
+      "cline_ttft_client_s": 1.9127776249952149,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:39:11.619-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 256,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:38:55.616-05:00",
+      "trial": 2
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 33.8783674556682,
+      "background_prefill_tok_s": 749.0460720427269,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.283928930990676,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.567080792010529,
+        "prompt_prefill_tok_s": 749.0460720427269,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.0013536250044126064,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.706370667001465,
+        "ttft_server_s": 5.62476587499259,
+        "wall_s": 16.14660854198155
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:39:12.069-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.34860083300736733,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 9.594438524677518,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.974901041976409,
+        "prompt_prefill_tok_s": 61.54470804376461,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.34860083300736733,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.9280328750028275,
+        "ttft_server_s": 1.6181691660021897,
+        "wall_s": 16.074335916986456
+      },
+      "cline_time_to_active_s": 0.37542054199730046,
+      "cline_ttft_client_s": 1.9280328750028275,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:39:27.816-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 256,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:39:11.619-05:00",
+      "trial": 3
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 33.429494839058975,
+      "background_prefill_tok_s": 747.4164338463378,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 23.848682809899625,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 5.579219041974284,
+        "prompt_prefill_tok_s": 747.4164338463378,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.2804971250006929,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.9849092090153135,
+        "ttft_server_s": 5.915837333974196,
+        "wall_s": 16.338620875001652
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:39:28.533-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 256,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.3496145830140449,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 9.580812029159347,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.9679042919888161,
+        "prompt_prefill_tok_s": 61.98960010469019,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.3496145830140449,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.9152802499884274,
+        "ttft_server_s": 1.6115639999916311,
+        "wall_s": 15.999459624988958
+      },
+      "cline_time_to_active_s": 0.3747251659806352,
+      "cline_ttft_client_s": 1.9152802499884274,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:39:44.166-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 256,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:39:27.816-05:00",
+      "trial": 4
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 31.474781069210696,
+      "background_prefill_tok_s": 549.4002862804037,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "c8867810f578eb24aa1b2657d29549b19cecd5032ed296bc901e1a366017a080",
+        "decode_tok_s": 23.676859060708157,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 7.590094334009336,
+        "prompt_prefill_tok_s": 549.4002862804037,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.3090154999808874,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 8.035749709000811,
+        "ttft_server_s": 7.95572237498709,
+        "wall_s": 18.43868433398893
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:39:44.868-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.2770228750014212,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 7.79792200850254,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.7343906250025611,
+        "prompt_prefill_tok_s": 81.70038935313309,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.2770228750014212,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.4972567499789875,
+        "ttft_server_s": 1.2527904590242542,
+        "wall_s": 18.04747087499709
+      },
+      "cline_time_to_active_s": 0.30047612500493415,
+      "cline_ttft_client_s": 1.4972567499789875,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:40:02.624-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 128,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:39:44.174-05:00",
+      "trial": 0
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 32.2366008373878,
+      "background_prefill_tok_s": 548.6879286095657,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "c8867810f578eb24aa1b2657d29549b19cecd5032ed296bc901e1a366017a080",
+        "decode_tok_s": 24.459615767830996,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 7.599948499992024,
+        "prompt_prefill_tok_s": 548.6879286095657,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.001013208006042987,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 7.734197999991011,
+        "ttft_server_s": 7.657524458016269,
+        "wall_s": 18.0992021659913
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:40:03.017-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.29871916701085865,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 7.776985069556799,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.7383109579968732,
+        "prompt_prefill_tok_s": 81.26657115152028,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.29871916701085865,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.5289544999832287,
+        "ttft_server_s": 1.279339250002522,
+        "wall_s": 18.03259566699853
+      },
+      "cline_time_to_active_s": 0.3236735830141697,
+      "cline_ttft_client_s": 1.5289544999832287,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:40:20.734-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 128,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:40:02.624-05:00",
+      "trial": 1
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 32.10604508826839,
+      "background_prefill_tok_s": 547.6252282075096,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "c8867810f578eb24aa1b2657d29549b19cecd5032ed296bc901e1a366017a080",
+        "decode_tok_s": 24.351335166939794,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 7.614696667005774,
+        "prompt_prefill_tok_s": 547.6252282075096,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.00021308299619704485,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 7.741505290992791,
+        "ttft_server_s": 7.673085542017361,
+        "wall_s": 18.1519382080005
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:40:21.120-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.30223554201074876,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 7.754709921328592,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.7459187080094125,
+        "prompt_prefill_tok_s": 80.43771976187368,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.30223554201074876,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.53854824998416,
+        "ttft_server_s": 1.2909050000016578,
+        "wall_s": 18.09503012499772
+      },
+      "cline_time_to_active_s": 0.32708675001049414,
+      "cline_ttft_client_s": 1.53854824998416,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:40:38.939-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 128,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:40:20.734-05:00",
+      "trial": 2
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 31.665913519368505,
+      "background_prefill_tok_s": 552.0426424972276,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "c8867810f578eb24aa1b2657d29549b19cecd5032ed296bc901e1a366017a080",
+        "decode_tok_s": 23.827076016680202,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 7.553764290991239,
+        "prompt_prefill_tok_s": 552.0426424972276,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.28264633400249295,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 7.960306249995483,
+        "ttft_server_s": 7.892134374997113,
+        "wall_s": 18.32284329200047
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:40:39.598-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.29279391598538496,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 7.838837502688302,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.7399328750034329,
+        "prompt_prefill_tok_s": 81.08843656895449,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.29279391598538496,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.518832667003153,
+        "ttft_server_s": 1.2743394160061143,
+        "wall_s": 17.983261833025608
+      },
+      "cline_time_to_active_s": 0.3156404160254169,
+      "cline_ttft_client_s": 1.518832667003153,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:40:57.273-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 128,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:40:38.939-05:00",
+      "trial": 3
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 32.283233392130526,
+      "background_prefill_tok_s": 552.7219961974728,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "c8867810f578eb24aa1b2657d29549b19cecd5032ed296bc901e1a366017a080",
+        "decode_tok_s": 24.440978551373515,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 7.544479917007266,
+        "prompt_prefill_tok_s": 552.7219961974728,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.001349792000837624,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 7.682355582976015,
+        "ttft_server_s": 7.6012126250134315,
+        "wall_s": 18.05678433299181
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:40:57.672-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 128,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.2987914169789292,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 7.842254840757013,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 0.741415541007882,
+        "prompt_prefill_tok_s": 80.92627775030971,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.2987914169789292,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 1.5271295419952367,
+        "ttft_server_s": 1.2795619169774,
+        "wall_s": 17.984743999986676
+      },
+      "cline_time_to_active_s": 0.3240865000116173,
+      "cline_ttft_client_s": 1.5271295419952367,
+      "digest_parity": false,
+      "error": null,
+      "finished_at": "2026-07-27T19:41:15.385-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 128,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:40:57.273-05:00",
+      "trial": 4
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 36.51260549947841,
+      "background_prefill_tok_s": 896.3418853473437,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 22.30555956262324,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.652242708019912,
+        "prompt_prefill_tok_s": 896.3418853473437,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 1.045093207998434,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 5.824788833997445,
+        "ttft_server_s": 5.752693749993341,
+        "wall_s": 16.158510834007757
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:41:17.527-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6305369590118062,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 14.207045936855168,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.6755890409986023,
+        "prompt_prefill_tok_s": 22.42496851370208,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6305369590118062,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.52463895798428,
+        "ttft_server_s": 4.182501500006765,
+        "wall_s": 15.050214457995025
+      },
+      "cline_time_to_active_s": 0.6577506669855211,
+      "cline_ttft_client_s": 4.52463895798428,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:41:31.927-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:41:15.732-05:00",
+      "trial": 0
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 38.38590894995388,
+      "background_prefill_tok_s": 904.8783847767083,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.292111887081006,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.60835408398998,
+        "prompt_prefill_tok_s": 904.8783847767083,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.00015874998643994331,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.73143000001437,
+        "ttft_server_s": 4.664227499975823,
+        "wall_s": 15.170649333012989
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:41:32.640-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6315000419854186,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 14.093797062872872,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.634784249996301,
+        "prompt_prefill_tok_s": 22.772263042062832,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6315000419854186,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.485528958000941,
+        "ttft_server_s": 4.146252124977764,
+        "wall_s": 15.115119791997131
+      },
+      "cline_time_to_active_s": 0.6545257089892402,
+      "cline_ttft_client_s": 4.485528958000941,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:41:47.109-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:41:31.927-05:00",
+      "trial": 1
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 38.72450466024475,
+      "background_prefill_tok_s": 897.2370826026632,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.556209463167914,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.647601041971939,
+        "prompt_prefill_tok_s": 897.2370826026632,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.0031585830147378147,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.7944329580059275,
+        "ttft_server_s": 4.706270082999254,
+        "wall_s": 15.117621250014054
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:41:47.862-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6331597089883871,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 14.168295197076835,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.659354625007836,
+        "prompt_prefill_tok_s": 22.561864986255152,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6331597089883871,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.522658000001684,
+        "ttft_server_s": 4.180328999995254,
+        "wall_s": 15.037445333000505
+      },
+      "cline_time_to_active_s": 0.6703402909915894,
+      "cline_ttft_client_s": 4.522658000001684,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:42:02.237-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:41:47.109-05:00",
+      "trial": 2
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 38.25408008739145,
+      "background_prefill_tok_s": 865.8955212980178,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.363797172374344,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.815823499986436,
+        "prompt_prefill_tok_s": 865.8955212980178,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 0.00014645900228060782,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.950503291009227,
+        "ttft_server_s": 4.8715364589879755,
+        "wall_s": 15.359153249999508
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:42:02.963-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6328682500170544,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 13.890282915017108,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.765731166000478,
+        "prompt_prefill_tok_s": 21.694082468169153,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6328682500170544,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.692202500009444,
+        "ttft_server_s": 4.363535125012277,
+        "wall_s": 15.291491332987789
+      },
+      "cline_time_to_active_s": 0.6558902499964461,
+      "cline_ttft_client_s": 4.692202500009444,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:42:17.607-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:42:02.237-05:00",
+      "trial": 3
+    },
+    {
+      "after": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "aggregate_decode_tok_s": 38.64949122523069,
+      "background_prefill_tok_s": 900.9106408642955,
+      "background_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "opensource-leaderboard",
+        "completion_tokens": 256,
+        "content_sha256": "cc57d68d93d67be2eea8677d08b70eeb89986eda701ab9937b3c6264d5485137",
+        "decode_tok_s": 24.474806953479433,
+        "http_status": 200,
+        "new_prefill_tokens": 4170,
+        "prompt_eval_time_s": 4.628649958001915,
+        "prompt_prefill_tok_s": 900.9106408642955,
+        "prompt_tokens": 4170,
+        "queue_wait_s": 7.320800796151161e-05,
+        "request_client_hint": "opensource-leaderboard",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.762362250010483,
+        "ttft_server_s": 4.684085125016281,
+        "wall_s": 15.123825457994826
+      },
+      "before": {
+        "active": 0,
+        "active_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": false
+      },
+      "both_active_snapshot": {
+        "active": 2,
+        "active_by_class": {
+          "background": 1,
+          "cline": 1
+        },
+        "at": "2026-07-27T19:42:18.337-05:00",
+        "config": {
+          "batch_wait_ms": 0.0,
+          "decode_batch_max": 2,
+          "experimental_mtp_cohorts": false,
+          "max_active_requests": 2,
+          "mode": "ar_batch",
+          "prefill_chunk_tokens": 1024,
+          "preset": "latency"
+        },
+        "last_batch_size": 1,
+        "last_error": null,
+        "pending": 0,
+        "pending_by_class": {
+          "background": 0,
+          "cline": 0
+        },
+        "pump_scheduled": true
+      },
+      "both_observed_m2": true,
+      "cline_queue_wait_s": 0.6355519579956308,
+      "cline_result": {
+        "ar_batch_max_observed": 2,
+        "cached_tokens": 0,
+        "client_header": "cline",
+        "completion_tokens": 64,
+        "content_sha256": "711e13c2e647ccfeb84cbdacf6f9d653a7875d2e8412ba0ef96528d88487dc7b",
+        "decode_tok_s": 14.174684271751254,
+        "http_status": 200,
+        "new_prefill_tokens": 60,
+        "prompt_eval_time_s": 2.6568300839862786,
+        "prompt_prefill_tok_s": 22.5833034493409,
+        "prompt_tokens": 60,
+        "queue_wait_s": 0.6355519579956308,
+        "request_client_hint": "cline",
+        "scheduler_lane": "ar_batch",
+        "ttft_client_s": 4.503535458003171,
+        "ttft_server_s": 4.168264707986964,
+        "wall_s": 15.056320917006815
+      },
+      "cline_time_to_active_s": 0.6600247920141555,
+      "cline_ttft_client_s": 4.503535458003171,
+      "digest_parity": true,
+      "error": null,
+      "finished_at": "2026-07-27T19:42:32.741-05:00",
+      "healthy_after": true,
+      "prefill_chunk_tokens": 1024,
+      "simultaneous_class_slots": true,
+      "started_at": "2026-07-27T19:42:17.607-05:00",
+      "trial": 4
+    }
+  ],
+  "schema_version": 1,
+  "selected_candidate": null,
+  "summary": {
+    "1024": {
+      "aggregate_decode_median_tok_s": 37.69066333141009,
+      "all_receipts_valid": true,
+      "background_prefill_median_tok_s": 891.2095746603304,
+      "cline_queue_p95_s": 0.7129545829957351,
+      "cline_time_to_active_p95_s": 0.7447910409828182,
+      "cline_ttft_median_s": 4.553085916486452,
+      "trial_count": 10
+    },
+    "128": {
+      "aggregate_decode_median_tok_s": 32.10604508826839,
+      "all_receipts_valid": false,
+      "background_prefill_median_tok_s": 549.4002862804037,
+      "cline_queue_p95_s": 0.30223554201074876,
+      "cline_time_to_active_p95_s": 0.32708675001049414,
+      "cline_ttft_median_s": 1.5271295419952367,
+      "trial_count": 5
+    },
+    "256": {
+      "aggregate_decode_median_tok_s": 33.88373873075544,
+      "all_receipts_valid": true,
+      "background_prefill_median_tok_s": 749.0460720427269,
+      "cline_queue_p95_s": 0.3574535000079777,
+      "cline_time_to_active_p95_s": 0.3804842079989612,
+      "cline_ttft_median_s": 1.9280328750028275,
+      "trial_count": 5
+    },
+    "512": {
+      "aggregate_decode_median_tok_s": 32.172356431906024,
+      "all_receipts_valid": false,
+      "background_prefill_median_tok_s": 822.3459529520777,
+      "cline_queue_p95_s": 0.4850340829871129,
+      "cline_time_to_active_p95_s": 0.5122706659894902,
+      "cline_ttft_median_s": 3.1031855840119533,
+      "trial_count": 5
+    }
+  },
+  "trials": 5
+}
