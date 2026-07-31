@@ -13,6 +13,7 @@ with `evalplus.evaluate` (base + plus pass@1). Rates are server-reported
 |---|---|---|---|---|---|
 | A3B 35B bf16 (reference) | 91.5 / 88.4 | 89.7 / 75.9 | 62 | 55.1 | 3177 |
 | A3B 35B 6-bit "Balance" | 91.5 / 89.0 | 90.5 / 76.5 | 106–115 | 82.5–104 | 3070 |
+| A3B 35B 4-bit "Speed" | 91.5 / 87.2 | 91.8 / 77.8 | 111.6–112.0 | 99.7 | 3319 |
 | 27B bf16 (reference) | 93.9 / 90.2 | 92.1 / 77.8 | 9.8 | 9.0 | 846 |
 | 27B 8-bit "Quality" | 93.3 / 90.9 | 89.9 / 75.7 | 36.8 | 58.2 | 724 |
 | 27B 4-bit "Speed" | 92.7 / 90.9 | 90.5 / 76.2 | ~36–50 | 64.7 | 734 |
@@ -24,6 +25,12 @@ bf16 releases as references.
 
 ## Verdicts
 
+- **A3B 4-bit is the family's first real degradation step — but a trade, not a
+  broad loss.** HumanEval+ drops to 87.2 (worst in the A3B family; 6-bit 89.0,
+  bf16 88.4) while MBPP+ rises to 77.8 (best in the family) with the matrix's
+  highest prefill (3319 tok/s). 6-bit stays the default for HumanEval-shaped
+  work; ~3 pt below the community Q4_K_M leaderboard HE+ reference (90.2),
+  attributable to quant-recipe difference rather than harness difference.
 - **The A3B 6-bit quantization is free.** It scores at or above its own bf16
   reference on all four tiers (differences within 1–2 problems), decodes 1.7×
   faster, and matches bf16 prefill. There is no measured quality reason to
