@@ -106,15 +106,15 @@ def test_cutover_requires_receipts_lock_identity_and_explicit_promotion() -> Non
         "assert_candidate_receipt",
         "assert_live_identity",
         "/v1/models",
-            "finish_reason",
-            "SENSITIVE_KEY",
-            "finally:",
-            "_bootstrap(prior_snapshot.path)",
+        "finish_reason",
+        "SENSITIVE_KEY",
+        "finally:",
+        "_bootstrap(prior_snapshot.path)",
         "candidate_model_ids",
         "attest_process_identity",
     ):
         assert required in source
-    bootstrap = source.index("_bootstrap(target_snapshot.source_path)")
+    bootstrap = source.index("_bootstrap(target_snapshot.path)")
     new_identity = source.index("_wait_for_process_identity(", bootstrap)
     readiness = source.index("_verify_live_ready(", new_identity)
     assert bootstrap < new_identity < readiness
@@ -156,19 +156,43 @@ def test_process_attestation_rejects_plist_not_loaded_by_launchd(monkeypatch, tm
         promote_cutover.attest_process_identity(label="com.tea.qwen", plist=plist)
 
 
-def test_prior_plist_snapshot_detects_replacement_and_preserves_rollback_bytes(tmp_path) -> None:
+def test_prior_plist_snapshot_is_durable_reignorable_and_safely_cleaned(
+    monkeypatch, tmp_path
+) -> None:
+    import promote_cutover
     from promote_cutover import PromotionError, plist_snapshot
 
     prior = tmp_path / "prior.plist"
     original = plistlib.dumps(
-        {"Label": "com.tea.qwen", "ProgramArguments": ["/bin/false"]}
+        {
+            "Label": "com.tea.qwen",
+            "ProgramArguments": ["/bin/false"],
+            "EnvironmentVariables": {"SAFE": "reviewed"},
+            "KeepAlive": True,
+            "StandardOutPath": "/tmp/reviewed.out",
+            "StandardErrorPath": "/tmp/reviewed.err",
+        }
     )
     prior.write_bytes(original)
     with plist_snapshot(prior) as snapshot:
+        snapshot_path = snapshot.path
+        assert snapshot_path.stat().st_dev == prior.stat().st_dev
+        assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o400
+        assert snapshot_path.stat().st_uid == os.getuid()
+        assert not snapshot_path.is_symlink()
+        assert stat.S_IMODE(snapshot_path.parent.stat().st_mode) == 0o700
+        snapshot.assert_source_unchanged()
         replacement = tmp_path / "attacker.plist"
         replacement.write_bytes(
             plistlib.dumps(
-                {"Label": "com.tea.qwen", "ProgramArguments": ["/bin/true"]}
+                {
+                    "Label": "com.tea.qwen",
+                    "ProgramArguments": ["/bin/false"],
+                    "EnvironmentVariables": {"SAFE": "attacker"},
+                    "KeepAlive": False,
+                    "StandardOutPath": "/tmp/attacker.out",
+                    "StandardErrorPath": "/tmp/attacker.err",
+                }
             )
         )
         os.replace(replacement, prior)
@@ -176,6 +200,81 @@ def test_prior_plist_snapshot_detects_replacement_and_preserves_rollback_bytes(t
             snapshot.assert_source_unchanged()
         snapshot.assert_snapshot_intact()
         assert snapshot.path.read_bytes() == original
+
+    assert snapshot_path.is_file()
+
+    def fake_command(*argv: str) -> str:
+        if argv[0] == "/bin/launchctl":
+            return f"""gui/501/com.tea.qwen = {{
+\tpath = {snapshot_path}
+\tprogram = /bin/false
+\targuments = {{
+\t\t/bin/false
+\t}}
+\tpid = 4242
+}}"""
+        return "p4242\n"
+
+    monkeypatch.setattr(promote_cutover, "_command", fake_command)
+    repeated = promote_cutover.attest_process_identity(
+        label="com.tea.qwen", plist=snapshot_path
+    )
+    assert repeated["plist_sha256"] == hashlib.sha256(original).hexdigest()
+    monkeypatch.setattr(
+        promote_cutover,
+        "_launchctl_job_if_loaded",
+        lambda _label: {"path": snapshot_path},
+    )
+    with pytest.raises(PromotionError, match="still loaded"):
+        snapshot.cleanup_if_unloaded()
+    monkeypatch.setattr(
+        promote_cutover, "_launchctl_job_if_loaded", lambda _label: None
+    )
+    snapshot.cleanup_if_unloaded()
+    assert not snapshot_path.exists()
+
+
+def test_snapshot_cleanup_distinguishes_absent_job_from_probe_failure(
+    monkeypatch, tmp_path
+) -> None:
+    import promote_cutover
+
+    plist = tmp_path / "prior.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.tea.qwen",
+                "ProgramArguments": ["/bin/false"],
+            }
+        )
+    )
+    with promote_cutover.plist_snapshot(plist) as snapshot:
+        snapshot_path = snapshot.path
+
+    monkeypatch.setattr(
+        promote_cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=70,
+            stdout="",
+            stderr="launchd transport failure",
+        ),
+    )
+    with pytest.raises(promote_cutover.PromotionError, match="safely determine"):
+        snapshot.cleanup_if_unloaded()
+    assert snapshot_path.is_file()
+
+    monkeypatch.setattr(
+        promote_cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=113,
+            stdout="",
+            stderr='Could not find service "com.tea.qwen" in domain for user gui: 501',
+        ),
+    )
+    snapshot.cleanup_if_unloaded()
+    assert not snapshot_path.exists()
 
 
 def test_launcher_invokes_exact_reviewed_artifact_validator() -> None:

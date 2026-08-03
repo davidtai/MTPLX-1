@@ -54,6 +54,7 @@ SIGNING_NAMESPACE = "mtplx-deepseek-v4-0731"
 ALLOWED_CANDIDATE_MODEL_IDS = frozenset({"deepseek-v4-0731-candidate"})
 ALLOWED_PRIOR_MODEL_IDS = ("mtplx-qwen36-27b-optimized-quality",)
 ALLOWED_LAUNCHD_LABELS = frozenset({PRIOR_LIVE_LABEL, PRODUCTION_LABEL})
+SNAPSHOT_DIR_NAME = ".mtplx-dsv4-0731-snapshots"
 CANDIDATE_WORKTREE = Path("/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service")
 REVIEWED_REF = "refs/tags/mtplx-dsv4-0731-reviewed"
 CANDIDATE_PLIST_SHA256 = "93eac0d4eaac491c7f2f1d3a293ba38a3144ade59ee3afdf52b35cc9ec9bb101"
@@ -87,9 +88,25 @@ class PlistSnapshot:
             raise PromotionError("source plist changed since snapshot")
 
     def assert_snapshot_intact(self) -> None:
-        raw, _metadata = _read_regular_file(self.path, "rollback plist snapshot")
-        if raw != self.raw or hashlib.sha256(raw).hexdigest() != self.sha256:
+        _assert_snapshot_directory(self.path.parent, source_device=self.source_device)
+        raw, metadata = _read_regular_file(self.path, "durable plist snapshot")
+        if (
+            raw != self.raw
+            or hashlib.sha256(raw).hexdigest() != self.sha256
+            or metadata.st_dev != self.source_device
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+        ):
             raise PromotionError("rollback plist snapshot changed")
+
+    def cleanup_if_unloaded(self) -> None:
+        """Remove this snapshot only after launchd no longer references it."""
+        job = _launchctl_job_if_loaded(self.label)
+        if job is not None and job["path"] == self.path:
+            raise PromotionError("durable plist snapshot is still loaded")
+        self.assert_snapshot_intact()
+        self.path.unlink()
+        _fsync_directory(self.path.parent)
 
 
 def _read_regular_file(path: Path, context: str) -> tuple[bytes, os.stat_result]:
@@ -130,40 +147,116 @@ def _parse_plist_identity(raw: bytes) -> tuple[str, tuple[str, ...]]:
     return str(label), tuple(arguments)
 
 
-@contextmanager
-def plist_snapshot(source: Path) -> Iterator[PlistSnapshot]:
-    """Hold exact descriptor-read plist bytes for identity and rollback."""
-    source = Path(os.path.abspath(source))
-    raw, metadata = _read_regular_file(source, "source plist")
-    label, program_arguments = _parse_plist_identity(raw)
-    fd, name = tempfile.mkstemp(prefix="mtplx-dsv4-0731-plist-", suffix=".snapshot")
-    snapshot_path = Path(name)
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise PromotionError("snapshot directory is missing or unsafe") from error
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _assert_snapshot_directory(path: Path, *, source_device: int) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise PromotionError("snapshot directory is missing or unsafe") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or path.is_symlink()
+        or metadata.st_dev != source_device
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise PromotionError("snapshot directory metadata is unsafe")
+
+
+def _materialize_durable_snapshot(
+    *, source: Path, raw: bytes, metadata: os.stat_result, label: str, digest: str
+) -> Path:
+    if source.parent.name == SNAPSHOT_DIR_NAME:
+        snapshot_dir = source.parent
+    else:
+        snapshot_dir = source.parent / SNAPSHOT_DIR_NAME
+        directory_created = False
+        try:
+            snapshot_dir.mkdir(mode=0o700)
+            directory_created = True
+        except FileExistsError:
+            pass
+        if directory_created:
+            _fsync_directory(source.parent)
+    _assert_snapshot_directory(snapshot_dir, source_device=metadata.st_dev)
+    snapshot_path = snapshot_dir / f"{label}-{digest}.plist"
+    if snapshot_path.exists() or snapshot_path.is_symlink():
+        existing, existing_metadata = _read_regular_file(
+            snapshot_path, "durable plist snapshot"
+        )
+        if (
+            existing != raw
+            or existing_metadata.st_dev != metadata.st_dev
+            or existing_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(existing_metadata.st_mode) != 0o400
+        ):
+            raise PromotionError("existing durable plist snapshot is unsafe")
+        return snapshot_path
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".mtplx-dsv4-0731-write-", suffix=".tmp", dir=snapshot_dir
+    )
+    temporary_path = Path(temporary_name)
     try:
         os.fchmod(fd, 0o400)
         view = memoryview(raw)
         while view:
             written = os.write(fd, view)
+            if written <= 0:
+                raise PromotionError("durable plist snapshot write did not progress")
             view = view[written:]
         os.fsync(fd)
-    finally:
         os.close(fd)
+        fd = -1
+        os.replace(temporary_path, snapshot_path)
+        _fsync_directory(snapshot_dir)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+    return snapshot_path
+
+
+@contextmanager
+def plist_snapshot(source: Path) -> Iterator[PlistSnapshot]:
+    """Materialize exact plist bytes durably beside the reviewed source."""
+    source = Path(os.path.abspath(source))
+    raw, metadata = _read_regular_file(source, "source plist")
+    label, program_arguments = _parse_plist_identity(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    snapshot_path = _materialize_durable_snapshot(
+        source=source,
+        raw=raw,
+        metadata=metadata,
+        label=label,
+        digest=digest,
+    )
     snapshot = PlistSnapshot(
         source_path=source,
         path=snapshot_path,
         raw=raw,
-        sha256=hashlib.sha256(raw).hexdigest(),
+        sha256=digest,
         label=label,
         program_arguments=program_arguments,
         source_device=metadata.st_dev,
         source_inode=metadata.st_ino,
     )
-    try:
-        yield snapshot
-    finally:
-        try:
-            snapshot_path.unlink()
-        except FileNotFoundError:
-            pass
+    snapshot.assert_snapshot_intact()
+    yield snapshot
 
 
 def _command(*argv: str) -> str:
@@ -223,12 +316,7 @@ def _listener_pid(port: int) -> int:
     return pids.pop()
 
 
-def _launchctl_job(label: str) -> dict[str, Any]:
-    if label not in ALLOWED_LAUNCHD_LABELS:
-        raise PromotionError("launchd label is not allowlisted")
-    domain = f"gui/{os.getuid()}/{label}"
-    output = _command("/bin/launchctl", "print", domain)
-
+def _parse_launchctl_job(output: str) -> dict[str, Any]:
     def scalar(name: str) -> str:
         match = re.search(rf"^\s*{re.escape(name)} = (.+?)\s*$", output, re.MULTILINE)
         if not match:
@@ -256,6 +344,32 @@ def _launchctl_job(label: str) -> dict[str, Any]:
         "program": scalar("program"),
         "arguments": arguments,
     }
+
+
+def _launchctl_job(label: str) -> dict[str, Any]:
+    if label not in ALLOWED_LAUNCHD_LABELS:
+        raise PromotionError("launchd label is not allowlisted")
+    domain = f"gui/{os.getuid()}/{label}"
+    return _parse_launchctl_job(_command("/bin/launchctl", "print", domain))
+
+
+def _launchctl_job_if_loaded(label: str) -> dict[str, Any] | None:
+    """Return a loaded job, distinguishing absence from an unsafe probe failure."""
+    if label not in ALLOWED_LAUNCHD_LABELS:
+        raise PromotionError("launchd label is not allowlisted")
+    domain = f"gui/{os.getuid()}/{label}"
+    result = subprocess.run(
+        ["/bin/launchctl", "print", domain],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        diagnostic = f"{result.stdout}\n{result.stderr}"
+        if "Could not find service" in diagnostic:
+            return None
+        raise PromotionError("could not safely determine whether launchd still references snapshot")
+    return _parse_launchctl_job(result.stdout)
 
 
 def _attest_process_snapshot(
@@ -613,15 +727,16 @@ def promote(args: argparse.Namespace) -> None:
             try:
                 _bootout(current["label"])
                 target_snapshot.assert_source_unchanged()
-                _bootstrap(target_snapshot.source_path)
+                _bootstrap(target_snapshot.path)
                 promoted = _wait_for_process_identity(
                     label=args.production_label,
                     plist=target_snapshot,
-                    loaded_path=target_snapshot.source_path,
+                    loaded_path=target_snapshot.path,
                 )
                 if promoted["plist_sha256"] != promotion_target["plist_sha256"]:
                     raise PromotionError("promoted service plist identity changed during cutover")
                 _verify_live_ready(candidate["candidate_smoke"]["candidate_model_ids"])
+                prior_snapshot.cleanup_if_unloaded()
             except BaseException:
                 try:
                     _bootout(args.production_label)
@@ -634,6 +749,7 @@ def promote(args: argparse.Namespace) -> None:
                         loaded_path=prior_snapshot.path,
                     )
                     _verify_live_ready(current["model_ids"])
+                    target_snapshot.cleanup_if_unloaded()
                 raise
 
 

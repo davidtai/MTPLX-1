@@ -45,10 +45,16 @@ After the new plist is bootstrapped, its hash, launchd PID, and ownership of the
 probe is allowed. The prior live identity is pinned to `com.tea.qwen` serving
 `mtplx-qwen36-27b-optimized-quality`; the target is pinned to
 `com.tea.deepseek-v4-0731.production`. Promotion parses `Label` and
-`ProgramArguments` from one descriptor-read plist snapshot and requires the
-loaded launchd job path, program, and arguments to match. The source inode and
-bytes are rechecked before bootout, and rollback uses the held exact snapshot
-rather than rereading a possibly replaced path.
+`ProgramArguments` from one descriptor read, then writes those exact bytes to a
+content-addressed, owner-only (`0400` file in a `0700` directory), same-filesystem
+snapshot and fsyncs it before any service action. Both promotion and rollback
+bootstrap that durable snapshot path rather than the mutable source path, and
+post-bootstrap attestation requires launchd's loaded path, current snapshot
+bytes and metadata, program, and arguments to still match. A snapshot remains
+on disk for as long as launchd references it, including after all Python context
+managers exit. The unreferenced side is removed only after a successful
+`launchctl print` proves that its label is absent or loaded from another path;
+an ambiguous probe preserves the snapshot and fails closed.
 
 Receipts have an exact allowlist and recursively reject local paths, request
 content, tool schemas, secrets, argv/env, and captured process output.
