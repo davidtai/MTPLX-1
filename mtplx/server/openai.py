@@ -23627,15 +23627,19 @@ def create_app(state: ServerState) -> FastAPI:
                 created=created,
                 request_max_tokens=request_max_tokens,
             )
-        cache_bypass = headers.get("x-mtplx-cache-mode", "").lower() in {
-            "bypass",
-            "stateless",
-            "off",
-        } or str(metadata.get("cache_mode", "")).lower() in {
-            "bypass",
-            "stateless",
-            "off",
-        }
+        cache_bypass = (
+            state.args.session_cache_mode == "off"
+            or headers.get("x-mtplx-cache-mode", "").lower() in {
+                "bypass",
+                "stateless",
+                "off",
+            }
+            or str(metadata.get("cache_mode", "")).lower() in {
+                "bypass",
+                "stateless",
+                "off",
+            }
+        )
         opencode_client = _is_opencode_client(headers=headers, metadata=metadata)
         requested_tool_specs = _normalize_tool_specs(request.tools)
         tool_specs = _filter_tool_specs_for_request(
@@ -28722,6 +28726,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--decode-batch-max", type=int)
     parser.add_argument("--batch-wait-ms", type=float)
     parser.add_argument("--prefill-chunk-tokens", type=int)
+    parser.add_argument(
+        "--session-cache-mode",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "Construction-time SessionBank policy. 'off' forces every request "
+            "through the existing stateless cold-prefill path and disables "
+            "session postcommit work."
+        ),
+    )
     parser.add_argument(
         "--experimental-mtp-cohorts",
         action="store_true",

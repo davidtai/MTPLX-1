@@ -3535,6 +3535,58 @@ def test_nonstream_unsafe_mtp_schedules_async_postcommit_in_default_mode(
     assert scheduled[0]["unsafe_reason"] == "missing_generation_final_state"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_global_session_cache_off_uses_stateless_path_without_postcommit(
+    monkeypatch, stream
+):
+    state = _fake_streaming_session_state()
+    state.args.session_cache_mode = "off"
+    generated_calls: list[dict] = []
+
+    def fake_schedule(*_args, **_kwargs):
+        raise AssertionError("stateless requests must not schedule postcommit")
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        generated_calls.append(kwargs)
+        tokens = [ord("O"), ord("K")]
+        callback = kwargs.get("token_callback")
+        if callback is not None:
+            callback(tokens)
+        return {
+            "text": "OK",
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+            "_final_state": None,
+        }
+
+    monkeypatch.setattr(openai, "_schedule_idle_postcommit_snapshot", fake_schedule)
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "must-not-create-session"},
+            json={
+                "messages": [{"role": "user", "content": "Say OK"}],
+                "enable_thinking": False,
+                "stream": stream,
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert generated_calls[0]["session_bank"] is None
+    assert state.sessions._sessions == {}
+    assert "session_postcommit_snapshot" not in response.text
+
+
 def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
