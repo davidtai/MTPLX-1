@@ -245,23 +245,16 @@ def test_no_tools_api_stream_split_chunks_never_release_dsml() -> None:
     from candidate_entry import install_candidate_surface
     from mtplx.server import openai as openai_server
 
-    class PassthroughSplitter:
-        def start(self):
-            return []
-
-        def feed(self, text: str):
-            return [("content", text)]
-
-        def finish(self, **_kwargs):
-            return []
-
     server = SimpleNamespace(
         _encode_messages=lambda *_args, **_kwargs: [],
         _parse_generated_tool_calls_or_content=lambda *_args, **_kwargs: (None, None),
         omlx_extract_tool_calls_with_thinking=lambda *_args, **_kwargs: None,
         _ToolAwareContentStreamTranslator=openai_server._ToolAwareContentStreamTranslator,
         _stream_tool_call_deltas=openai_server._stream_tool_call_deltas,
-        _stream_splitter_for_state=lambda *_args, **_kwargs: PassthroughSplitter(),
+        _stream_splitter_for_state=lambda *_args, **kwargs: openai_server._ThinkingContentStreamSplitter(
+            thinking_enabled=kwargs["thinking_enabled"],
+            suppress_orphan_tool_markup=kwargs.get("suppress_orphan_tool_markup", False),
+        ),
     )
     install_candidate_surface(server)
     splitter = server._stream_splitter_for_state(
@@ -274,6 +267,15 @@ def test_no_tools_api_stream_split_chunks_never_release_dsml() -> None:
     wire_chunks.extend(splitter.finish())
     assert "".join(text for field, text in wire_chunks if field == "content") == "Preamble."
     assert "<｜DSML｜" not in json.dumps(wire_chunks, ensure_ascii=False)
+
+    # The real endpoint performs both reads unconditionally during streaming
+    # finalization, including when the request declared no tools.
+    generated = {"stats": {}}
+    state = SimpleNamespace(last_metrics=[{}])
+    generated["stats"]["reasoning_reentries"] = splitter.reentry_count
+    state.last_metrics[-1]["reasoning_reentries"] = splitter.reentry_count
+    assert generated["stats"]["reasoning_reentries"] == 0
+    assert state.last_metrics[-1]["reasoning_reentries"] == 0
 
 
 def test_allowed_signers_is_digest_pinned_owned_and_not_writable() -> None:

@@ -365,6 +365,10 @@ def _install_no_tools_stream_sanitizer(server: ModuleType) -> None:
                 tools=[], argument_chunk_chars=1
             )
 
+        @property
+        def reentry_count(self) -> int:
+            return int(self._stock.reentry_count)
+
         def start(self):
             return self._translate(self._stock.start())
 
