@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,11 +150,43 @@ def test_process_attestation_rejects_plist_not_loaded_by_launchd(monkeypatch, tm
 \t}}
 \tpid = 4242
 }}"""
-        return "p4242\n"
+        return "p4242\nn127.0.0.1:8080\n"
 
     monkeypatch.setattr(promote_cutover, "_command", fake_command)
     with pytest.raises(promote_cutover.PromotionError, match="ProgramArguments"):
         promote_cutover.attest_process_identity(label="com.tea.qwen", plist=plist)
+
+
+def test_listener_identity_selects_exact_loopback_backend(monkeypatch) -> None:
+    import promote_cutover
+
+    monkeypatch.setattr(
+        promote_cutover,
+        "_command",
+        lambda *_argv: (
+            "p3098\nn10.8.0.2:8080\n"
+            "p14242\nn127.0.0.1:8080\n"
+        ),
+    )
+
+    assert promote_cutover._listener_pid(8080) == 14242
+
+
+@pytest.mark.parametrize(
+    "listeners",
+    [
+        "p3098\nn*:8080\np14242\nn127.0.0.1:8080\n",
+        "p14242\nn127.0.0.1:8080\np14243\nn127.0.0.1:8080\n",
+    ],
+)
+def test_listener_identity_rejects_wildcard_or_duplicate_loopback_owners(
+    monkeypatch, listeners: str
+) -> None:
+    import promote_cutover
+
+    monkeypatch.setattr(promote_cutover, "_command", lambda *_argv: listeners)
+    with pytest.raises(promote_cutover.PromotionError, match="loopback listener"):
+        promote_cutover._listener_pid(8080)
 
 
 def test_prior_plist_snapshot_is_durable_reignorable_and_safely_cleaned(
@@ -213,7 +246,7 @@ def test_prior_plist_snapshot_is_durable_reignorable_and_safely_cleaned(
 \t}}
 \tpid = 4242
 }}"""
-        return "p4242\n"
+        return "p4242\nn127.0.0.1:8080\n"
 
     monkeypatch.setattr(promote_cutover, "_command", fake_command)
     repeated = promote_cutover.attest_process_identity(
@@ -232,6 +265,120 @@ def test_prior_plist_snapshot_is_durable_reignorable_and_safely_cleaned(
     )
     snapshot.cleanup_if_unloaded()
     assert not snapshot_path.exists()
+
+
+def test_post_commit_snapshot_cleanup_failure_does_not_roll_back_production(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    import promote_cutover
+
+    prior_plist = tmp_path / "prior.plist"
+    prior_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": promote_cutover.PRIOR_LIVE_LABEL,
+                "ProgramArguments": ["/bin/false", "--prior"],
+            }
+        )
+    )
+    target_plist = tmp_path / "production.plist"
+    target_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": promote_cutover.PRODUCTION_LABEL,
+                "ProgramArguments": ["/bin/false", "--production"],
+            }
+        )
+    )
+    reviewed_commit = "c" * 40
+    candidate = _passing_candidate_receipt()
+    preflight = candidate["candidate_preflight"]
+    preflight.update(
+        {
+            "plist_sha256": promote_cutover.CANDIDATE_PLIST_SHA256,
+            "encoding_asset_set_sha256": promote_cutover.ENCODING_ASSET_SET_SHA256,
+            "reviewed_commit": reviewed_commit,
+            "model_config_sha256": promote_cutover.MODEL_CONFIG_SHA256,
+            "model_index_sha256": promote_cutover.MODEL_INDEX_SHA256,
+            "promotion_target": {
+                "label": promote_cutover.PRODUCTION_LABEL,
+                "plist_sha256": hashlib.sha256(target_plist.read_bytes()).hexdigest(),
+            },
+        }
+    )
+    candidate_receipt = tmp_path / "candidate.json"
+    candidate_receipt.write_text(json.dumps(candidate), encoding="utf-8")
+    live = {
+        "schema": "mtplx.live-identity.v1",
+        "label": promote_cutover.PRIOR_LIVE_LABEL,
+        "pid": 14242,
+        "listener_port": 8080,
+        "plist_sha256": hashlib.sha256(prior_plist.read_bytes()).hexdigest(),
+        "model_ids": list(promote_cutover.ALLOWED_PRIOR_MODEL_IDS),
+    }
+    live_attestation = tmp_path / "live.json"
+    live_attestation.write_text(json.dumps(live), encoding="utf-8")
+    events: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(promote_cutover, "_verify_candidate_signature", lambda *_args: None)
+    monkeypatch.setattr(promote_cutover, "_command", lambda *_args: reviewed_commit)
+    monkeypatch.setattr(promote_cutover, "exclusive_gpu_lock", nullcontext)
+    monkeypatch.setattr(promote_cutover, "attest_live", lambda **_kwargs: dict(live))
+    monkeypatch.setattr(
+        promote_cutover,
+        "_bootout",
+        lambda label: events.append(("bootout", label)),
+    )
+    monkeypatch.setattr(
+        promote_cutover,
+        "_bootstrap",
+        lambda path: events.append(("bootstrap", Path(path))),
+    )
+    monkeypatch.setattr(
+        promote_cutover,
+        "_wait_for_process_identity",
+        lambda **kwargs: {
+            "plist_sha256": kwargs["plist"].sha256,
+        },
+    )
+    monkeypatch.setattr(
+        promote_cutover,
+        "_verify_live_ready",
+        lambda model_ids: events.append(("ready", tuple(model_ids))),
+    )
+
+    def fail_after_unlink(snapshot) -> None:
+        events.append(("cleanup", snapshot.label))
+        if snapshot.label == promote_cutover.PRIOR_LIVE_LABEL:
+            snapshot.path.unlink()
+            raise OSError("injected failure immediately after unlink")
+
+    monkeypatch.setattr(promote_cutover.PlistSnapshot, "cleanup_if_unloaded", fail_after_unlink)
+    args = SimpleNamespace(
+        promote=True,
+        candidate_receipt=candidate_receipt,
+        candidate_signature=tmp_path / "candidate.json.sig",
+        live_attestation=live_attestation,
+        live_plist=prior_plist,
+        production_plist=target_plist,
+        production_label=promote_cutover.PRODUCTION_LABEL,
+    )
+
+    promote_cutover.promote(args)
+
+    assert ("ready", tuple(candidate["candidate_smoke"]["candidate_model_ids"])) in events
+    assert ("cleanup", promote_cutover.PRIOR_LIVE_LABEL) in events
+    assert ("bootout", promote_cutover.PRODUCTION_LABEL) not in events
+    assert any(
+        event == "bootstrap"
+        and path.name.startswith(promote_cutover.PRODUCTION_LABEL)
+        for event, path in events
+    )
+    assert not any(
+        event == "bootstrap" and path.name.startswith(promote_cutover.PRIOR_LIVE_LABEL)
+        for event, path in events
+    )
+    assert "promotion committed; prior snapshot cleanup was incomplete" in capsys.readouterr().err
 
 
 def test_snapshot_cleanup_distinguishes_absent_job_from_probe_failure(

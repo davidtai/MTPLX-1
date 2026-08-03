@@ -54,7 +54,12 @@ bytes and metadata, program, and arguments to still match. A snapshot remains
 on disk for as long as launchd references it, including after all Python context
 managers exit. The unreferenced side is removed only after a successful
 `launchctl print` proves that its label is absent or loaded from another path;
-an ambiguous probe preserves the snapshot and fails closed.
+an ambiguous probe preserves the snapshot and fails closed. Successful backend
+readiness is the cutover commit point: prior-snapshot cleanup happens afterward,
+and a cleanup failure reports a warning without stopping the verified production
+service or entering rollback. Backend PID attestation is bound specifically to
+the listener on `127.0.0.1:8080`; a same-port gateway on another interface is
+ignored, while wildcard listeners and multiple loopback owners are rejected.
 
 Receipts have an exact allowlist and recursively reject local paths, request
 content, tool schemas, secrets, argv/env, and captured process output.

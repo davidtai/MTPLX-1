@@ -310,10 +310,28 @@ def _smoke_stop(model_id: str) -> None:
 
 def _listener_pid(port: int) -> int:
     output = _command("/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpn")
-    pids = {int(line[1:]) for line in output.splitlines() if line.startswith("p") and line[1:].isdigit()}
-    if len(pids) != 1:
-        raise PromotionError("listener identity is absent or ambiguous")
-    return pids.pop()
+    current_pid: int | None = None
+    loopback_pids: set[int] = set()
+    wildcard_pids: set[int] = set()
+    loopback_endpoint = f"127.0.0.1:{port}"
+    wildcard_endpoints = {
+        f"*:{port}",
+        f"0.0.0.0:{port}",
+        f"[::]:{port}",
+        f":::{port}",
+    }
+    for line in output.splitlines():
+        if line.startswith("p"):
+            current_pid = int(line[1:]) if line[1:].isdigit() else None
+        elif line.startswith("n") and current_pid is not None:
+            endpoint = line[1:]
+            if endpoint == loopback_endpoint:
+                loopback_pids.add(current_pid)
+            elif endpoint in wildcard_endpoints:
+                wildcard_pids.add(current_pid)
+    if wildcard_pids or len(loopback_pids) != 1:
+        raise PromotionError("exact loopback listener identity is absent or ambiguous")
+    return loopback_pids.pop()
 
 
 def _parse_launchctl_job(output: str) -> dict[str, Any]:
@@ -736,7 +754,6 @@ def promote(args: argparse.Namespace) -> None:
                 if promoted["plist_sha256"] != promotion_target["plist_sha256"]:
                     raise PromotionError("promoted service plist identity changed during cutover")
                 _verify_live_ready(candidate["candidate_smoke"]["candidate_model_ids"])
-                prior_snapshot.cleanup_if_unloaded()
             except BaseException:
                 try:
                     _bootout(args.production_label)
@@ -751,6 +768,16 @@ def promote(args: argparse.Namespace) -> None:
                     _verify_live_ready(current["model_ids"])
                     target_snapshot.cleanup_if_unloaded()
                 raise
+            # Readiness is the cutover commit point. Snapshot reclamation is
+            # post-commit housekeeping and must never re-enter rollback after
+            # it has removed the only prior rollback path.
+            try:
+                prior_snapshot.cleanup_if_unloaded()
+            except Exception as error:
+                print(
+                    f"promotion committed; prior snapshot cleanup was incomplete: {error}",
+                    file=sys.stderr,
+                )
 
 
 def main(argv: list[str] | None = None) -> int:
