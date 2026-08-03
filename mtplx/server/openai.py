@@ -1779,6 +1779,61 @@ def _validate_deepseek_v4_0731_k2_entrypoint(args: argparse.Namespace) -> None:
         raise ValueError("DeepSeek-V4-0731 K2 requires MTP generation")
 
 
+def _global_stateless_session_cache_bypass(
+    _headers: Mapping[str, str], _metadata: Mapping[str, Any]
+) -> bool:
+    """Construction-installed session route for a globally stateless server."""
+    return True
+
+
+def _dynamic_session_cache_bypass(
+    headers: Mapping[str, str], metadata: Mapping[str, Any]
+) -> bool:
+    """Per-request escape hatch for the normal, constructed SessionBank lane."""
+    return (
+        headers.get("x-mtplx-cache-mode", "").lower()
+        in {"bypass", "stateless", "off"}
+        or str(metadata.get("cache_mode", "")).lower()
+        in {"bypass", "stateless", "off"}
+    )
+
+
+class _StatelessSessionRoute:
+    """Admin-compatible no-op session route; deliberately owns no bank."""
+
+    bank = None
+    last_prefix_diagnostic = None
+
+    @staticmethod
+    def resolve_session_id(**_kwargs: Any) -> tuple[None, str]:
+        return None, "stateless"
+
+    @staticmethod
+    def get_or_create(_session_id: str | None) -> None:
+        return None
+
+    @staticmethod
+    @contextmanager
+    def generation_slot(session: Any, **_kwargs: Any) -> Iterable[Any]:
+        yield session
+
+    @staticmethod
+    def list_sessions() -> dict[str, Any]:
+        return {"sessions": [], "count": 0, "session_bank": {}}
+
+    @staticmethod
+    def clear_session(session_id: str) -> dict[str, Any]:
+        return {"session_id": session_id, "cleared": False, "reason": "stateless"}
+
+    @staticmethod
+    def clear_all() -> dict[str, Any]:
+        return {"cleared": 0, "reason": "stateless"}
+
+    @staticmethod
+    def archive_cold_tier() -> dict[str, Any]:
+        return {"archived": False, "reason": "stateless"}
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         _validate_mtp_batch_settings(args)
@@ -2095,52 +2150,55 @@ class ServerState:
         # The paged KV pool clamps geometric growth to this window (#150);
         # env is the plumbing because cache_state has no server handle.
         os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(int(self.context_window))
-        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
-        from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
+        if args.session_cache_mode == "off":
+            # Install a route rather than a request-time condition. This lane
+            # never owns a SessionBank, manager, cold tier, or postcommit work.
+            self.session_cache_bypass = _global_stateless_session_cache_bypass
+            self.session_bank_cold_tier = None
+            self.sessions = _StatelessSessionRoute()
+        else:
+            self.session_cache_bypass = _dynamic_session_cache_bypass
+            self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
+            from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
 
-        self.sessions = EngineSessionManager(
-            cold_tier=self.session_bank_cold_tier,
-            model_weights_bytes=_model_weights_bytes(
-                getattr(self.runtime, "model_path", None)
-            ),
-        )
-        # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
-        # it runs at enqueue, never on the writer thread) off request and
-        # stream tails: dispatch it to the scheduler's idle lane, where it
-        # reads the immutable bank entry on the model owner thread.
-        _bank = getattr(self.sessions, "bank", None)
-        if _bank is not None and hasattr(_bank, "cold_enqueue_dispatch"):
-            _scheduler = self.model_scheduler
-            if getattr(_scheduler, "SUPPORTS_IDLE_PERSISTENCE", False):
-                # Durability band: cold encodes must never displace the
-                # canonical postcommit whose entry anchors the next turn's
-                # restore (2026-08-06 causal probe: FIFO idle ordering cost
-                # 0.66-1.17s per warm agent turn). Explicit capability
-                # check; legacy schedulers keep the idle-postcommit lane.
-                _bank.cold_enqueue_dispatch = lambda job: (
-                    _scheduler.submit_idle_persistence(
-                        job,
-                        batch_key="ssd.cold_enqueue",
-                        coalesce_key=getattr(job, "coalesce_key", None),
-                    )
-                )
-            else:
-                _bank.cold_enqueue_dispatch = lambda job: (
-                    _scheduler.submit_idle_postcommit(job, batch_key="ssd.cold_enqueue")
-                )
-        # Foreground-yield wiring (2026-08-07): the cold tier's encode runs
-        # on the model-owner thread and its writer thread moves GBs through
-        # unified memory — both must stand down while a request is queued or
-        # running (encode aborts between tensor evals and re-dispatches;
-        # writer pauses between entry writes). Without this the SSD write of
-        # each fresh postcommit entry overlapped the next turn: -30% decode
-        # + 0.66-0.75 s unattributed prompt-state wall (gate254-c4s).
-        if self.session_bank_cold_tier is not None and hasattr(
-            self.model_scheduler, "foreground_busy"
-        ):
-            self.session_bank_cold_tier.foreground_busy = (
-                self.model_scheduler.foreground_busy
+            self.sessions = EngineSessionManager(
+                cold_tier=self.session_bank_cold_tier,
+                model_weights_bytes=_model_weights_bytes(
+                    getattr(self.runtime, "model_path", None)
+                ),
             )
+            # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
+            # it runs at enqueue, never on the writer thread) off request and
+            # stream tails: dispatch it to the scheduler's idle lane, where it
+            # reads the immutable bank entry on the model owner thread.
+            _bank = getattr(self.sessions, "bank", None)
+            if _bank is not None and hasattr(_bank, "cold_enqueue_dispatch"):
+                _scheduler = self.model_scheduler
+                if getattr(_scheduler, "SUPPORTS_IDLE_PERSISTENCE", False):
+                    _bank.cold_enqueue_dispatch = lambda job: (
+                        _scheduler.submit_idle_persistence(
+                            job,
+                            batch_key="ssd.cold_enqueue",
+                            coalesce_key=getattr(job, "coalesce_key", None),
+                        )
+                    )
+                else:
+                    _bank.cold_enqueue_dispatch = lambda job: (
+                        _scheduler.submit_idle_postcommit(
+                            job, batch_key="ssd.cold_enqueue"
+                        )
+                    )
+            # Foreground-yield wiring (2026-08-07): the cold tier's encode runs
+            # on the model-owner thread and its writer thread moves GBs through
+            # unified memory — both must stand down while a request is queued or
+            # running (encode aborts between tensor evals and re-dispatches;
+            # writer pauses between entry writes).
+            if self.session_bank_cold_tier is not None and hasattr(
+                self.model_scheduler, "foreground_busy"
+            ):
+                self.session_bank_cold_tier.foreground_busy = (
+                    self.model_scheduler.foreground_busy
+                )
         self.last_metrics: list[dict[str, Any]] = []
         self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
@@ -23627,19 +23685,7 @@ def create_app(state: ServerState) -> FastAPI:
                 created=created,
                 request_max_tokens=request_max_tokens,
             )
-        cache_bypass = (
-            state.args.session_cache_mode == "off"
-            or headers.get("x-mtplx-cache-mode", "").lower() in {
-                "bypass",
-                "stateless",
-                "off",
-            }
-            or str(metadata.get("cache_mode", "")).lower() in {
-                "bypass",
-                "stateless",
-                "off",
-            }
-        )
+        cache_bypass = state.session_cache_bypass(headers, metadata)
         opencode_client = _is_opencode_client(headers=headers, metadata=metadata)
         requested_tool_specs = _normalize_tool_specs(request.tools)
         tool_specs = _filter_tool_specs_for_request(

@@ -1821,6 +1821,7 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         warmup_status={"enabled": False, "ran": False, "tokens": 0},
         last_metrics=[{"tok_s": 12.5, "accept_rate": 0.75}],
         rate_limiter=_RateLimiter(rate_limit),
+        session_cache_bypass=openai._dynamic_session_cache_bypass,
         sessions=SimpleNamespace(
             list_sessions=lambda: {"sessions": [], "count": 0, "session_bank": {}},
             clear_session=lambda session_id: {"cleared": session_id},
@@ -3541,6 +3542,8 @@ def test_global_session_cache_off_uses_stateless_path_without_postcommit(
 ):
     state = _fake_streaming_session_state()
     state.args.session_cache_mode = "off"
+    state.session_cache_bypass = openai._global_stateless_session_cache_bypass
+    state.sessions = openai._StatelessSessionRoute()
     generated_calls: list[dict] = []
 
     def fake_schedule(*_args, **_kwargs):
@@ -3583,7 +3586,7 @@ def test_global_session_cache_off_uses_stateless_path_without_postcommit(
 
     assert response.status_code == 200
     assert generated_calls[0]["session_bank"] is None
-    assert state.sessions._sessions == {}
+    assert state.sessions.list_sessions()["sessions"] == []
     assert "session_postcommit_snapshot" not in response.text
 
 
@@ -11660,6 +11663,53 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     assert "[5/6] Model loaded" in captured
     assert "[6/6] Warmup skipped" in captured
     assert state.context_window == 32768
+
+
+def test_server_state_session_cache_off_installs_stateless_route_without_bank_construction(
+    monkeypatch,
+):
+    """The global stateless lane is fixed at construction, never per request."""
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
+    )
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda model, mtp, contract, **_kwargs: SimpleNamespace(
+            model_path=Path(model), mtp_enabled=mtp, tokenizer=SimpleNamespace()
+        ),
+    )
+    monkeypatch.setattr(
+        openai, "_install_draft_lm_head", lambda *_args, **_kwargs: {"installed": True}
+    )
+    monkeypatch.setattr(openai, "_draft_head_identity", lambda _runtime: "draft-head")
+    monkeypatch.setattr(openai, "_template_hash", lambda _tokenizer: "template")
+    monkeypatch.setattr(
+        openai, "_resolve_context_window", lambda _tokenizer, _model: 32768
+    )
+    monkeypatch.setattr(
+        openai,
+        "EngineSessionManager",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not construct manager")),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_session_bank_cold_tier_from_args",
+        lambda _args: (_ for _ in ()).throw(AssertionError("must not construct cold tier")),
+    )
+
+    state = openai.ServerState(
+        parse_args(["--model", "models/example", "--warmup-tokens", "0", "--session-cache-mode", "off"])
+    )
+
+    assert isinstance(state.sessions, openai._StatelessSessionRoute)
+    assert state.session_cache_bypass is openai._global_stateless_session_cache_bypass
+    del state.args.session_cache_mode
+    assert state.session_cache_bypass({}, {}) is True
 
 
 def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
