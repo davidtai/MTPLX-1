@@ -27,7 +27,7 @@
   "trusted_python": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service/.venv/bin/python",
   "trusted_python_target": "/Users/davidtai/.local/share/uv/python/cpython-3.12-macos-aarch64-none/bin/python3.12",
   "trusted_python_sha256": "96793b100c947cdc81a38e8fb8c9c1889abccda9840ce1bef58d372bf3f2c263",
-  "candidate_entry_sha256": "029a177a932b2736fc02b90ebf8e240b576a28993ea0940ddba66a2719c26d1b",
+  "candidate_entry_sha256": "cc16dff9d2ebcd01af55cfc9ba36ca01ee832e3db264e5af311552292d127c97",
   "candidate_plist_sha256": "93eac0d4eaac491c7f2f1d3a293ba38a3144ade59ee3afdf52b35cc9ec9bb101",
   "served_model_id": "deepseek-v4-0731-candidate"
 }

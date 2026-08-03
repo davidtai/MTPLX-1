@@ -46,3 +46,12 @@ probe is allowed.
 
 Receipts have an exact allowlist and recursively reject local paths, request
 content, tool schemas, secrets, argv/env, and captured process output.
+
+The reviewed, dedicated signer list lives at
+`~/.config/mtplx/deepseek-v4-0731-allowed-signers` (owner-only mode `0600`),
+with its SHA-256 pinned in `promote_cutover.py`. Sign a receipt without
+printing key material using `/usr/bin/ssh-keygen -Y sign -f
+~/.config/mtplx/deepseek-v4-0731-signing -n mtplx-deepseek-v4-0731
+candidate-receipt.json`; this dedicated key is not a reused login key.
+Promotion rejects a missing, changed, wrongly owned, or group/world-writable
+signer list; it does not discover trust at runtime.

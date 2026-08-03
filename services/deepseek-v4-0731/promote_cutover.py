@@ -16,10 +16,12 @@ import json
 import os
 import plistlib
 import re
+import stat
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,9 +38,16 @@ SENSITIVE_VALUE = re.compile(
     r"[\"']?(?:prompt|messages|tools|secret|authorization)[\"']?\s*[:=])",
     re.I,
 )
+PATH_LIKE_VALUE = re.compile(
+    r"(?:^~[\\/]|(?:^|[\\/])\.\.(?:[\\/]|$)|\b[A-Za-z]:[\\/]|"
+    r"[A-Za-z][A-Za-z0-9+.-]*://|(?:^|\s)/)"
+)
 ALLOWED_SIGNERS = Path("/Users/davidtai/.config/mtplx/deepseek-v4-0731-allowed-signers")
+# Digest of the reviewed dedicated public signer list.
+ALLOWED_SIGNERS_SHA256 = "003f258613fe308134ef184e52988a082a3376655d6b44f526017d7d71c7f843"
 SIGNING_IDENTITY = "mtplx-deepseek-v4-0731-candidate"
 SIGNING_NAMESPACE = "mtplx-deepseek-v4-0731"
+ALLOWED_CANDIDATE_MODEL_IDS = frozenset({"deepseek-v4-0731-candidate"})
 CANDIDATE_WORKTREE = Path("/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service")
 REVIEWED_REF = "refs/tags/mtplx-dsv4-0731-reviewed"
 CANDIDATE_PLIST_SHA256 = "93eac0d4eaac491c7f2f1d3a293ba38a3144ade59ee3afdf52b35cc9ec9bb101"
@@ -180,8 +189,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _verify_candidate_signature(receipt_bytes: bytes, signature: Path) -> None:
-    if not ALLOWED_SIGNERS.is_file() or ALLOWED_SIGNERS.is_symlink():
-        raise PromotionError("pinned candidate allowed-signers file is missing or unsafe")
+    _assert_allowed_signers_trusted()
     if not signature.is_file() or signature.is_symlink():
         raise PromotionError("detached candidate signature is missing or unsafe")
     result = subprocess.run(
@@ -206,13 +214,30 @@ def _verify_candidate_signature(receipt_bytes: bytes, signature: Path) -> None:
         raise PromotionError("candidate receipt signature verification failed")
 
 
+def _assert_allowed_signers_trusted() -> None:
+    """Trust exactly the reviewed signer list, owned by this operator."""
+    if not ALLOWED_SIGNERS.is_file() or ALLOWED_SIGNERS.is_symlink():
+        raise PromotionError("pinned candidate allowed-signers file is missing or unsafe")
+    try:
+        metadata = ALLOWED_SIGNERS.stat()
+    except OSError as error:
+        raise PromotionError("pinned candidate allowed-signers metadata is unavailable") from error
+    if metadata.st_uid != os.getuid():
+        raise PromotionError("pinned candidate allowed-signers owner is unsafe")
+    if stat.S_IMODE(metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PromotionError("pinned candidate allowed-signers permissions are unsafe")
+    if hashlib.sha256(ALLOWED_SIGNERS.read_bytes()).hexdigest() != ALLOWED_SIGNERS_SHA256:
+        raise PromotionError("pinned candidate allowed-signers digest changed")
+
+
 def _contains_sensitive(value: Any) -> bool:
     if isinstance(value, dict):
         return any(SENSITIVE_KEY.search(str(key)) or _contains_sensitive(item) for key, item in value.items())
     if isinstance(value, list):
         return any(_contains_sensitive(item) for item in value)
     if isinstance(value, str):
-        if any(marker in value for marker in ("/Users/", "/private/", "/tmp/")):
+        decoded = urllib.parse.unquote(value)
+        if PATH_LIKE_VALUE.search(decoded):
             return True
         if SENSITIVE_VALUE.search(value):
             return True
@@ -271,9 +296,12 @@ def assert_candidate_receipt(payload: dict[str, Any]) -> None:
     if (
         not isinstance(candidate_model_ids, list)
         or not candidate_model_ids
-        or not all(isinstance(model_id, str) and model_id for model_id in candidate_model_ids)
+        or not all(
+            isinstance(model_id, str) and model_id in ALLOWED_CANDIDATE_MODEL_IDS
+            for model_id in candidate_model_ids
+        )
     ):
-        raise PromotionError("candidate smoke lacks nonempty candidate_model_ids")
+        raise PromotionError("candidate smoke has a disallowed model ID")
 
 
 def assert_live_identity(expected: dict[str, Any], current: dict[str, Any]) -> None:

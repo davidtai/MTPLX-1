@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -238,6 +240,136 @@ def test_server_construction_installs_verified_0731_encoder() -> None:
     assert "<｜DSML｜" not in json.dumps(split_deltas, ensure_ascii=False)
 
 
+def test_no_tools_api_stream_split_chunks_never_release_dsml() -> None:
+    """The candidate's stream boundary sanitizes no-tools API content too."""
+    from candidate_entry import install_candidate_surface
+    from mtplx.server import openai as openai_server
+
+    class PassthroughSplitter:
+        def start(self):
+            return []
+
+        def feed(self, text: str):
+            return [("content", text)]
+
+        def finish(self, **_kwargs):
+            return []
+
+    server = SimpleNamespace(
+        _encode_messages=lambda *_args, **_kwargs: [],
+        _parse_generated_tool_calls_or_content=lambda *_args, **_kwargs: (None, None),
+        omlx_extract_tool_calls_with_thinking=lambda *_args, **_kwargs: None,
+        _ToolAwareContentStreamTranslator=openai_server._ToolAwareContentStreamTranslator,
+        _stream_tool_call_deltas=openai_server._stream_tool_call_deltas,
+        _stream_splitter_for_state=lambda *_args, **_kwargs: PassthroughSplitter(),
+    )
+    install_candidate_surface(server)
+    splitter = server._stream_splitter_for_state(
+        SimpleNamespace(), thinking_enabled=False, suppress_orphan_tool_markup=True
+    )
+    wire_chunks: list[tuple[str, str]] = []
+    raw = "Preamble.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"x\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    for character in raw:
+        wire_chunks.extend(splitter.feed(character))
+    wire_chunks.extend(splitter.finish())
+    assert "".join(text for field, text in wire_chunks if field == "content") == "Preamble."
+    assert "<｜DSML｜" not in json.dumps(wire_chunks, ensure_ascii=False)
+
+
+def test_allowed_signers_is_digest_pinned_owned_and_not_writable() -> None:
+    import promote_cutover
+
+    assert promote_cutover.ALLOWED_SIGNERS_SHA256 == (
+        "003f258613fe308134ef184e52988a082a3376655d6b44f526017d7d71c7f843"
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        allowed = Path(directory) / "allowed-signers"
+        allowed.write_text("mtplx-deepseek-v4-0731-candidate ssh-ed25519 AAAA\n", encoding="utf-8")
+        allowed.chmod(0o600)
+        original_path = promote_cutover.ALLOWED_SIGNERS
+        original_digest = promote_cutover.ALLOWED_SIGNERS_SHA256
+        try:
+            promote_cutover.ALLOWED_SIGNERS = allowed
+            promote_cutover.ALLOWED_SIGNERS_SHA256 = hashlib.sha256(allowed.read_bytes()).hexdigest()
+            promote_cutover._assert_allowed_signers_trusted()
+
+            allowed.write_text("mutated\n", encoding="utf-8")
+            with pytest.raises(promote_cutover.PromotionError, match="digest"):
+                promote_cutover._assert_allowed_signers_trusted()
+
+            allowed.write_text("mtplx-deepseek-v4-0731-candidate ssh-ed25519 AAAA\n", encoding="utf-8")
+            allowed.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IWGRP)
+            with pytest.raises(promote_cutover.PromotionError, match="permissions"):
+                promote_cutover._assert_allowed_signers_trusted()
+
+            allowed.chmod(0o600)
+            original_getuid = promote_cutover.os.getuid
+            try:
+                promote_cutover.os.getuid = lambda: original_getuid() + 1
+                with pytest.raises(promote_cutover.PromotionError, match="owner"):
+                    promote_cutover._assert_allowed_signers_trusted()
+            finally:
+                promote_cutover.os.getuid = original_getuid
+        finally:
+            promote_cutover.ALLOWED_SIGNERS = original_path
+            promote_cutover.ALLOWED_SIGNERS_SHA256 = original_digest
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "/Users/davidtai/models/private",
+        "~/models/private",
+        r"C:\\Users\\davidtai\\models\\private",
+        "file:///Users/davidtai/models/private",
+        "deepseek-v4-0731/../../private",
+        "..%2Fprivate",
+    ],
+)
+def test_candidate_receipt_rejects_path_like_model_ids(model_id: str) -> None:
+    from promote_cutover import PromotionError, assert_candidate_receipt
+
+    receipt = _passing_candidate_receipt()
+    receipt["candidate_smoke"]["candidate_model_ids"] = [model_id]
+    with pytest.raises(PromotionError, match="sensitive|model ID"):
+        assert_candidate_receipt(receipt)
+
+
+@pytest.mark.parametrize("path_value", ["~/private", r"C:\\private", "file:///private", "a/../private"])
+def test_candidate_receipt_recursively_rejects_path_like_values(path_value: str) -> None:
+    from promote_cutover import PromotionError, assert_candidate_receipt
+
+    receipt = _passing_candidate_receipt()
+    receipt["candidate_preflight"]["promotion_target"]["label"] = path_value
+    with pytest.raises(PromotionError, match="sensitive"):
+        assert_candidate_receipt(receipt)
+
+
+def _passing_candidate_receipt() -> dict[str, object]:
+    return {
+        "schema": "mtplx.dsv4-0731-candidate.v1",
+        "candidate_preflight": {
+            "ok": True,
+            "label": "com.tea.deepseek-v4-0731.candidate",
+            "port": 8081,
+            "plist_sha256": "a" * 64,
+            "encoding_source_revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+            "encoding_asset_set_sha256": "b" * 64,
+            "reviewed_commit": "c" * 40,
+            "model_config_sha256": "d" * 64,
+            "model_index_sha256": "e" * 64,
+            "promotion_target": {"label": "com.tea.deepseek-v4-0731.production", "plist_sha256": "b" * 64},
+        },
+        "candidate_smoke": {
+            "ok": True,
+            "models_ok": True,
+            "ready": True,
+            "finish_reason": "stop",
+            "candidate_model_ids": ["deepseek-v4-0731-candidate"],
+        },
+    }
+
+
 @pytest.mark.parametrize("forbidden_key, forbidden_value", [
     ("stdout", "must never be retained"),
     ("prompt", "must never be retained"),
@@ -295,7 +427,7 @@ def test_scrubbed_passing_candidate_receipt_is_accepted() -> None:
                 "models_ok": True,
                 "ready": True,
                 "finish_reason": "stop",
-                "candidate_model_ids": ["deepseek-v4-0731"],
+                "candidate_model_ids": ["deepseek-v4-0731-candidate"],
             },
         }
     )
@@ -327,7 +459,7 @@ def test_candidate_receipt_rejects_unknown_nested_fields() -> None:
             "models_ok": True,
             "ready": True,
             "finish_reason": "stop",
-            "candidate_model_ids": ["deepseek-v4-0731"],
+            "candidate_model_ids": ["deepseek-v4-0731-candidate"],
         },
     }
     with pytest.raises(PromotionError, match="strict receipt schema"):

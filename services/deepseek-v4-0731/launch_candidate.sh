@@ -34,7 +34,7 @@ fi
 [ -x "$PYTHON_TARGET" ] && [ ! -L "$PYTHON_TARGET" ] || die "trusted python target is missing or unsafe"
 [ "$(sha256 "$PYTHON_TARGET")" = 96793b100c947cdc81a38e8fb8c9c1889abccda9840ce1bef58d372bf3f2c263 ] || die "trusted python hash changed"
 [ -f "$ENTRY" ] && [ ! -L "$ENTRY" ] || die "candidate entrypoint is missing or unsafe"
-[ "$(sha256 "$ENTRY")" = 029a177a932b2736fc02b90ebf8e240b576a28993ea0940ddba66a2719c26d1b ] || die "candidate entrypoint hash changed"
+[ "$(sha256 "$ENTRY")" = cc16dff9d2ebcd01af55cfc9ba36ca01ee832e3db264e5af311552292d127c97 ] || die "candidate entrypoint hash changed"
 [ -d "$MODEL" ] && [ ! -L "$MODEL" ] || die "pinned model path is missing or unsafe"
 [ "$(sha256 "$MODEL/config.json")" = 6d0297a4329d55dccf3cd48fd168efea8044996245195d518a9e8aaa14906d3e ] || die "model configuration hash changed"
 [ "$(sha256 "$MODEL/model.safetensors.index.json")" = 9edcd0db7e6b8f0b8e02978d73c30083b2aa64c2e3a8fd77d3b776a4efb4bc91 ] || die "model index hash changed"

@@ -354,6 +354,59 @@ def _install_stream_translator(server: ModuleType, encoding: ModuleType) -> None
     server._ToolAwareContentStreamTranslator = DSV40731StreamTranslator
 
 
+def _install_no_tools_stream_sanitizer(server: ModuleType) -> None:
+    """Apply the official DSML sanitizer to no-tools SSE content too."""
+    stock_factory = server._stream_splitter_for_state
+
+    class DSV40731NoToolsStreamSplitter:
+        def __init__(self, stock: Any) -> None:
+            self._stock = stock
+            self._translator = server._ToolAwareContentStreamTranslator(
+                tools=[], argument_chunk_chars=1
+            )
+
+        def start(self):
+            return self._translate(self._stock.start())
+
+        def feed(self, text: str):
+            return self._translate(self._stock.feed(text))
+
+        def finish(self, **kwargs):
+            chunks = self._translate(self._stock.finish(**kwargs))
+            try:
+                chunks.extend(self._content_pairs(self._translator.finish()))
+            except CandidateConstructionError:
+                # A malformed completion cannot release the DSML suffix that
+                # the translator withheld while it waited for official parsing.
+                return chunks
+            return chunks
+
+        def _translate(self, chunks: list[tuple[str, str]]):
+            translated: list[tuple[str, str]] = []
+            for field, text in chunks:
+                if field == "content":
+                    translated.extend(self._content_pairs(self._translator.feed(field, text)))
+                else:
+                    translated.append((field, text))
+            return translated
+
+        @staticmethod
+        def _content_pairs(deltas: list[dict[str, Any]]):
+            return [
+                ("content", text)
+                for delta in deltas
+                if isinstance((text := delta.get("content")), str) and text
+            ]
+
+    def stream_splitter_for_state(*args, **kwargs):
+        stock = stock_factory(*args, **kwargs)
+        if kwargs.get("suppress_orphan_tool_markup"):
+            return DSV40731NoToolsStreamSplitter(stock)
+        return stock
+
+    server._stream_splitter_for_state = stream_splitter_for_state
+
+
 def _install_reasoning_policy(server: ModuleType) -> None:
     def normalize(value: Any, *, default: str = "low") -> str:
         effort = str(value or default).strip().lower()
@@ -410,6 +463,8 @@ def install_candidate_surface(server: ModuleType) -> dict[str, str]:
         _install_actual_tool_extractor(server, encoding)
     if hasattr(server, "_ToolAwareContentStreamTranslator"):
         _install_stream_translator(server, encoding)
+    if hasattr(server, "_stream_splitter_for_state"):
+        _install_no_tools_stream_sanitizer(server)
     _install_reasoning_policy(server)
     _install_construction_identity(server)
     server._DSV4_0731_ENCODER_INSTALLED = True
