@@ -1,0 +1,16 @@
+{
+  "candidate_label": "com.tea.deepseek-v4-0731.candidate",
+  "candidate_port": 8081,
+  "encoding_asset": "encoding/chat_template.jinja",
+  "encoding_sha256": "03f2686beff14c3d9040894a2b658d9f1917be90bc1d90597502fc2562f0ec2a",
+  "encoding_source_revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+  "model_path": "/Users/davidtai/models/DeepSeek-V4-Flash-2bit-DQ-mtp",
+  "model_config_sha256": "c8ff87fd5ee5c9587d0c937e9bfd3193e1a1621141aa367848a9610b3291fa6f",
+  "model_index_sha256": "c84d2b369f5d5023d0f2d183fc36a935a3981751414996243b65f069983e43d8",
+  "worktree": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service",
+  "worktree_base_revision": "5ccc9fdf251a9eaf946f4c77c42eabd6ba3f0ab4",
+  "trusted_python": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service/.venv/bin/python",
+  "trusted_python_target": "/Users/davidtai/.local/share/uv/python/cpython-3.12-macos-aarch64-none/bin/python3.12",
+  "trusted_python_sha256": "96793b100c947cdc81a38e8fb8c9c1889abccda9840ce1bef58d372bf3f2c263",
+  "served_model_id": "deepseek-v4-0731-candidate"
+}
