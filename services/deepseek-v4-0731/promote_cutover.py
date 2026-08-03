@@ -19,17 +19,21 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 
 LOCK_PATH = Path("/tmp/mtplx-gpu-exclusive.lock")
 CANDIDATE_LABEL = "com.tea.deepseek-v4-0731.candidate"
+PRIOR_LIVE_LABEL = "com.tea.qwen"
+PRODUCTION_LABEL = "com.tea.deepseek-v4-0731.production"
 CANDIDATE_PORT = 8081
 LIVE_PORT = 8080
 SENSITIVE_KEY = re.compile(r"(?:prompt|message|tool|secret|token|authorization|argv|env|stdout|stderr)", re.I)
@@ -48,6 +52,8 @@ ALLOWED_SIGNERS_SHA256 = "003f258613fe308134ef184e52988a082a3376655d6b44f526017d
 SIGNING_IDENTITY = "mtplx-deepseek-v4-0731-candidate"
 SIGNING_NAMESPACE = "mtplx-deepseek-v4-0731"
 ALLOWED_CANDIDATE_MODEL_IDS = frozenset({"deepseek-v4-0731-candidate"})
+ALLOWED_PRIOR_MODEL_IDS = ("mtplx-qwen36-27b-optimized-quality",)
+ALLOWED_LAUNCHD_LABELS = frozenset({PRIOR_LIVE_LABEL, PRODUCTION_LABEL})
 CANDIDATE_WORKTREE = Path("/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service")
 REVIEWED_REF = "refs/tags/mtplx-dsv4-0731-reviewed"
 CANDIDATE_PLIST_SHA256 = "93eac0d4eaac491c7f2f1d3a293ba38a3144ade59ee3afdf52b35cc9ec9bb101"
@@ -60,10 +66,104 @@ class PromotionError(RuntimeError):
     pass
 
 
-def _sha256(path: Path) -> str:
-    if not path.is_file() or path.is_symlink():
-        raise PromotionError("attested plist is missing or unsafe")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+@dataclass
+class PlistSnapshot:
+    source_path: Path
+    path: Path
+    raw: bytes
+    sha256: str
+    label: str
+    program_arguments: tuple[str, ...]
+    source_device: int
+    source_inode: int
+
+    def assert_source_unchanged(self) -> None:
+        raw, metadata = _read_regular_file(self.source_path, "source plist")
+        if (
+            metadata.st_dev != self.source_device
+            or metadata.st_ino != self.source_inode
+            or hashlib.sha256(raw).hexdigest() != self.sha256
+        ):
+            raise PromotionError("source plist changed since snapshot")
+
+    def assert_snapshot_intact(self) -> None:
+        raw, _metadata = _read_regular_file(self.path, "rollback plist snapshot")
+        if raw != self.raw or hashlib.sha256(raw).hexdigest() != self.sha256:
+            raise PromotionError("rollback plist snapshot changed")
+
+
+def _read_regular_file(path: Path, context: str) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise PromotionError(f"{context} is missing or unsafe") from error
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PromotionError(f"{context} is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks), metadata
+    finally:
+        os.close(fd)
+
+
+def _parse_plist_identity(raw: bytes) -> tuple[str, tuple[str, ...]]:
+    try:
+        payload = plistlib.loads(raw)
+    except plistlib.InvalidFileException as error:
+        raise PromotionError("attested plist is not valid") from error
+    if not isinstance(payload, dict):
+        raise PromotionError("attested plist root is not a dictionary")
+    label = payload.get("Label")
+    arguments = payload.get("ProgramArguments")
+    if label not in ALLOWED_LAUNCHD_LABELS:
+        raise PromotionError("attested plist Label is not allowlisted")
+    if (
+        not isinstance(arguments, list)
+        or not arguments
+        or not all(isinstance(argument, str) and argument for argument in arguments)
+    ):
+        raise PromotionError("attested plist ProgramArguments are invalid")
+    return str(label), tuple(arguments)
+
+
+@contextmanager
+def plist_snapshot(source: Path) -> Iterator[PlistSnapshot]:
+    """Hold exact descriptor-read plist bytes for identity and rollback."""
+    source = Path(os.path.abspath(source))
+    raw, metadata = _read_regular_file(source, "source plist")
+    label, program_arguments = _parse_plist_identity(raw)
+    fd, name = tempfile.mkstemp(prefix="mtplx-dsv4-0731-plist-", suffix=".snapshot")
+    snapshot_path = Path(name)
+    try:
+        os.fchmod(fd, 0o400)
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    snapshot = PlistSnapshot(
+        source_path=source,
+        path=snapshot_path,
+        raw=raw,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        label=label,
+        program_arguments=program_arguments,
+        source_device=metadata.st_dev,
+        source_inode=metadata.st_ino,
+    )
+    try:
+        yield snapshot
+    finally:
+        try:
+            snapshot_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _command(*argv: str) -> str:
@@ -123,18 +223,60 @@ def _listener_pid(port: int) -> int:
     return pids.pop()
 
 
-def _launchctl_pid(label: str) -> int:
+def _launchctl_job(label: str) -> dict[str, Any]:
+    if label not in ALLOWED_LAUNCHD_LABELS:
+        raise PromotionError("launchd label is not allowlisted")
     domain = f"gui/{os.getuid()}/{label}"
     output = _command("/bin/launchctl", "print", domain)
-    match = re.search(r"\bpid = (\d+)", output)
-    if not match:
+
+    def scalar(name: str) -> str:
+        match = re.search(rf"^\s*{re.escape(name)} = (.+?)\s*$", output, re.MULTILINE)
+        if not match:
+            raise PromotionError(f"launchd job has no {name}")
+        return match.group(1)
+
+    arguments_match = re.search(
+        r"^\s*arguments = \{\s*$(.*?)^\s*\}\s*$",
+        output,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not arguments_match:
+        raise PromotionError("launchd job has no arguments")
+    arguments = tuple(
+        line.strip()
+        for line in arguments_match.group(1).splitlines()
+        if line.strip()
+    )
+    pid_text = scalar("pid")
+    if not pid_text.isdigit():
         raise PromotionError("launchd service has no single running PID")
-    return int(match.group(1))
+    return {
+        "pid": int(pid_text),
+        "path": Path(scalar("path")),
+        "program": scalar("program"),
+        "arguments": arguments,
+    }
 
 
-def attest_process_identity(*, label: str, plist: Path) -> dict[str, Any]:
+def _attest_process_snapshot(
+    *,
+    label: str,
+    snapshot: PlistSnapshot,
+    loaded_path: Path,
+) -> dict[str, Any]:
     """Bind one launchd label, plist, and 8080 listener before any HTTP probe."""
-    launch_pid = _launchctl_pid(label)
+    if label != snapshot.label:
+        raise PromotionError("supplied label differs from the plist Label")
+    snapshot.assert_snapshot_intact()
+    job = _launchctl_job(label)
+    if job["path"] != loaded_path:
+        raise PromotionError("launchd job path differs from the supplied plist")
+    if (
+        job["program"] != snapshot.program_arguments[0]
+        or job["arguments"] != snapshot.program_arguments
+    ):
+        raise PromotionError("launchd ProgramArguments differ from the supplied plist")
+    launch_pid = int(job["pid"])
     listener_pid = _listener_pid(LIVE_PORT)
     if launch_pid != listener_pid:
         raise PromotionError("launchd PID and 8080 listener PID differ")
@@ -142,13 +284,36 @@ def attest_process_identity(*, label: str, plist: Path) -> dict[str, Any]:
         "label": label,
         "pid": launch_pid,
         "listener_port": LIVE_PORT,
-        "plist_sha256": _sha256(plist),
+        "plist_sha256": snapshot.sha256,
     }
 
 
-def attest_live(*, label: str, plist: Path) -> dict[str, Any]:
+def attest_process_identity(*, label: str, plist: Path) -> dict[str, Any]:
+    with plist_snapshot(plist) as snapshot:
+        identity = _attest_process_snapshot(
+            label=label,
+            snapshot=snapshot,
+            loaded_path=snapshot.source_path,
+        )
+        snapshot.assert_source_unchanged()
+        return identity
+
+
+def attest_live(
+    *,
+    label: str,
+    plist: Path | PlistSnapshot,
+    loaded_path: Path | None = None,
+) -> dict[str, Any]:
     """Capture exact live identity without sending a generation prompt."""
-    process = attest_process_identity(label=label, plist=plist)
+    if isinstance(plist, PlistSnapshot):
+        process = _attest_process_snapshot(
+            label=label,
+            snapshot=plist,
+            loaded_path=loaded_path or plist.source_path,
+        )
+    else:
+        process = attest_process_identity(label=label, plist=plist)
     models = _http_json(f"http://127.0.0.1:{LIVE_PORT}/v1/models")
     model_ids = [item.get("id") for item in models.get("data", []) if isinstance(item, dict)]
     if not model_ids or not all(isinstance(model_id, str) for model_id in model_ids):
@@ -160,11 +325,22 @@ def attest_live(*, label: str, plist: Path) -> dict[str, Any]:
     }
 
 
-def _wait_for_process_identity(*, label: str, plist: Path) -> dict[str, Any]:
+def _wait_for_process_identity(
+    *,
+    label: str,
+    plist: Path | PlistSnapshot,
+    loaded_path: Path | None = None,
+) -> dict[str, Any]:
     """Wait for launchd and the listener to converge without probing HTTP."""
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         try:
+            if isinstance(plist, PlistSnapshot):
+                return _attest_process_snapshot(
+                    label=label,
+                    snapshot=plist,
+                    loaded_path=loaded_path or plist.source_path,
+                )
             return attest_process_identity(label=label, plist=plist)
         except PromotionError:
             time.sleep(0.5)
@@ -287,8 +463,8 @@ def assert_candidate_receipt(payload: dict[str, Any]) -> None:
     if not isinstance(preflight.get("reviewed_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", preflight["reviewed_commit"]):
         raise PromotionError("candidate preflight has invalid reviewed_commit")
     target = _require_exact_keys(preflight["promotion_target"], {"label", "plist_sha256"}, "promotion target")
-    if not isinstance(target.get("label"), str):
-        raise PromotionError("candidate preflight lacks a separately reviewed promotion target")
+    if target.get("label") != PRODUCTION_LABEL:
+        raise PromotionError("candidate preflight has a disallowed production label")
     digest = target.get("plist_sha256")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise PromotionError("candidate preflight lacks a valid promotion plist digest")
@@ -311,6 +487,24 @@ def assert_live_identity(expected: dict[str, Any], current: dict[str, Any]) -> N
         "live attestation",
     )
     fields = ("schema", "label", "pid", "listener_port", "plist_sha256", "model_ids")
+    if expected.get("schema") != "mtplx.live-identity.v1":
+        raise PromotionError("live attestation schema is not allowlisted")
+    if expected.get("label") != PRIOR_LIVE_LABEL:
+        raise PromotionError("live attestation label is not allowlisted")
+    if expected.get("model_ids") != list(ALLOWED_PRIOR_MODEL_IDS):
+        raise PromotionError("live attestation model IDs are not allowlisted")
+    if (
+        not isinstance(expected.get("pid"), int)
+        or isinstance(expected.get("pid"), bool)
+        or expected["pid"] <= 0
+    ):
+        raise PromotionError("live attestation has invalid pid")
+    if expected.get("listener_port") != LIVE_PORT:
+        raise PromotionError("live attestation has invalid listener port")
+    if not isinstance(expected.get("plist_sha256"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected["plist_sha256"]
+    ):
+        raise PromotionError("live attestation has invalid plist digest")
     if any(expected.get(field) != current.get(field) for field in fields):
         raise PromotionError("live service identity changed since its attestation")
 
@@ -355,6 +549,8 @@ def _verify_live_ready(expected_model_ids: list[str]) -> None:
 def promote(args: argparse.Namespace) -> None:
     if args.promote is not True:
         raise PromotionError("refusing promotion without --promote")
+    if args.production_label != PRODUCTION_LABEL:
+        raise PromotionError("production label is not allowlisted")
     candidate, candidate_bytes = _read_json_bytes(args.candidate_receipt)
     _verify_candidate_signature(candidate_bytes, args.candidate_signature)
     expected_live = _read_json(args.live_attestation)
@@ -386,40 +582,59 @@ def promote(args: argparse.Namespace) -> None:
         raise PromotionError("an absolute separately reviewed production plist is required")
     if not target.is_file() or target.is_symlink():
         raise PromotionError("production plist is missing or unsafe")
-    promotion_target = preflight["promotion_target"]
-    if promotion_target["label"] != args.production_label or promotion_target["plist_sha256"] != _sha256(target):
-        raise PromotionError("production plist identity does not match the passing candidate preflight")
-    try:
-        target_label = plistlib.loads(target.read_bytes()).get("Label")
-    except (plistlib.InvalidFileException, OSError) as error:
-        raise PromotionError("production plist is not valid") from error
-    if target_label != args.production_label or args.production_label == str(expected_live.get("label")):
-        raise PromotionError("production label is unsafe or does not match its plist")
-
     prior_plist = args.live_plist
     if not prior_plist.is_absolute():
         raise PromotionError("live attestation does not name an absolute prior plist")
-    with exclusive_gpu_lock():
-        current = attest_live(label=str(expected_live.get("label", "")), plist=prior_plist)
-        assert_live_identity(expected_live, current)
-        # No service is stopped until every receipt and identity check above has
-        # passed under the lock.  Any post-cutover exception restores the exact
-        # attested plist before releasing that same lock.
-        try:
-            _bootout(current["label"])
-            _bootstrap(target)
-            promoted = _wait_for_process_identity(label=args.production_label, plist=target)
-            if promoted["plist_sha256"] != promotion_target["plist_sha256"]:
-                raise PromotionError("promoted service plist identity changed during cutover")
-            _verify_live_ready(candidate["candidate_smoke"]["candidate_model_ids"])
-        except BaseException:
+    with plist_snapshot(target) as target_snapshot, plist_snapshot(prior_plist) as prior_snapshot:
+        promotion_target = preflight["promotion_target"]
+        if (
+            promotion_target["label"] != args.production_label
+            or promotion_target["plist_sha256"] != target_snapshot.sha256
+        ):
+            raise PromotionError("production plist identity does not match the passing candidate preflight")
+        if (
+            target_snapshot.label != args.production_label
+            or args.production_label == str(expected_live.get("label"))
+        ):
+            raise PromotionError("production label is unsafe or does not match its plist")
+
+        with exclusive_gpu_lock():
+            current = attest_live(
+                label=str(expected_live.get("label", "")),
+                plist=prior_snapshot,
+                loaded_path=prior_snapshot.source_path,
+            )
+            assert_live_identity(expected_live, current)
+            prior_snapshot.assert_source_unchanged()
+            target_snapshot.assert_source_unchanged()
+            # No service is stopped until every receipt and identity check above
+            # has passed under the lock. Any post-cutover exception restores
+            # the exact descriptor-read prior snapshot under that same lock.
             try:
-                _bootout(args.production_label)
-            finally:
-                _bootstrap(prior_plist)
-                _wait_for_process_identity(label=current["label"], plist=prior_plist)
-                _verify_live_ready(current["model_ids"])
-            raise
+                _bootout(current["label"])
+                target_snapshot.assert_source_unchanged()
+                _bootstrap(target_snapshot.source_path)
+                promoted = _wait_for_process_identity(
+                    label=args.production_label,
+                    plist=target_snapshot,
+                    loaded_path=target_snapshot.source_path,
+                )
+                if promoted["plist_sha256"] != promotion_target["plist_sha256"]:
+                    raise PromotionError("promoted service plist identity changed during cutover")
+                _verify_live_ready(candidate["candidate_smoke"]["candidate_model_ids"])
+            except BaseException:
+                try:
+                    _bootout(args.production_label)
+                finally:
+                    prior_snapshot.assert_snapshot_intact()
+                    _bootstrap(prior_snapshot.path)
+                    _wait_for_process_identity(
+                        label=current["label"],
+                        plist=prior_snapshot,
+                        loaded_path=prior_snapshot.path,
+                    )
+                    _verify_live_ready(current["model_ids"])
+                raise
 
 
 def main(argv: list[str] | None = None) -> int:

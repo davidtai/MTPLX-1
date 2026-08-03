@@ -239,6 +239,26 @@ def _install_actual_tool_extractor(server: ModuleType, encoding: ModuleType) -> 
     server.omlx_extract_tool_calls_with_thinking = extract
 
 
+def _install_no_tools_nonstream_sanitizer(server: ModuleType, encoding: ModuleType) -> None:
+    """Route the candidate's no-tools JSON response through official parsing."""
+    dsml_marker = f"<{encoding.dsml_token}"
+
+    def strip_orphan_tool_markup(text: str) -> tuple[str, int]:
+        try:
+            extraction = server.omlx_extract_tool_calls_with_thinking(
+                "", text, None, []
+            )
+        except CandidateConstructionError:
+            marker = text.find(dsml_marker)
+            return (text[:marker].rstrip(), 1) if marker >= 0 else ("", 0)
+        cleaned = extraction.cleaned_text.strip()
+        if dsml_marker in cleaned:
+            raise CandidateConstructionError("official nonstream parser retained DSML markup")
+        return cleaned, int(dsml_marker in text)
+
+    server._strip_orphan_tool_markup = strip_orphan_tool_markup
+
+
 def _install_stream_translator(server: ModuleType, encoding: ModuleType) -> None:
     """Keep scanning after visible prose while holding split DSML prefixes."""
 
@@ -465,6 +485,8 @@ def install_candidate_surface(server: ModuleType) -> dict[str, str]:
     server._parse_generated_tool_calls_or_content = _install_completion_parser(server, encoding)
     if hasattr(server, "omlx_extract_tool_calls_with_thinking"):
         _install_actual_tool_extractor(server, encoding)
+    if hasattr(server, "_strip_orphan_tool_markup"):
+        _install_no_tools_nonstream_sanitizer(server, encoding)
     if hasattr(server, "_ToolAwareContentStreamTranslator"):
         _install_stream_translator(server, encoding)
     if hasattr(server, "_stream_splitter_for_state"):

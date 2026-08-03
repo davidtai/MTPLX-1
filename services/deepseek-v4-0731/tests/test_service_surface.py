@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import plistlib
 import stat
 import subprocess
 import sys
@@ -105,20 +106,76 @@ def test_cutover_requires_receipts_lock_identity_and_explicit_promotion() -> Non
         "assert_candidate_receipt",
         "assert_live_identity",
         "/v1/models",
-        "finish_reason",
-        "SENSITIVE_KEY",
-        "finally:",
-        "_bootstrap(prior_plist)",
+            "finish_reason",
+            "SENSITIVE_KEY",
+            "finally:",
+            "_bootstrap(prior_snapshot.path)",
         "candidate_model_ids",
         "attest_process_identity",
     ):
         assert required in source
-    bootstrap = source.index("_bootstrap(target)")
+    bootstrap = source.index("_bootstrap(target_snapshot.source_path)")
     new_identity = source.index("_wait_for_process_identity(", bootstrap)
     readiness = source.index("_verify_live_ready(", new_identity)
     assert bootstrap < new_identity < readiness
     assert 'content.strip() != "READY"' in source
-    assert "return attest_process_identity(label=label, plist=plist)" in source
+    assert "_bootstrap(prior_snapshot.path)" in source
+    unchanged = source.index("prior_snapshot.assert_source_unchanged()")
+    bootout = source.index('_bootout(current["label"])')
+    assert unchanged < bootout
+
+
+def test_process_attestation_rejects_plist_not_loaded_by_launchd(monkeypatch, tmp_path) -> None:
+    import promote_cutover
+
+    plist = tmp_path / "prior.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.tea.qwen",
+                "ProgramArguments": ["/bin/false", "--reviewed"],
+            }
+        )
+    )
+
+    def fake_command(*argv: str) -> str:
+        if argv[0] == "/bin/launchctl":
+            return f"""gui/501/com.tea.qwen = {{
+\tpath = {plist}
+\tprogram = /bin/true
+\targuments = {{
+\t\t/bin/true
+\t\t--unrelated
+\t}}
+\tpid = 4242
+}}"""
+        return "p4242\n"
+
+    monkeypatch.setattr(promote_cutover, "_command", fake_command)
+    with pytest.raises(promote_cutover.PromotionError, match="ProgramArguments"):
+        promote_cutover.attest_process_identity(label="com.tea.qwen", plist=plist)
+
+
+def test_prior_plist_snapshot_detects_replacement_and_preserves_rollback_bytes(tmp_path) -> None:
+    from promote_cutover import PromotionError, plist_snapshot
+
+    prior = tmp_path / "prior.plist"
+    original = plistlib.dumps(
+        {"Label": "com.tea.qwen", "ProgramArguments": ["/bin/false"]}
+    )
+    prior.write_bytes(original)
+    with plist_snapshot(prior) as snapshot:
+        replacement = tmp_path / "attacker.plist"
+        replacement.write_bytes(
+            plistlib.dumps(
+                {"Label": "com.tea.qwen", "ProgramArguments": ["/bin/true"]}
+            )
+        )
+        os.replace(replacement, prior)
+        with pytest.raises(PromotionError, match="changed since snapshot"):
+            snapshot.assert_source_unchanged()
+        snapshot.assert_snapshot_intact()
+        assert snapshot.path.read_bytes() == original
 
 
 def test_launcher_invokes_exact_reviewed_artifact_validator() -> None:
@@ -278,6 +335,79 @@ def test_no_tools_api_stream_split_chunks_never_release_dsml() -> None:
     assert state.last_metrics[-1]["reasoning_reentries"] == 0
 
 
+@pytest.mark.parametrize("malformed", [False, True])
+def test_no_tools_nonstream_endpoint_uses_official_dsml_sanitizer(monkeypatch, malformed: bool) -> None:
+    from fastapi.testclient import TestClient
+    from candidate_entry import install_candidate_surface
+    from mtplx.server import openai as openai_server
+
+    tests_root = ROOT.parents[1] / "tests"
+    monkeypatch.syspath_prepend(str(tests_root))
+    from test_server_openai import _fake_generation, _fake_state  # noqa: PLC0415
+
+    class Tokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            assert add_special_tokens is False
+            return [ord(character) for character in text]
+
+        def decode(self, tokens, **_kwargs) -> str:
+            return "".join(chr(int(token)) for token in tokens)
+
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.runtime.tokenizer = Tokenizer()
+    vector = (ROOT / "encoding/tests/test_output_1.txt").read_text(encoding="utf-8")
+    marker = "<｜Assistant｜><think>"
+    start = vector.find(marker) + len(marker)
+    end = vector.find("<｜User｜>", start)
+    _thinking, dsml = vector[start:end].split("</think>", 1)
+    raw = "Preamble.\n\n" + ("<｜DSML｜tool_calls><｜DSML｜invoke" if malformed else dsml)
+
+    replaced = (
+        "_encode_messages",
+        "_parse_generated_tool_calls_or_content",
+        "omlx_extract_tool_calls_with_thinking",
+        "_ToolAwareContentStreamTranslator",
+        "_stream_splitter_for_state",
+        "_strip_orphan_tool_markup",
+        "_normalize_reasoning_effort",
+        "_reasoning_effort_for_state",
+        "_apply_chat_template_profile",
+        "_template_hash",
+        "_template_supports_scoped_reasoning",
+        "_DSV4_0731_ENCODER_INSTALLED",
+    )
+    missing = object()
+    originals = {name: getattr(openai_server, name, missing) for name in replaced}
+    try:
+        install_candidate_surface(openai_server)
+        monkeypatch.setattr(
+            openai_server,
+            "_run_generation",
+            lambda *_args, **_kwargs: _fake_generation(raw),
+        )
+        response = TestClient(openai_server.create_app(state)).post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass"},
+            json={
+                "messages": [{"role": "user", "content": "Do not use tools."}],
+                "enable_thinking": False,
+                "max_tokens": 64,
+            },
+        )
+    finally:
+        for name, original in originals.items():
+            if original is missing:
+                delattr(openai_server, name)
+            else:
+                setattr(openai_server, name, original)
+
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    assert content == "Preamble."
+    assert "<｜DSML｜" not in response.text
+
+
 def test_allowed_signers_is_digest_pinned_owned_and_not_writable() -> None:
     import promote_cutover
 
@@ -345,6 +475,55 @@ def test_candidate_receipt_recursively_rejects_path_like_values(path_value: str)
     receipt["candidate_preflight"]["promotion_target"]["label"] = path_value
     with pytest.raises(PromotionError, match="sensitive"):
         assert_candidate_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "com.tea.prod(/etc/x)",
+        "../com.tea.prod",
+        "file://com.tea.prod",
+        r"C:\\com.tea.prod",
+        "~/com.tea.prod",
+        "com.tea.other",
+    ],
+)
+def test_candidate_receipt_rejects_nonallowlisted_production_label(label: str) -> None:
+    from promote_cutover import PromotionError, assert_candidate_receipt
+
+    receipt = _passing_candidate_receipt()
+    receipt["candidate_preflight"]["promotion_target"]["label"] = label
+    with pytest.raises(PromotionError, match="sensitive|production label"):
+        assert_candidate_receipt(receipt)
+
+
+def test_live_receipt_rejects_nonallowlisted_label_and_model_id() -> None:
+    from promote_cutover import PromotionError, assert_live_identity
+
+    live = {
+        "schema": "mtplx.live-identity.v1",
+        "label": "com.tea.qwen",
+        "pid": 42,
+        "listener_port": 8080,
+        "plist_sha256": "a" * 64,
+        "model_ids": ["mtplx-qwen36-27b-optimized-quality"],
+    }
+    for field, value in (
+        ("label", "com.tea.qwen(/etc/x)"),
+        ("model_ids", ["../private-model"]),
+    ):
+        altered = {**live, field: value}
+        with pytest.raises(PromotionError, match="allowlist"):
+            assert_live_identity(altered, altered)
+
+    for field, value in (
+        ("pid", "42"),
+        ("listener_port", 9999),
+        ("plist_sha256", "com.tea.prod(/etc/x)"),
+    ):
+        altered = {**live, field: value}
+        with pytest.raises(PromotionError, match="invalid"):
+            assert_live_identity(altered, altered)
 
 
 def _passing_candidate_receipt() -> dict[str, object]:

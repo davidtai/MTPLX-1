@@ -42,7 +42,13 @@ verify rollback. The same lock remains held through restoration and the real
 `/v1/models` plus exact `content.strip() == "READY"`/`finish_reason=stop` smoke.
 After the new plist is bootstrapped, its hash, launchd PID, and ownership of the
 8080 listener are reattested under the lock before any HTTP identity or readiness
-probe is allowed.
+probe is allowed. The prior live identity is pinned to `com.tea.qwen` serving
+`mtplx-qwen36-27b-optimized-quality`; the target is pinned to
+`com.tea.deepseek-v4-0731.production`. Promotion parses `Label` and
+`ProgramArguments` from one descriptor-read plist snapshot and requires the
+loaded launchd job path, program, and arguments to match. The source inode and
+bytes are rechecked before bootout, and rollback uses the held exact snapshot
+rather than rereading a possibly replaced path.
 
 Receipts have an exact allowlist and recursively reject local paths, request
 content, tool schemas, secrets, argv/env, and captured process output.
