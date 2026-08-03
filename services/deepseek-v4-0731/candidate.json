@@ -15,15 +15,19 @@
     "tests/test_output_3.txt": "b3b1cd8748b7b90d3c6be6da3f786f12e4d70be073bd445ea162dfad4dc01a64",
     "tests/test_output_4.txt": "60e1643840ba9e4aeede450feb7b0498fa66ee24e4a939d48855ce04ec6fc375"
   },
-  "model_path": "/Users/davidtai/models/DeepSeek-V4-Flash-2bit-DQ-mtp",
-  "model_config_sha256": "c8ff87fd5ee5c9587d0c937e9bfd3193e1a1621141aa367848a9610b3291fa6f",
-  "model_index_sha256": "c84d2b369f5d5023d0f2d183fc36a935a3981751414996243b65f069983e43d8",
+  "model_path": "/Users/davidtai/models/DeepSeek-V4-Flash-0731-oQ2e-mtp",
+  "model_config_sha256": "6d0297a4329d55dccf3cd48fd168efea8044996245195d518a9e8aaa14906d3e",
+  "model_index_sha256": "9edcd0db7e6b8f0b8e02978d73c30083b2aa64c2e3a8fd77d3b776a4efb4bc91",
+  "model_tokenizer_config_sha256": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547",
+  "artifact_validator_commit": "bbf02944aab3e17be754ba3c88d6aad3c488d10d",
+  "artifact_validator_path": "scripts/deepseek_v4_0731_artifact_check.py",
+  "artifact_validator_blob_sha256": "672e3bafa8381c5264960d065730d9894b12f832eeb358922e0dd703042ac67b",
   "worktree": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service",
   "reviewed_ref": "refs/tags/mtplx-dsv4-0731-reviewed",
   "trusted_python": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service/.venv/bin/python",
   "trusted_python_target": "/Users/davidtai/.local/share/uv/python/cpython-3.12-macos-aarch64-none/bin/python3.12",
   "trusted_python_sha256": "96793b100c947cdc81a38e8fb8c9c1889abccda9840ce1bef58d372bf3f2c263",
-  "candidate_entry_sha256": "c7e2e79e45b3f2e8afd8453d5976e5234caea724813eae0e555c5f956bf725aa",
+  "candidate_entry_sha256": "029a177a932b2736fc02b90ebf8e240b576a28993ea0940ddba66a2719c26d1b",
   "candidate_plist_sha256": "93eac0d4eaac491c7f2f1d3a293ba38a3144ade59ee3afdf52b35cc9ec9bb101",
   "served_model_id": "deepseek-v4-0731-candidate"
 }

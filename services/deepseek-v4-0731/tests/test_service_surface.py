@@ -39,6 +39,29 @@ def test_candidate_config_pins_all_installation_identities() -> None:
     for key in ("model_config_sha256", "model_index_sha256", "trusted_python_sha256"):
         assert len(config[key]) == 64
     assert config["reviewed_ref"] == "refs/tags/mtplx-dsv4-0731-reviewed"
+    assert config["artifact_validator_commit"] == "bbf02944aab3e17be754ba3c88d6aad3c488d10d"
+    assert config["artifact_validator_path"] == "scripts/deepseek_v4_0731_artifact_check.py"
+    assert config["artifact_validator_blob_sha256"] == (
+        "672e3bafa8381c5264960d065730d9894b12f832eeb358922e0dd703042ac67b"
+    )
+    validator = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(ROOT.parents[1]),
+            "cat-file",
+            "blob",
+            f'{config["artifact_validator_commit"]}:{config["artifact_validator_path"]}',
+        ]
+    )
+    assert hashlib.sha256(validator).hexdigest() == config["artifact_validator_blob_sha256"]
+    assert config["model_path"] == "/Users/davidtai/models/DeepSeek-V4-Flash-0731-oQ2e-mtp"
+    assert config["model_config_sha256"] == (
+        "6d0297a4329d55dccf3cd48fd168efea8044996245195d518a9e8aaa14906d3e"
+    )
+    assert config["model_index_sha256"] == (
+        "9edcd0db7e6b8f0b8e02978d73c30083b2aa64c2e3a8fd77d3b776a4efb4bc91"
+    )
     assert len(config["encoding_assets"]) == 9
     for relative, expected in config["encoding_assets"].items():
         assert hashlib.sha256((ROOT / "encoding" / relative).read_bytes()).hexdigest() == expected
@@ -85,8 +108,24 @@ def test_cutover_requires_receipts_lock_identity_and_explicit_promotion() -> Non
         "finally:",
         "_bootstrap(prior_plist)",
         "candidate_model_ids",
+        "attest_process_identity",
     ):
         assert required in source
+    bootstrap = source.index("_bootstrap(target)")
+    new_identity = source.index("_wait_for_process_identity(", bootstrap)
+    readiness = source.index("_verify_live_ready(", new_identity)
+    assert bootstrap < new_identity < readiness
+    assert 'content.strip() != "READY"' in source
+    assert "return attest_process_identity(label=label, plist=plist)" in source
+
+
+def test_launcher_invokes_exact_reviewed_artifact_validator() -> None:
+    source = (ROOT / "launch_candidate.sh").read_text(encoding="utf-8")
+    assert "bbf02944aab3e17be754ba3c88d6aad3c488d10d" in source
+    assert "672e3bafa8381c5264960d065730d9894b12f832eeb358922e0dd703042ac67b" in source
+    assert "scripts/deepseek_v4_0731_artifact_check.py" in source
+    assert "git -C \"$WORKTREE\" cat-file blob" in source
+    assert '"$PYTHON" - "$MODEL"' in source
 
 
 def test_server_construction_installs_verified_0731_encoder() -> None:
@@ -151,6 +190,13 @@ def test_server_construction_installs_verified_0731_encoder() -> None:
     assert extraction.tool_calls[0]["function"]["name"] == "get_weather"
     assert extraction.tool_calls[0]["id"].startswith("call_")
 
+    no_tool = server.omlx_extract_tool_calls_with_thinking("", "READY", tokenizer, [])
+    assert no_tool.parser_source == "deepseek_v4_0731_official"
+    assert no_tool.status == "no_tool"
+    assert no_tool.cleaned_text == "READY"
+    assert no_tool.tool_calls is None
+    assert server._parse_generated_tool_calls_or_content("READY", tools=[]) == (None, None)
+
     translator = server._ToolAwareContentStreamTranslator(
         tools=[], argument_chunk_chars=16, tokenizer=tokenizer
     )
@@ -161,6 +207,35 @@ def test_server_construction_installs_verified_0731_encoder() -> None:
     assert translator.suppressed_tool_markup is True
     assert translator.tool_calls[0]["function"]["name"] == "get_weather"
     assert any("tool_calls" in delta for delta in deltas)
+
+    preamble = "I will check."
+    nonstream = server.omlx_extract_tool_calls_with_thinking(
+        "", preamble + regular, tokenizer, []
+    )
+    translator = server._ToolAwareContentStreamTranslator(
+        tools=[], argument_chunk_chars=16, tokenizer=tokenizer
+    )
+    # The ordinary preamble arrives before there is any evidence of DSML.
+    deltas = translator.feed("content", preamble)
+    deltas.extend(translator.feed("content", regular[:midpoint]))
+    deltas.extend(translator.feed("content", regular[midpoint:]))
+    deltas.extend(translator.finish())
+    streamed_content = "".join(delta.get("content", "") for delta in deltas)
+    assert streamed_content == nonstream.cleaned_text == preamble
+    assert translator.tool_calls == nonstream.tool_calls
+    assert any("tool_calls" in delta for delta in deltas)
+    assert "<｜DSML｜" not in json.dumps(deltas, ensure_ascii=False)
+
+    split_translator = server._ToolAwareContentStreamTranslator(
+        tools=[], argument_chunk_chars=16, tokenizer=tokenizer
+    )
+    split_deltas: list[dict[str, object]] = []
+    for character in preamble + regular:
+        split_deltas.extend(split_translator.feed("content", character))
+    split_deltas.extend(split_translator.finish())
+    assert "".join(str(delta.get("content", "")) for delta in split_deltas) == preamble
+    assert split_translator.tool_calls == nonstream.tool_calls
+    assert "<｜DSML｜" not in json.dumps(split_deltas, ensure_ascii=False)
 
 
 @pytest.mark.parametrize("forbidden_key, forbidden_value", [

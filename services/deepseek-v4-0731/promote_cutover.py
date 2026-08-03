@@ -43,8 +43,8 @@ CANDIDATE_WORKTREE = Path("/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv
 REVIEWED_REF = "refs/tags/mtplx-dsv4-0731-reviewed"
 CANDIDATE_PLIST_SHA256 = "93eac0d4eaac491c7f2f1d3a293ba38a3144ade59ee3afdf52b35cc9ec9bb101"
 ENCODING_ASSET_SET_SHA256 = "6758dfda8a39afdd00d907606c42c1a268289c463351b9628ac07f4f916d7d0a"
-MODEL_CONFIG_SHA256 = "c8ff87fd5ee5c9587d0c937e9bfd3193e1a1621141aa367848a9610b3291fa6f"
-MODEL_INDEX_SHA256 = "c84d2b369f5d5023d0f2d183fc36a935a3981751414996243b65f069983e43d8"
+MODEL_CONFIG_SHA256 = "6d0297a4329d55dccf3cd48fd168efea8044996245195d518a9e8aaa14906d3e"
+MODEL_INDEX_SHA256 = "9edcd0db7e6b8f0b8e02978d73c30083b2aa64c2e3a8fd77d3b776a4efb4bc91"
 
 
 class PromotionError(RuntimeError):
@@ -96,7 +96,11 @@ def _smoke_stop(model_id: str) -> None:
             payload = json.loads(response.read().decode("utf-8"))
         choice = payload["choices"][0]
         content = choice["message"]["content"]
-        if choice.get("finish_reason") != "stop" or not isinstance(content, str) or "READY" not in content:
+        if (
+            choice.get("finish_reason") != "stop"
+            or not isinstance(content, str)
+            or content.strip() != "READY"
+        ):
             raise ValueError("required READY/stop evidence absent")
     except (KeyError, OSError, TypeError, ValueError, urllib.error.URLError) as error:
         raise PromotionError("service smoke did not return READY with finish_reason=stop") from error
@@ -119,24 +123,43 @@ def _launchctl_pid(label: str) -> int:
     return int(match.group(1))
 
 
-def attest_live(*, label: str, plist: Path) -> dict[str, Any]:
-    """Capture exact live identity without sending a generation prompt."""
+def attest_process_identity(*, label: str, plist: Path) -> dict[str, Any]:
+    """Bind one launchd label, plist, and 8080 listener before any HTTP probe."""
     launch_pid = _launchctl_pid(label)
     listener_pid = _listener_pid(LIVE_PORT)
     if launch_pid != listener_pid:
         raise PromotionError("launchd PID and 8080 listener PID differ")
+    return {
+        "label": label,
+        "pid": launch_pid,
+        "listener_port": LIVE_PORT,
+        "plist_sha256": _sha256(plist),
+    }
+
+
+def attest_live(*, label: str, plist: Path) -> dict[str, Any]:
+    """Capture exact live identity without sending a generation prompt."""
+    process = attest_process_identity(label=label, plist=plist)
     models = _http_json(f"http://127.0.0.1:{LIVE_PORT}/v1/models")
     model_ids = [item.get("id") for item in models.get("data", []) if isinstance(item, dict)]
     if not model_ids or not all(isinstance(model_id, str) for model_id in model_ids):
         raise PromotionError("live /v1/models is not a valid service identity")
     return {
         "schema": "mtplx.live-identity.v1",
-        "label": label,
-        "pid": launch_pid,
-        "listener_port": LIVE_PORT,
-        "plist_sha256": _sha256(plist),
+        **process,
         "model_ids": model_ids,
     }
+
+
+def _wait_for_process_identity(*, label: str, plist: Path) -> dict[str, Any]:
+    """Wait for launchd and the listener to converge without probing HTTP."""
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        try:
+            return attest_process_identity(label=label, plist=plist)
+        except PromotionError:
+            time.sleep(0.5)
+    raise PromotionError("promoted launchd process did not acquire the 8080 listener")
 
 
 def _read_json_bytes(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -357,12 +380,16 @@ def promote(args: argparse.Namespace) -> None:
         try:
             _bootout(current["label"])
             _bootstrap(target)
+            promoted = _wait_for_process_identity(label=args.production_label, plist=target)
+            if promoted["plist_sha256"] != promotion_target["plist_sha256"]:
+                raise PromotionError("promoted service plist identity changed during cutover")
             _verify_live_ready(candidate["candidate_smoke"]["candidate_model_ids"])
         except BaseException:
             try:
                 _bootout(args.production_label)
             finally:
                 _bootstrap(prior_plist)
+                _wait_for_process_identity(label=current["label"], plist=prior_plist)
                 _verify_live_ready(current["model_ids"])
             raise
 

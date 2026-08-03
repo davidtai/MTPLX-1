@@ -2,8 +2,9 @@
 """Construction-only entrypoint for the isolated V4-Flash-0731 service.
 
 This module verifies and self-tests the official encoder before replacing the
-two MTPLX request-path call sites that own prompt encoding and DSML completion
-parsing. There is no tokenizer-template or stock-prompt fallback after install.
+MTPLX request-path call sites that own prompt encoding and DSML completion
+parsing. There is no tokenizer-template, stock-prompt, or stock completion
+parser fallback after install.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ import hashlib
 import json
 import re
 import sys
-import uuid
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -170,7 +170,6 @@ def _install_encoder(server: ModuleType, encoding: ModuleType):
 
 
 def _install_completion_parser(server: ModuleType, encoding: ModuleType):
-    stock = server._parse_generated_tool_calls_or_content
     dsml_marker = f"<{encoding.dsml_token}{encoding.tool_calls_block_name}>"
 
     def parse_generated_tool_calls_or_content(
@@ -182,15 +181,7 @@ def _install_completion_parser(server: ModuleType, encoding: ModuleType):
         response_id: str | None = None,
         stream: bool = False,
     ):
-        if dsml_marker not in text:
-            return stock(
-                text,
-                tools=tools,
-                tokenizer=tokenizer,
-                state=state,
-                response_id=response_id,
-                stream=stream,
-            )
+        del tools, tokenizer, state, response_id, stream
         completion = text if text.endswith(encoding.eos_token) else text + encoding.eos_token
         mode = "thinking" if encoding.thinking_end_token in completion.split(dsml_marker, 1)[0] else "chat"
         try:
@@ -207,18 +198,13 @@ def _install_actual_tool_extractor(server: ModuleType, encoding: ModuleType) -> 
     """Install official DSML completion parsing at the live response call site."""
     from mtplx.server.omlx_bridge import ToolCallExtraction
 
-    stock = server.omlx_extract_tool_calls_with_thinking
-    dsml_marker = f"<{encoding.dsml_token}{encoding.tool_calls_block_name}>"
-
     def extract(
         thinking_content: str,
         regular_content: str,
         tokenizer: Any | None,
         tools: list[dict[str, Any]] | None = None,
     ) -> ToolCallExtraction:
-        combined = thinking_content + regular_content
-        if dsml_marker not in combined:
-            return stock(thinking_content, regular_content, tokenizer, tools)
+        del tokenizer, tools
         mode = "thinking" if thinking_content else "chat"
         completion = (
             thinking_content + encoding.thinking_end_token + regular_content
@@ -233,114 +219,137 @@ def _install_actual_tool_extractor(server: ModuleType, encoding: ModuleType) -> 
             raise CandidateConstructionError("malformed V4-0731 DSML completion") from error
         calls = parsed.get("tool_calls") or None
         if calls:
-            calls = [
-                {**call, "id": str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")}
-                for call in calls
-            ]
+            stable_calls = []
+            for index, call in enumerate(calls):
+                canonical = json.dumps(call, sort_keys=True, separators=(",", ":"))
+                call_id = "call_" + hashlib.sha256(
+                    f"{index}:{canonical}".encode("utf-8")
+                ).hexdigest()[:24]
+                stable_calls.append({**call, "id": str(call.get("id") or call_id)})
+            calls = stable_calls
         return ToolCallExtraction(
             cleaned_text=str(parsed.get("content") or ""),
             tool_calls=calls,
             cleaned_thinking=str(parsed.get("reasoning_content") or ""),
             parser_source="deepseek_v4_0731_official",
             status="parsed" if calls else "no_tool",
-            raw_tool_markup_suppressed=True,
+            raw_tool_markup_suppressed=bool(calls),
         )
 
     server.omlx_extract_tool_calls_with_thinking = extract
 
 
 def _install_stream_translator(server: ModuleType, encoding: ModuleType) -> None:
-    """Buffer the official DSML envelope so streaming never leaks it as text."""
-    stock_class = server._ToolAwareContentStreamTranslator
-    dsml_marker = f"<{encoding.dsml_token}{encoding.tool_calls_block_name}>"
+    """Keep scanning after visible prose while holding split DSML prefixes."""
+
+    dsml_marker = f"<{encoding.dsml_token}"
+    dsml_envelope_start = "\n\n" + dsml_marker
 
     class DSV40731StreamTranslator:
         def __init__(self, *, tools, argument_chunk_chars, tokenizer=None, **kwargs) -> None:
+            del kwargs
             self._tools = tools
-            self._argument_chunk_chars = argument_chunk_chars
+            self._argument_chunk_chars = max(1, int(argument_chunk_chars))
             self._tokenizer = tokenizer
-            self._stock = stock_class(
-                tools=tools,
-                argument_chunk_chars=argument_chunk_chars,
-                tokenizer=tokenizer,
-                **kwargs,
-            )
             self._pending = ""
-            self._mode = "undecided"
+            self._all_content = ""
+            self._emitted_content = ""
+            self._inside_dsml = False
             self.tool_calls = None
             self.fallback_reason = None
             self.tool_parser_dialect = "deepseek_v4_0731_official"
             self._suppressed = False
+            self._emitted_tool_deltas = False
 
         @property
         def has_tool_calls(self):
-            return bool(self.tool_calls) if self._mode == "dsml" else self._stock.has_tool_calls
+            return bool(self.tool_calls)
 
         @property
         def has_emitted_tool_deltas(self):
-            return False if self._mode == "dsml" else self._stock.has_emitted_tool_deltas
+            return self._emitted_tool_deltas
 
         @property
         def suppressed_tool_markup(self):
-            return self._suppressed or self._stock.suppressed_tool_markup
+            return self._suppressed
 
         @property
         def buffering_tool_call(self):
-            return self._mode == "dsml" or self._stock.buffering_tool_call
+            return self._inside_dsml
 
         @property
         def tool_argument_in_progress(self):
-            return self._mode == "dsml" or self._stock.tool_argument_in_progress
+            return self._inside_dsml
 
         @property
         def ready_to_finish_tool_turn(self):
-            return False if self._mode == "dsml" else self._stock.ready_to_finish_tool_turn
+            return False
 
         @property
         def invalid_trailing_after_tool_call(self):
-            return False if self._mode == "dsml" else self._stock.invalid_trailing_after_tool_call
+            return False
 
         def feed(self, field: str, text: str):
-            if self._mode == "stock":
-                return self._stock.feed(field, text)
+            if not text:
+                return []
             if field != "content":
-                return self._stock.feed(field, text)
+                return [{field: text}]
+            self._all_content += text
+            if self._inside_dsml:
+                return []
             self._pending += text
-            stripped = self._pending.lstrip()
-            if dsml_marker in stripped:
-                self._mode = "dsml"
+            marker = self._pending.find(dsml_marker)
+            if marker >= 0:
+                visible = self._pending[:marker]
+                if visible.endswith("\n\n"):
+                    visible = visible[:-2]
+                self._pending = ""
+                self._inside_dsml = True
                 self._suppressed = True
-                return []
-            if dsml_marker.startswith(stripped):
-                return []
-            self._mode = "stock"
-            pending, self._pending = self._pending, ""
-            return self._stock.feed(field, pending)
+                self._emitted_content += visible
+                return [{"content": visible}] if visible else []
+            hold = 0
+            prefix_limit = max(len(dsml_marker), len(dsml_envelope_start)) - 1
+            for size in range(min(len(self._pending), prefix_limit), 0, -1):
+                suffix = self._pending[-size:]
+                if dsml_marker.startswith(suffix) or dsml_envelope_start.startswith(suffix):
+                    hold = size
+                    break
+            visible = self._pending[:-hold] if hold else self._pending
+            self._pending = self._pending[-hold:] if hold else ""
+            self._emitted_content += visible
+            return [{"content": visible}] if visible else []
 
         def finish(self, *, defer_content_resolution: bool = False):
-            if self._mode != "dsml":
-                if self._pending:
-                    self._stock.feed("content", self._pending)
-                    self._pending = ""
-                return self._stock.finish(defer_content_resolution=defer_content_resolution)
+            del defer_content_resolution
             extraction = server.omlx_extract_tool_calls_with_thinking(
-                "", self._pending, self._tokenizer, self._tools
+                "", self._all_content, self._tokenizer, self._tools
             )
             self.tool_calls = extraction.tool_calls
             self._pending = ""
-            if not self.tool_calls:
-                raise CandidateConstructionError("official DSML stream ended without tool calls")
-            return list(
-                server._stream_tool_call_deltas(
-                    self.tool_calls,
-                    argument_chunk_chars=self._argument_chunk_chars,
+            self._all_content = ""
+            deltas = []
+            if not extraction.cleaned_text.startswith(self._emitted_content):
+                raise CandidateConstructionError("official stream parse changed emitted content")
+            remaining_content = extraction.cleaned_text[len(self._emitted_content):]
+            if remaining_content:
+                deltas.append({"content": remaining_content})
+                self._emitted_content += remaining_content
+            if self.tool_calls:
+                self._suppressed = True
+                tool_deltas = list(
+                    server._stream_tool_call_deltas(
+                        self.tool_calls,
+                        argument_chunk_chars=self._argument_chunk_chars,
+                    )
                 )
-            )
+                self._emitted_tool_deltas = bool(tool_deltas)
+                deltas.extend(tool_deltas)
+            return deltas
 
         def resolve_deferred_content(self, *, has_tool_calls: bool):
-            if self._mode == "dsml":
-                return []
-            return self._stock.resolve_deferred_content(has_tool_calls=has_tool_calls)
+            del has_tool_calls
+            return []
 
     server._ToolAwareContentStreamTranslator = DSV40731StreamTranslator
 
@@ -424,7 +433,7 @@ def main() -> int:
             "serve",
             "--host", "127.0.0.1",
             "--port", "8081",
-            "--model", "/Users/davidtai/models/DeepSeek-V4-Flash-2bit-DQ-mtp",
+            "--model", "/Users/davidtai/models/DeepSeek-V4-Flash-0731-oQ2e-mtp",
             "--model-id", "deepseek-v4-0731-candidate",
             "--reasoning", "on",
             "--reasoning-effort", "low",
