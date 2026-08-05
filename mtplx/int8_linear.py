@@ -25,7 +25,6 @@ ATTRIBUTION — borrowed and improved:
 ────────────────────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
-import os
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -101,14 +100,15 @@ def int8_matvec(x: mx.array, w_int8: mx.array, scale: mx.array) -> mx.array:
 class Int8Linear(nn.Module):
     """Drop-in for nn.Linear whose weight stays int8 + per-out-channel scale.
 
-    Decode (small M) uses the fused int8 matvec; prefill (large M) dequantizes transiently
-    (weight-bandwidth is not the prefill bottleneck) unless ESCHA_INT8_ALWAYS is set.
+    Decode (small M) uses the fused int8 matvec — no bf16 weight copy, weight-bandwidth-bound.
+    Prefill (large M) is compute-bound, where a dense GEMM tiles/reuses the weight far better
+    than a per-row matvec, so we transiently dequantize there. The M<=32 gate keeps decode on
+    the fused path (the only path decode ever takes) and never dequantizes in the decode loop.
     """
     def __init__(self, w_int8: mx.array, scale: mx.array):
         super().__init__()
         self.weight = w_int8                        # [OUT, IN] int8, RESIDENT
         self.scale = scale.astype(mx.float32)       # [OUT]
-        self.always = bool(os.environ.get("ESCHA_INT8_ALWAYS"))
 
     def __call__(self, x: mx.array) -> mx.array:
         lead = x.shape[:-1]
@@ -117,15 +117,9 @@ class Int8Linear(nn.Module):
         for d in lead:
             M *= d
         x2 = x.reshape(M, IN)
-        if M <= 32 or self.always:
-            y = int8_matvec(x2, self.weight, self.scale).astype(x.dtype)   # f32 kernel out -> model dtype
-        else:
+        if M <= 32:                                 # decode: fused int8 matvec, no dequant
+            y = int8_matvec(x2, self.weight, self.scale).astype(x.dtype)
+        else:                                       # prefill: transient dequant -> dense GEMM
             w = self.weight.astype(x.dtype) * self.scale.astype(x.dtype)[:, None]
             y = x2 @ w.T
-        if os.environ.get("ESCHA_INT8_DEBUG") and M <= 32:
-            ref = x2.astype(mx.float32) @ (self.weight.astype(mx.float32) * self.scale[:, None]).T
-            rel = float(mx.max(mx.abs(y.astype(mx.float32) - ref)) / (mx.max(mx.abs(ref)) + 1e-6))
-            if rel > 1e-2:
-                print(f"  INT8 DIVERGE in-model rel={rel:.3e}  x{tuple(x.shape)} w{tuple(self.weight.shape)}",
-                      flush=True)
         return y.reshape(*lead, -1)

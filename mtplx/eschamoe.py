@@ -32,10 +32,11 @@ _XOR = np.uint16(0x3b60)
 _GATHER_PATH = os.path.join(os.path.dirname(__file__), "eschamoe_gather.npz")
 
 # Compute dtype for the Hadamard rotation + QMV matvec of the expert forward.
-# Default float32 (the numerically-safe QuaRot round-trip). ESCHA_BF16=1 keeps the
-# rotation in bf16 to drop the fp16<->fp32 cast storm (~30% of decode dispatches);
-# gated on an accuracy A/B — see bench/validate_qmv.py / the decode quality peek.
-COMPUTE_DTYPE = mx.bfloat16 if os.environ.get("ESCHA_BF16") else mx.float32
+# bf16 is the model's native dtype and the default: decoding 2-bit experts only to
+# compute them in fp32 is a wasteful cast storm (~30% of decode dispatches) with no
+# quality payoff on this checkpoint. ESCHA_FP32=1 restores the fp32 round-trip as a
+# numerical-debug escape hatch (see bench/validate_qmv.py).
+COMPUTE_DTYPE = mx.float32 if os.environ.get("ESCHA_FP32") else mx.bfloat16
 
 _DEC: mx.array | None = None
 _GATHER: dict | None = None
