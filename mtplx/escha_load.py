@@ -146,6 +146,11 @@ class EschaSwitchGLU(nn.Module):
         ind2 = indices.reshape(Tt, top_k)
         x2 = x.reshape(Tt, H)
         S = Tt * top_k
+        # Decode / spec-verify (small S): on-device per-row path, no host sync.
+        # Prefill (large S): the grouped 16-row-tile path. It reuses each decoded 2-bit weight
+        # across 16 tokens, which is ~1.6x faster than the per-row path here (444 vs 276 tok/s @16k)
+        # despite a per-layer host grouping sync — the decode-reuse dominates. (The ideal is
+        # on-device grouping WITH tile reuse; that's a follow-up kernel change.)
         if S <= 256:
             return self._forward_ondevice(x2, ind2, Tt, top_k, lead)
         ind_np = np.array(ind2)
