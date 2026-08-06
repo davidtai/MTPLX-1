@@ -105,10 +105,12 @@ class EschaSwitchGLU(nn.Module):
         gated = (nn.silu(y_gu[:, :I]) * y_gu[:, I:]).astype(mx.float16)
         xhd = t128(gated * self.dn_rin[er]).astype(mx.float16)
         y = fused_moe_matmul(xhd, te, self.dn_code, 3, H)
-        y = (t128(y) * self.dn_rout[er]).astype(mx.float32)
-        out = mx.zeros((S, H), mx.float32)
+        # Keep the scatter buffer in the model dtype (bf16): the result is returned as x.dtype
+        # anyway, so the f32 round-trip only doubled the prefill activation footprint for nothing.
+        y = (t128(y) * self.dn_rout[er]).astype(x.dtype)
+        out = mx.zeros((S, H), x.dtype)
         out[mx.array(dst_slot)] = y[mx.array(valid_prow)]
-        return out.reshape(*lead, top_k, H).astype(x.dtype)
+        return out.reshape(*lead, top_k, H)
 
     def _forward_ondevice(self, x2, ind2, Tt, top_k, lead):
         flat_e = ind2.reshape(-1)
