@@ -47,6 +47,59 @@ def is_escha_checkpoint(path: Path, config: dict[str, Any]) -> bool:
     return False
 
 
+# ── Compiled decode path ──────────────────────────────────────────────────────────────────────
+# At batch=1 decode the eschamoe MoE compute is a FIXED-shape chain of many tiny Metal launches
+# (per token: 2 gathers, 3 t128 Hadamard kernels, 2 escha_qmv matvec kernels, silu, casts). That
+# chain is host-encode-bound — the CPU can't hand kernels to the GPU fast enough to keep it busy.
+# Wrapping the pure compute in ``mx.compile`` lets MLX fuse/plan the launch chain once (traced on
+# the first token) and re-issue it as a compact captured graph every subsequent token, which cuts
+# the per-token Python + kernel-encode overhead. Weights are passed as ARGUMENTS (not closed over),
+# so the SAME compiled graph is reused across all 40 layers and every token — one trace per shape.
+# ``mx.fast.metal_kernel`` composes with ``mx.compile`` (see memory: metal-kernel-compiles-in-031),
+# so escha_qmv's custom primitive is embedded in the traced graph rather than re-encoded per call.
+#
+# ESCHA_COMPILE=0 restores the exact eager path (A/B + numerical-debug escape hatch). Default on.
+_ESCHA_COMPILE = os.environ.get("ESCHA_COMPILE", "1").strip().lower() not in ("0", "", "false", "no", "off")
+_DECODE_FN: dict = {}
+
+
+def _escha_decode_compute(x2, ind2, gu_code, gu_rin, gu_rout, dn_code, dn_rin, dn_rout, I, H):
+    """Shape-stable eschamoe decode MoE compute (the S<=256 on-device path, no host sync).
+
+    x2 [Tt, H], ind2 [Tt, top_k] -> y [Tt*top_k, H] bf16.  ``I``/``H`` are Python ints (model
+    globals, baked when compiled).  This is byte-for-byte the body of the original
+    ``_forward_ondevice`` minus the trailing reshape (kept in the caller so ``lead`` never enters
+    the traced graph).  Called eagerly when ESCHA_COMPILE=0, or wrapped by ``mx.compile`` otherwise.
+    """
+    Tt = x2.shape[0]
+    top_k = ind2.shape[-1]
+    flat_e = ind2.reshape(-1)
+    flat_tok = mx.repeat(mx.arange(Tt), top_k)
+    xh = t128(x2[flat_tok], pre=gu_rin[flat_e])
+    y_gu = escha_qmv(xh, flat_e, gu_code, 2, 2 * I)
+    y_gu = t128(y_gu, post=gu_rout[flat_e])
+    gated = nn.silu(y_gu[:, :I]) * y_gu[:, I:]
+    xhd = t128(gated, pre=dn_rin[flat_e])
+    y = escha_qmv(xhd, flat_e, dn_code, 3, H)
+    y = t128(y, post=dn_rout[flat_e]).astype(mx.bfloat16)
+    return y
+
+
+def _get_decode_fn(I, H):
+    """One ``mx.compile``d graph per (I, H) — i.e. one for the whole model. Cached so the trace
+    happens once; same-shape calls (all layers, every token) reuse it. Distinct S (e.g. spec-verify
+    with S>8) trace their own graph on first use — a small bounded set, each reused thereafter."""
+    key = (I, H)
+    fn = _DECODE_FN.get(key)
+    if fn is None:
+        fn = mx.compile(
+            lambda x2, ind2, guc, gur, guo, dnc, dnr, dno:
+                _escha_decode_compute(x2, ind2, guc, gur, guo, dnc, dnr, dno, I, H)
+        )
+        _DECODE_FN[key] = fn
+    return fn
+
+
 def _group_layout(ind_np, top_k, E):
     """Sort routed slots by expert, pad each expert block to 16 rows (prefill path)."""
     T = ind_np.shape[0]
@@ -113,15 +166,12 @@ class EschaSwitchGLU(nn.Module):
         return out.reshape(*lead, top_k, H)
 
     def _forward_ondevice(self, x2, ind2, Tt, top_k, lead):
-        flat_e = ind2.reshape(-1)
-        flat_tok = mx.repeat(mx.arange(Tt), top_k)
-        xh = t128(x2[flat_tok], pre=self.gu_rin[flat_e])
-        y_gu = escha_qmv(xh, flat_e, self.gu_code, 2, 2 * self.I)
-        y_gu = t128(y_gu, post=self.gu_rout[flat_e])
-        gated = nn.silu(y_gu[:, :self.I]) * y_gu[:, self.I:]
-        xhd = t128(gated, pre=self.dn_rin[flat_e])
-        y = escha_qmv(xhd, flat_e, self.dn_code, 3, self.H)
-        y = t128(y, post=self.dn_rout[flat_e]).astype(mx.bfloat16)
+        args = (x2, ind2, self.gu_code, self.gu_rin, self.gu_rout,
+                self.dn_code, self.dn_rin, self.dn_rout)
+        if _ESCHA_COMPILE:
+            y = _get_decode_fn(self.I, self.H)(*args)
+        else:
+            y = _escha_decode_compute(*args, self.I, self.H)
         return y.reshape(*lead, top_k, self.H)
 
 
