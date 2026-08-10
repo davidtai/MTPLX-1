@@ -627,6 +627,11 @@ def install_deepseek_v4_attention_island(
 ) -> dict[str, Any]:
     """Validate the canonical checkpoint, prebind nine tapes, and install."""
 
+    if getattr(model, "_dspark", None) is not None:
+        raise AttentionIslandError(
+            "DSpark requires tap-aware attention-island support; refusing to "
+            "install a target route that its tap collector would bypass"
+        )
     _validate_model(model, config)
     stock = getattr(model, "_target_hc_hidden_route", model.model.hc_hidden)
     bound_by_width: dict[int, _BoundWidthBody] = {}

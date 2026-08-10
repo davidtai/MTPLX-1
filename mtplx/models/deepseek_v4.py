@@ -273,7 +273,7 @@ import math
 import os
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1381,6 +1381,14 @@ class _DirectDenseMTPOLora(_DirectDenseOLora):
     __slots__ = ()
 
 
+_DSPARK_MANIFEST_KEYS = (
+    "dspark_block_size",
+    "dspark_noise_token_id",
+    "dspark_target_layer_ids",
+    "dspark_markov_rank",
+)
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v4"
@@ -1434,6 +1442,26 @@ class ModelArgs(BaseModelArgs):
     # upstream as ``mtp.0.*``; a conversion that drops it leaves this field at 1
     # while shipping no weights, which :meth:`Model.sanitize` detects and honours.
     num_nextn_predict_layers: int = 0
+    temperature: float = 1.0
+    # DeepSeek-V4-Flash-0731's DSpark draft is not the legacy one-layer MTP
+    # block above.  These fields are deliberately separate: the manifest selects
+    # one installed implementation at construction, never in the decode path.
+    # ``None`` preserves whether the artifact actually carried a DSpark field.
+    # This lets construction distinguish an absent legacy field from an explicit
+    # corrupt value such as ``dspark_block_size: 0``.
+    dspark_block_size: Optional[int] = None
+    dspark_noise_token_id: Optional[int] = None
+    dspark_target_layer_ids: Optional[List[int]] = None
+    dspark_markov_rank: Optional[int] = None
+    _dspark_signature_present: bool = field(default=False, init=False, repr=False)
+
+    @classmethod
+    def from_dict(cls, params):
+        args = super().from_dict(params)
+        args._dspark_signature_present = any(
+            key in params for key in _DSPARK_MANIFEST_KEYS
+        )
+        return args
 
     def __post_init__(self):
         # Accept the HF rope_scaling block and mirror it into the flat YaRN fields
@@ -3451,6 +3479,518 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
         return (logits, x) if return_hidden else logits
 
 
+# DSpark arithmetic below is transcribed from the official dedicated repository,
+# not inferred from the earlier preview-MTP implementation:
+# https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/blob/aa22cb07426656189b2573b8e77a9b7333b8ae0f/inference/model.py
+# The cited line numbers refer to that exact immutable source revision.
+def get_dspark_topk_idxs(
+    window_size: int, batch_size: int, block_size: int, start_pos: int
+) -> mx.array:
+    """Exact 0731 DSpark visibility matrix (official model.py L744-747)."""
+    if int(start_pos) <= 0:
+        raise ValueError("DSpark decode visibility requires start_pos > 0")
+    main = mx.arange(min(int(window_size), int(start_pos) + 1), dtype=mx.int32)
+    draft = int(window_size) + mx.arange(int(block_size), dtype=mx.int32)
+    row = mx.concatenate([main, draft])
+    return mx.broadcast_to(row[None, None, :], (int(batch_size), int(block_size), row.shape[0]))
+
+
+class DeepseekV4DSparkCache:
+    """Stage-owned fixed ring used by official ``DSparkAttention``."""
+
+    def __init__(self, window_size: int, head_dim: int):
+        self.window_size = int(window_size)
+        self.head_dim = int(head_dim)
+        self.ring: Optional[mx.array] = None
+        self.prefill_length = 0
+
+    def prefill(self, main_kv: mx.array) -> None:
+        b, seqlen, d = main_kv.shape
+        if d != self.head_dim:
+            raise ValueError("DSpark cache head dimension mismatch")
+        win = self.window_size
+        if seqlen <= win:
+            pad = mx.zeros((b, win - seqlen, d), dtype=main_kv.dtype)
+            self.ring = mx.concatenate([main_kv, pad], axis=1)
+        else:
+            last = main_kv[:, -win:]
+            cutoff = seqlen % win
+            self.ring = last if cutoff == 0 else mx.concatenate(
+                [last[:, win - cutoff:], last[:, : win - cutoff]], axis=1
+            )
+        self.prefill_length = int(seqlen)
+
+    def commit_main(self, start_pos: int, main_kv: mx.array) -> None:
+        """Commit consecutive authoritative target rows into the fixed ring."""
+        if self.ring is None:
+            raise RuntimeError("DSpark decode requires attention-only prefill first")
+        if main_kv.ndim != 3 or main_kv.shape[0] != self.ring.shape[0]:
+            raise ValueError("DSpark committed main KV must match the ring batch")
+        rows = int(main_kv.shape[1])
+        if rows <= 0 or rows > self.window_size:
+            raise ValueError("DSpark committed main KV width is outside its ring")
+        index = int(start_pos) % self.window_size
+        first = min(rows, self.window_size - index)
+        ring = mx.concatenate(
+            [
+                self.ring[:, :index],
+                main_kv[:, :first],
+                self.ring[:, index + first :],
+            ],
+            axis=1,
+        )
+        remaining = rows - first
+        if remaining:
+            ring = mx.concatenate(
+                [main_kv[:, first:], ring[:, remaining:]], axis=1
+            )
+        self.ring = ring
+
+    def replace_main(self, start_pos: int, main_kv: mx.array) -> None:
+        """Compatibility name for the one-row official proposal update."""
+        if int(main_kv.shape[1]) != 1:
+            raise ValueError("DSpark decode replaces exactly one current-main KV")
+        self.commit_main(start_pos, main_kv)
+
+
+class DeepseekV4DSparkAttention(DeepseekV4Attention):
+    """Official 0731 DSpark attention, distinct from trunk CSA attention."""
+
+    def __init__(self, args: ModelArgs, layer_id: int):
+        super().__init__(args, layer_id)
+        if self.compress_ratio != 0:
+            raise ValueError("DSpark attention requires compress_ratio=0")
+
+    def _kv(self, x: mx.array, positions: mx.array) -> mx.array:
+        rd = self.rope_head_dim
+        cos, sin = self._rope_tables(positions)
+        kv = self.kv_norm(self.wkv(x))
+        return mx.concatenate(
+            [kv[..., :-rd], _apply_interleaved_rope(kv[..., -rd:], cos[None], sin[None])],
+            axis=-1,
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        *,
+        start_pos: int,
+        main_x: mx.array,
+        cache: DeepseekV4DSparkCache,
+    ) -> mx.array:
+        b, main_len, _ = main_x.shape
+        main_pos = mx.arange(int(start_pos), int(start_pos) + main_len)
+        main_kv = self._kv(main_x, main_pos)
+        if int(start_pos) == 0:
+            cache.prefill(main_kv)
+            return x
+
+        if int(x.shape[1]) != _DSPARK_BLOCK_SIZE:
+            raise ValueError("DSpark decode requires one complete five-token block")
+        cache.replace_main(start_pos, main_kv)
+        block = int(x.shape[1])
+        positions = mx.arange(int(start_pos) + main_len, int(start_pos) + main_len + block)
+        cos, sin = self._rope_tables(positions)
+        rd = self.rope_head_dim
+
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).reshape(b, block, self.n_heads, self.head_dim)
+        q = q * mx.rsqrt(
+            mx.mean(mx.square(q.astype(mx.float32)), axis=-1, keepdims=True) + self.eps
+        )
+        q = q.astype(x.dtype)
+        q = mx.concatenate(
+            [q[..., :-rd], _apply_interleaved_rope(q[..., -rd:], cos[None, :, None], sin[None, :, None])],
+            axis=-1,
+        )
+        draft_kv = self._kv(x, positions)
+        full_kv = mx.concatenate([cache.ring, draft_kv], axis=1)
+        topk = get_dspark_topk_idxs(self.window_size, b, block, start_pos)
+        # Every row has the same official index vector.  Slice once; the query
+        # dimension is still fully retained in q.
+        visible_kv = full_kv[:, topk[0, 0]]
+        o = self._attend(q.transpose(0, 2, 1, 3), visible_kv, None)
+        o = o.transpose(0, 2, 1, 3)
+        o = mx.concatenate(
+            [o[..., :-rd], _apply_interleaved_rope(o[..., -rd:], cos[None, :, None], -sin[None, :, None])],
+            axis=-1,
+        )
+        return self._o_lora(o.reshape(b, block, self.n_heads * self.head_dim))
+
+
+class DSparkMarkovHead(nn.Module):
+    """The 0731 sequential token-id bias, kept separate from the lm head."""
+
+    def __init__(self, vocab_size: int, rank: int):
+        super().__init__()
+        self.markov_w1 = nn.Embedding(vocab_size, rank)
+        self.markov_w2 = nn.Linear(rank, vocab_size, bias=False)
+
+    def __call__(self, token_ids: mx.array) -> Tuple[mx.array, mx.array]:
+        embed = self.markov_w1(token_ids)
+        return self.markov_w2(embed), embed
+
+
+class DSparkConfidenceHead(nn.Module):
+    """DSpark's fp32 confidence projection (not a vocabulary-logit head)."""
+
+    def __init__(self, hidden_size: int, markov_rank: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size + markov_rank, 1, bias=False)
+
+    def __call__(self, hidden: mx.array, markov_embed: mx.array) -> mx.array:
+        x = mx.concatenate([hidden, markov_embed], axis=-1).astype(mx.float32)
+        # MLX stores Linear's parameters at the module dtype.  Cast both here so
+        # the confidence contract remains fp32 even when the model is bf16.
+        return (x @ self.proj.weight.astype(mx.float32).T).squeeze(-1)
+
+
+class DeepseekV4DSparkStage(DeepseekV4DecoderLayer):
+    """One of the three native 0731 DSpark stages.
+
+    Prefill writes this stage's attention cache only, as the upstream
+    ``DSparkBlock.forward`` does at ``start_pos == 0``.  Decode takes the normal
+    HC-attention-MoE block path.  The cache is supplied by its owning stage; no
+    stage ever borrows a trunk or sibling cache.
+    """
+
+    def __init__(self, args: ModelArgs, stage_id: int):
+        layer_id = args.num_hidden_layers + stage_id
+        ratios = list(args.compress_ratios)
+        if len(ratios) <= layer_id:
+            ratios.extend([0] * (layer_id + 1 - len(ratios)))
+            args = replace(args, compress_ratios=ratios)
+        super().__init__(args, layer_id)
+        self.attn = DeepseekV4DSparkAttention(args, layer_id)
+        self.stage_id = int(stage_id)
+        self.block_size = int(args.dspark_block_size)
+        self.noise_token_id = int(args.dspark_noise_token_id)
+        self.main_proj = None
+        self.main_norm = None
+        self.norm = None
+        self.hc_head = None
+        self.markov_head = None
+        self.confidence_head = None
+        if stage_id == 0:
+            self.main_proj = nn.Linear(
+                args.hidden_size * len(args.dspark_target_layer_ids), args.hidden_size,
+                bias=False,
+            )
+            self.main_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        if stage_id == _DSPARK_STAGE_COUNT - 1:
+            self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.hc_head = HeadHC(args.hidden_size, args.hc_mult, args.hc_eps)
+            self.markov_head = DSparkMarkovHead(args.vocab_size, args.dspark_markov_rank)
+            self.confidence_head = DSparkConfidenceHead(
+                args.hidden_size, args.dspark_markov_rank
+            )
+
+    def fuse_main(self, main_hidden: mx.array) -> mx.array:
+        if self.main_proj is None or self.main_norm is None:
+            raise RuntimeError("DSpark main fusion belongs exclusively to stage 0")
+        return self.main_norm(self.main_proj(main_hidden))
+
+    def prefill(self, h: mx.array, cache, main_x: mx.array) -> mx.array:
+        """Populate only this stage's attention cache; do not run its MoE."""
+        # The stage has a pure sliding-window cache in the 0731 manifest.  The
+        # cache is deliberately built from stage 0's projected target state on
+        # every stage, matching DSparkAttention's ``main_x`` prefill operand.
+        # The attention result is discarded: upstream prefill exists to seed KV
+        # state, and DSpark's draft output is produced on decode.
+        self.attn(h, start_pos=0, main_x=main_x, cache=cache)
+        return h
+
+    def __call__(
+        self, h: mx.array, *, start_pos: int, cache=None, input_ids=None,
+        main_x=None,
+    ) -> mx.array:
+        if int(start_pos) == 0:
+            if main_x is None:
+                raise ValueError("DSpark prefill requires stage-0 main_x")
+            return self.prefill(h, cache, main_x)
+        residual = h
+        x, post, comb = self.attn_hc.pre(h)
+        x = self.attn_norm(x)
+        x = self.attn(x, start_pos=start_pos, main_x=main_x, cache=cache)
+        h = self.attn_hc.post(x, residual, post, comb)
+        residual = h
+        x, post, comb = self.ffn_hc.pre(h)
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids=input_ids)
+        return self.ffn_hc.post(x, residual, post, comb)
+
+
+_DSPARK_STAGE_COUNT = 3
+_DSPARK_BLOCK_SIZE = 5
+_DSPARK_NOISE_TOKEN_ID = 128799
+_DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
+_DSPARK_MARKOV_RANK = 256
+
+
+def _has_dspark_signature(args: ModelArgs) -> bool:
+    """Whether any 0731-only manifest value is present, complete or corrupt."""
+    return bool(args._dspark_signature_present) or any(
+        value is not None
+        for value in (
+            args.dspark_block_size,
+            args.dspark_noise_token_id,
+            args.dspark_target_layer_ids,
+            args.dspark_markov_rank,
+        )
+    )
+
+
+def _config_has_dspark_signature(config: dict) -> bool:
+    config = config or {}
+    return any(key in config for key in _DSPARK_MANIFEST_KEYS)
+
+
+def _validate_dspark_manifest(args: ModelArgs) -> None:
+    """Fail before installation if this is not the exact 0731 DSpark artifact."""
+    if int(args.dspark_block_size or 0) != _DSPARK_BLOCK_SIZE:
+        raise ValueError("DSpark-0731 requires dspark_block_size=5")
+    if int(args.num_nextn_predict_layers) != 1:
+        raise ValueError("DSpark-0731 requires num_nextn_predict_layers=1")
+    if int(args.dspark_noise_token_id or 0) != _DSPARK_NOISE_TOKEN_ID:
+        raise ValueError("DSpark-0731 requires dspark_noise_token_id=128799")
+    if tuple(int(x) for x in (args.dspark_target_layer_ids or ())) != _DSPARK_TARGET_LAYER_IDS:
+        raise ValueError("DSpark-0731 requires target taps (40, 41, 42)")
+    if args.num_hidden_layers <= _DSPARK_TARGET_LAYER_IDS[-1]:
+        raise ValueError("DSpark-0731 target taps are absent from this trunk")
+    if args.vocab_size <= _DSPARK_NOISE_TOKEN_ID:
+        raise ValueError("DSpark-0731 vocabulary omits its noise token")
+    if int(args.dspark_markov_rank or 0) != _DSPARK_MARKOV_RANK:
+        raise ValueError("DSpark-0731 requires dspark_markov_rank=256")
+    ratios = list(args.compress_ratios)
+    for layer_id in range(args.num_hidden_layers, args.num_hidden_layers + _DSPARK_STAGE_COUNT):
+        if layer_id < len(ratios) and int(ratios[layer_id]) != 0:
+            raise ValueError("DSpark-0731 stages require uncompressed attention")
+
+
+def _sample_dspark_token(
+    logits: mx.array, temperature: float, *, greedy: bool = False, key=None
+) -> mx.array:
+    """Official Gumbel-max sampler plus an explicit canonical greedy control."""
+    temperature = float(temperature)
+    if greedy or temperature == 0.0:
+        return mx.argmax(logits, axis=-1)
+    scaled = logits / max(temperature, 1e-5)
+    uniform = mx.random.uniform(shape=scaled.shape, key=key)
+    uniform = mx.clip(uniform, 1e-30, 1.0 - mx.finfo(mx.float32).eps)
+    gumbel = -mx.log(-mx.log(uniform))
+    return mx.argmax(scaled.astype(mx.float32) + gumbel, axis=-1)
+
+
+class DeepseekV4DSpark:
+    """Installed 0731 DSpark layer set; intentionally not generation routing."""
+
+    def __init__(self, args: ModelArgs):
+        _validate_dspark_manifest(args)
+        self.args = args
+        self.block_size = _DSPARK_BLOCK_SIZE
+        self.noise_token_id = _DSPARK_NOISE_TOKEN_ID
+        self.target_layer_ids = _DSPARK_TARGET_LAYER_IDS
+        self.stages = [DeepseekV4DSparkStage(args, i) for i in range(_DSPARK_STAGE_COUNT)]
+
+    def draft_input_ids(self, target_ids: mx.array) -> mx.array:
+        if target_ids.ndim != 1:
+            raise ValueError("DSpark target ids must be a [batch] tensor")
+        noise = mx.full((target_ids.shape[0], self.block_size), self.noise_token_id,
+                        dtype=target_ids.dtype)
+        return mx.concatenate([target_ids[:, None], noise[:, 1:]], axis=1)
+
+    def make_cache(self) -> list:
+        return [
+            DeepseekV4DSparkCache(
+                window_size=stage.attn.window_size,
+                head_dim=stage.attn.head_dim,
+            )
+            for stage in self.stages
+        ]
+
+    def prefill(self, main_hidden: mx.array, caches) -> None:
+        """Seed all three stage rings from the authoritative prompt taps."""
+        if len(caches) != _DSPARK_STAGE_COUNT:
+            raise ValueError("DSpark requires one cache owned by each stage")
+        main_x = self.stages[0].fuse_main(main_hidden)
+        # At start_pos=0 DSparkAttention reads only main_x. Passing a narrow
+        # view avoids constructing the five noise-token embeddings discarded by
+        # the official attention-only prefill branch.
+        ignored = main_x[:, :1]
+        for stage, cache in zip(self.stages, caches):
+            stage.attn(
+                ignored,
+                start_pos=0,
+                main_x=main_x,
+                cache=cache,
+            )
+
+    def commit_main(self, main_hidden: mx.array, caches, *, start_pos: int) -> None:
+        """Commit only the target-verified proposal prefix to every stage ring."""
+        if len(caches) != _DSPARK_STAGE_COUNT:
+            raise ValueError("DSpark requires one cache owned by each stage")
+        if int(main_hidden.shape[1]) <= 0:
+            return
+        main_x = self.stages[0].fuse_main(main_hidden)
+        positions = mx.arange(int(start_pos), int(start_pos) + int(main_x.shape[1]))
+        for stage, cache in zip(self.stages, caches):
+            cache.commit_main(start_pos, stage.attn._kv(main_x, positions))
+
+    def finish(
+        self, logits: mx.array, hidden: mx.array, target_ids: mx.array,
+        *, greedy: bool = False, key=None,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Apply the sequential Markov recurrence and return fp32 confidence."""
+        final = self.stages[-1]
+        if final.markov_head is None or final.confidence_head is None:
+            raise RuntimeError("DSpark final stage is missing its output heads")
+        if logits.shape[1] != self.block_size or hidden.shape[1] != self.block_size:
+            raise ValueError("DSpark finish requires exactly one five-token block")
+        output_ids = [target_ids]
+        biased_rows = []
+        markov_embeds = []
+        previous = target_ids
+        keys = [None] * self.block_size if key is None else list(mx.random.split(key, self.block_size))
+        for i in range(self.block_size):
+            bias, markov_embed = final.markov_head(previous)
+            row = logits[:, i] + bias
+            biased_rows.append(row)
+            markov_embeds.append(markov_embed)
+            previous = _sample_dspark_token(
+                row, self.args.temperature, greedy=greedy, key=keys[i]
+            ).astype(target_ids.dtype)
+            output_ids.append(previous)
+        confidence = final.confidence_head(hidden, mx.stack(markov_embeds, axis=1))
+        return (mx.stack(output_ids, axis=1), mx.stack(biased_rows, axis=1), confidence)
+
+    def finish_ids(
+        self,
+        logits: mx.array,
+        target_ids: mx.array,
+        *,
+        width: int,
+        forced_first_token_ids: mx.array | None = None,
+    ) -> mx.array:
+        """Return a greedy proposal prefix without unused heads or rows.
+
+        ``forced_first_token_ids`` installs the target-owned primary at row zero
+        and uses it to seed the sequential Markov bias for the genuinely future
+        rows. The neural DSpark rows remain the same fixed parallel block; only
+        the token-id recurrence stops asking the drafter to overrule a token the
+        target has already sampled.
+        """
+        width = int(width)
+        if width < 1 or width > self.block_size:
+            raise ValueError("DSpark ids-only width must be between one and five")
+        if int(logits.shape[1]) != width:
+            raise ValueError("DSpark ids-only logits must match proposal width")
+        final = self.stages[-1]
+        if final.markov_head is None:
+            raise RuntimeError("DSpark final stage is missing its Markov head")
+        output_ids = [target_ids]
+        if forced_first_token_ids is None:
+            previous = target_ids
+            first_row = 0
+        else:
+            if forced_first_token_ids.shape != target_ids.shape:
+                raise ValueError("forced DSpark primary must match target id shape")
+            previous = forced_first_token_ids.astype(target_ids.dtype)
+            output_ids.append(previous)
+            first_row = 1
+        for index in range(first_row, width):
+            bias, _markov_embed = final.markov_head(previous)
+            previous = mx.argmax(logits[:, index] + bias, axis=-1).astype(
+                target_ids.dtype
+            )
+            output_ids.append(previous)
+        return mx.stack(output_ids, axis=1)
+
+    def forward(
+        self,
+        main_hidden: mx.array,
+        target_ids: mx.array,
+        embed_tokens: nn.Module,
+        lm_head: nn.Module,
+        caches=None,
+        *,
+        start_pos: int,
+        greedy: bool = False,
+        key=None,
+        ids_only_width: int | None = None,
+        forced_first_token_ids: mx.array | None = None,
+    ):
+        """Execute the three-stage 0731 layer without generation integration.
+
+        ``main_hidden`` is the target route's already-concatenated HC means.
+        ``start_pos == 0`` is the sole prefill signal: all three stages only write
+        their attention caches and return no draft output.  Positive positions run
+        all three full HC-attention-MoE stages.
+        """
+        if caches is None:
+            caches = self.make_cache()
+        if len(caches) != _DSPARK_STAGE_COUNT:
+            raise ValueError("DSpark requires one cache owned by each of its three stages")
+        main_x = self.stages[0].fuse_main(main_hidden)
+        ids = self.draft_input_ids(target_ids)
+        h = embed_tokens(ids)
+        h = mx.broadcast_to(h[:, :, None, :], (*h.shape[:2], self.args.hc_mult, h.shape[-1]))
+        for stage, cache in zip(self.stages, caches):
+            h = stage(
+                h, start_pos=start_pos, cache=cache, input_ids=ids,
+                main_x=main_x,
+            )
+        if int(start_pos) == 0:
+            return None
+        final = self.stages[-1]
+        if final.hc_head is None or final.norm is None:
+            raise RuntimeError("DSpark final stage is missing its shared-head route")
+        collapsed = final.hc_head(h)
+        if ids_only_width is not None:
+            width = int(ids_only_width)
+            if width < 1 or width > self.block_size:
+                raise ValueError("DSpark ids-only width must be between one and five")
+            logits = lm_head(final.norm(collapsed[:, :width]))
+            if forced_first_token_ids is None:
+                return self.finish_ids(logits, target_ids, width=width)
+            return self.finish_ids(
+                logits,
+                target_ids,
+                width=width,
+                forced_first_token_ids=forced_first_token_ids,
+            )
+        logits = lm_head(final.norm(collapsed))
+        return self.finish(logits, collapsed, target_ids, greedy=greedy, key=key)
+
+
+class _LegacyTargetRoute:
+    """Installed target route for pre-0731 checkpoints."""
+
+    def __call__(self, owner, inputs: mx.array, cache):
+        h = owner._target_hc_hidden_route(inputs, cache)
+        return h, h
+
+
+class _DSparkTargetRoute:
+    """Installed target route that captures the three HC-collapsed tap means."""
+
+    def __call__(self, owner, inputs: mx.array, cache):
+        h = owner.model.embed_tokens(inputs)
+        h = mx.broadcast_to(h[:, :, None, :], (*h.shape[:2], owner.args.hc_mult, h.shape[-1]))
+        if cache is None:
+            cache = [None] * len(owner.model.layers)
+        taps = []
+        wanted = owner._dspark.target_layer_ids
+        for layer_id, (layer, layer_cache) in enumerate(zip(owner.model.layers, cache)):
+            h = layer(h, mask=None, cache=layer_cache, input_ids=inputs)
+            if layer_id in wanted:
+                # This is intentionally inside the layer loop: DSpark consumes
+                # the HC mean from the exact post-layer state, not a later state.
+                taps.append(mx.mean(h, axis=2))
+        if len(taps) != _DSPARK_STAGE_COUNT:
+            raise RuntimeError("DSpark target route did not observe every required tap")
+        return h, mx.concatenate(taps, axis=-1)
+
+
 class DeepseekV4Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -3503,10 +4043,22 @@ class Model(nn.Module):
         # Reference ``Transformer.mtp`` (model.py L789-793): a top-level list, so
         # the parameter paths are ``mtp.{i}.*`` — exactly the upstream checkpoint's
         # names.  Dropped again by :meth:`sanitize` if the weights are not there.
-        self.mtp = [
-            DeepseekV4MTP(args, args.num_hidden_layers + i)
-            for i in range(max(int(args.num_nextn_predict_layers or 0), 0))
-        ]
+        # A DSpark manifest installs a different, typed target route and exactly
+        # three owned stage objects.  Do not even construct the legacy preview-MTP
+        # type for that artifact: the manifest selects one representation once.
+        if _has_dspark_signature(args):
+            self._dspark = DeepseekV4DSpark(args)
+            # Preserve the checkpoint's upstream ``mtp.{stage}.*`` namespace.
+            # `_dspark` is the installed type/control surface, while this list is
+            # the only registered parameter owner.
+            self.mtp = self._dspark.stages
+        else:
+            self._dspark = None
+            self.mtp = [
+                DeepseekV4MTP(args, args.num_hidden_layers + i)
+                for i in range(max(int(args.num_nextn_predict_layers or 0), 0))
+            ]
+        self._target_hidden_route = _DSparkTargetRoute() if self._dspark else _LegacyTargetRoute()
         # Construction-time performance installers may replace this with a
         # typed phase/width router.  The stock callable is explicit and direct;
         # decoder layers never probe candidate eligibility or fall back.
@@ -3550,7 +4102,7 @@ class Model(nn.Module):
                 "the DeepSeek-V4 backend does not support input_embeddings "
                 "(no vision splice path)"
             )
-        h = self._target_hc_hidden_route(inputs, cache)
+        h, exposed_hidden = self._target_hidden_route(self, inputs, cache)
         logits = None
         if emit_logits:
             source = h
@@ -3559,7 +4111,7 @@ class Model(nn.Module):
             logits = self.logits_from_hc_hidden(source)
         if not return_hidden:
             return logits
-        return logits, h
+        return logits, exposed_hidden
 
     @property
     def layers(self):
@@ -3583,11 +4135,43 @@ class Model(nn.Module):
 
     @property
     def has_mtp(self) -> bool:
-        return bool(self.mtp_blocks)
+        # DSpark has its own five-token output protocol and has deliberately not
+        # been connected to the generic preview-MTP generation path yet.
+        return self._dspark is None and bool(self.mtp_blocks)
 
     def hc_hidden(self, inputs: mx.array, cache=None) -> mx.array:
         """Trunk forward stopping at the pre-head state the MTP block consumes."""
         return self.model.hc_hidden(inputs, cache)
+
+    def _collect_dspark_taps(
+        self, h: mx.array, *, start_layer: int = 0, cache=None, input_ids=None
+    ) -> mx.array:
+        """Collect DSpark's post-layer HC means, primarily for exactness gates.
+
+        The installed target route above uses the same operation during a real
+        forward.  Keeping this small helper makes the boundary observable without
+        creating a second model-forward implementation for tests or loaders.
+        """
+        if self._dspark is None:
+            raise RuntimeError("DSpark taps requested from a legacy V4 model")
+        if cache is None:
+            cache = [None] * len(self.model.layers)
+        taps = []
+        wanted = self._dspark.target_layer_ids
+        for layer_id in range(int(start_layer), len(self.model.layers)):
+            h = self.model.layers[layer_id](
+                h, mask=None, cache=cache[layer_id], input_ids=input_ids
+            )
+            if layer_id in wanted:
+                taps.append(mx.mean(h, axis=2))
+        if len(taps) != _DSPARK_STAGE_COUNT:
+            raise RuntimeError("DSpark target tap collection was incomplete")
+        return mx.concatenate(taps, axis=-1)
+
+    def make_dspark_cache(self):
+        if self._dspark is None:
+            raise RuntimeError("this checkpoint does not install DSpark")
+        return self._dspark.make_cache()
 
     def logits_from_hc_hidden(self, h: mx.array) -> mx.array:
         """``[b, s, hc, dim]`` -> target logits; the other half of :meth:`hc_hidden`.
@@ -3635,6 +4219,8 @@ class Model(nn.Module):
         RoPE at the wrong absolute position instead of failing.
         """
         blocks = self.mtp_blocks
+        if self._dspark is not None:
+            raise RuntimeError("DSpark-0731 generation routing is not installed")
         if not blocks:
             raise RuntimeError("this checkpoint ships no MTP block")
         if isinstance(cache, (list, tuple)):
@@ -3741,6 +4327,40 @@ class Model(nn.Module):
         ``load_weights(strict=True)`` still sees an exact match instead of 58
         spurious "missing" keys.
         """
+        # Official PyTorch HC tensors are flat fields; the MLX modules group the
+        # same three arrays under their installed HC objects.  Translate once at
+        # the load boundary for both trunk and DSpark blocks.
+        hc_suffixes = {
+            ".hc_attn_fn": ".attn_hc.fn",
+            ".hc_attn_base": ".attn_hc.base",
+            ".hc_attn_scale": ".attn_hc.scale",
+            ".hc_ffn_fn": ".ffn_hc.fn",
+            ".hc_ffn_base": ".ffn_hc.base",
+            ".hc_ffn_scale": ".ffn_hc.scale",
+            ".hc_head_fn": ".hc_head.fn",
+            ".hc_head_base": ".hc_head.base",
+            ".hc_head_scale": ".hc_head.scale",
+        }
+        translated = {}
+        for key, value in weights.items():
+            target = str(key)
+            for source_suffix, target_suffix in hc_suffixes.items():
+                if target.endswith(source_suffix):
+                    target = target[: -len(source_suffix)] + target_suffix
+                    break
+            translated[target] = value
+        weights = translated
+        if self._dspark is not None:
+            missing = [
+                stage_id for stage_id in range(_DSPARK_STAGE_COUNT)
+                if not any(str(k).startswith(f"mtp.{stage_id}.") for k in weights)
+            ]
+            if missing:
+                raise ValueError(
+                    "DSpark-0731 checkpoint is missing required stage tensors: "
+                    + ", ".join(f"mtp.{stage_id}.*" for stage_id in missing)
+                )
+            return weights
         if self.mtp_blocks and not any(str(k).startswith("mtp.") for k in weights):
             self.mtp = []
         return weights
@@ -4272,6 +4892,11 @@ def is_deepseek_v4_mtp_config(config: dict) -> bool:
     mlx-community conversions declare the layer and ship no tensors, which is what
     the runtime's degrade-to-autoregressive branch exists for).
     """
+    if _config_has_dspark_signature(config or {}):
+        # 0731 uses the same num_nextn_predict_layers=1 marker as preview MTP but
+        # has a different three-stage protocol.  It must wait for its dedicated
+        # runtime route instead of being injected into the legacy adapter.
+        return False
     model_type = str((config or {}).get("model_type") or "").lower()
     architectures = [str(a) for a in (config or {}).get("architectures") or []]
     if model_type != "deepseek_v4" and not any(

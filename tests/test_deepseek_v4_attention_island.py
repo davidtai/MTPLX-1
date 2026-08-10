@@ -394,6 +394,26 @@ def test_runtime_installs_island_after_loaded_o_lora_routes():
     assert "deepseek_v4_attention_island_report" in runtime_source
 
 
+def test_install_rejects_dspark_before_publishing_a_bypassed_route(monkeypatch):
+    stock = object()
+    model = SimpleNamespace(
+        _dspark=object(),
+        _target_hc_hidden_route=stock,
+        model=SimpleNamespace(hc_hidden=stock),
+    )
+
+    def forbidden_validation(*_args, **_kwargs):
+        raise AssertionError("DSpark must fail before attention-island binding")
+
+    monkeypatch.setattr(AI, "_validate_model", forbidden_validation)
+
+    with pytest.raises(AI.AttentionIslandError, match="DSpark.*tap-aware"):
+        AI.install_deepseek_v4_attention_island(model, {})
+
+    assert model._target_hc_hidden_route is stock
+    assert not hasattr(model, "_mtplx_dsv4_attention_island_selector")
+
+
 def test_arm_selector_switches_prebound_model_route_without_hot_checks():
     model = SimpleNamespace(_target_hc_hidden_route=None)
     stock = object()
