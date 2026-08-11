@@ -21,7 +21,7 @@ dependencies = [
   # 0.32.0 exactness-gated 2026-07-11: byte-identical greedy 128-tok output
   # vs 0.31.3 on Optimized-Speed q4 turbo D3 (same 34 verify calls), and 103
   # kernel/paged-verifier/graphbank/sustained tests green under 0.32.0.
-  "mlx>=0.32,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx>=0.31,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name

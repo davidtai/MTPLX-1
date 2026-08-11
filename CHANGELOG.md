@@ -8,9 +8,9 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Changed
 
-- MLX 0.32 is now the minimum supported runtime. The package lock and the
-  native expert-I/O extension build environment use the matching 0.32.0 MLX
-  and Metal wheels.
+- The repository lock now selects MLX and MLX-Metal 0.32.0 for development and
+  packaged verification while the published dependency range continues to
+  support MLX 0.31 and 0.32.
 
 ## [2.3.0] - 2026-07-21
 
