@@ -52,7 +52,7 @@ CONTRIBUTING.md — Required verification, benchmark provenance, and workspace-l
 
 ## Critical Constraints
 - The GitHub default branch is `experiment/moe-pr13-pr14-stack`, not `main`; verify `origin/HEAD` before branching or pushing.
-- Compute paths require Apple Silicon/macOS and MLX 0.31.x, while non-compute CLI imports must remain usable without MLX.
+- Compute paths require Apple Silicon/macOS and MLX 0.32.x, while non-compute CLI imports must remain usable without MLX.
 - `transformers` stays below 5.13 until mlx-lm supports its tokenizer registration change.
 - SSD-streamed Hy3/GLM execution is opt-in; the resident router remains authoritative and selected experts must be present before dispatch.
 - The pinned Hy3/GLM community Q4 artifacts omit declared MTP weights; AR and MTP claims require separate pinned artifacts and benchmark lanes.
