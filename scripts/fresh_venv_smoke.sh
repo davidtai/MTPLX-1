@@ -14,6 +14,9 @@ trap cleanup EXIT
 
 python3 -m venv "$VENV"
 "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
+# Keep MLX absent while providing the non-MLX dependency imported by the
+# expert-inspection path exercised below.
+"$VENV/bin/python" -m pip install "numpy>=2" >/dev/null
 
 shopt -s nullglob
 wheels=("$ROOT"/dist/*.whl)
