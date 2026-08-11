@@ -26,10 +26,11 @@ in at proposal time) so it never carries a vocab-sized table of its own.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.rope_utils import initialize_rope
 
 
 @dataclass
@@ -40,9 +41,12 @@ class DFlashConfig:
     num_attention_heads: int
     num_key_value_heads: int
     head_dim: int
-    block_size: int
+    block_size: int = 8
     # which TARGET layer residual streams are tapped and stacked into `fc`.
-    target_layers: List[int]
+    target_layers: List[int] = field(default_factory=list)
+    # Glimmer's converted config stores hidden-state indices (layer output is
+    # index-1); NVIDIA stores zero-based model-layer ids directly.
+    target_layer_offset: int = -1
     rope_theta: float = 500000.0
     rms_norm_eps: float = 1e-5
     # encoder input width; must equal len(target_layers) * hidden_size.
@@ -52,6 +56,12 @@ class DFlashConfig:
     # with the last committed token (a driver-side convention; the acceptance
     # bench validates which the checkpoint was trained with).
     mask_token_id: Optional[int] = None
+    max_position_embeddings: int = 1048576
+    rope_scaling: Optional[dict[str, Any]] = None
+    has_embed_tokens: bool = False
+    causal: bool = False
+    vocab_size: int = 0
+    quantization: Optional[dict[str, Any]] = None
     model_type: str = "dflash"
 
     def __post_init__(self):
@@ -60,6 +70,18 @@ class DFlashConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "DFlashConfig":
+        d = dict(d)
+        dflash = d.get("dflash_config") or {}
+        rope = dict(d.get("rope_parameters") or d.get("rope_scaling") or {})
+        if "rope_type" in rope and "type" not in rope:
+            rope["rope_type"] = rope["rope_type"]
+        d.setdefault("target_layers", d.get("target_layer_ids") or dflash.get("target_layer_ids") or [])
+        if "target_layer_ids" in d or "eagle_aux_hidden_state_layer_ids" in d:
+            d.setdefault("target_layer_offset", 0)
+        d.setdefault("mask_token_id", dflash.get("mask_token_id"))
+        d.setdefault("causal", bool(dflash.get("causal", False)))
+        d.setdefault("rope_theta", rope.pop("rope_theta", d.get("rope_theta", 10000.0)))
+        d.setdefault("rope_scaling", rope or None)
         keys = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in d.items() if k in keys})
 
@@ -90,7 +112,13 @@ class _Attention(nn.Module):
         self.o_proj = nn.Linear(H * hd, d, bias=False)
         self.q_norm = _RMSNorm(hd, cfg.rms_norm_eps)
         self.k_norm = _RMSNorm(hd, cfg.rms_norm_eps)
-        self.rope = nn.RoPE(hd, traditional=False, base=cfg.rope_theta)
+        self.rope = initialize_rope(
+            hd,
+            cfg.rope_theta,
+            False,
+            scaling_config=cfg.rope_scaling,
+            max_position_embeddings=cfg.max_position_embeddings,
+        )
 
     def _kv(self, feats: mx.array, offset: int) -> tuple[mx.array, mx.array]:
         """Project `feats` [T, d] → per-head K/V with k_norm + rope. [1,KV,T,hd]."""
@@ -156,6 +184,10 @@ class DFlashDrafter(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.fc = nn.Linear(cfg.n_embd_inp_enc, cfg.hidden_size, bias=False)
+        if cfg.has_embed_tokens:
+            if cfg.vocab_size <= 0:
+                raise ValueError("dflash has_embed_tokens requires vocab_size")
+            self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.enc_norm = _RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.layers = [_Layer(cfg) for _ in range(cfg.num_hidden_layers)]
         self.norm = _RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
@@ -186,7 +218,8 @@ class DFlashDrafter(nn.Module):
         TARGET-projected logits [Tblk, vocab]."""
         Tctx = fused.shape[0]
         ctx_kv = [layer.inject(fused, 0) for layer in self.layers]   # context @ 0
-        x = target_tok_embd(block_ids).astype(mx.float32) * embed_scale
+        embed = self.embed_tokens if self.cfg.has_embed_tokens else target_tok_embd
+        x = embed(block_ids).astype(mx.float32) * embed_scale
         x = x.astype(self.norm.weight.dtype)
         for layer, (ck, cv) in zip(self.layers, ctx_kv):
             x = layer(x, ck, cv, Tctx, Tctx)                          # block @ Tctx
@@ -258,12 +291,29 @@ class DFlashDrafter(nn.Module):
             mx.array([int(primary_token_id)], dtype=mx.int32),
             mx.full((k - 1,), int(mask_token_id), dtype=mx.int32),
         ])
-        x = target_tok_embd(block_ids).astype(mx.float32) * embed_scale
+        embed = self.embed_tokens if self.cfg.has_embed_tokens else target_tok_embd
+        x = embed(block_ids).astype(mx.float32) * embed_scale
         x = x.astype(self.norm.weight.dtype)
         for layer, (ck, cv) in zip(self.layers, ctx_cache):
             x = layer(x, ck, cv, ctx_len, ctx_len)
         logits = target_lm_head(self.norm(x))
         return mx.argmax(logits[1:], axis=-1).astype(mx.int32)
+
+
+def normalize_dflash_weights(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """Map NVIDIA's DFlash module names onto the original Glimmer adapter tree."""
+    replacements = (
+        ("hidden_norm.", "enc_norm."),
+        (".input_layernorm.", ".attn_norm."),
+        (".post_attention_layernorm.", ".ffn_norm."),
+    )
+    out: dict[str, mx.array] = {}
+    for key, value in weights.items():
+        normalized = key
+        for old, new in replacements:
+            normalized = normalized.replace(old, new)
+        out[normalized] = value
+    return out
 
 
 def load_dflash(path: str) -> tuple[DFlashDrafter, DFlashConfig]:
@@ -272,9 +322,22 @@ def load_dflash(path: str) -> tuple[DFlashDrafter, DFlashConfig]:
     import json
     import os
 
-    cfg = DFlashConfig.from_dict(json.load(open(os.path.join(path, "config.json"))))
+    raw_config = json.load(open(os.path.join(path, "config.json")))
+    cfg = DFlashConfig.from_dict(raw_config)
     model = DFlashDrafter(cfg)
-    weights = mx.load(os.path.join(path, "model.safetensors"))
+    quantization = raw_config.get("quantization")
+    if isinstance(quantization, dict):
+        def quant_predicate(module_path, _module):
+            return quantization.get(module_path, False)
+
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=4,
+            mode="affine",
+            class_predicate=quant_predicate,
+        )
+    weights = normalize_dflash_weights(mx.load(os.path.join(path, "model.safetensors")))
     model.load_weights(list(weights.items()))
     model.eval()
     return model, cfg
