@@ -1626,6 +1626,33 @@ def _apply_interleaved_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.arr
     return out.reshape(shape).astype(out_dtype)
 
 
+def _q_head_norm_rope_stock(
+    q: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    *,
+    eps: float,
+    rope_dim: int,
+) -> mx.array:
+    """The stock per-head Q normalization and interleaved-RoPE graph."""
+    out_dtype = _store_dtype(q.dtype)
+    q = q * mx.rsqrt(
+        mx.mean(mx.square(q.astype(mx.float32)), axis=-1, keepdims=True) + eps
+    )
+    q = q.astype(out_dtype)
+    return mx.concatenate(
+        [
+            q[..., :-rope_dim],
+            _apply_interleaved_rope(
+                q[..., -rope_dim:],
+                cos[None, :, None, :],
+                sin[None, :, None, :],
+            ),
+        ],
+        axis=-1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hyper-Connections
 # ---------------------------------------------------------------------------
@@ -2885,11 +2912,38 @@ class DeepseekV4Attention(nn.Module):
         else:
             inv = _yarn_inv_freq(self.rope_head_dim, args.rope_theta, 0, 1.0, 32, 1)
         self._inv_freq = inv  # [rope_head_dim//2]
+        self._q_head_norm_rope_route = self._q_head_norm_rope_stock
+        self._q_projection_qhead_route = self._q_projection_qhead_stock
 
     def _rope_tables(self, positions: mx.array):
         # positions: [L] -> cos/sin [L, rope_head_dim//2]
         ang = positions[:, None].astype(mx.float32) * self._inv_freq[None, :]
         return mx.cos(ang), mx.sin(ang)
+
+    def _q_head_norm_rope_stock(
+        self,
+        q: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> mx.array:
+        return _q_head_norm_rope_stock(
+            q,
+            cos,
+            sin,
+            eps=self.eps,
+            rope_dim=self.rope_head_dim,
+        )
+
+    def _q_projection_qhead_stock(
+        self,
+        qr: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> mx.array:
+        """Project Q then run the currently installed phase-specific post route."""
+        batch, sequence, _ = qr.shape
+        q = self.wq_b(qr).reshape(batch, sequence, self.n_heads, self.head_dim)
+        return self._q_head_norm_rope_route(q, cos, sin)
 
     def _wo_a_quant(self):
         """``wo_a``'s quantised tensors + format, or ``None`` when it is dense.
@@ -3164,21 +3218,7 @@ class DeepseekV4Attention(nn.Module):
         cos, sin = self._rope_tables(positions)
 
         qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).reshape(b, s, self.n_heads, self.head_dim)
-        # per-head RMS-like normalisation (no learned weight), reference L498
-        q = q * mx.rsqrt(
-            mx.mean(mx.square(q.astype(mx.float32)), axis=-1, keepdims=True) + self.eps
-        )
-        q = q.astype(x.dtype)
-        q = mx.concatenate(
-            [
-                q[..., :-rd],
-                _apply_interleaved_rope(
-                    q[..., -rd:], cos[None, :, None, :], sin[None, :, None, :]
-                ),
-            ],
-            axis=-1,
-        )
+        q = self._q_projection_qhead_route(qr, cos, sin)
 
         kv = self.kv_norm(self.wkv(x))  # [b, s, head_dim] (single shared KV — MQA)
         kv = mx.concatenate(

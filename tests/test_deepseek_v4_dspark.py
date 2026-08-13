@@ -126,6 +126,35 @@ def test_real_filtered_config_derives_three_stages_without_n_mtp_layers():
     )
 
 
+def test_attention_exposes_exact_stock_q_projection_route():
+    attention = D.DeepseekV4Attention(_args(), 0)
+    qr = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8).astype(mx.bfloat16)
+    positions = mx.arange(2)
+    cos, sin = attention._rope_tables(positions)
+
+    projected = attention.wq_b(qr).reshape(1, 2, 1, 8)
+    expected = projected * mx.rsqrt(
+        mx.mean(mx.square(projected.astype(mx.float32)), axis=-1, keepdims=True)
+        + attention.eps
+    )
+    expected = expected.astype(projected.dtype)
+    expected = mx.concatenate(
+        [
+            expected[..., : -attention.rope_head_dim],
+            D._apply_interleaved_rope(
+                expected[..., -attention.rope_head_dim :],
+                cos[None, :, None, :],
+                sin[None, :, None, :],
+            ),
+        ],
+        axis=-1,
+    )
+    actual = attention._q_projection_qhead_route(qr, cos, sin)
+
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
 def test_legacy_model_call_uses_prebound_target_route_exactly_once():
     inputs = mx.array([[7]], dtype=mx.int32)
     cache = object()
