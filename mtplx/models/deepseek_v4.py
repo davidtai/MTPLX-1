@@ -1033,10 +1033,12 @@ def _o_lora_linear_logical_weight_shape(linear) -> tuple[int, ...]:
         scales_shape = tuple(linear.scales.shape)
     except (AttributeError, TypeError, ValueError):
         return ()
-    packed_divisor = 32 // bits if bits > 0 and 32 % bits == 0 else 0
-    if not packed_divisor or group_size <= 0 or len(scales_shape) != 2:
+    if bits not in {2, 3, 4, 6, 8} or group_size <= 0 or len(scales_shape) != 2:
         return ()
-    packed_logical = (weight_shape[0], weight_shape[1] * packed_divisor)
+    packed_bits = weight_shape[1] * 32
+    if packed_bits % bits:
+        return ()
+    packed_logical = (weight_shape[0], packed_bits // bits)
     scales_logical = (scales_shape[0], scales_shape[1] * group_size)
     return packed_logical if packed_logical == scales_logical else ()
 
@@ -1071,10 +1073,15 @@ class _DirectGatherOLora:
             raise ValueError(
                 "gather_qmm o-LoRA input width is not divisible by group_size"
             )
-        packed_divisor = 32 // int(bits) if int(bits) and 32 % int(bits) == 0 else 0
-        if not packed_divisor:
+        bits = int(bits)
+        if bits not in {2, 3, 4, 6, 8}:
             raise ValueError(f"gather_qmm o-LoRA has unsupported bits={bits!r}")
-        expected_weight = (output_rows, per_group_input // packed_divisor)
+        packed_row_bits = per_group_input * bits
+        if packed_row_bits % 32:
+            raise ValueError(
+                "gather_qmm o-LoRA logical input does not end on a packed word"
+            )
+        expected_weight = (output_rows, packed_row_bits // 32)
         expected_scales = (output_rows, per_group_input // int(group_size))
         if tuple(weight.shape) != expected_weight:
             raise ValueError(
