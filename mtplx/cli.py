@@ -661,6 +661,16 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
             "greedy AR. Requires explicit --depth 2 and MTP."
         ),
     )
+    parser.add_argument(
+        "--deepseek-v4-0731-optimized",
+        action="store_true",
+        help=(
+            "Select the construction-bound DeepSeek-V4-Flash-0731 optimized "
+            "DSpark stack for an explicit depth from 1 through 3. K2 uses the "
+            "measured physical-M3 target route; K1 and K3 use the native target "
+            "shape route. This lane is not token-exact against serial greedy AR."
+        ),
+    )
 
 
 SCHEDULER_MODE_CHOICES = (

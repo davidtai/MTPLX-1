@@ -420,6 +420,7 @@ def test_k2_option_publishes_one_construction_transaction(monkeypatch, tmp_path)
     ]
     assert loaded.deepseek_v4_0731_k2_receipt == {
         "target_protocol": "primary_plus_two_drafts_physical_m3",
+        "selected_depth": 2,
         "exact_vs_serial_greedy": False,
         "target": {"candidate": "target"},
         "dspark_ffn": {"candidate": "ffn"},
@@ -436,7 +437,7 @@ def test_k2_option_restores_both_staged_stacks_when_backend_binding_fails(
     monkeypatch.setattr(
         DeepseekV4DSparkBackend,
         "bind",
-        lambda _model: (_ for _ in ()).throw(RuntimeError("bind failed")),
+        lambda _model, **_kwargs: (_ for _ in ()).throw(RuntimeError("bind failed")),
     )
 
     with pytest.raises(RuntimeError, match="bind failed"):
@@ -520,7 +521,7 @@ def test_k2_rollback_attempts_target_and_o_lora_after_ffn_restore_failure(
     monkeypatch.setattr(
         DeepseekV4DSparkBackend,
         "bind",
-        lambda _model: (_ for _ in ()).throw(RuntimeError("bind failed")),
+        lambda _model, **_kwargs: (_ for _ in ()).throw(RuntimeError("bind failed")),
     )
 
     with pytest.raises(ExceptionGroup) as caught:
@@ -581,7 +582,7 @@ def test_k2_rollback_attempts_both_properties_and_all_o_lora_owners(
     monkeypatch.setattr(
         DeepseekV4DSparkBackend,
         "bind",
-        lambda _model: (_ for _ in ()).throw(RuntimeError("bind failed")),
+        lambda _model, **_kwargs: (_ for _ in ()).throw(RuntimeError("bind failed")),
     )
 
     with pytest.raises(ExceptionGroup) as caught:

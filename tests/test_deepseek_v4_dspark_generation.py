@@ -136,7 +136,7 @@ class _DSparkModel:
 
 
 class _DSparkRuntime(MTPLXRuntime):
-    def __init__(self):
+    def __init__(self, *, supported_depths=(2,)):
         model = _DSparkModel()
         super().__init__(
             model=model,
@@ -148,7 +148,9 @@ class _DSparkRuntime(MTPLXRuntime):
         self.deepseek_v4_dspark_enabled = True
         model._dspark.owner = self
         model.owner = self
-        self.block_speculative_backend = DeepseekV4DSparkBackend.bind(model)
+        self.block_speculative_backend = DeepseekV4DSparkBackend.bind(
+            model, supported_depths=supported_depths
+        )
         self.target_cache = _TargetCache()
         self.prefill_hidden = None
         self.proposal_cache = None
@@ -378,6 +380,25 @@ def test_dspark_depth_two_verifies_primary_and_two_drafts_in_one_m3_call():
     assert out.stats.drafted_tokens == 2
     assert out.stats.accepted_by_depth == [1, 1]
     assert out.stats.repair_time_s == 0.0
+
+
+def test_dspark_construction_selected_depth_three_verifies_one_physical_m4():
+    rt = _DSparkRuntime(supported_depths=(3,))
+
+    out = generate_mtpk(
+        rt,
+        [9, 10],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0),
+        speculative_depth=3,
+        stop_token_ids=set(),
+    )
+
+    assert out.tokens == [11, 12, 13, 14]
+    assert rt.target_forward_widths == [1, 1, 4, 1]
+    assert rt.proposal_widths == [4]
+    assert out.stats.accepted_drafts == 2
+    assert out.stats.accepted_by_depth == [1, 1, 0]
 
 
 def test_dspark_proposal_restore_precedes_the_full_accepted_prefix_commit():

@@ -1145,6 +1145,61 @@ def test_serve_forwards_explicit_0731_k2_construction_option(
     assert "--depth 2" in command
 
 
+def test_serve_forwards_explicit_0731_optimized_construction_option(
+    monkeypatch, tmp_path, capsys
+):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        extra_args=("--deepseek-v4-0731-optimized", "--depth", "3"),
+    )
+
+    command = payload["server_command"]
+    assert "--deepseek-v4-0731-optimized" in command
+    assert "--depth 3" in command
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ("--deepseek-v4-0731-optimized",),
+        ("--deepseek-v4-0731-optimized", "--depth", "3", "--no-load-mtp"),
+        (
+            "--deepseek-v4-0731-optimized",
+            "--depth",
+            "3",
+            "--generation-mode",
+            "ar",
+        ),
+    ],
+)
+def test_serve_rejects_invalid_0731_optimized_entrypoint_selection(
+    monkeypatch, tmp_path, capsys, extra_args
+):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        extra_args=extra_args,
+        expected_code=2,
+    )
+
+    assert "DeepSeek-V4-0731 optimized" in payload["error"]
+
+
 @pytest.mark.parametrize(
     "extra_args",
     [

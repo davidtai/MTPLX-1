@@ -651,6 +651,7 @@ def load(
     proj_quant: str | None = None,
     proj_requant: str | None = None,
     deepseek_v4_0731_k2: bool = False,
+    deepseek_v4_0731_depth: int | None = None,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
@@ -662,6 +663,11 @@ def load(
     """
     if deepseek_v4_0731_k2 and not mtp:
         raise ValueError("DeepSeek-V4-0731 K2 construction requires mtp=True")
+    selected_0731_depth = (
+        2 if deepseek_v4_0731_depth is None else int(deepseek_v4_0731_depth)
+    )
+    if deepseek_v4_0731_k2 and selected_0731_depth not in {1, 2, 3}:
+        raise ValueError("DeepSeek-V4-0731 optimized depth must be 1, 2, or 3")
     path = Path(model_path)
     k2_config = None
     if deepseek_v4_0731_k2:
@@ -1091,7 +1097,10 @@ def load(
             k2_prepared = (target_prepared, ffn_prepared)
             target_prepared.publish()
             ffn_prepared.publish()
-            block_speculative_backend = DeepseekV4DSparkBackend.bind(model)
+            block_speculative_backend = DeepseekV4DSparkBackend.bind(
+                model,
+                supported_depths=(selected_0731_depth,),
+            )
         except Exception as failure:
             rollback_failures = _rollback_deepseek_v4_0731_k2(
                 k2_prepared,
@@ -1104,7 +1113,12 @@ def load(
                 ) from failure
             raise
         deepseek_v4_0731_k2_receipt = {
-            "target_protocol": "primary_plus_two_drafts_physical_m3",
+            "target_protocol": (
+                "primary_plus_two_drafts_physical_m3"
+                if selected_0731_depth == 2
+                else f"primary_plus_{selected_0731_depth}_drafts_native_m{selected_0731_depth + 1}"
+            ),
+            "selected_depth": selected_0731_depth,
             "exact_vs_serial_greedy": False,
             "target": target_prepared.receipt,
             "dspark_ffn": ffn_prepared.receipt,

@@ -80,6 +80,30 @@ def test_candidate_config_pins_all_installation_identities() -> None:
     ]
 
 
+def test_production_profile_pins_coherent_0731_k3_mlx032_and_256k() -> None:
+    from production_entry import MODEL, MODEL_ID, serve_argv
+
+    assert MODEL == Path(
+        "/Users/davidtai/models/DeepSeek-V4-Flash-0731-2.4bit-mixed"
+    )
+    assert MODEL_ID == "mtplx-deepseek-v4-flash-0731-2.4bit-k3"
+    argv = serve_argv()
+    assert argv[:1] == ["serve"]
+    assert argv[argv.index("--port") + 1] == "8080"
+    assert argv[argv.index("--backend-id") + 1] == "deepseek_mtp"
+    assert argv[argv.index("--context-window") + 1] == "262144"
+    assert argv[argv.index("--depth") + 1] == "3"
+    assert "--deepseek-v4-0731-optimized" in argv
+    assert argv[argv.index("--session-cache-mode") + 1] == "off"
+    assert argv[argv.index("--ssd-session-cache") + 1] == "off"
+
+    launcher = (ROOT / "launch_production.sh").read_text(encoding="utf-8")
+    assert "/tmp/mtplx-gpu-exclusive.lock" in launcher
+    assert "fcntl.LOCK_EX | fcntl.LOCK_NB" in launcher
+    assert "mlx==0.32.0" in launcher
+    assert "DeepSeek-V4-Flash-0731-2.4bit-mixed" in launcher
+
+
 def test_command_override_is_rejected_except_for_nonstarting_fixture() -> None:
     launcher = ROOT / "launch_candidate.sh"
     fixture_env = {"PATH": os.environ["PATH"], "MTPLX_DSV4_0731_TEST_FIXTURE": "1"}

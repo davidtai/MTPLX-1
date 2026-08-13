@@ -1763,20 +1763,33 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
     _require_mlx_lm_arrays_cache_fix()
 
 
-def _validate_deepseek_v4_0731_k2_entrypoint(args: argparse.Namespace) -> None:
-    if not bool(getattr(args, "deepseek_v4_0731_k2", False)):
+def _validate_deepseek_v4_0731_entrypoint(args: argparse.Namespace) -> None:
+    legacy_k2 = bool(getattr(args, "deepseek_v4_0731_k2", False))
+    optimized = bool(getattr(args, "deepseek_v4_0731_optimized", False))
+    if not (legacy_k2 or optimized):
         return
+    if legacy_k2 and optimized:
+        raise ValueError(
+            "DeepSeek-V4-0731 optimized selection accepts only one entrypoint flag"
+        )
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if "depth" not in cli_flags or int(getattr(args, "depth", 3)) != 2:
+    depth = int(getattr(args, "depth", 3))
+    if legacy_k2 and ("depth" not in cli_flags or depth != 2):
         raise ValueError(
             "DeepSeek-V4-0731 K2 requires explicit --depth 2 before model load"
+        )
+    if optimized and ("depth" not in cli_flags or depth not in {1, 2, 3}):
+        raise ValueError(
+            "DeepSeek-V4-0731 optimized requires explicit --depth 1, 2, or 3 "
+            "before model load"
         )
     if (
         getattr(args, "load_mtp", True) is False
         or str(getattr(args, "generation_mode", "mtp")) != "mtp"
         or bool(getattr(args, "stock_ar", False))
     ):
-        raise ValueError("DeepSeek-V4-0731 K2 requires MTP generation")
+        label = "K2" if legacy_k2 else "optimized"
+        raise ValueError(f"DeepSeek-V4-0731 {label} requires MTP generation")
 
 
 def _global_stateless_session_cache_bypass(
@@ -1837,7 +1850,7 @@ class _StatelessSessionRoute:
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         _validate_mtp_batch_settings(args)
-        _validate_deepseek_v4_0731_k2_entrypoint(args)
+        _validate_deepseek_v4_0731_entrypoint(args)
         self.args = args
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
@@ -1960,8 +1973,11 @@ class ServerState:
         _startup_line("      Model load in progress (this may take a minute).")
         load_heartbeat = _startup_heartbeat("Model still loading")
         construction_options = {}
-        if bool(getattr(args, "deepseek_v4_0731_k2", False)):
+        if bool(getattr(args, "deepseek_v4_0731_k2", False)) or bool(
+            getattr(args, "deepseek_v4_0731_optimized", False)
+        ):
             construction_options["deepseek_v4_0731_k2"] = True
+            construction_options["deepseek_v4_0731_depth"] = int(args.depth)
         try:
             self.runtime = self.model_scheduler.submit_foreground(
                 load,
@@ -28862,6 +28878,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Select the exact construction-bound DeepSeek-V4-Flash-0731 "
             "DSpark K2 stack. Requires explicit --depth 2 and MTP."
+        ),
+    )
+    parser.add_argument(
+        "--deepseek-v4-0731-optimized",
+        action="store_true",
+        help=(
+            "Select the construction-bound DeepSeek-V4-Flash-0731 optimized "
+            "DSpark stack at an explicit depth from 1 through 3."
         ),
     )
     parser.add_argument(

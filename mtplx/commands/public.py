@@ -657,24 +657,38 @@ def _validate_public_depth(args: Any, *, printer=print) -> int | None:
     return None
 
 
-def _deepseek_v4_0731_k2_entrypoint_error(args: Any) -> dict[str, str] | None:
-    """Reject an explicit K2 selection before any public model construction."""
+def _deepseek_v4_0731_entrypoint_error(args: Any) -> dict[str, str] | None:
+    """Reject an invalid optimized selection before public model construction."""
 
-    if not bool(getattr(args, "deepseek_v4_0731_k2", False)):
+    legacy_k2 = bool(getattr(args, "deepseek_v4_0731_k2", False))
+    optimized = bool(getattr(args, "deepseek_v4_0731_optimized", False))
+    if not (legacy_k2 or optimized):
         return None
+    if legacy_k2 and optimized:
+        return {
+            "error": "DeepSeek-V4-0731 optimized selection accepts one entrypoint flag",
+            "detail": "Choose either the legacy K2 flag or the depth-selectable flag.",
+        }
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if "depth" not in cli_flags or int(getattr(args, "depth", 3)) != 2:
+    depth = int(getattr(args, "depth", 3))
+    if legacy_k2 and ("depth" not in cli_flags or depth != 2):
         return {
             "error": "DeepSeek-V4-0731 K2 requires explicit --depth 2",
             "detail": "The selected construction owns exactly two future drafts.",
+        }
+    if optimized and ("depth" not in cli_flags or depth not in {1, 2, 3}):
+        return {
+            "error": "DeepSeek-V4-0731 optimized requires explicit --depth 1, 2, or 3",
+            "detail": "The selected construction binds one fixed depth before loading.",
         }
     if (
         _generation_mode_from_args(args) != GENERATION_MODE_MTP
         or getattr(args, "load_mtp", True) is False
         or bool(getattr(args, "no_mtp", False))
     ):
+        label = "K2" if legacy_k2 else "optimized"
         return {
-            "error": "DeepSeek-V4-0731 K2 requires MTP generation",
+            "error": f"DeepSeek-V4-0731 {label} requires MTP generation",
             "detail": "Remove target-only AR or --no-load-mtp/--no-mtp options.",
         }
     return None
@@ -684,8 +698,12 @@ def _runtime_load_kwargs(args: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "mtp": getattr(args, "load_mtp", True) is not False,
     }
-    if bool(getattr(args, "deepseek_v4_0731_k2", False)):
+    legacy_k2 = bool(getattr(args, "deepseek_v4_0731_k2", False))
+    optimized = bool(getattr(args, "deepseek_v4_0731_optimized", False))
+    if legacy_k2 or optimized:
         kwargs["deepseek_v4_0731_k2"] = True
+    if optimized:
+        kwargs["deepseek_v4_0731_depth"] = int(args.depth)
     return kwargs
 
 
@@ -8352,7 +8370,7 @@ def cmd_serve_public(args: Any) -> int:
     if depth_error is not None:
         return depth_error
     generation_mode = _generation_mode_from_args(args)
-    k2_error = _deepseek_v4_0731_k2_entrypoint_error(args)
+    k2_error = _deepseek_v4_0731_entrypoint_error(args)
     if k2_error is not None:
         _print_command_error(
             k2_error,
@@ -8650,7 +8668,11 @@ def cmd_serve_public(args: Any) -> int:
     if draft_sampler_override is not None:
         draft_sampler = draft_sampler_override
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if dspark_request_defaults and ("depth" not in cli_flags or int(args.depth) != 2):
+    if (
+        dspark_request_defaults
+        and not bool(getattr(args, "deepseek_v4_0731_optimized", False))
+        and ("depth" not in cli_flags or int(args.depth) != 2)
+    ):
         _print_command_error(
             {
                 "error": "DeepSeek-V4-0731 DSpark requires explicit --depth 2",
@@ -8743,6 +8765,8 @@ def cmd_serve_public(args: Any) -> int:
     ]
     if bool(getattr(args, "deepseek_v4_0731_k2", False)):
         cmd.append("--deepseek-v4-0731-k2")
+    if bool(getattr(args, "deepseek_v4_0731_optimized", False)):
+        cmd.append("--deepseek-v4-0731-optimized")
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
         ("decode_batch_max", "--decode-batch-max"),
@@ -9360,7 +9384,7 @@ def _generate_one_shot_public(
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
-    k2_error = _deepseek_v4_0731_k2_entrypoint_error(args)
+    k2_error = _deepseek_v4_0731_entrypoint_error(args)
     if k2_error is not None:
         return 2, k2_error, []
     draft_lm_head = (
@@ -11749,6 +11773,7 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("api_key_file", None),
         ("api_key_source", "none"),
         ("deepseek_v4_0731_k2", False),
+        ("deepseek_v4_0731_optimized", False),
         ("default_presence_penalty", 0.0),
         ("default_frequency_penalty", 0.0),
         ("paged_kv_quantization", "off"),
@@ -12408,7 +12433,7 @@ def _quickstart_run_terminal_chat_body(
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
-    k2_error = _deepseek_v4_0731_k2_entrypoint_error(args)
+    k2_error = _deepseek_v4_0731_entrypoint_error(args)
     if k2_error is not None:
         _print_command_error(
             k2_error,

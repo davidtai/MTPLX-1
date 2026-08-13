@@ -26,7 +26,12 @@ class DeepseekV4DSparkBackend:
     minimum_proposal_target_position: int = 2
 
     @classmethod
-    def bind(cls, model: Any) -> "DeepseekV4DSparkBackend":
+    def bind(
+        cls,
+        model: Any,
+        *,
+        supported_depths: tuple[int, ...] = (2,),
+    ) -> "DeepseekV4DSparkBackend":
         """Validate ownership once and bind direct hot-path callables."""
         dspark = getattr(model, "_dspark", None)
         inner = getattr(model, "model", None)
@@ -39,13 +44,24 @@ class DeepseekV4DSparkBackend:
             or not callable(model)
         ):
             raise ValueError("DeepSeek-V4 DSpark backend cannot bind model ownership")
-        if len(tuple(getattr(dspark, "stages", ()))) != 3:
+        stage_count = len(tuple(getattr(dspark, "stages", ())))
+        if stage_count != 3:
             raise ValueError("DeepSeek-V4 DSpark backend requires three owned stages")
+        selected_depths = tuple(int(depth) for depth in supported_depths)
+        if (
+            not selected_depths
+            or len(set(selected_depths)) != len(selected_depths)
+            or any(depth < 1 or depth > stage_count for depth in selected_depths)
+        ):
+            raise ValueError(
+                "DeepSeek-V4 DSpark construction depths must be unique values from 1 to 3"
+            )
         return cls(
             dspark=dspark,
             embed_tokens=embed_tokens,
             lm_head=lm_head,
             target_forward=model,
+            supported_depths=selected_depths,
         )
 
     def make_cache(self, rt: Any) -> Any:

@@ -1,8 +1,47 @@
-# DeepSeek-V4-Flash-0731 isolated candidate service
+# DeepSeek-V4-Flash-0731 service
 
-This directory owns a separate candidate only. It does not change the loaded
-production service, and its launchd identity is
+This directory owns both the reviewed isolated candidate and the pinned local
+production profile. The candidate remains separate under
 `com.tea.deepseek-v4-0731.candidate` on `127.0.0.1:8081`.
+
+## Production profile
+
+`production_entry.py`, `launch_production.sh`, and
+`com.tea.deepseek-v4.plist` define the local production service on
+`127.0.0.1:8080`. The launcher acquires the exclusive GPU lock before model
+construction and pins the exact model hashes, DeepSeek-V4 topology, MLX 0.32.0,
+official 0731 encoder, 262,144-token context, greedy sampling, K3, and the
+construction-bound optimized DSpark route. Cline should use model ID
+`mtplx-deepseek-v4-flash-0731-2.4bit-k3`.
+
+The following warm production probes were measured under that lock on an Apple
+M5 Max with 128 GB unified memory. MLX active memory stayed flat at 86.73 GiB
+across the probes; the process-wide 139.71 GiB MLX peak includes model loading
+and first compilation and is not concurrent resident memory.
+
+| probe | prompt tokens | output tokens | prefill tok/s | decode tok/s | TTFT s | accepted / drafted | active GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| exact-text smoke | 17 | 20 | 20.85 | 44.10 | 0.92 | 14 / 15 | 86.73 |
+| coding response | 40 | 109 | 44.59 | 38.63 | 1.00 | 75 / 101 | 86.73 |
+| native tool call | 295 | 55 | 154.79 | 43.16 | 2.01 | 39 / 45 | 86.73 |
+| streamed tool call | 295 | 55 | 166.22 | 43.48 | 1.88 | 39 / 45 | 86.73 |
+
+The exact-text smoke deterministically repeated the requested marker twice, so
+it is a liveness/performance probe rather than an instruction-following pass.
+The coding response was coherent, and both nonstream and stream probes emitted
+a valid OpenAI tool call with incrementally valid streamed arguments. A replay
+of the prior 540 KB Cline transcript remained compute-bound for more than 1,323
+seconds and exceeded the 900-second client timeout. System free-memory pressure
+oscillated between 14% and 44% with zero throttled pages instead of growing
+monotonically. That establishes bounded chunk cleanup, but not acceptable
+long-context prefill latency; the replay is not listed as a successful TPS row.
+
+The historical K0-K3 diagnostic and the promoted physical-M3 K2 bracket remain
+in `docs/perf/receipts/deepseek-v4-0731-dspark.md`. Those runs used different
+target geometry and must not be compared directly with this native-M4 K3
+production profile.
+
+## Candidate profile
 
 The `encoding/` directory vendors the exact official Python encoder and four
 input/output vectors from

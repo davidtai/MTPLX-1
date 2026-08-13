@@ -693,6 +693,22 @@ def test_server_parser_accepts_explicit_0731_k2_construction_option():
     assert "depth" in selected._cli_flags
 
 
+def test_server_parser_accepts_optimized_0731_k3_construction_option():
+    selected = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--deepseek-v4-0731-optimized",
+            "--depth",
+            "3",
+        ]
+    )
+
+    assert selected.deepseek_v4_0731_optimized is True
+    assert "deepseek-v4-0731-optimized" in selected._cli_flags
+    openai._validate_deepseek_v4_0731_entrypoint(selected)
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -711,6 +727,31 @@ def test_server_rejects_invalid_0731_k2_selection_before_load(monkeypatch, argv)
     args = parse_args(["--warmup-tokens", "0", *argv])
 
     with pytest.raises(ValueError, match="DeepSeek-V4-0731 K2"):
+        openai.ServerState(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--deepseek-v4-0731-optimized"],
+        ["--deepseek-v4-0731-optimized", "--depth", "4"],
+        ["--deepseek-v4-0731-optimized", "--depth", "3", "--no-load-mtp"],
+        ["--deepseek-v4-0731-optimized", "--depth", "3", "--generation-mode", "ar"],
+    ],
+)
+def test_server_rejects_invalid_0731_optimized_selection_before_load(
+    monkeypatch, argv
+):
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid optimized 0731 selection reached load"
+        ),
+    )
+    args = parse_args(["--warmup-tokens", "0", *argv])
+
+    with pytest.raises(ValueError, match="DeepSeek-V4-0731 optimized"):
         openai.ServerState(args)
 
 
@@ -11886,6 +11927,43 @@ def test_server_state_passes_0731_k2_option_to_runtime_load(monkeypatch):
         openai.ServerState(args)
 
     assert captured["deepseek_v4_0731_k2"] is True
+    assert captured["deepseek_v4_0731_depth"] == 2
+
+
+def test_server_state_maps_0731_optimized_k3_to_runtime_installer(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai,
+        "_configure_mlx_cache_limit",
+        lambda _args: {"configured": False},
+    )
+
+    def stop_after_load(model, mtp, contract, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after load")
+
+    monkeypatch.setattr(openai, "load", stop_after_load)
+    args = parse_args(
+        [
+            "--model",
+            "models/DeepSeek-V4-Flash-0731",
+            "--warmup-tokens",
+            "0",
+            "--deepseek-v4-0731-optimized",
+            "--depth",
+            "3",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="stop after load"):
+        openai.ServerState(args)
+
+    assert captured["deepseek_v4_0731_k2"] is True
+    assert captured["deepseek_v4_0731_depth"] == 3
 
 
 def test_normalize_stop_sequences_accepts_string_list_and_caps_at_four():
