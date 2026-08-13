@@ -7,19 +7,27 @@ from mtplx.benchmarks.schema import PromptCase
 from mtplx.generation import GenerationOutput, GenerationStats
 
 
-def _generation_output(*, events: list[dict], verify_calls: int) -> GenerationOutput:
+def _generation_output(
+    *,
+    events: list[dict],
+    verify_calls: int,
+    mode: str = "mtp",
+) -> GenerationOutput:
     return GenerationOutput(
         tokens=[1, 2],
         text="ok",
         finish_reason="length",
         stats=GenerationStats(
-            mode="mtp",
+            mode=mode,
             generated_tokens=2,
             elapsed_s=1.0,
             tok_s=2.0,
             decode_elapsed_s=1.0,
             decode_tok_s=2.0,
             end_to_end_tok_s=2.0,
+            prompt_tps=50.0,
+            prompt_target_prefill_tok_s=48.0,
+            peak_memory_bytes=1_500,
             accepted_drafts=6,
             drafted_tokens=8,
             accepted_by_depth=[3, 3],
@@ -30,6 +38,81 @@ def _generation_output(*, events: list[dict], verify_calls: int) -> GenerationOu
             events=events,
         ),
     )
+
+
+def test_depth_sweep_reports_prefill_and_memory_growth_for_ar_and_each_depth(
+    monkeypatch, tmp_path
+) -> None:
+    fake_runtime = SimpleNamespace(
+        tokenizer=object(),
+        contract=SimpleNamespace(
+            base_hidden_variant="pre_norm",
+            hidden_variant="pre_norm",
+            concat_order="base_then_mtp",
+            mtp_quant_bits=None,
+            mtp_quant_group_size=64,
+            mtp_quant_mode="affine",
+            mtp_quant_policy=None,
+        ),
+        mtp_adapter_metadata=None,
+        mtp_adapter_merge_report=None,
+    )
+    active_memory = iter([1_000, 1_125, 1_250])
+
+    monkeypatch.setattr(mtp_depth_sweep, "load", lambda *_args, **_kwargs: fake_runtime)
+    monkeypatch.setattr(
+        mtp_depth_sweep,
+        "load_prompt_suite",
+        lambda *_args: [PromptCase(id="one", category="general", prompt="one")],
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep, "encode_prompt_case", lambda *_args, **_kwargs: [1, 2]
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep,
+        "generate_ar",
+        lambda *_args, **_kwargs: _generation_output(
+            events=[], verify_calls=0, mode="ar"
+        ),
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep,
+        "generate_mtpk",
+        lambda *_args, **_kwargs: _generation_output(events=[{}], verify_calls=1),
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep, "_active_memory_bytes", lambda: next(active_memory)
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep, "validate_benchmark_output", lambda *_args, **_kwargs: []
+    )
+
+    result = mtp_depth_sweep.run_mtp_depth_sweep(
+        tmp_path / "model",
+        tmp_path / "suite.jsonl",
+        depths=[1],
+        compare_ar=True,
+        temperature=0.0,
+    )
+
+    assert result["load_active_memory_bytes"] == 1_000
+    ar_row = result["ar_rows"][0]
+    assert ar_row["prompt_tokens"] == 2
+    assert ar_row["prompt_target_prefill_tok_s"] == 48.0
+    assert ar_row["prompt_tps"] == 50.0
+    assert ar_row["active_memory_bytes"] == 1_125
+    assert ar_row["active_memory_growth_bytes"] == 125
+    assert ar_row["peak_memory_bytes"] == 1_500
+    depth = result["depths"][0]
+    depth_row = depth["rows"][0]
+    assert depth_row["prompt_tokens"] == 2
+    assert depth_row["prompt_target_prefill_tok_s"] == 48.0
+    assert depth_row["prompt_tps"] == 50.0
+    assert depth_row["active_memory_bytes"] == 1_250
+    assert depth_row["active_memory_growth_bytes"] == 250
+    assert depth_row["peak_memory_bytes"] == 1_500
+    assert depth["summary"]["active_memory_bytes"] == 1_250
+    assert depth["summary"]["active_memory_growth_bytes"] == 250
 
 
 def test_depth_sweep_uses_verify_calls_only_when_events_are_empty(

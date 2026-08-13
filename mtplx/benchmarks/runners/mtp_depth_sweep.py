@@ -37,6 +37,12 @@ def _cycle_count(events: list[dict], verify_calls: int) -> int:
     return len(events) or max(0, int(verify_calls))
 
 
+def _active_memory_bytes() -> int:
+    import mlx.core as mx
+
+    return int(mx.get_active_memory())
+
+
 def _token_budget(max_tokens: int, case_max_tokens: int) -> int:
     return min(int(max_tokens), int(case_max_tokens))
 
@@ -137,6 +143,7 @@ def run_mtp_depth_sweep(
         merge_mtp_adapter=merge_mtp_adapter,
         gemma4_draft_block_size=gemma4_draft_block_size,
     )
+    load_active_memory_bytes = _active_memory_bytes()
     contract = getattr(rt, "contract", None)
     is_gemma4_assistant = getattr(rt, "backend_id", None) == "gemma4_assistant"
     resolved_base_hidden_variant = str(
@@ -213,6 +220,7 @@ def run_mtp_depth_sweep(
                 seed=seed + index,
             )
             generation_ended_at = time.time()
+            active_memory_bytes = _active_memory_bytes()
             validations = [
                 asdict(validation)
                 for validation in validate_benchmark_output(
@@ -236,12 +244,22 @@ def run_mtp_depth_sweep(
                         ar.finish_reason,
                     ),
                     "generated_tokens": ar.stats.generated_tokens,
+                    "prompt_tokens": len(ids),
                     "elapsed_s": ar.stats.elapsed_s,
                     "tok_s": ar.stats.tok_s,
                     "decode_tok_s": ar.stats.decode_tok_s,
                     "decode_elapsed_s": ar.stats.decode_elapsed_s,
                     "end_to_end_tok_s": ar.stats.end_to_end_tok_s,
                     "prompt_eval_time_s": ar.stats.prompt_eval_time_s,
+                    "prompt_tps": ar.stats.prompt_tps,
+                    "prompt_target_prefill_tok_s": (
+                        ar.stats.prompt_target_prefill_tok_s
+                    ),
+                    "active_memory_bytes": active_memory_bytes,
+                    "active_memory_growth_bytes": (
+                        active_memory_bytes - load_active_memory_bytes
+                    ),
+                    "peak_memory_bytes": ar.stats.peak_memory_bytes,
                     "tokens": ar.tokens,
                     "text": ar.text,
                     "validations": validations,
@@ -288,6 +306,7 @@ def run_mtp_depth_sweep(
                 mtp_topk_reranker=mtp_topk_reranker,
             )
             generation_ended_at = time.time()
+            active_memory_bytes = _active_memory_bytes()
             validations = [
                 asdict(validation)
                 for validation in validate_benchmark_output(
@@ -314,12 +333,21 @@ def run_mtp_depth_sweep(
                         out.finish_reason,
                     ),
                     "generated_tokens": out.stats.generated_tokens,
+                    "prompt_tokens": len(ids),
                     "elapsed_s": out.stats.elapsed_s,
                     "tok_s": out.stats.tok_s,
                     "decode_tok_s": out.stats.decode_tok_s,
                     "decode_elapsed_s": out.stats.decode_elapsed_s,
                     "end_to_end_tok_s": out.stats.end_to_end_tok_s,
                     "prompt_eval_time_s": out.stats.prompt_eval_time_s,
+                    "prompt_tps": out.stats.prompt_tps,
+                    "prompt_target_prefill_tok_s": (
+                        out.stats.prompt_target_prefill_tok_s
+                    ),
+                    "active_memory_bytes": active_memory_bytes,
+                    "active_memory_growth_bytes": (
+                        active_memory_bytes - load_active_memory_bytes
+                    ),
                     "ar_tok_s": ar_row["tok_s"] if ar_row is not None else None,
                     "ar_decode_tok_s": ar_row["decode_tok_s"]
                     if ar_row is not None
@@ -600,6 +628,12 @@ def run_mtp_depth_sweep(
                     "peak_memory_bytes": max(
                         [row["peak_memory_bytes"] for row in rows] or [0]
                     ),
+                    "active_memory_bytes": max(
+                        [row["active_memory_bytes"] for row in rows] or [0]
+                    ),
+                    "active_memory_growth_bytes": max(
+                        [row["active_memory_growth_bytes"] for row in rows] or [0]
+                    ),
                     "speed_model": _speed_model_summary(rows),
                 },
             }
@@ -607,6 +641,7 @@ def run_mtp_depth_sweep(
 
     return {
         "model_path": str(model_path),
+        "load_active_memory_bytes": load_active_memory_bytes,
         "prompt_suite": str(prompt_suite),
         "sampler": asdict(sampler),
         "draft_sampler": asdict(draft_sampler),
