@@ -148,6 +148,7 @@ def run_mtp_depth_sweep(
     load_active_memory_bytes = _active_memory_bytes()
     contract = getattr(rt, "contract", None)
     is_gemma4_assistant = getattr(rt, "backend_id", None) == "gemma4_assistant"
+    is_native_block_backend = getattr(rt, "block_speculative_backend", None) is not None
     resolved_base_hidden_variant = str(
         getattr(contract, "base_hidden_variant", "gemma4_assistant")
     )
@@ -281,8 +282,12 @@ def run_mtp_depth_sweep(
                 sampler=sampler,
                 speculative_depth=depth,
                 seed=seed + index,
-                base_hidden_variant=resolved_base_hidden_variant,
-                mtp_hidden_variant=resolved_mtp_hidden_variant,
+                base_hidden_variant=(
+                    None if is_native_block_backend else resolved_base_hidden_variant
+                ),
+                mtp_hidden_variant=(
+                    None if is_native_block_backend else resolved_mtp_hidden_variant
+                ),
                 mtp_cache_policy=mtp_cache_policy,
                 mtp_history_policy=mtp_history_policy,
                 draft_sampler=draft_sampler,

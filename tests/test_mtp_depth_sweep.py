@@ -297,3 +297,58 @@ def test_depth_sweep_selects_construction_bound_0731_stack(
     )
 
     assert load_kwargs[0]["deepseek_v4_0731_k2"] is True
+
+
+def test_depth_sweep_omits_hidden_variants_for_native_block_backend(
+    monkeypatch, tmp_path
+) -> None:
+    generate_kwargs = []
+    fake_runtime = SimpleNamespace(
+        tokenizer=object(),
+        block_speculative_backend=object(),
+        contract=SimpleNamespace(
+            base_hidden_variant="pre_norm",
+            hidden_variant="pre_norm",
+            concat_order="base_then_mtp",
+            mtp_quant_bits=None,
+            mtp_quant_group_size=64,
+            mtp_quant_mode="affine",
+            mtp_quant_policy=None,
+        ),
+        mtp_adapter_metadata=None,
+        mtp_adapter_merge_report=None,
+    )
+
+    monkeypatch.setattr(mtp_depth_sweep, "load", lambda *_args, **_kwargs: fake_runtime)
+    monkeypatch.setattr(mtp_depth_sweep, "_active_memory_bytes", lambda: 0)
+    monkeypatch.setattr(
+        mtp_depth_sweep,
+        "load_prompt_suite",
+        lambda *_args: [PromptCase(id="one", category="general", prompt="one")],
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep, "encode_prompt_case", lambda *_args, **_kwargs: [1, 2]
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep,
+        "generate_mtpk",
+        lambda *_args, **kwargs: (
+            generate_kwargs.append(kwargs)
+            or _generation_output(events=[], verify_calls=1)
+        ),
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep, "validate_benchmark_output", lambda *_args, **_kwargs: []
+    )
+
+    mtp_depth_sweep.run_mtp_depth_sweep(
+        tmp_path / "model",
+        tmp_path / "suite.jsonl",
+        depths=[1],
+        deepseek_v4_0731_k2=True,
+    )
+
+    assert generate_kwargs[0]["base_hidden_variant"] is None
+    assert generate_kwargs[0]["mtp_hidden_variant"] is None
+    assert generate_kwargs[0]["mtp_history_policy"] == "cycle"
+    assert generate_kwargs[0]["verify_strategy"] == "batched"
