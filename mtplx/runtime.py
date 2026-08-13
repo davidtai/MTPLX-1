@@ -1004,8 +1004,11 @@ def load(
             "gather_qmm" if deepseek_v4_0731_k2 else _o_lora_mode_from_env()
         )
         if deepseek_v4_0731_k2:
-            # Snapshot now, but leave O-Lora and the target/FFN routes stock while
-            # their candidates run construction-time preparation and self-checks.
+            # Snapshot every owner before the reversible construction transaction.
+            # The fused WOB preparer requires the installed gather route to own
+            # the same stock wo_b object, so gather publication happens first,
+            # while the model is still private to load(), and rolls back on any
+            # later preparation or publication failure.
             k2_o_lora_state = _snapshot_deepseek_v4_o_lora_routes(model)
         # The canonical mixed route hard-validates the exact DeepSeek-V4-Flash
         # topology (43 body layers, rank-1024 Q4/g64 wo_a/wo_b, one dense-BF16
@@ -1071,6 +1074,12 @@ def load(
         from .deepseek_v4_dspark_generation import DeepseekV4DSparkBackend
 
         try:
+            deepseek_v4_o_lora_report = install_deepseek_v4_o_lora_routes(
+                model,
+                mode="gather_qmm",
+                canonical_mixed_route=False,
+            )
+            logger.info("[deepseek-v4-o-lora] %s", deepseek_v4_o_lora_report)
             target_prepared = prepare_full_0731_dspark_compiled_tail_q2_pair(
                 model,
                 config,
@@ -1080,12 +1089,6 @@ def load(
             )
             ffn_prepared = prepare_dspark_q3_packed_gate_up_m5(model)
             k2_prepared = (target_prepared, ffn_prepared)
-            deepseek_v4_o_lora_report = install_deepseek_v4_o_lora_routes(
-                model,
-                mode="gather_qmm",
-                canonical_mixed_route=False,
-            )
-            logger.info("[deepseek-v4-o-lora] %s", deepseek_v4_o_lora_report)
             target_prepared.publish()
             ffn_prepared.publish()
             block_speculative_backend = DeepseekV4DSparkBackend.bind(model)

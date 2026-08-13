@@ -407,14 +407,14 @@ def test_k2_option_publishes_one_exact_construction_transaction(monkeypatch, tmp
         "artifact.validate",
         "sinkhorn.enter",
         "sinkhorn.exit",
-        ("target.prepare", "prepare_wqb_qhead_m3", "prepare_wob_m3"),
-        ("wqb.prepare", True),
-        ("wob.prepare", True),
-        "ffn.prepare",
         (
             "o_lora",
             {"mode": "gather_qmm", "canonical_mixed_route": False},
         ),
+        ("target.prepare", "prepare_wqb_qhead_m3", "prepare_wob_m3"),
+        ("wqb.prepare", True),
+        ("wob.prepare", True),
+        "ffn.prepare",
         "target.publish",
         "ffn.publish",
     ]
