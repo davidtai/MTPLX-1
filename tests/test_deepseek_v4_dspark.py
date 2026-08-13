@@ -512,6 +512,18 @@ def test_official_hc_names_map_to_exact_installed_parameter_keys(tiny_model):
     assert expected <= installed
 
 
+def test_dspark_grouped_o_lora_storage_flattens_at_load_boundary(tiny_model):
+    raw = {
+        "mtp.0.attn.wo_a.weight": mx.zeros((1, 8, 3), dtype=mx.uint32),
+        "mtp.1.attn.wo_a.weight": mx.zeros((1, 8, 3), dtype=mx.uint32),
+        "mtp.2.attn.wo_a.weight": mx.zeros((1, 8, 3), dtype=mx.uint32),
+    }
+    mapped = tiny_model.sanitize(raw)
+    assert all(
+        mapped[f"mtp.{stage}.attn.wo_a.weight"].shape == (8, 3) for stage in range(3)
+    )
+
+
 def test_dspark_visibility_is_exact_and_includes_all_five_draft_rows():
     got = np.array(D.get_dspark_topk_idxs(8, 2, 5, 3))
     expected = [0, 1, 2, 3, 8, 9, 10, 11, 12]

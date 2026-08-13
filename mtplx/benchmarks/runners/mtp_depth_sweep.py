@@ -33,11 +33,17 @@ def _rate_by_depth(accepted: list[int], drafted: list[int]) -> list[float | None
     return [(a / d if d else None) for a, d in zip(accepted, drafted)]
 
 
+def _cycle_count(events: list[dict], verify_calls: int) -> int:
+    return len(events) or max(0, int(verify_calls))
+
+
 def _token_budget(max_tokens: int, case_max_tokens: int) -> int:
     return min(int(max_tokens), int(case_max_tokens))
 
 
-def _hit_token_budget(generated_tokens: int, token_budget: int, finish_reason: str | None) -> bool:
+def _hit_token_budget(
+    generated_tokens: int, token_budget: int, finish_reason: str | None
+) -> bool:
     if finish_reason == "length":
         return True
     return int(generated_tokens) >= int(token_budget)
@@ -133,8 +139,12 @@ def run_mtp_depth_sweep(
     )
     contract = getattr(rt, "contract", None)
     is_gemma4_assistant = getattr(rt, "backend_id", None) == "gemma4_assistant"
-    resolved_base_hidden_variant = str(getattr(contract, "base_hidden_variant", "gemma4_assistant"))
-    resolved_mtp_hidden_variant = str(getattr(contract, "hidden_variant", "gemma4_assistant"))
+    resolved_base_hidden_variant = str(
+        getattr(contract, "base_hidden_variant", "gemma4_assistant")
+    )
+    resolved_mtp_hidden_variant = str(
+        getattr(contract, "hidden_variant", "gemma4_assistant")
+    )
     resolved_concat_order = str(getattr(contract, "concat_order", "assistant_pair"))
     draft_lm_head_report: dict[str, Any] | None = None
     if draft_lm_head_bits is not None and not is_gemma4_assistant:
@@ -287,6 +297,7 @@ def run_mtp_depth_sweep(
                 )
             ]
             ar_row = ar_rows[index] if compare_ar else None
+            cycles = _cycle_count(out.stats.events, out.stats.verify_calls)
             rows.append(
                 {
                     "prompt_id": case.id,
@@ -344,7 +355,7 @@ def run_mtp_depth_sweep(
                         out.stats.drafted_by_depth,
                     ),
                     "mean_accepted_drafts_per_cycle": (
-                        out.stats.accepted_drafts / max(1, len(out.stats.events))
+                        out.stats.accepted_drafts / max(1, cycles)
                     ),
                     "acceptance_rate": (
                         out.stats.accepted_drafts / out.stats.drafted_tokens
@@ -392,7 +403,9 @@ def run_mtp_depth_sweep(
 
         validations = [v for row in rows for v in row["validations"]]
         finish_reasons = _finish_reason_counts(rows)
-        accepted_by_depth = _sum_lists([row["accepted_by_depth"] for row in rows], depth)
+        accepted_by_depth = _sum_lists(
+            [row["accepted_by_depth"] for row in rows], depth
+        )
         drafted_by_depth = _sum_lists([row["drafted_by_depth"] for row in rows], depth)
         accept_probability_sum_by_depth = _sum_float_lists(
             [row["accept_probability_sum_by_depth"] for row in rows],
@@ -408,12 +421,8 @@ def run_mtp_depth_sweep(
         target_distribution_windows = sum(
             row["target_distribution_materialized_windows"] for row in rows
         )
-        lazy_bonus_verify_calls = sum(
-            row["lazy_bonus_verify_calls"] for row in rows
-        )
-        lazy_bonus_commit_time_s = sum(
-            row["lazy_bonus_commit_time_s"] for row in rows
-        )
+        lazy_bonus_verify_calls = sum(row["lazy_bonus_verify_calls"] for row in rows)
+        lazy_bonus_commit_time_s = sum(row["lazy_bonus_commit_time_s"] for row in rows)
         depth_results.append(
             {
                 "depth": depth,
@@ -512,9 +521,7 @@ def run_mtp_depth_sweep(
                     "verify_target_distribution_time_s": (
                         verify_target_distribution_time_s
                     ),
-                    "target_distribution_materialized_rows": (
-                        target_distribution_rows
-                    ),
+                    "target_distribution_materialized_rows": (target_distribution_rows),
                     "target_distribution_materialized_windows": (
                         target_distribution_windows
                     ),

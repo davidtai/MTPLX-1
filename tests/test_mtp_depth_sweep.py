@@ -3,6 +3,84 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from mtplx.benchmarks.runners import mtp_depth_sweep
+from mtplx.benchmarks.schema import PromptCase
+from mtplx.generation import GenerationOutput, GenerationStats
+
+
+def _generation_output(*, events: list[dict], verify_calls: int) -> GenerationOutput:
+    return GenerationOutput(
+        tokens=[1, 2],
+        text="ok",
+        finish_reason="length",
+        stats=GenerationStats(
+            mode="mtp",
+            generated_tokens=2,
+            elapsed_s=1.0,
+            tok_s=2.0,
+            decode_elapsed_s=1.0,
+            decode_tok_s=2.0,
+            end_to_end_tok_s=2.0,
+            accepted_drafts=6,
+            drafted_tokens=8,
+            accepted_by_depth=[3, 3],
+            drafted_by_depth=[4, 4],
+            accept_probability_sum_by_depth=[3.0, 3.0],
+            mean_accept_probability_by_depth=[0.75, 0.75],
+            verify_calls=verify_calls,
+            events=events,
+        ),
+    )
+
+
+def test_depth_sweep_uses_verify_calls_only_when_events_are_empty(
+    monkeypatch, tmp_path
+) -> None:
+    fake_runtime = SimpleNamespace(
+        tokenizer=object(),
+        contract=SimpleNamespace(
+            base_hidden_variant="pre_norm",
+            hidden_variant="pre_norm",
+            concat_order="base_then_mtp",
+            mtp_quant_bits=None,
+            mtp_quant_group_size=64,
+            mtp_quant_mode="affine",
+            mtp_quant_policy=None,
+        ),
+        mtp_adapter_metadata=None,
+        mtp_adapter_merge_report=None,
+    )
+    cases = [
+        PromptCase(id="native", category="general", prompt="native"),
+        PromptCase(id="generic", category="general", prompt="generic"),
+    ]
+    outputs = iter(
+        [
+            _generation_output(events=[], verify_calls=4),
+            _generation_output(events=[{}, {}], verify_calls=9),
+        ]
+    )
+
+    monkeypatch.setattr(mtp_depth_sweep, "load", lambda *_args, **_kwargs: fake_runtime)
+    monkeypatch.setattr(mtp_depth_sweep, "load_prompt_suite", lambda *_args: cases)
+    monkeypatch.setattr(
+        mtp_depth_sweep, "encode_prompt_case", lambda *_args, **_kwargs: [1, 2]
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep, "generate_mtpk", lambda *_args, **_kwargs: next(outputs)
+    )
+    monkeypatch.setattr(
+        mtp_depth_sweep, "validate_benchmark_output", lambda *_args, **_kwargs: []
+    )
+
+    result = mtp_depth_sweep.run_mtp_depth_sweep(
+        tmp_path / "model",
+        tmp_path / "suite.jsonl",
+        depths=[2],
+    )
+
+    native, generic = result["depths"][0]["rows"]
+    assert native["mean_accepted_drafts_per_cycle"] == 1.5
+    assert generic["mean_accepted_drafts_per_cycle"] == 3.0
 
 
 def test_depth_sweep_uses_packaged_draft_lm_head_helper(monkeypatch, tmp_path) -> None:
@@ -24,10 +102,14 @@ def test_depth_sweep_uses_packaged_draft_lm_head_helper(monkeypatch, tmp_path) -
     )
 
     monkeypatch.setattr(mtp_depth_sweep, "load", lambda *_args, **_kwargs: fake_runtime)
-    monkeypatch.setattr(mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: []
+    )
     monkeypatch.setattr(
         "mtplx.draft_lm_head._install_draft_lm_head",
-        lambda runtime, **kwargs: calls.append((runtime, kwargs)) or {"installed": True},
+        lambda runtime, **kwargs: (
+            calls.append((runtime, kwargs)) or {"installed": True}
+        ),
     )
 
     result = mtp_depth_sweep.run_mtp_depth_sweep(
@@ -73,7 +155,9 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
         return fake_runtime
 
     monkeypatch.setattr(mtp_depth_sweep, "load", fake_load)
-    monkeypatch.setattr(mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: []
+    )
 
     result = mtp_depth_sweep.run_mtp_depth_sweep(
         tmp_path / "model",
@@ -87,4 +171,7 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
     assert load_kwargs[0]["merge_mtp_adapter"] is True
     assert result["mtp_adapter_kind"] == "c4_mtp_lora_adapter"
     assert result["mtp_adapter_merged"] is True
-    assert result["mtp_adapter_merge_report"] == {"merged": 1, "targets": [{"target": "fc"}]}
+    assert result["mtp_adapter_merge_report"] == {
+        "merged": 1,
+        "targets": [{"target": "fc"}],
+    }
