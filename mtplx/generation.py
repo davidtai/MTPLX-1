@@ -6458,8 +6458,7 @@ def generate_mtpk(
     # the batch scheduler's dense host fallback).
     exact_a3b_target_prefix_factory = (
         rt.a3b_compiled_target_prefix_factory
-        if target_prefix_verify
-        and constraint is None
+        if target_prefix_verify and constraint is None
         and not _ccopy_takes_over_lane
         and not _penalty_bearing_request
         else None
@@ -7961,12 +7960,7 @@ def generate_mtpk(
                         "correction": None,
                     }
         # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
-        if (
-            ccopy_active
-            and _ccopy_capture_lane
-            and cycle_depth >= 1
-            and len(tokens) >= ccopy_suspend_until
-        ):
+        if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
             _cc_hist = prompt_ids + tokens
             ccopy_probes += 1
             # Prompt-only contract: candidates whose continuation starts at the
