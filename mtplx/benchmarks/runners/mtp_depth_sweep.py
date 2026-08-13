@@ -123,6 +123,7 @@ def run_mtp_depth_sweep(
     draft_lm_head_bits: int | None = None,
     draft_lm_head_group_size: int = 64,
     draft_lm_head_mode: str = "affine",
+    deepseek_v4_0731_k2: bool = False,
 ) -> dict[str, Any]:
     contract_kwargs: dict[str, Any] = {
         "mtp_quant_bits": mtp_quant_bits,
@@ -142,6 +143,7 @@ def run_mtp_depth_sweep(
         mtp_adapter=mtp_adapter_path,
         merge_mtp_adapter=merge_mtp_adapter,
         gemma4_draft_block_size=gemma4_draft_block_size,
+        deepseek_v4_0731_k2=deepseek_v4_0731_k2,
     )
     load_active_memory_bytes = _active_memory_bytes()
     contract = getattr(rt, "contract", None)
@@ -642,6 +644,7 @@ def run_mtp_depth_sweep(
     return {
         "model_path": str(model_path),
         "load_active_memory_bytes": load_active_memory_bytes,
+        "deepseek_v4_0731_k2": deepseek_v4_0731_k2,
         "prompt_suite": str(prompt_suite),
         "sampler": asdict(sampler),
         "draft_sampler": asdict(draft_sampler),

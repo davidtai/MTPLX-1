@@ -258,3 +258,42 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
         "merged": 1,
         "targets": [{"target": "fc"}],
     }
+
+
+def test_depth_sweep_selects_construction_bound_0731_stack(
+    monkeypatch, tmp_path
+) -> None:
+    load_kwargs = []
+    fake_runtime = SimpleNamespace(
+        tokenizer=object(),
+        contract=SimpleNamespace(
+            base_hidden_variant="pre_norm",
+            hidden_variant="pre_norm",
+            concat_order="base_then_mtp",
+            mtp_quant_bits=None,
+            mtp_quant_group_size=64,
+            mtp_quant_mode="affine",
+            mtp_quant_policy=None,
+        ),
+        mtp_adapter_metadata=None,
+        mtp_adapter_merge_report=None,
+    )
+
+    def fake_load(*_args, **kwargs):
+        load_kwargs.append(kwargs)
+        return fake_runtime
+
+    monkeypatch.setattr(mtp_depth_sweep, "load", fake_load)
+    monkeypatch.setattr(mtp_depth_sweep, "_active_memory_bytes", lambda: 0)
+    monkeypatch.setattr(
+        mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: []
+    )
+
+    mtp_depth_sweep.run_mtp_depth_sweep(
+        tmp_path / "model",
+        tmp_path / "suite.jsonl",
+        depths=[1],
+        deepseek_v4_0731_k2=True,
+    )
+
+    assert load_kwargs[0]["deepseek_v4_0731_k2"] is True
