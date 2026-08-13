@@ -254,10 +254,10 @@ for (uint row = 0; row < M; ++row) {
     // The eager stock graph materializes each FP32 product in a separate
     // binary kernel before its add/subtract.  ``precise`` preserves those
     // intermediate roundings inside this one-launch candidate.
-    precise float rope0_lhs = x0 * c[pair];
-    precise float rope0_rhs = x1 * s[pair];
-    precise float rope1_lhs = x0 * s[pair];
-    precise float rope1_rhs = x1 * c[pair];
+    float rope0_lhs = metal::precise::fma(x0, c[pair], 0.0f);
+    float rope0_rhs = metal::precise::fma(x1, s[pair], 0.0f);
+    float rope1_lhs = metal::precise::fma(x0, s[pair], 0.0f);
+    float rope1_rhs = metal::precise::fma(x1, c[pair], 0.0f);
     out[d] = T(rope0_lhs - rope0_rhs);
     out[d + 1] = T(rope1_lhs + rope1_rhs);
   }

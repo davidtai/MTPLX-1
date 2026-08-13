@@ -120,10 +120,13 @@ def test_source_preserves_pre_geometry_qmv_norm_and_rope_arithmetic():
         "constexpr uint NORM_LANES = 32;",
         "constexpr uint NORM_READS = 4;",
         "metal::precise::rsqrt(mean + EPS);",
-        "precise float rope0_lhs = x0 * c[pair];",
-        "precise float rope1_rhs = x1 * c[pair];",
+        "float rope0_lhs = metal::precise::fma(x0, c[pair], 0.0f);",
+        "float rope0_rhs = metal::precise::fma(x1, s[pair], 0.0f);",
+        "float rope1_lhs = metal::precise::fma(x0, s[pair], 0.0f);",
+        "float rope1_rhs = metal::precise::fma(x1, c[pair], 0.0f);",
     ):
         assert fragment in source
+    assert "precise float" not in source
     assert (
         "geometry"
         not in inspect.signature(candidate.m3_wqb_qnorm_rope_metal_source).parameters
