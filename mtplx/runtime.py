@@ -1104,6 +1104,8 @@ def load(
                 ) from failure
             raise
         deepseek_v4_0731_k2_receipt = {
+            "target_protocol": "primary_plus_two_drafts_physical_m3",
+            "exact_vs_serial_greedy": False,
             "target": target_prepared.receipt,
             "dspark_ffn": ffn_prepared.receipt,
         }

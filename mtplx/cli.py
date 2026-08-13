@@ -656,8 +656,9 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
         "--deepseek-v4-0731-k2",
         action="store_true",
         help=(
-            "Select the exact construction-bound DeepSeek-V4-Flash-0731 "
-            "DSpark K2 stack. Requires explicit --depth 2 and MTP."
+            "Select the construction-bound DeepSeek-V4-Flash-0731 physical-M3 "
+            "DSpark K2 stack. This faster lane is not token-exact against serial "
+            "greedy AR. Requires explicit --depth 2 and MTP."
         ),
     )
 

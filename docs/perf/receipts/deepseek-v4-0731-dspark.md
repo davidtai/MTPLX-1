@@ -1,9 +1,11 @@
 # DeepSeek-V4 Flash 0731 DSpark receipt
 
 This is the scrubbed, tracked performance receipt for the construction-bound
-DeepSeek-V4 Flash 0731 DSpark K2 lane. Raw generation artifacts remain local;
-their hashes are listed below without model paths, generated text, service
-details, or machine-local process data.
+DeepSeek-V4 Flash 0731 DSpark physical-M3 K2 lane. This route prioritizes the
+measured throughput win and is intentionally not token-exact against serial
+greedy AR. Raw generation artifacts remain local; their hashes are listed below
+without model paths, generated text, service details, or machine-local process
+data.
 
 ## Fixed conditions
 
@@ -21,9 +23,9 @@ details, or machine-local process data.
 - Output: forced 128-token budget, two identical cases in one model load. The
   second case is the warmed comparison; the first exposes one-time compilation.
 - PR lane: explicit `deepseek_v4_0731_k2=True`, fixed proposal width K2,
-  persistent cache, cycle history, batched native verification, stock verify and
-  draft cores.
-- Benchmarked commit: `8a57b9adb4030d1334ee5440e160a06c55555643`.
+  persistent cache, cycle history, one physical target-M3 call per full verify
+  cycle, stock verify and draft cores.
+- Benchmarked commit: `51873de47ff076c95cf9938be0aca56aabe3cebb`.
 
 ## Current PR bracket
 
@@ -33,16 +35,18 @@ load-time allocation; it is identical across these in-load arms.
 
 | case | depth | target prefill tok/s | decode tok/s | end-to-end tok/s | active GiB | growth MiB | peak GiB | accepted / drafted | exact vs K0 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| cold compile | K0 | 0.191 | 25.264 | 1.630 | 86.4561 | 0.0180 | 139.7061 | - | reference |
-| cold compile | K2 | 103.592 | 28.954 | 28.085 | 86.4561 | 0.0190 | 139.7061 | 68 / 119 | yes |
-| warmed | K0 | 103.584 | **32.358** | **31.289** | 86.4561 | 0.0180 | 139.7061 | - | reference |
-| warmed | K2 | 103.315 | 29.240 | 28.356 | 86.4561 | 0.0190 | 139.7061 | 68 / 119 | yes |
+| cold compile | K0 | 0.170 | 24.195 | 1.462 | 86.4561 | 0.0181 | 139.7061 | - | reference |
+| cold compile | K2 | 103.514 | **33.925** | **32.736** | 86.4561 | 0.0192 | 139.7061 | 68 / 119 | no |
+| warmed | K0 | 103.791 | 32.434 | 31.362 | 86.4561 | 0.0181 | 139.7061 | - | reference |
+| warmed | K2 | 103.509 | **35.700** | **34.393** | 86.4561 | 0.0192 | 139.7061 | 68 / 119 | no |
 
-The warmed K2 lane is exact in both cases, but it does **not** beat warmed AR:
-29.240 versus 32.358 decode tok/s, a 9.6% loss. First- and second-position
-acceptance were 70.0% and 44.1%. The cold K0 prefill result is compilation time,
-not model prefill throughput, so it is disclosed rather than used as a speedup
-claim.
+The warmed physical-M3 K2 lane beats warmed AR: 35.700 versus 32.434 decode
+tok/s, a 10.1% win; end-to-end throughput improves 9.7%. First- and
+second-position acceptance were 68.3% and 45.8%. The K2 stream is deterministic
+across both cases but diverges from serial greedy AR at generated-token index 44,
+so this is an explicit throughput-over-exactness contract rather than an exact
+speculative-decoding claim. The cold K0 prefill result is compilation time, not
+model prefill throughput, so it is disclosed rather than used as a speedup claim.
 
 ## Historical K-depth diagnostic
 
@@ -67,9 +71,10 @@ silently widening to an unqualified K1/K3 route.
 
 | local artifact | SHA-256 |
 |---|---|
+| `0731-pr-physical-m3-nonexact-k2-128-20260812.json` | `c290cfb5b0afde6eb83be79d8e5701682e4593f01bf5e1954667daa346e2f982` |
 | `0731-pr-optimized-k2-128-20260812.json` | `e3e8ab454a5a6860578eb022e85297de9143b5bd5588229bb795e472ba5395c2` |
 | `0731-dspark-width123-64tok-20260809.json` | `1f60e529e4c172642fa461c41f5cd5dd11f28048c571f875cff04ee73cae9a3f` |
 
-Profiler dispatch censuses and physical-M3 diagnostics are not used as TPS
-proof here. They are discovery evidence only and remain separate from these
-uninstrumented generation timings.
+Profiler dispatch censuses are not used as TPS proof here. The current physical-
+M3 chart is an uninstrumented generation timing under the exclusive GPU lock;
+its nonexactness is part of the published result, not hidden by the receipt.

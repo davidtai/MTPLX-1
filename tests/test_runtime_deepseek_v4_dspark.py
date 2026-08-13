@@ -383,7 +383,7 @@ def _patch_k2_preparers(monkeypatch, tmp_path, events, *, fail_restore=None):
     monkeypatch.setattr(D, "deepseek_v4_0731_k2_construction", selected_sinkhorn)
 
 
-def test_k2_option_publishes_one_exact_construction_transaction(monkeypatch, tmp_path):
+def test_k2_option_publishes_one_construction_transaction(monkeypatch, tmp_path):
     events = []
     model = _Model()
     _patch_k2_preparers(monkeypatch, tmp_path, events)
@@ -419,6 +419,8 @@ def test_k2_option_publishes_one_exact_construction_transaction(monkeypatch, tmp
         "ffn.publish",
     ]
     assert loaded.deepseek_v4_0731_k2_receipt == {
+        "target_protocol": "primary_plus_two_drafts_physical_m3",
+        "exact_vs_serial_greedy": False,
         "target": {"candidate": "target"},
         "dspark_ffn": {"candidate": "ffn"},
     }
