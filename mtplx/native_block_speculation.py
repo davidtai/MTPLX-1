@@ -1,8 +1,8 @@
-"""Generic serial-exact greedy speculation for fixed-block proposal backends.
+"""Generic physical-block greedy speculation for fixed-block proposal backends.
 
 The backend owns only model-specific proposal/cache operations.  This module
-owns the target protocol: first-token gating, serial-M1 draft verification,
-callbacks, and common generation statistics.
+owns the target protocol: first-token gating, primary-inclusive block
+verification, target-cache rollback, callbacks, and common generation statistics.
 """
 
 from __future__ import annotations
@@ -138,9 +138,8 @@ def generate_native_block_speculative(
     """Run a construction-installed native block proposer against the target.
 
     Depth two means two genuinely future DSpark drafts.  The already sampled
-    target primary plus accepted drafts advance the target through serial M1
-    calls.  The target remains the sole token and state authority; a rejected
-    draft never enters its cache.
+    target primary plus those drafts are verified in one physical target call.
+    Only the accepted prefix remains in the target and proposal caches.
     """
     from .generation import (
         GenerationOutput,
@@ -171,7 +170,7 @@ def generate_native_block_speculative(
         adaptive_width_policy=adaptive_width_policy,
     )
     # Bind the construction-certified target callable once.  The loop invokes
-    # this exact callable for every serial M1 target row.
+    # this exact callable for both M1 tail rows and physical verifier blocks.
     target_forward = backend.bind_target_forward(rt)
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
@@ -433,17 +432,16 @@ def generate_native_block_speculative(
         if abort_check is not None and abort_check():
             break
         # The primary is sampled from carried target logits and is therefore
-        # authoritative, never a DSpark acceptance gate.  DSpark still proposes
-        # K future rows together, but target ownership advances only through
-        # serial M1 calls.  A draft is fed only after the preceding M1 logits
-        # accept it, so target cache state is exact by construction.
+        # authoritative, never a DSpark acceptance gate.  DSpark proposes K
+        # future rows, then target verification executes [primary, drafts] in
+        # one physical block and rolls back its rejected suffix.
         current_top = int(mx.argmax(logits[0], axis=-1).item())
         remaining = max_tokens - len(tokens)
         width = min(int(speculative_depth) + 1, remaining)
         if _is_stop(current_top, stop_token_ids):
             width = 1
         proposal_snapshot = None
-        future = None
+        future_tokens: list[int] = []
         if width > 1:
             proposal_snapshot = backend.snapshot(proposal_cache)
             future = backend.propose(
@@ -455,25 +453,7 @@ def generate_native_block_speculative(
                 start_pos=target_position,
                 width=width - 1,
             )
-
-        # Build the authoritative primary M1 before forcing proposal IDs to the
-        # host.  The two graphs are independent given carried hidden/current_top,
-        # so they share one evaluation boundary without changing target math.
-        with attention_phase("ar_decode"):
-            row_logits, row_hidden = target_forward(
-                mx.array([[current_top]], dtype=mx.int32),
-                cache=target_cache,
-                return_hidden=True,
-            )
-        if future is None:
-            _eval(row_logits, row_hidden)
-        else:
-            _eval(future, row_logits, row_hidden)
-
-        accepted_hidden = [row_hidden[:, -1:]]
-        next_logits = row_logits[:, -1, :]
-        future_tokens: list[int] = []
-        if future is not None:
+            _eval(future)
             future_tokens = [int(token) for token in np.asarray(future)[0]]
             for index, token in enumerate(future_tokens):
                 drafted_by_depth[index] += 1
@@ -483,26 +463,29 @@ def generate_native_block_speculative(
                     break
             drafted_tokens += len(future_tokens)
         proposal_tokens = [current_top, *future_tokens]
-        for token in future_tokens:
-            previous_top = int(mx.argmax(next_logits[0], axis=-1).item())
-            if token != previous_top:
-                break
-            with attention_phase("ar_decode"):
-                row_logits, row_hidden = target_forward(
-                    mx.array([[token]], dtype=mx.int32),
-                    cache=target_cache,
-                    return_hidden=True,
-                )
-            _eval(row_logits, row_hidden)
-            next_logits = row_logits[:, -1, :]
-            accepted_hidden.append(row_hidden[:, -1:])
-            if _is_stop(token, stop_token_ids):
-                break
+        proposed = mx.array([proposal_tokens], dtype=mx.int32)
+        phase = "decode_verify" if width > 1 else "ar_decode"
+        with attention_phase(phase):
+            verify_logits, verify_hidden = target_forward(
+                proposed,
+                cache=target_cache,
+                return_hidden=True,
+            )
+        _eval(verify_logits, verify_hidden)
         verify_calls += 1
-        accepted = len(accepted_hidden)
-        verify_hidden = mx.concatenate(accepted_hidden, axis=1)
 
-        rejected_suffix = len(proposal_tokens) - accepted
+        accepted = 1
+        for index in range(1, width):
+            previous_top = int(mx.argmax(verify_logits[0, index - 1], axis=-1).item())
+            if proposal_tokens[index] != previous_top:
+                break
+            accepted += 1
+            if _is_stop(proposal_tokens[index], stop_token_ids):
+                break
+
+        rejected_suffix = width - accepted
+        if rejected_suffix:
+            backend.rollback_target(target_cache, rejected_suffix)
 
         accepted_drafts += max(0, accepted - 1)
         rejected_drafts += rejected_suffix
@@ -522,7 +505,7 @@ def generate_native_block_speculative(
         roots = backend.cache_roots(proposal_cache)
         if roots:
             _eval(*roots)
-        logits = next_logits
+        logits = verify_logits[:, accepted - 1, :]
         current_hidden = verify_hidden[:, accepted - 1 : accepted]
 
         committed = proposal_tokens[:accepted]

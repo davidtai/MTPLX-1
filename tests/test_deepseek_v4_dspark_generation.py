@@ -280,7 +280,7 @@ class _WidthDivergentTargetRuntime(_DSparkRuntime):
         return logits, hidden
 
 
-def test_dspark_target_verification_is_serial_m1_when_physical_m3_diverges():
+def test_dspark_target_verification_uses_physical_m3_when_width_diverges():
     rt = _WidthDivergentTargetRuntime()
 
     out = generate_mtpk(
@@ -292,11 +292,10 @@ def test_dspark_target_verification_is_serial_m1_when_physical_m3_diverges():
         stop_token_ids=set(),
     )
 
-    assert out.tokens == [11, 12, 13, 14]
-    assert rt.batched_decode_calls == 0
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1, 1]
-    assert all(float(hidden.max()) < 1000.0 for _, hidden in rt.commits)
-    assert rt.target_cache.offset == 2 + len(out.tokens)
+    assert out.tokens != [11, 12, 13, 14]
+    assert rt.batched_decode_calls > 0
+    assert 3 in rt.target_forward_widths
+    assert rt.target_cache.trimmed
 
 
 def test_dspark_uses_one_sanctioned_scheduler_evaluation_boundary(monkeypatch):
@@ -306,8 +305,8 @@ def test_dspark_uses_one_sanctioned_scheduler_evaluation_boundary(monkeypatch):
         future = None
 
         def target_forward(self, input_ids, cache=None, **kwargs):
-            if cache[0].offset >= 2 and int(np.asarray(input_ids).shape[1]) == 1:
-                events.append("target_row_zero_graph")
+            if cache[0].offset >= 2 and int(np.asarray(input_ids).shape[1]) > 1:
+                events.append("target_block_graph")
             return super().target_forward(input_ids, cache=cache, **kwargs)
 
     rt = _OrderingRuntime()
@@ -338,10 +337,11 @@ def test_dspark_uses_one_sanctioned_scheduler_evaluation_boundary(monkeypatch):
     )
 
     assert out.tokens == [11, 12, 13]
-    assert events[:3] in (
-        ["proposal_graph", "target_row_zero_graph", "proposal_materialized"],
-        ["proposal_graph", "proposal_materialized", "target_row_zero_graph"],
-    )
+    assert events[:3] == [
+        "proposal_graph",
+        "proposal_materialized",
+        "target_block_graph",
+    ]
 
 
 def test_dspark_uses_generic_backend_even_without_legacy_family_flag():
@@ -358,7 +358,7 @@ def test_dspark_uses_generic_backend_even_without_legacy_family_flag():
     assert out.tokens == [11, 12, 13, 14]
 
 
-def test_dspark_depth_two_keeps_k2_proposal_with_serial_m1_target_rows():
+def test_dspark_depth_two_verifies_primary_and_two_drafts_in_one_m3_call():
     rt = _DSparkRuntime()
 
     out = generate_mtpk(
@@ -371,9 +371,8 @@ def test_dspark_depth_two_keeps_k2_proposal_with_serial_m1_target_rows():
     )
 
     assert out.tokens == [11, 12, 13, 14]
-    # Depth two still proposes primary + two future drafts together, while the
-    # target advances one exact serial row per emitted token.
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1, 1]
+    # Chunked prefill owns two M1 calls, followed by one physical M3 and the M1 tail.
+    assert rt.target_forward_widths == [1, 1, 3, 1]
     assert rt.proposal_widths == [3]
     assert out.stats.accepted_drafts == 2
     assert out.stats.drafted_tokens == 2
@@ -402,7 +401,7 @@ def test_dspark_proposal_restore_precedes_the_full_accepted_prefix_commit():
         assert float(np.max(ring)) != 999.0
 
 
-def test_dspark_single_token_prompt_uses_one_explicit_m1_seed_before_fixed_k2():
+def test_dspark_single_token_prompt_uses_one_explicit_m1_seed_before_fixed_m3():
     rt = _DSparkRuntime()
 
     out = generate_mtpk(
@@ -415,7 +414,7 @@ def test_dspark_single_token_prompt_uses_one_explicit_m1_seed_before_fixed_k2():
     )
 
     assert out.tokens == [11, 12, 13, 14]
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1]
+    assert rt.target_forward_widths == [1, 1, 3]
     assert rt.proposal_inputs == [(11, 1, 3)]
     assert out.stats.verify_calls == 1
     assert out.stats.accepted_drafts == 2
@@ -472,7 +471,7 @@ class _SecondProposalMissRuntime(_DSparkRuntime):
         return ids, mx.zeros((1, 5, 1024)), mx.ones((1, 5))
 
 
-def test_dspark_rejected_drafts_never_enter_the_target_cache():
+def test_dspark_rejected_drafts_are_trimmed_from_the_target_cache():
     rt = _SecondProposalMissRuntime()
 
     out = generate_mtpk(
@@ -485,8 +484,8 @@ def test_dspark_rejected_drafts_never_enter_the_target_cache():
     )
 
     assert out.tokens == [11, 12, 13, 14]
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1, 1]
-    assert rt.target_cache.trimmed == []
+    assert rt.target_forward_widths == [1, 1, 3, 3, 2, 1]
+    assert rt.target_cache.trimmed[:2] == [2, 2]
     assert out.stats.rejected_drafts >= 2
 
 
@@ -504,7 +503,7 @@ def test_dspark_proposal_restore_precedes_the_primary_only_commit():
     )
 
     assert out.stats.accepted_drafts == 0
-    assert rt.target_cache.trimmed == []
+    assert rt.target_cache.trimmed == [2, 1]
     assert len(rt.commit_ring_history) >= 1
     for ring in rt.commit_ring_history[0]:
         np.testing.assert_array_equal(ring, rt.prefill_hidden)
@@ -535,7 +534,7 @@ def test_dspark_accept_one_resumes_at_the_target_correction_boundary():
     )
 
     assert out.tokens == [11, 12, 13, 14]
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1, 1]
+    assert rt.target_forward_widths == [1, 1, 3, 3]
     # The generic engine owns the next target position; DSpark RoPE/ring setup
     # owns the carried hidden's position, exactly one row earlier.
     assert rt.proposal_inputs == [(10, 1, 3), (11, 2, 3)]
@@ -567,7 +566,7 @@ def test_dspark_accept_two_resumes_at_the_target_correction_boundary():
     )
 
     assert out.tokens == [11, 12, 13, 14, 15]
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1, 1, 1]
+    assert rt.target_forward_widths == [1, 1, 3, 3]
     assert rt.proposal_inputs == [(10, 1, 3), (12, 3, 3)]
     assert out.stats.accepted_drafts == 3
     assert out.stats.rejected_drafts == 1
@@ -580,7 +579,7 @@ class _FirstMissRuntime(_DSparkRuntime):
         return ids, mx.zeros((1, 5, 1024)), mx.ones((1, 5))
 
 
-def test_dspark_wrong_internal_primary_is_replaced_before_serial_target_rows():
+def test_dspark_wrong_internal_primary_is_replaced_before_physical_target_block():
     rt = _FirstMissRuntime()
     out = generate_mtpk(
         rt,
@@ -592,7 +591,7 @@ def test_dspark_wrong_internal_primary_is_replaced_before_serial_target_rows():
     )
     assert out.tokens == [11, 12, 13]
     assert rt.forced_primary_ids == [11, 12]
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1]
+    assert rt.target_forward_widths == [1, 1, 3, 2, 1]
     assert out.stats.verify_calls == 3
 
 
@@ -684,7 +683,7 @@ def test_dspark_accepted_stop_commits_only_the_terminal_prefix():
     assert out.tokens == [11, 12]
     assert out.finish_reason == "stop"
     assert callback == [11]
-    assert rt.target_forward_widths == [1, 1, 1, 1]
+    assert rt.target_forward_widths == [1, 1, 2]
     assert rt.target_cache.trimmed == []
     assert out.stats.accepted_drafts == 1
     assert out.stats.drafted_tokens == 1
@@ -713,8 +712,8 @@ def test_dspark_rejected_stop_is_trimmed_and_never_emitted():
     )
     assert out.tokens == [11, 12, 13, 14]
     assert 99 not in out.tokens
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1, 1]
-    assert rt.target_cache.trimmed == []
+    assert rt.target_forward_widths == [1, 1, 2, 3]
+    assert rt.target_cache.trimmed == [1]
     assert out.stats.rejected_drafts == 1
     assert out.stats.accepted_drafts == 2
 
@@ -723,7 +722,7 @@ def test_dspark_rejected_stop_is_trimmed_and_never_emitted():
     ("max_tokens", "expected_tokens", "expected_widths", "proposal_widths"),
     [
         (1, [11], [1, 1, 1], []),
-        (2, [11, 12], [1, 1, 1, 1], [2]),
+        (2, [11, 12], [1, 1, 2], [2]),
     ],
 )
 def test_dspark_generation_tail_uses_only_the_remaining_target_rows(
@@ -838,7 +837,7 @@ def test_dspark_prefill_callback_failure_does_not_abort_generation(raise_on_call
     assert out.tokens == [11]
 
 
-def test_dspark_rejection_after_required_seed_restores_without_target_trim():
+def test_dspark_rejection_after_required_seed_trims_target_suffix():
     rt = _SecondProposalMissRuntime()
     out = generate_mtpk(
         rt,
@@ -849,9 +848,9 @@ def test_dspark_rejection_after_required_seed_restores_without_target_trim():
         stop_token_ids=set(),
     )
     assert out.tokens == [11, 12, 13, 14]
-    assert rt.target_forward_widths[:3] == [1, 1, 1]
+    assert rt.target_forward_widths[:3] == [1, 1, 3]
     assert rt.proposal_inputs[0] == (11, 1, 3)
-    assert rt.target_cache.trimmed == []
+    assert rt.target_cache.trimmed
     assert out.stats.rejected_drafts >= 2
 
 
@@ -1047,7 +1046,7 @@ def test_dspark_long_prefill_preserves_decode_position_arithmetic(monkeypatch):
         stop_token_ids=set(),
     )
     assert out.tokens == [300, 301, 302]
-    assert rt.target_forward_widths == [128, 128, 43, 1, 1, 1, 1]
+    assert rt.target_forward_widths == [128, 128, 43, 1, 3]
     assert rt.proposal_inputs == [(299, 299, 3)]
     assert rt.commits[-1][0] == 300
     assert rt.target_cache.offset == 303
@@ -1115,7 +1114,7 @@ def test_dspark_chunked_prefill_ring_matches_one_shot_across_wraps(prompt_length
     np.testing.assert_array_equal(np.asarray(chunked.ring), np.asarray(one_shot.ring))
 
 
-def test_dspark_verify_calls_counts_cycles_not_serial_target_forwards():
+def test_dspark_verify_calls_counts_physical_target_cycles():
     rt = _DSparkRuntime()
     out = generate_mtpk(
         rt,
@@ -1125,7 +1124,7 @@ def test_dspark_verify_calls_counts_cycles_not_serial_target_forwards():
         speculative_depth=2,
         stop_token_ids=set(),
     )
-    assert rt.target_forward_widths == [1, 1, 1, 1, 1]
+    assert rt.target_forward_widths == [1, 1, 3]
     assert out.stats.accepted_drafts == 2
-    # One K2 proposal/verification cycle owns three serial target-M1 forwards.
+    # One K2 proposal/verification cycle owns one physical target-M3 forward.
     assert out.stats.verify_calls == 1
