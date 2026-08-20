@@ -21,7 +21,9 @@
 
 ## File structure
 
-- Modify `pyproject.toml`: pin the competitor extra to `dflash-mlx==0.1.10`.
+- Modify `pyproject.toml`: pin the competitor extra to the immutable upstream
+  `dflash-mlx` HEAD commit `60803233af4589e18588b9bacbb03880801c828a`
+  (package version 0.1.10; that version is not published on PyPI).
 - Modify `uv.lock`: record the single dependency update without changing unrelated packages.
 - Create `tests/test_dflash2_dependency.py`: pin and public/internal API compatibility contract.
 - Create `mtplx/benchmarks/dflash2_contract.py`: width parsing, exact Python prompt IDs, immutable row schema, parity checks, and winner/tie selection.
@@ -50,7 +52,7 @@
 
 **Does NOT cover:** This task does not migrate the runner, load a model, update any other direct or transitive dependency intentionally, or change DFlash2 behavior.
 
-- [ ] **Step 1: Write the failing dependency and API contract**
+- [x] **Step 1: Write the failing dependency and API contract**
 
 ```python
 from pathlib import Path
@@ -60,23 +62,26 @@ import tomllib
 def test_competitor_extra_pins_dflash_mlx_0_1_10():
     project = tomllib.loads(Path("pyproject.toml").read_text())
     assert project["project"]["optional-dependencies"]["competitors"] == [
-        "dflash-mlx==0.1.10"
+        "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx.git@60803233af4589e18588b9bacbb03880801c828a"
     ]
 
 
 def test_dflash2_runtime_api_contract():
+    from importlib.metadata import version
+
     from dflash_mlx.draft.dflash2 import DFlash2DraftModel
     from dflash_mlx.engine.target_qwen_gdn import QwenGdnTargetOps
     from dflash_mlx.runtime import stream_dflash_generate
     from dflash_mlx.runtime.loading import load_draft_bundle
 
     assert DFlash2DraftModel.__name__ == "DFlash2DraftModel"
+    assert version("dflash-mlx") == "0.1.10"
     assert QwenGdnTargetOps.backend_name == "qwen_gdn"
     assert callable(stream_dflash_generate)
     assert callable(load_draft_bundle)
 ```
 
-- [ ] **Step 2: Run the contract and verify the old pin fails**
+- [x] **Step 2: Run the contract and verify the old pin fails**
 
 Run:
 
@@ -86,13 +91,13 @@ uv run --extra dev --extra competitors python -m pytest -q tests/test_dflash2_de
 
 Expected: FAIL because `pyproject.toml` still pins `dflash-mlx==0.1.0`; an import failure is also acceptable evidence that the old environment lacks DFlash2.
 
-- [ ] **Step 3: Update exactly one dependency and regenerate the lock**
+- [x] **Step 3: Update exactly one dependency and regenerate the lock**
 
 Change the competitor extra to:
 
 ```toml
 competitors = [
-  "dflash-mlx==0.1.10",
+  "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx.git@60803233af4589e18588b9bacbb03880801c828a",
 ]
 ```
 
@@ -103,9 +108,13 @@ uv lock --upgrade-package dflash-mlx
 uv sync --extra dev --extra competitors
 ```
 
-Review `git diff -- pyproject.toml uv.lock`; the intended direct change is `dflash-mlx 0.1.0 -> 0.1.10`. If unrelated direct dependencies move, stop and restore only this task's lockfile edits before retrying with the existing lock constraints.
+Review `git diff -- pyproject.toml uv.lock`; the intended direct change is
+`dflash-mlx 0.1.0 -> 0.1.10` sourced from exact Git commit
+`60803233af4589e18588b9bacbb03880801c828a`. If unrelated direct dependencies
+move, stop and restore only this task's lockfile edits before retrying with the
+existing lock constraints.
 
-- [ ] **Step 4: Verify imports and the existing competitor-runner tests**
+- [x] **Step 4: Verify imports and the existing competitor-runner tests**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_dependency.py
@@ -114,7 +123,7 @@ Review `git diff -- pyproject.toml uv.lock`; the intended direct change is `dfla
 
 Expected: tests pass and the smoke prints `DFlash2DraftModel`.
 
-- [ ] **Step 5: Commit the isolated dependency migration**
+- [x] **Step 5: Commit the isolated dependency migration**
 
 ```bash
 git add pyproject.toml uv.lock tests/test_dflash2_dependency.py
@@ -131,7 +140,7 @@ git commit -m "Upgrade dflash-mlx to 0.1.10"
 
 **Does NOT cover:** These pure functions do not import MLX, load models, execute benchmarks, or decide a custom optimization.
 
-- [ ] **Step 1: Write failing width, prompt, parity, and ranking tests**
+- [x] **Step 1: Write failing width, prompt, parity, and ranking tests**
 
 ```python
 import pytest
@@ -185,7 +194,7 @@ def test_mismatched_tokens_cannot_enter_selection():
         select_stock_depth([DepthBracket(8, 70.0, 60.0, 60.0, False)])
 ```
 
-- [ ] **Step 2: Run tests and observe the missing module**
+- [x] **Step 2: Run tests and observe the missing module**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_contract.py
@@ -193,7 +202,7 @@ def test_mismatched_tokens_cannot_enter_selection():
 
 Expected: FAIL during collection because `mtplx.benchmarks.dflash2_contract` does not exist.
 
-- [ ] **Step 3: Implement immutable contracts and exact-width prompt construction**
+- [x] **Step 3: Implement immutable contracts and exact-width prompt construction**
 
 ```python
 from __future__ import annotations
@@ -291,7 +300,7 @@ def select_stock_depth(rows: list[DepthBracket]) -> DepthSelection:
     )
 ```
 
-- [ ] **Step 4: Run the pure contract tests**
+- [x] **Step 4: Run the pure contract tests**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_contract.py
@@ -299,7 +308,7 @@ def select_stock_depth(rows: list[DepthBracket]) -> DepthSelection:
 
 Expected: all tests pass without importing MLX.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/benchmarks/dflash2_contract.py tests/test_dflash2_contract.py
