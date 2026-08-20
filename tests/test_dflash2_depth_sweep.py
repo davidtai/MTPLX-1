@@ -54,6 +54,12 @@ def test_target_oracle_uses_exact_greedy_contract(monkeypatch):
     ]
 
 
+def test_greedy_contract_standardizes_temperature_at_one():
+    assert runner.GREEDY.temperature == 1.0
+    assert runner.GREEDY.top_p == 1.0
+    assert runner.GREEDY.top_k == 1
+
+
 def test_target_oracle_rejects_short_output(monkeypatch):
     monkeypatch.setattr(
         runner,
@@ -288,16 +294,20 @@ def test_sweep_rotates_widths_and_brackets_every_candidate():
         "prompt_tokens": 2,
         "generated_tokens": 4,
         "greedy": True,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 1,
     }
     assert len(receipt["brackets"]) == 6
-    assert all(row["parity_passed"] for row in receipt["brackets"])
+    assert all(row["validation_passed"] for row in receipt["brackets"])
+    assert all(row["token_parity_passed"] for row in receipt["brackets"])
     assert receipt["selection"] is not None
     assert "tokens" not in receipt["brackets"][0]["candidate"]
     assert len(receipt["brackets"][0]["candidate"]["token_sha256"]) == 64
     json.dumps(receipt)
 
 
-@pytest.mark.parametrize("failure", ["short", "divergent", "fallback", "width"])
+@pytest.mark.parametrize("failure", ["short", "fallback", "width"])
 def test_sweep_rejects_invalid_candidate_before_selection(failure):
     oracle = tuple(range(4))
     calls = []
@@ -305,7 +315,6 @@ def test_sweep_rejects_invalid_candidate_before_selection(failure):
         oracle,
         calls,
         short_width=8 if failure == "short" else None,
-        divergent_width=8 if failure == "divergent" else None,
         fallback_width=8 if failure == "fallback" else None,
     )
 
@@ -328,7 +337,24 @@ def test_sweep_rejects_invalid_candidate_before_selection(failure):
         arm_runner=arm,
     )
     assert receipt["selection"] is None
-    assert receipt["brackets"][0]["parity_passed"] is False
+    assert receipt["brackets"][0]["validation_passed"] is False
+
+
+def test_sweep_records_token_divergence_without_blocking_selection():
+    oracle = tuple(range(4))
+    receipt = runner.run_dflash2_depth_sweep(
+        bundle=object(),
+        prompt_ids=(1,),
+        widths=(8,),
+        repetitions=1,
+        max_tokens=4,
+        oracle_tokens=oracle,
+        arm_runner=_fake_arm(oracle, [], divergent_width=8),
+    )
+
+    assert receipt["selection"] is not None
+    assert receipt["brackets"][0]["validation_passed"] is True
+    assert receipt["brackets"][0]["token_parity_passed"] is False
 
 
 def test_sweep_production_path_warms_each_width_and_propagates_smoke_budget(monkeypatch):

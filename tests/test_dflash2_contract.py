@@ -91,7 +91,7 @@ def test_depth_bracket_rejects_non_positive_or_non_finite_tps(field, value):
         "candidate_decode_tps": 60.0,
         "control_before_tps": 59.0,
         "control_after_tps": 61.0,
-        "parity_passed": True,
+        "validation_passed": True,
     }
     values[field] = value
 
@@ -138,6 +138,6 @@ def test_selection_reports_leaders_inside_full_control_drift_as_tie_band():
         [DepthBracket(8, 70.0, 60.0, 60.0, False)],
     ],
 )
-def test_empty_or_mismatched_tokens_cannot_enter_selection(rows):
-    with pytest.raises(ValueError, match="parity"):
+def test_empty_or_invalid_brackets_cannot_enter_selection(rows):
+    with pytest.raises(ValueError, match="validation"):
         select_stock_depth(rows)
