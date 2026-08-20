@@ -803,7 +803,7 @@ git commit -m "Add greedy DFlash2 depth sweep"
 
 **Does NOT cover:** The command does not own launchd, acquire or steal the GPU lock, accept arbitrary child commands, enable sampling, or run outside the canonical guard attestation.
 
-- [ ] **Step 1: Write failing parser and guarded-source tests**
+- [x] **Step 1: Write failing parser and guarded-source tests**
 
 ```python
 import inspect
@@ -813,7 +813,7 @@ from mtplx import cli
 
 def test_dflash_defaults_are_qwen38_greedy():
     parser = cli.build_parser()
-    args = parser.parse_args(["bench", "dflash-mlx-baseline"])
+    args = parser.parse_args(["dflash-mlx-baseline"])
     assert args.draft_model == "z-lab/Qwen3.8-27B-DFlash2"
     assert args.temperature == 0.0
     assert args.max_tokens == 1024
@@ -821,7 +821,7 @@ def test_dflash_defaults_are_qwen38_greedy():
 
 def test_depth_sweep_parser_is_closed_to_1_through_8():
     parser = cli.build_parser()
-    args = parser.parse_args(["bench", "dflash2-depth-sweep", "--widths", "1,2,8"])
+    args = parser.parse_args(["dflash2-depth-sweep", "--widths", "1,2,8", "--output", "result.json"])
     assert args.widths == "1,2,8"
     assert args.repetitions == 3
     assert args.prompt_tokens == 1024
@@ -846,7 +846,7 @@ def test_in_place_dflash_channel_no_longer_imports_obsolete_module():
     assert "load_mtplx_dflash2_bundle" in source
 ```
 
-- [ ] **Step 2: Run tests and verify old defaults and missing command fail**
+- [x] **Step 2: Run tests and verify old defaults and missing command fail**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_cli.py tests/test_qwen38_dflash2_depth_guarded.py
@@ -854,9 +854,14 @@ def test_in_place_dflash_channel_no_longer_imports_obsolete_module():
 
 Expected: parser assertions fail on the Qwen3.6/temperature-0.6 defaults and the guarded script is absent.
 
-- [ ] **Step 3: Update the in-place channel and add the closed sweep command**
+- [x] **Step 3: Update the in-place channel and add the closed sweep command**
 
 Keep `dflash-mlx-baseline` for one-width compatibility, but route it through the new runtime bundle and current `dflash_mlx` API. Remove the source-path import shim from its measured path. Add `dflash2-depth-sweep` with these fixed defaults:
+
+Resolve `z-lab/Qwen3.8-27B-DFlash2` only at immutable revision
+`50307d4c4cde6860d4eee73e2547cd786fe8e8a4`; the guarded child uses
+`local_files_only=True`, validates the resolved snapshot plus block/layer/quant
+metadata, and records the resolved revision in its receipt.
 
 ```python
 dflash2_p.add_argument("--model", default=default_model)
@@ -902,7 +907,7 @@ def run_cli_sweep(args, *, token_count=1024):
     )
 ```
 
-- [ ] **Step 4: Add the one-child guarded wrapper**
+- [x] **Step 4: Add the one-child guarded wrapper**
 
 `scripts/qwen38_dflash2_depth_guarded.py` performs this order inside `main()`:
 
@@ -957,7 +962,7 @@ wrapper-only `--smoke-tokens` whose only accepted value is 32. It does not
 accept a command or plist. It consumes the one-shot guard pipe before importing
 the runner and writes with `tempfile.mkstemp`, `fsync`, and `os.replace`.
 
-- [ ] **Step 5: Run parser, import-order, and focused runner tests**
+- [x] **Step 5: Run parser, import-order, and focused runner tests**
 
 ```bash
 .venv/bin/python -m pytest -q \
@@ -968,7 +973,7 @@ the runner and writes with `tempfile.mkstemp`, `fsync`, and `os.replace`.
 
 Expected: all tests pass without model loading.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add mtplx/benchmarks/runners/dflash2_depth_sweep.py \

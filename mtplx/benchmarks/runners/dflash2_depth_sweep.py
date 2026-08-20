@@ -5,15 +5,31 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict
 import hashlib
+import json
 import math
+import os
+from pathlib import Path
+import tempfile
 from typing import Any
 
-from mtplx.benchmarks.dflash2_contract import DepthBracket, select_stock_depth
+from mtplx.benchmarks.dflash2_contract import (
+    DepthBracket,
+    parse_dflash2_widths,
+    select_stock_depth,
+)
 from mtplx.sampling import SamplerConfig
 
 
 GREEDY = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
 MTP_DEPTH = 3
+QWEN38_OPTIMIZED_SPEED = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"
+QWEN38_OPTIMIZED_SPEED_DIRNAMES = (
+    "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
+    "Qwen3.8-27B-MTPLX-Optimized-Speed",
+)
+QWEN38_DFLASH2 = "z-lab/Qwen3.8-27B-DFlash2"
+QWEN38_DFLASH2_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
+QWEN38_DFLASH2_LAYERS = (5, 19, 33, 47, 61)
 
 
 def _generate_ar(*args, **kwargs):
@@ -38,6 +54,149 @@ def _stream_dflash_generate(**kwargs):
     from dflash_mlx.runtime import stream_dflash_generate
 
     return stream_dflash_generate(**kwargs)
+
+
+def _resolve_model_path(model_ref: str):
+    from mtplx.hf_loader import resolve_model_path
+
+    return resolve_model_path(model_ref)
+
+
+def _resolve_draft_snapshot(repo_id: str, revision: str) -> str:
+    from huggingface_hub import snapshot_download
+
+    path = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            local_files_only=True,
+            allow_patterns=[
+                "*.json",
+                "*.safetensors",
+                "*.py",
+                "*.txt",
+                "tokenizer*",
+            ],
+        )
+    ).resolve()
+    if path.name != revision:
+        raise ValueError("DFlash2 draft did not resolve to the pinned revision")
+    return str(path)
+
+
+def _inspect_model(model_path: str):
+    from mtplx.artifacts import inspect_model
+
+    return inspect_model(model_path)
+
+
+def _runtime_env_overrides_from_contract(contract):
+    from mtplx.profiles import runtime_env_overrides_from_contract
+
+    return runtime_env_overrides_from_contract(contract)
+
+
+def _apply_profile_env(profile: str, **kwargs):
+    from mtplx.profiles import apply_profile_env
+
+    return apply_profile_env(profile, **kwargs)
+
+
+def _profile_env_overridden():
+    from mtplx.profiles import profile_env_overridden
+
+    return tuple(dict(row) for row in profile_env_overridden)
+
+
+def _load_mtplx_dflash2_bundle(model_path: str, draft_ref: str):
+    from mtplx.benchmarks.dflash2_runtime import load_mtplx_dflash2_bundle
+
+    return load_mtplx_dflash2_bundle(model_path, draft_ref)
+
+
+def _install_draft_lm_head(runtime: Any, **kwargs):
+    from mtplx.draft_lm_head import _install_draft_lm_head
+
+    return _install_draft_lm_head(runtime, **kwargs)
+
+
+def _build_exact_python_prompt_ids(tokenizer: Any, **kwargs):
+    from mtplx.benchmarks.dflash2_contract import build_exact_python_prompt_ids
+
+    return build_exact_python_prompt_ids(tokenizer, **kwargs)
+
+
+def _validated_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any]:
+    """Fail before load unless this is the exact Optimized Speed artifact shape."""
+
+    quantization = inspection.get("quantization") or {}
+    lm_head = quantization.get("language_model.lm_head") or {}
+    mtp = inspection.get("mtp") or {}
+    compatibility = inspection.get("compatibility") or {}
+    runtime_contract = compatibility.get("runtime_contract")
+    valid = (
+        inspection.get("passes_primary_gate") is True
+        and inspection.get("model_type") == "qwen3_5_text"
+        and inspection.get("architecture") == "Qwen3_5ForConditionalGeneration"
+        and inspection.get("num_hidden_layers") == 64
+        and inspection.get("hidden_size") == 5120
+        and quantization.get("bits") == 4
+        and quantization.get("group_size") == 32
+        and lm_head
+        == {"bits": 8, "group_size": 64, "mode": "affine"}
+        and mtp.get("passes_tensor_gate") is True
+        and mtp.get("sidecar_format") == "bf16"
+        and compatibility.get("tier") == "verified"
+        and compatibility.get("arch_id") == "qwen3-next-mtp"
+        and compatibility.get("support_level") == "verified-native"
+        and isinstance(runtime_contract, dict)
+    )
+    if not valid:
+        raise ValueError(
+            "DFlash2 benchmark requires the verified Qwen3.8 Optimized Speed "
+            "q4/group-32 artifact with its bf16 MTP sidecar"
+        )
+    mtp_contract = runtime_contract.get("mtp_contract") or {}
+    if (
+        runtime_contract.get("recommended_profile") != "turbo"
+        or runtime_contract.get("mtp_depth_max") != MTP_DEPTH
+        or mtp_contract.get("mtp_quant_group_size") != 64
+        or mtp_contract.get("mtp_quant_mode") != "affine"
+        or (runtime_contract.get("verified_on") or {}).get("model")
+        != "Qwen3.8-27B-MTPLX-Optimized-Speed"
+    ):
+        raise ValueError(
+            "Qwen3.8 Optimized Speed runtime contract does not match the "
+            "promoted turbo depth-3 MTP control"
+        )
+    return runtime_contract
+
+
+def _validated_draft_meta(bundle: Any, pinned_path: str) -> dict[str, int]:
+    meta = getattr(bundle, "draft_meta", None)
+    if not isinstance(meta, dict):
+        raise ValueError("DFlash2 bundle has no draft metadata")
+    resolved_ref = meta.get("resolved_model_ref")
+    if not isinstance(resolved_ref, str) or Path(resolved_ref).resolve() != Path(
+        pinned_path
+    ).resolve():
+        raise ValueError("DFlash2 bundle did not load the pinned snapshot")
+    config = meta.get("config") or {}
+    dflash_config = config.get("dflash_config") or {}
+    quant = meta.get("draft_quant")
+    expected_quant = {"weight_bits": 4, "group_size": 64, "act_bits": 16}
+    if (
+        getattr(bundle, "checkpoint_block_size", None) != 8
+        or tuple(getattr(bundle, "target_layer_ids", ())) != QWEN38_DFLASH2_LAYERS
+        or dflash_config.get("block_size") != 8
+        or tuple(dflash_config.get("target_layer_ids") or ())
+        != QWEN38_DFLASH2_LAYERS
+        or quant != expected_quant
+    ):
+        raise ValueError(
+            "DFlash2 pinned snapshot metadata does not match block-8 q4/group-64"
+        )
+    return dict(expected_quant)
 
 
 def _exact_tokens(tokens: Iterable[int], *, expected_tokens: int, engine: str) -> tuple[int, ...]:
@@ -375,3 +534,100 @@ def run_dflash2_depth_sweep(
         "brackets": brackets,
         "selection": selection,
     }
+
+
+def run_cli_sweep(args: Any, *, token_count: int = 1024) -> dict[str, Any]:
+    """Load the fixed Optimized Speed target and run one closed sweep."""
+
+    if type(token_count) is not int or token_count not in {32, 1024}:
+        raise ValueError("DFlash2 benchmark token count must be 32 or 1024")
+    requested_model = str(args.model)
+    requested_path_name = Path(requested_model).expanduser().name
+    if (
+        requested_model != QWEN38_OPTIMIZED_SPEED
+        and requested_path_name not in QWEN38_OPTIMIZED_SPEED_DIRNAMES
+    ):
+        raise ValueError("DFlash2 benchmark requires Qwen3.8 Optimized Speed")
+    if str(args.draft_model) != QWEN38_DFLASH2:
+        raise ValueError("DFlash2 benchmark requires the Qwen3.8 DFlash2 checkpoint")
+    widths = parse_dflash2_widths(args.widths)
+    if type(args.repetitions) is not int or args.repetitions <= 0:
+        raise ValueError("repetitions must be a positive integer")
+
+    resolved_model = str(_resolve_model_path(requested_model))
+    if Path(resolved_model).name not in QWEN38_OPTIMIZED_SPEED_DIRNAMES:
+        raise ValueError(
+            "Qwen3.8 Optimized Speed did not resolve to the verified local artifact"
+        )
+    inspection = _inspect_model(resolved_model).to_dict()
+    runtime_contract = _validated_runtime_contract(inspection)
+    pinned_draft = _resolve_draft_snapshot(
+        QWEN38_DFLASH2,
+        QWEN38_DFLASH2_REVISION,
+    )
+    runtime_overrides = _runtime_env_overrides_from_contract(runtime_contract)
+    _apply_profile_env("turbo", runtime_env_overrides=runtime_overrides)
+    overridden = _profile_env_overridden()
+    if overridden:
+        names = ", ".join(str(row.get("var")) for row in overridden)
+        raise ValueError(
+            "operator environment overrides the optimized turbo control: " + names
+        )
+
+    bundle = _load_mtplx_dflash2_bundle(resolved_model, pinned_draft)
+    draft_quant = _validated_draft_meta(bundle, pinned_draft)
+    _install_draft_lm_head(
+        bundle.runtime,
+        bits=4,
+        group_size=64,
+        mode="affine",
+    )
+    prompt = _build_exact_python_prompt_ids(
+        bundle.tokenizer,
+        token_count=token_count,
+    )
+    receipt = run_dflash2_depth_sweep(
+        bundle=bundle,
+        prompt_ids=prompt.token_ids,
+        widths=widths,
+        repetitions=args.repetitions,
+        max_tokens=token_count,
+    )
+    receipt["model"] = {
+        "requested": requested_model,
+        "resolved": resolved_model,
+        "draft": {
+            "requested": str(args.draft_model),
+            "revision": QWEN38_DFLASH2_REVISION,
+            "resolved": pinned_draft,
+            "quant": draft_quant,
+        },
+        "profile": "turbo",
+        "mtp_depth": MTP_DEPTH,
+        "draft_lm_head": {"bits": 4, "group_size": 64, "mode": "affine"},
+    }
+    return receipt
+
+
+def write_depth_sweep_result(path: Path | str, receipt: dict[str, Any]) -> None:
+    """Atomically publish one JSON-safe depth-sweep receipt."""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        dir=destination.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(receipt, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
