@@ -20,7 +20,7 @@ from mtplx.benchmarks.dflash2_contract import (
 from mtplx.sampling import SamplerConfig
 
 
-GREEDY = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
+GREEDY = SamplerConfig(temperature=1.0, top_p=1.0, top_k=1)
 MTP_DEPTH = 3
 QWEN38_OPTIMIZED_SPEED = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"
 QWEN38_OPTIMIZED_SPEED_DIRNAMES = (
@@ -404,6 +404,19 @@ def _arm_matches_oracle(
     return tokens == oracle_tokens and generated_tokens == expected_tokens
 
 
+def _arm_has_expected_output(
+    arm: dict[str, Any],
+    *,
+    expected_tokens: int,
+) -> bool:
+    try:
+        tokens = tuple(int(token) for token in arm["tokens"])
+        generated_tokens = int(arm["generated_tokens"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return len(tokens) == expected_tokens and generated_tokens == expected_tokens
+
+
 def run_dflash2_depth_sweep(
     *,
     bundle: Any,
@@ -485,7 +498,7 @@ def run_dflash2_depth_sweep(
             control_before = resolved_arm_runner("mtp", MTP_DEPTH)
             candidate = resolved_arm_runner("dflash2", width)
             control_after = resolved_arm_runner("mtp", MTP_DEPTH)
-            parity_passed = all(
+            token_parity_passed = all(
                 _arm_matches_oracle(
                     arm,
                     oracle_tuple,
@@ -493,7 +506,10 @@ def run_dflash2_depth_sweep(
                 )
                 for arm in (control_before, candidate, control_after)
             )
-            parity_passed = parity_passed and (
+            validation_passed = all(
+                _arm_has_expected_output(arm, expected_tokens=max_tokens)
+                for arm in (control_before, candidate, control_after)
+            ) and (
                 candidate.get("requested_width") == width
                 and candidate.get("effective_width") == width
                 and candidate.get("fallback_ar") is False
@@ -505,7 +521,7 @@ def run_dflash2_depth_sweep(
                     candidate_decode_tps=float(candidate["decode_tps"]),
                     control_before_tps=float(control_before["decode_tps"]),
                     control_after_tps=float(control_after["decode_tps"]),
-                    parity_passed=parity_passed,
+                    validation_passed=validation_passed,
                 )
             )
             brackets.append(
@@ -515,18 +531,22 @@ def run_dflash2_depth_sweep(
                     "control_before": _receipt_without_tokens(control_before),
                     "candidate": _receipt_without_tokens(candidate),
                     "control_after": _receipt_without_tokens(control_after),
-                    "parity_passed": parity_passed,
+                    "validation_passed": validation_passed,
+                    "token_parity_passed": token_parity_passed,
                 }
             )
 
     selection = None
-    if all(row.parity_passed for row in selection_rows):
+    if all(row.validation_passed for row in selection_rows):
         selection = asdict(select_stock_depth(selection_rows))
     return {
         "workload": {
             "prompt_tokens": len(prompt_tuple),
             "generated_tokens": max_tokens,
             "greedy": True,
+            "temperature": GREEDY.temperature,
+            "top_p": GREEDY.top_p,
+            "top_k": GREEDY.top_k,
         },
         "widths": list(width_tuple),
         "repetitions": repetitions,

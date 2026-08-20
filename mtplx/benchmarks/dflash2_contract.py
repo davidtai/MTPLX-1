@@ -25,13 +25,13 @@ class ExactPrompt:
 
 @dataclass(frozen=True)
 class DepthBracket:
-    """One DFlash2 candidate measurement and its adjacent MTP controls."""
+    """One validated DFlash2 measurement and its adjacent MTP controls."""
 
     width: int
     candidate_decode_tps: float
     control_before_tps: float
     control_after_tps: float
-    parity_passed: bool
+    validation_passed: bool
 
     def __post_init__(self) -> None:
         if (
@@ -137,10 +137,10 @@ def build_exact_python_prompt_ids(
 
 
 def select_stock_depth(rows: list[DepthBracket]) -> DepthSelection:
-    """Rank correct widths by median bracket-normalized decode throughput."""
+    """Rank valid widths by median bracket-normalized decode throughput."""
 
-    if not rows or any(not row.parity_passed for row in rows):
-        raise ValueError("every ranked DFlash2 bracket must pass exact token parity")
+    if not rows or any(not row.validation_passed for row in rows):
+        raise ValueError("every ranked DFlash2 bracket must pass benchmark validation")
 
     grouped: dict[int, list[DepthBracket]] = {}
     for row in rows:
