@@ -5,8 +5,8 @@ import tomllib
 
 DFLASH_MLX_PIN = (
     "dflash-mlx @ "
-    "git+https://github.com/bstnxbt/dflash-mlx.git@"
-    "60803233af4589e18588b9bacbb03880801c828a"
+    "git+https://github.com/davidtai/dflash-mlx.git@"
+    "95a16104c5462793f9f14d2cd0b97b856fb643a1"
 )
 
 
