@@ -301,9 +301,20 @@ def test_sweep_rotates_widths_and_brackets_every_candidate():
     assert len(receipt["brackets"]) == 6
     assert all(row["validation_passed"] for row in receipt["brackets"])
     assert all(row["token_parity_passed"] for row in receipt["brackets"])
+    assert receipt["determinism"] == {
+        "control_stable": True,
+        "candidate_repeats_checked": True,
+        "candidate_stable_by_width": {"1": True, "2": True, "3": True},
+        "passed": True,
+    }
     assert receipt["selection"] is not None
     assert "tokens" not in receipt["brackets"][0]["candidate"]
     assert len(receipt["brackets"][0]["candidate"]["token_sha256"]) == 64
+    assert receipt["brackets"][0]["candidate"]["oracle_comparison"] == {
+        "exact_match": True,
+        "matching_prefix_tokens": 4,
+        "first_mismatch": None,
+    }
     json.dumps(receipt)
 
 
@@ -355,6 +366,97 @@ def test_sweep_records_token_divergence_without_blocking_selection():
     assert receipt["selection"] is not None
     assert receipt["brackets"][0]["validation_passed"] is True
     assert receipt["brackets"][0]["token_parity_passed"] is False
+    assert receipt["brackets"][0]["candidate"]["oracle_comparison"] == {
+        "exact_match": False,
+        "matching_prefix_tokens": 3,
+        "first_mismatch": {
+            "index": 3,
+            "oracle_token": 3,
+            "arm_token": 4,
+        },
+    }
+
+
+def test_sweep_rejects_nondeterministic_candidate_repetitions():
+    oracle = tuple(range(4))
+    candidate_calls = 0
+
+    def arm(kind, width):
+        nonlocal candidate_calls
+        tokens = oracle
+        if kind == "dflash2":
+            candidate_calls += 1
+            if candidate_calls == 2:
+                tokens = (*oracle[:-1], 99)
+        receipt = {
+            "tokens": tokens,
+            "generated_tokens": len(tokens),
+            "decode_tps": 60.0,
+        }
+        if kind == "dflash2":
+            receipt.update(
+                requested_width=width,
+                effective_width=width,
+                fallback_ar=False,
+            )
+        return receipt
+
+    receipt = runner.run_dflash2_depth_sweep(
+        bundle=object(),
+        prompt_ids=(1,),
+        widths=(8,),
+        repetitions=2,
+        max_tokens=4,
+        oracle_tokens=oracle,
+        arm_runner=arm,
+    )
+
+    assert receipt["selection"] is None
+    assert receipt["determinism"] == {
+        "control_stable": True,
+        "candidate_repeats_checked": True,
+        "candidate_stable_by_width": {"8": False},
+        "passed": False,
+    }
+
+
+def test_sweep_rejects_nondeterministic_mtp_controls():
+    oracle = tuple(range(4))
+    control_calls = 0
+
+    def arm(kind, width):
+        nonlocal control_calls
+        tokens = oracle
+        if kind == "mtp":
+            control_calls += 1
+            if control_calls == 2:
+                tokens = (*oracle[:-1], 99)
+        receipt = {
+            "tokens": tokens,
+            "generated_tokens": len(tokens),
+            "decode_tps": 60.0,
+        }
+        if kind == "dflash2":
+            receipt.update(
+                requested_width=width,
+                effective_width=width,
+                fallback_ar=False,
+            )
+        return receipt
+
+    receipt = runner.run_dflash2_depth_sweep(
+        bundle=object(),
+        prompt_ids=(1,),
+        widths=(8,),
+        repetitions=1,
+        max_tokens=4,
+        oracle_tokens=oracle,
+        arm_runner=arm,
+    )
+
+    assert receipt["selection"] is None
+    assert receipt["determinism"]["control_stable"] is False
+    assert receipt["determinism"]["passed"] is False
 
 
 def test_sweep_production_path_warms_each_width_and_propagates_smoke_budget(monkeypatch):

@@ -390,6 +390,48 @@ def _receipt_without_tokens(arm: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def _oracle_comparison(
+    arm: dict[str, Any],
+    oracle_tokens: tuple[int, ...],
+) -> dict[str, Any]:
+    tokens = tuple(int(token) for token in arm["tokens"])
+    matching_prefix = 0
+    for arm_token, oracle_token in zip(tokens, oracle_tokens):
+        if arm_token != oracle_token:
+            break
+        matching_prefix += 1
+    exact_match = tokens == oracle_tokens
+    first_mismatch = None
+    if not exact_match:
+        first_mismatch = {
+            "index": matching_prefix,
+            "oracle_token": (
+                oracle_tokens[matching_prefix]
+                if matching_prefix < len(oracle_tokens)
+                else None
+            ),
+            "arm_token": (
+                tokens[matching_prefix]
+                if matching_prefix < len(tokens)
+                else None
+            ),
+        }
+    return {
+        "exact_match": exact_match,
+        "matching_prefix_tokens": matching_prefix,
+        "first_mismatch": first_mismatch,
+    }
+
+
+def _public_arm_receipt(
+    arm: dict[str, Any],
+    oracle_tokens: tuple[int, ...],
+) -> dict[str, Any]:
+    public = _receipt_without_tokens(arm)
+    public["oracle_comparison"] = _oracle_comparison(arm, oracle_tokens)
+    return public
+
+
 def _arm_matches_oracle(
     arm: dict[str, Any],
     oracle_tokens: tuple[int, ...],
@@ -528,16 +570,49 @@ def run_dflash2_depth_sweep(
                 {
                     "repetition": repetition,
                     "width": width,
-                    "control_before": _receipt_without_tokens(control_before),
-                    "candidate": _receipt_without_tokens(candidate),
-                    "control_after": _receipt_without_tokens(control_after),
+                    "control_before": _public_arm_receipt(
+                        control_before,
+                        oracle_tuple,
+                    ),
+                    "candidate": _public_arm_receipt(candidate, oracle_tuple),
+                    "control_after": _public_arm_receipt(
+                        control_after,
+                        oracle_tuple,
+                    ),
                     "validation_passed": validation_passed,
                     "token_parity_passed": token_parity_passed,
                 }
             )
 
+    control_hashes = {
+        arm["token_sha256"]
+        for bracket in brackets
+        for arm in (bracket["control_before"], bracket["control_after"])
+    }
+    candidate_repeats_checked = repetitions >= 2
+    candidate_stable_by_width: dict[str, bool | None] = {}
+    for width in width_tuple:
+        hashes = {
+            bracket["candidate"]["token_sha256"]
+            for bracket in brackets
+            if bracket["width"] == width
+        }
+        candidate_stable_by_width[str(width)] = (
+            len(hashes) == 1 if candidate_repeats_checked else None
+        )
+    determinism_passed = len(control_hashes) == 1 and (
+        not candidate_repeats_checked
+        or all(value is True for value in candidate_stable_by_width.values())
+    )
+    determinism = {
+        "control_stable": len(control_hashes) == 1,
+        "candidate_repeats_checked": candidate_repeats_checked,
+        "candidate_stable_by_width": candidate_stable_by_width,
+        "passed": determinism_passed,
+    }
+
     selection = None
-    if all(row.validation_passed for row in selection_rows):
+    if determinism_passed and all(row.validation_passed for row in selection_rows):
         selection = asdict(select_stock_depth(selection_rows))
     return {
         "workload": {
@@ -552,6 +627,7 @@ def run_dflash2_depth_sweep(
         "repetitions": repetitions,
         "oracle_token_sha256": _token_sha256(oracle_tuple),
         "brackets": brackets,
+        "determinism": determinism,
         "selection": selection,
     }
 
