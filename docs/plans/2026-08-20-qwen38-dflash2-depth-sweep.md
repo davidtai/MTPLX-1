@@ -474,7 +474,7 @@ git commit -m "Connect DFlash2 to an MTPLX target"
 
 **Does NOT cover:** The runner does not alter DFlash2, tune kernels, sample stochastically, stop on EOS, compare unmatched timing windows, or declare a final MTP win.
 
-- [ ] **Step 1: Write failing orchestration tests with fake arms**
+- [x] **Step 1: Write failing orchestration tests with fake arms**
 
 ```python
 from mtplx.benchmarks.runners.dflash2_depth_sweep import run_dflash2_depth_sweep
@@ -521,7 +521,7 @@ def test_sweep_rejects_short_or_divergent_candidate():
     assert result["brackets"][0]["parity_passed"] is False
 ```
 
-- [ ] **Step 2: Run the tests and observe the missing runner**
+- [x] **Step 2: Run the tests and observe the missing runner**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_depth_sweep.py
@@ -529,7 +529,7 @@ def test_sweep_rejects_short_or_divergent_candidate():
 
 Expected: FAIL during collection because the runner does not exist.
 
-- [ ] **Step 3: Implement exact oracle, MTP, and DFlash2 arm functions**
+- [x] **Step 3: Implement exact oracle, MTP, and DFlash2 arm functions**
 
 The production arm runner uses these fixed contracts:
 
@@ -774,7 +774,7 @@ Build `runtime_context` once with `verify_mode="dflash"`, `copyspec_mode="off"`,
 
 For each repetition, rotate widths by the repetition index, and for every width append `C0 -> B -> C1`. Store raw tokens only as a SHA-256 plus an optional compressed token list in the local receipt; parity compares the full in-memory tuple before aggregation.
 
-- [ ] **Step 4: Run focused orchestration and event-adapter tests**
+- [x] **Step 4: Run focused orchestration and event-adapter tests**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_depth_sweep.py
@@ -782,7 +782,7 @@ For each repetition, rotate widths by the repetition index, and for every width 
 
 Expected: fake-arm tests pass; no real model loads occur.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/benchmarks/runners/dflash2_depth_sweep.py tests/test_dflash2_depth_sweep.py
