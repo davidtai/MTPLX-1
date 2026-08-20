@@ -992,7 +992,7 @@ git commit -m "Wire Qwen3.8 DFlash2 benchmark channel"
 
 **Does NOT cover:** Verification fixes do not broaden model support, add optimization code, weaken parity, or change benchmark thresholds.
 
-- [ ] **Step 1: Run focused tests with DFlash2 installed**
+- [x] **Step 1: Run focused tests with DFlash2 installed**
 
 ```bash
 .venv/bin/python -m pytest -q \
@@ -1006,7 +1006,7 @@ git commit -m "Wire Qwen3.8 DFlash2 benchmark channel"
 
 Expected: all focused tests pass.
 
-- [ ] **Step 2: Run formatting, static checks, and full suite**
+- [x] **Step 2: Run formatting, static checks, and full suite**
 
 ```bash
 .venv/bin/python -m ruff check mtplx tests scripts/qwen38_dflash2_depth_guarded.py
@@ -1016,15 +1016,22 @@ git diff --check upstream/main...HEAD
 
 Expected: Ruff, the full suite, and whitespace checks pass. If unrelated upstream tests fail, capture the exact failure and prove it also fails at `upstream/main` before classifying it as pre-existing.
 
-- [ ] **Step 3: Run a no-model CLI help smoke**
+Observed on 2026-08-20: the six focused DFlash2 files pass 81 tests and the
+changed files pass Ruff. Repository-wide Ruff reports the same 68 pre-existing
+errors at `upstream/main`, and the full suite's sole failure,
+`test_repeated_stats_polls_reuse_cached_aggregate` (`2 == 1`), reproduces on a
+detached `upstream/main` worktree. `git diff --check upstream/main...HEAD`
+passes.
+
+- [x] **Step 3: Run a no-model CLI help smoke**
 
 ```bash
-.venv/bin/mtplx bench dflash2-depth-sweep --help
+.venv/bin/mtplx dflash2-depth-sweep --help
 ```
 
 Expected: help shows fixed greedy 1,024/1,024 defaults, widths 1-8, repetitions 3, and required output.
 
-- [ ] **Step 4: Commit only necessary verification fixes**
+- [x] **Step 4: Commit only necessary verification fixes**
 
 If Tasks 1-5 require no fixes, do not create an empty commit. Otherwise stage
 only the owned files that changed:
