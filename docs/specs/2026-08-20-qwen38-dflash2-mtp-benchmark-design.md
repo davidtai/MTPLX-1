@@ -11,11 +11,22 @@ Optimized Speed MTP runtime on this machine.
 The benchmark is greedy, uses one tokenizer-normalized 1,024-token Python
 coding prompt, and forces 1,024 generated tokens. The control is the complete
 MTPLX Optimized Speed `turbo` profile at its artifact-recommended MTP depth 3.
-The DFlash2 arm reuses that target runtime and profile and replaces only the
-MTP draft source with DFlash2.
+The DFlash2 arm reuses the same loaded target object, weights, tokenizer, and
+resolved profile, but runs them through the unchanged DFlash2 speculative
+engine. It does not pretend that DFlash2 is merely a drop-in MTP draft head:
+the two engines retain their own cache, proposal, and verification mechanics.
 
-MTP is the reference to beat. A DFlash2 result that is merely faster than
-autoregressive decoding is not a successful outcome.
+The work has two sequential phases:
+
+1. **Phase A — depth benchmark:** run the unchanged upstream DFlash2
+   implementation at widths 1-8 and establish the fastest correct width.
+2. **Phase B — optimization:** profile only the Phase A winner, then design and
+   measure a fit-for-purpose optimization against the unchanged winner and the
+   MTP reference.
+
+MTP is the final reference to beat. Phase A is complete when the optimal stock
+DFlash2 width is established honestly, even if it is slower than MTP. No custom
+kernel work begins before that result exists.
 
 ## Pinned inputs
 
@@ -51,6 +62,9 @@ execution, warmup, profiling, and timed rows happen only while holding
   convolution, layer layout, or checkpoint contract.
 - Do not modify target weights, quantization, cache layout, target arithmetic,
   or the promoted Optimized Speed profile.
+- Do not add, port, tune, or benchmark a custom DFlash2 kernel during Phase A.
+  That phase changes only compatibility and benchmark plumbing required to run
+  the upstream DFlash2 implementation fairly.
 - Do not switch the persistent Qwen service to DFlash2 as part of this work.
 - Do not publish a speed claim from a microbenchmark, profiler trace, or
   unmatched runtime comparison.
@@ -59,26 +73,32 @@ execution, warmup, profiling, and timed rows happen only while holding
 
 ### One target runtime
 
-Both arms load the exact local Optimized Speed artifact through MTPLX after
-applying the same `turbo` profile and model-local runtime overrides. The target
-model object, tokenizer, token embedding, lm-head, target cache implementation,
-prefill policy, target verification policy, stop policy, and timing boundaries
-remain MTPLX-owned.
+Both arms use the exact local Optimized Speed artifact loaded once through
+MTPLX after applying the same `turbo` profile and model-local runtime
+overrides. The target model object, weights, tokenizer, token embedding, and
+lm-head are shared.
+
+Each speculative engine creates its own fresh cache for each arm. The MTP
+control uses MTPLX's promoted cache and verification path. The unchanged
+`dflash-mlx` candidate uses its existing Qwen GDN cache, rollback, and
+target-prefix verification machinery against the already-loaded MTPLX target
+object. This unavoidable engine-level difference is recorded in the receipt;
+Phase A does not rewrite it in an attempt to isolate only proposal cost.
 
 The MTP arm uses the existing native MTP head and `generate_mtpk` at depth 3.
 
-The DFlash2 arm uses the existing `dflash-mlx` engine and its native
-`DFlash2DraftModel`; this project does not create a second `dflash2-mlx`
-package or duplicate the DFlash2 implementation. A construction-time
-`MTPLXTargetOps` adapter gives that engine the already-loaded MTPLX target,
-tokenizer, cache operations, token embedding, lm-head, hidden-capture, verify,
-rollback, and commit operations.
+The DFlash2 arm uses the existing `dflash-mlx` engine, `QwenGdnTargetOps`, and
+native `DFlash2DraftModel`; this project does not create a second
+`dflash2-mlx` package, duplicate the DFlash2 implementation, or add a custom
+target adapter during Phase A. Construction gives that engine the already
+loaded MTPLX target model and tokenizer instead of a target model reference.
 
 The `dflash-mlx` engine loads and validates only the released DFlash2 draft
 checkpoint, captures the required target residual streams at layers 5, 19, 33,
-47, and 61 through `MTPLXTargetOps`, maintains DFlash2's context cache, emits
-one greedy candidate block, and drives target-prefix verification. It must not
-load a second stock target model or replace the MTPLX target implementation.
+47, and 61 through its existing Qwen target operations, maintains DFlash2's
+context cache, emits one greedy candidate block, and drives target-prefix
+verification. It must not load a second stock target model or replace the
+already-loaded MTPLX target object.
 
 Residual-stream capture is necessary DFlash2 proposal input and is charged to
 the candidate's end-to-end time. Capture must not change target arithmetic.
@@ -106,15 +126,15 @@ Before any measured generation, installation validates once:
   dynamic convolution, group size 16, selector rank 256, selector top-k 16,
   mask token, vocabulary, and target layer IDs;
 - target embedding and lm-head ownership shared with the DFlash2 proposer;
-- target cache rollback/commit behavior at every verify width 1-8;
+- unchanged DFlash cache rollback/commit behavior at every verify width 1-8;
 - the installed MTPLX `turbo` route and its resolved model runtime overrides;
 - a small exact greedy parity self-check against the unchanged target stream.
 
-The installer returns an immutable, prebound `MTPLXTargetOps` instance and
-DFlash2 runtime context for each supported width. An invariant failure aborts
-before warmup. The enabled DFlash2 hot path has no `eligible-or-stock`,
-exception fallback, per-cycle metadata validation, environment reads, or proof
-counters.
+The constructor returns an immutable bundle containing the MTPLX target,
+existing Qwen target operations, DFlash2 model/backend, tokenizer, and runtime
+context. An invariant failure aborts before warmup. The enabled DFlash2 hot
+path has no `eligible-or-stock`, exception fallback, per-cycle metadata
+validation, environment reads, or proof counters.
 
 ## Greedy correctness contract
 
@@ -135,12 +155,13 @@ width mismatch rejects that arm.
 
 ## Benchmark workload
 
-The repository gains one deterministic Python coding prompt fixture. The
-runner applies the target tokenizer's production chat template and adjusts
-only a clearly marked inert code-comment suffix until the encoded prompt is
-exactly 1,024 tokens. It asserts that length before model load timing begins
-and records the final prompt text, encoded-ID hash, tokenizer identity, chat
-template hash, and reasoning/thinking setting.
+The repository gains one deterministic Python coding prompt fixture long
+enough to exceed 1,024 encoded tokens. The runner applies the target
+tokenizer's production chat template once and takes the first exactly 1,024
+token IDs as the benchmark prompt. It asserts that length before model-load
+timing begins and records the source prompt, exact encoded IDs and their hash,
+tokenizer identity, chat-template hash, and reasoning/thinking setting. Both
+arms receive that same immutable token-ID tuple directly.
 
 Each measured row generates exactly 1,024 tokens. Warmup uses the same arm and
 width but is excluded from timing. The benchmark order uses matched brackets:
@@ -160,27 +181,40 @@ time to first token, generated tokens, target verify calls, drafted and
 accepted tokens by position, mean accepted speculative tail, peak memory,
 requested/effective width, profile identity, and thermal/quiet-machine state.
 
-## Reference and promotion gate
+## Depth-selection and final promotion gates
 
 The MTP reference is the mean of the two controls bracketing each candidate,
 not an older published number. Observed bracket drift is the absolute
 difference between `C0` and `C1`.
 
-A DFlash2 configuration beats MTP only if all correctness gates pass and its
-decode throughput exceeds the bracketed MTP mean by more than the full observed
-control drift. A practical win must repeat in the same direction across the
-accepted brackets. Peak memory and end-to-end latency are reported even when
-decode throughput wins.
+A Phase A DFlash2 width is ranked by its decode-throughput ratio to the mean of
+its bracketing MTP controls. The optimal width is the highest correct median
+ratio across accepted brackets. If the leading widths differ by no more than
+the full observed control drift, run direct alternating tie-break brackets; if
+they remain indistinguishable, report the tie band instead of inventing a
+single winner.
+
+Only after the winner or tie band is frozen may Phase B profile and optimize
+it. A final DFlash2 configuration beats MTP only if all correctness gates pass
+and its decode throughput exceeds the bracketed MTP mean by more than the full
+observed control drift. A practical win must repeat in the same direction
+across the accepted brackets. Peak memory and end-to-end latency are reported
+even when decode throughput wins.
 
 If no width clears this gate, the honest result is that Optimized Speed MTP
 remains the winner. The runner and receipts may still land, but DFlash2 is not
 promoted as a speed improvement.
 
-## Profiling and optimization loop
+## Phase B profiling and optimization loop
 
-First establish unchanged MTP and unoptimized DFlash2 baselines. Profile the
-fastest correct DFlash2 width outside the scored timing window and identify the
-top three wall-time components using real 1,024/1,024 shapes.
+Phase B is blocked until Phase A has committed immutable stock-DFlash2 receipts
+and selected the fastest correct width or a measured tie band. Then profile
+only that selected configuration outside the scored timing window and identify
+the top three wall-time components using real 1,024/1,024 shapes.
+
+The custom optimization is specified in a separate follow-on implementation
+plan written from that profiler evidence. The Phase A plan must not guess its
+kernel, geometry, or target operation.
 
 Optimization proceeds one hypothesis at a time:
 
@@ -195,10 +229,10 @@ Optimization proceeds one hypothesis at a time:
 Likely investigation areas are determined by the profile, not assumed in
 advance. Candidate examples include DFlash2 block construction, grouped
 dynamic convolution, context-cache append, selector synchronization,
-`MTPLXTargetOps` tap materialization, and verify-width routing. Improvements to
+target tap materialization, and verify-width routing. Improvements to
 generic DFlash2 arithmetic belong upstream in `dflash-mlx`; MTPLX keeps only
-the adapter and benchmark integration. No optimization is accepted solely
-because a similarly named kernel won on the older DFlash model.
+the construction bundle and benchmark integration. No optimization is accepted
+solely because a similarly named kernel won on the older DFlash model.
 
 Stop when a repeatable DFlash2 configuration clears the MTP gate or when the
 profiled candidates fail the first matched A/B gates. The final ledger records
@@ -224,16 +258,26 @@ not require the GPU lock.
 
 ## Deliverables
 
+### Phase A
+
 - Updated MTPLX DFlash channel using the current `dflash_mlx` package/API and
   the Qwen3.8 DFlash2 checkpoint.
-- Construction-time `MTPLXTargetOps` adapter for the existing `dflash-mlx`
-  engine, with no second target load and no measured-path fallback.
+- Construction-time bundle connecting the existing `dflash-mlx` engine to the
+  already-loaded MTPLX target, with no second target load, custom kernel, or
+  measured-path fallback.
 - Exact greedy parity tests for widths 1-8.
 - Deterministic 1,024-token Python prompt fixture and 1,024-token forced-output
   guarded runner.
-- Bracketed MTP depth-3 reference and DFlash2 width 1-8 benchmark receipts.
-- Profiler evidence and an optimization ledger including rejected candidates.
-- A final conclusion stating whether any DFlash2 width actually beats the
+- Bracketed MTP depth-3 reference and unchanged DFlash2 width 1-8 benchmark
+  receipts.
+- A frozen optimal stock DFlash2 width or an explicitly measured tie band.
+
+### Phase B
+
+- Profiler evidence for the Phase A winner at the real 1,024/1,024 workload.
+- A separate evidence-derived custom-optimization plan.
+- An optimization ledger including rejected candidates and matched A/B rows.
+- A final conclusion stating whether optimized DFlash2 actually beats the
   Optimized Speed MTP control.
 
 ## Failure handling
@@ -254,10 +298,10 @@ not require the GPU lock.
 ## Adversarial review
 
 1. **Critical: DFlash2 silently runs through a separately loaded stock target.**
-   The measured `dflash-mlx` engine accepts an already constructed
-   `MTPLXRuntime` through `MTPLXTargetOps`; the runner never gives it a second
-   target model reference. Receipts assert target object, cache, profile, and
-   route identity.
+   The measured `dflash-mlx` engine receives the target model from an already
+   constructed `MTPLXRuntime`; the runner never gives it a second target model
+   reference. Receipts assert target object, target weights, profile, and the
+   distinct cache/engine identities for both arms.
 2. **Critical: capturing target taps disables the promoted target path.**
    Construction records the installed route and a matched target-forward probe.
    Any unavoidable route change is reported as candidate overhead and cannot be
