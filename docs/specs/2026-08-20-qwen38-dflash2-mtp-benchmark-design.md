@@ -12,14 +12,15 @@ The benchmark is greedy, uses one tokenizer-normalized 1,024-token Python
 coding prompt, and forces 1,024 generated tokens. The control is the complete
 MTPLX Optimized Speed `turbo` profile at its artifact-recommended MTP depth 3.
 The DFlash2 arm reuses the same loaded target object, weights, tokenizer, and
-resolved profile, but runs them through the unchanged DFlash2 speculative
-engine. It does not pretend that DFlash2 is merely a drop-in MTP draft head:
+resolved profile, but runs them through the DFlash2 speculative engine using
+the checkpoint's native eight-token block. It does not pretend that DFlash2 is
+merely a drop-in MTP draft head:
 the two engines retain their own cache, proposal, and verification mechanics.
 
 The work has two sequential phases:
 
-1. **Phase A — depth benchmark:** run the unchanged upstream DFlash2
-   implementation at widths 1-8 and establish the fastest correct width.
+1. **Phase A — depth benchmark:** run Qwen3.8 DFlash2 at its checkpoint-valid
+   widths 1-8 and establish the fastest correct width.
 2. **Phase B — optimization:** profile only the Phase A winner, then design and
    measure a fit-for-purpose optimization against the unchanged winner and the
    MTP reference.
@@ -42,6 +43,9 @@ kernel work begins before that result exists.
 - MTP control depth: 3, matching the artifact's current default and maximum.
 - DFlash2 checkpoint: `z-lab/Qwen3.8-27B-DFlash2`, pinned in the receipt to Hub
   revision `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`.
+- DFlash2 width authority: that checkpoint's `dflash_config.block_size=8` and
+  published seven-draft-token configuration. Unrelated generic DFlash runtime
+  defaults or synthetic capability tests must not clamp this model to five.
 - DFlash2 reference implementation: `bstnxbt/dflash-mlx`, pinned in the
   receipt to commit `60803233af4589e18588b9bacbb03880801c828a` unless a newer
   head is deliberately selected and recorded before implementation begins.
@@ -64,7 +68,7 @@ execution, warmup, profiling, and timed rows happen only while holding
   or the promoted Optimized Speed profile.
 - Do not add, port, tune, or benchmark a custom DFlash2 kernel during Phase A.
   That phase changes only compatibility and benchmark plumbing required to run
-  the upstream DFlash2 implementation fairly.
+  the checkpoint's native width 1-8 contract fairly.
 - Do not switch the persistent Qwen service to DFlash2 as part of this work.
 - Do not publish a speed claim from a microbenchmark, profiler trace, or
   unmatched runtime comparison.
@@ -79,8 +83,8 @@ overrides. The target model object, weights, tokenizer, token embedding, and
 lm-head are shared.
 
 Each speculative engine creates its own fresh cache for each arm. The MTP
-control uses MTPLX's promoted cache and verification path. The unchanged
-`dflash-mlx` candidate uses its existing Qwen GDN cache, rollback, and
+control uses MTPLX's promoted cache and verification path. The `dflash-mlx`
+candidate uses its existing Qwen GDN cache, rollback, and
 target-prefix verification machinery against the already-loaded MTPLX target
 object. This unavoidable engine-level difference is recorded in the receipt;
 Phase A does not rewrite it in an attempt to isolate only proposal cost.
@@ -125,6 +129,8 @@ Before any measured generation, installation validates once:
 - DFlash2 architecture, block size 8, five sliding-attention layers, two-tap
   dynamic convolution, group size 16, selector rank 256, selector top-k 16,
   mask token, vocabulary, and target layer IDs;
+- installed DFlash2 runtime capabilities expose the checkpoint's exact
+  default/maximum block width 8, never a generic five-token clamp;
 - target embedding and lm-head ownership shared with the DFlash2 proposer;
 - unchanged DFlash cache rollback/commit behavior at every verify width 1-8;
 - the installed MTPLX `turbo` route and its resolved model runtime overrides;

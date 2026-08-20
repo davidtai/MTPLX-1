@@ -4,7 +4,7 @@
 
 **Goal:** Establish the fastest correct stock DFlash2 width from 1 through 8 on the Qwen3.8 27B Optimized Speed target with a greedy 1,024/1,024 Python workload and bracketed MTPLX MTP depth-3 controls.
 
-**Architecture:** MTPLX loads the local Optimized Speed artifact once after applying the artifact-resolved `turbo` profile. The existing native MTP generator supplies the control; the unchanged `dflash-mlx` 0.1.10 engine receives that same loaded target model object and supplies the candidate, using its existing Qwen GDN cache, rollback, DFlash2 draft backend, and target-prefix verification. Phase A records exact token parity and ranks widths by candidate throughput divided by the mean of adjacent MTP controls. It contains no custom kernel or DFlash2 arithmetic change.
+**Architecture:** MTPLX loads the local Optimized Speed artifact once after applying the artifact-resolved `turbo` profile. The existing native MTP generator supplies the control; `dflash-mlx` 0.1.10 receives that same loaded target model object and supplies the candidate, using its existing Qwen GDN cache, rollback, DFlash2 draft backend, and target-prefix verification. Construction takes width authority from the Qwen3.8 DFlash2 checkpoint (`block_size=8`, seven drafted tokens) rather than an unrelated generic five-token runtime policy. Phase A records exact token parity and ranks widths by candidate throughput divided by the mean of adjacent MTP controls. It contains no custom kernel or DFlash2 arithmetic change.
 
 **Tech Stack:** Python 3.12, MTPLX 2.9.0 source, MLX 0.32.x, mlx-lm 0.31.x, dflash-mlx 0.1.10, pytest, Ruff, uv, macOS launchd, and `/tmp/mtplx-gpu-exclusive.lock`.
 
@@ -12,7 +12,7 @@
 
 - Assumes `dflash_mlx.engine.target_qwen_gdn.QwenGdnTargetOps` accepts the model object produced by `mtplx.runtime.load` — Phase A stops at the construction gate and does not load a second stock target if that is false.
 - Assumes the local Optimized Speed artifact remains at `/Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed` — the benchmark will not substitute another quantization if the artifact is absent or changed.
-- Assumes DFlash2 checkpoint block size is exactly 8 and target layer IDs are exactly `[5, 19, 33, 47, 61]` — widths above 8 are rejected rather than clamped.
+- Assumes DFlash2 checkpoint block size is exactly 8 and target layer IDs are exactly `[5, 19, 33, 47, 61]` — widths 1-8 execute exactly as requested, while widths above 8 are rejected rather than clamped.
 - Assumes one guarded child can retain the loaded target while alternating fresh-cache MTP and DFlash2 arms — this plan will not compare separate machines, target bytes, or process-policy snapshots.
 - Assumes the live Qwen service is exactly `mtplx-qwen38-27b-optimized-speed` launched by `com.tea.qwen` — the canonical guard refuses any other observed model or launcher state.
 - Assumes Phase A identifies a single winner or measured tie band — no custom kernel is selected, implemented, or benchmarked until a separate Phase B plan is written from that result.
@@ -207,7 +207,7 @@ Expected: FAIL during collection because `mtplx.benchmarks.dflash2_contract` doe
 ```python
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import statistics
 
@@ -325,7 +325,7 @@ git commit -m "Define DFlash2 depth sweep contract"
 
 **Does NOT cover:** Construction does not replace DFlash2 cache arithmetic, add an MTPLX target adapter, add fallback loading, or benchmark performance.
 
-- [ ] **Step 1: Write failing single-target and geometry tests**
+- [x] **Step 1: Write failing single-target and geometry tests**
 
 ```python
 from types import SimpleNamespace
@@ -351,6 +351,8 @@ def test_bundle_reuses_runtime_model_without_target_reload(monkeypatch):
     assert bundle.runtime is runtime
     assert bundle.target_model is target
     assert bundle.checkpoint_block_size == 8
+    assert bundle.draft_model.capabilities.default_block_tokens == 8
+    assert bundle.draft_model.capabilities.max_block_tokens == 8
     assert bundle.target_layer_ids == (5, 19, 33, 47, 61)
 
 
@@ -364,7 +366,7 @@ def test_bundle_rejects_wrong_checkpoint_geometry(monkeypatch):
         dflash2_runtime.load_mtplx_dflash2_bundle("speed", "draft")
 ```
 
-- [ ] **Step 2: Verify the construction API is absent**
+- [x] **Step 2: Verify the construction API is absent**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_runtime.py
@@ -372,7 +374,7 @@ def test_bundle_rejects_wrong_checkpoint_geometry(monkeypatch):
 
 Expected: FAIL because the runtime bridge does not exist.
 
-- [ ] **Step 3: Implement a construction-only bundle with fixed callables**
+- [x] **Step 3: Implement a construction-only bundle with fixed callables**
 
 ```python
 from __future__ import annotations
@@ -421,12 +423,24 @@ def load_mtplx_dflash2_bundle(model_path: str, draft_ref: str) -> MTPLXDFlash2Bu
     if not target_ops.supports_model(target_model) or target_ops.family(target_model) != "hybrid_gdn":
         raise ValueError("DFlash2 requires the MTPLX-loaded Qwen hybrid GDN target")
     draft_model, draft_meta = load_draft(draft_ref)
-    block_size = int(getattr(draft_model, "block_size", getattr(draft_model.args, "block_size", 0)))
-    layer_ids = tuple(int(value) for value in draft_model.target_layer_ids)
+    block_size = draft_model.block_size
+    if type(block_size) is not int:
+        raise ValueError("Qwen3.8 DFlash2 checkpoint block size must be an integer")
+    raw_layer_ids = draft_model.target_layer_ids
+    if not isinstance(raw_layer_ids, (list, tuple)) or any(
+        type(value) is not int for value in raw_layer_ids
+    ):
+        raise ValueError("Qwen3.8 DFlash2 target layer IDs must be integers")
+    layer_ids = tuple(raw_layer_ids)
     if block_size != 8:
         raise ValueError(f"Qwen3.8 DFlash2 checkpoint must have block size 8, got {block_size}")
     if layer_ids != (5, 19, 33, 47, 61):
         raise ValueError(f"Qwen3.8 DFlash2 target layer IDs differ: {layer_ids}")
+    draft_model.capabilities = replace(
+        draft_model.capabilities,
+        default_block_tokens=block_size,
+        max_block_tokens=block_size,
+    )
     bind_draft(draft_model, target_model, target_ops)
     from dflash_mlx.draft_backend import EagerDraftBackend
     return MTPLXDFlash2Bundle(runtime, target_model, runtime.tokenizer, target_ops, draft_model, EagerDraftBackend(), dict(draft_meta), block_size, layer_ids)
@@ -434,7 +448,7 @@ def load_mtplx_dflash2_bundle(model_path: str, draft_ref: str) -> MTPLXDFlash2Bu
 
 Keep dependency imports inside construction functions so base MTPLX installs without the competitor extra still import normally. Before `load_mtplx_dflash2_bundle`, the caller resolves model runtime overrides with `inspect_model`, applies `apply_profile_env("turbo", runtime_env_overrides=...)`, and installs the existing q4/group-64 draft lm-head for the MTP control.
 
-- [ ] **Step 4: Run focused tests and an import-only smoke**
+- [x] **Step 4: Run focused tests and an import-only smoke**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_dflash2_runtime.py
@@ -443,7 +457,7 @@ Keep dependency imports inside construction functions so base MTPLX installs wit
 
 Expected: tests pass and the smoke does not load MLX model weights.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/benchmarks/dflash2_runtime.py tests/test_dflash2_runtime.py
