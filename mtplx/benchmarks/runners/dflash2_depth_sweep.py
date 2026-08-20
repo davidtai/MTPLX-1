@@ -71,17 +71,35 @@ def run_target_oracle(
     )
 
 
-def arm_receipt_from_mtplx(output: Any) -> dict[str, Any]:
+def arm_receipt_from_mtplx(
+    output: Any,
+    *,
+    prompt_tokens: int,
+) -> dict[str, Any]:
     stats = output.stats
+    generated_tokens = int(stats.generated_tokens)
+    elapsed_s = float(stats.elapsed_s)
+    decode_elapsed_s = float(stats.decode_elapsed_s)
+    prefill_s = elapsed_s - decode_elapsed_s
+    if not math.isfinite(prefill_s) or prefill_s <= 0.0:
+        raise RuntimeError("MTPLX MTP control must report a positive prefill duration")
+    accepted_by_depth = [int(value) for value in stats.accepted_by_depth]
+    accepted_from_draft = sum(accepted_by_depth)
+    if not 0 <= accepted_from_draft <= generated_tokens:
+        raise RuntimeError("MTPLX MTP control reported an invalid acceptance count")
     return {
         "tokens": tuple(int(token) for token in output.tokens),
-        "generated_tokens": int(stats.generated_tokens),
+        "generated_tokens": generated_tokens,
         "decode_tps": float(stats.decode_tok_s),
-        "elapsed_s": float(stats.elapsed_s),
-        "decode_elapsed_s": float(stats.decode_elapsed_s),
+        "elapsed_s": elapsed_s,
+        "decode_elapsed_s": decode_elapsed_s,
+        "prefill_s": prefill_s,
+        "prefill_tps": int(prompt_tokens) / prefill_s,
         "peak_memory_gb": float(stats.peak_memory_bytes) / (1024**3),
         "verify_calls": int(stats.verify_calls),
-        "accepted_by_depth": [int(value) for value in stats.accepted_by_depth],
+        "accepted_by_depth": accepted_by_depth,
+        "accepted_from_draft": accepted_from_draft,
+        "spec_decode_hit_rate": accepted_from_draft / generated_tokens,
         "engine": "mtplx_mtp",
     }
 
@@ -105,7 +123,7 @@ def run_mtp_control(
         mtp_cache_policy="persistent",
         mtp_history_policy="cycle",
     )
-    receipt = arm_receipt_from_mtplx(output)
+    receipt = arm_receipt_from_mtplx(output, prompt_tokens=len(prompt_ids))
     receipt["tokens"] = _exact_tokens(
         receipt["tokens"],
         expected_tokens=max_tokens,
@@ -162,10 +180,21 @@ def arm_receipt_from_dflash_events(
         engine="DFlash2 token ID count",
     )
     prefill_us = float(summary.phase_timings_us.get("prefill", 0.0))
+    prompt_token_count = int(summary.prompt_token_count)
+    if (
+        not math.isfinite(prefill_us)
+        or prefill_us <= 0.0
+        or prompt_token_count <= 0
+    ):
+        raise RuntimeError("DFlash2 summary must report a positive prefill duration")
     elapsed_us = float(summary.elapsed_us)
     decode_us = elapsed_us - prefill_us
     if not math.isfinite(decode_us) or decode_us <= 0.0:
         raise RuntimeError("DFlash2 summary must report a positive decode duration")
+
+    accepted_from_draft = int(summary.accepted_from_draft)
+    if not 0 <= accepted_from_draft <= generated_tokens:
+        raise RuntimeError("DFlash2 summary reported an invalid acceptance count")
 
     return {
         "tokens": token_ids,
@@ -173,11 +202,13 @@ def arm_receipt_from_dflash_events(
         "decode_tps": generated_tokens / (decode_us / 1_000_000.0),
         "elapsed_s": elapsed_us / 1_000_000.0,
         "prefill_s": prefill_us / 1_000_000.0,
+        "prefill_tps": prompt_token_count / (prefill_us / 1_000_000.0),
         "decode_elapsed_s": decode_us / 1_000_000.0,
         "peak_memory_gb": float(summary.peak_memory_gb or 0.0),
         "cycles_completed": int(summary.cycles_completed),
-        "accepted_from_draft": int(summary.accepted_from_draft),
+        "accepted_from_draft": accepted_from_draft,
         "acceptance_ratio": float(summary.acceptance_ratio),
+        "spec_decode_hit_rate": accepted_from_draft / generated_tokens,
         "acceptance_history": [int(value) for value in summary.acceptance_history],
         "requested_width": int(requested_width),
         "effective_width": effective_width,
@@ -219,6 +250,40 @@ def run_dflash2_candidate(
 def _token_sha256(tokens: Sequence[int]) -> str:
     payload = ",".join(str(int(token)) for token in tokens).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
+
+
+def enrich_depth_sweep_metrics(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Add derived prefill and speculative-hit metrics to an existing receipt."""
+
+    prompt_tokens = int(receipt["workload"]["prompt_tokens"])
+    if prompt_tokens <= 0:
+        raise ValueError("receipt prompt token count must be positive")
+    for bracket in receipt["brackets"]:
+        for arm_name in ("control_before", "candidate", "control_after"):
+            arm = bracket[arm_name]
+            generated_tokens = int(arm["generated_tokens"])
+            if generated_tokens <= 0:
+                raise ValueError("receipt generated token count must be positive")
+            if "prefill_s" not in arm:
+                arm["prefill_s"] = float(arm["elapsed_s"]) - float(
+                    arm["decode_elapsed_s"]
+                )
+            prefill_s = float(arm["prefill_s"])
+            if not math.isfinite(prefill_s) or prefill_s <= 0.0:
+                raise ValueError("receipt prefill duration must be finite and positive")
+            arm["prefill_tps"] = prompt_tokens / prefill_s
+
+            if "accepted_from_draft" not in arm:
+                arm["accepted_from_draft"] = sum(
+                    int(value) for value in arm["accepted_by_depth"]
+                )
+            accepted_from_draft = int(arm["accepted_from_draft"])
+            if not 0 <= accepted_from_draft <= generated_tokens:
+                raise ValueError("receipt acceptance count is out of range")
+            arm["spec_decode_hit_rate"] = (
+                accepted_from_draft / generated_tokens
+            )
+    return receipt
 
 
 def _receipt_without_tokens(arm: dict[str, Any]) -> dict[str, Any]:

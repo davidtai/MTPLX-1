@@ -90,6 +90,14 @@ def test_mtp_control_uses_promoted_depth_three_contract(monkeypatch):
     bundle = SimpleNamespace(runtime=object())
     receipt = runner.run_mtp_control(bundle, (1, 2), max_tokens=2)
 
+    metrics = {
+        name: receipt.pop(name)
+        for name in (
+            "prefill_s",
+            "prefill_tps",
+            "spec_decode_hit_rate",
+        )
+    }
     assert receipt == {
         "tokens": (7, 8),
         "generated_tokens": 2,
@@ -99,8 +107,16 @@ def test_mtp_control_uses_promoted_depth_three_contract(monkeypatch):
         "peak_memory_gb": 3.0,
         "verify_calls": 1,
         "accepted_by_depth": [1, 0, 0],
+        "accepted_from_draft": 1,
         "engine": "mtplx_mtp",
     }
+    assert metrics == pytest.approx(
+        {
+            "prefill_s": 0.03,
+            "prefill_tps": 2 / 0.03,
+            "spec_decode_hit_rate": 0.5,
+        }
+    )
     assert calls[0][0] is bundle.runtime
     assert calls[0][1] == [1, 2]
     assert calls[0][2] == {
@@ -193,11 +209,13 @@ def test_dflash_summary_adapter_returns_measured_metrics():
         "decode_tps": 1.0,
         "elapsed_s": 3.0,
         "prefill_s": 1.0,
+        "prefill_tps": 3.0,
         "decode_elapsed_s": 2.0,
         "peak_memory_gb": 12.5,
         "cycles_completed": 1,
         "accepted_from_draft": 1,
         "acceptance_ratio": 0.5,
+        "spec_decode_hit_rate": 0.5,
         "acceptance_history": [1],
         "requested_width": 8,
         "effective_width": 8,
@@ -236,6 +254,48 @@ def test_dflash_summary_adapter_rejects_invalid_result(overrides, message):
             requested_width=8,
             expected_tokens=2,
         )
+
+
+def test_existing_receipt_can_be_enriched_with_prefill_and_hit_rate_metrics():
+    receipt = {
+        "workload": {"prompt_tokens": 1024},
+        "brackets": [
+            {
+                "control_before": {
+                    "engine": "mtplx_mtp",
+                    "elapsed_s": 30.0,
+                    "decode_elapsed_s": 25.0,
+                    "generated_tokens": 1024,
+                    "accepted_by_depth": [200, 100, 50],
+                },
+                "candidate": {
+                    "engine": "dflash_mlx_0_1_10",
+                    "prefill_s": 4.0,
+                    "generated_tokens": 1024,
+                    "accepted_from_draft": 640,
+                },
+                "control_after": {
+                    "engine": "mtplx_mtp",
+                    "elapsed_s": 31.0,
+                    "decode_elapsed_s": 26.0,
+                    "generated_tokens": 1024,
+                    "accepted_by_depth": [200, 100, 50],
+                },
+            }
+        ],
+    }
+
+    enriched = runner.enrich_depth_sweep_metrics(receipt)
+
+    assert enriched is receipt
+    before = receipt["brackets"][0]["control_before"]
+    candidate = receipt["brackets"][0]["candidate"]
+    assert before["prefill_s"] == 5.0
+    assert before["prefill_tps"] == 1024 / 5.0
+    assert before["accepted_from_draft"] == 350
+    assert before["spec_decode_hit_rate"] == 350 / 1024
+    assert candidate["prefill_tps"] == 256.0
+    assert candidate["spec_decode_hit_rate"] == 0.625
 
 
 def _fake_arm(
