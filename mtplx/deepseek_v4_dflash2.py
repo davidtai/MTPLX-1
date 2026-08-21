@@ -359,8 +359,9 @@ class DeepseekV4DSparkBackend:
         del target_ops, mask_token_tail
         if target_model is not draft_model.target_model:
             raise ValueError("DSpark backend received a different target model")
-        if int(block_len) != _PHYSICAL_VERIFY_WIDTH:
-            raise ValueError("DeepSeek V4 DSpark requires physical verify width six")
+        requested_width = int(block_len)
+        if not 2 <= requested_width <= _PHYSICAL_VERIFY_WIDTH:
+            raise ValueError("DeepSeek V4 DSpark draft width must be between two and six")
         if suppress_token_mask is not None:
             raise ValueError("DeepSeek V4 DSpark does not support token suppression")
 
@@ -376,9 +377,10 @@ class DeepseekV4DSparkBackend:
             draft_cache,
             start_pos=start_pos,
         )
-        drafted = proposal.future_tokens.squeeze(0).astype(mx.uint32)
-        if tuple(drafted.shape) != (_PHYSICAL_VERIFY_WIDTH - 1,):
+        full_draft = proposal.future_tokens.squeeze(0).astype(mx.uint32)
+        if tuple(full_draft.shape) != (_PHYSICAL_VERIFY_WIDTH - 1,):
             raise ValueError("DeepSeek V4 DSpark must return exactly five future tokens")
+        drafted = full_draft[: requested_width - 1]
         if async_launch:
             mx.async_eval(drafted)
         else:

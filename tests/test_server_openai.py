@@ -3807,8 +3807,8 @@ def test_invalid_generation_mode_returns_400():
     )
 
     assert response.status_code == 400
-    assert (
-        response.json()["error"]["message"] == "generation_mode must be 'mtp' or 'ar'"
+    assert response.json()["error"]["message"] == (
+        "generation_mode must be 'mtp', 'dspark', or 'ar'"
     )
     assert response.json()["error"]["type"] == "invalid_request_error"
 
