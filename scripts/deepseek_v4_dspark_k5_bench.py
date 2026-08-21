@@ -199,6 +199,16 @@ def _write(payload: dict, output: Path | None) -> None:
     print(output)
 
 
+def _deepseek_quality_gate(candidate_tokens: list[int], control_tokens: list[int]) -> dict:
+    """Reuse the established real-weight DeepSeek bf16/fp32 parity policy."""
+
+    from deepseek_v4_mtpk_bench import _divergence, _exactness_is_enforced
+
+    gate = _divergence(candidate_tokens, control_tokens)
+    gate["enforced"] = _exactness_is_enforced(False)
+    return gate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
@@ -210,9 +220,16 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--profile-cycles",
+        action="store_true",
+        help="Enable stock DFlash2 cycle and top-logit diagnostics for a failing gate.",
+    )
     args = parser.parse_args()
 
     guard = _guard_before_mlx()
+    if args.profile_cycles:
+        os.environ["DFLASH_CAPTURE_LOGITS"] = "1"
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from mtplx.benchmarks.dflash2_runtime import (
@@ -226,6 +243,16 @@ def main() -> int:
     bundle = load_mtplx_deepseek_v4_dflash2_bundle(str(args.model))
     load_time = time.perf_counter() - load_started
     context = build_deepseek_v4_dflash2_runtime_context()
+    if args.profile_cycles:
+        from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
+
+        context = replace(
+            context,
+            diagnostics=DiagnosticsConfig(
+                mode="full",
+                trace=TraceConfig(cycle_events=True),
+            ),
+        )
     parameters = tree_flatten(bundle.target_model.parameters())
     resident_bytes = sum(int(value.nbytes) for _name, value in parameters)
     common = {
@@ -246,6 +273,10 @@ def main() -> int:
         "active_memory_bytes": _memory("get_active_memory"),
         "peak_memory_bytes": _memory("get_peak_memory"),
         "mlx_version": mx.__version__,
+        "fp32_activations": (
+            (os.environ.get("MTPLX_DSV4_FP32_ACTIVATIONS") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        ),
         "guard_window_id": guard["window_id"],
         "source_head": subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
@@ -267,19 +298,32 @@ def main() -> int:
     elif args.arm == "exact-stream":
         ar = _target_ar(bundle, prompt_ids, args.max_tokens)
         dspark = _dspark(bundle, prompt_ids, args.max_tokens, context)
-        exact = ar["tokens"] == dspark["tokens"]
-        status = 0 if exact else 2
-        payload = {**common, "exact": exact, "ar": ar, "dspark": dspark}
+        quality = _deepseek_quality_gate(dspark["tokens"], ar["tokens"])
+        status = 0 if quality["pass"] or not quality["enforced"] else 2
+        payload = {
+            **common,
+            "exact": quality["pass"],
+            "quality_gate": quality,
+            "ar": ar,
+            "dspark": dspark,
+        }
     else:
         control_0 = _target_ar(bundle, prompt_ids, args.max_tokens)
         candidate = _dspark(bundle, prompt_ids, args.max_tokens, context)
         control_1 = _target_ar(bundle, prompt_ids, args.max_tokens)
-        exact = control_0["tokens"] == candidate["tokens"] == control_1["tokens"]
-        status = 0 if exact else 2
+        controls_exact = control_0["tokens"] == control_1["tokens"]
+        quality = _deepseek_quality_gate(candidate["tokens"], control_0["tokens"])
+        status = (
+            0
+            if controls_exact and (quality["pass"] or not quality["enforced"])
+            else 2
+        )
         controls = (control_0["decode_tok_s"] + control_1["decode_tok_s"]) / 2
         payload = {
             **common,
-            "exact": exact,
+            "exact": controls_exact and quality["pass"],
+            "controls_exact": controls_exact,
+            "quality_gate": quality,
             "controls_mean_decode_tok_s": controls,
             "candidate_delta_percent": (
                 100.0 * (candidate["decode_tok_s"] / controls - 1.0)

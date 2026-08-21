@@ -387,6 +387,38 @@ class DeepseekV4DSparkBackend:
             mx.eval(drafted)
         return drafted
 
+    def draft_greedy_capture(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DeepseekV4DSparkDraftAdapter,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+        suppress_token_mask: Optional[mx.array],
+        async_launch: bool,
+        top_width: int,
+    ) -> tuple[mx.array, None, None]:
+        """Run the same DSpark proposal while DFlash captures target logits."""
+
+        del top_width
+        drafted = self.draft_greedy(
+            target_model=target_model,
+            target_ops=target_ops,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            staged_first=staged_first,
+            draft_context=draft_context,
+            block_len=block_len,
+            mask_token_tail=mask_token_tail,
+            suppress_token_mask=suppress_token_mask,
+            async_launch=async_launch,
+        )
+        return drafted, None, None
+
     def advance_context(
         self,
         *,

@@ -297,6 +297,37 @@ def test_draft_backend_returns_requested_prefix_for_dflash_final_tail() -> None:
     assert owner.proposal_positions == [4]
 
 
+def test_draft_backend_capture_reuses_the_same_dspark_proposal_path() -> None:
+    target, owner = _fake_dspark_target()
+    draft = DeepseekV4DSparkDraftAdapter(target)
+    backend = DeepseekV4DSparkBackend()
+    caches = backend.make_cache(
+        draft_model=draft,
+        sink_size=0,
+        window_size=8,
+        allow_full_context_layers=False,
+    )
+
+    drafted, top_ids, top_logprobs = backend.draft_greedy_capture(
+        target_model=target,
+        target_ops=DeepseekV4TargetOps(),
+        draft_model=draft,
+        draft_cache=caches,
+        staged_first=mx.array([29], dtype=mx.uint32),
+        draft_context=mx.zeros((1, 4, 64), dtype=mx.bfloat16),
+        block_len=6,
+        mask_token_tail=mx.full((5,), 128799, dtype=mx.uint32),
+        suppress_token_mask=None,
+        async_launch=False,
+        top_width=8,
+    )
+
+    assert tuple(np.array(drafted)) == (31, 32, 33, 34, 35)
+    assert top_ids is None
+    assert top_logprobs is None
+    assert owner.proposal_positions == [4]
+
+
 def test_deepseek_bundle_reuses_mtplx_target_and_dflash2_engine_types(
     monkeypatch,
 ) -> None:
