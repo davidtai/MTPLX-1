@@ -1,0 +1,219 @@
+{
+  "active_memory_bytes": 92831506332,
+  "arm": "one-cycle",
+  "config_sha256": "44735712733fcf8f299bdf1faa1d87fac88f1917efe1d3876d6d4c582f79a68f",
+  "cycle": {
+    "acceptance_len": 2,
+    "acceptance_us": 8186.584,
+    "block_len": 6,
+    "candidate_count": 1,
+    "commit_count": 3,
+    "commit_us": 410.75,
+    "committed_ids": [
+      455,
+      2019,
+      1531
+    ],
+    "cycle": 1,
+    "cycle_engine_us": 749584.251,
+    "cycle_total_us": 749584.251,
+    "cycle_wall_us": 749596.0,
+    "draft_source": "dflash",
+    "draft_us": 134831.417,
+    "future_draft_count": 5,
+    "hidden_extraction_us": 247.625,
+    "other_us": 109.459,
+    "physical_verify_width": 6,
+    "posterior_ids": [
+      2019,
+      1531,
+      1354,
+      14315,
+      23794,
+      294
+    ],
+    "prefix_len": 12,
+    "proposed_ids": [
+      455,
+      2019,
+      1531,
+      366,
+      260,
+      2310
+    ],
+    "rollback_us": 442.125,
+    "summary": {
+      "acceptance_first_20_avg": 2.0,
+      "acceptance_history": [
+        2,
+        2
+      ],
+      "acceptance_last_20_avg": 2.0,
+      "acceptance_ratio": 0.6666666666666666,
+      "accepted_from_draft": 4,
+      "adaptive_block_cycles": 0,
+      "adaptive_block_reductions": 0,
+      "block_tokens": 6,
+      "clear_cache_boundaries": true,
+      "cycle_profile_totals_us": {
+        "acceptance": 8460.584,
+        "commit": 894.208,
+        "cycle_total": 822931.917,
+        "cycle_wall": 822955.833,
+        "draft": 141891.292,
+        "hidden_extraction": 400.042,
+        "other": 167.583,
+        "rollback": 454.625,
+        "verify": 670663.583,
+        "yield_pause": 23.916
+      },
+      "cycle_profile_us": [
+        {
+          "acceptance_len": 2,
+          "acceptance_us": 8186.584,
+          "block_len": 6,
+          "candidate_count": 1,
+          "commit_count": 3,
+          "commit_us": 410.75,
+          "committed_ids": [
+            455,
+            2019,
+            1531
+          ],
+          "cycle": 1,
+          "cycle_engine_us": 749584.251,
+          "cycle_total_us": 749584.251,
+          "cycle_wall_us": 749596.0,
+          "draft_source": "dflash",
+          "draft_us": 134831.417,
+          "hidden_extraction_us": 247.625,
+          "other_us": 109.459,
+          "posterior_ids": [
+            2019,
+            1531,
+            1354,
+            14315,
+            23794,
+            294
+          ],
+          "prefix_len": 12,
+          "proposed_ids": [
+            455,
+            2019,
+            1531,
+            366,
+            260,
+            2310
+          ],
+          "rollback_us": 442.125,
+          "verify_token_count": 6,
+          "verify_us": 605356.291,
+          "yield_pause_us": 11.749
+        },
+        {
+          "acceptance_len": 2,
+          "acceptance_us": 274.0,
+          "block_len": 3,
+          "candidate_count": 1,
+          "commit_count": 3,
+          "commit_us": 483.458,
+          "committed_ids": [
+            1354,
+            260,
+            2310
+          ],
+          "cycle": 2,
+          "cycle_engine_us": 73347.666,
+          "cycle_total_us": 73347.666,
+          "cycle_wall_us": 73359.833,
+          "draft_source": "dflash",
+          "draft_us": 7059.875,
+          "hidden_extraction_us": 152.417,
+          "other_us": 58.124,
+          "posterior_ids": [
+            260,
+            2310,
+            294
+          ],
+          "prefix_len": 15,
+          "proposed_ids": [
+            1354,
+            260,
+            2310
+          ],
+          "rollback_us": 12.5,
+          "verify_token_count": 3,
+          "verify_us": 65307.292,
+          "yield_pause_us": 12.167
+        }
+      ],
+      "cycles_completed": 2,
+      "draft_sink_size": 64,
+      "draft_window_size": 1024,
+      "elapsed_us": 10405009.709,
+      "generated_token_ids": [
+        455,
+        2019,
+        1531,
+        1354,
+        260,
+        2310
+      ],
+      "generation_tokens": 6,
+      "hit_kind": "miss",
+      "peak_memory_gb": 95.952393544,
+      "phase_timings_us": {
+        "commit": 894.208,
+        "draft": 141891.292,
+        "draft_incremental": 7059.875,
+        "draft_prefill": 134831.417,
+        "prefill": 9581933.625,
+        "replay": 454.625,
+        "verify": 670663.583
+      },
+      "prompt_token_count": 12,
+      "quantize_kv_cache": false,
+      "target_fa_window": 0,
+      "tokens_per_cycle": 3.0,
+      "verify_len_cap": 6
+    },
+    "verify_token_count": 6,
+    "verify_us": 605356.291,
+    "yield_pause_us": 11.749
+  },
+  "dspark_kv": {
+    "bits": 4,
+    "group_size": 64,
+    "mode": "affine",
+    "stages": 3,
+    "start": 0
+  },
+  "dspark_stages": 3,
+  "engine": "dflash_mlx_0_1_10",
+  "future_draft_count": 5,
+  "guard_window_id": "65cf97a9e776435d9522bc43f2f443e1e43153ae8d9170a0e31a0b57db2176f0",
+  "index_sha256": "f1332b2b209769c2db335954c2651652a8048e7d7dbf60296c2f2c0198715861",
+  "kind": "deepseek_v4_dspark_dflash2_k5",
+  "load_time_s": 11.412608916987665,
+  "mlx_version": "0.32.1",
+  "model": "/Users/davidtai/models/DeepSeek-V4-Flash-0731-2.4bit-mixed",
+  "peak_memory_bytes": 92831506332,
+  "physical_verify_width": 6,
+  "prompt_tokens": 12,
+  "resident_parameter_bytes": 92831470584,
+  "schema_version": 2,
+  "source_head": "2f820990178bba5fa772d036a35ea0378c07412d",
+  "target_kv": {
+    "bits": 4,
+    "group_size": 64,
+    "layers": 43,
+    "mode": "affine",
+    "start": 0
+  },
+  "target_taps": [
+    40,
+    41,
+    42
+  ],
+  "timestamp_utc": "2026-08-21T17:04:48Z"
+}

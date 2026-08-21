@@ -1,0 +1,281 @@
+{
+  "active_memory_bytes": 92831506332,
+  "ar": {
+    "accepted_future_tokens": 0,
+    "decode_time_s": 2.7355394600890577,
+    "decode_tok_s": 8.773406616923252,
+    "drafted_future_tokens": 0,
+    "elapsed_s": 13.1097157089971,
+    "events": [
+      {
+        "step": 0,
+        "token": 455
+      },
+      {
+        "step": 1,
+        "token": 2019
+      },
+      {
+        "step": 2,
+        "token": 1531
+      },
+      {
+        "step": 3,
+        "token": 1354
+      },
+      {
+        "step": 4,
+        "token": 260
+      },
+      {
+        "step": 5,
+        "token": 2310
+      },
+      {
+        "step": 6,
+        "token": 294
+      },
+      {
+        "step": 7,
+        "token": 270
+      },
+      {
+        "step": 8,
+        "token": 1257
+      },
+      {
+        "step": 9,
+        "token": 313
+      },
+      {
+        "step": 10,
+        "token": 26509
+      },
+      {
+        "step": 11,
+        "token": 3737
+      },
+      {
+        "step": 12,
+        "token": 16
+      },
+      {
+        "step": 13,
+        "token": 455
+      },
+      {
+        "step": 14,
+        "token": 1257
+      },
+      {
+        "step": 15,
+        "token": 1234
+      },
+      {
+        "step": 16,
+        "token": 26509
+      },
+      {
+        "step": 17,
+        "token": 3737
+      },
+      {
+        "step": 18,
+        "token": 477
+      },
+      {
+        "step": 19,
+        "token": 223
+      },
+      {
+        "step": 20,
+        "token": 18
+      },
+      {
+        "step": 21,
+        "token": 305
+      },
+      {
+        "step": 22,
+        "token": 223
+      },
+      {
+        "step": 23,
+        "token": 19
+      }
+    ],
+    "generated_tokens": 24,
+    "milliseconds_per_token": 113.98081083704407,
+    "peak_memory_bytes": 96437307630,
+    "prompt_time_s": 10.374176248908043,
+    "token_digest": "0edbf61ae86b8dabb98fc5515916b1d51029d6f8ad19ff3c2235a8c4f5eb5581",
+    "tokens": [
+      455,
+      2019,
+      1531,
+      1354,
+      260,
+      2310,
+      294,
+      270,
+      1257,
+      313,
+      26509,
+      3737,
+      16,
+      455,
+      1257,
+      1234,
+      26509,
+      3737,
+      477,
+      223,
+      18,
+      305,
+      223,
+      19
+    ]
+  },
+  "arm": "exact-stream",
+  "config_sha256": "44735712733fcf8f299bdf1faa1d87fac88f1917efe1d3876d6d4c582f79a68f",
+  "dspark": {
+    "accepted_future_tokens": 18,
+    "decode_time_s": 1.1020381249999998,
+    "decode_tok_s": 21.777830962064044,
+    "drafted_future_tokens": 28,
+    "elapsed_s": 1.5204496669999998,
+    "events": [
+      {
+        "acceptance_first_20_avg": 3.0,
+        "acceptance_history": [
+          2,
+          5,
+          4,
+          0,
+          4,
+          3
+        ],
+        "acceptance_last_20_avg": 3.0,
+        "acceptance_ratio": 0.75,
+        "accepted_from_draft": 18,
+        "adaptive_block_cycles": 0,
+        "adaptive_block_reductions": 0,
+        "block_tokens": 6,
+        "clear_cache_boundaries": true,
+        "cycles_completed": 6,
+        "draft_sink_size": 64,
+        "draft_window_size": 1024,
+        "elapsed_us": 1520449.667,
+        "generated_token_ids": [
+          455,
+          2019,
+          1531,
+          1354,
+          260,
+          2310,
+          294,
+          270,
+          1257,
+          313,
+          26509,
+          3737,
+          16,
+          455,
+          1257,
+          1234,
+          26509,
+          3737,
+          477,
+          223,
+          18,
+          305,
+          223,
+          19
+        ],
+        "generation_tokens": 24,
+        "hit_kind": "miss",
+        "peak_memory_gb": 96.588562772,
+        "phase_timings_us": {
+          "commit": 25066.25,
+          "draft": 143104.126,
+          "draft_incremental": 50844.459,
+          "draft_prefill": 92259.667,
+          "prefill": 418411.542,
+          "replay": 1646.458,
+          "verify": 46063.959
+        },
+        "prompt_token_count": 12,
+        "quantize_kv_cache": false,
+        "target_fa_window": 0,
+        "tokens_per_cycle": 4.0,
+        "verify_len_cap": 6
+      }
+    ],
+    "generated_tokens": 24,
+    "milliseconds_per_token": 45.91825520833333,
+    "peak_memory_bytes": 96588562772,
+    "prompt_time_s": 0.418411542,
+    "token_digest": "0edbf61ae86b8dabb98fc5515916b1d51029d6f8ad19ff3c2235a8c4f5eb5581",
+    "tokens": [
+      455,
+      2019,
+      1531,
+      1354,
+      260,
+      2310,
+      294,
+      270,
+      1257,
+      313,
+      26509,
+      3737,
+      16,
+      455,
+      1257,
+      1234,
+      26509,
+      3737,
+      477,
+      223,
+      18,
+      305,
+      223,
+      19
+    ]
+  },
+  "dspark_kv": {
+    "bits": 4,
+    "group_size": 64,
+    "mode": "affine",
+    "stages": 3,
+    "start": 0
+  },
+  "dspark_stages": 3,
+  "engine": "dflash_mlx_0_1_10",
+  "exact": true,
+  "future_draft_count": 5,
+  "guard_window_id": "fa18c5958e0e896218a137ee6a51c506aebbb81d3a7effa67f78b9f46dbe228a",
+  "index_sha256": "f1332b2b209769c2db335954c2651652a8048e7d7dbf60296c2f2c0198715861",
+  "kind": "deepseek_v4_dspark_dflash2_k5",
+  "load_time_s": 11.140717041911557,
+  "mlx_version": "0.32.1",
+  "model": "/Users/davidtai/models/DeepSeek-V4-Flash-0731-2.4bit-mixed",
+  "peak_memory_bytes": 92831506332,
+  "physical_verify_width": 6,
+  "resident_parameter_bytes": 92831470584,
+  "schema_version": 2,
+  "source_head": "2f820990178bba5fa772d036a35ea0378c07412d",
+  "target_kv": {
+    "bits": 4,
+    "group_size": 64,
+    "layers": 43,
+    "mode": "affine",
+    "start": 0
+  },
+  "target_taps": [
+    40,
+    41,
+    42
+  ],
+  "timestamp_utc": "2026-08-21T17:10:05Z"
+}

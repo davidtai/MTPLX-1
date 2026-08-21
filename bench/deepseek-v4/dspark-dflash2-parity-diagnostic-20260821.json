@@ -1,0 +1,845 @@
+{
+  "active_memory_bytes": 92831506332,
+  "ar": {
+    "accepted_future_tokens": 0,
+    "decode_time_s": 1.053175000124611,
+    "decode_tok_s": 22.78823557068895,
+    "drafted_future_tokens": 0,
+    "elapsed_s": 10.522425958071835,
+    "events": [
+      {
+        "step": 0,
+        "token": 455
+      },
+      {
+        "step": 1,
+        "token": 2019
+      },
+      {
+        "step": 2,
+        "token": 1531
+      },
+      {
+        "step": 3,
+        "token": 1354
+      },
+      {
+        "step": 4,
+        "token": 260
+      },
+      {
+        "step": 5,
+        "token": 2310
+      },
+      {
+        "step": 6,
+        "token": 294
+      },
+      {
+        "step": 7,
+        "token": 270
+      },
+      {
+        "step": 8,
+        "token": 1257
+      },
+      {
+        "step": 9,
+        "token": 313
+      },
+      {
+        "step": 10,
+        "token": 26509
+      },
+      {
+        "step": 11,
+        "token": 3737
+      },
+      {
+        "step": 12,
+        "token": 16
+      },
+      {
+        "step": 13,
+        "token": 455
+      },
+      {
+        "step": 14,
+        "token": 1257
+      },
+      {
+        "step": 15,
+        "token": 1234
+      },
+      {
+        "step": 16,
+        "token": 26509
+      },
+      {
+        "step": 17,
+        "token": 3737
+      },
+      {
+        "step": 18,
+        "token": 477
+      },
+      {
+        "step": 19,
+        "token": 223
+      },
+      {
+        "step": 20,
+        "token": 19
+      },
+      {
+        "step": 21,
+        "token": 305
+      },
+      {
+        "step": 22,
+        "token": 223
+      },
+      {
+        "step": 23,
+        "token": 19
+      }
+    ],
+    "generated_tokens": 24,
+    "milliseconds_per_token": 43.88229167185879,
+    "peak_memory_bytes": 95753981746,
+    "prompt_time_s": 9.469250957947224,
+    "token_digest": "b6ecfcacde90b602e1179a5c7039f6cb3bd1f2bb1196ca5ad813094ca1c7b8cf",
+    "tokens": [
+      455,
+      2019,
+      1531,
+      1354,
+      260,
+      2310,
+      294,
+      270,
+      1257,
+      313,
+      26509,
+      3737,
+      16,
+      455,
+      1257,
+      1234,
+      26509,
+      3737,
+      477,
+      223,
+      19,
+      305,
+      223,
+      19
+    ]
+  },
+  "arm": "exact-stream",
+  "config_sha256": "44735712733fcf8f299bdf1faa1d87fac88f1917efe1d3876d6d4c582f79a68f",
+  "dspark": {
+    "accepted_future_tokens": 18,
+    "decode_time_s": 0.6946672899999999,
+    "decode_tok_s": 34.54891333662767,
+    "drafted_future_tokens": 28,
+    "elapsed_s": 0.808667124,
+    "events": [
+      {
+        "acceptance_first_20_avg": 3.0,
+        "acceptance_history": [
+          2,
+          5,
+          4,
+          0,
+          4,
+          3
+        ],
+        "acceptance_last_20_avg": 3.0,
+        "acceptance_ratio": 0.75,
+        "accepted_from_draft": 18,
+        "adaptive_block_cycles": 0,
+        "adaptive_block_reductions": 0,
+        "block_tokens": 6,
+        "clear_cache_boundaries": true,
+        "cycle_profile_totals_us": {
+          "acceptance": 9740.292,
+          "commit": 3053.541,
+          "cycle_total": 694510.916,
+          "cycle_wall": 694591.209,
+          "draft": 98776.502,
+          "hidden_extraction": 118693.334,
+          "other": 477.581,
+          "rollback": 1676.958,
+          "verify": 462092.708,
+          "yield_pause": 80.293
+        },
+        "cycle_profile_us": [
+          {
+            "acceptance_len": 2,
+            "acceptance_us": 8285.625,
+            "block_len": 6,
+            "candidate_count": 1,
+            "commit_count": 3,
+            "commit_us": 860.5,
+            "committed_ids": [
+              455,
+              2019,
+              1531
+            ],
+            "cycle": 1,
+            "cycle_engine_us": 259895.916,
+            "cycle_total_us": 259895.916,
+            "cycle_wall_us": 259908.833,
+            "draft_source": "dflash",
+            "draft_us": 54546.959,
+            "hidden_extraction_us": 116113.625,
+            "other_us": 127.206,
+            "posterior_ids": [
+              2019,
+              1531,
+              1354,
+              14315,
+              23794,
+              294
+            ],
+            "posterior_top2_ids": [
+              [
+                2019,
+                10274
+              ],
+              [
+                1531,
+                6026
+              ],
+              [
+                1354,
+                2188
+              ],
+              [
+                14315,
+                9306
+              ],
+              [
+                23794,
+                50494
+              ],
+              [
+                294,
+                26711
+              ]
+            ],
+            "posterior_top2_logprobs": [
+              [
+                -0.5,
+                -2.125
+              ],
+              [
+                -0.125,
+                -3.375
+              ],
+              [
+                -0.75,
+                -1.5
+              ],
+              [
+                -0.375,
+                -2.0
+              ],
+              [
+                -0.125,
+                -3.125
+              ],
+              [
+                -0.5,
+                -2.25
+              ]
+            ],
+            "prefix_len": 12,
+            "proposed_ids": [
+              455,
+              2019,
+              1531,
+              366,
+              260,
+              2310
+            ],
+            "rollback_us": 493.542,
+            "verify_token_count": 6,
+            "verify_us": 79468.459,
+            "yield_pause_us": 12.917
+          },
+          {
+            "acceptance_len": 5,
+            "acceptance_us": 285.75,
+            "block_len": 6,
+            "candidate_count": 1,
+            "commit_count": 6,
+            "commit_us": 438.416,
+            "committed_ids": [
+              1354,
+              260,
+              2310,
+              294,
+              270,
+              1257
+            ],
+            "cycle": 2,
+            "cycle_engine_us": 95543.5,
+            "cycle_total_us": 95543.5,
+            "cycle_wall_us": 95558.167,
+            "draft_source": "dflash",
+            "draft_us": 15985.542,
+            "hidden_extraction_us": 544.292,
+            "other_us": 62.084,
+            "posterior_ids": [
+              260,
+              2310,
+              294,
+              270,
+              1257,
+              313
+            ],
+            "posterior_top2_ids": [
+              [
+                260,
+                270
+              ],
+              [
+                2310,
+                49861
+              ],
+              [
+                294,
+                16
+              ],
+              [
+                270,
+                18392
+              ],
+              [
+                1257,
+                3737
+              ],
+              [
+                313,
+                3608
+              ]
+            ],
+            "posterior_top2_logprobs": [
+              [
+                -0.125,
+                -3.5
+              ],
+              [
+                0.0,
+                -6.0
+              ],
+              [
+                -0.5,
+                -1.5
+              ],
+              [
+                -0.125,
+                -3.25
+              ],
+              [
+                0.0,
+                -5.375
+              ],
+              [
+                0.0,
+                -7.5
+              ]
+            ],
+            "prefix_len": 15,
+            "proposed_ids": [
+              1354,
+              260,
+              2310,
+              294,
+              270,
+              1257
+            ],
+            "rollback_us": 6.208,
+            "verify_token_count": 6,
+            "verify_us": 78221.208,
+            "yield_pause_us": 14.667
+          },
+          {
+            "acceptance_len": 4,
+            "acceptance_us": 297.334,
+            "block_len": 6,
+            "candidate_count": 1,
+            "commit_count": 5,
+            "commit_us": 422.5,
+            "committed_ids": [
+              313,
+              26509,
+              3737,
+              16,
+              455
+            ],
+            "cycle": 3,
+            "cycle_engine_us": 87105.209,
+            "cycle_total_us": 87105.209,
+            "cycle_wall_us": 87120.375,
+            "draft_source": "dflash",
+            "draft_us": 7127.042,
+            "hidden_extraction_us": 481.917,
+            "other_us": 103.124,
+            "posterior_ids": [
+              26509,
+              3737,
+              16,
+              455,
+              1257,
+              23643
+            ],
+            "posterior_top2_ids": [
+              [
+                26509,
+                55155
+              ],
+              [
+                3737,
+                5809
+              ],
+              [
+                16,
+                14
+              ],
+              [
+                455,
+                1884
+              ],
+              [
+                1257,
+                26509
+              ],
+              [
+                23643,
+                1531
+              ]
+            ],
+            "posterior_top2_logprobs": [
+              [
+                0.0,
+                -5.0
+              ],
+              [
+                0.0,
+                -10.875
+              ],
+              [
+                -0.625,
+                -1.125
+              ],
+              [
+                -0.25,
+                -2.25
+              ],
+              [
+                0.0,
+                -3.75
+              ],
+              [
+                -0.5,
+                -1.125
+              ]
+            ],
+            "prefix_len": 21,
+            "proposed_ids": [
+              313,
+              26509,
+              3737,
+              16,
+              455,
+              2019
+            ],
+            "rollback_us": 388.667,
+            "verify_token_count": 6,
+            "verify_us": 78284.625,
+            "yield_pause_us": 15.166
+          },
+          {
+            "acceptance_len": 0,
+            "acceptance_us": 275.333,
+            "block_len": 6,
+            "candidate_count": 1,
+            "commit_count": 1,
+            "commit_us": 422.708,
+            "committed_ids": [
+              1257
+            ],
+            "cycle": 4,
+            "cycle_engine_us": 87209.583,
+            "cycle_total_us": 87209.583,
+            "cycle_wall_us": 87218.292,
+            "draft_source": "dflash",
+            "draft_us": 7051.25,
+            "hidden_extraction_us": 503.25,
+            "other_us": 72.876,
+            "posterior_ids": [
+              1234,
+              1167,
+              344,
+              223,
+              18,
+              14
+            ],
+            "posterior_top2_ids": [
+              [
+                1234,
+                26509
+              ],
+              [
+                1167,
+                3737
+              ],
+              [
+                344,
+                1531
+              ],
+              [
+                223,
+                262
+              ],
+              [
+                18,
+                19
+              ],
+              [
+                14,
+                16
+              ]
+            ],
+            "posterior_top2_logprobs": [
+              [
+                0.0,
+                -5.0
+              ],
+              [
+                0.0,
+                -5.5
+              ],
+              [
+                0.0,
+                -8.625
+              ],
+              [
+                0.0,
+                -10.125
+              ],
+              [
+                -0.5,
+                -1.0
+              ],
+              [
+                0.0,
+                -5.75
+              ]
+            ],
+            "prefix_len": 26,
+            "proposed_ids": [
+              1257,
+              26509,
+              1167,
+              344,
+              223,
+              19
+            ],
+            "rollback_us": 423.958,
+            "verify_token_count": 6,
+            "verify_us": 78460.208,
+            "yield_pause_us": 8.709
+          },
+          {
+            "acceptance_len": 4,
+            "acceptance_us": 272.75,
+            "block_len": 6,
+            "candidate_count": 1,
+            "commit_count": 5,
+            "commit_us": 435.542,
+            "committed_ids": [
+              1234,
+              26509,
+              3737,
+              477,
+              223
+            ],
+            "cycle": 5,
+            "cycle_engine_us": 87508.166,
+            "cycle_total_us": 87508.166,
+            "cycle_wall_us": 87522.75,
+            "draft_source": "dflash",
+            "draft_us": 7039.5,
+            "hidden_extraction_us": 490.833,
+            "other_us": 64.166,
+            "posterior_ids": [
+              26509,
+              3737,
+              477,
+              223,
+              18,
+              305
+            ],
+            "posterior_top2_ids": [
+              [
+                26509,
+                3737
+              ],
+              [
+                3737,
+                539
+              ],
+              [
+                477,
+                343
+              ],
+              [
+                223,
+                262
+              ],
+              [
+                18,
+                19
+              ],
+              [
+                305,
+                14
+              ]
+            ],
+            "posterior_top2_logprobs": [
+              [
+                0.0,
+                -4.375
+              ],
+              [
+                0.0,
+                -13.125
+              ],
+              [
+                0.0,
+                -6.5
+              ],
+              [
+                0.0,
+                -9.25
+              ],
+              [
+                -0.25,
+                -1.625
+              ],
+              [
+                0.0,
+                -4.25
+              ]
+            ],
+            "prefix_len": 27,
+            "proposed_ids": [
+              1234,
+              26509,
+              3737,
+              477,
+              223,
+              19
+            ],
+            "rollback_us": 355.375,
+            "verify_token_count": 6,
+            "verify_us": 78850.0,
+            "yield_pause_us": 14.584
+          },
+          {
+            "acceptance_len": 3,
+            "acceptance_us": 323.5,
+            "block_len": 4,
+            "candidate_count": 1,
+            "commit_count": 4,
+            "commit_us": 473.875,
+            "committed_ids": [
+              18,
+              305,
+              223,
+              19
+            ],
+            "cycle": 6,
+            "cycle_engine_us": 77248.542,
+            "cycle_total_us": 77248.542,
+            "cycle_wall_us": 77262.792,
+            "draft_source": "dflash",
+            "draft_us": 7026.209,
+            "hidden_extraction_us": 559.417,
+            "other_us": 48.125,
+            "posterior_ids": [
+              305,
+              223,
+              19,
+              16
+            ],
+            "posterior_top2_ids": [
+              [
+                305,
+                14
+              ],
+              [
+                223,
+                1539
+              ],
+              [
+                19,
+                18
+              ],
+              [
+                16,
+                14
+              ]
+            ],
+            "posterior_top2_logprobs": [
+              [
+                0.0,
+                -8.25
+              ],
+              [
+                0.0,
+                -9.0
+              ],
+              [
+                0.0,
+                -7.25
+              ],
+              [
+                -0.25,
+                -1.75
+              ]
+            ],
+            "prefix_len": 32,
+            "proposed_ids": [
+              18,
+              305,
+              223,
+              19
+            ],
+            "rollback_us": 9.208,
+            "verify_token_count": 4,
+            "verify_us": 68808.208,
+            "yield_pause_us": 14.25
+          }
+        ],
+        "cycles_completed": 6,
+        "draft_sink_size": 64,
+        "draft_window_size": 1024,
+        "elapsed_us": 808667.124,
+        "generated_token_ids": [
+          455,
+          2019,
+          1531,
+          1354,
+          260,
+          2310,
+          294,
+          270,
+          1257,
+          313,
+          26509,
+          3737,
+          16,
+          455,
+          1257,
+          1234,
+          26509,
+          3737,
+          477,
+          223,
+          18,
+          305,
+          223,
+          19
+        ],
+        "generation_tokens": 24,
+        "hit_kind": "miss",
+        "peak_memory_gb": 95.967848017,
+        "phase_timings_us": {
+          "commit": 3053.541,
+          "draft": 98776.502,
+          "draft_incremental": 44229.543,
+          "draft_prefill": 54546.959,
+          "prefill": 113999.834,
+          "replay": 1676.958,
+          "verify": 462092.708
+        },
+        "prompt_token_count": 12,
+        "quantize_kv_cache": false,
+        "target_fa_window": 0,
+        "tokens_per_cycle": 4.0,
+        "verify_len_cap": 6
+      }
+    ],
+    "generated_tokens": 24,
+    "milliseconds_per_token": 28.944470416666665,
+    "peak_memory_bytes": 95967848017,
+    "prompt_time_s": 0.11399983400000001,
+    "token_digest": "0edbf61ae86b8dabb98fc5515916b1d51029d6f8ad19ff3c2235a8c4f5eb5581",
+    "tokens": [
+      455,
+      2019,
+      1531,
+      1354,
+      260,
+      2310,
+      294,
+      270,
+      1257,
+      313,
+      26509,
+      3737,
+      16,
+      455,
+      1257,
+      1234,
+      26509,
+      3737,
+      477,
+      223,
+      18,
+      305,
+      223,
+      19
+    ]
+  },
+  "dspark_kv": {
+    "bits": 4,
+    "group_size": 64,
+    "mode": "affine",
+    "stages": 3,
+    "start": 0
+  },
+  "dspark_stages": 3,
+  "engine": "dflash_mlx_0_1_10",
+  "exact": false,
+  "future_draft_count": 5,
+  "guard_window_id": "32ba2ce39a46ceeb9aea1b9536163488bc8807853a3f53f8821f5ba9e4d856bd",
+  "index_sha256": "f1332b2b209769c2db335954c2651652a8048e7d7dbf60296c2f2c0198715861",
+  "kind": "deepseek_v4_dspark_dflash2_k5",
+  "load_time_s": 10.867572791990824,
+  "mlx_version": "0.32.1",
+  "model": "/Users/davidtai/models/DeepSeek-V4-Flash-0731-2.4bit-mixed",
+  "peak_memory_bytes": 92831506332,
+  "physical_verify_width": 6,
+  "resident_parameter_bytes": 92831470584,
+  "schema_version": 2,
+  "source_head": "2f820990178bba5fa772d036a35ea0378c07412d",
+  "target_kv": {
+    "bits": 4,
+    "group_size": 64,
+    "layers": 43,
+    "mode": "affine",
+    "start": 0
+  },
+  "target_taps": [
+    40,
+    41,
+    42
+  ],
+  "timestamp_utc": "2026-08-21T17:08:41Z"
+}
