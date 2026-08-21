@@ -7,8 +7,10 @@ from mtplx.benchmarks.runners import dflash2_depth_sweep as runner
 
 
 MODEL = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"
+QUALITY_MODEL = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality"
 DRAFT = "z-lab/Qwen3.8-27B-DFlash2"
 RESOLVED = "/cache/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
+QUALITY_RESOLVED = "/cache/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Quality"
 DRAFT_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 PINNED_DRAFT = f"/cache/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/{DRAFT_REVISION}"
 
@@ -37,6 +39,79 @@ def _verified_inspection(runtime_contract):
             "runtime_contract": runtime_contract,
         },
     }
+
+
+def _verified_quality_inspection(runtime_contract):
+    inspection = _verified_inspection(runtime_contract)
+    inspection["quantization"] = {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+    }
+    inspection["mtp"] = {
+        "passes_tensor_gate": True,
+        "sidecar_format": "prequantized-mlx-affine",
+    }
+    return inspection
+
+
+def test_quality_runtime_contract_is_accepted_as_a_distinct_verified_target():
+    runtime_contract = {
+        "recommended_profile": "turbo",
+        "mtp_depth_max": 3,
+        "mtp_contract": {
+            "mtp_quant_group_size": 64,
+            "mtp_quant_mode": "affine",
+        },
+        "verified_on": {"model": "Qwen3.8-27B-MTPLX-Optimized-Quality"},
+    }
+
+    assert (
+        runner._validated_runtime_contract(
+            _verified_quality_inspection(runtime_contract),
+            model_id=QUALITY_MODEL,
+        )
+        is runtime_contract
+    )
+
+
+def test_run_cli_sweep_routes_quality_through_its_own_contract(monkeypatch):
+    class QualityReachedDraftResolution(RuntimeError):
+        pass
+
+    runtime_contract = {
+        "recommended_profile": "turbo",
+        "mtp_depth_max": 3,
+        "mtp_contract": {
+            "mtp_quant_group_size": 64,
+            "mtp_quant_mode": "affine",
+        },
+        "verified_on": {"model": "Qwen3.8-27B-MTPLX-Optimized-Quality"},
+    }
+    monkeypatch.setattr(runner, "_resolve_model_path", lambda _model: QUALITY_RESOLVED)
+    monkeypatch.setattr(
+        runner,
+        "_inspect_model",
+        lambda _model: SimpleNamespace(
+            to_dict=lambda: _verified_quality_inspection(runtime_contract)
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_resolve_draft_snapshot",
+        lambda *_args: (_ for _ in ()).throw(QualityReachedDraftResolution()),
+    )
+
+    with pytest.raises(QualityReachedDraftResolution):
+        runner.run_cli_sweep(
+            SimpleNamespace(
+                model=QUALITY_MODEL,
+                draft_model=DRAFT,
+                widths="1,8",
+                repetitions=3,
+            ),
+            token_count=1024,
+        )
 
 
 def test_dflash_defaults_are_qwen38_greedy():

@@ -27,9 +27,27 @@ QWEN38_OPTIMIZED_SPEED_DIRNAMES = (
     "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
     "Qwen3.8-27B-MTPLX-Optimized-Speed",
 )
+QWEN38_OPTIMIZED_QUALITY = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality"
+QWEN38_OPTIMIZED_QUALITY_DIRNAMES = (
+    "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Quality",
+    "Qwen3.8-27B-MTPLX-Optimized-Quality",
+)
 QWEN38_DFLASH2 = "z-lab/Qwen3.8-27B-DFlash2"
 QWEN38_DFLASH2_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 QWEN38_DFLASH2_LAYERS = (5, 19, 33, 47, 61)
+
+
+def _target_model_id(model_ref: str) -> str:
+    path_name = Path(model_ref).expanduser().name
+    for model_id, directory_names in (
+        (QWEN38_OPTIMIZED_SPEED, QWEN38_OPTIMIZED_SPEED_DIRNAMES),
+        (QWEN38_OPTIMIZED_QUALITY, QWEN38_OPTIMIZED_QUALITY_DIRNAMES),
+    ):
+        if model_ref == model_id or path_name in directory_names:
+            return model_id
+    raise ValueError(
+        "DFlash2 benchmark requires Qwen3.8 Optimized Speed or Optimized Quality"
+    )
 
 
 def _generate_ar(*args, **kwargs):
@@ -126,8 +144,33 @@ def _build_exact_python_prompt_ids(tokenizer: Any, **kwargs):
     return build_exact_python_prompt_ids(tokenizer, **kwargs)
 
 
-def _validated_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any]:
-    """Fail before load unless this is the exact Optimized Speed artifact shape."""
+def _validated_runtime_contract(
+    inspection: dict[str, Any],
+    *,
+    model_id: str = QWEN38_OPTIMIZED_SPEED,
+) -> dict[str, Any]:
+    """Fail before load unless this is an exact supported Qwen3.8 artifact."""
+
+    artifact_contracts = {
+        QWEN38_OPTIMIZED_SPEED: {
+            "bits": 4,
+            "group_size": 32,
+            "lm_head": {"bits": 8, "group_size": 64, "mode": "affine"},
+            "mtp_sidecar": "bf16",
+            "verified_model": "Qwen3.8-27B-MTPLX-Optimized-Speed",
+        },
+        QWEN38_OPTIMIZED_QUALITY: {
+            "bits": 8,
+            "group_size": 64,
+            "lm_head": None,
+            "mtp_sidecar": "prequantized-mlx-affine",
+            "verified_model": "Qwen3.8-27B-MTPLX-Optimized-Quality",
+        },
+    }
+    try:
+        artifact = artifact_contracts[model_id]
+    except KeyError as error:
+        raise ValueError("unsupported Qwen3.8 DFlash2 target artifact") from error
 
     quantization = inspection.get("quantization") or {}
     lm_head = quantization.get("language_model.lm_head") or {}
@@ -140,12 +183,14 @@ def _validated_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any]:
         and inspection.get("architecture") == "Qwen3_5ForConditionalGeneration"
         and inspection.get("num_hidden_layers") == 64
         and inspection.get("hidden_size") == 5120
-        and quantization.get("bits") == 4
-        and quantization.get("group_size") == 32
-        and lm_head
-        == {"bits": 8, "group_size": 64, "mode": "affine"}
+        and quantization.get("bits") == artifact["bits"]
+        and quantization.get("group_size") == artifact["group_size"]
+        and (
+            (artifact["lm_head"] is None and not lm_head)
+            or lm_head == artifact["lm_head"]
+        )
         and mtp.get("passes_tensor_gate") is True
-        and mtp.get("sidecar_format") == "bf16"
+        and mtp.get("sidecar_format") == artifact["mtp_sidecar"]
         and compatibility.get("tier") == "verified"
         and compatibility.get("arch_id") == "qwen3-next-mtp"
         and compatibility.get("support_level") == "verified-native"
@@ -153,8 +198,8 @@ def _validated_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any]:
     )
     if not valid:
         raise ValueError(
-            "DFlash2 benchmark requires the verified Qwen3.8 Optimized Speed "
-            "q4/group-32 artifact with its bf16 MTP sidecar"
+            "DFlash2 benchmark target does not match its verified Qwen3.8 "
+            "artifact contract"
         )
     mtp_contract = runtime_contract.get("mtp_contract") or {}
     if (
@@ -163,10 +208,10 @@ def _validated_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any]:
         or mtp_contract.get("mtp_quant_group_size") != 64
         or mtp_contract.get("mtp_quant_mode") != "affine"
         or (runtime_contract.get("verified_on") or {}).get("model")
-        != "Qwen3.8-27B-MTPLX-Optimized-Speed"
+        != artifact["verified_model"]
     ):
         raise ValueError(
-            "Qwen3.8 Optimized Speed runtime contract does not match the "
+            "Qwen3.8 runtime contract does not match the "
             "promoted turbo depth-3 MTP control"
         )
     return runtime_contract
@@ -698,17 +743,12 @@ def run_dflash2_depth_sweep(
 
 
 def run_cli_sweep(args: Any, *, token_count: int = 1024) -> dict[str, Any]:
-    """Load the fixed Optimized Speed target and run one closed sweep."""
+    """Load one verified Qwen3.8 target artifact and run one closed sweep."""
 
     if type(token_count) is not int or token_count not in {32, 1024}:
         raise ValueError("DFlash2 benchmark token count must be 32 or 1024")
     requested_model = str(args.model)
-    requested_path_name = Path(requested_model).expanduser().name
-    if (
-        requested_model != QWEN38_OPTIMIZED_SPEED
-        and requested_path_name not in QWEN38_OPTIMIZED_SPEED_DIRNAMES
-    ):
-        raise ValueError("DFlash2 benchmark requires Qwen3.8 Optimized Speed")
+    target_model_id = _target_model_id(requested_model)
     if str(args.draft_model) != QWEN38_DFLASH2:
         raise ValueError("DFlash2 benchmark requires the Qwen3.8 DFlash2 checkpoint")
     widths = parse_dflash2_widths(args.widths)
@@ -716,12 +756,15 @@ def run_cli_sweep(args: Any, *, token_count: int = 1024) -> dict[str, Any]:
         raise ValueError("repetitions must be a positive integer")
 
     resolved_model = str(_resolve_model_path(requested_model))
-    if Path(resolved_model).name not in QWEN38_OPTIMIZED_SPEED_DIRNAMES:
+    if _target_model_id(resolved_model) != target_model_id:
         raise ValueError(
-            "Qwen3.8 Optimized Speed did not resolve to the verified local artifact"
+            "Qwen3.8 target did not resolve to its verified local artifact"
         )
     inspection = _inspect_model(resolved_model).to_dict()
-    runtime_contract = _validated_runtime_contract(inspection)
+    runtime_contract = _validated_runtime_contract(
+        inspection,
+        model_id=target_model_id,
+    )
     pinned_draft = _resolve_draft_snapshot(
         QWEN38_DFLASH2,
         QWEN38_DFLASH2_REVISION,

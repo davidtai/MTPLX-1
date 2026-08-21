@@ -5,6 +5,7 @@ import hashlib
 
 import pytest
 
+from mtplx.benchmarks import dflash2_contract as contract
 from mtplx.benchmarks.dflash2_contract import (
     DepthBracket,
     ExactPrompt,
@@ -23,6 +24,19 @@ class FakeTokenizer:
             "enable_thinking": False,
         }
         return list(range(1200))
+
+
+class PrefixTokenizer:
+    def encode(self, text):
+        return [ord(character) for character in text]
+
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs == {
+            "tokenize": True,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        return [101, 102, 103, 104]
 
 
 def test_widths_are_unique_integers_bounded_by_checkpoint():
@@ -60,6 +74,31 @@ def test_python_prompt_is_exactly_1024_token_ids():
 def test_python_prompt_rejects_an_encoded_prefix_that_is_too_short():
     with pytest.raises(ValueError, match="expected at least 1201"):
         build_exact_python_prompt_ids(FakeTokenizer(), token_count=1201)
+
+
+def test_cold_prefill_prompt_records_prefix_and_test_input_separately(monkeypatch):
+    monkeypatch.setattr(
+        contract,
+        "_coding_agent_prefill_text",
+        lambda: "abcdef",
+        raising=False,
+    )
+
+    prompt = contract.build_cold_prefill_python_prompt(
+        PrefixTokenizer(),
+        cold_prefix_tokens=3,
+        test_prompt_tokens=4,
+    )
+
+    assert prompt.cold_prefix_ids == (97, 98, 99)
+    assert prompt.test_prompt_ids == (101, 102, 103, 104)
+    assert prompt.token_ids == (97, 98, 99, 101, 102, 103, 104)
+    assert prompt.cold_prefix_tokens == 3
+    assert prompt.test_prompt_tokens == 4
+    assert prompt.total_prompt_tokens == 7
+    assert len(prompt.cold_prefix_sha256) == 64
+    assert len(prompt.test_prompt_sha256) == 64
+    assert len(prompt.token_sha256) == 64
 
 
 def test_contract_records_are_immutable():

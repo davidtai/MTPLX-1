@@ -24,6 +24,22 @@ class ExactPrompt:
 
 
 @dataclass(frozen=True)
+class ColdPrefillPrompt:
+    """One cold synthetic prefix followed by one fixed test input."""
+
+    cold_prefix_ids: tuple[int, ...]
+    test_prompt_ids: tuple[int, ...]
+    token_ids: tuple[int, ...]
+    cold_prefix_tokens: int
+    test_prompt_tokens: int
+    total_prompt_tokens: int
+    cold_prefix_sha256: str
+    test_prompt_sha256: str
+    token_sha256: str
+    enable_thinking: bool
+
+
+@dataclass(frozen=True)
 class DepthBracket:
     """One validated DFlash2 measurement and its adjacent MTP controls."""
 
@@ -125,13 +141,61 @@ def build_exact_python_prompt_ids(
             f"expected at least {token_count}"
         )
     token_ids = tuple(int(token) for token in encoded[:token_count])
-    token_sha256 = hashlib.sha256(
-        ",".join(map(str, token_ids)).encode()
-    ).hexdigest()
     return ExactPrompt(
         token_ids=token_ids,
         token_count=len(token_ids),
-        token_sha256=token_sha256,
+        token_sha256=_token_ids_sha256(token_ids),
+        enable_thinking=False,
+    )
+
+
+def _token_ids_sha256(token_ids: tuple[int, ...]) -> str:
+    return hashlib.sha256(",".join(map(str, token_ids)).encode()).hexdigest()
+
+
+def _coding_agent_prefill_text() -> str:
+    from mtplx.prefill_bench import _model_prompt_text
+
+    return _model_prompt_text()
+
+
+def build_cold_prefill_python_prompt(
+    tokenizer,
+    *,
+    cold_prefix_tokens: int,
+    test_prompt_tokens: int = 1024,
+) -> ColdPrefillPrompt:
+    """Compose an exact cold coding prefix and a separately counted test input."""
+
+    if type(cold_prefix_tokens) is not int or cold_prefix_tokens <= 0:
+        raise ValueError("cold_prefix_tokens must be a positive integer")
+    if type(test_prompt_tokens) is not int or test_prompt_tokens <= 0:
+        raise ValueError("test_prompt_tokens must be a positive integer")
+
+    filler = _coding_agent_prefill_text()
+    raw_prefix_ids = [int(token) for token in tokenizer.encode(filler)]
+    if not raw_prefix_ids:
+        raise ValueError("coding-agent prefill text encoded to no tokens")
+    repeated_prefix_ids = raw_prefix_ids * (
+        (cold_prefix_tokens + len(raw_prefix_ids) - 1) // len(raw_prefix_ids)
+    )
+    prefix_ids = tuple(repeated_prefix_ids[:cold_prefix_tokens])
+    test_prompt = build_exact_python_prompt_ids(
+        tokenizer,
+        token_count=test_prompt_tokens,
+    )
+    test_ids = test_prompt.token_ids
+    combined_ids = prefix_ids + test_ids
+    return ColdPrefillPrompt(
+        cold_prefix_ids=prefix_ids,
+        test_prompt_ids=test_ids,
+        token_ids=combined_ids,
+        cold_prefix_tokens=len(prefix_ids),
+        test_prompt_tokens=len(test_ids),
+        total_prompt_tokens=len(combined_ids),
+        cold_prefix_sha256=_token_ids_sha256(prefix_ids),
+        test_prompt_sha256=_token_ids_sha256(test_ids),
+        token_sha256=_token_ids_sha256(combined_ids),
         enable_thinking=False,
     )
 
