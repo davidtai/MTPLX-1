@@ -204,12 +204,22 @@ def _run_nvfp4_sparse_mla(
 ) -> mx.array:
     batch, _heads, query_count, _width = (int(value) for value in queries.shape)
     window_count = int(window_records.shape[1])
+    compressed_count = (
+        0 if compressed_records is None else int(compressed_records.shape[1])
+    )
+    # MLX assigns zero-sized array inputs to Metal's constant address space.
+    # Keep the logical counts at zero, but pass one real device-backed record so
+    # the fixed kernel signature is identical for every layer and phase.
+    if window_count == 0:
+        if compressed_count:
+            window_records = compressed_records[:, :1]
+        else:
+            window_records = mx.zeros(
+                (batch, 1, _RECORD_BYTES),
+                dtype=mx.uint8,
+            )
     if compressed_records is None:
-        compressed_records = mx.zeros(
-            (batch, 0, _RECORD_BYTES),
-            dtype=mx.uint8,
-        )
-    compressed_count = int(compressed_records.shape[1])
+        compressed_records = window_records[:, :1]
     if compressed_indices is None:
         compressed_indices = mx.zeros((batch, query_count, 1), dtype=mx.int32)
         selected_width = 1

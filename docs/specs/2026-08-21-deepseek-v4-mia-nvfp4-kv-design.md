@@ -10,10 +10,10 @@ Replace the temporary MLX affine-int4 cache in the exact Mia/Sero K216 target
 and K64 DSpark draft with Mia's native `stock432` NVFP4 cache contract, then
 consume that representation directly from the bounded sparse-attention path.
 
-This corrects both storage and arithmetic.  The current affine lane stores one
-already-rotated 512-wide row and uses it as both key and value.  Mia's packaged
-oracle instead uses an unrotated 512-wide latent as the value and forms the key
-from the first 448 latent values plus a separately rotated 64-wide RoPE tail.
+This corrects both storage and arithmetic. The current affine lane cannot
+represent Mia's native record. Mia's packaged writer applies RoPE before
+quantization, stores that post-RoPE 512-wide row as NVFP4, and also stores the
+rotated 64-wide tail separately as BF16 for the key path.
 
 ## Pinned Source Contract
 
@@ -32,9 +32,9 @@ bytes 304..431    64 BF16 GPT-J-interleaved rotated-RoPE values
 Dequantization is:
 
 ```text
-latent[d] = e2m1(record[d / 2], d % 2) * e4m3(record[256 + d / 16])
-value      = latent[0:512]
-key        = concat(latent[0:448], bf16(record[304:432]))
+post_rope[d] = e2m1(record[d / 2], d % 2) * e4m3(record[256 + d / 16])
+value        = post_rope[0:512]
+key          = concat(post_rope[0:448], bf16(record[304:432]))
 ```
 
 The record has no affine zero point and is not MLX `mxfp4`.  It is a single
@@ -49,28 +49,31 @@ an oracle decoder, and `MiaNVFP4Rows`.  Construction fixes width 512, NoPE 448,
 RoPE 64, group size 16, and record size 432.  Invalid geometry fails before the
 owner is installed.
 
-The owner accepts raw normalized latent rows and their already-computed rotated
-RoPE tails.  Append, replacement, truncation, eviction, and state restoration
-operate on whole records, preserving the existing target rollback and DSpark
-ring ownership contracts.
+The owner accepts normalized latent rows and their already-computed rotated
+RoPE tails. It substitutes the rotated tail before packing the full post-RoPE
+row, copies the same tail as BF16 bytes, and performs append, replacement,
+truncation, eviction, and state restoration on whole records.
 
 ### Target arithmetic
 
-The target attention route keeps `kv_norm(wkv(x))` unrotated.  It computes the
-64-wide rotated tail separately, inserts `(latent, rope)` into both the sliding
-window and compressed cache, and never stores a shared rotated K/V row.
+The target attention route computes `kv_norm(wkv(x))` and the 64-wide rotated
+tail separately. The record writer substitutes that tail into the 512-wide row
+before NVFP4 quantization and writes the same tail in the BF16 key field.
 
 The attention compressor exposes the normalized pooled latent before RoPE and
-the separately rotated compressed tail.  The indexer compressor and rollback
+the separately rotated compressed tail. Attention uses the NVFP4 post-RoPE row
+as V and, as the pinned DeepSeek model graph requires, inverse-rotates the
+64-wide output tail at the query position before o-LoRA. The indexer compressor and rollback
 journals remain their existing auxiliary state; they are not reclassified as
 NVFP4 attended K/V.
 
 ### DSpark arithmetic
 
-Each of the three DSpark stages owns a distinct `MiaNVFP4Rows` ring.  Context
-prefill and authoritative-main commits insert raw latent plus rotated RoPE.
-Proposal-local rows remain ephemeral.  Attention reconstructs distinct K and V;
-the inverse-output-RoPE workaround is removed.
+Each of the three DSpark stages owns a distinct `MiaNVFP4Rows` ring. Context
+prefill and authoritative-main commits insert normalized latent plus rotated
+RoPE; the writer packs the post-RoPE row. Proposal-local rows remain ephemeral.
+Attention reconstructs distinct K and V
+and retains the source model's inverse output RoPE before o-LoRA.
 
 ### Direct sparse Metal consumption
 
@@ -81,7 +84,8 @@ For every query/head it:
 2. visits the indexer's selected compressed rows, capped by the model's fixed
    `index_topk` contract;
 3. decodes E2M1 and E4M3 in registers;
-4. forms QK with the stored BF16 RoPE tail and accumulates PV from the raw latent;
+4. forms QK with the stored BF16 RoPE tail and accumulates PV from the NVFP4
+   post-RoPE row;
 5. includes the learned per-head sink in the online-softmax denominator; and
 6. writes one BF16 512-wide output without materializing a score matrix or a
    dense dequantized cache.
@@ -129,7 +133,7 @@ layouts, or fallback routes are in scope.
   operate only in 432-byte row units and the existing rejection-repair gate must
   pass before benchmarking.
 - **Minor: `stock432` is larger than the temporary affine record.**  This is an
-  accepted cost of matching Mia's distinct K/V arithmetic and fused sparse
+  accepted cost of matching Mia's post-RoPE NVFP4 arithmetic and fused sparse
   consumer; it remains smaller than Mia's 584-byte padded record.
 
 ## Non-Goals

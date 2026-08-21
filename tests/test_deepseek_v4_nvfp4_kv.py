@@ -48,12 +48,12 @@ def _as_numpy(value: mx.array) -> np.ndarray:
     return np.array(value.astype(mx.float32))
 
 
-def test_mia_stock432_record_reconstructs_distinct_key_and_value() -> None:
+def test_mia_stock432_record_quantizes_the_post_rope_row_for_key_and_value() -> None:
     if not mx.metal.is_available():
         pytest.skip("requires Metal NVFP4 record packer")
 
     latent = _exact_latent()
-    rope = _rope()
+    rope = -latent[..., 448:]
     rows = MiaNVFP4Rows()
     rows.append(latent[:, :1], rope[:, :1])
     rows.append(latent[:, 1:], rope[:, 1:])
@@ -72,10 +72,11 @@ def test_mia_stock432_record_reconstructs_distinct_key_and_value() -> None:
         np.full((1, 2, 32), 0x38, dtype=np.uint8),
     )
     assert int(rows.records[0, 0, 0].item()) == 0x10
-    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(latent))
+    stored = mx.concatenate([latent[..., :448], rope], axis=-1)
+    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(stored))
     np.testing.assert_array_equal(_as_numpy(key[..., :448]), _as_numpy(latent[..., :448]))
     np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))
-    assert not np.array_equal(_as_numpy(value[..., 448:]), _as_numpy(rope))
+    np.testing.assert_array_equal(_as_numpy(value[..., 448:]), _as_numpy(rope))
 
 
 def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> None:
@@ -85,7 +86,7 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     rows = MiaNVFP4Rows()
     rows.append(_exact_latent(4), _rope(4))
     replacement = -_exact_latent(1)
-    replacement_rope = -_rope(1)
+    replacement_rope = -replacement[..., 448:]
     rows.replace(1, replacement, replacement_rope)
     saved = rows.state
 
@@ -93,13 +94,23 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     rows.truncate(2)
     assert rows.shape == (1, 2, 432)
     key, value = rows.decode()
-    np.testing.assert_array_equal(_as_numpy(value[:, :1]), _as_numpy(replacement))
+    expected_replacement = mx.concatenate(
+        [replacement[..., :448], replacement_rope],
+        axis=-1,
+    )
+    np.testing.assert_array_equal(
+        _as_numpy(value[:, :1]),
+        _as_numpy(expected_replacement),
+    )
     np.testing.assert_array_equal(_as_numpy(key[:, :1, 448:]), _as_numpy(replacement_rope))
 
     rows.replace_state(saved)
     assert rows.shape == (1, 4, 432)
     restored_key, restored_value = rows.decode(1, 2)
-    np.testing.assert_array_equal(_as_numpy(restored_value), _as_numpy(replacement))
+    np.testing.assert_array_equal(
+        _as_numpy(restored_value),
+        _as_numpy(expected_replacement),
+    )
     np.testing.assert_array_equal(
         _as_numpy(restored_key[..., 448:]),
         _as_numpy(replacement_rope),
@@ -116,7 +127,7 @@ def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
         head_dim=512,
     )
     latent = _exact_latent(3)
-    rope = _rope(3)
+    rope = -latent[..., 448:]
 
     records, start = cache.update_window(latent, rope)
     key, value = cache.window.decode()
@@ -126,7 +137,8 @@ def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
     assert cache.window.mode == "nvfp4_stock432"
     assert cache.window.shape == (1, 3, 432)
     assert records.shape == (1, 3, 432)
-    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(latent))
+    stored = mx.concatenate([latent[..., :448], rope], axis=-1)
+    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(stored))
     np.testing.assert_array_equal(_as_numpy(key[..., :448]), _as_numpy(latent[..., :448]))
     np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))
 

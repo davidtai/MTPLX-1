@@ -3208,15 +3208,6 @@ class DeepseekV4Attention(nn.Module):
         )
 
     @staticmethod
-    def _raw_value_output(
-        output: mx.array,
-        cos: mx.array,
-        sin: mx.array,
-    ) -> mx.array:
-        del cos, sin
-        return output
-
-    @staticmethod
     def _no_additive_mask(
         q_pos: mx.array,
         kv_pos: Optional[mx.array],
@@ -3245,7 +3236,7 @@ class DeepseekV4Attention(nn.Module):
         )
         self._cached_attention_impl = self._mia_cached_attention
         self._cached_mask_impl = self._no_additive_mask
-        self._finalize_attention_impl = self._raw_value_output
+        self._finalize_attention_impl = self._inverse_rope_output
 
     def _wo_a_quant(self):
         """``wo_a``'s quantised tensors + format, or ``None`` when it is dense.

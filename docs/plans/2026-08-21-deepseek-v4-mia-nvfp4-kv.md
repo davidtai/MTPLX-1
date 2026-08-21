@@ -7,8 +7,9 @@
 **Goal:** Replace the exact Mia target and draft affine-int4 K/V lane with native
 432-byte NVFP4 records and direct bounded sparse Metal attention.
 
-**Architecture:** `MiaNVFP4Rows` owns the exact byte records.  Target and DSpark
-produce raw V latent plus a separate rotated K tail.  A construction-installed
+**Architecture:** `MiaNVFP4Rows` owns the exact byte records. Target and DSpark
+produce normalized latent plus a rotated tail; the writer substitutes that tail
+before NVFP4-quantizing the post-RoPE V row and also stores it as BF16 for K. A construction-installed
 Metal consumer reads selected records directly and performs online-softmax MLA
 without whole-cache dequantization or whole-context scores.
 
@@ -57,7 +58,7 @@ fused sparse consumption.
 - [ ] **Step 1: Write the failing record contract check**
 
 ```python
-def test_mia_stock432_record_reconstructs_distinct_key_and_value():
+def test_mia_stock432_record_quantizes_the_post_rope_row_for_key_and_value():
     latent = fixed_bf16_rows(shape=(1, 2, 512))
     rope = fixed_bf16_rows(shape=(1, 2, 64))
     rows = MiaNVFP4Rows()
@@ -69,7 +70,7 @@ def test_mia_stock432_record_reconstructs_distinct_key_and_value():
     assert bytes(rows.records[0, 0, 304:432]) == bf16_bytes(rope[0, 0])
     assert_allclose(key[..., :448], value[..., :448])
     assert_allclose(key[..., 448:], rope)
-    assert not mx.array_equal(value[..., 448:], rope)
+    assert_allclose(value[..., 448:], rope)
 ```
 
 - [ ] **Step 2: Verify RED**
@@ -139,8 +140,8 @@ the required arithmetic bring-up gate and is not considered the finished lane.
 - [ ] **Step 1: Write failing construction and arithmetic checks**
 
 The checks require `DeepseekV4NVFP4Cache` for all 43 target layers,
-`MiaNVFP4Rows` for all three draft rings, raw latent as V, first-448 plus stored
-RoPE as K, and exact target/draft trim/replace behavior.
+`MiaNVFP4Rows` for all three draft rings, the post-RoPE NVFP4 row as V,
+first-448 plus stored BF16 RoPE as K, and exact target/draft trim/replace behavior.
 
 - [ ] **Step 2: Verify RED**
 
@@ -166,8 +167,8 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
 ```
 
 Split attention projection into `(latent, rotated_rope)`, split compressor output
-at the normalized pooled latent boundary, reconstruct distinct K/V for the
-bring-up path, and remove output inverse RoPE.  Bind `DeepseekV4NVFP4Cache` and
+at the normalized pooled latent boundary, pack the post-RoPE row for the
+bring-up path, and retain the source model's output inverse RoPE. Bind `DeepseekV4NVFP4Cache` and
 the three NVFP4 draft rings once at exact-artifact construction.  DFlash2 rejects
 any non-`stock432` owner before generation.
 

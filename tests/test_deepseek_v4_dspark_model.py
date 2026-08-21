@@ -19,6 +19,8 @@ import mtplx.models.deepseek_v4_dspark as dspark_module  # noqa: E402
 from mtplx.models.deepseek_v4_dspark import (  # noqa: E402
     DSparkTargetRoute,
     DeepseekV4DSparkCache,
+    _dspark_draft_positions,
+    _dspark_visibility_indices,
     build_deepseek_v4_dspark,
     greedy_future_tokens,
 )
@@ -101,6 +103,17 @@ def test_dspark_cache_commits_authoritative_main_row_without_dense_owner() -> No
         np.array(replacement_rope.astype(mx.float32)),
     )
     assert not hasattr(cache, "dense_ring")
+
+
+def test_dspark_decode_uses_the_committed_main_row_then_five_future_positions() -> None:
+    np.testing.assert_array_equal(
+        np.array(_dspark_visibility_indices(128, 5, 17)),
+        np.concatenate([np.arange(18), 128 + np.arange(5)]),
+    )
+    np.testing.assert_array_equal(
+        np.array(_dspark_draft_positions(17, 5)),
+        np.arange(18, 23),
+    )
 
 
 class _Layer:

@@ -97,6 +97,7 @@ def _stock432_pack_kernel():
         uint row = gid / 432u;
         uint byte = gid - row * 432u;
         const device T* latent_row = latent + size_t(row) * 512u;
+        const device T* rope_row = rope + size_t(row) * 64u;
         device uchar* record = records + size_t(row) * 432u;
 
         if (byte < 256u) {
@@ -104,13 +105,23 @@ def _stock432_pack_kernel():
             uint group = dim0 / 16u;
             float amax = 0.0f;
             for (uint i = 0; i < 16u; ++i) {
-                amax = max(amax, abs(float(latent_row[group * 16u + i])));
+                uint dim = group * 16u + i;
+                float value = dim < 448u
+                    ? float(latent_row[dim])
+                    : float(rope_row[dim - 448u]);
+                amax = max(amax, abs(value));
             }
             uchar scale_byte = mtplx_e4m3_encode_positive(amax / 6.0f);
             float scale = mtplx_e4m3_decode(scale_byte);
             float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-            uchar low = mtplx_e2m1_encode(float(latent_row[dim0]) * inv_scale);
-            uchar high = mtplx_e2m1_encode(float(latent_row[dim0 + 1u]) * inv_scale);
+            float low_value = dim0 < 448u
+                ? float(latent_row[dim0])
+                : float(rope_row[dim0 - 448u]);
+            float high_value = dim0 + 1u < 448u
+                ? float(latent_row[dim0 + 1u])
+                : float(rope_row[dim0 + 1u - 448u]);
+            uchar low = mtplx_e2m1_encode(low_value * inv_scale);
+            uchar high = mtplx_e2m1_encode(high_value * inv_scale);
             record[byte] = uchar(low | uchar(high << 4));
             return;
         }
@@ -118,7 +129,11 @@ def _stock432_pack_kernel():
             uint group = byte - 256u;
             float amax = 0.0f;
             for (uint i = 0; i < 16u; ++i) {
-                amax = max(amax, abs(float(latent_row[group * 16u + i])));
+                uint dim = group * 16u + i;
+                float value = dim < 448u
+                    ? float(latent_row[dim])
+                    : float(rope_row[dim - 448u]);
+                amax = max(amax, abs(value));
             }
             record[byte] = mtplx_e4m3_encode_positive(amax / 6.0f);
             return;
@@ -127,9 +142,7 @@ def _stock432_pack_kernel():
             record[byte] = uchar(0);
             return;
         }
-        const device uchar* rope_bytes = reinterpret_cast<const device uchar*>(
-            rope + size_t(row) * 64u
-        );
+        const device uchar* rope_bytes = reinterpret_cast<const device uchar*>(rope_row);
         record[byte] = rope_bytes[byte - 304u];
     """
     return mx.fast.metal_kernel(

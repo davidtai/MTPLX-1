@@ -216,9 +216,16 @@ def _dspark_visibility_indices(
 ) -> mx.array:
     if int(start_pos) <= 0:
         raise ValueError("DSpark decode visibility requires start_pos > 0")
-    main = mx.arange(min(int(window_size), int(start_pos)), dtype=mx.int32)
+    main = mx.arange(min(int(window_size), int(start_pos) + 1), dtype=mx.int32)
     draft = int(window_size) + mx.arange(int(block_size), dtype=mx.int32)
     return mx.concatenate([main, draft])
+
+
+def _dspark_draft_positions(start_pos: int, block_size: int) -> mx.array:
+    return mx.arange(
+        int(start_pos) + 1,
+        int(start_pos) + 1 + int(block_size),
+    )
 
 
 class DeepseekV4DSparkAttention(DeepseekV4Attention):
@@ -271,7 +278,7 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         if int(block) != DSPARK_BLOCK_SIZE:
             raise ValueError("DSpark decode requires five neural rows")
 
-        positions = mx.arange(int(start_pos), int(start_pos) + block)
+        positions = _dspark_draft_positions(int(start_pos), block)
         cos, sin = self._rope_tables(positions)
         rope_dim = self.rope_head_dim
 
@@ -324,6 +331,17 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             self.softmax_scale,
         )
         output = output.transpose(0, 2, 1, 3)
+        output = mx.concatenate(
+            [
+                output[..., :-rope_dim],
+                _apply_interleaved_rope(
+                    output[..., -rope_dim:],
+                    cos[None, :, None],
+                    -sin[None, :, None],
+                ),
+            ],
+            axis=-1,
+        )
         return self._o_lora(
             output.reshape(batch, block, self.n_heads * self.head_dim)
         )
