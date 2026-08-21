@@ -81,7 +81,7 @@ from .sampling import (
 from .session_bank import _boundary_true_restore_enabled
 from .runtime_options import block_prefix_restore_enabled, env_bool
 
-Mode = Literal["ar", "mtp1", "mtpk", "mtpa"]
+Mode = Literal["ar", "mtp1", "mtpk", "mtpa", "dspark"]
 VerifyStrategy = Literal[
     "batched",
     "sequential",

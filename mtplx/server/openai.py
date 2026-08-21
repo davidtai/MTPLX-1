@@ -231,6 +231,7 @@ try:
         restore_or_prefill_prompt_state,
         score_prompt_logprobs,
     )
+    from mtplx.deepseek_v4_dspark_generation import generate_dspark
     from mtplx.native_mlp import native_mlp_stats
     from mtplx.thinking_guard import (
         think_marker_ids,
@@ -258,6 +259,7 @@ except Exception as exc:
 
     generate_ar = _missing_runtime
     generate_mtpk = _missing_runtime
+    generate_dspark = _missing_runtime
     score_prompt_logprobs = _missing_runtime
     think_marker_ids = _missing_runtime
     thinking_guard_config_from_env = _missing_runtime
@@ -1321,7 +1323,8 @@ def _health_runtime_mode_label(
     *,
     fan_boost_active: bool,
 ) -> str:
-    mode = "AR" if str(generation_mode or "").lower() == "ar" else "MTP"
+    selected = str(generation_mode or "").lower()
+    mode = "AR" if selected == "ar" else ("DSpark K5" if selected == "dspark" else "MTP")
     if profile_name == "sustained" and fan_boost_active:
         return f"Sustained Max {mode}"
     if profile_name == "sustained":
@@ -2005,8 +2008,16 @@ class ServerState:
             fan_boost_active=bool(getattr(args, "max", False)),
         )
         _startup_line(f"[4/6] Preparing {runtime_label} runtime")
-        if args.generation_mode == "mtp" and not args.load_mtp:
-            raise ValueError("--generation-mode mtp requires --load-mtp")
+        if args.generation_mode in {"mtp", "dspark"} and not args.load_mtp:
+            raise ValueError(
+                f"--generation-mode {args.generation_mode} requires --load-mtp"
+            )
+        if args.generation_mode == "dspark" and (
+            int(args.depth) != 5 or float(args.temperature) != 0.0
+        ):
+            raise ValueError(
+                "Phase 1 DSpark requires --depth 5 and --temperature 0"
+            )
         if args.diagnostic_env_ablation:
             self.profile_env_status = profile_env_status(self.profile.name)
             self.fast_path_env_status = _fast_path_env_status()
@@ -2071,6 +2082,7 @@ class ServerState:
                 load,
                 args.model,
                 mtp=bool(args.load_mtp),
+                dspark=args.generation_mode == "dspark",
                 contract=MTPContract(
                     mtp_quant_bits=getattr(args, "mtp_quant_bits", None),
                     mtp_quant_group_size=getattr(args, "mtp_quant_group_size", 64),
@@ -12737,10 +12749,10 @@ def _normalize_generation_mode(value: Any, *, default: str = "mtp") -> str:
     if value is None:
         return default
     text = str(value).strip().lower()
-    if text not in {"mtp", "ar"}:
+    if text not in {"mtp", "dspark", "ar"}:
         raise HTTPException(
             status_code=400,
-            detail="generation_mode must be 'mtp' or 'ar'",
+            detail="generation_mode must be 'mtp', 'dspark', or 'ar'",
         )
     return text
 
@@ -12767,6 +12779,15 @@ def _request_generation_mode_for_generation(
         raise HTTPException(
             status_code=400,
             detail="generation_mode 'mtp' requires a runtime loaded with MTP",
+        )
+    if mode == "dspark" and getattr(
+        state.runtime,
+        "deepseek_v4_dspark_runtime",
+        None,
+    ) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="generation_mode 'dspark' requires a DSpark-qualified runtime",
         )
     return mode
 
@@ -20101,7 +20122,7 @@ def _run_generation(
     # null-with-value): there is no draft, so resolution never runs (F8).
     effective_draft_sampler = (
         None
-        if effective_mode == "ar"
+        if effective_mode in {"ar", "dspark"}
         else _resolve_draft_sampler_for_request(
             state,
             request_draft_sampler=draft_sampler,
@@ -20113,7 +20134,11 @@ def _run_generation(
     requested_depth = (
         0
         if effective_mode == "ar"
-        else int(depth if depth is not None else getattr(state.args, "depth", 3))
+        else (
+            5
+            if effective_mode == "dspark"
+            else int(depth if depth is not None else getattr(state.args, "depth", 3))
+        )
     )
     effective_depth = requested_depth
     if (
@@ -20255,6 +20280,17 @@ def _run_generation(
                             if cancel_event is not None
                             else None
                         ),
+                    )
+                elif effective_mode == "dspark":
+                    if float(getattr(sampler, "temperature", 0.0)) != 0.0:
+                        raise ValueError("Phase 1 DSpark supports greedy temperature 0 only")
+                    if constraint is not None:
+                        raise ValueError("Phase 1 DSpark does not support constrained decoding")
+                    out = generate_dspark(
+                        state.runtime,
+                        prompt_ids,
+                        max_tokens=response_max,
+                        token_callback=record_tokens,
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
@@ -31253,9 +31289,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--generation-mode",
-        choices=["mtp", "ar"],
+        choices=["mtp", "dspark", "ar"],
         default="mtp",
-        help="Generation mode. 'ar' uses target-only AR generation while keeping the same loaded runtime.",
+        help=(
+            "Generation mode. 'dspark' selects fixed greedy K5 for the qualified "
+            "DeepSeek V4 artifact; 'ar' uses target-only generation."
+        ),
     )
     parser.add_argument(
         "--stock-ar",

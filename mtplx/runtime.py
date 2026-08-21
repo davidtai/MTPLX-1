@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+    from .deepseek_v4_dspark_runtime import DeepseekV4DSparkRuntime
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -94,6 +95,7 @@ class MTPLXRuntime:
     deepseek_v4_o_lora_report: dict[str, Any] | None = None
     deepseek_v4_attn_proj_wide_m3_report: dict[str, Any] | None = None
     deepseek_v4_attention_island_report: dict[str, Any] | None = None
+    deepseek_v4_dspark_runtime: DeepseekV4DSparkRuntime | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
@@ -570,6 +572,7 @@ def load(
     gemma4_target_distribution_mode: str | None = None,
     proj_quant: str | None = None,
     proj_requant: str | None = None,
+    dspark: bool = False,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
@@ -619,6 +622,11 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    verified_dspark_artifact = None
+    if dspark:
+        from .deepseek_v4_dspark_artifact import open_verified_dspark_artifact
+
+        verified_dspark_artifact = open_verified_dspark_artifact(path)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(
@@ -683,7 +691,10 @@ def load(
                 len(touched), proj_requant,
             )
     deepseek_v4_attn_proj_wide_m3_report = None
-    if str((config or {}).get("model_type") or "").lower() == "deepseek_v4":
+    if (
+        str((config or {}).get("model_type") or "").lower() == "deepseek_v4"
+        and not dspark
+    ):
         from .models.deepseek_v4 import configure_deepseek_v4_moe_tail
 
         configure_deepseek_v4_moe_tail(model, config)
@@ -710,7 +721,7 @@ def load(
         .with_config_defaults(config)
     )
     mtp_enabled = False
-    if mtp:
+    if mtp and not dspark:
         from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
@@ -872,7 +883,7 @@ def load(
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
     deepseek_v4_o_lora_report = None
     deepseek_v4_attention_island_report = None
-    if str(config.get("model_type") or "").lower() == "deepseek_v4":
+    if str(config.get("model_type") or "").lower() == "deepseek_v4" and not dspark:
         from .models.deepseek_v4 import (
             _o_lora_mode_from_env,
             install_deepseek_v4_o_lora_routes,
@@ -930,6 +941,16 @@ def load(
         if _is_laguna_s_2_1_mlx_4bit_config(config)
         else MTPLXRuntime
     )
+    deepseek_v4_dspark_runtime = None
+    if verified_dspark_artifact is not None:
+        from .deepseek_v4_dspark_runtime import (
+            install_deepseek_v4_dspark_runtime,
+        )
+
+        deepseek_v4_dspark_runtime = install_deepseek_v4_dspark_runtime(
+            model,
+            verified_dspark_artifact,
+        )
     runtime = runtime_class(
         model,
         tokenizer,
@@ -942,6 +963,7 @@ def load(
         deepseek_v4_o_lora_report=deepseek_v4_o_lora_report,
         deepseek_v4_attn_proj_wide_m3_report=deepseek_v4_attn_proj_wide_m3_report,
         deepseek_v4_attention_island_report=deepseek_v4_attention_island_report,
+        deepseek_v4_dspark_runtime=deepseek_v4_dspark_runtime,
         a3b_compiled_target_prefix_factory=compiled_target_factory,
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,

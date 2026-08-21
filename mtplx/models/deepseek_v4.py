@@ -281,6 +281,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.switch_layers import SwiGLU, SwitchGLU
 from mtplx.attention_context import current_attention_phase
+from mtplx.deepseek_v4_affine_kv import AffineInt4Rows
 
 
 # Default per-layer compress ratios for DeepSeek-V4-Flash (43 body layers; the
@@ -1434,6 +1435,13 @@ class ModelArgs(BaseModelArgs):
     # upstream as ``mtp.0.*``; a conversion that drops it leaves this field at 1
     # while shipping no weights, which :meth:`Model.sanitize` detects and honours.
     num_nextn_predict_layers: int = 0
+    # Mia/DeepSpec DSpark signature.  A populated signature installs the native
+    # fixed-K5 owner at construction; target-only and legacy one-block artifacts
+    # leave every field unset and retain the existing path.
+    dspark_block_size: Optional[int] = None
+    dspark_markov_rank: Optional[int] = None
+    dspark_noise_token_id: Optional[int] = None
+    dspark_target_layer_ids: Optional[List[int]] = None
 
     def __post_init__(self):
         # Accept the HF rope_scaling block and mirror it into the flat YaRN fields
@@ -2564,6 +2572,11 @@ class DeepseekV4Cache:
             self.compressed, compressor.step(x, self.comp, self.offset)
         )
 
+    def attention_compressed(self) -> mx.array:
+        if self.compressed is None:
+            raise ValueError("DeepSeek-V4 compressed attention cache is empty")
+        return self.compressed
+
     def update_index_compressed(self, compressor: Compressor, x: mx.array) -> None:
         """Same, for the ratio-4 indexer's own compressor lane."""
         self.index_compressed = self._grow(
@@ -2731,6 +2744,139 @@ class DeepseekV4Cache:
 
     def empty(self) -> bool:
         return self.offset == 0
+
+
+class DeepseekV4AffineInt4Cache(DeepseekV4Cache):
+    """DeepSeek V4 streaming cache with affine-int4 persistent attention K/V."""
+
+    _META_VERSION = "mtplx-deepseek-v4-affine-int4-cache-v1"
+
+    def __init__(
+        self,
+        window_size: int,
+        compress_ratio: int,
+        head_dim: int,
+        rollback_capacity: int = _DEFAULT_ROLLBACK_CAPACITY,
+    ) -> None:
+        super().__init__(
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            rollback_capacity=rollback_capacity,
+        )
+        self.window = AffineInt4Rows(width=self.head_dim)
+        self.compressed = AffineInt4Rows(width=self.head_dim)
+
+    @property
+    def n_compressed(self) -> int:
+        return len(self.compressed)
+
+    def update_window(self, kv: mx.array):
+        s = int(kv.shape[1])
+        buf_start = self.offset if len(self.window) == 0 else self.window_start
+        self.window.append(kv)
+        total = len(self.window)
+        first_visible = max(0, self.offset - self.window_size + 1)
+        lo = max(0, first_visible - buf_start)
+        rows = self.window.dequantize(lo, total)
+        start = buf_start + lo
+        keep = self.window_size + self.rollback_capacity
+        if total > keep:
+            self.window.drop_first(total - keep)
+            buf_start = self.offset + s - keep
+        self.window_start = buf_start
+        return rows, start
+
+    def update_compressed(self, compressor: Compressor, x: mx.array) -> None:
+        rows = compressor.step(x, self.comp, self.offset)
+        if rows.shape[1]:
+            self.compressed.append(rows)
+
+    def attention_compressed(self) -> mx.array:
+        return self.compressed.dequantize()
+
+    def trim(self, n: int) -> int:
+        n = int(n)
+        if n <= 0:
+            return 0
+        if n > int(self.offset):
+            raise ValueError(
+                f"cannot trim {n} tokens from a DeepSeek-V4 cache at offset "
+                f"{self.offset}"
+            )
+        if n > self.rollback_capacity:
+            raise ValueError(
+                f"DeepSeek-V4 cache rollback of {n} exceeds rollback_capacity="
+                f"{self.rollback_capacity}: the sliding window has already evicted "
+                "the rows that depth would need"
+            )
+        new_offset = int(self.offset) - n
+        self.window.truncate(len(self.window) - n)
+        if len(self.window) == 0:
+            self.window_start = new_offset
+        if self.compress_ratio:
+            n_rows = new_offset // self.compress_ratio
+            self.compressed.truncate(n_rows)
+            self.comp.rollback(n, new_offset)
+            if self.compress_ratio == 4:
+                if self.index_compressed is not None:
+                    self.index_compressed = (
+                        None if n_rows == 0 else self.index_compressed[:, :n_rows]
+                    )
+                self.index_comp.rollback(n, new_offset)
+        self.offset = new_offset
+        return n
+
+    @property
+    def state(self):
+        return (
+            self.window.state,
+            self.compressed.state,
+            self.comp.cur_kv,
+            self.comp.cur_score,
+            self.comp.prev_kv,
+            self.comp.prev_score,
+            self.comp.tail_kv,
+            self.comp.tail_score,
+            self.index_compressed,
+            self.index_comp.cur_kv,
+            self.index_comp.cur_score,
+            self.index_comp.prev_kv,
+            self.index_comp.prev_score,
+            self.index_comp.tail_kv,
+            self.index_comp.tail_score,
+        )
+
+    @state.setter
+    def state(self, value) -> None:
+        if value is None:
+            self.window.clear()
+            self.compressed.clear()
+            self.index_compressed = None
+            self.comp.reset()
+            self.index_comp.reset()
+            self.offset = 0
+            self.window_start = 0
+            return
+        if not isinstance(value, (tuple, list)) or len(value) != 15:
+            raise ValueError("DeepSeek-V4 affine-int4 cache state must contain fifteen entries")
+        self.window.replace_state(value[0])
+        self.compressed.replace_state(value[1])
+        (
+            self.comp.cur_kv,
+            self.comp.cur_score,
+            self.comp.prev_kv,
+            self.comp.prev_score,
+            self.comp.tail_kv,
+            self.comp.tail_score,
+            self.index_compressed,
+            self.index_comp.cur_kv,
+            self.index_comp.cur_score,
+            self.index_comp.prev_kv,
+            self.index_comp.prev_score,
+            self.index_comp.tail_kv,
+            self.index_comp.tail_score,
+        ) = value[2:]
 
 
 # ---------------------------------------------------------------------------
@@ -3124,7 +3270,7 @@ class DeepseekV4Attention(nn.Module):
             n_comp = cache.n_compressed
             n_win = int(win_kv.shape[1])
             full_kv = win_kv if not n_comp else mx.concatenate(
-                [win_kv, cache.compressed], axis=1
+                [win_kv, cache.attention_compressed()], axis=1
             )
             if self._indexer_active(n_comp):
                 assert cache.n_index_compressed == n_comp, (
@@ -3503,14 +3649,46 @@ class Model(nn.Module):
         # Reference ``Transformer.mtp`` (model.py L789-793): a top-level list, so
         # the parameter paths are ``mtp.{i}.*`` — exactly the upstream checkpoint's
         # names.  Dropped again by :meth:`sanitize` if the weights are not there.
-        self.mtp = [
-            DeepseekV4MTP(args, args.num_hidden_layers + i)
-            for i in range(max(int(args.num_nextn_predict_layers or 0), 0))
-        ]
         # Construction-time performance installers may replace this with a
         # typed phase/width router.  The stock callable is explicit and direct;
         # decoder layers never probe candidate eligibility or fall back.
         self._target_hc_hidden_route = self.model.hc_hidden
+        dspark_requested = any(
+            value is not None
+            for value in (
+                args.dspark_block_size,
+                args.dspark_markov_rank,
+                args.dspark_noise_token_id,
+                args.dspark_target_layer_ids,
+            )
+        )
+        self.dspark = None
+        if dspark_requested:
+            from mtplx.models.deepseek_v4_dspark import (
+                DSparkTargetRoute,
+                build_deepseek_v4_dspark,
+            )
+
+            self.dspark = build_deepseek_v4_dspark(args)
+            self.mtp = self.dspark.stages
+            target_route = DSparkTargetRoute(args.dspark_target_layer_ids)
+            self._target_forward_route = (
+                lambda inputs, cache: target_route(self, inputs, cache)
+            )
+            self._target_cache_type = DeepseekV4AffineInt4Cache
+            self._has_generic_mtp = False
+        else:
+            self.mtp = [
+                DeepseekV4MTP(args, args.num_hidden_layers + i)
+                for i in range(max(int(args.num_nextn_predict_layers or 0), 0))
+            ]
+            self._target_forward_route = self._stock_target_forward
+            self._target_cache_type = DeepseekV4Cache
+            self._has_generic_mtp = bool(self.mtp)
+
+    def _stock_target_forward(self, inputs: mx.array, cache):
+        hidden = self._target_hc_hidden_route(inputs, cache)
+        return hidden, hidden
 
     def __call__(
         self,
@@ -3550,7 +3728,7 @@ class Model(nn.Module):
                 "the DeepSeek-V4 backend does not support input_embeddings "
                 "(no vision splice path)"
             )
-        h = self._target_hc_hidden_route(inputs, cache)
+        h, exposed_hidden = self._target_forward_route(inputs, cache)
         logits = None
         if emit_logits:
             source = h
@@ -3559,7 +3737,7 @@ class Model(nn.Module):
             logits = self.logits_from_hc_hidden(source)
         if not return_hidden:
             return logits
-        return logits, h
+        return logits, exposed_hidden
 
     @property
     def layers(self):
@@ -3583,7 +3761,7 @@ class Model(nn.Module):
 
     @property
     def has_mtp(self) -> bool:
-        return bool(self.mtp_blocks)
+        return self._has_generic_mtp
 
     def hc_hidden(self, inputs: mx.array, cache=None) -> mx.array:
         """Trunk forward stopping at the pre-head state the MTP block consumes."""
@@ -3719,6 +3897,28 @@ class Model(nn.Module):
             for block in self.mtp_blocks
         ]
 
+    def make_dspark_cache(self):
+        return self.dspark.make_cache()
+
+    def prefill_dspark(self, target_taps, caches) -> None:
+        self.dspark.prefill(target_taps, caches)
+
+    def propose_dspark_k5(self, primary_token_ids, caches, *, start_pos: int):
+        return self.dspark.propose_k5(
+            primary_token_ids,
+            self.model.embed_tokens,
+            self.lm_head,
+            caches,
+            start_pos=start_pos,
+        )
+
+    def commit_dspark_main(self, target_taps, caches, *, start_pos: int) -> None:
+        self.dspark.commit_main(
+            target_taps,
+            caches,
+            start_pos=start_pos,
+        )
+
     def sanitize(self, weights: dict) -> dict:
         """Adapt this module tree to the checkpoint's tensors.
 
@@ -3741,8 +3941,12 @@ class Model(nn.Module):
         ``load_weights(strict=True)`` still sees an exact match instead of 58
         spurious "missing" keys.
         """
-        if self.mtp_blocks and not any(str(k).startswith("mtp.") for k in weights):
+        mtp_weights_present = any(str(k).startswith("mtp.") for k in weights)
+        if self.dspark is not None and not mtp_weights_present:
+            raise ValueError("the installed DSpark owner requires mtp.0/1/2 weights")
+        if self.dspark is None and self.mtp_blocks and not mtp_weights_present:
             self.mtp = []
+            self._has_generic_mtp = False
         return weights
 
     def make_cache(self):
@@ -3750,7 +3954,7 @@ class Model(nn.Module):
         + compressor frontier).  Shapes come off the built attention modules so the
         cache cannot drift from the layer's own compress ratio."""
         return [
-            DeepseekV4Cache(
+            self._target_cache_type(
                 window_size=layer.attn.window_size,
                 compress_ratio=layer.attn.compress_ratio,
                 head_dim=layer.attn.head_dim,
@@ -4276,6 +4480,16 @@ def is_deepseek_v4_mtp_config(config: dict) -> bool:
     architectures = [str(a) for a in (config or {}).get("architectures") or []]
     if model_type != "deepseek_v4" and not any(
         a.lower() == "deepseekv4forcausallm" for a in architectures
+    ):
+        return False
+    if any(
+        (config or {}).get(field) is not None
+        for field in (
+            "dspark_block_size",
+            "dspark_markov_rank",
+            "dspark_noise_token_id",
+            "dspark_target_layer_ids",
+        )
     ):
         return False
     return int((config or {}).get("num_nextn_predict_layers") or 0) > 0
