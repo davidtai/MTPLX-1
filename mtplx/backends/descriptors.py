@@ -731,8 +731,8 @@ DEEPSEEK_V4_DSPARK_DESCRIPTOR = replace(
         "target_logits",
         "dspark_k5",
         "dflash2_scheduler",
-        "affine_int4_target_kv",
-        "affine_int4_dspark_kv",
+        "mia_nvfp4_stock432_target_kv",
+        "mia_nvfp4_stock432_dspark_kv",
         "fp32_exact_speculative_sampling",
         "bf16_wide_numerics_reported",
     ),
@@ -763,7 +763,7 @@ DEEPSEEK_V4_DSPARK_DESCRIPTOR = replace(
     kv_quant_policy=KVQuantPolicy(
         supported=False,
         disabled_reason=(
-            "DSpark owns affine-int4 group-64 target and draft K/V from offset zero."
+            "DSpark owns Mia stock432 NVFP4 target and draft K/V from offset zero."
         ),
     ),
     context_window_policy=ContextWindowPolicy(

@@ -8,6 +8,7 @@ from mtplx.deepseek_v4_nvfp4_kv import (  # noqa: E402
     MIA_NVFP4_RECORD_BYTES,
     MiaNVFP4Rows,
 )
+from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache  # noqa: E402
 
 
 def _exact_latent(rows: int = 2) -> mx.array:
@@ -102,3 +103,26 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
         _as_numpy(restored_key[..., 448:]),
         _as_numpy(replacement_rope),
     )
+
+
+def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal NVFP4 record packer")
+
+    cache = DeepseekV4NVFP4Cache(
+        window_size=8,
+        compress_ratio=0,
+        head_dim=512,
+    )
+    latent = _exact_latent(3)
+    rope = _rope(3)
+
+    (key, value), start = cache.update_window(latent, rope)
+
+    assert start == 0
+    assert isinstance(cache.window, MiaNVFP4Rows)
+    assert cache.window.mode == "nvfp4_stock432"
+    assert cache.window.shape == (1, 3, 432)
+    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(latent))
+    np.testing.assert_array_equal(_as_numpy(key[..., :448]), _as_numpy(latent[..., :448]))
+    np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))

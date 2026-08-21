@@ -62,34 +62,33 @@ def _cache_contract(bundle) -> dict:
         allow_full_context_layers=False,
     )
     target_ok = all(
-        cache.window.bits == 4
-        and cache.window.group_size == 64
-        and cache.compressed.bits == 4
-        and cache.compressed.group_size == 64
+        cache.window.mode == "nvfp4_stock432"
+        and cache.window.record_bytes == 432
+        and cache.compressed.mode == "nvfp4_stock432"
+        and cache.compressed.record_bytes == 432
         for cache in target
     )
     draft_ok = all(
-        cache.ring.bits == 4 and cache.ring.group_size == 64 for cache in draft
+        cache.ring.mode == "nvfp4_stock432" and cache.ring.record_bytes == 432
+        for cache in draft
     )
     contract = {
         "target_kv": {
-            "mode": "affine",
-            "bits": 4,
-            "group_size": 64,
+            "mode": "nvfp4_stock432",
+            "record_bytes": 432,
             "start": 0,
             "layers": len(target),
         },
         "dspark_kv": {
-            "mode": "affine",
-            "bits": 4,
-            "group_size": 64,
+            "mode": "nvfp4_stock432",
+            "record_bytes": 432,
             "start": 0,
             "stages": len(draft),
         },
     }
     bundle.target_ops.cleanup_generation_caches(target, draft)
     if not target_ok or not draft_ok:
-        raise RuntimeError("DeepSeek DFlash2 bundle does not own affine-int4 K/V")
+        raise RuntimeError("DeepSeek DFlash2 bundle does not own Mia stock432 K/V")
     return contract
 
 

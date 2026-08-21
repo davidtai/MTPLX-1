@@ -4,7 +4,7 @@ import pytest
 
 from mtplx import runtime
 from mtplx.deepseek_v4_dspark_artifact import DSparkConfig
-from mtplx.models.deepseek_v4 import DeepseekV4AffineInt4Cache
+from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache
 from mtplx.models.deepseek_v4_dspark import DeepseekV4DSparkCache
 
 
@@ -29,7 +29,7 @@ def test_explicit_load_qualifies_dspark_without_installing_a_second_runtime(
         dspark = SimpleNamespace(stages=[object(), object(), object()])
 
         def make_cache(self):
-            return [DeepseekV4AffineInt4Cache(128, 0, 512)]
+            return [DeepseekV4NVFP4Cache(128, 0, 512)]
 
         def make_dspark_cache(self):
             return [

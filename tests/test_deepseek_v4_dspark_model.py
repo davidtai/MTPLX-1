@@ -7,10 +7,10 @@ pytest.importorskip("mlx.core")
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
 
-from mtplx.deepseek_v4_affine_kv import AffineInt4Rows  # noqa: E402
+from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows  # noqa: E402
 from mtplx.models import deepseek_v4 as target_module  # noqa: E402
 from mtplx.models.deepseek_v4 import (  # noqa: E402
-    DeepseekV4AffineInt4Cache,
+    DeepseekV4NVFP4Cache,
     Model,
     ModelArgs,
     is_deepseek_v4_mtp_config,
@@ -22,16 +22,6 @@ from mtplx.models.deepseek_v4_dspark import (  # noqa: E402
     build_deepseek_v4_dspark,
     greedy_future_tokens,
 )
-
-
-@pytest.fixture(autouse=True)
-def _cpu_default_device():
-    previous = mx.default_device()
-    mx.set_default_device(mx.cpu)
-    try:
-        yield
-    finally:
-        mx.set_default_device(previous)
 
 
 class _SpyMarkovHead:
@@ -61,16 +51,17 @@ def test_primary_token_conditions_dspark_row_zero_and_returns_five_future_tokens
     assert 29 not in tuple(np.array(future)[0])
 
 
-def test_each_dspark_stage_owns_distinct_affine_int4_cache() -> None:
+def test_each_dspark_stage_owns_distinct_mia_nvfp4_cache() -> None:
     caches = [DeepseekV4DSparkCache(window_size=8, head_dim=512) for _ in range(3)]
     assert len({id(cache) for cache in caches}) == 3
     assert len({id(cache.ring) for cache in caches}) == 3
-    assert all(isinstance(cache.ring, AffineInt4Rows) for cache in caches)
-    assert all(cache.ring.bits == 4 for cache in caches)
-    assert all(cache.ring.group_size == 64 for cache in caches)
+    assert all(isinstance(cache.ring, MiaNVFP4Rows) for cache in caches)
+    assert all(cache.ring.mode == "nvfp4_stock432" for cache in caches)
+    assert all(cache.ring.record_bytes == 432 for cache in caches)
 
-    prompt_kv = mx.zeros((1, 3, 512), dtype=mx.bfloat16)
-    caches[0].prefill(prompt_kv)
+    prompt_latent = mx.zeros((1, 3, 512), dtype=mx.bfloat16)
+    prompt_rope = mx.zeros((1, 3, 64), dtype=mx.bfloat16)
+    caches[0].prefill(prompt_latent, prompt_rope)
     assert len(caches[0].ring) == 8
     assert len(caches[1].ring) == 0
     assert len(caches[2].ring) == 0
@@ -78,23 +69,36 @@ def test_each_dspark_stage_owns_distinct_affine_int4_cache() -> None:
 
 def test_dspark_cache_commits_authoritative_main_row_without_dense_owner() -> None:
     cache = DeepseekV4DSparkCache(window_size=8, head_dim=512)
-    cache.prefill(mx.zeros((1, 8, 512), dtype=mx.bfloat16))
-    replacement = ((mx.arange(512, dtype=mx.float32) % 37) / 11).reshape(
+    cache.prefill(
+        mx.zeros((1, 8, 512), dtype=mx.bfloat16),
+        mx.zeros((1, 8, 64), dtype=mx.bfloat16),
+    )
+    replacement_latent = ((mx.arange(512, dtype=mx.float32) % 37) / 11).reshape(
         1, 1, 512
     ).astype(mx.bfloat16)
+    replacement_rope = ((mx.arange(64, dtype=mx.float32) - 11) / 9).reshape(
+        1, 1, 64
+    ).astype(mx.bfloat16)
 
-    cache.commit_main(start_pos=2, main_kv=replacement)
-
-    direct = mx.dequantize(
-        *mx.quantize(replacement, group_size=64, bits=4, mode="affine"),
-        group_size=64,
-        bits=4,
-        mode="affine",
+    cache.commit_main(
+        start_pos=2,
+        main_latent=replacement_latent,
+        main_rope=replacement_rope,
     )
-    visible = cache.visible_rows()
+
+    visible_key, visible_value = cache.visible_rows()
+    expected_key, expected_value = cache.ring.decode(2, 3)
     np.testing.assert_array_equal(
-        np.array(visible[:, 2:3].astype(mx.float32)),
-        np.array(direct.astype(mx.float32)),
+        np.array(visible_value[:, 2:3].astype(mx.float32)),
+        np.array(expected_value.astype(mx.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.array(visible_key[:, 2:3].astype(mx.float32)),
+        np.array(expected_key.astype(mx.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.array(visible_key[:, 2:3, 448:].astype(mx.float32)),
+        np.array(replacement_rope.astype(mx.float32)),
     )
     assert not hasattr(cache, "dense_ring")
 
@@ -160,21 +164,28 @@ def test_dspark_owner_constructs_three_stages_and_primary_plus_four_noise_inputs
     assert tuple(np.array(draft_inputs)[0]) == (29, 128799, 128799, 128799, 128799)
     assert len(caches) == 3
     assert len({id(cache) for cache in caches}) == 3
-    assert all(cache.ring.bits == 4 for cache in caches)
+    assert all(cache.ring.mode == "nvfp4_stock432" for cache in caches)
 
 
-def test_dspark_signature_installs_tap_route_and_affine_target_cache(monkeypatch) -> None:
+def test_dspark_signature_installs_tap_route_and_mia_nvfp4_target_cache(monkeypatch) -> None:
+    class _FakeAttention:
+        window_size = 128
+        compress_ratio = 0
+        head_dim = 512
+
+        def __init__(self) -> None:
+            self.mia_nvfp4_installed = False
+
+        def install_mia_nvfp4_attention(self) -> None:
+            self.mia_nvfp4_installed = True
+
     class _FakeTarget(nn.Module):
         def __init__(self, args):
             super().__init__()
             self.embed_tokens = _Embedding()
             self.layers = [_Layer(layer_id) for layer_id in range(args.num_hidden_layers)]
             for layer in self.layers:
-                layer.attn = SimpleNamespace(
-                    window_size=128,
-                    compress_ratio=0,
-                    head_dim=512,
-                )
+                layer.attn = _FakeAttention()
 
         def collapse(self, hidden):
             return mx.mean(hidden, axis=2)
@@ -215,7 +226,8 @@ def test_dspark_signature_installs_tap_route_and_affine_target_cache(monkeypatch
     assert model.has_mtp is False
     assert tuple(float(tap[0, 0, 0].item()) for tap in taps) == (40.0, 41.0, 42.0)
     assert len(caches) == 43
-    assert all(isinstance(cache, DeepseekV4AffineInt4Cache) for cache in caches)
+    assert all(isinstance(cache, DeepseekV4NVFP4Cache) for cache in caches)
+    assert all(layer.attn.mia_nvfp4_installed for layer in model.model.layers)
     assert is_deepseek_v4_mtp_config(
         {
             "model_type": "deepseek_v4",

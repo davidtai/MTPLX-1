@@ -231,7 +231,7 @@ def test_exact_mia_split_artifact_constructs_k216_target_and_k64_owner():
     assert model.args.n_routed_experts == 216
     assert model.args.dspark_block_size == 5
     assert model.args.dspark_target_layer_ids == [40, 41, 42]
-    assert model._target_cache_type.__name__ == "DeepseekV4AffineInt4Cache"
+    assert model._target_cache_type.__name__ == "DeepseekV4NVFP4Cache"
     assert model.dspark.args.n_routed_experts == 64
     assert len(model.dspark.stages) == 3
     sinkhorn_owners = tuple(model.layers) + tuple(model.dspark.stages)

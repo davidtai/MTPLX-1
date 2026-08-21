@@ -17,18 +17,8 @@ from mtplx.deepseek_v4_dflash2 import (  # noqa: E402
     DeepseekV4TargetOps,
     generate_deepseek_v4_dflash2,
 )
-from mtplx.models.deepseek_v4 import DeepseekV4AffineInt4Cache  # noqa: E402
+from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache  # noqa: E402
 from mtplx.models.deepseek_v4_dspark import DeepseekV4DSparkCache  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _cpu_default_device():
-    previous = mx.default_device()
-    mx.set_default_device(mx.cpu)
-    try:
-        yield
-    finally:
-        mx.set_default_device(previous)
 
 
 class _FakeDeepseekTarget:
@@ -43,7 +33,7 @@ class _FakeDeepseekTarget:
 
     def make_cache(self):
         return [
-            DeepseekV4AffineInt4Cache(
+            DeepseekV4NVFP4Cache(
                 window_size=128,
                 compress_ratio=0,
                 head_dim=512,
@@ -97,7 +87,7 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
     )
 
 
-def test_target_ops_owns_affine_int4_cache_and_trims_rejected_m6_suffix() -> None:
+def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
     model = _FakeDeepseekTarget()
     ops = DeepseekV4TargetOps()
     cache = ops.make_cache(
@@ -106,7 +96,10 @@ def test_target_ops_owns_affine_int4_cache_and_trims_rejected_m6_suffix() -> Non
         quantize_kv_cache=False,
     )
     owner = cache[0]
-    owner.window.append(mx.zeros((1, 6, 512), dtype=mx.bfloat16))
+    owner.window.append(
+        mx.zeros((1, 6, 512), dtype=mx.bfloat16),
+        mx.zeros((1, 6, 64), dtype=mx.bfloat16),
+    )
     owner.offset = 6
 
     elapsed_ns = ops.restore_after_acceptance(
@@ -116,9 +109,9 @@ def test_target_ops_owns_affine_int4_cache_and_trims_rejected_m6_suffix() -> Non
         drafted_tokens=5,
     )
 
-    assert isinstance(owner, DeepseekV4AffineInt4Cache)
-    assert owner.window.bits == 4
-    assert owner.window.group_size == 64
+    assert isinstance(owner, DeepseekV4NVFP4Cache)
+    assert owner.window.mode == "nvfp4_stock432"
+    assert owner.window.record_bytes == 432
     assert owner.offset == 3
     assert len(owner.window) == 3
     assert elapsed_ns >= 0
@@ -132,14 +125,14 @@ def test_target_ops_owns_affine_int4_cache_and_trims_rejected_m6_suffix() -> Non
 
 class _FakeDSparkAttention:
     window_size = 8
-    head_dim = 64
+    head_dim = 512
 
     def prefill_context(self, projected, cache) -> None:
-        cache.prefill(projected)
+        cache.prefill(*self.project_kv(projected, mx.arange(projected.shape[1])))
 
     def project_kv(self, projected, positions):
         assert int(projected.shape[1]) == int(positions.shape[0])
-        return projected
+        return projected, projected[..., -64:]
 
 
 class _FakeDSparkOwner:
@@ -152,7 +145,7 @@ class _FakeDSparkOwner:
 
     def make_cache(self):
         return [
-            DeepseekV4DSparkCache(window_size=8, head_dim=64) for _ in range(3)
+            DeepseekV4DSparkCache(window_size=8, head_dim=512) for _ in range(3)
         ]
 
     def propose_k5(
@@ -180,7 +173,7 @@ class _FakeStageZero:
     def fuse_main(self, taps):
         self.owner.projected_taps = tuple(taps)
         rows = int(taps[0].shape[1])
-        return mx.zeros((1, rows, 64), dtype=mx.bfloat16)
+        return mx.zeros((1, rows, 512), dtype=mx.bfloat16)
 
 
 def _fake_dspark_target():
@@ -221,7 +214,7 @@ def test_draft_adapter_advertises_m6_but_projects_three_dspark_taps() -> None:
     assert draft.capabilities.supports_copyspec is False
     assert draft.capabilities.supports_ddtree is False
     assert draft.capabilities.supports_early_rollback_launch is False
-    assert tuple(projected.shape) == (1, 2, 64)
+    assert tuple(projected.shape) == (1, 2, 512)
     assert owner.projected_taps is not None
     assert tuple(float(tap[0, 0, 0].item()) for tap in owner.projected_taps) == (
         40.0,
@@ -254,19 +247,19 @@ def test_draft_backend_appends_committed_context_once_and_returns_five_tokens() 
 
     first = backend.draft_greedy(
         **arguments,
-        draft_context=mx.zeros((1, 4, 64), dtype=mx.bfloat16),
+        draft_context=mx.zeros((1, 4, 512), dtype=mx.bfloat16),
     )
     second = backend.draft_greedy(
         **arguments,
-        draft_context=mx.zeros((1, 2, 64), dtype=mx.bfloat16),
+        draft_context=mx.zeros((1, 2, 512), dtype=mx.bfloat16),
     )
 
     assert tuple(np.array(first)) == (31, 32, 33, 34, 35)
     assert tuple(np.array(second)) == (31, 32, 33, 34, 35)
     assert owner.proposal_positions == [4, 6]
     assert [cache.prefill_length for cache in caches] == [6, 6, 6]
-    assert all(cache.ring.bits == 4 for cache in caches)
-    assert all(cache.ring.group_size == 64 for cache in caches)
+    assert all(cache.ring.mode == "nvfp4_stock432" for cache in caches)
+    assert all(cache.ring.record_bytes == 432 for cache in caches)
 
 
 def test_draft_backend_returns_requested_prefix_for_dflash_final_tail() -> None:
@@ -286,7 +279,7 @@ def test_draft_backend_returns_requested_prefix_for_dflash_final_tail() -> None:
         draft_model=draft,
         draft_cache=caches,
         staged_first=mx.array([29], dtype=mx.uint32),
-        draft_context=mx.zeros((1, 4, 64), dtype=mx.bfloat16),
+        draft_context=mx.zeros((1, 4, 512), dtype=mx.bfloat16),
         block_len=3,
         mask_token_tail=mx.full((5,), 128799, dtype=mx.uint32),
         suppress_token_mask=None,
@@ -314,7 +307,7 @@ def test_draft_backend_capture_reuses_the_same_dspark_proposal_path() -> None:
         draft_model=draft,
         draft_cache=caches,
         staged_first=mx.array([29], dtype=mx.uint32),
-        draft_context=mx.zeros((1, 4, 64), dtype=mx.bfloat16),
+        draft_context=mx.zeros((1, 4, 512), dtype=mx.bfloat16),
         block_len=6,
         mask_token_tail=mx.full((5,), 128799, dtype=mx.uint32),
         suppress_token_mask=None,
@@ -336,7 +329,7 @@ def test_deepseek_bundle_reuses_mtplx_target_and_dflash2_engine_types(
     target, _owner = _fake_dspark_target()
     target.args.model_type = "deepseek_v4"
     target.make_cache = lambda: [
-        DeepseekV4AffineInt4Cache(
+        DeepseekV4NVFP4Cache(
             window_size=128,
             compress_ratio=0,
             head_dim=512,

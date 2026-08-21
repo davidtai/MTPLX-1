@@ -31,7 +31,7 @@ The official `DSparkAttention` source establishes that persistent stage K/V is
 context K/V projected from accepted target taps. The five neural draft rows are
 combined with that context only for the proposal attention call and are not
 retained in the stage cache. The MLX cycle therefore trims rejected target-M6
-rows and inserts only the retained target-tap prefix into each stage's affine-int4
+rows and inserts only the retained target-tap prefix into each stage's Mia stock432
 context ring.
 
 ## Phase 1 checkpoint

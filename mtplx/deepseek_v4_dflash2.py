@@ -11,7 +11,7 @@ import mlx.core as mx
 from dflash_mlx.engine.target_ops import TargetCapabilities
 from dflash_mlx.model import DraftRuntimeCapabilities
 
-from mtplx.models.deepseek_v4 import DeepseekV4AffineInt4Cache
+from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache
 
 
 _TARGET_LAYER_IDS = (40, 41, 42)
@@ -93,15 +93,15 @@ class DeepseekV4TargetOps:
         del enable_speculative_linear_cache
         if quantize_kv_cache:
             raise ValueError(
-                "DeepSeek V4 target K/V is already affine-int4 from offset zero"
+                "DeepSeek V4 target K/V is already Mia stock432 NVFP4 from offset zero"
             )
         if target_fa_window is not None and int(target_fa_window) > 0:
             raise ValueError("DeepSeek V4 uses its model-defined attention windows")
         cache = target_model.make_cache()
         if not cache or not all(
-            isinstance(entry, DeepseekV4AffineInt4Cache) for entry in cache
+            isinstance(entry, DeepseekV4NVFP4Cache) for entry in cache
         ):
-            raise ValueError("DeepSeek V4 DFlash2 requires affine-int4 target caches")
+            raise ValueError("DeepSeek V4 DFlash2 requires Mia stock432 target caches")
         return cache
 
     def install_speculative_hooks(self, target_model: Any) -> None:
@@ -296,12 +296,12 @@ class DeepseekV4DSparkBackend:
         for cache in caches:
             ring = getattr(cache, "ring", None)
             if (
-                getattr(ring, "bits", None) != 4
-                or getattr(ring, "group_size", None) != 64
+                getattr(ring, "mode", None) != "nvfp4_stock432"
+                or getattr(ring, "record_bytes", None) != 432
                 or len(ring) != 0
             ):
                 raise ValueError(
-                    "DSpark DFlash2 caches must start empty in affine-int4 group64"
+                    "DSpark DFlash2 caches must start empty in Mia stock432 format"
                 )
         return caches
 
@@ -336,10 +336,8 @@ class DeepseekV4DSparkBackend:
                 draft_cache,
                 strict=True,
             ):
-                cache.commit_main(
-                    prior_length,
-                    stage.attn.project_kv(draft_context, positions),
-                )
+                latent, rope = stage.attn.project_kv(draft_context, positions)
+                cache.commit_main(prior_length, latent, rope)
         return prior_length + context_rows
 
     def draft_greedy(

@@ -8,7 +8,7 @@ from typing import Protocol
 import mlx.core as mx
 import mlx.nn as nn
 
-from mtplx.deepseek_v4_affine_kv import AffineInt4Rows
+from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows
 from mtplx.models.deepseek_v4 import (
     DeepseekV4Attention,
     DeepseekV4DecoderLayer,
@@ -53,57 +53,96 @@ def greedy_future_tokens(
 
 
 class DeepseekV4DSparkCache:
-    """One stage's fixed sliding-window context ring in affine-int4 storage."""
+    """One stage's fixed sliding-window context ring in Mia stock432 storage."""
 
     def __init__(self, *, window_size: int, head_dim: int) -> None:
         self.window_size = int(window_size)
         self.head_dim = int(head_dim)
-        self.ring = AffineInt4Rows(width=self.head_dim)
+        if self.head_dim != 512:
+            raise ValueError("Mia DSpark cache requires head_dim=512")
+        self.ring = MiaNVFP4Rows()
         self.prefill_length = 0
 
-    def prefill(self, main_kv: mx.array) -> None:
-        batch, sequence_length, width = (int(v) for v in main_kv.shape)
+    def prefill(self, main_latent: mx.array, main_rope: mx.array) -> None:
+        batch, sequence_length, width = (int(v) for v in main_latent.shape)
         if width != self.head_dim:
             raise ValueError("DSpark cache head dimension mismatch")
+        if tuple(main_rope.shape) != (batch, sequence_length, 64):
+            raise ValueError("DSpark cache RoPE rows must have shape [batch, rows, 64]")
         if sequence_length <= self.window_size:
-            padding = mx.zeros(
+            latent_padding = mx.zeros(
                 (batch, self.window_size - sequence_length, width),
-                dtype=main_kv.dtype,
+                dtype=main_latent.dtype,
             )
-            rows = mx.concatenate([main_kv, padding], axis=1)
+            rope_padding = mx.zeros(
+                (batch, self.window_size - sequence_length, 64),
+                dtype=main_rope.dtype,
+            )
+            latent_rows = mx.concatenate([main_latent, latent_padding], axis=1)
+            rope_rows = mx.concatenate([main_rope, rope_padding], axis=1)
         else:
-            last = main_kv[:, -self.window_size :]
+            latent_last = main_latent[:, -self.window_size :]
+            rope_last = main_rope[:, -self.window_size :]
             cutoff = sequence_length % self.window_size
-            rows = (
-                last
+            latent_rows = (
+                latent_last
                 if cutoff == 0
                 else mx.concatenate(
-                    [last[:, self.window_size - cutoff :], last[:, : self.window_size - cutoff]],
+                    [
+                        latent_last[:, self.window_size - cutoff :],
+                        latent_last[:, : self.window_size - cutoff],
+                    ],
+                    axis=1,
+                )
+            )
+            rope_rows = (
+                rope_last
+                if cutoff == 0
+                else mx.concatenate(
+                    [
+                        rope_last[:, self.window_size - cutoff :],
+                        rope_last[:, : self.window_size - cutoff],
+                    ],
                     axis=1,
                 )
             )
         self.ring.clear()
-        self.ring.append(rows)
+        self.ring.append(latent_rows, rope_rows)
         self.prefill_length = sequence_length
 
-    def visible_rows(self) -> mx.array:
+    def visible_rows(self) -> tuple[mx.array, mx.array]:
         if len(self.ring) != self.window_size:
             raise RuntimeError("DSpark attention cache has not been prefetched")
-        return self.ring.dequantize()
+        return self.ring.decode()
 
-    def commit_main(self, start_pos: int, main_kv: mx.array) -> None:
+    def commit_main(
+        self,
+        start_pos: int,
+        main_latent: mx.array,
+        main_rope: mx.array,
+    ) -> None:
         if len(self.ring) != self.window_size:
             raise RuntimeError("DSpark decode requires attention-only prefill first")
-        if main_kv.ndim != 3 or int(main_kv.shape[0]) != int(self.ring.shape[0]):
+        if (
+            main_latent.ndim != 3
+            or main_rope.ndim != 3
+            or int(main_latent.shape[0]) != int(self.ring.shape[0])
+            or tuple(main_latent.shape[:-1]) != tuple(main_rope.shape[:-1])
+            or int(main_rope.shape[-1]) != 64
+        ):
             raise ValueError("DSpark committed main K/V must match the ring batch")
-        count = int(main_kv.shape[1])
+        count = int(main_latent.shape[1])
         if count <= 0 or count > self.window_size:
             raise ValueError("DSpark committed main K/V width is outside its ring")
         start = int(start_pos) % self.window_size
         first = min(count, self.window_size - start)
-        self.ring.replace(start, main_kv[:, :first])
+        self.ring.replace(
+            start,
+            main_latent[:, :first],
+            main_rope[:, :first],
+        )
         if first < count:
-            self.ring.replace(0, main_kv[:, first:])
+            self.ring.replace(0, main_latent[:, first:], main_rope[:, first:])
         self.prefill_length = max(self.prefill_length, int(start_pos) + count)
 
 
@@ -182,28 +221,27 @@ def _dspark_visibility_indices(
 
 
 class DeepseekV4DSparkAttention(DeepseekV4Attention):
-    """Official DSpark attention with an affine-int4 stage context ring."""
+    """Official DSpark attention with a Mia stock432 stage context ring."""
 
     def __init__(self, args: ModelArgs, layer_id: int) -> None:
         super().__init__(args, layer_id)
         if self.compress_ratio != 0:
             raise ValueError("DSpark attention requires compress_ratio=0")
 
-    def project_kv(self, hidden: mx.array, positions: mx.array) -> mx.array:
+    def project_kv(
+        self,
+        hidden: mx.array,
+        positions: mx.array,
+    ) -> tuple[mx.array, mx.array]:
         rope_dim = self.rope_head_dim
         cos, sin = self._rope_tables(positions)
-        kv = self.kv_norm(self.wkv(hidden))
-        return mx.concatenate(
-            [
-                kv[..., :-rope_dim],
-                _apply_interleaved_rope(
-                    kv[..., -rope_dim:],
-                    cos[None],
-                    sin[None],
-                ),
-            ],
-            axis=-1,
+        latent = self.kv_norm(self.wkv(hidden))
+        rope = _apply_interleaved_rope(
+            latent[..., -rope_dim:],
+            cos[None],
+            sin[None],
         )
+        return latent, rope
 
     def prefill_context(
         self,
@@ -211,7 +249,7 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         cache: DeepseekV4DSparkCache,
     ) -> None:
         positions = mx.arange(int(main_hidden.shape[1]))
-        cache.prefill(self.project_kv(main_hidden, positions))
+        cache.prefill(*self.project_kv(main_hidden, positions))
 
     def __call__(
         self,
@@ -254,26 +292,27 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             axis=-1,
         )
 
-        draft_kv = self.project_kv(hidden, positions)
-        full_kv = mx.concatenate([cache.visible_rows(), draft_kv], axis=1)
-        visible = full_kv[:, _dspark_visibility_indices(
+        draft_latent, draft_rope = self.project_kv(hidden, positions)
+        draft_rows = MiaNVFP4Rows()
+        draft_rows.append(draft_latent, draft_rope)
+        draft_key, draft_value = draft_rows.decode()
+        cache_key, cache_value = cache.visible_rows()
+        full_key = mx.concatenate([cache_key, draft_key], axis=1)
+        full_value = mx.concatenate([cache_value, draft_value], axis=1)
+        visible_indices = _dspark_visibility_indices(
             self.window_size,
             block,
             int(start_pos),
-        )]
-        output = self._attend(query.transpose(0, 2, 1, 3), visible, None)
-        output = output.transpose(0, 2, 1, 3)
-        output = mx.concatenate(
-            [
-                output[..., :-rope_dim],
-                _apply_interleaved_rope(
-                    output[..., -rope_dim:],
-                    cos[None, :, None],
-                    -sin[None, :, None],
-                ),
-            ],
-            axis=-1,
         )
+        visible_key = full_key[:, visible_indices]
+        visible_value = full_value[:, visible_indices]
+        output = self._attend(
+            query.transpose(0, 2, 1, 3),
+            visible_key,
+            visible_value,
+            None,
+        )
+        output = output.transpose(0, 2, 1, 3)
         return self._o_lora(
             output.reshape(batch, block, self.n_heads * self.head_dim)
         )
@@ -423,10 +462,8 @@ class DeepseekV4DSparkOwner:
         main_hidden = self.stages[0].fuse_main(target_taps)
         positions = mx.arange(int(start_pos), int(start_pos) + int(main_hidden.shape[1]))
         for stage, cache in zip(self.stages, caches):
-            cache.commit_main(
-                start_pos,
-                stage.attn.project_kv(main_hidden, positions),
-            )
+            latent, rope = stage.attn.project_kv(main_hidden, positions)
+            cache.commit_main(start_pos, latent, rope)
 
     def propose_k5(
         self,
