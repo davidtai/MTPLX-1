@@ -15,6 +15,18 @@
 - DeepSpec: `MiaAI-Lab/DeepSpec@005e03b81cec38b7da6399833d609ee89a2587f2`
 - Official DSpark inference source: `DeepSeek-V4-Flash-DSpark@aa22cb07426656189b2573b8e77a9b7333b8ae0f`
 
+## Reused DFlash2 runtime
+
+- Existing MTPLX DFlash2 branch: `perf/qwen38-dflash2@c3487dc56de6c734c71508c1e293a44731ff025f`
+- DFlash2 dependency: `davidtai/dflash-mlx@95a16104c5462793f9f14d2cd0b97b856fb643a1`
+- Imported MTPLX bridge commit: `4d3d03aa`
+- Runtime authority: `dflash_mlx.engine.spec_epoch.SpeculativeSession`
+- Generation authority: `dflash_mlx.runtime.stream_dflash_generate`
+
+DeepSeek adds target and draft protocol adapters only. DFlash2 continues to own
+prefill orchestration, speculative epochs, physical verification, acceptance,
+target rollback calls, next-primary selection, events, and cleanup.
+
 The official `DSparkAttention` source establishes that persistent stage K/V is
 context K/V projected from accepted target taps. The five neural draft rows are
 combined with that context only for the proposal attention call and are not
