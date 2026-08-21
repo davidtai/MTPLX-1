@@ -282,6 +282,7 @@ from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.switch_layers import SwiGLU, SwitchGLU
 from mtplx.attention_context import current_attention_phase
 from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows
+from mtplx.kernels.deepseek_v4_nvfp4_mla import install_nvfp4_sparse_mla
 
 
 # Default per-layer compress ratios for DeepSeek-V4-Flash (43 body layers; the
@@ -2675,6 +2676,10 @@ class DeepseekV4Cache:
         return (rows, rows), start
 
     @staticmethod
+    def attention_window_length(rows) -> int:
+        return int(rows[0].shape[1])
+
+    @staticmethod
     def _grow(rows: Optional[mx.array], new: mx.array) -> Optional[mx.array]:
         if new.shape[1] == 0:
             return rows
@@ -2894,22 +2899,28 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         total = len(self.window)
         first_visible = max(0, self.offset - self.window_size + 1)
         lo = max(0, first_visible - buf_start)
-        rows = self.window.decode(lo, total)
+        records = self.window.records[..., lo:total, :]
         start = buf_start + lo
         keep = self.window_size + self.rollback_capacity
         if total > keep:
             self.window.drop_first(total - keep)
             buf_start = self.offset + s - keep
         self.window_start = buf_start
-        return rows, start
+        return records, start
+
+    @staticmethod
+    def attention_window_length(records: mx.array) -> int:
+        return int(records.shape[1])
 
     def update_compressed(self, compressor: Compressor, x: mx.array) -> None:
         latent, rope = compressor.step_nvfp4(x, self.comp, self.offset)
         if latent.shape[1]:
             self.compressed.append(latent, rope)
 
-    def attention_compressed(self) -> tuple[mx.array, mx.array]:
-        return self.compressed.decode()
+    def attention_compressed(self) -> mx.array:
+        if self.compressed.records is None:
+            raise ValueError("DeepSeek-V4 compressed NVFP4 cache is empty")
+        return self.compressed.records
 
     def trim(self, n: int) -> int:
         n = int(n)
@@ -3047,6 +3058,8 @@ class DeepseekV4Attention(nn.Module):
         # any measured execution; the hot path never probes model metadata.
         self._uncached_kv_impl = self._legacy_uncached_kv
         self._uncached_compressed_impl = self._legacy_uncached_compressed
+        self._cached_attention_impl = self._legacy_cached_attention
+        self._cached_mask_impl = self._attn_mask
         self._finalize_attention_impl = self._inverse_rope_output
 
         if self.compress_ratio:
@@ -3106,6 +3119,76 @@ class DeepseekV4Attention(nn.Module):
         latent, rope = compressor.nvfp4(x)
         return self._mia_uncached_kv(latent, rope)
 
+    def _legacy_cached_attention(
+        self,
+        queries: mx.array,
+        window_rows,
+        compressed_rows,
+        window_start: int,
+        query_positions: mx.array,
+        ratio: int,
+        compressed_selection: Optional[mx.array],
+        additive_mask: Optional[mx.array],
+    ) -> mx.array:
+        del window_start, query_positions, ratio, compressed_selection
+        window_key, window_value = window_rows
+        full_key, full_value = window_key, window_value
+        if compressed_rows is not None:
+            compressed_key, compressed_value = compressed_rows
+            full_key = mx.concatenate([window_key, compressed_key], axis=1)
+            full_value = mx.concatenate([window_value, compressed_value], axis=1)
+        return self._attend(queries, full_key, full_value, additive_mask)
+
+    def _mia_cached_attention(
+        self,
+        queries: mx.array,
+        window_records: mx.array,
+        compressed_records: Optional[mx.array],
+        window_start: int,
+        query_positions: mx.array,
+        ratio: int,
+        compressed_selection: Optional[mx.array],
+        additive_mask: Optional[mx.array],
+    ) -> mx.array:
+        del additive_mask
+        query_count = int(queries.shape[2])
+        if compressed_records is None:
+            compressed_indices = None
+            compressed_lengths = mx.zeros((1, query_count), dtype=mx.int32)
+        elif compressed_selection is None:
+            compressed_indices = None
+            compressed_lengths = mx.minimum(
+                int(compressed_records.shape[1]),
+                (query_positions + 1) // int(ratio),
+            )[None].astype(mx.int32)
+        else:
+            n_compressed = int(compressed_selection.shape[-1])
+            k_max = min(self.indexer.index_topk, n_compressed)
+            row_indices = mx.arange(n_compressed, dtype=mx.int32)
+            candidates = mx.where(
+                compressed_selection,
+                row_indices,
+                mx.array(n_compressed, dtype=mx.int32),
+            )
+            partition = mx.argpartition(candidates, k_max - 1, axis=-1)[..., :k_max]
+            selected = mx.take_along_axis(candidates, partition, axis=-1)
+            compressed_indices = mx.sort(selected, axis=-1)
+            compressed_lengths = mx.sum(
+                compressed_selection.astype(mx.int32),
+                axis=-1,
+            )
+        return self._nvfp4_sparse_mla(
+            queries,
+            window_records,
+            window_start,
+            query_positions.astype(mx.int32),
+            compressed_records,
+            compressed_indices,
+            compressed_lengths,
+            self.attn_sink.astype(mx.float32),
+            self.softmax_scale,
+        )
+
     def _inverse_rope_output(
         self,
         output: mx.array,
@@ -3133,6 +3216,19 @@ class DeepseekV4Attention(nn.Module):
         del cos, sin
         return output
 
+    @staticmethod
+    def _no_additive_mask(
+        q_pos: mx.array,
+        kv_pos: Optional[mx.array],
+        n_win: int,
+        n_comp: int,
+        ratio: int,
+        dtype,
+        comp_sel: Optional[mx.array] = None,
+    ) -> None:
+        del q_pos, kv_pos, n_win, n_comp, ratio, dtype, comp_sel
+        return None
+
     def install_mia_nvfp4_attention(self) -> None:
         """Bind exact Mia K/V construction and raw-V output at model install."""
         if self.head_dim != 512 or self.rope_head_dim != 64:
@@ -3141,6 +3237,14 @@ class DeepseekV4Attention(nn.Module):
             )
         self._uncached_kv_impl = self._mia_uncached_kv
         self._uncached_compressed_impl = self._mia_uncached_compressed
+        self._nvfp4_sparse_mla = install_nvfp4_sparse_mla(
+            heads=self.n_heads,
+            head_dim=self.head_dim,
+            rope_dim=self.rope_head_dim,
+            window_size=self.window_size,
+        )
+        self._cached_attention_impl = self._mia_cached_attention
+        self._cached_mask_impl = self._no_additive_mask
         self._finalize_attention_impl = self._raw_value_output
 
     def _wo_a_quant(self):
@@ -3475,14 +3579,10 @@ class DeepseekV4Attention(nn.Module):
                 cache.update_compressed(self.compressor, x)
                 if ratio == 4:
                     cache.update_index_compressed(self.indexer.compressor, x)
-            (win_key, win_value), win_start = cache.update_window(latent, rope)
+            window_rows, win_start = cache.update_window(latent, rope)
             n_comp = cache.n_compressed
-            n_win = int(win_key.shape[1])
-            full_key, full_value = win_key, win_value
-            if n_comp:
-                comp_key, comp_value = cache.attention_compressed()
-                full_key = mx.concatenate([win_key, comp_key], axis=1)
-                full_value = mx.concatenate([win_value, comp_value], axis=1)
+            n_win = cache.attention_window_length(window_rows)
+            compressed_rows = cache.attention_compressed() if n_comp else None
             if self._indexer_active(n_comp):
                 assert cache.n_index_compressed == n_comp, (
                     "indexer compressor lane desynced from the attention lane: "
@@ -3493,7 +3593,7 @@ class DeepseekV4Attention(nn.Module):
             # window, so that half needs no mask (the compressed half still does once
             # the indexer is filtering).
             kv_pos = None if s == 1 else mx.arange(
-                win_start, win_start + win_key.shape[1]
+                win_start, win_start + n_win
             )
             cache.advance(s)
 
@@ -3501,10 +3601,40 @@ class DeepseekV4Attention(nn.Module):
         # K/V are [b, s+n_comp, head_dim] and shared over heads (MQA).
         # q and both blocks always carry the same dtype (both follow x, or both
         # follow the fp32 escape hatch), so either one names the score dtype.
-        add = self._attn_mask(
-            positions, kv_pos, n_win, n_comp, ratio, q_t.dtype, comp_sel=comp_sel
-        )
-        o = self._attend(q_t, full_key, full_value, add)  # [b, h, s, head_dim]
+        if cache is None:
+            add = self._attn_mask(
+                positions,
+                kv_pos,
+                n_win,
+                n_comp,
+                ratio,
+                q_t.dtype,
+                comp_sel=comp_sel,
+            )
+            o = self._attend(q_t, full_key, full_value, add)
+        else:
+            # The exact Mia route consumes record owners here; the generic route
+            # receives decoded pairs.  Both are installed callables, not an
+            # eligibility/fallback decision in the measured path.
+            add = self._cached_mask_impl(
+                positions,
+                kv_pos,
+                n_win,
+                n_comp,
+                ratio,
+                q_t.dtype,
+                comp_sel=comp_sel,
+            )
+            o = self._cached_attention_impl(
+                q_t,
+                window_rows,
+                compressed_rows,
+                win_start,
+                positions,
+                ratio,
+                comp_sel,
+                add,
+            )
         o = o.transpose(0, 2, 1, 3)            # [b, s, h, head_dim]
         o = self._finalize_attention_impl(o, cos, sin)
         o = o.reshape(b, s, self.n_heads * self.head_dim)

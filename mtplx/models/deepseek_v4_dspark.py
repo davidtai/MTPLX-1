@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows
+from mtplx.kernels.deepseek_v4_nvfp4_mla import install_nvfp4_sparse_mla
 from mtplx.models.deepseek_v4 import (
     DeepseekV4Attention,
     DeepseekV4DecoderLayer,
@@ -227,6 +228,12 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         super().__init__(args, layer_id)
         if self.compress_ratio != 0:
             raise ValueError("DSpark attention requires compress_ratio=0")
+        self._nvfp4_sparse_mla = install_nvfp4_sparse_mla(
+            heads=self.n_heads,
+            head_dim=self.head_dim,
+            rope_dim=self.rope_head_dim,
+            window_size=self.window_size,
+        )
 
     def project_kv(
         self,
@@ -295,22 +302,26 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         draft_latent, draft_rope = self.project_kv(hidden, positions)
         draft_rows = MiaNVFP4Rows()
         draft_rows.append(draft_latent, draft_rope)
-        draft_key, draft_value = draft_rows.decode()
-        cache_key, cache_value = cache.visible_rows()
-        full_key = mx.concatenate([cache_key, draft_key], axis=1)
-        full_value = mx.concatenate([cache_value, draft_value], axis=1)
+        all_records = mx.concatenate(
+            [cache.ring.records, draft_rows.records],
+            axis=1,
+        )
         visible_indices = _dspark_visibility_indices(
             self.window_size,
             block,
             int(start_pos),
         )
-        visible_key = full_key[:, visible_indices]
-        visible_value = full_value[:, visible_indices]
-        output = self._attend(
+        visible_records = all_records[:, visible_indices]
+        output = self._nvfp4_sparse_mla(
             query.transpose(0, 2, 1, 3),
-            visible_key,
-            visible_value,
+            visible_records[:, :0],
+            0,
+            positions.astype(mx.int32),
+            visible_records,
             None,
+            mx.full((1, block), visible_records.shape[1], dtype=mx.int32),
+            self.attn_sink.astype(mx.float32),
+            self.softmax_scale,
         )
         output = output.transpose(0, 2, 1, 3)
         return self._o_lora(
