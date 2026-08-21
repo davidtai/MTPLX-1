@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-21
 
-**Status:** Approved for execution
+**Status:** Arithmetic contract retained; storage ownership superseded by
+`docs/specs/2026-08-21-system-paged-cache-design.md`
 
 ## Goal
 
@@ -118,8 +119,9 @@ bounded by selected rows rather than total context length.
    token parity, the Python service prompt, and the requested cold 1K/16K/64K
    matrix with peak memory.
 
-No unrelated compatibility tests, generic NVFP4 framework, alternate record
-layouts, or fallback routes are in scope.
+No unrelated compatibility tests, alternate record layouts, or fallback routes
+are in scope.  The record codec is now installed through the reusable paged
+ownership system rather than an appendable model-local array.
 
 ## Failure-Mode Check
 

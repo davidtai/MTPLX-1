@@ -7,7 +7,9 @@
 **Goal:** Replace the exact Mia target and draft affine-int4 K/V lane with native
 432-byte NVFP4 records and direct bounded sparse Metal attention.
 
-**Architecture:** `MiaNVFP4Rows` owns the exact byte records. Target and DSpark
+**Architecture:** The exact record arithmetic remains authoritative, but
+storage ownership is superseded by the reusable system plan in
+`docs/plans/2026-08-21-system-paged-cache.md`. Target and DSpark
 produce normalized latent plus a rotated tail; the writer substitutes that tail
 before NVFP4-quantizing the post-RoPE V row and also stores it as BF16 for K. A construction-installed
 Metal consumer reads selected records directly and performs online-softmax MLA
