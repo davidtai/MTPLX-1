@@ -44,6 +44,8 @@ class DeepseekV4TargetOps:
             self.model_type(target_model) == "deepseek_v4"
             and len(stages) == 3
             and layer_ids == _TARGET_LAYER_IDS
+            and getattr(target_model, "_target_cache_type", None)
+            is DeepseekV4NVFP4Cache
         )
 
     def family(self, target_model: Any) -> str:
@@ -287,6 +289,37 @@ class DeepseekV4DSparkDraftAdapter:
 class DeepseekV4DSparkBackend:
     """Append accepted target context and invoke the installed DSpark K5 model."""
 
+    def make_target_feature_store(
+        self,
+        *,
+        prompt_len: int,
+        project_context: Any,
+        draft_model: DeepseekV4DSparkDraftAdapter,
+        draft_cache: list[Any],
+    ):
+        from dflash_mlx.engine.target_features import StreamingTargetFeatureStore
+
+        def consume_prompt_chunk(*, start: int, end: int, features: mx.array) -> None:
+            lengths = tuple(int(cache.prefill_length) for cache in draft_cache)
+            if len(set(lengths)) != 1 or lengths[0] != int(start):
+                raise RuntimeError(
+                    "DSpark streamed prompt position diverged from its cache"
+                )
+            next_position = self._append_context(
+                draft_model=draft_model,
+                draft_cache=draft_cache,
+                draft_context=features,
+            )
+            mx.eval(*(cache.ring.records for cache in draft_cache))
+            if next_position != int(end):
+                raise RuntimeError("DSpark streamed prompt span was not fully consumed")
+
+        return StreamingTargetFeatureStore(
+            prompt_len=int(prompt_len),
+            project_context=project_context,
+            consume_prompt_chunk=consume_prompt_chunk,
+        )
+
     def make_cache(
         self,
         *,
@@ -327,8 +360,10 @@ class DeepseekV4DSparkBackend:
             raise RuntimeError("DSpark stage cache positions diverged")
         prior_length = lengths[0]
         context_rows = int(draft_context.shape[1])
-        if context_rows <= 0:
-            raise ValueError("DSpark context append requires at least one target row")
+        if context_rows == 0:
+            return prior_length
+        if context_rows < 0:
+            raise ValueError("DSpark context append row count is invalid")
 
         if prior_length == 0:
             for stage, cache in zip(

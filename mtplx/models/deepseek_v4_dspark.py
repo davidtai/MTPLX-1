@@ -133,8 +133,14 @@ class DeepseekV4DSparkCache:
         ):
             raise ValueError("DSpark committed main K/V must match the ring batch")
         count = int(main_latent.shape[1])
-        if count <= 0 or count > self.window_size:
+        if count <= 0:
             raise ValueError("DSpark committed main K/V width is outside its ring")
+        if count > self.window_size:
+            skip = count - self.window_size
+            start_pos = int(start_pos) + skip
+            main_latent = main_latent[:, skip:]
+            main_rope = main_rope[:, skip:]
+            count = self.window_size
         start = int(start_pos) % self.window_size
         first = min(count, self.window_size - start)
         self.ring.replace(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import gc
 import hashlib
 import json
 import os
@@ -18,6 +19,18 @@ DEFAULT_MODEL = Path(
     "/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-tp1"
 )
 DEFAULT_PROMPT = "Write a Python function that returns the first n Fibonacci numbers."
+MIA_SOURCE_REVISION = "d4ba142bc1d971eb73a911e207e3e963bbb3c455"
+MIA_MODEL_REVISION = "22f28d32b9b29b4352eaa380ff8c2c170b2847ab"
+MIA_SOURCE_CONFIG_SHA256 = (
+    "b001ec8308044aa11daa0e624f5aea5e5362a63c05879a83a7be046b00eada82"
+)
+MIA_SOURCE_INDEX_SHA256 = (
+    "61af5c0782a8651ef893004e84369d2281a0fc316c8bcefc0bd8f76244224649"
+)
+MIA_IMAGE_DIGEST = (
+    "sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4"
+)
+DFLASH_REVISION = "308672c08a04184cd075742db6db83ef6233296c"
 
 
 def _guard_before_mlx() -> dict:
@@ -43,17 +56,38 @@ def _memory(getter: str) -> int:
     return int(fn()) if callable(fn) else 0
 
 
+def _reset_peak_before_arm() -> bool:
+    """Drop probe temporaries, then measure the cold generation arm itself."""
+
+    import mlx.core as mx
+
+    gc.collect()
+    clear = getattr(mx, "clear_cache", None)
+    if callable(clear):
+        clear()
+    reset = getattr(mx, "reset_peak_memory", None)
+    if not callable(reset):
+        return False
+    reset()
+    return True
+
+
 def _token_digest(tokens: list[int]) -> str:
     return hashlib.sha256(
         json.dumps(tokens, separators=(",", ":")).encode()
     ).hexdigest()
 
 
-def _cache_contract(bundle) -> dict:
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _cache_contract(bundle, *, capacity_tokens: int) -> dict:
     target = bundle.target_ops.make_cache(
         bundle.target_model,
         enable_speculative_linear_cache=True,
         quantize_kv_cache=False,
+        cache_capacity_tokens=int(capacity_tokens),
     )
     draft = bundle.draft_backend.make_cache(
         draft_model=bundle.draft_model,
@@ -64,8 +98,24 @@ def _cache_contract(bundle) -> dict:
     target_ok = all(
         cache.window.mode == "nvfp4_stock432"
         and cache.window.record_bytes == 432
-        and cache.compressed.mode == "nvfp4_stock432"
-        and cache.compressed.record_bytes == 432
+        and (
+            cache.compress_ratio == 0
+            or (
+                cache.compressed.mode == "nvfp4_stock432_paged"
+                and cache.compressed.record_bytes == 432
+                and cache.compressed.capacity
+                == (int(capacity_tokens) + cache.compress_ratio - 1)
+                // cache.compress_ratio
+            )
+        )
+        and (
+            cache.compress_ratio != 4
+            or (
+                cache.index_compressed.mode
+                == "fp8_e4m3_ue8m0_scale132_paged"
+                and cache.index_compressed.record_bytes == 132
+            )
+        )
         for cache in target
     )
     draft_ok = all(
@@ -78,6 +128,14 @@ def _cache_contract(bundle) -> dict:
             "record_bytes": 432,
             "start": 0,
             "layers": len(target),
+            "capacity_tokens": int(capacity_tokens),
+            "paged_compressed_layers": sum(
+                int(cache.compress_ratio > 0) for cache in target
+            ),
+            "paged_indexer_layers": sum(
+                int(cache.compress_ratio == 4) for cache in target
+            ),
+            "indexer_record_bytes": 132,
         },
         "dspark_kv": {
             "mode": "nvfp4_stock432",
@@ -268,23 +326,38 @@ def main() -> int:
         )
     parameters = tree_flatten(bundle.target_model.parameters())
     resident_bytes = sum(int(value.nbytes) for _name, value in parameters)
+    prompt_ids = _prompt_ids(bundle, args.prompt, args.prompt_tokens)
+    cache_capacity_tokens = len(prompt_ids) + max(0, int(args.max_tokens))
+    os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(cache_capacity_tokens)
     common = {
         "schema_version": 2,
         "kind": "deepseek_v4_dspark_dflash2_k5",
         "arm": args.arm,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": str(args.model),
+        "mia_source": "MiaAI-Lab/DeepSeek-v4-Flash-One-DGX-Spark",
+        "mia_source_revision": MIA_SOURCE_REVISION,
+        "mia_model": "0xSero/deepseek-v4-flash-0731-spark",
+        "mia_model_revision": MIA_MODEL_REVISION,
+        "mia_source_config_sha256": MIA_SOURCE_CONFIG_SHA256,
+        "mia_source_index_sha256": MIA_SOURCE_INDEX_SHA256,
+        "mia_runtime_image_digest": MIA_IMAGE_DIGEST,
         "config_sha256": artifact.config_sha256,
         "index_sha256": artifact.index_sha256,
+        "target_artifact_index_sha256": _file_digest(
+            args.model / "model.safetensors.index.json"
+        ),
+        "draft_artifact_index_sha256": artifact.index_sha256,
         "engine": "dflash_mlx_0_1_10",
+        "dflash_revision": DFLASH_REVISION,
         "physical_verify_width": bundle.checkpoint_block_size,
         "future_draft_count": bundle.checkpoint_block_size - 1,
         "dspark_stages": len(bundle.target_model.dspark.stages),
         "target_taps": list(bundle.target_layer_ids),
         "load_time_s": load_time,
         "resident_parameter_bytes": resident_bytes,
-        "active_memory_bytes": _memory("get_active_memory"),
-        "peak_memory_bytes": _memory("get_peak_memory"),
+        "active_memory_bytes_after_load": _memory("get_active_memory"),
+        "peak_memory_bytes_after_load": _memory("get_peak_memory"),
         "mlx_version": mx.__version__,
         "fp32_activations": (
             (os.environ.get("MTPLX_DSV4_FP32_ACTIVATIONS") or "").strip().lower()
@@ -296,9 +369,11 @@ def main() -> int:
             cwd=Path(__file__).resolve().parents[1],
             text=True,
         ).strip(),
-        **_cache_contract(bundle),
+        **_cache_contract(bundle, capacity_tokens=cache_capacity_tokens),
     }
-    prompt_ids = _prompt_ids(bundle, args.prompt, args.prompt_tokens)
+    common["peak_memory_reset_before_arm"] = _reset_peak_before_arm()
+    common["active_memory_bytes_before_arm"] = _memory("get_active_memory")
+    common["peak_memory_bytes_before_arm"] = _memory("get_peak_memory")
     status = 0
     if args.arm == "construct":
         payload = common

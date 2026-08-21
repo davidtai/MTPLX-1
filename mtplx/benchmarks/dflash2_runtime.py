@@ -213,18 +213,13 @@ def bind_mtplx_deepseek_v4_dflash2_bundle(
     draft_backend = DeepseekV4DSparkBackend()
     bind_draft(draft_model, target_model, target_ops=target_ops)
 
-    target_probe = target_ops.make_cache(
-        target_model,
-        enable_speculative_linear_cache=True,
-        quantize_kv_cache=False,
-    )
     draft_probe = draft_backend.make_cache(
         draft_model=draft_model,
         sink_size=0,
         window_size=int(draft_model.args.sliding_window),
         allow_full_context_layers=False,
     )
-    target_ops.cleanup_generation_caches(target_probe, draft_probe)
+    target_ops.cleanup_generation_caches([], draft_probe)
 
     return MTPLXDFlash2Bundle(
         runtime=runtime,
