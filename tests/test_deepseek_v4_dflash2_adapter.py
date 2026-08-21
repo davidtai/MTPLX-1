@@ -30,8 +30,10 @@ class _FakeDeepseekTarget:
         self.dspark = SimpleNamespace(stages=(object(), object(), object()))
         self.model = SimpleNamespace(embed_tokens=object())
         self.calls: list[tuple[int, bool]] = []
+        self.cache_capacities: list[int | None] = []
 
-    def make_cache(self):
+    def make_cache(self, *, capacity_tokens=None):
+        self.cache_capacities.append(capacity_tokens)
         return [
             DeepseekV4NVFP4Cache(
                 window_size=128,
@@ -65,6 +67,7 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
         model,
         enable_speculative_linear_cache=True,
         quantize_kv_cache=False,
+        cache_capacity_tokens=64,
     )
 
     logits, captured = ops.verify_block(
@@ -78,6 +81,7 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
     assert ops.supports_model(model)
     assert ops.family(model) == "deepseek_v4_dspark"
     assert model.calls == [(6, False)]
+    assert model.cache_capacities == [64]
     assert tuple(logits.shape) == (1, 6, 64)
     assert set(captured) == {41, 42, 43}
     assert tuple(features.shape) == (1, 6, 6)

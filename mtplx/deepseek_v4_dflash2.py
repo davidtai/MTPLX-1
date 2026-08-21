@@ -90,6 +90,7 @@ class DeepseekV4TargetOps:
         enable_speculative_linear_cache: bool,
         quantize_kv_cache: bool = False,
         target_fa_window: Optional[int] = None,
+        cache_capacity_tokens: Optional[int] = None,
     ) -> list[Any]:
         del enable_speculative_linear_cache
         if quantize_kv_cache:
@@ -98,7 +99,13 @@ class DeepseekV4TargetOps:
             )
         if target_fa_window is not None and int(target_fa_window) > 0:
             raise ValueError("DeepSeek V4 uses its model-defined attention windows")
-        cache = target_model.make_cache()
+        cache = (
+            target_model.make_cache()
+            if cache_capacity_tokens is None
+            else target_model.make_cache(
+                capacity_tokens=int(cache_capacity_tokens)
+            )
+        )
         if not cache or not all(
             isinstance(entry, DeepseekV4NVFP4Cache) for entry in cache
         ):

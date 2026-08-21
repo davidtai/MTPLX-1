@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
+import math
 
 import mlx.core as mx
+
+from mtplx.paged_cache import PagedCachePlan, PagedCachePool
 
 
 MIA_NVFP4_HEAD_DIM = 512
@@ -351,3 +355,167 @@ class MiaNVFP4Rows:
             raise ValueError("invalid Mia stock432 K/V state")
         self.records = state
         self._prefix_shape = tuple(int(value) for value in state.shape[:-2])
+
+
+@dataclass(frozen=True)
+class PagedMiaNVFP4Records:
+    """Physical ``stock432`` pages and their logical row mapping."""
+
+    records: mx.array
+    block_table: mx.array
+    length: int
+    block_size: int
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (1, int(self.length), MIA_NVFP4_RECORD_BYTES)
+
+    @property
+    def dtype(self):
+        return self.records.dtype
+
+
+class PagedMiaNVFP4Rows:
+    """Fixed-capacity owner for Mia rows, backed by shared MTPLX pages.
+
+    The exact model is single-request/batch-one.  Removing that invariant would
+    require one block table per request, so it is rejected at insertion rather
+    than hidden behind an execution-time fallback.
+    """
+
+    head_dim = MIA_NVFP4_HEAD_DIM
+    nope_dim = MIA_NVFP4_NOPE_DIM
+    rope_dim = MIA_NVFP4_ROPE_DIM
+    group_size = MIA_NVFP4_GROUP_SIZE
+    record_bytes = MIA_NVFP4_RECORD_BYTES
+    mode = "nvfp4_stock432_paged"
+
+    def __init__(self, *, capacity_rows: int, block_size: int = 64) -> None:
+        capacity_rows = int(capacity_rows)
+        block_size = int(block_size)
+        if capacity_rows <= 0:
+            raise ValueError("paged Mia stock432 capacity_rows must be positive")
+        plan = PagedCachePlan.contiguous(
+            block_size=block_size,
+            num_blocks=math.ceil(capacity_rows / block_size),
+            array_names=("records",),
+        )
+        self._capacity_rows = capacity_rows
+        self._pool = PagedCachePool(plan)
+        self._pages = self._pool.bind(
+            "records",
+            row_shape=(self.record_bytes,),
+            dtype=mx.uint8,
+        )
+
+    def __len__(self) -> int:
+        return int(self._pool.offset)
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity_rows
+
+    @property
+    def pages(self) -> mx.array:
+        return self._pages
+
+    @property
+    def block_table(self) -> mx.array:
+        return self._pool.block_table
+
+    @property
+    def block_size(self) -> int:
+        return self._pool.block_size
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (1, len(self), self.record_bytes)
+
+    @property
+    def paged_records(self) -> PagedMiaNVFP4Records:
+        return PagedMiaNVFP4Records(
+            records=self.pages,
+            block_table=self.block_table,
+            length=len(self),
+            block_size=self.block_size,
+        )
+
+    @property
+    def records(self) -> mx.array:
+        """Materialize logical rows only at explicit state/oracle boundaries."""
+        return self._pool.active("records")[None]
+
+    @property
+    def state(self):
+        return self.pages, self.block_table, len(self)
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.pages.nbytes)
+
+    @staticmethod
+    def _validate_rows(latent: mx.array, rope: mx.array) -> None:
+        if tuple(int(value) for value in latent.shape[:1]) != (1,):
+            raise ValueError("paged Mia stock432 rows require batch size one")
+        if latent.ndim != 3 or int(latent.shape[-1]) != MIA_NVFP4_HEAD_DIM:
+            raise ValueError("paged Mia stock432 latent rows must be [1, rows, 512]")
+        if tuple(int(value) for value in rope.shape) != (
+            1,
+            int(latent.shape[1]),
+            MIA_NVFP4_ROPE_DIM,
+        ):
+            raise ValueError("paged Mia stock432 RoPE rows must be [1, rows, 64]")
+
+    def append(self, latent: mx.array, rope: mx.array) -> None:
+        self._validate_rows(latent, rope)
+        count = int(latent.shape[1])
+        if len(self) + count > self.capacity:
+            raise ValueError(
+                f"paged Mia stock432 capacity exceeded: {len(self) + count} "
+                f"> {self.capacity}"
+            )
+        packed = _pack_stock432(latent, rope)[0]
+        self._pool.write_tail({"records": packed})
+
+    def decode(self, start: int = 0, stop: int | None = None) -> tuple[mx.array, mx.array]:
+        begin = int(start)
+        end = len(self) if stop is None else int(stop)
+        if begin < 0 or end < begin or end > len(self):
+            raise ValueError("paged Mia stock432 decode range is outside the store")
+        return decode_stock432(self.records[:, begin:end])
+
+    def replace(self, start: int, latent: mx.array, rope: mx.array) -> None:
+        self._validate_rows(latent, rope)
+        start = int(start)
+        count = int(latent.shape[1])
+        if start < 0 or count <= 0 or start + count > len(self):
+            raise ValueError("replacement paged Mia stock432 range is outside the store")
+        positions = mx.arange(start, start + count, dtype=mx.int32)
+        self._pool.write_slots(
+            {"records": _pack_stock432(latent, rope)[0]},
+            logical_positions=positions,
+        )
+
+    def truncate(self, length: int) -> None:
+        length = max(0, int(length))
+        if length >= len(self):
+            return
+        self._pool.truncate(length)
+
+    def clear(self) -> None:
+        self._pool.clear()
+
+    def replace_state(self, state) -> None:
+        if state is None:
+            self.clear()
+            return
+        if not isinstance(state, (tuple, list)) or len(state) != 3:
+            raise ValueError("invalid paged Mia stock432 state")
+        pages, block_table, length = state
+        if tuple(int(value) for value in block_table.shape) != (
+            self._pool.num_blocks,
+        ):
+            raise ValueError("paged Mia stock432 block table shape changed")
+        self._pool.block_table = block_table
+        self._pool.replace_state({"records": pages}, int(length))
+        self._pages = self._pool.buffer("records")

@@ -7,6 +7,11 @@ import mlx.core as mx  # noqa: E402
 from mtplx.deepseek_v4_nvfp4_kv import (  # noqa: E402
     MIA_NVFP4_RECORD_BYTES,
     MiaNVFP4Rows,
+    PagedMiaNVFP4Rows,
+)
+from mtplx.deepseek_v4_paged_indexer import (  # noqa: E402
+    PagedMiaIndexerRows,
+    paged_indexer_scores,
 )
 from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache  # noqa: E402
 from mtplx.kernels.deepseek_v4_nvfp4_mla import nvfp4_sparse_mla  # noqa: E402
@@ -117,6 +122,37 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     )
 
 
+def test_paged_mia_stock432_owner_keeps_fixed_pages_across_writes() -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal NVFP4 record packer")
+
+    rows = PagedMiaNVFP4Rows(capacity_rows=8, block_size=4)
+    pages = rows.pages
+    rows.append(_exact_latent(3), _rope(3))
+    rows.append(_exact_latent(2), _rope(2))
+
+    assert rows.pages is pages
+    assert rows.shape == (1, 5, 432)
+    assert rows.paged_records.records is pages
+    assert rows.paged_records.length == 5
+    assert rows.paged_records.block_size == 4
+
+    replacement = -_exact_latent(1)
+    replacement_rope = -replacement[..., 448:]
+    rows.replace(1, replacement, replacement_rope)
+    rows.truncate(4)
+    _key, value = rows.decode()
+    expected_replacement = mx.concatenate(
+        [replacement[..., :448], replacement_rope], axis=-1
+    )
+    np.testing.assert_array_equal(
+        _as_numpy(value[:, 1:2]),
+        _as_numpy(expected_replacement),
+    )
+    with pytest.raises(ValueError, match="capacity exceeded"):
+        rows.append(_exact_latent(5), _rope(5))
+
+
 def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
     if not mx.metal.is_available():
         pytest.skip("requires Metal NVFP4 record packer")
@@ -143,8 +179,71 @@ def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
     np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))
 
 
+def test_target_compressed_cache_uses_fixed_stock432_pages() -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal NVFP4 record packer")
+
+    cache = DeepseekV4NVFP4Cache(
+        window_size=128,
+        compress_ratio=4,
+        head_dim=512,
+        capacity_tokens=33,
+    )
+    pages = cache.compressed.pages
+    cache.compressed.append(_exact_latent(5), _rope(5))
+    cache.compressed.append(_exact_latent(2), _rope(2))
+
+    assert isinstance(cache.compressed, PagedMiaNVFP4Rows)
+    assert cache.compressed.capacity == 9
+    assert cache.compressed.pages is pages
+    assert cache.attention_compressed().records is pages
+    assert isinstance(cache.index_compressed, PagedMiaIndexerRows)
+    assert cache.index_compressed.capacity == 9
+
+
+def test_paged_mia_indexer_reads_132_byte_fp8_records_directly() -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal paged indexer")
+
+    row_values = (
+        ((mx.arange(7 * 128, dtype=mx.float32) % 23) - 11) / 9.0
+    ).reshape(1, 7, 128).astype(mx.bfloat16)
+    rows = PagedMiaIndexerRows(capacity_rows=16, block_size=4)
+    pages = rows.pages
+    rows.append(row_values[:, :3])
+    rows.append(row_values[:, 3:])
+
+    query = (
+        ((mx.arange(2 * 64 * 128, dtype=mx.float32) % 29) - 14) / 13.0
+    ).reshape(1, 2, 64, 128).astype(mx.bfloat16)
+    weights = mx.linspace(-0.2, 0.3, 2 * 64).reshape(1, 2, 64)
+    actual = paged_indexer_scores(query, weights, rows.paged_records)
+
+    query_rows = PagedMiaIndexerRows(capacity_rows=128, block_size=64)
+    query_rows.append(query.reshape(1, 2 * 64, 128))
+    quant_query = query_rows.decode().reshape(1, 2, 64, 128)
+    quant_rows = rows.decode()
+    dot = mx.einsum("bshd,btd->bsht", quant_query, quant_rows)
+    expected = mx.sum(mx.maximum(dot, 0.0) * weights[..., None], axis=2)
+    mx.eval(actual, expected)
+
+    assert rows.pages is pages
+    assert rows.paged_records.records is pages
+    assert rows.paged_records.record_bytes == 132
+    np.testing.assert_allclose(
+        np.array(actual),
+        np.array(expected),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
 @pytest.mark.parametrize("query_rows", [1, 6])
-def test_sparse_attention_reads_stock432_records_directly(query_rows: int) -> None:
+@pytest.mark.parametrize("paged_compressed", [False, True])
+def test_sparse_attention_reads_stock432_records_directly(
+    query_rows: int,
+    paged_compressed: bool,
+) -> None:
     if not mx.metal.is_available():
         pytest.skip("requires direct Metal NVFP4 attention")
 
@@ -163,7 +262,11 @@ def test_sparse_attention_reads_stock432_records_directly(query_rows: int) -> No
         latent_values.reshape(1, window_count, 512).astype(mx.bfloat16),
         rope_values.reshape(1, window_count, 64).astype(mx.bfloat16),
     )
-    compressed = MiaNVFP4Rows()
+    compressed = (
+        PagedMiaNVFP4Rows(capacity_rows=32, block_size=8)
+        if paged_compressed
+        else MiaNVFP4Rows()
+    )
     compressed.append(
         (
             ((mx.arange(compressed_count * 512, dtype=mx.float32) % 19) - 9)
@@ -194,7 +297,7 @@ def test_sparse_attention_reads_stock432_records_directly(query_rows: int) -> No
         window.records,
         window_start,
         query_positions,
-        compressed.records,
+        compressed.paged_records if paged_compressed else compressed.records,
         selected,
         lengths,
         sinks,

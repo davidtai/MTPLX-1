@@ -6,6 +6,8 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from mtplx.deepseek_v4_nvfp4_kv import PagedMiaNVFP4Records
+
 
 _HEADS = 64
 _HEAD_DIM = 512
@@ -147,8 +149,18 @@ def _kernel():
                 ? uint(compressed_indices[selected_base + size_t(slot)])
                 : slot;
             if (row < uint(n_compressed_records)) {
+                uint physical_row = row;
+                if (use_paged_compressed != 0) {
+                    uint logical_block = row / uint(compressed_block_size);
+                    uint row_in_block = row - logical_block * uint(compressed_block_size);
+                    uint physical_block = uint(compressed_block_table[logical_block]);
+                    physical_row = physical_block * uint(compressed_block_size)
+                        + row_in_block;
+                } else {
+                    physical_row += uint(compressed_batch);
+                }
                 const device uchar* record = compressed_records
-                    + (compressed_batch + size_t(row)) * size_t(MTPLX_RECORD);
+                    + size_t(physical_row) * size_t(MTPLX_RECORD);
                 mtplx_dsv4_consume(
                     record,
                     query,
@@ -174,6 +186,7 @@ def _kernel():
             "window_start",
             "query_positions",
             "compressed_records",
+            "compressed_block_table",
             "compressed_indices",
             "compressed_lengths",
             "sinks",
@@ -183,6 +196,8 @@ def _kernel():
             "n_compressed_records",
             "selected_width",
             "use_indices",
+            "compressed_block_size",
+            "use_paged_compressed",
         ],
         output_names=["out"],
         header=_HEADER,
@@ -191,12 +206,16 @@ def _kernel():
     )
 
 
-def _run_nvfp4_sparse_mla(
+def _run_nvfp4_sparse_mla_storage(
     queries: mx.array,
     window_records: mx.array,
     window_start: int,
     query_positions: mx.array,
     compressed_records: mx.array | None,
+    compressed_block_table: mx.array,
+    compressed_count: int,
+    compressed_block_size: int,
+    use_paged_compressed: int,
     compressed_indices: mx.array | None,
     compressed_lengths: mx.array | None,
     sinks: mx.array,
@@ -204,20 +223,14 @@ def _run_nvfp4_sparse_mla(
 ) -> mx.array:
     batch, _heads, query_count, _width = (int(value) for value in queries.shape)
     window_count = int(window_records.shape[1])
-    compressed_count = (
-        0 if compressed_records is None else int(compressed_records.shape[1])
-    )
     # MLX assigns zero-sized array inputs to Metal's constant address space.
     # Keep the logical counts at zero, but pass one real device-backed record so
     # the fixed kernel signature is identical for every layer and phase.
     if window_count == 0:
-        if compressed_count:
-            window_records = compressed_records[:, :1]
-        else:
-            window_records = mx.zeros(
-                (batch, 1, _RECORD_BYTES),
-                dtype=mx.uint8,
-            )
+        window_records = mx.zeros(
+            (batch, 1, _RECORD_BYTES),
+            dtype=mx.uint8,
+        )
     if compressed_records is None:
         compressed_records = window_records[:, :1]
     if compressed_indices is None:
@@ -237,6 +250,7 @@ def _run_nvfp4_sparse_mla(
             int(window_start),
             query_positions,
             compressed_records,
+            compressed_block_table,
             compressed_indices,
             compressed_lengths,
             sinks,
@@ -246,6 +260,8 @@ def _run_nvfp4_sparse_mla(
             int(compressed_count),
             int(selected_width),
             int(use_indices),
+            int(compressed_block_size),
+            int(use_paged_compressed),
         ],
         template=[("T", mx.bfloat16)],
         grid=(batch * _HEADS * query_count * _LANES, 1, 1),
@@ -254,6 +270,75 @@ def _run_nvfp4_sparse_mla(
         output_dtypes=[mx.bfloat16],
     )
     return output
+
+
+def _run_nvfp4_sparse_mla(
+    queries: mx.array,
+    window_records: mx.array,
+    window_start: int,
+    query_positions: mx.array,
+    compressed_records: mx.array | None,
+    compressed_indices: mx.array | None,
+    compressed_lengths: mx.array | None,
+    sinks: mx.array,
+    scale: float,
+) -> mx.array:
+    compressed_count = (
+        0 if compressed_records is None else int(compressed_records.shape[1])
+    )
+    return _run_nvfp4_sparse_mla_storage(
+        queries,
+        window_records,
+        window_start,
+        query_positions,
+        compressed_records,
+        mx.zeros((1,), dtype=mx.int32),
+        compressed_count,
+        1,
+        0,
+        compressed_indices,
+        compressed_lengths,
+        sinks,
+        scale,
+    )
+
+
+def _run_paged_nvfp4_sparse_mla(
+    queries: mx.array,
+    window_records: mx.array,
+    window_start: int,
+    query_positions: mx.array,
+    compressed_records: PagedMiaNVFP4Records | None,
+    compressed_indices: mx.array | None,
+    compressed_lengths: mx.array | None,
+    sinks: mx.array,
+    scale: float,
+) -> mx.array:
+    if compressed_records is None:
+        pages = None
+        block_table = mx.zeros((1,), dtype=mx.int32)
+        compressed_count = 0
+        block_size = 1
+    else:
+        pages = compressed_records.records
+        block_table = compressed_records.block_table
+        compressed_count = int(compressed_records.length)
+        block_size = int(compressed_records.block_size)
+    return _run_nvfp4_sparse_mla_storage(
+        queries,
+        window_records,
+        window_start,
+        query_positions,
+        pages,
+        block_table,
+        compressed_count,
+        block_size,
+        1,
+        compressed_indices,
+        compressed_lengths,
+        sinks,
+        scale,
+    )
 
 
 def nvfp4_sparse_mla(
@@ -290,7 +375,15 @@ def nvfp4_sparse_mla(
         raise ValueError("Mia sparse MLA query positions must match query rows")
     if tuple(sinks.shape) != (_HEADS,):
         raise ValueError("Mia sparse MLA sinks must have shape [64]")
-    if compressed_records is not None and (
+    paged_compressed = isinstance(compressed_records, PagedMiaNVFP4Records)
+    if paged_compressed:
+        if (
+            compressed_records.records.dtype != mx.uint8
+            or int(compressed_records.records.shape[-1]) != _RECORD_BYTES
+            or int(compressed_records.block_size) <= 0
+        ):
+            raise ValueError("invalid paged Mia sparse MLA compressed records")
+    elif compressed_records is not None and (
         compressed_records.dtype != mx.uint8
         or tuple(compressed_records.shape[:1]) != (1,)
         or int(compressed_records.shape[-1]) != _RECORD_BYTES
@@ -308,7 +401,8 @@ def nvfp4_sparse_mla(
         query_count,
     ):
         raise ValueError("Mia sparse MLA compressed lengths must be [1, queries]")
-    return _run_nvfp4_sparse_mla(
+    runner = _run_paged_nvfp4_sparse_mla if paged_compressed else _run_nvfp4_sparse_mla
+    return runner(
         queries,
         window_records,
         window_start,
@@ -327,6 +421,7 @@ def install_nvfp4_sparse_mla(
     head_dim: int,
     rope_dim: int,
     window_size: int,
+    paged_compressed: bool = False,
 ):
     """Validate Mia's fixed geometry once and return the direct hot callable."""
     observed = (int(heads), int(head_dim), int(rope_dim), int(window_size))
@@ -338,4 +433,4 @@ def install_nvfp4_sparse_mla(
     if not mx.metal.is_available():
         raise RuntimeError("Mia stock432 sparse MLA installation requires Metal")
     _kernel()
-    return _run_nvfp4_sparse_mla
+    return _run_paged_nvfp4_sparse_mla if paged_compressed else _run_nvfp4_sparse_mla

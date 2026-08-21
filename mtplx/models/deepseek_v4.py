@@ -90,12 +90,10 @@ Status:
     rejection repair serve this backend
     (``mtplx.cache_state.trim_verified_window_without_snapshot``) instead of a
     bespoke snapshot/restore path.
-  * Dropped on purpose: the reference's inference-time QAT emulation (FP8 on the
-    attention compressor's rows, FP4 on the indexer's q and rows).  It is noise
-    injection, not model math — except that in the indexer it perturbs a *discrete*
-    top-k boundary, so selections near the cut can differ from the reference.  The
-    Hadamard rotation that precedes the FP4 step is implemented (it is graph, not
-    noise), and is a no-op for selection on its own; see :class:`Indexer`.
+  * The generic route retains the historical unquantized compressor/indexer oracle.
+    The installed Mia route instead owns attention rows in native 432-byte NVFP4
+    pages and its indexer rows in the image's 132-byte E4M3 compatibility layout;
+    both hot kernels consume physical pages through installed block tables.
   * The MTP draft block (:class:`DeepseekV4MTP`) is implemented and gated against a
     NumPy transcription of the reference ``MTPBlock`` (tests/test_deepseek_v4_mtp.py,
     max_rel ~2e-7 at a shrunk config; nine implementation mutations all caught).
@@ -281,7 +279,11 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.switch_layers import SwiGLU, SwitchGLU
 from mtplx.attention_context import current_attention_phase
-from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows
+from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows, PagedMiaNVFP4Rows
+from mtplx.deepseek_v4_paged_indexer import (
+    PagedMiaIndexerRows,
+    install_paged_indexer_scores,
+)
 from mtplx.kernels.deepseek_v4_nvfp4_mla import install_nvfp4_sparse_mla
 
 
@@ -2093,9 +2095,9 @@ class Compressor(nn.Module):
         fold in the previous window's second half.  Then RMSNorm, rope the tail
         ``rope_head_dim`` dims with the compressor's (YaRN) frequencies.
 
-    NOTE: the reference simulates FP8/FP4 on the pooled KV at inference (``act_quant``
-    /``fp4_act_quant`` in-place).  That QAT noise is intentionally dropped in this clean
-    MLX path; the divergence it introduces is quantified in M3, not hidden here.
+    This component emits normalized rows.  The generic route consumes them directly;
+    the installed Mia cache owners quantize them at insertion to native ``stock432``
+    attention records or 132-byte E4M3 indexer records.
 
     Two entry points share one pooling core (:meth:`_pool`): :meth:`__call__` pools a
     whole sequence from position 0 (the parity-gated path), :meth:`step` pools
@@ -2126,7 +2128,6 @@ class Compressor(nn.Module):
             self.rope_head_dim, args.compress_rope_theta, args.original_seq_len,
             args.rope_factor, args.beta_fast, args.beta_slow,
         )
-
     def _overlap_transform(
         self, t: mx.array, value: float, prev: Optional[mx.array] = None
     ) -> mx.array:
@@ -2347,16 +2348,11 @@ class Indexer(nn.Module):
     directly (``indexer_allowed_decode_one``) and the form used here, because it also
     covers the chunked-prefill case the reference has no branch for.
 
-    QAT: the reference FP4-quantises both ``q`` and the indexer's compressed rows
-    (``fp4_act_quant``, L370/L416).  That emulation is dropped here, consistently with
-    the attention compressor's dropped FP8 (see :class:`Compressor`).  The Hadamard
-    rotation that precedes it *is* kept, because it is part of the model graph — but
-    note it is an orthogonal map applied to both sides of the same dot product, so it
-    cancels exactly; with FP4 dropped it cannot change a selection, and it is retained
-    as the (tested) slot the quantiser would occupy.  ds4.c keeps both
-    (``dsv4_indexer_qat_row_inplace_cpu``) and warns that without the pair "the top-k
-    compressed-row selection is not the model's graph" — the divergence that warning
-    is about is the FP4 step, not the rotation.
+    The generic route keeps its historical full-precision scoring.  The exact Mia
+    route replaces the score callable at installation with the image's padded-cache
+    compatibility contract: Hadamard-rotated queries and K rows are E4M3-quantized
+    with one power-of-two FP32 scale per 128-wide row, K is retained as paged
+    132-byte records, and the score kernel reads those pages through the block table.
     """
 
     def __init__(self, args: ModelArgs, compress_ratio: int):
@@ -2377,6 +2373,18 @@ class Indexer(nn.Module):
         self._inv_freq = _yarn_inv_freq(
             self.rope_head_dim, args.compress_rope_theta, args.original_seq_len,
             args.rope_factor, args.beta_fast, args.beta_slow,
+        )
+        self._score_rows = self._dense_score_rows
+
+    @staticmethod
+    def _dense_score_rows(q: mx.array, weights: mx.array, rows: mx.array) -> mx.array:
+        score = mx.einsum("bshd,btd->bsht", q, rows.astype(mx.float32))
+        return mx.sum(mx.maximum(score, 0.0) * weights[..., None], axis=2)
+
+    def install_mia_paged_scores(self) -> None:
+        self._score_rows = install_paged_indexer_scores(
+            heads=self.n_heads,
+            head_dim=self.head_dim,
         )
 
     def scores(
@@ -2409,8 +2417,7 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x).astype(mx.float32) * (
             self.softmax_scale * self.n_heads ** -0.5
         )                                                        # [b, s, n_heads]
-        score = mx.einsum("bshd,btd->bsht", q, rows.astype(mx.float32))
-        return mx.sum(mx.maximum(score, 0.0) * weights[..., None], axis=2)  # [b,s,t]
+        return self._score_rows(q, weights, rows)
 
     def __call__(
         self, x: mx.array, qr: mx.array, positions: mx.array, rows: mx.array
@@ -2702,6 +2709,11 @@ class DeepseekV4Cache:
             self.index_compressed, compressor.step(x, self.index_comp, self.offset)
         )
 
+    def attention_index_compressed(self):
+        if self.index_compressed is None:
+            raise ValueError("DeepSeek-V4 indexer cache is empty")
+        return self.index_compressed
+
     def advance(self, s: int) -> None:
         self.offset += int(s)
 
@@ -2868,7 +2880,7 @@ class DeepseekV4Cache:
 class DeepseekV4NVFP4Cache(DeepseekV4Cache):
     """DeepSeek V4 streaming cache in Mia's native ``stock432`` K/V format."""
 
-    _META_VERSION = "mtplx-deepseek-v4-nvfp4-stock432-cache-v1"
+    _META_VERSION = "mtplx-deepseek-v4-nvfp4-paged-cache-v2"
 
     def __init__(
         self,
@@ -2876,6 +2888,7 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         compress_ratio: int,
         head_dim: int,
         rollback_capacity: int = _DEFAULT_ROLLBACK_CAPACITY,
+        capacity_tokens: Optional[int] = None,
     ) -> None:
         super().__init__(
             window_size=window_size,
@@ -2886,11 +2899,37 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         if self.head_dim != 512:
             raise ValueError("Mia stock432 target cache requires head_dim=512")
         self.window = MiaNVFP4Rows()
-        self.compressed = MiaNVFP4Rows()
+        if self.compress_ratio:
+            if capacity_tokens is None or int(capacity_tokens) <= 0:
+                raise ValueError(
+                    "Mia compressed stock432 cache requires a positive installed "
+                    "capacity_tokens"
+                )
+            compressed_capacity = (
+                int(capacity_tokens) + self.compress_ratio - 1
+            ) // self.compress_ratio
+            self.compressed = PagedMiaNVFP4Rows(
+                capacity_rows=compressed_capacity,
+                block_size=max(1, 256 // self.compress_ratio),
+            )
+            self.index_compressed = (
+                PagedMiaIndexerRows(
+                    capacity_rows=compressed_capacity,
+                    block_size=64,
+                )
+                if self.compress_ratio == 4
+                else None
+            )
+        else:
+            self.compressed = MiaNVFP4Rows()
 
     @property
     def n_compressed(self) -> int:
         return len(self.compressed)
+
+    @property
+    def n_index_compressed(self) -> int:
+        return 0 if self.index_compressed is None else len(self.index_compressed)
 
     def update_window(self, latent: mx.array, rope: mx.array):
         s = int(latent.shape[1])
@@ -2917,10 +2956,20 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         if latent.shape[1]:
             self.compressed.append(latent, rope)
 
-    def attention_compressed(self) -> mx.array:
-        if self.compressed.records is None:
+    def update_index_compressed(self, compressor: Compressor, x: mx.array) -> None:
+        rows = compressor.step(x, self.index_comp, self.offset)
+        if rows.shape[1]:
+            self.index_compressed.append(rows)
+
+    def attention_index_compressed(self):
+        if self.index_compressed is None or len(self.index_compressed) == 0:
+            raise ValueError("DeepSeek-V4 paged indexer cache is empty")
+        return self.index_compressed.paged_records
+
+    def attention_compressed(self):
+        if len(self.compressed) == 0:
             raise ValueError("DeepSeek-V4 compressed NVFP4 cache is empty")
-        return self.compressed.records
+        return self.compressed.paged_records
 
     def trim(self, n: int) -> int:
         n = int(n)
@@ -2946,10 +2995,7 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
             self.compressed.truncate(n_rows)
             self.comp.rollback(n, new_offset)
             if self.compress_ratio == 4:
-                if self.index_compressed is not None:
-                    self.index_compressed = (
-                        None if n_rows == 0 else self.index_compressed[:, :n_rows]
-                    )
+                self.index_compressed.truncate(n_rows)
                 self.index_comp.rollback(n, new_offset)
         self.offset = new_offset
         return n
@@ -2965,7 +3011,7 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
             self.comp.prev_score,
             self.comp.tail_kv,
             self.comp.tail_score,
-            self.index_compressed,
+            None if self.index_compressed is None else self.index_compressed.state,
             self.index_comp.cur_kv,
             self.index_comp.cur_score,
             self.index_comp.prev_kv,
@@ -2979,7 +3025,8 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         if value is None:
             self.window.clear()
             self.compressed.clear()
-            self.index_compressed = None
+            if self.index_compressed is not None:
+                self.index_compressed.clear()
             self.comp.reset()
             self.index_comp.reset()
             self.offset = 0
@@ -2989,6 +3036,7 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
             raise ValueError("DeepSeek-V4 NVFP4 cache state must contain fifteen entries")
         self.window.replace_state(value[0])
         self.compressed.replace_state(value[1])
+        index_state = value[8]
         (
             self.comp.cur_kv,
             self.comp.cur_score,
@@ -2996,7 +3044,7 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
             self.comp.prev_score,
             self.comp.tail_kv,
             self.comp.tail_score,
-            self.index_compressed,
+            _index_state,
             self.index_comp.cur_kv,
             self.index_comp.cur_score,
             self.index_comp.prev_kv,
@@ -3004,6 +3052,8 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
             self.index_comp.tail_kv,
             self.index_comp.tail_score,
         ) = value[2:]
+        if self.index_compressed is not None:
+            self.index_compressed.replace_state(index_state)
 
 
 # ---------------------------------------------------------------------------
@@ -3233,7 +3283,10 @@ class DeepseekV4Attention(nn.Module):
             head_dim=self.head_dim,
             rope_dim=self.rope_head_dim,
             window_size=self.window_size,
+            paged_compressed=bool(self.compress_ratio),
         )
+        if self.compress_ratio == 4:
+            self.indexer.install_mia_paged_scores()
         self._cached_attention_impl = self._mia_cached_attention
         self._cached_mask_impl = self._no_additive_mask
         self._finalize_attention_impl = self._inverse_rope_output
@@ -3579,7 +3632,12 @@ class DeepseekV4Attention(nn.Module):
                     "indexer compressor lane desynced from the attention lane: "
                     f"{cache.n_index_compressed} vs {n_comp}"
                 )
-                comp_sel = self.indexer(x, qr, positions, cache.index_compressed)
+                comp_sel = self.indexer(
+                    x,
+                    qr,
+                    positions,
+                    cache.attention_index_compressed(),
+                )
             # s == 1: update_window already dropped every row outside the query's
             # window, so that half needs no mask (the compressed half still does once
             # the indexer is filtering).
@@ -4362,15 +4420,23 @@ class Model(nn.Module):
             self._has_generic_mtp = False
         return weights
 
-    def make_cache(self):
+    def make_cache(self, *, capacity_tokens: Optional[int] = None):
         """One :class:`DeepseekV4Cache` per layer (sliding-window KV + compressed KV
         + compressor frontier).  Shapes come off the built attention modules so the
         cache cannot drift from the layer's own compress ratio."""
+        if capacity_tokens is None and self._target_cache_type is DeepseekV4NVFP4Cache:
+            configured = int(os.environ.get("MTPLX_CONTEXT_WINDOW_TOKENS", "0") or 0)
+            capacity_tokens = configured or None
         return [
             self._target_cache_type(
                 window_size=layer.attn.window_size,
                 compress_ratio=layer.attn.compress_ratio,
                 head_dim=layer.attn.head_dim,
+                **(
+                    {"capacity_tokens": capacity_tokens}
+                    if self._target_cache_type is DeepseekV4NVFP4Cache
+                    else {}
+                ),
             )
             for layer in self.layers
         ]
