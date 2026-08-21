@@ -120,6 +120,7 @@ def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
     assert capabilities.supports_kv_trim is True
     assert capabilities.supports_target_hidden_capture is True
     assert capabilities.supports_prefix_snapshot is False
+    assert capabilities.supports_chunked_prefill is True
     assert capabilities.supports_tree_verify is False
 
 

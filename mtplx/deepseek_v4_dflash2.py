@@ -63,6 +63,7 @@ class DeepseekV4TargetOps:
             supports_verify_linear=True,
             supports_full_context_draft_layers=False,
             supports_tree_verify=False,
+            supports_chunked_prefill=True,
         )
 
     def supports_tree_cache(self, cache_entries: list[Any]) -> bool:
