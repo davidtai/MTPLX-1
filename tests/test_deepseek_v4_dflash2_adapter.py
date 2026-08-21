@@ -420,15 +420,112 @@ def test_generation_adapter_translates_existing_dflash_events_without_scheduling
     assert stats.mode == "dspark"
     assert stats.generated_tokens == 2
     assert stats.accepted_drafts == 1
-    assert stats.drafted_tokens == 5
-    assert stats.rejected_drafts == 4
+    assert stats.drafted_tokens == 1
+    assert stats.rejected_drafts == 0
     assert stats.verify_calls == 1
     assert stats.speculative_depth == 5
     assert stats.decode_elapsed_s == pytest.approx(0.009)
     assert stats.decode_tok_s == pytest.approx(2 / 0.009)
-    assert stats.peak_memory_bytes == 2 * 1024**3
+    assert stats.peak_memory_bytes == 2_000_000_000
     assert stats.events == [summary.to_payload()]
     assert len(calls) == 1
     assert calls[0]["block_tokens"] == 6
     assert calls[0]["prompt_tokens_override"] == [1, 2, 3]
     assert calls[0]["quantize_kv_cache"] is False
+
+
+def test_generation_adapter_stops_at_first_stop_token_and_suppresses_suffix(
+    monkeypatch,
+) -> None:
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+    import mtplx.deepseek_v4_dflash2 as adapter_module
+
+    summary = SummaryEvent(
+        elapsed_us=10_000.0,
+        prompt_token_count=3,
+        generated_token_ids=(11, 12, 13),
+        generation_tokens=3,
+        accepted_from_draft=2,
+        acceptance_ratio=2 / 3,
+        cycles_completed=1,
+        phase_timings_us={"prefill": 1_000.0},
+        block_tokens=6,
+        verify_len_cap=6,
+        acceptance_history=(2,),
+        peak_memory_gb=2.0,
+    )
+    events = [
+        TokenEvent(11, 1, 0.0, 0),
+        TokenEvent(12, 2, 0.5, 1),
+        TokenEvent(13, 3, 2 / 3, 1),
+        summary,
+    ]
+    monkeypatch.setattr(
+        adapter_module,
+        "_stream_dflash_generate",
+        lambda **_kwargs: iter(events),
+    )
+    callback_tokens = []
+    bundle = SimpleNamespace(
+        target_model=object(),
+        target_ops=object(),
+        tokenizer=SimpleNamespace(decode=lambda values: f"decoded:{values}"),
+        draft_model=object(),
+        draft_backend=object(),
+    )
+
+    output = generate_deepseek_v4_dflash2(
+        bundle,
+        [1, 2, 3],
+        max_tokens=3,
+        stop_token_ids=[12],
+        token_callback=callback_tokens.append,
+        runtime_context=object(),
+    )
+
+    assert output.tokens == [11]
+    assert output.text == "decoded:[11]"
+    assert callback_tokens == [[11]]
+    assert output.finish_reason == "stop"
+
+
+def test_generation_adapter_accounts_for_each_physical_tail_width(monkeypatch) -> None:
+    from dflash_mlx.engine.events import SummaryEvent
+    import mtplx.deepseek_v4_dflash2 as adapter_module
+
+    summary = SummaryEvent(
+        elapsed_us=10_000.0,
+        prompt_token_count=3,
+        generated_token_ids=tuple(range(7)),
+        generation_tokens=7,
+        accepted_from_draft=4,
+        acceptance_ratio=4 / 7,
+        cycles_completed=3,
+        phase_timings_us={"prefill": 1_000.0},
+        block_tokens=6,
+        verify_len_cap=6,
+        acceptance_history=(2, 2, 0),
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_stream_dflash_generate",
+        lambda **_kwargs: iter([summary]),
+    )
+    bundle = SimpleNamespace(
+        target_model=object(),
+        target_ops=object(),
+        tokenizer=SimpleNamespace(decode=lambda values: str(values)),
+        draft_model=object(),
+        draft_backend=object(),
+    )
+
+    output = generate_deepseek_v4_dflash2(
+        bundle,
+        [1, 2, 3],
+        max_tokens=7,
+        runtime_context=object(),
+    )
+
+    assert output.stats.drafted_tokens == 8
+    assert output.stats.rejected_drafts == 4
+    assert output.stats.drafted_by_depth == [2, 2, 2, 1, 1]

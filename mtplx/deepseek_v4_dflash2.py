@@ -431,6 +431,7 @@ def generate_deepseek_v4_dflash2(
     )
     stop_set = set(resolved_stop_ids)
     summary = None
+    stop_seen = False
     for event in _stream_dflash_generate(
         target_model=bundle.target_model,
         target_ops=bundle.target_ops,
@@ -448,7 +449,9 @@ def generate_deepseek_v4_dflash2(
     ):
         if isinstance(event, TokenEvent):
             token_id = int(event.token_id)
-            if token_callback is not None and token_id not in stop_set:
+            if token_id in stop_set:
+                stop_seen = True
+            elif token_callback is not None and not stop_seen:
                 token_callback([token_id])
         elif isinstance(event, SummaryEvent):
             if summary is not None:
@@ -465,9 +468,12 @@ def generate_deepseek_v4_dflash2(
     if int(summary.block_tokens or 0) != _PHYSICAL_VERIFY_WIDTH:
         raise RuntimeError("DeepSeek V4 DFlash2 did not execute physical M6")
 
-    tokens = [int(value) for value in summary.generated_token_ids]
-    while tokens and tokens[-1] in stop_set:
-        tokens.pop()
+    physical_tokens = [int(value) for value in summary.generated_token_ids]
+    first_stop = next(
+        (index for index, token_id in enumerate(physical_tokens) if token_id in stop_set),
+        None,
+    )
+    tokens = physical_tokens if first_stop is None else physical_tokens[:first_stop]
     elapsed_s = float(summary.elapsed_us) / 1_000_000.0
     prompt_s = float(summary.phase_timings_us.get("prefill", 0.0)) / 1_000_000.0
     decode_s = max(0.0, elapsed_s - prompt_s)
@@ -478,7 +484,18 @@ def generate_deepseek_v4_dflash2(
         for depth in range(1, _PHYSICAL_VERIFY_WIDTH)
     ]
     accepted = int(summary.accepted_from_draft)
-    drafted = cycles * (_PHYSICAL_VERIFY_WIDTH - 1)
+    generated_before_cycle = 0
+    drafted_per_cycle = []
+    for acceptance_len in acceptance_history:
+        remaining = max(0, int(max_tokens) - generated_before_cycle)
+        verify_width = min(_PHYSICAL_VERIFY_WIDTH, remaining)
+        drafted_per_cycle.append(max(0, verify_width - 1))
+        generated_before_cycle += min(remaining, 1 + acceptance_len)
+    drafted = sum(drafted_per_cycle)
+    drafted_by_depth = [
+        sum(1 for draft_count in drafted_per_cycle if draft_count >= depth)
+        for depth in range(1, _PHYSICAL_VERIFY_WIDTH)
+    ]
     generated = len(tokens)
     stats = GenerationStats(
         mode="dspark",
@@ -507,11 +524,11 @@ def generate_deepseek_v4_dflash2(
             (summary.cycle_profile_totals_us or {}).get("rollback", 0.0)
         )
         / 1_000_000.0,
-        peak_memory_bytes=int(float(summary.peak_memory_gb or 0.0) * 1024**3),
+        peak_memory_bytes=int(float(summary.peak_memory_gb or 0.0) * 1_000_000_000),
         speculative_depth=_PHYSICAL_VERIFY_WIDTH - 1,
         requested_speculative_depth=_PHYSICAL_VERIFY_WIDTH - 1,
         accepted_by_depth=accepted_by_depth,
-        drafted_by_depth=[cycles] * (_PHYSICAL_VERIFY_WIDTH - 1),
+        drafted_by_depth=drafted_by_depth,
         verify_calls=cycles,
         verify_hidden_mode="dflash2_deepseek_taps_40_41_42",
         events=[summary.to_payload()],
@@ -521,5 +538,5 @@ def generate_deepseek_v4_dflash2(
         text=bundle.tokenizer.decode(tokens),
         stats=stats,
         final_state=None,
-        finish_reason="stop" if len(tokens) < int(summary.generation_tokens) else "length",
+        finish_reason="stop" if first_stop is not None else "length",
     )

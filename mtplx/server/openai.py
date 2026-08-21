@@ -231,11 +231,6 @@ try:
         restore_or_prefill_prompt_state,
         score_prompt_logprobs,
     )
-    from mtplx.deepseek_v4_dflash2 import generate_deepseek_v4_dflash2
-    from mtplx.benchmarks.dflash2_runtime import (
-        bind_mtplx_deepseek_v4_dflash2_bundle,
-        build_deepseek_v4_dflash2_runtime_context,
-    )
     from mtplx.native_mlp import native_mlp_stats
     from mtplx.thinking_guard import (
         think_marker_ids,
@@ -263,9 +258,6 @@ except Exception as exc:
 
     generate_ar = _missing_runtime
     generate_mtpk = _missing_runtime
-    generate_deepseek_v4_dflash2 = _missing_runtime
-    bind_mtplx_deepseek_v4_dflash2_bundle = _missing_runtime
-    build_deepseek_v4_dflash2_runtime_context = _missing_runtime
     score_prompt_logprobs = _missing_runtime
     think_marker_ids = _missing_runtime
     thinking_guard_config_from_env = _missing_runtime
@@ -309,6 +301,34 @@ except Exception as exc:
         NEW_SESSION = "new_session"
         SESSION_BUSY = "session_busy"
         BACKGROUND_BYPASS = "background_bypass"
+
+
+def generate_deepseek_v4_dflash2(*args: Any, **kwargs: Any) -> Any:
+    """Import the optional DFlash2 lane only when DSpark is selected."""
+
+    from mtplx.deepseek_v4_dflash2 import generate_deepseek_v4_dflash2 as generate
+
+    return generate(*args, **kwargs)
+
+
+def bind_mtplx_deepseek_v4_dflash2_bundle(*args: Any, **kwargs: Any) -> Any:
+    """Bind the optional DFlash2 lane only during DSpark startup."""
+
+    from mtplx.benchmarks.dflash2_runtime import (
+        bind_mtplx_deepseek_v4_dflash2_bundle as bind,
+    )
+
+    return bind(*args, **kwargs)
+
+
+def build_deepseek_v4_dflash2_runtime_context() -> Any:
+    """Construct the optional DFlash2 context only during DSpark startup."""
+
+    from mtplx.benchmarks.dflash2_runtime import (
+        build_deepseek_v4_dflash2_runtime_context as build,
+    )
+
+    return build()
 
 
 FAST_PATH_ENV = {
