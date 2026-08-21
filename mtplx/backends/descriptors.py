@@ -722,6 +722,68 @@ DEEPSEEK_MTP_DESCRIPTOR = BackendDescriptor(
 )
 
 
+DEEPSEEK_V4_DSPARK_DESCRIPTOR = replace(
+    DEEPSEEK_MTP_DESCRIPTOR,
+    backend_id="deepseek_v4_dspark",
+    architecture_id="deepseek-v4-dspark-dflash2",
+    display_name="DeepSeek V4 DSpark through DFlash2",
+    runtime_capabilities=(
+        "target_logits",
+        "dspark_k5",
+        "dflash2_scheduler",
+        "affine_int4_target_kv",
+        "affine_int4_dspark_kv",
+        "fp32_exact_speculative_sampling",
+        "bf16_wide_numerics_reported",
+    ),
+    sampler_defaults=SamplerDefaults(temperature=0.0, top_p=1.0, top_k=0),
+    reasoning_codec=ReasoningCodec(
+        parser="none",
+        display_name="No verified reasoning parser",
+        default_mode="off",
+        supported=False,
+        modes=(),
+        history_policy="visible_content_only",
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="DSpark future tokens",
+        default=5,
+        minimum=5,
+        maximum=5,
+        unit="depth",
+    ),
+    uses_draft_lm_head=False,
+    hidden_variant="target_taps_40_41_42",
+    mtp_history_policy="cycle",
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="DSpark Phase 1 owns one fixed DFlash2 K5 lane.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason=(
+            "DSpark owns affine-int4 group-64 target and draft K/V from offset zero."
+        ),
+    ),
+    context_window_policy=ContextWindowPolicy(
+        maximum=1_048_576,
+        default=262_144,
+        source="deepseek_v4_config",
+    ),
+    required_chat_template_profile="tokenizer",
+    allows_chat_template_path=False,
+    validation_status="real_checkpoint_guarded",
+    status="real_checkpoint_guarded",
+    profile_policy="backend-aware-sustained",
+    notes=(
+        "The existing DFlash2 scheduler owns verification and acceptance.",
+        "Target and all three DSpark caches are affine int4 group 64 from offset zero.",
+        "Default bf16 wide-forward divergence is reported; the fp32 causality gate is exact.",
+    ),
+)
+
+
 GLM_MTP_DESCRIPTOR = BackendDescriptor(
     backend_id="glm_mtp",
     architecture_id="glm4-moe-mtp",
@@ -912,6 +974,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
+    DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id: DEEPSEEK_V4_DSPARK_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
     HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
     "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
@@ -1091,6 +1154,8 @@ def tune_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.tune_policy
     if family in {"qwen3_5", "qwen3_6"}:
         return TunePolicy(supported=True)
     if family == "qwen3_8":
@@ -1123,6 +1188,8 @@ def kv_quant_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.kv_quant_policy
     if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         return QWEN3_NEXT_DESCRIPTOR.kv_quant_policy
     if family == "gemma4":
@@ -1167,6 +1234,10 @@ def context_window_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.context_window_policy.with_resolved_max(
+            _context_window_from_inspection(inspection)
+        )
     if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         base = QWEN3_NEXT_DESCRIPTOR.context_window_policy
     elif family == "gemma4":
@@ -1193,6 +1264,8 @@ def reasoning_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.reasoning_codec
     if family == "qwen3_8":
         return QWEN3_8_REASONING_CODEC
     if family in {"qwen3_5", "qwen3_6"}:

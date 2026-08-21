@@ -88,6 +88,7 @@ class MTPLXRuntime:
     model_path: Path
     mtp_enabled: bool
     contract: MTPContract
+    backend_id: str | None = None
     mtp_adapter_path: Path | None = None
     mtp_adapter_metadata: dict[str, Any] | None = None
     mtp_adapter_merge_report: dict[str, Any] | None = None
@@ -944,6 +945,7 @@ def load(
         path,
         mtp_enabled,
         contract,
+        backend_id="deepseek_v4_dspark" if dspark else None,
         mtp_adapter_path=adapter_path,
         mtp_adapter_metadata=adapter_metadata,
         mtp_adapter_merge_report=adapter_merge_report,

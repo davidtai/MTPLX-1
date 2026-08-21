@@ -1366,6 +1366,15 @@ def _health_runtime_mode_label(
     return mode
 
 
+def _available_generation_modes(state: "ServerState") -> list[str]:
+    if (
+        getattr(state.args, "generation_mode", None) == "dspark"
+        and getattr(state, "deepseek_v4_dflash2_bundle", None) is not None
+    ):
+        return ["dspark", "ar"]
+    return ["mtp", "ar"]
+
+
 def _kernel_selfcheck_health_payload() -> dict[str, Any]:
     """Per-lane turbo kernel selfcheck verdicts (JSON primitives only)."""
     try:
@@ -24765,7 +24774,7 @@ def create_app(state: ServerState) -> FastAPI:
                 fan_mode=fan_mode,
                 smart_status=smart_status,
             ),
-            "available_generation_modes": ["mtp", "ar"],
+            "available_generation_modes": _available_generation_modes(state),
             "load_mtp": bool(state.args.load_mtp),
             "mtp_enabled": bool(
                 getattr(runtime, "mtp_enabled", False)
@@ -30981,6 +30990,16 @@ def _apply_backend_server_defaults(
     *,
     explicit_flags: set[str],
 ) -> None:
+    if getattr(args, "generation_mode", None) == "dspark":
+        requested_backend = str(getattr(args, "backend_id", "") or "")
+        if (
+            _server_flag_present(explicit_flags, "backend-id")
+            and requested_backend != "deepseek_v4_dspark"
+        ):
+            raise ValueError(
+                "--generation-mode dspark requires the DeepSeek V4 DSpark backend"
+            )
+        args.backend_id = "deepseek_v4_dspark"
     if not _server_flag_present(
         explicit_flags, "backend-id"
     ) and _model_ref_is_gemma4_pair(getattr(args, "model", None)):
@@ -31052,6 +31071,35 @@ def _apply_backend_server_defaults(
         and backend.reasoning_codec.default_effort
     ):
         args.reasoning_effort = backend.reasoning_codec.default_effort
+    if backend.backend_id == "deepseek_v4_dspark":
+        if not _server_flag_present(explicit_flags, "model-id"):
+            args.model_id = "deepseek-v4-dspark-dflash2"
+        if not _server_flag_present(
+            explicit_flags, "temperature", "default-temperature"
+        ):
+            args.temperature = 0.0
+        if not _server_flag_present(explicit_flags, "top-p", "default-top-p"):
+            args.top_p = 1.0
+        if not _server_flag_present(explicit_flags, "top-k"):
+            args.top_k = 0
+        if not _server_flag_present(
+            explicit_flags,
+            "depth",
+            "mtp-depth",
+            "speculative-depth",
+        ):
+            args.depth = 5
+        if not _server_flag_present(
+            explicit_flags,
+            "reasoning",
+            "reasoning-mode",
+            "enable-thinking",
+            "no-enable-thinking",
+        ):
+            args.reasoning = "off"
+            args.reasoning_mode = "off"
+            args.enable_thinking = False
+        return
     if backend.backend_id != GEMMA4_BACKEND:
         return
 

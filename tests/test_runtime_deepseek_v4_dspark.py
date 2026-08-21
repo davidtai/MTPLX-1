@@ -73,6 +73,7 @@ def test_explicit_load_qualifies_dspark_without_installing_a_second_runtime(
     assert events[:2] == ["artifact", "model"]
     assert loaded.model is model
     assert loaded.mtp_enabled is False
+    assert loaded.backend_id == "deepseek_v4_dspark"
     assert not hasattr(loaded, "deepseek_v4_dspark_runtime")
 
 
@@ -97,6 +98,52 @@ def test_server_parser_accepts_explicit_fixed_dspark_route() -> None:
     assert args.generation_mode == "dspark"
     assert args.depth == 5
     assert args.temperature == 0.0
+
+
+def test_server_parser_selects_dspark_backend_defaults_at_construction() -> None:
+    from mtplx.server.openai import parse_args
+
+    args = parse_args(
+        [
+            "--model",
+            "/tmp/dspark-model",
+            "--generation-mode",
+            "dspark",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    assert args.backend_id == "deepseek_v4_dspark"
+    assert args.model_id == "deepseek-v4-dspark-dflash2"
+    assert args.depth == 5
+    assert args.temperature == 0.0
+    assert args.top_p == 1.0
+    assert args.top_k == 0
+    assert args.chat_template_profile == "tokenizer"
+    assert args.reasoning_parser == "none"
+    assert args.reasoning == "off"
+    assert args.enable_thinking is False
+
+
+def test_dspark_descriptor_and_health_modes_report_the_installed_lane() -> None:
+    from mtplx.backends.descriptors import descriptor_for_backend_id
+    from mtplx.server.openai import _available_generation_modes
+
+    descriptor = descriptor_for_backend_id("deepseek_v4_dspark")
+    assert descriptor.model_family == "deepseek"
+    assert descriptor.uses_draft_lm_head is False
+    assert descriptor.draft_semantics.minimum == 5
+    assert descriptor.draft_semantics.maximum == 5
+    assert descriptor.required_chat_template_profile == "tokenizer"
+    assert descriptor.reasoning_codec.supported is False
+
+    state = SimpleNamespace(
+        args=SimpleNamespace(generation_mode="dspark"),
+        runtime=SimpleNamespace(mtp_enabled=False),
+        deepseek_v4_dflash2_bundle=object(),
+    )
+    assert _available_generation_modes(state) == ["dspark", "ar"]
 
 
 def test_server_dspark_route_requires_the_bound_dflash2_bundle() -> None:
