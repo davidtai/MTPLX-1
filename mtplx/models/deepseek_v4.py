@@ -3926,12 +3926,17 @@ class Model(nn.Module):
           * ``ffn.switch_mlp.*`` ships pre-stacked (already ``[n_experts, ...]``) with
             mxfp4 scales and no biases — feed straight into ``SwitchGLU``'s quantised
             path (mode override supplied via config["quantization"]).
-          * ``attn.wo_a`` is a single ``[g*r, per]`` matrix; the grouped einsum in
-            ``_o_lora`` consumes it as-is (reshaped to ``[g, r, per]``) — no split
-            needed once quantised grouped matmul is wired.
           * ``ffn.gate.tid2eid`` (hash layers) loads as int32.
 
-        The one real adaptation is the MTP block.  ``num_nextn_predict_layers`` is
+        ``attn.wo_a`` is logically one ``[g*r, per]`` matrix, but the DSpark
+        conversion preserves its leading output groups on disk as
+        ``[g, r, packed_per]`` (and likewise for scales/biases).  MLX's
+        ``QuantizedLinear`` owns the equivalent flattened output dimension, so
+        collapse those two leading axes once at load.  This changes only the
+        storage view; :meth:`_wo_a_grouped` restores ``[g, r, per]`` before the
+        exact grouped einsum.
+
+        The other real adaptation is the MTP block.  ``num_nextn_predict_layers`` is
         not trustworthy on its own: the published MLX conversions declare 1 while
         shipping no ``mtp.*`` tensor at all (which is what
         ``mtplx.artifacts.mtp_weights_present_on_disk`` and the runtime's
@@ -3941,6 +3946,16 @@ class Model(nn.Module):
         ``load_weights(strict=True)`` still sees an exact match instead of 58
         spurious "missing" keys.
         """
+        for name, value in tuple(weights.items()):
+            if (
+                ".attn.wo_a." in str(name)
+                and getattr(value, "ndim", 0) == 3
+            ):
+                weights[name] = value.reshape(
+                    int(value.shape[0]) * int(value.shape[1]),
+                    int(value.shape[2]),
+                )
+
         mtp_weights_present = any(str(k).startswith("mtp.") for k in weights)
         if self.dspark is not None and not mtp_weights_present:
             raise ValueError("the installed DSpark owner requires mtp.0/1/2 weights")

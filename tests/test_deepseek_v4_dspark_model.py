@@ -226,3 +226,22 @@ def test_dspark_signature_installs_tap_route_and_affine_target_cache(monkeypatch
             "dspark_target_layer_ids": [40, 41, 42],
         }
     ) is False
+
+
+def test_sanitize_flattens_real_dspark_grouped_o_lora_storage() -> None:
+    model = SimpleNamespace(dspark=SimpleNamespace())
+    grouped = mx.zeros((8, 1024, 768), dtype=mx.uint32)
+    grouped_scales = mx.zeros((8, 1024, 32), dtype=mx.bfloat16)
+    weights = {
+        "model.layers.0.attn.wo_a.weight": grouped,
+        "model.layers.0.attn.wo_a.scales": grouped_scales,
+        "model.layers.0.attn.wo_a.biases": grouped_scales,
+        "mtp.0.attn.wo_a.weight": grouped,
+    }
+
+    sanitized = Model.sanitize(model, weights)
+
+    assert sanitized["model.layers.0.attn.wo_a.weight"].shape == (8192, 768)
+    assert sanitized["model.layers.0.attn.wo_a.scales"].shape == (8192, 32)
+    assert sanitized["model.layers.0.attn.wo_a.biases"].shape == (8192, 32)
+    assert sanitized["mtp.0.attn.wo_a.weight"].shape == (8192, 768)
