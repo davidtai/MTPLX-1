@@ -6,10 +6,16 @@ import pytest
 pytest.importorskip("mlx.core")
 import mlx.core as mx  # noqa: E402
 
+from mtplx.benchmarks.dflash2_runtime import (  # noqa: E402
+    MTPLXDFlash2Bundle,
+    build_deepseek_v4_dflash2_runtime_context,
+    load_mtplx_deepseek_v4_dflash2_bundle,
+)
 from mtplx.deepseek_v4_dflash2 import (  # noqa: E402
     DeepseekV4DSparkBackend,
     DeepseekV4DSparkDraftAdapter,
     DeepseekV4TargetOps,
+    generate_deepseek_v4_dflash2,
 )
 from mtplx.models.deepseek_v4 import DeepseekV4AffineInt4Cache  # noqa: E402
 from mtplx.models.deepseek_v4_dspark import DeepseekV4DSparkCache  # noqa: E402
@@ -261,3 +267,140 @@ def test_draft_backend_appends_committed_context_once_and_returns_five_tokens() 
     assert [cache.prefill_length for cache in caches] == [6, 6, 6]
     assert all(cache.ring.bits == 4 for cache in caches)
     assert all(cache.ring.group_size == 64 for cache in caches)
+
+
+def test_deepseek_bundle_reuses_mtplx_target_and_dflash2_engine_types(
+    monkeypatch,
+) -> None:
+    from mtplx.benchmarks import dflash2_runtime
+
+    target, _owner = _fake_dspark_target()
+    target.args.model_type = "deepseek_v4"
+    target.make_cache = lambda: [
+        DeepseekV4AffineInt4Cache(
+            window_size=128,
+            compress_ratio=0,
+            head_dim=512,
+        )
+    ]
+    tokenizer = object()
+    runtime = SimpleNamespace(model=target, tokenizer=tokenizer)
+    calls = []
+    monkeypatch.setattr(
+        dflash2_runtime,
+        "load_mtplx_deepseek_runtime",
+        lambda path: calls.append(path) or runtime,
+    )
+
+    bundle = load_mtplx_deepseek_v4_dflash2_bundle("/models/deepseek-v4")
+
+    assert isinstance(bundle, MTPLXDFlash2Bundle)
+    assert bundle.runtime is runtime
+    assert bundle.target_model is target
+    assert bundle.tokenizer is tokenizer
+    assert isinstance(bundle.target_ops, DeepseekV4TargetOps)
+    assert isinstance(bundle.draft_model, DeepseekV4DSparkDraftAdapter)
+    assert isinstance(bundle.draft_backend, DeepseekV4DSparkBackend)
+    assert bundle.checkpoint_block_size == 6
+    assert bundle.target_layer_ids == (40, 41, 42)
+    assert bundle.draft_meta["kind"] == "deepseek_v4_dspark"
+    assert calls == ["/models/deepseek-v4"]
+
+
+def test_deepseek_bundle_loader_selects_dspark_at_construction(monkeypatch) -> None:
+    from mtplx import runtime as runtime_module
+    from mtplx.benchmarks import dflash2_runtime
+
+    loaded = object()
+    calls = []
+
+    def fake_load(model_path, *, mtp, dspark):
+        calls.append((model_path, mtp, dspark))
+        return loaded
+
+    monkeypatch.setattr(runtime_module, "load", fake_load)
+
+    assert dflash2_runtime.load_mtplx_deepseek_runtime("model") is loaded
+    assert calls == [("model", True, True)]
+
+
+def test_deepseek_runtime_context_fixes_dflash_m6_without_generic_kv_quantizer() -> None:
+    context = build_deepseek_v4_dflash2_runtime_context()
+
+    assert context.runtime.verify_mode == "dflash"
+    assert context.runtime.verify_len_cap == 6
+    assert context.runtime.copyspec_mode == "off"
+    assert context.runtime.quantize_kv_cache is False
+    assert context.runtime.prefix_cache is False
+    assert context.runtime.dflash_max_ctx == 0
+
+
+def test_generation_adapter_translates_existing_dflash_events_without_scheduling(
+    monkeypatch,
+) -> None:
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+    import mtplx.deepseek_v4_dflash2 as adapter_module
+
+    summary = SummaryEvent(
+        elapsed_us=10_000.0,
+        prompt_token_count=3,
+        generated_token_ids=(11, 12),
+        generation_tokens=2,
+        accepted_from_draft=1,
+        acceptance_ratio=0.5,
+        cycles_completed=1,
+        phase_timings_us={"prefill": 1_000.0},
+        block_tokens=6,
+        verify_len_cap=6,
+        acceptance_history=(1,),
+        peak_memory_gb=2.0,
+    )
+    events = [
+        TokenEvent(11, 1, 0.0, 0),
+        TokenEvent(12, 2, 0.5, 1),
+        summary,
+    ]
+    calls = []
+
+    def fake_stream(**kwargs):
+        calls.append(kwargs)
+        return iter(events)
+
+    monkeypatch.setattr(adapter_module, "_stream_dflash_generate", fake_stream)
+    callback_tokens = []
+    bundle = SimpleNamespace(
+        target_model=object(),
+        target_ops=object(),
+        tokenizer=SimpleNamespace(decode=lambda values: f"decoded:{values}"),
+        draft_model=object(),
+        draft_backend=object(),
+    )
+
+    output = generate_deepseek_v4_dflash2(
+        bundle,
+        [1, 2, 3],
+        max_tokens=2,
+        token_callback=callback_tokens.append,
+        runtime_context=object(),
+    )
+
+    assert output.tokens == [11, 12]
+    assert output.text == "decoded:[11, 12]"
+    assert callback_tokens == [[11], [12]]
+    assert output.final_state is None
+    stats = output.stats
+    assert stats.mode == "dspark"
+    assert stats.generated_tokens == 2
+    assert stats.accepted_drafts == 1
+    assert stats.drafted_tokens == 5
+    assert stats.rejected_drafts == 4
+    assert stats.verify_calls == 1
+    assert stats.speculative_depth == 5
+    assert stats.decode_elapsed_s == pytest.approx(0.009)
+    assert stats.decode_tok_s == pytest.approx(2 / 0.009)
+    assert stats.peak_memory_bytes == 2 * 1024**3
+    assert stats.events == [summary.to_payload()]
+    assert len(calls) == 1
+    assert calls[0]["block_tokens"] == 6
+    assert calls[0]["prompt_tokens_override"] == [1, 2, 3]
+    assert calls[0]["quantize_kv_cache"] is False

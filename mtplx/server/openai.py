@@ -231,7 +231,11 @@ try:
         restore_or_prefill_prompt_state,
         score_prompt_logprobs,
     )
-    from mtplx.deepseek_v4_dspark_generation import generate_dspark
+    from mtplx.deepseek_v4_dflash2 import generate_deepseek_v4_dflash2
+    from mtplx.benchmarks.dflash2_runtime import (
+        bind_mtplx_deepseek_v4_dflash2_bundle,
+        build_deepseek_v4_dflash2_runtime_context,
+    )
     from mtplx.native_mlp import native_mlp_stats
     from mtplx.thinking_guard import (
         think_marker_ids,
@@ -259,7 +263,9 @@ except Exception as exc:
 
     generate_ar = _missing_runtime
     generate_mtpk = _missing_runtime
-    generate_dspark = _missing_runtime
+    generate_deepseek_v4_dflash2 = _missing_runtime
+    bind_mtplx_deepseek_v4_dflash2_bundle = _missing_runtime
+    build_deepseek_v4_dflash2_runtime_context = _missing_runtime
     score_prompt_logprobs = _missing_runtime
     think_marker_ids = _missing_runtime
     thinking_guard_config_from_env = _missing_runtime
@@ -2108,6 +2114,18 @@ class ServerState:
             load_heartbeat.set()
         self.load_time_s = time.perf_counter() - started
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
+        self.deepseek_v4_dflash2_bundle = None
+        self.deepseek_v4_dflash2_runtime_context = None
+        if args.generation_mode == "dspark":
+            self.deepseek_v4_dflash2_bundle = self.model_scheduler.submit_foreground(
+                bind_mtplx_deepseek_v4_dflash2_bundle,
+                self.runtime,
+                source=str(args.model),
+                batch_key="startup.deepseek_v4_dflash2",
+            ).result()
+            self.deepseek_v4_dflash2_runtime_context = (
+                build_deepseek_v4_dflash2_runtime_context()
+            )
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
         if self.backend_descriptor.uses_draft_lm_head:
@@ -12781,13 +12799,16 @@ def _request_generation_mode_for_generation(
             detail="generation_mode 'mtp' requires a runtime loaded with MTP",
         )
     if mode == "dspark" and getattr(
-        state.runtime,
-        "deepseek_v4_dspark_runtime",
+        state,
+        "deepseek_v4_dflash2_bundle",
         None,
     ) is None:
         raise HTTPException(
             status_code=400,
-            detail="generation_mode 'dspark' requires a DSpark-qualified runtime",
+            detail=(
+                "generation_mode 'dspark' requires a DFlash2-qualified "
+                "DeepSeek runtime"
+            ),
         )
     return mode
 
@@ -20286,11 +20307,12 @@ def _run_generation(
                         raise ValueError("Phase 1 DSpark supports greedy temperature 0 only")
                     if constraint is not None:
                         raise ValueError("Phase 1 DSpark does not support constrained decoding")
-                    out = generate_dspark(
-                        state.runtime,
+                    out = generate_deepseek_v4_dflash2(
+                        state.deepseek_v4_dflash2_bundle,
                         prompt_ids,
                         max_tokens=response_max,
                         token_callback=record_tokens,
+                        runtime_context=state.deepseek_v4_dflash2_runtime_context,
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(

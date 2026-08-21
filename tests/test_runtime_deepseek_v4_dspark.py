@@ -1,90 +1,14 @@
-from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("mlx.core")
-import mlx.core as mx  # noqa: E402
-
-from mtplx.deepseek_v4_dspark_artifact import DSparkConfig  # noqa: E402
-from mtplx.deepseek_v4_dspark_runtime import (  # noqa: E402
-    DeepseekV4DSparkRuntime,
-    install_deepseek_v4_dspark_runtime,
-)
-from mtplx.models.deepseek_v4 import DeepseekV4AffineInt4Cache  # noqa: E402
-from mtplx.models.deepseek_v4_dspark import DeepseekV4DSparkCache  # noqa: E402
-from mtplx import runtime  # noqa: E402
+from mtplx import runtime
+from mtplx.deepseek_v4_dspark_artifact import DSparkConfig
+from mtplx.models.deepseek_v4 import DeepseekV4AffineInt4Cache
+from mtplx.models.deepseek_v4_dspark import DeepseekV4DSparkCache
 
 
-def test_installed_runtime_binds_only_fixed_k5_m6_and_affine_int4_caches() -> None:
-    target_caches = [
-        DeepseekV4AffineInt4Cache(window_size=128, compress_ratio=0, head_dim=512)
-    ]
-    draft_caches = [
-        DeepseekV4DSparkCache(window_size=128, head_dim=512) for _ in range(3)
-    ]
-    calls = []
-
-    class _Model:
-        dspark = SimpleNamespace(stages=[object(), object(), object()])
-
-        def make_cache(self):
-            return target_caches
-
-        def make_dspark_cache(self):
-            return draft_caches
-
-        def __call__(self, input_ids, *, cache, return_hidden):
-            calls.append(("target_m6", int(input_ids.shape[1]), cache))
-            logits = mx.zeros((1, 6, 64))
-            taps = tuple(mx.zeros((1, 6, 2)) for _ in range(3))
-            return logits, taps
-
-        def propose_dspark_k5(self, primary, caches, *, start_pos):
-            calls.append(("proposal_k5", int(primary.item()), caches, start_pos))
-            return SimpleNamespace(
-                future_tokens=mx.array([[31, 32, 33, 34, 35]], dtype=mx.int32)
-            )
-
-        def commit_dspark_main(self, taps, caches, *, start_pos):
-            calls.append(("commit_dspark", taps, caches, start_pos))
-
-    artifact = SimpleNamespace(
-        config=DSparkConfig(
-            block_size=5,
-            markov_rank=256,
-            noise_token_id=128799,
-            target_layer_ids=(40, 41, 42),
-            stage_ids=(0, 1, 2),
-        )
-    )
-    installed = install_deepseek_v4_dspark_runtime(_Model(), artifact)
-
-    assert isinstance(installed, DeepseekV4DSparkRuntime)
-    assert installed.make_target_cache() is target_caches
-    assert installed.make_dspark_cache() is draft_caches
-    verified = installed.target_m6(
-        mx.array([[29, 31, 32, 33, 34, 35]], dtype=mx.int32),
-        target_caches,
-    )
-    proposed = installed.proposal_k5(
-        mx.array([29], dtype=mx.int32),
-        draft_caches,
-        9,
-    )
-
-    assert tuple(verified.logits.shape) == (1, 6, 64)
-    assert tuple(proposed.shape) == (1, 5)
-    assert calls[:2] == [
-        ("target_m6", 6, target_caches),
-        ("proposal_k5", 29, draft_caches, 9),
-    ]
-    assert not hasattr(installed, "mtp_forward")
-    with pytest.raises(FrozenInstanceError):
-        installed.config = None
-
-
-def test_explicit_load_qualifies_artifact_before_model_and_skips_generic_mtp(
+def test_explicit_load_qualifies_dspark_without_installing_a_second_runtime(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -108,7 +32,10 @@ def test_explicit_load_qualifies_artifact_before_model_and_skips_generic_mtp(
             return [DeepseekV4AffineInt4Cache(128, 0, 512)]
 
         def make_dspark_cache(self):
-            return [DeepseekV4DSparkCache(window_size=128, head_dim=512) for _ in range(3)]
+            return [
+                DeepseekV4DSparkCache(window_size=128, head_dim=512)
+                for _ in range(3)
+            ]
 
     model = _LoadModel()
     monkeypatch.setattr(runtime, "load_config", lambda _path: config)
@@ -144,11 +71,12 @@ def test_explicit_load_qualifies_artifact_before_model_and_skips_generic_mtp(
     loaded = runtime.load(tmp_path, mtp=True, dspark=True)
 
     assert events[:2] == ["artifact", "model"]
+    assert loaded.model is model
     assert loaded.mtp_enabled is False
-    assert isinstance(loaded.deepseek_v4_dspark_runtime, DeepseekV4DSparkRuntime)
+    assert not hasattr(loaded, "deepseek_v4_dspark_runtime")
 
 
-def test_server_parser_accepts_only_explicit_fixed_dspark_route() -> None:
+def test_server_parser_accepts_explicit_fixed_dspark_route() -> None:
     from mtplx.server.openai import parse_args
 
     args = parse_args(
@@ -169,3 +97,20 @@ def test_server_parser_accepts_only_explicit_fixed_dspark_route() -> None:
     assert args.generation_mode == "dspark"
     assert args.depth == 5
     assert args.temperature == 0.0
+
+
+def test_server_dspark_route_requires_the_bound_dflash2_bundle() -> None:
+    from fastapi import HTTPException
+    from mtplx.server.openai import _request_generation_mode_for_generation
+
+    request = SimpleNamespace(generation_mode=None, model_extra=None)
+    state = SimpleNamespace(
+        args=SimpleNamespace(generation_mode="dspark"),
+        runtime=SimpleNamespace(mtp_enabled=False),
+        deepseek_v4_dflash2_bundle=object(),
+    )
+
+    assert _request_generation_mode_for_generation(state, request) == "dspark"
+    state.deepseek_v4_dflash2_bundle = None
+    with pytest.raises(HTTPException, match="DFlash2-qualified"):
+        _request_generation_mode_for_generation(state, request)

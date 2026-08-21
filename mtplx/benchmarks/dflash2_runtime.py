@@ -9,6 +9,8 @@ from typing import Any
 _DRAFT_QUANT = "w4:gs64"
 _CHECKPOINT_BLOCK_SIZE = 8
 _TARGET_LAYER_IDS = (5, 19, 33, 47, 61)
+_DEEPSEEK_PHYSICAL_VERIFY_WIDTH = 6
+_DEEPSEEK_TARGET_LAYER_IDS = (40, 41, 42)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,14 @@ def load_mtplx_runtime(model_path: str):
     from mtplx.runtime import load
 
     return load(model_path, mtp=True)
+
+
+def load_mtplx_deepseek_runtime(model_path: str):
+    """Load one artifact-qualified DeepSeek DSpark target through MTPLX."""
+
+    from mtplx.runtime import load
+
+    return load(model_path, mtp=True, dspark=True)
 
 
 def load_draft(draft_ref: str, *, draft_quant: str):
@@ -64,6 +74,19 @@ def make_draft_backend():
     from dflash_mlx.draft_backend import EagerDraftBackend
 
     return EagerDraftBackend()
+
+
+def build_deepseek_v4_dflash2_runtime_context():
+    """Construct the fixed greedy M6 context for the qualified DSpark lane."""
+
+    from dflash_mlx.runtime.context import build_offline_runtime_context
+
+    return build_offline_runtime_context(
+        quantize_kv_cache=False,
+        verify_len_cap=_DEEPSEEK_PHYSICAL_VERIFY_WIDTH,
+        verify_mode="dflash",
+        copyspec_mode="off",
+    )
 
 
 def _checkpoint_geometry(draft_model) -> tuple[int, tuple[int, ...]]:
@@ -154,4 +177,66 @@ def load_mtplx_dflash2_bundle(
         draft_meta=dict(draft_meta),
         checkpoint_block_size=block_size,
         target_layer_ids=layer_ids,
+    )
+
+
+def load_mtplx_deepseek_v4_dflash2_bundle(
+    model_path: str,
+) -> MTPLXDFlash2Bundle:
+    """Load and bind a qualified DeepSeek V4 target to DFlash2."""
+
+    runtime = load_mtplx_deepseek_runtime(model_path)
+    return bind_mtplx_deepseek_v4_dflash2_bundle(runtime, source=model_path)
+
+
+def bind_mtplx_deepseek_v4_dflash2_bundle(
+    runtime: Any,
+    *,
+    source: str,
+) -> MTPLXDFlash2Bundle:
+    """Bind an already-loaded qualified DeepSeek V4 runtime to DFlash2."""
+
+    from mtplx.deepseek_v4_dflash2 import (
+        DeepseekV4DSparkBackend,
+        DeepseekV4DSparkDraftAdapter,
+        DeepseekV4TargetOps,
+    )
+
+    target_model = runtime.model
+    target_ops = DeepseekV4TargetOps()
+    if not target_ops.supports_model(target_model):
+        raise ValueError(
+            "DFlash2 target is not a construction-qualified DeepSeek V4 DSpark model"
+        )
+
+    draft_model = DeepseekV4DSparkDraftAdapter(target_model)
+    draft_backend = DeepseekV4DSparkBackend()
+    bind_draft(draft_model, target_model, target_ops=target_ops)
+
+    target_probe = target_ops.make_cache(
+        target_model,
+        enable_speculative_linear_cache=True,
+        quantize_kv_cache=False,
+    )
+    draft_probe = draft_backend.make_cache(
+        draft_model=draft_model,
+        sink_size=0,
+        window_size=int(draft_model.args.sliding_window),
+        allow_full_context_layers=False,
+    )
+    target_ops.cleanup_generation_caches(target_probe, draft_probe)
+
+    return MTPLXDFlash2Bundle(
+        runtime=runtime,
+        target_model=target_model,
+        tokenizer=runtime.tokenizer,
+        target_ops=target_ops,
+        draft_model=draft_model,
+        draft_backend=draft_backend,
+        draft_meta={
+            "kind": "deepseek_v4_dspark",
+            "source": str(source),
+        },
+        checkpoint_block_size=_DEEPSEEK_PHYSICAL_VERIFY_WIDTH,
+        target_layer_ids=_DEEPSEEK_TARGET_LAYER_IDS,
     )

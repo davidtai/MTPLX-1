@@ -397,3 +397,127 @@ class DeepseekV4DSparkBackend:
             draft_cache=draft_cache,
             draft_context=draft_context,
         )
+
+
+def _stream_dflash_generate(**kwargs):
+    from dflash_mlx.runtime import stream_dflash_generate
+
+    return stream_dflash_generate(**kwargs)
+
+
+def generate_deepseek_v4_dflash2(
+    bundle: Any,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    runtime_context: Any,
+    stop_token_ids: Optional[list[int]] = None,
+    token_callback: Any = None,
+):
+    """Translate the unchanged DFlash2 event stream into MTPLX output types."""
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+    from dflash_mlx.runtime import get_stop_token_ids
+    from mtplx.generation import GenerationOutput, GenerationStats
+
+    if runtime_context is None:
+        raise ValueError("DeepSeek V4 DFlash2 requires a prebuilt runtime context")
+    resolved_stop_ids = (
+        [int(value) for value in stop_token_ids]
+        if stop_token_ids is not None
+        else get_stop_token_ids(bundle.tokenizer)
+    )
+    stop_set = set(resolved_stop_ids)
+    summary = None
+    for event in _stream_dflash_generate(
+        target_model=bundle.target_model,
+        target_ops=bundle.target_ops,
+        tokenizer=bundle.tokenizer,
+        draft_model=bundle.draft_model,
+        draft_backend=bundle.draft_backend,
+        prompt_tokens_override=[int(value) for value in prompt_ids],
+        prompt="",
+        use_chat_template=False,
+        max_new_tokens=int(max_tokens),
+        block_tokens=_PHYSICAL_VERIFY_WIDTH,
+        stop_token_ids=resolved_stop_ids,
+        quantize_kv_cache=False,
+        runtime_context=runtime_context,
+    ):
+        if isinstance(event, TokenEvent):
+            token_id = int(event.token_id)
+            if token_callback is not None and token_id not in stop_set:
+                token_callback([token_id])
+        elif isinstance(event, SummaryEvent):
+            if summary is not None:
+                raise RuntimeError("DFlash2 emitted more than one summary")
+            summary = event
+
+    if summary is None:
+        raise RuntimeError("DFlash2 stream ended without a summary")
+    if summary.fallback_ar:
+        raise RuntimeError(
+            "DeepSeek V4 DFlash2 refused its installed lane: "
+            f"{summary.fallback_reason or 'unspecified fallback'}"
+        )
+    if int(summary.block_tokens or 0) != _PHYSICAL_VERIFY_WIDTH:
+        raise RuntimeError("DeepSeek V4 DFlash2 did not execute physical M6")
+
+    tokens = [int(value) for value in summary.generated_token_ids]
+    while tokens and tokens[-1] in stop_set:
+        tokens.pop()
+    elapsed_s = float(summary.elapsed_us) / 1_000_000.0
+    prompt_s = float(summary.phase_timings_us.get("prefill", 0.0)) / 1_000_000.0
+    decode_s = max(0.0, elapsed_s - prompt_s)
+    cycles = int(summary.cycles_completed)
+    acceptance_history = tuple(int(value) for value in summary.acceptance_history)
+    accepted_by_depth = [
+        sum(1 for accepted in acceptance_history if accepted >= depth)
+        for depth in range(1, _PHYSICAL_VERIFY_WIDTH)
+    ]
+    accepted = int(summary.accepted_from_draft)
+    drafted = cycles * (_PHYSICAL_VERIFY_WIDTH - 1)
+    generated = len(tokens)
+    stats = GenerationStats(
+        mode="dspark",
+        generated_tokens=generated,
+        elapsed_s=elapsed_s,
+        tok_s=(generated / elapsed_s if elapsed_s > 0 else 0.0),
+        decode_elapsed_s=decode_s,
+        decode_tok_s=(generated / decode_s if decode_s > 0 else 0.0),
+        end_to_end_tok_s=(generated / elapsed_s if elapsed_s > 0 else 0.0),
+        accepted_drafts=accepted,
+        rejected_drafts=max(0, drafted - accepted),
+        drafted_tokens=drafted,
+        verify_time_s=float(
+            (summary.cycle_profile_totals_us or {}).get("verify", 0.0)
+        )
+        / 1_000_000.0,
+        draft_time_s=float(
+            (summary.cycle_profile_totals_us or {}).get("draft", 0.0)
+        )
+        / 1_000_000.0,
+        prompt_eval_time_s=prompt_s,
+        prompt_tps=(
+            int(summary.prompt_token_count) / prompt_s if prompt_s > 0 else 0.0
+        ),
+        rollback_time_s=float(
+            (summary.cycle_profile_totals_us or {}).get("rollback", 0.0)
+        )
+        / 1_000_000.0,
+        peak_memory_bytes=int(float(summary.peak_memory_gb or 0.0) * 1024**3),
+        speculative_depth=_PHYSICAL_VERIFY_WIDTH - 1,
+        requested_speculative_depth=_PHYSICAL_VERIFY_WIDTH - 1,
+        accepted_by_depth=accepted_by_depth,
+        drafted_by_depth=[cycles] * (_PHYSICAL_VERIFY_WIDTH - 1),
+        verify_calls=cycles,
+        verify_hidden_mode="dflash2_deepseek_taps_40_41_42",
+        events=[summary.to_payload()],
+    )
+    return GenerationOutput(
+        tokens=tokens,
+        text=bundle.tokenizer.decode(tokens),
+        stats=stats,
+        final_state=None,
+        finish_reason="stop" if len(tokens) < int(summary.generation_tokens) else "length",
+    )

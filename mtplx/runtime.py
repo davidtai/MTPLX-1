@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
-    from .deepseek_v4_dspark_runtime import DeepseekV4DSparkRuntime
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -95,7 +94,6 @@ class MTPLXRuntime:
     deepseek_v4_o_lora_report: dict[str, Any] | None = None
     deepseek_v4_attn_proj_wide_m3_report: dict[str, Any] | None = None
     deepseek_v4_attention_island_report: dict[str, Any] | None = None
-    deepseek_v4_dspark_runtime: DeepseekV4DSparkRuntime | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
@@ -622,11 +620,10 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
-    verified_dspark_artifact = None
     if dspark:
         from .deepseek_v4_dspark_artifact import open_verified_dspark_artifact
 
-        verified_dspark_artifact = open_verified_dspark_artifact(path)
+        open_verified_dspark_artifact(path)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(
@@ -941,16 +938,6 @@ def load(
         if _is_laguna_s_2_1_mlx_4bit_config(config)
         else MTPLXRuntime
     )
-    deepseek_v4_dspark_runtime = None
-    if verified_dspark_artifact is not None:
-        from .deepseek_v4_dspark_runtime import (
-            install_deepseek_v4_dspark_runtime,
-        )
-
-        deepseek_v4_dspark_runtime = install_deepseek_v4_dspark_runtime(
-            model,
-            verified_dspark_artifact,
-        )
     runtime = runtime_class(
         model,
         tokenizer,
@@ -963,7 +950,6 @@ def load(
         deepseek_v4_o_lora_report=deepseek_v4_o_lora_report,
         deepseek_v4_attn_proj_wide_m3_report=deepseek_v4_attn_proj_wide_m3_report,
         deepseek_v4_attention_island_report=deepseek_v4_attention_island_report,
-        deepseek_v4_dspark_runtime=deepseek_v4_dspark_runtime,
         a3b_compiled_target_prefix_factory=compiled_target_factory,
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
