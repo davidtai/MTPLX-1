@@ -1442,6 +1442,7 @@ class ModelArgs(BaseModelArgs):
     dspark_markov_rank: Optional[int] = None
     dspark_noise_token_id: Optional[int] = None
     dspark_target_layer_ids: Optional[List[int]] = None
+    hybrid_tr3_tail: Optional[dict] = None
 
     def __post_init__(self):
         # Accept the HF rope_scaling block and mirror it into the flat YaRN fields
@@ -1456,6 +1457,33 @@ class ModelArgs(BaseModelArgs):
             self.beta_slow = int(rs.get("beta_slow", self.beta_slow))
         # window_size / sliding_window are the same knob under two names.
         self.window_size = int(self.sliding_window or self.window_size)
+        if self.hybrid_tr3_tail is not None:
+            metadata = self.hybrid_tr3_tail
+            observed = (
+                metadata.get("format"),
+                float(metadata.get("bits", 0.0)),
+                metadata.get("codebook"),
+                int(metadata.get("tp", 0)),
+                int(metadata.get("experts_per_layer", 0)),
+                tuple(metadata.get("moe_layers", ())),
+                metadata.get("exllamav3_revision"),
+                metadata.get("source_revision"),
+            )
+            expected = (
+                "exl3-trellis",
+                3.0,
+                "mcg",
+                1,
+                int(self.n_routed_experts),
+                (0, int(self.num_hidden_layers) - 1),
+                "787d1582267117d6ee83c90014f03b525b14754f",
+                "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+            )
+            if observed != expected:
+                raise ValueError(
+                    "unsupported DeepSeek V4 EXL3 target contract: "
+                    f"observed={observed!r}, expected={expected!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1714,7 +1742,13 @@ def _sinkhorn_kernel_apply(comb: mx.array, hc: int, iters: int, eps: float) -> m
     return out.reshape(*lead, hc, hc)
 
 
-def _install_sinkhorn_normaliser(hc: int, iters: int, eps: float):
+def _install_sinkhorn_normaliser(
+    hc: int,
+    iters: int,
+    eps: float,
+    *,
+    enabled: bool | None = None,
+):
     """Install the fixed Sinkhorn route for one Hyper-Connection instance.
 
     The experimental lane is deliberately selected at model construction, never
@@ -1727,7 +1761,8 @@ def _install_sinkhorn_normaliser(hc: int, iters: int, eps: float):
     def stock(comb: mx.array) -> mx.array:
         return _sinkhorn_ops(comb, iters, eps)
 
-    if not _SINKHORN_KERNEL:
+    selected = _SINKHORN_KERNEL if enabled is None else bool(enabled)
+    if not selected:
         return False, stock
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
         return False, stock
@@ -1956,6 +1991,22 @@ class HyperConnection(nn.Module):
             scale_vec,
         )
         return self._static_cache.put(src, value)
+
+    def install_sinkhorn_kernel(self) -> None:
+        """Bind the proven fixed-geometry Metal normaliser before execution."""
+
+        installed, normalise = _install_sinkhorn_normaliser(
+            self.hc,
+            self._iters,
+            self.eps,
+            enabled=True,
+        )
+        if not installed:
+            raise RuntimeError(
+                "DeepSeek-V4 Sinkhorn Metal installation requires the GPU lane"
+            )
+        self._sinkhorn_kernel = installed
+        self._sinkhorn_normalise = normalise
 
     def pre(self, x: mx.array):
         """Collapse the ``hc`` copies to one; return (y[..., dim], post, comb)."""
@@ -3445,12 +3496,23 @@ class DeepseekV4MoE(nn.Module):
         super().__init__()
         self.args = args
         self.gate = MoEGate(args, layer_id)
-        self.switch_mlp = SwitchGLU(
-            args.hidden_size,
-            args.moe_intermediate_size,
-            args.n_routed_experts,
-            activation=ClampedSwiGLU(args.swiglu_limit),
-        )
+        if args.hybrid_tr3_tail is not None and layer_id < args.num_hidden_layers:
+            from mtplx.deepseek_v4_exl3 import EXL3SwitchGLU
+
+            self.switch_mlp = EXL3SwitchGLU(
+                args.hidden_size,
+                args.moe_intermediate_size,
+                args.n_routed_experts,
+                args.num_experts_per_tok,
+                limit=args.swiglu_limit,
+            )
+        else:
+            self.switch_mlp = SwitchGLU(
+                args.hidden_size,
+                args.moe_intermediate_size,
+                args.n_routed_experts,
+                activation=ClampedSwiGLU(args.swiglu_limit),
+            )
         self.shared_experts = DeepseekV4MLP(
             args, args.moe_intermediate_size * args.n_shared_experts
         )
@@ -3664,19 +3726,9 @@ class Model(nn.Module):
         )
         self.dspark = None
         if dspark_requested:
-            from mtplx.models.deepseek_v4_dspark import (
-                DSparkTargetRoute,
-                build_deepseek_v4_dspark,
-            )
+            from mtplx.models.deepseek_v4_dspark import build_deepseek_v4_dspark
 
-            self.dspark = build_deepseek_v4_dspark(args)
-            self.mtp = self.dspark.stages
-            target_route = DSparkTargetRoute(args.dspark_target_layer_ids)
-            self._target_forward_route = (
-                lambda inputs, cache: target_route(self, inputs, cache)
-            )
-            self._target_cache_type = DeepseekV4AffineInt4Cache
-            self._has_generic_mtp = False
+            self.install_dspark_owner(build_deepseek_v4_dspark(args))
         else:
             self.mtp = [
                 DeepseekV4MTP(args, args.num_hidden_layers + i)
@@ -3685,6 +3737,63 @@ class Model(nn.Module):
             self._target_forward_route = self._stock_target_forward
             self._target_cache_type = DeepseekV4Cache
             self._has_generic_mtp = bool(self.mtp)
+
+    def install_dspark_owner(self, owner) -> None:
+        """Bind one qualified DSpark owner to the target exactly once.
+
+        The split Mia artifact cannot construct the draft from target arguments:
+        its routed expert bank has 64 owners while the target has 216.  Loading
+        therefore constructs and validates the draft separately, then installs
+        this fixed route once before any measured execution.  The ordinary
+        same-checkpoint owner remains the constructor's existing route.
+        """
+
+        from mtplx.models.deepseek_v4_dspark import (
+            DSPARK_BLOCK_SIZE,
+            DSPARK_STAGE_COUNT,
+            DSPARK_TARGET_LAYER_IDS,
+            DSparkTargetRoute,
+        )
+
+        if self.args.hybrid_tr3_tail is not None:
+            observed = (
+                len(owner.stages),
+                int(owner.args.n_routed_experts),
+                int(owner.block_size),
+                tuple(int(value) for value in owner.target_layer_ids),
+            )
+            expected = (
+                DSPARK_STAGE_COUNT,
+                64,
+                DSPARK_BLOCK_SIZE,
+                tuple(DSPARK_TARGET_LAYER_IDS),
+            )
+            if observed != expected:
+                raise ValueError(
+                    "unsupported Mia DSpark owner contract: "
+                    f"observed={observed!r}, expected={expected!r}"
+                )
+            self.args.dspark_block_size = int(owner.args.dspark_block_size)
+            self.args.dspark_markov_rank = int(owner.args.dspark_markov_rank)
+            self.args.dspark_noise_token_id = int(owner.args.dspark_noise_token_id)
+            self.args.dspark_target_layer_ids = list(
+                owner.args.dspark_target_layer_ids
+            )
+            target_layer_ids = owner.target_layer_ids
+        else:
+            if len(owner.stages) != DSPARK_STAGE_COUNT:
+                raise ValueError(
+                    "DeepSeek V4 DSpark owner must expose exactly three stages"
+                )
+            target_layer_ids = self.args.dspark_target_layer_ids
+        self.dspark = owner
+        self.mtp = owner.stages
+        target_route = DSparkTargetRoute(target_layer_ids)
+        self._target_forward_route = lambda inputs, cache: target_route(
+            self, inputs, cache
+        )
+        self._target_cache_type = DeepseekV4AffineInt4Cache
+        self._has_generic_mtp = False
 
     def _stock_target_forward(self, inputs: mx.array, cache):
         hidden = self._target_hc_hidden_route(inputs, cache)
@@ -3946,6 +4055,16 @@ class Model(nn.Module):
         ``load_weights(strict=True)`` still sees an exact match instead of 58
         spurious "missing" keys.
         """
+        args = getattr(self, "args", None)
+        if args is not None and args.hybrid_tr3_tail is not None:
+            from mtplx.deepseek_v4_exl3 import sanitize_mia_exl3_target_weights
+
+            weights = sanitize_mia_exl3_target_weights(
+                weights,
+                layers=int(args.num_hidden_layers),
+                experts=int(args.n_routed_experts),
+            )
+
         for name, value in tuple(weights.items()):
             if (
                 ".attn.wo_a." in str(name)

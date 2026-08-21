@@ -1029,6 +1029,16 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
         and "model_file" in config
     ):
         raise ValueError("Laguna model_file execution is not permitted")
+    hybrid_tail = config.get("hybrid_tr3_tail")
+    if (
+        str(config.get("model_type") or "").lower() == "deepseek_v4"
+        and isinstance(hybrid_tail, dict)
+        and hybrid_tail.get("format") == "exl3-trellis"
+    ):
+        from .deepseek_v4_exl3 import load_mia_exl3_dspark_model
+
+        tokenizer = _load_tokenizer_resilient(path, config)
+        return load_mia_exl3_dspark_model(path), tokenizer
     model_classes = _model_classes_for_config(config)
     if model_classes is not None:
         from mlx_lm.utils import load_model

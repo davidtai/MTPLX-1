@@ -14,7 +14,9 @@ import sys
 import time
 
 
-DEFAULT_MODEL = Path("/Users/davidtai/models/DeepSeek-V4-Flash-0731-2.4bit-mixed")
+DEFAULT_MODEL = Path(
+    "/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-tp1"
+)
 DEFAULT_PROMPT = "Write a Python function that returns the first n Fibonacci numbers."
 
 
@@ -91,17 +93,28 @@ def _cache_contract(bundle) -> dict:
     return contract
 
 
-def _prompt_ids(bundle, text: str) -> list[int]:
-    return [int(value) for value in bundle.tokenizer.encode(text)]
+def _prompt_ids(bundle, text: str, target_tokens: int | None = None) -> list[int]:
+    encoded = [int(value) for value in bundle.tokenizer.encode(text)]
+    if target_tokens is None:
+        return encoded
+    if target_tokens <= 0 or not encoded:
+        raise ValueError("prompt token target requires positive size and non-empty text")
+    return (encoded * ((target_tokens + len(encoded) - 1) // len(encoded)))[
+        :target_tokens
+    ]
 
 
 def _arm_payload(output) -> dict:
     stats = output.stats.to_dict()
+    prompt_tokens = int((stats["events"][-1] or {}).get("prompt_token_count", 0))
+    prompt_time = stats["prompt_eval_time_s"]
     return {
         "tokens": list(output.tokens),
         "token_digest": _token_digest(list(output.tokens)),
         "generated_tokens": len(output.tokens),
-        "prompt_time_s": stats["prompt_eval_time_s"],
+        "prompt_tokens": prompt_tokens,
+        "prompt_time_s": prompt_time,
+        "prefill_tok_s": prompt_tokens / prompt_time if prompt_time > 0 else 0.0,
         "decode_time_s": stats["decode_elapsed_s"],
         "elapsed_s": stats["elapsed_s"],
         "decode_tok_s": stats["decode_tok_s"],
@@ -214,11 +227,12 @@ def main() -> int:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument(
         "--arm",
-        choices=("construct", "one-cycle", "exact-stream", "bracket"),
+        choices=("construct", "one-cycle", "dspark", "exact-stream", "bracket"),
         required=True,
     )
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--prompt-tokens", type=int)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--profile-cycles",
@@ -285,7 +299,7 @@ def main() -> int:
         ).strip(),
         **_cache_contract(bundle),
     }
-    prompt_ids = _prompt_ids(bundle, args.prompt)
+    prompt_ids = _prompt_ids(bundle, args.prompt, args.prompt_tokens)
     status = 0
     if args.arm == "construct":
         payload = common
@@ -294,6 +308,12 @@ def main() -> int:
             **common,
             "prompt_tokens": len(prompt_ids),
             "cycle": _first_epoch(bundle, prompt_ids, context),
+        }
+    elif args.arm == "dspark":
+        payload = {
+            **common,
+            "prompt_tokens": len(prompt_ids),
+            "dspark": _dspark(bundle, prompt_ids, args.max_tokens, context),
         }
     elif args.arm == "exact-stream":
         ar = _target_ar(bundle, prompt_ids, args.max_tokens)
