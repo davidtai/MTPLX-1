@@ -11,10 +11,13 @@ or requantized during installation.
 from __future__ import annotations
 
 from functools import lru_cache
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
-from typing import Any
+import stat
+from typing import Any, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -599,18 +602,34 @@ def _pack_trellis_routes(
     experts: int,
     topk: int,
     block_m: int,
+    kernel,
 ):
     tasks = int(expert_ids.size)
-    return _trellis_route_pack_kernel(experts, topk, block_m)(
+    route_blocks = _trellis_route_block_capacity(tasks, experts, block_m)
+    return kernel(
         inputs=[
             mx.contiguous(expert_ids.reshape(tasks).astype(mx.uint32)),
             tasks,
         ],
         grid=(256, 1, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(tasks,)] * 6 + [(1,)],
+        output_shapes=[(tasks,)] * 3 + [(route_blocks,)] * 3 + [(1,)],
         output_dtypes=[mx.uint32] * 7,
     )
+
+
+def _trellis_route_block_capacity(tasks: int, experts: int, block_m: int) -> int:
+    """Exact maximum populated blocks for compact, expert-grouped routes.
+
+    Give one route to each active expert first: each creates one block.  Once
+    all experts are active, every additional block requires another ``block_m``
+    routes assigned to some expert.  This shape-only bound is proven before
+    Metal execution and therefore needs neither ``packed_count`` readback nor
+    a task-count launch padded with inactive threadgroups.
+    """
+    active_experts = min(int(tasks), int(experts))
+    extra_blocks = max(int(tasks) - int(experts), 0) // int(block_m)
+    return max(active_experts + extra_blocks, 1)
 
 
 @lru_cache(maxsize=None)
@@ -1293,6 +1312,13 @@ class EXL3LinearBank(nn.Module):
         )
         return output
 
+class _InstalledTrellisPlan(NamedTuple):
+    block_m: int
+    route_pack: Any
+    hidden_to_intermediate: Any
+    intermediate_to_hidden: Any
+
+
 class EXL3SwitchGLU(nn.Module):
     """DeepSeek routed SwiGLU over the exact Mia K216 EXL3 expert banks."""
 
@@ -1333,30 +1359,46 @@ class EXL3SwitchGLU(nn.Module):
             routed_input=True,
         )
         self._trellis_installed = False
+        self._trellis_plans = ()
+        self._trellis_input_hadamard = None
+        self._trellis_activation_down = None
+        self._trellis_final_reduce = None
 
     def install_trellis_runtime(self, *, max_tokens: int) -> None:
         """Install the pinned decode/prefill plans before request execution."""
         if int(max_tokens) < 1:
             raise ValueError("EXL3 Trellis max_tokens must be positive")
         self._trellis_max_tokens = int(max_tokens)
+        plans = []
         for block_m in (8, 64):
-            _trellis_route_pack_kernel(self.experts, self.topk, block_m)
-            _mcg_trellis_mma_kernel(
-                self.hidden_size, self.gate_proj.output_dims, self.experts, block_m
+            plans.append(
+                _InstalledTrellisPlan(
+                    block_m=block_m,
+                    route_pack=_trellis_route_pack_kernel(
+                        self.experts, self.topk, block_m
+                    ),
+                    hidden_to_intermediate=_mcg_trellis_mma_kernel(
+                        self.hidden_size,
+                        self.gate_proj.output_dims,
+                        self.experts,
+                        block_m,
+                    ),
+                    intermediate_to_hidden=_mcg_trellis_mma_kernel(
+                        self.down_proj.input_dims,
+                        self.hidden_size,
+                        self.experts,
+                        block_m,
+                    ),
+                )
             )
-            _mcg_trellis_mma_kernel(
-                self.down_proj.input_dims,
-                self.hidden_size,
-                self.experts,
-                block_m,
-            )
-        _packed_route_hadamard_kernel(
+        self._trellis_plans = tuple(plans)
+        self._trellis_input_hadamard = _packed_route_hadamard_kernel(
             self.hidden_size, self.experts, self.topk
         )
-        _trellis_activation_down_hadamard_kernel(
+        self._trellis_activation_down = _trellis_activation_down_hadamard_kernel(
             self.gate_proj.output_dims, self.experts, self.limit
         )
-        _trellis_final_reduce_kernel(
+        self._trellis_final_reduce = _trellis_final_reduce_kernel(
             self.hidden_size, self.experts, self.topk
         )
         self._trellis_installed = True
@@ -1366,17 +1408,15 @@ class EXL3SwitchGLU(nn.Module):
         bank: EXL3LinearBank,
         transformed: mx.array,
         route_blocks,
+        *,
         block_m: int,
+        kernel,
     ) -> mx.array:
         tasks = int(transformed.shape[0])
         block_expert, block_row, block_size, packed_count = route_blocks
+        route_blocks_capacity = int(block_expert.shape[0])
         threads = int(block_m) * 8
-        return _mcg_trellis_mma_kernel(
-            bank.input_dims,
-            bank.output_dims,
-            self.experts,
-            int(block_m),
-        )(
+        return kernel(
             inputs=[
                 mx.contiguous(transformed),
                 bank.trellis,
@@ -1385,7 +1425,7 @@ class EXL3SwitchGLU(nn.Module):
                 block_size,
                 packed_count,
             ],
-            grid=(threads, bank.output_dims // 32, tasks),
+            grid=(threads, bank.output_dims // 32, route_blocks_capacity),
             threadgroup=(threads, 1, 1),
             output_shapes=[(tasks, bank.output_dims)],
             output_dtypes=[mx.float16],
@@ -1402,7 +1442,8 @@ class EXL3SwitchGLU(nn.Module):
         original_dtype = x.dtype
         rows = int(expert_ids.shape[0])
         tasks = rows * self.topk
-        block_m = 8 if rows <= 32 else 64
+        plan = self._trellis_plans[0 if rows <= 32 else 1]
+        block_m = plan.block_m
         (
             packed_tasks,
             inverse,
@@ -1416,12 +1457,11 @@ class EXL3SwitchGLU(nn.Module):
             experts=self.experts,
             topk=self.topk,
             block_m=block_m,
+            kernel=plan.route_pack,
         )
         route_blocks = (block_expert, block_row, block_size, packed_count)
         x_half = mx.contiguous(x.astype(mx.float16))
-        transform = _packed_route_hadamard_kernel(
-            self.hidden_size, self.experts, self.topk
-        )
+        transform = self._trellis_input_hadamard
         gate_h = transform(
             inputs=[x_half, self.gate_proj.suh, packed_tasks, sorted_ids],
             grid=(128, self.hidden_size // 128, tasks),
@@ -1437,15 +1477,21 @@ class EXL3SwitchGLU(nn.Module):
             output_dtypes=[mx.float16],
         )[0]
         gate_inner = self._trellis_mma(
-            self.gate_proj, gate_h, route_blocks, block_m
+            self.gate_proj,
+            gate_h,
+            route_blocks,
+            block_m=block_m,
+            kernel=plan.hidden_to_intermediate,
         )
         up_inner = self._trellis_mma(
-            self.up_proj, up_h, route_blocks, block_m
+            self.up_proj,
+            up_h,
+            route_blocks,
+            block_m=block_m,
+            kernel=plan.hidden_to_intermediate,
         )
         intermediate = self.gate_proj.output_dims
-        down_h = _trellis_activation_down_hadamard_kernel(
-            intermediate, self.experts, self.limit
-        )(
+        down_h = self._trellis_activation_down(
             inputs=[
                 gate_inner,
                 up_inner,
@@ -1460,11 +1506,13 @@ class EXL3SwitchGLU(nn.Module):
             output_dtypes=[mx.float16],
         )[0]
         down_inner = self._trellis_mma(
-            self.down_proj, down_h, route_blocks, block_m
+            self.down_proj,
+            down_h,
+            route_blocks,
+            block_m=block_m,
+            kernel=plan.intermediate_to_hidden,
         )
-        return _trellis_final_reduce_kernel(
-            self.hidden_size, self.experts, self.topk
-        )(
+        return self._trellis_final_reduce(
             inputs=[
                 down_inner,
                 self.down_proj.svh,
@@ -1668,22 +1716,98 @@ def sanitize_mia_exl3_target_weights(
     return mapped
 
 
-def load_indexed_safetensors(root: Path | str) -> dict[str, mx.array]:
+def _open_file_identity(stream) -> tuple[int, int, int, int, int]:
+    observed = os.fstat(stream.fileno())
+    if not stat.S_ISREG(observed.st_mode):
+        raise ValueError("Mia shard must be a regular file")
+    return (
+        int(observed.st_dev),
+        int(observed.st_ino),
+        int(observed.st_size),
+        int(observed.st_mtime_ns),
+        int(observed.st_ctime_ns),
+    )
+
+
+def _load_verified_safetensors(
+    path: Path,
+    *,
+    expected_bytes: int,
+    expected_sha256: str,
+) -> dict[str, mx.array]:
+    """Hash and load one stable file descriptor without retaining its bytes."""
+
+    path = Path(path)
+    if len(expected_sha256) != 64:
+        raise ValueError(f"pinned Mia shard checksum is invalid: {path.name}")
+    with path.open("rb", buffering=0) as stream:
+        identity = _open_file_identity(stream)
+        if identity[2] != int(expected_bytes):
+            raise ValueError(f"pinned Mia shard size changed: {path.name}")
+
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if _open_file_identity(stream) != identity:
+            raise ValueError(
+                f"pinned Mia shard changed while validating: {path.name}"
+            )
+        observed_sha256 = digest.hexdigest()
+        if observed_sha256 != expected_sha256:
+            raise ValueError(
+                f"pinned Mia shard checksum changed: {path.name} "
+                f"observed={observed_sha256}, expected={expected_sha256}"
+            )
+
+        stream.seek(0)
+        weights = mx.load(stream, format="safetensors")
+        if _open_file_identity(stream) != identity:
+            raise ValueError(
+                f"pinned Mia shard changed while loading: {path.name}"
+            )
+    if not isinstance(weights, dict):
+        raise ValueError(f"invalid Mia safetensors shard: {path}")
+    return dict(weights)
+
+
+def load_indexed_safetensors(
+    root: Path | str,
+    *,
+    weight_map: dict[str, str] | None = None,
+    shard_pins: tuple[Any, ...] | None = None,
+) -> dict[str, mx.array]:
     """Load exactly the tensors named by one local safetensors index."""
 
     root = Path(root)
-    index_path = root / "model.safetensors.index.json"
-    index = json.loads(index_path.read_text())
-    weight_map = index.get("weight_map")
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError(f"invalid safetensors index: {index_path}")
+    if weight_map is None:
+        weight_map = _indexed_weight_map(root)
+    if not weight_map:
+        raise ValueError(f"invalid safetensors index: {root}")
+    pins_by_name = (
+        {str(pin.name): pin for pin in shard_pins}
+        if shard_pins is not None
+        else None
+    )
+    filenames = set(weight_map.values())
+    if pins_by_name is not None and set(pins_by_name) != filenames:
+        raise ValueError("Mia shard pins do not match the safetensors index")
     expected = set(weight_map)
     weights: dict[str, mx.array] = {}
-    for filename in sorted(set(weight_map.values())):
+    for filename in sorted(filenames):
         shard = root / filename
         if not shard.is_file():
             raise FileNotFoundError(shard)
-        weights.update(mx.load(str(shard)))
+        if pins_by_name is None:
+            weights.update(mx.load(str(shard)))
+        else:
+            pin = pins_by_name[filename]
+            weights.update(
+                _load_verified_safetensors(
+                    shard,
+                    expected_bytes=int(pin.bytes),
+                    expected_sha256=str(pin.sha256),
+                )
+            )
     observed = set(weights)
     if observed != expected:
         raise ValueError(
@@ -1767,8 +1891,16 @@ def _target_quantized_modules_from_index(
 
 def _map_mia_target_carried_shard(
     source: dict[str, mx.array],
+    *,
+    fp8_geometries: dict[str, tuple[int, int]],
 ) -> dict[str, mx.array]:
-    """Map one bounded non-expert shard without retaining the other shards."""
+    """Map one bounded non-expert shard without retaining the other shards.
+
+    The TP1 package splits two FP8 weight/scale pairs across adjacent carried
+    shards.  Their installed module geometry is fixed before streaming starts,
+    so it supplies both cross-shard ownership and the exact scale expansion
+    dimensions without retaining either source shard.
+    """
 
     mapped: dict[str, mx.array] = {}
     for name, value in source.items():
@@ -1776,28 +1908,32 @@ def _map_mia_target_carried_shard(
             continue
         if _EXPERT_KEY.match(name) is not None:
             raise ValueError("an EXL3 expert tensor reached a carried Mia shard")
+        target = _map_mia_target_name(name)
         if name.endswith(".scale"):
-            weight_name = name.removesuffix(".scale") + ".weight"
-            if weight_name in source:
-                continue
-        if name.endswith(".weight"):
-            scale_name = name.removesuffix(".weight") + ".scale"
-            scales = source.get(scale_name)
-            if scales is not None:
-                if value.dtype != mx.uint8 or value.ndim != 2:
-                    raise ValueError(f"unsupported Mia FP8 weight geometry: {name}")
-                output_dims, input_dims = (int(dim) for dim in value.shape)
-                target = _map_mia_target_name(name)
-                mapped[target] = mx.contiguous(value).view(mx.uint32)
-                mapped[target.removesuffix(".weight") + ".scales"] = (
-                    _expand_mia_fp8_block_scales(
-                        scales,
-                        output_dims,
-                        input_dims,
-                    )
+            module_name = target.removesuffix(".scale")
+            geometry = fp8_geometries.get(module_name)
+            if geometry is not None:
+                output_dims, input_dims = geometry
+                mapped[module_name + ".scales"] = _expand_mia_fp8_block_scales(
+                    value,
+                    output_dims,
+                    input_dims,
                 )
                 continue
-        target = _map_mia_target_name(name)
+        if name.endswith(".weight"):
+            module_name = target.removesuffix(".weight")
+            geometry = fp8_geometries.get(module_name)
+            if geometry is not None:
+                if value.dtype != mx.uint8 or value.ndim != 2:
+                    raise ValueError(f"unsupported Mia FP8 weight geometry: {name}")
+                output_dims, input_dims = geometry
+                if tuple(value.shape) != (output_dims, input_dims):
+                    raise ValueError(
+                        f"unsupported Mia FP8 weight geometry: {name} owns "
+                        f"{tuple(value.shape)}, expected {(output_dims, input_dims)}"
+                    )
+                mapped[target] = mx.contiguous(value).view(mx.uint32)
+                continue
         if target.endswith(".ffn.gate.tid2eid") and value.dtype == mx.int64:
             value = value.astype(mx.int32)
         if ".attn.wo_a." in target and value.ndim == 3:
@@ -1874,6 +2010,8 @@ def load_mia_exl3_target_streaming(
     *,
     layers: int,
     experts: int,
+    weight_map: dict[str, str] | None = None,
+    shard_pins: tuple[Any, ...] | None = None,
 ) -> dict[str, str]:
     """Install the 106 GB target with one source shard live at a time.
 
@@ -1886,7 +2024,27 @@ def load_mia_exl3_target_streaming(
     from mlx.utils import tree_flatten
 
     root = Path(root)
-    weight_map = _indexed_weight_map(root)
+    if weight_map is None:
+        weight_map = _indexed_weight_map(root)
+    pins_by_name = (
+        {str(pin.name): pin for pin in shard_pins}
+        if shard_pins is not None
+        else None
+    )
+    if pins_by_name is not None and set(pins_by_name) != set(weight_map.values()):
+        raise ValueError("Mia target shard pins do not match its weight index")
+
+    def load_shard(filename: str) -> dict[str, mx.array]:
+        shard = root / filename
+        if pins_by_name is None:
+            return dict(mx.load(str(shard)))
+        pin = pins_by_name[filename]
+        return _load_verified_safetensors(
+            shard,
+            expected_bytes=int(pin.bytes),
+            expected_sha256=str(pin.sha256),
+        )
+
     quantized = _target_quantized_modules_from_index(weight_map)
     model_quantized = {
         path: mode for path, mode in quantized.items() if path.startswith("model.")
@@ -1901,6 +2059,15 @@ def load_mia_exl3_target_streaming(
     receipt.update(
         _install_quantized_modules(model, head_quantized, prefix="lm_head")
     )
+    installed_modules = dict(model.named_modules())
+    fp8_geometries: dict[str, tuple[int, int]] = {}
+    for path in quantized:
+        module = installed_modules[path]
+        output_dims = int(module.scales.shape[0])
+        input_dims = int(module.scales.shape[1]) * 32
+        if tuple(module.weight.shape) != (output_dims, input_dims // 4):
+            raise ValueError(f"Mia module {path!r} has invalid MXFP8 geometry")
+        fp8_geometries[path] = (output_dims, input_dims)
 
     files: dict[str, set[str]] = {}
     for name, filename in weight_map.items():
@@ -1911,10 +2078,13 @@ def load_mia_exl3_target_streaming(
         name for name in files if name.startswith("carried-")
     }
     for filename in sorted(carried_files):
-        source = dict(mx.load(str(root / filename)))
+        source = load_shard(filename)
         if set(source) != files[filename]:
             raise ValueError(f"Mia carried shard index mismatch: {filename}")
-        mapped = _map_mia_target_carried_shard(source)
+        mapped = _map_mia_target_carried_shard(
+            source,
+            fp8_geometries=fp8_geometries,
+        )
         _install_mia_weight_batch(model, mapped, installed_names)
         del mapped, source
         if hasattr(mx, "clear_cache"):
@@ -1932,7 +2102,7 @@ def load_mia_exl3_target_streaming(
         filename = f"exl3-layer-{layer:03d}-tp1-rank0.safetensors"
         if filename not in expert_files:
             raise ValueError(f"Mia target is missing {filename}")
-        source = dict(mx.load(str(root / filename)))
+        source = load_shard(filename)
         if set(source) != files[filename]:
             raise ValueError(f"Mia EXL3 shard index mismatch: {filename}")
         mapped = _map_mia_target_expert_shard(
@@ -1961,6 +2131,9 @@ def load_mia_exl3_target_streaming(
         )
     model._mia_target_load_receipt = {
         "mode": "bounded_one_shard",
+        "artifact_identity": (
+            "sha256_same_fd" if pins_by_name is not None else "unverified_path"
+        ),
         "source_shards": len(files),
         "carried_shards": len(carried_files),
         "exl3_layer_shards": len(expert_files),
@@ -2108,6 +2281,7 @@ def load_mia_exl3_dspark_model(
     target_root: Path | str,
     *,
     draft_root: Path | str | None = None,
+    artifact_validation=None,
     lazy: bool = False,
     context_capacity_tokens: int = 384_000,
     max_batch_tokens: int = 8_224,
@@ -2127,8 +2301,19 @@ def load_mia_exl3_dspark_model(
     )
     from mtplx.deepseek_v4_mia_engine import validate_pinned_mia_artifacts
 
-    validate_pinned_mia_artifacts(target_root, resolved_draft)
-    target_config = json.loads((target_root / "config.json").read_text())
+    if artifact_validation is None:
+        artifact_validation = validate_pinned_mia_artifacts(
+            target_root,
+            resolved_draft,
+        )
+    elif (
+        artifact_validation.target_root != target_root
+        or artifact_validation.draft_root != resolved_draft
+    ):
+        raise ValueError(
+            "pinned Mia artifact validation does not own the requested roots"
+        )
+    target_config = dict(artifact_validation.target_config)
     # Qualify the source metadata before clearing only the separately-owned
     # draft signature for target construction.
     ModelArgs.from_dict(target_config)
@@ -2148,12 +2333,17 @@ def load_mia_exl3_dspark_model(
         target_root,
         layers=int(model.args.num_hidden_layers),
         experts=int(model.args.n_routed_experts),
+        weight_map=artifact_validation.target_weight_map,
+        shard_pins=artifact_validation.target_shards,
+    )
+    model._mia_target_load_receipt["small_file_sha256"] = dict(
+        artifact_validation.target_small_file_sha256
     )
     model.eval()
     for layer in model.layers:
         layer.ffn.install_mia_exl3_runtime(max_tokens=8224)
 
-    draft_config = json.loads((resolved_draft / "config.json").read_text())
+    draft_config = dict(artifact_validation.draft_config)
     draft_experts = int(draft_config.get("n_routed_experts", 0))
     draft_config["hybrid_tr3_tail"] = None
     draft_args = ModelArgs.from_dict(draft_config)
@@ -2162,11 +2352,26 @@ def load_mia_exl3_dspark_model(
     owner = build_deepseek_v4_dspark(draft_args)
     model.install_dspark_owner(owner)
 
+    draft_source = load_indexed_safetensors(
+        resolved_draft,
+        weight_map=artifact_validation.draft_weight_map,
+        shard_pins=artifact_validation.draft_shards,
+    )
     draft_weights = sanitize_mia_dspark_weights(
-        load_indexed_safetensors(resolved_draft),
+        draft_source,
         stages=3,
         experts=64,
     )
+    del draft_source
+    model._mia_draft_load_receipt = {
+        "mode": "single_shard",
+        "artifact_identity": "sha256_same_fd",
+        "source_shards": len(artifact_validation.draft_shards),
+        "source_tensors": len(artifact_validation.draft_weight_map),
+        "small_file_sha256": dict(
+            artifact_validation.draft_small_file_sha256
+        ),
+    }
     quantized_modules.update(
         _quantize_loaded_modules(model, draft_weights, prefix="mtp.")
     )
@@ -2194,24 +2399,59 @@ def load_mia_exl3_dspark_model(
     # for both the 43-layer target and the three-stage K64 draft.
     model.install_mia_mhc_runtime(max_tokens=8224)
 
-    # Reuse the existing direct grouped o-LoRA route against Mia's native MXFP8
-    # packing.  All target and draft attention owners are validated and bound
-    # here; generation never materializes or consults a fallback lane.
-    from mtplx.models.deepseek_v4 import install_deepseek_v4_o_lora_routes
+    # Bind the source-derived B12X WO owner directly against the native MXFP8
+    # tensors after both target and draft weights exist.  Each attention owns a
+    # distinct prebound plan; generation never enters the generic o-LoRA route.
+    from mtplx.models.deepseek_v4 import (
+        install_mia_qkv_prologue_routes,
+        install_mia_tp1_wo_projection_routes,
+        install_mia_stacked_projections,
+    )
 
-    o_lora = install_deepseek_v4_o_lora_routes(
+    wo_projection = install_mia_tp1_wo_projection_routes(
         model,
-        mode="gather_qmm",
-        canonical_mixed_route=False,
+        max_prefill_rows=max_batch_tokens,
     )
     if (
-        o_lora["module_count"] != 46
-        or o_lora["trunk_module_count"] != 43
-        or o_lora["mtp_module_count"] != 3
-        or not o_lora["all_direct"]
-        or not o_lora["all_mode_matches"]
+        wo_projection["route"] != "mia_tp1_b12x_wo_mxfp8"
+        or wo_projection["target_attention"] != 43
+        or wo_projection["draft_attention"] != 3
+        or wo_projection["plan_count"] != 46
+        or wo_projection["unique_plan_count"] != 46
+        or wo_projection["plan_type"] != "MiaTP1WOMXFP8Plan"
+        or wo_projection["max_prefill_rows"] != int(max_batch_tokens)
     ):
-        raise RuntimeError(f"Mia direct o-LoRA route is incomplete: {o_lora}")
+        raise RuntimeError(
+            f"Mia TP1 WO projection route is incomplete: {wo_projection}"
+        )
+
+    stacked_projections = install_mia_stacked_projections(model)
+    if stacked_projections != {
+        "target_attention": 43,
+        "draft_attention": 3,
+        "main_compressor": 41,
+        "indexer_compressor": 21,
+    }:
+        raise RuntimeError(
+            f"Mia stacked projection installation is incomplete: "
+            f"{stacked_projections}"
+        )
+
+    qkv_prologue = install_mia_qkv_prologue_routes(model)
+    if (
+        qkv_prologue["route"] != "mia_fused_qkv_stock432"
+        or qkv_prologue["target_attention"] != 43
+        or qkv_prologue["draft_attention"] != 3
+        or qkv_prologue["plan_count"] != 46
+        or qkv_prologue["unique_plan_count"] != 46
+        or qkv_prologue["plan_type"] != "MiaBoundQKVPrologue"
+        or qkv_prologue["prefill_cutoff"] != 1024
+        or qkv_prologue["proposal_rows"] != 5
+        or qkv_prologue["context_rows"] != 128
+    ):
+        raise RuntimeError(
+            f"Mia fused Q/KV prologue installation is incomplete: {qkv_prologue}"
+        )
 
     from mtplx.deepseek_v4_mia_engine import build_mia_engine_plan
 

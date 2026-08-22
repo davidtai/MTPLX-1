@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -21,17 +20,7 @@ _PHASE1_NOISE_TOKEN_ID = 128799
 _PHASE1_TARGET_LAYER_IDS = (40, 41, 42)
 _PHASE1_STAGE_IDS = (0, 1, 2)
 
-_REQUIRED_WEIGHT_KEYS = (
-    "mtp.0.main_proj.weight",
-    "mtp.0.attn.wq_a.weight",
-    "mtp.1.attn.wq_a.weight",
-    "mtp.2.attn.wq_a.weight",
-    "mtp.2.hc_head.base",
-    "mtp.2.markov_head.markov_w1.weight",
-    "mtp.2.markov_head.markov_w2.weight",
-    "mtp.2.confidence_head.proj.weight",
-)
-_MIA_REQUIRED_WEIGHT_KEYS = (
+_K64_REQUIRED_WEIGHT_KEYS = (
     "mtp.0.main_proj.weight",
     "mtp.0.attn.wq_a.weight",
     "mtp.1.attn.wq_a.weight",
@@ -129,31 +118,30 @@ def open_verified_dspark_artifact(root: Path) -> VerifiedDSparkArtifact:
     if not artifact_root.is_dir():
         raise DSparkArtifactError(f"DSpark artifact root is not a directory: {artifact_root}")
 
-    config_raw, config = _read_json(artifact_root / _CONFIG_NAME, label="config")
+    _, config = _read_json(artifact_root / _CONFIG_NAME, label="config")
     hybrid_tail = config.get("hybrid_tr3_tail")
-    is_mia_split = (
+    if not (
         isinstance(hybrid_tail, dict)
         and hybrid_tail.get("format") == "exl3-trellis"
-    )
-    weights_root = artifact_root
-    if is_mia_split:
-        from .deepseek_v4_exl3 import _default_mia_dspark_root
+    ):
+        raise DSparkArtifactError(
+            "the pinned Mia/Sero DSpark artifact requires an exl3-trellis "
+            "split target"
+        )
 
-        weights_root = _default_mia_dspark_root(artifact_root).resolve()
-    index_raw, index = _read_json(
-        weights_root / _INDEX_NAME,
-        label="Mia K64 draft weight index" if is_mia_split else "weight index",
-    )
+    from .deepseek_v4_exl3 import _default_mia_dspark_root
+    from .deepseek_v4_mia_engine import validate_pinned_mia_artifacts
 
-    weight_map_value = index.get("weight_map")
-    if not isinstance(weight_map_value, dict) or not weight_map_value:
-        raise DSparkArtifactError("DSpark weight index has no non-empty weight_map")
-    if not all(isinstance(key, str) and isinstance(value, str) for key, value in weight_map_value.items()):
-        raise DSparkArtifactError("DSpark weight_map keys and shard names must be strings")
-    weight_map = dict(weight_map_value)
+    weights_root = _default_mia_dspark_root(artifact_root).resolve()
+    try:
+        validation = validate_pinned_mia_artifacts(artifact_root, weights_root)
+    except (OSError, TypeError, ValueError) as exc:
+        raise DSparkArtifactError(
+            f"pinned Mia/Sero target and K64 draft validation failed: {exc}"
+        ) from exc
 
-    required = _MIA_REQUIRED_WEIGHT_KEYS if is_mia_split else _REQUIRED_WEIGHT_KEYS
-    missing = tuple(key for key in required if key not in weight_map)
+    weight_map = dict(validation.draft_weight_map)
+    missing = tuple(key for key in _K64_REQUIRED_WEIGHT_KEYS if key not in weight_map)
     if missing:
         raise DSparkArtifactError(f"DSpark artifact is missing required weights: {missing!r}")
 
@@ -166,23 +154,18 @@ def open_verified_dspark_artifact(root: Path) -> VerifiedDSparkArtifact:
             }
         )
     )
-    dspark_config = _phase1_config(config, stage_ids)
+    dspark_config = _phase1_config(validation.target_config, stage_ids)
 
-    shards = tuple(sorted(set(weight_map.values())))
-    for shard in shards:
-        try:
-            shard_path = (weights_root / shard).resolve(strict=True)
-        except OSError as exc:
-            raise DSparkArtifactError(f"DSpark shard is unavailable: {shard}") from exc
-        if not shard_path.is_relative_to(weights_root) or not shard_path.is_file():
-            raise DSparkArtifactError(f"DSpark shard is outside the artifact root: {shard}")
+    shards = tuple(sorted(pin.name for pin in validation.draft_shards))
+    target_small_file_sha256 = dict(validation.target_small_file_sha256)
+    draft_small_file_sha256 = dict(validation.draft_small_file_sha256)
 
     return VerifiedDSparkArtifact(
         root=artifact_root,
         weights_root=weights_root,
         config=dspark_config,
-        config_sha256=sha256(config_raw).hexdigest(),
-        index_sha256=sha256(index_raw).hexdigest(),
+        config_sha256=target_small_file_sha256[_CONFIG_NAME],
+        index_sha256=draft_small_file_sha256[_INDEX_NAME],
         weight_map=MappingProxyType(weight_map),
         shards=shards,
     )

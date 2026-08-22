@@ -41,6 +41,7 @@ from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from queue import Empty
 from threading import Condition, Event, Lock, Thread, Timer
@@ -309,6 +310,40 @@ def generate_deepseek_v4_dflash2(*args: Any, **kwargs: Any) -> Any:
     from mtplx.deepseek_v4_dflash2 import generate_deepseek_v4_dflash2 as generate
 
     return generate(*args, **kwargs)
+
+
+def _bind_deepseek_v4_dspark_attempt(
+    bundle: Any,
+) -> tuple[Callable[..., Any], dict[str, Any]]:
+    """Bind the sealed DSpark request call and its fixed cache receipt once."""
+
+    plan = bundle.target_model._mia_engine_plan
+    runtime_context = bundle.runtime_context
+    return (
+        partial(
+            generate_deepseek_v4_dflash2,
+            bundle,
+            runtime_context=runtime_context,
+        ),
+        {
+            "owner": "sealed_mia_engine_plan",
+            "plan_identity": str(plan.identity),
+            "context_capacity_tokens": int(plan.context_capacity_tokens),
+            "max_batch_tokens": int(plan.max_batch_tokens),
+            "max_sequences": int(plan.max_sequences),
+            "prefill_step_tokens": int(runtime_context.runtime.prefill_step_size),
+            "target_cache": "persistent_nvfp4_stock432_page_arena",
+            "draft_cache": "persistent_nvfp4_stock432_ring_arena",
+        },
+    )
+
+
+def _preflight_deepseek_v4_dflash2() -> Any:
+    """Validate the optional dependency before model construction starts."""
+
+    from mtplx.dflash_identity import require_pinned_dflash_install
+
+    return require_pinned_dflash_install()
 
 
 def bind_mtplx_deepseek_v4_dflash2_bundle(*args: Any, **kwargs: Any) -> Any:
@@ -1897,6 +1932,99 @@ def _select_backend_context_window(
     )
 
 
+def _validate_requested_backend_context_window(
+    backend: BackendDescriptor,
+    requested_context_window: int | None,
+) -> None:
+    """Reject an impossible sealed-backend launch before model construction."""
+
+    if backend.backend_id != "deepseek_v4_dspark":
+        return
+    requested = int(requested_context_window or 0)
+    maximum = int(backend.context_window_policy.maximum)
+    if requested > maximum:
+        raise ValueError(
+            "DeepSeek V4 DSpark --context-window "
+            f"{requested:,} exceeds the sealed Mia engine capacity of "
+            f"{maximum:,} tokens"
+        )
+
+
+def _deepseek_v4_dspark_sampler_is_sealed_greedy(
+    *,
+    temperature: Any,
+    top_p: Any,
+    top_k: Any,
+    presence_penalty: Any,
+    frequency_penalty: Any,
+) -> bool:
+    return (
+        float(temperature) == 0.0
+        and float(top_p) == 1.0
+        and int(top_k) == 0
+        and float(presence_penalty) == 0.0
+        and float(frequency_penalty) == 0.0
+    )
+
+
+def _validate_deepseek_v4_dspark_launch_sampler(args: argparse.Namespace) -> None:
+    if not _deepseek_v4_dspark_sampler_is_sealed_greedy(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        presence_penalty=args.default_presence_penalty,
+        frequency_penalty=args.default_frequency_penalty,
+    ):
+        raise ValueError(
+            "DeepSeek V4 DSpark requires fixed greedy sampling: "
+            "--temperature 0 --top-p 1 --top-k 0 "
+            "--default-presence-penalty 0 --default-frequency-penalty 0"
+        )
+
+
+def _validate_deepseek_v4_dspark_scheduler(args: argparse.Namespace) -> None:
+    if (
+        str(getattr(args, "generation_mode", "") or "") != "dspark"
+        and str(getattr(args, "backend_id", "") or "")
+        != "deepseek_v4_dspark"
+    ):
+        return
+    if (
+        str(getattr(args, "scheduler_mode", SchedulerMode.SERIAL.value))
+        != SchedulerMode.SERIAL.value
+    ):
+        raise ValueError("DeepSeek V4 DSpark requires --scheduler-mode serial")
+
+
+def _installed_backend_context_capacity(
+    backend: BackendDescriptor,
+    runtime: Any,
+    *,
+    configured_model_max: int,
+) -> int:
+    """Resolve capacity once from an installed sealed backend plan."""
+
+    if backend.backend_id != "deepseek_v4_dspark":
+        return int(configured_model_max)
+    from mtplx.deepseek_v4_mia_engine import (
+        MIA_CONTEXT_CAPACITY,
+        MiaDeepseekV4EnginePlan,
+    )
+
+    plan = getattr(getattr(runtime, "model", None), "_mia_engine_plan", None)
+    if not isinstance(plan, MiaDeepseekV4EnginePlan):
+        raise RuntimeError("DeepSeek V4 DSpark has no sealed Mia engine plan")
+    capacity = int(plan.context_capacity_tokens)
+    if (
+        capacity != MIA_CONTEXT_CAPACITY
+        or capacity != int(backend.context_window_policy.maximum)
+    ):
+        raise RuntimeError(
+            "DeepSeek V4 DSpark engine-plan and descriptor capacities disagree"
+        )
+    return capacity
+
+
 def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
     """Reject an invalid fixed-width MTP service before model construction."""
 
@@ -1956,6 +2084,7 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
 
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
+        _validate_deepseek_v4_dspark_scheduler(args)
         _validate_mtp_batch_settings(args)
         self.args = args
         try:
@@ -1992,6 +2121,9 @@ class ServerState:
                 args.paged_kv_quantization = "off"
         apply_paged_kv_quantization_env(args.paged_kv_quantization)
         self.model_id = args.model_id
+        self.deepseek_v4_dflash_identity = None
+        if args.generation_mode == "dspark":
+            self.deepseek_v4_dflash_identity = _preflight_deepseek_v4_dflash2()
         # Retrieval models are independent of the MTP generation path: they are
         # loaded on first use and may be absent entirely.
         from mtplx.retrieval import registry_from_args
@@ -2034,6 +2166,10 @@ class ServerState:
         _validate_backend_context_memory_budget(
             startup_backend,
             self.metal_memory_caps,
+            getattr(args, "context_window", None),
+        )
+        _validate_requested_backend_context_window(
+            startup_backend,
             getattr(args, "context_window", None),
         )
         self.profile = get_profile(args.profile)
@@ -2145,15 +2281,24 @@ class ServerState:
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
         self.deepseek_v4_dflash2_bundle = None
         self.deepseek_v4_dflash2_runtime_context = None
+        self.deepseek_v4_dspark_attempt = None
+        self.deepseek_v4_dspark_cache_ownership = None
         if args.generation_mode == "dspark":
             self.deepseek_v4_dflash2_bundle = self.model_scheduler.submit_foreground(
                 bind_mtplx_deepseek_v4_dflash2_bundle,
                 self.runtime,
                 source=str(args.model),
+                dflash_identity=self.deepseek_v4_dflash_identity,
                 batch_key="startup.deepseek_v4_dflash2",
             ).result()
             self.deepseek_v4_dflash2_runtime_context = (
                 self.deepseek_v4_dflash2_bundle.runtime_context
+            )
+            (
+                self.deepseek_v4_dspark_attempt,
+                self.deepseek_v4_dspark_cache_ownership,
+            ) = _bind_deepseek_v4_dspark_attempt(
+                self.deepseek_v4_dflash2_bundle,
             )
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
@@ -2304,9 +2449,14 @@ class ServerState:
             model_ref=str(getattr(args, "model", "") or "") or None,
             descriptor=self.backend_descriptor,
         )
-        self.model_context_window_max = _resolve_context_window(
+        configured_model_context_window = _resolve_context_window(
             self.runtime.tokenizer,
             args.model,
+        )
+        self.model_context_window_max = _installed_backend_context_capacity(
+            self.backend_descriptor,
+            self.runtime,
+            configured_model_max=configured_model_context_window,
         )
         requested_context_window = int(getattr(args, "context_window", None) or 0)
         self.context_window = _select_backend_context_window(
@@ -12850,6 +13000,38 @@ def _request_generation_mode_for_generation(
     return mode
 
 
+def _validate_deepseek_v4_dspark_request_sampler(
+    state: ServerState,
+    policy: Any,
+) -> None:
+    if getattr(state.runtime, "backend_id", None) != "deepseek_v4_dspark":
+        return
+    if _deepseek_v4_dspark_sampler_is_sealed_greedy(
+        temperature=policy.sampler_temperature,
+        top_p=policy.sampler_top_p,
+        top_k=policy.sampler_top_k,
+        presence_penalty=(
+            state.args.default_presence_penalty
+            if policy.sampler_presence_penalty is None
+            else policy.sampler_presence_penalty
+        ),
+        frequency_penalty=(
+            state.args.default_frequency_penalty
+            if policy.sampler_frequency_penalty is None
+            else policy.sampler_frequency_penalty
+        ),
+    ):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "DeepSeek V4 DSpark requests require greedy sampling "
+            "(temperature 0, top_p 1, top_k 0, presence_penalty 0, "
+            "frequency_penalty 0)"
+        ),
+    )
+
+
 def _request_depth_value(request: BaseModel) -> Any:
     for key in (
         "depth",
@@ -14638,9 +14820,45 @@ def _mtplx_apply_settings_payload(
                 "supported": list(DASHBOARD_MUTABLE_SETTINGS_KEYS),
             },
         )
+    backend = _backend_descriptor(state)
+    dspark_sampler_keys = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "presence_penalty",
+        "frequency_penalty",
+    } & set(payload)
+    if backend.backend_id == "deepseek_v4_dspark" and dspark_sampler_keys:
+        try:
+            prospective_sampler = {
+                key: _coerce_setting(key, payload[key])
+                for key in dspark_sampler_keys
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not _deepseek_v4_dspark_sampler_is_sealed_greedy(
+            temperature=prospective_sampler.get(
+                "temperature", state.args.temperature
+            ),
+            top_p=prospective_sampler.get("top_p", state.args.top_p),
+            top_k=prospective_sampler.get("top_k", state.args.top_k),
+            presence_penalty=prospective_sampler.get(
+                "presence_penalty", state.args.default_presence_penalty
+            ),
+            frequency_penalty=prospective_sampler.get(
+                "frequency_penalty", state.args.default_frequency_penalty
+            ),
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DeepSeek V4 DSpark settings require greedy sampling "
+                    "(temperature 0, top_p 1, top_k 0, presence_penalty 0, "
+                    "frequency_penalty 0)"
+                ),
+            )
     applied: dict[str, Any] = {}
     with state.lock:
-        backend = _backend_descriptor(state)
         for key, raw in payload.items():
             if raw is None:
                 continue
@@ -16398,6 +16616,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "live_frontier_assistant_tool_call_count",
     "live_frontier_tool_result_count",
     "live_frontier_unknown_tool_result_count",
+    "dspark_cache_ownership",
     "dynamic_paged_kv",
     "session_prompt_prefix_commit",
 )
@@ -16790,7 +17009,8 @@ def _policy_fingerprint(
         default=getattr(state.args, "generation_mode", "mtp"),
     )
     if (
-        getattr(state.runtime, "backend_id", None) == "deepseek_v4_dspark"
+        getattr(getattr(state, "runtime", None), "backend_id", None)
+        == "deepseek_v4_dspark"
         and effective_mode != "dspark"
     ):
         raise ValueError(
@@ -20159,6 +20379,7 @@ def _run_generation(
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
     prefill_chunk_tokens: int | None = None,
+    token_callback_required: bool = False,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -20284,168 +20505,170 @@ def _run_generation(
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
-            dynamic_kv_reservation = _dynamic_paged_kv_reservation(
-                prompt_tokens=len(prompt_ids),
-                max_new_tokens=response_max,
-                mtp_depth=effective_depth,
-            )
-            # Callers may tighten the prefill chunk for this generation
-            # (warming runs use a small chunk so their foreground-yield
-            # abort — checked once per chunk — fires fast); the serve-wide
-            # setting stays the default for real requests.
-            if prefill_chunk_tokens is None:
-                prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
-            with (
-                _temporary_env(dynamic_kv_reservation["env"]),
-                prefill_chunk_size_override(prefill_chunk_tokens),
-            ):
-                constraint = (
-                    constraint_spec.build(
-                        state.runtime.tokenizer, prompt_ids=prompt_ids
-                    )
-                    if constraint_spec is not None
-                    else None
+            dynamic_kv_reservation = None
+            if effective_mode == "dspark":
+                out = state.deepseek_v4_dspark_attempt(
+                    prompt_ids,
+                    max_tokens=response_max,
+                    token_callback=(
+                        record_tokens
+                        if response_is_streaming or token_callback_required
+                        else None
+                    ),
                 )
-                if effective_mode == "ar":
-                    out = generate_ar(
-                        state.runtime,
-                        prompt_ids,
-                        max_tokens=response_max,
-                        sampler=sampler,
-                        seed=generation_seed,
-                        token_callback=record_tokens,
-                        trace_label=trace_label,
-                        trace_metadata=trace_metadata,
-                        prefill_callback=prefill_callback,
-                        # The repetition trimmer retracts already-committed
-                        # tokens, which would desync the grammar matcher;
-                        # constrained output is schema-shaped, not freeform.
-                        repetition_stop=(
-                            False
-                            if constraint is not None
-                            else uncapped_repetition_stop
-                        ),
-                        loop_guard=_loop_guard_enabled(),
-                        thinking_guard=thinking_guard_config,
-                        constraint=constraint,
-                        # Warm-prefix parity with the MTP branch (#246): the
-                        # AR lane used to full-prefill unconditionally and
-                        # hardcode cached_tokens 0 / cache_hit false.
-                        session_bank=session_bank,
-                        session_id=session_id,
-                        session_restore_mode=_session_bank_restore_mode(
-                            session_restore_mode
-                        ),
-                        session_template_hash=session_template_hash,
-                        session_draft_head_identity=session_draft_head_identity,
-                        session_policy_fingerprint=session_policy_fingerprint,
-                        capture_final_state=session_bank is not None,
-                        abort_check=(
-                            (lambda: bool(cancel_event.is_set()))
-                            if cancel_event is not None
-                            else None
-                        ),
+            else:
+                dynamic_kv_reservation = _dynamic_paged_kv_reservation(
+                    prompt_tokens=len(prompt_ids),
+                    max_new_tokens=response_max,
+                    mtp_depth=effective_depth,
+                )
+                # Callers may tighten the prefill chunk for this generation
+                # (warming runs use a small chunk so their foreground-yield
+                # abort — checked once per chunk — fires fast); the serve-wide
+                # setting stays the default for real requests.
+                if prefill_chunk_tokens is None:
+                    prefill_chunk_tokens = getattr(
+                        state.args, "prefill_chunk_tokens", None
                     )
-                elif effective_mode == "dspark":
-                    if float(getattr(sampler, "temperature", 0.0)) != 0.0:
-                        raise ValueError("Phase 1 DSpark supports greedy temperature 0 only")
-                    if constraint is not None:
-                        raise ValueError("Phase 1 DSpark does not support constrained decoding")
-                    out = generate_deepseek_v4_dflash2(
-                        state.deepseek_v4_dflash2_bundle,
-                        prompt_ids,
-                        max_tokens=response_max,
-                        token_callback=record_tokens,
-                        runtime_context=state.deepseek_v4_dflash2_runtime_context,
+                with (
+                    _temporary_env(dynamic_kv_reservation["env"]),
+                    prefill_chunk_size_override(prefill_chunk_tokens),
+                ):
+                    constraint = (
+                        constraint_spec.build(
+                            state.runtime.tokenizer, prompt_ids=prompt_ids
+                        )
+                        if constraint_spec is not None
+                        else None
                     )
-                else:
-                    adaptive_policy = _make_adaptive_policy(
-                        state.args, max_depth=effective_depth
-                    )
-                    if vision_splice is not None and vision_splice.cursor:
-                        # Retries and tool-loop redispatches replay the
-                        # full prompt, so the image rows must rewind.
-                        vision_splice.reset()
-                    out = generate_mtpk(
-                        state.runtime,
-                        prompt_ids,
-                        constraint=constraint,
-                        vision_splice=vision_splice,
-                        abort_check=(
-                            (lambda: bool(cancel_event.is_set()))
-                            if cancel_event is not None
-                            else None
-                        ),
-                        max_tokens=response_max,
-                        sampler=sampler,
-                        draft_sampler=effective_draft_sampler,
-                        speculative_depth=effective_depth,
-                        seed=generation_seed,
-                        mtp_hidden_variant="post_norm",
-                        mtp_cache_policy="persistent",
-                        mtp_history_policy="committed",
-                        verify_strategy=state.args.verify_strategy,
-                        verify_core=state.args.verify_core,
-                        draft_core=str(
-                            getattr(state.args, "draft_core", None) or "stock"
-                        ),
-                        token_callback=record_tokens,
-                        session_bank=session_bank,
-                        session_id=session_id,
-                        session_restore_mode=_session_bank_restore_mode(
-                            session_restore_mode
-                        ),
-                        session_template_hash=session_template_hash,
-                        session_draft_head_identity=session_draft_head_identity,
-                        session_policy_fingerprint=session_policy_fingerprint,
-                        capture_final_state=session_bank is not None,
-                        commit_prompt_state_to_bank=(
-                            commit_prompt_prefix_to_bank
-                            and session_bank is not None
-                            and session_id is not None
-                        ),
-                        # Prompt-prefix commits happen before decode mutates
-                        # the same KV/MTP cache objects. They must snapshot or
-                        # skip, not live-lease the mutable prompt cache.
-                        commit_prompt_state_keep_live_ref=False,
-                        trace_label=trace_label,
-                        trace_metadata=trace_metadata,
-                        prefill_callback=prefill_callback,
-                        adaptive_policy=adaptive_policy,
-                        repetition_stop=uncapped_repetition_stop,
-                        loop_guard=_loop_guard_enabled(),
-                        thinking_guard=thinking_guard_config,
-                        online_correction_cache=bool(
-                            state.args.online_correction_cache
-                        ),
-                        online_correction_cache_min_depth=int(
-                            state.args.online_correction_cache_min_depth
-                        ),
-                        online_correction_cache_key=str(
-                            state.args.online_correction_cache_key
-                        ),
-                        prompt_correction_cache=bool(
-                            state.args.prompt_correction_cache
-                        ),
-                        prompt_correction_cache_min_depth=int(
-                            state.args.prompt_correction_cache_min_depth
-                        ),
-                        online_hidden_corrector_alpha=float(
-                            state.args.online_hidden_corrector_alpha
-                        ),
-                        online_hidden_corrector_decay=float(
-                            state.args.online_hidden_corrector_decay
-                        ),
-                        online_hidden_corrector_warmup=int(
-                            state.args.online_hidden_corrector_warmup
-                        ),
-                        online_hidden_corrector_max_feed_depth=(
-                            state.args.online_hidden_corrector_max_feed_depth
-                        ),
-                        online_hidden_corrector_key=str(
-                            state.args.online_hidden_corrector_key
-                        ),
-                    )
+                    if effective_mode == "ar":
+                        out = generate_ar(
+                            state.runtime,
+                            prompt_ids,
+                            max_tokens=response_max,
+                            sampler=sampler,
+                            seed=generation_seed,
+                            token_callback=record_tokens,
+                            trace_label=trace_label,
+                            trace_metadata=trace_metadata,
+                            prefill_callback=prefill_callback,
+                            # The repetition trimmer retracts already-committed
+                            # tokens, which would desync the grammar matcher;
+                            # constrained output is schema-shaped, not freeform.
+                            repetition_stop=(
+                                False
+                                if constraint is not None
+                                else uncapped_repetition_stop
+                            ),
+                            loop_guard=_loop_guard_enabled(),
+                            thinking_guard=thinking_guard_config,
+                            constraint=constraint,
+                            # Warm-prefix parity with the MTP branch (#246): the
+                            # AR lane used to full-prefill unconditionally and
+                            # hardcode cached_tokens 0 / cache_hit false.
+                            session_bank=session_bank,
+                            session_id=session_id,
+                            session_restore_mode=_session_bank_restore_mode(
+                                session_restore_mode
+                            ),
+                            session_template_hash=session_template_hash,
+                            session_draft_head_identity=session_draft_head_identity,
+                            session_policy_fingerprint=session_policy_fingerprint,
+                            capture_final_state=session_bank is not None,
+                            abort_check=(
+                                (lambda: bool(cancel_event.is_set()))
+                                if cancel_event is not None
+                                else None
+                            ),
+                        )
+                    else:
+                        adaptive_policy = _make_adaptive_policy(
+                            state.args, max_depth=effective_depth
+                        )
+                        if vision_splice is not None and vision_splice.cursor:
+                            # Retries and tool-loop redispatches replay the
+                            # full prompt, so the image rows must rewind.
+                            vision_splice.reset()
+                        out = generate_mtpk(
+                            state.runtime,
+                            prompt_ids,
+                            constraint=constraint,
+                            vision_splice=vision_splice,
+                            abort_check=(
+                                (lambda: bool(cancel_event.is_set()))
+                                if cancel_event is not None
+                                else None
+                            ),
+                            max_tokens=response_max,
+                            sampler=sampler,
+                            draft_sampler=effective_draft_sampler,
+                            speculative_depth=effective_depth,
+                            seed=generation_seed,
+                            mtp_hidden_variant="post_norm",
+                            mtp_cache_policy="persistent",
+                            mtp_history_policy="committed",
+                            verify_strategy=state.args.verify_strategy,
+                            verify_core=state.args.verify_core,
+                            draft_core=str(
+                                getattr(state.args, "draft_core", None) or "stock"
+                            ),
+                            token_callback=record_tokens,
+                            session_bank=session_bank,
+                            session_id=session_id,
+                            session_restore_mode=_session_bank_restore_mode(
+                                session_restore_mode
+                            ),
+                            session_template_hash=session_template_hash,
+                            session_draft_head_identity=session_draft_head_identity,
+                            session_policy_fingerprint=session_policy_fingerprint,
+                            capture_final_state=session_bank is not None,
+                            commit_prompt_state_to_bank=(
+                                commit_prompt_prefix_to_bank
+                                and session_bank is not None
+                                and session_id is not None
+                            ),
+                            # Prompt-prefix commits happen before decode mutates
+                            # the same KV/MTP cache objects. They must snapshot or
+                            # skip, not live-lease the mutable prompt cache.
+                            commit_prompt_state_keep_live_ref=False,
+                            trace_label=trace_label,
+                            trace_metadata=trace_metadata,
+                            prefill_callback=prefill_callback,
+                            adaptive_policy=adaptive_policy,
+                            repetition_stop=uncapped_repetition_stop,
+                            loop_guard=_loop_guard_enabled(),
+                            thinking_guard=thinking_guard_config,
+                            online_correction_cache=bool(
+                                state.args.online_correction_cache
+                            ),
+                            online_correction_cache_min_depth=int(
+                                state.args.online_correction_cache_min_depth
+                            ),
+                            online_correction_cache_key=str(
+                                state.args.online_correction_cache_key
+                            ),
+                            prompt_correction_cache=bool(
+                                state.args.prompt_correction_cache
+                            ),
+                            prompt_correction_cache_min_depth=int(
+                                state.args.prompt_correction_cache_min_depth
+                            ),
+                            online_hidden_corrector_alpha=float(
+                                state.args.online_hidden_corrector_alpha
+                            ),
+                            online_hidden_corrector_decay=float(
+                                state.args.online_hidden_corrector_decay
+                            ),
+                            online_hidden_corrector_warmup=int(
+                                state.args.online_hidden_corrector_warmup
+                            ),
+                            online_hidden_corrector_max_feed_depth=(
+                                state.args.online_hidden_corrector_max_feed_depth
+                            ),
+                            online_hidden_corrector_key=str(
+                                state.args.online_hidden_corrector_key
+                            ),
+                        )
         except PostcommitAbort:
             # abort_check tripped inside the prefill: the client disconnected
             # mid-prompt-processing. Reuse the exact cancellation path client
@@ -20553,9 +20776,16 @@ def _run_generation(
             mtp_depth=actual_mtp_depth if effective_mode == "mtp" else 0,
             generation_limits=generation_limits,
         )
-        envelope["dynamic_paged_kv"] = {
-            key: value for key, value in dynamic_kv_reservation.items() if key != "env"
-        }
+        if effective_mode == "dspark":
+            envelope["dspark_cache_ownership"] = (
+                state.deepseek_v4_dspark_cache_ownership
+            )
+        else:
+            envelope["dynamic_paged_kv"] = {
+                key: value
+                for key, value in dynamic_kv_reservation.items()
+                if key != "env"
+            }
         for key in (
             "paged_kv_capacity_tokens",
             "paged_kv_num_blocks",
@@ -26197,6 +26427,7 @@ def create_app(state: ServerState) -> FastAPI:
                     },
                 },
             )
+        _validate_deepseek_v4_dspark_request_sampler(state, policy)
         # Locals alias the policy so the generation/streaming body below and
         # its closures read exactly as before the extraction.
         opencode_client = policy.opencode_client
@@ -26262,6 +26493,14 @@ def create_app(state: ServerState) -> FastAPI:
             except ResponseFormatError as constraint_error:
                 raise HTTPException(status_code=400, detail=str(constraint_error))
         if constraint_spec is not None:
+            if getattr(state.runtime, "backend_id", None) == "deepseek_v4_dspark":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "constrained decoding is not supported on the "
+                        "DeepSeek V4 DSpark backend"
+                    ),
+                )
             if getattr(state.runtime, "backend_id", None) == "gemma4_assistant":
                 raise HTTPException(
                     status_code=400,
@@ -26824,6 +27063,7 @@ def create_app(state: ServerState) -> FastAPI:
                         vision_splice=vision_splice,
                         request_observability=request_observability,
                         token_callback=_nonstream_on_tokens,
+                        token_callback_required=nonstream_stop_monitor is not None,
                         prefill_callback=_nonstream_on_prefill,
                         cancel_event=nonstream_cancel_event,
                         mtp_batch_finalize_ownership=mtp_batch_finalize_ownership,
@@ -26863,6 +27103,7 @@ def create_app(state: ServerState) -> FastAPI:
                     vision_splice=vision_splice,
                     request_observability=request_observability,
                     token_callback=_nonstream_on_tokens,
+                    token_callback_required=nonstream_stop_monitor is not None,
                     prefill_callback=_nonstream_on_prefill,
                     cancel_event=nonstream_cancel_event,
                     mtp_batch_finalize_ownership=mtp_batch_finalize_ownership,
@@ -30275,6 +30516,7 @@ def create_app(state: ServerState) -> FastAPI:
             endpoint="completions",
             prompt_tokens=len(prompt_ids),
         )
+        _validate_deepseek_v4_dspark_request_sampler(state, policy)
         request_generation_mode = policy.request_generation_mode
         request_depth = policy.request_depth
         effective_request_depth = policy.effective_request_depth
@@ -31005,10 +31247,20 @@ def _apply_backend_server_defaults(
     *,
     explicit_flags: set[str],
 ) -> None:
-    if getattr(args, "generation_mode", None) == "dspark":
-        requested_backend = str(getattr(args, "backend_id", "") or "")
+    generation_mode = str(getattr(args, "generation_mode", "") or "")
+    requested_backend = str(getattr(args, "backend_id", "") or "")
+    explicit_backend = _server_flag_present(explicit_flags, "backend-id")
+    if (
+        explicit_backend
+        and requested_backend == "deepseek_v4_dspark"
+        and generation_mode != "dspark"
+    ):
+        raise ValueError(
+            "--backend-id deepseek_v4_dspark requires --generation-mode dspark"
+        )
+    if generation_mode == "dspark":
         if (
-            _server_flag_present(explicit_flags, "backend-id")
+            explicit_backend
             and requested_backend != "deepseek_v4_dspark"
         ):
             raise ValueError(
@@ -31087,6 +31339,7 @@ def _apply_backend_server_defaults(
     ):
         args.reasoning_effort = backend.reasoning_codec.default_effort
     if backend.backend_id == "deepseek_v4_dspark":
+        _validate_deepseek_v4_dspark_scheduler(args)
         if not _server_flag_present(explicit_flags, "model-id"):
             args.model_id = "deepseek-v4-dspark-dflash2"
         if not _server_flag_present(
@@ -31097,6 +31350,7 @@ def _apply_backend_server_defaults(
             args.top_p = 1.0
         if not _server_flag_present(explicit_flags, "top-k"):
             args.top_k = 0
+        _validate_deepseek_v4_dspark_launch_sampler(args)
         if not _server_flag_present(
             explicit_flags,
             "depth",
@@ -31864,11 +32118,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.fan_mode = normalize_fan_mode(getattr(args, "fan_mode", FAN_MODE_DEFAULT))
     except ValueError as exc:
         parser.error(str(exc))
-    _apply_backend_server_defaults(args, explicit_flags=args._cli_flags)
-    sync_backend_arg_aliases(args)
     if args.stock_ar:
         args.generation_mode = "ar"
         args.load_mtp = False
+    _apply_backend_server_defaults(args, explicit_flags=args._cli_flags)
+    sync_backend_arg_aliases(args)
     if getattr(args, "reasoning", None) is None:
         args.reasoning = args.reasoning_mode
     args.reasoning = _normalize_reasoning_mode(args.reasoning)

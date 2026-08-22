@@ -10,8 +10,9 @@
 **Architecture:** The exact record arithmetic remains authoritative, but
 storage ownership is superseded by the reusable system plan in
 `docs/plans/2026-08-21-system-paged-cache.md`. Target and DSpark
-produce normalized latent plus a rotated tail; the writer substitutes that tail
-before NVFP4-quantizing the post-RoPE V row and also stores it as BF16 for K. A construction-installed
+produce normalized latent plus a rotated tail; the writer NVFP4-quantizes the
+unmodified 512-wide latent V row and stores the rotated tail separately as BF16
+for K. Construction-installed
 Metal consumers read selected records directly without whole-cache
 dequantization or whole-context scores. Decode uses the measured one-head
 online-softmax kernel. Prefill uses the existing M5 NAX tensor primitive with
@@ -27,6 +28,53 @@ for MLX `mxfp4`, Mia `rope368`, the community UE8M0/360-byte format, other head
 geometry, or another model family.
 
 **Design:** `docs/specs/2026-08-21-deepseek-v4-mia-nvfp4-kv-design.md`
+
+## Execution status — 2026-08-22
+
+The artifact, ownership, and original CPU/static portions of this plan are
+complete on `feat/deepseek-v4-dspark-k5`:
+
+- exact Mia K216 target and Sero K64 draft artifact identity, tensor ownership,
+  cross-shard MXFP8 scale mapping, tokenizer identity, 384K admission, and
+  DFlash commit identity are validated before model execution;
+- `stock432` NVFP4 record production, compressor arithmetic, bounded indexer
+  geometry, fixed MLA route installation, sealed cache snapshot/restore, Trellis
+  launch geometry, carried mHC bindings, and DFlash lifecycle ownership are
+  implemented without enabled hot-path fallbacks;
+- the exact 48-shard target plus K64 draft construction gate passes, and the
+  consolidated CPU/static integration gate passes after the final artifact and
+  carried-mHC corrections.
+
+The final source-parity review then found performance-path omissions that make
+the earlier execution receipts invalid.  The construction-installed Trellis,
+indexer, compressor, raw stock432, MLA, stacked input projections, shared
+target/draft RoPE providers, exact mismatch gate, fused learned-Q/KV plus
+Q-normalize/RoPE/stock432 prologue, and TP1 B12X MXFP8 WO chain are now
+implemented and construction-bound for all 43 target and three draft owners.
+The remaining implementation review is closing direct fixed-page consumption
+in MLA so the exact target route does not gather its visible raw window after
+each cache write.  No long model run or benchmark is permitted before that
+review, the upstream merge, and the focused Metal gates complete.
+
+The remaining gates must execute in this order:
+
+1. finish and construction-bind the source-derived Q/KV prologue and TP1 B12X
+   WO kernels for all 43 target and three draft owners, then complete the
+   independent whole-branch review and consolidated static gate;
+2. commit the complete implementation, merge the current upstream `main` into
+   the published PR branch, resolve and verify the six overlapping paths, then
+   create a clean execution worktree at that exact SHA;
+3. acquire the exclusive Metal lane and run only the focused byte/parity gates
+   for the Q/KV prologue, B12X WO chain, compressor, paged indexer, and every
+   installed MLA route/shape, including the ratio-128 tile-crossing case;
+4. run one short exact Mia/Sero generation and committed-token parity gate;
+5. only after those pass, run the requested cold 1K, 16K, and 64K prefill matrix
+   with 1,024 output tokens, prefill TPS, decode TPS, and peak memory;
+6. update receipts and publish the PR with the exact Mia/Sero artifact and pinned
+   DFlash commit named explicitly.
+
+No long benchmark receipt is valid until the focused Metal and exact-generation
+gates above pass.
 
 ---
 
@@ -60,10 +108,10 @@ geometry, or another model family.
 **Does NOT cover:** model attention, DSpark wiring, alternate NVFP4 layouts, or
 fused sparse consumption.
 
-- [ ] **Step 1: Write the failing record contract check**
+- [x] **Step 1: Write the failing record contract check**
 
 ```python
-def test_mia_stock432_record_quantizes_the_post_rope_row_for_key_and_value():
+def test_mia_stock432_record_keeps_unrotated_value_and_separate_rope_key():
     latent = fixed_bf16_rows(shape=(1, 2, 512))
     rope = fixed_bf16_rows(shape=(1, 2, 64))
     rows = MiaNVFP4Rows()
@@ -75,10 +123,10 @@ def test_mia_stock432_record_quantizes_the_post_rope_row_for_key_and_value():
     assert bytes(rows.records[0, 0, 304:432]) == bf16_bytes(rope[0, 0])
     assert_allclose(key[..., :448], value[..., :448])
     assert_allclose(key[..., 448:], rope)
-    assert_allclose(value[..., 448:], rope)
+    assert_allclose(value[..., 448:], decode_nvfp4(latent)[..., 448:])
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -88,7 +136,7 @@ Run:
 
 Expected: import failure for `mtplx.deepseek_v4_nvfp4_kv`.
 
-- [ ] **Step 3: Implement the fixed codec and owner**
+- [x] **Step 3: Implement the fixed codec and owner**
 
 ```python
 NVFP4_HEAD_DIM = 512
@@ -115,12 +163,12 @@ zero padding, and copies the supplied rotated tail as BF16 bytes.  The decoder
 uses the fixed E2M1 table and E4M3 bit decoder already established by
 `mtplx.compressed_tensors`.
 
-- [ ] **Step 4: Verify GREEN and owner mutations**
+- [x] **Step 4: Verify GREEN and owner mutations**
 
 Run the same test file.  Expected: record, replacement, truncation, and state
 round-trip checks pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/deepseek_v4_nvfp4_kv.py tests/test_deepseek_v4_nvfp4_kv.py docs/specs docs/plans
@@ -142,13 +190,13 @@ git commit -m "feat: add Mia stock432 NVFP4 cache records"
 **Does NOT cover:** direct sparse Metal attention; this task uses record decode as
 the required arithmetic bring-up gate and is not considered the finished lane.
 
-- [ ] **Step 1: Write failing construction and arithmetic checks**
+- [x] **Step 1: Write failing construction and arithmetic checks**
 
 The checks require `DeepseekV4NVFP4Cache` for all 43 target layers,
 `MiaNVFP4Rows` for all three draft rings, the post-RoPE NVFP4 row as V,
 first-448 plus stored BF16 RoPE as K, and exact target/draft trim/replace behavior.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 ```bash
 .venv/bin/python -m pytest -q \
@@ -159,7 +207,7 @@ first-448 plus stored BF16 RoPE as K, and exact target/draft trim/replace behavi
 
 Expected: failures naming affine owners or the old shared rotated K/V result.
 
-- [ ] **Step 3: Install the source-correct owners and arithmetic**
+- [x] **Step 3: Install the source-correct owners and arithmetic**
 
 ```python
 class DeepseekV4NVFP4Cache(DeepseekV4Cache):
@@ -172,17 +220,17 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
 ```
 
 Split attention projection into `(latent, rotated_rope)`, split compressor output
-at the normalized pooled latent boundary, pack the post-RoPE row for the
+at the normalized pooled latent boundary, pack the unmodified latent row for the
 bring-up path, and retain the source model's output inverse RoPE. Bind `DeepseekV4NVFP4Cache` and
 the three NVFP4 draft rings once at exact-artifact construction.  DFlash2 rejects
 any non-`stock432` owner before generation.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run the three files above.  Expected: all direct cache/arithmetic/adapter contracts
 pass; no affine owner remains on the enabled exact-Mia route.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/models/deepseek_v4.py mtplx/models/deepseek_v4_dspark.py \
@@ -204,13 +252,13 @@ git commit -m "fix: restore Mia NVFP4 key value arithmetic"
 **Does NOT cover:** generic attention dimensions, batching beyond one request,
 other record layouts, non-M5 prefill, or a runtime fallback.
 
-- [ ] **Step 1: Write the failing direct-consumer comparison**
+- [x] **Step 1: Write the failing direct-consumer comparison**
 
 Use fixed `stock432` records, 64 query heads, a 128-row causal window, selected
 compressed indices, learned sinks, and both M1 and M6 query shapes.  Compare the
 Metal output with an online-softmax oracle reconstructed from the same records.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_deepseek_v4_nvfp4_kv.py -k sparse_attention
@@ -218,7 +266,7 @@ Metal output with an online-softmax oracle reconstructed from the same records.
 
 Expected: import failure for `mtplx.kernels.deepseek_v4_nvfp4_mla`.
 
-- [ ] **Step 3: Implement the fixed Metal kernel**
+- [x] **Step 3: Implement the fixed Metal kernel**
 
 ```python
 def nvfp4_sparse_mla(
@@ -258,13 +306,78 @@ git add mtplx/kernels/deepseek_v4_nvfp4_mla.py mtplx/models/deepseek_v4.py \
 git commit -m "perf: consume Mia NVFP4 cache in sparse Metal MLA"
 ```
 
-### Task 4: Exact-model execution, receipts, and PR correction
+### Task 3A: Close the inference-engine review blockers
+
+**Files:**
+- Modify: `mtplx/deepseek_v4_exl3.py`
+- Modify: `mtplx/deepseek_v4_paged_indexer.py`
+- Modify: `mtplx/kernels/deepseek_v4_compressor.py`
+- Modify: `mtplx/models/deepseek_v4.py`
+- Modify: `mtplx/deepseek_v4_mia_engine.py`
+- Modify only directly relevant DeepSeek V4 tests.
+
+**Security flag:** artifact validation/load identity must remain exact.
+
+**Does NOT cover:** unrelated model paths, generic optimization experiments,
+new runtime fallbacks, long benchmarks before the port is complete, or tests for
+hypothetical behavior outside the installed Mia route and reusable cache contract.
+
+- [x] **Step 1: Preserve the pinned source contracts before changing kernels**
+
+Record the exact official/vLLM/Mia/SparkInfer arithmetic, tie ordering, route
+block capacity, workspace ownership, RoPE-cache ownership, and artifact
+validation/load boundary used by each fix.  Where the available sources
+disagree, resolve the disagreement from the packaged Mia lane before choosing
+an implementation; do not create a third arithmetic definition.
+
+- [x] **Step 2: Fix the Trellis launch and workspace geometry**
+
+Bound descriptor capacity and MMA grid Z by the construction-proven maximum
+packed route blocks, not routed task count.  Port SparkInfer's frozen caller-owned
+intermediate/route workspace semantics for the installed M1..M6 and bounded
+prefill routes without a host readback, hot eligibility check, or fallback.
+
+- [x] **Step 3: Fix the indexer data plane**
+
+Preserve lowest-logical-index selection for pivot ties in both prefill folds and
+decode slices.  Replace the original K40 scorer with source-derived Q32xK256
+ownership and bounded 128 MiB/512 MiB FP32 score slabs that feed the fixed
+top-512 carry; never allocate query-by-full-context scores.  Use
+construction-owned RoPE tables rather than per-head transcendental calls.
+
+- [x] **Step 4: Fix compressor, cache, and lifecycle correctness**
+
+Make stock432 and Mia132 compressor records follow the chosen packaged-source
+BF16/RMSNorm/RoPE boundary exactly.  Include the fixed compressor rollback
+journal in reusable cache snapshots.  Release target/draft arenas on every
+prewarm exit, and bind shard validation to the bytes actually installed so cold
+construction does not validate one object and load another.
+
+- [ ] **Step 5: Port the remaining packaged-Mia fused projection paths**
+
+Construction-bind the exact TP1 stacked `wq_a+wkv` and `wkv+wgate` owners, one
+shared target/draft RoPE graph, the fused learned-Q/KV RMSNorm and one-cast
+Q-normalize/RoPE/stock432 prologue, and the packaged B12X inverse-RoPE/MXFP8
+WO-A/WO-B chain.  Preserve target versus ephemeral K5 cache ownership, the
+384K target page admission plus fixed draft lookahead, Mia's `ceil(log2())`
+activation scale encoding, the BF16 WO-A bottleneck, and original checkpoint
+parameter names.  Installed execution has no nullable callable, metadata
+revalidation, generic QMM substitution, or silent fallback.
+
+- [ ] **Step 6: Focused red/green and integration gates**
+
+For each encountered defect, first run the smallest deterministic reproducer,
+then the fix, then the relevant DeepSeek V4 suite.  Static gates do not count as
+Metal parity.  Do not run the requested long matrix until all review blockers
+and subsequent whole-branch review findings are closed.
+
+### Task 4: Exact-model execution, receipts, and PR publication
 
 **Files:**
 - Modify: `scripts/deepseek_v4_dspark_k5_bench.py`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-1024x1024.json`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-16384x1024-cold.json`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-65536x1024-cold.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-db155912-1024x1024.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-db155912-16384x1024-cold.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-db155912-65536x1024-cold.json`
 
 **Security flag:** `none`
 
@@ -274,7 +387,10 @@ lengths, or optimization experiments not nominated by these executions.
 - [ ] **Step 1: Update receipt identity and run focused non-GPU verification**
 
 Require `kv_cache_format=nvfp4_stock432`, K216 target, K64 draft, pinned model and
-source revisions.  Run lint plus only the DeepSeek NVFP4/DSpark/DFlash2 suites.
+source revisions. Refuse a dirty source tree before MLX/model load, commit the
+complete implementation, merge and verify the live upstream PR base, and run
+execution gates from a clean worktree at that exact SHA. Run lint plus only the
+DeepSeek NVFP4/DSpark/DFlash2 suites.
 
 - [ ] **Step 2: Run one guarded real epoch and committed-token parity gate**
 
@@ -289,14 +405,18 @@ generate roughly 100 tokens, then restore and verify the prior service.
 - [ ] **Step 4: Run the requested cold matrix**
 
 Run exact `1024/1024`, `16384/1024`, and `65536/1024`.  Each receipt records
-prefill tok/s, decode tok/s, generated count, acceptance, peak/active memory,
-output digest, source commit, artifact revisions, and `stock432` identity.
+prefill tok/s, decode tok/s, generated count, acceptance, MLX peak/active memory,
+process peak RSS, output digest, source commit, artifact revisions, and
+`stock432` identity.
 
-- [ ] **Step 5: Correct and publish PR #312**
+- [ ] **Step 5: Correct and publish upstream PR #312**
 
 Remove superseded affine/wrong-model claims, include only exact-model NVFP4
-evidence, push the implementation and receipts, update the PR body, and make it
-ready only after every required gate succeeds.
+evidence, push the implementation and receipts to its existing feature head,
+inspect the complete diff against upstream `main`, update the PR body, and make
+it ready only after every required gate succeeds. The PR head is
+`davidtai/MTPLX-1:feat/deepseek-v4-dspark-k5`, so push through the `mtplx1`
+remote rather than `origin`.
 
 - [ ] **Step 6: Final verification**
 

@@ -3908,7 +3908,64 @@ def restore_cache(
     restore_meta_state: bool = True,
     clone_states: bool = True,
 ) -> None:
+    cache_count = len(cache)
+    state_count = len(snapshot.states)
+    meta_count = len(snapshot.meta_states)
+    if cache_count != state_count or cache_count != meta_count:
+        raise ValueError(
+            "cache snapshot length mismatch: "
+            f"cache={cache_count}, states={state_count}, meta_states={meta_count}"
+        )
+
+    atomic_pairs = tuple(
+        (
+            getattr(entry, "prepare_snapshot_restore", None),
+            getattr(entry, "install_snapshot_restore", None),
+        )
+        for entry in cache
+    )
+    if (
+        restore_meta_state
+        and atomic_pairs
+        and all(callable(prepare) and callable(install) for prepare, install in atomic_pairs)
+    ):
+        pairs = tuple(zip(snapshot.states, snapshot.meta_states, strict=True))
+        if all(state is None and meta_state is None for state, meta_state in pairs):
+            return
+        if any(state is None or meta_state is None for state, meta_state in pairs):
+            raise ValueError("atomic cache snapshot requires complete state/meta pairs")
+        prepared = []
+        for entry, (state, meta_state), (prepare, install) in zip(
+            cache,
+            pairs,
+            atomic_pairs,
+            strict=True,
+        ):
+            install_view = not clone_states and _is_trimmable(entry)
+            prepared_state = (
+                _lazy_state_view(state) if install_view else _clone_tree(state)
+            )
+            prepared.append(
+                (install, prepare(prepared_state, _clone_tree(meta_state)))
+            )
+        for install, prepared_pair in prepared:
+            install(prepared_pair)
+        return
+
     for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
+        atomic_restore = getattr(entry, "restore_snapshot_state", None)
+        if (
+            state is not None
+            and restore_meta_state
+            and meta_state is not None
+            and callable(atomic_restore)
+        ):
+            install_view = not clone_states and _is_trimmable(entry)
+            prepared_state = (
+                _lazy_state_view(state) if install_view else _clone_tree(state)
+            )
+            atomic_restore(prepared_state, _clone_tree(meta_state))
+            continue
         if state is not None:
             install_view = not clone_states and _is_trimmable(entry)
             _restore_state_preserving_container(entry, state, clone=not install_view)

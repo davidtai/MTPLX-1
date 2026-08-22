@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 import math
 
 import mlx.core as mx
@@ -20,6 +20,7 @@ MIA_NVFP4_SCALE_BYTES = 32
 MIA_NVFP4_PADDING_OFFSET = 288
 MIA_NVFP4_ROPE_OFFSET = 304
 MIA_NVFP4_RECORD_BYTES = 432
+MIA_DSPARK_CONTEXT_ROWS = 128
 
 
 _NVFP4_HEADER = r"""
@@ -149,15 +150,24 @@ def _pack_stock432(latent: mx.array, rope: mx.array) -> mx.array:
         raise ValueError("Mia stock432 latent and RoPE row prefixes differ")
     if int(rope.shape[-1]) != MIA_NVFP4_ROPE_DIM:
         raise ValueError("Mia stock432 RoPE rows must end in width 64")
-    return _run_pack_stock432(latent, rope)
+    return _run_pack_stock432(
+        latent,
+        rope,
+        kernel=_stock432_pack_kernel(),
+    )
 
 
-def _run_pack_stock432(latent: mx.array, rope: mx.array) -> mx.array:
+def _run_pack_stock432(
+    latent: mx.array,
+    rope: mx.array,
+    *,
+    kernel,
+) -> mx.array:
     """Direct packer for a construction-qualified stock432 route."""
     row_count = 1
     for size in latent.shape[:-1]:
         row_count *= int(size)
-    records = _stock432_pack_kernel()(
+    records = kernel(
         inputs=[mx.contiguous(latent), mx.contiguous(rope)],
         template=[("T", mx.bfloat16)],
         grid=(row_count * 32, 1, 1),
@@ -176,8 +186,8 @@ def install_stock432_record_packer(*, head_dim: int, rope_dim: int):
         raise ValueError(
             f"unsupported Mia stock432 geometry: {observed} != {expected}"
         )
-    _stock432_pack_kernel()
-    return _run_pack_stock432
+    kernel = _stock432_pack_kernel()
+    return partial(_run_pack_stock432, kernel=kernel)
 
 
 _E2M1_TABLE = mx.array(
@@ -397,6 +407,13 @@ class FixedMiaNVFP4Ring:
             row_shape=(self.record_bytes,),
             dtype=mx.uint8,
         )
+        logical = (
+            mx.arange(capacity_rows * 2, dtype=mx.int32) % capacity_rows
+        )
+        logical_blocks = logical // self._pool.block_size
+        self._slot_blocks = self._pool.block_table[logical_blocks]
+        self._slot_offsets = logical - logical_blocks * self._pool.block_size
+        mx.eval(self._slot_blocks, self._slot_offsets)
 
     def __len__(self) -> int:
         return int(self._pool.offset)
@@ -414,8 +431,14 @@ class FixedMiaNVFP4Ring:
     def nbytes(self) -> int:
         return int(self._pages.nbytes)
 
-    def decode(self) -> tuple[mx.array, mx.array]:
-        return decode_stock432(self.records)
+    def decode(
+        self,
+        start: int = 0,
+        stop: int | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        begin = int(start)
+        end = self._capacity_rows if stop is None else int(stop)
+        return decode_stock432(self.records[:, begin:end])
 
     def _append_installed_records(
         self,
@@ -424,9 +447,10 @@ class FixedMiaNVFP4Ring:
         prefix: tuple[int, ...],
     ) -> None:
         del prefix
+        count = int(records.shape[1])
         self._pool._write_installed_tail(
             {"records": records[0]},
-            count=self._capacity_rows,
+            count=count,
         )
 
     def _replace_installed_records(
@@ -443,6 +467,33 @@ class FixedMiaNVFP4Ring:
 
     def clear(self) -> None:
         self._pool.clear()
+
+
+@dataclass(slots=True)
+class FixedMiaNVFP4WindowRecords:
+    """Construction-owned physical-page view of the target SWA ring.
+
+    ``capacity`` is the logical circular address space.  It is deliberately
+    distinct from the padded physical row count in ``pages``.
+    """
+
+    pages: mx.array
+    block_table: mx.array
+    length: int
+    block_size: int
+    capacity: int
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (1, int(self.length), MIA_NVFP4_RECORD_BYTES)
+
+    @property
+    def dtype(self):
+        return self.pages.dtype
+
+    @property
+    def physical_rows(self) -> int:
+        return int(self.pages.shape[0]) * int(self.pages.shape[1])
 
 
 class FixedMiaNVFP4Window:
@@ -470,8 +521,26 @@ class FixedMiaNVFP4Window:
             row_shape=(self.record_bytes,),
             dtype=mx.uint8,
         )
+        self._paged_records = FixedMiaNVFP4WindowRecords(
+            pages=self._pages,
+            block_table=self._pool.block_table,
+            length=0,
+            block_size=self._pool.block_size,
+            capacity=self._capacity_rows,
+        )
+        self._rebuild_slot_map()
         self._start = 0
         self._end = 0
+
+    def _rebuild_slot_map(self) -> None:
+        logical = (
+            mx.arange(self._capacity_rows * 2, dtype=mx.int32)
+            % self._capacity_rows
+        )
+        logical_blocks = logical // self._pool.block_size
+        self._slot_blocks = self._pool.block_table[logical_blocks]
+        self._slot_offsets = logical - logical_blocks * self._pool.block_size
+        mx.eval(self._slot_blocks, self._slot_offsets)
 
     def __len__(self) -> int:
         return self._end - self._start
@@ -495,6 +564,12 @@ class FixedMiaNVFP4Window:
     @property
     def records(self) -> mx.array:
         return self.slice(self._start, self._end)
+
+    def paged_records(self, start: int, stop: int) -> FixedMiaNVFP4WindowRecords:
+        """Return the persistent physical-page descriptor without gathering."""
+
+        self._paged_records.length = int(stop) - int(start)
+        return self._paged_records
 
     @property
     def state(self):
@@ -521,11 +596,13 @@ class FixedMiaNVFP4Window:
     def slice(self, start: int, stop: int) -> mx.array:
         start = int(start)
         stop = int(stop)
-        physical = mx.arange(start, stop, dtype=mx.int32) % self._capacity_rows
-        logical_blocks = physical // self._pool.block_size
-        block_offsets = physical - logical_blocks * self._pool.block_size
-        physical_blocks = self._pool.block_table[logical_blocks]
-        return self._pages[physical_blocks, block_offsets][None]
+        slot = start % self._capacity_rows
+        count = stop - start
+        end = slot + count
+        return self._pages[
+            self._slot_blocks[slot:end],
+            self._slot_offsets[slot:end],
+        ][None]
 
     def drop_before(self, start: int) -> None:
         start = int(start)
@@ -535,9 +612,20 @@ class FixedMiaNVFP4Window:
         length = int(length)
         self._end = self._start + length
 
+    def rewind(self, end: int, *, keep: int) -> int:
+        """Restore the retained frontier around an authoritative cache end."""
+
+        end = int(end)
+        retained_start = max(0, end - int(keep))
+        self._start = retained_start
+        self._end = end
+        self._paged_records.length = end - retained_start
+        return retained_start
+
     def clear(self) -> None:
         self._start = 0
         self._end = 0
+        self._paged_records.length = 0
 
     def replace_state(self, state) -> None:
         if state is None:
@@ -557,6 +645,10 @@ class FixedMiaNVFP4Window:
         self._pool.block_table = block_table
         self._pool.replace_state({"records": pages}, 0)
         self._pages = self._pool.buffer("records")
+        self._paged_records.pages = self._pages
+        self._paged_records.block_table = self._pool.block_table
+        self._paged_records.length = end - start
+        self._rebuild_slot_map()
         self._start = start
         self._end = end
 
@@ -742,3 +834,82 @@ class PagedMiaNVFP4Rows:
         self._pool.block_table = block_table
         self._pool.replace_state({"records": pages}, int(length))
         self._pages = self._pool.buffer("records")
+
+
+def _write_fixed_window_records(
+    records: mx.array,
+    *,
+    owner: FixedMiaNVFP4Window,
+    absolute_start: int,
+) -> None:
+    """Scatter one qualified target batch and advance its frontier once."""
+    absolute_start = int(absolute_start)
+    count = int(records.shape[1])
+    slot = absolute_start % owner._capacity_rows
+    stop = slot + count
+    owner._pages[
+        owner._slot_blocks[slot:stop],
+        owner._slot_offsets[slot:stop],
+    ] = records[0]
+    owner._end = absolute_start + count
+
+
+def install_fixed_window_record_writer(owner: FixedMiaNVFP4Window):
+    """Bind the final page owner for fused target prologue records."""
+    if not isinstance(owner, FixedMiaNVFP4Window):
+        raise TypeError("target record writer requires FixedMiaNVFP4Window")
+    return partial(_write_fixed_window_records, owner=owner)
+
+
+def _write_fixed_ring_context_records(
+    records: mx.array,
+    *,
+    owner: FixedMiaNVFP4Ring,
+    absolute_start: int,
+) -> None:
+    """Install one prompt tail, zero-pad its ring, and mark it ready."""
+    count = int(records.shape[1])
+    owner._pages[:] = mx.array(0, dtype=mx.uint8)
+    slot = int(absolute_start) % owner._capacity_rows
+    stop = slot + count
+    owner._pages[
+        owner._slot_blocks[slot:stop],
+        owner._slot_offsets[slot:stop],
+    ] = records[0]
+    owner._pool.offset = owner._capacity_rows
+
+
+def install_fixed_ring_context_writer(owner: FixedMiaNVFP4Ring):
+    """Bind the persistent DSpark context owner after geometry validation."""
+    if not isinstance(owner, FixedMiaNVFP4Ring):
+        raise TypeError("context record writer requires FixedMiaNVFP4Ring")
+    if int(owner._capacity_rows) != MIA_DSPARK_CONTEXT_ROWS:
+        raise ValueError(
+            "DSpark context writer requires the fixed 128-row ring"
+        )
+    return partial(_write_fixed_ring_context_records, owner=owner)
+
+
+def _write_fixed_ring_commit_records(
+    records: mx.array,
+    *,
+    owner: FixedMiaNVFP4Ring,
+    absolute_start: int,
+) -> None:
+    """Scatter one incremental commit without moving the filled frontier."""
+    count = int(records.shape[1])
+    slot = int(absolute_start) % owner._capacity_rows
+    stop = slot + count
+    owner._pages[
+        owner._slot_blocks[slot:stop],
+        owner._slot_offsets[slot:stop],
+    ] = records[0]
+
+
+def install_fixed_ring_commit_writer(owner: FixedMiaNVFP4Ring):
+    """Bind the fixed ring owner for variable-width authoritative commits."""
+    if not isinstance(owner, FixedMiaNVFP4Ring):
+        raise TypeError("commit record writer requires FixedMiaNVFP4Ring")
+    if int(owner._capacity_rows) != MIA_DSPARK_CONTEXT_ROWS:
+        raise ValueError("DSpark commit writer requires the fixed 128-row ring")
+    return partial(_write_fixed_ring_commit_records, owner=owner)

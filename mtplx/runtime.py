@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import inspect as py_inspect
 import json
@@ -109,6 +110,33 @@ class MTPLXRuntime:
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+    _target_cache_lifecycle_factory: Callable[[], Any] = field(
+        default=nullcontext,
+        init=False,
+        repr=False,
+    )
+    sealed_target_cache_lifecycle: bool = field(
+        default=False,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.backend_id != "deepseek_v4_dspark":
+            return
+        target_model = getattr(self.model, "language_model", self.model)
+        plan = getattr(target_model, "_mia_engine_plan", None)
+        lifecycle = getattr(plan, "target_cache_lifecycle", None)
+        if not callable(lifecycle):
+            raise RuntimeError(
+                "the sealed Mia runtime has no target-cache lifecycle"
+            )
+        self._target_cache_lifecycle_factory = lifecycle
+        self.sealed_target_cache_lifecycle = True
+
+    def target_cache_lifecycle(self):
+        """Return the construction-bound target-cache request scope."""
+
+        return self._target_cache_lifecycle_factory()
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
@@ -630,10 +658,11 @@ def load(
         raise ValueError(
             "the pinned Mia EXL3 artifact requires the sealed DSpark runtime"
         )
-    if dspark:
-        from .deepseek_v4_dspark_artifact import open_verified_dspark_artifact
-
-        open_verified_dspark_artifact(path)
+    if dspark and not exact_mia_dspark:
+        raise ValueError(
+            "DSpark requires the pinned Mia/Sero split TP1 target and K64 draft; "
+            "generic DeepSeek V4 and the old 2.4-bit artifact are not supported"
+        )
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(
@@ -678,6 +707,20 @@ def load(
         model, _loaded_config = load_model(path)
     else:
         model, tokenizer = _load_base_model(path, config)
+    if dspark:
+        from .deepseek_v4_mia_engine import (
+            MIA_CONTEXT_CAPACITY,
+            MiaDeepseekV4EnginePlan,
+        )
+
+        mia_plan = getattr(model, "_mia_engine_plan", None)
+        if (
+            not isinstance(mia_plan, MiaDeepseekV4EnginePlan)
+            or int(mia_plan.context_capacity_tokens) != MIA_CONTEXT_CAPACITY
+        ):
+            raise RuntimeError(
+                "the pinned Mia loader did not install its sealed Mia engine plan"
+            )
     import os as _os
 
     proj_quant = proj_quant or _os.environ.get("MTPLX_PROJ_QUANT") or None
@@ -1048,10 +1091,30 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
         and isinstance(hybrid_tail, dict)
         and hybrid_tail.get("format") == "exl3-trellis"
     ):
-        from .deepseek_v4_exl3 import load_mia_exl3_dspark_model
+        from .deepseek_v4_exl3 import (
+            _default_mia_dspark_root,
+            load_mia_exl3_dspark_model,
+        )
+        from .deepseek_v4_mia_engine import (
+            revalidate_pinned_mia_tokenizer_files,
+            validate_pinned_mia_artifacts,
+        )
 
-        tokenizer = _load_tokenizer_resilient(path, config)
-        return load_mia_exl3_dspark_model(path), tokenizer
+        draft_root = _default_mia_dspark_root(path).resolve()
+        artifact_validation = validate_pinned_mia_artifacts(path, draft_root)
+        tokenizer = _load_tokenizer_resilient(
+            path,
+            artifact_validation.target_config,
+        )
+        revalidate_pinned_mia_tokenizer_files(artifact_validation)
+        return (
+            load_mia_exl3_dspark_model(
+                path,
+                draft_root=draft_root,
+                artifact_validation=artifact_validation,
+            ),
+            tokenizer,
+        )
     model_classes = _model_classes_for_config(config)
     if model_classes is not None:
         from mlx_lm.utils import load_model

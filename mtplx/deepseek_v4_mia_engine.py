@@ -8,11 +8,16 @@ it never re-reads launcher settings or probes whether the exact lane applies.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 from typing import Any
+
+from mtplx.deepseek_v4_paged_indexer import precompute_indexer_rope_table
 
 
 MIA_CONTEXT_CAPACITY = 384_000
@@ -35,10 +40,12 @@ MIA_ROPE_DIM = 64
 MIA_HIDDEN = 4096
 MIA_HC = 4
 MIA_DRAFT_SHARD_BYTES = 3_157_508_012
-MIA_DFLASH_COMMIT = "d67e6e4788f82c114b8f4efee8c62501d6cf3386"
+MIA_DFLASH_COMMIT = "db155912c007f67315cdbf769d479e2e65379f25"
 
 _TARGET_SMALL_FILE_PINS = {
     "config.json": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
+    "tokenizer.json": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+    "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547",
     "model.safetensors.index.json": "b7a450f88c99aee7f6d44ecb127e91e45ab5ccb1a0dad49ca9eabb90b400c304",
     "rank-sliced-tp1-manifest.json": "cee5b97698e16433f88e7ca23ab529acaa13628ae4af3ea18590ba4060c1203e",
     "EXL3_MANIFEST.json": "1e35cbbc33a977606a950928fba4c6660c7df0134bfab9472dd6d851be894125",
@@ -47,6 +54,34 @@ _DRAFT_SMALL_FILE_PINS = {
     "config.json": "8dcd2ae923a8e3149454f4db1f1e03109625b19f137995d26f45d357212ba306",
     "model.safetensors.index.json": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
     "DSPARK_DRAFT_PLAN.json": "d7a45cc065363ec79516593d8910d0be36e6e589d093ad6ab4a3603dbf92b426",
+}
+_TOKENIZER_CONSUMED_SMALL_FILES = (
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+_MIA_ATTENTION_ROUTE_CONTRACTS = {
+    0: (
+        "_mia_cached_forward_uncompressed",
+        "_mia_cached_attention_ratio0",
+        "_mia_uncached_compressed",
+        "_run_installed_window_nvfp4_sparse_mla",
+        "_run_installed_window_nvfp4_prefill_mla",
+    ),
+    4: (
+        "_mia_cached_forward_ratio4",
+        "_mia_cached_attention_ratio4",
+        "_mia_uncached_compressed",
+        "_run_installed_indexed_paged_nvfp4_sparse_mla",
+        "_run_installed_indexed_paged_nvfp4_prefill_mla",
+    ),
+    128: (
+        "_mia_cached_forward_ratio128",
+        "_mia_cached_attention_ratio128",
+        "_mia_uncached_compressed",
+        "_run_installed_sequential_paged_nvfp4_sparse_mla",
+        "_run_installed_sequential_paged_nvfp4_prefill_mla",
+    ),
 }
 
 
@@ -59,37 +94,126 @@ def _callable_name(value: Any) -> str:
     return str(getattr(current, "__name__", type(current).__name__))
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+@dataclass(frozen=True, slots=True)
+class MiaSmallFilePin:
+    name: str
+    bytes: int
+    sha256: str
+    device: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
 
 
-def _validate_small_files(root: Path, pins: dict[str, str], label: str) -> None:
+def _small_file_identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
+    if not stat.S_ISREG(observed.st_mode):
+        raise ValueError("pinned Mia small file must be a regular file")
+    return (
+        int(observed.st_dev),
+        int(observed.st_ino),
+        int(observed.st_size),
+        int(observed.st_mtime_ns),
+        int(observed.st_ctime_ns),
+    )
+
+
+def _read_pinned_small_file(
+    path: Path,
+    *,
+    expected_sha256: str,
+    label: str,
+) -> tuple[bytes, MiaSmallFilePin]:
+    try:
+        with path.open("rb", buffering=0) as stream:
+            before = _small_file_identity(os.fstat(stream.fileno()))
+            payload = stream.read()
+            after = _small_file_identity(os.fstat(stream.fileno()))
+    except OSError as exc:
+        raise FileNotFoundError(f"pinned {label} file is absent: {path}") from exc
+    if after != before:
+        raise ValueError(f"pinned {label} file changed while validating: {path.name}")
+    observed_sha256 = hashlib.sha256(payload).hexdigest()
+    if observed_sha256 != expected_sha256:
+        raise ValueError(
+            f"pinned {label} file changed: {path.name} "
+            f"observed={observed_sha256}, expected={expected_sha256}"
+        )
+    return payload, MiaSmallFilePin(
+        name=path.name,
+        bytes=before[2],
+        sha256=observed_sha256,
+        device=before[0],
+        inode=before[1],
+        mtime_ns=before[3],
+        ctime_ns=before[4],
+    )
+
+
+def _validate_small_files(
+    root: Path,
+    pins: dict[str, str],
+    label: str,
+) -> tuple[dict[str, bytes], tuple[MiaSmallFilePin, ...]]:
+    validated: dict[str, bytes] = {}
+    identities: list[MiaSmallFilePin] = []
     for name, expected in pins.items():
         path = root / name
-        if not path.is_file():
-            raise FileNotFoundError(f"pinned {label} file is absent: {path}")
-        observed = _sha256(path)
-        if observed != expected:
-            raise ValueError(
-                f"pinned {label} file changed: {name} "
-                f"observed={observed}, expected={expected}"
-            )
+        payload, identity = _read_pinned_small_file(
+            path,
+            expected_sha256=expected,
+            label=label,
+        )
+        validated[name] = payload
+        identities.append(identity)
+    return validated, tuple(identities)
 
 
-def validate_pinned_mia_artifacts(target_root: Path, draft_root: Path) -> None:
-    """Reject a different model before allocating model or cache storage."""
+@dataclass(frozen=True, slots=True)
+class MiaShardPin:
+    name: str
+    bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class MiaArtifactValidation:
+    target_root: Path
+    draft_root: Path
+    target_config: dict[str, Any]
+    target_weight_map: dict[str, str]
+    target_shards: tuple[MiaShardPin, ...]
+    target_small_files: tuple[MiaSmallFilePin, ...]
+    target_small_file_sha256: tuple[tuple[str, str], ...]
+    draft_config: dict[str, Any]
+    draft_weight_map: dict[str, str]
+    draft_shards: tuple[MiaShardPin, ...]
+    draft_small_files: tuple[MiaSmallFilePin, ...]
+    draft_small_file_sha256: tuple[tuple[str, str], ...]
+
+
+def validate_pinned_mia_artifacts(
+    target_root: Path,
+    draft_root: Path,
+) -> MiaArtifactValidation:
+    """Validate pinned metadata and return shard pins for integrated loading."""
 
     target_root = Path(target_root).resolve()
     draft_root = Path(draft_root).resolve()
-    _validate_small_files(target_root, _TARGET_SMALL_FILE_PINS, "Mia target")
-    _validate_small_files(draft_root, _DRAFT_SMALL_FILE_PINS, "K64 DSpark")
+    target_files, target_small_files = _validate_small_files(
+        target_root,
+        _TARGET_SMALL_FILE_PINS,
+        "Mia target",
+    )
+    draft_files, draft_small_files = _validate_small_files(
+        draft_root,
+        _DRAFT_SMALL_FILE_PINS,
+        "K64 DSpark",
+    )
 
+    target_config = json.loads(target_files["config.json"])
+    target_index = json.loads(target_files["model.safetensors.index.json"])
     target_manifest = json.loads(
-        (target_root / "rank-sliced-tp1-manifest.json").read_text()
+        target_files["rank-sliced-tp1-manifest.json"]
     )
     manifest_contract = (
         target_manifest.get("format"),
@@ -112,27 +236,40 @@ def validate_pinned_mia_artifacts(target_root: Path, draft_root: Path) -> None:
     files = target_manifest.get("files")
     if not isinstance(files, list) or len(files) != 48:
         raise ValueError("pinned Mia TP1 manifest must own exactly 48 shards")
-    verified_bytes = 0
+    target_shards: list[MiaShardPin] = []
+    shard_names: set[str] = set()
     for entry in files:
-        shard = target_root / str(entry["name"])
+        if not isinstance(entry, dict):
+            raise ValueError("pinned Mia TP1 manifest has an invalid shard entry")
+        name = str(entry.get("name", ""))
+        if Path(name).name != name or name in shard_names:
+            raise ValueError(f"pinned Mia TP1 shard name changed: {name!r}")
+        shard_names.add(name)
+        shard = target_root / name
         expected_bytes = int(entry["bytes"])
         if not shard.is_file() or shard.stat().st_size != expected_bytes:
             raise ValueError(
                 f"pinned Mia TP1 shard size changed: {shard.name}"
             )
         expected_sha256 = str(entry.get("sha256", ""))
-        if len(expected_sha256) != 64 or _sha256(shard) != expected_sha256:
-            raise ValueError(
-                f"pinned Mia TP1 shard checksum changed: {shard.name}"
-            )
-        verified_bytes += expected_bytes
-    if verified_bytes != int(target_manifest["tensor_bytes"]):
-        raise ValueError("pinned Mia TP1 manifest byte total changed")
+        if len(expected_sha256) != 64:
+            raise ValueError(f"pinned Mia TP1 shard checksum is invalid: {name}")
+        target_shards.append(
+            MiaShardPin(name, expected_bytes, expected_sha256)
+        )
+    target_weight_map = target_index.get("weight_map")
+    if (
+        not isinstance(target_weight_map, dict)
+        or len(target_weight_map) != 117_005
+        or set(target_weight_map.values()) != shard_names
+        or int(target_index.get("metadata", {}).get("total_size", 0))
+        != 106_084_465_528
+    ):
+        raise ValueError("pinned Mia TP1 safetensors index changed")
 
-    draft_plan = json.loads((draft_root / "DSPARK_DRAFT_PLAN.json").read_text())
-    draft_index = json.loads(
-        (draft_root / "model.safetensors.index.json").read_text()
-    )
+    draft_config = json.loads(draft_files["config.json"])
+    draft_plan = json.loads(draft_files["DSPARK_DRAFT_PLAN.json"])
+    draft_index = json.loads(draft_files["model.safetensors.index.json"])
     if (
         int(draft_plan.get("draft_experts", 0)) != MIA_DRAFT_EXPERTS
         or int(draft_plan.get("source_experts", 0)) != MIA_TARGET_EXPERTS
@@ -153,8 +290,53 @@ def validate_pinned_mia_artifacts(target_root: Path, draft_root: Path) -> None:
     if draft_shard.stat().st_size != MIA_DRAFT_SHARD_BYTES:
         raise ValueError("pinned K64 DSpark shard size changed")
     draft_sha256 = str(draft_plan.get("sha256", {}).get(draft_shard.name, ""))
-    if len(draft_sha256) != 64 or _sha256(draft_shard) != draft_sha256:
-        raise ValueError("pinned K64 DSpark shard checksum changed")
+    if len(draft_sha256) != 64:
+        raise ValueError("pinned K64 DSpark shard checksum is invalid")
+    return MiaArtifactValidation(
+        target_root=target_root,
+        draft_root=draft_root,
+        target_config=dict(target_config),
+        target_weight_map={
+            str(name): str(filename) for name, filename in target_weight_map.items()
+        },
+        target_shards=tuple(target_shards),
+        target_small_files=target_small_files,
+        target_small_file_sha256=tuple(sorted(_TARGET_SMALL_FILE_PINS.items())),
+        draft_config=dict(draft_config),
+        draft_weight_map={
+            str(name): str(filename) for name, filename in weight_map.items()
+        },
+        draft_shards=(
+            MiaShardPin(
+                draft_shard.name,
+                MIA_DRAFT_SHARD_BYTES,
+                draft_sha256,
+            ),
+        ),
+        draft_small_files=draft_small_files,
+        draft_small_file_sha256=tuple(sorted(_DRAFT_SMALL_FILE_PINS.items())),
+    )
+
+
+def revalidate_pinned_mia_tokenizer_files(
+    validation: MiaArtifactValidation,
+) -> None:
+    """Prove tokenizer inputs kept the validated identity during construction."""
+
+    pins = {pin.name: pin for pin in validation.target_small_files}
+    for name in _TOKENIZER_CONSUMED_SMALL_FILES:
+        expected = pins.get(name)
+        if expected is None:
+            raise ValueError(f"pinned Mia tokenizer file was not validated: {name}")
+        _payload, observed = _read_pinned_small_file(
+            validation.target_root / name,
+            expected_sha256=expected.sha256,
+            label="Mia tokenizer",
+        )
+        if observed != expected:
+            raise ValueError(
+                f"pinned Mia tokenizer file identity changed: {name}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +363,44 @@ class MiaPrewarmSignature:
     phase: str
 
 
+def _release_prewarm_leases(
+    plan: "MiaDeepseekV4EnginePlan",
+    model: Any,
+    target_cache: list[Any],
+    draft_cache: list[Any] | None,
+    primary_error: BaseException | None,
+) -> None:
+    """Release every acquired prewarm lease while preserving body failures."""
+
+    release_errors: list[BaseException] = []
+    if draft_cache is not None:
+        try:
+            model.dspark.release_mia_cache(draft_cache)
+        except BaseException as exc:
+            release_errors.append(exc)
+    try:
+        plan.release_target_cache(target_cache)
+    except BaseException as exc:
+        release_errors.append(exc)
+
+    if not release_errors:
+        return
+    if primary_error is not None:
+        for error in release_errors:
+            primary_error.add_note(
+                "prewarm cache release also failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        return
+    first, *remaining = release_errors
+    for error in remaining:
+        first.add_note(
+            "additional prewarm cache release failed: "
+            f"{type(error).__name__}: {error}"
+        )
+    raise first
+
+
 class MiaTargetCacheArena:
     """One persistent vLLM-style page lease for the single-sequence model."""
 
@@ -193,6 +413,7 @@ class MiaTargetCacheArena:
     ) -> None:
         import mlx.core as mx
 
+        from mtplx.deepseek_v4_nvfp4_kv import FixedMiaNVFP4WindowRecords
         from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache
 
         self._layer_identity = tuple(id(layer) for layer in layers)
@@ -219,6 +440,37 @@ class MiaTargetCacheArena:
             for cache in self._caches
         ):
             raise ValueError("Mia target cache arena did not install fixed SWA pages")
+        if any(
+            not isinstance(
+                getattr(cache.window, "_paged_records", None),
+                FixedMiaNVFP4WindowRecords,
+            )
+            or cache.window._paged_records.pages is not cache.window._pages
+            or cache.window._paged_records.block_table
+            is not cache.window._pool.block_table
+            or int(cache.window._paged_records.capacity)
+            != expected_window_capacity
+            or int(cache.window._paged_records.block_size) != 64
+            or int(cache.window._paged_records.physical_rows)
+            != ((expected_window_capacity + 63) // 64) * 64
+            for cache in self._caches
+        ):
+            raise ValueError(
+                "Mia target cache arena lost its fixed-window paged descriptor"
+            )
+        if any(
+            getattr(getattr(cache, "_write_window_records", None), "keywords", {}).get(
+                "owner"
+            )
+            is not cache.window
+            or getattr(cache, "_pack_window_records", object()) is not None
+            or _callable_name(getattr(cache, "_update_window_impl", None))
+            != "_fixed_window_requires_records"
+            or _callable_name(getattr(cache, "_trim_window_impl", None))
+            != "_trim_fixed_window"
+            for cache in self._caches
+        ):
+            raise ValueError("Mia target record writers lost their cache owners")
         journal_buffers = []
         for layer, cache in zip(layers, self._caches, strict=True):
             ratio = int(layer.attn.compress_ratio)
@@ -292,6 +544,12 @@ class MiaTargetCacheArena:
         self._reset()
         self._leased = False
 
+    def release_active(self) -> None:
+        """Release the request-owned lease, if one was acquired."""
+
+        if self._leased:
+            self.release(list(self._caches))
+
 
 @dataclass(frozen=True, slots=True)
 class MiaDeepseekV4EnginePlan:
@@ -303,12 +561,14 @@ class MiaDeepseekV4EnginePlan:
     page_geometry: tuple[MiaPageGeometry, ...]
     workspace_geometry: tuple[MiaWorkspaceGeometry, ...]
     indexer_workspace: Any
+    indexer_rope_table: Any
     mla_workspace: Any
     target_cache_arena: MiaTargetCacheArena
     prewarm_signatures: tuple[MiaPrewarmSignature, ...]
     installed_routes: tuple[str, ...]
     target_artifact: str
     draft_artifact: str
+    artifact_small_file_sha256: tuple[tuple[str, str], ...]
     identity: str
 
     def make_target_cache(self, layers) -> list[Any]:
@@ -316,6 +576,31 @@ class MiaDeepseekV4EnginePlan:
 
     def release_target_cache(self, caches: list[Any]) -> None:
         self.target_cache_arena.release(caches)
+
+    @contextmanager
+    def target_cache_lifecycle(self):
+        """Own and close one target-only request's persistent cache lease."""
+
+        if self.target_cache_arena.leased:
+            raise RuntimeError(
+                "Mia target cache arena already owns the active request"
+            )
+        primary_error: BaseException | None = None
+        try:
+            yield
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                self.target_cache_arena.release_active()
+            except BaseException as release_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "target cache release also failed: "
+                    f"{type(release_error).__name__}: {release_error}"
+                )
 
     def prewarm(self, model) -> dict[str, Any]:
         """Compile every serving phase with bounded, disposable cache state.
@@ -338,105 +623,241 @@ class MiaDeepseekV4EnginePlan:
         )
 
         target_cache = self.make_target_cache(model.layers)
-        prefill_ids = mx.zeros((1, MIA_WINDOW), dtype=mx.uint32)
-        with attention_phase("prefill"):
-            prefill_logits, target_taps = model(
-                prefill_ids,
-                cache=target_cache,
-                return_hidden=True,
-                logits_keep=1,
+        draft_cache = None
+        primary_error = None
+        try:
+            prefill_ids = mx.zeros((1, MIA_WINDOW), dtype=mx.uint32)
+            with attention_phase("prefill"):
+                prefill_logits, target_taps = model(
+                    prefill_ids,
+                    cache=target_cache,
+                    return_hidden=True,
+                    logits_keep=1,
+                )
+            mx.eval(prefill_logits, *target_taps)
+
+            # SparkInfer changes the repeated post-pre projection at M=384.  Warm
+            # that installed component directly so startup covers the large-M mHC
+            # signature without a second full target-model pass.
+            mhc_rows = 384
+            first_layer = model.model.layers[0]
+            mhc_residual, mhc_post, mhc_comb, mhc_y = (
+                model.model._mia_mhc.post_pre(
+                    mx.zeros((mhc_rows, MIA_HIDDEN), dtype=mx.bfloat16),
+                    mx.zeros(
+                        (mhc_rows, MIA_HC, MIA_HIDDEN), dtype=mx.bfloat16
+                    ),
+                    mx.zeros((mhc_rows, MIA_HC), dtype=mx.float32),
+                    mx.zeros((mhc_rows, MIA_HC, MIA_HC), dtype=mx.float32),
+                    first_layer.attn_hc,
+                    first_layer.attn_norm,
+                )
             )
-        mx.eval(prefill_logits, *target_taps)
+            mx.eval(mhc_residual, mhc_post, mhc_comb, mhc_y)
 
-        # SparkInfer changes the repeated post-pre projection at M=384.  Warm
-        # that installed component directly so startup covers the large-M mHC
-        # signature without a second full target-model pass.
-        mhc_rows = 384
-        first_layer = model.model.layers[0]
-        mhc_residual, mhc_post, mhc_comb, mhc_y = model.model._mia_mhc.post_pre(
-            mx.zeros((mhc_rows, MIA_HIDDEN), dtype=mx.bfloat16),
-            mx.zeros((mhc_rows, MIA_HC, MIA_HIDDEN), dtype=mx.bfloat16),
-            mx.zeros((mhc_rows, MIA_HC), dtype=mx.float32),
-            mx.zeros((mhc_rows, MIA_HC, MIA_HC), dtype=mx.float32),
-            first_layer.attn_hc,
-            first_layer.attn_norm,
+            # Spark's exact B16 WO route has a distinct WO-A epilogue that writes
+            # E4M3/UE8M0 output directly for WO-B. Compile that construction-bound
+            # plan explicitly; the M128 prefill and M6 verify passes cannot reach
+            # this finite logical-M route.
+            wo_m16_rows = 16
+            _positions, wo_cos, wo_sin = (
+                model._mia_base_rope_provider.token_tables(0, wo_m16_rows)
+            )
+            wo_m16 = model.layers[0].attn._output_projection_impl(
+                mx.zeros(
+                    (1, wo_m16_rows, MIA_HEADS, MIA_HEAD_DIM),
+                    dtype=mx.bfloat16,
+                ),
+                wo_cos,
+                wo_sin,
+            )
+            mx.eval(wo_m16)
+
+            # The pinned CUDA prologue switches to its reduced one-CTA-per-row
+            # topology only at M1024.  Real DFlash prefill emits that exact chunk,
+            # while the bounded M128 model warmup above reaches the full grid.
+            qkv_prefill_rows = MIA_LONG_PREFILL_CHUNK
+            _positions, qkv_cos, qkv_sin = (
+                model._mia_base_rope_provider.token_tables(0, qkv_prefill_rows)
+            )
+            qkv_query, qkv_records = first_layer.attn._mia_qkv_plan.prefill_records(
+                mx.zeros(
+                    (1, qkv_prefill_rows, MIA_HEADS, MIA_HEAD_DIM),
+                    dtype=mx.bfloat16,
+                ),
+                mx.zeros(
+                    (1, qkv_prefill_rows, MIA_HEAD_DIM),
+                    dtype=mx.bfloat16,
+                ),
+                qkv_cos,
+                qkv_sin,
+            )
+            mx.eval(qkv_query, qkv_records)
+
+            # The real sparse selector starts only after 512 ratio-4 rows. Compile
+            # its prefill and decode engines against a tiny synthetic paged view so
+            # startup does not need a 2K-token model forward merely to reach that
+            # phase boundary.
+            selector_rows = MIA_INDEX_TOPK + 1
+            selector_block = 64
+            selector_blocks = (
+                selector_rows + selector_block - 1
+            ) // selector_block
+            selector_view = PagedMiaIndexerRecords(
+                records=mx.zeros(
+                    (selector_blocks, selector_block, INDEXER_RECORD_BYTES),
+                    dtype=mx.uint8,
+                ),
+                block_table=mx.arange(selector_blocks, dtype=mx.int32),
+                length=selector_rows,
+                block_size=selector_block,
+            )
+            selector_q = MiaIndexerQueryRecords(
+                mx.zeros(
+                    (1, 1, MIA_HEADS, INDEXER_RECORD_BYTES), dtype=mx.uint8
+                )
+            )
+            selector_weights = mx.zeros((1, 1, MIA_HEADS), dtype=mx.float32)
+            selector_positions = mx.array(
+                [selector_rows * 4 - 1], dtype=mx.int32
+            )
+            selector = model.layers[2].attn.indexer
+            with attention_phase("prefill"):
+                prefill_selection = selector._select_rows(
+                    selector_q,
+                    selector_weights,
+                    selector_positions,
+                    selector_view,
+                )
+            with attention_phase("decode_verify"):
+                decode_selection = selector._select_rows(
+                    selector_q,
+                    selector_weights,
+                    selector_positions,
+                    selector_view,
+                )
+            mx.eval(
+                prefill_selection.indices,
+                prefill_selection.lengths,
+                decode_selection.indices,
+                decode_selection.lengths,
+            )
+
+            draft_cache = model.make_dspark_cache()
+            model.prefill_dspark(target_taps, draft_cache)
+            mx.eval(*(cache.ring.records for cache in draft_cache))
+            primary = mx.argmax(prefill_logits[:, -1], axis=-1).astype(mx.uint32)
+            proposal = model.propose_dspark_k5(
+                primary,
+                draft_cache,
+                start_pos=MIA_WINDOW,
+            )
+            mx.eval(proposal.future_tokens, proposal.neural_logits)
+
+            verify_ids = mx.concatenate(
+                [primary[:, None], proposal.future_tokens], axis=1
+            )
+            with attention_phase("decode_verify"):
+                verify_logits, verify_taps = model(
+                    verify_ids,
+                    cache=target_cache,
+                    return_hidden=True,
+                )
+            mx.eval(verify_logits, *verify_taps)
+            return {
+                "identity": self.identity,
+                "signatures": tuple(
+                    signature.name for signature in self.prewarm_signatures
+                ),
+                "prefill_rows": MIA_WINDOW,
+                "mhc_prefill_rows": mhc_rows,
+                "wo_m16_rows": wo_m16_rows,
+                "qkv_reduced_prefill_rows": qkv_prefill_rows,
+                "verify_rows": MIA_DSPARK_BLOCK + 1,
+                "draft_rows": MIA_DSPARK_BLOCK,
+            }
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            _release_prewarm_leases(
+                self,
+                model,
+                target_cache,
+                draft_cache,
+                primary_error,
+            )
+
+
+def _install_shared_indexer_resources(
+    layers: tuple[Any, ...],
+    ratios: tuple[int, ...],
+    workspace: Any,
+    inv_freq: Any,
+) -> Any:
+    """Build one ratio-4 RoPE table and bind it to every indexer owner."""
+
+    indexers = tuple(
+        layer.attn.indexer
+        for layer, ratio in zip(layers, ratios, strict=True)
+        if ratio == 4
+    )
+    if not indexers:
+        raise ValueError("the Mia engine requires ratio-4 indexer owners")
+    rope_table = precompute_indexer_rope_table(
+        inv_freq,
+        max_positions=MIA_CONTEXT_CAPACITY,
+    )
+    for indexer in indexers:
+        indexer.install_mia_paged_topk(workspace, rope_table)
+    return rope_table
+
+
+def _artifact_small_file_sha256() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                *(
+                    (f"target/{name}", digest)
+                    for name, digest in _TARGET_SMALL_FILE_PINS.items()
+                ),
+                *(
+                    (f"draft/{name}", digest)
+                    for name, digest in _DRAFT_SMALL_FILE_PINS.items()
+                ),
+            )
         )
-        mx.eval(mhc_residual, mhc_post, mhc_comb, mhc_y)
+    )
 
-        # The real sparse selector starts only after 512 ratio-4 rows. Compile
-        # its prefill and decode engines against a tiny synthetic paged view so
-        # startup does not need a 2K-token model forward merely to reach that
-        # phase boundary.
-        selector_rows = MIA_INDEX_TOPK + 1
-        selector_block = 64
-        selector_blocks = (selector_rows + selector_block - 1) // selector_block
-        selector_view = PagedMiaIndexerRecords(
-            records=mx.zeros(
-                (selector_blocks, selector_block, INDEXER_RECORD_BYTES),
-                dtype=mx.uint8,
+
+def _mia_engine_identity(
+    context_capacity_tokens: int,
+    max_batch_tokens: int,
+) -> str:
+    identity_source = "|".join(
+        (
+            *(
+                f"{name}:{digest}"
+                for name, digest in _artifact_small_file_sha256()
             ),
-            block_table=mx.arange(selector_blocks, dtype=mx.int32),
-            length=selector_rows,
-            block_size=selector_block,
+            str(context_capacity_tokens),
+            str(max_batch_tokens),
+            "stock432",
+            "mia132",
+            "k5-k64",
+            "bounded-one-shard-sha256-same-fd-loader",
+            "mhc-post-pre-m384-bm64-bf16mma",
+            "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
+            "long-prefill-chunk1024",
+            "compressor-absolute-state-rings",
+            "fixed-target-window-m8224",
+            "persistent-target-draft-page-arenas",
+            MIA_DFLASH_COMMIT,
         )
-        selector_q = MiaIndexerQueryRecords(
-            mx.zeros((1, 1, MIA_HEADS, INDEXER_RECORD_BYTES), dtype=mx.uint8)
-        )
-        selector_weights = mx.zeros((1, 1, MIA_HEADS), dtype=mx.float32)
-        selector_positions = mx.array([selector_rows * 4 - 1], dtype=mx.int32)
-        selector = model.layers[2].attn.indexer
-        with attention_phase("prefill"):
-            prefill_selection = selector._select_rows(
-                selector_q,
-                selector_weights,
-                selector_positions,
-                selector_view,
-            )
-        with attention_phase("decode_verify"):
-            decode_selection = selector._select_rows(
-                selector_q,
-                selector_weights,
-                selector_positions,
-                selector_view,
-            )
-        mx.eval(
-            prefill_selection.indices,
-            prefill_selection.lengths,
-            decode_selection.indices,
-            decode_selection.lengths,
-        )
-
-        draft_cache = model.make_dspark_cache()
-        model.prefill_dspark(target_taps, draft_cache)
-        mx.eval(*(cache.ring.records for cache in draft_cache))
-        primary = mx.argmax(prefill_logits[:, -1], axis=-1).astype(mx.uint32)
-        proposal = model.propose_dspark_k5(
-            primary,
-            draft_cache,
-            start_pos=MIA_WINDOW,
-        )
-        mx.eval(proposal.future_tokens, proposal.neural_logits)
-
-        verify_ids = mx.concatenate(
-            [primary[:, None], proposal.future_tokens], axis=1
-        )
-        with attention_phase("decode_verify"):
-            verify_logits, verify_taps = model(
-                verify_ids,
-                cache=target_cache,
-                return_hidden=True,
-            )
-        mx.eval(verify_logits, *verify_taps)
-        model.dspark.release_mia_cache(draft_cache)
-        self.release_target_cache(target_cache)
-        return {
-            "identity": self.identity,
-            "signatures": tuple(signature.name for signature in self.prewarm_signatures),
-            "prefill_rows": MIA_WINDOW,
-            "mhc_prefill_rows": mhc_rows,
-            "verify_rows": MIA_DSPARK_BLOCK + 1,
-            "draft_rows": MIA_DSPARK_BLOCK,
-        }
+    )
+    return "mia-dsv4-" + hashlib.sha256(
+        identity_source.encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def build_mia_engine_plan(
@@ -512,15 +933,74 @@ def build_mia_engine_plan(
             f"installed Mia engine topology changed: {observed!r} != {expected!r}"
         )
 
+    from mtplx.models.deepseek_v4 import mia_tp1_wo_projection_receipt
+
+    wo_projection_receipt = mia_tp1_wo_projection_receipt(model)
+    if (
+        getattr(model, "_mia_wo_projection_receipt", None)
+        != wo_projection_receipt
+        or wo_projection_receipt["route"] != "mia_tp1_b12x_wo_mxfp8"
+        or wo_projection_receipt["target_attention"] != MIA_TARGET_LAYERS
+        or wo_projection_receipt["draft_attention"] != MIA_DSPARK_STAGES
+        or wo_projection_receipt["plan_count"]
+        != MIA_TARGET_LAYERS + MIA_DSPARK_STAGES
+        or wo_projection_receipt["unique_plan_count"]
+        != MIA_TARGET_LAYERS + MIA_DSPARK_STAGES
+        or wo_projection_receipt["plan_type"] != "MiaTP1WOMXFP8Plan"
+        or wo_projection_receipt["max_prefill_rows"] != max_batch_tokens
+    ):
+        raise ValueError("the Mia TP1 B12X WO projection receipt changed")
+
     ratio4_capacity = (context_capacity_tokens + 3) // 4
     indexer_workspace = MiaIndexerWorkspace.allocate(
         max_query_rows=max_batch_tokens,
         topk=MIA_INDEX_TOPK,
         sentinel=ratio4_capacity,
     )
-    for layer, ratio in zip(layers, ratios, strict=True):
-        if ratio == 4:
-            layer.attn.indexer.install_mia_paged_topk(indexer_workspace)
+    from mtplx.models.deepseek_v4 import install_mia_target_rope_providers
+
+    base_rope_provider, compress_rope_provider = (
+        install_mia_target_rope_providers(
+            model,
+            max_positions=context_capacity_tokens,
+        )
+    )
+    draft_rope_provider = model._mia_draft_rope_provider
+    stacked_projection_receipt = getattr(
+        model,
+        "_mia_stacked_projection_receipt",
+        None,
+    )
+    if stacked_projection_receipt != {
+        "target_attention": 43,
+        "draft_attention": 3,
+        "main_compressor": 41,
+        "indexer_compressor": 21,
+    }:
+        raise ValueError("the Mia stacked projection owner receipt changed")
+    from mtplx.models.deepseek_v4 import mia_qkv_prologue_receipt
+
+    qkv_receipt = mia_qkv_prologue_receipt(model)
+    if (
+        getattr(model, "_mia_qkv_prologue_receipt", None) != qkv_receipt
+        or qkv_receipt["route"] != "mia_fused_qkv_stock432"
+        or qkv_receipt["target_attention"] != MIA_TARGET_LAYERS
+        or qkv_receipt["draft_attention"] != MIA_DSPARK_STAGES
+        or qkv_receipt["plan_count"] != MIA_TARGET_LAYERS + MIA_DSPARK_STAGES
+        or qkv_receipt["unique_plan_count"]
+        != MIA_TARGET_LAYERS + MIA_DSPARK_STAGES
+        or qkv_receipt["plan_type"] != "MiaBoundQKVPrologue"
+        or qkv_receipt["prefill_cutoff"] != MIA_LONG_PREFILL_CHUNK
+        or qkv_receipt["proposal_rows"] != MIA_DSPARK_BLOCK
+        or qkv_receipt["context_rows"] != MIA_WINDOW
+    ):
+        raise ValueError("the Mia fused Q/KV prologue receipt changed")
+    indexer_rope_table = _install_shared_indexer_resources(
+        layers,
+        ratios,
+        indexer_workspace,
+        compress_rope_provider.inv_freq,
+    )
     mla_workspace = mia_mla_workspace()
 
     load_receipt = dict(getattr(model, "_mia_target_load_receipt", {}))
@@ -530,6 +1010,8 @@ def build_mia_engine_plan(
     )
     if (
         load_receipt.get("mode") != "bounded_one_shard"
+        or load_receipt.get("artifact_identity") != "sha256_same_fd"
+        or load_receipt.get("small_file_sha256") != _TARGET_SMALL_FILE_PINS
         or int(load_receipt.get("source_shards", 0)) != 48
         or int(load_receipt.get("carried_shards", 0)) != 5
         or int(load_receipt.get("exl3_layer_shards", 0)) != MIA_TARGET_LAYERS
@@ -537,6 +1019,15 @@ def build_mia_engine_plan(
         != target_parameter_count
     ):
         raise ValueError("the Mia target was not installed by the bounded shard loader")
+    draft_load_receipt = dict(getattr(model, "_mia_draft_load_receipt", {}))
+    if (
+        draft_load_receipt.get("mode") != "single_shard"
+        or draft_load_receipt.get("artifact_identity") != "sha256_same_fd"
+        or int(draft_load_receipt.get("source_shards", 0)) != 1
+        or int(draft_load_receipt.get("source_tensors", 0)) != 1_249
+        or draft_load_receipt.get("small_file_sha256") != _DRAFT_SMALL_FILE_PINS
+    ):
+        raise ValueError("the Mia draft was not installed from its pinned file")
 
     # These flags are installed at construction and never checked again by a
     # token path.  They certify that no generic arithmetic owner remains bound.
@@ -551,22 +1042,13 @@ def build_mia_engine_plan(
             if layer_id < int(args.num_hash_layers)
             else "_mia_score_route"
         )
-        expected_sparse = (
-            "_run_paged_nvfp4_sparse_mla" if ratio else "_run_nvfp4_sparse_mla"
-        )
-        expected_prefill = (
-            "_run_paged_nvfp4_prefill_mla" if ratio else "_run_nvfp4_prefill_mla"
-        )
-        expected_compressed = (
-            "_mia_uncached_compressed"
-            if ratio
-            else "_legacy_uncached_compressed"
-        )
-        expected_forward = {
-            0: "_mia_cached_forward_uncompressed",
-            4: "_mia_cached_forward_ratio4",
-            128: "_mia_cached_forward_ratio128",
-        }[ratio]
+        (
+            expected_forward,
+            expected_cached_attention,
+            expected_compressed,
+            expected_sparse,
+            expected_prefill,
+        ) = _MIA_ATTENTION_ROUTE_CONTRACTS[ratio]
         installed = (
             bool(getattr(layer.ffn.switch_mlp, "_trellis_installed", False)),
             _callable_name(getattr(layer.ffn, "_forward_impl", None)),
@@ -581,10 +1063,34 @@ def build_mia_engine_plan(
             _callable_name(getattr(layer.attn, "_cached_mask_impl", None)),
             _callable_name(getattr(layer.attn, "_nvfp4_sparse_mla", None)),
             _callable_name(getattr(layer.attn, "_nvfp4_prefill_mla", None)),
+            getattr(layer.attn, "_mia_rope_provider", None)
+            is (
+                base_rope_provider
+                if ratio == 0
+                else compress_rope_provider
+            ),
+            type(getattr(layer.attn, "_mia_input_projection", None)).__name__,
             type(getattr(layer.attn, "_output_projection_impl", None)).__name__,
             getattr(layer.attn, "_mia_mla_workspace", None) is mla_workspace,
+            getattr(layer.attn, "_mia_mla_query_layout", None),
+            getattr(layer.attn, "_mia_mla_output_layout", None),
             getattr(getattr(layer.attn, "_mia_attn_sink", None), "dtype", None)
             == mx.float32,
+            type(getattr(layer.attn, "_mia_qkv_plan", None)).__name__,
+            _callable_name(getattr(layer.attn, "_mia_qkv_impl", None)),
+            _callable_name(
+                getattr(getattr(layer.attn, "_mia_qkv_plan", None), "project_learned", None)
+            ),
+            _callable_name(
+                getattr(getattr(layer.attn, "_mia_qkv_plan", None), "target_records", None)
+            ),
+            _callable_name(
+                getattr(getattr(layer.attn, "_mia_qkv_plan", None), "prefill_records", None)
+            ),
+            getattr(getattr(layer.attn, "_mia_qkv_plan", None), "q_weight", None)
+            is layer.attn.q_norm.weight,
+            getattr(getattr(layer.attn, "_mia_qkv_plan", None), "kv_weight", None)
+            is layer.attn.kv_norm.weight,
             getattr(layer.ffn.gate, "_mia_router_contract", None),
         )
         expected_router_contract = router_contract_prefix + (
@@ -599,13 +1105,24 @@ def build_mia_engine_plan(
             "_required_input_rows",
             expected_gate,
             expected_forward,
-            "_mia_cached_attention",
+            expected_cached_attention,
             "_mia_uncached_kv",
             expected_compressed,
             "_no_additive_mask",
             expected_sparse,
             expected_prefill,
-            "_MiaInverseRopeGatherOLora",
+            True,
+            "MiaStackedMXFP8Projection",
+            "MiaTP1WOMXFP8Plan",
+            True,
+            "BMHD",
+            "BMHD",
+            True,
+            "MiaBoundQKVPrologue",
+            "_mia_cached_qkv_records",
+            "_project_learned_norms",
+            "_run_target_qkv_records",
+            "_run_prefill_qkv_records",
             True,
             True,
             expected_router_contract,
@@ -616,17 +1133,45 @@ def build_mia_engine_plan(
                 f"{installed!r} != {required!r}"
             )
         if ratio:
-            compressor_route = _callable_name(
-                getattr(layer.attn.compressor, "_mia_record_impl", None)
+            compressor_route = (
+                _callable_name(
+                    getattr(layer.attn.compressor, "_mia_record_impl", None)
+                ),
+                getattr(layer.attn.compressor, "_mia_rope_provider", None)
+                is compress_rope_provider,
+                type(
+                    getattr(
+                        layer.attn.compressor,
+                        "_mia_stacked_projection",
+                        None,
+                    )
+                ).__name__,
+                type(
+                    getattr(layer.attn.compressor, "_project_rows_impl", None)
+                ).__name__,
             )
-            if compressor_route != "_nvfp4_record_impl":
+            if compressor_route != (
+                "_nvfp4_record_impl",
+                True,
+                "MiaStackedDenseProjection",
+                "MiaStackedDenseProjection",
+            ):
                 raise ValueError(
                     f"Mia target layer {layer_id} compressor route changed"
                 )
         if ratio == 4:
             indexer = layer.attn.indexer
+            query_record_keywords = getattr(
+                getattr(indexer, "_mia_query_records", None),
+                "keywords",
+                {},
+            )
             indexer_routes = (
                 getattr(indexer, "_mia_workspace", None) is indexer_workspace,
+                getattr(indexer, "_mia_rope_table", None)
+                is indexer_rope_table,
+                query_record_keywords.get("cos_sin_cache")
+                is indexer_rope_table.values,
                 _callable_name(getattr(indexer, "_query_components_impl", None)),
                 _callable_name(getattr(indexer, "_mia_query_records", None)),
                 _callable_name(getattr(indexer, "_prepare_query_rows", None)),
@@ -634,14 +1179,27 @@ def build_mia_engine_plan(
                 _callable_name(
                     getattr(indexer.compressor, "_mia_record_impl", None)
                 ),
+                getattr(indexer.compressor, "_mia_rope_provider", None)
+                is compress_rope_provider,
+                type(
+                    getattr(
+                        indexer.compressor,
+                        "_mia_stacked_projection",
+                        None,
+                    )
+                ).__name__,
             )
             if indexer_routes != (
+                True,
+                True,
                 True,
                 "_mia_query_components",
                 "_run_installed_indexer_query_records",
                 "_native_query_rows",
                 "_run_installed_paged_indexer_phase_topk",
                 "_indexer_record_impl",
+                True,
+                "MiaStackedDenseProjection",
             ):
                 raise ValueError(
                     f"Mia target layer {layer_id} indexer route changed: "
@@ -663,6 +1221,8 @@ def build_mia_engine_plan(
                 for name in ("gate_proj", "up_proj", "down_proj")
             ),
             _callable_name(getattr(stage.attn, "_dspark_k5_mla", None)),
+            getattr(stage.attn, "_mia_mla_query_layout", None),
+            getattr(stage.attn, "_mia_mla_output_layout", None),
             tuple(
                 int(value)
                 for value in getattr(
@@ -686,6 +1246,35 @@ def build_mia_engine_plan(
             ),
             getattr(getattr(stage.attn, "_mia_attn_sink", None), "dtype", None)
             == mx.float32,
+            getattr(stage.attn, "_mia_rope_provider", None)
+            is draft_rope_provider,
+            getattr(draft_rope_provider, "max_positions", None)
+            == context_capacity_tokens + MIA_DSPARK_BLOCK,
+            type(getattr(stage.attn, "_mia_input_projection", None)).__name__,
+            _callable_name(getattr(stage.attn, "_project_kv_impl", None)),
+            _callable_name(
+                getattr(stage.attn, "_project_context_records_impl", None)
+            ),
+            _callable_name(
+                getattr(stage.attn, "_prefill_context_impl", None)
+            ),
+            type(getattr(stage.attn, "_mia_qkv_plan", None)).__name__,
+            _callable_name(
+                getattr(getattr(stage.attn, "_mia_qkv_plan", None), "project_learned", None)
+            ),
+            _callable_name(
+                getattr(getattr(stage.attn, "_mia_qkv_plan", None), "project_kv", None)
+            ),
+            _callable_name(
+                getattr(getattr(stage.attn, "_mia_qkv_plan", None), "proposal_records", None)
+            ),
+            _callable_name(
+                getattr(getattr(stage.attn, "_mia_qkv_plan", None), "context_records", None)
+            ),
+            getattr(getattr(stage.attn, "_mia_qkv_plan", None), "q_weight", None)
+            is stage.attn.q_norm.weight,
+            getattr(getattr(stage.attn, "_mia_qkv_plan", None), "kv_weight", None)
+            is stage.attn.kv_norm.weight,
             type(getattr(stage.attn, "_output_projection_impl", None)).__name__,
             getattr(stage.ffn.gate, "_mia_router_contract", None),
         )
@@ -693,16 +1282,31 @@ def build_mia_engine_plan(
             "DeepseekV4DSparkAttention",
             "SwitchGLU",
             "_run_k5",
-            "_run_pack_stock432",
+            "NoneType",
             "_stock_forward",
             "_required_input_rows",
             "_mia_score_route",
             ("mxfp4", "mxfp4", "mxfp4"),
             "_run_dspark_k5_nvfp4_mla",
+            "BMHD",
+            "BMHD",
             (MIA_DSPARK_BLOCK,),
             mx.int32,
             True,
-            "_MiaInverseRopeGatherOLora",
+            True,
+            True,
+            "MiaStackedMXFP8Projection",
+            "NoneType",
+            "_mia_context_records",
+            "_mia_prefill_context_records",
+            "MiaBoundQKVPrologue",
+            "_project_learned_norms",
+            "_project_kv_norm",
+            "_run_k5_proposal_records",
+            "_run_context_kv_records",
+            True,
+            True,
+            "MiaTP1WOMXFP8Plan",
             router_contract_prefix
             + ("bias_selection_fp32", "unbiased_normalize_scale1p5"),
         )
@@ -807,6 +1411,8 @@ def build_mia_engine_plan(
         != "_mia_propose_k5"
         or _callable_name(getattr(model.dspark, "_make_cache_impl", None))
         != "_acquire_mia_cache"
+        or _callable_name(getattr(model.dspark, "_commit_main_impl", None))
+        != "_mia_commit_main"
         or len(tuple(getattr(model.dspark, "_mia_cache_arena", ())))
         != MIA_DSPARK_STAGES
         or any(
@@ -814,6 +1420,18 @@ def build_mia_engine_plan(
             != "nvfp4_stock432_fixed_ring"
             or int(getattr(getattr(cache, "ring", None), "_capacity_rows", 0))
             != MIA_WINDOW
+            or getattr(
+                getattr(cache, "_write_initial_records", None),
+                "keywords",
+                {},
+            ).get("owner")
+            is not cache.ring
+            or getattr(
+                getattr(cache, "_write_commit_records", None),
+                "keywords",
+                {},
+            ).get("owner")
+            is not cache.ring
             for cache in tuple(getattr(model.dspark, "_mia_cache_arena", ()))
         )
         or bool(getattr(model.dspark, "_mia_cache_leased", True))
@@ -894,10 +1512,33 @@ def build_mia_engine_plan(
             "shared immutable seeds plus bounded functional Metal outputs",
         ),
         MiaWorkspaceGeometry(
+            "indexer_rope_table",
+            (MIA_CONTEXT_CAPACITY, 64),
+            "float32",
+            "one engine-owned immutable table shared by 21 ratio-4 layers",
+        ),
+        MiaWorkspaceGeometry(
             "nvfp4_prefill_nax_threadgroup",
             (28 * 1024,),
             "uint8",
             "threadgroup local per 16-head query group",
+        ),
+        MiaWorkspaceGeometry(
+            "nvfp4_mla_token_major_output",
+            (max_batch_tokens, MIA_HEADS, MIA_HEAD_DIM),
+            "bfloat16",
+            "functional BMHD output consumed directly by B12X",
+        ),
+        MiaWorkspaceGeometry(
+            "target_swa_stock432_physical_pages",
+            (
+                MIA_TARGET_LAYERS,
+                (max_batch_tokens + MIA_WINDOW + 64 + 63) // 64,
+                64,
+                432,
+            ),
+            "uint8",
+            "cache-owned pages addressed through the logical 8416-row ring",
         ),
         MiaWorkspaceGeometry(
             "mhc_fp32_partials",
@@ -917,25 +1558,85 @@ def build_mia_engine_plan(
             "uint32",
             "functional Metal outputs owned by the fused MoE call",
         ),
+        MiaWorkspaceGeometry(
+            "wo_a_mxfp8_activation_values",
+            (8, max_batch_tokens, 4096),
+            "uint8",
+            "inverse-RoPE group-major E4M3 values",
+        ),
+        MiaWorkspaceGeometry(
+            "wo_a_mxfp8_activation_scales",
+            (8, max_batch_tokens, 128),
+            "uint8",
+            "inverse-RoPE group-32 UE8M0 scales",
+        ),
+        MiaWorkspaceGeometry(
+            "wo_a_bf16_boundary",
+            (max_batch_tokens, 8, 1024),
+            "bfloat16",
+            "grouped WO-A output consumed directly by the WO-B producer",
+        ),
+        MiaWorkspaceGeometry(
+            "wo_b_prefill_mxfp8_values",
+            (max_batch_tokens, 8192),
+            "uint8",
+            "M>8 group-major E4M3 values, produced directly by WO-A at M16",
+        ),
+        MiaWorkspaceGeometry(
+            "wo_b_prefill_mxfp8_scales",
+            (max_batch_tokens, 256),
+            "uint8",
+            "M>8 group-32 UE8M0 scales, produced directly by WO-A at M16",
+        ),
+        MiaWorkspaceGeometry(
+            "qkv_fused_projection_boundary",
+            (max_batch_tokens, 1536),
+            "bfloat16",
+            "single row-adjacent q-rank/KV MXFP8 projection output",
+        ),
+        MiaWorkspaceGeometry(
+            "qkv_learned_norm_boundaries",
+            (max_batch_tokens, 1024 + MIA_HEAD_DIM),
+            "bfloat16",
+            "fused learned Q-rank/KV RMSNorm outputs",
+        ),
+        MiaWorkspaceGeometry(
+            "qkv_finalized_outputs",
+            (max_batch_tokens, MIA_HEADS * MIA_HEAD_DIM + 432),
+            "bfloat16+uint8",
+            "one-BF16-cast Q plus functional stock432 record output",
+        ),
     )
     signatures = (
         MiaPrewarmSignature("target_prefill_bm64", MIA_WINDOW, "prefill"),
         MiaPrewarmSignature("mhc_post_pre_bf16_mma_bm64", 384, "prefill"),
+        MiaPrewarmSignature("wo_a_quantized_output_m16", 16, "prefill"),
+        MiaPrewarmSignature(
+            "qkv_reduced_prefill_m1024", MIA_LONG_PREFILL_CHUNK, "prefill"
+        ),
         MiaPrewarmSignature("indexer_sparse_prefill", 1, "prefill"),
         MiaPrewarmSignature("indexer_sparse_decode", 1, "decode_verify"),
         MiaPrewarmSignature("target_verify_m6_bm8", 6, "decode_verify"),
         MiaPrewarmSignature("dspark_k5_bm8", MIA_DSPARK_BLOCK, "decode_verify"),
     )
     installed_routes = (
-        "target_bounded_one_shard_loader",
+        "target_bounded_one_shard_sha256_same_fd_loader",
         "target_mhc_carried_post_pre_bf16_mma_bm64",
         "compressor_stock432_mia132",
         "compressor_fixed_absolute_state_rings",
+        "target_shared_base_compress_rope_graphs",
+        "draft_shared_base_rope_graph_through_position_384004",
+        "target_draft_stacked_mxfp8_projections",
+        "target_draft_fused_qkv_stock432_prologues",
+        "target_finalized_record_cache_owner",
+        "target_fixed_swa_paged_descriptor_8416",
+        "dspark_initial_commit_record_cache_owners",
         "indexer_radix_top512",
         "mla_decode_direct_stock432",
         "mla_prefill_nax_mg16_tile32",
+        "mla_token_major_query_output_no_transpose",
         "target_exl3_trellis_bm8_bm64",
-        "wo_inverse_rope_mxfp8",
+        "wo_tp1_b12x_inv_rope_mxfp8_bm8_m16q_bm64",
         "nonexpert_native_mxfp8",
         "dspark_k5_direct_stock432_k64_native_mxfp4",
         "target_fixed_swa_page_arena_m8224",
@@ -943,27 +1644,8 @@ def build_mia_engine_plan(
         "dspark_persistent_fixed_ring_arena_128",
         "dflash2_structured_taps_fixed_linear_m6_copyspec_zero_owner",
     )
-    identity_source = "|".join(
-        (
-            _TARGET_SMALL_FILE_PINS["model.safetensors.index.json"],
-            _DRAFT_SMALL_FILE_PINS["model.safetensors.index.json"],
-            str(context_capacity_tokens),
-            str(max_batch_tokens),
-            "stock432",
-            "mia132",
-            "k5-k64",
-            "bounded-one-shard-loader",
-            "mhc-post-pre-m384-bm64-bf16mma",
-            "long-prefill-chunk1024",
-            "compressor-absolute-state-rings",
-            "fixed-target-window-m8224",
-            "persistent-target-draft-page-arenas",
-            MIA_DFLASH_COMMIT,
-        )
-    )
-    identity = "mia-dsv4-" + hashlib.sha256(
-        identity_source.encode("utf-8")
-    ).hexdigest()[:16]
+    artifact_small_file_sha256 = _artifact_small_file_sha256()
+    identity = _mia_engine_identity(context_capacity_tokens, max_batch_tokens)
     return MiaDeepseekV4EnginePlan(
         context_capacity_tokens=context_capacity_tokens,
         max_batch_tokens=max_batch_tokens,
@@ -971,11 +1653,13 @@ def build_mia_engine_plan(
         page_geometry=page_geometry,
         workspace_geometry=workspace_geometry,
         indexer_workspace=indexer_workspace,
+        indexer_rope_table=indexer_rope_table,
         mla_workspace=mla_workspace,
         target_cache_arena=target_cache_arena,
         prewarm_signatures=signatures,
         installed_routes=installed_routes,
         target_artifact=str(Path(target_root).resolve()),
         draft_artifact=str(Path(draft_root).resolve()),
+        artifact_small_file_sha256=artifact_small_file_sha256,
         identity=identity,
     )

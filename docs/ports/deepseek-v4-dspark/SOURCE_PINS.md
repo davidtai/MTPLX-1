@@ -13,6 +13,8 @@
 - MiaAI target artifact: `0xSero/deepseek-v4-flash-0731-spark@22f28d32b9b29b4352eaa380ff8c2c170b2847ab`
 - MiaAI runtime image: `sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4`
 - Image vLLM tree: `local-inference-lab/vllm@30038602b71395f481ef4a6edfe4fcf8551d9c15`
+- Image-applied vLLM patch: `/tmp/vllm.patch` in immutable image layer
+  `sha256:520582d536ce8491792f637f563699bc4139760a5f97e506ef1118d4cfb0a658`
 - Image SparkInfer tree: `local-inference-lab/sparkinfer@272a84bd97ce791a1e92d1f3a0da3dd5f3c6565f`
 - DeepSpec: `MiaAI-Lab/DeepSpec@005e03b81cec38b7da6399833d609ee89a2587f2`
 - Official DSpark inference source: `DeepSeek-V4-Flash-DSpark@aa22cb07426656189b2573b8e77a9b7333b8ae0f`
@@ -20,7 +22,7 @@
 ## Reused DFlash2 runtime
 
 - Existing MTPLX DFlash2 branch: `perf/qwen38-dflash2@c3487dc56de6c734c71508c1e293a44731ff025f`
-- DFlash2 dependency: `davidtai/dflash-mlx@d67e6e4788f82c114b8f4efee8c62501d6cf3386`
+- DFlash2 dependency: `davidtai/dflash-mlx@db155912c007f67315cdbf769d479e2e65379f25`
 - Imported MTPLX bridge commit: `4d3d03aa`
 - Runtime authority: `dflash_mlx.engine.spec_epoch.SpeculativeSession`
 - Generation authority: `dflash_mlx.runtime.stream_dflash_generate`
@@ -65,18 +67,43 @@ context ring.
 - Mia's fused FP8 indexer quantizes post-RoPE BF16 Q/K directly.  The pinned
   compressor stores a `rotate` member but never consumes it, so the exact lane
   does not apply the generic DwarfStar Hadamard before FP8 quantization.
-- Mia prefill consumes compact top-k indices/lengths and never materializes a
-  full query-by-context boolean selection matrix.  SparkInfer's CUDA path then
-  uses 16-head groups, native BF16 QK over the dequantized E2M1/E4M3 records,
-  one FP32 online softmax across the SWA/indexed-cache union, and BF16 P.V with
-  FP32 accumulation.  MTPLX maps that ownership to M5 NAX M16xN32xK16 tiles:
-  16 heads per threadgroup, 32 candidates per tile, four QK K-splits, and eight
-  PV SIMD groups covering the 512-value row.  The exact route installs that
-  engine for prefill and retains the measured one-head direct kernel for
-  decode.  A minimal installation-time dispatch compiles the fixed BF16 NAX
-  pipeline before serving, matching vLLM's compile/warm lifecycle. Phase is the
-  only hot-path route, neither lane silently falls back, and a request cannot
-  become the first compiler trigger.
+- Mia consumes compact top-k indices/lengths and never materializes a full
+  query-by-context boolean selection matrix.  The immutable runtime image is
+  `sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4`.
+  Its compressed layer
+  `sha256:13df22ffc5bb3e52c9c4e084dcd297ba17fd4a571ef95b8708b43711ab2509c8`
+  contains `/tmp/sparkinfer.patch`; that patch adds the DSV4 NVFP4 traits
+  H16, 288 block threads, and 256 math threads, and disables both native DSV4
+  H8 and native DSV4 H16 for NVFP4.  Stock432 therefore uses the generic
+  H16/288 BF16 arm, not the native H8 arm.
+
+- MTPLX preserves the generic H16 owner in one 288-thread Metal threadgroup:
+  eight tensor-math SIMD groups plus one coordination group.  A logical tile64
+  is evaluated as two sequential native NAX N32 panels because the literal CUDA
+  shared-memory panel does not fit Metal. During QK the 30 KiB arena aliases
+  query `[0,16384)`, first-panel FP32 scores `[16384,18432)`, BF16 K operands
+  `[18432,22528)`, and FP32 partials `[22528,30720)`; after panel two completes,
+  its FP32 scores reuse the dead query range `[0,2048)`. Both score ranges stay
+  read-only while the corrected BF16 probabilities reuse the dead QK operand
+  range `[18432,20480)`; P.V value panels then use `[2048,10240)`. The 512-byte
+  row/kind/softmax metadata brings total
+  threadgroup allocation to 31,232 bytes, below 32 KiB. M1 launches four groups,
+  physical M6 launches 24, and DSpark K5 launches 20.  Q, K, V, and
+  unnormalized P cross BF16 boundaries; completed QK is scaled by log2(e),
+  correction/probability use fast base-2 exponentiation, and QK, P.V, and the
+  online-softmax state accumulate in FP32.  Physical M6 remains
+  decode/verification.
+
+- The mounted Mia prefill patch requests H32, tile64, and 384 CUDA threads,
+  with about 92 KiB shared memory in the selected source.  That topology cannot
+  be represented by a Metal threadgroup with the 32 KiB limit: H32xD512 BF16
+  query storage alone consumes 32 KiB before KV, scores, or softmax state.  The
+  installed Metal prefill engine is therefore an explicitly bounded arithmetic
+  mapping, H16/tile32/256 threads in 28 KiB, not a claim of topology parity.
+  The image-owned patched trait revision is not present in the local source
+  extraction; the available upstream trait rejects DSV4 plus NVFP4 while the
+  mounted prefill patch requests it.  Thus the packaged runtime's exact prefill
+  trait enablement remains an evidence gap rather than an inferred fact.
 
 ## Historical implementation boundary
 
@@ -114,13 +141,17 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Arithmetic and layout:** 64 query heads, 512-wide latent rows, 64 RoPE
   dimensions, a 128-token SWA unioned with selected compressed rows, stock432
   E2M1 plus E4M3 scales, BF16 QK/P.V operands, and one FP32 online softmax with
-  the learned sink.  The 432-byte record stores all 512 compressed latent
+  the learned sink.  The selected generic decode geometry is H16, 288 block
+  threads, 256 math threads, and one context split for physical M1/M6 and
+  DSpark K5.  The 432-byte record stores
+  all 512 compressed latent
   values in bytes `[0,256)`, their 32 E4M3 group scales in `[256,288)`, zero
   padding in `[288,304)`, and a separate 64-value BF16 RoPE tail in
   `[304,432)`; the RoPE tail never replaces the final 64 latent values used by
   P.V.  Attention scaling is applied to the completed FP32 QK dot, not to each
-  BF16 query element.  Prefill owns 16 heads per group, 32 candidates per M5
-  NAX tile, four QK K-splits, and eight P.V SIMD groups.
+  BF16 query element.  The mounted patched CUDA prefill source requests
+  H32/tile64/384 threads; MTPLX's H16/tile32/256-thread Metal prefill mapping is
+  the bounded substitute documented above, not exact source topology.
 - **MTPLX implementation:**
   `mtplx/kernels/deepseek_v4_nvfp4_mla.py`.
 - **Construction owner / installed callable:**
@@ -128,15 +159,69 @@ created.  The enabled callables do not probe eligibility or fall back.
   `_mia_cached_forward_uncompressed`, `_mia_cached_forward_ratio4`, or
   `_mia_cached_forward_ratio128` from the layer's immutable compression ratio;
   the enabled target lane never enters the generic cache/no-cache branch.  It
-  also installs
-  `_run_paged_nvfp4_prefill_mla` for prefill and
-  `_run_paged_nvfp4_sparse_mla` for decode/verification.  Uncompressed target
-  layers and DSpark stages install the corresponding direct-record callables.
-  `MiaMLAWorkspace` owns invariant empty operands once.
+  also installs ratio-specific prebound callables:
+  `_run_installed_window_nvfp4_{prefill,sparse}_mla`,
+  `_run_installed_indexed_paged_nvfp4_{prefill,sparse}_mla`, or
+  `_run_installed_sequential_paged_nvfp4_{prefill,sparse}_mla`. DSpark installs
+  the separately prebound ring/K5 callable. No installed hot launcher performs
+  a kernel-cache lookup or receives route, selected-width, or block geometry.
+  `MiaMLAWorkspace` owns invariant empty operands once.  Every target callable
+  receives the cache owner's persistent physical window pages and block table;
+  no target prefill or decode gathers `window.slice()` into a contiguous
+  staging array.  Candidate addresses wrap through the descriptor's logical
+  8,416-row capacity before block-table translation.  They never use the
+  allocation's padded 8,448 physical-row count as the circular modulus.  The
+  exact QKV prologue, MLA input, MLA output, and B12X boundary remain contiguous
+  token-major `[B,M,H,D]`; the checked public oracle retains its separate
+  `[B,H,M,D]` kernel variant.  Thus neither side of exact MLA materializes the
+  64 MiB M1024 transpose that `ensure_row_contiguous` would otherwise force.
   `DeepseekV4TargetOps` explicitly labels every DFlash prompt chunk as prefill
   and every physical M6 target call as decode/verification, so the external
   DFlash engine cannot leave the phase at `unknown`.
 - **Disposition:** source-derived Metal port.  Phase is the only runtime route.
+
+### 1a. Fused learned Q/KV prologue and stock432 insertion
+
+- **Source:**
+  `vllm/csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu`
+  from the pinned image vLLM tree, plus Mia's
+  `image-patch/selftest_padded_stride.py` stock432 oracle.
+- **Arithmetic and layout:** the row-adjacent MXFP8 Q-rank/WKV weights produce
+  one BF16 `[M,1536]` owner buffer.  One learned-RMSNorm dispatch reads the
+  1024-wide Q-rank prefix and 512-wide KV suffix without materializing either
+  slice.  Post-`wq_b`, every 512-wide head is RMS-normalized in FP32; only its
+  final 64 values receive interleaved RoPE in FP32, and the completed Q crosses
+  one BF16 boundary.  For K/V, the learned-normalized latent crosses BF16 and
+  remains unrotated for all 512 NVFP4 values: it is the reconstructed V and its
+  first 448 values are K-NoPE.  A separate FP32 RoPE operation rotates only the
+  latent tail64 and stores that BF16 result in bytes `[304,432)` for K.  Bytes
+  `[288,304)` remain zero.  The CUDA launch uses the full per-slot grid when
+  `M < 1024` and the reduced one-CTA-per-row grid when `M >= 1024`; bounded
+  DFlash chunks are at most 1024, so exactly M1024 selects the reduced route.
+- **MTPLX implementation:**
+  `mtplx/kernels/deepseek_v4_qkv_prologue.py`, finalized-record owners in
+  `mtplx/deepseek_v4_nvfp4_kv.py`, and the attention bindings in
+  `mtplx/models/deepseek_v4.py` / `deepseek_v4_dspark.py`.
+- **Construction owner / installed callable:** after weights, B12X WO, and the
+  stacked MXFP8 projection owners are installed, the loader binds 46 distinct
+  `MiaBoundQKVPrologue` plans.  Each plan retains its projection owner and
+  query/KV learned-norm weights by identity and closes over epsilon.  Target
+  prefill/decode returns Q plus finalized records; the fixed target cache owns
+  visibility, retention, and frontier changes.  DSpark context uses the
+  KV-only learned-norm entrypoint over offset 1024, while K5 proposal records
+  are temporary and never mutate the three persistent rings.  Initial context
+  zero-fills and marks the full physical 128-row ring; later 1..128 prompt
+  increments and 1..6 generation commits use the separate modulo writer.
+  M1024 reduced-grid finalization is prewarmed explicitly.
+- **Functional-output adaptation:** `mx.fast.metal_kernel` exposes immutable
+  inputs and newly allocated outputs, so it cannot alias the persistent cache
+  buffer as CUDA's fused slot-mapping kernel does.  MTPLX therefore emits one
+  bounded record output and performs one cache-owned scatter.  Physical block
+  and offset maps are construction-precomputed (and rebuilt at state restore),
+  so the writer does not rebuild `arange`/modulo/block mappings in the hot path.
+- **Disposition:** source-derived Metal arithmetic with one documented MLX
+  functional-output insertion dispatch.  Legacy latent-plus-RoPE packers are
+  poisoned on the fixed target and exact DSpark routes.
 
 ### 2. B12X sparse indexer
 
@@ -147,12 +232,30 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Arithmetic and layout:** post-RoPE BF16 Q/K is quantized directly to E4M3;
   each 128-wide row is a 132-byte record with a FP32 power-of-two scale.  Scores
   are `sum_h(max(q_h dot k, 0) * w_h)`: tiled prefill decodes the raw E4M3
-  operands into exactly representable FP16 values, completes the dot in FP32,
-  then applies the Q and K row scales before ReLU and head weighting.  Selection
-  is exact top-512 over only causal ratio-4 rows, represented as compact indices
-  plus lengths.  The bounded prefill route carries candidates across score
-  tiles; decode produces candidates in one fused pass and both use the same
-  four-pass radix fold.
+  operands into exactly representable FP16 values and completes each dot in
+  FP32.  The CuTe Q finalizer folds weights in the exact FP32 order
+  `(BF16 weight * combined weight scale) * Q row scale` and stores unit scale in
+  the installed Q record.  Prefill and decode then accumulate raw
+  ReLU-weighted heads and apply the positive K row scale once to the completed
+  head sum.  For the packaged H64 long-prefill shape, SparkInfer gathers one
+  paged 32K K supertile into contiguous records and selects a Q32xK512,
+  256-thread scorer.  It batches seven Q heads in shared memory, keeps the FP32
+  ReLU-weighted head reduction in registers, writes a bounded FP32 tiled-logit
+  slab, and invokes the radix selector separately.  Metal preserves Q32 and
+  256-thread ownership but uses K256: eight SIMD groups each own Q8xK128, K/Q
+  are decoded through eight-dimension staging panels, and the completed
+  source-order head sum remains in matrix fragments.  K512 would require 128
+  live FP32 score/dot fragment values per Metal thread before input state;
+  K256 requires 64 and 6,784 bytes of threadgroup scratch (6,912 for the
+  ordinary-record oracle).  At K96K this gives 12,000 scorer threadgroups for
+  Q1024 and 96,375 across the Q8224/512-MiB query splits, versus the prior K40
+  path's 76,864 and 617,314.  The FP32 logit slabs remain capped at 128 MiB for
+  Q1024 and 512 MiB per Q8224 subchunk.  Ordinary raw-record oracle scorers are
+  separately compiled and consume their stored Q scales.  Selection is exact
+  top-512 over only
+  causal ratio-4 rows, represented as compact indices plus lengths.  The
+  bounded prefill route carries candidates across score tiles; decode produces
+  candidates in one fused pass and both use the same four-pass radix fold.
 - **MTPLX implementation:** `mtplx/deepseek_v4_paged_indexer.py` and the
   `Indexer` installation seam in `mtplx/models/deepseek_v4.py`.
 - **Construction owner / installed callable:** `MiaIndexerWorkspace` is sized
@@ -170,14 +273,20 @@ created.  The enabled callables do not probe eligibility or fall back.
 ### 3. Fused compressor and cache insertion
 
 - **Source:**
-  `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py` and the
-  compressor/cache wiring in `vllm/models/deepseek_v4/nvidia/model.py`.
+  The image-applied `/tmp/vllm.patch` over
+  `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py`, plus the
+  compressor/cache wiring in `vllm/models/deepseek_v4/attention.py`.  The
+  immutable patch layer above is authoritative because the image applies it
+  after checking out the pinned vLLM tree and before building the runtime op.
 - **Arithmetic and layout:** FP32 projection outputs and gate logits are folded
   with per-dimension window softmax; ratio-4 includes the preceding half-window
-  and ratio-128 does not.  The result takes the source BF16 boundary, RMSNorm,
-  compressor RoPE, then direct stock432 NVFP4 packing.  The indexer copy packs
-  direct post-RoPE Mia132 E4M3 records.  Full and incremental paths preserve the
-  same completed-window frontier.
+  and ratio-128 does not.  Pooling, RMSNorm, and compressor RoPE remain FP32.
+  The learned-normalized latent crosses one BF16 boundary before direct record
+  quantization: stock432 packs that unrotated 512-wide value row as E2M1/E4M3,
+  while only its tail64 is separately rotated and stored as the BF16 K-RoPE
+  tail.  The indexer copy retains its separately documented post-RoPE Mia132
+  E4M3 contract.  Full and incremental paths preserve the same completed-window
+  frontier.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_compressor.py`,
   `Compressor.mia_records`, `Compressor.step_records`, and paged
   `append_records` owners.
@@ -263,17 +372,33 @@ created.  The enabled callables do not probe eligibility or fall back.
 
 - **Source:** `sparkinfer/gemm/_shared/wo_mxfp8.py` and
   `sparkinfer/gemm/wo_projection/api.py`.
-- **Arithmetic and layout:** inverse RoPE is fused into the grouped WO-A input;
-  WO-A and WO-B consume the artifact's byte-identical E4M3 weights with E8M0
-  group scales and retain the model BF16 boundary.
-- **MTPLX implementation:** `_MiaInverseRopeGatherOLora` and
-  `_mia_inverse_rope_output_kernel` in `mtplx/models/deepseek_v4.py`.
-- **Construction owner / installed callable:**
-  `install_deepseek_v4_o_lora_routes(mode="gather_qmm")` installs one direct
-  object on all 43 target and three draft attention modules after the weights
-  have been converted to the native MLX group-32 MXFP8 view.
-- **Disposition:** fused inverse-RoPE Metal port plus the existing native MLX
-  MXFP8 projections; the unfused output route is not selected.
+- **Arithmetic and layout:** a standalone producer applies inverse RoPE while
+  quantizing each 32-value grouped WO-A input block to E4M3 with Mia's
+  ceil-power-of-two UE8M0 scale.  It emits only `[8,M,4096]` byte values plus
+  `[8,M,128]` byte scales, never a BF16 `[M,32768]` tensor.  Grouped WO-A
+  reinterprets the artifact's byte-identical E4M3/expanded-UE8M0 storage,
+  accumulates in FP32, and normally crosses the model boundary once as BF16
+  `[M,8,1024]`.  At Spark's exact M16 route, WO-A instead applies the source
+  group-32 E4M3/UE8M0 quantization directly to its FP32 accumulator and feeds
+  WO-B without materializing the BF16 boundary.  At M1/M5/M6, WO-B quantizes
+  the BF16 boundary inside its input stage; other bounded prefill rows use a
+  standalone group-major E4M3/UE8M0 producer.  WO-B likewise accumulates in
+  FP32 and returns BF16 `[M,4096]`.
+- **MTPLX implementation:**
+  `mtplx/kernels/deepseek_v4_wo_mxfp8.py`.
+- **Construction owner / installed callable:** after both target and draft
+  weights load, `install_mia_tp1_wo_projection_routes` installs 46 distinct
+  `MiaTP1WOMXFP8Plan` objects directly as `_output_projection_impl`.  The
+  plans retain each attention's existing `uint32` weight view and expanded
+  `uint8` scales by identity and prebind the BM8, exact-M16 quantized-output,
+  and BM64 kernels.  The engine verifies the complete
+  plan/callable/storage/parameter-identity receipt before allocating serving
+  caches or prewarming.
+- **Disposition:** source-derived TP1 Metal mapping with standalone WO-A
+  producer, grouped MXFP8 GEMMs, and fused decode WO-B input quantization.  The
+  generic `_MiaInverseRopeGatherOLora`/native-MLX route remains available only
+  to explicitly constructed non-Mia models and is not reachable from exact
+  Mia execution.
 
 ### 7. General non-expert FP8 linears
 
@@ -314,8 +439,9 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Construction owner / installed callable:** the separately validated K64
   package constructs `DeepseekV4DSparkOwner`; its three expert banks use native
   group-32 MXFP4, its gates use `_mia_score_route`, and its proposal callable is
-  `_mia_propose_k5`.  Each attention stage binds `_run_k5` and the direct
-  `_run_pack_stock432` finalizer.  Its installed
+  `_mia_propose_k5`.  Each attention stage binds `_run_k5`, the fused
+  `MiaBoundQKVPrologue`, a KV-only context finalizer, and separate initial and
+  incremental ring writers.  Its installed
   `_run_dspark_k5_nvfp4_mla` consumes the persistent 128-row ring and five
   proposal-local records as separate inputs to one online softmax, using
   `absolute_position % 128` for physical ring ownership.  It therefore does
@@ -337,9 +463,12 @@ created.  The enabled callables do not probe eligibility or fall back.
   `vllm/v1/attention/backends/mla/b12x_mla_sparse.py`, SparkInfer's paged MLA and
   indexer modules above, and `sparkinfer/attention/sparse_mla/_scratch.py`.
 - **Arithmetic and layout:** capacity is fixed at 384,000 logical tokens.  Each
-  target layer owns an 8,416-row physical circular stock432 arena: the 8,224
-  maximum input batch plus the logical 128-row attention window and M6 rollback
-  allowance.  Every query exposes only its causal 128-row window.  Ratio-4 and
+  target layer owns an 8,416-row logical circular stock432 arena: the 8,224
+  maximum input batch plus the logical 128-row attention window and installed
+  64-row rollback allowance.  It is backed by 132 64-row pages (8,448
+  allocated rows); the final 32 padding rows are not part of the circular
+  address space.  Every query
+  exposes only its causal 128-row window.  Ratio-4 and
   ratio-128 layers own `ceil(capacity / ratio)` persistent stock432 pages;
   ratio-4 layers additionally own the same number of Mia132 index pages.
   DSpark owns three persistent physical 128-row rings.
@@ -350,8 +479,9 @@ created.  The enabled callables do not probe eligibility or fall back.
   fixed Metal threadgroup geometry, fixed compressor state rings, one persistent
   target page lease, and one persistent DSpark ring lease.  Per-dispatch Metal
   result arrays are bounded functional outputs, not growing histories.  Cache
-  writes address the installed pages directly; request cleanup resets logical
-  frontiers without reallocating their physical storage.
+  writes use construction-precomputed physical maps and one functional scatter
+  into the installed pages; request cleanup resets logical frontiers without
+  reallocating their physical storage.
 - **Disposition:** reusable fixed-capacity MTPLX paging specialized by exact
   DeepSeek record specs.  No geometric cache growth is on the Mia route.
 
@@ -361,12 +491,12 @@ created.  The enabled callables do not probe eligibility or fall back.
   `deepseek_v4_compressor_warmup.py`, `kernel_warmup.py`, and Mia's eager
   launcher/capture configuration.
 - **Arithmetic and layout:** the finite serving signatures are target prefill
-  BM64, M384 mHC post-pre BF16 MMA BM64, sparse-indexer prefill,
-  sparse-indexer decode, target M6 verification BM8, and three-stage DSpark K5
-  BM8.  A 128-row target prefill reaches both compressor ratios; a direct
-  384-row installed mHC call reaches the large-M projection without a second
-  full target pass; a 513-row synthetic paged index view reaches top-512
-  without a long model forward.
+  BM64, M384 mHC post-pre BF16 MMA BM64, exact-M16 WO-A quantized output,
+  sparse-indexer prefill, sparse-indexer decode, target M6 verification BM8,
+  and three-stage DSpark K5 BM8.  A 128-row target prefill reaches both
+  compressor ratios; direct M384 mHC and M16 WO calls cover their distinct
+  installed kernels without another full target pass; a 513-row synthetic
+  paged index view reaches top-512 without a long model forward.
 - **MTPLX implementation:** `MiaDeepseekV4EnginePlan.prewarm`.
 - **Construction owner / installed callable:** the loader evaluates all weights
   and prewarms every signature before returning.  `DeepseekV4TargetOps` refuses

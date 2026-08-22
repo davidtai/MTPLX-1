@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import gc
 import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import subprocess
 import sys
 import time
@@ -30,7 +30,26 @@ MIA_SOURCE_INDEX_SHA256 = (
 MIA_IMAGE_DIGEST = (
     "sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4"
 )
-DFLASH_REVISION = "308672c08a04184cd075742db6db83ef6233296c"
+
+
+def _require_clean_source(repo: Path) -> str:
+    """Bind the measurement to one committed source tree before MLX import."""
+
+    status = subprocess.check_output(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        text=True,
+    )
+    if status.strip():
+        raise RuntimeError("worktree is dirty; refusing an unrepeatable benchmark")
+    commit = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    if len(commit) != 40 or any(
+        character not in "0123456789abcdef" for character in commit
+    ):
+        raise RuntimeError(f"source commit is malformed: {commit!r}")
+    return commit
 
 
 def _guard_before_mlx() -> dict:
@@ -54,6 +73,50 @@ def _memory(getter: str) -> int:
     if fn is None:
         fn = getattr(getattr(mx, "metal", None), getter, None)
     return int(fn()) if callable(fn) else 0
+
+
+def _process_peak_rss_bytes() -> int:
+    """Return the process-lifetime RSS high-water mark in bytes."""
+
+    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return peak if sys.platform == "darwin" else peak * 1_024
+
+
+def _finish_memory_receipt(
+    *,
+    mlx_active_after_load_bytes: int,
+    mlx_peak_after_load_bytes: int,
+    process_peak_rss_after_load_bytes: int,
+    mlx_peak_reset_before_arm: bool,
+    mlx_active_before_arm_bytes: int,
+    mlx_peak_before_arm_bytes: int,
+) -> dict:
+    return {
+        "mlx": {
+            "after_load": {
+                "active_bytes": int(mlx_active_after_load_bytes),
+                "peak_bytes": int(mlx_peak_after_load_bytes),
+                "peak_scope": "process_lifetime_through_load",
+            },
+            "arm": {
+                "active_bytes_before": int(mlx_active_before_arm_bytes),
+                "peak_bytes_before": int(mlx_peak_before_arm_bytes),
+                "active_bytes_after": _memory("get_active_memory"),
+                "peak_bytes": _memory("get_peak_memory"),
+                "peak_reset_before_arm": bool(mlx_peak_reset_before_arm),
+                "peak_scope": (
+                    "since_explicit_arm_reset"
+                    if mlx_peak_reset_before_arm
+                    else "process_lifetime"
+                ),
+            },
+        },
+        "process": {
+            "peak_rss_bytes_after_load": int(process_peak_rss_after_load_bytes),
+            "peak_rss_bytes_after_arm": _process_peak_rss_bytes(),
+            "peak_rss_scope": "process_lifetime_since_exec",
+        },
+    }
 
 
 def _reset_peak_before_arm() -> bool:
@@ -82,72 +145,142 @@ def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _cache_contract(bundle, *, capacity_tokens: int) -> dict:
-    target = bundle.target_ops.make_cache(
-        bundle.target_model,
-        enable_speculative_linear_cache=True,
-        quantize_kv_cache=False,
-        cache_capacity_tokens=int(capacity_tokens),
-    )
-    draft = bundle.draft_backend.make_cache(
-        draft_model=bundle.draft_model,
-        sink_size=0,
-        window_size=int(bundle.draft_model.args.sliding_window),
-        allow_full_context_layers=False,
-    )
-    target_ok = all(
-        cache.window.mode == "nvfp4_stock432"
-        and cache.window.record_bytes == 432
-        and (
-            cache.compress_ratio == 0
-            or (
-                cache.compressed.mode == "nvfp4_stock432_paged"
-                and cache.compressed.record_bytes == 432
-                and cache.compressed.capacity
-                == (int(capacity_tokens) + cache.compress_ratio - 1)
-                // cache.compress_ratio
-            )
+def _cache_contract(bundle, *, requested_span_tokens: int) -> dict:
+    """Report the installed fixed arena without relabeling it per request."""
+
+    requested_span_tokens = int(requested_span_tokens)
+    plan = bundle.target_model._mia_engine_plan
+    context_capacity = int(plan.context_capacity_tokens)
+    if requested_span_tokens > context_capacity:
+        raise ValueError(
+            f"requested span {requested_span_tokens} exceeds the installed "
+            f"{context_capacity}-token cache plan"
         )
-        and (
-            cache.compress_ratio != 4
-            or (
-                cache.index_compressed.mode
-                == "fp8_e4m3_ue8m0_scale132_paged"
-                and cache.index_compressed.record_bytes == 132
-            )
+
+    target = []
+    draft = []
+    try:
+        target = bundle.target_ops.make_cache(
+            bundle.target_model,
+            enable_speculative_linear_cache=True,
+            quantize_kv_cache=False,
+            cache_capacity_tokens=requested_span_tokens,
         )
-        for cache in target
-    )
-    draft_ok = all(
-        cache.ring.mode == "nvfp4_stock432" and cache.ring.record_bytes == 432
-        for cache in draft
-    )
-    contract = {
-        "target_kv": {
-            "mode": "nvfp4_stock432",
-            "record_bytes": 432,
-            "start": 0,
-            "layers": len(target),
-            "capacity_tokens": int(capacity_tokens),
-            "paged_compressed_layers": sum(
-                int(cache.compress_ratio > 0) for cache in target
-            ),
-            "paged_indexer_layers": sum(
-                int(cache.compress_ratio == 4) for cache in target
-            ),
-            "indexer_record_bytes": 132,
-        },
-        "dspark_kv": {
-            "mode": "nvfp4_stock432",
-            "record_bytes": 432,
-            "start": 0,
-            "stages": len(draft),
-        },
-    }
-    bundle.target_ops.cleanup_generation_caches(target, draft)
-    if not target_ok or not draft_ok:
-        raise RuntimeError("DeepSeek DFlash2 bundle does not own Mia stock432 K/V")
-    return contract
+        draft = bundle.draft_backend.make_cache(
+            draft_model=bundle.draft_model,
+            sink_size=0,
+            window_size=int(bundle.draft_model.args.sliding_window),
+            allow_full_context_layers=False,
+        )
+
+        page_geometry = tuple(plan.page_geometry)
+        if len(target) != len(page_geometry):
+            raise RuntimeError("Mia target cache count changed from its engine plan")
+
+        window_capacities: set[int] = set()
+        compressed_pages: dict[int, list[int]] = {}
+        indexer_capacities: set[int] = set()
+        for layer_id, (cache, geometry) in enumerate(
+            zip(target, page_geometry, strict=True)
+        ):
+            ratio = int(cache.compress_ratio)
+            if (
+                int(geometry.layer_id) != layer_id
+                or int(geometry.compress_ratio) != ratio
+                or cache.window.mode != "nvfp4_stock432_fixed_window"
+                or int(cache.window.record_bytes) != 432
+            ):
+                raise RuntimeError("Mia target fixed-window cache contract changed")
+            window_capacities.add(int(cache.window.capacity))
+            if ratio == 0:
+                if int(geometry.compressed_capacity) != 0:
+                    raise RuntimeError("Mia uncompressed page geometry changed")
+                continue
+
+            expected_capacity = (context_capacity + ratio - 1) // ratio
+            observed_capacity = int(cache.compressed.capacity)
+            if (
+                cache.compressed.mode != "nvfp4_stock432_paged"
+                or int(cache.compressed.record_bytes) != 432
+                or int(geometry.compressed_capacity) != expected_capacity
+                or observed_capacity != expected_capacity
+            ):
+                raise RuntimeError("Mia compressed page geometry changed")
+            tier = compressed_pages.setdefault(ratio, [observed_capacity, 0])
+            if tier[0] != observed_capacity:
+                raise RuntimeError("Mia compressed page tier has mixed capacities")
+            tier[1] += 1
+
+            if ratio == 4:
+                indexer = cache.index_compressed
+                if (
+                    indexer.mode != "fp8_e4m3_ue8m0_scale132_paged"
+                    or int(indexer.record_bytes) != 132
+                    or int(indexer.capacity) != expected_capacity
+                ):
+                    raise RuntimeError("Mia indexer page geometry changed")
+                indexer_capacities.add(int(indexer.capacity))
+
+        if len(window_capacities) != 1 or len(indexer_capacities) != 1:
+            raise RuntimeError("Mia fixed target cache capacities are inconsistent")
+
+        draft_ring_capacities: set[int] = set()
+        for cache in draft:
+            ring = cache.ring
+            if (
+                ring.mode != "nvfp4_stock432_fixed_ring"
+                or int(ring.record_bytes) != 432
+                or int(ring.nbytes) % int(ring.record_bytes)
+            ):
+                raise RuntimeError("Mia DSpark fixed-ring cache contract changed")
+            draft_ring_capacities.add(
+                int(ring.nbytes) // int(ring.record_bytes)
+            )
+        if len(draft_ring_capacities) != 1:
+            raise RuntimeError("Mia DSpark ring capacities are inconsistent")
+
+        return {
+            "request": {"span_tokens": requested_span_tokens},
+            "installed_cache_plan": {
+                "context_capacity_tokens": context_capacity,
+                "max_batch_tokens": int(plan.max_batch_tokens),
+            },
+            "target_kv": {
+                "mode": "nvfp4_stock432",
+                "record_bytes": 432,
+                "start": 0,
+                "layers": len(target),
+                "window_mode": "nvfp4_stock432_fixed_window",
+                "window_capacity_records": next(iter(window_capacities)),
+                "compressed_pages": [
+                    {
+                        "compress_ratio": ratio,
+                        "capacity_records": values[0],
+                        "layers": values[1],
+                    }
+                    for ratio, values in sorted(compressed_pages.items())
+                ],
+                "paged_compressed_layers": sum(
+                    values[1] for values in compressed_pages.values()
+                ),
+                "paged_indexer_layers": sum(
+                    int(cache.compress_ratio == 4) for cache in target
+                ),
+                "indexer_mode": "fp8_e4m3_ue8m0_scale132_paged",
+                "indexer_record_bytes": 132,
+                "indexer_capacity_records": next(iter(indexer_capacities)),
+            },
+            "dspark_kv": {
+                "mode": "nvfp4_stock432",
+                "record_bytes": 432,
+                "start": 0,
+                "stages": len(draft),
+                "ring_mode": "nvfp4_stock432_fixed_ring",
+                "ring_capacity_records": next(iter(draft_ring_capacities)),
+            },
+        }
+    finally:
+        bundle.target_ops.cleanup_generation_caches(target, draft)
 
 
 def _prompt_ids(bundle, text: str, target_tokens: int | None = None) -> list[int]:
@@ -161,17 +294,30 @@ def _prompt_ids(bundle, text: str, target_tokens: int | None = None) -> list[int
     ]
 
 
-def _arm_payload(output) -> dict:
+def _arm_payload(
+    output,
+    *,
+    total_prompt_tokens: int,
+    new_prefill_tokens: int | None = None,
+) -> dict:
     stats = output.stats.to_dict()
-    prompt_tokens = int((stats["events"][-1] or {}).get("prompt_token_count", 0))
+    total_prompt_tokens = int(total_prompt_tokens)
+    if new_prefill_tokens is None:
+        new_prefill_tokens = int(stats["new_prefill_tokens"])
+    else:
+        new_prefill_tokens = int(new_prefill_tokens)
     prompt_time = stats["prompt_eval_time_s"]
     return {
         "tokens": list(output.tokens),
         "token_digest": _token_digest(list(output.tokens)),
         "generated_tokens": len(output.tokens),
-        "prompt_tokens": prompt_tokens,
+        "prompt_tokens": total_prompt_tokens,
+        "new_prefill_tokens": new_prefill_tokens,
         "prompt_time_s": prompt_time,
-        "prefill_tok_s": prompt_tokens / prompt_time if prompt_time > 0 else 0.0,
+        "prefill_tok_s": (
+            new_prefill_tokens / prompt_time if prompt_time > 0 else 0.0
+        ),
+        "prefill_tok_s_token_basis": "new_prefill_tokens",
         "decode_time_s": stats["decode_elapsed_s"],
         "elapsed_s": stats["elapsed_s"],
         "decode_tok_s": stats["decode_tok_s"],
@@ -181,6 +327,8 @@ def _arm_payload(output) -> dict:
             else 0.0
         ),
         "peak_memory_bytes": stats["peak_memory_bytes"],
+        "peak_memory_kind": "mlx_allocator_peak",
+        "peak_memory_scope": "since_last_mlx_peak_reset",
         "accepted_future_tokens": stats["accepted_drafts"],
         "drafted_future_tokens": stats["drafted_tokens"],
         "events": stats["events"],
@@ -188,48 +336,42 @@ def _arm_payload(output) -> dict:
 
 
 def _target_ar(bundle, prompt_ids: list[int], max_tokens: int) -> dict:
-    from mtplx.generation import generate_ar
+    from mtplx.generation import generate_sealed_target_ar
     from mtplx.sampling import SamplerConfig
 
-    return _arm_payload(
-        generate_ar(
-            bundle.runtime,
-            prompt_ids,
-            max_tokens=max_tokens,
-            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
-            seed=0,
-            stop_token_ids=set(),
-        )
+    output = generate_sealed_target_ar(
+        bundle.runtime,
+        prompt_ids,
+        max_tokens=max_tokens,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
+        seed=0,
+        stop_token_ids=set(),
     )
+    return _arm_payload(output, total_prompt_tokens=len(prompt_ids))
 
 
 def _dspark(bundle, prompt_ids: list[int], max_tokens: int, context) -> dict:
     from mtplx.deepseek_v4_dflash2 import generate_deepseek_v4_dflash2
 
+    output = generate_deepseek_v4_dflash2(
+        bundle,
+        prompt_ids,
+        max_tokens=max_tokens,
+        stop_token_ids=[],
+        runtime_context=context,
+    )
     return _arm_payload(
-        generate_deepseek_v4_dflash2(
-            bundle,
-            prompt_ids,
-            max_tokens=max_tokens,
-            stop_token_ids=[],
-            runtime_context=context,
-        )
+        output,
+        total_prompt_tokens=len(prompt_ids),
+        new_prefill_tokens=len(prompt_ids),
     )
 
 
 def _first_epoch(bundle, prompt_ids: list[int], context) -> dict:
-    from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
-    from dflash_mlx.engine.events import CycleCompleteEvent, SummaryEvent
+    from dflash_mlx.engine.config import verify_token_count_for_block
+    from dflash_mlx.engine.events import SummaryEvent
     from dflash_mlx.runtime import stream_dflash_generate
 
-    profiled = replace(
-        context,
-        diagnostics=DiagnosticsConfig(
-            mode="full",
-            trace=TraceConfig(cycle_events=True),
-        ),
-    )
-    first = None
     summary = None
     for event in stream_dflash_generate(
         target_model=bundle.target_model,
@@ -244,19 +386,42 @@ def _first_epoch(bundle, prompt_ids: list[int], context) -> dict:
         block_tokens=6,
         stop_token_ids=[],
         quantize_kv_cache=False,
-        runtime_context=profiled,
+        runtime_context=context,
     ):
-        if first is None and isinstance(event, CycleCompleteEvent):
-            first = event
         if isinstance(event, SummaryEvent):
             summary = event
-    if first is None or summary is None:
-        raise RuntimeError("DFlash2 did not emit a cycle and summary")
-    payload = first.to_payload()
-    payload["physical_verify_width"] = int(first.verify_token_count or 0)
-    payload["future_draft_count"] = max(0, len(first.proposed_ids or ()) - 1)
-    payload["summary"] = summary.to_payload()
-    return payload
+    if summary is None:
+        raise RuntimeError("fixed-linear DFlash2 did not emit a summary")
+    if (
+        summary.cycles_completed < 1
+        or not summary.acceptance_history
+        or summary.block_tokens is None
+        or summary.verify_len_cap is None
+    ):
+        raise RuntimeError("fixed-linear DFlash2 summary has no completed first cycle")
+
+    block_len = max(1, min(int(summary.block_tokens), 6))
+    physical_verify_width = verify_token_count_for_block(
+        block_len,
+        int(summary.verify_len_cap),
+    )
+    acceptance_len = int(summary.acceptance_history[0])
+    commit_count = 1 + acceptance_len
+    committed_output_ids = list(summary.generated_token_ids[:commit_count])
+    if commit_count > physical_verify_width or len(committed_output_ids) != commit_count:
+        raise RuntimeError("fixed-linear DFlash2 first-cycle accounting is inconsistent")
+    return {
+        "cycle": 1,
+        "block_len": block_len,
+        "proposed_token_count": block_len,
+        "future_draft_count": max(0, block_len - 1),
+        "physical_verify_width": physical_verify_width,
+        "acceptance_len": acceptance_len,
+        "commit_count": commit_count,
+        "committed_output_ids": committed_output_ids,
+        "committed_output_relation": "summary_generated_prefix",
+        "summary": summary.to_payload(),
+    }
 
 
 def _write(payload: dict, output: Path | None) -> None:
@@ -270,12 +435,12 @@ def _write(payload: dict, output: Path | None) -> None:
 
 
 def _deepseek_quality_gate(candidate_tokens: list[int], control_tokens: list[int]) -> dict:
-    """Reuse the established real-weight DeepSeek bf16/fp32 parity policy."""
+    """Require exact committed tokens for the sealed Mia DSpark lane."""
 
-    from deepseek_v4_mtpk_bench import _divergence, _exactness_is_enforced
+    from deepseek_v4_mtpk_bench import _divergence
 
     gate = _divergence(candidate_tokens, control_tokens)
-    gate["enforced"] = _exactness_is_enforced(False)
+    gate["enforced"] = True
     return gate
 
 
@@ -291,46 +456,41 @@ def main() -> int:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--prompt-tokens", type=int)
     parser.add_argument("--out", type=Path)
-    parser.add_argument(
-        "--profile-cycles",
-        action="store_true",
-        help="Enable stock DFlash2 cycle and top-logit diagnostics for a failing gate.",
-    )
     args = parser.parse_args()
 
+    repo = Path(__file__).resolve().parents[1]
+    source_commit = _require_clean_source(repo)
     guard = _guard_before_mlx()
-    if args.profile_cycles:
-        os.environ["DFLASH_CAPTURE_LOGITS"] = "1"
+    from mtplx.dflash_identity import require_pinned_dflash_install
+
+    dflash_identity = require_pinned_dflash_install()
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from mtplx.benchmarks.dflash2_runtime import (
-        build_deepseek_v4_dflash2_runtime_context,
         load_mtplx_deepseek_v4_dflash2_bundle,
     )
     from mtplx.deepseek_v4_dspark_artifact import open_verified_dspark_artifact
 
     artifact = open_verified_dspark_artifact(args.model)
     load_started = time.perf_counter()
-    bundle = load_mtplx_deepseek_v4_dflash2_bundle(str(args.model))
+    bundle = load_mtplx_deepseek_v4_dflash2_bundle(
+        str(args.model),
+        dflash_identity=dflash_identity,
+    )
     load_time = time.perf_counter() - load_started
-    context = build_deepseek_v4_dflash2_runtime_context()
-    if args.profile_cycles:
-        from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
-
-        context = replace(
-            context,
-            diagnostics=DiagnosticsConfig(
-                mode="full",
-                trace=TraceConfig(cycle_events=True),
-            ),
-        )
+    context = bundle.runtime_context
+    if context.dflash_identity is not dflash_identity:
+        raise RuntimeError("DFlash bundle did not preserve its preflight receipt")
     parameters = tree_flatten(bundle.target_model.parameters())
     resident_bytes = sum(int(value.nbytes) for _name, value in parameters)
+    mlx_active_after_load = _memory("get_active_memory")
+    mlx_peak_after_load = _memory("get_peak_memory")
+    process_peak_rss_after_load = _process_peak_rss_bytes()
     prompt_ids = _prompt_ids(bundle, args.prompt, args.prompt_tokens)
-    cache_capacity_tokens = len(prompt_ids) + max(0, int(args.max_tokens))
-    os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(cache_capacity_tokens)
+    requested_span_tokens = len(prompt_ids) + max(0, int(args.max_tokens))
+    os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(requested_span_tokens)
     common = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "deepseek_v4_dspark_dflash2_k5",
         "arm": args.arm,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -349,31 +509,31 @@ def main() -> int:
         ),
         "draft_artifact_index_sha256": artifact.index_sha256,
         "engine": "dflash_mlx_0_1_10",
-        "dflash_revision": DFLASH_REVISION,
+        "dflash_vcs": context.dflash_identity.vcs,
+        "dflash_url": context.dflash_identity.url,
+        "dflash_revision": context.dflash_identity.commit_id,
+        "dflash_requested_revision": context.dflash_identity.requested_revision,
         "physical_verify_width": bundle.checkpoint_block_size,
         "future_draft_count": bundle.checkpoint_block_size - 1,
         "dspark_stages": len(bundle.target_model.dspark.stages),
         "target_taps": list(bundle.target_layer_ids),
         "load_time_s": load_time,
         "resident_parameter_bytes": resident_bytes,
-        "active_memory_bytes_after_load": _memory("get_active_memory"),
-        "peak_memory_bytes_after_load": _memory("get_peak_memory"),
         "mlx_version": mx.__version__,
         "fp32_activations": (
             (os.environ.get("MTPLX_DSV4_FP32_ACTIVATIONS") or "").strip().lower()
             in {"1", "true", "yes", "on"}
         ),
         "guard_window_id": guard["window_id"],
-        "source_head": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parents[1],
-            text=True,
-        ).strip(),
-        **_cache_contract(bundle, capacity_tokens=cache_capacity_tokens),
+        "source_head": source_commit,
+        **_cache_contract(
+            bundle,
+            requested_span_tokens=requested_span_tokens,
+        ),
     }
-    common["peak_memory_reset_before_arm"] = _reset_peak_before_arm()
-    common["active_memory_bytes_before_arm"] = _memory("get_active_memory")
-    common["peak_memory_bytes_before_arm"] = _memory("get_peak_memory")
+    mlx_peak_reset_before_arm = _reset_peak_before_arm()
+    mlx_active_before_arm = _memory("get_active_memory")
+    mlx_peak_before_arm = _memory("get_peak_memory")
     status = 0
     if args.arm == "construct":
         payload = common
@@ -426,6 +586,14 @@ def main() -> int:
             ),
             "arms": {"C0": control_0, "K5": candidate, "C1": control_1},
         }
+    payload["memory"] = _finish_memory_receipt(
+        mlx_active_after_load_bytes=mlx_active_after_load,
+        mlx_peak_after_load_bytes=mlx_peak_after_load,
+        process_peak_rss_after_load_bytes=process_peak_rss_after_load,
+        mlx_peak_reset_before_arm=mlx_peak_reset_before_arm,
+        mlx_active_before_arm_bytes=mlx_active_before_arm,
+        mlx_peak_before_arm_bytes=mlx_peak_before_arm,
+    )
     _write(payload, args.out)
     return status
 

@@ -5,7 +5,9 @@ The two dense projections remain MLX GEMMs, matching the source's
 per-dimension window softmax, gated reduction, RMS normalization, compressor
 RoPE, quantization, and construction of the exact cache record.  Consequently
 the Mia route never materializes a dense compressed history merely to repack it
-into the paged cache.
+into the paged cache.  The pinned image patch keeps pooling, RMSNorm, and RoPE
+in FP32, then crosses one BF16 boundary before either stock432 or Mia132 record
+quantization.
 """
 
 from __future__ import annotations
@@ -33,13 +35,24 @@ _REDUCTION_HEADER = r"""
 """
 
 
+# Mia's Triton compressor classifies sign with ``value < 0``.  The ordinary
+# target/draft stock432 writer keeps the base header's IEEE sign-bit contract.
+_MIA_COMPRESSOR_NVFP4_HEADER = _NVFP4_HEADER + r"""
+    inline uchar mtplx_mia_compressor_e2m1_encode(float value) {
+        uchar code = mtplx_e2m1_encode(value);
+        uint sign = value < 0.0f ? 1u : 0u;
+        return uchar((code & uchar(0x07)) | uchar(sign << 3));
+    }
+"""
+
+
 @lru_cache(maxsize=2)
 def _nvfp4_finalize_kernel(compress_ratio: int):
     ratio = int(compress_ratio)
     if ratio not in (4, 128):
         raise ValueError("Mia attention compressor ratio must be 4 or 128")
     overlap = ratio == 4
-    header = _NVFP4_HEADER + _REDUCTION_HEADER + f"""
+    header = _MIA_COMPRESSOR_NVFP4_HEADER + _REDUCTION_HEADER + f"""
         constant constexpr uint MTPLX_COMPRESS_RATIO = {ratio}u;
         constant constexpr bool MTPLX_COMPRESS_OVERLAP = {'true' if overlap else 'false'};
         constant constexpr uint MTPLX_COMPRESS_HEAD = 512u;
@@ -53,6 +66,7 @@ def _nvfp4_finalize_kernel(compress_ratio: int):
         uint current_window = out_row;
 
         threadgroup float normed[512];
+        threadgroup float record_values[512];
         threadgroup float simd_sums[16];
         threadgroup float rrms_shared;
         threadgroup float group_scales[32];
@@ -132,11 +146,28 @@ def _nvfp4_finalize_kernel(compress_ratio: int):
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float normalized = pooled * rrms_shared * float(norm_weight[tid]);
-        normed[tid] = mtplx_bf16_roundtrip(normalized);
+        normed[tid] = normalized;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float rotated = normed[tid];
+        if (tid >= 448u) {
+            uint rope_dim = tid - 448u;
+            uint pair = rope_dim / 2u;
+            uint even_dim = 448u + pair * 2u;
+            float even = normed[even_dim];
+            float odd = normed[even_dim + 1u];
+            float c = float(rope_cos[size_t(out_row) * 32u + pair]);
+            float s = float(rope_sin[size_t(out_row) * 32u + pair]);
+            rotated = (rope_dim & 1u) == 0u
+                ? even * c - odd * s
+                : odd * c + even * s;
+        }
+        float record_value = mtplx_bf16_roundtrip(rotated);
+        record_values[tid] = record_value;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         uint group = tid / 16u;
-        float group_max = abs(normed[tid]);
+        float group_max = abs(record_value);
         group_max = max(group_max, simd_shuffle_down(group_max, 8u));
         group_max = max(group_max, simd_shuffle_down(group_max, 4u));
         group_max = max(group_max, simd_shuffle_down(group_max, 2u));
@@ -152,8 +183,10 @@ def _nvfp4_finalize_kernel(compress_ratio: int):
         if ((tid & 1u) == 0u) {
             float scale = group_scales[group];
             float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
-            uchar low = mtplx_e2m1_encode(normed[tid] * inverse);
-            uchar high = mtplx_e2m1_encode(normed[tid + 1u] * inverse);
+            uchar low = mtplx_mia_compressor_e2m1_encode(record_value * inverse);
+            uchar high = mtplx_mia_compressor_e2m1_encode(
+                record_values[tid + 1u] * inverse
+            );
             record[tid / 2u] = uchar(low | uchar(high << 4));
         }
         if (tid < 16u) {
@@ -162,16 +195,7 @@ def _nvfp4_finalize_kernel(compress_ratio: int):
 
         if (tid >= 448u) {
             uint rope_dim = tid - 448u;
-            uint pair = rope_dim / 2u;
-            uint even_dim = 448u + pair * 2u;
-            float even = normed[even_dim];
-            float odd = normed[even_dim + 1u];
-            float c = float(rope_cos[size_t(out_row) * 32u + pair]);
-            float s = float(rope_sin[size_t(out_row) * 32u + pair]);
-            float rotated = (rope_dim & 1u) == 0u
-                ? even * c - odd * s
-                : odd * c + even * s;
-            bfloat stored = bfloat(rotated);
+            bfloat stored = bfloat(record_value);
             ushort bits = as_type<ushort>(stored);
             uint byte = rope_dim * 2u;
             record[304u + byte] = uchar(bits & 0xffu);
@@ -275,19 +299,9 @@ def _indexer_finalize_kernel():
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float normalized = mtplx_bf16_roundtrip(
-            pooled * rrms_shared * float(norm_weight[tid])
-        );
+        float normalized = pooled * rrms_shared * float(norm_weight[tid]);
         uint pair = (tid >= 64u ? tid - 64u : 0u) / 2u;
-        if (tid >= 64u) {
-            uint even_dim = 64u + pair * 2u;
-            float even_pooled = 0.0f;
-            float odd_pooled = 0.0f;
-            // The pair mate writes before this read.
-            normed[tid] = normalized;
-        } else {
-            normed[tid] = normalized;
-        }
+        normed[tid] = normalized;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid >= 64u) {
             uint even_dim = 64u + pair * 2u;
@@ -298,9 +312,9 @@ def _indexer_finalize_kernel():
             normalized = (tid & 1u) == 0u
                 ? even * c - odd * s
                 : odd * c + even * s;
-            normalized = mtplx_bf16_roundtrip(normalized);
-            normed[tid] = normalized;
         }
+        normalized = mtplx_bf16_roundtrip(normalized);
+        normed[tid] = normalized;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float local_max = abs(normed[tid]);
@@ -345,6 +359,19 @@ def _indexer_finalize_kernel():
     )
 
 
+def install_nvfp4_record_kernel(*, compress_ratio: int):
+    """Construct and return the fixed-ratio stock432 finalizer once."""
+    ratio = int(compress_ratio)
+    if ratio not in (4, 128):
+        raise ValueError(f"unsupported Mia NVFP4 compressor ratio {ratio}")
+    return _nvfp4_finalize_kernel(ratio)
+
+
+def install_indexer_record_kernel():
+    """Construct and return the fixed ratio-4 Mia132 finalizer once."""
+    return _indexer_finalize_kernel()
+
+
 def fused_nvfp4_records(
     kv_windows: mx.array,
     score_windows: mx.array,
@@ -354,7 +381,7 @@ def fused_nvfp4_records(
     rope_cos: mx.array,
     rope_sin: mx.array,
     *,
-    compress_ratio: int,
+    kernel,
     has_previous: bool,
     output_rows: int,
     rms_eps: float,
@@ -363,7 +390,7 @@ def fused_nvfp4_records(
     rows = int(output_rows)
     if rows == 0:
         return mx.zeros((1, 0, MIA_NVFP4_RECORD_BYTES), dtype=mx.uint8)
-    records = _nvfp4_finalize_kernel(int(compress_ratio))(
+    records = kernel(
         inputs=[
             mx.contiguous(kv_windows),
             mx.contiguous(score_windows),
@@ -393,6 +420,7 @@ def fused_indexer_records(
     rope_cos: mx.array,
     rope_sin: mx.array,
     *,
+    kernel,
     has_previous: bool,
     output_rows: int,
     rms_eps: float,
@@ -401,7 +429,7 @@ def fused_indexer_records(
     rows = int(output_rows)
     if rows == 0:
         return mx.zeros((1, 0, INDEXER_RECORD_BYTES), dtype=mx.uint8)
-    records = _indexer_finalize_kernel()(
+    records = kernel(
         inputs=[
             mx.contiguous(kv_windows),
             mx.contiguous(score_windows),

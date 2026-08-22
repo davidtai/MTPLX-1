@@ -727,6 +727,7 @@ DEEPSEEK_V4_DSPARK_DESCRIPTOR = replace(
     backend_id="deepseek_v4_dspark",
     architecture_id="deepseek-v4-dspark-dflash2",
     display_name="DeepSeek V4 DSpark through DFlash2",
+    artifact_layout="split_mia_tp1_target_plus_k64_draft",
     runtime_capabilities=(
         "target_logits",
         "dspark_k5",
@@ -767,9 +768,9 @@ DEEPSEEK_V4_DSPARK_DESCRIPTOR = replace(
         ),
     ),
     context_window_policy=ContextWindowPolicy(
-        maximum=1_048_576,
-        default=262_144,
-        source="deepseek_v4_config",
+        maximum=384_000,
+        default=384_000,
+        source="sealed_mia_engine_plan",
     ),
     required_chat_template_profile="tokenizer",
     allows_chat_template_path=False,
@@ -778,7 +779,8 @@ DEEPSEEK_V4_DSPARK_DESCRIPTOR = replace(
     profile_policy="backend-aware-sustained",
     notes=(
         "The existing DFlash2 scheduler owns verification and acceptance.",
-        "Target and all three DSpark caches are affine int4 group 64 from offset zero.",
+        "The artifact is the pinned split Mia/Sero TP1 target plus packaged K64 draft.",
+        "Target and all three DSpark caches use stock432 NVFP4 records from offset zero.",
         "Default bf16 wide-forward divergence is reported; the fp32 causality gate is exact.",
     ),
 )
@@ -1235,9 +1237,7 @@ def context_window_policy_for_model(
         descriptor=descriptor,
     )
     if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
-        return descriptor.context_window_policy.with_resolved_max(
-            _context_window_from_inspection(inspection)
-        )
+        return descriptor.context_window_policy
     if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         base = QWEN3_NEXT_DESCRIPTOR.context_window_policy
     elif family == "gemma4":
@@ -1487,13 +1487,35 @@ def _runtime_is_lfm2(runtime: Any) -> bool:
 
 def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDescriptor:
     runtime_backend = getattr(runtime, "backend_id", None)
-    if runtime_backend:
+    requested_backend = getattr(args, "backend_id", None) if args is not None else None
+    if runtime_backend == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        from mtplx.deepseek_v4_mia_engine import (
+            MIA_CONTEXT_CAPACITY,
+            MiaDeepseekV4EnginePlan,
+        )
+
+        plan = getattr(getattr(runtime, "model", None), "_mia_engine_plan", None)
+        if (
+            not isinstance(plan, MiaDeepseekV4EnginePlan)
+            or int(plan.context_capacity_tokens) != MIA_CONTEXT_CAPACITY
+        ):
+            raise RuntimeError(
+                "deepseek_v4_dspark runtime has no sealed Mia engine plan"
+            )
+        descriptor = DEEPSEEK_V4_DSPARK_DESCRIPTOR
+    elif requested_backend == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        raise RuntimeError(
+            "sealed DSpark backend requires runtime.backend_id=deepseek_v4_dspark "
+            "and its installed Mia engine plan"
+        )
+    elif runtime_backend:
         descriptor = descriptor_for_backend_id(str(runtime_backend))
     elif bool(getattr(runtime, "gemma4_external_assistant", False)):
         return GEMMA4_ASSISTANT_DESCRIPTOR
     else:
-        backend_id = getattr(args, "backend_id", None) if args is not None else None
-        descriptor = descriptor_for_backend_id(str(backend_id) if backend_id else None)
+        descriptor = descriptor_for_backend_id(
+            str(requested_backend) if requested_backend else None
+        )
     if (
         descriptor.backend_id == MLX_LM_AR_DESCRIPTOR.backend_id
         and _runtime_is_lfm2(runtime)

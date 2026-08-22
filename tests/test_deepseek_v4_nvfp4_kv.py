@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,14 +8,16 @@ pytest.importorskip("mlx.core")
 import mlx.core as mx  # noqa: E402
 
 from mtplx.deepseek_v4_nvfp4_kv import (  # noqa: E402
+    FixedMiaNVFP4Window,
     MIA_NVFP4_RECORD_BYTES,
     MiaNVFP4Rows,
     PagedMiaNVFP4Rows,
 )
 from mtplx.deepseek_v4_paged_indexer import (  # noqa: E402
+    MiaIndexerWorkspace,
     MiaTopKSelection,
     PagedMiaIndexerRows,
-    _run_paged_indexer_topk,
+    _run_paged_indexer_records_topk,
     paged_indexer_scores,
     paged_indexer_tiled_scores,
 )
@@ -24,7 +27,10 @@ from mtplx.models.deepseek_v4 import (  # noqa: E402
     DeepseekV4NVFP4Cache,
     Indexer,
 )
+from mtplx.kernels import deepseek_v4_nvfp4_mla as nvfp4_mla_module  # noqa: E402
 from mtplx.kernels.deepseek_v4_nvfp4_mla import (  # noqa: E402
+    install_dspark_k5_nvfp4_mla,
+    install_nvfp4_sparse_mla,
     nvfp4_prefill_mla,
     nvfp4_sparse_mla,
 )
@@ -66,7 +72,111 @@ def _as_numpy(value: mx.array) -> np.ndarray:
     return np.array(value.astype(mx.float32))
 
 
-def test_mia_stock432_record_quantizes_the_post_rope_row_for_key_and_value() -> None:
+def test_mia_decode_kernel_seals_image_h16_bf16_base2_contract() -> None:
+    assert nvfp4_mla_module._DECODE_HEADS_PER_GROUP == 16
+    assert nvfp4_mla_module._DECODE_CANDIDATE_TILE == 64
+    assert nvfp4_mla_module._DECODE_METAL_PANEL == 32
+    assert nvfp4_mla_module._DECODE_MATH_THREADS == 256
+    assert nvfp4_mla_module._DECODE_NAX_THREADS == 288
+    assert "mtplx_dsv4_device_value_bf16" in nvfp4_mla_module._HEADER
+    assert "bfloat probability_bf16" in nvfp4_mla_module._DECODE_NAX_SOURCE
+    assert "MTPLX_LOG2E" in nvfp4_mla_module._DECODE_NAX_SOURCE
+    assert "fast::exp2" in nvfp4_mla_module._DECODE_NAX_SOURCE
+    assert "use_indices" not in nvfp4_mla_module._DECODE_NAX_SOURCE
+    assert "use_paged_compressed" not in nvfp4_mla_module._DECODE_NAX_SOURCE
+
+
+def test_tile64_correction_precedes_the_single_bf16_probability_boundary() -> None:
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        interim_probability = 2.0**-9.95
+        correction = 2.0**-0.03507537688442211
+        rounded_too_early = (
+            mx.array(interim_probability, dtype=mx.bfloat16).astype(mx.float32)
+            * correction
+        ).astype(mx.bfloat16)
+        source_order = mx.array(
+            interim_probability * correction,
+            dtype=mx.bfloat16,
+        )
+        assert float(rounded_too_early.item()) == 0.0009918212890625
+        assert float(source_order.item()) == 0.00098419189453125
+        assert float(rounded_too_early.item()) != float(source_order.item())
+    finally:
+        mx.set_default_device(previous)
+
+    source = nvfp4_mla_module._DECODE_NAX_SOURCE
+    assert "second_panel_scores" in source
+    assert "float corrected_probability" in source
+    assert source.index("float corrected_probability") < source.index(
+        "bfloat probability_bf16 = bfloat(corrected_probability)"
+    )
+
+
+def test_tile64_score_and_probability_lifetimes_are_disjoint() -> None:
+    first = nvfp4_mla_module._DECODE_FIRST_SCORE_RANGE
+    second = nvfp4_mla_module._DECODE_SECOND_SCORE_RANGE
+    probabilities = nvfp4_mla_module._DECODE_PROBABILITY_RANGE
+
+    def disjoint(left, right) -> bool:
+        return left[1] <= right[0] or right[1] <= left[0]
+
+    assert first == (16_384, 18_432)
+    assert second == (0, 2_048)
+    assert probabilities == (18_432, 20_480)
+    assert disjoint(probabilities, first)
+    assert disjoint(probabilities, second)
+    assert probabilities[1] <= nvfp4_mla_module._DECODE_NAX_SCRATCH_BYTES
+    assert (
+        "reinterpret_cast<threadgroup bfloat*>(scratch + 18432)"
+        in nvfp4_mla_module._DECODE_NAX_SOURCE
+    )
+
+
+def test_decode_reloads_query_inside_every_tile_before_score_alias() -> None:
+    source = nvfp4_mla_module._DECODE_NAX_SOURCE
+    tile_loop = source.index("for (uint tile_start = 0u;")
+    query_reload = source.index("for (uint index = thread_index;", tile_loop)
+    qk_read = source.index("auto q_tile = Q.template", query_reload)
+    score_alias = source.index(
+        "threadgroup float* second_panel_scores =",
+        query_reload,
+    )
+
+    assert "q_shared[index] =" not in source[:tile_loop]
+    assert tile_loop < query_reload < qk_read < score_alias
+    assert "Reload the immutable query at every candidate" in source
+
+
+def test_installed_mla_launchers_use_only_the_prebound_kernel() -> None:
+    names = (
+        "_run_installed_window_nvfp4_sparse_mla",
+        "_run_installed_indexed_paged_nvfp4_sparse_mla",
+        "_run_installed_sequential_paged_nvfp4_sparse_mla",
+        "_run_installed_window_nvfp4_prefill_mla",
+        "_run_installed_indexed_paged_nvfp4_prefill_mla",
+        "_run_installed_sequential_paged_nvfp4_prefill_mla",
+    )
+    for name in names:
+        source = inspect.getsource(getattr(nvfp4_mla_module, name))
+        assert "kernel=kernel" in source
+        assert "_kernel(" not in source
+        assert "selected_width" not in source
+        assert "compressed_block_size" not in source
+        assert "window_records.block_size" in source
+    dspark_source = inspect.getsource(nvfp4_mla_module._run_dspark_k5_nvfp4_mla)
+    assert "(output,) = kernel(" in dspark_source
+    assert "_kernel(" not in dspark_source
+    assert "_dspark_placeholder_inputs" not in dspark_source
+    installer_source = inspect.getsource(
+        nvfp4_mla_module.install_dspark_k5_nvfp4_mla
+    )
+    assert "_dspark_placeholder_inputs()" in installer_source
+    assert "query_positions=query_positions" in installer_source
+
+
+def test_mia_stock432_record_keeps_value_latent_and_key_rope_distinct() -> None:
     if not mx.metal.is_available():
         pytest.skip("requires Metal NVFP4 record packer")
 
@@ -90,11 +200,17 @@ def test_mia_stock432_record_quantizes_the_post_rope_row_for_key_and_value() -> 
         np.full((1, 2, 32), 0x38, dtype=np.uint8),
     )
     assert int(rows.records[0, 0, 0].item()) == 0x10
-    stored = mx.concatenate([latent[..., :448], rope], axis=-1)
-    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(stored))
+    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(latent))
     np.testing.assert_array_equal(_as_numpy(key[..., :448]), _as_numpy(latent[..., :448]))
     np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))
-    np.testing.assert_array_equal(_as_numpy(value[..., 448:]), _as_numpy(rope))
+    np.testing.assert_array_equal(
+        _as_numpy(value[..., 448:]),
+        _as_numpy(latent[..., 448:]),
+    )
+    assert not np.array_equal(
+        _as_numpy(value[..., 448:]),
+        _as_numpy(key[..., 448:]),
+    )
 
 
 def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> None:
@@ -112,13 +228,9 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     rows.truncate(2)
     assert rows.shape == (1, 2, 432)
     key, value = rows.decode()
-    expected_replacement = mx.concatenate(
-        [replacement[..., :448], replacement_rope],
-        axis=-1,
-    )
     np.testing.assert_array_equal(
         _as_numpy(value[:, :1]),
-        _as_numpy(expected_replacement),
+        _as_numpy(replacement),
     )
     np.testing.assert_array_equal(_as_numpy(key[:, :1, 448:]), _as_numpy(replacement_rope))
 
@@ -127,7 +239,7 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     restored_key, restored_value = rows.decode(1, 2)
     np.testing.assert_array_equal(
         _as_numpy(restored_value),
-        _as_numpy(expected_replacement),
+        _as_numpy(replacement),
     )
     np.testing.assert_array_equal(
         _as_numpy(restored_key[..., 448:]),
@@ -155,12 +267,9 @@ def test_paged_mia_stock432_owner_keeps_fixed_pages_across_writes() -> None:
     rows.replace(1, replacement, replacement_rope)
     rows.truncate(4)
     _key, value = rows.decode()
-    expected_replacement = mx.concatenate(
-        [replacement[..., :448], replacement_rope], axis=-1
-    )
     np.testing.assert_array_equal(
         _as_numpy(value[:, 1:2]),
-        _as_numpy(expected_replacement),
+        _as_numpy(replacement),
     )
     with pytest.raises(ValueError, match="capacity exceeded"):
         rows.append(_exact_latent(5), _rope(5))
@@ -186,10 +295,13 @@ def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
     assert cache.window.mode == "nvfp4_stock432"
     assert cache.window.shape == (1, 3, 432)
     assert records.shape == (1, 3, 432)
-    stored = mx.concatenate([latent[..., :448], rope], axis=-1)
-    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(stored))
+    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(latent))
     np.testing.assert_array_equal(_as_numpy(key[..., :448]), _as_numpy(latent[..., :448]))
     np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))
+    assert not np.array_equal(
+        _as_numpy(value[..., 448:]),
+        _as_numpy(key[..., 448:]),
+    )
 
 
 def test_target_compressed_cache_uses_fixed_stock432_pages() -> None:
@@ -258,10 +370,11 @@ def test_paged_mia_indexer_reads_132_byte_fp8_records_directly() -> None:
     )
 
 
-def test_mia_indexer_streams_bounded_score_slices_into_compact_topk(
+def test_mia_indexer_streams_qualified_records_into_compact_topk(
     monkeypatch,
 ) -> None:
     score_slice_widths = []
+    fold_calls = []
 
     def fake_score_slice(q_records, weights, rows, row_start, row_count):
         del q_records, weights, rows
@@ -273,30 +386,52 @@ def test_mia_indexer_streams_bounded_score_slices_into_compact_topk(
         "mtplx.deepseek_v4_paged_indexer._run_paged_indexer_score_slice",
         fake_score_slice,
     )
+
+    def fake_radix_fold(
+        scores,
+        carry_values,
+        carry_indices,
+        causal_lengths,
+        *,
+        row_start,
+        score_indices,
+        has_carry,
+        sentinel,
+    ):
+        del scores, causal_lengths, score_indices, sentinel
+        fold_calls.append((row_start, has_carry))
+        return carry_values, carry_indices
+
     monkeypatch.setattr(
-        "mtplx.deepseek_v4_paged_indexer._pack_indexer132",
-        lambda queries: queries,
+        "mtplx.deepseek_v4_paged_indexer._run_radix_fold",
+        fake_radix_fold,
     )
     rows = SimpleNamespace(length=300)
-    selection = _run_paged_indexer_topk(
-        mx.zeros((1, 2, 64, 128), dtype=mx.bfloat16),
+    workspace = MiaIndexerWorkspace.allocate(
+        max_query_rows=2,
+        topk=512,
+        sentinel=300,
+    )
+    selection = _run_paged_indexer_records_topk(
+        mx.zeros((1, 2, 64, 132), dtype=mx.uint8),
         mx.zeros((1, 2, 64), dtype=mx.float32),
         mx.array([7, 1199], dtype=mx.int32),
         rows,
-        topk=3,
+        topk=512,
         compress_ratio=4,
+        workspace=workspace,
         score_chunk_rows=128,
+        query_count=2,
+        score_slice=fake_score_slice,
+        radix_fold=fake_radix_fold,
     )
 
     assert isinstance(selection, MiaTopKSelection)
     assert score_slice_widths == [128, 128, 44]
-    assert tuple(selection.indices.shape) == (1, 2, 3)
+    assert fold_calls == [(0, False), (128, True), (256, True)]
+    assert tuple(selection.indices.shape) == (1, 2, 512)
     assert tuple(selection.lengths.shape) == (1, 2)
-    np.testing.assert_array_equal(
-        np.array(selection.indices),
-        np.array([[[0, 1, 300], [297, 298, 299]]], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(np.array(selection.lengths), [[2, 3]])
+    np.testing.assert_array_equal(np.array(selection.lengths), [[2, 300]])
 
 
 def test_mia_indexer_install_removes_the_non_source_hadamard(monkeypatch) -> None:
@@ -308,16 +443,36 @@ def test_mia_indexer_install_removes_the_non_source_hadamard(monkeypatch) -> Non
         "install_paged_indexer_topk",
         lambda **_kwargs: installed,
     )
+    query_install = {}
+
+    def install_query_records(**kwargs):
+        query_install.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        deepseek_v4_module,
+        "install_indexer_query_records",
+        install_query_records,
+    )
     indexer = Indexer.__new__(Indexer)
     indexer.n_heads = 64
     indexer.head_dim = 128
+    indexer.rope_head_dim = 64
     indexer.index_topk = 512
     indexer.compress_ratio = 4
-    indexer.compressor = SimpleNamespace(rotate=True)
+    indexer.softmax_scale = 128**-0.5
+    installed_record_modes = []
+    indexer.compressor = SimpleNamespace(
+        rotate=True,
+        install_mia_record_packer=installed_record_modes.append,
+    )
 
-    indexer.install_mia_paged_topk()
+    rope_table = object()
+    indexer.install_mia_paged_topk(workspace=object(), rope_table=rope_table)
 
     query = mx.zeros((1, 1, 64, 128), dtype=mx.bfloat16)
+    assert installed_record_modes == ["indexer"]
+    assert query_install["rope_table"] is rope_table
     assert indexer.compressor.rotate is False
     assert indexer._prepare_query_rows(query) is query
     assert indexer._select_rows is installed
@@ -329,12 +484,12 @@ def test_mia_attention_routes_nax_prefill_by_phase(monkeypatch) -> None:
     monkeypatch.setattr(
         deepseek_v4_module,
         "install_nvfp4_prefill_mla",
-        lambda **_kwargs: lambda *_args: prefill_result,
+        lambda **_kwargs: lambda *_args, **_run_kwargs: prefill_result,
     )
     monkeypatch.setattr(
         deepseek_v4_module,
         "install_nvfp4_sparse_mla",
-        lambda **_kwargs: lambda *_args: direct_result,
+        lambda **_kwargs: lambda *_args, **_run_kwargs: direct_result,
     )
 
     class FakeIndexer:
@@ -352,7 +507,12 @@ def test_mia_attention_routes_nax_prefill_by_phase(monkeypatch) -> None:
     attn.attn_sink = mx.zeros((64,), dtype=mx.float32)
     attn.softmax_scale = 512**-0.5
     attn.indexer = FakeIndexer()
+    installed_record_modes = []
+    attn.compressor = SimpleNamespace(
+        install_mia_record_packer=installed_record_modes.append,
+    )
     attn.install_mia_nvfp4_attention()
+    assert installed_record_modes == ["nvfp4"]
 
     selection = MiaTopKSelection(
         indices=mx.zeros((1, 2, 1), dtype=mx.int32),
@@ -360,8 +520,8 @@ def test_mia_attention_routes_nax_prefill_by_phase(monkeypatch) -> None:
     )
 
     def run(query_rows: int):
-        return attn._mia_cached_attention(
-            mx.zeros((1, 64, query_rows, 512), dtype=mx.bfloat16),
+        return attn._cached_attention_impl(
+            mx.zeros((1, query_rows, 64, 512), dtype=mx.bfloat16),
             mx.zeros((1, 1, 432), dtype=mx.uint8),
             None,
             0,
@@ -476,25 +636,194 @@ def test_sparse_attention_reads_stock432_records_directly(
             [window_value[:, valid_window], compressed_value[:, chosen]],
             axis=1,
         )
-        query = queries[:, :, query_row : query_row + 1].astype(mx.float32)
-        scores = (query * scale) @ mx.swapaxes(key[:, None].astype(mx.float32), -1, -2)
-        maximum = mx.maximum(
-            mx.max(scores, axis=-1, keepdims=True),
-            sinks.reshape(1, 64, 1, 1),
-        )
-        weights = mx.exp(scores - maximum)
-        denominator = mx.sum(weights, axis=-1, keepdims=True) + mx.exp(
-            sinks.reshape(1, 64, 1, 1) - maximum
-        )
-        expected_rows.append(
-            ((weights / denominator) @ value[:, None].astype(mx.float32)).astype(
-                mx.bfloat16
+        # SparkInfer dequantizes stock432 operands to BF16, performs QK with
+        # FP32 accumulation, and scales only the completed dot product.
+        query = queries[:, :, query_row : query_row + 1].astype(mx.bfloat16)
+        key_bf16 = key[:, None].astype(mx.bfloat16)
+        scores = (
+            mx.sum(
+                query[..., None, :].astype(mx.float32)
+                * key_bf16[:, :, None].astype(mx.float32),
+                axis=-1,
             )
+            * scale
         )
+        scores_base2 = scores * np.log2(np.e)
+        sinks_base2 = sinks.reshape(1, 64, 1, 1) * np.log2(np.e)
+        maximum = mx.maximum(
+            mx.max(scores_base2, axis=-1, keepdims=True),
+            sinks_base2,
+        )
+        weights = mx.exp2(scores_base2 - maximum)
+        denominator = mx.sum(weights, axis=-1, keepdims=True) + mx.exp2(
+            sinks_base2 - maximum
+        )
+        # The unnormalized P operand crosses a BF16 boundary before P.V.  Its
+        # FP32 value still owns the online-softmax denominator.
+        probability_bf16 = weights.astype(mx.bfloat16)
+        numerator = probability_bf16.astype(mx.float32) @ value[:, None].astype(
+            mx.bfloat16
+        ).astype(mx.float32)
+        expected_rows.append((numerator / denominator).astype(mx.bfloat16))
     expected = mx.concatenate(expected_rows, axis=2)
     mx.eval(output, expected)
 
     assert output.shape == (1, 64, query_rows, 512)
+    np.testing.assert_allclose(
+        np.array(output.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_dspark_k5_attention_uses_bf16_source_math_over_ring_and_all_drafts() -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires direct Metal NVFP4 attention")
+
+    prefix_length = 131
+    context = MiaNVFP4Rows()
+    context.append(
+        (
+            ((mx.arange(128 * 512, dtype=mx.float32) % 31) - 15) / 7.0
+        ).reshape(1, 128, 512).astype(mx.bfloat16),
+        (
+            ((mx.arange(128 * 64, dtype=mx.float32) % 23) - 11) / 8.0
+        ).reshape(1, 128, 64).astype(mx.bfloat16),
+    )
+    draft = MiaNVFP4Rows()
+    draft.append(
+        (
+            ((mx.arange(5 * 512, dtype=mx.float32) % 19) - 9) / 6.0
+        ).reshape(1, 5, 512).astype(mx.bfloat16),
+        (
+            ((mx.arange(5 * 64, dtype=mx.float32) % 13) - 6) / 5.0
+        ).reshape(1, 5, 64).astype(mx.bfloat16),
+    )
+    queries = (
+        ((mx.arange(64 * 5 * 512, dtype=mx.float32) % 29) - 14) / 17.0
+    ).reshape(1, 5, 64, 512).astype(mx.bfloat16)
+    sinks = mx.linspace(-0.5, 0.75, 64, dtype=mx.float32)
+    scale = 512**-0.5
+
+    run = install_dspark_k5_nvfp4_mla(
+        heads=64,
+        head_dim=512,
+        rope_dim=64,
+        window_size=128,
+        block_size=5,
+    )
+    output = run(
+        queries,
+        context.records,
+        draft.records,
+        prefix_length,
+        sinks,
+        scale,
+    )
+
+    context_key, context_value = context.decode()
+    draft_key, draft_value = draft.decode()
+    ring_rows = mx.arange(prefix_length - 128, prefix_length, dtype=mx.int32) % 128
+    key = mx.concatenate([context_key[:, ring_rows], draft_key], axis=1)
+    value = mx.concatenate([context_value[:, ring_rows], draft_value], axis=1)
+    scores = (
+        mx.sum(
+            queries.transpose(0, 2, 1, 3)[..., None, :].astype(mx.float32)
+            * key[:, None, None].astype(mx.bfloat16).astype(mx.float32),
+            axis=-1,
+        )
+        * scale
+    )
+    scores_base2 = scores * np.log2(np.e)
+    sinks_base2 = sinks.reshape(1, 64, 1, 1) * np.log2(np.e)
+    maximum = mx.maximum(
+        mx.max(scores_base2, axis=-1, keepdims=True),
+        sinks_base2,
+    )
+    probabilities = mx.exp2(scores_base2 - maximum)
+    denominator = mx.sum(probabilities, axis=-1, keepdims=True) + mx.exp2(
+        sinks_base2 - maximum
+    )
+    numerator = probabilities.astype(mx.bfloat16).astype(mx.float32) @ value[
+        :, None
+    ].astype(mx.bfloat16).astype(mx.float32)
+    expected = (numerator / denominator).astype(mx.bfloat16).transpose(
+        0, 2, 1, 3
+    )
+    mx.eval(output, expected)
+
+    np.testing.assert_allclose(
+        np.array(output.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_ratio128_sequential_paged_decode_crosses_tile64() -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires direct Metal NVFP4 attention")
+
+    compressed = PagedMiaNVFP4Rows(capacity_rows=80, block_size=8)
+    compressed.append(
+        (
+            ((mx.arange(65 * 512, dtype=mx.float32) % 31) - 15) / 7.0
+        ).reshape(1, 65, 512).astype(mx.bfloat16),
+        (
+            ((mx.arange(65 * 64, dtype=mx.float32) % 23) - 11) / 8.0
+        ).reshape(1, 65, 64).astype(mx.bfloat16),
+    )
+    queries = (
+        ((mx.arange(64 * 512, dtype=mx.float32) % 29) - 14) / 17.0
+    ).reshape(1, 1, 64, 512).astype(mx.bfloat16)
+    sinks = mx.linspace(-0.5, 0.75, 64, dtype=mx.float32)
+    scale = 512**-0.5
+    run = install_nvfp4_sparse_mla(
+        heads=64,
+        head_dim=512,
+        rope_dim=64,
+        window_size=128,
+        compress_ratio=128,
+    )
+    output = run(
+        queries,
+        FixedMiaNVFP4Window(
+            capacity_rows=8_416,
+            block_size=64,
+        ).paged_records(0, 0),
+        0,
+        mx.array([-1], dtype=mx.int32),
+        compressed.paged_records,
+        None,
+        mx.array([[65]], dtype=mx.int32),
+        sinks,
+        scale,
+    )
+
+    key, value = compressed.decode()
+    scores = (
+        mx.sum(
+            queries.transpose(0, 2, 1, 3)[..., None, :].astype(mx.float32)
+            * key[:, None, None].astype(mx.bfloat16).astype(mx.float32),
+            axis=-1,
+        )
+        * scale
+        * np.log2(np.e)
+    )
+    sink = sinks.reshape(1, 64, 1, 1) * np.log2(np.e)
+    maximum = mx.maximum(mx.max(scores, axis=-1, keepdims=True), sink)
+    probabilities = mx.exp2(scores - maximum)
+    denominator = mx.sum(probabilities, axis=-1, keepdims=True) + mx.exp2(
+        sink - maximum
+    )
+    numerator = probabilities.astype(mx.bfloat16).astype(mx.float32) @ value[
+        :, None
+    ].astype(mx.bfloat16).astype(mx.float32)
+    expected = (numerator / denominator).astype(mx.bfloat16).transpose(
+        0, 2, 1, 3
+    )
+    mx.eval(output, expected)
     np.testing.assert_allclose(
         np.array(output.astype(mx.float32)),
         np.array(expected.astype(mx.float32)),

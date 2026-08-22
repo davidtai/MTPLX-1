@@ -11,14 +11,42 @@ from mtplx.benchmarks.dflash2_runtime import (  # noqa: E402
     build_deepseek_v4_dflash2_runtime_context,
     load_mtplx_deepseek_v4_dflash2_bundle,
 )
+from mtplx.dflash_identity import PINNED_DFLASH_IDENTITY  # noqa: E402
 from mtplx.deepseek_v4_dflash2 import (  # noqa: E402
     DeepseekV4DSparkBackend,
     DeepseekV4DSparkDraftAdapter,
+    DeepseekV4TargetTapRows,
     DeepseekV4TargetOps,
     generate_deepseek_v4_dflash2,
 )
 from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache  # noqa: E402
 from mtplx.models.deepseek_v4_dspark import DeepseekV4DSparkCache  # noqa: E402
+
+
+class _FakeMiaEnginePlan:
+    identity = "test-mia-deepseek-v4-engine-plan"
+    context_capacity_tokens = 384_000
+
+    def __init__(self, target_cache_factory=None) -> None:
+        self._target_cache_factory = target_cache_factory
+        self.target_cache_layers = []
+        self.released_target_caches = []
+
+    def make_target_cache(self, layers):
+        self.target_cache_layers.append(layers)
+        if self._target_cache_factory is None:
+            raise AssertionError("this fixture does not allocate target caches")
+        return self._target_cache_factory()
+
+    def release_target_cache(self, caches) -> None:
+        self.released_target_caches.append(caches)
+
+
+def _seal_fake_target(target, *, target_cache_factory=None) -> _FakeMiaEnginePlan:
+    plan = _FakeMiaEnginePlan(target_cache_factory)
+    target._mia_engine_plan = plan
+    target._mia_prewarm_receipt = {"identity": plan.identity}
+    return plan
 
 
 class _FakeDeepseekTarget:
@@ -27,11 +55,22 @@ class _FakeDeepseekTarget:
             model_type="deepseek_v4",
             dspark_target_layer_ids=(40, 41, 42),
         )
-        self.dspark = SimpleNamespace(stages=(object(), object(), object()))
+        self.released_draft_caches = []
+        self.dspark = SimpleNamespace(
+            stages=(object(), object(), object()),
+            release_mia_cache=self.released_draft_caches.append,
+        )
         self.model = SimpleNamespace(embed_tokens=object())
+        self.layers = (object(),)
         self._target_cache_type = DeepseekV4NVFP4Cache
         self.calls: list[tuple[int, bool]] = []
         self.cache_capacities: list[int | None] = []
+        self.plan = _seal_fake_target(
+            self,
+            target_cache_factory=lambda: self.make_cache(
+                capacity_tokens=_FakeMiaEnginePlan.context_capacity_tokens
+            ),
+        )
 
     def make_cache(self, *, capacity_tokens=None):
         self.cache_capacities.append(capacity_tokens)
@@ -60,10 +99,18 @@ class _FakeDeepseekTarget:
         )
         return logits, taps
 
+    def mia_dflash_forward(self, input_ids, cache, *, logits_last_only):
+        return self(
+            input_ids,
+            cache=cache,
+            return_hidden=True,
+            logits_keep=1 if logits_last_only else None,
+        )
+
 
 def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
     model = _FakeDeepseekTarget()
-    ops = DeepseekV4TargetOps()
+    ops = DeepseekV4TargetOps(model)
     cache = ops.make_cache(
         model,
         enable_speculative_linear_cache=True,
@@ -82,19 +129,20 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
     assert ops.supports_model(model)
     assert ops.family(model) == "deepseek_v4_dspark"
     assert model.calls == [(6, False)]
-    assert model.cache_capacities == [64]
+    assert model.cache_capacities == [384_000]
+    assert model.plan.target_cache_layers == [model.layers]
     assert tuple(logits.shape) == (1, 6, 64)
     assert set(captured) == {41, 42, 43}
     assert tuple(features.shape) == (1, 6, 6)
     np.testing.assert_array_equal(
         np.array(features[0, 0]),
-        np.array([40, 40, 41, 41, 42, 42], dtype=np.float32),
+        np.array([[40, 40], [41, 41], [42, 42]], dtype=np.float32),
     )
 
 
 def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
     model = _FakeDeepseekTarget()
-    ops = DeepseekV4TargetOps()
+    ops = DeepseekV4TargetOps(model)
     cache = ops.make_cache(
         model,
         enable_speculative_linear_cache=True,
@@ -130,15 +178,25 @@ def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
 
 
 class _FakeDSparkAttention:
-    window_size = 8
+    window_size = 128
     head_dim = 512
 
     def prefill_context(self, projected, cache) -> None:
         cache.prefill(*self.project_kv(projected, mx.arange(projected.shape[1])))
 
     def project_kv(self, projected, positions):
+        if isinstance(positions, int):
+            positions = mx.arange(positions, positions + projected.shape[1])
         assert int(projected.shape[1]) == int(positions.shape[0])
+        assert int(projected.shape[-1]) == 512
         return projected, projected[..., -64:]
+
+    def project_context_records(self, projected, start_pos):
+        assert isinstance(start_pos, int)
+        assert int(projected.shape[-1]) == 512
+        return mx.zeros(
+            (1, int(projected.shape[1]), 432), dtype=mx.uint8
+        )
 
 
 class _FakeDSparkOwner:
@@ -146,13 +204,17 @@ class _FakeDSparkOwner:
         self.stages = tuple(
             SimpleNamespace(attn=_FakeDSparkAttention()) for _ in range(3)
         )
-        self.projected_taps: tuple[mx.array, ...] | None = None
+        self.projected_rows: mx.array | None = None
         self.proposal_positions: list[int] = []
+        self.released_mia_caches = []
 
     def make_cache(self):
         return [
-            DeepseekV4DSparkCache(window_size=8, head_dim=512) for _ in range(3)
+            DeepseekV4DSparkCache(window_size=128, head_dim=512) for _ in range(3)
         ]
+
+    def release_mia_cache(self, caches) -> None:
+        self.released_mia_caches.append(caches)
 
     def propose_k5(
         self,
@@ -176,9 +238,9 @@ class _FakeStageZero:
         self.owner = owner
         self.attn = _FakeDSparkAttention()
 
-    def fuse_main(self, taps):
-        self.owner.projected_taps = tuple(taps)
-        rows = int(taps[0].shape[1])
+    def _run_fuse_main_rows(self, target_rows):
+        self.owner.projected_rows = target_rows
+        rows = int(target_rows.shape[1])
         return mx.zeros((1, rows, 512), dtype=mx.bfloat16)
 
 
@@ -196,21 +258,31 @@ def _fake_dspark_target():
             dspark_noise_token_id=128799,
         ),
         dspark=owner,
+        layers=(),
         model=SimpleNamespace(embed_tokens=object()),
         lm_head=object(),
+        _target_cache_type=DeepseekV4NVFP4Cache,
     )
+    _seal_fake_target(target)
     return target, owner
+
+
+def _fake_target_taps(rows: int) -> DeepseekV4TargetTapRows:
+    return DeepseekV4TargetTapRows(
+        tuple(
+            mx.full((1, rows, 2), value)
+            for value in (40.0, 41.0, 42.0)
+        )
+    )
 
 
 def test_draft_adapter_advertises_m6_but_projects_three_dspark_taps() -> None:
     target, owner = _fake_dspark_target()
     draft = DeepseekV4DSparkDraftAdapter(target)
-    concatenated = mx.concatenate(
-        [mx.full((1, 2, 2), value) for value in (40.0, 41.0, 42.0)],
-        axis=-1,
-    )
+    target_taps = _fake_target_taps(2)
 
-    projected = draft.project_target_hidden(concatenated)
+    projected = draft.project_target_hidden(target_taps)
+    latent = target.dspark.stages[0]._run_fuse_main_rows(projected.fuse_tail(0))
 
     assert draft.block_size == 6
     assert draft.mask_token_id == 128799
@@ -220,9 +292,10 @@ def test_draft_adapter_advertises_m6_but_projects_three_dspark_taps() -> None:
     assert draft.capabilities.supports_copyspec is False
     assert draft.capabilities.supports_ddtree is False
     assert draft.capabilities.supports_early_rollback_launch is False
-    assert tuple(projected.shape) == (1, 2, 512)
-    assert owner.projected_taps is not None
-    assert tuple(float(tap[0, 0, 0].item()) for tap in owner.projected_taps) == (
+    assert projected is target_taps
+    assert tuple(latent.shape) == (1, 2, 512)
+    assert owner.projected_rows is not None
+    assert tuple(float(tap[0, 0, 0].item()) for tap in projected.taps) == (
         40.0,
         41.0,
         42.0,
@@ -241,7 +314,7 @@ def test_draft_backend_appends_committed_context_once_and_returns_five_tokens() 
     )
     arguments = dict(
         target_model=target,
-        target_ops=DeepseekV4TargetOps(),
+        target_ops=DeepseekV4TargetOps(target),
         draft_model=draft,
         draft_cache=caches,
         staged_first=mx.array([29], dtype=mx.uint32),
@@ -253,18 +326,18 @@ def test_draft_backend_appends_committed_context_once_and_returns_five_tokens() 
 
     first = backend.draft_greedy(
         **arguments,
-        draft_context=mx.zeros((1, 4, 512), dtype=mx.bfloat16),
+        draft_context=_fake_target_taps(4),
     )
     second = backend.draft_greedy(
         **arguments,
-        draft_context=mx.zeros((1, 2, 512), dtype=mx.bfloat16),
+        draft_context=_fake_target_taps(2),
     )
 
     assert tuple(np.array(first)) == (31, 32, 33, 34, 35)
     assert tuple(np.array(second)) == (31, 32, 33, 34, 35)
     assert owner.proposal_positions == [4, 6]
     assert [cache.prefill_length for cache in caches] == [6, 6, 6]
-    assert all(cache.ring.mode == "nvfp4_stock432" for cache in caches)
+    assert all(cache.ring.mode == "nvfp4_stock432_fixed_ring" for cache in caches)
     assert all(cache.ring.record_bytes == 432 for cache in caches)
 
 
@@ -284,16 +357,13 @@ def test_draft_backend_streams_prefill_chunks_without_retaining_or_reappending_p
         draft_model=draft,
         draft_cache=caches,
     )
-    raw = mx.concatenate(
-        [mx.full((1, 20, 2), value) for value in (40.0, 41.0, 42.0)],
-        axis=-1,
-    )
+    raw = _fake_target_taps(20)
 
     store.write_prompt_slice(start=0, end=10, features=raw[:, :10])
     current = store.write_prompt_slice(start=10, end=20, features=raw[:, 10:])
     drafted = backend.draft_greedy(
         target_model=target,
-        target_ops=DeepseekV4TargetOps(),
+        target_ops=DeepseekV4TargetOps(target),
         draft_model=draft,
         draft_cache=caches,
         staged_first=mx.array([29], dtype=mx.uint32),
@@ -304,7 +374,7 @@ def test_draft_backend_streams_prefill_chunks_without_retaining_or_reappending_p
         async_launch=False,
     )
 
-    assert tuple(current.shape) == (1, 0, 512)
+    assert tuple(current.shape) == (1, 0, 6)
     assert [cache.prefill_length for cache in caches] == [20, 20, 20]
     assert owner.proposal_positions == [20]
     assert tuple(np.array(drafted)) == (31, 32, 33, 34, 35)
@@ -323,11 +393,11 @@ def test_draft_backend_returns_requested_prefix_for_dflash_final_tail() -> None:
 
     tail = backend.draft_greedy(
         target_model=target,
-        target_ops=DeepseekV4TargetOps(),
+        target_ops=DeepseekV4TargetOps(target),
         draft_model=draft,
         draft_cache=caches,
         staged_first=mx.array([29], dtype=mx.uint32),
-        draft_context=mx.zeros((1, 4, 512), dtype=mx.bfloat16),
+        draft_context=_fake_target_taps(4),
         block_len=3,
         mask_token_tail=mx.full((5,), 128799, dtype=mx.uint32),
         suppress_token_mask=None,
@@ -351,11 +421,11 @@ def test_draft_backend_capture_reuses_the_same_dspark_proposal_path() -> None:
 
     drafted, top_ids, top_logprobs = backend.draft_greedy_capture(
         target_model=target,
-        target_ops=DeepseekV4TargetOps(),
+        target_ops=DeepseekV4TargetOps(target),
         draft_model=draft,
         draft_cache=caches,
         staged_first=mx.array([29], dtype=mx.uint32),
-        draft_context=mx.zeros((1, 4, 512), dtype=mx.bfloat16),
+        draft_context=_fake_target_taps(4),
         block_len=6,
         mask_token_tail=mx.full((5,), 128799, dtype=mx.uint32),
         suppress_token_mask=None,
@@ -374,7 +444,7 @@ def test_deepseek_bundle_reuses_mtplx_target_and_dflash2_engine_types(
 ) -> None:
     from mtplx.benchmarks import dflash2_runtime
 
-    target, _owner = _fake_dspark_target()
+    target, owner = _fake_dspark_target()
     target.args.model_type = "deepseek_v4"
     target._target_cache_type = DeepseekV4NVFP4Cache
 
@@ -387,11 +457,20 @@ def test_deepseek_bundle_reuses_mtplx_target_and_dflash2_engine_types(
     calls = []
     monkeypatch.setattr(
         dflash2_runtime,
-        "load_mtplx_deepseek_runtime",
+        "_load_mtplx_deepseek_runtime",
         lambda path: calls.append(path) or runtime,
     )
+    monkeypatch.setattr(
+        dflash2_runtime,
+        "require_pinned_dflash_install",
+        lambda: pytest.fail("the accepted preflight receipt was read a second time"),
+        raising=False,
+    )
 
-    bundle = load_mtplx_deepseek_v4_dflash2_bundle("/models/deepseek-v4")
+    bundle = load_mtplx_deepseek_v4_dflash2_bundle(
+        "/models/deepseek-v4",
+        dflash_identity=PINNED_DFLASH_IDENTITY,
+    )
 
     assert isinstance(bundle, MTPLXDFlash2Bundle)
     assert bundle.runtime is runtime
@@ -404,6 +483,8 @@ def test_deepseek_bundle_reuses_mtplx_target_and_dflash2_engine_types(
     assert bundle.target_layer_ids == (40, 41, 42)
     assert bundle.draft_meta["kind"] == "deepseek_v4_dspark"
     assert calls == ["/models/deepseek-v4"]
+    assert bundle.runtime_context.dflash_identity is PINNED_DFLASH_IDENTITY
+    assert len(owner.released_mia_caches) == 1
 
 
 def test_deepseek_bundle_loader_selects_dspark_at_construction(monkeypatch) -> None:
@@ -432,6 +513,23 @@ def test_deepseek_runtime_context_fixes_dflash_m6_without_generic_kv_quantizer()
     assert context.runtime.quantize_kv_cache is False
     assert context.runtime.prefix_cache is False
     assert context.runtime.dflash_max_ctx == 0
+    assert context.dflash_identity.vcs == "git"
+
+
+def _fake_generation_bundle(tokenizer):
+    context = build_deepseek_v4_dflash2_runtime_context()
+    target_model = SimpleNamespace(_mia_engine_plan=_FakeMiaEnginePlan())
+    return (
+        SimpleNamespace(
+            target_model=target_model,
+            target_ops=object(),
+            tokenizer=tokenizer,
+            draft_model=object(),
+            draft_backend=object(),
+            runtime_context=context,
+        ),
+        context,
+    )
 
 
 def test_generation_adapter_translates_existing_dflash_events_without_scheduling(
@@ -467,12 +565,8 @@ def test_generation_adapter_translates_existing_dflash_events_without_scheduling
 
     monkeypatch.setattr(adapter_module, "_stream_dflash_generate", fake_stream)
     callback_tokens = []
-    bundle = SimpleNamespace(
-        target_model=object(),
-        target_ops=object(),
-        tokenizer=SimpleNamespace(decode=lambda values: f"decoded:{values}"),
-        draft_model=object(),
-        draft_backend=object(),
+    bundle, context = _fake_generation_bundle(
+        SimpleNamespace(decode=lambda values: f"decoded:{values}")
     )
 
     output = generate_deepseek_v4_dflash2(
@@ -480,7 +574,7 @@ def test_generation_adapter_translates_existing_dflash_events_without_scheduling
         [1, 2, 3],
         max_tokens=2,
         token_callback=callback_tokens.append,
-        runtime_context=object(),
+        runtime_context=context,
     )
 
     assert output.tokens == [11, 12]
@@ -537,12 +631,8 @@ def test_generation_adapter_stops_at_first_stop_token_and_suppresses_suffix(
         lambda **_kwargs: iter(events),
     )
     callback_tokens = []
-    bundle = SimpleNamespace(
-        target_model=object(),
-        target_ops=object(),
-        tokenizer=SimpleNamespace(decode=lambda values: f"decoded:{values}"),
-        draft_model=object(),
-        draft_backend=object(),
+    bundle, context = _fake_generation_bundle(
+        SimpleNamespace(decode=lambda values: f"decoded:{values}")
     )
 
     output = generate_deepseek_v4_dflash2(
@@ -551,7 +641,7 @@ def test_generation_adapter_stops_at_first_stop_token_and_suppresses_suffix(
         max_tokens=3,
         stop_token_ids=[12],
         token_callback=callback_tokens.append,
-        runtime_context=object(),
+        runtime_context=context,
     )
 
     assert output.tokens == [11]
@@ -582,19 +672,15 @@ def test_generation_adapter_accounts_for_each_physical_tail_width(monkeypatch) -
         "_stream_dflash_generate",
         lambda **_kwargs: iter([summary]),
     )
-    bundle = SimpleNamespace(
-        target_model=object(),
-        target_ops=object(),
-        tokenizer=SimpleNamespace(decode=lambda values: str(values)),
-        draft_model=object(),
-        draft_backend=object(),
+    bundle, context = _fake_generation_bundle(
+        SimpleNamespace(decode=lambda values: str(values))
     )
 
     output = generate_deepseek_v4_dflash2(
         bundle,
         [1, 2, 3],
         max_tokens=7,
-        runtime_context=object(),
+        runtime_context=context,
     )
 
     assert output.stats.drafted_tokens == 8

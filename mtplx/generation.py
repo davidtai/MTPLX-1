@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import wraps
 import inspect
 import json
 import os
@@ -903,8 +904,16 @@ def _make_target_prefill_cache(rt: MTPLXRuntime):
         return rt.make_cache()
 
 
+def _has_sealed_mia_cache_arena(rt: MTPLXRuntime) -> bool:
+    target_model = getattr(rt, "model", None)
+    target_model = getattr(target_model, "language_model", target_model)
+    return getattr(target_model, "_mia_engine_plan", None) is not None
+
+
 def _maybe_repage_target_prefill_cache(rt: MTPLXRuntime, cache: Any) -> float:
     if not _contiguous_then_repage_prefill_enabled():
+        return 0.0
+    if _has_sealed_mia_cache_arena(rt):
         return 0.0
 
     started = time.perf_counter()
@@ -916,6 +925,8 @@ def _maybe_repage_target_prefill_cache(rt: MTPLXRuntime, cache: Any) -> float:
 
 def _session_restore_cache_factory(rt: MTPLXRuntime) -> Callable[[], Any] | None:
     if not _contiguous_prefill_cache_layout_enabled():
+        return None
+    if _has_sealed_mia_cache_arena(rt):
         return None
     return lambda: _make_target_prefill_cache(rt)
 
@@ -5222,6 +5233,18 @@ def _append_mtp_history(
     return time.perf_counter() - started
 
 
+def _target_cache_lifecycle_managed(call):
+    """Close construction-owned target caches at the whole-request boundary."""
+
+    @wraps(call)
+    def managed(rt: MTPLXRuntime, *args, **kwargs):
+        with rt.target_cache_lifecycle():
+            return call(rt, *args, **kwargs)
+
+    return managed
+
+
+@_target_cache_lifecycle_managed
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -5313,6 +5336,7 @@ def score_prompt_logprobs(
     }
 
 
+@_target_cache_lifecycle_managed
 def generate_ar(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -5808,6 +5832,20 @@ def generate_ar(
         final_state=final_state,
         finish_reason=finish_reason,
     )
+
+
+def generate_sealed_target_ar(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    **kwargs,
+) -> GenerationOutput:
+    """Run the target-only control through the installed sealed lifecycle."""
+
+    if not rt.sealed_target_cache_lifecycle:
+        raise RuntimeError(
+            "generate_sealed_target_ar requires a sealed target-cache lifecycle"
+        )
+    return generate_ar(rt, prompt_ids, **kwargs)
 
 
 def generate_mtp1(

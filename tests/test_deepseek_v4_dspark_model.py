@@ -7,7 +7,7 @@ pytest.importorskip("mlx.core")
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
 
-from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows  # noqa: E402
+from mtplx.deepseek_v4_nvfp4_kv import FixedMiaNVFP4Ring  # noqa: E402
 from mtplx.models import deepseek_v4 as target_module  # noqa: E402
 from mtplx.models.deepseek_v4 import (  # noqa: E402
     DeepseekV4NVFP4Cache,
@@ -18,9 +18,8 @@ from mtplx.models.deepseek_v4 import (  # noqa: E402
 import mtplx.models.deepseek_v4_dspark as dspark_module  # noqa: E402
 from mtplx.models.deepseek_v4_dspark import (  # noqa: E402
     DSparkTargetRoute,
+    DeepseekV4DSparkAttention,
     DeepseekV4DSparkCache,
-    _dspark_draft_positions,
-    _dspark_visibility_indices,
     build_deepseek_v4_dspark,
     greedy_future_tokens,
 )
@@ -57,8 +56,8 @@ def test_each_dspark_stage_owns_distinct_mia_nvfp4_cache() -> None:
     caches = [DeepseekV4DSparkCache(window_size=8, head_dim=512) for _ in range(3)]
     assert len({id(cache) for cache in caches}) == 3
     assert len({id(cache.ring) for cache in caches}) == 3
-    assert all(isinstance(cache.ring, MiaNVFP4Rows) for cache in caches)
-    assert all(cache.ring.mode == "nvfp4_stock432" for cache in caches)
+    assert all(isinstance(cache.ring, FixedMiaNVFP4Ring) for cache in caches)
+    assert all(cache.ring.mode == "nvfp4_stock432_fixed_ring" for cache in caches)
     assert all(cache.ring.record_bytes == 432 for cache in caches)
 
     prompt_latent = mx.zeros((1, 3, 512), dtype=mx.bfloat16)
@@ -105,15 +104,152 @@ def test_dspark_cache_commits_authoritative_main_row_without_dense_owner() -> No
     assert not hasattr(cache, "dense_ring")
 
 
-def test_dspark_decode_uses_the_committed_main_row_then_five_future_positions() -> None:
-    np.testing.assert_array_equal(
-        np.array(_dspark_visibility_indices(128, 5, 17)),
-        np.concatenate([np.arange(18), 128 + np.arange(5)]),
+def test_installed_dspark_k5_keeps_context_and_draft_records_separate() -> None:
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        captured = {}
+        context_records = mx.zeros((1, 7, 432), dtype=mx.uint8)
+        draft_records = mx.zeros((1, 5, 432), dtype=mx.uint8)
+
+        def rope_tables(start, count):
+            captured["rope_slice"] = (start, count)
+            return (
+                mx.arange(start, start + count, dtype=mx.int32),
+                mx.ones((5, 32), dtype=mx.float32),
+                mx.zeros((5, 32), dtype=mx.float32),
+            )
+
+        def project_learned(hidden):
+            captured["projection_calls"] = (
+                captured.get("projection_calls", 0) + 1
+            )
+            return (
+                hidden,
+                mx.zeros((1, 5, 512), dtype=mx.bfloat16),
+            )
+
+        def fail_old_route(*_args, **_kwargs):
+            raise AssertionError("installed K5 called a legacy projection/RoPE route")
+
+        def run_mla(*args, **kwargs):
+            captured["mla_args"] = args
+            captured["mla_kwargs"] = kwargs
+            return mx.zeros((1, 5, 64, 512), dtype=mx.bfloat16)
+
+        attn = DeepseekV4DSparkAttention.__new__(DeepseekV4DSparkAttention)
+        attn.n_heads = 64
+        attn.head_dim = 512
+        attn.rope_head_dim = 64
+        attn.window_size = 128
+        attn.attn_sink = mx.zeros((64,), dtype=mx.float32)
+        attn.softmax_scale = 512**-0.5
+        attn.eps = 1e-6
+        attn._mia_qkv_plan = None
+        attn.wq_b = lambda value: mx.zeros(
+            (*value.shape[:2], 64 * 512), dtype=mx.bfloat16
+        )
+        attn._mia_token_rope_tables = rope_tables
+        attn._rope_tables = fail_old_route
+        attn.wq_a = fail_old_route
+        attn.wkv = fail_old_route
+        attn.project_kv = fail_old_route
+        attn._pack_draft_records = fail_old_route
+        attn._dspark_k5_mla = run_mla
+        attn._project_attention_output = lambda output, _cos, _sin: output
+
+        attn.install_mia_k5_runtime()
+        attn.install_mia_qkv_prologue(
+            SimpleNamespace(
+                project_learned=project_learned,
+                proposal_records=lambda *_args: (
+                    mx.zeros((1, 5, 64, 512), dtype=mx.bfloat16),
+                    draft_records,
+                ),
+            )
+        )
+        output = attn(
+            mx.zeros((1, 5, 8), dtype=mx.bfloat16),
+            start_pos=17,
+            cache=SimpleNamespace(
+                ring=SimpleNamespace(records=context_records),
+            ),
+        )
+        mx.eval(output)
+
+        np.testing.assert_array_equal(
+            np.array(attn._mia_draft_position_offsets),
+            np.arange(5),
+        )
+        assert captured["rope_slice"] == (17, 5)
+        assert captured["projection_calls"] == 1
+        assert tuple(captured["mla_args"][0].shape) == (1, 5, 64, 512)
+        assert captured["mla_args"][1] is context_records
+        assert captured["mla_args"][2] is draft_records
+        assert captured["mla_args"][3] == 17
+        assert set(captured["mla_kwargs"]) == {"sinks", "scale"}
+        assert attn._mia_mla_query_layout == "BMHD"
+        assert attn._mia_mla_output_layout == "BMHD"
+    finally:
+        mx.set_default_device(previous)
+
+
+def test_dspark_stages_share_boundary_rope_graph_after_provider_poison(
+    monkeypatch,
+) -> None:
+    provider = target_module.MiaRoPETableProvider(
+        mx.ones((32,), dtype=mx.float32),
+        max_positions=384_005,
     )
-    np.testing.assert_array_equal(
-        np.array(_dspark_draft_positions(17, 5)),
-        np.arange(18, 23),
+    stages = []
+    projection_calls = []
+
+    def fail_unfused_kv(*_args, **_kwargs):
+        raise AssertionError("exact DSpark context called the standalone wkv")
+
+    for stage_id in range(3):
+        attention = DeepseekV4DSparkAttention.__new__(
+            DeepseekV4DSparkAttention
+        )
+        attention.compress_ratio = 0
+        attention.rope_head_dim = 64
+        attention._mia_rope_provider = None
+        attention._mia_token_rope_tables = None
+        attention.kv_norm = lambda value: value
+        attention._mia_input_projection = (
+            lambda value, stage_id=stage_id: (
+                projection_calls.append(stage_id)
+                or mx.zeros((*value.shape[:2], 1), dtype=value.dtype),
+                value,
+            )
+        )
+        attention.wkv = fail_unfused_kv
+        attention.install_mia_rope_provider(provider)
+        attention._project_kv_impl = attention._mia_project_kv
+        stages.append(attention)
+
+    provider.begin_forward()
+    hidden = mx.zeros((1, 5, 512), dtype=mx.bfloat16)
+    first_latent, first_rope = stages[0].project_kv(
+        hidden,
+        384_000,
     )
+    cached_tables = provider.token_tables(384_000, 5)
+
+    def fail_rebuild(*_args, **_kwargs):
+        raise AssertionError("a DSpark stage rebuilt the shared RoPE graph")
+
+    monkeypatch.setattr(target_module.mx, "cos", fail_rebuild)
+    monkeypatch.setattr(target_module.mx, "sin", fail_rebuild)
+    for stage in stages[1:]:
+        latent, rope = stage.project_kv(hidden, 384_000)
+        assert latent is first_latent
+        np.testing.assert_array_equal(
+            np.array(rope.astype(mx.float32)),
+            np.array(first_rope.astype(mx.float32)),
+        )
+        assert provider.token_tables(384_000, 5) is cached_tables
+    assert projection_calls == [0, 1, 2]
 
 
 class _Layer:
@@ -177,7 +313,7 @@ def test_dspark_owner_constructs_three_stages_and_primary_plus_four_noise_inputs
     assert tuple(np.array(draft_inputs)[0]) == (29, 128799, 128799, 128799, 128799)
     assert len(caches) == 3
     assert len({id(cache) for cache in caches}) == 3
-    assert all(cache.ring.mode == "nvfp4_stock432" for cache in caches)
+    assert all(cache.ring.mode == "nvfp4_stock432_fixed_ring" for cache in caches)
 
 
 def test_dspark_signature_installs_tap_route_and_mia_nvfp4_target_cache(monkeypatch) -> None:

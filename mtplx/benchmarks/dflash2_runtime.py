@@ -5,6 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+from mtplx.dflash_identity import (
+    InstalledDFlashIdentity,
+    assert_pinned_dflash_identity,
+    require_pinned_dflash_install,
+)
+
 
 _DRAFT_QUANT = "w4:gs64"
 _CHECKPOINT_BLOCK_SIZE = 8
@@ -38,12 +44,29 @@ def load_mtplx_runtime(model_path: str):
     return load(model_path, mtp=True)
 
 
-def load_mtplx_deepseek_runtime(model_path: str):
-    """Load one artifact-qualified DeepSeek DSpark target through MTPLX."""
+def _resolve_dflash_identity(
+    dflash_identity: InstalledDFlashIdentity | None,
+) -> InstalledDFlashIdentity:
+    if dflash_identity is None:
+        return require_pinned_dflash_install()
+    return assert_pinned_dflash_identity(dflash_identity)
 
+
+def _load_mtplx_deepseek_runtime(model_path: str):
     from mtplx.runtime import load
 
     return load(model_path, mtp=True, dspark=True)
+
+
+def load_mtplx_deepseek_runtime(
+    model_path: str,
+    *,
+    dflash_identity: InstalledDFlashIdentity | None = None,
+):
+    """Load one artifact-qualified DeepSeek DSpark target through MTPLX."""
+
+    _resolve_dflash_identity(dflash_identity)
+    return _load_mtplx_deepseek_runtime(model_path)
 
 
 def load_draft(draft_ref: str, *, draft_quant: str):
@@ -78,8 +101,10 @@ def make_draft_backend():
     return EagerDraftBackend()
 
 
-def build_deepseek_v4_dflash2_runtime_context():
-    """Construct the fixed greedy M6 context for the qualified DSpark lane."""
+def _build_deepseek_v4_dflash2_runtime_context(
+    dflash_identity: InstalledDFlashIdentity,
+):
+    """Construct the fixed greedy M6 context after the lightweight gate."""
 
     from dflash_mlx.runtime.context import build_offline_runtime_context
     from mtplx.deepseek_v4_dflash2 import DeepseekV4DFlashRuntimeContext
@@ -98,7 +123,20 @@ def build_deepseek_v4_dflash2_runtime_context():
         context,
         runtime=replace(context.runtime, clear_cache_boundaries=False),
     )
-    return DeepseekV4DFlashRuntimeContext.install(context)
+    return DeepseekV4DFlashRuntimeContext.install(
+        context,
+        dflash_identity=dflash_identity,
+    )
+
+
+def build_deepseek_v4_dflash2_runtime_context(
+    *,
+    dflash_identity: InstalledDFlashIdentity | None = None,
+):
+    """Preflight and construct the fixed greedy M6 DSpark context."""
+
+    identity = _resolve_dflash_identity(dflash_identity)
+    return _build_deepseek_v4_dflash2_runtime_context(identity)
 
 
 def _checkpoint_geometry(draft_model) -> tuple[int, tuple[int, ...]]:
@@ -194,19 +232,43 @@ def load_mtplx_dflash2_bundle(
 
 def load_mtplx_deepseek_v4_dflash2_bundle(
     model_path: str,
+    *,
+    dflash_identity: InstalledDFlashIdentity | None = None,
 ) -> MTPLXDFlash2Bundle:
     """Load and bind a qualified DeepSeek V4 target to DFlash2."""
 
-    runtime = load_mtplx_deepseek_runtime(model_path)
-    return bind_mtplx_deepseek_v4_dflash2_bundle(runtime, source=model_path)
+    identity = _resolve_dflash_identity(dflash_identity)
+    runtime = _load_mtplx_deepseek_runtime(model_path)
+    return _bind_mtplx_deepseek_v4_dflash2_bundle(
+        runtime,
+        source=model_path,
+        dflash_identity=identity,
+    )
 
 
 def bind_mtplx_deepseek_v4_dflash2_bundle(
     runtime: Any,
     *,
     source: str,
+    dflash_identity: InstalledDFlashIdentity | None = None,
 ) -> MTPLXDFlash2Bundle:
-    """Bind an already-loaded qualified DeepSeek V4 runtime to DFlash2."""
+    """Preflight and bind an already-loaded DeepSeek V4 runtime to DFlash2."""
+
+    identity = _resolve_dflash_identity(dflash_identity)
+    return _bind_mtplx_deepseek_v4_dflash2_bundle(
+        runtime,
+        source=source,
+        dflash_identity=identity,
+    )
+
+
+def _bind_mtplx_deepseek_v4_dflash2_bundle(
+    runtime: Any,
+    *,
+    source: str,
+    dflash_identity: InstalledDFlashIdentity,
+) -> MTPLXDFlash2Bundle:
+    """Bind a DeepSeek runtime after the lightweight identity gate."""
 
     from mtplx.deepseek_v4_dflash2 import (
         DeepseekV4DSparkBackend,
@@ -224,7 +286,7 @@ def bind_mtplx_deepseek_v4_dflash2_bundle(
     draft_model = DeepseekV4DSparkDraftAdapter(target_model)
     draft_backend = DeepseekV4DSparkBackend()
     bind_draft(draft_model, target_model, target_ops=target_ops)
-    runtime_context = build_deepseek_v4_dflash2_runtime_context()
+    runtime_context = _build_deepseek_v4_dflash2_runtime_context(dflash_identity)
 
     draft_probe = draft_backend.make_cache(
         draft_model=draft_model,

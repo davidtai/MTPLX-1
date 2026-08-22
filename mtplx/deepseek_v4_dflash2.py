@@ -12,6 +12,10 @@ from dflash_mlx.engine.target_ops import TargetCapabilities
 from dflash_mlx.engine.target_features import StreamingTargetFeatureStore
 from dflash_mlx.model import DraftRuntimeCapabilities
 
+from mtplx.dflash_identity import (
+    InstalledDFlashIdentity,
+    PINNED_DFLASH_COMMIT,
+)
 from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache
 
 
@@ -20,7 +24,8 @@ _CAPTURE_LAYER_IDS = tuple(layer_id + 1 for layer_id in _TARGET_LAYER_IDS)
 _PHYSICAL_VERIFY_WIDTH = 6
 _DFLASH_RUNTIME_IDENTITY = (
     "mia-deepseek-v4:dflash:fixed-linear:m6:prefill1024:window128:"
-    "stock432:copyspec-zero-owner-d67e6e4:adaptive-off:fallback-off"
+    f"stock432:copyspec-zero-owner-{PINNED_DFLASH_COMMIT}:"
+    "adaptive-off:fallback-off"
 )
 
 
@@ -32,10 +37,16 @@ class DeepseekV4DFlashRuntimeContext:
     diagnostics: Any
     verify: Any
     metal_limits: Any
+    dflash_identity: InstalledDFlashIdentity
     identity: str
 
     @classmethod
-    def install(cls, context: Any) -> "DeepseekV4DFlashRuntimeContext":
+    def install(
+        cls,
+        context: Any,
+        *,
+        dflash_identity: InstalledDFlashIdentity,
+    ) -> "DeepseekV4DFlashRuntimeContext":
         runtime = context.runtime
         required_runtime = {
             "prefill_step_size": 1024,
@@ -77,6 +88,7 @@ class DeepseekV4DFlashRuntimeContext:
             diagnostics=diagnostics,
             verify=context.verify,
             metal_limits=context.metal_limits,
+            dflash_identity=dflash_identity,
             identity=_DFLASH_RUNTIME_IDENTITY,
         )
 
@@ -512,16 +524,17 @@ class DeepseekV4DSparkBackend:
         tail_start = prior_length + tail_offset
         tail_context = draft_context.fuse_tail(tail_offset)
         main_hidden = draft_model.owner.stages[0]._run_fuse_main_rows(tail_context)
-        positions = mx.arange(tail_start, prior_length + context_rows)
         if prior_length == 0:
             for stage, cache in zip(
                 draft_model.owner.stages,
                 draft_cache,
             ):
-                latent, rope = stage.attn.project_kv(main_hidden, positions)
-                cache._install_prefill_tail(
-                    latent,
-                    rope,
+                records = stage.attn.project_context_records(
+                    main_hidden, tail_start
+                )
+                cache._install_prefill_records(
+                    records,
+                    absolute_start=tail_start,
                     total_length=context_rows,
                 )
         else:
@@ -529,8 +542,10 @@ class DeepseekV4DSparkBackend:
                 draft_model.owner.stages,
                 draft_cache,
             ):
-                latent, rope = stage.attn.project_kv(main_hidden, positions)
-                cache._commit_main(tail_start, latent, rope)
+                records = stage.attn.project_context_records(
+                    main_hidden, tail_start
+                )
+                cache._commit_records(tail_start, records)
         return prior_length + context_rows
 
     def draft_greedy(

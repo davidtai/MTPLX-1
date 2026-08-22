@@ -16,9 +16,21 @@ INDEXER_HEADS = 64
 INDEXER_HEAD_DIM = 128
 INDEXER_TOPK = 512
 INDEXER_RECORD_BYTES = 132
+INDEXER_ROPE_POSITIONS = 384_000
+# Pinned vLLM bounds the sparse-indexer FP32 logits slab to 512 MiB and
+# query-subchunks only when one request exceeds that construction policy.
+INDEXER_PREFILL_MAX_LOGITS_BYTES = 512 * 1024 * 1024
+INDEXER_PREFILL_Q_TILE = 32
+INDEXER_PREFILL_K_TILE = 256
+INDEXER_PREFILL_K_SIMD_SPAN = 128
+INDEXER_PREFILL_DIM_PANEL = 8
+INDEXER_PREFILL_SCORE_THREADS = 256
 # SparkInfer's production paged prefill route owns one 32K K supertile and
-# folds it into a fixed top-512 carry.  The scorer's physical tile remains
-# 16-wide on Metal; this constant is the bounded selector workspace extent.
+# folds it into a fixed top-512 carry.  Its CUDA scorer owns Q32xK512 with 256
+# threads and keeps the completed head reduction in registers.  Metal retains
+# Q32 and 256-thread ownership, but uses K256: eight SIMD groups each own
+# Q8xK128, keeping the score plus current-head dot fragments to 64 FP32 values
+# per thread instead of the K512 port's 128 before other live state.
 INDEXER_PREFILL_SCORE_CHUNK_ROWS = 32768
 INDEXER_DECODE_SLICE_ROWS = 4096
 
@@ -128,8 +140,121 @@ def _pack_indexer132(rows: mx.array) -> mx.array:
     )[0]
 
 
+@dataclass(frozen=True)
+class MiaIndexerRoPETable:
+    """Shared read-only vLLM-layout cos/sin cache for every ratio-4 indexer.
+
+    ``values[position]`` stores 32 FP32 cosines followed by 32 FP32 sines.
+    One engine-owned table is shared by all ratio-4 layers; it must not be
+    replicated per layer.
+    """
+
+    values: mx.array
+
+    @property
+    def max_positions(self) -> int:
+        return int(self.values.shape[0])
+
+    @property
+    def nbytes(self) -> int:
+        return math.prod(int(dim) for dim in self.values.shape) * 4
+
+
+def precompute_indexer_rope_table(
+    inv_freq: mx.array,
+    *,
+    max_positions: int,
+) -> MiaIndexerRoPETable:
+    """Build one engine-owned FP32 ``[positions, cos32 | sin32]`` table."""
+    max_positions = int(max_positions)
+    if max_positions <= 0:
+        raise ValueError("Mia indexer RoPE table capacity must be positive")
+    if inv_freq.ndim != 1 or int(inv_freq.shape[0]) != 32:
+        raise ValueError("Mia indexer RoPE frequencies must have shape [32]")
+    positions = mx.arange(max_positions, dtype=mx.float32)
+    angles = positions[:, None] * inv_freq.astype(mx.float32)[None, :]
+    values = mx.concatenate([mx.cos(angles), mx.sin(angles)], axis=-1)
+    values = mx.contiguous(values.astype(mx.float32))
+    mx.eval(values)
+    return MiaIndexerRoPETable(values=values)
+
+
 @lru_cache(maxsize=1)
 def _query_rope_quant_kernel():
+    """Pack Q using the construction-bound vLLM cos/sin cache."""
+    source = r"""
+        uint lane = thread_index_in_simdgroup;
+        uint group = threadgroup_position_in_grid.x;
+        uint head = group % 64u;
+        uint query = group / 64u;
+        const device T* q_row = queries
+            + (size_t(query) * 64u + size_t(head)) * 128u;
+        device uchar* record = records
+            + (size_t(query) * 64u + size_t(head)) * 132u;
+        threadgroup float rotated[128];
+
+        uint dim0 = lane * 4u;
+        float local_max = 0.0f;
+        for (uint element = 0u; element < 4u; ++element) {
+            uint dim = dim0 + element;
+            float value = float(q_row[dim]);
+            if (dim >= 64u) {
+                uint rope_dim = dim - 64u;
+                uint pair = rope_dim / 2u;
+                uint position = uint(positions[query]);
+                const device float* rope_row = cos_sin_cache
+                    + size_t(position) * 64u;
+                float c = rope_row[pair];
+                float s = rope_row[32u + pair];
+                uint even_dim = 64u + pair * 2u;
+                float even = float(q_row[even_dim]);
+                float odd = float(q_row[even_dim + 1u]);
+                value = (rope_dim & 1u) == 0u
+                    ? even * c - odd * s
+                    : odd * c + even * s;
+                value = float(bfloat(value));
+            }
+            rotated[dim] = value;
+            local_max = max(local_max, abs(value));
+        }
+        float amax = simd_max(local_max);
+        float scale = exp2(ceil(log2(max(amax, 1.0e-4f) / 448.0f)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint element = 0u; element < 4u; ++element) {
+            uint dim = dim0 + element;
+            record[dim] = mtplx_indexer_e4m3_encode(rotated[dim] / scale);
+        }
+        if (lane < 4u) {
+            uint one_bits = as_type<uint>(1.0f);
+            record[128u + lane] = uchar((one_bits >> (8u * lane)) & 0xffu);
+        }
+        if (lane == 0u) {
+            float folded_weight =
+                float(weights[size_t(query) * 64u + head])
+                * float(weight_scale);
+            scaled_weights[size_t(query) * 64u + head] =
+                folded_weight * scale;
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_mia_fused_indexer_q_rope_fp8",
+        input_names=[
+            "queries",
+            "weights",
+            "positions",
+            "cos_sin_cache",
+            "weight_scale",
+        ],
+        output_names=["records", "scaled_weights"],
+        header=_FP8_HEADER,
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+@lru_cache(maxsize=1)
+def _query_rope_quant_from_inv_freq_kernel():
+    """Validated reference entry point; the installed lane never binds this."""
     source = r"""
         uint lane = thread_index_in_simdgroup;
         uint group = threadgroup_position_in_grid.x;
@@ -175,13 +300,15 @@ def _query_rope_quant_kernel():
             record[128u + lane] = uchar((one_bits >> (8u * lane)) & 0xffu);
         }
         if (lane == 0u) {
-            scaled_weights[size_t(query) * 64u + head] =
+            float folded_weight =
                 float(weights[size_t(query) * 64u + head])
-                * scale * float(weight_scale);
+                * float(weight_scale);
+            scaled_weights[size_t(query) * 64u + head] =
+                folded_weight * scale;
         }
     """
     return mx.fast.metal_kernel(
-        name="mtplx_dsv4_mia_fused_indexer_q_rope_fp8",
+        name="mtplx_dsv4_mia_fused_indexer_q_rope_fp8_reference",
         input_names=[
             "queries",
             "weights",
@@ -226,31 +353,44 @@ def _run_fused_indexer_query_records(
     weight_scale: float,
 ) -> tuple[MiaIndexerQueryRecords, mx.array]:
     """Validated scalar wrapper for the generic/reference entry point."""
-    return _run_installed_indexer_query_records(
-        queries,
-        weights,
-        positions.astype(mx.int32),
-        inv_freq,
-        weight_scale=mx.array(float(weight_scale), dtype=mx.float32),
+    batch, query_count = (int(dim) for dim in queries.shape[:2])
+    records, scaled_weights = _query_rope_quant_from_inv_freq_kernel()(
+        inputs=[
+            mx.contiguous(queries),
+            mx.contiguous(weights),
+            mx.contiguous(positions.astype(mx.int32)),
+            mx.contiguous(inv_freq),
+            mx.array(float(weight_scale), dtype=mx.float32),
+        ],
+        template=[("T", queries.dtype)],
+        grid=(query_count * INDEXER_HEADS * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (batch, query_count, INDEXER_HEADS, INDEXER_RECORD_BYTES),
+            (batch, query_count, INDEXER_HEADS),
+        ],
+        output_dtypes=[mx.uint8, mx.float32],
     )
+    return MiaIndexerQueryRecords(records), scaled_weights
 
 
 def _run_installed_indexer_query_records(
     queries: mx.array,
     weights: mx.array,
     positions: mx.array,
-    inv_freq: mx.array,
     *,
+    cos_sin_cache: mx.array,
     weight_scale: mx.array,
+    kernel,
 ) -> tuple[MiaIndexerQueryRecords, mx.array]:
-    """Direct query finalizer with the construction-bound scalar operand."""
+    """Direct finalizer with construction-bound table and scalar operands."""
     batch, query_count = (int(dim) for dim in queries.shape[:2])
-    records, scaled_weights = _query_rope_quant_kernel()(
+    records, scaled_weights = kernel(
         inputs=[
             mx.contiguous(queries),
             mx.contiguous(weights),
             mx.contiguous(positions),
-            mx.contiguous(inv_freq),
+            cos_sin_cache,
             weight_scale,
         ],
         template=[("T", queries.dtype)],
@@ -271,6 +411,7 @@ def install_indexer_query_records(
     head_dim: int,
     rope_dim: int,
     weight_scale: float,
+    rope_table: MiaIndexerRoPETable | None = None,
 ):
     observed = (int(heads), int(head_dim), int(rope_dim))
     expected = (INDEXER_HEADS, INDEXER_HEAD_DIM, 64)
@@ -278,12 +419,48 @@ def install_indexer_query_records(
         raise ValueError(
             f"unsupported Mia indexer Q geometry: {observed} != {expected}"
         )
-    _query_rope_quant_kernel()
+    if rope_table is None:
+        raise ValueError(
+            "exact Mia indexer installation requires a shared RoPE table"
+        )
+    if (
+        rope_table.values.ndim != 2
+        or tuple(int(dim) for dim in rope_table.values.shape)
+        != (INDEXER_ROPE_POSITIONS, 64)
+        or rope_table.values.dtype != mx.float32
+    ):
+        raise ValueError(
+            "Mia indexer RoPE table must be FP32 [384000, 64]"
+        )
     installed_scale = mx.array(float(weight_scale), dtype=mx.float32)
     mx.eval(installed_scale)
+    kernel = _query_rope_quant_kernel()
     return partial(
         _run_installed_indexer_query_records,
+        cos_sin_cache=rope_table.values,
         weight_scale=installed_scale,
+        kernel=kernel,
+    )
+
+
+def install_reference_indexer_query_records(
+    *,
+    heads: int,
+    head_dim: int,
+    rope_dim: int,
+    weight_scale: float,
+):
+    """Install the explicit inv-freq reference path, never the exact lane."""
+    observed = (int(heads), int(head_dim), int(rope_dim))
+    expected = (INDEXER_HEADS, INDEXER_HEAD_DIM, 64)
+    if observed != expected:
+        raise ValueError(
+            f"unsupported Mia indexer Q geometry: {observed} != {expected}"
+        )
+    _query_rope_quant_from_inv_freq_kernel()
+    return partial(
+        _run_fused_indexer_query_records,
+        weight_scale=float(weight_scale),
     )
 
 
@@ -508,7 +685,8 @@ class PagedMiaIndexerRows:
 
 
 @lru_cache(maxsize=1)
-def _score_kernel():
+def _oracle_score_kernel():
+    """Score ordinary packed Q records whose per-head scale remains stored."""
     source = r"""
         uint lane = thread_index_in_simdgroup;
         uint group = threadgroup_position_in_grid.x;
@@ -530,11 +708,7 @@ def _score_kernel():
         for (uint head = 0u; head < 64u; ++head) {
             const device uchar* q_record = q_records
                 + (size_t(query) * 64u + size_t(head)) * 132u;
-            uint q_scale_bits = uint(q_record[128u])
-                | (uint(q_record[129u]) << 8u)
-                | (uint(q_record[130u]) << 16u)
-                | (uint(q_record[131u]) << 24u);
-            float q_scale = as_type<float>(q_scale_bits);
+            float q_scale = mtplx_indexer_record_scale(q_record);
             float partial = 0.0f;
             uint dim0 = lane * 4u;
             for (uint element = 0u; element < 4u; ++element) {
@@ -553,7 +727,7 @@ def _score_kernel():
         }
     """
     return mx.fast.metal_kernel(
-        name="mtplx_dsv4_mia_paged_indexer_scores",
+        name="mtplx_dsv4_mia_paged_indexer_oracle_scores",
         input_names=[
             "q_records",
             "weights",
@@ -570,18 +744,89 @@ def _score_kernel():
     )
 
 
-@lru_cache(maxsize=1)
-def _tiled_score_kernel():
-    header = _FP8_HEADER + r"""
-        constant constexpr int MTPLX_INDEX_Q_TILE = 16;
-        constant constexpr int MTPLX_INDEX_K_TILE = 16;
+def _tiled_score_source(*, apply_query_scale: bool) -> tuple[str, str]:
+    """Build distinct exact and ordinary-record Metal scorer sources."""
+    fragment_count = INDEXER_PREFILL_K_SIMD_SPAN // 8
+    header = _FP8_HEADER + rf"""
+        // SparkInfer owns Q32xK512 with 256 CUDA threads and retains the
+        // completed 64-head reduction in registers.  Metal keeps Q32 and 256
+        // threads, but splits K256 over two SIMD groups per Q8 tile.  K512
+        // would require 128 live FP32 score/dot values per thread before the
+        // input fragments; K256 requires 64.  Eight-dimension staging panels
+        // keep threadgroup scratch at __MTPLX_INDEXER_SCRATCH_DESCRIPTION__
+        constant constexpr int MTPLX_INDEX_Q_TILE = {INDEXER_PREFILL_Q_TILE};
+        constant constexpr int MTPLX_INDEX_K_TILE = {INDEXER_PREFILL_K_TILE};
+        constant constexpr int MTPLX_INDEX_K_SIMD_SPAN = {INDEXER_PREFILL_K_SIMD_SPAN};
+        constant constexpr int MTPLX_INDEX_DIM_PANEL = {INDEXER_PREFILL_DIM_PANEL};
         constant constexpr int MTPLX_INDEX_DIM = 128;
         constant constexpr int MTPLX_INDEX_HEADS = 64;
-        constant constexpr int MTPLX_INDEX_THREADS = 64;
+        constant constexpr int MTPLX_INDEX_THREADS = {INDEXER_PREFILL_SCORE_THREADS};
+
+        inline uint mtplx_indexer_mma_row(uint lane) {{
+            uint quad = lane / 4u;
+            return (quad & 4u) + ((lane / 2u) % 4u);
+        }}
+
+        inline uint mtplx_indexer_mma_col(uint lane) {{
+            uint quad = lane / 4u;
+            return (quad & 2u) * 2u + (lane % 2u) * 2u;
+        }}
     """
+
+    score_declarations = "\n".join(
+        f"""        simdgroup_matrix<float, 8, 8> score{index} =
+            simdgroup_matrix<float, 8, 8>(0.0f);"""
+        for index in range(fragment_count)
+    )
+    dot_declarations = "\n".join(
+        f"""            simdgroup_matrix<float, 8, 8> dot{index} =
+                simdgroup_matrix<float, 8, 8>(0.0f);"""
+        for index in range(fragment_count)
+    )
+    mma_steps = "\n".join(
+        f"""                simdgroup_load(
+                    k_matrix,
+                    k_values + k_simd_base + {index * 8}u,
+                    MTPLX_INDEX_K_TILE
+                );
+                simdgroup_multiply_accumulate(
+                    dot{index}, q_matrix, k_matrix, dot{index}
+                );"""
+        for index in range(fragment_count)
+    )
+    q_scale_factor = " * q_scales[local_q]" if apply_query_scale else ""
+    score_updates = "\n".join(
+        f"""            score{index}.thread_elements()[0] += max(
+                dot{index}.thread_elements()[0]{q_scale_factor}, 0.0f
+            ) * q_weight;
+            score{index}.thread_elements()[1] += max(
+                dot{index}.thread_elements()[1]{q_scale_factor}, 0.0f
+            ) * q_weight;"""
+        for index in range(fragment_count)
+    )
+    score_stores = "\n".join(
+        f"""        uint local_k{index} = k_simd_base + {index * 8}u + mma_col;
+        if (query < uint(n_queries)
+            && k0 + local_k{index} < uint(n_rows)) {{
+            output[
+                size_t(query) * size_t(n_rows) + size_t(k0 + local_k{index})
+            ] = score{index}.thread_elements()[0] * k_scales[local_k{index}];
+        }}
+        if (query < uint(n_queries)
+            && k0 + local_k{index} + 1u < uint(n_rows)) {{
+            output[
+                size_t(query) * size_t(n_rows)
+                    + size_t(k0 + local_k{index} + 1u)
+            ] = score{index}.thread_elements()[1]
+                * k_scales[local_k{index} + 1u];
+        }}"""
+        for index in range(fragment_count)
+    )
+
     source = r"""
         uint tid = thread_position_in_threadgroup.x;
         uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
         uint tile = threadgroup_position_in_grid.x;
         uint k_tiles = (uint(n_rows) + MTPLX_INDEX_K_TILE - 1u)
             / MTPLX_INDEX_K_TILE;
@@ -591,25 +836,16 @@ def _tiled_score_kernel():
         uint k0 = k_tile * MTPLX_INDEX_K_TILE;
 
         threadgroup half q_values[
-            MTPLX_INDEX_Q_TILE * MTPLX_INDEX_DIM
+            MTPLX_INDEX_Q_TILE * MTPLX_INDEX_DIM_PANEL
         ];
         threadgroup half k_values[
-            MTPLX_INDEX_DIM * MTPLX_INDEX_K_TILE
+            MTPLX_INDEX_DIM_PANEL * MTPLX_INDEX_K_TILE
         ];
-        threadgroup float q_scales[MTPLX_INDEX_Q_TILE];
+        threadgroup uint physical_rows[MTPLX_INDEX_K_TILE];
+        threadgroup float q_weights[MTPLX_INDEX_Q_TILE];
+        __MTPLX_INDEXER_Q_SCALE_STORAGE__
         threadgroup float k_scales[MTPLX_INDEX_K_TILE];
-        threadgroup float head_dot[
-            MTPLX_INDEX_Q_TILE * MTPLX_INDEX_K_TILE
-        ];
-        threadgroup float scores[
-            MTPLX_INDEX_Q_TILE * MTPLX_INDEX_K_TILE
-        ];
 
-        for (uint index = tid;
-             index < MTPLX_INDEX_Q_TILE * MTPLX_INDEX_K_TILE;
-             index += MTPLX_INDEX_THREADS) {
-            scores[index] = 0.0f;
-        }
         if (tid < MTPLX_INDEX_K_TILE) {
             uint local_k = tid;
             uint logical_row = uint(row_start) + k0 + local_k;
@@ -620,151 +856,149 @@ def _tiled_score_kernel():
                 uint physical_block = uint(block_table[logical_block]);
                 uint physical_row = physical_block * uint(block_size)
                     + row_in_block;
+                physical_rows[local_k] = physical_row;
                 const device uchar* record = k_records
                     + size_t(physical_row) * 132u;
                 k_scales[local_k] = mtplx_indexer_record_scale(record);
             } else {
+                physical_rows[local_k] = 0u;
                 k_scales[local_k] = 0.0f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint index = tid;
-             index < MTPLX_INDEX_DIM * MTPLX_INDEX_K_TILE;
-             index += MTPLX_INDEX_THREADS) {
-            uint dim = index / MTPLX_INDEX_K_TILE;
-            uint local_k = index - dim * MTPLX_INDEX_K_TILE;
-            uint logical_row = uint(row_start) + k0 + local_k;
-            half value = half(0.0f);
-            if (k0 + local_k < uint(n_rows)) {
-                uint logical_block = logical_row / uint(block_size);
-                uint row_in_block = logical_row
-                    - logical_block * uint(block_size);
-                uint physical_block = uint(block_table[logical_block]);
-                uint physical_row = physical_block * uint(block_size)
-                    + row_in_block;
-                const device uchar* record = k_records
-                    + size_t(physical_row) * 132u;
-                // Stage the exact E4M3 value.  Its power-of-two grid is
-                // exactly representable in FP16; the row scales are applied
-                // to the FP32 accumulator below, in the same order as the
-                // source FP8 logits kernel.
-                value = half(mtplx_indexer_e4m3_decode(record[dim]));
-            }
-            k_values[index] = value;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+__MTPLX_INDEXER_SCORE_DECLARATIONS__
 
         for (uint head = 0u; head < MTPLX_INDEX_HEADS; ++head) {
             if (tid < MTPLX_INDEX_Q_TILE) {
                 uint local_q = tid;
                 uint query = q0 + local_q;
                 if (query < uint(n_queries)) {
-                    const device uchar* record = q_records
-                        + (size_t(query) * MTPLX_INDEX_HEADS + size_t(head))
-                            * 132u;
-                    q_scales[local_q] = mtplx_indexer_record_scale(record);
+                    q_weights[local_q] = weights[
+                        size_t(query) * MTPLX_INDEX_HEADS + size_t(head)
+                    ];
+                    __MTPLX_INDEXER_Q_SCALE_VALID__
                 } else {
-                    q_scales[local_q] = 0.0f;
+                    q_weights[local_q] = 0.0f;
+                    __MTPLX_INDEXER_Q_SCALE_INVALID__
                 }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint index = tid;
-                 index < MTPLX_INDEX_Q_TILE * MTPLX_INDEX_DIM;
-                 index += MTPLX_INDEX_THREADS) {
-                uint local_q = index / MTPLX_INDEX_DIM;
-                uint dim = index - local_q * MTPLX_INDEX_DIM;
-                uint query = q0 + local_q;
-                half value = half(0.0f);
-                if (query < uint(n_queries)) {
-                    const device uchar* record = q_records
-                        + (size_t(query) * MTPLX_INDEX_HEADS + size_t(head))
-                            * 132u;
-                    value = half(mtplx_indexer_e4m3_decode(record[dim]));
-                }
-                q_values[index] = value;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             simdgroup_matrix<half, 8, 8> q_matrix;
-            simdgroup_matrix<half, 8, 8> k_left;
-            simdgroup_matrix<half, 8, 8> k_right;
-            simdgroup_matrix<float, 8, 8> dot_left =
-                simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_matrix<float, 8, 8> dot_right =
-                simdgroup_matrix<float, 8, 8>(0.0f);
-            uint q_base = simd_group * 8u * MTPLX_INDEX_DIM;
-            for (uint dim0 = 0u; dim0 < MTPLX_INDEX_DIM; dim0 += 8u) {
+            simdgroup_matrix<half, 8, 8> k_matrix;
+__MTPLX_INDEXER_DOT_DECLARATIONS__
+            uint q_simd_base = (simd_group / 2u)
+                * 8u * MTPLX_INDEX_DIM_PANEL;
+            uint k_simd_base = (simd_group % 2u)
+                * MTPLX_INDEX_K_SIMD_SPAN;
+            for (uint dim0 = 0u;
+                 dim0 < MTPLX_INDEX_DIM;
+                 dim0 += MTPLX_INDEX_DIM_PANEL) {
+                uint local_q = tid / MTPLX_INDEX_DIM_PANEL;
+                uint local_dim = tid - local_q * MTPLX_INDEX_DIM_PANEL;
+                uint query = q0 + local_q;
+                half q_value = half(0.0f);
+                if (query < uint(n_queries)) {
+                    const device uchar* record = q_records
+                        + (size_t(query) * MTPLX_INDEX_HEADS + size_t(head))
+                            * 132u;
+                    q_value = half(mtplx_indexer_e4m3_decode(
+                        record[dim0 + local_dim]
+                    ));
+                }
+                q_values[tid] = q_value;
+
+                for (uint index = tid;
+                     index < MTPLX_INDEX_DIM_PANEL * MTPLX_INDEX_K_TILE;
+                     index += MTPLX_INDEX_THREADS) {
+                    uint panel_dim = index / MTPLX_INDEX_K_TILE;
+                    uint local_k = index - panel_dim * MTPLX_INDEX_K_TILE;
+                    half k_value = half(0.0f);
+                    if (k0 + local_k < uint(n_rows)) {
+                        const device uchar* record = k_records
+                            + size_t(physical_rows[local_k]) * 132u;
+                        // E4M3 values are exactly representable in FP16.  The
+                        // positive K scale is applied only after the complete
+                        // source-order head reduction below.
+                        k_value = half(mtplx_indexer_e4m3_decode(
+                            record[dim0 + panel_dim]
+                        ));
+                    }
+                    k_values[index] = k_value;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
                 simdgroup_load(
                     q_matrix,
-                    q_values + q_base + dim0,
-                    MTPLX_INDEX_DIM
+                    q_values + q_simd_base,
+                    MTPLX_INDEX_DIM_PANEL
                 );
-                simdgroup_load(
-                    k_left,
-                    k_values + dim0 * MTPLX_INDEX_K_TILE,
-                    MTPLX_INDEX_K_TILE
-                );
-                simdgroup_load(
-                    k_right,
-                    k_values + dim0 * MTPLX_INDEX_K_TILE + 8u,
-                    MTPLX_INDEX_K_TILE
-                );
-                simdgroup_multiply_accumulate(
-                    dot_left, q_matrix, k_left, dot_left
-                );
-                simdgroup_multiply_accumulate(
-                    dot_right, q_matrix, k_right, dot_right
-                );
+__MTPLX_INDEXER_MMA_STEPS__
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            uint score_base = simd_group * 8u * MTPLX_INDEX_K_TILE;
-            simdgroup_store(
-                dot_left,
-                head_dot + score_base,
-                MTPLX_INDEX_K_TILE
-            );
-            simdgroup_store(
-                dot_right,
-                head_dot + score_base + 8u,
-                MTPLX_INDEX_K_TILE
-            );
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint index = tid;
-                 index < MTPLX_INDEX_Q_TILE * MTPLX_INDEX_K_TILE;
-                 index += MTPLX_INDEX_THREADS) {
-                uint local_q = index / MTPLX_INDEX_K_TILE;
-                uint local_k = index - local_q * MTPLX_INDEX_K_TILE;
-                uint query = q0 + local_q;
-                if (query < uint(n_queries)
-                    && k0 + local_k < uint(n_rows)) {
-                    float dot = head_dot[index]
-                        * q_scales[local_q] * k_scales[local_k];
-                    scores[index] += max(dot, 0.0f)
-                        * weights[
-                            size_t(query) * MTPLX_INDEX_HEADS + size_t(head)
-                        ];
-                }
-            }
+            uint local_q = (simd_group / 2u) * 8u
+                + mtplx_indexer_mma_row(lane);
+            float q_weight = q_weights[local_q];
+__MTPLX_INDEXER_SCORE_UPDATES__
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        for (uint index = tid;
-             index < MTPLX_INDEX_Q_TILE * MTPLX_INDEX_K_TILE;
-             index += MTPLX_INDEX_THREADS) {
-            uint local_q = index / MTPLX_INDEX_K_TILE;
-            uint local_k = index - local_q * MTPLX_INDEX_K_TILE;
-            uint query = q0 + local_q;
-            uint row = k0 + local_k;
-            if (query < uint(n_queries) && row < uint(n_rows)) {
-                output[size_t(query) * size_t(n_rows) + size_t(row)] =
-                    scores[index];
-            }
-        }
+        uint local_q = (simd_group / 2u) * 8u
+            + mtplx_indexer_mma_row(lane);
+        uint query = q0 + local_q;
+        uint k_simd_base = (simd_group % 2u) * MTPLX_INDEX_K_SIMD_SPAN;
+        uint mma_col = mtplx_indexer_mma_col(lane);
+__MTPLX_INDEXER_SCORE_STORES__
     """
+
+    if apply_query_scale:
+        scratch_description = "6,912 bytes for the ordinary-record oracle."
+        q_scale_storage = "threadgroup float q_scales[MTPLX_INDEX_Q_TILE];"
+        q_scale_valid = (
+            "const device uchar* q_scale_record = q_records + "
+            "(size_t(query) * MTPLX_INDEX_HEADS + size_t(head)) * 132u; "
+            "q_scales[local_q] = "
+            "mtplx_indexer_record_scale(q_scale_record);"
+        )
+        q_scale_invalid = "q_scales[local_q] = 0.0f;"
+    else:
+        scratch_description = "6,784 bytes for installed unit-scale Q records."
+        q_scale_storage = ""
+        q_scale_valid = ""
+        q_scale_invalid = ""
+
+    header = header.replace(
+        "__MTPLX_INDEXER_SCRATCH_DESCRIPTION__", scratch_description
+    )
+    source = source.replace(
+        "__MTPLX_INDEXER_Q_SCALE_STORAGE__", q_scale_storage
+    )
+    source = source.replace(
+        "__MTPLX_INDEXER_Q_SCALE_VALID__", q_scale_valid
+    )
+    source = source.replace(
+        "__MTPLX_INDEXER_Q_SCALE_INVALID__", q_scale_invalid
+    )
+    source = source.replace(
+        "__MTPLX_INDEXER_SCORE_DECLARATIONS__", score_declarations
+    )
+    source = source.replace(
+        "__MTPLX_INDEXER_DOT_DECLARATIONS__", dot_declarations
+    )
+    source = source.replace("__MTPLX_INDEXER_MMA_STEPS__", mma_steps)
+    source = source.replace(
+        "__MTPLX_INDEXER_SCORE_UPDATES__", score_updates
+    )
+    source = source.replace("__MTPLX_INDEXER_SCORE_STORES__", score_stores)
+    return header, source
+
+
+def _make_tiled_score_kernel(*, name: str, apply_query_scale: bool):
+    header, source = _tiled_score_source(apply_query_scale=apply_query_scale)
     return mx.fast.metal_kernel(
-        name="mtplx_dsv4_mia_paged_indexer_tiled_scores",
+        name=name,
         input_names=[
             "q_records",
             "weights",
@@ -783,12 +1017,33 @@ def _tiled_score_kernel():
 
 
 @lru_cache(maxsize=1)
+def _tiled_score_kernel():
+    """Installed Mia scorer for unit-scale Q records and scale-folded weights."""
+    return _make_tiled_score_kernel(
+        name="mtplx_dsv4_mia_paged_indexer_tiled_scores",
+        apply_query_scale=False,
+    )
+
+
+@lru_cache(maxsize=1)
+def _tiled_score_oracle_kernel():
+    """Ordinary-record oracle scorer that consumes each stored Q scale."""
+    return _make_tiled_score_kernel(
+        name="mtplx_dsv4_mia_paged_indexer_tiled_oracle_scores",
+        apply_query_scale=True,
+    )
+
+
+@lru_cache(maxsize=1)
 def _radix_fold_kernel():
     """Exact SparkInfer-style four-pass MSD radix fold into top-512."""
     header = r"""
         using namespace metal;
 
         inline uint mtplx_indexer_ordered_key(float value) {
+            if (value == 0.0f) {
+                return 0x80000000u;
+            }
             uint bits = as_type<uint>(value);
             return (bits & 0x80000000u) != 0u
                 ? ~bits
@@ -797,15 +1052,23 @@ def _radix_fold_kernel():
     """
     source = r"""
         uint tid = thread_position_in_threadgroup.x;
+        uint sg = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
         uint query = threadgroup_position_in_grid.x;
         constexpr uint TOPK = 512u;
         constexpr uint THREADS = 256u;
 
         threadgroup atomic_uint histogram[256];
-        threadgroup atomic_uint output_counter;
+        threadgroup uint simd_counts[8];
+        threadgroup uint simd_offsets[8];
+        threadgroup uint output_counter;
+        threadgroup uint batch_start;
         threadgroup uint prefix;
         threadgroup uint remaining;
         threadgroup uint pivot;
+        threadgroup uint index_prefix;
+        threadgroup uint index_remaining;
+        threadgroup uint index_pivot;
 
         int causal = causal_lengths[query];
         int available = causal - int(row_start);
@@ -899,13 +1162,27 @@ def _radix_fold_kernel():
 
         if (tid == 0u) {
             pivot = prefix;
-            atomic_store_explicit(
-                &output_counter, 0u, memory_order_relaxed
-            );
+            index_prefix = 0u;
+            index_remaining = remaining;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint equality = 0u; equality < 2u; ++equality) {
+        // A value-only radix leaves the final pivot bucket tied.  Resolve its
+        // cutoff with a second MSD radix over the already-global logical row
+        // indices, ascending.  This is the strict-`>` reference rule: among
+        // equal values, lower logical rows win even when they came from carry.
+        for (uint round = 0u; round < 4u; ++round) {
+            if (tid < 256u) {
+                atomic_store_explicit(
+                    &histogram[tid], 0u, memory_order_relaxed
+                );
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint shift = 24u - round * 8u;
+            uint locked = index_prefix;
+            uint mask = round == 0u
+                ? 0u
+                : 0xffffffffu << (32u - round * 8u);
             for (uint i = tid; i < total; i += THREADS) {
                 bool local = i < local_count;
                 uint carry_slot = i - local_count;
@@ -913,22 +1190,98 @@ def _radix_fold_kernel():
                     ? score_row[i]
                     : carry_value_row[carry_slot];
                 uint key = mtplx_indexer_ordered_key(value);
-                bool selected = equality == 0u ? key > pivot : key == pivot;
-                if (selected) {
-                    uint position = atomic_fetch_add_explicit(
-                        &output_counter, 1u, memory_order_relaxed
+                int logical_index = local
+                    ? (use_score_indices
+                        ? score_index_row[i]
+                        : int(row_start) + int(i))
+                    : carry_index_row[carry_slot];
+                uint index_key = uint(logical_index);
+                if (key == pivot
+                    && (round == 0u || (index_key & mask) == locked)) {
+                    atomic_fetch_add_explicit(
+                        &histogram[(index_key >> shift) & 0xffu],
+                        1u,
+                        memory_order_relaxed
                     );
-                    if (position < TOPK) {
-                        output_value_row[position] = value;
-                        output_index_row[position] = local
-                            ? (use_score_indices
-                                ? score_index_row[i]
-                                : int(row_start) + int(i))
-                            : carry_index_row[carry_slot];
-                    }
                 }
             }
-            threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                uint need = index_remaining;
+                uint chosen = 0u;
+                for (uint bucket = 0u; bucket < 256u; ++bucket) {
+                    uint count = atomic_load_explicit(
+                        &histogram[bucket], memory_order_relaxed
+                    );
+                    if (need <= count) {
+                        chosen = bucket;
+                        break;
+                    }
+                    need -= count;
+                }
+                index_prefix = locked | (chosen << shift);
+                index_remaining = need;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            index_pivot = index_prefix;
+            output_counter = 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Deterministic thread-order compaction.  Atomics are fine for the
+        // histograms (only counts matter), but not for emitting candidates:
+        // their winning order otherwise varies across SIMD-group schedules.
+        for (uint selection_pass = 0u; selection_pass < 2u; ++selection_pass) {
+            for (uint base = 0u; base < total; base += THREADS) {
+                uint i = base + tid;
+                bool selected = false;
+                bool local = i < local_count;
+                uint carry_slot = i - local_count;
+                float value = -INFINITY;
+                int logical_index = int(sentinel);
+                if (i < total) {
+                    value = local
+                        ? score_row[i]
+                        : carry_value_row[carry_slot];
+                    logical_index = local
+                        ? (use_score_indices
+                            ? score_index_row[i]
+                            : int(row_start) + int(i))
+                        : carry_index_row[carry_slot];
+                    uint key = mtplx_indexer_ordered_key(value);
+                    selected = selection_pass == 0u
+                        ? key > pivot
+                        : key == pivot
+                            && uint(logical_index) <= index_pivot;
+                }
+                uint lane_offset = simd_prefix_exclusive_sum(uint(selected));
+                uint simd_count = simd_sum(uint(selected));
+                if (lane == 0u) {
+                    simd_counts[sg] = simd_count;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    uint running = 0u;
+                    batch_start = output_counter;
+                    for (uint group_id = 0u; group_id < 8u; ++group_id) {
+                        simd_offsets[group_id] = running;
+                        running += simd_counts[group_id];
+                    }
+                    output_counter += running;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (selected) {
+                    uint position = batch_start + simd_offsets[sg] + lane_offset;
+                    if (position < TOPK) {
+                        output_value_row[position] = value;
+                        output_index_row[position] = logical_index;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+            }
         }
     """
     return mx.fast.metal_kernel(
@@ -962,6 +1315,7 @@ def _run_radix_fold(
     score_indices: mx.array | None = None,
     has_carry: bool,
     sentinel: int,
+    kernel,
 ) -> tuple[mx.array, mx.array]:
     query_count = int(scores.shape[1])
     n_local = int(scores.shape[2])
@@ -969,7 +1323,7 @@ def _run_radix_fold(
     if score_indices is None:
         score_indices = carry_indices
     return tuple(
-        _radix_fold_kernel()(
+        kernel(
             inputs=[
                 mx.contiguous(scores),
                 mx.contiguous(score_indices),
@@ -996,6 +1350,9 @@ def _fused_decode_candidates_kernel():
     """Fused paged FP8 score plus exact local radix top-512."""
     header = _FP8_HEADER + r"""
         inline uint mtplx_indexer_ordered_key(float value) {
+            if (value == 0.0f) {
+                return 0x80000000u;
+            }
             uint bits = as_type<uint>(value);
             return (bits & 0x80000000u) != 0u
                 ? ~bits
@@ -1016,10 +1373,16 @@ def _fused_decode_candidates_kernel():
 
         threadgroup float local_scores[SLICE_ROWS];
         threadgroup atomic_uint histogram[256];
-        threadgroup atomic_uint output_counter;
+        threadgroup uint simd_counts[SIMD_GROUPS];
+        threadgroup uint simd_offsets[SIMD_GROUPS];
+        threadgroup uint output_counter;
+        threadgroup uint batch_start;
         threadgroup uint prefix;
         threadgroup uint remaining;
         threadgroup uint pivot;
+        threadgroup uint index_prefix;
+        threadgroup uint index_remaining;
+        threadgroup uint index_pivot;
 
         int causal = causal_lengths[query];
         uint row_start = slice * SLICE_ROWS;
@@ -1053,7 +1416,6 @@ def _fused_decode_candidates_kernel():
             for (uint head = 0u; head < 64u; ++head) {
                 const device uchar* q_record = q_records
                     + (size_t(query) * 64u + size_t(head)) * 132u;
-                float q_scale = mtplx_indexer_record_scale(q_record);
                 float partial = 0.0f;
                 uint dim0 = lane * 4u;
                 for (uint element = 0u; element < 4u; ++element) {
@@ -1061,14 +1423,14 @@ def _fused_decode_candidates_kernel():
                     partial += mtplx_indexer_e4m3_decode(q_record[dim])
                         * mtplx_indexer_e4m3_decode(k_record[dim]);
                 }
-                float dot = simd_sum(partial) * q_scale * k_scale;
+                float dot = simd_sum(partial);
                 if (lane == 0u) {
                     score += max(dot, 0.0f)
                         * weights[size_t(query) * 64u + size_t(head)];
                 }
             }
             if (lane == 0u) {
-                local_scores[local_row] = score;
+                local_scores[local_row] = score * k_scale;
             }
         }
         threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
@@ -1128,27 +1490,102 @@ def _fused_decode_candidates_kernel():
 
         if (tid == 0u) {
             pivot = prefix;
-            atomic_store_explicit(
-                &output_counter, 0u, memory_order_relaxed
-            );
+            index_prefix = 0u;
+            index_remaining = remaining;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint equality = 0u; equality < 2u; ++equality) {
+
+        // Resolve the final equal-score bucket by ascending logical row.
+        // Atomic histogram counts are deterministic; candidate emission is
+        // deliberately handled by the ordered compaction below.
+        for (uint round = 0u; round < 4u; ++round) {
+            atomic_store_explicit(
+                &histogram[tid], 0u, memory_order_relaxed
+            );
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint shift = 24u - round * 8u;
+            uint locked = index_prefix;
+            uint mask = round == 0u
+                ? 0u
+                : 0xffffffffu << (32u - round * 8u);
             for (uint i = tid; i < local_count; i += THREADS) {
                 float value = local_scores[i];
                 uint key = mtplx_indexer_ordered_key(value);
-                bool selected = equality == 0u ? key > pivot : key == pivot;
-                if (selected) {
-                    uint position = atomic_fetch_add_explicit(
-                        &output_counter, 1u, memory_order_relaxed
+                uint logical_index = row_start + i;
+                if (key == pivot
+                    && (round == 0u || (logical_index & mask) == locked)) {
+                    atomic_fetch_add_explicit(
+                        &histogram[(logical_index >> shift) & 0xffu],
+                        1u,
+                        memory_order_relaxed
                     );
-                    if (position < TOPK) {
-                        output_value_row[position] = value;
-                        output_index_row[position] = int(row_start + i);
-                    }
                 }
             }
-            threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                uint need = index_remaining;
+                uint chosen = 0u;
+                for (uint bucket = 0u; bucket < 256u; ++bucket) {
+                    uint count = atomic_load_explicit(
+                        &histogram[bucket], memory_order_relaxed
+                    );
+                    if (need <= count) {
+                        chosen = bucket;
+                        break;
+                    }
+                    need -= count;
+                }
+                index_prefix = locked | (chosen << shift);
+                index_remaining = need;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            index_pivot = index_prefix;
+            output_counter = 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint selection_pass = 0u; selection_pass < 2u; ++selection_pass) {
+            for (uint base = 0u; base < local_count; base += THREADS) {
+                uint i = base + tid;
+                bool selected = false;
+                float value = -INFINITY;
+                uint logical_index = uint(sentinel);
+                if (i < local_count) {
+                    value = local_scores[i];
+                    logical_index = row_start + i;
+                    uint key = mtplx_indexer_ordered_key(value);
+                    selected = selection_pass == 0u
+                        ? key > pivot
+                        : key == pivot && logical_index <= index_pivot;
+                }
+                uint lane_offset = simd_prefix_exclusive_sum(uint(selected));
+                uint simd_count = simd_sum(uint(selected));
+                if (lane == 0u) {
+                    simd_counts[sg] = simd_count;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    uint running = 0u;
+                    batch_start = output_counter;
+                    for (uint group_id = 0u; group_id < SIMD_GROUPS; ++group_id) {
+                        simd_offsets[group_id] = running;
+                        running += simd_counts[group_id];
+                    }
+                    output_counter += running;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (selected) {
+                    uint position = batch_start + simd_offsets[sg] + lane_offset;
+                    if (position < TOPK) {
+                        output_value_row[position] = value;
+                        output_index_row[position] = int(logical_index);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+            }
         }
     """
     return mx.fast.metal_kernel(
@@ -1175,6 +1612,8 @@ def _run_fused_decode_candidates(
     weights: mx.array,
     rows: PagedMiaIndexerRecords,
     causal_lengths: mx.array,
+    *,
+    kernel,
 ) -> tuple[mx.array, mx.array]:
     query_count = int(q_records.shape[1])
     n_slices = max(
@@ -1183,7 +1622,7 @@ def _run_fused_decode_candidates(
         // INDEXER_DECODE_SLICE_ROWS,
     )
     return tuple(
-        _fused_decode_candidates_kernel()(
+        kernel(
             inputs=[
                 mx.contiguous(q_records),
                 mx.contiguous(weights),
@@ -1211,7 +1650,7 @@ def _run_paged_indexer_score_slice_oracle(
     row_count: int,
 ) -> mx.array:
     batch, query_count = (int(dim) for dim in q_records.shape[:2])
-    (scores,) = _score_kernel()(
+    (scores,) = _oracle_score_kernel()(
         inputs=[
             q_records,
             weights,
@@ -1230,17 +1669,22 @@ def _run_paged_indexer_score_slice_oracle(
     return scores
 
 
-def _run_paged_indexer_score_slice(
+def _run_paged_indexer_tiled_score_slice_oracle(
     q_records: mx.array,
     weights: mx.array,
     rows: PagedMiaIndexerRecords,
     row_start: int,
     row_count: int,
 ) -> mx.array:
+    """Tiled oracle for ordinary records that retain per-head Q scales."""
     batch, query_count = (int(dim) for dim in q_records.shape[:2])
-    q_tiles = (query_count + 15) // 16
-    k_tiles = (int(row_count) + 15) // 16
-    (scores,) = _tiled_score_kernel()(
+    q_tiles = (
+        query_count + INDEXER_PREFILL_Q_TILE - 1
+    ) // INDEXER_PREFILL_Q_TILE
+    k_tiles = (
+        int(row_count) + INDEXER_PREFILL_K_TILE - 1
+    ) // INDEXER_PREFILL_K_TILE
+    (scores,) = _tiled_score_oracle_kernel()(
         inputs=[
             q_records,
             weights,
@@ -1252,8 +1696,44 @@ def _run_paged_indexer_score_slice(
             int(query_count),
         ],
         template=[],
-        grid=(q_tiles * k_tiles * 64, 1, 1),
-        threadgroup=(64, 1, 1),
+        grid=(q_tiles * k_tiles * INDEXER_PREFILL_SCORE_THREADS, 1, 1),
+        threadgroup=(INDEXER_PREFILL_SCORE_THREADS, 1, 1),
+        output_shapes=[(batch, query_count, int(row_count))],
+        output_dtypes=[mx.float32],
+    )
+    return scores
+
+
+def _run_paged_indexer_score_slice(
+    q_records: mx.array,
+    weights: mx.array,
+    rows: PagedMiaIndexerRecords,
+    row_start: int,
+    row_count: int,
+    *,
+    kernel,
+) -> mx.array:
+    batch, query_count = (int(dim) for dim in q_records.shape[:2])
+    q_tiles = (
+        query_count + INDEXER_PREFILL_Q_TILE - 1
+    ) // INDEXER_PREFILL_Q_TILE
+    k_tiles = (
+        int(row_count) + INDEXER_PREFILL_K_TILE - 1
+    ) // INDEXER_PREFILL_K_TILE
+    (scores,) = kernel(
+        inputs=[
+            q_records,
+            weights,
+            rows.records,
+            rows.block_table,
+            int(row_start),
+            int(row_count),
+            int(rows.block_size),
+            int(query_count),
+        ],
+        template=[],
+        grid=(q_tiles * k_tiles * INDEXER_PREFILL_SCORE_THREADS, 1, 1),
+        threadgroup=(INDEXER_PREFILL_SCORE_THREADS, 1, 1),
         output_shapes=[(batch, query_count, int(row_count))],
         output_dtypes=[mx.float32],
     )
@@ -1279,7 +1759,7 @@ def _run_paged_indexer_tiled_scores(
     weights: mx.array,
     rows: PagedMiaIndexerRecords,
 ) -> mx.array:
-    return _run_paged_indexer_score_slice(
+    return _run_paged_indexer_tiled_score_slice_oracle(
         _pack_indexer132(queries),
         weights,
         rows,
@@ -1288,48 +1768,27 @@ def _run_paged_indexer_tiled_scores(
     )
 
 
-def _installed_query_records(
-    queries: mx.array | MiaIndexerQueryRecords,
-) -> tuple[mx.array, int, int]:
-    if isinstance(queries, MiaIndexerQueryRecords):
-        return queries.records, int(queries.records.shape[0]), int(
-            queries.records.shape[1]
-        )
-    records = _pack_indexer132(queries)
-    return records, int(queries.shape[0]), int(queries.shape[1])
+def _iter_prefill_k_tiles(row_count: int, score_chunk_rows: int):
+    for row_start in range(0, int(row_count), int(score_chunk_rows)):
+        yield row_start, min(int(score_chunk_rows), int(row_count) - row_start)
 
 
-def _run_paged_indexer_topk(
-    queries: mx.array | MiaIndexerQueryRecords,
-    weights: mx.array,
-    positions: mx.array,
-    rows: PagedMiaIndexerRecords,
+def _iter_prefill_query_tiles(
     *,
-    topk: int,
-    compress_ratio: int,
-    workspace: MiaIndexerWorkspace,
-    score_chunk_rows: int = INDEXER_PREFILL_SCORE_CHUNK_ROWS,
-) -> MiaTopKSelection:
-    """Stream fixed-width score tiles into Mia's compact top-k buffer.
-
-    SparkInfer's paged prefill indexer scores one bounded K supertile at a time
-    and folds each tile's candidates into a fixed ``[queries, topk]`` carry.
-    Metal keeps the scorer's 16x16 physical tile, folds one source-sized 32K K
-    supertile at a time, and applies the source's exact four-pass radix select.
-    No whole-context score, boolean selection, or generic sort enters the graph.
-    """
-    q_records, _, query_count = _installed_query_records(queries)
-    return _run_paged_indexer_records_topk(
-        q_records,
-        weights,
-        positions,
-        rows,
-        topk=topk,
-        compress_ratio=compress_ratio,
-        workspace=workspace,
-        score_chunk_rows=score_chunk_rows,
-        query_count=query_count,
-    )
+    query_count: int,
+    row_count: int,
+    score_chunk_rows: int,
+    max_logits_bytes: int = INDEXER_PREFILL_MAX_LOGITS_BYTES,
+):
+    """Apply vLLM's M*N*4 logits cap only to oversized single requests."""
+    query_count = int(query_count)
+    max_score_rows = min(int(row_count), int(score_chunk_rows))
+    if max_score_rows <= 0:
+        yield 0, query_count
+        return
+    max_queries = max(1, int(max_logits_bytes) // (max_score_rows * 4))
+    for query_start in range(0, query_count, max_queries):
+        yield query_start, min(max_queries, query_count - query_start)
 
 
 def _run_paged_indexer_records_topk(
@@ -1343,8 +1802,10 @@ def _run_paged_indexer_records_topk(
     workspace: MiaIndexerWorkspace,
     score_chunk_rows: int,
     query_count: int,
+    score_slice,
+    radix_fold,
 ) -> MiaTopKSelection:
-    """Direct installed prefill selector over already-qualified Q records."""
+    """Exact tiled-MMA scorer plus unordered fixed top-k winner set."""
     n_rows = int(rows.length)
     topk = int(topk)
     score_chunk_rows = int(score_chunk_rows)
@@ -1353,57 +1814,93 @@ def _run_paged_indexer_records_topk(
         n_rows,
     )[None]
     output_lengths = mx.minimum(causal_lengths, topk).astype(mx.int32)
+    query_tiles = tuple(
+        _iter_prefill_query_tiles(
+            query_count=query_count,
+            row_count=n_rows,
+            score_chunk_rows=score_chunk_rows,
+        )
+    )
+
+    # The ordinary exact route owns the complete query axis and performs only
+    # score+fold per K supertile.  Only a single request above vLLM's pinned
+    # 512-MiB logits cap enters the source-style query-subchunk route below.
+    if len(query_tiles) == 1:
+        carry_indices = _run_paged_indexer_records_topk_query_tile(
+            q_records,
+            weights,
+            rows,
+            causal_lengths,
+            workspace=workspace,
+            score_chunk_rows=score_chunk_rows,
+            query_count=query_count,
+            sentinel=n_rows,
+            score_slice=score_slice,
+            radix_fold=radix_fold,
+        )
+        return MiaTopKSelection(indices=carry_indices, lengths=output_lengths)
+
+    index_tiles = []
+    for query_start, tile_queries in query_tiles:
+        query_stop = query_start + tile_queries
+        index_tiles.append(
+            _run_paged_indexer_records_topk_query_tile(
+                q_records[:, query_start:query_stop],
+                weights[:, query_start:query_stop],
+                rows,
+                causal_lengths[:, query_start:query_stop],
+                workspace=workspace,
+                score_chunk_rows=score_chunk_rows,
+                query_count=tile_queries,
+                sentinel=n_rows,
+                score_slice=score_slice,
+                radix_fold=radix_fold,
+            )
+        )
+    return MiaTopKSelection(
+        indices=mx.concatenate(index_tiles, axis=1),
+        lengths=output_lengths,
+    )
+
+
+def _run_paged_indexer_records_topk_query_tile(
+    q_records: mx.array,
+    weights: mx.array,
+    rows: PagedMiaIndexerRecords,
+    causal_lengths: mx.array,
+    *,
+    workspace: MiaIndexerWorkspace,
+    score_chunk_rows: int,
+    query_count: int,
+    sentinel: int,
+    score_slice,
+    radix_fold,
+) -> mx.array:
+    """Fold tiled-MMA score supertiles; output order is not a sort contract."""
     carry_scores, carry_indices = workspace.seeds(query_count)
     has_carry = False
-
-    for row_start in range(0, n_rows, score_chunk_rows):
-        row_count = min(score_chunk_rows, n_rows - row_start)
-        scores = _run_paged_indexer_score_slice(
+    for row_start, row_count in _iter_prefill_k_tiles(
+        int(rows.length), score_chunk_rows
+    ):
+        scores = score_slice(
             q_records,
             weights,
             rows,
             row_start,
             row_count,
         )
-        carry_scores, carry_indices = _run_radix_fold(
+        carry_scores, carry_indices = radix_fold(
             scores,
             carry_scores,
             carry_indices,
             causal_lengths,
             row_start=row_start,
+            score_indices=None,
             has_carry=has_carry,
-            sentinel=n_rows,
+            sentinel=sentinel,
         )
         has_carry = True
-
-    return MiaTopKSelection(
-        indices=carry_indices,
-        lengths=output_lengths,
-    )
-
-
-def _run_paged_indexer_decode_topk(
-    queries: mx.array | MiaIndexerQueryRecords,
-    weights: mx.array,
-    positions: mx.array,
-    rows: PagedMiaIndexerRecords,
-    *,
-    topk: int,
-    compress_ratio: int,
-    workspace: MiaIndexerWorkspace,
-) -> MiaTopKSelection:
-    """Fused score/local-select followed by one bounded candidate merge."""
-    q_records, _, query_count = _installed_query_records(queries)
-    return _run_paged_indexer_records_decode_topk(
-        q_records,
-        weights,
-        positions,
-        rows,
-        topk=topk,
-        compress_ratio=compress_ratio,
-        workspace=workspace,
-        query_count=query_count,
-    )
+    return carry_indices
 
 
 def _run_paged_indexer_records_decode_topk(
@@ -1416,6 +1913,8 @@ def _run_paged_indexer_records_decode_topk(
     compress_ratio: int,
     workspace: MiaIndexerWorkspace,
     query_count: int,
+    decode_candidates,
+    radix_fold,
 ) -> MiaTopKSelection:
     """Direct installed decode selector over already-qualified Q records."""
     n_rows = int(rows.length)
@@ -1424,7 +1923,7 @@ def _run_paged_indexer_records_decode_topk(
         n_rows,
     )[None]
     output_lengths = mx.minimum(causal_lengths, int(topk)).astype(mx.int32)
-    candidate_values, candidate_indices = _run_fused_decode_candidates(
+    candidate_values, candidate_indices = decode_candidates(
         q_records,
         weights,
         rows,
@@ -1438,7 +1937,7 @@ def _run_paged_indexer_records_decode_topk(
         merge_lengths = mx.full(
             (1, query_count), candidate_width, dtype=mx.int32
         )
-        _, indices = _run_radix_fold(
+        _, indices = radix_fold(
             values,
             empty_values,
             empty_indices,
@@ -1451,39 +1950,6 @@ def _run_paged_indexer_records_decode_topk(
     return MiaTopKSelection(indices=indices, lengths=output_lengths)
 
 
-def _run_paged_indexer_phase_topk(
-    queries: mx.array | MiaIndexerQueryRecords,
-    weights: mx.array,
-    positions: mx.array,
-    rows: PagedMiaIndexerRecords,
-    *,
-    topk: int,
-    compress_ratio: int,
-    workspace: MiaIndexerWorkspace,
-    score_chunk_rows: int,
-) -> MiaTopKSelection:
-    if current_attention_phase() == "prefill":
-        return _run_paged_indexer_topk(
-            queries,
-            weights,
-            positions,
-            rows,
-            topk=topk,
-            compress_ratio=compress_ratio,
-            workspace=workspace,
-            score_chunk_rows=score_chunk_rows,
-        )
-    return _run_paged_indexer_decode_topk(
-        queries,
-        weights,
-        positions,
-        rows,
-        topk=topk,
-        compress_ratio=compress_ratio,
-        workspace=workspace,
-    )
-
-
 def _run_installed_paged_indexer_phase_topk(
     queries: MiaIndexerQueryRecords,
     weights: mx.array,
@@ -1494,6 +1960,9 @@ def _run_installed_paged_indexer_phase_topk(
     compress_ratio: int,
     workspace: MiaIndexerWorkspace,
     score_chunk_rows: int,
+    score_slice,
+    radix_fold,
+    decode_candidates,
 ) -> MiaTopKSelection:
     """Phase-only route for the installed Mia record type."""
     q_records = queries.records
@@ -1509,6 +1978,8 @@ def _run_installed_paged_indexer_phase_topk(
             workspace=workspace,
             score_chunk_rows=score_chunk_rows,
             query_count=query_count,
+            score_slice=score_slice,
+            radix_fold=radix_fold,
         )
     return _run_paged_indexer_records_decode_topk(
         q_records,
@@ -1519,6 +1990,8 @@ def _run_installed_paged_indexer_phase_topk(
         compress_ratio=compress_ratio,
         workspace=workspace,
         query_count=query_count,
+        decode_candidates=decode_candidates,
+        radix_fold=radix_fold,
     )
 
 
@@ -1572,7 +2045,7 @@ def install_paged_indexer_scores(*, heads: int, head_dim: int):
     if not mx.metal.is_available():
         raise RuntimeError("Mia paged indexer installation requires Metal")
     _pack_kernel()
-    _score_kernel()
+    _oracle_score_kernel()
     return _run_paged_indexer_scores
 
 
@@ -1598,10 +2071,18 @@ def install_paged_indexer_topk(
         raise ValueError("the Mia paged indexer workspace geometry is invalid")
     if not mx.metal.is_available():
         raise RuntimeError("Mia paged indexer top-k installation requires Metal")
-    _pack_kernel()
-    _tiled_score_kernel()
-    _radix_fold_kernel()
-    _fused_decode_candidates_kernel()
+    score_slice = partial(
+        _run_paged_indexer_score_slice,
+        kernel=_tiled_score_kernel(),
+    )
+    radix_fold = partial(
+        _run_radix_fold,
+        kernel=_radix_fold_kernel(),
+    )
+    decode_candidates = partial(
+        _run_fused_decode_candidates,
+        kernel=_fused_decode_candidates_kernel(),
+    )
 
     return partial(
         _run_installed_paged_indexer_phase_topk,
@@ -1609,4 +2090,7 @@ def install_paged_indexer_topk(
         compress_ratio=int(compress_ratio),
         workspace=workspace,
         score_chunk_rows=INDEXER_PREFILL_SCORE_CHUNK_ROWS,
+        score_slice=score_slice,
+        radix_fold=radix_fold,
+        decode_candidates=decode_candidates,
     )

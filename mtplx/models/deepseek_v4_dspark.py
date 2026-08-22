@@ -11,6 +11,8 @@ import mlx.nn as nn
 
 from mtplx.deepseek_v4_nvfp4_kv import (
     FixedMiaNVFP4Ring,
+    install_fixed_ring_commit_writer,
+    install_fixed_ring_context_writer,
     install_stock432_record_packer,
 )
 from mtplx.kernels.deepseek_v4_nvfp4_mla import (
@@ -85,6 +87,16 @@ class DeepseekV4DSparkCache:
             head_dim=self.head_dim,
             rope_dim=64,
         )
+        if self.window_size == 128:
+            self._write_initial_records = install_fixed_ring_context_writer(
+                self.ring
+            )
+            self._write_commit_records = install_fixed_ring_commit_writer(
+                self.ring
+            )
+        else:
+            self._write_initial_records = None
+            self._write_commit_records = None
         self.prefill_length = 0
 
     def prefill(self, main_latent: mx.array, main_rope: mx.array) -> None:
@@ -160,6 +172,17 @@ class DeepseekV4DSparkCache:
         )
         self.prefill_length = total_length
 
+    def _install_prefill_records(
+        self,
+        records: mx.array,
+        *,
+        absolute_start: int,
+        total_length: int,
+    ) -> None:
+        """Install one fused initial prompt tail into its fixed physical ring."""
+        self._write_initial_records(records, absolute_start=int(absolute_start))
+        self.prefill_length = int(total_length)
+
     def visible_rows(self) -> tuple[mx.array, mx.array]:
         if len(self.ring) != self.window_size:
             raise RuntimeError("DSpark attention cache has not been prefetched")
@@ -200,6 +223,12 @@ class DeepseekV4DSparkCache:
         self.ring._replace_installed_records(start, records[:, :first])
         if first < count:
             self.ring._replace_installed_records(0, records[:, first:])
+        self.prefill_length = max(self.prefill_length, int(start_pos) + count)
+
+    def _commit_records(self, start_pos: int, records: mx.array) -> None:
+        """Scatter one fused authoritative context increment into the ring."""
+        count = int(records.shape[1])
+        self._write_commit_records(records, absolute_start=int(start_pos))
         self.prefill_length = max(self.prefill_length, int(start_pos) + count)
 
 
@@ -283,6 +312,8 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             head_dim=self.head_dim,
             rope_dim=self.rope_head_dim,
         )
+        self._project_kv_impl = self._stock_project_kv
+        self._prefill_context_impl = self._stock_prefill_context
         self._forward_impl = self._checked_forward_k5
 
     def install_mia_k5_runtime(self) -> None:
@@ -295,6 +326,8 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         ):
             raise ValueError("Mia DSpark attention geometry changed")
         self._mia_attn_sink = self.attn_sink.astype(mx.float32)
+        self._mia_mla_query_layout = "BMHD"
+        self._mia_mla_output_layout = "BMHD"
         self._mia_draft_position_offsets = mx.arange(
             DSPARK_BLOCK_SIZE,
             dtype=mx.int32,
@@ -306,9 +339,23 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             sinks=self._mia_attn_sink,
             scale=self.softmax_scale,
         )
+
+    def install_mia_qkv_prologue(self, plan) -> None:
+        super().install_mia_qkv_prologue(plan)
+        self._pack_draft_records = None
+        self._project_kv_impl = None
+        self._project_context_records_impl = self._mia_context_records
+        self._prefill_context_impl = self._mia_prefill_context_records
         self._forward_impl = self._run_k5
 
     def project_kv(
+        self,
+        hidden: mx.array,
+        positions_or_start,
+    ) -> tuple[mx.array, mx.array]:
+        return self._project_kv_impl(hidden, positions_or_start)
+
+    def _stock_project_kv(
         self,
         hidden: mx.array,
         positions: mx.array,
@@ -323,7 +370,53 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         )
         return latent, rope
 
+    def _mia_project_kv(
+        self,
+        hidden: mx.array,
+        start_pos: int,
+    ) -> tuple[mx.array, mx.array]:
+        """Project an exact context slice from the shared base-theta graph."""
+        rope_dim = self.rope_head_dim
+        _positions, cos, sin = self._mia_token_rope_tables(
+            int(start_pos),
+            int(hidden.shape[1]),
+        )
+        _query_rank_raw, latent_raw = self._mia_input_projection(hidden)
+        latent = self.kv_norm(latent_raw)
+        rope = _apply_interleaved_rope(
+            latent[..., -rope_dim:],
+            cos[None],
+            sin[None],
+        )
+        return latent, rope
+
+    def project_context_records(
+        self,
+        hidden: mx.array,
+        start_pos: int,
+    ) -> mx.array:
+        return self._project_context_records_impl(hidden, int(start_pos))
+
+    def _mia_context_records(
+        self,
+        hidden: mx.array,
+        start_pos: int,
+    ) -> mx.array:
+        _positions, cos, sin = self._mia_token_rope_tables(
+            int(start_pos),
+            int(hidden.shape[1]),
+        )
+        latent = self._mia_qkv_plan.project_kv(hidden)
+        return self._mia_qkv_plan.context_records(latent, cos, sin)
+
     def prefill_context(
+        self,
+        main_hidden: mx.array,
+        cache: DeepseekV4DSparkCache,
+    ) -> None:
+        return self._prefill_context_impl(main_hidden, cache)
+
+    def _stock_prefill_context(
         self,
         main_hidden: mx.array,
         cache: DeepseekV4DSparkCache,
@@ -331,10 +424,29 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         total_length = int(main_hidden.shape[1])
         tail_start = max(0, total_length - self.window_size)
         positions = mx.arange(tail_start, total_length)
-        latent, rope = self.project_kv(main_hidden[:, tail_start:], positions)
+        latent, rope = self.project_kv(
+            main_hidden[:, tail_start:],
+            positions,
+        )
         cache._install_prefill_tail(
             latent,
             rope,
+            total_length=total_length,
+        )
+
+    def _mia_prefill_context_records(
+        self,
+        main_hidden: mx.array,
+        cache: DeepseekV4DSparkCache,
+    ) -> None:
+        total_length = int(main_hidden.shape[1])
+        tail_start = max(0, total_length - self.window_size)
+        records = self.project_context_records(
+            main_hidden[:, tail_start:], tail_start
+        )
+        cache._install_prefill_records(
+            records,
+            absolute_start=tail_start,
             total_length=total_length,
         )
 
@@ -371,43 +483,26 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         """Installed physical K5 attention with a fixed stock432 union."""
         batch = int(hidden.shape[0])
         block = DSPARK_BLOCK_SIZE
-        positions = self._mia_draft_position_offsets + int(start_pos)
-        cos, sin = self._rope_tables(positions)
-        rope_dim = self.rope_head_dim
-
-        query_rank = self.q_norm(self.wq_a(hidden))
-        query = self.wq_b(query_rank).reshape(
+        _positions, cos, sin = self._mia_token_rope_tables(start_pos, block)
+        query_rank, draft_latent = self._mia_qkv_plan.project_learned(hidden)
+        query_pre = self.wq_b(query_rank).reshape(
             batch,
             block,
             self.n_heads,
             self.head_dim,
         )
-        query = query * mx.rsqrt(
-            mx.mean(mx.square(query.astype(mx.float32)), axis=-1, keepdims=True)
-            + self.eps
+        query, draft_records = self._mia_qkv_plan.proposal_records(
+            query_pre,
+            draft_latent,
+            cos,
+            sin,
         )
-        query = query.astype(hidden.dtype)
-        query = mx.concatenate(
-            [
-                query[..., :-rope_dim],
-                _apply_interleaved_rope(
-                    query[..., -rope_dim:],
-                    cos[None, :, None],
-                    sin[None, :, None],
-                ),
-            ],
-            axis=-1,
-        )
-
-        draft_latent, draft_rope = self.project_kv(hidden, positions)
-        draft_records = self._pack_draft_records(draft_latent, draft_rope)
         output = self._dspark_k5_mla(
-            query.transpose(0, 2, 1, 3),
+            query,
             cache.ring.records,
             draft_records,
             int(start_pos),
         )
-        output = output.transpose(0, 2, 1, 3)
         return self._project_attention_output(output, cos, sin)
 
 
@@ -520,6 +615,7 @@ class DeepseekV4DSparkOwner:
             raise ValueError("DeepSeek V4 DSpark requires exactly three stages")
         self._propose_impl = self._stock_propose_k5
         self._make_cache_impl = self._new_cache
+        self._commit_main_impl = self._stock_commit_main
 
     def install_mia_mhc_runtime(self, *, max_tokens: int) -> None:
         from mtplx.kernels.deepseek_v4_mhc import MiaMHCPlan
@@ -550,6 +646,7 @@ class DeepseekV4DSparkOwner:
         self._mia_cache_arena = tuple(self._new_cache())
         self._mia_cache_leased = False
         self._make_cache_impl = self._acquire_mia_cache
+        self._commit_main_impl = self._mia_commit_main
         self._propose_impl = self._mia_propose_k5
 
     def draft_input_ids(self, primary_token_ids: mx.array) -> mx.array:
@@ -623,6 +720,19 @@ class DeepseekV4DSparkOwner:
         *,
         start_pos: int,
     ) -> None:
+        return self._commit_main_impl(
+            target_taps,
+            caches,
+            start_pos=start_pos,
+        )
+
+    def _stock_commit_main(
+        self,
+        target_taps: tuple[mx.array, mx.array, mx.array],
+        caches: list[DeepseekV4DSparkCache],
+        *,
+        start_pos: int,
+    ) -> None:
         if len(caches) != DSPARK_STAGE_COUNT:
             raise ValueError("DSpark commit requires one cache per stage")
         main_hidden = self.stages[0].fuse_main(target_taps)
@@ -630,6 +740,22 @@ class DeepseekV4DSparkOwner:
         for stage, cache in zip(self.stages, caches):
             latent, rope = stage.attn.project_kv(main_hidden, positions)
             cache.commit_main(start_pos, latent, rope)
+
+    def _mia_commit_main(
+        self,
+        target_taps: tuple[mx.array, mx.array, mx.array],
+        caches: list[DeepseekV4DSparkCache],
+        *,
+        start_pos: int,
+    ) -> None:
+        if len(caches) != DSPARK_STAGE_COUNT:
+            raise ValueError("DSpark commit requires one cache per stage")
+        main_hidden = self.stages[0].fuse_main(target_taps)
+        for stage, cache in zip(self.stages, caches):
+            records = stage.attn.project_context_records(
+                main_hidden, int(start_pos)
+            )
+            cache._commit_records(start_pos, records)
 
     def _stock_propose_k5(
         self,
