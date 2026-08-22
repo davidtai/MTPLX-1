@@ -377,16 +377,16 @@ and subsequent whole-branch review findings are closed.
 
 **Files:**
 - Modify: `scripts/deepseek_v4_dspark_k5_bench.py`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-144d8193-1024x1024.json`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-144d8193-16384x1024-cold.json`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-144d8193-65536x1024-cold.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-b5638db-1024x1024.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-b5638db-16384x1024-cold.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-b5638db-65536x1024-cold.json`
 
 **Security flag:** `none`
 
 **Does NOT cover:** unrelated models, concurrency, sampling, additional context
 lengths, or optimization experiments not nominated by these executions.
 
-- [ ] **Step 1: Update receipt identity and run focused non-GPU verification**
+- [x] **Step 1: Update receipt identity and run focused non-GPU verification**
 
 Require `kv_cache_format=nvfp4_stock432`, K216 target, K64 draft, pinned model and
 source revisions. Refuse a dirty source tree before MLX/model load, commit the
@@ -394,7 +394,7 @@ complete implementation, merge and verify the live upstream PR base, and run
 execution gates from a clean worktree at that exact SHA. Run lint plus only the
 DeepSeek NVFP4/DSpark/DFlash2 suites.
 
-- [ ] **Step 2: Run one guarded real epoch and committed-token parity gate**
+- [x] **Step 2: Run one guarded real epoch and committed-token parity gate**
 
 Acquire `/tmp/mtplx-gpu-exclusive.lock` through the existing service-restoration
 guard.  Stop at the first record, output, rollback, or token mismatch.
@@ -404,7 +404,7 @@ guard.  Stop at the first record, output, rollback, or token mismatch.
 Serve the exact Mia/Sero target with the packaged K64 draft through DFlash2,
 generate roughly 100 tokens, then restore and verify the prior service.
 
-- [ ] **Step 4: Run the requested cold matrix**
+- [x] **Step 4: Run the requested cold matrix**
 
 Run exact `1024/1024`, `16384/1024`, and `65536/1024`.  Each receipt records
 prefill tok/s, decode tok/s, generated count, acceptance, MLX peak/active memory,
