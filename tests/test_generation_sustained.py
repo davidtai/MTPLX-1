@@ -318,6 +318,7 @@ def _sealed_target_runtime():
     arena = _SealedTargetArena(events)
     plan = MiaDeepseekV4EnginePlan(
         context_capacity_tokens=384_000,
+        target_physical_capacity_tokens=384_005,
         max_batch_tokens=8_224,
         max_sequences=1,
         page_geometry=(),

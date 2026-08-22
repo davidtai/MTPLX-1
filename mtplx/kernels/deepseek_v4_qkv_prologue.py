@@ -189,21 +189,20 @@ _QKV_RECORD_BODY = r"""
     if (is_kv) {
         float rope_elements[16];
         for (uint i = 0u; i < 16u; ++i) {
-            uint dim = dim_base + i;
             elements[i] = mtplx_bf16_roundtrip(elements[i]);
-            if (dim >= 448u) {
-                uint local = dim - 448u;
+        }
+        if (dim_base >= 448u) {
+            for (uint i = 0u; i < 16u; i += 2u) {
+                uint local = dim_base + i - 448u;
                 uint pair = local >> 1u;
-                uint pair_base = i & ~1u;
-                float even = elements[pair_base];
-                float odd = elements[pair_base + 1u];
+                float even = elements[i];
+                float odd = elements[i + 1u];
                 float c = float(rope_cos[size_t(row) * 32u + pair]);
                 float s = float(rope_sin[size_t(row) * 32u + pair]);
-                float rotated = (local & 1u) == 0u
-                    ? even * c - odd * s
-                    : even * s + odd * c;
-                elements[i] = mtplx_bf16_roundtrip(rotated);
+                elements[i] = mtplx_bf16_roundtrip(even * c - odd * s);
+                elements[i + 1u] = mtplx_bf16_roundtrip(even * s + odd * c);
                 rope_elements[i] = elements[i];
+                rope_elements[i + 1u] = elements[i + 1u];
             }
         }
 
@@ -303,21 +302,20 @@ _KV_RECORD_SOURCE = r"""
     }
     float rope_elements[16];
     for (uint i = 0u; i < 16u; ++i) {
-        uint dim = dim_base + i;
         elements[i] = mtplx_bf16_roundtrip(elements[i]);
-        if (dim >= 448u) {
-            uint local = dim - 448u;
+    }
+    if (dim_base >= 448u) {
+        for (uint i = 0u; i < 16u; i += 2u) {
+            uint local = dim_base + i - 448u;
             uint pair = local >> 1u;
-            uint pair_base = i & ~1u;
-            float even = elements[pair_base];
-            float odd = elements[pair_base + 1u];
+            float even = elements[i];
+            float odd = elements[i + 1u];
             float c = float(rope_cos[size_t(row) * 32u + pair]);
             float s = float(rope_sin[size_t(row) * 32u + pair]);
-            float rotated = (local & 1u) == 0u
-                ? even * c - odd * s
-                : even * s + odd * c;
-            elements[i] = mtplx_bf16_roundtrip(rotated);
+            elements[i] = mtplx_bf16_roundtrip(even * c - odd * s);
+            elements[i + 1u] = mtplx_bf16_roundtrip(even * s + odd * c);
             rope_elements[i] = elements[i];
+            rope_elements[i + 1u] = elements[i + 1u];
         }
     }
 

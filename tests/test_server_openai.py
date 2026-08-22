@@ -5181,6 +5181,7 @@ def test_dspark_nonstream_attempt_bypasses_generic_cache_and_token_instrumentati
             _mia_engine_plan=SimpleNamespace(
                 identity="exact-mia-plan",
                 context_capacity_tokens=384_000,
+                target_physical_capacity_tokens=384_005,
                 max_batch_tokens=8_224,
                 max_sequences=1,
             )
@@ -5252,6 +5253,7 @@ def test_dspark_nonstream_attempt_bypasses_generic_cache_and_token_instrumentati
         "owner": "sealed_mia_engine_plan",
         "plan_identity": "exact-mia-plan",
         "context_capacity_tokens": 384_000,
+        "target_physical_capacity_tokens": 384_005,
         "max_batch_tokens": 8_224,
         "max_sequences": 1,
         "prefill_step_tokens": 1024,

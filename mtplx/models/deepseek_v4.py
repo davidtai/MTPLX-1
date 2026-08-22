@@ -2044,9 +2044,9 @@ def install_mia_qkv_prologue_routes(model) -> dict:
 def install_mia_target_rope_providers(
     model,
     *,
-    max_positions: int,
+    physical_max_positions: int,
 ) -> tuple[MiaRoPETableProvider, MiaRoPETableProvider]:
-    """Construct exact-Mia providers and bind them to their fixed owners."""
+    """Bind exact-Mia RoPE owners with fixed physical M6 tail headroom."""
     if (
         getattr(model, "_mia_base_rope_provider", None) is not None
         or getattr(model, "_mia_compress_rope_provider", None) is not None
@@ -2054,6 +2054,7 @@ def install_mia_target_rope_providers(
     ):
         raise ValueError("the shared Mia target RoPE providers are already installed")
     args = model.args
+    physical_max_positions = int(physical_max_positions)
     base = MiaRoPETableProvider(
         _yarn_inv_freq(
             int(args.qk_rope_head_dim),
@@ -2063,7 +2064,7 @@ def install_mia_target_rope_providers(
             32,
             1,
         ),
-        max_positions=max_positions,
+        max_positions=physical_max_positions,
     )
     compress = MiaRoPETableProvider(
         _yarn_inv_freq(
@@ -2074,16 +2075,16 @@ def install_mia_target_rope_providers(
             int(args.beta_fast),
             int(args.beta_slow),
         ),
-        max_positions=max_positions,
+        max_positions=physical_max_positions,
     )
-    # DFlash always constructs all five draft rows before slicing a final
-    # partial acceptance block.  Keep target admission at 384k while giving the
-    # one stage-shared base-theta draft owner its fixed four-row lookahead.
+    # DFlash always verifies one target row plus all five draft rows before
+    # slicing a final partial block.  Target and draft providers therefore own
+    # the same physical positions while request admission remains logical.
     draft = MiaRoPETableProvider(
         base.inv_freq,
-        # ``max_positions`` is an exclusive bound; five rows beginning at
-        # 384000 require storage through inclusive position 384004.
-        max_positions=int(max_positions) + 5,
+        # ``max_positions`` is an exclusive bound; six rows beginning at
+        # position 383999 require storage through inclusive position 384004.
+        max_positions=physical_max_positions,
     )
     for layer in model.layers:
         provider = base if int(layer.attn.compress_ratio) == 0 else compress

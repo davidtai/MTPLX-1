@@ -271,8 +271,9 @@ to reach it.
 - Inverse RoPE is fused at the grouped output boundary, and every other
   scale-bearing non-expert FP8 module is installed once as native group-32
   MXFP8 by the bounded one-source-shard loader.
-- The immutable engine plan owns the 384,000-token target pages, 8,416-row
-  target window arenas, 128-row DSpark rings, fixed compressor state,
+- The immutable engine plan admits 384,000 logical tokens and owns 384,005
+  physical target positions for terminal M6 verification, plus 8,416-row target
+  window arenas, 128-row DSpark rings, fixed compressor state,
   selector/MLA/mHC/Trellis geometry, exact phase callables, and finite prewarm
   signatures.
 - The pinned DFlash dependency is

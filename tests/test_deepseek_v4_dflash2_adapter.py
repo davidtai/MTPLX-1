@@ -26,6 +26,7 @@ from mtplx.models.deepseek_v4_dspark import DeepseekV4DSparkCache  # noqa: E402
 class _FakeMiaEnginePlan:
     identity = "test-mia-deepseek-v4-engine-plan"
     context_capacity_tokens = 384_000
+    target_physical_capacity_tokens = 384_005
 
     def __init__(self, target_cache_factory=None) -> None:
         self._target_cache_factory = target_cache_factory
@@ -688,3 +689,53 @@ def test_generation_adapter_accounts_for_fixed_m6_terminal_cycles(monkeypatch) -
     assert output.stats.drafted_tokens == 20
     assert output.stats.rejected_drafts == 18
     assert output.stats.drafted_by_depth == [4, 4, 4, 4, 4]
+
+
+@pytest.mark.parametrize("remaining_tokens", range(1, 7))
+def test_generation_adapter_keeps_logical_384k_admission_with_physical_m6_headroom(
+    monkeypatch,
+    remaining_tokens,
+) -> None:
+    from dflash_mlx.engine.events import SummaryEvent
+    import mtplx.deepseek_v4_dflash2 as adapter_module
+
+    observed = []
+    summary = SummaryEvent(
+        elapsed_us=10_000.0,
+        prompt_token_count=384_000 - remaining_tokens,
+        generated_token_ids=tuple(range(remaining_tokens)),
+        generation_tokens=remaining_tokens,
+        accepted_from_draft=0,
+        acceptance_ratio=0.0,
+        cycles_completed=1,
+        phase_timings_us={"prefill": 1_000.0},
+        block_tokens=6,
+        verify_len_cap=6,
+        acceptance_history=(0,),
+    )
+
+    def fake_stream(**kwargs):
+        observed.append(kwargs)
+        return iter([summary])
+
+    monkeypatch.setattr(adapter_module, "_stream_dflash_generate", fake_stream)
+    bundle, context = _fake_generation_bundle(
+        SimpleNamespace(decode=lambda values: str(values))
+    )
+    prompt = [1] * (384_000 - remaining_tokens)
+
+    output = generate_deepseek_v4_dflash2(
+        bundle,
+        prompt,
+        max_tokens=remaining_tokens,
+        runtime_context=context,
+    )
+
+    assert len(output.tokens) == remaining_tokens
+    assert observed[0]["block_tokens"] == 6
+    plan = bundle.target_model._mia_engine_plan
+    assert plan.context_capacity_tokens == len(prompt) + remaining_tokens
+    assert (
+        plan.target_physical_capacity_tokens
+        == plan.context_capacity_tokens + 5
+    )

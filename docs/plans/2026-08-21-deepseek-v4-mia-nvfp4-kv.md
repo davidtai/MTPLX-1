@@ -355,7 +355,7 @@ journal in reusable cache snapshots.  Release target/draft arenas on every
 prewarm exit, and bind shard validation to the bytes actually installed so cold
 construction does not validate one object and load another.
 
-- [ ] **Step 5: Port the remaining packaged-Mia fused projection paths**
+- [x] **Step 5: Port the remaining packaged-Mia fused projection paths**
 
 Construction-bind the exact TP1 stacked `wq_a+wkv` and `wkv+wgate` owners, one
 shared target/draft RoPE graph, the fused learned-Q/KV RMSNorm and one-cast
@@ -366,7 +366,7 @@ activation scale encoding, the BF16 WO-A bottleneck, and original checkpoint
 parameter names.  Installed execution has no nullable callable, metadata
 revalidation, generic QMM substitution, or silent fallback.
 
-- [ ] **Step 6: Focused red/green and integration gates**
+- [x] **Step 6: Focused red/green and integration gates**
 
 For each encountered defect, first run the smallest deterministic reproducer,
 then the fix, then the relevant DeepSeek V4 suite.  Static gates do not count as

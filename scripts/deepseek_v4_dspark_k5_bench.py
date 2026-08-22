@@ -151,6 +151,7 @@ def _cache_contract(bundle, *, requested_span_tokens: int) -> dict:
     requested_span_tokens = int(requested_span_tokens)
     plan = bundle.target_model._mia_engine_plan
     context_capacity = int(plan.context_capacity_tokens)
+    target_physical_capacity = int(plan.target_physical_capacity_tokens)
     if requested_span_tokens > context_capacity:
         raise ValueError(
             f"requested span {requested_span_tokens} exceeds the installed "
@@ -197,7 +198,7 @@ def _cache_contract(bundle, *, requested_span_tokens: int) -> dict:
                     raise RuntimeError("Mia uncompressed page geometry changed")
                 continue
 
-            expected_capacity = (context_capacity + ratio - 1) // ratio
+            expected_capacity = (target_physical_capacity + ratio - 1) // ratio
             observed_capacity = int(cache.compressed.capacity)
             if (
                 cache.compressed.mode != "nvfp4_stock432_paged"
@@ -243,6 +244,7 @@ def _cache_contract(bundle, *, requested_span_tokens: int) -> dict:
             "request": {"span_tokens": requested_span_tokens},
             "installed_cache_plan": {
                 "context_capacity_tokens": context_capacity,
+                "target_physical_capacity_tokens": target_physical_capacity,
                 "max_batch_tokens": int(plan.max_batch_tokens),
             },
             "target_kv": {

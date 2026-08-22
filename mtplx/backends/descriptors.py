@@ -1491,6 +1491,7 @@ def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDes
     if runtime_backend == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
         from mtplx.deepseek_v4_mia_engine import (
             MIA_CONTEXT_CAPACITY,
+            MIA_TARGET_PHYSICAL_CAPACITY,
             MiaDeepseekV4EnginePlan,
         )
 
@@ -1498,6 +1499,8 @@ def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDes
         if (
             not isinstance(plan, MiaDeepseekV4EnginePlan)
             or int(plan.context_capacity_tokens) != MIA_CONTEXT_CAPACITY
+            or int(plan.target_physical_capacity_tokens)
+            != MIA_TARGET_PHYSICAL_CAPACITY
         ):
             raise RuntimeError(
                 "deepseek_v4_dspark runtime has no sealed Mia engine plan"

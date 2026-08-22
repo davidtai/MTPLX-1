@@ -199,13 +199,14 @@ def test_cache_contract_reports_fixed_arena_separately_from_request_span() -> No
     requested_span = 16_384 + 1_024
     plan = SimpleNamespace(
         context_capacity_tokens=384_000,
+        target_physical_capacity_tokens=384_005,
         max_batch_tokens=8_224,
         page_geometry=tuple(
             SimpleNamespace(
                 layer_id=layer_id,
                 compress_ratio=ratio,
                 compressed_capacity=(
-                    0 if ratio == 0 else (384_000 + ratio - 1) // ratio
+                    0 if ratio == 0 else (384_005 + ratio - 1) // ratio
                 ),
             )
             for layer_id, ratio in enumerate((0, 4, 128))
@@ -225,13 +226,13 @@ def test_cache_contract_reports_fixed_arena_separately_from_request_span() -> No
             values["compressed"] = SimpleNamespace(
                 mode="nvfp4_stock432_paged",
                 record_bytes=432,
-                capacity=(384_000 + ratio - 1) // ratio,
+                capacity=(384_005 + ratio - 1) // ratio,
             )
         if ratio == 4:
             values["index_compressed"] = SimpleNamespace(
                 mode="fp8_e4m3_ue8m0_scale132_paged",
                 record_bytes=132,
-                capacity=96_000,
+                capacity=96_002,
             )
         return SimpleNamespace(**values)
 
@@ -281,15 +282,16 @@ def test_cache_contract_reports_fixed_arena_separately_from_request_span() -> No
     assert contract["request"]["span_tokens"] == requested_span
     assert contract["installed_cache_plan"] == {
         "context_capacity_tokens": 384_000,
+        "target_physical_capacity_tokens": 384_005,
         "max_batch_tokens": 8_224,
     }
     assert contract["target_kv"]["window_capacity_records"] == 8_416
     assert "capacity_tokens" not in contract["target_kv"]
     assert contract["target_kv"]["compressed_pages"] == [
-        {"compress_ratio": 4, "capacity_records": 96_000, "layers": 1},
-        {"compress_ratio": 128, "capacity_records": 3_000, "layers": 1},
+        {"compress_ratio": 4, "capacity_records": 96_002, "layers": 1},
+        {"compress_ratio": 128, "capacity_records": 3_001, "layers": 1},
     ]
-    assert contract["target_kv"]["indexer_capacity_records"] == 96_000
+    assert contract["target_kv"]["indexer_capacity_records"] == 96_002
     assert contract["dspark_kv"]["ring_capacity_records"] == 128
     assert calls[0] == (
         "target",

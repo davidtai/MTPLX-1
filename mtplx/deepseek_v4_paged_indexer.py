@@ -16,7 +16,7 @@ INDEXER_HEADS = 64
 INDEXER_HEAD_DIM = 128
 INDEXER_TOPK = 512
 INDEXER_RECORD_BYTES = 132
-INDEXER_ROPE_POSITIONS = 384_000
+INDEXER_ROPE_POSITIONS = 384_005
 # Pinned vLLM bounds the sparse-indexer FP32 logits slab to 512 MiB and
 # query-subchunks only when one request exceeds that construction policy.
 INDEXER_PREFILL_MAX_LOGITS_BYTES = 512 * 1024 * 1024
@@ -430,7 +430,7 @@ def install_indexer_query_records(
         or rope_table.values.dtype != mx.float32
     ):
         raise ValueError(
-            "Mia indexer RoPE table must be FP32 [384000, 64]"
+            "Mia indexer RoPE table must be FP32 [384005, 64]"
         )
     installed_scale = mx.array(float(weight_scale), dtype=mx.float32)
     mx.eval(installed_scale)

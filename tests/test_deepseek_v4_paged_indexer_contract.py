@@ -41,7 +41,7 @@ def test_exact_installer_seals_rope_capacity_and_requires_shared_table():
     undersized = indexer.MiaIndexerRoPETable(
         mx.zeros((2, 64), dtype=mx.float32)
     )
-    with pytest.raises(ValueError, match="384000"):
+    with pytest.raises(ValueError, match="384005"):
         indexer.install_indexer_query_records(
             heads=64,
             head_dim=128,
@@ -52,7 +52,7 @@ def test_exact_installer_seals_rope_capacity_and_requires_shared_table():
 
     exact_values = SimpleNamespace(
         ndim=2,
-        shape=(384_000, 64),
+        shape=(384_005, 64),
         dtype=mx.float32,
     )
     exact = indexer.install_indexer_query_records(
@@ -64,7 +64,7 @@ def test_exact_installer_seals_rope_capacity_and_requires_shared_table():
     )
     assert exact.func is indexer._run_installed_indexer_query_records
     assert exact.keywords["cos_sin_cache"] is exact_values
-    assert indexer.MiaIndexerRoPETable(exact_values).nbytes == 98_304_000
+    assert indexer.MiaIndexerRoPETable(exact_values).nbytes == 98_305_280
 
     with pytest.raises(ValueError, match="shared RoPE table"):
         indexer.install_indexer_query_records(
@@ -102,7 +102,7 @@ def test_exact_query_installer_prebinds_kernel_before_hot_calls(monkeypatch):
         )
 
     monkeypatch.setattr(indexer, "_query_rope_quant_kernel", lambda: fake_kernel)
-    rope_values = mx.zeros((384_000, 64), dtype=mx.float32)
+    rope_values = mx.zeros((384_005, 64), dtype=mx.float32)
     installed = indexer.install_indexer_query_records(
         heads=64,
         head_dim=128,

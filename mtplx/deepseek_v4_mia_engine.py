@@ -28,6 +28,7 @@ MIA_MAX_SEQUENCES = 1
 MIA_TARGET_LAYERS = 43
 MIA_DSPARK_STAGES = 3
 MIA_DSPARK_BLOCK = 5
+MIA_TARGET_PHYSICAL_CAPACITY = MIA_CONTEXT_CAPACITY + MIA_DSPARK_BLOCK
 MIA_TARGET_TAPS = (40, 41, 42)
 MIA_TARGET_EXPERTS = 216
 MIA_DRAFT_EXPERTS = 64
@@ -779,6 +780,7 @@ class MiaDeepseekV4EnginePlan:
     """Immutable plan installed after all exact callables and weights exist."""
 
     context_capacity_tokens: int
+    target_physical_capacity_tokens: int
     max_batch_tokens: int
     max_sequences: int
     page_geometry: tuple[MiaPageGeometry, ...]
@@ -1017,6 +1019,8 @@ def _install_shared_indexer_resources(
     ratios: tuple[int, ...],
     workspace: Any,
     inv_freq: Any,
+    *,
+    max_positions: int,
 ) -> Any:
     """Build one ratio-4 RoPE table and bind it to every indexer owner."""
 
@@ -1029,7 +1033,7 @@ def _install_shared_indexer_resources(
         raise ValueError("the Mia engine requires ratio-4 indexer owners")
     rope_table = precompute_indexer_rope_table(
         inv_freq,
-        max_positions=MIA_CONTEXT_CAPACITY,
+        max_positions=int(max_positions),
     )
     for indexer in indexers:
         indexer.install_mia_paged_topk(workspace, rope_table)
@@ -1213,7 +1217,10 @@ def build_mia_engine_plan(
     ):
         raise ValueError("the Mia TP1 B12X WO projection receipt changed")
 
-    ratio4_capacity = (context_capacity_tokens + 3) // 4
+    target_physical_capacity_tokens = (
+        context_capacity_tokens + MIA_DSPARK_BLOCK
+    )
+    ratio4_capacity = (target_physical_capacity_tokens + 3) // 4
     indexer_workspace = MiaIndexerWorkspace.allocate(
         max_query_rows=max_batch_tokens,
         topk=MIA_INDEX_TOPK,
@@ -1224,10 +1231,19 @@ def build_mia_engine_plan(
     base_rope_provider, compress_rope_provider = (
         install_mia_target_rope_providers(
             model,
-            max_positions=context_capacity_tokens,
+            physical_max_positions=target_physical_capacity_tokens,
         )
     )
     draft_rope_provider = model._mia_draft_rope_provider
+    if (
+        int(getattr(base_rope_provider, "max_positions", 0))
+        != target_physical_capacity_tokens
+        or int(getattr(compress_rope_provider, "max_positions", 0))
+        != target_physical_capacity_tokens
+        or int(getattr(draft_rope_provider, "max_positions", 0))
+        != target_physical_capacity_tokens
+    ):
+        raise ValueError("the Mia physical M6 RoPE capacity changed")
     stacked_projection_receipt = getattr(
         model,
         "_mia_stacked_projection_receipt",
@@ -1262,6 +1278,7 @@ def build_mia_engine_plan(
         ratios,
         indexer_workspace,
         compress_rope_provider.inv_freq,
+        max_positions=target_physical_capacity_tokens,
     )
     mla_workspace = mia_mla_workspace()
 
@@ -1523,7 +1540,7 @@ def build_mia_engine_plan(
             getattr(stage.attn, "_mia_rope_provider", None)
             is draft_rope_provider,
             getattr(draft_rope_provider, "max_positions", None)
-            == context_capacity_tokens + MIA_DSPARK_BLOCK,
+            == target_physical_capacity_tokens,
             type(getattr(stage.attn, "_mia_input_projection", None)).__name__,
             _callable_name(getattr(stage.attn, "_project_kv_impl", None)),
             _callable_name(
@@ -1742,7 +1759,7 @@ def build_mia_engine_plan(
     # topology, storage, callable, and quantization seal above must pass first.
     target_cache_arena = MiaTargetCacheArena(
         layers,
-        capacity_tokens=context_capacity_tokens,
+        capacity_tokens=target_physical_capacity_tokens,
         max_batch_tokens=max_batch_tokens,
     )
 
@@ -1753,7 +1770,7 @@ def build_mia_engine_plan(
             compressed_capacity=(
                 0
                 if ratio == 0
-                else (context_capacity_tokens + ratio - 1) // ratio
+                else (target_physical_capacity_tokens + ratio - 1) // ratio
             ),
             attention_record_bytes=432,
             index_record_bytes=132 if ratio == 4 else 0,
@@ -1787,7 +1804,7 @@ def build_mia_engine_plan(
         ),
         MiaWorkspaceGeometry(
             "indexer_rope_table",
-            (MIA_CONTEXT_CAPACITY, 64),
+            (target_physical_capacity_tokens, 64),
             "float32",
             "one engine-owned immutable table shared by 21 ratio-4 layers",
         ),
@@ -1914,7 +1931,7 @@ def build_mia_engine_plan(
         "nonexpert_native_mxfp8",
         "dspark_k5_direct_stock432_k64_native_mxfp4",
         "target_fixed_swa_page_arena_m8224",
-        "target_persistent_compressed_page_arena_384k",
+        "target_persistent_compressed_page_arena_384k_plus_m6_headroom",
         "dspark_persistent_fixed_ring_arena_128",
         "dflash2_structured_taps_fixed_linear_m6_copyspec_zero_owner",
     )
@@ -1925,6 +1942,7 @@ def build_mia_engine_plan(
     identity = _mia_engine_identity(context_capacity_tokens, max_batch_tokens)
     return MiaDeepseekV4EnginePlan(
         context_capacity_tokens=context_capacity_tokens,
+        target_physical_capacity_tokens=target_physical_capacity_tokens,
         max_batch_tokens=max_batch_tokens,
         max_sequences=MIA_MAX_SEQUENCES,
         page_geometry=page_geometry,

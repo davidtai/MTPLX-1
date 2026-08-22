@@ -145,7 +145,7 @@ def _score_router_kernel(experts: int):
         constexpr uint TOPK = 6u;
 
         uint lane = thread_index_in_simdgroup;
-        uint row = threadgroup_position_in_grid.x;
+        uint row = threadgroup_position_in_grid.z;
         threadgroup float candidate_scores[32u * TOPK];
         threadgroup int candidate_ids[32u * TOPK];
 
@@ -252,7 +252,7 @@ def _hash_router_kernel():
         constexpr uint TOPK = 6u;
 
         uint lane = thread_index_in_simdgroup;
-        uint row = threadgroup_position_in_grid.x;
+        uint row = threadgroup_position_in_grid.z;
         threadgroup float selected[TOPK];
 
         if (lane < TOPK) {

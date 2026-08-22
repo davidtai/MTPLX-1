@@ -176,12 +176,21 @@ def test_prologue_sources_pin_source_order_and_stock432_bytes() -> None:
     assert "q_out[q_offset + dim] = T(rotated);" in source
     assert "mtplx_bf16_roundtrip(normalized)" not in source
     for record_source in (source, prefill["source"]):
-        rotated_store = record_source.index(
-            "elements[i] = mtplx_bf16_roundtrip(rotated);"
+        pair_loop = record_source.index("for (uint i = 0u; i < 16u; i += 2u)")
+        even_read = record_source.index("float even = elements[i];", pair_loop)
+        odd_read = record_source.index("float odd = elements[i + 1u];", pair_loop)
+        even_store = record_source.index(
+            "elements[i] = mtplx_bf16_roundtrip(even * c - odd * s);",
+            pair_loop,
+        )
+        odd_store = record_source.index(
+            "elements[i + 1u] = mtplx_bf16_roundtrip(even * s + odd * c);",
+            pair_loop,
         )
         rope_copy = record_source.index("rope_elements[i] = elements[i];")
         quantization = record_source.index("float group_max = 0.0f;")
-        assert rotated_store < rope_copy < quantization
+        assert pair_loop < even_read < odd_read < even_store < odd_store
+        assert odd_store < rope_copy < quantization
     assert "record[256u + lane] = scale_byte;" in source
     assert "record[304u + rope_byte]" in source
     assert "record[288u + lane] = uchar(0);" in source
@@ -193,12 +202,34 @@ def test_prologue_sources_pin_source_order_and_stock432_bytes() -> None:
     assert context["ensure_row_contiguous"] is False
     assert context["input_names"] == ["kv_norm", "rope_cos", "rope_sin", "rows"]
     assert "q_out" not in context["source"]
-    context_rotated_store = context["source"].index(
-        "elements[i] = mtplx_bf16_roundtrip(rotated);"
+    context_pair_loop = context["source"].index(
+        "for (uint i = 0u; i < 16u; i += 2u)"
+    )
+    context_even_read = context["source"].index(
+        "float even = elements[i];", context_pair_loop
+    )
+    context_odd_read = context["source"].index(
+        "float odd = elements[i + 1u];", context_pair_loop
+    )
+    context_even_store = context["source"].index(
+        "elements[i] = mtplx_bf16_roundtrip(even * c - odd * s);",
+        context_pair_loop,
+    )
+    context_odd_store = context["source"].index(
+        "elements[i + 1u] = mtplx_bf16_roundtrip(even * s + odd * c);",
+        context_pair_loop,
     )
     context_rope_copy = context["source"].index("rope_elements[i] = elements[i];")
     context_quantization = context["source"].index("float group_max = 0.0f;")
-    assert context_rotated_store < context_rope_copy < context_quantization
+    assert (
+        context_pair_loop
+        < context_even_read
+        < context_odd_read
+        < context_even_store
+        < context_odd_store
+        < context_rope_copy
+        < context_quantization
+    )
     assert "threadgroup_position_in_grid.x * 8u" in context["source"]
 
     dimensions = np.arange(512, dtype=np.float32)
@@ -252,6 +283,49 @@ def test_prologue_sources_pin_source_order_and_stock432_bytes() -> None:
     np.testing.assert_array_equal(expected[256:284], unrotated_value[256:284])
     assert not np.array_equal(expected[224:256], unrotated_value[224:256])
     assert not np.array_equal(q_exact[-64:], q_early[-64:])
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is unavailable")
+def test_real_kv_record_kernels_match_pairwise_rope_stock432_bytes() -> None:
+    mx.set_default_device(mx.gpu)
+    rows = 2
+    dimensions = np.arange(rows * 512, dtype=np.float32).reshape(rows, 512)
+    kv = _bf16_roundtrip(
+        np.sin(dimensions * np.float32(0.173)) * np.float32(1.7)
+        + np.linspace(-0.4, 0.6, 512, dtype=np.float32)[None, :]
+    )
+    pair = np.arange(rows * 32, dtype=np.float32).reshape(rows, 32)
+    angles = (pair + np.float32(0.37)) * np.float32(0.217)
+    cosine = np.cos(angles).astype(np.float32)
+    sine = np.sin(angles).astype(np.float32)
+    rotated = kv.copy()
+    tail = kv[:, -64:].reshape(rows, 32, 2)
+    rotated[:, -64::2] = tail[:, :, 0] * cosine - tail[:, :, 1] * sine
+    rotated[:, -63::2] = tail[:, :, 0] * sine + tail[:, :, 1] * cosine
+    source_boundary = _bf16_roundtrip(rotated)
+    expected = _pack_stock432(source_boundary, source_boundary[:, -64:])
+
+    kv_input = mx.array(kv.reshape(1, rows, 512)).astype(mx.bfloat16)
+    rope_cos = mx.array(cosine.reshape(1, rows, 32))
+    rope_sin = mx.array(sine.reshape(1, rows, 32))
+    context_records = prologue._run_context_kv_records(
+        kv_input,
+        rope_cos,
+        rope_sin,
+        kernel=prologue._kv_record_kernel(),
+    )
+    _q_out, target_records = prologue._run_target_qkv_records(
+        mx.zeros((1, rows, 64, 512), dtype=mx.bfloat16),
+        kv_input,
+        rope_cos,
+        rope_sin,
+        decode_kernel=prologue._qkv_record_kernel(prefill=False),
+        rms_eps=1.0e-6,
+    )
+    mx.eval(context_records, target_records)
+
+    np.testing.assert_array_equal(np.array(context_records)[0], expected)
+    np.testing.assert_array_equal(np.array(target_records)[0], expected)
 
 
 def test_installed_prologue_prebinds_norm_and_phase_finalizer_kernels(

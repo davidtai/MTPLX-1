@@ -475,15 +475,19 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Source:** vLLM's fixed KV block tables in
   `vllm/v1/attention/backends/mla/b12x_mla_sparse.py`, SparkInfer's paged MLA and
   indexer modules above, and `sparkinfer/attention/sparse_mla/_scratch.py`.
-- **Arithmetic and layout:** capacity is fixed at 384,000 logical tokens.  Each
+- **Arithmetic and layout:** request admission is fixed at 384,000 logical
+  tokens.  Physical target storage and the shared target/indexer RoPE tables
+  own 384,005 positions because DFlash always executes one target row plus its
+  five draft rows before trimming a terminal partial block.  Each
   target layer owns an 8,416-row logical circular stock432 arena: the 8,224
   maximum input batch plus the logical 128-row attention window and installed
   64-row rollback allowance.  It is backed by 132 64-row pages (8,448
   allocated rows); the final 32 padding rows are not part of the circular
   address space.  Every query
   exposes only its causal 128-row window.  Ratio-4 and
-  ratio-128 layers own `ceil(capacity / ratio)` persistent stock432 pages;
-  ratio-4 layers additionally own the same number of Mia132 index pages.
+  ratio-128 layers own `ceil(384005 / ratio)` persistent stock432 records:
+  96,002 at ratio 4 and 3,001 at ratio 128.  Ratio-4 layers additionally own
+  96,002 Mia132 index records.
   DSpark owns three persistent physical 128-row rings.
 - **MTPLX implementation:** `mtplx/paged_cache.py`, paged owners in
   `mtplx/deepseek_v4_nvfp4_kv.py`, and `MiaDeepseekV4EnginePlan`.

@@ -50,6 +50,7 @@ class _FakeTargetArena:
 def _plan(events):
     return MiaDeepseekV4EnginePlan(
         context_capacity_tokens=384_000,
+        target_physical_capacity_tokens=384_005,
         max_batch_tokens=8_224,
         max_sequences=1,
         page_geometry=(),
@@ -109,10 +110,11 @@ def test_shared_indexer_rope_table_is_built_once_and_owned_by_every_ratio4_layer
         (4, 128, 4),
         workspace,
         inv_freq,
+        max_positions=384_005,
     )
 
     assert actual is shared_table
-    assert build_calls == [(inv_freq, 384_000)]
+    assert build_calls == [(inv_freq, 384_005)]
     assert install_calls == [
         (workspace, shared_table),
         (workspace, shared_table),
@@ -155,14 +157,14 @@ def test_exact_engine_binds_one_base_and_one_compress_rope_provider() -> None:
 
         base, compress = target_module.install_mia_target_rope_providers(
             model,
-            max_positions=384_000,
+            physical_max_positions=384_005,
         )
 
         assert model._mia_base_rope_provider is base
         assert model._mia_compress_rope_provider is compress
         assert base is not compress
-        assert base.max_positions == 384_000
-        assert compress.max_positions == 384_000
+        assert base.max_positions == 384_005
+        assert compress.max_positions == 384_005
         draft = model._mia_draft_rope_provider
         assert draft.max_positions == 384_005
         assert draft is not base
@@ -181,8 +183,8 @@ def test_exact_engine_binds_one_base_and_one_compress_rope_provider() -> None:
         ]
         positions, _cos, _sin = draft.token_tables(384_000, 5)
         assert positions.tolist() == list(range(384_000, 384_005))
-        with pytest.raises(ValueError, match="384k capacity"):
-            base.token_tables(384_000, 5)
+        target_positions, _cos, _sin = base.token_tables(384_000, 5)
+        assert target_positions.tolist() == list(range(384_000, 384_005))
     finally:
         mx.set_default_device(previous)
 

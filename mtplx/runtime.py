@@ -710,6 +710,7 @@ def load(
     if dspark:
         from .deepseek_v4_mia_engine import (
             MIA_CONTEXT_CAPACITY,
+            MIA_TARGET_PHYSICAL_CAPACITY,
             MiaDeepseekV4EnginePlan,
         )
 
@@ -717,6 +718,8 @@ def load(
         if (
             not isinstance(mia_plan, MiaDeepseekV4EnginePlan)
             or int(mia_plan.context_capacity_tokens) != MIA_CONTEXT_CAPACITY
+            or int(mia_plan.target_physical_capacity_tokens)
+            != MIA_TARGET_PHYSICAL_CAPACITY
         ):
             raise RuntimeError(
                 "the pinned Mia loader did not install its sealed Mia engine plan"

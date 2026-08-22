@@ -339,6 +339,9 @@ def _bind_deepseek_v4_dspark_attempt(
             "owner": "sealed_mia_engine_plan",
             "plan_identity": str(plan.identity),
             "context_capacity_tokens": int(plan.context_capacity_tokens),
+            "target_physical_capacity_tokens": int(
+                plan.target_physical_capacity_tokens
+            ),
             "max_batch_tokens": int(plan.max_batch_tokens),
             "max_sequences": int(plan.max_sequences),
             "prefill_step_tokens": int(runtime_context.runtime.prefill_step_size),
@@ -2017,6 +2020,7 @@ def _installed_backend_context_capacity(
         return int(configured_model_max)
     from mtplx.deepseek_v4_mia_engine import (
         MIA_CONTEXT_CAPACITY,
+        MIA_TARGET_PHYSICAL_CAPACITY,
         MiaDeepseekV4EnginePlan,
     )
 
@@ -2026,6 +2030,8 @@ def _installed_backend_context_capacity(
     capacity = int(plan.context_capacity_tokens)
     if (
         capacity != MIA_CONTEXT_CAPACITY
+        or int(plan.target_physical_capacity_tokens)
+        != MIA_TARGET_PHYSICAL_CAPACITY
         or capacity != int(backend.context_window_policy.maximum)
     ):
         raise RuntimeError(
