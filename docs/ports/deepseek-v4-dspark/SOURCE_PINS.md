@@ -376,7 +376,10 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Construction owner / installed callable:** each target `DeepseekV4MoE`
   binds `_mia_exl3_forward`; each gate binds `_mia_hash_route` or
   `_mia_score_route`; `EXL3SwitchGLU.install_trellis_runtime` binds the BM8 and
-  BM64 plans.  `_pack_trellis_routes` is the enabled packer.
+  BM64 plans.  The fixed logical-M route uses BM8 through M127 and BM64 above;
+  this preserves M128 construction prewarm while the matched exact-model M127
+  gate avoids 4,032 BM64 slots for 762 routed tasks.  `_pack_trellis_routes` is
+  the enabled packer.
 - **Disposition:** source-derived Metal W4A16 port.  The older QMV and generic
   `mx.argsort` implementations remain explicit stock/oracle code and are not
   reachable from `_mia_exl3_forward`.

@@ -275,10 +275,10 @@ def test_trellis_bm64_descriptors_and_launch_use_populated_block_bound(
     assert calls["mma"]["grid"] == (512, 64, 308)
 
 
-def test_trellis_uses_measured_bm8_route_through_m128() -> None:
+def test_trellis_uses_measured_bm8_route_through_m127() -> None:
     source = inspect.getsource(EXL3SwitchGLU.fused)
 
-    assert "self._trellis_plans[0 if rows <= 128 else 1]" in source
+    assert "self._trellis_plans[0 if rows <= 127 else 1]" in source
 
 
 def test_trellis_swiglu_limit_is_a_valid_metal_float_literal(monkeypatch):

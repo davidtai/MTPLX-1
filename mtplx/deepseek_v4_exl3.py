@@ -1446,7 +1446,7 @@ class EXL3SwitchGLU(nn.Module):
         original_dtype = x.dtype
         rows = int(expert_ids.shape[0])
         tasks = rows * self.topk
-        plan = self._trellis_plans[0 if rows <= 128 else 1]
+        plan = self._trellis_plans[0 if rows <= 127 else 1]
         block_m = plan.block_m
         (
             packed_tasks,
