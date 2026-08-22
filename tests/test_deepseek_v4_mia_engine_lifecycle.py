@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
-import re
 import struct
 from types import SimpleNamespace
 
@@ -189,57 +187,27 @@ def test_exact_engine_binds_one_base_and_one_compress_rope_provider() -> None:
         mx.set_default_device(previous)
 
 
-def test_exact_target_forward_joins_fixed_stores_once_per_chunk() -> None:
-    previous = mx.default_device()
-    mx.set_default_device(mx.cpu)
+def test_exact_target_forward_starts_one_shared_rope_epoch_per_chunk() -> None:
     events = []
 
     class Provider:
         def begin_forward(self):
             events.append("rope")
 
-    try:
-        dependencies = []
-        for index in range(6):
-            store = mx.zeros((8,), dtype=mx.float32)
-            store[:] = mx.sin(mx.arange(8, dtype=mx.float32) + index)
-            dependencies.append(store)
-        hidden = mx.arange(16, dtype=mx.float32).reshape(1, 2, 2, 4)
-        taps = tuple(hidden + index for index in (1, 2, 3))
-        model = target_module.Model.__new__(target_module.Model)
-        model._mia_base_rope_provider = Provider()
-        model._mia_compress_rope_provider = Provider()
-        model._mia_draft_rope_provider = Provider()
-        model._mia_engine_plan = SimpleNamespace(
-            target_forward_dependencies=tuple(dependencies)
+    model = target_module.Model.__new__(target_module.Model)
+    model._mia_base_rope_provider = Provider()
+    model._mia_compress_rope_provider = Provider()
+    model._mia_draft_rope_provider = Provider()
+    model.model = SimpleNamespace(
+        _run_mia_hc_target_tail_taps=lambda inputs, cache: (
+            events.append((inputs, cache)) or "result"
         )
-        model.model = SimpleNamespace(
-            _run_mia_hc_target_tail_taps=lambda inputs, cache: (
-                events.append((inputs, cache)) or (hidden, taps)
-            )
-        )
-        inputs = object()
-        cache = object()
+    )
+    inputs = object()
+    cache = object()
 
-        actual_hidden, actual_taps = model._mia_target_forward(inputs, cache)
-        graph = io.StringIO()
-        mx.export_to_dot(graph, actual_hidden, *actual_taps)
-
-        assert re.findall(r'label ="Depends"', graph.getvalue()) == [
-            'label ="Depends"'
-        ]
-        mx.eval(actual_hidden, *actual_taps)
-        assert mx.array_equal(actual_hidden, hidden).item()
-        assert all(
-            mx.array_equal(actual, expected).item()
-            for actual, expected in zip(actual_taps, taps, strict=True)
-        )
-        settled = io.StringIO()
-        mx.export_to_dot(settled, *dependencies)
-        assert re.findall(r'label ="([^"]+)"', settled.getvalue()) == []
-        assert events == ["rope", "rope", "rope", (inputs, cache)]
-    finally:
-        mx.set_default_device(previous)
+    assert model._mia_target_forward(inputs, cache) == "result"
+    assert events == ["rope", "rope", "rope", (inputs, cache)]
 
 
 def test_exact_stacked_projection_installer_binds_all_named_owners(monkeypatch):

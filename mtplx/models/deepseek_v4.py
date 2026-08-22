@@ -6427,12 +6427,7 @@ class Model(nn.Module):
         self._mia_base_rope_provider.begin_forward()
         self._mia_compress_rope_provider.begin_forward()
         self._mia_draft_rope_provider.begin_forward()
-        hidden, taps = self.model._run_mia_hc_target_tail_taps(inputs, cache)
-        bound = mx.depends(
-            (hidden, *taps),
-            self._mia_engine_plan.target_forward_dependencies,
-        )
-        return bound[0], tuple(bound[1:])
+        return self.model._run_mia_hc_target_tail_taps(inputs, cache)
 
     def mia_dflash_forward(
         self,

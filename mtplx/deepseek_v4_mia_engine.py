@@ -692,7 +692,7 @@ class MiaTargetCacheArena:
             for cache in self._caches
         ):
             raise ValueError("Mia target record writers lost their cache owners")
-        forward_dependencies = []
+        journal_buffers = []
         for layer, cache in zip(layers, self._caches, strict=True):
             ratio = int(layer.attn.compress_ratio)
             if ratio == 0:
@@ -715,7 +715,7 @@ class MiaTargetCacheArena:
                 raise ValueError(
                     "Mia target cache arena did not install fixed compressor pages"
                 )
-            forward_dependencies.extend(cache.comp.journal_buffers)
+            journal_buffers.extend(cache.comp.journal_buffers)
             if ratio == 4:
                 if (
                     getattr(cache.index_comp, "mode", None)
@@ -731,10 +731,8 @@ class MiaTargetCacheArena:
                     raise ValueError(
                         "Mia target cache arena did not install fixed indexer state"
                     )
-                forward_dependencies.extend(cache.index_comp.journal_buffers)
-                forward_dependencies.append(cache.index_compressed.pages)
-        self._forward_dependencies = tuple(forward_dependencies)
-        mx.eval(*self._forward_dependencies)
+                journal_buffers.extend(cache.index_comp.journal_buffers)
+        mx.eval(*journal_buffers)
         self._leased = False
 
     @property
@@ -744,12 +742,6 @@ class MiaTargetCacheArena:
     @property
     def leased(self) -> bool:
         return self._leased
-
-    @property
-    def forward_dependencies(self) -> tuple[Any, ...]:
-        """Fixed side-write arrays joined once by the terminal target forward."""
-
-        return self._forward_dependencies
 
     def _reset(self) -> None:
         for cache in self._caches:
@@ -801,10 +793,6 @@ class MiaDeepseekV4EnginePlan:
     draft_artifact: str
     artifact_small_file_sha256: tuple[tuple[str, str], ...]
     identity: str
-
-    @property
-    def target_forward_dependencies(self) -> tuple[Any, ...]:
-        return self.target_cache_arena.forward_dependencies
 
     def make_target_cache(self, layers) -> list[Any]:
         return self.target_cache_arena.acquire(tuple(layers))
