@@ -12,6 +12,7 @@ import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
 from mtplx import deepseek_v4_nvfp4_kv as nvfp4_kv  # noqa: E402
+from mtplx import deepseek_v4_mia_engine as mia_engine  # noqa: E402
 from mtplx.attention_context import attention_phase  # noqa: E402
 from mtplx.kernels import deepseek_v4_compressor as compressor_kernels  # noqa: E402
 from mtplx.kernels import deepseek_v4_qkv_prologue as qkv_prologue  # noqa: E402
@@ -945,3 +946,39 @@ def test_fixed_compressor_uses_retained_frontier_without_journal_readback() -> N
     assert state.latest_calls == []
     assert before_boundary.shape == (1, 0, 432)
     np.testing.assert_array_equal(np.array(actual), np.array(expected))
+
+
+def test_ratio128_terminal_dependencies_cover_reused_127_plus_1_frontier() -> None:
+    compressor = _make_compressor(512, "stock432", 128)
+    inputs = mx.array(
+        np.random.default_rng(4128).normal(0.0, 0.4, (1, 128, 8)).astype(
+            np.float32
+        )
+    )
+    expected = compressor.mia_records(inputs)
+    state = FixedMiaCompressorState(
+        ratio=128,
+        overlap=False,
+        rollback_capacity=8,
+        state_width=512,
+    )
+    arena = mia_engine.MiaTargetCacheArena.__new__(mia_engine.MiaTargetCacheArena)
+    arena._forward_dependencies = state.journal_buffers
+    arena._forward_dependency_lanes = (state,)
+    mx.eval(expected)
+
+    for _request in range(2):
+        state.reset()
+        before_boundary = compressor.step_records(inputs[:, :127], state, 0)
+        dependencies = arena.forward_dependencies
+        assert any(value is state.cur_kv for value in dependencies)
+        assert any(value is state.cur_score for value in dependencies)
+        body = mx.depends(mx.zeros((1,), dtype=mx.float32), dependencies)
+        mx.eval(body)
+
+        actual = compressor.step_records(inputs[:, 127:], state, 127)
+        actual = mx.depends(actual, arena.forward_dependencies)
+        mx.eval(actual)
+
+        assert before_boundary.shape == (1, 0, 432)
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))

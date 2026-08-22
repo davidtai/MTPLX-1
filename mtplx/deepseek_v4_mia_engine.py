@@ -693,6 +693,7 @@ class MiaTargetCacheArena:
         ):
             raise ValueError("Mia target record writers lost their cache owners")
         forward_dependencies = []
+        forward_dependency_lanes = []
         for layer, cache in zip(layers, self._caches, strict=True):
             ratio = int(layer.attn.compress_ratio)
             if ratio == 0:
@@ -715,6 +716,7 @@ class MiaTargetCacheArena:
                 raise ValueError(
                     "Mia target cache arena did not install fixed compressor pages"
                 )
+            forward_dependency_lanes.append(cache.comp)
             forward_dependencies.extend(cache.comp.journal_buffers)
             if ratio == 4:
                 if (
@@ -731,9 +733,11 @@ class MiaTargetCacheArena:
                     raise ValueError(
                         "Mia target cache arena did not install fixed indexer state"
                     )
+                forward_dependency_lanes.append(cache.index_comp)
                 forward_dependencies.extend(cache.index_comp.journal_buffers)
                 forward_dependencies.append(cache.index_compressed.pages)
         self._forward_dependencies = tuple(forward_dependencies)
+        self._forward_dependency_lanes = tuple(forward_dependency_lanes)
         mx.eval(*self._forward_dependencies)
         self._leased = False
 
@@ -747,9 +751,20 @@ class MiaTargetCacheArena:
 
     @property
     def forward_dependencies(self) -> tuple[Any, ...]:
-        """Fixed side-write arrays joined once by the terminal target forward."""
+        """Fixed stores and the current compressor frontiers for this chunk."""
 
-        return self._forward_dependencies
+        frontiers = tuple(
+            value
+            for lane in self._forward_dependency_lanes
+            for value in (
+                lane.cur_kv,
+                lane.cur_score,
+                lane.prev_kv,
+                lane.prev_score,
+            )
+            if value is not None
+        )
+        return self._forward_dependencies + frontiers
 
     def _reset(self) -> None:
         for cache in self._caches:

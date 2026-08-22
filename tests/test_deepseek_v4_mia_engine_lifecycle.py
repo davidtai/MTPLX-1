@@ -199,45 +199,100 @@ def test_exact_target_forward_joins_fixed_stores_once_per_chunk() -> None:
             events.append("rope")
 
     try:
-        dependencies = []
-        for index in range(6):
-            store = mx.zeros((8,), dtype=mx.float32)
-            store[:] = mx.sin(mx.arange(8, dtype=mx.float32) + index)
-            dependencies.append(store)
-        hidden = mx.arange(16, dtype=mx.float32).reshape(1, 2, 2, 4)
-        taps = tuple(hidden + index for index in (1, 2, 3))
+        stable = tuple(mx.zeros((8,), dtype=mx.float32) for _ in range(3))
+        ratio128 = SimpleNamespace(
+            cur_kv=None,
+            cur_score=None,
+            prev_kv=None,
+            prev_score=None,
+        )
+        ratio4 = SimpleNamespace(
+            cur_kv=None,
+            cur_score=None,
+            prev_kv=None,
+            prev_score=None,
+        )
+        arena = mia_engine.MiaTargetCacheArena.__new__(
+            mia_engine.MiaTargetCacheArena
+        )
+        arena._forward_dependencies = stable
+        arena._forward_dependency_lanes = (ratio128, ratio4)
+
+        class Plan:
+            @property
+            def target_forward_dependencies(self):
+                return arena.forward_dependencies
+
+        phase_dependencies = []
+
+        def run_body(inputs, cache):
+            phase = 127 if inputs.endswith("body127") else 128
+            for index, store in enumerate(stable):
+                store[:] = mx.sin(
+                    mx.arange(8, dtype=mx.float32) + phase + index
+                )
+            dynamic = tuple(
+                mx.cos(mx.arange(8, dtype=mx.float32) + phase + index)
+                for index in range(6)
+            )
+            if phase == 127:
+                ratio128.cur_kv, ratio128.cur_score = dynamic[:2]
+                ratio4.cur_kv, ratio4.cur_score = dynamic[2:4]
+                ratio4.prev_kv, ratio4.prev_score = dynamic[4:]
+                phase_dependencies[:] = dynamic
+            else:
+                ratio128.cur_kv = ratio128.cur_score = None
+                ratio4.cur_kv = ratio4.cur_score = None
+                ratio4.prev_kv, ratio4.prev_score = dynamic[4:]
+                phase_dependencies[:] = dynamic[4:]
+            hidden = (
+                mx.arange(16, dtype=mx.float32).reshape(1, 2, 2, 4)
+                + phase
+            )
+            taps = tuple(hidden + index for index in (1, 2, 3))
+            events.append((inputs, cache))
+            return hidden, taps
+
         model = target_module.Model.__new__(target_module.Model)
         model._mia_base_rope_provider = Provider()
         model._mia_compress_rope_provider = Provider()
         model._mia_draft_rope_provider = Provider()
-        model._mia_engine_plan = SimpleNamespace(
-            target_forward_dependencies=tuple(dependencies)
-        )
-        model.model = SimpleNamespace(
-            _run_mia_hc_target_tail_taps=lambda inputs, cache: (
-                events.append((inputs, cache)) or (hidden, taps)
-            )
-        )
-        inputs = object()
+        model._mia_engine_plan = Plan()
+        model.model = SimpleNamespace(_run_mia_hc_target_tail_taps=run_body)
         cache = object()
 
-        actual_hidden, actual_taps = model._mia_target_forward(inputs, cache)
-        graph = io.StringIO()
-        mx.export_to_dot(graph, actual_hidden, *actual_taps)
-
-        assert re.findall(r'label ="Depends"', graph.getvalue()) == [
-            'label ="Depends"'
-        ]
-        mx.eval(actual_hidden, *actual_taps)
-        assert mx.array_equal(actual_hidden, hidden).item()
-        assert all(
-            mx.array_equal(actual, expected).item()
-            for actual, expected in zip(actual_taps, taps, strict=True)
+        chunks = (
+            "body127",
+            "boundary1",
+            "reused-body127",
+            "reused-boundary1",
         )
-        settled = io.StringIO()
-        mx.export_to_dot(settled, *dependencies)
-        assert re.findall(r'label ="([^"]+)"', settled.getvalue()) == []
-        assert events == ["rope", "rope", "rope", (inputs, cache)]
+        for inputs in chunks:
+            actual_hidden, actual_taps = model._mia_target_forward(inputs, cache)
+            graph = io.StringIO()
+            mx.export_to_dot(graph, actual_hidden, *actual_taps)
+
+            assert re.findall(r'label ="Depends"', graph.getvalue()) == [
+                'label ="Depends"'
+            ]
+            mx.eval(actual_hidden, *actual_taps)
+            phase = 127 if inputs.endswith("body127") else 128
+            expected = (
+                mx.arange(16, dtype=mx.float32).reshape(1, 2, 2, 4) + phase
+            )
+            assert mx.array_equal(actual_hidden, expected).item()
+            assert all(
+                mx.array_equal(actual, expected + index).item()
+                for index, actual in enumerate(actual_taps, 1)
+            )
+            settled = io.StringIO()
+            mx.export_to_dot(settled, *stable, *phase_dependencies)
+            assert re.findall(r'label ="([^"]+)"', settled.getvalue()) == []
+        assert events == [
+            event
+            for inputs in chunks
+            for event in ("rope", "rope", "rope", (inputs, cache))
+        ]
     finally:
         mx.set_default_device(previous)
 
