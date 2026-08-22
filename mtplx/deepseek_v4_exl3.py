@@ -818,12 +818,15 @@ def _trellis_activation_down_hadamard_kernel(
     experts: int,
     limit: float,
 ):
+    limit_literal = format(float(limit), ".9g")
+    if "." not in limit_literal and "e" not in limit_literal.lower():
+        limit_literal += ".0"
     header = f"""
         using namespace metal;
         constant constexpr uint INTERMEDIATE = {intermediate_size}u;
         constant constexpr uint HAD = 128u;
         constant constexpr float HAD_SCALE = 0.088388347648f;
-        constant constexpr float LIMIT = {float(limit):.9g}f;
+        constant constexpr float LIMIT = {limit_literal}f;
     """
     source = r"""
         uint lane = thread_position_in_threadgroup.x;

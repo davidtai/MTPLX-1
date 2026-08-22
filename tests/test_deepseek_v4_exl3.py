@@ -275,6 +275,19 @@ def test_trellis_bm64_descriptors_and_launch_use_populated_block_bound(
     assert calls["mma"]["grid"] == (512, 64, 308)
 
 
+def test_trellis_swiglu_limit_is_a_valid_metal_float_literal(monkeypatch):
+    captured = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(exl3.mx.fast, "metal_kernel", capture)
+    exl3._trellis_activation_down_hadamard_kernel.__wrapped__(2048, 216, 10.0)
+
+    assert "constant constexpr float LIMIT = 10.0f;" in captured["header"]
+
+
 def test_installed_trellis_runtime_never_reenters_kernel_factories(monkeypatch):
     """BM8/BM64 execution must use only construction-bound Metal kernels."""
 
