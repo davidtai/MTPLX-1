@@ -377,6 +377,7 @@ and subsequent whole-branch review findings are closed.
 
 **Files:**
 - Modify: `scripts/deepseek_v4_dspark_k5_bench.py`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-b5638db-python-100.json`
 - Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-b5638db-1024x1024.json`
 - Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-b5638db-16384x1024-cold.json`
 - Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-b5638db-65536x1024-cold.json`
@@ -399,7 +400,7 @@ DeepSeek NVFP4/DSpark/DFlash2 suites.
 Acquire `/tmp/mtplx-gpu-exclusive.lock` through the existing service-restoration
 guard.  Stop at the first record, output, rollback, or token mismatch.
 
-- [ ] **Step 3: Run the guarded Python service prompt**
+- [x] **Step 3: Run the guarded Python service prompt**
 
 Serve the exact Mia/Sero target with the packaged K64 draft through DFlash2,
 generate roughly 100 tokens, then restore and verify the prior service.
