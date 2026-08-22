@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 from typing import Any, NamedTuple
 
 import mlx.core as mx
@@ -1737,20 +1738,59 @@ def _load_verified_safetensors(
     *,
     expected_bytes: int,
     expected_sha256: str,
+    expected_canonical_sha256: str | None = None,
 ) -> dict[str, mx.array]:
-    """Hash and load one stable file descriptor without retaining its bytes."""
+    """Hash and load one stable descriptor with an optional semantic header pin."""
 
     path = Path(path)
     if len(expected_sha256) != 64:
         raise ValueError(f"pinned Mia shard checksum is invalid: {path.name}")
+    if (
+        expected_canonical_sha256 is not None
+        and len(expected_canonical_sha256) != 64
+    ):
+        raise ValueError(
+            f"pinned Mia shard canonical checksum is invalid: {path.name}"
+        )
     with path.open("rb", buffering=0) as stream:
         identity = _open_file_identity(stream)
         if identity[2] != int(expected_bytes):
             raise ValueError(f"pinned Mia shard size changed: {path.name}")
 
         digest = hashlib.sha256()
+        canonical_digest = None
+        if expected_canonical_sha256 is not None:
+            from mtplx.deepseek_v4_mia_engine import (
+                _SAFETENSORS_CANONICAL_PREFIX,
+                _canonical_safetensors_header,
+            )
+
+            encoded_header_length = stream.read(8)
+            if len(encoded_header_length) != 8:
+                raise ValueError(f"invalid Mia safetensors header: {path.name}")
+            header_length = struct.unpack("<Q", encoded_header_length)[0]
+            if header_length == 0 or header_length > identity[2] - 8:
+                raise ValueError(f"invalid Mia safetensors header: {path.name}")
+            encoded_header = stream.read(header_length)
+            if len(encoded_header) != header_length:
+                raise ValueError(f"truncated Mia safetensors header: {path.name}")
+            try:
+                canonical_header = _canonical_safetensors_header(encoded_header)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid Mia safetensors JSON header: {path.name}"
+                ) from exc
+            digest.update(encoded_header_length)
+            digest.update(encoded_header)
+            canonical_digest = hashlib.sha256()
+            canonical_digest.update(_SAFETENSORS_CANONICAL_PREFIX)
+            canonical_digest.update(encoded_header_length)
+            canonical_digest.update(struct.pack("<Q", len(canonical_header)))
+            canonical_digest.update(canonical_header)
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+            if canonical_digest is not None:
+                canonical_digest.update(chunk)
         if _open_file_identity(stream) != identity:
             raise ValueError(
                 f"pinned Mia shard changed while validating: {path.name}"
@@ -1760,6 +1800,15 @@ def _load_verified_safetensors(
             raise ValueError(
                 f"pinned Mia shard checksum changed: {path.name} "
                 f"observed={observed_sha256}, expected={expected_sha256}"
+            )
+        if canonical_digest is not None and (
+            canonical_digest.hexdigest() != expected_canonical_sha256
+        ):
+            observed_canonical_sha256 = canonical_digest.hexdigest()
+            raise ValueError(
+                f"pinned Mia shard canonical checksum changed: {path.name} "
+                f"observed={observed_canonical_sha256}, "
+                f"expected={expected_canonical_sha256}"
             )
 
         stream.seek(0)
@@ -1809,6 +1858,7 @@ def load_indexed_safetensors(
                     shard,
                     expected_bytes=int(pin.bytes),
                     expected_sha256=str(pin.sha256),
+                    expected_canonical_sha256=str(pin.canonical_sha256),
                 )
             )
     observed = set(weights)
@@ -2046,6 +2096,7 @@ def load_mia_exl3_target_streaming(
             shard,
             expected_bytes=int(pin.bytes),
             expected_sha256=str(pin.sha256),
+            expected_canonical_sha256=str(pin.canonical_sha256),
         )
 
     quantized = _target_quantized_modules_from_index(weight_map)
@@ -2135,7 +2186,9 @@ def load_mia_exl3_target_streaming(
     model._mia_target_load_receipt = {
         "mode": "bounded_one_shard",
         "artifact_identity": (
-            "sha256_same_fd" if pins_by_name is not None else "unverified_path"
+            "raw_canonical_sha256_same_fd"
+            if pins_by_name is not None
+            else "unverified_path"
         ),
         "source_shards": len(files),
         "carried_shards": len(carried_files),
@@ -2368,7 +2421,7 @@ def load_mia_exl3_dspark_model(
     del draft_source
     model._mia_draft_load_receipt = {
         "mode": "single_shard",
-        "artifact_identity": "sha256_same_fd",
+        "artifact_identity": "raw_canonical_sha256_same_fd",
         "source_shards": len(artifact_validation.draft_shards),
         "source_tensors": len(artifact_validation.draft_weight_map),
         "small_file_sha256": dict(

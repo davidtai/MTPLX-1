@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import struct
 from typing import Any
 
 from mtplx.deepseek_v4_paged_indexer import precompute_indexer_rope_table
@@ -41,20 +42,75 @@ MIA_HIDDEN = 4096
 MIA_HC = 4
 MIA_DRAFT_SHARD_BYTES = 3_157_508_012
 MIA_DFLASH_COMMIT = "db155912c007f67315cdbf769d479e2e65379f25"
+MIA_TARGET_REVISION = "22f28d32b9b29b4352eaa380ff8c2c170b2847ab"
+MIA_SOURCE_CONFIG_SHA256 = "b001ec8308044aa11daa0e624f5aea5e5362a63c05879a83a7be046b00eada82"
+MIA_SOURCE_INDEX_SHA256 = "61af5c0782a8651ef893004e84369d2281a0fc316c8bcefc0bd8f76244224649"
+MIA_SOURCE_EXL3_SHA256 = "1e35cbbc33a977606a950928fba4c6660c7df0134bfab9472dd6d851be894125"
 
 _TARGET_SMALL_FILE_PINS = {
     "config.json": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
     "tokenizer.json": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
     "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547",
     "model.safetensors.index.json": "b7a450f88c99aee7f6d44ecb127e91e45ab5ccb1a0dad49ca9eabb90b400c304",
-    "rank-sliced-tp1-manifest.json": "cee5b97698e16433f88e7ca23ab529acaa13628ae4af3ea18590ba4060c1203e",
     "EXL3_MANIFEST.json": "1e35cbbc33a977606a950928fba4c6660c7df0134bfab9472dd6d851be894125",
 }
 _DRAFT_SMALL_FILE_PINS = {
     "config.json": "8dcd2ae923a8e3149454f4db1f1e03109625b19f137995d26f45d357212ba306",
     "model.safetensors.index.json": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
-    "DSPARK_DRAFT_PLAN.json": "d7a45cc065363ec79516593d8910d0be36e6e589d093ad6ab4a3603dbf92b426",
 }
+_TARGET_CANONICAL_ARTIFACT_SEAL = "c05e8ecb1d387cc351d9c5733689343ccca9d92c2be663954ce154bd43befd7d"
+_DRAFT_CANONICAL_PLAN_SEAL = "b371a65a0f452040109648551eb362bebfa802a15d92659a4cf0b90f23a57cd9"
+_TARGET_CANONICAL_SHARD_PINS = {
+    "carried-001.safetensors": "172dc4fddaaf003eb4477a5a839358afe31bec041add0f57a7423009cf5fffde",
+    "carried-002.safetensors": "9de257123f6e99efe4ddbd9d89ebe159f83ce53e9232fb6f1f08b7adf1692c11",
+    "carried-003.safetensors": "e59d5a51203a2ffd91c4ec401302043f30b4ae5140817f5e746e889eaa0541d1",
+    "carried-004.safetensors": "43bcc1adbce2a7f2cd4b46178d73a8205b9dc73c529c24507b085a6a2af0490c",
+    "carried-005.safetensors": "c902086dcfb6f686145f44568df9144499687f12ae8688dce369ab55c55c9698",
+    "exl3-layer-000-tp1-rank0.safetensors": "56e1ee251d028e9e0c8404789d2974bd45c16d136eba149ac2c0fbad1eb39ba0",
+    "exl3-layer-001-tp1-rank0.safetensors": "0a1b8c4d61a65745987f8733c6a0a0a8d9375f59bb8d5271fe1bcde25656d739",
+    "exl3-layer-002-tp1-rank0.safetensors": "a8e6d9e09e3a8d974bacafec96c38a79907210d2f1464afbccddc2034672fbcf",
+    "exl3-layer-003-tp1-rank0.safetensors": "123a4e571ad15461994648b193a6c44e4987076f994fe8137345a4e657f4e196",
+    "exl3-layer-004-tp1-rank0.safetensors": "5d4eb35deb25545866ebcb4c22be212c587868f71d5548d79cded1df8514498c",
+    "exl3-layer-005-tp1-rank0.safetensors": "5c2912083933c53bac9683629e69b69aff1941135665f8209ba74067c8d3d9c2",
+    "exl3-layer-006-tp1-rank0.safetensors": "15201a69a18ce178dbaf30a3a88969ee5e6da89d22c64f6d8bedbe14fabb86bb",
+    "exl3-layer-007-tp1-rank0.safetensors": "3e7c9fdf321f793b35449a874273cdfe03f1f79bd7bdf345193eaf505fcb07ef",
+    "exl3-layer-008-tp1-rank0.safetensors": "f914659192e27fbe063539e20a1768cf8745f20cb2bfe2b906a5b3eae0a69cbf",
+    "exl3-layer-009-tp1-rank0.safetensors": "6aa7d79141a7e017efa160374e438311c073a1ac1ebd6e8990316b5d6169cb4f",
+    "exl3-layer-010-tp1-rank0.safetensors": "953a67f1fcb3e9b9b71c7254cdd709fa8a7e86103b733481bd2466db30f2c7f2",
+    "exl3-layer-011-tp1-rank0.safetensors": "8044b3604d655ea74b73445db887fdaa309bfd71118571edcef396abb0e3c03c",
+    "exl3-layer-012-tp1-rank0.safetensors": "367d899623ddddb245ceba4a4d255b86c50a2dcc250b5bd02ea0482d32809a70",
+    "exl3-layer-013-tp1-rank0.safetensors": "e383380b866f5d3462635fd767bb5fd66928ad8407245198c61df44463501fe7",
+    "exl3-layer-014-tp1-rank0.safetensors": "bbadbabacbbcd3806dbe2ca1479a35e8da1a9b66db9f045a6d7cc44a57024bdf",
+    "exl3-layer-015-tp1-rank0.safetensors": "b3702b5769c2d764cabeb486cd7f1534dad9664d132564a618a655e552784d7d",
+    "exl3-layer-016-tp1-rank0.safetensors": "a9b82623f29e73c68b3e13b4129d7bf469cf78bdfd983edf16103b2e89966919",
+    "exl3-layer-017-tp1-rank0.safetensors": "d9c57a476f827472c60068c714a5139509e4b0b7f867c2b32c5e02545402e6db",
+    "exl3-layer-018-tp1-rank0.safetensors": "4052604ce5c928e1e20045840a76e0d25e594113ba276786dc5058fa9f559bf5",
+    "exl3-layer-019-tp1-rank0.safetensors": "9672b3c5d69fc99c453a123a10d4c43b30f7fcb1e7e006b8aec8ed4e5cc3ce10",
+    "exl3-layer-020-tp1-rank0.safetensors": "95c5f76a8991d39d83cd68aea6be51459e5e3dbebd4e1c42f9dd92e5b6fe06dd",
+    "exl3-layer-021-tp1-rank0.safetensors": "4d44e129f982a52cf8d84a391ca99b2bba7dfa6b6b4e55f5e38f922700993162",
+    "exl3-layer-022-tp1-rank0.safetensors": "94c61252e7f75ade0a3a6ad9fb35befb84854ae49bfef7fc2c8e89ec1747b94b",
+    "exl3-layer-023-tp1-rank0.safetensors": "3e2cc5dbfbe2a8359c5e3980083d1907c21aab8d28c4b6252f31d24354f1c80d",
+    "exl3-layer-024-tp1-rank0.safetensors": "45915ad1d260106ecbda0c23b5a6555cc4c85999c43c17c221849440f11f96f2",
+    "exl3-layer-025-tp1-rank0.safetensors": "350004098d1b5758b305c26046bca9dec30a810b972b1c4b018392c480872667",
+    "exl3-layer-026-tp1-rank0.safetensors": "f132ccc3ae9ae0bcf5ad781e1193df9e3b51a359d589001adbf7ccb2572eb3bd",
+    "exl3-layer-027-tp1-rank0.safetensors": "33b2099ece51752f174e1224d94fc5986b4fc06a883c8b6fa1ef9692e33669d9",
+    "exl3-layer-028-tp1-rank0.safetensors": "ad396044a0d202284526f9f99bcf7f799f54aa81bf32b8644c31d4f6e5c80c68",
+    "exl3-layer-029-tp1-rank0.safetensors": "e92fddd438b5602344dc753aa571b312571763e5d9a81e1c46d2f5c6614ca207",
+    "exl3-layer-030-tp1-rank0.safetensors": "49ae0f675bf5b826c710e888760435547467147f1334fc383803483e953380ae",
+    "exl3-layer-031-tp1-rank0.safetensors": "a554f2bb650247b24d0d42151bc2159b458a5d6b635af431fa28ed3e59e2656b",
+    "exl3-layer-032-tp1-rank0.safetensors": "dde21dd115b9f1275c917789740b2b707ac8255351ff68c0452a7883e9d0e704",
+    "exl3-layer-033-tp1-rank0.safetensors": "ce2b40b1ebdb4412b1a62f18b6ffdb8b66fb26a5e8a5b8be556200acacf0a5c9",
+    "exl3-layer-034-tp1-rank0.safetensors": "d74d19f932e9679903c543622490c253cc0fb68ad2e5ff3da303bbff53b8a164",
+    "exl3-layer-035-tp1-rank0.safetensors": "e250c12511f34061b2d743dcf14ca49bc49c201ea295577e162e9826a6af6bed",
+    "exl3-layer-036-tp1-rank0.safetensors": "ec454bbeb420bc528fdf2e557994764eee46c04a67b8aff4ce02a23c317e02aa",
+    "exl3-layer-037-tp1-rank0.safetensors": "97b438c0009dd390dd9db027d51e9491ea31b8b3aa3293406363f3670e0f0fb2",
+    "exl3-layer-038-tp1-rank0.safetensors": "464d2577ab866072548e90b7913302c3e5fa2109f63190e95a0cc9bb91b27e79",
+    "exl3-layer-039-tp1-rank0.safetensors": "f9437df4893794a69121cbc137de7cd6906cd5426da0b7595ff88b387326b154",
+    "exl3-layer-040-tp1-rank0.safetensors": "61e16010ffa32524bc35c92e67e345dfbf176af9b32537f6e7403356cc0a9aea",
+    "exl3-layer-041-tp1-rank0.safetensors": "a45233df123226cf1476ef4d02126d79b1ef3e25a65bc28b35a0da64429cd04a",
+    "exl3-layer-042-tp1-rank0.safetensors": "5440bca5af2ed689fbfd80b241fb5a69a58c85c1f5b64a17f96b52e67cad1989",
+}
+_DRAFT_CANONICAL_SHARD_PIN = "5d510d98e9a744aa78724b54250c8f55e319fc4ab8d44db8b68aafc1cbfe6b15"
 _TOKENIZER_CONSUMED_SMALL_FILES = (
     "config.json",
     "tokenizer.json",
@@ -105,6 +161,11 @@ class MiaSmallFilePin:
     ctime_ns: int
 
 
+_SAFETENSORS_CANONICAL_PREFIX = b"mtplx-mia-safetensors-json-order-v1\0"
+_TARGET_ARTIFACT_CANONICAL_PREFIX = b"mtplx-mia-target-artifact-v1\0"
+_DRAFT_PLAN_CANONICAL_PREFIX = b"mtplx-mia-draft-plan-v1\0"
+
+
 def _small_file_identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
     if not stat.S_ISREG(observed.st_mode):
         raise ValueError("pinned Mia small file must be a regular file")
@@ -117,10 +178,123 @@ def _small_file_identity(observed: os.stat_result) -> tuple[int, int, int, int, 
     )
 
 
+def _json_object_without_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _canonical_safetensors_header(encoded_header: bytes) -> bytes:
+    try:
+        header = json.loads(
+            encoded_header,
+            object_pairs_hook=_json_object_without_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid Mia safetensors JSON header") from exc
+    if not isinstance(header, dict):
+        raise ValueError("invalid Mia safetensors JSON header")
+    return json.dumps(
+        header,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _canonical_json_sha256(prefix: bytes, value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(prefix)
+    digest.update(struct.pack("<Q", len(encoded)))
+    digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _target_artifact_seal_sha256(
+    manifest: dict[str, Any],
+    shard_seals: dict[str, str | MiaShardPin],
+) -> str:
+    source = manifest.get("source")
+    if not isinstance(source, str) or not source:
+        raise ValueError(f"pinned Mia source contract changed: {source!r}")
+    sealed_manifest = dict(manifest)
+    sealed_manifest["source"] = {
+        "repository": "0xSero/deepseek-v4-flash-0731-spark",
+        "revision": MIA_TARGET_REVISION,
+        "config_sha256": MIA_SOURCE_CONFIG_SHA256,
+        "index_sha256": MIA_SOURCE_INDEX_SHA256,
+        "exl3_manifest_sha256": MIA_SOURCE_EXL3_SHA256,
+    }
+    sealed_files = []
+    for entry in manifest.get("files", ()):
+        sealed_entry = {
+            key: value for key, value in entry.items() if key != "sha256"
+        }
+        name = str(sealed_entry.get("name", ""))
+        seal = shard_seals[name]
+        canonical_sha256 = (
+            seal if isinstance(seal, str) else seal.canonical_sha256
+        )
+        if len(canonical_sha256) != 64:
+            raise ValueError(
+                f"pinned Mia TP1 canonical shard checksum is invalid: {name}"
+            )
+        sealed_entry["canonical_safetensors_sha256"] = canonical_sha256
+        sealed_files.append(sealed_entry)
+    sealed_manifest["files"] = sealed_files
+    sealed_manifest["small_file_sha256"] = {
+        name: digest
+        for name, digest in _TARGET_SMALL_FILE_PINS.items()
+    }
+    return _canonical_json_sha256(
+        _TARGET_ARTIFACT_CANONICAL_PREFIX,
+        sealed_manifest,
+    )
+
+
+def _draft_plan_seal_sha256(plan: dict[str, Any]) -> str:
+    sealed_plan = {
+        key: value
+        for key, value in plan.items()
+        if key not in {"source", "source_plan", "sha256"}
+    }
+    return _canonical_json_sha256(_DRAFT_PLAN_CANONICAL_PREFIX, sealed_plan)
+
+
 def _read_pinned_small_file(
     path: Path,
     *,
     expected_sha256: str,
+    label: str,
+) -> tuple[bytes, MiaSmallFilePin]:
+    payload, identity = _read_stable_small_file(path, label=label)
+    if identity.sha256 != expected_sha256:
+        raise ValueError(
+            f"pinned {label} file changed: {path.name} "
+            f"observed={identity.sha256}, expected={expected_sha256}"
+        )
+    return payload, identity
+
+
+def _read_stable_small_file(
+    path: Path,
+    *,
     label: str,
 ) -> tuple[bytes, MiaSmallFilePin]:
     try:
@@ -133,11 +307,6 @@ def _read_pinned_small_file(
     if after != before:
         raise ValueError(f"pinned {label} file changed while validating: {path.name}")
     observed_sha256 = hashlib.sha256(payload).hexdigest()
-    if observed_sha256 != expected_sha256:
-        raise ValueError(
-            f"pinned {label} file changed: {path.name} "
-            f"observed={observed_sha256}, expected={expected_sha256}"
-        )
     return payload, MiaSmallFilePin(
         name=path.name,
         bytes=before[2],
@@ -173,6 +342,7 @@ class MiaShardPin:
     name: str
     bytes: int
     sha256: str
+    canonical_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +379,18 @@ def validate_pinned_mia_artifacts(
         _DRAFT_SMALL_FILE_PINS,
         "K64 DSpark",
     )
+    target_manifest_payload, target_manifest_pin = _read_stable_small_file(
+        target_root / "rank-sliced-tp1-manifest.json",
+        label="Mia target",
+    )
+    target_files["rank-sliced-tp1-manifest.json"] = target_manifest_payload
+    target_small_files = (*target_small_files, target_manifest_pin)
+    draft_plan_payload, draft_plan_pin = _read_stable_small_file(
+        draft_root / "DSPARK_DRAFT_PLAN.json",
+        label="K64 DSpark",
+    )
+    draft_files["DSPARK_DRAFT_PLAN.json"] = draft_plan_payload
+    draft_small_files = (*draft_small_files, draft_plan_pin)
 
     target_config = json.loads(target_files["config.json"])
     target_index = json.loads(target_files["model.safetensors.index.json"])
@@ -237,6 +419,7 @@ def validate_pinned_mia_artifacts(
     if not isinstance(files, list) or len(files) != 48:
         raise ValueError("pinned Mia TP1 manifest must own exactly 48 shards")
     target_shards: list[MiaShardPin] = []
+    target_seals: dict[str, str] = {}
     shard_names: set[str] = set()
     for entry in files:
         if not isinstance(entry, dict):
@@ -254,8 +437,31 @@ def validate_pinned_mia_artifacts(
         expected_sha256 = str(entry.get("sha256", ""))
         if len(expected_sha256) != 64:
             raise ValueError(f"pinned Mia TP1 shard checksum is invalid: {name}")
+        canonical_sha256 = _TARGET_CANONICAL_SHARD_PINS.get(name, "")
+        if len(canonical_sha256) != 64:
+            raise ValueError(
+                f"pinned Mia TP1 canonical shard checksum is invalid: {name}"
+            )
+        target_seals[name] = canonical_sha256
         target_shards.append(
-            MiaShardPin(name, expected_bytes, expected_sha256)
+            MiaShardPin(
+                name,
+                expected_bytes,
+                expected_sha256,
+                canonical_sha256,
+            )
+        )
+    if set(_TARGET_CANONICAL_SHARD_PINS) != shard_names:
+        raise ValueError("pinned Mia TP1 canonical shard set changed")
+    observed_target_seal = _target_artifact_seal_sha256(
+        target_manifest,
+        target_seals,
+    )
+    expected_target_seal = _TARGET_CANONICAL_ARTIFACT_SEAL
+    if observed_target_seal != expected_target_seal:
+        raise ValueError(
+            "pinned Mia TP1 canonical artifact seal changed: "
+            f"observed={observed_target_seal}, expected={expected_target_seal}"
         )
     target_weight_map = target_index.get("weight_map")
     if (
@@ -278,6 +484,14 @@ def validate_pinned_mia_artifacts(
         != int(draft_plan.get("total_size", -1))
     ):
         raise ValueError("pinned K64 DSpark derivation manifest changed")
+    observed_draft_plan_seal = _draft_plan_seal_sha256(draft_plan)
+    expected_draft_plan_seal = _DRAFT_CANONICAL_PLAN_SEAL
+    if observed_draft_plan_seal != expected_draft_plan_seal:
+        raise ValueError(
+            "pinned K64 DSpark canonical plan seal changed: "
+            f"observed={observed_draft_plan_seal}, "
+            f"expected={expected_draft_plan_seal}"
+        )
     weight_map = draft_index.get("weight_map")
     if not isinstance(weight_map, dict) or len(weight_map) != 1249:
         raise ValueError("pinned K64 DSpark weight index changed")
@@ -292,6 +506,8 @@ def validate_pinned_mia_artifacts(
     draft_sha256 = str(draft_plan.get("sha256", {}).get(draft_shard.name, ""))
     if len(draft_sha256) != 64:
         raise ValueError("pinned K64 DSpark shard checksum is invalid")
+    if len(_DRAFT_CANONICAL_SHARD_PIN) != 64:
+        raise ValueError("pinned K64 DSpark canonical shard checksum is invalid")
     return MiaArtifactValidation(
         target_root=target_root,
         draft_root=draft_root,
@@ -301,7 +517,9 @@ def validate_pinned_mia_artifacts(
         },
         target_shards=tuple(target_shards),
         target_small_files=target_small_files,
-        target_small_file_sha256=tuple(sorted(_TARGET_SMALL_FILE_PINS.items())),
+        target_small_file_sha256=tuple(
+            sorted((pin.name, pin.sha256) for pin in target_small_files)
+        ),
         draft_config=dict(draft_config),
         draft_weight_map={
             str(name): str(filename) for name, filename in weight_map.items()
@@ -311,10 +529,13 @@ def validate_pinned_mia_artifacts(
                 draft_shard.name,
                 MIA_DRAFT_SHARD_BYTES,
                 draft_sha256,
+                _DRAFT_CANONICAL_SHARD_PIN,
             ),
         ),
         draft_small_files=draft_small_files,
-        draft_small_file_sha256=tuple(sorted(_DRAFT_SMALL_FILE_PINS.items())),
+        draft_small_file_sha256=tuple(
+            sorted((pin.name, pin.sha256) for pin in draft_small_files)
+        ),
     )
 
 
@@ -815,20 +1036,37 @@ def _install_shared_indexer_resources(
     return rope_table
 
 
-def _artifact_small_file_sha256() -> tuple[tuple[str, str], ...]:
+def _artifact_small_file_sha256(
+    target: dict[str, str],
+    draft: dict[str, str],
+) -> tuple[tuple[str, str], ...]:
     return tuple(
         sorted(
             (
                 *(
                     (f"target/{name}", digest)
-                    for name, digest in _TARGET_SMALL_FILE_PINS.items()
+                    for name, digest in target.items()
                 ),
                 *(
                     (f"draft/{name}", digest)
-                    for name, digest in _DRAFT_SMALL_FILE_PINS.items()
+                    for name, digest in draft.items()
                 ),
             )
         )
+    )
+
+
+def _matches_small_file_receipt(
+    observed: Any,
+    fixed: dict[str, str],
+    semantic_name: str,
+) -> bool:
+    if not isinstance(observed, dict):
+        return False
+    return (
+        set(observed) == {*fixed, semantic_name}
+        and all(observed.get(name) == digest for name, digest in fixed.items())
+        and len(str(observed.get(semantic_name, ""))) == 64
     )
 
 
@@ -840,14 +1078,36 @@ def _mia_engine_identity(
         (
             *(
                 f"{name}:{digest}"
-                for name, digest in _artifact_small_file_sha256()
+                for name, digest in sorted(
+                    (
+                        *(
+                            (f"target/{name}", digest)
+                            for name, digest in _TARGET_SMALL_FILE_PINS.items()
+                        ),
+                        *(
+                            (f"draft/{name}", digest)
+                            for name, digest in _DRAFT_SMALL_FILE_PINS.items()
+                        ),
+                    )
+                )
             ),
+            f"target/rank-sliced-tp1-manifest.json#canonical:"
+            f"{_TARGET_CANONICAL_ARTIFACT_SEAL}",
+            f"draft/DSPARK_DRAFT_PLAN.json#canonical:"
+            f"{_DRAFT_CANONICAL_PLAN_SEAL}",
+            *(
+                f"target-shard/{name}:{digest}"
+                for name, digest in sorted(
+                    _TARGET_CANONICAL_SHARD_PINS.items()
+                )
+            ),
+            f"draft-shard/dspark-draft.safetensors:{_DRAFT_CANONICAL_SHARD_PIN}",
             str(context_capacity_tokens),
             str(max_batch_tokens),
             "stock432",
             "mia132",
             "k5-k64",
-            "bounded-one-shard-sha256-same-fd-loader",
+            "bounded-one-shard-raw-canonical-sha256-same-fd-loader",
             "mhc-post-pre-m384-bm64-bf16mma",
             "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
             "long-prefill-chunk1024",
@@ -1006,14 +1266,20 @@ def build_mia_engine_plan(
     mla_workspace = mia_mla_workspace()
 
     load_receipt = dict(getattr(model, "_mia_target_load_receipt", {}))
+    target_small_file_sha256 = load_receipt.get("small_file_sha256")
     target_parameter_count = sum(
         not name.startswith("mtp.")
         for name, _value in tree_flatten(model.parameters())
     )
     if (
         load_receipt.get("mode") != "bounded_one_shard"
-        or load_receipt.get("artifact_identity") != "sha256_same_fd"
-        or load_receipt.get("small_file_sha256") != _TARGET_SMALL_FILE_PINS
+        or load_receipt.get("artifact_identity")
+        != "raw_canonical_sha256_same_fd"
+        or not _matches_small_file_receipt(
+            target_small_file_sha256,
+            _TARGET_SMALL_FILE_PINS,
+            "rank-sliced-tp1-manifest.json",
+        )
         or int(load_receipt.get("source_shards", 0)) != 48
         or int(load_receipt.get("carried_shards", 0)) != 5
         or int(load_receipt.get("exl3_layer_shards", 0)) != MIA_TARGET_LAYERS
@@ -1022,12 +1288,18 @@ def build_mia_engine_plan(
     ):
         raise ValueError("the Mia target was not installed by the bounded shard loader")
     draft_load_receipt = dict(getattr(model, "_mia_draft_load_receipt", {}))
+    draft_small_file_sha256 = draft_load_receipt.get("small_file_sha256")
     if (
         draft_load_receipt.get("mode") != "single_shard"
-        or draft_load_receipt.get("artifact_identity") != "sha256_same_fd"
+        or draft_load_receipt.get("artifact_identity")
+        != "raw_canonical_sha256_same_fd"
         or int(draft_load_receipt.get("source_shards", 0)) != 1
         or int(draft_load_receipt.get("source_tensors", 0)) != 1_249
-        or draft_load_receipt.get("small_file_sha256") != _DRAFT_SMALL_FILE_PINS
+        or not _matches_small_file_receipt(
+            draft_small_file_sha256,
+            _DRAFT_SMALL_FILE_PINS,
+            "DSPARK_DRAFT_PLAN.json",
+        )
     ):
         raise ValueError("the Mia draft was not installed from its pinned file")
 
@@ -1622,7 +1894,7 @@ def build_mia_engine_plan(
         MiaPrewarmSignature("dspark_k5_bm8", MIA_DSPARK_BLOCK, "decode_verify"),
     )
     installed_routes = (
-        "target_bounded_one_shard_sha256_same_fd_loader",
+        "target_bounded_one_shard_raw_canonical_sha256_same_fd_loader",
         "target_mhc_carried_post_pre_bf16_mma_bm64",
         "compressor_stock432_mia132",
         "compressor_fixed_absolute_state_rings",
@@ -1646,7 +1918,10 @@ def build_mia_engine_plan(
         "dspark_persistent_fixed_ring_arena_128",
         "dflash2_structured_taps_fixed_linear_m6_copyspec_zero_owner",
     )
-    artifact_small_file_sha256 = _artifact_small_file_sha256()
+    artifact_small_file_sha256 = _artifact_small_file_sha256(
+        target_small_file_sha256,
+        draft_small_file_sha256,
+    )
     identity = _mia_engine_identity(context_capacity_tokens, max_batch_tokens)
     return MiaDeepseekV4EnginePlan(
         context_capacity_tokens=context_capacity_tokens,

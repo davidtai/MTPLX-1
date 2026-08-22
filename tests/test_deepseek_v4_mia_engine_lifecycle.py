@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,12 @@ import mtplx.deepseek_v4_exl3 as exl3
 import mtplx.deepseek_v4_mia_engine as mia_engine
 from mtplx.models import deepseek_v4 as target_module
 from mtplx.deepseek_v4_mia_engine import MiaDeepseekV4EnginePlan
+
+
+def _safetensors_bytes(header: dict, payload: bytes) -> bytes:
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    padded = encoded + b" " * (-len(encoded) % 8)
+    return struct.pack("<Q", len(padded)) + padded + payload
 
 
 class _FakeArray:
@@ -532,7 +539,151 @@ def test_verified_safetensors_rejects_in_place_change_during_load(
         )
 
 
-def test_artifact_metadata_preserves_exact_manifest_and_defers_shard_digest(
+def test_verified_safetensors_enforces_canonical_pin_in_existing_single_pass(
+    monkeypatch,
+    tmp_path,
+):
+    original = tmp_path / "original.safetensors"
+    reordered = tmp_path / "reordered.safetensors"
+    changed_header = tmp_path / "changed-header.safetensors"
+    changed_payload = tmp_path / "changed-payload.safetensors"
+    first_header = {
+        "a": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+        "b": {"dtype": "U8", "shape": [1], "data_offsets": [1, 2]},
+    }
+    reordered_header = {
+        "b": {"data_offsets": [1, 2], "shape": [1], "dtype": "U8"},
+        "a": {"shape": [1], "dtype": "U8", "data_offsets": [0, 1]},
+    }
+    original.write_bytes(_safetensors_bytes(first_header, b"AB"))
+    reordered.write_bytes(_safetensors_bytes(reordered_header, b"AB"))
+    changed_header.write_bytes(
+        _safetensors_bytes(
+            {
+                **reordered_header,
+                "b": {
+                    "data_offsets": [0, 1],
+                    "shape": [1],
+                    "dtype": "U8",
+                },
+            },
+            b"AB",
+        )
+    )
+    changed_payload.write_bytes(_safetensors_bytes(reordered_header, b"AC"))
+    canonical_sha256 = (
+        "f291c11aa84a6ca9259cb713843859743223b11d2a4e74c0b8cf97074778c520"
+    )
+    loaded_payloads = []
+
+    def fake_load(stream, *, format):
+        assert format == "safetensors"
+        loaded_payloads.append(stream.read())
+        return {"loaded": True}
+
+    monkeypatch.setattr(exl3.mx, "load", fake_load)
+
+    for path in (original, reordered):
+        payload = path.read_bytes()
+        assert exl3._load_verified_safetensors(
+            path,
+            expected_bytes=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            expected_canonical_sha256=canonical_sha256,
+        ) == {"loaded": True}
+    for path in (changed_header, changed_payload):
+        payload = path.read_bytes()
+        with pytest.raises(ValueError, match="canonical checksum changed"):
+            exl3._load_verified_safetensors(
+                path,
+                expected_bytes=len(payload),
+                expected_sha256=hashlib.sha256(payload).hexdigest(),
+                expected_canonical_sha256=canonical_sha256,
+            )
+
+    assert loaded_payloads == [original.read_bytes(), reordered.read_bytes()]
+
+
+def test_artifact_seals_normalize_only_materialization_paths_and_raw_hashes():
+    shard_seals = {
+        "target.safetensors": "a" * 64,
+    }
+
+    def target_manifest(source: str, raw_sha256: str) -> dict:
+        return {
+            "files": [
+                {
+                    "sha256": raw_sha256,
+                    "bytes": 17,
+                    "name": "target.safetensors",
+                }
+            ],
+            "tensor_count": 3,
+            "source_tp": 4,
+            "format": "rank-sliced-exl3-tp1-v1",
+            "tensor_bytes": 9,
+            "target_tp": 1,
+            "source": source,
+        }
+
+    local = target_manifest(
+        "/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI",
+        "1" * 64,
+    )
+    packaged = target_manifest(
+        "/hf-cache/hub/models--0xSero--deepseek-v4-flash-0731-spark/"
+        "snapshots/22f28d32b9b29b4352eaa380ff8c2c170b2847ab",
+        "2" * 64,
+    )
+
+    assert mia_engine._target_artifact_seal_sha256(
+        local, shard_seals
+    ) == mia_engine._target_artifact_seal_sha256(packaged, shard_seals)
+    relocated = target_manifest("/arbitrary/relocated/source", "3" * 64)
+    assert mia_engine._target_artifact_seal_sha256(
+        local, shard_seals
+    ) == mia_engine._target_artifact_seal_sha256(relocated, shard_seals)
+    changed_target = target_manifest(local["source"], "1" * 64)
+    changed_target["files"][0]["bytes"] = 18
+    assert mia_engine._target_artifact_seal_sha256(
+        local, shard_seals
+    ) != mia_engine._target_artifact_seal_sha256(changed_target, shard_seals)
+    with pytest.raises(ValueError, match="source contract"):
+        mia_engine._target_artifact_seal_sha256(
+            target_manifest("", "1" * 64),
+            shard_seals,
+        )
+
+    plan = {
+        "current_to_new_expert_id": {"6": 0, "7": 1},
+        "draft_experts": 2,
+        "selected_current_expert_ids": [6, 7],
+        "selected_original_expert_ids": [164, 27],
+        "selection_policy": "pinned policy",
+        "sha256": {"draft.safetensors": "1" * 64},
+        "source": "/first/source",
+        "source_experts": 216,
+        "source_plan": "/first/source/REAP_PLAN.json",
+        "structured_categories": ["agentic", "tools"],
+        "structured_per_category": 1,
+        "tensor_count": 3,
+        "total_size": 9,
+    }
+    relocated_plan = dict(reversed(plan.items()))
+    relocated_plan["source"] = "/second/source"
+    relocated_plan["source_plan"] = "/second/source/REAP_PLAN.json"
+    relocated_plan["sha256"] = {"draft.safetensors": "2" * 64}
+    assert mia_engine._draft_plan_seal_sha256(plan) == (
+        mia_engine._draft_plan_seal_sha256(relocated_plan)
+    )
+    changed_plan = dict(plan)
+    changed_plan["selected_original_expert_ids"] = [164, 28]
+    assert mia_engine._draft_plan_seal_sha256(plan) != (
+        mia_engine._draft_plan_seal_sha256(changed_plan)
+    )
+
+
+def test_artifact_metadata_pins_semantic_manifests_and_defers_shard_digest(
     monkeypatch,
     tmp_path,
 ):
@@ -563,6 +714,7 @@ def test_artifact_metadata_preserves_exact_manifest_and_defers_shard_digest(
         },
         "rank-sliced-tp1-manifest.json": {
             "format": "rank-sliced-exl3-tp1-v1",
+            "source": "/relocatable/source",
             "source_tp": 4,
             "target_tp": 1,
             "tensor_count": 117_005,
@@ -609,15 +761,41 @@ def test_artifact_metadata_preserves_exact_manifest_and_defers_shard_digest(
             for name in documents
         }
 
+    target_pins = write_documents(target, target_documents)
+    target_pins.pop("rank-sliced-tp1-manifest.json")
+    target_canonical = {
+        name: hashlib.sha256(f"canonical:{name}".encode()).hexdigest()
+        for name in target_names
+    }
+    monkeypatch.setattr(mia_engine, "_TARGET_SMALL_FILE_PINS", target_pins)
     monkeypatch.setattr(
         mia_engine,
-        "_TARGET_SMALL_FILE_PINS",
-        write_documents(target, target_documents),
+        "_TARGET_CANONICAL_ARTIFACT_SEAL",
+        mia_engine._target_artifact_seal_sha256(
+            target_documents["rank-sliced-tp1-manifest.json"], target_canonical
+        ),
+    )
+    draft_pins = write_documents(draft, draft_documents)
+    draft_pins.pop("DSPARK_DRAFT_PLAN.json")
+    monkeypatch.setattr(
+        mia_engine,
+        "_DRAFT_CANONICAL_PLAN_SEAL",
+        mia_engine._draft_plan_seal_sha256(
+            draft_documents["DSPARK_DRAFT_PLAN.json"]
+        ),
     )
     monkeypatch.setattr(
         mia_engine,
-        "_DRAFT_SMALL_FILE_PINS",
-        write_documents(draft, draft_documents),
+        "_TARGET_CANONICAL_SHARD_PINS",
+        target_canonical,
+        raising=False,
+    )
+    monkeypatch.setattr(mia_engine, "_DRAFT_SMALL_FILE_PINS", draft_pins)
+    monkeypatch.setattr(
+        mia_engine,
+        "_DRAFT_CANONICAL_SHARD_PIN",
+        hashlib.sha256(b"canonical:draft").hexdigest(),
+        raising=False,
     )
     monkeypatch.setattr(mia_engine, "MIA_DRAFT_SHARD_BYTES", 1)
 
@@ -633,9 +811,21 @@ def test_artifact_metadata_preserves_exact_manifest_and_defers_shard_digest(
     assert target_small_files["tokenizer_config.json"] == hashlib.sha256(
         (target / "tokenizer_config.json").read_bytes()
     ).hexdigest()
+    assert target_small_files["rank-sliced-tp1-manifest.json"] == hashlib.sha256(
+        (target / "rank-sliced-tp1-manifest.json").read_bytes()
+    ).hexdigest()
+    assert dict(validation.draft_small_file_sha256)[
+        "DSPARK_DRAFT_PLAN.json"
+    ] == hashlib.sha256((draft / "DSPARK_DRAFT_PLAN.json").read_bytes()).hexdigest()
     assert validation.target_shards[0].sha256 == hashlib.sha256(
         b"not-the-shard"
     ).hexdigest()
+    assert validation.target_shards[0].canonical_sha256 == (
+        target_canonical[validation.target_shards[0].name]
+    )
+    assert validation.draft_shards[0].canonical_sha256 == (
+        hashlib.sha256(b"canonical:draft").hexdigest()
+    )
 
     replacement = tmp_path / "replacement-tokenizer.json"
     replacement.write_bytes((target / "tokenizer.json").read_bytes())
@@ -654,4 +844,42 @@ def test_engine_identity_includes_every_pinned_small_file(monkeypatch):
     changed["tokenizer.json"] = "0" * 64
     monkeypatch.setattr(mia_engine, "_TARGET_SMALL_FILE_PINS", changed)
 
+    assert mia_engine._mia_engine_identity(384_000, 8_224) != original
+
+
+def test_engine_identity_includes_canonical_shard_seals(monkeypatch):
+    target_artifact_seal = mia_engine._TARGET_CANONICAL_ARTIFACT_SEAL
+    monkeypatch.setattr(
+        mia_engine,
+        "_TARGET_CANONICAL_SHARD_PINS",
+        {"target.safetensors": "a" * 64},
+    )
+    monkeypatch.setattr(mia_engine, "_DRAFT_CANONICAL_SHARD_PIN", "b" * 64)
+    original = mia_engine._mia_engine_identity(384_000, 8_224)
+
+    monkeypatch.setattr(
+        mia_engine,
+        "_TARGET_CANONICAL_SHARD_PINS",
+        {"target.safetensors": "c" * 64},
+    )
+    assert mia_engine._mia_engine_identity(384_000, 8_224) != original
+
+    monkeypatch.setattr(
+        mia_engine,
+        "_TARGET_CANONICAL_SHARD_PINS",
+        {"target.safetensors": "a" * 64},
+    )
+    monkeypatch.setattr(mia_engine, "_DRAFT_CANONICAL_SHARD_PIN", "d" * 64)
+    assert mia_engine._mia_engine_identity(384_000, 8_224) != original
+
+    monkeypatch.setattr(mia_engine, "_DRAFT_CANONICAL_SHARD_PIN", "b" * 64)
+    monkeypatch.setattr(mia_engine, "_TARGET_CANONICAL_ARTIFACT_SEAL", "e" * 64)
+    assert mia_engine._mia_engine_identity(384_000, 8_224) != original
+
+    monkeypatch.setattr(
+        mia_engine,
+        "_TARGET_CANONICAL_ARTIFACT_SEAL",
+        target_artifact_seal,
+    )
+    monkeypatch.setattr(mia_engine, "_DRAFT_CANONICAL_PLAN_SEAL", "f" * 64)
     assert mia_engine._mia_engine_identity(384_000, 8_224) != original

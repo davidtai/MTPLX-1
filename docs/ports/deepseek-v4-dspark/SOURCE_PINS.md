@@ -57,9 +57,20 @@ context ring.
 - TP1 rank-sliced directory: `/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-tp1`
 - TP1 `config.json` SHA-256: `39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90`
 - TP1 `model.safetensors.index.json` SHA-256: `b7a450f88c99aee7f6d44ecb127e91e45ab5ccb1a0dad49ca9eabb90b400c304`
-- TP1 rank-slice manifest SHA-256: `cee5b97698e16433f88e7ca23ab529acaa13628ae4af3ea18590ba4060c1203e`
+- TP1 canonical artifact seal: `c05e8ecb1d387cc351d9c5733689343ccca9d92c2be663954ce154bd43befd7d`.
+  It pins the normalized manifest, the exact Mia/Sero source revision and small
+  files, and the canonical safetensors header plus payload of every one of the
+  48 target shards. Raw manifest and shard SHA-256 values remain truthful load
+  receipts, but are not artifact identity: the pinned Mia image and a current
+  local PyTorch materialization can emit byte-different safetensors JSON object
+  order for the same tensor metadata and payload.
 - Separately derived K64 DSpark directory: `/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-dspark-k64`
 - K64 draft weight index SHA-256: `c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3`
+- K64 draft plan SHA-256: `d7a45cc065363ec79516593d8910d0be36e6e589d093ad6ab4a3603dbf92b426`
+- K64 canonical draft-plan seal: `b371a65a0f452040109648551eb362bebfa802a15d92659a4cf0b90f23a57cd9`.
+  The relocatable plan seal excludes only source path spelling and raw shard
+  receipt hashes; the draft shard's canonical header-plus-payload SHA-256 is
+  `5d510d98e9a744aa78724b54250c8f55e319fc4ab8d44db8b68aafc1cbfe6b15`.
 - DSpark: block size 5, Markov rank 256, noise token 128799, target taps 40/41/42, stage namespaces 0/1/2.
 - Persistent target and draft K/V use Mia-compatible 432-byte `stock432`
   NVFP4 records. Ratio-4 indexer records use Mia's 132-byte E4M3 plus FP32
