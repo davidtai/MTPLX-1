@@ -155,11 +155,12 @@ created.  The enabled callables do not probe eligibility or fall back.
   the learned sink.  The selected generic decode geometry is H16, 288 block
   threads, 256 math threads, and one context split for physical M1/M6 and
   DSpark K5.  The 432-byte record stores
-  all 512 compressed latent
-  values in bytes `[0,256)`, their 32 E4M3 group scales in `[256,288)`, zero
+  all 512 post-RoPE compressed latent values in bytes `[0,256)`, their 32 E4M3
+  group scales in `[256,288)`, zero
   padding in `[288,304)`, and a separate 64-value BF16 RoPE tail in
-  `[304,432)`; the RoPE tail never replaces the final 64 latent values used by
-  P.V.  Attention scaling is applied to the completed FP32 QK dot, not to each
+  `[304,432)`; that BF16 field duplicates the rotated tail while P.V uses its
+  NVFP4-quantized copy from the full post-RoPE row.  Attention scaling is
+  applied to the completed FP32 QK dot, not to each
   BF16 query element.  The mounted patched CUDA prefill source requests
   H32/tile64/384 threads; MTPLX's H16/tile32/256-thread Metal prefill mapping is
   the bounded substitute documented above, not exact source topology.
@@ -202,11 +203,12 @@ created.  The enabled callables do not probe eligibility or fall back.
   1024-wide Q-rank prefix and 512-wide KV suffix without materializing either
   slice.  Post-`wq_b`, every 512-wide head is RMS-normalized in FP32; only its
   final 64 values receive interleaved RoPE in FP32, and the completed Q crosses
-  one BF16 boundary.  For K/V, the learned-normalized latent crosses BF16 and
-  remains unrotated for all 512 NVFP4 values: it is the reconstructed V and its
-  first 448 values are K-NoPE.  A separate FP32 RoPE operation rotates only the
-  latent tail64 and stores that BF16 result in bytes `[304,432)` for K.  Bytes
-  `[288,304)` remain zero.  The CUDA launch uses the full per-slot grid when
+  one BF16 boundary.  For K/V, RoPE is applied to the final 64 values of the
+  learned-normalized latent in FP32, the complete post-RoPE 512-wide row crosses
+  one BF16 boundary, and all 512 values are NVFP4-quantized for V.  Its first
+  448 values are also K-NoPE, while the same rotated BF16 tail is duplicated in
+  bytes `[304,432)` for K.  Bytes `[288,304)` remain zero.  The CUDA launch uses
+  the full per-slot grid when
   `M < 1024` and the reduced one-CTA-per-row grid when `M >= 1024`; bounded
   DFlash chunks are at most 1024, so exactly M1024 selects the reduced route.
 - **MTPLX implementation:**
@@ -292,10 +294,10 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Arithmetic and layout:** FP32 projection outputs and gate logits are folded
   with per-dimension window softmax; ratio-4 includes the preceding half-window
   and ratio-128 does not.  Pooling, RMSNorm, and compressor RoPE remain FP32.
-  The learned-normalized latent crosses one BF16 boundary before direct record
-  quantization: stock432 packs that unrotated 512-wide value row as E2M1/E4M3,
-  while only its tail64 is separately rotated and stored as the BF16 K-RoPE
-  tail.  The indexer copy retains its separately documented post-RoPE Mia132
+  The complete post-RoPE latent crosses one BF16 boundary before direct record
+  quantization: stock432 packs all 512 rotated-row values as E2M1/E4M3 and
+  duplicates its rotated tail64 as the BF16 K-RoPE field.  The indexer copy
+  retains its separately documented post-RoPE Mia132
   E4M3 contract.  Full and incremental paths preserve the same completed-window
   frontier.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_compressor.py`,

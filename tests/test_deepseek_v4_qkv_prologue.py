@@ -175,8 +175,13 @@ def test_prologue_sources_pin_source_order_and_stock432_bytes() -> None:
     assert "float rotated = normalized;" in source
     assert "q_out[q_offset + dim] = T(rotated);" in source
     assert "mtplx_bf16_roundtrip(normalized)" not in source
-    assert "rope_elements[i] = mtplx_bf16_roundtrip(rotated);" in source
-    assert "\n            elements[i] = mtplx_bf16_roundtrip(rotated);" not in source
+    for record_source in (source, prefill["source"]):
+        rotated_store = record_source.index(
+            "elements[i] = mtplx_bf16_roundtrip(rotated);"
+        )
+        rope_copy = record_source.index("rope_elements[i] = elements[i];")
+        quantization = record_source.index("float group_max = 0.0f;")
+        assert rotated_store < rope_copy < quantization
     assert "record[256u + lane] = scale_byte;" in source
     assert "record[304u + rope_byte]" in source
     assert "record[288u + lane] = uchar(0);" in source
@@ -188,11 +193,12 @@ def test_prologue_sources_pin_source_order_and_stock432_bytes() -> None:
     assert context["ensure_row_contiguous"] is False
     assert context["input_names"] == ["kv_norm", "rope_cos", "rope_sin", "rows"]
     assert "q_out" not in context["source"]
-    assert "rope_elements[i] = mtplx_bf16_roundtrip(rotated);" in context["source"]
-    assert (
-        "\n        elements[i] = mtplx_bf16_roundtrip(rotated);"
-        not in context["source"]
+    context_rotated_store = context["source"].index(
+        "elements[i] = mtplx_bf16_roundtrip(rotated);"
     )
+    context_rope_copy = context["source"].index("rope_elements[i] = elements[i];")
+    context_quantization = context["source"].index("float group_max = 0.0f;")
+    assert context_rotated_store < context_rope_copy < context_quantization
     assert "threadgroup_position_in_grid.x * 8u" in context["source"]
 
     dimensions = np.arange(512, dtype=np.float32)
@@ -210,10 +216,10 @@ def test_prologue_sources_pin_source_order_and_stock432_bytes() -> None:
     rotated[-64::2] = tail[:, 0] * cosine - tail[:, 1] * sine
     rotated[-63::2] = tail[:, 0] * sine + tail[:, 1] * cosine
     source_boundary = _bf16_roundtrip(rotated)
-    expected = _pack_stock432(kv[None], source_boundary[-64:][None])[0]
-    rotated_value = _pack_stock432(
+    expected = _pack_stock432(
         source_boundary[None], source_boundary[-64:][None]
     )[0]
+    unrotated_value = _pack_stock432(kv[None], source_boundary[-64:][None])[0]
 
     q = _bf16_roundtrip(
         np.cos(dimensions * np.float32(0.113)) * np.float32(2.1)
@@ -242,10 +248,9 @@ def test_prologue_sources_pin_source_order_and_stock432_bytes() -> None:
         .astype(np.uint16)
         .view(np.uint8),
     )
-    np.testing.assert_array_equal(
-        expected[:288], _pack_stock432(kv[None], kv[-64:][None])[0, :288]
-    )
-    assert not np.array_equal(expected[:256], rotated_value[:256])
+    np.testing.assert_array_equal(expected[:224], unrotated_value[:224])
+    np.testing.assert_array_equal(expected[256:284], unrotated_value[256:284])
+    assert not np.array_equal(expected[224:256], unrotated_value[224:256])
     assert not np.array_equal(q_exact[-64:], q_early[-64:])
 
 

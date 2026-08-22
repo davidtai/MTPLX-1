@@ -11,8 +11,8 @@
 storage ownership is superseded by the reusable system plan in
 `docs/plans/2026-08-21-system-paged-cache.md`. Target and DSpark
 produce normalized latent plus a rotated tail; the writer NVFP4-quantizes the
-unmodified 512-wide latent V row and stores the rotated tail separately as BF16
-for K. Construction-installed
+complete BF16-rounded post-RoPE 512-wide V row and duplicates the rotated tail
+as BF16 for K. Construction-installed
 Metal consumers read selected records directly without whole-cache
 dequantization or whole-context scores. Decode uses the measured one-head
 online-softmax kernel. Prefill uses the existing M5 NAX tensor primitive with
@@ -84,7 +84,7 @@ gates above pass.
   kernels, oracle decode, and appendable row owner.
 - Create `mtplx/kernels/deepseek_v4_nvfp4_mla.py`: direct record-consuming sparse
   online-softmax attention for target and fixed-window DSpark inputs.
-- Modify `mtplx/models/deepseek_v4.py`: raw-latent/separate-RoPE target arithmetic,
+- Modify `mtplx/models/deepseek_v4.py`: full post-RoPE target arithmetic,
   NVFP4 cache owner, selected-index route, and construction binding.
 - Modify `mtplx/models/deepseek_v4_dspark.py`: three NVFP4 rings and distinct K/V.
 - Modify `mtplx/deepseek_v4_dflash2.py`: construction checks and bounded prefill.
@@ -111,19 +111,20 @@ fused sparse consumption.
 - [x] **Step 1: Write the failing record contract check**
 
 ```python
-def test_mia_stock432_record_keeps_unrotated_value_and_separate_rope_key():
+def test_mia_stock432_record_quantizes_full_post_rope_value_and_duplicates_key_tail():
     latent = fixed_bf16_rows(shape=(1, 2, 512))
     rope = fixed_bf16_rows(shape=(1, 2, 64))
     rows = MiaNVFP4Rows()
     rows.append(latent, rope)
     key, value = rows.decode()
+    post_rope = concatenate([latent[..., :448], rope], axis=-1)
     assert rows.records.shape == (1, 2, 432)
     assert rows.records.dtype == mx.uint8
     assert mx.array_equal(rows.records[..., 288:304], mx.zeros((1, 2, 16), mx.uint8))
     assert bytes(rows.records[0, 0, 304:432]) == bf16_bytes(rope[0, 0])
     assert_allclose(key[..., :448], value[..., :448])
     assert_allclose(key[..., 448:], rope)
-    assert_allclose(value[..., 448:], decode_nvfp4(latent)[..., 448:])
+    assert_allclose(value[..., 448:], decode_nvfp4(post_rope)[..., 448:])
 ```
 
 - [x] **Step 2: Verify RED**
@@ -157,9 +158,10 @@ class MiaNVFP4Rows:
     def decode(self, start: int = 0, stop: int | None = None) -> tuple[mx.array, mx.array]: ...
 ```
 
-The Metal pack kernel calculates one group-16 scale from `amax / 6`, encodes it
-as finite E4M3, uses that decoded scale for nearest/saturating E2M1 packing, writes
-zero padding, and copies the supplied rotated tail as BF16 bytes.  The decoder
+The Metal pack kernel substitutes the rotated tail into the complete row,
+crosses the BF16 boundary, calculates each group-16 scale from `amax / 6`,
+encodes it as finite E4M3, uses that decoded scale for nearest/saturating E2M1
+packing, writes zero padding, and duplicates the rotated tail as BF16 bytes. The decoder
 uses the fixed E2M1 table and E4M3 bit decoder already established by
 `mtplx.compressed_tensors`.
 
@@ -219,9 +221,9 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
     def attention_compressed_records(self): ...
 ```
 
-Split attention projection into `(latent, rotated_rope)`, split compressor output
-at the normalized pooled latent boundary, pack the unmodified latent row for the
-bring-up path, and retain the source model's output inverse RoPE. Bind `DeepseekV4NVFP4Cache` and
+Split attention projection into `(latent, rotated_rope)`, form and BF16-roundtrip
+the complete post-RoPE row before NVFP4 packing, and retain the source model's
+output inverse RoPE. Bind `DeepseekV4NVFP4Cache` and
 the three NVFP4 draft rings once at exact-artifact construction.  DFlash2 rejects
 any non-`stock432` owner before generation.
 

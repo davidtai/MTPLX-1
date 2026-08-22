@@ -202,7 +202,8 @@ _QKV_RECORD_BODY = r"""
                 float rotated = (local & 1u) == 0u
                     ? even * c - odd * s
                     : even * s + odd * c;
-                rope_elements[i] = mtplx_bf16_roundtrip(rotated);
+                elements[i] = mtplx_bf16_roundtrip(rotated);
+                rope_elements[i] = elements[i];
             }
         }
 
@@ -315,7 +316,8 @@ _KV_RECORD_SOURCE = r"""
             float rotated = (local & 1u) == 0u
                 ? even * c - odd * s
                 : even * s + odd * c;
-            rope_elements[i] = mtplx_bf16_roundtrip(rotated);
+            elements[i] = mtplx_bf16_roundtrip(rotated);
+            rope_elements[i] = elements[i];
         }
     }
 

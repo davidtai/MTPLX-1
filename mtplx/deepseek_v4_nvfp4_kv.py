@@ -108,7 +108,9 @@ def _stock432_pack_kernel():
         float amax = 0.0f;
         for (uint i = 0u; i < 16u; ++i) {
             uint dim = group_dim + i;
-            float value = float(latent_row[dim]);
+            float value = dim < 448u
+                ? float(latent_row[dim])
+                : float(rope_row[dim - 448u]);
             amax = max(amax, abs(value));
         }
         uchar scale_byte = mtplx_e4m3_encode_positive(amax / 6.0f);
@@ -116,8 +118,12 @@ def _stock432_pack_kernel():
         float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
         for (uint packed = 0u; packed < 8u; ++packed) {
             uint dim0 = group_dim + packed * 2u;
-            float low_value = float(latent_row[dim0]);
-            float high_value = float(latent_row[dim0 + 1u]);
+            float low_value = dim0 < 448u
+                ? float(latent_row[dim0])
+                : float(rope_row[dim0 - 448u]);
+            float high_value = dim0 + 1u < 448u
+                ? float(latent_row[dim0 + 1u])
+                : float(rope_row[dim0 + 1u - 448u]);
             uchar low = mtplx_e2m1_encode(low_value * inv_scale);
             uchar high = mtplx_e2m1_encode(high_value * inv_scale);
             record[group * 8u + packed] = uchar(low | uchar(high << 4));

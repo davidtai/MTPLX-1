@@ -67,6 +67,10 @@ def _rope(rows: int = 2) -> mx.array:
     return values.reshape(1, rows, 64).astype(mx.bfloat16)
 
 
+def _post_rope_row(latent: mx.array, rope: mx.array) -> mx.array:
+    return mx.concatenate((latent[..., :448], rope), axis=-1)
+
+
 def _as_numpy(value: mx.array) -> np.ndarray:
     mx.eval(value)
     return np.array(value.astype(mx.float32))
@@ -182,12 +186,13 @@ def test_installed_mla_launchers_use_only_the_prebound_kernel() -> None:
     assert "query_positions=query_positions" in installer_source
 
 
-def test_mia_stock432_record_keeps_value_latent_and_key_rope_distinct() -> None:
+def test_mia_stock432_record_uses_the_post_rope_row_for_key_and_value() -> None:
     if not mx.metal.is_available():
         pytest.skip("requires Metal NVFP4 record packer")
 
     latent = _exact_latent()
     rope = -latent[..., 448:]
+    post_rope = _post_rope_row(latent, rope)
     rows = MiaNVFP4Rows()
     rows.append(latent[:, :1], rope[:, :1])
     rows.append(latent[:, 1:], rope[:, 1:])
@@ -206,17 +211,8 @@ def test_mia_stock432_record_keeps_value_latent_and_key_rope_distinct() -> None:
         np.full((1, 2, 32), 0x38, dtype=np.uint8),
     )
     assert int(rows.records[0, 0, 0].item()) == 0x10
-    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(latent))
-    np.testing.assert_array_equal(_as_numpy(key[..., :448]), _as_numpy(latent[..., :448]))
-    np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))
-    np.testing.assert_array_equal(
-        _as_numpy(value[..., 448:]),
-        _as_numpy(latent[..., 448:]),
-    )
-    assert not np.array_equal(
-        _as_numpy(value[..., 448:]),
-        _as_numpy(key[..., 448:]),
-    )
+    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(post_rope))
+    np.testing.assert_array_equal(_as_numpy(key), _as_numpy(post_rope))
 
 
 def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> None:
@@ -227,6 +223,7 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     rows.append(_exact_latent(4), _rope(4))
     replacement = -_exact_latent(1)
     replacement_rope = -replacement[..., 448:]
+    expected = _post_rope_row(replacement, replacement_rope)
     rows.replace(1, replacement, replacement_rope)
     saved = rows.state
 
@@ -236,7 +233,7 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     key, value = rows.decode()
     np.testing.assert_array_equal(
         _as_numpy(value[:, :1]),
-        _as_numpy(replacement),
+        _as_numpy(expected),
     )
     np.testing.assert_array_equal(_as_numpy(key[:, :1, 448:]), _as_numpy(replacement_rope))
 
@@ -245,7 +242,7 @@ def test_mia_stock432_owner_replaces_truncates_and_restores_whole_records() -> N
     restored_key, restored_value = rows.decode(1, 2)
     np.testing.assert_array_equal(
         _as_numpy(restored_value),
-        _as_numpy(replacement),
+        _as_numpy(expected),
     )
     np.testing.assert_array_equal(
         _as_numpy(restored_key[..., 448:]),
@@ -270,18 +267,19 @@ def test_paged_mia_stock432_owner_keeps_fixed_pages_across_writes() -> None:
 
     replacement = -_exact_latent(1)
     replacement_rope = -replacement[..., 448:]
+    expected = _post_rope_row(replacement, replacement_rope)
     rows.replace(1, replacement, replacement_rope)
     rows.truncate(4)
     _key, value = rows.decode()
     np.testing.assert_array_equal(
         _as_numpy(value[:, 1:2]),
-        _as_numpy(replacement),
+        _as_numpy(expected),
     )
     with pytest.raises(ValueError, match="capacity exceeded"):
         rows.append(_exact_latent(5), _rope(5))
 
 
-def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
+def test_target_cache_owns_the_source_exact_post_rope_key_and_value_row() -> None:
     if not mx.metal.is_available():
         pytest.skip("requires Metal NVFP4 record packer")
 
@@ -292,6 +290,7 @@ def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
     )
     latent = _exact_latent(3)
     rope = -latent[..., 448:]
+    post_rope = _post_rope_row(latent, rope)
 
     records, start = cache.update_window(latent, rope)
     key, value = cache.window.decode()
@@ -301,13 +300,8 @@ def test_target_cache_owns_distinct_mia_key_and_value_rows() -> None:
     assert cache.window.mode == "nvfp4_stock432"
     assert cache.window.shape == (1, 3, 432)
     assert records.shape == (1, 3, 432)
-    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(latent))
-    np.testing.assert_array_equal(_as_numpy(key[..., :448]), _as_numpy(latent[..., :448]))
-    np.testing.assert_array_equal(_as_numpy(key[..., 448:]), _as_numpy(rope))
-    assert not np.array_equal(
-        _as_numpy(value[..., 448:]),
-        _as_numpy(key[..., 448:]),
-    )
+    np.testing.assert_array_equal(_as_numpy(value), _as_numpy(post_rope))
+    np.testing.assert_array_equal(_as_numpy(key), _as_numpy(post_rope))
 
 
 def test_target_compressed_cache_uses_fixed_stock432_pages() -> None:

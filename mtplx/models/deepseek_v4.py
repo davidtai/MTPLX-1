@@ -5015,7 +5015,7 @@ class DeepseekV4Attention(nn.Module):
         self,
         workspace: MiaMLAWorkspace | None = None,
     ) -> None:
-        """Bind exact Mia K/V construction and raw-V output at model install."""
+        """Bind exact Mia K/V construction and post-RoPE V output at install."""
         if self.head_dim != 512 or self.rope_head_dim != 64:
             raise ValueError(
                 "Mia stock432 attention requires head_dim=512 and rope_head_dim=64"
