@@ -292,6 +292,7 @@ def test_draft_adapter_advertises_m6_but_projects_three_dspark_taps() -> None:
     assert draft.capabilities.supports_copyspec is False
     assert draft.capabilities.supports_ddtree is False
     assert draft.capabilities.supports_early_rollback_launch is False
+    assert draft.capabilities.fixed_physical_block is True
     assert projected is target_taps
     assert tuple(latent.shape) == (1, 2, 512)
     assert owner.projected_rows is not None
@@ -585,8 +586,9 @@ def test_generation_adapter_translates_existing_dflash_events_without_scheduling
     assert stats.mode == "dspark"
     assert stats.generated_tokens == 2
     assert stats.accepted_drafts == 1
-    assert stats.drafted_tokens == 1
-    assert stats.rejected_drafts == 0
+    assert stats.drafted_tokens == 5
+    assert stats.rejected_drafts == 4
+    assert stats.drafted_by_depth == [1, 1, 1, 1, 1]
     assert stats.verify_calls == 1
     assert stats.speculative_depth == 5
     assert stats.decode_elapsed_s == pytest.approx(0.009)
@@ -650,22 +652,22 @@ def test_generation_adapter_stops_at_first_stop_token_and_suppresses_suffix(
     assert output.finish_reason == "stop"
 
 
-def test_generation_adapter_accounts_for_each_physical_tail_width(monkeypatch) -> None:
+def test_generation_adapter_accounts_for_fixed_m6_terminal_cycles(monkeypatch) -> None:
     from dflash_mlx.engine.events import SummaryEvent
     import mtplx.deepseek_v4_dflash2 as adapter_module
 
     summary = SummaryEvent(
         elapsed_us=10_000.0,
         prompt_token_count=3,
-        generated_token_ids=tuple(range(7)),
-        generation_tokens=7,
-        accepted_from_draft=4,
-        acceptance_ratio=4 / 7,
-        cycles_completed=3,
+        generated_token_ids=tuple(range(6)),
+        generation_tokens=6,
+        accepted_from_draft=2,
+        acceptance_ratio=2 / 6,
+        cycles_completed=4,
         phase_timings_us={"prefill": 1_000.0},
         block_tokens=6,
         verify_len_cap=6,
-        acceptance_history=(2, 2, 0),
+        acceptance_history=(0, 1, 0, 1),
     )
     monkeypatch.setattr(
         adapter_module,
@@ -679,10 +681,10 @@ def test_generation_adapter_accounts_for_each_physical_tail_width(monkeypatch) -
     output = generate_deepseek_v4_dflash2(
         bundle,
         [1, 2, 3],
-        max_tokens=7,
+        max_tokens=6,
         runtime_context=context,
     )
 
-    assert output.stats.drafted_tokens == 8
-    assert output.stats.rejected_drafts == 4
-    assert output.stats.drafted_by_depth == [2, 2, 2, 1, 1]
+    assert output.stats.drafted_tokens == 20
+    assert output.stats.rejected_drafts == 18
+    assert output.stats.drafted_by_depth == [4, 4, 4, 4, 4]

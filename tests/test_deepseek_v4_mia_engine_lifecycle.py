@@ -847,6 +847,12 @@ def test_engine_identity_includes_every_pinned_small_file(monkeypatch):
     assert mia_engine._mia_engine_identity(384_000, 8_224) != original
 
 
+def test_engine_identity_uses_the_installed_dflash_source_pin():
+    from mtplx.dflash_identity import PINNED_DFLASH_COMMIT
+
+    assert mia_engine.MIA_DFLASH_COMMIT == PINNED_DFLASH_COMMIT
+
+
 def test_engine_identity_includes_canonical_shard_seals(monkeypatch):
     target_artifact_seal = mia_engine._TARGET_CANONICAL_ARTIFACT_SEAL
     monkeypatch.setattr(

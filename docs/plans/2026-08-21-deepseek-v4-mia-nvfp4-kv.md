@@ -377,9 +377,9 @@ and subsequent whole-branch review findings are closed.
 
 **Files:**
 - Modify: `scripts/deepseek_v4_dspark_k5_bench.py`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-db155912-1024x1024.json`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-db155912-16384x1024-cold.json`
-- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-db155912-65536x1024-cold.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-144d8193-1024x1024.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-144d8193-16384x1024-cold.json`
+- Create: `bench/deepseek-v4-mia/mia-k216-k64-nvfp4-144d8193-65536x1024-cold.json`
 
 **Security flag:** `none`
 

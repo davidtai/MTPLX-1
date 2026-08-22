@@ -433,6 +433,7 @@ class DeepseekV4DSparkDraftAdapter:
             supports_copyspec=False,
             supports_ddtree=False,
             supports_early_rollback_launch=False,
+            fixed_physical_block=True,
         )
 
     def bind_target_model(self, target_model: Any, *, target_ops: Any) -> None:
@@ -720,18 +721,8 @@ def generate_deepseek_v4_dflash2(
         for depth in range(1, _PHYSICAL_VERIFY_WIDTH)
     ]
     accepted = int(summary.accepted_from_draft)
-    generated_before_cycle = 0
-    drafted_per_cycle = []
-    for acceptance_len in acceptance_history:
-        remaining = max(0, int(max_tokens) - generated_before_cycle)
-        verify_width = min(_PHYSICAL_VERIFY_WIDTH, remaining)
-        drafted_per_cycle.append(max(0, verify_width - 1))
-        generated_before_cycle += min(remaining, 1 + acceptance_len)
-    drafted = sum(drafted_per_cycle)
-    drafted_by_depth = [
-        sum(1 for draft_count in drafted_per_cycle if draft_count >= depth)
-        for depth in range(1, _PHYSICAL_VERIFY_WIDTH)
-    ]
+    drafted = cycles * (_PHYSICAL_VERIFY_WIDTH - 1)
+    drafted_by_depth = [cycles] * (_PHYSICAL_VERIFY_WIDTH - 1)
     generated = len(tokens)
     stats = GenerationStats(
         mode="dspark",

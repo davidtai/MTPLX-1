@@ -10,7 +10,7 @@ import json
 DFLASH_DISTRIBUTION = "dflash-mlx"
 PINNED_DFLASH_VCS = "git"
 PINNED_DFLASH_URL = "https://github.com/davidtai/dflash-mlx.git"
-PINNED_DFLASH_COMMIT = "db155912c007f67315cdbf769d479e2e65379f25"
+PINNED_DFLASH_COMMIT = "144d8193a781a9ffea2fdfb22a137825e107c892"
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,10 +11,10 @@ import pytest
 DFLASH_MLX_PIN = (
     "dflash-mlx @ "
     "git+https://github.com/davidtai/dflash-mlx.git@"
-    "db155912c007f67315cdbf769d479e2e65379f25"
+    "144d8193a781a9ffea2fdfb22a137825e107c892"
 )
 DFLASH_MLX_URL = "https://github.com/davidtai/dflash-mlx.git"
-DFLASH_MLX_REVISION = "db155912c007f67315cdbf769d479e2e65379f25"
+DFLASH_MLX_REVISION = "144d8193a781a9ffea2fdfb22a137825e107c892"
 
 
 def test_competitor_extra_pins_immutable_dflash_mlx_source():
