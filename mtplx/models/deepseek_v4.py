@@ -3601,6 +3601,12 @@ class FixedMiaCompressorState(CompressorState):
     ) -> tuple[mx.array, mx.array]:
         offset = int(offset)
         count = int(kv.shape[1])
+        prior = offset % self.ratio
+        if prior:
+            # ``cur_*`` is the settled frontier retained by the preceding step.
+            # Keep the current rows as direct graph inputs so a boundary emit
+            # never reads back the same journal slots this call is scattering.
+            prior_kv, prior_score = self.cur_kv, self.cur_score
         retained = min(count, self.rollback_rows)
         source_start = count - retained
         absolute_start = offset + source_start
@@ -3613,10 +3619,12 @@ class FixedMiaCompressorState(CompressorState):
         self._journal_end = offset + count
         self._journal_length = min(self.rollback_rows, self._journal_end)
 
-        prior = offset % self.ratio
         if prior == 0:
             return kv, score
-        return self._latest(prior + count)
+        return (
+            mx.concatenate((prior_kv, kv), axis=1),
+            mx.concatenate((prior_score, score), axis=1),
+        )
 
     def rollback(self, n: int, new_offset: int) -> None:
         del n

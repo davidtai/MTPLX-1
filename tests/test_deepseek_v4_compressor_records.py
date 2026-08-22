@@ -19,6 +19,7 @@ from mtplx.models import deepseek_v4 as target_module  # noqa: E402
 from mtplx.models.deepseek_v4 import (  # noqa: E402
     Compressor,
     CompressorState,
+    FixedMiaCompressorState,
     MiaRoPETableProvider,
     ModelArgs,
 )
@@ -912,3 +913,35 @@ def test_full_and_incremental_completed_windows_emit_the_same_source_records(
 
     np.testing.assert_array_equal(np.array(incremental), np.array(whole))
     assert whole.shape == (1, 3, 432 if mode == "stock432" else 132)
+
+
+def test_fixed_compressor_uses_retained_frontier_without_journal_readback() -> None:
+    class TracedFixedState(FixedMiaCompressorState):
+        def __init__(self) -> None:
+            super().__init__(
+                ratio=128,
+                overlap=False,
+                rollback_capacity=8,
+                state_width=512,
+            )
+            self.latest_calls: list[tuple[int, int]] = []
+
+        def _latest(self, count: int) -> tuple[mx.array, mx.array]:
+            self.latest_calls.append((int(count), self._journal_end))
+            return super()._latest(count)
+
+    compressor = _make_compressor(512, "stock432", 128)
+    inputs = mx.array(
+        np.random.default_rng(128).normal(0.0, 0.4, (1, 128, 8)).astype(
+            np.float32
+        )
+    )
+    expected = compressor.mia_records(inputs)
+    state = TracedFixedState()
+    before_boundary = compressor.step_records(inputs[:, :127], state, 0)
+    actual = compressor.step_records(inputs[:, 127:], state, 127)
+    mx.eval(expected, before_boundary, actual)
+
+    assert state.latest_calls == []
+    assert before_boundary.shape == (1, 0, 432)
+    np.testing.assert_array_equal(np.array(actual), np.array(expected))
