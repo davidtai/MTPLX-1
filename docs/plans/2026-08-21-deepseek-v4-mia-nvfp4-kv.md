@@ -412,7 +412,7 @@ prefill tok/s, decode tok/s, generated count, acceptance, MLX peak/active memory
 process peak RSS, output digest, source commit, artifact revisions, and
 `stock432` identity.
 
-- [ ] **Step 5: Correct and publish upstream PR #312**
+- [x] **Step 5: Correct and publish upstream PR #312**
 
 Remove superseded affine/wrong-model claims, include only exact-model NVFP4
 evidence, push the implementation and receipts to its existing feature head,
@@ -421,7 +421,7 @@ it ready only after every required gate succeeds. The PR head is
 `davidtai/MTPLX-1:feat/deepseek-v4-dspark-k5`, so push through the `mtplx1`
 remote rather than `origin`.
 
-- [ ] **Step 6: Final verification**
+- [x] **Step 6: Final verification**
 
 Run `git diff --check`, focused ruff, the directly relevant suite, inspect the
 three receipts, confirm the branch/remote SHA, and verify the original Qwen
