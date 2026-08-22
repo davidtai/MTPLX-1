@@ -42,7 +42,7 @@ MIA_ROPE_DIM = 64
 MIA_HIDDEN = 4096
 MIA_HC = 4
 MIA_DRAFT_SHARD_BYTES = 3_157_508_012
-MIA_DFLASH_COMMIT = "144d8193a781a9ffea2fdfb22a137825e107c892"
+MIA_DFLASH_COMMIT = "b5638db3794327dadba33c9f3aaa4c2610b28b0c"
 MIA_TARGET_REVISION = "22f28d32b9b29b4352eaa380ff8c2c170b2847ab"
 MIA_SOURCE_CONFIG_SHA256 = "b001ec8308044aa11daa0e624f5aea5e5362a63c05879a83a7be046b00eada82"
 MIA_SOURCE_INDEX_SHA256 = "61af5c0782a8651ef893004e84369d2281a0fc316c8bcefc0bd8f76244224649"
@@ -693,7 +693,8 @@ class MiaTargetCacheArena:
             for cache in self._caches
         ):
             raise ValueError("Mia target record writers lost their cache owners")
-        journal_buffers = []
+        prefill_settlement_roots = [cache.window._pages for cache in self._caches]
+        prefill_frontier_lanes = []
         for layer, cache in zip(layers, self._caches, strict=True):
             ratio = int(layer.attn.compress_ratio)
             if ratio == 0:
@@ -716,7 +717,9 @@ class MiaTargetCacheArena:
                 raise ValueError(
                     "Mia target cache arena did not install fixed compressor pages"
                 )
-            journal_buffers.extend(cache.comp.journal_buffers)
+            prefill_settlement_roots.append(cache.compressed.pages)
+            prefill_settlement_roots.extend(cache.comp.journal_buffers)
+            prefill_frontier_lanes.append(cache.comp)
             if ratio == 4:
                 if (
                     getattr(cache.index_comp, "mode", None)
@@ -732,8 +735,14 @@ class MiaTargetCacheArena:
                     raise ValueError(
                         "Mia target cache arena did not install fixed indexer state"
                     )
-                journal_buffers.extend(cache.index_comp.journal_buffers)
-        mx.eval(*journal_buffers)
+                prefill_settlement_roots.append(cache.index_compressed.pages)
+                prefill_settlement_roots.extend(cache.index_comp.journal_buffers)
+                prefill_frontier_lanes.append(cache.index_comp)
+        self._prefill_settlement_roots = tuple(prefill_settlement_roots)
+        self._prefill_frontier_lanes = tuple(prefill_frontier_lanes)
+        self._eval_prefill_roots = mx.eval
+        self._schedule_verify_roots = mx.async_eval
+        mx.eval(*self._prefill_settlement_roots)
         self._leased = False
 
     @property
@@ -747,6 +756,46 @@ class MiaTargetCacheArena:
     def _reset(self) -> None:
         for cache in self._caches:
             cache.state = None
+
+    def settle_prefill_chunk(self, *outputs: Any) -> None:
+        """Complete one fixed-linear target chunk without gathering cache rows."""
+
+        live_frontiers = tuple(
+            value
+            for lane in self._prefill_frontier_lanes
+            for value in (
+                lane.cur_kv,
+                lane.cur_score,
+                lane.prev_kv,
+                lane.prev_score,
+            )
+            if value is not None
+        )
+        self._eval_prefill_roots(
+            *outputs,
+            *self._prefill_settlement_roots,
+            *live_frontiers,
+        )
+
+    def schedule_verify_chunk(self, *outputs: Any) -> None:
+        """Schedule one fixed-linear verify cycle with every retained owner."""
+
+        live_frontiers = tuple(
+            value
+            for lane in self._prefill_frontier_lanes
+            for value in (
+                lane.cur_kv,
+                lane.cur_score,
+                lane.prev_kv,
+                lane.prev_score,
+            )
+            if value is not None
+        )
+        self._schedule_verify_roots(
+            *outputs,
+            *self._prefill_settlement_roots,
+            *live_frontiers,
+        )
 
     def acquire(self, layers: tuple[Any, ...]) -> list[Any]:
         if tuple(id(layer) for layer in layers) != self._layer_identity:
@@ -801,6 +850,12 @@ class MiaDeepseekV4EnginePlan:
 
     def release_target_cache(self, caches: list[Any]) -> None:
         self.target_cache_arena.release(caches)
+
+    def settle_target_prefill_chunk(self, *outputs: Any) -> None:
+        self.target_cache_arena.settle_prefill_chunk(*outputs)
+
+    def schedule_target_verify_chunk(self, *outputs: Any) -> None:
+        self.target_cache_arena.schedule_verify_chunk(*outputs)
 
     @contextmanager
     def target_cache_lifecycle(self):
@@ -859,7 +914,7 @@ class MiaDeepseekV4EnginePlan:
                     return_hidden=True,
                     logits_keep=1,
                 )
-            mx.eval(prefill_logits, *target_taps)
+            self.settle_target_prefill_chunk(prefill_logits, *target_taps)
 
             # SparkInfer changes the repeated post-pre projection at M=384.  Warm
             # that installed component directly so startup covers the large-M mHC
@@ -988,7 +1043,7 @@ class MiaDeepseekV4EnginePlan:
                     cache=target_cache,
                     return_hidden=True,
                 )
-            mx.eval(verify_logits, *verify_taps)
+            self.settle_target_prefill_chunk(verify_logits, *verify_taps)
             return {
                 "identity": self.identity,
                 "signatures": tuple(

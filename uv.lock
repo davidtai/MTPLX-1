@@ -255,7 +255,7 @@ wheels = [
 [[package]]
 name = "dflash-mlx"
 version = "0.1.10"
-source = { git = "https://github.com/davidtai/dflash-mlx.git?rev=144d8193a781a9ffea2fdfb22a137825e107c892#144d8193a781a9ffea2fdfb22a137825e107c892" }
+source = { git = "https://github.com/davidtai/dflash-mlx.git?rev=b5638db3794327dadba33c9f3aaa4c2610b28b0c#b5638db3794327dadba33c9f3aaa4c2610b28b0c" }
 dependencies = [
     { name = "mlx" },
     { name = "mlx-lm" },
@@ -755,7 +755,7 @@ server = [
 [package.metadata]
 requires-dist = [
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
-    { name = "dflash-mlx", marker = "extra == 'competitors'", git = "https://github.com/davidtai/dflash-mlx.git?rev=144d8193a781a9ffea2fdfb22a137825e107c892" },
+    { name = "dflash-mlx", marker = "extra == 'competitors'", git = "https://github.com/davidtai/dflash-mlx.git?rev=b5638db3794327dadba33c9f3aaa4c2610b28b0c" },
     { name = "fastapi", specifier = ">=0.136" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.136" },
     { name = "huggingface-hub", specifier = ">=0.36" },

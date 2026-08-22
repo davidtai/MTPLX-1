@@ -16,6 +16,77 @@ from mtplx.models import deepseek_v4 as target_module
 from mtplx.deepseek_v4_mia_engine import MiaDeepseekV4EnginePlan
 
 
+def test_target_arena_settles_fixed_pages_journals_and_live_frontiers(
+    monkeypatch,
+) -> None:
+    layers = tuple(
+        SimpleNamespace(
+            attn=SimpleNamespace(
+                window_size=8,
+                compress_ratio=ratio,
+                head_dim=512,
+            )
+        )
+        for ratio in (0, 4, 128)
+    )
+    arena = mia_engine.MiaTargetCacheArena(
+        layers,
+        capacity_tokens=128,
+        max_batch_tokens=16,
+    )
+    ratio4 = arena._caches[1]
+    ratio128 = arena._caches[2]
+    ratio4.comp.cur_kv = mx.zeros((1, 3, 1024), dtype=mx.float32)
+    ratio4.comp.cur_score = mx.zeros((1, 3, 1024), dtype=mx.float32)
+    ratio4.index_comp.prev_kv = mx.zeros((1, 4, 256), dtype=mx.float32)
+    ratio4.index_comp.prev_score = mx.zeros((1, 4, 256), dtype=mx.float32)
+    ratio128.comp.cur_kv = mx.zeros((1, 127, 512), dtype=mx.float32)
+    ratio128.comp.cur_score = mx.zeros((1, 127, 512), dtype=mx.float32)
+    logits = mx.zeros((1, 1, 64), dtype=mx.float32)
+    tap = mx.zeros((1, 1, 2), dtype=mx.float32)
+    calls = []
+    scheduled = []
+    monkeypatch.setattr(
+        arena,
+        "_eval_prefill_roots",
+        lambda *arrays: calls.append(arrays),
+    )
+    monkeypatch.setattr(
+        arena,
+        "_schedule_verify_roots",
+        lambda *arrays: scheduled.append(arrays),
+        raising=False,
+    )
+
+    arena.settle_prefill_chunk(logits, tap)
+    arena.schedule_verify_chunk(logits)
+
+    assert len(calls) == 1
+    assert len(scheduled) == 1
+    roots = calls[0]
+    assert roots[:2] == (logits, tap)
+    for cache in arena._caches:
+        assert any(root is cache.window._pages for root in roots)
+    for cache in (ratio4, ratio128):
+        assert any(root is cache.compressed.pages for root in roots)
+        for journal in cache.comp.journal_buffers:
+            assert any(root is journal for root in roots)
+    assert any(root is ratio4.index_compressed.pages for root in roots)
+    for journal in ratio4.index_comp.journal_buffers:
+        assert any(root is journal for root in roots)
+    for frontier in (
+        ratio4.comp.cur_kv,
+        ratio4.comp.cur_score,
+        ratio4.index_comp.prev_kv,
+        ratio4.index_comp.prev_score,
+        ratio128.comp.cur_kv,
+        ratio128.comp.cur_score,
+    ):
+        assert any(root is frontier for root in roots)
+    assert scheduled[0][0] is logits
+    assert all(any(root is expected for root in scheduled[0]) for expected in roots[2:])
+
+
 def _safetensors_bytes(header: dict, payload: bytes) -> bytes:
     encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
     padded = encoded + b" " * (-len(encoded) % 8)
@@ -45,6 +116,9 @@ class _FakeTargetArena:
     def release(self, caches):
         assert caches is self.cache
         self.events.append("target.release")
+
+    def settle_prefill_chunk(self, *_outputs):
+        self.events.append("target.settle")
 
 
 def _plan(events):
@@ -411,9 +485,31 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
 
     assert events == [
         "target.acquire",
+        "target.settle",
         "wo.m16",
         "qkv.m1024",
         "draft.acquire",
+        "draft.release",
+        "target.release",
+    ]
+
+    events.clear()
+    successful = FailingModel()
+    successful.propose_dspark_k5 = lambda *_args, **_kwargs: SimpleNamespace(
+        future_tokens=fake,
+        neural_logits=fake,
+    )
+
+    receipt = _plan(events).prewarm(successful)
+
+    assert receipt["verify_rows"] == mia_engine.MIA_DSPARK_BLOCK + 1
+    assert events == [
+        "target.acquire",
+        "target.settle",
+        "wo.m16",
+        "qkv.m1024",
+        "draft.acquire",
+        "target.settle",
         "draft.release",
         "target.release",
     ]

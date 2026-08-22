@@ -22,7 +22,7 @@
 ## Reused DFlash2 runtime
 
 - Existing MTPLX DFlash2 branch: `perf/qwen38-dflash2@c3487dc56de6c734c71508c1e293a44731ff025f`
-- DFlash2 dependency: `davidtai/dflash-mlx@144d8193a781a9ffea2fdfb22a137825e107c892`
+- DFlash2 dependency: `davidtai/dflash-mlx@b5638db3794327dadba33c9f3aaa4c2610b28b0c`
 - Imported MTPLX bridge commit: `4d3d03aa`
 - Runtime authority: `dflash_mlx.engine.spec_epoch.SpeculativeSession`
 - Generation authority: `dflash_mlx.runtime.stream_dflash_generate`

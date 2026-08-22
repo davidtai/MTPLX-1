@@ -277,7 +277,7 @@ to reach it.
   selector/MLA/mHC/Trellis geometry, exact phase callables, and finite prewarm
   signatures.
 - The pinned DFlash dependency is
-  `144d8193a781a9ffea2fdfb22a137825e107c892`.  Its fixed-linear lane has direct
+  `b5638db3794327dadba33c9f3aaa4c2610b28b0c`.  Its fixed-linear lane has direct
   chunked prefill and M6 decode/verification, streaming structured taps,
   asynchronous next proposal, direct unarmed acceptance restore, and no
   adaptive, CopySpec, snapshot, diagnostic, cache-clear, or fallback work in

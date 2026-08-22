@@ -32,6 +32,8 @@ class _FakeMiaEnginePlan:
         self._target_cache_factory = target_cache_factory
         self.target_cache_layers = []
         self.released_target_caches = []
+        self.prefill_settlement_calls = []
+        self.verify_settlement_calls = []
 
     def make_target_cache(self, layers):
         self.target_cache_layers.append(layers)
@@ -41,6 +43,12 @@ class _FakeMiaEnginePlan:
 
     def release_target_cache(self, caches) -> None:
         self.released_target_caches.append(caches)
+
+    def settle_target_prefill_chunk(self, *arrays) -> None:
+        self.prefill_settlement_calls.append(arrays)
+
+    def schedule_target_verify_chunk(self, *arrays) -> None:
+        self.verify_settlement_calls.append(arrays)
 
 
 def _seal_fake_target(target, *, target_cache_factory=None) -> _FakeMiaEnginePlan:
@@ -126,6 +134,9 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
         capture_layer_ids={41, 42, 43},
     )
     features = ops.extract_context_feature(captured, [40, 41, 42])
+    ops.settle_prefill_chunk(cache, logits, captured)
+    posterior = mx.argmax(logits[0], axis=-1)
+    ops.schedule_verify_chunk(cache, posterior)
 
     assert ops.supports_model(model)
     assert ops.family(model) == "deepseek_v4_dspark"
@@ -134,6 +145,10 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
     assert model.plan.target_cache_layers == [model.layers]
     assert tuple(logits.shape) == (1, 6, 64)
     assert set(captured) == {41, 42, 43}
+    assert model.plan.prefill_settlement_calls == [
+        (logits, captured[41], captured[42], captured[43])
+    ]
+    assert model.plan.verify_settlement_calls == [(posterior,)]
     assert tuple(features.shape) == (1, 6, 6)
     np.testing.assert_array_equal(
         np.array(features[0, 0]),
@@ -304,7 +319,9 @@ def test_draft_adapter_advertises_m6_but_projects_three_dspark_taps() -> None:
     )
 
 
-def test_draft_backend_appends_committed_context_once_and_returns_five_tokens() -> None:
+def test_draft_backend_appends_committed_context_once_and_returns_five_tokens(
+    monkeypatch,
+) -> None:
     target, owner = _fake_dspark_target()
     draft = DeepseekV4DSparkDraftAdapter(target)
     backend = DeepseekV4DSparkBackend()
@@ -325,6 +342,8 @@ def test_draft_backend_appends_committed_context_once_and_returns_five_tokens() 
         suppress_token_mask=None,
         async_launch=False,
     )
+    scheduled = []
+    monkeypatch.setattr(mx, "async_eval", lambda *arrays: scheduled.append(arrays))
 
     first = backend.draft_greedy(
         **arguments,
@@ -341,6 +360,11 @@ def test_draft_backend_appends_committed_context_once_and_returns_five_tokens() 
     assert [cache.prefill_length for cache in caches] == [6, 6, 6]
     assert all(cache.ring.mode == "nvfp4_stock432_fixed_ring" for cache in caches)
     assert all(cache.ring.record_bytes == 432 for cache in caches)
+    assert len(scheduled) == 2
+    for call in scheduled:
+        assert len(call) == 4
+        for cache in caches:
+            assert any(root is cache.ring.records for root in call)
 
 
 def test_draft_backend_streams_prefill_chunks_without_retaining_or_reappending_prompt() -> None:

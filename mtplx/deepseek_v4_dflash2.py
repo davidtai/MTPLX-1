@@ -180,6 +180,8 @@ class DeepseekV4TargetOps:
         self._plan = plan
         self._make_target_cache = plan.make_target_cache
         self._release_target_cache = plan.release_target_cache
+        self._settle_target_prefill_chunk = plan.settle_target_prefill_chunk
+        self._schedule_target_verify_chunk = plan.schedule_target_verify_chunk
         self._release_draft_cache = target_model.dspark.release_mia_cache
 
     def model_type(self, target_model: Any) -> str:
@@ -301,6 +303,23 @@ class DeepseekV4TargetOps:
             logits_last_only=logits_last_only,
             phase="prefill",
         )
+
+    def settle_prefill_chunk(
+        self,
+        cache_entries: list[Any],
+        logits: mx.array,
+        captured: dict[int, mx.array],
+    ) -> None:
+        del cache_entries
+        self._settle_target_prefill_chunk(logits, *captured.values())
+
+    def schedule_verify_chunk(
+        self,
+        cache_entries: list[Any],
+        posterior: mx.array,
+    ) -> None:
+        del cache_entries
+        self._schedule_target_verify_chunk(posterior)
 
     def _forward_with_hidden_capture_phase(
         self,
@@ -580,7 +599,10 @@ class DeepseekV4DSparkBackend:
         )
         full_draft = proposal.future_tokens.squeeze(0).astype(mx.uint32)
         drafted = full_draft[: requested_width - 1]
-        mx.async_eval(drafted)
+        mx.async_eval(
+            drafted,
+            *(cache.ring.records for cache in draft_cache),
+        )
         return drafted
 
     def draft_greedy_capture(
