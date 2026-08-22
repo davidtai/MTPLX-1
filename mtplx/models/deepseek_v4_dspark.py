@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import Protocol
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows
-from mtplx.kernels.deepseek_v4_nvfp4_mla import install_nvfp4_sparse_mla
+from mtplx.deepseek_v4_nvfp4_kv import (
+    FixedMiaNVFP4Ring,
+    install_stock432_record_packer,
+)
+from mtplx.kernels.deepseek_v4_nvfp4_mla import (
+    install_dspark_k5_nvfp4_mla,
+)
 from mtplx.models.deepseek_v4 import (
     DeepseekV4Attention,
     DeepseekV4DecoderLayer,
@@ -42,6 +48,19 @@ def greedy_future_tokens(
         DSPARK_BLOCK_SIZE,
     ):
         raise ValueError("DSpark K5 logits must have shape [batch, 5, vocab]")
+    return _run_greedy_future_tokens_k5(
+        neural_logits,
+        primary_token_ids,
+        markov_head,
+    )
+
+
+def _run_greedy_future_tokens_k5(
+    neural_logits: mx.array,
+    primary_token_ids: mx.array,
+    markov_head: _MarkovHead,
+) -> mx.array:
+    """Direct sequential Markov decode for the installed physical K5 block."""
     previous = primary_token_ids
     future = []
     for row in range(DSPARK_BLOCK_SIZE):
@@ -61,7 +80,11 @@ class DeepseekV4DSparkCache:
         self.head_dim = int(head_dim)
         if self.head_dim != 512:
             raise ValueError("Mia DSpark cache requires head_dim=512")
-        self.ring = MiaNVFP4Rows()
+        self.ring = FixedMiaNVFP4Ring(capacity_rows=self.window_size)
+        self._pack_records = install_stock432_record_packer(
+            head_dim=self.head_dim,
+            rope_dim=64,
+        )
         self.prefill_length = 0
 
     def prefill(self, main_latent: mx.array, main_rope: mx.array) -> None:
@@ -70,46 +93,72 @@ class DeepseekV4DSparkCache:
             raise ValueError("DSpark cache head dimension mismatch")
         if tuple(main_rope.shape) != (batch, sequence_length, 64):
             raise ValueError("DSpark cache RoPE rows must have shape [batch, rows, 64]")
-        if sequence_length <= self.window_size:
+        self._prefill(main_latent, main_rope)
+
+    def _prefill(self, main_latent: mx.array, main_rope: mx.array) -> None:
+        """Install prompt rows after the DSpark cache contract is sealed."""
+        sequence_length = int(main_latent.shape[1])
+        if sequence_length > self.window_size:
+            main_latent = main_latent[:, -self.window_size :]
+            main_rope = main_rope[:, -self.window_size :]
+        self._install_prefill_tail(
+            main_latent,
+            main_rope,
+            total_length=sequence_length,
+        )
+
+    def _install_prefill_tail(
+        self,
+        main_latent: mx.array,
+        main_rope: mx.array,
+        *,
+        total_length: int,
+    ) -> None:
+        """Own an at-most-window prompt tail at its absolute ring positions."""
+        batch, tail_length, width = (int(v) for v in main_latent.shape)
+        total_length = int(total_length)
+        if total_length <= self.window_size:
             latent_padding = mx.zeros(
-                (batch, self.window_size - sequence_length, width),
+                (batch, self.window_size - tail_length, width),
                 dtype=main_latent.dtype,
             )
             rope_padding = mx.zeros(
-                (batch, self.window_size - sequence_length, 64),
+                (batch, self.window_size - tail_length, 64),
                 dtype=main_rope.dtype,
             )
             latent_rows = mx.concatenate([main_latent, latent_padding], axis=1)
             rope_rows = mx.concatenate([main_rope, rope_padding], axis=1)
         else:
-            latent_last = main_latent[:, -self.window_size :]
-            rope_last = main_rope[:, -self.window_size :]
-            cutoff = sequence_length % self.window_size
+            cutoff = total_length % self.window_size
             latent_rows = (
-                latent_last
+                main_latent
                 if cutoff == 0
                 else mx.concatenate(
                     [
-                        latent_last[:, self.window_size - cutoff :],
-                        latent_last[:, : self.window_size - cutoff],
+                        main_latent[:, self.window_size - cutoff :],
+                        main_latent[:, : self.window_size - cutoff],
                     ],
                     axis=1,
                 )
             )
             rope_rows = (
-                rope_last
+                main_rope
                 if cutoff == 0
                 else mx.concatenate(
                     [
-                        rope_last[:, self.window_size - cutoff :],
-                        rope_last[:, : self.window_size - cutoff],
+                        main_rope[:, self.window_size - cutoff :],
+                        main_rope[:, : self.window_size - cutoff],
                     ],
                     axis=1,
                 )
             )
+        records = self._pack_records(latent_rows, rope_rows)
         self.ring.clear()
-        self.ring.append(latent_rows, rope_rows)
-        self.prefill_length = sequence_length
+        self.ring._append_installed_records(
+            records,
+            prefix=tuple(int(value) for value in records.shape[:-2]),
+        )
+        self.prefill_length = total_length
 
     def visible_rows(self) -> tuple[mx.array, mx.array]:
         if len(self.ring) != self.window_size:
@@ -135,21 +184,22 @@ class DeepseekV4DSparkCache:
         count = int(main_latent.shape[1])
         if count <= 0:
             raise ValueError("DSpark committed main K/V width is outside its ring")
-        if count > self.window_size:
-            skip = count - self.window_size
-            start_pos = int(start_pos) + skip
-            main_latent = main_latent[:, skip:]
-            main_rope = main_rope[:, skip:]
-            count = self.window_size
+        self._commit_main(start_pos, main_latent, main_rope)
+
+    def _commit_main(
+        self,
+        start_pos: int,
+        main_latent: mx.array,
+        main_rope: mx.array,
+    ) -> None:
+        """Advance the installed fixed ring without repeated geometry proofs."""
+        count = int(main_latent.shape[1])
         start = int(start_pos) % self.window_size
         first = min(count, self.window_size - start)
-        self.ring.replace(
-            start,
-            main_latent[:, :first],
-            main_rope[:, :first],
-        )
+        records = self._pack_records(main_latent, main_rope)
+        self.ring._replace_installed_records(start, records[:, :first])
         if first < count:
-            self.ring.replace(0, main_latent[:, first:], main_rope[:, first:])
+            self.ring._replace_installed_records(0, records[:, first:])
         self.prefill_length = max(self.prefill_length, int(start_pos) + count)
 
 
@@ -215,25 +265,6 @@ def _validate_dspark_args(args) -> None:
             raise ValueError("DeepSeek V4 DSpark stages require uncompressed attention")
 
 
-def _dspark_visibility_indices(
-    window_size: int,
-    block_size: int,
-    start_pos: int,
-) -> mx.array:
-    if int(start_pos) <= 0:
-        raise ValueError("DSpark decode visibility requires start_pos > 0")
-    main = mx.arange(min(int(window_size), int(start_pos) + 1), dtype=mx.int32)
-    draft = int(window_size) + mx.arange(int(block_size), dtype=mx.int32)
-    return mx.concatenate([main, draft])
-
-
-def _dspark_draft_positions(start_pos: int, block_size: int) -> mx.array:
-    return mx.arange(
-        int(start_pos) + 1,
-        int(start_pos) + 1 + int(block_size),
-    )
-
-
 class DeepseekV4DSparkAttention(DeepseekV4Attention):
     """Official DSpark attention with a Mia stock432 stage context ring."""
 
@@ -241,12 +272,41 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         super().__init__(args, layer_id)
         if self.compress_ratio != 0:
             raise ValueError("DSpark attention requires compress_ratio=0")
-        self._nvfp4_sparse_mla = install_nvfp4_sparse_mla(
+        self._dspark_k5_mla = install_dspark_k5_nvfp4_mla(
             heads=self.n_heads,
             head_dim=self.head_dim,
             rope_dim=self.rope_head_dim,
             window_size=self.window_size,
+            block_size=DSPARK_BLOCK_SIZE,
         )
+        self._pack_draft_records = install_stock432_record_packer(
+            head_dim=self.head_dim,
+            rope_dim=self.rope_head_dim,
+        )
+        self._forward_impl = self._checked_forward_k5
+
+    def install_mia_k5_runtime(self) -> None:
+        """Bind the already-qualified fixed K5 attention route."""
+        if (
+            self.n_heads != 64
+            or self.head_dim != 512
+            or self.rope_head_dim != 64
+            or self.window_size != 128
+        ):
+            raise ValueError("Mia DSpark attention geometry changed")
+        self._mia_attn_sink = self.attn_sink.astype(mx.float32)
+        self._mia_draft_position_offsets = mx.arange(
+            DSPARK_BLOCK_SIZE,
+            dtype=mx.int32,
+        )
+        mx.eval(self._mia_attn_sink)
+        mx.eval(self._mia_draft_position_offsets)
+        self._dspark_k5_mla = partial(
+            self._dspark_k5_mla,
+            sinks=self._mia_attn_sink,
+            scale=self.softmax_scale,
+        )
+        self._forward_impl = self._run_k5
 
     def project_kv(
         self,
@@ -268,8 +328,15 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         main_hidden: mx.array,
         cache: DeepseekV4DSparkCache,
     ) -> None:
-        positions = mx.arange(int(main_hidden.shape[1]))
-        cache.prefill(*self.project_kv(main_hidden, positions))
+        total_length = int(main_hidden.shape[1])
+        tail_start = max(0, total_length - self.window_size)
+        positions = mx.arange(tail_start, total_length)
+        latent, rope = self.project_kv(main_hidden[:, tail_start:], positions)
+        cache._install_prefill_tail(
+            latent,
+            rope,
+            total_length=total_length,
+        )
 
     def __call__(
         self,
@@ -278,13 +345,33 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         start_pos: int,
         cache: DeepseekV4DSparkCache,
     ) -> mx.array:
+        return self._forward_impl(hidden, start_pos=start_pos, cache=cache)
+
+    def _checked_forward_k5(
+        self,
+        hidden: mx.array,
+        *,
+        start_pos: int,
+        cache: DeepseekV4DSparkCache,
+    ) -> mx.array:
         if int(start_pos) <= 0:
             raise ValueError("DSpark decode attention requires a positive position")
-        batch, block, _ = hidden.shape
+        _batch, block, _width = hidden.shape
         if int(block) != DSPARK_BLOCK_SIZE:
             raise ValueError("DSpark decode requires five neural rows")
+        return self._run_k5(hidden, start_pos=start_pos, cache=cache)
 
-        positions = _dspark_draft_positions(int(start_pos), block)
+    def _run_k5(
+        self,
+        hidden: mx.array,
+        *,
+        start_pos: int,
+        cache: DeepseekV4DSparkCache,
+    ) -> mx.array:
+        """Installed physical K5 attention with a fixed stock432 union."""
+        batch = int(hidden.shape[0])
+        block = DSPARK_BLOCK_SIZE
+        positions = self._mia_draft_position_offsets + int(start_pos)
         cos, sin = self._rope_tables(positions)
         rope_dim = self.rope_head_dim
 
@@ -313,44 +400,15 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         )
 
         draft_latent, draft_rope = self.project_kv(hidden, positions)
-        draft_rows = MiaNVFP4Rows()
-        draft_rows.append(draft_latent, draft_rope)
-        all_records = mx.concatenate(
-            [cache.ring.records, draft_rows.records],
-            axis=1,
-        )
-        visible_indices = _dspark_visibility_indices(
-            self.window_size,
-            block,
+        draft_records = self._pack_draft_records(draft_latent, draft_rope)
+        output = self._dspark_k5_mla(
+            query.transpose(0, 2, 1, 3),
+            cache.ring.records,
+            draft_records,
             int(start_pos),
         )
-        visible_records = all_records[:, visible_indices]
-        output = self._nvfp4_sparse_mla(
-            query.transpose(0, 2, 1, 3),
-            visible_records[:, :0],
-            0,
-            positions.astype(mx.int32),
-            visible_records,
-            None,
-            mx.full((1, block), visible_records.shape[1], dtype=mx.int32),
-            self.attn_sink.astype(mx.float32),
-            self.softmax_scale,
-        )
         output = output.transpose(0, 2, 1, 3)
-        output = mx.concatenate(
-            [
-                output[..., :-rope_dim],
-                _apply_interleaved_rope(
-                    output[..., -rope_dim:],
-                    cos[None, :, None],
-                    -sin[None, :, None],
-                ),
-            ],
-            axis=-1,
-        )
-        return self._o_lora(
-            output.reshape(batch, block, self.n_heads * self.head_dim)
-        )
+        return self._project_attention_output(output, cos, sin)
 
 
 class DSparkMarkovHead(nn.Module):
@@ -408,9 +466,15 @@ class DeepseekV4DSparkStage(DeepseekV4DecoderLayer):
             )
 
     def fuse_main(self, target_taps: tuple[mx.array, mx.array, mx.array]) -> mx.array:
+        return self.fuse_main_rows(mx.concatenate(target_taps, axis=-1))
+
+    def fuse_main_rows(self, target_rows: mx.array) -> mx.array:
         if self.main_proj is None or self.main_norm is None:
             raise RuntimeError("DSpark target-tap fusion belongs to stage zero")
-        return self.main_norm(self.main_proj(mx.concatenate(target_taps, axis=-1)))
+        return self._run_fuse_main_rows(target_rows)
+
+    def _run_fuse_main_rows(self, target_rows: mx.array) -> mx.array:
+        return self.main_norm(self.main_proj(target_rows))
 
     def __call__(
         self,
@@ -454,10 +518,46 @@ class DeepseekV4DSparkOwner:
         self.stages = list(stages)
         if len(self.stages) != DSPARK_STAGE_COUNT:
             raise ValueError("DeepSeek V4 DSpark requires exactly three stages")
+        self._propose_impl = self._stock_propose_k5
+        self._make_cache_impl = self._new_cache
+
+    def install_mia_mhc_runtime(self, *, max_tokens: int) -> None:
+        from mtplx.kernels.deepseek_v4_mhc import MiaMHCPlan
+
+        self._mia_mhc = MiaMHCPlan(
+            max_tokens=max_tokens,
+            rms_eps=self.args.rms_norm_eps,
+            hc_eps=self.args.hc_eps,
+            iters=self.args.hc_sinkhorn_iters,
+        )
+        self._mia_mhc.install_modules(
+            hyper_connections=tuple(
+                connection
+                for stage in self.stages
+                for connection in (stage.attn_hc, stage.ffn_hc)
+            ),
+            broadcast_connection=self.stages[0].attn_hc,
+        )
+        for stage in self.stages:
+            stage.attn.install_mia_k5_runtime()
+            stage.ffn.install_mia_k64_runtime()
+        self._mia_noise_tail = mx.full(
+            (1, self.block_size - 1),
+            self.noise_token_id,
+            dtype=mx.uint32,
+        )
+        mx.eval(self._mia_noise_tail)
+        self._mia_cache_arena = tuple(self._new_cache())
+        self._mia_cache_leased = False
+        self._make_cache_impl = self._acquire_mia_cache
+        self._propose_impl = self._mia_propose_k5
 
     def draft_input_ids(self, primary_token_ids: mx.array) -> mx.array:
         if primary_token_ids.ndim != 1:
             raise ValueError("DSpark primary ids must have shape [batch]")
+        return self._draft_input_ids_k5(primary_token_ids)
+
+    def _draft_input_ids_k5(self, primary_token_ids: mx.array) -> mx.array:
         noise = mx.full(
             (primary_token_ids.shape[0], self.block_size - 1),
             self.noise_token_id,
@@ -465,7 +565,13 @@ class DeepseekV4DSparkOwner:
         )
         return mx.concatenate([primary_token_ids[:, None], noise], axis=1)
 
-    def make_cache(self) -> list[DeepseekV4DSparkCache]:
+    def _mia_draft_input_ids_k5(self, primary_token_ids: mx.array) -> mx.array:
+        return mx.concatenate(
+            [primary_token_ids[:, None], self._mia_noise_tail],
+            axis=1,
+        )
+
+    def _new_cache(self) -> list[DeepseekV4DSparkCache]:
         return [
             DeepseekV4DSparkCache(
                 window_size=stage.attn.window_size,
@@ -473,6 +579,31 @@ class DeepseekV4DSparkOwner:
             )
             for stage in self.stages
         ]
+
+    def _acquire_mia_cache(self) -> list[DeepseekV4DSparkCache]:
+        if self._mia_cache_leased:
+            raise RuntimeError("Mia DSpark cache arena already owns the active request")
+        for cache in self._mia_cache_arena:
+            cache.ring.clear()
+            cache.prefill_length = 0
+        self._mia_cache_leased = True
+        return list(self._mia_cache_arena)
+
+    def release_mia_cache(self, caches: list[DeepseekV4DSparkCache]) -> None:
+        if not self._mia_cache_leased:
+            raise RuntimeError("Mia DSpark cache arena has no active request")
+        if len(caches) != len(self._mia_cache_arena) or any(
+            observed is not expected
+            for observed, expected in zip(caches, self._mia_cache_arena, strict=True)
+        ):
+            raise ValueError("Mia DSpark cache release does not match its page lease")
+        for cache in self._mia_cache_arena:
+            cache.ring.clear()
+            cache.prefill_length = 0
+        self._mia_cache_leased = False
+
+    def make_cache(self) -> list[DeepseekV4DSparkCache]:
+        return self._make_cache_impl()
 
     def prefill(
         self,
@@ -500,7 +631,7 @@ class DeepseekV4DSparkOwner:
             latent, rope = stage.attn.project_kv(main_hidden, positions)
             cache.commit_main(start_pos, latent, rope)
 
-    def propose_k5(
+    def _stock_propose_k5(
         self,
         primary_token_ids: mx.array,
         embed_tokens: nn.Module,
@@ -535,6 +666,98 @@ class DeepseekV4DSparkOwner:
                 final.markov_head,
             ),
             neural_logits=neural_logits,
+        )
+
+    def _mia_propose_k5(
+        self,
+        primary_token_ids: mx.array,
+        embed_tokens: nn.Module,
+        lm_head: nn.Module,
+        caches: list[DeepseekV4DSparkCache],
+        *,
+        start_pos: int,
+    ) -> DSparkModelProposal:
+        input_ids = self._mia_draft_input_ids_k5(primary_token_ids)
+        lead = tuple(int(value) for value in input_ids.shape)
+        first = self.stages[0]
+        residual, post, comb, value = self._mia_mhc.pre_broadcast(
+            embed_tokens(input_ids),
+            first.attn_hc,
+            first.attn_norm,
+        )
+        value = first.attn(
+            value.reshape(*lead, self.args.hidden_size),
+            start_pos=start_pos,
+            cache=caches[0],
+        )
+        residual, post, comb, value = self._mia_mhc.post_pre(
+            value,
+            residual,
+            post,
+            comb,
+            first.ffn_hc,
+            first.ffn_norm,
+        )
+        value = first.ffn(
+            value.reshape(*lead, self.args.hidden_size),
+            input_ids=input_ids,
+        )
+        for stage, cache in zip(self.stages[1:3], caches[1:3]):
+            residual, post, comb, value = self._mia_mhc.post_pre(
+                value,
+                residual,
+                post,
+                comb,
+                stage.attn_hc,
+                stage.attn_norm,
+            )
+            value = stage.attn(
+                value.reshape(*lead, self.args.hidden_size),
+                start_pos=start_pos,
+                cache=cache,
+            )
+            residual, post, comb, value = self._mia_mhc.post_pre(
+                value,
+                residual,
+                post,
+                comb,
+                stage.ffn_hc,
+                stage.ffn_norm,
+            )
+            value = stage.ffn(
+                value.reshape(*lead, self.args.hidden_size),
+                input_ids=input_ids,
+            )
+        hidden = self._mia_mhc.post(value, residual, post, comb)
+        final = self.stages[-1]
+        neural_hidden = self._mia_mhc.head(hidden, final.hc_head, final.norm).reshape(
+            *lead, self.args.hidden_size
+        )
+        neural_logits = lm_head(neural_hidden)
+        return DSparkModelProposal(
+            future_tokens=_run_greedy_future_tokens_k5(
+                neural_logits,
+                primary_token_ids,
+                final.markov_head,
+            ),
+            neural_logits=neural_logits,
+        )
+
+    def propose_k5(
+        self,
+        primary_token_ids: mx.array,
+        embed_tokens: nn.Module,
+        lm_head: nn.Module,
+        caches: list[DeepseekV4DSparkCache],
+        *,
+        start_pos: int,
+    ) -> DSparkModelProposal:
+        return self._propose_impl(
+            primary_token_ids,
+            embed_tokens,
+            lm_head,
+            caches,
+            start_pos=start_pos,
         )
 
 

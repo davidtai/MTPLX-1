@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -10,11 +12,22 @@ from mtplx.deepseek_v4_nvfp4_kv import (  # noqa: E402
     PagedMiaNVFP4Rows,
 )
 from mtplx.deepseek_v4_paged_indexer import (  # noqa: E402
+    MiaTopKSelection,
     PagedMiaIndexerRows,
+    _run_paged_indexer_topk,
     paged_indexer_scores,
+    paged_indexer_tiled_scores,
 )
-from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache  # noqa: E402
-from mtplx.kernels.deepseek_v4_nvfp4_mla import nvfp4_sparse_mla  # noqa: E402
+from mtplx.attention_context import attention_phase  # noqa: E402
+from mtplx.models import deepseek_v4 as deepseek_v4_module  # noqa: E402
+from mtplx.models.deepseek_v4 import (  # noqa: E402
+    DeepseekV4NVFP4Cache,
+    Indexer,
+)
+from mtplx.kernels.deepseek_v4_nvfp4_mla import (  # noqa: E402
+    nvfp4_prefill_mla,
+    nvfp4_sparse_mla,
+)
 
 
 def _exact_latent(rows: int = 2) -> mx.array:
@@ -218,6 +231,7 @@ def test_paged_mia_indexer_reads_132_byte_fp8_records_directly() -> None:
     ).reshape(1, 2, 64, 128).astype(mx.bfloat16)
     weights = mx.linspace(-0.2, 0.3, 2 * 64).reshape(1, 2, 64)
     actual = paged_indexer_scores(query, weights, rows.paged_records)
+    tiled = paged_indexer_tiled_scores(query, weights, rows.paged_records)
 
     query_rows = PagedMiaIndexerRows(capacity_rows=128, block_size=64)
     query_rows.append(query.reshape(1, 2 * 64, 128))
@@ -225,7 +239,7 @@ def test_paged_mia_indexer_reads_132_byte_fp8_records_directly() -> None:
     quant_rows = rows.decode()
     dot = mx.einsum("bshd,btd->bsht", quant_query, quant_rows)
     expected = mx.sum(mx.maximum(dot, 0.0) * weights[..., None], axis=2)
-    mx.eval(actual, expected)
+    mx.eval(actual, tiled, expected)
 
     assert rows.pages is pages
     assert rows.paged_records.records is pages
@@ -236,13 +250,148 @@ def test_paged_mia_indexer_reads_132_byte_fp8_records_directly() -> None:
         rtol=2e-3,
         atol=2e-3,
     )
+    np.testing.assert_allclose(
+        np.array(tiled),
+        np.array(actual),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+def test_mia_indexer_streams_bounded_score_slices_into_compact_topk(
+    monkeypatch,
+) -> None:
+    score_slice_widths = []
+
+    def fake_score_slice(q_records, weights, rows, row_start, row_count):
+        del q_records, weights, rows
+        score_slice_widths.append(row_count)
+        scores = mx.arange(row_start, row_start + row_count, dtype=mx.float32)
+        return mx.broadcast_to(scores[None, None], (1, 2, row_count))
+
+    monkeypatch.setattr(
+        "mtplx.deepseek_v4_paged_indexer._run_paged_indexer_score_slice",
+        fake_score_slice,
+    )
+    monkeypatch.setattr(
+        "mtplx.deepseek_v4_paged_indexer._pack_indexer132",
+        lambda queries: queries,
+    )
+    rows = SimpleNamespace(length=300)
+    selection = _run_paged_indexer_topk(
+        mx.zeros((1, 2, 64, 128), dtype=mx.bfloat16),
+        mx.zeros((1, 2, 64), dtype=mx.float32),
+        mx.array([7, 1199], dtype=mx.int32),
+        rows,
+        topk=3,
+        compress_ratio=4,
+        score_chunk_rows=128,
+    )
+
+    assert isinstance(selection, MiaTopKSelection)
+    assert score_slice_widths == [128, 128, 44]
+    assert tuple(selection.indices.shape) == (1, 2, 3)
+    assert tuple(selection.lengths.shape) == (1, 2)
+    np.testing.assert_array_equal(
+        np.array(selection.indices),
+        np.array([[[0, 1, 300], [297, 298, 299]]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(np.array(selection.lengths), [[2, 3]])
+
+
+def test_mia_indexer_install_removes_the_non_source_hadamard(monkeypatch) -> None:
+    def installed(*_args):
+        return None
+
+    monkeypatch.setattr(
+        deepseek_v4_module,
+        "install_paged_indexer_topk",
+        lambda **_kwargs: installed,
+    )
+    indexer = Indexer.__new__(Indexer)
+    indexer.n_heads = 64
+    indexer.head_dim = 128
+    indexer.index_topk = 512
+    indexer.compress_ratio = 4
+    indexer.compressor = SimpleNamespace(rotate=True)
+
+    indexer.install_mia_paged_topk()
+
+    query = mx.zeros((1, 1, 64, 128), dtype=mx.bfloat16)
+    assert indexer.compressor.rotate is False
+    assert indexer._prepare_query_rows(query) is query
+    assert indexer._select_rows is installed
+
+
+def test_mia_attention_routes_nax_prefill_by_phase(monkeypatch) -> None:
+    prefill_result = mx.array([11], dtype=mx.int32)
+    direct_result = mx.array([22], dtype=mx.int32)
+    monkeypatch.setattr(
+        deepseek_v4_module,
+        "install_nvfp4_prefill_mla",
+        lambda **_kwargs: lambda *_args: prefill_result,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_module,
+        "install_nvfp4_sparse_mla",
+        lambda **_kwargs: lambda *_args: direct_result,
+    )
+
+    class FakeIndexer:
+        def install_mia_paged_topk(self) -> None:
+            return None
+
+    attn = deepseek_v4_module.DeepseekV4Attention.__new__(
+        deepseek_v4_module.DeepseekV4Attention
+    )
+    attn.head_dim = 512
+    attn.rope_head_dim = 64
+    attn.n_heads = 64
+    attn.window_size = 128
+    attn.compress_ratio = 4
+    attn.attn_sink = mx.zeros((64,), dtype=mx.float32)
+    attn.softmax_scale = 512**-0.5
+    attn.indexer = FakeIndexer()
+    attn.install_mia_nvfp4_attention()
+
+    selection = MiaTopKSelection(
+        indices=mx.zeros((1, 2, 1), dtype=mx.int32),
+        lengths=mx.ones((1, 2), dtype=mx.int32),
+    )
+
+    def run(query_rows: int):
+        return attn._mia_cached_attention(
+            mx.zeros((1, 64, query_rows, 512), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 432), dtype=mx.uint8),
+            None,
+            0,
+            mx.arange(query_rows, dtype=mx.int32),
+            4,
+            MiaTopKSelection(
+                indices=selection.indices[:, :query_rows],
+                lengths=selection.lengths[:, :query_rows],
+            ),
+            None,
+        )
+
+    with attention_phase("prefill"):
+        assert run(1) is prefill_result
+        assert run(2) is prefill_result
+    with attention_phase("ar_decode"):
+        assert run(2) is direct_result
 
 
 @pytest.mark.parametrize("query_rows", [1, 6])
 @pytest.mark.parametrize("paged_compressed", [False, True])
+@pytest.mark.parametrize(
+    "attention_impl",
+    [nvfp4_sparse_mla, nvfp4_prefill_mla],
+    ids=["direct-decode", "nax-prefill"],
+)
 def test_sparse_attention_reads_stock432_records_directly(
     query_rows: int,
     paged_compressed: bool,
+    attention_impl,
 ) -> None:
     if not mx.metal.is_available():
         pytest.skip("requires direct Metal NVFP4 attention")
@@ -292,7 +441,7 @@ def test_sparse_attention_reads_stock432_records_directly(
     )[None]
     scale = 512**-0.5
 
-    output = nvfp4_sparse_mla(
+    output = attention_impl(
         queries,
         window.records,
         window_start,

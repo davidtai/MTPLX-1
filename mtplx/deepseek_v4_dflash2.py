@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Optional
 
 import mlx.core as mx
 
 from dflash_mlx.engine.target_ops import TargetCapabilities
+from dflash_mlx.engine.target_features import StreamingTargetFeatureStore
 from dflash_mlx.model import DraftRuntimeCapabilities
 
 from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache
@@ -17,12 +18,157 @@ from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache
 _TARGET_LAYER_IDS = (40, 41, 42)
 _CAPTURE_LAYER_IDS = tuple(layer_id + 1 for layer_id in _TARGET_LAYER_IDS)
 _PHYSICAL_VERIFY_WIDTH = 6
+_DFLASH_RUNTIME_IDENTITY = (
+    "mia-deepseek-v4:dflash:fixed-linear:m6:prefill1024:window128:"
+    "stock432:copyspec-zero-owner-d67e6e4:adaptive-off:fallback-off"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DeepseekV4DFlashRuntimeContext:
+    """Frozen construction receipt for the sole Mia DFlash execution lane."""
+
+    runtime: Any
+    diagnostics: Any
+    verify: Any
+    metal_limits: Any
+    identity: str
+
+    @classmethod
+    def install(cls, context: Any) -> "DeepseekV4DFlashRuntimeContext":
+        runtime = context.runtime
+        required_runtime = {
+            "prefill_step_size": 1024,
+            "draft_sink_size": 0,
+            "draft_window_size": 128,
+            "verify_len_cap": _PHYSICAL_VERIFY_WIDTH,
+            "prefix_cache": False,
+            "prefix_cache_l2": False,
+            "clear_cache_boundaries": False,
+            "target_fa_window": 0,
+            # Zero disables the generic DFlash AR cutoff. The model-owned page
+            # plan rejects over-capacity requests before DFlash is entered.
+            "dflash_max_ctx": 0,
+            "verify_mode": "dflash",
+            "copyspec_mode": "off",
+            "quantize_kv_cache": False,
+        }
+        changed = {
+            name: getattr(runtime, name, None)
+            for name, expected in required_runtime.items()
+            if getattr(runtime, name, None) != expected
+        }
+        if changed:
+            raise ValueError(
+                "DeepSeek V4 DFlash runtime does not match the installed Mia route: "
+                f"{changed}"
+            )
+        if getattr(context.verify, "mode", None) != "dflash":
+            raise ValueError("DeepSeek V4 DFlash requires the fixed linear verifier")
+        diagnostics = context.diagnostics
+        if (
+            getattr(diagnostics, "mode", None) != "off"
+            or bool(getattr(diagnostics, "memory_waterfall", False))
+            or bool(getattr(getattr(diagnostics, "trace", None), "cycle_events", False))
+        ):
+            raise ValueError("DeepSeek V4 DFlash diagnostics must be off at installation")
+        return cls(
+            runtime=runtime,
+            diagnostics=diagnostics,
+            verify=context.verify,
+            metal_limits=context.metal_limits,
+            identity=_DFLASH_RUNTIME_IDENTITY,
+        )
+
+
+class DeepseekV4TargetTapRows(tuple):
+    """Three ordered target-tap views without a full-width concatenation.
+
+    It is deliberately a tuple-native MLX tree.  The shared DFlash scheduler
+    can therefore evaluate the three arrays without a model-specific runtime
+    branch, while tuple-shaped tensor indexing still returns a structured view.
+    """
+
+    def __new__(cls, taps: tuple[mx.array, mx.array, mx.array]):
+        return super().__new__(cls, taps)
+
+    @property
+    def taps(self) -> tuple[mx.array, mx.array, mx.array]:
+        return self[0], self[1], self[2]
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        first = self.taps[0]
+        return int(first.shape[0]), int(first.shape[1]), sum(
+            int(tap.shape[-1]) for tap in self.taps
+        )
+
+    @property
+    def rows(self) -> int:
+        return int(self.taps[0].shape[1])
+
+    def __getitem__(self, key: Any):
+        if isinstance(key, int):
+            return super().__getitem__(key)
+        return DeepseekV4TargetTapRows(tuple(tap[key] for tap in self))
+
+    def fuse_tail(self, first_row: int) -> mx.array:
+        return mx.concatenate(
+            tuple(tap[:, int(first_row) :, :] for tap in self.taps),
+            axis=-1,
+        )
+
+
+@dataclass
+class DeepseekV4StreamingTargetFeatureStore(StreamingTargetFeatureStore):
+    """Existing streaming store specialized to structured DeepSeek taps."""
+
+    def _project(self, features: Any) -> DeepseekV4TargetTapRows:
+        return features
+
+    def write_prompt_slice(
+        self,
+        *,
+        start: int,
+        end: int,
+        features: Any,
+    ) -> DeepseekV4TargetTapRows:
+        start = int(start)
+        end = int(end)
+        projected = self._project(features)
+        self.consume_prompt_chunk(start=start, end=end, features=projected)
+        self._current_hidden = projected[:, :0, :]
+        return self._current_hidden
+
+    def commit_generation(
+        self,
+        committed_hidden: Any,
+        *,
+        collect_snapshot: bool,
+    ) -> None:
+        del collect_snapshot
+        self._current_hidden = self._project(committed_hidden)
 
 
 class DeepseekV4TargetOps:
     """Bind a construction-qualified DeepSeek V4 target to DFlash2."""
 
     backend_name = "deepseek_v4_dspark"
+
+    def __init__(self, target_model: Any) -> None:
+        plan = getattr(target_model, "_mia_engine_plan", None)
+        receipt = getattr(target_model, "_mia_prewarm_receipt", None)
+        if plan is None or not isinstance(receipt, dict):
+            raise ValueError(
+                "DeepSeek V4 DFlash2 requires the sealed and prewarmed Mia engine"
+            )
+        if str(receipt.get("identity")) != str(plan.identity):
+            raise ValueError("DeepSeek V4 Mia prewarm receipt does not match its plan")
+        self._target_model = target_model
+        self._plan = plan
+        self._make_target_cache = plan.make_target_cache
+        self._release_target_cache = plan.release_target_cache
+        self._release_draft_cache = target_model.dspark.release_mia_cache
 
     def model_type(self, target_model: Any) -> str:
         return str(getattr(getattr(target_model, "args", None), "model_type", "")).lower()
@@ -41,7 +187,8 @@ class DeepseekV4TargetOps:
             )
         )
         return (
-            self.model_type(target_model) == "deepseek_v4"
+            target_model is self._target_model
+            and self.model_type(target_model) == "deepseek_v4"
             and len(stages) == 3
             and layer_ids == _TARGET_LAYER_IDS
             and getattr(target_model, "_target_cache_type", None)
@@ -66,6 +213,8 @@ class DeepseekV4TargetOps:
             supports_full_context_draft_layers=False,
             supports_tree_verify=False,
             supports_chunked_prefill=True,
+            supports_fixed_linear_runtime=True,
+            fixed_linear_restore_without_arming=True,
         )
 
     def supports_tree_cache(self, cache_entries: list[Any]) -> bool:
@@ -95,19 +244,22 @@ class DeepseekV4TargetOps:
         cache_capacity_tokens: Optional[int] = None,
     ) -> list[Any]:
         del enable_speculative_linear_cache
+        if target_model is not self._target_model:
+            raise ValueError("DeepSeek V4 target ops are bound to one Mia engine")
         if quantize_kv_cache:
             raise ValueError(
                 "DeepSeek V4 target K/V is already Mia stock432 NVFP4 from offset zero"
             )
         if target_fa_window is not None and int(target_fa_window) > 0:
             raise ValueError("DeepSeek V4 uses its model-defined attention windows")
-        cache = (
-            target_model.make_cache()
-            if cache_capacity_tokens is None
-            else target_model.make_cache(
-                capacity_tokens=int(cache_capacity_tokens)
+        if (
+            cache_capacity_tokens is not None
+            and int(cache_capacity_tokens) > int(self._plan.context_capacity_tokens)
+        ):
+            raise ValueError(
+                "DeepSeek V4 request exceeds the installed Mia context capacity"
             )
-        )
+        cache = self._make_target_cache(target_model.layers)
         if not cache or not all(
             isinstance(entry, DeepseekV4NVFP4Cache) for entry in cache
         ):
@@ -127,26 +279,39 @@ class DeepseekV4TargetOps:
         capture_layer_ids: Optional[set[int]] = None,
         logits_last_only: bool = False,
     ) -> tuple[mx.array, dict[int, mx.array]]:
-        if input_embeddings is not None:
-            raise ValueError("DeepSeek V4 DFlash2 does not support input embeddings")
-        if input_ids is None:
-            raise ValueError("DeepSeek V4 DFlash2 requires input IDs")
-        logits, taps = target_model(
-            input_ids,
+        del input_embeddings
+        return self._forward_with_hidden_capture_phase(
+            target_model,
+            input_ids=input_ids,
             cache=cache,
-            return_hidden=True,
-            logits_keep=1 if logits_last_only else None,
+            input_embeddings=None,
+            capture_layer_ids=capture_layer_ids,
+            logits_last_only=logits_last_only,
+            phase="prefill",
         )
-        if len(taps) != len(_TARGET_LAYER_IDS):
-            raise RuntimeError("DeepSeek V4 target did not return taps 40/41/42")
-        captured = dict(zip(_CAPTURE_LAYER_IDS, taps, strict=True))
-        if capture_layer_ids is not None:
-            captured = {
-                layer_id: value
-                for layer_id, value in captured.items()
-                if layer_id in capture_layer_ids
-            }
-        return logits, captured
+
+    def _forward_with_hidden_capture_phase(
+        self,
+        target_model: Any,
+        *,
+        input_ids: Optional[mx.array],
+        cache: Optional[list[Any]],
+        input_embeddings: Optional[mx.array],
+        capture_layer_ids: Optional[set[int]],
+        logits_last_only: bool,
+        phase: str,
+    ) -> tuple[mx.array, dict[int, mx.array]]:
+        from mtplx.attention_context import attention_phase
+
+        del input_embeddings
+        with attention_phase(phase):
+            logits, taps = target_model.mia_dflash_forward(
+                input_ids,
+                cache,
+                logits_last_only=logits_last_only,
+            )
+        del capture_layer_ids
+        return logits, dict(zip(_CAPTURE_LAYER_IDS, taps))
 
     def verify_block(
         self,
@@ -156,13 +321,14 @@ class DeepseekV4TargetOps:
         target_cache: list[Any],
         capture_layer_ids: Optional[set[int]] = None,
     ) -> tuple[mx.array, dict[int, mx.array]]:
-        if int(verify_ids.shape[1]) <= 0:
-            raise ValueError("verify block must contain at least one token")
-        return self.forward_with_hidden_capture(
+        return self._forward_with_hidden_capture_phase(
             target_model,
             input_ids=verify_ids,
             cache=target_cache,
+            input_embeddings=None,
             capture_layer_ids=capture_layer_ids,
+            logits_last_only=False,
+            phase="decode_verify",
         )
 
     def verify_tree_block(
@@ -189,15 +355,10 @@ class DeepseekV4TargetOps:
         self,
         captured_dict: dict[int, mx.array],
         target_layer_ids: list[int],
-    ) -> mx.array:
-        layer_ids = tuple(int(value) for value in target_layer_ids)
-        if layer_ids != _TARGET_LAYER_IDS:
-            raise ValueError(
-                "DeepSeek V4 DSpark target layer IDs must be exactly 40/41/42"
-            )
-        return mx.concatenate(
-            [captured_dict[layer_id + 1] for layer_id in layer_ids],
-            axis=-1,
+    ) -> DeepseekV4TargetTapRows:
+        del target_layer_ids
+        return DeepseekV4TargetTapRows(
+            tuple(captured_dict[layer_id + 1] for layer_id in _TARGET_LAYER_IDS)
         )
 
     def arm_rollback(self, cache_entries: list[Any], *, prefix_len: int) -> None:
@@ -212,24 +373,20 @@ class DeepseekV4TargetOps:
         drafted_tokens: int = 0,
     ) -> int:
         del acceptance_length, drafted_tokens
-        started = time.perf_counter_ns()
+        trim_count = int(cache_entries[0].offset) - int(target_len)
         for cache_entry in cache_entries:
-            offset = int(cache_entry.offset)
-            if offset < int(target_len):
-                raise ValueError(
-                    "DeepSeek V4 target cache ended before the accepted prefix"
-                )
-            if offset > int(target_len):
-                cache_entry.trim(offset - int(target_len))
-        return time.perf_counter_ns() - started
+            cache_entry._trim_installed(trim_count)
+        return 0
 
     def cleanup_generation_caches(
         self,
         target_cache: list[Any],
         draft_cache: list[Any],
     ) -> None:
-        draft_cache.clear()
-        target_cache.clear()
+        if target_cache:
+            self._release_target_cache(target_cache)
+        if draft_cache:
+            self._release_draft_cache(draft_cache)
 
 
 class DeepseekV4DSparkDraftAdapter:
@@ -272,18 +429,13 @@ class DeepseekV4DSparkDraftAdapter:
         ):
             raise ValueError("DSpark draft adapter is bound to one DeepSeek target")
 
-    def project_target_hidden(self, target_hidden: mx.array) -> mx.array:
-        hidden_size = int(self.target_model.args.hidden_size)
-        expected_width = hidden_size * len(_TARGET_LAYER_IDS)
-        if int(target_hidden.shape[-1]) != expected_width:
-            raise ValueError(
-                "DeepSeek V4 captured target width does not match taps 40/41/42"
-            )
-        taps = tuple(
-            target_hidden[..., index * hidden_size : (index + 1) * hidden_size]
-            for index in range(len(_TARGET_LAYER_IDS))
-        )
-        return self.owner.stages[0].fuse_main(taps)
+    def project_target_hidden(
+        self,
+        target_hidden: DeepseekV4TargetTapRows,
+    ) -> DeepseekV4TargetTapRows:
+        # The streaming owner must slice first: projecting all 8,224 captured
+        # rows here would immediately discard 8,096 of them for a 128-row ring.
+        return target_hidden
 
 
 class DeepseekV4DSparkBackend:
@@ -297,24 +449,21 @@ class DeepseekV4DSparkBackend:
         draft_model: DeepseekV4DSparkDraftAdapter,
         draft_cache: list[Any],
     ):
-        from dflash_mlx.engine.target_features import StreamingTargetFeatureStore
-
-        def consume_prompt_chunk(*, start: int, end: int, features: mx.array) -> None:
-            lengths = tuple(int(cache.prefill_length) for cache in draft_cache)
-            if len(set(lengths)) != 1 or lengths[0] != int(start):
-                raise RuntimeError(
-                    "DSpark streamed prompt position diverged from its cache"
-                )
-            next_position = self._append_context(
+        def consume_prompt_chunk(
+            *,
+            start: int,
+            end: int,
+            features: DeepseekV4TargetTapRows,
+        ) -> None:
+            del start, end
+            self._append_context(
                 draft_model=draft_model,
                 draft_cache=draft_cache,
                 draft_context=features,
             )
             mx.eval(*(cache.ring.records for cache in draft_cache))
-            if next_position != int(end):
-                raise RuntimeError("DSpark streamed prompt span was not fully consumed")
 
-        return StreamingTargetFeatureStore(
+        return DeepseekV4StreamingTargetFeatureStore(
             prompt_len=int(prompt_len),
             project_context=project_context,
             consume_prompt_chunk=consume_prompt_chunk,
@@ -337,7 +486,7 @@ class DeepseekV4DSparkBackend:
         for cache in caches:
             ring = getattr(cache, "ring", None)
             if (
-                getattr(ring, "mode", None) != "nvfp4_stock432"
+                getattr(ring, "mode", None) != "nvfp4_stock432_fixed_ring"
                 or getattr(ring, "record_bytes", None) != 432
                 or len(ring) != 0
             ):
@@ -351,36 +500,37 @@ class DeepseekV4DSparkBackend:
         *,
         draft_model: DeepseekV4DSparkDraftAdapter,
         draft_cache: list[Any],
-        draft_context: mx.array,
+        draft_context: DeepseekV4TargetTapRows,
     ) -> int:
-        if len(draft_cache) != 3 or int(draft_context.ndim) != 3:
-            raise ValueError("DSpark context append requires three caches and rank-3 rows")
-        lengths = tuple(int(cache.prefill_length) for cache in draft_cache)
-        if len(set(lengths)) != 1:
-            raise RuntimeError("DSpark stage cache positions diverged")
-        prior_length = lengths[0]
-        context_rows = int(draft_context.shape[1])
+        prior_length = int(draft_cache[0].prefill_length)
+        context_rows = draft_context.rows
         if context_rows == 0:
             return prior_length
-        if context_rows < 0:
-            raise ValueError("DSpark context append row count is invalid")
 
+        tail_count = min(context_rows, int(draft_model.args.sliding_window))
+        tail_offset = context_rows - tail_count
+        tail_start = prior_length + tail_offset
+        tail_context = draft_context.fuse_tail(tail_offset)
+        main_hidden = draft_model.owner.stages[0]._run_fuse_main_rows(tail_context)
+        positions = mx.arange(tail_start, prior_length + context_rows)
         if prior_length == 0:
             for stage, cache in zip(
                 draft_model.owner.stages,
                 draft_cache,
-                strict=True,
             ):
-                stage.attn.prefill_context(draft_context, cache)
+                latent, rope = stage.attn.project_kv(main_hidden, positions)
+                cache._install_prefill_tail(
+                    latent,
+                    rope,
+                    total_length=context_rows,
+                )
         else:
-            positions = mx.arange(prior_length, prior_length + context_rows)
             for stage, cache in zip(
                 draft_model.owner.stages,
                 draft_cache,
-                strict=True,
             ):
-                latent, rope = stage.attn.project_kv(draft_context, positions)
-                cache.commit_main(prior_length, latent, rope)
+                latent, rope = stage.attn.project_kv(main_hidden, positions)
+                cache._commit_main(tail_start, latent, rope)
         return prior_length + context_rows
 
     def draft_greedy(
@@ -391,20 +541,14 @@ class DeepseekV4DSparkBackend:
         draft_model: DeepseekV4DSparkDraftAdapter,
         draft_cache: list[Any],
         staged_first: mx.array,
-        draft_context: mx.array,
+        draft_context: DeepseekV4TargetTapRows,
         block_len: int,
         mask_token_tail: mx.array,
         suppress_token_mask: Optional[mx.array],
         async_launch: bool,
     ) -> mx.array:
-        del target_ops, mask_token_tail
-        if target_model is not draft_model.target_model:
-            raise ValueError("DSpark backend received a different target model")
+        del target_ops, mask_token_tail, suppress_token_mask, async_launch
         requested_width = int(block_len)
-        if not 2 <= requested_width <= _PHYSICAL_VERIFY_WIDTH:
-            raise ValueError("DeepSeek V4 DSpark draft width must be between two and six")
-        if suppress_token_mask is not None:
-            raise ValueError("DeepSeek V4 DSpark does not support token suppression")
 
         start_pos = self._append_context(
             draft_model=draft_model,
@@ -419,13 +563,8 @@ class DeepseekV4DSparkBackend:
             start_pos=start_pos,
         )
         full_draft = proposal.future_tokens.squeeze(0).astype(mx.uint32)
-        if tuple(full_draft.shape) != (_PHYSICAL_VERIFY_WIDTH - 1,):
-            raise ValueError("DeepSeek V4 DSpark must return exactly five future tokens")
         drafted = full_draft[: requested_width - 1]
-        if async_launch:
-            mx.async_eval(drafted)
-        else:
-            mx.eval(drafted)
+        mx.async_eval(drafted)
         return drafted
 
     def draft_greedy_capture(
@@ -436,7 +575,7 @@ class DeepseekV4DSparkBackend:
         draft_model: DeepseekV4DSparkDraftAdapter,
         draft_cache: list[Any],
         staged_first: mx.array,
-        draft_context: mx.array,
+        draft_context: DeepseekV4TargetTapRows,
         block_len: int,
         mask_token_tail: mx.array,
         suppress_token_mask: Optional[mx.array],
@@ -465,7 +604,7 @@ class DeepseekV4DSparkBackend:
         *,
         draft_model: DeepseekV4DSparkDraftAdapter,
         draft_cache: list[Any],
-        draft_context: mx.array,
+        draft_context: DeepseekV4TargetTapRows,
     ) -> None:
         self._append_context(
             draft_model=draft_model,
@@ -495,8 +634,17 @@ def generate_deepseek_v4_dflash2(
     from dflash_mlx.runtime import get_stop_token_ids
     from mtplx.generation import GenerationOutput, GenerationStats
 
-    if runtime_context is None:
-        raise ValueError("DeepSeek V4 DFlash2 requires a prebuilt runtime context")
+    if not isinstance(runtime_context, DeepseekV4DFlashRuntimeContext):
+        raise ValueError("DeepSeek V4 DFlash2 requires its installed runtime context")
+    if runtime_context is not getattr(bundle, "runtime_context", None):
+        raise ValueError("DeepSeek V4 DFlash2 runtime context is not owned by its bundle")
+    capacity = int(bundle.target_model._mia_engine_plan.context_capacity_tokens)
+    requested_span = len(prompt_ids) + int(max_tokens)
+    if requested_span > capacity:
+        raise ValueError(
+            f"DeepSeek V4 DFlash2 request span {requested_span} exceeds "
+            f"the installed {capacity}-token page plan"
+        )
     resolved_stop_ids = (
         [int(value) for value in stop_token_ids]
         if stop_token_ids is not None

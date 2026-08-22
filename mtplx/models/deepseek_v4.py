@@ -270,7 +270,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import List, Optional
 
 import mlx.core as mx
@@ -279,12 +279,31 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.switch_layers import SwiGLU, SwitchGLU
 from mtplx.attention_context import current_attention_phase
-from mtplx.deepseek_v4_nvfp4_kv import MiaNVFP4Rows, PagedMiaNVFP4Rows
-from mtplx.deepseek_v4_paged_indexer import (
-    PagedMiaIndexerRows,
-    install_paged_indexer_scores,
+from mtplx.deepseek_v4_nvfp4_kv import (
+    FixedMiaNVFP4Window,
+    MiaNVFP4Rows,
+    PagedMiaNVFP4Rows,
+    decode_stock432,
+    install_stock432_record_packer,
 )
-from mtplx.kernels.deepseek_v4_nvfp4_mla import install_nvfp4_sparse_mla
+from mtplx.deepseek_v4_paged_indexer import (
+    MiaIndexerQueryRecords,
+    MiaTopKSelection,
+    PagedMiaIndexerRows,
+    decode_indexer132,
+    install_indexer_query_records,
+    install_paged_indexer_topk,
+)
+from mtplx.kernels.deepseek_v4_compressor import (
+    fused_indexer_records,
+    fused_nvfp4_records,
+)
+from mtplx.kernels.deepseek_v4_nvfp4_mla import (
+    MiaMLAWorkspace,
+    install_nvfp4_prefill_mla,
+    install_nvfp4_sparse_mla,
+    mia_mla_workspace,
+)
 
 
 # Default per-layer compress ratios for DeepSeek-V4-Flash (43 body layers; the
@@ -1107,6 +1126,83 @@ class _DirectGatherOLora:
                 batch, sequence, self.groups * self.rank
             )
         )
+
+
+@lru_cache(maxsize=1)
+def _mia_inverse_rope_output_kernel():
+    source = r"""
+        uint element = thread_position_in_grid.x;
+        constexpr uint HEADS = 64u;
+        constexpr uint HEAD_DIM = 512u;
+        constexpr uint ROPE_START = 448u;
+        constexpr uint ROPE_DIM = 64u;
+        uint total = uint(rows) * HEADS * HEAD_DIM;
+        if (element >= total) return;
+        uint row = element / (HEADS * HEAD_DIM);
+        uint within = element % (HEADS * HEAD_DIM);
+        uint head = within / HEAD_DIM;
+        uint dim = within % HEAD_DIM;
+        float value = float(o[element]);
+        if (dim >= ROPE_START) {
+            uint rope_dim = dim - ROPE_START;
+            uint pair = rope_dim / 2u;
+            uint partner_dim = dim ^ 1u;
+            float partner = float(
+                o[(size_t(row) * HEADS + head) * HEAD_DIM + partner_dim]
+            );
+            float c = float(cos[size_t(row) * (ROPE_DIM / 2u) + pair]);
+            float s = float(sin[size_t(row) * (ROPE_DIM / 2u) + pair]);
+            value = (rope_dim & 1u) == 0u
+                ? value * c + partner * s
+                : value * c - partner * s;
+        }
+        projected_input[element] = T(value);
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_mia_fused_inverse_rope_wo_input",
+        input_names=["o", "cos", "sin", "rows"],
+        output_names=["projected_input"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+class _MiaInverseRopeGatherOLora:
+    """Fused inverse-RoPE producer feeding native MXFP8 WO-A/WO-B."""
+
+    __slots__ = ("inverse_rope", "projection")
+
+    def __init__(self, attention: "DeepseekV4Attention", quant: tuple) -> None:
+        if (
+            attention.n_heads,
+            attention.head_dim,
+            attention.rope_head_dim,
+            attention.n_groups,
+        ) != (64, 512, 64, 8):
+            raise ValueError("Mia fused WO route requires 64x512 heads in 8 groups")
+        if (int(quant[3]), int(quant[4]), str(quant[5])) != (32, 8, "mxfp8"):
+            raise ValueError("Mia fused WO route requires native group-32 MXFP8")
+        self.inverse_rope = _mia_inverse_rope_output_kernel()
+        self.projection = _DirectGatherOLora(attention, quant)
+
+    def __call__(self, o: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+        batch, sequence, heads, head_dim = (int(value) for value in o.shape)
+        rows = batch * sequence
+        elements = rows * heads * head_dim
+        (projected_input,) = self.inverse_rope(
+            inputs=[
+                mx.contiguous(o),
+                mx.contiguous(cos),
+                mx.contiguous(sin),
+                rows,
+            ],
+            template=[("T", o.dtype)],
+            grid=((elements + 255) // 256 * 256, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(batch, sequence, heads * head_dim)],
+            output_dtypes=[o.dtype],
+        )
+        return self.projection(projected_input)
 
 
 class _DirectGatherOLoraWideM4:
@@ -2113,6 +2209,7 @@ class Compressor(nn.Module):
         self.rope_head_dim = args.qk_rope_head_dim
         self.compress_ratio = compress_ratio
         self.overlap = compress_ratio == 4
+        self.rms_norm_eps = float(args.rms_norm_eps)
         # rotate=True is the indexer's copy: the reference Hadamard-rotates its pooled
         # rows before FP4-quantising them (model.py L368-370).  Applied in _pool, so
         # the prefill and streaming paths get it from the same place.
@@ -2127,6 +2224,80 @@ class Compressor(nn.Module):
         self._inv_freq = _yarn_inv_freq(
             self.rope_head_dim, args.compress_rope_theta, args.original_seq_len,
             args.rope_factor, args.beta_fast, args.beta_slow,
+        )
+        self._mia_record_impl = None
+
+    def install_mia_record_packer(self, mode: str) -> None:
+        """Bind the source-format fused finalizer before exact-model serving."""
+        selected = str(mode)
+        if selected == "nvfp4":
+            if self.head_dim != 512 or self.compress_ratio not in (4, 128):
+                raise ValueError("Mia NVFP4 compressor geometry is not supported")
+            self._mia_record_impl = self._nvfp4_record_impl
+        elif selected == "indexer":
+            if self.head_dim != 128 or self.compress_ratio != 4:
+                raise ValueError("Mia indexer compressor geometry is not supported")
+            self.rotate = False
+            self._mia_record_impl = self._indexer_record_impl
+        else:
+            raise ValueError(f"unknown Mia compressor record mode {selected!r}")
+
+    def _rope_tables_for_windows(
+        self, first_window: int, count: int
+    ) -> tuple[mx.array, mx.array]:
+        positions = (
+            mx.arange(int(count), dtype=mx.float32) + float(first_window)
+        ) * self.compress_ratio
+        angles = positions[:, None] * self._inv_freq[None, :]
+        return mx.cos(angles), mx.sin(angles)
+
+    def _nvfp4_record_impl(
+        self,
+        kv_windows: mx.array,
+        score_windows: mx.array,
+        previous_kv: Optional[mx.array],
+        previous_score: Optional[mx.array],
+        first_window: int,
+        has_previous: bool,
+        output_rows: int,
+    ) -> mx.array:
+        cos, sin = self._rope_tables_for_windows(first_window, output_rows)
+        return fused_nvfp4_records(
+            kv_windows,
+            score_windows,
+            kv_windows if previous_kv is None else previous_kv,
+            score_windows if previous_score is None else previous_score,
+            self.norm.weight,
+            cos,
+            sin,
+            compress_ratio=self.compress_ratio,
+            has_previous=has_previous,
+            output_rows=output_rows,
+            rms_eps=self.rms_norm_eps,
+        )
+
+    def _indexer_record_impl(
+        self,
+        kv_windows: mx.array,
+        score_windows: mx.array,
+        previous_kv: Optional[mx.array],
+        previous_score: Optional[mx.array],
+        first_window: int,
+        has_previous: bool,
+        output_rows: int,
+    ) -> mx.array:
+        cos, sin = self._rope_tables_for_windows(first_window, output_rows)
+        return fused_indexer_records(
+            kv_windows,
+            score_windows,
+            kv_windows if previous_kv is None else previous_kv,
+            score_windows if previous_score is None else previous_score,
+            self.norm.weight,
+            cos,
+            sin,
+            has_previous=has_previous,
+            output_rows=output_rows,
+            rms_eps=self.rms_norm_eps,
         )
     def _overlap_transform(
         self, t: mx.array, value: float, prev: Optional[mx.array] = None
@@ -2194,7 +2365,9 @@ class Compressor(nn.Module):
         out = mx.concatenate([pooled[..., :-self.rope_head_dim], tail], axis=-1)
         return _hadamard_rotate(out) if self.rotate else out
 
-    def _whole_components(self, x: mx.array) -> tuple[mx.array, mx.array]:
+    def _whole_projected_windows(
+        self, x: mx.array
+    ) -> tuple[mx.array, mx.array, int, object]:
         b, s, _ = x.shape
         ratio = self.compress_ratio
         d = self.head_dim
@@ -2202,17 +2375,34 @@ class Compressor(nn.Module):
         cutoff = s - (s % ratio)
         nwin = cutoff // ratio
         if nwin == 0:
+            width = (2 if self.overlap else 1) * d
+            empty = mx.zeros((b, 0, ratio, width), dtype=mx.float32)
+            return empty, empty, 0, out_dtype
+        xf = x.astype(mx.float32)
+        kv = self.wkv(xf)[:, :cutoff].reshape(b, nwin, ratio, -1)          # [b,nwin,ratio,coff*d]
+        score = self.wgate(xf)[:, :cutoff].reshape(b, nwin, ratio, -1) + self.ape
+        return kv, score, nwin, out_dtype
+
+    def _whole_components(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        b = int(x.shape[0])
+        d = self.head_dim
+        kv, score, nwin, out_dtype = self._whole_projected_windows(x)
+        if nwin == 0:
             return (
                 mx.zeros((b, 0, d), dtype=out_dtype),
                 mx.zeros((b, 0, self.rope_head_dim), dtype=out_dtype),
             )
-        xf = x.astype(mx.float32)
-        kv = self.wkv(xf)[:, :cutoff].reshape(b, nwin, ratio, -1)          # [b,nwin,ratio,coff*d]
-        score = self.wgate(xf)[:, :cutoff].reshape(b, nwin, ratio, -1) + self.ape
         if self.overlap:
             kv = self._overlap_transform(kv, 0.0)                          # [b,nwin,2*ratio,d]
             score = self._overlap_transform(score, float("-inf"))
         return self._pool_components(kv, score, 0, out_dtype)
+
+    def mia_records(self, x: mx.array) -> mx.array:
+        """Finalize a full prefill directly into the installed record format."""
+        if self._mia_record_impl is None:
+            raise RuntimeError("Mia compressor record packer was not installed")
+        kv, score, nwin, _ = self._whole_projected_windows(x)
+        return self._mia_record_impl(kv, score, None, None, 0, False, nwin)
 
     def __call__(self, x: mx.array) -> mx.array:
         """Whole-sequence pooling from ``start_pos == 0`` (the parity-gated path).
@@ -2233,14 +2423,13 @@ class Compressor(nn.Module):
             raise ValueError("the Mia attention K/V lane cannot use indexer rotation")
         return self._whole_components(x)
 
-    def _step_components(
+    def _step_projected_windows(
         self,
         x: mx.array,
         state: "CompressorState",
         offset: int,
-    ) -> tuple[mx.array, mx.array]:
-        """Incremental pooling: consume ``x`` (positions ``offset..offset+s-1``) and
-        emit the compressed rows whose windows *complete* inside that span.
+    ) -> tuple[mx.array, mx.array, object, object, int, object]:
+        """Advance the projected frontier and return newly completed windows.
 
         State machine adapted from ``ds4.c``'s ``compressor_decode_one`` (antirez/
         DwarfStar4, MIT): a token at position ``p`` lands in slot ``p % ratio`` of the
@@ -2252,12 +2441,12 @@ class Compressor(nn.Module):
         The buffered frontier is the window's *projected* rows (post-``ape`` for the
         gate), not the raw hidden states, so the emit does the same arithmetic on the
         same values ``__call__`` would have.  For the overlap lane ``state.prev_*``
-        keeps the last completed window's full-width rows, which
-        :meth:`_overlap_transform` folds in under the ``:d`` projection.
+        keeps the last completed window's full-width rows.  The returned previous
+        window lets either the generic pooler or the installed fused record finalizer
+        consume the same state transition without doing the projection twice.
         """
         b, s, _ = x.shape
         ratio = self.compress_ratio
-        d = self.head_dim
         out_dtype = _store_dtype(x.dtype)
         xf = x.astype(mx.float32)
         kv_rows = self.wkv(xf)                                   # [b, s, coff*d]
@@ -2268,39 +2457,104 @@ class Compressor(nn.Module):
         # (:meth:`CompressorState.rollback`).  Pushed BEFORE the frontier concat so
         # the journal stores each row exactly once, as the very array the emit path
         # consumes — a rebuilt frontier is then bit-identical, not merely equal.
-        state.push_rollback_rows(kv_rows, score_rows)
-        if state.cur_kv is not None:
-            kv_rows = mx.concatenate([state.cur_kv, kv_rows], axis=1)
-            score_rows = mx.concatenate([state.cur_score, score_rows], axis=1)
+        kv_rows, score_rows = state.append_projected_rows(
+            kv_rows,
+            score_rows,
+            offset=offset,
+        )
         # kv_rows[:, 0] is at position offset - (offset % ratio), a window boundary.
         total = kv_rows.shape[1]
         nwin = total // ratio
         filled = nwin * ratio
+        first_window = state.n_emitted
+        previous_kv = state.prev_kv
+        previous_score = state.prev_score
         if nwin:
             kv_w = kv_rows[:, :filled].reshape(b, nwin, ratio, -1)
             score_w = score_rows[:, :filled].reshape(b, nwin, ratio, -1)
             if self.overlap:
-                kv_slots = self._overlap_transform(kv_w, 0.0, state.prev_kv)
-                score_slots = self._overlap_transform(
-                    score_w, float("-inf"), state.prev_score
-                )
                 state.prev_kv = kv_w[:, -1]                      # [b, ratio, coff*d]
                 state.prev_score = score_w[:, -1]
-            else:
-                kv_slots, score_slots = kv_w, score_w
-            pooled, rope = self._pool_components(
-                kv_slots,
-                score_slots,
-                state.n_emitted,
-                out_dtype,
-            )
             state.n_emitted += nwin
         else:
-            pooled = mx.zeros((b, 0, d), dtype=out_dtype)
-            rope = mx.zeros((b, 0, self.rope_head_dim), dtype=out_dtype)
+            width = (2 if self.overlap else 1) * self.head_dim
+            kv_w = mx.zeros((b, 0, ratio, width), dtype=mx.float32)
+            score_w = kv_w
         state.cur_kv = kv_rows[:, filled:] if filled < total else None
         state.cur_score = score_rows[:, filled:] if filled < total else None
+        return (
+            kv_w,
+            score_w,
+            previous_kv,
+            previous_score,
+            first_window,
+            out_dtype,
+        )
+
+    def _step_components(
+        self,
+        x: mx.array,
+        state: "CompressorState",
+        offset: int,
+    ) -> tuple[mx.array, mx.array]:
+        kv_w, score_w, previous_kv, previous_score, first_window, out_dtype = (
+            self._step_projected_windows(x, state, offset)
+        )
+        nwin = int(kv_w.shape[1])
+        if nwin == 0:
+            return (
+                mx.zeros((int(x.shape[0]), 0, self.head_dim), dtype=out_dtype),
+                mx.zeros(
+                    (int(x.shape[0]), 0, self.rope_head_dim), dtype=out_dtype
+                ),
+            )
+        if self.overlap:
+            kv_slots = self._overlap_transform(kv_w, 0.0, previous_kv)
+            score_slots = self._overlap_transform(
+                score_w, float("-inf"), previous_score
+            )
+        else:
+            kv_slots, score_slots = kv_w, score_w
+        pooled, rope = self._pool_components(
+            kv_slots,
+            score_slots,
+            first_window,
+            out_dtype,
+        )
         return pooled, rope
+
+    def step_records(
+        self,
+        x: mx.array,
+        state: "CompressorState",
+        offset: int,
+    ) -> mx.array:
+        """Advance the frontier and emit source-format cache records directly."""
+        if self._mia_record_impl is None:
+            raise RuntimeError("Mia compressor record packer was not installed")
+        return self._step_records_installed(x, state, offset)
+
+    def _step_records_installed(
+        self,
+        x: mx.array,
+        state: "CompressorState",
+        offset: int,
+    ) -> mx.array:
+        """Advance through the construction-bound fused record finalizer."""
+        kv_w, score_w, previous_kv, previous_score, first_window, _ = (
+            self._step_projected_windows(x, state, offset)
+        )
+        nwin = int(kv_w.shape[1])
+        has_previous = self.overlap and previous_kv is not None
+        return self._mia_record_impl(
+            kv_w,
+            score_w,
+            previous_kv,
+            previous_score,
+            first_window,
+            has_previous,
+            nwin,
+        )
 
     def step(self, x: mx.array, state: "CompressorState", offset: int) -> mx.array:
         """Emit the legacy combined row used by the generic DeepSeek path."""
@@ -2323,23 +2577,32 @@ class Compressor(nn.Module):
         return self._step_components(x, state, offset)
 
 
+class _UninstalledMiaIndexerTopK:
+    __slots__ = ()
+
+    def __call__(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "the Mia indexer workspace was not installed before execution"
+        )
+
+
 class Indexer(nn.Module):
     """Sparse-position selector for ``compress_ratio==4`` layers (reference
     ``Indexer``, model.py L380-433).
 
-    It owns a second, narrower :class:`Compressor` (``index_head_dim`` wide, Hadamard
-    rotated) that pools the *same* token windows as the attention compressor, plus
-    ``wq_b``/``weights_proj``.  For each query it scores every compressed row
+    It owns a second, narrower :class:`Compressor` (``index_head_dim`` wide) that
+    pools the *same* token windows as the attention compressor, plus
+    ``wq_b``/``weights_proj``.  The generic reference lane Hadamard-rotates both
+    sides; the exact Mia lane installs its source-native unrotated FP8 contract.
+    For each query it scores every compressed row
 
         ``score[q, c] = sum_h relu(q_h · row_c) * weights[q, h]``
         ``weights     = weights_proj(x) / sqrt(index_head_dim * index_n_heads)``
 
     and keeps the top ``index_topk`` of the rows that are causally available to that
-    query.  :meth:`__call__` returns that decision as a boolean ``[b, s, n_comp]``
-    mask (True = attend), which is what attention needs — the reference instead
-    returns gathered indices for its sparse kernel and marks unusable slots ``-1``
-    (``sparse_attn``, kernel.py L323-327, zeroes those rows and scores them ``-inf``),
-    which is the same thing expressed for a gather.
+    query.  The generic route returns a boolean ``[b, s, n_comp]`` mask.  Exact Mia
+    installation replaces that construction-time callable with SparkInfer's compact
+    ``[b, s, topk]`` indices plus ``[b, s]`` lengths contract.
 
     Per-query ``k``: the reference prefill takes one global
     ``k = min(index_topk, end_pos // ratio)`` over ``-inf``-masked scores and then
@@ -2349,9 +2612,9 @@ class Indexer(nn.Module):
     covers the chunked-prefill case the reference has no branch for.
 
     The generic route keeps its historical full-precision scoring.  The exact Mia
-    route replaces the score callable at installation with the image's padded-cache
-    compatibility contract: Hadamard-rotated queries and K rows are E4M3-quantized
-    with one power-of-two FP32 scale per 128-wide row, K is retained as paged
+    route replaces the selector callable at installation with the image's padded-cache
+    compatibility contract: post-RoPE BF16 queries and K rows are E4M3-quantized
+    directly with one power-of-two FP32 scale per 128-wide row, K is retained as paged
     132-byte records, and the score kernel reads those pages through the block table.
     """
 
@@ -2375,30 +2638,55 @@ class Indexer(nn.Module):
             args.rope_factor, args.beta_fast, args.beta_slow,
         )
         self._score_rows = self._dense_score_rows
+        self._prepare_query_rows = self._hadamard_query_rows
+        self._select_rows = self._dense_select_rows
+        self._query_components_impl = self._legacy_query_components
 
     @staticmethod
     def _dense_score_rows(q: mx.array, weights: mx.array, rows: mx.array) -> mx.array:
         score = mx.einsum("bshd,btd->bsht", q, rows.astype(mx.float32))
         return mx.sum(mx.maximum(score, 0.0) * weights[..., None], axis=2)
 
-    def install_mia_paged_scores(self) -> None:
-        self._score_rows = install_paged_indexer_scores(
+    @staticmethod
+    def _hadamard_query_rows(q: mx.array) -> mx.array:
+        return _hadamard_rotate(q.astype(mx.float32))
+
+    @staticmethod
+    def _native_query_rows(q: mx.array) -> mx.array:
+        return q
+
+    def install_mia_paged_topk(self, workspace=None) -> None:
+        # Mia's fused FP8 indexer quantizes post-RoPE BF16 Q/K directly.  The
+        # generic DwarfStar lane's orthogonal Hadamard is not in the pinned
+        # vLLM/SparkInfer path and would change the post-quantization scores.
+        self.compressor.rotate = False
+        self.compressor.install_mia_record_packer("indexer")
+        self._prepare_query_rows = self._native_query_rows
+        self._mia_query_records = install_indexer_query_records(
             heads=self.n_heads,
             head_dim=self.head_dim,
+            rope_dim=self.rope_head_dim,
+            weight_scale=self.softmax_scale * self.n_heads**-0.5,
         )
+        self._query_components_impl = self._mia_query_components
+        self._mia_workspace = workspace
+        if workspace is None:
+            self._select_rows = _UninstalledMiaIndexerTopK()
+        else:
+            self._select_rows = install_paged_indexer_topk(
+                heads=self.n_heads,
+                head_dim=self.head_dim,
+                topk=self.index_topk,
+                compress_ratio=self.compress_ratio,
+                workspace=workspace,
+            )
 
-    def scores(
-        self, x: mx.array, qr: mx.array, positions: mx.array, rows: mx.array
-    ) -> mx.array:
-        """Per-query relevance of every compressed row (reference L411-421).
-
-        ``x``: ``[b, s, dim]`` (the attention input) — ``weights_proj`` reads it.
-        ``qr``: ``[b, s, q_lora_rank]`` — ``q_norm(wq_a(x))``, shared with attention.
-        ``positions``: ``[s]`` absolute query positions.
-        ``rows``: ``[b, n_comp, index_head_dim]`` every compressed row emitted so far.
-        Returns ``[b, s, n_comp]`` fp32.  No causality applied — that is
-        :meth:`__call__`'s job.
-        """
+    def _legacy_query_components(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        positions: mx.array,
+    ) -> tuple[mx.array, mx.array]:
         b, s, _ = x.shape
         rd = self.rope_head_dim
         q = self.wq_b(qr).reshape(b, s, self.n_heads, self.head_dim)
@@ -2413,30 +2701,78 @@ class Indexer(nn.Module):
             ],
             axis=-1,
         )
-        q = _hadamard_rotate(q.astype(mx.float32))
+        q = self._prepare_query_rows(q)
         weights = self.weights_proj(x).astype(mx.float32) * (
             self.softmax_scale * self.n_heads ** -0.5
-        )                                                        # [b, s, n_heads]
-        return self._score_rows(q, weights, rows)
+        )
+        return q, weights
 
-    def __call__(
+    def _mia_query_components(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        positions: mx.array,
+    ) -> tuple[MiaIndexerQueryRecords, mx.array]:
+        b, s, _ = x.shape
+        q = self.wq_b(qr).reshape(b, s, self.n_heads, self.head_dim)
+        weights = self.weights_proj(x)
+        return self._mia_query_records(
+            q,
+            weights,
+            positions,
+            self._inv_freq,
+        )
+
+    def _query_components(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        positions: mx.array,
+    ):
+        return self._query_components_impl(x, qr, positions)
+
+    def scores(
         self, x: mx.array, qr: mx.array, positions: mx.array, rows: mx.array
     ) -> mx.array:
-        """Select compressed rows for each query; returns ``[b, s, n_comp]`` bool."""
-        b, s, _ = x.shape
-        n_comp = int(rows.shape[1])
-        ratio = self.compress_ratio
-        score = self.scores(x, qr, positions, rows)
+        """Per-query relevance of every compressed row (reference L411-421).
 
-        # Causality: window c holds tokens [c*ratio, (c+1)*ratio), so query p may use
-        # it once p has completed it — the same rule the dense mask uses.
-        causal = (mx.arange(n_comp)[None, :] < ((positions[:, None] + 1) // ratio))[None]
+        ``x``: ``[b, s, dim]`` (the attention input) — ``weights_proj`` reads it.
+        ``qr``: ``[b, s, q_lora_rank]`` — ``q_norm(wq_a(x))``, shared with attention.
+        ``positions``: ``[s]`` absolute query positions.
+        ``rows``: ``[b, n_comp, index_head_dim]`` every compressed row emitted so far.
+        Returns ``[b, s, n_comp]`` fp32.  No causality applied — that is
+        :meth:`__call__`'s job.
+        """
+        q, weights = self._query_components(x, qr, positions)
+        return self._score_rows(q, weights, rows)
+
+    def _dense_select_rows(
+        self,
+        q: mx.array,
+        weights: mx.array,
+        positions: mx.array,
+        rows: mx.array,
+    ) -> mx.array:
+        b, s = (int(dim) for dim in q.shape[:2])
+        n_comp = int(rows.shape[1])
+        score = self._score_rows(q, weights, rows)
+        causal = (
+            mx.arange(n_comp)[None, :]
+            < ((positions[:, None] + 1) // self.compress_ratio)
+        )[None]
         key = mx.where(causal, score, mx.array(-float("inf"), mx.float32))
         k_row = mx.minimum(
-            mx.sum(causal.astype(mx.int32), axis=-1, keepdims=True), self.index_topk
+            mx.sum(causal.astype(mx.int32), axis=-1, keepdims=True),
+            self.index_topk,
         )
         k_row = mx.broadcast_to(k_row, (b, s, 1))
         return _topk_mask(key, k_row, min(self.index_topk, n_comp)) & causal
+
+    def __call__(
+        self, x: mx.array, qr: mx.array, positions: mx.array, rows: mx.array
+    ) -> mx.array | MiaTopKSelection:
+        q, weights = self._query_components(x, qr, positions)
+        return self._select_rows(q, weights, positions, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -2516,6 +2852,24 @@ class CompressorState:
             self.tail_kv = self.tail_kv[:, -self.rollback_rows:]
             self.tail_score = self.tail_score[:, -self.rollback_rows:]
 
+    def append_projected_rows(
+        self,
+        kv: mx.array,
+        score: mx.array,
+        *,
+        offset: int,
+    ) -> tuple[mx.array, mx.array]:
+        """Append projected state for the generic retained-array owner."""
+
+        del offset
+        self.push_rollback_rows(kv, score)
+        if self.cur_kv is None:
+            return kv, score
+        return (
+            mx.concatenate([self.cur_kv, kv], axis=1),
+            mx.concatenate([self.cur_score, score], axis=1),
+        )
+
     def rollback(self, n: int, new_offset: int) -> None:
         """Rewind ``n`` token positions; ``new_offset`` is the resulting offset.
 
@@ -2552,6 +2906,113 @@ class CompressorState:
             lo = kept - r - self.ratio
             self.prev_kv = self.tail_kv[:, lo: lo + self.ratio]
             self.prev_score = self.tail_score[:, lo: lo + self.ratio]
+        else:
+            self.prev_kv = None
+            self.prev_score = None
+
+
+class FixedMiaCompressorState(CompressorState):
+    """Single-sequence circular compressor state derived from vLLM pages.
+
+    vLLM stores every projected compressor row in its request page table, then
+    the fused boundary gathers the ratio-sized state window by absolute token
+    position.  The Mia MTPLX route owns one sequence and never shares prefixes,
+    so only ``(1 + overlap) * ratio + rollback`` recent rows are live.  This
+    owner preserves the same absolute-position lookup while bounding storage
+    and eliminating incremental ``concatenate`` journals.
+    """
+
+    mode = "mia_fixed_compressor_state"
+
+    def __init__(
+        self,
+        *,
+        ratio: int,
+        overlap: bool,
+        rollback_capacity: int,
+        state_width: int,
+    ) -> None:
+        super().__init__(
+            ratio=ratio,
+            overlap=overlap,
+            rollback_capacity=rollback_capacity,
+        )
+        self.state_width = int(state_width)
+        self._journal_kv = mx.zeros(
+            (1, self.rollback_rows, self.state_width),
+            dtype=mx.float32,
+        )
+        self._journal_score = mx.zeros(
+            (1, self.rollback_rows, self.state_width),
+            dtype=mx.float32,
+        )
+        self._journal_end = 0
+        self._journal_length = 0
+
+    @property
+    def journal_buffers(self) -> tuple[mx.array, mx.array]:
+        return self._journal_kv, self._journal_score
+
+    def reset(self) -> None:
+        self.cur_kv = None
+        self.cur_score = None
+        self.prev_kv = None
+        self.prev_score = None
+        self.tail_kv = None
+        self.tail_score = None
+        self.n_emitted = 0
+        self._journal_end = 0
+        self._journal_length = 0
+
+    def _latest(self, count: int) -> tuple[mx.array, mx.array]:
+        positions = (
+            mx.arange(self._journal_end - int(count), self._journal_end)
+            % self.rollback_rows
+        )
+        return self._journal_kv[:, positions], self._journal_score[:, positions]
+
+    def append_projected_rows(
+        self,
+        kv: mx.array,
+        score: mx.array,
+        *,
+        offset: int,
+    ) -> tuple[mx.array, mx.array]:
+        offset = int(offset)
+        count = int(kv.shape[1])
+        retained = min(count, self.rollback_rows)
+        source_start = count - retained
+        absolute_start = offset + source_start
+        positions = (
+            mx.arange(absolute_start, offset + count, dtype=mx.int32)
+            % self.rollback_rows
+        )
+        self._journal_kv[:, positions] = kv[:, source_start:]
+        self._journal_score[:, positions] = score[:, source_start:]
+        self._journal_end = offset + count
+        self._journal_length = min(self.rollback_rows, self._journal_end)
+
+        prior = offset % self.ratio
+        if prior == 0:
+            return kv, score
+        return self._latest(prior + count)
+
+    def rollback(self, n: int, new_offset: int) -> None:
+        del n
+        new_offset = int(new_offset)
+        self._journal_end = new_offset
+        self._journal_length = min(self.rollback_rows, new_offset)
+        self.n_emitted = new_offset // self.ratio
+        remainder = new_offset % self.ratio
+        if remainder:
+            self.cur_kv, self.cur_score = self._latest(remainder)
+        else:
+            self.cur_kv = None
+            self.cur_score = None
+        if self.overlap and self.n_emitted > 0:
+            previous_kv, previous_score = self._latest(remainder + self.ratio)
+            self.prev_kv = previous_kv[:, : self.ratio]
+            self.prev_score = previous_score[:, : self.ratio]
         else:
             self.prev_kv = None
             self.prev_score = None
@@ -2889,6 +3350,7 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         head_dim: int,
         rollback_capacity: int = _DEFAULT_ROLLBACK_CAPACITY,
         capacity_tokens: Optional[int] = None,
+        max_batch_tokens: Optional[int] = None,
     ) -> None:
         super().__init__(
             window_size=window_size,
@@ -2896,9 +3358,40 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
             head_dim=head_dim,
             rollback_capacity=rollback_capacity,
         )
+        if self.compress_ratio:
+            overlap = self.compress_ratio == 4
+            self.comp = FixedMiaCompressorState(
+                ratio=self.compress_ratio,
+                overlap=overlap,
+                rollback_capacity=self.rollback_capacity,
+                state_width=(2 if overlap else 1) * self.head_dim,
+            )
+            if self.compress_ratio == 4:
+                self.index_comp = FixedMiaCompressorState(
+                    ratio=self.compress_ratio,
+                    overlap=True,
+                    rollback_capacity=self.rollback_capacity,
+                    state_width=2 * 128,
+                )
         if self.head_dim != 512:
             raise ValueError("Mia stock432 target cache requires head_dim=512")
-        self.window = MiaNVFP4Rows()
+        self._pack_window_records = install_stock432_record_packer(
+            head_dim=self.head_dim,
+            rope_dim=64,
+        )
+        if max_batch_tokens is None:
+            self.window = MiaNVFP4Rows()
+            self._update_window_impl = self._update_growing_window
+        else:
+            max_batch_tokens = int(max_batch_tokens)
+            if max_batch_tokens <= 0:
+                raise ValueError("Mia fixed target window requires max_batch_tokens")
+            self.window = FixedMiaNVFP4Window(
+                capacity_rows=(
+                    max_batch_tokens + self.window_size + self.rollback_capacity
+                )
+            )
+            self._update_window_impl = self._update_fixed_window
         if self.compress_ratio:
             if capacity_tokens is None or int(capacity_tokens) <= 0:
                 raise ValueError(
@@ -2932,9 +3425,16 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         return 0 if self.index_compressed is None else len(self.index_compressed)
 
     def update_window(self, latent: mx.array, rope: mx.array):
+        return self._update_window_impl(latent, rope)
+
+    def _update_growing_window(self, latent: mx.array, rope: mx.array):
         s = int(latent.shape[1])
         buf_start = self.offset if len(self.window) == 0 else self.window_start
-        self.window.append(latent, rope)
+        records = self._pack_window_records(latent, rope)
+        self.window._append_installed_records(
+            records,
+            prefix=tuple(int(value) for value in records.shape[:-2]),
+        )
         total = len(self.window)
         first_visible = max(0, self.offset - self.window_size + 1)
         lo = max(0, first_visible - buf_start)
@@ -2947,19 +3447,34 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         self.window_start = buf_start
         return records, start
 
+    def _update_fixed_window(self, latent: mx.array, rope: mx.array):
+        s = int(latent.shape[1])
+        records = self._pack_window_records(latent, rope)
+        self.window._append_installed_records(
+            records,
+            absolute_start=self.offset,
+        )
+        start = max(0, self.offset - self.window_size + 1)
+        visible = self.window.slice(start, self.offset + s)
+        keep = self.window_size + self.rollback_capacity
+        retained_start = max(0, self.offset + s - keep)
+        self.window.drop_before(retained_start)
+        self.window_start = retained_start
+        return visible, start
+
     @staticmethod
     def attention_window_length(records: mx.array) -> int:
         return int(records.shape[1])
 
     def update_compressed(self, compressor: Compressor, x: mx.array) -> None:
-        latent, rope = compressor.step_nvfp4(x, self.comp, self.offset)
-        if latent.shape[1]:
-            self.compressed.append(latent, rope)
+        records = compressor._step_records_installed(x, self.comp, self.offset)
+        if records.shape[1]:
+            self.compressed._append_installed_records(records)
 
     def update_index_compressed(self, compressor: Compressor, x: mx.array) -> None:
-        rows = compressor.step(x, self.index_comp, self.offset)
-        if rows.shape[1]:
-            self.index_compressed.append(rows)
+        records = compressor._step_records_installed(x, self.index_comp, self.offset)
+        if records.shape[1]:
+            self.index_compressed._append_installed_records(records)
 
     def attention_index_compressed(self):
         if self.index_compressed is None or len(self.index_compressed) == 0:
@@ -2990,6 +3505,24 @@ class DeepseekV4NVFP4Cache(DeepseekV4Cache):
         self.window.truncate(len(self.window) - n)
         if len(self.window) == 0:
             self.window_start = new_offset
+        if self.compress_ratio:
+            n_rows = new_offset // self.compress_ratio
+            self.compressed.truncate(n_rows)
+            self.comp.rollback(n, new_offset)
+            if self.compress_ratio == 4:
+                self.index_compressed.truncate(n_rows)
+                self.index_comp.rollback(n, new_offset)
+        self.offset = new_offset
+        return n
+
+    def _trim_installed(self, n: int) -> int:
+        """Rewind a verifier-qualified tail without repeating arena proofs."""
+
+        n = int(n)
+        if n <= 0:
+            return 0
+        new_offset = int(self.offset) - n
+        self.window.truncate(len(self.window) - n)
         if self.compress_ratio:
             n_rows = new_offset // self.compress_ratio
             self.compressed.truncate(n_rows)
@@ -3111,6 +3644,8 @@ class DeepseekV4Attention(nn.Module):
         self._cached_attention_impl = self._legacy_cached_attention
         self._cached_mask_impl = self._attn_mask
         self._finalize_attention_impl = self._inverse_rope_output
+        self._output_projection_impl = self._stock_output_projection
+        self._forward_impl = self._stock_forward
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
@@ -3166,8 +3701,7 @@ class DeepseekV4Attention(nn.Module):
         compressor: Compressor,
         x: mx.array,
     ) -> tuple[mx.array, mx.array]:
-        latent, rope = compressor.nvfp4(x)
-        return self._mia_uncached_kv(latent, rope)
+        return decode_stock432(compressor.mia_records(x))
 
     def _legacy_cached_attention(
         self,
@@ -3204,7 +3738,7 @@ class DeepseekV4Attention(nn.Module):
         query_count = int(queries.shape[2])
         if compressed_records is None:
             compressed_indices = None
-            compressed_lengths = mx.zeros((1, query_count), dtype=mx.int32)
+            compressed_lengths = self._mia_mla_workspace.lengths(query_count)
         elif compressed_selection is None:
             compressed_indices = None
             compressed_lengths = mx.minimum(
@@ -3212,31 +3746,21 @@ class DeepseekV4Attention(nn.Module):
                 (query_positions + 1) // int(ratio),
             )[None].astype(mx.int32)
         else:
-            n_compressed = int(compressed_selection.shape[-1])
-            k_max = min(self.indexer.index_topk, n_compressed)
-            row_indices = mx.arange(n_compressed, dtype=mx.int32)
-            candidates = mx.where(
-                compressed_selection,
-                row_indices,
-                mx.array(n_compressed, dtype=mx.int32),
-            )
-            partition = mx.argpartition(candidates, k_max - 1, axis=-1)[..., :k_max]
-            selected = mx.take_along_axis(candidates, partition, axis=-1)
-            compressed_indices = mx.sort(selected, axis=-1)
-            compressed_lengths = mx.sum(
-                compressed_selection.astype(mx.int32),
-                axis=-1,
-            )
-        return self._nvfp4_sparse_mla(
+            compressed_indices = compressed_selection.indices
+            compressed_lengths = compressed_selection.lengths
+        runner = (
+            self._nvfp4_prefill_mla
+            if current_attention_phase() == "prefill"
+            else self._nvfp4_sparse_mla
+        )
+        return runner(
             queries,
             window_records,
             window_start,
-            query_positions.astype(mx.int32),
+            query_positions,
             compressed_records,
             compressed_indices,
             compressed_lengths,
-            self.attn_sink.astype(mx.float32),
-            self.softmax_scale,
         )
 
     def _inverse_rope_output(
@@ -3257,6 +3781,16 @@ class DeepseekV4Attention(nn.Module):
             axis=-1,
         )
 
+    def _stock_output_projection(self, output, cos, sin):
+        output = self._finalize_attention_impl(output, cos, sin)
+        batch, sequence = (int(value) for value in output.shape[:2])
+        return self._o_lora(
+            output.reshape(batch, sequence, self.n_heads * self.head_dim)
+        )
+
+    def _project_attention_output(self, output, cos, sin):
+        return self._output_projection_impl(output, cos, sin)
+
     @staticmethod
     def _no_additive_mask(
         q_pos: mx.array,
@@ -3270,23 +3804,58 @@ class DeepseekV4Attention(nn.Module):
         del q_pos, kv_pos, n_win, n_comp, ratio, dtype, comp_sel
         return None
 
-    def install_mia_nvfp4_attention(self) -> None:
+    def install_mia_nvfp4_attention(
+        self,
+        workspace: MiaMLAWorkspace | None = None,
+    ) -> None:
         """Bind exact Mia K/V construction and raw-V output at model install."""
         if self.head_dim != 512 or self.rope_head_dim != 64:
             raise ValueError(
                 "Mia stock432 attention requires head_dim=512 and rope_head_dim=64"
             )
+        if self.compress_ratio:
+            self.compressor.install_mia_record_packer("nvfp4")
+        self._mia_attn_sink = self.attn_sink.astype(mx.float32)
+        mx.eval(self._mia_attn_sink)
+        workspace = workspace or mia_mla_workspace()
+        self._mia_mla_workspace = workspace
         self._uncached_kv_impl = self._mia_uncached_kv
         self._uncached_compressed_impl = self._mia_uncached_compressed
-        self._nvfp4_sparse_mla = install_nvfp4_sparse_mla(
-            heads=self.n_heads,
-            head_dim=self.head_dim,
-            rope_dim=self.rope_head_dim,
-            window_size=self.window_size,
-            paged_compressed=bool(self.compress_ratio),
+        self._nvfp4_sparse_mla = partial(
+            install_nvfp4_sparse_mla(
+                heads=self.n_heads,
+                head_dim=self.head_dim,
+                rope_dim=self.rope_head_dim,
+                window_size=self.window_size,
+                paged_compressed=bool(self.compress_ratio),
+                workspace=workspace,
+            ),
+            sinks=self._mia_attn_sink,
+            scale=self.softmax_scale,
+        )
+        self._nvfp4_prefill_mla = partial(
+            install_nvfp4_prefill_mla(
+                heads=self.n_heads,
+                head_dim=self.head_dim,
+                rope_dim=self.rope_head_dim,
+                window_size=self.window_size,
+                paged_compressed=bool(self.compress_ratio),
+                workspace=workspace,
+            ),
+            sinks=self._mia_attn_sink,
+            scale=self.softmax_scale,
         )
         if self.compress_ratio == 4:
-            self.indexer.install_mia_paged_scores()
+            self.indexer.install_mia_paged_topk()
+            self._forward_impl = self._mia_cached_forward_ratio4
+        elif self.compress_ratio == 128:
+            self._forward_impl = self._mia_cached_forward_ratio128
+        elif self.compress_ratio == 0:
+            self._forward_impl = self._mia_cached_forward_uncompressed
+        else:
+            raise ValueError(
+                f"unsupported Mia compression ratio {self.compress_ratio}"
+            )
         self._cached_attention_impl = self._mia_cached_attention
         self._cached_mask_impl = self._no_additive_mask
         self._finalize_attention_impl = self._inverse_rope_output
@@ -3367,12 +3936,15 @@ class DeepseekV4Attention(nn.Module):
                     "is forbidden"
                 )
             installed = _DirectGatherOLora(self, quant)
+            output_projection = _MiaInverseRopeGatherOLora(self, quant)
             direct = True
         else:
             installed = self._o_lora_dense
+            output_projection = self._stock_output_projection
             direct = False
         self.o_lora_mode = selected
         self._o_lora_impl = installed
+        self._output_projection_impl = output_projection
         return {
             "mode": selected,
             "direct": direct,
@@ -3559,7 +4131,168 @@ class DeepseekV4Attention(nn.Module):
         """
         return self.compress_ratio == 4 and n_comp > self.indexer.index_topk
 
-    def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
+    def _mia_cached_qkv(self, x: mx.array, cache):
+        """Project Q/K/V for a construction-bound Mia cache owner."""
+        batch, sequence, _ = x.shape
+        rope_dim = self.rope_head_dim
+        offset = int(cache.offset)
+        positions = mx.arange(offset, offset + sequence, dtype=mx.int32)
+        cos, sin = self._rope_tables(positions)
+
+        query_rank = self.q_norm(self.wq_a(x))
+        query = self.wq_b(query_rank).reshape(
+            batch,
+            sequence,
+            self.n_heads,
+            self.head_dim,
+        )
+        query = query * mx.rsqrt(
+            mx.mean(mx.square(query.astype(mx.float32)), axis=-1, keepdims=True)
+            + self.eps
+        )
+        query = query.astype(x.dtype)
+        query = mx.concatenate(
+            [
+                query[..., :-rope_dim],
+                _apply_interleaved_rope(
+                    query[..., -rope_dim:],
+                    cos[None, :, None, :],
+                    sin[None, :, None, :],
+                ),
+            ],
+            axis=-1,
+        )
+        latent = self.kv_norm(self.wkv(x))
+        rope = _apply_interleaved_rope(
+            latent[..., -rope_dim:],
+            cos[None, :, :],
+            sin[None, :, :],
+        )
+        return (
+            query.transpose(0, 2, 1, 3),
+            query_rank,
+            latent,
+            rope,
+            positions,
+            cos,
+            sin,
+        )
+
+    def _mia_finish_cached(
+        self,
+        query: mx.array,
+        window_records: mx.array,
+        compressed_records,
+        window_start: int,
+        positions: mx.array,
+        compressed_selection,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> mx.array:
+        output = self._cached_attention_impl(
+            query,
+            window_records,
+            compressed_records,
+            window_start,
+            positions,
+            self.compress_ratio,
+            compressed_selection,
+            None,
+        )
+        return self._project_attention_output(
+            output.transpose(0, 2, 1, 3),
+            cos,
+            sin,
+        )
+
+    def _mia_cached_forward_uncompressed(
+        self,
+        x: mx.array,
+        mask=None,
+        cache=None,
+    ) -> mx.array:
+        del mask
+        query, _qr, latent, rope, positions, cos, sin = self._mia_cached_qkv(
+            x, cache
+        )
+        window_records, window_start = cache.update_window(latent, rope)
+        cache.advance(int(x.shape[1]))
+        return self._mia_finish_cached(
+            query,
+            window_records,
+            None,
+            window_start,
+            positions,
+            None,
+            cos,
+            sin,
+        )
+
+    def _mia_cached_forward_ratio128(
+        self,
+        x: mx.array,
+        mask=None,
+        cache=None,
+    ) -> mx.array:
+        del mask
+        query, _qr, latent, rope, positions, cos, sin = self._mia_cached_qkv(
+            x, cache
+        )
+        cache.update_compressed(self.compressor, x)
+        window_records, window_start = cache.update_window(latent, rope)
+        compressed_records = (
+            cache.compressed.paged_records if cache.n_compressed else None
+        )
+        cache.advance(int(x.shape[1]))
+        return self._mia_finish_cached(
+            query,
+            window_records,
+            compressed_records,
+            window_start,
+            positions,
+            None,
+            cos,
+            sin,
+        )
+
+    def _mia_cached_forward_ratio4(
+        self,
+        x: mx.array,
+        mask=None,
+        cache=None,
+    ) -> mx.array:
+        del mask
+        query, query_rank, latent, rope, positions, cos, sin = (
+            self._mia_cached_qkv(x, cache)
+        )
+        cache.update_compressed(self.compressor, x)
+        cache.update_index_compressed(self.indexer.compressor, x)
+        window_records, window_start = cache.update_window(latent, rope)
+        compressed_count = cache.n_compressed
+        compressed_records = (
+            cache.compressed.paged_records if compressed_count else None
+        )
+        compressed_selection = None
+        if compressed_count > self.indexer.index_topk:
+            compressed_selection = self.indexer(
+                x,
+                query_rank,
+                positions,
+                cache.index_compressed.paged_records,
+            )
+        cache.advance(int(x.shape[1]))
+        return self._mia_finish_cached(
+            query,
+            window_records,
+            compressed_records,
+            window_start,
+            positions,
+            compressed_selection,
+            cos,
+            sin,
+        )
+
+    def _stock_forward(self, x: mx.array, mask=None, cache=None) -> mx.array:
         # Attends the causal sliding window over per-position KV plus the compressed
         # KV rows the ratio-4 indexer selects (every causal row on ratio-128 layers,
         # and on ratio-4 layers below index_topk) — the dense-mask equivalent of the
@@ -3628,10 +4361,6 @@ class DeepseekV4Attention(nn.Module):
             n_win = cache.attention_window_length(window_rows)
             compressed_rows = cache.attention_compressed() if n_comp else None
             if self._indexer_active(n_comp):
-                assert cache.n_index_compressed == n_comp, (
-                    "indexer compressor lane desynced from the attention lane: "
-                    f"{cache.n_index_compressed} vs {n_comp}"
-                )
                 comp_sel = self.indexer(
                     x,
                     qr,
@@ -3685,9 +4414,10 @@ class DeepseekV4Attention(nn.Module):
                 add,
             )
         o = o.transpose(0, 2, 1, 3)            # [b, s, h, head_dim]
-        o = self._finalize_attention_impl(o, cos, sin)
-        o = o.reshape(b, s, self.n_heads * self.head_dim)
-        return self._o_lora(o)
+        return self._project_attention_output(o, cos, sin)
+
+    def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
+        return self._forward_impl(x, mask=mask, cache=cache)
 
 
 # ---------------------------------------------------------------------------
@@ -3789,6 +4519,7 @@ class MoEGate(nn.Module):
             self.tid2eid = mx.zeros((args.vocab_size, self.topk), dtype=mx.int32)
         else:
             self.e_score_correction_bias = mx.zeros((self.n_routed,))
+        self._route_impl = self._stock_route
 
     def _score(self, x: mx.array) -> mx.array:
         s = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
@@ -3799,7 +4530,7 @@ class MoEGate(nn.Module):
         # sqrtsoftplus
         return mx.sqrt(nn.softplus(s))
 
-    def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
+    def _stock_route(self, x: mx.array, input_ids: Optional[mx.array] = None):
         scores = self._score(x)  # [n, n_routed]
         if self.hash:
             assert input_ids is not None
@@ -3812,6 +4543,75 @@ class MoEGate(nn.Module):
             weights = weights / (mx.sum(weights, axis=-1, keepdims=True))
         weights = weights * self.route_scale
         return indices, weights
+
+    def _mia_score_route(self, x: mx.array, input_ids: Optional[mx.array] = None):
+        logits = self._mia_projection(x, self.weight)
+        return self._mia_router(logits, self.e_score_correction_bias, input_ids)
+
+    def _mia_hash_route(self, x: mx.array, input_ids: Optional[mx.array] = None):
+        logits = self._mia_projection(x, self.weight)
+        return self._mia_router(logits, self.tid2eid, input_ids)
+
+    def install_mia_router(self) -> None:
+        """Install the pinned fused-topk-bias route before generation."""
+        if (
+            self.score_func != "sqrtsoftplus"
+            or not self.norm_topk_prob
+            or self.topk != 6
+            or self.n_routed not in (64, 216)
+            or self.dim != 4096
+            or self.route_scale != 1.5
+            or tuple(self.weight.shape) != (self.n_routed, self.dim)
+            or self.weight.dtype != mx.bfloat16
+        ):
+            raise ValueError(
+                "Mia router requires BF16 K4096 K64/K216 normalized "
+                "sqrtsoftplus top-6 routing scaled by 1.5"
+            )
+        from mtplx.kernels.deepseek_v4_moe_router import (
+            install_hash_router,
+            install_router_projection,
+            install_score_router,
+        )
+
+        self._mia_projection = install_router_projection(experts=self.n_routed)
+
+        if self.hash:
+            if (
+                self.n_routed != 216
+                or tuple(self.tid2eid.shape) != (129280, self.topk)
+                or self.tid2eid.dtype != mx.int32
+            ):
+                raise ValueError("Mia hash router table contract changed")
+            self._mia_router = install_hash_router(
+                experts=self.n_routed,
+                topk=self.topk,
+                route_scale=self.route_scale,
+            )
+            self._route_impl = self._mia_hash_route
+            route_kind = "hash_tid2eid_int32"
+        else:
+            if (
+                tuple(self.e_score_correction_bias.shape) != (self.n_routed,)
+                or self.e_score_correction_bias.dtype != mx.float32
+            ):
+                raise ValueError("Mia score correction contract changed")
+            self._mia_router = install_score_router(
+                experts=self.n_routed,
+                topk=self.topk,
+                route_scale=self.route_scale,
+            )
+            self._route_impl = self._mia_score_route
+            route_kind = "bias_selection_fp32"
+        self._mia_router_contract = (
+            "bf16xbf16_fp32_k4096",
+            "softplus_threshold20_sqrt",
+            route_kind,
+            "unbiased_normalize_scale1p5",
+        )
+
+    def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
+        return self._route_impl(x, input_ids)
 
 
 class DeepseekV4MoE(nn.Module):
@@ -3855,14 +4655,57 @@ class DeepseekV4MoE(nn.Module):
         # stock route until ``configure_deepseek_v4_moe_tail`` validates the
         # fully loaded model and prebinds the candidate at the runtime boundary.
         self._tail_combine = _stock_moe_tail_combine
+        self._forward_impl = self._stock_forward
+        self._input_rows_impl = self._optional_input_rows
+
+    @staticmethod
+    def _optional_input_rows(input_ids: Optional[mx.array]):
+        return input_ids.reshape(-1) if input_ids is not None else None
+
+    @staticmethod
+    def _required_input_rows(input_ids: mx.array):
+        return input_ids.reshape(-1)
+
+    def _stock_forward(
+        self, xf: mx.array, ids: Optional[mx.array]
+    ) -> mx.array:
+        indices, weights = self.gate(xf, ids)
+        y = self.switch_mlp(xf, indices)
+        y = self._tail_combine(y, weights, self.shared_experts(xf))
+        return y
+
+    def _mia_exl3_forward(
+        self, xf: mx.array, ids: Optional[mx.array]
+    ) -> mx.array:
+        indices, weights = self.gate(xf, ids)
+        return self.switch_mlp.fused(
+            xf,
+            indices,
+            weights,
+            self.shared_experts(xf),
+        )
+
+    def install_mia_exl3_runtime(self, *, max_tokens: int) -> None:
+        from mtplx.deepseek_v4_exl3 import EXL3SwitchGLU
+
+        if not isinstance(self.switch_mlp, EXL3SwitchGLU):
+            raise ValueError("Mia EXL3 runtime requires rank-sliced expert banks")
+        self.gate.install_mia_router()
+        self.switch_mlp.install_trellis_runtime(max_tokens=max_tokens)
+        self._forward_impl = self._mia_exl3_forward
+        self._input_rows_impl = self._required_input_rows
+
+    def install_mia_k64_runtime(self) -> None:
+        """Seal the native K64 expert route and required token IDs."""
+
+        self.gate.install_mia_router()
+        self._input_rows_impl = self._required_input_rows
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None) -> mx.array:
         shape = x.shape
         xf = x.reshape(-1, shape[-1])
-        ids = input_ids.reshape(-1) if input_ids is not None else None
-        indices, weights = self.gate(xf, ids)
-        y = self.switch_mlp(xf, indices)
-        y = self._tail_combine(y, weights, self.shared_experts(xf))
+        ids = self._input_rows_impl(input_ids)
+        y = self._forward_impl(xf, ids)
         return y.reshape(shape)
 
 
@@ -4005,8 +4848,10 @@ class DeepseekV4Model(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.hc_head = HeadHC(args.hidden_size, args.hc_mult, args.hc_eps)
+        self._hc_hidden_impl = self._stock_hc_hidden
+        self._collapse_impl = self._stock_collapse
 
-    def hc_hidden(self, input_ids: mx.array, cache=None) -> mx.array:
+    def _stock_hc_hidden(self, input_ids: mx.array, cache=None) -> mx.array:
         """Run the body and stop at the Hyper-Connection state ``[b, s, hc, dim]``.
 
         This is the split point the MTP block needs: the reference keeps ``h`` in
@@ -4027,10 +4872,222 @@ class DeepseekV4Model(nn.Module):
             h = layer(h, mask=None, cache=c, input_ids=input_ids)
         return h
 
-    def collapse(self, h: mx.array) -> mx.array:
+    def _stock_collapse(self, h: mx.array) -> mx.array:
         """Head-side collapse of the hc copies + final norm (``ParallelHead.forward``
         L718-721, minus the ``lm_head`` matmul the caller owns)."""
         return self.norm(self.hc_head(h))
+
+    def _mia_hc_body(self, input_ids: mx.array, cache, tap_ids=()):
+        if cache is None:
+            cache = [None] * len(self.layers)
+        return self._run_mia_hc_body(input_ids, cache, tap_ids)
+
+    def _run_mia_hc_body(self, input_ids: mx.array, cache, tap_ids=()):
+        """Execute the installed carried trunk against an owned cache list."""
+        lead = tuple(int(value) for value in input_ids.shape)
+        first = self.layers[0]
+        residual, post, comb, value = self._mia_mhc.pre_broadcast(
+            self.embed_tokens(input_ids),
+            first.attn_hc,
+            first.attn_norm,
+        )
+        taps = []
+        final_reconstructed = None
+        for layer_id, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
+            if layer_id:
+                residual, post, comb, value = self._mia_mhc.post_pre(
+                    value,
+                    residual,
+                    post,
+                    comb,
+                    layer.attn_hc,
+                    layer.attn_norm,
+                )
+            value = layer.attn(
+                value.reshape(*lead, self.args.hidden_size),
+                mask=None,
+                cache=layer_cache,
+            )
+            residual, post, comb, value = self._mia_mhc.post_pre(
+                value,
+                residual,
+                post,
+                comb,
+                layer.ffn_hc,
+                layer.ffn_norm,
+            )
+            value = layer.ffn(
+                value.reshape(*lead, self.args.hidden_size),
+                input_ids=input_ids,
+            )
+            if layer_id in tap_ids:
+                reconstructed = self._mia_mhc.post(value, residual, post, comb)
+                taps.append(
+                    mx.mean(
+                        reconstructed.reshape(*lead, self.args.hc_mult, self.args.hidden_size),
+                        axis=-2,
+                    )
+                )
+                if layer_id == len(self.layers) - 1:
+                    final_reconstructed = reconstructed
+        hidden = (
+            final_reconstructed
+            if final_reconstructed is not None
+            else self._mia_mhc.post(value, residual, post, comb)
+        )
+        hidden = hidden.reshape(*lead, self.args.hc_mult, self.args.hidden_size)
+        return hidden, tuple(taps)
+
+    def _run_mia_hc_target_tail_taps(self, input_ids: mx.array, cache):
+        """Execute the fixed 43-layer Mia target and capture layers 40-42.
+
+        The artifact assigns layer zero the broadcast transition, layers 1-39
+        ordinary carried transitions, and the final three layers DSpark tap
+        ownership.  Encoding those roles in this installed entrypoint removes
+        invariant layer-id and tap-membership decisions from target execution.
+        """
+        lead = tuple(int(value) for value in input_ids.shape)
+        first = self.layers[0]
+        residual, post, comb, value = self._mia_mhc.pre_broadcast(
+            self.embed_tokens(input_ids),
+            first.attn_hc,
+            first.attn_norm,
+        )
+        value = first.attn(
+            value.reshape(*lead, self.args.hidden_size),
+            mask=None,
+            cache=cache[0],
+        )
+        residual, post, comb, value = self._mia_mhc.post_pre(
+            value,
+            residual,
+            post,
+            comb,
+            first.ffn_hc,
+            first.ffn_norm,
+        )
+        value = first.ffn(
+            value.reshape(*lead, self.args.hidden_size),
+            input_ids=input_ids,
+        )
+
+        for layer, layer_cache in zip(self.layers[1:40], cache[1:40]):
+            residual, post, comb, value = self._mia_mhc.post_pre(
+                value,
+                residual,
+                post,
+                comb,
+                layer.attn_hc,
+                layer.attn_norm,
+            )
+            value = layer.attn(
+                value.reshape(*lead, self.args.hidden_size),
+                mask=None,
+                cache=layer_cache,
+            )
+            residual, post, comb, value = self._mia_mhc.post_pre(
+                value,
+                residual,
+                post,
+                comb,
+                layer.ffn_hc,
+                layer.ffn_norm,
+            )
+            value = layer.ffn(
+                value.reshape(*lead, self.args.hidden_size),
+                input_ids=input_ids,
+            )
+
+        taps = []
+        reconstructed = None
+        for layer, layer_cache in zip(self.layers[40:43], cache[40:43]):
+            residual, post, comb, value = self._mia_mhc.post_pre(
+                value,
+                residual,
+                post,
+                comb,
+                layer.attn_hc,
+                layer.attn_norm,
+            )
+            value = layer.attn(
+                value.reshape(*lead, self.args.hidden_size),
+                mask=None,
+                cache=layer_cache,
+            )
+            residual, post, comb, value = self._mia_mhc.post_pre(
+                value,
+                residual,
+                post,
+                comb,
+                layer.ffn_hc,
+                layer.ffn_norm,
+            )
+            value = layer.ffn(
+                value.reshape(*lead, self.args.hidden_size),
+                input_ids=input_ids,
+            )
+            reconstructed = self._mia_mhc.post(value, residual, post, comb)
+            taps.append(
+                mx.mean(
+                    reconstructed.reshape(
+                        *lead,
+                        self.args.hc_mult,
+                        self.args.hidden_size,
+                    ),
+                    axis=-2,
+                )
+            )
+        hidden = reconstructed.reshape(
+            *lead,
+            self.args.hc_mult,
+            self.args.hidden_size,
+        )
+        return hidden, tuple(taps)
+
+    def _mia_hc_hidden(self, input_ids: mx.array, cache=None) -> mx.array:
+        hidden, _ = self._mia_hc_body(input_ids, cache)
+        return hidden
+
+    def mia_hc_hidden_with_taps(self, input_ids, cache, tap_ids):
+        return self._mia_hc_body(input_ids, cache, tuple(tap_ids))
+
+    def _mia_collapse(self, h: mx.array) -> mx.array:
+        lead = tuple(int(value) for value in h.shape[:-2])
+        return self._mia_mhc.head(h, self.hc_head, self.norm).reshape(
+            *lead, self.args.hidden_size
+        )
+
+    def install_mia_mhc_runtime(self, *, max_tokens: int) -> None:
+        from mtplx.kernels.deepseek_v4_mhc import MiaMHCPlan
+
+        if (
+            self.args.hidden_size != 4096
+            or self.args.hc_mult != 4
+            or not self.layers
+        ):
+            raise ValueError("Mia mHC requires a nonempty hidden=4096, hc=4 trunk")
+        self._mia_mhc = MiaMHCPlan(
+            max_tokens=max_tokens,
+            rms_eps=self.args.rms_norm_eps,
+            hc_eps=self.args.hc_eps,
+            iters=self.args.hc_sinkhorn_iters,
+        )
+        self._mia_mhc.install_modules(
+            hyper_connections=tuple(
+                connection
+                for layer in self.layers
+                for connection in (layer.attn_hc, layer.ffn_hc)
+            ),
+            broadcast_connection=self.layers[0].attn_hc,
+        )
+        self._hc_hidden_impl = self._mia_hc_hidden
+        self._collapse_impl = self._mia_collapse
+
+    def hc_hidden(self, input_ids: mx.array, cache=None) -> mx.array:
+        return self._hc_hidden_impl(input_ids, cache)
+
+    def collapse(self, h: mx.array) -> mx.array:
+        return self._collapse_impl(h)
 
     def __call__(self, input_ids: mx.array, cache=None) -> mx.array:
         return self.collapse(self.hc_hidden(input_ids, cache))
@@ -4043,6 +5100,7 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = DeepseekV4Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self._mia_engine_plan = None
         # Reference ``Transformer.mtp`` (model.py L789-793): a top-level list, so
         # the parameter paths are ``mtp.{i}.*`` — exactly the upstream checkpoint's
         # names.  Dropped again by :meth:`sanitize` if the weights are not there.
@@ -4131,6 +5189,44 @@ class Model(nn.Module):
             layer.attn.install_mia_nvfp4_attention()
         self._target_cache_type = DeepseekV4NVFP4Cache
         self._has_generic_mtp = False
+
+    def install_mia_mhc_runtime(self, *, max_tokens: int) -> None:
+        """Install the carried target and K64 draft mHC state machines."""
+        if self.dspark is None:
+            raise ValueError("Mia carried mHC installation requires DSpark")
+        self.model.install_mia_mhc_runtime(max_tokens=max_tokens)
+        self.dspark.install_mia_mhc_runtime(max_tokens=max_tokens)
+        if (
+            len(self.model.layers) != 43
+            or tuple(int(value) for value in self.dspark.target_layer_ids)
+            != (40, 41, 42)
+        ):
+            raise ValueError(
+                "Mia fixed target execution requires 43 layers and tail taps 40-42"
+            )
+        self._target_forward_route = self._mia_target_forward
+
+    def _mia_target_forward(self, inputs: mx.array, cache):
+        return self.model._run_mia_hc_target_tail_taps(inputs, cache)
+
+    def mia_dflash_forward(
+        self,
+        inputs: mx.array,
+        cache,
+        *,
+        logits_last_only: bool,
+    ):
+        """Direct target surface for the sealed Mia DFlash execution lane."""
+        hidden, taps = self._target_forward_route(inputs, cache)
+        logits_source = hidden[:, -1:] if logits_last_only else hidden
+        return self.logits_from_hc_hidden(logits_source), taps
+
+    def install_mia_engine_plan(self, plan) -> None:
+        """Seal the exact artifact, cache capacity, and installed callables."""
+
+        if self._mia_engine_plan is not None:
+            raise ValueError("the Mia engine plan is already installed")
+        self._mia_engine_plan = plan
 
     def _stock_target_forward(self, inputs: mx.array, cache):
         hidden = self._target_hc_hidden_route(inputs, cache)
@@ -4424,9 +5520,17 @@ class Model(nn.Module):
         """One :class:`DeepseekV4Cache` per layer (sliding-window KV + compressed KV
         + compressor frontier).  Shapes come off the built attention modules so the
         cache cannot drift from the layer's own compress ratio."""
-        if capacity_tokens is None and self._target_cache_type is DeepseekV4NVFP4Cache:
-            configured = int(os.environ.get("MTPLX_CONTEXT_WINDOW_TOKENS", "0") or 0)
-            capacity_tokens = configured or None
+        if self._mia_engine_plan is not None:
+            installed_capacity = int(
+                self._mia_engine_plan.context_capacity_tokens
+            )
+            if capacity_tokens is not None and int(capacity_tokens) > installed_capacity:
+                raise ValueError(
+                    "the request exceeds the exact Mia cache capacity installed at "
+                    "construction: "
+                    f"requested={int(capacity_tokens)}, installed={installed_capacity}"
+                )
+            return self._mia_engine_plan.make_target_cache(self.layers)
         return [
             self._target_cache_type(
                 window_size=layer.attn.window_size,

@@ -97,57 +97,38 @@ def _stock432_pack_kernel():
     if not mx.metal.is_available():
         raise RuntimeError("Mia stock432 NVFP4 K/V requires Metal")
     source = r"""
-        uint gid = thread_position_in_grid.x;
-        uint row = gid / 432u;
-        uint byte = gid - row * 432u;
+        uint row = threadgroup_position_in_grid.x;
+        uint group = thread_index_in_simdgroup;
         const device T* latent_row = latent + size_t(row) * 512u;
         const device T* rope_row = rope + size_t(row) * 64u;
         device uchar* record = records + size_t(row) * 432u;
 
-        if (byte < 256u) {
-            uint dim0 = byte * 2u;
-            uint group = dim0 / 16u;
-            float amax = 0.0f;
-            for (uint i = 0; i < 16u; ++i) {
-                uint dim = group * 16u + i;
-                float value = dim < 448u
-                    ? float(latent_row[dim])
-                    : float(rope_row[dim - 448u]);
-                amax = max(amax, abs(value));
-            }
-            uchar scale_byte = mtplx_e4m3_encode_positive(amax / 6.0f);
-            float scale = mtplx_e4m3_decode(scale_byte);
-            float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-            float low_value = dim0 < 448u
-                ? float(latent_row[dim0])
-                : float(rope_row[dim0 - 448u]);
-            float high_value = dim0 + 1u < 448u
-                ? float(latent_row[dim0 + 1u])
-                : float(rope_row[dim0 + 1u - 448u]);
+        uint group_dim = group * 16u;
+        float amax = 0.0f;
+        for (uint i = 0u; i < 16u; ++i) {
+            uint dim = group_dim + i;
+            float value = float(latent_row[dim]);
+            amax = max(amax, abs(value));
+        }
+        uchar scale_byte = mtplx_e4m3_encode_positive(amax / 6.0f);
+        float scale = mtplx_e4m3_decode(scale_byte);
+        float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        for (uint packed = 0u; packed < 8u; ++packed) {
+            uint dim0 = group_dim + packed * 2u;
+            float low_value = float(latent_row[dim0]);
+            float high_value = float(latent_row[dim0 + 1u]);
             uchar low = mtplx_e2m1_encode(low_value * inv_scale);
             uchar high = mtplx_e2m1_encode(high_value * inv_scale);
-            record[byte] = uchar(low | uchar(high << 4));
-            return;
+            record[group * 8u + packed] = uchar(low | uchar(high << 4));
         }
-        if (byte < 288u) {
-            uint group = byte - 256u;
-            float amax = 0.0f;
-            for (uint i = 0; i < 16u; ++i) {
-                uint dim = group * 16u + i;
-                float value = dim < 448u
-                    ? float(latent_row[dim])
-                    : float(rope_row[dim - 448u]);
-                amax = max(amax, abs(value));
-            }
-            record[byte] = mtplx_e4m3_encode_positive(amax / 6.0f);
-            return;
-        }
-        if (byte < 304u) {
-            record[byte] = uchar(0);
-            return;
+        record[256u + group] = scale_byte;
+        if (group < 16u) {
+            record[288u + group] = uchar(0);
         }
         const device uchar* rope_bytes = reinterpret_cast<const device uchar*>(rope_row);
-        record[byte] = rope_bytes[byte - 304u];
+        for (uint byte = group; byte < 128u; byte += 32u) {
+            record[304u + byte] = rope_bytes[byte];
+        }
     """
     return mx.fast.metal_kernel(
         name="mtplx_dsv4_mia_stock432_pack",
@@ -168,18 +149,35 @@ def _pack_stock432(latent: mx.array, rope: mx.array) -> mx.array:
         raise ValueError("Mia stock432 latent and RoPE row prefixes differ")
     if int(rope.shape[-1]) != MIA_NVFP4_ROPE_DIM:
         raise ValueError("Mia stock432 RoPE rows must end in width 64")
+    return _run_pack_stock432(latent, rope)
+
+
+def _run_pack_stock432(latent: mx.array, rope: mx.array) -> mx.array:
+    """Direct packer for a construction-qualified stock432 route."""
     row_count = 1
     for size in latent.shape[:-1]:
         row_count *= int(size)
     records = _stock432_pack_kernel()(
         inputs=[mx.contiguous(latent), mx.contiguous(rope)],
         template=[("T", mx.bfloat16)],
-        grid=(row_count * MIA_NVFP4_RECORD_BYTES, 1, 1),
-        threadgroup=(256, 1, 1),
+        grid=(row_count * 32, 1, 1),
+        threadgroup=(32, 1, 1),
         output_shapes=[(*latent.shape[:-1], MIA_NVFP4_RECORD_BYTES)],
         output_dtypes=[mx.uint8],
     )[0]
     return records
+
+
+def install_stock432_record_packer(*, head_dim: int, rope_dim: int):
+    """Validate fixed Mia geometry once and bind its direct record finalizer."""
+    observed = (int(head_dim), int(rope_dim))
+    expected = (MIA_NVFP4_HEAD_DIM, MIA_NVFP4_ROPE_DIM)
+    if observed != expected:
+        raise ValueError(
+            f"unsupported Mia stock432 geometry: {observed} != {expected}"
+        )
+    _stock432_pack_kernel()
+    return _run_pack_stock432
 
 
 _E2M1_TABLE = mx.array(
@@ -288,11 +286,36 @@ class MiaNVFP4Rows:
     def append(self, latent: mx.array, rope: mx.array) -> None:
         prefix = self._validate_rows(latent, rope)
         new_records = _pack_stock432(latent, rope)
+        self._append_installed_records(new_records, prefix=prefix)
+
+    def _append_installed_records(
+        self,
+        new_records: mx.array,
+        *,
+        prefix: tuple[int, ...],
+    ) -> None:
+        """Append records supplied by an installed, geometry-qualified packer."""
         if self.records is None:
             self.records = new_records
             self._prefix_shape = prefix
         else:
             self.records = mx.concatenate([self.records, new_records], axis=-2)
+
+    def _replace_installed_records(
+        self,
+        start: int,
+        replacement: mx.array,
+    ) -> None:
+        """Replace a qualified range without repeating record metadata checks."""
+        count = int(replacement.shape[-2])
+        self.records = mx.concatenate(
+            [
+                self.records[..., :start, :],
+                replacement,
+                self.records[..., start + count :, :],
+            ],
+            axis=-2,
+        )
 
     def decode(self, start: int = 0, stop: int | None = None) -> tuple[mx.array, mx.array]:
         if self.records is None:
@@ -312,14 +335,7 @@ class MiaNVFP4Rows:
         if start < 0 or count <= 0 or start + count > len(self):
             raise ValueError("replacement Mia stock432 range is outside the store")
         replacement = _pack_stock432(latent, rope)
-        self.records = mx.concatenate(
-            [
-                self.records[..., :start, :],
-                replacement,
-                self.records[..., start + count :, :],
-            ],
-            axis=-2,
-        )
+        self._replace_installed_records(start, replacement)
 
     def drop_first(self, count: int) -> None:
         count = max(0, int(count))
@@ -355,6 +371,194 @@ class MiaNVFP4Rows:
             raise ValueError("invalid Mia stock432 K/V state")
         self.records = state
         self._prefix_shape = tuple(int(value) for value in state.shape[:-2])
+
+
+class FixedMiaNVFP4Ring:
+    """One contiguous fixed page with direct slot writes for DSpark SWA."""
+
+    head_dim = MIA_NVFP4_HEAD_DIM
+    rope_dim = MIA_NVFP4_ROPE_DIM
+    record_bytes = MIA_NVFP4_RECORD_BYTES
+    mode = "nvfp4_stock432_fixed_ring"
+
+    def __init__(self, *, capacity_rows: int) -> None:
+        capacity_rows = int(capacity_rows)
+        if capacity_rows <= 0:
+            raise ValueError("Mia fixed ring capacity must be positive")
+        plan = PagedCachePlan.contiguous(
+            block_size=capacity_rows,
+            num_blocks=1,
+            array_names=("records",),
+        )
+        self._capacity_rows = capacity_rows
+        self._pool = PagedCachePool(plan)
+        self._pages = self._pool.bind(
+            "records",
+            row_shape=(self.record_bytes,),
+            dtype=mx.uint8,
+        )
+
+    def __len__(self) -> int:
+        return int(self._pool.offset)
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (1, len(self), self.record_bytes)
+
+    @property
+    def records(self) -> mx.array:
+        # num_blocks=1 makes the physical page exactly [1, capacity, 432].
+        return self._pages
+
+    @property
+    def nbytes(self) -> int:
+        return int(self._pages.nbytes)
+
+    def decode(self) -> tuple[mx.array, mx.array]:
+        return decode_stock432(self.records)
+
+    def _append_installed_records(
+        self,
+        records: mx.array,
+        *,
+        prefix: tuple[int, ...],
+    ) -> None:
+        del prefix
+        self._pool._write_installed_tail(
+            {"records": records[0]},
+            count=self._capacity_rows,
+        )
+
+    def _replace_installed_records(
+        self,
+        start: int,
+        replacement: mx.array,
+    ) -> None:
+        count = int(replacement.shape[1])
+        positions = mx.arange(int(start), int(start) + count, dtype=mx.int32)
+        self._pool.write_slots(
+            {"records": replacement[0]},
+            logical_positions=positions,
+        )
+
+    def clear(self) -> None:
+        self._pool.clear()
+
+
+class FixedMiaNVFP4Window:
+    """Persistent circular pages for a target SWA batch plus rollback tail."""
+
+    head_dim = MIA_NVFP4_HEAD_DIM
+    rope_dim = MIA_NVFP4_ROPE_DIM
+    record_bytes = MIA_NVFP4_RECORD_BYTES
+    mode = "nvfp4_stock432_fixed_window"
+
+    def __init__(self, *, capacity_rows: int, block_size: int = 64) -> None:
+        capacity_rows = int(capacity_rows)
+        block_size = int(block_size)
+        if capacity_rows <= 0 or block_size <= 0:
+            raise ValueError("Mia fixed window geometry must be positive")
+        plan = PagedCachePlan.contiguous(
+            block_size=block_size,
+            num_blocks=math.ceil(capacity_rows / block_size),
+            array_names=("records",),
+        )
+        self._capacity_rows = capacity_rows
+        self._pool = PagedCachePool(plan)
+        self._pages = self._pool.bind(
+            "records",
+            row_shape=(self.record_bytes,),
+            dtype=mx.uint8,
+        )
+        self._start = 0
+        self._end = 0
+
+    def __len__(self) -> int:
+        return self._end - self._start
+
+    @property
+    def start(self) -> int:
+        return self._start
+
+    @property
+    def end(self) -> int:
+        return self._end
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity_rows
+
+    @property
+    def nbytes(self) -> int:
+        return int(self._pages.nbytes)
+
+    @property
+    def records(self) -> mx.array:
+        return self.slice(self._start, self._end)
+
+    @property
+    def state(self):
+        return self._pages, self._pool.block_table, self._start, self._end
+
+    def _append_installed_records(
+        self,
+        records: mx.array,
+        *,
+        absolute_start: int,
+    ) -> None:
+        absolute_start = int(absolute_start)
+        count = int(records.shape[1])
+        physical = (
+            mx.arange(absolute_start, absolute_start + count, dtype=mx.int32)
+            % self._capacity_rows
+        )
+        self._pool.write_slots(
+            {"records": records[0]},
+            logical_positions=physical,
+        )
+        self._end = absolute_start + count
+
+    def slice(self, start: int, stop: int) -> mx.array:
+        start = int(start)
+        stop = int(stop)
+        physical = mx.arange(start, stop, dtype=mx.int32) % self._capacity_rows
+        logical_blocks = physical // self._pool.block_size
+        block_offsets = physical - logical_blocks * self._pool.block_size
+        physical_blocks = self._pool.block_table[logical_blocks]
+        return self._pages[physical_blocks, block_offsets][None]
+
+    def drop_before(self, start: int) -> None:
+        start = int(start)
+        self._start = start
+
+    def truncate(self, length: int) -> None:
+        length = int(length)
+        self._end = self._start + length
+
+    def clear(self) -> None:
+        self._start = 0
+        self._end = 0
+
+    def replace_state(self, state) -> None:
+        if state is None:
+            self.clear()
+            return
+        if not isinstance(state, (tuple, list)) or len(state) != 4:
+            raise ValueError("invalid Mia fixed target window state")
+        pages, block_table, start, end = state
+        start = int(start)
+        end = int(end)
+        if tuple(int(value) for value in block_table.shape) != (
+            self._pool.num_blocks,
+        ):
+            raise ValueError("Mia fixed target window block table shape changed")
+        if start < 0 or end < start or end - start > self._capacity_rows:
+            raise ValueError("Mia fixed target window frontier changed")
+        self._pool.block_table = block_table
+        self._pool.replace_state({"records": pages}, 0)
+        self._pages = self._pool.buffer("records")
+        self._start = start
+        self._end = end
 
 
 @dataclass(frozen=True)
@@ -468,14 +672,33 @@ class PagedMiaNVFP4Rows:
 
     def append(self, latent: mx.array, rope: mx.array) -> None:
         self._validate_rows(latent, rope)
-        count = int(latent.shape[1])
+        self.append_records(_pack_stock432(latent, rope))
+
+    def append_records(self, records: mx.array) -> None:
+        """Insert records already finalized by the fused Mia compressor."""
+        if (
+            records.dtype != mx.uint8
+            or records.ndim != 3
+            or tuple(int(value) for value in records.shape[:1]) != (1,)
+            or int(records.shape[-1]) != self.record_bytes
+        ):
+            raise ValueError(
+                "paged Mia stock432 records must be [1, rows, 432] uint8"
+            )
+        count = int(records.shape[1])
         if len(self) + count > self.capacity:
             raise ValueError(
                 f"paged Mia stock432 capacity exceeded: {len(self) + count} "
                 f"> {self.capacity}"
             )
-        packed = _pack_stock432(latent, rope)[0]
-        self._pool.write_tail({"records": packed})
+        self._append_installed_records(records)
+
+    def _append_installed_records(self, records: mx.array) -> None:
+        """Insert records emitted by the construction-bound fused compressor."""
+        self._pool._write_installed_tail(
+            {"records": records[0]},
+            count=int(records.shape[1]),
+        )
 
     def decode(self, start: int = 0, stop: int | None = None) -> tuple[mx.array, mx.array]:
         begin = int(start)

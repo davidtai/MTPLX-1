@@ -621,6 +621,15 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    exact_mia_dspark = (
+        str(config.get("model_type") or "").lower() == "deepseek_v4"
+        and isinstance(config.get("hybrid_tr3_tail"), dict)
+        and config["hybrid_tr3_tail"].get("format") == "exl3-trellis"
+    )
+    if exact_mia_dspark and not dspark:
+        raise ValueError(
+            "the pinned Mia EXL3 artifact requires the sealed DSpark runtime"
+        )
     if dspark:
         from .deepseek_v4_dspark_artifact import open_verified_dspark_artifact
 
@@ -673,6 +682,10 @@ def load(
 
     proj_quant = proj_quant or _os.environ.get("MTPLX_PROJ_QUANT") or None
     proj_requant = proj_requant or _os.environ.get("MTPLX_PROJ_REQUANT") or None
+    if dspark and (proj_quant or proj_requant):
+        raise ValueError(
+            "the sealed Mia DSpark artifact forbids generic projection quantization"
+        )
     if proj_quant or proj_requant:
         from .proj_quant import quantize_projections, requantize_projections
 
@@ -778,7 +791,7 @@ def load(
     router_report: dict[str, Any] = {}
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
-    if not _is_laguna_s_2_1_mlx_4bit_config(config):
+    if not dspark and not _is_laguna_s_2_1_mlx_4bit_config(config):
         from .attention_split import configure_split_full_attention
         from .moe_packed_projections import (
             configure_moe_packed_projections,

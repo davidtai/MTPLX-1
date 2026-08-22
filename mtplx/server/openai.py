@@ -1371,7 +1371,7 @@ def _available_generation_modes(state: "ServerState") -> list[str]:
         getattr(state.args, "generation_mode", None) == "dspark"
         and getattr(state, "deepseek_v4_dflash2_bundle", None) is not None
     ):
-        return ["dspark", "ar"]
+        return ["dspark"]
     return ["mtp", "ar"]
 
 
@@ -2153,7 +2153,7 @@ class ServerState:
                 batch_key="startup.deepseek_v4_dflash2",
             ).result()
             self.deepseek_v4_dflash2_runtime_context = (
-                build_deepseek_v4_dflash2_runtime_context()
+                self.deepseek_v4_dflash2_bundle.runtime_context
             )
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
@@ -12822,6 +12822,14 @@ def _request_generation_mode_for_generation(
         _request_generation_mode_value(request) if allow_client_controls else None,
         default=default,
     )
+    if (
+        getattr(state.runtime, "backend_id", None) == "deepseek_v4_dspark"
+        and mode != "dspark"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="the sealed Mia DeepSeek runtime supports only generation_mode 'dspark'",
+        )
     if mode == "mtp" and not bool(getattr(state.runtime, "mtp_enabled", False)):
         raise HTTPException(
             status_code=400,
@@ -16781,6 +16789,13 @@ def _policy_fingerprint(
         generation_mode,
         default=getattr(state.args, "generation_mode", "mtp"),
     )
+    if (
+        getattr(state.runtime, "backend_id", None) == "deepseek_v4_dspark"
+        and effective_mode != "dspark"
+    ):
+        raise ValueError(
+            "the sealed Mia DeepSeek runtime cannot execute an AR or generic MTP lane"
+        )
     effective_depth = (
         0
         if effective_mode == "ar"

@@ -11,6 +11,7 @@ _CHECKPOINT_BLOCK_SIZE = 8
 _TARGET_LAYER_IDS = (5, 19, 33, 47, 61)
 _DEEPSEEK_PHYSICAL_VERIFY_WIDTH = 6
 _DEEPSEEK_TARGET_LAYER_IDS = (40, 41, 42)
+_DEEPSEEK_DRAFT_WINDOW = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class MTPLXDFlash2Bundle:
     draft_meta: dict[str, Any]
     checkpoint_block_size: int
     target_layer_ids: tuple[int, ...]
+    runtime_context: Any = None
 
 
 def load_mtplx_runtime(model_path: str):
@@ -80,13 +82,23 @@ def build_deepseek_v4_dflash2_runtime_context():
     """Construct the fixed greedy M6 context for the qualified DSpark lane."""
 
     from dflash_mlx.runtime.context import build_offline_runtime_context
+    from mtplx.deepseek_v4_dflash2 import DeepseekV4DFlashRuntimeContext
+    from mtplx.deepseek_v4_mia_engine import MIA_LONG_PREFILL_CHUNK
 
-    return build_offline_runtime_context(
+    context = build_offline_runtime_context(
         quantize_kv_cache=False,
+        prefill_step_size=MIA_LONG_PREFILL_CHUNK,
+        draft_sink_size=0,
+        draft_window_size=_DEEPSEEK_DRAFT_WINDOW,
         verify_len_cap=_DEEPSEEK_PHYSICAL_VERIFY_WIDTH,
         verify_mode="dflash",
         copyspec_mode="off",
     )
+    context = replace(
+        context,
+        runtime=replace(context.runtime, clear_cache_boundaries=False),
+    )
+    return DeepseekV4DFlashRuntimeContext.install(context)
 
 
 def _checkpoint_geometry(draft_model) -> tuple[int, tuple[int, ...]]:
@@ -203,7 +215,7 @@ def bind_mtplx_deepseek_v4_dflash2_bundle(
     )
 
     target_model = runtime.model
-    target_ops = DeepseekV4TargetOps()
+    target_ops = DeepseekV4TargetOps(target_model)
     if not target_ops.supports_model(target_model):
         raise ValueError(
             "DFlash2 target is not a construction-qualified DeepSeek V4 DSpark model"
@@ -212,6 +224,7 @@ def bind_mtplx_deepseek_v4_dflash2_bundle(
     draft_model = DeepseekV4DSparkDraftAdapter(target_model)
     draft_backend = DeepseekV4DSparkBackend()
     bind_draft(draft_model, target_model, target_ops=target_ops)
+    runtime_context = build_deepseek_v4_dflash2_runtime_context()
 
     draft_probe = draft_backend.make_cache(
         draft_model=draft_model,
@@ -234,4 +247,5 @@ def bind_mtplx_deepseek_v4_dflash2_bundle(
         },
         checkpoint_block_size=_DEEPSEEK_PHYSICAL_VERIFY_WIDTH,
         target_layer_ids=_DEEPSEEK_TARGET_LAYER_IDS,
+        runtime_context=runtime_context,
     )

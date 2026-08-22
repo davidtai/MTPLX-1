@@ -156,8 +156,6 @@ class PagedCachePool:
     def slot_mapping(self, start: int, count: int) -> tuple[Any, Any]:
         """Return physical block ids and offsets for a logical token range."""
 
-        import mlx.core as mx
-
         start = int(start)
         count = int(count)
         stop = start + count
@@ -165,6 +163,13 @@ class PagedCachePool:
             raise ValueError(
                 f"paged cache range {start}:{stop} is outside capacity {self.capacity}"
             )
+        return self._installed_slot_mapping(start, count)
+
+    def _installed_slot_mapping(self, start: int, count: int) -> tuple[Any, Any]:
+        """Map a range already bounded by an installed capacity contract."""
+        import mlx.core as mx
+
+        stop = int(start) + int(count)
         positions = mx.arange(start, stop, dtype=mx.int32)
         logical_blocks = positions // self.block_size
         offsets = positions - logical_blocks * self.block_size
@@ -182,7 +187,20 @@ class PagedCachePool:
             raise ValueError(
                 f"paged cache capacity exceeded: {stop} > {self.capacity}"
             )
-        physical_blocks, block_offsets = self.slot_mapping(self.offset, count)
+        self._write_installed_tail(updates, count=count)
+
+    def _write_installed_tail(
+        self,
+        updates: Mapping[str, Any],
+        *,
+        count: int,
+    ) -> None:
+        """Write qualified lockstep rows without repeating installed invariants."""
+        stop = self.offset + int(count)
+        physical_blocks, block_offsets = self._installed_slot_mapping(
+            self.offset,
+            int(count),
+        )
         for name in self.plan.array_names:
             rows = updates[name]
             self._buffers[name][physical_blocks, block_offsets] = rows

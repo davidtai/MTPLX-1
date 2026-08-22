@@ -5,15 +5,18 @@
 > arithmetic, attention, and real-model gates share one evolving contract.
 
 **Goal:** Replace the exact Mia target and draft affine-int4 K/V lane with native
-432-byte NVFP4 records and direct bounded sparse Metal attention.
+432-byte NVFP4 records and a bounded source-derived Metal attention engine.
 
 **Architecture:** The exact record arithmetic remains authoritative, but
 storage ownership is superseded by the reusable system plan in
 `docs/plans/2026-08-21-system-paged-cache.md`. Target and DSpark
 produce normalized latent plus a rotated tail; the writer substitutes that tail
 before NVFP4-quantizing the post-RoPE V row and also stores it as BF16 for K. A construction-installed
-Metal consumer reads selected records directly and performs online-softmax MLA
-without whole-cache dequantization or whole-context scores.
+Metal consumers read selected records directly without whole-cache
+dequantization or whole-context scores. Decode uses the measured one-head
+online-softmax kernel. Prefill uses the existing M5 NAX tensor primitive with
+Mia's 16-head ownership, native BF16 QK/P.V operands, and one FP32 online
+softmax over the window/indexed-cache union.
 
 **Tech Stack:** Python 3.11, MLX 0.32, `mx.fast.metal_kernel`, pytest, existing
 DeepSeek V4/DFlash2 adapters.
@@ -188,7 +191,7 @@ git add mtplx/models/deepseek_v4.py mtplx/models/deepseek_v4_dspark.py \
 git commit -m "fix: restore Mia NVFP4 key value arithmetic"
 ```
 
-### Task 3: Direct bounded sparse Metal consumer
+### Task 3: Complete bounded sparse Metal engine
 
 **Files:**
 - Create: `mtplx/kernels/deepseek_v4_nvfp4_mla.py`
@@ -199,7 +202,7 @@ git commit -m "fix: restore Mia NVFP4 key value arithmetic"
 **Security flag:** `none`
 
 **Does NOT cover:** generic attention dimensions, batching beyond one request,
-other record layouts, or a runtime fallback.
+other record layouts, non-M5 prefill, or a runtime fallback.
 
 - [ ] **Step 1: Write the failing direct-consumer comparison**
 
@@ -231,11 +234,16 @@ def nvfp4_sparse_mla(
 ) -> mx.array: ...
 ```
 
-The kernel uses one 32-thread SIMD group per `(query, head)`, decodes one
-16-value group per lane, initializes online softmax with the head sink and zero
-numerator, loops only the 128-row causal window plus selected compressed rows,
-and writes BF16 output.  Target and DSpark receive prebound callables at
-construction; enabled execution has no fallback or invariant checks.
+The decode kernel uses one 32-thread SIMD group per `(query, head)`. The prefill
+kernel maps SparkInfer's native-NVFP4 engine to Metal's M16xN32xK16 NAX tile:
+16 query heads per threadgroup, 32 candidates per tile, four 128-wide QK
+splits, eight PV groups covering 512 values, BF16 tensor operands, and FP32
+QK/softmax/P.V state. Both consume the 128-row causal window plus selected
+compressed rows as one online-softmax union and write BF16 output. Target and
+DSpark receive prebound phase callables at construction; enabled execution has
+no fallback or invariant checks. A minimal installation-time dispatch compiles
+the one fixed BF16 pipeline before serving, following the pinned vLLM engine's
+compile/warm-before-request lifecycle.
 
 - [ ] **Step 4: Verify GREEN and the bounded-allocation contract**
 

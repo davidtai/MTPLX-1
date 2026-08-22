@@ -513,6 +513,442 @@ def _mma_route_pack_kernel(experts: int):
 
 
 @lru_cache(maxsize=None)
+def _trellis_route_pack_kernel(experts: int, topk: int, block_m: int):
+    """Source-owned histogram/prefix/route pack with no generic sort."""
+    header = f"""
+        using namespace metal;
+        constant constexpr uint EXPERTS = {experts}u;
+        constant constexpr uint TOPK = {topk}u;
+        constant constexpr uint BM = {block_m}u;
+    """
+    source = r"""
+        uint tid = thread_position_in_threadgroup.x;
+        threadgroup atomic_uint counts[EXPERTS];
+        threadgroup atomic_uint cursors[EXPERTS];
+        threadgroup uint offsets[EXPERTS + 1u];
+        threadgroup uint total_blocks;
+
+        for (uint expert = tid; expert < EXPERTS; expert += 256u) {
+            atomic_store_explicit(&counts[expert], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint task = tid; task < uint(n_tasks); task += 256u) {
+            uint expert = uint(expert_ids[task]);
+            atomic_fetch_add_explicit(
+                &counts[expert], 1u, memory_order_relaxed
+            );
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            uint offset = 0u;
+            uint block = 0u;
+            for (uint expert = 0u; expert < EXPERTS; ++expert) {
+                offsets[expert] = offset;
+                uint count = atomic_load_explicit(
+                    &counts[expert], memory_order_relaxed
+                );
+                atomic_store_explicit(
+                    &cursors[expert], offset, memory_order_relaxed
+                );
+                for (uint first = 0u; first < count; first += BM) {
+                    block_expert[block] = expert;
+                    block_row[block] = offset + first;
+                    block_size[block] = min(BM, count - first);
+                    block += 1u;
+                }
+                offset += count;
+            }
+            offsets[EXPERTS] = offset;
+            total_blocks = block;
+            packed_count[0] = block;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint task = tid; task < uint(n_tasks); task += 256u) {
+            uint expert = uint(expert_ids[task]);
+            uint position = atomic_fetch_add_explicit(
+                &cursors[expert], 1u, memory_order_relaxed
+            );
+            packed_tasks[position] = task;
+            inverse[task] = position;
+            sorted_ids[position] = expert;
+        }
+    """
+    return mx.fast.metal_kernel(
+        name=(
+            f"mtplx_dsv4_exl3_trellis_route_e{experts}_t{topk}"
+            f"_bm{block_m}_v1"
+        ),
+        input_names=["expert_ids", "n_tasks"],
+        output_names=[
+            "packed_tasks",
+            "inverse",
+            "sorted_ids",
+            "block_expert",
+            "block_row",
+            "block_size",
+            "packed_count",
+        ],
+        header=header,
+        source=source,
+    )
+
+
+def _pack_trellis_routes(
+    expert_ids: mx.array,
+    *,
+    experts: int,
+    topk: int,
+    block_m: int,
+):
+    tasks = int(expert_ids.size)
+    return _trellis_route_pack_kernel(experts, topk, block_m)(
+        inputs=[
+            mx.contiguous(expert_ids.reshape(tasks).astype(mx.uint32)),
+            tasks,
+        ],
+        grid=(256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(tasks,)] * 6 + [(1,)],
+        output_dtypes=[mx.uint32] * 7,
+    )
+
+
+@lru_cache(maxsize=None)
+def _packed_route_hadamard_kernel(size_k: int, experts: int, topk: int):
+    header = f"""
+        using namespace metal;
+        constant constexpr uint SIZE_K = {size_k}u;
+        constant constexpr uint TOPK = {topk}u;
+        constant constexpr uint HAD = 128u;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+    """
+    source = r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint k_block = threadgroup_position_in_grid.y;
+        uint sorted_task = threadgroup_position_in_grid.z;
+        uint original_task = uint(packed_tasks[sorted_task]);
+        uint source_row = original_task / TOPK;
+        uint expert = uint(sorted_ids[sorted_task]);
+        uint k = k_block * HAD + lane;
+        threadgroup float values[HAD];
+        half scaled = half(
+            float(x[size_t(source_row) * SIZE_K + k])
+            * float(suh[size_t(expert) * SIZE_K + k])
+        );
+        values[lane] = float(scaled);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
+            float own = values[lane];
+            float peer = values[lane ^ stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            values[lane] = (lane & stride) ? (peer - own) : (own + peer);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        y[size_t(sorted_task) * SIZE_K + k] = half(
+            values[lane] * HAD_SCALE
+        );
+    """
+    return mx.fast.metal_kernel(
+        name=(
+            f"mtplx_dsv4_exl3_packed_h128_k{size_k}_e{experts}"
+            f"_t{topk}_v1"
+        ),
+        input_names=["x", "suh", "packed_tasks", "sorted_ids"],
+        output_names=["y"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _mcg_trellis_mma_kernel(
+    size_k: int,
+    size_n: int,
+    experts: int,
+    block_m: int,
+):
+    if block_m not in (8, 64):
+        raise ValueError("Mia Trellis block_m must be 8 or 64")
+    inverse = ",".join(str(value) for value in EXL3_TENSOR_CORE_INVERSE)
+    simdgroups = block_m // 8 * 2
+    threads = simdgroups * 32
+    header = f"""
+        using namespace metal;
+        constant constexpr uint SIZE_K = {size_k}u;
+        constant constexpr uint SIZE_N = {size_n}u;
+        constant constexpr uint NTILES_N = {size_n // 16}u;
+        constant constexpr uint BM = {block_m}u;
+        constant constexpr uint BN = 32u;
+        constant constexpr uint BK = 32u;
+        constant constexpr uint THREADS = {threads}u;
+        constant constexpr uint TILE_WORDS = 48u;
+        constant ushort TC_INV[256] = {{ {inverse} }};
+
+        inline half decode_mcg_device(
+            device const ushort* packed,
+            uint tensor_core_offset
+        ) {{
+            device const uint* words = reinterpret_cast<device const uint*>(packed);
+            uint bit0 = tensor_core_offset * 3u + 755u;
+            uint bit1 = bit0 + 16u;
+            uint index0 = bit0 / 32u;
+            uint index1 = (bit1 - 1u) / 32u;
+            uint shift = (index1 + 1u) * 32u - bit1;
+            uint low = words[index0 % 24u];
+            uint high = words[index1 % 24u];
+            uint state = ((high >> shift) | (low << (32u - shift))) & 0xffffu;
+            uint product = state * 0xCBAC1FEDu;
+            uint bits = 0x3B603B60u ^ (product & 0x8FFF8FFFu);
+            half2 pair = as_type<half2>(bits);
+            return pair.x + pair.y;
+        }}
+    """
+    source = r"""
+        uint tid = thread_position_in_threadgroup.x;
+        uint sg = simdgroup_index_in_threadgroup;
+        uint packed_block = threadgroup_position_in_grid.z;
+        if (packed_block >= packed_count[0]) return;
+        uint n0 = threadgroup_position_in_grid.y * BN;
+        uint expert = block_expert[packed_block];
+        uint first_row = block_row[packed_block];
+        uint active_rows = block_size[packed_block];
+        uint sg_m = sg / 2u;
+        uint sg_n = (sg & 1u) * 16u;
+
+        threadgroup half A_tile[BM * BK];
+        threadgroup half B_tile[BK * BN];
+        threadgroup half C_tile[BM * BN];
+        simdgroup_matrix<half, 8, 8> a, b_left, b_right;
+        simdgroup_matrix<float, 8, 8> c_left =
+            simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> c_right =
+            simdgroup_matrix<float, 8, 8>(0.0f);
+
+        for (uint k0 = 0u; k0 < SIZE_K; k0 += BK) {
+            for (uint index = tid; index < BM * BK; index += THREADS) {
+                uint row = index / BK;
+                uint local_k = index - row * BK;
+                A_tile[index] = row < active_rows
+                    ? x[size_t(first_row + row) * SIZE_K + k0 + local_k]
+                    : half(0.0h);
+            }
+            for (uint index = tid; index < BK * BN; index += THREADS) {
+                uint local_k = index / BN;
+                uint local_n = index - local_k * BN;
+                uint k = k0 + local_k;
+                uint n = n0 + local_n;
+                uint tile_k = k / 16u;
+                uint tile_n = n / 16u;
+                uint row_major = (k & 15u) * 16u + (n & 15u);
+                uint tensor_core = uint(TC_INV[row_major]);
+                size_t tile_index =
+                    ((size_t)expert * (SIZE_K / 16u) * NTILES_N
+                     + size_t(tile_k) * NTILES_N + tile_n) * TILE_WORDS;
+                B_tile[index] = decode_mcg_device(
+                    reinterpret_cast<const device ushort*>(trellis) + tile_index,
+                    tensor_core
+                );
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint ks = 0u; ks < BK; ks += 8u) {
+                simdgroup_load(a, A_tile + sg_m * 8u * BK + ks, BK);
+                simdgroup_load(b_left, B_tile + ks * BN + sg_n, BN);
+                simdgroup_load(b_right, B_tile + ks * BN + sg_n + 8u, BN);
+                simdgroup_multiply_accumulate(c_left, a, b_left, c_left);
+                simdgroup_multiply_accumulate(c_right, a, b_right, c_right);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        simdgroup_matrix<half, 8, 8> out_left, out_right;
+        out_left.thread_elements()[0] = half(c_left.thread_elements()[0]);
+        out_left.thread_elements()[1] = half(c_left.thread_elements()[1]);
+        out_right.thread_elements()[0] = half(c_right.thread_elements()[0]);
+        out_right.thread_elements()[1] = half(c_right.thread_elements()[1]);
+        simdgroup_store(out_left, C_tile + sg_m * 8u * BN + sg_n, BN);
+        simdgroup_store(out_right, C_tile + sg_m * 8u * BN + sg_n + 8u, BN);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint index = tid; index < active_rows * BN; index += THREADS) {
+            uint row = index / BN;
+            uint local_n = index - row * BN;
+            y[size_t(first_row + row) * SIZE_N + n0 + local_n] = C_tile[index];
+        }
+    """
+    return mx.fast.metal_kernel(
+        name=(
+            f"mtplx_dsv4_exl3_trellis_mma_k{size_k}_n{size_n}"
+            f"_e{experts}_bm{block_m}_v1"
+        ),
+        input_names=[
+            "x",
+            "trellis",
+            "block_expert",
+            "block_row",
+            "block_size",
+            "packed_count",
+        ],
+        output_names=["y"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _trellis_activation_down_hadamard_kernel(
+    intermediate_size: int,
+    experts: int,
+    limit: float,
+):
+    header = f"""
+        using namespace metal;
+        constant constexpr uint INTERMEDIATE = {intermediate_size}u;
+        constant constexpr uint HAD = 128u;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+        constant constexpr float LIMIT = {float(limit):.9g}f;
+    """
+    source = r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint block = threadgroup_position_in_grid.y;
+        uint task = threadgroup_position_in_grid.z;
+        uint expert = uint(sorted_ids[task]);
+        uint column = block * HAD + lane;
+        threadgroup float gate_values[HAD];
+        threadgroup float up_values[HAD];
+
+        gate_values[lane] = float(gate_inner[size_t(task) * INTERMEDIATE + column]);
+        up_values[lane] = float(up_inner[size_t(task) * INTERMEDIATE + column]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
+            float gate_own = gate_values[lane];
+            float gate_peer = gate_values[lane ^ stride];
+            float up_own = up_values[lane];
+            float up_peer = up_values[lane ^ stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            gate_values[lane] = (lane & stride)
+                ? gate_peer - gate_own
+                : gate_own + gate_peer;
+            up_values[lane] = (lane & stride)
+                ? up_peer - up_own
+                : up_own + up_peer;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        half gate_half = half(
+            gate_values[lane] * HAD_SCALE
+            * float(gate_svh[size_t(expert) * INTERMEDIATE + column])
+        );
+        half up_half = half(
+            up_values[lane] * HAD_SCALE
+            * float(up_svh[size_t(expert) * INTERMEDIATE + column])
+        );
+        float gate = float(gate_half);
+        float up = float(up_half);
+        if (LIMIT > 0.0f) {
+            gate = min(gate, LIMIT);
+            up = clamp(up, -LIMIT, LIMIT);
+        }
+        half activated = half((gate / (1.0f + exp(-gate))) * up);
+        gate_values[lane] = float(half(
+            float(activated)
+            * float(down_suh[size_t(expert) * INTERMEDIATE + column])
+        ));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
+            float own = gate_values[lane];
+            float peer = gate_values[lane ^ stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            gate_values[lane] = (lane & stride) ? peer - own : own + peer;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        down_h[size_t(task) * INTERMEDIATE + column] = half(
+            gate_values[lane] * HAD_SCALE
+        );
+    """
+    return mx.fast.metal_kernel(
+        name=(
+            f"mtplx_dsv4_exl3_trellis_swiglu_down_h_i{intermediate_size}"
+            f"_e{experts}_l{int(round(limit * 1000.0))}_v1"
+        ),
+        input_names=[
+            "gate_inner",
+            "up_inner",
+            "gate_svh",
+            "up_svh",
+            "down_suh",
+            "sorted_ids",
+        ],
+        output_names=["down_h"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _trellis_final_reduce_kernel(
+    hidden_size: int,
+    experts: int,
+    topk: int,
+):
+    header = f"""
+        using namespace metal;
+        constant constexpr uint HIDDEN = {hidden_size}u;
+        constant constexpr uint TOPK = {topk}u;
+        constant constexpr uint HAD = 128u;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+    """
+    source = r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint block = threadgroup_position_in_grid.y;
+        uint row = threadgroup_position_in_grid.z;
+        uint column = block * HAD + lane;
+        threadgroup float values[HAD];
+        float routed_sum = 0.0f;
+        for (uint route = 0u; route < TOPK; ++route) {
+            uint original_task = row * TOPK + route;
+            uint sorted_task = uint(inverse[original_task]);
+            uint expert = uint(expert_ids[original_task]);
+            values[lane] = float(
+                down_inner[size_t(sorted_task) * HIDDEN + column]
+            );
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = 1u; stride < HAD; stride <<= 1u) {
+                float own = values[lane];
+                float peer = values[lane ^ stride];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                values[lane] = (lane & stride) ? peer - own : own + peer;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            half projected = half(
+                values[lane] * HAD_SCALE
+                * float(down_svh[size_t(expert) * HIDDEN + column])
+            );
+            routed_sum += float(projected)
+                * float(route_weights[original_task]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        output[size_t(row) * HIDDEN + column] = T(
+            routed_sum + float(shared[size_t(row) * HIDDEN + column])
+        );
+    """
+    return mx.fast.metal_kernel(
+        name=(
+            f"mtplx_dsv4_exl3_trellis_final_reduce_h{hidden_size}"
+            f"_e{experts}_t{topk}_v1"
+        ),
+        input_names=[
+            "down_inner",
+            "down_svh",
+            "inverse",
+            "expert_ids",
+            "route_weights",
+            "shared",
+        ],
+        output_names=["output"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
 def _mcg_grouped_mma_kernel(size_k: int, size_n: int, experts: int):
     inverse = ",".join(str(value) for value in EXL3_TENSOR_CORE_INVERSE)
     header = f"""
@@ -896,6 +1332,153 @@ class EXL3SwitchGLU(nn.Module):
             topk,
             routed_input=True,
         )
+        self._trellis_installed = False
+
+    def install_trellis_runtime(self, *, max_tokens: int) -> None:
+        """Install the pinned decode/prefill plans before request execution."""
+        if int(max_tokens) < 1:
+            raise ValueError("EXL3 Trellis max_tokens must be positive")
+        self._trellis_max_tokens = int(max_tokens)
+        for block_m in (8, 64):
+            _trellis_route_pack_kernel(self.experts, self.topk, block_m)
+            _mcg_trellis_mma_kernel(
+                self.hidden_size, self.gate_proj.output_dims, self.experts, block_m
+            )
+            _mcg_trellis_mma_kernel(
+                self.down_proj.input_dims,
+                self.hidden_size,
+                self.experts,
+                block_m,
+            )
+        _packed_route_hadamard_kernel(
+            self.hidden_size, self.experts, self.topk
+        )
+        _trellis_activation_down_hadamard_kernel(
+            self.gate_proj.output_dims, self.experts, self.limit
+        )
+        _trellis_final_reduce_kernel(
+            self.hidden_size, self.experts, self.topk
+        )
+        self._trellis_installed = True
+
+    def _trellis_mma(
+        self,
+        bank: EXL3LinearBank,
+        transformed: mx.array,
+        route_blocks,
+        block_m: int,
+    ) -> mx.array:
+        tasks = int(transformed.shape[0])
+        block_expert, block_row, block_size, packed_count = route_blocks
+        threads = int(block_m) * 8
+        return _mcg_trellis_mma_kernel(
+            bank.input_dims,
+            bank.output_dims,
+            self.experts,
+            int(block_m),
+        )(
+            inputs=[
+                mx.contiguous(transformed),
+                bank.trellis,
+                block_expert,
+                block_row,
+                block_size,
+                packed_count,
+            ],
+            grid=(threads, bank.output_dims // 32, tasks),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[(tasks, bank.output_dims)],
+            output_dtypes=[mx.float16],
+        )[0]
+
+    def fused(
+        self,
+        x: mx.array,
+        expert_ids: mx.array,
+        route_weights: mx.array,
+        shared: mx.array,
+    ) -> mx.array:
+        """Run the installed W4A16 Trellis MoE and final weighted reduction."""
+        original_dtype = x.dtype
+        rows = int(expert_ids.shape[0])
+        tasks = rows * self.topk
+        block_m = 8 if rows <= 32 else 64
+        (
+            packed_tasks,
+            inverse,
+            sorted_ids,
+            block_expert,
+            block_row,
+            block_size,
+            packed_count,
+        ) = _pack_trellis_routes(
+            expert_ids,
+            experts=self.experts,
+            topk=self.topk,
+            block_m=block_m,
+        )
+        route_blocks = (block_expert, block_row, block_size, packed_count)
+        x_half = mx.contiguous(x.astype(mx.float16))
+        transform = _packed_route_hadamard_kernel(
+            self.hidden_size, self.experts, self.topk
+        )
+        gate_h = transform(
+            inputs=[x_half, self.gate_proj.suh, packed_tasks, sorted_ids],
+            grid=(128, self.hidden_size // 128, tasks),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(tasks, self.hidden_size)],
+            output_dtypes=[mx.float16],
+        )[0]
+        up_h = transform(
+            inputs=[x_half, self.up_proj.suh, packed_tasks, sorted_ids],
+            grid=(128, self.hidden_size // 128, tasks),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(tasks, self.hidden_size)],
+            output_dtypes=[mx.float16],
+        )[0]
+        gate_inner = self._trellis_mma(
+            self.gate_proj, gate_h, route_blocks, block_m
+        )
+        up_inner = self._trellis_mma(
+            self.up_proj, up_h, route_blocks, block_m
+        )
+        intermediate = self.gate_proj.output_dims
+        down_h = _trellis_activation_down_hadamard_kernel(
+            intermediate, self.experts, self.limit
+        )(
+            inputs=[
+                gate_inner,
+                up_inner,
+                self.gate_proj.svh,
+                self.up_proj.svh,
+                self.down_proj.suh,
+                sorted_ids,
+            ],
+            grid=(128, intermediate // 128, tasks),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(tasks, intermediate)],
+            output_dtypes=[mx.float16],
+        )[0]
+        down_inner = self._trellis_mma(
+            self.down_proj, down_h, route_blocks, block_m
+        )
+        return _trellis_final_reduce_kernel(
+            self.hidden_size, self.experts, self.topk
+        )(
+            inputs=[
+                down_inner,
+                self.down_proj.svh,
+                inverse,
+                mx.contiguous(expert_ids.reshape(tasks).astype(mx.uint32)),
+                mx.contiguous(route_weights.reshape(tasks)),
+                mx.contiguous(shared),
+            ],
+            template=[("T", original_dtype)],
+            grid=(128, self.hidden_size // 128, rows),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(rows, self.hidden_size)],
+            output_dtypes=[original_dtype],
+        )[0]
 
     def __call__(self, x: mx.array, expert_ids: mx.array) -> mx.array:
         original_dtype = x.dtype
@@ -1110,6 +1693,282 @@ def load_indexed_safetensors(root: Path | str) -> dict[str, mx.array]:
     return weights
 
 
+def _indexed_weight_map(root: Path) -> dict[str, str]:
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"invalid safetensors index: {index_path}")
+    return {str(name): str(filename) for name, filename in weight_map.items()}
+
+
+def _install_quantized_modules(
+    model: nn.Module,
+    expected: dict[str, str],
+    *,
+    prefix: str,
+) -> dict[str, str]:
+    selected: set[str] = set()
+
+    def predicate(path: str, module: nn.Module):
+        if not path.startswith(prefix) or not hasattr(module, "to_quantized"):
+            return False
+        mode = expected.get(path)
+        if mode == "mxfp4":
+            selected.add(path)
+            return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+        if mode == "mxfp8":
+            selected.add(path)
+            return {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+        return False
+
+    nn.quantize(model, class_predicate=predicate)
+    if selected != set(expected):
+        raise ValueError(
+            f"Mia quantized module ownership mismatch under {prefix!r}: "
+            f"missing={sorted(set(expected) - selected)!r}, "
+            f"extra={sorted(selected - set(expected))!r}"
+        )
+    installed = dict(model.named_modules())
+    for path, mode in expected.items():
+        module = installed.get(path)
+        bits = 4 if mode == "mxfp4" else 8
+        if (
+            module is None
+            or int(getattr(module, "group_size", 0)) != 32
+            or int(getattr(module, "bits", 0)) != bits
+            or str(getattr(module, "mode", "")) != mode
+            or getattr(getattr(module, "weight", None), "dtype", None)
+            != mx.uint32
+            or getattr(getattr(module, "scales", None), "dtype", None)
+            != mx.uint8
+            or getattr(module, "biases", None) is not None
+        ):
+            raise ValueError(
+                f"Mia module {path!r} did not install group-32 {mode} ownership"
+            )
+    return dict(expected)
+
+
+def _target_quantized_modules_from_index(
+    weight_map: dict[str, str],
+) -> dict[str, str]:
+    expected: dict[str, str] = {}
+    for scale_name in weight_map:
+        if scale_name.startswith("mtp.") or not scale_name.endswith(".scale"):
+            continue
+        weight_name = scale_name.removesuffix(".scale") + ".weight"
+        if weight_name not in weight_map:
+            continue
+        target_weight = _map_mia_target_name(weight_name)
+        expected[target_weight.removesuffix(".weight")] = "mxfp8"
+    return expected
+
+
+def _map_mia_target_carried_shard(
+    source: dict[str, mx.array],
+) -> dict[str, mx.array]:
+    """Map one bounded non-expert shard without retaining the other shards."""
+
+    mapped: dict[str, mx.array] = {}
+    for name, value in source.items():
+        if name.startswith("mtp."):
+            continue
+        if _EXPERT_KEY.match(name) is not None:
+            raise ValueError("an EXL3 expert tensor reached a carried Mia shard")
+        if name.endswith(".scale"):
+            weight_name = name.removesuffix(".scale") + ".weight"
+            if weight_name in source:
+                continue
+        if name.endswith(".weight"):
+            scale_name = name.removesuffix(".weight") + ".scale"
+            scales = source.get(scale_name)
+            if scales is not None:
+                if value.dtype != mx.uint8 or value.ndim != 2:
+                    raise ValueError(f"unsupported Mia FP8 weight geometry: {name}")
+                output_dims, input_dims = (int(dim) for dim in value.shape)
+                target = _map_mia_target_name(name)
+                mapped[target] = mx.contiguous(value).view(mx.uint32)
+                mapped[target.removesuffix(".weight") + ".scales"] = (
+                    _expand_mia_fp8_block_scales(
+                        scales,
+                        output_dims,
+                        input_dims,
+                    )
+                )
+                continue
+        target = _map_mia_target_name(name)
+        if target.endswith(".ffn.gate.tid2eid") and value.dtype == mx.int64:
+            value = value.astype(mx.int32)
+        if ".attn.wo_a." in target and value.ndim == 3:
+            value = value.reshape(
+                int(value.shape[0]) * int(value.shape[1]),
+                int(value.shape[2]),
+            )
+        mapped[target] = value
+    return mapped
+
+
+def _map_mia_target_expert_shard(
+    source: dict[str, mx.array],
+    *,
+    layer: int,
+    experts: int,
+) -> dict[str, mx.array]:
+    """Stack one layer-local EXL3 shard and discard its unused MCG mirrors."""
+
+    fields: dict[tuple[str, str], dict[int, mx.array]] = {}
+    observed: set[str] = set()
+    for name, value in source.items():
+        match = _EXPERT_KEY.match(name)
+        if match is None or int(match.group("layer")) != int(layer):
+            raise ValueError(
+                f"EXL3 shard for layer {layer} owns unexpected tensor {name!r}"
+            )
+        observed.add(name)
+        if match.group("field") == "mcg":
+            continue
+        key = (match.group("projection"), match.group("field"))
+        fields.setdefault(key, {})[int(match.group("expert"))] = value
+
+    expected_ids = set(range(int(experts)))
+    mapped: dict[str, mx.array] = {}
+    for projection, target_projection in _PROJECTION_NAMES.items():
+        for field in ("trellis", "suh", "svh"):
+            values = fields.get((projection, field), {})
+            if set(values) != expected_ids:
+                raise ValueError(
+                    f"Mia EXL3 layer {layer} {projection}.{field} has "
+                    f"{len(values)} experts, expected {experts}"
+                )
+            target = (
+                f"model.layers.{int(layer)}.ffn.switch_mlp."
+                f"{target_projection}.{field}"
+            )
+            mapped[target] = mx.stack(
+                [values[expert] for expert in range(int(experts))],
+                axis=0,
+            )
+    if observed != set(source):
+        raise ValueError(f"Mia EXL3 layer {layer} shard was not fully consumed")
+    return mapped
+
+
+def _install_mia_weight_batch(
+    model: nn.Module,
+    mapped: dict[str, mx.array],
+    installed_names: set[str],
+) -> None:
+    overlap = installed_names.intersection(mapped)
+    if overlap:
+        raise ValueError(f"Mia target parameters were loaded twice: {sorted(overlap)!r}")
+    if mapped:
+        mx.eval(*mapped.values())
+        model.load_weights(list(mapped.items()), strict=False)
+        installed_names.update(mapped)
+
+
+def load_mia_exl3_target_streaming(
+    model: nn.Module,
+    root: Path | str,
+    *,
+    layers: int,
+    experts: int,
+) -> dict[str, str]:
+    """Install the 106 GB target with one source shard live at a time.
+
+    The rank-sliced package owns five carried shards and one complete EXL3 shard
+    per target layer.  Keeping that boundary avoids the former all-shards source
+    dictionary and bounds conversion scratch to one carried shard or one 2 GB
+    expert layer while preserving the exact destination tensors.
+    """
+
+    from mlx.utils import tree_flatten
+
+    root = Path(root)
+    weight_map = _indexed_weight_map(root)
+    quantized = _target_quantized_modules_from_index(weight_map)
+    model_quantized = {
+        path: mode for path, mode in quantized.items() if path.startswith("model.")
+    }
+    head_quantized = {
+        path: mode for path, mode in quantized.items() if path.startswith("lm_head")
+    }
+    receipt: dict[str, str] = {}
+    receipt.update(
+        _install_quantized_modules(model, model_quantized, prefix="model.")
+    )
+    receipt.update(
+        _install_quantized_modules(model, head_quantized, prefix="lm_head")
+    )
+
+    files: dict[str, set[str]] = {}
+    for name, filename in weight_map.items():
+        files.setdefault(filename, set()).add(name)
+    installed_names: set[str] = set()
+
+    carried_files = {
+        name for name in files if name.startswith("carried-")
+    }
+    for filename in sorted(carried_files):
+        source = dict(mx.load(str(root / filename)))
+        if set(source) != files[filename]:
+            raise ValueError(f"Mia carried shard index mismatch: {filename}")
+        mapped = _map_mia_target_carried_shard(source)
+        _install_mia_weight_batch(model, mapped, installed_names)
+        del mapped, source
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+
+    expert_files = {
+        name for name in files if name.startswith("exl3-layer-")
+    }
+    if len(expert_files) != int(layers):
+        raise ValueError(
+            f"Mia target owns {len(expert_files)} EXL3 layer shards, "
+            f"expected {layers}"
+        )
+    for layer in range(int(layers)):
+        filename = f"exl3-layer-{layer:03d}-tp1-rank0.safetensors"
+        if filename not in expert_files:
+            raise ValueError(f"Mia target is missing {filename}")
+        source = dict(mx.load(str(root / filename)))
+        if set(source) != files[filename]:
+            raise ValueError(f"Mia EXL3 shard index mismatch: {filename}")
+        mapped = _map_mia_target_expert_shard(
+            source,
+            layer=layer,
+            experts=experts,
+        )
+        _install_mia_weight_batch(model, mapped, installed_names)
+        del mapped, source
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+
+    unexpected_files = set(files) - carried_files - expert_files
+    if unexpected_files:
+        raise ValueError(
+            f"Mia target index owns unexpected shards: {sorted(unexpected_files)!r}"
+        )
+    installed_parameters = {
+        name for name, _value in tree_flatten(model.parameters())
+    }
+    if installed_names != installed_parameters:
+        raise ValueError(
+            "Mia streaming target parameter mismatch: "
+            f"missing={len(installed_parameters - installed_names)}, "
+            f"extra={len(installed_names - installed_parameters)}"
+        )
+    model._mia_target_load_receipt = {
+        "mode": "bounded_one_shard",
+        "source_shards": len(files),
+        "carried_shards": len(carried_files),
+        "exl3_layer_shards": len(expert_files),
+        "installed_parameters": len(installed_names),
+    }
+    return receipt
+
+
 def _map_mia_dspark_name(name: str) -> str:
     mapped = name
     replacements = (
@@ -1219,17 +2078,15 @@ def _quantize_loaded_modules(
     weights: dict[str, mx.array],
     *,
     prefix: str,
-) -> None:
-    def predicate(path: str, module: nn.Module):
-        if not path.startswith(prefix) or not hasattr(module, "to_quantized"):
-            return False
-        if ".ffn.switch_mlp." in path:
-            return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-        if f"{path}.scales" in weights:
-            return {"group_size": 32, "bits": 8, "mode": "mxfp8"}
-        return False
-
-    nn.quantize(model, class_predicate=predicate)
+) -> dict[str, str]:
+    expected = {
+        name.removesuffix(".scales"): (
+            "mxfp4" if ".ffn.switch_mlp." in name else "mxfp8"
+        )
+        for name in weights
+        if name.startswith(prefix) and name.endswith(".scales")
+    }
+    return _install_quantized_modules(model, expected, prefix=prefix)
 
 
 def _default_mia_dspark_root(target_root: Path) -> Path:
@@ -1252,6 +2109,8 @@ def load_mia_exl3_dspark_model(
     *,
     draft_root: Path | str | None = None,
     lazy: bool = False,
+    context_capacity_tokens: int = 384_000,
+    max_batch_tokens: int = 8_224,
 ):
     """Construct the exact split Mia K216 target plus K64 DSpark owner."""
 
@@ -1261,6 +2120,14 @@ def load_mia_exl3_dspark_model(
     from mtplx.models.deepseek_v4_dspark import build_deepseek_v4_dspark
 
     target_root = Path(target_root).resolve()
+    resolved_draft = (
+        Path(draft_root).resolve()
+        if draft_root is not None
+        else _default_mia_dspark_root(target_root).resolve()
+    )
+    from mtplx.deepseek_v4_mia_engine import validate_pinned_mia_artifacts
+
+    validate_pinned_mia_artifacts(target_root, resolved_draft)
     target_config = json.loads((target_root / "config.json").read_text())
     # Qualify the source metadata before clearing only the separately-owned
     # draft signature for target construction.
@@ -1276,17 +2143,16 @@ def load_mia_exl3_dspark_model(
         }
     )
     model = Model(ModelArgs.from_dict(target_only))
-    target_weights = model.sanitize(load_indexed_safetensors(target_root))
-    _quantize_loaded_modules(model, target_weights, prefix="model.")
-    _quantize_loaded_modules(model, target_weights, prefix="lm_head")
-    model.eval()
-    model.load_weights(list(target_weights.items()), strict=True)
-
-    resolved_draft = (
-        Path(draft_root).resolve()
-        if draft_root is not None
-        else _default_mia_dspark_root(target_root).resolve()
+    quantized_modules = load_mia_exl3_target_streaming(
+        model,
+        target_root,
+        layers=int(model.args.num_hidden_layers),
+        experts=int(model.args.n_routed_experts),
     )
+    model.eval()
+    for layer in model.layers:
+        layer.ffn.install_mia_exl3_runtime(max_tokens=8224)
+
     draft_config = json.loads((resolved_draft / "config.json").read_text())
     draft_experts = int(draft_config.get("n_routed_experts", 0))
     draft_config["hybrid_tr3_tail"] = None
@@ -1296,20 +2162,14 @@ def load_mia_exl3_dspark_model(
     owner = build_deepseek_v4_dspark(draft_args)
     model.install_dspark_owner(owner)
 
-    # The exact Mia route inherits the independently measured DeepSeek-V4
-    # fixed-HC Sinkhorn win.  Bind it once to all 43 target layers and all three
-    # DSpark stages; the token path sees only the installed callable.
-    sinkhorn_owners = tuple(model.layers) + tuple(owner.stages)
-    for layer in sinkhorn_owners:
-        layer.attn_hc.install_sinkhorn_kernel()
-        layer.ffn_hc.install_sinkhorn_kernel()
-
     draft_weights = sanitize_mia_dspark_weights(
         load_indexed_safetensors(resolved_draft),
         stages=3,
         experts=64,
     )
-    _quantize_loaded_modules(model, draft_weights, prefix="mtp.")
+    quantized_modules.update(
+        _quantize_loaded_modules(model, draft_weights, prefix="mtp.")
+    )
     installed = {
         name: value
         for name, value in tree_flatten(model.parameters())
@@ -1328,6 +2188,11 @@ def load_mia_exl3_dspark_model(
                 f"installed={value.shape}, source={draft_weights[name].shape}"
             )
     model.load_weights(list(draft_weights.items()), strict=False)
+    model._mia_quantized_modules = dict(quantized_modules)
+
+    # Replace the layer-local mHC chain with the pinned carried state machine
+    # for both the 43-layer target and the three-stage K64 draft.
+    model.install_mia_mhc_runtime(max_tokens=8224)
 
     # Reuse the existing direct grouped o-LoRA route against Mia's native MXFP8
     # packing.  All target and draft attention owners are validated and bound
@@ -1347,6 +2212,18 @@ def load_mia_exl3_dspark_model(
         or not o_lora["all_mode_matches"]
     ):
         raise RuntimeError(f"Mia direct o-LoRA route is incomplete: {o_lora}")
+
+    from mtplx.deepseek_v4_mia_engine import build_mia_engine_plan
+
+    engine_plan = build_mia_engine_plan(
+        model,
+        target_root=target_root,
+        draft_root=resolved_draft,
+        context_capacity_tokens=context_capacity_tokens,
+        max_batch_tokens=max_batch_tokens,
+    )
+    model.install_mia_engine_plan(engine_plan)
     if not lazy:
         mx.eval(model.parameters())
+        model._mia_prewarm_receipt = engine_plan.prewarm(model)
     return model
