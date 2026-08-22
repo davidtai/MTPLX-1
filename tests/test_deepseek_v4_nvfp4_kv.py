@@ -72,6 +72,12 @@ def _as_numpy(value: mx.array) -> np.ndarray:
     return np.array(value.astype(mx.float32))
 
 
+def _exp2(value: mx.array) -> mx.array:
+    """Evaluate the base-2 oracle on MLX builds without ``mx.exp2``."""
+
+    return mx.exp(value * np.log(2.0))
+
+
 def test_mia_decode_kernel_seals_image_h16_bf16_base2_contract() -> None:
     assert nvfp4_mla_module._DECODE_HEADS_PER_GROUP == 16
     assert nvfp4_mla_module._DECODE_CANDIDATE_TILE == 64
@@ -654,8 +660,8 @@ def test_sparse_attention_reads_stock432_records_directly(
             mx.max(scores_base2, axis=-1, keepdims=True),
             sinks_base2,
         )
-        weights = mx.exp2(scores_base2 - maximum)
-        denominator = mx.sum(weights, axis=-1, keepdims=True) + mx.exp2(
+        weights = _exp2(scores_base2 - maximum)
+        denominator = mx.sum(weights, axis=-1, keepdims=True) + _exp2(
             sinks_base2 - maximum
         )
         # The unnormalized P operand crosses a BF16 boundary before P.V.  Its
@@ -741,8 +747,8 @@ def test_dspark_k5_attention_uses_bf16_source_math_over_ring_and_all_drafts() ->
         mx.max(scores_base2, axis=-1, keepdims=True),
         sinks_base2,
     )
-    probabilities = mx.exp2(scores_base2 - maximum)
-    denominator = mx.sum(probabilities, axis=-1, keepdims=True) + mx.exp2(
+    probabilities = _exp2(scores_base2 - maximum)
+    denominator = mx.sum(probabilities, axis=-1, keepdims=True) + _exp2(
         sinks_base2 - maximum
     )
     numerator = probabilities.astype(mx.bfloat16).astype(mx.float32) @ value[
@@ -765,7 +771,8 @@ def test_ratio128_sequential_paged_decode_crosses_tile64() -> None:
     if not mx.metal.is_available():
         pytest.skip("requires direct Metal NVFP4 attention")
 
-    compressed = PagedMiaNVFP4Rows(capacity_rows=80, block_size=8)
+    compressed = PagedMiaNVFP4Rows(capacity_rows=80, block_size=2)
+    assert compressed.block_size == 256 // 128
     compressed.append(
         (
             ((mx.arange(65 * 512, dtype=mx.float32) % 31) - 15) / 7.0
@@ -813,8 +820,8 @@ def test_ratio128_sequential_paged_decode_crosses_tile64() -> None:
     )
     sink = sinks.reshape(1, 64, 1, 1) * np.log2(np.e)
     maximum = mx.maximum(mx.max(scores, axis=-1, keepdims=True), sink)
-    probabilities = mx.exp2(scores - maximum)
-    denominator = mx.sum(probabilities, axis=-1, keepdims=True) + mx.exp2(
+    probabilities = _exp2(scores - maximum)
+    denominator = mx.sum(probabilities, axis=-1, keepdims=True) + _exp2(
         sink - maximum
     )
     numerator = probabilities.astype(mx.bfloat16).astype(mx.float32) @ value[

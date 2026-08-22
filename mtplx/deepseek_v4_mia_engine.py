@@ -488,6 +488,8 @@ class MiaTargetCacheArena:
                 != "nvfp4_stock432_paged"
                 or int(getattr(cache.compressed, "capacity", 0))
                 != (int(capacity_tokens) + ratio - 1) // ratio
+                or int(getattr(cache.compressed, "block_size", 0))
+                != max(1, 256 // ratio)
             ):
                 raise ValueError(
                     "Mia target cache arena did not install fixed compressor pages"

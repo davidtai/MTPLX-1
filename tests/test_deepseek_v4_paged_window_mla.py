@@ -281,6 +281,8 @@ def test_engine_seals_fixed_descriptor_and_token_major_route():
     assert "FixedMiaNVFP4WindowRecords" in arena
     assert "expected_window_capacity" in arena
     assert "physical_rows" in arena
+    assert 'getattr(cache.compressed, "block_size", 0)' in arena
+    assert "256 // ratio" in arena
     assert '!= "_trim_fixed_window"' in arena
     assert '"target_swa_stock432_physical_pages"' in build
     assert '"target_fixed_swa_paged_descriptor_8416"' in build
