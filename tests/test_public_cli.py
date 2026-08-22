@@ -340,7 +340,9 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert "--prompt-format chat" in payload["recommended_plugged_in_commands"][0]
     assert "--disable-thinking" in payload["recommended_plugged_in_commands"][0]
     assert payload["profile"]["env"]["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
-    assert payload["profile"]["env"]["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
+    # Lazy is the active strategy; the batched lane must not be claimed
+    # while the lazy gate kills it (PR #314 dead-pair fix).
+    assert payload["profile"]["env"]["MTPLX_BATCH_TARGET_ARRAYS"] == "0"
     assert payload["profile"]["env"]["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
     assert payload["profile"]["env"]["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] == "1"
     assert (
@@ -881,10 +883,15 @@ def test_start_opencode_dry_run_json_writes_no_hidden_cap(
     model_id = payload["opencode"]["model_id"]
     assert payload["opencode"]["provider"]["options"]["apiKey"] == "<configured>"
     model = payload["opencode"]["config"]["provider"]["mtplx"]["models"][model_id]
-    assert model["reasoning"] is False
-    assert model["temperature"] is False
+    # The dry-run stub resolves the default qwen3_next lane: verified codec
+    # (reasoning_content round-trips), no effort dial (OpenCode's built-in
+    # effort picker disabled tier by tier), temperature declared so explicit
+    # client-side choices transmit (nothing is injected for MTPLX ids).
+    assert model["reasoning"] is True
+    assert model["temperature"] is True
     assert "interleaved" not in model
     assert "options" not in model
+    assert all(value == {"disabled": True} for value in model["variants"].values())
 
 
 def test_start_opencode_dry_run_emits_explicit_ssd_off(monkeypatch, tmp_path, capsys):
@@ -1445,7 +1452,11 @@ def test_start_hermes_dry_run_json_matches_native_agent_lane(
     assert "--ssd-session-cache-min-prefix-tokens 512" in command
     assert "--temperature 0.6" in command
     assert "--top-p 1.0" in command
-    assert "--draft-top-p 1.0" in command
+    # Draft sampler is family/stamp-owned; the serve correction chain
+    # resolves it at launch, so the hermes writer emits no draft flags.
+    assert "--draft-temperature" not in command
+    assert "--draft-top-p" not in command
+    assert "--draft-top-k" not in command
     assert "--tool-prompt-mode hybrid" in command
     assert "--chat-template-profile local_qwen36" in command
     assert "--adaptive-policy expected_value" in command
@@ -2860,9 +2871,14 @@ def test_quickstart_pi_dry_run_json(monkeypatch, tmp_path, capsys):
     assert payload["pi"]["provider"]["authHeader"] is True
     assert payload["pi"]["provider"]["headers"] == {"x-mtplx-client": "pi"}
     assert payload["pi"]["provider"]["compat"]["supportsDeveloperRole"] is False
-    assert payload["pi"]["provider"]["compat"]["supportsReasoningEffort"] is False
+    assert payload["pi"]["provider"]["compat"]["supportsReasoningEffort"] is True
+    assert payload["pi"]["provider"]["compat"]["thinkingFormat"] == "qwen"
     assert payload["pi"]["provider"]["compat"]["maxTokensField"] == "max_tokens"
     assert payload["pi"]["provider"]["models"][0]["reasoning"] is True
+    assert payload["pi"]["provider"]["models"][0]["thinkingLevelMap"] == {
+        "minimal": None,
+        "xhigh": "xhigh",
+    }
     assert payload["pi"]["no_hidden_max_tokens"] is True
     assert payload["pi"]["provider"]["models"][0]["maxTokens"] == payload["pi"][
         "context_window"
@@ -2872,8 +2888,14 @@ def test_quickstart_pi_dry_run_json(monkeypatch, tmp_path, capsys):
     )
     assert "--api-key mtplx-local" in payload["pi"]["server_command"]
     assert "--default-top-p 0.95" in payload["pi"]["server_command"]
-    assert "--draft-top-p 0.95" in payload["pi"]["server_command"]
-    assert "--preserve-thinking off" in payload["pi"]["server_command"]
+    # Draft sampler is family/stamp-owned; the old writer cross-wired the Pi
+    # TARGET sampler into draft flags, pinning past the correction chain.
+    assert "--draft-temperature" not in payload["pi"]["server_command"]
+    assert "--draft-top-p" not in payload["pi"]["server_command"]
+    assert "--draft-top-k" not in payload["pi"]["server_command"]
+    # Pi rides the general auto resolution (2026-08-21): the family contract
+    # owns reasoning history, replacing the 1.0.0-era Pi-only hard "off".
+    assert "--preserve-thinking auto" in payload["pi"]["server_command"]
 
 
 def test_start_pi_missing_cli_stops_before_model_check(monkeypatch, tmp_path, capsys):
@@ -3057,8 +3079,10 @@ def test_start_pi_handoff_writes_config_and_starts_authenticated_server(
         "model_id": "mtplx-test-model",
         "top_p": 0.95,
         "top_k": 20,
-        "draft_top_p": 0.95,
-        "draft_top_k": 20,
+        # No user draft flags: the handoff forwards None so the serve
+        # correction chain resolves the family/stamp draft sampler.
+        "draft_top_p": None,
+        "draft_top_k": None,
     }
     assert payload["providers"]["mtplx"]["baseUrl"] == "http://127.0.0.1:18012/v1"
     assert payload["providers"]["mtplx"]["models"][0]["id"] == "mtplx-test-model"
@@ -5478,10 +5502,19 @@ def test_integrate_opencode_json_uses_mtplx_owned_generation_contract(capsys):
     assert (
         payload["config"]["provider"]["mtplx"]["options"]["apiKey"] == "$MTPLX_API_KEY"
     )
-    assert model["reasoning"] is False
-    assert model["temperature"] is False
+    # The default model is the Qwen3.8 coding flagship: verified reasoning
+    # codec (so reasoning_content round-trips), the family effort dial
+    # (default medium) mirrored into options.reasoningEffort, and OpenCode's
+    # built-in effort picker trimmed to the xhigh/medium/low family levels.
+    assert model["reasoning"] is True
+    assert model["temperature"] is True
     assert "interleaved" not in model
-    assert "options" not in model
+    assert model["options"] == {"reasoningEffort": "medium"}
+    assert model["variants"] == {
+        "none": {"disabled": True},
+        "minimal": {"disabled": True},
+        "high": {"disabled": True},
+    }
 
 
 def test_integrate_swival_json_emits_generic_provider_command(capsys):
@@ -7039,7 +7072,7 @@ def test_quickstart_pi_passes_launch_command_to_server(monkeypatch):
 
     assert "--launch-pi" in calls["cmd"]
     assert "--server-console" in calls["cmd"]
-    assert calls["cmd"][calls["cmd"].index("--preserve-thinking") + 1] == "off"
+    assert calls["cmd"][calls["cmd"].index("--preserve-thinking") + 1] == "auto"
     assert calls["cmd"][calls["cmd"].index("--context-window") + 1] == "262144"
     command = calls["cmd"][calls["cmd"].index("--pi-launch-command") + 1]
     assert command == "pi --model mtplx/example"
@@ -8011,6 +8044,75 @@ def test_hermes_merged_config_without_existing_is_template():
     template = 'model:\n  default: "m"\n'
     assert public._hermes_merged_config_yaml(None, template) == template
     assert public._hermes_merged_config_yaml("  \n", template) == template
+
+
+def _hermes_template_blocks(template):
+    _preamble, blocks, _trailing = public._hermes_parse_top_level_blocks(template)
+    return {block["key"]: "\n".join(block["lines"]) for block in blocks}
+
+
+def test_hermes_config_yaml_identity_header_and_agent_effort():
+    template = public._hermes_config_yaml(
+        model_id="m",
+        base_url="http://127.0.0.1:9001/v1",
+        api_key="k",
+        workspace_path="/ws",
+        reasoning_effort="high",
+    )
+    by_key = _hermes_template_blocks(template)
+    # model.default_headers is the only client-side identity hook hermes
+    # exposes; every hermes-conditional server branch keys on it.
+    assert "  default_headers:\n    x-mtplx-client: hermes" in by_key["model"]
+    # hermes reads CLI_CONFIG["agent"]["reasoning_effort"]; under model: the
+    # key is silently ignored.
+    assert "  reasoning_effort: 'high'" in by_key["agent"]
+    assert "reasoning_effort" not in by_key["model"]
+
+    effortless = public._hermes_config_yaml(
+        model_id="m",
+        base_url="http://127.0.0.1:9001/v1",
+        api_key="k",
+        workspace_path="/ws",
+    )
+    assert "reasoning_effort" not in effortless
+    assert "x-mtplx-client: hermes" in effortless
+
+
+def test_hermes_merge_moves_stale_model_effort_under_agent():
+    template = public._hermes_config_yaml(
+        model_id="m",
+        base_url="http://127.0.0.1:9001/v1",
+        api_key="k",
+        workspace_path="/ws",
+        reasoning_effort="low",
+    )
+    stale = (
+        "model:\n"
+        "  default: 'old'\n"
+        "  provider: custom\n"
+        "  reasoning_effort: 'high'\n"
+        "agent:\n"
+        "  system_prompt: 'old'\n"
+    )
+    merged = public._hermes_merged_config_yaml(stale, template)
+    by_key = _hermes_template_blocks(merged)
+    assert "reasoning_effort" not in by_key["model"]
+    assert by_key["agent"].count("reasoning_effort") == 1
+    assert "  reasoning_effort: 'low'" in by_key["agent"]
+    # Idempotent with the nested default_headers child in place.
+    assert public._hermes_merged_config_yaml(merged, template) == merged
+
+
+def test_hermes_client_reasoning_effort_excludes_auto():
+    from types import SimpleNamespace
+
+    effort = public._hermes_client_reasoning_effort
+    assert effort(SimpleNamespace(reasoning_effort="xhigh")) == "xhigh"
+    # "auto" is the server-resolved sentinel; hermes warns and falls back to
+    # medium on unknown ladder values, so it must never be written.
+    assert effort(SimpleNamespace(reasoning_effort="auto")) is None
+    assert effort(SimpleNamespace(reasoning_effort=None)) is None
+    assert effort(SimpleNamespace()) is None
 
 
 def test_sync_hermes_profile_preserves_user_sections(monkeypatch, tmp_path):

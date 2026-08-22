@@ -5675,7 +5675,6 @@ def test_opencode_simple_chitchat_does_not_retry_or_cook_a_reply(monkeypatch):
             "tool_choice": "auto",
             "stream": True,
             "max_tokens": 64,
-            "enable_thinking": True,
         },
     ) as response:
         body = "".join(response.iter_text())
@@ -5768,14 +5767,12 @@ def test_step_reasoning_off_closes_template_think_prompt_for_managed_clients(
         headers={
             "x-mtplx-cache-mode": "bypass",
             "x-mtplx-client": "opencode",
-            "x-mtplx-allow-client-controls": "1",
         },
         json={
             "messages": [{"role": "user", "content": "hi"}],
             "stream": False,
             "max_tokens": 16,
-            "enable_thinking": True,
-            "reasoning_effort": "high",
+            "temperature": 0.2,
         },
     )
 
@@ -5791,11 +5788,53 @@ def test_step_reasoning_off_closes_template_think_prompt_for_managed_clients(
     assert stats["request_enable_thinking"] is False
     assert stats["request_reasoning_mode"] == "off"
     assert stats["request_enable_thinking_override"] is False
-    assert stats["client_control_fields_ignored"] == [
-        "enable_thinking",
-        "reasoning_effort",
-    ]
+    assert stats["client_control_fields_ignored"] == ["temperature"]
     assert stats["disabled_thinking_prompt_closed"] is True
+
+
+def test_managed_client_thinking_controls_are_honored(monkeypatch):
+    """Managed surfaces keep sampler params server-owned, but their thinking
+    controls (enable_thinking / reasoning_effort) govern the request — the
+    client-side effort picker must actually work (2026-08-21 order)."""
+    captured: dict[str, object] = {}
+    state = _fake_streaming_session_state()
+    state.backend_descriptor = openai.descriptor_for_backend_id("step3p5_mtp")
+    state.args.reasoning = "off"
+    state.args.enable_thinking = False
+    state.args.reasoning_parser = "step3p5"
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        captured["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("hello")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-client": "opencode",
+        },
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 16,
+            "enable_thinking": True,
+            "temperature": 0.2,
+        },
+    )
+
+    assert response.status_code == 200
+    stats = captured["request_observability"]
+    assert stats["mtplx_control_owner"] == "server"
+    assert stats["client_controls_allowed"] is False
+    assert stats["thinking_controls_allowed"] is True
+    assert stats["request_enable_thinking"] is True
+    assert stats["request_reasoning_mode"] == "on"
+    assert stats["request_enable_thinking_override"] is True
+    assert stats["client_control_fields_ignored"] == ["temperature"]
 
 
 def test_step_reasoning_off_strips_orphan_thinks_close_nonstream(monkeypatch):
@@ -13174,3 +13213,36 @@ def test_mtp_postcommit_snapshot_keeps_committed_policy(monkeypatch):
     assert made["mtp_cache"] == 1
     assert result["stored"] is True
     assert state.sessions.bank.puts[0]["mtp_history_policy"] == "committed"
+
+
+def test_strip_client_injected_output_cap_hermes_exact_match_only():
+    from mtplx.server.openai import _strip_client_injected_output_cap
+
+    hermes_headers = {"x-mtplx-client": "hermes"}
+    assert _strip_client_injected_output_cap(
+        65_536, headers=hermes_headers, metadata={}
+    ) == (None, True)
+    # Any other value is a deliberate client choice and must pass through.
+    assert _strip_client_injected_output_cap(
+        65_535, headers=hermes_headers, metadata={}
+    ) == (65_535, False)
+    assert _strip_client_injected_output_cap(
+        None, headers=hermes_headers, metadata={}
+    ) == (None, False)
+    # The same value from any other client is not the hermes injected floor.
+    assert _strip_client_injected_output_cap(
+        65_536, headers={"x-mtplx-client": "opencode"}, metadata={}
+    ) == (65_536, False)
+    assert _strip_client_injected_output_cap(65_536, headers={}, metadata={}) == (
+        65_536,
+        False,
+    )
+
+
+def test_anonymous_coding_agent_tools_cover_hermes_names():
+    from mtplx.server.openai import _anonymous_coding_agent_tool_request
+
+    for name in ("read_file", "write_file", "search_files", "terminal"):
+        assert _anonymous_coding_agent_tool_request([name]), name
+    assert not _anonymous_coding_agent_tool_request(["calendar_lookup"])
+    assert not _anonymous_coding_agent_tool_request([])

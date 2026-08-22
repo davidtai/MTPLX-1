@@ -44,6 +44,7 @@ public struct PiIntegration: Sendable {
     public static let providerID = "mtplx"
     public static let localAPIKey = "mtplx-local"
     public static let codingTools = "read,bash,edit,write,grep,find,ls"
+    public static let requestPolicyExtensionName = "mtplx-request-policy.ts"
     public static let agentOperatingHintsFilename = "pi-agent-operating-hints.md"
     public static let agentOperatingHints = """
     MTPLX agent operating hints:
@@ -301,8 +302,7 @@ public struct PiIntegration: Sendable {
                 baseURL: baseURL,
                 apiKey: apiKey,
                 contextWindow: contextWindow,
-                reasoningEnabled: OpenCodeIntegration.reasoningEnabled(forModelID: modelID),
-                reasoningEffort: OpenCodeIntegration.reasoningEffort(forModelID: modelID)
+                reasoningEnabled: OpenCodeIntegration.reasoningEnabled(forModelID: modelID)
             )
         )
         root["providers"] = .object(providers)
@@ -316,6 +316,13 @@ public struct PiIntegration: Sendable {
             at: configURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        let extensionURL = configURL.deletingLastPathComponent()
+            .appendingPathComponent("extensions", isDirectory: true)
+            .appendingPathComponent(Self.requestPolicyExtensionName)
+        let extensionDidChange = try Self.installRequestPolicyExtensionFile(
+            at: extensionURL,
+            modelID: modelID
+        )
 
         let existingData = try? Data(contentsOf: configURL)
         if existingData == nextData {
@@ -325,7 +332,7 @@ public struct PiIntegration: Sendable {
                 baseURL: baseURL,
                 modelReference: modelReference,
                 launchCommand: Self.launchCommand(for: configuration.model),
-                didChange: false,
+                didChange: extensionDidChange,
                 backupPath: nil
             )
         }
@@ -348,23 +355,93 @@ public struct PiIntegration: Sendable {
         )
     }
 
+    /// The MTPLX-owned Pi extension both writers install (byte-identical to
+    /// `mtplx.pi.build_pi_request_policy_extension_source` with
+    /// `uncapped=True`; both compare content before rewriting, so the lanes
+    /// never fight). It gives MTPLX Pi's real session id and strips exactly
+    /// Pi's generated 16,384 output ceiling for the configured model while
+    /// leaving explicit user caps alone. Regenerated with the current model
+    /// id on every sync — a stale model pin here silently disarms both hooks.
+    static func requestPolicyExtensionSource(modelID: String) -> String {
+        """
+        const mtplxModelID = "\(modelID)";
+        const mtplxUncapped = true;
+        const mtplxPiInjectedDefaultMaxTokens = 16384;
+
+        export default function (pi: any) {
+          pi.on("before_provider_headers", (event: any, ctx: any) => {
+            const headers = event?.headers;
+            if (!headers || typeof headers !== "object") return;
+            const client = Object.entries(headers).find(
+              ([key]) => key.toLowerCase() === "x-mtplx-client",
+            )?.[1];
+            if (client !== "pi") return;
+            event.headers["x-mtplx-session-id"] = String(
+              ctx.sessionManager.getSessionId(),
+            );
+          });
+
+          pi.on("before_provider_request", (event: any) => {
+            const payload = event?.payload;
+            if (!mtplxUncapped || !payload || typeof payload !== "object") return;
+            if (payload.model !== mtplxModelID) return;
+            // Strip only Pi's serialized default ceiling; an explicit user cap (any
+            // other value) is honored end to end.
+            const request = { ...payload };
+            let changed = false;
+            if (request.max_tokens === mtplxPiInjectedDefaultMaxTokens) {
+              delete request.max_tokens;
+              changed = true;
+            }
+            if (request.max_completion_tokens === mtplxPiInjectedDefaultMaxTokens) {
+              delete request.max_completion_tokens;
+              changed = true;
+            }
+            if (!changed) return;
+            return request;
+          });
+        }
+
+        """
+    }
+
+    /// Write the managed extension into Pi's extensions directory next to
+    /// `models.json`. Content-compared before writing so repeat launches
+    /// (and the Python `mtplx start pi` writer, which installs the identical
+    /// bytes) never churn the file.
+    private static func installRequestPolicyExtensionFile(
+        at url: URL,
+        modelID: String
+    ) throws -> Bool {
+        let data = Data(requestPolicyExtensionSource(modelID: modelID).utf8)
+        if let existing = try? Data(contentsOf: url), existing == data {
+            return false
+        }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: [.atomic])
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+        return true
+    }
+
     private static func providerConfig(
         modelID: String,
         baseURL: String,
         apiKey: String,
         contextWindow: Int,
-        reasoningEnabled: Bool,
-        reasoningEffort: String?
+        reasoningEnabled: Bool
     ) -> [String: JSONValue] {
-        var compat: [String: JSONValue] = [
-            "supportsDeveloperRole": .bool(false),
-            "supportsReasoningEffort": .bool(reasoningEffort != nil),
-            "maxTokensField": .string("max_tokens"),
-        ]
-        if let reasoningEffort {
-            compat["reasoningEffort"] = .string(reasoningEffort)
-        }
-
+        // Mirrors the CLI provider block (mtplx/pi.py build_pi_provider_config):
+        // the Qwen thinking format makes Pi 0.84.x serialize exactly the
+        // request fields the MTPLX server accepts — top-level enable_thinking
+        // plus reasoning_effort mapped through thinkingLevelMap. The server
+        // narrows effort to the loaded family's declared tiers; Pi's default
+        // level is "medium", the Qwen 3.8 family coding default.
         return [
             "baseUrl": .string(baseURL),
             "api": .string("openai-completions"),
@@ -373,14 +450,33 @@ public struct PiIntegration: Sendable {
             "headers": .object([
                 "x-mtplx-client": .string("pi"),
             ]),
-            "compat": .object(compat),
+            "compat": .object([
+                "supportsDeveloperRole": .bool(false),
+                "supportsReasoningEffort": .bool(true),
+                "thinkingFormat": .string("qwen"),
+                "maxTokensField": .string("max_tokens"),
+            ]),
             "models": .array([
                 .object([
                     "id": .string(modelID),
                     "name": .string("MTPLX \(modelID)"),
                     "reasoning": .bool(reasoningEnabled),
+                    // Pi's ladder is off/minimal/low/medium/high/xhigh/max;
+                    // MTPLX vocabulary is low/medium/high/xhigh. null hides
+                    // Pi's duplicate "minimal" tier; "xhigh" must be mapped
+                    // to appear in Pi's picker at all; "max" stays hidden.
+                    "thinkingLevelMap": .object([
+                        "minimal": .null,
+                        "xhigh": .string("xhigh"),
+                    ]),
                     "input": .array([.string("text")]),
                     "contextWindow": .number(Double(contextWindow)),
+                    // Pi silently substitutes a 16,384 output ceiling for
+                    // models whose metadata omits maxTokens. Advertise the
+                    // real context ceiling; the request-policy extension
+                    // strips only Pi's generated 16,384 leftover, so an
+                    // explicit user cap still passes through untouched.
+                    "maxTokens": .number(Double(contextWindow)),
                     "cost": .object([
                         "input": .number(0),
                         "output": .number(0),

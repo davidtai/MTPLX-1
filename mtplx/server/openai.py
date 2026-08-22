@@ -128,6 +128,7 @@ from mtplx.server.response_envelope import build_generation_result
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
     DEFAULT_PROFILE_NAME,
+    NATIVE_MTP_60_FAST_PATH_ENV,
     PROFILE_CHOICES,
     apply_profile_env,
     get_profile,
@@ -165,6 +166,15 @@ from mtplx.reasoning_codecs import (
     stream_splitter_for_parser,
 )
 from mtplx.server.dashboard_state import DashboardState, InFlightHandle
+from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
+
+# Inert fallback so stubbed states (tests) hit no-op recorder methods instead
+# of AttributeError; real ServerState installs its own in __init__.
+_INERT_FLIGHT = FlightRecorder(None)
+
+
+def _flight(state: Any) -> FlightRecorder:
+    return getattr(state, "flight", None) or _INERT_FLIGHT
 from mtplx.server.mtp_batch import (
     MTPBatchFinalizeOwnership,
     MTPBatchGenerationService,
@@ -366,14 +376,13 @@ def build_deepseek_v4_dflash2_runtime_context() -> Any:
     return build()
 
 
-FAST_PATH_ENV = {
-    "MTPLX_LAZY_VERIFY_LOGITS": "1",
-    "MTPLX_BATCH_TARGET_ARRAYS": "1",
-    "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
-    "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
-    "MTPLX_DROP_EVENTS": "1",
-    "MTPLX_SKIP_VERIFY_SNAPSHOT": "1",
-}
+# The native-MTP fast-path block, shared with the profile registry so
+# /health's fast_path_env can never drift from what the profiles actually
+# set. The old duplicated literal shipped 2.9.0 expecting
+# MTPLX_BATCH_TARGET_ARRAYS=1 — a value that was runtime-dead under the
+# lazy-distribution gate the same block enabled (turbo-truth audit,
+# 2026-08-21).
+FAST_PATH_ENV = dict(NATIVE_MTP_60_FAST_PATH_ENV)
 #: Verify strategies known to be correct with ``MTPLX_SKIP_VERIFY_SNAPSHOT=1``.
 #:
 #: Stated as a safe-list rather than as the complement (which used to be the
@@ -2525,6 +2534,10 @@ class ServerState:
                 self.model_scheduler.foreground_busy
             )
         self.last_metrics: list[dict[str, Any]] = []
+        # Per-request flight recorder (second-by-second telemetry + live
+        # in-flight endpoint). Inert when resolved off; hot paths only touch
+        # plain counters and a queue.
+        self.flight = resolve_flight_recorder(self.args)
         self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
         # decide when to drop fans back to auto after an idle period.
@@ -11139,13 +11152,20 @@ def _message_to_template_dict(
             ).strip()
         )
     item: dict[str, Any] = {"role": message.role, "content": content}
-    if include_reasoning_content and message.role == "assistant":
-        # Scoped reasoning history carries the client's structured reasoning
-        # fields through to the chat template so its rolling checkpoint can
-        # keep them inside the active agent round (interleaved-thinking
-        # continuity) and drop them for completed turns. The legacy
-        # preserve/strip modes keep their historical behavior: the field is
-        # dropped here, so `on` stays byte-identical as the rollback path.
+    if (
+        include_reasoning_content
+        and message.role == "assistant"
+        and not content.lstrip().startswith("<think>")
+    ):
+        # Structured reasoning echoes ride to the chat template for scoped
+        # mode (its rolling checkpoint governs retention) AND for
+        # preserve-mode echo-carry (base render for turns the committed
+        # stream hasn't covered; the committed substitution below overwrites
+        # covered turns with KV-exact bytes). Policy `--preserve-thinking on`
+        # never sets the flag, so it stays byte-identical legacy (the drop)
+        # as the rollback path. Content that already STARTS with an inline
+        # think block keeps it as the single reasoning source — rendering
+        # the field too would put the turn's thinking in twice.
         for key in ("reasoning_content", "reasoning"):
             reasoning = _message_extra(message, key)
             if reasoning:
@@ -11808,6 +11828,7 @@ def _maybe_canonicalize_committed_reasoning(
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=False,
         scoped_reasoning_history=False,
+        preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
         tools=tools,
         tool_choice=tool_choice,
         tool_prompt_mode=tool_prompt_mode,
@@ -12092,6 +12113,7 @@ def _encode_messages(
     reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool = False,
     scoped_reasoning_history: bool = False,
+    preserve_reasoning_history: bool = False,
     add_generation_prompt: bool = True,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
@@ -12114,6 +12136,7 @@ def _encode_messages(
             reasoning_effort=reasoning_effort,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
             scoped_reasoning_history=scoped_reasoning_history,
+            preserve_reasoning_history=preserve_reasoning_history,
             add_generation_prompt=add_generation_prompt,
             tools=tools,
             tool_choice=tool_choice,
@@ -12135,6 +12158,7 @@ def _encode_messages(
                 "reasoning_effort": reasoning_effort,
                 "strip": bool(strip_assistant_reasoning_history),
                 "scoped": bool(scoped_reasoning_history),
+                "preserve_echo": bool(preserve_reasoning_history),
                 "gen_prompt": bool(add_generation_prompt),
                 "tools": tools,
                 "tool_choice": tool_choice,
@@ -12175,6 +12199,7 @@ def _encode_messages(
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=strip_assistant_reasoning_history,
         scoped_reasoning_history=scoped_reasoning_history,
+        preserve_reasoning_history=preserve_reasoning_history,
         add_generation_prompt=add_generation_prompt,
         tools=tools,
         tool_choice=tool_choice,
@@ -12198,6 +12223,7 @@ def _encode_messages_uncached(
     reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool = False,
     scoped_reasoning_history: bool = False,
+    preserve_reasoning_history: bool = False,
     add_generation_prompt: bool = True,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
@@ -12212,12 +12238,25 @@ def _encode_messages_uncached(
     template_preserve_thinking = (
         not strip_assistant_reasoning_history and not scoped_reasoning_history
     )
+    # Preserve-mode echo-carry (2026-08-21): thinking transcripts render the
+    # client's echoed reasoning as the BASE history, so a turn the committed
+    # stream doesn't cover shows the model its own prior thinking instead of
+    # an empty scaffold (postcommit-starvation receipts: committed froze at
+    # 15,389 while the stream passed 76k and the model re-derived a 57.8k-token
+    # turn from scratch). Committed-think substitution still overwrites covered
+    # turns inside _message_to_template_dict, so KV-exact bytes win wherever
+    # they exist. Thinking-off and strip keep their pinned legacy renders.
+    include_reasoning = scoped_reasoning_history or (
+        preserve_reasoning_history
+        and enable_thinking
+        and not strip_assistant_reasoning_history
+    )
     prepared_messages: list[dict[str, Any]] = []
     for message in messages:
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=scoped_reasoning_history,
+            include_reasoning_content=include_reasoning,
             allow_committed_reasoning=allow_committed_reasoning,
         )
         if item is not None:
@@ -12289,15 +12328,27 @@ def _encode_messages_uncached(
     )
     if segmented_tool_history is not None:
         return segmented_tool_history
-    if allow_committed_reasoning:
-        # Canonicalized encodes must be token-compatible with the committed
-        # stream at each assistant generation start: generation began right
-        # after '<think>\n', so a single-pass BPE of the substituted render
-        # could merge that newline with the think's first bytes and diverge
-        # in TOKENS while matching in bytes. Splitting the encode at the
-        # generation boundaries (the same merge-safe seam the tool-history
-        # path uses) reproduces the committed tokenization exactly.
-        rendered = _render_messages_with_chat_template(
+    # One segmentation policy (2026-08-21): every THINKING encode of a
+    # transcript with assistant generation seams splits at them,
+    # canonicalized or not. Generation begins right after '<think>\n', so a
+    # single-pass BPE of a re-rendered history merges that seam newline with
+    # what follows and diverges from the live committed stream in TOKENS
+    # while matching in bytes. The raw path used to plain-tokenize whenever
+    # native template tools were off, so on the compact OpenCode lane the
+    # raw prompt, the canonical encode, and the postcommit all disagreed at
+    # every assistant turn and the committed prefix died at the first seam
+    # each request (founder-session walls 3913/4041/4444, 2026-08-21).
+    # Thinking-off keeps its pinned legacy contract (plain encode — "must
+    # not split inside the empty think scaffold") except on the
+    # canonicalized path, which always segmented. Seam-less renders are
+    # reused below so this branch never adds a second template pass.
+    seam_rendered: str | None = None
+    # Generation seams only exist under an assistant HISTORY turn, so
+    # first-turn requests never pay the extra render.
+    if (enable_thinking or allow_committed_reasoning) and any(
+        message.get("role") == "assistant" for message in normalized
+    ):
+        seam_rendered = _render_messages_with_chat_template(
             tokenizer,
             normalized,
             add_generation_prompt=add_generation_prompt,
@@ -12307,20 +12358,20 @@ def _encode_messages_uncached(
             tools=template_tools,
             template_observability=template_observability,
         )
-        if rendered:
-            canon_boundaries = _qwen_assistant_generation_boundaries(rendered)
+        if seam_rendered:
+            canon_boundaries = _qwen_assistant_generation_boundaries(seam_rendered)
             if canon_boundaries:
                 # Registry-backed and tail-guarded; see
                 # _encode_generation_compatible_tool_history (audit F11 #5).
-                hint_boundary = _trailing_tool_hint_char_boundary(rendered)
+                hint_boundary = _trailing_tool_hint_char_boundary(seam_rendered)
                 if hint_boundary is None:
                     return _encode_rendered_chat_text_segmented(
-                        tokenizer, rendered, canon_boundaries
+                        tokenizer, seam_rendered, canon_boundaries
                     )
                 token_counts: dict[int, int] = {hint_boundary: -1}
                 token_ids = _encode_rendered_chat_text_segmented(
                     tokenizer,
-                    rendered,
+                    seam_rendered,
                     [*canon_boundaries, hint_boundary],
                     token_counts_at=token_counts,
                 )
@@ -12369,6 +12420,11 @@ def _encode_messages_uncached(
         )
         if stable_ids is not None:
             return stable_ids
+    if seam_rendered and enable_thinking:
+        # Seam-less thinking render (single-turn / no assistant history):
+        # identical bytes to the template call below — encode the render the
+        # unified branch already produced instead of rendering twice.
+        return _encode_rendered_chat_text(tokenizer, seam_rendered)
     template_kwargs: dict[str, Any] = {
         "tokenize": True,
         "add_generation_prompt": add_generation_prompt,
@@ -12400,7 +12456,7 @@ def _encode_messages_uncached(
                     **fallback_kwargs,
                 )
             )
-        except (TypeError, Exception):
+        except (TypeError, Exception) as chat_template_exc:
             if template_tools:
                 try:
                     if template_observability is not None:
@@ -12420,8 +12476,10 @@ def _encode_messages_uncached(
                             f"tool schemas: {schema_free_exc}"
                         ),
                     ) from schema_free_exc
-            pass
-    except Exception:
+            _raise_unless_templateless_render(
+                tokenizer, chat_template_exc, template_observability
+            )
+    except Exception as chat_template_exc:
         if template_tools:
             try:
                 if template_observability is not None:
@@ -12441,11 +12499,43 @@ def _encode_messages_uncached(
                         f"tool schemas: {schema_free_exc}"
                     ),
                 ) from schema_free_exc
-            pass
+            _raise_unless_templateless_render(
+                tokenizer, chat_template_exc, template_observability
+            )
     prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized)
     if add_generation_prompt:
         prompt += "\nassistant:"
     return _encode_rendered_chat_text(tokenizer, prompt)
+
+
+_TEMPLATELESS_RENDER_WARNED = False
+
+
+def _raise_unless_templateless_render(
+    tokenizer: Any,
+    template_exc: Exception,
+    template_observability: dict[str, Any] | None,
+) -> None:
+    """A chat-template failure must never silently de-template a request.
+
+    Tokenizers that ship no chat template at all (generic AR backends) keep the
+    plain role-prefixed render as their only lane; everything else gets the same
+    hard failure the tool-schema legs raise.
+    """
+    if getattr(tokenizer, "chat_template", None):
+        raise HTTPException(
+            status_code=500,
+            detail=f"tokenizer chat template failed for chat request: {template_exc}",
+        ) from template_exc
+    global _TEMPLATELESS_RENDER_WARNED
+    if not _TEMPLATELESS_RENDER_WARNED:
+        _TEMPLATELESS_RENDER_WARNED = True
+        LOGGER.warning(
+            "tokenizer has no chat template; rendering plain role-prefixed text "
+            "(base-model lane)"
+        )
+    if template_observability is not None:
+        template_observability["plain_text_render"] = True
 
 
 def _render_messages_for_postcommit(
@@ -12539,10 +12629,19 @@ def _postcommit_next_turn_prefix_ids(
     reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool,
     scoped_reasoning_history: bool = False,
+    preserve_reasoning_history: bool = False,
     tools: list[dict[str, Any]] | None,
     assistant_tool_calls: list[dict[str, Any]] | None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
 ) -> list[int] | None:
+    # Same echo-carry rule as _encode_messages_uncached: the postcommit
+    # prediction must render the exact bytes the next request's encode will,
+    # or the banked prefix diverges at the first uncovered echoed turn.
+    include_reasoning = scoped_reasoning_history or (
+        preserve_reasoning_history
+        and enable_thinking
+        and not strip_assistant_reasoning_history
+    )
     sentinel_role = "user"
     sentinel_message = ChatMessage(role="user", content=_POSTCOMMIT_SENTINEL_CONTENT)
     if assistant_tool_calls:
@@ -12560,7 +12659,7 @@ def _postcommit_next_turn_prefix_ids(
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=scoped_reasoning_history,
+            include_reasoning_content=include_reasoning,
             # Postcommit predicts the NEXT turn's render: when this request
             # served canonicalized history (committed-think substitution),
             # the prediction must render the same substituted bytes or the
@@ -12574,7 +12673,7 @@ def _postcommit_next_turn_prefix_ids(
     item = _message_to_template_dict(
         sentinel_message,
         strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-        include_reasoning_content=scoped_reasoning_history,
+        include_reasoning_content=include_reasoning,
     )
     if item is not None:
         normalized.append(item)
@@ -12620,24 +12719,25 @@ def _postcommit_next_turn_prefix_ids(
     prefix_text = rendered[:turn_start]
     if not prefix_text:
         return None
-    # Match _encode_messages(): assistant-boundary segmentation is only used
-    # when native template tools are active. Compact OpenCode history uses the
-    # schema-free contract and the normal prompt path plain-tokenizes the
-    # rendered chat, so segmenting here would create a different cache key for
-    # identical rendered text.
+    # Match _encode_messages(): one segmentation policy (2026-08-21). Thinking
+    # transcripts split at EVERY assistant generation seam — the same
+    # boundaries the raw prompt and the canonical encode use — because the
+    # live committed stream carries generation-time tokens and a plain BPE
+    # merges the '<think>\n' seam into a different id. The old
+    # template-tools-only gate left this postcommit plain on the compact
+    # OpenCode lane, so the banked prefix could never byte-match the next
+    # request's encode (founder-session walls, 2026-08-21). Thinking-off
+    # keeps its exact legacy boundaries.
     template_tools = _template_tools_for_prompt_mode(
         tools,
         tool_prompt_mode=tool_prompt_mode,
     )
     boundaries: list[int] = []
-    if template_tools:
+    if enable_thinking:
+        boundaries = _qwen_assistant_generation_boundaries(prefix_text)
+    elif template_tools:
         boundaries = _tool_history_generation_boundaries(prefix_text)
-        if not enable_thinking:
-            boundaries.extend(_qwen_plain_assistant_content_boundaries(prefix_text))
-        elif last_history_role == "assistant":
-            boundary = _last_qwen_assistant_generation_boundary(prefix_text)
-            if boundary is not None:
-                boundaries.append(boundary)
+        boundaries.extend(_qwen_plain_assistant_content_boundaries(prefix_text))
     return _encode_rendered_chat_text_segmented(tokenizer, prefix_text, boundaries)
 
 
@@ -12735,6 +12835,13 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     safe = _json_safe(record)
     state.last_metrics.append(safe)
     state.last_metrics = state.last_metrics[-100:]
+    # Flight recorder terminal event: every completion path (normal, cancel,
+    # disconnect) funnels through this sink, so the flight "end" is written
+    # even for requests whose client-side accounting is lost (turn-13 class).
+    try:
+        _flight(state).end(safe.get("request_id"), safe)
+    except Exception:
+        pass
     path = _request_log_path(state)
     if not path:
         return
@@ -12798,6 +12905,32 @@ def _response_id_from_client_hint(
         return f"{prefix}-{uuid.uuid4().hex}"
     prefix_with_dash = f"{prefix}-"
     return hint if hint.startswith(prefix_with_dash) else f"{prefix_with_dash}{hint}"
+
+
+# hermes-agent's custom provider serializes this floor on every request when
+# the user has not set model.max_tokens — the client cannot express "no cap".
+_HERMES_INJECTED_DEFAULT_MAX_TOKENS = 65_536
+
+
+def _strip_client_injected_output_cap(
+    request_max_tokens: int | None,
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> tuple[int | None, bool]:
+    """Strip exactly hermes's injected default cap for hermes-hinted requests.
+
+    Same contract as the OpenCode plugin's 32,000 strip and Pi's
+    request-policy extension: MTPLX owns the uncapped generation contract for
+    the known client-injected value, while any other value is a deliberate
+    client choice and passes through untouched.
+    """
+
+    if request_max_tokens == _HERMES_INJECTED_DEFAULT_MAX_TOKENS and _is_hermes_client(
+        headers=headers, metadata=metadata
+    ):
+        return None, True
+    return request_max_tokens, False
 
 
 def _request_max_tokens(request: BaseModel) -> int | None:
@@ -13238,6 +13371,20 @@ def _client_controls_allowed(
     if _truthy_control_value(value):
         return True
     return _client_controls_default() == "honor"
+
+
+def _client_thinking_controls_allowed(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Thinking controls (enable_thinking / reasoning_effort) are user intent,
+    not sampler policy: managed MTPLX surfaces honor them so the client-side
+    effort picker governs the request, while their sampler params stay
+    server-owned. Anonymous clients keep the _client_controls_allowed
+    contract unchanged."""
+    if _app_managed_client_hint(headers, metadata):
+        return True
+    return _client_controls_allowed(headers, metadata)
 
 
 def _ignored_client_control_fields(request: BaseModel) -> list[str]:
@@ -14376,6 +14523,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
         "snapshot": "/v1/mtplx/snapshot",
         "metrics_stream": "/v1/mtplx/metrics/stream",
         "prefill_history": "/v1/mtplx/prefill_history",
+        "flight": "/v1/mtplx/flight",
         "settings": "/v1/mtplx/settings",
         "cancel": "/v1/mtplx/cancel/{request_id}",
         "dashboard": "/dashboard/",
@@ -15892,6 +16040,8 @@ def _anonymous_coding_agent_tool_request(
     }
     if not names:
         return False
+    # read_file/search_files/terminal/write_file are hermes-agent's wire
+    # names; without them that lane's membership hangs on "patch" alone.
     coding_agent_tools = {
         "bash",
         "edit",
@@ -15901,11 +16051,15 @@ def _anonymous_coding_agent_tool_request(
         "multi_edit",
         "patch",
         "read",
+        "read_file",
+        "search_files",
         "str_replace_editor",
         "task",
+        "terminal",
         "todowrite",
         "webfetch",
         "write",
+        "write_file",
     }
     return bool(names & coding_agent_tools)
 
@@ -16006,6 +16160,7 @@ def _live_frontier_envelope_fields(
     session_restore_mode: Any,
     cache_miss_reason: str | None,
     session_keep_live_ref: bool,
+    cached_tokens: Any = None,
 ) -> dict[str, Any]:
     """Frontier hit/miss envelope fields for agent result turns.
 
@@ -16016,7 +16171,7 @@ def _live_frontier_envelope_fields(
     if not request_observability.get("live_frontier_result_turn"):
         return {}
     frontier_hit = bool(session_cache_hit)
-    return {
+    fields: dict[str, Any] = {
         "live_frontier_hit": frontier_hit,
         "live_frontier_restore_mode": session_restore_mode,
         "live_frontier_miss_reason": (
@@ -16042,6 +16197,19 @@ def _live_frontier_envelope_fields(
             )
         ),
     }
+    canonicalization = (
+        request_observability.get("committed_reasoning_canonicalization") or {}
+    )
+    committed_len = canonicalization.get("committed_len")
+    cached = request_observability.get("cached_tokens")
+    if committed_len is not None and cached is not None:
+        # live_frontier_hit is a legacy any-hit bool; this is the honest
+        # signal — did the reusable prefix actually reach the committed
+        # frontier (2026-08-21: a 3913-of-4661 partial hit reported a clean
+        # frontier and hid the seam walls).
+        fields["live_frontier_extended"] = int(cached) >= int(committed_len) - 1
+        fields["live_frontier_committed_len"] = int(committed_len)
+    return fields
 
 
 def _clear_mlx_cache_after_request(
@@ -17854,6 +18022,7 @@ def _history_ids_for_postcommit(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
+    session_committed_ids: Sequence[int] | None = None,
 ) -> tuple[list[int], Any]:
     """Retokenized next-turn history ids, plus a VisionSplice when the
     history carries images.
@@ -17951,6 +18120,35 @@ def _history_ids_for_postcommit(
             committed_text = ""
         if committed_text:
             committed_turns = _committed_assistant_turns(committed_text)
+            # F11 #3 follow-up (founder-session receipt 2026-08-21): the
+            # request-local stream renders an EMPTY think interior for any
+            # history turn the committed-reasoning gate could not
+            # canonicalize (stale-frontier race, fail-open), and an empty
+            # interior here republishes that regression — the committed
+            # session oscillates real→empty→real and the gate loses its
+            # substrate. The session's committed stream is KV-true for every
+            # turn it holds: backfill empty ordinals from it.
+            if session_committed_ids:
+                try:
+                    session_text = state.runtime.tokenizer.decode(
+                        [int(token) for token in session_committed_ids]
+                    )
+                except Exception:
+                    session_text = ""
+                if session_text:
+                    session_turns = _committed_assistant_turns(session_text)
+                    committed_turns = [
+                        (
+                            session_turns[index]
+                            if not interior
+                            and index < len(session_turns)
+                            and session_turns[index][0]
+                            else (interior, gate, markup)
+                        )
+                        for index, (interior, gate, markup) in enumerate(
+                            committed_turns
+                        )
+                    ]
             if any(interior for interior, _gate, _markup in committed_turns):
                 history_messages, _substituted = (
                     _substitute_committed_reasoning_messages(
@@ -17971,6 +18169,7 @@ def _history_ids_for_postcommit(
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         scoped_reasoning_history=_reasoning_history_scoped_active(state),
+        preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
         tools=tool_specs,
         assistant_tool_calls=assistant_tool_calls,
         tool_prompt_mode=effective_tool_prompt_mode,
@@ -17982,6 +18181,7 @@ def _history_ids_for_postcommit(
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         scoped_reasoning_history=_reasoning_history_scoped_active(state),
+        preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
         add_generation_prompt=False,
         tools=tool_specs,
         tool_prompt_mode=effective_tool_prompt_mode,
@@ -18014,13 +18214,17 @@ def _generation_final_postcommit_compatibility(
     tool_specs: list[dict[str, Any]] | None = None,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    session: Any | None = None,
 ) -> dict[str, Any]:
-    if assistant_tool_calls:
-        return {
-            "safe": False,
-            "mode": "unsafe",
-            "reason": "tool_call_history_rewrite",
-        }
+    # Tool-call turns are no longer refused a priori (the retired
+    # "tool_call_history_rewrite" gate): the byte-compare below is the real
+    # safety — _history_ids_for_postcommit renders tool-call histories via
+    # the tool sentinel — and the early refusal forced every coding-agent
+    # tool round onto the starvable idle re-prefill postcommit (2026-08-21:
+    # committed froze at 15,389 while the stream passed 76k). A render
+    # mismatch still refuses empirically below, which is exactly the old
+    # behavior; a byte-identical render banks the live generation-final KV
+    # with zero GPU recompute and advances the frontier inline.
     if (
         _STATS_FOOTER_RE.search(assistant_content)
         or STATS_FOOTER_MARKER in assistant_content
@@ -18081,6 +18285,14 @@ def _generation_final_postcommit_compatibility(
         # all (before F11 #3 the retokenized history rendered an empty
         # think scaffold and thinking turns could never match).
         committed_stream_ids=final_token_ids,
+        # The session's own committed stream backfills think interiors the
+        # request-local render lost (canon-miss turns) so the postcommit
+        # publishes the richest stream instead of regressing it.
+        session_committed_ids=(
+            list(getattr(session, "committed_token_ids", ()) or ())
+            if session is not None
+            else None
+        ),
     )
 
     def _bank_view(token_ids: list[int]) -> list[int] | None:
@@ -18150,9 +18362,20 @@ def _store_generation_final_history_snapshot(
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    session: Any | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
+    if session is None:
+        # Fast-final callers carry only session_id; resolve the live session
+        # so the compatibility render can backfill think interiors from the
+        # session's committed stream (oscillation kill, 2026-08-21).
+        peek = getattr(getattr(state, "sessions", None), "peek", None)
+        if peek is not None:
+            try:
+                session = peek(session_id)
+            except Exception:
+                session = None
     started = time.perf_counter()
     compatibility = _generation_final_postcommit_compatibility(
         state,
@@ -18166,6 +18389,7 @@ def _store_generation_final_history_snapshot(
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+        session=session,
     )
     if not bool(compatibility.get("safe")):
         return {
@@ -18291,6 +18515,7 @@ def _schedule_idle_postcommit_snapshot(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
+    retry_count: int = 0,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
     generation-final compatibility check rejected as unsafe (most commonly
@@ -18305,7 +18530,7 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
-    if unsafe_reason == "tool_call_history_rewrite" and str(
+    if assistant_tool_calls and str(
         os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
     ).strip().lower() in {"0", "false", "off", "no"}:
         # 2026-08-01 gauntlet: on the OpenCode hybrid tool lane this commit's
@@ -18327,11 +18552,17 @@ def _schedule_idle_postcommit_snapshot(
         "mode": "async_pending",
         "reason": unsafe_reason,
     }
+    if retry_count > 0:
+        pending["retry_count"] = int(retry_count)
     abort_event = Event()
     pending_record_holder: dict[str, Any] = {}
 
     def _log(outcome: dict[str, Any]) -> None:
         record = pending_record_holder.get("record")
+        try:
+            _flight(state).pc(session_id, outcome)
+        except Exception:
+            pass
         if (
             session is not None
             and record is not None
@@ -18410,6 +18641,45 @@ def _schedule_idle_postcommit_snapshot(
             or _foreground_pressure_past_grace()
         )
 
+    def _resubmit_after_yield() -> bool:
+        # Re-arm an abandoned commit (2026-08-21): yielding frees the single
+        # model worker for queued foreground (bounded-yield contract, kept),
+        # but drop-on-abandon let fast agent chains starve the commit forever
+        # — the committed stream froze at 15,389 while the true stream passed
+        # 76k, and preserve-mode history silently lost the model's own
+        # 57.8k-token derivation. The re-armed job queues on the idle band
+        # (runs only when foreground drains) with a fresh abort event; a
+        # superseding newer turn bumps the session revision, so a re-armed
+        # job that is no longer the frontier dies as abandoned_stale on its
+        # first check. Stored/stale/error outcomes never re-arm.
+        if session is None or _stale_session_revision():
+            return False
+        if retry_count >= 16:
+            return False
+        try:
+            _schedule_idle_postcommit_snapshot(
+                state,
+                session_id=session_id,
+                messages=messages,
+                assistant_content=assistant_content,
+                assistant_tool_calls=assistant_tool_calls,
+                thinking_enabled=thinking_enabled,
+                reasoning_effort=reasoning_effort,
+                policy_fingerprint=policy_fingerprint,
+                unsafe_reason=unsafe_reason,
+                tool_specs=tool_specs,
+                session=session,
+                expected_session_revision=expected_session_revision,
+                keep_live_ref=keep_live_ref,
+                tool_prompt_mode=tool_prompt_mode,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                committed_stream_ids=committed_stream_ids,
+                retry_count=retry_count + 1,
+            )
+            return True
+        except BaseException:
+            return False
+
     # The postcommit re-prefills the conversation at full GPU load after the
     # HTTP response has already finished. Hold a smart-fan lease from
     # schedule time (while the request's own lease is still active, so the
@@ -18459,6 +18729,7 @@ def _schedule_idle_postcommit_snapshot(
                             "stored": False,
                             "mode": "abandoned_foreground_busy",
                             "reason": _postcommit_abort_reason(),
+                            "retry_scheduled": _resubmit_after_yield(),
                         }
                     )
                     return
@@ -18498,6 +18769,7 @@ def _schedule_idle_postcommit_snapshot(
                             "stored": False,
                             "mode": "abandoned_foreground_busy",
                             "reason": "model_lock_busy_past_deadline",
+                            "retry_scheduled": _resubmit_after_yield(),
                         }
                     )
                     return
@@ -20530,6 +20802,17 @@ def _run_generation(
                     prefill_chunk_tokens = getattr(
                         state.args, "prefill_chunk_tokens", None
                     )
+                # Install the per-request live decode sink (flight recorder) so
+                # _DecodeTrace publishes by-depth acceptance at 1 Hz mid-request.
+                # DSpark owns a sealed direct lane and intentionally bypasses this
+                # generic generation instrumentation.
+                from mtplx.generation import set_live_decode_sink
+
+                set_live_decode_sink(
+                    _flight(state).live_depth_sink(
+                        str((request_observability or {}).get("request_id") or "")
+                    )
+                )
                 with (
                     _temporary_env(dynamic_kv_reservation["env"]),
                     prefill_chunk_size_override(prefill_chunk_tokens),
@@ -20675,6 +20958,10 @@ def _run_generation(
             # disconnects already take during decode.
             raise _StreamCancelled("client disconnected during prefill")
         finally:
+            if effective_mode != "dspark":
+                from mtplx.generation import set_live_decode_sink
+
+                set_live_decode_sink(None)
             state.lock.release()
             if not background_request:
                 state.end_foreground()
@@ -20869,6 +21156,10 @@ def _run_generation(
                     session_restore_mode=session_restore_mode,
                     cache_miss_reason=cache_miss_reason,
                     session_keep_live_ref=session_keep_live_ref,
+                    # cached_tokens lives in the metrics envelope, never in
+                    # request_observability — the old gate read the latter
+                    # and silently never fired (E5 inert, 2026-08-21).
+                    cached_tokens=envelope.get("cached_tokens"),
                 )
             )
         if effective_mode == "ar":
@@ -24608,17 +24899,46 @@ def _reasoning_history_scoped_active(state: "ServerState") -> bool:
     return _reasoning_history_mode(state) == _REASONING_HISTORY_SCOPED
 
 
+def _reasoning_history_preserve_echo_active(state: "ServerState") -> bool:
+    """Preserve-mode echo-carry: render client-echoed reasoning history.
+
+    The committed-reasoning canonicalizer substitutes KV-true interiors for
+    every turn the committed stream covers, but commits lag live agent chains
+    (postcommit starvation, receipts 2026-08-21: committed froze at 15,389
+    tokens while the stream passed 76k — the model lost its own 57.8k-token
+    derivation and re-derived it from scratch). Carrying the client's echoed
+    reasoning as the BASE render means uncovered turns show the model its own
+    prior thinking instead of an empty scaffold; committed substitution still
+    overwrites covered turns, so cache exactness is untouched where it
+    exists. Explicit policy ``on`` keeps the legacy drop as the
+    byte-identical rollback lane.
+    """
+    if _reasoning_history_mode(state) != _REASONING_HISTORY_PRESERVE:
+        return False
+    return (
+        _normalize_preserve_thinking_policy(
+            getattr(state.args, "preserve_thinking", "auto")
+        )
+        != "on"
+    )
+
+
 def _reasoning_history_fingerprint_component(state: "ServerState") -> str:
     """Session-cache identity component for the reasoning-history policy.
 
-    Explicit preserve/strip emit the exact legacy ``strip_reasoning={0|1}``
-    strings so existing users' warm session banks survive this release.
-    Only scoped mints a new component - honest, because its rendered prompt
-    bytes genuinely differ from both legacy modes.
+    Explicit ``on``/strip emit the exact legacy ``strip_reasoning={0|1}``
+    strings so those users' warm session banks survive upgrades. Scoped and
+    preserve-echo mint their own components - honest, because their rendered
+    prompt bytes genuinely differ from the legacy modes.
     """
     mode = _reasoning_history_mode(state)
     if mode == _REASONING_HISTORY_SCOPED:
         return "reasoning_history=scoped"
+    if _reasoning_history_preserve_echo_active(state):
+        # Echo-carry renders bytes legacy preserve never did (structured
+        # reasoning echoes), so it mints its own component. Policy `on`
+        # stays on the legacy string below (byte-identical rollback lane).
+        return "reasoning_history=preserve_echo"
     return f"strip_reasoning={int(mode == _REASONING_HISTORY_STRIP)}"
 
 
@@ -24826,9 +25146,12 @@ def create_app(state: ServerState) -> FastAPI:
             mtp_batch_service = getattr(state, "mtp_batch_service", None)
             if mtp_batch_service is not None:
                 mtp_batch_service.shutdown()
+                # park=True: the process is exiting; a clean owner-thread
+                # exit during interpreter finalization runs mlx's TLS
+                # destructor into _Py_Dealloc (#303).
             scheduler = getattr(state, "model_scheduler", None)
             if scheduler is not None:
-                scheduler.shutdown(wait=False, cancel_futures=True)
+                scheduler.shutdown(wait=False, cancel_futures=True, park=True)
             else:
                 postcommit_executor = getattr(state, "postcommit_executor", None)
                 generation_executor = getattr(state, "generation_executor", None)
@@ -25280,6 +25603,13 @@ def create_app(state: ServerState) -> FastAPI:
             "capacity": state.dashboard.prefill_history.capacity(),
             "history": state.dashboard.prefill_history.snapshot(),
         }
+
+    @app.get("/v1/mtplx/flight")
+    def mtplx_flight() -> dict[str, Any]:
+        # Live in-flight status: phase, tokens, instantaneous TPS, live MTP
+        # acceptance, stall age, and a tail preview of the generated text —
+        # the one-curl answer to "is it hung or thinking?".
+        return _flight(state).snapshot()
 
     @app.post("/v1/mtplx/cancel/{request_id}")
     def mtplx_cancel(request_id: str) -> dict[str, Any]:
@@ -26353,7 +26683,11 @@ def create_app(state: ServerState) -> FastAPI:
             )
         headers = dict(raw_request.headers)
         metadata = _request_metadata(request)
-        request_max_tokens = _request_max_tokens(request)
+        request_max_tokens, hermes_default_cap_stripped = (
+            _strip_client_injected_output_cap(
+                _request_max_tokens(request), headers=headers, metadata=metadata
+            )
+        )
         requested_model = request.model
         # A request that names a configured embedder or reranker is a
         # capability mismatch, not a stale id: silently answering it with the
@@ -26540,6 +26874,7 @@ def create_app(state: ServerState) -> FastAPI:
             reasoning_effort=reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
+            preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
             tools=tool_specs if tools_active else None,
             tool_choice=request.tool_choice,
             tool_prompt_mode=template_tool_prompt_mode,
@@ -26547,6 +26882,9 @@ def create_app(state: ServerState) -> FastAPI:
         )
         resolved_session_id: str | None = None
         resolved_session_source: str | None = None
+        early_postcommit_handled = False
+        early_postcommit_wait: dict[str, Any] | None = None
+        early_cross_session_yield: dict[str, Any] | None = None
         if (
             not background
             and not cache_bypass
@@ -26575,6 +26913,44 @@ def create_app(state: ServerState) -> FastAPI:
             except Exception:
                 resolved_session_id = None
                 resolved_session_source = None
+            # Canon-after-wait (2026-08-21): the committed-reasoning gate
+            # below peeks the session's committed stream, but the pending
+            # postcommit sweep + wait used to run ~690 lines later — every
+            # turn canonicalized against a frontier one commit stale even
+            # when the wait then reported completed. Run them FIRST so the
+            # gate reads the post-commit frontier. Bonus: no foreground work
+            # from THIS request is queued yet, so the job's bounded
+            # foreground-pressure grace can no longer be tripped by the very
+            # request waiting on it. Observability lands at the original
+            # site below (request_observability binds later in the prologue).
+            if resolved_session_id is not None:
+                early_postcommit_handled = True
+                _early_sweep = getattr(
+                    getattr(state, "sessions", None),
+                    "abort_cross_session_postcommits",
+                    None,
+                )
+                if (
+                    _early_sweep is not None
+                    and _postcommit_cross_session_yield_enabled()
+                ):
+                    early_cross_session_yield = await asyncio.to_thread(
+                        _early_sweep,
+                        except_session_id=resolved_session_id,
+                    )
+                _early_peek = getattr(
+                    getattr(state, "sessions", None), "peek", None
+                )
+                _pending_session = None
+                if _early_peek is not None:
+                    try:
+                        _pending_session = _early_peek(resolved_session_id)
+                    except Exception:
+                        _pending_session = None
+                if _pending_session is not None:
+                    early_postcommit_wait = await asyncio.to_thread(
+                        _pending_session.resolve_pending_postcommit_for_request
+                    )
             # Defect B (2.8 headline): if this conversation's session holds a
             # committed stream the raw encode diverges from inside a think
             # block, substitute the committed think bytes and re-encode so
@@ -26746,6 +27122,15 @@ def create_app(state: ServerState) -> FastAPI:
         if vision_splice is not None:
             request_observability["request_vision_images"] = len(vision_images)
             request_observability["request_vision_rows"] = vision_splice.total_rows
+        # Receipt identity + resolved effort: request_id joins the receipt to
+        # flight-recorder events (the cancellation lane already stamps it; this
+        # covers the normal lane via envelope.update), and the resolved effort
+        # was previously logged nowhere (2026-08-21 lane-audit telemetry gap).
+        request_observability["request_id"] = response_id
+        if reasoning_effort is not None:
+            request_observability["resolved_reasoning_effort"] = reasoning_effort
+        if hermes_default_cap_stripped:
+            request_observability["hermes_default_cap_stripped"] = True
         if transient_suffix_contract_active:
             if read_only_force_answer_contract_active:
                 _restore_policy_label = "stable_without_transient_force_answer"
@@ -27153,6 +27538,7 @@ def create_app(state: ServerState) -> FastAPI:
                 tool_specs=postcommit_tool_specs,
                 tool_prompt_mode=postcommit_tool_prompt_mode,
                 strip_tool_call_preamble_text=opencode_client,
+                session=session,
             )
             if compatibility.get("safe"):
                 generated["stats"]["session_postcommit_snapshot"] = {
@@ -27243,40 +27629,72 @@ def create_app(state: ServerState) -> FastAPI:
         # the session lock is acquired. Set MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S
         # explicitly to restore the blocking wait.
         postcommit_wait_outcome: dict[str, Any] | None = None
-        _cross_session_sweep = getattr(
-            getattr(state, "sessions", None),
-            "abort_cross_session_postcommits",
-            None,
-        )
-        if (
-            _cross_session_sweep is not None
-            and _postcommit_cross_session_yield_enabled()
-        ):
-            # A foreign session's idle commit cannot help THIS request —
-            # only the same-session grace below has a payoff. Abort all
-            # cross-session pending commits so this request never pays a
-            # stranger's 0.5-3.5GB retokenized_history job (2026-08-05
-            # showdown: tight-cadence multi-session traffic lost 30-50%
-            # decode + the job's runtime in TTFT to exactly this).
-            cross_yield = await asyncio.to_thread(
-                _cross_session_sweep,
-                except_session_id=session_id,
-            )
-            if cross_yield is not None:
-                request_observability["postcommit_cross_session_yield"] = cross_yield
+        if early_postcommit_handled:
+            # Sweep + wait already ran BEFORE the committed-reasoning gate
+            # (canon-after-wait, 2026-08-21); publish those results here,
+            # where request_observability exists.
+            if early_cross_session_yield is not None:
+                request_observability["postcommit_cross_session_yield"] = (
+                    early_cross_session_yield
+                )
                 if not _server_console_enabled(state):
                     try:
                         _safe_stdout_print(
                             "[mtplx] postcommit cross-session yield "
                             + json.dumps(
-                                {"admitting_session_id": session_id, **cross_yield},
+                                {
+                                    "admitting_session_id": session_id,
+                                    **early_cross_session_yield,
+                                },
                                 sort_keys=True,
                                 default=str,
                             )
                         )
                     except BaseException:
                         pass
-        if session is not None:
+            postcommit_wait_outcome = early_postcommit_wait
+            if postcommit_wait_outcome is not None:
+                request_observability["postcommit_wait"] = postcommit_wait_outcome
+        else:
+            _cross_session_sweep = getattr(
+                getattr(state, "sessions", None),
+                "abort_cross_session_postcommits",
+                None,
+            )
+            if (
+                _cross_session_sweep is not None
+                and _postcommit_cross_session_yield_enabled()
+            ):
+                # A foreign session's idle commit cannot help THIS request —
+                # only the same-session grace below has a payoff. Abort all
+                # cross-session pending commits so this request never pays a
+                # stranger's 0.5-3.5GB retokenized_history job (2026-08-05
+                # showdown: tight-cadence multi-session traffic lost 30-50%
+                # decode + the job's runtime in TTFT to exactly this).
+                cross_yield = await asyncio.to_thread(
+                    _cross_session_sweep,
+                    except_session_id=session_id,
+                )
+                if cross_yield is not None:
+                    request_observability["postcommit_cross_session_yield"] = (
+                        cross_yield
+                    )
+                    if not _server_console_enabled(state):
+                        try:
+                            _safe_stdout_print(
+                                "[mtplx] postcommit cross-session yield "
+                                + json.dumps(
+                                    {
+                                        "admitting_session_id": session_id,
+                                        **cross_yield,
+                                    },
+                                    sort_keys=True,
+                                    default=str,
+                                )
+                            )
+                        except BaseException:
+                            pass
+        if not early_postcommit_handled and session is not None:
             postcommit_wait_outcome = await asyncio.to_thread(
                 session.resolve_pending_postcommit_for_request
             )
@@ -27362,6 +27780,13 @@ def create_app(state: ServerState) -> FastAPI:
                     prompt_tokens=len(prompt_ids),
                 )
                 state.dashboard.in_flight.register(in_flight_handle)
+                _flight(state).begin(
+                    response_id,
+                    session_id=session_id,
+                    model=model,
+                    prompt_tokens=len(prompt_ids),
+                    stream=True,
+                )
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 splitter = _stream_splitter_for_state(
                     state,
@@ -27605,6 +28030,9 @@ def create_app(state: ServerState) -> FastAPI:
                         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
                         scoped_reasoning_history=_reasoning_history_scoped_active(
                             state
+                        ),
+                        preserve_reasoning_history=(
+                            _reasoning_history_preserve_echo_active(state)
                         ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
@@ -27937,6 +28365,9 @@ def create_app(state: ServerState) -> FastAPI:
                         scoped_reasoning_history=_reasoning_history_scoped_active(
                             state
                         ),
+                        preserve_reasoning_history=(
+                            _reasoning_history_preserve_echo_active(state)
+                        ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
                         template_observability=repair_observability,
@@ -28102,6 +28533,9 @@ def create_app(state: ServerState) -> FastAPI:
                         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
                         scoped_reasoning_history=_reasoning_history_scoped_active(
                             state
+                        ),
+                        preserve_reasoning_history=(
+                            _reasoning_history_preserve_echo_active(state)
                         ),
                         tools=None,
                         tool_prompt_mode=tool_prompt_mode,
@@ -28711,6 +29145,9 @@ def create_app(state: ServerState) -> FastAPI:
                     nonlocal pending_tool_cancel_started_s
                     if not text:
                         return []
+                    # Flight recorder sees generated truth (pre-guard, pre-
+                    # suppression) so char counts reflect what the model wrote.
+                    _flight(state).on_delta(response_id, field, text)
                     if use_orphan_guard:
                         text = apply_orphan_stream_guard(field, text)
                         if not text:
@@ -29161,7 +29598,18 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 if streamed_decode_started_s is None:
                                     streamed_decode_started_s = token_timestamp_s
+                                    _flight(state).note_decode_started(
+                                        response_id,
+                                        getattr(
+                                            in_flight_handle, "prefill_state", None
+                                        ),
+                                    )
                                 streamed_progress_tokens += len(stream_tokens)
+                                _flight(state).on_tokens(
+                                    response_id,
+                                    len(stream_tokens),
+                                    token_timestamp_s,
+                                )
                                 progress_payload = _stream_progress_payload(
                                     completion_tokens=streamed_progress_tokens,
                                     decode_started_s=streamed_decode_started_s,
@@ -29755,8 +30203,29 @@ def create_app(state: ServerState) -> FastAPI:
                                             prompt_prefix_commit_info["prefix_len"]
                                         )
                                     else:
+                                        # The trailing tool-result continuation
+                                        # hint is transient: the client never
+                                        # echoes it, so a committed stream that
+                                        # includes it can never be extended by
+                                        # any future prompt (strict prefix rule)
+                                        # - the committed frontier froze exactly
+                                        # there (2026-08-21: 15,389 while the
+                                        # true stream passed 76k). Commit only
+                                        # the stable prefix; the hint's KV stays
+                                        # live for this turn regardless.
+                                        _stable_prefix = template_observability.get(
+                                            "stable_prefix_len"
+                                        )
+                                        _prefix_commit_ids = prompt_ids
+                                        if (
+                                            isinstance(_stable_prefix, int)
+                                            and 0 < _stable_prefix < len(prompt_ids)
+                                        ):
+                                            _prefix_commit_ids = prompt_ids[
+                                                :_stable_prefix
+                                            ]
                                         prompt_prefix_commit = session.commit_prompt_prefix(
-                                            prompt_ids=prompt_ids,
+                                            prompt_ids=_prefix_commit_ids,
                                             finish_reason=str(
                                                 generated.get("finish_reason") or "stop"
                                             ),
@@ -30090,6 +30559,7 @@ def create_app(state: ServerState) -> FastAPI:
                             )
                             cancelled_metric_recorded = True
                     state.dashboard.in_flight.deregister(response_id)
+                    _flight(state).sweep(response_id)
                     state.dashboard.progress_events.forget(response_id)
 
                 if generated is None:
@@ -30138,6 +30608,13 @@ def create_app(state: ServerState) -> FastAPI:
             prompt_tokens=len(prompt_ids),
         )
         state.dashboard.in_flight.register(nonstream_handle)
+        _flight(state).begin(
+            response_id,
+            session_id=session_id,
+            model=model,
+            prompt_tokens=len(prompt_ids),
+            stream=False,
+        )
         nonstream_started_s = time.perf_counter()
 
         def mark_nonstream_client_disconnected() -> None:
@@ -30240,6 +30717,7 @@ def create_app(state: ServerState) -> FastAPI:
             with suppress(asyncio.CancelledError, TimeoutError):
                 await asyncio.wait_for(disconnect_monitor_task, timeout=0.25)
             state.dashboard.in_flight.deregister(response_id)
+            _flight(state).sweep(response_id)
             state.dashboard.progress_events.forget(response_id)
         generated.setdefault("stats", {})
         generated["stats"]["openai_bridge_mode"] = "omlx_style"
@@ -30475,6 +30953,7 @@ def create_app(state: ServerState) -> FastAPI:
             reasoning_effort=policy.reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
+            preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
             tools=policy.tool_specs if policy.tools_active else None,
             tool_choice=chat_request.tool_choice,
             tool_prompt_mode=policy.tool_prompt_mode,
@@ -31857,6 +32336,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--flight-recorder",
+        default=None,
+        help=(
+            "Per-request flight recorder: begin/prefill/~1Hz sample/end "
+            "events (tokens, TPS, reasoning/content chars, live MTP "
+            "acceptance) plus postcommit outcomes, as JSONL. Feeds "
+            "GET /v1/mtplx/flight and `mtplx trace`. Default: ON at "
+            "~/.mtplx/metrics/flight-<port>.jsonl with 64MB x4 rotation; "
+            "pass 'off' or a custom path. Generated text is persisted "
+            "under ~/.mtplx/metrics/gen/ only for cancelled/errored "
+            "requests by default (MTPLX_FLIGHT_TEXT=abnormal|always|off). "
+            "Env: MTPLX_FLIGHT_RECORDER."
+        ),
+    )
+    parser.add_argument(
         "--tool-prompt-mode",
         choices=sorted(_TOOL_PROMPT_MODES),
         default=os.environ.get("MTPLX_TOOL_PROMPT_MODE", _TOOL_PROMPT_MODE_HYBRID),
@@ -32247,6 +32741,14 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "warning: --launch-hermes was set but no Hermes command was provided."
             )
+    # Main-thread insurance for the mlx 0.32.1 TLS-destructor teardown
+    # crash (#303): the owner thread parks (model_scheduler), and the main
+    # thread clears its own mlx streams before Py_Finalize.
+    import atexit
+
+    from mtplx.model_scheduler import _release_mlx_thread_state
+
+    atexit.register(_release_mlx_thread_state)
     # Graceful-with-deadline shutdown (#124): a browser tab holding an
     # infinite SSE stream (chat, dashboard, /metrics) otherwise makes
     # uvicorn wait forever on Ctrl-C. The deadline lets in-flight requests
