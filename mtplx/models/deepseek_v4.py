@@ -290,7 +290,6 @@ from mtplx.deepseek_v4_paged_indexer import (
     MiaIndexerQueryRecords,
     MiaTopKSelection,
     PagedMiaIndexerRows,
-    decode_indexer132,
     install_indexer_query_records,
     install_paged_indexer_topk,
 )
