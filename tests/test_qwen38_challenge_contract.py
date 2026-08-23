@@ -305,6 +305,49 @@ def test_row10_candidate_route_names_compact_proposal_only_head(monkeypatch) -> 
     assert runtime.qwen38_feature_receipt["r10_compact_vocab"]["active"] is True
 
 
+def test_row17_route_installs_the_q4_group64_mtp_block(monkeypatch) -> None:
+    artifact = Path("/artifacts/row17/model.safetensors")
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_mtp_block",
+        lambda runtime, *, variant, artifact_path: {
+            "installed": variant is not None,
+            "active": variant is not None,
+            "variant": variant,
+            "artifact_path": str(artifact_path) if artifact_path else None,
+            "bits": 4 if variant else None,
+            "group_size": 64 if variant else None,
+        },
+        raising=False,
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(mtp_update_cache=_callable),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="control",
+        mtp_block_variant="r17",
+        mtp_block_artifact_path=artifact,
+    )
+
+    assert route.route_id == "r17_q4_mtp_block"
+    assert route.kernel_ids == ("qwen38_row17_q4_g64_mtp_block_v1",)
+    assert runtime.qwen38_feature_receipt["r17_q4_mtp_block"] == {
+        "installed": True,
+        "active": True,
+        "variant": "r17",
+        "artifact_path": str(artifact),
+        "bits": 4,
+        "group_size": 64,
+    }
+
+
 def test_row18_route_names_input_independent_gdn_decay_memo(monkeypatch) -> None:
     monkeypatch.setattr(
         "mtplx.qwen38_challenge.configure_qwen38_row18_gdn_decay_memo",

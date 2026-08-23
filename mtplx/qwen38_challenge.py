@@ -14,6 +14,7 @@ from typing import Any
 
 from .draft_lm_head import configure_qwen38_row10_compact_head
 from .gdn_capture import configure_qwen38_row18_gdn_decay_memo
+from .qwen38_mtp_block_artifacts import configure_qwen38_mtp_block
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -317,6 +318,8 @@ def install_qwen38_route(
     dual_norm: bool = False,
     source_proposal: bool = False,
     row10_compact_vocab: bool = False,
+    mtp_block_variant: str | None = None,
+    mtp_block_artifact_path: Path | None = None,
     row18_gdn_decay_memo: bool = False,
     row24_eval_ladder: bool = False,
     row26_prefill_ladder_3: bool = False,
@@ -332,6 +335,35 @@ def install_qwen38_route(
     kernel_ids: list[str] = []
     route_features: list[str] = []
     feature_receipt: dict[str, dict[str, int]] = {}
+
+    text = getattr(runtime.model, "language_model", runtime.model)
+    if mtp_block_variant is not None or hasattr(
+        text, "_mtplx_qwen38_control_mtp_block"
+    ):
+        mtp_block_report = configure_qwen38_mtp_block(
+            runtime,
+            variant=mtp_block_variant,
+            artifact_path=mtp_block_artifact_path,
+        )
+    else:
+        mtp_block_report = {"installed": False, "active": False, "variant": None}
+    if mtp_block_variant is not None:
+        if not bool(mtp_block_report.get("installed")):
+            raise Qwen38ContractError(
+                f"Qwen 3.8 {mtp_block_variant} MTP block was not installed"
+            )
+        if mtp_block_variant == "r17":
+            route_features.append("r17_q4_mtp_block")
+            kernel_ids.append("qwen38_row17_q4_g64_mtp_block_v1")
+            feature_receipt["r17_q4_mtp_block"] = mtp_block_report
+        elif mtp_block_variant == "r28":
+            route_features.extend(("r17_q4_mtp_block", "r28_q4_mtp_block"))
+            kernel_ids.append("qwen38_row28_q4_g64_mtp_block_v1")
+            feature_receipt["r28_q4_mtp_block"] = mtp_block_report
+        else:
+            raise Qwen38ContractError(
+                f"unknown Qwen 3.8 MTP block variant: {mtp_block_variant!r}"
+            )
 
     selfcheck_status = "control"
     min_context_tokens = 0
@@ -368,7 +400,6 @@ def install_qwen38_route(
         kernel_ids.append("qwen38_row18_gdn_neg_exp_a_log_memo_v1")
         feature_receipt["r18_gdn_decay_memo"] = row18_gdn_report
 
-    text = getattr(runtime.model, "language_model", runtime.model)
     text._mtplx_qwen38_row24_eval_ladder = bool(row24_eval_ladder)
     text._mtplx_qwen38_row24_prefill_stride = (
         3 if row26_prefill_ladder_3 else 4

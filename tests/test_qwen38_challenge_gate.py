@@ -309,6 +309,9 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "r08_device_draft+r10_compact_vocab"
     ) == {"r08_device_draft", "r10_compact_vocab"}
     assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block"
+    ) == {"r08_device_draft", "r10_compact_vocab", "r17_q4_mtp_block"}
+    assert gate._validate_route_id(
         "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo"
     ) == {"r08_device_draft", "r10_compact_vocab", "r18_gdn_decay_memo"}
     assert gate._validate_route_id(
@@ -367,9 +370,10 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
     assert row_8 == {
         "cache_route": "control",
         "dual_norm": False,
-        "source_proposal": False,
-        "row10_compact_vocab": False,
-        "row18_gdn_decay_memo": False,
+            "source_proposal": False,
+            "row10_compact_vocab": False,
+            "mtp_block_variant": None,
+            "row18_gdn_decay_memo": False,
         "row24_eval_ladder": False,
         "row26_prefill_ladder_3": False,
         "draft_core": "device",
@@ -457,6 +461,34 @@ def test_row20_promotion_requires_kv_only_history_engagement() -> None:
         "row 20 packed K/V projection did not execute",
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
+def test_row17_promotion_requires_the_pinned_q4_mtp_block() -> None:
+    gate = _module()
+    route = "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block"
+    wrong = {
+        "route_id": route,
+        "feature_receipt": {
+            "r17_q4_mtp_block": {"installed": True, "active": True, "variant": "r28"}
+        },
+    }
+    engaged = {
+        "route_id": route,
+        "feature_receipt": {
+            "r17_q4_mtp_block": {
+                "installed": True,
+                "active": True,
+                "variant": "r17",
+                "bits": 4,
+                "group_size": 64,
+            }
+        },
+    }
+
+    assert gate._candidate_engagement_errors(route, [wrong], []) == [
+        "row 17 pinned Q4/group-64 MTP block was not active"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [wrong]) == []
 
 
 def test_row_24_eval_ladder_extends_the_retained_stack() -> None:
