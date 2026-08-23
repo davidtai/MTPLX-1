@@ -470,7 +470,6 @@ def _m6_quad_qmv_kernel(
     size_k: int,
     size_n: int,
     routed_input: bool,
-    expert_major: bool = False,
 ):
     """Build the fixed-M6 BN256 QMV with four-row MCG window reuse."""
 
@@ -628,24 +627,13 @@ def _m6_quad_qmv_kernel(
             """
         )
     quad_decode = "".join(quad_blocks)
-    if expert_major:
-        route_setup = """
-        uint task_position = threadgroup_position_in_grid.z;
-        uint task = uint(packed_tasks[task_position]);
-        uint row = task / TOPK;
-        uint expert = uint(sorted_ids[task_position]);
-        """
-    else:
-        route_setup = """
-        uint task = threadgroup_position_in_grid.z;
-        uint row = task / TOPK;
-        uint expert = uint(expert_ids[task]);
-        """
     x_row = "task" if routed_input else "row"
     source = f"""
         uint lane = thread_position_in_threadgroup.x;
         uint n_block = threadgroup_position_in_grid.y;
-        {route_setup}
+        uint task = threadgroup_position_in_grid.z;
+        uint row = task / TOPK;
+        uint expert = uint(expert_ids[task]);
         size_t x_row = {x_row};
         uint n0 = n_block * 256u + lane;
         uint n1 = n0 + HAD;
@@ -721,18 +709,12 @@ def _m6_quad_qmv_kernel(
             rotated1 * svh[(size_t)expert * SIZE_N + n1]
         );
     """
-    input_names = ["x", "trellis", "suh", "svh"]
-    if expert_major:
-        input_names.extend(("packed_tasks", "sorted_ids"))
-    else:
-        input_names.append("expert_ids")
     return mx.fast.metal_kernel(
         name=(
             f"mtplx_dsv4_exl3_m6_quad_mcg_qmv_k{size_k}_n{size_n}"
             f"_e216_t6_r{int(routed_input)}_bn256_u4stage_v2"
-            f"{'_expert_major' if expert_major else ''}"
         ),
-        input_names=input_names,
+        input_names=["x", "trellis", "suh", "svh", "expert_ids"],
         output_names=["y"],
         header=header,
         source=source,
@@ -1772,13 +1754,6 @@ class _InstalledM6QuadQMVPlan(NamedTuple):
     intermediate_to_hidden: Any
 
 
-class _InstalledM6ExpertMajorQMVPlan(NamedTuple):
-    geometry: tuple[int, int, int, int, float, int, int]
-    route_pack: Any
-    hidden_to_intermediate: Any
-    intermediate_to_hidden: Any
-
-
 class EXL3SwitchGLU(nn.Module):
     """DeepSeek routed SwiGLU over the exact Mia K216 EXL3 expert banks."""
 
@@ -1824,7 +1799,6 @@ class EXL3SwitchGLU(nn.Module):
         self._trellis_activation_down = None
         self._trellis_final_reduce = None
         self._m6_quad_qmv_plan = None
-        self._m6_expert_major_qmv_plan = None
 
     def install_trellis_runtime(self, *, max_tokens: int) -> None:
         """Install the pinned decode/prefill plans before request execution."""
@@ -1937,33 +1911,6 @@ class EXL3SwitchGLU(nn.Module):
             stage_vectors_per_k_tile=EXL3_M6_STAGE_VECTORS_PER_K_TILE,
             hidden_to_intermediate=_m6_quad_qmv_kernel(4096, 2048, False),
             intermediate_to_hidden=_m6_quad_qmv_kernel(2048, 4096, True),
-        )
-
-    def install_m6_expert_major_qmv_runtime(self) -> None:
-        """Bind source-order route packing around the unchanged direct decoder."""
-
-        if self._m6_quad_qmv_plan is None:
-            raise ValueError("Mia expert-major QMV requires the exact quad plan")
-        geometry = (
-            self.hidden_size,
-            self.gate_proj.output_dims,
-            self.experts,
-            self.topk,
-            self.limit,
-            256,
-            self.topk * 6,
-        )
-        if geometry != (4096, 2048, 216, 6, 10.0, 256, 36):
-            raise ValueError(f"Mia expert-major QMV geometry changed: {geometry!r}")
-        self._m6_expert_major_qmv_plan = _InstalledM6ExpertMajorQMVPlan(
-            geometry=geometry,
-            route_pack=_trellis_route_pack_kernel(216, 6, 8),
-            hidden_to_intermediate=_m6_quad_qmv_kernel(
-                4096, 2048, False, True
-            ),
-            intermediate_to_hidden=_m6_quad_qmv_kernel(
-                2048, 4096, True, True
-            ),
         )
 
     def _trellis_mma(
@@ -2156,72 +2103,6 @@ class EXL3SwitchGLU(nn.Module):
             self.down_proj,
             activated.reshape(36, self.down_proj.input_dims),
             flat_ids,
-            plan.intermediate_to_hidden,
-        ).astype(original_dtype)
-
-    @staticmethod
-    def _m6_expert_major_project(
-        bank: EXL3LinearBank,
-        x_rows: mx.array,
-        packed_tasks: mx.array,
-        sorted_ids: mx.array,
-        kernel,
-    ) -> mx.array:
-        tasks = 36
-        return kernel(
-            inputs=[
-                mx.contiguous(x_rows),
-                bank.trellis,
-                bank.suh,
-                bank.svh,
-                packed_tasks,
-                sorted_ids,
-            ],
-            grid=(128, bank.output_dims // 256, tasks),
-            threadgroup=(128, 1, 1),
-            output_shapes=[(tasks, bank.output_dims)],
-            output_dtypes=[mx.float16],
-        )[0].reshape(6, 6, bank.output_dims)
-
-    def direct_qmv_m6_expert_major(
-        self,
-        x: mx.array,
-        expert_ids: mx.array,
-    ) -> mx.array:
-        """Run exact-M6 QMV in expert-major dispatch order."""
-
-        original_dtype = x.dtype
-        x_half = x.astype(mx.float16)
-        plan = self._m6_expert_major_qmv_plan
-        packed_tasks, _inverse, sorted_ids, *_route_blocks = _pack_trellis_routes(
-            expert_ids,
-            experts=self.experts,
-            topk=self.topk,
-            block_m=8,
-            kernel=plan.route_pack,
-        )
-        gate = self._m6_expert_major_project(
-            self.gate_proj,
-            x_half,
-            packed_tasks,
-            sorted_ids,
-            plan.hidden_to_intermediate,
-        )
-        up = self._m6_expert_major_project(
-            self.up_proj,
-            x_half,
-            packed_tasks,
-            sorted_ids,
-            plan.hidden_to_intermediate,
-        )
-        gate = mx.minimum(gate, self.limit)
-        up = mx.clip(up, -self.limit, self.limit)
-        activated = (nn.silu(gate) * up).astype(mx.float16)
-        return self._m6_expert_major_project(
-            self.down_proj,
-            activated.reshape(36, self.down_proj.input_dims),
-            packed_tasks,
-            sorted_ids,
             plan.intermediate_to_hidden,
         ).astype(original_dtype)
 

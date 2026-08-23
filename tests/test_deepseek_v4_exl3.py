@@ -910,7 +910,6 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
         hidden_to_intermediate=exl3._m6_quad_qmv_kernel(4096, 2048, False),
         intermediate_to_hidden=exl3._m6_quad_qmv_kernel(2048, 4096, True),
     )
-    switch.install_m6_expert_major_qmv_runtime()
     x = mx.array(
         np.linspace(-1.0, 1.0, 6 * 4096, dtype=np.float32).reshape(6, 4096)
     ).astype(mx.bfloat16)
@@ -945,7 +944,6 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
     )
     oracle_final = switch.direct_qmv(x, expert_ids)
     quad_final = switch.direct_qmv_m6_quad(x, expert_ids)
-    expert_major_final = switch.direct_qmv_m6_expert_major(x, expert_ids)
     mx.eval(
         oracle_gate,
         quad_gate,
@@ -955,7 +953,6 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
         quad_down,
         oracle_final,
         quad_final,
-        expert_major_final,
     )
 
     for oracle, quad in (
@@ -963,7 +960,6 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
         (oracle_up, quad_up),
         (oracle_down, quad_down),
         (oracle_final, quad_final),
-        (quad_final, expert_major_final),
     ):
         np.testing.assert_array_equal(
             np.array(oracle.view(mx.uint16)),
