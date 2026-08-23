@@ -348,6 +348,49 @@ def test_row17_route_installs_the_q4_group64_mtp_block(monkeypatch) -> None:
     }
 
 
+def test_row36_route_installs_q4_block_with_bf16_qkv_islands(monkeypatch) -> None:
+    artifact = Path("/artifacts/row36/model.safetensors")
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_mtp_block",
+        lambda runtime, *, variant, artifact_path: {
+            "installed": variant is not None,
+            "active": variant is not None,
+            "variant": variant,
+            "artifact_path": str(artifact_path) if artifact_path else None,
+            "bits": 4 if variant else None,
+            "group_size": 64 if variant else None,
+            "precision_q_rows": 1_024 if variant == "r36" else 0,
+            "precision_k_rows": 1_024 if variant == "r36" else 0,
+            "precision_v_rows": 1_024 if variant == "r36" else 0,
+        },
+        raising=False,
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(mtp_update_cache=_callable),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="control",
+        mtp_block_variant="r36",
+        mtp_block_artifact_path=artifact,
+    )
+
+    assert route.route_id == "r17_q4_mtp_block+r36_qkv_islands"
+    assert route.kernel_ids == ("qwen38_row36_q4_g64_bf16_qkv_islands_v1",)
+    report = runtime.qwen38_feature_receipt["r36_qkv_islands"]
+    assert report["variant"] == "r36"
+    assert report["precision_q_rows"] == 1_024
+    assert report["precision_k_rows"] == 1_024
+    assert report["precision_v_rows"] == 1_024
+
+
 def test_row18_route_names_input_independent_gdn_decay_memo(monkeypatch) -> None:
     monkeypatch.setattr(
         "mtplx.qwen38_challenge.configure_qwen38_row18_gdn_decay_memo",

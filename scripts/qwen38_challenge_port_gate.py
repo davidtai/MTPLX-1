@@ -192,6 +192,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r10_compact_vocab",
         "r17_q4_mtp_block",
         "r28_q4_mtp_block",
+        "r36_qkv_islands",
         "r18_gdn_decay_memo",
         "r20_kv_only_history",
         "r21_qk_rms_rope",
@@ -229,6 +230,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(26)
     if "r28_q4_mtp_block" in features:
         source_rows.append(28)
+    if "r36_qkv_islands" in features:
+        source_rows.append(36)
     return {
         "cache_route": (
             "kv_only_history"
@@ -239,7 +242,9 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "mtp_block_variant": (
-            "r28"
+            "r36"
+            if "r36_qkv_islands" in features
+            else "r28"
             if "r28_q4_mtp_block" in features
             else "r17"
             if "r17_q4_mtp_block" in features
@@ -312,7 +317,11 @@ def _candidate_engagement_errors(
         if run.get("route_id") == candidate_route
     ]
     errors: list[str] = []
-    if "r17_q4_mtp_block" in features and "r28_q4_mtp_block" not in features:
+    if (
+        "r17_q4_mtp_block" in features
+        and "r28_q4_mtp_block" not in features
+        and "r36_qkv_islands" not in features
+    ):
         active = any(
             bool(report.get("installed"))
             and bool(report.get("active"))
@@ -340,6 +349,35 @@ def _candidate_engagement_errors(
         )
         if not active:
             errors.append("row 28 pinned alternate Q4/group-64 MTP block was not active")
+    if "r36_qkv_islands" in features:
+        active = any(
+            bool(report.get("installed"))
+            and bool(report.get("active"))
+            and report.get("variant") == "r36"
+            and int(report.get("precision_q_rows", 0)) == 1_024
+            and int(report.get("precision_k_rows", 0)) == 1_024
+            and int(report.get("precision_v_rows", 0)) == 1_024
+            for run in candidate_runs
+            for report in [
+                ((run.get("feature_receipt") or {}).get("r36_qkv_islands") or {})
+            ]
+        )
+        if not active:
+            errors.append("row 36 pinned Q/K/V precision islands were not active")
+        island_calls = {
+            key: sum(
+                int(
+                    ((run.get("engagement") or {}).get("r36_qkv_islands") or {}).get(
+                        key,
+                        0,
+                    )
+                )
+                for run in candidate_runs
+            )
+            for key in ("q", "k", "v")
+        }
+        if any(value <= 0 for value in island_calls.values()):
+            errors.append("row 36 Q/K/V precision-island projections did not execute")
     if "r18_gdn_decay_memo" in features:
         memo_calls = sum(
             int(
@@ -446,6 +484,9 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         qwen38_row26_qk_widen_counter_snapshot,
     )
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
+    from mtplx.qwen38_mtp_block_artifacts import (
+        qwen38_row36_island_counter_snapshot,
+    )
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
 
     return {
@@ -464,6 +505,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r26_qk_length_limit": {
             "widen_calls": qwen38_row26_qk_widen_counter_snapshot()
         },
+        "r36_qkv_islands": qwen38_row36_island_counter_snapshot(),
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -569,6 +611,7 @@ def _run_arm(
     source_artifact_path: Path | None,
     row17_artifact_path: Path | None,
     row28_artifact_path: Path | None,
+    row36_artifact_path: Path | None,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -587,7 +630,9 @@ def _run_arm(
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
         mtp_block_variant=options["mtp_block_variant"],
         mtp_block_artifact_path=(
-            row28_artifact_path
+            row36_artifact_path
+            if options["mtp_block_variant"] == "r36"
+            else row28_artifact_path
             if options["mtp_block_variant"] == "r28"
             else row17_artifact_path
         ),
@@ -682,6 +727,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--source-artifact", type=Path)
     parser.add_argument("--row17-artifact", type=Path)
     parser.add_argument("--row28-artifact", type=Path)
+    parser.add_argument("--row36-artifact", type=Path)
     parser.add_argument(
         "--warmup-tokens",
         type=int,
@@ -768,6 +814,7 @@ def main() -> int:
             source_artifact_path=args.source_artifact,
             row17_artifact_path=args.row17_artifact,
             row28_artifact_path=args.row28_artifact,
+            row36_artifact_path=args.row36_artifact,
         )
         for route_id in unique_routes
     ]
@@ -785,6 +832,7 @@ def main() -> int:
             source_artifact_path=args.source_artifact,
             row17_artifact_path=args.row17_artifact,
             row28_artifact_path=args.row28_artifact,
+            row36_artifact_path=args.row36_artifact,
         )
         for route_id in order
     ]

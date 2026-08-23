@@ -1257,45 +1257,61 @@ def inject_mtp_support(
 
             k_proj = attention.k_proj
             v_proj = attention.v_proj
+            k_pack_proj = getattr(k_proj, "_mtplx_pack_linear", k_proj)
+            v_pack_proj = getattr(v_proj, "_mtplx_pack_linear", v_proj)
             packed = getattr(attention, "_mtplx_qwen38_packed_kv", None)
             if packed is None and all(
                 isinstance(module, nn.QuantizedLinear)
-                for module in (k_proj, v_proj)
+                for module in (k_pack_proj, v_pack_proj)
             ):
                 compatible = (
-                    int(k_proj.bits) == int(v_proj.bits)
-                    and int(k_proj.group_size) == int(v_proj.group_size)
-                    and str(k_proj.mode) == str(v_proj.mode) == "affine"
-                    and tuple(k_proj.weight.shape[1:])
-                    == tuple(v_proj.weight.shape[1:])
-                    and tuple(k_proj.scales.shape[1:])
-                    == tuple(v_proj.scales.shape[1:])
-                    and tuple(k_proj.biases.shape[1:])
-                    == tuple(v_proj.biases.shape[1:])
+                    int(k_pack_proj.bits) == int(v_pack_proj.bits)
+                    and int(k_pack_proj.group_size) == int(v_pack_proj.group_size)
+                    and str(k_pack_proj.mode) == str(v_pack_proj.mode) == "affine"
+                    and tuple(k_pack_proj.weight.shape[1:])
+                    == tuple(v_pack_proj.weight.shape[1:])
+                    and tuple(k_pack_proj.scales.shape[1:])
+                    == tuple(v_pack_proj.scales.shape[1:])
+                    and tuple(k_pack_proj.biases.shape[1:])
+                    == tuple(v_pack_proj.biases.shape[1:])
                 )
                 if compatible:
                     packed = (
                         "quantized",
-                        mx.concatenate([k_proj.weight, v_proj.weight], axis=0),
-                        mx.concatenate([k_proj.scales, v_proj.scales], axis=0),
-                        mx.concatenate([k_proj.biases, v_proj.biases], axis=0),
-                        int(k_proj.weight.shape[0]),
-                        int(k_proj.group_size),
-                        int(k_proj.bits),
-                        str(k_proj.mode),
+                        mx.concatenate(
+                            [k_pack_proj.weight, v_pack_proj.weight], axis=0
+                        ),
+                        mx.concatenate(
+                            [k_pack_proj.scales, v_pack_proj.scales], axis=0
+                        ),
+                        mx.concatenate(
+                            [k_pack_proj.biases, v_pack_proj.biases], axis=0
+                        ),
+                        int(k_pack_proj.weight.shape[0]),
+                        int(k_pack_proj.group_size),
+                        int(k_pack_proj.bits),
+                        str(k_pack_proj.mode),
                     )
                     mx.eval(*packed[1:4])
                     attention._mtplx_qwen38_packed_kv = packed
             if (
                 packed is None
-                and all(isinstance(module, nn.Linear) for module in (k_proj, v_proj))
-                and all("bias" not in module for module in (k_proj, v_proj))
-                and tuple(k_proj.weight.shape[1:]) == tuple(v_proj.weight.shape[1:])
+                and all(
+                    isinstance(module, nn.Linear)
+                    for module in (k_pack_proj, v_pack_proj)
+                )
+                and all(
+                    "bias" not in module for module in (k_pack_proj, v_pack_proj)
+                )
+                and tuple(k_pack_proj.weight.shape[1:])
+                == tuple(v_pack_proj.weight.shape[1:])
             ):
                 packed = (
                     "dense",
-                    mx.concatenate([k_proj.weight, v_proj.weight], axis=0),
-                    int(k_proj.weight.shape[0]),
+                    mx.concatenate(
+                        [k_pack_proj.weight, v_pack_proj.weight], axis=0
+                    ),
+                    int(k_pack_proj.weight.shape[0]),
                 )
                 mx.eval(packed[1])
                 attention._mtplx_qwen38_packed_kv = packed
@@ -1325,6 +1341,14 @@ def inject_mtp_support(
                     _, weight, split_at = packed
                     kv = normed @ weight.T
                 keys, values = mx.split(kv, [split_at], axis=-1)
+                for projection in (k_proj, v_proj):
+                    record_packed = getattr(
+                        projection,
+                        "_mtplx_record_packed_call",
+                        None,
+                    )
+                    if callable(record_packed):
+                        record_packed()
                 QWEN38_KV_ONLY_HISTORY_COUNTERS["packed_calls"] += 1
             else:
                 keys = k_proj(normed)

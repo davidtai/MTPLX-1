@@ -365,6 +365,10 @@ def install_qwen38_route(
             route_features.extend(("r17_q4_mtp_block", "r28_q4_mtp_block"))
             kernel_ids.append("qwen38_row28_q4_g64_mtp_block_v1")
             feature_receipt["r28_q4_mtp_block"] = mtp_block_report
+        elif mtp_block_variant == "r36":
+            route_features.extend(("r17_q4_mtp_block", "r36_qkv_islands"))
+            kernel_ids.append("qwen38_row36_q4_g64_bf16_qkv_islands_v1")
+            feature_receipt["r36_qkv_islands"] = mtp_block_report
         else:
             raise Qwen38ContractError(
                 f"unknown Qwen 3.8 MTP block variant: {mtp_block_variant!r}"

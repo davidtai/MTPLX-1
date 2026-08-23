@@ -321,6 +321,15 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "r28_q4_mtp_block",
     }
     assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block+"
+        "r36_qkv_islands"
+    ) == {
+        "r08_device_draft",
+        "r10_compact_vocab",
+        "r17_q4_mtp_block",
+        "r36_qkv_islands",
+    }
+    assert gate._validate_route_id(
         "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo"
     ) == {"r08_device_draft", "r10_compact_vocab", "r18_gdn_decay_memo"}
     assert gate._validate_route_id(

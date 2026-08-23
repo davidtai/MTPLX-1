@@ -1,8 +1,8 @@
 """Chronological Qwen 3.8 MTP-block artifact candidates.
 
-Rows 17 and 28 replace the complete one-layer MTP block, not the draft-only
-vocabulary projection.  Keep those two surfaces separate so a Q4 vocabulary
-head can never be mistaken for a Q4 MTP block again.
+Rows 17, 28, and 36 replace the complete one-layer MTP block, not the
+draft-only vocabulary projection.  Keep those surfaces separate so a Q4
+vocabulary head can never be mistaken for a Q4 MTP block again.
 """
 
 from __future__ import annotations
@@ -42,6 +42,13 @@ QWEN38_MTP_BLOCK_ARTIFACTS = {
         file_sha256="c934b40f1254858425cc0b5fdfe62b6ae13d1a4aff74da9d81606e92fdcf41ee",
         bytes=238_934_129,
     ),
+    "r36": Qwen38MTPBlockArtifactSpec(
+        variant="r36",
+        source_commit="ed4dfd6b0e95bb1cafb26c694bc247f551d550fe",
+        manifest_sha256="477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
+        file_sha256="517bb133d7ca6e228a5129710b3cb2c25aa9944753b9f9a225fa1e8135df5e65",
+        bytes=270_404_624,
+    ),
 }
 
 _Q4_LINEAR_SHAPES = {
@@ -63,6 +70,16 @@ _NORM_SHAPES = {
     "pre_fc_norm_embedding.weight": (5120,),
     "pre_fc_norm_hidden.weight": (5120,),
 }
+_PRECISION_ISLAND_SHAPES = {
+    "precision_islands.q.weight": ((1024, 5120), "mlx.core.bfloat16"),
+    "precision_islands.q.indices": ((1024,), "mlx.core.int32"),
+    "precision_islands.k.weight": ((1024, 5120), "mlx.core.bfloat16"),
+    "precision_islands.k.indices": ((1024,), "mlx.core.int32"),
+    "precision_islands.v.weight": ((1024, 5120), "mlx.core.bfloat16"),
+    "precision_islands.v.indices": ((1024,), "mlx.core.int32"),
+}
+
+qwen38_row36_island_calls = {"q": 0, "k": 0, "v": 0}
 
 
 def _sha256(path: Path) -> str:
@@ -73,10 +90,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_tensors(tensors: dict[str, Any]) -> None:
+def _validate_tensors(tensors: dict[str, Any], *, precision_islands: bool) -> None:
     expected = set(_NORM_SHAPES)
     for prefix in _Q4_LINEAR_SHAPES:
         expected.update((f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"))
+    if precision_islands:
+        expected.update(_PRECISION_ISLAND_SHAPES)
     if set(tensors) != expected:
         missing = sorted(expected - set(tensors))
         extra = sorted(set(tensors) - expected)
@@ -98,6 +117,79 @@ def _validate_tensors(tensors: dict[str, Any]) -> None:
         value = tensors[key]
         if tuple(value.shape) != shape or str(value.dtype) != "mlx.core.bfloat16":
             raise Qwen38MTPBlockArtifactError(f"invalid BF16 norm geometry for {key}")
+    for key, (shape, dtype) in (
+        _PRECISION_ISLAND_SHAPES.items() if precision_islands else ()
+    ):
+        value = tensors[key]
+        if tuple(value.shape) != shape or str(value.dtype) != dtype:
+            raise Qwen38MTPBlockArtifactError(
+                f"invalid precision-island geometry for {key}"
+            )
+
+
+class _ExactQRows:
+    def __init__(self, base: Any, weight: Any, indices: Any):
+        import mlx.core as mx
+
+        self.base = base
+        self.weight = weight
+        self.indices = indices.astype(mx.int32)
+
+    def __call__(self, x: Any) -> Any:
+        import mlx.core as mx
+
+        qwen38_row36_island_calls["q"] += 1
+        base = self.base(x)
+        exact = mx.matmul(x, self.weight.T)
+        shape = [1] * (base.ndim - 1) + [int(self.indices.shape[0])]
+        return mx.put_along_axis(base, self.indices.reshape(shape), exact, axis=-1)
+
+
+class _CountedDense:
+    def __init__(self, layer: Any, counter: str):
+        self.layer = layer
+        self.counter = counter
+        self._mtplx_pack_linear = layer
+
+    def __call__(self, x: Any) -> Any:
+        qwen38_row36_island_calls[self.counter] += 1
+        return self.layer(x)
+
+    def _mtplx_record_packed_call(self) -> None:
+        qwen38_row36_island_calls[self.counter] += 1
+
+
+def _dense_linear(weight: Any, *, counter: str) -> Any:
+    import mlx.nn as nn
+
+    layer = nn.Linear(int(weight.shape[1]), int(weight.shape[0]), bias=False)
+    layer.weight = weight
+    return _CountedDense(layer, counter)
+
+
+def _install_precision_islands(candidate: Any, tensors: dict[str, Any]) -> None:
+    import mlx.core as mx
+
+    attn = candidate.layers[0].self_attn
+    q_weight = tensors["precision_islands.q.weight"]
+    q_indices = tensors["precision_islands.q.indices"]
+    attn.q_proj = _ExactQRows(attn.q_proj, q_weight, q_indices)
+    k_order = mx.argsort(tensors["precision_islands.k.indices"])
+    v_order = mx.argsort(tensors["precision_islands.v.indices"])
+    k_weight = mx.take(tensors["precision_islands.k.weight"], k_order, axis=0)
+    v_weight = mx.take(tensors["precision_islands.v.weight"], v_order, axis=0)
+    mx.eval(q_weight, q_indices, k_weight, v_weight)
+    attn.k_proj = _dense_linear(k_weight, counter="k")
+    attn.v_proj = _dense_linear(v_weight, counter="v")
+
+
+def reset_qwen38_row36_island_calls() -> None:
+    for key in qwen38_row36_island_calls:
+        qwen38_row36_island_calls[key] = 0
+
+
+def qwen38_row36_island_counter_snapshot() -> dict[str, int]:
+    return dict(qwen38_row36_island_calls)
 
 
 def configure_qwen38_mtp_block(
@@ -151,10 +243,18 @@ def configure_qwen38_mtp_block(
         import mlx.nn as nn
 
         tensors = mx.load(str(path), format="safetensors")
-        _validate_tensors(tensors)
+        precision_islands = variant == "r36"
+        _validate_tensors(tensors, precision_islands=precision_islands)
         candidate = copy.deepcopy(control)
         nn.quantize(candidate, group_size=64, bits=4, mode="affine")
-        candidate.load_weights(list(tensors.items()), strict=True)
+        body = {
+            key: value
+            for key, value in tensors.items()
+            if not key.startswith("precision_islands.")
+        }
+        candidate.load_weights(list(body.items()), strict=True)
+        if precision_islands:
+            _install_precision_islands(candidate, tensors)
         mx.eval(candidate.parameters())
         variants[variant] = candidate
 
@@ -175,4 +275,7 @@ def configure_qwen38_mtp_block(
         "group_size": 64,
         "mode": "affine",
         "linear_modules": len(_Q4_LINEAR_SHAPES),
+        "precision_q_rows": 1_024 if variant == "r36" else 0,
+        "precision_k_rows": 1_024 if variant == "r36" else 0,
+        "precision_v_rows": 1_024 if variant == "r36" else 0,
     }
