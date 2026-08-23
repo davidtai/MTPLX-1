@@ -345,7 +345,10 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Arithmetic and layout:** hidden size 4,096, four residual streams, 20
   Sinkhorn iterations, FP32 routing matrices, the source Gram-trick norm, BF16
   carried values, fused RMSNorm at the following branch, final post, and head
-  collapse.  Target taps are reconstructed after layers 40, 41, and 42 without
+  collapse.  The head collapse is stored at the source BF16 boundary before the
+  model-owned RMSNorm; the norm scale is therefore computed from the rounded
+  collapse rather than an analytical pre-rounding Gram.  Target taps are
+  reconstructed after layers 40, 41, and 42 without
   breaking carried residual ownership; the layer-42 reconstruction is reused
   as the final trunk state exactly as in the pinned vLLM path.  The large-M
   repeated `post_pre` route follows SparkInfer's prefill split: one BF16
@@ -370,7 +373,9 @@ created.  The enabled callables do not probe eligibility or fall back.
   view once, seals M384/BM64, and owns compact `[M,11]` Gram and `[M,24]`
   projection outputs at repeated large-M post-pre boundaries.  Initial/head
   FP32 partials and the M<384 post-pre partials remain explicit source routes;
-  the initial route owns the precollapsed FP32 broadcast matrix.
+  the initial route owns the precollapsed FP32 broadcast matrix.  Target and
+  draft heads bind `head_bf16_then_rmsnorm`, preserving the separate norm call
+  without a hot-path eligibility branch.
 - **Disposition:** source-derived Metal port for target prefill, target M6
   verification, and draft K5.
 

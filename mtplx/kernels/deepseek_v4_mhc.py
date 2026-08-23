@@ -2,8 +2,10 @@
 
 The installed route keeps the source state machine: one initial pre, fused
 post-pre boundaries with fused RMSNorm, one final post, and a fused head
-collapse.  Projection and residual Gram partials are produced together so the
-normalizer never launches a second hidden-width reduction.
+collapse to the source BF16 boundary.  The model-owned final RMSNorm remains a
+separate operation after that boundary, matching the pinned DSpark/target
+execution order.  Block projection and residual Gram partials are produced
+together so their normalizers never launch a second hidden-width reduction.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ _MIXES = 24
 _SOURCE_TILE = 128
 _SOURCE_SPLITS = _HIDDEN // _SOURCE_TILE
 _PARTIALS = 1 + _MIXES + 10
+_HEAD_PARTIALS = 1 + _HC
 _PREFILL_MIN_ROWS = 384
 _PREFILL_BLOCK_M = 64
 _PREFILL_THREADS = 256
@@ -654,9 +657,7 @@ def _head_partial_kernel():
         uint row = threadgroup_position_in_grid.z;
         uint first_h = split * MTPLX_SOURCE_TILE + lane * 4u;
         float sums[5];
-        float gram[10];
         for (uint i = 0u; i < 5u; ++i) sums[i] = 0.0f;
-        for (uint i = 0u; i < 10u; ++i) gram[i] = 0.0f;
         for (uint offset = 0u; offset < 4u; ++offset) {
             uint h = first_h + offset;
             float value[4];
@@ -673,20 +674,11 @@ def _head_partial_kernel():
                     );
                 }
             }
-            gram[0] += value[0] * value[0]; gram[1] += value[1] * value[1];
-            gram[2] += value[2] * value[2]; gram[3] += value[3] * value[3];
-            gram[4] += value[0] * value[1]; gram[5] += value[0] * value[2];
-            gram[6] += value[0] * value[3]; gram[7] += value[1] * value[2];
-            gram[8] += value[1] * value[3]; gram[9] += value[2] * value[3];
         }
-        size_t base_out = (size_t(row) * MTPLX_SOURCE_SPLITS + split) * 15u;
+        size_t base_out = (size_t(row) * MTPLX_SOURCE_SPLITS + split) * 5u;
         for (uint column = 0u; column < 5u; ++column) {
             float value = simd_sum(sums[column]);
             if (lane == 0u) partials[base_out + column] = value;
-        }
-        for (uint pair = 0u; pair < 10u; ++pair) {
-            float value = simd_sum(gram[pair]);
-            if (lane == 0u) partials[base_out + 5u + pair] = value;
         }
     """
     return mx.fast.metal_kernel(
@@ -705,14 +697,13 @@ def _head_finalize_kernel():
         uint tid = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.z;
         threadgroup float pre[4];
-        threadgroup float norm_rms;
         if (tid == 0u) {
-            float reduced[15];
-            for (uint column = 0u; column < 15u; ++column) {
+            float reduced[5];
+            for (uint column = 0u; column < 5u; ++column) {
                 float total = 0.0f;
                 for (uint split = 0u; split < MTPLX_SOURCE_SPLITS; ++split) {
                     total += partials[(size_t(row) * MTPLX_SOURCE_SPLITS + split)
-                        * 15u + column];
+                        * 5u + column];
                 }
                 reduced[column] = total;
             }
@@ -723,19 +714,6 @@ def _head_finalize_kernel():
                         + float(base[stream])
                 ) + MTPLX_HC_EPS;
             }
-            float sy2 = pre[0] * pre[0] * reduced[5]
-                + pre[1] * pre[1] * reduced[6]
-                + pre[2] * pre[2] * reduced[7]
-                + pre[3] * pre[3] * reduced[8]
-                + 2.0f * (
-                    pre[0] * pre[1] * reduced[9]
-                    + pre[0] * pre[2] * reduced[10]
-                    + pre[0] * pre[3] * reduced[11]
-                    + pre[1] * pre[2] * reduced[12]
-                    + pre[1] * pre[3] * reduced[13]
-                    + pre[2] * pre[3] * reduced[14]
-                );
-            norm_rms = rsqrt(sy2 / 4096.0f + float(norm_eps));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint h = tid; h < MTPLX_HIDDEN; h += 256u) {
@@ -745,15 +723,12 @@ def _head_finalize_kernel():
                     residual[(size_t(row) * 4u + stream) * MTPLX_HIDDEN + h]
                 );
             }
-            bfloat rounded = bfloat(collapsed);
-            y[size_t(row) * MTPLX_HIDDEN + h] = T(
-                float(rounded) * norm_rms * float(norm_weight[h])
-            );
+            y[size_t(row) * MTPLX_HIDDEN + h] = T(collapsed);
         }
     """
     return mx.fast.metal_kernel(
-        name="mtplx_dsv4_mhc_head_norm_h4096",
-        input_names=["residual", "partials", "scale", "base", "norm_weight", "norm_eps"],
+        name="mtplx_dsv4_mhc_head_bf16_h4096",
+        input_names=["residual", "partials", "scale", "base"],
         output_names=["y"],
         header=_MHC_HEADER,
         source=source,
@@ -789,6 +764,7 @@ class MiaMHCPlan:
             "tiny_split32_fp32",
             "prefill_post_pre_bf16_mma_bm64_fp32",
             "compact_gram_finalize",
+            "head_bf16_then_rmsnorm",
         )
         self.bound_hyper_connections = 0
 
@@ -965,14 +941,14 @@ class MiaMHCPlan:
         )
         return out
 
-    def head(self, residual, head, norm):
+    def head(self, residual, head):
         rows = self._rows(residual) // _HC
         residual = mx.contiguous(residual.reshape(rows, _HC, _HIDDEN))
         (partials,) = self._head_partial(
             inputs=[residual, head.fn],
             grid=(32, _SOURCE_SPLITS, rows),
             threadgroup=(32, 1, 1),
-            output_shapes=[(rows, _SOURCE_SPLITS, 15)],
+            output_shapes=[(rows, _SOURCE_SPLITS, _HEAD_PARTIALS)],
             output_dtypes=[mx.float32],
         )
         (y,) = self._head_finalize(
@@ -981,8 +957,6 @@ class MiaMHCPlan:
                 partials,
                 head.scale,
                 head.base,
-                norm.weight,
-                float(norm.eps),
             ],
             template=[("T", residual.dtype)],
             grid=(256, 1, rows),

@@ -11,6 +11,7 @@ from mtplx.deepseek_v4_nvfp4_kv import FixedMiaNVFP4Ring  # noqa: E402
 from mtplx.models import deepseek_v4 as target_module  # noqa: E402
 from mtplx.models.deepseek_v4 import (  # noqa: E402
     DeepseekV4NVFP4Cache,
+    DeepseekV4Model,
     Model,
     ModelArgs,
     is_deepseek_v4_mtp_config,
@@ -20,6 +21,7 @@ from mtplx.models.deepseek_v4_dspark import (  # noqa: E402
     DSparkTargetRoute,
     DeepseekV4DSparkAttention,
     DeepseekV4DSparkCache,
+    DeepseekV4DSparkOwner,
     build_deepseek_v4_dspark,
     greedy_future_tokens,
 )
@@ -33,6 +35,116 @@ class _SpyMarkovHead:
         self.inputs.append(int(token_ids.item()))
         batch = int(token_ids.shape[0])
         return mx.zeros((batch, 64)), mx.zeros((batch, 8))
+
+
+class _SourceOrderHead:
+    def __init__(self, calls: list[str], output: mx.array) -> None:
+        self.calls = calls
+        self.output = output
+
+    def head(self, hidden, _head):
+        self.calls.append("hc_head_bf16")
+        assert hidden.dtype == mx.bfloat16
+        return self.output
+
+
+class _SourceOrderNorm:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def __call__(self, hidden):
+        self.calls.append("rms_norm")
+        assert hidden.dtype == mx.bfloat16
+        return hidden + mx.array(1, dtype=mx.bfloat16)
+
+
+def test_mia_target_collapse_preserves_source_bf16_then_norm_boundary() -> None:
+    calls = []
+    collapsed = mx.full((1, 1), 3, dtype=mx.bfloat16)
+    owner = SimpleNamespace(
+        _mia_mhc=_SourceOrderHead(calls, collapsed),
+        hc_head=object(),
+        norm=_SourceOrderNorm(calls),
+        args=SimpleNamespace(hidden_size=1),
+    )
+    hidden = mx.zeros((1, 1, 4, 1), dtype=mx.bfloat16)
+
+    output = DeepseekV4Model._mia_collapse(owner, hidden)
+    mx.eval(output)
+
+    assert calls == ["hc_head_bf16", "rms_norm"]
+    np.testing.assert_array_equal(
+        np.array(output.astype(mx.float32)),
+        np.array([[[4]]], dtype=np.float32),
+    )
+
+
+def test_mia_dspark_head_preserves_source_bf16_then_norm_boundary() -> None:
+    calls = []
+    hidden_size = 1
+    vocab_size = 8
+    collapsed = mx.full((5, hidden_size), 3, dtype=mx.bfloat16)
+    norm = _SourceOrderNorm(calls)
+
+    def passthrough(value, **_kwargs):
+        return value
+
+    stages = [
+        SimpleNamespace(
+            attn_hc=object(),
+            attn_norm=object(),
+            ffn_hc=object(),
+            ffn_norm=object(),
+            attn=passthrough,
+            ffn=passthrough,
+            hc_head=None,
+            norm=None,
+            markov_head=None,
+        )
+        for _ in range(3)
+    ]
+    stages[-1].hc_head = object()
+    stages[-1].norm = norm
+    stages[-1].markov_head = lambda token_ids: (
+        mx.zeros((token_ids.shape[0], vocab_size), dtype=mx.bfloat16),
+        mx.zeros((token_ids.shape[0], 1), dtype=mx.bfloat16),
+    )
+    owner = DeepseekV4DSparkOwner.__new__(DeepseekV4DSparkOwner)
+    owner.args = SimpleNamespace(hidden_size=hidden_size)
+    owner.stages = stages
+    owner._mia_mhc = _SourceOrderHead(calls, collapsed)
+    owner._mia_draft_input_ids_k5 = lambda _primary: mx.zeros(
+        (1, 5), dtype=mx.uint32
+    )
+    owner._mia_mhc.pre_broadcast = lambda embedded, *_args: (
+        mx.zeros((5, 4, hidden_size), dtype=mx.bfloat16),
+        mx.zeros((5, 4), dtype=mx.float32),
+        mx.zeros((5, 4, 4), dtype=mx.float32),
+        embedded,
+    )
+    owner._mia_mhc.post_pre = lambda value, residual, post, comb, *_args: (
+        residual,
+        post,
+        comb,
+        value,
+    )
+    owner._mia_mhc.post = lambda _value, residual, _post, _comb: residual
+
+    def lm_head(hidden):
+        calls.append("lm_head")
+        assert bool(mx.all(hidden == mx.array(4, dtype=mx.bfloat16)).item())
+        return mx.zeros((1, 5, vocab_size), dtype=mx.bfloat16)
+
+    DeepseekV4DSparkOwner._mia_propose_k5(
+        owner,
+        mx.zeros((1,), dtype=mx.uint32),
+        lambda ids: mx.zeros((*ids.shape, hidden_size), dtype=mx.bfloat16),
+        lm_head,
+        [object(), object(), object()],
+        start_pos=0,
+    )
+
+    assert calls == ["hc_head_bf16", "rms_norm", "lm_head"]
 
 
 def test_primary_token_conditions_dspark_row_zero_and_returns_five_future_tokens() -> None:

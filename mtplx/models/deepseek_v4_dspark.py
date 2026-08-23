@@ -856,9 +856,10 @@ class DeepseekV4DSparkOwner:
             )
         hidden = self._mia_mhc.post(value, residual, post, comb)
         final = self.stages[-1]
-        neural_hidden = self._mia_mhc.head(hidden, final.hc_head, final.norm).reshape(
+        neural_hidden = self._mia_mhc.head(hidden, final.hc_head).reshape(
             *lead, self.args.hidden_size
         )
+        neural_hidden = final.norm(neural_hidden)
         neural_logits = lm_head(neural_hidden)
         return DSparkModelProposal(
             future_tokens=_run_greedy_future_tokens_k5(

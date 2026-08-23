@@ -1760,6 +1760,7 @@ def build_mia_engine_plan(
         "tiny_split32_fp32",
         "prefill_post_pre_bf16_mma_bm64_fp32",
         "compact_gram_finalize",
+        "head_bf16_then_rmsnorm",
     )
     mhc_installed = (
         target_mhc is not None,

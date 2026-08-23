@@ -6281,9 +6281,10 @@ class DeepseekV4Model(nn.Module):
 
     def _mia_collapse(self, h: mx.array) -> mx.array:
         lead = tuple(int(value) for value in h.shape[:-2])
-        return self._mia_mhc.head(h, self.hc_head, self.norm).reshape(
+        collapsed = self._mia_mhc.head(h, self.hc_head).reshape(
             *lead, self.args.hidden_size
         )
+        return self.norm(collapsed)
 
     def install_mia_mhc_runtime(self, *, max_tokens: int) -> None:
         from mtplx.kernels.deepseek_v4_mhc import MiaMHCPlan
