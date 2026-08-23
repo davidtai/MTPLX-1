@@ -46,6 +46,8 @@ Means are two timed arms per route; peak is the maximum timed arm.
 | 13 | + four-way GDN input projection through S=9 | 778.485 | 54.008 | 27.507 | 40.469 | **-0.9949%** | REJECTED, removed | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
+| 20 | Optimized-Speed main + retained rows 8, 10, 18 | 744.888 | 56.926 | 25.16900 | 40.497 | - | cumulative control | `chrono-r20-kv-only-history-on-r08-r10-r18-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 20 | + packed K/V-only committed-history append | 780.840 | 54.742 | 25.16900 | 39.793 | **+1.7697%** | **RETAINED** | same |
 
 Row 8's source-only four-way GDN projection fuse is separately proven a
 target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
@@ -53,7 +55,7 @@ target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
 engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
-Rows 8, 10, and 18 are therefore part of every later timed control. Row 9 regressed
+Rows 8, 10, 18, and 20 are therefore part of every later timed control. Row 9 regressed
 despite 82,880 timed kernel engagements and remains absent. Row 13 executed
 7,104 fused four-way projection calls in each timed candidate arm and was
 deterministic within route; its loss is measured, not a no-op or parity veto.
@@ -90,7 +92,7 @@ row or from the earlier bundle campaign.
 | 17 | 126 | 7.5460% | `deb63ad0d170` | `2dbcb36ee10e` | +6/-14 | ALREADY PRESENT: manifest-only switch from BF16 to Q4/group-64 proposal head. Optimized-Speed loads Q4/group-64 before every arm, and retained row 10 further reduces it to the reachable compact vocabulary. |
 | 18 | 135 | 0.4535% | `b6ce964b16bb` | `2181386c97ac` | +324/-247 | RETAINED: adaptive depth, S>=6 attention segmentation, and synthetic 512-token warming are inapplicable to fixed D3/exact 16K conditioning. The adapted per-layer input-independent `-exp(A_log)` GDN memo was exact, engaged 6,912 times per timed arm, and improved wall throughput 1.0970% on rows 8+10. |
 | 19 | 160 | 2.5391% | `1033e1ac5197` | `1a4f47311818` | +581/-97 | TARGET-SHAPE NON-TRANSFERABLE: source replaces compact projection + argmax + target-ID mapping with an argmax-only selector. The required temperature-1/top-k20 route must retain the complete sparse proposal distribution for exact speculative acceptance; substituting argmax changes the sampling law. Row 10 already retains the source's compact Q4/group-64 projection and on-device mapping. |
-| 20 | 180 | 0.9180% | `cf350293feb4` | `b9b4300e973d` | +144/-8 | PENDING |
+| 20 | 180 | 0.9180% | `cf350293feb4` | `b9b4300e973d` | +144/-8 | RETAINED: adapted to MTPLX's dead committed-history outputs by omitting Q/gate/attention/MLP for every appended row and packing the live BF16 K+V projections into one matmul. The packed path engaged 288 times per timed candidate arm over 17,125 history tokens and improved wall throughput 1.7697% on rows 8+10+18. Deterministic tie drift was allowed. |
 | 21 | 186 | 1.5222% | `4eb54489fb51` | `df0b66eded6c` | +228/-5 | PENDING |
 | 23 | 215 | 0.2964% | `df404e08fee2` | `597330a384fb` | +64/-41 | PENDING |
 | 24 | 234 | 0.9658% | `7351e62674bc` | `849631b545f2` | +54/-14 | PENDING |
