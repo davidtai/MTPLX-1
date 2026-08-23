@@ -320,6 +320,16 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "r18_gdn_decay_memo",
         "r20_kv_only_history",
     }
+    assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history+r21_qk_rms_rope"
+    ) == {
+        "r08_device_draft",
+        "r10_compact_vocab",
+        "r18_gdn_decay_memo",
+        "r20_kv_only_history",
+        "r21_qk_rms_rope",
+    }
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -349,6 +359,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "source_proposal": False,
         "row10_compact_vocab": False,
         "row18_gdn_decay_memo": False,
+        "row21_qk_rms_rope": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
@@ -432,6 +443,44 @@ def test_row20_promotion_requires_kv_only_history_engagement() -> None:
     assert gate._candidate_engagement_errors(route, [zero], []) == [
         "row 20 K/V-only history path did not execute",
         "row 20 packed K/V projection did not execute",
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
+def test_row_21_qk_fusion_extends_rows_8_10_18_and_20() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history+r21_qk_rms_rope"
+    )
+
+    options = gate._route_execution_options(route)
+
+    assert options["row21_qk_rms_rope"] is True
+    assert options["source_rows"] == (8, 10, 18, 20, 21)
+
+
+def test_row21_promotion_requires_qk_fusion_engagement() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history+r21_qk_rms_rope"
+    )
+    cumulative = {
+        "r18_gdn_decay_memo": {"memo_calls": 48},
+        "r20_kv_only_history": {"calls": 48, "packed_calls": 48},
+    }
+    zero = {
+        "route_id": route,
+        "engagement": {**cumulative, "r21_qk_rms_rope": {"calls": 0}},
+    }
+    engaged = {
+        "route_id": route,
+        "engagement": {**cumulative, "r21_qk_rms_rope": {"calls": 48}},
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 21 fused Q/K RMSNorm+RoPE did not execute"
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:
