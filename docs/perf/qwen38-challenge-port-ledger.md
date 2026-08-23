@@ -114,7 +114,11 @@ After every one of the 54 Yukon rows has a final disposition, merge the DFlash
 Qwen 3.8 target/MTP shape, stacked on every retained Yukon winner, and measured
 with the same exact 16K Python, 1,024-output, four-arm guarded gate. Its result
 gets its own receipt and metrics-table rows in this same PR; it does not replace
-or retroactively bundle any of the 54 individual decisions. The scheduled source
+or retroactively bundle any of the 54 individual decisions. Item 55 is an
+assembled DFlash stack, not a bare transplant: every retained target-side win
+stays enabled, and every retained proposer/custom-kernel win receives an
+explicit DFlash-equivalent adaptation or concrete evidence that DFlash replaces
+that surface. The scheduled source
 is the local `dflash-mlx` implementation at `54644e991039` and its declared
 `z-lab/Qwen3.8-27B-DFlash2` checkpoint snapshot `50307d4c4cde`; implementation
 will pin the complete artifact digest and geometry before the final gate rather
