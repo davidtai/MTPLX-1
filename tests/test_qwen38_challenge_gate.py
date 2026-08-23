@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 SCRIPT = Path(__file__).parents[1] / "scripts/qwen38_challenge_port_gate.py"
 
 
@@ -241,3 +243,14 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
 
     assert gate._validate_route_id("control") == {"control"}
     assert gate._validate_route_id("kv_only_history") == {"kv_only_history"}
+    assert gate._validate_route_id("packed_qkv") == {"packed_qkv"}
+    assert gate._validate_route_id(
+        "packed_qkv+gdn_projection_pairs+kv_only_history"
+    ) == {"packed_qkv", "gdn_projection_pairs", "kv_only_history"}
+
+
+def test_route_validation_rejects_control_combinations() -> None:
+    gate = _module()
+
+    with pytest.raises(ValueError, match="control cannot be combined"):
+        gate._validate_route_id("control+packed_qkv")

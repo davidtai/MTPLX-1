@@ -136,13 +136,41 @@ def _correctness_summary(
 
 def _validate_route_id(route_id: str) -> set[str]:
     features = {item for item in route_id.split("+") if item}
-    allowed = {"control", "kv_only_history"}
+    allowed = {
+        "control",
+        "packed_qkv",
+        "gdn_projection_pairs",
+        "kv_only_history",
+    }
     unknown = features - allowed
     if not features or unknown:
         raise ValueError(f"unknown route features: {sorted(unknown)}")
     if "control" in features and len(features) != 1:
         raise ValueError("control cannot be combined with candidate features")
     return features
+
+
+def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
+    from mtplx.gdn_capture import GDN_PROJECTION_COUNTERS
+    from mtplx.packed_concats import COUNTERS as PACKED_CONCAT_COUNTERS
+
+    return {
+        "packed_qkv": dict(PACKED_CONCAT_COUNTERS),
+        "gdn_projection_pairs": dict(GDN_PROJECTION_COUNTERS),
+    }
+
+
+def _counter_delta(
+    before: dict[str, dict[str, int]],
+    after: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int]]:
+    return {
+        family: {
+            key: int(value) - int(before.get(family, {}).get(key, 0))
+            for key, value in values.items()
+        }
+        for family, values in after.items()
+    }
 
 
 def _load_optimized_speed_stack(
@@ -236,12 +264,15 @@ def _run_arm(
     from mtplx.qwen38_challenge import install_qwen38_route
     from mtplx.sampling import SamplerConfig
 
-    cache_route = "kv_only_history" if route_id == "kv_only_history" else "control"
+    features = _validate_route_id(route_id)
+    cache_route = "kv_only_history" if "kv_only_history" in features else "control"
     route = install_qwen38_route(
         runtime,
         config,
         model_path,
         cache_route=cache_route,
+        packed_qkv="packed_qkv" in features,
+        gdn_projection_pairs="gdn_projection_pairs" in features,
     )
     target_sampler = SamplerConfig(
         temperature=target_temperature,
@@ -253,6 +284,7 @@ def _run_arm(
         top_p=0.95,
         top_k=20,
     )
+    counters_before = _projection_counter_snapshot()
     mx.reset_peak_memory()
     started = time.perf_counter()
     output = generate_mtpk(
@@ -270,14 +302,20 @@ def _run_arm(
         mtp_history_policy="committed",
     )
     wall_s = time.perf_counter() - started
+    counters_after = _projection_counter_snapshot()
     stats = output.stats
     return {
         **_generation_metrics(stats),
         "route_id": route_id,
+        "installed_route_id": route.route_id,
         "route_fingerprint": hashlib.sha256(
             f"{route.fingerprint}:{route_id}".encode()
         ).hexdigest(),
         "kernel_ids": list(route.kernel_ids),
+        "feature_receipt": dict(
+            getattr(runtime, "qwen38_feature_receipt", {}) or {}
+        ),
+        "engagement": _counter_delta(counters_before, counters_after),
         "wall_s": wall_s,
         "generated_tokens": int(stats.generated_tokens),
         "prompt_mtp_history_time_s": float(stats.prompt_mtp_history_time_s),
@@ -325,11 +363,18 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     model_path = args.model.expanduser().resolve()
-    lock_handle = args.lock.open("a+")
-    try:
-        fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        raise RuntimeError(f"GPU lock is busy: {args.lock}") from exc
+    from scripts.qwen35b_mtp_batch_numerics_attribution import (
+        _verify_parent_guard_attestation,
+    )
+
+    guarded_by_parent = _verify_parent_guard_attestation(args.lock)
+    lock_handle = None
+    if not guarded_by_parent:
+        lock_handle = args.lock.open("a+")
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(f"GPU lock is busy: {args.lock}") from exc
 
     from mtplx.backends.registry import load_runtime_contract
 
@@ -453,6 +498,7 @@ def main() -> int:
         "draft_temperature": draft_temperature,
         "optimized_speed_stack": optimized_stack,
         "order": order,
+        "gpu_lock_scope": "attested_parent" if guarded_by_parent else "direct",
         "platform": platform.platform(),
         "python": platform.python_version(),
         "mlx_version": importlib.metadata.version("mlx"),

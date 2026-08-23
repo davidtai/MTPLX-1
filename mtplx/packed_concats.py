@@ -138,10 +138,21 @@ def _fused_forward(payload: dict[str, Any], x: mx.array) -> list[mx.array]:
     return [mx.contiguous(t) for t in mx.split(out, payload["splits"], axis=-1)]
 
 
-def install_qwen3_next_packed_concats(model: Any) -> dict[str, int] | None:
-    """Fuse attention q|k|v and MLP gate|up on every stock decoder layer."""
+def install_qwen3_next_packed_concats(
+    model: Any,
+    *,
+    force: bool = False,
+    attention: bool = True,
+    mlp: bool = True,
+) -> dict[str, int] | None:
+    """Fuse selected projection families on every stock decoder layer.
 
-    if not enabled():
+    ``force`` exists for an explicitly measured model route.  Normal serving
+    keeps the historical environment opt-in, while the Qwen 3.8 challenge gate
+    can install only packed attention Q/K/V without also changing the MLP.
+    """
+
+    if not force and not enabled():
         return None
     from mlx_lm.models import qwen3_next as qn
 
@@ -156,7 +167,8 @@ def install_qwen3_next_packed_concats(model: Any) -> dict[str, int] | None:
 
         def attention_call_packed(self, x, mask=None, cache=None):
             payload = getattr(self, "_mtplx_fused_qkv", None)
-            if payload is None or x.shape[1] > max_s:
+            active = bool(getattr(self, "_mtplx_fused_qkv_active", True))
+            if not active or payload is None or x.shape[1] > max_s:
                 return attention_call(self, x, mask=mask, cache=cache)
             COUNTERS["fused_attention_calls"] += 1
             # Tail replicated verbatim from the stock forward (qwen3_next
@@ -208,7 +220,7 @@ def install_qwen3_next_packed_concats(model: Any) -> dict[str, int] | None:
     layers = getattr(inner, "layers", None) or []
     for layer in layers:
         attn = getattr(layer, "self_attn", None)
-        if isinstance(attn, attention_class) and not hasattr(
+        if attention and isinstance(attn, attention_class) and not hasattr(
             attn, "_mtplx_fused_qkv"
         ):
             payload = _pack([attn.q_proj, attn.k_proj, attn.v_proj])
@@ -218,7 +230,9 @@ def install_qwen3_next_packed_concats(model: Any) -> dict[str, int] | None:
             else:
                 COUNTERS["skipped_modules"] += 1
         mlp = getattr(layer, "mlp", None)
-        if isinstance(mlp, mlp_class) and not hasattr(mlp, "_mtplx_fused_gate_up"):
+        if mlp and isinstance(mlp, mlp_class) and not hasattr(
+            mlp, "_mtplx_fused_gate_up"
+        ):
             payload = _pack([mlp.gate_proj, mlp.up_proj])
             if payload is not None:
                 mlp._mtplx_fused_gate_up = payload
@@ -238,3 +252,40 @@ def install_qwen3_next_packed_concats(model: Any) -> dict[str, int] | None:
         atexit.register(_dump)
         install_qwen3_next_packed_concats._receipt_registered = True
     return dict(COUNTERS)
+
+
+def configure_qwen3_next_packed_qkv(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, int]:
+    """Install/materialize and toggle the attention-only packed-QKV route."""
+
+    if active:
+        install_qwen3_next_packed_concats(
+            model,
+            force=True,
+            attention=True,
+            mlp=False,
+        )
+
+    from mlx_lm.models import qwen3_next as qn
+
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", text_model)
+    layers = getattr(inner, "layers", None) or []
+    configured = 0
+    active_modules = 0
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if not isinstance(attn, qn.Qwen3NextAttention):
+            continue
+        if hasattr(attn, "_mtplx_fused_qkv"):
+            configured += 1
+        enabled_for_module = bool(active and hasattr(attn, "_mtplx_fused_qkv"))
+        attn._mtplx_fused_qkv_active = enabled_for_module
+        active_modules += int(enabled_for_module)
+    return {
+        "configured_modules": configured,
+        "active_modules": active_modules,
+    }

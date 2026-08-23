@@ -14,6 +14,13 @@ import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
+GDN_PROJECTION_COUNTERS: dict[str, int] = {
+    "configured_modules": 0,
+    "fused_pair_calls": 0,
+    "four_to_one_calls": 0,
+    "stock_calls": 0,
+}
+
 # One-time warning latch for an explicitly requested but unavailable
 # headquarter tape kernel (PR #209 review edit).
 _HEADQUARTER_IMPORT_WARNED = False
@@ -1563,16 +1570,9 @@ def _fused_quantized_pair(
     left: nn.QuantizedLinear,
     right: nn.QuantizedLinear,
 ) -> tuple[mx.array, mx.array] | None:
-    if not _matching_quantized_linears(left, right):
-        return None
-    cached = getattr(owner, cache_name, None)
+    cached = _prepare_quantized_pair(owner, cache_name, left, right)
     if cached is None:
-        weight = mx.concatenate([left.weight, right.weight], axis=0)
-        scales = mx.concatenate([left.scales, right.scales], axis=0)
-        biases = mx.concatenate([left.biases, right.biases], axis=0)
-        mx.eval(weight, scales, biases)
-        cached = (weight, scales, biases, int(left.weight.shape[0]))
-        setattr(owner, cache_name, cached)
+        return None
     weight, scales, biases, split_at = cached
     out = mx.quantized_matmul(
         inputs,
@@ -1586,6 +1586,27 @@ def _fused_quantized_pair(
     )
     left_out, right_out = mx.split(out, [int(split_at)], axis=-1)
     return left_out, right_out
+
+
+def _prepare_quantized_pair(
+    owner: Any,
+    cache_name: str,
+    left: nn.QuantizedLinear,
+    right: nn.QuantizedLinear,
+) -> tuple[mx.array, mx.array, mx.array, int] | None:
+    """Materialize one compatible packed pair outside a timed generation."""
+
+    if not _matching_quantized_linears(left, right):
+        return None
+    cached = getattr(owner, cache_name, None)
+    if cached is None:
+        weight = mx.concatenate([left.weight, right.weight], axis=0)
+        scales = mx.concatenate([left.scales, right.scales], axis=0)
+        biases = mx.concatenate([left.biases, right.biases], axis=0)
+        mx.eval(weight, scales, biases)
+        cached = (weight, scales, biases, int(left.weight.shape[0]))
+        setattr(owner, cache_name, cached)
+    return cached
 
 
 def _fused_quantized_many(
@@ -1632,7 +1653,12 @@ def _fused_quantized_many(
 def _gdn_input_projections(
     gdn: Any, inputs: mx.array
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
-    fuse_mode = os.environ.get("MTPLX_FUSE_GDN_PROJECTIONS", "").lower()
+    route_mode = getattr(gdn, "_mtplx_gdn_projection_mode", None)
+    fuse_mode = str(
+        os.environ.get("MTPLX_FUSE_GDN_PROJECTIONS", "")
+        if route_mode is None
+        else route_mode
+    ).lower()
     if fuse_mode in {"all", "4to1", "one"}:
         fused = _fused_quantized_many(
             gdn,
@@ -1641,6 +1667,7 @@ def _gdn_input_projections(
             (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
         )
         if fused is not None:
+            GDN_PROJECTION_COUNTERS["four_to_one_calls"] += 1
             qkv, z, b, a = fused
             return qkv, z, b, a
     if fuse_mode in {"1", "true", "yes", "on"}:
@@ -1659,15 +1686,67 @@ def _gdn_input_projections(
             gdn.in_proj_a,
         )
         if qkvz is not None and ba is not None:
+            GDN_PROJECTION_COUNTERS["fused_pair_calls"] += 1
             qkv, z = qkvz
             b, a = ba
             return qkv, z, b, a
+    GDN_PROJECTION_COUNTERS["stock_calls"] += 1
     return (
         gdn.in_proj_qkv(inputs),
         gdn.in_proj_z(inputs),
         gdn.in_proj_b(inputs),
         gdn.in_proj_a(inputs),
     )
+
+
+def configure_qwen3_next_gdn_projection_pairs(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, int]:
+    """Materialize and toggle the source-faithful QKV+Z and B+A pairs."""
+
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", text_model)
+    layers = getattr(inner, "layers", None) or []
+    configured = 0
+    active_modules = 0
+    for layer in layers:
+        gdn = getattr(layer, "linear_attn", None)
+        required = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        if gdn is None or any(not hasattr(gdn, name) for name in required):
+            continue
+        if active:
+            ready = bool(
+                _prepare_quantized_pair(
+                    gdn,
+                    "_mtplx_fused_qkvz",
+                    gdn.in_proj_qkv,
+                    gdn.in_proj_z,
+                )
+                is not None
+                and _prepare_quantized_pair(
+                    gdn,
+                    "_mtplx_fused_ba",
+                    gdn.in_proj_b,
+                    gdn.in_proj_a,
+                )
+                is not None
+            )
+        else:
+            ready = bool(
+                hasattr(gdn, "_mtplx_fused_qkvz")
+                and hasattr(gdn, "_mtplx_fused_ba")
+            )
+        configured += int(ready)
+        enabled_for_module = bool(active and ready)
+        gdn._mtplx_gdn_projection_mode = "1" if enabled_for_module else "off"
+        active_modules += int(enabled_for_module)
+    GDN_PROJECTION_COUNTERS["configured_modules"] = configured
+    return {
+        "configured_modules": configured,
+        "active_modules": active_modules,
+    }
 
 
 def _stock_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, gdn: Any):

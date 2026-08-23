@@ -11,6 +11,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from .gdn_capture import configure_qwen3_next_gdn_projection_pairs
+from .packed_concats import configure_qwen3_next_packed_qkv
+
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
     0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22,
     24, 25, 26, 28, 29, 30, 32, 33, 34, 36, 37, 38, 40, 41, 42, 44, 45,
@@ -300,6 +303,8 @@ def install_qwen38_route(
     model_path: Path,
     *,
     cache_route: str = DEFAULT_QWEN38_CACHE_ROUTE,
+    packed_qkv: bool = False,
+    gdn_projection_pairs: bool = False,
 ) -> Qwen38RouteSpec | None:
     if not is_qwen38_27b_candidate(config, model_path):
         return None
@@ -307,7 +312,36 @@ def install_qwen38_route(
         return None
     cache_route_id = str(cache_route or "control").strip().lower()
     bindings = control_bindings(runtime)
-    kernel_ids: tuple[str, ...] = ()
+    kernel_ids: list[str] = []
+    route_features: list[str] = []
+    feature_receipt: dict[str, dict[str, int]] = {}
+
+    packed_report = configure_qwen3_next_packed_qkv(
+        runtime.model,
+        active=bool(packed_qkv),
+    )
+    if packed_qkv:
+        if int(packed_report.get("active_modules", 0)) <= 0:
+            raise Qwen38ContractError(
+                "Qwen 3.8 packed-QKV route did not configure any attention modules"
+            )
+        route_features.append("packed_qkv")
+        kernel_ids.append("qwen38_attention_packed_qkv_s_le16_v1")
+        feature_receipt["packed_qkv"] = packed_report
+
+    gdn_report = configure_qwen3_next_gdn_projection_pairs(
+        runtime.model,
+        active=bool(gdn_projection_pairs),
+    )
+    if gdn_projection_pairs:
+        if int(gdn_report.get("active_modules", 0)) <= 0:
+            raise Qwen38ContractError(
+                "Qwen 3.8 fused-GDN-pairs route did not configure any GDN modules"
+            )
+        route_features.append("gdn_projection_pairs")
+        kernel_ids.append("qwen38_gdn_projection_pairs_v1")
+        feature_receipt["gdn_projection_pairs"] = gdn_report
+
     selfcheck_status = "control"
     min_context_tokens = 0
     if cache_route_id == "kv_only_history":
@@ -321,7 +355,8 @@ def install_qwen38_route(
                 "Qwen 3.8 K/V-only history route is unavailable on the loaded model"
             )
         bindings = replace(bindings, mtp_cache_append=implementation)
-        kernel_ids = ("qwen38_mtp_kv_only_history_ge16384_v1",)
+        route_features.append("kv_only_history")
+        kernel_ids.append("qwen38_mtp_kv_only_history_ge16384_v1")
         min_context_tokens = QWEN38_KV_ONLY_MIN_CONTEXT
         selfcheck_status = "passed:python16384:conditioned_abba"
     elif cache_route_id != "control":
@@ -329,16 +364,18 @@ def install_qwen38_route(
             f"unknown Qwen 3.8 cache route: {cache_route!r}"
         )
 
+    route_id = "+".join(route_features) if route_features else "control"
     route = build_qwen38_route(
         config,
         model_path,
         bindings=bindings,
-        route_id=cache_route_id,
-        kernel_ids=kernel_ids,
+        route_id=route_id,
+        kernel_ids=tuple(kernel_ids),
         min_context_tokens=min_context_tokens,
         selfcheck_status=selfcheck_status,
     )
     runtime.qwen38_route = route
+    runtime.qwen38_feature_receipt = feature_receipt
     return route
 
 
