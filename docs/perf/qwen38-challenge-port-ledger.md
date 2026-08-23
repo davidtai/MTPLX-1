@@ -24,7 +24,7 @@ rows are dependencies only when a surviving final mechanism requires them.
 
 | Candidate | Historical rows | Initial disposition | MTPLX gate | Receipt | Final status |
 | --- | --- | --- | --- | --- | --- |
-| Exact target top-2/readout reuse | 5, 6 | PORT | pending | pending | pending |
+| Exact target top-2/readout reuse | 5, 6 | CHALLENGE-ONLY after MTPLX call-path inspection | no target top-2 consumer; port would add two dispatches | source PRs #29/#37 and `generation.py` argmax sites | SKIP |
 | Compact Q2 coarse/Q4 rerank proposal head | 10, 42, 46, 47, 67, 69, 71, 79, 82 | PORT plus row 46 dependency | pending | pending | pending |
 | Final cross-row affine-4/group-64 QMV | 19, 34, 36, 39, 40, 41, 70, 78, 80 | PORT/dependency as one final family | pending | pending | pending |
 | Projection/GDN/attention/norm fusions | 3, 13, 16, 18, 21, 30, 45, 60, 61 | PORT as final retained forms | pending | pending | pending |
@@ -41,8 +41,9 @@ rows are dependencies only when a surviving final mechanism requires them.
   no-op/noise rows have no performance claim.
 - **SUPERSEDED:** nine historical mechanisms are represented only by their
   surviving descendants or are omitted after an accepted reversal.
-- **CHALLENGE-ONLY:** Swift worker plumbing, declared-head staging, and Metal
-  command-buffer/residency policy do not map to the Python MTPLX runtime.
+- **CHALLENGE-ONLY:** Swift worker plumbing, declared-head staging, Metal
+  command-buffer/residency policy, and the trusted worker's required target
+  top-2 ledger do not map to the Python MTPLX runtime.
 - **DEPENDENCY:** seven below-threshold or intermediate rows may inform a final
   candidate but receive neither an independent port nor an independent win.
 

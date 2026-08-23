@@ -10,7 +10,7 @@ optimizations into MTPLX, retain only independently verified MTPLX wins, and
 open one PR from `perf/qwen38-challenge-port` to `youssofal/MTPLX:main`.
 
 **Architecture:** Add a construction-selected Qwen 3.8 optimization lane that
-binds immutable proposal, target-readout, QMV, projection, cache-append, and
+binds immutable proposal, QMV, projection, cache-append, and
 policy callables after validating the real model contract. Reuse MTPLX's
 existing committed history, capture/commit verification, NAX/compiled verify,
 session identity, and adaptive-policy infrastructure. Every candidate has an
@@ -48,15 +48,15 @@ per-token feature eligibility checks or silent fallback.
 
 - Create `mtplx/qwen38_challenge.py`: exact model-contract validation,
   immutable route specification, installer, route fingerprint, and counters.
-- Create `mtplx/qwen38_challenge_kernels.py`: target top-2, final wide QMV,
-  compact selector, projection, GDN, RMSNorm, and attention kernels that earn
+- Create `mtplx/qwen38_challenge_kernels.py`: final wide QMV, compact selector,
+  projection, GDN, RMSNorm, and attention kernels that earn
   promotion.
 - Create `mtplx/qwen38_compact_head.py`: compact-vocabulary manifest loading,
   cluster mapping, coarse selection, exact reranking, and proposal-only API.
 - Modify `mtplx/qwen3_5_mtp_patch.py`: Qwen 3.8 K/V-only MTP cache update and
   construction-bound optimized MTP methods.
 - Modify `mtplx/runtime.py`: install and expose the immutable Qwen 3.8 route.
-- Modify `mtplx/generation.py`: consume bound readout/cache/policy callables;
+- Modify `mtplx/generation.py`: consume bound proposal/cache/policy callables;
   preserve existing history and rollback contracts.
 - Modify `mtplx/nax_verify.py`: compose, rather than conflict, with promoted
   width routes.
@@ -176,7 +176,7 @@ Cover:
 
 - [x] **Step 3: Implement the route dataclass and installer**
 
-The bound spec contains callables for target readout, proposal readout, QMV
+The bound spec contains callables for proposal readout, QMV
 widths, MTP cache append, projection fusions, and policy selection. Missing
 promoted callables fail construction for the candidate route. The unchanged
 route binds current MTPLX functions directly.
@@ -201,62 +201,30 @@ git add mtplx/qwen38_challenge.py mtplx/runtime.py mtplx/session_bank.py \
 git commit -m "Add Qwen 3.8 optimization route contract"
 ```
 
-## Task 3: Port exact hierarchical target top-2 readout
+## Task 3: Close hierarchical target top-2 as non-transferable
 
 **Source rows:** 5 and 6.
 
-**Files:**
+The source win removed duplicate work only because the trusted challenge worker
+was required to materialize a per-row target top-2 ledger. MTPLX's production
+greedy verifier consumes one target argmax and has no target top-2 consumer.
+Porting the two-stage reducer would therefore add two dispatches instead of
+removing work.
 
-- Create: `mtplx/qwen38_challenge_kernels.py`
-- Create: `tests/test_qwen38_challenge_kernels.py`
-- Modify: `mtplx/qwen38_challenge.py`
-- Modify: `mtplx/generation.py`
-- Modify: `mtplx/kernel_selfcheck.py`
+- [x] **Step 1: Inspect the exact source dependency**
 
-- [ ] **Step 1: Write failing exact-order tests**
+Confirmed PR #29 introduced mandatory hierarchical target top-2 production and
+PR #37 reused its first ID in place of a separate target argmax.
 
-Compare the candidate against the existing MLX target readout for M=1..9 and
-the real vocabulary width. Include random rows, exact ties, signed zero, NaN,
-positive/negative infinity, boundary token IDs, and repeated maxima. Assert
-top-1/top-2 IDs and values, row ordering, and the reuse of top-1 as argmax.
+- [x] **Step 2: Inspect the current MTPLX target acceptance path**
 
-- [ ] **Step 2: Confirm the tests fail before the kernel exists**
+Confirmed `generation.py` computes a single target `mx.argmax`; no target
+top-2 values or IDs are consumed by generation, history, policy, or receipts.
 
-```bash
-"$PY" -m pytest -q tests/test_qwen38_challenge_kernels.py \
-  -k 'top_two or target_argmax'
-```
+- [x] **Step 3: Record the source rows as challenge-only**
 
-- [ ] **Step 3: Implement and construction-bind the two-stage reducer**
-
-Use disjoint vocabulary stripes followed by one exact merge. Bind only after
-self-check. Remove duplicate target argmax work only in the candidate route.
-
-- [ ] **Step 4: Run exactness and one-cycle gates**
-
-```bash
-"$PY" -m pytest -q \
-  tests/test_qwen38_challenge_kernels.py \
-  tests/test_qwen38_challenge_generation.py \
-  tests/test_greedy_draft_coupling.py
-```
-
-Acquire the GPU lock, then run the readout-only control/candidate microbench and
-one 64-token exact-output bracket. Reject and remove the candidate on parity
-failure or regression.
-
-- [ ] **Step 5: Commit only if retained**
-
-```bash
-git add mtplx/qwen38_challenge_kernels.py mtplx/qwen38_challenge.py \
-  mtplx/generation.py mtplx/kernel_selfcheck.py \
-  tests/test_qwen38_challenge_kernels.py \
-  tests/test_qwen38_challenge_generation.py \
-  docs/perf/qwen38-challenge-port-ledger.md
-git commit -m "Add exact Qwen 3.8 target top-two readout"
-```
-
-If rejected, update only the ledger and receipt with the result.
+Mark rows 5 and 6 `CHALLENGE-ONLY` / `SKIP`. Do not add a kernel, dispatch,
+feature flag, test-only implementation, or performance claim.
 
 ## Task 4: Remove the discarded vocabulary projection from MTP history append
 

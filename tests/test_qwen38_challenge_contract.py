@@ -88,7 +88,6 @@ def _callable(*args, **kwargs):
 
 def _bindings() -> Qwen38RouteBindings:
     return Qwen38RouteBindings(
-        target_readout=_callable,
         proposal_readout=_callable,
         qmv_by_width={width: _callable for width in range(2, 10)},
         mtp_cache_append=_callable,

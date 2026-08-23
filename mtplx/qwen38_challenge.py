@@ -90,7 +90,6 @@ class Qwen38ModelContract:
 
 @dataclass(frozen=True)
 class Qwen38RouteBindings:
-    target_readout: Callable[..., Any]
     proposal_readout: Callable[..., Any]
     qmv_by_width: Mapping[int, Callable[..., Any]]
     mtp_cache_append: Callable[..., Any]
@@ -300,7 +299,6 @@ def validate_qwen38_27b_contract(
 
 def _validate_bindings(bindings: Qwen38RouteBindings, route_id: str) -> None:
     for name in (
-        "target_readout",
         "proposal_readout",
         "mtp_cache_append",
         "policy_factory",
@@ -347,12 +345,6 @@ def build_qwen38_route(
     )
 
 
-def _stock_target_readout(logits: Any) -> Any:
-    import mlx.core as mx
-
-    return mx.topk(logits, k=2)
-
-
 def _stock_proposal_readout(logits: Any) -> Any:
     import mlx.core as mx
 
@@ -375,7 +367,6 @@ def _stock_policy_factory(factory: Callable[..., Any], *args: Any, **kwargs: Any
 
 def control_bindings(runtime: Any) -> Qwen38RouteBindings:
     return Qwen38RouteBindings(
-        target_readout=_stock_target_readout,
         proposal_readout=_stock_proposal_readout,
         qmv_by_width={width: _stock_qmv for width in QWEN38_QMV_WIDTHS},
         mtp_cache_append=runtime.update_mtp_cache,

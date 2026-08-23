@@ -58,14 +58,17 @@ The implementation is organized around final mechanisms, not 54 historical
 patches. Historical submissions that converge on one final mechanism share one
 candidate and one MTPLX A/B gate.
 
-### 1. Exact target readout
+### 1. Exact target readout — closed as non-transferable
 
-Port the hierarchical two-stage top-2 reduction and reuse its first token as
-the target argmax. Preserve value-descending, token-ID-ascending exact-tie
-ordering and NaN-last behavior. Replace duplicate full-vocabulary reductions
-only after output equivalence is proven for every routed row width.
-
-Sources: submissions 5 and 6 (PRs #29 and #37).
+Do not port the hierarchical two-stage top-2 reduction. Challenge PR #29 won
+because the trusted worker was required to materialize target top-2 values for
+every row; PR #37 then reused top-1 and removed a second vocabulary-wide
+argmax. MTPLX's production verifier has no target top-2 ledger consumer and
+already launches only the target argmax. Adding the two-stage reducer would add
+two Metal dispatches without removing duplicate work. MTPLX's existing
+experimental dense-logit top-k kernel is likewise not routed on this greedy
+target path. Rows 5 and 6 therefore remain qualifying source results but are
+skipped as challenge-only work-binding optimizations.
 
 ### 2. Compact proposal head
 
@@ -162,8 +165,8 @@ the challenge bootstrap and has no preceding Yukon row.
 | 2 | 13 | 23.2995% | Infrastructure resubmission | CHALLENGE-ONLY |
 | 3 | 18 | 1.5662% | Fused affine-4 Q/K/V | PORT, fusion set |
 | 4 | 24 | 1.2868% | K=1 fused verify/lazy boundary | ALREADY in generalized MTPLX verify |
-| 5 | 29 | 6.7162% | Hierarchical exact top-2 | PORT, readout set |
-| 6 | 37 | 1.7673% | Reuse top-2 top-1 as argmax | PORT, readout set |
+| 5 | 29 | 6.7162% | Hierarchical exact top-2 | CHALLENGE-ONLY; MTPLX has no target top-2 ledger |
+| 6 | 37 | 1.7673% | Reuse top-2 top-1 as argmax | CHALLENGE-ONLY; MTPLX has no duplicate target argmax |
 | 7 | 38 | 20.4283% | Committed MTP-head history | ALREADY |
 | 8 | 41 | 17.9183% | History/single-sync/fusions/checkpoints/depth bundle | ALREADY for history, sync, checkpoints; fusions tracked separately |
 | 9 | 55 | 6.8764% | Paired affine QMV | SUPERSEDED by final cross-row family |
