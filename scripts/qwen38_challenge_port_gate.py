@@ -143,6 +143,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "kv_only_history",
         "dual_norm",
         "qmv_final",
+        "source_proposal",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -159,12 +160,14 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         qwen38_dual_norm_counter_snapshot,
         qwen38_qmv_counter_snapshot,
     )
+    from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
 
     return {
         "packed_qkv": dict(PACKED_CONCAT_COUNTERS),
         "gdn_projection_pairs": dict(GDN_PROJECTION_COUNTERS),
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
         "qmv_final": qwen38_qmv_counter_snapshot(),
+        "source_proposal": qwen38_source_counter_snapshot(),
     }
 
 
@@ -265,6 +268,7 @@ def _run_arm(
     seed: int,
     target_temperature: float,
     draft_temperature: float,
+    source_artifact_path: Path | None,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -283,6 +287,8 @@ def _run_arm(
         gdn_projection_pairs="gdn_projection_pairs" in features,
         dual_norm="dual_norm" in features,
         qmv_final="qmv_final" in features,
+        source_proposal="source_proposal" in features,
+        source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(
         temperature=target_temperature,
@@ -359,6 +365,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--control-route")
     parser.add_argument("--candidate-route")
+    parser.add_argument("--source-artifact", type=Path)
     parser.add_argument(
         "--warmup-tokens",
         type=int,
@@ -438,6 +445,7 @@ def main() -> int:
             seed=args.seed,
             target_temperature=args.target_temperature,
             draft_temperature=draft_temperature,
+            source_artifact_path=args.source_artifact,
         )
         for route_id in unique_routes
     ]
@@ -452,6 +460,7 @@ def main() -> int:
             seed=args.seed,
             target_temperature=args.target_temperature,
             draft_temperature=draft_temperature,
+            source_artifact_path=args.source_artifact,
         )
         for route_id in order
     ]

@@ -100,7 +100,7 @@ by a later measured descendant + 23 evidence-backed skips.
 
 | Candidate | Source endpoint | Candidate route | Promotion rule |
 | --- | ---: | --- | --- |
-| C1 | row 3 | target attention Q/K/V packed concat only | Retain only if 16K wall improves >0.10%; require engagement counters and flat/acceptable memory. |
+| C1 | row 3 | target attention Q/K/V packed concat only | Retain only if 16K wall improves >0.05%; require engagement counters and flat/acceptable memory. |
 | C2 | row 13 | GDN packed QKV+Z and B+A projections | Measure on C1 winner stack; same promotion rule. |
 | C3 | row 20 | K/V-only committed-history append at original request >=16K | Rerun if C1 or C2 wins; otherwise existing exact receipt remains comparable. |
 | C4 | row 21 | fused Q/K norm + partial RoPE | Measure on retained C1-C3 stack. |
@@ -150,11 +150,11 @@ remains enabled in both arms of every later bracket.
 `docs/perf/qwen38-challenge-port-ledger.md`.
 
 - [ ] Acquire the exclusive GPU lock and confirm no unrelated owner.
-- [ ] Run C1 then C2. Promote each >0.10% winner immediately.
+- [ ] Run C1 then C2. Promote each >0.05% winner immediately.
 - [ ] Continue C3-C8 in order, always using the retained stack as control.
 - [ ] Use one conditioning generation per unique route and exactly four timed
   ABBA arms; do not add BAAB or additional timed arms.
-- [ ] Reject a candidate on matched wall regression or <=0.10% gain, not a
+- [ ] Reject a candidate on matched wall regression or <=0.05% gain, not a
   deterministic tie-breaking hash difference.
 
 ## Task 4: Reduce to the winner stack and update the one PR

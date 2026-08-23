@@ -14,6 +14,7 @@ from typing import Any
 from .gdn_capture import configure_qwen3_next_gdn_projection_pairs
 from .packed_concats import configure_qwen3_next_packed_qkv
 from .qwen38_challenge_kernels import configure_qwen38_final_qmv
+from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
     0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22,
@@ -312,6 +313,8 @@ def install_qwen38_route(
     gdn_projection_pairs: bool = False,
     dual_norm: bool = False,
     qmv_final: bool = False,
+    source_proposal: bool = False,
+    source_artifact_path: Path | None = None,
 ) -> Qwen38RouteSpec | None:
     if not is_qwen38_27b_candidate(config, model_path):
         return None
@@ -388,6 +391,23 @@ def install_qwen38_route(
             "active": int(bool(qmv_report.get("active"))),
             "installed": int(bool(qmv_report.get("installed"))),
         }
+
+    source_report = configure_qwen38_source_proposal(
+        runtime,
+        active=bool(source_proposal),
+        artifact_path=source_artifact_path,
+    )
+    if source_proposal:
+        if not bool(source_report.get("installed")):
+            raise Qwen38ContractError("Qwen 3.8 source proposal route was not installed")
+        route_features.append("source_proposal")
+        kernel_ids.extend(
+            (
+                "qwen38_source_q4_g64_bf16_qkv_islands_v1",
+                "qwen38_source_q2_top32_q4_rerank_v1",
+            )
+        )
+        feature_receipt["source_proposal"] = source_report
 
     route_id = "+".join(route_features) if route_features else "control"
     route = build_qwen38_route(

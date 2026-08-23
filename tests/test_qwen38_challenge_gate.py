@@ -250,6 +250,14 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     assert gate._validate_route_id(
         "kv_only_history+dual_norm+qmv_final"
     ) == {"kv_only_history", "dual_norm", "qmv_final"}
+    assert gate._validate_route_id(
+        "kv_only_history+dual_norm+qmv_final+source_proposal"
+    ) == {
+        "kv_only_history",
+        "dual_norm",
+        "qmv_final",
+        "source_proposal",
+    }
 
 
 def test_route_validation_rejects_control_combinations() -> None:
