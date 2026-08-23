@@ -725,6 +725,12 @@ def _draft_head_identity(runtime: Any) -> str | None:
     return h.hexdigest()[:16]
 
 
+def _qwen38_challenge_route_payload(runtime: Any) -> dict[str, Any] | None:
+    from mtplx.qwen38_challenge import qwen38_route_receipt
+
+    return qwen38_route_receipt(getattr(runtime, "qwen38_route", None))
+
+
 def _mlx_runtime_status() -> dict[str, Any]:
     """Report which MLX runtime the daemon imported.
 
@@ -16932,7 +16938,12 @@ def _policy_fingerprint(
         )
     if normalized_cache_scope and normalized_cache_scope != "stable":
         parts.append(f"cache_scope={normalized_cache_scope}")
-    return ";".join(parts)
+    from mtplx.qwen38_challenge import policy_fingerprint_with_qwen38_route
+
+    return policy_fingerprint_with_qwen38_route(
+        ";".join(parts),
+        getattr(getattr(state, "runtime", None), "qwen38_route", None),
+    )
 
 
 def _session_cache_scope_for_request(
@@ -20650,6 +20661,9 @@ def _run_generation(
             completion_tokens=completion_tokens,
             elapsed_s=elapsed_s,
         )
+        qwen38_route = _qwen38_challenge_route_payload(state.runtime)
+        if qwen38_route is not None:
+            stats["qwen38_challenge_route"] = qwen38_route
         if effective_mode == "mtp":
             stats["requested_speculative_depth"] = int(requested_depth)
         if session_bank is not None:
@@ -25040,6 +25054,7 @@ def create_app(state: ServerState) -> FastAPI:
             "paged_kv_quantization": _effective_paged_kv_quantization(),
             "paged_kv_quantization_detail": _paged_kv_quantization_detail(),
             "kernel_selfcheck": _kernel_selfcheck_health_payload(),
+            "qwen38_challenge_route": _qwen38_challenge_route_payload(runtime),
             "rate_limit_per_minute": int(state.args.rate_limit),
             "stream_interval": int(state.args.stream_interval),
             "warmup": state.warmup_status,

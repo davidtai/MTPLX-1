@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+    from .qwen38_challenge import Qwen38RouteSpec
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -97,6 +98,7 @@ class MTPLXRuntime:
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
+    qwen38_route: Qwen38RouteSpec | None = None
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,
@@ -946,6 +948,16 @@ def load(
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
     )
+    from .qwen38_challenge import install_qwen38_control_route
+
+    qwen38_route = install_qwen38_control_route(runtime, config, path)
+    if qwen38_route is not None:
+        logger.info(
+            "[qwen38-challenge] route=%s fingerprint=%s selfcheck=%s",
+            qwen38_route.route_id,
+            qwen38_route.fingerprint,
+            qwen38_route.selfcheck_status,
+        )
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError

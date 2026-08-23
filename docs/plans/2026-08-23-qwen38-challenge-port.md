@@ -153,7 +153,7 @@ git commit -m "Document Qwen 3.8 challenge port inventory"
 **Does not cover:** The control route remains behavior-identical and no new
 kernel is available yet.
 
-- [ ] **Step 1: Write failing construction and identity tests**
+- [x] **Step 1: Write failing construction and identity tests**
 
 Cover:
 
@@ -165,7 +165,7 @@ Cover:
 - session-bank restore rejects incompatible route identity;
 - health and completion receipts report selected route and self-check status.
 
-- [ ] **Step 2: Run the red tests**
+- [x] **Step 2: Run the red tests**
 
 ```bash
 "$PY" -m pytest -q \
@@ -174,14 +174,14 @@ Cover:
   tests/test_session_bank.py
 ```
 
-- [ ] **Step 3: Implement the route dataclass and installer**
+- [x] **Step 3: Implement the route dataclass and installer**
 
 The bound spec contains callables for target readout, proposal readout, QMV
 widths, MTP cache append, projection fusions, and policy selection. Missing
 promoted callables fail construction for the candidate route. The unchanged
 route binds current MTPLX functions directly.
 
-- [ ] **Step 4: Verify no behavior change**
+- [x] **Step 4: Verify no behavior change**
 
 ```bash
 "$PY" -m pytest -q \
@@ -193,7 +193,7 @@ route binds current MTPLX functions directly.
 git diff --check
 ```
 
-- [ ] **Step 5: Commit the contract seam**
+- [x] **Step 5: Commit the contract seam**
 
 ```bash
 git add mtplx/qwen38_challenge.py mtplx/runtime.py mtplx/session_bank.py \
