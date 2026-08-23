@@ -185,17 +185,17 @@ the challenge bootstrap and has no preceding Yukon row.
 | 6 | 37 | 1.7673% | Reuse top-2 top-1 as argmax | CHALLENGE-ONLY; MTPLX has no duplicate target argmax |
 | 7 | 38 | 20.4283% | Committed MTP-head history | ALREADY |
 | 8 | 41 | 17.9183% | History/single-sync/fusions/checkpoints/depth bundle | ALREADY for history, sync, checkpoints; fusions tracked separately |
-| 9 | 55 | 6.8764% | Paired affine QMV | SUPERSEDED by final cross-row family |
+| 9 | 55 | 6.8764% | Paired affine QMV | SUPERSEDED by final C7 candidate; C7 rejected locally |
 | 10 | 59 | 5.3467% | Warmed compact vocabulary | PORT, compact-head set |
 | 11 | 63 | 5.7425% | Cost model, seed warm, early flush | ALREADY for controller, warm framework, and proposal submission boundary; final calibration tracked separately |
 | 12 | 70 | 0.8266% | Lazy exact prefix replay | ALREADY |
 | 13 | 71 | 2.0944% | Fused GDN input projections | PORT, fusion set |
 | 14 | 77 | 0.9839% | Lazy exact prefix replay restack | SUPERSEDED/ALREADY |
-| 15 | 95 | 3.7597% | Width-6..9 chunking | SUPERSEDED by final QMV |
+| 15 | 95 | 3.7597% | Width-6..9 chunking | SUPERSEDED by final C7 candidate; C7 rejected locally |
 | 16 | 103 | 0.5808% | Compiled GDN satellite expressions | PORT, fusion set |
 | 17 | 126 | 7.5460% | Declared Q4/group-64 head | ALREADY; later superseded by compact Q2/Q4 artifact |
 | 18 | 135 | 0.4535% | One-forward exact SDPA width bridge | PORT, fusion set |
-| 19 | 160 | 2.5391% | Wider cross-row QMV and fused draft readout | DEPENDENCY of final QMV/readout |
+| 19 | 160 | 2.5391% | Wider cross-row QMV and fused draft readout | Target-QMV part rejected through C7; proposal readout retained through C8 |
 | 20 | 180 | 0.9180% | K/V-only committed-history flush | RETAINED at original request context >=16K; exact cache and +2.3680% clean conditioned 16K ABBA win |
 | 21 | 186 | 1.5222% | Fused Q/K RMSNorm and partial RoPE | PORT, fusion set |
 | 22 | 194 | 0.0911% | Packed GDN prework mixer | WEAK, below threshold |
@@ -210,14 +210,14 @@ the challenge bootstrap and has no preceding Yukon row.
 | 31 | 364 | 0.0533% | Row-cost adaptive depth | WEAK and ALREADY |
 | 32 | 365 | 0.1764% | Streak-gate restore | SUPERSEDED by final policy |
 | 33 | 401 | 1.7181% | Q4 head with BF16 Q/K/V precision islands | PORT, artifact set |
-| 34 | 405 | 0.6815% | Direct-nibble QMV M=6,9 | DEPENDENCY of final QMV |
+| 34 | 405 | 0.6815% | Direct-nibble QMV M=6,9 | SUPERSEDED by rejected C7 |
 | 35 | 417 | 0.0537% | Warm `AndNormed` | WEAK, below threshold |
-| 36 | 423 | 1.6826% | Precision islands plus direct-nibble M=8 | PORT through final artifact/QMV sets |
+| 36 | 423 | 1.6826% | Precision islands plus direct-nibble M=8 | PORT through C8 islands; target-QMV part rejected through C7 |
 | 37 | 428 | 0.1477% | Precision-island restack | SUPERSEDED duplicate |
 | 38 | 430 | 0.6244% | Restore `callWithHiddenAndNormed` warm | PORT, final warm set |
-| 39 | 437 | 0.3030% | Affine-4 QMV M=4 ownership | DEPENDENCY of final QMV |
-| 40 | 438 | 0.6643% | Direct-nibble QMV M=7 | DEPENDENCY of final QMV |
-| 41 | 450 | 0.4931% | Direct-nibble QMV M=3,4,5,7 | DEPENDENCY of final QMV |
+| 39 | 437 | 0.3030% | Affine-4 QMV M=4 ownership | SUPERSEDED by rejected C7 |
+| 40 | 438 | 0.6643% | Direct-nibble QMV M=7 | SUPERSEDED by rejected C7 |
+| 41 | 450 | 0.4931% | Direct-nibble QMV M=3,4,5,7 | SUPERSEDED by rejected C7 |
 | 42 | 472 | 1.4130% | Affine-2 shortlist plus affine-4 rerank | PORT, compact-head set |
 | 43 | 493 | 0.0824% | M=1 coarse-readout QMV | WEAK, below threshold |
 | 44 | 503 | 0.0718% | M=8 4+4 QMV combine | WEAK and superseded |
@@ -246,7 +246,7 @@ the challenge bootstrap and has no preceding Yukon row.
 | 67 | 968 | 0.3523% | Selected affine-4 rerank | PORT, compact-head set |
 | 68 | 1028 | 0.0540% | Centroid-selector redraw | WEAK/no-op |
 | 69 | 1031 | 0.2133% | E87 two-dispatch shortlist | PORT, compact-head set |
-| 70 | 1063 | 3.9125% | Hoisted activation chunk sums | PORT, final QMV set |
+| 70 | 1063 | 3.9125% | Hoisted activation chunk sums | Evaluated through C7; rejected locally |
 | 71 | 1066 | 0.7439% | E121 affine-2 cluster QMV | PORT, compact-head set |
 | 72 | 1071 | 0.0524% | Restore qL2/3 SDPA warms | WEAK, below threshold |
 | 73 | 1089 | 0.0227% | Three-mechanism restore | WEAK/restack |
@@ -254,9 +254,9 @@ the challenge bootstrap and has no preceding Yukon row.
 | 75 | 1105 | 0.0686% | qL1..5 warm restore | WEAK, below threshold |
 | 76 | 1107 | 0.0518% | New-crown resample | WEAK/no-op |
 | 77 | 1117 | 0.0503% | Probe fraction 0.15 | DEPENDENCY of qualifying row 79 |
-| 78 | 1123 | 4.3907% | Tight active-group QMV launch | PORT, final QMV set |
+| 78 | 1123 | 4.3907% | Tight active-group QMV launch | Evaluated through C7; rejected locally |
 | 79 | 1130 | 0.2444% | Restore 0.15 probe fraction | PORT, compact-head set |
-| 80 | 1139 | 0.3477% | Tight launch for width M=2 | PORT, final QMV set |
+| 80 | 1139 | 0.3477% | Tight launch for width M=2 | C7 endpoint; rejected at -0.7253% locally |
 | 81 | 1150 | 0.0597% | Flush-fold warm M=3..9 | WEAK, below threshold |
 | 82 | 1153 | 0.3733% | Skip unused probe-sort JIT | PORT as compact-head construction invariant |
 

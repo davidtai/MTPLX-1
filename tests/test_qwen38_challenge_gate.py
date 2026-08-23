@@ -276,10 +276,6 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
 
     assert gate._validate_route_id("control") == {"control"}
     assert gate._validate_route_id("kv_only_history") == {"kv_only_history"}
-    assert gate._validate_route_id("packed_qkv") == {"packed_qkv"}
-    assert gate._validate_route_id(
-        "packed_qkv+gdn_projection_pairs+kv_only_history"
-    ) == {"packed_qkv", "gdn_projection_pairs", "kv_only_history"}
     assert gate._validate_route_id(
         "kv_only_history+dual_norm+source_proposal"
     ) == {
@@ -290,13 +286,17 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
+    with pytest.raises(ValueError, match="unknown route features"):
+        gate._validate_route_id("packed_qkv")
+    with pytest.raises(ValueError, match="unknown route features"):
+        gate._validate_route_id("gdn_projection_pairs")
 
 
 def test_route_validation_rejects_control_combinations() -> None:
     gate = _module()
 
     with pytest.raises(ValueError, match="control cannot be combined"):
-        gate._validate_route_id("control+packed_qkv")
+        gate._validate_route_id("control+dual_norm")
 
 
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:

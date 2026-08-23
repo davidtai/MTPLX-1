@@ -100,14 +100,14 @@ by a later measured descendant + 23 evidence-backed skips.
 
 | Candidate | Source endpoint | Candidate route | Promotion rule |
 | --- | ---: | --- | --- |
-| C1 | row 3 | target attention Q/K/V packed concat only | Retain only if 16K wall improves >0.05%; require engagement counters and flat/acceptable memory. |
-| C2 | row 13 | GDN packed QKV+Z and B+A projections | Measure on C1 winner stack; same promotion rule. |
-| C3 | row 20 | K/V-only committed-history append at original request >=16K | Rerun if C1 or C2 wins; otherwise existing exact receipt remains comparable. |
-| C4 | row 21 | fused Q/K norm + partial RoPE | Measure on retained C1-C3 stack. |
-| C5 | row 45 | boundary residual/RMSNorm | Measure on retained C1-C4 stack. |
-| C6 | row 61 | concat-free dual pre-FC RMSNorm | Measure on retained C1-C5 stack. |
-| C7 | row 80 | final cross-row affine-4 QMV adapted to group-32 trunk and group-64 islands | Measure on retained C1-C6 stack. |
-| C8 | row 82 | final compact selector/reranker with source-pinned precision islands | Measure last on the retained stack after dropping any C7 loss. |
+| C1 | row 3 | target attention Q/K/V packed concat only | Rejected at -4.0629%. |
+| C2 | row 13 | GDN packed QKV+Z and B+A projections | Rejected at -7.2989%. |
+| C3 | row 20 | K/V-only committed-history append at original request >=16K | Retained at +2.3680%. |
+| C4 | row 21 | fused Q/K norm + partial RoPE | Rejected at -0.2034%; tie drift was not the reason. |
+| C5 | row 45 | boundary residual/RMSNorm | Rejected at -0.0130%. |
+| C6 | row 61 | concat-free dual pre-FC RMSNorm | Retained at +1.7907%. |
+| C7 | row 80 | final cross-row affine-4 QMV adapted to group-32 trunk and group-64 islands | Rejected at -0.7253% on C3+C6. |
+| C8 | row 82 | final compact selector/reranker with source-pinned precision islands | Retained at +4.2007% on C3+C6. |
 
 No percentage is added or multiplied. If a candidate wins, its implementation
 remains enabled in both arms of every later bracket.

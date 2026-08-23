@@ -12,8 +12,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from .gdn_capture import configure_qwen3_next_gdn_projection_pairs
-from .packed_concats import configure_qwen3_next_packed_qkv
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -314,8 +312,6 @@ def install_qwen38_route(
     model_path: Path,
     *,
     cache_route: str = DEFAULT_QWEN38_CACHE_ROUTE,
-    packed_qkv: bool = False,
-    gdn_projection_pairs: bool = False,
     dual_norm: bool = False,
     source_proposal: bool = False,
     source_artifact_path: Path | None = None,
@@ -330,50 +326,6 @@ def install_qwen38_route(
     kernel_ids: list[str] = []
     route_features: list[str] = []
     feature_receipt: dict[str, dict[str, int]] = {}
-
-    packed_report: dict[str, int] = {
-        "configured_modules": 0,
-        "active_modules": 0,
-    }
-    if packed_qkv or bool(
-        getattr(runtime, "_mtplx_qwen38_packed_qkv_candidate_active", False)
-    ):
-        packed_report = configure_qwen3_next_packed_qkv(
-            runtime.model,
-            active=bool(packed_qkv),
-        )
-        runtime._mtplx_qwen38_packed_qkv_candidate_active = bool(packed_qkv)
-    if packed_qkv:
-        if int(packed_report.get("active_modules", 0)) <= 0:
-            raise Qwen38ContractError(
-                "Qwen 3.8 packed-QKV route did not configure any attention modules"
-            )
-        route_features.append("packed_qkv")
-        kernel_ids.append("qwen38_attention_packed_qkv_s_le16_v1")
-        feature_receipt["packed_qkv"] = packed_report
-
-    gdn_report: dict[str, int] = {
-        "configured_modules": 0,
-        "active_modules": 0,
-    }
-    if gdn_projection_pairs or bool(
-        getattr(runtime, "_mtplx_qwen38_gdn_pairs_candidate_active", False)
-    ):
-        gdn_report = configure_qwen3_next_gdn_projection_pairs(
-            runtime.model,
-            active=bool(gdn_projection_pairs),
-        )
-        runtime._mtplx_qwen38_gdn_pairs_candidate_active = bool(
-            gdn_projection_pairs
-        )
-    if gdn_projection_pairs:
-        if int(gdn_report.get("active_modules", 0)) <= 0:
-            raise Qwen38ContractError(
-                "Qwen 3.8 fused-GDN-pairs route did not configure any GDN modules"
-            )
-        route_features.append("gdn_projection_pairs")
-        kernel_ids.append("qwen38_gdn_projection_pairs_v1")
-        feature_receipt["gdn_projection_pairs"] = gdn_report
 
     selfcheck_status = "control"
     min_context_tokens = 0
