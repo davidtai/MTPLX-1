@@ -541,6 +541,21 @@ def test_row20_promotion_requires_kv_only_history_engagement() -> None:
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 
 
+def test_row50_conditions_cache_clearing_candidate_before_control() -> None:
+    gate = _module()
+    control = "r08_device_draft"
+    candidate = control + "+r50_wired_residency"
+
+    assert gate._conditioning_order(
+        [control, candidate, candidate, control],
+        candidate_id=candidate,
+    ) == [candidate, control]
+    assert gate._conditioning_order(
+        [control, control + "+r48_boundary_fused"],
+        candidate_id=control + "+r48_boundary_fused",
+    ) == [control, control + "+r48_boundary_fused"]
+
+
 def test_row21_promotion_requires_qk_fusion_engagement() -> None:
     gate = _module()
     route = (

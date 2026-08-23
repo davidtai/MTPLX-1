@@ -301,6 +301,29 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
     }
 
 
+def _conditioning_order(
+    order: list[str],
+    *,
+    candidate_id: str | None,
+) -> list[str]:
+    """Condition each route once without letting row 50 erase control warmup."""
+
+    unique_routes = list(dict.fromkeys(order))
+    inferred_candidate = candidate_id
+    if inferred_candidate is None and len(unique_routes) == 2:
+        inferred_candidate = unique_routes[1]
+    if (
+        inferred_candidate is not None
+        and inferred_candidate in unique_routes
+        and "r50_wired_residency" in _validate_route_id(inferred_candidate)
+    ):
+        return [
+            inferred_candidate,
+            *[route for route in unique_routes if route != inferred_candidate],
+        ]
+    return unique_routes
+
+
 def _promotion_decision(
     *,
     order: list[str],
@@ -979,6 +1002,10 @@ def main() -> int:
     for item in order:
         _validate_route_id(item)
     unique_routes = list(dict.fromkeys(order))
+    conditioning_routes = _conditioning_order(
+        order,
+        candidate_id=args.candidate_route,
+    )
 
     warmups = [
         _run_arm(
@@ -996,7 +1023,7 @@ def main() -> int:
             row28_artifact_path=args.row28_artifact,
             row36_artifact_path=args.row36_artifact,
         )
-        for route_id in unique_routes
+        for route_id in conditioning_routes
     ]
     arms = [
         _run_arm(
