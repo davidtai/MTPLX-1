@@ -32,12 +32,12 @@ target-shape no-op proof, or removed-later proof.
 
 Means are two timed arms per route; peak is the maximum timed arm.
 
-Chronology correction in progress: row 17's declared Q4/group-64 artifact is
+Chronology correction: row 17's declared Q4/group-64 artifact is
 the complete one-layer MTP block, while row 10 quantizes only the separate
 draft vocabulary projection. The earlier `ALREADY PRESENT` disposition
-conflated those surfaces. Row 17 is now staged for its own gate on rows 8+10;
-if retained, every row-18-and-later receipt below will be rerun on the corrected
-cumulative control before it can remain authoritative.
+conflated those surfaces. Its corrected gate retained the block, so every old
+row-18-and-later receipt below is historical and must be rerun on the corrected
+cumulative control before that later decision can remain authoritative.
 
 | Row | Route | Prefill tok/s | Decode tok/s | Peak GiB | Mean wall s | Delta | Decision | Receipt |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
@@ -51,6 +51,8 @@ cumulative control before it can remain authoritative.
 | 10 | + compact proposal vocabulary | 765.005 | 55.240 | 25.149 | 40.411 | **+3.0411%** | **RETAINED** | same |
 | 13 | Optimized-Speed main + retained rows 8, 10 | 765.003 | 56.424 | 27.507 | 40.066 | - | cumulative control | `chrono-r13-gdn-inproj-s9-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 13 | + four-way GDN input projection through S=9 | 778.485 | 54.008 | 27.507 | 40.469 | **-0.9949%** | REJECTED, removed | same |
+| 17 | Optimized-Speed main + retained rows 8, 10 | 750.137 | 56.805 | 25.37195 | 40.377 | - | cumulative control | `chrono-r17-q4-mtp-block-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 17 | + exact declared Q4/group-64 MTP block | 781.155 | 55.766 | 25.37197 | 39.808 | **+1.4299%** | **RETAINED** | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -70,7 +72,9 @@ target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
 engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
-Rows 8, 10, 18, 20, 24, and 26 are therefore part of every later timed control. Row 9 regressed
+Rows 8, 10, and 17 are therefore part of every corrected later timed control.
+Rows 18, 20, 24, and 26 remain implemented but their old timings do not promote
+them on the corrected stack; they are being rerun in order. Row 9 regressed
 despite 82,880 timed kernel engagements and remains absent. Row 13 executed
 7,104 fused four-way projection calls in each timed candidate arm and was
 deterministic within route; its loss is measured, not a no-op or parity veto.
@@ -104,7 +108,7 @@ row or from the earlier bundle campaign.
 | 14 | 77 | 0.9839% | `d81964127281` | `0b3dba1ea446` | +304/-24 | ALREADY PRESENT: source reintroduces recurrent prefix replay for wide verifies; Optimized-Speed already runs the broader target `capture_commit` + `linear-gdn-from-conv-tape` boundary. Row-18 receipt directly records that strategy/core and 47.6 ms mean nonzero capture-commit work in both control and candidate arms. |
 | 15 | 95 | 3.7597% | `08897af24b57` | `8e803fafd868` | +216/-53 | TARGET-SHAPE NO-OP: every source code path is gated to verify widths 6...9 or raises an adaptive depth cap. This campaign is fixed D3, hence target verify S=4; widths 2...5 are explicitly unchanged by the source patch. |
 | 16 | 103 | 0.5808% | `8f41fa6d4f67` | `114e6ca13e03` | +149/-32 | ALREADY PRESENT: source separately compiles the GDN g/beta elementwise prologue and gated post-norm. Optimized-Speed compiles the entire route-specific S=4 target capture graph, which contains both regions; a nested subcompile adds no missing dispatch boundary. |
-| 17 | 126 | 7.5460% | `deb63ad0d170` | `2dbcb36ee10e` | +6/-14 | STAGED FOR CORRECTED GATE: source replaces the complete BF16 one-layer MTP block with the exact declared Q4/group-64 artifact. This is distinct from row 10's compact Q4 draft vocabulary projection. The artifact is pinned by source revision, manifest digest, file digest, byte count, tensor set, shape, and dtype before installation. |
+| 17 | 126 | 7.5460% | `deb63ad0d170` | `2dbcb36ee10e` | +6/-14 | RETAINED: exact declared Q4/group-64 complete MTP block, distinct from row 10's compact Q4 draft vocabulary projection. The artifact is pinned by source revision, manifest digest, file digest, byte count, tensor set, shape, and dtype; it improved wall throughput 1.4299% on rows 8+10. Both routes were deterministic; proposal/acceptance tie drift was allowed. |
 | 18 | 135 | 0.4535% | `b6ce964b16bb` | `2181386c97ac` | +324/-247 | RETAINED in part: adaptive depth, S>=6 attention segmentation, and synthetic 512-token warming are inapplicable to fixed D3/exact 16K conditioning. The adapted per-layer input-independent `-exp(A_log)` GDN memo was exact, engaged 6,912 times per timed arm, and improved wall throughput 1.0970% on rows 8+10. A chronology audit found the source also expands row 8's S<=2 packed MLP gate/up to S<=9; the corrected addendum engaged 9,628 times per candidate arm but regressed 0.5360%, so that component is removed. |
 | 19 | 160 | 2.5391% | `1033e1ac5197` | `1a4f47311818` | +581/-97 | TARGET-SHAPE NON-TRANSFERABLE: source replaces compact projection + argmax + target-ID mapping with an argmax-only selector. The required temperature-1/top-k20 route must retain the complete sparse proposal distribution for exact speculative acceptance; substituting argmax changes the sampling law. Row 10 already retains the source's compact Q4/group-64 projection and on-device mapping. |
 | 20 | 180 | 0.9180% | `cf350293feb4` | `b9b4300e973d` | +144/-8 | RETAINED: adapted to MTPLX's dead committed-history outputs by omitting Q/gate/attention/MLP for every appended row and packing the live BF16 K+V projections into one matmul. The packed path engaged 288 times per timed candidate arm over 17,125 history tokens and improved wall throughput 1.7697% on rows 8+10+18. Deterministic tie drift was allowed. |
