@@ -201,6 +201,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r48_boundary_fused",
         "r50_wired_residency",
         "r61_dual_norm_concat",
+        "r63_q8_embedding_dual_norm",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -241,6 +242,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(50)
     if "r61_dual_norm_concat" in features:
         source_rows.append(61)
+    if "r63_q8_embedding_dual_norm" in features:
+        source_rows.append(63)
     return {
         "cache_route": (
             "kv_only_history"
@@ -248,6 +251,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
             else "control"
         ),
         "dual_norm": bool({"dual_norm", "r61_dual_norm_concat"} & features),
+        "row63_q8_embedding_dual_norm": "r63_q8_embedding_dual_norm" in features,
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "mtp_block_variant": (
@@ -480,7 +484,10 @@ def _candidate_engagement_errors(
             )
             if qk_widen_calls <= 0:
                 errors.append("row 26 Q/K L<=32 widening did not execute")
-    if "r61_dual_norm_concat" in features:
+    if (
+        "r61_dual_norm_concat" in features
+        and "r63_q8_embedding_dual_norm" not in features
+    ):
         calls = sum(
             int(
                 ((run.get("engagement") or {}).get("dual_norm") or {}).get(
@@ -516,6 +523,17 @@ def _candidate_engagement_errors(
         )
         if not active:
             errors.append("row 50 post-warm wired residency was not active")
+    if "r63_q8_embedding_dual_norm" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r63_q8_embedding_dual_norm") or {}).get(
+                    "calls", 0
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 63 fused Q8 embedding/dual RMSNorm did not execute")
     return errors
 
 
@@ -527,6 +545,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     )
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_challenge_kernels import (
+        qwen38_q8_embedding_dual_norm_counter_snapshot,
         qwen38_qk_rms_rope_counter_snapshot,
         qwen38_row24_eval_ladder_counter_snapshot,
         qwen38_row24_qk_length_fallback_counter_snapshot,
@@ -541,6 +560,9 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
+        "r63_q8_embedding_dual_norm": {
+            "calls": qwen38_q8_embedding_dual_norm_counter_snapshot()
+        },
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
@@ -693,6 +715,9 @@ def _run_arm(
         row26_prefill_ladder_3=bool(options["row26_prefill_ladder_3"]),
         row48_boundary_fused=bool(options["row48_boundary_fused"]),
         row50_wired_residency=bool(options["row50_wired_residency"]),
+        row63_q8_embedding_dual_norm=bool(
+            options["row63_q8_embedding_dual_norm"]
+        ),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

@@ -371,6 +371,9 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     assert gate._validate_route_id(
         "r08_device_draft+r50_wired_residency"
     ) == {"r08_device_draft", "r50_wired_residency"}
+    assert gate._validate_route_id(
+        "r08_device_draft+r63_q8_embedding_dual_norm"
+    ) == {"r08_device_draft", "r63_q8_embedding_dual_norm"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -406,6 +409,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "row26_prefill_ladder_3": False,
         "row48_boundary_fused": False,
         "row50_wired_residency": False,
+        "row63_q8_embedding_dual_norm": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
@@ -546,6 +550,24 @@ def test_row48_promotion_requires_boundary_fusion_engagement() -> None:
     assert gate._candidate_engagement_errors(route, [zero], []) == [
         "row 48 boundary-fused residual/RMSNorm path did not execute",
         "row 48 fused no-copy layer boundaries did not execute",
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
+def test_row63_promotion_requires_q8_embedding_fusion_engagement() -> None:
+    gate = _module()
+    route = "r08_device_draft+r61_dual_norm_concat+r63_q8_embedding_dual_norm"
+    zero = {
+        "route_id": route,
+        "engagement": {"r63_q8_embedding_dual_norm": {"calls": 0}},
+    }
+    engaged = {
+        "route_id": route,
+        "engagement": {"r63_q8_embedding_dual_norm": {"calls": 48}},
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 63 fused Q8 embedding/dual RMSNorm did not execute"
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 

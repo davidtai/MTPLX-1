@@ -1081,13 +1081,34 @@ def inject_mtp_support(
             # Vision prompts: the caller passes the same spliced embedding
             # rows the trunk prefill consumed, so the MTP history sees the
             # image content instead of raw image-pad embeddings (#103).
-            input_embeds = (
-                input_embeddings
-                if input_embeddings is not None
-                else self.model.embed_tokens(next_token_ids)
+            qwen38_row63 = bool(
+                getattr(self, "_mtplx_qwen38_row63_q8_embedding_dual_norm", False)
             )
+            if input_embeddings is not None:
+                input_embeds = input_embeddings
+            elif qwen38_row63:
+                input_embeds = None
+            else:
+                input_embeds = self.model.embed_tokens(next_token_ids)
             order = concat_order or getattr(self, "_mtplx_concat_order", "embedding_hidden")
-            if (
+            if qwen38_row63 and input_embeddings is None and order == "embedding_hidden":
+                from .qwen38_challenge_kernels import (
+                    qwen38_q8_embedding_dual_rms_norm_concat,
+                )
+
+                embedding_norm = self.mtp.pre_fc_norm_embedding
+                hidden_norm = self.mtp.pre_fc_norm_hidden
+                if float(embedding_norm.eps) != float(hidden_norm.eps):
+                    raise ValueError("Qwen 3.8 dual RMSNorm eps values differ")
+                pre_fc = qwen38_q8_embedding_dual_rms_norm_concat(
+                    next_token_ids,
+                    self.model.embed_tokens,
+                    hidden_states,
+                    embedding_norm.weight,
+                    hidden_norm.weight,
+                    float(embedding_norm.eps),
+                )
+            elif (
                 bool(getattr(self, "_mtplx_qwen38_dual_norm_concat", False))
                 and order == "embedding_hidden"
             ):

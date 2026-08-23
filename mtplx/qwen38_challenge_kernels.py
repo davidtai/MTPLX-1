@@ -5,8 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 _DUAL_RMS_CONCAT_KERNEL = None
+_Q8_EMBED_DUAL_RMS_CONCAT_KERNEL = None
 _QK_RMS_ROPE_KERNEL = None
 qwen38_dual_norm_calls = 0
+qwen38_q8_embed_dual_norm_calls = 0
 qwen38_qk_rms_rope_calls = 0
 qwen38_row24_qk_length_fallback_calls = 0
 qwen38_row26_qk_widen_calls = 0
@@ -471,3 +473,177 @@ def reset_qwen38_dual_norm_calls() -> None:
 
 def qwen38_dual_norm_counter_snapshot() -> int:
     return int(qwen38_dual_norm_calls)
+
+
+def qwen38_q8_embedding_dual_rms_norm_concat(
+    token_ids: Any,
+    embedding: Any,
+    hidden: Any,
+    embedding_norm_weight: Any,
+    hidden_norm_weight: Any,
+    eps: float,
+) -> Any:
+    """Fuse the target's Q8/g64 embedding lookup with both MTP input norms."""
+
+    import mlx.core as mx
+
+    global _Q8_EMBED_DUAL_RMS_CONCAT_KERNEL, qwen38_q8_embed_dual_norm_calls
+    weight = getattr(embedding, "weight", None)
+    scales = getattr(embedding, "scales", None)
+    biases = getattr(embedding, "biases", None)
+    rows = int(hidden.size) // 5120
+    if (
+        int(getattr(embedding, "bits", 0)) != 8
+        or int(getattr(embedding, "group_size", 0)) != 64
+        or str(getattr(embedding, "mode", "")).lower() != "affine"
+        or weight is None
+        or scales is None
+        or biases is None
+        or weight.dtype != mx.uint32
+        or scales.dtype != mx.bfloat16
+        or biases.dtype != mx.bfloat16
+        or hidden.dtype != mx.bfloat16
+        or int(hidden.shape[-1]) != 5120
+        or int(token_ids.size) != rows
+        or tuple(weight.shape[1:]) != (1280,)
+        or tuple(scales.shape[1:]) != (80,)
+        or tuple(biases.shape[1:]) != (80,)
+        or tuple(embedding_norm_weight.shape) != (5120,)
+        or tuple(hidden_norm_weight.shape) != (5120,)
+        or embedding_norm_weight.dtype != mx.bfloat16
+        or hidden_norm_weight.dtype != mx.bfloat16
+    ):
+        raise ValueError("unsupported Qwen 3.8 Q8 embedding dual RMSNorm contract")
+
+    if _Q8_EMBED_DUAL_RMS_CONCAT_KERNEL is None:
+        _Q8_EMBED_DUAL_RMS_CONCAT_KERNEL = mx.fast.metal_kernel(
+            name="mtplx_qwen38_q8_embedding_dual_rms_norm_concat_bf16_v1",
+            input_names=[
+                "token_ids",
+                "embedding_weight",
+                "embedding_scales",
+                "embedding_biases",
+                "hidden",
+                "embedding_norm_weight",
+                "hidden_norm_weight",
+                "eps",
+            ],
+            output_names=["concat_out"],
+            source=r"""
+                constexpr uint axis_size = 5120;
+                constexpr uint group_size = 64;
+                constexpr uint n_reads = 4;
+                constexpr uint simd_size = 32;
+                constexpr uint lsize = 1024;
+
+                uint row = threadgroup_position_in_grid.x;
+                uint thread_id = thread_position_in_threadgroup.x;
+                uint simd_thread = thread_index_in_simdgroup;
+                uint simd_group = simdgroup_index_in_threadgroup;
+                uint hidden_rows = 1;
+                for (uint i = 0; i + 1 < hidden_ndim; ++i) {
+                    hidden_rows *= uint(hidden_shape[i]);
+                }
+                bool is_embedding = row < hidden_rows;
+                uint local_row = is_embedding ? row : row - hidden_rows;
+                long token = is_embedding ? long(token_ids[local_row]) : 0;
+                ulong packed_off = ulong(token) * ulong(embedding_weight_shape[1]);
+                ulong scale_off = ulong(token) * ulong(embedding_scales_shape[1]);
+                ulong hidden_off = ulong(local_row) * ulong(axis_size);
+                ulong out_off = hidden_off * 2ul
+                    + (is_embedding ? 0ul : ulong(axis_size));
+
+                threadgroup float local_inv_mean[1];
+                threadgroup float local_sums[simd_size];
+                float acc = 0.0f;
+                for (uint start = 0; start < axis_size; start += lsize * n_reads) {
+                    uint elem = start + thread_id * n_reads;
+                    for (uint i = 0; i < n_reads; ++i) {
+                        uint index = elem + i;
+                        if (index < axis_size) {
+                            float xi;
+                            if (is_embedding) {
+                                uint packed = embedding_weight[
+                                    packed_off + ulong(index >> 2)];
+                                uint q = (packed >> ((index & 3u) * 8u)) & 255u;
+                                bfloat dequantized = bfloat(q)
+                                    * embedding_scales[
+                                        scale_off + ulong(index / group_size)]
+                                    + embedding_biases[
+                                        scale_off + ulong(index / group_size)];
+                                xi = float(dequantized);
+                            } else {
+                                xi = float(hidden[hidden_off + ulong(index)]);
+                            }
+                            acc += xi * xi;
+                        }
+                    }
+                }
+                acc = simd_sum(acc);
+                if (simd_group == 0) local_sums[simd_thread] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_thread == 0) local_sums[simd_group] = acc;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group == 0) {
+                    acc = simd_sum(local_sums[simd_thread]);
+                    if (simd_thread == 0) {
+                        local_inv_mean[0] = metal::precise::rsqrt(
+                            acc / float(axis_size) + eps);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                float inv_mean = local_inv_mean[0];
+                for (uint start = 0; start < axis_size; start += lsize * n_reads) {
+                    uint elem = start + thread_id * n_reads;
+                    for (uint i = 0; i < n_reads; ++i) {
+                        uint index = elem + i;
+                        if (index < axis_size) {
+                            float xi;
+                            if (is_embedding) {
+                                uint packed = embedding_weight[
+                                    packed_off + ulong(index >> 2)];
+                                uint q = (packed >> ((index & 3u) * 8u)) & 255u;
+                                bfloat dequantized = bfloat(q)
+                                    * embedding_scales[
+                                        scale_off + ulong(index / group_size)]
+                                    + embedding_biases[
+                                        scale_off + ulong(index / group_size)];
+                                xi = float(dequantized);
+                            } else {
+                                xi = float(hidden[hidden_off + ulong(index)]);
+                            }
+                            bfloat wi = is_embedding
+                                ? embedding_norm_weight[index]
+                                : hidden_norm_weight[index];
+                            concat_out[out_off + ulong(index)] =
+                                wi * bfloat(xi * inv_mean);
+                        }
+                    }
+                }
+            """,
+            ensure_row_contiguous=False,
+        )
+    qwen38_q8_embed_dual_norm_calls += 1
+    (output,) = _Q8_EMBED_DUAL_RMS_CONCAT_KERNEL(
+        inputs=[
+            token_ids.reshape(-1),
+            weight,
+            scales,
+            biases,
+            hidden.reshape(rows, 5120),
+            embedding_norm_weight,
+            hidden_norm_weight,
+            float(eps),
+        ],
+        template=[],
+        grid=(2 * rows * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(*hidden.shape[:-1], 10240)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return output
+
+
+def qwen38_q8_embedding_dual_norm_counter_snapshot() -> int:
+    return int(qwen38_q8_embed_dual_norm_calls)

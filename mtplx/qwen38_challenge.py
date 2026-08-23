@@ -394,6 +394,7 @@ def install_qwen38_route(
     row26_prefill_ladder_3: bool = False,
     row48_boundary_fused: bool = False,
     row50_wired_residency: bool = False,
+    row63_q8_embedding_dual_norm: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -542,6 +543,13 @@ def install_qwen38_route(
         route_features.append("dual_norm")
         kernel_ids.append("qwen38_dual_rms_norm_concat_bf16_v1")
         feature_receipt["dual_norm"] = {"active": 1}
+    text._mtplx_qwen38_row63_q8_embedding_dual_norm = bool(
+        row63_q8_embedding_dual_norm
+    )
+    if row63_q8_embedding_dual_norm:
+        route_features.append("r63_q8_embedding_dual_norm")
+        kernel_ids.append("qwen38_row63_q8_g64_embedding_dual_rmsnorm_concat_v1")
+        feature_receipt["r63_q8_embedding_dual_norm"] = {"active": 1}
 
     row10_report = configure_qwen38_row10_compact_head(
         runtime,
