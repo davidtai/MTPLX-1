@@ -369,6 +369,13 @@ def test_direct_qmv_banks_bind_production_bn256_geometry(monkeypatch, request):
     assert len(qmv_sources) == 2
     for captured in qmv_sources:
         assert "constant constexpr uint BLOCK_TILES_N = 16;" in captured["header"]
+        assert "simd_shuffle_xor(value, ushort(stride))" in captured["header"]
+        assert "for (uint stride = 1u; stride < 32u; stride <<= 1u)" in captured[
+            "header"
+        ]
+        assert "for (uint stride = 32u; stride < HAD; stride <<= 1u)" in captured[
+            "header"
+        ]
         assert "float accumulator0 = 0.0f;" in captured["source"]
         assert "float accumulator1 = 0.0f;" in captured["source"]
         assert "BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS" in captured["source"]
@@ -595,6 +602,49 @@ def test_authentic_mia_projection_fuses_h128_signs_and_mcg_qmv():
     mx.eval(grouped)
     assert tuple(grouped.shape) == (1, 1, 128)
     np.testing.assert_array_equal(np.array(grouped)[0, 0], np.array(actual)[0])
+
+
+def test_authentic_mia_bn256_matches_two_bn128_output_panels():
+    """The production-wide QMV must preserve each independent H128 panel."""
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    trellis, suh, svh = _authentic_w1_block()
+    right_trellis = np.flip(trellis, axis=1).copy()
+    right_svh = np.flip(svh).copy()
+    wide_trellis = np.concatenate((trellis, right_trellis), axis=1)
+    wide_svh = np.concatenate((svh, right_svh))
+    x = mx.array(np.linspace(-1.0, 1.0, 128, dtype=np.float16))[None]
+
+    left = exl3_mcg_qmv(
+        x,
+        mx.array(trellis),
+        mx.array(suh),
+        mx.array(svh),
+    )
+    right = exl3_mcg_qmv(
+        x,
+        mx.array(right_trellis),
+        mx.array(suh),
+        mx.array(right_svh),
+    )
+    wide_kernel = exl3._mcg_qmv_kernel(128, 256, block_n=256)
+    (wide,) = wide_kernel(
+        inputs=[
+            mx.contiguous(x),
+            mx.array(wide_trellis),
+            mx.array(suh),
+            mx.array(wide_svh),
+        ],
+        grid=(128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(1, 256)],
+        output_dtypes=[mx.float16],
+    )
+    expected = mx.concatenate((left, right), axis=-1)
+    mx.eval(wide, expected)
+
+    np.testing.assert_array_equal(np.array(wide), np.array(expected))
 
 
 def test_authentic_mia_grouped_mma_matches_exl3_projection():

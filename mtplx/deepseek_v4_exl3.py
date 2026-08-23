@@ -153,6 +153,25 @@ def _mcg_qmv_kernel(
         constant constexpr float HAD_SCALE = 0.088388347648f;
         constant ushort TC_INV[256] = {{ {inverse} }};
 
+        inline float hadamard_h128(
+            float value,
+            uint lane,
+            threadgroup float* exchange
+        ) {{
+            for (uint stride = 1u; stride < 32u; stride <<= 1u) {{
+                float peer = simd_shuffle_xor(value, ushort(stride));
+                value = (lane & stride) ? (peer - value) : (value + peer);
+            }}
+            for (uint stride = 32u; stride < HAD; stride <<= 1u) {{
+                exchange[lane] = value;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float peer = exchange[lane ^ stride];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                value = (lane & stride) ? (peer - value) : (value + peer);
+            }}
+            return value;
+        }}
+
         inline half decode_mcg(
             threadgroup const ushort* packed,
             uint tensor_core_offset
@@ -206,18 +225,8 @@ def _mcg_qmv_kernel(
                 x[x_row * SIZE_K + k]
                 * suh[__EXPERT_SUH_OFFSET__k]
             );
-            had_values[lane] = float(scaled);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint stride = 1u; stride < HAD; stride <<= 1u) {
-                float own = had_values[lane];
-                float peer = had_values[lane ^ stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                had_values[lane] =
-                    (lane & stride) ? (peer - own) : (own + peer);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            x_had[lane] = half(had_values[lane] * HAD_SCALE);
+            float transformed = hadamard_h128(float(scaled), lane, had_values);
+            x_had[lane] = half(transformed * HAD_SCALE);
         """
     source_n128 = """
         uint lane = thread_position_in_threadgroup.x;
@@ -271,17 +280,10 @@ def _mcg_qmv_kernel(
         }
 
         // ExLlamaV3's half-output GEMV rounds before its output H128 epilogue.
-        had_values[lane] = float(half(accumulator));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
-            float own = had_values[lane];
-            float peer = had_values[lane ^ stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            had_values[lane] =
-                (lane & stride) ? (peer - own) : (own + peer);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        half rotated = half(had_values[lane] * HAD_SCALE);
+        float output_had = hadamard_h128(
+            float(half(accumulator)), lane, had_values
+        );
+        half rotated = half(output_had * HAD_SCALE);
         y[(size_t)threadgroup_position_in_grid.z * SIZE_N + n] =
             half(rotated * svh[__EXPERT_SVH_OFFSET__n]);
     """
@@ -346,32 +348,17 @@ def _mcg_qmv_kernel(
         }
 
         // Preserve ExLlamaV3's half-output rounding independently per N128 panel.
-        had_values[lane] = float(half(accumulator0));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
-            float own = had_values[lane];
-            float peer = had_values[lane ^ stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            had_values[lane] =
-                (lane & stride) ? (peer - own) : (own + peer);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        half rotated0 = half(had_values[lane] * HAD_SCALE);
+        float output_had0 = hadamard_h128(
+            float(half(accumulator0)), lane, had_values
+        );
+        half rotated0 = half(output_had0 * HAD_SCALE);
         y[(size_t)threadgroup_position_in_grid.z * SIZE_N + n0] =
             half(rotated0 * svh[__EXPERT_SVH_OFFSET__n0]);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        had_values[lane] = float(half(accumulator1));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
-            float own = had_values[lane];
-            float peer = had_values[lane ^ stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            had_values[lane] =
-                (lane & stride) ? (peer - own) : (own + peer);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        half rotated1 = half(had_values[lane] * HAD_SCALE);
+        float output_had1 = hadamard_h128(
+            float(half(accumulator1)), lane, had_values
+        );
+        half rotated1 = half(output_had1 * HAD_SCALE);
         y[(size_t)threadgroup_position_in_grid.z * SIZE_N + n1] =
             half(rotated1 * svh[__EXPERT_SVH_OFFSET__n1]);
     """
@@ -389,7 +376,7 @@ def _mcg_qmv_kernel(
     return mx.fast.metal_kernel(
         name=(
             f"mtplx_dsv4_exl3_mcg_qmv_k{size_k}_n{size_n}"
-            f"_e{experts}_t{topk}_r{int(routed_input)}_bn{block_n}_v4"
+            f"_e{experts}_t{topk}_r{int(routed_input)}_bn{block_n}_v5"
         ),
         input_names=input_names,
         output_names=["y"],
