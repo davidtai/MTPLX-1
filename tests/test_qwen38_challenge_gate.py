@@ -36,7 +36,11 @@ def test_generation_metrics_include_prefill_decode_and_peak_memory() -> None:
         ],
     )
 
-    metrics = gate._generation_metrics(stats)
+    metrics = gate._generation_metrics(
+        stats,
+        verify_strategy="capture_commit",
+        verify_core="linear-gdn-from-conv-tape",
+    )
 
     assert metrics == {
         "prefill_tokens": 512,

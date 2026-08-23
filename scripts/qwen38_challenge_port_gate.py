@@ -87,7 +87,12 @@ def _token_hash(tokens: list[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _generation_metrics(stats: Any) -> dict[str, Any]:
+def _generation_metrics(
+    stats: Any,
+    *,
+    verify_strategy: str,
+    verify_core: str,
+) -> dict[str, Any]:
     peak = int(stats.peak_memory_bytes)
     capture_commit_events = sum(
         str(event.get("capture_repair") or "").startswith("captured_")
@@ -102,8 +107,8 @@ def _generation_metrics(stats: Any) -> dict[str, Any]:
         "peak_memory_gib": peak / 2**30,
         "capture_commit_time_s": float(stats.capture_commit_time_s),
         "capture_commit_events": int(capture_commit_events),
-        "verify_strategy": str(stats.verify_strategy),
-        "verify_core": str(stats.verify_core),
+        "verify_strategy": str(verify_strategy),
+        "verify_core": str(verify_core),
     }
 
 
@@ -456,7 +461,11 @@ def _run_arm(
     counters_after = _projection_counter_snapshot()
     stats = output.stats
     return {
-        **_generation_metrics(stats),
+        **_generation_metrics(
+            stats,
+            verify_strategy="capture_commit",
+            verify_core="linear-gdn-from-conv-tape",
+        ),
         "route_id": route_id,
         "installed_route_id": route.route_id,
         "route_fingerprint": hashlib.sha256(
