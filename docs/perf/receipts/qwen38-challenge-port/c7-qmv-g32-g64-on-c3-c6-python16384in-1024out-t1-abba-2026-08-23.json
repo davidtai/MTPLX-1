@@ -8,8 +8,8 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 49.67998687384597,
-      "draft_time_s": 3.285418657149421,
+      "decode_tok_s": 51.63262915671752,
+      "draft_time_s": 3.234477582620457,
       "drafted_by_depth": [
         293,
         292,
@@ -35,6 +35,15 @@
         "qmv_final": {
           "g32_m2": 0,
           "g32_m4": 0
+        },
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
         }
       },
       "feature_receipt": {
@@ -50,10 +59,10 @@
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 23.558175623969873,
-      "prefill_tok_s": 695.4698131772851,
+      "prefill_time_s": 20.91251120896777,
+      "prefill_tok_s": 783.454451561712,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.10368683296837844,
+      "prompt_mtp_history_time_s": 0.09499054198386148,
       "route_fingerprint": "25ffebaf773bec2e23c0c52b95b4d4bba4b1c620b4da091a3ee7327f86dddbde",
       "route_id": "kv_only_history+dual_norm",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -1083,7 +1092,7 @@
         14755,
         93873
       ],
-      "wall_s": 44.27504229100305
+      "wall_s": 40.841139750002185
     },
     {
       "accepted_by_depth": [
@@ -1093,8 +1102,8 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 49.457793877484576,
-      "draft_time_s": 3.28138540830696,
+      "decode_tok_s": 51.503409044512125,
+      "draft_time_s": 3.224979654623894,
       "drafted_by_depth": [
         293,
         292,
@@ -1120,6 +1129,15 @@
         "qmv_final": {
           "g32_m2": 296,
           "g32_m4": 42920
+        },
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
         }
       },
       "feature_receipt": {
@@ -1128,6 +1146,7 @@
         },
         "qmv_final": {
           "active": 1,
+          "bound_modules": 987,
           "installed": 1
         }
       },
@@ -1140,10 +1159,10 @@
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 22.760172749083722,
-      "prefill_tok_s": 719.853938747437,
+      "prefill_time_s": 20.932574332982767,
+      "prefill_tok_s": 782.7035384837627,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.10417283399146982,
+      "prompt_mtp_history_time_s": 0.09570779002388008,
       "route_fingerprint": "82fb6b04b2699d1c613c805698f74690d249d3dc5f442f5cddf2cbc79431f79a",
       "route_id": "kv_only_history+dual_norm+qmv_final",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -2173,7 +2192,7 @@
         14755,
         93873
       ],
-      "wall_s": 43.57009120800649
+      "wall_s": 40.91168549997383
     },
     {
       "accepted_by_depth": [
@@ -2183,8 +2202,8 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 49.802032056842286,
-      "draft_time_s": 3.2699024071043823,
+      "decode_tok_s": 51.443300991635724,
+      "draft_time_s": 3.2256310867960565,
       "drafted_by_depth": [
         293,
         292,
@@ -2210,6 +2229,15 @@
         "qmv_final": {
           "g32_m2": 296,
           "g32_m4": 42920
+        },
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
         }
       },
       "feature_receipt": {
@@ -2218,6 +2246,7 @@
         },
         "qmv_final": {
           "active": 1,
+          "bound_modules": 987,
           "installed": 1
         }
       },
@@ -2230,10 +2259,10 @@
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 22.48098566502449,
-      "prefill_tok_s": 728.7936678635016,
+      "prefill_time_s": 21.266194958938286,
+      "prefill_tok_s": 770.4246120020509,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.09716770905652083,
+      "prompt_mtp_history_time_s": 0.09611712701735087,
       "route_fingerprint": "82fb6b04b2699d1c613c805698f74690d249d3dc5f442f5cddf2cbc79431f79a",
       "route_id": "kv_only_history+dual_norm+qmv_final",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -3263,7 +3292,7 @@
         14755,
         93873
       ],
-      "wall_s": 43.14077695799642
+      "wall_s": 41.26894270902267
     },
     {
       "accepted_by_depth": [
@@ -3273,8 +3302,8 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 50.278854409734585,
-      "draft_time_s": 3.2666805408953223,
+      "decode_tok_s": 51.87458203971289,
+      "draft_time_s": 3.221832962881308,
       "drafted_by_depth": [
         293,
         292,
@@ -3300,6 +3329,15 @@
         "qmv_final": {
           "g32_m2": 0,
           "g32_m4": 0
+        },
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
         }
       },
       "feature_receipt": {
@@ -3315,10 +3353,10 @@
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 22.1902932060475,
-      "prefill_tok_s": 738.340852365794,
+      "prefill_time_s": 20.89426633203402,
+      "prefill_tok_s": 784.138564122775,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.0970957940153312,
+      "prompt_mtp_history_time_s": 0.10801671101944521,
       "route_fingerprint": "25ffebaf773bec2e23c0c52b95b4d4bba4b1c620b4da091a3ee7327f86dddbde",
       "route_id": "kv_only_history+dual_norm",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -4348,10 +4386,10 @@
         14755,
         93873
       ],
-      "wall_s": 42.655039374978514
+      "wall_s": 40.743407040979946
     }
   ],
-  "candidate_improvement_pct": 0.25280971649248585,
+  "candidate_improvement_pct": -0.7253308121452307,
   "candidate_route_id": "kv_only_history+dual_norm+qmv_final",
   "context_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-challenge-port/mtplx/generation.py",
   "context_sha256": "1e542f0e0f2db9dae9d404976936d1f43743ef855148121cca4abd530370d8dd",
@@ -4365,17 +4403,18 @@
     "per_route_deterministic": {
       "kv_only_history+dual_norm": true,
       "kv_only_history+dual_norm+qmv_final": true
-    }
+    },
+    "schedule_capture": "depth_histograms"
   },
-  "created_at": "2026-08-23T17:15:08Z",
+  "created_at": "2026-08-23T18:34:56Z",
   "draft_temperature": 1.0,
   "exact": true,
   "gpu_lock_scope": "attested_parent",
   "kind": "qwen38_challenge_port_gate",
   "max_tokens": 1024,
   "mean_wall_s": {
-    "kv_only_history+dual_norm": 43.46504083299078,
-    "kv_only_history+dual_norm+qmv_final": 43.355434083001455
+    "kv_only_history+dual_norm": 40.792273395491065,
+    "kv_only_history+dual_norm+qmv_final": 41.09031410449825
   },
   "mlx_version": "0.32.0",
   "model": "/Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
@@ -4399,7 +4438,7 @@
           640
         ]
       },
-      "elapsed_s": 0.07947495800908655,
+      "elapsed_s": 0.07968091699876823,
       "original": {
         "bits": 8,
         "group_size": 64,
@@ -4479,14 +4518,22 @@
     "kv_only_history+dual_norm"
   ],
   "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "promotion": {
+    "errors": [
+      "candidate improvement must be strictly greater than 0.05%"
+    ],
+    "passed": false,
+    "threshold_pct": 0.05
+  },
   "prompt_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-challenge-port/mtplx/benchmarks/prompts/python_modules_long.jsonl",
   "prompt_id": "python_modules_long_high_acceptance",
+  "prompt_token_sha256": "bcc68c63e11c676d87f2772ab8a5781c16cf2f97d581c0f4233d337a5c706186",
   "prompt_token_target": 16384,
   "prompt_tokens": 16384,
   "python": "3.12.13",
   "schedule_exact": true,
   "seed": 42,
-  "source_commit": "76dd6d64fe1601019bd7febb015c3e54ea9032bf",
+  "source_commit": "7a873137c7cb8755b68fa5852405776d26f9232e",
   "source_status": [],
   "target_temperature": 1.0,
   "token_exact": true,
@@ -4499,8 +4546,8 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 51.229224776864825,
-      "draft_time_s": 3.273059925850248,
+      "decode_tok_s": 52.04984966416736,
+      "draft_time_s": 3.221896163537167,
       "drafted_by_depth": [
         293,
         292,
@@ -4523,7 +4570,16 @@
           "mlp_fused_modules": 0,
           "skipped_modules": 0
         },
-        "qmv_final": {}
+        "qmv_final": {},
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
+        }
       },
       "feature_receipt": {
         "dual_norm": {
@@ -4538,10 +4594,10 @@
       ],
       "peak_memory_bytes": 26720356422,
       "peak_memory_gib": 24.885271137580276,
-      "prefill_time_s": 19.734957831999054,
-      "prefill_tok_s": 830.2019259161691,
+      "prefill_time_s": 19.706546625035116,
+      "prefill_tok_s": 831.3988397736737,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.0936795840098057,
+      "prompt_mtp_history_time_s": 0.1001593739783857,
       "route_fingerprint": "25ffebaf773bec2e23c0c52b95b4d4bba4b1c620b4da091a3ee7327f86dddbde",
       "route_id": "kv_only_history+dual_norm",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -5571,7 +5627,7 @@
         14755,
         93873
       ],
-      "wall_s": 39.877098124998156
+      "wall_s": 39.4864611250232
     },
     {
       "accepted_by_depth": [
@@ -5581,8 +5637,8 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 50.34138405894462,
-      "draft_time_s": 3.283083616552176,
+      "decode_tok_s": 51.447794440765314,
+      "draft_time_s": 3.2277094746241346,
       "drafted_by_depth": [
         293,
         292,
@@ -5608,6 +5664,15 @@
         "qmv_final": {
           "g32_m2": 296,
           "g32_m4": 42920
+        },
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
         }
       },
       "feature_receipt": {
@@ -5616,6 +5681,7 @@
         },
         "qmv_final": {
           "active": 1,
+          "bound_modules": 987,
           "installed": 1
         }
       },
@@ -5628,10 +5694,10 @@
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 24.458046537998598,
-      "prefill_tok_s": 669.8817902135165,
+      "prefill_time_s": 20.855897539964644,
+      "prefill_tok_s": 785.581151259711,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.10656237599323504,
+      "prompt_mtp_history_time_s": 0.1011597920442,
       "route_fingerprint": "82fb6b04b2699d1c613c805698f74690d249d3dc5f442f5cddf2cbc79431f79a",
       "route_id": "kv_only_history+dual_norm+qmv_final",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -6661,7 +6727,7 @@
         14755,
         93873
       ],
-      "wall_s": 44.90711112500867
+      "wall_s": 40.861974125000415
     }
   ]
 }
