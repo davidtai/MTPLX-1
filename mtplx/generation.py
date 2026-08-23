@@ -5276,8 +5276,23 @@ def _rollback_mtp_cache(mtp_cache, offset: int) -> None:
     if not mtp_cache:
         return
     for cache in mtp_cache:
-        current = int(getattr(cache, "offset", 0))
+        raw_offset = getattr(cache, "offset", 0)
+        current = int(raw_offset)
         trim = max(0, current - offset)
+        if trim and isinstance(raw_offset, mx.array) and hasattr(
+            cache, "compile_state"
+        ):
+            # Device-draft tensor offsets are compiled outputs. Restoring the
+            # saved rollback leaf after a route-dependent acceptance branch
+            # can resurrect a traced array whose primitive has already been
+            # released. These caches append strictly at the logical tail, so
+            # resetting the authoritative offset is sufficient; later writes
+            # overwrite the now-dead capacity rows.
+            cache.offset = mx.array(int(offset), dtype=raw_offset.dtype)
+            rollback_state = getattr(cache, "rollback_state", None)
+            if isinstance(rollback_state, list):
+                rollback_state[:] = [None] * len(rollback_state)
+            continue
         if trim and hasattr(cache, "trim"):
             cache.trim(trim)
 
