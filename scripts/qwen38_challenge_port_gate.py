@@ -27,6 +27,11 @@ DEFAULT_PROMPT = ROOT / "mtplx/benchmarks/prompts/python_modules_long.jsonl"
 DEFAULT_CONTEXT = ROOT / "mtplx/generation.py"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
 PROMOTION_THRESHOLD_PCT = 0.05
+OPTIMIZED_MAIN_BASE = {
+    "id": "upstream_main_qwen38_optimized_speed",
+    "commit": "bd4421567f9e16ce957c6ef97708b072dcd73937",
+    "internal_control_route": "control",
+}
 
 
 def _read_prompt(path: Path) -> tuple[str, str]:
@@ -171,6 +176,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "dual_norm",
         "source_proposal",
         "r08_device_draft",
+        "r09_paired_qmv",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -187,12 +193,15 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
     source_rows: list[int] = []
     if "r08_device_draft" in features:
         source_rows.append(8)
+    if "r09_paired_qmv" in features:
+        source_rows.append(9)
     return {
         "cache_route": (
             "kv_only_history" if "kv_only_history" in features else "control"
         ),
         "dual_norm": "dual_norm" in features,
         "source_proposal": "source_proposal" in features,
+        "row9_paired_qmv": "r09_paired_qmv" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -239,11 +248,15 @@ def _promotion_decision(
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
-    from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
+    from mtplx.qwen38_challenge_kernels import (
+        qwen38_dual_norm_counter_snapshot,
+        qwen38_row9_qmv_counter_snapshot,
+    )
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
+        "r09_paired_qmv": {"calls": qwen38_row9_qmv_counter_snapshot()},
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -320,6 +333,7 @@ def _load_optimized_speed_stack(
         mode=str(draft_head["mode"]),
     )
     return runtime, {
+        "base_stack": dict(OPTIMIZED_MAIN_BASE),
         "profile": profile.name,
         "runtime_profile": profile.runtime_profile,
         "runtime_env": {**profile.env_dict(), **runtime_env_overrides},
@@ -361,6 +375,7 @@ def _run_arm(
         cache_route=str(options["cache_route"]),
         dual_norm=bool(options["dual_norm"]),
         source_proposal=bool(options["source_proposal"]),
+        row9_paired_qmv=bool(options["row9_paired_qmv"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

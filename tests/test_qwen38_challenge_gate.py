@@ -87,6 +87,11 @@ def test_optimized_speed_stack_applies_turbo_before_load_and_installs_q4_head() 
     assert stack["draft_sampler"] == contract["recommended_draft_sampler"]
     assert stack["verify_strategy"] == "capture_commit"
     assert stack["verify_core"] == "linear-gdn-from-conv-tape"
+    assert stack["base_stack"] == {
+        "id": "upstream_main_qwen38_optimized_speed",
+        "commit": "bd4421567f9e16ce957c6ef97708b072dcd73937",
+        "internal_control_route": "control",
+    }
 
 
 def test_expand_prompt_hits_exact_token_budget() -> None:
@@ -284,6 +289,9 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "source_proposal",
     }
     assert gate._validate_route_id("r08_device_draft") == {"r08_device_draft"}
+    assert gate._validate_route_id(
+        "r08_device_draft+r09_paired_qmv"
+    ) == {"r08_device_draft", "r09_paired_qmv"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -311,9 +319,22 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "cache_route": "control",
         "dual_norm": False,
         "source_proposal": False,
+        "row9_paired_qmv": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
+
+
+def test_row_9_extends_row_8_with_target_g32_m4_paired_qmv() -> None:
+    gate = _module()
+
+    row_9 = gate._route_execution_options(
+        "r08_device_draft+r09_paired_qmv"
+    )
+
+    assert row_9["draft_core"] == "device"
+    assert row_9["row9_paired_qmv"] is True
+    assert row_9["source_rows"] == (8, 9)
 
 
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:

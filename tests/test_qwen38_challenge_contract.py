@@ -277,3 +277,29 @@ def test_control_route_and_receipt_are_stable() -> None:
         "selfcheck": {"passed": True, "status": "control"},
     }
     assert _qwen38_challenge_route_payload(runtime) == qwen38_route_receipt(route)
+
+
+def test_row9_candidate_route_names_the_target_adaptation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_row9_paired_qmv",
+        lambda **kwargs: {"installed": True, "active": kwargs["active"]},
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(mtp_update_cache=_callable),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="control",
+        row9_paired_qmv=True,
+    )
+
+    assert route.route_id == "r09_paired_qmv"
+    assert route.kernel_ids == ("qwen38_row9_paired_qmv_g32_m4_v1",)
+    assert runtime.qwen38_feature_receipt["r09_paired_qmv"]["active"] is True

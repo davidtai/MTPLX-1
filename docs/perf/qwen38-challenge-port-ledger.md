@@ -1,135 +1,110 @@
-# Qwen 3.8 Challenge Port Ledger
+# Qwen 3.8 Challenge Port: 54-Proposal Ledger
 
-This ledger records the MTPLX disposition of all 82 promoted Yukon Qwen 3.8
-submissions. The immutable source snapshot is
-`receipts/qwen38-challenge-port/yukon-accepted-2026-08-23.json`; the row-by-row
-mechanism mapping is in
-`../../specs/2026-08-23-qwen38-challenge-port-design.md`.
+This is the authoritative campaign state for the 54 chronological Yukon rows
+whose relative score improvement is strictly greater than 0.10%. It replaces
+the invalid eight-bundle ledger. A later descendant, composite, or family gate
+does not prove an earlier proposal. Every row receives its own exact source
+diff review and one of: an individual 16K receipt, exact already-present proof,
+target-shape no-op proof, or removed-later proof.
 
-## Source and benchmark contract
+## Fixed benchmark and stacking contract
 
-- Source gate: `(score / previous promoted score - 1) * 100 > 0.10`.
-- Promoted Yukon rows: 82; above-threshold source rows: 54.
-- Challenge pin: `eb5eadc7a165047d4321ce883b9ff30894d8bd19`.
-- MTPLX branch base pin: `bd4421567f9e16ce957c6ef97708b072dcd73937`.
-- Local promotion gate: strict `>0.05%` matched wall improvement.
-- Inventory check: `python scripts/qwen38_challenge_inventory.py --check`.
+- Base: upstream Optimized-Speed `main` at
+  `bd4421567f9e16ce957c6ef97708b072dcd73937` (v2.9.1), never stock MLX.
+- Runtime: Turbo, compiled verify, packed GQA, Q4/group-64 draft head,
+  persistent committed history, `capture_commit`, and
+  `linear-gdn-from-conv-tape`.
+- Workload: exactly 16,384 Python tokens assembled from `mtplx/generation.py`
+  plus the intact `python_modules_long.jsonl` instruction tail; 1,024 output;
+  target/draft temperature 1.0; top-p 0.95; top-k 20; seed 42; fixed D3.
+- Timing: one conditioning generation per route, then exactly four timed ABBA
+  arms under `/tmp/mtplx-gpu-exclusive.lock`.
+- Promotion: strict matched wall-time improvement greater than 0.05%.
+  Deterministic tie-breaking drift is recorded but is not a rejection reason.
+- Stacking: proposal N's control is Optimized-Speed plus every retained row
+  before N. A retained candidate becomes the next control. Percentages are
+  never added or multiplied.
+- Source: pinned challenge checkout
+  `eb5eadc7a165047d4321ce883b9ff30894d8bd19`. The inventory test resolves and
+  hashes each row's exact parent diff.
 
-The 54 rows are not 54 independent ports. Controlled resamples, no-ops,
-Swift/Metal worker plumbing, already-present MTPLX behavior, intermediate
-variants superseded by later rows, and mechanisms later removed from the
-accepted source sequence are skipped. Only the final transferable descendant
-of each mechanism is implemented and measured.
+## Current measured results
 
-Performance decisions are cumulative and chronological. Candidate `N` is
-measured against the complete stack retained before `N`; a winner becomes the
-next control. Percentages are measured matched wall-time changes, never added
-or multiplied from isolated results.
+Means are two timed arms per route; peak is the maximum timed arm.
 
-The final gate uses exactly 16,384 Python input tokens and 1,024 generated
-tokens. Each route receives one full conditioning generation, followed by four
-timed ABBA arms. Target and draft sampling use temperature 1.0, top-p 0.95,
-top-k 20, and seed 42. The runtime is the exact Optimized-Speed artifact with
-Turbo, the installed Q4/group-64 draft head, depth 3, persistent committed
-history, capture/commit verification, and `linear-gdn-from-conv-tape`. The
-prompt is built from `mtplx/generation.py` with the intact
-`python_modules_long.jsonl` instruction at the tail.
+| Row | Route | Prefill tok/s | Decode tok/s | Peak GiB | Mean wall s | Delta | Decision | Receipt |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 3 | Optimized-Speed main | 754.031 | 51.803 | 25.569 | 42.006 | - | control | `c1-packed-qkv-corrected-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 3 | + packed target Q/K/V | 761.534 | 46.971 | 25.569 | 43.785 | **-4.0629%** | REJECTED, removed | same |
+| 8 | Optimized-Speed main + rows 2-7 dispositions | 750.099 | 52.478 | 24.885 | 41.870 | - | cumulative control | `chrono-r08-device-draft-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 8 | + device-resident fixed-D3 draft chain | 779.772 | 54.038 | 24.885 | 40.413 | **+3.6049%** | **RETAINED** | same |
 
-## Chronological decisions
+Row 8 is therefore part of every later timed control. Row 9's pending gate is
+`r08_device_draft` versus `r08_device_draft+r09_paired_qmv`.
 
-| Order | Source rows / final descendant | Candidate | 16K wall delta | Decision |
-| ---: | --- | --- | ---: | --- |
-| 1 | 3 | packed target attention Q/K/V | **-4.0629%** | Reject and remove. The corrected isolated arm engaged attention only; the earlier positive arm was invalid because it also packed MLP projections. |
-| 2 | 13 | fused GDN QKV+Z and B+A projection pairs | **-7.2989%** | Reject and remove after 7,392 engaged pair calls per candidate arm. |
-| 3 | 11, 20 | K/V-only committed-history append | **+2.3680%** | **Retain as S1**, active only when original request context is at least 16,384 tokens. Exact output/schedule; flat memory. |
-| 4 | 21 | fused Q/K RMSNorm + partial RoPE | **-0.2034%** | Reject and remove. Token drift was not the rejection reason; wall time lost. |
-| 5 | 45 | boundary residual/RMSNorm fusion | **-0.0130%** | Reject and remove as flat/losing; peak memory increased. |
-| 6 | 60, 61 | dual pre-FC RMSNorm / concat-free output | **+1.7907%** | **Retain as S2** under the revised strict `>0.05%` local gate. |
-| 7 | 19, 34, 36, 39, 40, 41, 70, 78, 80 | final cross-row affine-4 QMV, adapted to group-32 target trunk and group-64 source head | **-0.7253%** | Reject and remove after a clean S1+S2 regate. Both candidate arms engaged 296 group-32 M=2 and 42,920 group-32 M=4 calls; exact parity did not rescue the wall regression. |
-| 8 | 10, 42, 46, 47, 67, 69, 71, 79, 82 | source Q4 proposal body with BF16 Q/K/V islands, E87 Q2 cluster shortlist, fused row top-32, and selected Q4 rerank | **+4.2007%** | **Retain as S3** on S1+S2. Both routes were deterministic and completed 1,024 tokens; proposal drift is allowed. |
+## Exact 54-row campaign state
 
-The final production stack is **S3: S1 K/V-only history + S2 dual norm + S3
-source proposal stack**. The history route uses
-the original request length rather than the truncated 8K committed-history
-window. Below the threshold it falls back to the existing stock append. The
-proposal artifact is immutable and proposal-only; every emitted token remains
-target-verified.
+`Patch` is the SHA-256 prefix of the full binary parent diff; `Stats` is that
+same exact diff. `PENDING` means no disposition has been inferred from a later
+row or from the earlier bundle campaign.
 
-## 16K prefill/decode/memory table
+| Row | PR | Yukon delta | Source | Patch | Stats | Individual status |
+| ---: | ---: | ---: | --- | --- | ---: | --- |
+| 2 | 13 | 23.2995% | `97921a3fc5dd` | `bbabc5b7c18a` | +83/-26 | ALREADY PRESENT: checkpoint/rejection fast path is generalized by capture/commit; source D1 policy is superseded by fixed D3. Exact engagement proof pending. |
+| 3 | 18 | 1.5662% | `c9e32f70dac8` | `758626e5d0ea` | +47/-3 | REJECTED at -4.0629%; individual receipt above. |
+| 4 | 24 | 1.2868% | `ec0ba7d9ce42` | `2c67706857e2` | +542/-21 | ALREADY PRESENT: seed-tail logits and lazy capture/commit boundary are broader in main. Exact engagement proof pending. |
+| 5 | 29 | 6.7162% | `ab62ceab428a` | `158a74067412` | +200/-7 | ALREADY PRESENT/ADAPTED: exact device top-k20 sampling supersets source top-2 for the fixed stochastic shape. Exact proof pending. |
+| 6 | 37 | 1.7673% | `5c2441b5f08b` | `061942094f64` | +10/-8 | TARGET-SHAPE NO-OP: there is no second target argmax consumer to reuse under top-k20 sampling. Exact proof pending. |
+| 7 | 38 | 20.4283% | `fe8829244cd9` | `9e25f5798c47` | +227/-22 | ALREADY PRESENT: persistent committed MTP history. Row-8 receipt exercises it; focused proof pending. |
+| 8 | 41 | 17.9183% | `11670086c1b9` | `52c2ac2b4934` | +901/-822 | RETAINED: missing device-resident D3 draft-chain adaptation, +3.6049%. |
+| 9 | 55 | 6.8764% | `b6c725144b56` | `9193949c4c87` | +340/-0 | PORTED FOR GATE: adjacent-row shared-weight QMV adapted from source G64 to live target G32/M4; parity/unit gates pass; 16K ABBA pending. |
+| 10 | 59 | 5.3467% | `61936f26547d` | `c44c6fd53fb6` | +89/-7 | PENDING |
+| 11 | 63 | 5.7425% | `62174dbbca88` | `40a33f553244` | +230/-16 | PENDING |
+| 12 | 70 | 0.8266% | `09eda55a08b1` | `96bb2be6fbe1` | +304/-24 | PENDING |
+| 13 | 71 | 2.0944% | `3e157ad981bb` | `83215ffbd861` | +25/-305 | PENDING |
+| 14 | 77 | 0.9839% | `d81964127281` | `0b3dba1ea446` | +304/-24 | PENDING |
+| 15 | 95 | 3.7597% | `08897af24b57` | `8e803fafd868` | +216/-53 | PENDING |
+| 16 | 103 | 0.5808% | `8f41fa6d4f67` | `114e6ca13e03` | +149/-32 | PENDING |
+| 17 | 126 | 7.5460% | `deb63ad0d170` | `2dbcb36ee10e` | +6/-14 | PENDING |
+| 18 | 135 | 0.4535% | `b6ce964b16bb` | `2181386c97ac` | +324/-247 | PENDING |
+| 19 | 160 | 2.5391% | `1033e1ac5197` | `1a4f47311818` | +581/-97 | PENDING |
+| 20 | 180 | 0.9180% | `cf350293feb4` | `b9b4300e973d` | +144/-8 | PENDING |
+| 21 | 186 | 1.5222% | `4eb54489fb51` | `df0b66eded6c` | +228/-5 | PENDING |
+| 23 | 215 | 0.2964% | `df404e08fee2` | `597330a384fb` | +64/-41 | PENDING |
+| 24 | 234 | 0.9658% | `7351e62674bc` | `849631b545f2` | +54/-14 | PENDING |
+| 25 | 270 | 0.5421% | `c7468c565a7c` | `e8898ba2afd6` | +1/-1 | PENDING |
+| 26 | 276 | 0.1799% | `033f622755ac` | `47dc8c6d9b36` | +14/-6 | PENDING |
+| 28 | 304 | 0.2525% | `6209702fba83` | `a6d69403cda0` | +6/-10 | PENDING |
+| 30 | 350 | 0.4202% | `32b94cb67d2f` | `948f58d0f63b` | +120/-9 | PENDING |
+| 32 | 365 | 0.1764% | `156b5b75bdfa` | `66b436ee06e7` | +58/-24 | PENDING |
+| 33 | 401 | 1.7181% | `cbdc3a8d5fa9` | `9cd8e978d00a` | +92/-7 | PENDING |
+| 34 | 405 | 0.6815% | `79683c633b13` | `aa0820c6217c` | +65/-114 | PENDING |
+| 36 | 423 | 1.6826% | `ed4dfd6b0e95` | `12afdfd18be8` | +105/-40 | PENDING |
+| 37 | 428 | 0.1477% | `be3361b96875` | `882e395797e2` | +33/-13 | PENDING |
+| 38 | 430 | 0.6244% | `0824e0ec28e5` | `dc1e16093bb7` | +2/-2 | PENDING |
+| 39 | 437 | 0.3030% | `1abe6368a882` | `2f3e81092f41` | +13/-33 | PENDING |
+| 40 | 438 | 0.6643% | `d1530a409848` | `7a4e9cbc4c6b` | +4/-4 | PENDING |
+| 41 | 450 | 0.4931% | `0d800b229e94` | `3272565fbdc7` | +6/-6 | PENDING |
+| 42 | 472 | 1.4130% | `036fd9ca2a2c` | `be0fefb19a14` | +124/-9 | PENDING |
+| 45 | 505 | 0.4408% | `868cde8f985a` | `3138ecedd936` | +309/-48 | PENDING |
+| 47 | 530 | 0.5687% | `dccba745af5b` | `e89a06dfd673` | +195/-5 | PENDING |
+| 48 | 543 | 0.1230% | `86fb1f020fc1` | `d2962993b6da` | +422/-240 | PENDING |
+| 50 | 572 | 0.2736% | `c0e34afd857e` | `4b6eb22f8820` | +115/-0 | PENDING |
+| 53 | 600 | 0.1577% | `0c90733d383f` | `39b6322daa32` | +11/-24 | PENDING |
+| 59 | 843 | 1.4217% | `3e2530aeae21` | `a0b5e9aaa3c4` | +23/-2 | PENDING |
+| 60 | 846 | 0.2224% | `88578f929552` | `c529a4989d0d` | +155/-27 | PENDING |
+| 61 | 866 | 0.2836% | `8b54ff11c6d6` | `feeffa289cd4` | +129/-10 | PENDING |
+| 63 | 911 | 0.1698% | `61612aa89dc6` | `0fd574d04a01` | +384/-14 | PENDING: this is a real fused quantized embedding/dual-norm/top-32 patch, not a resample. |
+| 66 | 965 | 0.3080% | `ca0612472eb5` | `ddfede29ee90` | +1/-1 | PENDING |
+| 67 | 968 | 0.3523% | `41bad1c6f124` | `76fa838f3cf2` | +93/-90 | PENDING |
+| 69 | 1031 | 0.2133% | `fac135f222f9` | `863c65d8ae0b` | +412/-746 | PENDING |
+| 70 | 1063 | 3.9125% | `6f1cd66fc214` | `0dd6cffb1309` | +1070/-496 | PENDING |
+| 71 | 1066 | 0.7439% | `a0f8588668c6` | `8b0283f1e500` | +267/-11 | PENDING |
+| 78 | 1123 | 4.3907% | `8849fad72cc3` | `53cc0c1c6e42` | +39/-14 | PENDING |
+| 79 | 1130 | 0.2444% | `1d66bb36cda1` | `503f4fe8d56b` | +7/-10 | PENDING |
+| 80 | 1139 | 0.3477% | `e8f14c444156` | `49484169aabc` | +8/-4 | PENDING |
+| 82 | 1153 | 0.3733% | `eb5eadc7a165` | `3142edaa4070` | +5/-27 | PENDING |
 
-Means are over two timed arms per route; peak memory is the maximum arm value.
-Wall delta is computed from mean total wall time. Absolute throughput varies
-between brackets, so only the matched routes within one receipt are compared.
-
-| Candidate | Arm | Prefill tok/s | Decode tok/s | Peak GiB | Mean wall s | Generated | Wall delta |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Packed Q/K/V | C: Optimized-Speed | 754.031 | 51.803 | 25.569 | 42.006 | 1,024 | - |
-|  | N: packed attention Q/K/V | 761.534 | 46.971 | 25.569 | 43.785 | 1,024 | **-4.0629%** |
-| GDN pairs | C: Optimized-Speed | 756.716 | 52.217 | 27.244 | 41.744 | 1,024 | - |
-|  | N: fused QKVZ + BA | 694.867 | 49.341 | 27.244 | 45.031 | 1,024 | **-7.2989%** |
-| K/V-only history | C: Optimized-Speed | 757.003 | 52.576 | 24.885 | 41.605 | 1,024 | - |
-|  | N: K/V-only >=16K | 778.244 | 52.544 | 24.885 | 40.643 | 1,024 | **+2.3680%** |
-| Q/K norm + RoPE | C: S1 | 774.028 | 51.919 | 24.885 | 40.990 | 1,024 | - |
-|  | N: S1 + Q/K | 776.849 | 51.492 | 24.885 | 41.073 | 1,024 | **-0.2034%** |
-| Boundary norm | C: S1 | 781.277 | 51.681 | 24.885 | 40.885 | 1,024 | - |
-|  | N: S1 + boundary | 782.377 | 51.616 | 24.944 | 40.891 | 1,024 | **-0.0130%** |
-| Dual norm | C: S1 | 750.642 | 52.609 | 24.885 | 41.436 | 1,024 | - |
-|  | N: S1 + dual | 780.373 | 52.219 | 24.885 | 40.707 | 1,024 | **+1.7907%** |
-| Final QMV | C: S1 + dual | 783.797 | 51.754 | 24.885 | 40.792 | 1,024 | - |
-|  | N: S1 + dual + QMV | 776.564 | 51.473 | 24.885 | 41.090 | 1,024 | **-0.7253%** |
-| Source proposal | C: S1 + dual | 739.856 | 51.591 | 25.707 | 42.131 | 1,024 | - |
-|  | N: final S3 stack | 763.518 | 54.245 | 25.707 | 40.432 | 1,024 | **+4.2007%** |
-
-K/V has direct causal evidence beyond the aggregate wall delta. Its two timed
-arms reduced prompt MTP-history append from 0.448-0.485 seconds to
-0.112-0.116 seconds. Dual norm's clean regate engaged 877 calls in both
-candidate arms and cleared the revised floor. C8 engaged 885 calls per timed
-arm for each of E87 probe selection, fused row top-32, selected Q4 rerank, the
-Q precision island, and proposal selection; K and V islands each engaged 1,163
-times. Its timed control and candidate arms had the same matched
-25.707 GiB peak because both route objects were resident for ABBA switching.
-
-The Q/K receipt predates the final tie-breaking classification and marks its
-cross-route token drift as `correctness.passed=false`. Both routes were
-individually deterministic, produced all 1,024 tokens, and had identical depth
-schedules. Its rejection is the measured 0.2034% wall regression, not the token
-hash difference.
-
-## Skipped source mechanisms
-
-| Classification | Mechanisms | Reason |
-| --- | --- | --- |
-| Already present | fused target Q/K/V projection; GDN `in_proj_qkvz` / `in_proj_ba`; verify-hidden reuse; compiled attention gate; committed-history and replay infrastructure; Q4 draft head; warmup and EV/cost policy | Optimized-Speed already owns the same work or a broader compiled boundary. A duplicate port is a no-op or adds dispatch overhead. |
-| Weak / no-op | 27 rows at or below 0.10%, controlled resamples, bookkeeping-only changes | No qualifying source performance claim. |
-| Superseded / removed later | intermediate compact-head, QMV, fusion, and calibration variants | Only the final surviving descendant receives an MTPLX gate. |
-| Challenge-only | Swift worker plumbing, declared-head staging, Metal command-buffer/residency policy, trusted-worker target top-2 ledger | No equivalent consumer or ownership boundary exists in Python MTPLX. |
-| Source-specific | one-forward SDPA workaround and source depth floor 6/cap 7 | MTPLX has no matching SDPA width wall and the measured policy is depth 3. |
-| Artifact/provenance | declared compact/island artifact | Retained by exact HF revision, raw LFS SHA-256, byte count, metadata, and tensor-shape checks. Runtime resolution is cache/path-only and never downloads implicitly. |
-
-## Authoritative receipts
-
-- Retained S1:
-  `conditioned-s1-kv-ge16384-request-context-python-long16384in-1024out-t1-abba-2026-08-23.json`.
-- Retained S2:
-  `conditioned-r61-dual-stack-corrected-s1-python-long16384in-1024out-t1-abba-2026-08-23.json`.
-- Rejected C7:
-  `c7-qmv-g32-g64-on-c3-c6-python16384in-1024out-t1-abba-2026-08-23.json`.
-- Retained S3:
-  `c8-source-proposal-on-c3-c6-python16384in-1024out-t1-abba-2026-08-23.json`.
-- Production S3 control-release verification:
-  `final-s3-production-route-verify-2026-08-23.md` (816.916 prefill tok/s,
-  54.398 decode tok/s, 25.041 GiB peak, 38.990 s wall).
-- Rejections: the corrected `c1-packed-qkv`, `c2-gdn-projection-pairs`,
-  `chrono-r21`, and `chrono-r45` 16K receipts in the same directory.
-- QMV numerical tie audit:
-  `qmv-final-g32-g64-real-model-numeric-parity-2026-08-23.json`. This records
-  the earlier uncorrected QMV attempt; it was rejected for performance, not
-  parity. The corrected, group-aware C7 regate above is the authoritative
-  rejection.
-- Static benchmark contract:
-  `receipts/qwen38-challenge-port/control-contract-2026-08-23.md`.
-
-The final route names only the three retained families. Rejected packed-QKV,
-GDN-pair, Q/K-RoPE, boundary-norm, and final-QMV experiments are absent from the
-production path. C8's cross-repository weight dependency and lineage are
-declared in `qwen38-source-artifact-manifest.json` and staged by `mtplx pull`.
+The campaign remains incomplete until every `PENDING` cell is replaced by
+direct evidence and every applicable retained implementation has its own 16K
+receipt on the cumulative stack.
