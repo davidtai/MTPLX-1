@@ -25,6 +25,10 @@ DEFAULT_MODEL = Path.home() / (
 )
 DEFAULT_PROMPT = ROOT / "mtplx/benchmarks/prompts/python_modules_long.jsonl"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
+DEFAULT_COMPACT_HEAD = (
+    Path.home()
+    / ".cache/mtplx/qwen38-optimized-speed-compact-q2-v1/model.safetensors"
+)
 
 
 def _read_prompt(path: Path) -> tuple[str, str]:
@@ -44,21 +48,39 @@ def _run_arm(
     prompt_ids: list[int],
     *,
     route_id: str,
+    compact_head_path: Path,
     max_tokens: int,
     seed: int,
+    target_temperature: float,
+    draft_temperature: float,
 ) -> dict[str, Any]:
     from mtplx.generation import generate_mtpk
     from mtplx.qwen38_challenge import install_qwen38_route
     from mtplx.sampling import SamplerConfig
 
+    features = set(route_id.split("+"))
+    cache_route = "kv_only_history" if "kv_only_history" in features else "control"
+    proposal_route = "compact_head" if "compact_head" in features else "control"
     route = install_qwen38_route(
         runtime,
         config,
         model_path,
-        cache_route=route_id,
+        cache_route=cache_route,
+        proposal_route=proposal_route,
+        compact_head_path=(
+            compact_head_path if proposal_route == "compact_head" else None
+        ),
     )
-    target_sampler = SamplerConfig(temperature=0.6, top_p=0.95, top_k=20)
-    draft_sampler = SamplerConfig(temperature=1.0, top_p=0.95, top_k=20)
+    target_sampler = SamplerConfig(
+        temperature=target_temperature,
+        top_p=0.95,
+        top_k=20,
+    )
+    draft_sampler = SamplerConfig(
+        temperature=draft_temperature,
+        top_p=0.95,
+        top_k=20,
+    )
     started = time.perf_counter()
     output = generate_mtpk(
         runtime,
@@ -101,9 +123,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT)
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--target-temperature", type=float, default=0.6)
+    parser.add_argument("--draft-temperature", type=float, default=1.0)
     parser.add_argument("--order", default="control,kv_only_history,kv_only_history,control")
+    parser.add_argument("--control-route")
+    parser.add_argument("--candidate-route")
     parser.add_argument("--warmup-tokens", type=int, default=8)
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
+    parser.add_argument("--compact-head", type=Path, default=DEFAULT_COMPACT_HEAD)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -125,8 +152,15 @@ def main() -> int:
     prompt_id, prompt = _read_prompt(args.prompt_file)
     prompt_ids = list(runtime.tokenizer.encode(prompt))
     order = [item.strip() for item in args.order.split(",") if item.strip()]
-    if not order or any(item not in {"control", "kv_only_history"} for item in order):
-        raise ValueError("order must contain only control and kv_only_history")
+    allowed = {
+        "control",
+        "kv_only_history",
+        "compact_head",
+        "compact_head+kv_only_history",
+    }
+    if not order or any(item not in allowed for item in order):
+        raise ValueError(f"order entries must be one of {sorted(allowed)}")
+    unique_routes = list(dict.fromkeys(order))
 
     warmups = [
         _run_arm(
@@ -135,10 +169,13 @@ def main() -> int:
             model_path,
             prompt_ids,
             route_id=route_id,
+            compact_head_path=args.compact_head,
             max_tokens=args.warmup_tokens,
             seed=args.seed,
+            target_temperature=args.target_temperature,
+            draft_temperature=args.draft_temperature,
         )
-        for route_id in ("control", "kv_only_history")
+        for route_id in unique_routes
     ]
     arms = [
         _run_arm(
@@ -147,29 +184,43 @@ def main() -> int:
             model_path,
             prompt_ids,
             route_id=route_id,
+            compact_head_path=args.compact_head,
             max_tokens=args.max_tokens,
             seed=args.seed,
+            target_temperature=args.target_temperature,
+            draft_temperature=args.draft_temperature,
         )
         for route_id in order
     ]
     hashes = {arm["token_hash"] for arm in arms}
     attempted = {tuple(arm["attempted_depth_schedule"]) for arm in arms}
     accepted = {tuple(arm["accepted_depth_schedule"]) for arm in arms}
-    exact = len(hashes) == len(attempted) == len(accepted) == 1
+    token_exact = len(hashes) == 1
+    schedule_exact = len(attempted) == len(accepted) == 1
+    proposal_candidate = any("compact_head" in item for item in order)
+    exact = token_exact and (proposal_candidate or schedule_exact)
     by_route = {
         route_id: [arm["wall_s"] for arm in arms if arm["route_id"] == route_id]
-        for route_id in ("control", "kv_only_history")
+        for route_id in unique_routes
     }
     means = {
         route_id: sum(values) / len(values)
         for route_id, values in by_route.items()
         if values
     }
-    improvement_pct = (
-        (means["control"] / means["kv_only_history"] - 1.0) * 100.0
-        if set(means) == {"control", "kv_only_history"}
-        else None
-    )
+    control_id = args.control_route
+    candidate_id = args.candidate_route
+    if control_id is None and candidate_id is None and len(unique_routes) == 2:
+        control_id, candidate_id = unique_routes
+    if (control_id is None) != (candidate_id is None):
+        raise ValueError("control-route and candidate-route must be supplied together")
+    if control_id is not None and (
+        control_id not in unique_routes or candidate_id not in unique_routes
+    ):
+        raise ValueError("control-route and candidate-route must occur in order")
+    improvement_pct = None
+    if control_id is not None and candidate_id is not None:
+        improvement_pct = (means[control_id] / means[candidate_id] - 1.0) * 100.0
     receipt = {
         "kind": "qwen38_challenge_port_gate",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -179,6 +230,8 @@ def main() -> int:
         "prompt_tokens": len(prompt_ids),
         "max_tokens": args.max_tokens,
         "seed": args.seed,
+        "target_temperature": args.target_temperature,
+        "draft_temperature": args.draft_temperature,
         "order": order,
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -194,6 +247,11 @@ def main() -> int:
             text=True,
         ).splitlines(),
         "exact": exact,
+        "token_exact": token_exact,
+        "schedule_exact": schedule_exact,
+        "proposal_candidate": proposal_candidate,
+        "control_route_id": control_id,
+        "candidate_route_id": candidate_id,
         "mean_wall_s": means,
         "candidate_improvement_pct": improvement_pct,
         "warmups": warmups,

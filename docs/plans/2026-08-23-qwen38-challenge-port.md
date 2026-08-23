@@ -341,8 +341,9 @@ or fails closed for the candidate route.
 
 - [ ] **Step 5: Implement the 32-value/lane affine-2 cluster QMV**
 
-Match real N=12292/non-multiple-of-eight behavior, 3073-tile gather, packing,
-and dtype. Test tail rows explicitly.
+Match real N=12292/non-multiple-of-eight behavior, the final 0.15 probe fraction
+(1,844 leaves and 14,752 gathered rows), packing, and dtype. Test tail rows
+explicitly. The earlier 3,073-leaf setting was superseded and must not return.
 
 - [ ] **Step 6: Verify proposal safety and locked performance**
 
@@ -519,12 +520,15 @@ Rejected fusions leave documentation and receipts only.
 - [ ] **Step 1: Write failing provenance and artifact tests**
 
 Require immutable source revision, SHA-256, byte size, license, complete tensor
-map, exact precision-island rows, Q2/Q4 packing, and model-family identity.
+map, exact precision-island rows, Q2/Q4 packing, and model-family identity. The
+accepted remote artifact currently has no license declaration or model card;
+it is a local comparison input, not a redistributable MTPLX dependency.
 
 - [ ] **Step 2: Reproduce the artifact outside the timed benchmark**
 
-Do not runtime-requantize the head. Verify the generated artifact equals the
-declared digest and loads without rewriting target weights.
+Do not requantize inside timed decode. Derive any MTPLX-owned proposal table
+from the pinned local target during an explicit setup step, verify its digest,
+and load it without rewriting target weights.
 
 - [ ] **Step 3: Run proposal and target parity gates**
 

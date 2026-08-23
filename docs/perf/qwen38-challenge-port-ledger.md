@@ -25,11 +25,11 @@ rows are dependencies only when a surviving final mechanism requires them.
 | Candidate | Historical rows | Initial disposition | MTPLX gate | Receipt | Final status |
 | --- | --- | --- | --- | --- | --- |
 | Exact target top-2/readout reuse | 5, 6 | CHALLENGE-ONLY after MTPLX call-path inspection | no target top-2 consumer; port would add two dispatches | source PRs #29/#37 and `generation.py` argmax sites | SKIP |
-| Compact Q2 coarse/Q4 rerank proposal head | 10, 42, 46, 47, 67, 69, 71, 79, 82 | PORT plus row 46 dependency | pending | pending | pending |
+| Compact Q2 coarse/exact rerank proposal head | 10, 42, 46, 47, 67, 69, 71, 79, 82 | PORT plus row 46 dependency; adapt exact rerank to the named target's Q8 rows | dense compact stage: exact Python-100 token/depth parity; +6.38% ABBA and +5.08% BAAB; final derived-cluster stage pending | `compact-head-python-100t-{abba,baab}-2026-08-23.json`; local Q2 artifact `77f093…d3e8` | DENSE STAGE RETAINED; CLUSTER STAGE PENDING |
 | Final cross-row affine-4/group-64 QMV | 19, 34, 36, 39, 40, 41, 70, 78, 80 | PORT/dependency as one final family | pending | pending | pending |
 | Projection/GDN/attention/norm fusions | 3, 13, 16, 18, 21, 30, 45, 60, 61 | PORT as final retained forms | pending | pending | pending |
 | K/V-only history append and early submission | 11, 20 | PORT only absent K/V-only append; early submission already implicit | exact cache; Python-100 token/depth parity; +3.56% ABBA and +1.69% BAAB; longer parity gates also pass | `kv-only-history-python-100t{-baab,}-2026-08-23.json` plus longer receipts | RETAINED |
-| Compact-head precision-island artifact | 33, 36 | PORT artifact candidate | pending | pending | pending |
+| Compact-head precision-island artifact | 33, 36 | EVALUATE artifact candidate | accepted HF tree verified (`559b24…5f71`) but it targets a different Q4 head and declares no license/card | local comparison only; no production dependency | pending benchmark; provenance blocks redistribution |
 | Final depth/warm calibration | 11, 38, 59 | PORT into existing controller only | pending | pending | pending |
 
 ## Skip summary

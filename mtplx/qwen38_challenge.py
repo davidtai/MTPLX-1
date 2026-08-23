@@ -367,10 +367,15 @@ def _stock_policy_factory(factory: Callable[..., Any], *args: Any, **kwargs: Any
 
 
 def control_bindings(runtime: Any) -> Qwen38RouteBindings:
+    stock_cache_append = getattr(
+        runtime.model,
+        "mtp_update_cache",
+        runtime.update_mtp_cache,
+    )
     return Qwen38RouteBindings(
         proposal_readout=_stock_proposal_readout,
         qmv_by_width={width: _stock_qmv for width in QWEN38_QMV_WIDTHS},
-        mtp_cache_append=runtime.update_mtp_cache,
+        mtp_cache_append=stock_cache_append,
         projection_fusions={"stock": _stock_projection},
         policy_factory=_stock_policy_factory,
     )
@@ -395,16 +400,20 @@ def install_qwen38_route(
     model_path: Path,
     *,
     cache_route: str = DEFAULT_QWEN38_CACHE_ROUTE,
+    proposal_route: str = "control",
+    compact_head_path: Path | None = None,
 ) -> Qwen38RouteSpec | None:
     if not is_qwen38_27b_candidate(config, model_path):
         return None
     if not bool(getattr(runtime, "mtp_enabled", False)):
         return None
-    route_id = str(cache_route or "control").strip().lower()
+    cache_route_id = str(cache_route or "control").strip().lower()
+    proposal_route_id = str(proposal_route or "control").strip().lower()
     bindings = control_bindings(runtime)
-    kernel_ids: tuple[str, ...] = ()
+    kernel_ids: list[str] = []
     selfcheck_status = "control"
-    if route_id == "kv_only_history":
+    compact_head_digest = None
+    if cache_route_id == "kv_only_history":
         implementation = getattr(
             runtime.model,
             "mtp_update_cache_kv_only_history",
@@ -415,16 +424,57 @@ def install_qwen38_route(
                 "Qwen 3.8 K/V-only history route is unavailable on the loaded model"
             )
         bindings = replace(bindings, mtp_cache_append=implementation)
-        kernel_ids = ("qwen38_mtp_kv_only_history_v1",)
+        kernel_ids.append("qwen38_mtp_kv_only_history_v1")
         selfcheck_status = "passed:cache_exact+64t_abba_baab"
-    elif route_id != "control":
+    elif cache_route_id != "control":
         raise Qwen38ContractError(f"unknown Qwen 3.8 cache route: {cache_route!r}")
+
+    if proposal_route_id == "compact_head":
+        if compact_head_path is None:
+            raise Qwen38ContractError("compact_head route requires compact_head_path")
+        from .qwen38_compact_head import install_qwen38_compact_proposal_head
+
+        artifact = install_qwen38_compact_proposal_head(
+            runtime,
+            compact_head_path,
+            source_contract_id=validate_qwen38_27b_contract(
+                config,
+                model_path,
+            ).contract_id,
+        )
+        text = getattr(runtime.model, "language_model", runtime.model)
+        proposal = getattr(text, "_mtplx_draft_lm_head")
+        bindings = replace(bindings, proposal_readout=proposal)
+        compact_head_digest = artifact.sha256
+        kernel_ids.extend(
+            (
+                "qwen38_compact_q2_shortlist_reference_v1",
+                "qwen38_target_q8_selected_rerank_reference_v1",
+            )
+        )
+        selfcheck_status = "pending:python100"
+    elif proposal_route_id == "control":
+        from .qwen38_compact_head import restore_qwen38_control_proposal_head
+
+        restore_qwen38_control_proposal_head(runtime)
+    else:
+        raise Qwen38ContractError(
+            f"unknown Qwen 3.8 proposal route: {proposal_route!r}"
+        )
+
+    route_parts = []
+    if proposal_route_id != "control":
+        route_parts.append(proposal_route_id)
+    if cache_route_id != "control":
+        route_parts.append(cache_route_id)
+    route_id = "+".join(route_parts) or "control"
     route = build_qwen38_route(
         config,
         model_path,
         bindings=bindings,
         route_id=route_id,
-        kernel_ids=kernel_ids,
+        compact_head_digest=compact_head_digest,
+        kernel_ids=tuple(kernel_ids),
         selfcheck_status=selfcheck_status,
     )
     runtime.qwen38_route = route

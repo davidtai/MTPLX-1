@@ -11,6 +11,7 @@ from mtplx.qwen38_challenge import (
     Qwen38ContractError,
     Qwen38RouteBindings,
     build_qwen38_route,
+    control_bindings,
     install_qwen38_control_route,
     install_qwen38_route,
     is_qwen38_27b_candidate,
@@ -277,3 +278,29 @@ def test_kv_only_candidate_binds_exact_route_and_runtime_dispatches_to_it() -> N
     assert route.kernel_ids == ("qwen38_mtp_kv_only_history_v1",)
     assert result == "candidate"
     assert calls == ["kv_only"]
+
+
+def test_non_cache_candidate_binding_uses_model_append_without_runtime_recursion() -> None:
+    calls: list[str] = []
+
+    def stock(*args, **kwargs):
+        calls.append("stock")
+        return "stock"
+
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(mtp_update_cache=stock),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+    bindings = control_bindings(runtime)
+    runtime.qwen38_route = build_qwen38_route(
+        _config(),
+        MODEL_PATH,
+        bindings=bindings,
+        route_id="proposal_only_test",
+    )
+
+    assert runtime.update_mtp_cache("hidden", "tokens", mtp_cache="cache") == "stock"
+    assert calls == ["stock"]
