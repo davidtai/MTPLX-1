@@ -421,8 +421,9 @@ created.  The enabled callables do not probe eligibility or fall back.
   Authentic three-bank/final-bit parity passed, and matched one-cycle gates
   improved from 30.84--30.87 tok/s to 39.74--39.79 tok/s.  The retained
   construction-bound piecewise target route, which compiles only cache-free
-  regions around the same eager attention calls, subsequently measured 43.531
-  tok/s on that full-acceptance gate.  Sustained measurement remains separate.
+  regions around the same eager attention calls, subsequently measured 43.523
+  tok/s on that full-acceptance gate after preserving the source BF16 head
+  boundary before RMSNorm.  Sustained measurement remains separate.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_moe_router.py` and the
   installed `EXL3SwitchGLU.direct_qmv_m6_quad` /
   `EXL3SwitchGLU.fused` paths in `mtplx/deepseek_v4_exl3.py`.  The scalar

@@ -77,10 +77,11 @@ keeps all 43 cache-owning attention calls eager. Construction prewarms those
 fixed regions and binds the route directly; decode does not perform an
 eligibility check or silent fallback. On the same 1,024-token repeated-prompt,
 single-cycle gate used for the earlier 39.74--39.79 tok/s comparison, the final
-`5c382ad6` tree generated six tokens in one 137.833 ms physical cycle, accepted
-all 5/5 DSpark drafts, and measured **43.531 tok/s**. The artifact, source pins,
-stock432/Mia132 cache layout, and emitted token digest are recorded in the raw
-receipt.
+`015153d9` tree generated six tokens in one 137.857 ms physical cycle, accepted
+all 5/5 DSpark drafts, and measured **43.523 tok/s**. This tree also preserves
+the pinned BF16 head-collapse boundary before the model-owned RMSNorm. The
+artifact, source pins, stock432/Mia132 cache layout, and emitted token digest
+are recorded in the raw receipt.
 
 This is deliberately a full-acceptance cycle-cost gate, not a sustained or
 nonrepetitive-prompt throughput claim. The cold Python-vocabulary ladder above
@@ -89,14 +90,14 @@ many useful tokens each physical M6 cycle returns.
 
 Raw receipt:
 
-- [`mia-5c382ad6-piecewise-1024x6-full-accept.json`](../../../bench/deepseek-v4-mia/mia-5c382ad6-piecewise-1024x6-full-accept.json)
+- [`mia-015153d9-piecewise-1024x6-full-accept.json`](../../../bench/deepseek-v4-mia/mia-015153d9-piecewise-1024x6-full-accept.json)
 
 ## Remaining performance headroom
 
 The retained 16-byte Trellis staging change first raised matched short-cycle
 decode from 30.84--30.87 tok/s to 39.74--39.79 tok/s with exact final bits and
 5/5 accepted drafts. The construction-bound piecewise target route now clears
-that same full-acceptance gate at 43.531 tok/s. This remains a cycle-cost result,
+that same full-acceptance gate at 43.523 tok/s. This remains a cycle-cost result,
 not a performance ceiling or a substitute for the sustained rows above. The
 long-context receipts still expose meaningful work in paged MLA attention and
 in the number of physical verification cycles.
