@@ -68,6 +68,18 @@ class ValidationReport:
     errors: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SourceDiffReceipt:
+    ordinal: int
+    pr_number: int
+    source_commit: str
+    parent_commit: str
+    patch_sha256: str
+    files: tuple[str, ...]
+    insertions: int
+    deletions: int
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -163,6 +175,81 @@ def validate_inventory(inventory: Inventory) -> ValidationReport:
             f"found {len(qualifying)}"
         )
     return ValidationReport(qualifying_rows=qualifying, errors=tuple(errors))
+
+
+def build_source_diff_manifest(
+    rows: Sequence[InventoryRow],
+    challenge_repo: Path,
+) -> tuple[SourceDiffReceipt, ...]:
+    """Bind every qualifying row to its exact parent patch in the source repo."""
+
+    commits = [row.source_commit for row in rows]
+    _validate_challenge_checkout(challenge_repo, commits)
+    receipts: list[SourceDiffReceipt] = []
+    for row in rows:
+        parent = subprocess.run(
+            ["git", "rev-parse", f"{row.source_commit}^"],
+            cwd=challenge_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        patch = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--binary",
+                parent,
+                row.source_commit,
+                "--",
+            ],
+            cwd=challenge_repo,
+            check=True,
+            capture_output=True,
+        ).stdout
+        numstat = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--numstat",
+                parent,
+                row.source_commit,
+                "--",
+            ],
+            cwd=challenge_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        files: list[str] = []
+        insertions = 0
+        deletions = 0
+        for line in numstat:
+            added, removed, path = line.split("\t", 2)
+            if added == "-" or removed == "-":
+                raise ValueError(
+                    f"row {row.ordinal}: binary numstat cannot prove line coverage"
+                )
+            insertions += int(added)
+            deletions += int(removed)
+            files.append(path)
+        if not patch or not files:
+            raise ValueError(f"row {row.ordinal}: source parent diff is empty")
+        receipts.append(
+            SourceDiffReceipt(
+                ordinal=row.ordinal,
+                pr_number=row.pr_number,
+                source_commit=row.source_commit,
+                parent_commit=parent,
+                patch_sha256=hashlib.sha256(patch).hexdigest(),
+                files=tuple(files),
+                insertions=insertions,
+                deletions=deletions,
+            )
+        )
+    return tuple(receipts)
 
 
 def _extract_yukon_rows(path: Path) -> list[dict[str, Any]]:

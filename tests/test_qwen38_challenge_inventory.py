@@ -9,6 +9,7 @@ from scripts import qwen38_challenge_inventory as inventory_tool
 from scripts.qwen38_challenge_inventory import (
     CHALLENGE_COMMIT,
     QUALIFYING_RELATIVE_PERCENT,
+    build_source_diff_manifest,
     load_inventory,
     validate_inventory,
 )
@@ -23,6 +24,7 @@ RECEIPT = (
     / "yukon-accepted-2026-08-23.json"
 )
 DESIGN = ROOT / "docs" / "specs" / "2026-08-23-qwen38-challenge-port-design.md"
+CHALLENGE_REPO = ROOT.parent.parent / "qwen-3.8-mtp-challenge"
 
 
 def test_pinned_inventory_covers_every_accepted_submission() -> None:
@@ -90,3 +92,26 @@ def test_regeneration_requires_explicit_checkout_and_threshold() -> None:
                 "/does/not/matter.json",
             ]
         )
+
+
+def test_every_qualifying_row_has_an_exact_parent_diff_receipt() -> None:
+    inventory = load_inventory(RECEIPT, DESIGN)
+    report = validate_inventory(inventory)
+
+    diffs = build_source_diff_manifest(report.qualifying_rows, CHALLENGE_REPO)
+
+    assert len(diffs) == 54
+    assert [item.ordinal for item in diffs] == [
+        row.ordinal for row in report.qualifying_rows
+    ]
+    assert all(len(item.parent_commit) == 40 for item in diffs)
+    assert all(len(item.patch_sha256) == 64 for item in diffs)
+    assert all(item.files for item in diffs)
+    assert all(item.insertions + item.deletions > 0 for item in diffs)
+    assert diffs[0].ordinal == 2
+    assert diffs[0].files == (
+        "Sources/MLXFastModel/Qwen36MTPBlockSession.swift",
+    )
+    assert diffs[0].insertions == 83
+    assert diffs[0].deletions == 26
+    assert next(item for item in diffs if item.ordinal == 63).insertions == 384

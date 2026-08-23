@@ -170,6 +170,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "kv_only_history",
         "dual_norm",
         "source_proposal",
+        "r08_device_draft",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -177,6 +178,24 @@ def _validate_route_id(route_id: str) -> set[str]:
     if "control" in features and len(features) != 1:
         raise ValueError("control cannot be combined with candidate features")
     return features
+
+
+def _route_execution_options(route_id: str) -> dict[str, Any]:
+    """Translate chronological proposal features into one cumulative run."""
+
+    features = _validate_route_id(route_id)
+    source_rows: list[int] = []
+    if "r08_device_draft" in features:
+        source_rows.append(8)
+    return {
+        "cache_route": (
+            "kv_only_history" if "kv_only_history" in features else "control"
+        ),
+        "dual_norm": "dual_norm" in features,
+        "source_proposal": "source_proposal" in features,
+        "draft_core": "device" if "r08_device_draft" in features else "stock",
+        "source_rows": tuple(source_rows),
+    }
 
 
 def _promotion_decision(
@@ -334,15 +353,14 @@ def _run_arm(
     from mtplx.qwen38_challenge import install_qwen38_route
     from mtplx.sampling import SamplerConfig
 
-    features = _validate_route_id(route_id)
-    cache_route = "kv_only_history" if "kv_only_history" in features else "control"
+    options = _route_execution_options(route_id)
     route = install_qwen38_route(
         runtime,
         config,
         model_path,
-        cache_route=cache_route,
-        dual_norm="dual_norm" in features,
-        source_proposal="source_proposal" in features,
+        cache_route=str(options["cache_route"]),
+        dual_norm=bool(options["dual_norm"]),
+        source_proposal=bool(options["source_proposal"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(
@@ -368,6 +386,7 @@ def _run_arm(
         seed=seed,
         mtp_hidden_variant="post_norm",
         mtp_cache_policy="persistent",
+        draft_core=str(options["draft_core"]),
         verify_strategy="capture_commit",
         verify_core="linear-gdn-from-conv-tape",
         mtp_history_policy="committed",
@@ -386,6 +405,8 @@ def _run_arm(
         "feature_receipt": dict(
             getattr(runtime, "qwen38_feature_receipt", {}) or {}
         ),
+        "source_rows": list(options["source_rows"]),
+        "draft_core": str(options["draft_core"]),
         "engagement": _counter_delta(counters_before, counters_after),
         "wall_s": wall_s,
         "generated_tokens": int(stats.generated_tokens),

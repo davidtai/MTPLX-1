@@ -283,6 +283,7 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "dual_norm",
         "source_proposal",
     }
+    assert gate._validate_route_id("r08_device_draft") == {"r08_device_draft"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -297,6 +298,22 @@ def test_route_validation_rejects_control_combinations() -> None:
 
     with pytest.raises(ValueError, match="control cannot be combined"):
         gate._validate_route_id("control+dual_norm")
+
+
+def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> None:
+    gate = _module()
+
+    control = gate._route_execution_options("control")
+    row_8 = gate._route_execution_options("r08_device_draft")
+
+    assert control["draft_core"] == "stock"
+    assert row_8 == {
+        "cache_route": "control",
+        "dual_norm": False,
+        "source_proposal": False,
+        "draft_core": "device",
+        "source_rows": (8,),
+    }
 
 
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:
