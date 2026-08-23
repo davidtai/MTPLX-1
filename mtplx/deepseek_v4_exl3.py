@@ -3051,6 +3051,7 @@ def load_mia_exl3_dspark_model(
         install_mia_qkv_prologue_routes,
         install_mia_tp1_wo_projection_routes,
         install_mia_stacked_projections,
+        install_mia_wq_b_m6_routes,
     )
 
     wo_projection = install_mia_tp1_wo_projection_routes(
@@ -3096,6 +3097,24 @@ def load_mia_exl3_dspark_model(
     ):
         raise RuntimeError(
             f"Mia fused Q/KV prologue installation is incomplete: {qkv_prologue}"
+        )
+
+    wq_b_m6 = install_mia_wq_b_m6_routes(model)
+    if wq_b_m6 != {
+        "route": "mia_wq_b_m6",
+        "target_attention": 43,
+        "draft_attention_stock": 3,
+        "plan_count": 43,
+        "unique_plan_count": 43,
+        "plan_type": "MiaWQBM6Route",
+        "geometry": (1024, 32768, 6),
+        "descriptor_sha256": (
+            "b3ef2fb537e88b613a9d106a3836ab47"
+            "f08512cf6b9141b01a1aa35253d2dfad"
+        ),
+    }:
+        raise RuntimeError(
+            f"Mia target wq_b M6 installation is incomplete: {wq_b_m6}"
         )
 
     from mtplx.deepseek_v4_mia_engine import build_mia_engine_plan

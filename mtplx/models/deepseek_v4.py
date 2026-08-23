@@ -2043,6 +2043,76 @@ def install_mia_qkv_prologue_routes(model) -> dict:
     return receipt
 
 
+def mia_wq_b_m6_receipt(model) -> dict:
+    """Return the construction seal for target-only physical-M6 ``wq_b``."""
+    from mtplx.kernels.deepseek_v4_mxfp8_qmv_m6 import (
+        MIA_WQ_B_M6_DESCRIPTOR_SHA256,
+        MiaWQBM6Route,
+        _mxfp8_qmv_m6_kernel,
+    )
+
+    target, draft = _mia_qkv_attentions(model)
+    routes = tuple(attention._mia_wq_b_impl for attention in target)
+    if any(type(route) is not MiaWQBM6Route for route in routes):
+        raise ValueError("the exact Mia target wq_b M6 route is absent or changed")
+    for index, (attention, route) in enumerate(
+        zip(target, routes, strict=True)
+    ):
+        if route.stock is not attention.wq_b:
+            raise ValueError(f"Mia target wq_b route {index} lost its stock owner")
+        if (
+            route.m6.k != 1024
+            or route.m6.n != 32768
+            or route.m6.weight is not attention.wq_b.weight
+            or route.m6.scales is not attention.wq_b.scales
+            or route.m6.kernel is not _mxfp8_qmv_m6_kernel(1024, 32768)
+            or route.m6.descriptor_sha256
+            != MIA_WQ_B_M6_DESCRIPTOR_SHA256
+        ):
+            raise ValueError(f"Mia target wq_b route {index} geometry changed")
+    for attention in draft:
+        stock = attention._mia_wq_b_impl
+        if (
+            getattr(stock, "__self__", None) is not attention
+            or getattr(stock, "__func__", None)
+            is not type(attention)._stock_wq_b_projection
+        ):
+            raise ValueError("the Mia draft wq_b route must remain stock")
+    route_ids = tuple(id(route) for route in routes)
+    if len(set(route_ids)) != len(routes):
+        raise ValueError("Mia target wq_b M6 routes must be one-to-one")
+    return {
+        "route": "mia_wq_b_m6",
+        "target_attention": len(target),
+        "draft_attention_stock": len(draft),
+        "plan_count": len(routes),
+        "unique_plan_count": len(set(route_ids)),
+        "plan_type": "MiaWQBM6Route",
+        "geometry": (1024, 32768, 6),
+        "descriptor_sha256": MIA_WQ_B_M6_DESCRIPTOR_SHA256,
+    }
+
+
+def install_mia_wq_b_m6_routes(model) -> dict:
+    """Bind the leaf-qualified M6 lane to all and only target ``wq_b`` owners."""
+    from mtplx.kernels.deepseek_v4_mxfp8_qmv_m6 import (
+        install_mia_wq_b_m6_route,
+    )
+
+    if getattr(model, "_mia_wq_b_m6_receipt", None) is not None:
+        raise ValueError("the Mia target wq_b M6 routes are already installed")
+    target, _draft = _mia_qkv_attentions(model)
+    routes = tuple(
+        install_mia_wq_b_m6_route(attention.wq_b)
+        for attention in target
+    )
+    for attention, route in zip(target, routes, strict=True):
+        attention.install_mia_wq_b_m6_route(route)
+    receipt = mia_wq_b_m6_receipt(model)
+    model._mia_wq_b_m6_receipt = receipt
+    return receipt
+
+
 def install_mia_target_rope_providers(
     model,
     *,
@@ -4742,6 +4812,7 @@ class DeepseekV4Attention(nn.Module):
         self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
         self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=self.eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self._mia_wq_b_impl = self._stock_wq_b_projection
         self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=self.eps)
         # o-LoRA: grouped down-projection (block matmul) then a dense up-projection.
@@ -4816,6 +4887,20 @@ class DeepseekV4Attention(nn.Module):
         if self._mia_input_projection is not None:
             raise ValueError("the Mia attention projection is already installed")
         self._mia_input_projection = owner
+
+    def install_mia_wq_b_m6_route(self, route) -> None:
+        """Bind the construction-qualified target M6/stock row route once."""
+        current = self._mia_wq_b_impl
+        if (
+            getattr(current, "__self__", None) is not self
+            or getattr(current, "__func__", None)
+            is not type(self)._stock_wq_b_projection
+        ):
+            raise ValueError("the Mia attention wq_b route is already installed")
+        self._mia_wq_b_impl = route
+
+    def _stock_wq_b_projection(self, values: mx.array) -> mx.array:
+        return self.wq_b(values)
 
     def _rope_tables(self, positions: mx.array):
         # positions: [L] -> cos/sin [L, rope_head_dim//2]
@@ -5360,7 +5445,7 @@ class DeepseekV4Attention(nn.Module):
         offset = int(cache.offset)
         positions, cos, sin = self._mia_token_rope_tables(offset, sequence)
         query_rank, latent = self._mia_qkv_plan.project_learned(x)
-        query_pre = self.wq_b(query_rank).reshape(
+        query_pre = self._mia_wq_b_impl(query_rank).reshape(
             batch,
             sequence,
             self.n_heads,
