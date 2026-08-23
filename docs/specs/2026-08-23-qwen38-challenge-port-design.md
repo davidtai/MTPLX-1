@@ -190,7 +190,7 @@ the challenge bootstrap and has no preceding Yukon row.
 | 17 | 126 | 7.5460% | Declared Q4/group-64 head | ALREADY; later superseded by compact Q2/Q4 artifact |
 | 18 | 135 | 0.4535% | One-forward exact SDPA width bridge | PORT, fusion set |
 | 19 | 160 | 2.5391% | Wider cross-row QMV and fused draft readout | DEPENDENCY of final QMV/readout |
-| 20 | 180 | 0.9180% | K/V-only committed-history flush | RETAINED; exact cache, 64/512-token ABBA and BAAB wins |
+| 20 | 180 | 0.9180% | K/V-only committed-history flush | RETAINED at original request context >=16K; exact cache and +1.9268% conditioned 16K ABBA win |
 | 21 | 186 | 1.5222% | Fused Q/K RMSNorm and partial RoPE | PORT, fusion set |
 | 22 | 194 | 0.0911% | Packed GDN prework mixer | WEAK, below threshold |
 | 23 | 215 | 0.2964% | Two-level compact selector | SUPERSEDED by E87 |
@@ -271,21 +271,22 @@ the challenge bootstrap and has no preceding Yukon row.
 ## Performance gates
 
 - Acquire `/tmp/mtplx-gpu-exclusive.lock` before any real-model GPU run.
-- Use the same Qwen 3.8 artifact, prompt set, context, decode length, sampler,
-  warmup, timing boundary, MLX version, thermal policy, and process lifecycle
-  for control and candidate.
-- Run exactness and one-cycle micro gates first. Reject at the first material
-  regression or correctness failure.
-- Sanity-check every implemented candidate on `python_modules_long.jsonl` at
-  approximately 100 generated tokens. Token hashes must match before any
-  longer benchmark. Attempted/accepted depth schedules must also match unless
-  proposal selection is the optimization itself; in that case record the
-  delta and reject an acceptance collapse.
-- Measure each consolidated candidate against unchanged `bd442156` behavior,
-  then remeasure the cumulative retained stack against the same control.
+- Use the exact Optimized-Speed artifact with the Turbo Q4/group-64 draft head,
+  depth 3, temperature 1.0, top-p 0.95, top-k 20, and seed 42.
+- Build exactly 16,384 Python input tokens from `mtplx/generation.py`, keeping
+  the intact `python_modules_long.jsonl` instruction at the tail, and require
+  all 1,024 output tokens.
+- Give each route one full-output conditioning generation, then run exactly
+  four timed ABBA arms. Record prefill tok/s, decode tok/s, peak memory, wall
+  time, route identity, counters, output hash, and acceptance schedule.
+- Measure candidates chronologically and cumulatively. Candidate N is compared
+  with all earlier retained winners; a passing >0.10% win becomes the next
+  control. Never add or multiply isolated percentages.
+- Exact output/schedule parity passes immediately. Deterministic full-length
+  output with a tie-breaking token or schedule shift is recorded for numerical
+  audit and is not rejected from hashes alone.
 - Keep only independently measured wins. Source leaderboard improvement is
   evidence to test, not proof of an MTPLX win.
-- Report candidate distributions and complete receipts, not only headline TPS.
 
 ## Licensing and attribution
 

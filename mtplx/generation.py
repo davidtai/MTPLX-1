@@ -31,7 +31,11 @@ from .a3b_compiled_target_prefix import (
 )
 from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
-from .attention_context import attention_phase, model_forward_kind
+from .attention_context import (
+    attention_phase,
+    model_forward_kind,
+    request_prompt_tokens,
+)
 from .deepseek_v4_adaptive_width import (
     validate_installed_deepseek_v4_adaptive_width_policy,
 )
@@ -2351,16 +2355,17 @@ def _prefill_restored_prompt_suffix(
         nonlocal mtp_history_time
         if not use_committed_mtp or not token_ids:
             return
-        mtp_history_time += _append_mtp_history(
-            rt,
-            restored.mtp_history_cache,
-            hidden_states,
-            token_ids,
-            phase="prefill",
-            mtp_hidden_variant=mtp_hidden_variant,
-            force_eval=True,
-            input_embeddings=_history_window_embeddings(token_ids, window_start),
-        )
+        with request_prompt_tokens(tokens_total):
+            mtp_history_time += _append_mtp_history(
+                rt,
+                restored.mtp_history_cache,
+                hidden_states,
+                token_ids,
+                phase="prefill",
+                mtp_hidden_variant=mtp_hidden_variant,
+                force_eval=True,
+                input_embeddings=_history_window_embeddings(token_ids, window_start),
+            )
         _check_postcommit_abort(abort_check)
 
     if use_committed_mtp and restored.hidden is not None:
@@ -3983,20 +3988,22 @@ def restore_or_prefill_prompt_state(
                             vision_splice,
                             rows_before=rows_before,
                         )
-                prompt_history_time = _append_mtp_history(
-                    rt,
-                    mtp_history_cache,
-                    history_hidden,
-                    history_token_ids,
-                    phase="prefill",
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    position_offset=(
-                        mtp_history_position_base
-                        if mtp_position_mode == "absolute" or mtp_history_policy == "last_window"
-                        else None
-                    ),
-                    input_embeddings=history_embeddings,
-                )
+                with request_prompt_tokens(len(prompt_ids)):
+                    prompt_history_time = _append_mtp_history(
+                        rt,
+                        mtp_history_cache,
+                        history_hidden,
+                        history_token_ids,
+                        phase="prefill",
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        position_offset=(
+                            mtp_history_position_base
+                            if mtp_position_mode == "absolute"
+                            or mtp_history_policy == "last_window"
+                            else None
+                        ),
+                        input_embeddings=history_embeddings,
+                    )
                 prompt_eval_time += prompt_history_time
     else:
         # Only request hidden states from a runtime that can produce them.
@@ -5004,23 +5011,24 @@ def _prefill_committed_mtp_history_streaming(
                             vision_splice,
                             rows_before=pad_prefix_counts[window_start],
                         )
-                prompt_history_time += _append_mtp_history(
-                    rt,
-                    mtp_history_cache,
-                    sliced_hidden,
-                    sliced_token_ids,
-                    phase="prefill",
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    position_offset=(
-                        token_start_index + slice_start
-                        if use_absolute_positions
-                        else token_start_index + slice_start - 1
-                        if history_window_tokens is not None
-                        else None
-                    ),
-                    force_eval=True,
-                    input_embeddings=history_embeddings,
-                )
+                with request_prompt_tokens(len(prompt_ids)):
+                    prompt_history_time += _append_mtp_history(
+                        rt,
+                        mtp_history_cache,
+                        sliced_hidden,
+                        sliced_token_ids,
+                        phase="prefill",
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        position_offset=(
+                            token_start_index + slice_start
+                            if use_absolute_positions
+                            else token_start_index + slice_start - 1
+                            if history_window_tokens is not None
+                            else None
+                        ),
+                        force_eval=True,
+                        input_embeddings=history_embeddings,
+                    )
                 _check_postcommit_abort(abort_check)
         cursor += chunk_len
         boundary_hidden = (
@@ -7551,16 +7559,17 @@ def generate_mtpk(
             mtp_history_materialize_every > 0
             and mtp_history_tokens_since_materialize >= mtp_history_materialize_every
         )
-        elapsed = _append_mtp_history(
-            rt,
-            mtp_cache,
-            hidden_states,
-            token_ids,
-            phase="ar_decode",
-            mtp_hidden_variant=mtp_hidden_variant,
-            position_offset=mtp_position_offset_for_cache(mtp_cache),
-            force_eval=force_eval,
-        )
+        with request_prompt_tokens(len(prompt_ids)):
+            elapsed = _append_mtp_history(
+                rt,
+                mtp_cache,
+                hidden_states,
+                token_ids,
+                phase="ar_decode",
+                mtp_hidden_variant=mtp_hidden_variant,
+                position_offset=mtp_position_offset_for_cache(mtp_cache),
+                force_eval=force_eval,
+            )
         if force_eval:
             mtp_history_materialize_events += 1
             mtp_history_tokens_since_materialize = 0

@@ -387,7 +387,20 @@ class MTPLXRuntime:
         update = getattr(self.model, "mtp_update_cache", None)
         qwen38_route = self.qwen38_route
         if qwen38_route is not None and qwen38_route.route_id != "control":
-            update = qwen38_route.bindings.mtp_cache_append
+            from .attention_context import current_request_prompt_tokens
+
+            cache_offset = (
+                int(getattr(mtp_cache[0], "offset", 0))
+                if mtp_cache
+                else 0
+            )
+            incoming_tokens = int(next_token_ids.shape[-1])
+            effective_context = max(
+                current_request_prompt_tokens(),
+                cache_offset + incoming_tokens,
+            )
+            if effective_context >= qwen38_route.min_context_tokens:
+                update = qwen38_route.bindings.mtp_cache_append
         if update is not None:
             try:
                 params = py_inspect.signature(update).parameters
@@ -951,17 +964,9 @@ def load(
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
     )
-    from .qwen38_challenge import DEFAULT_QWEN38_CACHE_ROUTE, install_qwen38_route
+    from .qwen38_challenge import install_qwen38_route, qwen38_final_route
 
-    qwen38_route = install_qwen38_route(
-        runtime,
-        config,
-        path,
-        cache_route=os.environ.get(
-            "MTPLX_QWEN38_CACHE_ROUTE",
-            DEFAULT_QWEN38_CACHE_ROUTE,
-        ),
-    )
+    qwen38_route = install_qwen38_route(runtime, config, path, **qwen38_final_route())
     if qwen38_route is not None:
         logger.info(
             "[qwen38-challenge] route=%s fingerprint=%s selfcheck=%s",

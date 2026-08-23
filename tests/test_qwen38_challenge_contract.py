@@ -6,24 +6,25 @@ from types import SimpleNamespace
 
 import pytest
 
+from mtplx.attention_context import request_prompt_tokens
+from mtplx.mtp_patch import MTPContract
 from mtplx.qwen38_challenge import (
+    QWEN38_FINAL_ROUTE,
     QWEN38_Q8_LINEAR_ATTN_LAYERS,
     Qwen38ContractError,
     Qwen38RouteBindings,
     build_qwen38_route,
-    control_bindings,
     install_qwen38_control_route,
     install_qwen38_route,
     is_qwen38_27b_candidate,
     policy_fingerprint_with_qwen38_route,
+    qwen38_final_route,
     qwen38_route_receipt,
     validate_qwen38_27b_contract,
 )
-from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import MTPLXRuntime
 from mtplx.server.openai import _qwen38_challenge_route_payload
 from mtplx.session_bank import CacheMissReason, SessionBank
-
 
 MODEL_PATH = Path("models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed")
 
@@ -59,10 +60,7 @@ def _config() -> dict:
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "model_type": "qwen3_5",
         "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
-        "mtplx_runtime": {
-            "arch_id": "qwen3-next-mtp",
-            "base_trunk": "/models/Qwen--Qwen3.8-27B",
-        },
+        "mtplx_runtime": {"base_trunk": "/models/Qwen--Qwen3.8-27B"},
         "quantization": quantization,
         "text_config": {
             "model_type": "qwen3_5_text",
@@ -89,13 +87,7 @@ def _callable(*args, **kwargs):
 
 
 def _bindings() -> Qwen38RouteBindings:
-    return Qwen38RouteBindings(
-        proposal_readout=_callable,
-        qmv_by_width={width: _callable for width in range(2, 10)},
-        mtp_cache_append=_callable,
-        projection_fusions={"stock": _callable},
-        policy_factory=_callable,
-    )
+    return Qwen38RouteBindings(mtp_cache_append=_callable)
 
 
 def test_exact_qwen38_27b_control_contract_is_accepted() -> None:
@@ -105,8 +97,12 @@ def test_exact_qwen38_27b_control_contract_is_accepted() -> None:
     assert contract.vocab_size == 248320
     assert contract.trunk_bits == 4
     assert contract.trunk_group_size == 32
-    assert contract.qmv_group_size == 64
     assert contract.packing == "mlx_affine_u32_le"
+
+
+def test_final_route_is_only_the_chronological_winner_stack() -> None:
+    assert dict(QWEN38_FINAL_ROUTE) == {"cache_route": "kv_only_history"}
+    assert qwen38_final_route() == {"cache_route": "kv_only_history"}
 
 
 @pytest.mark.parametrize(
@@ -118,10 +114,7 @@ def test_exact_qwen38_27b_control_contract_is_accepted() -> None:
     ],
 )
 def test_unmeasured_qwen38_siblings_stay_outside_the_route(sibling: str) -> None:
-    config = _config()
-    config["mtplx_runtime"]["base_trunk"] = "/models/Qwen--Qwen3.8-27B"
-
-    assert not is_qwen38_27b_candidate(config, Path(sibling))
+    assert not is_qwen38_27b_candidate(_config(), Path(sibling))
 
 
 @pytest.mark.parametrize(
@@ -147,44 +140,29 @@ def test_contract_misses_fail_loudly(field: str, value: object, message: str) ->
         config["text_config"][field] = value
     elif field in {"bits", "group_size", "mode"}:
         config["quantization"][field] = value
-    elif field == "packing":
+    else:
         packing = str(value)
 
     with pytest.raises(Qwen38ContractError, match=message):
         validate_qwen38_27b_contract(config, path, packing=packing)
 
 
-def test_route_is_immutable_and_identity_covers_head_kernels_and_policy() -> None:
+def test_route_is_immutable_and_fingerprint_covers_kernel_and_policy() -> None:
     base = build_qwen38_route(
         _config(), MODEL_PATH, bindings=_bindings(), route_id="control"
     )
 
     with pytest.raises(FrozenInstanceError):
         base.route_id = "changed"  # type: ignore[misc]
-    with pytest.raises(TypeError):
-        base.bindings.qmv_by_width[2] = _callable  # type: ignore[index]
-
-    assert replace(base, compact_head_digest="head-b").fingerprint != base.fingerprint
     assert replace(base, kernel_ids=("kernel-b",)).fingerprint != base.fingerprint
     assert replace(base, policy_id="policy-b").fingerprint != base.fingerprint
-
-
-def test_candidate_route_requires_every_promoted_callable() -> None:
-    bindings = replace(_bindings(), qmv_by_width={2: _callable})
-
-    with pytest.raises(Qwen38ContractError, match="QMV widths 2..9"):
-        build_qwen38_route(
-            _config(), MODEL_PATH, bindings=bindings, route_id="challenge"
-        )
 
 
 def test_route_fingerprint_prevents_cross_route_session_restore() -> None:
     control = build_qwen38_route(
         _config(), MODEL_PATH, bindings=_bindings(), route_id="control"
     )
-    candidate = replace(control, route_id="challenge", kernel_ids=("top2-v1",))
-    control_policy = policy_fingerprint_with_qwen38_route("base", control)
-    candidate_policy = policy_fingerprint_with_qwen38_route("base", candidate)
+    candidate = replace(control, route_id="kv_only_history", kernel_ids=("kv-v1",))
     runtime = SimpleNamespace(model_path=MODEL_PATH, mtp_enabled=True)
     bank = SessionBank(max_entries=2, max_bytes=4096, per_session_max_bytes=4096)
     assert bank.put(
@@ -193,57 +171,20 @@ def test_route_fingerprint_prevents_cross_route_session_restore() -> None:
         cache=[],
         logits=None,
         hidden=None,
-        policy_fingerprint=control_policy,
+        policy_fingerprint=policy_fingerprint_with_qwen38_route("base", control),
         nbytes_override=64,
     )
 
-    assert (
-        bank.restore(
-            runtime,
-            [1, 2, 3],
-            policy_fingerprint=candidate_policy,
-            cache_factory=lambda: [],
-        )
-        is None
-    )
+    assert bank.restore(
+        runtime,
+        [1, 2, 3],
+        policy_fingerprint=policy_fingerprint_with_qwen38_route("base", candidate),
+        cache_factory=list,
+    ) is None
     assert bank.last_miss_reason == CacheMissReason.POLICY_MISMATCH.value
 
 
-def test_health_and_completion_receipt_is_stable() -> None:
-    route = build_qwen38_route(
-        _config(), MODEL_PATH, bindings=_bindings(), route_id="control"
-    )
-
-    receipt = qwen38_route_receipt(route)
-
-    assert receipt == {
-        "route_id": "control",
-        "fingerprint": route.fingerprint,
-        "contract_id": route.contract.contract_id,
-        "compact_head_digest": None,
-        "kernel_ids": [],
-        "policy_id": "current_mtplx",
-        "selfcheck": {"passed": True, "status": "control"},
-    }
-
-
-def test_runtime_installs_one_control_route_and_server_surfaces_it() -> None:
-    runtime = MTPLXRuntime(
-        model=SimpleNamespace(),
-        tokenizer=SimpleNamespace(),
-        model_path=MODEL_PATH,
-        mtp_enabled=True,
-        contract=MTPContract(),
-    )
-    assert runtime.qwen38_route is None
-
-    route = install_qwen38_control_route(runtime, _config(), MODEL_PATH)
-
-    assert route is runtime.qwen38_route
-    assert _qwen38_challenge_route_payload(runtime) == qwen38_route_receipt(route)
-
-
-def test_kv_only_candidate_binds_exact_route_and_runtime_dispatches_to_it() -> None:
+def test_kv_only_history_route_binds_the_target_shaped_append() -> None:
     calls: list[str] = []
 
     def stock(*args, **kwargs):
@@ -251,56 +192,76 @@ def test_kv_only_candidate_binds_exact_route_and_runtime_dispatches_to_it() -> N
         return "stock"
 
     def kv_only(*args, **kwargs):
-        calls.append("kv_only")
-        return "candidate"
+        calls.append("kv-only")
+        return "kv-only"
 
-    model = SimpleNamespace(
-        mtp_update_cache=stock,
-        mtp_update_cache_kv_only_history=kv_only,
-    )
     runtime = MTPLXRuntime(
-        model=model,
+        model=SimpleNamespace(
+            mtp_update_cache=stock,
+            mtp_update_cache_kv_only_history=kv_only,
+        ),
         tokenizer=SimpleNamespace(),
         model_path=MODEL_PATH,
         mtp_enabled=True,
         contract=MTPContract(),
     )
-
-    route = install_qwen38_route(
-        runtime,
-        _config(),
-        MODEL_PATH,
-    )
-    result = runtime.update_mtp_cache("hidden", "tokens", mtp_cache="cache")
+    route = install_qwen38_route(runtime, _config(), MODEL_PATH)
 
     assert route is runtime.qwen38_route
     assert route.route_id == "kv_only_history"
-    assert route.kernel_ids == ("qwen38_mtp_kv_only_history_v1",)
-    assert result == "candidate"
-    assert calls == ["kv_only"]
+    assert route.bindings.mtp_cache_append is kv_only
+    assert route.min_context_tokens == 16_384
+    short = runtime.update_mtp_cache(
+        object(),
+        SimpleNamespace(shape=(1, 1024)),
+        mtp_cache=[SimpleNamespace(offset=0)],
+    )
+    long = runtime.update_mtp_cache(
+        object(),
+        SimpleNamespace(shape=(1, 16384)),
+        mtp_cache=[SimpleNamespace(offset=0)],
+    )
+    continued_long = runtime.update_mtp_cache(
+        object(),
+        SimpleNamespace(shape=(1, 1)),
+        mtp_cache=[SimpleNamespace(offset=16384)],
+    )
+    with request_prompt_tokens(16_384):
+        windowed_long = runtime.update_mtp_cache(
+            object(),
+            SimpleNamespace(shape=(1, 8192)),
+            mtp_cache=[SimpleNamespace(offset=0)],
+        )
+
+    assert (short, long, continued_long, windowed_long) == (
+        "stock",
+        "kv-only",
+        "kv-only",
+        "kv-only",
+    )
+    assert calls == ["stock", "kv-only", "kv-only", "kv-only"]
+    assert route.kernel_ids == ("qwen38_mtp_kv_only_history_ge16384_v1",)
+    assert route.selfcheck_status == "passed:python16384:conditioned_abba"
 
 
-def test_non_cache_candidate_binding_uses_model_append_without_runtime_recursion() -> None:
-    calls: list[str] = []
-
-    def stock(*args, **kwargs):
-        calls.append("stock")
-        return "stock"
-
+def test_control_route_and_receipt_are_stable() -> None:
     runtime = MTPLXRuntime(
-        model=SimpleNamespace(mtp_update_cache=stock),
+        model=SimpleNamespace(mtp_update_cache=_callable),
         tokenizer=SimpleNamespace(),
         model_path=MODEL_PATH,
         mtp_enabled=True,
         contract=MTPContract(),
     )
-    bindings = control_bindings(runtime)
-    runtime.qwen38_route = build_qwen38_route(
-        _config(),
-        MODEL_PATH,
-        bindings=bindings,
-        route_id="proposal_only_test",
-    )
+    route = install_qwen38_control_route(runtime, _config(), MODEL_PATH)
 
-    assert runtime.update_mtp_cache("hidden", "tokens", mtp_cache="cache") == "stock"
-    assert calls == ["stock"]
+    assert route.route_id == "control"
+    assert qwen38_route_receipt(route) == {
+        "route_id": "control",
+        "fingerprint": route.fingerprint,
+        "contract_id": route.contract.contract_id,
+        "kernel_ids": [],
+        "min_context_tokens": 0,
+        "policy_id": "current_mtplx",
+        "selfcheck": {"passed": True, "status": "control"},
+    }
+    assert _qwen38_challenge_route_payload(runtime) == qwen38_route_receipt(route)

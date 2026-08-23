@@ -13,7 +13,6 @@ from scripts.qwen38_challenge_inventory import (
     validate_inventory,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 RECEIPT = (
     ROOT

@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -24,11 +23,8 @@ DEFAULT_MODEL = Path.home() / (
     ".mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
 )
 DEFAULT_PROMPT = ROOT / "mtplx/benchmarks/prompts/python_modules_long.jsonl"
+DEFAULT_CONTEXT = ROOT / "mtplx/generation.py"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
-DEFAULT_COMPACT_HEAD = (
-    Path.home()
-    / ".cache/mtplx/qwen38-optimized-speed-compact-q2-v1/model.safetensors"
-)
 
 
 def _read_prompt(path: Path) -> tuple[str, str]:
@@ -36,9 +32,190 @@ def _read_prompt(path: Path) -> tuple[str, str]:
     return str(row["id"]), str(row["prompt"])
 
 
+def _expand_prompt_to_token_count(
+    tokenizer: Any,
+    seed_prompt: str,
+    target_tokens: int,
+) -> tuple[str, list[int]]:
+    """Repeat a fixed seed and truncate its token IDs to an exact cold-prefill size."""
+
+    if target_tokens <= 0:
+        raise ValueError("prompt token target must be positive")
+    unit = seed_prompt.rstrip() + "\n"
+    repeats = 1
+    token_ids = list(tokenizer.encode(unit))
+    while len(token_ids) < target_tokens:
+        repeats *= 2
+        token_ids = list(tokenizer.encode(unit * repeats))
+    token_ids = token_ids[:target_tokens]
+    return str(tokenizer.decode(token_ids)), token_ids
+
+
+def _context_prompt_to_token_count(
+    tokenizer: Any,
+    *,
+    context: str,
+    instruction: str,
+    target_tokens: int,
+) -> tuple[str, list[int]]:
+    """Fill an exact prompt budget with context and one intact tail instruction."""
+
+    if target_tokens <= 0:
+        raise ValueError("prompt token target must be positive")
+    tail_ids = list(tokenizer.encode("\n\n" + instruction.strip()))
+    if len(tail_ids) >= target_tokens:
+        raise ValueError("tail instruction does not fit inside prompt token target")
+    context_unit = context.rstrip() + "\n"
+    context_ids = list(tokenizer.encode(context_unit))
+    if not context_ids:
+        raise ValueError("context must encode to at least one token")
+    context_budget = target_tokens - len(tail_ids)
+    repeats = (context_budget + len(context_ids) - 1) // len(context_ids)
+    token_ids = (context_ids * repeats)[:context_budget] + tail_ids
+    return str(tokenizer.decode(token_ids)), token_ids
+
+
 def _token_hash(tokens: list[int]) -> str:
     payload = json.dumps(tokens, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _generation_metrics(stats: Any) -> dict[str, int | float]:
+    peak = int(stats.peak_memory_bytes)
+    return {
+        "prefill_tokens": int(stats.new_prefill_tokens),
+        "prefill_time_s": float(stats.prompt_target_prefill_time_s),
+        "prefill_tok_s": float(stats.prompt_target_prefill_tok_s),
+        "decode_tok_s": float(stats.decode_tok_s),
+        "peak_memory_bytes": peak,
+        "peak_memory_gib": peak / 2**30,
+    }
+
+
+def _correctness_summary(
+    arms: list[dict[str, Any]],
+    *,
+    route_ids: list[str],
+    max_tokens: int,
+) -> dict[str, Any]:
+    """Require exact output and schedule replay for the retained route."""
+
+    cross_route_token_exact = len({arm["token_hash"] for arm in arms}) == 1
+    cross_route_schedule_exact = (
+        len({tuple(arm["attempted_depth_schedule"]) for arm in arms}) == 1
+        and len({tuple(arm["accepted_depth_schedule"]) for arm in arms}) == 1
+    )
+    per_route_deterministic = {
+        route_id: len(
+            {
+                (
+                    arm["token_hash"],
+                    tuple(arm["attempted_depth_schedule"]),
+                    tuple(arm["accepted_depth_schedule"]),
+                )
+                for arm in arms
+                if arm["route_id"] == route_id
+            }
+        )
+        == 1
+        for route_id in route_ids
+    }
+    full_output = all(int(arm["generated_tokens"]) == max_tokens for arm in arms)
+    deterministic = all(per_route_deterministic.values())
+    passed = bool(full_output and deterministic)
+    exact = bool(cross_route_token_exact and cross_route_schedule_exact)
+    return {
+        "passed": passed,
+        "mode": "exact" if exact else ("deterministic_drift" if passed else "rejected"),
+        "full_output": full_output,
+        "cross_route_token_exact": cross_route_token_exact,
+        "cross_route_schedule_exact": cross_route_schedule_exact,
+        "per_route_deterministic": per_route_deterministic,
+    }
+
+
+def _validate_route_id(route_id: str) -> set[str]:
+    features = {item for item in route_id.split("+") if item}
+    allowed = {"control", "kv_only_history"}
+    unknown = features - allowed
+    if not features or unknown:
+        raise ValueError(f"unknown route features: {sorted(unknown)}")
+    if "control" in features and len(features) != 1:
+        raise ValueError("control cannot be combined with candidate features")
+    return features
+
+
+def _load_optimized_speed_stack(
+    model_path: Path,
+    runtime_contract: dict[str, Any],
+    *,
+    apply_profile_env_fn: Any = None,
+    load_runtime_fn: Any = None,
+    install_draft_head_fn: Any = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Construct the same Turbo/Q4 draft stack used by Optimized-Speed serving."""
+
+    from mtplx.draft_lm_head import draft_lm_head_spec_from_runtime_contract
+    from mtplx.draft_sampling import draft_sampler_spec_from_runtime_contract
+    from mtplx.profiles import (
+        get_profile,
+        runtime_env_overrides_from_contract,
+    )
+
+    profile = get_profile("turbo")
+    fallback_head = {
+        "bits": int(profile.draft_lm_head.bits),
+        "group_size": int(profile.draft_lm_head.group_size),
+        "mode": str(profile.draft_lm_head.mode),
+    }
+    draft_head = draft_lm_head_spec_from_runtime_contract(
+        runtime_contract,
+        fallback=fallback_head,
+    )
+    if draft_head is None:  # pragma: no cover - Turbo always has this requirement
+        raise RuntimeError("Turbo profile requires a draft-only LM head")
+    draft_sampler = draft_sampler_spec_from_runtime_contract(runtime_contract)
+    runtime_env_overrides = runtime_env_overrides_from_contract(runtime_contract)
+
+    if apply_profile_env_fn is None:
+        from mtplx.profiles import apply_profile_env
+
+        apply_profile_env_fn = apply_profile_env
+    apply_profile_env_fn(
+        profile.name,
+        runtime_env_overrides=runtime_env_overrides,
+    )
+
+    # Runtime modules that bind env-gated kernels are deliberately imported
+    # only after the production profile has populated the process environment.
+    if load_runtime_fn is None:
+        from mtplx.runtime import load
+
+        load_runtime_fn = load
+    runtime = load_runtime_fn(model_path, mtp=True)
+    if install_draft_head_fn is None:
+        from mtplx.draft_lm_head import _install_draft_lm_head
+
+        install_draft_head_fn = _install_draft_lm_head
+    draft_head_report = install_draft_head_fn(
+        runtime,
+        bits=int(draft_head["bits"]),
+        group_size=int(draft_head["group_size"]),
+        mode=str(draft_head["mode"]),
+    )
+    return runtime, {
+        "profile": profile.name,
+        "runtime_profile": profile.runtime_profile,
+        "runtime_env": {**profile.env_dict(), **runtime_env_overrides},
+        "draft_lm_head": draft_head,
+        "draft_lm_head_report": draft_head_report,
+        "draft_sampler": draft_sampler,
+        "mtp_hidden_variant": "post_norm",
+        "mtp_cache_policy": "persistent",
+        "mtp_history_policy": "committed",
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+    }
 
 
 def _run_arm(
@@ -48,28 +225,23 @@ def _run_arm(
     prompt_ids: list[int],
     *,
     route_id: str,
-    compact_head_path: Path,
     max_tokens: int,
     seed: int,
     target_temperature: float,
     draft_temperature: float,
 ) -> dict[str, Any]:
+    import mlx.core as mx
+
     from mtplx.generation import generate_mtpk
     from mtplx.qwen38_challenge import install_qwen38_route
     from mtplx.sampling import SamplerConfig
 
-    features = set(route_id.split("+"))
-    cache_route = "kv_only_history" if "kv_only_history" in features else "control"
-    proposal_route = "compact_head" if "compact_head" in features else "control"
+    cache_route = "kv_only_history" if route_id == "kv_only_history" else "control"
     route = install_qwen38_route(
         runtime,
         config,
         model_path,
         cache_route=cache_route,
-        proposal_route=proposal_route,
-        compact_head_path=(
-            compact_head_path if proposal_route == "compact_head" else None
-        ),
     )
     target_sampler = SamplerConfig(
         temperature=target_temperature,
@@ -81,6 +253,7 @@ def _run_arm(
         top_p=0.95,
         top_k=20,
     )
+    mx.reset_peak_memory()
     started = time.perf_counter()
     output = generate_mtpk(
         runtime,
@@ -90,18 +263,23 @@ def _run_arm(
         draft_sampler=draft_sampler,
         speculative_depth=3,
         seed=seed,
+        mtp_hidden_variant="post_norm",
+        mtp_cache_policy="persistent",
         verify_strategy="capture_commit",
+        verify_core="linear-gdn-from-conv-tape",
         mtp_history_policy="committed",
     )
     wall_s = time.perf_counter() - started
     stats = output.stats
     return {
-        "route_id": route.route_id,
-        "route_fingerprint": route.fingerprint,
+        **_generation_metrics(stats),
+        "route_id": route_id,
+        "route_fingerprint": hashlib.sha256(
+            f"{route.fingerprint}:{route_id}".encode()
+        ).hexdigest(),
         "kernel_ids": list(route.kernel_ids),
         "wall_s": wall_s,
         "generated_tokens": int(stats.generated_tokens),
-        "decode_tok_s": float(stats.decode_tok_s),
         "prompt_mtp_history_time_s": float(stats.prompt_mtp_history_time_s),
         "draft_time_s": float(stats.draft_time_s),
         "accepted_by_depth": list(stats.accepted_by_depth),
@@ -121,16 +299,25 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT)
-    parser.add_argument("--max-tokens", type=int, default=100)
+    parser.add_argument("--prompt-tokens", type=int, default=16_384)
+    parser.add_argument("--context-file", type=Path, default=DEFAULT_CONTEXT)
+    parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--target-temperature", type=float, default=0.6)
-    parser.add_argument("--draft-temperature", type=float, default=1.0)
-    parser.add_argument("--order", default="control,kv_only_history,kv_only_history,control")
+    parser.add_argument("--target-temperature", type=float, default=1.0)
+    parser.add_argument("--draft-temperature", type=float)
+    parser.add_argument(
+        "--order",
+        default="control,kv_only_history,kv_only_history,control",
+    )
     parser.add_argument("--control-route")
     parser.add_argument("--candidate-route")
-    parser.add_argument("--warmup-tokens", type=int, default=8)
+    parser.add_argument(
+        "--warmup-tokens",
+        type=int,
+        default=1024,
+        help="Full-output conditioning tokens per route before timed arms.",
+    )
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
-    parser.add_argument("--compact-head", type=Path, default=DEFAULT_COMPACT_HEAD)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -144,22 +331,45 @@ def main() -> int:
     except OSError as exc:
         raise RuntimeError(f"GPU lock is busy: {args.lock}") from exc
 
+    from mtplx.backends.registry import load_runtime_contract
+
+    contract, contract_error = load_runtime_contract(model_path)
+    if contract_error is not None:
+        raise RuntimeError(f"invalid runtime contract: {contract_error}")
+    runtime_contract = {} if contract is None else contract.raw
+    runtime, optimized_stack = _load_optimized_speed_stack(
+        model_path,
+        runtime_contract,
+    )
     from mtplx.artifacts import load_config
-    from mtplx.runtime import load
 
     config = load_config(model_path)
-    runtime = load(model_path, mtp=True)
+    draft_temperature = (
+        float(args.draft_temperature)
+        if args.draft_temperature is not None
+        else float((optimized_stack.get("draft_sampler") or {}).get("temperature", 1.0))
+    )
     prompt_id, prompt = _read_prompt(args.prompt_file)
-    prompt_ids = list(runtime.tokenizer.encode(prompt))
+    if args.prompt_tokens is None:
+        prompt_ids = list(runtime.tokenizer.encode(prompt))
+    elif args.context_file is not None:
+        prompt, prompt_ids = _context_prompt_to_token_count(
+            runtime.tokenizer,
+            context=args.context_file.read_text(encoding="utf-8"),
+            instruction=prompt,
+            target_tokens=args.prompt_tokens,
+        )
+    else:
+        prompt, prompt_ids = _expand_prompt_to_token_count(
+            runtime.tokenizer,
+            prompt,
+            args.prompt_tokens,
+        )
     order = [item.strip() for item in args.order.split(",") if item.strip()]
-    allowed = {
-        "control",
-        "kv_only_history",
-        "compact_head",
-        "compact_head+kv_only_history",
-    }
-    if not order or any(item not in allowed for item in order):
-        raise ValueError(f"order entries must be one of {sorted(allowed)}")
+    if not order:
+        raise ValueError("order must contain at least one route")
+    for item in order:
+        _validate_route_id(item)
     unique_routes = list(dict.fromkeys(order))
 
     warmups = [
@@ -169,11 +379,10 @@ def main() -> int:
             model_path,
             prompt_ids,
             route_id=route_id,
-            compact_head_path=args.compact_head,
             max_tokens=args.warmup_tokens,
             seed=args.seed,
             target_temperature=args.target_temperature,
-            draft_temperature=args.draft_temperature,
+            draft_temperature=draft_temperature,
         )
         for route_id in unique_routes
     ]
@@ -184,21 +393,22 @@ def main() -> int:
             model_path,
             prompt_ids,
             route_id=route_id,
-            compact_head_path=args.compact_head,
             max_tokens=args.max_tokens,
             seed=args.seed,
             target_temperature=args.target_temperature,
-            draft_temperature=args.draft_temperature,
+            draft_temperature=draft_temperature,
         )
         for route_id in order
     ]
-    hashes = {arm["token_hash"] for arm in arms}
-    attempted = {tuple(arm["attempted_depth_schedule"]) for arm in arms}
-    accepted = {tuple(arm["accepted_depth_schedule"]) for arm in arms}
-    token_exact = len(hashes) == 1
-    schedule_exact = len(attempted) == len(accepted) == 1
-    proposal_candidate = any("compact_head" in item for item in order)
-    exact = token_exact and (proposal_candidate or schedule_exact)
+    correctness = _correctness_summary(
+        arms,
+        route_ids=unique_routes,
+        max_tokens=args.max_tokens,
+    )
+    exact = bool(
+        correctness["cross_route_token_exact"]
+        and correctness["cross_route_schedule_exact"]
+    )
     by_route = {
         route_id: [arm["wall_s"] for arm in arms if arm["route_id"] == route_id]
         for route_id in unique_routes
@@ -226,12 +436,22 @@ def main() -> int:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": str(model_path),
         "prompt_file": str(args.prompt_file.resolve()),
+        "context_file": (
+            None if args.context_file is None else str(args.context_file.resolve())
+        ),
+        "context_sha256": (
+            None
+            if args.context_file is None
+            else hashlib.sha256(args.context_file.read_bytes()).hexdigest()
+        ),
         "prompt_id": prompt_id,
         "prompt_tokens": len(prompt_ids),
+        "prompt_token_target": args.prompt_tokens,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "target_temperature": args.target_temperature,
-        "draft_temperature": args.draft_temperature,
+        "draft_temperature": draft_temperature,
+        "optimized_speed_stack": optimized_stack,
         "order": order,
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -247,9 +467,9 @@ def main() -> int:
             text=True,
         ).splitlines(),
         "exact": exact,
-        "token_exact": token_exact,
-        "schedule_exact": schedule_exact,
-        "proposal_candidate": proposal_candidate,
+        "token_exact": correctness["cross_route_token_exact"],
+        "schedule_exact": correctness["cross_route_schedule_exact"],
+        "correctness": correctness,
         "control_route_id": control_id,
         "candidate_route_id": candidate_id,
         "mean_wall_s": means,
@@ -259,12 +479,17 @@ def main() -> int:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({
-        "exact": exact,
-        "candidate_improvement_pct": improvement_pct,
-        "output": str(args.output),
-    }, sort_keys=True))
-    return 0 if exact else 2
+    print(
+        json.dumps(
+            {
+                "exact": exact,
+                "candidate_improvement_pct": improvement_pct,
+                "output": str(args.output),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0 if correctness["passed"] else 2
 
 
 if __name__ == "__main__":

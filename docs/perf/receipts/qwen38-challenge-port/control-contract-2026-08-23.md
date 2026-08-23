@@ -1,7 +1,7 @@
 # Qwen 3.8 Challenge Port Control Contract
 
-Status: static contract captured; real-model timing deferred until the shared
-GPU lock is free.
+Status: static construction contract. Real-model timing is recorded in the
+conditioned 16K receipts referenced by the final ledger.
 
 ## Source and environment
 
@@ -56,7 +56,8 @@ order `embedding_hidden`, local MTP positions, and maximum/default depth 3.
 - Profile: `turbo` / `native_mtp_turbo`.
 - Draft depth: 3.
 - Draft sampler: temperature 1.0, top-p 0.95, top-k 20.
-- MTP history: `committed`; last-window fallback is not active.
+- MTP history: `committed`; at 16K the Turbo profile retains the last 8K rows,
+  while the Qwen 3.8 route gate carries the original 16K request length.
 - Target verification: NAX enabled with M4 route `vk_k`; compiled verify
   enabled through context 32768.
 - Packed GQA attention: enabled from context 8192.
@@ -69,25 +70,23 @@ packing, dtype, head, or cache-contract miss.
 
 ## Matched measurement contract
 
-- Prompt suite: `mtplx/benchmarks/prompts/flappy.jsonl` at SHA-256
-  `d9f32acb3d56cc645d58c26e1c3a0bc799d1d8e2f2f160bb8730ad73fcc4bd7a`
-  and `mtplx/benchmarks/prompts/python_modules_long.jsonl` at SHA-256
-  `ca2054913c5c27c24c983ed27e3ee4eff1d01d456a73e71377fdaea3cbf8c140`.
-- Seed: 42 for every matched arm.
-- Prompt length: native encoded length for the first short gate; fixed context
-  rungs are introduced only as named, token-identical follow-up cases.
-- Decode gates: one verify cycle, then 64 tokens, then 512 tokens.
-- Warmup: construct and self-check each route, then one unmeasured generation
-  per prompt/route before its first timed arm.
+- Prompt: exactly 16,384 tokens built from `mtplx/generation.py`, with the
+  intact instruction from `mtplx/benchmarks/prompts/python_modules_long.jsonl`
+  at the tail.
+- Decode: exactly 1,024 generated tokens; shorter output invalidates the arm.
+- Sampling: target and draft temperature 1.0, top-p 0.95, top-k 20, seed 42.
+- Warmup: construct and self-check each route, then one unmeasured full-output
+  conditioning generation per route before timed arms.
 - Primary timing boundary: after tokenization and prompt-state construction,
   immediately before the first decode cycle through completion of the final
   emitted token. Model load, tokenizer load, receipt serialization, and the
   unmeasured warmup are excluded. Prompt-history construction is reported
   separately so cache-append work cannot be hidden.
-- Ordering: at least ABBA and BAAB with identical process lifecycle and thermal
-  gate; reject at the first exactness failure or matched material regression.
+- Ordering: exactly four timed ABBA arms with identical process lifecycle and
+  thermal gate.
 - Required raw output: per-prompt wall times, output-token hashes, acceptance
   by depth, attempted depth schedule, route/kernel/compile counters, peak
   memory, thermal observations, environment, source revisions, and lock owner.
 
-This document defines the control. It contains no performance result.
+This document defines the control. The final ledger and raw 16K receipts carry
+the performance decisions.

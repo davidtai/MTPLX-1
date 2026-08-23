@@ -1143,7 +1143,11 @@ def inject_mtp_support(
             position_offset: int | None = None,
             input_embeddings=None,
         ):
-            """Append dead committed-history rows through attention K/V only."""
+            """Append dead committed-history rows through attention K/V only.
+
+            Adapted for MTPLX from the K/V-only history mechanism in the
+            Layr-Labs Qwen 3.8 MLXFast challenge (MIT); see NOTICE.
+            """
             del mtp_hidden_variant
             if len(self.mtp.layers) != 1:
                 raise ValueError("K/V-only history append requires a one-layer MTP head")

@@ -1,0 +1,73 @@
+{
+  "kind": "qwen38_qmv_real_model_numeric_parity",
+  "model": "/Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
+  "route_id": "qmv_final",
+  "kernel_quantization": {
+    "bits": 4,
+    "group_sizes": [
+      32,
+      64
+    ],
+    "verify_widths": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "audit": {
+    "cache_state": "identical",
+    "sampled_rows": 4,
+    "candidate_kernel_calls": {
+      "m4": 296
+    },
+    "control_kernel_calls": {},
+    "top1_equal": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "top20_overlap": [
+      20,
+      19,
+      20,
+      20
+    ],
+    "max_abs_logit_delta": [
+      0.1953125,
+      0.265625,
+      0.1953125,
+      0.15625
+    ],
+    "rms_logit_delta": [
+      0.04581,
+      0.05008,
+      0.03154,
+      0.02762
+    ],
+    "sampling_total_variation": [
+      0.010713,
+      0.023044,
+      4.2e-09,
+      0.003478
+    ],
+    "control_top1_margin": [
+      3.5,
+      1.25,
+      2.5,
+      3.25
+    ]
+  },
+  "criteria": {
+    "top1_stable": true,
+    "top1_margin_exceeds_twice_max_error": true,
+    "max_sampling_total_variation": 0.023044,
+    "token_hash_drift_is_diagnostic": true
+  },
+  "passed": true
+}

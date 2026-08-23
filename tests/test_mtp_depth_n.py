@@ -232,11 +232,7 @@ def test_one_layer_kv_only_history_append_matches_control_cache(tmp_path) -> Non
     hidden = mx.random.normal((1, 4, args.hidden_size))
     tokens = mx.array([[1, 2, 3, 4]])
     control_cache = model.make_mtp_cache()
-    control_root = model.mtp_update_cache(
-        hidden,
-        tokens,
-        mtp_cache=control_cache,
-    )
+    control_root = model.mtp_update_cache(hidden, tokens, mtp_cache=control_cache)
     mx.eval(control_root, *(control_cache[0].state))
 
     def forbidden(*_args, **_kwargs):

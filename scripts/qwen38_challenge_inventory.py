@@ -12,10 +12,10 @@ import hashlib
 import json
 import re
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RECEIPT = (
