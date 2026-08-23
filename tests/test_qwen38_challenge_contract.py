@@ -277,3 +277,29 @@ def test_control_route_and_receipt_are_stable() -> None:
         "selfcheck": {"passed": True, "status": "control"},
     }
     assert _qwen38_challenge_route_payload(runtime) == qwen38_route_receipt(route)
+
+
+def test_row10_candidate_route_names_compact_proposal_only_head(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_row10_compact_head",
+        lambda runtime, *, active: {"installed": True, "active": active},
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(mtp_update_cache=_callable),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="control",
+        row10_compact_vocab=True,
+    )
+
+    assert route.route_id == "r10_compact_vocab"
+    assert route.kernel_ids == ("qwen38_row10_compact_q4_g64_vocab_v1",)
+    assert runtime.qwen38_feature_receipt["r10_compact_vocab"]["active"] is True

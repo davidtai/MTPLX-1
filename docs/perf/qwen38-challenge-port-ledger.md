@@ -60,7 +60,7 @@ row or from the earlier bundle campaign.
 | 7 | 38 | 20.4283% | `fe8829244cd9` | `9e25f5798c47` | +227/-22 | ALREADY PRESENT: persistent committed MTP history. Row-8 receipt exercises it; focused proof pending. |
 | 8 | 41 | 17.9183% | `11670086c1b9` | `52c2ac2b4934` | +901/-822 | RETAINED: missing device-resident D3 draft-chain adaptation, +3.6049%. |
 | 9 | 55 | 6.8764% | `b6c725144b56` | `9193949c4c87` | +340/-0 | REJECTED: adjacent-row shared-weight QMV adapted from source G64 to live target G32/M4; parity passed, but 16K wall regressed 3.8350% on row 8. |
-| 10 | 59 | 5.3467% | `61936f26547d` | `c44c6fd53fb6` | +89/-7 | PENDING |
+| 10 | 59 | 5.3467% | `61936f26547d` | `c44c6fd53fb6` | +89/-7 | PORTED FOR GATE: compact Q4/group-64 proposal vocabulary (98,330 reachable rows, padded to 98,336) with on-device target-ID mapping; 16K ABBA pending on retained row 8. |
 | 11 | 63 | 5.7425% | `62174dbbca88` | `40a33f553244` | +230/-16 | PENDING |
 | 12 | 70 | 0.8266% | `09eda55a08b1` | `96bb2be6fbe1` | +304/-24 | PENDING |
 | 13 | 71 | 2.0944% | `3e157ad981bb` | `83215ffbd861` | +25/-305 | PENDING |

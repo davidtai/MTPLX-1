@@ -4531,6 +4531,12 @@ def _device_draft_q_arrays(
     return top_idx, kept / kept.sum()
 
 
+def _map_compact_draft_ids(ids: mx.array, token_map: mx.array | None) -> mx.array:
+    """Map proposal-only vocabulary rows to target tokenizer IDs lazily."""
+
+    return ids if token_map is None else mx.take(token_map, ids.astype(mx.int32))
+
+
 def _device_core_state_tree(cache: Any) -> list[Any]:
     """State arrays the compiled draft chain reads and writes.
 
@@ -4593,6 +4599,9 @@ def _make_device_draft_core(
     top_k = int(draft_sampler.top_k)
     top_p = float(draft_sampler.top_p)
     greedy = temperature <= 0
+    text_model = getattr(rt.model, "language_model", rt.model)
+    token_map = getattr(text_model, "_mtplx_draft_token_id_map", None)
+    target_vocab_size = getattr(text_model, "_mtplx_draft_target_vocab_size", None)
 
     base_offset = _mtp_cache_offset(mtp_cache)
     promoted, failures = promote_kv_cache_offsets(
@@ -4612,10 +4621,17 @@ def _make_device_draft_core(
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_depth=level,
         )
-        warm_tok = mx.argmax(warm_logits[:, -1, :], axis=-1).reshape(1, 1)
+        warm_tok = _map_compact_draft_ids(
+            mx.argmax(warm_logits[:, -1, :], axis=-1),
+            token_map,
+        ).reshape(1, 1)
         warm_hidden = warm_h[:, -1:, :]
     _eval(warm_tok, warm_hidden)
-    vocab_size = int(warm_logits.shape[-1])
+    vocab_size = int(
+        target_vocab_size
+        if token_map is not None and target_vocab_size is not None
+        else warm_logits.shape[-1]
+    )
     _rollback_mtp_cache(mtp_cache, base_offset)
 
     def chain_fn(hidden_states, first_token_ids, level_keys):
@@ -4634,14 +4650,18 @@ def _make_device_draft_core(
             )
             row = logits_level[:, -1, :].reshape(-1)
             if greedy:
-                next_tok = mx.argmax(row, axis=-1).reshape(1, 1)
+                next_tok = _map_compact_draft_ids(
+                    mx.argmax(row, axis=-1),
+                    token_map,
+                ).reshape(1, 1)
             else:
-                top_idx, q_norm = _device_draft_q_arrays(
+                compact_idx, q_norm = _device_draft_q_arrays(
                     row,
                     temperature=temperature,
-                    top_k=min(top_k, vocab_size),
+                    top_k=min(top_k, int(row.shape[0])),
                     top_p=top_p,
                 )
+                top_idx = _map_compact_draft_ids(compact_idx, token_map)
                 cdf = mx.cumsum(q_norm, axis=-1)
                 u = mx.random.uniform(key=level_keys[level - 1])
                 pick = mx.minimum(
@@ -8748,6 +8768,19 @@ def generate_mtpk(
                     "requested": "device",
                     "reason": "ineligible_contract",
                 }
+        if (
+            getattr(
+                getattr(rt.model, "language_model", rt.model),
+                "_mtplx_draft_token_id_map",
+                None,
+            )
+            is not None
+            and draft_core == "device"
+            and not used_device_core
+        ):
+            raise RuntimeError(
+                "compact draft vocabulary requires the device draft core"
+            )
         for depth_index in range(0 if used_device_core else cycle_depth):
             source_token = int(next_token)
             step_mtp_cache = (

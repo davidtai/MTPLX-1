@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from .draft_lm_head import configure_qwen38_row10_compact_head
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -314,6 +315,7 @@ def install_qwen38_route(
     cache_route: str = DEFAULT_QWEN38_CACHE_ROUTE,
     dual_norm: bool = False,
     source_proposal: bool = False,
+    row10_compact_vocab: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -355,6 +357,17 @@ def install_qwen38_route(
         route_features.append("dual_norm")
         kernel_ids.append("qwen38_dual_rms_norm_concat_bf16_v1")
         feature_receipt["dual_norm"] = {"active": 1}
+
+    row10_report = configure_qwen38_row10_compact_head(
+        runtime,
+        active=bool(row10_compact_vocab),
+    )
+    if row10_compact_vocab:
+        if not bool(row10_report.get("installed")):
+            raise Qwen38ContractError("Qwen 3.8 row 10 compact head was not installed")
+        route_features.append("r10_compact_vocab")
+        kernel_ids.append("qwen38_row10_compact_q4_g64_vocab_v1")
+        feature_receipt["r10_compact_vocab"] = row10_report
 
     source_report = configure_qwen38_source_proposal(
         runtime,

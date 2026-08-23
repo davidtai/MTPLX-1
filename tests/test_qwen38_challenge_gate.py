@@ -289,6 +289,9 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "source_proposal",
     }
     assert gate._validate_route_id("r08_device_draft") == {"r08_device_draft"}
+    assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab"
+    ) == {"r08_device_draft", "r10_compact_vocab"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -316,9 +319,22 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "cache_route": "control",
         "dual_norm": False,
         "source_proposal": False,
+        "row10_compact_vocab": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
+
+
+def test_row_10_extends_retained_row_8_with_compact_proposal_vocabulary() -> None:
+    gate = _module()
+
+    row_10 = gate._route_execution_options(
+        "r08_device_draft+r10_compact_vocab"
+    )
+
+    assert row_10["draft_core"] == "device"
+    assert row_10["row10_compact_vocab"] is True
+    assert row_10["source_rows"] == (8, 10)
 
 
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:

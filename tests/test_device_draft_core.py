@@ -11,6 +11,7 @@ from mtplx.fast_sampling import sparse_distribution_from_mlx_logits  # noqa: E40
 from mtplx.generation import (  # noqa: E402
     _device_core_state_signature,
     _device_draft_q_arrays,
+    _map_compact_draft_ids,
 )
 from mtplx.sampling import SamplerConfig  # noqa: E402
 
@@ -61,6 +62,16 @@ def test_device_q_top_p_disabled_branch() -> None:
     assert set(device) == set(host)
     for token, prob in host.items():
         assert device[token] == pytest.approx(prob, abs=2e-5), token
+
+
+def test_compact_draft_ids_map_back_to_target_vocabulary_on_device() -> None:
+    compact_ids = mx.array([0, 3, 5], dtype=mx.int32)
+    token_map = mx.array([0, 1, 2, 100, 101, 102], dtype=mx.int32)
+
+    mapped = _map_compact_draft_ids(compact_ids, token_map)
+    mx.eval(mapped)
+
+    assert mapped.tolist() == [0, 100, 102]
 
 
 def test_device_inverse_cdf_sampling_matches_q() -> None:
