@@ -52,6 +52,8 @@ Means are two timed arms per route; peak is the maximum timed arm.
 | 20 | + packed K/V-only committed-history append | 780.840 | 54.742 | 25.16900 | 39.793 | **+1.7697%** | **RETAINED** | same |
 | 21 | Optimized-Speed main + retained rows 8, 10, 18, 20 | 733.350 | 53.475 | 25.16899 | 41.645 | - | cumulative control | `chrono-r21-qk-rms-rope-on-r08-r10-r18-r20-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 21 | + fused Q/K RMSNorm + partial RoPE | 726.746 | 52.912 | 25.16899 | 42.018 | **-0.8870%** | REJECTED, removed | same |
+| 24 | Optimized-Speed main + retained rows 8, 10, 18, 20 | 745.937 | 55.524 | 25.16900 | 40.554 | - | cumulative control | `chrono-r24-eval-ladder-on-r08-r10-r18-r20-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 24 | + target trunk evaluation ladder | 778.710 | 54.530 | 25.23538 | 39.915 | **+1.6019%** | **RETAINED** | same |
 
 Row 8's source-only four-way GDN projection fuse is separately proven a
 target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
@@ -59,7 +61,7 @@ target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
 engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
-Rows 8, 10, 18, and 20 are therefore part of every later timed control. Row 9 regressed
+Rows 8, 10, 18, 20, and 24 are therefore part of every later timed control. Row 9 regressed
 despite 82,880 timed kernel engagements and remains absent. Row 13 executed
 7,104 fused four-way projection calls in each timed candidate arm and was
 deterministic within route; its loss is measured, not a no-op or parity veto.
@@ -99,7 +101,7 @@ row or from the earlier bundle campaign.
 | 20 | 180 | 0.9180% | `cf350293feb4` | `b9b4300e973d` | +144/-8 | RETAINED: adapted to MTPLX's dead committed-history outputs by omitting Q/gate/attention/MLP for every appended row and packing the live BF16 K+V projections into one matmul. The packed path engaged 288 times per timed candidate arm over 17,125 history tokens and improved wall throughput 1.7697% on rows 8+10+18. Deterministic tie drift was allowed. |
 | 21 | 186 | 1.5222% | `4eb54489fb51` | `df0b66eded6c` | +228/-5 | REJECTED: exact Qwen 3.8 BF16 H256/R64 fused Q/K RMSNorm + partial-RoPE engaged 2,416 times per timed candidate arm on rows 8+10+18+20, but regressed wall throughput 0.8870%. Deterministic tie drift was allowed; implementation removed. |
 | 23 | 215 | 0.2964% | `df404e08fee2` | `597330a384fb` | +64/-41 | DEPENDENCY ABSENT/TARGET-SHAPE NON-TRANSFERABLE: this patch only retunes the row-19 argmax-only compact selector's reduction. Row 19 is absent because temperature-1/top-k20 acceptance requires the complete sparse proposal distribution, so row 23 has no retained call site and cannot affect this route. |
-| 24 | 234 | 0.9658% | `7351e62674bc` | `849631b545f2` | +54/-14 | PENDING |
+| 24 | 234 | 0.9658% | `7351e62674bc` | `849631b545f2` | +54/-14 | RETAINED in part: adaptive-margin depth is disabled by fixed D3; the Q/K width restriction modifies rejected row 21; and fused SwiGLU depends on row 18's rejected packed MLP gate/up. The remaining live mechanism, the source's target trunk evaluation ladder, engaged 144 times per candidate arm and improved wall throughput 1.6019% on rows 8+10+18+20 with exact tokens and schedules. |
 | 25 | 270 | 0.5421% | `c7468c565a7c` | `e8898ba2afd6` | +1/-1 | PENDING |
 | 26 | 276 | 0.1799% | `033f622755ac` | `47dc8c6d9b36` | +14/-6 | PENDING |
 | 28 | 304 | 0.2525% | `6209702fba83` | `a6d69403cda0` | +6/-10 | PENDING |
