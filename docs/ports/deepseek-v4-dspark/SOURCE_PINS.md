@@ -1,5 +1,8 @@
 # DeepSeek V4 DSpark Port Source Pins
 
+The current exact-Mia cold 16K/64K/128K Python vocabulary ladder and its raw
+receipts are documented in [`BENCHMARKS.md`](BENCHMARKS.md).
+
 ## Clean implementation base
 
 - MTPLX repository: `https://github.com/youssofal/MTPLX.git`
