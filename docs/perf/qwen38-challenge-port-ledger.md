@@ -137,35 +137,35 @@ row or from the earlier bundle campaign.
 | 25 | 270 | 0.5421% | `c7468c565a7c` | `e8898ba2afd6` | +1/-1 | TARGET-SHAPE NO-OP: the only change lowers the streak gate for adaptive segmented verification depth. This campaign is fixed D3 with adaptive depth disabled, so the policy constant has no call site. |
 | 26 | 276 | 0.1799% | `033f622755ac` | `47dc8c6d9b36` | +14/-6 | RETAINED in part: debug-only validation removal is irrelevant in release Python, adaptive-depth changes are disabled by fixed D3, packed-MLP widening depends on row 18's rejected MLP fusion, and Q/K widening depends on rejected row 21. The live source change tightens retained row 24's long-prefill target-evaluation cadence from every fourth layer to every third; it engaged 176 times per candidate arm and improved wall throughput 1.7032% on rows 8+10+18+20+24 with exact tokens and schedules. |
 | 28 | 304 | 0.2525% | `6209702fba83` | `a6d69403cda0` | +6/-10 | STAGED: source removes an eager recurrent-state evaluation that is already absent from MTPLX capture/commit rollback, and swaps row 17's Q4/group-64 complete MTP block for a second independently requantized artifact. The exact alternate artifact is pinned and will be gated as a proposal/acceptance candidate on the corrected cumulative stack. |
-| 30 | 350 | 0.4202% | `32b94cb67d2f` | `948f58d0f63b` | +120/-9 | PENDING |
-| 32 | 365 | 0.1764% | `156b5b75bdfa` | `66b436ee06e7` | +58/-24 | PENDING |
-| 33 | 401 | 1.7181% | `cbdc3a8d5fa9` | `9cd8e978d00a` | +92/-7 | PENDING |
-| 34 | 405 | 0.6815% | `79683c633b13` | `aa0820c6217c` | +65/-114 | PENDING |
+| 30 | 350 | 0.4202% | `32b94cb67d2f` | `948f58d0f63b` | +120/-9 | ALREADY PRESENT/TARGET-COMPILED: source publishes the target forward's existing post-final-norm block and reuses it for committed MTP history. MTPLX's Qwen forward already returns `post_norm` for `base_hidden_variant=post_norm`, and capture/commit appends those returned rows directly without another final RMSNorm. Source's separately compiled full-attention sigmoid/multiply is already enclosed by MTPLX's whole route-specific compiled target graph. There is no missing live dispatch boundary to port. |
+| 32 | 365 | 0.1764% | `156b5b75bdfa` | `66b436ee06e7` | +58/-24 | TARGET-SHAPE NO-OP: source retunes only affine-4/group-64 QMV width M=8 (4+4 to 3+3+2) plus adaptive depth/streak policy. This campaign fixes D3, so target verification is M=4 and adaptive depth is disabled; exact 16K prefill is not an M=8 QMV. |
+| 33 | 401 | 1.7181% | `cbdc3a8d5fa9` | `9cd8e978d00a` | +92/-7 | REMOVED NEXT ROW: proposal-only BF16 Q/K/V precision islands and their declared artifact are deleted wholesale by row 34 before they can enter the retained chronological stack. The mechanism is reintroduced later by row 36 and is handled there. |
+| 34 | 405 | 0.6815% | `79683c633b13` | `aa0820c6217c` | +65/-114 | TARGET-SHAPE NO-OP/REMOVAL: deletes row 33's transient precision-island artifact, restores the independent row-28 Q4/group-64 block, and changes direct-nibble QMV only at M=6 and M=9. Fixed-D3 verification is M=4, so the surviving kernel edits have no live call site. |
 | 36 | 423 | 1.6826% | `ed4dfd6b0e95` | `12afdfd18be8` | +105/-40 | PENDING |
-| 37 | 428 | 0.1477% | `be3361b96875` | `882e395797e2` | +33/-13 | PENDING |
-| 38 | 430 | 0.6244% | `0824e0ec28e5` | `dc1e16093bb7` | +2/-2 | PENDING |
-| 39 | 437 | 0.3030% | `1abe6368a882` | `2f3e81092f41` | +13/-33 | PENDING |
-| 40 | 438 | 0.6643% | `d1530a409848` | `7a4e9cbc4c6b` | +4/-4 | PENDING |
+| 37 | 428 | 0.1477% | `be3361b96875` | `882e395797e2` | +33/-13 | CONDITIONER-COVERED/TARGET-SHAPE NO-OP: source warms the row-30 post-norm verify output and reverts row 36's M=8 direct-nibble toggle. Every route receives the required 1,024-token conditioning generation before its timed arms, while fixed D3 never dispatches M=8. |
+| 38 | 430 | 0.6244% | `0824e0ec28e5` | `dc1e16093bb7` | +2/-2 | TARGET-SHAPE NO-OP: toggles direct-nibble extraction only for affine-4/group-64 M=8. The fixed-D3 target verify is M=4. |
+| 39 | 437 | 0.3030% | `1abe6368a882` | `2f3e81092f41` | +13/-33 | REMOVED NEXT ROW: source changes affine-4/group-64 M=4 from one four-row input group to two two-row groups, then row 40 restores the M=4 incumbent exactly. The same two-row ownership idea was independently adapted to the live group-32 target at row 9 and rejected there; this removed snapshot does not enter the cumulative stack. |
+| 40 | 438 | 0.6643% | `d1530a409848` | `7a4e9cbc4c6b` | +4/-4 | TARGET-SHAPE NO-OP/RESTORE: restores M=4 after row 39 and enables direct-nibble extraction only at M=7. Fixed D3 verifies at M=4, so the surviving M=7 edit is inactive. |
 | 41 | 450 | 0.4931% | `0d800b229e94` | `3272565fbdc7` | +6/-6 | PENDING |
 | 42 | 472 | 1.4130% | `036fd9ca2a2c` | `be0fefb19a14` | +124/-9 | PENDING |
-| 45 | 505 | 0.4408% | `868cde8f985a` | `3138ecedd936` | +309/-48 | PENDING |
-| 47 | 530 | 0.5687% | `dccba745af5b` | `e89a06dfd673` | +195/-5 | PENDING |
+| 45 | 505 | 0.4408% | `868cde8f985a` | `3138ecedd936` | +309/-48 | REMOVED NEXT ROW: its memoized norm constants, fused residual/RMSNorm boundary chain, and no-copy attention gate layout are deleted by row 46. The target-side mechanisms are reintroduced by row 48 and are handled as that later live candidate. |
+| 47 | 530 | 0.5687% | `dccba745af5b` | `e89a06dfd673` | +195/-5 | DEPENDENCY ABSENT/TARGET-SHAPE NO-OP: adds a custom affine-2 M=1 kernel for row 42's argmax-only coarse proposal selector and changes Q4 M=8 grouping. Temperature-1/top-k20 speculative acceptance cannot replace the complete proposal distribution with that argmax shortlist, and fixed D3 does not dispatch M=8. |
 | 48 | 543 | 0.1230% | `86fb1f020fc1` | `d2962993b6da` | +422/-240 | PENDING |
 | 50 | 572 | 0.2736% | `c0e34afd857e` | `4b6eb22f8820` | +115/-0 | PENDING |
 | 53 | 600 | 0.1577% | `0c90733d383f` | `39b6322daa32` | +11/-24 | PENDING |
-| 59 | 843 | 1.4217% | `3e2530aeae21` | `a0b5e9aaa3c4` | +23/-2 | PENDING |
-| 60 | 846 | 0.2224% | `88578f929552` | `c529a4989d0d` | +155/-27 | PENDING |
+| 59 | 843 | 1.4217% | `3e2530aeae21` | `a0b5e9aaa3c4` | +23/-2 | TARGET-SHAPE NO-OP/REMOVED NEXT ROW: only raises the adaptive SDPA width cap from depth 5 to 6 before the full-accept streak gate; row 60 restores the prior policy. This campaign fixes D3 and disables adaptive depth. |
+| 60 | 846 | 0.2224% | `88578f929552` | `c529a4989d0d` | +155/-27 | REMOVED NEXT ROW: restores row 59's policy and introduces a two-output dual RMSNorm for the MTP embedding/hidden pair. Row 61 immediately replaces that kernel and its two outputs plus concatenate with the later single-output dual-RMSNorm-concat candidate, which is the live mechanism to gate. |
 | 61 | 866 | 0.2836% | `8b54ff11c6d6` | `feeffa289cd4` | +129/-10 | PENDING |
 | 63 | 911 | 0.1698% | `61612aa89dc6` | `0fd574d04a01` | +384/-14 | PENDING: this is a real fused quantized embedding/dual-norm/top-32 patch, not a resample. |
-| 66 | 965 | 0.3080% | `ca0612472eb5` | `ddfede29ee90` | +1/-1 | PENDING |
-| 67 | 968 | 0.3523% | `41bad1c6f124` | `76fa838f3cf2` | +93/-90 | PENDING |
+| 66 | 965 | 0.3080% | `ca0612472eb5` | `ddfede29ee90` | +1/-1 | WEAK/NO-OP: changes only the human-readable artifact note by appending a resample-ticket annotation; model tensors and executable code are byte-for-byte unchanged. |
+| 67 | 968 | 0.3523% | `41bad1c6f124` | `76fa838f3cf2` | +93/-90 | TARGET-SHAPE NON-TRANSFERABLE: replaces the gather-QMM plus reducer for row 42's argmax-only 32-row proposal rerank with a direct selected-row Metal kernel. Temperature-1/top-k20 acceptance requires the complete proposal probability distribution, so this selector has no valid call site in the required route. |
 | 69 | 1031 | 0.2133% | `fac135f222f9` | `863c65d8ae0b` | +412/-746 | PENDING |
 | 70 | 1063 | 3.9125% | `6f1cd66fc214` | `0dd6cffb1309` | +1070/-496 | PENDING |
-| 71 | 1066 | 0.7439% | `a0f8588668c6` | `8b0283f1e500` | +267/-11 | PENDING |
+| 71 | 1066 | 0.7439% | `a0f8588668c6` | `8b0283f1e500` | +267/-11 | TARGET-SHAPE NON-TRANSFERABLE: customizes the affine-2 centroid and selected-cluster QMV stages of the row-42/69 argmax-only retrieval index. The required stochastic route needs the complete proposal distribution and cannot dispatch this shortlist selector. |
 | 78 | 1123 | 4.3907% | `8849fad72cc3` | `53cc0c1c6e42` | +39/-14 | PENDING |
-| 79 | 1130 | 0.2444% | `1d66bb36cda1` | `503f4fe8d56b` | +7/-10 | PENDING |
+| 79 | 1130 | 0.2444% | `1d66bb36cda1` | `503f4fe8d56b` | +7/-10 | TARGET-SHAPE NON-TRANSFERABLE: only changes the row-69 argmax retrieval index's derived-cluster probe fraction from 0.25 to 0.15. That selector is absent under temperature-1/top-k20 full-distribution acceptance. |
 | 80 | 1139 | 0.3477% | `e8f14c444156` | `49484169aabc` | +8/-4 | PENDING |
-| 82 | 1153 | 0.3733% | `eb5eadc7a165` | `3142edaa4070` | +5/-27 | PENDING |
+| 82 | 1153 | 0.3733% | `eb5eadc7a165` | `3142edaa4070` | +5/-27 | CONDITIONER-COVERED/DEPENDENCY ABSENT: removes untimed folded-history warm shapes and skips construction of a fallback probe-sort factory while row 69's E87 argmax selector is active. The exact 1,024-token route conditioner already pays any live first touch before timed arms, and the argmax-only selector is absent from the required stochastic route. |
 
 The campaign remains incomplete until every `PENDING` cell is replaced by
 direct evidence and every applicable retained implementation has its own 16K
