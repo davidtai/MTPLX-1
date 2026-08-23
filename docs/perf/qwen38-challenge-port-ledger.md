@@ -35,8 +35,10 @@ Adaptive MTP is now also required. Fixed-D3 receipts remain valid for mechanisms
 that engage at D3, but a fixed-D3 no-op is no longer a final skip. Rows 11, 15,
 18, 24, 25, 26, 32, 34, 36, 37, 38, 40, and 47 are reopened for surviving
 adaptive-policy or newly reachable M5--M9 mechanisms. They will be tested
-chronologically on a cumulative adaptive stack before the final DFlash 2 item;
-changes genuinely removed by later rows remain removed.
+chronologically only after item 55 has replaced/merged the drafter with
+DFlash2. The adaptive stack will start from that merged target/drafter and use
+the DFlash2-supported depth range 1--8; changes genuinely removed by later rows
+remain removed.
 
 Custom MTP mechanisms are in scope as well: proposal-block variants, committed
 history, rollback/warm paths, custom readouts, and shape-specific kernels must
@@ -141,7 +143,9 @@ works. The scheduled source
 is the local `dflash-mlx` implementation at `54644e991039` and its declared
 `z-lab/Qwen3.8-27B-DFlash2` checkpoint snapshot `50307d4c4cde`; implementation
 will pin the complete artifact digest and geometry before the final gate rather
-than silently following either moving ref.
+than silently following either moving ref. After the fixed DFlash2 stack and
+its per-survivor gates are complete, adaptive DFlash2 depth 1--8 becomes the
+next cumulative lane on the same branch and in the same PR.
 
 ## Exact 54-row campaign state
 
@@ -194,7 +198,7 @@ row or from the earlier bundle campaign.
 | 53 | 600 | 0.1577% | `0c90733d383f` | `39b6322daa32` | +11/-24 | RETAINED on corrected rows 8+10+18+20+21+24+26+36+48+50: the live source change force-sets MLX's process-latched command-buffer profile to 512 MiB/50 operations; its verify-concat warm-loop removal is conditioner-covered, and the older Swift-only 128-to-512 override has no separate Python call site. Four clean child processes loaded the identical cumulative stack in ABBA order and observed null/null for control versus exact 512/50 candidate values before any MLX import. Tokens and depth schedules were exact; wall throughput improved 0.4708%. Peak memory rose from 25.48171 to 32.72811 GiB (+7.24641 GiB), which is recorded but does not override the speed-first >0.05% promotion rule. Item 55 must re-gate this profile over the combined target/DFlash2 process rather than assuming transfer. |
 | 59 | 843 | 1.4217% | `3e2530aeae21` | `a0b5e9aaa3c4` | +23/-2 | TARGET-SHAPE NO-OP/REMOVED NEXT ROW: only raises the adaptive SDPA width cap from depth 5 to 6 before the full-accept streak gate; row 60 restores the prior policy. This campaign fixes D3 and disables adaptive depth. |
 | 60 | 846 | 0.2224% | `88578f929552` | `c529a4989d0d` | +155/-27 | REMOVED NEXT ROW: restores row 59's policy and introduces a two-output dual RMSNorm for the MTP embedding/hidden pair. Row 61 immediately replaces that kernel and its two outputs plus concatenate with the later single-output dual-RMSNorm-concat candidate, which is the live mechanism to gate. |
-| 61 | 866 | 0.2836% | `8b54ff11c6d6` | `feeffa289cd4` | +129/-10 | STAGED: exact BF16 dual RMSNorm plus output concatenate for the MTP embedding/hidden pre-FC pair already exists in the campaign kernel module. It now has an explicit chronological `r61_dual_norm_concat` route and nonzero-call promotion guard; it awaits its turn on the retained stack rather than being hidden behind the old generic `dual_norm` label. |
+| 61 | 866 | 0.2836% | `8b54ff11c6d6` | `feeffa289cd4` | +129/-10 | STAGED; CLEAN RERUN REQUIRED: exact BF16 dual RMSNorm plus output concatenate for the MTP embedding/hidden pre-FC pair exists in the campaign kernel module with an explicit `r61_dual_norm_concat` route and nonzero-call guard. Its first chronological gate is diagnostic only: candidate arms were stable at 44.589/44.076 s, but control arms were 51.711/44.217 s (16.9% self-spread), so the apparent +8.1902% was entirely an anomalously slow opening control. The invalid receipt is preserved as `invalid-unstable-r61-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-r50-r53-python16384in-1024out-t1-abba-2026-08-23.json`; it is not promotion evidence. |
 | 63 | 911 | 0.1698% | `61612aa89dc6` | `0fd574d04a01` | +384/-14 | STAGED IN PART: the source fuses its Q4/group-64 embedding lookup with the two row-61 RMSNorms and concatenate, while its second mechanism is an argmax-only top-32 proposer. The shortlist is non-transferable to temperature-1 full-distribution acceptance. The live fusion is corrected for Optimized-Speed's actual Q8/group-64 embedding tensor: one kernel directly unpacks four 8-bit values per word, dequantizes with the target scales/biases, normalizes embedding and hidden rows, and writes the 10,240-wide concat without materializing the embedding gather. It supersedes row 61 inside the candidate and has a nonzero-call gate; real artifact parity/compilation and the chronological 16K A/B remain pending. |
 | 66 | 965 | 0.3080% | `ca0612472eb5` | `ddfede29ee90` | +1/-1 | WEAK/NO-OP: changes only the human-readable artifact note by appending a resample-ticket annotation; model tensors and executable code are byte-for-byte unchanged. |
 | 67 | 968 | 0.3523% | `41bad1c6f124` | `76fa838f3cf2` | +93/-90 | TARGET-SHAPE NON-TRANSFERABLE: replaces the gather-QMM plus reducer for row 42's argmax-only 32-row proposal rerank with a direct selected-row Metal kernel. Temperature-1/top-k20 acceptance requires the complete proposal probability distribution, so this selector has no valid call site in the required route. |
