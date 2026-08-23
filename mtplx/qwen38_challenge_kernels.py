@@ -222,15 +222,7 @@ def configure_qwen38_row21_qk_rms_rope(model: Any, *, active: bool) -> dict[str,
                 raise ValueError("active Qwen 3.8 row-21 attention is ineligible")
             offset = getattr(cache, "offset", 0) if cache is not None else 0
             if isinstance(offset, mx.array):
-                # Matches the source patch's `hasArrayOffset` fallback: the
-                # device draft core keeps this offset traced, while the fused
-                # Metal kernel takes a host scalar.
-                return _QWEN38_ATTENTION_ORIGINAL_CALL(
-                    self,
-                    x,
-                    mask=mask,
-                    cache=cache,
-                )
+                raise ValueError("Qwen 3.8 row-21 route requires a host cache offset")
             batch, length, _ = x.shape
             q_projection = self.q_proj(x)
             queries, gate = mx.split(
