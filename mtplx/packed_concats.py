@@ -143,7 +143,7 @@ def install_qwen3_next_packed_concats(
     *,
     force: bool = False,
     attention: bool = True,
-    mlp: bool = True,
+    include_mlp: bool = True,
 ) -> dict[str, int] | None:
     """Fuse selected projection families on every stock decoder layer.
 
@@ -229,13 +229,13 @@ def install_qwen3_next_packed_concats(
                 COUNTERS["attention_fused_modules"] += 1
             else:
                 COUNTERS["skipped_modules"] += 1
-        mlp = getattr(layer, "mlp", None)
-        if mlp and isinstance(mlp, mlp_class) and not hasattr(
-            mlp, "_mtplx_fused_gate_up"
+        mlp_module = getattr(layer, "mlp", None)
+        if include_mlp and isinstance(mlp_module, mlp_class) and not hasattr(
+            mlp_module, "_mtplx_fused_gate_up"
         ):
-            payload = _pack([mlp.gate_proj, mlp.up_proj])
+            payload = _pack([mlp_module.gate_proj, mlp_module.up_proj])
             if payload is not None:
-                mlp._mtplx_fused_gate_up = payload
+                mlp_module._mtplx_fused_gate_up = payload
                 COUNTERS["mlp_fused_modules"] += 1
             else:
                 COUNTERS["skipped_modules"] += 1
@@ -266,7 +266,7 @@ def configure_qwen3_next_packed_qkv(
             model,
             force=True,
             attention=True,
-            mlp=False,
+            include_mlp=False,
         )
 
     from mlx_lm.models import qwen3_next as qn
