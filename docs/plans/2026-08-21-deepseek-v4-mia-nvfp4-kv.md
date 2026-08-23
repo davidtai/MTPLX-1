@@ -295,12 +295,12 @@ no fallback or invariant checks. A minimal installation-time dispatch compiles
 the one fixed BF16 pipeline before serving, following the pinned vLLM engine's
 compile/warm-before-request lifecycle.
 
-- [ ] **Step 4: Verify GREEN and the bounded-allocation contract**
+- [x] **Step 4: Verify GREEN and the bounded-allocation contract**
 
 Run the sparse-attention check and the target/DSpark files.  Inspect the callable's
 interface to confirm it cannot receive a whole-context mask or score tensor.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/kernels/deepseek_v4_nvfp4_mla.py mtplx/models/deepseek_v4.py \
