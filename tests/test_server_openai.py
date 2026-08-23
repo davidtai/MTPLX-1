@@ -13272,6 +13272,7 @@ def _postcommit_route_state(*, mtp_enabled: bool):
 
     foreground = ForegroundState()
     return SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         runtime=SimpleNamespace(
             mtp_enabled=mtp_enabled,
             make_mtp_cache=_boom_mtp_cache,
