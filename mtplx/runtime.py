@@ -966,7 +966,18 @@ def load(
     )
     from .qwen38_challenge import install_qwen38_route, qwen38_final_route
 
-    qwen38_route = install_qwen38_route(runtime, config, path, **qwen38_final_route())
+    qwen38_options = qwen38_final_route()
+    pending_source = bool(qwen38_options.pop("source_proposal", False))
+    pending_retain_control = bool(
+        qwen38_options.pop("source_retain_control", True)
+    )
+    qwen38_route = install_qwen38_route(runtime, config, path, **qwen38_options)
+    if qwen38_route is not None and pending_source:
+        runtime._mtplx_qwen38_pending_source_route = {
+            **qwen38_options,
+            "source_proposal": True,
+            "source_retain_control": pending_retain_control,
+        }
     if qwen38_route is not None:
         logger.info(
             "[qwen38-challenge] route=%s fingerprint=%s selfcheck=%s",

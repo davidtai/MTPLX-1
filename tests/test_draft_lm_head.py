@@ -66,6 +66,47 @@ def test_install_draft_lm_head_quantizes_dense_linear_head() -> None:
     assert logits.shape == (1, 2, 64)
 
 
+def test_draft_head_install_finishes_pending_qwen38_source_route(
+    monkeypatch, tmp_path
+) -> None:
+    linear = nn.Linear(32, 64, bias=False)
+    linear.weight = mx.ones((64, 32), dtype=mx.bfloat16)
+    rt = SimpleNamespace(
+        model=SimpleNamespace(lm_head=linear),
+        model_path=tmp_path,
+        _mtplx_qwen38_pending_source_route={
+            "cache_route": "kv_only_history",
+            "source_proposal": True,
+            "source_retain_control": False,
+        },
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("mtplx.artifacts.load_config", lambda path: {"path": path})
+
+    def install(runtime, config, model_path, **route):
+        seen.update(
+            runtime=runtime,
+            config=config,
+            model_path=model_path,
+            route=route,
+            draft_head_present=hasattr(runtime.model, "_mtplx_draft_lm_head"),
+        )
+        return SimpleNamespace(route_id="kv_only_history+source_proposal")
+
+    monkeypatch.setattr("mtplx.qwen38_challenge.install_qwen38_route", install)
+
+    _install_draft_lm_head(rt, bits=4, group_size=32, mode="affine")
+
+    assert seen["draft_head_present"] is True
+    assert seen["route"] == {
+        "cache_route": "kv_only_history",
+        "source_proposal": True,
+        "source_retain_control": False,
+    }
+    assert not hasattr(rt, "_mtplx_qwen38_pending_source_route")
+
+
 def test_install_draft_lm_head_quantizes_step_mtp_shared_heads() -> None:
     rt = SimpleNamespace(model=_StepMTPText())
 

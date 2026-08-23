@@ -48,6 +48,24 @@ def _text_model(model: Any) -> Any:
     return getattr(model, "language_model", model)
 
 
+def _finish_pending_qwen38_source_route(rt: Any) -> None:
+    pending = getattr(rt, "_mtplx_qwen38_pending_source_route", None)
+    if not isinstance(pending, dict):
+        return
+    from .artifacts import load_config
+    from .qwen38_challenge import install_qwen38_route
+
+    route = install_qwen38_route(
+        rt,
+        load_config(rt.model_path),
+        rt.model_path,
+        **pending,
+    )
+    if route is None or "source_proposal" not in route.route_id.split("+"):
+        raise RuntimeError("pending Qwen 3.8 source proposal route did not install")
+    delattr(rt, "_mtplx_qwen38_pending_source_route")
+
+
 def _make_requantized_head(module: Any, *, bits: int, group_size: int, mode: str) -> tuple[Any, dict[str, Any]]:
     import mlx.core as mx
     import mlx.nn as nn
@@ -311,6 +329,7 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
             "mode": str(mode),
             "layers": len(reports),
         }
+        _finish_pending_qwen38_source_route(rt)
         return {
             "source": "step_mtp_shared_head",
             "layers": reports,
@@ -346,4 +365,5 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
     else:
         raise AttributeError("model has no lm_head and does not tie output projection to embeddings")
     text._mtplx_draft_lm_head = draft_head
+    _finish_pending_qwen38_source_route(rt)
     return report
