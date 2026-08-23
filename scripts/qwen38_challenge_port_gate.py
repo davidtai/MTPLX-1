@@ -199,6 +199,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
         "r48_boundary_fused",
+        "r50_wired_residency",
         "r61_dual_norm_concat",
     }
     unknown = features - allowed
@@ -236,6 +237,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(36)
     if "r48_boundary_fused" in features:
         source_rows.append(48)
+    if "r50_wired_residency" in features:
+        source_rows.append(50)
     if "r61_dual_norm_concat" in features:
         source_rows.append(61)
     return {
@@ -261,6 +264,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "row24_eval_ladder": "r24_eval_ladder" in features,
         "row26_prefill_ladder_3": "r26_prefill_ladder_3" in features,
         "row48_boundary_fused": "r48_boundary_fused" in features,
+        "row50_wired_residency": "r50_wired_residency" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -499,6 +503,19 @@ def _candidate_engagement_errors(
             )
         if sum(int(item.get("merged_boundaries", 0)) for item in engagement) <= 0:
             errors.append("row 48 fused no-copy layer boundaries did not execute")
+    if "r50_wired_residency" in features:
+        active = any(
+            bool(report.get("installed"))
+            and bool(report.get("active"))
+            and int(report.get("target_limit_bytes", 0)) > 0
+            and int(report.get("active_memory_bytes", 0)) > 0
+            for run in candidate_runs
+            for report in [
+                ((run.get("feature_receipt") or {}).get("r50_wired_residency") or {})
+            ]
+        )
+        if not active:
+            errors.append("row 50 post-warm wired residency was not active")
     return errors
 
 
@@ -675,6 +692,7 @@ def _run_arm(
         row24_eval_ladder=bool(options["row24_eval_ladder"]),
         row26_prefill_ladder_3=bool(options["row26_prefill_ladder_3"]),
         row48_boundary_fused=bool(options["row48_boundary_fused"]),
+        row50_wired_residency=bool(options["row50_wired_residency"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

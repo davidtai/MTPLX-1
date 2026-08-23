@@ -313,6 +313,70 @@ def install_qwen38_control_route(
     return install_qwen38_route(runtime, config, model_path, cache_route="control")
 
 
+def configure_qwen38_row50_wired_residency(
+    runtime: Any,
+    *,
+    active: bool,
+    mx_module: Any | None = None,
+) -> dict[str, Any]:
+    """Apply row 50's post-warm resident-weight budget and restore controls."""
+
+    if mx_module is None:
+        import mlx.core as mx
+    else:
+        mx = mx_module
+
+    state = getattr(runtime, "_qwen38_row50_wired_state", None)
+    if not active:
+        if isinstance(state, dict) and state.get("installed"):
+            baseline = int(state["baseline_limit_bytes"])
+            mx.set_wired_limit(baseline)
+            return {
+                **state,
+                "active": False,
+                "restored_limit_bytes": baseline,
+            }
+        return {"installed": False, "active": False}
+
+    if isinstance(state, dict) and state.get("installed"):
+        mx.set_wired_limit(int(state["target_limit_bytes"]))
+        return {**state, "active": True}
+
+    info = dict(mx.device_info())
+    physical = int(info.get("memory_size") or 0)
+    if physical and physical < 96 * 2**30:
+        return {
+            "installed": False,
+            "active": False,
+            "reason": "physical_memory_below_96gib",
+            "physical_memory_bytes": physical,
+        }
+
+    # Row 50 sizes residency only after temporary warm graphs leave scope.
+    mx.clear_cache()
+    active_bytes = int(mx.get_active_memory())
+    if active_bytes <= 0:
+        return {"installed": False, "active": False, "reason": "no_active_memory"}
+    target = active_bytes + 64 * 2**20
+    recommended = int(info.get("max_recommended_working_set_size") or 0)
+    if recommended > 0:
+        target = min(target, max(0, recommended - 256 * 2**20))
+    if target <= 0:
+        return {"installed": False, "active": False, "reason": "invalid_target"}
+    baseline = int(mx.set_wired_limit(target))
+    state = {
+        "installed": True,
+        "active": True,
+        "active_memory_bytes": active_bytes,
+        "target_limit_bytes": target,
+        "baseline_limit_bytes": baseline,
+        "max_recommended_working_set_bytes": recommended,
+        "slack_bytes": 64 * 2**20,
+    }
+    runtime._qwen38_row50_wired_state = state
+    return dict(state)
+
+
 def install_qwen38_route(
     runtime: Any,
     config: Mapping[str, Any],
@@ -329,6 +393,7 @@ def install_qwen38_route(
     row24_eval_ladder: bool = False,
     row26_prefill_ladder_3: bool = False,
     row48_boundary_fused: bool = False,
+    row50_wired_residency: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -460,6 +525,18 @@ def install_qwen38_route(
         route_features.append("r48_boundary_fused")
         kernel_ids.append("qwen38_row48_boundary_fused_residual_rmsnorm_v1")
         feature_receipt["r48_boundary_fused"] = {"active": 1}
+    row50_report = configure_qwen38_row50_wired_residency(
+        runtime,
+        active=bool(row50_wired_residency),
+    )
+    if row50_wired_residency:
+        if not bool(row50_report.get("installed")):
+            raise Qwen38ContractError(
+                "Qwen 3.8 row 50 wired residency could not be installed"
+            )
+        route_features.append("r50_wired_residency")
+        kernel_ids.append("qwen38_row50_post_warm_wired_residency_v1")
+        feature_receipt["r50_wired_residency"] = row50_report
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)
     if dual_norm:
         route_features.append("dual_norm")

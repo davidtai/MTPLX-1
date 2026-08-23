@@ -14,6 +14,7 @@ from mtplx.qwen38_challenge import (
     Qwen38ContractError,
     Qwen38RouteBindings,
     build_qwen38_route,
+    configure_qwen38_row50_wired_residency,
     install_qwen38_control_route,
     install_qwen38_route,
     is_qwen38_27b_candidate,
@@ -422,3 +423,40 @@ def test_row18_route_names_input_independent_gdn_decay_memo(monkeypatch) -> None
         "configured_modules": 48,
         "active_modules": 48,
     }
+
+
+def test_row50_wired_residency_restores_the_control_limit() -> None:
+    calls: list[tuple[str, int | None]] = []
+
+    class FakeMX:
+        def device_info(self):
+            return {
+                "memory_size": 128 * 2**30,
+                "max_recommended_working_set_size": 100 * 2**30,
+            }
+
+        def clear_cache(self):
+            calls.append(("clear", None))
+
+        def get_active_memory(self):
+            return 25 * 2**30
+
+        def set_wired_limit(self, value):
+            calls.append(("wired", int(value)))
+            return 0
+
+    runtime = SimpleNamespace()
+    candidate = configure_qwen38_row50_wired_residency(
+        runtime, active=True, mx_module=FakeMX()
+    )
+    control = configure_qwen38_row50_wired_residency(
+        runtime, active=False, mx_module=FakeMX()
+    )
+
+    assert candidate["target_limit_bytes"] == 25 * 2**30 + 64 * 2**20
+    assert control["restored_limit_bytes"] == 0
+    assert calls == [
+        ("clear", None),
+        ("wired", 25 * 2**30 + 64 * 2**20),
+        ("wired", 0),
+    ]

@@ -368,6 +368,9 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     assert gate._validate_route_id(
         "r08_device_draft+r48_boundary_fused"
     ) == {"r08_device_draft", "r48_boundary_fused"}
+    assert gate._validate_route_id(
+        "r08_device_draft+r50_wired_residency"
+    ) == {"r08_device_draft", "r50_wired_residency"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -402,6 +405,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "row24_eval_ladder": False,
         "row26_prefill_ladder_3": False,
         "row48_boundary_fused": False,
+        "row50_wired_residency": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
