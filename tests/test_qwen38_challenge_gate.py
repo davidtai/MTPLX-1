@@ -313,6 +313,15 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     ) == {"r08_device_draft", "r10_compact_vocab", "r18_gdn_decay_memo"}
     assert gate._validate_route_id(
         "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r18_mlp_gate_up"
+    ) == {
+        "r08_device_draft",
+        "r10_compact_vocab",
+        "r18_gdn_decay_memo",
+        "r18_mlp_gate_up",
+    }
+    assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
         "r20_kv_only_history"
     ) == {
         "r08_device_draft",
@@ -349,6 +358,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "source_proposal": False,
         "row10_compact_vocab": False,
         "row18_gdn_decay_memo": False,
+        "row18_mlp_gate_up": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
@@ -391,6 +401,46 @@ def test_row18_promotion_requires_memoized_decay_engagement() -> None:
 
     assert gate._candidate_engagement_errors(route, [zero], []) == [
         "row 18 GDN decay memo did not execute"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
+def test_row18_mlp_addendum_keeps_the_chronological_row_number() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r18_mlp_gate_up"
+    )
+
+    options = gate._route_execution_options(route)
+
+    assert options["row18_mlp_gate_up"] is True
+    assert options["source_rows"] == (8, 10, 18)
+
+
+def test_row18_mlp_addendum_requires_gate_up_engagement() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r18_mlp_gate_up"
+    )
+    zero = {
+        "route_id": route,
+        "engagement": {
+            "r18_gdn_decay_memo": {"memo_calls": 48},
+            "r18_mlp_gate_up": {"calls": 0},
+        },
+    }
+    engaged = {
+        "route_id": route,
+        "engagement": {
+            "r18_gdn_decay_memo": {"memo_calls": 48},
+            "r18_mlp_gate_up": {"calls": 48},
+        },
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 18 packed MLP gate/up did not execute"
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 

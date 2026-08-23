@@ -191,6 +191,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r08_device_draft",
         "r10_compact_vocab",
         "r18_gdn_decay_memo",
+        "r18_mlp_gate_up",
         "r20_kv_only_history",
     }
     unknown = features - allowed
@@ -224,6 +225,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "row18_gdn_decay_memo": "r18_gdn_decay_memo" in features,
+        "row18_mlp_gate_up": "r18_mlp_gate_up" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -299,6 +301,18 @@ def _candidate_engagement_errors(
         )
         if memo_calls <= 0:
             errors.append("row 18 GDN decay memo did not execute")
+    if "r18_mlp_gate_up" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r18_mlp_gate_up") or {}).get(
+                    "calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 18 packed MLP gate/up did not execute")
     if "r20_kv_only_history" in features:
         engagement = [
             ((run.get("engagement") or {}).get("r20_kv_only_history") or {})
@@ -325,6 +339,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.draft_lm_head import qwen38_row10_compact_counter_snapshot
     from mtplx.gdn_capture import QWEN38_GDN_DECAY_MEMO_COUNTERS
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
+    from mtplx.qwen38_challenge_kernels import qwen38_row18_mlp_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
 
@@ -332,6 +347,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
+        "r18_mlp_gate_up": {"calls": qwen38_row18_mlp_counter_snapshot()},
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
         "source_proposal": qwen38_source_counter_snapshot(),
     }
@@ -453,6 +469,7 @@ def _run_arm(
         source_proposal=bool(options["source_proposal"]),
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
         row18_gdn_decay_memo=bool(options["row18_gdn_decay_memo"]),
+        row18_mlp_gate_up=bool(options["row18_mlp_gate_up"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(
