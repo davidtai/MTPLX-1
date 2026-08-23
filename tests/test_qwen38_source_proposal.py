@@ -52,9 +52,15 @@ def test_candidate_body_validation_rejects_missing_or_mismatched_weights() -> No
     class Candidate:
         @staticmethod
         def parameters():
-            return {"fc": {"weight": mx.zeros((2, 2), dtype=mx.uint32)}}
+            return {
+                "fc": {"weight": mx.zeros((2, 2), dtype=mx.uint32)},
+                "norm": {"weight": mx.zeros((2,), dtype=mx.float32)},
+            }
 
-    body = {"fc.weight": mx.zeros((2, 2), dtype=mx.uint32)}
+    body = {
+        "fc.weight": mx.zeros((2, 2), dtype=mx.uint32),
+        "norm.weight": mx.zeros((2,), dtype=mx.bfloat16),
+    }
     _validate_candidate_body(Candidate(), body)
 
     with pytest.raises(Qwen38SourceProposalError, match="missing=.*fc.weight"):
@@ -62,5 +68,8 @@ def test_candidate_body_validation_rejects_missing_or_mismatched_weights() -> No
     with pytest.raises(Qwen38SourceProposalError, match="shape/dtype"):
         _validate_candidate_body(
             Candidate(),
-            {"fc.weight": mx.zeros((2, 3), dtype=mx.uint32)},
+            {
+                "fc.weight": mx.zeros((2, 3), dtype=mx.uint32),
+                "norm.weight": mx.zeros((2,), dtype=mx.bfloat16),
+            },
         )

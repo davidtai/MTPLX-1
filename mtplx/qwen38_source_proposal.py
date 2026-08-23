@@ -762,6 +762,7 @@ def _dense_linear(weight: Any, *, counter: str) -> Any:
 def _validate_candidate_body(candidate: Any, body: dict[str, Any]) -> None:
     """Require the artifact body to cover the constructed module exactly."""
 
+    import mlx.core as mx
     from mlx.utils import tree_flatten
 
     expected = dict(tree_flatten(candidate.parameters()))
@@ -775,7 +776,8 @@ def _validate_candidate_body(candidate: Any, body: dict[str, Any]) -> None:
         key
         for key, value in body.items()
         if tuple(value.shape) != tuple(expected[key].shape)
-        or str(value.dtype) != str(expected[key].dtype)
+        or value.dtype
+        != (mx.uint32 if expected[key].dtype == mx.uint32 else mx.bfloat16)
     )
     if mismatched:
         raise Qwen38SourceProposalError(
