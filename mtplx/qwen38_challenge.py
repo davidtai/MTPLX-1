@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -63,6 +63,7 @@ QWEN38_Q8_LINEAR_ATTN_LAYERS = (
 )
 QWEN38_QMV_WIDTHS = tuple(range(2, 10))
 QWEN38_PACKING = "mlx_affine_u32_le"
+DEFAULT_QWEN38_CACHE_ROUTE = "kv_only_history"
 
 
 class Qwen38ContractError(RuntimeError):
@@ -380,15 +381,51 @@ def install_qwen38_control_route(
     config: Mapping[str, Any],
     model_path: Path,
 ) -> Qwen38RouteSpec | None:
+    return install_qwen38_route(
+        runtime,
+        config,
+        model_path,
+        cache_route="control",
+    )
+
+
+def install_qwen38_route(
+    runtime: Any,
+    config: Mapping[str, Any],
+    model_path: Path,
+    *,
+    cache_route: str = DEFAULT_QWEN38_CACHE_ROUTE,
+) -> Qwen38RouteSpec | None:
     if not is_qwen38_27b_candidate(config, model_path):
         return None
     if not bool(getattr(runtime, "mtp_enabled", False)):
         return None
+    route_id = str(cache_route or "control").strip().lower()
+    bindings = control_bindings(runtime)
+    kernel_ids: tuple[str, ...] = ()
+    selfcheck_status = "control"
+    if route_id == "kv_only_history":
+        implementation = getattr(
+            runtime.model,
+            "mtp_update_cache_kv_only_history",
+            None,
+        )
+        if not callable(implementation):
+            raise Qwen38ContractError(
+                "Qwen 3.8 K/V-only history route is unavailable on the loaded model"
+            )
+        bindings = replace(bindings, mtp_cache_append=implementation)
+        kernel_ids = ("qwen38_mtp_kv_only_history_v1",)
+        selfcheck_status = "passed:cache_exact+64t_abba_baab"
+    elif route_id != "control":
+        raise Qwen38ContractError(f"unknown Qwen 3.8 cache route: {cache_route!r}")
     route = build_qwen38_route(
         config,
         model_path,
-        bindings=control_bindings(runtime),
-        route_id="control",
+        bindings=bindings,
+        route_id=route_id,
+        kernel_ids=kernel_ids,
+        selfcheck_status=selfcheck_status,
     )
     runtime.qwen38_route = route
     return route

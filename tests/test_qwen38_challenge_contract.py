@@ -12,6 +12,7 @@ from mtplx.qwen38_challenge import (
     Qwen38RouteBindings,
     build_qwen38_route,
     install_qwen38_control_route,
+    install_qwen38_route,
     is_qwen38_27b_candidate,
     policy_fingerprint_with_qwen38_route,
     qwen38_route_receipt,
@@ -239,3 +240,40 @@ def test_runtime_installs_one_control_route_and_server_surfaces_it() -> None:
 
     assert route is runtime.qwen38_route
     assert _qwen38_challenge_route_payload(runtime) == qwen38_route_receipt(route)
+
+
+def test_kv_only_candidate_binds_exact_route_and_runtime_dispatches_to_it() -> None:
+    calls: list[str] = []
+
+    def stock(*args, **kwargs):
+        calls.append("stock")
+        return "stock"
+
+    def kv_only(*args, **kwargs):
+        calls.append("kv_only")
+        return "candidate"
+
+    model = SimpleNamespace(
+        mtp_update_cache=stock,
+        mtp_update_cache_kv_only_history=kv_only,
+    )
+    runtime = MTPLXRuntime(
+        model=model,
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+    )
+    result = runtime.update_mtp_cache("hidden", "tokens", mtp_cache="cache")
+
+    assert route is runtime.qwen38_route
+    assert route.route_id == "kv_only_history"
+    assert route.kernel_ids == ("qwen38_mtp_kv_only_history_v1",)
+    assert result == "candidate"
+    assert calls == ["kv_only"]

@@ -1133,6 +1133,77 @@ def inject_mtp_support(
             )
             return hidden
 
+        def mtp_update_cache_kv_only_history(
+            self,
+            hidden_states,
+            next_token_ids,
+            mtp_cache=None,
+            concat_order=None,
+            mtp_hidden_variant: str | None = None,
+            position_offset: int | None = None,
+            input_embeddings=None,
+        ):
+            """Append dead committed-history rows through attention K/V only."""
+            del mtp_hidden_variant
+            if len(self.mtp.layers) != 1:
+                raise ValueError("K/V-only history append requires a one-layer MTP head")
+            if not mtp_cache or len(mtp_cache) != 1:
+                raise ValueError("K/V-only history append requires exactly one cache")
+            if hidden_states.shape[1] != next_token_ids.shape[1]:
+                raise ValueError("hidden and token history lengths must match")
+
+            input_embeds = (
+                input_embeddings
+                if input_embeddings is not None
+                else self.model.embed_tokens(next_token_ids)
+            )
+            embedding_norm = self.mtp.pre_fc_norm_embedding(input_embeds)
+            hidden_norm = self.mtp.pre_fc_norm_hidden(hidden_states)
+            order = concat_order or getattr(
+                self,
+                "_mtplx_concat_order",
+                "embedding_hidden",
+            )
+            parts = (
+                [embedding_norm, hidden_norm]
+                if order == "embedding_hidden"
+                else [hidden_norm, embedding_norm]
+            )
+            mixed = self.mtp.fc(mx.concatenate(parts, axis=-1))
+
+            layer = self.mtp.layers[0]
+            if layer.is_linear:
+                raise ValueError("K/V-only history append requires full attention")
+            attention = layer.self_attn
+            normed = layer.input_layernorm(mixed)
+            batch, length, _ = normed.shape
+            keys = attention.k_proj(normed)
+            values = attention.v_proj(normed)
+            keys = attention.k_norm(
+                keys.reshape(
+                    batch,
+                    length,
+                    attention.num_key_value_heads,
+                    -1,
+                )
+            ).transpose(0, 2, 1, 3)
+            values = values.reshape(
+                batch,
+                length,
+                attention.num_key_value_heads,
+                -1,
+            ).transpose(0, 2, 1, 3)
+
+            layer_cache = mtp_cache[0]
+            rope_offset = (
+                int(position_offset)
+                if position_offset is not None
+                else int(layer_cache.offset)
+            )
+            keys = attention.rope(keys, offset=rope_offset)
+            layer_cache.update_and_fetch(keys, values)
+            return layer_cache.state
+
         def make_mtp_cache(self):
             return [KVCache() for _ in self.mtp.layers]
 
@@ -1170,6 +1241,12 @@ def inject_mtp_support(
 
             def mtp_update_cache(self, *args, **kwargs):
                 return self.language_model.mtp_update_cache(*args, **kwargs)
+
+            def mtp_update_cache_kv_only_history(self, *args, **kwargs):
+                return self.language_model.mtp_update_cache_kv_only_history(
+                    *args,
+                    **kwargs,
+                )
 
             def make_mtp_cache(self):
                 return self.language_model.make_mtp_cache()

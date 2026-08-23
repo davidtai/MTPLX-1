@@ -385,6 +385,9 @@ class MTPLXRuntime:
             self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
         )
         update = getattr(self.model, "mtp_update_cache", None)
+        qwen38_route = self.qwen38_route
+        if qwen38_route is not None and qwen38_route.route_id != "control":
+            update = qwen38_route.bindings.mtp_cache_append
         if update is not None:
             try:
                 params = py_inspect.signature(update).parameters
@@ -948,9 +951,17 @@ def load(
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
     )
-    from .qwen38_challenge import install_qwen38_control_route
+    from .qwen38_challenge import DEFAULT_QWEN38_CACHE_ROUTE, install_qwen38_route
 
-    qwen38_route = install_qwen38_control_route(runtime, config, path)
+    qwen38_route = install_qwen38_route(
+        runtime,
+        config,
+        path,
+        cache_route=os.environ.get(
+            "MTPLX_QWEN38_CACHE_ROUTE",
+            DEFAULT_QWEN38_CACHE_ROUTE,
+        ),
+    )
     if qwen38_route is not None:
         logger.info(
             "[qwen38-challenge] route=%s fingerprint=%s selfcheck=%s",
