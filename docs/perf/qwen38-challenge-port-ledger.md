@@ -79,6 +79,8 @@ cumulative control before that later decision can remain authoritative.
 | 26 corrected | + three-layer prefill evaluation cadence | 774.419 | 57.018 | 25.44388 | 39.226 | **+1.6797%** | **RETAINED** | same |
 | 28 corrected | retained rows 8, 10, 17, 18, 20, 21, 24, 26 | 778.698 | 56.396 | 25.67190 | 39.299 | - | corrected cumulative control | `chrono-r28-full-on-r08-r10-r17-r18-r20-r21-r24-r26-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 28 corrected | replace row-17 block with alternate Q4/group-64 artifact | 783.596 | 55.874 | 25.67190 | 39.332 | **-0.0861%** | REJECTED, row 17 retained | same |
+| 36 corrected | retained rows 8, 10, 17, 18, 20, 21, 24, 26 | 772.342 | 56.640 | 25.70974 | 39.399 | - | corrected cumulative control | `chrono-r36-full-on-r08-r10-r17-r18-r20-r21-r24-r26-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 36 corrected | replace row-17 block with Q4/group-64 + BF16 Q/K/V islands | 782.572 | 55.929 | 25.70974 | 39.341 | **+0.1479%** | **RETAINED**, replaces row 17 artifact | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -98,8 +100,9 @@ target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
 engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
-Rows 8, 10, 17, 18, 20, 21, 24, and 26 are therefore part of every corrected
-later timed control. Row 26's corrected candidate engaged 176 times per timed
+Rows 8, 10, 18, 20, 21, 24, 26, and 36 are therefore part of every corrected
+later timed control; row 36 supersedes row 17's artifact while preserving its
+Q4/group-64 base tensors. Row 26's corrected candidate engaged 176 times per timed
 arm and cleared the gate by 1.6797%. Row 9 regressed
 despite 82,880 timed kernel engagements and remains absent. Row 13 executed
 7,104 fused four-way projection calls in each timed candidate arm and was
@@ -165,7 +168,7 @@ row or from the earlier bundle campaign.
 | 32 | 365 | 0.1764% | `156b5b75bdfa` | `66b436ee06e7` | +58/-24 | REOPENED FOR ADAPTIVE MTP: both the M=8 Q4/group-64 retune and adaptive streak policy become live at deeper selected widths and require a chronological adaptive-stack gate. |
 | 33 | 401 | 1.7181% | `cbdc3a8d5fa9` | `9cd8e978d00a` | +92/-7 | REMOVED NEXT ROW: proposal-only BF16 Q/K/V precision islands and their declared artifact are deleted wholesale by row 34 before they can enter the retained chronological stack. The mechanism is reintroduced later by row 36 and is handled there. |
 | 34 | 405 | 0.6815% | `79683c633b13` | `aa0820c6217c` | +65/-114 | TARGET-SHAPE NO-OP/REMOVAL: deletes row 33's transient precision-island artifact, restores the independent row-28 Q4/group-64 block, and changes direct-nibble QMV only at M=6 and M=9. Fixed-D3 verification is M=4, so the surviving kernel edits have no live call site. |
-| 36 | 423 | 1.6826% | `ed4dfd6b0e95` | `12afdfd18be8` | +105/-40 | STAGED: source reinstates the Q4/group-64 complete MTP block with proposal-only BF16 precision islands (1,024 Q rows and all 1,024 K/V rows), removes redundant post-norm warm expressions, and toggles direct nibbles only at M=8. The exact island artifact is pinned at revision `8081fee431e3`, 270,404,624 bytes, file SHA-256 `517bb133d7ca`; the M=8 and warmup edits are fixed-D3/conditioner no-ops. The artifact swap is wired as the live row-36 candidate and awaits its chronological 16K gate after rows 26 and 28. |
+| 36 | 423 | 1.6826% | `ed4dfd6b0e95` | `12afdfd18be8` | +105/-40 | RETAINED on corrected rows 8+10+17+18+20+21+24+26: the pinned Q4/group-64 block plus proposal-only BF16 precision islands executed a mean 7 Q and 299 each K/V correction calls per timed candidate arm and improved wall throughput 0.1479%. Both routes were internally deterministic; proposal/acceptance and emitted-token drift at temperature 1 were allowed. The source M=8 toggle remains reopened for adaptive depth, while removed warm expressions are covered by the common conditioner. Row 36 supersedes row 17's artifact in later controls. |
 | 37 | 428 | 0.1477% | `be3361b96875` | `882e395797e2` | +33/-13 | CONDITIONER-COVERED/TARGET-SHAPE NO-OP: source warms the row-30 post-norm verify output and reverts row 36's M=8 direct-nibble toggle. Every route receives the required 1,024-token conditioning generation before its timed arms, while fixed D3 never dispatches M=8. |
 | 38 | 430 | 0.6244% | `0824e0ec28e5` | `dc1e16093bb7` | +2/-2 | TARGET-SHAPE NO-OP: toggles direct-nibble extraction only for affine-4/group-64 M=8. The fixed-D3 target verify is M=4. |
 | 39 | 437 | 0.3030% | `1abe6368a882` | `2f3e81092f41` | +13/-33 | REMOVED NEXT ROW: source changes affine-4/group-64 M=4 from one four-row input group to two two-row groups, then row 40 restores the M=4 incumbent exactly. The same two-row ownership idea was independently adapted to the live group-32 target at row 9 and rejected there; this removed snapshot does not enter the cumulative stack. |
