@@ -9,11 +9,14 @@ mx = pytest.importorskip("mlx.core")
 
 from mtplx.fast_sampling import sparse_distribution_from_mlx_logits  # noqa: E402
 from mtplx.generation import (  # noqa: E402
+    _device_core_cycle_depth_eligible,
     _device_core_state_signature,
     _device_draft_q_arrays,
     _map_compact_draft_ids,
+    _map_compact_host_draft,
+    _require_compact_device_core,
 )
-from mtplx.sampling import SamplerConfig  # noqa: E402
+from mtplx.sampling import SamplerConfig, SparseDistribution  # noqa: E402
 
 
 def _host_q(logits: mx.array, config: SamplerConfig) -> dict[int, float]:
@@ -72,6 +75,80 @@ def test_compact_draft_ids_map_back_to_target_vocabulary_on_device() -> None:
     mx.eval(mapped)
 
     assert mapped.tolist() == [0, 100, 102]
+
+
+def test_compact_device_core_failure_preserves_root_cause() -> None:
+    cause = ValueError("compiled draft shape mismatch")
+
+    with pytest.raises(RuntimeError, match="compact draft vocabulary") as caught:
+        _require_compact_device_core(
+            token_map=mx.array([0, 1], dtype=mx.int32),
+            draft_core="device",
+            used_device_core=False,
+            device_core_error=cause,
+            ineligibility_reasons=(),
+            allow_host_fallback=False,
+        )
+
+    assert caught.value.__cause__ is cause
+
+
+def test_compact_device_core_failure_names_ineligible_contract() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="ineligible contract: cycle_depth, persistent_cache",
+    ):
+        _require_compact_device_core(
+            token_map=mx.array([0, 1], dtype=mx.int32),
+            draft_core="device",
+            used_device_core=False,
+            device_core_error=None,
+            ineligibility_reasons=("cycle_depth", "persistent_cache"),
+            allow_host_fallback=False,
+        )
+
+
+@pytest.mark.parametrize("cycle_depth", [2, 3, 4, 5])
+def test_device_core_accepts_supported_cycle_depth(cycle_depth: int) -> None:
+    assert _device_core_cycle_depth_eligible(cycle_depth)
+
+
+@pytest.mark.parametrize("cycle_depth", [0, 1, 6])
+def test_device_core_rejects_unsupported_cycle_depth(cycle_depth: int) -> None:
+    assert not _device_core_cycle_depth_eligible(cycle_depth)
+
+
+def test_compact_d1_host_fallback_maps_token_and_sparse_distribution() -> None:
+    token_map = mx.array([10, 20, 30, 40], dtype=mx.int32)
+    compact_q = SparseDistribution(
+        np.array([1, 3], dtype=np.int64),
+        np.array([0.75, 0.25], dtype=np.float64),
+        4,
+    )
+
+    token, mapped_q = _map_compact_host_draft(
+        3,
+        compact_q,
+        token_map=token_map,
+        target_vocab_size=100,
+    )
+
+    assert token == 40
+    assert mapped_q is not None
+    assert mapped_q.token_ids.tolist() == [20, 40]
+    assert mapped_q.probs.tolist() == pytest.approx([0.75, 0.25])
+    assert mapped_q.vocab_size == 100
+
+
+def test_compact_device_core_allows_only_explicit_d1_host_fallback() -> None:
+    _require_compact_device_core(
+        token_map=mx.array([0, 1], dtype=mx.int32),
+        draft_core="device",
+        used_device_core=False,
+        device_core_error=None,
+        ineligibility_reasons=("cycle_depth",),
+        allow_host_fallback=True,
+    )
 
 
 def test_device_inverse_cdf_sampling_matches_q() -> None:

@@ -4537,6 +4537,66 @@ def _map_compact_draft_ids(ids: mx.array, token_map: mx.array | None) -> mx.arra
     return ids if token_map is None else mx.take(token_map, ids.astype(mx.int32))
 
 
+def _map_compact_host_draft(
+    draft_token: int,
+    draft_q: np.ndarray | SparseDistribution | None,
+    *,
+    token_map: mx.array,
+    target_vocab_size: int,
+) -> tuple[int, SparseDistribution | None]:
+    """Map the one shortened final-cycle host draft into target token space."""
+    mapped_token_array = _map_compact_draft_ids(
+        mx.array([int(draft_token)], dtype=mx.int32),
+        token_map,
+    )
+    if draft_q is None:
+        _eval(mapped_token_array)
+        return int(mapped_token_array.item()), None
+    if not isinstance(draft_q, SparseDistribution):
+        raise RuntimeError("compact D1 host fallback requires a sparse distribution")
+    mapped_ids_array = _map_compact_draft_ids(
+        mx.array(draft_q.token_ids, dtype=mx.int32),
+        token_map,
+    )
+    _eval(mapped_token_array, mapped_ids_array)
+    mapped_q = SparseDistribution(
+        np.asarray(mapped_ids_array, dtype=np.int64).reshape(-1),
+        draft_q.probs,
+        int(target_vocab_size),
+    )
+    return int(mapped_token_array.item()), mapped_q
+
+
+def _require_compact_device_core(
+    *,
+    token_map: mx.array | None,
+    draft_core: str,
+    used_device_core: bool,
+    device_core_error: Exception | None,
+    ineligibility_reasons: tuple[str, ...],
+    allow_host_fallback: bool,
+) -> None:
+    """Fail closed for compact logits while retaining the device-core cause."""
+    if (
+        token_map is None
+        or draft_core != "device"
+        or used_device_core
+        or allow_host_fallback
+    ):
+        return
+    message = "compact draft vocabulary requires the device draft core"
+    if device_core_error is not None:
+        raise RuntimeError(message) from device_core_error
+    if ineligibility_reasons:
+        message += "; ineligible contract: " + ", ".join(ineligibility_reasons)
+    raise RuntimeError(message)
+
+
+def _device_core_cycle_depth_eligible(cycle_depth: int) -> bool:
+    """The compiled chain supports D2-D5; D1 uses the mapped host boundary."""
+    return 2 <= int(cycle_depth) <= 5
+
+
 def _device_core_state_tree(cache: Any) -> list[Any]:
     """State arrays the compiled draft chain reads and writes.
 
@@ -8598,6 +8658,15 @@ def generate_mtpk(
                 }
 
         used_device_core = used_device_d2_core
+        device_core_error: Exception | None = None
+        device_core_ineligibility: tuple[str, ...] = ()
+        text_model = getattr(rt.model, "language_model", rt.model)
+        compact_token_map = getattr(text_model, "_mtplx_draft_token_id_map", None)
+        compact_target_vocab_size = getattr(
+            text_model,
+            "_mtplx_draft_target_vocab_size",
+            None,
+        )
         a3b_k2 = (
             a3b_target_prefix_route is not None
             and int(getattr(a3b_target_prefix_route, "speculative_depth", 1)) == 2
@@ -8655,24 +8724,31 @@ def generate_mtpk(
                 }
             )
         elif not used_device_core and draft_core == "device":
-            device_core_eligible = (
-                2 <= cycle_depth <= 5
-                and cycle_depth == speculative_depth
-                and mtp_cache is not None
-                and _mtp_history_uses_committed_cache(mtp_history_policy)
-                and draft_margin_threshold is None
-                and adaptive_policy is None
-                and mtp_corrector is None
-                and mtp_topk_reranker is None
-                and not adapter_ensemble_q
-                and not online_hidden_enabled
-                and not correction_cache_enabled
-                and not target_prefix_verify
-                and (
+            device_core_contract = (
+                ("cycle_depth", _device_core_cycle_depth_eligible(cycle_depth)),
+                ("persistent_cache", mtp_cache is not None),
+                (
+                    "committed_history",
+                    _mtp_history_uses_committed_cache(mtp_history_policy),
+                ),
+                ("draft_margin", draft_margin_threshold is None),
+                ("adaptive_policy", adaptive_policy is None),
+                ("mtp_corrector", mtp_corrector is None),
+                ("mtp_topk_reranker", mtp_topk_reranker is None),
+                ("adapter_ensemble", not adapter_ensemble_q),
+                ("online_hidden", not online_hidden_enabled),
+                ("correction_cache", not correction_cache_enabled),
+                ("target_prefix_verify", not target_prefix_verify),
+                (
+                    "draft_sampler_topk",
                     draft_sampler.temperature <= 0
-                    or 0 < draft_sampler.top_k <= _DEVICE_CORE_MAX_TOP_K
-                )
+                    or 0 < draft_sampler.top_k <= _DEVICE_CORE_MAX_TOP_K,
+                ),
             )
+            device_core_ineligibility = tuple(
+                name for name, eligible in device_core_contract if not eligible
+            )
+            device_core_eligible = not device_core_ineligibility
             if device_core_eligible:
                 try:
                     live_signature = _device_core_state_signature(mtp_cache)
@@ -8761,26 +8837,34 @@ def generate_mtpk(
                 except Exception as exc:
                     device_core_fallbacks += 1
                     event["draft_core_error"] = repr(exc)
+                    device_core_error = exc
                     used_device_core = False
             else:
                 device_core_fallbacks += 1
                 event["draft_core_fallback"] = {
                     "requested": "device",
                     "reason": "ineligible_contract",
+                    "failed": list(device_core_ineligibility),
                 }
-        if (
-            getattr(
-                getattr(rt.model, "language_model", rt.model),
-                "_mtplx_draft_token_id_map",
-                None,
-            )
-            is not None
+        compact_d1_host_fallback = bool(
+            compact_token_map is not None
+            and compact_target_vocab_size is not None
             and draft_core == "device"
+            and cycle_depth == 1
             and not used_device_core
-        ):
-            raise RuntimeError(
-                "compact draft vocabulary requires the device draft core"
-            )
+            and device_core_error is None
+            and device_core_ineligibility == ("cycle_depth",)
+        )
+        if compact_d1_host_fallback:
+            event["compact_host_fallback"] = "d1_final_boundary"
+        _require_compact_device_core(
+            token_map=compact_token_map,
+            draft_core=draft_core,
+            used_device_core=used_device_core,
+            device_core_error=device_core_error,
+            ineligibility_reasons=device_core_ineligibility,
+            allow_host_fallback=compact_d1_host_fallback,
+        )
         for depth_index in range(0 if used_device_core else cycle_depth):
             source_token = int(next_token)
             step_mtp_cache = (
@@ -8978,6 +9062,13 @@ def generate_mtpk(
                             decision_margins=adaptive_width_decision_margins,
                         )
                     )
+            if compact_d1_host_fallback:
+                draft_token, draft_q = _map_compact_host_draft(
+                    int(draft_token),
+                    draft_q,
+                    token_map=compact_token_map,
+                    target_vocab_size=int(compact_target_vocab_size),
+                )
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
             if trace.enabled:
