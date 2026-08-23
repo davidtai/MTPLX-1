@@ -14,7 +14,6 @@ from typing import Any
 
 from .draft_lm_head import configure_qwen38_row10_compact_head
 from .gdn_capture import configure_qwen38_row18_gdn_decay_memo
-from .qwen38_challenge_kernels import configure_qwen38_row18_mlp_gate_up
 from .qwen38_mtp_block_artifacts import configure_qwen38_mtp_block
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
@@ -322,7 +321,6 @@ def install_qwen38_route(
     mtp_block_variant: str | None = None,
     mtp_block_artifact_path: Path | None = None,
     row18_gdn_decay_memo: bool = False,
-    row18_mlp_gate_up: bool = False,
     row24_eval_ladder: bool = False,
     row26_prefill_ladder_3: bool = False,
     source_artifact_path: Path | None = None,
@@ -401,19 +399,6 @@ def install_qwen38_route(
         route_features.append("r18_gdn_decay_memo")
         kernel_ids.append("qwen38_row18_gdn_neg_exp_a_log_memo_v1")
         feature_receipt["r18_gdn_decay_memo"] = row18_gdn_report
-
-    row18_mlp_report = configure_qwen38_row18_mlp_gate_up(
-        runtime.model,
-        active=bool(row18_mlp_gate_up),
-    )
-    if row18_mlp_gate_up:
-        if int(row18_mlp_report.get("active_modules", 0)) <= 0:
-            raise Qwen38ContractError(
-                "Qwen 3.8 row 18 packed MLP gate/up configured no modules"
-            )
-        route_features.append("r18_mlp_gate_up")
-        kernel_ids.append("qwen38_row18_mlp_gate_up_s_le9_v1")
-        feature_receipt["r18_mlp_gate_up"] = row18_mlp_report
 
     text._mtplx_qwen38_row24_eval_ladder = bool(row24_eval_ladder)
     text._mtplx_qwen38_row24_prefill_stride = (
