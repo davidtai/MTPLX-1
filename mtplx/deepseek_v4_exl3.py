@@ -131,9 +131,12 @@ def _mcg_qmv_kernel(
     experts: int = 1,
     topk: int = 0,
     routed_input: bool = False,
+    block_n: int = 128,
 ):
     if size_k % EXL3_HADAMARD or size_n % EXL3_HADAMARD:
         raise ValueError("EXL3 projection dimensions must be divisible by H128")
+    if block_n not in (128, 256) or size_n % block_n:
+        raise ValueError("EXL3 QMV output dimensions must tile the fixed block N")
     inverse = ",".join(str(value) for value in EXL3_TENSOR_CORE_INVERSE)
     header = f"""
         using namespace metal;
@@ -146,6 +149,7 @@ def _mcg_qmv_kernel(
         constant constexpr uint HAD = 128;
         constant constexpr uint TILE_WORDS = 48;
         constant constexpr uint BLOCK_TILES = 8;
+        constant constexpr uint BLOCK_TILES_N = {block_n // 16};
         constant constexpr float HAD_SCALE = 0.088388347648f;
         constant ushort TC_INV[256] = {{ {inverse} }};
 
@@ -215,7 +219,7 @@ def _mcg_qmv_kernel(
             }
             x_had[lane] = half(had_values[lane] * HAD_SCALE);
         """
-    source = """
+    source_n128 = """
         uint lane = thread_position_in_threadgroup.x;
         uint n_block = threadgroup_position_in_grid.y;
         __GROUPED_SETUP__
@@ -224,7 +228,7 @@ def _mcg_qmv_kernel(
         threadgroup float had_values[HAD];
         threadgroup half x_had[HAD];
         threadgroup ushort packed_tiles[
-            BLOCK_TILES * BLOCK_TILES * TILE_WORDS
+            BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS
         ];
 
         float accumulator = 0.0f;
@@ -234,17 +238,17 @@ def _mcg_qmv_kernel(
 
             for (
                 uint packed_index = lane;
-                packed_index < BLOCK_TILES * BLOCK_TILES * TILE_WORDS;
+                packed_index < BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS;
                 packed_index += HAD
             ) {
-                uint tile_k = packed_index / (BLOCK_TILES * TILE_WORDS);
-                uint remainder = packed_index % (BLOCK_TILES * TILE_WORDS);
+                uint tile_k = packed_index / (BLOCK_TILES_N * TILE_WORDS);
+                uint remainder = packed_index % (BLOCK_TILES_N * TILE_WORDS);
                 uint tile_n = remainder / TILE_WORDS;
                 uint word = remainder % TILE_WORDS;
                 size_t source_index =
                     __EXPERT_TRELLIS_OFFSET__
                     ((size_t)(k_block * BLOCK_TILES + tile_k) * NTILES_N
-                     + n_block * BLOCK_TILES + tile_n) * TILE_WORDS + word;
+                     + n_block * BLOCK_TILES_N + tile_n) * TILE_WORDS + word;
                 packed_tiles[packed_index] =
                     reinterpret_cast<const device ushort*>(trellis)[source_index];
             }
@@ -281,6 +285,97 @@ def _mcg_qmv_kernel(
         y[(size_t)threadgroup_position_in_grid.z * SIZE_N + n] =
             half(rotated * svh[__EXPERT_SVH_OFFSET__n]);
     """
+    source_n256 = """
+        uint lane = thread_position_in_threadgroup.x;
+        uint n_block = threadgroup_position_in_grid.y;
+        __GROUPED_SETUP__
+        uint n0 = n_block * 256u + lane;
+        uint n1 = n0 + HAD;
+
+        threadgroup float had_values[HAD];
+        threadgroup half x_had[HAD];
+        threadgroup ushort packed_tiles[
+            BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS
+        ];
+
+        float accumulator0 = 0.0f;
+        float accumulator1 = 0.0f;
+        for (uint k_block = 0; k_block < KBLOCKS; ++k_block) {
+            uint k = k_block * HAD + lane;
+            __LOAD_HADAMARD__
+
+            for (
+                uint packed_index = lane;
+                packed_index < BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS;
+                packed_index += HAD
+            ) {
+                uint tile_k = packed_index / (BLOCK_TILES_N * TILE_WORDS);
+                uint remainder = packed_index % (BLOCK_TILES_N * TILE_WORDS);
+                uint tile_n = remainder / TILE_WORDS;
+                uint word = remainder % TILE_WORDS;
+                size_t source_index =
+                    __EXPERT_TRELLIS_OFFSET__
+                    ((size_t)(k_block * BLOCK_TILES + tile_k) * NTILES_N
+                     + n_block * BLOCK_TILES_N + tile_n) * TILE_WORDS + word;
+                packed_tiles[packed_index] =
+                    reinterpret_cast<const device ushort*>(trellis)[source_index];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint tile_n0 = lane / 16u;
+            uint tile_n1 = tile_n0 + BLOCK_TILES;
+            uint local_n = lane & 15u;
+            for (uint local_k = 0; local_k < HAD; ++local_k) {
+                uint tile_k = local_k / 16u;
+                uint local_row = local_k & 15u;
+                uint row_major = local_row * 16u + local_n;
+                uint tensor_core = uint(TC_INV[row_major]);
+                threadgroup const ushort* tile0 =
+                    packed_tiles
+                    + (tile_k * BLOCK_TILES_N + tile_n0) * TILE_WORDS;
+                threadgroup const ushort* tile1 =
+                    packed_tiles
+                    + (tile_k * BLOCK_TILES_N + tile_n1) * TILE_WORDS;
+                half weight0 = decode_mcg(tile0, tensor_core);
+                half weight1 = decode_mcg(tile1, tensor_core);
+                float value = float(x_had[local_k]);
+                accumulator0 += value * float(weight0);
+                accumulator1 += value * float(weight1);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Preserve ExLlamaV3's half-output rounding independently per N128 panel.
+        had_values[lane] = float(half(accumulator0));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
+            float own = had_values[lane];
+            float peer = had_values[lane ^ stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            had_values[lane] =
+                (lane & stride) ? (peer - own) : (own + peer);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        half rotated0 = half(had_values[lane] * HAD_SCALE);
+        y[(size_t)threadgroup_position_in_grid.z * SIZE_N + n0] =
+            half(rotated0 * svh[__EXPERT_SVH_OFFSET__n0]);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        had_values[lane] = float(half(accumulator1));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 1u; stride < HAD; stride <<= 1u) {
+            float own = had_values[lane];
+            float peer = had_values[lane ^ stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            had_values[lane] =
+                (lane & stride) ? (peer - own) : (own + peer);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        half rotated1 = half(had_values[lane] * HAD_SCALE);
+        y[(size_t)threadgroup_position_in_grid.z * SIZE_N + n1] =
+            half(rotated1 * svh[__EXPERT_SVH_OFFSET__n1]);
+    """
+    source = source_n256 if block_n == 256 else source_n128
     source = (
         source.replace("__GROUPED_SETUP__", grouped_setup)
         .replace("__LOAD_HADAMARD__", load_hadamard)
@@ -294,7 +389,7 @@ def _mcg_qmv_kernel(
     return mx.fast.metal_kernel(
         name=(
             f"mtplx_dsv4_exl3_mcg_qmv_k{size_k}_n{size_n}"
-            f"_e{experts}_t{topk}_r{int(routed_input)}_v3"
+            f"_e{experts}_t{topk}_r{int(routed_input)}_bn{block_n}_v4"
         ),
         input_names=input_names,
         output_names=["y"],
@@ -1220,8 +1315,11 @@ class EXL3LinearBank(nn.Module):
         routed_input: bool,
     ) -> None:
         super().__init__()
-        if input_dims % 128 or output_dims % 128:
-            raise ValueError("EXL3 expert dimensions must be divisible by H128")
+        self._qmv_output_tile = 256
+        if input_dims % 128 or output_dims % self._qmv_output_tile:
+            raise ValueError(
+                "EXL3 expert input must tile H128 and output must tile QMV BN256"
+            )
         self.experts = int(experts)
         self.input_dims = int(input_dims)
         self.output_dims = int(output_dims)
@@ -1239,6 +1337,7 @@ class EXL3LinearBank(nn.Module):
             self.experts,
             self.topk,
             self.routed_input,
+            self._qmv_output_tile,
         )
         self._had_kernel = _route_hadamard_kernel(
             self.input_dims,
@@ -1272,7 +1371,7 @@ class EXL3LinearBank(nn.Module):
                 self.svh,
                 mx.contiguous(expert_ids.reshape(tasks)),
             ],
-            grid=(128, self.output_dims // 128, tasks),
+            grid=(128, self.output_dims // self._qmv_output_tile, tasks),
             threadgroup=(128, 1, 1),
             output_shapes=[(tasks, self.output_dims)],
             output_dtypes=[mx.float16],

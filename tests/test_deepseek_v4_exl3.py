@@ -305,7 +305,7 @@ def test_mia_exl3_install_binds_unconditional_direct_qmv_and_exact_tail(
     assert "self.up_proj(x_half, expert_ids)" in direct_source
     assert "self.down_proj(activated, expert_ids)" in direct_source
 
-    switch = EXL3SwitchGLU(128, 128, 2, 1, limit=0.0)
+    switch = EXL3SwitchGLU(256, 256, 2, 1, limit=0.0)
     installs = []
     monkeypatch.setattr(
         switch,
@@ -327,6 +327,63 @@ def test_mia_exl3_install_binds_unconditional_direct_qmv_and_exact_tail(
     assert owner._mia_exl3_trellis_fused.__func__ is EXL3SwitchGLU.fused
     assert owner._mia_exl3_tail_combine is target_module._stock_moe_tail_combine
     assert installs == ["router", 64]
+
+
+def test_direct_qmv_banks_bind_production_bn256_geometry(monkeypatch, request):
+    """Mia's three direct banks must reuse each input H128 across two N panels."""
+
+    qmv_sources = []
+    launches = []
+
+    def kernel(**kwargs):
+        launches.append(kwargs)
+        return tuple(
+            _StaticArray(shape, dtype)
+            for shape, dtype in zip(
+                kwargs["output_shapes"], kwargs["output_dtypes"], strict=True
+            )
+        )
+
+    def capture_metal_kernel(**kwargs):
+        if kwargs["name"].startswith("mtplx_dsv4_exl3_mcg_qmv_"):
+            qmv_sources.append(kwargs)
+        return kernel
+
+    monkeypatch.setattr(
+        exl3.mx, "zeros", lambda shape, dtype: _StaticArray(shape, dtype)
+    )
+    monkeypatch.setattr(exl3.mx, "contiguous", lambda value: value)
+    monkeypatch.setattr(exl3.mx.fast, "metal_kernel", capture_metal_kernel)
+    exl3._mcg_qmv_kernel.cache_clear()
+    request.addfinalizer(exl3._mcg_qmv_kernel.cache_clear)
+
+    switch = EXL3SwitchGLU(4096, 2048, 216, 6, limit=0.0)
+    banks = (switch.gate_proj, switch.up_proj, switch.down_proj)
+
+    assert [bank._qmv_output_tile for bank in banks] == [256, 256, 256]
+    assert [(bank.input_dims, bank.output_dims) for bank in banks] == [
+        (4096, 2048),
+        (4096, 2048),
+        (2048, 4096),
+    ]
+    assert len(qmv_sources) == 2
+    for captured in qmv_sources:
+        assert "constant constexpr uint BLOCK_TILES_N = 16;" in captured["header"]
+        assert "float accumulator0 = 0.0f;" in captured["source"]
+        assert "float accumulator1 = 0.0f;" in captured["source"]
+        assert "BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS" in captured["source"]
+        assert captured["source"].count("x[x_row * SIZE_K + k]") == 1
+
+    expert_ids = _StaticArray((6, 6), mx.int32)
+    switch.gate_proj(_StaticArray((6, 4096)), expert_ids)
+    switch.up_proj(_StaticArray((6, 4096)), expert_ids)
+    switch.down_proj(_StaticArray((6, 6, 2048)), expert_ids)
+
+    assert [call["grid"] for call in launches[-3:]] == [
+        (128, 2048 // 256, 36),
+        (128, 2048 // 256, 36),
+        (128, 4096 // 256, 36),
+    ]
 
 
 def test_mia_exl3_forward_selects_direct_only_for_physical_m6_verify(monkeypatch):
@@ -403,7 +460,7 @@ def test_installed_trellis_runtime_never_reenters_kernel_factories(monkeypatch):
     )
     monkeypatch.setattr(exl3, "_trellis_final_reduce_kernel", lambda *_args: kernel)
 
-    owner = EXL3SwitchGLU(128, 128, 2, 1, limit=0.0)
+    owner = EXL3SwitchGLU(256, 256, 2, 1, limit=0.0)
     owner.install_trellis_runtime(max_tokens=64)
 
     def forbidden_factory(*_args, **_kwargs):
@@ -419,10 +476,10 @@ def test_installed_trellis_runtime_never_reenters_kernel_factories(monkeypatch):
 
     for rows in (1, 33):
         owner.fused(
-            mx.zeros((rows, 128), dtype=mx.float16),
+            mx.zeros((rows, 256), dtype=mx.float16),
             mx.zeros((rows, 1), dtype=mx.int32),
             mx.ones((rows, 1), dtype=mx.float32),
-            mx.zeros((rows, 128), dtype=mx.float16),
+            mx.zeros((rows, 256), dtype=mx.float16),
         )
 
 
