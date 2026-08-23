@@ -97,5 +97,5 @@ sampling total variation.
   generated-count results.
 - [x] Remove exploratory prompt/receipt artifacts, run focused and full tests,
   Ruff, inventory reproduction, and diff checks.
-- [ ] Review the final diff, commit, push this one branch, and open exactly one
+- [x] Review the final diff, commit, push this one branch, and open exactly one
   PR to `main`.
