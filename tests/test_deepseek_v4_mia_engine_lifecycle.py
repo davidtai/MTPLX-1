@@ -165,16 +165,22 @@ def test_engine_plan_seals_quad_qmv_owners_and_prewarm_signatures() -> None:
     assert "_m6_quad_qmv_kernel(2048, 4096, True)" in build_source
     assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in build_source
     assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in identity_source
+    assert "EXL3_M6_STAGE_VECTOR_BYTES" in build_source
+    assert "EXL3_M6_STAGE_VECTORS_PER_K_TILE" in build_source
+    assert 'getattr(quad_plan, "stage_vector_bytes", None)' in build_source
+    assert 'getattr(quad_plan, "stage_vectors_per_k_tile", None)' in build_source
     assert "_mia_exl3_trellis_fused" in build_source
     assert "EXL3SwitchGLU.fused" in build_source
     assert "_mia_exl3_tail_combine" in build_source
     assert "is _stock_moe_tail_combine" in build_source
-    assert "target_exl3_prefill_trellis_bm8_bm64_verify_m6_quad_qmv" in (
-        build_source
+    assert (
+        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_quad_qmv_"
+        "u4_stage16b_96x8"
+        in build_source
     )
     assert (
         "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-"
-        "bn256-simd-h128"
+        "bn256-simd-h128-u4-stage16b-96x8"
         in identity_source
     )
     assert 'MiaPrewarmSignature("target_prefill_m6_bm8", 6, "prefill")' in (
@@ -185,7 +191,7 @@ def test_engine_plan_seals_quad_qmv_owners_and_prewarm_signatures() -> None:
         in build_source
     )
     assert (
-        'MiaPrewarmSignature("target_verify_m6_quad_qmv", 6, "decode_verify")'
+        '"target_verify_m6_quad_qmv_u4_stage16b", 6, "decode_verify"'
         in build_source
     )
     assert 'with attention_phase("prefill"):' in prewarm_source

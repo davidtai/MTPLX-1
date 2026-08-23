@@ -29,6 +29,8 @@ EXL3_TILE = 16
 EXL3_PACKED_WORDS = 48
 EXL3_HADAMARD = 128
 EXL3_MCG_MULTIPLIER = 0xCBAC1FED
+EXL3_M6_STAGE_VECTOR_BYTES = 16
+EXL3_M6_STAGE_VECTORS_PER_K_TILE = 96
 
 _EXPERT_KEY = re.compile(
     r"^layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
@@ -488,8 +490,10 @@ def _m6_quad_qmv_kernel(
         constant constexpr uint TOPK = 6;
         constant constexpr uint HAD = 128;
         constant constexpr uint TILE_WORDS = 48;
+        constant constexpr uint TILE_VECTORS = 6;
         constant constexpr uint BLOCK_TILES = 8;
         constant constexpr uint BLOCK_TILES_N = 16;
+        constant constexpr uint STAGE_VECTORS_PER_K_TILE = 96;
         constant constexpr float HAD_SCALE = 0.088388347648f;
         constant uint QUAD_DESCRIPTORS[64] = {{ {descriptors} }};
 
@@ -636,9 +640,17 @@ def _m6_quad_qmv_kernel(
 
         threadgroup float had_values[HAD];
         threadgroup half x_had[HAD];
-        threadgroup ushort packed_tiles[
-            BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS
+        threadgroup uint4 packed_tile_vectors[
+            BLOCK_TILES * STAGE_VECTORS_PER_K_TILE
         ];
+        threadgroup ushort* packed_tiles =
+            reinterpret_cast<threadgroup ushort*>(packed_tile_vectors);
+        device const uint4* trellis_vectors =
+            reinterpret_cast<const device uint4*>(trellis);
+        size_t expert_base =
+            (size_t)expert * (SIZE_K / 16u) * NTILES_N * TILE_VECTORS;
+        size_t n_block_offset =
+            (size_t)n_block * STAGE_VECTORS_PER_K_TILE;
 
         float accumulator0 = 0.0f;
         float accumulator1 = 0.0f;
@@ -653,24 +665,17 @@ def _m6_quad_qmv_kernel(
             );
             x_had[lane] = half(transformed * HAD_SCALE);
 
-            for (
-                uint packed_index = lane;
-                packed_index < BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS;
-                packed_index += HAD
-            ) {{
-                uint tile_k = packed_index / (BLOCK_TILES_N * TILE_WORDS);
-                uint remainder = packed_index % (BLOCK_TILES_N * TILE_WORDS);
-                uint tile_n = remainder / TILE_WORDS;
-                uint word = remainder % TILE_WORDS;
-                size_t source_index =
-                    (size_t)expert * (SIZE_K / 16u) * NTILES_N * TILE_WORDS
-                    + ((size_t)(k_block * BLOCK_TILES + tile_k) * NTILES_N
-                       + n_block * BLOCK_TILES_N + tile_n) * TILE_WORDS
-                    + word;
-                packed_tiles[packed_index] =
-                    reinterpret_cast<const device ushort*>(trellis)[
-                        source_index
+            size_t k_base = expert_base
+                + (size_t)k_block * BLOCK_TILES * NTILES_N * TILE_VECTORS;
+            size_t n_base = k_base + n_block_offset;
+            if (lane < STAGE_VECTORS_PER_K_TILE) {{
+                for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
+                    packed_tile_vectors[
+                        tile_k * STAGE_VECTORS_PER_K_TILE + lane
+                    ] = trellis_vectors[
+                        n_base + (size_t)tile_k * NTILES_N * TILE_VECTORS + lane
                     ];
+                }}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -707,7 +712,7 @@ def _m6_quad_qmv_kernel(
     return mx.fast.metal_kernel(
         name=(
             f"mtplx_dsv4_exl3_m6_quad_mcg_qmv_k{size_k}_n{size_n}"
-            f"_e216_t6_r{int(routed_input)}_bn256_v1"
+            f"_e216_t6_r{int(routed_input)}_bn256_u4stage_v2"
         ),
         input_names=["x", "trellis", "suh", "svh", "expert_ids"],
         output_names=["y"],
@@ -1743,6 +1748,8 @@ class _InstalledTrellisPlan(NamedTuple):
 class _InstalledM6QuadQMVPlan(NamedTuple):
     geometry: tuple[int, int, int, int, float, int, int]
     descriptor_sha256: str
+    stage_vector_bytes: int
+    stage_vectors_per_k_tile: int
     hidden_to_intermediate: Any
     intermediate_to_hidden: Any
 
@@ -1846,6 +1853,15 @@ class EXL3SwitchGLU(nn.Module):
         )
         if geometry != (4096, 2048, 216, 6, 10.0, 256, 36):
             raise ValueError(f"Mia quad QMV geometry changed: {geometry!r}")
+        tile_bytes = EXL3_PACKED_WORDS * 2
+        stage_vectors_per_k_tile = (
+            EXL3_TILE * tile_bytes // EXL3_M6_STAGE_VECTOR_BYTES
+        )
+        if (
+            tile_bytes % EXL3_M6_STAGE_VECTOR_BYTES != 0
+            or stage_vectors_per_k_tile != EXL3_M6_STAGE_VECTORS_PER_K_TILE
+        ):
+            raise ValueError("Mia quad QMV uint4 staging alignment changed")
         bank_contract = (
             (
                 self.gate_proj,
@@ -1891,6 +1907,8 @@ class EXL3SwitchGLU(nn.Module):
         self._m6_quad_qmv_plan = _InstalledM6QuadQMVPlan(
             geometry=geometry,
             descriptor_sha256=descriptors.sha256,
+            stage_vector_bytes=EXL3_M6_STAGE_VECTOR_BYTES,
+            stage_vectors_per_k_tile=EXL3_M6_STAGE_VECTORS_PER_K_TILE,
             hidden_to_intermediate=_m6_quad_qmv_kernel(4096, 2048, False),
             intermediate_to_hidden=_m6_quad_qmv_kernel(2048, 4096, True),
         )

@@ -544,6 +544,8 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
 
     assert plan.geometry == (4096, 2048, 216, 6, 10.0, 256, 36)
     assert plan.descriptor_sha256 == exl3.EXL3_M6_QUAD_DESCRIPTOR_SHA256
+    assert plan.stage_vector_bytes == 16
+    assert plan.stage_vectors_per_k_tile == 96
     assert plan.hidden_to_intermediate is exl3._m6_quad_qmv_kernel(
         4096, 2048, False
     )
@@ -554,13 +556,19 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     assert "routed_input" not in project_source
 
     quad = [
-        value
+        (name, value)
         for name, value in captured.items()
         if "m6_quad_mcg_qmv" in name
     ]
     assert len(quad) == 2
-    for kernel in quad:
+    for name, kernel in quad:
+        assert name.endswith("_bn256_u4stage_v2")
         assert "constant uint QUAD_DESCRIPTORS[64]" in kernel["header"]
+        assert "constant constexpr uint TILE_VECTORS = 6;" in kernel["header"]
+        assert (
+            "constant constexpr uint STAGE_VECTORS_PER_K_TILE = 96;"
+            in kernel["header"]
+        )
         assert "if (shift == 0u)" in kernel["header"]
         quad3 = kernel["header"].split("inline half4 decode_mcg_quad3", 1)[1]
         quad3, quad2 = quad3.split("inline half4 decode_mcg_quad2", 1)
@@ -573,8 +581,21 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
         ]
         assert kernel["source"].count("decode_mcg_quad3(") == 4
         assert kernel["source"].count("decode_mcg_quad2(") == 4
-        assert "threadgroup ushort packed_tiles[" in kernel["source"]
-        assert kernel["source"].count("threadgroup ushort packed_tiles[") == 1
+        source = kernel["source"]
+        assert "threadgroup uint4 packed_tile_vectors[" in source
+        assert "BLOCK_TILES * STAGE_VECTORS_PER_K_TILE" in source
+        assert "reinterpret_cast<const device uint4*>(trellis)" in source
+        assert "if (lane < STAGE_VECTORS_PER_K_TILE)" in source
+        assert source.count(
+            "for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k)"
+        ) == 2
+        assert "packed_index" not in source
+        assert "reinterpret_cast<const device ushort*>(trellis)" not in source
+        copy_start = source.index("if (lane < STAGE_VECTORS_PER_K_TILE)")
+        assert source.index("size_t expert_base") < copy_start
+        assert source.index("size_t k_base") < copy_start
+        assert source.index("size_t n_base") < copy_start
+        assert source.count("threadgroup_barrier(mem_flags::mem_threadgroup);") == 2
         k0_accumulator0 = kernel["source"].index(
             "accumulator0 += value0_0 * float(weights0_0.x);"
         )
@@ -884,6 +905,8 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
     switch._m6_quad_qmv_plan = exl3._InstalledM6QuadQMVPlan(
         geometry=(4096, 2048, 216, 6, 10.0, 256, 36),
         descriptor_sha256=descriptor_plan.sha256,
+        stage_vector_bytes=16,
+        stage_vectors_per_k_tile=96,
         hidden_to_intermediate=exl3._m6_quad_qmv_kernel(4096, 2048, False),
         intermediate_to_hidden=exl3._m6_quad_qmv_kernel(2048, 4096, True),
     )

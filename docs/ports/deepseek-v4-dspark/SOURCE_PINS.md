@@ -398,7 +398,15 @@ created.  The enabled callables do not probe eligibility or fall back.
   loads per 16 K values and output panel instead of the previous 16.  The
   quad decoder preserves the four independent MCG products and ascending
   k0,k1,k2,k3 FP32 FMA order; it changes decoder window/address work, not the
-  artifact arithmetic.
+  artifact arithmetic.  The retained `u4-stage16b-96x8` lane
+  retains the same 48-ushort tile and 12,288-byte threadgroup layout, but stages
+  it through aligned `uint4` storage.  Lanes 0 through 95 (three complete
+  SIMDgroups) issue one 16-byte copy for each of the eight K tiles; expert, K,
+  and N vector bases are formed before that copy loop.  Construction seals the
+  16-byte vector and 96 vectors per K tile before installing the v2 kernel.
+  Authentic three-bank/final-bit parity passed, and matched one-cycle gates
+  improved from 30.84--30.87 tok/s to 39.74--39.79 tok/s.  Sustained
+  measurement remains a separate final gate.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_moe_router.py` and the
   installed `EXL3SwitchGLU.direct_qmv_m6_quad` /
   `EXL3SwitchGLU.fused` paths in `mtplx/deepseek_v4_exl3.py`.  The scalar
@@ -418,10 +426,11 @@ created.  The enabled callables do not probe eligibility or fall back.
   widths use Trellis.  `_pack_trellis_routes` remains the enabled Trellis
   packer.
 - **Disposition:** source-derived Metal W4A16 port.  Quad direct QMV is the
-  measured production M6 verification route with uniform BN256 ownership and
-  the source-equivalent register/SIMD H128 butterfly; scalar direct QMV and the
-  generic `__call__` M-width selection remain explicit compatibility/oracle
-  code outside `_mia_exl3_forward`.
+  measured production M6 arithmetic with uniform BN256 ownership and the
+  source-equivalent register/SIMD H128 butterfly.  The `uint4` staging change
+  is retained after guarded authentic parity and two matched short-cycle wins;
+  scalar direct QMV and the generic `__call__` M-width selection remain
+  explicit compatibility/oracle code outside `_mia_exl3_forward`.
 
 ### 6. WO inverse-RoPE and two projections
 

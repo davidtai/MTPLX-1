@@ -1184,7 +1184,7 @@ def _mia_engine_identity(
             "mhc-post-pre-m384-bm64-bf16mma",
             "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
             "long-prefill-chunk1024",
-            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-bn256-simd-h128",
+            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-bn256-simd-h128-u4-stage16b-96x8",
             MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256,
             "compressor-absolute-state-rings",
             "fixed-target-window-m8224",
@@ -1272,6 +1272,8 @@ def build_mia_engine_plan(
 
     from mtplx.deepseek_v4_exl3 import (
         EXL3_M6_QUAD_DESCRIPTOR_SHA256,
+        EXL3_M6_STAGE_VECTOR_BYTES,
+        EXL3_M6_STAGE_VECTORS_PER_K_TILE,
         EXL3SwitchGLU,
         _InstalledM6QuadQMVPlan,
         _m6_quad_qmv_kernel,
@@ -1439,6 +1441,10 @@ def build_mia_engine_plan(
             == (4096, 2048, 216, 6, 10.0, 256, 36),
             getattr(quad_plan, "descriptor_sha256", None)
             == MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256,
+            getattr(quad_plan, "stage_vector_bytes", None)
+            == EXL3_M6_STAGE_VECTOR_BYTES,
+            getattr(quad_plan, "stage_vectors_per_k_tile", None)
+            == EXL3_M6_STAGE_VECTORS_PER_K_TILE,
             getattr(quad_plan, "hidden_to_intermediate", None)
             is _m6_quad_qmv_kernel(4096, 2048, False),
             getattr(quad_plan, "intermediate_to_hidden", None)
@@ -1499,6 +1505,8 @@ def build_mia_engine_plan(
             True,
             "_mia_exl3_forward",
             "direct_qmv_m6_quad",
+            True,
+            True,
             True,
             True,
             True,
@@ -2026,7 +2034,9 @@ def build_mia_engine_plan(
         ),
         MiaPrewarmSignature("indexer_sparse_prefill", 1, "prefill"),
         MiaPrewarmSignature("indexer_sparse_decode", 1, "decode_verify"),
-        MiaPrewarmSignature("target_verify_m6_quad_qmv", 6, "decode_verify"),
+        MiaPrewarmSignature(
+            "target_verify_m6_quad_qmv_u4_stage16b", 6, "decode_verify"
+        ),
         MiaPrewarmSignature("dspark_k5_bm8", MIA_DSPARK_BLOCK, "decode_verify"),
     )
     installed_routes = (
@@ -2045,7 +2055,7 @@ def build_mia_engine_plan(
         "mla_decode_direct_stock432",
         "mla_prefill_nax_mg16_tile32",
         "mla_token_major_query_output_no_transpose",
-        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_quad_qmv",
+        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_quad_qmv_u4_stage16b_96x8",
         "wo_tp1_b12x_inv_rope_mxfp8_bm8_m16q_bm64",
         "nonexpert_native_mxfp8",
         "dspark_k5_direct_stock432_k64_native_mxfp4",
