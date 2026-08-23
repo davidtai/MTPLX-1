@@ -1811,7 +1811,7 @@ class MiaStackedMXFP8Projection:
 
 
 class MiaStackedDenseProjection:
-    """One BF16-weight GEMM for the source FP32 compressor projections."""
+    """One construction-widened GEMM for source FP32 compressor projections."""
 
     __slots__ = ("weight", "split")
 
@@ -1834,7 +1834,9 @@ class MiaStackedDenseProjection:
         self.validate_pair(first, second)
         self.split = int(first.weight.shape[0])
         self.weight = mx.contiguous(
-            mx.concatenate((first.weight, second.weight), axis=0)
+            mx.concatenate((first.weight, second.weight), axis=0).astype(
+                mx.float32
+            )
         )
         mx.eval(self.weight)
         first.weight = self.weight[: self.split]

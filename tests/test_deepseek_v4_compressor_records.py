@@ -143,10 +143,17 @@ def test_mia_stacked_dense_projection_preserves_fp32_compressor_arithmetic(
 
     pair = Pair()
     values = ((mx.arange(24, dtype=mx.float32) - 5.0) / 13.0).reshape(1, 3, 8)
-    expected = (pair.first(values), pair.second(values))
+    control_weight = mx.contiguous(
+        mx.concatenate((pair.first.weight, pair.second.weight), axis=0)
+    )
+    control_fused = mx.matmul(values, mx.swapaxes(control_weight, -1, -2))
+    expected = (control_fused[..., :6], control_fused[..., 6:])
     mx.eval(*expected)
     names_before = tuple(name for name, _ in tree_flatten(pair.parameters()))
     owner = target_module.MiaStackedDenseProjection(pair.first, pair.second)
+    assert owner.weight.dtype == mx.float32
+    assert pair.first.weight.dtype == mx.float32
+    assert pair.second.weight.dtype == mx.float32
     original_matmul = target_module.mx.matmul
     calls = []
 
@@ -170,17 +177,13 @@ def test_mia_stacked_dense_projection_preserves_fp32_compressor_arithmetic(
     assert names_before == ("first.weight", "second.weight")
     assert len(calls) == 1
     assert owner.split == 6
-    np.testing.assert_allclose(
+    np.testing.assert_array_equal(
         np.array(actual[0]),
         np.array(expected[0]),
-        rtol=1e-6,
-        atol=1e-6,
     )
-    np.testing.assert_allclose(
+    np.testing.assert_array_equal(
         np.array(actual[1]),
         np.array(expected[1]),
-        rtol=1e-6,
-        atol=1e-6,
     )
 
 
