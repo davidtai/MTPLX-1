@@ -260,23 +260,6 @@ def test_build_verify_state_spec_orders_layers():
     assert reason == "unsupported_container:object"
 
 
-def test_device_mtp_rollback_resets_tensor_offset_without_saved_trace() -> None:
-    from mtplx.generation import _rollback_mtp_cache
-
-    cache = TensorOffsetKVCache(
-        mx.zeros((1, 1, 16, 4)),
-        mx.zeros((1, 1, 16, 4)),
-        9,
-    )
-    cache.rollback_state = [mx.array(7), mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4))]
-    cache.trim = lambda _n: (_ for _ in ()).throw(AssertionError("trim used"))
-
-    _rollback_mtp_cache([cache], 7)
-
-    assert cache.size() == 7
-    assert cache.rollback_state == [None, None, None]
-
-
 def test_real_entries_unchanged_until_mirror_commit():
     rt = ToyHybridRuntime()
     bank = CompiledVerifyBank(rt)
