@@ -166,7 +166,7 @@ the ledger, raw receipts, and `NOTICE`.
 
 - [x] Remove every rejected experimental implementation from production while
   preserving its receipt and row-level disposition.
-- [ ] Run `uv run --frozen --with pytest pytest -q`, inventory reproduction,
+- [x] Run `uv run --frozen --with pytest pytest -q`, inventory reproduction,
   focused Ruff, receipt schema checks, stub scan, and `git diff --check`. The
   unchanged cold-tier stats-cache race fails on both this branch and
   `upstream/main` (19/20 base reproductions); the full suite excluding only
