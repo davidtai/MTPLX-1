@@ -372,6 +372,18 @@ def _candidate_engagement_errors(
         )
         if calls <= 0:
             errors.append("row 24 target evaluation ladder did not execute")
+        if "r21_qk_rms_rope" in features:
+            qk_fallbacks = sum(
+                int(
+                    ((run.get("engagement") or {}).get("r24_qk_length_limit") or {}).get(
+                        "fallback_calls",
+                        0,
+                    )
+                )
+                for run in candidate_runs
+            )
+            if qk_fallbacks <= 0:
+                errors.append("row 24 Q/K L<=16 fallback did not execute")
     if "r26_prefill_ladder_3" in features:
         calls = sum(
             int(
@@ -394,6 +406,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.qwen38_challenge_kernels import (
         qwen38_qk_rms_rope_counter_snapshot,
         qwen38_row24_eval_ladder_counter_snapshot,
+        qwen38_row24_qk_length_fallback_counter_snapshot,
         qwen38_row26_prefill_ladder_counter_snapshot,
     )
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
@@ -406,6 +419,9 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
         "r21_qk_rms_rope": {"calls": qwen38_qk_rms_rope_counter_snapshot()},
         "r24_eval_ladder": {"calls": qwen38_row24_eval_ladder_counter_snapshot()},
+        "r24_qk_length_limit": {
+            "fallback_calls": qwen38_row24_qk_length_fallback_counter_snapshot()
+        },
         "r26_prefill_ladder_3": {
             "calls": qwen38_row26_prefill_ladder_counter_snapshot()
         },

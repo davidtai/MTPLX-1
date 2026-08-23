@@ -8,6 +8,7 @@ _DUAL_RMS_CONCAT_KERNEL = None
 _QK_RMS_ROPE_KERNEL = None
 qwen38_dual_norm_calls = 0
 qwen38_qk_rms_rope_calls = 0
+qwen38_row24_qk_length_fallback_calls = 0
 qwen38_row24_eval_ladder_calls = 0
 qwen38_row26_prefill_ladder_calls = 0
 _QWEN38_ATTENTION_ORIGINAL_CALL = None
@@ -240,6 +241,16 @@ def configure_qwen38_row21_qk_rms_rope(model: Any, *, active: bool) -> dict[str,
                 )
             if not _row21_attention_eligible(self):
                 raise ValueError("active Qwen 3.8 row-21 attention is ineligible")
+            max_length = getattr(self, "_mtplx_qwen38_row24_qk_max_length", None)
+            if max_length is not None and int(x.shape[1]) > int(max_length):
+                global qwen38_row24_qk_length_fallback_calls
+                qwen38_row24_qk_length_fallback_calls += 1
+                return _QWEN38_ATTENTION_ORIGINAL_CALL(
+                    self,
+                    x,
+                    mask=mask,
+                    cache=cache,
+                )
             offset = getattr(cache, "offset", 0) if cache is not None else 0
             if isinstance(offset, mx.array):
                 # Matches the source patch's `hasArrayOffset` fallback: the
@@ -301,6 +312,29 @@ def configure_qwen38_row21_qk_rms_rope(model: Any, *, active: bool) -> dict[str,
         "active_modules": eligible if active else 0,
         "mtp_array_offset_skipped": 1,
     }
+
+
+def configure_qwen38_row24_qk_length_limit(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, int]:
+    """Apply row 24's L<=16 bound to the retained row-21 fusion."""
+
+    text = getattr(model, "language_model", model)
+    inner = getattr(text, "model", text)
+    eligible = 0
+    for layer in list(getattr(inner, "layers", ()) or ()):
+        attention = getattr(layer, "self_attn", None)
+        if attention is None or not _row21_attention_eligible(attention):
+            continue
+        attention._mtplx_qwen38_row24_qk_max_length = 16 if active else None
+        eligible += 1
+    return {"eligible_modules": eligible, "active_modules": eligible if active else 0}
+
+
+def qwen38_row24_qk_length_fallback_counter_snapshot() -> int:
+    return int(qwen38_row24_qk_length_fallback_calls)
 
 
 def qwen38_dual_rms_norm_concat(

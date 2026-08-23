@@ -14,7 +14,10 @@ from typing import Any
 
 from .draft_lm_head import configure_qwen38_row10_compact_head
 from .gdn_capture import configure_qwen38_row18_gdn_decay_memo
-from .qwen38_challenge_kernels import configure_qwen38_row21_qk_rms_rope
+from .qwen38_challenge_kernels import (
+    configure_qwen38_row21_qk_rms_rope,
+    configure_qwen38_row24_qk_length_limit,
+)
 from .qwen38_mtp_block_artifacts import configure_qwen38_mtp_block
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
@@ -414,6 +417,18 @@ def install_qwen38_route(
         route_features.append("r21_qk_rms_rope")
         kernel_ids.append("qwen38_qk_rms_rope_bf16_h256_r64_v1")
         feature_receipt["r21_qk_rms_rope"] = row21_report
+
+    row24_qk_report = configure_qwen38_row24_qk_length_limit(
+        runtime.model,
+        active=bool(row24_eval_ladder and row21_qk_rms_rope),
+    )
+    if row24_eval_ladder and row21_qk_rms_rope:
+        if int(row24_qk_report.get("active_modules", 0)) <= 0:
+            raise Qwen38ContractError(
+                "Qwen 3.8 row 24 Q/K length limit configured no modules"
+            )
+        kernel_ids.append("qwen38_row24_qk_rms_rope_l_le16_v1")
+        feature_receipt["r24_qk_length_limit"] = row24_qk_report
 
     text._mtplx_qwen38_row24_eval_ladder = bool(row24_eval_ladder)
     text._mtplx_qwen38_row24_prefill_stride = (
