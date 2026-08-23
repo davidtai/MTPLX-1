@@ -886,9 +886,26 @@ def inject_mtp_support(
 
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
-            for layer, layer_cache in zip(inner.layers, cache):
+            row24_ladder = bool(
+                getattr(self, "_mtplx_qwen38_row24_eval_ladder", False)
+            )
+            row24_prefill = int(hidden_states.shape[1]) >= 512
+            row24_decode = int(hidden_states.shape[1]) <= 9
+            for layer_index, (layer, layer_cache) in enumerate(
+                zip(inner.layers, cache)
+            ):
                 mask = ssm_mask if layer.is_linear else fa_mask
                 hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+                if row24_ladder and (
+                    (row24_prefill and (layer_index == 0 or layer_index % 4 == 3))
+                    or (
+                        row24_decode
+                        and layer_index in {0, 1, 9, 19, 29, 39, 49, 57}
+                    )
+                ):
+                    from .qwen38_challenge_kernels import qwen38_row24_async_eval
+
+                    qwen38_row24_async_eval(hidden_states)
 
             pre_norm = hidden_states
             variant = hidden_variant or getattr(self, "_mtplx_hidden_variant", "post_norm")

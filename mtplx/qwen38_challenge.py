@@ -318,6 +318,7 @@ def install_qwen38_route(
     source_proposal: bool = False,
     row10_compact_vocab: bool = False,
     row18_gdn_decay_memo: bool = False,
+    row24_eval_ladder: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -367,6 +368,11 @@ def install_qwen38_route(
         feature_receipt["r18_gdn_decay_memo"] = row18_gdn_report
 
     text = getattr(runtime.model, "language_model", runtime.model)
+    text._mtplx_qwen38_row24_eval_ladder = bool(row24_eval_ladder)
+    if row24_eval_ladder:
+        route_features.append("r24_eval_ladder")
+        kernel_ids.append("qwen38_row24_target_eval_ladder_v1")
+        feature_receipt["r24_eval_ladder"] = {"active": 1}
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)
     if dual_norm:
         route_features.append("dual_norm")

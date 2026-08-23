@@ -234,6 +234,29 @@ def test_mtp_forward_uses_qwen38_dual_norm_concat_route(
     assert calls == [(args.hidden_size, args.hidden_size)]
 
 
+def test_row24_target_eval_ladder_uses_decode_rungs(tmp_path, monkeypatch) -> None:
+    from mlx_lm.models.qwen3_5 import TextModel
+
+    import mtplx.qwen38_challenge_kernels as kernels
+
+    args = _tiny_text_model_args()
+    config = _write_tiny_mtp_sidecar(tmp_path, args, n_layers=1)
+    model = TextModel(args)
+    assert inject_mtp_support(model, tmp_path, config) is True
+    calls: list[tuple[int, ...]] = []
+    monkeypatch.setattr(
+        kernels,
+        "qwen38_row24_async_eval",
+        lambda value: calls.append(tuple(value.shape)),
+    )
+    model._mtplx_qwen38_row24_eval_ladder = True
+
+    logits = model(mx.array([[1, 2, 3, 4]]))
+    mx.eval(logits)
+
+    assert calls == [(1, 4, args.hidden_size), (1, 4, args.hidden_size)]
+
+
 def test_mtp_cache_length_mismatch_fails_loud(tmp_path) -> None:
     from mlx_lm.models.cache import KVCache
     from mlx_lm.models.qwen3_5 import TextModel
