@@ -166,8 +166,10 @@ def test_engine_plan_seals_direct_qmv_owners_and_prewarm_signatures() -> None:
     assert "target_exl3_prefill_trellis_bm8_bm64_verify_m6_direct_qmv" in (
         build_source
     )
-    assert "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-qmv" in (
-        identity_source
+    assert (
+        "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-qmv-"
+        "bn256-simd-h128"
+        in identity_source
     )
     assert 'MiaPrewarmSignature("target_prefill_m6_bm8", 6, "prefill")' in (
         build_source

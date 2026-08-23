@@ -381,6 +381,15 @@ created.  The enabled callables do not probe eligibility or fall back.
   reduction and shared-expert addition.  Target prefill uses Trellis BM8 through
   M127 and BM64 from M128, while the exact physical M6 verification phase uses
   the source-backed direct-QMV projection sequence and stock weighted tail.
+  Each direct bank owns an N256 output slab: one 128-thread Metal group reuses
+  its input H128 across two independently accumulated and independently
+  FP16-rounded N128 panels.  This preserves the artifact's H128/K128 packing
+  while mapping SparkInfer's pinned direct-top-k N256 ownership to Metal; it
+  does not transplant SparkInfer's CUDA K tile or thread topology.  Within
+  each H128, strides 1 through 16 use the repository's existing
+  `simd_shuffle_xor` exchange and only cross-SIMD strides 32 and 64 use
+  threadgroup scratch.  The ascending FP32 butterfly order and every FP16
+  boundary remain unchanged.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_moe_router.py` and the
   installed `EXL3SwitchGLU.direct_qmv` / `EXL3SwitchGLU.fused` paths in
   `mtplx/deepseek_v4_exl3.py`.
@@ -388,14 +397,18 @@ created.  The enabled callables do not probe eligibility or fall back.
   binds the exact `direct_qmv`, Trellis `fused`, and
   `_stock_moe_tail_combine` callables before binding `_mia_exl3_forward`; each
   gate binds `_mia_hash_route` or `_mia_score_route`.
+  Each `EXL3LinearBank` fixes BN256 and its compiled kernel at construction;
+  the enabled direct-QMV call contains no geometry eligibility or fallback.
   `EXL3SwitchGLU.install_trellis_runtime` binds the BM8 and BM64 plans.  The
   runtime selector uses direct QMV only when the phase is `decode_verify` and
   the physical hidden row count is exactly six; every prefill and all other
   widths use Trellis.  `_pack_trellis_routes` remains the enabled Trellis
   packer.
 - **Disposition:** source-derived Metal W4A16 port.  Direct QMV is the measured
-  production M6 verification route; the generic `__call__` M-width selection
-  remains explicit compatibility/oracle code outside `_mia_exl3_forward`.
+  production M6 verification route with uniform BN256 ownership and the
+  source-equivalent register/SIMD H128 butterfly; the generic `__call__`
+  M-width selection remains explicit compatibility/oracle code outside
+  `_mia_exl3_forward`.
 
 ### 6. WO inverse-RoPE and two projections
 

@@ -1181,7 +1181,7 @@ def _mia_engine_identity(
             "mhc-post-pre-m384-bm64-bf16mma",
             "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
             "long-prefill-chunk1024",
-            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-qmv",
+            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-qmv-bn256-simd-h128",
             "compressor-absolute-state-rings",
             "fixed-target-window-m8224",
             "persistent-target-draft-page-arenas",
