@@ -1752,9 +1752,14 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
     if api_key:
         argv.extend(["--api-key", api_key])
     args = parse_args(argv)
+    backend_descriptor = openai.descriptor_for_backend_id("qwen3_next")
     return SimpleNamespace(
         args=args,
         model_id="mtplx-test-model",
+        backend_descriptor=backend_descriptor,
+        session_cache_route=openai._session_cache_route_for_backend(
+            backend_descriptor
+        ),
         lock=Lock(),
         runtime=SimpleNamespace(
             model_path=Path("models/example"),
@@ -1803,6 +1808,9 @@ def _fake_dspark_state():
     state.runtime.mtp_enabled = False
     state.backend_descriptor = openai.descriptor_for_backend_id(
         "deepseek_v4_dspark"
+    )
+    state.session_cache_route = openai._session_cache_route_for_backend(
+        state.backend_descriptor
     )
     state.deepseek_v4_dflash2_bundle = object()
     return state
@@ -4010,6 +4018,84 @@ def test_streaming_ar_honors_explicit_inline_postcommit_mode(monkeypatch):
     assert '"generation_mode": "ar"' in response.text
 
 
+def test_dspark_streaming_inline_skips_retokenized_postcommit(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.args.backend_id = "deepseek_v4_dspark"
+    state.args.generation_mode = "dspark"
+    state.args.depth = 5
+    state.args.temperature = 0.0
+    state.args.top_p = 1.0
+    state.args.top_k = 0
+    state.args.session_postcommit_mode = "inline"
+    state.runtime.backend_id = "deepseek_v4_dspark"
+    state.runtime.mtp_enabled = False
+    state.backend_descriptor = openai.descriptor_for_backend_id(
+        "deepseek_v4_dspark"
+    )
+    state.session_cache_route = openai._session_cache_route_for_backend(
+        state.backend_descriptor
+    )
+    state.deepseek_v4_dflash2_bundle = object()
+    observed_session_banks = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        observed_session_banks.append(kwargs.get("session_bank"))
+        tokens = [ord("O"), ord("K")]
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            token_callback(tokens)
+        return {
+            "text": "OK",
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": "dspark",
+                "mtp_depth": 5,
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+            "_final_state": None,
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    monkeypatch.setattr(
+        openai,
+        "_store_retokenized_history_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "DSpark entered retokenized postcommit"
+        ),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_schedule_idle_postcommit_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("DSpark scheduled idle postcommit"),
+    )
+
+    with TestClient(create_app(state)) as client:
+        for content in ("Say OK", "Again"):
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"x-mtplx-session-id": "dspark-inline"},
+                json={
+                    "messages": [{"role": "user", "content": content}],
+                    "enable_thinking": False,
+                    "stream": True,
+                    "max_tokens": 4,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "top_k": 0,
+                },
+            )
+            assert response.status_code == 200
+            assert (
+                '"reason": "deepseek_v4_dspark_postcommit_unsupported"'
+                in response.text
+            )
+            assert '"finish_reason": "error"' not in response.text
+    assert observed_session_banks == [None, None]
+
+
 def test_invalid_generation_mode_returns_400():
     client = TestClient(create_app(_fake_state()))
 
@@ -5220,6 +5306,7 @@ def test_dspark_nonstream_attempt_bypasses_generic_cache_and_token_instrumentati
         lambda *_args, **_kwargs: pytest.fail("DSpark entered generic chunk override"),
     )
     delivered: list[list[int]] = []
+    cancel_event = Event()
 
     generated = openai._run_generation(
         state,
@@ -5233,17 +5320,26 @@ def test_dspark_nonstream_attempt_bypasses_generic_cache_and_token_instrumentati
         depth=5,
         token_callback=delivered.append,
         streaming_response=False,
+        cancel_event=cancel_event,
+        prefill_chunk_tokens=256,
     )
 
-    assert calls == [
-        {
-            "bundle": bundle,
-            "prompt_ids": [1, 2, 3],
-            "max_tokens": 2,
-            "token_callback": None,
-            "runtime_context": runtime_context,
-        }
-    ]
+    assert len(calls) == 1
+    observed_call = dict(calls[0])
+    should_cancel = observed_call.pop("should_cancel")
+    assert observed_call == {
+        "bundle": bundle,
+        "prompt_ids": [1, 2, 3],
+        "max_tokens": 2,
+        "token_callback": None,
+        "prefill_step_size": 256,
+        "runtime_context": runtime_context,
+    }
+    assert callable(should_cancel)
+    assert should_cancel() is False
+    cancel_event.set()
+    with pytest.raises(openai._StreamCancelled, match="request cancelled"):
+        should_cancel()
     assert delivered == []
     assert "dynamic_paged_kv" not in generated["stats"]
     assert generated["stats"]["dspark_cache_ownership"] == (
@@ -5264,6 +5360,78 @@ def test_dspark_nonstream_attempt_bypasses_generic_cache_and_token_instrumentati
         state.deepseek_v4_dspark_cache_ownership
     )
     assert generated["stats"]["decode_tok_s"] == pytest.approx(8.0)
+
+
+def test_dspark_skips_unsupported_retokenized_postcommit() -> None:
+    route = openai._session_cache_route_for_backend(
+        openai.descriptor_for_backend_id("deepseek_v4_dspark")
+    )
+    state = SimpleNamespace(
+        session_cache_route=route,
+        backend_descriptor=openai.descriptor_for_backend_id("qwen3_next"),
+        runtime=SimpleNamespace(backend_id="qwen3_next"),
+    )
+
+    result = openai._skipped_idle_postcommit_snapshot(
+        state=state,
+        unsafe_reason="missing_generation_final_state",
+        assistant_tool_calls=[{"name": "read"}],
+        prompt_prefix_len=4096,
+    )
+
+    assert result == {
+        "stored": False,
+        "mode": "skipped",
+        "reason": "deepseek_v4_dspark_postcommit_unsupported",
+        "unsafe_reason": "missing_generation_final_state",
+        "assistant_tool_calls": 1,
+        "prompt_prefix_len": 4096,
+    }
+    assert route.generation_bank(SimpleNamespace(bank=object()), bypass=False) is None
+
+
+def test_dspark_direct_retokenized_postcommit_is_rejected_before_model_work() -> None:
+    route = openai._session_cache_route_for_backend(
+        openai.descriptor_for_backend_id("deepseek_v4_dspark")
+    )
+    state = SimpleNamespace(session_cache_route=route)
+
+    result = openai._store_retokenized_history_snapshot(
+        state,
+        session_id="dspark-session",
+        messages=[],
+        assistant_content="answer",
+        thinking_enabled=False,
+        policy_fingerprint="policy",
+    )
+
+    assert result["reason"] == "deepseek_v4_dspark_postcommit_unsupported"
+
+
+def test_dspark_async_retokenized_postcommit_is_rejected_before_submit(
+    monkeypatch,
+) -> None:
+    route = openai._session_cache_route_for_backend(
+        openai.descriptor_for_backend_id("deepseek_v4_dspark")
+    )
+    state = SimpleNamespace(session_cache_route=route)
+    monkeypatch.setattr(
+        openai,
+        "_submit_idle_postcommit_model_work",
+        lambda *_args, **_kwargs: pytest.fail("unsupported DSpark work was submitted"),
+    )
+
+    result = openai._schedule_idle_postcommit_snapshot(
+        state,
+        session_id="dspark-session",
+        messages=[],
+        assistant_content="answer",
+        thinking_enabled=False,
+        policy_fingerprint="policy",
+        unsafe_reason="missing_generation_final_state",
+    )
+
+    assert result["reason"] == "deepseek_v4_dspark_postcommit_unsupported"
 
 
 @pytest.mark.parametrize(

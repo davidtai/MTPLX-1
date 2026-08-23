@@ -22,7 +22,7 @@
 ## Reused DFlash2 runtime
 
 - Existing MTPLX DFlash2 branch: `perf/qwen38-dflash2@c3487dc56de6c734c71508c1e293a44731ff025f`
-- DFlash2 dependency: `davidtai/dflash-mlx@b5638db3794327dadba33c9f3aaa4c2610b28b0c`
+- DFlash2 dependency: `davidtai/dflash-mlx@54644e991039110f30140006c892c57734b9311e`
 - Fixed-linear ownership boundary: target physical pages, compressor journals,
   live frontiers, and DSpark rings are scheduled once per installed prefill or
   verify chunk; no logical cache rows are gathered or materialized.
@@ -42,6 +42,12 @@ launch, stop, and event ordering are unchanged.
 The fixed capability additionally certifies that acceptance restore trims the
 installed target pages directly, so the shared loop does not run a disabled
 per-cycle rollback-arm call or repeat the staged-primary proof.
+The pinned runtime also accepts a per-request prefill chunk size and a
+cancellation callback.  The callback is polled only after settled prefill
+chunks and before speculative decode cycles; session construction and
+sparse-RoPE installation unwind acquired target and draft caches on failure.
+These serving-control additions do not change fixed-linear arithmetic, layout,
+verification width, or event ordering.
 
 The official `DSparkAttention` source establishes that persistent stage K/V is
 context K/V projected from accepted target taps. The five neural draft rows are

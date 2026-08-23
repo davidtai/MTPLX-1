@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -274,10 +275,22 @@ class DeepseekV4TargetOps:
                 "DeepSeek V4 request exceeds the installed Mia context capacity"
             )
         cache = self._make_target_cache(target_model.layers)
-        if not cache or not all(
-            isinstance(entry, DeepseekV4NVFP4Cache) for entry in cache
-        ):
-            raise ValueError("DeepSeek V4 DFlash2 requires Mia stock432 target caches")
+        try:
+            if not cache or not all(
+                isinstance(entry, DeepseekV4NVFP4Cache) for entry in cache
+            ):
+                raise ValueError(
+                    "DeepSeek V4 DFlash2 requires Mia stock432 target caches"
+                )
+        except BaseException as primary_error:
+            try:
+                self._release_target_cache(cache)
+            except BaseException as release_error:
+                primary_error.add_note(
+                    "target cache release also failed: "
+                    f"{type(release_error).__name__}: {release_error}"
+                )
+            raise
         return cache
 
     def install_speculative_hooks(self, target_model: Any) -> None:
@@ -414,10 +427,25 @@ class DeepseekV4TargetOps:
         target_cache: list[Any],
         draft_cache: list[Any],
     ) -> None:
+        release_errors: list[BaseException] = []
         if target_cache:
-            self._release_target_cache(target_cache)
+            try:
+                self._release_target_cache(target_cache)
+            except BaseException as error:
+                release_errors.append(error)
         if draft_cache:
-            self._release_draft_cache(draft_cache)
+            try:
+                self._release_draft_cache(draft_cache)
+            except BaseException as error:
+                release_errors.append(error)
+        if release_errors:
+            primary_error, *additional_errors = release_errors
+            for error in additional_errors:
+                primary_error.add_note(
+                    "additional generation cache release failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+            raise primary_error
 
 
 class DeepseekV4DSparkDraftAdapter:
@@ -436,9 +464,17 @@ class DeepseekV4DSparkDraftAdapter:
         )
         if target_layer_ids != _TARGET_LAYER_IDS:
             raise ValueError("DeepSeek V4 DFlash2 requires target taps 40/41/42")
+        make_cache = getattr(owner, "make_cache", None)
+        release_cache = getattr(owner, "release_mia_cache", None)
+        if not callable(make_cache) or not callable(release_cache):
+            raise ValueError(
+                "DeepSeek V4 DFlash2 requires the sealed DSpark cache arena"
+            )
 
         self.target_model = target_model
         self.owner = owner
+        self._make_cache = make_cache
+        self._release_cache = release_cache
         self.target_layer_ids = list(_TARGET_LAYER_IDS)
         self.block_size = _PHYSICAL_VERIFY_WIDTH
         self.mask_token_id = int(target_model.args.dspark_noise_token_id)
@@ -512,19 +548,29 @@ class DeepseekV4DSparkBackend:
         del sink_size, window_size
         if allow_full_context_layers:
             raise ValueError("DSpark stages use their fixed sliding attention window")
-        caches = draft_model.owner.make_cache()
-        if len(caches) != 3:
-            raise ValueError("DeepSeek V4 DFlash2 requires three DSpark caches")
-        for cache in caches:
-            ring = getattr(cache, "ring", None)
-            if (
-                getattr(ring, "mode", None) != "nvfp4_stock432_fixed_ring"
-                or getattr(ring, "record_bytes", None) != 432
-                or len(ring) != 0
-            ):
-                raise ValueError(
-                    "DSpark DFlash2 caches must start empty in Mia stock432 format"
+        caches = draft_model._make_cache()
+        try:
+            if len(caches) != 3:
+                raise ValueError("DeepSeek V4 DFlash2 requires three DSpark caches")
+            for cache in caches:
+                ring = getattr(cache, "ring", None)
+                if (
+                    getattr(ring, "mode", None) != "nvfp4_stock432_fixed_ring"
+                    or getattr(ring, "record_bytes", None) != 432
+                    or len(ring) != 0
+                ):
+                    raise ValueError(
+                        "DSpark DFlash2 caches must start empty in Mia stock432 format"
+                    )
+        except BaseException as primary_error:
+            try:
+                draft_model._release_cache(caches)
+            except BaseException as release_error:
+                primary_error.add_note(
+                    "draft cache release also failed: "
+                    f"{type(release_error).__name__}: {release_error}"
                 )
+            raise
         return caches
 
     @staticmethod
@@ -665,6 +711,8 @@ def generate_deepseek_v4_dflash2(
     runtime_context: Any,
     stop_token_ids: Optional[list[int]] = None,
     token_callback: Any = None,
+    prefill_step_size: int | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ):
     """Translate the unchanged DFlash2 event stream into MTPLX output types."""
 
@@ -705,6 +753,8 @@ def generate_deepseek_v4_dflash2(
         stop_token_ids=resolved_stop_ids,
         quantize_kv_cache=False,
         runtime_context=runtime_context,
+        prefill_step_size=prefill_step_size,
+        should_cancel=should_cancel,
     ):
         if isinstance(event, TokenEvent):
             token_id = int(event.token_id)

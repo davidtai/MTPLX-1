@@ -1,4 +1,5 @@
 from importlib.metadata import PackageNotFoundError, version
+from inspect import signature
 import json
 from pathlib import Path
 import subprocess
@@ -11,10 +12,10 @@ import pytest
 DFLASH_MLX_PIN = (
     "dflash-mlx @ "
     "git+https://github.com/davidtai/dflash-mlx.git@"
-    "b5638db3794327dadba33c9f3aaa4c2610b28b0c"
+    "54644e991039110f30140006c892c57734b9311e"
 )
 DFLASH_MLX_URL = "https://github.com/davidtai/dflash-mlx.git"
-DFLASH_MLX_REVISION = "b5638db3794327dadba33c9f3aaa4c2610b28b0c"
+DFLASH_MLX_REVISION = "54644e991039110f30140006c892c57734b9311e"
 
 
 def test_competitor_extra_pins_immutable_dflash_mlx_source():
@@ -32,6 +33,9 @@ def test_dflash2_runtime_api_contract():
     assert DFlash2DraftModel.__name__ == "DFlash2DraftModel"
     assert QwenGdnTargetOps.backend_name == "qwen_gdn"
     assert callable(stream_dflash_generate)
+    assert {"prefill_step_size", "should_cancel"} <= set(
+        signature(stream_dflash_generate).parameters
+    )
     assert callable(load_draft_bundle)
 
 

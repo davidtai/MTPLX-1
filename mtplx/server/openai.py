@@ -644,9 +644,10 @@ def _stream_cancelled_queue_item(exc: _StreamCancelled) -> tuple[str, str]:
 
 def _raise_if_stream_cancelled(
     cancel_event: Event, message: str = "stream client disconnected"
-) -> None:
+) -> bool:
     if cancel_event.is_set():
         raise _StreamCancelled(message)
+    return False
 
 
 def _cancel_stream_generation(
@@ -2316,6 +2317,9 @@ class ServerState:
                 self.deepseek_v4_dflash2_bundle,
             )
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
+        self.session_cache_route = _session_cache_route_for_backend(
+            self.backend_descriptor
+        )
         args.backend_id = self.backend_descriptor.backend_id
         if self.backend_descriptor.uses_draft_lm_head:
             _startup_line("[5/6] Installing native-MTP draft head")
@@ -17615,6 +17619,87 @@ def _make_adaptive_policy(
     raise ValueError(f"unknown adaptive policy: {policy}")
 
 
+def _generic_generation_session_bank(
+    sessions: Any,
+    *,
+    bypass: bool,
+) -> Any | None:
+    return None if bypass else sessions.bank
+
+
+def _dspark_generation_session_bank(
+    sessions: Any,
+    *,
+    bypass: bool,
+) -> None:
+    del sessions, bypass
+    return None
+
+
+def _generic_postcommit_skip(
+    *,
+    unsafe_reason: str,
+    assistant_tool_calls: list[dict[str, Any]] | None = None,
+    prompt_prefix_len: int | None = None,
+) -> None:
+    del unsafe_reason, assistant_tool_calls, prompt_prefix_len
+    return None
+
+
+def _dspark_postcommit_skip(
+    *,
+    unsafe_reason: str,
+    assistant_tool_calls: list[dict[str, Any]] | None = None,
+    prompt_prefix_len: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "stored": False,
+        "mode": "skipped",
+        "reason": "deepseek_v4_dspark_postcommit_unsupported",
+        "unsafe_reason": unsafe_reason,
+        "assistant_tool_calls": len(assistant_tool_calls or []),
+        "prompt_prefix_len": int(prompt_prefix_len or 0),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionCacheRoute:
+    generation_bank: Callable[..., Any | None]
+    postcommit_skip: Callable[..., dict[str, Any] | None]
+
+
+_GENERIC_SESSION_CACHE_ROUTE = _SessionCacheRoute(
+    generation_bank=_generic_generation_session_bank,
+    postcommit_skip=_generic_postcommit_skip,
+)
+_DSPARK_SESSION_CACHE_ROUTE = _SessionCacheRoute(
+    generation_bank=_dspark_generation_session_bank,
+    postcommit_skip=_dspark_postcommit_skip,
+)
+
+
+def _session_cache_route_for_backend(
+    backend: BackendDescriptor,
+) -> _SessionCacheRoute:
+    if backend.backend_id == "deepseek_v4_dspark":
+        return _DSPARK_SESSION_CACHE_ROUTE
+    return _GENERIC_SESSION_CACHE_ROUTE
+
+
+def _session_cache_postcommit_skip(
+    state: Any,
+    *,
+    unsafe_reason: str,
+    assistant_tool_calls: list[dict[str, Any]] | None = None,
+    prompt_prefix_len: int | None = None,
+) -> dict[str, Any] | None:
+    return state.session_cache_route.postcommit_skip(
+        unsafe_reason=unsafe_reason,
+        assistant_tool_calls=assistant_tool_calls,
+        prompt_prefix_len=prompt_prefix_len,
+    )
+
+
 def _store_retokenized_history_snapshot(
     state: ServerState,
     *,
@@ -17639,6 +17724,13 @@ def _store_retokenized_history_snapshot(
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
+    skipped = _session_cache_postcommit_skip(
+        state,
+        unsafe_reason="missing_generation_final_state",
+        assistant_tool_calls=assistant_tool_calls,
+    )
+    if skipped is not None:
+        return skipped
 
     def _abort_requested() -> bool:
         if abort_check is None:
@@ -18536,6 +18628,13 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
+    skipped = _session_cache_postcommit_skip(
+        state,
+        unsafe_reason=unsafe_reason,
+        assistant_tool_calls=assistant_tool_calls,
+    )
+    if skipped is not None:
+        return skipped
     if assistant_tool_calls and str(
         os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
     ).strip().lower() in {"0", "false", "off", "no"}:
@@ -18828,6 +18927,14 @@ def _skipped_idle_postcommit_snapshot(
     prompt_prefix_len: int | None = None,
 ) -> dict[str, Any] | None:
     backend_id = getattr(getattr(state, "backend_descriptor", None), "backend_id", "")
+    skipped = _session_cache_postcommit_skip(
+        state,
+        unsafe_reason=unsafe_reason,
+        assistant_tool_calls=assistant_tool_calls,
+        prompt_prefix_len=prompt_prefix_len,
+    )
+    if skipped is not None:
+        return skipped
     if backend_id == GEMMA4_BACKEND:
         return {
             "stored": False,
@@ -20791,6 +20898,16 @@ def _run_generation(
                     token_callback=(
                         record_tokens
                         if response_is_streaming or token_callback_required
+                        else None
+                    ),
+                    prefill_step_size=prefill_chunk_tokens,
+                    should_cancel=(
+                        partial(
+                            _raise_if_stream_cancelled,
+                            cancel_event,
+                            "request cancelled",
+                        )
+                        if cancel_event is not None
                         else None
                     ),
                 )
@@ -27310,13 +27427,14 @@ def create_app(state: ServerState) -> FastAPI:
             request_observability["live_frontier_unknown_tool_result_count"] = len(
                 live_frontier_tool_result_ids - live_frontier_tool_call_ids
             )
-        session_bank_for_generation = (
-            None
-            if background
-            or cache_bypass
-            or opencode_tool_history_cache_bypass
-            or (vision_splice is not None and not vision_cache_keying)
-            else state.sessions.bank
+        session_bank_for_generation = state.session_cache_route.generation_bank(
+            state.sessions,
+            bypass=bool(
+                background
+                or cache_bypass
+                or opencode_tool_history_cache_bypass
+                or (vision_splice is not None and not vision_cache_keying)
+            ),
         )
         request_observability["request_session_bank_bypass"] = (
             session_bank_for_generation is None
@@ -28785,34 +28903,43 @@ def create_app(state: ServerState) -> FastAPI:
                                         for token in (generated.get("tokens") or [])
                                     ]
                                     if bool(commit_state.get("retokenize_inline")):
-                                        postcommit = _submit_foreground_model_work(
-                                            state,
-                                            lambda: _store_retokenized_history_snapshot(
+                                        postcommit = _skipped_idle_postcommit_snapshot(
+                                            state=state,
+                                            unsafe_reason=(
+                                                "missing_generation_final_state"
+                                            ),
+                                            assistant_tool_calls=assistant_tool_calls,
+                                            prompt_prefix_len=len(prompt_ids),
+                                        )
+                                        if postcommit is None:
+                                            postcommit = _submit_foreground_model_work(
                                                 state,
-                                                session_id=session_id,
-                                                messages=raw_messages_for_postcommit,
-                                                assistant_content=(
-                                                    assistant_history_content
+                                                lambda: _store_retokenized_history_snapshot(
+                                                    state,
+                                                    session_id=session_id,
+                                                    messages=raw_messages_for_postcommit,
+                                                    assistant_content=(
+                                                        assistant_history_content
+                                                    ),
+                                                    assistant_tool_calls=(
+                                                        assistant_tool_calls
+                                                    ),
+                                                    thinking_enabled=thinking_enabled,
+                                                    reasoning_effort=reasoning_effort,
+                                                    policy_fingerprint=postcommit_policy_fingerprint,
+                                                    tool_specs=postcommit_tool_specs,
+                                                    keep_live_ref=session_keep_live_ref,
+                                                    tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                    strip_tool_call_preamble_text=opencode_client,
+                                                    committed_stream_ids=(
+                                                        stream_committed_stream
+                                                    ),
                                                 ),
-                                                assistant_tool_calls=(
-                                                    assistant_tool_calls
+                                                batch_key=(
+                                                    f"postcommit.stream.inline:"
+                                                    f"{session_id or 'stateless'}"
                                                 ),
-                                                thinking_enabled=thinking_enabled,
-                                                reasoning_effort=reasoning_effort,
-                                                policy_fingerprint=postcommit_policy_fingerprint,
-                                                tool_specs=postcommit_tool_specs,
-                                                keep_live_ref=session_keep_live_ref,
-                                                tool_prompt_mode=postcommit_tool_prompt_mode,
-                                                strip_tool_call_preamble_text=opencode_client,
-                                                committed_stream_ids=(
-                                                    stream_committed_stream
-                                                ),
-                                            ),
-                                            batch_key=(
-                                                f"postcommit.stream.inline:"
-                                                f"{session_id or 'stateless'}"
-                                            ),
-                                        ).result()
+                                            ).result()
                                     elif generated.get("_final_state") is None:
                                         # Batched AR has no generation-final cache
                                         # state to install. Do not queue this known

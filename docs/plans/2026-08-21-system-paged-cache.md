@@ -277,7 +277,7 @@ to reach it.
   selector/MLA/mHC/Trellis geometry, exact phase callables, and finite prewarm
   signatures.
 - The pinned DFlash dependency is
-  `b5638db3794327dadba33c9f3aaa4c2610b28b0c`.  Its fixed-linear lane has direct
+  `54644e991039110f30140006c892c57734b9311e`.  Its fixed-linear lane has direct
   chunked prefill and M6 decode/verification, streaming structured taps,
   asynchronous next proposal, direct unarmed acceptance restore, and no
   adaptive, CopySpec, snapshot, diagnostic, cache-clear, or fallback work in
@@ -329,3 +329,32 @@ immutable-plan/no-fallback/no-hot-validation constraints.  Push DFlash2 and
 MTPLX commits, correct draft PR #312 to name the Mia/Sero artifact and exact
 revisions, attach only valid receipts, and make it ready once every requested
 gate passes.
+
+## Task 13: Close the live serving audit
+
+The final server audit found two request-lifecycle defects that the standalone
+exact-model receipts did not exercise.  Close them without changing target or
+draft arithmetic:
+
+1. Bind DSpark to an explicit no-retokenized-cache-postcommit route.  The
+   fixed-linear DFlash lane does not publish restorable prefix snapshots, so a
+   generic SessionBank rebuild would create unusable references into Mia's
+   reset-on-release singleton arena.  Preserve the logical EngineSession, but
+   skip every direct, async, recursive, nonstream, and streaming-inline model
+   postcommit before tokenizer or model work begins.
+2. Extend the shared DFlash request contract with an immutable per-request
+   prefill chunk size and a cancellation callback.  Poll cancellation only
+   after settled prefill chunks and before speculative decode cycles; do not
+   add per-token checks or change the selected fixed-linear loop.
+3. Make DFlash session construction exception-safe after target-cache
+   acquisition, including draft construction and generic sparse-RoPE setup.
+   Adapter-owned Mia target and draft acquisitions must also unwind if their
+   returned layout validation fails.
+4. Pin and install the resulting DFlash commit before MTPLX can pass its real
+   imported-runtime signature and source-identity gates.
+
+Verification is limited to the directly affected DFlash runtime, adapter,
+dependency-identity, and OpenAI route tests plus focused lint and diff checks.
+The published long-model receipts remain tied to the earlier inference-core
+pin; do not rerun them because these changes affect serving control and failure
+cleanup, not model arithmetic, cache layout, or dispatch geometry.

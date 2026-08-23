@@ -193,6 +193,87 @@ def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
     assert capabilities.supports_tree_verify is False
 
 
+def test_target_ops_releases_cache_when_acquired_layout_is_invalid() -> None:
+    model = _FakeDeepseekTarget()
+    invalid_cache = [object()]
+    plan = _seal_fake_target(
+        model,
+        target_cache_factory=lambda: invalid_cache,
+    )
+    ops = DeepseekV4TargetOps(model)
+
+    with pytest.raises(
+        ValueError,
+        match="requires Mia stock432 target caches",
+    ):
+        ops.make_cache(
+            model,
+            enable_speculative_linear_cache=True,
+        )
+
+    assert plan.released_target_caches == [invalid_cache]
+
+
+def test_target_ops_preserves_validation_error_when_cache_release_fails() -> None:
+    model = _FakeDeepseekTarget()
+    invalid_cache = [object()]
+    plan = _seal_fake_target(
+        model,
+        target_cache_factory=lambda: invalid_cache,
+    )
+
+    def fail_release(caches) -> None:
+        plan.released_target_caches.append(caches)
+        raise RuntimeError("target release failed")
+
+    plan.release_target_cache = fail_release
+    ops = DeepseekV4TargetOps(model)
+
+    with pytest.raises(
+        ValueError,
+        match="requires Mia stock432 target caches",
+    ) as exc_info:
+        ops.make_cache(
+            model,
+            enable_speculative_linear_cache=True,
+        )
+
+    assert plan.released_target_caches == [invalid_cache]
+    assert any(
+        "target cache release also failed: RuntimeError: target release failed" in note
+        for note in getattr(exc_info.value, "__notes__", ())
+    )
+
+
+def test_target_ops_cleanup_attempts_both_arena_releases() -> None:
+    model = _FakeDeepseekTarget()
+    ops = DeepseekV4TargetOps(model)
+    target_cache = [object()]
+    draft_cache = [object()]
+    releases = []
+
+    def fail_target_release(caches) -> None:
+        releases.append(("target", caches))
+        raise RuntimeError("target release failed")
+
+    def fail_draft_release(caches) -> None:
+        releases.append(("draft", caches))
+        raise RuntimeError("draft release failed")
+
+    ops._release_target_cache = fail_target_release
+    ops._release_draft_cache = fail_draft_release
+
+    with pytest.raises(RuntimeError, match="target release failed") as exc_info:
+        ops.cleanup_generation_caches(target_cache, draft_cache)
+
+    assert releases == [("target", target_cache), ("draft", draft_cache)]
+    assert any(
+        "additional generation cache release failed: "
+        "RuntimeError: draft release failed" in note
+        for note in getattr(exc_info.value, "__notes__", ())
+    )
+
+
 class _FakeDSparkAttention:
     window_size = 128
     head_dim = 512
@@ -316,6 +397,56 @@ def test_draft_adapter_advertises_m6_but_projects_three_dspark_taps() -> None:
         40.0,
         41.0,
         42.0,
+    )
+
+
+def test_draft_backend_releases_cache_when_acquired_layout_is_invalid() -> None:
+    target, owner = _fake_dspark_target()
+    invalid_cache = [object(), object(), object()]
+    owner.make_cache = lambda: invalid_cache
+    draft = DeepseekV4DSparkDraftAdapter(target)
+    backend = DeepseekV4DSparkBackend()
+
+    with pytest.raises(
+        ValueError,
+        match="must start empty in Mia stock432 format",
+    ):
+        backend.make_cache(
+            draft_model=draft,
+            sink_size=0,
+            window_size=128,
+        )
+
+    assert owner.released_mia_caches == [invalid_cache]
+
+
+def test_draft_backend_preserves_validation_error_when_cache_release_fails() -> None:
+    target, owner = _fake_dspark_target()
+    invalid_cache = [object(), object(), object()]
+    owner.make_cache = lambda: invalid_cache
+
+    def fail_release(caches) -> None:
+        owner.released_mia_caches.append(caches)
+        raise RuntimeError("draft release failed")
+
+    owner.release_mia_cache = fail_release
+    draft = DeepseekV4DSparkDraftAdapter(target)
+    backend = DeepseekV4DSparkBackend()
+
+    with pytest.raises(
+        ValueError,
+        match="must start empty in Mia stock432 format",
+    ) as exc_info:
+        backend.make_cache(
+            draft_model=draft,
+            sink_size=0,
+            window_size=128,
+        )
+
+    assert owner.released_mia_caches == [invalid_cache]
+    assert any(
+        "draft cache release also failed: RuntimeError: draft release failed" in note
+        for note in getattr(exc_info.value, "__notes__", ())
     )
 
 
@@ -591,6 +722,10 @@ def test_generation_adapter_translates_existing_dflash_events_without_scheduling
 
     monkeypatch.setattr(adapter_module, "_stream_dflash_generate", fake_stream)
     callback_tokens = []
+
+    def should_cancel() -> bool:
+        return False
+
     bundle, context = _fake_generation_bundle(
         SimpleNamespace(decode=lambda values: f"decoded:{values}")
     )
@@ -600,6 +735,8 @@ def test_generation_adapter_translates_existing_dflash_events_without_scheduling
         [1, 2, 3],
         max_tokens=2,
         token_callback=callback_tokens.append,
+        prefill_step_size=256,
+        should_cancel=should_cancel,
         runtime_context=context,
     )
 
@@ -624,6 +761,8 @@ def test_generation_adapter_translates_existing_dflash_events_without_scheduling
     assert calls[0]["block_tokens"] == 6
     assert calls[0]["prompt_tokens_override"] == [1, 2, 3]
     assert calls[0]["quantize_kv_cache"] is False
+    assert calls[0]["prefill_step_size"] == 256
+    assert calls[0]["should_cancel"] is should_cancel
 
 
 def test_generation_adapter_stops_at_first_stop_token_and_suppresses_suffix(
