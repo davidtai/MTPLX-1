@@ -8,25 +8,51 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "boundary_norm_calls": 0,
-      "decode_tok_s": 52.965553196612234,
-      "draft_time_s": 3.1866911322285887,
+      "decode_tok_s": 53.324886640549686,
+      "draft_time_s": 3.175551454827655,
       "drafted_by_depth": [
         293,
         292,
         292
       ],
-      "dual_norm_calls": 0,
+      "engagement": {
+        "dual_norm": {
+          "calls": 0
+        },
+        "gdn_projection_pairs": {
+          "configured_modules": 0,
+          "four_to_one_calls": 0,
+          "fused_pair_calls": 0,
+          "stock_calls": 7488
+        },
+        "packed_qkv": {
+          "attention_fused_modules": 0,
+          "fused_attention_calls": 0,
+          "fused_mlp_calls": 0,
+          "mlp_fused_modules": 0,
+          "skipped_modules": 0
+        },
+        "qmv_final": {},
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
+        }
+      },
+      "feature_receipt": {},
       "generated_tokens": 1024,
+      "installed_route_id": "control",
       "kernel_ids": [],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 22.774539707956137,
-      "prefill_tok_s": 719.3998302532699,
+      "prefill_time_s": 22.287618957983796,
+      "prefill_tok_s": 735.1166596524649,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.48491912498138845,
-      "qk_rms_rope_calls": 0,
-      "qmv_counts": {},
+      "prompt_mtp_history_time_s": 0.47320850094547495,
       "route_fingerprint": "1abdc2385f20480ec8edbbbc10ed9d1b1c581e8ec345e14a32158c73ef475cd0",
       "route_id": "control",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -1056,7 +1082,7 @@
         14755,
         93873
       ],
-      "wall_s": 42.59399150000536
+      "wall_s": 41.96506870901794
     },
     {
       "accepted_by_depth": [
@@ -1066,28 +1092,54 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "boundary_norm_calls": 0,
-      "decode_tok_s": 51.39324696264284,
-      "draft_time_s": 3.2346883297141176,
+      "decode_tok_s": 53.25782764710021,
+      "draft_time_s": 3.178801953938091,
       "drafted_by_depth": [
         293,
         292,
         292
       ],
-      "dual_norm_calls": 0,
+      "engagement": {
+        "dual_norm": {
+          "calls": 0
+        },
+        "gdn_projection_pairs": {
+          "configured_modules": 0,
+          "four_to_one_calls": 0,
+          "fused_pair_calls": 0,
+          "stock_calls": 7488
+        },
+        "packed_qkv": {
+          "attention_fused_modules": 0,
+          "fused_attention_calls": 0,
+          "fused_mlp_calls": 0,
+          "mlp_fused_modules": 0,
+          "skipped_modules": 0
+        },
+        "qmv_final": {},
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
+        }
+      },
+      "feature_receipt": {},
       "generated_tokens": 1024,
+      "installed_route_id": "kv_only_history",
       "kernel_ids": [
         "qwen38_mtp_kv_only_history_ge16384_v1"
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 21.17728466799599,
-      "prefill_tok_s": 773.6591473769154,
+      "prefill_time_s": 21.22990870696958,
+      "prefill_tok_s": 771.7414250877719,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.11582912504673004,
-      "qk_rms_rope_calls": 0,
-      "qmv_counts": {},
-      "route_fingerprint": "c19da7c501e6f7bec90146fb1e85d6cd6694ed5905222a096260d17f4197da06",
+      "prompt_mtp_history_time_s": 0.0962289169547148,
+      "route_fingerprint": "cdb3006d1ae66b4d783f0ed08cdc75c16e8611660f023000a4569163cac3e716",
       "route_id": "kv_only_history",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
       "tokens": [
@@ -2116,7 +2168,7 @@
         14755,
         93873
       ],
-      "wall_s": 41.219108499994036
+      "wall_s": 40.5545962920005
     },
     {
       "accepted_by_depth": [
@@ -2126,28 +2178,54 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "boundary_norm_calls": 0,
-      "decode_tok_s": 51.401284760585334,
-      "draft_time_s": 3.226807932544034,
+      "decode_tok_s": 51.831164394950555,
+      "draft_time_s": 3.2178526563220657,
       "drafted_by_depth": [
         293,
         292,
         292
       ],
-      "dual_norm_calls": 0,
+      "engagement": {
+        "dual_norm": {
+          "calls": 0
+        },
+        "gdn_projection_pairs": {
+          "configured_modules": 0,
+          "four_to_one_calls": 0,
+          "fused_pair_calls": 0,
+          "stock_calls": 7488
+        },
+        "packed_qkv": {
+          "attention_fused_modules": 0,
+          "fused_attention_calls": 0,
+          "fused_mlp_calls": 0,
+          "mlp_fused_modules": 0,
+          "skipped_modules": 0
+        },
+        "qmv_final": {},
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
+        }
+      },
+      "feature_receipt": {},
       "generated_tokens": 1024,
+      "installed_route_id": "kv_only_history",
       "kernel_ids": [
         "qwen38_mtp_kv_only_history_ge16384_v1"
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 21.27175420994172,
-      "prefill_tok_s": 770.2232659468516,
+      "prefill_time_s": 20.878058458009036,
+      "prefill_tok_s": 784.7472998005201,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.11156808398663998,
-      "qk_rms_rope_calls": 0,
-      "qmv_counts": {},
-      "route_fingerprint": "c19da7c501e6f7bec90146fb1e85d6cd6694ed5905222a096260d17f4197da06",
+      "prompt_mtp_history_time_s": 0.09525779201067053,
+      "route_fingerprint": "cdb3006d1ae66b4d783f0ed08cdc75c16e8611660f023000a4569163cac3e716",
       "route_id": "kv_only_history",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
       "tokens": [
@@ -3176,7 +3254,7 @@
         14755,
         93873
       ],
-      "wall_s": 41.30623787501827
+      "wall_s": 40.73098708302132
     },
     {
       "accepted_by_depth": [
@@ -3186,25 +3264,51 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "boundary_norm_calls": 0,
-      "decode_tok_s": 51.48283155871509,
-      "draft_time_s": 3.229352351219859,
+      "decode_tok_s": 51.82779483386046,
+      "draft_time_s": 3.2884383963537402,
       "drafted_by_depth": [
         293,
         292,
         292
       ],
-      "dual_norm_calls": 0,
+      "engagement": {
+        "dual_norm": {
+          "calls": 0
+        },
+        "gdn_projection_pairs": {
+          "configured_modules": 0,
+          "four_to_one_calls": 0,
+          "fused_pair_calls": 0,
+          "stock_calls": 7488
+        },
+        "packed_qkv": {
+          "attention_fused_modules": 0,
+          "fused_attention_calls": 0,
+          "fused_mlp_calls": 0,
+          "mlp_fused_modules": 0,
+          "skipped_modules": 0
+        },
+        "qmv_final": {},
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
+        }
+      },
+      "feature_receipt": {},
       "generated_tokens": 1024,
+      "installed_route_id": "control",
       "kernel_ids": [],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 21.182938876008848,
-      "prefill_tok_s": 773.4526401601441,
+      "prefill_time_s": 21.0351044179406,
+      "prefill_tok_s": 778.8884559102199,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.4471977510256693,
-      "qk_rms_rope_calls": 0,
-      "qmv_counts": {},
+      "prompt_mtp_history_time_s": 0.4512143339961767,
       "route_fingerprint": "1abdc2385f20480ec8edbbbc10ed9d1b1c581e8ec345e14a32158c73ef475cd0",
       "route_id": "control",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -4234,13 +4338,13 @@
         14755,
         93873
       ],
-      "wall_s": 41.52147466599126
+      "wall_s": 41.24532045898377
     }
   ],
-  "candidate_improvement_pct": 1.9268259520638376,
+  "candidate_improvement_pct": 2.3679547012654734,
   "candidate_route_id": "kv_only_history",
   "context_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-challenge-port/mtplx/generation.py",
-  "context_sha256": "fdb50c31c4906056a1465e6d7e958098ea2fc749a8803eeceaec40323766b80d",
+  "context_sha256": "1e542f0e0f2db9dae9d404976936d1f43743ef855148121cca4abd530370d8dd",
   "control_route_id": "control",
   "correctness": {
     "cross_route_schedule_exact": true,
@@ -4251,16 +4355,18 @@
     "per_route_deterministic": {
       "control": true,
       "kv_only_history": true
-    }
+    },
+    "schedule_capture": "depth_histograms"
   },
-  "created_at": "2026-08-23T16:14:12Z",
+  "created_at": "2026-08-23T18:25:00Z",
   "draft_temperature": 1.0,
   "exact": true,
+  "gpu_lock_scope": "attested_parent",
   "kind": "qwen38_challenge_port_gate",
   "max_tokens": 1024,
   "mean_wall_s": {
-    "control": 42.05773308299831,
-    "kv_only_history": 41.26267318750615
+    "control": 41.605194584000856,
+    "kv_only_history": 40.64279168751091
   },
   "mlx_version": "0.32.0",
   "model": "/Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
@@ -4284,7 +4390,7 @@
           640
         ]
       },
-      "elapsed_s": 0.07906641700537875,
+      "elapsed_s": 0.07887624998693354,
       "original": {
         "bits": 8,
         "group_size": 64,
@@ -4364,59 +4470,21 @@
     "control"
   ],
   "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "promotion": {
+    "errors": [],
+    "passed": true,
+    "threshold_pct": 0.05
+  },
   "prompt_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-challenge-port/mtplx/benchmarks/prompts/python_modules_long.jsonl",
   "prompt_id": "python_modules_long_high_acceptance",
+  "prompt_token_sha256": "bcc68c63e11c676d87f2772ab8a5781c16cf2f97d581c0f4233d337a5c706186",
   "prompt_token_target": 16384,
   "prompt_tokens": 16384,
   "python": "3.12.13",
   "schedule_exact": true,
   "seed": 42,
-  "source_commit": "983e171bf00d1ac6b4fd661785fccf8c31e2be6b",
-  "source_status": [
-    " M docs/perf/qwen38-challenge-port-ledger.md",
-    " D docs/perf/receipts/qwen38-challenge-port/compact-head-python-100t-abba-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/compact-head-python-100t-baab-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/kv-only-history-512t-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/kv-only-history-512t-baab-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/kv-only-history-64t-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/kv-only-history-64t-baab-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/kv-only-history-python-100t-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/kv-only-history-python-100t-baab-2026-08-23.json",
-    " D docs/perf/receipts/qwen38-challenge-port/kv-only-history-short-2026-08-23.json",
-    " M docs/plans/2026-08-23-qwen38-challenge-port.md",
-    " M mtplx/attention_context.py",
-    " M mtplx/generation.py",
-    " M mtplx/mtp_patch.py",
-    " M mtplx/nax_verify.py",
-    " M mtplx/qwen38_challenge.py",
-    " D mtplx/qwen38_compact_head.py",
-    " M mtplx/runtime.py",
-    " D scripts/build_qwen38_compact_head.py",
-    " M scripts/qwen38_challenge_port_gate.py",
-    " M tests/test_mtp_depth_n.py",
-    " M tests/test_qwen38_challenge_contract.py",
-    " D tests/test_qwen38_compact_head.py",
-    " M uv.lock",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r21-qk-rope-stack-s1-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r21-qk-rope-stack-s1-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r45-boundary-stack-s1-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r45-boundary-stack-s1-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r61-dual-norm-stack-s1-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r61-dual-norm-stack-s1-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r80-qmv-stack-s1-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r80-qmv-stack-s1-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r82-compact-stack-s1-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/chrono-r82-compact-stack-s1-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/conditioned-r61-dual-stack-s1-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/conditioned-s1-kv-ge16384-direct-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/conditioned-s1-kv-ge16384-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/conditioned-s1-kv-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/conditioned-s1-kv-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/qmv-final-g32-g64-real-model-numeric-parity-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/turbo-kv-only-history-python-long1024in-1024out-t1-abba-2026-08-23.json",
-    "?? docs/perf/receipts/qwen38-challenge-port/turbo-kv-only-history-python-long16384in-1024out-t1-abba-2026-08-23.json",
-    "?? tests/test_qwen38_challenge_gate.py"
-  ],
+  "source_commit": "4f02535633e55e7fd6cc8e6203e52d518d7d5bde",
+  "source_status": [],
   "target_temperature": 1.0,
   "token_exact": true,
   "warmups": [
@@ -4428,25 +4496,51 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "boundary_norm_calls": 0,
-      "decode_tok_s": 51.999570533272575,
-      "draft_time_s": 3.213795364339603,
+      "decode_tok_s": 51.06726341305149,
+      "draft_time_s": 3.245116735837655,
       "drafted_by_depth": [
         293,
         292,
         292
       ],
-      "dual_norm_calls": 0,
+      "engagement": {
+        "dual_norm": {
+          "calls": 0
+        },
+        "gdn_projection_pairs": {
+          "configured_modules": 0,
+          "four_to_one_calls": 0,
+          "fused_pair_calls": 0,
+          "stock_calls": 7536
+        },
+        "packed_qkv": {
+          "attention_fused_modules": 0,
+          "fused_attention_calls": 0,
+          "fused_mlp_calls": 0,
+          "mlp_fused_modules": 0,
+          "skipped_modules": 0
+        },
+        "qmv_final": {},
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
+        }
+      },
+      "feature_receipt": {},
       "generated_tokens": 1024,
+      "installed_route_id": "control",
       "kernel_ids": [],
       "peak_memory_bytes": 26720356422,
       "peak_memory_gib": 24.885271137580276,
-      "prefill_time_s": 19.653982793010073,
-      "prefill_tok_s": 833.6223844577171,
+      "prefill_time_s": 19.84322591597447,
+      "prefill_tok_s": 825.672200144147,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.4361221250437666,
-      "qk_rms_rope_calls": 0,
-      "qmv_counts": {},
+      "prompt_mtp_history_time_s": 0.4306352910352871,
       "route_fingerprint": "1abdc2385f20480ec8edbbbc10ed9d1b1c581e8ec345e14a32158c73ef475cd0",
       "route_id": "control",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
@@ -5476,7 +5570,7 @@
         14755,
         93873
       ],
-      "wall_s": 39.78910133300815
+      "wall_s": 40.34104370800196
     },
     {
       "accepted_by_depth": [
@@ -5486,28 +5580,54 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "boundary_norm_calls": 0,
-      "decode_tok_s": 50.84165666376107,
-      "draft_time_s": 3.2630614807712846,
+      "decode_tok_s": 51.36731243873596,
+      "draft_time_s": 3.258492638968164,
       "drafted_by_depth": [
         293,
         292,
         292
       ],
-      "dual_norm_calls": 0,
+      "engagement": {
+        "dual_norm": {
+          "calls": 0
+        },
+        "gdn_projection_pairs": {
+          "configured_modules": 0,
+          "four_to_one_calls": 0,
+          "fused_pair_calls": 0,
+          "stock_calls": 7488
+        },
+        "packed_qkv": {
+          "attention_fused_modules": 0,
+          "fused_attention_calls": 0,
+          "fused_mlp_calls": 0,
+          "mlp_fused_modules": 0,
+          "skipped_modules": 0
+        },
+        "qmv_final": {},
+        "source_proposal": {
+          "e87_probe_calls": 0,
+          "k_island_calls": 0,
+          "q_island_calls": 0,
+          "row_top32_calls": 0,
+          "selected_q4_rerank_calls": 0,
+          "selector_calls": 0,
+          "v_island_calls": 0
+        }
+      },
+      "feature_receipt": {},
       "generated_tokens": 1024,
+      "installed_route_id": "kv_only_history",
       "kernel_ids": [
         "qwen38_mtp_kv_only_history_ge16384_v1"
       ],
       "peak_memory_bytes": 26720356472,
       "peak_memory_gib": 24.885271184146404,
-      "prefill_time_s": 21.150398414058145,
-      "prefill_tok_s": 774.6426180373965,
+      "prefill_time_s": 21.759611166955438,
+      "prefill_tok_s": 752.9546311416196,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.105319167021662,
-      "qk_rms_rope_calls": 0,
-      "qmv_counts": {},
-      "route_fingerprint": "c19da7c501e6f7bec90146fb1e85d6cd6694ed5905222a096260d17f4197da06",
+      "prompt_mtp_history_time_s": 0.09291483496781439,
+      "route_fingerprint": "cdb3006d1ae66b4d783f0ed08cdc75c16e8611660f023000a4569163cac3e716",
       "route_id": "kv_only_history",
       "token_hash": "d844e2af1876f1925ce9b0765f719126707030fd37386e186f5341020d0cc13c",
       "tokens": [
@@ -6536,7 +6656,7 @@
         14755,
         93873
       ],
-      "wall_s": 41.397894624999026
+      "wall_s": 41.7885865829885
     }
   ]
 }
