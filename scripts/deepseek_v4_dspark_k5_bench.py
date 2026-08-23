@@ -7,6 +7,7 @@ import argparse
 import gc
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -296,11 +297,93 @@ def _prompt_ids(bundle, text: str, target_tokens: int | None = None) -> list[int
     ]
 
 
+def _python_vocabulary_prompt_ids(
+    tokenizer,
+    *,
+    context_tokens: int,
+    python_prompt_tokens: int = 1_024,
+) -> tuple[list[int], dict]:
+    """Build a near-one-pass vocabulary prefix plus a coherent Python tail."""
+
+    from mtplx.benchmarks.programming_prompts import (
+        build_unique_programming_context,
+    )
+
+    context_tokens = int(context_tokens)
+    python_prompt_tokens = int(python_prompt_tokens)
+    if python_prompt_tokens <= 0 or context_tokens < python_prompt_tokens:
+        raise ValueError(
+            "Python vocabulary prompt requires context >= positive tail size"
+        )
+    python_text = build_unique_programming_context()
+    encoded_python = [int(value) for value in tokenizer.encode(python_text)]
+    if len(encoded_python) < python_prompt_tokens:
+        raise ValueError(
+            "unique Python repository prompt is shorter than the requested tail"
+        )
+    python_tail = encoded_python[-python_prompt_tokens:]
+
+    base_vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    full_vocab = get_vocab() if callable(get_vocab) else {}
+    vocab_size = max(
+        base_vocab_size,
+        max((int(value) for value in full_vocab.values()), default=-1) + 1,
+    )
+    if vocab_size <= 0:
+        raise ValueError("tokenizer does not expose a positive vocabulary size")
+    special_ids = {
+        int(value)
+        for value in (getattr(tokenizer, "all_special_ids", ()) or ())
+        if 0 <= int(value) < vocab_size
+    }
+    if len(special_ids) >= vocab_size:
+        raise ValueError("tokenizer vocabulary contains no normal token ids")
+
+    digest = hashlib.sha256(
+        json.dumps(python_tail, separators=(",", ":")).encode()
+    ).digest()
+    start = int.from_bytes(digest[:8], "little") % vocab_size
+    step = 65_537 % vocab_size
+    if step == 0:
+        step = 1
+    while math.gcd(step, vocab_size) != 1:
+        step += 1
+
+    filler_target = context_tokens - python_prompt_tokens
+    filler: list[int] = []
+    cursor = 0
+    while len(filler) < filler_target:
+        token_id = (start + (cursor % vocab_size) * step) % vocab_size
+        cursor += 1
+        if token_id not in special_ids:
+            filler.append(token_id)
+    token_ids = filler + python_tail
+    filler_unique = len(set(filler))
+    return token_ids, {
+        "prompt_policy": "python_vocab_tail_v1",
+        "prompt_context_tokens": context_tokens,
+        "prompt_actual_tokens": len(token_ids),
+        "python_prompt_tokens": python_prompt_tokens,
+        "python_prompt_source_tokens": len(encoded_python),
+        "python_prompt_sha256": hashlib.sha256(python_text.encode()).hexdigest(),
+        "vocabulary_size": vocab_size,
+        "vocabulary_base_size": base_vocab_size,
+        "vocabulary_special_ids_excluded": len(special_ids),
+        "vocabulary_permutation_step": step,
+        "vocabulary_filler_tokens": len(filler),
+        "vocabulary_unique_ids": filler_unique,
+        "vocabulary_duplicate_ids": len(filler) - filler_unique,
+        "prompt_token_sha256": _token_digest(token_ids),
+    }
+
+
 def _arm_payload(
     output,
     *,
     total_prompt_tokens: int,
     new_prefill_tokens: int | None = None,
+    ttft_s: float | None = None,
 ) -> dict:
     stats = output.stats.to_dict()
     total_prompt_tokens = int(total_prompt_tokens)
@@ -320,6 +403,8 @@ def _arm_payload(
             new_prefill_tokens / prompt_time if prompt_time > 0 else 0.0
         ),
         "prefill_tok_s_token_basis": "new_prefill_tokens",
+        "ttft_s": None if ttft_s is None else float(ttft_s),
+        "ttft_scope": "request_start_through_first_emitted_token",
         "decode_time_s": stats["decode_elapsed_s"],
         "elapsed_s": stats["elapsed_s"],
         "decode_tok_s": stats["decode_tok_s"],
@@ -355,17 +440,29 @@ def _target_ar(bundle, prompt_ids: list[int], max_tokens: int) -> dict:
 def _dspark(bundle, prompt_ids: list[int], max_tokens: int, context) -> dict:
     from mtplx.deepseek_v4_dflash2 import generate_deepseek_v4_dflash2
 
+    request_started = time.perf_counter()
+    first_token_s = None
+
+    def record_first_token(_token_ids: list[int]) -> None:
+        nonlocal first_token_s
+        if first_token_s is None:
+            first_token_s = time.perf_counter()
+
     output = generate_deepseek_v4_dflash2(
         bundle,
         prompt_ids,
         max_tokens=max_tokens,
         stop_token_ids=[],
         runtime_context=context,
+        token_callback=record_first_token,
     )
     return _arm_payload(
         output,
         total_prompt_tokens=len(prompt_ids),
         new_prefill_tokens=len(prompt_ids),
+        ttft_s=(
+            None if first_token_s is None else first_token_s - request_started
+        ),
     )
 
 
@@ -457,6 +554,12 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--prompt-tokens", type=int)
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("repeat", "python-vocab"),
+        default="repeat",
+    )
+    parser.add_argument("--python-prompt-tokens", type=int, default=1_024)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
@@ -488,7 +591,21 @@ def main() -> int:
     mlx_active_after_load = _memory("get_active_memory")
     mlx_peak_after_load = _memory("get_peak_memory")
     process_peak_rss_after_load = _process_peak_rss_bytes()
-    prompt_ids = _prompt_ids(bundle, args.prompt, args.prompt_tokens)
+    if args.prompt_mode == "python-vocab":
+        if args.prompt_tokens is None:
+            raise ValueError("--prompt-mode python-vocab requires --prompt-tokens")
+        prompt_ids, prompt_metadata = _python_vocabulary_prompt_ids(
+            bundle.tokenizer,
+            context_tokens=args.prompt_tokens,
+            python_prompt_tokens=args.python_prompt_tokens,
+        )
+    else:
+        prompt_ids = _prompt_ids(bundle, args.prompt, args.prompt_tokens)
+        prompt_metadata = {
+            "prompt_policy": "repeat_hard_truncate",
+            "prompt_context_tokens": len(prompt_ids),
+            "prompt_actual_tokens": len(prompt_ids),
+        }
     requested_span_tokens = len(prompt_ids) + max(0, int(args.max_tokens))
     os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(requested_span_tokens)
     common = {
@@ -528,6 +645,7 @@ def main() -> int:
         ),
         "guard_window_id": guard["window_id"],
         "source_head": source_commit,
+        "prompt": prompt_metadata,
         **_cache_contract(
             bundle,
             requested_span_tokens=requested_span_tokens,

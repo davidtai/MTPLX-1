@@ -47,16 +47,57 @@ def test_dspark_payload_counts_its_summary_prompt_as_new_prefill(monkeypatch) ->
         events=[{"type": "summary", "prompt_token_count": 3}],
         new_prefill_tokens=0,
     )
+    def fake_generate(*_args, **kwargs):
+        kwargs["token_callback"]([7])
+        return output
+
     monkeypatch.setattr(
         "mtplx.deepseek_v4_dflash2.generate_deepseek_v4_dflash2",
-        lambda *_args, **_kwargs: output,
+        fake_generate,
     )
+    clock = iter((10.0, 12.5))
+    monkeypatch.setattr(bench.time, "perf_counter", lambda: next(clock))
 
     receipt = bench._dspark(object(), [10, 11, 12], 1, object())
 
     assert receipt["prompt_tokens"] == 3
     assert receipt["new_prefill_tokens"] == 3
     assert receipt["prefill_tok_s"] == 6.0
+    assert receipt["ttft_s"] == 2.5
+
+
+def test_python_vocabulary_prompt_uses_unique_normal_ids_before_exact_tail(
+    monkeypatch,
+) -> None:
+    class Tokenizer:
+        vocab_size = 20
+        all_special_ids = (0, 19)
+
+        @staticmethod
+        def encode(_text):
+            return list(range(10, 18))
+
+    monkeypatch.setattr(
+        "mtplx.benchmarks.programming_prompts.build_unique_programming_context",
+        lambda **_kwargs: "coherent unique Python repository task",
+    )
+
+    token_ids, metadata = bench._python_vocabulary_prompt_ids(
+        Tokenizer(),
+        context_tokens=20,
+        python_prompt_tokens=8,
+    )
+
+    filler = token_ids[:-8]
+    assert len(token_ids) == 20
+    assert token_ids[-8:] == list(range(10, 18))
+    assert len(filler) == len(set(filler))
+    assert not set(filler) & {0, 19}
+    assert metadata["prompt_policy"] == "python_vocab_tail_v1"
+    assert metadata["python_prompt_tokens"] == 8
+    assert metadata["vocabulary_filler_tokens"] == 12
+    assert metadata["vocabulary_unique_ids"] == 12
+    assert metadata["vocabulary_duplicate_ids"] == 0
 
 
 def test_mia_committed_token_divergence_is_always_enforced(monkeypatch) -> None:
