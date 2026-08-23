@@ -176,7 +176,6 @@ def _validate_route_id(route_id: str) -> set[str]:
         "dual_norm",
         "source_proposal",
         "r08_device_draft",
-        "r09_paired_qmv",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -193,15 +192,12 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
     source_rows: list[int] = []
     if "r08_device_draft" in features:
         source_rows.append(8)
-    if "r09_paired_qmv" in features:
-        source_rows.append(9)
     return {
         "cache_route": (
             "kv_only_history" if "kv_only_history" in features else "control"
         ),
         "dual_norm": "dual_norm" in features,
         "source_proposal": "source_proposal" in features,
-        "row9_paired_qmv": "r09_paired_qmv" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -248,15 +244,11 @@ def _promotion_decision(
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
-    from mtplx.qwen38_challenge_kernels import (
-        qwen38_dual_norm_counter_snapshot,
-        qwen38_row9_qmv_counter_snapshot,
-    )
+    from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
-        "r09_paired_qmv": {"calls": qwen38_row9_qmv_counter_snapshot()},
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -375,7 +367,6 @@ def _run_arm(
         cache_route=str(options["cache_route"]),
         dual_norm=bool(options["dual_norm"]),
         source_proposal=bool(options["source_proposal"]),
-        row9_paired_qmv=bool(options["row9_paired_qmv"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

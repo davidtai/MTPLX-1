@@ -38,9 +38,11 @@ Means are two timed arms per route; peak is the maximum timed arm.
 | 3 | + packed target Q/K/V | 761.534 | 46.971 | 25.569 | 43.785 | **-4.0629%** | REJECTED, removed | same |
 | 8 | Optimized-Speed main + rows 2-7 dispositions | 750.099 | 52.478 | 24.885 | 41.870 | - | cumulative control | `chrono-r08-device-draft-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 8 | + device-resident fixed-D3 draft chain | 779.772 | 54.038 | 24.885 | 40.413 | **+3.6049%** | **RETAINED** | same |
+| 9 | Optimized-Speed main + retained row 8 | 744.715 | 52.555 | 24.885 | 41.977 | - | cumulative control | `chrono-r09-paired-qmv-g32-m4-on-r08-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 9 | + paired G32/M4 target QMV | 761.698 | 47.465 | 24.885 | 43.651 | **-3.8350%** | REJECTED, remove | same |
 
-Row 8 is therefore part of every later timed control. Row 9's pending gate is
-`r08_device_draft` versus `r08_device_draft+r09_paired_qmv`.
+Row 8 is therefore part of every later timed control. Row 9 regressed despite
+82,880 timed kernel engagements, so row 10's control remains row 8 alone.
 
 ## Exact 54-row campaign state
 
@@ -57,7 +59,7 @@ row or from the earlier bundle campaign.
 | 6 | 37 | 1.7673% | `5c2441b5f08b` | `061942094f64` | +10/-8 | TARGET-SHAPE NO-OP: there is no second target argmax consumer to reuse under top-k20 sampling. Exact proof pending. |
 | 7 | 38 | 20.4283% | `fe8829244cd9` | `9e25f5798c47` | +227/-22 | ALREADY PRESENT: persistent committed MTP history. Row-8 receipt exercises it; focused proof pending. |
 | 8 | 41 | 17.9183% | `11670086c1b9` | `52c2ac2b4934` | +901/-822 | RETAINED: missing device-resident D3 draft-chain adaptation, +3.6049%. |
-| 9 | 55 | 6.8764% | `b6c725144b56` | `9193949c4c87` | +340/-0 | PORTED FOR GATE: adjacent-row shared-weight QMV adapted from source G64 to live target G32/M4; parity/unit gates pass; 16K ABBA pending. |
+| 9 | 55 | 6.8764% | `b6c725144b56` | `9193949c4c87` | +340/-0 | REJECTED: adjacent-row shared-weight QMV adapted from source G64 to live target G32/M4; parity passed, but 16K wall regressed 3.8350% on row 8. |
 | 10 | 59 | 5.3467% | `61936f26547d` | `c44c6fd53fb6` | +89/-7 | PENDING |
 | 11 | 63 | 5.7425% | `62174dbbca88` | `40a33f553244` | +230/-16 | PENDING |
 | 12 | 70 | 0.8266% | `09eda55a08b1` | `96bb2be6fbe1` | +304/-24 | PENDING |

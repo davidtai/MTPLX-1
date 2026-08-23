@@ -13,33 +13,8 @@ from mtplx.nax_verify import (
     nax_available,
     nax_qmm_m4,
     nax_qmm_m16,
-    register_qwen38_qmv_dispatch,
     uninstall_nax_qlinear_patch,
 )
-
-
-def test_qwen38_candidate_dispatch_precedes_the_general_m4_kernel() -> None:
-    report = install_nax_qlinear_patch()
-    assert report["installed"] is True
-    calls: list[int] = []
-
-    def candidate(layer, x, width):
-        calls.append(width)
-        return mx.zeros((*x.shape[:-1], int(layer["weight"].shape[0])), x.dtype)
-
-    try:
-        register_qwen38_qmv_dispatch(candidate)
-        layer = nn.QuantizedLinear(512, 4096, bias=False, group_size=32, bits=4)
-        x = mx.random.normal((4, 512)).astype(mx.bfloat16)
-        from mtplx.attention_context import attention_phase
-
-        with attention_phase("decode_verify"):
-            y = layer(x)
-            mx.eval(y)
-        assert calls == [4]
-        assert tuple(y.shape) == (4, 4096)
-    finally:
-        uninstall_nax_qlinear_patch()
 
 
 def test_eligibility_shape_policy() -> None:
