@@ -300,17 +300,24 @@ def _candidate_engagement_errors(
         if memo_calls <= 0:
             errors.append("row 18 GDN decay memo did not execute")
     if "r20_kv_only_history" in features:
-        calls = sum(
-            int(
-                ((run.get("engagement") or {}).get("r20_kv_only_history") or {}).get(
-                    "calls",
-                    0,
-                )
-            )
+        engagement = [
+            ((run.get("engagement") or {}).get("r20_kv_only_history") or {})
             for run in candidate_runs
+        ]
+        calls = sum(
+            int(item.get("calls", 0))
+            for item in engagement
+        )
+        packed_calls = sum(
+            int(
+                item.get("packed_calls", 0)
+            )
+            for item in engagement
         )
         if calls <= 0:
             errors.append("row 20 K/V-only history path did not execute")
+        if packed_calls <= 0:
+            errors.append("row 20 packed K/V projection did not execute")
     return errors
 
 

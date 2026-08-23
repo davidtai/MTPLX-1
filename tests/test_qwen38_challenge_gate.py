@@ -418,19 +418,20 @@ def test_row20_promotion_requires_kv_only_history_engagement() -> None:
         "route_id": route,
         "engagement": {
             "r18_gdn_decay_memo": {"memo_calls": 48},
-            "r20_kv_only_history": {"calls": 0},
+            "r20_kv_only_history": {"calls": 0, "packed_calls": 0},
         },
     }
     engaged = {
         "route_id": route,
         "engagement": {
             "r18_gdn_decay_memo": {"memo_calls": 48},
-            "r20_kv_only_history": {"calls": 48},
+            "r20_kv_only_history": {"calls": 48, "packed_calls": 48},
         },
     }
 
     assert gate._candidate_engagement_errors(route, [zero], []) == [
-        "row 20 K/V-only history path did not execute"
+        "row 20 K/V-only history path did not execute",
+        "row 20 packed K/V projection did not execute",
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:

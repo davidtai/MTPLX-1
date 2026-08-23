@@ -252,6 +252,8 @@ def test_mtp_cache_length_mismatch_fails_loud(tmp_path) -> None:
 def test_one_layer_kv_only_history_append_matches_control_cache(tmp_path) -> None:
     from mlx_lm.models.qwen3_5 import TextModel
 
+    from mtplx.mtp_patch import QWEN38_KV_ONLY_HISTORY_COUNTERS
+
     args = _tiny_text_model_args()
     config = _write_tiny_mtp_sidecar(tmp_path, args, n_layers=1)
     model = TextModel(args)
@@ -272,6 +274,7 @@ def test_one_layer_kv_only_history_append_matches_control_cache(tmp_path) -> Non
     layer.mlp = forbidden
     model.mtp.norm = forbidden
     candidate_cache = model.make_mtp_cache()
+    before = dict(QWEN38_KV_ONLY_HISTORY_COUNTERS)
     candidate_root = model.mtp_update_cache_kv_only_history(
         hidden,
         tokens,
@@ -282,6 +285,12 @@ def test_one_layer_kv_only_history_append_matches_control_cache(tmp_path) -> Non
     assert candidate_cache[0].offset == control_cache[0].offset == 4
     for candidate, control in zip(candidate_cache[0].state, control_cache[0].state):
         assert mx.array_equal(candidate, control).item()
+    assert QWEN38_KV_ONLY_HISTORY_COUNTERS["packed_calls"] - before["packed_calls"] == 1
+    assert (
+        QWEN38_KV_ONLY_HISTORY_COUNTERS["stock_projection_calls"]
+        - before["stock_projection_calls"]
+        == 0
+    )
 
 
 def test_qwen38_kv_only_history_packs_quantized_kv_projection(tmp_path) -> None:

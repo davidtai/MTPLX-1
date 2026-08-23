@@ -1234,6 +1234,7 @@ def inject_mtp_support(
                 )
                 if compatible:
                     packed = (
+                        "quantized",
                         mx.concatenate([k_proj.weight, v_proj.weight], axis=0),
                         mx.concatenate([k_proj.scales, v_proj.scales], axis=0),
                         mx.concatenate([k_proj.biases, v_proj.biases], axis=0),
@@ -1242,20 +1243,46 @@ def inject_mtp_support(
                         int(k_proj.bits),
                         str(k_proj.mode),
                     )
-                    mx.eval(*packed[:3])
+                    mx.eval(*packed[1:4])
                     attention._mtplx_qwen38_packed_kv = packed
-            if packed is not None:
-                weight, scales, biases, split_at, group_size, bits, mode = packed
-                kv = mx.quantized_matmul(
-                    normed,
-                    weight,
-                    scales=scales,
-                    biases=biases,
-                    transpose=True,
-                    group_size=group_size,
-                    bits=bits,
-                    mode=mode,
+            if (
+                packed is None
+                and all(isinstance(module, nn.Linear) for module in (k_proj, v_proj))
+                and all("bias" not in module for module in (k_proj, v_proj))
+                and tuple(k_proj.weight.shape[1:]) == tuple(v_proj.weight.shape[1:])
+            ):
+                packed = (
+                    "dense",
+                    mx.concatenate([k_proj.weight, v_proj.weight], axis=0),
+                    int(k_proj.weight.shape[0]),
                 )
+                mx.eval(packed[1])
+                attention._mtplx_qwen38_packed_kv = packed
+            if packed is not None:
+                if packed[0] == "quantized":
+                    (
+                        _,
+                        weight,
+                        scales,
+                        biases,
+                        split_at,
+                        group_size,
+                        bits,
+                        mode,
+                    ) = packed
+                    kv = mx.quantized_matmul(
+                        normed,
+                        weight,
+                        scales=scales,
+                        biases=biases,
+                        transpose=True,
+                        group_size=group_size,
+                        bits=bits,
+                        mode=mode,
+                    )
+                else:
+                    _, weight, split_at = packed
+                    kv = normed @ weight.T
                 keys, values = mx.split(kv, [split_at], axis=-1)
                 QWEN38_KV_ONLY_HISTORY_COUNTERS["packed_calls"] += 1
             else:

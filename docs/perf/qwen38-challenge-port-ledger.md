@@ -58,6 +58,12 @@ despite 82,880 timed kernel engagements and remains absent. Row 13 executed
 7,104 fused four-way projection calls in each timed candidate arm and was
 deterministic within route; its loss is measured, not a no-op or parity veto.
 
+Row 20's first diagnostic ABBA is preserved under an `invalid-` receipt name.
+It measured the dead-output K/V-only path but showed `packed_calls=0` because
+the live MTP attention K/V projections are BF16 rather than quantized. That
+receipt is not promotion evidence; the corrected gate requires both K/V-only
+history calls and the source patch's packed K+V projection to execute.
+
 ## Exact 54-row campaign state
 
 `Patch` is the SHA-256 prefix of the full binary parent diff; `Stats` is that
