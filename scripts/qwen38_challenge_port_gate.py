@@ -202,12 +202,22 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r50_wired_residency",
         "r61_dual_norm_concat",
         "r63_q8_embedding_dual_norm",
+        "r70_qmv_sumtable",
+        "r78_qmv_active_groups",
+        "r80_qmv_m2",
     }
     unknown = features - allowed
     if not features or unknown:
         raise ValueError(f"unknown route features: {sorted(unknown)}")
     if "control" in features and len(features) != 1:
         raise ValueError("control cannot be combined with candidate features")
+    if "r78_qmv_active_groups" in features and "r70_qmv_sumtable" not in features:
+        raise ValueError("row 78 requires row 70")
+    if "r80_qmv_m2" in features and not {
+        "r70_qmv_sumtable",
+        "r78_qmv_active_groups",
+    } <= features:
+        raise ValueError("row 80 requires rows 70 and 78")
     return features
 
 
@@ -244,6 +254,12 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(61)
     if "r63_q8_embedding_dual_norm" in features:
         source_rows.append(63)
+    if "r70_qmv_sumtable" in features:
+        source_rows.append(70)
+    if "r78_qmv_active_groups" in features:
+        source_rows.append(78)
+    if "r80_qmv_m2" in features:
+        source_rows.append(80)
     return {
         "cache_route": (
             "kv_only_history"
@@ -252,6 +268,9 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         ),
         "dual_norm": bool({"dual_norm", "r61_dual_norm_concat"} & features),
         "row63_q8_embedding_dual_norm": "r63_q8_embedding_dual_norm" in features,
+        "row70_qmv_sumtable": "r70_qmv_sumtable" in features,
+        "row78_qmv_active_groups": "r78_qmv_active_groups" in features,
+        "row80_qmv_m2": "r80_qmv_m2" in features,
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "mtp_block_variant": (
@@ -534,6 +553,38 @@ def _candidate_engagement_errors(
         )
         if calls <= 0:
             errors.append("row 63 fused Q8 embedding/dual RMSNorm did not execute")
+    if "r70_qmv_sumtable" in features:
+        calls = sum(
+            int(value)
+            for run in candidate_runs
+            for key, value in (
+                ((run.get("engagement") or {}).get("r70_qmv_sumtable") or {})
+            ).items()
+            if key in {f"m{width}" for width in range(3, 10)}
+        )
+        if calls <= 0:
+            errors.append("row 70 Q4/group-64 wide QMV did not execute")
+    if "r78_qmv_active_groups" in features:
+        active = any(
+            bool(report.get("active_groups"))
+            for run in candidate_runs
+            for report in [
+                ((run.get("feature_receipt") or {}).get("r78_qmv_active_groups") or {})
+            ]
+        )
+        if not active:
+            errors.append("row 78 active-input-group launch was not configured")
+    if "r80_qmv_m2" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r70_qmv_sumtable") or {}).get(
+                    "m2", 0
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 80 Q4/group-64 M2 QMV did not execute")
     return errors
 
 
@@ -556,6 +607,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.qwen38_mtp_block_artifacts import (
         qwen38_row36_island_counter_snapshot,
     )
+    from mtplx.qwen38_qmv import qwen38_qmv_counter_snapshot
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
 
     return {
@@ -563,6 +615,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r63_q8_embedding_dual_norm": {
             "calls": qwen38_q8_embedding_dual_norm_counter_snapshot()
         },
+        "r70_qmv_sumtable": qwen38_qmv_counter_snapshot(),
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
@@ -718,6 +771,9 @@ def _run_arm(
         row63_q8_embedding_dual_norm=bool(
             options["row63_q8_embedding_dual_norm"]
         ),
+        row70_qmv_sumtable=bool(options["row70_qmv_sumtable"]),
+        row78_qmv_active_groups=bool(options["row78_qmv_active_groups"]),
+        row80_qmv_m2=bool(options["row80_qmv_m2"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

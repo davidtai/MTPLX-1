@@ -19,6 +19,7 @@ from .qwen38_challenge_kernels import (
     configure_qwen38_row24_qk_length_limit,
 )
 from .qwen38_mtp_block_artifacts import configure_qwen38_mtp_block
+from .qwen38_qmv import configure_qwen38_qmv
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -395,6 +396,9 @@ def install_qwen38_route(
     row48_boundary_fused: bool = False,
     row50_wired_residency: bool = False,
     row63_q8_embedding_dual_norm: bool = False,
+    row70_qmv_sumtable: bool = False,
+    row78_qmv_active_groups: bool = False,
+    row80_qmv_m2: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -550,6 +554,30 @@ def install_qwen38_route(
         route_features.append("r63_q8_embedding_dual_norm")
         kernel_ids.append("qwen38_row63_q8_g64_embedding_dual_rmsnorm_concat_v1")
         feature_receipt["r63_q8_embedding_dual_norm"] = {"active": 1}
+    qmv_report = configure_qwen38_qmv(
+        runtime.model,
+        active=bool(row70_qmv_sumtable),
+        min_width=2 if row80_qmv_m2 else 3,
+        active_groups=bool(row78_qmv_active_groups),
+    )
+    if row70_qmv_sumtable:
+        if int(qmv_report.get("active_modules", 0)) <= 0:
+            raise Qwen38ContractError("Qwen 3.8 row 70 QMV configured no modules")
+        route_features.append("r70_qmv_sumtable")
+        kernel_ids.append("qwen38_row70_q4_g64_qmv_sumtable_m3_m9_v1")
+        feature_receipt["r70_qmv_sumtable"] = qmv_report
+    if row78_qmv_active_groups:
+        if not row70_qmv_sumtable:
+            raise Qwen38ContractError("Qwen 3.8 row 78 requires row 70 QMV")
+        route_features.append("r78_qmv_active_groups")
+        kernel_ids.append("qwen38_row78_qmv_active_input_groups_v1")
+        feature_receipt["r78_qmv_active_groups"] = qmv_report
+    if row80_qmv_m2:
+        if not (row70_qmv_sumtable and row78_qmv_active_groups):
+            raise Qwen38ContractError("Qwen 3.8 row 80 requires rows 70 and 78")
+        route_features.append("r80_qmv_m2")
+        kernel_ids.append("qwen38_row80_q4_g64_qmv_m2_v1")
+        feature_receipt["r80_qmv_m2"] = qmv_report
 
     row10_report = configure_qwen38_row10_compact_head(
         runtime,
