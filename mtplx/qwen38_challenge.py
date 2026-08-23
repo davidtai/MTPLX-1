@@ -421,6 +421,7 @@ def install_qwen38_route(
     row24_qk_report = configure_qwen38_row24_qk_length_limit(
         runtime.model,
         active=bool(row24_eval_ladder and row21_qk_rms_rope),
+        max_length=32 if row26_prefill_ladder_3 else 16,
     )
     if row24_eval_ladder and row21_qk_rms_rope:
         if int(row24_qk_report.get("active_modules", 0)) <= 0:
@@ -445,6 +446,9 @@ def install_qwen38_route(
             )
         route_features.append("r26_prefill_ladder_3")
         kernel_ids.append("qwen38_row26_prefill_eval_every3_v1")
+        if row21_qk_rms_rope:
+            kernel_ids.append("qwen38_row26_qk_rms_rope_l_le32_v1")
+            feature_receipt["r26_qk_length_limit"] = row24_qk_report
         feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)
     if dual_norm:

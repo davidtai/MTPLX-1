@@ -9,6 +9,7 @@ _QK_RMS_ROPE_KERNEL = None
 qwen38_dual_norm_calls = 0
 qwen38_qk_rms_rope_calls = 0
 qwen38_row24_qk_length_fallback_calls = 0
+qwen38_row26_qk_widen_calls = 0
 qwen38_row24_eval_ladder_calls = 0
 qwen38_row26_prefill_ladder_calls = 0
 _QWEN38_ATTENTION_ORIGINAL_CALL = None
@@ -251,6 +252,9 @@ def configure_qwen38_row21_qk_rms_rope(model: Any, *, active: bool) -> dict[str,
                     mask=mask,
                     cache=cache,
                 )
+            if max_length == 32 and 16 < int(x.shape[1]) <= 32:
+                global qwen38_row26_qk_widen_calls
+                qwen38_row26_qk_widen_calls += 1
             offset = getattr(cache, "offset", 0) if cache is not None else 0
             if isinstance(offset, mx.array):
                 # Matches the source patch's `hasArrayOffset` fallback: the
@@ -318,6 +322,7 @@ def configure_qwen38_row24_qk_length_limit(
     model: Any,
     *,
     active: bool,
+    max_length: int = 16,
 ) -> dict[str, int]:
     """Apply row 24's L<=16 bound to the retained row-21 fusion."""
 
@@ -328,13 +333,21 @@ def configure_qwen38_row24_qk_length_limit(
         attention = getattr(layer, "self_attn", None)
         if attention is None or not _row21_attention_eligible(attention):
             continue
-        attention._mtplx_qwen38_row24_qk_max_length = 16 if active else None
+        attention._mtplx_qwen38_row24_qk_max_length = max_length if active else None
         eligible += 1
-    return {"eligible_modules": eligible, "active_modules": eligible if active else 0}
+    return {
+        "eligible_modules": eligible,
+        "active_modules": eligible if active else 0,
+        "max_length": max_length if active else 0,
+    }
 
 
 def qwen38_row24_qk_length_fallback_counter_snapshot() -> int:
     return int(qwen38_row24_qk_length_fallback_calls)
+
+
+def qwen38_row26_qk_widen_counter_snapshot() -> int:
+    return int(qwen38_row26_qk_widen_calls)
 
 
 def qwen38_dual_rms_norm_concat(

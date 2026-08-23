@@ -396,6 +396,18 @@ def _candidate_engagement_errors(
         )
         if calls <= 0:
             errors.append("row 26 every-third-layer prefill ladder did not execute")
+        if "r21_qk_rms_rope" in features:
+            qk_widen_calls = sum(
+                int(
+                    ((run.get("engagement") or {}).get("r26_qk_length_limit") or {}).get(
+                        "widen_calls",
+                        0,
+                    )
+                )
+                for run in candidate_runs
+            )
+            if qk_widen_calls <= 0:
+                errors.append("row 26 Q/K L<=32 widening did not execute")
     return errors
 
 
@@ -408,6 +420,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         qwen38_row24_eval_ladder_counter_snapshot,
         qwen38_row24_qk_length_fallback_counter_snapshot,
         qwen38_row26_prefill_ladder_counter_snapshot,
+        qwen38_row26_qk_widen_counter_snapshot,
     )
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
@@ -424,6 +437,9 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         },
         "r26_prefill_ladder_3": {
             "calls": qwen38_row26_prefill_ladder_counter_snapshot()
+        },
+        "r26_qk_length_limit": {
+            "widen_calls": qwen38_row26_qk_widen_counter_snapshot()
         },
         "source_proposal": qwen38_source_counter_snapshot(),
     }
