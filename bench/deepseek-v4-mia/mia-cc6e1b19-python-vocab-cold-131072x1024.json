@@ -8,10 +8,10 @@
   "draft_artifact_index_sha256": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
   "dspark": {
     "accepted_future_tokens": 835,
-    "decode_time_s": 58.81461991700007,
-    "decode_tok_s": 17.410637039652414,
+    "decode_time_s": 62.702392375000045,
+    "decode_tok_s": 16.33111530858075,
     "drafted_future_tokens": 945,
-    "elapsed_s": 867.150761542,
+    "elapsed_s": 870.87502225,
     "events": [
       {
         "acceptance_first_20_avg": 2.75,
@@ -216,7 +216,7 @@
         "cycles_completed": 189,
         "draft_sink_size": 0,
         "draft_window_size": 128,
-        "elapsed_us": 867150761.542,
+        "elapsed_us": 870875022.25,
         "generated_token_ids": [
           4147,
           554,
@@ -1245,13 +1245,13 @@
         ],
         "generation_tokens": 1024,
         "hit_kind": "miss",
-        "peak_memory_gb": 103.42398846,
+        "peak_memory_gb": 103.915116126,
         "phase_timings_us": {
           "commit": 0.0,
           "draft": 0.0,
           "draft_incremental": 0.0,
           "draft_prefill": 0.0,
-          "prefill": 808336141.625,
+          "prefill": 808172629.875,
           "replay": 0.0,
           "verify": 0.0
         },
@@ -1263,14 +1263,14 @@
       }
     ],
     "generated_tokens": 1024,
-    "milliseconds_per_token": 57.43615226269539,
+    "milliseconds_per_token": 61.23280505371098,
     "new_prefill_tokens": 131072,
-    "peak_memory_bytes": 103423988460,
+    "peak_memory_bytes": 103915116126,
     "peak_memory_kind": "mlx_allocator_peak",
     "peak_memory_scope": "since_last_mlx_peak_reset",
-    "prefill_tok_s": 162.15036449626717,
+    "prefill_tok_s": 162.18317121216157,
     "prefill_tok_s_token_basis": "new_prefill_tokens",
-    "prompt_time_s": 808.336141625,
+    "prompt_time_s": 808.172629875,
     "prompt_tokens": 131072,
     "token_digest": "e886bf5ce260de40e01fb16a3f67979393d5c9521d7c0213fdb8aba7591e418f",
     "tokens": [
@@ -2299,7 +2299,7 @@
       20829,
       16
     ],
-    "ttft_s": 808.3737438330136,
+    "ttft_s": 808.2098977089918,
     "ttft_scope": "request_start_through_first_emitted_token"
   },
   "dspark_kv": {
@@ -2314,7 +2314,7 @@
   "engine": "dflash_mlx_0_1_10",
   "fp32_activations": false,
   "future_draft_count": 5,
-  "guard_window_id": "dede1c7d72f5125e0d006ec3c79618a3f15dc58affd693d207d6c2172d2b0e7f",
+  "guard_window_id": "da231b4f738c0351db33f04687df0a6b236e4257ddd09df21a1a98519a793eaa",
   "index_sha256": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
   "installed_cache_plan": {
     "context_capacity_tokens": 384000,
@@ -2322,26 +2322,26 @@
     "target_physical_capacity_tokens": 384005
   },
   "kind": "deepseek_v4_dspark_dflash2_k5",
-  "load_time_s": 81.74784529101453,
+  "load_time_s": 81.71514641700196,
   "memory": {
     "mlx": {
       "after_load": {
-        "active_bytes": 101737129992,
-        "peak_bytes": 103417930085,
+        "active_bytes": 102345304430,
+        "peak_bytes": 104026104165,
         "peak_scope": "process_lifetime_through_load"
       },
       "arm": {
-        "active_bytes_after": 101737130660,
-        "active_bytes_before": 101737129992,
-        "peak_bytes": 103423988460,
+        "active_bytes_after": 102345304934,
+        "active_bytes_before": 102345304430,
+        "peak_bytes": 103915116126,
         "peak_bytes_before": 0,
         "peak_reset_before_arm": true,
         "peak_scope": "since_explicit_arm_reset"
       }
     },
     "process": {
-      "peak_rss_bytes_after_arm": 12810977280,
-      "peak_rss_bytes_after_load": 12810977280,
+      "peak_rss_bytes_after_arm": 12813172736,
+      "peak_rss_bytes_after_load": 12813172736,
       "peak_rss_scope": "process_lifetime_since_exec"
     }
   },
@@ -2375,9 +2375,9 @@
   "request": {
     "span_tokens": 132096
   },
-  "resident_parameter_bytes": 100171504120,
+  "resident_parameter_bytes": 100779678200,
   "schema_version": 3,
-  "source_head": "eba059982602387f2f868f80f6022cdf19cd3951",
+  "source_head": "cc6e1b1986a946fc7907b292a827e6d80e1aa316",
   "target_artifact_index_sha256": "b7a450f88c99aee7f6d44ecb127e91e45ab5ccb1a0dad49ca9eabb90b400c304",
   "target_kv": {
     "compressed_pages": [
@@ -2409,5 +2409,5 @@
     41,
     42
   ],
-  "timestamp_utc": "2026-08-23T11:32:52Z"
+  "timestamp_utc": "2026-08-23T22:43:32Z"
 }

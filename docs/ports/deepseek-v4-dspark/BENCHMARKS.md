@@ -4,7 +4,7 @@
 
 These measurements use the exact local Mia/Sero package at
 `/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-tp1`, MTPLX source
-`eba059982602387f2f868f80f6022cdf19cd3951`, and pinned DFlash revision
+`cc6e1b1986a946fc7907b292a827e6d80e1aa316`, and pinned DFlash revision
 `54644e991039110f30140006c892c57734b9311e`.
 
 Source lineage is documented against MiaAI's DGX Spark launcher and Sero's
@@ -20,9 +20,10 @@ reported separately and is not included in TTFT. The request prompt ends with
 the same coherent 1,024-token Python repository task. Its prefix walks a
 deterministic permutation of the tokenizer vocabulary, excludes special token
 IDs, and avoids repeated filler IDs until the usable vocabulary is exhausted.
-The 16K and 64K fillers contain no duplicate IDs. The 128K filler covers all
-129,278 usable IDs before the 770 repeats that are mathematically required to
-fill its remaining positions.
+The 1K row is the coherent Python task without a vocabulary prefix. The 16K
+and 64K fillers contain no duplicate IDs. The 128K filler covers all 129,278
+usable IDs before the 770 repeats that are mathematically required to fill its
+remaining positions.
 
 Each request generates exactly 1,024 tokens with physical M6 DSpark. TTFT is
 wall time from request start through the first emitted token. The MLX peak is
@@ -31,15 +32,17 @@ request; it includes the already installed fixed physical cache arena.
 
 | Cold prompt | Load | TTFT | Prefill | Prefill tok/s | Decode | Decode tok/s | Request | MLX peak | K5 accept | Cycles |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 16,384 | 80.97 s | 87.02 s | 86.99 s | 188.35 | 50.21 s | 20.39 | 137.20 s | 103.424 GB / 96.321 GiB | 837/935 (89.52%) | 187 |
-| 65,536 | 81.89 s | 371.39 s | 371.36 s | 176.48 | 64.76 s | 15.81 | 436.12 s | 103.424 GB / 96.321 GiB | 811/1,065 (76.15%) | 213 |
-| 131,072 | 81.75 s | 808.37 s | 808.34 s | 162.15 | 58.81 s | 17.41 | 867.15 s | 103.424 GB / 96.321 GiB | 835/945 (88.36%) | 189 |
+| 1,024 | 82.03 s | 5.84 s | 5.81 s | 176.23 | 32.74 s | 31.28 | 38.55 s | 103.815 GB / 96.686 GiB | 784/1,200 (65.33%) | 240 |
+| 16,384 | 81.95 s | 87.27 s | 87.24 s | 187.80 | 48.38 s | 21.16 | 135.63 s | 103.915 GB / 96.778 GiB | 837/935 (89.52%) | 187 |
+| 65,536 | 81.70 s | 371.34 s | 371.31 s | 176.50 | 65.88 s | 15.54 | 437.18 s | 103.915 GB / 96.778 GiB | 811/1,065 (76.15%) | 213 |
+| 131,072 | 81.72 s | 808.21 s | 808.17 s | 162.18 | 62.70 s | 16.33 | 870.88 s | 103.915 GB / 96.778 GiB | 835/945 (88.36%) | 189 |
 
 Raw receipts:
 
-- [`mia-eba05998-python-vocab-cold-16384x1024.json`](../../../bench/deepseek-v4-mia/mia-eba05998-python-vocab-cold-16384x1024.json)
-- [`mia-eba05998-python-vocab-cold-65536x1024.json`](../../../bench/deepseek-v4-mia/mia-eba05998-python-vocab-cold-65536x1024.json)
-- [`mia-eba05998-python-vocab-cold-131072x1024.json`](../../../bench/deepseek-v4-mia/mia-eba05998-python-vocab-cold-131072x1024.json)
+- [`mia-cc6e1b19-python-vocab-cold-1024x1024.json`](../../../bench/deepseek-v4-mia/mia-cc6e1b19-python-vocab-cold-1024x1024.json)
+- [`mia-cc6e1b19-python-vocab-cold-16384x1024.json`](../../../bench/deepseek-v4-mia/mia-cc6e1b19-python-vocab-cold-16384x1024.json)
+- [`mia-cc6e1b19-python-vocab-cold-65536x1024.json`](../../../bench/deepseek-v4-mia/mia-cc6e1b19-python-vocab-cold-65536x1024.json)
+- [`mia-cc6e1b19-python-vocab-cold-131072x1024.json`](../../../bench/deepseek-v4-mia/mia-cc6e1b19-python-vocab-cold-131072x1024.json)
 
 The command shape for each independent arm was:
 
@@ -49,22 +52,23 @@ python3 /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
   --child-timeout-seconds 1800 -- \
   .venv/bin/python scripts/deepseek_v4_dspark_k5_bench.py \
   --arm dspark --max-tokens 1024 \
-  --prompt-tokens <16384|65536|131072> \
+  --prompt-tokens <1024|16384|65536|131072> \
   --prompt-mode python-vocab --python-prompt-tokens 1024 \
   --out <receipt.json>
 ```
 
 ## What the ladder says
 
-Cold prefill declines gradually from 188.35 tok/s at 16K to 162.15 tok/s at
-128K. The fixed 384K target arena keeps allocator peak essentially flat: the
-128K arm peaks only 460,940 bytes above the 16K arm. This is the intended
-vLLM-style ownership result—request length advances logical page frontiers and
-block tables instead of growing or materializing a contiguous cache. It also
-means the roughly 103.4 GB peak is paid at installation rather than scaled to
-the individual request.
+The 1K prefill measures 176.23 tok/s because fixed request work is material at
+that size. Long-context prefill declines from 187.80 tok/s at 16K to 162.18
+tok/s at 128K. The fixed 384K target arena keeps allocator peak essentially
+flat: the 128K arm peaks only 458,752 bytes above the 16K arm. This is the
+intended vLLM-style ownership result—request length advances logical page
+frontiers and block tables instead of growing or materializing a contiguous
+cache. It also means the roughly 103.9 GB peak is paid at installation rather
+than scaled to the individual request.
 
-Long-context decode is not monotonic in this single-run ladder because useful
+Sustained decode is not monotonic in this single-run ladder because useful
 tokens per physical M6 cycle vary with K5 acceptance. The 64K completion has
 the lowest acceptance (76.15%), requires 213 cycles, and is therefore slower
 than the 128K completion, which accepts 88.36% and finishes in 189 cycles. The
