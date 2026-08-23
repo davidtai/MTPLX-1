@@ -1051,10 +1051,10 @@ class MiaDeepseekV4EnginePlan:
                 [primary[:, None], proposal.future_tokens], axis=1
             )
             with attention_phase("decode_verify"):
-                verify_logits, verify_taps = model.mia_dflash_forward(
+                verify_logits, verify_taps = model(
                     verify_ids,
-                    target_cache,
-                    logits_last_only=False,
+                    cache=target_cache,
+                    return_hidden=True,
                 )
             self.settle_target_prefill_chunk(verify_logits, *verify_taps)
             return {
@@ -1182,7 +1182,6 @@ def _mia_engine_identity(
             "k5-k64",
             "bounded-one-shard-raw-canonical-sha256-same-fd-loader",
             "mhc-post-pre-m384-bm64-bf16mma",
-            "target-physical-m6-piecewise-compile-eager-attention",
             "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
             "long-prefill-chunk1024",
             "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-bn256-simd-h128-u4-stage16b-96x8",
@@ -1882,16 +1881,6 @@ def build_mia_engine_plan(
     ):
         raise ValueError("the pinned K64 draft/general FP8 storage contract changed")
 
-    target_piecewise_route = model.install_mia_piecewise_target_runtime()
-    if (
-        getattr(model.model, "_mia_piecewise_target_route", None)
-        is not target_piecewise_route
-        or type(getattr(model, "_mia_dflash_target_route", None)).__name__
-        != "MiaDFlashTargetPhaseRoute"
-        or int(getattr(target_piecewise_route, "physical_width", 0)) != 6
-    ):
-        raise ValueError("the Mia physical-M6 piecewise target route was not installed")
-
     # Physical pages are the final construction allocation. Every artifact,
     # topology, storage, callable, and quantization seal above must pass first.
     target_cache_arena = MiaTargetCacheArena(
@@ -2053,7 +2042,6 @@ def build_mia_engine_plan(
     installed_routes = (
         "target_bounded_one_shard_raw_canonical_sha256_same_fd_loader",
         "target_mhc_carried_post_pre_bf16_mma_bm64",
-        "target_physical_m6_piecewise_compile_eager_attention",
         "compressor_stock432_mia132",
         "compressor_fixed_absolute_state_rings",
         "target_shared_base_compress_rope_graphs",
