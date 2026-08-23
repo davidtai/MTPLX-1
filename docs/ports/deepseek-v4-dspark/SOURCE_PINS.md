@@ -414,8 +414,10 @@ created.  The enabled callables do not probe eligibility or fall back.
   and N vector bases are formed before that copy loop.  Construction seals the
   16-byte vector and 96 vectors per K tile before installing the v2 kernel.
   Authentic three-bank/final-bit parity passed, and matched one-cycle gates
-  improved from 30.84--30.87 tok/s to 39.74--39.79 tok/s.  Sustained
-  measurement remains a separate final gate.
+  improved from 30.84--30.87 tok/s to 39.74--39.79 tok/s.  The retained
+  construction-bound piecewise target route, which compiles only cache-free
+  regions around the same eager attention calls, subsequently measured 43.531
+  tok/s on that full-acceptance gate.  Sustained measurement remains separate.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_moe_router.py` and the
   installed `EXL3SwitchGLU.direct_qmv_m6_quad` /
   `EXL3SwitchGLU.fused` paths in `mtplx/deepseek_v4_exl3.py`.  The scalar
@@ -576,7 +578,8 @@ created.  The enabled callables do not probe eligibility or fall back.
   M384 mHC and M16 WO calls cover their distinct installed kernels without
   another full target pass; a 513-row synthetic paged index view reaches
   top-512 without a long model forward.
-- **MTPLX implementation:** `MiaDeepseekV4EnginePlan.prewarm`.
+- **MTPLX implementation:** `MiaDeepseekV4EnginePlan.prewarm` and
+  `mtplx/deepseek_v4_mia_piecewise.py`.
 - **Construction owner / installed callable:** the loader evaluates all weights
   and prewarms every signature before returning.  `DeepseekV4TargetOps` refuses
   to bind DFlash2 without a matching immutable-plan prewarm receipt.  The
@@ -585,7 +588,9 @@ created.  The enabled callables do not probe eligibility or fall back.
   cap; it fixes the draft window at 128, installs the dependency's fixed-linear
   M6 lane, and retains target/draft allocator state between chunks and requests.
 - **Disposition:** MLX compile/prewarm equivalent of source eager warmup and
-  piecewise capture.  The first request cannot become the compiler trigger.
+  piecewise capture.  Cache-free regions are compiled at the fixed physical M6
+  width; all attention/cache ownership stays eager.  The first request cannot
+  become the compiler trigger.
 
 ## Source features intentionally absent on TP1 Metal
 
