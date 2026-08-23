@@ -277,8 +277,10 @@ the challenge bootstrap and has no preceding Yukon row.
 - Run exactness and one-cycle micro gates first. Reject at the first material
   regression or correctness failure.
 - Sanity-check every implemented candidate on `python_modules_long.jsonl` at
-  approximately 100 generated tokens. Token hashes and attempted/accepted
-  depth schedules must match before any longer benchmark.
+  approximately 100 generated tokens. Token hashes must match before any
+  longer benchmark. Attempted/accepted depth schedules must also match unless
+  proposal selection is the optimization itself; in that case record the
+  delta and reject an acceptance collapse.
 - Measure each consolidated candidate against unchanged `bd442156` behavior,
   then remeasure the cumulative retained stack against the same control.
 - Keep only independently measured wins. Source leaderboard improvement is

@@ -40,8 +40,10 @@ per-token feature eligibility checks or silent fallback.
 - Reject a candidate at the first matched A/B regression or parity failure.
 - Give every implemented candidate a first sanity bracket on
   `python_modules_long.jsonl` at approximately 100 generated tokens. Require
-  identical token hashes and attempted/accepted depth schedules before any
-  longer or broader benchmark.
+  identical token hashes before any longer or broader benchmark. Also require
+  identical attempted/accepted depth schedules for candidates that do not
+  intentionally change proposal selection; for proposal-only candidates,
+  record the schedule and acceptance delta and reject an acceptance collapse.
 - Do not retain code merely because its source challenge score improved.
 - Do not push or open the PR until all retained candidates and the cumulative
   stack pass the final gate.
@@ -617,7 +619,8 @@ For each retained commit:
 1. exactness/self-check;
 2. one-cycle real-shape timing;
 3. approximately 100 generated tokens on `python_modules_long.jsonl`, with
-   identical token hashes and attempted/accepted depth schedules;
+   identical token hashes plus either identical schedules or a documented,
+   non-collapsing proposal-only schedule delta;
 4. longer matched A/B only after the earlier gates pass.
 
 Remove candidates that fail. Do not average a regression into a later bundle.
