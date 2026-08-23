@@ -75,6 +75,21 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_source_handle(
+    handle: Any,
+    required: dict[str, tuple[list[int], str]],
+) -> None:
+    available = set(handle.keys())
+    for name, (shape, dtype) in required.items():
+        if name not in available:
+            raise Qwen38SourceProposalError(f"source artifact is missing {name}")
+        tensor = handle.get_slice(name)
+        if tensor.get_shape() != shape or tensor.get_dtype() != dtype:
+            raise Qwen38SourceProposalError(
+                f"source tensor {name} has {tensor.get_shape()}/{tensor.get_dtype()}"
+            )
+
+
 def validate_qwen38_source_artifact(path: Path) -> Qwen38SourceArtifact:
     """Validate the immutable HF blob and every tensor used by C8."""
 
@@ -108,14 +123,7 @@ def validate_qwen38_source_artifact(path: Path) -> Qwen38SourceArtifact:
         metadata = dict(handle.metadata() or {})
         if metadata.get("format") != QWEN38_SOURCE_HEAD_FORMAT:
             raise Qwen38SourceProposalError("source artifact format metadata mismatch")
-        for name, (shape, dtype) in required.items():
-            if name not in handle:
-                raise Qwen38SourceProposalError(f"source artifact is missing {name}")
-            tensor = handle.get_slice(name)
-            if tensor.get_shape() != shape or tensor.get_dtype() != dtype:
-                raise Qwen38SourceProposalError(
-                    f"source tensor {name} has {tensor.get_shape()}/{tensor.get_dtype()}"
-                )
+        _validate_source_handle(handle, required)
     return Qwen38SourceArtifact(path, observed_sha, observed_bytes, metadata)
 
 

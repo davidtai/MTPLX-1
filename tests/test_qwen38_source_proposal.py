@@ -8,10 +8,37 @@ from mtplx.qwen38_source_proposal import (
     QWEN38_SOURCE_HEAD_SHA256,
     Qwen38SourceProposalError,
     _validate_candidate_body,
+    _validate_source_handle,
     compact_token_ids_to_full,
     resolve_qwen38_source_artifact,
 )
 import pytest
+
+
+def test_source_handle_validation_uses_safe_open_keys_api() -> None:
+    class Slice:
+        @staticmethod
+        def get_shape():
+            return [2, 3]
+
+        @staticmethod
+        def get_dtype():
+            return "BF16"
+
+    class SafeOpenLike:
+        @staticmethod
+        def keys():
+            return ["weight"]
+
+        @staticmethod
+        def get_slice(name):
+            assert name == "weight"
+            return Slice()
+
+    _validate_source_handle(SafeOpenLike(), {"weight": ([2, 3], "BF16")})
+
+    with pytest.raises(Qwen38SourceProposalError, match="missing missing"):
+        _validate_source_handle(SafeOpenLike(), {"missing": ([2, 3], "BF16")})
 
 
 def test_source_artifact_contract_is_the_immutable_huggingface_blob() -> None:
