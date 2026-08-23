@@ -169,4 +169,4 @@ the ledger, raw receipts, and `NOTICE`.
   unchanged cold-tier stats-cache race fails on both this branch and
   `upstream/main` (19/20 base reproductions); the full suite excluding only
   that exact base flake passes.
-- [ ] Update draft PR #335 in place. Do not open another PR.
+- [x] Update PR #335 in place. Do not open another PR.
