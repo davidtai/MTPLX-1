@@ -14,6 +14,12 @@ import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
+QWEN38_GDN_PROJECTION_COUNTERS: dict[str, int] = {
+    "configured_modules": 0,
+    "fused_four_way_calls": 0,
+    "stock_calls": 0,
+}
+
 # One-time warning latch for an explicitly requested but unavailable
 # headquarter tape kernel (PR #209 review edit).
 _HEADQUARTER_IMPORT_WARNED = False
@@ -1594,6 +1600,30 @@ def _fused_quantized_many(
     inputs: mx.array,
     modules: tuple[nn.QuantizedLinear, ...],
 ) -> tuple[mx.array, ...] | None:
+    cached = _prepare_quantized_many(owner, cache_name, modules)
+    if cached is None:
+        return None
+    weight, scales, biases, split_points, first = cached
+    out = mx.quantized_matmul(
+        inputs,
+        weight,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=int(first.group_size),
+        bits=int(first.bits),
+        mode=str(first.mode),
+    )
+    return tuple(mx.split(out, list(split_points), axis=-1))
+
+
+def _prepare_quantized_many(
+    owner: Any,
+    cache_name: str,
+    modules: tuple[nn.QuantizedLinear, ...],
+) -> tuple[mx.array, mx.array, mx.array, tuple[int, ...], nn.QuantizedLinear] | None:
+    """Materialize a compatible packed projection outside timed generation."""
+
     if not modules:
         return None
     first = modules[0]
@@ -1616,23 +1646,21 @@ def _fused_quantized_many(
         cached = (weight, scales, biases, tuple(split_points))
         setattr(owner, cache_name, cached)
     weight, scales, biases, split_points = cached
-    out = mx.quantized_matmul(
-        inputs,
-        weight,
-        scales=scales,
-        biases=biases,
-        transpose=True,
-        group_size=int(first.group_size),
-        bits=int(first.bits),
-        mode=str(first.mode),
-    )
-    return tuple(mx.split(out, list(split_points), axis=-1))
+    return weight, scales, biases, split_points, first
 
 
 def _gdn_input_projections(
     gdn: Any, inputs: mx.array
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
-    fuse_mode = os.environ.get("MTPLX_FUSE_GDN_PROJECTIONS", "").lower()
+    route_mode = getattr(gdn, "_mtplx_gdn_projection_mode", None)
+    fuse_mode = str(
+        os.environ.get("MTPLX_FUSE_GDN_PROJECTIONS", "")
+        if route_mode is None
+        else route_mode
+    ).lower()
+    max_width = getattr(gdn, "_mtplx_gdn_projection_max_width", None)
+    if max_width is not None and int(inputs.shape[1]) > int(max_width):
+        fuse_mode = "off"
     if fuse_mode in {"all", "4to1", "one"}:
         fused = _fused_quantized_many(
             gdn,
@@ -1641,6 +1669,7 @@ def _gdn_input_projections(
             (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
         )
         if fused is not None:
+            QWEN38_GDN_PROJECTION_COUNTERS["fused_four_way_calls"] += 1
             qkv, z, b, a = fused
             return qkv, z, b, a
     if fuse_mode in {"1", "true", "yes", "on"}:
@@ -1662,12 +1691,52 @@ def _gdn_input_projections(
             qkv, z = qkvz
             b, a = ba
             return qkv, z, b, a
+    QWEN38_GDN_PROJECTION_COUNTERS["stock_calls"] += 1
     return (
         gdn.in_proj_qkv(inputs),
         gdn.in_proj_z(inputs),
         gdn.in_proj_b(inputs),
         gdn.in_proj_a(inputs),
     )
+
+
+def configure_qwen38_row8_gdn_projection_fusion(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, int]:
+    """Bind row 8's exact four-way affine projection at source widths S<=2."""
+
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", text_model)
+    layers = getattr(inner, "layers", None) or []
+    configured = 0
+    active_modules = 0
+    for layer in layers:
+        gdn = getattr(layer, "linear_attn", None)
+        required = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        if gdn is None or any(not hasattr(gdn, name) for name in required):
+            continue
+        projections = tuple(getattr(gdn, name) for name in required)
+        if active:
+            ready = _prepare_quantized_many(
+                gdn,
+                "_mtplx_fused_qkvzba",
+                projections,
+            ) is not None
+        else:
+            ready = hasattr(gdn, "_mtplx_fused_qkvzba")
+        configured += int(ready)
+        enabled = bool(active and ready)
+        gdn._mtplx_gdn_projection_mode = "all" if enabled else "off"
+        gdn._mtplx_gdn_projection_max_width = 2
+        active_modules += int(enabled)
+    QWEN38_GDN_PROJECTION_COUNTERS["configured_modules"] = configured
+    return {
+        "configured_modules": configured,
+        "active_modules": active_modules,
+        "max_width": 2,
+    }
 
 
 def _stock_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, gdn: Any):
