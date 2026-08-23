@@ -15,6 +15,11 @@ receipts are documented in [`BENCHMARKS.md`](BENCHMARKS.md).
 - MiaAI-Lab launcher and patches: `MiaAI-Lab/DeepSeek-v4-Flash-One-DGX-Spark@d4ba142bc1d971eb73a911e207e3e963bbb3c455`
 - MiaAI target artifact: `0xSero/deepseek-v4-flash-0731-spark@22f28d32b9b29b4352eaa380ff8c2c170b2847ab`
 - MiaAI runtime image: `sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4`
+- Related RTX PRO 6000 / SM120 implementation reference:
+  `local-inference-lab/rtx6kpro@3633c2c6028056729a6612126e9afe05c2e3cf08`,
+  especially `models/deepseek-v4-flash.md`. This is a cross-hardware runbook
+  reference, not evidence that the pinned Mia/Sero DGX Spark launcher or this
+  Metal port was validated on RTX PRO 6000.
 - Image vLLM tree: `local-inference-lab/vllm@30038602b71395f481ef4a6edfe4fcf8551d9c15`
 - Image-applied vLLM patch: `/tmp/vllm.patch` in immutable image layer
   `sha256:520582d536ce8491792f637f563699bc4139760a5f97e506ef1118d4cfb0a658`

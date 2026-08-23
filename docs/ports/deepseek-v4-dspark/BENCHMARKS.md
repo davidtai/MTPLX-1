@@ -7,6 +7,12 @@ These measurements use the exact local Mia/Sero package at
 `eba059982602387f2f868f80f6022cdf19cd3951`, and pinned DFlash revision
 `54644e991039110f30140006c892c57734b9311e`.
 
+Source lineage is documented against MiaAI's DGX Spark launcher and Sero's
+packaged artifact. The related RTX PRO 6000 / SM120 community reference is
+`local-inference-lab/rtx6kpro@3633c2c6028056729a6612126e9afe05c2e3cf08`.
+It is included for cross-hardware comparison; these receipts are Apple Metal
+measurements and do not claim RTX PRO 6000 validation.
+
 Every row is a separate process with an empty request cache. Model load is
 reported separately and is not included in TTFT. The request prompt ends with
 the same coherent 1,024-token Python repository task. Its prefix walks a
