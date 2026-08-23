@@ -198,6 +198,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r21_qk_rms_rope",
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
+        "r48_boundary_fused",
         "r61_dual_norm_concat",
     }
     unknown = features - allowed
@@ -233,6 +234,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(28)
     if "r36_qkv_islands" in features:
         source_rows.append(36)
+    if "r48_boundary_fused" in features:
+        source_rows.append(48)
     if "r61_dual_norm_concat" in features:
         source_rows.append(61)
     return {
@@ -257,6 +260,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "row21_qk_rms_rope": "r21_qk_rms_rope" in features,
         "row24_eval_ladder": "r24_eval_ladder" in features,
         "row26_prefill_ladder_3": "r26_prefill_ladder_3" in features,
+        "row48_boundary_fused": "r48_boundary_fused" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -484,12 +488,26 @@ def _candidate_engagement_errors(
         )
         if calls <= 0:
             errors.append("row 61 dual RMSNorm+concat kernel did not execute")
+    if "r48_boundary_fused" in features:
+        engagement = [
+            ((run.get("engagement") or {}).get("r48_boundary_fused") or {})
+            for run in candidate_runs
+        ]
+        if sum(int(item.get("calls", 0)) for item in engagement) <= 0:
+            errors.append(
+                "row 48 boundary-fused residual/RMSNorm path did not execute"
+            )
+        if sum(int(item.get("merged_boundaries", 0)) for item in engagement) <= 0:
+            errors.append("row 48 fused no-copy layer boundaries did not execute")
     return errors
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.draft_lm_head import qwen38_row10_compact_counter_snapshot
-    from mtplx.gdn_capture import QWEN38_GDN_DECAY_MEMO_COUNTERS
+    from mtplx.gdn_capture import (
+        QWEN38_GDN_DECAY_MEMO_COUNTERS,
+        qwen38_row48_boundary_counter_snapshot,
+    )
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_challenge_kernels import (
         qwen38_qk_rms_rope_counter_snapshot,
@@ -521,6 +539,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
             "widen_calls": qwen38_row26_qk_widen_counter_snapshot()
         },
         "r36_qkv_islands": qwen38_row36_island_counter_snapshot(),
+        "r48_boundary_fused": qwen38_row48_boundary_counter_snapshot(),
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -655,6 +674,7 @@ def _run_arm(
         row21_qk_rms_rope=bool(options["row21_qk_rms_rope"]),
         row24_eval_ladder=bool(options["row24_eval_ladder"]),
         row26_prefill_ladder_3=bool(options["row26_prefill_ladder_3"]),
+        row48_boundary_fused=bool(options["row48_boundary_fused"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

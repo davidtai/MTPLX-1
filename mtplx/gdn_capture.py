@@ -19,6 +19,14 @@ QWEN38_GDN_DECAY_MEMO_COUNTERS: dict[str, int] = {
     "memo_calls": 0,
     "stock_calls": 0,
 }
+QWEN38_ROW48_BOUNDARY_COUNTERS: dict[str, int] = {
+    "calls": 0,
+    "merged_boundaries": 0,
+}
+
+
+def qwen38_row48_boundary_counter_snapshot() -> dict[str, int]:
+    return dict(QWEN38_ROW48_BOUNDARY_COUNTERS)
 
 # One-time warning latch for an explicitly requested but unavailable
 # headquarter tape kernel (PR #209 review edit).
@@ -3031,9 +3039,33 @@ def forward_with_gdn_capture(
         and context_len >= max(0, layer_eval_threshold)
     )
 
+    boundary_fused = bool(
+        getattr(text_model, "_mtplx_qwen38_row48_boundary_fused", False)
+    )
+    boundary_base = hidden_states
+    boundary_delta = None
+    if boundary_fused:
+        QWEN38_ROW48_BOUNDARY_COUNTERS["calls"] += 1
+
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
-        normed = layer.input_layernorm(hidden_states)
+        if boundary_fused and boundary_delta is not None:
+            from .kernels.fused_norm import fused_add_rmsnorm
+
+            hidden_in, normed = fused_add_rmsnorm(
+                boundary_base,
+                boundary_delta,
+                layer.input_layernorm.weight,
+                layer.input_layernorm.eps,
+                threadgroup_size=1024,
+            )
+            QWEN38_ROW48_BOUNDARY_COUNTERS["merged_boundaries"] += 1
+        elif boundary_fused:
+            hidden_in = boundary_base
+            normed = layer.input_layernorm(hidden_in)
+        else:
+            hidden_in = hidden_states
+            normed = layer.input_layernorm(hidden_states)
         if layer.is_linear:
             if os.environ.get("MTPLX_ABLATE_LINEAR_ATTN", "").lower() in {
                 "1",
@@ -3057,7 +3089,17 @@ def forward_with_gdn_capture(
                         captures[layer_idx] = capture
         else:
             r = layer.self_attn(normed, mask=mask, cache=layer_cache)
-        if os.environ.get("MTPLX_FUSE_POST_NORM_RESIDUAL", "").lower() in {
+        if boundary_fused:
+            from .kernels.fused_norm import fused_add_rmsnorm
+
+            h, mlp_input = fused_add_rmsnorm(
+                hidden_in,
+                r,
+                layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.eps,
+                threadgroup_size=1024,
+            )
+        elif os.environ.get("MTPLX_FUSE_POST_NORM_RESIDUAL", "").lower() in {
             "1",
             "true",
             "yes",
@@ -3080,9 +3122,20 @@ def forward_with_gdn_capture(
         else:
             h = hidden_states + r
             mlp_input = layer.post_attention_layernorm(h)
-        hidden_states = h + layer.mlp(mlp_input)
+        if boundary_fused:
+            boundary_base = h
+            boundary_delta = layer.mlp(mlp_input)
+            hidden_states = boundary_base
+        else:
+            hidden_states = h + layer.mlp(mlp_input)
         if layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0:
-            mx.eval(hidden_states)
+            if boundary_fused:
+                mx.eval(boundary_base, boundary_delta)
+            else:
+                mx.eval(hidden_states)
+
+    if boundary_fused and boundary_delta is not None:
+        hidden_states = boundary_base + boundary_delta
 
     pre_norm = hidden_states
     post_norm = inner.norm(hidden_states)

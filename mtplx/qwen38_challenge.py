@@ -328,6 +328,7 @@ def install_qwen38_route(
     row21_qk_rms_rope: bool = False,
     row24_eval_ladder: bool = False,
     row26_prefill_ladder_3: bool = False,
+    row48_boundary_fused: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -454,6 +455,11 @@ def install_qwen38_route(
             kernel_ids.append("qwen38_row26_qk_rms_rope_l_le32_v1")
             feature_receipt["r26_qk_length_limit"] = row24_qk_report
         feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
+    text._mtplx_qwen38_row48_boundary_fused = bool(row48_boundary_fused)
+    if row48_boundary_fused:
+        route_features.append("r48_boundary_fused")
+        kernel_ids.append("qwen38_row48_boundary_fused_residual_rmsnorm_v1")
+        feature_receipt["r48_boundary_fused"] = {"active": 1}
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)
     if dual_norm:
         route_features.append("dual_norm")
