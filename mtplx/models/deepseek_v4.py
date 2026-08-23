@@ -6311,6 +6311,13 @@ class DeepseekV4Model(nn.Module):
         self._hc_hidden_impl = self._mia_hc_hidden
         self._collapse_impl = self._mia_collapse
 
+    def install_mia_piecewise_target_runtime(self):
+        from mtplx.deepseek_v4_mia_piecewise import (
+            install_mia_physical_m6_piecewise_target,
+        )
+
+        return install_mia_physical_m6_piecewise_target(self)
+
     def hc_hidden(self, input_ids: mx.array, cache=None) -> mx.array:
         return self._hc_hidden_impl(input_ids, cache)
 
@@ -6437,11 +6444,27 @@ class Model(nn.Module):
             )
         self._target_forward_route = self._mia_target_forward
 
+    def install_mia_piecewise_target_runtime(self):
+        from mtplx.deepseek_v4_mia_piecewise import MiaDFlashTargetPhaseRoute
+
+        route = self.model.install_mia_piecewise_target_runtime()
+        self._mia_dflash_target_route = MiaDFlashTargetPhaseRoute(
+            prefill=self._mia_target_forward,
+            decode_verify=self._mia_piecewise_target_forward,
+        )
+        return route
+
     def _mia_target_forward(self, inputs: mx.array, cache):
         self._mia_base_rope_provider.begin_forward()
         self._mia_compress_rope_provider.begin_forward()
         self._mia_draft_rope_provider.begin_forward()
         return self.model._run_mia_hc_target_tail_taps(inputs, cache)
+
+    def _mia_piecewise_target_forward(self, inputs: mx.array, cache):
+        self._mia_base_rope_provider.begin_forward()
+        self._mia_compress_rope_provider.begin_forward()
+        self._mia_draft_rope_provider.begin_forward()
+        return self.model._mia_piecewise_target_route(inputs, cache)
 
     def mia_dflash_forward(
         self,
@@ -6451,7 +6474,7 @@ class Model(nn.Module):
         logits_last_only: bool,
     ):
         """Direct target surface for the sealed Mia DFlash execution lane."""
-        hidden, taps = self._target_forward_route(inputs, cache)
+        hidden, taps = self._mia_dflash_target_route(inputs, cache)
         logits_source = hidden[:, -1:] if logits_last_only else hidden
         return self.logits_from_hc_hidden(logits_source), taps
 
