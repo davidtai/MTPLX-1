@@ -83,6 +83,8 @@ cumulative control before that later decision can remain authoritative.
 | 36 corrected | replace row-17 block with Q4/group-64 + BF16 Q/K/V islands | 782.572 | 55.929 | 25.70974 | 39.341 | **+0.1479%** | **RETAINED**, replaces row 17 artifact | same |
 | 48 corrected | retained rows 8, 10, 18, 20, 21, 24, 26, 36 | 735.798 | 55.947 | 25.48171 | 40.703 | - | corrected cumulative control | `chrono-r48-full-on-r08-r10-r18-r20-r21-r24-r26-r36-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 48 corrected | + fused residual/RMSNorm boundary chain | 760.347 | 54.792 | 25.48171 | 40.333 | **+0.9175%** | **RETAINED** | same |
+| 50 corrected | retained rows 8, 10, 18, 20, 21, 24, 26, 36, 48 | 754.316 | 56.472 | 25.48171 | 39.990 | - | corrected cumulative control | `chrono-r50-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 50 corrected | + post-warm active-footprint wired residency | 771.058 | 55.787 | 25.48171 | 39.661 | **+0.8299%** | **RETAINED** | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -102,7 +104,7 @@ target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
 engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
-Rows 8, 10, 18, 20, 21, 24, 26, 36, and 48 are therefore part of every corrected
+Rows 8, 10, 18, 20, 21, 24, 26, 36, 48, and 50 are therefore part of every corrected
 later timed control; row 36 supersedes row 17's artifact while preserving its
 Q4/group-64 base tensors. Row 26's corrected candidate engaged 176 times per timed
 arm and cleared the gate by 1.6797%. Row 9 regressed
@@ -180,7 +182,7 @@ row or from the earlier bundle campaign.
 | 45 | 505 | 0.4408% | `868cde8f985a` | `3138ecedd936` | +309/-48 | REMOVED NEXT ROW: its memoized norm constants, fused residual/RMSNorm boundary chain, and no-copy attention gate layout are deleted by row 46. The target-side mechanisms are reintroduced by row 48 and are handled as that later live candidate. |
 | 47 | 530 | 0.5687% | `dccba745af5b` | `e89a06dfd673` | +195/-5 | DEPENDENCY ABSENT/TARGET-SHAPE NO-OP: adds a custom affine-2 M=1 kernel for row 42's argmax-only coarse proposal selector and changes Q4 M=8 grouping. Temperature-1/top-k20 speculative acceptance cannot replace the complete proposal distribution with that argmax shortlist, and fixed D3 does not dispatch M=8. |
 | 48 | 543 | 0.1230% | `86fb1f020fc1` | `d2962993b6da` | +422/-240 | RETAINED on corrected rows 8+10+18+20+21+24+26+36: the source's Q/K scalar memo is already present in MTPLX capture, and its row-47 affine-2 removal is irrelevant because that argmax selector is absent. The adapted 64-layer BF16/5120 fused residual/RMSNorm boundary path executed a mean 151 forwards and 9,513 merged interior boundaries per timed candidate arm, kept exact tokens and schedules, and improved wall throughput 0.9175%. |
-| 50 | 572 | 0.2736% | `c0e34afd857e` | `4b6eb22f8820` | +115/-0 | STAGED: adapted the source's post-warm `WiredMemoryTicket` policy to MLX Python's process-wide wired-limit API. On the 128 GiB target it clears only pre-timing warm scratch once, measures the live model footprint, and requests exactly active bytes plus the source's 64 MiB slack, capped 256 MiB below MLX's recommended working set. The gate records active/target/baseline bytes and restores the original wired limit on every control arm, avoiding candidate contamination of ABBA. It awaits its chronological 16K cumulative gate. |
+| 50 | 572 | 0.2736% | `c0e34afd857e` | `4b6eb22f8820` | +115/-0 | RETAINED on corrected rows 8+10+18+20+21+24+26+36+48: the adapted post-warm policy measured 21,317,046,640 active bytes and set a 21,384,155,504-byte wired limit (64 MiB slack), while control arms restored the zero baseline. Candidate-first then control conditioning prevented the one-time cache clear from making control cold. The route kept exact tokens/schedules and improved wall throughput 0.8299%. Item 55 must recompute this budget over the assembled target plus DFlash2 footprint. |
 | 53 | 600 | 0.1577% | `0c90733d383f` | `39b6322daa32` | +11/-24 | PENDING |
 | 59 | 843 | 1.4217% | `3e2530aeae21` | `a0b5e9aaa3c4` | +23/-2 | TARGET-SHAPE NO-OP/REMOVED NEXT ROW: only raises the adaptive SDPA width cap from depth 5 to 6 before the full-accept streak gate; row 60 restores the prior policy. This campaign fixes D3 and disables adaptive depth. |
 | 60 | 846 | 0.2224% | `88578f929552` | `c529a4989d0d` | +155/-27 | REMOVED NEXT ROW: restores row 59's policy and introduces a two-output dual RMSNorm for the MTP embedding/hidden pair. Row 61 immediately replaces that kernel and its two outputs plus concatenate with the later single-output dual-RMSNorm-concat candidate, which is the live mechanism to gate. |
