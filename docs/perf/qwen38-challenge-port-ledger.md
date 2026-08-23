@@ -95,6 +95,15 @@ the live MTP attention K/V projections are BF16 rather than quantized. That
 receipt is not promotion evidence; the corrected gate requires both K/V-only
 history calls and the source patch's packed K+V projection to execute.
 
+## Post-54 final stacked candidate
+
+After every one of the 54 Yukon rows has a final disposition, merge the DFlash
+2 logic as the campaign's final candidate. It must be adapted to the resulting
+Qwen 3.8 target/MTP shape, stacked on every retained Yukon winner, and measured
+with the same exact 16K Python, 1,024-output, four-arm guarded gate. Its result
+gets its own receipt and metrics-table rows in this same PR; it does not replace
+or retroactively bundle any of the 54 individual decisions.
+
 ## Exact 54-row campaign state
 
 `Patch` is the SHA-256 prefix of the full binary parent diff; `Stats` is that
