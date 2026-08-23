@@ -26,6 +26,14 @@ def test_generation_metrics_include_prefill_decode_and_peak_memory() -> None:
         prompt_target_prefill_tok_s=2048.0,
         decode_tok_s=40.0,
         peak_memory_bytes=24 * 2**30,
+        capture_commit_time_s=0.125,
+        verify_strategy="capture_commit",
+        verify_core="linear-gdn-from-conv-tape",
+        events=[
+            {"capture_repair": "captured_prefix_commit"},
+            {"capture_repair": "captured_prefix_pending_correction"},
+            {"capture_repair": "standard_reforward"},
+        ],
     )
 
     metrics = gate._generation_metrics(stats)
@@ -37,6 +45,10 @@ def test_generation_metrics_include_prefill_decode_and_peak_memory() -> None:
         "decode_tok_s": 40.0,
         "peak_memory_bytes": 24 * 2**30,
         "peak_memory_gib": 24.0,
+        "capture_commit_time_s": 0.125,
+        "capture_commit_events": 2,
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
     }
 
 
@@ -292,6 +304,9 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     assert gate._validate_route_id(
         "r08_device_draft+r10_compact_vocab"
     ) == {"r08_device_draft", "r10_compact_vocab"}
+    assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo"
+    ) == {"r08_device_draft", "r10_compact_vocab", "r18_gdn_decay_memo"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -320,6 +335,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "dual_norm": False,
         "source_proposal": False,
         "row10_compact_vocab": False,
+        "row18_gdn_decay_memo": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
@@ -335,6 +351,35 @@ def test_row_10_extends_retained_row_8_with_compact_proposal_vocabulary() -> Non
     assert row_10["draft_core"] == "device"
     assert row_10["row10_compact_vocab"] is True
     assert row_10["source_rows"] == (8, 10)
+
+
+def test_row_18_decay_memo_extends_rows_8_and_10() -> None:
+    gate = _module()
+    row_18 = gate._route_execution_options(
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo"
+    )
+
+    assert row_18["draft_core"] == "device"
+    assert row_18["row18_gdn_decay_memo"] is True
+    assert row_18["source_rows"] == (8, 10, 18)
+
+
+def test_row18_promotion_requires_memoized_decay_engagement() -> None:
+    gate = _module()
+    route = "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo"
+    zero = {
+        "route_id": route,
+        "engagement": {"r18_gdn_decay_memo": {"memo_calls": 0}},
+    }
+    engaged = {
+        "route_id": route,
+        "engagement": {"r18_gdn_decay_memo": {"memo_calls": 48}},
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 18 GDN decay memo did not execute"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:
     gate = _module()
     order = ["kv_only_history", "kv_only_history+dual_norm"] * 2

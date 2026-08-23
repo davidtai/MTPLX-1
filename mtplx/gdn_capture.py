@@ -14,6 +14,12 @@ import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
+QWEN38_GDN_DECAY_MEMO_COUNTERS: dict[str, int] = {
+    "configured_modules": 0,
+    "memo_calls": 0,
+    "stock_calls": 0,
+}
+
 # One-time warning latch for an explicitly requested but unavailable
 # headquarter tape kernel (PR #209 review edit).
 _HEADQUARTER_IMPORT_WARNED = False
@@ -1668,6 +1674,46 @@ def _gdn_input_projections(
         gdn.in_proj_b(inputs),
         gdn.in_proj_a(inputs),
     )
+
+
+def _qwen38_compute_g(gdn: Any, a: mx.array) -> mx.array:
+    """Use row 18's materialized input-independent decay factor when active."""
+    memo = getattr(gdn, "_mtplx_qwen38_neg_exp_a_log", None)
+    if memo is None:
+        from mlx_lm.models.gated_delta import compute_g
+
+        QWEN38_GDN_DECAY_MEMO_COUNTERS["stock_calls"] += 1
+        return compute_g(gdn.A_log, a, gdn.dt_bias)
+    QWEN38_GDN_DECAY_MEMO_COUNTERS["memo_calls"] += 1
+    return mx.exp(memo * nn.softplus(a + gdn.dt_bias))
+
+
+def configure_qwen38_row18_gdn_decay_memo(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, int]:
+    """Materialize row 18's per-layer ``-exp(A_log)`` outside generation."""
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", text_model)
+    layers = getattr(inner, "layers", None) or []
+    configured = 0
+    active_modules = 0
+    for layer in layers:
+        gdn = getattr(layer, "linear_attn", None)
+        if gdn is None or not hasattr(gdn, "A_log") or not hasattr(gdn, "dt_bias"):
+            continue
+        configured += 1
+        memo = -mx.exp(gdn.A_log.astype(mx.float32)) if active else None
+        if memo is not None:
+            mx.eval(memo)
+            active_modules += 1
+        gdn._mtplx_qwen38_neg_exp_a_log = memo
+    QWEN38_GDN_DECAY_MEMO_COUNTERS["configured_modules"] = configured
+    return {
+        "configured_modules": configured,
+        "active_modules": active_modules,
+    }
 def _stock_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, gdn: Any):
     """Run the exact MLX Conv1d path and capture each linear-prefix state."""
     B, T, _ = qkv.shape
@@ -2577,8 +2623,6 @@ def gdn_forward_with_capture(
     if getattr(gdn, "sharding_group", None) is not None:
         return gdn(inputs, mask=mask, cache=cache), None
 
-    from mlx_lm.models.gated_delta import compute_g
-
     B, S, _ = inputs.shape
     qkv, z, b, a = _gdn_input_projections(gdn, inputs)
     z = z.reshape(B, S, gdn.num_v_heads, gdn.head_v_dim)
@@ -2620,7 +2664,7 @@ def gdn_forward_with_capture(
         out, states = delta_result
     elif backend == "linear_gdn_from_conv_tape":
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = _qwen38_compute_g(gdn, a)
         delta_result = _linear_gated_delta_from_conv_tape_capture(
             conv_out,
             g,
@@ -2637,7 +2681,7 @@ def gdn_forward_with_capture(
         "linear_gdn_from_conv_stream_skip0",
     }:
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = _qwen38_compute_g(gdn, a)
         capture_start = 1 if backend == "linear_gdn_from_conv_stream_skip0" else 0
         delta_result = _linear_gated_delta_from_conv_stream_capture(
             conv_out,
@@ -2660,7 +2704,7 @@ def gdn_forward_with_capture(
             "on",
         }
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = _qwen38_compute_g(gdn, a)
         if use_from_conv:
             delta_result = _linear_gated_delta_from_conv_capture(
                 conv_out, g, beta, state, gdn
@@ -2694,7 +2738,7 @@ def gdn_forward_with_capture(
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = _qwen38_compute_g(gdn, a)
         delta_result = _linear_gated_delta_final(q, k, v, g, beta, state)
         if delta_result is None:
             return gdn(inputs, mask=mask, cache=cache), None

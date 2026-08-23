@@ -303,3 +303,36 @@ def test_row10_candidate_route_names_compact_proposal_only_head(monkeypatch) -> 
     assert route.route_id == "r10_compact_vocab"
     assert route.kernel_ids == ("qwen38_row10_compact_q4_g64_vocab_v1",)
     assert runtime.qwen38_feature_receipt["r10_compact_vocab"]["active"] is True
+
+
+def test_row18_route_names_input_independent_gdn_decay_memo(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_row18_gdn_decay_memo",
+        lambda model, *, active: {
+            "configured_modules": 48,
+            "active_modules": 48 if active else 0,
+        },
+        raising=False,
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(mtp_update_cache=_callable),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="control",
+        row18_gdn_decay_memo=True,
+    )
+
+    assert route.route_id == "r18_gdn_decay_memo"
+    assert route.kernel_ids == ("qwen38_row18_gdn_neg_exp_a_log_memo_v1",)
+    assert runtime.qwen38_feature_receipt["r18_gdn_decay_memo"] == {
+        "configured_modules": 48,
+        "active_modules": 48,
+    }

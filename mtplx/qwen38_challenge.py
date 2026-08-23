@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .draft_lm_head import configure_qwen38_row10_compact_head
+from .gdn_capture import configure_qwen38_row18_gdn_decay_memo
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -316,6 +317,7 @@ def install_qwen38_route(
     dual_norm: bool = False,
     source_proposal: bool = False,
     row10_compact_vocab: bool = False,
+    row18_gdn_decay_memo: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -350,6 +352,19 @@ def install_qwen38_route(
         raise Qwen38ContractError(
             f"unknown Qwen 3.8 cache route: {cache_route!r}"
         )
+
+    row18_gdn_report = configure_qwen38_row18_gdn_decay_memo(
+        runtime.model,
+        active=bool(row18_gdn_decay_memo),
+    )
+    if row18_gdn_decay_memo:
+        if int(row18_gdn_report.get("active_modules", 0)) <= 0:
+            raise Qwen38ContractError(
+                "Qwen 3.8 row 18 GDN decay memo configured no modules"
+            )
+        route_features.append("r18_gdn_decay_memo")
+        kernel_ids.append("qwen38_row18_gdn_neg_exp_a_log_memo_v1")
+        feature_receipt["r18_gdn_decay_memo"] = row18_gdn_report
 
     text = getattr(runtime.model, "language_model", runtime.model)
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)

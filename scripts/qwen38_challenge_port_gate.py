@@ -87,8 +87,12 @@ def _token_hash(tokens: list[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _generation_metrics(stats: Any) -> dict[str, int | float]:
+def _generation_metrics(stats: Any) -> dict[str, Any]:
     peak = int(stats.peak_memory_bytes)
+    capture_commit_events = sum(
+        str(event.get("capture_repair") or "").startswith("captured_")
+        for event in stats.events
+    )
     return {
         "prefill_tokens": int(stats.new_prefill_tokens),
         "prefill_time_s": float(stats.prompt_target_prefill_time_s),
@@ -96,6 +100,10 @@ def _generation_metrics(stats: Any) -> dict[str, int | float]:
         "decode_tok_s": float(stats.decode_tok_s),
         "peak_memory_bytes": peak,
         "peak_memory_gib": peak / 2**30,
+        "capture_commit_time_s": float(stats.capture_commit_time_s),
+        "capture_commit_events": int(capture_commit_events),
+        "verify_strategy": str(stats.verify_strategy),
+        "verify_core": str(stats.verify_core),
     }
 
 
@@ -177,6 +185,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "source_proposal",
         "r08_device_draft",
         "r10_compact_vocab",
+        "r18_gdn_decay_memo",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -195,6 +204,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(8)
     if "r10_compact_vocab" in features:
         source_rows.append(10)
+    if "r18_gdn_decay_memo" in features:
+        source_rows.append(18)
     return {
         "cache_route": (
             "kv_only_history" if "kv_only_history" in features else "control"
@@ -202,6 +213,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "dual_norm": "dual_norm" in features,
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
+        "row18_gdn_decay_memo": "r18_gdn_decay_memo" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -258,18 +270,38 @@ def _candidate_engagement_errors(
 
     if candidate_route is None:
         return []
-    _validate_route_id(candidate_route)
-    return []
+    features = _validate_route_id(candidate_route)
+    candidate_runs = [
+        run
+        for run in [*warmups, *arms]
+        if run.get("route_id") == candidate_route
+    ]
+    errors: list[str] = []
+    if "r18_gdn_decay_memo" in features:
+        memo_calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r18_gdn_decay_memo") or {}).get(
+                    "memo_calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if memo_calls <= 0:
+            errors.append("row 18 GDN decay memo did not execute")
+    return errors
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.draft_lm_head import qwen38_row10_compact_counter_snapshot
+    from mtplx.gdn_capture import QWEN38_GDN_DECAY_MEMO_COUNTERS
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
+        "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -389,6 +421,7 @@ def _run_arm(
         dual_norm=bool(options["dual_norm"]),
         source_proposal=bool(options["source_proposal"]),
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
+        row18_gdn_decay_memo=bool(options["row18_gdn_decay_memo"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(
