@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -29,6 +30,8 @@ QWEN38_FINAL_ROUTE: Mapping[str, Any] = MappingProxyType(
         "cache_route": DEFAULT_QWEN38_CACHE_ROUTE,
         "dual_norm": True,
         "qmv_final": True,
+        "source_proposal": True,
+        "source_retain_control": False,
     }
 )
 
@@ -36,7 +39,11 @@ QWEN38_FINAL_ROUTE: Mapping[str, Any] = MappingProxyType(
 def qwen38_final_route() -> dict[str, Any]:
     """Return the cumulative winner stack measured at 16K context."""
 
-    return dict(QWEN38_FINAL_ROUTE)
+    route = dict(QWEN38_FINAL_ROUTE)
+    if os.environ.get("MTPLX_QWEN38_DISABLE_SOURCE_AUTO") == "1":
+        route.pop("source_proposal", None)
+        route.pop("source_retain_control", None)
+    return route
 
 
 class Qwen38ContractError(RuntimeError):
@@ -315,6 +322,7 @@ def install_qwen38_route(
     qmv_final: bool = False,
     source_proposal: bool = False,
     source_artifact_path: Path | None = None,
+    source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
     if not is_qwen38_27b_candidate(config, model_path):
         return None
@@ -396,6 +404,7 @@ def install_qwen38_route(
         runtime,
         active=bool(source_proposal),
         artifact_path=source_artifact_path,
+        retain_control=bool(source_retain_control),
     )
     if source_proposal:
         if not bool(source_report.get("installed")):

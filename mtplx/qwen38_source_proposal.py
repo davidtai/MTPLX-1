@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 QWEN38_SOURCE_HEAD_REPO = "amal-david/qwen38-mtp-head-q2-q4-rerank-v1"
+QWEN38_SOURCE_HEAD_FILENAME = "model.safetensors"
 QWEN38_SOURCE_HEAD_REVISION = "ae6282749a52e052496dd5300b4aa441df7301e8"
 QWEN38_SOURCE_HEAD_SHA256 = (
     "d038fd41e2d5dab1b3905c115d859fdc98dfbfde9862c14ebb82c2b3247ec2f1"
@@ -115,6 +117,29 @@ def validate_qwen38_source_artifact(path: Path) -> Qwen38SourceArtifact:
                     f"source tensor {name} has {tensor.get_shape()}/{tensor.get_dtype()}"
                 )
     return Qwen38SourceArtifact(path, observed_sha, observed_bytes, metadata)
+
+
+def resolve_qwen38_source_artifact() -> Path:
+    """Resolve the declared artifact without initiating a network download."""
+
+    override = os.environ.get("MTPLX_QWEN38_SOURCE_HEAD")
+    if override:
+        return Path(override).expanduser()
+    from huggingface_hub import try_to_load_from_cache
+
+    cached = try_to_load_from_cache(
+        repo_id=QWEN38_SOURCE_HEAD_REPO,
+        filename=QWEN38_SOURCE_HEAD_FILENAME,
+        revision=QWEN38_SOURCE_HEAD_REVISION,
+    )
+    if isinstance(cached, str):
+        return Path(cached)
+    raise Qwen38SourceProposalError(
+        "the retained Qwen 3.8 source proposal requires its explicitly pinned "
+        f"artifact {QWEN38_SOURCE_HEAD_REPO}@{QWEN38_SOURCE_HEAD_REVISION}; "
+        "pre-stage model.safetensors in the Hugging Face cache or set "
+        "MTPLX_QWEN38_SOURCE_HEAD to its local path"
+    )
 
 
 def _compact_source_rows() -> Any:
@@ -800,7 +825,6 @@ class Qwen38SourceProposalHead:
         import mlx.core as mx
 
         _require_affine_head(incumbent_head, bits=4)
-        self.incumbent_head = incumbent_head
         self.coarse_weight = tensors["draft_lm_head.weight"]
         self.coarse_scales = tensors["draft_lm_head.scales"]
         self.coarse_biases = tensors["draft_lm_head.biases"]
@@ -915,6 +939,7 @@ def configure_qwen38_source_proposal(
     *,
     active: bool,
     artifact_path: Path | None = None,
+    retain_control: bool = True,
 ) -> dict[str, Any]:
     """Switch between the incumbent head and the source Q4+island/Q2 route."""
 
@@ -929,6 +954,7 @@ def configure_qwen38_source_proposal(
             "precision_k_rows": 0,
             "precision_v_rows": 0,
             "selector": "control",
+            "retained_control": False,
         }
     if not hasattr(text, "_mtplx_qwen38_control_mtp"):
         text._mtplx_qwen38_control_mtp = text.mtp
@@ -942,7 +968,7 @@ def configure_qwen38_source_proposal(
         import mlx.core as mx
 
         if artifact_path is None:
-            raise Qwen38SourceProposalError("source proposal route requires artifact_path")
+            artifact_path = resolve_qwen38_source_artifact()
         artifact = validate_qwen38_source_artifact(artifact_path)
         tensors = mx.load(str(artifact.path), format="safetensors")
         text._mtplx_qwen38_source_mtp = _candidate_mtp(text, tensors)
@@ -955,6 +981,14 @@ def configure_qwen38_source_proposal(
     if active:
         text.mtp = text._mtplx_qwen38_source_mtp
         text._mtplx_draft_lm_head = text._mtplx_qwen38_source_draft_head
+        if not retain_control:
+            import gc
+            import mlx.core as mx
+
+            del text._mtplx_qwen38_control_mtp
+            del text._mtplx_qwen38_control_draft_head
+            gc.collect()
+            mx.clear_cache()
     else:
         text.mtp = control_mtp
         text._mtplx_draft_lm_head = control_head
@@ -969,6 +1003,7 @@ def configure_qwen38_source_proposal(
         "precision_k_rows": 1_024 if active else 0,
         "precision_v_rows": 1_024 if active else 0,
         "selector": "cluster_q2_top32_q4_rerank" if active else "control",
+        "retained_control": bool(active and retain_control),
     }
 
 

@@ -117,14 +117,14 @@ remains enabled in both arms of every later bracket.
 **Files:** `scripts/qwen38_challenge_port_gate.py`,
 `tests/test_qwen38_challenge_gate.py`, `mtplx/qwen38_challenge.py`.
 
-- [ ] Add route composition for C1-C8 and reject route strings that omit a
+- [x] Add route composition for C1-C8 and reject route strings that omit a
   previously retained winner.
-- [ ] Record packed-QKV calls, fused-GDN calls, compiled-verify engagement,
+- [x] Record packed-QKV calls, fused-GDN calls, compiled-verify engagement,
   recurrence-tape engagement, post-norm reuse, prefill/decode TPS, peak bytes,
   wall time, token hashes, schedules, and full output count per arm.
-- [ ] Keep deterministic cross-route tie drift as an audit field rather than a
+- [x] Keep deterministic cross-route tie drift as an audit field rather than a
   hash-only rejection.
-- [ ] Verify with:
+- [x] Verify with:
   `uv run --frozen --with pytest pytest -q tests/test_qwen38_challenge_gate.py tests/test_qwen38_challenge_contract.py`.
 
 ## Task 2: Implement the three missing faithful mechanisms
@@ -133,15 +133,15 @@ remains enabled in both arms of every later bracket.
 `mtplx/qwen38_challenge.py`, `mtplx/qwen38_compact_head.py`,
 `tests/test_qwen38_challenge_contract.py`, plus focused kernel tests.
 
-- [ ] C1: expose an attention-only packed Q/K/V installer so the arm cannot
+- [x] C1: expose an attention-only packed Q/K/V installer so the arm cannot
   silently include gate/up MLP fusion.
-- [ ] C2: bind the existing exact two-pair GDN projection packer explicitly to
+- [x] C2: bind the existing exact two-pair GDN projection packer explicitly to
   the Qwen 3.8 candidate route and materialize packed arrays before timing.
-- [ ] C8: load the immutable source compact/island artifact by declared
+- [x] C8: load the immutable source compact/island artifact by declared
   revision and digest for measurement; bind the island corrections only to
   the proposal MTP attention. A promoted production route must require an
   explicit artifact declaration and must never download weights implicitly.
-- [ ] Prove tensor/cache equality for C1/C2 and proposal-only isolation for C8
+- [x] Prove tensor/cache equality for C1/C2 and proposal-only isolation for C8
   before running the GPU benchmark.
 
 ## Task 3: Run the serial 16K campaign
@@ -149,12 +149,12 @@ remains enabled in both arms of every later bracket.
 **Files:** `docs/perf/receipts/qwen38-challenge-port/*.json`,
 `docs/perf/qwen38-challenge-port-ledger.md`.
 
-- [ ] Acquire the exclusive GPU lock and confirm no unrelated owner.
-- [ ] Run C1 then C2. Promote each >0.05% winner immediately.
-- [ ] Continue C3-C8 in order, always using the retained stack as control.
-- [ ] Use one conditioning generation per unique route and exactly four timed
+- [x] Acquire the exclusive GPU lock and confirm no unrelated owner.
+- [x] Run C1 then C2. Promote each >0.05% winner immediately.
+- [x] Continue C3-C8 in order, always using the retained stack as control.
+- [x] Use one conditioning generation per unique route and exactly four timed
   ABBA arms; do not add BAAB or additional timed arms.
-- [ ] Reject a candidate on matched wall regression or <=0.05% gain, not a
+- [x] Reject a candidate on matched wall regression or <=0.05% gain, not a
   deterministic tie-breaking hash difference.
 
 ## Task 4: Reduce to the winner stack and update the one PR
@@ -162,7 +162,7 @@ remains enabled in both arms of every later bracket.
 **Files:** production files touched by retained candidates, tests, this plan,
 the ledger, raw receipts, and `NOTICE`.
 
-- [ ] Remove every rejected experimental implementation from production while
+- [x] Remove every rejected experimental implementation from production while
   preserving its receipt and row-level disposition.
 - [ ] Run `uv run --frozen --with pytest pytest -q`, inventory reproduction,
   focused Ruff, receipt schema checks, stub scan, and `git diff --check`.

@@ -100,13 +100,23 @@ def test_exact_qwen38_27b_control_contract_is_accepted() -> None:
     assert contract.packing == "mlx_affine_u32_le"
 
 
-def test_final_route_is_only_the_chronological_winner_stack() -> None:
+def test_final_route_is_only_the_chronological_winner_stack(monkeypatch) -> None:
+    monkeypatch.delenv("MTPLX_QWEN38_DISABLE_SOURCE_AUTO", raising=False)
     assert dict(QWEN38_FINAL_ROUTE) == {
         "cache_route": "kv_only_history",
         "dual_norm": True,
         "qmv_final": True,
+        "source_proposal": True,
+        "source_retain_control": False,
     }
     assert qwen38_final_route() == dict(QWEN38_FINAL_ROUTE)
+
+    monkeypatch.setenv("MTPLX_QWEN38_DISABLE_SOURCE_AUTO", "1")
+    assert qwen38_final_route() == {
+        "cache_route": "kv_only_history",
+        "dual_norm": True,
+        "qmv_final": True,
+    }
 
 
 @pytest.mark.parametrize(

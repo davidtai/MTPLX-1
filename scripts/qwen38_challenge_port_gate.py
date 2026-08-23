@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import importlib.metadata
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -379,6 +380,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    # The ordinary runtime installs the retained production route and drops
+    # its controls. This harness must switch both directions inside one process
+    # for ABBA, so it installs candidates explicitly after the common load.
+    os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] = "1"
     model_path = args.model.expanduser().resolve()
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,

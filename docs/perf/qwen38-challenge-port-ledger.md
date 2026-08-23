@@ -11,7 +11,7 @@ mechanism mapping is in
 - Source gate: `(score / previous promoted score - 1) * 100 > 0.10`.
 - Promoted Yukon rows: 82; above-threshold source rows: 54.
 - Challenge pin: `eb5eadc7a165047d4321ce883b9ff30894d8bd19`.
-- MTPLX base pin: `bd4421567f9e16ce957c6ef97708b072dcd73937`.
+- MTPLX branch base pin: `c1300f17c66e5fef7810efa80f2a53489b8d001d`.
 - Inventory check: `python scripts/qwen38_challenge_inventory.py --check`.
 
 The 54 rows are not 54 independent ports. Controlled resamples, no-ops,
@@ -38,17 +38,21 @@ prompt is built from `mtplx/generation.py` with the intact
 
 | Order | Source rows / final descendant | Candidate | 16K wall delta | Decision |
 | ---: | --- | --- | ---: | --- |
-| 1 | 11, 20 | K/V-only committed-history append | **+1.9268%** | **Retain as S1**, active only when original request context is at least 16,384 tokens. Exact output/schedule; flat memory. |
-| 2 | 21 | fused Q/K RMSNorm + partial RoPE | **-0.2034%** | Reject and remove. Token drift was not the rejection reason; wall time lost. |
-| 3 | 45 | boundary residual/RMSNorm fusion | **-0.0130%** | Reject and remove as flat/losing; peak memory increased. |
-| 4 | 60, 61 | dual pre-FC RMSNorm / concat-free output | **+0.0505%** | Reject and remove as below the 0.10% floor after a conditioned rerun on corrected S1. |
-| 5 | 19, 34, 36, 39, 40, 41, 70, 78, 80 | final cross-row affine-4 QMV, adapted to group-32 trunk plus group-64 islands | **+0.0618%** | Reject and remove as below the 0.10% floor; decode throughput also slightly regressed. |
-| 6 | 10, 42, 46, 47, 67, 69, 71, 79, 82 | final compact Q2 coarse/exact proposal head | **-1.3792%** | Reject and remove. |
+| 1 | 3 | packed target attention Q/K/V | **-4.0629%** | Reject and remove. The corrected isolated arm engaged attention only; the earlier positive arm was invalid because it also packed MLP projections. |
+| 2 | 13 | fused GDN QKV+Z and B+A projection pairs | **-7.2989%** | Reject and remove after 7,392 engaged pair calls per candidate arm. |
+| 3 | 11, 20 | K/V-only committed-history append | **+1.9268%** | **Retain as S1**, active only when original request context is at least 16,384 tokens. Exact output/schedule; flat memory. |
+| 4 | 21 | fused Q/K RMSNorm + partial RoPE | **-0.2034%** | Reject and remove. Token drift was not the rejection reason; wall time lost. |
+| 5 | 45 | boundary residual/RMSNorm fusion | **-0.0130%** | Reject and remove as flat/losing; peak memory increased. |
+| 6 | 60, 61 | dual pre-FC RMSNorm / concat-free output | **+0.0505%** | **Retain as S2** under the revised strict `>0.05%` local gate. |
+| 7 | 19, 34, 36, 39, 40, 41, 70, 78, 80 | final cross-row affine-4 QMV, adapted to group-32 target trunk and group-64 source head | **+0.2528%** | **Retain as S3** after correcting the group-size indexing and measuring on S1+S2. |
+| 8 | 10, 42, 46, 47, 67, 69, 71, 79, 82 | source Q4 proposal body with BF16 Q/K/V islands, E87 Q2 cluster shortlist, fused row top-32, and selected Q4 rerank | **+2.8631%** | **Retain as S4**. Both routes were deterministic and completed 1,024 tokens; proposal drift is allowed. |
 
-The final production stack is therefore **S1: K/V-only history at request
-context >=16,384**. The route uses the original request length rather than the
-truncated 8K committed-history window. Below the threshold the runtime calls
-the existing stock append directly.
+The final production stack is **S4: S1 K/V-only history + S2 dual norm + S3
+target-shaped final QMV + S4 source proposal stack**. The history route uses
+the original request length rather than the truncated 8K committed-history
+window. Below the threshold it falls back to the existing stock append. The
+proposal artifact is immutable and proposal-only; every emitted token remains
+target-verified.
 
 ## 16K prefill/decode/memory table
 
@@ -58,6 +62,10 @@ between brackets, so only the matched routes within one receipt are compared.
 
 | Candidate | Arm | Prefill tok/s | Decode tok/s | Peak GiB | Mean wall s | Generated | Wall delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Packed Q/K/V | C: Optimized-Speed | 754.031 | 51.803 | 25.569 | 42.006 | 1,024 | - |
+|  | N: packed attention Q/K/V | 761.534 | 46.971 | 25.569 | 43.785 | 1,024 | **-4.0629%** |
+| GDN pairs | C: Optimized-Speed | 756.716 | 52.217 | 27.244 | 41.744 | 1,024 | - |
+|  | N: fused QKVZ + BA | 694.867 | 49.341 | 27.244 | 45.031 | 1,024 | **-7.2989%** |
 | K/V-only history | C: Optimized-Speed | 746.426 | 52.224 | 24.885 | 42.058 | 1,024 | - |
 |  | N: K/V-only >=16K | 771.941 | 51.397 | 24.885 | 41.263 | 1,024 | **+1.9268%** |
 | Q/K norm + RoPE | C: S1 | 774.028 | 51.919 | 24.885 | 40.990 | 1,024 | - |
@@ -66,16 +74,19 @@ between brackets, so only the matched routes within one receipt are compared.
 |  | N: S1 + boundary | 782.377 | 51.616 | 24.944 | 40.891 | 1,024 | **-0.0130%** |
 | Dual norm | C: S1 | 782.799 | 52.099 | 24.885 | 40.682 | 1,024 | - |
 |  | N: S1 + dual | 786.854 | 51.911 | 24.885 | 40.661 | 1,024 | **+0.0505%** |
-| Final QMV | C: S1 | 782.860 | 51.626 | 24.885 | 40.861 | 1,024 | - |
-|  | N: S1 + QMV | 784.808 | 51.592 | 24.885 | 40.836 | 1,024 | **+0.0618%** |
-| Compact head | C: S1 | 760.692 | 50.715 | 24.885 | 41.841 | 1,024 | - |
-|  | N: S1 + compact | 759.563 | 49.345 | 24.885 | 42.426 | 1,024 | **-1.3792%** |
+| Final QMV | C: S1 + dual | 716.905 | 49.979 | 24.885 | 43.465 | 1,024 | - |
+|  | N: S1 + dual + QMV | 724.324 | 49.630 | 24.885 | 43.355 | 1,024 | **+0.2528%** |
+| Source proposal | C: S1 + dual + QMV | 741.592 | 50.267 | 25.707 | 42.585 | 1,024 | - |
+|  | N: final S4 stack | 757.719 | 52.035 | 25.707 | 41.400 | 1,024 | **+2.8631%** |
 
 K/V has direct causal evidence beyond the aggregate wall delta. Its two timed
 arms reduced prompt MTP-history append from 0.448-0.485 seconds to
 0.112-0.116 seconds. Dual norm's corrected rerun engaged 877 calls in both
-candidate arms but improved total wall by only 0.0505%, below the requested
-floor.
+candidate arms and narrowly cleared the revised floor. C8 engaged 918 calls
+per timed arm for each of E87 probe selection, fused row top-32, selected Q4
+rerank, the Q precision island, and proposal selection; K and V islands each
+engaged 1,207 times. Its timed control and candidate arms had the same matched
+25.707 GiB peak because both route objects were resident for ABBA switching.
 
 The Q/K receipt predates the final tie-breaking classification and marks its
 cross-route token drift as `correctness.passed=false`. Both routes were
@@ -92,22 +103,26 @@ hash difference.
 | Superseded / removed later | intermediate compact-head, QMV, fusion, and calibration variants | Only the final surviving descendant receives an MTPLX gate. |
 | Challenge-only | Swift worker plumbing, declared-head staging, Metal command-buffer/residency policy, trusted-worker target top-2 ledger | No equivalent consumer or ownership boundary exists in Python MTPLX. |
 | Source-specific | one-forward SDPA workaround and source depth floor 6/cap 7 | MTPLX has no matching SDPA width wall and the measured policy is depth 3. |
-| Artifact/provenance | challenge precision-island compact artifact | It targets a different head, lacks redistribution metadata, and its final compact descendant loses. |
+| Artifact/provenance | declared compact/island artifact | Retained by exact HF revision, raw LFS SHA-256, byte count, metadata, and tensor-shape checks. Runtime resolution is cache/path-only and never downloads implicitly. |
 
 ## Authoritative receipts
 
 - Retained S1:
   `conditioned-s1-kv-ge16384-request-context-python-long16384in-1024out-t1-abba-2026-08-23.json`.
-- Corrected dual-on-S1 rejection:
+- Retained S2:
   `conditioned-r61-dual-stack-corrected-s1-python-long16384in-1024out-t1-abba-2026-08-23.json`.
-- Remaining chronological rejections: the `chrono-r21`, `chrono-r45`,
-  `chrono-r80`, and `chrono-r82` 16K receipts in the same directory.
+- Retained S3:
+  `c7-qmv-g32-g64-on-c3-c6-python16384in-1024out-t1-abba-2026-08-23.json`.
+- Retained S4:
+  `c8-source-proposal-on-c3-c6-c7-python16384in-1024out-t1-abba-2026-08-23.json`.
+- Rejections: the corrected `c1-packed-qkv`, `c2-gdn-projection-pairs`,
+  `chrono-r21`, and `chrono-r45` 16K receipts in the same directory.
 - QMV numerical tie audit:
   `qmv-final-g32-g64-real-model-numeric-parity-2026-08-23.json`. QMV was
   rejected for performance, not parity.
 - Static benchmark contract:
   `receipts/qwen38-challenge-port/control-contract-2026-08-23.md`.
 
-The final route receipt names only
-`qwen38_mtp_kv_only_history_ge16384_v1`; rejected experimental kernels are
-absent from the production path.
+The final route names only the four retained families. Rejected packed-QKV,
+GDN-pair, Q/K-RoPE, and boundary-norm experiments are absent from the
+production path.
