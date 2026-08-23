@@ -45,17 +45,17 @@ is measured in Cn. Every skip states the concrete reason.
 | 6 | 37 | 1.7673% | Reuse target top-2 top-1 as argmax | Skip challenge-only: no duplicate target argmax exists in MTPLX. |
 | 7 | 38 | 20.4283% | Committed MTP history | Skip already present: persistent committed draft history is the measured control. |
 | 8 | 41 | 17.9183% | History/sync/fusion/checkpoint/depth bundle | Split: existing history/sync/checkpoints; projection pieces go through C1/C2; source depth policy is inapplicable to fixed D3. |
-| 9 | 55 | 6.8764% | Paired affine QMV | Covered by final cross-row QMV C7. |
+| 9 | 55 | 6.8764% | Paired affine QMV | Superseded by C7, which was benchmarked and rejected locally. |
 | 10 | 59 | 5.3467% | Warmed compact vocabulary | Covered by final faithful compact artifact C8. |
 | 11 | 63 | 5.7425% | Cost model, seed warm, early flush | Existing controller/warm framework; surviving early-flush work is measured in K/V history C3. |
 | 12 | 70 | 0.8266% | Lazy exact prefix replay | Skip already present: capture/commit replay and recurrent repair are control behavior. |
 | 13 | 71 | 2.0944% | Fused GDN QKV+Z and B+A inputs | **Benchmark C2** using the source's two packed affine projections, not the optional unmeasured four-to-one variant. |
 | 14 | 77 | 0.9839% | Prefix replay restack | Skip duplicate of already-present row 12 behavior. |
-| 15 | 95 | 3.7597% | Width-6..9 chunking | Covered by final QMV C7; fixed D3 never reaches source verify widths 6..9. |
+| 15 | 95 | 3.7597% | Width-6..9 chunking | Superseded by rejected C7; fixed D3 never reaches source verify widths 6..9. |
 | 16 | 103 | 0.5808% | Compiled GDN g/beta/post-norm satellites | Skip already present: the complete target verify is one compiled graph and the promoted tape backend carries recurrence inputs into replay. Add an engagement receipt proving both paths. |
 | 17 | 126 | 7.5460% | Q4/group-64 draft head | Skip already present: this is the installed Turbo draft construction. |
 | 18 | 135 | 0.4535% | One-forward SDPA width bridge | Skip target-shape no-op: source fixes widths 6..9; fixed D3 target verify uses widths 2..4. |
-| 19 | 160 | 2.5391% | Wider cross-row QMV/readout | Covered by final QMV C7 and compact C8 descendants. |
+| 19 | 160 | 2.5391% | Wider cross-row QMV/readout | Target-QMV portion rejected through C7; compact proposal portion retained through C8. |
 | 20 | 180 | 0.9180% | K/V-only committed-history append | **Benchmark C3** against the C1+C2 winner stack. |
 | 21 | 186 | 1.5222% | Fused Q/K RMSNorm plus partial RoPE | **Benchmark C4** against the retained stack through C3. |
 | 23 | 215 | 0.2964% | Two-level compact selector | Covered by final compact C8. |
@@ -66,13 +66,13 @@ is measured in Cn. Every skip states the concrete reason.
 | 30 | 350 | 0.4202% | Verify hidden reuse and compiled output gate | Skip already present: `post_norm` is returned from the norm already used by logits, and the output gate sits inside whole-verify compilation. Add an engagement receipt. |
 | 32 | 365 | 0.1764% | Streak-gate restore | Skip superseded by row 59 and no-op under fixed D3. |
 | 33 | 401 | 1.7181% | Q4 head plus BF16 Q/K/V precision islands | Covered by C8, which must use the source-pinned island tensors rather than reconstructing a plain Q4 head. |
-| 34 | 405 | 0.6815% | Direct-nibble QMV M=6,9 | Covered by final QMV C7. |
-| 36 | 423 | 1.6826% | Precision islands plus direct-nibble M=8 | Island portion covered by C8; QMV portion covered by C7. |
+| 34 | 405 | 0.6815% | Direct-nibble QMV M=6,9 | Superseded by rejected C7. |
+| 36 | 423 | 1.6826% | Precision islands plus direct-nibble M=8 | Island portion retained by C8; target-QMV portion rejected through C7. |
 | 37 | 428 | 0.1477% | Precision-island restack | Covered by C8; no independent operation. |
 | 38 | 430 | 0.6244% | Reuse `HiddenAndNormed` | Skip already present: MTPLX's `post_norm` result is shared between target logits and committed draft history. Add an engagement receipt. |
-| 39 | 437 | 0.3030% | Affine-4 QMV M=4 | Covered by final QMV C7. |
-| 40 | 438 | 0.6643% | Direct-nibble QMV M=7 | Covered by final QMV C7. |
-| 41 | 450 | 0.4931% | Direct-nibble QMV M=3,4,5,7 | Covered by final QMV C7. |
+| 39 | 437 | 0.3030% | Affine-4 QMV M=4 | Superseded by rejected C7. |
+| 40 | 438 | 0.6643% | Direct-nibble QMV M=7 | Superseded by rejected C7. |
+| 41 | 450 | 0.4931% | Direct-nibble QMV M=3,4,5,7 | Superseded by rejected C7. |
 | 42 | 472 | 1.4130% | Affine-2 shortlist plus affine-4 rerank | Covered by final faithful compact C8. |
 | 45 | 505 | 0.4408% | Boundary residual/RMSNorm fusion | **Benchmark C5.** |
 | 47 | 530 | 0.5687% | 32-value/lane affine-2 QMV | Covered by final faithful compact C8. |
@@ -86,12 +86,12 @@ is measured in Cn. Every skip states the concrete reason.
 | 66 | 965 | 0.3080% | Variance resample | Skip no-op: no source code change to port. |
 | 67 | 968 | 0.3523% | Selected affine-4 rerank | Covered by final faithful compact C8. |
 | 69 | 1031 | 0.2133% | E87 two-dispatch shortlist | Covered by final faithful compact C8. |
-| 70 | 1063 | 3.9125% | Hoisted QMV activation chunk sums | Covered by final QMV C7. |
+| 70 | 1063 | 3.9125% | Hoisted QMV activation chunk sums | Superseded by rejected C7. |
 | 71 | 1066 | 0.7439% | E121 affine-2 cluster QMV | Covered by final faithful compact C8. |
-| 78 | 1123 | 4.3907% | Tight active-group QMV launch | Covered by final QMV C7. |
+| 78 | 1123 | 4.3907% | Tight active-group QMV launch | Superseded by rejected C7. |
 | 79 | 1130 | 0.2444% | Restore compact probe fraction | Covered by final faithful compact C8. |
-| 80 | 1139 | 0.3477% | Tight QMV launch for M=2 | **Benchmark C7** as the final surviving cross-row QMV family. |
-| 82 | 1153 | 0.3733% | Skip unused compact probe-sort JIT | **Benchmark C8** as the final compact descendant, preserving the pinned precision islands. |
+| 80 | 1139 | 0.3477% | Tight QMV launch for M=2 | **C7 rejected** at -0.7253% on the clean C3+C6 regate. |
+| 82 | 1153 | 0.3733% | Skip unused compact probe-sort JIT | **C8 retained** at +4.2007% on C3+C6, preserving the pinned precision islands. |
 
 Count: 54 qualifying rows = 8 real cumulative candidates + 23 rows covered
 by a later measured descendant + 23 evidence-backed skips.
@@ -107,7 +107,7 @@ by a later measured descendant + 23 evidence-backed skips.
 | C5 | row 45 | boundary residual/RMSNorm | Measure on retained C1-C4 stack. |
 | C6 | row 61 | concat-free dual pre-FC RMSNorm | Measure on retained C1-C5 stack. |
 | C7 | row 80 | final cross-row affine-4 QMV adapted to group-32 trunk and group-64 islands | Measure on retained C1-C6 stack. |
-| C8 | row 82 | final compact selector/reranker with source-pinned precision islands | Measure last on retained C1-C7 stack. |
+| C8 | row 82 | final compact selector/reranker with source-pinned precision islands | Measure last on the retained stack after dropping any C7 loss. |
 
 No percentage is added or multiplied. If a candidate wins, its implementation
 remains enabled in both arms of every later bracket.
@@ -149,14 +149,14 @@ remains enabled in both arms of every later bracket.
 **Files:** `docs/perf/receipts/qwen38-challenge-port/*.json`,
 `docs/perf/qwen38-challenge-port-ledger.md`.
 
-- [ ] Acquire the exclusive GPU lock and confirm no unrelated owner for the
+- [x] Acquire the exclusive GPU lock and confirm no unrelated owner for the
   clean confirmation campaign.
-- [ ] Re-run retained C3 then C6 from the clean immutable candidate commit;
+- [x] Re-run retained C3 then C6 from the clean immutable candidate commit;
   promote each strict >0.05% winner immediately.
-- [ ] Re-run C7-C8 if the clean retained base differs from the recorded stack.
-- [ ] Use one conditioning generation per unique route and exactly four timed
+- [x] Re-run C7-C8 if the clean retained base differs from the recorded stack.
+- [x] Use one conditioning generation per unique route and exactly four timed
   ABBA arms; do not add BAAB or additional timed arms.
-- [ ] Reject a candidate on matched wall regression or <=0.05% gain, not a
+- [x] Reject a candidate on matched wall regression or <=0.05% gain, not a
   deterministic tie-breaking hash difference.
 
 ## Task 4: Reduce to the winner stack and update the one PR
@@ -164,7 +164,7 @@ remains enabled in both arms of every later bracket.
 **Files:** production files touched by retained candidates, tests, this plan,
 the ledger, raw receipts, and `NOTICE`.
 
-- [ ] Remove every rejected experimental implementation from production while
+- [x] Remove every rejected experimental implementation from production while
   preserving its receipt and row-level disposition.
 - [ ] Run `uv run --frozen --with pytest pytest -q`, inventory reproduction,
   focused Ruff, receipt schema checks, stub scan, and `git diff --check`. The

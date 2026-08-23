@@ -171,7 +171,6 @@ def _validate_route_id(route_id: str) -> set[str]:
         "gdn_projection_pairs",
         "kv_only_history",
         "dual_norm",
-        "qmv_final",
         "source_proposal",
     }
     unknown = features - allowed
@@ -225,17 +224,13 @@ def _promotion_decision(
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.gdn_capture import GDN_PROJECTION_COUNTERS
     from mtplx.packed_concats import COUNTERS as PACKED_CONCAT_COUNTERS
-    from mtplx.qwen38_challenge_kernels import (
-        qwen38_dual_norm_counter_snapshot,
-        qwen38_qmv_counter_snapshot,
-    )
+    from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
 
     return {
         "packed_qkv": dict(PACKED_CONCAT_COUNTERS),
         "gdn_projection_pairs": dict(GDN_PROJECTION_COUNTERS),
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
-        "qmv_final": qwen38_qmv_counter_snapshot(),
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -355,7 +350,6 @@ def _run_arm(
         packed_qkv="packed_qkv" in features,
         gdn_projection_pairs="gdn_projection_pairs" in features,
         dual_norm="dual_norm" in features,
-        qmv_final="qmv_final" in features,
         source_proposal="source_proposal" in features,
         source_artifact_path=source_artifact_path,
     )

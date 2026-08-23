@@ -41,15 +41,15 @@ prompt is built from `mtplx/generation.py` with the intact
 | ---: | --- | --- | ---: | --- |
 | 1 | 3 | packed target attention Q/K/V | **-4.0629%** | Reject and remove. The corrected isolated arm engaged attention only; the earlier positive arm was invalid because it also packed MLP projections. |
 | 2 | 13 | fused GDN QKV+Z and B+A projection pairs | **-7.2989%** | Reject and remove after 7,392 engaged pair calls per candidate arm. |
-| 3 | 11, 20 | K/V-only committed-history append | **+1.9268%** | **Retain as S1**, active only when original request context is at least 16,384 tokens. Exact output/schedule; flat memory. |
+| 3 | 11, 20 | K/V-only committed-history append | **+2.3680%** | **Retain as S1**, active only when original request context is at least 16,384 tokens. Exact output/schedule; flat memory. |
 | 4 | 21 | fused Q/K RMSNorm + partial RoPE | **-0.2034%** | Reject and remove. Token drift was not the rejection reason; wall time lost. |
 | 5 | 45 | boundary residual/RMSNorm fusion | **-0.0130%** | Reject and remove as flat/losing; peak memory increased. |
-| 6 | 60, 61 | dual pre-FC RMSNorm / concat-free output | **+0.0505%** | **Retain as S2** under the revised strict `>0.05%` local gate. |
-| 7 | 19, 34, 36, 39, 40, 41, 70, 78, 80 | final cross-row affine-4 QMV, adapted to group-32 target trunk and group-64 source head | **+0.2528%** | **Retain as S3** after correcting the group-size indexing and measuring on S1+S2. |
-| 8 | 10, 42, 46, 47, 67, 69, 71, 79, 82 | source Q4 proposal body with BF16 Q/K/V islands, E87 Q2 cluster shortlist, fused row top-32, and selected Q4 rerank | **+2.8631%** | **Retain as S4**. Both routes were deterministic and completed 1,024 tokens; proposal drift is allowed. |
+| 6 | 60, 61 | dual pre-FC RMSNorm / concat-free output | **+1.7907%** | **Retain as S2** under the revised strict `>0.05%` local gate. |
+| 7 | 19, 34, 36, 39, 40, 41, 70, 78, 80 | final cross-row affine-4 QMV, adapted to group-32 target trunk and group-64 source head | **-0.7253%** | Reject and remove after a clean S1+S2 regate. Both candidate arms engaged 296 group-32 M=2 and 42,920 group-32 M=4 calls; exact parity did not rescue the wall regression. |
+| 8 | 10, 42, 46, 47, 67, 69, 71, 79, 82 | source Q4 proposal body with BF16 Q/K/V islands, E87 Q2 cluster shortlist, fused row top-32, and selected Q4 rerank | **+4.2007%** | **Retain as S3** on S1+S2. Both routes were deterministic and completed 1,024 tokens; proposal drift is allowed. |
 
-The final production stack is **S4: S1 K/V-only history + S2 dual norm + S3
-target-shaped final QMV + S4 source proposal stack**. The history route uses
+The final production stack is **S3: S1 K/V-only history + S2 dual norm + S3
+source proposal stack**. The history route uses
 the original request length rather than the truncated 8K committed-history
 window. Below the threshold it falls back to the existing stock append. The
 proposal artifact is immutable and proposal-only; every emitted token remains
@@ -67,26 +67,26 @@ between brackets, so only the matched routes within one receipt are compared.
 |  | N: packed attention Q/K/V | 761.534 | 46.971 | 25.569 | 43.785 | 1,024 | **-4.0629%** |
 | GDN pairs | C: Optimized-Speed | 756.716 | 52.217 | 27.244 | 41.744 | 1,024 | - |
 |  | N: fused QKVZ + BA | 694.867 | 49.341 | 27.244 | 45.031 | 1,024 | **-7.2989%** |
-| K/V-only history | C: Optimized-Speed | 746.426 | 52.224 | 24.885 | 42.058 | 1,024 | - |
-|  | N: K/V-only >=16K | 771.941 | 51.397 | 24.885 | 41.263 | 1,024 | **+1.9268%** |
+| K/V-only history | C: Optimized-Speed | 757.003 | 52.576 | 24.885 | 41.605 | 1,024 | - |
+|  | N: K/V-only >=16K | 778.244 | 52.544 | 24.885 | 40.643 | 1,024 | **+2.3680%** |
 | Q/K norm + RoPE | C: S1 | 774.028 | 51.919 | 24.885 | 40.990 | 1,024 | - |
 |  | N: S1 + Q/K | 776.849 | 51.492 | 24.885 | 41.073 | 1,024 | **-0.2034%** |
 | Boundary norm | C: S1 | 781.277 | 51.681 | 24.885 | 40.885 | 1,024 | - |
 |  | N: S1 + boundary | 782.377 | 51.616 | 24.944 | 40.891 | 1,024 | **-0.0130%** |
-| Dual norm | C: S1 | 782.799 | 52.099 | 24.885 | 40.682 | 1,024 | - |
-|  | N: S1 + dual | 786.854 | 51.911 | 24.885 | 40.661 | 1,024 | **+0.0505%** |
-| Final QMV | C: S1 + dual | 716.905 | 49.979 | 24.885 | 43.465 | 1,024 | - |
-|  | N: S1 + dual + QMV | 724.324 | 49.630 | 24.885 | 43.355 | 1,024 | **+0.2528%** |
-| Source proposal | C: S1 + dual + QMV | 741.592 | 50.267 | 25.707 | 42.585 | 1,024 | - |
-|  | N: final S4 stack | 757.719 | 52.035 | 25.707 | 41.400 | 1,024 | **+2.8631%** |
+| Dual norm | C: S1 | 750.642 | 52.609 | 24.885 | 41.436 | 1,024 | - |
+|  | N: S1 + dual | 780.373 | 52.219 | 24.885 | 40.707 | 1,024 | **+1.7907%** |
+| Final QMV | C: S1 + dual | 783.797 | 51.754 | 24.885 | 40.792 | 1,024 | - |
+|  | N: S1 + dual + QMV | 776.564 | 51.473 | 24.885 | 41.090 | 1,024 | **-0.7253%** |
+| Source proposal | C: S1 + dual | 739.856 | 51.591 | 25.707 | 42.131 | 1,024 | - |
+|  | N: final S3 stack | 763.518 | 54.245 | 25.707 | 40.432 | 1,024 | **+4.2007%** |
 
 K/V has direct causal evidence beyond the aggregate wall delta. Its two timed
 arms reduced prompt MTP-history append from 0.448-0.485 seconds to
-0.112-0.116 seconds. Dual norm's corrected rerun engaged 877 calls in both
-candidate arms and narrowly cleared the revised floor. C8 engaged 918 calls
-per timed arm for each of E87 probe selection, fused row top-32, selected Q4
-rerank, the Q precision island, and proposal selection; K and V islands each
-engaged 1,207 times. Its timed control and candidate arms had the same matched
+0.112-0.116 seconds. Dual norm's clean regate engaged 877 calls in both
+candidate arms and cleared the revised floor. C8 engaged 885 calls per timed
+arm for each of E87 probe selection, fused row top-32, selected Q4 rerank, the
+Q precision island, and proposal selection; K and V islands each engaged 1,163
+times. Its timed control and candidate arms had the same matched
 25.707 GiB peak because both route objects were resident for ABBA switching.
 
 The Q/K receipt predates the final tie-breaking classification and marks its
@@ -112,23 +112,23 @@ hash difference.
   `conditioned-s1-kv-ge16384-request-context-python-long16384in-1024out-t1-abba-2026-08-23.json`.
 - Retained S2:
   `conditioned-r61-dual-stack-corrected-s1-python-long16384in-1024out-t1-abba-2026-08-23.json`.
-- Retained S3:
+- Rejected C7:
   `c7-qmv-g32-g64-on-c3-c6-python16384in-1024out-t1-abba-2026-08-23.json`.
-- Retained S4:
-  `c8-source-proposal-on-c3-c6-c7-python16384in-1024out-t1-abba-2026-08-23.json`.
-- Production S4 control-release verification:
-  `final-s4-production-route-verify-2026-08-23.md` (25.041 GiB peak with the
-  BF16 control body and full Q4 control head released before generation).
+- Retained S3:
+  `c8-source-proposal-on-c3-c6-python16384in-1024out-t1-abba-2026-08-23.json`.
+- Production S3 control-release verification:
+  `final-s3-production-route-verify-2026-08-23.md`.
 - Rejections: the corrected `c1-packed-qkv`, `c2-gdn-projection-pairs`,
   `chrono-r21`, and `chrono-r45` 16K receipts in the same directory.
 - QMV numerical tie audit:
   `qmv-final-g32-g64-real-model-numeric-parity-2026-08-23.json`. This records
   the earlier uncorrected QMV attempt; it was rejected for performance, not
-  parity. Corrected, group-aware C7 is retained by the receipt above.
+  parity. The corrected, group-aware C7 regate above is the authoritative
+  rejection.
 - Static benchmark contract:
   `receipts/qwen38-challenge-port/control-contract-2026-08-23.md`.
 
-The final route names only the four retained families. Rejected packed-QKV,
-GDN-pair, Q/K-RoPE, and boundary-norm experiments are absent from the
+The final route names only the three retained families. Rejected packed-QKV,
+GDN-pair, Q/K-RoPE, boundary-norm, and final-QMV experiments are absent from the
 production path. C8's cross-repository weight dependency and lineage are
 declared in `qwen38-source-artifact-manifest.json` and staged by `mtplx pull`.

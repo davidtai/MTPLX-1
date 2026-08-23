@@ -281,16 +281,15 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "packed_qkv+gdn_projection_pairs+kv_only_history"
     ) == {"packed_qkv", "gdn_projection_pairs", "kv_only_history"}
     assert gate._validate_route_id(
-        "kv_only_history+dual_norm+qmv_final"
-    ) == {"kv_only_history", "dual_norm", "qmv_final"}
-    assert gate._validate_route_id(
-        "kv_only_history+dual_norm+qmv_final+source_proposal"
+        "kv_only_history+dual_norm+source_proposal"
     ) == {
         "kv_only_history",
         "dual_norm",
-        "qmv_final",
         "source_proposal",
     }
+
+    with pytest.raises(ValueError, match="unknown route features"):
+        gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
 
 
 def test_route_validation_rejects_control_combinations() -> None:

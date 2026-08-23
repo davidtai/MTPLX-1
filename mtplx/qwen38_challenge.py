@@ -14,7 +14,6 @@ from typing import Any
 
 from .gdn_capture import configure_qwen3_next_gdn_projection_pairs
 from .packed_concats import configure_qwen3_next_packed_qkv
-from .qwen38_challenge_kernels import configure_qwen38_final_qmv
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -29,7 +28,6 @@ QWEN38_FINAL_ROUTE: Mapping[str, Any] = MappingProxyType(
     {
         "cache_route": DEFAULT_QWEN38_CACHE_ROUTE,
         "dual_norm": True,
-        "qmv_final": True,
         "source_proposal": True,
         "source_retain_control": False,
     }
@@ -319,7 +317,6 @@ def install_qwen38_route(
     packed_qkv: bool = False,
     gdn_projection_pairs: bool = False,
     dual_norm: bool = False,
-    qmv_final: bool = False,
     source_proposal: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
@@ -406,20 +403,6 @@ def install_qwen38_route(
         route_features.append("dual_norm")
         kernel_ids.append("qwen38_dual_rms_norm_concat_bf16_v1")
         feature_receipt["dual_norm"] = {"active": 1}
-
-    qmv_report = configure_qwen38_final_qmv(
-        active=bool(qmv_final),
-        model=runtime.model,
-    )
-    if qmv_final:
-        if bool(qmv_report.get("installed")) and bool(qmv_report.get("active")):
-            route_features.append("qmv_final")
-            kernel_ids.append("qwen38_affine4_qmv_g32_g64_m2_m9_v2")
-            feature_receipt["qmv_final"] = {
-                "active": 1,
-                "installed": 1,
-                "bound_modules": int(qmv_report.get("bound_modules", 0)),
-            }
 
     source_report = configure_qwen38_source_proposal(
         runtime,

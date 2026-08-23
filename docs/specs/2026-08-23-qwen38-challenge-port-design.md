@@ -82,13 +82,19 @@ token correctness.
 Sources: submissions 10, 42, 47, 67, 69, 71, 79, and 82. Submission 46 is a
 dependency for the final top-32 candidate contract but has no standalone claim.
 
-### 3. Final wide affine-4 verification QMV
+### 3. Final wide affine-4 verification QMV — evaluated and rejected
 
-Port the final cross-row affine-4/group-64 family rather than each intermediate
+The final cross-row affine-4 family was ported as one candidate rather than as
+each intermediate
 kernel: direct-nibble packing for the retained widths, reusable activation
 chunk-sum tables where they amortize, width-specialized ownership for M=2..9,
 and exact active-group launch geometry. The candidate must preserve real Qwen
 3.8 shapes, BF16 activation order, packing, group size, and output layout.
+
+The corrected group-aware C7 route preserved exact output and schedule and
+engaged the intended kernels, but regressed matched 16K wall time by 0.7253%
+on top of C3+C6. It is therefore absent from the production route; the raw
+rejection receipt remains as evidence.
 
 Sources: submissions 19, 34, 36, 39, 40, 41, 70, 78, and 80. Submissions 9,
 15, and 44 are superseded ancestors.
@@ -190,7 +196,7 @@ the challenge bootstrap and has no preceding Yukon row.
 | 17 | 126 | 7.5460% | Declared Q4/group-64 head | ALREADY; later superseded by compact Q2/Q4 artifact |
 | 18 | 135 | 0.4535% | One-forward exact SDPA width bridge | PORT, fusion set |
 | 19 | 160 | 2.5391% | Wider cross-row QMV and fused draft readout | DEPENDENCY of final QMV/readout |
-| 20 | 180 | 0.9180% | K/V-only committed-history flush | RETAINED at original request context >=16K; exact cache and +1.9268% conditioned 16K ABBA win |
+| 20 | 180 | 0.9180% | K/V-only committed-history flush | RETAINED at original request context >=16K; exact cache and +2.3680% clean conditioned 16K ABBA win |
 | 21 | 186 | 1.5222% | Fused Q/K RMSNorm and partial RoPE | PORT, fusion set |
 | 22 | 194 | 0.0911% | Packed GDN prework mixer | WEAK, below threshold |
 | 23 | 215 | 0.2964% | Two-level compact selector | SUPERSEDED by E87 |

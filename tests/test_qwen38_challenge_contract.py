@@ -105,7 +105,6 @@ def test_final_route_is_only_the_chronological_winner_stack(monkeypatch) -> None
     assert dict(QWEN38_FINAL_ROUTE) == {
         "cache_route": "kv_only_history",
         "dual_norm": True,
-        "qmv_final": True,
         "source_proposal": True,
         "source_retain_control": False,
     }
@@ -115,7 +114,6 @@ def test_final_route_is_only_the_chronological_winner_stack(monkeypatch) -> None
     assert qwen38_final_route() == {
         "cache_route": "kv_only_history",
         "dual_norm": True,
-        "qmv_final": True,
     }
 
 
@@ -363,69 +361,3 @@ def test_retained_route_does_not_touch_rejected_projection_candidates(
     )
 
     assert calls == []
-
-
-def test_retained_c6_c7_stack_follows_kv_history(monkeypatch) -> None:
-    calls: list[bool] = []
-    monkeypatch.setattr(
-        "mtplx.qwen38_challenge.configure_qwen38_final_qmv",
-        lambda *, active, model: calls.append(active)
-        or {"installed": True, "active": True},
-        raising=False,
-    )
-    text = SimpleNamespace()
-    runtime = MTPLXRuntime(
-        model=SimpleNamespace(
-            language_model=text,
-            mtp_update_cache=_callable,
-            mtp_update_cache_kv_only_history=_callable,
-        ),
-        tokenizer=SimpleNamespace(),
-        model_path=MODEL_PATH,
-        mtp_enabled=True,
-        contract=MTPContract(),
-    )
-
-    route = install_qwen38_route(
-        runtime,
-        _config(),
-        MODEL_PATH,
-        cache_route="kv_only_history",
-        dual_norm=True,
-        qmv_final=True,
-    )
-
-    assert route.route_id == "kv_only_history+dual_norm+qmv_final"
-    assert text._mtplx_qwen38_dual_norm_concat is True
-    assert calls == [True]
-
-
-def test_qmv_request_degrades_cleanly_when_turbo_dispatcher_is_unavailable(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "mtplx.qwen38_challenge.configure_qwen38_final_qmv",
-        lambda *, active, model: {
-            "installed": False,
-            "active": False,
-            "bound_modules": 0,
-        },
-    )
-    runtime = MTPLXRuntime(
-        model=SimpleNamespace(mtp_update_cache=_callable),
-        tokenizer=SimpleNamespace(),
-        model_path=MODEL_PATH,
-        mtp_enabled=True,
-        contract=MTPContract(),
-    )
-
-    route = install_qwen38_route(
-        runtime,
-        _config(),
-        MODEL_PATH,
-        cache_route="control",
-        qmv_final=True,
-    )
-
-    assert route.route_id == "control"
-    assert "qwen38_affine4_qmv_g32_g64_m2_m9_v2" not in route.kernel_ids
