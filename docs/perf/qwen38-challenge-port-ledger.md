@@ -117,7 +117,8 @@ hash difference.
 - Retained S3:
   `c8-source-proposal-on-c3-c6-python16384in-1024out-t1-abba-2026-08-23.json`.
 - Production S3 control-release verification:
-  `final-s3-production-route-verify-2026-08-23.md`.
+  `final-s3-production-route-verify-2026-08-23.md` (816.916 prefill tok/s,
+  54.398 decode tok/s, 25.041 GiB peak, 38.990 s wall).
 - Rejections: the corrected `c1-packed-qkv`, `c2-gdn-projection-pairs`,
   `chrono-r21`, and `chrono-r45` 16K receipts in the same directory.
 - QMV numerical tie audit:
