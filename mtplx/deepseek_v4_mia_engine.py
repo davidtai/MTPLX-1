@@ -886,11 +886,12 @@ class MiaDeepseekV4EnginePlan:
         """Compile every serving phase with bounded, disposable cache state.
 
         A 128-row prefill reaches both ratio-4 and ratio-128 compressors and the
-        large-M Trellis plan.  One physical M6 target verify reaches the small-M
-        target plan, while the packaged K5 proposal reaches all three K64 draft
-        stages and the sequential Markov head.  Custom Metal kernels carry their
-        row counts as runtime arguments, so these dispatches compile the finite
-        pipeline set without a model-length-sized warmup.
+        large-M Trellis plan.  A direct M6 layer call compiles the prefill BM8
+        Trellis plan, while one physical M6 target verify reaches the direct-QMV
+        plan.  The packaged K5 proposal reaches all three K64 draft stages and
+        the sequential Markov head.  Custom Metal kernels carry their row counts
+        as runtime arguments, so these dispatches compile the finite pipeline set
+        without a model-length-sized warmup.
         """
 
         import mlx.core as mx
@@ -921,6 +922,15 @@ class MiaDeepseekV4EnginePlan:
             # signature without a second full target-model pass.
             mhc_rows = 384
             first_layer = model.model.layers[0]
+            prefill_m6_rows = 6
+            with attention_phase("prefill"):
+                prefill_m6 = first_layer.ffn(
+                    mx.zeros(
+                        (1, prefill_m6_rows, MIA_HIDDEN), dtype=mx.bfloat16
+                    ),
+                    mx.zeros((1, prefill_m6_rows), dtype=mx.uint32),
+                )
+            mx.eval(prefill_m6)
             mhc_residual, mhc_post, mhc_comb, mhc_y = (
                 model.model._mia_mhc.post_pre(
                     mx.zeros((mhc_rows, MIA_HIDDEN), dtype=mx.bfloat16),
@@ -1050,6 +1060,7 @@ class MiaDeepseekV4EnginePlan:
                     signature.name for signature in self.prewarm_signatures
                 ),
                 "prefill_rows": MIA_WINDOW,
+                "prefill_m6_rows": prefill_m6_rows,
                 "mhc_prefill_rows": mhc_rows,
                 "wo_m16_rows": wo_m16_rows,
                 "qkv_reduced_prefill_rows": qkv_prefill_rows,
@@ -1170,6 +1181,7 @@ def _mia_engine_identity(
             "mhc-post-pre-m384-bm64-bf16mma",
             "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
             "long-prefill-chunk1024",
+            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-qmv",
             "compressor-absolute-state-rings",
             "fixed-target-window-m8224",
             "persistent-target-draft-page-arenas",
@@ -1254,7 +1266,11 @@ def build_mia_engine_plan(
             f"installed Mia engine topology changed: {observed!r} != {expected!r}"
         )
 
-    from mtplx.models.deepseek_v4 import mia_tp1_wo_projection_receipt
+    from mtplx.deepseek_v4_exl3 import EXL3SwitchGLU
+    from mtplx.models.deepseek_v4 import (
+        _stock_moe_tail_combine,
+        mia_tp1_wo_projection_receipt,
+    )
 
     wo_projection_receipt = mia_tp1_wo_projection_receipt(model)
     if (
@@ -1395,9 +1411,20 @@ def build_mia_engine_plan(
             expected_sparse,
             expected_prefill,
         ) = _MIA_ATTENTION_ROUTE_CONTRACTS[ratio]
+        direct_qmv = getattr(layer.ffn, "_mia_exl3_direct_qmv", None)
+        trellis_fused = getattr(layer.ffn, "_mia_exl3_trellis_fused", None)
+        tail_combine = getattr(layer.ffn, "_mia_exl3_tail_combine", None)
         installed = (
             bool(getattr(layer.ffn.switch_mlp, "_trellis_installed", False)),
             _callable_name(getattr(layer.ffn, "_forward_impl", None)),
+            _callable_name(direct_qmv),
+            getattr(direct_qmv, "__self__", None) is layer.ffn.switch_mlp,
+            getattr(direct_qmv, "__func__", None) is EXL3SwitchGLU.direct_qmv,
+            _callable_name(trellis_fused),
+            getattr(trellis_fused, "__self__", None) is layer.ffn.switch_mlp,
+            getattr(trellis_fused, "__func__", None) is EXL3SwitchGLU.fused,
+            _callable_name(tail_combine),
+            tail_combine is _stock_moe_tail_combine,
             _callable_name(getattr(layer.ffn, "_input_rows_impl", None)),
             _callable_name(getattr(layer.ffn.gate, "_route_impl", None)),
             _callable_name(getattr(layer.attn, "_forward_impl", None)),
@@ -1448,6 +1475,14 @@ def build_mia_engine_plan(
         required = (
             True,
             "_mia_exl3_forward",
+            "direct_qmv",
+            True,
+            True,
+            "fused",
+            True,
+            True,
+            "_stock_moe_tail_combine",
+            True,
             "_required_input_rows",
             expected_gate,
             expected_forward,
@@ -1954,7 +1989,8 @@ def build_mia_engine_plan(
         ),
     )
     signatures = (
-        MiaPrewarmSignature("target_prefill_bm64", MIA_WINDOW, "prefill"),
+        MiaPrewarmSignature("target_prefill_m128_bm64", MIA_WINDOW, "prefill"),
+        MiaPrewarmSignature("target_prefill_m6_bm8", 6, "prefill"),
         MiaPrewarmSignature("mhc_post_pre_bf16_mma_bm64", 384, "prefill"),
         MiaPrewarmSignature("wo_a_quantized_output_m16", 16, "prefill"),
         MiaPrewarmSignature(
@@ -1962,7 +1998,7 @@ def build_mia_engine_plan(
         ),
         MiaPrewarmSignature("indexer_sparse_prefill", 1, "prefill"),
         MiaPrewarmSignature("indexer_sparse_decode", 1, "decode_verify"),
-        MiaPrewarmSignature("target_verify_m6_bm8", 6, "decode_verify"),
+        MiaPrewarmSignature("target_verify_m6_qmv", 6, "decode_verify"),
         MiaPrewarmSignature("dspark_k5_bm8", MIA_DSPARK_BLOCK, "decode_verify"),
     )
     installed_routes = (
@@ -1981,7 +2017,7 @@ def build_mia_engine_plan(
         "mla_decode_direct_stock432",
         "mla_prefill_nax_mg16_tile32",
         "mla_token_major_query_output_no_transpose",
-        "target_exl3_trellis_bm8_bm64",
+        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_direct_qmv",
         "wo_tp1_b12x_inv_rope_mxfp8_bm8_m16q_bm64",
         "nonexpert_native_mxfp8",
         "dspark_k5_direct_stock432_k64_native_mxfp4",

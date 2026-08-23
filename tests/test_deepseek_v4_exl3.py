@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,6 +12,7 @@ from safetensors import safe_open
 import mlx.core as mx
 
 import mtplx.deepseek_v4_exl3 as exl3
+import mtplx.models.deepseek_v4 as target_module
 from mtplx.deepseek_v4_exl3 import (
     EXL3SwitchGLU,
     decode_mcg_trellis_tile,
@@ -292,6 +293,89 @@ def test_trellis_swiglu_limit_is_a_valid_metal_float_literal(monkeypatch):
     exl3._trellis_activation_down_hadamard_kernel.__wrapped__(2048, 216, 10.0)
 
     assert "constant constexpr float LIMIT = 10.0f;" in captured["header"]
+
+
+def test_mia_exl3_install_binds_unconditional_direct_qmv_and_exact_tail(
+    monkeypatch,
+):
+    direct_source = inspect.getsource(EXL3SwitchGLU.direct_qmv)
+    assert "rows" not in direct_source
+    assert "mma" not in direct_source
+    assert "self.gate_proj(x_half, expert_ids)" in direct_source
+    assert "self.up_proj(x_half, expert_ids)" in direct_source
+    assert "self.down_proj(activated, expert_ids)" in direct_source
+
+    switch = EXL3SwitchGLU(128, 128, 2, 1, limit=0.0)
+    installs = []
+    monkeypatch.setattr(
+        switch,
+        "install_trellis_runtime",
+        lambda *, max_tokens: installs.append(max_tokens),
+    )
+    owner = SimpleNamespace(
+        switch_mlp=switch,
+        gate=SimpleNamespace(install_mia_router=lambda: installs.append("router")),
+    )
+    owner._mia_exl3_forward = MethodType(DeepseekV4MoE._mia_exl3_forward, owner)
+    owner._required_input_rows = DeepseekV4MoE._required_input_rows
+
+    DeepseekV4MoE.install_mia_exl3_runtime(owner, max_tokens=64)
+
+    assert owner._mia_exl3_direct_qmv.__self__ is switch
+    assert owner._mia_exl3_direct_qmv.__func__ is EXL3SwitchGLU.direct_qmv
+    assert owner._mia_exl3_trellis_fused.__self__ is switch
+    assert owner._mia_exl3_trellis_fused.__func__ is EXL3SwitchGLU.fused
+    assert owner._mia_exl3_tail_combine is target_module._stock_moe_tail_combine
+    assert installs == ["router", 64]
+
+
+def test_mia_exl3_forward_selects_direct_only_for_physical_m6_verify(monkeypatch):
+    phase = "decode_verify"
+    calls = []
+    indices = object()
+    weights = object()
+    shared = object()
+    routed = object()
+    direct_output = object()
+    trellis_output = object()
+
+    def direct(xf, observed_indices):
+        calls.append(("direct", xf, observed_indices))
+        return routed
+
+    def trellis(xf, observed_indices, observed_weights, observed_shared):
+        calls.append(
+            ("trellis", xf, observed_indices, observed_weights, observed_shared)
+        )
+        return trellis_output
+
+    def tail(observed_routed, observed_weights, observed_shared):
+        calls.append(("tail", observed_routed, observed_weights, observed_shared))
+        return direct_output
+
+    owner = SimpleNamespace(
+        gate=lambda _xf, _ids: (indices, weights),
+        shared_experts=lambda _xf: shared,
+        _mia_exl3_direct_qmv=direct,
+        _mia_exl3_trellis_fused=trellis,
+        _mia_exl3_tail_combine=tail,
+    )
+    monkeypatch.setattr(target_module, "current_attention_phase", lambda: phase)
+
+    verify_x = _StaticArray((6, 4096))
+    assert DeepseekV4MoE._mia_exl3_forward(owner, verify_x, None) is direct_output
+    assert [call[0] for call in calls] == ["direct", "tail"]
+
+    calls.clear()
+    phase = "prefill"
+    assert DeepseekV4MoE._mia_exl3_forward(owner, verify_x, None) is trellis_output
+    assert [call[0] for call in calls] == ["trellis"]
+
+    calls.clear()
+    phase = "decode_verify"
+    decode_x = _StaticArray((5, 4096))
+    assert DeepseekV4MoE._mia_exl3_forward(owner, decode_x, None) is trellis_output
+    assert [call[0] for call in calls] == ["trellis"]
 
 
 def test_installed_trellis_runtime_never_reenters_kernel_factories(monkeypatch):

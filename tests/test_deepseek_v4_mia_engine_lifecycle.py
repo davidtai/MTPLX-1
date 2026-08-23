@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import struct
@@ -149,6 +150,38 @@ def _patch_fake_mx(monkeypatch):
     monkeypatch.setattr(mx, "argmax", lambda *_args, **_kwargs: _FakeArray((1,)))
     monkeypatch.setattr(mx, "concatenate", lambda *_args, **_kwargs: _FakeArray((1, 6)))
     monkeypatch.setattr(mx, "eval", lambda *_args, **_kwargs: None)
+
+
+def test_engine_plan_seals_direct_qmv_owners_and_prewarm_signatures() -> None:
+    build_source = inspect.getsource(mia_engine.build_mia_engine_plan)
+    identity_source = inspect.getsource(mia_engine._mia_engine_identity)
+    prewarm_source = inspect.getsource(MiaDeepseekV4EnginePlan.prewarm)
+
+    assert "_mia_exl3_direct_qmv" in build_source
+    assert "EXL3SwitchGLU.direct_qmv" in build_source
+    assert "_mia_exl3_trellis_fused" in build_source
+    assert "EXL3SwitchGLU.fused" in build_source
+    assert "_mia_exl3_tail_combine" in build_source
+    assert "is _stock_moe_tail_combine" in build_source
+    assert "target_exl3_prefill_trellis_bm8_bm64_verify_m6_direct_qmv" in (
+        build_source
+    )
+    assert "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-qmv" in (
+        identity_source
+    )
+    assert 'MiaPrewarmSignature("target_prefill_m6_bm8", 6, "prefill")' in (
+        build_source
+    )
+    assert (
+        'MiaPrewarmSignature("target_prefill_m128_bm64", MIA_WINDOW, "prefill")'
+        in build_source
+    )
+    assert 'MiaPrewarmSignature("target_verify_m6_qmv", 6, "decode_verify")' in (
+        build_source
+    )
+    assert 'with attention_phase("prefill"):' in prewarm_source
+    assert "first_layer.ffn(" in prewarm_source
+    assert '"prefill_m6_rows": prefill_m6_rows' in prewarm_source
 
 
 def test_shared_indexer_rope_table_is_built_once_and_owned_by_every_ratio4_layer(
@@ -443,6 +476,7 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
             first = SimpleNamespace(
                 attn_hc=fake,
                 attn_norm=fake,
+                ffn=lambda *_args: events.append("ffn.prefill_m6") or fake,
                 attn=SimpleNamespace(
                     _output_projection_impl=lambda *_args: (
                         events.append("wo.m16") or fake
@@ -486,6 +520,7 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
     assert events == [
         "target.acquire",
         "target.settle",
+        "ffn.prefill_m6",
         "wo.m16",
         "qkv.m1024",
         "draft.acquire",
@@ -503,9 +538,11 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
     receipt = _plan(events).prewarm(successful)
 
     assert receipt["verify_rows"] == mia_engine.MIA_DSPARK_BLOCK + 1
+    assert receipt["prefill_m6_rows"] == 6
     assert events == [
         "target.acquire",
         "target.settle",
+        "ffn.prefill_m6",
         "wo.m16",
         "qkv.m1024",
         "draft.acquire",

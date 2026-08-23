@@ -1532,24 +1532,29 @@ class EXL3SwitchGLU(nn.Module):
             output_dtypes=[original_dtype],
         )[0]
 
-    def __call__(self, x: mx.array, expert_ids: mx.array) -> mx.array:
+    def direct_qmv(self, x: mx.array, expert_ids: mx.array) -> mx.array:
+        """Run the authentic direct-QMV MoE arithmetic unconditionally."""
+
         original_dtype = x.dtype
         x_half = x.astype(mx.float16)
-        rows = int(expert_ids.shape[0])
-        tasks = int(expert_ids.size)
-        # Packaged DSpark verifies one primary plus five future tokens.  Keep
-        # every M1..M6 decode/verify call on the authentic direct QMV kernel;
-        # route only wider prefill work to the sorted M-tiled MMA path.
-        mma = rows > 6
-        if not mma:
-            gate = self.gate_proj(x_half, expert_ids)
-            up = self.up_proj(x_half, expert_ids)
-            if self.limit > 0:
-                gate = mx.minimum(gate, self.limit)
-                up = mx.clip(up, -self.limit, self.limit)
-            activated = (nn.silu(gate) * up).astype(mx.float16)
-            return self.down_proj(activated, expert_ids).astype(original_dtype)
+        gate = self.gate_proj(x_half, expert_ids)
+        up = self.up_proj(x_half, expert_ids)
+        if self.limit > 0:
+            gate = mx.minimum(gate, self.limit)
+            up = mx.clip(up, -self.limit, self.limit)
+        activated = (nn.silu(gate) * up).astype(mx.float16)
+        return self.down_proj(activated, expert_ids).astype(original_dtype)
 
+    def __call__(self, x: mx.array, expert_ids: mx.array) -> mx.array:
+        rows = int(expert_ids.shape[0])
+        # Preserve the explicit stock/oracle compatibility route.  Production
+        # binds ``direct_qmv`` and ``fused`` separately at construction.
+        if rows <= 6:
+            return self.direct_qmv(x, expert_ids)
+
+        original_dtype = x.dtype
+        x_half = x.astype(mx.float16)
+        tasks = int(expert_ids.size)
         flat_ids = expert_ids.reshape(tasks).astype(mx.uint32)
         order = mx.argsort(flat_ids)
         inverse = mx.argsort(order)

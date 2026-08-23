@@ -378,20 +378,24 @@ created.  The enabled callables do not probe eligibility or fall back.
   scores are normalized then scaled by 1.5.  Source histogram, prefix, and
   expert-major route packing feed EXL3 MCG trellis payloads with H128 input
   transforms; fused clamped gate/up activation; down projection; route weight
-  reduction and shared-expert addition.  The launcher's exact decode graph
-  widths use BM8 and the construction-owned large-prefill arena uses BM64.
+  reduction and shared-expert addition.  Target prefill uses Trellis BM8 through
+  M127 and BM64 from M128, while the exact physical M6 verification phase uses
+  the source-backed direct-QMV projection sequence and stock weighted tail.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_moe_router.py` and the
-  installed `EXL3SwitchGLU.fused` path in `mtplx/deepseek_v4_exl3.py`.
+  installed `EXL3SwitchGLU.direct_qmv` / `EXL3SwitchGLU.fused` paths in
+  `mtplx/deepseek_v4_exl3.py`.
 - **Construction owner / installed callable:** each target `DeepseekV4MoE`
-  binds `_mia_exl3_forward`; each gate binds `_mia_hash_route` or
-  `_mia_score_route`; `EXL3SwitchGLU.install_trellis_runtime` binds the BM8 and
-  BM64 plans.  The fixed logical-M route uses BM8 through M127 and BM64 above;
-  this preserves M128 construction prewarm while the matched exact-model M127
-  gate avoids 4,032 BM64 slots for 762 routed tasks.  `_pack_trellis_routes` is
-  the enabled packer.
-- **Disposition:** source-derived Metal W4A16 port.  The older QMV and generic
-  `mx.argsort` implementations remain explicit stock/oracle code and are not
-  reachable from `_mia_exl3_forward`.
+  binds the exact `direct_qmv`, Trellis `fused`, and
+  `_stock_moe_tail_combine` callables before binding `_mia_exl3_forward`; each
+  gate binds `_mia_hash_route` or `_mia_score_route`.
+  `EXL3SwitchGLU.install_trellis_runtime` binds the BM8 and BM64 plans.  The
+  runtime selector uses direct QMV only when the phase is `decode_verify` and
+  the physical hidden row count is exactly six; every prefill and all other
+  widths use Trellis.  `_pack_trellis_routes` remains the enabled Trellis
+  packer.
+- **Disposition:** source-derived Metal W4A16 port.  Direct QMV is the measured
+  production M6 verification route; the generic `__call__` M-width selection
+  remains explicit compatibility/oracle code outside `_mia_exl3_forward`.
 
 ### 6. WO inverse-RoPE and two projections
 
@@ -519,13 +523,15 @@ created.  The enabled callables do not probe eligibility or fall back.
 - **Source:** `vllm/model_executor/warmup/b12x_sparse_indexer_warmup.py`,
   `deepseek_v4_compressor_warmup.py`, `kernel_warmup.py`, and Mia's eager
   launcher/capture configuration.
-- **Arithmetic and layout:** the finite serving signatures are target prefill
-  BM64, M384 mHC post-pre BF16 MMA BM64, exact-M16 WO-A quantized output,
-  sparse-indexer prefill, sparse-indexer decode, target M6 verification BM8,
-  and three-stage DSpark K5 BM8.  A 128-row target prefill reaches both
-  compressor ratios; direct M384 mHC and M16 WO calls cover their distinct
-  installed kernels without another full target pass; a 513-row synthetic
-  paged index view reaches top-512 without a long model forward.
+- **Arithmetic and layout:** the finite serving signatures are target M6
+  prefill Trellis BM8, target M128 prefill Trellis BM64, M384 mHC post-pre BF16
+  MMA BM64, exact-M16 WO-A quantized output, sparse-indexer prefill,
+  sparse-indexer decode, target M6 verification direct QMV, and three-stage
+  DSpark K5 BM8.  A 128-row target prefill reaches both compressor ratios; a
+  direct first-layer M6 prefill compiles its distinct Trellis BM8 route; direct
+  M384 mHC and M16 WO calls cover their distinct installed kernels without
+  another full target pass; a 513-row synthetic paged index view reaches
+  top-512 without a long model forward.
 - **MTPLX implementation:** `MiaDeepseekV4EnginePlan.prewarm`.
 - **Construction owner / installed callable:** the loader evaluates all weights
   and prewarms every signature before returning.  `DeepseekV4TargetOps` refuses

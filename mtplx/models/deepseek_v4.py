@@ -5893,7 +5893,15 @@ class DeepseekV4MoE(nn.Module):
         self, xf: mx.array, ids: Optional[mx.array]
     ) -> mx.array:
         indices, weights = self.gate(xf, ids)
-        return self.switch_mlp.fused(
+        phase = current_attention_phase()
+        if phase == "decode_verify" and int(xf.shape[0]) == 6:
+            routed = self._mia_exl3_direct_qmv(xf, indices)
+            return self._mia_exl3_tail_combine(
+                routed,
+                weights,
+                self.shared_experts(xf),
+            )
+        return self._mia_exl3_trellis_fused(
             xf,
             indices,
             weights,
@@ -5907,6 +5915,9 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError("Mia EXL3 runtime requires rank-sliced expert banks")
         self.gate.install_mia_router()
         self.switch_mlp.install_trellis_runtime(max_tokens=max_tokens)
+        self._mia_exl3_direct_qmv = self.switch_mlp.direct_qmv
+        self._mia_exl3_trellis_fused = self.switch_mlp.fused
+        self._mia_exl3_tail_combine = _stock_moe_tail_combine
         self._forward_impl = self._mia_exl3_forward
         self._input_rows_impl = self._required_input_rows
 
