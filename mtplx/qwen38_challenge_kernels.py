@@ -268,6 +268,8 @@ def configure_qwen38_row21_qk_rms_rope(model: Any, *, active: bool) -> dict[str,
     text = getattr(model, "language_model", model)
     inner = getattr(text, "model", text)
     layers = list(getattr(inner, "layers", ()) or ())
+    mtp = getattr(text, "mtp", None)
+    layers.extend(list(getattr(mtp, "layers", ()) or ()))
     eligible = 0
     for layer in layers:
         attention = getattr(layer, "self_attn", None)
@@ -276,11 +278,7 @@ def configure_qwen38_row21_qk_rms_rope(model: Any, *, active: bool) -> dict[str,
         is_eligible = _row21_attention_eligible(attention)
         attention._mtplx_qwen38_row21_active = bool(active and is_eligible)
         eligible += int(is_eligible)
-    return {
-        "eligible_modules": eligible,
-        "active_modules": eligible if active else 0,
-        "mtp_array_offset_skipped": 1,
-    }
+    return {"eligible_modules": eligible, "active_modules": eligible if active else 0}
 
 
 def qwen38_dual_rms_norm_concat(
