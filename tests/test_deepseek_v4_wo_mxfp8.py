@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mtplx.kernels import deepseek_v4_wo_mxfp8 as wo
 import mtplx.deepseek_v4_mia_engine as mia_engine
 from mtplx.models import deepseek_v4 as deepseek_v4_model
+
+
+_MIA_EXACT_MODEL = Path(
+    "/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-tp1"
+)
+_LAYER0_CARRIED = _MIA_EXACT_MODEL / "carried-001.safetensors"
+_WO_B_WEIGHT = "layers.0.attn.wo_b.weight"
+_WO_B_SCALE = "layers.0.attn.wo_b.scale"
 
 
 class _StaticArray:
@@ -79,6 +89,7 @@ def test_mia_e4m3_and_ceil_ue8m0_byte_oracles_pin_source_boundaries():
 
 def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeypatch):
     calls = []
+    decode_block_ns = []
 
     def kernel(name):
         def run(**kwargs):
@@ -99,9 +110,11 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         "_mxfp8_mma_kernel",
         lambda stage, block_m: kernel(f"{stage}_bm{block_m}"),
     )
-    monkeypatch.setattr(
-        wo, "_wo_b_decode_fused_quant_kernel", lambda: kernel("wo_b_decode")
-    )
+    def decode_kernel(block_n):
+        decode_block_ns.append(block_n)
+        return kernel(f"wo_b_decode_bn{block_n}")
+
+    monkeypatch.setattr(wo, "_wo_b_decode_fused_quant_kernel", decode_kernel)
     monkeypatch.setattr(
         wo,
         "_wo_a_m16_quantized_kernel",
@@ -116,6 +129,7 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
     assert plan.wo_b_weight is weights["wo_b_weight"]
     assert plan.wo_b_scales is weights["wo_b_scales"]
     assert plan.max_prefill_rows == 8224
+    assert decode_block_ns == [64]
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("installed WO execution re-entered a kernel factory")
@@ -141,7 +155,7 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         assert [name for name, _kwargs in calls] == [
             "inv_quant",
             "wo_a_bm8",
-            "wo_b_decode",
+            "wo_b_decode_bn64",
         ]
         inv_call = calls[0][1]
         assert inv_call["inputs"][1] is cos
@@ -151,6 +165,8 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         assert (1, rows, 64 * 512) not in inv_call["output_shapes"]
         assert calls[1][1]["output_shapes"] == [(rows, 8, 1024)]
         assert calls[1][1]["output_dtypes"] == [mx.bfloat16]
+        assert calls[2][1]["grid"] == (128, 64, 1)
+        assert calls[2][1]["threadgroup"] == (128, 1, 1)
 
     calls.clear()
     output = plan(
@@ -202,7 +218,9 @@ def test_tp1_wo_install_rejects_shape_or_storage_poison(
     monkeypatch.setattr(wo, "_inverse_rope_quant_kernel", lambda: object())
     monkeypatch.setattr(wo, "_group_major_quant_kernel", lambda: object())
     monkeypatch.setattr(wo, "_mxfp8_mma_kernel", lambda *_args: object())
-    monkeypatch.setattr(wo, "_wo_b_decode_fused_quant_kernel", lambda: object())
+    monkeypatch.setattr(
+        wo, "_wo_b_decode_fused_quant_kernel", lambda _block_n: object()
+    )
     monkeypatch.setattr(
         wo, "_wo_a_m16_quantized_kernel", lambda: object(), raising=False
     )
@@ -233,6 +251,54 @@ def test_wo_sources_pin_fp32_accumulation_logical_row_guards_and_no_bf16_wide_sc
         "simdgroup_multiply_accumulate(c_left, a, b_left, c_left);"
     ) == wo._MXFP8_MMA_SOURCE.count(
         "simdgroup_multiply_accumulate(c_right, a, b_right, c_right);"
+    )
+
+
+def test_authentic_mia_m6_wo_b_bn64_matches_bn32_bit_exact():
+    """The wider decode owner must preserve every BF16 output bit."""
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    if not _LAYER0_CARRIED.is_file():
+        pytest.skip("exact MiaAI TP1 artifact is not installed")
+
+    source = mx.load(str(_LAYER0_CARRIED))
+    weight = mx.contiguous(source[_WO_B_WEIGHT]).view(mx.uint32)
+    block_scales = source[_WO_B_SCALE]
+    scales = mx.contiguous(
+        mx.repeat(mx.repeat(block_scales, 128, axis=0), 4, axis=1)[
+            :4096, : 8192 // 32
+        ]
+    )
+
+    indices = mx.arange(6 * 8192, dtype=mx.uint32).reshape(6, 8192)
+    values = (
+        ((indices * 37) % 1021).astype(mx.float32) - 510.0
+    ) * 0.125
+    values = mx.where(indices % 4096 == 0, -0.0, values)
+    values = mx.where(indices % 4096 == 1, 448.0, values)
+    values = mx.where(indices % 4096 == 2, -448.0, values)
+    tmp = values.astype(mx.bfloat16)
+
+    def project(block_n):
+        threads = (block_n // 16) * 32
+        (output,) = wo._wo_b_decode_fused_quant_kernel(block_n)(
+            inputs=[tmp, weight, scales, 6],
+            template=[("T", mx.bfloat16)],
+            grid=(threads, 4096 // block_n, 1),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[(6, 4096)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return output
+
+    baseline = project(32)
+    candidate = project(64)
+    mx.eval(baseline, candidate)
+
+    np.testing.assert_array_equal(
+        np.array(candidate.view(mx.uint16)),
+        np.array(baseline.view(mx.uint16)),
     )
 
 
@@ -267,7 +333,9 @@ def test_exact_model_install_owns_46_distinct_plans_and_native_parameters(
     monkeypatch.setattr(wo, "_inverse_rope_quant_kernel", lambda: object())
     monkeypatch.setattr(wo, "_group_major_quant_kernel", lambda: object())
     monkeypatch.setattr(wo, "_mxfp8_mma_kernel", lambda *_args: object())
-    monkeypatch.setattr(wo, "_wo_b_decode_fused_quant_kernel", lambda: object())
+    monkeypatch.setattr(
+        wo, "_wo_b_decode_fused_quant_kernel", lambda _block_n: object()
+    )
     monkeypatch.setattr(
         wo, "_wo_a_m16_quantized_kernel", lambda: object(), raising=False
     )

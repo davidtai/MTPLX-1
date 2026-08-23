@@ -30,6 +30,9 @@ _WO_B_K = _GROUPS * _RANK
 _SCALE_GROUP = 32
 _BN = 32
 _BK = 32
+_WO_B_DECODE_BM = 8
+_WO_B_DECODE_BN = 64
+_WO_B_DECODE_BK = 32
 
 
 def mia_e4m3_encode_byte(value: float) -> int:
@@ -373,14 +376,14 @@ _MXFP8_MMA_SOURCE = r"""
 _WO_B_DECODE_FUSED_QUANT_SOURCE = r"""
     uint tid = thread_position_in_threadgroup.x;
     uint sg = simdgroup_index_in_threadgroup;
-    uint row0 = threadgroup_position_in_grid.z * 8u;
-    uint n0 = threadgroup_position_in_grid.y * 32u;
-    uint sg_n = (sg & 1u) * 16u;
+    uint row0 = threadgroup_position_in_grid.z * BM;
+    uint n0 = threadgroup_position_in_grid.y * BN;
+    uint sg_n = sg * 16u;
 
-    threadgroup T a_tile[8u * 32u];
-    threadgroup T b_tile[32u * 32u];
-    threadgroup float c_tile[8u * 32u];
-    threadgroup float quant_scales[8u];
+    threadgroup T a_tile[BM * BK];
+    threadgroup T b_tile[BK * BN];
+    threadgroup float c_tile[BM * BN];
+    threadgroup float quant_scales[BM];
     simdgroup_matrix<T, 8, 8> a, b_left, b_right;
     simdgroup_matrix<float, 8, 8> c_left =
         simdgroup_matrix<float, 8, 8>(0.0f);
@@ -389,15 +392,15 @@ _WO_B_DECODE_FUSED_QUANT_SOURCE = r"""
     const device uchar* weight_bytes =
         reinterpret_cast<const device uchar*>(weight);
 
-    for (uint k0 = 0u; k0 < 8192u; k0 += 32u) {
-        if (tid < 8u) {
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        if (tid < BM) {
             uint row = row0 + tid;
             float max_abs = 0.0f;
             if (row < uint(rows)) {
-                for (uint local_k = 0u; local_k < 32u; ++local_k) {
+                for (uint local_k = 0u; local_k < BK; ++local_k) {
                     max_abs = max(
                         max_abs,
-                        abs(float(tmp[size_t(row) * 8192u + k0 + local_k]))
+                        abs(float(tmp[size_t(row) * K + k0 + local_k]))
                     );
                 }
             }
@@ -405,48 +408,48 @@ _WO_B_DECODE_FUSED_QUANT_SOURCE = r"""
             quant_scales[tid] = exp2(float(exponent));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint index = tid; index < 8u * 32u; index += 64u) {
-            uint local_row = index / 32u;
-            uint local_k = index - local_row * 32u;
+        for (uint index = tid; index < BM * BK; index += THREADS) {
+            uint local_row = index / BK;
+            uint local_k = index - local_row * BK;
             uint row = row0 + local_row;
             float value = row < uint(rows)
-                ? float(tmp[size_t(row) * 8192u + k0 + local_k])
+                ? float(tmp[size_t(row) * K + k0 + local_k])
                 : 0.0f;
             float scale = quant_scales[local_row];
             uchar quantized = mia_e4m3_encode(value / scale);
             a_tile[index] = T(mia_e4m3_decode(quantized) * scale);
         }
-        for (uint index = tid; index < 32u * 32u; index += 64u) {
-            uint local_k = index / 32u;
-            uint local_n = index - local_k * 32u;
+        for (uint index = tid; index < BK * BN; index += THREADS) {
+            uint local_k = index / BN;
+            uint local_n = index - local_k * BN;
             uint k = k0 + local_k;
             uint n = n0 + local_n;
             float scale = mia_ue8m0_decode(
-                weight_scales[size_t(n) * 256u + k / 32u]
+                weight_scales[size_t(n) * (K / 32u) + k / 32u]
             );
             b_tile[index] = T(
-                mia_e4m3_decode(weight_bytes[size_t(n) * 8192u + k]) * scale
+                mia_e4m3_decode(weight_bytes[size_t(n) * K + k]) * scale
             );
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint ks = 0u; ks < 32u; ks += 8u) {
-            simdgroup_load(a, a_tile + ks, 32u);
-            simdgroup_load(b_left, b_tile + ks * 32u + sg_n, 32u);
-            simdgroup_load(b_right, b_tile + ks * 32u + sg_n + 8u, 32u);
+        for (uint ks = 0u; ks < BK; ks += 8u) {
+            simdgroup_load(a, a_tile + ks, BK);
+            simdgroup_load(b_left, b_tile + ks * BN + sg_n, BN);
+            simdgroup_load(b_right, b_tile + ks * BN + sg_n + 8u, BN);
             simdgroup_multiply_accumulate(c_left, a, b_left, c_left);
             simdgroup_multiply_accumulate(c_right, a, b_right, c_right);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    simdgroup_store(c_left, c_tile + sg_n, 32u);
-    simdgroup_store(c_right, c_tile + sg_n + 8u, 32u);
+    simdgroup_store(c_left, c_tile + sg_n, BN);
+    simdgroup_store(c_right, c_tile + sg_n + 8u, BN);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint index = tid; index < 8u * 32u; index += 64u) {
-        uint local_row = index / 32u;
-        uint local_n = index - local_row * 32u;
+    for (uint index = tid; index < BM * BN; index += THREADS) {
+        uint local_row = index / BN;
+        uint local_n = index - local_row * BN;
         uint row = row0 + local_row;
         if (row < uint(rows)) {
-            output[size_t(row) * 4096u + n0 + local_n] = T(c_tile[index]);
+            output[size_t(row) * N + n0 + local_n] = T(c_tile[index]);
         }
     }
 """
@@ -533,13 +536,25 @@ def _mxfp8_mma_kernel(stage: str, block_m: int):
     )
 
 
-@lru_cache(maxsize=1)
-def _wo_b_decode_fused_quant_kernel():
+@lru_cache(maxsize=2)
+def _wo_b_decode_fused_quant_kernel(block_n: int):
+    block_n = int(block_n)
+    if block_n not in {32, 64}:
+        raise ValueError(f"unsupported Mia TP1 WO-B decode BN: {block_n}")
+    threads = (block_n // 16) * 32
+    header = _MXFP8_HEADER + f"""
+        constant constexpr uint K = {_WO_B_K}u;
+        constant constexpr uint N = {_HIDDEN}u;
+        constant constexpr uint BM = {_WO_B_DECODE_BM}u;
+        constant constexpr uint BN = {block_n}u;
+        constant constexpr uint BK = {_WO_B_DECODE_BK}u;
+        constant constexpr uint THREADS = {threads}u;
+    """
     return mx.fast.metal_kernel(
-        name="mtplx_dsv4_mia_wo_b_mxfp8_decode_bm8_tp1",
+        name=f"mtplx_dsv4_mia_wo_b_mxfp8_decode_bm8_bn{block_n}_tp1",
         input_names=["tmp", "weight", "weight_scales", "rows"],
         output_names=["output"],
-        header=_MXFP8_HEADER,
+        header=header,
         source=_WO_B_DECODE_FUSED_QUANT_SOURCE,
         ensure_row_contiguous=True,
     )
@@ -626,11 +641,16 @@ class MiaTP1WOMXFP8Plan:
                 output_dtypes=[mx.bfloat16],
             )
         if rows <= 8:
+            threads = (_WO_B_DECODE_BN // 16) * 32
             (output,) = self.wo_b_decode(
                 inputs=[tmp, self.wo_b_weight, self.wo_b_scales, rows],
                 template=[("T", mx.bfloat16)],
-                grid=(64, _HIDDEN // _BN, (rows + 7) // 8),
-                threadgroup=(64, 1, 1),
+                grid=(
+                    threads,
+                    _HIDDEN // _WO_B_DECODE_BN,
+                    (rows + _WO_B_DECODE_BM - 1) // _WO_B_DECODE_BM,
+                ),
+                threadgroup=(threads, 1, 1),
                 output_shapes=[(rows, _HIDDEN)],
                 output_dtypes=[mx.bfloat16],
             )
@@ -713,7 +733,7 @@ def install_mia_tp1_wo_mxfp8(
         wo_a_m16_quantized=_wo_a_m16_quantized_kernel(),
         wo_a_bm8=_mxfp8_mma_kernel("wo_a", 8),
         wo_a_bm64=_mxfp8_mma_kernel("wo_a", 64),
-        wo_b_decode=_wo_b_decode_fused_quant_kernel(),
+        wo_b_decode=_wo_b_decode_fused_quant_kernel(_WO_B_DECODE_BN),
         wo_b_bm64=_mxfp8_mma_kernel("wo_b", 64),
     )
 
