@@ -13,7 +13,6 @@ from types import MappingProxyType
 from typing import Any
 
 from .draft_lm_head import configure_qwen38_row10_compact_head
-from .gdn_capture import configure_qwen38_row13_gdn_projection_fusion
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -316,7 +315,6 @@ def install_qwen38_route(
     cache_route: str = DEFAULT_QWEN38_CACHE_ROUTE,
     dual_norm: bool = False,
     source_proposal: bool = False,
-    row13_gdn_inproj_s9: bool = False,
     row10_compact_vocab: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
@@ -352,19 +350,6 @@ def install_qwen38_route(
         raise Qwen38ContractError(
             f"unknown Qwen 3.8 cache route: {cache_route!r}"
         )
-
-    row13_gdn_report = configure_qwen38_row13_gdn_projection_fusion(
-        runtime.model,
-        active=bool(row13_gdn_inproj_s9),
-    )
-    if row13_gdn_inproj_s9:
-        if int(row13_gdn_report.get("active_modules", 0)) <= 0:
-            raise Qwen38ContractError(
-                "Qwen 3.8 row 13 GDN input fusion configured no modules"
-            )
-        route_features.append("r13_gdn_inproj_s9")
-        kernel_ids.append("qwen38_row13_gdn_inproj_qkvzba_s_le9_v1")
-        feature_receipt["r13_gdn_inproj_s9"] = row13_gdn_report
 
     text = getattr(runtime.model, "language_model", runtime.model)
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)

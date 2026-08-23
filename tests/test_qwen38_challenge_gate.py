@@ -292,9 +292,6 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     assert gate._validate_route_id(
         "r08_device_draft+r10_compact_vocab"
     ) == {"r08_device_draft", "r10_compact_vocab"}
-    assert gate._validate_route_id(
-        "r08_device_draft+r10_compact_vocab+r13_gdn_inproj_s9"
-    ) == {"r08_device_draft", "r10_compact_vocab", "r13_gdn_inproj_s9"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -322,7 +319,6 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "cache_route": "control",
         "dual_norm": False,
         "source_proposal": False,
-        "row13_gdn_inproj_s9": False,
         "row10_compact_vocab": False,
         "draft_core": "device",
         "source_rows": (8,),
@@ -339,39 +335,6 @@ def test_row_10_extends_retained_row_8_with_compact_proposal_vocabulary() -> Non
     assert row_10["draft_core"] == "device"
     assert row_10["row10_compact_vocab"] is True
     assert row_10["source_rows"] == (8, 10)
-
-
-def test_row_13_projection_fusion_extends_rows_8_and_10() -> None:
-    gate = _module()
-
-    row_13 = gate._route_execution_options(
-        "r08_device_draft+r10_compact_vocab+r13_gdn_inproj_s9"
-    )
-
-    assert row_13["draft_core"] == "device"
-    assert row_13["row13_gdn_inproj_s9"] is True
-    assert row_13["row10_compact_vocab"] is True
-    assert row_13["source_rows"] == (8, 10, 13)
-
-
-def test_row13_projection_promotion_requires_conditioner_engagement() -> None:
-    gate = _module()
-    route = "r08_device_draft+r10_compact_vocab+r13_gdn_inproj_s9"
-    zero = {
-        "route_id": route,
-        "engagement": {"r13_gdn_inproj_s9": {"fused_four_way_calls": 0}},
-    }
-    engaged = {
-        "route_id": route,
-        "engagement": {"r13_gdn_inproj_s9": {"fused_four_way_calls": 48}},
-    }
-
-    assert gate._candidate_engagement_errors(route, [zero], []) == [
-        "row 13 GDN projection graph did not trace the fused four-way path"
-    ]
-    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
-
-
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:
     gate = _module()
     order = ["kv_only_history", "kv_only_history+dual_norm"] * 2

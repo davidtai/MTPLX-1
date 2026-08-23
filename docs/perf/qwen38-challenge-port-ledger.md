@@ -42,6 +42,8 @@ Means are two timed arms per route; peak is the maximum timed arm.
 | 9 | + paired G32/M4 target QMV | 761.698 | 47.465 | 24.885 | 43.651 | **-3.8350%** | REJECTED, remove | same |
 | 10 | Optimized-Speed main + retained row 8 | 737.536 | 54.151 | 25.149 | 41.640 | - | cumulative control | `chrono-r10-compact-vocab-on-r08-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 10 | + compact proposal vocabulary | 765.005 | 55.240 | 25.149 | 40.411 | **+3.0411%** | **RETAINED** | same |
+| 13 | Optimized-Speed main + retained rows 8, 10 | 765.003 | 56.424 | 27.507 | 40.066 | - | cumulative control | `chrono-r13-gdn-inproj-s9-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 13 | + four-way GDN input projection through S=9 | 778.485 | 54.008 | 27.507 | 40.469 | **-0.9949%** | REJECTED, removed | same |
 
 Row 8's source-only four-way GDN projection fuse is separately proven a
 target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
@@ -50,7 +52,9 @@ engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
 Rows 8 and 10 are therefore part of every later timed control. Row 9 regressed
-despite 82,880 timed kernel engagements and remains absent.
+despite 82,880 timed kernel engagements and remains absent. Row 13 executed
+7,104 fused four-way projection calls in each timed candidate arm and was
+deterministic within route; its loss is measured, not a no-op or parity veto.
 
 ## Exact 54-row campaign state
 
@@ -71,7 +75,7 @@ row or from the earlier bundle campaign.
 | 10 | 59 | 5.3467% | `61936f26547d` | `c44c6fd53fb6` | +89/-7 | RETAINED: compact Q4/group-64 proposal vocabulary (98,330 reachable rows, padded to 98,336) with on-device target-ID mapping; exact parity and +3.0411% on retained row 8. |
 | 11 | 63 | 5.7425% | `62174dbbca88` | `40a33f553244` | +230/-16 | TARGET-SHAPE NO-OP/COVERED: adaptive depth is disabled by fixed D3, exact 16K conditioning warms the seed shape, and retained row 8 has no host-built first draft to early-flush. Focused evidence receipt pending. |
 | 12 | 70 | 0.8266% | `09eda55a08b1` | `96bb2be6fbe1` | +304/-24 | REMOVED NEXT ROW: row 13 deletes the prefix-replay tape and restores eager per-boundary checkpoints; never enters the cumulative target stack. |
-| 13 | 71 | 2.0944% | `3e157ad981bb` | `83215ffbd861` | +25/-305 | STAGED: source expands four-way GDN input fusion from S<=2 to S<=9; adapted exactly to live group-32 weights and fixed-D3 S=4 verification. Prefix-replay removal is moot because row 12 was not retained. |
+| 13 | 71 | 2.0944% | `3e157ad981bb` | `83215ffbd861` | +25/-305 | REJECTED: source S<=9 four-way GDN input fusion was adapted exactly to live group-32 fixed-D3 S=4 verification, engaged 7,104 times per timed arm, and regressed wall throughput 0.9949% on retained rows 8+10. Deterministic tie drift was allowed; implementation removed. Prefix-replay removal is moot because row 12 was not retained. |
 | 14 | 77 | 0.9839% | `d81964127281` | `0b3dba1ea446` | +304/-24 | ALREADY PRESENT candidate: reintroduces prefix replay; target capture/commit plus linear-GDN-from-conv-tape implements the broader recurrent replay boundary. Focused structural/engagement proof pending. |
 | 15 | 95 | 3.7597% | `08897af24b57` | `8e803fafd868` | +216/-53 | PENDING |
 | 16 | 103 | 0.5808% | `8f41fa6d4f67` | `114e6ca13e03` | +149/-32 | PENDING |

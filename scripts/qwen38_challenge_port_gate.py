@@ -177,7 +177,6 @@ def _validate_route_id(route_id: str) -> set[str]:
         "source_proposal",
         "r08_device_draft",
         "r10_compact_vocab",
-        "r13_gdn_inproj_s9",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -196,8 +195,6 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(8)
     if "r10_compact_vocab" in features:
         source_rows.append(10)
-    if "r13_gdn_inproj_s9" in features:
-        source_rows.append(13)
     return {
         "cache_route": (
             "kv_only_history" if "kv_only_history" in features else "control"
@@ -205,7 +202,6 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "dual_norm": "dual_norm" in features,
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
-        "row13_gdn_inproj_s9": "r13_gdn_inproj_s9" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -262,39 +258,17 @@ def _candidate_engagement_errors(
 
     if candidate_route is None:
         return []
-    features = _validate_route_id(candidate_route)
-    candidate_runs = [
-        run
-        for run in [*warmups, *arms]
-        if run.get("route_id") == candidate_route
-    ]
-    errors: list[str] = []
-    if "r13_gdn_inproj_s9" in features:
-        fused_calls = sum(
-            int(
-                ((run.get("engagement") or {}).get("r13_gdn_inproj_s9") or {}).get(
-                    "fused_four_way_calls",
-                    0,
-                )
-            )
-            for run in candidate_runs
-        )
-        if fused_calls <= 0:
-            errors.append(
-                "row 13 GDN projection graph did not trace the fused four-way path"
-            )
-    return errors
+    _validate_route_id(candidate_route)
+    return []
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.draft_lm_head import qwen38_row10_compact_counter_snapshot
-    from mtplx.gdn_capture import QWEN38_GDN_PROJECTION_COUNTERS
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
-        "r13_gdn_inproj_s9": dict(QWEN38_GDN_PROJECTION_COUNTERS),
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "source_proposal": qwen38_source_counter_snapshot(),
     }
@@ -415,7 +389,6 @@ def _run_arm(
         dual_norm=bool(options["dual_norm"]),
         source_proposal=bool(options["source_proposal"]),
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
-        row13_gdn_inproj_s9=bool(options["row13_gdn_inproj_s9"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(
