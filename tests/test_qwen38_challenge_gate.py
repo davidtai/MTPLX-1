@@ -354,6 +354,24 @@ def test_row_8_projection_fusion_extends_the_device_draft_winner() -> None:
     assert row_8_complete["source_rows"] == (8,)
 
 
+def test_row8_projection_promotion_requires_conditioner_engagement() -> None:
+    gate = _module()
+    route = "r08_device_draft+r08_gdn_inproj_s2"
+    zero = {
+        "route_id": route,
+        "engagement": {"r08_gdn_inproj_s2": {"fused_four_way_calls": 0}},
+    }
+    engaged = {
+        "route_id": route,
+        "engagement": {"r08_gdn_inproj_s2": {"fused_four_way_calls": 48}},
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 8 GDN projection graph did not trace the fused four-way path"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:
     gate = _module()
     order = ["kv_only_history", "kv_only_history+dual_norm"] * 2

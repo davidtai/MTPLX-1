@@ -807,13 +807,20 @@ def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
             pass
 
 # Process-global compiled verify callables, keyed by
-# (runtime id, capture backend, state spec, verify length, hidden variant,
-# bucket). The bank is per-generation; without sharing, every request pays a
+# (runtime id, route fingerprint, capture backend, state spec, verify length,
+# hidden variant, bucket). The bank is per-generation; without sharing, every request pays a
 # fresh trace. Values are (compiled_fn, trace_host) where trace_host["bank"]
 # is re-pointed to the live bank before each dispatch so internal retraces
 # (mx.compile re-traces on leaf-shape changes) always use live scratch
 # containers. See CompiledVerifyBank._shared_or_new_verify_step.
 _SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
+
+
+def _compiled_verify_route_fingerprint(runtime: Any) -> str:
+    """Separate shared traces whose model-side optimization bindings differ."""
+
+    route = getattr(runtime, "qwen38_route", None)
+    return str(getattr(route, "fingerprint", "") or "")
 
 
 def _prewarm_enabled() -> bool:
@@ -2074,6 +2081,7 @@ class CompiledVerifyBank:
         spec_sig = tuple(self._spec or [])
         global_key = (
             id(self.runtime),
+            _compiled_verify_route_fingerprint(self.runtime),
             self.capture_backend,
             spec_sig,
             int(length),

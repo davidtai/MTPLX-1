@@ -217,6 +217,7 @@ def _promotion_decision(
     improvement_pct: float | None,
     correctness: dict[str, Any],
     source_status: list[str],
+    engagement_errors: list[str] | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     expected_order = (
@@ -242,11 +243,45 @@ def _promotion_decision(
         errors.append("correctness/determinism gate did not pass")
     if source_status:
         errors.append("promotion receipt requires a clean source tree")
+    errors.extend(engagement_errors or [])
     return {
         "passed": not errors,
         "threshold_pct": PROMOTION_THRESHOLD_PCT,
         "errors": errors,
     }
+
+
+def _candidate_engagement_errors(
+    candidate_route: str | None,
+    warmups: list[dict[str, Any]],
+    arms: list[dict[str, Any]],
+) -> list[str]:
+    """Reject a candidate whose route was configured but never traced."""
+
+    if candidate_route is None:
+        return []
+    features = _validate_route_id(candidate_route)
+    candidate_runs = [
+        run
+        for run in [*warmups, *arms]
+        if run.get("route_id") == candidate_route
+    ]
+    errors: list[str] = []
+    if "r08_gdn_inproj_s2" in features:
+        fused_calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r08_gdn_inproj_s2") or {}).get(
+                    "fused_four_way_calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if fused_calls <= 0:
+            errors.append(
+                "row 8 GDN projection graph did not trace the fused four-way path"
+            )
+    return errors
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
@@ -605,6 +640,11 @@ def main() -> int:
         improvement_pct=improvement_pct,
         correctness=correctness,
         source_status=source_status,
+        engagement_errors=_candidate_engagement_errors(
+            candidate_id,
+            warmups,
+            arms,
+        ),
     )
     receipt = {
         "kind": "qwen38_challenge_port_gate",
@@ -647,6 +687,11 @@ def main() -> int:
         "candidate_route_id": candidate_id,
         "mean_wall_s": means,
         "candidate_improvement_pct": improvement_pct,
+        "candidate_engagement_errors": _candidate_engagement_errors(
+            candidate_id,
+            warmups,
+            arms,
+        ),
         "promotion": promotion,
         "warmups": warmups,
         "arms": arms,
