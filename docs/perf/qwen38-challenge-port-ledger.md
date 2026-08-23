@@ -19,6 +19,9 @@ target-shape no-op proof, or removed-later proof.
   target/draft temperature 1.0; top-p 0.95; top-k 20; seed 42; fixed D3.
 - Timing: one conditioning generation per route, then exactly four timed ABBA
   arms under `/tmp/mtplx-gpu-exclusive.lock`.
+  Process-latched environment candidates use one conditioning generation in
+  each isolated arm process; the timed comparison remains exactly four ABBA
+  arms, and every process loads the same cumulative stack.
 - Promotion: strict matched wall-time improvement greater than 0.05%.
   Deterministic tie-breaking drift is recorded but is not a rejection reason.
 - Stacking: proposal N's control is Optimized-Speed plus every retained row
@@ -127,9 +130,12 @@ with the same exact 16K Python, 1,024-output, four-arm guarded gate. Its result
 gets its own receipt and metrics-table rows in this same PR; it does not replace
 or retroactively bundle any of the 54 individual decisions. Item 55 is an
 assembled DFlash stack, not a bare transplant: every retained target-side win
-stays enabled, and every retained proposer/custom-kernel win receives an
-explicit DFlash-equivalent adaptation or concrete evidence that DFlash replaces
-that surface. The scheduled source
+stays enabled, and every compatible survivor is separately adapted and gated
+on both the Qwen target path and the DFlash2 drafter path. Every retained
+proposer/custom-kernel win receives an explicit DFlash-equivalent adaptation or
+concrete evidence that DFlash replaces or cannot dispatch that exact surface;
+no survivor is considered covered merely because the base DFlash integration
+works. The scheduled source
 is the local `dflash-mlx` implementation at `54644e991039` and its declared
 `z-lab/Qwen3.8-27B-DFlash2` checkpoint snapshot `50307d4c4cde`; implementation
 will pin the complete artifact digest and geometry before the final gate rather
@@ -183,7 +189,7 @@ row or from the earlier bundle campaign.
 | 47 | 530 | 0.5687% | `dccba745af5b` | `e89a06dfd673` | +195/-5 | DEPENDENCY ABSENT/TARGET-SHAPE NO-OP: adds a custom affine-2 M=1 kernel for row 42's argmax-only coarse proposal selector and changes Q4 M=8 grouping. Temperature-1/top-k20 speculative acceptance cannot replace the complete proposal distribution with that argmax shortlist, and fixed D3 does not dispatch M=8. |
 | 48 | 543 | 0.1230% | `86fb1f020fc1` | `d2962993b6da` | +422/-240 | RETAINED on corrected rows 8+10+18+20+21+24+26+36: the source's Q/K scalar memo is already present in MTPLX capture, and its row-47 affine-2 removal is irrelevant because that argmax selector is absent. The adapted 64-layer BF16/5120 fused residual/RMSNorm boundary path executed a mean 151 forwards and 9,513 merged interior boundaries per timed candidate arm, kept exact tokens and schedules, and improved wall throughput 0.9175%. |
 | 50 | 572 | 0.2736% | `c0e34afd857e` | `4b6eb22f8820` | +115/-0 | RETAINED on corrected rows 8+10+18+20+21+24+26+36+48: the adapted post-warm policy measured 21,317,046,640 active bytes and set a 21,384,155,504-byte wired limit (64 MiB slack), while control arms restored the zero baseline. Candidate-first then control conditioning prevented the one-time cache clear from making control cold. The route kept exact tokens/schedules and improved wall throughput 0.8299%. Item 55 must recompute this budget over the assembled target plus DFlash2 footprint. |
-| 53 | 600 | 0.1577% | `0c90733d383f` | `39b6322daa32` | +11/-24 | PENDING |
+| 53 | 600 | 0.1577% | `0c90733d383f` | `39b6322daa32` | +11/-24 | STAGED: the live source change force-sets MLX's process-latched command-buffer profile to 512 MiB/50 operations; its verify-concat warm-loop removal is conditioner-covered, and the older Swift-only 128-to-512 override has no separate Python call site. The candidate is therefore isolated before any MLX import. A parent lock holder delegates verified lock attestations to four clean child processes in ABBA order; each child loads the identical cumulative stack, runs a 1,024-token conditioner, and emits one timed 16K/1,024 arm. Promotion additionally requires the candidate receipt to observe the exact 512/50 values. Chronological gate pending. |
 | 59 | 843 | 1.4217% | `3e2530aeae21` | `a0b5e9aaa3c4` | +23/-2 | TARGET-SHAPE NO-OP/REMOVED NEXT ROW: only raises the adaptive SDPA width cap from depth 5 to 6 before the full-accept streak gate; row 60 restores the prior policy. This campaign fixes D3 and disables adaptive depth. |
 | 60 | 846 | 0.2224% | `88578f929552` | `c529a4989d0d` | +155/-27 | REMOVED NEXT ROW: restores row 59's policy and introduces a two-output dual RMSNorm for the MTP embedding/hidden pair. Row 61 immediately replaces that kernel and its two outputs plus concatenate with the later single-output dual-RMSNorm-concat candidate, which is the live mechanism to gate. |
 | 61 | 866 | 0.2836% | `8b54ff11c6d6` | `feeffa289cd4` | +129/-10 | STAGED: exact BF16 dual RMSNorm plus output concatenate for the MTP embedding/hidden pre-FC pair already exists in the campaign kernel module. It now has an explicit chronological `r61_dual_norm_concat` route and nonzero-call promotion guard; it awaits its turn on the retained stack rather than being hidden behind the old generic `dual_norm` label. |

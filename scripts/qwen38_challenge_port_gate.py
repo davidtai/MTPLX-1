@@ -201,6 +201,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r26_prefill_ladder_3",
         "r48_boundary_fused",
         "r50_wired_residency",
+        "r53_command_buffers",
         "r61_dual_norm_concat",
         "r63_q8_embedding_dual_norm",
         "r70_qmv_sumtable",
@@ -253,6 +254,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(48)
     if "r50_wired_residency" in features:
         source_rows.append(50)
+    if "r53_command_buffers" in features:
+        source_rows.append(53)
     if "r61_dual_norm_concat" in features:
         source_rows.append(61)
     if "r63_q8_embedding_dual_norm" in features:
@@ -296,6 +299,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "row26_prefill_ladder_3": "r26_prefill_ladder_3" in features,
         "row48_boundary_fused": "r48_boundary_fused" in features,
         "row50_wired_residency": "r50_wired_residency" in features,
+        "row53_command_buffers": "r53_command_buffers" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -596,6 +600,21 @@ def _candidate_engagement_errors(
         )
         if not active:
             errors.append("row 50 post-warm wired residency was not active")
+    if "r53_command_buffers" in features:
+        active = any(
+            bool(report.get("installed"))
+            and bool(report.get("active"))
+            and int(report.get("max_mb_per_buffer", 0)) == 512
+            and int(report.get("max_ops_per_buffer", 0)) == 50
+            for run in candidate_runs
+            for report in [
+                ((run.get("feature_receipt") or {}).get("r53_command_buffers") or {})
+            ]
+        )
+        if not active:
+            errors.append(
+                "row 53 process-latched command-buffer profile was not active"
+            )
     if "r63_q8_embedding_dual_norm" in features:
         calls = sum(
             int(
@@ -871,6 +890,19 @@ def _run_arm(
     wall_s = time.perf_counter() - started
     counters_after = _projection_counter_snapshot()
     stats = output.stats
+    feature_receipt = dict(
+        getattr(runtime, "qwen38_feature_receipt", {}) or {}
+    )
+    if options["row53_command_buffers"]:
+        max_mb = int(os.environ.get("MLX_MAX_MB_PER_BUFFER", "0") or "0")
+        max_ops = int(os.environ.get("MLX_MAX_OPS_PER_BUFFER", "0") or "0")
+        feature_receipt["r53_command_buffers"] = {
+            "installed": True,
+            "active": max_mb == 512 and max_ops == 50,
+            "max_mb_per_buffer": max_mb,
+            "max_ops_per_buffer": max_ops,
+            "process_latched": True,
+        }
     return {
         **_generation_metrics(
             stats,
@@ -883,9 +915,11 @@ def _run_arm(
             f"{route.fingerprint}:{route_id}".encode()
         ).hexdigest(),
         "kernel_ids": list(route.kernel_ids),
-        "feature_receipt": dict(
-            getattr(runtime, "qwen38_feature_receipt", {}) or {}
-        ),
+        "feature_receipt": feature_receipt,
+        "process_environment": {
+            name: os.environ.get(name)
+            for name in ("MLX_MAX_MB_PER_BUFFER", "MLX_MAX_OPS_PER_BUFFER")
+        },
         "source_rows": list(options["source_rows"]),
         "draft_core": str(options["draft_core"]),
         "engagement": _counter_delta(counters_before, counters_after),

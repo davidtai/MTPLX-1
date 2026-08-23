@@ -8,10 +8,23 @@ from types import SimpleNamespace
 import pytest
 
 SCRIPT = Path(__file__).parents[1] / "scripts/qwen38_challenge_port_gate.py"
+ISOLATED_SCRIPT = (
+    Path(__file__).parents[1] / "scripts/qwen38_challenge_port_isolated_gate.py"
+)
 
 
 def _module():
     spec = importlib.util.spec_from_file_location("qwen38_challenge_port_gate", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _isolated_module():
+    spec = importlib.util.spec_from_file_location(
+        "qwen38_challenge_port_isolated_gate", ISOLATED_SCRIPT
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -420,6 +433,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "row26_prefill_ladder_3": False,
         "row48_boundary_fused": False,
         "row50_wired_residency": False,
+        "row53_command_buffers": False,
         "row63_q8_embedding_dual_norm": False,
         "row70_qmv_sumtable": False,
         "row78_qmv_active_groups": False,
@@ -554,6 +568,78 @@ def test_row50_conditions_cache_clearing_candidate_before_control() -> None:
         [control, control + "+r48_boundary_fused"],
         candidate_id=control + "+r48_boundary_fused",
     ) == [control, control + "+r48_boundary_fused"]
+
+
+def test_row53_extends_the_retained_stack_with_process_latched_buffers() -> None:
+    gate = _module()
+    control = "r08_device_draft+r50_wired_residency"
+    candidate = control + "+r53_command_buffers"
+
+    options = gate._route_execution_options(candidate)
+
+    assert options["row53_command_buffers"] is True
+    assert options["source_rows"] == (8, 50, 53)
+    engaged = {
+        "route_id": candidate,
+        "feature_receipt": {
+            "r50_wired_residency": {
+                "installed": True,
+                "active": True,
+                "target_limit_bytes": 1024,
+                "active_memory_bytes": 512,
+            },
+            "r53_command_buffers": {
+                "installed": True,
+                "active": True,
+                "max_mb_per_buffer": 512,
+                "max_ops_per_buffer": 50,
+            }
+        },
+    }
+    assert gate._candidate_engagement_errors(candidate, [engaged], []) == []
+
+
+def test_row53_requires_exact_process_latched_buffer_values() -> None:
+    gate = _module()
+    route = "r08_device_draft+r53_command_buffers"
+    wrong = {
+        "route_id": route,
+        "feature_receipt": {
+            "r53_command_buffers": {
+                "installed": True,
+                "active": False,
+                "max_mb_per_buffer": 128,
+                "max_ops_per_buffer": 50,
+            }
+        },
+    }
+
+    assert gate._candidate_engagement_errors(route, [wrong], []) == [
+        "row 53 process-latched command-buffer profile was not active"
+    ]
+
+
+def test_row53_isolated_children_set_candidate_and_unset_control_env() -> None:
+    isolated = _isolated_module()
+    inherited = {
+        "KEEP": "yes",
+        "MLX_MAX_MB_PER_BUFFER": "128",
+        "MLX_MAX_OPS_PER_BUFFER": "99",
+    }
+
+    control = isolated._environment_for_route(
+        "r08_device_draft+r50_wired_residency",
+        inherited,
+    )
+    candidate = isolated._environment_for_route(
+        "r08_device_draft+r50_wired_residency+r53_command_buffers",
+        inherited,
+    )
+
+    assert control == {"KEEP": "yes"}
+    assert candidate["KEEP"] == "yes"
+    assert candidate["MLX_MAX_MB_PER_BUFFER"] == "512"
+    assert candidate["MLX_MAX_OPS_PER_BUFFER"] == "50"
 
 
 def test_row21_promotion_requires_qk_fusion_engagement() -> None:
