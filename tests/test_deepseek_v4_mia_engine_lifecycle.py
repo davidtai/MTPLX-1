@@ -519,6 +519,10 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
         def __call__(self, *_args, **_kwargs):
             return fake, (fake,)
 
+        def mia_dflash_forward(self, *_args, **_kwargs):
+            events.append("target.verify_m6_piecewise")
+            return fake, (fake,)
+
         def make_dspark_cache(self):
             events.append("draft.acquire")
             return [SimpleNamespace(ring=SimpleNamespace(records=fake))]
@@ -561,6 +565,7 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
         "wo.m16",
         "qkv.m1024",
         "draft.acquire",
+        "target.verify_m6_piecewise",
         "target.settle",
         "draft.release",
         "target.release",
