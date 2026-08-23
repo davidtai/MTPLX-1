@@ -1700,12 +1700,12 @@ def _gdn_input_projections(
     )
 
 
-def configure_qwen38_row8_gdn_projection_fusion(
+def configure_qwen38_row13_gdn_projection_fusion(
     model: Any,
     *,
     active: bool,
 ) -> dict[str, int]:
-    """Bind row 8's exact four-way affine projection at source widths S<=2."""
+    """Bind row 13's four-way affine projection through source width S<=9."""
 
     text_model = getattr(model, "language_model", model)
     inner = getattr(text_model, "model", text_model)
@@ -1729,13 +1729,13 @@ def configure_qwen38_row8_gdn_projection_fusion(
         configured += int(ready)
         enabled = bool(active and ready)
         gdn._mtplx_gdn_projection_mode = "all" if enabled else "off"
-        gdn._mtplx_gdn_projection_max_width = 2
+        gdn._mtplx_gdn_projection_max_width = 9
         active_modules += int(enabled)
     QWEN38_GDN_PROJECTION_COUNTERS["configured_modules"] = configured
     return {
         "configured_modules": configured,
         "active_modules": active_modules,
-        "max_width": 2,
+        "max_width": 9,
     }
 
 

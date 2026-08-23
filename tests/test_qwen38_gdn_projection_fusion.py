@@ -32,8 +32,10 @@ def _gdn() -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("width", (1, 2))
-def test_row8_four_way_projection_fusion_is_exact_at_source_widths(width: int) -> None:
+@pytest.mark.parametrize("width", (1, 2, 4, 9))
+def test_row13_four_way_projection_fusion_is_exact_through_width_nine(
+    width: int,
+) -> None:
     gdn = _gdn()
     model = SimpleNamespace(
         language_model=SimpleNamespace(
@@ -55,22 +57,22 @@ def test_row8_four_way_projection_fusion_is_exact_at_source_widths(width: int) -
         )
     )
 
-    report = gdn_capture.configure_qwen38_row8_gdn_projection_fusion(
+    report = gdn_capture.configure_qwen38_row13_gdn_projection_fusion(
         model,
         active=True,
     )
     actual = gdn_capture._gdn_input_projections(gdn, x)
     mx.eval(*expected, *actual)
 
-    assert report == {"configured_modules": 1, "active_modules": 1, "max_width": 2}
+    assert report == {"configured_modules": 1, "active_modules": 1, "max_width": 9}
     assert all(mx.array_equal(left, right).item() for left, right in zip(expected, actual))
 
 
-def test_row8_projection_fusion_keeps_width_three_on_stock_calls(monkeypatch) -> None:
+def test_row13_projection_fusion_keeps_width_ten_on_stock_calls(monkeypatch) -> None:
     calls: list[str] = []
     gdn = SimpleNamespace(
         _mtplx_gdn_projection_mode="all",
-        _mtplx_gdn_projection_max_width=2,
+        _mtplx_gdn_projection_max_width=9,
         in_proj_qkv=lambda _x: calls.append("qkv") or "qkv",
         in_proj_z=lambda _x: calls.append("z") or "z",
         in_proj_b=lambda _x: calls.append("b") or "b",
@@ -79,12 +81,12 @@ def test_row8_projection_fusion_keeps_width_three_on_stock_calls(monkeypatch) ->
     monkeypatch.setattr(
         gdn_capture,
         "_fused_quantized_many",
-        lambda *_args, **_kwargs: pytest.fail("width-three fusion must not run"),
+        lambda *_args, **_kwargs: pytest.fail("width-ten fusion must not run"),
     )
 
     result = gdn_capture._gdn_input_projections(
         gdn,
-        mx.zeros((1, 3, 32), dtype=mx.bfloat16),
+        mx.zeros((1, 10, 32), dtype=mx.bfloat16),
     )
 
     assert result == ("qkv", "z", "b", "a")

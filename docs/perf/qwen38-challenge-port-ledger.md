@@ -43,6 +43,12 @@ Means are two timed arms per route; peak is the maximum timed arm.
 | 10 | Optimized-Speed main + retained row 8 | 737.536 | 54.151 | 25.149 | 41.640 | - | cumulative control | `chrono-r10-compact-vocab-on-r08-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 10 | + compact proposal vocabulary | 765.005 | 55.240 | 25.149 | 40.411 | **+3.0411%** | **RETAINED** | same |
 
+Row 8's source-only four-way GDN projection fuse is separately proven a
+target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
+`S = 4` verify. Two diagnostic ABBA runs are preserved with zero fused-call
+engagement and are explicitly invalidated rather than interpreted as timing
+results. Row 13's later `S <= 9` expansion is the first applicable form.
+
 Rows 8 and 10 are therefore part of every later timed control. Row 9 regressed
 despite 82,880 timed kernel engagements and remains absent.
 
@@ -60,13 +66,13 @@ row or from the earlier bundle campaign.
 | 5 | 29 | 6.7162% | `ab62ceab428a` | `158a74067412` | +200/-7 | ALREADY PRESENT/ADAPTED: exact device top-k20 sampling supersets source top-2 for the fixed stochastic shape. Exact proof pending. |
 | 6 | 37 | 1.7673% | `5c2441b5f08b` | `061942094f64` | +10/-8 | TARGET-SHAPE NO-OP: there is no second target argmax consumer to reuse under top-k20 sampling. Exact proof pending. |
 | 7 | 38 | 20.4283% | `fe8829244cd9` | `9e25f5798c47` | +227/-22 | ALREADY PRESENT: persistent committed MTP history. Row-8 receipt exercises it; focused proof pending. |
-| 8 | 41 | 17.9183% | `11670086c1b9` | `52c2ac2b4934` | +901/-822 | RETAINED: missing device-resident D3 draft-chain adaptation, +3.6049%. |
+| 8 | 41 | 17.9183% | `11670086c1b9` | `52c2ac2b4934` | +901/-822 | RETAINED in part: device-resident D3 draft-chain adaptation, +3.6049%. Its four-way GDN fuse is a fixed-shape no-op because source limits it to S<=2 while this campaign verifies S=4; both diagnostic receipts record zero fused calls. |
 | 9 | 55 | 6.8764% | `b6c725144b56` | `9193949c4c87` | +340/-0 | REJECTED: adjacent-row shared-weight QMV adapted from source G64 to live target G32/M4; parity passed, but 16K wall regressed 3.8350% on row 8. |
 | 10 | 59 | 5.3467% | `61936f26547d` | `c44c6fd53fb6` | +89/-7 | RETAINED: compact Q4/group-64 proposal vocabulary (98,330 reachable rows, padded to 98,336) with on-device target-ID mapping; exact parity and +3.0411% on retained row 8. |
-| 11 | 63 | 5.7425% | `62174dbbca88` | `40a33f553244` | +230/-16 | PENDING |
-| 12 | 70 | 0.8266% | `09eda55a08b1` | `96bb2be6fbe1` | +304/-24 | PENDING |
-| 13 | 71 | 2.0944% | `3e157ad981bb` | `83215ffbd861` | +25/-305 | PENDING |
-| 14 | 77 | 0.9839% | `d81964127281` | `0b3dba1ea446` | +304/-24 | PENDING |
+| 11 | 63 | 5.7425% | `62174dbbca88` | `40a33f553244` | +230/-16 | TARGET-SHAPE NO-OP/COVERED: adaptive depth is disabled by fixed D3, exact 16K conditioning warms the seed shape, and retained row 8 has no host-built first draft to early-flush. Focused evidence receipt pending. |
+| 12 | 70 | 0.8266% | `09eda55a08b1` | `96bb2be6fbe1` | +304/-24 | REMOVED NEXT ROW: row 13 deletes the prefix-replay tape and restores eager per-boundary checkpoints; never enters the cumulative target stack. |
+| 13 | 71 | 2.0944% | `3e157ad981bb` | `83215ffbd861` | +25/-305 | STAGED: source expands four-way GDN input fusion from S<=2 to S<=9; adapted exactly to live group-32 weights and fixed-D3 S=4 verification. Prefix-replay removal is moot because row 12 was not retained. |
+| 14 | 77 | 0.9839% | `d81964127281` | `0b3dba1ea446` | +304/-24 | ALREADY PRESENT candidate: reintroduces prefix replay; target capture/commit plus linear-GDN-from-conv-tape implements the broader recurrent replay boundary. Focused structural/engagement proof pending. |
 | 15 | 95 | 3.7597% | `08897af24b57` | `8e803fafd868` | +216/-53 | PENDING |
 | 16 | 103 | 0.5808% | `8f41fa6d4f67` | `114e6ca13e03` | +149/-32 | PENDING |
 | 17 | 126 | 7.5460% | `deb63ad0d170` | `2dbcb36ee10e` | +6/-14 | PENDING |

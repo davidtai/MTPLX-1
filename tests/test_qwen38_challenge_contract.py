@@ -305,13 +305,13 @@ def test_row10_candidate_route_names_compact_proposal_only_head(monkeypatch) -> 
     assert runtime.qwen38_feature_receipt["r10_compact_vocab"]["active"] is True
 
 
-def test_row8_gdn_projection_route_names_the_source_width_boundary(monkeypatch) -> None:
+def test_row13_gdn_projection_route_names_the_source_width_boundary(monkeypatch) -> None:
     monkeypatch.setattr(
-        "mtplx.qwen38_challenge.configure_qwen38_row8_gdn_projection_fusion",
+        "mtplx.qwen38_challenge.configure_qwen38_row13_gdn_projection_fusion",
         lambda model, *, active: {
             "configured_modules": 48,
             "active_modules": 48 if active else 0,
-            "max_width": 2,
+            "max_width": 9,
         },
         raising=False,
     )
@@ -328,13 +328,13 @@ def test_row8_gdn_projection_route_names_the_source_width_boundary(monkeypatch) 
         _config(),
         MODEL_PATH,
         cache_route="control",
-        row8_gdn_inproj_s2=True,
+        row13_gdn_inproj_s9=True,
     )
 
-    assert route.route_id == "r08_gdn_inproj_s2"
-    assert route.kernel_ids == ("qwen38_row8_gdn_inproj_qkvzba_s_le2_v1",)
-    assert runtime.qwen38_feature_receipt["r08_gdn_inproj_s2"] == {
+    assert route.route_id == "r13_gdn_inproj_s9"
+    assert route.kernel_ids == ("qwen38_row13_gdn_inproj_qkvzba_s_le9_v1",)
+    assert runtime.qwen38_feature_receipt["r13_gdn_inproj_s9"] == {
         "configured_modules": 48,
         "active_modules": 48,
-        "max_width": 2,
+        "max_width": 9,
     }

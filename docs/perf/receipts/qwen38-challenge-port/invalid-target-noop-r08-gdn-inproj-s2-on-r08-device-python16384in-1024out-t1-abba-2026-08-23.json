@@ -1,6 +1,6 @@
 {
   "invalidated": {
-    "reason": "candidate conditioner and timed arms recorded zero fused_four_way_calls; fixed D3 verifies S=4 and never satisfies row 8's S<=2 eligibility, so the apparent positive delta compares identical execution paths",
+    "reason": "row 8 limits fusion to S<=2 while the fixed D3 benchmark verifies S=4; zero fused calls prove this candidate is a target-shape no-op",
     "status": "diagnostic_only_do_not_promote"
   },
   "arms": [
@@ -12,9 +12,9 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 55.7284811656889,
+      "decode_tok_s": 52.845605665835805,
       "draft_core": "device",
-      "draft_time_s": 3.3565690447285306,
+      "draft_time_s": 3.4286832970392425,
       "drafted_by_depth": [
         278,
         278,
@@ -46,12 +46,12 @@
       "generated_tokens": 1024,
       "installed_route_id": "control",
       "kernel_ids": [],
-      "peak_memory_bytes": 29251900280,
-      "peak_memory_gib": 27.242955081164837,
-      "prefill_time_s": 22.91895879097865,
-      "prefill_tok_s": 714.8666808742229,
+      "peak_memory_bytes": 29251897514,
+      "peak_memory_gib": 27.242952505126595,
+      "prefill_time_s": 22.966867334005656,
+      "prefill_tok_s": 713.3754796302236,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.4849051660276018,
+      "prompt_mtp_history_time_s": 0.48947124904952943,
       "route_fingerprint": "f3a2e072405bbe5c36a8a20fb2113fe8cda7bdfab638a7efaabb2f306a2372f9",
       "route_id": "r08_device_draft",
       "source_rows": [
@@ -1084,7 +1084,7 @@
         68053,
         7824
       ],
-      "wall_s": 41.78001708397642
+      "wall_s": 42.83489683299558
     },
     {
       "accepted_by_depth": [
@@ -1094,9 +1094,9 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 53.89931544705225,
+      "decode_tok_s": 52.84277406765884,
       "draft_core": "device",
-      "draft_time_s": 3.3980616830231156,
+      "draft_time_s": 3.4180133654735982,
       "drafted_by_depth": [
         278,
         278,
@@ -1136,12 +1136,12 @@
       "kernel_ids": [
         "qwen38_row8_gdn_inproj_qkvzba_s_le2_v1"
       ],
-      "peak_memory_bytes": 29251900280,
-      "peak_memory_gib": 27.242955081164837,
-      "prefill_time_s": 20.969984999013832,
-      "prefill_tok_s": 781.3071874286271,
+      "peak_memory_bytes": 29251897514,
+      "peak_memory_gib": 27.242952505126595,
+      "prefill_time_s": 22.755435873026727,
+      "prefill_tok_s": 720.0037868499306,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.45141566696111113,
+      "prompt_mtp_history_time_s": 0.4739210019761231,
       "route_fingerprint": "881992c72de33e2377a155a6b82f006ee6e6930cde7faa8b8e600c2dc1b9e833",
       "route_id": "r08_device_draft+r08_gdn_inproj_s2",
       "source_rows": [
@@ -2174,7 +2174,7 @@
         68053,
         7824
       ],
-      "wall_s": 40.42107858401141
+      "wall_s": 42.60899354101275
     },
     {
       "accepted_by_depth": [
@@ -2184,9 +2184,9 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 54.0034915830282,
+      "decode_tok_s": 51.853012859324735,
       "draft_core": "device",
-      "draft_time_s": 3.3975805821246468,
+      "draft_time_s": 3.4319707868271507,
       "drafted_by_depth": [
         278,
         278,
@@ -2226,12 +2226,12 @@
       "kernel_ids": [
         "qwen38_row8_gdn_inproj_qkvzba_s_le2_v1"
       ],
-      "peak_memory_bytes": 29251900280,
-      "peak_memory_gib": 27.242955081164837,
-      "prefill_time_s": 21.034377834002953,
-      "prefill_tok_s": 778.9153608106525,
+      "peak_memory_bytes": 29251897514,
+      "peak_memory_gib": 27.242952505126595,
+      "prefill_time_s": 23.754292832978535,
+      "prefill_tok_s": 689.7279626549767,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.45221224892884493,
+      "prompt_mtp_history_time_s": 0.4885677080019377,
       "route_fingerprint": "881992c72de33e2377a155a6b82f006ee6e6930cde7faa8b8e600c2dc1b9e833",
       "route_id": "r08_device_draft+r08_gdn_inproj_s2",
       "source_rows": [
@@ -3264,7 +3264,7 @@
         68053,
         7824
       ],
-      "wall_s": 40.44964729200001
+      "wall_s": 43.992342874989845
     },
     {
       "accepted_by_depth": [
@@ -3274,9 +3274,9 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 54.082151305018265,
+      "decode_tok_s": 52.29023105476218,
       "draft_core": "device",
-      "draft_time_s": 3.3928527850366663,
+      "draft_time_s": 3.421327665069839,
       "drafted_by_depth": [
         278,
         278,
@@ -3308,12 +3308,12 @@
       "generated_tokens": 1024,
       "installed_route_id": "control",
       "kernel_ids": [],
-      "peak_memory_bytes": 29251900280,
-      "peak_memory_gib": 27.242955081164837,
-      "prefill_time_s": 20.999500876030652,
-      "prefill_tok_s": 780.2090200487147,
+      "peak_memory_bytes": 29251897514,
+      "peak_memory_gib": 27.242952505126595,
+      "prefill_time_s": 23.58611379089416,
+      "prefill_tok_s": 694.6460169426189,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.44419774907873943,
+      "prompt_mtp_history_time_s": 0.48991812599706464,
       "route_fingerprint": "f3a2e072405bbe5c36a8a20fb2113fe8cda7bdfab638a7efaabb2f306a2372f9",
       "route_id": "r08_device_draft",
       "source_rows": [
@@ -4346,10 +4346,13 @@
         68053,
         7824
       ],
-      "wall_s": 40.379162000026554
+      "wall_s": 43.660426084010396
     }
   ],
-  "candidate_improvement_pct": 1.5932257241847658,
+  "candidate_engagement_errors": [
+    "row 8 GDN projection graph did not trace the fused four-way path"
+  ],
+  "candidate_improvement_pct": -0.12241554620746609,
   "candidate_route_id": "r08_device_draft+r08_gdn_inproj_s2",
   "context_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-challenge-port/mtplx/generation.py",
   "context_sha256": "3bd8a8384b3a429bbc674f852ba40b1c697334839641ba856f1b58a817b558e0",
@@ -4366,15 +4369,15 @@
     },
     "schedule_capture": "depth_histograms"
   },
-  "created_at": "2026-08-23T19:53:41Z",
+  "created_at": "2026-08-23T20:00:28Z",
   "draft_temperature": 1.0,
   "exact": true,
   "gpu_lock_scope": "attested_parent",
   "kind": "qwen38_challenge_port_gate",
   "max_tokens": 1024,
   "mean_wall_s": {
-    "r08_device_draft": 41.079589542001486,
-    "r08_device_draft+r08_gdn_inproj_s2": 40.43536293800571
+    "r08_device_draft": 43.24766145850299,
+    "r08_device_draft+r08_gdn_inproj_s2": 43.3006682080013
   },
   "mlx_version": "0.32.0",
   "model": "/Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
@@ -4403,7 +4406,7 @@
           640
         ]
       },
-      "elapsed_s": 0.07767279198742472,
+      "elapsed_s": 0.07720433300710283,
       "original": {
         "bits": 8,
         "group_size": 64,
@@ -4484,8 +4487,11 @@
   ],
   "platform": "macOS-26.5.2-arm64-arm-64bit",
   "promotion": {
-    "errors": [],
-    "passed": true,
+    "errors": [
+      "candidate improvement must be strictly greater than 0.05%",
+      "row 8 GDN projection graph did not trace the fused four-way path"
+    ],
+    "passed": false,
     "threshold_pct": 0.05
   },
   "prompt_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-challenge-port/mtplx/benchmarks/prompts/python_modules_long.jsonl",
@@ -4496,7 +4502,7 @@
   "python": "3.12.13",
   "schedule_exact": true,
   "seed": 42,
-  "source_commit": "250ab5d5b4d59f623e425ea28495d15dc092ad06",
+  "source_commit": "b66f68b96fa52a55d81c2fa472042795e7568872",
   "source_status": [],
   "target_temperature": 1.0,
   "token_exact": true,
@@ -4509,9 +4515,9 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 53.59933772634286,
+      "decode_tok_s": 53.4494261129958,
       "draft_core": "device",
-      "draft_time_s": 3.4068618886813056,
+      "draft_time_s": 3.421430951275397,
       "drafted_by_depth": [
         278,
         278,
@@ -4545,10 +4551,10 @@
       "kernel_ids": [],
       "peak_memory_bytes": 26720356422,
       "peak_memory_gib": 24.885271137580276,
-      "prefill_time_s": 19.764853084023343,
-      "prefill_tok_s": 828.9462072067608,
+      "prefill_time_s": 19.842185208923183,
+      "prefill_tok_s": 825.7155060034411,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.4307919990387745,
+      "prompt_mtp_history_time_s": 0.43395074998261407,
       "route_fingerprint": "f3a2e072405bbe5c36a8a20fb2113fe8cda7bdfab638a7efaabb2f306a2372f9",
       "route_id": "r08_device_draft",
       "source_rows": [
@@ -5581,7 +5587,7 @@
         68053,
         7824
       ],
-      "wall_s": 39.307027583010495
+      "wall_s": 39.44129395799246
     },
     {
       "accepted_by_depth": [
@@ -5591,9 +5597,9 @@
       ],
       "accepted_depth_schedule": [],
       "attempted_depth_schedule": [],
-      "decode_tok_s": 54.96559635746013,
+      "decode_tok_s": 53.09195435483826,
       "draft_core": "device",
-      "draft_time_s": 3.405903556966223,
+      "draft_time_s": 3.477169931778917,
       "drafted_by_depth": [
         278,
         278,
@@ -5606,7 +5612,7 @@
         "r08_gdn_inproj_s2": {
           "configured_modules": 0,
           "fused_four_way_calls": 0,
-          "stock_calls": 6912
+          "stock_calls": 6960
         },
         "r10_compact_vocab": {
           "calls": 0
@@ -5633,12 +5639,12 @@
       "kernel_ids": [
         "qwen38_row8_gdn_inproj_qkvzba_s_le2_v1"
       ],
-      "peak_memory_bytes": 29251900280,
-      "peak_memory_gib": 27.242955081164837,
-      "prefill_time_s": 22.09749174999888,
-      "prefill_tok_s": 741.4416163319001,
+      "peak_memory_bytes": 29251897464,
+      "peak_memory_gib": 27.242952458560467,
+      "prefill_time_s": 22.624074664985528,
+      "prefill_tok_s": 724.1843143912945,
       "prefill_tokens": 16384,
-      "prompt_mtp_history_time_s": 0.4642135409230832,
+      "prompt_mtp_history_time_s": 0.48374750002403744,
       "route_fingerprint": "881992c72de33e2377a155a6b82f006ee6e6930cde7faa8b8e600c2dc1b9e833",
       "route_id": "r08_device_draft+r08_gdn_inproj_s2",
       "source_rows": [
@@ -6671,7 +6677,7 @@
         68053,
         7824
       ],
-      "wall_s": 41.192874416010454
+      "wall_s": 42.39656345802359
     }
   ]
 }

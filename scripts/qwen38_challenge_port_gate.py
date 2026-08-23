@@ -176,8 +176,8 @@ def _validate_route_id(route_id: str) -> set[str]:
         "dual_norm",
         "source_proposal",
         "r08_device_draft",
-        "r08_gdn_inproj_s2",
         "r10_compact_vocab",
+        "r13_gdn_inproj_s9",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -192,18 +192,20 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
 
     features = _validate_route_id(route_id)
     source_rows: list[int] = []
-    if {"r08_device_draft", "r08_gdn_inproj_s2"} & features:
+    if "r08_device_draft" in features:
         source_rows.append(8)
     if "r10_compact_vocab" in features:
         source_rows.append(10)
+    if "r13_gdn_inproj_s9" in features:
+        source_rows.append(13)
     return {
         "cache_route": (
             "kv_only_history" if "kv_only_history" in features else "control"
         ),
         "dual_norm": "dual_norm" in features,
         "source_proposal": "source_proposal" in features,
-        "row8_gdn_inproj_s2": "r08_gdn_inproj_s2" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
+        "row13_gdn_inproj_s9": "r13_gdn_inproj_s9" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -267,10 +269,10 @@ def _candidate_engagement_errors(
         if run.get("route_id") == candidate_route
     ]
     errors: list[str] = []
-    if "r08_gdn_inproj_s2" in features:
+    if "r13_gdn_inproj_s9" in features:
         fused_calls = sum(
             int(
-                ((run.get("engagement") or {}).get("r08_gdn_inproj_s2") or {}).get(
+                ((run.get("engagement") or {}).get("r13_gdn_inproj_s9") or {}).get(
                     "fused_four_way_calls",
                     0,
                 )
@@ -279,7 +281,7 @@ def _candidate_engagement_errors(
         )
         if fused_calls <= 0:
             errors.append(
-                "row 8 GDN projection graph did not trace the fused four-way path"
+                "row 13 GDN projection graph did not trace the fused four-way path"
             )
     return errors
 
@@ -292,7 +294,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
-        "r08_gdn_inproj_s2": dict(QWEN38_GDN_PROJECTION_COUNTERS),
+        "r13_gdn_inproj_s9": dict(QWEN38_GDN_PROJECTION_COUNTERS),
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "source_proposal": qwen38_source_counter_snapshot(),
     }
@@ -412,8 +414,8 @@ def _run_arm(
         cache_route=str(options["cache_route"]),
         dual_norm=bool(options["dual_norm"]),
         source_proposal=bool(options["source_proposal"]),
-        row8_gdn_inproj_s2=bool(options["row8_gdn_inproj_s2"]),
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
+        row13_gdn_inproj_s9=bool(options["row13_gdn_inproj_s9"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(
