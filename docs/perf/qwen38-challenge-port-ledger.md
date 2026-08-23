@@ -59,6 +59,8 @@ cumulative control before that later decision can remain authoritative.
 | 18 addendum corrected | + S≤9 packed MLP gate/up | 725.433 | 52.206 | 32.92571 | 42.702 | **-0.3108%** | REJECTED, removed | same |
 | 20 corrected | Optimized-Speed main + retained rows 8, 10, 17, 18 | 735.167 | 55.625 | 25.37749 | 41.230 | - | corrected cumulative control | `chrono-r20-kv-only-history-on-r08-r10-r17-r18-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 20 corrected | + packed K/V-only committed-history append | 758.616 | 54.778 | 25.37749 | 40.392 | **+2.0739%** | **RETAINED** | same |
+| 21 corrected | Optimized-Speed main + retained rows 8, 10, 17, 18, 20 | 720.881 | 54.455 | 25.37751 | 41.661 | - | corrected cumulative control | `chrono-r21-qk-rms-rope-on-r08-r10-r17-r18-r20-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 21 corrected | + fused Q/K RMSNorm + partial RoPE | 737.392 | 54.433 | 25.37751 | 41.132 | **+1.2860%** | **RETAINED** | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -78,9 +80,9 @@ target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
 engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
-Rows 8, 10, and 17 are therefore part of every corrected later timed control.
-Rows 18, 20, 24, and 26 remain implemented but their old timings do not promote
-them on the corrected stack; they are being rerun in order. Row 9 regressed
+Rows 8, 10, 17, 18, 20, and 21 are therefore part of every corrected later
+timed control. Rows 24 and 26 remain implemented but their old timings do not
+promote them on the corrected stack; they are being rerun in order. Row 9 regressed
 despite 82,880 timed kernel engagements and remains absent. Row 13 executed
 7,104 fused four-way projection calls in each timed candidate arm and was
 deterministic within route; its loss is measured, not a no-op or parity veto.
@@ -118,7 +120,7 @@ row or from the earlier bundle campaign.
 | 18 | 135 | 0.4535% | `b6ce964b16bb` | `2181386c97ac` | +324/-247 | RETAINED in part on corrected rows 8+10+17: adaptive depth, S>=6 attention segmentation, and synthetic 512-token warming are inapplicable to fixed D3/exact 16K conditioning. The adapted per-layer input-independent `-exp(A_log)` GDN memo was exact, engaged 7,584 times per timed arm, and improved wall throughput 0.9843%. The source's S<=9 packed MLP gate/up addendum engaged 9,887 times per candidate arm but regressed 0.3108% on the corrected stack, so it is removed. Deterministic proposal/acceptance drift was allowed. |
 | 19 | 160 | 2.5391% | `1033e1ac5197` | `1a4f47311818` | +581/-97 | TARGET-SHAPE NON-TRANSFERABLE: source replaces compact projection + argmax + target-ID mapping with an argmax-only selector. The required temperature-1/top-k20 route must retain the complete sparse proposal distribution for exact speculative acceptance; substituting argmax changes the sampling law. Row 10 already retains the source's compact Q4/group-64 projection and on-device mapping. |
 | 20 | 180 | 0.9180% | `cf350293feb4` | `b9b4300e973d` | +144/-8 | RETAINED on corrected rows 8+10+17+18: adapted to MTPLX's dead committed-history outputs by omitting Q/gate/attention/MLP for every appended row and packing the live BF16 K+V projections into one matmul. The packed path engaged 286 times per candidate arm over 17,112 history tokens and improved wall throughput 2.0739% with exact tokens and schedules. |
-| 21 | 186 | 1.5222% | `4eb54489fb51` | `df0b66eded6c` | +228/-5 | REJECTED: exact Qwen 3.8 BF16 H256/R64 fused Q/K RMSNorm + partial-RoPE engaged 2,416 times per timed candidate arm on rows 8+10+18+20, but regressed wall throughput 0.8870%. Deterministic tie drift was allowed; implementation removed. |
+| 21 | 186 | 1.5222% | `4eb54489fb51` | `df0b66eded6c` | +228/-5 | RETAINED on corrected rows 8+10+17+18+20: exact Qwen 3.8 BF16 H256/R64 fused Q/K RMSNorm + partial-RoPE engaged 2,512 times per candidate arm and improved wall throughput 1.2860%. Both routes were deterministic; proposal/acceptance tie drift was allowed. The old -0.8870% pre-row17 result is historical. |
 | 23 | 215 | 0.2964% | `df404e08fee2` | `597330a384fb` | +64/-41 | DEPENDENCY ABSENT/TARGET-SHAPE NON-TRANSFERABLE: this patch only retunes the row-19 argmax-only compact selector's reduction. Row 19 is absent because temperature-1/top-k20 acceptance requires the complete sparse proposal distribution, so row 23 has no retained call site and cannot affect this route. |
 | 24 | 234 | 0.9658% | `7351e62674bc` | `849631b545f2` | +54/-14 | RETAINED in part: adaptive-margin depth is disabled by fixed D3; the Q/K width restriction modifies rejected row 21; and fused SwiGLU depends on row 18's rejected packed MLP gate/up. The remaining live mechanism, the source's target trunk evaluation ladder, engaged 144 times per candidate arm and improved wall throughput 1.6019% on rows 8+10+18+20 with exact tokens and schedules. |
 | 25 | 270 | 0.5421% | `c7468c565a7c` | `e8898ba2afd6` | +1/-1 | TARGET-SHAPE NO-OP: the only change lowers the streak gate for adaptive segmented verification depth. This campaign is fixed D3 with adaptive depth disabled, so the policy constant has no call site. |
