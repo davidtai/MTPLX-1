@@ -374,7 +374,8 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
             "row10_compact_vocab": False,
             "mtp_block_variant": None,
             "row18_gdn_decay_memo": False,
-        "row24_eval_ladder": False,
+            "row21_qk_rms_rope": False,
+            "row24_eval_ladder": False,
         "row26_prefill_ladder_3": False,
         "draft_core": "device",
         "source_rows": (8,),
@@ -459,6 +460,42 @@ def test_row20_promotion_requires_kv_only_history_engagement() -> None:
     assert gate._candidate_engagement_errors(route, [zero], []) == [
         "row 20 K/V-only history path did not execute",
         "row 20 packed K/V projection did not execute",
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
+def test_row21_promotion_requires_qk_fusion_engagement() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block+"
+        "r18_gdn_decay_memo+r20_kv_only_history+r21_qk_rms_rope"
+    )
+    block = {
+        "r17_q4_mtp_block": {
+            "installed": True,
+            "active": True,
+            "variant": "r17",
+            "bits": 4,
+            "group_size": 64,
+        }
+    }
+    cumulative = {
+        "r18_gdn_decay_memo": {"memo_calls": 48},
+        "r20_kv_only_history": {"calls": 48, "packed_calls": 48},
+    }
+    zero = {
+        "route_id": route,
+        "feature_receipt": block,
+        "engagement": {**cumulative, "r21_qk_rms_rope": {"calls": 0}},
+    }
+    engaged = {
+        "route_id": route,
+        "feature_receipt": block,
+        "engagement": {**cumulative, "r21_qk_rms_rope": {"calls": 48}},
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 21 fused Q/K RMSNorm+RoPE did not execute"
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 

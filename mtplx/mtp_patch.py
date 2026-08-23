@@ -996,13 +996,22 @@ def inject_mtp_support(
             gate = gate.reshape(B, L, -1)
 
             keys, values = attn.k_proj(normed), attn.v_proj(normed)
-            queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
-            keys = attn.k_norm(keys.reshape(B, L, attn.num_key_value_heads, -1)).transpose(
-                0,
-                2,
-                1,
-                3,
-            )
+            if bool(getattr(attn, "_mtplx_qwen38_row21_active", False)):
+                from .qwen38_challenge_kernels import qwen38_qk_rms_rope
+
+                queries, keys = qwen38_qk_rms_rope(
+                    queries,
+                    keys.reshape(B, L, attn.num_key_value_heads, -1),
+                    attn.q_norm.weight,
+                    attn.k_norm.weight,
+                    float(attn.q_norm.eps),
+                    int(position_offset),
+                )
+            else:
+                queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+                keys = attn.k_norm(
+                    keys.reshape(B, L, attn.num_key_value_heads, -1)
+                ).transpose(0, 2, 1, 3)
             values = values.reshape(B, L, attn.num_key_value_heads, -1).transpose(
                 0,
                 2,
@@ -1010,8 +1019,9 @@ def inject_mtp_support(
                 3,
             )
 
-            queries = attn.rope(queries, offset=int(position_offset))
-            keys = attn.rope(keys, offset=int(position_offset))
+            if not bool(getattr(attn, "_mtplx_qwen38_row21_active", False)):
+                queries = attn.rope(queries, offset=int(position_offset))
+                keys = attn.rope(keys, offset=int(position_offset))
             paged_mtp_enabled = (
                 os.environ.get("MTPLX_VLLM_METAL_PAGED_MTP_ATTN", "")
                 .strip()

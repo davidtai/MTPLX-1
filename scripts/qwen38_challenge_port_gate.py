@@ -193,6 +193,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r17_q4_mtp_block",
         "r18_gdn_decay_memo",
         "r20_kv_only_history",
+        "r21_qk_rms_rope",
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
     }
@@ -219,6 +220,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(18)
     if "r20_kv_only_history" in features:
         source_rows.append(20)
+    if "r21_qk_rms_rope" in features:
+        source_rows.append(21)
     if "r24_eval_ladder" in features:
         source_rows.append(24)
     if "r26_prefill_ladder_3" in features:
@@ -234,6 +237,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "mtp_block_variant": "r17" if "r17_q4_mtp_block" in features else None,
         "row18_gdn_decay_memo": "r18_gdn_decay_memo" in features,
+        "row21_qk_rms_rope": "r21_qk_rms_rope" in features,
         "row24_eval_ladder": "r24_eval_ladder" in features,
         "row26_prefill_ladder_3": "r26_prefill_ladder_3" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
@@ -344,6 +348,18 @@ def _candidate_engagement_errors(
             errors.append("row 20 K/V-only history path did not execute")
         if packed_calls <= 0:
             errors.append("row 20 packed K/V projection did not execute")
+    if "r21_qk_rms_rope" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r21_qk_rms_rope") or {}).get(
+                    "calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 21 fused Q/K RMSNorm+RoPE did not execute")
     if "r24_eval_ladder" in features:
         calls = sum(
             int(
@@ -376,6 +392,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.gdn_capture import QWEN38_GDN_DECAY_MEMO_COUNTERS
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_challenge_kernels import (
+        qwen38_qk_rms_rope_counter_snapshot,
         qwen38_row24_eval_ladder_counter_snapshot,
         qwen38_row26_prefill_ladder_counter_snapshot,
     )
@@ -387,6 +404,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
+        "r21_qk_rms_rope": {"calls": qwen38_qk_rms_rope_counter_snapshot()},
         "r24_eval_ladder": {"calls": qwen38_row24_eval_ladder_counter_snapshot()},
         "r26_prefill_ladder_3": {
             "calls": qwen38_row26_prefill_ladder_counter_snapshot()
@@ -514,6 +532,7 @@ def _run_arm(
         mtp_block_variant=options["mtp_block_variant"],
         mtp_block_artifact_path=row17_artifact_path,
         row18_gdn_decay_memo=bool(options["row18_gdn_decay_memo"]),
+        row21_qk_rms_rope=bool(options["row21_qk_rms_rope"]),
         row24_eval_ladder=bool(options["row24_eval_ladder"]),
         row26_prefill_ladder_3=bool(options["row26_prefill_ladder_3"]),
         source_artifact_path=source_artifact_path,
