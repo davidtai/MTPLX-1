@@ -11,7 +11,8 @@ mechanism mapping is in
 - Source gate: `(score / previous promoted score - 1) * 100 > 0.10`.
 - Promoted Yukon rows: 82; above-threshold source rows: 54.
 - Challenge pin: `eb5eadc7a165047d4321ce883b9ff30894d8bd19`.
-- MTPLX branch base pin: `c1300f17c66e5fef7810efa80f2a53489b8d001d`.
+- MTPLX branch base pin: `bd4421567f9e16ce957c6ef97708b072dcd73937`.
+- Local promotion gate: strict `>0.05%` matched wall improvement.
 - Inventory check: `python scripts/qwen38_challenge_inventory.py --check`.
 
 The 54 rows are not 54 independent ports. Controlled resamples, no-ops,
@@ -129,4 +130,5 @@ hash difference.
 
 The final route names only the four retained families. Rejected packed-QKV,
 GDN-pair, Q/K-RoPE, and boundary-norm experiments are absent from the
-production path.
+production path. C8's cross-repository weight dependency and lineage are
+declared in `qwen38-source-artifact-manifest.json` and staged by `mtplx pull`.

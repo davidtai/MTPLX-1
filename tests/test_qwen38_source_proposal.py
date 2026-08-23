@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from mtplx.qwen38_source_proposal import (
+    QWEN38_SOURCE_HEAD_LOCAL_PATH,
     QWEN38_SOURCE_HEAD_BYTES,
     QWEN38_SOURCE_HEAD_FORMAT,
     QWEN38_SOURCE_HEAD_REVISION,
     QWEN38_SOURCE_HEAD_SHA256,
+    Qwen38SourceProposalError,
+    _validate_candidate_body,
     compact_token_ids_to_full,
+    resolve_qwen38_source_artifact,
 )
+import pytest
 
 
 def test_source_artifact_contract_is_the_immutable_huggingface_blob() -> None:
@@ -28,3 +33,34 @@ def test_compact_token_mapping_preserves_prefix_and_maps_controls() -> None:
     compact = mx.array([0, 98_303, 98_304, 98_329], dtype=mx.int32)
     mapped = compact_token_ids_to_full(compact)
     assert mapped.tolist() == [0, 98_303, 248_044, 248_069]
+
+
+def test_source_artifact_resolver_prefers_the_pulled_model_dependency(
+    tmp_path,
+) -> None:
+    model_path = tmp_path / "model"
+    artifact = model_path / QWEN38_SOURCE_HEAD_LOCAL_PATH
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"staged")
+
+    assert resolve_qwen38_source_artifact(model_path) == artifact
+
+
+def test_candidate_body_validation_rejects_missing_or_mismatched_weights() -> None:
+    import mlx.core as mx
+
+    class Candidate:
+        @staticmethod
+        def parameters():
+            return {"fc": {"weight": mx.zeros((2, 2), dtype=mx.uint32)}}
+
+    body = {"fc.weight": mx.zeros((2, 2), dtype=mx.uint32)}
+    _validate_candidate_body(Candidate(), body)
+
+    with pytest.raises(Qwen38SourceProposalError, match="missing=.*fc.weight"):
+        _validate_candidate_body(Candidate(), {})
+    with pytest.raises(Qwen38SourceProposalError, match="shape/dtype"):
+        _validate_candidate_body(
+            Candidate(),
+            {"fc.weight": mx.zeros((2, 3), dtype=mx.uint32)},
+        )

@@ -389,15 +389,10 @@ class MTPLXRuntime:
         if qwen38_route is not None and qwen38_route.route_id != "control":
             from .attention_context import current_request_prompt_tokens
 
-            cache_offset = (
-                int(getattr(mtp_cache[0], "offset", 0))
-                if mtp_cache
-                else 0
-            )
             incoming_tokens = int(next_token_ids.shape[-1])
             effective_context = max(
                 current_request_prompt_tokens(),
-                cache_offset + incoming_tokens,
+                incoming_tokens,
             )
             if effective_context >= qwen38_route.min_context_tokens:
                 update = qwen38_route.bindings.mtp_cache_append

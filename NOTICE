@@ -61,3 +61,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+The retained Qwen 3.8 source-proposal route downloads a pinned auxiliary
+weight artifact directly from amal-david/qwen38-mtp-head-q2-q4-rerank-v1.
+The artifact's full MTP body records EigenLabs/Qwen3.8-27B-MTP-bf16 as its
+source; that repository declares Apache-2.0. The auxiliary repository itself
+does not currently declare separate license metadata. Exact revisions, hashes,
+lineage, and distribution status are recorded in
+docs/perf/qwen38-source-artifact-manifest.json.

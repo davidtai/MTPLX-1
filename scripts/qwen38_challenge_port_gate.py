@@ -26,6 +26,7 @@ DEFAULT_MODEL = Path.home() / (
 DEFAULT_PROMPT = ROOT / "mtplx/benchmarks/prompts/python_modules_long.jsonl"
 DEFAULT_CONTEXT = ROOT / "mtplx/generation.py"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
+PROMOTION_THRESHOLD_PCT = 0.05
 
 
 def _read_prompt(path: Path) -> tuple[str, str]:
@@ -102,23 +103,38 @@ def _correctness_summary(
     """Require exact output and schedule replay for the retained route."""
 
     cross_route_token_exact = len({arm["token_hash"] for arm in arms}) == 1
-    cross_route_schedule_exact = (
-        len({tuple(arm["attempted_depth_schedule"]) for arm in arms}) == 1
-        and len({tuple(arm["accepted_depth_schedule"]) for arm in arms}) == 1
+
+    def schedule_fingerprint(arm: dict[str, Any]) -> tuple[Any, ...] | None:
+        attempted = tuple(arm.get("attempted_depth_schedule") or ())
+        accepted = tuple(arm.get("accepted_depth_schedule") or ())
+        if attempted or accepted:
+            return ("events", attempted, accepted)
+        drafted_by_depth = tuple(arm.get("drafted_by_depth") or ())
+        accepted_by_depth = tuple(arm.get("accepted_by_depth") or ())
+        if drafted_by_depth or accepted_by_depth:
+            return ("depth_histograms", drafted_by_depth, accepted_by_depth)
+        return None
+
+    schedule_fingerprints = [schedule_fingerprint(arm) for arm in arms]
+    cross_route_schedule_exact = bool(
+        schedule_fingerprints
+        and all(value is not None for value in schedule_fingerprints)
+        and len(set(schedule_fingerprints)) == 1
     )
     per_route_deterministic = {
         route_id: len(
             {
-                (
-                    arm["token_hash"],
-                    tuple(arm["attempted_depth_schedule"]),
-                    tuple(arm["accepted_depth_schedule"]),
-                )
+                (arm["token_hash"], schedule_fingerprint(arm))
                 for arm in arms
                 if arm["route_id"] == route_id
             }
         )
         == 1
+        and all(
+            schedule_fingerprint(arm) is not None
+            for arm in arms
+            if arm["route_id"] == route_id
+        )
         for route_id in route_ids
     }
     full_output = all(int(arm["generated_tokens"]) == max_tokens for arm in arms)
@@ -131,6 +147,18 @@ def _correctness_summary(
         "full_output": full_output,
         "cross_route_token_exact": cross_route_token_exact,
         "cross_route_schedule_exact": cross_route_schedule_exact,
+        "schedule_capture": (
+            "events"
+            if schedule_fingerprints
+            and all(value is not None and value[0] == "events" for value in schedule_fingerprints)
+            else "depth_histograms"
+            if schedule_fingerprints
+            and all(
+                value is not None and value[0] == "depth_histograms"
+                for value in schedule_fingerprints
+            )
+            else "missing"
+        ),
         "per_route_deterministic": per_route_deterministic,
     }
 
@@ -152,6 +180,46 @@ def _validate_route_id(route_id: str) -> set[str]:
     if "control" in features and len(features) != 1:
         raise ValueError("control cannot be combined with candidate features")
     return features
+
+
+def _promotion_decision(
+    *,
+    order: list[str],
+    control_id: str | None,
+    candidate_id: str | None,
+    improvement_pct: float | None,
+    correctness: dict[str, Any],
+    source_status: list[str],
+) -> dict[str, Any]:
+    errors: list[str] = []
+    expected_order = (
+        [control_id, candidate_id, candidate_id, control_id]
+        if control_id is not None and candidate_id is not None
+        else []
+    )
+    if order != expected_order:
+        errors.append("gate requires exactly four timed ABBA arms")
+    if control_id is None or candidate_id is None:
+        errors.append("gate requires explicit control and candidate routes")
+    else:
+        control_features = _validate_route_id(control_id) - {"control"}
+        candidate_features = _validate_route_id(candidate_id) - {"control"}
+        if not control_features < candidate_features:
+            errors.append("candidate route must strictly extend the cumulative control")
+    if improvement_pct is None or improvement_pct <= PROMOTION_THRESHOLD_PCT:
+        errors.append(
+            "candidate improvement must be strictly greater than "
+            f"{PROMOTION_THRESHOLD_PCT:.2f}%"
+        )
+    if not bool(correctness.get("passed")):
+        errors.append("correctness/determinism gate did not pass")
+    if source_status:
+        errors.append("promotion receipt requires a clean source tree")
+    return {
+        "passed": not errors,
+        "threshold_pct": PROMOTION_THRESHOLD_PCT,
+        "errors": errors,
+    }
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
@@ -500,6 +568,19 @@ def main() -> int:
     improvement_pct = None
     if control_id is not None and candidate_id is not None:
         improvement_pct = (means[control_id] / means[candidate_id] - 1.0) * 100.0
+    source_status = subprocess.check_output(
+        ["git", "status", "--short"],
+        cwd=ROOT,
+        text=True,
+    ).splitlines()
+    promotion = _promotion_decision(
+        order=order,
+        control_id=control_id,
+        candidate_id=candidate_id,
+        improvement_pct=improvement_pct,
+        correctness=correctness,
+        source_status=source_status,
+    )
     receipt = {
         "kind": "qwen38_challenge_port_gate",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -515,6 +596,7 @@ def main() -> int:
         ),
         "prompt_id": prompt_id,
         "prompt_tokens": len(prompt_ids),
+        "prompt_token_sha256": _token_hash(prompt_ids),
         "prompt_token_target": args.prompt_tokens,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
@@ -531,11 +613,7 @@ def main() -> int:
             cwd=ROOT,
             text=True,
         ).strip(),
-        "source_status": subprocess.check_output(
-            ["git", "status", "--short"],
-            cwd=ROOT,
-            text=True,
-        ).splitlines(),
+        "source_status": source_status,
         "exact": exact,
         "token_exact": correctness["cross_route_token_exact"],
         "schedule_exact": correctness["cross_route_schedule_exact"],
@@ -544,6 +622,7 @@ def main() -> int:
         "candidate_route_id": candidate_id,
         "mean_wall_s": means,
         "candidate_improvement_pct": improvement_pct,
+        "promotion": promotion,
         "warmups": warmups,
         "arms": arms,
     }
@@ -559,7 +638,7 @@ def main() -> int:
             sort_keys=True,
         )
     )
-    return 0 if correctness["passed"] else 2
+    return 0 if promotion["passed"] else 2
 
 
 if __name__ == "__main__":

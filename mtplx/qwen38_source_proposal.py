@@ -11,6 +11,7 @@ from typing import Any
 
 QWEN38_SOURCE_HEAD_REPO = "amal-david/qwen38-mtp-head-q2-q4-rerank-v1"
 QWEN38_SOURCE_HEAD_FILENAME = "model.safetensors"
+QWEN38_SOURCE_HEAD_LOCAL_PATH = Path("qwen38-source-proposal/model.safetensors")
 QWEN38_SOURCE_HEAD_REVISION = "ae6282749a52e052496dd5300b4aa441df7301e8"
 QWEN38_SOURCE_HEAD_SHA256 = (
     "d038fd41e2d5dab1b3905c115d859fdc98dfbfde9862c14ebb82c2b3247ec2f1"
@@ -118,12 +119,16 @@ def validate_qwen38_source_artifact(path: Path) -> Qwen38SourceArtifact:
     return Qwen38SourceArtifact(path, observed_sha, observed_bytes, metadata)
 
 
-def resolve_qwen38_source_artifact() -> Path:
+def resolve_qwen38_source_artifact(model_path: Path | None = None) -> Path:
     """Resolve the declared artifact without initiating a network download."""
 
     override = os.environ.get("MTPLX_QWEN38_SOURCE_HEAD")
     if override:
         return Path(override).expanduser()
+    if model_path is not None:
+        staged = Path(model_path).expanduser() / QWEN38_SOURCE_HEAD_LOCAL_PATH
+        if staged.is_file():
+            return staged
     from huggingface_hub import try_to_load_from_cache
 
     cached = try_to_load_from_cache(
@@ -754,6 +759,30 @@ def _dense_linear(weight: Any, *, counter: str) -> Any:
     return _CountedDense(layer, counter)
 
 
+def _validate_candidate_body(candidate: Any, body: dict[str, Any]) -> None:
+    """Require the artifact body to cover the constructed module exactly."""
+
+    from mlx.utils import tree_flatten
+
+    expected = dict(tree_flatten(candidate.parameters()))
+    missing = sorted(set(expected) - set(body))
+    unexpected = sorted(set(body) - set(expected))
+    if missing or unexpected:
+        raise Qwen38SourceProposalError(
+            f"source body coverage mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    mismatched = sorted(
+        key
+        for key, value in body.items()
+        if tuple(value.shape) != tuple(expected[key].shape)
+        or str(value.dtype) != str(expected[key].dtype)
+    )
+    if mismatched:
+        raise Qwen38SourceProposalError(
+            f"source body shape/dtype mismatch: {mismatched}"
+        )
+
+
 def _candidate_mtp(text: Any, tensors: dict[str, Any]) -> Any:
     """Instantiate the source Q4 body and install its BF16 precision islands."""
 
@@ -794,7 +823,8 @@ def _candidate_mtp(text: Any, tensors: dict[str, Any]) -> Any:
         if not key.startswith("draft_lm_head.")
         and not key.startswith("precision_islands.")
     }
-    candidate.load_weights(list(body.items()), strict=False)
+    _validate_candidate_body(candidate, body)
+    candidate.load_weights(list(body.items()), strict=True)
     mx.eval(candidate.parameters())
 
     attn = candidate.layers[0].self_attn
@@ -967,7 +997,7 @@ def configure_qwen38_source_proposal(
         import mlx.core as mx
 
         if artifact_path is None:
-            artifact_path = resolve_qwen38_source_artifact()
+            artifact_path = resolve_qwen38_source_artifact(runtime.model_path)
         artifact = validate_qwen38_source_artifact(artifact_path)
         tensors = mx.load(str(artifact.path), format="safetensors")
         text._mtplx_qwen38_source_mtp = _candidate_mtp(text, tensors)

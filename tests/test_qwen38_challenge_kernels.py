@@ -4,11 +4,41 @@ import mlx.core as mx
 
 from mtplx.attention_context import attention_phase, model_forward_kind
 from mtplx.qwen38_challenge_kernels import (
+    _QMV_PATCH,
+    _qwen38_qmv_dispatch,
     _qmv_route_active,
+    configure_qwen38_final_qmv,
     qwen38_active_input_groups,
     qwen38_affine4_qmv,
     qwen38_dual_rms_norm_concat,
 )
+
+
+class _FakeQuantizedLinear:
+    bits = 4
+    group_size = 32
+    mode = "affine"
+
+    def __init__(self) -> None:
+        self.parameters = {
+            "weight": mx.zeros((4096, 640), dtype=mx.uint32),
+            "scales": mx.ones((4096, 160), dtype=mx.bfloat16),
+            "biases": mx.zeros((4096, 160), dtype=mx.bfloat16),
+        }
+
+    def __getitem__(self, key: str):
+        return self.parameters[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.parameters
+
+
+class _FakeModel:
+    def __init__(self, module: _FakeQuantizedLinear) -> None:
+        self.module = module
+
+    def named_modules(self):
+        return [("projection", self.module)]
 
 
 def test_final_qmv_width_plan_has_only_live_input_groups() -> None:
@@ -23,6 +53,25 @@ def test_qmv_is_limited_to_the_target_verify_forward() -> None:
         assert _qmv_route_active() is True
     with attention_phase("prefill"), model_forward_kind("target_verify"):
         assert _qmv_route_active() is False
+
+
+def test_final_qmv_is_limited_to_configured_model_modules(monkeypatch) -> None:
+    owned = _FakeQuantizedLinear()
+    foreign = _FakeQuantizedLinear()
+    sentinel = mx.ones((2, 4096), dtype=mx.bfloat16)
+    monkeypatch.setitem(_QMV_PATCH, "installed", True)
+    monkeypatch.setitem(_QMV_PATCH, "enabled", False)
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.qwen38_affine4_qmv",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    configure_qwen38_final_qmv(active=True, model=_FakeModel(owned))
+
+    x = mx.zeros((2, 5120), dtype=mx.bfloat16)
+    with attention_phase("decode_verify"), model_forward_kind("target_verify"):
+        assert _qwen38_qmv_dispatch(foreign, x, 2) is None
+        assert mx.array_equal(_qwen38_qmv_dispatch(owned, x, 2), sentinel).item()
 
 
 def test_final_qmv_matches_bf16_stock_for_group32_and_group64() -> None:

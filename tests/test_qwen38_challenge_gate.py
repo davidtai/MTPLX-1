@@ -238,6 +238,39 @@ def test_deterministic_cross_route_drift_is_recorded_without_rejection() -> None
     assert correctness["cross_route_schedule_exact"] is False
 
 
+def test_empty_event_schedules_do_not_create_vacuous_exactness() -> None:
+    gate = _module()
+    arms = [
+        {
+            "route_id": "control",
+            "generated_tokens": 1024,
+            "token_hash": "same",
+            "attempted_depth_schedule": [],
+            "accepted_depth_schedule": [],
+            "drafted_by_depth": [10, 9, 8],
+            "accepted_by_depth": [9, 8, 7],
+        },
+        {
+            "route_id": "candidate",
+            "generated_tokens": 1024,
+            "token_hash": "same",
+            "attempted_depth_schedule": [],
+            "accepted_depth_schedule": [],
+            "drafted_by_depth": [10, 9, 8],
+            "accepted_by_depth": [9, 8, 6],
+        },
+    ]
+
+    correctness = gate._correctness_summary(
+        arms,
+        route_ids=["control", "candidate"],
+        max_tokens=1024,
+    )
+
+    assert correctness["cross_route_schedule_exact"] is False
+    assert correctness["schedule_capture"] == "depth_histograms"
+
+
 def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     gate = _module()
 
@@ -265,3 +298,29 @@ def test_route_validation_rejects_control_combinations() -> None:
 
     with pytest.raises(ValueError, match="control cannot be combined"):
         gate._validate_route_id("control+packed_qkv")
+
+
+def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:
+    gate = _module()
+    order = ["kv_only_history", "kv_only_history+dual_norm"] * 2
+    order[2:] = ["kv_only_history+dual_norm", "kv_only_history"]
+    kwargs = {
+        "order": order,
+        "control_id": "kv_only_history",
+        "candidate_id": "kv_only_history+dual_norm",
+        "correctness": {"passed": True},
+        "source_status": [],
+    }
+
+    passed = gate._promotion_decision(improvement_pct=0.050453818, **kwargs)
+    tied = gate._promotion_decision(improvement_pct=0.05, **kwargs)
+    dirty = gate._promotion_decision(
+        improvement_pct=0.050453818,
+        **{**kwargs, "source_status": [" M mtplx/runtime.py"]},
+    )
+
+    assert passed == {"passed": True, "threshold_pct": 0.05, "errors": []}
+    assert tied["passed"] is False
+    assert any("strictly greater" in error for error in tied["errors"])
+    assert dirty["passed"] is False
+    assert any("source tree" in error for error in dirty["errors"])

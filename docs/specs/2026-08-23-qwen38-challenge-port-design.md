@@ -280,7 +280,7 @@ the challenge bootstrap and has no preceding Yukon row.
   four timed ABBA arms. Record prefill tok/s, decode tok/s, peak memory, wall
   time, route identity, counters, output hash, and acceptance schedule.
 - Measure candidates chronologically and cumulatively. Candidate N is compared
-  with all earlier retained winners; a passing >0.10% win becomes the next
+  with all earlier retained winners; a passing >0.05% win becomes the next
   control. Never add or multiply isolated percentages.
 - Exact output/schedule parity passes immediately. Deterministic full-length
   output with a tie-breaking token or schedule shift is recorded for numerical

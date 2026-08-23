@@ -1,0 +1,33 @@
+{
+  "artifact": {
+    "bytes": 427742600,
+    "filename": "model.safetensors",
+    "format": "qwen38-mtp-incumbent-q4-g64-plus-bf16-qkv-islands-v1",
+    "local_path": "qwen38-source-proposal/model.safetensors",
+    "repo_id": "amal-david/qwen38-mtp-head-q2-q4-rerank-v1",
+    "revision": "ae6282749a52e052496dd5300b4aa441df7301e8",
+    "sha256": "d038fd41e2d5dab1b3905c115d859fdc98dfbfde9862c14ebb82c2b3247ec2f1"
+  },
+  "code_source": {
+    "license": "MIT",
+    "repo_id": "Layr-Labs/qwen-3.8-mtp-challenge",
+    "revision": "eb5eadc7a165047d4321ce883b9ff30894d8bd19"
+  },
+  "distribution": {
+    "bundled_in_mtplx": false,
+    "mechanism": "downloaded directly from the pinned artifact repository by mtplx pull",
+    "repository_license_metadata": "not declared as of 2026-08-23"
+  },
+  "weight_lineage": {
+    "base_quantized_model": {
+      "license_metadata": "not declared as of 2026-08-23",
+      "repo_id": "dwsdubey/qwen3.8-27b-mtp-4bit",
+      "revision": "34ee78d5070ea683b50a96f1aa43c6d509ead580"
+    },
+    "full_mtp_body": {
+      "license": "Apache-2.0",
+      "repo_id": "EigenLabs/Qwen3.8-27B-MTP-bf16",
+      "revision": "26a4e3dfd0a594068153b501342ce15a42640488"
+    }
+  }
+}

@@ -924,6 +924,33 @@ def _local_matches_remote_index(
         return True
 
 
+def _stage_model_dependencies(repo_id: str, destination: Path) -> list[str]:
+    """Stage pinned cross-repo weight dependencies during an explicit pull."""
+
+    from mtplx.profiles import QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID
+
+    if repo_id.casefold() != QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID.casefold():
+        return []
+    from huggingface_hub import hf_hub_download
+
+    from mtplx.qwen38_source_proposal import (
+        QWEN38_SOURCE_HEAD_FILENAME,
+        QWEN38_SOURCE_HEAD_LOCAL_PATH,
+        QWEN38_SOURCE_HEAD_REPO,
+        QWEN38_SOURCE_HEAD_REVISION,
+    )
+
+    target = destination / QWEN38_SOURCE_HEAD_LOCAL_PATH
+    hf_hub_download(
+        repo_id=QWEN38_SOURCE_HEAD_REPO,
+        filename=QWEN38_SOURCE_HEAD_FILENAME,
+        revision=QWEN38_SOURCE_HEAD_REVISION,
+        local_dir=str(target.parent),
+        token=hf_token_for_download(),
+    )
+    return [str(target)]
+
+
 def pull_model(
     model_ref: str,
     *,
@@ -948,6 +975,7 @@ def pull_model(
     remote_sha: str | None = None
     remote_files: dict[str, dict[str, Any]] | None = None
     snapshot_resolved = False
+    dependencies: list[str] = []
 
     def _resolve_remote_snapshot() -> None:
         nonlocal remote_sha, remote_files, snapshot_resolved
@@ -989,6 +1017,7 @@ def pull_model(
                 "cached MTPLX model is incomplete: "
                 + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
             )
+        dependencies = _stage_model_dependencies(repo_id, resolved)
         _emit_download_progress(
             progress_callback,
             {
@@ -1101,6 +1130,7 @@ def pull_model(
             resolved_sha=remote_sha,
             files=remote_files,
         )
+        dependencies = _stage_model_dependencies(repo_id, resolved)
         final_size = directory_size_bytes(resolved)
         _emit_download_progress(
             progress_callback,
@@ -1128,6 +1158,7 @@ def pull_model(
         "has_runtime_contract": (resolved / "mtplx_runtime.json").exists(),
         "has_config": (resolved / "config.json").exists(),
         "validation": _pull_validation(resolved, repo_id),
+        "dependencies": dependencies,
     }
 
 

@@ -149,12 +149,14 @@ remains enabled in both arms of every later bracket.
 **Files:** `docs/perf/receipts/qwen38-challenge-port/*.json`,
 `docs/perf/qwen38-challenge-port-ledger.md`.
 
-- [x] Acquire the exclusive GPU lock and confirm no unrelated owner.
-- [x] Run C1 then C2. Promote each >0.05% winner immediately.
-- [x] Continue C3-C8 in order, always using the retained stack as control.
-- [x] Use one conditioning generation per unique route and exactly four timed
+- [ ] Acquire the exclusive GPU lock and confirm no unrelated owner for the
+  clean confirmation campaign.
+- [ ] Re-run retained C3 then C6 from the clean immutable candidate commit;
+  promote each strict >0.05% winner immediately.
+- [ ] Re-run C7-C8 if the clean retained base differs from the recorded stack.
+- [ ] Use one conditioning generation per unique route and exactly four timed
   ABBA arms; do not add BAAB or additional timed arms.
-- [x] Reject a candidate on matched wall regression or <=0.05% gain, not a
+- [ ] Reject a candidate on matched wall regression or <=0.05% gain, not a
   deterministic tie-breaking hash difference.
 
 ## Task 4: Reduce to the winner stack and update the one PR
@@ -162,11 +164,11 @@ remains enabled in both arms of every later bracket.
 **Files:** production files touched by retained candidates, tests, this plan,
 the ledger, raw receipts, and `NOTICE`.
 
-- [x] Remove every rejected experimental implementation from production while
+- [ ] Remove every rejected experimental implementation from production while
   preserving its receipt and row-level disposition.
-- [x] Run `uv run --frozen --with pytest pytest -q`, inventory reproduction,
+- [ ] Run `uv run --frozen --with pytest pytest -q`, inventory reproduction,
   focused Ruff, receipt schema checks, stub scan, and `git diff --check`. The
   unchanged cold-tier stats-cache race fails on both this branch and
   `upstream/main` (19/20 base reproductions); the full suite excluding only
   that exact base flake passes.
-- [x] Update PR #335 in place. Do not open another PR.
+- [ ] Update PR #335 in place. Do not open another PR.

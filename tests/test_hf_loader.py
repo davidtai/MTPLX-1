@@ -272,6 +272,50 @@ def test_pull_model_reuses_complete_destination_without_redownload(
     assert result["resumed_existing"] is False
 
 
+def test_qwen38_pull_stages_its_pinned_source_proposal_dependency(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import mtplx.hf_loader as loader
+    from mtplx.profiles import QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID
+    from mtplx.qwen38_source_proposal import (
+        QWEN38_SOURCE_HEAD_FILENAME,
+        QWEN38_SOURCE_HEAD_LOCAL_PATH,
+        QWEN38_SOURCE_HEAD_REPO,
+        QWEN38_SOURCE_HEAD_REVISION,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_hf_hub_download(**kwargs):
+        captured.update(kwargs)
+        path = Path(kwargs["local_dir"]) / kwargs["filename"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"dependency")
+        return str(path)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(hf_hub_download=fake_hf_hub_download),
+    )
+    destination = tmp_path / "model"
+    destination.mkdir()
+
+    dependencies = loader._stage_model_dependencies(
+        QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+        destination,
+    )
+
+    assert captured == {
+        "repo_id": QWEN38_SOURCE_HEAD_REPO,
+        "filename": QWEN38_SOURCE_HEAD_FILENAME,
+        "revision": QWEN38_SOURCE_HEAD_REVISION,
+        "local_dir": str((destination / QWEN38_SOURCE_HEAD_LOCAL_PATH).parent),
+        "token": False,
+    }
+    assert dependencies == [str(destination / QWEN38_SOURCE_HEAD_LOCAL_PATH)]
+
+
 def test_pull_model_pins_laguna_revision_and_records_source(
     tmp_path: Path, monkeypatch
 ):

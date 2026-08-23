@@ -250,10 +250,10 @@ def test_kv_only_history_route_binds_the_target_shaped_append() -> None:
     assert (short, long, continued_long, windowed_long) == (
         "stock",
         "kv-only",
-        "kv-only",
+        "stock",
         "kv-only",
     )
-    assert calls == ["stock", "kv-only", "kv-only", "kv-only"]
+    assert calls == ["stock", "kv-only", "stock", "kv-only"]
     assert route.kernel_ids == ("qwen38_mtp_kv_only_history_ge16384_v1",)
     assert route.selfcheck_status == "passed:python16384:conditioned_abba"
 
@@ -330,11 +330,47 @@ def test_early_projection_candidates_compose_in_chronological_order(
     }
 
 
+def test_retained_route_does_not_touch_rejected_projection_candidates(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen3_next_packed_qkv",
+        lambda model, *, active: calls.append(("packed_qkv", active)) or {},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen3_next_gdn_projection_pairs",
+        lambda model, *, active: calls.append(("gdn_projection_pairs", active)) or {},
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(
+            language_model=SimpleNamespace(),
+            mtp_update_cache=_callable,
+            mtp_update_cache_kv_only_history=_callable,
+        ),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="kv_only_history",
+        dual_norm=True,
+    )
+
+    assert calls == []
+
+
 def test_retained_c6_c7_stack_follows_kv_history(monkeypatch) -> None:
     calls: list[bool] = []
     monkeypatch.setattr(
         "mtplx.qwen38_challenge.configure_qwen38_final_qmv",
-        lambda *, active: calls.append(active) or {"installed": True},
+        lambda *, active, model: calls.append(active)
+        or {"installed": True, "active": True},
         raising=False,
     )
     text = SimpleNamespace()
@@ -362,3 +398,34 @@ def test_retained_c6_c7_stack_follows_kv_history(monkeypatch) -> None:
     assert route.route_id == "kv_only_history+dual_norm+qmv_final"
     assert text._mtplx_qwen38_dual_norm_concat is True
     assert calls == [True]
+
+
+def test_qmv_request_degrades_cleanly_when_turbo_dispatcher_is_unavailable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_final_qmv",
+        lambda *, active, model: {
+            "installed": False,
+            "active": False,
+            "bound_modules": 0,
+        },
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(mtp_update_cache=_callable),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="control",
+        qmv_final=True,
+    )
+
+    assert route.route_id == "control"
+    assert "qwen38_affine4_qmv_g32_g64_m2_m9_v2" not in route.kernel_ids

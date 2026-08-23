@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 _QMV_INPUTS_PER_GROUP = {
@@ -21,6 +22,7 @@ _DUAL_RMS_CONCAT_KERNEL = None
 _QMV_PATCH: dict[str, Any] = {
     "installed": False,
     "enabled": False,
+    "modules": {},
 }
 qwen38_qmv_counts: dict[str, int] = {}
 qwen38_dual_norm_calls = 0
@@ -473,6 +475,9 @@ def _qwen38_qmv_dispatch(self: Any, x: Any, width: int) -> Any | None:
 
     if not _QMV_PATCH["enabled"] or not _qmv_route_active():
         return None
+    owner_ref = _QMV_PATCH["modules"].get(id(self))
+    if owner_ref is None or owner_ref() is not self:
+        return None
     group_size = int(getattr(self, "group_size", 0) or 0)
     if (
         not 2 <= int(width) <= 9
@@ -506,17 +511,30 @@ def _qwen38_qmv_dispatch(self: Any, x: Any, width: int) -> Any | None:
     return y
 
 
-def configure_qwen38_final_qmv(*, active: bool) -> dict[str, bool]:
-    """Register once with NAX and toggle only the Qwen target-verify route."""
+def configure_qwen38_final_qmv(*, active: bool, model: Any) -> dict[str, Any]:
+    """Register once and bind dispatch to one exact Qwen model instance."""
 
     if active and not _QMV_PATCH["installed"]:
         from .nax_verify import register_qwen38_qmv_dispatch
 
-        register_qwen38_qmv_dispatch(_qwen38_qmv_dispatch)
-        _QMV_PATCH["installed"] = True
+        try:
+            register_qwen38_qmv_dispatch(_qwen38_qmv_dispatch)
+        except RuntimeError:
+            pass
+        else:
+            _QMV_PATCH["installed"] = True
     if _QMV_PATCH["installed"]:
         _QMV_PATCH["enabled"] = bool(active)
+        _QMV_PATCH["modules"] = (
+            {
+                id(module): weakref.ref(module)
+                for _, module in model.named_modules()
+            }
+            if active
+            else {}
+        )
     return {
         "installed": bool(_QMV_PATCH["installed"]),
         "active": bool(_QMV_PATCH["enabled"]),
+        "bound_modules": len(_QMV_PATCH["modules"]),
     }
