@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 DEFAULT_MODEL = Path.home() / (
     ".mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
 )
-DEFAULT_PROMPT = ROOT / "mtplx/benchmarks/prompts/flappy.jsonl"
+DEFAULT_PROMPT = ROOT / "mtplx/benchmarks/prompts/python_modules_long.jsonl"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
 
 
@@ -99,7 +99,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT)
-    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--order", default="control,kv_only_history,kv_only_history,control")
     parser.add_argument("--warmup-tokens", type=int, default=8)

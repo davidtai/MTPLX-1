@@ -1,0 +1,276 @@
+{
+  "arms": [
+    {
+      "accepted_by_depth": [
+        2,
+        2,
+        1
+      ],
+      "accepted_depth_schedule": [
+        3,
+        0,
+        2
+      ],
+      "attempted_depth_schedule": [
+        3,
+        3,
+        3
+      ],
+      "decode_tok_s": 40.87264799633754,
+      "draft_time_s": 0.04304529100772925,
+      "drafted_by_depth": [
+        3,
+        3,
+        2
+      ],
+      "generated_tokens": 8,
+      "kernel_ids": [],
+      "prompt_mtp_history_time_s": 0.004443958023330197,
+      "route_fingerprint": "2326724e9cd631db5afd31e80bed7a360aa7b4e25fcd9519b8c641c5117c2278",
+      "route_id": "control",
+      "token_hash": "d9555527927d9c2a22a285f495fd371321266fe970c0859b740f8767e3a7bfab",
+      "tokens": [
+        271,
+        248068,
+        198,
+        760,
+        1156,
+        6587,
+        264,
+        4434
+      ],
+      "wall_s": 0.4119259169965517
+    },
+    {
+      "accepted_by_depth": [
+        2,
+        2,
+        1
+      ],
+      "accepted_depth_schedule": [
+        3,
+        0,
+        2
+      ],
+      "attempted_depth_schedule": [
+        3,
+        3,
+        3
+      ],
+      "decode_tok_s": 43.2729109079598,
+      "draft_time_s": 0.03700166902854107,
+      "drafted_by_depth": [
+        3,
+        3,
+        2
+      ],
+      "generated_tokens": 8,
+      "kernel_ids": [
+        "qwen38_mtp_kv_only_history_v1"
+      ],
+      "prompt_mtp_history_time_s": 0.0013679589901585132,
+      "route_fingerprint": "7268173eff20ef5cc6e7681c3c2cbbdb29a344d4eab4ca57932277af436f63d5",
+      "route_id": "kv_only_history",
+      "token_hash": "d9555527927d9c2a22a285f495fd371321266fe970c0859b740f8767e3a7bfab",
+      "tokens": [
+        271,
+        248068,
+        198,
+        760,
+        1156,
+        6587,
+        264,
+        4434
+      ],
+      "wall_s": 0.39692133298376575
+    },
+    {
+      "accepted_by_depth": [
+        2,
+        2,
+        1
+      ],
+      "accepted_depth_schedule": [
+        3,
+        0,
+        2
+      ],
+      "attempted_depth_schedule": [
+        3,
+        3,
+        3
+      ],
+      "decode_tok_s": 43.213849641447226,
+      "draft_time_s": 0.03740558496792801,
+      "drafted_by_depth": [
+        3,
+        3,
+        2
+      ],
+      "generated_tokens": 8,
+      "kernel_ids": [
+        "qwen38_mtp_kv_only_history_v1"
+      ],
+      "prompt_mtp_history_time_s": 0.0014129579940345138,
+      "route_fingerprint": "7268173eff20ef5cc6e7681c3c2cbbdb29a344d4eab4ca57932277af436f63d5",
+      "route_id": "kv_only_history",
+      "token_hash": "d9555527927d9c2a22a285f495fd371321266fe970c0859b740f8767e3a7bfab",
+      "tokens": [
+        271,
+        248068,
+        198,
+        760,
+        1156,
+        6587,
+        264,
+        4434
+      ],
+      "wall_s": 0.3967011249915231
+    },
+    {
+      "accepted_by_depth": [
+        2,
+        2,
+        1
+      ],
+      "accepted_depth_schedule": [
+        3,
+        0,
+        2
+      ],
+      "attempted_depth_schedule": [
+        3,
+        3,
+        3
+      ],
+      "decode_tok_s": 42.1414624548037,
+      "draft_time_s": 0.04227712700958364,
+      "drafted_by_depth": [
+        3,
+        3,
+        2
+      ],
+      "generated_tokens": 8,
+      "kernel_ids": [],
+      "prompt_mtp_history_time_s": 0.004523999989032745,
+      "route_fingerprint": "2326724e9cd631db5afd31e80bed7a360aa7b4e25fcd9519b8c641c5117c2278",
+      "route_id": "control",
+      "token_hash": "d9555527927d9c2a22a285f495fd371321266fe970c0859b740f8767e3a7bfab",
+      "tokens": [
+        271,
+        248068,
+        198,
+        760,
+        1156,
+        6587,
+        264,
+        4434
+      ],
+      "wall_s": 0.4044272920000367
+    }
+  ],
+  "candidate_improvement_pct": 2.864176888251224,
+  "created_at": "2026-08-23T12:02:25Z",
+  "exact": true,
+  "kind": "qwen38_challenge_port_gate",
+  "max_tokens": 8,
+  "mean_wall_s": {
+    "control": 0.4081766044982942,
+    "kv_only_history": 0.3968112289876444
+  },
+  "mlx_version": "0.32.0",
+  "model": "/Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
+  "order": [
+    "control",
+    "kv_only_history",
+    "kv_only_history",
+    "control"
+  ],
+  "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "prompt_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-challenge-port/mtplx/benchmarks/prompts/flappy.jsonl",
+  "prompt_id": "flappy_html5_canvas_game",
+  "prompt_tokens": 116,
+  "python": "3.12.13",
+  "seed": 42,
+  "source_commit": "23723e86cff69bfcd8cfe31058ff6be8e5bd529a",
+  "source_status": [
+    " M docs/perf/qwen38-challenge-port-ledger.md",
+    " M docs/plans/2026-08-23-qwen38-challenge-port.md",
+    " M docs/specs/2026-08-23-qwen38-challenge-port-design.md",
+    "?? docs/perf/receipts/qwen38-challenge-port/kv-only-history-512t-2026-08-23.json",
+    "?? docs/perf/receipts/qwen38-challenge-port/kv-only-history-512t-baab-2026-08-23.json",
+    "?? docs/perf/receipts/qwen38-challenge-port/kv-only-history-64t-2026-08-23.json",
+    "?? docs/perf/receipts/qwen38-challenge-port/kv-only-history-64t-baab-2026-08-23.json",
+    "?? docs/perf/receipts/qwen38-challenge-port/kv-only-history-short-2026-08-23.json"
+  ],
+  "warmups": [
+    {
+      "accepted_by_depth": [
+        1,
+        1,
+        1
+      ],
+      "accepted_depth_schedule": [
+        3
+      ],
+      "attempted_depth_schedule": [
+        3
+      ],
+      "decode_tok_s": 56.18980580468409,
+      "draft_time_s": 0.017111124005168676,
+      "drafted_by_depth": [
+        1,
+        1,
+        1
+      ],
+      "generated_tokens": 4,
+      "kernel_ids": [],
+      "prompt_mtp_history_time_s": 0.006206209014635533,
+      "route_fingerprint": "2326724e9cd631db5afd31e80bed7a360aa7b4e25fcd9519b8c641c5117c2278",
+      "route_id": "control",
+      "token_hash": "0a61b066408616097a8ce3c37c374738a8f846d322469f4cdaeaa03c291dc8de",
+      "tokens": [
+        271,
+        248068,
+        198,
+        760
+      ],
+      "wall_s": 0.3119687909784261
+    },
+    {
+      "accepted_by_depth": [
+        1,
+        1,
+        1
+      ],
+      "accepted_depth_schedule": [
+        3
+      ],
+      "attempted_depth_schedule": [
+        3
+      ],
+      "decode_tok_s": 63.674495988620755,
+      "draft_time_s": 0.01407208398450166,
+      "drafted_by_depth": [
+        1,
+        1,
+        1
+      ],
+      "generated_tokens": 4,
+      "kernel_ids": [
+        "qwen38_mtp_kv_only_history_v1"
+      ],
+      "prompt_mtp_history_time_s": 0.0012815000081900507,
+      "route_fingerprint": "7268173eff20ef5cc6e7681c3c2cbbdb29a344d4eab4ca57932277af436f63d5",
+      "route_id": "kv_only_history",
+      "token_hash": "0a61b066408616097a8ce3c37c374738a8f846d322469f4cdaeaa03c291dc8de",
+      "tokens": [
+        271,
+        248068,
+        198,
+        760
+      ],
+      "wall_s": 0.27615608301130123
+    }
+  ]
+}

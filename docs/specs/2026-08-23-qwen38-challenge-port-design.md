@@ -110,11 +110,21 @@ Sources: submissions 3, 13, 16, 18, 21, 30, 45, 60, and 61.
 
 ### 5. MTP-head cache append and early submission
 
-MTPLX already has committed history, but its Qwen 3.8 `mtp_update_cache`
-currently calls the full MTP forward including the vocabulary head and discards
-the logits. Port the K/V-only committed-history flush and the safe early first
-draft submission after construction-time warmup. Preserve the existing MTPLX
-history, rollback, session-bank, and prefix-reuse contracts.
+MTPLX already skipped the vocabulary head in `mtp_update_cache`, so that part
+of the source mechanism is `ALREADY`. It still computed Q/gate, attention,
+output projection, MoE, and final norm for committed-history rows whose outputs
+the caller discards. The retained route performs only embedding/hidden
+normalization, fusion, input normalization, K/V projection, RoPE, and the cache
+write. Unlike the Swift worker, MTPLX appends history separately from the next
+proposal step, so every row in this call is dead-output K/V-only work rather
+than all-but-the-final row.
+
+The source's early first-draft submission is also already implicit in MTPLX:
+each proposal ID must be sampled on the host before the next chained MTP call
+can be built, which submits the first step at that boundary. No extra async
+dispatch is added. The optimized cache route remains limited to the validated
+one-layer Qwen 3.8 artifact and preserves history, rollback, session-bank, and
+prefix-reuse contracts.
 
 Sources: the not-already-present portions of submissions 11 and 20.
 
@@ -171,7 +181,7 @@ the challenge bootstrap and has no preceding Yukon row.
 | 8 | 41 | 17.9183% | History/single-sync/fusions/checkpoints/depth bundle | ALREADY for history, sync, checkpoints; fusions tracked separately |
 | 9 | 55 | 6.8764% | Paired affine QMV | SUPERSEDED by final cross-row family |
 | 10 | 59 | 5.3467% | Warmed compact vocabulary | PORT, compact-head set |
-| 11 | 63 | 5.7425% | Cost model, seed warm, early flush | ALREADY for controller/warm framework; PORT early submission/final calibration |
+| 11 | 63 | 5.7425% | Cost model, seed warm, early flush | ALREADY for controller, warm framework, and proposal submission boundary; final calibration tracked separately |
 | 12 | 70 | 0.8266% | Lazy exact prefix replay | ALREADY |
 | 13 | 71 | 2.0944% | Fused GDN input projections | PORT, fusion set |
 | 14 | 77 | 0.9839% | Lazy exact prefix replay restack | SUPERSEDED/ALREADY |
@@ -180,7 +190,7 @@ the challenge bootstrap and has no preceding Yukon row.
 | 17 | 126 | 7.5460% | Declared Q4/group-64 head | ALREADY; later superseded by compact Q2/Q4 artifact |
 | 18 | 135 | 0.4535% | One-forward exact SDPA width bridge | PORT, fusion set |
 | 19 | 160 | 2.5391% | Wider cross-row QMV and fused draft readout | DEPENDENCY of final QMV/readout |
-| 20 | 180 | 0.9180% | K/V-only committed-history flush | PORT, cache set |
+| 20 | 180 | 0.9180% | K/V-only committed-history flush | RETAINED; exact cache, 64/512-token ABBA and BAAB wins |
 | 21 | 186 | 1.5222% | Fused Q/K RMSNorm and partial RoPE | PORT, fusion set |
 | 22 | 194 | 0.0911% | Packed GDN prework mixer | WEAK, below threshold |
 | 23 | 215 | 0.2964% | Two-level compact selector | SUPERSEDED by E87 |
@@ -266,6 +276,9 @@ the challenge bootstrap and has no preceding Yukon row.
   for control and candidate.
 - Run exactness and one-cycle micro gates first. Reject at the first material
   regression or correctness failure.
+- Sanity-check every implemented candidate on `python_modules_long.jsonl` at
+  approximately 100 generated tokens. Token hashes and attempted/accepted
+  depth schedules must match before any longer benchmark.
 - Measure each consolidated candidate against unchanged `bd442156` behavior,
   then remeasure the cumulative retained stack against the same control.
 - Keep only independently measured wins. Source leaderboard improvement is

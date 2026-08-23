@@ -38,6 +38,10 @@ per-token feature eligibility checks or silent fallback.
 - Preserve shape, dtype, group size, bit packing, ownership, tiling, cache
   layout, compilation behavior, and workload timing boundaries.
 - Reject a candidate at the first matched A/B regression or parity failure.
+- Give every implemented candidate a first sanity bracket on
+  `python_modules_long.jsonl` at approximately 100 generated tokens. Require
+  identical token hashes and attempted/accepted depth schedules before any
+  longer or broader benchmark.
 - Do not retain code merely because its source challenge score improved.
 - Do not push or open the PR until all retained candidates and the cumulative
   stack pass the final gate.
@@ -226,63 +230,67 @@ top-2 values or IDs are consumed by generation, history, policy, or receipts.
 Mark rows 5 and 6 `CHALLENGE-ONLY` / `SKIP`. Do not add a kernel, dispatch,
 feature flag, test-only implementation, or performance claim.
 
-## Task 4: Remove the discarded vocabulary projection from MTP history append
+## Task 4: Remove dead full-layer work from MTP history append
 
 **Source rows:** remaining portion of 11 and row 20.
 
 **Files:**
 
-- Modify: `mtplx/qwen3_5_mtp_patch.py`
+- Modify: `mtplx/mtp_patch.py`
+- Modify: `mtplx/qwen38_challenge.py`
 - Modify: `mtplx/runtime.py`
-- Modify: `mtplx/generation.py`
-- Create/modify: `tests/test_qwen38_challenge_generation.py`
-- Modify: `tests/test_qwen3_5_mtp_backend.py`
+- Modify: `tests/test_mtp_depth_n.py`
+- Create: `scripts/qwen38_challenge_port_gate.py`
 
-- [ ] **Step 1: Write failing cache-update tests**
+- [x] **Step 1: Write failing cache-update tests**
 
 Assert that the optimized Qwen 3.8 cache update:
 
-- performs embedding normalization, hidden normalization, fusion, MTP layer,
-  and K/V cache write;
-- does not invoke MTP norm or the vocabulary head;
-- produces the same cache state and returned hidden row as the current full
-  forward for prompt, accepted, partial-accept, and repair cases;
+- performs embedding normalization, hidden normalization, fusion, input
+  normalization, K/V projection, RoPE, and the cache write;
+- does not invoke Q/gate, attention, output projection, MoE, MTP norm, or the
+  vocabulary head;
+- produces the exact same K/V cache state as the current full forward;
 - never appends rejected speculative rows;
 - preserves session and prefix restore behavior.
 
-- [ ] **Step 2: Run the red tests**
+- [x] **Step 2: Run the red tests**
 
 ```bash
 "$PY" -m pytest -q \
-  tests/test_qwen38_challenge_generation.py \
-  tests/test_qwen3_5_mtp_backend.py \
-  tests/test_scoped_reasoning_history.py \
-  -k 'cache_update or committed_history'
+  tests/test_mtp_depth_n.py \
+  tests/test_qwen38_challenge_contract.py \
+  -k 'kv_only_history or kv_only_candidate'
 ```
 
-- [ ] **Step 3: Add a hidden-only MTP update method**
+- [x] **Step 3: Add a K/V-only MTP history method**
 
 Bind the optimized method only for the validated Qwen 3.8 route. Do not change
 generic MTP or other Qwen families.
 
-- [ ] **Step 4: Add early first-draft submission behind the route**
+- [x] **Step 4: Close early first-draft submission as already present**
 
-Submit only after all inputs and caches are constructed and the exact seed
-shape is warmed. Do not introduce a host race, extra eval, or a new cache owner.
+The host must materialize each sampled proposal ID before it can build the next
+MTP step, so the first proposal is already submitted at that dependency
+boundary. No additional async dispatch or cache owner is introduced.
 
-- [ ] **Step 5: Verify and benchmark**
+- [x] **Step 5: Verify and benchmark**
 
-Run the focused history/session suite, then a locked matched A/B with identical
-acceptance schedule. Reject if schedule changes unexpectedly or candidate
-cycle time regresses.
+The exact cache test and focused suites pass. The required 100-token Python
+sanity brackets preserve token hash
+`485303a13e681058a2d25bf216898ec321dbd45e3a107e12a6d87276cbad2388`
+and `[23,20,17] / [25,25,25]` accepted/drafted counts in both orderings,
+improving wall time by 3.56% in ABBA and 1.69% in BAAB. Locked longer brackets
+also preserve token hashes and depth schedules.
 
-- [ ] **Step 6: Commit only retained changes**
+- [x] **Step 6: Commit only retained changes**
 
 ```bash
-git add mtplx/qwen3_5_mtp_patch.py mtplx/runtime.py mtplx/generation.py \
-  tests/test_qwen38_challenge_generation.py \
-  tests/test_qwen3_5_mtp_backend.py \
-  docs/perf/qwen38-challenge-port-ledger.md
+git add mtplx/mtp_patch.py mtplx/qwen38_challenge.py mtplx/runtime.py \
+  tests/test_mtp_depth_n.py tests/test_qwen38_challenge_contract.py \
+  scripts/qwen38_challenge_port_gate.py \
+  docs/perf/qwen38-challenge-port-ledger.md \
+  docs/perf/receipts/qwen38-challenge-port/kv-only-history-*.json
 git commit -m "Optimize Qwen 3.8 committed MTP cache updates"
 ```
 
@@ -608,8 +616,9 @@ For each retained commit:
 
 1. exactness/self-check;
 2. one-cycle real-shape timing;
-3. 64-token matched A/B;
-4. 512-token matched A/B only after the earlier gates pass.
+3. approximately 100 generated tokens on `python_modules_long.jsonl`, with
+   identical token hashes and attempted/accepted depth schedules;
+4. longer matched A/B only after the earlier gates pass.
 
 Remove candidates that fail. Do not average a regression into a later bundle.
 

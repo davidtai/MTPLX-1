@@ -28,14 +28,15 @@ rows are dependencies only when a surviving final mechanism requires them.
 | Compact Q2 coarse/Q4 rerank proposal head | 10, 42, 46, 47, 67, 69, 71, 79, 82 | PORT plus row 46 dependency | pending | pending | pending |
 | Final cross-row affine-4/group-64 QMV | 19, 34, 36, 39, 40, 41, 70, 78, 80 | PORT/dependency as one final family | pending | pending | pending |
 | Projection/GDN/attention/norm fusions | 3, 13, 16, 18, 21, 30, 45, 60, 61 | PORT as final retained forms | pending | pending | pending |
-| K/V-only history append and early submission | 11, 20 | PORT only for absent portions | pending | pending | pending |
+| K/V-only history append and early submission | 11, 20 | PORT only absent K/V-only append; early submission already implicit | exact cache; Python-100 token/depth parity; +3.56% ABBA and +1.69% BAAB; longer parity gates also pass | `kv-only-history-python-100t{-baab,}-2026-08-23.json` plus longer receipts | RETAINED |
 | Compact-head precision-island artifact | 33, 36 | PORT artifact candidate | pending | pending | pending |
 | Final depth/warm calibration | 11, 38, 59 | PORT into existing controller only | pending | pending | pending |
 
 ## Skip summary
 
 - **ALREADY:** committed history/prompt streaming, exact replay, generalized
-  verify, cost-model infrastructure, Q4/group-64 draft head, and current
+  verify, cost-model infrastructure, the host proposal-submission boundary,
+  Q4/group-64 draft head, and current
   NAX/compiled-verify behavior remain MTPLX-owned and unchanged.
 - **WEAK:** 27 rows at or below the threshold, controlled resamples, and
   no-op/noise rows have no performance claim.
