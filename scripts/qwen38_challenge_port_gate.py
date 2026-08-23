@@ -190,6 +190,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "source_proposal",
         "r08_device_draft",
         "r10_compact_vocab",
+        "r11_position_ema",
         "r17_q4_mtp_block",
         "r28_q4_mtp_block",
         "r36_qkv_islands",
@@ -230,6 +231,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(8)
     if "r10_compact_vocab" in features:
         source_rows.append(10)
+    if "r11_position_ema" in features:
+        source_rows.append(11)
     if "r17_q4_mtp_block" in features:
         source_rows.append(17)
     if "r18_gdn_decay_memo" in features:
@@ -273,6 +276,11 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "row80_qmv_m2": "r80_qmv_m2" in features,
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
+        "adaptive_policy": (
+            "position_ema" if "r11_position_ema" in features else "none"
+        ),
+        "speculative_depth": 4 if "r11_position_ema" in features else 3,
+        "adaptive_depth_cap": 4 if "r11_position_ema" in features else 0,
         "mtp_block_variant": (
             "r36"
             if "r36_qkv_islands" in features
@@ -365,6 +373,15 @@ def _candidate_engagement_errors(
         if run.get("route_id") == candidate_route
     ]
     errors: list[str] = []
+    if "r11_position_ema" in features:
+        policy_events = [
+            event
+            for run in candidate_runs
+            for event in (run.get("adaptive_policy_events") or [])
+            if event.get("kind") == "position_ema"
+        ]
+        if not policy_events:
+            errors.append("row 11 position-EMA adaptive policy did not execute")
     if (
         "r17_q4_mtp_block" in features
         and "r28_q4_mtp_block" not in features
@@ -756,6 +773,7 @@ def _run_arm(
     import mlx.core as mx
 
     from mtplx.generation import generate_mtpk
+    from mtplx.adaptive import PositionEMADepthPolicy
     from mtplx.qwen38_challenge import install_qwen38_route
     from mtplx.sampling import SamplerConfig
 
@@ -801,6 +819,14 @@ def _run_arm(
         top_k=20,
     )
     counters_before = _projection_counter_snapshot()
+    adaptive_policy = (
+        PositionEMADepthPolicy(
+            max_depth=int(options["speculative_depth"]),
+            depth_cap=int(options["adaptive_depth_cap"]),
+        )
+        if options["adaptive_policy"] == "position_ema"
+        else None
+    )
     mx.reset_peak_memory()
     started = time.perf_counter()
     output = generate_mtpk(
@@ -809,7 +835,8 @@ def _run_arm(
         max_tokens=max_tokens,
         sampler=target_sampler,
         draft_sampler=draft_sampler,
-        speculative_depth=3,
+        speculative_depth=int(options["speculative_depth"]),
+        adaptive_policy=adaptive_policy,
         seed=seed,
         mtp_hidden_variant="post_norm",
         mtp_cache_policy="persistent",
@@ -850,6 +877,11 @@ def _run_arm(
         ],
         "accepted_depth_schedule": [
             int(event.get("accepted_depths", 0)) for event in stats.events
+        ],
+        "adaptive_policy_events": [
+            dict(event["policy"])
+            for event in stats.events
+            if isinstance(event.get("policy"), dict)
         ],
         "token_hash": _token_hash(list(output.tokens)),
         "tokens": list(output.tokens),

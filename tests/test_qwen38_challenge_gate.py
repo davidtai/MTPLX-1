@@ -407,6 +407,9 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
     assert control["draft_core"] == "stock"
     assert row_8 == {
         "cache_route": "control",
+        "adaptive_policy": "none",
+        "speculative_depth": 3,
+        "adaptive_depth_cap": 0,
         "dual_norm": False,
             "source_proposal": False,
             "row10_compact_vocab": False,
@@ -436,6 +439,36 @@ def test_row_10_extends_retained_row_8_with_compact_proposal_vocabulary() -> Non
     assert row_10["draft_core"] == "device"
     assert row_10["row10_compact_vocab"] is True
     assert row_10["source_rows"] == (8, 10)
+
+
+def test_row11_enables_position_ema_depth_four_candidate() -> None:
+    gate = _module()
+
+    options = gate._route_execution_options(
+        "r08_device_draft+r10_compact_vocab+r11_position_ema"
+    )
+
+    assert options["adaptive_policy"] == "position_ema"
+    assert options["speculative_depth"] == 4
+    assert options["adaptive_depth_cap"] == 4
+    assert options["source_rows"] == (8, 10, 11)
+
+
+def test_row11_promotion_requires_position_ema_policy_events() -> None:
+    gate = _module()
+    route = "r08_device_draft+r10_compact_vocab+r11_position_ema"
+    zero = {"route_id": route, "adaptive_policy_events": []}
+    engaged = {
+        "route_id": route,
+        "adaptive_policy_events": [
+            {"kind": "position_ema", "attempted_depth": 4, "next_depth": 4}
+        ],
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 11 position-EMA adaptive policy did not execute"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 
 
 def test_row_18_decay_memo_extends_rows_8_and_10() -> None:
