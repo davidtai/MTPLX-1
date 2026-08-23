@@ -455,6 +455,77 @@ _WO_B_DECODE_FUSED_QUANT_SOURCE = r"""
 """
 
 
+_WO_B_DECODE_QUANTIZED_SOURCE = r"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint row0 = threadgroup_position_in_grid.z * BM;
+    uint n0 = threadgroup_position_in_grid.y * BN;
+    uint sg_n = sg * 16u;
+
+    threadgroup T a_tile[BM * BK];
+    threadgroup T b_tile[BK * BN];
+    threadgroup float c_tile[BM * BN];
+    simdgroup_matrix<T, 8, 8> a, b_left, b_right;
+    simdgroup_matrix<float, 8, 8> c_left =
+        simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> c_right =
+        simdgroup_matrix<float, 8, 8>(0.0f);
+    const device uchar* weight_bytes =
+        reinterpret_cast<const device uchar*>(weight);
+
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        for (uint index = tid; index < BM * BK; index += THREADS) {
+            uint local_row = index / BK;
+            uint local_k = index - local_row * BK;
+            uint row = row0 + local_row;
+            uint k = k0 + local_k;
+            if (row < uint(rows)) {
+                float scale = mia_ue8m0_decode(
+                    activation_scales[size_t(row) * (K / 32u) + k / 32u]
+                );
+                a_tile[index] = T(
+                    mia_e4m3_decode(activations[size_t(row) * K + k]) * scale
+                );
+            } else {
+                a_tile[index] = T(0.0f);
+            }
+        }
+        for (uint index = tid; index < BK * BN; index += THREADS) {
+            uint local_k = index / BN;
+            uint local_n = index - local_k * BN;
+            uint k = k0 + local_k;
+            uint n = n0 + local_n;
+            float scale = mia_ue8m0_decode(
+                weight_scales[size_t(n) * (K / 32u) + k / 32u]
+            );
+            b_tile[index] = T(
+                mia_e4m3_decode(weight_bytes[size_t(n) * K + k]) * scale
+            );
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ks = 0u; ks < BK; ks += 8u) {
+            simdgroup_load(a, a_tile + ks, BK);
+            simdgroup_load(b_left, b_tile + ks * BN + sg_n, BN);
+            simdgroup_load(b_right, b_tile + ks * BN + sg_n + 8u, BN);
+            simdgroup_multiply_accumulate(c_left, a, b_left, c_left);
+            simdgroup_multiply_accumulate(c_right, a, b_right, c_right);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(c_left, c_tile + sg_n, BN);
+    simdgroup_store(c_right, c_tile + sg_n + 8u, BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint index = tid; index < BM * BN; index += THREADS) {
+        uint local_row = index / BN;
+        uint local_n = index - local_row * BN;
+        uint row = row0 + local_row;
+        if (row < uint(rows)) {
+            output[size_t(row) * N + n0 + local_n] = T(c_tile[index]);
+        }
+    }
+"""
+
+
 @lru_cache(maxsize=1)
 def _inverse_rope_quant_kernel():
     return mx.fast.metal_kernel(
@@ -560,6 +631,36 @@ def _wo_b_decode_fused_quant_kernel(block_n: int):
     )
 
 
+@lru_cache(maxsize=2)
+def _wo_b_decode_quantized_kernel(block_n: int):
+    block_n = int(block_n)
+    if block_n not in {32, 64}:
+        raise ValueError(f"unsupported Mia TP1 quantized WO-B decode BN: {block_n}")
+    threads = (block_n // 16) * 32
+    header = _MXFP8_HEADER + f"""
+        constant constexpr uint K = {_WO_B_K}u;
+        constant constexpr uint N = {_HIDDEN}u;
+        constant constexpr uint BM = {_WO_B_DECODE_BM}u;
+        constant constexpr uint BN = {block_n}u;
+        constant constexpr uint BK = {_WO_B_DECODE_BK}u;
+        constant constexpr uint THREADS = {threads}u;
+    """
+    return mx.fast.metal_kernel(
+        name=f"mtplx_dsv4_mia_wo_b_mxfp8_quantized_bm8_bn{block_n}_tp1",
+        input_names=[
+            "activations",
+            "activation_scales",
+            "weight",
+            "weight_scales",
+            "rows",
+        ],
+        output_names=["output"],
+        header=header,
+        source=_WO_B_DECODE_QUANTIZED_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
 def _require_array(name: str, value, shape: tuple[int, ...], dtype) -> None:
     observed_shape = tuple(int(dim) for dim in getattr(value, "shape", ()))
     observed_dtype = getattr(value, "dtype", None)
@@ -585,6 +686,7 @@ class MiaTP1WOMXFP8Plan:
     wo_a_bm8: object
     wo_a_bm64: object
     wo_b_decode: object
+    wo_b_decode_quantized: object
     wo_b_bm64: object
 
     def __call__(self, o, cos, sin):
@@ -641,9 +743,26 @@ class MiaTP1WOMXFP8Plan:
                 output_dtypes=[mx.bfloat16],
             )
         if rows <= 8:
+            tmp_quantized, tmp_scales = self.group_major_quant(
+                inputs=[tmp, rows],
+                template=[("T", mx.bfloat16)],
+                grid=(32, _WO_B_K // _SCALE_GROUP, rows),
+                threadgroup=(32, 1, 1),
+                output_shapes=[
+                    (rows, _WO_B_K),
+                    (rows, _WO_B_K // _SCALE_GROUP),
+                ],
+                output_dtypes=[mx.uint8, mx.uint8],
+            )
             threads = (_WO_B_DECODE_BN // 16) * 32
-            (output,) = self.wo_b_decode(
-                inputs=[tmp, self.wo_b_weight, self.wo_b_scales, rows],
+            (output,) = self.wo_b_decode_quantized(
+                inputs=[
+                    tmp_quantized,
+                    tmp_scales,
+                    self.wo_b_weight,
+                    self.wo_b_scales,
+                    rows,
+                ],
                 template=[("T", mx.bfloat16)],
                 grid=(
                     threads,
@@ -734,6 +853,7 @@ def install_mia_tp1_wo_mxfp8(
         wo_a_bm8=_mxfp8_mma_kernel("wo_a", 8),
         wo_a_bm64=_mxfp8_mma_kernel("wo_a", 64),
         wo_b_decode=_wo_b_decode_fused_quant_kernel(_WO_B_DECODE_BN),
+        wo_b_decode_quantized=_wo_b_decode_quantized_kernel(_WO_B_DECODE_BN),
         wo_b_bm64=_mxfp8_mma_kernel("wo_b", 64),
     )
 

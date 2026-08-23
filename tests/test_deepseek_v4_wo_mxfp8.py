@@ -117,6 +117,11 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
     monkeypatch.setattr(wo, "_wo_b_decode_fused_quant_kernel", decode_kernel)
     monkeypatch.setattr(
         wo,
+        "_wo_b_decode_quantized_kernel",
+        lambda block_n: kernel(f"wo_b_decode_quantized_bn{block_n}"),
+    )
+    monkeypatch.setattr(
+        wo,
         "_wo_a_m16_quantized_kernel",
         lambda: kernel("wo_a_m16_quantized"),
         raising=False,
@@ -138,6 +143,7 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
     monkeypatch.setattr(wo, "_group_major_quant_kernel", forbidden)
     monkeypatch.setattr(wo, "_mxfp8_mma_kernel", forbidden)
     monkeypatch.setattr(wo, "_wo_b_decode_fused_quant_kernel", forbidden)
+    monkeypatch.setattr(wo, "_wo_b_decode_quantized_kernel", forbidden)
     monkeypatch.setattr(
         wo, "_wo_a_m16_quantized_kernel", forbidden, raising=False
     )
@@ -155,7 +161,8 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         assert [name for name, _kwargs in calls] == [
             "inv_quant",
             "wo_a_bm8",
-            "wo_b_decode_bn64",
+            "tmp_quant",
+            "wo_b_decode_quantized_bn64",
         ]
         inv_call = calls[0][1]
         assert inv_call["inputs"][1] is cos
@@ -165,8 +172,10 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         assert (1, rows, 64 * 512) not in inv_call["output_shapes"]
         assert calls[1][1]["output_shapes"] == [(rows, 8, 1024)]
         assert calls[1][1]["output_dtypes"] == [mx.bfloat16]
-        assert calls[2][1]["grid"] == (128, 64, 1)
-        assert calls[2][1]["threadgroup"] == (128, 1, 1)
+        assert calls[2][1]["output_shapes"] == [(rows, 8192), (rows, 256)]
+        assert calls[2][1]["output_dtypes"] == [mx.uint8, mx.uint8]
+        assert calls[3][1]["grid"] == (128, 64, 1)
+        assert calls[3][1]["threadgroup"] == (128, 1, 1)
 
     calls.clear()
     output = plan(
@@ -222,6 +231,9 @@ def test_tp1_wo_install_rejects_shape_or_storage_poison(
         wo, "_wo_b_decode_fused_quant_kernel", lambda _block_n: object()
     )
     monkeypatch.setattr(
+        wo, "_wo_b_decode_quantized_kernel", lambda _block_n: object()
+    )
+    monkeypatch.setattr(
         wo, "_wo_a_m16_quantized_kernel", lambda: object(), raising=False
     )
     weights = _weights()
@@ -237,6 +249,7 @@ def test_wo_sources_pin_fp32_accumulation_logical_row_guards_and_no_bf16_wide_sc
             wo._MXFP8_MMA_SOURCE,
             wo._WO_A_M16_QUANTIZED_SOURCE,
             wo._WO_B_DECODE_FUSED_QUANT_SOURCE,
+            wo._WO_B_DECODE_QUANTIZED_SOURCE,
             inspect.getsource(wo.MiaTP1WOMXFP8Plan.__call__),
         )
     )
@@ -254,8 +267,8 @@ def test_wo_sources_pin_fp32_accumulation_logical_row_guards_and_no_bf16_wide_sc
     )
 
 
-def test_authentic_mia_m6_wo_b_bn64_matches_bn32_bit_exact():
-    """The wider decode owner must preserve every BF16 output bit."""
+def test_authentic_mia_m6_wo_b_routes_match_bit_exact():
+    """Both the wider and quantize-once owners preserve every BF16 output bit."""
 
     if not mx.metal.is_available():
         pytest.skip("Metal is unavailable")
@@ -293,11 +306,31 @@ def test_authentic_mia_m6_wo_b_bn64_matches_bn32_bit_exact():
         return output
 
     baseline = project(32)
-    candidate = project(64)
-    mx.eval(baseline, candidate)
+    widened = project(64)
+    tmp_quantized, tmp_scales = wo._group_major_quant_kernel()(
+        inputs=[tmp, 6],
+        template=[("T", mx.bfloat16)],
+        grid=(32, 8192 // 32, 6),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(6, 8192), (6, 8192 // 32)],
+        output_dtypes=[mx.uint8, mx.uint8],
+    )
+    (quantize_once,) = wo._wo_b_decode_quantized_kernel(64)(
+        inputs=[tmp_quantized, tmp_scales, weight, scales, 6],
+        template=[("T", mx.bfloat16)],
+        grid=(128, 4096 // 64, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(6, 4096)],
+        output_dtypes=[mx.bfloat16],
+    )
+    mx.eval(baseline, widened, quantize_once)
 
     np.testing.assert_array_equal(
-        np.array(candidate.view(mx.uint16)),
+        np.array(widened.view(mx.uint16)),
+        np.array(baseline.view(mx.uint16)),
+    )
+    np.testing.assert_array_equal(
+        np.array(quantize_once.view(mx.uint16)),
         np.array(baseline.view(mx.uint16)),
     )
 
@@ -335,6 +368,9 @@ def test_exact_model_install_owns_46_distinct_plans_and_native_parameters(
     monkeypatch.setattr(wo, "_mxfp8_mma_kernel", lambda *_args: object())
     monkeypatch.setattr(
         wo, "_wo_b_decode_fused_quant_kernel", lambda _block_n: object()
+    )
+    monkeypatch.setattr(
+        wo, "_wo_b_decode_quantized_kernel", lambda _block_n: object()
     )
     monkeypatch.setattr(
         wo, "_wo_a_m16_quantized_kernel", lambda: object(), raising=False
