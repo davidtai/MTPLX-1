@@ -35,17 +35,9 @@ def test_mia_loader_installs_stacked_projections_after_weights_before_plan() -> 
     wo_install = source.index("install_mia_tp1_wo_projection_routes(")
     stacked_install = source.index("install_mia_stacked_projections(model)")
     qkv_install = source.index("install_mia_qkv_prologue_routes(model)")
-    wq_b_m6_install = source.index("install_mia_wq_b_m6_routes(model)")
     plan_build = source.index("engine_plan = build_mia_engine_plan(")
 
-    assert (
-        draft_load
-        < wo_install
-        < stacked_install
-        < qkv_install
-        < wq_b_m6_install
-        < plan_build
-    )
+    assert draft_load < wo_install < stacked_install < qkv_install < plan_build
 
 
 _MIA_EXACT_MODEL = Path(

@@ -165,10 +165,6 @@ def test_engine_plan_seals_quad_qmv_owners_and_prewarm_signatures() -> None:
     assert "_m6_quad_qmv_kernel(2048, 4096, True)" in build_source
     assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in build_source
     assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in identity_source
-    assert "MIA_WQ_B_M6_DESCRIPTOR_SHA256" in build_source
-    assert "MIA_WQ_B_M6_DESCRIPTOR_SHA256" in identity_source
-    assert "_mxfp8_qmv_m6_kernel(1024, 32768)" in build_source
-    assert "target_wq_b_m6_mxfp8_nv6" in build_source
     assert "EXL3_M6_STAGE_VECTOR_BYTES" in build_source
     assert "EXL3_M6_STAGE_VECTORS_PER_K_TILE" in build_source
     assert 'getattr(quad_plan, "stage_vector_bytes", None)' in build_source
@@ -413,68 +409,6 @@ def test_exact_stacked_projection_installer_binds_all_named_owners(monkeypatch):
         for layer in layers
         if layer.attn.compress_ratio == 4
     )
-
-
-def test_exact_wq_b_m6_installer_binds_target_only(monkeypatch) -> None:
-    from mtplx.kernels import deepseek_v4_mxfp8_qmv_m6 as qmv_m6
-
-    class StaticArray:
-        def __init__(self, shape, dtype):
-            self.shape = tuple(shape)
-            self.dtype = dtype
-
-    class Projection:
-        def __init__(self):
-            self.weight = StaticArray((32768, 256), mx.uint32)
-            self.scales = StaticArray((32768, 32), mx.uint8)
-            self.bias = None
-            self.biases = None
-            self.group_size = 32
-            self.bits = 8
-            self.mode = "mxfp8"
-
-        def __call__(self, values):
-            return values
-
-    class Attention:
-        def __init__(self):
-            self.wq_b = Projection()
-            self._mia_wq_b_impl = self._stock_wq_b_projection
-
-        def _stock_wq_b_projection(self, values):
-            return self.wq_b(values)
-
-        def install_mia_wq_b_m6_route(self, route):
-            self._mia_wq_b_impl = route
-
-    kernel = object()
-    monkeypatch.setattr(qmv_m6, "_mxfp8_qmv_m6_kernel", lambda *_args: kernel)
-    layers = tuple(SimpleNamespace(attn=Attention()) for _ in range(43))
-    stages = tuple(SimpleNamespace(attn=Attention()) for _ in range(3))
-    model = SimpleNamespace(
-        layers=layers,
-        dspark=SimpleNamespace(stages=stages),
-    )
-
-    receipt = target_module.install_mia_wq_b_m6_routes(model)
-
-    assert receipt == {
-        "route": "mia_wq_b_m6",
-        "target_attention": 43,
-        "draft_attention_stock": 3,
-        "plan_count": 43,
-        "unique_plan_count": 43,
-        "plan_type": "MiaWQBM6Route",
-        "geometry": (1024, 32768, 6),
-        "descriptor_sha256": qmv_m6.MIA_WQ_B_M6_DESCRIPTOR_SHA256,
-    }
-    assert all(layer.attn._mia_wq_b_impl is not layer.attn.wq_b for layer in layers)
-    assert all(
-        stage.attn._mia_wq_b_impl.__self__ is stage.attn
-        and stage.attn._mia_wq_b_impl.__func__ is Attention._stock_wq_b_projection
-        for stage in stages
-    )
-    assert model._mia_wq_b_m6_receipt == receipt
 
 
 def test_ratio_specialized_mla_route_contract_rejects_generic_callables():

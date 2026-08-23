@@ -50,9 +50,6 @@ MIA_SOURCE_EXL3_SHA256 = "1e35cbbc33a977606a950928fba4c6660c7df0134bfab9472dd6d8
 MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256 = (
     "158d8b220411e42a910b29a47d8af0f045b4eb1feec745cfa39b9997db72efa2"
 )
-MIA_WQ_B_M6_DESCRIPTOR_SHA256 = (
-    "b3ef2fb537e88b613a9d106a3836ab47f08512cf6b9141b01a1aa35253d2dfad"
-)
 
 _TARGET_SMALL_FILE_PINS = {
     "config.json": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
@@ -1189,8 +1186,6 @@ def _mia_engine_identity(
             "long-prefill-chunk1024",
             "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-bn256-simd-h128-u4-stage16b-96x8",
             MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256,
-            "target-wq-b-m6-mxfp8-nv6",
-            MIA_WQ_B_M6_DESCRIPTOR_SHA256,
             "compressor-absolute-state-rings",
             "fixed-target-window-m8224",
             "persistent-target-draft-page-arenas",
@@ -1286,17 +1281,10 @@ def build_mia_engine_plan(
     from mtplx.models.deepseek_v4 import (
         _stock_moe_tail_combine,
         mia_tp1_wo_projection_receipt,
-        mia_wq_b_m6_receipt,
-    )
-    from mtplx.kernels.deepseek_v4_mxfp8_qmv_m6 import (
-        MIA_WQ_B_M6_DESCRIPTOR_SHA256 as INSTALLED_WQ_B_M6_DESCRIPTOR_SHA256,
-        _mxfp8_qmv_m6_kernel,
     )
 
     if EXL3_M6_QUAD_DESCRIPTOR_SHA256 != MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256:
         raise ValueError("the Mia quad MCG descriptor seal changed")
-    if INSTALLED_WQ_B_M6_DESCRIPTOR_SHA256 != MIA_WQ_B_M6_DESCRIPTOR_SHA256:
-        raise ValueError("the Mia target wq_b M6 descriptor seal changed")
 
     wo_projection_receipt = mia_tp1_wo_projection_receipt(model)
     if (
@@ -1313,21 +1301,6 @@ def build_mia_engine_plan(
         or wo_projection_receipt["max_prefill_rows"] != max_batch_tokens
     ):
         raise ValueError("the Mia TP1 B12X WO projection receipt changed")
-
-    wq_b_m6_receipt = mia_wq_b_m6_receipt(model)
-    if (
-        getattr(model, "_mia_wq_b_m6_receipt", None) != wq_b_m6_receipt
-        or wq_b_m6_receipt["route"] != "mia_wq_b_m6"
-        or wq_b_m6_receipt["target_attention"] != MIA_TARGET_LAYERS
-        or wq_b_m6_receipt["draft_attention_stock"] != MIA_DSPARK_STAGES
-        or wq_b_m6_receipt["plan_count"] != MIA_TARGET_LAYERS
-        or wq_b_m6_receipt["unique_plan_count"] != MIA_TARGET_LAYERS
-        or wq_b_m6_receipt["plan_type"] != "MiaWQBM6Route"
-        or wq_b_m6_receipt["geometry"] != (1024, 32768, 6)
-        or wq_b_m6_receipt["descriptor_sha256"]
-        != MIA_WQ_B_M6_DESCRIPTOR_SHA256
-    ):
-        raise ValueError("the Mia target wq_b M6 receipt changed")
 
     target_physical_capacity_tokens = (
         context_capacity_tokens + MIA_DSPARK_BLOCK
@@ -1456,7 +1429,6 @@ def build_mia_engine_plan(
         trellis_fused = getattr(layer.ffn, "_mia_exl3_trellis_fused", None)
         tail_combine = getattr(layer.ffn, "_mia_exl3_tail_combine", None)
         quad_plan = getattr(layer.ffn.switch_mlp, "_m6_quad_qmv_plan", None)
-        wq_b_route = getattr(layer.attn, "_mia_wq_b_impl", None)
         installed = (
             bool(getattr(layer.ffn.switch_mlp, "_trellis_installed", False)),
             _callable_name(getattr(layer.ffn, "_forward_impl", None)),
@@ -1500,11 +1472,6 @@ def build_mia_engine_plan(
                 else compress_rope_provider
             ),
             type(getattr(layer.attn, "_mia_input_projection", None)).__name__,
-            type(wq_b_route).__name__,
-            getattr(getattr(wq_b_route, "m6", None), "kernel", None)
-            is _mxfp8_qmv_m6_kernel(1024, 32768),
-            getattr(getattr(wq_b_route, "m6", None), "descriptor_sha256", None)
-            == MIA_WQ_B_M6_DESCRIPTOR_SHA256,
             type(getattr(layer.attn, "_output_projection_impl", None)).__name__,
             getattr(layer.attn, "_mia_mla_workspace", None) is mla_workspace,
             getattr(layer.attn, "_mia_mla_query_layout", None),
@@ -1563,9 +1530,6 @@ def build_mia_engine_plan(
             expected_prefill,
             True,
             "MiaStackedMXFP8Projection",
-            "MiaWQBM6Route",
-            True,
-            True,
             "MiaTP1WOMXFP8Plan",
             True,
             "BMHD",
@@ -2084,7 +2048,6 @@ def build_mia_engine_plan(
         "draft_shared_base_rope_graph_through_position_384004",
         "target_draft_stacked_mxfp8_projections",
         "target_draft_fused_qkv_stock432_prologues",
-        f"target_wq_b_m6_mxfp8_nv6_{MIA_WQ_B_M6_DESCRIPTOR_SHA256}",
         "target_finalized_record_cache_owner",
         "target_fixed_swa_paged_descriptor_8416",
         "dspark_initial_commit_record_cache_owners",

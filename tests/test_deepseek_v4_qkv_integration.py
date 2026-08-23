@@ -54,7 +54,7 @@ def test_target_qkv_route_projects_once_and_finalizes_by_runtime_phase() -> None
             prefill_records=finalizer("prefill"),
             target_records=finalizer("target"),
         ),
-        _mia_wq_b_impl=lambda values: mx.zeros(
+        wq_b=lambda values: mx.zeros(
             (*values.shape[:-1], 64 * 512), dtype=mx.bfloat16
         ),
         _mia_token_rope_tables=lambda start, rows: (
