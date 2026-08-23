@@ -191,6 +191,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r08_device_draft",
         "r10_compact_vocab",
         "r17_q4_mtp_block",
+        "r28_q4_mtp_block",
         "r18_gdn_decay_memo",
         "r20_kv_only_history",
         "r21_qk_rms_rope",
@@ -226,6 +227,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(24)
     if "r26_prefill_ladder_3" in features:
         source_rows.append(26)
+    if "r28_q4_mtp_block" in features:
+        source_rows.append(28)
     return {
         "cache_route": (
             "kv_only_history"
@@ -235,7 +238,13 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "dual_norm": "dual_norm" in features,
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
-        "mtp_block_variant": "r17" if "r17_q4_mtp_block" in features else None,
+        "mtp_block_variant": (
+            "r28"
+            if "r28_q4_mtp_block" in features
+            else "r17"
+            if "r17_q4_mtp_block" in features
+            else None
+        ),
         "row18_gdn_decay_memo": "r18_gdn_decay_memo" in features,
         "row21_qk_rms_rope": "r21_qk_rms_rope" in features,
         "row24_eval_ladder": "r24_eval_ladder" in features,
@@ -303,7 +312,7 @@ def _candidate_engagement_errors(
         if run.get("route_id") == candidate_route
     ]
     errors: list[str] = []
-    if "r17_q4_mtp_block" in features:
+    if "r17_q4_mtp_block" in features and "r28_q4_mtp_block" not in features:
         active = any(
             bool(report.get("installed"))
             and bool(report.get("active"))
@@ -317,6 +326,20 @@ def _candidate_engagement_errors(
         )
         if not active:
             errors.append("row 17 pinned Q4/group-64 MTP block was not active")
+    if "r28_q4_mtp_block" in features:
+        active = any(
+            bool(report.get("installed"))
+            and bool(report.get("active"))
+            and report.get("variant") == "r28"
+            and int(report.get("bits", 0)) == 4
+            and int(report.get("group_size", 0)) == 64
+            for run in candidate_runs
+            for report in [
+                ((run.get("feature_receipt") or {}).get("r28_q4_mtp_block") or {})
+            ]
+        )
+        if not active:
+            errors.append("row 28 pinned alternate Q4/group-64 MTP block was not active")
     if "r18_gdn_decay_memo" in features:
         memo_calls = sum(
             int(
@@ -545,6 +568,7 @@ def _run_arm(
     draft_temperature: float,
     source_artifact_path: Path | None,
     row17_artifact_path: Path | None,
+    row28_artifact_path: Path | None,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -562,7 +586,11 @@ def _run_arm(
         source_proposal=bool(options["source_proposal"]),
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
         mtp_block_variant=options["mtp_block_variant"],
-        mtp_block_artifact_path=row17_artifact_path,
+        mtp_block_artifact_path=(
+            row28_artifact_path
+            if options["mtp_block_variant"] == "r28"
+            else row17_artifact_path
+        ),
         row18_gdn_decay_memo=bool(options["row18_gdn_decay_memo"]),
         row21_qk_rms_rope=bool(options["row21_qk_rms_rope"]),
         row24_eval_ladder=bool(options["row24_eval_ladder"]),
@@ -653,6 +681,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-route")
     parser.add_argument("--source-artifact", type=Path)
     parser.add_argument("--row17-artifact", type=Path)
+    parser.add_argument("--row28-artifact", type=Path)
     parser.add_argument(
         "--warmup-tokens",
         type=int,
@@ -738,6 +767,7 @@ def main() -> int:
             draft_temperature=draft_temperature,
             source_artifact_path=args.source_artifact,
             row17_artifact_path=args.row17_artifact,
+            row28_artifact_path=args.row28_artifact,
         )
         for route_id in unique_routes
     ]
@@ -754,6 +784,7 @@ def main() -> int:
             draft_temperature=draft_temperature,
             source_artifact_path=args.source_artifact,
             row17_artifact_path=args.row17_artifact,
+            row28_artifact_path=args.row28_artifact,
         )
         for route_id in order
     ]
