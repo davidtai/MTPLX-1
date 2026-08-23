@@ -47,6 +47,9 @@ MIA_TARGET_REVISION = "22f28d32b9b29b4352eaa380ff8c2c170b2847ab"
 MIA_SOURCE_CONFIG_SHA256 = "b001ec8308044aa11daa0e624f5aea5e5362a63c05879a83a7be046b00eada82"
 MIA_SOURCE_INDEX_SHA256 = "61af5c0782a8651ef893004e84369d2281a0fc316c8bcefc0bd8f76244224649"
 MIA_SOURCE_EXL3_SHA256 = "1e35cbbc33a977606a950928fba4c6660c7df0134bfab9472dd6d851be894125"
+MIA_EXL3_M6_PAIR_DESCRIPTOR_SHA256 = (
+    "1117b53c6867097d7fbeeaaeb25c46725a78046ca767b709edd00bacf9ebd690"
+)
 
 _TARGET_SMALL_FILE_PINS = {
     "config.json": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
@@ -1181,7 +1184,8 @@ def _mia_engine_identity(
             "mhc-post-pre-m384-bm64-bf16mma",
             "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
             "long-prefill-chunk1024",
-            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-qmv-bn256-simd-h128",
+            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-paired-mcg-qmv-bn256-simd-h128",
+            MIA_EXL3_M6_PAIR_DESCRIPTOR_SHA256,
             "compressor-absolute-state-rings",
             "fixed-target-window-m8224",
             "persistent-target-draft-page-arenas",
@@ -1266,11 +1270,19 @@ def build_mia_engine_plan(
             f"installed Mia engine topology changed: {observed!r} != {expected!r}"
         )
 
-    from mtplx.deepseek_v4_exl3 import EXL3SwitchGLU
+    from mtplx.deepseek_v4_exl3 import (
+        EXL3_M6_PAIR_DESCRIPTOR_SHA256,
+        EXL3SwitchGLU,
+        _InstalledM6PairedQMVPlan,
+        _m6_paired_qmv_kernel,
+    )
     from mtplx.models.deepseek_v4 import (
         _stock_moe_tail_combine,
         mia_tp1_wo_projection_receipt,
     )
+
+    if EXL3_M6_PAIR_DESCRIPTOR_SHA256 != MIA_EXL3_M6_PAIR_DESCRIPTOR_SHA256:
+        raise ValueError("the Mia paired MCG descriptor seal changed")
 
     wo_projection_receipt = mia_tp1_wo_projection_receipt(model)
     if (
@@ -1414,12 +1426,23 @@ def build_mia_engine_plan(
         direct_qmv = getattr(layer.ffn, "_mia_exl3_direct_qmv", None)
         trellis_fused = getattr(layer.ffn, "_mia_exl3_trellis_fused", None)
         tail_combine = getattr(layer.ffn, "_mia_exl3_tail_combine", None)
+        paired_plan = getattr(layer.ffn.switch_mlp, "_m6_paired_qmv_plan", None)
         installed = (
             bool(getattr(layer.ffn.switch_mlp, "_trellis_installed", False)),
             _callable_name(getattr(layer.ffn, "_forward_impl", None)),
             _callable_name(direct_qmv),
             getattr(direct_qmv, "__self__", None) is layer.ffn.switch_mlp,
-            getattr(direct_qmv, "__func__", None) is EXL3SwitchGLU.direct_qmv,
+            getattr(direct_qmv, "__func__", None)
+            is EXL3SwitchGLU.direct_qmv_m6_paired,
+            isinstance(paired_plan, _InstalledM6PairedQMVPlan),
+            getattr(paired_plan, "geometry", None)
+            == (4096, 2048, 216, 6, 10.0, 256, 36),
+            getattr(paired_plan, "descriptor_sha256", None)
+            == MIA_EXL3_M6_PAIR_DESCRIPTOR_SHA256,
+            getattr(paired_plan, "hidden_to_intermediate", None)
+            is _m6_paired_qmv_kernel(4096, 2048, False),
+            getattr(paired_plan, "intermediate_to_hidden", None)
+            is _m6_paired_qmv_kernel(2048, 4096, True),
             _callable_name(trellis_fused),
             getattr(trellis_fused, "__self__", None) is layer.ffn.switch_mlp,
             getattr(trellis_fused, "__func__", None) is EXL3SwitchGLU.fused,
@@ -1475,7 +1498,12 @@ def build_mia_engine_plan(
         required = (
             True,
             "_mia_exl3_forward",
-            "direct_qmv",
+            "direct_qmv_m6_paired",
+            True,
+            True,
+            True,
+            True,
+            True,
             True,
             True,
             "fused",
@@ -1998,7 +2026,7 @@ def build_mia_engine_plan(
         ),
         MiaPrewarmSignature("indexer_sparse_prefill", 1, "prefill"),
         MiaPrewarmSignature("indexer_sparse_decode", 1, "decode_verify"),
-        MiaPrewarmSignature("target_verify_m6_qmv", 6, "decode_verify"),
+        MiaPrewarmSignature("target_verify_m6_paired_qmv", 6, "decode_verify"),
         MiaPrewarmSignature("dspark_k5_bm8", MIA_DSPARK_BLOCK, "decode_verify"),
     )
     installed_routes = (
@@ -2017,7 +2045,7 @@ def build_mia_engine_plan(
         "mla_decode_direct_stock432",
         "mla_prefill_nax_mg16_tile32",
         "mla_token_major_query_output_no_transpose",
-        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_direct_qmv",
+        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_paired_qmv",
         "wo_tp1_b12x_inv_rope_mxfp8_bm8_m16q_bm64",
         "nonexpert_native_mxfp8",
         "dspark_k5_direct_stock432_k64_native_mxfp4",

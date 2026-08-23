@@ -76,6 +76,50 @@ EXL3_TENSOR_CORE_PERMUTATION = _tensor_core_permutation()
 EXL3_TENSOR_CORE_INVERSE = tuple(
     sorted(range(256), key=EXL3_TENSOR_CORE_PERMUTATION.__getitem__)
 )
+EXL3_M6_PAIR_DESCRIPTOR_SHA256 = (
+    "1117b53c6867097d7fbeeaaeb25c46725a78046ca767b709edd00bacf9ebd690"
+)
+
+
+class _MCGPairDescriptorPlan(NamedTuple):
+    descriptors: tuple[int, ...]
+    sha256: str
+
+
+@lru_cache(maxsize=1)
+def _mcg_pair_descriptor_plan() -> _MCGPairDescriptorPlan:
+    """Build and validate the fixed row-pair windows for one MCG/K3 tile."""
+
+    descriptors: list[int] = []
+    for pair_row in range(EXL3_TILE // 2):
+        row0 = pair_row * 2
+        for local_n in range(EXL3_TILE):
+            tensor_core0 = EXL3_TENSOR_CORE_INVERSE[row0 * EXL3_TILE + local_n]
+            tensor_core1 = EXL3_TENSOR_CORE_INVERSE[
+                (row0 + 1) * EXL3_TILE + local_n
+            ]
+            if tensor_core1 != tensor_core0 + 1:
+                raise ValueError(
+                    "Mia paired MCG decoder requires adjacent t,t+1 row pairs"
+                )
+
+            bit_start = tensor_core0 * EXL3_BITS + 755
+            bit_end = bit_start + 16 + EXL3_BITS
+            raw_index0 = bit_start // 32
+            raw_index2 = (bit_end - 1) // 32
+            shift = (raw_index2 + 1) * 32 - bit_end
+            descriptor = (
+                raw_index0 % 24
+                | (raw_index2 % 24) << 5
+                | shift << 10
+            )
+            descriptors.append(descriptor)
+
+    packed = struct.pack("<128H", *descriptors)
+    digest = hashlib.sha256(packed).hexdigest()
+    if len(descriptors) != 128 or digest != EXL3_M6_PAIR_DESCRIPTOR_SHA256:
+        raise ValueError("Mia paired MCG descriptor construction changed")
+    return _MCGPairDescriptorPlan(tuple(descriptors), digest)
 
 
 def decode_mcg_trellis_tile(packed: Any):
@@ -379,6 +423,190 @@ def _mcg_qmv_kernel(
             f"_e{experts}_t{topk}_r{int(routed_input)}_bn{block_n}_v5"
         ),
         input_names=input_names,
+        output_names=["y"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _m6_paired_qmv_kernel(
+    size_k: int,
+    size_n: int,
+    routed_input: bool,
+):
+    """Build the fixed-M6 BN256 QMV with adjacent-K paired MCG decode."""
+
+    if (size_k, size_n, routed_input) not in (
+        (4096, 2048, False),
+        (2048, 4096, True),
+    ):
+        raise ValueError("Mia paired QMV requires an exact gate/up or down bank")
+    descriptor_plan = _mcg_pair_descriptor_plan()
+    descriptors = ",".join(str(value) for value in descriptor_plan.descriptors)
+    header = f"""
+        using namespace metal;
+        constant constexpr uint SIZE_K = {size_k};
+        constant constexpr uint SIZE_N = {size_n};
+        constant constexpr uint NTILES_N = {size_n // 16};
+        constant constexpr uint KBLOCKS = {size_k // 128};
+        constant constexpr uint EXPERTS = 216;
+        constant constexpr uint TOPK = 6;
+        constant constexpr uint HAD = 128;
+        constant constexpr uint TILE_WORDS = 48;
+        constant constexpr uint BLOCK_TILES = 8;
+        constant constexpr uint BLOCK_TILES_N = 16;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+        constant ushort PAIR_DESCRIPTORS[128] = {{ {descriptors} }};
+
+        inline float hadamard_h128(
+            float value,
+            uint lane,
+            threadgroup float* exchange
+        ) {{
+            for (uint stride = 1u; stride < 32u; stride <<= 1u) {{
+                float peer = simd_shuffle_xor(value, ushort(stride));
+                value = (lane & stride) ? (peer - value) : (value + peer);
+            }}
+            for (uint stride = 32u; stride < HAD; stride <<= 1u) {{
+                exchange[lane] = value;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float peer = exchange[lane ^ stride];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                value = (lane & stride) ? (peer - value) : (value + peer);
+            }}
+            return value;
+        }}
+
+        inline half2 decode_mcg_pair(
+            threadgroup const ushort* packed,
+            ushort descriptor
+        ) {{
+            threadgroup const uint* words =
+                reinterpret_cast<threadgroup const uint*>(packed);
+            uint index0 = uint(descriptor) & 0x1fu;
+            uint index2 = (uint(descriptor) >> 5u) & 0x1fu;
+            uint shift = uint(descriptor) >> 10u;
+            uint low = words[index0];
+            uint high = words[index2];
+            uint window;
+            if (shift == 0u) {{
+                window = high;
+            }} else {{
+                window = (high >> shift) | (low << (32u - shift));
+            }}
+            uint state0 = (window >> 3u) & 0xffffu;
+            uint state1 = window & 0xffffu;
+
+            uint product0 = state0 * 0xCBAC1FEDu;
+            uint product1 = state1 * 0xCBAC1FEDu;
+            uint half_pair_bits0 =
+                0x3B603B60u ^ (product0 & 0x8FFF8FFFu);
+            uint half_pair_bits1 =
+                0x3B603B60u ^ (product1 & 0x8FFF8FFFu);
+            half2 pair0 = as_type<half2>(half_pair_bits0);
+            half2 pair1 = as_type<half2>(half_pair_bits1);
+            return half2(pair0.x + pair0.y, pair1.x + pair1.y);
+        }}
+    """
+    x_row = "task" if routed_input else "row"
+    source = f"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint n_block = threadgroup_position_in_grid.y;
+        uint task = threadgroup_position_in_grid.z;
+        uint row = task / TOPK;
+        uint expert = uint(expert_ids[task]);
+        size_t x_row = {x_row};
+        uint n0 = n_block * 256u + lane;
+        uint n1 = n0 + HAD;
+
+        threadgroup float had_values[HAD];
+        threadgroup half x_had[HAD];
+        threadgroup ushort packed_tiles[
+            BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS
+        ];
+
+        float accumulator0 = 0.0f;
+        float accumulator1 = 0.0f;
+        for (uint k_block = 0; k_block < KBLOCKS; ++k_block) {{
+            uint k = k_block * HAD + lane;
+            half scaled = half(
+                x[x_row * SIZE_K + k]
+                * suh[(size_t)expert * SIZE_K + k]
+            );
+            float transformed = hadamard_h128(
+                float(scaled), lane, had_values
+            );
+            x_had[lane] = half(transformed * HAD_SCALE);
+
+            for (
+                uint packed_index = lane;
+                packed_index < BLOCK_TILES * BLOCK_TILES_N * TILE_WORDS;
+                packed_index += HAD
+            ) {{
+                uint tile_k = packed_index / (BLOCK_TILES_N * TILE_WORDS);
+                uint remainder = packed_index % (BLOCK_TILES_N * TILE_WORDS);
+                uint tile_n = remainder / TILE_WORDS;
+                uint word = remainder % TILE_WORDS;
+                size_t source_index =
+                    (size_t)expert * (SIZE_K / 16u) * NTILES_N * TILE_WORDS
+                    + ((size_t)(k_block * BLOCK_TILES + tile_k) * NTILES_N
+                       + n_block * BLOCK_TILES_N + tile_n) * TILE_WORDS
+                    + word;
+                packed_tiles[packed_index] =
+                    reinterpret_cast<const device ushort*>(trellis)[
+                        source_index
+                    ];
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint tile_n0 = lane / 16u;
+            uint tile_n1 = tile_n0 + BLOCK_TILES;
+            uint local_n = lane & 15u;
+            for (uint local_k = 0; local_k < HAD; local_k += 2u) {{
+                uint tile_k = local_k / 16u;
+                uint pair_row = (local_k & 15u) / 2u;
+                ushort descriptor =
+                    PAIR_DESCRIPTORS[pair_row * 16u + local_n];
+                threadgroup const ushort* tile0 =
+                    packed_tiles
+                    + (tile_k * BLOCK_TILES_N + tile_n0) * TILE_WORDS;
+                threadgroup const ushort* tile1 =
+                    packed_tiles
+                    + (tile_k * BLOCK_TILES_N + tile_n1) * TILE_WORDS;
+                half2 weights0 = decode_mcg_pair(tile0, descriptor);
+                half2 weights1 = decode_mcg_pair(tile1, descriptor);
+                float value0 = float(x_had[local_k]);
+                accumulator0 += value0 * float(weights0.x);
+                accumulator1 += value0 * float(weights1.x);
+                float value1 = float(x_had[local_k + 1u]);
+                accumulator0 += value1 * float(weights0.y);
+                accumulator1 += value1 * float(weights1.y);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        float output_had0 = hadamard_h128(
+            float(half(accumulator0)), lane, had_values
+        );
+        half rotated0 = half(output_had0 * HAD_SCALE);
+        y[(size_t)task * SIZE_N + n0] = half(
+            rotated0 * svh[(size_t)expert * SIZE_N + n0]
+        );
+        float output_had1 = hadamard_h128(
+            float(half(accumulator1)), lane, had_values
+        );
+        half rotated1 = half(output_had1 * HAD_SCALE);
+        y[(size_t)task * SIZE_N + n1] = half(
+            rotated1 * svh[(size_t)expert * SIZE_N + n1]
+        );
+    """
+    return mx.fast.metal_kernel(
+        name=(
+            f"mtplx_dsv4_exl3_m6_paired_mcg_qmv_k{size_k}_n{size_n}"
+            f"_e216_t6_r{int(routed_input)}_bn256_v1"
+        ),
+        input_names=["x", "trellis", "suh", "svh", "expert_ids"],
         output_names=["y"],
         header=header,
         source=source,
@@ -1409,6 +1637,13 @@ class _InstalledTrellisPlan(NamedTuple):
     intermediate_to_hidden: Any
 
 
+class _InstalledM6PairedQMVPlan(NamedTuple):
+    geometry: tuple[int, int, int, int, float, int, int]
+    descriptor_sha256: str
+    hidden_to_intermediate: Any
+    intermediate_to_hidden: Any
+
+
 class EXL3SwitchGLU(nn.Module):
     """DeepSeek routed SwiGLU over the exact Mia K216 EXL3 expert banks."""
 
@@ -1453,6 +1688,7 @@ class EXL3SwitchGLU(nn.Module):
         self._trellis_input_hadamard = None
         self._trellis_activation_down = None
         self._trellis_final_reduce = None
+        self._m6_paired_qmv_plan = None
 
     def install_trellis_runtime(self, *, max_tokens: int) -> None:
         """Install the pinned decode/prefill plans before request execution."""
@@ -1492,6 +1728,69 @@ class EXL3SwitchGLU(nn.Module):
             self.hidden_size, self.experts, self.topk
         )
         self._trellis_installed = True
+
+    def install_m6_paired_qmv_runtime(self) -> None:
+        """Bind the exact Mia M6 paired decoder before request execution."""
+
+        geometry = (
+            self.hidden_size,
+            self.gate_proj.output_dims,
+            self.experts,
+            self.topk,
+            self.limit,
+            256,
+            self.topk * 6,
+        )
+        if geometry != (4096, 2048, 216, 6, 10.0, 256, 36):
+            raise ValueError(f"Mia paired QMV geometry changed: {geometry!r}")
+        bank_contract = (
+            (
+                self.gate_proj,
+                (216, 256, 128, 48),
+                (216, 4096),
+                (216, 2048),
+            ),
+            (
+                self.up_proj,
+                (216, 256, 128, 48),
+                (216, 4096),
+                (216, 2048),
+            ),
+            (
+                self.down_proj,
+                (216, 128, 256, 48),
+                (216, 2048),
+                (216, 4096),
+            ),
+        )
+        for bank, trellis_shape, suh_shape, svh_shape in bank_contract:
+            observed = (
+                tuple(bank.trellis.shape),
+                tuple(bank.suh.shape),
+                tuple(bank.svh.shape),
+                bank.trellis.dtype,
+                bank.suh.dtype,
+                bank.svh.dtype,
+            )
+            required = (
+                trellis_shape,
+                suh_shape,
+                svh_shape,
+                mx.int16,
+                mx.float16,
+                mx.float16,
+            )
+            if observed != required:
+                raise ValueError(
+                    f"Mia paired QMV bank storage changed: {observed!r}"
+                )
+        descriptors = _mcg_pair_descriptor_plan()
+        self._m6_paired_qmv_plan = _InstalledM6PairedQMVPlan(
+            geometry=geometry,
+            descriptor_sha256=descriptors.sha256,
+            hidden_to_intermediate=_m6_paired_qmv_kernel(4096, 2048, False),
+            intermediate_to_hidden=_m6_paired_qmv_kernel(2048, 4096, True),
+        )
 
     def _trellis_mma(
         self,
@@ -1631,6 +1930,61 @@ class EXL3SwitchGLU(nn.Module):
         activated = (nn.silu(gate) * up).astype(mx.float16)
         return self.down_proj(activated, expert_ids).astype(original_dtype)
 
+    @staticmethod
+    def _m6_paired_project(
+        bank: EXL3LinearBank,
+        x_rows: mx.array,
+        flat_ids: mx.array,
+        kernel,
+    ) -> mx.array:
+        tasks = 36
+        return kernel(
+            inputs=[
+                mx.contiguous(x_rows),
+                bank.trellis,
+                bank.suh,
+                bank.svh,
+                flat_ids,
+            ],
+            grid=(128, bank.output_dims // 256, tasks),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(tasks, bank.output_dims)],
+            output_dtypes=[mx.float16],
+        )[0].reshape(6, 6, bank.output_dims)
+
+    def direct_qmv_m6_paired(
+        self,
+        x: mx.array,
+        expert_ids: mx.array,
+    ) -> mx.array:
+        """Run the construction-bound exact-M6 adjacent-K paired decoder."""
+
+        original_dtype = x.dtype
+        x_half = x.astype(mx.float16)
+        flat_ids = mx.contiguous(expert_ids.reshape(36).astype(mx.uint32))
+        plan = self._m6_paired_qmv_plan
+        gate = self._m6_paired_project(
+            self.gate_proj,
+            x_half,
+            flat_ids,
+            plan.hidden_to_intermediate,
+        )
+        up = self._m6_paired_project(
+            self.up_proj,
+            x_half,
+            flat_ids,
+            plan.hidden_to_intermediate,
+        )
+        gate = mx.minimum(gate, self.limit)
+        up = mx.clip(up, -self.limit, self.limit)
+        activated = (nn.silu(gate) * up).astype(mx.float16)
+        return self._m6_paired_project(
+            self.down_proj,
+            activated.reshape(36, self.down_proj.input_dims),
+            flat_ids,
+            plan.intermediate_to_hidden,
+        ).astype(original_dtype)
+
     def __call__(self, x: mx.array, expert_ids: mx.array) -> mx.array:
         rows = int(expert_ids.shape[0])
         # Preserve the explicit stock/oracle compatibility route.  Production
@@ -1674,6 +2028,28 @@ class EXL3SwitchGLU(nn.Module):
         ).astype(
             original_dtype
         )
+
+
+def install_mia_m6_paired_qmv_routes(model) -> None:
+    """Install every exact-M6 paired plan, then rebind the verified owner."""
+
+    switches = []
+    for layer_id, layer in enumerate(model.layers):
+        switch = layer.ffn.switch_mlp
+        direct_qmv = getattr(layer.ffn, "_mia_exl3_direct_qmv", None)
+        if (
+            getattr(direct_qmv, "__self__", None) is not switch
+            or getattr(direct_qmv, "__func__", None)
+            is not type(switch).direct_qmv
+        ):
+            raise ValueError(
+                f"Mia target layer {layer_id} generic direct QMV owner changed"
+            )
+        switches.append((layer.ffn, switch))
+    for _ffn, switch in switches:
+        switch.install_m6_paired_qmv_runtime()
+    for ffn, switch in switches:
+        ffn._mia_exl3_direct_qmv = switch.direct_qmv_m6_paired
 
 
 def _map_mia_target_name(name: str) -> str:
@@ -2489,6 +2865,7 @@ def load_mia_exl3_dspark_model(
     model.eval()
     for layer in model.layers:
         layer.ffn.install_mia_exl3_runtime(max_tokens=8224)
+    install_mia_m6_paired_qmv_routes(model)
 
     draft_config = dict(artifact_validation.draft_config)
     draft_experts = int(draft_config.get("n_routed_experts", 0))
