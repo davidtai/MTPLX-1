@@ -101,8 +101,12 @@ def test_exact_qwen38_27b_control_contract_is_accepted() -> None:
 
 
 def test_final_route_is_only_the_chronological_winner_stack() -> None:
-    assert dict(QWEN38_FINAL_ROUTE) == {"cache_route": "kv_only_history"}
-    assert qwen38_final_route() == {"cache_route": "kv_only_history"}
+    assert dict(QWEN38_FINAL_ROUTE) == {
+        "cache_route": "kv_only_history",
+        "dual_norm": True,
+        "qmv_final": True,
+    }
+    assert qwen38_final_route() == dict(QWEN38_FINAL_ROUTE)
 
 
 @pytest.mark.parametrize(
@@ -314,3 +318,37 @@ def test_early_projection_candidates_compose_in_chronological_order(
             "active_modules": 48,
         },
     }
+
+
+def test_retained_c6_c7_stack_follows_kv_history(monkeypatch) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_final_qmv",
+        lambda *, active: calls.append(active) or {"installed": True},
+        raising=False,
+    )
+    text = SimpleNamespace()
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(
+            language_model=text,
+            mtp_update_cache=_callable,
+            mtp_update_cache_kv_only_history=_callable,
+        ),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="kv_only_history",
+        dual_norm=True,
+        qmv_final=True,
+    )
+
+    assert route.route_id == "kv_only_history+dual_norm+qmv_final"
+    assert text._mtplx_qwen38_dual_norm_concat is True
+    assert calls == [True]

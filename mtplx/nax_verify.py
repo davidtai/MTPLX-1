@@ -882,6 +882,7 @@ def nax_qmm_m16(
 
 
 _QLINEAR_PATCH: dict[str, object] = {"installed": False, "original": None}
+_QWEN38_QMV_DISPATCH = None
 
 # F23b (2026-08-16): verify-shaped QuantizedLinear calls that entered the
 # patched fast-path window (bits in {4,6,8}, decode/verify phase, M in the
@@ -896,6 +897,15 @@ nax_qlinear_fallback_counts: dict[str, int] = {}
 def _count_qlinear_fallback(bits: int, m: int) -> None:
     key = f"b{int(bits)}_m{int(m)}"
     nax_qlinear_fallback_counts[key] = nax_qlinear_fallback_counts.get(key, 0) + 1
+
+
+def register_qwen38_qmv_dispatch(callback) -> None:  # type: ignore[no-untyped-def]
+    """Compose the target-shaped Qwen 3.8 QMV with the Turbo dispatcher."""
+
+    if not _QLINEAR_PATCH["installed"]:
+        raise RuntimeError("NAX QuantizedLinear dispatcher is not installed")
+    global _QWEN38_QMV_DISPATCH
+    _QWEN38_QMV_DISPATCH = callback
 
 
 def install_nax_qlinear_patch() -> dict[str, object]:
@@ -1037,6 +1047,10 @@ def install_nax_qlinear_patch() -> dict[str, object]:
             m = 1
             for d in x.shape[:-1]:
                 m *= int(d)
+            if 2 <= m <= 9 and _QWEN38_QMV_DISPATCH is not None:
+                qwen38_output = _QWEN38_QMV_DISPATCH(self, x, m)
+                if qwen38_output is not None:
+                    return qwen38_output
             if 4 <= m <= 16:
                 w_q = self["weight"]
                 k = int(x.shape[-1])

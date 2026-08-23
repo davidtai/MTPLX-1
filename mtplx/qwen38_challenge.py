@@ -13,6 +13,7 @@ from typing import Any
 
 from .gdn_capture import configure_qwen3_next_gdn_projection_pairs
 from .packed_concats import configure_qwen3_next_packed_qkv
+from .qwen38_challenge_kernels import configure_qwen38_final_qmv
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
     0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22,
@@ -22,12 +23,16 @@ QWEN38_Q8_LINEAR_ATTN_LAYERS = (
 QWEN38_PACKING = "mlx_affine_u32_le"
 DEFAULT_QWEN38_CACHE_ROUTE = "kv_only_history"
 QWEN38_KV_ONLY_MIN_CONTEXT = 16_384
-QWEN38_FINAL_ROUTE: Mapping[str, str] = MappingProxyType(
-    {"cache_route": DEFAULT_QWEN38_CACHE_ROUTE}
+QWEN38_FINAL_ROUTE: Mapping[str, Any] = MappingProxyType(
+    {
+        "cache_route": DEFAULT_QWEN38_CACHE_ROUTE,
+        "dual_norm": True,
+        "qmv_final": True,
+    }
 )
 
 
-def qwen38_final_route() -> dict[str, str]:
+def qwen38_final_route() -> dict[str, Any]:
     """Return the cumulative winner stack measured at 16K context."""
 
     return dict(QWEN38_FINAL_ROUTE)
@@ -305,6 +310,8 @@ def install_qwen38_route(
     cache_route: str = DEFAULT_QWEN38_CACHE_ROUTE,
     packed_qkv: bool = False,
     gdn_projection_pairs: bool = False,
+    dual_norm: bool = False,
+    qmv_final: bool = False,
 ) -> Qwen38RouteSpec | None:
     if not is_qwen38_27b_candidate(config, model_path):
         return None
@@ -363,6 +370,24 @@ def install_qwen38_route(
         raise Qwen38ContractError(
             f"unknown Qwen 3.8 cache route: {cache_route!r}"
         )
+
+    text = getattr(runtime.model, "language_model", runtime.model)
+    text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)
+    if dual_norm:
+        route_features.append("dual_norm")
+        kernel_ids.append("qwen38_dual_rms_norm_concat_bf16_v1")
+        feature_receipt["dual_norm"] = {"active": 1}
+
+    qmv_report = configure_qwen38_final_qmv(active=bool(qmv_final))
+    if qmv_final:
+        if not bool(qmv_report.get("installed")):
+            raise Qwen38ContractError("Qwen 3.8 final QMV route was not installed")
+        route_features.append("qmv_final")
+        kernel_ids.append("qwen38_affine4_qmv_g32_g64_m2_m9_v2")
+        feature_receipt["qmv_final"] = {
+            "active": int(bool(qmv_report.get("active"))),
+            "installed": int(bool(qmv_report.get("installed"))),
+        }
 
     route_id = "+".join(route_features) if route_features else "control"
     route = build_qwen38_route(

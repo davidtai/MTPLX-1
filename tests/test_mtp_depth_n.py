@@ -206,6 +206,34 @@ def test_inject_and_forward_two_layer_mtp_head(tmp_path) -> None:
     assert all(int(cache.offset) == 4 for cache in mtp_cache)
 
 
+def test_mtp_forward_uses_qwen38_dual_norm_concat_route(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from mlx_lm.models.qwen3_5 import TextModel
+
+    import mtplx.qwen38_challenge_kernels as kernels
+
+    args = _tiny_text_model_args()
+    config = _write_tiny_two_layer_sidecar(tmp_path, args)
+    model = TextModel(args)
+    assert inject_mtp_support(model, tmp_path, config) is True
+    calls: list[tuple[int, int]] = []
+
+    def fused(a, b, a_weight, b_weight, eps):
+        calls.append((int(a.shape[-1]), int(b.shape[-1])))
+        return mx.concatenate((a, b), axis=-1)
+
+    monkeypatch.setattr(kernels, "qwen38_dual_rms_norm_concat", fused)
+    model._mtplx_qwen38_dual_norm_concat = True
+    hidden = mx.random.normal((1, 1, args.hidden_size))
+    tokens = mx.array([[1]])
+    logits = model.mtp_forward(hidden, tokens, mtp_cache=model.make_mtp_cache())
+    mx.eval(logits)
+
+    assert calls == [(args.hidden_size, args.hidden_size)]
+
+
 def test_mtp_cache_length_mismatch_fails_loud(tmp_path) -> None:
     from mlx_lm.models.cache import KVCache
     from mlx_lm.models.qwen3_5 import TextModel

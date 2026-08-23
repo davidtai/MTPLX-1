@@ -1034,11 +1034,30 @@ def inject_mtp_support(
                 if input_embeddings is not None
                 else self.model.embed_tokens(next_token_ids)
             )
-            e = self.mtp.pre_fc_norm_embedding(input_embeds)
-            h = self.mtp.pre_fc_norm_hidden(hidden_states)
             order = concat_order or getattr(self, "_mtplx_concat_order", "embedding_hidden")
-            parts = [e, h] if order == "embedding_hidden" else [h, e]
-            x = self.mtp.fc(mx.concatenate(parts, axis=-1))
+            if (
+                bool(getattr(self, "_mtplx_qwen38_dual_norm_concat", False))
+                and order == "embedding_hidden"
+            ):
+                from .qwen38_challenge_kernels import qwen38_dual_rms_norm_concat
+
+                embedding_norm = self.mtp.pre_fc_norm_embedding
+                hidden_norm = self.mtp.pre_fc_norm_hidden
+                if float(embedding_norm.eps) != float(hidden_norm.eps):
+                    raise ValueError("Qwen 3.8 dual RMSNorm eps values differ")
+                pre_fc = qwen38_dual_rms_norm_concat(
+                    input_embeds,
+                    hidden_states,
+                    embedding_norm.weight,
+                    hidden_norm.weight,
+                    float(embedding_norm.eps),
+                )
+            else:
+                e = self.mtp.pre_fc_norm_embedding(input_embeds)
+                h = self.mtp.pre_fc_norm_hidden(hidden_states)
+                parts = [e, h] if order == "embedding_hidden" else [h, e]
+                pre_fc = mx.concatenate(parts, axis=-1)
+            x = self.mtp.fc(pre_fc)
             fc_hidden = x
             num_draft_layers = len(self.mtp.layers)
             if mtp_cache:
