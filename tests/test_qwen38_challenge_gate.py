@@ -710,3 +710,24 @@ def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:
     assert any("strictly greater" in error for error in tied["errors"])
     assert dirty["passed"] is False
     assert any("source tree" in error for error in dirty["errors"])
+
+
+def test_promotion_gate_allows_row28_to_replace_retained_row17_artifact() -> None:
+    gate = _module()
+    prefix = (
+        "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block+"
+        "r18_gdn_decay_memo+r20_kv_only_history+r21_qk_rms_rope+"
+        "r24_eval_ladder+r26_prefill_ladder_3"
+    )
+    candidate = prefix.replace("r17_q4_mtp_block", "r28_q4_mtp_block")
+
+    result = gate._promotion_decision(
+        order=[prefix, candidate, candidate, prefix],
+        control_id=prefix,
+        candidate_id=candidate,
+        improvement_pct=0.1,
+        correctness={"passed": True},
+        source_status=[],
+    )
+
+    assert result == {"passed": True, "threshold_pct": 0.05, "errors": []}

@@ -30,7 +30,11 @@ from .a3b_compiled_target_prefix import (
     validate_a3b_k1_target_prefix_sampler,
 )
 from .a3b_whole_moe import validate_a3b_whole_moe_request
-from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from .adaptive import (
+    AdaptiveDepthPolicy,
+    ExpectedValueDepthPolicy,
+    PositionEMADepthPolicy,
+)
 from .attention_context import (
     attention_phase,
     model_forward_kind,
@@ -6637,7 +6641,12 @@ def generate_mtpk(
     verify_core: str = "stock",
     draft_core: str = "stock",
     mtp_corrector: Any | None = None,
-    adaptive_policy: AdaptiveDepthPolicy | ExpectedValueDepthPolicy | None = None,
+    adaptive_policy: (
+        AdaptiveDepthPolicy
+        | ExpectedValueDepthPolicy
+        | PositionEMADepthPolicy
+        | None
+    ) = None,
     online_hidden_corrector_alpha: float = 0.0,
     online_hidden_corrector_decay: float = 0.8,
     online_hidden_corrector_warmup: int = 1,
@@ -7317,6 +7326,11 @@ def generate_mtpk(
     accept_probability_sum_by_depth = [0.0 for _ in range(speculative_depth)]
     deferred_correction_repairs = 0
     pending_primary: int | None = None
+    # A target-only adaptive cycle must not run the proposal head merely to
+    # maintain committed history. Retain those (hidden, token) transitions and
+    # fold the whole backlog into the next live proposal forward.
+    serial_skip_history_hidden: list[mx.array] = []
+    serial_skip_history_tokens: list[int] = []
     online_hidden_deltas: dict[object, mx.array] = {}
     online_hidden_update_counts: dict[object, int] = {}
     online_hidden_apply_counts: dict[object, int] = {}
@@ -7733,6 +7747,10 @@ def generate_mtpk(
         hidden = rebased.hidden
         mtp_history_cache = rebased.committed_mtp_cache
         trace_current_mtp_cache = mtp_history_cache
+        # The replay rebuilt committed MTP history through current_tokens, so
+        # deferred serial transitions are already represented in the new cache.
+        serial_skip_history_hidden.clear()
+        serial_skip_history_tokens.clear()
         target_time += max(
             0.0, rebased.prompt_eval_time_s - rebased.prompt_mtp_history_time_s
         )
@@ -8189,7 +8207,16 @@ def generate_mtpk(
                 if len(tokens) >= late_depth_switch_after
                 else late_depth_before
             )
-        planned_depth = max(1, min(int(planned_depth), int(speculative_depth)))
+        minimum_planned_depth = (
+            0
+            if adaptive_policy is not None
+            and getattr(adaptive_policy, "allows_depth_zero", False)
+            else 1
+        )
+        planned_depth = max(
+            minimum_planned_depth,
+            min(int(planned_depth), int(speculative_depth)),
+        )
         event = {
             "step": step,
             "primary": primary,
@@ -8252,6 +8279,37 @@ def generate_mtpk(
             emit_trace()
             break
 
+        if planned_depth == 0:
+            event["speculation_skipped"] = True
+            event["skip_reason"] = "adaptive_depth_zero"
+            if _mtp_history_uses_committed_cache(mtp_history_policy):
+                serial_skip_history_hidden.append(hidden)
+                serial_skip_history_tokens.append(int(primary))
+            started_serial = time.perf_counter()
+            with attention_phase("decode_verify"):
+                serial_logits, serial_hidden = rt.forward_ar(
+                    mx.array([[primary]]),
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=base_hidden_variant,
+                )
+            _eval(serial_logits, serial_hidden)
+            elapsed_serial = time.perf_counter() - started_serial
+            target_time += elapsed_serial
+            commit_time += elapsed_serial
+            _add_timing(event, "serial_skip_forward", elapsed_serial)
+            logits, hidden = own_live_logits_hidden(
+                serial_logits[:, -1, :],
+                serial_hidden[:, -1:, :],
+            )
+            maybe_detach_dirty_state(len(tokens))
+            maybe_rebase_decode_state(len(tokens))
+            maybe_eval_state_roots(event, len(tokens))
+            append_event(event)
+            emit_new_tokens()
+            emit_trace()
+            continue
+
         cycle_depth = min(planned_depth, max_tokens - len(tokens))
         cycle_draft_reader = adaptive_width_cycle_readers[cycle_depth - 1]
         adaptive_width_decision_margins: list[float] = []
@@ -8262,6 +8320,19 @@ def generate_mtpk(
         draft_hidden_update_keys: list[object] = []
         if _mtp_history_uses_committed_cache(mtp_history_policy):
             mtp_cache = mtp_history_cache
+            if serial_skip_history_tokens:
+                assert mtp_cache is not None
+                backlog_hidden = mx.concatenate(
+                    serial_skip_history_hidden,
+                    axis=1,
+                )
+                draft_time += append_mtp_history(
+                    mtp_cache,
+                    backlog_hidden,
+                    serial_skip_history_tokens,
+                )
+                serial_skip_history_hidden.clear()
+                serial_skip_history_tokens.clear()
             cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
         else:
             mtp_cache = (
@@ -10395,6 +10466,21 @@ def generate_mtpk(
     # its own capture_final_state tail — F31).
     elapsed = time.perf_counter() - started_all
     final_state: GenerationFinalState | None = None
+    if (
+        capture_final_state
+        and serial_skip_history_tokens
+        and _mtp_history_uses_committed_cache(mtp_history_policy)
+        and mtp_history_cache is not None
+    ):
+        commit_started = time.perf_counter()
+        draft_time += append_mtp_history(
+            mtp_history_cache,
+            mx.concatenate(serial_skip_history_hidden, axis=1),
+            serial_skip_history_tokens,
+        )
+        commit_time += time.perf_counter() - commit_started
+        serial_skip_history_hidden.clear()
+        serial_skip_history_tokens.clear()
     if (
         capture_final_state
         and pending_primary is not None

@@ -30,6 +30,27 @@ def test_server_parser_accepts_native_app_launch_id():
     assert args.app_launch_id == "native-123"
 
 
+def test_server_parser_builds_position_ema_policy_with_source_cap():
+    args = parse_args(
+        [
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-position-depth-cap",
+            "4",
+            "--depth",
+            "8",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    policy = openai._make_adaptive_policy(args, max_depth=8)
+
+    assert policy.max_depth == 8
+    assert policy.depth_cap == 4
+    assert policy.current_depth == 4
+
+
 def test_direct_server_parser_exposes_mtp_batch_numerics():
     args = parse_args(["--mtp-batch-numerics", "b1-exact", "--warmup-tokens", "0"])
 

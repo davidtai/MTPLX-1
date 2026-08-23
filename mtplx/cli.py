@@ -668,7 +668,13 @@ SCHEDULER_MODE_CHOICES = (
     "mtp_cohort_experimental",
 )
 BATCHING_PRESET_CHOICES = ("solo", "latency", "agent", "throughput")
-ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value", "cost")
+ADAPTIVE_POLICY_CHOICES = (
+    "none",
+    "streak",
+    "expected_value",
+    "cost",
+    "position_ema",
+)
 
 
 def _add_batching_args(parser: argparse.ArgumentParser) -> None:
@@ -773,6 +779,7 @@ def _add_adaptive_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--adaptive-start-depth", type=_positive_int, default=1)
     parser.add_argument("--adaptive-increase-after", type=_positive_int, default=4)
     parser.add_argument("--adaptive-decrease-after", type=_positive_int, default=1)
+    parser.add_argument("--adaptive-position-depth-cap", type=_positive_int, default=4)
     parser.add_argument("--adaptive-ev-base-depth", type=_positive_int, default=2)
     parser.add_argument("--adaptive-ev-accept-priors", default="0.92,0.64,0.32")
     parser.add_argument("--adaptive-ev-draft-cost-s", type=float, default=0.0048)

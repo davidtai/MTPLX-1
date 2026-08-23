@@ -316,7 +316,21 @@ def _promotion_decision(
     else:
         control_features = _validate_route_id(control_id) - {"control"}
         candidate_features = _validate_route_id(candidate_id) - {"control"}
-        if not control_features < candidate_features:
+        artifact_replacement = any(
+            new_feature in candidate_features
+            and old_feature in control_features
+            and (control_features - {old_feature})
+            <= (candidate_features - {new_feature})
+            for new_feature, old_features in (
+                ("r28_q4_mtp_block", ("r17_q4_mtp_block",)),
+                (
+                    "r36_qkv_islands",
+                    ("r17_q4_mtp_block", "r28_q4_mtp_block"),
+                ),
+            )
+            for old_feature in old_features
+        )
+        if not (control_features < candidate_features or artifact_replacement):
             errors.append("candidate route must strictly extend the cumulative control")
     if improvement_pct is None or improvement_pct <= PROMOTION_THRESHOLD_PCT:
         errors.append(

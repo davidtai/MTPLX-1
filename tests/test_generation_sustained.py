@@ -685,6 +685,25 @@ def test_default_qwen27b_ar_decode_trace_does_not_crash(tmp_path, monkeypatch):
     assert rows[-1]["target_distribution_materialized_rows_delta"] == 0
 
 
+def test_generate_mtpk_position_policy_depth_zero_uses_serial_target_path():
+    model = TinyModel()
+    policy = SimpleNamespace(current_depth=0, allows_depth_zero=True)
+
+    out = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=4,
+        adaptive_policy=policy,
+        stop_token_ids=set(),
+    )
+
+    assert out.tokens == [1, 1, 1]
+    assert [call["tokens"] for call in model.calls] == [1, 1, 1]
+    assert sum(bool(event.get("speculation_skipped")) for event in out.stats.events) == 2
+
+
 def test_lazy_bonus_verify_shortens_full_accept_verify_input(monkeypatch):
     monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "1")
     monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")

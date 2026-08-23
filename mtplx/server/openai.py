@@ -72,7 +72,11 @@ from mtplx.a3b_mtp_batch import (
     _require_mlx_lm_arrays_cache_fix,
     install_a3b_mtp_batch_lane,
 )
-from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from mtplx.adaptive import (
+    AdaptiveDepthPolicy,
+    ExpectedValueDepthPolicy,
+    PositionEMADepthPolicy,
+)
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
 from mtplx.mtp_patch import MTPContract
@@ -17224,6 +17228,11 @@ def _adaptive_config(
         config["marginal_ms_prior"] = float(
             getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
         )
+    elif policy == "position_ema":
+        config["depth_cap"] = min(
+            effective_max_depth,
+            max(1, int(getattr(args, "adaptive_position_depth_cap", 4))),
+        )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
         effective_base_depth = max(
@@ -17259,7 +17268,7 @@ def _make_adaptive_policy(
     args: argparse.Namespace,
     *,
     max_depth: int | None = None,
-) -> AdaptiveDepthPolicy | ExpectedValueDepthPolicy | None:
+) -> AdaptiveDepthPolicy | ExpectedValueDepthPolicy | PositionEMADepthPolicy | None:
     policy = str(getattr(args, "adaptive_policy", "none") or "none")
     if policy == "none":
         return None
@@ -17287,6 +17296,14 @@ def _make_adaptive_policy(
             min_depth=effective_min_depth,
             marginal_ms=float(getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0)
             or None,
+        )
+    if policy == "position_ema":
+        return PositionEMADepthPolicy(
+            max_depth=effective_max_depth,
+            depth_cap=min(
+                effective_max_depth,
+                max(1, int(getattr(args, "adaptive_position_depth_cap", 4))),
+            ),
         )
     if policy == "expected_value":
         effective_base_depth = max(
@@ -31805,7 +31822,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value", "cost"],
+        choices=["none", "streak", "expected_value", "cost", "position_ema"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
     )
@@ -31813,6 +31830,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--adaptive-start-depth", type=int, default=1)
     parser.add_argument("--adaptive-increase-after", type=int, default=4)
     parser.add_argument("--adaptive-decrease-after", type=int, default=1)
+    parser.add_argument("--adaptive-position-depth-cap", type=int, default=4)
     parser.add_argument("--adaptive-ev-base-depth", type=int, default=2)
     parser.add_argument(
         "--adaptive-ev-accept-priors",
