@@ -192,6 +192,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r10_compact_vocab",
         "r17_q4_mtp_block",
         "r18_gdn_decay_memo",
+        "r18_mlp_gate_up",
         "r20_kv_only_history",
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
@@ -234,6 +235,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "mtp_block_variant": "r17" if "r17_q4_mtp_block" in features else None,
         "row18_gdn_decay_memo": "r18_gdn_decay_memo" in features,
+        "row18_mlp_gate_up": "r18_mlp_gate_up" in features,
         "row24_eval_ladder": "r24_eval_ladder" in features,
         "row26_prefill_ladder_3": "r26_prefill_ladder_3" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
@@ -325,6 +327,18 @@ def _candidate_engagement_errors(
         )
         if memo_calls <= 0:
             errors.append("row 18 GDN decay memo did not execute")
+    if "r18_mlp_gate_up" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r18_mlp_gate_up") or {}).get(
+                    "calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 18 packed MLP gate/up did not execute")
     if "r20_kv_only_history" in features:
         engagement = [
             ((run.get("engagement") or {}).get("r20_kv_only_history") or {})
@@ -379,6 +393,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         qwen38_row24_eval_ladder_counter_snapshot,
         qwen38_row26_prefill_ladder_counter_snapshot,
     )
+    from mtplx.qwen38_challenge_kernels import qwen38_row18_mlp_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
 
@@ -386,6 +401,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
+        "r18_mlp_gate_up": {"calls": qwen38_row18_mlp_counter_snapshot()},
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
         "r24_eval_ladder": {"calls": qwen38_row24_eval_ladder_counter_snapshot()},
         "r26_prefill_ladder_3": {
@@ -514,6 +530,7 @@ def _run_arm(
         mtp_block_variant=options["mtp_block_variant"],
         mtp_block_artifact_path=row17_artifact_path,
         row18_gdn_decay_memo=bool(options["row18_gdn_decay_memo"]),
+        row18_mlp_gate_up=bool(options["row18_mlp_gate_up"]),
         row24_eval_ladder=bool(options["row24_eval_ladder"]),
         row26_prefill_ladder_3=bool(options["row26_prefill_ladder_3"]),
         source_artifact_path=source_artifact_path,

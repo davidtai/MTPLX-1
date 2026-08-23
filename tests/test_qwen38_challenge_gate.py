@@ -312,6 +312,16 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block"
     ) == {"r08_device_draft", "r10_compact_vocab", "r17_q4_mtp_block"}
     assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block+"
+        "r18_gdn_decay_memo+r18_mlp_gate_up"
+    ) == {
+        "r08_device_draft",
+        "r10_compact_vocab",
+        "r17_q4_mtp_block",
+        "r18_gdn_decay_memo",
+        "r18_mlp_gate_up",
+    }
+    assert gate._validate_route_id(
         "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo"
     ) == {"r08_device_draft", "r10_compact_vocab", "r18_gdn_decay_memo"}
     assert gate._validate_route_id(
@@ -374,6 +384,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
             "row10_compact_vocab": False,
             "mtp_block_variant": None,
             "row18_gdn_decay_memo": False,
+            "row18_mlp_gate_up": False,
         "row24_eval_ladder": False,
         "row26_prefill_ladder_3": False,
         "draft_core": "device",
@@ -489,6 +500,44 @@ def test_row17_promotion_requires_the_pinned_q4_mtp_block() -> None:
         "row 17 pinned Q4/group-64 MTP block was not active"
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [wrong]) == []
+
+
+def test_row18_mlp_addendum_requires_gate_up_engagement() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r17_q4_mtp_block+"
+        "r18_gdn_decay_memo+r18_mlp_gate_up"
+    )
+    block = {
+        "r17_q4_mtp_block": {
+            "installed": True,
+            "active": True,
+            "variant": "r17",
+            "bits": 4,
+            "group_size": 64,
+        }
+    }
+    zero = {
+        "route_id": route,
+        "feature_receipt": block,
+        "engagement": {
+            "r18_gdn_decay_memo": {"memo_calls": 48},
+            "r18_mlp_gate_up": {"calls": 0},
+        },
+    }
+    engaged = {
+        "route_id": route,
+        "feature_receipt": block,
+        "engagement": {
+            "r18_gdn_decay_memo": {"memo_calls": 48},
+            "r18_mlp_gate_up": {"calls": 48},
+        },
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 18 packed MLP gate/up did not execute"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 
 
 def test_row_24_eval_ladder_extends_the_retained_stack() -> None:
