@@ -152,28 +152,28 @@ def _patch_fake_mx(monkeypatch):
     monkeypatch.setattr(mx, "eval", lambda *_args, **_kwargs: None)
 
 
-def test_engine_plan_seals_paired_qmv_owners_and_prewarm_signatures() -> None:
+def test_engine_plan_seals_quad_qmv_owners_and_prewarm_signatures() -> None:
     build_source = inspect.getsource(mia_engine.build_mia_engine_plan)
     identity_source = inspect.getsource(mia_engine._mia_engine_identity)
     prewarm_source = inspect.getsource(MiaDeepseekV4EnginePlan.prewarm)
 
     assert "_mia_exl3_direct_qmv" in build_source
-    assert "EXL3SwitchGLU.direct_qmv_m6_paired" in build_source
-    assert "_InstalledM6PairedQMVPlan" in build_source
-    assert "EXL3_M6_PAIR_DESCRIPTOR_SHA256" in build_source
-    assert "_m6_paired_qmv_kernel(4096, 2048, False)" in build_source
-    assert "_m6_paired_qmv_kernel(2048, 4096, True)" in build_source
-    assert "MIA_EXL3_M6_PAIR_DESCRIPTOR_SHA256" in build_source
-    assert "MIA_EXL3_M6_PAIR_DESCRIPTOR_SHA256" in identity_source
+    assert "EXL3SwitchGLU.direct_qmv_m6_quad" in build_source
+    assert "_InstalledM6QuadQMVPlan" in build_source
+    assert "EXL3_M6_QUAD_DESCRIPTOR_SHA256" in build_source
+    assert "_m6_quad_qmv_kernel(4096, 2048, False)" in build_source
+    assert "_m6_quad_qmv_kernel(2048, 4096, True)" in build_source
+    assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in build_source
+    assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in identity_source
     assert "_mia_exl3_trellis_fused" in build_source
     assert "EXL3SwitchGLU.fused" in build_source
     assert "_mia_exl3_tail_combine" in build_source
     assert "is _stock_moe_tail_combine" in build_source
-    assert "target_exl3_prefill_trellis_bm8_bm64_verify_m6_paired_qmv" in (
+    assert "target_exl3_prefill_trellis_bm8_bm64_verify_m6_quad_qmv" in (
         build_source
     )
     assert (
-        "target-exl3-prefill-trellis-bm8-bm64-verify-m6-paired-mcg-qmv-"
+        "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-"
         "bn256-simd-h128"
         in identity_source
     )
@@ -185,7 +185,7 @@ def test_engine_plan_seals_paired_qmv_owners_and_prewarm_signatures() -> None:
         in build_source
     )
     assert (
-        'MiaPrewarmSignature("target_verify_m6_paired_qmv", 6, "decode_verify")'
+        'MiaPrewarmSignature("target_verify_m6_quad_qmv", 6, "decode_verify")'
         in build_source
     )
     assert 'with attention_phase("prefill"):' in prewarm_source

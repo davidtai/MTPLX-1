@@ -380,7 +380,7 @@ created.  The enabled callables do not probe eligibility or fall back.
   transforms; fused clamped gate/up activation; down projection; route weight
   reduction and shared-expert addition.  Target prefill uses Trellis BM8 through
   M127 and BM64 from M128, while the exact physical M6 verification phase uses
-  the source-backed adjacent-K paired direct-QMV projection sequence and stock
+  the source-backed four-row direct-QMV projection sequence and stock
   weighted tail.
   Each direct bank owns an N256 output slab: one 128-thread Metal group reuses
   its input H128 across two independently accumulated and independently
@@ -390,21 +390,25 @@ created.  The enabled callables do not probe eligibility or fall back.
   each H128, strides 1 through 16 use the repository's existing
   `simd_shuffle_xor` exchange and only cross-SIMD strides 32 and 64 use
   threadgroup scratch.  The ascending FP32 butterfly order and every FP16
-  boundary remain unchanged.  Adjacent row pairs map to consecutive MCG
-  states in the pinned tensor-core permutation, so a construction-sealed
-  descriptor decodes both states from one 19-bit window.  The paired decoder
-  preserves the original independent MCG products and ascending K/FMA order;
-  it changes decoder window/address work, not the artifact arithmetic.
+  boundary remain unchanged.  Consecutive four-row groups map to MCG states
+  `t,t+1,t+8,t+9` in the pinned tensor-core permutation.  A
+  construction-sealed descriptor reconstructs the two original 19-bit
+  adjacent-pair windows from shared words: fixed q0/q2 paths issue three loads
+  and fixed q1/q3 paths issue two, with no optional-load branch.  This is 10
+  loads per 16 K values and output panel instead of the previous 16.  The
+  quad decoder preserves the four independent MCG products and ascending
+  k0,k1,k2,k3 FP32 FMA order; it changes decoder window/address work, not the
+  artifact arithmetic.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_moe_router.py` and the
-  installed `EXL3SwitchGLU.direct_qmv_m6_paired` /
+  installed `EXL3SwitchGLU.direct_qmv_m6_quad` /
   `EXL3SwitchGLU.fused` paths in `mtplx/deepseek_v4_exl3.py`.  The scalar
   `EXL3SwitchGLU.direct_qmv` remains the exact oracle and generic installation
   predecessor.
 - **Construction owner / installed callable:** each target `DeepseekV4MoE`
-  first binds the exact scalar oracle, then installs all paired plans before
-  rebinding `direct_qmv_m6_paired`; Trellis `fused` and
+  first binds the exact scalar oracle, then installs all quad plans before
+  rebinding `direct_qmv_m6_quad`; Trellis `fused` and
   `_stock_moe_tail_combine` are also fixed before `_mia_exl3_forward`, and each
-  gate binds `_mia_hash_route` or `_mia_score_route`.  Each paired plan seals
+  gate binds `_mia_hash_route` or `_mia_score_route`.  Each quad plan seals
   the exact Mia geometry, descriptor digest, BN256 ownership, and both compiled
   kernels at construction; the enabled M6 call contains no geometry
   eligibility, kernel factory lookup, or fallback.
@@ -413,7 +417,7 @@ created.  The enabled callables do not probe eligibility or fall back.
   the physical hidden row count is exactly six; every prefill and all other
   widths use Trellis.  `_pack_trellis_routes` remains the enabled Trellis
   packer.
-- **Disposition:** source-derived Metal W4A16 port.  Paired direct QMV is the
+- **Disposition:** source-derived Metal W4A16 port.  Quad direct QMV is the
   measured production M6 verification route with uniform BN256 ownership and
   the source-equivalent register/SIMD H128 butterfly; scalar direct QMV and the
   generic `__call__` M-width selection remain explicit compatibility/oracle

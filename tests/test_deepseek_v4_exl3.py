@@ -155,41 +155,63 @@ def _named_route(name):
     return route
 
 
-def test_m6_pair_descriptors_exhaustively_match_scalar_trellis_states():
-    plan = exl3._mcg_pair_descriptor_plan()
+def test_m6_quad_descriptors_exhaustively_match_scalar_trellis_states():
+    plan = exl3._mcg_quad_descriptor_plan()
     words = np.array(
         [(index * 0x9E3779B9 + 0x7F4A7C15) & 0xFFFFFFFF for index in range(24)],
         dtype=np.uint32,
     )
 
-    assert len(plan.descriptors) == 128
-    assert plan.sha256 == exl3.EXL3_M6_PAIR_DESCRIPTOR_SHA256
-    assert any(descriptor >> 10 == 0 for descriptor in plan.descriptors)
+    assert len(plan.descriptors) == 64
+    assert plan.sha256 == exl3.EXL3_M6_QUAD_DESCRIPTOR_SHA256
 
-    for pair_row in range(8):
+    def merge(low, high, shift):
+        if shift == 0:
+            return high
+        return ((high >> shift) | (low << (32 - shift))) & 0xFFFFFFFF
+
+    observed_shifts = []
+    for quad_row in range(4):
         for local_n in range(16):
-            descriptor = plan.descriptors[pair_row * 16 + local_n]
+            descriptor = plan.descriptors[quad_row * 16 + local_n]
             index0 = descriptor & 0x1F
-            index2 = (descriptor >> 5) & 0x1F
-            shift = descriptor >> 10
-            high = int(words[index2])
-            if shift == 0:
-                window = high
+            index1 = (descriptor >> 5) & 0x1F
+            index2 = (descriptor >> 10) & 0x1F
+            shift0 = (descriptor >> 15) & 0x1F
+            shift1 = (descriptor >> 20) & 0x1F
+            observed_shifts.extend((shift0, shift1))
+            word0 = int(words[index0])
+            word1 = int(words[index1])
+            if quad_row in (0, 2):
+                word2 = int(words[index2])
+                window0 = merge(word0, word1, shift0)
+                window1 = merge(word1, word2, shift1)
             else:
-                window = (
-                    (high >> shift) | (int(words[index0]) << (32 - shift))
-                ) & 0xFFFFFFFF
-            paired = ((window >> 3) & 0xFFFF, window & 0xFFFF)
+                high0 = word1 if descriptor & (1 << 25) else word0
+                low1 = word1 if descriptor & (1 << 26) else word0
+                window0 = merge(word0, high0, shift0)
+                window1 = merge(low1, word1, shift1)
+            decoded = (
+                (window0 >> 3) & 0xFFFF,
+                window0 & 0xFFFF,
+                (window1 >> 3) & 0xFFFF,
+                window1 & 0xFFFF,
+            )
 
-            row0 = pair_row * 2
-            tensor_core0 = exl3.EXL3_TENSOR_CORE_INVERSE[row0 * 16 + local_n]
-            tensor_core1 = exl3.EXL3_TENSOR_CORE_INVERSE[
-                (row0 + 1) * 16 + local_n
-            ]
-            assert tensor_core1 == tensor_core0 + 1
+            row0 = quad_row * 4
+            tensor_cores = tuple(
+                exl3.EXL3_TENSOR_CORE_INVERSE[(row0 + offset) * 16 + local_n]
+                for offset in range(4)
+            )
+            assert tensor_cores == (
+                tensor_cores[0],
+                tensor_cores[0] + 1,
+                tensor_cores[0] + 8,
+                tensor_cores[0] + 9,
+            )
 
             expected = []
-            for tensor_core in (tensor_core0, tensor_core1):
+            for tensor_core in tensor_cores:
                 bit0 = tensor_core * 3 + 755
                 bit1 = bit0 + 16
                 scalar_index0 = bit0 // 32
@@ -200,7 +222,9 @@ def test_m6_pair_descriptors_exhaustively_match_scalar_trellis_states():
                 expected.append(
                     (((low << 32) | high) >> scalar_shift) & 0xFFFF
                 )
-            assert paired == tuple(expected)
+            assert decoded == tuple(expected)
+
+    assert 0 in observed_shifts
 
 
 def test_carried_mhc_contract_owns_43_target_and_3_draft_layers():
@@ -380,13 +404,13 @@ def test_mia_exl3_install_binds_unconditional_direct_qmv_and_exact_tail(
     assert installs == ["router", 64]
 
 
-def test_mia_loader_rebinds_paired_qmv_only_after_generic_install():
+def test_mia_loader_rebinds_quad_qmv_only_after_generic_install():
     source = inspect.getsource(load_mia_exl3_dspark_model)
     generic_install = source.index(
         "layer.ffn.install_mia_exl3_runtime(max_tokens=8224)"
     )
-    paired_install = source.index("install_mia_m6_paired_qmv_routes(model)")
-    assert generic_install < paired_install
+    quad_install = source.index("install_mia_m6_quad_qmv_routes(model)")
+    assert generic_install < quad_install
 
     events = []
 
@@ -394,10 +418,10 @@ def test_mia_loader_rebinds_paired_qmv_only_after_generic_install():
         def direct_qmv(self, _x, _expert_ids):
             return "oracle"
 
-        def direct_qmv_m6_paired(self, _x, _expert_ids):
-            return "paired"
+        def direct_qmv_m6_quad(self, _x, _expert_ids):
+            return "quad"
 
-        def install_m6_paired_qmv_runtime(self):
+        def install_m6_quad_qmv_runtime(self):
             events.append("plan")
 
     switch = Switch()
@@ -405,13 +429,13 @@ def test_mia_loader_rebinds_paired_qmv_only_after_generic_install():
         switch_mlp=switch,
         _mia_exl3_direct_qmv=switch.direct_qmv,
     )
-    exl3.install_mia_m6_paired_qmv_routes(
+    exl3.install_mia_m6_quad_qmv_routes(
         SimpleNamespace(layers=(SimpleNamespace(ffn=ffn),))
     )
 
     assert events == ["plan"]
     assert ffn._mia_exl3_direct_qmv.__self__ is switch
-    assert ffn._mia_exl3_direct_qmv.__func__ is Switch.direct_qmv_m6_paired
+    assert ffn._mia_exl3_direct_qmv.__func__ is Switch.direct_qmv_m6_quad
 
 
 def test_direct_qmv_banks_bind_production_bn256_geometry(monkeypatch, request):
@@ -478,7 +502,7 @@ def test_direct_qmv_banks_bind_production_bn256_geometry(monkeypatch, request):
     ]
 
 
-def test_m6_paired_qmv_is_construction_bound_and_never_reenters_factories(
+def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     monkeypatch,
     request,
 ):
@@ -510,56 +534,66 @@ def test_m6_paired_qmv_is_construction_bound_and_never_reenters_factories(
     monkeypatch.setattr(exl3.nn, "silu", lambda value: value)
     monkeypatch.setattr(exl3.mx.fast, "metal_kernel", capture_metal_kernel)
     exl3._mcg_qmv_kernel.cache_clear()
-    exl3._m6_paired_qmv_kernel.cache_clear()
+    exl3._m6_quad_qmv_kernel.cache_clear()
     request.addfinalizer(exl3._mcg_qmv_kernel.cache_clear)
-    request.addfinalizer(exl3._m6_paired_qmv_kernel.cache_clear)
+    request.addfinalizer(exl3._m6_quad_qmv_kernel.cache_clear)
 
     switch = EXL3SwitchGLU(4096, 2048, 216, 6, limit=10.0)
-    switch.install_m6_paired_qmv_runtime()
-    plan = switch._m6_paired_qmv_plan
+    switch.install_m6_quad_qmv_runtime()
+    plan = switch._m6_quad_qmv_plan
 
     assert plan.geometry == (4096, 2048, 216, 6, 10.0, 256, 36)
-    assert plan.descriptor_sha256 == exl3.EXL3_M6_PAIR_DESCRIPTOR_SHA256
-    assert plan.hidden_to_intermediate is exl3._m6_paired_qmv_kernel(
+    assert plan.descriptor_sha256 == exl3.EXL3_M6_QUAD_DESCRIPTOR_SHA256
+    assert plan.hidden_to_intermediate is exl3._m6_quad_qmv_kernel(
         4096, 2048, False
     )
-    assert plan.intermediate_to_hidden is exl3._m6_paired_qmv_kernel(
+    assert plan.intermediate_to_hidden is exl3._m6_quad_qmv_kernel(
         2048, 4096, True
     )
-    project_source = inspect.getsource(EXL3SwitchGLU._m6_paired_project)
+    project_source = inspect.getsource(EXL3SwitchGLU._m6_quad_project)
     assert "routed_input" not in project_source
 
-    paired = [
+    quad = [
         value
         for name, value in captured.items()
-        if "m6_paired_mcg_qmv" in name
+        if "m6_quad_mcg_qmv" in name
     ]
-    assert len(paired) == 2
-    for kernel in paired:
-        assert "constant ushort PAIR_DESCRIPTORS[128]" in kernel["header"]
+    assert len(quad) == 2
+    for kernel in quad:
+        assert "constant uint QUAD_DESCRIPTORS[64]" in kernel["header"]
         assert "if (shift == 0u)" in kernel["header"]
-        assert kernel["header"].count("words[index0]") == 1
-        assert kernel["header"].count("words[index2]") == 1
-        assert "uint state0 = (window >> 3u) & 0xffffu;" in kernel["header"]
-        assert "uint state1 = window & 0xffffu;" in kernel["header"]
-        assert "for (uint local_k = 0; local_k < HAD; local_k += 2u)" in kernel[
+        quad3 = kernel["header"].split("inline half4 decode_mcg_quad3", 1)[1]
+        quad3, quad2 = quad3.split("inline half4 decode_mcg_quad2", 1)
+        assert quad3.count("words[index") == 3
+        assert quad2.count("words[index") == 2
+        assert "uint state0 = (window0 >> 3u) & 0xffffu;" in kernel["header"]
+        assert "uint state3 = window1 & 0xffffu;" in kernel["header"]
+        assert "for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k)" in kernel[
             "source"
         ]
+        assert kernel["source"].count("decode_mcg_quad3(") == 4
+        assert kernel["source"].count("decode_mcg_quad2(") == 4
         assert "threadgroup ushort packed_tiles[" in kernel["source"]
         assert kernel["source"].count("threadgroup ushort packed_tiles[") == 1
         k0_accumulator0 = kernel["source"].index(
-            "accumulator0 += value0 * float(weights0.x);"
+            "accumulator0 += value0_0 * float(weights0_0.x);"
         )
         k1_accumulator0 = kernel["source"].index(
-            "accumulator0 += value1 * float(weights0.y);"
+            "accumulator0 += value0_1 * float(weights0_0.y);"
         )
-        assert k0_accumulator0 < k1_accumulator0
+        k2_accumulator0 = kernel["source"].index(
+            "accumulator0 += value0_2 * float(weights0_0.z);"
+        )
+        k3_accumulator0 = kernel["source"].index(
+            "accumulator0 += value0_3 * float(weights0_0.w);"
+        )
+        assert k0_accumulator0 < k1_accumulator0 < k2_accumulator0 < k3_accumulator0
 
     def forbidden_factory(*_args, **_kwargs):
-        raise AssertionError("installed paired QMV re-entered its kernel factory")
+        raise AssertionError("installed quad QMV re-entered its kernel factory")
 
-    monkeypatch.setattr(exl3, "_m6_paired_qmv_kernel", forbidden_factory)
-    result = switch.direct_qmv_m6_paired(
+    monkeypatch.setattr(exl3, "_m6_quad_qmv_kernel", forbidden_factory)
+    result = switch.direct_qmv_m6_quad(
         _StaticArray((6, 4096), mx.bfloat16),
         _StaticArray((6, 6), mx.int32),
     )
@@ -826,7 +860,7 @@ def test_authentic_mia_bn256_matches_two_bn128_output_panels():
     np.testing.assert_array_equal(np.array(wide), np.array(expected))
 
 
-def test_authentic_mia_m6_paired_qmv_matches_three_banks_and_final_bits():
+def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
     """Gate full production K/N/M arithmetic on authentic layer-0 storage."""
 
     if not mx.metal.is_available():
@@ -846,12 +880,12 @@ def test_authentic_mia_m6_paired_qmv_matches_three_banks_and_final_bits():
             bank.suh = mx.array(handle.get_tensor(f"{prefix}.suh"))[None]
             bank.svh = mx.array(handle.get_tensor(f"{prefix}.svh"))[None]
 
-    descriptor_plan = exl3._mcg_pair_descriptor_plan()
-    switch._m6_paired_qmv_plan = exl3._InstalledM6PairedQMVPlan(
+    descriptor_plan = exl3._mcg_quad_descriptor_plan()
+    switch._m6_quad_qmv_plan = exl3._InstalledM6QuadQMVPlan(
         geometry=(4096, 2048, 216, 6, 10.0, 256, 36),
         descriptor_sha256=descriptor_plan.sha256,
-        hidden_to_intermediate=exl3._m6_paired_qmv_kernel(4096, 2048, False),
-        intermediate_to_hidden=exl3._m6_paired_qmv_kernel(2048, 4096, True),
+        hidden_to_intermediate=exl3._m6_quad_qmv_kernel(4096, 2048, False),
+        intermediate_to_hidden=exl3._m6_quad_qmv_kernel(2048, 4096, True),
     )
     x = mx.array(
         np.linspace(-1.0, 1.0, 6 * 4096, dtype=np.float32).reshape(6, 4096)
@@ -861,52 +895,52 @@ def test_authentic_mia_m6_paired_qmv_matches_three_banks_and_final_bits():
     x_half = x.astype(mx.float16)
 
     oracle_gate = switch.gate_proj(x_half, expert_ids)
-    paired_gate = switch._m6_paired_project(
+    quad_gate = switch._m6_quad_project(
         switch.gate_proj,
         x_half,
         flat_ids,
-        switch._m6_paired_qmv_plan.hidden_to_intermediate,
+        switch._m6_quad_qmv_plan.hidden_to_intermediate,
     )
     oracle_up = switch.up_proj(x_half, expert_ids)
-    paired_up = switch._m6_paired_project(
+    quad_up = switch._m6_quad_project(
         switch.up_proj,
         x_half,
         flat_ids,
-        switch._m6_paired_qmv_plan.hidden_to_intermediate,
+        switch._m6_quad_qmv_plan.hidden_to_intermediate,
     )
     activated = (
         exl3.nn.silu(mx.minimum(oracle_gate, 10.0))
         * mx.clip(oracle_up, -10.0, 10.0)
     ).astype(mx.float16)
     oracle_down = switch.down_proj(activated, expert_ids)
-    paired_down = switch._m6_paired_project(
+    quad_down = switch._m6_quad_project(
         switch.down_proj,
         activated.reshape(36, 2048),
         flat_ids,
-        switch._m6_paired_qmv_plan.intermediate_to_hidden,
+        switch._m6_quad_qmv_plan.intermediate_to_hidden,
     )
     oracle_final = switch.direct_qmv(x, expert_ids)
-    paired_final = switch.direct_qmv_m6_paired(x, expert_ids)
+    quad_final = switch.direct_qmv_m6_quad(x, expert_ids)
     mx.eval(
         oracle_gate,
-        paired_gate,
+        quad_gate,
         oracle_up,
-        paired_up,
+        quad_up,
         oracle_down,
-        paired_down,
+        quad_down,
         oracle_final,
-        paired_final,
+        quad_final,
     )
 
-    for oracle, paired in (
-        (oracle_gate, paired_gate),
-        (oracle_up, paired_up),
-        (oracle_down, paired_down),
-        (oracle_final, paired_final),
+    for oracle, quad in (
+        (oracle_gate, quad_gate),
+        (oracle_up, quad_up),
+        (oracle_down, quad_down),
+        (oracle_final, quad_final),
     ):
         np.testing.assert_array_equal(
             np.array(oracle.view(mx.uint16)),
-            np.array(paired.view(mx.uint16)),
+            np.array(quad.view(mx.uint16)),
         )
 
 

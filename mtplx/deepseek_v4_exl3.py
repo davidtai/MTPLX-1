@@ -76,50 +76,84 @@ EXL3_TENSOR_CORE_PERMUTATION = _tensor_core_permutation()
 EXL3_TENSOR_CORE_INVERSE = tuple(
     sorted(range(256), key=EXL3_TENSOR_CORE_PERMUTATION.__getitem__)
 )
-EXL3_M6_PAIR_DESCRIPTOR_SHA256 = (
-    "1117b53c6867097d7fbeeaaeb25c46725a78046ca767b709edd00bacf9ebd690"
+EXL3_M6_QUAD_DESCRIPTOR_SHA256 = (
+    "158d8b220411e42a910b29a47d8af0f045b4eb1feec745cfa39b9997db72efa2"
 )
 
 
-class _MCGPairDescriptorPlan(NamedTuple):
+class _MCGQuadDescriptorPlan(NamedTuple):
     descriptors: tuple[int, ...]
     sha256: str
 
 
 @lru_cache(maxsize=1)
-def _mcg_pair_descriptor_plan() -> _MCGPairDescriptorPlan:
-    """Build and validate the fixed row-pair windows for one MCG/K3 tile."""
+def _mcg_quad_descriptor_plan() -> _MCGQuadDescriptorPlan:
+    """Build the fixed four-row window descriptors for one MCG/K3 tile."""
 
     descriptors: list[int] = []
-    for pair_row in range(EXL3_TILE // 2):
-        row0 = pair_row * 2
+    for quad_row in range(EXL3_TILE // 4):
+        row0 = quad_row * 4
         for local_n in range(EXL3_TILE):
-            tensor_core0 = EXL3_TENSOR_CORE_INVERSE[row0 * EXL3_TILE + local_n]
-            tensor_core1 = EXL3_TENSOR_CORE_INVERSE[
-                (row0 + 1) * EXL3_TILE + local_n
-            ]
-            if tensor_core1 != tensor_core0 + 1:
-                raise ValueError(
-                    "Mia paired MCG decoder requires adjacent t,t+1 row pairs"
-                )
+            tensor_cores = tuple(
+                EXL3_TENSOR_CORE_INVERSE[
+                    (row0 + offset) * EXL3_TILE + local_n
+                ]
+                for offset in range(4)
+            )
+            if tensor_cores != (
+                tensor_cores[0],
+                tensor_cores[0] + 1,
+                tensor_cores[0] + 8,
+                tensor_cores[0] + 9,
+            ):
+                raise ValueError("Mia quad MCG tensor-core ownership changed")
 
-            bit_start = tensor_core0 * EXL3_BITS + 755
-            bit_end = bit_start + 16 + EXL3_BITS
-            raw_index0 = bit_start // 32
-            raw_index2 = (bit_end - 1) // 32
-            shift = (raw_index2 + 1) * 32 - bit_end
+            pairs = []
+            for tensor_core in (tensor_cores[0], tensor_cores[2]):
+                bit_start = tensor_core * EXL3_BITS + 755
+                bit_end = bit_start + 16 + EXL3_BITS
+                raw_index0 = bit_start // 32
+                raw_index2 = (bit_end - 1) // 32
+                pairs.append(
+                    (
+                        raw_index0 % 24,
+                        raw_index2 % 24,
+                        (raw_index2 + 1) * 32 - bit_end,
+                    )
+                )
+            pair0, pair1 = pairs
+            if quad_row in (0, 2):
+                if pair1[0] != pair0[1]:
+                    raise ValueError("Mia quad three-load word ownership changed")
+                index0, index1, index2 = pair0[0], pair0[1], pair1[1]
+                high0_is_word1 = low1_is_word1 = 0
+            else:
+                index0, index1, index2 = pair0[0], pair1[1], 0
+                if (
+                    pair0[0] not in (index0, index1)
+                    or pair0[1] not in (index0, index1)
+                    or pair1[0] not in (index0, index1)
+                    or pair1[1] != index1
+                ):
+                    raise ValueError("Mia quad two-load word ownership changed")
+                high0_is_word1 = int(pair0[1] == index1)
+                low1_is_word1 = int(pair1[0] == index1)
             descriptor = (
-                raw_index0 % 24
-                | (raw_index2 % 24) << 5
-                | shift << 10
+                index0
+                | index1 << 5
+                | index2 << 10
+                | pair0[2] << 15
+                | pair1[2] << 20
+                | high0_is_word1 << 25
+                | low1_is_word1 << 26
             )
             descriptors.append(descriptor)
 
-    packed = struct.pack("<128H", *descriptors)
+    packed = struct.pack("<64I", *descriptors)
     digest = hashlib.sha256(packed).hexdigest()
-    if len(descriptors) != 128 or digest != EXL3_M6_PAIR_DESCRIPTOR_SHA256:
-        raise ValueError("Mia paired MCG descriptor construction changed")
-    return _MCGPairDescriptorPlan(tuple(descriptors), digest)
+    if len(descriptors) != 64 or digest != EXL3_M6_QUAD_DESCRIPTOR_SHA256:
+        raise ValueError("Mia quad MCG descriptor construction changed")
+    return _MCGQuadDescriptorPlan(tuple(descriptors), digest)
 
 
 def decode_mcg_trellis_tile(packed: Any):
@@ -430,19 +464,19 @@ def _mcg_qmv_kernel(
 
 
 @lru_cache(maxsize=None)
-def _m6_paired_qmv_kernel(
+def _m6_quad_qmv_kernel(
     size_k: int,
     size_n: int,
     routed_input: bool,
 ):
-    """Build the fixed-M6 BN256 QMV with adjacent-K paired MCG decode."""
+    """Build the fixed-M6 BN256 QMV with four-row MCG window reuse."""
 
     if (size_k, size_n, routed_input) not in (
         (4096, 2048, False),
         (2048, 4096, True),
     ):
-        raise ValueError("Mia paired QMV requires an exact gate/up or down bank")
-    descriptor_plan = _mcg_pair_descriptor_plan()
+        raise ValueError("Mia quad QMV requires an exact gate/up or down bank")
+    descriptor_plan = _mcg_quad_descriptor_plan()
     descriptors = ",".join(str(value) for value in descriptor_plan.descriptors)
     header = f"""
         using namespace metal;
@@ -457,7 +491,7 @@ def _m6_paired_qmv_kernel(
         constant constexpr uint BLOCK_TILES = 8;
         constant constexpr uint BLOCK_TILES_N = 16;
         constant constexpr float HAD_SCALE = 0.088388347648f;
-        constant ushort PAIR_DESCRIPTORS[128] = {{ {descriptors} }};
+        constant uint QUAD_DESCRIPTORS[64] = {{ {descriptors} }};
 
         inline float hadamard_h128(
             float value,
@@ -478,37 +512,117 @@ def _m6_paired_qmv_kernel(
             return value;
         }}
 
-        inline half2 decode_mcg_pair(
-            threadgroup const ushort* packed,
-            ushort descriptor
-        ) {{
-            threadgroup const uint* words =
-                reinterpret_cast<threadgroup const uint*>(packed);
-            uint index0 = uint(descriptor) & 0x1fu;
-            uint index2 = (uint(descriptor) >> 5u) & 0x1fu;
-            uint shift = uint(descriptor) >> 10u;
-            uint low = words[index0];
-            uint high = words[index2];
-            uint window;
+        inline uint merge_mcg_window(uint low, uint high, uint shift) {{
             if (shift == 0u) {{
-                window = high;
-            }} else {{
-                window = (high >> shift) | (low << (32u - shift));
+                return high;
             }}
-            uint state0 = (window >> 3u) & 0xffffu;
-            uint state1 = window & 0xffffu;
+            return (high >> shift) | (low << (32u - shift));
+        }}
 
+        inline half4 decode_mcg_states(
+            uint state0,
+            uint state1,
+            uint state2,
+            uint state3
+        ) {{
             uint product0 = state0 * 0xCBAC1FEDu;
             uint product1 = state1 * 0xCBAC1FEDu;
+            uint product2 = state2 * 0xCBAC1FEDu;
+            uint product3 = state3 * 0xCBAC1FEDu;
             uint half_pair_bits0 =
                 0x3B603B60u ^ (product0 & 0x8FFF8FFFu);
             uint half_pair_bits1 =
                 0x3B603B60u ^ (product1 & 0x8FFF8FFFu);
+            uint half_pair_bits2 =
+                0x3B603B60u ^ (product2 & 0x8FFF8FFFu);
+            uint half_pair_bits3 =
+                0x3B603B60u ^ (product3 & 0x8FFF8FFFu);
             half2 pair0 = as_type<half2>(half_pair_bits0);
             half2 pair1 = as_type<half2>(half_pair_bits1);
-            return half2(pair0.x + pair0.y, pair1.x + pair1.y);
+            half2 pair2 = as_type<half2>(half_pair_bits2);
+            half2 pair3 = as_type<half2>(half_pair_bits3);
+            return half4(
+                pair0.x + pair0.y,
+                pair1.x + pair1.y,
+                pair2.x + pair2.y,
+                pair3.x + pair3.y
+            );
+        }}
+
+        inline half4 decode_mcg_quad3(
+            threadgroup const ushort* packed,
+            uint descriptor
+        ) {{
+            threadgroup const uint* words =
+                reinterpret_cast<threadgroup const uint*>(packed);
+            uint index0 = uint(descriptor) & 0x1fu;
+            uint index1 = (uint(descriptor) >> 5u) & 0x1fu;
+            uint index2 = (uint(descriptor) >> 10u) & 0x1fu;
+            uint shift0 = (uint(descriptor) >> 15u) & 0x1fu;
+            uint shift1 = (uint(descriptor) >> 20u) & 0x1fu;
+            uint word0 = words[index0];
+            uint word1 = words[index1];
+            uint word2 = words[index2];
+            uint window0 = merge_mcg_window(word0, word1, shift0);
+            uint window1 = merge_mcg_window(word1, word2, shift1);
+            uint state0 = (window0 >> 3u) & 0xffffu;
+            uint state1 = window0 & 0xffffu;
+            uint state2 = (window1 >> 3u) & 0xffffu;
+            uint state3 = window1 & 0xffffu;
+            return decode_mcg_states(state0, state1, state2, state3);
+        }}
+
+        inline half4 decode_mcg_quad2(
+            threadgroup const ushort* packed,
+            uint descriptor
+        ) {{
+            threadgroup const uint* words =
+                reinterpret_cast<threadgroup const uint*>(packed);
+            uint index0 = uint(descriptor) & 0x1fu;
+            uint index1 = (uint(descriptor) >> 5u) & 0x1fu;
+            uint shift0 = (uint(descriptor) >> 15u) & 0x1fu;
+            uint shift1 = (uint(descriptor) >> 20u) & 0x1fu;
+            uint word0 = words[index0];
+            uint word1 = words[index1];
+            bool high0_is_word1 = (uint(descriptor) & (1u << 25u)) != 0u;
+            bool low1_is_word1 = (uint(descriptor) & (1u << 26u)) != 0u;
+            uint high0 = select(word0, word1, high0_is_word1);
+            uint low1 = select(word0, word1, low1_is_word1);
+            uint window0 = merge_mcg_window(word0, high0, shift0);
+            uint window1 = merge_mcg_window(low1, word1, shift1);
+            uint state0 = (window0 >> 3u) & 0xffffu;
+            uint state1 = window0 & 0xffffu;
+            uint state2 = (window1 >> 3u) & 0xffffu;
+            uint state3 = window1 & 0xffffu;
+            return decode_mcg_states(state0, state1, state2, state3);
         }}
     """
+    quad_blocks = []
+    for quad_row, decoder in enumerate(
+        ("decode_mcg_quad3", "decode_mcg_quad2") * 2
+    ):
+        quad_blocks.append(
+            f"""
+            uint local_k{quad_row} = tile_k * 16u + {quad_row * 4}u;
+            uint descriptor{quad_row} =
+                QUAD_DESCRIPTORS[{quad_row * 16}u + local_n];
+            half4 weights{quad_row}_0 = {decoder}(tile0, descriptor{quad_row});
+            half4 weights{quad_row}_1 = {decoder}(tile1, descriptor{quad_row});
+            float value{quad_row}_0 = float(x_had[local_k{quad_row}]);
+            accumulator0 += value{quad_row}_0 * float(weights{quad_row}_0.x);
+            accumulator1 += value{quad_row}_0 * float(weights{quad_row}_1.x);
+            float value{quad_row}_1 = float(x_had[local_k{quad_row} + 1u]);
+            accumulator0 += value{quad_row}_1 * float(weights{quad_row}_0.y);
+            accumulator1 += value{quad_row}_1 * float(weights{quad_row}_1.y);
+            float value{quad_row}_2 = float(x_had[local_k{quad_row} + 2u]);
+            accumulator0 += value{quad_row}_2 * float(weights{quad_row}_0.z);
+            accumulator1 += value{quad_row}_2 * float(weights{quad_row}_1.z);
+            float value{quad_row}_3 = float(x_had[local_k{quad_row} + 3u]);
+            accumulator0 += value{quad_row}_3 * float(weights{quad_row}_0.w);
+            accumulator1 += value{quad_row}_3 * float(weights{quad_row}_1.w);
+            """
+        )
+    quad_decode = "".join(quad_blocks)
     x_row = "task" if routed_input else "row"
     source = f"""
         uint lane = thread_position_in_threadgroup.x;
@@ -563,25 +677,14 @@ def _m6_paired_qmv_kernel(
             uint tile_n0 = lane / 16u;
             uint tile_n1 = tile_n0 + BLOCK_TILES;
             uint local_n = lane & 15u;
-            for (uint local_k = 0; local_k < HAD; local_k += 2u) {{
-                uint tile_k = local_k / 16u;
-                uint pair_row = (local_k & 15u) / 2u;
-                ushort descriptor =
-                    PAIR_DESCRIPTORS[pair_row * 16u + local_n];
+            for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
                 threadgroup const ushort* tile0 =
                     packed_tiles
                     + (tile_k * BLOCK_TILES_N + tile_n0) * TILE_WORDS;
                 threadgroup const ushort* tile1 =
                     packed_tiles
                     + (tile_k * BLOCK_TILES_N + tile_n1) * TILE_WORDS;
-                half2 weights0 = decode_mcg_pair(tile0, descriptor);
-                half2 weights1 = decode_mcg_pair(tile1, descriptor);
-                float value0 = float(x_had[local_k]);
-                accumulator0 += value0 * float(weights0.x);
-                accumulator1 += value0 * float(weights1.x);
-                float value1 = float(x_had[local_k + 1u]);
-                accumulator0 += value1 * float(weights0.y);
-                accumulator1 += value1 * float(weights1.y);
+                {quad_decode}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
@@ -603,7 +706,7 @@ def _m6_paired_qmv_kernel(
     """
     return mx.fast.metal_kernel(
         name=(
-            f"mtplx_dsv4_exl3_m6_paired_mcg_qmv_k{size_k}_n{size_n}"
+            f"mtplx_dsv4_exl3_m6_quad_mcg_qmv_k{size_k}_n{size_n}"
             f"_e216_t6_r{int(routed_input)}_bn256_v1"
         ),
         input_names=["x", "trellis", "suh", "svh", "expert_ids"],
@@ -1637,7 +1740,7 @@ class _InstalledTrellisPlan(NamedTuple):
     intermediate_to_hidden: Any
 
 
-class _InstalledM6PairedQMVPlan(NamedTuple):
+class _InstalledM6QuadQMVPlan(NamedTuple):
     geometry: tuple[int, int, int, int, float, int, int]
     descriptor_sha256: str
     hidden_to_intermediate: Any
@@ -1688,7 +1791,7 @@ class EXL3SwitchGLU(nn.Module):
         self._trellis_input_hadamard = None
         self._trellis_activation_down = None
         self._trellis_final_reduce = None
-        self._m6_paired_qmv_plan = None
+        self._m6_quad_qmv_plan = None
 
     def install_trellis_runtime(self, *, max_tokens: int) -> None:
         """Install the pinned decode/prefill plans before request execution."""
@@ -1729,8 +1832,8 @@ class EXL3SwitchGLU(nn.Module):
         )
         self._trellis_installed = True
 
-    def install_m6_paired_qmv_runtime(self) -> None:
-        """Bind the exact Mia M6 paired decoder before request execution."""
+    def install_m6_quad_qmv_runtime(self) -> None:
+        """Bind the exact Mia M6 four-row decoder before request execution."""
 
         geometry = (
             self.hidden_size,
@@ -1742,7 +1845,7 @@ class EXL3SwitchGLU(nn.Module):
             self.topk * 6,
         )
         if geometry != (4096, 2048, 216, 6, 10.0, 256, 36):
-            raise ValueError(f"Mia paired QMV geometry changed: {geometry!r}")
+            raise ValueError(f"Mia quad QMV geometry changed: {geometry!r}")
         bank_contract = (
             (
                 self.gate_proj,
@@ -1782,14 +1885,14 @@ class EXL3SwitchGLU(nn.Module):
             )
             if observed != required:
                 raise ValueError(
-                    f"Mia paired QMV bank storage changed: {observed!r}"
+                    f"Mia quad QMV bank storage changed: {observed!r}"
                 )
-        descriptors = _mcg_pair_descriptor_plan()
-        self._m6_paired_qmv_plan = _InstalledM6PairedQMVPlan(
+        descriptors = _mcg_quad_descriptor_plan()
+        self._m6_quad_qmv_plan = _InstalledM6QuadQMVPlan(
             geometry=geometry,
             descriptor_sha256=descriptors.sha256,
-            hidden_to_intermediate=_m6_paired_qmv_kernel(4096, 2048, False),
-            intermediate_to_hidden=_m6_paired_qmv_kernel(2048, 4096, True),
+            hidden_to_intermediate=_m6_quad_qmv_kernel(4096, 2048, False),
+            intermediate_to_hidden=_m6_quad_qmv_kernel(2048, 4096, True),
         )
 
     def _trellis_mma(
@@ -1931,7 +2034,7 @@ class EXL3SwitchGLU(nn.Module):
         return self.down_proj(activated, expert_ids).astype(original_dtype)
 
     @staticmethod
-    def _m6_paired_project(
+    def _m6_quad_project(
         bank: EXL3LinearBank,
         x_rows: mx.array,
         flat_ids: mx.array,
@@ -1952,24 +2055,24 @@ class EXL3SwitchGLU(nn.Module):
             output_dtypes=[mx.float16],
         )[0].reshape(6, 6, bank.output_dims)
 
-    def direct_qmv_m6_paired(
+    def direct_qmv_m6_quad(
         self,
         x: mx.array,
         expert_ids: mx.array,
     ) -> mx.array:
-        """Run the construction-bound exact-M6 adjacent-K paired decoder."""
+        """Run the construction-bound exact-M6 four-row decoder."""
 
         original_dtype = x.dtype
         x_half = x.astype(mx.float16)
         flat_ids = mx.contiguous(expert_ids.reshape(36).astype(mx.uint32))
-        plan = self._m6_paired_qmv_plan
-        gate = self._m6_paired_project(
+        plan = self._m6_quad_qmv_plan
+        gate = self._m6_quad_project(
             self.gate_proj,
             x_half,
             flat_ids,
             plan.hidden_to_intermediate,
         )
-        up = self._m6_paired_project(
+        up = self._m6_quad_project(
             self.up_proj,
             x_half,
             flat_ids,
@@ -1978,7 +2081,7 @@ class EXL3SwitchGLU(nn.Module):
         gate = mx.minimum(gate, self.limit)
         up = mx.clip(up, -self.limit, self.limit)
         activated = (nn.silu(gate) * up).astype(mx.float16)
-        return self._m6_paired_project(
+        return self._m6_quad_project(
             self.down_proj,
             activated.reshape(36, self.down_proj.input_dims),
             flat_ids,
@@ -2030,8 +2133,8 @@ class EXL3SwitchGLU(nn.Module):
         )
 
 
-def install_mia_m6_paired_qmv_routes(model) -> None:
-    """Install every exact-M6 paired plan, then rebind the verified owner."""
+def install_mia_m6_quad_qmv_routes(model) -> None:
+    """Install every exact-M6 quad plan, then rebind the verified owner."""
 
     switches = []
     for layer_id, layer in enumerate(model.layers):
@@ -2047,9 +2150,9 @@ def install_mia_m6_paired_qmv_routes(model) -> None:
             )
         switches.append((layer.ffn, switch))
     for _ffn, switch in switches:
-        switch.install_m6_paired_qmv_runtime()
+        switch.install_m6_quad_qmv_runtime()
     for ffn, switch in switches:
-        ffn._mia_exl3_direct_qmv = switch.direct_qmv_m6_paired
+        ffn._mia_exl3_direct_qmv = switch.direct_qmv_m6_quad
 
 
 def _map_mia_target_name(name: str) -> str:
@@ -2865,7 +2968,7 @@ def load_mia_exl3_dspark_model(
     model.eval()
     for layer in model.layers:
         layer.ffn.install_mia_exl3_runtime(max_tokens=8224)
-    install_mia_m6_paired_qmv_routes(model)
+    install_mia_m6_quad_qmv_routes(model)
 
     draft_config = dict(artifact_validation.draft_config)
     draft_experts = int(draft_config.get("n_routed_experts", 0))
