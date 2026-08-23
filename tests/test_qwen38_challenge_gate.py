@@ -362,6 +362,9 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
     }
+    assert gate._validate_route_id(
+        "r08_device_draft+r61_dual_norm_concat"
+    ) == {"r08_device_draft", "r61_dual_norm_concat"}
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")

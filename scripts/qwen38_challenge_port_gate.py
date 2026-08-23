@@ -198,6 +198,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r21_qk_rms_rope",
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
+        "r61_dual_norm_concat",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -232,13 +233,15 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(28)
     if "r36_qkv_islands" in features:
         source_rows.append(36)
+    if "r61_dual_norm_concat" in features:
+        source_rows.append(61)
     return {
         "cache_route": (
             "kv_only_history"
             if {"kv_only_history", "r20_kv_only_history"} & features
             else "control"
         ),
-        "dual_norm": "dual_norm" in features,
+        "dual_norm": bool({"dual_norm", "r61_dual_norm_concat"} & features),
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "mtp_block_variant": (
@@ -469,6 +472,18 @@ def _candidate_engagement_errors(
             )
             if qk_widen_calls <= 0:
                 errors.append("row 26 Q/K L<=32 widening did not execute")
+    if "r61_dual_norm_concat" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("dual_norm") or {}).get(
+                    "calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 61 dual RMSNorm+concat kernel did not execute")
     return errors
 
 
