@@ -102,7 +102,7 @@ row or from the earlier bundle campaign.
 | 21 | 186 | 1.5222% | `4eb54489fb51` | `df0b66eded6c` | +228/-5 | REJECTED: exact Qwen 3.8 BF16 H256/R64 fused Q/K RMSNorm + partial-RoPE engaged 2,416 times per timed candidate arm on rows 8+10+18+20, but regressed wall throughput 0.8870%. Deterministic tie drift was allowed; implementation removed. |
 | 23 | 215 | 0.2964% | `df404e08fee2` | `597330a384fb` | +64/-41 | DEPENDENCY ABSENT/TARGET-SHAPE NON-TRANSFERABLE: this patch only retunes the row-19 argmax-only compact selector's reduction. Row 19 is absent because temperature-1/top-k20 acceptance requires the complete sparse proposal distribution, so row 23 has no retained call site and cannot affect this route. |
 | 24 | 234 | 0.9658% | `7351e62674bc` | `849631b545f2` | +54/-14 | RETAINED in part: adaptive-margin depth is disabled by fixed D3; the Q/K width restriction modifies rejected row 21; and fused SwiGLU depends on row 18's rejected packed MLP gate/up. The remaining live mechanism, the source's target trunk evaluation ladder, engaged 144 times per candidate arm and improved wall throughput 1.6019% on rows 8+10+18+20 with exact tokens and schedules. |
-| 25 | 270 | 0.5421% | `c7468c565a7c` | `e8898ba2afd6` | +1/-1 | PENDING |
+| 25 | 270 | 0.5421% | `c7468c565a7c` | `e8898ba2afd6` | +1/-1 | TARGET-SHAPE NO-OP: the only change lowers the streak gate for adaptive segmented verification depth. This campaign is fixed D3 with adaptive depth disabled, so the policy constant has no call site. |
 | 26 | 276 | 0.1799% | `033f622755ac` | `47dc8c6d9b36` | +14/-6 | PENDING |
 | 28 | 304 | 0.2525% | `6209702fba83` | `a6d69403cda0` | +6/-10 | PENDING |
 | 30 | 350 | 0.4202% | `32b94cb67d2f` | `948f58d0f63b` | +120/-9 | PENDING |

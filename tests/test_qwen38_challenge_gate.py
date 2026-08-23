@@ -330,6 +330,17 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
         "r20_kv_only_history",
         "r24_eval_ladder",
     }
+    assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3"
+    ) == {
+        "r08_device_draft",
+        "r10_compact_vocab",
+        "r18_gdn_decay_memo",
+        "r20_kv_only_history",
+        "r24_eval_ladder",
+        "r26_prefill_ladder_3",
+    }
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -360,6 +371,7 @@ def test_row_8_adapts_device_resident_draft_chaining_to_the_fixed_d3_route() -> 
         "row10_compact_vocab": False,
         "row18_gdn_decay_memo": False,
         "row24_eval_ladder": False,
+        "row26_prefill_ladder_3": False,
         "draft_core": "device",
         "source_rows": (8,),
     }
@@ -481,6 +493,45 @@ def test_row24_promotion_requires_eval_ladder_engagement() -> None:
 
     assert gate._candidate_engagement_errors(route, [zero], []) == [
         "row 24 target evaluation ladder did not execute"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
+def test_row_26_prefill_cadence_extends_retained_row_24() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3"
+    )
+
+    options = gate._route_execution_options(route)
+
+    assert options["row26_prefill_ladder_3"] is True
+    assert options["source_rows"] == (8, 10, 18, 20, 24, 26)
+
+
+def test_row26_promotion_requires_prefill_cadence_engagement() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3"
+    )
+    cumulative = {
+        "r18_gdn_decay_memo": {"memo_calls": 48},
+        "r20_kv_only_history": {"calls": 48, "packed_calls": 48},
+        "r24_eval_ladder": {"calls": 48},
+    }
+    zero = {
+        "route_id": route,
+        "engagement": {**cumulative, "r26_prefill_ladder_3": {"calls": 0}},
+    }
+    engaged = {
+        "route_id": route,
+        "engagement": {**cumulative, "r26_prefill_ladder_3": {"calls": 48}},
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 26 every-third-layer prefill ladder did not execute"
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:

@@ -193,6 +193,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r18_gdn_decay_memo",
         "r20_kv_only_history",
         "r24_eval_ladder",
+        "r26_prefill_ladder_3",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -217,6 +218,8 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(20)
     if "r24_eval_ladder" in features:
         source_rows.append(24)
+    if "r26_prefill_ladder_3" in features:
+        source_rows.append(26)
     return {
         "cache_route": (
             "kv_only_history"
@@ -228,6 +231,7 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "row18_gdn_decay_memo": "r18_gdn_decay_memo" in features,
         "row24_eval_ladder": "r24_eval_ladder" in features,
+        "row26_prefill_ladder_3": "r26_prefill_ladder_3" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -334,6 +338,18 @@ def _candidate_engagement_errors(
         )
         if calls <= 0:
             errors.append("row 24 target evaluation ladder did not execute")
+    if "r26_prefill_ladder_3" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r26_prefill_ladder_3") or {}).get(
+                    "calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 26 every-third-layer prefill ladder did not execute")
     return errors
 
 
@@ -343,6 +359,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_challenge_kernels import (
         qwen38_row24_eval_ladder_counter_snapshot,
+        qwen38_row26_prefill_ladder_counter_snapshot,
     )
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
@@ -353,6 +370,9 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
         "r24_eval_ladder": {"calls": qwen38_row24_eval_ladder_counter_snapshot()},
+        "r26_prefill_ladder_3": {
+            "calls": qwen38_row26_prefill_ladder_counter_snapshot()
+        },
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -474,6 +494,7 @@ def _run_arm(
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
         row18_gdn_decay_memo=bool(options["row18_gdn_decay_memo"]),
         row24_eval_ladder=bool(options["row24_eval_ladder"]),
+        row26_prefill_ladder_3=bool(options["row26_prefill_ladder_3"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

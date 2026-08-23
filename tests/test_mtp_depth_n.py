@@ -247,7 +247,7 @@ def test_row24_target_eval_ladder_uses_decode_rungs(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(
         kernels,
         "qwen38_row24_async_eval",
-        lambda value: calls.append(tuple(value.shape)),
+        lambda value, **_kwargs: calls.append(tuple(value.shape)),
     )
     model._mtplx_qwen38_row24_eval_ladder = True
 

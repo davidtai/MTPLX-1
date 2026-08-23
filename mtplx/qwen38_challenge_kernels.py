@@ -7,18 +7,25 @@ from typing import Any
 _DUAL_RMS_CONCAT_KERNEL = None
 qwen38_dual_norm_calls = 0
 qwen38_row24_eval_ladder_calls = 0
+qwen38_row26_prefill_ladder_calls = 0
 
 
-def qwen38_row24_async_eval(value: Any) -> None:
+def qwen38_row24_async_eval(value: Any, *, row26: bool = False) -> None:
     import mlx.core as mx
 
-    global qwen38_row24_eval_ladder_calls
+    global qwen38_row24_eval_ladder_calls, qwen38_row26_prefill_ladder_calls
     qwen38_row24_eval_ladder_calls += 1
+    if row26:
+        qwen38_row26_prefill_ladder_calls += 1
     mx.async_eval(value)
 
 
 def qwen38_row24_eval_ladder_counter_snapshot() -> int:
     return int(qwen38_row24_eval_ladder_calls)
+
+
+def qwen38_row26_prefill_ladder_counter_snapshot() -> int:
+    return int(qwen38_row26_prefill_ladder_calls)
 
 
 def qwen38_dual_rms_norm_concat(

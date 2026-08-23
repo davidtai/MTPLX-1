@@ -319,6 +319,7 @@ def install_qwen38_route(
     row10_compact_vocab: bool = False,
     row18_gdn_decay_memo: bool = False,
     row24_eval_ladder: bool = False,
+    row26_prefill_ladder_3: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -369,10 +370,21 @@ def install_qwen38_route(
 
     text = getattr(runtime.model, "language_model", runtime.model)
     text._mtplx_qwen38_row24_eval_ladder = bool(row24_eval_ladder)
+    text._mtplx_qwen38_row24_prefill_stride = (
+        3 if row26_prefill_ladder_3 else 4
+    )
     if row24_eval_ladder:
         route_features.append("r24_eval_ladder")
         kernel_ids.append("qwen38_row24_target_eval_ladder_v1")
         feature_receipt["r24_eval_ladder"] = {"active": 1}
+    if row26_prefill_ladder_3:
+        if not row24_eval_ladder:
+            raise Qwen38ContractError(
+                "Qwen 3.8 row 26 prefill cadence requires retained row 24"
+            )
+        route_features.append("r26_prefill_ladder_3")
+        kernel_ids.append("qwen38_row26_prefill_eval_every3_v1")
+        feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)
     if dual_norm:
         route_features.append("dual_norm")

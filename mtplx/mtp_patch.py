@@ -891,13 +891,24 @@ def inject_mtp_support(
             )
             row24_prefill = int(hidden_states.shape[1]) >= 512
             row24_decode = int(hidden_states.shape[1]) <= 9
+            row24_prefill_stride = int(
+                getattr(self, "_mtplx_qwen38_row24_prefill_stride", 4)
+            )
+            row26_ladder = row24_prefill_stride == 3
             for layer_index, (layer, layer_cache) in enumerate(
                 zip(inner.layers, cache)
             ):
                 mask = ssm_mask if layer.is_linear else fa_mask
                 hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
                 if row24_ladder and (
-                    (row24_prefill and (layer_index == 0 or layer_index % 4 == 3))
+                    (
+                        row24_prefill
+                        and (
+                            layer_index == 0
+                            or layer_index % row24_prefill_stride
+                            == row24_prefill_stride - 1
+                        )
+                    )
                     or (
                         row24_decode
                         and layer_index in {0, 1, 9, 19, 29, 39, 49, 57}
@@ -905,7 +916,10 @@ def inject_mtp_support(
                 ):
                     from .qwen38_challenge_kernels import qwen38_row24_async_eval
 
-                    qwen38_row24_async_eval(hidden_states)
+                    qwen38_row24_async_eval(
+                        hidden_states,
+                        row26=bool(row26_ladder and row24_prefill),
+                    )
 
             pre_norm = hidden_states
             variant = hidden_variant or getattr(self, "_mtplx_hidden_variant", "post_norm")
