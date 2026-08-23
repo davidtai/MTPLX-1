@@ -8,10 +8,12 @@ These measurements use the exact local Mia/Sero package at
 `54644e991039110f30140006c892c57734b9311e`.
 
 Source lineage is documented against MiaAI's DGX Spark launcher and Sero's
-packaged artifact. The related RTX PRO 6000 / SM120 community reference is
+packaged artifact, with the RTX6K Discord community
+(`https://discord.gg/X54jjmcxWJ`) included in the references. Its related
+RTX PRO 6000 / SM120 public wiki is pinned at
 `local-inference-lab/rtx6kpro@3633c2c6028056729a6612126e9afe05c2e3cf08`.
-It is included for cross-hardware comparison; these receipts are Apple Metal
-measurements and do not claim RTX PRO 6000 validation.
+These receipts are Apple Metal measurements and do not claim RTX PRO 6000
+validation.
 
 Every row is a separate process with an empty request cache. Model load is
 reported separately and is not included in TTFT. The request prompt ends with
