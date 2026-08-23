@@ -192,7 +192,6 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r10_compact_vocab",
         "r18_gdn_decay_memo",
         "r20_kv_only_history",
-        "r21_qk_rms_rope",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -215,8 +214,6 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(18)
     if "r20_kv_only_history" in features:
         source_rows.append(20)
-    if "r21_qk_rms_rope" in features:
-        source_rows.append(21)
     return {
         "cache_route": (
             "kv_only_history"
@@ -227,7 +224,6 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         "source_proposal": "source_proposal" in features,
         "row10_compact_vocab": "r10_compact_vocab" in features,
         "row18_gdn_decay_memo": "r18_gdn_decay_memo" in features,
-        "row21_qk_rms_rope": "r21_qk_rms_rope" in features,
         "draft_core": "device" if "r08_device_draft" in features else "stock",
         "source_rows": tuple(source_rows),
     }
@@ -322,28 +318,13 @@ def _candidate_engagement_errors(
             errors.append("row 20 K/V-only history path did not execute")
         if packed_calls <= 0:
             errors.append("row 20 packed K/V projection did not execute")
-    if "r21_qk_rms_rope" in features:
-        calls = sum(
-            int(
-                ((run.get("engagement") or {}).get("r21_qk_rms_rope") or {}).get(
-                    "calls",
-                    0,
-                )
-            )
-            for run in candidate_runs
-        )
-        if calls <= 0:
-            errors.append("row 21 fused Q/K RMSNorm+RoPE did not execute")
     return errors
 
 
 def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.draft_lm_head import qwen38_row10_compact_counter_snapshot
     from mtplx.gdn_capture import QWEN38_GDN_DECAY_MEMO_COUNTERS
-    from mtplx.qwen38_challenge_kernels import (
-        qwen38_dual_norm_counter_snapshot,
-        qwen38_qk_rms_rope_counter_snapshot,
-    )
+    from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
 
@@ -352,7 +333,6 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
-        "r21_qk_rms_rope": {"calls": qwen38_qk_rms_rope_counter_snapshot()},
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
@@ -473,7 +453,6 @@ def _run_arm(
         source_proposal=bool(options["source_proposal"]),
         row10_compact_vocab=bool(options["row10_compact_vocab"]),
         row18_gdn_decay_memo=bool(options["row18_gdn_decay_memo"]),
-        row21_qk_rms_rope=bool(options["row21_qk_rms_rope"]),
         source_artifact_path=source_artifact_path,
     )
     target_sampler = SamplerConfig(

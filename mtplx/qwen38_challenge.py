@@ -14,7 +14,6 @@ from typing import Any
 
 from .draft_lm_head import configure_qwen38_row10_compact_head
 from .gdn_capture import configure_qwen38_row18_gdn_decay_memo
-from .qwen38_challenge_kernels import configure_qwen38_row21_qk_rms_rope
 from .qwen38_source_proposal import configure_qwen38_source_proposal
 
 QWEN38_Q8_LINEAR_ATTN_LAYERS = (
@@ -319,7 +318,6 @@ def install_qwen38_route(
     source_proposal: bool = False,
     row10_compact_vocab: bool = False,
     row18_gdn_decay_memo: bool = False,
-    row21_qk_rms_rope: bool = False,
     source_artifact_path: Path | None = None,
     source_retain_control: bool = True,
 ) -> Qwen38RouteSpec | None:
@@ -367,19 +365,6 @@ def install_qwen38_route(
         route_features.append("r18_gdn_decay_memo")
         kernel_ids.append("qwen38_row18_gdn_neg_exp_a_log_memo_v1")
         feature_receipt["r18_gdn_decay_memo"] = row18_gdn_report
-
-    row21_report = configure_qwen38_row21_qk_rms_rope(
-        runtime.model,
-        active=bool(row21_qk_rms_rope),
-    )
-    if row21_qk_rms_rope:
-        if int(row21_report.get("active_modules", 0)) <= 0:
-            raise Qwen38ContractError(
-                "Qwen 3.8 row 21 Q/K RMSNorm+RoPE configured no modules"
-            )
-        route_features.append("r21_qk_rms_rope")
-        kernel_ids.append("qwen38_qk_rms_rope_bf16_h256_r64_v1")
-        feature_receipt["r21_qk_rms_rope"] = row21_report
 
     text = getattr(runtime.model, "language_model", runtime.model)
     text._mtplx_qwen38_dual_norm_concat = bool(dual_norm)
