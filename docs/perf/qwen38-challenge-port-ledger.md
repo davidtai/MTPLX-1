@@ -44,6 +44,8 @@ Means are two timed arms per route; peak is the maximum timed arm.
 | 10 | + compact proposal vocabulary | 765.005 | 55.240 | 25.149 | 40.411 | **+3.0411%** | **RETAINED** | same |
 | 13 | Optimized-Speed main + retained rows 8, 10 | 765.003 | 56.424 | 27.507 | 40.066 | - | cumulative control | `chrono-r13-gdn-inproj-s9-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 13 | + four-way GDN input projection through S=9 | 778.485 | 54.008 | 27.507 | 40.469 | **-0.9949%** | REJECTED, removed | same |
+| 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 
 Row 8's source-only four-way GDN projection fuse is separately proven a
 target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
@@ -51,7 +53,7 @@ target-shape no-op: its `S <= 2` eligibility never fires in the fixed-D3
 engagement and are explicitly invalidated rather than interpreted as timing
 results. Row 13's later `S <= 9` expansion is the first applicable form.
 
-Rows 8 and 10 are therefore part of every later timed control. Row 9 regressed
+Rows 8, 10, and 18 are therefore part of every later timed control. Row 9 regressed
 despite 82,880 timed kernel engagements and remains absent. Row 13 executed
 7,104 fused four-way projection calls in each timed candidate arm and was
 deterministic within route; its loss is measured, not a no-op or parity veto.
@@ -76,11 +78,11 @@ row or from the earlier bundle campaign.
 | 11 | 63 | 5.7425% | `62174dbbca88` | `40a33f553244` | +230/-16 | TARGET-SHAPE NO-OP/COVERED: adaptive depth is disabled by fixed D3, exact 16K conditioning warms the seed shape, and retained row 8 has no host-built first draft to early-flush. Focused evidence receipt pending. |
 | 12 | 70 | 0.8266% | `09eda55a08b1` | `96bb2be6fbe1` | +304/-24 | REMOVED NEXT ROW: row 13 deletes the prefix-replay tape and restores eager per-boundary checkpoints; never enters the cumulative target stack. |
 | 13 | 71 | 2.0944% | `3e157ad981bb` | `83215ffbd861` | +25/-305 | REJECTED: source S<=9 four-way GDN input fusion was adapted exactly to live group-32 fixed-D3 S=4 verification, engaged 7,104 times per timed arm, and regressed wall throughput 0.9949% on retained rows 8+10. Deterministic tie drift was allowed; implementation removed. Prefix-replay removal is moot because row 12 was not retained. |
-| 14 | 77 | 0.9839% | `d81964127281` | `0b3dba1ea446` | +304/-24 | ALREADY PRESENT: source reintroduces recurrent prefix replay for wide verifies; Optimized-Speed already runs the broader target `capture_commit` + `linear-gdn-from-conv-tape` boundary. The harness now records direct capture-commit time/strategy/core engagement; first post-row-13 receipt pending. |
+| 14 | 77 | 0.9839% | `d81964127281` | `0b3dba1ea446` | +304/-24 | ALREADY PRESENT: source reintroduces recurrent prefix replay for wide verifies; Optimized-Speed already runs the broader target `capture_commit` + `linear-gdn-from-conv-tape` boundary. Row-18 receipt directly records that strategy/core and 47.6 ms mean nonzero capture-commit work in both control and candidate arms. |
 | 15 | 95 | 3.7597% | `08897af24b57` | `8e803fafd868` | +216/-53 | TARGET-SHAPE NO-OP: every source code path is gated to verify widths 6...9 or raises an adaptive depth cap. This campaign is fixed D3, hence target verify S=4; widths 2...5 are explicitly unchanged by the source patch. |
 | 16 | 103 | 0.5808% | `8f41fa6d4f67` | `114e6ca13e03` | +149/-32 | ALREADY PRESENT: source separately compiles the GDN g/beta elementwise prologue and gated post-norm. Optimized-Speed compiles the entire route-specific S=4 target capture graph, which contains both regions; a nested subcompile adds no missing dispatch boundary. |
 | 17 | 126 | 7.5460% | `deb63ad0d170` | `2dbcb36ee10e` | +6/-14 | ALREADY PRESENT: manifest-only switch from BF16 to Q4/group-64 proposal head. Optimized-Speed loads Q4/group-64 before every arm, and retained row 10 further reduces it to the reachable compact vocabulary. |
-| 18 | 135 | 0.4535% | `b6ce964b16bb` | `2181386c97ac` | +324/-247 | STAGING: adaptive depth, S>=6 attention segmentation, and 512-token synthetic warming are inapplicable to fixed D3/exact 16K conditioning. The remaining transferable mechanism is per-layer memoization of input-independent `-exp(A_log)` for GDN decay; adapt and gate on rows 8+10. |
+| 18 | 135 | 0.4535% | `b6ce964b16bb` | `2181386c97ac` | +324/-247 | RETAINED: adaptive depth, S>=6 attention segmentation, and synthetic 512-token warming are inapplicable to fixed D3/exact 16K conditioning. The adapted per-layer input-independent `-exp(A_log)` GDN memo was exact, engaged 6,912 times per timed arm, and improved wall throughput 1.0970% on rows 8+10. |
 | 19 | 160 | 2.5391% | `1033e1ac5197` | `1a4f47311818` | +581/-97 | PENDING |
 | 20 | 180 | 0.9180% | `cf350293feb4` | `b9b4300e973d` | +144/-8 | PENDING |
 | 21 | 186 | 1.5222% | `4eb54489fb51` | `df0b66eded6c` | +228/-5 | PENDING |
