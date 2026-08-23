@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 QWEN38_SOURCE_HEAD_REPO = "amal-david/qwen38-mtp-head-q2-q4-rerank-v1"
 QWEN38_SOURCE_HEAD_FILENAME = "model.safetensors"
 QWEN38_SOURCE_HEAD_REVISION = "ae6282749a52e052496dd5300b4aa441df7301e8"
@@ -109,7 +108,7 @@ def validate_qwen38_source_artifact(path: Path) -> Qwen38SourceArtifact:
         if metadata.get("format") != QWEN38_SOURCE_HEAD_FORMAT:
             raise Qwen38SourceProposalError("source artifact format metadata mismatch")
         for name, (shape, dtype) in required.items():
-            if name not in handle.keys():
+            if name not in handle:
                 raise Qwen38SourceProposalError(f"source artifact is missing {name}")
             tensor = handle.get_slice(name)
             if tensor.get_shape() != shape or tensor.get_dtype() != dtype:
@@ -162,7 +161,7 @@ def _compact_source_rows() -> Any:
 
 
 def _require_affine_head(head: Any, *, bits: int) -> None:
-    import mlx.nn as nn
+    from mlx import nn
 
     if not isinstance(head, nn.QuantizedLinear):
         raise Qwen38SourceProposalError("proposal rerank head must be quantized")
@@ -748,7 +747,7 @@ class _CountedDense:
 
 
 def _dense_linear(weight: Any, *, counter: str) -> Any:
-    import mlx.nn as nn
+    from mlx import nn
 
     layer = nn.Linear(int(weight.shape[1]), int(weight.shape[0]), bias=False)
     layer.weight = weight
@@ -759,7 +758,7 @@ def _candidate_mtp(text: Any, tensors: dict[str, Any]) -> Any:
     """Instantiate the source Q4 body and install its BF16 precision islands."""
 
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
 
     control = text.mtp
     try:
@@ -983,6 +982,7 @@ def configure_qwen38_source_proposal(
         text._mtplx_draft_lm_head = text._mtplx_qwen38_source_draft_head
         if not retain_control:
             import gc
+
             import mlx.core as mx
 
             del text._mtplx_qwen38_control_mtp

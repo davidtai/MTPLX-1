@@ -115,11 +115,15 @@ hash difference.
   `c7-qmv-g32-g64-on-c3-c6-python16384in-1024out-t1-abba-2026-08-23.json`.
 - Retained S4:
   `c8-source-proposal-on-c3-c6-c7-python16384in-1024out-t1-abba-2026-08-23.json`.
+- Production S4 control-release verification:
+  `final-s4-production-route-verify-2026-08-23.md` (25.041 GiB peak with the
+  BF16 control body and full Q4 control head released before generation).
 - Rejections: the corrected `c1-packed-qkv`, `c2-gdn-projection-pairs`,
   `chrono-r21`, and `chrono-r45` 16K receipts in the same directory.
 - QMV numerical tie audit:
-  `qmv-final-g32-g64-real-model-numeric-parity-2026-08-23.json`. QMV was
-  rejected for performance, not parity.
+  `qmv-final-g32-g64-real-model-numeric-parity-2026-08-23.json`. This records
+  the earlier uncorrected QMV attempt; it was rejected for performance, not
+  parity. Corrected, group-aware C7 is retained by the receipt above.
 - Static benchmark contract:
   `receipts/qwen38-challenge-port/control-contract-2026-08-23.md`.
 

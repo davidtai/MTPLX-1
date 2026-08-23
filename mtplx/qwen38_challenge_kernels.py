@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 _QMV_INPUTS_PER_GROUP = {
     2: 2,
     3: 3,
