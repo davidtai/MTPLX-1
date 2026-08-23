@@ -311,6 +311,15 @@ def test_route_validation_accepts_the_single_cumulative_winner_stack() -> None:
     assert gate._validate_route_id(
         "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo"
     ) == {"r08_device_draft", "r10_compact_vocab", "r18_gdn_decay_memo"}
+    assert gate._validate_route_id(
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history"
+    ) == {
+        "r08_device_draft",
+        "r10_compact_vocab",
+        "r18_gdn_decay_memo",
+        "r20_kv_only_history",
+    }
 
     with pytest.raises(ValueError, match="unknown route features"):
         gate._validate_route_id("kv_only_history+dual_norm+qmv_final")
@@ -382,6 +391,46 @@ def test_row18_promotion_requires_memoized_decay_engagement() -> None:
 
     assert gate._candidate_engagement_errors(route, [zero], []) == [
         "row 18 GDN decay memo did not execute"
+    ]
+    assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
+
+
+def test_row_20_kv_only_history_extends_rows_8_10_and_18() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history"
+    )
+
+    options = gate._route_execution_options(route)
+
+    assert options["cache_route"] == "kv_only_history"
+    assert options["source_rows"] == (8, 10, 18, 20)
+
+
+def test_row20_promotion_requires_kv_only_history_engagement() -> None:
+    gate = _module()
+    route = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history"
+    )
+    zero = {
+        "route_id": route,
+        "engagement": {
+            "r18_gdn_decay_memo": {"memo_calls": 48},
+            "r20_kv_only_history": {"calls": 0},
+        },
+    }
+    engaged = {
+        "route_id": route,
+        "engagement": {
+            "r18_gdn_decay_memo": {"memo_calls": 48},
+            "r20_kv_only_history": {"calls": 48},
+        },
+    }
+
+    assert gate._candidate_engagement_errors(route, [zero], []) == [
+        "row 20 K/V-only history path did not execute"
     ]
     assert gate._candidate_engagement_errors(route, [engaged], [zero]) == []
 def test_promotion_gate_is_strictly_above_point_zero_five_and_clean() -> None:

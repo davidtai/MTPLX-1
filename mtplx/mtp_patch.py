@@ -22,6 +22,17 @@ from .expert_layout import num_experts_from_config, stack_numbered_experts
 
 logger = logging.getLogger(__name__)
 
+QWEN38_KV_ONLY_HISTORY_COUNTERS: dict[str, int] = {
+    "calls": 0,
+    "tokens": 0,
+    "packed_calls": 0,
+    "stock_projection_calls": 0,
+}
+
+
+def qwen38_kv_only_history_counter_snapshot() -> dict[str, int]:
+    return dict(QWEN38_KV_ONLY_HISTORY_COUNTERS)
+
 _MTP_QUANT_POLICY_ALIASES = {
     "prequantized-int4": "cyankiwi",
 }
@@ -1200,8 +1211,57 @@ def inject_mtp_support(
             attention = layer.self_attn
             normed = layer.input_layernorm(mixed)
             batch, length, _ = normed.shape
-            keys = attention.k_proj(normed)
-            values = attention.v_proj(normed)
+            QWEN38_KV_ONLY_HISTORY_COUNTERS["calls"] += 1
+            QWEN38_KV_ONLY_HISTORY_COUNTERS["tokens"] += int(length)
+
+            k_proj = attention.k_proj
+            v_proj = attention.v_proj
+            packed = getattr(attention, "_mtplx_qwen38_packed_kv", None)
+            if packed is None and all(
+                isinstance(module, nn.QuantizedLinear)
+                for module in (k_proj, v_proj)
+            ):
+                compatible = (
+                    int(k_proj.bits) == int(v_proj.bits)
+                    and int(k_proj.group_size) == int(v_proj.group_size)
+                    and str(k_proj.mode) == str(v_proj.mode) == "affine"
+                    and tuple(k_proj.weight.shape[1:])
+                    == tuple(v_proj.weight.shape[1:])
+                    and tuple(k_proj.scales.shape[1:])
+                    == tuple(v_proj.scales.shape[1:])
+                    and tuple(k_proj.biases.shape[1:])
+                    == tuple(v_proj.biases.shape[1:])
+                )
+                if compatible:
+                    packed = (
+                        mx.concatenate([k_proj.weight, v_proj.weight], axis=0),
+                        mx.concatenate([k_proj.scales, v_proj.scales], axis=0),
+                        mx.concatenate([k_proj.biases, v_proj.biases], axis=0),
+                        int(k_proj.weight.shape[0]),
+                        int(k_proj.group_size),
+                        int(k_proj.bits),
+                        str(k_proj.mode),
+                    )
+                    mx.eval(*packed[:3])
+                    attention._mtplx_qwen38_packed_kv = packed
+            if packed is not None:
+                weight, scales, biases, split_at, group_size, bits, mode = packed
+                kv = mx.quantized_matmul(
+                    normed,
+                    weight,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                )
+                keys, values = mx.split(kv, [split_at], axis=-1)
+                QWEN38_KV_ONLY_HISTORY_COUNTERS["packed_calls"] += 1
+            else:
+                keys = k_proj(normed)
+                values = v_proj(normed)
+                QWEN38_KV_ONLY_HISTORY_COUNTERS["stock_projection_calls"] += 1
             keys = attention.k_norm(
                 keys.reshape(
                     batch,

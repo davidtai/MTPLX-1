@@ -282,3 +282,35 @@ def test_one_layer_kv_only_history_append_matches_control_cache(tmp_path) -> Non
     assert candidate_cache[0].offset == control_cache[0].offset == 4
     for candidate, control in zip(candidate_cache[0].state, control_cache[0].state):
         assert mx.array_equal(candidate, control).item()
+
+
+def test_qwen38_kv_only_history_packs_quantized_kv_projection(tmp_path) -> None:
+    from mlx_lm.models.qwen3_5 import TextModel
+
+    from mtplx.mtp_patch import QWEN38_KV_ONLY_HISTORY_COUNTERS
+
+    args = _tiny_text_model_args()
+    config = _write_tiny_mtp_sidecar(tmp_path, args, n_layers=1)
+    model = TextModel(args)
+    contract = MTPContract(
+        mtp_quant_bits=4,
+        mtp_quant_group_size=32,
+        mtp_quant_policy="all",
+    )
+    assert inject_mtp_support(model, tmp_path, config, contract=contract) is True
+
+    before = dict(QWEN38_KV_ONLY_HISTORY_COUNTERS)
+    hidden = mx.random.normal((1, 4, args.hidden_size))
+    tokens = mx.array([[1, 2, 3, 4]])
+    cache = model.make_mtp_cache()
+    root = model.mtp_update_cache_kv_only_history(hidden, tokens, mtp_cache=cache)
+    mx.eval(root)
+
+    assert QWEN38_KV_ONLY_HISTORY_COUNTERS["calls"] - before["calls"] == 1
+    assert QWEN38_KV_ONLY_HISTORY_COUNTERS["tokens"] - before["tokens"] == 4
+    assert QWEN38_KV_ONLY_HISTORY_COUNTERS["packed_calls"] - before["packed_calls"] == 1
+    assert (
+        QWEN38_KV_ONLY_HISTORY_COUNTERS["stock_projection_calls"]
+        - before["stock_projection_calls"]
+        == 0
+    )

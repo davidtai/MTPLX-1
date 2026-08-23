@@ -191,6 +191,7 @@ def _validate_route_id(route_id: str) -> set[str]:
         "r08_device_draft",
         "r10_compact_vocab",
         "r18_gdn_decay_memo",
+        "r20_kv_only_history",
     }
     unknown = features - allowed
     if not features or unknown:
@@ -211,9 +212,13 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
         source_rows.append(10)
     if "r18_gdn_decay_memo" in features:
         source_rows.append(18)
+    if "r20_kv_only_history" in features:
+        source_rows.append(20)
     return {
         "cache_route": (
-            "kv_only_history" if "kv_only_history" in features else "control"
+            "kv_only_history"
+            if {"kv_only_history", "r20_kv_only_history"} & features
+            else "control"
         ),
         "dual_norm": "dual_norm" in features,
         "source_proposal": "source_proposal" in features,
@@ -294,6 +299,18 @@ def _candidate_engagement_errors(
         )
         if memo_calls <= 0:
             errors.append("row 18 GDN decay memo did not execute")
+    if "r20_kv_only_history" in features:
+        calls = sum(
+            int(
+                ((run.get("engagement") or {}).get("r20_kv_only_history") or {}).get(
+                    "calls",
+                    0,
+                )
+            )
+            for run in candidate_runs
+        )
+        if calls <= 0:
+            errors.append("row 20 K/V-only history path did not execute")
     return errors
 
 
@@ -302,11 +319,13 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     from mtplx.gdn_capture import QWEN38_GDN_DECAY_MEMO_COUNTERS
     from mtplx.qwen38_challenge_kernels import qwen38_dual_norm_counter_snapshot
     from mtplx.qwen38_source_proposal import qwen38_source_counter_snapshot
+    from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
         "r10_compact_vocab": {"calls": qwen38_row10_compact_counter_snapshot()},
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
+        "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
         "source_proposal": qwen38_source_counter_snapshot(),
     }
 
