@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -640,6 +641,17 @@ def test_row53_isolated_children_set_candidate_and_unset_control_env() -> None:
     assert candidate["KEEP"] == "yes"
     assert candidate["MLX_MAX_MB_PER_BUFFER"] == "512"
     assert candidate["MLX_MAX_OPS_PER_BUFFER"] == "50"
+
+
+def test_row53_isolated_gate_runs_as_a_direct_script_outside_repo() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ISOLATED_SCRIPT), "--help"],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_row21_promotion_requires_qk_fusion_engagement() -> None:

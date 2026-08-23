@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
+import importlib.util
 import json
 import os
 import secrets
@@ -16,10 +17,20 @@ import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from scripts import qwen38_challenge_port_gate as gate
-
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+_GATE_SCRIPT = ROOT / "scripts/qwen38_challenge_port_gate.py"
+_GATE_SPEC = importlib.util.spec_from_file_location(
+    "qwen38_challenge_port_gate",
+    _GATE_SCRIPT,
+)
+if _GATE_SPEC is None or _GATE_SPEC.loader is None:
+    raise RuntimeError(f"cannot load gate module: {_GATE_SCRIPT}")
+gate = importlib.util.module_from_spec(_GATE_SPEC)
+_GATE_SPEC.loader.exec_module(gate)
+
+
 BUFFER_ENV = ("MLX_MAX_MB_PER_BUFFER", "MLX_MAX_OPS_PER_BUFFER")
 GUARD_FD_ENV = "MTPLX_GUARD_ATTEST_FD"
 GUARD_NONCE_ENV = "MTPLX_GUARD_ATTEST_NONCE"
