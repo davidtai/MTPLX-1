@@ -848,7 +848,6 @@ def nax_qmm_m8(
 _QWEN38_M8_NAX_ISLAND_ACTIVE = False
 _QWEN38_M8_NAX_ISLAND_SHAPES = frozenset(
     {
-        (5_120, 6_144),
         (6_144, 5_120),
     }
 )

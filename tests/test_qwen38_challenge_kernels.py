@@ -11,11 +11,65 @@ from mtplx.gdn_capture import (
 )
 from mtplx.qwen38_challenge_kernels import (
     configure_qwen38_dflash_row24_eval_ladder,
+    configure_qwen38_dflash_m8_nax_island,
     configure_qwen38_row21_qk_rms_rope,
     configure_qwen38_row24_qk_length_limit,
     qwen38_dual_rms_norm_concat,
     qwen38_qk_rms_rope,
 )
+
+
+class _FakeQuantizedProjection(dict):
+    bits = 4
+    group_size = 32
+
+    def __init__(self, packed_shape: tuple[int, int]) -> None:
+        super().__init__(weight=SimpleNamespace(shape=packed_shape))
+
+
+def _qwen38_full_attention() -> SimpleNamespace:
+    return SimpleNamespace(
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        rope=SimpleNamespace(
+            dims=64,
+            base=10_000_000.0,
+            scale=1.0,
+            traditional=False,
+        ),
+        q_norm=SimpleNamespace(eps=1e-6),
+        k_norm=SimpleNamespace(eps=1e-6),
+        q_proj=_FakeQuantizedProjection((12_288, 640)),
+        o_proj=_FakeQuantizedProjection((5_120, 768)),
+    )
+
+
+def test_dflash_m8_nax_island_selects_only_measured_live_o_projection(
+    monkeypatch,
+) -> None:
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=_qwen38_full_attention())
+                for _ in range(16)
+            ]
+        )
+    )
+    selected = {}
+    monkeypatch.setattr(
+        "mtplx.nax_verify.configure_qwen38_m8_nax_island",
+        lambda *, active: selected.update(active=active)
+        or {"active": active, "width": 8, "shapes": [[6144, 5120]]},
+    )
+
+    report = configure_qwen38_dflash_m8_nax_island(model, active=True)
+
+    assert selected == {"active": True}
+    assert report["eligible_attention_modules"] == 16
+    assert report["validated_projections"] == 32
+    assert report["eligible_projections"] == 16
+    assert report["shapes"] == [[6144, 5120]]
 
 
 def test_dual_rms_norm_concat_matches_two_stock_norms() -> None:

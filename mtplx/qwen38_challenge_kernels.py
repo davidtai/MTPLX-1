@@ -222,17 +222,26 @@ def configure_qwen38_dflash_m8_nax_island(
             projection_shapes.append(
                 (int(weight.shape[1]) * 32 // bits, int(weight.shape[0]))
             )
-    expected = [(5_120, 6_144), (6_144, 5_120)] * 16
+    expected = [(5_120, 12_288), (6_144, 5_120)] * 16
     if len(eligible) != 16 or sorted(projection_shapes) != sorted(expected):
-        raise ValueError("Qwen 3.8 M8 NAX island projection geometry changed")
+        raise ValueError(
+            "Qwen 3.8 M8 NAX island projection geometry changed: "
+            f"attention={len(attention_modules)}, eligible={len(eligible)}, "
+            f"shapes={sorted(set(projection_shapes))}, "
+            f"shape_counts={[(shape, projection_shapes.count(shape)) for shape in sorted(set(projection_shapes))]}"
+        )
 
     from mtplx.nax_verify import configure_qwen38_m8_nax_island
 
     report = configure_qwen38_m8_nax_island(active=active)
+    routed_shapes = {tuple(shape) for shape in report["shapes"]}
     return {
         **report,
         "eligible_attention_modules": len(eligible),
-        "eligible_projections": len(projection_shapes),
+        "validated_projections": len(projection_shapes),
+        "eligible_projections": sum(
+            shape in routed_shapes for shape in projection_shapes
+        ),
     }
 
 

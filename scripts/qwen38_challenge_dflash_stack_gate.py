@@ -265,9 +265,10 @@ def _engagement_exact(
         return all(not route(row) for row in by_variant["control"]) and all(
             bool(route(row).get("active"))
             and int(route(row).get("width", 0)) == 8
-            and route(row).get("shapes") == [[5120, 6144], [6144, 5120]]
+            and route(row).get("shapes") == [[6144, 5120]]
             and int(route(row).get("eligible_attention_modules", 0)) == 16
-            and int(route(row).get("eligible_projections", 0)) == 32
+            and int(route(row).get("validated_projections", 0)) == 32
+            and int(route(row).get("eligible_projections", 0)) == 16
             and int(
                 row.get("adaptive_metrics", {})
                 .get("cycles_by_block", {})
