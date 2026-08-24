@@ -86,8 +86,8 @@ def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
         max_block_tokens: int = 5
 
     root = _bundle(tmp_path, monkeypatch)
-    monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-    monkeypatch.delenv("MLX_MAX_OPS_PER_BUFFER", raising=False)
+    monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "512")
+    monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "50")
     _isolate_turbo_environment(monkeypatch)
     calls: list[tuple] = []
     target_runtime = SimpleNamespace(
@@ -147,24 +147,24 @@ def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
     assert runtime.draft_model.capabilities.default_block_tokens == 8
     assert runtime.draft_model.capabilities.max_block_tokens == 8
     assert runtime.qwen38_feature_receipt == {"retained": True}
-    assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
-    assert "MLX_MAX_OPS_PER_BUFFER" not in os.environ
+    assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "512"
+    assert os.environ["MLX_MAX_OPS_PER_BUFFER"] == "50"
     assert os.environ["MTPLX_SUSTAINED_PREFILL"] == "1"
     assert os.environ["MTPLX_GQA_PACKED_SDPA"] == "1"
 
 
-def test_load_rejects_retired_row53_environment_override(
+def test_load_requires_tuned_row53_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _bundle(tmp_path, monkeypatch)
-    monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "512")
-    monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "50")
+    monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+    monkeypatch.delenv("MLX_MAX_OPS_PER_BUFFER", raising=False)
 
-    with pytest.raises(RuntimeError, match="must be unset before importing MLX"):
+    with pytest.raises(RuntimeError, match="must be 512 and 50 before importing MLX"):
         load_dflash2_bundle(root)
 
 
-def test_package_bootstrap_selects_stock_row53_for_dflash2_model(
+def test_package_bootstrap_selects_tuned_row53_for_dflash2_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _bundle(tmp_path, monkeypatch)
@@ -176,8 +176,8 @@ def test_package_bootstrap_selects_stock_row53_for_dflash2_model(
     assert mtplx._bootstrap_dflash2_command_buffer_environment(
         ["mtplx", "serve", "--model", str(root)]
     ) is True
-    assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
-    assert "MLX_MAX_OPS_PER_BUFFER" not in os.environ
+    assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "512"
+    assert os.environ["MLX_MAX_OPS_PER_BUFFER"] == "50"
     assert os.environ["MTPLX_SUSTAINED_PREFILL"] == "1"
     assert os.environ["MTPLX_GQA_PACKED_SDPA"] == "1"
     assert os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] == "1"
@@ -197,8 +197,8 @@ def test_measured_context_route_splits_only_the_supported_phase_controls() -> No
     assert backend.qwen38_dflash_context_route(16_384) == {
         "route_id": "long_ge16384",
         "adaptive_active": False,
-        "row21_active": False,
-        "row24_prefill_active": False,
+        "row21_active": True,
+        "row24_prefill_active": True,
         "row24_decode_active": True,
         "row48_prefill_active": True,
         "row48_decode_active": True,
@@ -263,9 +263,9 @@ def test_context_route_is_applied_to_every_phase_control(
     )
 
     assert calls == {
-        "row21": [(True,), (False,)],
+        "row21": [(True,), (True,)],
         "row24_qk": [(True, 32), (True, 32)],
-        "row24": [(True, True), (False, True)],
+        "row24": [(True, True), (True, True)],
         "row48": [(True, True), (True, True)],
         "adaptive": [(True,), (False,)],
         "row50": [(True,), (True,)],

@@ -260,14 +260,13 @@ def load_dflash2_bundle(
     # MLX reads these once when its Metal device is constructed.  The package
     # bootstrap handles CLI/server argv before importing MLX; direct Python
     # callers must establish the same process contract before importing MTPLX.
-    retired_environment = (
-        "MLX_MAX_MB_PER_BUFFER",
-        "MLX_MAX_OPS_PER_BUFFER",
-    )
-    if any(name in os.environ for name in retired_environment):
+    if (
+        os.environ.get("MLX_MAX_MB_PER_BUFFER") != "512"
+        or os.environ.get("MLX_MAX_OPS_PER_BUFFER") != "50"
+    ):
         raise RuntimeError(
             "DFlash2 row-53 MLX_MAX_MB_PER_BUFFER and MLX_MAX_OPS_PER_BUFFER "
-            "must be unset before importing MLX"
+            "must be 512 and 50 before importing MLX"
         )
     from mtplx.profiles import apply_profile_env
 
@@ -419,10 +418,10 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             runtime.target_runtime, active=True
         ),
         "r53_command_buffers": {
-            "active": False,
+            "active": True,
             "installed": True,
-            "max_mb_per_buffer": None,
-            "max_ops_per_buffer": None,
+            "max_mb_per_buffer": 512,
+            "max_ops_per_buffer": 50,
             "process_latched": True,
         },
         "native_mtp_release": {
@@ -443,8 +442,8 @@ def qwen38_dflash_context_route(prompt_tokens: int) -> dict[str, Any]:
     return {
         "route_id": "long_ge16384" if long_context else "short_lt16384",
         "adaptive_active": not long_context,
-        "row21_active": not long_context,
-        "row24_prefill_active": not long_context,
+        "row21_active": True,
+        "row24_prefill_active": True,
         "row24_decode_active": True,
         "row48_prefill_active": True,
         "row48_decode_active": True,

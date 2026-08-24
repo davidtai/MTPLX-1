@@ -30,7 +30,9 @@ measured row-53 command-buffer environment. Direct Python embedding must set
 
 DFlash2 defaults are sampler `temperature=1.0`, `top_p=0.95`, `top_k=20`, and
 physical block `8`. The retained adaptive row-15 policy selects physical blocks
-from `1` through `8`; `--depth` or `--draft-block-size` changes the ceiling.
+from `1` through `8` below 16K input tokens; the measured long-context route
+uses fixed M=8 at 16K and above. `--depth` or `--draft-block-size` changes the
+ceiling.
 `--generation-mode ar` or `--no-mtp` deliberately routes to the bundle's
 `target/` model with MTP disabled; it never loads the DFlash2 draft or silently
 falls back to native MTP.

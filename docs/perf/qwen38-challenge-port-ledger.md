@@ -316,23 +316,23 @@ same exact diff. Every row below now has a final individual disposition.
 
 All 54 rows have a direct measured or source-causal disposition. The branch
 ships the target-only Optimized-Speed model, pinned W4/group-64 DFlash draft,
-row 50, row 24 decode, row 26, both row 48 phases, and the final M5--M8 kernel
-winners through the first-class bundle/runtime entry point. The earlier final
+row 21, both row-24 phases, row 26, both row-48 phases, row 50, tuned row-53
+command buffers, and the final M5--M8 kernel winners through the first-class
+bundle/runtime entry point. The earlier final
 stack reached 772.201 prefill tok/s, 70.045 decode tok/s, 35.869 s wall, and
 35.349 GB peak at 16K; its receipt remains
 `final-dflash2-phase-corrected-stack-vs-post54-control-python16384in-1024out-t1-isolated-abba-2026-08-24.json`.
 
 The subsequent nine-mechanism phase re-gate measured every relevant live path
-at both 1K and 16K, for 18 four-arm ABBA runs. At 16K the assembled removal of
-adaptive rows 11+15, row 21, row 24 prefill, and tuned row-53 command buffers
-improved prefill 750.765→755.688 tok/s, decode 69.109→69.332 tok/s, and wall
-36.671→36.474 s (**+0.5404%**) while reducing peak memory 35.349→26.564 GB.
-The same phase split with tuned row-53 buffers regressed wall 0.1563%, so row 53
-is not separable from the winning assembly. Because MLX latches row 53 at
-process startup, stock buffers are selected globally under the agreed 16K
-decision rule. At 1K that process-wide choice costs 0.3533% wall time; removing
-row 50 at the same time amplified the regression to 1.6078%, so row 50 remains
-active at every context. Below 16K, adaptive row 15, row 21, and row 24 prefill
-also remain active. The full 18-row table and assembly receipts are in
+at both 1K and 16K, for 18 four-arm ABBA runs. A first wall-only assembly
+removed adaptive rows 11+15, row 21, row 24 prefill, and tuned row-53 command
+buffers, but reached only 69.332 decode tok/s and therefore failed the final
+throughput target. The final phase-correct assembly keeps every retained
+prefill/decode winner and tuned 512 MiB / 50-op row-53 buffers, disabling only
+adaptive drafting at 16K and above. Its fresh matched gate improved prefill
+751.111→751.675 tok/s, decode 71.279→71.384 tok/s, and wall
+36.231→36.181 s (**+0.1371%**) at 35.349→35.352 GB peak. Adaptive row 15
+remains active below 16K. The full phase table and assembly receipts are in
 `docs/perf/qwen38-challenge-performance-tables.md` and
-`docs/perf/receipts/qwen38-challenge-port/phase-split-*.json`.
+`docs/perf/receipts/qwen38-challenge-port/`, including
+`final-ge70-adaptive-off-vs-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json`.

@@ -34,10 +34,9 @@ def _bootstrap_dflash2_command_buffer_environment(argv: list[str] | None = None)
     apply_profile_env("turbo")
     # The external DFlash draft replaces every native/source MTP proposal path.
     os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] = "1"
-    # The final 16K gate retired row 53. MLX reads these once, so the measured
-    # stock policy must be selected before any MLX import.
-    os.environ.pop("MLX_MAX_MB_PER_BUFFER", None)
-    os.environ.pop("MLX_MAX_OPS_PER_BUFFER", None)
+    # MLX reads row 53 once, so select the measured tuned policy before import.
+    os.environ["MLX_MAX_MB_PER_BUFFER"] = "512"
+    os.environ["MLX_MAX_OPS_PER_BUFFER"] = "50"
     return True
 
 
