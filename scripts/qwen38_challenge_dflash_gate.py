@@ -26,7 +26,6 @@ from scripts.qwen38_challenge_port_gate import (  # noqa: E402
     DEFAULT_LOCK,
     DEFAULT_MODEL,
     DEFAULT_PROMPT,
-    PROMOTION_THRESHOLD_PCT,
     _context_prompt_to_token_count,
     _load_optimized_speed_stack,
     _projection_counter_snapshot,
@@ -40,6 +39,7 @@ from scripts.qwen38_challenge_port_gate import (  # noqa: E402
 DFLASH_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 DFLASH_SOURCE_COMMIT = "54644e991039110f30140006c892c57734b9311e"
+PROMOTION_THRESHOLD_PCT = 0.05
 STATIC_WIDTH = 8
 FULL_RETAINED_ROUTE = (
     "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
@@ -217,10 +217,6 @@ def _run_mtp_arm(
     return arm
 
 
-def _mean(rows: list[dict[str, Any]], key: str) -> float:
-    return sum(float(row[key]) for row in rows) / len(rows)
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
@@ -232,6 +228,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--warmup-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--engine",
+        choices=("mtp_fixed_d3", "dflash2"),
+        required=True,
+        help="Run one isolated conditioner plus one timed arm.",
+    )
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -274,14 +276,18 @@ def main() -> int:
     )
 
     from mtplx.artifacts import load_config
-    from mtplx.benchmarks.dflash2_runtime import bind_mtplx_dflash2_bundle
-    from mtplx.benchmarks.runners.dflash2_depth_sweep import (
-        build_fixed_dflash_runtime_context,
-    )
 
     config = load_config(model_path)
-    bundle = bind_mtplx_dflash2_bundle(runtime, str(draft_path))
-    runtime_context = build_fixed_dflash_runtime_context()
+    bundle = None
+    runtime_context = None
+    if args.engine == "dflash2":
+        from mtplx.benchmarks.dflash2_runtime import bind_mtplx_dflash2_bundle
+        from mtplx.benchmarks.runners.dflash2_depth_sweep import (
+            build_fixed_dflash_runtime_context,
+        )
+
+        bundle = bind_mtplx_dflash2_bundle(runtime, str(draft_path))
+        runtime_context = build_fixed_dflash_runtime_context()
     prompt_id, instruction = _read_prompt(args.prompt_file)
     prompt_text, prompt_ids = _context_prompt_to_token_count(
         runtime.tokenizer,
@@ -291,8 +297,8 @@ def main() -> int:
     )
     del prompt_text
 
-    def run(engine: str, tokens: int) -> dict[str, Any]:
-        if engine == "mtp_fixed_d3":
+    def run(tokens: int) -> dict[str, Any]:
+        if args.engine == "mtp_fixed_d3":
             return _run_mtp_arm(
                 runtime,
                 config,
@@ -302,6 +308,8 @@ def main() -> int:
                 seed=args.seed,
                 row36_artifact=row36_artifact,
             )
+        if bundle is None or runtime_context is None:
+            raise RuntimeError("DFlash2 isolated child did not construct its bundle")
         return _run_dflash_arm(
             bundle,
             config,
@@ -313,49 +321,12 @@ def main() -> int:
             row36_artifact=row36_artifact,
         )
 
-    warmups = [
-        run("mtp_fixed_d3", args.warmup_tokens),
-        run("dflash2", args.warmup_tokens),
-    ]
-    order = ["mtp_fixed_d3", "dflash2", "dflash2", "mtp_fixed_d3"]
-    arms = [run(engine, args.max_tokens) for engine in order]
-    by_engine = {
-        engine: [arm for arm in arms if arm["engine"] == engine]
-        for engine in ("mtp_fixed_d3", "dflash2")
-    }
-    deterministic = {
-        engine: len({arm["token_hash"] for arm in rows}) == 1
-        for engine, rows in by_engine.items()
-    }
-    generated_exact = all(
-        int(arm["generated_tokens"]) == args.max_tokens for arm in arms
-    )
-    dflash_contract = all(
-        int(arm["requested_width"]) == STATIC_WIDTH
-        and int(arm["effective_width"]) == STATIC_WIDTH
-        and not bool(arm["fallback_ar"])
-        for arm in by_engine["dflash2"]
-    )
-    mean_wall = {
-        engine: _mean(rows, "wall_s") for engine, rows in by_engine.items()
-    }
-    improvement_pct = (
-        mean_wall["mtp_fixed_d3"] / mean_wall["dflash2"] - 1.0
-    ) * 100.0
-    summary = {
-        engine: {
-            "prefill_tps": _mean(rows, "prefill_tps"),
-            "decode_tps": _mean(rows, "decode_tps"),
-            "peak_memory_gb": _mean(rows, "peak_memory_gb"),
-            "wall_s": mean_wall[engine],
-        }
-        for engine, rows in by_engine.items()
-    }
-    exact = bool(generated_exact and dflash_contract and all(deterministic.values()))
-    promoted = bool(exact and improvement_pct > PROMOTION_THRESHOLD_PCT)
+    warmup = run(args.warmup_tokens)
+    arm = run(args.max_tokens)
     receipt = {
-        "kind": "qwen38_challenge_dflash2_item55_abba",
+        "kind": "qwen38_challenge_dflash2_item55_isolated_arm",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "engine": args.engine,
         "model": str(model_path),
         "dflash": {
             "repo_id": DFLASH_REPO,
@@ -376,7 +347,6 @@ def main() -> int:
             "top_k": 20,
             "seed": args.seed,
             "conditioning_tokens_per_engine": args.warmup_tokens,
-            "timed_order": order,
         },
         "optimized_speed_stack": optimized_stack,
         "retained_route": FULL_RETAINED_ROUTE,
@@ -391,41 +361,28 @@ def main() -> int:
             capture_output=True,
             text=True,
         ).stdout.strip(),
-        "warmups": warmups,
-        "arms": arms,
-        "summary": summary,
-        "correctness": {
-            "per_engine_deterministic": deterministic,
-            "generated_count_exact": generated_exact,
-            "dflash_width_and_fallback_exact": dflash_contract,
-            "cross_engine_token_exact": (
-                by_engine["mtp_fixed_d3"][0]["token_hash"]
-                == by_engine["dflash2"][0]["token_hash"]
-            ),
-            "cross_engine_token_exact_required": False,
-            "exact": exact,
-        },
-        "candidate_improvement_pct": improvement_pct,
-        "promotion": {
-            "threshold_pct": PROMOTION_THRESHOLD_PCT,
-            "passed": promoted,
-            "reason": (
-                "strict wall improvement above threshold"
-                if promoted
-                else "correctness or strict wall threshold failed"
-            ),
-        },
+        "warmup": warmup,
+        "arm": arm,
         "gpu_lock_scope": str(args.lock),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    print(json.dumps(receipt["summary"], indent=2, sort_keys=True))
-    print(f"candidate_improvement_pct={improvement_pct:.6f}")
-    print(f"promotion_passed={promoted}")
+    print(
+        json.dumps(
+            {
+                "engine": args.engine,
+                "prefill_tps": arm["prefill_tps"],
+                "decode_tps": arm["decode_tps"],
+                "peak_memory_gb": arm["peak_memory_gb"],
+                "wall_s": arm["wall_s"],
+            },
+            sort_keys=True,
+        )
+    )
     if lock_handle is not None:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         lock_handle.close()
-    return 0 if exact else 2
+    return 0
 
 
 if __name__ == "__main__":
