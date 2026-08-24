@@ -109,7 +109,7 @@ replaces; that delta is composite and is not claimed as an isolated row-8 win.
 | 37 | Warm path + M=8 revert | — | — | — | — | — | Conditioner-covered; adaptive disposition pending | Adaptive lane |
 | 38 | M=8 direct-nibble extraction | — | — | — | — | — | Pending DFlash adaptive applicability review | Adaptive lane |
 | 39 | Transient M=4 grouping | — | — | — | — | — | Removed by row 40 | Source chronology |
-| 40 | M=7 direct-nibble extraction | — | — | — | — | — | Pending DFlash adaptive applicability review | Adaptive lane |
+| 40 | Restore M=4 and add M=7 direct-nibble extraction; complete surviving M6+M7 DFlash state | 757.932 → 740.764 | 67.344 → 63.313 | 36.868 → 38.350 | **-3.8639%** | 35.34873 → 35.34725 | Rejected; M6/M7 engaged 2,655/1,589 calls per arm | `item55-dflash2-c40-m6-m7-direct-nibble-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 41 | Direct-nibble native target QMV | — | — | — | — | — | Already present/superseded target implementation | Native-MTP row 41 evidence |
 | 42 | Affine-2 argmax proposer | — | — | — | — | — | Non-transferable to stochastic DFlash acceptance | Native-MTP row 42 evidence |
 | 45 | Early boundary fusion | — | — | — | — | — | Removed; live form is row 48 | Source chronology |
