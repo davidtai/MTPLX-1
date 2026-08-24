@@ -104,7 +104,7 @@ replaces; that delta is composite and is not claimed as an isolated row-8 win.
 | 30 | Reused target post-final-norm output | — | — | — | — | — | Already present in DFlash hidden-capture/logit path | DFlash target-ops contract |
 | 32 | Final source-policy streak revision; interim M=8 retune later superseded | 739.288 → 751.009 | 69.437 → 50.860 | 36.963 → 41.984 | **-11.9594%** | 35.34874 → 35.34973 | Adaptive revision rejected; interim M=8 grouping deferred to final row 47 form | `item55-dflash2-a32-final-source-policy-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 33 | Transient precision islands | — | — | — | — | — | Removed by row 34 | Source chronology |
-| 34 | M=6/M=9 direct-nibble edits | — | — | — | — | — | Pending adaptive applicability review; DFlash cap is 8 | Adaptive lane |
+| 34 | M=6/M=9 direct-nibble edits, adapted to the DFlash W4/G64 drafter | 722.962 → 720.659 | 65.958 → 59.689 | 38.221 → 39.924 | **-4.2634%** | 35.34873 → 35.35205 | Rejected; M6 engaged 926 calls/arm, while M9 is outside DFlash's 1–8 block range | `item55-dflash2-c34-m6-direct-nibble-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 36 | Native Q4/G64 block + precision islands | — | — | — | — | — | Replaced by pinned DFlash W4/G64 checkpoint | Checkpoint manifest |
 | 37 | Warm path + M=8 revert | — | — | — | — | — | Conditioner-covered; adaptive disposition pending | Adaptive lane |
 | 38 | M=8 direct-nibble extraction | — | — | — | — | — | Pending DFlash adaptive applicability review | Adaptive lane |
