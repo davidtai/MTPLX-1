@@ -204,6 +204,20 @@ native MTP in the candidate process.
 | 53 | ACTIVE: both DFlash arms ran in fresh processes with the retained 512 MiB/50-op process-latched command-buffer profile. |
 | 61 | REPLACED: dual norm/concat feeds the removed native MTP block; DFlash2 uses its own embeddings, dynamic-conv layers, and selector. |
 
+### Post-port DFlash2 target-shape stack
+
+These candidates begin only after all 54 source rows and the assembled DFlash2
+replacement are complete. Each valid result is a four-process ABBA gate on the
+exact 16,384-token Python prompt plus 1,024 output tokens. Retained candidates
+become the control for the next row.
+
+| Candidate | Cumulative control | Prefill tok/s | Decode tok/s | Mean wall s | Wall delta | Peak GB | Result | Receipt |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| GQA widths 6--8 | Retained DFlash2 production stack | 736.967 → 743.492 | 67.977 → 68.445 | 37.361 → 37.036 | **+0.8785%** | 35.34873 → 35.34683 | RETAINED; widths 6, 7, and 8 all engaged | `post54-dflash2-gqa678-on-production-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Cost-aligned adaptive widths | + GQA widths 6--8 | 773.971 → 771.523 | 68.195 → 67.067 | 36.215 → 36.539 | **-0.8862%** | 35.34685 → 35.34978 | REJECTED; also changed cycle schedules between same-variant arms | `post54-dflash2-cost-aligned-on-gqa678-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Shape-specific exact-BM8 NAX `o_proj` | + GQA widths 6--8 | 747.641 → 755.515 | 69.444 → 69.253 | 36.705 → 36.507 | **+0.5432%** | 35.34683 → 35.34683 | RETAINED by wall gate; exact tokens, deterministic variants, 16 live `6144→5120` projections | `post54-dflash2-m8-nax-island-on-gqa678-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| 1,024 MiB / 50-op command buffers | + GQA widths 6--8 + BM8 `o_proj` | 722.149 → 664.922 | 67.903 → 63.760 | 37.823 → 40.760 | **-7.2060%** | 35.34685 → 47.45433 | INVALID diagnostic: guard restoration overlapped another queued guarded benchmark; must be rerun before canonical rejection | `invalid-overlap-post54-dflash2-cb1024-on-gqa678-m8nax-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+
 ## Exact 54-row campaign state
 
 `Patch` is the SHA-256 prefix of the full binary parent diff; `Stats` is that

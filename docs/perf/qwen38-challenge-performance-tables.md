@@ -142,3 +142,16 @@ only block-5 draft capabilities and omitted the pre-import Turbo profile. See
 | 79 | Cluster probe fraction | — | — | — | — | — | Non-transferable | Source diff |
 | 80 | Row-70 M=2 extension | — | — | — | — | — | Dependency absent | Source diff |
 | 82 | Removed warm/probe construction | — | — | — | — | — | Conditioner-covered; selector dependency absent | Source diff + conditioner contract |
+
+## Post-54 DFlash2 target-shape candidates
+
+These are cumulative follow-ups, not additional Yukon proposal rows. Every
+valid row uses four isolated ABBA arms on the same 16K Python / 1,024-output
+workload. DFlash memory values are decimal GB as reported by `dflash-mlx`.
+
+| Candidate | Control → candidate stack | Prefill tok/s | Decode tok/s | Mean wall s | Wall delta | Peak GB | Result | Receipt |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| GQA widths 6--8 | Production → + GQA | 736.967 → 743.492 | 67.977 → 68.445 | 37.361 → 37.036 | **+0.8785%** | 35.34873 → 35.34683 | Retained | `post54-dflash2-gqa678-on-production-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Cost-aligned adaptive widths | GQA → + cost alignment | 773.971 → 771.523 | 68.195 → 67.067 | 36.215 → 36.539 | **-0.8862%** | 35.34685 → 35.34978 | Rejected | `post54-dflash2-cost-aligned-on-gqa678-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Exact-BM8 NAX output projection | GQA → + shape-gated M8 | 747.641 → 755.515 | 69.444 → 69.253 | 36.705 → 36.507 | **+0.5432%** | 35.34683 → 35.34683 | Retained; exact/deterministic, 16 live projections | `post54-dflash2-m8-nax-island-on-gqa678-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| 1,024 MiB command buffers | GQA+M8 → + 1,024 MiB | 722.149 → 664.922 | 67.903 → 63.760 | 37.823 → 40.760 | **-7.2060%** | 35.34685 → 47.45433 | Invalid diagnostic; queued guard overlap, rerun required | `invalid-overlap-post54-dflash2-cb1024-on-gqa678-m8nax-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
