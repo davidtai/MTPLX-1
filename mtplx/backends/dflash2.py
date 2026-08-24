@@ -364,6 +364,7 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
     from mtplx.qwen38_challenge import configure_qwen38_row50_wired_residency
     from mtplx.qwen38_challenge_kernels import (
         configure_qwen38_dflash_row24_eval_ladder,
+        configure_qwen38_dflash_gqa_widths,
         configure_qwen38_row21_qk_rms_rope,
         configure_qwen38_row24_qk_length_limit,
     )
@@ -383,6 +384,9 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
         "r26_prefill_ladder_3": {"active": 1},
         "r48_boundary_fused": configure_qwen38_dflash_row48_boundary(
             model, active=True
+        ),
+        "dflash_gqa_widths": configure_qwen38_dflash_gqa_widths(
+            model, active=True, widths=(6, 7, 8)
         ),
         "adaptive_policy": configure_qwen38_dflash_adaptive_policy(
             model, active=True, proposal_rows=(11, 15)
