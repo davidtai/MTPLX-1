@@ -372,6 +372,10 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
     from mtplx.qwen38_dflash_adaptive import (
         configure_qwen38_dflash_adaptive_policy,
     )
+    from mtplx.nax_verify import (
+        configure_qwen38_m6_barrier_free_kp1,
+        configure_qwen38_m56_kconst,
+    )
 
     model = runtime.target_model
     receipt = {
@@ -401,6 +405,10 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             include_m5_exact=True,
             include_m6_kp1=True,
         ),
+        "dflash_m6_barrier_free_kp1": configure_qwen38_m6_barrier_free_kp1(
+            active=True
+        ),
+        "dflash_m56_kconst": configure_qwen38_m56_kconst(active=True),
         "adaptive_policy": configure_qwen38_dflash_adaptive_policy(
             model, active=True, proposal_rows=(11, 15)
         ),

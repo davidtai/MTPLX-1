@@ -476,6 +476,34 @@ def _engagement_exact(
         return all(matches(row, control_families) for row in by_variant["control"]) and all(
             matches(row, expected_families) for row in by_variant["candidate"]
         )
+    if args.candidate_label == "final_m58_exhaustion":
+        def matches(row: dict[str, Any], active: bool) -> bool:
+            features = row.get("feature_receipt", {})
+            barrier = features.get("dflash_m6_barrier_free_kp1", {})
+            kconst = features.get("dflash_m56_kconst", {})
+            if bool(barrier.get("active")) != active or bool(
+                kconst.get("active")
+            ) != active:
+                return False
+            expected_m5 = [[5120, 48], [5120, 10240]] if active else []
+            expected_m6 = [[5120, 10240]] if active else []
+            if kconst.get("m5_shapes") != expected_m5 or kconst.get(
+                "m6_shapes"
+            ) != expected_m6:
+                return False
+            counters = row.get("engagement", {}).get("nax_verify", {})
+            keys = (
+                "m6_ksplit_kp1_direct_k5120_n10240",
+                "m6_ksplit_kp1_direct_k5120_n17408",
+                "m5_ksplit_kconst_k5120_n48",
+                "m5_ksplit_kconst_k5120_n10240",
+                "m6_ksplit_kconst_k5120_n10240",
+            )
+            return all((int(counters.get(key, 0)) > 0) == active for key in keys)
+
+        return all(matches(row, False) for row in by_variant["control"]) and all(
+            matches(row, True) for row in by_variant["candidate"]
+        )
     if args.candidate_label == "release_native_mtp":
         return all(
             not bool(row["feature_receipt"]["native_mtp_release"]["native_mtp_released"])

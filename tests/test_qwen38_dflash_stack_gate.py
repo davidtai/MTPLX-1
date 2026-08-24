@@ -979,6 +979,40 @@ def test_m6_kconst_engagement_allows_retained_m5_kconst_control() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is True
 
 
+def test_final_m58_exhaustion_requires_every_incremental_route() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="final_m58_exhaustion")
+
+    def arm(active):
+        calls = 1 if active else 0
+        return {
+            "feature_receipt": {
+                "dflash_m6_barrier_free_kp1": {"active": active},
+                "dflash_m56_kconst": {
+                    "active": active,
+                    "m5_shapes": [[5120, 48], [5120, 10240]] if active else [],
+                    "m6_shapes": [[5120, 10240]] if active else [],
+                },
+            },
+            "engagement": {
+                "nax_verify": {
+                    "m6_ksplit_kp1_direct_k5120_n10240": calls,
+                    "m6_ksplit_kp1_direct_k5120_n17408": calls,
+                    "m5_ksplit_kconst_k5120_n48": calls,
+                    "m5_ksplit_kconst_k5120_n10240": calls,
+                    "m6_ksplit_kconst_k5120_n10240": calls,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(False), arm(False)],
+        "candidate": [arm(True), arm(True)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

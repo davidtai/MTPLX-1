@@ -272,6 +272,18 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
         "mtplx.qwen38_challenge.configure_qwen38_row50_wired_residency",
         lambda target_runtime, *, active: {"installed": active},
     )
+    monkeypatch.setattr(
+        "mtplx.nax_verify.configure_qwen38_m6_barrier_free_kp1",
+        lambda *, active: {"active": active},
+    )
+    monkeypatch.setattr(
+        "mtplx.nax_verify.configure_qwen38_m56_kconst",
+        lambda *, active, m5_active=True, m6_active=True: {
+            "active": active,
+            "m5_shapes": [[5120, 48], [5120, 10240]] if m5_active else [],
+            "m6_shapes": [[5120, 10240]] if m6_active else [],
+        },
+    )
 
     receipt = backend._install_measured_qwen38_dflash_stack(runtime)
 
@@ -301,6 +313,12 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     assert receipt["native_mtp_release"] == {
         "native_mtp_released": True,
         "native_mtp_loaded": False,
+    }
+    assert receipt["dflash_m6_barrier_free_kp1"] == {"active": True}
+    assert receipt["dflash_m56_kconst"] == {
+        "active": True,
+        "m5_shapes": [[5120, 48], [5120, 10240]],
+        "m6_shapes": [[5120, 10240]],
     }
 
 
