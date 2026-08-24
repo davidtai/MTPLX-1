@@ -17,7 +17,7 @@ from typing import Any
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
-IS_PALINDROME_PROMPT = """Write Python code only. Implement `is_palindrome(text: str) -> bool` for a production utility. Ignore whitespace, punctuation, and letter case while preserving Unicode letters and digits. Use O(n) time, explain edge cases in docstrings, and include concise pytest tests for empty input, punctuation, mixed case, Unicode, and a clear negative case."""
+IS_PALINDROME_PROMPT = """Write Python code only. Implement `is_palindrome(text: str) -> bool` for a production utility. Ignore whitespace, punctuation, and letter case while preserving Unicode letters and digits. Use O(n) time, explain edge cases in docstrings, and include concise pytest tests for empty input, punctuation, mixed case, Unicode, and a clear negative case. Return only a single self-contained Python module with no prose outside the code exactly."""
 
 
 def _sha256_tokens(tokens: list[int]) -> str:
@@ -33,6 +33,29 @@ def _fit_prompt(tokenizer: Any, text: str, target_tokens: int) -> tuple[str, lis
         unit += "# Keep the implementation readable and deterministic.\n"
         ids = list(tokenizer.encode(unit))
     ids = ids[:target_tokens]
+    return str(tokenizer.decode(ids)), ids
+
+
+def _build_exact_chat_prompt(
+    tokenizer: Any,
+    *,
+    text: str,
+    target_tokens: int,
+) -> tuple[str, list[int]]:
+    """Render a generation-ready non-thinking chat prompt at the exact budget."""
+
+    ids = list(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    )
+    if len(ids) != target_tokens:
+        raise ValueError(
+            f"chat-formatted burst prompt is {len(ids)} tokens, expected {target_tokens}"
+        )
     return str(tokenizer.decode(ids)), ids
 
 
@@ -205,7 +228,11 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_prompt(args: argparse.Namespace, tokenizer: Any) -> tuple[str, list[int]]:
     if args.prompt_kind == "is_palindrome":
-        return _fit_prompt(tokenizer, IS_PALINDROME_PROMPT, args.prompt_tokens)
+        return _build_exact_chat_prompt(
+            tokenizer,
+            text=IS_PALINDROME_PROMPT,
+            target_tokens=args.prompt_tokens,
+        )
     row = json.loads(args.prompt_file.read_text(encoding="utf-8").splitlines()[0])
     return _build_exact_coding_prompt(
         tokenizer,
@@ -436,6 +463,11 @@ def main() -> int:
         "draft": str(args.draft.resolve()) if args.engine == "pr_dflash2" else None,
         "workload": {
             "prompt_kind": args.prompt_kind,
+            "prompt_format": (
+                "qwen_chat_template_non_thinking"
+                if args.prompt_kind == "is_palindrome"
+                else "exact_token_coding_context"
+            ),
             "prompt_tokens": len(prompt_ids),
             "prompt_token_sha256": _sha256_tokens(prompt_ids),
             "output_limit": args.max_tokens,

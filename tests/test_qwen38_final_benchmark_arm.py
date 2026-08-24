@@ -57,9 +57,38 @@ def test_native_metrics_prove_cold_prefill_and_preserve_all_requested_fields() -
 def test_burst_prompt_is_python_palindrome_task_and_fits_exact_budget() -> None:
     arm = _module()
 
+    class RecordingTokenizer:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            return list(range(100))
+
+        def decode(self, ids):
+            return "rendered prompt"
+
+    tokenizer = RecordingTokenizer()
+    _text, ids = arm._build_exact_chat_prompt(
+        tokenizer,
+        text=arm.IS_PALINDROME_PROMPT,
+        target_tokens=100,
+    )
+
     assert "is_palindrome" in arm.IS_PALINDROME_PROMPT
     assert "Python" in arm.IS_PALINDROME_PROMPT
     assert "test" in arm.IS_PALINDROME_PROMPT.lower()
+    assert len(ids) == 100
+    assert tokenizer.calls == [
+        (
+            [{"role": "user", "content": arm.IS_PALINDROME_PROMPT}],
+            {
+                "tokenize": True,
+                "add_generation_prompt": True,
+                "enable_thinking": False,
+            },
+        )
+    ]
 
 
 def test_palindrome_uses_eos_with_1024_cap_but_load_scenarios_force_1024() -> None:
