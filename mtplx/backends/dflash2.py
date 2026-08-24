@@ -390,7 +390,7 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             model, active=True, widths=(6, 7, 8)
         ),
         "dflash_m8_nax_island": configure_qwen38_dflash_m8_nax_island(
-            model, active=True
+            model, active=True, include_m7_output=True
         ),
         "adaptive_policy": configure_qwen38_dflash_adaptive_policy(
             model, active=True, proposal_rows=(11, 15)

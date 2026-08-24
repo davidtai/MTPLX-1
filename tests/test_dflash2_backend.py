@@ -210,11 +210,14 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     )
     monkeypatch.setattr(
         "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_m8_nax_island",
-        lambda model, *, active: {
+        lambda model, *, active, include_m7_output=False: {
             "active": active,
             "width": 8,
+            "include_m7_output": include_m7_output,
             "shapes": [[6144, 5120]],
+            "m7_shapes": [[6144, 5120]] if include_m7_output else [],
             "eligible_projections": 16,
+            "eligible_m7_projections": 16 if include_m7_output else 0,
         },
     )
     monkeypatch.setattr(
@@ -241,8 +244,11 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     assert receipt["dflash_m8_nax_island"] == {
         "active": True,
         "width": 8,
+        "include_m7_output": True,
         "shapes": [[6144, 5120]],
+        "m7_shapes": [[6144, 5120]],
         "eligible_projections": 16,
+        "eligible_m7_projections": 16,
     }
     assert receipt["native_mtp_release"] == {
         "native_mtp_released": True,
