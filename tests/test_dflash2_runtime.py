@@ -158,6 +158,24 @@ def test_mtplx_loader_loads_one_mtp_runtime(monkeypatch):
     assert calls == [("speed", True)]
 
 
+def test_release_native_mtp_drops_replaced_drafter_only():
+    target_inner = object()
+    native_mtp = object()
+    text = SimpleNamespace(model=target_inner, mtp=native_mtp)
+    runtime = SimpleNamespace(
+        model=SimpleNamespace(language_model=text),
+        mtp_enabled=True,
+        tokenizer=object(),
+    )
+
+    report = dflash2_runtime.release_mtplx_native_mtp(runtime)
+
+    assert text.model is target_inner
+    assert text.mtp is None
+    assert runtime.mtp_enabled is False
+    assert report == {"native_mtp_released": True}
+
+
 def test_stock_draft_loader_and_binder_receive_exact_arguments(monkeypatch):
     from dflash_mlx.engine import target_ops as target_ops_module
     from dflash_mlx.runtime import loading as loading_module

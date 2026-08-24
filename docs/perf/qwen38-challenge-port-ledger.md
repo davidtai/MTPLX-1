@@ -146,7 +146,7 @@ proposer/custom-kernel win receives an explicit DFlash-equivalent adaptation or
 concrete evidence that DFlash replaces or cannot dispatch that exact surface;
 no survivor is considered covered merely because the base DFlash integration
 works. The scheduled source
-is the local `dflash-mlx` implementation at `0a6a9adab99b` (the current
+is the local `dflash-mlx` implementation at `a11f3d2ec2f1` (the current
 DFlash2 source, compatibility-gated by its full suite on MLX 0.32.0) and its declared
 `z-lab/Qwen3.8-27B-DFlash2` checkpoint snapshot `50307d4c4cde`; implementation
 will pin the complete artifact digest and geometry before the final gate rather

@@ -38,9 +38,10 @@ from scripts.qwen38_challenge_port_gate import (  # noqa: E402
 
 DFLASH_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
-DFLASH_SOURCE_COMMIT = "0a6a9adab99b1a95d1dbc2921239ceb5ba3a7e7e"
+DFLASH_SOURCE_COMMIT = "a11f3d2ec2f1e136987fb05f3be9ee263ff74d84"
 PROMOTION_THRESHOLD_PCT = 0.05
 STATIC_WIDTH = 8
+DFLASH_SURVIVOR_ROWS = frozenset({18, 21, 24, 26, 48})
 FULL_RETAINED_ROUTE = (
     "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
     "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
@@ -133,16 +134,75 @@ def _install_retained_route(
     )
 
 
-def _run_dflash_arm(
-    bundle: Any,
+def _parse_dflash_survivors(value: str) -> tuple[int, ...]:
+    if not value.strip():
+        return ()
+    rows = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    unknown = set(rows) - DFLASH_SURVIVOR_ROWS
+    if unknown:
+        raise ValueError(f"unsupported DFlash survivor rows: {sorted(unknown)}")
+    if tuple(sorted(set(rows))) != rows:
+        raise ValueError("DFlash survivor rows must be unique and chronological")
+    dependencies = {21: (), 24: (21,), 26: (21, 24), 48: ()}
+    for row, required in dependencies.items():
+        if row in rows and not set(required) <= set(rows):
+            raise ValueError(f"DFlash row {row} requires survivor rows {required}")
+    return rows
+
+
+def _install_dflash_route(
+    runtime: Any,
     config: dict[str, Any],
     model_path: Path,
+    *,
+    survivor_rows: tuple[int, ...],
+) -> Any:
+    """Install only survivor mechanisms that remain valid on DFlash target work."""
+
+    from mtplx.qwen38_challenge import install_qwen38_route
+
+    rows = set(survivor_rows)
+    return install_qwen38_route(
+        runtime,
+        config,
+        model_path,
+        cache_route="control",
+        dual_norm=False,
+        source_proposal=False,
+        row10_compact_vocab=False,
+        mtp_block_variant=None,
+        mtp_block_artifact_path=None,
+        row18_gdn_decay_memo=18 in rows,
+        row21_qk_rms_rope=21 in rows,
+        row24_eval_ladder=24 in rows,
+        row26_prefill_ladder_3=26 in rows,
+        row48_boundary_fused=48 in rows,
+        row50_wired_residency=False,
+        row63_q8_embedding_dual_norm=False,
+        row70_qmv_sumtable=False,
+        row78_qmv_active_groups=False,
+        row80_qmv_m2=False,
+    )
+
+
+def _dflash_target_counter_snapshot() -> dict[str, int]:
+    from dflash_mlx.engine.target_qwen_gdn import (
+        dflash_qwen_target_counter_snapshot,
+    )
+
+    return dflash_qwen_target_counter_snapshot()
+
+
+def _run_dflash_arm(
+    bundle: Any,
     prompt_ids: list[int],
     runtime_context: Any,
     *,
     max_tokens: int,
     seed: int,
-    row36_artifact: Path,
+    route: Any,
+    survivor_rows: tuple[int, ...],
+    release_report: dict[str, bool],
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -150,13 +210,8 @@ def _run_dflash_arm(
         run_dflash2_candidate,
     )
 
-    route = _install_retained_route(
-        bundle.runtime,
-        config,
-        model_path,
-        row36_artifact=row36_artifact,
-    )
     counters_before = _projection_counter_snapshot()
+    dflash_counters_before = _dflash_target_counter_snapshot()
     mx.reset_peak_memory()
     started = time.perf_counter()
     with _dflash_target_sampling(seed=seed):
@@ -169,19 +224,33 @@ def _run_dflash_arm(
         )
     wall_s = time.perf_counter() - started
     counters_after = _projection_counter_snapshot()
+    dflash_counters_after = _dflash_target_counter_snapshot()
     tokens = tuple(int(token) for token in arm.pop("tokens"))
     return {
         **arm,
         "engine": "dflash2",
-        "route_id": FULL_RETAINED_ROUTE,
+        "route_id": "+".join(
+            ("dflash2_static8", *(f"r{row:02d}" for row in survivor_rows))
+        ),
         "installed_route_id": route.route_id,
         "wall_s": wall_s,
         "token_hash": _token_hash(tokens),
         "tokens": list(tokens),
         "engagement": _counter_delta(counters_before, counters_after),
+        "dflash_target_engagement": _counter_delta(
+            dflash_counters_before,
+            dflash_counters_after,
+        ),
         "feature_receipt": dict(
             getattr(bundle.runtime, "qwen38_feature_receipt", {}) or {}
-        ),
+        )
+        | {
+            "native_mtp_release": dict(release_report),
+            "r53_command_buffers": {
+                "max_mb_per_buffer": int(os.environ["MLX_MAX_MB_PER_BUFFER"]),
+                "max_ops_per_buffer": int(os.environ["MLX_MAX_OPS_PER_BUFFER"]),
+            },
+        },
     }
 
 
@@ -228,6 +297,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--warmup-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--release-native-mtp", action="store_true")
+    parser.add_argument("--dflash-survivors", default="")
     parser.add_argument(
         "--engine",
         choices=("mtp_fixed_d3", "dflash2"),
@@ -248,8 +319,9 @@ def main() -> int:
     row36_artifact = args.row36_artifact.expanduser().resolve()
     if not draft_path.is_dir():
         raise FileNotFoundError(f"pinned DFlash snapshot is absent: {draft_path}")
-    if not row36_artifact.is_file():
+    if args.engine == "mtp_fixed_d3" and not row36_artifact.is_file():
         raise FileNotFoundError(f"row 36 artifact is absent: {row36_artifact}")
+    survivor_rows = _parse_dflash_survivors(args.dflash_survivors)
 
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,
@@ -280,13 +352,37 @@ def main() -> int:
     config = load_config(model_path)
     bundle = None
     runtime_context = None
+    dflash_route = None
+    release_report = {"native_mtp_released": False}
     if args.engine == "dflash2":
-        from mtplx.benchmarks.dflash2_runtime import bind_mtplx_dflash2_bundle
+        from mtplx.benchmarks.dflash2_runtime import (
+            bind_mtplx_dflash2_bundle,
+            release_mtplx_native_mtp,
+        )
         from mtplx.benchmarks.runners.dflash2_depth_sweep import (
             build_fixed_dflash_runtime_context,
         )
 
         bundle = bind_mtplx_dflash2_bundle(runtime, str(draft_path))
+        dflash_route = _install_dflash_route(
+            runtime,
+            config,
+            model_path,
+            survivor_rows=survivor_rows,
+        )
+        if dflash_route is None:
+            raise RuntimeError("DFlash2 survivor route did not install")
+        if args.release_native_mtp:
+            release_report = release_mtplx_native_mtp(runtime)
+        from mtplx.qwen38_challenge import configure_qwen38_row50_wired_residency
+
+        row50_report = configure_qwen38_row50_wired_residency(runtime, active=True)
+        if not bool(row50_report.get("installed")):
+            raise RuntimeError("DFlash2 row-50 wired residency did not install")
+        runtime.qwen38_feature_receipt = {
+            **dict(getattr(runtime, "qwen38_feature_receipt", {}) or {}),
+            "r50_wired_residency": row50_report,
+        }
         runtime_context = build_fixed_dflash_runtime_context()
     prompt_id, instruction = _read_prompt(args.prompt_file)
     prompt_text, prompt_ids = _context_prompt_to_token_count(
@@ -308,17 +404,17 @@ def main() -> int:
                 seed=args.seed,
                 row36_artifact=row36_artifact,
             )
-        if bundle is None or runtime_context is None:
+        if bundle is None or runtime_context is None or dflash_route is None:
             raise RuntimeError("DFlash2 isolated child did not construct its bundle")
         return _run_dflash_arm(
             bundle,
-            config,
-            model_path,
             prompt_ids,
             runtime_context,
             max_tokens=tokens,
             seed=args.seed,
-            row36_artifact=row36_artifact,
+            route=dflash_route,
+            survivor_rows=survivor_rows,
+            release_report=release_report,
         )
 
     warmup = run(args.warmup_tokens)
@@ -350,6 +446,8 @@ def main() -> int:
         },
         "optimized_speed_stack": optimized_stack,
         "retained_route": FULL_RETAINED_ROUTE,
+        "dflash_survivor_rows": list(survivor_rows),
+        "native_mtp_release": dict(release_report),
         "mlx_version": importlib.metadata.version("mlx"),
         "dflash_mlx_version": importlib.metadata.version("dflash-mlx"),
         "python": platform.python_version(),

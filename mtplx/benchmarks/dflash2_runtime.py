@@ -34,6 +34,23 @@ def load_mtplx_runtime(model_path: str):
     return load(model_path, mtp=True)
 
 
+def release_mtplx_native_mtp(runtime: Any) -> dict[str, bool]:
+    """Release the native MTP drafter after DFlash2 replaces it."""
+
+    import gc
+
+    import mlx.core as mx
+
+    text_model = getattr(runtime.model, "language_model", runtime.model)
+    native_mtp_released = getattr(text_model, "mtp", None) is not None
+    if native_mtp_released:
+        text_model.mtp = None
+    runtime.mtp_enabled = False
+    gc.collect()
+    mx.clear_cache()
+    return {"native_mtp_released": native_mtp_released}
+
+
 def load_draft(draft_ref: str, *, draft_quant: str):
     """Load the stock DFlash2 draft without importing the extra at module import."""
 
