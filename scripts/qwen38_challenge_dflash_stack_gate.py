@@ -24,6 +24,15 @@ from scripts.qwen38_challenge_port_isolated_gate import (  # noqa: E402
 )
 
 ORDER = ("control", "candidate", "candidate", "control")
+APPROVED_PROMPT_TOKENS = frozenset({1024, 16_384})
+
+
+def _validate_workload(*, prompt_tokens: int, max_tokens: int) -> None:
+    if prompt_tokens not in APPROVED_PROMPT_TOKENS or max_tokens != 1024:
+        raise ValueError(
+            "DFlash2 phase gates require exactly 1K or 16K Python input "
+            "and 1024 output"
+        )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -87,6 +96,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-disable-row48-prefill-fusion", action="store_true")
     parser.add_argument("--control-disable-row48-decode-fusion", action="store_true")
     parser.add_argument("--candidate-disable-row48-decode-fusion", action="store_true")
+    parser.add_argument("--control-disable-row21", action="store_true")
+    parser.add_argument("--candidate-disable-row21", action="store_true")
+    parser.add_argument("--control-disable-row24-qk", action="store_true")
+    parser.add_argument("--candidate-disable-row24-qk", action="store_true")
+    parser.add_argument("--control-disable-row50", action="store_true")
+    parser.add_argument("--candidate-disable-row50", action="store_true")
+    parser.add_argument("--control-disable-row53", action="store_true")
+    parser.add_argument("--candidate-disable-row53", action="store_true")
     parser.add_argument("--control-cost-aligned-widths", action="store_true")
     parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
@@ -103,6 +120,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--warmup-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--decision-metric",
+        choices=("prefill", "decode", "wall"),
+        default="wall",
+    )
     parser.add_argument("--lock", type=Path, default=arm_gate.DEFAULT_LOCK)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -115,12 +137,25 @@ def _variant_environment(
 ) -> dict[str, str]:
     environment = dict(base)
     prefix = "control" if variant == "control" else "candidate"
-    environment["MLX_MAX_MB_PER_BUFFER"] = str(
-        int(getattr(args, f"{prefix}_max_mb_per_buffer"))
-    )
-    environment["MLX_MAX_OPS_PER_BUFFER"] = str(
-        int(getattr(args, f"{prefix}_max_ops_per_buffer"))
-    )
+    disable_row53 = bool(getattr(args, f"{prefix}_disable_row53", False))
+    if disable_row53:
+        environment.pop("MLX_MAX_MB_PER_BUFFER", None)
+        environment.pop("MLX_MAX_OPS_PER_BUFFER", None)
+    else:
+        environment["MLX_MAX_MB_PER_BUFFER"] = str(
+            int(getattr(args, f"{prefix}_max_mb_per_buffer"))
+        )
+        environment["MLX_MAX_OPS_PER_BUFFER"] = str(
+            int(getattr(args, f"{prefix}_max_ops_per_buffer"))
+        )
+    for suffix, env_name in (
+        ("disable_row21", "MTPLX_QWEN38_DFLASH_DISABLE_ROW21"),
+        ("disable_row24_qk", "MTPLX_QWEN38_DFLASH_DISABLE_ROW24_QK"),
+        ("disable_row50", "MTPLX_QWEN38_DFLASH_DISABLE_ROW50"),
+    ):
+        environment[env_name] = (
+            "1" if bool(getattr(args, f"{prefix}_{suffix}", False)) else "0"
+        )
     environment["MTPLX_QWEN38_M7_LINEAR_Z_NSG4"] = (
         "1" if bool(getattr(args, f"{prefix}_m7_linear_z_nsg4", False)) else "0"
     )
@@ -309,6 +344,20 @@ def _child_command(
 
 def _mean(rows: list[dict[str, Any]], key: str) -> float:
     return sum(float(row[key]) for row in rows) / len(rows)
+
+
+def _metric_improvement_pct(
+    summary: dict[str, dict[str, float]],
+    metric: str,
+) -> float:
+    if metric == "wall":
+        return (
+            summary["control"]["wall_s"] / summary["candidate"]["wall_s"] - 1.0
+        ) * 100.0
+    key = f"{metric}_tps"
+    return (
+        summary["candidate"][key] / summary["control"][key] - 1.0
+    ) * 100.0
 
 
 def _engagement_exact(
@@ -511,6 +560,60 @@ def _engagement_exact(
         ) and all(
             bool(row["feature_receipt"]["native_mtp_release"]["native_mtp_released"])
             for row in by_variant["candidate"]
+        )
+    if args.candidate_label == "row15_no_decode":
+        def adaptive(row: dict[str, Any]) -> tuple[tuple[int, ...], int]:
+            metrics = dict(row.get("adaptive_metrics", {}) or {})
+            return (
+                tuple(int(value) for value in metrics.get("proposal_rows", ())),
+                int(metrics.get("cycles", 0)),
+            )
+
+        return all(
+            rows == (11, 15) and cycles > 0
+            for rows, cycles in map(adaptive, by_variant["control"])
+        ) and all(
+            rows == () and cycles == 0
+            for rows, cycles in map(adaptive, by_variant["candidate"])
+        )
+    if args.candidate_label == "row21_no_decode":
+        def row21(row: dict[str, Any]) -> tuple[int, int]:
+            receipt = dict(row.get("feature_receipt", {}).get("r21_qk_rms_rope", {}))
+            calls = int(
+                row.get("engagement", {}).get("r21_qk_rms_rope", {}).get("calls", 0)
+            )
+            return int(receipt.get("active_modules", 0)), calls
+
+        return all(
+            modules > 0 and calls > 0
+            for modules, calls in map(row21, by_variant["control"])
+        ) and all(
+            modules == 0 and calls == 0
+            for modules, calls in map(row21, by_variant["candidate"])
+        )
+    if args.candidate_label == "row26_no_prefill":
+        def row26_calls(row: dict[str, Any]) -> int:
+            return int(
+                row.get("engagement", {})
+                .get("r26_prefill_ladder_3", {})
+                .get("calls", 0)
+            )
+
+        return all(row26_calls(row) > 0 for row in by_variant["control"]) and all(
+            row26_calls(row) == 0 for row in by_variant["candidate"]
+        )
+    if args.candidate_label in {"row50_no_shared", "row53_no_shared"}:
+        key = (
+            "r50_wired_residency"
+            if args.candidate_label == "row50_no_shared"
+            else "r53_command_buffers"
+        )
+
+        def active(row: dict[str, Any]) -> bool:
+            return bool(row.get("feature_receipt", {}).get(key, {}).get("active"))
+
+        return all(active(row) for row in by_variant["control"]) and all(
+            not active(row) for row in by_variant["candidate"]
         )
     if args.candidate_label == "r21":
         def calls(row: dict[str, Any]) -> int:
@@ -955,7 +1058,7 @@ def _engagement_exact(
                 .get(f"{phase}_calls", 0)
             )
 
-        return all(
+        ladder_exact = all(
             bool(route(row).get(f"{disabled_phase}_active"))
             and bool(route(row).get(f"{other_phase}_active"))
             and calls(row, disabled_phase) > 0
@@ -967,6 +1070,27 @@ def _engagement_exact(
             and calls(row, disabled_phase) == 0
             and calls(row, other_phase) > 0
             for row in by_variant["candidate"]
+        )
+        if not ladder_exact or disabled_phase != "decode":
+            return ladder_exact
+
+        def qk(row: dict[str, Any]) -> tuple[int, int]:
+            receipt = dict(
+                row.get("feature_receipt", {}).get("r24_qk_length_limit", {})
+            )
+            fallback = int(
+                row.get("engagement", {})
+                .get("r24_qk_length_limit", {})
+                .get("fallback_calls", 0)
+            )
+            return int(receipt.get("active_modules", 0)), fallback
+
+        return all(
+            modules > 0 and fallback > 0
+            for modules, fallback in map(qk, by_variant["control"])
+        ) and all(
+            modules == 0 and fallback == 0
+            for modules, fallback in map(qk, by_variant["candidate"])
         )
     if args.candidate_label in {"row48_no_prefill", "row48_no_decode"}:
         disabled_phase = (
@@ -1082,7 +1206,6 @@ def _aggregate(
     mean_wall = {
         variant: _mean(rows, "wall_s") for variant, rows in by_variant.items()
     }
-    improvement_pct = (mean_wall["control"] / mean_wall["candidate"] - 1.0) * 100.0
     summary = {
         variant: {
             "prefill_tps": _mean(rows, "prefill_tps"),
@@ -1092,6 +1215,7 @@ def _aggregate(
         }
         for variant, rows in by_variant.items()
     }
+    improvement_pct = _metric_improvement_pct(summary, args.decision_metric)
     exact = bool(generated_exact and width_exact and engagement_exact and all(deterministic.values()))
     source_status = subprocess.check_output(
         ["git", "status", "--short"], cwd=ROOT, text=True
@@ -1106,6 +1230,7 @@ def _aggregate(
         "kind": "qwen38_challenge_dflash2_cumulative_stack_abba",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "candidate_label": args.candidate_label,
+        "decision_metric": args.decision_metric,
         "model": first["model"],
         "dflash": first["dflash"],
         "workload": {
@@ -1200,6 +1325,14 @@ def _aggregate(
             "candidate_disable_row48_decode_fusion": bool(
                 args.candidate_disable_row48_decode_fusion
             ),
+            "control_disable_row21": bool(args.control_disable_row21),
+            "candidate_disable_row21": bool(args.candidate_disable_row21),
+            "control_disable_row24_qk": bool(args.control_disable_row24_qk),
+            "candidate_disable_row24_qk": bool(args.candidate_disable_row24_qk),
+            "control_disable_row50": bool(args.control_disable_row50),
+            "candidate_disable_row50": bool(args.candidate_disable_row50),
+            "control_disable_row53": bool(args.control_disable_row53),
+            "candidate_disable_row53": bool(args.candidate_disable_row53),
             "control_cost_aligned_widths": bool(args.control_cost_aligned_widths),
             "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
@@ -1236,11 +1369,14 @@ def _aggregate(
         "candidate_improvement_pct": improvement_pct,
         "promotion": {
             "threshold_pct": arm_gate.PROMOTION_THRESHOLD_PCT,
+            "decision_metric": args.decision_metric,
             "passed": promoted,
             "reason": (
-                "strict wall improvement above threshold"
+                f"strict {args.decision_metric} improvement above threshold"
                 if promoted
-                else "correctness, clean-source, or strict wall threshold failed"
+                else (
+                    "correctness, clean-source, or strict phase threshold failed"
+                )
             ),
         },
     }
@@ -1248,8 +1384,10 @@ def _aggregate(
 
 def main() -> int:
     args = _parse_args()
-    if args.prompt_tokens != 16_384 or args.max_tokens != 1024:
-        raise ValueError("DFlash2 stack gates require exactly 16K input and 1024 output")
+    _validate_workload(
+        prompt_tokens=args.prompt_tokens,
+        max_tokens=args.max_tokens,
+    )
     arm_gate._parse_dflash_survivors(args.control_survivors)
     arm_gate._parse_dflash_survivors(args.candidate_survivors)
     arm_gate._parse_dflash_adaptive_rows(args.control_adaptive_rows)

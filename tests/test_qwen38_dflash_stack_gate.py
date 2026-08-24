@@ -8,6 +8,50 @@ import pytest
 from scripts import qwen38_challenge_dflash_gate as gate
 
 
+@pytest.mark.parametrize("prompt_tokens", [1024, 16_384])
+def test_phase_gate_accepts_only_approved_prompt_lengths(prompt_tokens: int) -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    stack_gate._validate_workload(prompt_tokens=prompt_tokens, max_tokens=1024)
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "max_tokens"),
+    [(512, 1024), (2048, 1024), (1024, 512)],
+)
+def test_phase_gate_rejects_other_workloads(
+    prompt_tokens: int,
+    max_tokens: int,
+) -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    with pytest.raises(ValueError):
+        stack_gate._validate_workload(
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+        )
+
+
+@pytest.mark.parametrize(
+    ("metric", "expected"),
+    [("prefill", 10.0), ("decode", 5.0), ("wall", 25.0)],
+)
+def test_phase_gate_improvement_uses_selected_metric(
+    metric: str,
+    expected: float,
+) -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    summary = {
+        "control": {"prefill_tps": 100.0, "decode_tps": 100.0, "wall_s": 10.0},
+        "candidate": {"prefill_tps": 110.0, "decode_tps": 105.0, "wall_s": 8.0},
+    }
+
+    assert stack_gate._metric_improvement_pct(summary, metric) == pytest.approx(
+        expected
+    )
+
+
 def test_dflash_survivors_are_unique_chronological_and_dependency_closed() -> None:
     assert gate._parse_dflash_survivors("") == ()
     assert gate._parse_dflash_survivors("21,24,26,48") == (
@@ -205,6 +249,135 @@ def test_command_buffer_candidate_isolated_environment() -> None:
     assert candidate["MLX_MAX_MB_PER_BUFFER"] == "1024"
     assert control["MLX_MAX_OPS_PER_BUFFER"] == "50"
     assert candidate["MLX_MAX_OPS_PER_BUFFER"] == "50"
+
+
+def test_phase_ablation_environment_isolated_per_variant() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(
+        control_max_mb_per_buffer=512,
+        candidate_max_mb_per_buffer=512,
+        control_max_ops_per_buffer=50,
+        candidate_max_ops_per_buffer=50,
+        control_disable_row21=False,
+        candidate_disable_row21=True,
+        control_disable_row24_qk=False,
+        candidate_disable_row24_qk=True,
+        control_disable_row50=False,
+        candidate_disable_row50=True,
+        control_disable_row53=False,
+        candidate_disable_row53=True,
+    )
+
+    control = stack_gate._variant_environment(args, "control", {"KEEP": "1"})
+    candidate = stack_gate._variant_environment(args, "candidate", {"KEEP": "1"})
+
+    assert control["MTPLX_QWEN38_DFLASH_DISABLE_ROW21"] == "0"
+    assert candidate["MTPLX_QWEN38_DFLASH_DISABLE_ROW21"] == "1"
+    assert control["MTPLX_QWEN38_DFLASH_DISABLE_ROW24_QK"] == "0"
+    assert candidate["MTPLX_QWEN38_DFLASH_DISABLE_ROW24_QK"] == "1"
+    assert control["MTPLX_QWEN38_DFLASH_DISABLE_ROW50"] == "0"
+    assert candidate["MTPLX_QWEN38_DFLASH_DISABLE_ROW50"] == "1"
+    assert control["MLX_MAX_MB_PER_BUFFER"] == "512"
+    assert control["MLX_MAX_OPS_PER_BUFFER"] == "50"
+    assert "MLX_MAX_MB_PER_BUFFER" not in candidate
+    assert "MLX_MAX_OPS_PER_BUFFER" not in candidate
+
+
+def test_dflash_arm_reads_phase_ablation_environment(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_QWEN38_DFLASH_DISABLE_ROW21", "1")
+    monkeypatch.setenv("MTPLX_QWEN38_DFLASH_DISABLE_ROW24_QK", "0")
+    monkeypatch.setenv("MTPLX_QWEN38_DFLASH_DISABLE_ROW50", "1")
+
+    assert gate._phase_ablation_disabled("ROW21") is True
+    assert gate._phase_ablation_disabled("ROW24_QK") is False
+    assert gate._phase_ablation_disabled("ROW50") is True
+
+
+def test_row26_removal_requires_prefill_counter_to_reach_zero() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="row26_no_prefill")
+    by_variant = {
+        "control": [
+            {"engagement": {"r26_prefill_ladder_3": {"calls": 176}}},
+            {"engagement": {"r26_prefill_ladder_3": {"calls": 176}}},
+        ],
+        "candidate": [
+            {"engagement": {"r26_prefill_ladder_3": {"calls": 0}}},
+            {"engagement": {"r26_prefill_ladder_3": {"calls": 0}}},
+        ],
+    }
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = {
+        "engagement": {"r26_prefill_ladder_3": {"calls": 176}}
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_row15_removal_requires_adaptive_cycles_to_reach_zero() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="row15_no_decode")
+    active = {
+        "adaptive_metrics": {"proposal_rows": [11, 15], "cycles": 201},
+    }
+    inactive = {"adaptive_metrics": {}}
+    by_variant = {
+        "control": [active, active],
+        "candidate": [inactive, inactive],
+    }
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = active
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_row21_removal_requires_decode_counter_to_reach_zero() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="row21_no_decode")
+    active = {
+        "feature_receipt": {"r21_qk_rms_rope": {"active_modules": 40}},
+        "engagement": {"r21_qk_rms_rope": {"calls": 3152}},
+    }
+    inactive = {
+        "feature_receipt": {"r21_qk_rms_rope": {"active_modules": 0}},
+        "engagement": {"r21_qk_rms_rope": {"calls": 0}},
+    }
+    by_variant = {
+        "control": [active, active],
+        "candidate": [inactive, inactive],
+    }
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = active
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+@pytest.mark.parametrize(
+    ("candidate_label", "receipt_key"),
+    [("row50_no_shared", "r50_wired_residency"),
+     ("row53_no_shared", "r53_command_buffers")],
+)
+def test_shared_policy_removal_requires_candidate_inactive(
+    candidate_label: str,
+    receipt_key: str,
+) -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label=candidate_label)
+    active = {"feature_receipt": {receipt_key: {"active": True}}}
+    inactive = {"feature_receipt": {receipt_key: {"active": False}}}
+    by_variant = {
+        "control": [active, active],
+        "candidate": [inactive, inactive],
+    }
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = active
+    assert stack_gate._engagement_exact(args, by_variant) is False
 
 
 def test_command_buffer_engagement_requires_exact_variant_caps() -> None:
@@ -599,21 +772,37 @@ def test_m6_kp1_engagement_requires_both_selected_shapes() -> None:
 def test_row24_phase_removal_requires_other_phase_to_remain_live() -> None:
     from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
 
-    args = SimpleNamespace(candidate_label="row24_no_decode")
+    args = SimpleNamespace(
+        candidate_label="row24_no_decode",
+        candidate_disable_row24_qk=True,
+    )
 
-    def arm(*, decode_active: bool, prefill_calls: int = 176):
+    def arm(
+        *,
+        decode_active: bool,
+        prefill_calls: int = 176,
+        qk_active: bool | None = None,
+    ):
+        if qk_active is None:
+            qk_active = decode_active
         return {
             "feature_receipt": {
                 "r24_eval_ladder": {
                     "prefill_active": 1,
                     "decode_active": int(decode_active),
-                }
+                },
+                "r24_qk_length_limit": {
+                    "active_modules": 40 if qk_active else 0,
+                },
             },
             "engagement": {
                 "r24_eval_ladder": {
                     "prefill_calls": prefill_calls,
                     "decode_calls": 1616 if decode_active else 0,
-                }
+                },
+                "r24_qk_length_limit": {
+                    "fallback_calls": 240 if qk_active else 0,
+                },
             },
         }
 
@@ -623,6 +812,8 @@ def test_row24_phase_removal_requires_other_phase_to_remain_live() -> None:
     }
     assert stack_gate._engagement_exact(args, by_variant) is True
     by_variant["candidate"][0] = arm(decode_active=False, prefill_calls=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+    by_variant["candidate"][0] = arm(decode_active=False, qk_active=True)
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 

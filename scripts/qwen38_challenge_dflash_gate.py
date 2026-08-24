@@ -64,6 +64,10 @@ DEFAULT_ROW36_ARTIFACT = Path.home() / (
 )
 
 
+def _phase_ablation_disabled(row: str) -> bool:
+    return os.environ.get(f"MTPLX_QWEN38_DFLASH_DISABLE_{row}", "0") == "1"
+
+
 def _token_hash(tokens: list[int] | tuple[int, ...]) -> str:
     payload = ",".join(str(int(token)) for token in tokens).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
@@ -228,11 +232,11 @@ def _install_dflash_route(
     rows = set(survivor_rows)
     row21_report = configure_qwen38_row21_qk_rms_rope(
         runtime.model,
-        active=21 in rows,
+        active=21 in rows and not _phase_ablation_disabled("ROW21"),
     )
     row24_report = configure_qwen38_row24_qk_length_limit(
         runtime.model,
-        active=24 in rows,
+        active=24 in rows and not _phase_ablation_disabled("ROW24_QK"),
         max_length=32 if 26 in rows else 16,
     )
     row24_ladder_report = configure_qwen38_dflash_row24_eval_ladder(
@@ -467,6 +471,9 @@ def _run_dflash_arm(
                 *(("r24nodecode",) if not row24_decode_ladder else ()),
                 *(("r48noprefill",) if not row48_prefill_fused else ()),
                 *(("r48nodecode",) if not row48_decode_fused else ()),
+                *(("r21off",) if _phase_ablation_disabled("ROW21") else ()),
+                *(("r24qkoff",) if _phase_ablation_disabled("ROW24_QK") else ()),
+                *(("r50off",) if _phase_ablation_disabled("ROW50") else ()),
                 *(("cost_aligned",) if cost_aligned_widths else ()),
             )
         ),
@@ -485,8 +492,20 @@ def _run_dflash_arm(
         | {
             "native_mtp_release": dict(release_report),
             "r53_command_buffers": {
-                "max_mb_per_buffer": int(os.environ["MLX_MAX_MB_PER_BUFFER"]),
-                "max_ops_per_buffer": int(os.environ["MLX_MAX_OPS_PER_BUFFER"]),
+                "active": (
+                    os.environ.get("MLX_MAX_MB_PER_BUFFER") == "512"
+                    and os.environ.get("MLX_MAX_OPS_PER_BUFFER") == "50"
+                ),
+                "max_mb_per_buffer": (
+                    int(os.environ["MLX_MAX_MB_PER_BUFFER"])
+                    if "MLX_MAX_MB_PER_BUFFER" in os.environ
+                    else None
+                ),
+                "max_ops_per_buffer": (
+                    int(os.environ["MLX_MAX_OPS_PER_BUFFER"])
+                    if "MLX_MAX_OPS_PER_BUFFER" in os.environ
+                    else None
+                ),
             },
         },
     }
@@ -696,8 +715,12 @@ def main() -> int:
         )
         from mtplx.qwen38_challenge import configure_qwen38_row50_wired_residency
 
-        row50_report = configure_qwen38_row50_wired_residency(runtime, active=True)
-        if not bool(row50_report.get("installed")):
+        row50_active = not _phase_ablation_disabled("ROW50")
+        row50_report = configure_qwen38_row50_wired_residency(
+            runtime,
+            active=row50_active,
+        )
+        if row50_active and not bool(row50_report.get("installed")):
             raise RuntimeError("DFlash2 row-50 wired residency did not install")
         runtime.qwen38_feature_receipt = {
             **dict(getattr(runtime, "qwen38_feature_receipt", {}) or {}),
