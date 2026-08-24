@@ -96,6 +96,8 @@ cumulative control before that later decision can remain authoritative.
 | 61 corrected | + fused dual RMSNorm and output concatenate | 765.844 | 55.094 | 32.72812 | 40.037 | **+0.9996%** | **RETAINED** | same |
 | 63 corrected | retained rows 8, 10, 18, 20, 21, 24, 26, 36, 48, 50, 53, 61 | 754.687 | 57.141 | 32.72812 | 39.698 | - | corrected cumulative control | `chrono-r63-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-r50-r53-r61-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 63 corrected | replace separate row-61 kernel with fused Q8 embedding/norm/concat | 768.177 | 55.700 | 32.72812 | 39.773 | **-0.1895%** | REJECTED, row 61 retained | same |
+| 55 base | retained fixed MTP D3 stack | 742.781 | 55.441 | 32.72811 | 40.604 | - | replacement control | `item55-dflash2-static8-on-full-fixed-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 base | DFlash2 fixed depth 8, before survivor-specific ports | 733.786 | 65.858 | 34.81407 | 37.917 | **+7.0860%** | **RETAINED as the replacement base**; not the final merged item 55 | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -151,6 +153,28 @@ will pin the complete artifact digest and geometry before the final gate rather
 than silently following either moving ref. After the fixed DFlash2 stack and
 its per-survivor gates are complete, adaptive DFlash2 depth 1--8 becomes the
 next cumulative lane on the same branch and in the same PR.
+
+The first fixed-depth gate retains DFlash2 as the replacement base at
+`+7.0860%`. Its engagement counters also prove that installing an MTP route is
+not enough to port an MTP-specific mechanism: DFlash's target cache and capture
+path bypassed those hooks. Therefore that receipt is deliberately labeled
+`55 base`, and the final item 55 remains open until each survivor below has an
+adapted gate or a concrete replacement/incompatibility disposition.
+
+| Survivor | DFlash2 disposition before adaptive 1--8 |
+| ---: | --- |
+| 8 | REPLACED by DFlash2's device-resident eight-token proposal block; no MTP draft chain remains. |
+| 10 | INCOMPATIBLE: its 98,330-row vocabulary is the native MTP head's reachable-ID set, while DFlash2 selects from the target vocabulary and can emit IDs outside that set. |
+| 18 | PENDING: port the memoized GDN decay into DFlash's recurrent rollback hook and gate it. |
+| 20 | REPLACED: K/V-only append is a native-MTP committed-history optimization; DFlash2 owns projected target features plus separate rollback caches. |
+| 21 | PENDING: route eligible DFlash target-attention blocks through the retained fused Q/K RMSNorm plus partial-RoPE kernel and gate it. |
+| 24 | PENDING: port both the Q/K length fence and DFlash target evaluation ladder, then gate them cumulatively. |
+| 26 | PENDING: adapt the prefill evaluation cadence from every four layers to every three on the retained row-24 DFlash path and gate it. |
+| 36 | REPLACED: the Q4/group-64 MTP block and BF16 Q/K/V islands belong to the removed native MTP drafter; the pinned DFlash2 checkpoint supplies its own W4/group-64 drafter. |
+| 48 | PENDING: port the fused residual/RMSNorm target-layer boundary to DFlash's hidden-capture loop and gate it. |
+| 50 | ACTIVE: the depth-8 DFlash arms recomputed the combined active footprint as 22,328,201,584 bytes and set a 22,395,310,448-byte wired limit. |
+| 53 | ACTIVE: both DFlash arms ran in fresh processes with the retained 512 MiB/50-op process-latched command-buffer profile. |
+| 61 | REPLACED: dual norm/concat feeds the removed native MTP block; DFlash2 uses its own embeddings, dynamic-conv layers, and selector. |
 
 ## Exact 54-row campaign state
 
