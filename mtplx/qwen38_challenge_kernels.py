@@ -268,7 +268,7 @@ def configure_qwen38_dflash_m8_nax_island(
             if int(getattr(projection, "bits", 0)) != 4 or int(
                 getattr(projection, "group_size", 0)
             ) != 32:
-                raise ValueError("Qwen 3.8 expanded M8 route requires affine Q4/G32")
+                continue
             expanded_projection_shapes.append(
                 (int(weight.shape[1]) * 8, int(weight.shape[0]))
             )
@@ -276,8 +276,6 @@ def configure_qwen38_dflash_m8_nax_island(
         [(5_120, 1_024)] * 32
         + [(5_120, 10_240)] * 48
         + [(5_120, 17_408)] * 112
-        + [(10_240, 17_408)] * 16
-        + [(12_288, 5_120)] * 48
     )
     if include_m8_expanded and sorted(expanded_projection_shapes) != sorted(
         expected_expanded

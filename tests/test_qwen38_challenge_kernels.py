@@ -20,11 +20,16 @@ from mtplx.qwen38_challenge_kernels import (
 
 
 class _FakeQuantizedProjection(dict):
-    bits = 4
-    group_size = 32
-
-    def __init__(self, packed_shape: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        packed_shape: tuple[int, int],
+        *,
+        bits: int = 4,
+        group_size: int = 32,
+    ) -> None:
         super().__init__(weight=SimpleNamespace(shape=packed_shape))
+        self.bits = bits
+        self.group_size = group_size
 
 
 def _qwen38_full_attention() -> SimpleNamespace:
@@ -51,7 +56,9 @@ def _qwen38_linear_attention() -> SimpleNamespace:
     return SimpleNamespace(
         in_proj_qkv=_FakeQuantizedProjection((10_240, 640)),
         in_proj_z=_FakeQuantizedProjection((6_144, 640)),
-        out_proj=_FakeQuantizedProjection((5_120, 1_536)),
+        out_proj=_FakeQuantizedProjection(
+            (5_120, 1_536), bits=8, group_size=64
+        ),
     )
 
 
@@ -194,10 +201,16 @@ def test_dflash_nax_island_can_add_measured_m7_linear_z_route(monkeypatch) -> No
 def test_dflash_nax_island_validates_expanded_exact_m8_shape_set(monkeypatch) -> None:
     layers = []
     for index in range(64):
-        mlp_k = 5_120 if index < 56 else 10_240
+        mlp_bits = 4 if index < 56 else 8
+        mlp_group = 32 if index < 56 else 64
+        mlp_packed_k = 640 if index < 56 else 1_280
         mlp = SimpleNamespace(
-            gate_proj=_FakeQuantizedProjection((17_408, mlp_k // 8)),
-            up_proj=_FakeQuantizedProjection((17_408, mlp_k // 8)),
+            gate_proj=_FakeQuantizedProjection(
+                (17_408, mlp_packed_k), bits=mlp_bits, group_size=mlp_group
+            ),
+            up_proj=_FakeQuantizedProjection(
+                (17_408, mlp_packed_k), bits=mlp_bits, group_size=mlp_group
+            ),
         )
         attention = (
             {"linear_attn": _qwen38_linear_attention()}
@@ -216,16 +229,12 @@ def test_dflash_nax_island_validates_expanded_exact_m8_shape_set(monkeypatch) ->
                 [5120, 10240],
                 [5120, 17408],
                 [6144, 5120],
-                [10240, 17408],
-                [12288, 5120],
             ],
             "m7_shapes": [[5120, 6144], [6144, 5120]],
             "m8_expanded_shapes": [
                 [5120, 1024],
                 [5120, 10240],
                 [5120, 17408],
-                [10240, 17408],
-                [12288, 5120],
             ],
         },
     )
@@ -238,8 +247,8 @@ def test_dflash_nax_island_validates_expanded_exact_m8_shape_set(monkeypatch) ->
         include_m8_expanded=True,
     )
 
-    assert report["eligible_m8_expanded_projections"] == 256
-    assert report["validated_m8_expanded_projections"] == 256
+    assert report["eligible_m8_expanded_projections"] == 192
+    assert report["validated_m8_expanded_projections"] == 192
 
 
 def test_dual_rms_norm_concat_matches_two_stock_norms() -> None:

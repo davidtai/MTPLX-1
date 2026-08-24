@@ -395,8 +395,6 @@ def test_expanded_m8_engagement_requires_every_winning_shape() -> None:
         "m8_nax_k5120_n1024": 2112,
         "m8_nax_k5120_n10240": 3168,
         "m8_nax_k5120_n17408": 7392,
-        "m8_nax_k10240_n17408": 1056,
-        "m8_nax_k12288_n5120": 3168,
     }
 
     def arm(*, active: bool, calls: dict[str, int]):
@@ -410,13 +408,11 @@ def test_expanded_m8_engagement_requires_every_winning_shape() -> None:
                             [5120, 1024],
                             [5120, 10240],
                             [5120, 17408],
-                            [10240, 17408],
-                            [12288, 5120],
                         ]
                         if active
                         else []
                     ),
-                    "eligible_m8_expanded_projections": 256 if active else 0,
+                    "eligible_m8_expanded_projections": 192 if active else 0,
                 }
             },
             "engagement": {"nax_verify": calls},

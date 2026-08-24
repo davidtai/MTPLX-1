@@ -454,8 +454,6 @@ def _engagement_exact(
             [5120, 1024],
             [5120, 10240],
             [5120, 17408],
-            [10240, 17408],
-            [12288, 5120],
         ]
         counter_keys = [
             f"m8_nax_k{k}_n{n}" for k, n in expected_shapes
@@ -479,7 +477,7 @@ def _engagement_exact(
         ) and all(
             bool(route(row).get("include_m8_expanded"))
             and route(row).get("m8_expanded_shapes") == expected_shapes
-            and int(route(row).get("eligible_m8_expanded_projections", 0)) == 256
+            and int(route(row).get("eligible_m8_expanded_projections", 0)) == 192
             and all(calls(row, key) > 0 for key in counter_keys)
             for row in by_variant["candidate"]
         )
