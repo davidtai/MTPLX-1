@@ -44,6 +44,8 @@ PROMOTION_THRESHOLD_PCT = 0.05
 STATIC_WIDTH = 8
 DFLASH_SURVIVOR_ROWS = frozenset({21, 24, 26, 48})
 DFLASH_ADAPTIVE_ROWS = (11, 15, 18, 24, 25, 26, 32)
+DFLASH_CUSTOM_ROWS = (34, 40, 47)
+DFLASH_CUSTOM_WIDTHS = {34: (6,), 40: (6, 7), 47: (6, 7, 8)}
 FULL_RETAINED_ROUTE = (
     "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
     "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
@@ -166,6 +168,21 @@ def _parse_dflash_adaptive_rows(value: str) -> tuple[int, ...]:
     return rows
 
 
+def _parse_dflash_custom_rows(value: str) -> tuple[int, ...]:
+    if not value.strip():
+        return ()
+    rows = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    unknown = set(rows) - set(DFLASH_CUSTOM_ROWS)
+    if unknown:
+        raise ValueError(f"unsupported DFlash custom rows: {sorted(unknown)}")
+    if tuple(sorted(set(rows))) != rows:
+        raise ValueError("DFlash custom rows must be unique and chronological")
+    expected_prefix = DFLASH_CUSTOM_ROWS[: len(rows)]
+    if rows != expected_prefix:
+        raise ValueError("DFlash custom rows must be dependency-closed")
+    return rows
+
+
 def _install_dflash_route(
     runtime: Any,
     *,
@@ -266,6 +283,7 @@ def _run_dflash_arm(
     route: Any,
     survivor_rows: tuple[int, ...],
     adaptive_rows: tuple[int, ...],
+    custom_rows: tuple[int, ...],
     release_report: dict[str, bool],
 ) -> dict[str, Any]:
     import mlx.core as mx
@@ -298,6 +316,7 @@ def _run_dflash_arm(
                 "dflash2_static8",
                 *(f"r{row:02d}" for row in survivor_rows),
                 *(f"a{row:02d}" for row in adaptive_rows),
+                *(f"c{row:02d}" for row in custom_rows),
             )
         ),
         "installed_route_id": route.route_id,
@@ -368,6 +387,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--release-native-mtp", action="store_true")
     parser.add_argument("--dflash-survivors", default="")
     parser.add_argument("--dflash-adaptive-rows", default="")
+    parser.add_argument("--dflash-custom-rows", default="")
     parser.add_argument(
         "--engine",
         choices=("mtp_fixed_d3", "dflash2"),
@@ -392,6 +412,7 @@ def main() -> int:
         raise FileNotFoundError(f"row 36 artifact is absent: {row36_artifact}")
     survivor_rows = _parse_dflash_survivors(args.dflash_survivors)
     adaptive_rows = _parse_dflash_adaptive_rows(args.dflash_adaptive_rows)
+    custom_rows = _parse_dflash_custom_rows(args.dflash_custom_rows)
 
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,
@@ -456,6 +477,15 @@ def main() -> int:
             active=bool(adaptive_rows),
             proposal_rows=adaptive_rows,
         )
+        from mtplx.qwen38_qmv import configure_qwen38_dflash_qmv
+
+        custom_report = configure_qwen38_dflash_qmv(
+            bundle.draft_model,
+            active=bool(custom_rows),
+            allowed_widths=(
+                DFLASH_CUSTOM_WIDTHS[custom_rows[-1]] if custom_rows else ()
+            ),
+        )
         from mtplx.qwen38_challenge import configure_qwen38_row50_wired_residency
 
         row50_report = configure_qwen38_row50_wired_residency(runtime, active=True)
@@ -464,6 +494,7 @@ def main() -> int:
         runtime.qwen38_feature_receipt = {
             **dict(getattr(runtime, "qwen38_feature_receipt", {}) or {}),
             "adaptive_policy": adaptive_report,
+            "custom_draft_qmv": custom_report,
             "r50_wired_residency": row50_report,
         }
         runtime_context = build_fixed_dflash_runtime_context()
@@ -498,6 +529,7 @@ def main() -> int:
             route=dflash_route,
             survivor_rows=survivor_rows,
             adaptive_rows=adaptive_rows,
+            custom_rows=custom_rows,
             release_report=release_report,
         )
 
@@ -532,6 +564,7 @@ def main() -> int:
         "retained_route": FULL_RETAINED_ROUTE,
         "dflash_survivor_rows": list(survivor_rows),
         "dflash_adaptive_rows": list(adaptive_rows),
+        "dflash_custom_rows": list(custom_rows),
         "native_mtp_release": dict(release_report),
         "mlx_version": importlib.metadata.version("mlx"),
         "dflash_mlx_version": importlib.metadata.version("dflash-mlx"),

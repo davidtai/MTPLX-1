@@ -236,6 +236,10 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
         return None
     min_width = int(getattr(linear, "_mtplx_qwen38_qmv_min_width", 3))
     active_groups = bool(getattr(linear, "_mtplx_qwen38_qmv_active_groups", False))
+    allowed_widths = tuple(
+        int(width)
+        for width in getattr(linear, "_mtplx_qwen38_qmv_allowed_widths", ())
+    )
     weight = linear.weight
     scales = linear.scales
     biases = linear.biases
@@ -253,6 +257,7 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
         or scales.dtype != mx.bfloat16
         or biases.dtype != mx.bfloat16
         or m < min_width
+        or (allowed_widths and m not in allowed_widths)
         or m not in _INPUTS_PER_GROUP
         or int(x.shape[-2]) != m
         or tuple(weight.shape[1:]) != (k // 8,)
@@ -332,6 +337,7 @@ def configure_qwen38_qmv(
         )
         module._mtplx_qwen38_qmv_active = bool(active and is_eligible)
         module._mtplx_qwen38_qmv_min_width = int(min_width)
+        module._mtplx_qwen38_qmv_allowed_widths = ()
         module._mtplx_qwen38_qmv_active_groups = bool(active_groups)
         eligible += int(is_eligible)
     return {
@@ -339,4 +345,52 @@ def configure_qwen38_qmv(
         "active_modules": eligible if active else 0,
         "min_width": int(min_width) if active else 0,
         "active_groups": int(bool(active and active_groups)),
+    }
+
+
+def configure_qwen38_dflash_qmv(
+    draft_model: Any,
+    *,
+    active: bool,
+    allowed_widths: tuple[int, ...],
+) -> dict[str, Any]:
+    """Route only selected DFlash draft block widths through the source QMV."""
+
+    import mlx.nn as nn
+
+    global _ORIGINAL_QUANTIZED_LINEAR_CALL
+    if _ORIGINAL_QUANTIZED_LINEAR_CALL is None:
+        _ORIGINAL_QUANTIZED_LINEAR_CALL = nn.QuantizedLinear.__call__
+
+        def routed_call(self, x):
+            result = qwen38_qmv(self, x)
+            if result is not None:
+                return result
+            return _ORIGINAL_QUANTIZED_LINEAR_CALL(self, x)
+
+        nn.QuantizedLinear.__call__ = routed_call
+
+    widths = tuple(int(width) for width in allowed_widths)
+    if tuple(sorted(set(widths))) != widths or any(
+        width not in _INPUTS_PER_GROUP for width in widths
+    ):
+        raise ValueError("DFlash QMV widths must be unique, chronological, and in 2..9")
+    eligible = 0
+    for module in list(getattr(draft_model, "modules", lambda: [])()):
+        if not isinstance(module, nn.QuantizedLinear):
+            continue
+        is_eligible = bool(
+            int(getattr(module, "bits", 0)) == 4
+            and int(getattr(module, "group_size", 0)) == 64
+            and str(getattr(module, "mode", "")) == "affine"
+        )
+        module._mtplx_qwen38_qmv_active = bool(active and is_eligible)
+        module._mtplx_qwen38_qmv_min_width = min(widths, default=10)
+        module._mtplx_qwen38_qmv_allowed_widths = widths
+        module._mtplx_qwen38_qmv_active_groups = bool(active)
+        eligible += int(is_eligible)
+    return {
+        "eligible_modules": eligible,
+        "active_modules": eligible if active else 0,
+        "allowed_widths": list(widths) if active else [],
     }

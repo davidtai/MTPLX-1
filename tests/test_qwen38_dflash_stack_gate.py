@@ -31,6 +31,14 @@ def test_dflash_adaptive_rows_are_unique_chronological_and_dependency_closed() -
             gate._parse_dflash_adaptive_rows(invalid)
 
 
+def test_dflash_custom_rows_are_dependency_closed() -> None:
+    assert gate._parse_dflash_custom_rows("") == ()
+    assert gate._parse_dflash_custom_rows("34,40,47") == (34, 40, 47)
+    for invalid in ("40", "34,47", "34,34", "34,38"):
+        with pytest.raises(ValueError):
+            gate._parse_dflash_custom_rows(invalid)
+
+
 def test_dflash_flat_counter_delta_tracks_only_current_arm() -> None:
     assert gate._flat_counter_delta(
         {"memo": 11, "qk": 3},
@@ -154,6 +162,28 @@ def test_row11_engagement_requires_candidate_position_ema_cycles() -> None:
 
     assert stack_gate._engagement_exact(args, by_variant) is True
     by_variant["candidate"][1] = arm((11,), 0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_custom_row34_engagement_requires_m6_draft_qmv_calls() -> None:
+    args = SimpleNamespace(
+        candidate_label="c34",
+        control_custom_rows="",
+        candidate_custom_rows="34",
+    )
+
+    def arm(m6):
+        return {"engagement": {"r70_qmv_sumtable": {"m6": m6}}}
+
+    by_variant = {
+        "control": [arm(0), arm(0)],
+        "candidate": [arm(64), arm(63)],
+    }
+
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = arm(0)
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 

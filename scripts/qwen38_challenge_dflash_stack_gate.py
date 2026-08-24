@@ -33,6 +33,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-survivors", default="")
     parser.add_argument("--control-adaptive-rows", default="")
     parser.add_argument("--candidate-adaptive-rows", default="")
+    parser.add_argument("--control-custom-rows", default="")
+    parser.add_argument("--candidate-custom-rows", default="")
     parser.add_argument("--control-release-native-mtp", action="store_true")
     parser.add_argument("--candidate-release-native-mtp", action="store_true")
     parser.add_argument("--model", type=Path, default=arm_gate.DEFAULT_MODEL)
@@ -48,16 +50,21 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _variant_config(args: argparse.Namespace, variant: str) -> tuple[str, str, bool]:
+def _variant_config(
+    args: argparse.Namespace,
+    variant: str,
+) -> tuple[str, str, str, bool]:
     if variant == "control":
         return (
             args.control_survivors,
             args.control_adaptive_rows,
+            args.control_custom_rows,
             bool(args.control_release_native_mtp),
         )
     return (
         args.candidate_survivors,
         args.candidate_adaptive_rows,
+        args.candidate_custom_rows,
         bool(args.candidate_release_native_mtp),
     )
 
@@ -68,7 +75,9 @@ def _child_command(
     variant: str,
     output: Path,
 ) -> list[str]:
-    survivors, adaptive_rows, release_native_mtp = _variant_config(args, variant)
+    survivors, adaptive_rows, custom_rows, release_native_mtp = _variant_config(
+        args, variant
+    )
     command = [
         sys.executable,
         str(ROOT / "scripts/qwen38_challenge_dflash_gate.py"),
@@ -94,6 +103,8 @@ def _child_command(
         survivors,
         "--dflash-adaptive-rows",
         adaptive_rows,
+        "--dflash-custom-rows",
+        custom_rows,
         "--lock",
         str(args.lock),
         "--output",
@@ -112,6 +123,24 @@ def _engagement_exact(
     args: argparse.Namespace,
     by_variant: dict[str, list[dict[str, Any]]],
 ) -> bool:
+    if args.candidate_label.startswith("c"):
+        expected_row = int(args.candidate_label[1:])
+        expected_width = {34: 6, 40: 7, 47: 8}.get(expected_row)
+        control_rows = arm_gate._parse_dflash_custom_rows(args.control_custom_rows)
+        candidate_rows = arm_gate._parse_dflash_custom_rows(args.candidate_custom_rows)
+        if expected_width is None or not candidate_rows or candidate_rows[-1] != expected_row:
+            return False
+
+        def calls(row: dict[str, Any], width: int) -> int:
+            return int(row["engagement"]["r70_qmv_sumtable"][f"m{width}"])
+
+        control_expected = expected_row in control_rows
+        return all(
+            (calls(row, expected_width) > 0) == control_expected
+            for row in by_variant["control"]
+        ) and all(
+            calls(row, expected_width) > 0 for row in by_variant["candidate"]
+        )
     if args.candidate_label.startswith("a"):
         expected_row = int(args.candidate_label[1:])
         control_rows = list(
@@ -254,6 +283,12 @@ def _aggregate(
             "candidate_adaptive_rows": list(
                 arm_gate._parse_dflash_adaptive_rows(args.candidate_adaptive_rows)
             ),
+            "control_custom_rows": list(
+                arm_gate._parse_dflash_custom_rows(args.control_custom_rows)
+            ),
+            "candidate_custom_rows": list(
+                arm_gate._parse_dflash_custom_rows(args.candidate_custom_rows)
+            ),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
             "candidate_release_native_mtp": bool(args.candidate_release_native_mtp),
         },
@@ -298,6 +333,8 @@ def main() -> int:
     arm_gate._parse_dflash_survivors(args.candidate_survivors)
     arm_gate._parse_dflash_adaptive_rows(args.control_adaptive_rows)
     arm_gate._parse_dflash_adaptive_rows(args.candidate_adaptive_rows)
+    arm_gate._parse_dflash_custom_rows(args.control_custom_rows)
+    arm_gate._parse_dflash_custom_rows(args.candidate_custom_rows)
     children: list[dict[str, Any]] = []
     with _gpu_lock_scope(args.lock) as lock_scope:
         with tempfile.TemporaryDirectory(prefix="qwen38-dflash-stack-") as temp_dir:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 
 import mtplx.qwen38_qmv as qmv
 from mtplx.qwen38_qmv import qwen38_qmv_active_input_groups
@@ -52,3 +53,57 @@ def test_row70_routes_real_mlx_arrays_without_a_strides_attribute(monkeypatch) -
     assert result.shape == (3, 4096)
     assert len(calls) == 1
     assert len(contiguous_inputs) == 4
+
+
+def test_dflash_width_filter_keeps_unselected_physical_blocks_stock() -> None:
+    linear = SimpleNamespace(
+        _mtplx_qwen38_qmv_active=True,
+        _mtplx_qwen38_qmv_min_width=2,
+        _mtplx_qwen38_qmv_allowed_widths=(6,),
+        _mtplx_qwen38_qmv_active_groups=False,
+        bits=4,
+        group_size=64,
+        mode="affine",
+        bias=None,
+        weight=mx.zeros((4096, 64), dtype=mx.uint32),
+        scales=mx.zeros((4096, 8), dtype=mx.bfloat16),
+        biases=mx.zeros((4096, 8), dtype=mx.bfloat16),
+    )
+
+    assert qmv.qwen38_qmv(
+        linear,
+        mx.zeros((7, 512), dtype=mx.bfloat16),
+    ) is None
+
+
+def test_dflash_config_marks_only_q4_group64_draft_linears() -> None:
+    eligible = nn.QuantizedLinear(
+        512,
+        4096,
+        bias=False,
+        group_size=64,
+        bits=4,
+    )
+    wrong_group = nn.QuantizedLinear(
+        512,
+        4096,
+        bias=False,
+        group_size=32,
+        bits=4,
+    )
+    draft_model = SimpleNamespace(modules=lambda: [eligible, wrong_group])
+
+    report = qmv.configure_qwen38_dflash_qmv(
+        draft_model,
+        active=True,
+        allowed_widths=(6,),
+    )
+
+    assert report == {
+        "eligible_modules": 1,
+        "active_modules": 1,
+        "allowed_widths": [6],
+    }
+    assert eligible._mtplx_qwen38_qmv_active is True
+    assert eligible._mtplx_qwen38_qmv_allowed_widths == (6,)
+    assert wrong_group._mtplx_qwen38_qmv_active is False
