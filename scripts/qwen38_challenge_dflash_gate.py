@@ -454,6 +454,12 @@ def main() -> int:
         except OSError as exc:
             raise RuntimeError(f"GPU lock is busy: {args.lock}") from exc
 
+    # The retained Qwen3.8 stack is the turbo profile.  Establish its complete
+    # process-latched environment before runtime loading so isolated ABBA arms
+    # cannot silently benchmark the stock/default verify path.
+    from mtplx.profiles import apply_profile_env
+
+    apply_profile_env("turbo")
     os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] = "1"
     from mtplx.backends.registry import load_runtime_contract
 
