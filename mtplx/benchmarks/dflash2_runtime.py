@@ -117,6 +117,21 @@ def load_mtplx_dflash2_bundle(
     """Validate and bind stock DFlash2 to one MTPLX-loaded target model."""
 
     runtime = load_mtplx_runtime(model_path)
+    return bind_mtplx_dflash2_bundle(runtime, draft_ref)
+
+
+def bind_mtplx_dflash2_bundle(
+    runtime: Any,
+    draft_ref: str,
+) -> MTPLXDFlash2Bundle:
+    """Bind DFlash2 to an already configured MTPLX runtime.
+
+    Challenge-port measurements must configure the exact Optimized-Speed
+    target once, then compare the retained MTP path with DFlash2 without
+    loading a second target model.  Keeping this construction path explicit
+    also makes the extra DFlash residency identical in both timed arms.
+    """
+
     target_model = runtime.model
     target_ops = make_target_ops()
 

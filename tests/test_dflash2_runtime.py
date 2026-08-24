@@ -123,6 +123,25 @@ def test_bundle_reuses_exact_runtime_target_and_binds_once(monkeypatch):
         bundle.target_model = object()
 
 
+def test_bundle_can_bind_an_already_configured_runtime(monkeypatch):
+    values = _install_fakes(monkeypatch)
+
+    bundle = dflash2_runtime.bind_mtplx_dflash2_bundle(
+        values.runtime,
+        "z-lab/Qwen3.8-27B-DFlash2",
+    )
+
+    assert bundle.runtime is values.runtime
+    assert bundle.target_model is values.target
+    assert values.calls["runtime"] == []
+    assert values.calls["draft"] == [
+        ("z-lab/Qwen3.8-27B-DFlash2", "w4:gs64")
+    ]
+    assert values.calls["bind"] == [
+        (values.draft, values.target, values.target_ops)
+    ]
+
+
 def test_mtplx_loader_loads_one_mtp_runtime(monkeypatch):
     from mtplx import runtime as runtime_module
 
