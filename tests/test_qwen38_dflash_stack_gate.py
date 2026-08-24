@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from scripts import qwen38_challenge_dflash_gate as gate
@@ -25,3 +28,41 @@ def test_dflash_flat_counter_delta_tracks_only_current_arm() -> None:
         {"memo": 11, "qk": 3},
         {"memo": 18, "qk": 3, "boundary": 4},
     ) == {"boundary": 4, "memo": 7, "qk": 0}
+
+
+def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
+    from mtplx import runtime as runtime_module
+
+    runtime = SimpleNamespace()
+    load_calls = []
+
+    def fake_load(path, *, mtp):
+        load_calls.append((path, mtp))
+        return runtime
+
+    def fake_stack_loader(
+        model_path,
+        runtime_contract,
+        *,
+        load_runtime_fn,
+        install_draft_head_fn,
+    ):
+        loaded = load_runtime_fn(model_path, mtp=True)
+        head = install_draft_head_fn(loaded, bits=4, group_size=64, mode="affine")
+        return loaded, {"contract": runtime_contract, "draft_lm_head_report": head}
+
+    monkeypatch.setattr(runtime_module, "load", fake_load)
+    monkeypatch.setattr(gate, "_load_optimized_speed_stack", fake_stack_loader)
+
+    loaded, report = gate._load_optimized_speed_target_stack(
+        Path("speed"),
+        {"profile": "turbo"},
+    )
+
+    assert loaded is runtime
+    assert load_calls == [(Path("speed"), False)]
+    assert report["native_mtp_loaded"] is False
+    assert report["draft_lm_head_report"] == {
+        "installed": False,
+        "reason": "replaced_by_dflash2",
+    }

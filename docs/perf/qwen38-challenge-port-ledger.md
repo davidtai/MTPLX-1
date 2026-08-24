@@ -161,6 +161,14 @@ path bypassed those hooks. Therefore that receipt is deliberately labeled
 `55 base`, and the final item 55 remains open until each survivor below has an
 adapted gate or a concrete replacement/incompatibility disposition.
 
+The first native-MTP release probe deleted the drafter only after both engines
+had already been constructed. It reported a nominal `+3.1418%`, but candidate
+decode was slower and both routes had the identical 34.30129383 GiB peak and
+22,099,068,944-byte active footprint. That prefill-only drift is preserved as
+`invalid-item55-dflash2-postload-release-native-mtp-python16384in-1024out-t1-isolated-abba-2026-08-23.json`
+and is not promotion evidence. The corrected replacement gate never constructs
+native MTP in the candidate process.
+
 | Survivor | DFlash2 disposition before adaptive 1--8 |
 | ---: | --- |
 | 8 | REPLACED by DFlash2's device-resident eight-token proposal block; no MTP draft chain remains. |

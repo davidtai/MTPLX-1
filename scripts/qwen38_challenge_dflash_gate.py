@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -152,37 +153,78 @@ def _parse_dflash_survivors(value: str) -> tuple[int, ...]:
 
 def _install_dflash_route(
     runtime: Any,
-    config: dict[str, Any],
-    model_path: Path,
     *,
     survivor_rows: tuple[int, ...],
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
-    from mtplx.qwen38_challenge import install_qwen38_route
+    from mtplx.gdn_capture import configure_qwen38_row18_gdn_decay_memo
+    from mtplx.qwen38_challenge_kernels import (
+        configure_qwen38_row21_qk_rms_rope,
+        configure_qwen38_row24_qk_length_limit,
+    )
 
     rows = set(survivor_rows)
-    return install_qwen38_route(
-        runtime,
-        config,
-        model_path,
-        cache_route="control",
-        dual_norm=False,
-        source_proposal=False,
-        row10_compact_vocab=False,
-        mtp_block_variant=None,
-        mtp_block_artifact_path=None,
-        row18_gdn_decay_memo=18 in rows,
-        row21_qk_rms_rope=21 in rows,
-        row24_eval_ladder=24 in rows,
-        row26_prefill_ladder_3=26 in rows,
-        row48_boundary_fused=48 in rows,
-        row50_wired_residency=False,
-        row63_q8_embedding_dual_norm=False,
-        row70_qmv_sumtable=False,
-        row78_qmv_active_groups=False,
-        row80_qmv_m2=False,
+    row18_report = configure_qwen38_row18_gdn_decay_memo(
+        runtime.model,
+        active=18 in rows,
     )
+    row21_report = configure_qwen38_row21_qk_rms_rope(
+        runtime.model,
+        active=21 in rows,
+    )
+    row24_report = configure_qwen38_row24_qk_length_limit(
+        runtime.model,
+        active=24 in rows,
+        max_length=32 if 26 in rows else 16,
+    )
+    text_model = getattr(runtime.model, "language_model", runtime.model)
+    text_model._mtplx_qwen38_row24_eval_ladder = 24 in rows
+    text_model._mtplx_qwen38_row24_prefill_stride = 3 if 26 in rows else 4
+    text_model._mtplx_qwen38_row48_boundary_fused = 48 in rows
+    feature_receipt: dict[str, dict[str, Any]] = {}
+    if 18 in rows:
+        feature_receipt["r18_gdn_decay_memo"] = row18_report
+    if 21 in rows:
+        feature_receipt["r21_qk_rms_rope"] = row21_report
+    if 24 in rows:
+        feature_receipt["r24_qk_length_limit"] = row24_report
+        feature_receipt["r24_eval_ladder"] = {"active": 1}
+    if 26 in rows:
+        feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
+    if 48 in rows:
+        feature_receipt["r48_boundary_fused"] = {"active": 1}
+    runtime.qwen38_feature_receipt = feature_receipt
+    return SimpleNamespace(
+        route_id="+".join(
+            ("dflash2_static8", *(f"r{row:02d}" for row in survivor_rows))
+        )
+    )
+
+
+def _load_optimized_speed_target_stack(
+    model_path: Path,
+    runtime_contract: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Apply the Optimized-Speed profile while never constructing native MTP."""
+
+    from mtplx.runtime import load
+
+    def load_target_only(path: Path, *, mtp: bool) -> Any:
+        if not mtp:
+            raise AssertionError("Optimized-Speed loader contract changed")
+        return load(path, mtp=False)
+
+    def skip_native_draft_head(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"installed": False, "reason": "replaced_by_dflash2"}
+
+    runtime, stack = _load_optimized_speed_stack(
+        model_path,
+        runtime_contract,
+        load_runtime_fn=load_target_only,
+        install_draft_head_fn=skip_native_draft_head,
+    )
+    return runtime, {**stack, "native_mtp_loaded": False}
 
 
 def _dflash_target_counter_snapshot() -> dict[str, int]:
@@ -352,10 +394,17 @@ def main() -> int:
     runtime_contract, contract_error = load_runtime_contract(model_path)
     if contract_error is not None:
         raise RuntimeError(f"invalid runtime contract: {contract_error}")
-    runtime, optimized_stack = _load_optimized_speed_stack(
-        model_path,
-        {} if runtime_contract is None else runtime_contract.raw,
-    )
+    raw_contract = {} if runtime_contract is None else runtime_contract.raw
+    if args.engine == "dflash2" and args.release_native_mtp:
+        runtime, optimized_stack = _load_optimized_speed_target_stack(
+            model_path,
+            raw_contract,
+        )
+    else:
+        runtime, optimized_stack = _load_optimized_speed_stack(
+            model_path,
+            raw_contract,
+        )
 
     from mtplx.artifacts import load_config
 
@@ -363,12 +412,12 @@ def main() -> int:
     bundle = None
     runtime_context = None
     dflash_route = None
-    release_report = {"native_mtp_released": False}
+    release_report = {
+        "native_mtp_released": bool(args.release_native_mtp),
+        "native_mtp_loaded": not bool(args.release_native_mtp),
+    }
     if args.engine == "dflash2":
-        from mtplx.benchmarks.dflash2_runtime import (
-            bind_mtplx_dflash2_bundle,
-            release_mtplx_native_mtp,
-        )
+        from mtplx.benchmarks.dflash2_runtime import bind_mtplx_dflash2_bundle
         from mtplx.benchmarks.runners.dflash2_depth_sweep import (
             build_fixed_dflash_runtime_context,
         )
@@ -376,14 +425,10 @@ def main() -> int:
         bundle = bind_mtplx_dflash2_bundle(runtime, str(draft_path))
         dflash_route = _install_dflash_route(
             runtime,
-            config,
-            model_path,
             survivor_rows=survivor_rows,
         )
         if dflash_route is None:
             raise RuntimeError("DFlash2 survivor route did not install")
-        if args.release_native_mtp:
-            release_report = release_mtplx_native_mtp(runtime)
         from mtplx.qwen38_challenge import configure_qwen38_row50_wired_residency
 
         row50_report = configure_qwen38_row50_wired_residency(runtime, active=True)
