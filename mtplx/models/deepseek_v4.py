@@ -7747,6 +7747,14 @@ def _mia_tp1_wo_attentions(model) -> tuple[tuple[object, ...], tuple[object, ...
     return target, draft
 
 
+# Authentic physical-M6 traces showed persistent native WO-B rounding drift in
+# these target owners.  Seal their exact callable once during installation;
+# the measured decode path does not inspect layer metadata or fall back.
+_MIA_TP1_EXACT_WO_B_TARGET_LAYERS = frozenset(
+    (1, 5, 10, 11, 21, 26, 30, 31, 40)
+)
+
+
 def mia_tp1_wo_projection_receipt(model) -> dict:
     """Return the construction seal for the exact 46-owner TP1 WO route."""
 
@@ -7775,6 +7783,17 @@ def mia_tp1_wo_projection_receipt(model) -> dict:
             raise ValueError(
                 f"Mia TP1 WO attention {index} owns role {plan.owner_role!r}, "
                 f"not {expected_role!r}"
+            )
+        expected_decode_mode = (
+            "exact"
+            if index >= len(target)
+            or index in _MIA_TP1_EXACT_WO_B_TARGET_LAYERS
+            else "native"
+        )
+        if plan.decode_mode != expected_decode_mode:
+            raise ValueError(
+                f"Mia TP1 WO attention {index} owns decode mode "
+                f"{plan.decode_mode!r}, not {expected_decode_mode!r}"
             )
         geometry = (
             int(attention.n_heads),
@@ -7840,6 +7859,9 @@ def mia_tp1_wo_projection_receipt(model) -> dict:
         "plan_count": len(plans),
         "unique_plan_count": len(set(plan_ids)),
         "plan_type": MiaTP1WOMXFP8Plan.__name__,
+        "exact_target_wo_b_layers": tuple(
+            sorted(_MIA_TP1_EXACT_WO_B_TARGET_LAYERS)
+        ),
         "max_prefill_rows": max_prefill_rows.pop(),
         "storage_contract": tuple(
             (shape, str(dtype)) for shape, dtype in expected_storage
@@ -7868,9 +7890,14 @@ def install_mia_tp1_wo_projection_routes(
             wo_b_weight=attention.wo_b.weight,
             wo_b_scales=attention.wo_b.scales,
             owner_role="target",
+            decode_mode=(
+                "exact"
+                if layer_id in _MIA_TP1_EXACT_WO_B_TARGET_LAYERS
+                else "native"
+            ),
             max_prefill_rows=max_prefill_rows,
         )
-        for attention in target
+        for layer_id, attention in enumerate(target)
     ) + tuple(
         install_mia_tp1_wo_mxfp8(
             wo_a_weight=attention.wo_a.weight,
@@ -7878,6 +7905,7 @@ def install_mia_tp1_wo_projection_routes(
             wo_b_weight=attention.wo_b.weight,
             wo_b_scales=attention.wo_b.scales,
             owner_role="draft",
+            decode_mode="exact",
             max_prefill_rows=max_prefill_rows,
         )
         for attention in draft

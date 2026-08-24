@@ -694,9 +694,9 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     }
     assert set(stages) == {
         "mtplx_dsv4_exl3_m6_dual_fc1_input_h4096_v2",
-        "mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v2",
+        "mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v3",
         "mtplx_dsv4_exl3_m6_clamp10_activation_down_i2048_v2",
-        "mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v1",
+        "mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v2",
         "mtplx_dsv4_exl3_m6_direct_final_tail_h4096_t6_v2",
     }
 
@@ -738,7 +738,7 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     assert "float4 up_transformed = hadamard_h128_quad(" in staged_source
     assert "up_h[(size_t)task * HIDDEN + k0 + 3u] = half(" in staged_source
 
-    dual = stages["mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v2"]
+    dual = stages["mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v3"]
     assert dual["output_names"] == ["gate_inner", "up_inner"]
     assert dual["input_names"] == [
         "gate_h",
@@ -750,6 +750,11 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     assert "gate_suh" not in dual["source"]
     assert "hadamard_h128" not in dual["source"]
     assert "half(gate_accumulator0)" in dual["source"]
+    assert "struct QuadWeightPair" in dual["header"]
+    assert "decode_mcg_column_words" in dual["header"]
+    assert "decode_mcg_column_pair" in dual["header"]
+    assert "constant uint QUAD_DESCRIPTORS" not in dual["header"]
+    assert dual["source"].count("decode_mcg_column_pair(") == 2
 
     activation = stages[
         "mtplx_dsv4_exl3_m6_clamp10_activation_down_i2048_v2"
@@ -770,7 +775,7 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
         activation_source
     )
 
-    down = stages["mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v1"]
+    down = stages["mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v2"]
     assert down["input_names"] == ["down_h", "down_trellis", "expert_ids"]
     assert "down_inner[(size_t)task * SIZE_N + n0] = half(accumulator0);" in down[
         "source"

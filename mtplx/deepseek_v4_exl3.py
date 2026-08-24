@@ -726,9 +726,6 @@ def _m6_quad_inner_parts(size_k: int, size_n: int):
 
     if (size_k, size_n) not in ((4096, 2048), (2048, 4096)):
         raise ValueError("Mia M6 inner stages require an exact FC1 or FC2 bank")
-    descriptors = ",".join(
-        str(value) for value in _mcg_quad_descriptor_plan().descriptors
-    )
     header = f"""
         using namespace metal;
         constant constexpr uint SIZE_K = {size_k};
@@ -743,8 +740,6 @@ def _m6_quad_inner_parts(size_k: int, size_n: int):
         constant constexpr uint BLOCK_TILES_N = 16;
         constant constexpr uint STAGE_VECTORS_PER_K_TILE = 96;
         constant constexpr float HAD_SCALE = 0.088388347648f;
-        constant uint QUAD_DESCRIPTORS[64] = {{ {descriptors} }};
-
         inline float hadamard_h128(
             float value,
             uint lane,
@@ -801,100 +796,134 @@ def _m6_quad_inner_parts(size_k: int, size_n: int):
             );
         }}
 
-        inline half4 decode_mcg_quad3(
-            threadgroup const ushort* packed,
-            uint descriptor
+        struct QuadWeights {{
+            half4 q0;
+            half4 q1;
+            half4 q2;
+            half4 q3;
+        }};
+
+        struct QuadWeightPair {{
+            QuadWeights first;
+            QuadWeights second;
+        }};
+
+        inline half4 decode_mcg_windows(
+            uint low0,
+            uint high0,
+            uint shift0,
+            uint low1,
+            uint high1,
+            uint shift1
         ) {{
-            threadgroup const uint* words =
-                reinterpret_cast<threadgroup const uint*>(packed);
-            uint index0 = uint(descriptor) & 0x1fu;
-            uint index1 = (uint(descriptor) >> 5u) & 0x1fu;
-            uint index2 = (uint(descriptor) >> 10u) & 0x1fu;
-            uint shift0 = (uint(descriptor) >> 15u) & 0x1fu;
-            uint shift1 = (uint(descriptor) >> 20u) & 0x1fu;
-            uint word0 = words[index0];
-            uint word1 = words[index1];
-            uint word2 = words[index2];
-            uint window0 = merge_mcg_window(word0, word1, shift0);
-            uint window1 = merge_mcg_window(word1, word2, shift1);
-            uint state0 = (window0 >> 3u) & 0xffffu;
-            uint state1 = window0 & 0xffffu;
-            uint state2 = (window1 >> 3u) & 0xffffu;
-            uint state3 = window1 & 0xffffu;
-            return decode_mcg_states(state0, state1, state2, state3);
+            uint window0 = merge_mcg_window(low0, high0, shift0);
+            uint window1 = merge_mcg_window(low1, high1, shift1);
+            return decode_mcg_states(
+                (window0 >> 3u) & 0xffffu,
+                window0 & 0xffffu,
+                (window1 >> 3u) & 0xffffu,
+                window1 & 0xffffu
+            );
         }}
 
-        inline half4 decode_mcg_quad2(
-            threadgroup const ushort* packed,
-            uint descriptor
+        inline QuadWeights decode_mcg_column_words(
+            threadgroup const uint* words,
+            uint start,
+            bool high
         ) {{
-            threadgroup const uint* words =
-                reinterpret_cast<threadgroup const uint*>(packed);
-            uint index0 = uint(descriptor) & 0x1fu;
-            uint index1 = (uint(descriptor) >> 5u) & 0x1fu;
-            uint shift0 = (uint(descriptor) >> 15u) & 0x1fu;
-            uint shift1 = (uint(descriptor) >> 20u) & 0x1fu;
-            uint word0 = words[index0];
-            uint word1 = words[index1];
-            bool high0_is_word1 = (uint(descriptor) & (1u << 25u)) != 0u;
-            bool low1_is_word1 = (uint(descriptor) & (1u << 26u)) != 0u;
-            uint high0 = select(word0, word1, high0_is_word1);
-            uint low1 = select(word0, word1, low1_is_word1);
-            uint window0 = merge_mcg_window(word0, high0, shift0);
-            uint window1 = merge_mcg_window(low1, word1, shift1);
-            uint state0 = (window0 >> 3u) & 0xffffu;
-            uint state1 = window0 & 0xffffu;
-            uint state2 = (window1 >> 3u) & 0xffffu;
-            uint state3 = window1 & 0xffffu;
-            return decode_mcg_states(state0, state1, state2, state3);
+            uint next1 = (start + 1u) % 24u;
+            uint next2 = (start + 2u) % 24u;
+            uint next3 = (start + 3u) % 24u;
+            uint a = words[start];
+            uint b = words[next1];
+            uint c = words[next2];
+            uint d = words[next3];
+            QuadWeights result;
+            result.q0 = decode_mcg_windows(
+                a, b, select(26u, 14u, high),
+                b, select(b, c, high), select(2u, 22u, high)
+            );
+            result.q1 = decode_mcg_windows(
+                c, select(c, d, high), select(10u, 30u, high),
+                select(c, d, high), d, select(18u, 6u, high)
+            );
+            result.q2 = decode_mcg_windows(
+                select(a, b, high), b, select(20u, 8u, high),
+                b, c, select(28u, 16u, high)
+            );
+            result.q3 = decode_mcg_windows(
+                c, select(c, d, high), select(4u, 24u, high),
+                d, d, select(12u, 0u, high)
+            );
+            return result;
+        }}
+
+        inline QuadWeightPair decode_mcg_column_pair(
+            threadgroup const ushort* packed0,
+            threadgroup const ushort* packed1,
+            uint local_n
+        ) {{
+            uint u = local_n & 7u;
+            bool high = local_n >= 8u;
+            uint start = select(23u, 3u * u - 1u, u != 0u);
+            QuadWeightPair result;
+            result.first = decode_mcg_column_words(
+                reinterpret_cast<threadgroup const uint*>(packed0),
+                start,
+                high
+            );
+            result.second = decode_mcg_column_words(
+                reinterpret_cast<threadgroup const uint*>(packed1),
+                start,
+                high
+            );
+            return result;
         }}
     """
 
     def fma_source(prefix: str, accumulator0: str, accumulator1: str) -> str:
-        blocks = []
-        for quad_row, decoder in enumerate(
-            ("decode_mcg_quad3", "decode_mcg_quad2") * 2
-        ):
+        blocks = [
+            f"""
+            QuadWeightPair {prefix}_weights = decode_mcg_column_pair(
+                {prefix}_tile0,
+                {prefix}_tile1,
+                {prefix}_local_n
+            );
+            """
+        ]
+        for quad_row in range(4):
             blocks.append(
                 f"""
                 uint {prefix}_local_k{quad_row} =
                     tile_k * 16u + {quad_row * 4}u;
-                uint {prefix}_descriptor{quad_row} =
-                    QUAD_DESCRIPTORS[{quad_row * 16}u + {prefix}_local_n];
-                half4 {prefix}_weights{quad_row}_0 = {decoder}(
-                    {prefix}_tile0, {prefix}_descriptor{quad_row}
-                );
-                half4 {prefix}_weights{quad_row}_1 = {decoder}(
-                    {prefix}_tile1, {prefix}_descriptor{quad_row}
-                );
                 float {prefix}_value{quad_row}_0 = float(
                     x_had[{prefix}_local_k{quad_row}]
                 );
                 {accumulator0} += {prefix}_value{quad_row}_0
-                    * float({prefix}_weights{quad_row}_0.x);
+                    * float({prefix}_weights.first.q{quad_row}.x);
                 {accumulator1} += {prefix}_value{quad_row}_0
-                    * float({prefix}_weights{quad_row}_1.x);
+                    * float({prefix}_weights.second.q{quad_row}.x);
                 float {prefix}_value{quad_row}_1 = float(
                     x_had[{prefix}_local_k{quad_row} + 1u]
                 );
                 {accumulator0} += {prefix}_value{quad_row}_1
-                    * float({prefix}_weights{quad_row}_0.y);
+                    * float({prefix}_weights.first.q{quad_row}.y);
                 {accumulator1} += {prefix}_value{quad_row}_1
-                    * float({prefix}_weights{quad_row}_1.y);
+                    * float({prefix}_weights.second.q{quad_row}.y);
                 float {prefix}_value{quad_row}_2 = float(
                     x_had[{prefix}_local_k{quad_row} + 2u]
                 );
                 {accumulator0} += {prefix}_value{quad_row}_2
-                    * float({prefix}_weights{quad_row}_0.z);
+                    * float({prefix}_weights.first.q{quad_row}.z);
                 {accumulator1} += {prefix}_value{quad_row}_2
-                    * float({prefix}_weights{quad_row}_1.z);
+                    * float({prefix}_weights.second.q{quad_row}.z);
                 float {prefix}_value{quad_row}_3 = float(
                     x_had[{prefix}_local_k{quad_row} + 3u]
                 );
                 {accumulator0} += {prefix}_value{quad_row}_3
-                    * float({prefix}_weights{quad_row}_0.w);
+                    * float({prefix}_weights.first.q{quad_row}.w);
                 {accumulator1} += {prefix}_value{quad_row}_3
-                    * float({prefix}_weights{quad_row}_1.w);
+                    * float({prefix}_weights.second.q{quad_row}.w);
                 """
             )
         return "".join(blocks)
@@ -1125,7 +1154,7 @@ def _m6_dual_fc1_inner_kernel():
         up_inner[(size_t)task * SIZE_N + n1] = half(up_accumulator1);
     """
     return mx.fast.metal_kernel(
-        name="mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v2",
+        name="mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v3",
         input_names=[
             "gate_h",
             "up_h",
@@ -1383,7 +1412,7 @@ def _m6_down_inner_kernel():
         down_inner[(size_t)task * SIZE_N + n1] = half(accumulator1);
     """
     return mx.fast.metal_kernel(
-        name="mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v1",
+        name="mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v2",
         input_names=["down_h", "down_trellis", "expert_ids"],
         output_names=["down_inner"],
         header=header,

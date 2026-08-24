@@ -730,6 +730,7 @@ class MiaTP1WOMXFP8Plan:
     wo_b_weight: object
     wo_b_scales: object
     owner_role: str
+    decode_mode: str
     max_prefill_rows: int
     inverse_rope_quant: object
     group_major_quant: object
@@ -843,6 +844,7 @@ def install_mia_tp1_wo_mxfp8(
     wo_b_weight,
     wo_b_scales,
     owner_role: str,
+    decode_mode: str,
     max_prefill_rows: int,
 ) -> MiaTP1WOMXFP8Plan:
     """Validate native MXFP8 storage once and bind the finite TP1 routes."""
@@ -877,10 +879,15 @@ def install_mia_tp1_wo_mxfp8(
     owner_role = str(owner_role)
     if owner_role not in {"target", "draft"}:
         raise ValueError(f"unsupported Mia TP1 WO owner role: {owner_role!r}")
+    decode_mode = str(decode_mode)
+    if decode_mode not in {"native", "exact"}:
+        raise ValueError(f"unsupported Mia TP1 WO decode mode: {decode_mode!r}")
+    if owner_role == "draft" and decode_mode != "exact":
+        raise ValueError("Mia TP1 WO draft owners require exact decode")
     group_major_quant = _group_major_quant_kernel()
     decode_wo_b = (
         _native_quantized_mxfp8_wo_b(wo_b_weight, wo_b_scales)
-        if owner_role == "target"
+        if decode_mode == "native"
         else _exact_quantized_mxfp8_wo_b(wo_b_weight, wo_b_scales)
     )
     return MiaTP1WOMXFP8Plan(
@@ -889,6 +896,7 @@ def install_mia_tp1_wo_mxfp8(
         wo_b_weight=wo_b_weight,
         wo_b_scales=wo_b_scales,
         owner_role=owner_role,
+        decode_mode=decode_mode,
         max_prefill_rows=max_prefill_rows,
         inverse_rope_quant=_inverse_rope_quant_kernel(),
         group_major_quant=group_major_quant,
