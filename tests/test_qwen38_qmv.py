@@ -111,6 +111,41 @@ def test_dflash_config_marks_only_q4_group64_draft_linears() -> None:
     assert wrong_group._mtplx_qwen38_qmv_active is False
 
 
+def test_dflash_config_routes_verify_linear_private_dispatch(monkeypatch) -> None:
+    class DraftVerifyLinear(nn.QuantizedLinear):
+        def __init__(self) -> None:
+            super().__init__(
+                512,
+                4096,
+                bias=False,
+                group_size=64,
+                bits=4,
+            )
+            object.__setattr__(self, "_call_fn", lambda _x: "stock")
+
+        def __call__(self, x):
+            return self._call_fn(x)
+
+    routed = object()
+    monkeypatch.setattr(
+        qmv,
+        "qwen38_qmv",
+        lambda linear, _x: routed
+        if linear._mtplx_qwen38_qmv_active
+        else None,
+    )
+    linear = DraftVerifyLinear()
+    draft_model = SimpleNamespace(modules=lambda: [linear])
+
+    qmv.configure_qwen38_dflash_qmv(
+        draft_model,
+        active=True,
+        allowed_widths=(6,),
+    )
+
+    assert linear(mx.zeros((1, 6, 512), dtype=mx.bfloat16)) is routed
+
+
 def test_dflash_direct_nibble_route_does_not_add_row70_sum_table(monkeypatch) -> None:
     calls = []
 

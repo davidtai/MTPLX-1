@@ -398,6 +398,21 @@ def configure_qwen38_dflash_qmv(
         module._mtplx_qwen38_qmv_active_groups = bool(active)
         module._mtplx_qwen38_qmv_use_table = False
         module._mtplx_qwen38_qmv_min_output_size = 0
+        private_dispatch = getattr(module, "_call_fn", None)
+        if callable(private_dispatch) and not hasattr(
+            module, "_mtplx_qwen38_qmv_original_call_fn"
+        ):
+            object.__setattr__(
+                module,
+                "_mtplx_qwen38_qmv_original_call_fn",
+                private_dispatch,
+            )
+
+            def routed_private_call(x, *, _module=module, _stock=private_dispatch):
+                result = qwen38_qmv(_module, x)
+                return _stock(x) if result is None else result
+
+            object.__setattr__(module, "_call_fn", routed_private_call)
         eligible += int(is_eligible)
     return {
         "eligible_modules": eligible,
