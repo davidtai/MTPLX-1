@@ -75,6 +75,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m6-barrier-free-kp1", action="store_true")
     parser.add_argument("--control-m56-kconst", action="store_true")
     parser.add_argument("--candidate-m56-kconst", action="store_true")
+    parser.add_argument("--control-m5-kconst", action="store_true")
+    parser.add_argument("--candidate-m5-kconst", action="store_true")
+    parser.add_argument("--control-m6-kconst", action="store_true")
+    parser.add_argument("--candidate-m6-kconst", action="store_true")
     parser.add_argument("--control-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--candidate-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--control-disable-row24-decode-ladder", action="store_true")
@@ -140,6 +144,12 @@ def _variant_environment(
     )
     environment["MTPLX_QWEN38_M56_KCONST"] = (
         "1" if bool(getattr(args, f"{prefix}_m56_kconst", False)) else "0"
+    )
+    environment["MTPLX_QWEN38_M5_KCONST"] = (
+        "1" if bool(getattr(args, f"{prefix}_m5_kconst", False)) else "0"
+    )
+    environment["MTPLX_QWEN38_M6_KCONST"] = (
+        "1" if bool(getattr(args, f"{prefix}_m6_kconst", False)) else "0"
     )
     return environment
 
@@ -430,27 +440,36 @@ def _engagement_exact(
         return all(matches(row, False) for row in by_variant["control"]) and all(
             matches(row, True) for row in by_variant["candidate"]
         )
-    if args.candidate_label == "m56_kconst":
-        def matches(row: dict[str, Any], active: bool) -> bool:
+    if args.candidate_label in {"m5_kconst", "m6_kconst", "m56_kconst"}:
+        expected_families = {
+            "m5_kconst": {"m5"},
+            "m6_kconst": {"m6"},
+            "m56_kconst": {"m5", "m6"},
+        }[args.candidate_label]
+
+        def matches(row: dict[str, Any], families: set[str]) -> bool:
             report = row.get("feature_receipt", {}).get("dflash_m56_kconst", {})
-            if bool(report.get("active")) != active:
+            if bool(report.get("active")) != bool(families):
                 return False
-            expected_m5 = [[5120, 48], [5120, 10240]] if active else []
-            expected_m6 = [[5120, 10240]] if active else []
+            expected_m5 = [[5120, 48], [5120, 10240]] if "m5" in families else []
+            expected_m6 = [[5120, 10240]] if "m6" in families else []
             if report.get("m5_shapes") != expected_m5 or report.get(
                 "m6_shapes"
             ) != expected_m6:
                 return False
             counters = row.get("engagement", {}).get("nax_verify", {})
             keys = (
-                "m5_ksplit_kconst_k5120_n48",
-                "m5_ksplit_kconst_k5120_n10240",
-                "m6_ksplit_kconst_k5120_n10240",
+                ("m5", "m5_ksplit_kconst_k5120_n48"),
+                ("m5", "m5_ksplit_kconst_k5120_n10240"),
+                ("m6", "m6_ksplit_kconst_k5120_n10240"),
             )
-            return all((int(counters.get(key, 0)) > 0) == active for key in keys)
+            return all(
+                (int(counters.get(key, 0)) > 0) == (family in families)
+                for family, key in keys
+            )
 
-        return all(matches(row, False) for row in by_variant["control"]) and all(
-            matches(row, True) for row in by_variant["candidate"]
+        return all(matches(row, set()) for row in by_variant["control"]) and all(
+            matches(row, expected_families) for row in by_variant["candidate"]
         )
     if args.candidate_label == "release_native_mtp":
         return all(
@@ -1120,6 +1139,10 @@ def _aggregate(
             "candidate_m6_barrier_free_kp1": bool(args.candidate_m6_barrier_free_kp1),
             "control_m56_kconst": bool(args.control_m56_kconst),
             "candidate_m56_kconst": bool(args.candidate_m56_kconst),
+            "control_m5_kconst": bool(args.control_m5_kconst),
+            "candidate_m5_kconst": bool(args.candidate_m5_kconst),
+            "control_m6_kconst": bool(args.control_m6_kconst),
+            "candidate_m6_kconst": bool(args.candidate_m6_kconst),
             "control_disable_row24_prefill_ladder": bool(
                 args.control_disable_row24_prefill_ladder
             ),

@@ -1050,13 +1050,20 @@ def configure_qwen38_m6_barrier_free_kp1(*, active: bool) -> dict[str, bool]:
     return {"active": bool(active)}
 
 
-def configure_qwen38_m56_kconst(*, active: bool) -> dict[str, object]:
+def configure_qwen38_m56_kconst(
+    *,
+    active: bool,
+    m5_active: bool = True,
+    m6_active: bool = True,
+) -> dict[str, object]:
     global _QWEN38_M5_KCONST_SHAPES, _QWEN38_M6_KCONST_SHAPES
     _QWEN38_M5_KCONST_SHAPES = (
-        frozenset({(5_120, 48), (5_120, 10_240)}) if active else frozenset()
+        frozenset({(5_120, 48), (5_120, 10_240)})
+        if active and m5_active
+        else frozenset()
     )
     _QWEN38_M6_KCONST_SHAPES = (
-        frozenset({(5_120, 10_240)}) if active else frozenset()
+        frozenset({(5_120, 10_240)}) if active and m6_active else frozenset()
     )
     return {
         "active": bool(active),

@@ -363,6 +363,12 @@ def test_qwen38_m5_m6_kconst_configuration() -> None:
         "m5_shapes": [],
         "m6_shapes": [],
     }
+    assert configure_qwen38_m56_kconst(active=True, m5_active=False) == {
+        "active": True,
+        "m5_shapes": [],
+        "m6_shapes": [[5120, 10240]],
+    }
+    configure_qwen38_m56_kconst(active=False)
 
 
 def test_m8_output_can_be_removed_without_removing_m7_or_mlp() -> None:

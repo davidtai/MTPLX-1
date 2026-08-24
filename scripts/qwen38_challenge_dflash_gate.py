@@ -298,8 +298,13 @@ def _install_dflash_route(
     )
     from mtplx.nax_verify import configure_qwen38_m56_kconst
 
+    m56_kconst = os.environ.get("MTPLX_QWEN38_M56_KCONST", "0") == "1"
+    m5_kconst = m56_kconst or os.environ.get("MTPLX_QWEN38_M5_KCONST", "0") == "1"
+    m6_kconst = m56_kconst or os.environ.get("MTPLX_QWEN38_M6_KCONST", "0") == "1"
     m56_kconst_report = configure_qwen38_m56_kconst(
-        active=os.environ.get("MTPLX_QWEN38_M56_KCONST", "0") == "1"
+        active=bool(m5_kconst or m6_kconst),
+        m5_active=bool(m5_kconst),
+        m6_active=bool(m6_kconst),
     )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
