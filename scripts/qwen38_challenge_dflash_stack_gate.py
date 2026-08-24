@@ -140,7 +140,7 @@ def _engagement_exact(
     args: argparse.Namespace,
     by_variant: dict[str, list[dict[str, Any]]],
 ) -> bool:
-    if args.candidate_label.startswith("c"):
+    if args.candidate_label.startswith("c") and args.candidate_label[1:].isdigit():
         expected_row = int(args.candidate_label[1:])
         expected_width = {34: 6, 40: 7, 47: 8}.get(expected_row)
         control_rows = arm_gate._parse_dflash_custom_rows(args.control_custom_rows)
