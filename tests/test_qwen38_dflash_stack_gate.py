@@ -348,6 +348,45 @@ def test_m7_output_engagement_requires_actual_padded_m8_routes() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m7_linear_z_engagement_requires_incremental_live_routes() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m7_nax_linear_z")
+
+    def arm(*, linear: bool, linear_calls: int):
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "active": True,
+                    "include_m7_output": True,
+                    "include_m7_linear_z": linear,
+                    "m7_shapes": (
+                        [[5120, 6144], [6144, 5120]]
+                        if linear
+                        else [[6144, 5120]]
+                    ),
+                    "eligible_m7_projections": 64 if linear else 16,
+                    "eligible_m7_linear_z_projections": 48 if linear else 0,
+                }
+            },
+            "engagement": {
+                "nax_verify": {
+                    "m7_to_m8_nax_k6144_n5120": 992,
+                    "m7_to_m8_nax_k5120_n6144": linear_calls,
+                }
+            },
+            "adaptive_metrics": {"cycles_by_block": {"7": 62}},
+        }
+
+    by_variant = {
+        "control": [arm(linear=False, linear_calls=0) for _ in range(2)],
+        "candidate": [arm(linear=True, linear_calls=2976) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = arm(linear=True, linear_calls=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

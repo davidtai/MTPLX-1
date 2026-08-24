@@ -868,6 +868,7 @@ def configure_qwen38_m8_nax_island(
     active: bool,
     include_linear_z: bool = False,
     include_m7_output: bool = False,
+    include_m7_linear_z: bool = False,
 ) -> dict[str, object]:
     global _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES
     global _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES
@@ -876,12 +877,15 @@ def configure_qwen38_m8_nax_island(
         shapes = shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
     _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES = shapes if active else frozenset()
     m7_shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES if include_m7_output else frozenset()
+    if include_m7_linear_z:
+        m7_shapes = m7_shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
     _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES = m7_shapes if active else frozenset()
     return {
         "active": bool(active),
         "width": 8,
         "include_linear_z": bool(include_linear_z),
         "include_m7_output": bool(include_m7_output),
+        "include_m7_linear_z": bool(include_m7_linear_z),
         "shapes": [list(shape) for shape in sorted(shapes)],
         "m7_shapes": [list(shape) for shape in sorted(m7_shapes)],
     }

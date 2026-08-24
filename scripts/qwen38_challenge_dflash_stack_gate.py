@@ -43,6 +43,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m8-linear-z", action="store_true")
     parser.add_argument("--control-m7-nax-output", action="store_true")
     parser.add_argument("--candidate-m7-nax-output", action="store_true")
+    parser.add_argument("--control-m7-nax-linear-z", action="store_true")
+    parser.add_argument("--candidate-m7-nax-linear-z", action="store_true")
     parser.add_argument("--control-cost-aligned-widths", action="store_true")
     parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
@@ -83,7 +85,7 @@ def _variant_environment(
 def _variant_config(
     args: argparse.Namespace,
     variant: str,
-) -> tuple[str, str, str, str, bool, bool, bool, bool, bool]:
+) -> tuple[str, str, str, str, bool, bool, bool, bool, bool, bool]:
     if variant == "control":
         return (
             args.control_survivors,
@@ -93,6 +95,7 @@ def _variant_config(
             bool(args.control_m8_nax_island),
             bool(args.control_m8_linear_z),
             bool(args.control_m7_nax_output),
+            bool(args.control_m7_nax_linear_z),
             bool(args.control_cost_aligned_widths),
             bool(args.control_release_native_mtp),
         )
@@ -104,6 +107,7 @@ def _variant_config(
         bool(args.candidate_m8_nax_island),
         bool(args.candidate_m8_linear_z),
         bool(args.candidate_m7_nax_output),
+        bool(args.candidate_m7_nax_linear_z),
         bool(args.candidate_cost_aligned_widths),
         bool(args.candidate_release_native_mtp),
     )
@@ -123,6 +127,7 @@ def _child_command(
         m8_nax_island,
         m8_linear_z,
         m7_nax_output,
+        m7_nax_linear_z,
         cost_aligned_widths,
         release_native_mtp,
     ) = _variant_config(args, variant)
@@ -170,6 +175,8 @@ def _child_command(
         command.append("--dflash-m8-linear-z")
     if m7_nax_output:
         command.append("--dflash-m7-nax-output")
+    if m7_nax_linear_z:
+        command.append("--dflash-m7-nax-linear-z")
     return command
 
 
@@ -405,6 +412,36 @@ def _engagement_exact(
             and calls(row) > 0
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "m7_nax_linear_z":
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        def calls(row: dict[str, Any], shape: str) -> int:
+            return int(
+                row.get("engagement", {})
+                .get("nax_verify", {})
+                .get(shape, 0)
+            )
+
+        return all(
+            bool(route(row).get("include_m7_output"))
+            and not bool(route(row).get("include_m7_linear_z"))
+            and route(row).get("m7_shapes") == [[6144, 5120]]
+            and calls(row, "m7_to_m8_nax_k6144_n5120") > 0
+            and calls(row, "m7_to_m8_nax_k5120_n6144") == 0
+            for row in by_variant["control"]
+        ) and all(
+            bool(route(row).get("include_m7_output"))
+            and bool(route(row).get("include_m7_linear_z"))
+            and route(row).get("m7_shapes") == [[5120, 6144], [6144, 5120]]
+            and int(route(row).get("eligible_m7_projections", 0)) == 64
+            and int(route(row).get("eligible_m7_linear_z_projections", 0)) == 48
+            and calls(row, "m7_to_m8_nax_k6144_n5120") > 0
+            and calls(row, "m7_to_m8_nax_k5120_n6144") > 0
+            for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -498,6 +535,8 @@ def _aggregate(
             "candidate_m8_linear_z": bool(args.candidate_m8_linear_z),
             "control_m7_nax_output": bool(args.control_m7_nax_output),
             "candidate_m7_nax_output": bool(args.candidate_m7_nax_output),
+            "control_m7_nax_linear_z": bool(args.control_m7_nax_linear_z),
+            "candidate_m7_nax_linear_z": bool(args.candidate_m7_nax_linear_z),
             "control_cost_aligned_widths": bool(args.control_cost_aligned_widths),
             "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
@@ -565,6 +604,10 @@ def main() -> int:
             getattr(args, f"{prefix}_m8_nax_island")
         ):
             raise ValueError("DFlash M7 output route requires the M8 NAX island")
+        if bool(getattr(args, f"{prefix}_m7_nax_linear_z")) and not bool(
+            getattr(args, f"{prefix}_m7_nax_output")
+        ):
+            raise ValueError("DFlash M7 linear-Z route requires the M7 output route")
     for value in (
         args.control_max_mb_per_buffer,
         args.candidate_max_mb_per_buffer,
