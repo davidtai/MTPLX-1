@@ -98,6 +98,8 @@ cumulative control before that later decision can remain authoritative.
 | 63 corrected | replace separate row-61 kernel with fused Q8 embedding/norm/concat | 768.177 | 55.700 | 32.72812 | 39.773 | **-0.1895%** | REJECTED, row 61 retained | same |
 | 55 base | retained fixed MTP D3 stack | 742.781 | 55.441 | 32.72811 | 40.604 | - | replacement control | `item55-dflash2-static8-on-full-fixed-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 55 base | DFlash2 fixed depth 8, before survivor-specific ports | 733.786 | 65.858 | 34.81407 | 37.917 | **+7.0860%** | **RETAINED as the replacement base**; not the final merged item 55 | same |
+| 55 target-only | DFlash2 with native MTP still constructed | 732.129 | 68.140 | 34.30132 | 37.444 | - | DFlash replacement control | `item55-dflash2-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 target-only | Optimized-Speed target plus DFlash2; native MTP never constructed | 747.429 | 66.839 | 32.73674 | 37.275 | **+0.4543%** | **RETAINED**, -1.56458 GiB peak | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
