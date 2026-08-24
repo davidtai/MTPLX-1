@@ -210,7 +210,7 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     )
     monkeypatch.setattr(
         "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_m8_nax_island",
-        lambda model, *, active, include_m7_output=False, include_m7_linear_z=False, include_m8_kv=False, include_m8_qkv=False, include_m8_mlp=False, include_m5_exact=False: {
+        lambda model, *, active, include_m7_output=False, include_m7_linear_z=False, include_m8_kv=False, include_m8_qkv=False, include_m8_mlp=False, include_m5_exact=False, include_m6_kp1=False: {
             "active": active,
             "width": 8,
             "include_m7_output": include_m7_output,
@@ -219,6 +219,10 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
             "include_m8_qkv": include_m8_qkv,
             "include_m8_mlp": include_m8_mlp,
             "include_m5_exact": include_m5_exact,
+            "include_m6_kp1": include_m6_kp1,
+            "m6_kp1_shapes": (
+                [[5120, 10240], [5120, 17408]] if include_m6_kp1 else []
+            ),
             "shapes": (
                 [[5120, 1024], [6144, 5120]]
                 if include_m8_kv and not include_m8_qkv
@@ -282,6 +286,8 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
         "include_m8_qkv": True,
         "include_m8_mlp": True,
         "include_m5_exact": True,
+        "include_m6_kp1": True,
+        "m6_kp1_shapes": [[5120, 10240], [5120, 17408]],
         "shapes": [[5120, 1024], [5120, 10240], [5120, 17408], [6144, 5120]],
         "m7_shapes": [[5120, 6144], [6144, 5120]],
         "eligible_projections": 16,
