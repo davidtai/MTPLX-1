@@ -416,7 +416,7 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             model, active=True, proposal_rows=(11, 15)
         ),
         "r50_wired_residency": configure_qwen38_row50_wired_residency(
-            runtime.target_runtime, active=False
+            runtime.target_runtime, active=True
         ),
         "r53_command_buffers": {
             "active": False,
@@ -430,6 +430,8 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             "native_mtp_loaded": False,
         },
     }
+    if not bool(receipt["r50_wired_residency"].get("installed")):
+        raise RuntimeError("retained DFlash row 50 residency policy did not install")
     receipt["context_route"] = qwen38_dflash_context_route(1024)
     return receipt
 
@@ -446,7 +448,9 @@ def qwen38_dflash_context_route(prompt_tokens: int) -> dict[str, Any]:
         "row24_decode_active": True,
         "row48_prefill_active": True,
         "row48_decode_active": True,
-        "row50_active": long_context,
+        # Removing residency won alone at 1K, but regressed 1.608% when
+        # assembled with the process-wide stock row-53 policy.
+        "row50_active": True,
     }
 
 

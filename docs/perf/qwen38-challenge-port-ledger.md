@@ -314,15 +314,25 @@ same exact diff. Every row below now has a final individual disposition.
 | 80 | 1139 | 0.3477% | `e8f14c444156` | `49484169aabc` | +8/-4 | DEPENDENCY ABSENT: extends the rejected row-70 QMV plus row-78 launch policy to M=2. Although committed-history updates can present M2, the required kernel family is absent after row 70's fixed-stack incompatibility rejection, so row 80 has no independent executable change. |
 | 82 | 1153 | 0.3733% | `eb5eadc7a165` | `3142edaa4070` | +5/-27 | CONDITIONER-COVERED/DEPENDENCY ABSENT: removes untimed folded-history warm shapes and skips construction of a fallback probe-sort factory while row 69's E87 argmax selector is active. The exact 1,024-token route conditioner already pays any live first touch before timed arms, and the argmax-only selector is absent from the required stochastic route. |
 
-All 54 rows now have a direct measured or source-causal disposition. The branch
-ships the retained DFlash stack through the first-class bundle/runtime entry
-point: target-only Optimized-Speed, the pinned W4/group-64 DFlash draft, fixed
-target rows 21/24/26/48, active rows 50/53, the retained row-11+15 adaptive
-policy over physical blocks 1--8, and the final target-shape kernel winner set.
-The final four-arm ABBA measured the 16,384-token Python prompt plus 1,024 output
-tokens at 772.201 prefill tok/s, 70.045 decode tok/s, 35.869 s wall, and 35.349
-GB peak. Against the post54 DFlash control, decode improved 2.150% and wall
-improved 0.729%. The exact-M8 output route is intentionally absent; M7 output
-and linear-Z, M8 K/V/QKV/MLP, exact-M5, and selected-M6 routes all engaged.
-The receipt is
+All 54 rows have a direct measured or source-causal disposition. The branch
+ships the target-only Optimized-Speed model, pinned W4/group-64 DFlash draft,
+row 50, row 24 decode, row 26, both row 48 phases, and the final M5--M8 kernel
+winners through the first-class bundle/runtime entry point. The earlier final
+stack reached 772.201 prefill tok/s, 70.045 decode tok/s, 35.869 s wall, and
+35.349 GB peak at 16K; its receipt remains
 `final-dflash2-phase-corrected-stack-vs-post54-control-python16384in-1024out-t1-isolated-abba-2026-08-24.json`.
+
+The subsequent nine-mechanism phase re-gate measured every relevant live path
+at both 1K and 16K, for 18 four-arm ABBA runs. At 16K the assembled removal of
+adaptive rows 11+15, row 21, row 24 prefill, and tuned row-53 command buffers
+improved prefill 750.765→755.688 tok/s, decode 69.109→69.332 tok/s, and wall
+36.671→36.474 s (**+0.5404%**) while reducing peak memory 35.349→26.564 GB.
+The same phase split with tuned row-53 buffers regressed wall 0.1563%, so row 53
+is not separable from the winning assembly. Because MLX latches row 53 at
+process startup, stock buffers are selected globally under the agreed 16K
+decision rule. At 1K that process-wide choice costs 0.3533% wall time; removing
+row 50 at the same time amplified the regression to 1.6078%, so row 50 remains
+active at every context. Below 16K, adaptive row 15, row 21, and row 24 prefill
+also remain active. The full 18-row table and assembly receipts are in
+`docs/perf/qwen38-challenge-performance-tables.md` and
+`docs/perf/receipts/qwen38-challenge-port/phase-split-*.json`.

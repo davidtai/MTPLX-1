@@ -199,3 +199,56 @@ survives the final composability check.
 | M5 KCONST isolated | 762.890 → 745.013 | 69.395 → 69.512 | 36.267 → 36.760 | **-1.3406%** | 35.34894 → 35.34896 | REJECTED after final composability check | `followup-m5-kconst-on-barrier-free-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | M6 QKV KCONST on M5 KCONST | 768.666 → 759.304 | 69.720 → 70.305 | 36.036 → 36.182 | **-0.4033%** | 35.34894 → 35.34894 | REJECTED after final composability check | `followup-m6-kconst-on-m5-kconst-barrier-free-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Final barrier-free + KCONST composition | 763.851 → 743.324 | 69.361 → 71.286 | 36.246 → 36.460 | **-0.5857%** | 35.34894 → 35.34896 | REJECTED; gain came from one anomalous pair, second pair tied | `final-m58-exhausted-winner-stack-vs-pre-followup-final-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+
+## Final-stack phase re-gate: nine relevant mechanisms
+
+These are the 18 requested follow-up measurements: nine live mechanisms at
+1,024 and 16,384 Python input tokens, always with a 1,024-token conditioner,
+1,024 output tokens, and four isolated ABBA arms. Each candidate removes the
+named mechanism from the same fully stacked DFlash2 control. Phase rows use the
+named prefill/decode metric and shared rows use wall time; the strict gate is
+greater than 0.05%. Wall delta is `control / candidate - 1`, so positive is a
+faster removal. Peak values are MLX decimal GB, matching the raw receipts.
+
+| Row / phase | Context | Prefill tok/s | Decode tok/s | Wall s | Wall delta | Peak GB | Result on final stack |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 15 adaptive decode | 1K | 777.296 → 747.819 | 75.766 → 63.195 | 14.867 → 17.601 | -15.5345% | 29.937 → 29.937 | Keep adaptive |
+| 15 adaptive decode | 16K | 772.501 → 770.636 | 70.104 → 70.527 | 35.848 → 35.806 | +0.1166% | 35.349 → 35.352 | Bypass adaptive |
+| 21 fused QK decode | 1K | 714.202 → 754.447 | 75.741 → 75.376 | 14.988 → 14.976 | +0.0845% | 29.937 → 29.937 | Keep row 21 by decode gate |
+| 21 fused QK decode | 16K | 767.725 → 764.508 | 69.902 → 70.001 | 36.024 → 36.091 | -0.1840% | 35.349 → 35.349 | Bypass row 21 by decode gate; assembly required |
+| 24 decode ladder + QK fence | 1K | 737.339 → 737.862 | 74.543 → 73.736 | 15.160 → 15.309 | -0.9746% | 29.937 → 29.905 | Keep decode path |
+| 24 decode ladder + QK fence | 16K | 758.761 → 759.669 | 69.631 → 69.164 | 36.333 → 36.405 | -0.1962% | 35.349 → 35.760 | Keep decode path |
+| 24 prefill ladder | 1K | 775.982 → 766.103 | 75.844 → 75.330 | 14.855 → 14.964 | -0.7244% | 29.937 → 26.259 | Keep prefill path |
+| 24 prefill ladder | 16K | 772.371 → 772.872 | 70.092 → 69.873 | 35.855 → 35.887 | -0.0872% | 35.349 → 33.155 | Bypass prefill path by prefill gate; assembly required |
+| 26 stride-3 prefill | 1K | 780.401 → 740.042 | 75.591 → 73.739 | 14.895 → 15.304 | -2.6735% | 29.937 → 27.318 | Keep |
+| 26 stride-3 prefill | 16K | 774.196 → 770.108 | 70.036 → 69.997 | 35.817 → 35.937 | -0.3351% | 35.349 → 36.874 | Keep |
+| 48 prefill boundary fusion | 1K | 765.732 → 765.268 | 75.813 → 75.295 | 14.879 → 14.972 | -0.6226% | 29.937 → 26.283 | Keep |
+| 48 prefill boundary fusion | 16K | 772.018 → 772.169 | 70.066 → 69.944 | 35.870 → 35.891 | -0.0559% | 35.349 → 33.536 | Keep; +0.0195% prefill is below gate |
+| 48 decode boundary fusion | 1K | 713.797 → 728.604 | 73.947 → 73.947 | 15.316 → 15.286 | +0.2007% | 29.937 → 29.937 | Keep/tie; +0.00008% decode |
+| 48 decode boundary fusion | 16K | 753.950 → 753.181 | 69.284 → 69.228 | 36.544 → 36.576 | -0.0891% | 35.349 → 35.349 | Keep |
+| 50 wired residency | 1K | 731.226 → 711.138 | 73.192 → 73.568 | 15.442 → 15.393 | +0.3219% | 29.937 → 29.937 | Isolated removal passed; rejected in assembly |
+| 50 wired residency | 16K | 751.657 → 748.332 | 69.121 → 69.069 | 36.646 → 36.752 | -0.2884% | 35.349 → 35.349 | Keep |
+| 53 tuned command buffers | 1K | 736.058 → 743.476 | 73.247 → 72.873 | 15.405 → 15.459 | -0.3533% | 29.937 → 22.617 | Tuned faster at 1K |
+| 53 tuned command buffers | 16K | 749.489 → 753.234 | 68.989 → 68.778 | 36.737 → 36.668 | +0.1867% | 35.349 → 26.562 | Stock faster at 16K and selected process-wide |
+
+### Assembly trials and selected route
+
+Independent percentages were not added. The surviving switches were assembled
+and measured against the immutable full stack:
+
+| Candidate assembly | Context | Prefill tok/s | Decode tok/s | Wall s | Wall delta | Peak GB | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Stock buffers + row 50 off | 1K | 757.347 → 679.233 | 74.268 → 73.747 | 15.186 → 15.434 | -1.6078% | 29.937 → 22.617 | Reject row-50 removal interaction |
+| Stock buffers + adaptive/21/24-prefill off | 16K | 750.765 → 755.688 | 69.109 → 69.332 | 36.671 → 36.474 | **+0.5404%** | 35.349 → 26.564 | Retain final 16K route |
+| Tuned buffers + adaptive/21/24-prefill off | 16K | 765.180 → 760.660 | 69.708 → 70.000 | 36.137 → 36.193 | -0.1563% | 35.349 → 33.158 | Reject alternative assembly |
+
+The selected production policy therefore keeps row 50, row 24 decode, row 26,
+and both row 48 phases at every context. Below 16K it also keeps adaptive row
+15, row 21, and row 24 prefill. At 16K and above it bypasses those three paths.
+Row 53 is process-latched and cannot vary per request, so the agreed 16K
+decision selects stock MLX buffers globally. The resulting production route is
+0.5404% faster and uses 8.785 GB less peak memory at 16K; its unavoidable 1K
+tradeoff is the independently measured 0.3533% wall regression from stock
+buffers. Raw evidence is under
+`docs/perf/receipts/qwen38-challenge-port/phase-split-*.json` and the three
+`final-context-split-*.json` receipts.

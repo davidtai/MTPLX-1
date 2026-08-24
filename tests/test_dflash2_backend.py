@@ -192,7 +192,7 @@ def test_measured_context_route_splits_only_the_supported_phase_controls() -> No
         "row24_decode_active": True,
         "row48_prefill_active": True,
         "row48_decode_active": True,
-        "row50_active": False,
+        "row50_active": True,
     }
     assert backend.qwen38_dflash_context_route(16_384) == {
         "route_id": "long_ge16384",
@@ -268,7 +268,7 @@ def test_context_route_is_applied_to_every_phase_control(
         "row24": [(True, True), (False, True)],
         "row48": [(True, True), (True, True)],
         "adaptive": [(True,), (False,)],
-        "row50": [(False,), (True,)],
+        "row50": [(True,), (True,)],
     }
     assert runtime.qwen38_feature_receipt["context_route"]["route_id"] == (
         "long_ge16384"
