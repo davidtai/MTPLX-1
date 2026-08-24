@@ -85,7 +85,7 @@ replaces; that delta is composite and is not claimed as an isolated row-8 win.
 | 8 | Device-resident native draft chain | 742.781 → 733.786 | 55.441 → 65.858 | 40.604 → 37.917 | **+7.0860%** | 32.72811 → 34.81407 | Replaced by DFlash2 eight-token proposal block; composite base delta | DFlash replacement-base receipt |
 | 9 | Paired target QMV | — | — | — | — | — | Not ported: native candidate rejected | Native-MTP row 9 receipt |
 | 10 | Compact native-MTP vocabulary | — | — | — | — | — | Incompatible: DFlash selector can emit outside the 98,330-ID set | Vocabulary geometry evidence |
-| 11 | Position-EMA adaptive depth | — | — | — | — | — | Pending adaptation to DFlash depths 1–8 | Adaptive lane |
+| 11 | Position-EMA adaptive depth, mapped to DFlash blocks 1–8 | 749.632 → 759.566 | 67.048 → 57.642 | 37.162 → 39.370 | **-5.6076%** | 35.34997 → 35.34765 | Rejected; engaged 281 cycles/arm across blocks 1–5 | `item55-dflash2-a11-position-ema-on-r21-r24-r26-r48-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 12 | Prefix-replay tape | — | — | — | — | — | Removed by row 13 | Source chronology |
 | 13 | Four-way GDN input projection | — | — | — | — | — | Not ported: native candidate rejected | Native-MTP row 13 receipt |
 | 14 | Recurrent prefix replay | — | — | — | — | — | Replaced by DFlash rollback/cache path | DFlash cache contract |
