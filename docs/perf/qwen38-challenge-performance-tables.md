@@ -89,7 +89,7 @@ replaces; that delta is composite and is not claimed as an isolated row-8 win.
 | 12 | Prefix-replay tape | — | — | — | — | — | Removed by row 13 | Source chronology |
 | 13 | Four-way GDN input projection | — | — | — | — | — | Not ported: native candidate rejected | Native-MTP row 13 receipt |
 | 14 | Recurrent prefix replay | — | — | — | — | — | Replaced by DFlash rollback/cache path | DFlash cache contract |
-| 15 | Verify widths 6–9 / adaptive cap | — | — | — | — | — | Pending adaptation, clamped to DFlash maximum 8 | Adaptive lane |
+| 15 | Wide adaptive cap, clamped to DFlash blocks 1–8 | 763.417 → 752.280 | 66.733 → 69.670 | 36.833 → 36.528 | **+0.8344%** | 35.34996 → 35.34873 | Retained complete row-11+15 revision; blocks 4–8 engaged | `item55-dflash2-a15-wide-position-ema-on-fixed-stack-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 16 | Compiled GDN prologue/post-norm | — | — | — | — | — | Already enclosed by target execution graphs | Native-MTP row 16 evidence |
 | 17 | Complete Q4/G64 native MTP block | — | — | — | — | — | Replaced by pinned DFlash W4/G64 checkpoint; superseded by row 36 | Checkpoint manifest |
 | 18 | Memoized GDN decay in DFlash rollback | 736.544 → 717.003 | 67.051 → 66.759 | 37.559 → 38.221 | **-1.7342%** | 32.73673 → 32.73675 | Rejected and removed; 9,120 calls/arm | `item55-dflash2-r18-gdn-decay-memo-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
