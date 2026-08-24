@@ -203,6 +203,7 @@ def _install_dflash_route(
     m7_nax_output: bool = False,
     m7_nax_linear_z: bool = False,
     m8_nax_expanded: bool = False,
+    m8_nax_kv: bool = False,
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
@@ -246,6 +247,7 @@ def _install_dflash_route(
         include_m7_output=bool(m7_nax_output),
         include_m7_linear_z=bool(m7_nax_linear_z),
         include_m8_expanded=bool(m8_nax_expanded),
+        include_m8_kv=bool(m8_nax_kv),
     )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
@@ -273,6 +275,7 @@ def _install_dflash_route(
                 *(("m7naxout",) if m7_nax_output else ()),
                 *(("m7naxlinearz",) if m7_nax_linear_z else ()),
                 *(("m8naxexpanded",) if m8_nax_expanded else ()),
+                *(("m8naxkv",) if m8_nax_kv else ()),
             )
         )
     )
@@ -334,6 +337,7 @@ def _run_dflash_arm(
     m7_nax_output: bool,
     m7_nax_linear_z: bool,
     m8_nax_expanded: bool,
+    m8_nax_kv: bool,
     cost_aligned_widths: bool,
     release_report: dict[str, bool],
 ) -> dict[str, Any]:
@@ -374,6 +378,7 @@ def _run_dflash_arm(
                 *(("m7naxout",) if m7_nax_output else ()),
                 *(("m7naxlinearz",) if m7_nax_linear_z else ()),
                 *(("m8naxexpanded",) if m8_nax_expanded else ()),
+                *(("m8naxkv",) if m8_nax_kv else ()),
                 *(("cost_aligned",) if cost_aligned_widths else ()),
             )
         ),
@@ -452,6 +457,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dflash-m7-nax-output", action="store_true")
     parser.add_argument("--dflash-m7-nax-linear-z", action="store_true")
     parser.add_argument("--dflash-m8-nax-expanded", action="store_true")
+    parser.add_argument("--dflash-m8-nax-kv", action="store_true")
     parser.add_argument("--dflash-cost-aligned-widths", action="store_true")
     parser.add_argument(
         "--engine",
@@ -487,6 +493,8 @@ def main() -> int:
         raise ValueError("DFlash M7 linear-Z route requires the M7 output route")
     if args.dflash_m8_nax_expanded and not args.dflash_m8_nax_island:
         raise ValueError("DFlash expanded M8 route requires the M8 NAX island")
+    if args.dflash_m8_nax_kv and not args.dflash_m8_nax_island:
+        raise ValueError("DFlash M8 K/V route requires the M8 NAX island")
 
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,
@@ -551,6 +559,7 @@ def main() -> int:
             m7_nax_output=bool(args.dflash_m7_nax_output),
             m7_nax_linear_z=bool(args.dflash_m7_nax_linear_z),
             m8_nax_expanded=bool(args.dflash_m8_nax_expanded),
+            m8_nax_kv=bool(args.dflash_m8_nax_kv),
         )
         if dflash_route is None:
             raise RuntimeError("DFlash2 survivor route did not install")
@@ -623,6 +632,7 @@ def main() -> int:
             m7_nax_output=bool(args.dflash_m7_nax_output),
             m7_nax_linear_z=bool(args.dflash_m7_nax_linear_z),
             m8_nax_expanded=bool(args.dflash_m8_nax_expanded),
+            m8_nax_kv=bool(args.dflash_m8_nax_kv),
             cost_aligned_widths=bool(args.dflash_cost_aligned_widths),
             release_report=release_report,
         )

@@ -429,6 +429,32 @@ def test_expanded_m8_engagement_requires_every_winning_shape() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m8_kv_engagement_requires_live_subgroup_only() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m8_nax_kv")
+
+    def arm(*, active: bool, calls: int):
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "include_m8_kv": active,
+                    "m8_expanded_shapes": [[5120, 1024]] if active else [],
+                    "eligible_m8_expanded_projections": 32 if active else 0,
+                }
+            },
+            "engagement": {"nax_verify": {"m8_nax_k5120_n1024": calls}},
+        }
+
+    by_variant = {
+        "control": [arm(active=False, calls=0) for _ in range(2)],
+        "candidate": [arm(active=True, calls=2112) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(active=True, calls=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

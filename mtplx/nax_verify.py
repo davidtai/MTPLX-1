@@ -877,6 +877,7 @@ def configure_qwen38_m8_nax_island(
     include_m7_output: bool = False,
     include_m7_linear_z: bool = False,
     include_m8_expanded: bool = False,
+    include_m8_kv: bool = False,
 ) -> dict[str, object]:
     global _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES
     global _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES
@@ -885,6 +886,8 @@ def configure_qwen38_m8_nax_island(
         shapes = shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
     if include_m8_expanded:
         shapes = shapes | _QWEN38_M8_NAX_EXPANDED_SHAPES
+    elif include_m8_kv:
+        shapes = shapes | frozenset({(5_120, 1_024)})
     _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES = shapes if active else frozenset()
     m7_shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES if include_m7_output else frozenset()
     if include_m7_linear_z:
@@ -897,11 +900,12 @@ def configure_qwen38_m8_nax_island(
         "include_m7_output": bool(include_m7_output),
         "include_m7_linear_z": bool(include_m7_linear_z),
         "include_m8_expanded": bool(include_m8_expanded),
+        "include_m8_kv": bool(include_m8_kv),
         "shapes": [list(shape) for shape in sorted(shapes)],
         "m7_shapes": [list(shape) for shape in sorted(m7_shapes)],
         "m8_expanded_shapes": [
             list(shape) for shape in sorted(_QWEN38_M8_NAX_EXPANDED_SHAPES)
-        ] if include_m8_expanded else [],
+        ] if include_m8_expanded else ([[5_120, 1_024]] if include_m8_kv else []),
     }
 
 

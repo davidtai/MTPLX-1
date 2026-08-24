@@ -204,6 +204,7 @@ def configure_qwen38_dflash_m8_nax_island(
     include_m7_output: bool = False,
     include_m7_linear_z: bool = False,
     include_m8_expanded: bool = False,
+    include_m8_kv: bool = False,
 ) -> dict[str, Any]:
     """Route only measured width-8 Qwen attention projections to BM=8 NAX."""
 
@@ -290,6 +291,7 @@ def configure_qwen38_dflash_m8_nax_island(
         include_m7_output=include_m7_output,
         include_m7_linear_z=include_m7_linear_z,
         include_m8_expanded=include_m8_expanded,
+        include_m8_kv=include_m8_kv,
     )
     routed_shapes = {tuple(shape) for shape in report["shapes"]}
     all_projection_shapes = projection_shapes + linear_z_shapes
@@ -310,7 +312,9 @@ def configure_qwen38_dflash_m8_nax_island(
         ),
         "validated_m8_expanded_projections": len(expanded_projection_shapes),
         "eligible_m8_expanded_projections": (
-            len(expanded_projection_shapes) if include_m8_expanded else 0
+            len(expanded_projection_shapes)
+            if include_m8_expanded
+            else (expanded_projection_shapes.count((5_120, 1_024)) if include_m8_kv else 0)
         ),
         "validated_projections": len(projection_shapes),
         "eligible_projections": sum(
