@@ -220,6 +220,7 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--draft-block-size", type=int, choices=range(1, 9), default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -287,6 +288,7 @@ def _load_dflash(
     draft: Path,
     *,
     draft_adaptive: bool,
+    draft_block_size: int,
 ) -> tuple[Any, dict[str, Any]]:
     from mtplx.profiles import apply_profile_env
     from mtplx.runtime import load
@@ -306,7 +308,7 @@ def _load_dflash(
     config = DFlash2RuntimeConfig.from_paths(
         target_model_path=model,
         draft_model_path=draft,
-        draft_block_size=8,
+        draft_block_size=int(draft_block_size),
         draft_quantization="4bit",
         prefill_step_size=2048,
         draft_adaptive=bool(draft_adaptive),
@@ -329,11 +331,12 @@ def _load_dflash(
         config=config,
     )
     runtime.qwen38_feature_receipt = _install_measured_qwen38_dflash_stack(runtime)
-    validate_candidate_adaptive_receipt(runtime.qwen38_feature_receipt)
+    if draft_adaptive:
+        validate_candidate_adaptive_receipt(runtime.qwen38_feature_receipt)
     return runtime, {
         "profile": "turbo",
         "native_mtp_loaded": False,
-        "dflash_block_size": 8,
+        "dflash_block_size": int(draft_block_size),
         "feature_receipt": runtime.qwen38_feature_receipt,
     }
 
@@ -408,6 +411,7 @@ def main() -> int:
             args.model,
             args.draft,
             draft_adaptive=bool(args.dflash2_adaptive),
+            draft_block_size=int(args.draft_block_size),
         )
     )
     if args.engine == "main_native_mtp":
@@ -437,7 +441,7 @@ def main() -> int:
     started = time.perf_counter()
     output = generate(runtime, prompt_ids, args)
     wall_s = time.perf_counter() - started
-    if args.engine == "pr_dflash2":
+    if args.engine == "pr_dflash2" and args.dflash2_adaptive:
         validate_candidate_adaptive_receipt(runtime.qwen38_feature_receipt)
     arm = (
         native_arm_metrics(output, prompt_tokens=len(prompt_ids), wall_s=wall_s)
@@ -499,6 +503,11 @@ def main() -> int:
             "output_count_forced": args.prompt_kind != "is_palindrome",
             "requested_adaptive": (
                 bool(args.dflash2_adaptive)
+                if args.engine == "pr_dflash2"
+                else None
+            ),
+            "requested_draft_m": (
+                int(args.draft_block_size)
                 if args.engine == "pr_dflash2"
                 else None
             ),
