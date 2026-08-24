@@ -30,6 +30,7 @@ def test_row11_position_ema_maps_to_dflash_physical_blocks_one_through_eight() -
         "deep_draft_cap": 4,
         "head_step_cost_ratio": 0.20,
         "streak_gate": None,
+        "cost_aligned_widths": False,
     }
     assert 1 <= policy.block_limit() <= 5
     offered = policy.block_limit()
