@@ -25,7 +25,9 @@ DEFAULT_DRAFT = Path.home() / (
 )
 DEFAULT_MAIN_ROOT = Path("/tmp/mtplx-qwen38-main-control.1Z0Lm7/main")
 DEFAULT_CONTEXT = ROOT / "mtplx/generation.py"
-DEFAULT_PROMPT = ROOT / "mtplx/benchmarks/prompts/python_modules_long.jsonl"
+DEFAULT_PROMPT = ROOT / (
+    "mtplx/benchmarks/prompts/qwen38_naturalistic_generation_patch.jsonl"
+)
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
 ORDER = ("main_native_mtp", "pr_dflash2", "pr_dflash2", "main_native_mtp")
 

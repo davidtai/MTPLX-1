@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -71,6 +72,18 @@ def test_coding_prompt_has_one_instruction_and_exact_total_token_budget() -> Non
     assert len(token_ids) == 2_048
     assert prompt.endswith("Implement the production-ready scheduler.")
     assert prompt.count("Implement the production-ready scheduler.") == 1
+
+
+def test_load_scenarios_use_one_naturalistic_generation_patch_prompt() -> None:
+    matrix = _module()
+
+    row = json.loads(matrix.DEFAULT_PROMPT.read_text(encoding="utf-8").splitlines()[0])
+
+    assert row["id"] == "qwen38_naturalistic_generation_summary_patch"
+    assert "GenerationOutput" in row["prompt"]
+    assert "unified diff" in row["prompt"]
+    assert "focused pytest tests" in row["prompt"]
+    assert "Implement these sections in order" not in row["prompt"]
 
 
 def test_child_command_pins_source_revision_and_disables_prefix_sessions(tmp_path) -> None:
