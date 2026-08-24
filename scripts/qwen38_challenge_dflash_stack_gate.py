@@ -59,6 +59,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m5-exact", action="store_true")
     parser.add_argument("--control-m6-kp1", action="store_true")
     parser.add_argument("--candidate-m6-kp1", action="store_true")
+    parser.add_argument("--control-m7-linear-z-nsg4", action="store_true")
+    parser.add_argument("--candidate-m7-linear-z-nsg4", action="store_true")
+    parser.add_argument("--control-m8-kv-nsg16", action="store_true")
+    parser.add_argument("--candidate-m8-kv-nsg16", action="store_true")
+    parser.add_argument("--control-m8-qkv-nsg4", action="store_true")
+    parser.add_argument("--candidate-m8-qkv-nsg4", action="store_true")
     parser.add_argument("--control-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--candidate-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--control-disable-row24-decode-ladder", action="store_true")
@@ -100,6 +106,15 @@ def _variant_environment(
     )
     environment["MLX_MAX_OPS_PER_BUFFER"] = str(
         int(getattr(args, f"{prefix}_max_ops_per_buffer"))
+    )
+    environment["MTPLX_QWEN38_M7_LINEAR_Z_NSG4"] = (
+        "1" if bool(getattr(args, f"{prefix}_m7_linear_z_nsg4", False)) else "0"
+    )
+    environment["MTPLX_QWEN38_M8_KV_NSG16"] = (
+        "1" if bool(getattr(args, f"{prefix}_m8_kv_nsg16", False)) else "0"
+    )
+    environment["MTPLX_QWEN38_M8_QKV_NSG4"] = (
+        "1" if bool(getattr(args, f"{prefix}_m8_qkv_nsg4", False)) else "0"
     )
     return environment
 
@@ -306,6 +321,33 @@ def _engagement_exact(
 
         return all(matches(row, control_rows) for row in by_variant["control"]) and all(
             matches(row, candidate_rows) for row in by_variant["candidate"]
+        )
+    split_labels = {
+        "m7_linear_z_nsg4": ("m7_nsg_by_shape", "5120x6144", 4, "m7_to_m8_nax"),
+        "m8_kv_nsg16": ("m8_nsg_by_shape", "5120x1024", 16, "m8_nax"),
+        "m8_qkv_nsg4": ("m8_nsg_by_shape", "5120x10240", 4, "m8_nax"),
+    }
+    if args.candidate_label in split_labels:
+        route_key, shape_key, candidate_nsg, counter_prefix = split_labels[
+            args.candidate_label
+        ]
+        k_text, n_text = shape_key.split("x", 1)
+
+        def matches(row: dict[str, Any], nsg: int) -> bool:
+            report = row.get("feature_receipt", {}).get(
+                "dflash_nax_split_tuning", {}
+            )
+            configured = int(report.get(route_key, {}).get(shape_key, 8))
+            counter = (
+                f"{counter_prefix}_nsg{nsg}_k{k_text}_n{n_text}"
+            )
+            calls = int(
+                row.get("engagement", {}).get("nax_verify", {}).get(counter, 0)
+            )
+            return configured == nsg and calls > 0
+
+        return all(matches(row, 8) for row in by_variant["control"]) and all(
+            matches(row, candidate_nsg) for row in by_variant["candidate"]
         )
     if args.candidate_label == "release_native_mtp":
         return all(
@@ -959,6 +1001,12 @@ def _aggregate(
             "candidate_m5_exact": bool(args.candidate_m5_exact),
             "control_m6_kp1": bool(args.control_m6_kp1),
             "candidate_m6_kp1": bool(args.candidate_m6_kp1),
+            "control_m7_linear_z_nsg4": bool(args.control_m7_linear_z_nsg4),
+            "candidate_m7_linear_z_nsg4": bool(args.candidate_m7_linear_z_nsg4),
+            "control_m8_kv_nsg16": bool(args.control_m8_kv_nsg16),
+            "candidate_m8_kv_nsg16": bool(args.candidate_m8_kv_nsg16),
+            "control_m8_qkv_nsg4": bool(args.control_m8_qkv_nsg4),
+            "candidate_m8_qkv_nsg4": bool(args.candidate_m8_qkv_nsg4),
             "control_disable_row24_prefill_ladder": bool(
                 args.control_disable_row24_prefill_ladder
             ),

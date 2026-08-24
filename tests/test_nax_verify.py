@@ -48,6 +48,36 @@ def test_m8_nax_route_counter_records_exact_shape(monkeypatch) -> None:
     assert after["m8_nax_k32_n64"] == before.get("m8_nax_k32_n64", 0) + 1
 
 
+def test_m8_nax_allows_shape_screening_with_explicit_nsg(monkeypatch) -> None:
+    from mtplx import nax_verify
+
+    observed = {}
+
+    class FakeKernel:
+        def __call__(self, *, grid, threadgroup, output_shapes, output_dtypes, **_kwargs):
+            observed["grid"] = grid
+            observed["threadgroup"] = threadgroup
+            return [mx.zeros(output_shapes[0], dtype=output_dtypes[0])]
+
+    def build(k, group_size, dtype, *, nsg=8):
+        observed["build"] = (k, group_size, dtype, nsg)
+        return FakeKernel()
+
+    monkeypatch.setattr(nax_verify, "_build_kernel_m8_nax_ktmpl", build)
+    y = nax_verify.nax_qmm_m8_nax(
+        mx.zeros((8, 32), dtype=mx.bfloat16),
+        mx.zeros((64, 4), dtype=mx.uint32),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        group_size=32,
+        nsg=4,
+    )
+    assert y.shape == (8, 64)
+    assert observed["build"] == (32, 32, mx.bfloat16, 4)
+    assert observed["grid"] == (128, 2, 1)
+    assert observed["threadgroup"] == (128, 1, 1)
+
+
 def test_m7_route_pads_to_m8_tile_and_records_original_width(monkeypatch) -> None:
     from mtplx import nax_verify
 
@@ -259,6 +289,25 @@ def test_m8_output_can_be_removed_without_removing_m7_or_mlp() -> None:
         assert [5120, 17408] in report["shapes"]
     finally:
         configure_qwen38_m8_nax_island(active=False)
+
+
+def test_qwen38_shape_specific_nax_split_tuning() -> None:
+    from mtplx.nax_verify import configure_qwen38_nax_split_tuning
+
+    report = configure_qwen38_nax_split_tuning(
+        active=True,
+        m7_linear_z_nsg4=True,
+        m8_kv_nsg16=True,
+        m8_qkv_nsg4=True,
+    )
+    try:
+        assert report == {
+            "active": True,
+            "m7_nsg_by_shape": {"5120x6144": 4},
+            "m8_nsg_by_shape": {"5120x1024": 16, "5120x10240": 4},
+        }
+    finally:
+        configure_qwen38_nax_split_tuning(active=False)
 
 
 def test_vk_6bit_hexpack_ksplit_matches_stock() -> None:

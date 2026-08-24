@@ -765,6 +765,59 @@ def test_final_phase_stack_requires_every_retained_kernel_and_no_m8_output() -> 
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_nax_split_candidate_flags_are_isolated_per_arm() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(
+        control_max_mb_per_buffer=512,
+        candidate_max_mb_per_buffer=512,
+        control_max_ops_per_buffer=50,
+        candidate_max_ops_per_buffer=50,
+        control_m7_linear_z_nsg4=False,
+        candidate_m7_linear_z_nsg4=True,
+        control_m8_kv_nsg16=False,
+        candidate_m8_kv_nsg16=True,
+        control_m8_qkv_nsg4=False,
+        candidate_m8_qkv_nsg4=True,
+    )
+    control = stack_gate._variant_environment(args, "control", {})
+    candidate = stack_gate._variant_environment(args, "candidate", {})
+    assert control["MTPLX_QWEN38_M7_LINEAR_Z_NSG4"] == "0"
+    assert candidate["MTPLX_QWEN38_M7_LINEAR_Z_NSG4"] == "1"
+    assert control["MTPLX_QWEN38_M8_KV_NSG16"] == "0"
+    assert candidate["MTPLX_QWEN38_M8_KV_NSG16"] == "1"
+    assert control["MTPLX_QWEN38_M8_QKV_NSG4"] == "0"
+    assert candidate["MTPLX_QWEN38_M8_QKV_NSG4"] == "1"
+
+
+def test_m7_linear_z_nsg4_engagement_requires_exact_shape_counter() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m7_linear_z_nsg4")
+
+    def arm(nsg):
+        return {
+            "feature_receipt": {
+                "dflash_nax_split_tuning": {
+                    "active": True,
+                    "m7_nsg_by_shape": ({"5120x6144": 4} if nsg == 4 else {}),
+                    "m8_nsg_by_shape": {},
+                }
+            },
+            "engagement": {
+                "nax_verify": {f"m7_to_m8_nax_nsg{nsg}_k5120_n6144": 2736}
+            },
+        }
+
+    by_variant = {
+        "control": [arm(8), arm(8)],
+        "candidate": [arm(4), arm(4)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0]["engagement"]["nax_verify"].clear()
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

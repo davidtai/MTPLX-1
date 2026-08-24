@@ -267,6 +267,16 @@ def _install_dflash_route(
         include_m5_exact=bool(m5_exact),
         include_m6_kp1=bool(m6_kp1),
     )
+    from mtplx.nax_verify import configure_qwen38_nax_split_tuning
+
+    nax_split_report = configure_qwen38_nax_split_tuning(
+        active=bool(m8_nax_island),
+        m7_linear_z_nsg4=os.environ.get(
+            "MTPLX_QWEN38_M7_LINEAR_Z_NSG4", "0"
+        ) == "1",
+        m8_kv_nsg16=os.environ.get("MTPLX_QWEN38_M8_KV_NSG16", "0") == "1",
+        m8_qkv_nsg4=os.environ.get("MTPLX_QWEN38_M8_QKV_NSG4", "0") == "1",
+    )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
         feature_receipt["r21_qk_rms_rope"] = row21_report
@@ -281,6 +291,7 @@ def _install_dflash_route(
         feature_receipt["dflash_gqa_widths"] = gqa_report
     if m8_nax_island:
         feature_receipt["dflash_m8_nax_island"] = m8_nax_report
+        feature_receipt["dflash_nax_split_tuning"] = nax_split_report
     runtime.qwen38_feature_receipt = feature_receipt
     return SimpleNamespace(
         route_id="+".join(

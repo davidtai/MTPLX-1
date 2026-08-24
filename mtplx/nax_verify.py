@@ -90,12 +90,38 @@ def _build_kernel_nax_ktmpl(
     k_val: int,
     group_size: int,
     dtype: mx.Dtype,
+    *,
+    nsg: int = 8,
 ):
     if int(m_val) not in (8, 16):
         raise ValueError("NAX verify tile rows must be 8 or 16")
-    key = (f"m{int(m_val)}_nax_ktmpl", int(k_val), group_size, dtype)
+    if int(nsg) not in (4, 8, 16) or int(k_val) % (16 * int(nsg)) != 0:
+        raise ValueError("NAX split count must be 4, 8, or 16 and divide K/16")
+    key = (f"m{int(m_val)}_nax_ktmpl", int(k_val), group_size, dtype, int(nsg))
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
+
+    pair_names = []
+    pair_lines = []
+    for pair in range(int(nsg) // 2):
+        name = f"acc{pair * 2}_{pair * 2 + 1}"
+        pair_names.append(name)
+        pair_lines.append(
+            f"            float {name} = partial[{pair * 2}][off] + "
+            f"partial[{pair * 2 + 1}][off];"
+        )
+    while len(pair_names) > 1:
+        next_names = []
+        for index in range(0, len(pair_names), 2):
+            name = f"sum_{len(next_names)}_{len(pair_lines)}"
+            pair_lines.append(
+                f"            float {name} = {pair_names[index]} + "
+                f"{pair_names[index + 1]};"
+            )
+            next_names.append(name)
+        pair_names = next_names
+    pair_lines.append(f"            float acc = {pair_names[0]};")
+    reduction_source = "\n".join(pair_lines)
 
     source = f"""
         using namespace metal;
@@ -104,7 +130,7 @@ def _build_kernel_nax_ktmpl(
         constexpr int BM = {int(m_val)};
         constexpr int BN = 32;
         constexpr int BK = 16;
-        constexpr int NSG = 8;
+        constexpr int NSG = {int(nsg)};
         constexpr int GS = {group_size};
         constexpr int K = KCONST;
         constexpr int K_by_8 = K / 8;
@@ -187,11 +213,7 @@ def _build_kernel_nax_ktmpl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int off = int(tid); off < BM * BN; off += NSG * 32) {{
-            float acc01 = partial[0][off] + partial[1][off];
-            float acc23 = partial[2][off] + partial[3][off];
-            float acc45 = partial[4][off] + partial[5][off];
-            float acc67 = partial[6][off] + partial[7][off];
-            float acc = (acc01 + acc23) + (acc45 + acc67);
+{reduction_source}
             int row = off / BN;
             int col = off - row * BN;
             y[row * N + n0 + col] = T(acc);
@@ -202,7 +224,7 @@ def _build_kernel_nax_ktmpl(
     kernel = mx.fast.metal_kernel(
         name=(
             f"mtplx_verify_m{int(m_val)}_nax_"
-            f"k{int(k_val)}_gs{group_size}_{dtype_tag}"
+            f"k{int(k_val)}_nsg{int(nsg)}_gs{group_size}_{dtype_tag}"
         ),
         input_names=["x", "w_q", "scales", "biases", "N_size"],
         output_names=["y"],
@@ -219,8 +241,14 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
     return _build_kernel_nax_ktmpl(16, k_val, group_size, dtype)
 
 
-def _build_kernel_m8_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
-    return _build_kernel_nax_ktmpl(8, k_val, group_size, dtype)
+def _build_kernel_m8_nax_ktmpl(
+    k_val: int,
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    nsg: int = 8,
+):
+    return _build_kernel_nax_ktmpl(8, k_val, group_size, dtype, nsg=nsg)
 
 
 def _build_kernel_m4_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int = 4):
@@ -887,6 +915,8 @@ _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
 _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
 _QWEN38_M5_EXACT_ACTIVE = False
 _QWEN38_M6_KP1_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
+_QWEN38_M7_NSG_BY_SHAPE: dict[tuple[int, int], int] = {}
+_QWEN38_M8_NSG_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M8_NAX_OUTPUT_SHAPES = frozenset({(6_144, 5_120)})
 _QWEN38_M8_NAX_LINEAR_Z_SHAPES = frozenset({(5_120, 6_144)})
 _QWEN38_M8_NAX_EXPANDED_SHAPES = frozenset(
@@ -896,6 +926,35 @@ _QWEN38_M8_NAX_EXPANDED_SHAPES = frozenset(
         (5_120, 17_408),
     }
 )
+
+
+def configure_qwen38_nax_split_tuning(
+    *,
+    active: bool,
+    m7_linear_z_nsg4: bool = False,
+    m8_kv_nsg16: bool = False,
+    m8_qkv_nsg4: bool = False,
+) -> dict[str, object]:
+    """Select only independently measured NAX split counts by live shape."""
+
+    global _QWEN38_M7_NSG_BY_SHAPE, _QWEN38_M8_NSG_BY_SHAPE
+    m7 = {(5_120, 6_144): 4} if active and m7_linear_z_nsg4 else {}
+    m8: dict[tuple[int, int], int] = {}
+    if active and m8_kv_nsg16:
+        m8[(5_120, 1_024)] = 16
+    if active and m8_qkv_nsg4:
+        m8[(5_120, 10_240)] = 4
+    _QWEN38_M7_NSG_BY_SHAPE = m7
+    _QWEN38_M8_NSG_BY_SHAPE = m8
+
+    def receipt(values: dict[tuple[int, int], int]) -> dict[str, int]:
+        return {f"{k}x{n}": split for (k, n), split in sorted(values.items())}
+
+    return {
+        "active": bool(active),
+        "m7_nsg_by_shape": receipt(m7),
+        "m8_nsg_by_shape": receipt(m8),
+    }
 
 
 def configure_qwen38_m8_nax_island(
@@ -969,6 +1028,7 @@ def nax_qmm_m8_nax(
     biases: mx.array,
     *,
     group_size: int = 64,
+    nsg: int = 8,
 ) -> mx.array:
     """Run the eight-row MPP tile for seven or eight live rows."""
 
@@ -986,12 +1046,13 @@ def nax_qmm_m8_nax(
         x8 = mx.contiguous(x2)
         kind = "m8_nax"
     _count_nax_dispatch(kind, k=K, n=N)
-    kernel = _build_kernel_m8_nax_ktmpl(K, group_size, x2.dtype)
+    _count_nax_dispatch(f"{kind}_nsg{int(nsg)}", k=K, n=N)
+    kernel = _build_kernel_m8_nax_ktmpl(K, group_size, x2.dtype, nsg=int(nsg))
     (y,) = kernel(
         inputs=[x8, w_q, scales, biases, N],
         template=[("T", x2.dtype), ("KCONST", K)],
-        grid=(256, N // 32, 1),
-        threadgroup=(256, 1, 1),
+        grid=(32 * int(nsg), N // 32, 1),
+        threadgroup=(32 * int(nsg), 1, 1),
         output_shapes=[(8, N)],
         output_dtypes=[x2.dtype],
     )
@@ -1248,6 +1309,7 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     y = nax_qmm_m8_nax(
                         x.reshape(m, k), w_q, self["scales"], self["biases"],
                         group_size=group_size,
+                        nsg=_QWEN38_M7_NSG_BY_SHAPE.get((k, n), 8),
                     )
                 elif (
                     m == 8
@@ -1258,6 +1320,7 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     y = nax_qmm_m8_nax(
                         x.reshape(m, k), w_q, self["scales"], self["biases"],
                         group_size=group_size,
+                        nsg=_QWEN38_M8_NSG_BY_SHAPE.get((k, n), 8),
                     )
                 elif (
                     not lane_disabled("qmm_m16_nax")
