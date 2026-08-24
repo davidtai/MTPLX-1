@@ -31,6 +31,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-label", required=True)
     parser.add_argument("--control-survivors", default="")
     parser.add_argument("--candidate-survivors", default="")
+    parser.add_argument("--control-adaptive-rows", default="")
+    parser.add_argument("--candidate-adaptive-rows", default="")
     parser.add_argument("--control-release-native-mtp", action="store_true")
     parser.add_argument("--candidate-release-native-mtp", action="store_true")
     parser.add_argument("--model", type=Path, default=arm_gate.DEFAULT_MODEL)
@@ -46,10 +48,18 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _variant_config(args: argparse.Namespace, variant: str) -> tuple[str, bool]:
+def _variant_config(args: argparse.Namespace, variant: str) -> tuple[str, str, bool]:
     if variant == "control":
-        return args.control_survivors, bool(args.control_release_native_mtp)
-    return args.candidate_survivors, bool(args.candidate_release_native_mtp)
+        return (
+            args.control_survivors,
+            args.control_adaptive_rows,
+            bool(args.control_release_native_mtp),
+        )
+    return (
+        args.candidate_survivors,
+        args.candidate_adaptive_rows,
+        bool(args.candidate_release_native_mtp),
+    )
 
 
 def _child_command(
@@ -58,7 +68,7 @@ def _child_command(
     variant: str,
     output: Path,
 ) -> list[str]:
-    survivors, release_native_mtp = _variant_config(args, variant)
+    survivors, adaptive_rows, release_native_mtp = _variant_config(args, variant)
     command = [
         sys.executable,
         str(ROOT / "scripts/qwen38_challenge_dflash_gate.py"),
@@ -82,6 +92,8 @@ def _child_command(
         str(args.seed),
         "--dflash-survivors",
         survivors,
+        "--dflash-adaptive-rows",
+        adaptive_rows,
         "--lock",
         str(args.lock),
         "--output",
@@ -100,6 +112,30 @@ def _engagement_exact(
     args: argparse.Namespace,
     by_variant: dict[str, list[dict[str, Any]]],
 ) -> bool:
+    if args.candidate_label.startswith("a"):
+        expected_row = int(args.candidate_label[1:])
+        control_rows = list(
+            arm_gate._parse_dflash_adaptive_rows(args.control_adaptive_rows)
+        )
+        candidate_rows = list(
+            arm_gate._parse_dflash_adaptive_rows(args.candidate_adaptive_rows)
+        )
+        if not candidate_rows or candidate_rows[-1] != expected_row:
+            return False
+
+        def matches(row: dict[str, Any], expected: list[int]) -> bool:
+            metrics = row.get("adaptive_metrics", {})
+            if not expected:
+                return not metrics
+            return (
+                metrics.get("kind") == "qwen38_position_ema"
+                and metrics.get("proposal_rows") == expected
+                and int(metrics.get("cycles", 0)) > 0
+            )
+
+        return all(matches(row, control_rows) for row in by_variant["control"]) and all(
+            matches(row, candidate_rows) for row in by_variant["candidate"]
+        )
     if args.candidate_label == "release_native_mtp":
         return all(
             not bool(row["feature_receipt"]["native_mtp_release"]["native_mtp_released"])
@@ -212,6 +248,12 @@ def _aggregate(
         "stack": {
             "control_survivors": list(arm_gate._parse_dflash_survivors(args.control_survivors)),
             "candidate_survivors": list(arm_gate._parse_dflash_survivors(args.candidate_survivors)),
+            "control_adaptive_rows": list(
+                arm_gate._parse_dflash_adaptive_rows(args.control_adaptive_rows)
+            ),
+            "candidate_adaptive_rows": list(
+                arm_gate._parse_dflash_adaptive_rows(args.candidate_adaptive_rows)
+            ),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
             "candidate_release_native_mtp": bool(args.candidate_release_native_mtp),
         },
@@ -254,6 +296,8 @@ def main() -> int:
         raise ValueError("DFlash2 stack gates require exactly 16K input and 1024 output")
     arm_gate._parse_dflash_survivors(args.control_survivors)
     arm_gate._parse_dflash_survivors(args.candidate_survivors)
+    arm_gate._parse_dflash_adaptive_rows(args.control_adaptive_rows)
+    arm_gate._parse_dflash_adaptive_rows(args.candidate_adaptive_rows)
     children: list[dict[str, Any]] = []
     with _gpu_lock_scope(args.lock) as lock_scope:
         with tempfile.TemporaryDirectory(prefix="qwen38-dflash-stack-") as temp_dir:

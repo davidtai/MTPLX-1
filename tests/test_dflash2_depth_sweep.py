@@ -217,6 +217,7 @@ def test_dflash_summary_adapter_returns_measured_metrics():
         "acceptance_ratio": 0.5,
         "spec_decode_hit_rate": 0.5,
         "acceptance_history": [1],
+        "adaptive_metrics": {},
         "requested_width": 8,
         "effective_width": 8,
         "fallback_ar": False,

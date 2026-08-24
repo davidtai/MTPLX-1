@@ -22,6 +22,15 @@ def test_dflash_survivors_are_unique_chronological_and_dependency_closed() -> No
             gate._parse_dflash_survivors(invalid)
 
 
+def test_dflash_adaptive_rows_are_unique_chronological_and_dependency_closed() -> None:
+    assert gate._parse_dflash_adaptive_rows("") == ()
+    assert gate._parse_dflash_adaptive_rows("11,15,18") == (11, 15, 18)
+
+    for invalid in ("15", "11,18,15", "11,11", "11,17"):
+        with pytest.raises(ValueError):
+            gate._parse_dflash_adaptive_rows(invalid)
+
+
 def test_dflash_flat_counter_delta_tracks_only_current_arm() -> None:
     assert gate._flat_counter_delta(
         {"memo": 11, "qk": 3},
@@ -112,6 +121,39 @@ def test_row48_engagement_requires_candidate_boundary_fusion() -> None:
 
     assert stack_gate._engagement_exact(args, by_variant) is True
     by_variant["candidate"][1] = arm(151, 0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_row11_engagement_requires_candidate_position_ema_cycles() -> None:
+    args = SimpleNamespace(
+        candidate_label="a11",
+        control_adaptive_rows="",
+        candidate_adaptive_rows="11",
+    )
+
+    def arm(rows, cycles):
+        return {
+            "adaptive_metrics": (
+                {}
+                if not rows
+                else {
+                    "kind": "qwen38_position_ema",
+                    "proposal_rows": list(rows),
+                    "cycles": cycles,
+                    "cycles_by_block": {"5": cycles},
+                }
+            )
+        }
+
+    by_variant = {
+        "control": [arm((), 0), arm((), 0)],
+        "candidate": [arm((11,), 190), arm((11,), 191)],
+    }
+
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm((11,), 0)
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 

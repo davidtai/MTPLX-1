@@ -210,6 +210,7 @@ def arm_receipt_from_dflash_events(
         "acceptance_ratio": float(summary.acceptance_ratio),
         "spec_decode_hit_rate": accepted_from_draft / generated_tokens,
         "acceptance_history": [int(value) for value in summary.acceptance_history],
+        "adaptive_metrics": dict(summary.adaptive_metrics or {}),
         "requested_width": int(requested_width),
         "effective_width": effective_width,
         "fallback_ar": bool(summary.fallback_ar),
