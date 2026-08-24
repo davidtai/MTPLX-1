@@ -39,7 +39,7 @@ from scripts.qwen38_challenge_port_gate import (  # noqa: E402
 
 DFLASH_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
-DFLASH_SOURCE_COMMIT = "dc442a608bf062e118901ee4e43a436ef083a11a"
+DFLASH_SOURCE_COMMIT = "56c882164a3803312a515789672122a1c5a28325"
 PROMOTION_THRESHOLD_PCT = 0.05
 STATIC_WIDTH = 8
 DFLASH_SURVIVOR_ROWS = frozenset({21, 24, 26, 48})
@@ -158,6 +158,7 @@ def _install_dflash_route(
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
+    from mtplx.gdn_capture import configure_qwen38_dflash_row48_boundary
     from mtplx.qwen38_challenge_kernels import (
         configure_qwen38_dflash_row24_eval_ladder,
         configure_qwen38_row21_qk_rms_rope,
@@ -179,8 +180,10 @@ def _install_dflash_route(
         active=24 in rows,
         prefill_stride=3 if 26 in rows else 4,
     )
-    text_model = getattr(runtime.model, "language_model", runtime.model)
-    text_model._mtplx_qwen38_row48_boundary_fused = 48 in rows
+    row48_report = configure_qwen38_dflash_row48_boundary(
+        runtime.model,
+        active=48 in rows,
+    )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
         feature_receipt["r21_qk_rms_rope"] = row21_report
@@ -190,7 +193,7 @@ def _install_dflash_route(
     if 26 in rows:
         feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
     if 48 in rows:
-        feature_receipt["r48_boundary_fused"] = {"active": 1}
+        feature_receipt["r48_boundary_fused"] = row48_report
     runtime.qwen38_feature_receipt = feature_receipt
     return SimpleNamespace(
         route_id="+".join(

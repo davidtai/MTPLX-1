@@ -5,6 +5,10 @@ from types import SimpleNamespace
 import mlx.core as mx
 
 from mtplx import qwen38_challenge_kernels as kernels
+from mtplx.gdn_capture import (
+    configure_qwen38_dflash_row48_boundary,
+    qwen38_row48_boundary_counter_snapshot,
+)
 from mtplx.qwen38_challenge_kernels import (
     configure_qwen38_dflash_row24_eval_ladder,
     configure_qwen38_row21_qk_rms_rope,
@@ -183,3 +187,48 @@ def test_row24_dflash_eval_ladder_uses_prefill_and_decode_rungs(monkeypatch) -> 
     )
     assert inactive == {"active": 0, "prefill_stride": 0}
     assert not hasattr(inner, "_dflash_post_layer")
+
+
+def test_row48_config_exposes_dflash_cross_layer_fusion(monkeypatch) -> None:
+    layer = SimpleNamespace(
+        input_layernorm=SimpleNamespace(weight=object(), eps=1e-6),
+        post_attention_layernorm=SimpleNamespace(weight=object(), eps=1e-6),
+        mlp=object(),
+        self_attn=object(),
+    )
+    inner = SimpleNamespace(layers=[layer, layer])
+    model = SimpleNamespace(model=inner)
+    calls = []
+
+    from mtplx.kernels import fused_norm
+
+    monkeypatch.setattr(
+        fused_norm,
+        "fused_add_rmsnorm",
+        lambda base, delta, weight, eps, *, threadgroup_size: calls.append(
+            (base, delta, weight, eps, threadgroup_size)
+        )
+        or ("hidden", "normed"),
+    )
+    before = qwen38_row48_boundary_counter_snapshot()
+
+    report = configure_qwen38_dflash_row48_boundary(model, active=True)
+    assert report == {"eligible_modules": 2, "active_modules": 2}
+    inner._dflash_boundary_begin()
+    assert inner._dflash_fused_add_rmsnorm(
+        "base",
+        "delta",
+        "weight",
+        1e-6,
+        merged_boundary=True,
+    ) == ("hidden", "normed")
+    after = qwen38_row48_boundary_counter_snapshot()
+
+    assert after["calls"] == before["calls"] + 1
+    assert after["merged_boundaries"] == before["merged_boundaries"] + 1
+    assert calls == [("base", "delta", "weight", 1e-6, 1024)]
+
+    inactive = configure_qwen38_dflash_row48_boundary(model, active=False)
+    assert inactive == {"eligible_modules": 2, "active_modules": 0}
+    assert not hasattr(inner, "_dflash_boundary_begin")
+    assert not hasattr(inner, "_dflash_fused_add_rmsnorm")

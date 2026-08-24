@@ -28,6 +28,69 @@ QWEN38_ROW48_BOUNDARY_COUNTERS: dict[str, int] = {
 def qwen38_row48_boundary_counter_snapshot() -> dict[str, int]:
     return dict(QWEN38_ROW48_BOUNDARY_COUNTERS)
 
+
+def configure_qwen38_dflash_row48_boundary(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, int]:
+    """Install row 48's cross-layer residual/RMSNorm fusion in DFlash."""
+
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", text_model)
+    layers = list(getattr(inner, "layers", ()) or ())
+    eligible = sum(
+        int(
+            all(
+                hasattr(layer, attr)
+                for attr in (
+                    "input_layernorm",
+                    "post_attention_layernorm",
+                    "mlp",
+                )
+            )
+            and (
+                hasattr(layer, "linear_attn")
+                or hasattr(layer, "self_attn")
+            )
+        )
+        for layer in layers
+    )
+    if active and (not layers or eligible != len(layers)):
+        raise ValueError("active DFlash row-48 boundary has ineligible layers")
+    if not active:
+        for attr in ("_dflash_boundary_begin", "_dflash_fused_add_rmsnorm"):
+            if hasattr(inner, attr):
+                delattr(inner, attr)
+        return {"eligible_modules": eligible, "active_modules": 0}
+
+    def boundary_begin() -> None:
+        QWEN38_ROW48_BOUNDARY_COUNTERS["calls"] += 1
+
+    def fused_boundary(
+        base: Any,
+        delta: Any,
+        weight: Any,
+        eps: float,
+        *,
+        merged_boundary: bool,
+    ) -> tuple[Any, Any]:
+        from .kernels.fused_norm import fused_add_rmsnorm
+
+        if merged_boundary:
+            QWEN38_ROW48_BOUNDARY_COUNTERS["merged_boundaries"] += 1
+        return fused_add_rmsnorm(
+            base,
+            delta,
+            weight,
+            eps,
+            threadgroup_size=1024,
+        )
+
+    inner._dflash_boundary_begin = boundary_begin
+    inner._dflash_fused_add_rmsnorm = fused_boundary
+    return {"eligible_modules": eligible, "active_modules": eligible}
+
 # One-time warning latch for an explicitly requested but unavailable
 # headquarter tape kernel (PR #209 review edit).
 _HEADQUARTER_IMPORT_WARNED = False

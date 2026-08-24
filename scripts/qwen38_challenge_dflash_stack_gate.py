@@ -134,6 +134,15 @@ def _engagement_exact(
         return all(calls(row) == 0 for row in by_variant["control"]) and all(
             calls(row) > 0 for row in by_variant["candidate"]
         )
+    if args.candidate_label == "r48":
+        def counts(row: dict[str, Any]) -> tuple[int, int]:
+            report = row["engagement"]["r48_boundary_fused"]
+            return int(report["calls"]), int(report["merged_boundaries"])
+
+        return all(counts(row) == (0, 0) for row in by_variant["control"]) and all(
+            calls > 0 and merged > 0
+            for calls, merged in map(counts, by_variant["candidate"])
+        )
     return True
 
 
