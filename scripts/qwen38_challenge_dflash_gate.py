@@ -39,10 +39,10 @@ from scripts.qwen38_challenge_port_gate import (  # noqa: E402
 
 DFLASH_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
-DFLASH_SOURCE_COMMIT = "a11f3d2ec2f1e136987fb05f3be9ee263ff74d84"
+DFLASH_SOURCE_COMMIT = "b6c7f2201b260aaa8d3b03b6c1a4233b1df79983"
 PROMOTION_THRESHOLD_PCT = 0.05
 STATIC_WIDTH = 8
-DFLASH_SURVIVOR_ROWS = frozenset({18, 21, 24, 26, 48})
+DFLASH_SURVIVOR_ROWS = frozenset({21, 24, 26, 48})
 FULL_RETAINED_ROUTE = (
     "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
     "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
@@ -158,17 +158,12 @@ def _install_dflash_route(
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
-    from mtplx.gdn_capture import configure_qwen38_row18_gdn_decay_memo
     from mtplx.qwen38_challenge_kernels import (
         configure_qwen38_row21_qk_rms_rope,
         configure_qwen38_row24_qk_length_limit,
     )
 
     rows = set(survivor_rows)
-    row18_report = configure_qwen38_row18_gdn_decay_memo(
-        runtime.model,
-        active=18 in rows,
-    )
     row21_report = configure_qwen38_row21_qk_rms_rope(
         runtime.model,
         active=21 in rows,
@@ -183,8 +178,6 @@ def _install_dflash_route(
     text_model._mtplx_qwen38_row24_prefill_stride = 3 if 26 in rows else 4
     text_model._mtplx_qwen38_row48_boundary_fused = 48 in rows
     feature_receipt: dict[str, dict[str, Any]] = {}
-    if 18 in rows:
-        feature_receipt["r18_gdn_decay_memo"] = row18_report
     if 21 in rows:
         feature_receipt["r21_qk_rms_rope"] = row21_report
     if 24 in rows:
@@ -228,11 +221,7 @@ def _load_optimized_speed_target_stack(
 
 
 def _dflash_target_counter_snapshot() -> dict[str, int]:
-    from dflash_mlx.engine.target_qwen_gdn import (
-        dflash_qwen_target_counter_snapshot,
-    )
-
-    return dflash_qwen_target_counter_snapshot()
+    return {}
 
 
 def _flat_counter_delta(

@@ -108,14 +108,6 @@ def _engagement_exact(
             bool(row["feature_receipt"]["native_mtp_release"]["native_mtp_released"])
             for row in by_variant["candidate"]
         )
-    if args.candidate_label == "r18":
-        return all(
-            int(row["dflash_target_engagement"]["gdn_decay_memo_calls"]) == 0
-            for row in by_variant["control"]
-        ) and all(
-            int(row["dflash_target_engagement"]["gdn_decay_memo_calls"]) > 0
-            for row in by_variant["candidate"]
-        )
     return True
 
 

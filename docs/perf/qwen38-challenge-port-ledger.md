@@ -100,6 +100,8 @@ cumulative control before that later decision can remain authoritative.
 | 55 base | DFlash2 fixed depth 8, before survivor-specific ports | 733.786 | 65.858 | 34.81407 | 37.917 | **+7.0860%** | **RETAINED as the replacement base**; not the final merged item 55 | same |
 | 55 target-only | DFlash2 with native MTP still constructed | 732.129 | 68.140 | 34.30132 | 37.444 | - | DFlash replacement control | `item55-dflash2-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 55 target-only | Optimized-Speed target plus DFlash2; native MTP never constructed | 747.429 | 66.839 | 32.73674 | 37.275 | **+0.4543%** | **RETAINED**, -1.56458 GiB peak | same |
+| 55 / row 18 | target-only DFlash2 replacement base | 736.544 | 67.051 | 32.73673 | 37.559 | - | cumulative control | `item55-dflash2-r18-gdn-decay-memo-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 18 | + memoized GDN decay in DFlash recurrent rollback | 717.003 | 66.759 | 32.73675 | 38.221 | **-1.7342%** | **REJECTED, removed**; 9,120 calls/arm | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -148,7 +150,7 @@ proposer/custom-kernel win receives an explicit DFlash-equivalent adaptation or
 concrete evidence that DFlash replaces or cannot dispatch that exact surface;
 no survivor is considered covered merely because the base DFlash integration
 works. The scheduled source
-is the local `dflash-mlx` implementation at `a11f3d2ec2f1` (the current
+is the local `dflash-mlx` implementation at `b6c7f2201b26` (the current
 DFlash2 source, compatibility-gated by its full suite on MLX 0.32.0) and its declared
 `z-lab/Qwen3.8-27B-DFlash2` checkpoint snapshot `50307d4c4cde`; implementation
 will pin the complete artifact digest and geometry before the final gate rather
@@ -175,7 +177,7 @@ native MTP in the candidate process.
 | ---: | --- |
 | 8 | REPLACED by DFlash2's device-resident eight-token proposal block; no MTP draft chain remains. |
 | 10 | INCOMPATIBLE: its 98,330-row vocabulary is the native MTP head's reachable-ID set, while DFlash2 selects from the target vocabulary and can emit IDs outside that set. |
-| 18 | PENDING: port the memoized GDN decay into DFlash's recurrent rollback hook and gate it. |
+| 18 | REJECTED: the memoized GDN decay engaged 9,120 times per candidate arm with exact tokens and width, but regressed wall time 1.7342%; the port was removed. |
 | 20 | REPLACED: K/V-only append is a native-MTP committed-history optimization; DFlash2 owns projected target features plus separate rollback caches. |
 | 21 | PENDING: route eligible DFlash target-attention blocks through the retained fused Q/K RMSNorm plus partial-RoPE kernel and gate it. |
 | 24 | PENDING: port both the Q/K length fence and DFlash target evaluation ladder, then gate them cumulatively. |
