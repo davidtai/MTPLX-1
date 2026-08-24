@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,16 @@ def _module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_direct_script_bootstrap_adds_repository_root_to_import_path() -> None:
+    original = list(sys.path)
+    try:
+        sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != SCRIPT.parents[1]]
+        matrix = _module()
+        assert str(matrix.ROOT) in sys.path
+    finally:
+        sys.path[:] = original
 
 
 class CharacterTokenizer:

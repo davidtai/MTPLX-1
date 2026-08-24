@@ -16,6 +16,8 @@ from typing import Any, NamedTuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_MODEL = Path.home() / ".mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
 DEFAULT_DRAFT = Path.home() / (
     ".cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/"
