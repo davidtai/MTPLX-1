@@ -98,7 +98,6 @@ def test_child_command_pins_source_revision_and_disables_prefix_sessions(tmp_pat
     assert command[command.index("--prompt-tokens") + 1] == "16384"
     assert command[command.index("--source-root") + 1] == "/tmp/main"
     assert command[command.index("--source-commit") + 1] == "abc123"
-    assert command[command.index("--profile") + 1] == "turbo"
     assert "--prefix-cache" not in command
     assert "--session-id" not in command
 
@@ -126,7 +125,6 @@ def test_headline_uses_full_same_shape_decode_conditioning() -> None:
 
     assert command[command.index("--conditioner-tokens") + 1] == "1024"
     assert command[command.index("--conditioner-mode") + 1] == "same_prompt"
-    assert command[command.index("--profile") + 1] == "performance-cold"
     assert "--dflash2-adaptive" in command
 
 

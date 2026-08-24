@@ -102,7 +102,6 @@ def child_command(
         "--temperature", str(scenario.temperature),
         "--top-p", str(scenario.top_p),
         "--top-k", str(scenario.top_k),
-        "--profile", "performance-cold" if headline else "turbo",
         "--conditioner-tokens", str(scenario.max_tokens if headline else args.conditioner_tokens),
         "--conditioner-mode", "same_prompt" if headline else "unrelated_prompt",
         "--seed", str(args.seed),

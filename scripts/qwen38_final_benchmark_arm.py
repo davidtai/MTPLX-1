@@ -209,7 +209,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, required=True)
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
-    parser.add_argument("--profile", choices=("performance-cold", "turbo"), default="turbo")
     parser.add_argument("--conditioner-tokens", type=int, default=32)
     parser.add_argument(
         "--conditioner-mode",
@@ -244,7 +243,7 @@ def _load_prompt(args: argparse.Namespace, tokenizer: Any) -> tuple[str, list[in
     )
 
 
-def _load_native(model: Path, *, profile_name: str) -> tuple[Any, dict[str, Any]]:
+def _load_native(model: Path) -> tuple[Any, dict[str, Any]]:
     from mtplx.backends.registry import load_runtime_contract
     from mtplx.draft_lm_head import (
         _install_draft_lm_head,
@@ -258,7 +257,7 @@ def _load_native(model: Path, *, profile_name: str) -> tuple[Any, dict[str, Any]
     if error is not None:
         raise RuntimeError(f"invalid runtime contract: {error}")
     raw = {} if contract is None else contract.raw
-    profile = get_profile(profile_name)
+    profile = get_profile("turbo")
     apply_profile_env(
         profile.name,
         runtime_env_overrides=runtime_env_overrides_from_contract(raw),
@@ -290,12 +289,11 @@ def _load_dflash(
     *,
     draft_adaptive: bool,
     draft_block_size: int,
-    profile_name: str,
 ) -> tuple[Any, dict[str, Any]]:
     from mtplx.profiles import apply_profile_env
     from mtplx.runtime import load
 
-    apply_profile_env(profile_name)
+    apply_profile_env("turbo")
     os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] = "1"
     target_runtime = load(model, mtp=False)
     from mtplx.benchmarks.dflash2_runtime import bind_mtplx_dflash2_bundle
@@ -336,7 +334,7 @@ def _load_dflash(
     if draft_adaptive:
         validate_candidate_adaptive_receipt(runtime.qwen38_feature_receipt)
     return runtime, {
-        "profile": profile_name,
+        "profile": "turbo",
         "native_mtp_loaded": False,
         "dflash_block_size": int(draft_block_size),
         "feature_receipt": runtime.qwen38_feature_receipt,
@@ -407,14 +405,13 @@ def main() -> int:
     if not _verify_parent_guard_attestation(args.lock):
         raise RuntimeError("benchmark arm requires exclusive parent GPU lock attestation")
     runtime, stack = (
-        _load_native(args.model, profile_name=args.profile)
+        _load_native(args.model)
         if args.engine == "main_native_mtp"
         else _load_dflash(
             args.model,
             args.draft,
             draft_adaptive=bool(args.dflash2_adaptive),
             draft_block_size=int(args.draft_block_size),
-            profile_name=args.profile,
         )
     )
     if args.engine == "main_native_mtp":
