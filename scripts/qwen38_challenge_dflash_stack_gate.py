@@ -49,6 +49,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m8-nax-expanded", action="store_true")
     parser.add_argument("--control-m8-nax-kv", action="store_true")
     parser.add_argument("--candidate-m8-nax-kv", action="store_true")
+    parser.add_argument("--control-m8-nax-qkv", action="store_true")
+    parser.add_argument("--candidate-m8-nax-qkv", action="store_true")
     parser.add_argument("--control-cost-aligned-widths", action="store_true")
     parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
@@ -89,7 +91,7 @@ def _variant_environment(
 def _variant_config(
     args: argparse.Namespace,
     variant: str,
-) -> tuple[str, str, str, str, bool, bool, bool, bool, bool, bool, bool, bool]:
+) -> tuple[str, str, str, str, bool, bool, bool, bool, bool, bool, bool, bool, bool]:
     if variant == "control":
         return (
             args.control_survivors,
@@ -102,6 +104,7 @@ def _variant_config(
             bool(args.control_m7_nax_linear_z),
             bool(args.control_m8_nax_expanded),
             bool(args.control_m8_nax_kv),
+            bool(args.control_m8_nax_qkv),
             bool(args.control_cost_aligned_widths),
             bool(args.control_release_native_mtp),
         )
@@ -116,6 +119,7 @@ def _variant_config(
         bool(args.candidate_m7_nax_linear_z),
         bool(args.candidate_m8_nax_expanded),
         bool(args.candidate_m8_nax_kv),
+        bool(args.candidate_m8_nax_qkv),
         bool(args.candidate_cost_aligned_widths),
         bool(args.candidate_release_native_mtp),
     )
@@ -138,6 +142,7 @@ def _child_command(
         m7_nax_linear_z,
         m8_nax_expanded,
         m8_nax_kv,
+        m8_nax_qkv,
         cost_aligned_widths,
         release_native_mtp,
     ) = _variant_config(args, variant)
@@ -191,6 +196,8 @@ def _child_command(
         command.append("--dflash-m8-nax-expanded")
     if m8_nax_kv:
         command.append("--dflash-m8-nax-kv")
+    if m8_nax_qkv:
+        command.append("--dflash-m8-nax-qkv")
     return command
 
 
@@ -511,6 +518,33 @@ def _engagement_exact(
             and calls(row) > 0
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "m8_nax_qkv":
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        def calls(row: dict[str, Any], shape: str) -> int:
+            return int(
+                row.get("engagement", {}).get("nax_verify", {}).get(shape, 0)
+            )
+
+        return all(
+            bool(route(row).get("include_m8_kv"))
+            and not bool(route(row).get("include_m8_qkv"))
+            and calls(row, "m8_nax_k5120_n1024") > 0
+            and calls(row, "m8_nax_k5120_n10240") == 0
+            for row in by_variant["control"]
+        ) and all(
+            bool(route(row).get("include_m8_kv"))
+            and bool(route(row).get("include_m8_qkv"))
+            and route(row).get("m8_expanded_shapes")
+            == [[5120, 1024], [5120, 10240]]
+            and int(route(row).get("eligible_m8_expanded_projections", 0)) == 80
+            and calls(row, "m8_nax_k5120_n1024") > 0
+            and calls(row, "m8_nax_k5120_n10240") > 0
+            for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -610,6 +644,8 @@ def _aggregate(
             "candidate_m8_nax_expanded": bool(args.candidate_m8_nax_expanded),
             "control_m8_nax_kv": bool(args.control_m8_nax_kv),
             "candidate_m8_nax_kv": bool(args.candidate_m8_nax_kv),
+            "control_m8_nax_qkv": bool(args.control_m8_nax_qkv),
+            "candidate_m8_nax_qkv": bool(args.candidate_m8_nax_qkv),
             "control_cost_aligned_widths": bool(args.control_cost_aligned_widths),
             "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
@@ -689,6 +725,10 @@ def main() -> int:
             getattr(args, f"{prefix}_m8_nax_island")
         ):
             raise ValueError("DFlash M8 K/V route requires the M8 NAX island")
+        if bool(getattr(args, f"{prefix}_m8_nax_qkv")) and not bool(
+            getattr(args, f"{prefix}_m8_nax_kv")
+        ):
+            raise ValueError("DFlash M8 QKV route requires the retained M8 K/V route")
     for value in (
         args.control_max_mb_per_buffer,
         args.candidate_max_mb_per_buffer,

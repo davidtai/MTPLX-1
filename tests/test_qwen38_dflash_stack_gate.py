@@ -455,6 +455,42 @@ def test_m8_kv_engagement_requires_live_subgroup_only() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m8_qkv_engagement_requires_incremental_subgroup() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m8_nax_qkv")
+
+    def arm(*, qkv: bool, qkv_calls: int):
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "include_m8_kv": True,
+                    "include_m8_qkv": qkv,
+                    "m8_expanded_shapes": (
+                        [[5120, 1024], [5120, 10240]]
+                        if qkv
+                        else [[5120, 1024]]
+                    ),
+                    "eligible_m8_expanded_projections": 80 if qkv else 32,
+                }
+            },
+            "engagement": {
+                "nax_verify": {
+                    "m8_nax_k5120_n1024": 2112,
+                    "m8_nax_k5120_n10240": qkv_calls,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(qkv=False, qkv_calls=0) for _ in range(2)],
+        "candidate": [arm(qkv=True, qkv_calls=3168) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = arm(qkv=True, qkv_calls=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

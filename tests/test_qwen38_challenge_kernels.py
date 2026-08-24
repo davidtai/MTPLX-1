@@ -76,7 +76,7 @@ def test_dflash_m8_nax_island_selects_only_measured_live_o_projection(
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False, include_m8_expanded=False, include_m8_kv=False: selected.update(active=active)
+        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False, include_m8_expanded=False, include_m8_kv=False, include_m8_qkv=False: selected.update(active=active)
         or {
             "active": active,
             "width": 8,
@@ -107,7 +107,7 @@ def test_dflash_m8_nax_island_can_add_measured_linear_attention_z(
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False, include_m8_expanded=False, include_m8_kv=False: selected.update(
+        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False, include_m8_expanded=False, include_m8_kv=False, include_m8_qkv=False: selected.update(
             active=active,
             include_linear_z=include_linear_z,
         )
@@ -144,7 +144,7 @@ def test_dflash_nax_island_can_add_measured_m7_output_route(monkeypatch) -> None
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z, include_m7_output, include_m7_linear_z=False, include_m8_expanded=False, include_m8_kv=False: selected.update(
+        lambda *, active, include_linear_z, include_m7_output, include_m7_linear_z=False, include_m8_expanded=False, include_m8_kv=False, include_m8_qkv=False: selected.update(
             active=active,
             include_m7_output=include_m7_output,
         )
