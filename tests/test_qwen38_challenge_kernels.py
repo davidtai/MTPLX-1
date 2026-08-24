@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 
+from mtplx import qwen38_challenge_kernels as kernels
 from mtplx.qwen38_challenge_kernels import (
+    configure_qwen38_row21_qk_rms_rope,
     qwen38_dual_rms_norm_concat,
     qwen38_qk_rms_rope,
 )
@@ -61,3 +65,44 @@ def test_qk_rms_rope_matches_stock_qwen38_partial_rope_at_fixed_d3_width() -> No
 
     assert mx.array_equal(q_actual, q_expected).item()
     assert mx.array_equal(k_actual, k_expected).item()
+
+
+def test_row21_config_exposes_dflash_qk_prepare_callback(monkeypatch) -> None:
+    rope = SimpleNamespace(
+        dims=64,
+        base=10_000_000.0,
+        scale=1.0,
+        traditional=False,
+    )
+    q_norm = SimpleNamespace(weight=object(), eps=1e-6)
+    k_norm = SimpleNamespace(weight=object(), eps=1e-6)
+    attention = SimpleNamespace(
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        rope=rope,
+        q_norm=q_norm,
+        k_norm=k_norm,
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)])
+    )
+    calls = []
+
+    def fake_kernel(queries, keys, q_weight, k_weight, eps, offset):
+        calls.append((queries, keys, q_weight, k_weight, eps, offset))
+        return "prepared-q", "prepared-k"
+
+    monkeypatch.setattr(kernels, "qwen38_qk_rms_rope", fake_kernel)
+
+    report = configure_qwen38_row21_qk_rms_rope(model, active=True)
+    assert report["dflash_modules"] == 1
+    assert attention._dflash_qk_prepare("q", "k", 4096) == (
+        "prepared-q",
+        "prepared-k",
+    )
+    assert calls == [("q", "k", q_norm.weight, k_norm.weight, 1e-6, 4096)]
+
+    inactive = configure_qwen38_row21_qk_rms_rope(model, active=False)
+    assert inactive["dflash_modules"] == 0
+    assert not hasattr(attention, "_dflash_qk_prepare")

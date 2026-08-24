@@ -108,6 +108,13 @@ def _engagement_exact(
             bool(row["feature_receipt"]["native_mtp_release"]["native_mtp_released"])
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "r21":
+        def calls(row: dict[str, Any]) -> int:
+            return int(row["engagement"]["r21_qk_rms_rope"]["calls"])
+
+        return all(calls(row) == 0 for row in by_variant["control"]) and all(
+            calls(row) > 0 for row in by_variant["candidate"]
+        )
     return True
 
 

@@ -306,16 +306,39 @@ def configure_qwen38_row21_qk_rms_rope(model: Any, *, active: bool) -> dict[str,
     inner = getattr(text, "model", text)
     layers = list(getattr(inner, "layers", ()) or ())
     eligible = 0
+    dflash_modules = 0
     for layer in layers:
         attention = getattr(layer, "self_attn", None)
         if attention is None:
             continue
         is_eligible = _row21_attention_eligible(attention)
         attention._mtplx_qwen38_row21_active = bool(active and is_eligible)
+        if active and is_eligible:
+            def dflash_qk_prepare(
+                queries,
+                keys,
+                offset,
+                *,
+                _attention=attention,
+            ):
+                return qwen38_qk_rms_rope(
+                    queries,
+                    keys,
+                    _attention.q_norm.weight,
+                    _attention.k_norm.weight,
+                    float(_attention.q_norm.eps),
+                    int(offset),
+                )
+
+            attention._dflash_qk_prepare = dflash_qk_prepare
+            dflash_modules += 1
+        elif hasattr(attention, "_dflash_qk_prepare"):
+            delattr(attention, "_dflash_qk_prepare")
         eligible += int(is_eligible)
     return {
         "eligible_modules": eligible,
         "active_modules": eligible if active else 0,
+        "dflash_modules": dflash_modules,
         "mtp_array_offset_skipped": 1,
     }
 

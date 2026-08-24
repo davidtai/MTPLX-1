@@ -29,6 +29,26 @@ def test_dflash_flat_counter_delta_tracks_only_current_arm() -> None:
     ) == {"boundary": 4, "memo": 7, "qk": 0}
 
 
+def test_row21_engagement_requires_candidate_only_fused_calls() -> None:
+    args = SimpleNamespace(candidate_label="r21")
+    by_variant = {
+        "control": [
+            {"engagement": {"r21_qk_rms_rope": {"calls": 0}}},
+            {"engagement": {"r21_qk_rms_rope": {"calls": 0}}},
+        ],
+        "candidate": [
+            {"engagement": {"r21_qk_rms_rope": {"calls": 32}}},
+            {"engagement": {"r21_qk_rms_rope": {"calls": 31}}},
+        ],
+    }
+
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1]["engagement"]["r21_qk_rms_rope"]["calls"] = 0
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 
