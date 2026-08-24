@@ -949,6 +949,36 @@ def test_m56_kconst_engagement_requires_all_three_selected_routes() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m6_kconst_engagement_allows_retained_m5_kconst_control() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m6_kconst", control_m5_kconst=True)
+
+    def arm(include_m6):
+        counters = {
+            "m5_ksplit_kconst_k5120_n48": 1,
+            "m5_ksplit_kconst_k5120_n10240": 1,
+        }
+        if include_m6:
+            counters["m6_ksplit_kconst_k5120_n10240"] = 1
+        return {
+            "feature_receipt": {
+                "dflash_m56_kconst": {
+                    "active": True,
+                    "m5_shapes": [[5120, 48], [5120, 10240]],
+                    "m6_shapes": [[5120, 10240]] if include_m6 else [],
+                }
+            },
+            "engagement": {"nax_verify": counters},
+        }
+
+    by_variant = {
+        "control": [arm(False), arm(False)],
+        "candidate": [arm(True), arm(True)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 
