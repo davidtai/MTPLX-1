@@ -849,6 +849,8 @@ def nax_qmm_m6(
         else f"m6_ksplit_kp{int(k_parts)}"
     )
     _count_nax_dispatch(dispatch_kind, k=K, n=N)
+    if rows == 5:
+        _count_nax_dispatch(f"m5_exact_ksplit_kp{int(k_parts)}", k=K, n=N)
     kernel = _build_kernel_m6_ksplit_np(
         group_size,
         x2.dtype,
@@ -917,6 +919,8 @@ _QWEN38_M5_EXACT_ACTIVE = False
 _QWEN38_M6_KP1_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
 _QWEN38_M7_NSG_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M8_NSG_BY_SHAPE: dict[tuple[int, int], int] = {}
+_QWEN38_M5_KPARTS_BY_SHAPE: dict[tuple[int, int], int] = {}
+_QWEN38_M6_KPARTS_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M8_NAX_OUTPUT_SHAPES = frozenset({(6_144, 5_120)})
 _QWEN38_M8_NAX_LINEAR_Z_SHAPES = frozenset({(5_120, 6_144)})
 _QWEN38_M8_NAX_EXPANDED_SHAPES = frozenset(
@@ -954,6 +958,36 @@ def configure_qwen38_nax_split_tuning(
         "active": bool(active),
         "m7_nsg_by_shape": receipt(m7),
         "m8_nsg_by_shape": receipt(m8),
+    }
+
+
+def configure_qwen38_m56_partition_tuning(*, active: bool) -> dict[str, object]:
+    """Install the micro-screened K-partition candidate by live projection."""
+
+    global _QWEN38_M5_KPARTS_BY_SHAPE, _QWEN38_M6_KPARTS_BY_SHAPE
+    m5 = {
+        (17_408, 5_120): 1,
+        (5_120, 1_024): 1,
+        (5_120, 17_408): 1,
+        (5_120, 48): 4,
+    }
+    m6 = {
+        (17_408, 5_120): 4,
+        (5_120, 1_024): 1,
+        (5_120, 10_240): 1,
+        (5_120, 12_288): 4,
+        (5_120, 17_408): 2,
+    }
+    _QWEN38_M5_KPARTS_BY_SHAPE = m5 if active else {}
+    _QWEN38_M6_KPARTS_BY_SHAPE = m6 if active else {}
+
+    def receipt(values: dict[tuple[int, int], int]) -> dict[str, int]:
+        return {f"{k}x{n}": parts for (k, n), parts in sorted(values.items())}
+
+    return {
+        "active": bool(active),
+        "m5_kparts_by_shape": receipt(_QWEN38_M5_KPARTS_BY_SHAPE),
+        "m6_kparts_by_shape": receipt(_QWEN38_M6_KPARTS_BY_SHAPE),
     }
 
 
@@ -1295,9 +1329,12 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                         group_size=group_size,
                         exact_m5=bool(m == 5 and _QWEN38_M5_EXACT_ACTIVE),
                         k_parts=(
-                            1
-                            if m == 6 and (k, n) in _QWEN38_M6_KP1_ACTIVE_SHAPES
-                            else 2
+                            _QWEN38_M5_KPARTS_BY_SHAPE.get((k, n), 2)
+                            if m == 5
+                            else _QWEN38_M6_KPARTS_BY_SHAPE.get(
+                                (k, n),
+                                1 if (k, n) in _QWEN38_M6_KP1_ACTIVE_SHAPES else 2,
+                            )
                         ),
                     )
                 elif (

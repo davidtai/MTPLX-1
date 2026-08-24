@@ -779,6 +779,8 @@ def test_nax_split_candidate_flags_are_isolated_per_arm() -> None:
         candidate_m8_kv_nsg16=True,
         control_m8_qkv_nsg4=False,
         candidate_m8_qkv_nsg4=True,
+        control_m56_partition_v2=False,
+        candidate_m56_partition_v2=True,
     )
     control = stack_gate._variant_environment(args, "control", {})
     candidate = stack_gate._variant_environment(args, "candidate", {})
@@ -788,6 +790,8 @@ def test_nax_split_candidate_flags_are_isolated_per_arm() -> None:
     assert candidate["MTPLX_QWEN38_M8_KV_NSG16"] == "1"
     assert control["MTPLX_QWEN38_M8_QKV_NSG4"] == "0"
     assert candidate["MTPLX_QWEN38_M8_QKV_NSG4"] == "1"
+    assert control["MTPLX_QWEN38_M56_PARTITION_V2"] == "0"
+    assert candidate["MTPLX_QWEN38_M56_PARTITION_V2"] == "1"
 
 
 def test_m7_linear_z_nsg4_engagement_requires_exact_shape_counter() -> None:
@@ -815,6 +819,44 @@ def test_m7_linear_z_nsg4_engagement_requires_exact_shape_counter() -> None:
     }
     assert stack_gate._engagement_exact(args, by_variant) is True
     by_variant["candidate"][0]["engagement"]["nax_verify"].clear()
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_m56_partition_v2_engagement_checks_every_selected_shape() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m56_partition_v2")
+    m5 = {"5120x48": 4, "5120x1024": 1, "5120x17408": 1, "17408x5120": 1}
+    m6 = {"5120x1024": 1, "5120x10240": 1, "5120x12288": 4, "5120x17408": 2, "17408x5120": 4}
+
+    def arm(active):
+        counters = {}
+        if active:
+            for shape, kp in m5.items():
+                k, n = shape.split("x")
+                counters[f"m5_exact_ksplit_kp{kp}_k{k}_n{n}"] = 1
+            for shape, kp in m6.items():
+                k, n = shape.split("x")
+                counters[f"m6_ksplit_kp{kp}_k{k}_n{n}"] = 1
+        return {
+            "feature_receipt": {
+                "dflash_m56_partition_tuning": {
+                    "active": active,
+                    "m5_kparts_by_shape": m5 if active else {},
+                    "m6_kparts_by_shape": m6 if active else {},
+                }
+            },
+            "engagement": {"nax_verify": counters},
+        }
+
+    by_variant = {
+        "control": [arm(False), arm(False)],
+        "candidate": [arm(True), arm(True)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0]["engagement"]["nax_verify"].pop(
+        "m6_ksplit_kp4_k17408_n5120"
+    )
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 

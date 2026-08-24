@@ -310,6 +310,28 @@ def test_qwen38_shape_specific_nax_split_tuning() -> None:
         configure_qwen38_nax_split_tuning(active=False)
 
 
+def test_qwen38_shape_specific_m5_m6_partition_candidate() -> None:
+    from mtplx.nax_verify import configure_qwen38_m56_partition_tuning
+
+    report = configure_qwen38_m56_partition_tuning(active=True)
+    try:
+        assert report["m5_kparts_by_shape"] == {
+            "5120x48": 4,
+            "5120x1024": 1,
+            "5120x17408": 1,
+            "17408x5120": 1,
+        }
+        assert report["m6_kparts_by_shape"] == {
+            "5120x1024": 1,
+            "5120x10240": 1,
+            "5120x12288": 4,
+            "5120x17408": 2,
+            "17408x5120": 4,
+        }
+    finally:
+        configure_qwen38_m56_partition_tuning(active=False)
+
+
 def test_vk_6bit_hexpack_ksplit_matches_stock() -> None:
     """The 9B-tier 6-bit lane (2026-07-07): MLX packs 6-bit values
     bit-contiguously little-endian; the hexpack kernels must agree with

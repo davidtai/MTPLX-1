@@ -277,6 +277,11 @@ def _install_dflash_route(
         m8_kv_nsg16=os.environ.get("MTPLX_QWEN38_M8_KV_NSG16", "0") == "1",
         m8_qkv_nsg4=os.environ.get("MTPLX_QWEN38_M8_QKV_NSG4", "0") == "1",
     )
+    from mtplx.nax_verify import configure_qwen38_m56_partition_tuning
+
+    m56_partition_report = configure_qwen38_m56_partition_tuning(
+        active=os.environ.get("MTPLX_QWEN38_M56_PARTITION_V2", "0") == "1"
+    )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
         feature_receipt["r21_qk_rms_rope"] = row21_report
@@ -292,6 +297,7 @@ def _install_dflash_route(
     if m8_nax_island:
         feature_receipt["dflash_m8_nax_island"] = m8_nax_report
         feature_receipt["dflash_nax_split_tuning"] = nax_split_report
+        feature_receipt["dflash_m56_partition_tuning"] = m56_partition_report
     runtime.qwen38_feature_receipt = feature_receipt
     return SimpleNamespace(
         route_id="+".join(

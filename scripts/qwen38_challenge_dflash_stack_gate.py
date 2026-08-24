@@ -65,6 +65,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m8-kv-nsg16", action="store_true")
     parser.add_argument("--control-m8-qkv-nsg4", action="store_true")
     parser.add_argument("--candidate-m8-qkv-nsg4", action="store_true")
+    parser.add_argument("--control-m56-partition-v2", action="store_true")
+    parser.add_argument("--candidate-m56-partition-v2", action="store_true")
     parser.add_argument("--control-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--candidate-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--control-disable-row24-decode-ladder", action="store_true")
@@ -115,6 +117,9 @@ def _variant_environment(
     )
     environment["MTPLX_QWEN38_M8_QKV_NSG4"] = (
         "1" if bool(getattr(args, f"{prefix}_m8_qkv_nsg4", False)) else "0"
+    )
+    environment["MTPLX_QWEN38_M56_PARTITION_V2"] = (
+        "1" if bool(getattr(args, f"{prefix}_m56_partition_v2", False)) else "0"
     )
     return environment
 
@@ -348,6 +353,32 @@ def _engagement_exact(
 
         return all(matches(row, 8) for row in by_variant["control"]) and all(
             matches(row, candidate_nsg) for row in by_variant["candidate"]
+        )
+    if args.candidate_label == "m56_partition_v2":
+        def matches(row: dict[str, Any], active: bool) -> bool:
+            report = row.get("feature_receipt", {}).get(
+                "dflash_m56_partition_tuning", {}
+            )
+            if bool(report.get("active")) != active:
+                return False
+            if not active:
+                return not report.get("m5_kparts_by_shape") and not report.get(
+                    "m6_kparts_by_shape"
+                )
+            counters = row.get("engagement", {}).get("nax_verify", {})
+            for family, receipt_key in (
+                ("m5_exact_ksplit", "m5_kparts_by_shape"),
+                ("m6_ksplit", "m6_kparts_by_shape"),
+            ):
+                for shape, parts in report.get(receipt_key, {}).items():
+                    k_text, n_text = shape.split("x", 1)
+                    counter = f"{family}_kp{parts}_k{k_text}_n{n_text}"
+                    if int(counters.get(counter, 0)) <= 0:
+                        return False
+            return True
+
+        return all(matches(row, False) for row in by_variant["control"]) and all(
+            matches(row, True) for row in by_variant["candidate"]
         )
     if args.candidate_label == "release_native_mtp":
         return all(
@@ -1007,6 +1038,8 @@ def _aggregate(
             "candidate_m8_kv_nsg16": bool(args.candidate_m8_kv_nsg16),
             "control_m8_qkv_nsg4": bool(args.control_m8_qkv_nsg4),
             "candidate_m8_qkv_nsg4": bool(args.candidate_m8_qkv_nsg4),
+            "control_m56_partition_v2": bool(args.control_m56_partition_v2),
+            "candidate_m56_partition_v2": bool(args.candidate_m56_partition_v2),
             "control_disable_row24_prefill_ladder": bool(
                 args.control_disable_row24_prefill_ladder
             ),
