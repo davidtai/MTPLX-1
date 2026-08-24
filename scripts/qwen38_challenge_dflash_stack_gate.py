@@ -37,6 +37,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-custom-rows", default="")
     parser.add_argument("--control-gqa-widths", default="")
     parser.add_argument("--candidate-gqa-widths", default="")
+    parser.add_argument("--control-m8-nax-island", action="store_true")
+    parser.add_argument("--candidate-m8-nax-island", action="store_true")
     parser.add_argument("--control-cost-aligned-widths", action="store_true")
     parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
@@ -57,13 +59,14 @@ def _parse_args() -> argparse.Namespace:
 def _variant_config(
     args: argparse.Namespace,
     variant: str,
-) -> tuple[str, str, str, str, bool, bool]:
+) -> tuple[str, str, str, str, bool, bool, bool]:
     if variant == "control":
         return (
             args.control_survivors,
             args.control_adaptive_rows,
             args.control_custom_rows,
             args.control_gqa_widths,
+            bool(args.control_m8_nax_island),
             bool(args.control_cost_aligned_widths),
             bool(args.control_release_native_mtp),
         )
@@ -72,6 +75,7 @@ def _variant_config(
         args.candidate_adaptive_rows,
         args.candidate_custom_rows,
         args.candidate_gqa_widths,
+        bool(args.candidate_m8_nax_island),
         bool(args.candidate_cost_aligned_widths),
         bool(args.candidate_release_native_mtp),
     )
@@ -88,6 +92,7 @@ def _child_command(
         adaptive_rows,
         custom_rows,
         gqa_widths,
+        m8_nax_island,
         cost_aligned_widths,
         release_native_mtp,
     ) = _variant_config(args, variant)
@@ -129,6 +134,8 @@ def _child_command(
         command.append("--release-native-mtp")
     if cost_aligned_widths:
         command.append("--dflash-cost-aligned-widths")
+    if m8_nax_island:
+        command.append("--dflash-m8-nax-island")
     return command
 
 
@@ -249,6 +256,26 @@ def _engagement_exact(
             and set(alignment(row).get("promoted_widths", ())) == {"5->6", "7->8"}
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "m8_nax_island":
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        return all(not route(row) for row in by_variant["control"]) and all(
+            bool(route(row).get("active"))
+            and int(route(row).get("width", 0)) == 8
+            and route(row).get("shapes") == [[5120, 6144], [6144, 5120]]
+            and int(route(row).get("eligible_attention_modules", 0)) == 16
+            and int(route(row).get("eligible_projections", 0)) == 32
+            and int(
+                row.get("adaptive_metrics", {})
+                .get("cycles_by_block", {})
+                .get("8", 0)
+            )
+            > 0
+            for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -336,6 +363,8 @@ def _aggregate(
             "candidate_gqa_widths": list(
                 arm_gate._parse_dflash_gqa_widths(args.candidate_gqa_widths)
             ),
+            "control_m8_nax_island": bool(args.control_m8_nax_island),
+            "candidate_m8_nax_island": bool(args.candidate_m8_nax_island),
             "control_cost_aligned_widths": bool(args.control_cost_aligned_widths),
             "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),

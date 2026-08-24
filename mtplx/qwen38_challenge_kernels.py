@@ -196,6 +196,46 @@ def configure_qwen38_dflash_gqa_widths(
     }
 
 
+def configure_qwen38_dflash_m8_nax_island(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, Any]:
+    """Route only measured width-8 Qwen attention projections to BM=8 NAX."""
+
+    text = getattr(model, "language_model", model)
+    inner = getattr(text, "model", text)
+    attention_modules = [
+        attention
+        for layer in list(getattr(inner, "layers", ()) or ())
+        if (attention := getattr(layer, "self_attn", None)) is not None
+    ]
+    eligible = [attention for attention in attention_modules if _row21_attention_eligible(attention)]
+    projection_shapes: list[tuple[int, int]] = []
+    for attention in eligible:
+        for projection in (attention.q_proj, attention.o_proj):
+            weight = projection["weight"]
+            bits = int(getattr(projection, "bits", 0))
+            group_size = int(getattr(projection, "group_size", 0))
+            if bits != 4 or group_size != 32:
+                raise ValueError("Qwen 3.8 M8 NAX island requires affine Q4/G32")
+            projection_shapes.append(
+                (int(weight.shape[1]) * 32 // bits, int(weight.shape[0]))
+            )
+    expected = [(5_120, 6_144), (6_144, 5_120)] * 16
+    if len(eligible) != 16 or sorted(projection_shapes) != sorted(expected):
+        raise ValueError("Qwen 3.8 M8 NAX island projection geometry changed")
+
+    from mtplx.nax_verify import configure_qwen38_m8_nax_island
+
+    report = configure_qwen38_m8_nax_island(active=active)
+    return {
+        **report,
+        "eligible_attention_modules": len(eligible),
+        "eligible_projections": len(projection_shapes),
+    }
+
+
 def qwen38_qk_rms_rope(
     queries: Any,
     keys: Any,

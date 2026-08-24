@@ -73,8 +73,15 @@ def nax_available() -> bool:
 nax_available.cache_clear = _nax_hardware_available.cache_clear  # type: ignore[attr-defined]
 
 
-def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
-    key = ("m16_nax_ktmpl", int(k_val), group_size, dtype)
+def _build_kernel_nax_ktmpl(
+    m_val: int,
+    k_val: int,
+    group_size: int,
+    dtype: mx.Dtype,
+):
+    if int(m_val) not in (8, 16):
+        raise ValueError("NAX verify tile rows must be 8 or 16")
+    key = (f"m{int(m_val)}_nax_ktmpl", int(k_val), group_size, dtype)
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
 
@@ -82,7 +89,7 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
         using namespace metal;
         using namespace mpp::tensor_ops;
 
-        constexpr int BM = 16;
+        constexpr int BM = {int(m_val)};
         constexpr int BN = 32;
         constexpr int BK = 16;
         constexpr int NSG = 8;
@@ -105,7 +112,7 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
         threadgroup float partial[NSG][BM * BN];
 
         constexpr auto desc = matmul2d_descriptor(
-            16,
+            {int(m_val)},
             32,
             16,
             false,
@@ -128,7 +135,7 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
             array<int, 2>{{1, BN}});
 
         auto ct_c = op.template get_destination_cooperative_tensor<
-            tensor<device T, extents<int, 16, 16>, tensor_inline>,
+            tensor<device T, extents<int, {int(m_val)}, 16>, tensor_inline>,
             tensor<threadgroup T, extents<int, 32, 16>, tensor_inline>,
             float>();
         _Pragma("unroll")
@@ -157,13 +164,13 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
             }}
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
-            auto tA = A.template slice<16, 16>(k0, 0);
+            auto tA = A.template slice<16, {int(m_val)}>(k0, 0);
             auto tB = B.template slice<32, 16>(0, 0);
             op.run(tA, tB, ct_c);
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }}
 
-        auto tC = C.template slice<32, 16>(0, 0);
+        auto tC = C.template slice<32, {int(m_val)}>(0, 0);
         ct_c.store(tC);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -181,7 +188,10 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
 
     dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     kernel = mx.fast.metal_kernel(
-        name=f"mtplx_verify_m16_nax_k{int(k_val)}_gs{group_size}_{dtype_tag}",
+        name=(
+            f"mtplx_verify_m{int(m_val)}_nax_"
+            f"k{int(k_val)}_gs{group_size}_{dtype_tag}"
+        ),
         input_names=["x", "w_q", "scales", "biases", "N_size"],
         output_names=["y"],
         header="""
@@ -191,6 +201,14 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
     )
     _VERIFY_KERNEL_CACHE[key] = kernel
     return kernel
+
+
+def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
+    return _build_kernel_nax_ktmpl(16, k_val, group_size, dtype)
+
+
+def _build_kernel_m8_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
+    return _build_kernel_nax_ktmpl(8, k_val, group_size, dtype)
 
 
 def _build_kernel_m4_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int = 4):
@@ -827,6 +845,52 @@ def nax_qmm_m8(
     return y
 
 
+_QWEN38_M8_NAX_ISLAND_ACTIVE = False
+_QWEN38_M8_NAX_ISLAND_SHAPES = frozenset(
+    {
+        (5_120, 6_144),
+        (6_144, 5_120),
+    }
+)
+
+
+def configure_qwen38_m8_nax_island(*, active: bool) -> dict[str, object]:
+    global _QWEN38_M8_NAX_ISLAND_ACTIVE
+    _QWEN38_M8_NAX_ISLAND_ACTIVE = bool(active)
+    return {
+        "active": bool(active),
+        "width": 8,
+        "shapes": [list(shape) for shape in sorted(_QWEN38_M8_NAX_ISLAND_SHAPES)],
+    }
+
+
+def nax_qmm_m8_nax(
+    x2: mx.array,
+    w_q: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    group_size: int = 64,
+) -> mx.array:
+    """Run the exact eight-row MPP tile without padding to sixteen rows."""
+
+    M = int(x2.shape[0])
+    K = int(x2.shape[1])
+    N = int(w_q.shape[0])
+    if M != 8:
+        raise ValueError(f"Qwen3.8 M8 NAX island requires exactly 8 rows, got {M}")
+    kernel = _build_kernel_m8_nax_ktmpl(K, group_size, x2.dtype)
+    (y,) = kernel(
+        inputs=[mx.contiguous(x2), w_q, scales, biases, N],
+        template=[("T", x2.dtype), ("KCONST", K)],
+        grid=(256, N // 32, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(8, N)],
+        output_dtypes=[x2.dtype],
+    )
+    return y
+
+
 def m16_nax_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
     return (
         int(bits) == 4
@@ -1058,6 +1122,17 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     and m6_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
                 ):
                     y = nax_qmm_m6(
+                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        group_size=group_size,
+                    )
+                elif (
+                    _QWEN38_M8_NAX_ISLAND_ACTIVE
+                    and m == 8
+                    and (k, n) in _QWEN38_M8_NAX_ISLAND_SHAPES
+                    and not lane_disabled("qmm_m16_nax")
+                    and m16_nax_eligible(m, k, n, bits, group_size, x.dtype)
+                ):
+                    y = nax_qmm_m8_nax(
                         x.reshape(m, k), w_q, self["scales"], self["biases"],
                         group_size=group_size,
                     )
