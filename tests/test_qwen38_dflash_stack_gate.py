@@ -533,7 +533,7 @@ def test_exact_m5_engagement_requires_every_live_shape() -> None:
     args = SimpleNamespace(candidate_label="m5_exact")
     shapes = (
         (5120, 1024), (5120, 6144), (5120, 10240), (5120, 12288),
-        (5120, 17408), (6144, 5120), (17408, 5120),
+        (5120, 17408), (5120, 48), (6144, 5120), (17408, 5120),
     )
 
     def arm(*, exact: bool, missing: tuple[int, int] | None = None):
