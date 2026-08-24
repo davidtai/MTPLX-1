@@ -845,21 +845,26 @@ def nax_qmm_m8(
     return y
 
 
-_QWEN38_M8_NAX_ISLAND_ACTIVE = False
-_QWEN38_M8_NAX_ISLAND_SHAPES = frozenset(
-    {
-        (6_144, 5_120),
-    }
-)
+_QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
+_QWEN38_M8_NAX_OUTPUT_SHAPES = frozenset({(6_144, 5_120)})
+_QWEN38_M8_NAX_LINEAR_Z_SHAPES = frozenset({(5_120, 6_144)})
 
 
-def configure_qwen38_m8_nax_island(*, active: bool) -> dict[str, object]:
-    global _QWEN38_M8_NAX_ISLAND_ACTIVE
-    _QWEN38_M8_NAX_ISLAND_ACTIVE = bool(active)
+def configure_qwen38_m8_nax_island(
+    *,
+    active: bool,
+    include_linear_z: bool = False,
+) -> dict[str, object]:
+    global _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES
+    shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES
+    if include_linear_z:
+        shapes = shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
+    _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES = shapes if active else frozenset()
     return {
         "active": bool(active),
         "width": 8,
-        "shapes": [list(shape) for shape in sorted(_QWEN38_M8_NAX_ISLAND_SHAPES)],
+        "include_linear_z": bool(include_linear_z),
+        "shapes": [list(shape) for shape in sorted(shapes)],
     }
 
 
@@ -1125,9 +1130,8 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                         group_size=group_size,
                     )
                 elif (
-                    _QWEN38_M8_NAX_ISLAND_ACTIVE
-                    and m == 8
-                    and (k, n) in _QWEN38_M8_NAX_ISLAND_SHAPES
+                    m == 8
+                    and (k, n) in _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES
                     and not lane_disabled("qmm_m16_nax")
                     and m16_nax_eligible(m, k, n, bits, group_size, x.dtype)
                 ):

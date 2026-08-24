@@ -199,6 +199,7 @@ def _install_dflash_route(
     survivor_rows: tuple[int, ...],
     gqa_widths: tuple[int, ...] = (),
     m8_nax_island: bool = False,
+    m8_linear_z: bool = False,
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
@@ -238,6 +239,7 @@ def _install_dflash_route(
     m8_nax_report = configure_qwen38_dflash_m8_nax_island(
         runtime.model,
         active=bool(m8_nax_island),
+        include_linear_z=bool(m8_linear_z),
     )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
@@ -261,6 +263,7 @@ def _install_dflash_route(
                 *(f"r{row:02d}" for row in survivor_rows),
                 *(("gqa678",) if gqa_widths else ()),
                 *(("m8nax",) if m8_nax_island else ()),
+                *(("m8linearz",) if m8_linear_z else ()),
             )
         )
     )
@@ -318,6 +321,7 @@ def _run_dflash_arm(
     custom_rows: tuple[int, ...],
     gqa_widths: tuple[int, ...],
     m8_nax_island: bool,
+    m8_linear_z: bool,
     cost_aligned_widths: bool,
     release_report: dict[str, bool],
 ) -> dict[str, Any]:
@@ -354,6 +358,7 @@ def _run_dflash_arm(
                 *(f"c{row:02d}" for row in custom_rows),
                 *(("gqa678",) if gqa_widths else ()),
                 *(("m8nax",) if m8_nax_island else ()),
+                *(("m8linearz",) if m8_linear_z else ()),
                 *(("cost_aligned",) if cost_aligned_widths else ()),
             )
         ),
@@ -428,6 +433,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dflash-custom-rows", default="")
     parser.add_argument("--dflash-gqa-widths", default="")
     parser.add_argument("--dflash-m8-nax-island", action="store_true")
+    parser.add_argument("--dflash-m8-linear-z", action="store_true")
     parser.add_argument("--dflash-cost-aligned-widths", action="store_true")
     parser.add_argument(
         "--engine",
@@ -455,6 +461,8 @@ def main() -> int:
     adaptive_rows = _parse_dflash_adaptive_rows(args.dflash_adaptive_rows)
     custom_rows = _parse_dflash_custom_rows(args.dflash_custom_rows)
     gqa_widths = _parse_dflash_gqa_widths(args.dflash_gqa_widths)
+    if args.dflash_m8_linear_z and not args.dflash_m8_nax_island:
+        raise ValueError("DFlash M8 linear-Z requires the M8 NAX island")
 
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,
@@ -515,6 +523,7 @@ def main() -> int:
             survivor_rows=survivor_rows,
             gqa_widths=gqa_widths,
             m8_nax_island=bool(args.dflash_m8_nax_island),
+            m8_linear_z=bool(args.dflash_m8_linear_z),
         )
         if dflash_route is None:
             raise RuntimeError("DFlash2 survivor route did not install")
@@ -583,6 +592,7 @@ def main() -> int:
             custom_rows=custom_rows,
             gqa_widths=gqa_widths,
             m8_nax_island=bool(args.dflash_m8_nax_island),
+            m8_linear_z=bool(args.dflash_m8_linear_z),
             cost_aligned_widths=bool(args.dflash_cost_aligned_widths),
             release_report=release_report,
         )
@@ -621,6 +631,7 @@ def main() -> int:
         "dflash_custom_rows": list(custom_rows),
         "dflash_gqa_widths": list(gqa_widths),
         "dflash_m8_nax_island": bool(args.dflash_m8_nax_island),
+        "dflash_m8_linear_z": bool(args.dflash_m8_linear_z),
         "dflash_cost_aligned_widths": bool(args.dflash_cost_aligned_widths),
         "native_mtp_release": dict(release_report),
         "mlx_version": importlib.metadata.version("mlx"),

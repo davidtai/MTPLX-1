@@ -200,6 +200,7 @@ def configure_qwen38_dflash_m8_nax_island(
     model: Any,
     *,
     active: bool,
+    include_linear_z: bool = False,
 ) -> dict[str, Any]:
     """Route only measured width-8 Qwen attention projections to BM=8 NAX."""
 
@@ -231,16 +232,42 @@ def configure_qwen38_dflash_m8_nax_island(
             f"shape_counts={[(shape, projection_shapes.count(shape)) for shape in sorted(set(projection_shapes))]}"
         )
 
+    linear_modules = [
+        linear
+        for layer in list(getattr(inner, "layers", ()) or ())
+        if (linear := getattr(layer, "linear_attn", None)) is not None
+    ]
+    linear_z_shapes: list[tuple[int, int]] = []
+    for linear in linear_modules:
+        projection = linear.in_proj_z
+        weight = projection["weight"]
+        bits = int(getattr(projection, "bits", 0))
+        group_size = int(getattr(projection, "group_size", 0))
+        if bits != 4 or group_size != 32:
+            raise ValueError("Qwen 3.8 M8 linear-Z island requires affine Q4/G32")
+        linear_z_shapes.append(
+            (int(weight.shape[1]) * 32 // bits, int(weight.shape[0]))
+        )
+    if include_linear_z and linear_z_shapes != [(5_120, 6_144)] * 48:
+        raise ValueError("Qwen 3.8 M8 linear-Z projection geometry changed")
+
     from mtplx.nax_verify import configure_qwen38_m8_nax_island
 
-    report = configure_qwen38_m8_nax_island(active=active)
+    report = configure_qwen38_m8_nax_island(
+        active=active,
+        include_linear_z=include_linear_z,
+    )
     routed_shapes = {tuple(shape) for shape in report["shapes"]}
+    all_projection_shapes = projection_shapes + linear_z_shapes
     return {
         **report,
         "eligible_attention_modules": len(eligible),
+        "eligible_linear_z_projections": sum(
+            shape in routed_shapes for shape in linear_z_shapes
+        ),
         "validated_projections": len(projection_shapes),
         "eligible_projections": sum(
-            shape in routed_shapes for shape in projection_shapes
+            shape in routed_shapes for shape in all_projection_shapes
         ),
     }
 

@@ -45,6 +45,12 @@ def _qwen38_full_attention() -> SimpleNamespace:
     )
 
 
+def _qwen38_linear_attention() -> SimpleNamespace:
+    return SimpleNamespace(
+        in_proj_z=_FakeQuantizedProjection((6_144, 640)),
+    )
+
+
 def test_dflash_m8_nax_island_selects_only_measured_live_o_projection(
     monkeypatch,
 ) -> None:
@@ -59,8 +65,13 @@ def test_dflash_m8_nax_island_selects_only_measured_live_o_projection(
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active: selected.update(active=active)
-        or {"active": active, "width": 8, "shapes": [[6144, 5120]]},
+        lambda *, active, include_linear_z: selected.update(active=active)
+        or {
+            "active": active,
+            "width": 8,
+            "include_linear_z": include_linear_z,
+            "shapes": [[6144, 5120]],
+        },
     )
 
     report = configure_qwen38_dflash_m8_nax_island(model, active=True)
@@ -70,6 +81,42 @@ def test_dflash_m8_nax_island_selects_only_measured_live_o_projection(
     assert report["validated_projections"] == 32
     assert report["eligible_projections"] == 16
     assert report["shapes"] == [[6144, 5120]]
+
+
+def test_dflash_m8_nax_island_can_add_measured_linear_attention_z(
+    monkeypatch,
+) -> None:
+    layers = [
+        SimpleNamespace(self_attn=_qwen38_full_attention()) for _ in range(16)
+    ] + [
+        SimpleNamespace(linear_attn=_qwen38_linear_attention()) for _ in range(48)
+    ]
+    model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+    selected = {}
+    monkeypatch.setattr(
+        "mtplx.nax_verify.configure_qwen38_m8_nax_island",
+        lambda *, active, include_linear_z: selected.update(
+            active=active,
+            include_linear_z=include_linear_z,
+        )
+        or {
+            "active": active,
+            "width": 8,
+            "shapes": [[5120, 6144], [6144, 5120]],
+        },
+    )
+
+    report = configure_qwen38_dflash_m8_nax_island(
+        model,
+        active=True,
+        include_linear_z=True,
+    )
+
+    assert selected == {"active": True, "include_linear_z": True}
+    assert report["eligible_attention_modules"] == 16
+    assert report["eligible_linear_z_projections"] == 48
+    assert report["eligible_projections"] == 64
+    assert report["shapes"] == [[5120, 6144], [6144, 5120]]
 
 
 def test_dual_rms_norm_concat_matches_two_stock_norms() -> None:

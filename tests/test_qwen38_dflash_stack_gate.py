@@ -231,6 +231,39 @@ def test_command_buffer_engagement_requires_exact_variant_caps() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m8_linear_z_engagement_requires_all_64_live_projections() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m8_linear_z")
+
+    def arm(*, linear: bool, eligible: int):
+        shapes = [[6144, 5120]]
+        if linear:
+            shapes.insert(0, [5120, 6144])
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "active": True,
+                    "width": 8,
+                    "include_linear_z": linear,
+                    "shapes": shapes,
+                    "eligible_attention_modules": 16,
+                    "eligible_linear_z_projections": 48 if linear else 0,
+                    "eligible_projections": eligible,
+                }
+            },
+            "adaptive_metrics": {"cycles_by_block": {"8": 66}},
+        }
+
+    by_variant = {
+        "control": [arm(linear=False, eligible=16) for _ in range(2)],
+        "candidate": [arm(linear=True, eligible=64) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(linear=True, eligible=63)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 
