@@ -232,6 +232,20 @@ become the control for the next row.
 | Remove row-24 decode evaluation rungs | + retained M5/M6 full stack | 738.211 → 743.429 | 71.041 → 70.819 | 36.651 → 36.531 | **+0.3268%** | 35.34894 → 35.34894 | REJECTED for the decode stack: candidate correctly removed all 1,576 decode evals/arm and retained 176 prefill evals, but decode throughput regressed 0.313%. The apparent whole-wall win came from unrelated positive prefill drift. | `post54-dflash2-row24-no-decode-ladder-on-m5-m6-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Remove row-24/26 prefill evaluation rungs | + retained M5/M6 full stack | 763.316 → 756.810 | 71.216 → 71.684 | 35.876 → 35.969 | **-0.2579%** | 35.34894 → 33.15513 | REJECTED for the prefill stack: all 176 prefill evals/arm were removed while 1,576 decode evals remained, but prefill throughput regressed 0.852% and wall regressed. The 2.194 GB memory saving is recorded but does not override optimization-first throughput. | `post54-dflash2-row24-no-prefill-ladder-on-m5-m6-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Remove row-48 prefill boundary fusion | + retained M5/M6 full stack | 771.966 → 769.646 | 71.373 → 71.529 | 35.603 → 35.637 | **-0.0951%** | 35.34894 → 33.53628 | REJECTED for prefill: candidate routed all 1,016 prefill boundaries/arm through stock math while retaining 25,019 fused decode boundaries, but prefill throughput regressed 0.301% and wall regressed. The 1.813 GB memory saving is recorded. | `post54-dflash2-row48-no-prefill-fusion-on-m5-m6-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Remove row-48 decode boundary fusion | + retained M5/M6 full stack | 771.231 → 769.225 | 71.569 → 71.550 | 35.586 → 35.642 | **-0.1562%** | 35.34894 → 35.34894 | REJECTED: candidate routed all 25,019 decode boundaries/arm through stock math while retaining 1,016 fused prefill boundaries. Decode was effectively tied at -0.027%, but wall regressed beyond the 0.05% threshold, so the retained fused incumbent remains. | `post54-dflash2-row48-no-decode-fusion-on-m5-m6-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+
+### Prefill/decode route audit
+
+| Retained mechanism | Phase | Evidence and final routing |
+| --- | --- | --- |
+| Row 21 fused Q/K RMSNorm + RoPE and row 24 Q/K length fence | Decode-only | DFlash invokes the hook only for cached-prefix GQA windows with query length at most 32; the 16K admission prefill takes the stock attention path. Retained on decode. |
+| Row 24 evaluation ladder | Shared, independently gated | 176 long-prefill evals and 1,576 short-verify evals per arm. Removing prefill regressed prefill 0.852%; removing decode regressed decode 0.313%. Both phase routes remain enabled. |
+| Row 26 stride-3 ladder change | Prefill-only | Counter increments only on long-prefill rungs; retained with the row-24 prefill ladder. |
+| Row 48 fused residual/RMSNorm boundary | Shared, independently gated | 1,016 prefill and 25,019 decode fused boundaries per arm. Removing prefill fusion regressed prefill 0.301%; removing decode fusion had no decode win and regressed wall 0.156%. Both remain enabled. |
+| Adaptive DFlash depth 1--8 | Decode-only | Policy is instantiated and stepped only by speculative decode cycles. Retained rows 11+15. |
+| GQA widths 6--8 | Decode-only | Shape gate requires query length 6--8 and long cached KV. Retained. |
+| M=5 exact, selected M=6 split, padded-M7/BM8, exact-M8 subgroups | Decode-only | QuantizedLinear dispatcher excludes explicit prefill and routes only verify row counts 5--8. Retained shape-specific winner set. |
+| Row 50 wired residency and row 53 command buffers | Process/shared resource policy | Installed before the measured request and affects both phases; no safe per-call split exists. Retained at 512 MiB / 50 ops. |
 
 ## Exact 54-row campaign state
 
