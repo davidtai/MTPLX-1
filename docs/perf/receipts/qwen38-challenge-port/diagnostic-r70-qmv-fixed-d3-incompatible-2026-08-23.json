@@ -1,0 +1,45 @@
+{
+  "kind": "qwen38_challenge_port_incompatibility",
+  "created_at": "2026-08-24T00:13:22Z",
+  "source_row": 70,
+  "source_commit": "6f1cd66fc214",
+  "control_rows": [8, 10, 18, 20, 21, 24, 26, 36, 48, 50, 53, 61],
+  "candidate": "r70_qmv_sumtable",
+  "workload": {
+    "prompt_tokens": 16384,
+    "max_tokens": 1024,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "seed": 42
+  },
+  "timed_arms_completed": 0,
+  "decision": "rejected_incompatible_with_lazy_committed_history",
+  "attempts": [
+    {
+      "mtplx_commit": "33153510",
+      "phase": "candidate_conditioner",
+      "error": "AttributeError: mlx.core.array has no attribute strides"
+    },
+    {
+      "mtplx_commit": "1a80a856",
+      "phase": "candidate_conditioner",
+      "error": "RuntimeError: Attempting to eval an array without a primitive at mtp_cache offset"
+    },
+    {
+      "mtplx_commit": "5dc3ded6",
+      "phase": "candidate_conditioner",
+      "error": "RuntimeError: Attempting to eval an array without a primitive at mtp_cache offset"
+    }
+  ],
+  "causal_chain": [
+    "Under fixed D3 the M3-wide QMV engages in retained K/V-only committed-history batching.",
+    "Turbo keeps those history appends lazy and uses tensor-promoted cache offsets captured by the device draft core.",
+    "The custom Metal QMV result cannot remain lazy across that cache mutation boundary; the next offset read has no evaluable primitive.",
+    "Forcing history materialization would change the retained control contract and add a synchronization to the candidate rather than porting a QMV-only optimization."
+  ],
+  "dependent_rows": {
+    "78": "dependency absent because row 70 is rejected",
+    "80": "dependency absent because rows 70 and 78 are absent"
+  }
+}
