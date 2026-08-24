@@ -308,6 +308,7 @@ def _run_dflash_arm(
     adaptive_rows: tuple[int, ...],
     custom_rows: tuple[int, ...],
     gqa_widths: tuple[int, ...],
+    cost_aligned_widths: bool,
     release_report: dict[str, bool],
 ) -> dict[str, Any]:
     import mlx.core as mx
@@ -342,6 +343,7 @@ def _run_dflash_arm(
                 *(f"a{row:02d}" for row in adaptive_rows),
                 *(f"c{row:02d}" for row in custom_rows),
                 *(("gqa678",) if gqa_widths else ()),
+                *(("cost_aligned",) if cost_aligned_widths else ()),
             )
         ),
         "installed_route_id": route.route_id,
@@ -414,6 +416,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dflash-adaptive-rows", default="")
     parser.add_argument("--dflash-custom-rows", default="")
     parser.add_argument("--dflash-gqa-widths", default="")
+    parser.add_argument("--dflash-cost-aligned-widths", action="store_true")
     parser.add_argument(
         "--engine",
         choices=("mtp_fixed_d3", "dflash2"),
@@ -510,6 +513,7 @@ def main() -> int:
             bundle.target_model,
             active=bool(adaptive_rows),
             proposal_rows=adaptive_rows,
+            cost_aligned_widths=bool(args.dflash_cost_aligned_widths),
         )
         from mtplx.qwen38_qmv import configure_qwen38_dflash_qmv
 
@@ -565,6 +569,7 @@ def main() -> int:
             adaptive_rows=adaptive_rows,
             custom_rows=custom_rows,
             gqa_widths=gqa_widths,
+            cost_aligned_widths=bool(args.dflash_cost_aligned_widths),
             release_report=release_report,
         )
 
@@ -601,6 +606,7 @@ def main() -> int:
         "dflash_adaptive_rows": list(adaptive_rows),
         "dflash_custom_rows": list(custom_rows),
         "dflash_gqa_widths": list(gqa_widths),
+        "dflash_cost_aligned_widths": bool(args.dflash_cost_aligned_widths),
         "native_mtp_release": dict(release_report),
         "mlx_version": importlib.metadata.version("mlx"),
         "dflash_mlx_version": importlib.metadata.version("dflash-mlx"),

@@ -37,6 +37,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-custom-rows", default="")
     parser.add_argument("--control-gqa-widths", default="")
     parser.add_argument("--candidate-gqa-widths", default="")
+    parser.add_argument("--control-cost-aligned-widths", action="store_true")
+    parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
     parser.add_argument("--candidate-release-native-mtp", action="store_true")
     parser.add_argument("--model", type=Path, default=arm_gate.DEFAULT_MODEL)
@@ -55,13 +57,14 @@ def _parse_args() -> argparse.Namespace:
 def _variant_config(
     args: argparse.Namespace,
     variant: str,
-) -> tuple[str, str, str, str, bool]:
+) -> tuple[str, str, str, str, bool, bool]:
     if variant == "control":
         return (
             args.control_survivors,
             args.control_adaptive_rows,
             args.control_custom_rows,
             args.control_gqa_widths,
+            bool(args.control_cost_aligned_widths),
             bool(args.control_release_native_mtp),
         )
     return (
@@ -69,6 +72,7 @@ def _variant_config(
         args.candidate_adaptive_rows,
         args.candidate_custom_rows,
         args.candidate_gqa_widths,
+        bool(args.candidate_cost_aligned_widths),
         bool(args.candidate_release_native_mtp),
     )
 
@@ -79,9 +83,14 @@ def _child_command(
     variant: str,
     output: Path,
 ) -> list[str]:
-    survivors, adaptive_rows, custom_rows, gqa_widths, release_native_mtp = _variant_config(
-        args, variant
-    )
+    (
+        survivors,
+        adaptive_rows,
+        custom_rows,
+        gqa_widths,
+        cost_aligned_widths,
+        release_native_mtp,
+    ) = _variant_config(args, variant)
     command = [
         sys.executable,
         str(ROOT / "scripts/qwen38_challenge_dflash_gate.py"),
@@ -118,6 +127,8 @@ def _child_command(
     ]
     if release_native_mtp:
         command.append("--release-native-mtp")
+    if cost_aligned_widths:
+        command.append("--dflash-cost-aligned-widths")
     return command
 
 
@@ -227,6 +238,17 @@ def _engagement_exact(
             )
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "cost_aligned":
+        def alignment(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("adaptive_metrics", {}).get("cost_alignment", {})
+            )
+
+        return all(not alignment(row).get("active") for row in by_variant["control"]) and all(
+            bool(alignment(row).get("active"))
+            and set(alignment(row).get("promoted_widths", ())) == {"5->6", "7->8"}
+            for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -314,6 +336,8 @@ def _aggregate(
             "candidate_gqa_widths": list(
                 arm_gate._parse_dflash_gqa_widths(args.candidate_gqa_widths)
             ),
+            "control_cost_aligned_widths": bool(args.control_cost_aligned_widths),
+            "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
             "candidate_release_native_mtp": bool(args.candidate_release_native_mtp),
         },
