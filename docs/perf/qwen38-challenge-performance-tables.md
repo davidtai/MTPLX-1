@@ -99,7 +99,7 @@ replaces; that delta is composite and is not claimed as an isolated row-8 win.
 | 23 | Retuned row-19 reduction | — | — | — | — | — | Dependency absent | Native-MTP row 23 evidence |
 | 24 | Q/K L≤16 fence + target evaluation ladder | 749.960 → 770.175 | 68.026 → 67.199 | 36.944 → 36.537 | **+1.1148%** | 32.73674 → 35.73142 | Retained; 240 fallback and 1,664 ladder calls/arm | `item55-dflash2-r24-eval-ladder-on-r21-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 25 | Adaptive streak-gate constant | — | — | — | — | — | Pending DFlash adaptive gate | Adaptive lane |
-| 26 | Three-layer prefill cadence + deeper widths | — | — | — | — | — | Fixed DFlash gate pending on rows 21+24; adaptive pieces follow | Pending |
+| 26 | Three-layer prefill cadence + deeper widths | 752.388 → 754.599 | 67.593 → 68.557 | 36.965 → 36.689 | **+0.7544%** | 35.73143 → 34.31398 | Retained; 176 cadence calls/arm, deeper-width pieces continue in adaptive lane | `item55-dflash2-r26-prefill-ladder3-on-r21-r24-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 28 | Alternate native Q4/G64 block | — | — | — | — | — | Not applicable: rejected native artifact; DFlash owns drafter | Native-MTP row 28 receipt |
 | 30 | Reused target post-final-norm output | — | — | — | — | — | Already present in DFlash hidden-capture/logit path | DFlash target-ops contract |
 | 32 | M=8 Q4/G64 retune + adaptive streak | — | — | — | — | — | Pending DFlash adaptive gate | Adaptive lane |

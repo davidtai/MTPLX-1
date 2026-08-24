@@ -111,6 +111,8 @@ cumulative control before that later decision can remain authoritative.
 | 55 / row 21 | + fused Q/K RMSNorm and partial RoPE | 729.811 | 65.775 | 32.73672 | 38.046 | **+2.8001%** | **RETAINED**; 3,184 calls/arm | same |
 | 55 / row 24 | DFlash2 + retained row 21 | 749.960 | 68.026 | 32.73674 | 36.944 | - | cumulative control | `item55-dflash2-r24-eval-ladder-on-r21-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 55 / row 24 | + Q/K L≤16 fence and target evaluation ladder | 770.175 | 67.199 | 35.73142 | 36.537 | **+1.1148%** | **RETAINED**; 1,664 ladder and 240 fallback calls/arm | same |
+| 55 / row 26 | DFlash2 + retained rows 21, 24 | 752.388 | 67.593 | 35.73143 | 36.965 | - | cumulative control | `item55-dflash2-r26-prefill-ladder3-on-r21-r24-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 26 | + three-layer prefill evaluation cadence | 754.599 | 68.557 | 34.31398 | 36.689 | **+0.7544%** | **RETAINED**; 176 row-26 calls/arm, -1.41745 GiB peak | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -190,7 +192,7 @@ native MTP in the candidate process.
 | 20 | REPLACED: K/V-only append is a native-MTP committed-history optimization; DFlash2 owns projected target features plus separate rollback caches. |
 | 21 | RETAINED: the DFlash target hook routed raw Q/K through the exact Qwen 3.8 fused RMSNorm plus partial-RoPE kernel, engaged 3,184 times per candidate arm with exact tokens and width, and improved wall time 2.8001%. |
 | 24 | RETAINED: the explicit DFlash Q/K L≤16 fence and target evaluation ladder engaged 240 and 1,664 times per candidate arm respectively, preserved exact tokens and width, and improved wall time 1.1148%. Peak rose 2.99468 GiB. |
-| 26 | PENDING: adapt the prefill evaluation cadence from every four layers to every three on the retained row-24 DFlash path and gate it. |
+| 26 | RETAINED: the DFlash target prefill ladder moved from every fourth layer to every third, engaged 176 times per candidate arm with exact tokens and width, improved wall time 0.7544%, and reduced peak memory 1.41745 GiB. |
 | 36 | REPLACED: the Q4/group-64 MTP block and BF16 Q/K/V islands belong to the removed native MTP drafter; the pinned DFlash2 checkpoint supplies its own W4/group-64 drafter. |
 | 48 | PENDING: port the fused residual/RMSNorm target-layer boundary to DFlash's hidden-capture loop and gate it. |
 | 50 | ACTIVE: the depth-8 DFlash arms recomputed the combined active footprint as 22,328,201,584 bytes and set a 22,395,310,448-byte wired limit. |
