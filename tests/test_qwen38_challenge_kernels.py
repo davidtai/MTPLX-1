@@ -41,13 +41,17 @@ def _qwen38_full_attention() -> SimpleNamespace:
         q_norm=SimpleNamespace(eps=1e-6),
         k_norm=SimpleNamespace(eps=1e-6),
         q_proj=_FakeQuantizedProjection((12_288, 640)),
+        k_proj=_FakeQuantizedProjection((1_024, 640)),
+        v_proj=_FakeQuantizedProjection((1_024, 640)),
         o_proj=_FakeQuantizedProjection((5_120, 768)),
     )
 
 
 def _qwen38_linear_attention() -> SimpleNamespace:
     return SimpleNamespace(
+        in_proj_qkv=_FakeQuantizedProjection((10_240, 640)),
         in_proj_z=_FakeQuantizedProjection((6_144, 640)),
+        out_proj=_FakeQuantizedProjection((5_120, 1_536)),
     )
 
 
@@ -65,7 +69,7 @@ def test_dflash_m8_nax_island_selects_only_measured_live_o_projection(
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False: selected.update(active=active)
+        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False, include_m8_expanded=False: selected.update(active=active)
         or {
             "active": active,
             "width": 8,
@@ -96,7 +100,7 @@ def test_dflash_m8_nax_island_can_add_measured_linear_attention_z(
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False: selected.update(
+        lambda *, active, include_linear_z, include_m7_output=False, include_m7_linear_z=False, include_m8_expanded=False: selected.update(
             active=active,
             include_linear_z=include_linear_z,
         )
@@ -133,7 +137,7 @@ def test_dflash_nax_island_can_add_measured_m7_output_route(monkeypatch) -> None
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z, include_m7_output, include_m7_linear_z=False: selected.update(
+        lambda *, active, include_linear_z, include_m7_output, include_m7_linear_z=False, include_m8_expanded=False: selected.update(
             active=active,
             include_m7_output=include_m7_output,
         )
@@ -185,6 +189,57 @@ def test_dflash_nax_island_can_add_measured_m7_linear_z_route(monkeypatch) -> No
     assert report["m7_shapes"] == [[5120, 6144], [6144, 5120]]
     assert report["eligible_m7_projections"] == 64
     assert report["eligible_m7_linear_z_projections"] == 48
+
+
+def test_dflash_nax_island_validates_expanded_exact_m8_shape_set(monkeypatch) -> None:
+    layers = []
+    for index in range(64):
+        mlp_k = 5_120 if index < 56 else 10_240
+        mlp = SimpleNamespace(
+            gate_proj=_FakeQuantizedProjection((17_408, mlp_k // 8)),
+            up_proj=_FakeQuantizedProjection((17_408, mlp_k // 8)),
+        )
+        attention = (
+            {"linear_attn": _qwen38_linear_attention()}
+            if index < 48
+            else {"self_attn": _qwen38_full_attention()}
+        )
+        layers.append(SimpleNamespace(mlp=mlp, **attention))
+    model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+    monkeypatch.setattr(
+        "mtplx.nax_verify.configure_qwen38_m8_nax_island",
+        lambda **kwargs: {
+            **kwargs,
+            "width": 8,
+            "shapes": [
+                [5120, 1024],
+                [5120, 10240],
+                [5120, 17408],
+                [6144, 5120],
+                [10240, 17408],
+                [12288, 5120],
+            ],
+            "m7_shapes": [[5120, 6144], [6144, 5120]],
+            "m8_expanded_shapes": [
+                [5120, 1024],
+                [5120, 10240],
+                [5120, 17408],
+                [10240, 17408],
+                [12288, 5120],
+            ],
+        },
+    )
+
+    report = configure_qwen38_dflash_m8_nax_island(
+        model,
+        active=True,
+        include_m7_output=True,
+        include_m7_linear_z=True,
+        include_m8_expanded=True,
+    )
+
+    assert report["eligible_m8_expanded_projections"] == 256
+    assert report["validated_m8_expanded_projections"] == 256
 
 
 def test_dual_rms_norm_concat_matches_two_stock_norms() -> None:
