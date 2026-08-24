@@ -39,7 +39,7 @@ from scripts.qwen38_challenge_port_gate import (  # noqa: E402
 
 DFLASH_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
-DFLASH_SOURCE_COMMIT = "3617e5c83990b6d8788f7eb13c90d4c5c4a49c76"
+DFLASH_SOURCE_COMMIT = "dc442a608bf062e118901ee4e43a436ef083a11a"
 PROMOTION_THRESHOLD_PCT = 0.05
 STATIC_WIDTH = 8
 DFLASH_SURVIVOR_ROWS = frozenset({21, 24, 26, 48})
@@ -159,6 +159,7 @@ def _install_dflash_route(
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
     from mtplx.qwen38_challenge_kernels import (
+        configure_qwen38_dflash_row24_eval_ladder,
         configure_qwen38_row21_qk_rms_rope,
         configure_qwen38_row24_qk_length_limit,
     )
@@ -173,16 +174,19 @@ def _install_dflash_route(
         active=24 in rows,
         max_length=32 if 26 in rows else 16,
     )
+    row24_ladder_report = configure_qwen38_dflash_row24_eval_ladder(
+        runtime.model,
+        active=24 in rows,
+        prefill_stride=3 if 26 in rows else 4,
+    )
     text_model = getattr(runtime.model, "language_model", runtime.model)
-    text_model._mtplx_qwen38_row24_eval_ladder = 24 in rows
-    text_model._mtplx_qwen38_row24_prefill_stride = 3 if 26 in rows else 4
     text_model._mtplx_qwen38_row48_boundary_fused = 48 in rows
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
         feature_receipt["r21_qk_rms_rope"] = row21_report
     if 24 in rows:
         feature_receipt["r24_qk_length_limit"] = row24_report
-        feature_receipt["r24_eval_ladder"] = {"active": 1}
+        feature_receipt["r24_eval_ladder"] = row24_ladder_report
     if 26 in rows:
         feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
     if 48 in rows:

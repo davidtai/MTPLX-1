@@ -6,7 +6,9 @@ import mlx.core as mx
 
 from mtplx import qwen38_challenge_kernels as kernels
 from mtplx.qwen38_challenge_kernels import (
+    configure_qwen38_dflash_row24_eval_ladder,
     configure_qwen38_row21_qk_rms_rope,
+    configure_qwen38_row24_qk_length_limit,
     qwen38_dual_rms_norm_concat,
     qwen38_qk_rms_rope,
 )
@@ -106,3 +108,78 @@ def test_row21_config_exposes_dflash_qk_prepare_callback(monkeypatch) -> None:
     inactive = configure_qwen38_row21_qk_rms_rope(model, active=False)
     assert inactive["dflash_modules"] == 0
     assert not hasattr(attention, "_dflash_qk_prepare")
+
+
+def test_row24_config_exposes_dflash_qk_length_fallback() -> None:
+    rope = SimpleNamespace(
+        dims=64,
+        base=10_000_000.0,
+        scale=1.0,
+        traditional=False,
+    )
+    attention = SimpleNamespace(
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        rope=rope,
+        q_norm=SimpleNamespace(weight=object(), eps=1e-6),
+        k_norm=SimpleNamespace(weight=object(), eps=1e-6),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)])
+    )
+    before = kernels.qwen38_row24_qk_length_fallback_counter_snapshot()
+
+    report = configure_qwen38_row24_qk_length_limit(
+        model,
+        active=True,
+        max_length=16,
+    )
+    assert report["dflash_modules"] == 1
+    assert attention._dflash_qk_max_length == 16
+    attention._dflash_qk_fallback()
+    assert kernels.qwen38_row24_qk_length_fallback_counter_snapshot() == before + 1
+
+    inactive = configure_qwen38_row24_qk_length_limit(model, active=False)
+    assert inactive["dflash_modules"] == 0
+    assert not hasattr(attention, "_dflash_qk_max_length")
+    assert not hasattr(attention, "_dflash_qk_fallback")
+
+
+def test_row24_dflash_eval_ladder_uses_prefill_and_decode_rungs(monkeypatch) -> None:
+    inner = SimpleNamespace(layers=[])
+    model = SimpleNamespace(model=inner)
+    calls = []
+    monkeypatch.setattr(
+        kernels,
+        "qwen38_row24_async_eval",
+        lambda value, *, row26=False: calls.append((tuple(value.shape), row26)),
+    )
+
+    report = configure_qwen38_dflash_row24_eval_ladder(
+        model,
+        active=True,
+        prefill_stride=4,
+    )
+    assert report == {"active": 1, "prefill_stride": 4}
+    decode = mx.zeros((1, 8, 16))
+    for layer_index in range(3):
+        inner._dflash_post_layer(decode, layer_index)
+    prefill = mx.zeros((1, 512, 16))
+    for layer_index in range(5):
+        inner._dflash_post_layer(prefill, layer_index)
+
+    assert calls == [
+        ((1, 8, 16), False),
+        ((1, 8, 16), False),
+        ((1, 512, 16), False),
+        ((1, 512, 16), False),
+    ]
+
+    inactive = configure_qwen38_dflash_row24_eval_ladder(
+        model,
+        active=False,
+        prefill_stride=4,
+    )
+    assert inactive == {"active": 0, "prefill_stride": 0}
+    assert not hasattr(inner, "_dflash_post_layer")

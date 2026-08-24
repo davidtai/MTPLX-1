@@ -115,6 +115,18 @@ def _engagement_exact(
         return all(calls(row) == 0 for row in by_variant["control"]) and all(
             calls(row) > 0 for row in by_variant["candidate"]
         )
+    if args.candidate_label == "r24":
+        def counts(row: dict[str, Any]) -> tuple[int, int]:
+            engagement = row["engagement"]
+            return (
+                int(engagement["r24_eval_ladder"]["calls"]),
+                int(engagement["r24_qk_length_limit"]["fallback_calls"]),
+            )
+
+        return all(counts(row) == (0, 0) for row in by_variant["control"]) and all(
+            ladder > 0 and fallback > 0
+            for ladder, fallback in map(counts, by_variant["candidate"])
+        )
     return True
 
 

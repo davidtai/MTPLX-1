@@ -49,6 +49,29 @@ def test_row21_engagement_requires_candidate_only_fused_calls() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_row24_engagement_requires_candidate_ladder_and_qk_fallback() -> None:
+    args = SimpleNamespace(candidate_label="r24")
+
+    def arm(ladder: int, fallback: int):
+        return {
+            "engagement": {
+                "r24_eval_ladder": {"calls": ladder},
+                "r24_qk_length_limit": {"fallback_calls": fallback},
+            }
+        }
+
+    by_variant = {
+        "control": [arm(0, 0), arm(0, 0)],
+        "candidate": [arm(144, 176), arm(144, 176)],
+    }
+
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(144, 0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

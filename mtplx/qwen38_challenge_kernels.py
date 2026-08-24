@@ -35,6 +35,45 @@ def qwen38_row26_prefill_ladder_counter_snapshot() -> int:
     return int(qwen38_row26_prefill_ladder_calls)
 
 
+def configure_qwen38_dflash_row24_eval_ladder(
+    model: Any,
+    *,
+    active: bool,
+    prefill_stride: int = 4,
+) -> dict[str, int]:
+    """Install the retained target-evaluation ladder in DFlash hidden capture."""
+
+    if prefill_stride not in (3, 4):
+        raise ValueError("DFlash evaluation ladder stride must be 3 or 4")
+    text = getattr(model, "language_model", model)
+    inner = getattr(text, "model", text)
+    if not active:
+        if hasattr(inner, "_dflash_post_layer"):
+            delattr(inner, "_dflash_post_layer")
+        return {"active": 0, "prefill_stride": 0}
+
+    decode_rungs = frozenset({0, 1, 9, 19, 29, 39, 49, 57})
+
+    def post_layer(hidden_states: Any, layer_index: int) -> None:
+        length = int(hidden_states.shape[1])
+        row24_prefill = length >= 512
+        row24_decode = length <= 9
+        if (
+            row24_prefill
+            and (
+                layer_index == 0
+                or layer_index % prefill_stride == prefill_stride - 1
+            )
+        ) or (row24_decode and layer_index in decode_rungs):
+            qwen38_row24_async_eval(
+                hidden_states,
+                row26=bool(prefill_stride == 3 and row24_prefill),
+            )
+
+    inner._dflash_post_layer = post_layer
+    return {"active": 1, "prefill_stride": prefill_stride}
+
+
 def qwen38_qk_rms_rope(
     queries: Any,
     keys: Any,
@@ -354,15 +393,29 @@ def configure_qwen38_row24_qk_length_limit(
     text = getattr(model, "language_model", model)
     inner = getattr(text, "model", text)
     eligible = 0
+    dflash_modules = 0
     for layer in list(getattr(inner, "layers", ()) or ()):
         attention = getattr(layer, "self_attn", None)
         if attention is None or not _row21_attention_eligible(attention):
             continue
         attention._mtplx_qwen38_row24_qk_max_length = max_length if active else None
+        if active:
+            def dflash_qk_fallback() -> None:
+                global qwen38_row24_qk_length_fallback_calls
+                qwen38_row24_qk_length_fallback_calls += 1
+
+            attention._dflash_qk_max_length = max_length
+            attention._dflash_qk_fallback = dflash_qk_fallback
+            dflash_modules += 1
+        else:
+            for attr in ("_dflash_qk_max_length", "_dflash_qk_fallback"):
+                if hasattr(attention, attr):
+                    delattr(attention, attr)
         eligible += 1
     return {
         "eligible_modules": eligible,
         "active_modules": eligible if active else 0,
+        "dflash_modules": dflash_modules,
         "max_length": max_length if active else 0,
     }
 
