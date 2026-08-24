@@ -102,6 +102,8 @@ cumulative control before that later decision can remain authoritative.
 | 55 target-only | Optimized-Speed target plus DFlash2; native MTP never constructed | 747.429 | 66.839 | 32.73674 | 37.275 | **+0.4543%** | **RETAINED**, -1.56458 GiB peak | same |
 | 55 / row 18 | target-only DFlash2 replacement base | 736.544 | 67.051 | 32.73673 | 37.559 | - | cumulative control | `item55-dflash2-r18-gdn-decay-memo-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 55 / row 18 | + memoized GDN decay in DFlash recurrent rollback | 717.003 | 66.759 | 32.73675 | 38.221 | **-1.7342%** | **REJECTED, removed**; 9,120 calls/arm | same |
+| 55 / row 21 | target-only DFlash2 replacement base | 694.696 | 66.374 | 32.73673 | 39.111 | - | cumulative control | `item55-dflash2-r21-qk-rms-rope-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 21 | + fused Q/K RMSNorm and partial RoPE | 729.811 | 65.775 | 32.73672 | 38.046 | **+2.8001%** | **RETAINED**; 3,184 calls/arm | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -179,7 +181,7 @@ native MTP in the candidate process.
 | 10 | INCOMPATIBLE: its 98,330-row vocabulary is the native MTP head's reachable-ID set, while DFlash2 selects from the target vocabulary and can emit IDs outside that set. |
 | 18 | REJECTED: the memoized GDN decay engaged 9,120 times per candidate arm with exact tokens and width, but regressed wall time 1.7342%; the port was removed. |
 | 20 | REPLACED: K/V-only append is a native-MTP committed-history optimization; DFlash2 owns projected target features plus separate rollback caches. |
-| 21 | PENDING: route eligible DFlash target-attention blocks through the retained fused Q/K RMSNorm plus partial-RoPE kernel and gate it. |
+| 21 | RETAINED: the DFlash target hook routed raw Q/K through the exact Qwen 3.8 fused RMSNorm plus partial-RoPE kernel, engaged 3,184 times per candidate arm with exact tokens and width, and improved wall time 2.8001%. |
 | 24 | PENDING: port both the Q/K length fence and DFlash target evaluation ladder, then gate them cumulatively. |
 | 26 | PENDING: adapt the prefill evaluation cadence from every four layers to every three on the retained row-24 DFlash path and gate it. |
 | 36 | REPLACED: the Q4/group-64 MTP block and BF16 Q/K/V islands belong to the removed native MTP drafter; the pinned DFlash2 checkpoint supplies its own W4/group-64 drafter. |
