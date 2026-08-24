@@ -318,6 +318,36 @@ def test_m8_output_engagement_requires_actual_kernel_routes() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m7_output_engagement_requires_actual_padded_m8_routes() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m7_nax_output")
+
+    def arm(*, active: bool, calls: int):
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "active": True,
+                    "include_m7_output": active,
+                    "m7_shapes": [[6144, 5120]] if active else [],
+                    "eligible_m7_projections": 16 if active else 0,
+                }
+            },
+            "engagement": {
+                "nax_verify": {"m7_to_m8_nax_k6144_n5120": calls}
+            },
+            "adaptive_metrics": {"cycles_by_block": {"7": 62}},
+        }
+
+    by_variant = {
+        "control": [arm(active=False, calls=0) for _ in range(2)],
+        "candidate": [arm(active=True, calls=992) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(active=True, calls=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

@@ -65,7 +65,7 @@ def test_dflash_m8_nax_island_selects_only_measured_live_o_projection(
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z: selected.update(active=active)
+        lambda *, active, include_linear_z, include_m7_output=False: selected.update(active=active)
         or {
             "active": active,
             "width": 8,
@@ -95,7 +95,7 @@ def test_dflash_m8_nax_island_can_add_measured_linear_attention_z(
     selected = {}
     monkeypatch.setattr(
         "mtplx.nax_verify.configure_qwen38_m8_nax_island",
-        lambda *, active, include_linear_z: selected.update(
+        lambda *, active, include_linear_z, include_m7_output=False: selected.update(
             active=active,
             include_linear_z=include_linear_z,
         )
@@ -117,6 +117,43 @@ def test_dflash_m8_nax_island_can_add_measured_linear_attention_z(
     assert report["eligible_linear_z_projections"] == 48
     assert report["eligible_projections"] == 64
     assert report["shapes"] == [[5120, 6144], [6144, 5120]]
+
+
+def test_dflash_nax_island_can_add_measured_m7_output_route(monkeypatch) -> None:
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=_qwen38_full_attention())
+                for _ in range(16)
+            ]
+        )
+    )
+    selected = {}
+    monkeypatch.setattr(
+        "mtplx.nax_verify.configure_qwen38_m8_nax_island",
+        lambda *, active, include_linear_z, include_m7_output: selected.update(
+            active=active,
+            include_m7_output=include_m7_output,
+        )
+        or {
+            "active": active,
+            "width": 8,
+            "include_linear_z": include_linear_z,
+            "include_m7_output": include_m7_output,
+            "shapes": [[6144, 5120]],
+            "m7_shapes": [[6144, 5120]],
+        },
+    )
+
+    report = configure_qwen38_dflash_m8_nax_island(
+        model,
+        active=True,
+        include_m7_output=True,
+    )
+
+    assert selected == {"active": True, "include_m7_output": True}
+    assert report["m7_shapes"] == [[6144, 5120]]
+    assert report["eligible_m7_projections"] == 16
 
 
 def test_dual_rms_norm_concat_matches_two_stock_norms() -> None:

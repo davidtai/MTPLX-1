@@ -48,6 +48,50 @@ def test_m8_nax_route_counter_records_exact_shape(monkeypatch) -> None:
     assert after["m8_nax_k32_n64"] == before.get("m8_nax_k32_n64", 0) + 1
 
 
+def test_m7_route_pads_to_m8_tile_and_records_original_width(monkeypatch) -> None:
+    from mtplx import nax_verify
+
+    class FakeKernel:
+        def __call__(self, *, output_shapes, output_dtypes, **_kwargs):
+            assert output_shapes == [(8, 64)]
+            return [mx.zeros(output_shapes[0], dtype=output_dtypes[0])]
+
+    monkeypatch.setattr(
+        nax_verify,
+        "_build_kernel_m8_nax_ktmpl",
+        lambda *_args, **_kwargs: FakeKernel(),
+    )
+    before = nax_dispatch_counter_snapshot()
+    y = nax_verify.nax_qmm_m8_nax(
+        mx.zeros((7, 32), dtype=mx.bfloat16),
+        mx.zeros((64, 4), dtype=mx.uint32),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        group_size=32,
+    )
+    assert y.shape == (7, 64)
+    after = nax_dispatch_counter_snapshot()
+    assert after["m7_to_m8_nax"] == before.get("m7_to_m8_nax", 0) + 1
+    assert after["m7_to_m8_nax_k32_n64"] == (
+        before.get("m7_to_m8_nax_k32_n64", 0) + 1
+    )
+
+
+@pytest.mark.skipif(not nax_available(), reason="requires Apple G17 + macOS >= 26.2")
+def test_m7_padded_m8_nax_matches_stock_within_tolerance() -> None:
+    from mtplx.nax_verify import nax_qmm_m8_nax
+
+    k, n = 512, 256
+    w_q, scales, biases = _quantized_fixture(k, n)
+    x = (mx.random.normal((7, k), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+    y = nax_qmm_m8_nax(x, w_q, scales, biases, group_size=64)
+    ref = _stock(x, w_q, scales, biases)
+    mx.eval(y, ref)
+    diff = float(mx.abs(y.astype(mx.float32) - ref.astype(mx.float32)).max())
+    assert y.shape == (7, n)
+    assert diff < 0.25
+
+
 def test_eligibility_shape_policy() -> None:
     dt = mx.bfloat16
     # m4: exact 4 rows only, no NAX hardware requirement

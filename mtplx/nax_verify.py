@@ -858,6 +858,7 @@ def nax_qmm_m8(
 
 
 _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
+_QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
 _QWEN38_M8_NAX_OUTPUT_SHAPES = frozenset({(6_144, 5_120)})
 _QWEN38_M8_NAX_LINEAR_Z_SHAPES = frozenset({(5_120, 6_144)})
 
@@ -866,17 +867,23 @@ def configure_qwen38_m8_nax_island(
     *,
     active: bool,
     include_linear_z: bool = False,
+    include_m7_output: bool = False,
 ) -> dict[str, object]:
+    global _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES
     global _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES
     shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES
     if include_linear_z:
         shapes = shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
     _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES = shapes if active else frozenset()
+    m7_shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES if include_m7_output else frozenset()
+    _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES = m7_shapes if active else frozenset()
     return {
         "active": bool(active),
         "width": 8,
         "include_linear_z": bool(include_linear_z),
+        "include_m7_output": bool(include_m7_output),
         "shapes": [list(shape) for shape in sorted(shapes)],
+        "m7_shapes": [list(shape) for shape in sorted(m7_shapes)],
     }
 
 
@@ -888,24 +895,32 @@ def nax_qmm_m8_nax(
     *,
     group_size: int = 64,
 ) -> mx.array:
-    """Run the exact eight-row MPP tile without padding to sixteen rows."""
+    """Run the eight-row MPP tile for seven or eight live rows."""
 
     M = int(x2.shape[0])
     K = int(x2.shape[1])
     N = int(w_q.shape[0])
-    if M != 8:
-        raise ValueError(f"Qwen3.8 M8 NAX island requires exactly 8 rows, got {M}")
-    _count_nax_dispatch("m8_nax", k=K, n=N)
+    if M not in (7, 8):
+        raise ValueError(f"Qwen3.8 M8 NAX island requires 7 or 8 rows, got {M}")
+    if M == 7:
+        x8 = mx.contiguous(
+            mx.concatenate([x2, mx.zeros((1, K), dtype=x2.dtype)], axis=0)
+        )
+        kind = "m7_to_m8_nax"
+    else:
+        x8 = mx.contiguous(x2)
+        kind = "m8_nax"
+    _count_nax_dispatch(kind, k=K, n=N)
     kernel = _build_kernel_m8_nax_ktmpl(K, group_size, x2.dtype)
     (y,) = kernel(
-        inputs=[mx.contiguous(x2), w_q, scales, biases, N],
+        inputs=[x8, w_q, scales, biases, N],
         template=[("T", x2.dtype), ("KCONST", K)],
         grid=(256, N // 32, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(8, N)],
         output_dtypes=[x2.dtype],
     )
-    return y
+    return y[:M, :]
 
 
 def m16_nax_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
@@ -1140,6 +1155,16 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     and m6_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
                 ):
                     y = nax_qmm_m6(
+                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        group_size=group_size,
+                    )
+                elif (
+                    m == 7
+                    and (k, n) in _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES
+                    and not lane_disabled("qmm_m16_nax")
+                    and m16_nax_eligible(m, k, n, bits, group_size, x.dtype)
+                ):
+                    y = nax_qmm_m8_nax(
                         x.reshape(m, k), w_q, self["scales"], self["biases"],
                         group_size=group_size,
                     )
