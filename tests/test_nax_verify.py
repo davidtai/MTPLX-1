@@ -10,11 +10,42 @@ from mtplx.nax_verify import (
     install_nax_qlinear_patch,
     m4_ksplit_eligible,
     m16_nax_eligible,
+    nax_dispatch_counter_snapshot,
     nax_available,
     nax_qmm_m4,
     nax_qmm_m16,
     uninstall_nax_qlinear_patch,
 )
+
+
+def test_m8_nax_route_counter_records_exact_shape(monkeypatch) -> None:
+    from mtplx import nax_verify
+
+    class FakeKernel:
+        def __call__(self, *, output_shapes, output_dtypes, **_kwargs):
+            return [mx.zeros(output_shapes[0], dtype=output_dtypes[0])]
+
+    monkeypatch.setattr(
+        nax_verify,
+        "_build_kernel_m8_nax_ktmpl",
+        lambda *_args, **_kwargs: FakeKernel(),
+    )
+    before = nax_dispatch_counter_snapshot()
+    x = mx.zeros((8, 32), dtype=mx.bfloat16)
+    w_q = mx.zeros((64, 4), dtype=mx.uint32)
+    scales = mx.zeros((64, 1), dtype=mx.bfloat16)
+    biases = mx.zeros((64, 1), dtype=mx.bfloat16)
+    y = nax_verify.nax_qmm_m8_nax(
+        x,
+        w_q,
+        scales,
+        biases,
+        group_size=32,
+    )
+    assert y.shape == (8, 64)
+    after = nax_dispatch_counter_snapshot()
+    assert after["m8_nax"] == before.get("m8_nax", 0) + 1
+    assert after["m8_nax_k32_n64"] == before.get("m8_nax_k32_n64", 0) + 1
 
 
 def test_eligibility_shape_policy() -> None:

@@ -682,6 +682,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
     )
     from mtplx.qwen38_qmv import qwen38_qmv_counter_snapshot
     from mtplx.mtp_patch import qwen38_kv_only_history_counter_snapshot
+    from mtplx.nax_verify import nax_dispatch_counter_snapshot
 
     return {
         "dual_norm": {"calls": qwen38_dual_norm_counter_snapshot()},
@@ -706,6 +707,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r36_qkv_islands": qwen38_row36_island_counter_snapshot(),
         "r48_boundary_fused": qwen38_row48_boundary_counter_snapshot(),
         "source_proposal": qwen38_source_counter_snapshot(),
+        "nax_verify": nax_dispatch_counter_snapshot(),
     }
 
 

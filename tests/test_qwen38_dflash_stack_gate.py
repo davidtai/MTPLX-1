@@ -236,7 +236,7 @@ def test_m8_linear_z_engagement_requires_all_64_live_projections() -> None:
 
     args = SimpleNamespace(candidate_label="m8_linear_z")
 
-    def arm(*, linear: bool, eligible: int):
+    def arm(*, linear: bool, eligible: int, output_calls: int, linear_calls: int):
         shapes = [[6144, 5120]]
         if linear:
             shapes.insert(0, [5120, 6144])
@@ -252,15 +252,69 @@ def test_m8_linear_z_engagement_requires_all_64_live_projections() -> None:
                     "eligible_projections": eligible,
                 }
             },
+            "engagement": {
+                "nax_verify": {
+                    "m8_nax": output_calls + linear_calls,
+                    "m8_nax_k6144_n5120": output_calls,
+                    "m8_nax_k5120_n6144": linear_calls,
+                }
+            },
             "adaptive_metrics": {"cycles_by_block": {"8": 66}},
         }
 
     by_variant = {
-        "control": [arm(linear=False, eligible=16) for _ in range(2)],
-        "candidate": [arm(linear=True, eligible=64) for _ in range(2)],
+        "control": [
+            arm(linear=False, eligible=16, output_calls=1056, linear_calls=0)
+            for _ in range(2)
+        ],
+        "candidate": [
+            arm(linear=True, eligible=64, output_calls=1056, linear_calls=3168)
+            for _ in range(2)
+        ],
     }
     assert stack_gate._engagement_exact(args, by_variant) is True
-    by_variant["candidate"][1] = arm(linear=True, eligible=63)
+    by_variant["candidate"][1] = arm(
+        linear=True,
+        eligible=64,
+        output_calls=1056,
+        linear_calls=0,
+    )
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_m8_output_engagement_requires_actual_kernel_routes() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m8_nax_island")
+
+    def arm(*, active: bool, calls: int):
+        return {
+            "feature_receipt": (
+                {
+                    "dflash_m8_nax_island": {
+                        "active": True,
+                        "width": 8,
+                        "shapes": [[6144, 5120]],
+                        "eligible_attention_modules": 16,
+                        "validated_projections": 32,
+                        "eligible_projections": 16,
+                    }
+                }
+                if active
+                else {}
+            ),
+            "engagement": {
+                "nax_verify": {"m8_nax_k6144_n5120": calls}
+            },
+            "adaptive_metrics": {"cycles_by_block": {"8": 66}},
+        }
+
+    by_variant = {
+        "control": [arm(active=False, calls=0) for _ in range(2)],
+        "candidate": [arm(active=True, calls=1056) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(active=True, calls=0)
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 

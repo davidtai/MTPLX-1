@@ -24,6 +24,18 @@ from functools import lru_cache
 import mlx.core as mx
 
 _VERIFY_KERNEL_CACHE: dict[tuple, object] = {}
+_NAX_DISPATCH_COUNTERS: dict[str, int] = {}
+
+
+def _count_nax_dispatch(kind: str, *, k: int, n: int) -> None:
+    for key in (str(kind), f"{kind}_k{int(k)}_n{int(n)}"):
+        _NAX_DISPATCH_COUNTERS[key] = _NAX_DISPATCH_COUNTERS.get(key, 0) + 1
+
+
+def nax_dispatch_counter_snapshot() -> dict[str, int]:
+    """Return process-lifetime routed-kernel counts for receipt deltas."""
+
+    return dict(_NAX_DISPATCH_COUNTERS)
 
 
 def nax_env_enabled() -> bool:
@@ -883,6 +895,7 @@ def nax_qmm_m8_nax(
     N = int(w_q.shape[0])
     if M != 8:
         raise ValueError(f"Qwen3.8 M8 NAX island requires exactly 8 rows, got {M}")
+    _count_nax_dispatch("m8_nax", k=K, n=N)
     kernel = _build_kernel_m8_nax_ktmpl(K, group_size, x2.dtype)
     (y,) = kernel(
         inputs=[mx.contiguous(x2), w_q, scales, biases, N],
@@ -930,6 +943,7 @@ def nax_qmm_m16(
     M = int(x2.shape[0])
     K = int(x2.shape[1])
     N = int(w_q.shape[0])
+    _count_nax_dispatch("m16_nax", k=K, n=N)
     if M < 16:
         pad = mx.zeros((16 - M, K), dtype=x2.dtype)
         x16 = mx.contiguous(mx.concatenate([x2, pad], axis=0))

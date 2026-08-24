@@ -289,7 +289,17 @@ def _engagement_exact(
                 row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
             )
 
-        return all(not route(row) for row in by_variant["control"]) and all(
+        def calls(row: dict[str, Any]) -> int:
+            return int(
+                row.get("engagement", {})
+                .get("nax_verify", {})
+                .get("m8_nax_k6144_n5120", 0)
+            )
+
+        return all(
+            not route(row) and calls(row) == 0
+            for row in by_variant["control"]
+        ) and all(
             bool(route(row).get("active"))
             and int(route(row).get("width", 0)) == 8
             and route(row).get("shapes") == [[6144, 5120]]
@@ -302,6 +312,7 @@ def _engagement_exact(
                 .get("8", 0)
             )
             > 0
+            and calls(row) > 0
             for row in by_variant["candidate"]
         )
     if args.candidate_label == "cb1024":
@@ -323,11 +334,20 @@ def _engagement_exact(
                 row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
             )
 
+        def calls(row: dict[str, Any], shape: str) -> int:
+            return int(
+                row.get("engagement", {})
+                .get("nax_verify", {})
+                .get(shape, 0)
+            )
+
         return all(
             bool(route(row).get("active"))
             and not bool(route(row).get("include_linear_z"))
             and route(row).get("shapes") == [[6144, 5120]]
             and int(route(row).get("eligible_projections", 0)) == 16
+            and calls(row, "m8_nax_k6144_n5120") > 0
+            and calls(row, "m8_nax_k5120_n6144") == 0
             for row in by_variant["control"]
         ) and all(
             bool(route(row).get("active"))
@@ -342,6 +362,8 @@ def _engagement_exact(
                 .get("8", 0)
             )
             > 0
+            and calls(row, "m8_nax_k6144_n5120") > 0
+            and calls(row, "m8_nax_k5120_n6144") > 0
             for row in by_variant["candidate"]
         )
     return True
