@@ -106,4 +106,39 @@ def test_dflash_config_marks_only_q4_group64_draft_linears() -> None:
     }
     assert eligible._mtplx_qwen38_qmv_active is True
     assert eligible._mtplx_qwen38_qmv_allowed_widths == (6,)
+    assert eligible._mtplx_qwen38_qmv_use_table is False
     assert wrong_group._mtplx_qwen38_qmv_active is False
+
+
+def test_dflash_direct_nibble_route_does_not_add_row70_sum_table(monkeypatch) -> None:
+    calls = []
+
+    def replica(**kwargs):
+        calls.append("replica")
+        return (mx.zeros((6, 4096), dtype=mx.bfloat16),)
+
+    def table(**kwargs):
+        calls.append("table")
+        return (mx.zeros((6, 4096), dtype=mx.bfloat16),)
+
+    monkeypatch.setattr(qmv, "_kernels", lambda: (replica, table, object()))
+    linear = SimpleNamespace(
+        _mtplx_qwen38_qmv_active=True,
+        _mtplx_qwen38_qmv_min_width=6,
+        _mtplx_qwen38_qmv_allowed_widths=(6,),
+        _mtplx_qwen38_qmv_active_groups=True,
+        _mtplx_qwen38_qmv_use_table=False,
+        bits=4,
+        group_size=64,
+        mode="affine",
+        bias=None,
+        weight=mx.zeros((4096, 64), dtype=mx.uint32),
+        scales=mx.zeros((4096, 8), dtype=mx.bfloat16),
+        biases=mx.zeros((4096, 8), dtype=mx.bfloat16),
+    )
+
+    assert qmv.qwen38_qmv(
+        linear,
+        mx.zeros((6, 512), dtype=mx.bfloat16),
+    ) is not None
+    assert calls == ["replica"]

@@ -240,6 +240,9 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
         int(width)
         for width in getattr(linear, "_mtplx_qwen38_qmv_allowed_widths", ())
     )
+    use_sum_table = bool(
+        getattr(linear, "_mtplx_qwen38_qmv_use_table", True)
+    )
     weight = linear.weight
     scales = linear.scales
     biases = linear.biases
@@ -284,7 +287,7 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
         "output_shapes": [output_shape],
         "output_dtypes": [mx.bfloat16],
     }
-    if m >= 4:
+    if m >= 4 and use_sum_table:
         stride = 8 if m <= 8 else 16
         (xsums,) = xsums_kernel(
             inputs=[x],
@@ -339,6 +342,7 @@ def configure_qwen38_qmv(
         module._mtplx_qwen38_qmv_min_width = int(min_width)
         module._mtplx_qwen38_qmv_allowed_widths = ()
         module._mtplx_qwen38_qmv_active_groups = bool(active_groups)
+        module._mtplx_qwen38_qmv_use_table = True
         eligible += int(is_eligible)
     return {
         "eligible_modules": eligible,
@@ -388,6 +392,7 @@ def configure_qwen38_dflash_qmv(
         module._mtplx_qwen38_qmv_min_width = min(widths, default=10)
         module._mtplx_qwen38_qmv_allowed_widths = widths
         module._mtplx_qwen38_qmv_active_groups = bool(active)
+        module._mtplx_qwen38_qmv_use_table = False
         eligible += int(is_eligible)
     return {
         "eligible_modules": eligible,
