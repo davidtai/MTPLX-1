@@ -246,11 +246,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 15.07014825,
-      "decode_tps": 67.9489002372621,
+      "decode_elapsed_s": 15.045630209000002,
+      "decode_tps": 68.05962832899237,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 36.372580375,
+      "elapsed_s": 36.220097417000005,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -509,8 +509,8 @@
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "peak_memory_gb": 35.346827904,
-      "prefill_s": 21.302432125,
-      "prefill_tps": 769.1140572053342,
+      "prefill_s": 21.174467208,
+      "prefill_tps": 773.7620899292288,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "spec_decode_hit_rate": 0.802734375,
@@ -1542,7 +1542,7 @@
         638
       ],
       "variant": "control",
-      "wall_s": 36.40452220899169
+      "wall_s": 36.25141500000609
     },
     {
       "acceptance_history": [
@@ -1790,11 +1790,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 14.940533625000004,
-      "decode_tps": 68.53838194149506,
+      "decode_elapsed_s": 14.940168540999997,
+      "decode_tps": 68.54005677311189,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 36.206049917,
+      "elapsed_s": 36.189643083,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -2053,8 +2053,8 @@
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
       "peak_memory_gb": 35.346827904,
-      "prefill_s": 21.265516292,
-      "prefill_tps": 770.4491993059953,
+      "prefill_s": 21.249474541999998,
+      "prefill_tps": 771.030830320849,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
       "spec_decode_hit_rate": 0.802734375,
@@ -3086,7 +3086,7 @@
         638
       ],
       "variant": "candidate",
-      "wall_s": 36.2365914999973
+      "wall_s": 36.221453500009375
     },
     {
       "acceptance_history": [
@@ -3334,11 +3334,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 14.947708207999996,
-      "decode_tps": 68.50548497139891,
+      "decode_elapsed_s": 14.93523875,
+      "decode_tps": 68.56268032541496,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 36.227497957999994,
+      "elapsed_s": 36.23206975,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -3596,9 +3596,9 @@
       },
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
-      "peak_memory_gb": 35.346827904,
-      "prefill_s": 21.27978975,
-      "prefill_tps": 769.9324190926276,
+      "peak_memory_gb": 35.346844432,
+      "prefill_s": 21.296831,
+      "prefill_tps": 769.316336313135,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
       "spec_decode_hit_rate": 0.802734375,
@@ -4630,7 +4630,7 @@
         638
       ],
       "variant": "candidate",
-      "wall_s": 36.25852279199171
+      "wall_s": 36.26434162500664
     },
     {
       "acceptance_history": [
@@ -4878,11 +4878,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 15.051340874999996,
-      "decode_tps": 68.03380565919183,
+      "decode_elapsed_s": 15.019164416999999,
+      "decode_tps": 68.17955856724943,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 36.308107457999995,
+      "elapsed_s": 36.3130585,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -5141,8 +5141,8 @@
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "peak_memory_gb": 35.346827904,
-      "prefill_s": 21.256766583,
-      "prefill_tps": 770.7663315597127,
+      "prefill_s": 21.293894083,
+      "prefill_tps": 769.4224427029616,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "spec_decode_hit_rate": 0.802734375,
@@ -6174,10 +6174,10 @@
         638
       ],
       "variant": "control",
-      "wall_s": 36.33960612499504
+      "wall_s": 36.3455415420176
     }
   ],
-  "candidate_improvement_pct": 0.34349079166187124,
+  "candidate_improvement_pct": 0.15335613938698422,
   "candidate_label": "m5_exact",
   "correctness": {
     "candidate_engagement_exact": true,
@@ -6191,7 +6191,7 @@
       "control": true
     }
   },
-  "created_at": "2026-08-24T15:12:01Z",
+  "created_at": "2026-08-24T15:17:24Z",
   "dflash": {
     "block_size": 8,
     "repo_id": "z-lab/Qwen3.8-27B-DFlash2",
@@ -6208,19 +6208,17 @@
     ]
   },
   "dflash_mlx_version": "0.1.10",
-  "git_commit": "fa1282dfff426e4312c2f873fa6dae0990ee0c43",
+  "git_commit": "0f4b810c2cea7911be323b369c5e7368669c9b66",
   "gpu_lock_scope": "direct",
   "kind": "qwen38_challenge_dflash2_cumulative_stack_abba",
   "mlx_version": "0.32.0",
   "model": "/Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
   "promotion": {
-    "passed": false,
-    "reason": "correctness, clean-source, or strict wall threshold failed",
+    "passed": true,
+    "reason": "strict wall improvement above threshold",
     "threshold_pct": 0.05
   },
-  "source_status": [
-    "?? docs/perf/receipts/qwen38-challenge-port/followup-m6-kp1-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json"
-  ],
+  "source_status": [],
   "stack": {
     "candidate_adaptive_rows": [
       11,
@@ -6299,16 +6297,16 @@
   },
   "summary": {
     "candidate": {
-      "decode_tps": 68.52193345644699,
-      "peak_memory_gb": 35.346827904,
-      "prefill_tps": 770.1908091993114,
-      "wall_s": 36.247557145994506
+      "decode_tps": 68.55136854926343,
+      "peak_memory_gb": 35.346844432,
+      "prefill_tps": 770.173583316992,
+      "wall_s": 36.242897562508006
     },
     "control": {
-      "decode_tps": 67.99135294822696,
+      "decode_tps": 68.1195934481209,
       "peak_memory_gb": 35.346827904,
-      "prefill_tps": 769.9401943825235,
-      "wall_s": 36.37206416699337
+      "prefill_tps": 771.5922663160952,
+      "wall_s": 36.298478271011845
     }
   },
   "warmups": [
@@ -6558,11 +6556,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 15.012827667,
-      "decode_tps": 68.20833641159254,
+      "decode_elapsed_s": 15.088546749999995,
+      "decode_tps": 67.86604548247831,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 35.10581725,
+      "elapsed_s": 35.063538582999996,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -6821,8 +6819,8 @@
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "peak_memory_gb": 35.273606772,
-      "prefill_s": 20.092989583,
-      "prefill_tps": 815.4087739069923,
+      "prefill_s": 19.974991833,
+      "prefill_tps": 820.2256169603311,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "spec_decode_hit_rate": 0.802734375,
@@ -7854,7 +7852,7 @@
         638
       ],
       "variant": "control",
-      "wall_s": 35.150268166005844
+      "wall_s": 35.136785874987254
     },
     {
       "acceptance_history": [
@@ -8102,11 +8100,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 14.946629500000004,
-      "decode_tps": 68.51042905693218,
+      "decode_elapsed_s": 14.959777748999999,
+      "decode_tps": 68.45021478132924,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 35.762509417000004,
+      "elapsed_s": 35.770938333,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -8365,8 +8363,8 @@
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
       "peak_memory_gb": 35.273606772,
-      "prefill_s": 20.815879917,
-      "prefill_tps": 787.0913968243757,
+      "prefill_s": 20.811160584,
+      "prefill_tps": 787.26988501527,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
       "spec_decode_hit_rate": 0.802734375,
@@ -9398,7 +9396,7 @@
         638
       ],
       "variant": "candidate",
-      "wall_s": 35.80690054199658
+      "wall_s": 35.81362679199083
     },
     {
       "acceptance_history": [
@@ -9646,11 +9644,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 14.995403207999997,
-      "decode_tps": 68.28759359092788,
+      "decode_elapsed_s": 14.950207333,
+      "decode_tps": 68.4940333730153,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 35.842946207999994,
+      "elapsed_s": 35.80159025,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -9909,8 +9907,8 @@
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
       "peak_memory_gb": 35.273606772,
-      "prefill_s": 20.847543,
-      "prefill_tps": 785.8959686520373,
+      "prefill_s": 20.851382917,
+      "prefill_tps": 785.7512408274,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp+m5exact",
       "spec_decode_hit_rate": 0.802734375,
@@ -10942,7 +10940,7 @@
         638
       ],
       "variant": "candidate",
-      "wall_s": 35.88659483299125
+      "wall_s": 35.846198375016684
     },
     {
       "acceptance_history": [
@@ -11190,11 +11188,11 @@
         "serial_cycles": 0
       },
       "cycles_completed": 202,
-      "decode_elapsed_s": 15.124599,
-      "decode_tps": 67.7042743414222,
+      "decode_elapsed_s": 15.119942124999996,
+      "decode_tps": 67.72512695712453,
       "dflash_target_engagement": {},
       "effective_width": 8,
-      "elapsed_s": 35.945667125,
+      "elapsed_s": 35.950824958,
       "engagement": {
         "dual_norm": {
           "calls": 0
@@ -11453,8 +11451,8 @@
       "generated_tokens": 1024,
       "installed_route_id": "dflash2_static8+r21+r24+r26+r48+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "peak_memory_gb": 35.273606772,
-      "prefill_s": 20.821068125,
-      "prefill_tps": 786.895268851631,
+      "prefill_s": 20.830882833,
+      "prefill_tps": 786.5245141720394,
       "requested_width": 8,
       "route_id": "dflash2_static8+r21+r24+r26+r48+a11+a15+gqa678+m8nax+m8noout+m7naxout+m7naxlinearz+m8naxkv+m8naxqkv+m8naxmlp",
       "spec_decode_hit_rate": 0.802734375,
@@ -12486,7 +12484,7 @@
         638
       ],
       "variant": "control",
-      "wall_s": 35.9902824999881
+      "wall_s": 35.99398325002403
     }
   ],
   "workload": {
