@@ -5416,7 +5416,7 @@ class DeepseekV4Attention(nn.Module):
                     "is forbidden"
                 )
             installed = _DirectGatherOLora(self, quant)
-            output_projection = _MiaInverseRopeGatherOLora(self, quant)
+            output_projection = self._stock_output_projection
             direct = True
         else:
             installed = self._o_lora_dense

@@ -69,6 +69,26 @@ class _StaticArray:
         return self
 
 
+_FAKE_METAL_KERNEL_CACHES = (
+    exl3._mcg_qmv_kernel,
+    exl3._route_hadamard_kernel,
+    exl3._mma_route_pack_kernel,
+    exl3._mcg_grouped_mma_kernel,
+    exl3._route_output_hadamard_kernel,
+    exl3._m6_quad_qmv_kernel,
+    exl3._m6_dual_fc1_input_kernel,
+    exl3._m6_dual_fc1_inner_kernel,
+    exl3._m6_clamp10_activation_down_kernel,
+    exl3._m6_down_inner_kernel,
+    exl3._m6_direct_final_tail_kernel,
+)
+
+
+def _clear_fake_metal_kernel_caches() -> None:
+    for factory in _FAKE_METAL_KERNEL_CACHES:
+        factory.cache_clear()
+
+
 _MIA_MHC_ROUTE_CONTRACT = (
     "broadcast_fn_fp32",
     "attention_post_pre_fn_fp32",
@@ -524,8 +544,8 @@ def test_direct_qmv_banks_bind_production_bn256_geometry(monkeypatch, request):
     )
     monkeypatch.setattr(exl3.mx, "contiguous", lambda value: value)
     monkeypatch.setattr(exl3.mx.fast, "metal_kernel", capture_metal_kernel)
-    exl3._mcg_qmv_kernel.cache_clear()
-    request.addfinalizer(exl3._mcg_qmv_kernel.cache_clear)
+    _clear_fake_metal_kernel_caches()
+    request.addfinalizer(_clear_fake_metal_kernel_caches)
 
     switch = EXL3SwitchGLU(4096, 2048, 216, 6, limit=0.0)
     banks = (switch.gate_proj, switch.up_proj, switch.down_proj)
@@ -594,20 +614,8 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     monkeypatch.setattr(exl3.mx, "clip", lambda value, _low, _high: value)
     monkeypatch.setattr(exl3.nn, "silu", lambda value: value)
     monkeypatch.setattr(exl3.mx.fast, "metal_kernel", capture_metal_kernel)
-    exl3._mcg_qmv_kernel.cache_clear()
-    exl3._m6_quad_qmv_kernel.cache_clear()
-    exl3._m6_dual_fc1_input_kernel.cache_clear()
-    exl3._m6_dual_fc1_inner_kernel.cache_clear()
-    exl3._m6_clamp10_activation_down_kernel.cache_clear()
-    exl3._m6_down_inner_kernel.cache_clear()
-    exl3._m6_direct_final_tail_kernel.cache_clear()
-    request.addfinalizer(exl3._mcg_qmv_kernel.cache_clear)
-    request.addfinalizer(exl3._m6_quad_qmv_kernel.cache_clear)
-    request.addfinalizer(exl3._m6_dual_fc1_input_kernel.cache_clear)
-    request.addfinalizer(exl3._m6_dual_fc1_inner_kernel.cache_clear)
-    request.addfinalizer(exl3._m6_clamp10_activation_down_kernel.cache_clear)
-    request.addfinalizer(exl3._m6_down_inner_kernel.cache_clear)
-    request.addfinalizer(exl3._m6_direct_final_tail_kernel.cache_clear)
+    _clear_fake_metal_kernel_caches()
+    request.addfinalizer(_clear_fake_metal_kernel_caches)
 
     switch = EXL3SwitchGLU(4096, 2048, 216, 6, limit=10.0)
     switch.install_m6_quad_qmv_runtime()
