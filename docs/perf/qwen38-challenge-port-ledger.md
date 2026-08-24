@@ -194,7 +194,7 @@ native MTP in the candidate process.
 | 24 | RETAINED: the explicit DFlash Q/K L≤16 fence and target evaluation ladder engaged 240 and 1,664 times per candidate arm respectively, preserved exact tokens and width, and improved wall time 1.1148%. Peak rose 2.99468 GiB. |
 | 26 | RETAINED: the DFlash target prefill ladder moved from every fourth layer to every third, engaged 176 times per candidate arm with exact tokens and width, improved wall time 0.7544%, and reduced peak memory 1.41745 GiB. |
 | 36 | REPLACED: the Q4/group-64 MTP block and BF16 Q/K/V islands belong to the removed native MTP drafter; the pinned DFlash2 checkpoint supplies its own W4/group-64 drafter. |
-| 48 | PENDING: port the fused residual/RMSNorm target-layer boundary to DFlash's hidden-capture loop and gate it. |
+| 48 | RETAINED: the adapted DFlash hidden-capture loop carried each layer's residual delta into the next layer's input RMSNorm, executed 199 forwards and 12,537 merged interior boundaries per candidate arm, preserved exact tokens and width, and improved wall time 1.9584%. Peak rose 1.03600 GiB. |
 | 50 | ACTIVE: the depth-8 DFlash arms recomputed the combined active footprint as 22,328,201,584 bytes and set a 22,395,310,448-byte wired limit. |
 | 53 | ACTIVE: both DFlash arms ran in fresh processes with the retained 512 MiB/50-op process-latched command-buffer profile. |
 | 61 | REPLACED: dual norm/concat feeds the removed native MTP block; DFlash2 uses its own embeddings, dynamic-conv layers, and selector. |

@@ -114,7 +114,7 @@ replaces; that delta is composite and is not claimed as an isolated row-8 win.
 | 42 | Affine-2 argmax proposer | — | — | — | — | — | Non-transferable to stochastic DFlash acceptance | Native-MTP row 42 evidence |
 | 45 | Early boundary fusion | — | — | — | — | — | Removed; live form is row 48 | Source chronology |
 | 47 | Affine-2 M=1 selector + M=8 grouping | — | — | — | — | — | Selector absent; M=8 applicability pending | Adaptive lane |
-| 48 | Fused residual/RMSNorm DFlash capture boundary | — | — | — | — | — | Fixed DFlash gate pending on retained rows 21+24+26 | Pending |
+| 48 | Fused residual/RMSNorm DFlash capture boundary | 729.581 → 742.123 | 66.704 → 68.098 | 37.899 → 37.171 | **+1.9584%** | 34.31398 → 35.34998 | Retained; 199 forwards and 12,537 merged boundaries/arm | `item55-dflash2-r48-boundary-fused-on-r21-r24-r26-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
 | 50 | Wired-residency budget | — | — | — | — | — | Active and recomputed in every DFlash arm; no isolated delta | DFlash arm feature receipts |
 | 53 | 512 MiB / 50-op command buffers | — | — | — | — | — | Active in every isolated DFlash arm; no isolated delta | DFlash arm feature receipts |
 | 59 | Temporary adaptive SDPA cap | — | — | — | — | — | Removed by row 60 | Source chronology |
