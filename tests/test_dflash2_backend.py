@@ -210,16 +210,19 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     )
     monkeypatch.setattr(
         "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_m8_nax_island",
-        lambda model, *, active, include_m7_output=False, include_m7_linear_z=False, include_m8_kv=False, include_m8_qkv=False: {
+        lambda model, *, active, include_m7_output=False, include_m7_linear_z=False, include_m8_kv=False, include_m8_qkv=False, include_m8_mlp=False: {
             "active": active,
             "width": 8,
             "include_m7_output": include_m7_output,
             "include_m7_linear_z": include_m7_linear_z,
             "include_m8_kv": include_m8_kv,
             "include_m8_qkv": include_m8_qkv,
+            "include_m8_mlp": include_m8_mlp,
             "shapes": (
                 [[5120, 1024], [6144, 5120]]
                 if include_m8_kv and not include_m8_qkv
+                else [[5120, 1024], [5120, 10240], [5120, 17408], [6144, 5120]]
+                if include_m8_mlp
                 else [[5120, 1024], [5120, 10240], [6144, 5120]]
                 if include_m8_qkv
                 else [[6144, 5120]]
@@ -235,12 +238,16 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
             ),
             "eligible_m7_linear_z_projections": 48 if include_m7_linear_z else 0,
             "m8_expanded_shapes": (
-                [[5120, 1024], [5120, 10240]]
+                [[5120, 1024], [5120, 10240], [5120, 17408]]
+                if include_m8_mlp
+                else [[5120, 1024], [5120, 10240]]
                 if include_m8_qkv
                 else ([[5120, 1024]] if include_m8_kv else [])
             ),
             "eligible_m8_expanded_projections": (
-                80 if include_m8_qkv else (32 if include_m8_kv else 0)
+                192
+                if include_m8_mlp
+                else (80 if include_m8_qkv else (32 if include_m8_kv else 0))
             ),
         },
     )
@@ -272,13 +279,14 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
         "include_m7_linear_z": True,
         "include_m8_kv": True,
         "include_m8_qkv": True,
-        "shapes": [[5120, 1024], [5120, 10240], [6144, 5120]],
+        "include_m8_mlp": True,
+        "shapes": [[5120, 1024], [5120, 10240], [5120, 17408], [6144, 5120]],
         "m7_shapes": [[5120, 6144], [6144, 5120]],
         "eligible_projections": 16,
         "eligible_m7_projections": 64,
         "eligible_m7_linear_z_projections": 48,
-        "m8_expanded_shapes": [[5120, 1024], [5120, 10240]],
-        "eligible_m8_expanded_projections": 80,
+        "m8_expanded_shapes": [[5120, 1024], [5120, 10240], [5120, 17408]],
+        "eligible_m8_expanded_projections": 192,
     }
     assert receipt["native_mtp_release"] == {
         "native_mtp_released": True,
