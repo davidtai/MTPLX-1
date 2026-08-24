@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 pytest.importorskip("mlx.core")
 import mlx.core as mx  # noqa: E402
@@ -13,6 +14,7 @@ from mtplx.cache_state import (  # noqa: E402
     snapshot_cache_lazy_hybrid,
 )
 from mtplx.models.deepseek_v4 import DeepseekV4NVFP4Cache  # noqa: E402
+from mtplx.deepseek_v4_mia_engine import MiaTargetCacheArena  # noqa: E402
 mx.set_default_device(_IMPORT_DEVICE)
 
 
@@ -165,6 +167,147 @@ def _assert_state_tree_equal(actual, expected) -> None:
             _assert_state_tree_equal(actual_item, expected_item)
         return
     assert actual == expected
+
+
+def _new_m6_arena():
+    layers = tuple(
+        SimpleNamespace(
+            attn=SimpleNamespace(
+                window_size=8,
+                compress_ratio=ratio,
+                head_dim=512,
+            )
+        )
+        for ratio in (0, 4, 128)
+    )
+    arena = MiaTargetCacheArena(
+        layers,
+        capacity_tokens=256,
+        max_batch_tokens=6,
+    )
+    return arena, layers, arena.acquire(layers)
+
+
+def _stage_m6_lane(lane, schedule, *, base: float) -> None:
+    kv = _projected_rows(rows=6, width=lane.state_width, base=base)
+    score = _projected_rows(
+        rows=6,
+        width=lane.state_width,
+        base=base + 100.0,
+    )
+    combined_kv, combined_score = lane.append_m6_projected_rows(
+        kv,
+        score,
+        schedule,
+    )
+    emitted = schedule.emitted_rows
+    filled = emitted * schedule.ratio
+    if emitted and lane.overlap:
+        lane.prev_kv = combined_kv[:, :filled].reshape(
+            1,
+            emitted,
+            schedule.ratio,
+            lane.state_width,
+        )[:, -1]
+        lane.prev_score = combined_score[:, :filled].reshape(
+            1,
+            emitted,
+            schedule.ratio,
+            lane.state_width,
+        )[:, -1]
+    lane.n_emitted = schedule.first_window + emitted
+    total = schedule.prior_rows + 6
+    lane.cur_kv = combined_kv[:, filled:] if filled < total else None
+    lane.cur_score = combined_score[:, filled:] if filled < total else None
+
+
+def _stage_m6_cache(cache, schedule, *, base: float) -> None:
+    if schedule is not None:
+        _stage_m6_lane(cache.comp, schedule, base=base + 10.0)
+        cache.compressed._append_m6_records(
+            mx.full(
+                (1, schedule.emitted_rows, 432),
+                int(base + 20.0) & 0xFF,
+                dtype=mx.uint8,
+            ),
+            schedule,
+        )
+        if cache.compress_ratio == 4:
+            _stage_m6_lane(cache.index_comp, schedule, base=base + 30.0)
+            cache.index_compressed._append_m6_records(
+                mx.full(
+                    (1, schedule.emitted_rows, 132),
+                    int(base + 40.0) & 0xFF,
+                    dtype=mx.uint8,
+                ),
+                schedule,
+            )
+    cache.update_window_records(
+        mx.full((1, 6, 432), int(base + 50.0) & 0xFF, dtype=mx.uint8)
+    )
+    cache.advance(6)
+
+
+@pytest.mark.parametrize("start", [3, 127, 191])
+@pytest.mark.parametrize("accepted_rows", range(7))
+def test_m6_direct_acceptance_matches_installed_trim_complete_cache_state(
+    start: int,
+    accepted_rows: int,
+) -> None:
+    candidate_arena, _candidate_layers, candidate = _new_m6_arena()
+    control_arena, _control_layers, control = _new_m6_arena()
+    for index, (candidate_cache, control_cache) in enumerate(
+        zip(candidate, control, strict=True)
+    ):
+        _install_request(candidate_cache, base=10.0 + index, rows=start)
+        _install_request(control_cache, base=10.0 + index, rows=start)
+    candidate_cycle = candidate_arena.begin_verify()
+    control_cycle = control_arena.begin_verify()
+    for index, (candidate_cache, control_cache) in enumerate(
+        zip(candidate, control, strict=True)
+    ):
+        candidate_schedule = {
+            0: None,
+            4: candidate_cycle.ratio4,
+            128: candidate_cycle.ratio128,
+        }[candidate_cache.compress_ratio]
+        control_schedule = {
+            0: None,
+            4: control_cycle.ratio4,
+            128: control_cycle.ratio128,
+        }[control_cache.compress_ratio]
+        _stage_m6_cache(
+            candidate_cache,
+            candidate_schedule,
+            base=100.0 + index * 100.0,
+        )
+        _stage_m6_cache(
+            control_cache,
+            control_schedule,
+            base=100.0 + index * 100.0,
+        )
+
+    acceptance = candidate_arena.commit_verify(accepted_rows)
+    for cache in control:
+        cache._trim_installed(6 - accepted_rows)
+    mx.eval(
+        *(cache.state for cache in candidate),
+        *(cache.state for cache in control),
+    )
+
+    assert acceptance.stop_offset == start + accepted_rows
+    assert acceptance.ratio4.compressed_rows == (
+        start + accepted_rows
+    ) // 4
+    assert acceptance.ratio128.compressed_rows == (
+        start + accepted_rows
+    ) // 128
+    assert candidate_arena.current_m6_cycle is None
+    for candidate_cache, control_cache in zip(candidate, control, strict=True):
+        _assert_state_tree_equal(candidate_cache.state, control_cache.state)
+        assert candidate_cache.meta_state == control_cache.meta_state
+        assert getattr(candidate_cache.comp, "_pending_m6", None) is None
+        assert getattr(candidate_cache.index_comp, "_pending_m6", None) is None
 
 
 @pytest.mark.parametrize(

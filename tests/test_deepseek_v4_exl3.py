@@ -24,6 +24,7 @@ from mtplx.deepseek_v4_exl3 import (
     sanitize_mia_dspark_weights,
 )
 from mtplx.models.deepseek_v4 import DeepseekV4MoE, ModelArgs
+from mtplx.kernels.deepseek_v4_mhc import MiaMHCPlan
 
 
 def test_mia_loader_installs_stacked_projections_after_weights_before_plan() -> None:
@@ -70,11 +71,61 @@ class _StaticArray:
 
 _MIA_MHC_ROUTE_CONTRACT = (
     "broadcast_fn_fp32",
-    "tiny_split32_fp32",
-    "prefill_post_pre_bf16_mma_bm64_fp32",
+    "attention_post_pre_fn_fp32",
+    "ffn_tiny_post_pre_fn_bf16_split32_fp32",
+    "ffn_prefill_post_pre_fn_bf16_mma_bm64_fp32",
     "compact_gram_finalize",
     "head_bf16_then_rmsnorm",
 )
+
+
+def test_mia_mhc_post_pre_precision_is_selected_by_connection_role() -> None:
+    plan = MiaMHCPlan.__new__(MiaMHCPlan)
+    calls = []
+
+    def record_split(
+        _self,
+        x,
+        residual,
+        post,
+        comb,
+        hc,
+        norm,
+        *,
+        projection_weight,
+    ):
+        calls.append(("split", projection_weight))
+        return x, residual, post, comb
+
+    def record_prefill(_self, x, residual, post, comb, hc, norm):
+        calls.append(("prefill", hc._mia_mhc_weight.fn_bf16))
+        return x, residual, post, comb
+
+    plan._post_pre_connection = MethodType(record_split, plan)
+    plan._post_pre_ffn_prefill = MethodType(record_prefill, plan)
+    plan.prefill_min_rows = 384
+    fp32_weight = object()
+    bf16_weight = object()
+    hc = SimpleNamespace(
+        fn=fp32_weight,
+        _mia_mhc_weight=SimpleNamespace(fn_bf16=bf16_weight),
+    )
+    args = tuple(object() for _ in range(4))
+    norm = object()
+
+    plan._rows = lambda _value: 6
+    plan.post_pre_attn(*args, hc, norm)
+    plan.post_pre_ffn(*args, hc, norm)
+    plan._rows = lambda _value: 1024
+    plan.post_pre_attn(*args, hc, norm)
+    plan.post_pre_ffn(*args, hc, norm)
+
+    assert calls == [
+        ("split", fp32_weight),
+        ("split", bf16_weight),
+        ("split", fp32_weight),
+        ("prefill", bf16_weight),
+    ]
 
 
 def _callable_name(value):
@@ -139,7 +190,7 @@ def _assert_mia_carried_mhc_contract(model) -> None:
         "_mia_hc_hidden",
         "_mia_collapse",
         "_mia_target_forward",
-        "_mia_propose_k5",
+        "_mia_fullgraph_propose_k5",
     )
     generic_sinkhorn_callables = {
         id(connection._sinkhorn_normalise)
@@ -282,7 +333,7 @@ def test_carried_mhc_contract_owns_43_target_and_3_draft_layers():
         dspark=SimpleNamespace(
             stages=draft_stages,
             _mia_mhc=draft_mhc,
-            _propose_impl=_named_route("_mia_propose_k5"),
+            _propose_impl=_named_route("_mia_fullgraph_propose_k5"),
         ),
         _target_forward_route=_named_route("_mia_target_forward"),
     )
@@ -422,6 +473,15 @@ def test_mia_loader_rebinds_quad_qmv_only_after_generic_install():
         def direct_qmv_m6_quad(self, _x, _expert_ids):
             return "quad"
 
+        def direct_m6_clamp10(
+            self,
+            _x,
+            _expert_ids,
+            _route_weights,
+            _shared,
+        ):
+            return "fused"
+
         def install_m6_quad_qmv_runtime(self):
             events.append("plan")
 
@@ -435,8 +495,8 @@ def test_mia_loader_rebinds_quad_qmv_only_after_generic_install():
     )
 
     assert events == ["plan"]
-    assert ffn._mia_exl3_direct_qmv.__self__ is switch
-    assert ffn._mia_exl3_direct_qmv.__func__ is Switch.direct_qmv_m6_quad
+    assert ffn._mia_exl3_m6_fused.__self__ is switch
+    assert ffn._mia_exl3_m6_fused.__func__ is Switch.direct_m6_clamp10
 
 
 def test_direct_qmv_banks_bind_production_bn256_geometry(monkeypatch, request):
@@ -536,8 +596,18 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     monkeypatch.setattr(exl3.mx.fast, "metal_kernel", capture_metal_kernel)
     exl3._mcg_qmv_kernel.cache_clear()
     exl3._m6_quad_qmv_kernel.cache_clear()
+    exl3._m6_dual_fc1_input_kernel.cache_clear()
+    exl3._m6_dual_fc1_inner_kernel.cache_clear()
+    exl3._m6_clamp10_activation_down_kernel.cache_clear()
+    exl3._m6_down_inner_kernel.cache_clear()
+    exl3._m6_direct_final_tail_kernel.cache_clear()
     request.addfinalizer(exl3._mcg_qmv_kernel.cache_clear)
     request.addfinalizer(exl3._m6_quad_qmv_kernel.cache_clear)
+    request.addfinalizer(exl3._m6_dual_fc1_input_kernel.cache_clear)
+    request.addfinalizer(exl3._m6_dual_fc1_inner_kernel.cache_clear)
+    request.addfinalizer(exl3._m6_clamp10_activation_down_kernel.cache_clear)
+    request.addfinalizer(exl3._m6_down_inner_kernel.cache_clear)
+    request.addfinalizer(exl3._m6_direct_final_tail_kernel.cache_clear)
 
     switch = EXL3SwitchGLU(4096, 2048, 216, 6, limit=10.0)
     switch.install_m6_quad_qmv_runtime()
@@ -553,6 +623,11 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
     assert plan.intermediate_to_hidden is exl3._m6_quad_qmv_kernel(
         2048, 4096, True
     )
+    assert plan.dual_fc1_input is exl3._m6_dual_fc1_input_kernel()
+    assert plan.dual_fc1_inner is exl3._m6_dual_fc1_inner_kernel()
+    assert plan.activation_down is exl3._m6_clamp10_activation_down_kernel()
+    assert plan.down_inner is exl3._m6_down_inner_kernel()
+    assert plan.direct_final_tail is exl3._m6_direct_final_tail_kernel()
     project_source = inspect.getsource(EXL3SwitchGLU._m6_quad_project)
     assert "routed_input" not in project_source
 
@@ -611,20 +686,142 @@ def test_m6_quad_qmv_is_construction_bound_and_never_reenters_factories(
         )
         assert k0_accumulator0 < k1_accumulator0 < k2_accumulator0 < k3_accumulator0
 
+    stages = {
+        name: kernel
+        for name, kernel in captured.items()
+        if name.startswith("mtplx_dsv4_exl3_m6_")
+        and "quad_mcg_qmv" not in name
+    }
+    assert set(stages) == {
+        "mtplx_dsv4_exl3_m6_dual_fc1_input_h4096_v2",
+        "mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v2",
+        "mtplx_dsv4_exl3_m6_clamp10_activation_down_i2048_v2",
+        "mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v1",
+        "mtplx_dsv4_exl3_m6_direct_final_tail_h4096_t6_v2",
+    }
+
+    h128_stages = [
+        stages["mtplx_dsv4_exl3_m6_dual_fc1_input_h4096_v2"],
+        stages["mtplx_dsv4_exl3_m6_clamp10_activation_down_i2048_v2"],
+        stages["mtplx_dsv4_exl3_m6_direct_final_tail_h4096_t6_v2"],
+    ]
+    for kernel in h128_stages:
+        header = kernel["header"]
+        assert "inline float4 hadamard_h128_quad" in header
+        assert "float s0 = value.x + value.y;" in header
+        assert "float d0 = value.x - value.y;" in header
+        assert "float s1 = value.z + value.w;" in header
+        assert "float d1 = value.z - value.w;" in header
+        assert "float h0 = s0 + s1;" in header
+        assert "float h1 = d0 + d1;" in header
+        assert "float h2 = s0 - s1;" in header
+        assert "float h3 = d0 - d1;" in header
+        assert "for (uint step = 0u; step < 5u; ++step)" in header
+        assert "simd_shuffle_xor" in header
+        for component in range(4):
+            assert f"h{component} = p{component} - h{component};" in header
+            assert f"h{component} = h{component} + p{component};" in header
+            assert f"h{component} = p{component} + h{component};" not in header
+        assert "threadgroup float exchange" not in header
+        assert "threadgroup_barrier" not in header
+        assert "threadgroup float exchange" not in kernel["source"]
+        assert "threadgroup_barrier" not in kernel["source"]
+
+    staged = stages["mtplx_dsv4_exl3_m6_dual_fc1_input_h4096_v2"]
+    assert staged["output_names"] == ["gate_h", "up_h"]
+    staged_source = staged["source"]
+    assert "uint k0 = k_block * HAD + lane * 4u;" in staged_source
+    assert "half x0 = half(x[" in staged_source
+    assert "half gate_scaled0 = half(" in staged_source
+    assert "float4 gate_transformed = hadamard_h128_quad(" in staged_source
+    assert "gate_h[(size_t)task * HIDDEN + k0 + 3u] = half(" in staged_source
+    assert "float4 up_transformed = hadamard_h128_quad(" in staged_source
+    assert "up_h[(size_t)task * HIDDEN + k0 + 3u] = half(" in staged_source
+
+    dual = stages["mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v2"]
+    assert dual["output_names"] == ["gate_inner", "up_inner"]
+    assert dual["input_names"] == [
+        "gate_h",
+        "up_h",
+        "gate_trellis",
+        "up_trellis",
+        "expert_ids",
+    ]
+    assert "gate_suh" not in dual["source"]
+    assert "hadamard_h128" not in dual["source"]
+    assert "half(gate_accumulator0)" in dual["source"]
+
+    activation = stages[
+        "mtplx_dsv4_exl3_m6_clamp10_activation_down_i2048_v2"
+    ]
+    activation_source = activation["source"]
+    assert "uint column0 = block * HAD + lane * 4u;" in activation_source
+    assert "float4 gate_had = hadamard_h128_quad(" in activation_source
+    assert "half gate_rotated0 = half(gate_had.x * HAD_SCALE);" in activation_source
+    assert "half gate0 = half(" in activation_source
+    assert (
+        "half silu0 = half(gate0 * sigmoid_mlx_exact(gate0));"
+        in activation_source
+    )
+    assert "half activated0 = half(silu0 * up0);" in activation_source
+    assert "half down_scaled0 = half(" in activation_source
+    assert "float4 down_had = hadamard_h128_quad(" in activation_source
+    assert "down_h[(size_t)task * INTERMEDIATE + column0 + 3u] = half(" in (
+        activation_source
+    )
+
+    down = stages["mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v1"]
+    assert down["input_names"] == ["down_h", "down_trellis", "expert_ids"]
+    assert "down_inner[(size_t)task * SIZE_N + n0] = half(accumulator0);" in down[
+        "source"
+    ]
+
+    final = stages["mtplx_dsv4_exl3_m6_direct_final_tail_h4096_t6_v2"]
+    final_source = final["source"]
+    assert "uint column0 = block * HAD + lane * 4u;" in final_source
+    assert "T mixed0 = T(0.0f);" in final_source
+    assert "T mixed3 = T(0.0f);" in final_source
+    assert "float4 output_had = hadamard_h128_quad(" in final_source
+    assert "half rotated0 = half(output_had.x * HAD_SCALE);" in final_source
+    assert "T projected0 = T(projected_half0);" in final_source
+    assert "T weight = T(route_weights[task]);" in final_source
+    assert "T product0 = T(projected0 * weight);" in final_source
+    assert "mixed0 = T(product0 + mixed0);" in final_source
+    assert "T product3 = T(projected3 * weight);" in final_source
+    assert "mixed3 = T(product3 + mixed3);" in final_source
+
     def forbidden_factory(*_args, **_kwargs):
         raise AssertionError("installed quad QMV re-entered its kernel factory")
 
     monkeypatch.setattr(exl3, "_m6_quad_qmv_kernel", forbidden_factory)
-    result = switch.direct_qmv_m6_quad(
+    monkeypatch.setattr(exl3, "_m6_dual_fc1_input_kernel", forbidden_factory)
+    monkeypatch.setattr(exl3, "_m6_dual_fc1_inner_kernel", forbidden_factory)
+    monkeypatch.setattr(
+        exl3, "_m6_clamp10_activation_down_kernel", forbidden_factory
+    )
+    monkeypatch.setattr(exl3, "_m6_down_inner_kernel", forbidden_factory)
+    monkeypatch.setattr(exl3, "_m6_direct_final_tail_kernel", forbidden_factory)
+    result = switch.direct_m6_clamp10(
         _StaticArray((6, 4096), mx.bfloat16),
         _StaticArray((6, 6), mx.int32),
+        _StaticArray((6, 6), mx.float32),
+        _StaticArray((6, 4096), mx.bfloat16),
     )
 
     assert result is not None
-    assert [launch["grid"] for launch in launches[-3:]] == [
+    assert [launch["grid"] for launch in launches[-5:]] == [
+        (32, 32, 36),
         (128, 8, 36),
-        (128, 8, 36),
+        (32, 16, 36),
         (128, 16, 36),
+        (32, 32, 6),
+    ]
+    assert [launch["threadgroup"] for launch in launches[-5:]] == [
+        (32, 1, 1),
+        (128, 1, 1),
+        (32, 1, 1),
+        (128, 1, 1),
+        (32, 1, 1),
     ]
 
 
@@ -634,13 +831,25 @@ def test_mia_exl3_forward_selects_direct_only_for_physical_m6_verify(monkeypatch
     indices = object()
     weights = object()
     shared = object()
-    routed = object()
     direct_output = object()
     trellis_output = object()
 
-    def direct(xf, observed_indices):
-        calls.append(("direct", xf, observed_indices))
-        return routed
+    def direct_fused(
+        xf,
+        observed_indices,
+        observed_weights,
+        observed_shared,
+    ):
+        calls.append(
+            (
+                "direct_fused",
+                xf,
+                observed_indices,
+                observed_weights,
+                observed_shared,
+            )
+        )
+        return direct_output
 
     def trellis(xf, observed_indices, observed_weights, observed_shared):
         calls.append(
@@ -648,22 +857,17 @@ def test_mia_exl3_forward_selects_direct_only_for_physical_m6_verify(monkeypatch
         )
         return trellis_output
 
-    def tail(observed_routed, observed_weights, observed_shared):
-        calls.append(("tail", observed_routed, observed_weights, observed_shared))
-        return direct_output
-
     owner = SimpleNamespace(
         gate=lambda _xf, _ids: (indices, weights),
         shared_experts=lambda _xf: shared,
-        _mia_exl3_direct_qmv=direct,
+        _mia_exl3_m6_fused=direct_fused,
         _mia_exl3_trellis_fused=trellis,
-        _mia_exl3_tail_combine=tail,
     )
     monkeypatch.setattr(target_module, "current_attention_phase", lambda: phase)
 
     verify_x = _StaticArray((6, 4096))
     assert DeepseekV4MoE._mia_exl3_forward(owner, verify_x, None) is direct_output
-    assert [call[0] for call in calls] == ["direct", "tail"]
+    assert [call[0] for call in calls] == ["direct_fused"]
 
     calls.clear()
     phase = "prefill"
@@ -910,6 +1114,11 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
         stage_vectors_per_k_tile=96,
         hidden_to_intermediate=exl3._m6_quad_qmv_kernel(4096, 2048, False),
         intermediate_to_hidden=exl3._m6_quad_qmv_kernel(2048, 4096, True),
+        dual_fc1_input=exl3._m6_dual_fc1_input_kernel(),
+        dual_fc1_inner=exl3._m6_dual_fc1_inner_kernel(),
+        activation_down=exl3._m6_clamp10_activation_down_kernel(),
+        down_inner=exl3._m6_down_inner_kernel(),
+        direct_final_tail=exl3._m6_direct_final_tail_kernel(),
     )
     x = mx.array(
         np.linspace(-1.0, 1.0, 6 * 4096, dtype=np.float32).reshape(6, 4096)
@@ -917,6 +1126,21 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
     expert_ids = mx.zeros((6, 6), dtype=mx.int32)
     flat_ids = mx.contiguous(expert_ids.reshape(36).astype(mx.uint32))
     x_half = x.astype(mx.float16)
+
+    oracle_gate_h = switch.gate_proj.transform_routes(x_half, flat_ids)
+    oracle_up_h = switch.up_proj.transform_routes(x_half, flat_ids)
+    staged_gate_h, staged_up_h = switch._m6_quad_qmv_plan.dual_fc1_input(
+        inputs=[
+            mx.contiguous(x),
+            switch.gate_proj.suh,
+            switch.up_proj.suh,
+            mx.contiguous(expert_ids),
+        ],
+        grid=(32, 32, 36),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(36, 4096), (36, 4096)],
+        output_dtypes=[mx.float16, mx.float16],
+    )
 
     oracle_gate = switch.gate_proj(x_half, expert_ids)
     quad_gate = switch._m6_quad_project(
@@ -945,7 +1169,28 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
     )
     oracle_final = switch.direct_qmv(x, expert_ids)
     quad_final = switch.direct_qmv_m6_quad(x, expert_ids)
+    route_weights = mx.array(
+        np.linspace(0.03125, 0.96875, 36, dtype=np.float32).reshape(6, 6)
+    )
+    shared = mx.array(
+        np.cos(np.arange(6 * 4096, dtype=np.float32) * 0.017).reshape(6, 4096)
+    ).astype(mx.bfloat16)
+    oracle_fused = target_module._stock_moe_tail_combine(
+        quad_final,
+        route_weights,
+        shared,
+    )
+    quad_fused = switch.direct_m6_clamp10(
+        x,
+        expert_ids,
+        route_weights,
+        shared,
+    )
     mx.eval(
+        oracle_gate_h,
+        staged_gate_h,
+        oracle_up_h,
+        staged_up_h,
         oracle_gate,
         quad_gate,
         oracle_up,
@@ -954,13 +1199,18 @@ def test_authentic_mia_m6_quad_qmv_matches_three_banks_and_final_bits():
         quad_down,
         oracle_final,
         quad_final,
+        oracle_fused,
+        quad_fused,
     )
 
     for oracle, quad in (
+        (oracle_gate_h, staged_gate_h),
+        (oracle_up_h, staged_up_h),
         (oracle_gate, quad_gate),
         (oracle_up, quad_up),
         (oracle_down, quad_down),
         (oracle_final, quad_final),
+        (oracle_fused, quad_fused),
     ):
         np.testing.assert_array_equal(
             np.array(oracle.view(mx.uint16)),

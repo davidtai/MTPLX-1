@@ -657,6 +657,15 @@ class PagedMiaIndexerRows:
             count=int(records.shape[1]),
         )
 
+    def _append_m6_records(self, records: mx.array, schedule) -> None:
+        """Insert physical-M6 records through the shared ratio-4 mapping."""
+        self._pool._write_installed_mapping(
+            {"records": records[0]},
+            physical_blocks=schedule.compressed_blocks,
+            block_offsets=schedule.compressed_offsets,
+            new_offset=schedule.first_window + schedule.emitted_rows,
+        )
+
     def decode(self) -> mx.array:
         return decode_indexer132(self.records)
 
@@ -1950,6 +1959,49 @@ def _run_paged_indexer_records_decode_topk(
     return MiaTopKSelection(indices=indices, lengths=output_lengths)
 
 
+def _run_paged_indexer_records_m6_topk(
+    q_records: mx.array,
+    weights: mx.array,
+    rows: PagedMiaIndexerRecords,
+    causal_lengths: mx.array,
+    *,
+    topk: int,
+    workspace: MiaIndexerWorkspace,
+    query_count: int,
+    decode_candidates,
+    radix_fold,
+) -> MiaTopKSelection:
+    """Direct physical-M6 selector with request-owned causal lengths."""
+    n_rows = int(rows.length)
+    causal_lengths = causal_lengths[None]
+    output_lengths = mx.minimum(causal_lengths, int(topk)).astype(mx.int32)
+    candidate_values, candidate_indices = decode_candidates(
+        q_records,
+        weights,
+        rows,
+        causal_lengths,
+    )
+    candidate_width = int(candidate_values.shape[2]) * int(topk)
+    values = candidate_values.reshape(1, query_count, candidate_width)
+    indices = candidate_indices.reshape(1, query_count, candidate_width)
+    if candidate_width > int(topk):
+        empty_values, empty_indices = workspace.seeds(query_count)
+        merge_lengths = mx.full(
+            (1, query_count), candidate_width, dtype=mx.int32
+        )
+        _, indices = radix_fold(
+            values,
+            empty_values,
+            empty_indices,
+            merge_lengths,
+            row_start=0,
+            score_indices=indices,
+            has_carry=False,
+            sentinel=n_rows,
+        )
+    return MiaTopKSelection(indices=indices, lengths=output_lengths)
+
+
 def _run_installed_paged_indexer_phase_topk(
     queries: MiaIndexerQueryRecords,
     weights: mx.array,
@@ -2093,4 +2145,45 @@ def install_paged_indexer_topk(
         score_slice=score_slice,
         radix_fold=radix_fold,
         decode_candidates=decode_candidates,
+    )
+
+
+def install_paged_indexer_m6_topk(
+    *,
+    heads: int,
+    head_dim: int,
+    topk: int,
+    compress_ratio: int,
+    workspace: MiaIndexerWorkspace,
+):
+    """Install the decode-only physical-M6 selector without phase routing."""
+    observed = (int(heads), int(head_dim), int(topk), int(compress_ratio))
+    expected = (INDEXER_HEADS, INDEXER_HEAD_DIM, INDEXER_TOPK, 4)
+    if observed != expected:
+        raise ValueError(
+            f"unsupported Mia paged indexer M6 geometry: {observed} != {expected}"
+        )
+    if (
+        int(workspace.topk) != INDEXER_TOPK
+        or int(workspace.max_query_rows) < 6
+        or int(workspace.sentinel) <= 0
+    ):
+        raise ValueError("the Mia paged indexer M6 workspace geometry is invalid")
+    if not mx.metal.is_available():
+        raise RuntimeError("Mia paged indexer M6 installation requires Metal")
+    radix_fold = partial(
+        _run_radix_fold,
+        kernel=_radix_fold_kernel(),
+    )
+    decode_candidates = partial(
+        _run_fused_decode_candidates,
+        kernel=_fused_decode_candidates_kernel(),
+    )
+    return partial(
+        _run_paged_indexer_records_m6_topk,
+        topk=int(topk),
+        workspace=workspace,
+        query_count=6,
+        decode_candidates=decode_candidates,
+        radix_fold=radix_fold,
     )

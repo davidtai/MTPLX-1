@@ -418,12 +418,11 @@ created.  The enabled callables do not probe eligibility or fall back.
   SIMDgroups) issue one 16-byte copy for each of the eight K tiles; expert, K,
   and N vector bases are formed before that copy loop.  Construction seals the
   16-byte vector and 96 vectors per K tile before installing the v2 kernel.
-  Authentic three-bank/final-bit parity passed, and matched one-cycle gates
-  improved from 30.84--30.87 tok/s to 39.74--39.79 tok/s.  The retained
-  construction-bound piecewise target route, which compiles only cache-free
-  regions around the same eager attention calls, subsequently measured 43.523
-  tok/s on that full-acceptance gate after preserving the source BF16 head
-  boundary before RMSNorm.  Sustained measurement remains separate.
+  Authentic three-bank/final-bit parity passed.  The retained
+  construction-bound piecewise target route compiles only cache-free regions
+  around the same eager attention calls while preserving the source BF16 head
+  boundary before RMSNorm.  Only sustained 1,024-output requests are published
+  as decode-throughput evidence.
 - **MTPLX implementation:** `mtplx/kernels/deepseek_v4_moe_router.py` and the
   installed `EXL3SwitchGLU.direct_qmv_m6_quad` /
   `EXL3SwitchGLU.fused` paths in `mtplx/deepseek_v4_exl3.py`.  The scalar
@@ -472,14 +471,22 @@ created.  The enabled callables do not probe eligibility or fall back.
   `MiaTP1WOMXFP8Plan` objects directly as `_output_projection_impl`.  The
   plans retain each attention's existing `uint32` weight view and expanded
   `uint8` scales by identity and prebind the BM8, exact-M16 quantized-output,
-  and BM64 kernels.  The engine verifies the complete
-  plan/callable/storage/parameter-identity receipt before allocating serving
-  caches or prewarming.
+  and BM64 kernels.  Target and draft plans carry distinct construction roles,
+  and bind their WO-B owners once: target binds MLX's native group-32 MXFP8
+  matmul while draft binds the exact FP32-accumulating Metal owner.  The engine
+  verifies the complete plan/callable/storage/parameter-identity receipt before
+  allocating serving caches or prewarming; no runtime eligibility or fallback
+  branch remains in the installed plan.
 - **Disposition:** source-derived TP1 Metal mapping with standalone WO-A
-  producer, grouped MXFP8 GEMMs, and fused decode WO-B input quantization.  The
-  generic `_MiaInverseRopeGatherOLora`/native-MLX route remains available only
-  to explicitly constructed non-Mia models and is not reachable from exact
-  Mia execution.
+  producer and grouped MXFP8 GEMMs.  Target M6 verification first applies the
+  exact source K32 E4M3/UE8M0 activation quantizer, reconstructs its BF16
+  boundary, and feeds the already-installed native MXFP8 WO-B weights.  Against
+  the exact owner on the authentic M6 layer-0 tensors, this construction-bound
+  target route differs in only 3 of 24,576 BF16 outputs with maximum absolute
+  drift 0.015625.  Draft and prefill retain the exact ordered BF16-tile,
+  FP32-accumulating owners.  The generic
+  `_MiaInverseRopeGatherOLora` route remains available only to explicitly
+  constructed non-Mia models and is not reachable from Mia execution.
 
 ### 7. General non-expert FP8 linears
 
@@ -535,7 +542,8 @@ created.  The enabled callables do not probe eligibility or fall back.
   for the main projection before inserting the three context-K/V copies; the
   full 1,024-by-12,288 tap tensor is never materialized.  Neither the projected
   DSpark context nor stage K/V is materialized for discarded prompt rows.
-- **Disposition:** source-faithful DSpark/DFlash protocol port reusing the
+- **Disposition:** source-faithful fixed-K5, temperature-0 DSpark/DFlash
+  protocol subset reusing the
   existing DFlash2 engine.  There is no full-prompt target-feature store.
 
 ### 9. Pages and bounded workspace ownership

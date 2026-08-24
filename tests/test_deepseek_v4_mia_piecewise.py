@@ -47,7 +47,7 @@ class _ToyMHC:
         value = x + hc.bias + norm.bias
         return residual, post, comb, value
 
-    def post_pre(self, x, residual, post, comb, hc, norm):
+    def _post_pre(self, x, residual, post, comb, hc, norm):
         rows = x.shape[0] * x.shape[1] if x.ndim == 3 else x.shape[0]
         x = x.reshape(rows, self._hidden_size)
         residual = residual.reshape(rows, self._hc_mult, self._hidden_size)
@@ -56,6 +56,9 @@ class _ToyMHC:
         comb = comb + norm.bias
         value = mx.sum(residual, axis=-2) + hc.bias + norm.bias
         return residual, post, comb, value
+
+    post_pre_attn = _post_pre
+    post_pre_ffn = _post_pre
 
     def post(self, x, residual, post, comb):
         rows = x.shape[0] * x.shape[1] if x.ndim == 3 else x.shape[0]
@@ -74,8 +77,18 @@ class _ToyAttention:
         self._layer_id = layer_id
         self._compile_spy = compile_spy
         self.observed_offsets = []
+        self.observed_schedules = []
+        self.generic_calls = 0
 
     def __call__(self, value, *, mask, cache):
+        self.generic_calls += 1
+        return self._forward(value, mask=mask, cache=cache)
+
+    def _mia_m6_forward_impl(self, value, *, cache, schedule):
+        self.observed_schedules.append(schedule)
+        return self._forward(value, mask=None, cache=cache)
+
+    def _forward(self, value, *, mask, cache):
         assert mask is None
         if self._compile_spy is not None:
             assert self._compile_spy.depth == 0
@@ -86,8 +99,23 @@ class _ToyAttention:
 class _ToyFFN:
     def __init__(self, layer_id: int):
         self._layer_id = layer_id
+        self.generic_calls = 0
+        self.shared_input_shapes = []
+        self._input_rows_impl = lambda input_ids: input_ids.reshape(-1)
+        self.gate = lambda _value, input_ids: (input_ids, None)
+        self.shared_experts = self._shared_experts
+        self._mia_exl3_m6_fused = (
+            lambda _value, input_ids, _weights, shared: (
+                shared + input_ids.astype(mx.float32)[:, None] / 64.0
+            )
+        )
+
+    def _shared_experts(self, value):
+        self.shared_input_shapes.append(tuple(int(item) for item in value.shape))
+        return value + float(self._layer_id) / 64.0
 
     def __call__(self, value, *, input_ids):
+        self.generic_calls += 1
         token_term = input_ids.astype(mx.float32)[..., None]
         return value + token_term / 64.0 + float(self._layer_id) / 64.0
 
@@ -133,8 +161,25 @@ class _CompileSpy:
         return compiled
 
 
+class _ScheduleSpy:
+    def __init__(self):
+        self.accesses = 0
+        self.cycle = SimpleNamespace(
+            by_layer=tuple(object() for _ in range(43)),
+        )
+
+    @property
+    def current_cycle(self):
+        self.accesses += 1
+        return self.cycle
+
+
 def _caches(offset: int):
-    return tuple(SimpleNamespace(offset=offset) for _ in range(43))
+    schedule = _ScheduleSpy()
+    return tuple(
+        SimpleNamespace(offset=offset, _mia_m6_schedule=schedule)
+        for _ in range(43)
+    )
 
 
 def _assert_array_equal(actual, expected):
@@ -193,6 +238,51 @@ def test_attention_is_outside_tapes_and_reads_current_cache_metadata():
     assert len(spy.functions) == 44
     assert all(layer.attn.observed_offsets == [3, 19] for layer in model.layers)
     assert not bool(mx.array_equal(first_hidden, second_hidden).item())
+
+
+def test_piecewise_fetches_one_cycle_and_uses_prebound_m6_attentions():
+    model = _toy_model()
+    route = MiaPhysicalM6PiecewiseTargetRoute(
+        model,
+        physical_width=6,
+        compile_fn=lambda fn: fn,
+    )
+    caches = _caches(127)
+    schedule = caches[0]._mia_m6_schedule
+
+    hidden, taps = route(mx.arange(6, dtype=mx.uint32)[None], caches)
+    mx.eval(hidden, *taps)
+
+    assert schedule.accesses == 1
+    assert all(layer.attn.generic_calls == 0 for layer in model.layers)
+    assert all(
+        layer.attn.observed_schedules == [schedule.cycle.by_layer[layer_id]]
+        for layer_id, layer in enumerate(model.layers)
+    )
+
+
+def test_piecewise_regions_bind_the_fixed_m6_ffn_without_generic_routing():
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        spy = _CompileSpy()
+        model = _toy_model(compile_spy=spy)
+        route = MiaPhysicalM6PiecewiseTargetRoute(
+            model,
+            physical_width=6,
+            compile_fn=spy,
+        )
+
+        hidden, taps = route(mx.arange(6, dtype=mx.uint32)[None], _caches(3))
+        mx.eval(hidden, *taps)
+
+        assert all(layer.ffn.generic_calls == 0 for layer in model.layers)
+        assert all(
+            layer.ffn.shared_input_shapes == [(6, 4)]
+            for layer in model.layers
+        )
+    finally:
+        mx.set_default_device(previous)
 
 
 def test_piecewise_outputs_and_tail_taps_match_exact_eager_route_bitwise():

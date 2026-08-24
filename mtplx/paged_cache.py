@@ -206,6 +206,19 @@ class PagedCachePool:
             self._buffers[name][physical_blocks, block_offsets] = rows
         self.offset = stop
 
+    def _write_installed_mapping(
+        self,
+        updates: Mapping[str, Any],
+        *,
+        physical_blocks: Any,
+        block_offsets: Any,
+        new_offset: int,
+    ) -> None:
+        """Write through a construction-owned logical-to-physical mapping."""
+        for name in self.plan.array_names:
+            self._buffers[name][physical_blocks, block_offsets] = updates[name]
+        self.offset = int(new_offset)
+
     def write_slots(
         self,
         updates: Mapping[str, Any],

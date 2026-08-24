@@ -15,6 +15,7 @@ from mtplx import deepseek_v4_nvfp4_kv as nvfp4_kv  # noqa: E402
 from mtplx.attention_context import attention_phase  # noqa: E402
 from mtplx.kernels import deepseek_v4_compressor as compressor_kernels  # noqa: E402
 from mtplx.kernels import deepseek_v4_qkv_prologue as qkv_prologue  # noqa: E402
+from mtplx.deepseek_v4_mia_engine import MiaM6RatioTables  # noqa: E402
 from mtplx.models import deepseek_v4 as target_module  # noqa: E402
 from mtplx.models.deepseek_v4 import (  # noqa: E402
     Compressor,
@@ -948,3 +949,131 @@ def test_fixed_compressor_uses_retained_frontier_without_journal_readback() -> N
     assert state.latest_calls == []
     assert before_boundary.shape == (1, 0, 432)
     np.testing.assert_array_equal(np.array(actual), np.array(expected))
+
+
+@pytest.mark.parametrize("offset", [3, 127, 191])
+@pytest.mark.parametrize(
+    "head_dim,mode,ratio",
+    [
+        (512, "stock432", 4),
+        (512, "stock432", 128),
+        (128, "mia132", 4),
+    ],
+)
+def test_m6_scheduled_compressor_matches_current_records_and_frontiers(
+    offset: int,
+    head_dim: int,
+    mode: str,
+    ratio: int,
+) -> None:
+    compressor = _make_compressor(head_dim, mode, ratio)
+    overlap = ratio == 4
+    state_width = (2 if overlap else 1) * head_dim
+    expected_state = FixedMiaCompressorState(
+        ratio=ratio,
+        overlap=overlap,
+        rollback_capacity=8,
+        state_width=state_width,
+    )
+    actual_state = FixedMiaCompressorState(
+        ratio=ratio,
+        overlap=overlap,
+        rollback_capacity=8,
+        state_width=state_width,
+    )
+    inputs = mx.array(
+        np.random.default_rng(4_000 + head_dim + ratio + offset).normal(
+            0.0,
+            0.4,
+            (1, offset + 6, 8),
+        ).astype(np.float32)
+    )
+    if offset:
+        expected_prefix = compressor._step_records_installed(
+            inputs[:, :offset],
+            expected_state,
+            0,
+        )
+        actual_prefix = compressor._step_records_installed(
+            inputs[:, :offset],
+            actual_state,
+            0,
+        )
+        mx.eval(expected_prefix, actual_prefix)
+
+    compressed_capacity = (256 + ratio - 1) // ratio
+    block_size = max(1, 256 // ratio)
+    tables = MiaM6RatioTables.allocate(
+        ratio=ratio,
+        rollback_rows=actual_state.rollback_rows,
+        capacity_tokens=256,
+        compressed_capacity=compressed_capacity,
+        compressed_block_size=block_size,
+        block_table=mx.arange(
+            (compressed_capacity + block_size - 1) // block_size,
+            dtype=mx.int32,
+        ),
+    )
+    schedule = tables.slice(offset)
+    expected = compressor._step_records_installed(
+        inputs[:, offset:],
+        expected_state,
+        offset,
+    )
+    actual = compressor._step_m6_records_installed(
+        inputs[:, offset:],
+        actual_state,
+        schedule,
+    )
+    expected_arrays = [
+        expected,
+        *expected_state.journal_buffers,
+        *(
+            value
+            for value in (
+                expected_state.cur_kv,
+                expected_state.cur_score,
+                expected_state.prev_kv,
+                expected_state.prev_score,
+            )
+            if value is not None
+        ),
+    ]
+    actual_arrays = [
+        actual,
+        *actual_state.journal_buffers,
+        *(
+            value
+            for value in (
+                actual_state.cur_kv,
+                actual_state.cur_score,
+                actual_state.prev_kv,
+                actual_state.prev_score,
+            )
+            if value is not None
+        ),
+    ]
+    mx.eval(*expected_arrays, *actual_arrays)
+
+    np.testing.assert_array_equal(np.array(actual), np.array(expected))
+    for actual_journal, expected_journal in zip(
+        actual_state.journal_buffers,
+        expected_state.journal_buffers,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            np.array(actual_journal),
+            np.array(expected_journal),
+        )
+    for name in ("cur_kv", "cur_score", "prev_kv", "prev_score"):
+        actual_frontier = getattr(actual_state, name)
+        expected_frontier = getattr(expected_state, name)
+        assert (actual_frontier is None) == (expected_frontier is None)
+        if actual_frontier is not None:
+            np.testing.assert_array_equal(
+                np.array(actual_frontier),
+                np.array(expected_frontier),
+            )
+    assert actual_state.n_emitted == expected_state.n_emitted
+    assert actual_state._journal_end == expected_state._journal_end
+    assert actual_state._journal_length == expected_state._journal_length

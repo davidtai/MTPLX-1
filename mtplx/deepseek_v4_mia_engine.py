@@ -41,6 +41,7 @@ MIA_HEAD_DIM = 512
 MIA_ROPE_DIM = 64
 MIA_HIDDEN = 4096
 MIA_HC = 4
+_MIA_TARGET_COMPRESS_RATIOS = (0, 0) + (4, 128) * 20 + (4,)
 MIA_DRAFT_SHARD_BYTES = 3_157_508_012
 MIA_DFLASH_COMMIT = "54644e991039110f30140006c892c57734b9311e"
 MIA_TARGET_REVISION = "22f28d32b9b29b4352eaa380ff8c2c170b2847ab"
@@ -50,6 +51,18 @@ MIA_SOURCE_EXL3_SHA256 = "1e35cbbc33a977606a950928fba4c6660c7df0134bfab9472dd6d8
 MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256 = (
     "158d8b220411e42a910b29a47d8af0f045b4eb1feec745cfa39b9997db72efa2"
 )
+
+
+def _require_mia_target_ratio_order(ratios: tuple[int, ...]) -> tuple[int, ...]:
+    """Seal the artifact's exact per-layer compressor route at construction."""
+
+    observed = tuple(int(ratio) for ratio in ratios)
+    if observed != _MIA_TARGET_COMPRESS_RATIOS:
+        raise ValueError(
+            "installed Mia target compress-ratio order changed: "
+            f"{observed!r} != {_MIA_TARGET_COMPRESS_RATIOS!r}"
+        )
+    return observed
 
 _TARGET_SMALL_FILE_PINS = {
     "config.json": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
@@ -588,6 +601,242 @@ class MiaPrewarmSignature:
     phase: str
 
 
+@dataclass(frozen=True, slots=True)
+class MiaM6RatioSlice:
+    """One physical-M6 index schedule shared by every layer of one ratio."""
+
+    ratio: int
+    start_offset: int
+    prior_rows: int
+    first_window: int
+    emitted_rows: int
+    ape_slots: Any
+    journal_slots: Any
+    compressed_blocks: Any
+    compressed_offsets: Any
+    causal_lengths: Any
+    batch_slots: Any
+
+
+@dataclass(frozen=True, slots=True)
+class MiaM6Cycle:
+    """Request-owned physical-M6 schedule with shared ratio slices."""
+
+    start_offset: int
+    stop_offset: int
+    ratio4: MiaM6RatioSlice
+    ratio128: MiaM6RatioSlice
+    by_layer: tuple[MiaM6RatioSlice | None, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MiaM6RatioAcceptance:
+    """One ratio's shared direct-commit frontier after an M6 verdict."""
+
+    stop_offset: int
+    compressed_rows: int
+    journal_length: int
+    current_start: int
+    current_rows: int
+    completed_rows: int
+    previous_start: int
+
+
+@dataclass(frozen=True, slots=True)
+class MiaM6Acceptance:
+    """Request-owned direct-commit descriptor shared across target layers."""
+
+    accepted_rows: int
+    stop_offset: int
+    window_start: int
+    ratio4: MiaM6RatioAcceptance
+    ratio128: MiaM6RatioAcceptance
+
+
+@dataclass(frozen=True, slots=True)
+class MiaM6RatioTables:
+    """Construction-evaluated tables for one exact Mia compressor ratio."""
+
+    ratio: int
+    rollback_rows: int
+    compressed_block_size: int
+    ape_slots: Any
+    journal_slots: Any
+    compressed_blocks: Any
+    compressed_offsets: Any
+    causal_lengths: Any
+    batch_slots: Any
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        ratio: int,
+        rollback_rows: int,
+        capacity_tokens: int,
+        compressed_capacity: int,
+        compressed_block_size: int,
+        block_table: Any,
+    ) -> "MiaM6RatioTables":
+        import mlx.core as mx
+
+        width = MIA_DSPARK_BLOCK + 1
+        ratio = int(ratio)
+        rollback_rows = int(rollback_rows)
+        compressed_capacity = int(compressed_capacity)
+        compressed_block_size = int(compressed_block_size)
+        ape_slots = mx.arange(ratio + width - 1, dtype=mx.int32) % ratio
+        journal_slots = (
+            mx.arange(rollback_rows + width - 1, dtype=mx.int32)
+            % rollback_rows
+        )
+        logical_rows = mx.arange(compressed_capacity, dtype=mx.int32)
+        logical_blocks = logical_rows // compressed_block_size
+        compressed_offsets = (
+            logical_rows - logical_blocks * compressed_block_size
+        )
+        compressed_blocks = block_table[logical_blocks]
+        positions = mx.arange(int(capacity_tokens), dtype=mx.int32)
+        causal_lengths = (positions + 1) // ratio
+        batch_slots = mx.zeros((width,), dtype=mx.int32)
+        mx.eval(
+            ape_slots,
+            journal_slots,
+            compressed_blocks,
+            compressed_offsets,
+            causal_lengths,
+            batch_slots,
+        )
+        return cls(
+            ratio=ratio,
+            rollback_rows=rollback_rows,
+            compressed_block_size=compressed_block_size,
+            ape_slots=ape_slots,
+            journal_slots=journal_slots,
+            compressed_blocks=compressed_blocks,
+            compressed_offsets=compressed_offsets,
+            causal_lengths=causal_lengths,
+            batch_slots=batch_slots,
+        )
+
+    def slice(self, start_offset: int) -> MiaM6RatioSlice:
+        width = MIA_DSPARK_BLOCK + 1
+        start_offset = int(start_offset)
+        prior_rows = start_offset % self.ratio
+        first_window = start_offset // self.ratio
+        emitted_rows = (prior_rows + width) // self.ratio
+        ape_start = prior_rows
+        journal_start = start_offset % self.rollback_rows
+        return MiaM6RatioSlice(
+            ratio=self.ratio,
+            start_offset=start_offset,
+            prior_rows=prior_rows,
+            first_window=first_window,
+            emitted_rows=emitted_rows,
+            ape_slots=self.ape_slots[ape_start : ape_start + width],
+            journal_slots=self.journal_slots[
+                journal_start : journal_start + width
+            ],
+            compressed_blocks=self.compressed_blocks[
+                first_window : first_window + emitted_rows
+            ],
+            compressed_offsets=self.compressed_offsets[
+                first_window : first_window + emitted_rows
+            ],
+            causal_lengths=self.causal_lengths[
+                start_offset : start_offset + width
+            ],
+            batch_slots=self.batch_slots,
+        )
+
+
+class MiaM6CacheSchedule:
+    """One active request's physical-M6 schedule owner."""
+
+    def __init__(
+        self,
+        *,
+        authoritative_cache: Any,
+        ratio4: MiaM6RatioTables,
+        ratio128: MiaM6RatioTables,
+    ) -> None:
+        self._authoritative_cache = authoritative_cache
+        self._ratio4 = ratio4
+        self._ratio128 = ratio128
+        self.current_cycle: MiaM6Cycle | None = None
+
+    def begin(self) -> MiaM6Cycle:
+        # Request admission reserves one M6-minus-one headroom block beyond the
+        # 384K logical limit, so the authoritative first cache always owns a
+        # complete six-row slice. The sealed target advances all 43 caches in
+        # lockstep; repeating either proof here would put validation in the hot path.
+        start_offset = int(self._authoritative_cache.offset)
+        ratio4 = self._ratio4.slice(start_offset)
+        ratio128 = self._ratio128.slice(start_offset)
+        by_ratio = {4: ratio4, 128: ratio128}
+        cycle = MiaM6Cycle(
+            start_offset=int(start_offset),
+            stop_offset=int(start_offset) + MIA_DSPARK_BLOCK + 1,
+            ratio4=ratio4,
+            ratio128=ratio128,
+            by_layer=tuple(
+                None if ratio == 0 else by_ratio[ratio]
+                for ratio in _MIA_TARGET_COMPRESS_RATIOS
+            ),
+        )
+        self.current_cycle = cycle
+        return cycle
+
+    def reset(self) -> None:
+        self.current_cycle = None
+
+    @staticmethod
+    def _ratio_acceptance(
+        schedule: MiaM6RatioSlice,
+        *,
+        accepted_rows: int,
+        rollback_rows: int,
+    ) -> MiaM6RatioAcceptance:
+        total = schedule.prior_rows + int(accepted_rows)
+        completed = total // schedule.ratio
+        current_start = completed * schedule.ratio
+        stop_offset = schedule.start_offset + int(accepted_rows)
+        return MiaM6RatioAcceptance(
+            stop_offset=stop_offset,
+            compressed_rows=schedule.first_window + completed,
+            journal_length=min(int(rollback_rows), stop_offset),
+            current_start=current_start,
+            current_rows=total - current_start,
+            completed_rows=completed,
+            previous_start=(completed - 1) * schedule.ratio,
+        )
+
+    def acceptance(
+        self,
+        accepted_rows: int,
+        *,
+        window_keep: int,
+    ) -> MiaM6Acceptance:
+        """Build the two shared ratio descriptors for one qualified verdict."""
+        cycle = self.current_cycle
+        stop_offset = cycle.start_offset + int(accepted_rows)
+        return MiaM6Acceptance(
+            accepted_rows=int(accepted_rows),
+            stop_offset=stop_offset,
+            window_start=max(0, stop_offset - int(window_keep)),
+            ratio4=self._ratio_acceptance(
+                cycle.ratio4,
+                accepted_rows=accepted_rows,
+                rollback_rows=self._ratio4.rollback_rows,
+            ),
+            ratio128=self._ratio_acceptance(
+                cycle.ratio128,
+                accepted_rows=accepted_rows,
+                rollback_rows=self._ratio128.rollback_rows,
+            ),
+        )
+
+
 def _release_prewarm_leases(
     plan: "MiaDeepseekV4EnginePlan",
     model: Any,
@@ -743,6 +992,56 @@ class MiaTargetCacheArena:
                 prefill_frontier_lanes.append(cache.index_comp)
         self._prefill_settlement_roots = tuple(prefill_settlement_roots)
         self._prefill_frontier_lanes = tuple(prefill_frontier_lanes)
+        ratio4_cache = next(
+            cache
+            for layer, cache in zip(layers, self._caches, strict=True)
+            if int(layer.attn.compress_ratio) == 4
+        )
+        ratio128_cache = next(
+            cache
+            for layer, cache in zip(layers, self._caches, strict=True)
+            if int(layer.attn.compress_ratio) == 128
+        )
+        self._m6_schedule = MiaM6CacheSchedule(
+            authoritative_cache=self._caches[0],
+            ratio4=MiaM6RatioTables.allocate(
+                ratio=4,
+                rollback_rows=int(ratio4_cache.comp.rollback_rows),
+                capacity_tokens=int(capacity_tokens),
+                compressed_capacity=int(ratio4_cache.compressed.capacity),
+                compressed_block_size=int(ratio4_cache.compressed.block_size),
+                block_table=ratio4_cache.compressed.block_table,
+            ),
+            ratio128=MiaM6RatioTables.allocate(
+                ratio=128,
+                rollback_rows=int(ratio128_cache.comp.rollback_rows),
+                capacity_tokens=int(capacity_tokens),
+                compressed_capacity=int(ratio128_cache.compressed.capacity),
+                compressed_block_size=int(ratio128_cache.compressed.block_size),
+                block_table=ratio128_cache.compressed.block_table,
+            ),
+        )
+        for layer, cache in zip(layers, self._caches, strict=True):
+            ratio = int(layer.attn.compress_ratio)
+            cache._mia_m6_schedule = self._m6_schedule
+            if ratio == 4:
+                cache.comp._mia_m6_tables = self._m6_schedule._ratio4
+                cache.index_comp._mia_m6_tables = self._m6_schedule._ratio4
+            elif ratio == 128:
+                cache.comp._mia_m6_tables = self._m6_schedule._ratio128
+        commit_routes = {
+            0: ("_commit_m6_ratio0", 0),
+            4: ("_commit_m6_ratio4", 1),
+            128: ("_commit_m6_ratio128", 2),
+        }
+        self._m6_committers = tuple(
+            (getattr(cache, commit_routes[ratio][0]), commit_routes[ratio][1])
+            for layer, cache in zip(layers, self._caches, strict=True)
+            for ratio in (int(layer.attn.compress_ratio),)
+        )
+        self._m6_window_keep = int(self._caches[0].window_size) + int(
+            self._caches[0].rollback_capacity
+        )
         self._eval_prefill_roots = mx.eval
         self._schedule_verify_roots = mx.async_eval
         mx.eval(*self._prefill_settlement_roots)
@@ -756,7 +1055,26 @@ class MiaTargetCacheArena:
     def leased(self) -> bool:
         return self._leased
 
+    @property
+    def current_m6_cycle(self) -> MiaM6Cycle | None:
+        return self._m6_schedule.current_cycle
+
+    def begin_verify(self) -> MiaM6Cycle:
+        return self._m6_schedule.begin()
+
+    def commit_verify(self, accepted_rows: int) -> MiaM6Acceptance:
+        acceptance = self._m6_schedule.acceptance(
+            accepted_rows,
+            window_keep=self._m6_window_keep,
+        )
+        descriptors = (acceptance, acceptance.ratio4, acceptance.ratio128)
+        for commit, descriptor_index in self._m6_committers:
+            commit(acceptance, descriptors[descriptor_index])
+        self._m6_schedule.reset()
+        return acceptance
+
     def _reset(self) -> None:
+        self._m6_schedule.reset()
         for cache in self._caches:
             cache.state = None
 
@@ -794,10 +1112,19 @@ class MiaTargetCacheArena:
             )
             if value is not None
         )
+        pending_frontiers = tuple(
+            value
+            for lane in self._prefill_frontier_lanes
+            for value in (
+                lane._pending_m6.combined_kv,
+                lane._pending_m6.combined_score,
+            )
+        )
         self._schedule_verify_roots(
             *outputs,
             *self._prefill_settlement_roots,
             *live_frontiers,
+            *pending_frontiers,
         )
 
     def acquire(self, layers: tuple[Any, ...]) -> list[Any]:
@@ -860,6 +1187,20 @@ class MiaDeepseekV4EnginePlan:
     def schedule_target_verify_chunk(self, *outputs: Any) -> None:
         self.target_cache_arena.schedule_verify_chunk(*outputs)
 
+    def begin_target_verify(self, cache: list[Any]) -> MiaM6Cycle:
+        del cache
+        return self.target_cache_arena.begin_verify()
+
+    def commit_target_verify(
+        self,
+        cache: list[Any],
+        target_len: int,
+    ) -> MiaM6Acceptance:
+        del cache
+        cycle = self.target_cache_arena.current_m6_cycle
+        accepted_rows = int(target_len) - int(cycle.start_offset)
+        return self.target_cache_arena.commit_verify(accepted_rows)
+
     @contextmanager
     def target_cache_lifecycle(self):
         """Own and close one target-only request's persistent cache lease."""
@@ -920,9 +1261,9 @@ class MiaDeepseekV4EnginePlan:
                 )
             self.settle_target_prefill_chunk(prefill_logits, *target_taps)
 
-            # SparkInfer changes the repeated post-pre projection at M=384.  Warm
-            # that installed component directly so startup covers the large-M mHC
-            # signature without a second full target-model pass.
+            # SparkInfer supplies the BF16 projection only for the FFN
+            # connection. Warm that installed large-M component directly so
+            # startup covers its signature without a second target-model pass.
             mhc_rows = 384
             first_layer = model.model.layers[0]
             prefill_m6_rows = 6
@@ -935,15 +1276,15 @@ class MiaDeepseekV4EnginePlan:
                 )
             mx.eval(prefill_m6)
             mhc_residual, mhc_post, mhc_comb, mhc_y = (
-                model.model._mia_mhc.post_pre(
+                model.model._mia_mhc.post_pre_ffn(
                     mx.zeros((mhc_rows, MIA_HIDDEN), dtype=mx.bfloat16),
                     mx.zeros(
                         (mhc_rows, MIA_HC, MIA_HIDDEN), dtype=mx.bfloat16
                     ),
                     mx.zeros((mhc_rows, MIA_HC), dtype=mx.float32),
                     mx.zeros((mhc_rows, MIA_HC, MIA_HC), dtype=mx.float32),
-                    first_layer.attn_hc,
-                    first_layer.attn_norm,
+                    first_layer.ffn_hc,
+                    first_layer.ffn_norm,
                 )
             )
             mx.eval(mhc_residual, mhc_post, mhc_comb, mhc_y)
@@ -1050,6 +1391,7 @@ class MiaDeepseekV4EnginePlan:
             verify_ids = mx.concatenate(
                 [primary[:, None], proposal.future_tokens], axis=1
             )
+            self.begin_target_verify(target_cache)
             with attention_phase("decode_verify"):
                 verify_logits, verify_taps = model.mia_dflash_forward(
                     verify_ids,
@@ -1179,13 +1521,14 @@ def _mia_engine_identity(
             str(max_batch_tokens),
             "stock432",
             "mia132",
-            "k5-k64",
+            "k5-k64-packed-gate-up-native-mxfp4",
             "bounded-one-shard-raw-canonical-sha256-same-fd-loader",
-            "mhc-post-pre-m384-bm64-bf16mma",
+            "mhc-role-attn-fp32-ffn-bf16-m384-bm64",
             "target-physical-m6-piecewise-compile-eager-attention",
+            "draft-physical-k5-fullgraph-compile-live-cache-pages",
             "wo-tp1-b12x-inv-rope-mxfp8-bm8-m16q-bm64",
             "long-prefill-chunk1024",
-            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-bn256-simd-h128-u4-stage16b-96x8",
+            "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-5stage-staged-fc1-clamp10-bf16tail-u4-stage16b-96x8",
             MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256,
             "compressor-absolute-state-rings",
             "fixed-target-window-m8224",
@@ -1222,7 +1565,9 @@ def build_mia_engine_plan(
     args = model.args
     layers = tuple(model.layers)
     stages = tuple(getattr(model.dspark, "stages", ()))
-    ratios = tuple(int(layer.attn.compress_ratio) for layer in layers)
+    ratios = _require_mia_target_ratio_order(
+        tuple(int(layer.attn.compress_ratio) for layer in layers)
+    )
     from mtplx.deepseek_v4_paged_indexer import MiaIndexerWorkspace
     from mtplx.kernels.deepseek_v4_nvfp4_mla import mia_mla_workspace
     import mlx.core as mx
@@ -1277,12 +1622,13 @@ def build_mia_engine_plan(
         EXL3_M6_STAGE_VECTORS_PER_K_TILE,
         EXL3SwitchGLU,
         _InstalledM6QuadQMVPlan,
-        _m6_quad_qmv_kernel,
+        _m6_clamp10_activation_down_kernel,
+        _m6_direct_final_tail_kernel,
+        _m6_down_inner_kernel,
+        _m6_dual_fc1_input_kernel,
+        _m6_dual_fc1_inner_kernel,
     )
-    from mtplx.models.deepseek_v4 import (
-        _stock_moe_tail_combine,
-        mia_tp1_wo_projection_receipt,
-    )
+    from mtplx.models.deepseek_v4 import mia_tp1_wo_projection_receipt
 
     if EXL3_M6_QUAD_DESCRIPTOR_SHA256 != MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256:
         raise ValueError("the Mia quad MCG descriptor seal changed")
@@ -1330,6 +1676,30 @@ def build_mia_engine_plan(
         != target_physical_capacity_tokens
     ):
         raise ValueError("the Mia physical M6 RoPE capacity changed")
+    draft_fullgraph_route = model.dspark.install_mia_fullgraph_runtime(
+        embed_tokens=model.model.embed_tokens,
+        lm_head=model.lm_head,
+    )
+    from mtplx.deepseek_v4_mia_draft_graph import (
+        MiaPhysicalK5FullGraphDraftRoute,
+    )
+
+    draft_propose_impl = getattr(model.dspark, "_propose_impl", None)
+    if (
+        getattr(model.dspark, "_mia_fullgraph_route", None)
+        is not draft_fullgraph_route
+        or not isinstance(
+            draft_fullgraph_route,
+            MiaPhysicalK5FullGraphDraftRoute,
+        )
+        or int(getattr(draft_fullgraph_route, "physical_width", 0))
+        != MIA_DSPARK_BLOCK
+        or not callable(getattr(draft_fullgraph_route, "_compiled", None))
+        or getattr(draft_propose_impl, "__self__", None) is not model.dspark
+        or getattr(draft_propose_impl, "__func__", None)
+        is not type(model.dspark)._mia_fullgraph_propose_k5
+    ):
+        raise ValueError("the Mia physical-K5 full draft graph was not installed")
     stacked_projection_receipt = getattr(
         model,
         "_mia_stacked_projection_receipt",
@@ -1338,6 +1708,7 @@ def build_mia_engine_plan(
     if stacked_projection_receipt != {
         "target_attention": 43,
         "draft_attention": 3,
+        "shared_expert": 46,
         "main_compressor": 41,
         "indexer_compressor": 21,
     }:
@@ -1426,17 +1797,21 @@ def build_mia_engine_plan(
             expected_sparse,
             expected_prefill,
         ) = _MIA_ATTENTION_ROUTE_CONTRACTS[ratio]
-        direct_qmv = getattr(layer.ffn, "_mia_exl3_direct_qmv", None)
+        m6_fused = getattr(layer.ffn, "_mia_exl3_m6_fused", None)
         trellis_fused = getattr(layer.ffn, "_mia_exl3_trellis_fused", None)
-        tail_combine = getattr(layer.ffn, "_mia_exl3_tail_combine", None)
         quad_plan = getattr(layer.ffn.switch_mlp, "_m6_quad_qmv_plan", None)
+        shared_projection = getattr(
+            layer.ffn.shared_experts,
+            "_mia_stacked_projection",
+            None,
+        )
         installed = (
             bool(getattr(layer.ffn.switch_mlp, "_trellis_installed", False)),
             _callable_name(getattr(layer.ffn, "_forward_impl", None)),
-            _callable_name(direct_qmv),
-            getattr(direct_qmv, "__self__", None) is layer.ffn.switch_mlp,
-            getattr(direct_qmv, "__func__", None)
-            is EXL3SwitchGLU.direct_qmv_m6_quad,
+            _callable_name(m6_fused),
+            getattr(m6_fused, "__self__", None) is layer.ffn.switch_mlp,
+            getattr(m6_fused, "__func__", None)
+            is EXL3SwitchGLU.direct_m6_clamp10,
             isinstance(quad_plan, _InstalledM6QuadQMVPlan),
             getattr(quad_plan, "geometry", None)
             == (4096, 2048, 216, 6, 10.0, 256, 36),
@@ -1446,16 +1821,23 @@ def build_mia_engine_plan(
             == EXL3_M6_STAGE_VECTOR_BYTES,
             getattr(quad_plan, "stage_vectors_per_k_tile", None)
             == EXL3_M6_STAGE_VECTORS_PER_K_TILE,
-            getattr(quad_plan, "hidden_to_intermediate", None)
-            is _m6_quad_qmv_kernel(4096, 2048, False),
-            getattr(quad_plan, "intermediate_to_hidden", None)
-            is _m6_quad_qmv_kernel(2048, 4096, True),
+            getattr(quad_plan, "dual_fc1_input", None)
+            is _m6_dual_fc1_input_kernel(),
+            getattr(quad_plan, "dual_fc1_inner", None)
+            is _m6_dual_fc1_inner_kernel(),
+            getattr(quad_plan, "activation_down", None)
+            is _m6_clamp10_activation_down_kernel(),
+            getattr(quad_plan, "down_inner", None)
+            is _m6_down_inner_kernel(),
+            getattr(quad_plan, "direct_final_tail", None)
+            is _m6_direct_final_tail_kernel(),
             _callable_name(trellis_fused),
             getattr(trellis_fused, "__self__", None) is layer.ffn.switch_mlp,
             getattr(trellis_fused, "__func__", None) is EXL3SwitchGLU.fused,
-            _callable_name(tail_combine),
-            tail_combine is _stock_moe_tail_combine,
             _callable_name(getattr(layer.ffn, "_input_rows_impl", None)),
+            type(shared_projection).__name__,
+            getattr(layer.ffn.shared_experts, "_gate_up_impl", None)
+            is shared_projection,
             _callable_name(getattr(layer.ffn.gate, "_route_impl", None)),
             _callable_name(getattr(layer.attn, "_forward_impl", None)),
             _callable_name(getattr(layer.attn, "_cached_attention_impl", None)),
@@ -1505,7 +1887,10 @@ def build_mia_engine_plan(
         required = (
             True,
             "_mia_exl3_forward",
-            "direct_qmv_m6_quad",
+            "direct_m6_clamp10",
+            True,
+            True,
+            True,
             True,
             True,
             True,
@@ -1518,9 +1903,9 @@ def build_mia_engine_plan(
             "fused",
             True,
             True,
-            "_stock_moe_tail_combine",
-            True,
             "_required_input_rows",
+            "MiaStackedMXFP8Projection",
+            True,
             expected_gate,
             expected_forward,
             expected_cached_attention,
@@ -1626,6 +2011,11 @@ def build_mia_engine_plan(
 
     for stage_id, stage in enumerate(stages):
         switch = stage.ffn.switch_mlp
+        shared_projection = getattr(
+            stage.ffn.shared_experts,
+            "_mia_stacked_projection",
+            None,
+        )
         installed = (
             type(stage.attn).__name__,
             type(switch).__name__,
@@ -1633,12 +2023,18 @@ def build_mia_engine_plan(
             _callable_name(getattr(stage.attn, "_pack_draft_records", None)),
             _callable_name(getattr(stage.ffn, "_forward_impl", None)),
             _callable_name(getattr(stage.ffn, "_input_rows_impl", None)),
+            type(shared_projection).__name__,
+            getattr(stage.ffn.shared_experts, "_gate_up_impl", None)
+            is shared_projection,
             _callable_name(getattr(stage.ffn.gate, "_route_impl", None)),
             tuple(
                 str(getattr(getattr(switch, name, None), "mode", ""))
                 for name in ("gate_proj", "up_proj", "down_proj")
             ),
             _callable_name(getattr(stage.attn, "_dspark_k5_mla", None)),
+            _callable_name(
+                getattr(stage.attn, "_dspark_k5_mla_graph", None)
+            ),
             getattr(stage.attn, "_mia_mla_query_layout", None),
             getattr(stage.attn, "_mia_mla_output_layout", None),
             tuple(
@@ -1698,14 +2094,17 @@ def build_mia_engine_plan(
         )
         required = (
             "DeepseekV4DSparkAttention",
-            "SwitchGLU",
+            "MiaPhysicalM5K64SwitchGLU",
             "_run_k5",
             "NoneType",
             "_stock_forward",
             "_required_input_rows",
+            "MiaStackedMXFP8Projection",
+            True,
             "_mia_score_route",
             ("mxfp4", "mxfp4", "mxfp4"),
             "_run_dspark_k5_nvfp4_mla",
+            "_run_dspark_k5_nvfp4_mla_graph",
             "BMHD",
             "BMHD",
             (MIA_DSPARK_BLOCK,),
@@ -1757,8 +2156,9 @@ def build_mia_engine_plan(
     )
     mhc_route_contract = (
         "broadcast_fn_fp32",
-        "tiny_split32_fp32",
-        "prefill_post_pre_bf16_mma_bm64_fp32",
+        "attention_post_pre_fn_fp32",
+        "ffn_tiny_post_pre_fn_bf16_split32_fp32",
+        "ffn_prefill_post_pre_fn_bf16_mma_bm64_fp32",
         "compact_gram_finalize",
         "head_bf16_then_rmsnorm",
     )
@@ -1826,8 +2226,9 @@ def build_mia_engine_plan(
         != "_mia_target_forward"
         or _callable_name(getattr(model, "mia_dflash_forward", None))
         != "mia_dflash_forward"
-        or _callable_name(getattr(model.dspark, "_propose_impl", None))
-        != "_mia_propose_k5"
+        or getattr(draft_propose_impl, "__self__", None) is not model.dspark
+        or getattr(draft_propose_impl, "__func__", None)
+        is not type(model.dspark)._mia_fullgraph_propose_k5
         or _callable_name(getattr(model.dspark, "_make_cache_impl", None))
         != "_acquire_mia_cache"
         or _callable_name(getattr(model.dspark, "_commit_main_impl", None))
@@ -2039,7 +2440,7 @@ def build_mia_engine_plan(
     signatures = (
         MiaPrewarmSignature("target_prefill_m128_bm64", MIA_WINDOW, "prefill"),
         MiaPrewarmSignature("target_prefill_m6_bm8", 6, "prefill"),
-        MiaPrewarmSignature("mhc_post_pre_bf16_mma_bm64", 384, "prefill"),
+        MiaPrewarmSignature("mhc_ffn_post_pre_bf16_mma_bm64", 384, "prefill"),
         MiaPrewarmSignature("wo_a_quantized_output_m16", 16, "prefill"),
         MiaPrewarmSignature(
             "qkv_reduced_prefill_m1024", MIA_LONG_PREFILL_CHUNK, "prefill"
@@ -2047,14 +2448,17 @@ def build_mia_engine_plan(
         MiaPrewarmSignature("indexer_sparse_prefill", 1, "prefill"),
         MiaPrewarmSignature("indexer_sparse_decode", 1, "decode_verify"),
         MiaPrewarmSignature(
-            "target_verify_m6_quad_qmv_u4_stage16b", 6, "decode_verify"
+            "target_verify_m6_direct_5stage_staged_fc1_clamp10",
+            6,
+            "decode_verify",
         ),
         MiaPrewarmSignature("dspark_k5_bm8", MIA_DSPARK_BLOCK, "decode_verify"),
     )
     installed_routes = (
         "target_bounded_one_shard_raw_canonical_sha256_same_fd_loader",
-        "target_mhc_carried_post_pre_bf16_mma_bm64",
+        "target_mhc_role_bound_attn_fp32_ffn_bf16",
         "target_physical_m6_piecewise_compile_eager_attention",
+        "draft_physical_k5_fullgraph_compile_live_cache_pages",
         "compressor_stock432_mia132",
         "compressor_fixed_absolute_state_rings",
         "target_shared_base_compress_rope_graphs",
@@ -2068,10 +2472,10 @@ def build_mia_engine_plan(
         "mla_decode_direct_stock432",
         "mla_prefill_nax_mg16_tile32",
         "mla_token_major_query_output_no_transpose",
-        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_quad_qmv_u4_stage16b_96x8",
+        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_direct_5stage_staged_fc1_clamp10_bf16tail_u4_stage16b_96x8",
         "wo_tp1_b12x_inv_rope_mxfp8_bm8_m16q_bm64",
         "nonexpert_native_mxfp8",
-        "dspark_k5_direct_stock432_k64_native_mxfp4",
+        "dspark_k5_direct_stock432_k64_packed_gate_up_native_mxfp4",
         "target_fixed_swa_page_arena_m8224",
         "target_persistent_compressed_page_arena_384k_plus_m6_headroom",
         "dspark_persistent_fixed_ring_arena_128",

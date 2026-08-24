@@ -661,6 +661,56 @@ def _wo_b_decode_quantized_kernel(block_n: int):
     )
 
 
+def _exact_quantized_mxfp8_wo_b(weight, scales):
+    """Bind the exact standalone-quantized decode WO-B implementation."""
+
+    kernel = _wo_b_decode_quantized_kernel(_WO_B_DECODE_BN)
+    threads = (_WO_B_DECODE_BN // 16) * 32
+
+    def run(values, activation_scales):
+        rows = int(values.shape[0])
+        return kernel(
+            inputs=[values, activation_scales, weight, scales, rows],
+            template=[("T", mx.bfloat16)],
+            grid=(
+                threads,
+                _HIDDEN // _WO_B_DECODE_BN,
+                (rows + _WO_B_DECODE_BM - 1) // _WO_B_DECODE_BM,
+            ),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[(rows, _HIDDEN)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+
+    return run
+
+
+def _native_quantized_mxfp8_wo_b(weight, scales):
+    """Bind the target-only native MXFP8 decode WO-B implementation."""
+
+    def run(values, activation_scales):
+        reconstructed = mx.dequantize(
+            values.view(mx.uint32),
+            activation_scales,
+            biases=None,
+            group_size=_SCALE_GROUP,
+            bits=8,
+            mode="mxfp8",
+        ).astype(mx.bfloat16)
+        return mx.quantized_matmul(
+            reconstructed,
+            weight,
+            scales=scales,
+            biases=None,
+            transpose=True,
+            group_size=_SCALE_GROUP,
+            bits=8,
+            mode="mxfp8",
+        )
+
+    return run
+
+
 def _require_array(name: str, value, shape: tuple[int, ...], dtype) -> None:
     observed_shape = tuple(int(dim) for dim in getattr(value, "shape", ()))
     observed_dtype = getattr(value, "dtype", None)
@@ -679,6 +729,7 @@ class MiaTP1WOMXFP8Plan:
     wo_a_scales: object
     wo_b_weight: object
     wo_b_scales: object
+    owner_role: str
     max_prefill_rows: int
     inverse_rope_quant: object
     group_major_quant: object
@@ -686,7 +737,6 @@ class MiaTP1WOMXFP8Plan:
     wo_a_bm8: object
     wo_a_bm64: object
     wo_b_decode: object
-    wo_b_decode_quantized: object
     wo_b_bm64: object
 
     def __call__(self, o, cos, sin):
@@ -754,25 +804,7 @@ class MiaTP1WOMXFP8Plan:
                 ],
                 output_dtypes=[mx.uint8, mx.uint8],
             )
-            threads = (_WO_B_DECODE_BN // 16) * 32
-            (output,) = self.wo_b_decode_quantized(
-                inputs=[
-                    tmp_quantized,
-                    tmp_scales,
-                    self.wo_b_weight,
-                    self.wo_b_scales,
-                    rows,
-                ],
-                template=[("T", mx.bfloat16)],
-                grid=(
-                    threads,
-                    _HIDDEN // _WO_B_DECODE_BN,
-                    (rows + _WO_B_DECODE_BM - 1) // _WO_B_DECODE_BM,
-                ),
-                threadgroup=(threads, 1, 1),
-                output_shapes=[(rows, _HIDDEN)],
-                output_dtypes=[mx.bfloat16],
-            )
+            output = self.wo_b_decode(tmp_quantized, tmp_scales)
         elif rows != 16:
             tmp_quantized, tmp_scales = self.group_major_quant(
                 inputs=[tmp, rows],
@@ -810,6 +842,7 @@ def install_mia_tp1_wo_mxfp8(
     wo_a_scales,
     wo_b_weight,
     wo_b_scales,
+    owner_role: str,
     max_prefill_rows: int,
 ) -> MiaTP1WOMXFP8Plan:
     """Validate native MXFP8 storage once and bind the finite TP1 routes."""
@@ -841,19 +874,28 @@ def install_mia_tp1_wo_mxfp8(
     max_prefill_rows = int(max_prefill_rows)
     if max_prefill_rows <= 8:
         raise ValueError("Mia TP1 WO max_prefill_rows must exceed the M1-M8 decode band")
+    owner_role = str(owner_role)
+    if owner_role not in {"target", "draft"}:
+        raise ValueError(f"unsupported Mia TP1 WO owner role: {owner_role!r}")
+    group_major_quant = _group_major_quant_kernel()
+    decode_wo_b = (
+        _native_quantized_mxfp8_wo_b(wo_b_weight, wo_b_scales)
+        if owner_role == "target"
+        else _exact_quantized_mxfp8_wo_b(wo_b_weight, wo_b_scales)
+    )
     return MiaTP1WOMXFP8Plan(
         wo_a_weight=wo_a_weight,
         wo_a_scales=wo_a_scales,
         wo_b_weight=wo_b_weight,
         wo_b_scales=wo_b_scales,
+        owner_role=owner_role,
         max_prefill_rows=max_prefill_rows,
         inverse_rope_quant=_inverse_rope_quant_kernel(),
-        group_major_quant=_group_major_quant_kernel(),
+        group_major_quant=group_major_quant,
         wo_a_m16_quantized=_wo_a_m16_quantized_kernel(),
         wo_a_bm8=_mxfp8_mma_kernel("wo_a", 8),
         wo_a_bm64=_mxfp8_mma_kernel("wo_a", 64),
-        wo_b_decode=_wo_b_decode_fused_quant_kernel(_WO_B_DECODE_BN),
-        wo_b_decode_quantized=_wo_b_decode_quantized_kernel(_WO_B_DECODE_BN),
+        wo_b_decode=decode_wo_b,
         wo_b_bm64=_mxfp8_mma_kernel("wo_b", 64),
     )
 

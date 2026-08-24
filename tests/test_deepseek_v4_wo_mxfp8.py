@@ -8,6 +8,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from mtplx.attention_context import attention_phase
 from mtplx.kernels import deepseek_v4_wo_mxfp8 as wo
 import mtplx.deepseek_v4_mia_engine as mia_engine
 from mtplx.models import deepseek_v4 as deepseek_v4_model
@@ -120,6 +121,48 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         "_wo_b_decode_quantized_kernel",
         lambda block_n: kernel(f"wo_b_decode_quantized_bn{block_n}"),
     )
+    def exact_decode(weight, scales):
+        assert weight is weights["wo_b_weight"]
+        assert scales is weights["wo_b_scales"]
+
+        def run(values, activation_scales):
+            calls.append(
+                (
+                    "wo_b_exact_quantized_mxfp8",
+                    {"values": values, "activation_scales": activation_scales},
+                )
+            )
+            return _StaticArray((values.shape[0], 4096), mx.bfloat16)
+
+        return run
+
+    def native_decode(weight, scales):
+        assert weight is weights["wo_b_weight"]
+        assert scales is weights["wo_b_scales"]
+
+        def run(values, activation_scales):
+            calls.append(
+                (
+                    "wo_b_native_quantized_mxfp8",
+                    {"values": values, "activation_scales": activation_scales},
+                )
+            )
+            return _StaticArray((values.shape[0], 4096), mx.bfloat16)
+
+        return run
+
+    monkeypatch.setattr(
+        wo,
+        "_exact_quantized_mxfp8_wo_b",
+        exact_decode,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        wo,
+        "_native_quantized_mxfp8_wo_b",
+        native_decode,
+        raising=False,
+    )
     monkeypatch.setattr(
         wo,
         "_wo_a_m16_quantized_kernel",
@@ -127,14 +170,25 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         raising=False,
     )
     weights = _weights()
-    plan = wo.install_mia_tp1_wo_mxfp8(max_prefill_rows=8224, **weights)
+    plan = wo.install_mia_tp1_wo_mxfp8(
+        owner_role="target",
+        max_prefill_rows=8224,
+        **weights,
+    )
+    draft_plan = wo.install_mia_tp1_wo_mxfp8(
+        owner_role="draft",
+        max_prefill_rows=8224,
+        **weights,
+    )
 
     assert plan.wo_a_weight is weights["wo_a_weight"]
     assert plan.wo_a_scales is weights["wo_a_scales"]
     assert plan.wo_b_weight is weights["wo_b_weight"]
     assert plan.wo_b_scales is weights["wo_b_scales"]
     assert plan.max_prefill_rows == 8224
-    assert decode_block_ns == [64]
+    assert plan.owner_role == "target"
+    assert draft_plan.owner_role == "draft"
+    assert decode_block_ns == []
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("installed WO execution re-entered a kernel factory")
@@ -145,24 +199,31 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
     monkeypatch.setattr(wo, "_wo_b_decode_fused_quant_kernel", forbidden)
     monkeypatch.setattr(wo, "_wo_b_decode_quantized_kernel", forbidden)
     monkeypatch.setattr(
+        wo, "_exact_quantized_mxfp8_wo_b", forbidden, raising=False
+    )
+    monkeypatch.setattr(
+        wo, "_native_quantized_mxfp8_wo_b", forbidden, raising=False
+    )
+    monkeypatch.setattr(
         wo, "_wo_a_m16_quantized_kernel", forbidden, raising=False
     )
 
-    for rows in (1, 5, 6):
+    for rows in (6,):
         calls.clear()
         cos = _StaticArray((1, rows, 32), mx.float32)
         sin = _StaticArray((1, rows, 32), mx.float32)
-        output = plan(
-            _StaticArray((1, rows, 64, 512), mx.bfloat16),
-            cos,
-            sin,
-        )
+        with attention_phase("decode_verify"):
+            output = plan(
+                _StaticArray((1, rows, 64, 512), mx.bfloat16),
+                cos,
+                sin,
+            )
         assert output.shape == (1, rows, 4096)
         assert [name for name, _kwargs in calls] == [
             "inv_quant",
             "wo_a_bm8",
             "tmp_quant",
-            "wo_b_decode_quantized_bn64",
+            "wo_b_native_quantized_mxfp8",
         ]
         inv_call = calls[0][1]
         assert inv_call["inputs"][1] is cos
@@ -174,8 +235,27 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
         assert calls[1][1]["output_dtypes"] == [mx.bfloat16]
         assert calls[2][1]["output_shapes"] == [(rows, 8192), (rows, 256)]
         assert calls[2][1]["output_dtypes"] == [mx.uint8, mx.uint8]
-        assert calls[3][1]["grid"] == (128, 64, 1)
-        assert calls[3][1]["threadgroup"] == (128, 1, 1)
+        assert calls[3][1]["values"].shape == (rows, 8192)
+        assert calls[3][1]["activation_scales"].shape == (rows, 256)
+
+    for owner, rows, phase, decode_owner in (
+        (plan, 1, "prefill", "wo_b_native_quantized_mxfp8"),
+        (draft_plan, 5, "decode_verify", "wo_b_exact_quantized_mxfp8"),
+    ):
+        calls.clear()
+        with attention_phase(phase):
+            output = owner(
+                _StaticArray((1, rows, 64, 512), mx.bfloat16),
+                _StaticArray((1, rows, 32), mx.float32),
+                _StaticArray((1, rows, 32), mx.float32),
+            )
+        assert output.shape == (1, rows, 4096)
+        assert [name for name, _kwargs in calls] == [
+            "inv_quant",
+            "wo_a_bm8",
+            "tmp_quant",
+            decode_owner,
+        ]
 
     calls.clear()
     output = plan(
@@ -240,11 +320,15 @@ def test_tp1_wo_install_rejects_shape_or_storage_poison(
     weights[field] = _StaticArray(shape, dtype)
 
     with pytest.raises(ValueError, match="Mia TP1 WO"):
-        wo.install_mia_tp1_wo_mxfp8(max_prefill_rows=8224, **weights)
+        wo.install_mia_tp1_wo_mxfp8(
+            owner_role="target",
+            max_prefill_rows=8224,
+            **weights,
+        )
 
 
-def test_wo_sources_pin_fp32_accumulation_logical_row_guards_and_no_bf16_wide_scratch():
-    source = "\n".join(
+def test_wo_sources_pin_quantization_and_decode_route_contracts():
+    exact_source = "\n".join(
         (
             wo._MXFP8_MMA_SOURCE,
             wo._WO_A_M16_QUANTIZED_SOURCE,
@@ -253,13 +337,16 @@ def test_wo_sources_pin_fp32_accumulation_logical_row_guards_and_no_bf16_wide_sc
             inspect.getsource(wo.MiaTP1WOMXFP8Plan.__call__),
         )
     )
+    native_source = inspect.getsource(wo._native_quantized_mxfp8_wo_b)
 
-    assert "simdgroup_matrix<float, 8, 8>" in source
-    assert "row < uint(rows)" in source
-    assert "mia_ceil_ue8m0" in source
-    assert "rows <= 8" in source
-    assert "32768" not in source
-    assert "mx.quantized_matmul" not in source
+    assert "simdgroup_matrix<float, 8, 8>" in exact_source
+    assert "row < uint(rows)" in exact_source
+    assert "mia_ceil_ue8m0" in exact_source
+    assert "rows <= 8" in exact_source
+    assert "32768" not in exact_source
+    assert "mx.quantized_matmul" not in exact_source
+    assert "mx.dequantize" in native_source
+    assert "mx.quantized_matmul" in native_source
     assert wo._MXFP8_MMA_SOURCE.count(
         "simdgroup_multiply_accumulate(c_left, a, b_left, c_left);"
     ) == wo._MXFP8_MMA_SOURCE.count(
@@ -267,8 +354,8 @@ def test_wo_sources_pin_fp32_accumulation_logical_row_guards_and_no_bf16_wide_sc
     )
 
 
-def test_authentic_mia_m6_wo_b_routes_match_bit_exact():
-    """Both the wider and quantize-once owners preserve every BF16 output bit."""
+def test_authentic_mia_m6_wo_b_routes_bound_native_drift():
+    """The target native owner stays within the measured BF16 drift bound."""
 
     if not mx.metal.is_available():
         pytest.skip("Metal is unavailable")
@@ -323,7 +410,16 @@ def test_authentic_mia_m6_wo_b_routes_match_bit_exact():
         output_shapes=[(6, 4096)],
         output_dtypes=[mx.bfloat16],
     )
-    mx.eval(baseline, widened, quantize_once)
+    native = wo._native_quantized_mxfp8_wo_b(weight, scales)(
+        tmp_quantized,
+        tmp_scales,
+    )
+    mx.eval(
+        baseline,
+        widened,
+        quantize_once,
+        native,
+    )
 
     np.testing.assert_array_equal(
         np.array(widened.view(mx.uint16)),
@@ -333,6 +429,11 @@ def test_authentic_mia_m6_wo_b_routes_match_bit_exact():
         np.array(quantize_once.view(mx.uint16)),
         np.array(baseline.view(mx.uint16)),
     )
+    native_delta = np.abs(
+        np.array(native.astype(mx.float32))
+        - np.array(baseline.astype(mx.float32))
+    )
+    assert float(native_delta.max()) <= 0.03125
 
 
 def test_m16_wo_a_quantizes_fp32_accumulators_directly_in_group_major_order():
@@ -398,6 +499,9 @@ def test_exact_model_install_owns_46_distinct_plans_and_native_parameters(
     assert len(plans) == 46
     assert len({id(plan) for plan in plans}) == 46
     assert all(isinstance(plan, wo.MiaTP1WOMXFP8Plan) for plan in plans)
+    assert tuple(plan.owner_role for plan in plans) == ("target",) * 43 + (
+        "draft",
+    ) * 3
     assert all(
         plan.wo_a_weight is attention.wo_a.weight
         and plan.wo_a_scales is attention.wo_a.scales

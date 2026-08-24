@@ -122,7 +122,13 @@ def test_mia_dspark_head_preserves_source_bf16_then_norm_boundary() -> None:
         mx.zeros((5, 4, 4), dtype=mx.float32),
         embedded,
     )
-    owner._mia_mhc.post_pre = lambda value, residual, post, comb, *_args: (
+    owner._mia_mhc.post_pre_ffn = lambda value, residual, post, comb, *_args: (
+        residual,
+        post,
+        comb,
+        value,
+    )
+    owner._mia_mhc.post_pre_attn = lambda value, residual, post, comb, *_args: (
         residual,
         post,
         comb,

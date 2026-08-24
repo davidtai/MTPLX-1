@@ -60,6 +60,24 @@ def test_target_arena_settles_fixed_pages_journals_and_live_frontiers(
     )
 
     arena.settle_prefill_chunk(logits, tap)
+    pending_frontiers = []
+    for lane in arena._prefill_frontier_lanes:
+        lane._pending_m6 = SimpleNamespace(
+            combined_kv=mx.zeros(
+                (1, 6, lane.state_width),
+                dtype=mx.float32,
+            ),
+            combined_score=mx.zeros(
+                (1, 6, lane.state_width),
+                dtype=mx.float32,
+            ),
+        )
+        pending_frontiers.extend(
+            (
+                lane._pending_m6.combined_kv,
+                lane._pending_m6.combined_score,
+            )
+        )
     arena.schedule_verify_chunk(logits)
 
     assert len(calls) == 1
@@ -86,6 +104,163 @@ def test_target_arena_settles_fixed_pages_journals_and_live_frontiers(
         assert any(root is frontier for root in roots)
     assert scheduled[0][0] is logits
     assert all(any(root is expected for root in scheduled[0]) for expected in roots[2:])
+    assert all(
+        any(root is expected for root in scheduled[0])
+        for expected in pending_frontiers
+    )
+
+
+def test_m6_cache_schedule_reuses_exact_ratio_slices_across_43_layers(
+    monkeypatch,
+) -> None:
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        eval_calls = []
+        original_eval = mx.eval
+
+        def capture_eval(*arrays):
+            eval_calls.append(arrays)
+            return original_eval(*arrays)
+
+        monkeypatch.setattr(mx, "eval", capture_eval)
+        ratios = (0, 0) + (4, 128) * 20 + (4,)
+        layers = tuple(
+            SimpleNamespace(
+                attn=SimpleNamespace(
+                    window_size=128,
+                    compress_ratio=ratio,
+                    head_dim=512,
+                )
+            )
+            for ratio in ratios
+        )
+        arena = mia_engine.MiaTargetCacheArena(
+            layers,
+            capacity_tokens=512,
+            max_batch_tokens=6,
+        )
+        caches = arena.acquire(layers)
+        schedule = arena._m6_schedule
+        ratio4_tables = schedule._ratio4
+        ratio128_tables = schedule._ratio128
+
+        for tables in (ratio4_tables, ratio128_tables):
+            evaluated = (
+                tables.ape_slots,
+                tables.journal_slots,
+                tables.compressed_blocks,
+                tables.compressed_offsets,
+                tables.causal_lengths,
+                tables.batch_slots,
+            )
+            assert any(
+                len(call) == len(evaluated)
+                and all(
+                    observed is expected
+                    for observed, expected in zip(call, evaluated, strict=True)
+                )
+                for call in eval_calls
+            )
+            assert all(value.dtype == mx.int32 for value in evaluated)
+        assert all(cache._mia_m6_schedule is schedule for cache in caches)
+        assert all(
+            cache.comp._mia_m6_tables is ratio4_tables
+            and cache.index_comp._mia_m6_tables is ratio4_tables
+            for ratio, cache in zip(ratios, caches, strict=True)
+            if ratio == 4
+        )
+        assert all(
+            cache.comp._mia_m6_tables is ratio128_tables
+            for ratio, cache in zip(ratios, caches, strict=True)
+            if ratio == 128
+        )
+
+        caches[0].offset = 127
+        cycle = arena.begin_verify()
+
+        assert cycle is arena.current_m6_cycle
+        assert cycle.start_offset == 127
+        assert cycle.stop_offset == 133
+        assert cycle.ratio4.ape_slots.tolist() == [3, 0, 1, 2, 3, 0]
+        assert cycle.ratio4.journal_slots.tolist() == [55, 56, 57, 58, 59, 60]
+        assert cycle.ratio4.first_window == 31
+        assert cycle.ratio4.emitted_rows == 2
+        assert cycle.ratio4.compressed_blocks.tolist() == [0, 0]
+        assert cycle.ratio4.compressed_offsets.tolist() == [31, 32]
+        assert cycle.ratio4.causal_lengths.tolist() == [32, 32, 32, 32, 33, 33]
+        assert cycle.ratio128.ape_slots.tolist() == [127, 0, 1, 2, 3, 4]
+        assert cycle.ratio128.journal_slots.tolist() == [127, 128, 129, 130, 131, 132]
+        assert cycle.ratio128.first_window == 0
+        assert cycle.ratio128.emitted_rows == 1
+        assert cycle.ratio128.compressed_blocks.tolist() == [0]
+        assert cycle.ratio128.compressed_offsets.tolist() == [0]
+        assert cycle.ratio128.causal_lengths.tolist() == [1, 1, 1, 1, 1, 1]
+        assert all(
+            lane is None if ratio == 0 else lane is cycle.ratio4
+            for ratio, lane in zip(ratios, cycle.by_layer, strict=True)
+            if ratio != 128
+        )
+        assert all(
+            lane is cycle.ratio128
+            for ratio, lane in zip(ratios, cycle.by_layer, strict=True)
+            if ratio == 128
+        )
+
+        caches[0].offset = 70
+        ratio4_wrap = arena.begin_verify()
+        assert ratio4_wrap.ratio4.journal_slots.tolist() == [70, 71, 0, 1, 2, 3]
+
+        caches[0].offset = 190
+        ratio128_wrap = arena.begin_verify()
+        assert ratio128_wrap.ratio128.journal_slots.tolist() == [
+            190,
+            191,
+            0,
+            1,
+            2,
+            3,
+        ]
+
+        caches[0].offset = 255
+        page_crossing = arena.begin_verify()
+        assert page_crossing.ratio4.first_window == 63
+        assert page_crossing.ratio4.emitted_rows == 2
+        assert page_crossing.ratio4.compressed_blocks.tolist() == [0, 1]
+        assert page_crossing.ratio4.compressed_offsets.tolist() == [63, 0]
+
+        caches[0].offset = 506
+        maximum = arena.begin_verify()
+        assert maximum.start_offset == 506
+        assert maximum.stop_offset == 512
+        assert maximum.ratio4.causal_lengths.tolist() == [
+            126,
+            127,
+            127,
+            127,
+            127,
+            128,
+        ]
+        assert maximum.ratio128.causal_lengths.tolist() == [3, 3, 3, 3, 3, 4]
+        for lane in (maximum.ratio4, maximum.ratio128):
+            assert len(lane.ape_slots) == 6
+            assert len(lane.journal_slots) == 6
+            assert len(lane.causal_lengths) == 6
+            assert len(lane.batch_slots) == 6
+
+        arena.release(caches)
+
+        assert arena.current_m6_cycle is None
+    finally:
+        mx.set_default_device(previous_device)
+
+
+def test_mia_target_ratio_order_rejects_same_count_reordering() -> None:
+    reordered = list(mia_engine._MIA_TARGET_COMPRESS_RATIOS)
+    reordered[2], reordered[3] = reordered[3], reordered[2]
+
+    with pytest.raises(ValueError, match="compress-ratio order changed"):
+        mia_engine._require_mia_target_ratio_order(tuple(reordered))
 
 
 def _safetensors_bytes(header: dict, payload: bytes) -> bytes:
@@ -109,6 +284,7 @@ class _FakeTargetArena:
     def __init__(self, events):
         self.events = events
         self.cache = [object()]
+        self.current_m6_cycle = None
 
     def acquire(self, _layers):
         self.events.append("target.acquire")
@@ -120,6 +296,16 @@ class _FakeTargetArena:
 
     def settle_prefill_chunk(self, *_outputs):
         self.events.append("target.settle")
+
+    def begin_verify(self):
+        self.current_m6_cycle = SimpleNamespace(start_offset=127)
+        self.events.append("target.begin_verify")
+        return self.current_m6_cycle
+
+    def commit_verify(self, accepted_rows):
+        self.events.append(("target.commit_verify", accepted_rows))
+        self.current_m6_cycle = None
+        return accepted_rows
 
 
 def _plan(events):
@@ -152,17 +338,36 @@ def _patch_fake_mx(monkeypatch):
     monkeypatch.setattr(mx, "eval", lambda *_args, **_kwargs: None)
 
 
+def test_engine_plan_converts_absolute_target_length_to_m6_acceptance() -> None:
+    events = []
+    plan = _plan(events)
+    cache = plan.target_cache_arena.cache
+
+    cycle = plan.begin_target_verify(cache)
+    acceptance = plan.commit_target_verify(cache, target_len=131)
+
+    assert cycle.start_offset == 127
+    assert acceptance == 4
+    assert events == [
+        "target.begin_verify",
+        ("target.commit_verify", 4),
+    ]
+
+
 def test_engine_plan_seals_quad_qmv_owners_and_prewarm_signatures() -> None:
     build_source = inspect.getsource(mia_engine.build_mia_engine_plan)
     identity_source = inspect.getsource(mia_engine._mia_engine_identity)
     prewarm_source = inspect.getsource(MiaDeepseekV4EnginePlan.prewarm)
 
-    assert "_mia_exl3_direct_qmv" in build_source
-    assert "EXL3SwitchGLU.direct_qmv_m6_quad" in build_source
+    assert "_mia_exl3_m6_fused" in build_source
+    assert "EXL3SwitchGLU.direct_m6_clamp10" in build_source
     assert "_InstalledM6QuadQMVPlan" in build_source
     assert "EXL3_M6_QUAD_DESCRIPTOR_SHA256" in build_source
-    assert "_m6_quad_qmv_kernel(4096, 2048, False)" in build_source
-    assert "_m6_quad_qmv_kernel(2048, 4096, True)" in build_source
+    assert 'getattr(quad_plan, "dual_fc1_input", None)' in build_source
+    assert 'getattr(quad_plan, "dual_fc1_inner", None)' in build_source
+    assert 'getattr(quad_plan, "activation_down", None)' in build_source
+    assert 'getattr(quad_plan, "down_inner", None)' in build_source
+    assert 'getattr(quad_plan, "direct_final_tail", None)' in build_source
     assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in build_source
     assert "MIA_EXL3_M6_QUAD_DESCRIPTOR_SHA256" in identity_source
     assert "EXL3_M6_STAGE_VECTOR_BYTES" in build_source
@@ -171,16 +376,18 @@ def test_engine_plan_seals_quad_qmv_owners_and_prewarm_signatures() -> None:
     assert 'getattr(quad_plan, "stage_vectors_per_k_tile", None)' in build_source
     assert "_mia_exl3_trellis_fused" in build_source
     assert "EXL3SwitchGLU.fused" in build_source
-    assert "_mia_exl3_tail_combine" in build_source
-    assert "is _stock_moe_tail_combine" in build_source
+    assert "_mia_fullgraph_propose_k5" in build_source
+    assert '!= "_mia_propose_k5"' not in build_source
+    assert "_run_dspark_k5_nvfp4_mla_graph" in build_source
+    assert "_gate_up_impl" in build_source
     assert (
-        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_quad_qmv_"
-        "u4_stage16b_96x8"
+        "target_exl3_prefill_trellis_bm8_bm64_verify_m6_direct_5stage_"
+        "staged_fc1_clamp10_bf16tail_u4_stage16b_96x8"
         in build_source
     )
     assert (
-        "target-exl3-prefill-trellis-bm8-bm64-verify-m6-quad-mcg-qmv-"
-        "bn256-simd-h128-u4-stage16b-96x8"
+        "target-exl3-prefill-trellis-bm8-bm64-verify-m6-direct-5stage-"
+        "staged-fc1-clamp10-bf16tail-u4-stage16b-96x8"
         in identity_source
     )
     assert 'MiaPrewarmSignature("target_prefill_m6_bm8", 6, "prefill")' in (
@@ -191,7 +398,7 @@ def test_engine_plan_seals_quad_qmv_owners_and_prewarm_signatures() -> None:
         in build_source
     )
     assert (
-        '"target_verify_m6_quad_qmv_u4_stage16b", 6, "decode_verify"'
+        '"target_verify_m6_direct_5stage_staged_fc1_clamp10"'
         in build_source
     )
     assert 'with attention_phase("prefill"):' in prewarm_source
@@ -358,6 +565,16 @@ def test_exact_stacked_projection_installer_binds_all_named_owners(monkeypatch):
         def install_mia_stacked_projection(self, owner):
             self.owner = owner
 
+    class FakeSharedExpert:
+        def __init__(self, name):
+            self.gate_proj = f"{name}.gate_proj"
+            self.up_proj = f"{name}.up_proj"
+            self.owner = None
+
+        def install_mia_stacked_gate_up(self, owner):
+            self.owner = owner
+            self._gate_up_impl = owner
+
     class FakeAttention:
         def __init__(self, name, ratio):
             self.compress_ratio = ratio
@@ -376,11 +593,21 @@ def test_exact_stacked_projection_installer_binds_all_named_owners(monkeypatch):
 
     ratios = (0, 0) + (4,) * 21 + (128,) * 20
     layers = tuple(
-        SimpleNamespace(attn=FakeAttention(f"target.{index}", ratio))
+        SimpleNamespace(
+            attn=FakeAttention(f"target.{index}", ratio),
+            ffn=SimpleNamespace(
+                shared_experts=FakeSharedExpert(f"target.{index}.shared")
+            ),
+        )
         for index, ratio in enumerate(ratios)
     )
     stages = tuple(
-        SimpleNamespace(attn=FakeAttention(f"draft.{index}", 0))
+        SimpleNamespace(
+            attn=FakeAttention(f"draft.{index}", 0),
+            ffn=SimpleNamespace(
+                shared_experts=FakeSharedExpert(f"draft.{index}.shared")
+            ),
+        )
         for index in range(3)
     )
     model = SimpleNamespace(
@@ -393,12 +620,25 @@ def test_exact_stacked_projection_installer_binds_all_named_owners(monkeypatch):
     assert receipt == {
         "target_attention": 43,
         "draft_attention": 3,
+        "shared_expert": 46,
         "main_compressor": 41,
         "indexer_compressor": 21,
     }
-    assert len(validated) == len(built) == 108
+    assert len(validated) == len(built) == 154
     assert all(layer.attn.owner is not None for layer in layers)
     assert all(stage.attn.owner is not None for stage in stages)
+    assert all(layer.ffn.shared_experts.owner is not None for layer in layers)
+    assert all(stage.ffn.shared_experts.owner is not None for stage in stages)
+    assert all(
+        layer.ffn.shared_experts._gate_up_impl
+        is layer.ffn.shared_experts.owner
+        for layer in layers
+    )
+    assert all(
+        stage.ffn.shared_experts._gate_up_impl
+        is stage.ffn.shared_experts.owner
+        for stage in stages
+    )
     assert all(
         layer.attn.compressor.owner is not None
         for layer in layers
@@ -479,7 +719,7 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
             return SimpleNamespace(indices=fake, lengths=fake)
 
     class FakeMHC:
-        def post_pre(self, *_args, **_kwargs):
+        def post_pre_ffn(self, *_args, **_kwargs):
             return fake, fake, fake, fake
 
     class FakeDraftOwner:
@@ -491,6 +731,8 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
             first = SimpleNamespace(
                 attn_hc=fake,
                 attn_norm=fake,
+                ffn_hc=fake,
+                ffn_norm=fake,
                 ffn=lambda *_args: events.append("ffn.prefill_m6") or fake,
                 attn=SimpleNamespace(
                     _output_projection_impl=lambda *_args: (
@@ -565,6 +807,7 @@ def test_prewarm_releases_both_leases_when_proposal_fails(monkeypatch):
         "wo.m16",
         "qkv.m1024",
         "draft.acquire",
+        "target.begin_verify",
         "target.verify_m6_piecewise",
         "target.settle",
         "draft.release",

@@ -53,6 +53,9 @@ class MiaPhysicalM6PiecewiseTargetRoute:
         self._hidden_size = int(model.args.hidden_size)
         self._hc_mult = int(model.args.hc_mult)
         self._layers = layers
+        self._attentions = tuple(
+            layer.attn._mia_m6_forward_impl for layer in layers
+        )
         self._prefix = compile_fn(self._make_prefix(model, layers[0]))
         self._regions = tuple(
             compile_fn(
@@ -86,7 +89,7 @@ class MiaPhysicalM6PiecewiseTargetRoute:
         mhc = model._mia_mhc
         ffn_hc = layer.ffn_hc
         ffn_norm = layer.ffn_norm
-        ffn = layer.ffn
+        ffn = self._make_fixed_m6_ffn(layer.ffn)
         hidden_size = self._hidden_size
         hc_mult = self._hc_mult
         lead = (1, self.physical_width)
@@ -94,7 +97,7 @@ class MiaPhysicalM6PiecewiseTargetRoute:
         if next_layer is None:
 
             def final_region(value, residual, post, comb, input_ids):
-                residual, post, comb, value = mhc.post_pre(
+                residual, post, comb, value = mhc.post_pre_ffn(
                     value,
                     residual,
                     post,
@@ -102,10 +105,7 @@ class MiaPhysicalM6PiecewiseTargetRoute:
                     ffn_hc,
                     ffn_norm,
                 )
-                value = ffn(
-                    value.reshape(*lead, hidden_size),
-                    input_ids=input_ids,
-                )
+                value = ffn(value, input_ids)
                 reconstructed = mhc.post(value, residual, post, comb)
                 hidden = reconstructed.reshape(*lead, hc_mult, hidden_size)
                 tap = mx.mean(hidden, axis=-2)
@@ -119,7 +119,7 @@ class MiaPhysicalM6PiecewiseTargetRoute:
         if layer_id >= _MIA_TAP_START:
 
             def tail_region(value, residual, post, comb, input_ids):
-                residual, post, comb, value = mhc.post_pre(
+                residual, post, comb, value = mhc.post_pre_ffn(
                     value,
                     residual,
                     post,
@@ -127,16 +127,13 @@ class MiaPhysicalM6PiecewiseTargetRoute:
                     ffn_hc,
                     ffn_norm,
                 )
-                value = ffn(
-                    value.reshape(*lead, hidden_size),
-                    input_ids=input_ids,
-                )
+                value = ffn(value, input_ids)
                 reconstructed = mhc.post(value, residual, post, comb)
                 tap = mx.mean(
                     reconstructed.reshape(*lead, hc_mult, hidden_size),
                     axis=-2,
                 )
-                residual, post, comb, value = mhc.post_pre(
+                residual, post, comb, value = mhc.post_pre_attn(
                     value,
                     residual,
                     post,
@@ -149,7 +146,7 @@ class MiaPhysicalM6PiecewiseTargetRoute:
             return tail_region
 
         def middle_region(value, residual, post, comb, input_ids):
-            residual, post, comb, value = mhc.post_pre(
+            residual, post, comb, value = mhc.post_pre_ffn(
                 value,
                 residual,
                 post,
@@ -157,11 +154,8 @@ class MiaPhysicalM6PiecewiseTargetRoute:
                 ffn_hc,
                 ffn_norm,
             )
-            value = ffn(
-                value.reshape(*lead, hidden_size),
-                input_ids=input_ids,
-            )
-            return mhc.post_pre(
+            value = ffn(value, input_ids)
+            return mhc.post_pre_attn(
                 value,
                 residual,
                 post,
@@ -172,16 +166,39 @@ class MiaPhysicalM6PiecewiseTargetRoute:
 
         return middle_region
 
+    def _make_fixed_m6_ffn(self, ffn):
+        input_rows = ffn._input_rows_impl
+        gate = ffn.gate
+        shared_experts = ffn.shared_experts
+        routed_with_shared = ffn._mia_exl3_m6_fused
+        physical_width = self.physical_width
+        hidden_size = self._hidden_size
+        lead = (1, physical_width)
+
+        def fixed_m6_ffn(value, input_ids):
+            rows = value.reshape(physical_width, hidden_size)
+            ids = input_rows(input_ids)
+            shared = shared_experts(rows)
+            indices, weights = gate(rows, ids)
+            return routed_with_shared(
+                rows,
+                indices,
+                weights,
+                shared,
+            ).reshape(*lead, hidden_size)
+
+        return fixed_m6_ffn
+
     def __call__(self, input_ids, cache):
+        cycle = cache[0]._mia_m6_schedule.current_cycle
         residual, post, comb, value = self._prefix(input_ids)
         lead = (1, self.physical_width)
 
         for layer_id in range(_MIA_TAP_START):
-            layer = self._layers[layer_id]
-            value = layer.attn(
+            value = self._attentions[layer_id](
                 value.reshape(*lead, self._hidden_size),
-                mask=None,
                 cache=cache[layer_id],
+                schedule=cycle.by_layer[layer_id],
             )
             residual, post, comb, value = self._regions[layer_id](
                 value,
@@ -193,11 +210,10 @@ class MiaPhysicalM6PiecewiseTargetRoute:
 
         taps = []
         for layer_id in range(_MIA_TAP_START, _MIA_TARGET_LAYERS - 1):
-            layer = self._layers[layer_id]
-            value = layer.attn(
+            value = self._attentions[layer_id](
                 value.reshape(*lead, self._hidden_size),
-                mask=None,
                 cache=cache[layer_id],
+                schedule=cycle.by_layer[layer_id],
             )
             residual, post, comb, value, tap = self._regions[layer_id](
                 value,
@@ -209,10 +225,10 @@ class MiaPhysicalM6PiecewiseTargetRoute:
             taps.append(tap)
 
         final_layer_id = _MIA_TARGET_LAYERS - 1
-        value = self._layers[final_layer_id].attn(
+        value = self._attentions[final_layer_id](
             value.reshape(*lead, self._hidden_size),
-            mask=None,
             cache=cache[final_layer_id],
+            schedule=cycle.by_layer[final_layer_id],
         )
         hidden, final_tap = self._regions[final_layer_id](
             value,

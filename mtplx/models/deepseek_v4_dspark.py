@@ -17,6 +17,7 @@ from mtplx.deepseek_v4_nvfp4_kv import (
 )
 from mtplx.kernels.deepseek_v4_nvfp4_mla import (
     install_dspark_k5_nvfp4_mla,
+    install_dspark_k5_nvfp4_mla_graph,
 )
 from mtplx.models.deepseek_v4 import (
     DeepseekV4Attention,
@@ -308,6 +309,7 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             window_size=self.window_size,
             block_size=DSPARK_BLOCK_SIZE,
         )
+        self._dspark_k5_mla_graph = None
         self._pack_draft_records = install_stock432_record_packer(
             head_dim=self.head_dim,
             rope_dim=self.rope_head_dim,
@@ -336,6 +338,17 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         mx.eval(self._mia_draft_position_offsets)
         self._dspark_k5_mla = partial(
             self._dspark_k5_mla,
+            sinks=self._mia_attn_sink,
+            scale=self.softmax_scale,
+        )
+        self._dspark_k5_mla_graph = partial(
+            install_dspark_k5_nvfp4_mla_graph(
+                heads=self.n_heads,
+                head_dim=self.head_dim,
+                rope_dim=self.rope_head_dim,
+                window_size=self.window_size,
+                block_size=DSPARK_BLOCK_SIZE,
+            ),
             sinks=self._mia_attn_sink,
             scale=self.softmax_scale,
         )
@@ -505,6 +518,39 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         )
         return self._project_attention_output(output, cos, sin)
 
+    def _run_k5_graph(
+        self,
+        hidden: mx.array,
+        context_records: mx.array,
+        start_position: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> mx.array:
+        """The same installed K5 arithmetic with graph inputs made explicit."""
+
+        batch = int(hidden.shape[0])
+        block = DSPARK_BLOCK_SIZE
+        query_rank, draft_latent = self._mia_qkv_plan.project_learned(hidden)
+        query_pre = self.wq_b(query_rank).reshape(
+            batch,
+            block,
+            self.n_heads,
+            self.head_dim,
+        )
+        query, draft_records = self._mia_qkv_plan.proposal_records(
+            query_pre,
+            draft_latent,
+            cos,
+            sin,
+        )
+        output = self._dspark_k5_mla_graph(
+            query,
+            context_records,
+            draft_records,
+            start_position,
+        )
+        return self._project_attention_output(output, cos, sin)
+
 
 class DSparkMarkovHead(nn.Module):
     def __init__(self, vocab_size: int, rank: int) -> None:
@@ -616,6 +662,7 @@ class DeepseekV4DSparkOwner:
         self._propose_impl = self._stock_propose_k5
         self._make_cache_impl = self._new_cache
         self._commit_main_impl = self._stock_commit_main
+        self._mia_fullgraph_route = None
 
     def install_mia_mhc_runtime(self, *, max_tokens: int) -> None:
         from mtplx.kernels.deepseek_v4_mhc import MiaMHCPlan
@@ -648,6 +695,151 @@ class DeepseekV4DSparkOwner:
         self._make_cache_impl = self._acquire_mia_cache
         self._commit_main_impl = self._mia_commit_main
         self._propose_impl = self._mia_propose_k5
+
+    def install_mia_fullgraph_runtime(self, *, embed_tokens, lm_head):
+        """Bind Mia's fixed physical-K5 proposal as one compiled graph."""
+
+        from mtplx.deepseek_v4_mia_draft_graph import (
+            MiaPhysicalK5FullGraphDraftRoute,
+        )
+
+        if self._mia_fullgraph_route is not None:
+            raise ValueError("the Mia DSpark full graph is already installed")
+        stages = tuple(self.stages)
+        providers = tuple(stage.attn._mia_rope_provider for stage in stages)
+        if (
+            len(stages) != DSPARK_STAGE_COUNT
+            or getattr(self, "_mia_mhc", None) is None
+            or any(stage.attn._dspark_k5_mla_graph is None for stage in stages)
+            or providers[0] is None
+            or any(provider is not providers[0] for provider in providers[1:])
+        ):
+            raise ValueError("the Mia DSpark graph dependencies are incomplete")
+        route = MiaPhysicalK5FullGraphDraftRoute(
+            self._make_mia_fullgraph_proposal(embed_tokens, lm_head),
+        )
+        self._mia_fullgraph_route = route
+        self._propose_impl = self._mia_fullgraph_propose_k5
+        return route
+
+    def _make_mia_fullgraph_proposal(self, embed_tokens, lm_head):
+        stages = tuple(self.stages)
+        mhc = self._mia_mhc
+        hidden_size = int(self.args.hidden_size)
+        lead = (1, DSPARK_BLOCK_SIZE)
+        noise_tail = self._mia_noise_tail
+        position_offsets = stages[0].attn._mia_draft_position_offsets
+        inv_freq = stages[0].attn._mia_rope_provider.inv_freq
+
+        def proposal_graph(
+            primary_token_ids,
+            cache0_records,
+            cache1_records,
+            cache2_records,
+            start_position,
+        ):
+            input_ids = mx.concatenate(
+                [primary_token_ids[:, None], noise_tail],
+                axis=1,
+            )
+            positions = start_position[0] + position_offsets
+            angles = positions[:, None].astype(mx.float32) * inv_freq[None, :]
+            cos = mx.cos(angles)
+            sin = mx.sin(angles)
+            cache_records = (cache0_records, cache1_records, cache2_records)
+
+            first = stages[0]
+            residual, post, comb, value = mhc.pre_broadcast(
+                embed_tokens(input_ids),
+                first.attn_hc,
+                first.attn_norm,
+            )
+            value = first.attn._run_k5_graph(
+                value.reshape(*lead, hidden_size),
+                cache_records[0],
+                start_position,
+                cos,
+                sin,
+            )
+            residual, post, comb, value = mhc.post_pre_ffn(
+                value,
+                residual,
+                post,
+                comb,
+                first.ffn_hc,
+                first.ffn_norm,
+            )
+            value = first.ffn(
+                value.reshape(*lead, hidden_size),
+                input_ids=input_ids,
+            )
+
+            for stage, records in zip(stages[1:], cache_records[1:], strict=True):
+                residual, post, comb, value = mhc.post_pre_attn(
+                    value,
+                    residual,
+                    post,
+                    comb,
+                    stage.attn_hc,
+                    stage.attn_norm,
+                )
+                value = stage.attn._run_k5_graph(
+                    value.reshape(*lead, hidden_size),
+                    records,
+                    start_position,
+                    cos,
+                    sin,
+                )
+                residual, post, comb, value = mhc.post_pre_ffn(
+                    value,
+                    residual,
+                    post,
+                    comb,
+                    stage.ffn_hc,
+                    stage.ffn_norm,
+                )
+                value = stage.ffn(
+                    value.reshape(*lead, hidden_size),
+                    input_ids=input_ids,
+                )
+
+            hidden = mhc.post(value, residual, post, comb)
+            final = stages[-1]
+            neural_hidden = mhc.head(hidden, final.hc_head).reshape(
+                *lead,
+                hidden_size,
+            )
+            neural_logits = lm_head(final.norm(neural_hidden))
+            future_tokens = _run_greedy_future_tokens_k5(
+                neural_logits,
+                primary_token_ids,
+                final.markov_head,
+            )
+            return future_tokens, neural_logits
+
+        return proposal_graph
+
+    def _mia_fullgraph_propose_k5(
+        self,
+        primary_token_ids: mx.array,
+        embed_tokens: nn.Module,
+        lm_head: nn.Module,
+        caches: list[DeepseekV4DSparkCache],
+        *,
+        start_pos: int,
+    ) -> DSparkModelProposal:
+        del embed_tokens, lm_head
+        future_tokens, neural_logits = self._mia_fullgraph_route(
+            primary_token_ids,
+            caches[0].ring.records,
+            caches[1].ring.records,
+            caches[2].ring.records,
+            start_pos,
+        )
+        return DSparkModelProposal(
+            future_tokens=future_tokens,
+            neural_logits=neural_logits,
+        )
 
     def draft_input_ids(self, primary_token_ids: mx.array) -> mx.array:
         if primary_token_ids.ndim != 1:
@@ -816,7 +1008,7 @@ class DeepseekV4DSparkOwner:
             start_pos=start_pos,
             cache=caches[0],
         )
-        residual, post, comb, value = self._mia_mhc.post_pre(
+        residual, post, comb, value = self._mia_mhc.post_pre_ffn(
             value,
             residual,
             post,
@@ -829,7 +1021,7 @@ class DeepseekV4DSparkOwner:
             input_ids=input_ids,
         )
         for stage, cache in zip(self.stages[1:3], caches[1:3]):
-            residual, post, comb, value = self._mia_mhc.post_pre(
+            residual, post, comb, value = self._mia_mhc.post_pre_attn(
                 value,
                 residual,
                 post,
@@ -842,7 +1034,7 @@ class DeepseekV4DSparkOwner:
                 start_pos=start_pos,
                 cache=cache,
             )
-            residual, post, comb, value = self._mia_mhc.post_pre(
+            residual, post, comb, value = self._mia_mhc.post_pre_ffn(
                 value,
                 residual,
                 post,

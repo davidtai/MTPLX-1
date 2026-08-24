@@ -721,6 +721,796 @@ def _m6_quad_qmv_kernel(
     )
 
 
+def _m6_quad_inner_parts(size_k: int, size_n: int):
+    """Return the sealed MCG header and per-panel FMA used by M6 inner stages."""
+
+    if (size_k, size_n) not in ((4096, 2048), (2048, 4096)):
+        raise ValueError("Mia M6 inner stages require an exact FC1 or FC2 bank")
+    descriptors = ",".join(
+        str(value) for value in _mcg_quad_descriptor_plan().descriptors
+    )
+    header = f"""
+        using namespace metal;
+        constant constexpr uint SIZE_K = {size_k};
+        constant constexpr uint SIZE_N = {size_n};
+        constant constexpr uint NTILES_N = {size_n // 16};
+        constant constexpr uint KBLOCKS = {size_k // 128};
+        constant constexpr uint TOPK = 6;
+        constant constexpr uint HAD = 128;
+        constant constexpr uint TILE_WORDS = 48;
+        constant constexpr uint TILE_VECTORS = 6;
+        constant constexpr uint BLOCK_TILES = 8;
+        constant constexpr uint BLOCK_TILES_N = 16;
+        constant constexpr uint STAGE_VECTORS_PER_K_TILE = 96;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+        constant uint QUAD_DESCRIPTORS[64] = {{ {descriptors} }};
+
+        inline float hadamard_h128(
+            float value,
+            uint lane,
+            threadgroup float* exchange
+        ) {{
+            for (uint stride = 1u; stride < 32u; stride <<= 1u) {{
+                float peer = simd_shuffle_xor(value, ushort(stride));
+                value = (lane & stride) ? (peer - value) : (value + peer);
+            }}
+            for (uint stride = 32u; stride < HAD; stride <<= 1u) {{
+                exchange[lane] = value;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float peer = exchange[lane ^ stride];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                value = (lane & stride) ? (peer - value) : (value + peer);
+            }}
+            return value;
+        }}
+
+        inline uint merge_mcg_window(uint low, uint high, uint shift) {{
+            if (shift == 0u) {{
+                return high;
+            }}
+            return (high >> shift) | (low << (32u - shift));
+        }}
+
+        inline half4 decode_mcg_states(
+            uint state0,
+            uint state1,
+            uint state2,
+            uint state3
+        ) {{
+            uint product0 = state0 * 0xCBAC1FEDu;
+            uint product1 = state1 * 0xCBAC1FEDu;
+            uint product2 = state2 * 0xCBAC1FEDu;
+            uint product3 = state3 * 0xCBAC1FEDu;
+            uint half_pair_bits0 =
+                0x3B603B60u ^ (product0 & 0x8FFF8FFFu);
+            uint half_pair_bits1 =
+                0x3B603B60u ^ (product1 & 0x8FFF8FFFu);
+            uint half_pair_bits2 =
+                0x3B603B60u ^ (product2 & 0x8FFF8FFFu);
+            uint half_pair_bits3 =
+                0x3B603B60u ^ (product3 & 0x8FFF8FFFu);
+            half2 pair0 = as_type<half2>(half_pair_bits0);
+            half2 pair1 = as_type<half2>(half_pair_bits1);
+            half2 pair2 = as_type<half2>(half_pair_bits2);
+            half2 pair3 = as_type<half2>(half_pair_bits3);
+            return half4(
+                pair0.x + pair0.y,
+                pair1.x + pair1.y,
+                pair2.x + pair2.y,
+                pair3.x + pair3.y
+            );
+        }}
+
+        inline half4 decode_mcg_quad3(
+            threadgroup const ushort* packed,
+            uint descriptor
+        ) {{
+            threadgroup const uint* words =
+                reinterpret_cast<threadgroup const uint*>(packed);
+            uint index0 = uint(descriptor) & 0x1fu;
+            uint index1 = (uint(descriptor) >> 5u) & 0x1fu;
+            uint index2 = (uint(descriptor) >> 10u) & 0x1fu;
+            uint shift0 = (uint(descriptor) >> 15u) & 0x1fu;
+            uint shift1 = (uint(descriptor) >> 20u) & 0x1fu;
+            uint word0 = words[index0];
+            uint word1 = words[index1];
+            uint word2 = words[index2];
+            uint window0 = merge_mcg_window(word0, word1, shift0);
+            uint window1 = merge_mcg_window(word1, word2, shift1);
+            uint state0 = (window0 >> 3u) & 0xffffu;
+            uint state1 = window0 & 0xffffu;
+            uint state2 = (window1 >> 3u) & 0xffffu;
+            uint state3 = window1 & 0xffffu;
+            return decode_mcg_states(state0, state1, state2, state3);
+        }}
+
+        inline half4 decode_mcg_quad2(
+            threadgroup const ushort* packed,
+            uint descriptor
+        ) {{
+            threadgroup const uint* words =
+                reinterpret_cast<threadgroup const uint*>(packed);
+            uint index0 = uint(descriptor) & 0x1fu;
+            uint index1 = (uint(descriptor) >> 5u) & 0x1fu;
+            uint shift0 = (uint(descriptor) >> 15u) & 0x1fu;
+            uint shift1 = (uint(descriptor) >> 20u) & 0x1fu;
+            uint word0 = words[index0];
+            uint word1 = words[index1];
+            bool high0_is_word1 = (uint(descriptor) & (1u << 25u)) != 0u;
+            bool low1_is_word1 = (uint(descriptor) & (1u << 26u)) != 0u;
+            uint high0 = select(word0, word1, high0_is_word1);
+            uint low1 = select(word0, word1, low1_is_word1);
+            uint window0 = merge_mcg_window(word0, high0, shift0);
+            uint window1 = merge_mcg_window(low1, word1, shift1);
+            uint state0 = (window0 >> 3u) & 0xffffu;
+            uint state1 = window0 & 0xffffu;
+            uint state2 = (window1 >> 3u) & 0xffffu;
+            uint state3 = window1 & 0xffffu;
+            return decode_mcg_states(state0, state1, state2, state3);
+        }}
+    """
+
+    def fma_source(prefix: str, accumulator0: str, accumulator1: str) -> str:
+        blocks = []
+        for quad_row, decoder in enumerate(
+            ("decode_mcg_quad3", "decode_mcg_quad2") * 2
+        ):
+            blocks.append(
+                f"""
+                uint {prefix}_local_k{quad_row} =
+                    tile_k * 16u + {quad_row * 4}u;
+                uint {prefix}_descriptor{quad_row} =
+                    QUAD_DESCRIPTORS[{quad_row * 16}u + {prefix}_local_n];
+                half4 {prefix}_weights{quad_row}_0 = {decoder}(
+                    {prefix}_tile0, {prefix}_descriptor{quad_row}
+                );
+                half4 {prefix}_weights{quad_row}_1 = {decoder}(
+                    {prefix}_tile1, {prefix}_descriptor{quad_row}
+                );
+                float {prefix}_value{quad_row}_0 = float(
+                    x_had[{prefix}_local_k{quad_row}]
+                );
+                {accumulator0} += {prefix}_value{quad_row}_0
+                    * float({prefix}_weights{quad_row}_0.x);
+                {accumulator1} += {prefix}_value{quad_row}_0
+                    * float({prefix}_weights{quad_row}_1.x);
+                float {prefix}_value{quad_row}_1 = float(
+                    x_had[{prefix}_local_k{quad_row} + 1u]
+                );
+                {accumulator0} += {prefix}_value{quad_row}_1
+                    * float({prefix}_weights{quad_row}_0.y);
+                {accumulator1} += {prefix}_value{quad_row}_1
+                    * float({prefix}_weights{quad_row}_1.y);
+                float {prefix}_value{quad_row}_2 = float(
+                    x_had[{prefix}_local_k{quad_row} + 2u]
+                );
+                {accumulator0} += {prefix}_value{quad_row}_2
+                    * float({prefix}_weights{quad_row}_0.z);
+                {accumulator1} += {prefix}_value{quad_row}_2
+                    * float({prefix}_weights{quad_row}_1.z);
+                float {prefix}_value{quad_row}_3 = float(
+                    x_had[{prefix}_local_k{quad_row} + 3u]
+                );
+                {accumulator0} += {prefix}_value{quad_row}_3
+                    * float({prefix}_weights{quad_row}_0.w);
+                {accumulator1} += {prefix}_value{quad_row}_3
+                    * float({prefix}_weights{quad_row}_1.w);
+                """
+            )
+        return "".join(blocks)
+
+    return header, fma_source
+
+
+@lru_cache(maxsize=1)
+def _m6_dual_fc1_input_kernel():
+    """Build gate/up EXL3 input rotations once for each physical M6 route."""
+
+    header = r"""
+        using namespace metal;
+        constant constexpr uint HIDDEN = 4096u;
+        constant constexpr uint TOPK = 6u;
+        constant constexpr uint HAD = 128u;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+
+        inline float4 hadamard_h128_quad(float4 value, uint lane) {
+            float s0 = value.x + value.y;
+            float d0 = value.x - value.y;
+            float s1 = value.z + value.w;
+            float d1 = value.z - value.w;
+            float h0 = s0 + s1;
+            float h1 = d0 + d1;
+            float h2 = s0 - s1;
+            float h3 = d0 - d1;
+            for (uint step = 0u; step < 5u; ++step) {
+                uint stride = 1u << step;
+                float p0 = simd_shuffle_xor(h0, ushort(stride));
+                float p1 = simd_shuffle_xor(h1, ushort(stride));
+                float p2 = simd_shuffle_xor(h2, ushort(stride));
+                float p3 = simd_shuffle_xor(h3, ushort(stride));
+                if (lane & stride) {
+                    h0 = p0 - h0;
+                    h1 = p1 - h1;
+                    h2 = p2 - h2;
+                    h3 = p3 - h3;
+                } else {
+                    h0 = h0 + p0;
+                    h1 = h1 + p1;
+                    h2 = h2 + p2;
+                    h3 = h3 + p3;
+                }
+            }
+            return float4(h0, h1, h2, h3);
+        }
+    """
+    source = r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint k_block = threadgroup_position_in_grid.y;
+        uint task = threadgroup_position_in_grid.z;
+        uint row = task / TOPK;
+        uint expert = uint(expert_ids[task]);
+        uint k0 = k_block * HAD + lane * 4u;
+
+        half x0 = half(x[(size_t)row * HIDDEN + k0]);
+        half x1 = half(x[(size_t)row * HIDDEN + k0 + 1u]);
+        half x2 = half(x[(size_t)row * HIDDEN + k0 + 2u]);
+        half x3 = half(x[(size_t)row * HIDDEN + k0 + 3u]);
+        half gate_scaled0 = half(
+            x0 * gate_suh[(size_t)expert * HIDDEN + k0]
+        );
+        half gate_scaled1 = half(
+            x1 * gate_suh[(size_t)expert * HIDDEN + k0 + 1u]
+        );
+        half gate_scaled2 = half(
+            x2 * gate_suh[(size_t)expert * HIDDEN + k0 + 2u]
+        );
+        half gate_scaled3 = half(
+            x3 * gate_suh[(size_t)expert * HIDDEN + k0 + 3u]
+        );
+        float4 gate_transformed = hadamard_h128_quad(
+            float4(
+                float(gate_scaled0),
+                float(gate_scaled1),
+                float(gate_scaled2),
+                float(gate_scaled3)
+            ),
+            lane
+        );
+        gate_h[(size_t)task * HIDDEN + k0] = half(
+            gate_transformed.x * HAD_SCALE
+        );
+        gate_h[(size_t)task * HIDDEN + k0 + 1u] = half(
+            gate_transformed.y * HAD_SCALE
+        );
+        gate_h[(size_t)task * HIDDEN + k0 + 2u] = half(
+            gate_transformed.z * HAD_SCALE
+        );
+        gate_h[(size_t)task * HIDDEN + k0 + 3u] = half(
+            gate_transformed.w * HAD_SCALE
+        );
+
+        half up_scaled0 = half(
+            x0 * up_suh[(size_t)expert * HIDDEN + k0]
+        );
+        half up_scaled1 = half(
+            x1 * up_suh[(size_t)expert * HIDDEN + k0 + 1u]
+        );
+        half up_scaled2 = half(
+            x2 * up_suh[(size_t)expert * HIDDEN + k0 + 2u]
+        );
+        half up_scaled3 = half(
+            x3 * up_suh[(size_t)expert * HIDDEN + k0 + 3u]
+        );
+        float4 up_transformed = hadamard_h128_quad(
+            float4(
+                float(up_scaled0),
+                float(up_scaled1),
+                float(up_scaled2),
+                float(up_scaled3)
+            ),
+            lane
+        );
+        up_h[(size_t)task * HIDDEN + k0] = half(
+            up_transformed.x * HAD_SCALE
+        );
+        up_h[(size_t)task * HIDDEN + k0 + 1u] = half(
+            up_transformed.y * HAD_SCALE
+        );
+        up_h[(size_t)task * HIDDEN + k0 + 2u] = half(
+            up_transformed.z * HAD_SCALE
+        );
+        up_h[(size_t)task * HIDDEN + k0 + 3u] = half(
+            up_transformed.w * HAD_SCALE
+        );
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_exl3_m6_dual_fc1_input_h4096_v2",
+        input_names=["x", "gate_suh", "up_suh", "expert_ids"],
+        output_names=["gate_h", "up_h"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=1)
+def _m6_dual_fc1_inner_kernel():
+    """Build exact-M6 dual FC1 over pre-rotated FP16 route rows."""
+
+    header, build_fma = _m6_quad_inner_parts(4096, 2048)
+    gate_fma = build_fma("gate", "gate_accumulator0", "gate_accumulator1")
+    up_fma = build_fma("up", "up_accumulator0", "up_accumulator1")
+    source = f"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint n_block = threadgroup_position_in_grid.y;
+        uint task = threadgroup_position_in_grid.z;
+        uint expert = uint(expert_ids[task]);
+        uint n0 = n_block * 256u + lane;
+        uint n1 = n0 + HAD;
+
+        threadgroup half x_had[HAD];
+        threadgroup uint4 packed_tile_vectors[
+            BLOCK_TILES * STAGE_VECTORS_PER_K_TILE
+        ];
+        threadgroup ushort* packed_tiles =
+            reinterpret_cast<threadgroup ushort*>(packed_tile_vectors);
+        device const uint4* gate_trellis_vectors =
+            reinterpret_cast<const device uint4*>(gate_trellis);
+        device const uint4* up_trellis_vectors =
+            reinterpret_cast<const device uint4*>(up_trellis);
+        size_t expert_base =
+            (size_t)expert * (SIZE_K / 16u) * NTILES_N * TILE_VECTORS;
+        size_t n_block_offset =
+            (size_t)n_block * STAGE_VECTORS_PER_K_TILE;
+
+        float gate_accumulator0 = 0.0f;
+        float gate_accumulator1 = 0.0f;
+        float up_accumulator0 = 0.0f;
+        float up_accumulator1 = 0.0f;
+        for (uint k_block = 0; k_block < KBLOCKS; ++k_block) {{
+            uint k = k_block * HAD + lane;
+            x_had[lane] = gate_h[(size_t)task * SIZE_K + k];
+
+            size_t k_base = expert_base
+                + (size_t)k_block * BLOCK_TILES * NTILES_N * TILE_VECTORS;
+            size_t n_base = k_base + n_block_offset;
+            if (lane < STAGE_VECTORS_PER_K_TILE) {{
+                for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
+                    packed_tile_vectors[
+                        tile_k * STAGE_VECTORS_PER_K_TILE + lane
+                    ] = gate_trellis_vectors[
+                        n_base + (size_t)tile_k * NTILES_N * TILE_VECTORS + lane
+                    ];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint gate_tile_n0 = lane / 16u;
+            uint gate_tile_n1 = gate_tile_n0 + BLOCK_TILES;
+            uint gate_local_n = lane & 15u;
+            for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
+                threadgroup const ushort* gate_tile0 = packed_tiles
+                    + (tile_k * BLOCK_TILES_N + gate_tile_n0) * TILE_WORDS;
+                threadgroup const ushort* gate_tile1 = packed_tiles
+                    + (tile_k * BLOCK_TILES_N + gate_tile_n1) * TILE_WORDS;
+                {gate_fma}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            x_had[lane] = up_h[(size_t)task * SIZE_K + k];
+            if (lane < STAGE_VECTORS_PER_K_TILE) {{
+                for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
+                    packed_tile_vectors[
+                        tile_k * STAGE_VECTORS_PER_K_TILE + lane
+                    ] = up_trellis_vectors[
+                        n_base + (size_t)tile_k * NTILES_N * TILE_VECTORS + lane
+                    ];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint up_tile_n0 = lane / 16u;
+            uint up_tile_n1 = up_tile_n0 + BLOCK_TILES;
+            uint up_local_n = lane & 15u;
+            for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
+                threadgroup const ushort* up_tile0 = packed_tiles
+                    + (tile_k * BLOCK_TILES_N + up_tile_n0) * TILE_WORDS;
+                threadgroup const ushort* up_tile1 = packed_tiles
+                    + (tile_k * BLOCK_TILES_N + up_tile_n1) * TILE_WORDS;
+                {up_fma}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        gate_inner[(size_t)task * SIZE_N + n0] = half(gate_accumulator0);
+        gate_inner[(size_t)task * SIZE_N + n1] = half(gate_accumulator1);
+        up_inner[(size_t)task * SIZE_N + n0] = half(up_accumulator0);
+        up_inner[(size_t)task * SIZE_N + n1] = half(up_accumulator1);
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_exl3_m6_dual_fc1_inner_h4096_i2048_v2",
+        input_names=[
+            "gate_h",
+            "up_h",
+            "gate_trellis",
+            "up_trellis",
+            "expert_ids",
+        ],
+        output_names=["gate_inner", "up_inner"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=1)
+def _m6_clamp10_activation_down_kernel():
+    """Build exact output rotations, clamp-10 SwiGLU, and down input rotation."""
+
+    header = r"""
+        using namespace metal;
+        constant constexpr uint INTERMEDIATE = 2048u;
+        constant constexpr uint TOPK = 6u;
+        constant constexpr uint HAD = 128u;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+
+        inline float4 hadamard_h128_quad(float4 value, uint lane) {
+            float s0 = value.x + value.y;
+            float d0 = value.x - value.y;
+            float s1 = value.z + value.w;
+            float d1 = value.z - value.w;
+            float h0 = s0 + s1;
+            float h1 = d0 + d1;
+            float h2 = s0 - s1;
+            float h3 = d0 - d1;
+            for (uint step = 0u; step < 5u; ++step) {
+                uint stride = 1u << step;
+                float p0 = simd_shuffle_xor(h0, ushort(stride));
+                float p1 = simd_shuffle_xor(h1, ushort(stride));
+                float p2 = simd_shuffle_xor(h2, ushort(stride));
+                float p3 = simd_shuffle_xor(h3, ushort(stride));
+                if (lane & stride) {
+                    h0 = p0 - h0;
+                    h1 = p1 - h1;
+                    h2 = p2 - h2;
+                    h3 = p3 - h3;
+                } else {
+                    h0 = h0 + p0;
+                    h1 = h1 + p1;
+                    h2 = h2 + p2;
+                    h3 = h3 + p3;
+                }
+            }
+            return float4(h0, h1, h2, h3);
+        }
+
+        inline half sigmoid_mlx_exact(half value) {
+            auto y = 1 / (1 + metal::exp(metal::abs(value)));
+            return (value < half(0.0f)) ? y : 1 - y;
+        }
+    """
+    source = r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint block = threadgroup_position_in_grid.y;
+        uint task = threadgroup_position_in_grid.z;
+        uint expert = uint(expert_ids[task]);
+        uint column0 = block * HAD + lane * 4u;
+
+        float4 gate_had = hadamard_h128_quad(
+            float4(
+                float(gate_inner[(size_t)task * INTERMEDIATE + column0]),
+                float(gate_inner[(size_t)task * INTERMEDIATE + column0 + 1u]),
+                float(gate_inner[(size_t)task * INTERMEDIATE + column0 + 2u]),
+                float(gate_inner[(size_t)task * INTERMEDIATE + column0 + 3u])
+            ),
+            lane
+        );
+        half gate_rotated0 = half(gate_had.x * HAD_SCALE);
+        half gate_rotated1 = half(gate_had.y * HAD_SCALE);
+        half gate_rotated2 = half(gate_had.z * HAD_SCALE);
+        half gate_rotated3 = half(gate_had.w * HAD_SCALE);
+        half gate0 = half(
+            gate_rotated0
+            * gate_svh[(size_t)expert * INTERMEDIATE + column0]
+        );
+        half gate1 = half(
+            gate_rotated1
+            * gate_svh[(size_t)expert * INTERMEDIATE + column0 + 1u]
+        );
+        half gate2 = half(
+            gate_rotated2
+            * gate_svh[(size_t)expert * INTERMEDIATE + column0 + 2u]
+        );
+        half gate3 = half(
+            gate_rotated3
+            * gate_svh[(size_t)expert * INTERMEDIATE + column0 + 3u]
+        );
+
+        float4 up_had = hadamard_h128_quad(
+            float4(
+                float(up_inner[(size_t)task * INTERMEDIATE + column0]),
+                float(up_inner[(size_t)task * INTERMEDIATE + column0 + 1u]),
+                float(up_inner[(size_t)task * INTERMEDIATE + column0 + 2u]),
+                float(up_inner[(size_t)task * INTERMEDIATE + column0 + 3u])
+            ),
+            lane
+        );
+        half up_rotated0 = half(up_had.x * HAD_SCALE);
+        half up_rotated1 = half(up_had.y * HAD_SCALE);
+        half up_rotated2 = half(up_had.z * HAD_SCALE);
+        half up_rotated3 = half(up_had.w * HAD_SCALE);
+        half up0 = half(
+            up_rotated0
+            * up_svh[(size_t)expert * INTERMEDIATE + column0]
+        );
+        half up1 = half(
+            up_rotated1
+            * up_svh[(size_t)expert * INTERMEDIATE + column0 + 1u]
+        );
+        half up2 = half(
+            up_rotated2
+            * up_svh[(size_t)expert * INTERMEDIATE + column0 + 2u]
+        );
+        half up3 = half(
+            up_rotated3
+            * up_svh[(size_t)expert * INTERMEDIATE + column0 + 3u]
+        );
+
+        gate0 = min(gate0, half(10.0f));
+        gate1 = min(gate1, half(10.0f));
+        gate2 = min(gate2, half(10.0f));
+        gate3 = min(gate3, half(10.0f));
+        up0 = min(max(up0, half(-10.0f)), half(10.0f));
+        up1 = min(max(up1, half(-10.0f)), half(10.0f));
+        up2 = min(max(up2, half(-10.0f)), half(10.0f));
+        up3 = min(max(up3, half(-10.0f)), half(10.0f));
+        half silu0 = half(gate0 * sigmoid_mlx_exact(gate0));
+        half silu1 = half(gate1 * sigmoid_mlx_exact(gate1));
+        half silu2 = half(gate2 * sigmoid_mlx_exact(gate2));
+        half silu3 = half(gate3 * sigmoid_mlx_exact(gate3));
+        half activated0 = half(silu0 * up0);
+        half activated1 = half(silu1 * up1);
+        half activated2 = half(silu2 * up2);
+        half activated3 = half(silu3 * up3);
+        half down_scaled0 = half(
+            activated0
+            * down_suh[(size_t)expert * INTERMEDIATE + column0]
+        );
+        half down_scaled1 = half(
+            activated1
+            * down_suh[(size_t)expert * INTERMEDIATE + column0 + 1u]
+        );
+        half down_scaled2 = half(
+            activated2
+            * down_suh[(size_t)expert * INTERMEDIATE + column0 + 2u]
+        );
+        half down_scaled3 = half(
+            activated3
+            * down_suh[(size_t)expert * INTERMEDIATE + column0 + 3u]
+        );
+        float4 down_had = hadamard_h128_quad(
+            float4(
+                float(down_scaled0),
+                float(down_scaled1),
+                float(down_scaled2),
+                float(down_scaled3)
+            ),
+            lane
+        );
+        down_h[(size_t)task * INTERMEDIATE + column0] = half(
+            down_had.x * HAD_SCALE
+        );
+        down_h[(size_t)task * INTERMEDIATE + column0 + 1u] = half(
+            down_had.y * HAD_SCALE
+        );
+        down_h[(size_t)task * INTERMEDIATE + column0 + 2u] = half(
+            down_had.z * HAD_SCALE
+        );
+        down_h[(size_t)task * INTERMEDIATE + column0 + 3u] = half(
+            down_had.w * HAD_SCALE
+        );
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_exl3_m6_clamp10_activation_down_i2048_v2",
+        input_names=[
+            "gate_inner",
+            "up_inner",
+            "gate_svh",
+            "up_svh",
+            "down_suh",
+            "expert_ids",
+        ],
+        output_names=["down_h"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=1)
+def _m6_down_inner_kernel():
+    """Build exact-M6 FC2 from an already rotated FP16 intermediate."""
+
+    header, build_fma = _m6_quad_inner_parts(2048, 4096)
+    down_fma = build_fma("down", "accumulator0", "accumulator1")
+    source = f"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint n_block = threadgroup_position_in_grid.y;
+        uint task = threadgroup_position_in_grid.z;
+        uint expert = uint(expert_ids[task]);
+        uint n0 = n_block * 256u + lane;
+        uint n1 = n0 + HAD;
+
+        threadgroup half x_had[HAD];
+        threadgroup uint4 packed_tile_vectors[
+            BLOCK_TILES * STAGE_VECTORS_PER_K_TILE
+        ];
+        threadgroup ushort* packed_tiles =
+            reinterpret_cast<threadgroup ushort*>(packed_tile_vectors);
+        device const uint4* trellis_vectors =
+            reinterpret_cast<const device uint4*>(down_trellis);
+        size_t expert_base =
+            (size_t)expert * (SIZE_K / 16u) * NTILES_N * TILE_VECTORS;
+        size_t n_block_offset =
+            (size_t)n_block * STAGE_VECTORS_PER_K_TILE;
+
+        float accumulator0 = 0.0f;
+        float accumulator1 = 0.0f;
+        for (uint k_block = 0; k_block < KBLOCKS; ++k_block) {{
+            uint k = k_block * HAD + lane;
+            x_had[lane] = down_h[(size_t)task * SIZE_K + k];
+            size_t k_base = expert_base
+                + (size_t)k_block * BLOCK_TILES * NTILES_N * TILE_VECTORS;
+            size_t n_base = k_base + n_block_offset;
+            if (lane < STAGE_VECTORS_PER_K_TILE) {{
+                for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
+                    packed_tile_vectors[
+                        tile_k * STAGE_VECTORS_PER_K_TILE + lane
+                    ] = trellis_vectors[
+                        n_base + (size_t)tile_k * NTILES_N * TILE_VECTORS + lane
+                    ];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint down_tile_n0 = lane / 16u;
+            uint down_tile_n1 = down_tile_n0 + BLOCK_TILES;
+            uint down_local_n = lane & 15u;
+            for (uint tile_k = 0; tile_k < BLOCK_TILES; ++tile_k) {{
+                threadgroup const ushort* down_tile0 = packed_tiles
+                    + (tile_k * BLOCK_TILES_N + down_tile_n0) * TILE_WORDS;
+                threadgroup const ushort* down_tile1 = packed_tiles
+                    + (tile_k * BLOCK_TILES_N + down_tile_n1) * TILE_WORDS;
+                {down_fma}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        down_inner[(size_t)task * SIZE_N + n0] = half(accumulator0);
+        down_inner[(size_t)task * SIZE_N + n1] = half(accumulator1);
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_exl3_m6_down_inner_i2048_h4096_v1",
+        input_names=["down_h", "down_trellis", "expert_ids"],
+        output_names=["down_inner"],
+        header=header,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=1)
+def _m6_direct_final_tail_kernel():
+    """Build exact FC2 output rotation and serial BF16 top-6/shared tail."""
+
+    header = r"""
+        using namespace metal;
+        constant constexpr uint HIDDEN = 4096u;
+        constant constexpr uint TOPK = 6u;
+        constant constexpr uint HAD = 128u;
+        constant constexpr float HAD_SCALE = 0.088388347648f;
+
+        inline float4 hadamard_h128_quad(float4 value, uint lane) {
+            float s0 = value.x + value.y;
+            float d0 = value.x - value.y;
+            float s1 = value.z + value.w;
+            float d1 = value.z - value.w;
+            float h0 = s0 + s1;
+            float h1 = d0 + d1;
+            float h2 = s0 - s1;
+            float h3 = d0 - d1;
+            for (uint step = 0u; step < 5u; ++step) {
+                uint stride = 1u << step;
+                float p0 = simd_shuffle_xor(h0, ushort(stride));
+                float p1 = simd_shuffle_xor(h1, ushort(stride));
+                float p2 = simd_shuffle_xor(h2, ushort(stride));
+                float p3 = simd_shuffle_xor(h3, ushort(stride));
+                if (lane & stride) {
+                    h0 = p0 - h0;
+                    h1 = p1 - h1;
+                    h2 = p2 - h2;
+                    h3 = p3 - h3;
+                } else {
+                    h0 = h0 + p0;
+                    h1 = h1 + p1;
+                    h2 = h2 + p2;
+                    h3 = h3 + p3;
+                }
+            }
+            return float4(h0, h1, h2, h3);
+        }
+    """
+    source = r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint block = threadgroup_position_in_grid.y;
+        uint row = threadgroup_position_in_grid.z;
+        uint column0 = block * HAD + lane * 4u;
+        T mixed0 = T(0.0f);
+        T mixed1 = T(0.0f);
+        T mixed2 = T(0.0f);
+        T mixed3 = T(0.0f);
+        for (uint route = 0u; route < TOPK; ++route) {
+            uint task = row * TOPK + route;
+            uint expert = uint(expert_ids[task]);
+            float4 output_had = hadamard_h128_quad(
+                float4(
+                    float(down_inner[(size_t)task * HIDDEN + column0]),
+                    float(down_inner[(size_t)task * HIDDEN + column0 + 1u]),
+                    float(down_inner[(size_t)task * HIDDEN + column0 + 2u]),
+                    float(down_inner[(size_t)task * HIDDEN + column0 + 3u])
+                ),
+                lane
+            );
+            half rotated0 = half(output_had.x * HAD_SCALE);
+            half rotated1 = half(output_had.y * HAD_SCALE);
+            half rotated2 = half(output_had.z * HAD_SCALE);
+            half rotated3 = half(output_had.w * HAD_SCALE);
+            half projected_half0 = half(
+                rotated0 * down_svh[(size_t)expert * HIDDEN + column0]
+            );
+            half projected_half1 = half(
+                rotated1 * down_svh[(size_t)expert * HIDDEN + column0 + 1u]
+            );
+            half projected_half2 = half(
+                rotated2 * down_svh[(size_t)expert * HIDDEN + column0 + 2u]
+            );
+            half projected_half3 = half(
+                rotated3 * down_svh[(size_t)expert * HIDDEN + column0 + 3u]
+            );
+            T projected0 = T(projected_half0);
+            T projected1 = T(projected_half1);
+            T projected2 = T(projected_half2);
+            T projected3 = T(projected_half3);
+            T weight = T(route_weights[task]);
+            T product0 = T(projected0 * weight);
+            T product1 = T(projected1 * weight);
+            T product2 = T(projected2 * weight);
+            T product3 = T(projected3 * weight);
+            mixed0 = T(product0 + mixed0);
+            mixed1 = T(product1 + mixed1);
+            mixed2 = T(product2 + mixed2);
+            mixed3 = T(product3 + mixed3);
+        }
+        output[(size_t)row * HIDDEN + column0] = T(
+            mixed0 + shared[(size_t)row * HIDDEN + column0]
+        );
+        output[(size_t)row * HIDDEN + column0 + 1u] = T(
+            mixed1 + shared[(size_t)row * HIDDEN + column0 + 1u]
+        );
+        output[(size_t)row * HIDDEN + column0 + 2u] = T(
+            mixed2 + shared[(size_t)row * HIDDEN + column0 + 2u]
+        );
+        output[(size_t)row * HIDDEN + column0 + 3u] = T(
+            mixed3 + shared[(size_t)row * HIDDEN + column0 + 3u]
+        );
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_exl3_m6_direct_final_tail_h4096_t6_v2",
+        input_names=[
+            "down_inner",
+            "down_svh",
+            "expert_ids",
+            "route_weights",
+            "shared",
+        ],
+        output_names=["output"],
+        header=header,
+        source=source,
+    )
+
+
 def exl3_mcg_qmv(
     x: mx.array,
     trellis: mx.array,
@@ -1752,6 +2542,11 @@ class _InstalledM6QuadQMVPlan(NamedTuple):
     stage_vectors_per_k_tile: int
     hidden_to_intermediate: Any
     intermediate_to_hidden: Any
+    dual_fc1_input: Any
+    dual_fc1_inner: Any
+    activation_down: Any
+    down_inner: Any
+    direct_final_tail: Any
 
 
 class EXL3SwitchGLU(nn.Module):
@@ -1911,8 +2706,12 @@ class EXL3SwitchGLU(nn.Module):
             stage_vectors_per_k_tile=EXL3_M6_STAGE_VECTORS_PER_K_TILE,
             hidden_to_intermediate=_m6_quad_qmv_kernel(4096, 2048, False),
             intermediate_to_hidden=_m6_quad_qmv_kernel(2048, 4096, True),
+            dual_fc1_input=_m6_dual_fc1_input_kernel(),
+            dual_fc1_inner=_m6_dual_fc1_inner_kernel(),
+            activation_down=_m6_clamp10_activation_down_kernel(),
+            down_inner=_m6_down_inner_kernel(),
+            direct_final_tail=_m6_direct_final_tail_kernel(),
         )
-
     def _trellis_mma(
         self,
         bank: EXL3LinearBank,
@@ -2106,6 +2905,78 @@ class EXL3SwitchGLU(nn.Module):
             plan.intermediate_to_hidden,
         ).astype(original_dtype)
 
+    def direct_m6_clamp10(
+        self,
+        x: mx.array,
+        expert_ids: mx.array,
+        route_weights: mx.array,
+        shared: mx.array,
+    ) -> mx.array:
+        """Run the construction-bound five-stage exact-M6 clamp-10 route."""
+
+        plan = self._m6_quad_qmv_plan
+        ids = mx.contiguous(expert_ids)
+        gate_h, up_h = plan.dual_fc1_input(
+            inputs=[
+                mx.contiguous(x),
+                self.gate_proj.suh,
+                self.up_proj.suh,
+                ids,
+            ],
+            grid=(32, 32, 36),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(36, 4096), (36, 4096)],
+            output_dtypes=[mx.float16, mx.float16],
+        )
+        gate_inner, up_inner = plan.dual_fc1_inner(
+            inputs=[
+                gate_h,
+                up_h,
+                self.gate_proj.trellis,
+                self.up_proj.trellis,
+                ids,
+            ],
+            grid=(128, 8, 36),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(36, 2048), (36, 2048)],
+            output_dtypes=[mx.float16, mx.float16],
+        )
+        down_h = plan.activation_down(
+            inputs=[
+                gate_inner,
+                up_inner,
+                self.gate_proj.svh,
+                self.up_proj.svh,
+                self.down_proj.suh,
+                ids,
+            ],
+            grid=(32, 16, 36),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(36, 2048)],
+            output_dtypes=[mx.float16],
+        )[0]
+        down_inner = plan.down_inner(
+            inputs=[down_h, self.down_proj.trellis, ids],
+            grid=(128, 16, 36),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(36, 4096)],
+            output_dtypes=[mx.float16],
+        )[0]
+        return plan.direct_final_tail(
+            inputs=[
+                down_inner,
+                self.down_proj.svh,
+                ids,
+                mx.contiguous(route_weights),
+                mx.contiguous(shared),
+            ],
+            template=[("T", x.dtype)],
+            grid=(32, 32, 6),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(6, 4096)],
+            output_dtypes=[x.dtype],
+        )[0]
+
     def __call__(self, x: mx.array, expert_ids: mx.array) -> mx.array:
         rows = int(expert_ids.shape[0])
         # Preserve the explicit stock/oracle compatibility route.  Production
@@ -2171,6 +3042,7 @@ def install_mia_m6_quad_qmv_routes(model) -> None:
         switch.install_m6_quad_qmv_runtime()
     for ffn, switch in switches:
         ffn._mia_exl3_direct_qmv = switch.direct_qmv_m6_quad
+        ffn._mia_exl3_m6_fused = switch.direct_m6_clamp10
 
 
 def _map_mia_target_name(name: str) -> str:
@@ -3074,6 +3946,7 @@ def load_mia_exl3_dspark_model(
     if stacked_projections != {
         "target_attention": 43,
         "draft_attention": 3,
+        "shared_expert": 46,
         "main_compressor": 41,
         "indexer_compressor": 21,
     }:

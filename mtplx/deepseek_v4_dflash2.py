@@ -183,6 +183,8 @@ class DeepseekV4TargetOps:
         self._release_target_cache = plan.release_target_cache
         self._settle_target_prefill_chunk = plan.settle_target_prefill_chunk
         self._schedule_target_verify_chunk = plan.schedule_target_verify_chunk
+        self._begin_target_verify = plan.begin_target_verify
+        self._commit_target_verify = plan.commit_target_verify
         self._release_draft_cache = target_model.dspark.release_mia_cache
 
     def model_type(self, target_model: Any) -> str:
@@ -365,6 +367,7 @@ class DeepseekV4TargetOps:
         target_cache: list[Any],
         capture_layer_ids: Optional[set[int]] = None,
     ) -> tuple[mx.array, dict[int, mx.array]]:
+        self._begin_target_verify(target_cache)
         return self._forward_with_hidden_capture_phase(
             target_model,
             input_ids=verify_ids,
@@ -417,9 +420,7 @@ class DeepseekV4TargetOps:
         drafted_tokens: int = 0,
     ) -> int:
         del acceptance_length, drafted_tokens
-        trim_count = int(cache_entries[0].offset) - int(target_len)
-        for cache_entry in cache_entries:
-            cache_entry._trim_installed(trim_count)
+        self._commit_target_verify(cache_entries, target_len)
         return 0
 
     def cleanup_generation_caches(

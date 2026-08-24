@@ -13,6 +13,7 @@ from mtplx.deepseek_v4_nvfp4_kv import (  # noqa: E402
     MiaNVFP4Rows,
     PagedMiaNVFP4Rows,
 )
+from mtplx.deepseek_v4_mia_engine import MiaM6RatioTables  # noqa: E402
 from mtplx.deepseek_v4_paged_indexer import (  # noqa: E402
     MiaIndexerWorkspace,
     MiaTopKSelection,
@@ -326,6 +327,71 @@ def test_target_compressed_cache_uses_fixed_stock432_pages() -> None:
     assert cache.index_compressed.capacity == 9
 
 
+@pytest.mark.parametrize("offset", [3, 127, 191])
+@pytest.mark.parametrize(
+    "owner_type,record_bytes,ratio,block_size",
+    [
+        (PagedMiaNVFP4Rows, 432, 4, 64),
+        (PagedMiaNVFP4Rows, 432, 128, 2),
+        (PagedMiaIndexerRows, 132, 4, 64),
+    ],
+)
+def test_m6_scheduled_page_append_matches_current_page_bytes(
+    offset: int,
+    owner_type,
+    record_bytes: int,
+    ratio: int,
+    block_size: int,
+) -> None:
+    capacity_tokens = 256
+    compressed_capacity = (capacity_tokens + ratio - 1) // ratio
+    expected = owner_type(
+        capacity_rows=compressed_capacity,
+        block_size=block_size,
+    )
+    actual = owner_type(
+        capacity_rows=compressed_capacity,
+        block_size=block_size,
+    )
+    tables = MiaM6RatioTables.allocate(
+        ratio=ratio,
+        rollback_rows=(2 if ratio == 4 else 1) * ratio + 8,
+        capacity_tokens=capacity_tokens,
+        compressed_capacity=compressed_capacity,
+        compressed_block_size=block_size,
+        block_table=actual.block_table,
+    )
+    schedule = tables.slice(offset)
+    rng = np.random.default_rng(8_000 + record_bytes + ratio + offset)
+    prefix = mx.array(
+        rng.integers(
+            0,
+            256,
+            (1, schedule.first_window, record_bytes),
+            dtype=np.uint8,
+        )
+    )
+    records = mx.array(
+        rng.integers(
+            0,
+            256,
+            (1, schedule.emitted_rows, record_bytes),
+            dtype=np.uint8,
+        )
+    )
+    expected._append_installed_records(prefix)
+    actual._append_installed_records(prefix)
+    expected._append_installed_records(records)
+    actual._append_m6_records(records, schedule)
+    mx.eval(expected.pages, actual.pages)
+
+    assert len(actual) == len(expected)
+    np.testing.assert_array_equal(
+        np.array(actual.pages),
+        np.array(expected.pages),
+    )
+
+
 def test_paged_mia_indexer_reads_132_byte_fp8_records_directly() -> None:
     if not mx.metal.is_available():
         pytest.skip("requires Metal paged indexer")
@@ -438,10 +504,18 @@ def test_mia_indexer_install_removes_the_non_source_hadamard(monkeypatch) -> Non
     def installed(*_args):
         return None
 
+    def installed_m6(*_args):
+        return None
+
     monkeypatch.setattr(
         deepseek_v4_module,
         "install_paged_indexer_topk",
         lambda **_kwargs: installed,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_module,
+        "install_paged_indexer_m6_topk",
+        lambda **_kwargs: installed_m6,
     )
     query_install = {}
 
@@ -476,6 +550,33 @@ def test_mia_indexer_install_removes_the_non_source_hadamard(monkeypatch) -> Non
     assert indexer.compressor.rotate is False
     assert indexer._prepare_query_rows(query) is query
     assert indexer._select_rows is installed
+    assert indexer._select_m6_rows is installed_m6
+
+
+def test_m6_attention_and_indexer_bypass_phase_dispatchers() -> None:
+    for method in (
+        deepseek_v4_module.DeepseekV4Attention._mia_m6_forward_uncompressed,
+        deepseek_v4_module.DeepseekV4Attention._mia_m6_forward_ratio4,
+        deepseek_v4_module.DeepseekV4Attention._mia_m6_forward_ratio128,
+    ):
+        source = inspect.getsource(method)
+        assert "_mia_run_installed_attention" not in source
+        assert "_nvfp4_sparse_mla" in source
+        assert "_mia_qkv_impl" not in source
+        assert "_mia_m6_qkv_impl" in source
+    qkv_source = inspect.getsource(
+        deepseek_v4_module.DeepseekV4Attention._mia_m6_qkv_records
+    )
+    assert "current_attention_phase" not in qkv_source
+    assert ".target_records(" in qkv_source
+    ratio4_source = inspect.getsource(
+        deepseek_v4_module.DeepseekV4Attention._mia_m6_forward_ratio4
+    )
+    indexer_source = inspect.getsource(Indexer._mia_m6_select)
+    assert "self.indexer(" not in ratio4_source
+    assert "_mia_m6_select" in ratio4_source
+    assert "_select_rows" not in indexer_source
+    assert "_select_m6_rows" in indexer_source
 
 
 def test_mia_attention_routes_nax_prefill_by_phase(monkeypatch) -> None:
@@ -539,6 +640,51 @@ def test_mia_attention_routes_nax_prefill_by_phase(monkeypatch) -> None:
         assert run(2) is prefill_result
     with attention_phase("ar_decode"):
         assert run(2) is direct_result
+
+
+@pytest.mark.parametrize(
+    "ratio,entrypoint",
+    [
+        (0, "_mia_m6_forward_uncompressed"),
+        (4, "_mia_m6_forward_ratio4"),
+        (128, "_mia_m6_forward_ratio128"),
+    ],
+)
+def test_mia_attention_install_prebinds_ratio_specific_m6_entrypoints(
+    monkeypatch,
+    ratio: int,
+    entrypoint: str,
+) -> None:
+    monkeypatch.setattr(
+        deepseek_v4_module,
+        "install_nvfp4_prefill_mla",
+        lambda **_kwargs: lambda *_args, **_run_kwargs: None,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_module,
+        "install_nvfp4_sparse_mla",
+        lambda **_kwargs: lambda *_args, **_run_kwargs: None,
+    )
+    attention = deepseek_v4_module.DeepseekV4Attention.__new__(
+        deepseek_v4_module.DeepseekV4Attention
+    )
+    attention.head_dim = 512
+    attention.rope_head_dim = 64
+    attention.n_heads = 64
+    attention.window_size = 128
+    attention.compress_ratio = ratio
+    attention.attn_sink = mx.zeros((64,), dtype=mx.float32)
+    attention.softmax_scale = 512**-0.5
+    attention.compressor = SimpleNamespace(
+        install_mia_record_packer=lambda _mode: None,
+    )
+
+    attention.install_mia_nvfp4_attention()
+
+    assert attention._mia_m6_forward_impl.__func__ is getattr(
+        deepseek_v4_module.DeepseekV4Attention,
+        entrypoint,
+    )
 
 
 @pytest.mark.parametrize("query_rows", [1, 6])

@@ -28,12 +28,15 @@ class _FakeMiaEnginePlan:
     context_capacity_tokens = 384_000
     target_physical_capacity_tokens = 384_005
 
-    def __init__(self, target_cache_factory=None) -> None:
+    def __init__(self, target_cache_factory=None, events=None) -> None:
         self._target_cache_factory = target_cache_factory
+        self.events = events if events is not None else []
         self.target_cache_layers = []
         self.released_target_caches = []
         self.prefill_settlement_calls = []
         self.verify_settlement_calls = []
+        self.begin_verify_calls = []
+        self.commit_verify_calls = []
 
     def make_target_cache(self, layers):
         self.target_cache_layers.append(layers)
@@ -49,10 +52,22 @@ class _FakeMiaEnginePlan:
 
     def schedule_target_verify_chunk(self, *arrays) -> None:
         self.verify_settlement_calls.append(arrays)
+        self.events.append("target.schedule_verify")
+
+    def begin_target_verify(self, caches) -> None:
+        self.begin_verify_calls.append(caches)
+        self.events.append("target.begin_verify")
+
+    def commit_target_verify(self, caches, target_len) -> None:
+        self.commit_verify_calls.append((caches, target_len))
+        self.events.append("target.commit_verify")
 
 
 def _seal_fake_target(target, *, target_cache_factory=None) -> _FakeMiaEnginePlan:
-    plan = _FakeMiaEnginePlan(target_cache_factory)
+    plan = _FakeMiaEnginePlan(
+        target_cache_factory,
+        events=getattr(target, "events", None),
+    )
     target._mia_engine_plan = plan
     target._mia_prewarm_receipt = {"identity": plan.identity}
     return plan
@@ -73,6 +88,7 @@ class _FakeDeepseekTarget:
         self.layers = (object(),)
         self._target_cache_type = DeepseekV4NVFP4Cache
         self.calls: list[tuple[int, bool]] = []
+        self.events: list[str] = []
         self.cache_capacities: list[int | None] = []
         self.plan = _seal_fake_target(
             self,
@@ -109,6 +125,7 @@ class _FakeDeepseekTarget:
         return logits, taps
 
     def mia_dflash_forward(self, input_ids, cache, *, logits_last_only):
+        self.events.append("target.forward")
         return self(
             input_ids,
             cache=cache,
@@ -137,6 +154,12 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
     ops.settle_prefill_chunk(cache, logits, captured)
     posterior = mx.argmax(logits[0], axis=-1)
     ops.schedule_verify_chunk(cache, posterior)
+    ops.restore_after_acceptance(
+        cache,
+        target_len=3,
+        acceptance_length=2,
+        drafted_tokens=5,
+    )
 
     assert ops.supports_model(model)
     assert ops.family(model) == "deepseek_v4_dspark"
@@ -149,6 +172,14 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
         (logits, captured[41], captured[42], captured[43])
     ]
     assert model.plan.verify_settlement_calls == [(posterior,)]
+    assert model.plan.begin_verify_calls == [cache]
+    assert model.plan.commit_verify_calls == [(cache, 3)]
+    assert model.events == [
+        "target.begin_verify",
+        "target.forward",
+        "target.schedule_verify",
+        "target.commit_verify",
+    ]
     assert tuple(features.shape) == (1, 6, 6)
     np.testing.assert_array_equal(
         np.array(features[0, 0]),
@@ -156,7 +187,7 @@ def test_target_ops_uses_physical_m6_and_ordered_deepseek_taps() -> None:
     )
 
 
-def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
+def test_target_ops_commits_once_without_per_cache_trim(monkeypatch) -> None:
     model = _FakeDeepseekTarget()
     ops = DeepseekV4TargetOps(model)
     cache = ops.make_cache(
@@ -165,15 +196,15 @@ def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
         quantize_kv_cache=False,
     )
     owner = cache[0]
-    owner.window.append(
-        mx.zeros((1, 6, 512), dtype=mx.bfloat16),
-        mx.zeros((1, 6, 64), dtype=mx.bfloat16),
+    monkeypatch.setattr(
+        owner,
+        "_trim_installed",
+        lambda _trim_count: pytest.fail("DFlash must not trim Mia caches per layer"),
     )
-    owner.offset = 6
 
     elapsed_ns = ops.restore_after_acceptance(
         cache,
-        target_len=3,
+        target_len=131,
         acceptance_length=2,
         drafted_tokens=5,
     )
@@ -181,9 +212,8 @@ def test_target_ops_owns_mia_nvfp4_cache_and_trims_rejected_m6_suffix() -> None:
     assert isinstance(owner, DeepseekV4NVFP4Cache)
     assert owner.window.mode == "nvfp4_stock432"
     assert owner.window.record_bytes == 432
-    assert owner.offset == 3
-    assert len(owner.window) == 3
-    assert elapsed_ns >= 0
+    assert model.plan.commit_verify_calls == [(cache, 131)]
+    assert elapsed_ns == 0
     capabilities = ops.capabilities_for(model)
     assert capabilities.supports_dflash is True
     assert capabilities.supports_kv_trim is True

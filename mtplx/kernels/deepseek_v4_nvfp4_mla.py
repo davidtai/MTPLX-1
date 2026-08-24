@@ -781,6 +781,63 @@ def _run_dspark_k5_nvfp4_mla(
     return output
 
 
+def _run_dspark_k5_nvfp4_mla_graph(
+    queries: mx.array,
+    context_records: mx.array,
+    draft_records: mx.array,
+    start_position: mx.array,
+    sinks: mx.array,
+    scale: float,
+    *,
+    kernel,
+    query_positions: mx.array,
+    block_table: mx.array,
+    indices: mx.array,
+    lengths: mx.array,
+) -> mx.array:
+    """Graph-safe K5 launch with the live position supplied as an array input."""
+
+    batch = int(queries.shape[0])
+    prefix_length = start_position[0]
+    context_count = mx.minimum(
+        prefix_length,
+        mx.array(_WINDOW, dtype=start_position.dtype),
+    )
+    (output,) = kernel(
+        inputs=[
+            queries,
+            draft_records,
+            block_table,
+            prefix_length,
+            1,
+            1,
+            query_positions,
+            context_records,
+            block_table,
+            indices,
+            lengths,
+            sinks,
+            float(scale),
+            _DSPARK_ROWS,
+            _DSPARK_ROWS,
+            context_count,
+        ],
+        template=[("T", mx.bfloat16)],
+        grid=(
+            batch
+            * (_HEADS // _DECODE_HEADS_PER_GROUP)
+            * _DSPARK_ROWS
+            * _DECODE_NAX_THREADS,
+            1,
+            1,
+        ),
+        threadgroup=(_DECODE_NAX_THREADS, 1, 1),
+        output_shapes=[(batch, _DSPARK_ROWS, _HEADS, _HEAD_DIM)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return output
+
+
 @lru_cache(maxsize=None)
 def _prefill_nax_mg16_kernel(
     route: str,
@@ -2169,6 +2226,47 @@ def install_dspark_k5_nvfp4_mla(
     query_positions, block_table, indices, lengths = _dspark_placeholder_inputs()
     return partial(
         _run_dspark_k5_nvfp4_mla,
+        kernel=kernel,
+        query_positions=query_positions,
+        block_table=block_table,
+        indices=indices,
+        lengths=lengths,
+    )
+
+
+def install_dspark_k5_nvfp4_mla_graph(
+    *,
+    heads: int,
+    head_dim: int,
+    rope_dim: int,
+    window_size: int,
+    block_size: int,
+):
+    """Install the graph-safe form of the fixed-K5 DSpark attention launch."""
+
+    observed = (
+        int(heads),
+        int(head_dim),
+        int(rope_dim),
+        int(window_size),
+        int(block_size),
+    )
+    expected = (_HEADS, _HEAD_DIM, 64, _WINDOW, _DSPARK_ROWS)
+    if observed != expected:
+        raise ValueError(
+            f"unsupported Mia stock432 DSpark geometry: {observed!r} != {expected!r}"
+        )
+    if not mx.metal.is_available():
+        raise RuntimeError("Mia stock432 DSpark K5 installation requires Metal")
+    kernel = _kernel(
+        _ROUTE_DSPARK,
+        1,
+        1,
+        query_token_major=True,
+    )
+    query_positions, block_table, indices, lengths = _dspark_placeholder_inputs()
+    return partial(
+        _run_dspark_k5_nvfp4_mla_graph,
         kernel=kernel,
         query_positions=query_positions,
         block_table=block_table,

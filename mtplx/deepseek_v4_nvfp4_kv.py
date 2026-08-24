@@ -798,6 +798,15 @@ class PagedMiaNVFP4Rows:
             count=int(records.shape[1]),
         )
 
+    def _append_m6_records(self, records: mx.array, schedule) -> None:
+        """Insert physical-M6 records through the request-owned page schedule."""
+        self._pool._write_installed_mapping(
+            {"records": records[0]},
+            physical_blocks=schedule.compressed_blocks,
+            block_offsets=schedule.compressed_offsets,
+            new_offset=schedule.first_window + schedule.emitted_rows,
+        )
+
     def decode(self, start: int = 0, stop: int | None = None) -> tuple[mx.array, mx.array]:
         begin = int(start)
         end = len(self) if stop is None else int(stop)

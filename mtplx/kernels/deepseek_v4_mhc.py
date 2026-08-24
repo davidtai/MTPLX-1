@@ -761,8 +761,9 @@ class MiaMHCPlan:
         self._prefill_finalize = _prefill_finalize_kernel()
         self.route_contract = (
             "broadcast_fn_fp32",
-            "tiny_split32_fp32",
-            "prefill_post_pre_bf16_mma_bm64_fp32",
+            "attention_post_pre_fn_fp32",
+            "ffn_tiny_post_pre_fn_bf16_split32_fp32",
+            "ffn_prefill_post_pre_fn_bf16_mma_bm64_fp32",
             "compact_gram_finalize",
             "head_bf16_then_rmsnorm",
         )
@@ -881,35 +882,29 @@ class MiaMHCPlan:
         )
         return self._finish(residual, partials, hc, norm)
 
-    def post_pre(self, x, residual, post, comb, hc, norm):
+    def _post_pre_connection(
+        self,
+        x,
+        residual,
+        post,
+        comb,
+        hc,
+        norm,
+        *,
+        projection_weight,
+    ):
         rows = self._rows(x)
         x = mx.contiguous(x.reshape(rows, _HIDDEN))
         residual = mx.contiguous(residual.reshape(rows, _HC, _HIDDEN))
         post = mx.contiguous(post.reshape(rows, _HC))
         comb = mx.contiguous(comb.reshape(rows, _HC, _HC))
-        if rows >= self.prefill_min_rows:
-            residual, stats = self._prefill_post_pre_gram(
-                inputs=[x, residual, post, comb],
-                template=[("T", x.dtype)],
-                grid=(_PREFILL_THREADS, 1, rows),
-                threadgroup=(_PREFILL_THREADS, 1, 1),
-                output_shapes=[
-                    (rows, _HC, _HIDDEN),
-                    (rows, _PREFILL_STATS),
-                ],
-                output_dtypes=[x.dtype, mx.float32],
-            )
-            projected = self._project_prefill(
-                residual, hc._mia_mhc_weight.fn_bf16, rows
-            )
-            return self._finish_prefill(residual, stats, projected, hc, norm)
         residual, partials = self._post_pre_partial(
             inputs=[
                 x,
                 residual,
                 post,
                 comb,
-                hc.fn,
+                projection_weight,
             ],
             template=[("T", x.dtype)],
             grid=(32, _SOURCE_SPLITS, rows),
@@ -921,6 +916,56 @@ class MiaMHCPlan:
             output_dtypes=[x.dtype, mx.float32],
         )
         return self._finish(residual, partials, hc, norm)
+
+    def _post_pre_ffn_prefill(self, x, residual, post, comb, hc, norm):
+        rows = self._rows(x)
+        x = mx.contiguous(x.reshape(rows, _HIDDEN))
+        residual = mx.contiguous(residual.reshape(rows, _HC, _HIDDEN))
+        post = mx.contiguous(post.reshape(rows, _HC))
+        comb = mx.contiguous(comb.reshape(rows, _HC, _HC))
+        residual, stats = self._prefill_post_pre_gram(
+            inputs=[x, residual, post, comb],
+            template=[("T", x.dtype)],
+            grid=(_PREFILL_THREADS, 1, rows),
+            threadgroup=(_PREFILL_THREADS, 1, 1),
+            output_shapes=[
+                (rows, _HC, _HIDDEN),
+                (rows, _PREFILL_STATS),
+            ],
+            output_dtypes=[x.dtype, mx.float32],
+        )
+        projected = self._project_prefill(
+            residual, hc._mia_mhc_weight.fn_bf16, rows
+        )
+        return self._finish_prefill(residual, stats, projected, hc, norm)
+
+    def post_pre_attn(self, x, residual, post, comb, hc, norm):
+        """Run the source attention connection with its installed FP32 projection."""
+
+        return self._post_pre_connection(
+            x,
+            residual,
+            post,
+            comb,
+            hc,
+            norm,
+            projection_weight=hc.fn,
+        )
+
+    def post_pre_ffn(self, x, residual, post, comb, hc, norm):
+        """Run the source FFN connection with its installed BF16 projection."""
+
+        if self._rows(x) >= self.prefill_min_rows:
+            return self._post_pre_ffn_prefill(x, residual, post, comb, hc, norm)
+        return self._post_pre_connection(
+            x,
+            residual,
+            post,
+            comb,
+            hc,
+            norm,
+            projection_weight=hc._mia_mhc_weight.fn_bf16,
+        )
 
     def post(self, x, residual, post, comb):
         rows = self._rows(x)
