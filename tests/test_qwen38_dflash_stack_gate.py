@@ -491,6 +491,42 @@ def test_m8_qkv_engagement_requires_incremental_subgroup() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m8_mlp_engagement_requires_incremental_subgroup() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m8_nax_mlp")
+
+    def arm(*, mlp: bool, mlp_calls: int):
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "include_m8_qkv": True,
+                    "include_m8_mlp": mlp,
+                    "m8_expanded_shapes": (
+                        [[5120, 1024], [5120, 10240], [5120, 17408]]
+                        if mlp
+                        else [[5120, 1024], [5120, 10240]]
+                    ),
+                    "eligible_m8_expanded_projections": 192 if mlp else 80,
+                }
+            },
+            "engagement": {
+                "nax_verify": {
+                    "m8_nax_k5120_n10240": 3168,
+                    "m8_nax_k5120_n17408": mlp_calls,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(mlp=False, mlp_calls=0) for _ in range(2)],
+        "candidate": [arm(mlp=True, mlp_calls=7392) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = arm(mlp=True, mlp_calls=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

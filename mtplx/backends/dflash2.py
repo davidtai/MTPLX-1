@@ -395,6 +395,7 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             include_m7_output=True,
             include_m7_linear_z=True,
             include_m8_kv=True,
+            include_m8_qkv=True,
         ),
         "adaptive_policy": configure_qwen38_dflash_adaptive_policy(
             model, active=True, proposal_rows=(11, 15)
