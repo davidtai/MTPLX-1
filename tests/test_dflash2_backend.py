@@ -77,6 +77,23 @@ def test_runtime_config_rejects_physical_width_outside_one_through_eight(
             config.validate_static()
 
 
+def test_runtime_config_defaults_adaptive_and_accepts_fixed_opt_out(
+    tmp_path: Path,
+) -> None:
+    adaptive = DFlash2RuntimeConfig.from_paths(
+        target_model_path=tmp_path,
+        draft_model_path=tmp_path,
+    )
+    fixed = DFlash2RuntimeConfig.from_paths(
+        target_model_path=tmp_path,
+        draft_model_path=tmp_path,
+        draft_adaptive=False,
+    )
+
+    assert adaptive.draft_adaptive is True
+    assert fixed.draft_adaptive is False
+
+
 def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -193,8 +210,26 @@ def test_measured_context_route_splits_only_the_supported_phase_controls() -> No
         "row48_prefill_active": True,
         "row48_decode_active": True,
         "row50_active": True,
+        "requested_adaptive": True,
+        "effective_adaptive": True,
+        "fixed_block_size": None,
     }
     assert backend.qwen38_dflash_context_route(16_384) == {
+        "route_id": "long_ge16384",
+        "adaptive_active": True,
+        "row21_active": True,
+        "row24_prefill_active": True,
+        "row24_decode_active": True,
+        "row48_prefill_active": True,
+        "row48_decode_active": True,
+        "row50_active": True,
+        "requested_adaptive": True,
+        "effective_adaptive": True,
+        "fixed_block_size": None,
+    }
+    assert backend.qwen38_dflash_context_route(
+        131_072, adaptive_active=False
+    ) == {
         "route_id": "long_ge16384",
         "adaptive_active": False,
         "row21_active": True,
@@ -203,6 +238,9 @@ def test_measured_context_route_splits_only_the_supported_phase_controls() -> No
         "row48_prefill_active": True,
         "row48_decode_active": True,
         "row50_active": True,
+        "requested_adaptive": False,
+        "effective_adaptive": False,
+        "fixed_block_size": 8,
     }
 
 
@@ -255,24 +293,71 @@ def test_context_route_is_applied_to_every_phase_control(
         or {"installed": active},
     )
 
-    backend._apply_measured_qwen38_dflash_context_route(
-        runtime, prompt_tokens=1024
-    )
-    backend._apply_measured_qwen38_dflash_context_route(
-        runtime, prompt_tokens=16_384
-    )
+    for prompt_tokens in (1024, 16_384, 65_536, 131_072):
+        backend._apply_measured_qwen38_dflash_context_route(
+            runtime, prompt_tokens=prompt_tokens
+        )
 
     assert calls == {
-        "row21": [(True,), (True,)],
-        "row24_qk": [(True, 32), (True, 32)],
-        "row24": [(True, True), (True, True)],
-        "row48": [(True, True), (True, True)],
-        "adaptive": [(True,), (False,)],
-        "row50": [(True,), (True,)],
+        "row21": [(True,)] * 4,
+        "row24_qk": [(True, 32)] * 4,
+        "row24": [(True, True)] * 4,
+        "row48": [(True, True)] * 4,
+        "adaptive": [(True,)] * 4,
+        "row50": [(True,)] * 4,
     }
     assert runtime.qwen38_feature_receipt["context_route"]["route_id"] == (
         "long_ge16384"
     )
+    assert runtime.qwen38_feature_receipt["context_route"]["requested_adaptive"] is True
+    assert runtime.qwen38_feature_receipt["context_route"]["effective_adaptive"] is True
+    assert runtime.qwen38_feature_receipt["context_route"]["fixed_block_size"] is None
+
+
+def test_fixed_runtime_disables_adaptive_at_every_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.config = DFlash2RuntimeConfig.from_paths(
+        target_model_path=tmp_path,
+        draft_model_path=tmp_path,
+        draft_adaptive=False,
+    )
+    runtime.qwen38_feature_receipt = {"installed": True}
+    adaptive_calls: list[bool] = []
+    monkeypatch.setattr(
+        "mtplx.qwen38_dflash_adaptive.configure_qwen38_dflash_adaptive_policy",
+        lambda model, *, active, proposal_rows: adaptive_calls.append(active)
+        or {"active": active},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_row21_qk_rms_rope",
+        lambda model, *, active: {"active": active},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_row24_qk_length_limit",
+        lambda model, *, active, max_length: {"active": active},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_row24_eval_ladder",
+        lambda model, **kwargs: {"active": kwargs["active"]},
+    )
+    monkeypatch.setattr(
+        "mtplx.gdn_capture.configure_qwen38_dflash_row48_boundary",
+        lambda model, **kwargs: {"active": kwargs["active"]},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_row50_wired_residency",
+        lambda target_runtime, *, active: {"installed": active},
+    )
+
+    for prompt_tokens in (1024, 16_384, 65_536, 131_072):
+        backend._apply_measured_qwen38_dflash_context_route(
+            runtime, prompt_tokens=prompt_tokens
+        )
+
+    assert adaptive_calls == [False] * 4
+    assert runtime.qwen38_feature_receipt["context_route"]["fixed_block_size"] == 8
 
 
 def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(

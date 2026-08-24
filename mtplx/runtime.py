@@ -581,6 +581,7 @@ def load(
     merge_mtp_adapter: bool = False,
     gemma4_draft_block_size: int | None = None,
     dflash2_draft_block_size: int | None = None,
+    dflash2_draft_adaptive: bool | None = None,
     gemma4_target_distribution_mode: str | None = None,
     proj_quant: str | None = None,
     proj_requant: str | None = None,
@@ -606,6 +607,11 @@ def load(
             runtime = load_dflash2_bundle(
                 path,
                 draft_block_size=dflash2_draft_block_size,
+                draft_adaptive=(
+                    True
+                    if dflash2_draft_adaptive is None
+                    else bool(dflash2_draft_adaptive)
+                ),
             )
             runtime.model_path = path
             runtime.path = path

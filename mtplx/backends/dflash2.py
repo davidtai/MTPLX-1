@@ -126,6 +126,7 @@ class DFlash2RuntimeConfig:
     draft_block_size: int = DEFAULT_DFLASH2_BLOCK_SIZE
     draft_quantization: DFlash2Quantization = "unquantized"
     prefill_step_size: int = 2048
+    draft_adaptive: bool = True
     backend: str = "dflash2"
 
     @classmethod
@@ -138,6 +139,7 @@ class DFlash2RuntimeConfig:
         draft_quantization: Any = "unquantized",
         quantization: Any | None = None,
         prefill_step_size: int = 2048,
+        draft_adaptive: bool = True,
     ) -> DFlash2RuntimeConfig:
         return cls(
             target_model_path=Path(target_model_path),
@@ -147,6 +149,7 @@ class DFlash2RuntimeConfig:
                 draft_quantization if quantization is None else quantization
             ),
             prefill_step_size=int(prefill_step_size),
+            draft_adaptive=bool(draft_adaptive),
         )
 
     @property
@@ -254,6 +257,7 @@ def load_dflash2_bundle(
     *,
     draft_block_size: int | None = None,
     draft_quantization: Any | None = None,
+    draft_adaptive: bool = True,
 ) -> DFlash2Runtime:
     """Load the measured target-only Optimized-Speed plus dflash-mlx stack."""
 
@@ -294,6 +298,7 @@ def load_dflash2_bundle(
         draft_quantization=(
             manifest_quantization if draft_quantization is None else draft_quantization
         ),
+        draft_adaptive=bool(draft_adaptive),
     )
     config.validate_static()
     try:
@@ -431,17 +436,24 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
     }
     if not bool(receipt["r50_wired_residency"].get("installed")):
         raise RuntimeError("retained DFlash row 50 residency policy did not install")
-    receipt["context_route"] = qwen38_dflash_context_route(1024)
+    receipt["context_route"] = qwen38_dflash_context_route(
+        1024,
+        adaptive_active=runtime.config.draft_adaptive,
+    )
     return receipt
 
 
-def qwen38_dflash_context_route(prompt_tokens: int) -> dict[str, Any]:
+def qwen38_dflash_context_route(
+    prompt_tokens: int,
+    *,
+    adaptive_active: bool = True,
+) -> dict[str, Any]:
     """Return the independently measured short/long DFlash phase route."""
 
     long_context = int(prompt_tokens) >= QWEN38_DFLASH_LONG_CONTEXT_TOKENS
     return {
         "route_id": "long_ge16384" if long_context else "short_lt16384",
-        "adaptive_active": not long_context,
+        "adaptive_active": bool(adaptive_active),
         "row21_active": True,
         "row24_prefill_active": True,
         "row24_decode_active": True,
@@ -450,6 +462,9 @@ def qwen38_dflash_context_route(prompt_tokens: int) -> dict[str, Any]:
         # Removing residency won alone at 1K, but regressed 1.608% when
         # assembled with the process-wide stock row-53 policy.
         "row50_active": True,
+        "requested_adaptive": bool(adaptive_active),
+        "effective_adaptive": bool(adaptive_active),
+        "fixed_block_size": None if adaptive_active else DEFAULT_DFLASH2_BLOCK_SIZE,
     }
 
 
@@ -469,7 +484,10 @@ def _apply_measured_qwen38_dflash_context_route(
     )
     from mtplx.qwen38_dflash_adaptive import configure_qwen38_dflash_adaptive_policy
 
-    route = qwen38_dflash_context_route(prompt_tokens)
+    route = qwen38_dflash_context_route(
+        prompt_tokens,
+        adaptive_active=runtime.config.draft_adaptive,
+    )
     model = runtime.target_model
     updates = {
         "r21_qk_rms_rope": configure_qwen38_row21_qk_rms_rope(
