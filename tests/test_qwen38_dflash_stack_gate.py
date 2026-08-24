@@ -15,6 +15,14 @@ def test_phase_gate_accepts_only_approved_prompt_lengths(prompt_tokens: int) -> 
     stack_gate._validate_workload(prompt_tokens=prompt_tokens, max_tokens=1024)
 
 
+@pytest.mark.parametrize("prompt_tokens", [1024, 16_384])
+def test_isolated_arm_accepts_approved_prompt_lengths(prompt_tokens: int) -> None:
+    gate._validate_item55_workload(
+        prompt_tokens=prompt_tokens,
+        max_tokens=1024,
+    )
+
+
 @pytest.mark.parametrize(
     ("prompt_tokens", "max_tokens"),
     [(512, 1024), (2048, 1024), (1024, 512)],

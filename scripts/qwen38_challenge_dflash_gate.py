@@ -47,6 +47,7 @@ DFLASH_ADAPTIVE_ROWS = (11, 15, 18, 24, 25, 26, 32)
 DFLASH_CUSTOM_ROWS = (34, 40, 47)
 DFLASH_CUSTOM_WIDTHS = {34: (6,), 40: (6, 7), 47: (6, 7, 8)}
 DFLASH_GQA_WIDTHS = (6, 7, 8)
+APPROVED_PHASE_PROMPT_TOKENS = frozenset({1024, 16_384})
 FULL_RETAINED_ROUTE = (
     "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
     "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
@@ -62,6 +63,13 @@ DEFAULT_ROW36_ARTIFACT = Path.home() / (
     "models--amal-david--qwen38-mtp-head-q4-qkv-islands-v1/"
     "blobs/517bb133d7ca6e228a5129710b3cb2c25aa9944753b9f9a225fa1e8135df5e65"
 )
+
+
+def _validate_item55_workload(*, prompt_tokens: int, max_tokens: int) -> None:
+    if prompt_tokens not in APPROVED_PHASE_PROMPT_TOKENS or max_tokens != 1024:
+        raise ValueError(
+            "item 55 phase gates require exactly 1K or 16K input and 1024 output"
+        )
 
 
 def _phase_ablation_disabled(row: str) -> bool:
@@ -588,8 +596,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    if args.prompt_tokens != 16_384 or args.max_tokens != 1024:
-        raise ValueError("item 55 requires exactly 16K input and 1024 output tokens")
+    _validate_item55_workload(
+        prompt_tokens=args.prompt_tokens,
+        max_tokens=args.max_tokens,
+    )
     model_path = args.model.expanduser().resolve()
     draft_path = args.draft.expanduser().resolve()
     row36_artifact = args.row36_artifact.expanduser().resolve()
