@@ -30,6 +30,11 @@ wall time from request start through the first emitted token. The MLX peak is
 the allocator high-water mark after an explicit reset immediately before the
 request; it includes the already installed fixed physical cache arena.
 
+The historical `mia-015153d9-piecewise-1024x6-full-accept.json` receipt emits
+only six tokens in one verification cycle. Its 43.523 tok/s value is a
+micro-gate cycle-cost calculation, not sustained decode throughput, and is
+explicitly excluded from this chart and from PR performance claims.
+
 | Cold prompt | Load | TTFT | Prefill | Prefill tok/s | Decode | Decode tok/s | Request | MLX peak | K5 accept | Cycles |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1,024 | 82.03 s | 5.84 s | 5.81 s | 176.23 | 32.74 s | 31.28 | 38.55 s | 103.815 GB / 96.686 GiB | 784/1,200 (65.33%) | 240 |

@@ -1,5 +1,7 @@
 {
+  "acceptance_benchmark_eligible": false,
   "arm": "dspark",
+  "benchmark_annotation": "Historical one-cycle micro-gate only. The reported decode_tok_s divides six emitted tokens by one physical verification-cycle time and is not sustained decode throughput.",
   "config_sha256": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
   "dflash_requested_revision": "54644e991039110f30140006c892c57734b9311e",
   "dflash_revision": "54644e991039110f30140006c892c57734b9311e",
@@ -142,6 +144,7 @@
   },
   "resident_parameter_bytes": 100779678200,
   "schema_version": 3,
+  "scope": "1024-token prompt plus exactly six generated tokens in one verifier-width-6 cycle; excluded from all sustained benchmark charts and PR performance claims",
   "source_head": "015153d969b0915ac19a8aa1984e5fdad8ada5d8",
   "target_artifact_index_sha256": "b7a450f88c99aee7f6d44ecb127e91e45ab5ccb1a0dad49ca9eabb90b400c304",
   "target_kv": {
