@@ -43,6 +43,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
     parser.add_argument("--candidate-release-native-mtp", action="store_true")
+    parser.add_argument("--control-max-mb-per-buffer", type=int, default=512)
+    parser.add_argument("--candidate-max-mb-per-buffer", type=int, default=512)
+    parser.add_argument("--control-max-ops-per-buffer", type=int, default=50)
+    parser.add_argument("--candidate-max-ops-per-buffer", type=int, default=50)
     parser.add_argument("--model", type=Path, default=arm_gate.DEFAULT_MODEL)
     parser.add_argument("--draft", type=Path, default=arm_gate.DEFAULT_DFLASH_SNAPSHOT)
     parser.add_argument("--prompt-file", type=Path, default=arm_gate.DEFAULT_PROMPT)
@@ -54,6 +58,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lock", type=Path, default=arm_gate.DEFAULT_LOCK)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
+
+
+def _variant_environment(
+    args: argparse.Namespace,
+    variant: str,
+    base: dict[str, str] | os._Environ[str],
+) -> dict[str, str]:
+    environment = dict(base)
+    prefix = "control" if variant == "control" else "candidate"
+    environment["MLX_MAX_MB_PER_BUFFER"] = str(
+        int(getattr(args, f"{prefix}_max_mb_per_buffer"))
+    )
+    environment["MLX_MAX_OPS_PER_BUFFER"] = str(
+        int(getattr(args, f"{prefix}_max_ops_per_buffer"))
+    )
+    return environment
 
 
 def _variant_config(
@@ -277,6 +297,19 @@ def _engagement_exact(
             > 0
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "cb1024":
+        def limits(row: dict[str, Any]) -> tuple[int, int]:
+            report = row.get("feature_receipt", {}).get(
+                "r53_command_buffers", {}
+            )
+            return (
+                int(report.get("max_mb_per_buffer", 0)),
+                int(report.get("max_ops_per_buffer", 0)),
+            )
+
+        return all(limits(row) == (512, 50) for row in by_variant["control"]) and all(
+            limits(row) == (1024, 50) for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -370,6 +403,14 @@ def _aggregate(
             "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
             "candidate_release_native_mtp": bool(args.candidate_release_native_mtp),
+            "control_command_buffers": {
+                "max_mb_per_buffer": int(args.control_max_mb_per_buffer),
+                "max_ops_per_buffer": int(args.control_max_ops_per_buffer),
+            },
+            "candidate_command_buffers": {
+                "max_mb_per_buffer": int(args.candidate_max_mb_per_buffer),
+                "max_ops_per_buffer": int(args.candidate_max_ops_per_buffer),
+            },
         },
         "mlx_version": first["mlx_version"],
         "dflash_mlx_version": first["dflash_mlx_version"],
@@ -416,6 +457,14 @@ def main() -> int:
     arm_gate._parse_dflash_custom_rows(args.candidate_custom_rows)
     arm_gate._parse_dflash_gqa_widths(args.control_gqa_widths)
     arm_gate._parse_dflash_gqa_widths(args.candidate_gqa_widths)
+    for value in (
+        args.control_max_mb_per_buffer,
+        args.candidate_max_mb_per_buffer,
+        args.control_max_ops_per_buffer,
+        args.candidate_max_ops_per_buffer,
+    ):
+        if int(value) <= 0:
+            raise ValueError("command-buffer limits must be positive")
     children: list[dict[str, Any]] = []
     with _gpu_lock_scope(args.lock) as lock_scope:
         with tempfile.TemporaryDirectory(prefix="qwen38-dflash-stack-") as temp_dir:
@@ -424,7 +473,7 @@ def main() -> int:
                 child_output = temp_root / f"arm-{index}.json"
                 result = _run_attested_child(
                     _child_command(args, variant=variant, output=child_output),
-                    environment=os.environ,
+                    environment=_variant_environment(args, variant, os.environ),
                     lock_path=args.lock,
                 )
                 if result.returncode != 0 or not child_output.is_file():

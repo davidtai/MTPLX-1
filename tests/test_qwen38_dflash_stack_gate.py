@@ -187,6 +187,50 @@ def test_custom_row34_engagement_requires_m6_draft_qmv_calls() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_command_buffer_candidate_isolated_environment() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(
+        control_max_mb_per_buffer=512,
+        candidate_max_mb_per_buffer=1024,
+        control_max_ops_per_buffer=50,
+        candidate_max_ops_per_buffer=50,
+    )
+
+    control = stack_gate._variant_environment(args, "control", {"KEEP": "1"})
+    candidate = stack_gate._variant_environment(args, "candidate", {"KEEP": "1"})
+
+    assert control["KEEP"] == candidate["KEEP"] == "1"
+    assert control["MLX_MAX_MB_PER_BUFFER"] == "512"
+    assert candidate["MLX_MAX_MB_PER_BUFFER"] == "1024"
+    assert control["MLX_MAX_OPS_PER_BUFFER"] == "50"
+    assert candidate["MLX_MAX_OPS_PER_BUFFER"] == "50"
+
+
+def test_command_buffer_engagement_requires_exact_variant_caps() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="cb1024")
+
+    def arm(max_mb: int):
+        return {
+            "feature_receipt": {
+                "r53_command_buffers": {
+                    "max_mb_per_buffer": max_mb,
+                    "max_ops_per_buffer": 50,
+                }
+            }
+        }
+
+    by_variant = {
+        "control": [arm(512), arm(512)],
+        "candidate": [arm(1024), arm(1024)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(512)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 
