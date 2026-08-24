@@ -172,3 +172,23 @@ the ledger, raw receipts, and `NOTICE`.
   `upstream/main` (19/20 base reproductions); the full suite excluding only
   that exact base flake passes.
 - [x] Update PR #335 in place. Do not open another PR.
+
+## Task 5: Raise the retained DFlash2 stack above 70 decode tok/s
+
+**Files:** `mtplx/qwen38_challenge_kernels.py`,
+`mtplx/backends/dflash2.py`, `scripts/qwen38_challenge_dflash_gate.py`,
+`scripts/qwen38_challenge_dflash_stack_gate.py`, focused tests, the DFlash
+performance table, and a raw receipt.
+
+- [ ] Install a construction-validated width router that keeps the existing
+  width-4 and width-5 routes, sends width 6--7 to asynchronous per-head GQA,
+  and sends width 8 to per-head GQA at the exact Qwen3.8 target shape.
+- [ ] Expose control/candidate installation in the isolated stack gate without
+  adding hot-path counters; prove engagement from the route receipt and the
+  adaptive block histogram.
+- [ ] Run the exact guarded 16K Python / 1,024-output four-arm gate on top of
+  the retained production stack. Retain only a strict matched wall win.
+- [ ] If the retained candidate remains at or below 70 decode tok/s, stack and
+  gate the next evidence-backed candidate rather than multiplying estimates.
+- [ ] Update PR #335 in place with only the retained winner, receipt, table,
+  tests, and final production-bundle verification.

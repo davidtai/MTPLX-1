@@ -15,6 +15,9 @@ qwen38_row26_qk_widen_calls = 0
 qwen38_row24_eval_ladder_calls = 0
 qwen38_row26_prefill_ladder_calls = 0
 _QWEN38_ATTENTION_ORIGINAL_CALL = None
+_QWEN38_DFLASH_GQA_ORIGINAL = None
+_QWEN38_DFLASH_GQA_ROUTED = None
+_QWEN38_DFLASH_GQA_WIDTHS: tuple[int, ...] = ()
 
 
 def qwen38_row24_async_eval(value: Any, *, row26: bool = False) -> None:
@@ -72,6 +75,125 @@ def configure_qwen38_dflash_row24_eval_ladder(
 
     inner._dflash_post_layer = post_layer
     return {"active": 1, "prefill_stride": prefill_stride}
+
+
+def configure_qwen38_dflash_gqa_widths(
+    model: Any,
+    *,
+    active: bool,
+    widths: tuple[int, ...] = (6, 7, 8),
+) -> dict[str, Any]:
+    """Route the measured 16K DFlash verify widths through per-head SDPA."""
+
+    requested = tuple(int(width) for width in widths)
+    if requested != (6, 7, 8):
+        raise ValueError("Qwen 3.8 DFlash GQA widths must be exactly (6, 7, 8)")
+
+    text = getattr(model, "language_model", model)
+    inner = getattr(text, "model", text)
+    attention_modules = [
+        attention
+        for layer in list(getattr(inner, "layers", ()) or ())
+        if (attention := getattr(layer, "self_attn", None)) is not None
+    ]
+    eligible = sum(_row21_attention_eligible(attention) for attention in attention_modules)
+    if active and eligible != 16:
+        raise ValueError(
+            "Qwen 3.8 DFlash GQA route requires exactly 16 eligible attention modules"
+        )
+
+    from dflash_mlx.engine import target_qwen_gdn
+    from dflash_mlx.engine.gqa_sdpa import (
+        async_per_head_gqa_sdpa,
+        per_head_gqa_sdpa,
+        repeat_gqa_mask,
+    )
+
+    global _QWEN38_DFLASH_GQA_ORIGINAL
+    global _QWEN38_DFLASH_GQA_ROUTED
+    global _QWEN38_DFLASH_GQA_WIDTHS
+    if _QWEN38_DFLASH_GQA_ORIGINAL is None:
+        _QWEN38_DFLASH_GQA_ORIGINAL = target_qwen_gdn._gqa_reshape_sdpa
+
+    if not active:
+        if (
+            _QWEN38_DFLASH_GQA_ROUTED is not None
+            and target_qwen_gdn._gqa_reshape_sdpa is _QWEN38_DFLASH_GQA_ROUTED
+        ):
+            target_qwen_gdn._gqa_reshape_sdpa = _QWEN38_DFLASH_GQA_ORIGINAL
+        _QWEN38_DFLASH_GQA_ROUTED = None
+        _QWEN38_DFLASH_GQA_WIDTHS = ()
+        return {
+            "active": False,
+            "eligible_modules": eligible,
+            "widths": [],
+        }
+
+    if _QWEN38_DFLASH_GQA_ROUTED is not None:
+        if target_qwen_gdn._gqa_reshape_sdpa is not _QWEN38_DFLASH_GQA_ROUTED:
+            raise RuntimeError("Qwen 3.8 DFlash GQA route was replaced after installation")
+        if _QWEN38_DFLASH_GQA_WIDTHS != requested:
+            raise RuntimeError("Qwen 3.8 DFlash GQA route changed widths")
+    else:
+        original = _QWEN38_DFLASH_GQA_ORIGINAL
+
+        def routed_gqa(
+            queries: Any,
+            keys: Any,
+            values: Any,
+            *,
+            scale: float,
+            mask: Any,
+            cache: Any = None,
+        ) -> Any:
+            q_len = int(queries.shape[2])
+            kv_len = int(keys.shape[2])
+            if 16_384 <= kv_len < 32_768 and q_len in requested:
+                grouped_mask = repeat_gqa_mask(
+                    mask,
+                    q_len=q_len,
+                    kv_len=kv_len,
+                    gqa=6,
+                )
+                if q_len < 8:
+                    return async_per_head_gqa_sdpa(
+                        queries,
+                        keys,
+                        values,
+                        scale=scale,
+                        mask=grouped_mask,
+                        gqa=6,
+                    )
+                return per_head_gqa_sdpa(
+                    queries,
+                    keys,
+                    values,
+                    scale=scale,
+                    mask=grouped_mask,
+                    gqa=6,
+                )
+            return original(
+                queries,
+                keys,
+                values,
+                scale=scale,
+                mask=mask,
+                cache=cache,
+            )
+
+        _QWEN38_DFLASH_GQA_ROUTED = routed_gqa
+        _QWEN38_DFLASH_GQA_WIDTHS = requested
+        target_qwen_gdn._gqa_reshape_sdpa = routed_gqa
+
+    return {
+        "active": True,
+        "eligible_modules": eligible,
+        "widths": list(requested),
+        "async_widths": [6, 7],
+        "per_head_widths": [8],
+        "kv_len_min": 16_384,
+        "kv_len_max_exclusive": 32_768,
+    }
 
 
 def qwen38_qk_rms_rope(

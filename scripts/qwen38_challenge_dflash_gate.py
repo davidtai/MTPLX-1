@@ -46,6 +46,7 @@ DFLASH_SURVIVOR_ROWS = frozenset({21, 24, 26, 48})
 DFLASH_ADAPTIVE_ROWS = (11, 15, 18, 24, 25, 26, 32)
 DFLASH_CUSTOM_ROWS = (34, 40, 47)
 DFLASH_CUSTOM_WIDTHS = {34: (6,), 40: (6, 7), 47: (6, 7, 8)}
+DFLASH_GQA_WIDTHS = (6, 7, 8)
 FULL_RETAINED_ROUTE = (
     "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
     "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
@@ -183,16 +184,27 @@ def _parse_dflash_custom_rows(value: str) -> tuple[int, ...]:
     return rows
 
 
+def _parse_dflash_gqa_widths(value: str) -> tuple[int, ...]:
+    if not value.strip():
+        return ()
+    widths = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    if widths != DFLASH_GQA_WIDTHS:
+        raise ValueError("DFlash GQA widths must be empty or exactly 6,7,8")
+    return widths
+
+
 def _install_dflash_route(
     runtime: Any,
     *,
     survivor_rows: tuple[int, ...],
+    gqa_widths: tuple[int, ...] = (),
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
     from mtplx.gdn_capture import configure_qwen38_dflash_row48_boundary
     from mtplx.qwen38_challenge_kernels import (
         configure_qwen38_dflash_row24_eval_ladder,
+        configure_qwen38_dflash_gqa_widths,
         configure_qwen38_row21_qk_rms_rope,
         configure_qwen38_row24_qk_length_limit,
     )
@@ -216,6 +228,11 @@ def _install_dflash_route(
         runtime.model,
         active=48 in rows,
     )
+    gqa_report = configure_qwen38_dflash_gqa_widths(
+        runtime.model,
+        active=bool(gqa_widths),
+        widths=DFLASH_GQA_WIDTHS,
+    )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
         feature_receipt["r21_qk_rms_rope"] = row21_report
@@ -226,10 +243,16 @@ def _install_dflash_route(
         feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
     if 48 in rows:
         feature_receipt["r48_boundary_fused"] = row48_report
+    if gqa_widths:
+        feature_receipt["dflash_gqa_widths"] = gqa_report
     runtime.qwen38_feature_receipt = feature_receipt
     return SimpleNamespace(
         route_id="+".join(
-            ("dflash2_static8", *(f"r{row:02d}" for row in survivor_rows))
+            (
+                "dflash2_static8",
+                *(f"r{row:02d}" for row in survivor_rows),
+                *(("gqa678",) if gqa_widths else ()),
+            )
         )
     )
 
@@ -284,6 +307,7 @@ def _run_dflash_arm(
     survivor_rows: tuple[int, ...],
     adaptive_rows: tuple[int, ...],
     custom_rows: tuple[int, ...],
+    gqa_widths: tuple[int, ...],
     release_report: dict[str, bool],
 ) -> dict[str, Any]:
     import mlx.core as mx
@@ -317,6 +341,7 @@ def _run_dflash_arm(
                 *(f"r{row:02d}" for row in survivor_rows),
                 *(f"a{row:02d}" for row in adaptive_rows),
                 *(f"c{row:02d}" for row in custom_rows),
+                *(("gqa678",) if gqa_widths else ()),
             )
         ),
         "installed_route_id": route.route_id,
@@ -388,6 +413,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dflash-survivors", default="")
     parser.add_argument("--dflash-adaptive-rows", default="")
     parser.add_argument("--dflash-custom-rows", default="")
+    parser.add_argument("--dflash-gqa-widths", default="")
     parser.add_argument(
         "--engine",
         choices=("mtp_fixed_d3", "dflash2"),
@@ -413,6 +439,7 @@ def main() -> int:
     survivor_rows = _parse_dflash_survivors(args.dflash_survivors)
     adaptive_rows = _parse_dflash_adaptive_rows(args.dflash_adaptive_rows)
     custom_rows = _parse_dflash_custom_rows(args.dflash_custom_rows)
+    gqa_widths = _parse_dflash_gqa_widths(args.dflash_gqa_widths)
 
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,
@@ -465,6 +492,7 @@ def main() -> int:
         dflash_route = _install_dflash_route(
             runtime,
             survivor_rows=survivor_rows,
+            gqa_widths=gqa_widths,
         )
         if dflash_route is None:
             raise RuntimeError("DFlash2 survivor route did not install")
@@ -530,6 +558,7 @@ def main() -> int:
             survivor_rows=survivor_rows,
             adaptive_rows=adaptive_rows,
             custom_rows=custom_rows,
+            gqa_widths=gqa_widths,
             release_report=release_report,
         )
 
@@ -565,6 +594,7 @@ def main() -> int:
         "dflash_survivor_rows": list(survivor_rows),
         "dflash_adaptive_rows": list(adaptive_rows),
         "dflash_custom_rows": list(custom_rows),
+        "dflash_gqa_widths": list(gqa_widths),
         "native_mtp_release": dict(release_report),
         "mlx_version": importlib.metadata.version("mlx"),
         "dflash_mlx_version": importlib.metadata.version("dflash-mlx"),

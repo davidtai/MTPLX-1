@@ -35,6 +35,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-adaptive-rows", default="")
     parser.add_argument("--control-custom-rows", default="")
     parser.add_argument("--candidate-custom-rows", default="")
+    parser.add_argument("--control-gqa-widths", default="")
+    parser.add_argument("--candidate-gqa-widths", default="")
     parser.add_argument("--control-release-native-mtp", action="store_true")
     parser.add_argument("--candidate-release-native-mtp", action="store_true")
     parser.add_argument("--model", type=Path, default=arm_gate.DEFAULT_MODEL)
@@ -53,18 +55,20 @@ def _parse_args() -> argparse.Namespace:
 def _variant_config(
     args: argparse.Namespace,
     variant: str,
-) -> tuple[str, str, str, bool]:
+) -> tuple[str, str, str, str, bool]:
     if variant == "control":
         return (
             args.control_survivors,
             args.control_adaptive_rows,
             args.control_custom_rows,
+            args.control_gqa_widths,
             bool(args.control_release_native_mtp),
         )
     return (
         args.candidate_survivors,
         args.candidate_adaptive_rows,
         args.candidate_custom_rows,
+        args.candidate_gqa_widths,
         bool(args.candidate_release_native_mtp),
     )
 
@@ -75,7 +79,7 @@ def _child_command(
     variant: str,
     output: Path,
 ) -> list[str]:
-    survivors, adaptive_rows, custom_rows, release_native_mtp = _variant_config(
+    survivors, adaptive_rows, custom_rows, gqa_widths, release_native_mtp = _variant_config(
         args, variant
     )
     command = [
@@ -105,6 +109,8 @@ def _child_command(
         adaptive_rows,
         "--dflash-custom-rows",
         custom_rows,
+        "--dflash-gqa-widths",
+        gqa_widths,
         "--lock",
         str(args.lock),
         "--output",
@@ -208,6 +214,19 @@ def _engagement_exact(
             calls > 0 and merged > 0
             for calls, merged in map(counts, by_variant["candidate"])
         )
+    if args.candidate_label == "gqa678":
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(row.get("feature_receipt", {}).get("dflash_gqa_widths", {}))
+
+        return all(not route(row) for row in by_variant["control"]) and all(
+            bool(route(row).get("active"))
+            and route(row).get("widths") == [6, 7, 8]
+            and all(
+                int(row.get("adaptive_metrics", {}).get("cycles_by_block", {}).get(str(width), 0)) > 0
+                for width in (6, 7, 8)
+            )
+            for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -289,6 +308,12 @@ def _aggregate(
             "candidate_custom_rows": list(
                 arm_gate._parse_dflash_custom_rows(args.candidate_custom_rows)
             ),
+            "control_gqa_widths": list(
+                arm_gate._parse_dflash_gqa_widths(args.control_gqa_widths)
+            ),
+            "candidate_gqa_widths": list(
+                arm_gate._parse_dflash_gqa_widths(args.candidate_gqa_widths)
+            ),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
             "candidate_release_native_mtp": bool(args.candidate_release_native_mtp),
         },
@@ -335,6 +360,8 @@ def main() -> int:
     arm_gate._parse_dflash_adaptive_rows(args.candidate_adaptive_rows)
     arm_gate._parse_dflash_custom_rows(args.control_custom_rows)
     arm_gate._parse_dflash_custom_rows(args.candidate_custom_rows)
+    arm_gate._parse_dflash_gqa_widths(args.control_gqa_widths)
+    arm_gate._parse_dflash_gqa_widths(args.candidate_gqa_widths)
     children: list[dict[str, Any]] = []
     with _gpu_lock_scope(args.lock) as lock_scope:
         with tempfile.TemporaryDirectory(prefix="qwen38-dflash-stack-") as temp_dir:

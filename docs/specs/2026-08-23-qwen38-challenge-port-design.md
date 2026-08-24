@@ -308,3 +308,36 @@ receipts, route/provenance documentation, and attribution. Rejected candidates
 remain documented in the ledger and local benchmark artifacts but are removed
 from production code. The branch is pushed to the user's MTPLX fork and opened
 against `youssofal/MTPLX:main` only after the final verification gate.
+
+## Post-port DFlash2 width specialization
+
+The production DFlash2 run remains below the requested 70 decode tok/s target,
+so the completed 54-row port is followed by a measured target-shape search.
+The adaptive policy selects a physical verification width in 1--8; execution
+then dispatches through a Qwen3.8-specific width table. Width routing never
+changes the policy's selected width or acceptance arithmetic.
+
+The first candidate specializes full-attention GQA at the observed 16K cache
+shape. The retained run uses widths 4--8. Width 4 already uses asynchronous
+per-KV-head SDPA and width 5 already uses native GQA. Widths 6--8 currently
+fall through grouped GQA even though the exact `(QH=24, KVH=4, D=256,
+KV=16512)` microgate measured per-head routes 13--15 percent faster. The
+candidate therefore binds widths 6--7 to asynchronous per-head SDPA and width
+8 to per-head SDPA, while all other widths preserve the installed control.
+
+Only the width varies in the hot path. Model family, head geometry, dtype,
+cache ownership, and supported context are validated once when the route is
+installed. Engagement is proved by the installed-route receipt plus the
+existing adaptive block histogram; no per-layer or per-dispatch counter is
+added. The candidate must clear the unchanged four-arm 16K/1K gate before it
+enters the production stack. If it does not raise decode above 70 tok/s, later
+candidates are measured cumulatively in this order: cost-aware adaptive depth,
+DFlash-specific command-buffer sizing, then draft-window or fused-readout work
+that first demonstrates a credible isolated ceiling.
+
+Failure boundaries are explicit: a microkernel win may lose under mixed graph
+co-residency, extra shape graphs may raise peak memory, and asynchronous stream
+fan-out may increase command-buffer pressure. Any such matched wall regression
+rejects the candidate immediately. Widths 1--3 remain lazy control fallbacks
+until a real workload engages them; the branch does not eagerly materialize
+eight whole-model compiled graphs.
