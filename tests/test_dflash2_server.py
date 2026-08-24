@@ -12,6 +12,7 @@ from mtplx.commands.public import (
     DFLASH2_BACKEND_ID,
     _launcher_python,
     _prepare_dflash2_args,
+    _dflash2_adaptive_cli_flag,
     _serve_dry_run_payload,
     _validate_public_depth,
     resolve_dflash2_bundle_paths,
@@ -208,6 +209,66 @@ def test_public_commands_accept_dflash2_backend() -> None:
     for command in ("serve", "ask", "start"):
         args = parser.parse_args([command, "--model", "bundle", "--backend-id", "dflash2"])
         assert args.backend_id == DFLASH2_BACKEND_ID
+
+
+@pytest.mark.parametrize("command", ["run", "ask", "serve", "start"])
+def test_public_dflash2_adaptive_flag_defaults_on_and_supports_opt_out(
+    command: str,
+) -> None:
+    parser = build_parser()
+    tail = ["prompt"] if command in {"run", "ask"} else []
+
+    default = parser.parse_args(
+        [command, "--model", "bundle", "--backend-id", "dflash2", *tail]
+    )
+    enabled = parser.parse_args(
+        [
+            command,
+            "--model",
+            "bundle",
+            "--backend-id",
+            "dflash2",
+            "--dflash2-adaptive",
+            *tail,
+        ]
+    )
+    disabled = parser.parse_args(
+        [
+            command,
+            "--model",
+            "bundle",
+            "--backend-id",
+            "dflash2",
+            "--no-dflash2-adaptive",
+            *tail,
+        ]
+    )
+
+    assert default.dflash2_adaptive is True
+    assert enabled.dflash2_adaptive is True
+    assert disabled.dflash2_adaptive is False
+    assert _dflash2_adaptive_cli_flag(default) == "--dflash2-adaptive"
+    assert _dflash2_adaptive_cli_flag(disabled) == "--no-dflash2-adaptive"
+
+
+def test_server_dflash2_adaptive_flag_defaults_on_and_supports_opt_out(
+    tmp_path: Path,
+) -> None:
+    root = _bundle(tmp_path)
+
+    default = parse_args(["--model", str(root), "--warmup-tokens", "0"])
+    disabled = parse_args(
+        [
+            "--model",
+            str(root),
+            "--warmup-tokens",
+            "0",
+            "--no-dflash2-adaptive",
+        ]
+    )
+
+    assert default.dflash2_adaptive is True
+    assert disabled.dflash2_adaptive is False
 
 
 def test_llama_cpp_is_not_an_implicit_fallback() -> None:

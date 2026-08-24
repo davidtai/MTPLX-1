@@ -2134,6 +2134,9 @@ class ServerState:
                     if requested_backend == DFLASH2_BACKEND_ID
                     else None
                 ),
+                dflash2_draft_adaptive=bool(
+                    getattr(args, "dflash2_adaptive", True)
+                ),
                 gemma4_target_distribution_mode=target_distribution_mode_from_args(
                     args,
                     startup_backend,
@@ -31733,6 +31736,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument("--dflash2-bundle", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--dflash2-draft-model", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--dflash2-adaptive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--assistant-model",
         "--gemma-assistant-model",

@@ -652,6 +652,14 @@ def _add_dflash2_args(parser: argparse.ArgumentParser) -> None:
         type=_positive_int,
         help="DFlash2 physical block size; defaults to the measured width 8.",
     )
+    parser.add_argument(
+        "--dflash2-adaptive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use adaptive M=1..8 DFlash2 drafting (default; disable for fixed M=8)."
+        ),
+    )
     parser.add_argument("--dflash2-bundle", help=argparse.SUPPRESS)
     parser.add_argument("--dflash2-draft-model", help=argparse.SUPPRESS)
 

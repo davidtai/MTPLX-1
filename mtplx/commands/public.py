@@ -172,6 +172,14 @@ def _dflash2_descriptor() -> Any | None:
     return None
 
 
+def _dflash2_adaptive_cli_flag(args: Any) -> str:
+    return (
+        "--dflash2-adaptive"
+        if bool(getattr(args, "dflash2_adaptive", True))
+        else "--no-dflash2-adaptive"
+    )
+
+
 def _prepare_dflash2_args(args: Any) -> dict[str, Any] | None:
     """Select DFlash2 or route an explicit AR request to its target model."""
     requested = str(getattr(args, "backend_id", "") or "").strip().lower()
@@ -203,6 +211,8 @@ def _prepare_dflash2_args(args: Any) -> dict[str, Any] | None:
     args.dflash2_bundle = bundle
     args.dflash2_target_model = bundle.get("target_model")
     args.dflash2_draft_model = bundle.get("draft_model")
+    if not hasattr(args, "dflash2_adaptive"):
+        args.dflash2_adaptive = True
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     target_only = (
         bool(getattr(args, "no_mtp", False))
@@ -9728,6 +9738,7 @@ def cmd_serve_public(args: Any) -> int:
                 str(getattr(args, "draft_block_size", 8)),
             ]
         )
+        cmd.append(_dflash2_adaptive_cli_flag(args))
     if bool(getattr(args, "quickstart_hermes", False)):
         cmd.extend(["--launch-hermes", "--server-console"])
         hermes_launch_command = str(
@@ -10235,7 +10246,13 @@ def _generate_one_shot_public(
     )
 
     try:
-        rt = load(runtime_model, mtp=getattr(args, "load_mtp", True) is not False)
+        rt = load(
+            runtime_model,
+            mtp=getattr(args, "load_mtp", True) is not False,
+            dflash2_draft_adaptive=bool(
+                getattr(args, "dflash2_adaptive", True)
+            ),
+        )
         draft_report = None
         if (
             draft_lm_head is not None
@@ -13348,7 +13365,13 @@ def _quickstart_run_terminal_chat_body(
     quiet_progress = not sys.stdout.isatty()
     with ModelLoadProgress("Loading model", quiet=quiet_progress) as progress:
         progress.set_subtitle(f"profile {profile.name}")
-        rt = load(runtime_model, mtp=getattr(args, "load_mtp", True) is not False)
+        rt = load(
+            runtime_model,
+            mtp=getattr(args, "load_mtp", True) is not False,
+            dflash2_draft_adaptive=bool(
+                getattr(args, "dflash2_adaptive", True)
+            ),
+        )
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")
