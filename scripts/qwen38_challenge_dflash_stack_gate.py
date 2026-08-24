@@ -127,6 +127,13 @@ def _engagement_exact(
             ladder > 0 and fallback > 0
             for ladder, fallback in map(counts, by_variant["candidate"])
         )
+    if args.candidate_label == "r26":
+        def calls(row: dict[str, Any]) -> int:
+            return int(row["engagement"]["r26_prefill_ladder_3"]["calls"])
+
+        return all(calls(row) == 0 for row in by_variant["control"]) and all(
+            calls(row) > 0 for row in by_variant["candidate"]
+        )
     return True
 
 

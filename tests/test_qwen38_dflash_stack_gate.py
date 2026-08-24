@@ -72,6 +72,24 @@ def test_row24_engagement_requires_candidate_ladder_and_qk_fallback() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_row26_engagement_requires_candidate_prefill_stride_calls() -> None:
+    args = SimpleNamespace(candidate_label="r26")
+
+    def arm(calls: int):
+        return {"engagement": {"r26_prefill_ladder_3": {"calls": calls}}}
+
+    by_variant = {
+        "control": [arm(0), arm(0)],
+        "candidate": [arm(176), arm(176)],
+    }
+
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = arm(0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 
