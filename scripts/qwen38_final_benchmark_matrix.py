@@ -85,7 +85,8 @@ def child_command(
     scenario: Scenario,
     output: Path,
 ) -> list[str]:
-    return [
+    headline = scenario.prompt_kind == "is_palindrome"
+    command = [
         sys.executable,
         str(ROOT / "scripts/qwen38_final_benchmark_arm.py"),
         "--engine", engine,
@@ -101,11 +102,15 @@ def child_command(
         "--temperature", str(scenario.temperature),
         "--top-p", str(scenario.top_p),
         "--top-k", str(scenario.top_k),
-        "--conditioner-tokens", str(args.conditioner_tokens),
+        "--conditioner-tokens", str(scenario.max_tokens if headline else args.conditioner_tokens),
+        "--conditioner-mode", "same_prompt" if headline else "unrelated_prompt",
         "--seed", str(args.seed),
         "--lock", str(args.lock),
         "--output", str(output),
     ]
+    if engine == "pr_dflash2":
+        command.append("--dflash2-adaptive")
+    return command
 
 
 def aggregate_scenario(
@@ -127,22 +132,45 @@ def aggregate_scenario(
                 "prefill_s",
                 "decode_elapsed_s",
                 "peak_memory_gib",
+                "generated_tokens",
             )
         }
         for engine, rows in by_engine.items()
     }
     control_wall = summary["main_native_mtp"]["wall_s"]
     candidate_wall = summary["pr_dflash2"]["wall_s"]
+    output_limit_respected = all(
+        0 < int(arm["generated_tokens"]) <= scenario.max_tokens for arm in arms
+    )
     exact_counts = all(
-        int(arm["prompt_tokens"]) == scenario.prompt_tokens
-        and int(arm["generated_tokens"]) == scenario.max_tokens
-        for arm in arms
+        int(arm["prompt_tokens"]) == scenario.prompt_tokens for arm in arms
+    ) and (
+        output_limit_respected
+        if scenario.prompt_kind == "is_palindrome"
+        else all(int(arm["generated_tokens"]) == scenario.max_tokens for arm in arms)
     )
     no_prefix_cache = all(
         not bool(arm.get("prefix_cache_used", False))
         and int(arm.get("cached_tokens", 0)) == 0
         for arm in arms
     )
+    dflash_adaptive = {
+        "requested": all(
+            bool(arm.get("requested_adaptive"))
+            for arm in by_engine["pr_dflash2"]
+        ),
+        "effective": all(
+            bool(arm.get("effective_adaptive"))
+            for arm in by_engine["pr_dflash2"]
+        ),
+        "observed_widths": sorted(
+            {
+                int(width)
+                for arm in by_engine["pr_dflash2"]
+                for width in arm.get("effective_widths", [])
+            }
+        ),
+    }
     return {
         "scenario": scenario.name,
         "prompt_kind": scenario.prompt_kind,
@@ -157,8 +185,10 @@ def aggregate_scenario(
         "timed_arm_count": len(arms),
         "summary": summary,
         "wall_time_improvement_pct": (control_wall / candidate_wall - 1.0) * 100.0,
+        "dflash_adaptive": dflash_adaptive,
         "correctness": {
             "exact_prompt_and_output_counts": exact_counts,
+            "output_limit_respected": output_limit_respected,
             "no_prefix_cache_or_session_restore": no_prefix_cache,
             "per_engine_token_replay": {
                 engine: len({row["token_sha256"] for row in rows}) == 1
@@ -168,6 +198,7 @@ def aggregate_scenario(
                 not bool(row.get("fallback_ar", False))
                 for row in by_engine["pr_dflash2"]
             ),
+            "dflash_adaptive_effective": dflash_adaptive["effective"],
         },
         "arms": arms,
         "child_receipts": child_receipts,
@@ -251,7 +282,8 @@ def main() -> int:
                     "gpu_lock_scope": lock_scope,
                     "cold_prefill_definition": (
                         "fresh prompt/KV state; exact total prompt length; no prefix cache "
-                        "or session restore; unrelated conditioner only"
+                        "or session restore; same-prompt decode conditioner for the burst "
+                        "and unrelated short conditioner for coding loads"
                     ),
                     "results": results,
                 }

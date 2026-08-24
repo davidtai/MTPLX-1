@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 SCRIPT = Path(__file__).parents[1] / "scripts/qwen38_final_benchmark_arm.py"
 
@@ -60,6 +62,13 @@ def test_burst_prompt_is_python_palindrome_task_and_fits_exact_budget() -> None:
     assert "test" in arm.IS_PALINDROME_PROMPT.lower()
 
 
+def test_palindrome_uses_eos_with_1024_cap_but_load_scenarios_force_1024() -> None:
+    arm = _module()
+
+    assert arm.stop_token_ids_for_prompt("is_palindrome") is None
+    assert arm.stop_token_ids_for_prompt("coding") == set()
+
+
 def test_native_draft_sampler_uses_contract_except_for_full_greedy_headline() -> None:
     arm = _module()
     contract = {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
@@ -70,3 +79,25 @@ def test_native_draft_sampler_uses_contract_except_for_full_greedy_headline() ->
     assert arm.native_draft_sampler_values(
         temperature=0.0, top_p=1.0, top_k=0, contract=contract
     ) == (0.0, 1.0, 0)
+
+
+def test_candidate_adaptive_receipt_must_be_effective() -> None:
+    arm = _module()
+
+    arm.validate_candidate_adaptive_receipt(
+        {
+            "context_route": {
+                "requested_adaptive": True,
+                "effective_adaptive": True,
+            }
+        }
+    )
+    with pytest.raises(RuntimeError, match="not effectively adaptive"):
+        arm.validate_candidate_adaptive_receipt(
+            {
+                "context_route": {
+                    "requested_adaptive": True,
+                    "effective_adaptive": False,
+                }
+            }
+        )

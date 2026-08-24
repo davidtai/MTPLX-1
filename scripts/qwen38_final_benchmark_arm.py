@@ -106,6 +106,21 @@ def native_draft_sampler_values(
     )
 
 
+def stop_token_ids_for_prompt(prompt_kind: str) -> set[int] | None:
+    """Let the simple burst stop naturally; load simulations fill their cap."""
+
+    return None if prompt_kind == "is_palindrome" else set()
+
+
+def validate_candidate_adaptive_receipt(receipt: dict[str, Any]) -> None:
+    route = dict(receipt.get("context_route") or {})
+    if not (
+        bool(route.get("requested_adaptive"))
+        and bool(route.get("effective_adaptive"))
+    ):
+        raise RuntimeError("DFlash2 benchmark candidate is not effectively adaptive")
+
+
 def _dflash_arm_metrics(
     output: Any,
     runtime: Any,
@@ -140,6 +155,16 @@ def _dflash_arm_metrics(
         "effective_widths": sorted(
             int(value) for value in (telemetry.adaptive_metrics.get("cycles_by_block") or {})
         ),
+        "requested_adaptive": bool(
+            runtime.qwen38_feature_receipt.get("context_route", {}).get(
+                "requested_adaptive"
+            )
+        ),
+        "effective_adaptive": bool(
+            runtime.qwen38_feature_receipt.get("context_route", {}).get(
+                "effective_adaptive"
+            )
+        ),
         "fallback_ar": False,
         "adaptive_metrics": dict(telemetry.adaptive_metrics),
         "token_sha256": _sha256_tokens(list(output.tokens)),
@@ -162,6 +187,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
     parser.add_argument("--conditioner-tokens", type=int, default=32)
+    parser.add_argument(
+        "--conditioner-mode",
+        choices=("same_prompt", "unrelated_prompt"),
+        default="unrelated_prompt",
+    )
+    parser.add_argument(
+        "--dflash2-adaptive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -220,7 +255,12 @@ def _load_native(model: Path) -> tuple[Any, dict[str, Any]]:
     }
 
 
-def _load_dflash(model: Path, draft: Path) -> tuple[Any, dict[str, Any]]:
+def _load_dflash(
+    model: Path,
+    draft: Path,
+    *,
+    draft_adaptive: bool,
+) -> tuple[Any, dict[str, Any]]:
     from mtplx.profiles import apply_profile_env
     from mtplx.runtime import load
 
@@ -242,6 +282,7 @@ def _load_dflash(model: Path, draft: Path) -> tuple[Any, dict[str, Any]]:
         draft_block_size=8,
         draft_quantization="4bit",
         prefill_step_size=2048,
+        draft_adaptive=bool(draft_adaptive),
     )
     runtime_context = build_offline_runtime_context(
         quantize_kv_cache=False,
@@ -261,6 +302,7 @@ def _load_dflash(model: Path, draft: Path) -> tuple[Any, dict[str, Any]]:
         config=config,
     )
     runtime.qwen38_feature_receipt = _install_measured_qwen38_dflash_stack(runtime)
+    validate_candidate_adaptive_receipt(runtime.qwen38_feature_receipt)
     return runtime, {
         "profile": "turbo",
         "native_mtp_loaded": False,
@@ -289,7 +331,7 @@ def _generate_native(runtime: Any, prompt_ids: list[int], args: argparse.Namespa
         draft_sampler=draft_sampler,
         speculative_depth=3,
         seed=args.seed,
-        stop_token_ids=set(),
+        stop_token_ids=stop_token_ids_for_prompt(args.prompt_kind),
         mtp_hidden_variant="post_norm",
         mtp_cache_policy="persistent",
         mtp_history_policy="committed",
@@ -308,7 +350,7 @@ def _generate_dflash(runtime: Any, prompt_ids: list[int], args: argparse.Namespa
         max_tokens=args.max_tokens,
         sampler=SamplerConfig(args.temperature, args.top_p, args.top_k),
         seed=args.seed,
-        stop_token_ids=set(),
+        stop_token_ids=stop_token_ids_for_prompt(args.prompt_kind),
     )
 
 
@@ -335,18 +377,25 @@ def main() -> int:
     runtime, stack = (
         _load_native(args.model)
         if args.engine == "main_native_mtp"
-        else _load_dflash(args.model, args.draft)
+        else _load_dflash(
+            args.model,
+            args.draft,
+            draft_adaptive=bool(args.dflash2_adaptive),
+        )
     )
     if args.engine == "main_native_mtp":
         runtime._final_benchmark_draft_sampler = stack.get("draft_sampler")
     prompt_text, prompt_ids = _load_prompt(args, runtime.tokenizer)
     if len(prompt_ids) != args.prompt_tokens:
         raise RuntimeError("prompt builder missed exact cold-prefill token count")
-    conditioner_text, conditioner_ids = _fit_prompt(
-        runtime.tokenizer,
-        "Write a Python function named clamp and include two tests.",
-        64,
-    )
+    if args.conditioner_mode == "same_prompt":
+        conditioner_text, conditioner_ids = prompt_text, list(prompt_ids)
+    else:
+        conditioner_text, conditioner_ids = _fit_prompt(
+            runtime.tokenizer,
+            "Write a Python function named clamp and include two tests.",
+            64,
+        )
     del prompt_text, conditioner_text
 
     conditioner_args = argparse.Namespace(**vars(args))
@@ -361,6 +410,8 @@ def main() -> int:
     started = time.perf_counter()
     output = generate(runtime, prompt_ids, args)
     wall_s = time.perf_counter() - started
+    if args.engine == "pr_dflash2":
+        validate_candidate_adaptive_receipt(runtime.qwen38_feature_receipt)
     arm = (
         native_arm_metrics(output, prompt_tokens=len(prompt_ids), wall_s=wall_s)
         if args.engine == "main_native_mtp"
@@ -387,7 +438,7 @@ def main() -> int:
             "prompt_kind": args.prompt_kind,
             "prompt_tokens": len(prompt_ids),
             "prompt_token_sha256": _sha256_tokens(prompt_ids),
-            "generated_tokens": args.max_tokens,
+            "output_limit": args.max_tokens,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
@@ -411,7 +462,14 @@ def main() -> int:
             "prefix_cache_used": False,
             "conditioner_prompt_tokens": len(conditioner_ids),
             "conditioner_output_tokens": args.conditioner_tokens,
-            "conditioner_reuses_timed_prompt": False,
+            "conditioner_mode": args.conditioner_mode,
+            "conditioner_reuses_timed_prompt": args.conditioner_mode == "same_prompt",
+            "output_count_forced": args.prompt_kind != "is_palindrome",
+            "requested_adaptive": (
+                bool(args.dflash2_adaptive)
+                if args.engine == "pr_dflash2"
+                else None
+            ),
         },
         "stack": stack,
         "arm": arm,

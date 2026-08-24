@@ -102,6 +102,65 @@ def test_child_command_pins_source_revision_and_disables_prefix_sessions(tmp_pat
     assert "--session-id" not in command
 
 
+def test_headline_uses_full_same_shape_decode_conditioning() -> None:
+    matrix = _module()
+    args = SimpleNamespace(
+        model=Path("/models/target"),
+        draft=Path("/models/draft"),
+        context_file=Path("/repo/mtplx/generation.py"),
+        prompt_file=Path("/repo/prompt.jsonl"),
+        conditioner_tokens=32,
+        seed=42,
+        lock=Path("/tmp/gpu.lock"),
+    )
+
+    command = matrix.child_command(
+        args,
+        engine="pr_dflash2",
+        source_root=Path("/repo"),
+        source_commit="abc123",
+        scenario=matrix.SCENARIOS[0],
+        output=Path("/tmp/arm.json"),
+    )
+
+    assert command[command.index("--conditioner-tokens") + 1] == "1024"
+    assert command[command.index("--conditioner-mode") + 1] == "same_prompt"
+    assert "--dflash2-adaptive" in command
+
+
+def test_headline_accepts_natural_eos_below_its_output_limit() -> None:
+    matrix = _module()
+    receipts = []
+    for engine, count in (
+        ("main_native_mtp", 180),
+        ("pr_dflash2", 190),
+        ("pr_dflash2", 190),
+        ("main_native_mtp", 180),
+    ):
+        receipts.append(
+            {
+                "arm": {
+                    "engine": engine,
+                    "wall_s": 3.0,
+                    "prefill_tps": 500.0,
+                    "decode_tps": 80.0,
+                    "peak_memory_gib": 20.0,
+                    "prefill_s": 0.2,
+                    "decode_elapsed_s": 2.5,
+                    "generated_tokens": count,
+                    "prompt_tokens": 100,
+                    "fallback_ar": False,
+                    "token_sha256": engine,
+                }
+            }
+        )
+
+    result = matrix.aggregate_scenario(matrix.SCENARIOS[0], receipts)
+
+    assert result["correctness"]["output_limit_respected"] is True
+    assert result["correctness"]["exact_prompt_and_output_counts"] is True
+
+
 def test_aggregate_reports_requested_metrics_and_matched_wall_delta() -> None:
     matrix = _module()
     receipts = []
