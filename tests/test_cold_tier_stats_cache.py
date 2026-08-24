@@ -32,6 +32,10 @@ def _count_connects(tier, monkeypatch) -> list:
 def test_repeated_stats_polls_reuse_cached_aggregate(tmp_path, monkeypatch):
     tier = _tier(tmp_path)
     try:
+        # Prime the independent disk-usage reconciliation before spying on
+        # SQLite. Otherwise the first stats() call starts its background scan,
+        # whose _current_bytes() connection races this manifest-cache check.
+        tier._managed_disk_usage(force=True)
         calls = _count_connects(tier, monkeypatch)
         first = tier.stats()
         connects_after_first = len(calls)
