@@ -13,7 +13,7 @@ __all__ = ["MTPLXRuntime", "load", "__version__", "DISPLAY_VERSION"]
 
 
 def _bootstrap_dflash2_command_buffer_environment(argv: list[str] | None = None) -> bool:
-    """Latch measured row-53 settings before any MLX-bearing submodule imports."""
+    """Latch the measured Turbo/DFlash environment before MLX imports."""
 
     arguments = list(sys.argv if argv is None else argv)
     model_value: str | None = None
@@ -29,6 +29,11 @@ def _bootstrap_dflash2_command_buffer_environment(argv: list[str] | None = None)
     model_path = Path(model_value).expanduser()
     if not (model_path / "mtplx_dflash2.json").is_file():
         return False
+    from .profiles import apply_profile_env
+
+    apply_profile_env("turbo")
+    # The external DFlash draft replaces every native/source MTP proposal path.
+    os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] = "1"
     os.environ["MLX_MAX_MB_PER_BUFFER"] = "512"
     os.environ["MLX_MAX_OPS_PER_BUFFER"] = "50"
     return True

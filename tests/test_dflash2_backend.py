@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,14 @@ from tests.dflash2_test_bundle import write_exact_bundle
 
 def _bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return write_exact_bundle(tmp_path / "bundle", monkeypatch=monkeypatch)
+
+
+def _isolate_turbo_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mtplx.profiles import get_profile
+
+    for name in get_profile("turbo").env_dict():
+        monkeypatch.setenv(name, "")
+    monkeypatch.setenv("MTPLX_QWEN38_DISABLE_SOURCE_AUTO", "")
 
 
 def _runtime(tmp_path: Path) -> DFlash2Runtime:
@@ -71,12 +80,23 @@ def test_runtime_config_rejects_physical_width_outside_one_through_eight(
 def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    @dataclass(frozen=True)
+    class DraftCapabilities:
+        default_block_tokens: int = 5
+        max_block_tokens: int = 5
+
     root = _bundle(tmp_path, monkeypatch)
     monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "512")
     monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "50")
+    _isolate_turbo_environment(monkeypatch)
     calls: list[tuple] = []
     target_runtime = SimpleNamespace(
         model=SimpleNamespace(), tokenizer=SimpleNamespace(decode=lambda ids: str(ids))
+    )
+    draft_model = SimpleNamespace(
+        block_size=8,
+        target_layer_ids=(5, 19, 33, 47, 61),
+        capabilities=DraftCapabilities(),
     )
     import mtplx.runtime
     import dflash_mlx.runtime.loading
@@ -93,7 +113,7 @@ def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
         dflash_mlx.runtime.loading,
         "load_draft_bundle",
         lambda path, **kwargs: (
-            calls.append(("draft", Path(path), kwargs)) or (SimpleNamespace(), {"pinned": True})
+            calls.append(("draft", Path(path), kwargs)) or (draft_model, {"pinned": True})
         ),
     )
     monkeypatch.setattr(
@@ -124,9 +144,13 @@ def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
     assert calls[1][2]["draft_quant"] == "w4:gs64"
     assert runtime.backend_id == "dflash2"
     assert runtime.config.draft_block_size == 8
+    assert runtime.draft_model.capabilities.default_block_tokens == 8
+    assert runtime.draft_model.capabilities.max_block_tokens == 8
     assert runtime.qwen38_feature_receipt == {"retained": True}
     assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "512"
     assert os.environ["MLX_MAX_OPS_PER_BUFFER"] == "50"
+    assert os.environ["MTPLX_SUSTAINED_PREFILL"] == "1"
+    assert os.environ["MTPLX_GQA_PACKED_SDPA"] == "1"
 
 
 def test_load_rejects_row53_environment_that_was_not_bootstrapped(
@@ -146,6 +170,7 @@ def test_package_bootstrap_latches_row53_for_dflash2_model(
     root = _bundle(tmp_path, monkeypatch)
     monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
     monkeypatch.delenv("MLX_MAX_OPS_PER_BUFFER", raising=False)
+    _isolate_turbo_environment(monkeypatch)
     import mtplx
 
     assert mtplx._bootstrap_dflash2_command_buffer_environment(
@@ -153,6 +178,9 @@ def test_package_bootstrap_latches_row53_for_dflash2_model(
     ) is True
     assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "512"
     assert os.environ["MLX_MAX_OPS_PER_BUFFER"] == "50"
+    assert os.environ["MTPLX_SUSTAINED_PREFILL"] == "1"
+    assert os.environ["MTPLX_GQA_PACKED_SDPA"] == "1"
+    assert os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] == "1"
 
 
 def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(

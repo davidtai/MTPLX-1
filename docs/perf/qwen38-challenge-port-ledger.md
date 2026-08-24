@@ -271,9 +271,11 @@ also ships the retained DFlash stack through the first-class bundle/runtime
 entry point: target-only Optimized-Speed, the pinned W4/group-64 DFlash draft,
 fixed target rows 21/24/26/48, active rows 50/53, and the retained row-11+15
 adaptive policy over physical blocks 1--8. The exact production verification
-completed the 16,384-token Python prompt and 1,024 output tokens at 713.394
-prefill tok/s, 60.261 decode tok/s, 39.985 s wall, and 32.921 GiB peak, with
-976 drafted and 768 accepted tokens. Its supplemental receipt is
-`final-production-dflash2-entry-python16384in-1024out-t1-2026-08-23.json`;
+completed the 16,384-token Python prompt and 1,024 output tokens at 731.314
+prefill tok/s, 69.489 decode tok/s, 37.173 s wall, and 32.921 GiB peak, with
+1,161 drafted and 823 accepted tokens over 201 cycles at blocks 4--8. This
+supersedes the invalid 60.261 tok/s integration run: that loader exposed only
+block-5 draft capabilities and omitted the pre-import Turbo profile. Its
+receipt is `final-production-dflash2-entry-python16384in-1024out-t1-2026-08-23.json`;
 individual promotion decisions remain in their row-specific four-arm ABBA
 receipts and are not inferred from this single integration run.

@@ -77,9 +77,11 @@ replaces; that delta is composite and is not claimed as an isolated row-8 win.
 The final production-entry verification is likewise supplemental, not a 55th
 proposal row or a promotion bracket. After a 1,024-output conditioner, the
 shipped bundle path completed 16,384 Python input tokens plus 1,024 output at
-713.394 prefill tok/s, 60.261 decode tok/s, 39.985 s wall, and 32.921 GiB peak.
-It proposed 976 tokens, accepted 768, and engaged the retained row-11+15
-adaptive policy for 256 cycles over physical blocks 2--5. See
+731.314 prefill tok/s, 69.489 decode tok/s, 37.173 s wall, and 32.921 GiB peak.
+It proposed 1,161 tokens, accepted 823, and engaged the retained row-11+15
+adaptive policy for 201 cycles over physical blocks 4--8. This supersedes the
+invalid 60.261 tok/s integration measurement, whose production loader exposed
+only block-5 draft capabilities and omitted the pre-import Turbo profile. See
 `final-production-dflash2-entry-python16384in-1024out-t1-2026-08-23.json`.
 
 | Row | Optimization / DFlash disposition | Prefill tok/s | Decode tok/s | Mean wall s | Wall delta | Peak GiB | DFlash2 result | Receipt / evidence |

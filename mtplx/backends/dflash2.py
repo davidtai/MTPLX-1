@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 from pathlib import Path
 from threading import RLock
@@ -14,6 +14,7 @@ from mtplx.dflash2_bundle import (
     DFLASH2_ARCH_ID,
     DFLASH2_BACKEND,
     DFLASH2_DEFAULT_BLOCK_SIZE,
+    DFLASH2_TARGET_LAYER_IDS,
     dflash2_bundle_inspection,
     load_dflash2_metadata,
     resolve_dflash2_bundle_paths,
@@ -32,6 +33,38 @@ _DFLASH2_GENERATION_LOCK = RLock()
 
 class DFlash2Unsupported(RuntimeError):
     """Raised when an MTPLX feature is not supported by DFlash2."""
+
+
+def _install_checkpoint_capabilities(draft_model: Any, *, block_size: int) -> None:
+    """Expose the checkpoint's physical width to the DFlash scheduler."""
+
+    try:
+        checkpoint_block_size = draft_model.block_size
+        target_layer_ids = tuple(draft_model.target_layer_ids)
+    except (AttributeError, TypeError) as error:
+        raise ValueError(
+            "Qwen3.8 DFlash2 draft must expose checkpoint geometry"
+        ) from error
+    if checkpoint_block_size != block_size:
+        raise ValueError(
+            "Qwen3.8 DFlash2 checkpoint block size must match the bundle manifest: "
+            f"{checkpoint_block_size} != {block_size}"
+        )
+    if target_layer_ids != DFLASH2_TARGET_LAYER_IDS:
+        raise ValueError(
+            "Qwen3.8 DFlash2 checkpoint target layer IDs must be "
+            f"{DFLASH2_TARGET_LAYER_IDS}, got {target_layer_ids}"
+        )
+    try:
+        draft_model.capabilities = replace(
+            draft_model.capabilities,
+            default_block_tokens=block_size,
+            max_block_tokens=block_size,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "Qwen3.8 DFlash2 draft must expose replaceable runtime capabilities"
+        ) from error
 
 
 def _normalise_quantization(value: Any) -> DFlash2Quantization:
@@ -235,6 +268,10 @@ def load_dflash2_bundle(
             "DFlash2 row-53 MLX_MAX_MB_PER_BUFFER=512 and "
             "MLX_MAX_OPS_PER_BUFFER=50 must be set before importing MLX"
         )
+    from mtplx.profiles import apply_profile_env
+
+    apply_profile_env("turbo")
+    os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] = "1"
     root = Path(bundle_root).expanduser()
     resolved = resolve_dflash2_bundle_paths(root)
     if resolved is None:
@@ -286,6 +323,10 @@ def load_dflash2_bundle(
         config.draft_model_path,
         lazy=True,
         draft_quant=draft_quant,
+    )
+    _install_checkpoint_capabilities(
+        draft_model,
+        block_size=config.draft_block_size,
     )
     bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
     draft_backend = EagerDraftBackend()

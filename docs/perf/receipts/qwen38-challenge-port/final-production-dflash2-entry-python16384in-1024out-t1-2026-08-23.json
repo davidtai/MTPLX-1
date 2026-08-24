@@ -16,28 +16,32 @@
   },
   "bundle": "/tmp/mtplx-dflash2-production.eyEGbZ",
   "conditioner": {
-    "accepted_drafts": 768,
-    "decode_time_s": 17.525195499999995,
-    "decode_tok_s": 58.43016130690241,
+    "accepted_drafts": 823,
+    "decode_time_s": 15.084658332999997,
+    "decode_tok_s": 67.88353951377496,
     "draft_core": {
-      "accepted_tokens": 768,
+      "accepted_tokens": 823,
       "adaptive_metrics": {
-        "cycles": 256,
+        "cycles": 201,
         "cycles_by_block": {
-          "2": 1,
-          "3": 15,
-          "4": 15,
-          "5": 225
+          "4": 9,
+          "5": 29,
+          "6": 31,
+          "7": 61,
+          "8": 71
         },
-        "final_block_limit": 5,
-        "full_accept_streak": 1,
+        "final_block_limit": 8,
+        "full_accept_streak": 4,
         "kind": "qwen38_position_ema",
         "last_draft_margins": [],
         "position_accept_ema": [
-          0.9058792108914065,
-          0.8896710628188811,
-          0.9662807938747104,
-          0.8090460270833102
+          0.9083386552330631,
+          0.9699102191052246,
+          0.950481731257441,
+          0.948842487018114,
+          0.9371874573719543,
+          0.9930807322578397,
+          0.8528964201962094
         ],
         "proposal_rows": [
           11,
@@ -46,45 +50,63 @@
         "serial_cycles": 0
       },
       "backend": "dflash2",
-      "chunks": 256,
-      "drafted_tokens": 976,
+      "chunks": 201,
+      "drafted_tokens": 1161,
       "events": [],
       "finish_reason": "length",
       "generated_tokens": 1024,
-      "generation_tps": 58.43016130690241,
-      "peak_memory_bytes": 35273442932,
+      "generation_tps": 67.88353951377496,
+      "peak_memory_bytes": 35273606772,
       "prompt_tokens": 16384,
-      "prompt_tps": 809.1445349909702
+      "prompt_tps": 818.65507759738
     },
-    "drafted_tokens": 976,
+    "drafted_tokens": 1161,
     "finish_reason": "length",
-    "generated_token_sha256": "44df1eef4b30596a64682f21e69c19032cbf1532d4030dc29b7b7a6aa3488175",
+    "generated_token_sha256": "82cff1b18e50839f2cf733460e70da1ad09552eb1a4ee719c66df4a39cd9ba22",
     "generated_tokens": 1024,
-    "peak_memory_bytes": 35273442932,
-    "peak_memory_gib": 32.85095368698239,
-    "prefill_time_s": 20.248545583000002,
-    "prefill_tok_s": 809.1445349909702,
+    "peak_memory_bytes": 35273606772,
+    "peak_memory_gib": 32.85110627487302,
+    "prefill_time_s": 20.013312625,
+    "prefill_tok_s": 818.65507759738,
     "prefill_tokens": 16384,
-    "verify_calls": 256,
-    "wall_s": 37.82290708398796
+    "verify_calls": 201,
+    "wall_s": 35.14204104201053
   },
-  "git_commit": "1f52ac4dfe9e16cfa93177335897ff0bc5d1fecf",
+  "git_commit": "3e069b593ab9d93746a11f4d31e36bad028e71ee",
   "git_worktree_dirty": true,
   "kind": "qwen38_dflash2_production_entry_verification",
-  "recorded_at": "2026-08-24T04:42:39.627912+00:00",
+  "recorded_at": "2026-08-24T09:57:42.540620+00:00",
   "reporting": {
     "candidate_decision": false,
     "canonical_table": "docs/perf/qwen38-challenge-performance-tables.md",
     "dflash2_rows": 54,
     "matched_wall_delta_pct": null,
     "native_mtp_rows": 54,
-    "reason": "production-entry integration verification only; row decisions use their recorded four-arm ABBA brackets"
+    "reason": "production-entry integration verification only; row decisions use their recorded four-arm ABBA brackets",
+    "supersedes_invalid_integration_measurement": {
+      "decode_tok_s": 60.26145143012146,
+      "reason": "the earlier loader exposed block 5 capabilities and omitted the pre-import Turbo profile",
+      "verify_calls": 256
+    }
+  },
+  "source_files_sha256": {
+    "mtplx/__init__.py": "eac262fed6b1b33455b9c27800c23f82a530dd96625b729dfd6947bf65041259",
+    "mtplx/backends/dflash2.py": "358ccb91ddfad6cd447672c27b6a406cd4ec01f96cf136a988f29028760ec0d3",
+    "mtplx/dflash2_bundle.py": "215ecee33c69b1a9f22540b29ca30bb4867472c23560269b9ba6c616fa59af59",
+    "mtplx/generation.py": "dfa72b4d7b161ef6f6105b0a635cff3bf3d112f37bdb4f0d1a4eb092ccbf5771",
+    "mtplx/runtime.py": "aa3999323e2c053ac95fa98260d56e0e75f53a46746b62429950b8ed3f93308c",
+    "pyproject.toml": "ba39455577ed08fe3862e613322008d544b3357ee3992c7b6a97156d45e2c069",
+    "uv.lock": "384d60e15c73f89212c48e3e0ab981891468277b8301497b16c9a81346f5daf0"
   },
   "runtime": {
     "backend_id": "dflash2",
     "command_buffer_environment": {
       "MLX_MAX_MB_PER_BUFFER": "512",
       "MLX_MAX_OPS_PER_BUFFER": "50"
+    },
+    "draft_capabilities": {
+      "default_block_tokens": 8,
+      "max_block_tokens": 8
     },
     "external_dflash_draft": true,
     "feature_receipt": {
@@ -130,12 +152,12 @@
       },
       "r50_wired_residency": {
         "active": true,
-        "active_memory_bytes": 20534344712,
+        "active_memory_bytes": 20534508560,
         "baseline_limit_bytes": 0,
         "installed": true,
         "max_recommended_working_set_bytes": 107374182400,
         "slack_bytes": 67108864,
-        "target_limit_bytes": 20601453576
+        "target_limit_bytes": 20601617424
       },
       "r53_command_buffers": {
         "active": true,
@@ -149,38 +171,33 @@
     "physical_block_size": 8
   },
   "schema_version": 1,
-  "source_files_sha256": {
-    "mtplx/__init__.py": "b2d402b80fed10315920e3c97e7e339ca9c8ee0921fab7b70329576bdb24c222",
-    "mtplx/backends/dflash2.py": "879a8e8c11da5fdacf2743a1560ae257037b8a1809cfca9949ace392902d7676",
-    "mtplx/dflash2_bundle.py": "215ecee33c69b1a9f22540b29ca30bb4867472c23560269b9ba6c616fa59af59",
-    "mtplx/generation.py": "dfa72b4d7b161ef6f6105b0a635cff3bf3d112f37bdb4f0d1a4eb092ccbf5771",
-    "mtplx/runtime.py": "aa3999323e2c053ac95fa98260d56e0e75f53a46746b62429950b8ed3f93308c",
-    "pyproject.toml": "ba39455577ed08fe3862e613322008d544b3357ee3992c7b6a97156d45e2c069",
-    "uv.lock": "384d60e15c73f89212c48e3e0ab981891468277b8301497b16c9a81346f5daf0"
-  },
   "timed_production_entry": {
-    "accepted_drafts": 768,
-    "decode_time_s": 16.992620916,
-    "decode_tok_s": 60.26145143012146,
+    "accepted_drafts": 823,
+    "decode_time_s": 14.736240165999998,
+    "decode_tok_s": 69.48855260669617,
     "draft_core": {
-      "accepted_tokens": 768,
+      "accepted_tokens": 823,
       "adaptive_metrics": {
-        "cycles": 256,
+        "cycles": 201,
         "cycles_by_block": {
-          "2": 1,
-          "3": 15,
-          "4": 15,
-          "5": 225
+          "4": 9,
+          "5": 29,
+          "6": 31,
+          "7": 61,
+          "8": 71
         },
-        "final_block_limit": 5,
-        "full_accept_streak": 1,
+        "final_block_limit": 8,
+        "full_accept_streak": 4,
         "kind": "qwen38_position_ema",
         "last_draft_margins": [],
         "position_accept_ema": [
-          0.9058792108914065,
-          0.8896710628188811,
-          0.9662807938747104,
-          0.8090460270833102
+          0.9083386552330631,
+          0.9699102191052246,
+          0.950481731257441,
+          0.948842487018114,
+          0.9371874573719543,
+          0.9930807322578397,
+          0.8528964201962094
         ],
         "proposal_rows": [
           11,
@@ -189,26 +206,26 @@
         "serial_cycles": 0
       },
       "backend": "dflash2",
-      "chunks": 256,
-      "drafted_tokens": 976,
+      "chunks": 201,
+      "drafted_tokens": 1161,
       "events": [],
       "finish_reason": "length",
       "generated_tokens": 1024,
-      "generation_tps": 60.26145143012146,
-      "peak_memory_bytes": 35348302608,
+      "generation_tps": 69.48855260669617,
+      "peak_memory_bytes": 35348728592,
       "prompt_tokens": 16384,
-      "prompt_tps": 713.394207369323
+      "prompt_tps": 731.3137976046661
     },
-    "drafted_tokens": 976,
+    "drafted_tokens": 1161,
     "finish_reason": "length",
-    "generated_token_sha256": "44df1eef4b30596a64682f21e69c19032cbf1532d4030dc29b7b7a6aa3488175",
+    "generated_token_sha256": "82cff1b18e50839f2cf733460e70da1ad09552eb1a4ee719c66df4a39cd9ba22",
     "generated_tokens": 1024,
-    "peak_memory_bytes": 35348302608,
-    "peak_memory_gib": 32.920672193169594,
-    "prefill_time_s": 22.966264416999998,
-    "prefill_tok_s": 713.394207369323,
+    "peak_memory_bytes": 35348728592,
+    "peak_memory_gib": 32.92106892168522,
+    "prefill_time_s": 22.4035155,
+    "prefill_tok_s": 731.3137976046661,
     "prefill_tokens": 16384,
-    "verify_calls": 256,
-    "wall_s": 39.98502516699955
+    "verify_calls": 201,
+    "wall_s": 37.17274070798885
   }
 }
