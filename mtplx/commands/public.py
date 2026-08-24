@@ -197,10 +197,9 @@ def _prepare_dflash2_args(args: Any) -> dict[str, Any] | None:
         return None
     if requested and requested != DFLASH2_BACKEND_ID:
         raise ValueError(f"DFlash2 bundle requires backend_id={DFLASH2_BACKEND_ID}")
-    # Retained row 53 is process-latched, so install it before MLX is imported
-    # by either the one-shot path or the spawned server.
-    os.environ["MLX_MAX_MB_PER_BUFFER"] = "512"
-    os.environ["MLX_MAX_OPS_PER_BUFFER"] = "50"
+    # Row 53 is process-latched; the final 16K gate selected MLX stock limits.
+    os.environ.pop("MLX_MAX_MB_PER_BUFFER", None)
+    os.environ.pop("MLX_MAX_OPS_PER_BUFFER", None)
     args.dflash2_bundle = bundle
     args.dflash2_target_model = bundle.get("target_model")
     args.dflash2_draft_model = bundle.get("draft_model")

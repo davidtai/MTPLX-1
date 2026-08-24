@@ -86,8 +86,8 @@ def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
         max_block_tokens: int = 5
 
     root = _bundle(tmp_path, monkeypatch)
-    monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "512")
-    monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "50")
+    monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+    monkeypatch.delenv("MLX_MAX_OPS_PER_BUFFER", raising=False)
     _isolate_turbo_environment(monkeypatch)
     calls: list[tuple] = []
     target_runtime = SimpleNamespace(
@@ -147,24 +147,24 @@ def test_load_uses_target_only_mtplx_and_pinned_dflash_mlx(
     assert runtime.draft_model.capabilities.default_block_tokens == 8
     assert runtime.draft_model.capabilities.max_block_tokens == 8
     assert runtime.qwen38_feature_receipt == {"retained": True}
-    assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "512"
-    assert os.environ["MLX_MAX_OPS_PER_BUFFER"] == "50"
+    assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
+    assert "MLX_MAX_OPS_PER_BUFFER" not in os.environ
     assert os.environ["MTPLX_SUSTAINED_PREFILL"] == "1"
     assert os.environ["MTPLX_GQA_PACKED_SDPA"] == "1"
 
 
-def test_load_rejects_row53_environment_that_was_not_bootstrapped(
+def test_load_rejects_retired_row53_environment_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _bundle(tmp_path, monkeypatch)
-    monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-    monkeypatch.delenv("MLX_MAX_OPS_PER_BUFFER", raising=False)
+    monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "512")
+    monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "50")
 
-    with pytest.raises(RuntimeError, match="must be set before importing MLX"):
+    with pytest.raises(RuntimeError, match="must be unset before importing MLX"):
         load_dflash2_bundle(root)
 
 
-def test_package_bootstrap_latches_row53_for_dflash2_model(
+def test_package_bootstrap_selects_stock_row53_for_dflash2_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _bundle(tmp_path, monkeypatch)
@@ -176,11 +176,103 @@ def test_package_bootstrap_latches_row53_for_dflash2_model(
     assert mtplx._bootstrap_dflash2_command_buffer_environment(
         ["mtplx", "serve", "--model", str(root)]
     ) is True
-    assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "512"
-    assert os.environ["MLX_MAX_OPS_PER_BUFFER"] == "50"
+    assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
+    assert "MLX_MAX_OPS_PER_BUFFER" not in os.environ
     assert os.environ["MTPLX_SUSTAINED_PREFILL"] == "1"
     assert os.environ["MTPLX_GQA_PACKED_SDPA"] == "1"
     assert os.environ["MTPLX_QWEN38_DISABLE_SOURCE_AUTO"] == "1"
+
+
+def test_measured_context_route_splits_only_the_supported_phase_controls() -> None:
+    assert backend.qwen38_dflash_context_route(1024) == {
+        "route_id": "short_lt16384",
+        "adaptive_active": True,
+        "row21_active": True,
+        "row24_prefill_active": True,
+        "row24_decode_active": True,
+        "row48_prefill_active": True,
+        "row48_decode_active": True,
+        "row50_active": False,
+    }
+    assert backend.qwen38_dflash_context_route(16_384) == {
+        "route_id": "long_ge16384",
+        "adaptive_active": False,
+        "row21_active": False,
+        "row24_prefill_active": False,
+        "row24_decode_active": True,
+        "row48_prefill_active": True,
+        "row48_decode_active": True,
+        "row50_active": True,
+    }
+
+
+def test_context_route_is_applied_to_every_phase_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.qwen38_feature_receipt = {"installed": True}
+    calls: dict[str, list[tuple]] = {
+        "row21": [],
+        "row24_qk": [],
+        "row24": [],
+        "row48": [],
+        "adaptive": [],
+        "row50": [],
+    }
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_row21_qk_rms_rope",
+        lambda model, *, active: calls["row21"].append((active,)) or {"active": active},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_row24_qk_length_limit",
+        lambda model, *, active, max_length: calls["row24_qk"].append(
+            (active, max_length)
+        )
+        or {"active": active},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_row24_eval_ladder",
+        lambda model, **kwargs: calls["row24"].append(
+            (kwargs["prefill_active"], kwargs["decode_active"])
+        )
+        or {"active": kwargs["active"]},
+    )
+    monkeypatch.setattr(
+        "mtplx.gdn_capture.configure_qwen38_dflash_row48_boundary",
+        lambda model, **kwargs: calls["row48"].append(
+            (kwargs["prefill_active"], kwargs["decode_active"])
+        )
+        or {"active": kwargs["active"]},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_dflash_adaptive.configure_qwen38_dflash_adaptive_policy",
+        lambda model, *, active, proposal_rows: calls["adaptive"].append((active,))
+        or {"active": active},
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.configure_qwen38_row50_wired_residency",
+        lambda target_runtime, *, active: calls["row50"].append((active,))
+        or {"installed": active},
+    )
+
+    backend._apply_measured_qwen38_dflash_context_route(
+        runtime, prompt_tokens=1024
+    )
+    backend._apply_measured_qwen38_dflash_context_route(
+        runtime, prompt_tokens=16_384
+    )
+
+    assert calls == {
+        "row21": [(True,), (False,)],
+        "row24_qk": [(True, 32), (True, 32)],
+        "row24": [(True, True), (False, True)],
+        "row48": [(True, True), (True, True)],
+        "adaptive": [(True,), (False,)],
+        "row50": [(False,), (True,)],
+    }
+    assert runtime.qwen38_feature_receipt["context_route"]["route_id"] == (
+        "long_ge16384"
+    )
 
 
 def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
@@ -197,8 +289,11 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     )
     monkeypatch.setattr(
         "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_row24_eval_ladder",
-        lambda model, *, active, prefill_stride: {
-            "installed": active, "prefill_stride": prefill_stride
+        lambda model, *, active, prefill_stride, prefill_active, decode_active: {
+            "installed": active,
+            "prefill_stride": prefill_stride,
+            "prefill_active": prefill_active,
+            "decode_active": decode_active,
         },
     )
     monkeypatch.setattr(
@@ -259,7 +354,11 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     )
     monkeypatch.setattr(
         "mtplx.gdn_capture.configure_qwen38_dflash_row48_boundary",
-        lambda model, *, active: {"installed": active},
+        lambda model, *, active, prefill_active, decode_active: {
+            "installed": active,
+            "prefill_active": prefill_active,
+            "decode_active": decode_active,
+        },
     )
     monkeypatch.setattr(
         "mtplx.qwen38_dflash_adaptive.configure_qwen38_dflash_adaptive_policy",

@@ -26,6 +26,7 @@ ARCH_ID = DFLASH2_ARCH_ID
 # block of up to eight tokens.  Those are different axes.
 DEFAULT_DFLASH2_BLOCK_SIZE = DFLASH2_DEFAULT_BLOCK_SIZE
 DEFAULT_DRAFT_BLOCK_SIZE = DEFAULT_DFLASH2_BLOCK_SIZE
+QWEN38_DFLASH_LONG_CONTEXT_TOKENS = 16_384
 DFlash2Quantization = Literal["4bit", "8bit", "unquantized"]
 _DFLASH2_QUANTIZATIONS = {"4bit", "8bit", "unquantized"}
 _DFLASH2_GENERATION_LOCK = RLock()
@@ -259,14 +260,14 @@ def load_dflash2_bundle(
     # MLX reads these once when its Metal device is constructed.  The package
     # bootstrap handles CLI/server argv before importing MLX; direct Python
     # callers must establish the same process contract before importing MTPLX.
-    required_environment = {
-        "MLX_MAX_MB_PER_BUFFER": "512",
-        "MLX_MAX_OPS_PER_BUFFER": "50",
-    }
-    if any(os.environ.get(name) != value for name, value in required_environment.items()):
+    retired_environment = (
+        "MLX_MAX_MB_PER_BUFFER",
+        "MLX_MAX_OPS_PER_BUFFER",
+    )
+    if any(name in os.environ for name in retired_environment):
         raise RuntimeError(
-            "DFlash2 row-53 MLX_MAX_MB_PER_BUFFER=512 and "
-            "MLX_MAX_OPS_PER_BUFFER=50 must be set before importing MLX"
+            "DFlash2 row-53 MLX_MAX_MB_PER_BUFFER and MLX_MAX_OPS_PER_BUFFER "
+            "must be unset before importing MLX"
         )
     from mtplx.profiles import apply_profile_env
 
@@ -383,11 +384,15 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             model, active=True, max_length=32
         ),
         "r24_eval_ladder": configure_qwen38_dflash_row24_eval_ladder(
-            model, active=True, prefill_stride=3
+            model,
+            active=True,
+            prefill_stride=3,
+            prefill_active=True,
+            decode_active=True,
         ),
         "r26_prefill_ladder_3": {"active": 1},
         "r48_boundary_fused": configure_qwen38_dflash_row48_boundary(
-            model, active=True
+            model, active=True, prefill_active=True, decode_active=True
         ),
         "dflash_gqa_widths": configure_qwen38_dflash_gqa_widths(
             model, active=True, widths=(6, 7, 8)
@@ -411,13 +416,13 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             model, active=True, proposal_rows=(11, 15)
         ),
         "r50_wired_residency": configure_qwen38_row50_wired_residency(
-            runtime.target_runtime, active=True
+            runtime.target_runtime, active=False
         ),
         "r53_command_buffers": {
-            "active": True,
+            "active": False,
             "installed": True,
-            "max_mb_per_buffer": 512,
-            "max_ops_per_buffer": 50,
+            "max_mb_per_buffer": None,
+            "max_ops_per_buffer": None,
             "process_latched": True,
         },
         "native_mtp_release": {
@@ -425,9 +430,83 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
             "native_mtp_loaded": False,
         },
     }
-    if not bool(receipt["r50_wired_residency"].get("installed")):
-        raise RuntimeError("retained DFlash row 50 residency policy did not install")
+    receipt["context_route"] = qwen38_dflash_context_route(1024)
     return receipt
+
+
+def qwen38_dflash_context_route(prompt_tokens: int) -> dict[str, Any]:
+    """Return the independently measured short/long DFlash phase route."""
+
+    long_context = int(prompt_tokens) >= QWEN38_DFLASH_LONG_CONTEXT_TOKENS
+    return {
+        "route_id": "long_ge16384" if long_context else "short_lt16384",
+        "adaptive_active": not long_context,
+        "row21_active": not long_context,
+        "row24_prefill_active": not long_context,
+        "row24_decode_active": True,
+        "row48_prefill_active": True,
+        "row48_decode_active": True,
+        "row50_active": long_context,
+    }
+
+
+def _apply_measured_qwen38_dflash_context_route(
+    runtime: DFlash2Runtime,
+    *,
+    prompt_tokens: int,
+) -> dict[str, Any]:
+    """Apply the measured route while the serialized generation lock is held."""
+
+    from mtplx.gdn_capture import configure_qwen38_dflash_row48_boundary
+    from mtplx.qwen38_challenge import configure_qwen38_row50_wired_residency
+    from mtplx.qwen38_challenge_kernels import (
+        configure_qwen38_dflash_row24_eval_ladder,
+        configure_qwen38_row21_qk_rms_rope,
+        configure_qwen38_row24_qk_length_limit,
+    )
+    from mtplx.qwen38_dflash_adaptive import configure_qwen38_dflash_adaptive_policy
+
+    route = qwen38_dflash_context_route(prompt_tokens)
+    model = runtime.target_model
+    updates = {
+        "r21_qk_rms_rope": configure_qwen38_row21_qk_rms_rope(
+            model, active=bool(route["row21_active"])
+        ),
+        "r24_qk_length_limit": configure_qwen38_row24_qk_length_limit(
+            model, active=True, max_length=32
+        ),
+        "r24_eval_ladder": configure_qwen38_dflash_row24_eval_ladder(
+            model,
+            active=True,
+            prefill_stride=3,
+            prefill_active=bool(route["row24_prefill_active"]),
+            decode_active=bool(route["row24_decode_active"]),
+        ),
+        "r48_boundary_fused": configure_qwen38_dflash_row48_boundary(
+            model,
+            active=True,
+            prefill_active=bool(route["row48_prefill_active"]),
+            decode_active=bool(route["row48_decode_active"]),
+        ),
+        "adaptive_policy": configure_qwen38_dflash_adaptive_policy(
+            model,
+            active=bool(route["adaptive_active"]),
+            proposal_rows=(11, 15),
+        ),
+        "r50_wired_residency": configure_qwen38_row50_wired_residency(
+            runtime.target_runtime, active=bool(route["row50_active"])
+        ),
+        "context_route": route,
+    }
+    if route["row50_active"] and not bool(
+        updates["r50_wired_residency"].get("installed")
+    ):
+        raise RuntimeError("long-context DFlash row 50 residency policy did not install")
+    runtime.qwen38_feature_receipt = {
+        **dict(runtime.qwen38_feature_receipt),
+        **updates,
+    }
+    return updates
 
 
 def _unsupported_options(
@@ -545,6 +624,11 @@ def _generate_stream(
     summary = None
     cycle_events: list[dict[str, Any]] = []
     with _dflash_target_sampling(sampler, seed=seed):
+        if runtime.qwen38_feature_receipt:
+            _apply_measured_qwen38_dflash_context_route(
+                runtime,
+                prompt_tokens=len(prompt_ids),
+            )
         stream = stream_dflash_generate(
             target_model=runtime.target_model,
             target_ops=runtime.target_ops,

@@ -31476,8 +31476,8 @@ def _apply_backend_server_defaults(
         dflash2_bundle = resolve_dflash2_bundle_paths(model_ref)
         if dflash2_bundle is None:
             raise ValueError("invalid DFlash2 bundle; refusing native-MTP fallback")
-        os.environ["MLX_MAX_MB_PER_BUFFER"] = "512"
-        os.environ["MLX_MAX_OPS_PER_BUFFER"] = "50"
+        os.environ.pop("MLX_MAX_MB_PER_BUFFER", None)
+        os.environ.pop("MLX_MAX_OPS_PER_BUFFER", None)
         args.dflash2_bundle = dflash2_bundle
         args.dflash2_target_model = dflash2_bundle.get("target_model")
         args.dflash2_draft_model = dflash2_bundle.get("draft_model")
