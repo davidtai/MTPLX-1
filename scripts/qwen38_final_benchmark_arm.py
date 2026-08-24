@@ -17,7 +17,10 @@ from typing import Any
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
-IS_PALINDROME_PROMPT = """Write only Python code. Implement `is_palindrome(text: str) -> bool`. Normalize by retaining Unicode letters and digits and applying `casefold()`, then compare the normalized text with its reverse. Treat empty and punctuation-only strings as palindromes. Do not include tests, docstrings, examples, markdown fences, explanations, helper functions, classes, imports, or command-line code. Keep the function concise and at most four lines."""
+IS_PALINDROME_PROMPT = '''Complete this Python function. Return only the function body, with no markdown or explanation.
+
+def is_palindrome(text: str) -> bool:
+    """Return whether text reads the same forward and backward. Ignore whitespace, punctuation, and case, while handling Unicode letters and digits. Empty input counts as a palindrome. For example, "A man, a plan, a canal: Panama" is true and "hello" is false."""'''
 
 
 def _sha256_tokens(tokens: list[int]) -> str:

@@ -43,7 +43,7 @@ def test_scenarios_are_exact_cold_prefill_lengths_not_prefix_additions() -> None
     matrix = _module()
 
     assert [(item.name, item.prompt_tokens) for item in matrix.SCENARIOS] == [
-        ("burst_is_palindrome", 101),
+        ("burst_is_palindrome", 100),
         ("coding_cold_prefill_1k", 1_024),
         ("coding_cold_prefill_16k", 16_384),
         ("coding_cold_prefill_64k", 65_536),
@@ -148,7 +148,7 @@ def test_headline_accepts_natural_eos_below_its_output_limit() -> None:
                     "prefill_s": 0.2,
                     "decode_elapsed_s": 2.5,
                     "generated_tokens": count,
-                    "prompt_tokens": 101,
+                    "prompt_tokens": 100,
                     "fallback_ar": False,
                     "token_sha256": engine,
                 }
