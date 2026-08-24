@@ -398,7 +398,12 @@ def test_row24_dflash_eval_ladder_uses_prefill_and_decode_rungs(monkeypatch) -> 
         active=True,
         prefill_stride=4,
     )
-    assert report == {"active": 1, "prefill_stride": 4}
+    assert report == {
+        "active": 1,
+        "prefill_stride": 4,
+        "prefill_active": 1,
+        "decode_active": 1,
+    }
     decode = mx.zeros((1, 8, 16))
     for layer_index in range(3):
         inner._dflash_post_layer(decode, layer_index)
@@ -418,8 +423,36 @@ def test_row24_dflash_eval_ladder_uses_prefill_and_decode_rungs(monkeypatch) -> 
         active=False,
         prefill_stride=4,
     )
-    assert inactive == {"active": 0, "prefill_stride": 0}
+    assert inactive == {
+        "active": 0,
+        "prefill_stride": 0,
+        "prefill_active": 0,
+        "decode_active": 0,
+    }
     assert not hasattr(inner, "_dflash_post_layer")
+
+
+def test_row24_dflash_eval_ladder_can_disable_prefill_only(monkeypatch) -> None:
+    inner = SimpleNamespace(layers=[])
+    model = SimpleNamespace(model=inner)
+    calls = []
+    monkeypatch.setattr(
+        kernels,
+        "qwen38_row24_async_eval",
+        lambda value, *, row26=False: calls.append((tuple(value.shape), row26)),
+    )
+    report = configure_qwen38_dflash_row24_eval_ladder(
+        model,
+        active=True,
+        prefill_stride=3,
+        prefill_active=False,
+        decode_active=True,
+    )
+    inner._dflash_post_layer(mx.zeros((1, 512, 16)), 0)
+    inner._dflash_post_layer(mx.zeros((1, 8, 16)), 0)
+    assert report["prefill_active"] == 0
+    assert report["decode_active"] == 1
+    assert calls == [((1, 8, 16), False)]
 
 
 def test_row48_config_exposes_dflash_cross_layer_fusion(monkeypatch) -> None:
@@ -446,12 +479,20 @@ def test_row48_config_exposes_dflash_cross_layer_fusion(monkeypatch) -> None:
     before = qwen38_row48_boundary_counter_snapshot()
 
     report = configure_qwen38_dflash_row48_boundary(model, active=True)
-    assert report == {"eligible_modules": 2, "active_modules": 2}
+    assert report == {
+        "eligible_modules": 2,
+        "active_modules": 2,
+        "prefill_active": 1,
+        "decode_active": 1,
+    }
     inner._dflash_boundary_begin()
+    base = mx.zeros((1, 8, 16))
+    delta = mx.zeros((1, 8, 16))
+    weight = mx.ones((16,))
     assert inner._dflash_fused_add_rmsnorm(
-        "base",
-        "delta",
-        "weight",
+        base,
+        delta,
+        weight,
         1e-6,
         merged_boundary=True,
     ) == ("hidden", "normed")
@@ -459,9 +500,67 @@ def test_row48_config_exposes_dflash_cross_layer_fusion(monkeypatch) -> None:
 
     assert after["calls"] == before["calls"] + 1
     assert after["merged_boundaries"] == before["merged_boundaries"] + 1
-    assert calls == [("base", "delta", "weight", 1e-6, 1024)]
+    assert len(calls) == 1
+    assert calls[0][0] is base
+    assert calls[0][1] is delta
+    assert calls[0][2] is weight
+    assert calls[0][3:] == (1e-6, 1024)
 
     inactive = configure_qwen38_dflash_row48_boundary(model, active=False)
-    assert inactive == {"eligible_modules": 2, "active_modules": 0}
+    assert inactive == {
+        "eligible_modules": 2,
+        "active_modules": 0,
+        "prefill_active": 0,
+        "decode_active": 0,
+    }
     assert not hasattr(inner, "_dflash_boundary_begin")
     assert not hasattr(inner, "_dflash_fused_add_rmsnorm")
+
+
+def test_row48_config_can_keep_decode_fused_and_prefill_stock(monkeypatch) -> None:
+    layer = SimpleNamespace(
+        input_layernorm=object(),
+        post_attention_layernorm=object(),
+        mlp=object(),
+        self_attn=object(),
+    )
+    inner = SimpleNamespace(layers=[layer])
+    model = SimpleNamespace(model=inner)
+    from mtplx.kernels import fused_norm
+
+    fused_calls = []
+    monkeypatch.setattr(
+        fused_norm,
+        "fused_add_rmsnorm",
+        lambda *args, **kwargs: fused_calls.append((args, kwargs))
+        or ("hidden", "normed"),
+    )
+    report = configure_qwen38_dflash_row48_boundary(
+        model,
+        active=True,
+        prefill_active=False,
+        decode_active=True,
+    )
+    prefill_base = mx.ones((1, 512, 16), dtype=mx.bfloat16)
+    prefill_delta = mx.ones((1, 512, 16), dtype=mx.bfloat16)
+    weight = mx.ones((16,), dtype=mx.bfloat16)
+    hidden, normed = inner._dflash_fused_add_rmsnorm(
+        prefill_base,
+        prefill_delta,
+        weight,
+        1e-6,
+        merged_boundary=True,
+    )
+    mx.eval(hidden, normed)
+    assert mx.array_equal(hidden, prefill_base + prefill_delta).item()
+    assert fused_calls == []
+    assert inner._dflash_fused_add_rmsnorm(
+        mx.ones((1, 8, 16), dtype=mx.bfloat16),
+        mx.ones((1, 8, 16), dtype=mx.bfloat16),
+        weight,
+        1e-6,
+        merged_boundary=True,
+    ) == ("hidden", "normed")
+    assert len(fused_calls) == 1
+    assert report["prefill_active"] == 0
+    assert report["decode_active"] == 1

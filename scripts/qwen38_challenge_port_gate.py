@@ -672,6 +672,7 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         qwen38_q8_embedding_dual_norm_counter_snapshot,
         qwen38_qk_rms_rope_counter_snapshot,
         qwen38_row24_eval_ladder_counter_snapshot,
+        qwen38_row24_eval_ladder_phase_counter_snapshot,
         qwen38_row24_qk_length_fallback_counter_snapshot,
         qwen38_row26_prefill_ladder_counter_snapshot,
         qwen38_row26_qk_widen_counter_snapshot,
@@ -694,7 +695,10 @@ def _projection_counter_snapshot() -> dict[str, dict[str, int]]:
         "r18_gdn_decay_memo": dict(QWEN38_GDN_DECAY_MEMO_COUNTERS),
         "r20_kv_only_history": qwen38_kv_only_history_counter_snapshot(),
         "r21_qk_rms_rope": {"calls": qwen38_qk_rms_rope_counter_snapshot()},
-        "r24_eval_ladder": {"calls": qwen38_row24_eval_ladder_counter_snapshot()},
+        "r24_eval_ladder": {
+            "calls": qwen38_row24_eval_ladder_counter_snapshot(),
+            **qwen38_row24_eval_ladder_phase_counter_snapshot(),
+        },
         "r24_qk_length_limit": {
             "fallback_calls": qwen38_row24_qk_length_fallback_counter_snapshot()
         },

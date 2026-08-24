@@ -57,6 +57,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m5-exact", action="store_true")
     parser.add_argument("--control-m6-kp1", action="store_true")
     parser.add_argument("--candidate-m6-kp1", action="store_true")
+    parser.add_argument("--control-disable-row24-prefill-ladder", action="store_true")
+    parser.add_argument("--candidate-disable-row24-prefill-ladder", action="store_true")
+    parser.add_argument("--control-disable-row24-decode-ladder", action="store_true")
+    parser.add_argument("--candidate-disable-row24-decode-ladder", action="store_true")
+    parser.add_argument("--control-disable-row48-prefill-fusion", action="store_true")
+    parser.add_argument("--candidate-disable-row48-prefill-fusion", action="store_true")
+    parser.add_argument("--control-disable-row48-decode-fusion", action="store_true")
+    parser.add_argument("--candidate-disable-row48-decode-fusion", action="store_true")
     parser.add_argument("--control-cost-aligned-widths", action="store_true")
     parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
@@ -97,7 +105,7 @@ def _variant_environment(
 def _variant_config(
     args: argparse.Namespace,
     variant: str,
-) -> tuple[str, str, str, str, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool]:
+) -> tuple[Any, ...]:
     if variant == "control":
         return (
             args.control_survivors,
@@ -114,6 +122,10 @@ def _variant_config(
             bool(args.control_m8_nax_mlp),
             bool(args.control_m5_exact),
             bool(args.control_m6_kp1),
+            bool(args.control_disable_row24_prefill_ladder),
+            bool(args.control_disable_row24_decode_ladder),
+            bool(args.control_disable_row48_prefill_fusion),
+            bool(args.control_disable_row48_decode_fusion),
             bool(args.control_cost_aligned_widths),
             bool(args.control_release_native_mtp),
         )
@@ -132,6 +144,10 @@ def _variant_config(
         bool(args.candidate_m8_nax_mlp),
         bool(args.candidate_m5_exact),
         bool(args.candidate_m6_kp1),
+        bool(args.candidate_disable_row24_prefill_ladder),
+        bool(args.candidate_disable_row24_decode_ladder),
+        bool(args.candidate_disable_row48_prefill_fusion),
+        bool(args.candidate_disable_row48_decode_fusion),
         bool(args.candidate_cost_aligned_widths),
         bool(args.candidate_release_native_mtp),
     )
@@ -158,6 +174,10 @@ def _child_command(
         m8_nax_mlp,
         m5_exact,
         m6_kp1,
+        disable_row24_prefill_ladder,
+        disable_row24_decode_ladder,
+        disable_row48_prefill_fusion,
+        disable_row48_decode_fusion,
         cost_aligned_widths,
         release_native_mtp,
     ) = _variant_config(args, variant)
@@ -219,6 +239,14 @@ def _child_command(
         command.append("--dflash-m5-exact")
     if m6_kp1:
         command.append("--dflash-m6-kp1")
+    if disable_row24_prefill_ladder:
+        command.append("--disable-dflash-row24-prefill-ladder")
+    if disable_row24_decode_ladder:
+        command.append("--disable-dflash-row24-decode-ladder")
+    if disable_row48_prefill_fusion:
+        command.append("--disable-dflash-row48-prefill-fusion")
+    if disable_row48_decode_fusion:
+        command.append("--disable-dflash-row48-decode-fusion")
     return command
 
 
@@ -659,6 +687,67 @@ def _engagement_exact(
             and all(calls(row, "m6_ksplit_kp1", shape) > 0 for shape in selected)
             for row in by_variant["candidate"]
         )
+    if args.candidate_label in {"row24_no_prefill", "row24_no_decode"}:
+        disabled_phase = (
+            "prefill" if args.candidate_label == "row24_no_prefill" else "decode"
+        )
+        other_phase = "decode" if disabled_phase == "prefill" else "prefill"
+
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(row.get("feature_receipt", {}).get("r24_eval_ladder", {}))
+
+        def calls(row: dict[str, Any], phase: str) -> int:
+            return int(
+                row.get("engagement", {})
+                .get("r24_eval_ladder", {})
+                .get(f"{phase}_calls", 0)
+            )
+
+        return all(
+            bool(route(row).get(f"{disabled_phase}_active"))
+            and bool(route(row).get(f"{other_phase}_active"))
+            and calls(row, disabled_phase) > 0
+            and calls(row, other_phase) > 0
+            for row in by_variant["control"]
+        ) and all(
+            not bool(route(row).get(f"{disabled_phase}_active"))
+            and bool(route(row).get(f"{other_phase}_active"))
+            and calls(row, disabled_phase) == 0
+            and calls(row, other_phase) > 0
+            for row in by_variant["candidate"]
+        )
+    if args.candidate_label in {"row48_no_prefill", "row48_no_decode"}:
+        disabled_phase = (
+            "prefill" if args.candidate_label == "row48_no_prefill" else "decode"
+        )
+        other_phase = "decode" if disabled_phase == "prefill" else "prefill"
+
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("r48_boundary_fused", {})
+            )
+
+        def calls(row: dict[str, Any], phase: str, kind: str) -> int:
+            return int(
+                row.get("engagement", {})
+                .get("r48_boundary_fused", {})
+                .get(f"{phase}_{kind}_boundaries", 0)
+            )
+
+        return all(
+            bool(route(row).get(f"{disabled_phase}_active"))
+            and bool(route(row).get(f"{other_phase}_active"))
+            and calls(row, disabled_phase, "fused") > 0
+            and calls(row, disabled_phase, "stock") == 0
+            for row in by_variant["control"]
+        ) and all(
+            not bool(route(row).get(f"{disabled_phase}_active"))
+            and bool(route(row).get(f"{other_phase}_active"))
+            and calls(row, disabled_phase, "fused") == 0
+            and calls(row, disabled_phase, "stock") > 0
+            and calls(row, other_phase, "fused") > 0
+            for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -766,6 +855,30 @@ def _aggregate(
             "candidate_m5_exact": bool(args.candidate_m5_exact),
             "control_m6_kp1": bool(args.control_m6_kp1),
             "candidate_m6_kp1": bool(args.candidate_m6_kp1),
+            "control_disable_row24_prefill_ladder": bool(
+                args.control_disable_row24_prefill_ladder
+            ),
+            "candidate_disable_row24_prefill_ladder": bool(
+                args.candidate_disable_row24_prefill_ladder
+            ),
+            "control_disable_row24_decode_ladder": bool(
+                args.control_disable_row24_decode_ladder
+            ),
+            "candidate_disable_row24_decode_ladder": bool(
+                args.candidate_disable_row24_decode_ladder
+            ),
+            "control_disable_row48_prefill_fusion": bool(
+                args.control_disable_row48_prefill_fusion
+            ),
+            "candidate_disable_row48_prefill_fusion": bool(
+                args.candidate_disable_row48_prefill_fusion
+            ),
+            "control_disable_row48_decode_fusion": bool(
+                args.control_disable_row48_decode_fusion
+            ),
+            "candidate_disable_row48_decode_fusion": bool(
+                args.candidate_disable_row48_decode_fusion
+            ),
             "control_cost_aligned_widths": bool(args.control_cost_aligned_widths),
             "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),

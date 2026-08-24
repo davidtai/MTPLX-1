@@ -208,6 +208,10 @@ def _install_dflash_route(
     m8_nax_mlp: bool = False,
     m5_exact: bool = False,
     m6_kp1: bool = False,
+    row24_prefill_ladder: bool = True,
+    row24_decode_ladder: bool = True,
+    row48_prefill_fused: bool = True,
+    row48_decode_fused: bool = True,
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
@@ -234,10 +238,14 @@ def _install_dflash_route(
         runtime.model,
         active=24 in rows,
         prefill_stride=3 if 26 in rows else 4,
+        prefill_active=bool(row24_prefill_ladder),
+        decode_active=bool(row24_decode_ladder),
     )
     row48_report = configure_qwen38_dflash_row48_boundary(
         runtime.model,
         active=48 in rows,
+        prefill_active=bool(row48_prefill_fused),
+        decode_active=bool(row48_decode_fused),
     )
     gqa_report = configure_qwen38_dflash_gqa_widths(
         runtime.model,
@@ -288,6 +296,10 @@ def _install_dflash_route(
                 *(("m8naxmlp",) if m8_nax_mlp else ()),
                 *(("m5exact",) if m5_exact else ()),
                 *(("m6kp1",) if m6_kp1 else ()),
+                *(("r24noprefill",) if not row24_prefill_ladder else ()),
+                *(("r24nodecode",) if not row24_decode_ladder else ()),
+                *(("r48noprefill",) if not row48_prefill_fused else ()),
+                *(("r48nodecode",) if not row48_decode_fused else ()),
             )
         )
     )
@@ -354,6 +366,10 @@ def _run_dflash_arm(
     m8_nax_mlp: bool,
     m5_exact: bool,
     m6_kp1: bool,
+    row24_prefill_ladder: bool,
+    row24_decode_ladder: bool,
+    row48_prefill_fused: bool,
+    row48_decode_fused: bool,
     cost_aligned_widths: bool,
     release_report: dict[str, bool],
 ) -> dict[str, Any]:
@@ -399,6 +415,10 @@ def _run_dflash_arm(
                 *(("m8naxmlp",) if m8_nax_mlp else ()),
                 *(("m5exact",) if m5_exact else ()),
                 *(("m6kp1",) if m6_kp1 else ()),
+                *(("r24noprefill",) if not row24_prefill_ladder else ()),
+                *(("r24nodecode",) if not row24_decode_ladder else ()),
+                *(("r48noprefill",) if not row48_prefill_fused else ()),
+                *(("r48nodecode",) if not row48_decode_fused else ()),
                 *(("cost_aligned",) if cost_aligned_widths else ()),
             )
         ),
@@ -482,6 +502,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dflash-m8-nax-mlp", action="store_true")
     parser.add_argument("--dflash-m5-exact", action="store_true")
     parser.add_argument("--dflash-m6-kp1", action="store_true")
+    parser.add_argument("--disable-dflash-row24-prefill-ladder", action="store_true")
+    parser.add_argument("--disable-dflash-row24-decode-ladder", action="store_true")
+    parser.add_argument("--disable-dflash-row48-prefill-fusion", action="store_true")
+    parser.add_argument("--disable-dflash-row48-decode-fusion", action="store_true")
     parser.add_argument("--dflash-cost-aligned-widths", action="store_true")
     parser.add_argument(
         "--engine",
@@ -596,6 +620,10 @@ def main() -> int:
             m8_nax_mlp=bool(args.dflash_m8_nax_mlp),
             m5_exact=bool(args.dflash_m5_exact),
             m6_kp1=bool(args.dflash_m6_kp1),
+            row24_prefill_ladder=not bool(args.disable_dflash_row24_prefill_ladder),
+            row24_decode_ladder=not bool(args.disable_dflash_row24_decode_ladder),
+            row48_prefill_fused=not bool(args.disable_dflash_row48_prefill_fusion),
+            row48_decode_fused=not bool(args.disable_dflash_row48_decode_fusion),
         )
         if dflash_route is None:
             raise RuntimeError("DFlash2 survivor route did not install")
@@ -673,6 +701,10 @@ def main() -> int:
             m8_nax_mlp=bool(args.dflash_m8_nax_mlp),
             m5_exact=bool(args.dflash_m5_exact),
             m6_kp1=bool(args.dflash_m6_kp1),
+            row24_prefill_ladder=not bool(args.disable_dflash_row24_prefill_ladder),
+            row24_decode_ladder=not bool(args.disable_dflash_row24_decode_ladder),
+            row48_prefill_fused=not bool(args.disable_dflash_row48_prefill_fusion),
+            row48_decode_fused=not bool(args.disable_dflash_row48_decode_fusion),
             cost_aligned_widths=bool(args.dflash_cost_aligned_widths),
             release_report=release_report,
         )

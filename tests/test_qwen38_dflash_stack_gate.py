@@ -596,6 +596,68 @@ def test_m6_kp1_engagement_requires_both_selected_shapes() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_row24_phase_removal_requires_other_phase_to_remain_live() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="row24_no_decode")
+
+    def arm(*, decode_active: bool, prefill_calls: int = 176):
+        return {
+            "feature_receipt": {
+                "r24_eval_ladder": {
+                    "prefill_active": 1,
+                    "decode_active": int(decode_active),
+                }
+            },
+            "engagement": {
+                "r24_eval_ladder": {
+                    "prefill_calls": prefill_calls,
+                    "decode_calls": 1616 if decode_active else 0,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(decode_active=True) for _ in range(2)],
+        "candidate": [arm(decode_active=False) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = arm(decode_active=False, prefill_calls=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_row48_phase_removal_requires_stock_fallback_and_other_fusion() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="row48_no_prefill")
+
+    def arm(*, prefill_active: bool, decode_fused: int = 12726):
+        return {
+            "feature_receipt": {
+                "r48_boundary_fused": {
+                    "prefill_active": int(prefill_active),
+                    "decode_active": 1,
+                }
+            },
+            "engagement": {
+                "r48_boundary_fused": {
+                    "prefill_fused_boundaries": 567 if prefill_active else 0,
+                    "prefill_stock_boundaries": 0 if prefill_active else 567,
+                    "decode_fused_boundaries": decode_fused,
+                    "decode_stock_boundaries": 0,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(prefill_active=True) for _ in range(2)],
+        "candidate": [arm(prefill_active=False) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(prefill_active=False, decode_fused=0)
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

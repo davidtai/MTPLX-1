@@ -22,6 +22,10 @@ QWEN38_GDN_DECAY_MEMO_COUNTERS: dict[str, int] = {
 QWEN38_ROW48_BOUNDARY_COUNTERS: dict[str, int] = {
     "calls": 0,
     "merged_boundaries": 0,
+    "prefill_fused_boundaries": 0,
+    "decode_fused_boundaries": 0,
+    "prefill_stock_boundaries": 0,
+    "decode_stock_boundaries": 0,
 }
 
 
@@ -33,6 +37,8 @@ def configure_qwen38_dflash_row48_boundary(
     model: Any,
     *,
     active: bool,
+    prefill_active: bool = True,
+    decode_active: bool = True,
 ) -> dict[str, int]:
     """Install row 48's cross-layer residual/RMSNorm fusion in DFlash."""
 
@@ -62,7 +68,12 @@ def configure_qwen38_dflash_row48_boundary(
         for attr in ("_dflash_boundary_begin", "_dflash_fused_add_rmsnorm"):
             if hasattr(inner, attr):
                 delattr(inner, attr)
-        return {"eligible_modules": eligible, "active_modules": 0}
+        return {
+            "eligible_modules": eligible,
+            "active_modules": 0,
+            "prefill_active": 0,
+            "decode_active": 0,
+        }
 
     def boundary_begin() -> None:
         QWEN38_ROW48_BOUNDARY_COUNTERS["calls"] += 1
@@ -77,6 +88,14 @@ def configure_qwen38_dflash_row48_boundary(
     ) -> tuple[Any, Any]:
         from .kernels.fused_norm import fused_add_rmsnorm
 
+        length = int(base.shape[-2])
+        phase = "prefill" if length >= 512 else "decode"
+        phase_active = prefill_active if phase == "prefill" else decode_active
+        if not phase_active:
+            QWEN38_ROW48_BOUNDARY_COUNTERS[f"{phase}_stock_boundaries"] += 1
+            hidden = base + delta
+            return hidden, mx.fast.rms_norm(hidden, weight, eps)
+        QWEN38_ROW48_BOUNDARY_COUNTERS[f"{phase}_fused_boundaries"] += 1
         if merged_boundary:
             QWEN38_ROW48_BOUNDARY_COUNTERS["merged_boundaries"] += 1
         return fused_add_rmsnorm(
@@ -89,7 +108,12 @@ def configure_qwen38_dflash_row48_boundary(
 
     inner._dflash_boundary_begin = boundary_begin
     inner._dflash_fused_add_rmsnorm = fused_boundary
-    return {"eligible_modules": eligible, "active_modules": eligible}
+    return {
+        "eligible_modules": eligible,
+        "active_modules": eligible,
+        "prefill_active": int(prefill_active),
+        "decode_active": int(decode_active),
+    }
 
 # One-time warning latch for an explicitly requested but unavailable
 # headquarter tape kernel (PR #209 review edit).

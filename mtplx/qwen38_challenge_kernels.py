@@ -13,6 +13,8 @@ qwen38_qk_rms_rope_calls = 0
 qwen38_row24_qk_length_fallback_calls = 0
 qwen38_row26_qk_widen_calls = 0
 qwen38_row24_eval_ladder_calls = 0
+qwen38_row24_prefill_eval_ladder_calls = 0
+qwen38_row24_decode_eval_ladder_calls = 0
 qwen38_row26_prefill_ladder_calls = 0
 _QWEN38_ATTENTION_ORIGINAL_CALL = None
 _QWEN38_DFLASH_GQA_ORIGINAL = None
@@ -34,6 +36,13 @@ def qwen38_row24_eval_ladder_counter_snapshot() -> int:
     return int(qwen38_row24_eval_ladder_calls)
 
 
+def qwen38_row24_eval_ladder_phase_counter_snapshot() -> dict[str, int]:
+    return {
+        "prefill_calls": int(qwen38_row24_prefill_eval_ladder_calls),
+        "decode_calls": int(qwen38_row24_decode_eval_ladder_calls),
+    }
+
+
 def qwen38_row26_prefill_ladder_counter_snapshot() -> int:
     return int(qwen38_row26_prefill_ladder_calls)
 
@@ -43,6 +52,8 @@ def configure_qwen38_dflash_row24_eval_ladder(
     *,
     active: bool,
     prefill_stride: int = 4,
+    prefill_active: bool = True,
+    decode_active: bool = True,
 ) -> dict[str, int]:
     """Install the retained target-evaluation ladder in DFlash hidden capture."""
 
@@ -53,28 +64,49 @@ def configure_qwen38_dflash_row24_eval_ladder(
     if not active:
         if hasattr(inner, "_dflash_post_layer"):
             delattr(inner, "_dflash_post_layer")
-        return {"active": 0, "prefill_stride": 0}
+        return {
+            "active": 0,
+            "prefill_stride": 0,
+            "prefill_active": 0,
+            "decode_active": 0,
+        }
 
     decode_rungs = frozenset({0, 1, 9, 19, 29, 39, 49, 57})
 
     def post_layer(hidden_states: Any, layer_index: int) -> None:
+        global qwen38_row24_prefill_eval_ladder_calls
+        global qwen38_row24_decode_eval_ladder_calls
         length = int(hidden_states.shape[1])
         row24_prefill = length >= 512
         row24_decode = length <= 9
-        if (
-            row24_prefill
+        prefill_rung = bool(
+            prefill_active
+            and row24_prefill
             and (
                 layer_index == 0
                 or layer_index % prefill_stride == prefill_stride - 1
             )
-        ) or (row24_decode and layer_index in decode_rungs):
+        )
+        decode_rung = bool(
+            decode_active and row24_decode and layer_index in decode_rungs
+        )
+        if prefill_rung or decode_rung:
+            if prefill_rung:
+                qwen38_row24_prefill_eval_ladder_calls += 1
+            if decode_rung:
+                qwen38_row24_decode_eval_ladder_calls += 1
             qwen38_row24_async_eval(
                 hidden_states,
-                row26=bool(prefill_stride == 3 and row24_prefill),
+                row26=bool(prefill_stride == 3 and prefill_rung),
             )
 
     inner._dflash_post_layer = post_layer
-    return {"active": 1, "prefill_stride": prefill_stride}
+    return {
+        "active": 1,
+        "prefill_stride": prefill_stride,
+        "prefill_active": int(prefill_active),
+        "decode_active": int(decode_active),
+    }
 
 
 def configure_qwen38_dflash_gqa_widths(
