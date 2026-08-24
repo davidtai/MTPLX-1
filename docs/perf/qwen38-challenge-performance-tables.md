@@ -1,0 +1,132 @@
+# Qwen 3.8 Challenge Performance Tables
+
+These are the canonical performance tables for the 54 Yukon proposals. Each
+metric cell is `control → candidate`; untimed rows remain visible with the
+reason they were not benchmarked. Means use the two arms for each route from
+the exact 16,384-token Python / 1,024-output ABBA gate. Wall delta is
+`control / candidate - 1`, so positive is faster. Peak is the maximum arm.
+
+## Native MTP: all 54 proposal rows
+
+| Row | Optimization | Prefill tok/s | Decode tok/s | Mean wall s | Wall delta | Peak GiB | Native-MTP result | Receipt / evidence |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 2 | Checkpoint/rejection fast path | — | — | — | — | — | Already present in broader capture/commit rollback | Row-8 route receipt |
+| 3 | Packed target Q/K/V projection | 754.031 → 761.534 | 51.803 → 46.971 | 42.006 → 43.785 | **-4.0629%** | 25.569 → 25.569 | Rejected, removed | `c1-packed-qkv-corrected-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 4 | Seed-tail logits and lazy capture boundary | — | — | — | — | — | Already present, broader in Optimized-Speed | Row-8 route receipt |
+| 5 | Device target top-k sampling | — | — | — | — | — | Already present/adapted for temperature 1, top-p .95, top-k 20 | Row-8 route receipt |
+| 6 | Reuse second target argmax | — | — | — | — | — | Target-shape no-op: stochastic route has no second argmax | Source diff + row-8 route receipt |
+| 7 | Persistent committed MTP history | — | — | — | — | — | Already present and engaged | Row-8 route receipt |
+| 8 | Device-resident fixed-D3 draft chain | 750.099 → 779.772 | 52.478 → 54.038 | 41.870 → 40.413 | **+3.6049%** | 24.885 → 24.885 | Retained; S≤2 GDN sub-fuse was a D3 no-op | `chrono-r08-device-draft-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 9 | Paired shared-row G32/M4 target QMV | 744.715 → 761.698 | 52.555 → 47.465 | 41.977 → 43.651 | **-3.8350%** | 24.885 → 24.885 | Rejected, removed | `chrono-r09-paired-qmv-g32-m4-on-r08-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 10 | Compact Q4/G64 proposal vocabulary | 737.536 → 765.005 | 54.151 → 55.240 | 41.640 → 40.411 | **+3.0411%** | 25.149 → 25.149 | Retained | `chrono-r10-compact-vocab-on-r08-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 11 | Position-EMA adaptive-depth policy | — | — | — | — | — | Ported and staged; adaptive 1–8 gate pending | Adaptive lane |
+| 12 | Recurrent prefix-replay tape | — | — | — | — | — | Removed by row 13 before entering stack | Source chronology |
+| 13 | Four-way GDN input projection through S≤9 | 765.003 → 778.485 | 56.424 → 54.008 | 40.066 → 40.469 | **-0.9949%** | 27.507 → 27.507 | Rejected, removed | `chrono-r13-gdn-inproj-s9-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 14 | Reintroduced recurrent prefix replay | — | — | — | — | — | Already present in broader capture/commit path | Row-18 route receipt |
+| 15 | Verify widths 6–9 and raised adaptive cap | — | — | — | — | — | Reopened; adaptive 1–8 gate pending | Adaptive lane |
+| 16 | Compiled GDN prologue/post-norm | — | — | — | — | — | Already enclosed by whole-route compilation | Source diff + route contract |
+| 17 | Complete Q4/G64 MTP block | 750.137 → 781.155 | 56.805 → 55.766 | 40.377 → 39.808 | **+1.4299%** | 25.37195 → 25.37197 | Retained, later superseded by row 36 artifact | `chrono-r17-q4-mtp-block-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 18 | Memoized GDN decay | 736.928 → 763.072 | 56.265 → 54.971 | 40.978 → 40.579 | **+0.9843%** | 25.37198 → 25.37199 | Memo retained; packed MLP addendum rejected at -0.3108% | `chrono-r18-gdn-decay-memo-on-r08-r10-r17-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 19 | Argmax-only compact proposal selector | — | — | — | — | — | Non-transferable to stochastic full-distribution acceptance | Source diff |
+| 20 | Packed K/V-only committed-history append | 735.167 → 758.616 | 55.625 → 54.778 | 41.230 → 40.392 | **+2.0739%** | 25.37749 → 25.37749 | Retained | `chrono-r20-kv-only-history-on-r08-r10-r17-r18-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 21 | Fused Q/K RMSNorm + partial RoPE | 720.881 → 737.392 | 54.455 → 54.433 | 41.661 → 41.132 | **+1.2860%** | 25.37751 → 25.37751 | Retained on corrected stack | `chrono-r21-qk-rms-rope-on-r08-r10-r17-r18-r20-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 23 | Retuned row-19 compact reduction | — | — | — | — | — | Dependency absent; row 19 is non-transferable | Source diff |
+| 24 | Q/K L≤16 fence + target evaluation ladder | 724.633 → 740.452 | 55.175 → 54.674 | 41.303 → 40.958 | **+0.8435%** | 25.37750 → 25.44388 | Retained on corrected stack | `chrono-r24-full-on-r08-r10-r17-r18-r20-r21-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 25 | Adaptive streak-gate constant | — | — | — | — | — | Reopened; adaptive 1–8 gate pending | Adaptive lane |
+| 26 | Three-layer prefill evaluation cadence | 753.929 → 774.419 | 56.866 → 57.018 | 39.885 → 39.226 | **+1.6797%** | 25.44388 → 25.44388 | Retained; deeper-width pieces reopened | `chrono-r26-full-on-r08-r10-r17-r18-r20-r21-r24-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 28 | Alternate Q4/G64 block + eager recurrent state | 778.698 → 783.596 | 56.396 → 55.874 | 39.299 → 39.332 | **-0.0861%** | 25.67190 → 25.67190 | Rejected; incumbent block retained | `chrono-r28-full-on-r08-r10-r17-r18-r20-r21-r24-r26-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 30 | Reused post-final-norm target output | — | — | — | — | — | Already present/target-compiled | Source diff + capture contract |
+| 32 | M=8 Q4/G64 retune + adaptive streak | — | — | — | — | — | Reopened; adaptive 1–8 gate pending | Adaptive lane |
+| 33 | Transient BF16 Q/K/V precision islands | — | — | — | — | — | Removed by row 34; live form returns at row 36 | Source chronology |
+| 34 | M=6/M=9 direct-nibble edits and row-33 removal | — | — | — | — | — | Fixed-D3 no-op/removal; adaptive widths reopened | Adaptive lane |
+| 36 | Q4/G64 block + BF16 Q/K/V islands | 772.342 → 782.572 | 56.640 → 55.929 | 39.399 → 39.341 | **+0.1479%** | 25.70974 → 25.70974 | Retained; supersedes row 17 | `chrono-r36-full-on-r08-r10-r17-r18-r20-r21-r24-r26-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 37 | Warm post-norm verify + revert M=8 toggle | — | — | — | — | — | Conditioner-covered/fixed-shape no-op; adaptive review pending | Adaptive lane |
+| 38 | M=8 direct-nibble extraction | — | — | — | — | — | Fixed-D3 no-op; adaptive review pending | Adaptive lane |
+| 39 | Two two-row M=4 input groups | — | — | — | — | — | Removed by row 40; related row-9 adaptation rejected | Source chronology + row-9 receipt |
+| 40 | Restore M=4 + enable M=7 direct nibble | — | — | — | — | — | Fixed-D3 no-op/restore; adaptive review pending | Adaptive lane |
+| 41 | Direct-nibble M=3/4/5 stock QMV | — | — | — | — | — | Already present/superseded by stronger G32 M=4 path | Source diff + row-9 receipt |
+| 42 | Affine-2 coarse top-32 argmax proposer | — | — | — | — | — | Non-transferable to stochastic full-distribution acceptance | Source diff |
+| 45 | Early fused residual/RMS boundary variant | — | — | — | — | — | Removed by row 46; live form returns at row 48 | Source chronology |
+| 47 | Affine-2 M=1 selector + Q4 M=8 grouping | — | — | — | — | — | Selector dependency absent; M=8 portion reopened | Adaptive lane |
+| 48 | Fused residual/RMSNorm boundary chain | 735.798 → 760.347 | 55.947 → 54.792 | 40.703 → 40.333 | **+0.9175%** | 25.48171 → 25.48171 | Retained | `chrono-r48-full-on-r08-r10-r18-r20-r21-r24-r26-r36-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 50 | Post-warm wired-residency budget | 754.316 → 771.058 | 56.472 → 55.787 | 39.990 → 39.661 | **+0.8299%** | 25.48171 → 25.48171 | Retained | `chrono-r50-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 53 | 512 MiB / 50-op command buffers | 754.872 → 754.912 | 55.414 → 55.979 | 40.247 → 40.059 | **+0.4708%** | 25.48171 → 32.72811 | Retained, +7.24640 GiB peak | `chrono-r53-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-r50-python16384in-1024out-t1-abba-isolated-2026-08-23.json` |
+| 59 | Temporary adaptive SDPA cap 5→6 | — | — | — | — | — | Removed by row 60 | Source chronology |
+| 60 | Two-output dual RMSNorm | — | — | — | — | — | Replaced by row 61 before entering stack | Source chronology |
+| 61 | Fused dual RMSNorm + concatenate | 742.826 → 765.844 | 55.991 → 55.094 | 40.438 → 40.037 | **+0.9996%** | 32.72812 → 32.72812 | Retained | `chrono-r61-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-r50-r53-python16384in-1024out-t1-abba-rerun-2026-08-23.json` |
+| 63 | Fused Q8 embedding/norm/concat + argmax proposer | 754.687 → 768.177 | 57.141 → 55.700 | 39.698 → 39.773 | **-0.1895%** | 32.72812 → 32.72812 | Live fusion rejected; argmax proposer non-transferable | `chrono-r63-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-r50-r53-r61-python16384in-1024out-t1-abba-2026-08-23.json` |
+| 66 | Resample-ticket artifact note | — | — | — | — | — | Weak/no-op: executable bytes unchanged | Source diff |
+| 67 | Direct selected-row Q4 rerank kernel | — | — | — | — | — | Non-transferable argmax-selector dependency | Source diff |
+| 69 | Fused clustered BF16 selectors | — | — | — | — | — | Non-transferable argmax retrieval path | Source diff |
+| 70 | Clustered proposer + M3-wide QMV | — | — | — | — | — | Rejected incompatible after three real-artifact attempts | `diagnostic-r70-qmv-fixed-d3-incompatible-2026-08-23.json` |
+| 71 | Custom centroid/selected-cluster QMV | — | — | — | — | — | Non-transferable argmax retrieval path | Source diff |
+| 78 | Active-input-group row-70 launch | — | — | — | — | — | Dependency absent after row-70 rejection | Source diff |
+| 79 | Cluster probe fraction .25→.15 | — | — | — | — | — | Non-transferable argmax retrieval path | Source diff |
+| 80 | Extend rejected row-70 QMV to M=2 | — | — | — | — | — | Dependency absent after row-70 rejection | Source diff |
+| 82 | Remove folded-history warm/probe-sort construction | — | — | — | — | — | Conditioner-covered; selector dependency absent | Source diff + conditioner contract |
+
+## DFlash2 port stack: the same 54 proposal rows
+
+The two `Base` rows are not Yukon proposal rows; they record the engine
+replacement and the removal of the unused native-MTP object. Row 8 repeats the
+engine-replacement metrics only to show which original drafter optimization it
+replaces; that delta is composite and is not claimed as an isolated row-8 win.
+
+| Row | Optimization / DFlash disposition | Prefill tok/s | Decode tok/s | Mean wall s | Wall delta | Peak GiB | DFlash2 result | Receipt / evidence |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Base | Fixed native-MTP stack → fixed-depth-8 DFlash2 | 742.781 → 733.786 | 55.441 → 65.858 | 40.604 → 37.917 | **+7.0860%** | 32.72811 → 34.81407 | Retained replacement base | `item55-dflash2-static8-on-full-fixed-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| Base | Dual-loaded DFlash2 → target-only DFlash2 | 732.129 → 747.429 | 68.140 → 66.839 | 37.444 → 37.275 | **+0.4543%** | 34.30132 → 32.73674 | Retained; native MTP never constructed | `item55-dflash2-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 2 | Checkpoint/rejection fast path remains target-side | — | — | — | — | — | Already present; no DFlash-specific transplant | Native-MTP row 2 evidence |
+| 3 | Packed target Q/K/V projection | — | — | — | — | — | Not ported: native candidate rejected | Native-MTP row 3 receipt |
+| 4 | Lazy capture/commit target boundary | — | — | — | — | — | Already present in target stack | Native-MTP row 4 evidence |
+| 5 | Exact stochastic target sampler | — | — | — | — | — | Active in every DFlash arm | DFlash workload contract |
+| 6 | Second target argmax reuse | — | — | — | — | — | No-op under stochastic target sampling | Native-MTP row 6 evidence |
+| 7 | Persistent native-MTP history | — | — | — | — | — | Replaced by DFlash target-feature/rollback ownership | DFlash cache contract |
+| 8 | Device-resident native draft chain | 742.781 → 733.786 | 55.441 → 65.858 | 40.604 → 37.917 | **+7.0860%** | 32.72811 → 34.81407 | Replaced by DFlash2 eight-token proposal block; composite base delta | DFlash replacement-base receipt |
+| 9 | Paired target QMV | — | — | — | — | — | Not ported: native candidate rejected | Native-MTP row 9 receipt |
+| 10 | Compact native-MTP vocabulary | — | — | — | — | — | Incompatible: DFlash selector can emit outside the 98,330-ID set | Vocabulary geometry evidence |
+| 11 | Position-EMA adaptive depth | — | — | — | — | — | Pending adaptation to DFlash depths 1–8 | Adaptive lane |
+| 12 | Prefix-replay tape | — | — | — | — | — | Removed by row 13 | Source chronology |
+| 13 | Four-way GDN input projection | — | — | — | — | — | Not ported: native candidate rejected | Native-MTP row 13 receipt |
+| 14 | Recurrent prefix replay | — | — | — | — | — | Replaced by DFlash rollback/cache path | DFlash cache contract |
+| 15 | Verify widths 6–9 / adaptive cap | — | — | — | — | — | Pending adaptation, clamped to DFlash maximum 8 | Adaptive lane |
+| 16 | Compiled GDN prologue/post-norm | — | — | — | — | — | Already enclosed by target execution graphs | Native-MTP row 16 evidence |
+| 17 | Complete Q4/G64 native MTP block | — | — | — | — | — | Replaced by pinned DFlash W4/G64 checkpoint; superseded by row 36 | Checkpoint manifest |
+| 18 | Memoized GDN decay in DFlash rollback | 736.544 → 717.003 | 67.051 → 66.759 | 37.559 → 38.221 | **-1.7342%** | 32.73673 → 32.73675 | Rejected and removed; 9,120 calls/arm | `item55-dflash2-r18-gdn-decay-memo-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 19 | Argmax-only compact selector | — | — | — | — | — | Non-transferable to stochastic DFlash acceptance | Native-MTP row 19 evidence |
+| 20 | Native K/V-only history append | — | — | — | — | — | Replaced by DFlash feature and rollback caches | DFlash cache contract |
+| 21 | Fused Q/K RMSNorm + partial RoPE | 694.696 → 729.811 | 66.374 → 65.775 | 39.111 → 38.046 | **+2.8001%** | 32.73673 → 32.73672 | Retained; 3,184 calls/arm | `item55-dflash2-r21-qk-rms-rope-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 23 | Retuned row-19 reduction | — | — | — | — | — | Dependency absent | Native-MTP row 23 evidence |
+| 24 | Q/K L≤16 fence + target evaluation ladder | 749.960 → 770.175 | 68.026 → 67.199 | 36.944 → 36.537 | **+1.1148%** | 32.73674 → 35.73142 | Retained; 240 fallback and 1,664 ladder calls/arm | `item55-dflash2-r24-eval-ladder-on-r21-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 25 | Adaptive streak-gate constant | — | — | — | — | — | Pending DFlash adaptive gate | Adaptive lane |
+| 26 | Three-layer prefill cadence + deeper widths | — | — | — | — | — | Fixed DFlash gate pending on rows 21+24; adaptive pieces follow | Pending |
+| 28 | Alternate native Q4/G64 block | — | — | — | — | — | Not applicable: rejected native artifact; DFlash owns drafter | Native-MTP row 28 receipt |
+| 30 | Reused target post-final-norm output | — | — | — | — | — | Already present in DFlash hidden-capture/logit path | DFlash target-ops contract |
+| 32 | M=8 Q4/G64 retune + adaptive streak | — | — | — | — | — | Pending DFlash adaptive gate | Adaptive lane |
+| 33 | Transient precision islands | — | — | — | — | — | Removed by row 34 | Source chronology |
+| 34 | M=6/M=9 direct-nibble edits | — | — | — | — | — | Pending adaptive applicability review; DFlash cap is 8 | Adaptive lane |
+| 36 | Native Q4/G64 block + precision islands | — | — | — | — | — | Replaced by pinned DFlash W4/G64 checkpoint | Checkpoint manifest |
+| 37 | Warm path + M=8 revert | — | — | — | — | — | Conditioner-covered; adaptive disposition pending | Adaptive lane |
+| 38 | M=8 direct-nibble extraction | — | — | — | — | — | Pending DFlash adaptive applicability review | Adaptive lane |
+| 39 | Transient M=4 grouping | — | — | — | — | — | Removed by row 40 | Source chronology |
+| 40 | M=7 direct-nibble extraction | — | — | — | — | — | Pending DFlash adaptive applicability review | Adaptive lane |
+| 41 | Direct-nibble native target QMV | — | — | — | — | — | Already present/superseded target implementation | Native-MTP row 41 evidence |
+| 42 | Affine-2 argmax proposer | — | — | — | — | — | Non-transferable to stochastic DFlash acceptance | Native-MTP row 42 evidence |
+| 45 | Early boundary fusion | — | — | — | — | — | Removed; live form is row 48 | Source chronology |
+| 47 | Affine-2 M=1 selector + M=8 grouping | — | — | — | — | — | Selector absent; M=8 applicability pending | Adaptive lane |
+| 48 | Fused residual/RMSNorm DFlash capture boundary | — | — | — | — | — | Fixed DFlash gate pending on retained rows 21+24+26 | Pending |
+| 50 | Wired-residency budget | — | — | — | — | — | Active and recomputed in every DFlash arm; no isolated delta | DFlash arm feature receipts |
+| 53 | 512 MiB / 50-op command buffers | — | — | — | — | — | Active in every isolated DFlash arm; no isolated delta | DFlash arm feature receipts |
+| 59 | Temporary adaptive SDPA cap | — | — | — | — | — | Removed by row 60 | Source chronology |
+| 60 | Two-output dual RMSNorm | — | — | — | — | — | Replaced by row 61 | Source chronology |
+| 61 | Native-MTP dual norm/concat | — | — | — | — | — | Replaced: removed native MTP block has no call site | DFlash replacement contract |
+| 63 | Fused native embedding/norm + argmax proposer | — | — | — | — | — | Native fusion rejected; proposer non-transferable | Native-MTP row 63 receipt |
+| 66 | Artifact-note-only change | — | — | — | — | — | Weak/no-op | Source diff |
+| 67 | Selected-row argmax rerank | — | — | — | — | — | Non-transferable | Source diff |
+| 69 | Clustered argmax selectors | — | — | — | — | — | Non-transferable | Source diff |
+| 70 | Clustered proposer + native M3 QMV | — | — | — | — | — | Rejected incompatible before DFlash port | Native-MTP row 70 diagnostic |
+| 71 | Cluster QMV kernels | — | — | — | — | — | Non-transferable | Source diff |
+| 78 | Row-70 active-group launch | — | — | — | — | — | Dependency absent | Source diff |
+| 79 | Cluster probe fraction | — | — | — | — | — | Non-transferable | Source diff |
+| 80 | Row-70 M=2 extension | — | — | — | — | — | Dependency absent | Source diff |
+| 82 | Removed warm/probe construction | — | — | — | — | — | Conditioner-covered; selector dependency absent | Source diff + conditioner contract |
