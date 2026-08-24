@@ -174,13 +174,14 @@ class Qwen38DFlashPositionEMAPolicy:
         accepted = max(0, min(int(acceptance_len), attempted))
         self.cycles += 1
         self.cycles_by_block[block_len] = self.cycles_by_block.get(block_len, 0) + 1
-        self.commit_tokens_by_block[block_len] = (
-            self.commit_tokens_by_block.get(block_len, 0) + 1 + accepted
-        )
-        if cycle_cost_ns is not None and int(cycle_cost_ns) > 0:
-            self.cost_ns_by_block[block_len] = (
-                self.cost_ns_by_block.get(block_len, 0) + int(cycle_cost_ns)
+        if self.cost_aligned_widths:
+            self.commit_tokens_by_block[block_len] = (
+                self.commit_tokens_by_block.get(block_len, 0) + 1 + accepted
             )
+            if cycle_cost_ns is not None and int(cycle_cost_ns) > 0:
+                self.cost_ns_by_block[block_len] = (
+                    self.cost_ns_by_block.get(block_len, 0) + int(cycle_cost_ns)
+                )
         if block_len < self.full_block_tokens:
             self.reduced_cycles += 1
             self.min_seen = block_len if self.min_seen is None else min(self.min_seen, block_len)
