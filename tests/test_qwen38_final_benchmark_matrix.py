@@ -13,7 +13,9 @@ SCRIPT = Path(__file__).parents[1] / "scripts/qwen38_final_benchmark_matrix.py"
 
 
 def _module():
-    spec = importlib.util.spec_from_file_location("qwen38_final_benchmark_matrix", SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "qwen38_final_benchmark_matrix", SCRIPT
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -23,21 +25,15 @@ def _module():
 def test_direct_script_bootstrap_adds_repository_root_to_import_path() -> None:
     original = list(sys.path)
     try:
-        sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != SCRIPT.parents[1]]
+        sys.path[:] = [
+            entry
+            for entry in sys.path
+            if Path(entry or ".").resolve() != SCRIPT.parents[1]
+        ]
         matrix = _module()
         assert str(matrix.ROOT) in sys.path
     finally:
         sys.path[:] = original
-
-
-class CharacterTokenizer:
-    @staticmethod
-    def encode(text: str) -> list[int]:
-        return [ord(character) for character in text]
-
-    @staticmethod
-    def decode(tokens: list[int]) -> str:
-        return "".join(chr(token) for token in tokens)
 
 
 def test_scenarios_are_exact_cold_prefill_lengths_not_prefix_additions() -> None:
@@ -45,33 +41,36 @@ def test_scenarios_are_exact_cold_prefill_lengths_not_prefix_additions() -> None
 
     assert [(item.name, item.prompt_tokens) for item in matrix.SCENARIOS] == [
         ("burst_is_palindrome", 100),
-        ("coding_cold_prefill_1k", 1_024),
-        ("coding_cold_prefill_16k", 16_384),
-        ("coding_cold_prefill_64k", 65_536),
-        ("coding_cold_prefill_128k", 131_072),
+        ("coding_cold_prefill_1k_low", 1_024),
+        ("coding_cold_prefill_16k_low", 16_384),
+        ("coding_cold_prefill_64k_low", 65_536),
+        ("coding_cold_prefill_128k_low", 131_072),
+        ("coding_cold_prefill_1k_xhigh", 1_024),
+        ("coding_cold_prefill_16k_xhigh", 16_384),
+        ("coding_cold_prefill_64k_xhigh", 65_536),
+        ("coding_cold_prefill_128k_xhigh", 131_072),
     ]
-    assert all(item.max_tokens == 1_024 for item in matrix.SCENARIOS)
+    assert matrix.SCENARIOS[0].max_tokens == 1_024
+    assert all(item.max_tokens == 16_384 for item in matrix.SCENARIOS[1:])
     assert matrix.SCENARIOS[0].temperature == 0.0
     assert matrix.SCENARIOS[0].top_p == 1.0
     assert matrix.SCENARIOS[0].top_k == 0
-    assert all(item.temperature == 0.6 for item in matrix.SCENARIOS[1:])
+    assert matrix.SCENARIOS[0].enable_thinking is False
+    assert matrix.SCENARIOS[0].reasoning_effort is None
+    assert all(item.temperature == 1.0 for item in matrix.SCENARIOS[1:])
     assert all(item.top_p == 0.95 for item in matrix.SCENARIOS[1:])
     assert all(item.top_k == 20 for item in matrix.SCENARIOS[1:])
-
-
-def test_coding_prompt_has_one_instruction_and_exact_total_token_budget() -> None:
-    matrix = _module()
-
-    prompt, token_ids = matrix.build_exact_coding_prompt(
-        CharacterTokenizer(),
-        target_tokens=2_048,
-        context="class ExistingModule:\n    pass\n",
-        instruction="Implement the production-ready scheduler.",
-    )
-
-    assert len(token_ids) == 2_048
-    assert prompt.endswith("Implement the production-ready scheduler.")
-    assert prompt.count("Implement the production-ready scheduler.") == 1
+    assert all(item.enable_thinking is True for item in matrix.SCENARIOS[1:])
+    assert [item.reasoning_effort for item in matrix.SCENARIOS[1:]] == [
+        "low",
+        "low",
+        "low",
+        "low",
+        "xhigh",
+        "xhigh",
+        "xhigh",
+        "xhigh",
+    ]
 
 
 def test_load_scenarios_use_one_naturalistic_generation_patch_prompt() -> None:
@@ -86,7 +85,9 @@ def test_load_scenarios_use_one_naturalistic_generation_patch_prompt() -> None:
     assert "Implement these sections in order" not in row["prompt"]
 
 
-def test_child_command_pins_source_revision_and_disables_prefix_sessions(tmp_path) -> None:
+def test_child_command_pins_low_reasoning_contract_and_disables_prefix_sessions(
+    tmp_path,
+) -> None:
     matrix = _module()
     args = SimpleNamespace(
         model=Path("/models/target"),
@@ -111,11 +112,13 @@ def test_child_command_pins_source_revision_and_disables_prefix_sessions(tmp_pat
     assert command[command.index("--prompt-tokens") + 1] == "16384"
     assert command[command.index("--source-root") + 1] == "/tmp/main"
     assert command[command.index("--source-commit") + 1] == "abc123"
+    assert "--enable-thinking" in command
+    assert command[command.index("--reasoning-effort") + 1] == "low"
     assert "--prefix-cache" not in command
     assert "--session-id" not in command
 
 
-def test_headline_uses_full_same_shape_decode_conditioning() -> None:
+def test_child_command_pins_xhigh_reasoning_contract(tmp_path) -> None:
     matrix = _module()
     args = SimpleNamespace(
         model=Path("/models/target"),
@@ -132,7 +135,36 @@ def test_headline_uses_full_same_shape_decode_conditioning() -> None:
         engine="pr_dflash2",
         source_root=Path("/repo"),
         source_commit="abc123",
-        scenario=matrix.SCENARIOS[0],
+        scenario=matrix.SCENARIOS[6],
+        output=tmp_path / "arm.json",
+    )
+
+    assert command[command.index("--max-tokens") + 1] == "16384"
+    assert "--enable-thinking" in command
+    assert command[command.index("--reasoning-effort") + 1] == "xhigh"
+
+
+@pytest.mark.parametrize("scenario_index", [0, 2, 6])
+def test_every_effort_uses_1024_token_same_prompt_conditioning(
+    scenario_index: int,
+) -> None:
+    matrix = _module()
+    args = SimpleNamespace(
+        model=Path("/models/target"),
+        draft=Path("/models/draft"),
+        context_file=Path("/repo/mtplx/generation.py"),
+        prompt_file=Path("/repo/prompt.jsonl"),
+        conditioner_tokens=32,
+        seed=42,
+        lock=Path("/tmp/gpu.lock"),
+    )
+
+    command = matrix.child_command(
+        args,
+        engine="pr_dflash2",
+        source_root=Path("/repo"),
+        source_commit="abc123",
+        scenario=matrix.SCENARIOS[scenario_index],
         output=Path("/tmp/arm.json"),
     )
 
@@ -220,3 +252,6 @@ def test_aggregate_reports_requested_metrics_and_matched_wall_delta() -> None:
     assert result["wall_time_improvement_pct"] == pytest.approx(40.0)
     assert result["cold_prefill"] is True
     assert result["prefix_cache_used"] is False
+    assert result["enable_thinking"] is True
+    assert result["reasoning_effort"] == "low"
+    assert result["correctness"]["exact_prompt_and_output_counts"] is True

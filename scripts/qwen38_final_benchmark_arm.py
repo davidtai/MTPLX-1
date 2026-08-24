@@ -21,6 +21,7 @@ IS_PALINDROME_PROMPT = '''Complete this Python function. Return only the functio
 
 def is_palindrome(text: str) -> bool:
     """Return whether text reads the same forward and backward. Ignore whitespace, punctuation, and case, while handling Unicode letters and digits. Empty input counts as a palindrome. For example, "A man, a plan, a canal: Panama" is true and "hello" is false."""'''
+_CHAT_CONTENT_SENTINEL = "MTPLX_QWEN38_BENCHMARK_CONTENT_7F13C9A2"
 
 
 def _sha256_tokens(tokens: list[int]) -> str:
@@ -68,27 +69,49 @@ def _build_exact_coding_prompt(
     target_tokens: int,
     context: str,
     instruction: str,
+    reasoning_effort: str,
 ) -> tuple[str, list[int]]:
+    if reasoning_effort not in {"low", "xhigh"}:
+        raise ValueError("coding reasoning effort must be low or xhigh")
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": _CHAT_CONTENT_SENTINEL}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        reasoning_effort=reasoning_effort,
+    )
+    if not isinstance(rendered, str) or rendered.count(_CHAT_CONTENT_SENTINEL) != 1:
+        raise ValueError(
+            "chat template did not preserve the benchmark content sentinel"
+        )
+    prefix, suffix = rendered.split(_CHAT_CONTENT_SENTINEL)
+    prefix_ids = list(tokenizer.encode(prefix))
+    suffix_ids = list(tokenizer.encode(suffix))
     tail_ids = list(tokenizer.encode("\n\n" + instruction.strip()))
-    if len(tail_ids) >= target_tokens:
+    fixed_tokens = len(prefix_ids) + len(tail_ids) + len(suffix_ids)
+    if fixed_tokens >= target_tokens:
         raise ValueError("instruction does not fit inside prompt token target")
     context_ids = list(tokenizer.encode(context.rstrip() + "\n"))
     if not context_ids:
         raise ValueError("context must encode to at least one token")
-    budget = target_tokens - len(tail_ids)
+    budget = target_tokens - fixed_tokens
     repeats = (budget + len(context_ids) - 1) // len(context_ids)
-    ids = (context_ids * repeats)[:budget] + tail_ids
+    ids = prefix_ids + (context_ids * repeats)[:budget] + tail_ids + suffix_ids
     return str(tokenizer.decode(ids)), ids
 
 
-def native_arm_metrics(output: Any, *, prompt_tokens: int, wall_s: float) -> dict[str, Any]:
+def native_arm_metrics(
+    output: Any, *, prompt_tokens: int, wall_s: float
+) -> dict[str, Any]:
     stats = output.stats
     peak = int(stats.peak_memory_bytes)
     cached_tokens = int(getattr(stats, "cached_tokens", 0) or 0)
     return {
         "prompt_tokens": int(prompt_tokens),
         "generated_tokens": int(stats.generated_tokens),
-        "prefill_tokens": int(getattr(stats, "new_prefill_tokens", prompt_tokens) or prompt_tokens),
+        "prefill_tokens": int(
+            getattr(stats, "new_prefill_tokens", prompt_tokens) or prompt_tokens
+        ),
         "prefill_s": float(stats.prompt_target_prefill_time_s),
         "prefill_tps": float(stats.prompt_target_prefill_tok_s),
         "decode_elapsed_s": float(stats.decode_elapsed_s),
@@ -98,7 +121,9 @@ def native_arm_metrics(output: Any, *, prompt_tokens: int, wall_s: float) -> dic
         "peak_memory_bytes": peak,
         "peak_memory_gib": peak / 2**30,
         "cached_tokens": cached_tokens,
-        "prefix_cache_used": bool(cached_tokens or getattr(stats, "session_cache_hit", False)),
+        "prefix_cache_used": bool(
+            cached_tokens or getattr(stats, "session_cache_hit", False)
+        ),
         "session_cache_hit": bool(getattr(stats, "session_cache_hit", False)),
         "cache_source": str(getattr(stats, "cache_source", "none")),
         "session_restore_mode": str(getattr(stats, "session_restore_mode", "cold")),
@@ -135,18 +160,31 @@ def native_draft_sampler_values(
 
 
 def stop_token_ids_for_prompt(prompt_kind: str) -> set[int] | None:
-    """Let the simple burst stop naturally; load simulations fill their cap."""
+    """Use the model's natural stop tokens for every real-usage scenario."""
 
-    return None if prompt_kind == "is_palindrome" else set()
+    del prompt_kind
+    return None
 
 
 def validate_candidate_adaptive_receipt(receipt: dict[str, Any]) -> None:
     route = dict(receipt.get("context_route") or {})
     if not (
-        bool(route.get("requested_adaptive"))
-        and bool(route.get("effective_adaptive"))
+        bool(route.get("requested_adaptive")) and bool(route.get("effective_adaptive"))
     ):
         raise RuntimeError("DFlash2 benchmark candidate is not effectively adaptive")
+
+
+def capture_effective_stack_receipt(
+    engine: str,
+    runtime: Any,
+    stack: dict[str, Any],
+) -> dict[str, Any]:
+    """Snapshot the route receipt after the measured request has selected it."""
+
+    captured = dict(stack)
+    if engine == "pr_dflash2":
+        captured["feature_receipt"] = dict(runtime.qwen38_feature_receipt)
+    return captured
 
 
 def _dflash_arm_metrics(
@@ -181,7 +219,8 @@ def _dflash_arm_metrics(
         "verify_calls": int(stats.verify_calls),
         "requested_width": int(runtime.config.draft_block_size),
         "effective_widths": sorted(
-            int(value) for value in (telemetry.adaptive_metrics.get("cycles_by_block") or {})
+            int(value)
+            for value in (telemetry.adaptive_metrics.get("cycles_by_block") or {})
         ),
         "requested_adaptive": bool(
             runtime.qwen38_feature_receipt.get("context_route", {}).get(
@@ -203,19 +242,29 @@ def _dflash_arm_metrics(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--engine", choices=("main_native_mtp", "pr_dflash2"), required=True)
+    parser.add_argument(
+        "--engine", choices=("main_native_mtp", "pr_dflash2"), required=True
+    )
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--draft", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--context-file", type=Path, required=True)
-    parser.add_argument("--prompt-kind", choices=("is_palindrome", "coding"), required=True)
+    parser.add_argument(
+        "--prompt-kind", choices=("is_palindrome", "coding"), required=True
+    )
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--max-tokens", type=int, required=True)
     parser.add_argument("--temperature", type=float, required=True)
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+    )
+    parser.add_argument("--reasoning-effort", choices=("low", "xhigh"))
     parser.add_argument("--conditioner-tokens", type=int, default=32)
     parser.add_argument(
         "--conditioner-mode",
@@ -236,17 +285,22 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_prompt(args: argparse.Namespace, tokenizer: Any) -> tuple[str, list[int]]:
     if args.prompt_kind == "is_palindrome":
+        if args.enable_thinking or args.reasoning_effort is not None:
+            raise ValueError("palindrome scenario must remain non-thinking")
         return _build_exact_chat_prompt(
             tokenizer,
             text=IS_PALINDROME_PROMPT,
             target_tokens=args.prompt_tokens,
         )
+    if not args.enable_thinking or args.reasoning_effort is None:
+        raise ValueError("coding scenario requires an explicit thinking effort")
     row = json.loads(args.prompt_file.read_text(encoding="utf-8").splitlines()[0])
     return _build_exact_coding_prompt(
         tokenizer,
         target_tokens=args.prompt_tokens,
         context=args.context_file.read_text(encoding="utf-8"),
         instruction=str(row["prompt"]),
+        reasoning_effort=args.reasoning_effort,
     )
 
 
@@ -257,7 +311,11 @@ def _load_native(model: Path) -> tuple[Any, dict[str, Any]]:
         draft_lm_head_spec_from_runtime_contract,
     )
     from mtplx.draft_sampling import draft_sampler_spec_from_runtime_contract
-    from mtplx.profiles import apply_profile_env, get_profile, runtime_env_overrides_from_contract
+    from mtplx.profiles import (
+        apply_profile_env,
+        get_profile,
+        runtime_env_overrides_from_contract,
+    )
     from mtplx.runtime import load
 
     contract, error = load_runtime_contract(model)
@@ -348,7 +406,9 @@ def _load_dflash(
     }
 
 
-def _generate_native(runtime: Any, prompt_ids: list[int], args: argparse.Namespace) -> Any:
+def _generate_native(
+    runtime: Any, prompt_ids: list[int], args: argparse.Namespace
+) -> Any:
     from mtplx.generation import generate_mtpk
     from mtplx.sampling import SamplerConfig
 
@@ -377,7 +437,9 @@ def _generate_native(runtime: Any, prompt_ids: list[int], args: argparse.Namespa
     )
 
 
-def _generate_dflash(runtime: Any, prompt_ids: list[int], args: argparse.Namespace) -> Any:
+def _generate_dflash(
+    runtime: Any, prompt_ids: list[int], args: argparse.Namespace
+) -> Any:
     from mtplx.backends.dflash2 import generate_dflash2
     from mtplx.sampling import SamplerConfig
 
@@ -402,15 +464,22 @@ def main() -> int:
         )
     sys.path.insert(0, str(args.source_root.resolve()))
     imported_mtplx = __import__("mtplx")
-    if args.source_root.resolve() not in Path(imported_mtplx.__file__).resolve().parents:
-        raise RuntimeError(f"mtplx import escaped pinned source root: {imported_mtplx.__file__}")
+    if (
+        args.source_root.resolve()
+        not in Path(imported_mtplx.__file__).resolve().parents
+    ):
+        raise RuntimeError(
+            f"mtplx import escaped pinned source root: {imported_mtplx.__file__}"
+        )
 
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,
     )
 
     if not _verify_parent_guard_attestation(args.lock):
-        raise RuntimeError("benchmark arm requires exclusive parent GPU lock attestation")
+        raise RuntimeError(
+            "benchmark arm requires exclusive parent GPU lock attestation"
+        )
     runtime, stack = (
         _load_native(args.model)
         if args.engine == "main_native_mtp"
@@ -438,7 +507,9 @@ def main() -> int:
 
     conditioner_args = argparse.Namespace(**vars(args))
     conditioner_args.max_tokens = args.conditioner_tokens
-    generate = _generate_native if args.engine == "main_native_mtp" else _generate_dflash
+    generate = (
+        _generate_native if args.engine == "main_native_mtp" else _generate_dflash
+    )
     generate(runtime, conditioner_ids, conditioner_args)
 
     import mlx.core as mx
@@ -463,6 +534,7 @@ def main() -> int:
         if args.engine == "main_native_mtp"
         else "pr_final_production_dflash2"
     )
+    stack = capture_effective_stack_receipt(args.engine, runtime, stack)
     receipt = {
         "kind": "qwen38_final_cold_prefill_isolated_arm",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -477,8 +549,10 @@ def main() -> int:
             "prompt_format": (
                 "qwen_chat_template_non_thinking"
                 if args.prompt_kind == "is_palindrome"
-                else "exact_token_coding_context"
+                else f"qwen_chat_template_thinking_{args.reasoning_effort}"
             ),
+            "enable_thinking": bool(args.enable_thinking),
+            "reasoning_effort": args.reasoning_effort,
             "prompt_tokens": len(prompt_ids),
             "prompt_token_sha256": _sha256_tokens(prompt_ids),
             "output_limit": args.max_tokens,
@@ -507,16 +581,12 @@ def main() -> int:
             "conditioner_output_tokens": args.conditioner_tokens,
             "conditioner_mode": args.conditioner_mode,
             "conditioner_reuses_timed_prompt": args.conditioner_mode == "same_prompt",
-            "output_count_forced": args.prompt_kind != "is_palindrome",
+            "output_count_forced": False,
             "requested_adaptive": (
-                bool(args.dflash2_adaptive)
-                if args.engine == "pr_dflash2"
-                else None
+                bool(args.dflash2_adaptive) if args.engine == "pr_dflash2" else None
             ),
             "requested_draft_m": (
-                int(args.draft_block_size)
-                if args.engine == "pr_dflash2"
-                else None
+                int(args.draft_block_size) if args.engine == "pr_dflash2" else None
             ),
         },
         "stack": stack,

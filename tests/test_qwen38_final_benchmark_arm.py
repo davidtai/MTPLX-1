@@ -94,9 +94,7 @@ def test_dflash_metrics_report_actual_stop_and_effective_widths() -> None:
         },
     )
 
-    metrics = arm._dflash_arm_metrics(
-        output, runtime, prompt_tokens=100, wall_s=1.12
-    )
+    metrics = arm._dflash_arm_metrics(output, runtime, prompt_tokens=100, wall_s=1.12)
 
     assert metrics["finish_reason"] == "stop"
     assert metrics["output_text"].startswith("normalized =")
@@ -143,11 +141,53 @@ def test_burst_prompt_is_python_palindrome_task_and_fits_exact_budget() -> None:
     ]
 
 
-def test_palindrome_uses_eos_with_1024_cap_but_load_scenarios_force_1024() -> None:
+@pytest.mark.parametrize("reasoning_effort", ["low", "xhigh"])
+def test_coding_prompt_uses_requested_thinking_effort_at_exact_budget(
+    reasoning_effort: str,
+) -> None:
+    arm = _module()
+
+    class CharacterChatTokenizer:
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+        @staticmethod
+        def decode(tokens: list[int]) -> str:
+            return "".join(chr(token) for token in tokens)
+
+        @staticmethod
+        def apply_chat_template(messages, **kwargs):
+            assert kwargs == {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": True,
+                "reasoning_effort": reasoning_effort,
+            }
+            return (
+                f"<system>Reasoning effort is set to {reasoning_effort}.</system>"
+                f"<user>{messages[0]['content']}</user><assistant><think>\n"
+            )
+
+    prompt, ids = arm._build_exact_coding_prompt(
+        CharacterChatTokenizer(),
+        target_tokens=512,
+        context="class ExistingModule:\n    pass\n",
+        instruction="Implement the production-ready scheduler.",
+        reasoning_effort=reasoning_effort,
+    )
+
+    assert len(ids) == 512
+    assert f"Reasoning effort is set to {reasoning_effort}." in prompt
+    assert prompt.endswith("</user><assistant><think>\n")
+    assert prompt.count("Implement the production-ready scheduler.") == 1
+
+
+def test_all_final_matrix_scenarios_use_natural_eos() -> None:
     arm = _module()
 
     assert arm.stop_token_ids_for_prompt("is_palindrome") is None
-    assert arm.stop_token_ids_for_prompt("coding") == set()
+    assert arm.stop_token_ids_for_prompt("coding") is None
 
 
 def test_native_draft_sampler_uses_contract_except_for_full_greedy_headline() -> None:
@@ -182,3 +222,18 @@ def test_candidate_adaptive_receipt_must_be_effective() -> None:
                 }
             }
         )
+
+
+def test_dflash_stack_receipt_uses_post_generation_context_route() -> None:
+    arm = _module()
+    stale = {
+        "feature_receipt": {"context_route": {"route_id": "short_lt16384"}}
+    }
+    runtime = SimpleNamespace(
+        qwen38_feature_receipt={"context_route": {"route_id": "long_ge16384"}}
+    )
+
+    captured = arm.capture_effective_stack_receipt("pr_dflash2", runtime, stale)
+
+    assert captured["feature_receipt"]["context_route"]["route_id"] == "long_ge16384"
+    assert stale["feature_receipt"]["context_route"]["route_id"] == "short_lt16384"
