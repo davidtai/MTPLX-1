@@ -172,13 +172,11 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
     weights = _weights()
     plan = wo.install_mia_tp1_wo_mxfp8(
         owner_role="target",
-        decode_mode="native",
         max_prefill_rows=8224,
         **weights,
     )
     draft_plan = wo.install_mia_tp1_wo_mxfp8(
         owner_role="draft",
-        decode_mode="exact",
         max_prefill_rows=8224,
         **weights,
     )
@@ -189,9 +187,7 @@ def test_installed_tp1_wo_core_owns_weights_and_never_reenters_factories(monkeyp
     assert plan.wo_b_scales is weights["wo_b_scales"]
     assert plan.max_prefill_rows == 8224
     assert plan.owner_role == "target"
-    assert plan.decode_mode == "native"
     assert draft_plan.owner_role == "draft"
-    assert draft_plan.decode_mode == "exact"
     assert decode_block_ns == []
 
     def forbidden(*_args, **_kwargs):
@@ -326,7 +322,6 @@ def test_tp1_wo_install_rejects_shape_or_storage_poison(
     with pytest.raises(ValueError, match="Mia TP1 WO"):
         wo.install_mia_tp1_wo_mxfp8(
             owner_role="target",
-            decode_mode="native",
             max_prefill_rows=8224,
             **weights,
         )
@@ -466,7 +461,7 @@ def test_engine_receipt_describes_four_physical_wo_scratch_arrays():
     assert "8192 + 256" not in source
 
 
-def test_exact_model_install_owns_46_distinct_plans_and_decode_routes(
+def test_exact_model_install_owns_46_distinct_plans_and_native_parameters(
     monkeypatch,
 ):
     monkeypatch.setattr(wo, "_inverse_rope_quant_kernel", lambda: object())
@@ -507,12 +502,6 @@ def test_exact_model_install_owns_46_distinct_plans_and_decode_routes(
     assert tuple(plan.owner_role for plan in plans) == ("target",) * 43 + (
         "draft",
     ) * 3
-    assert tuple(
-        index
-        for index, plan in enumerate(plans[:43])
-        if plan.decode_mode == "exact"
-    ) == (1, 5, 10, 11, 21, 26, 30, 31, 40)
-    assert all(plan.decode_mode == "exact" for plan in plans[43:])
     assert all(
         plan.wo_a_weight is attention.wo_a.weight
         and plan.wo_a_scales is attention.wo_a.scales
@@ -525,17 +514,6 @@ def test_exact_model_install_owns_46_distinct_plans_and_decode_routes(
     assert receipt["draft_attention"] == 3
     assert receipt["plan_count"] == receipt["unique_plan_count"] == 46
     assert receipt["plan_type"] == "MiaTP1WOMXFP8Plan"
-    assert receipt["exact_target_wo_b_layers"] == (
-        1,
-        5,
-        10,
-        11,
-        21,
-        26,
-        30,
-        31,
-        40,
-    )
     assert deepseek_v4_model.mia_tp1_wo_projection_receipt(model) == receipt
     with pytest.raises(ValueError, match="already installed"):
         deepseek_v4_model.install_mia_tp1_wo_projection_routes(
