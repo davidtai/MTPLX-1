@@ -699,6 +699,7 @@ def _build_kernel_m6_ksplit_np(
     k_parts: int = 2,
     rows: int = 6,
     barrier_free_kp1: bool = False,
+    kconst: int = 0,
 ):
     """5/6-row K-split variant with exact scalar row registers.
 
@@ -719,6 +720,7 @@ def _build_kernel_m6_ksplit_np(
         int(k_parts),
         int(rows),
         bool(barrier_free_kp1),
+        int(kconst),
     )
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
@@ -730,6 +732,11 @@ def _build_kernel_m6_ksplit_np(
     row_fmas = "\n".join(
         f"                    acc[j * M + {row}] += float(v{row}[ki]) * wv;"
         for row in range(int(rows))
+    )
+    k_declaration = (
+        "        constexpr int K = KCONST;"
+        if int(kconst)
+        else "        int K = int(K_size);"
     )
     if barrier_free_kp1:
         reduction_source = """
@@ -779,7 +786,7 @@ def _build_kernel_m6_ksplit_np(
         uint lane = thread_index_in_simdgroup;
         uint tg_n = threadgroup_position_in_grid.y;
 
-        int K = int(K_size);
+{k_declaration}
         int N = int(N_size);
         int K_by_8 = K / 8;
         int K_by_gs = K / GS;
@@ -826,6 +833,7 @@ def _build_kernel_m6_ksplit_np(
         name=(
             f"mtplx_verify_m{int(rows)}_ksplit_kp{int(k_parts)}_"
             f"{'direct_' if barrier_free_kp1 else ''}"
+            f"{'k' + str(int(kconst)) + '_' if int(kconst) else ''}"
             f"gs{group_size}_{dtype_tag}"
         ),
         input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
@@ -857,6 +865,7 @@ def nax_qmm_m6(
     exact_m5: bool = False,
     k_parts: int = 2,
     barrier_free_kp1: bool = False,
+    compile_time_k: bool = False,
 ) -> mx.array:
     """Run the 5/6-row K-split verify matmul."""
     M = int(x2.shape[0])
@@ -880,16 +889,22 @@ def nax_qmm_m6(
         _count_nax_dispatch(f"m5_exact_ksplit_kp{int(k_parts)}", k=K, n=N)
     elif barrier_free_kp1:
         _count_nax_dispatch("m6_ksplit_kp1_direct", k=K, n=N)
+    if compile_time_k:
+        _count_nax_dispatch(f"m{M}_ksplit_kconst", k=K, n=N)
     kernel = _build_kernel_m6_ksplit_np(
         group_size,
         x2.dtype,
         k_parts=int(k_parts),
         rows=rows,
         barrier_free_kp1=bool(barrier_free_kp1),
+        kconst=K if compile_time_k else 0,
     )
+    template = [("T", x2.dtype)]
+    if compile_time_k:
+        template.append(("KCONST", K))
     (y,) = kernel(
         inputs=[x_rows, w_q, scales, biases, K, N],
-        template=[("T", x2.dtype)],
+        template=template,
         grid=(32 * int(k_parts), N // 4, 1),
         threadgroup=(32 * int(k_parts), 1, 1),
         output_shapes=[(rows, N)],
@@ -952,6 +967,8 @@ _QWEN38_M8_NSG_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M5_KPARTS_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M6_KPARTS_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M6_BARRIER_FREE_KP1_ACTIVE = False
+_QWEN38_M5_KCONST_SHAPES: frozenset[tuple[int, int]] = frozenset()
+_QWEN38_M6_KCONST_SHAPES: frozenset[tuple[int, int]] = frozenset()
 _QWEN38_M8_NAX_OUTPUT_SHAPES = frozenset({(6_144, 5_120)})
 _QWEN38_M8_NAX_LINEAR_Z_SHAPES = frozenset({(5_120, 6_144)})
 _QWEN38_M8_NAX_EXPANDED_SHAPES = frozenset(
@@ -1031,6 +1048,21 @@ def configure_qwen38_m6_barrier_free_kp1(*, active: bool) -> dict[str, bool]:
     global _QWEN38_M6_BARRIER_FREE_KP1_ACTIVE
     _QWEN38_M6_BARRIER_FREE_KP1_ACTIVE = bool(active)
     return {"active": bool(active)}
+
+
+def configure_qwen38_m56_kconst(*, active: bool) -> dict[str, object]:
+    global _QWEN38_M5_KCONST_SHAPES, _QWEN38_M6_KCONST_SHAPES
+    _QWEN38_M5_KCONST_SHAPES = (
+        frozenset({(5_120, 48), (5_120, 10_240)}) if active else frozenset()
+    )
+    _QWEN38_M6_KCONST_SHAPES = (
+        frozenset({(5_120, 10_240)}) if active else frozenset()
+    )
+    return {
+        "active": bool(active),
+        "m5_shapes": [list(shape) for shape in sorted(_QWEN38_M5_KCONST_SHAPES)],
+        "m6_shapes": [list(shape) for shape in sorted(_QWEN38_M6_KCONST_SHAPES)],
+    }
 
 
 def configure_qwen38_m8_nax_island(
@@ -1390,6 +1422,10 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                                 )
                                 == 1
                             )
+                        ),
+                        compile_time_k=bool(
+                            (m == 5 and (k, n) in _QWEN38_M5_KCONST_SHAPES)
+                            or (m == 6 and (k, n) in _QWEN38_M6_KCONST_SHAPES)
                         ),
                     )
                 elif (

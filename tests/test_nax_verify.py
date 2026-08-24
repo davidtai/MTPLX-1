@@ -315,11 +315,54 @@ def test_m6_kp1_can_select_barrier_free_kernel(monkeypatch) -> None:
     assert observed["barrier_free_kp1"] is True
 
 
+def test_m5_m6_kernel_can_specialize_compile_time_k(monkeypatch) -> None:
+    from mtplx import nax_verify
+
+    observed = {}
+
+    class FakeKernel:
+        def __call__(self, *, template, output_shapes, output_dtypes, **_kwargs):
+            observed["template"] = template
+            return [mx.zeros(output_shapes[0], dtype=output_dtypes[0])]
+
+    def build(*_args, **kwargs):
+        observed.update(kwargs)
+        return FakeKernel()
+
+    monkeypatch.setattr(nax_verify, "_build_kernel_m6_ksplit_np", build)
+    nax_verify.nax_qmm_m6(
+        mx.zeros((5, 32), dtype=mx.bfloat16),
+        mx.zeros((64, 4), dtype=mx.uint32),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        group_size=32,
+        exact_m5=True,
+        compile_time_k=True,
+    )
+    assert observed["kconst"] == 32
+    assert observed["template"] == [("T", mx.bfloat16), ("KCONST", 32)]
+
+
 def test_qwen38_barrier_free_m6_kp1_configuration() -> None:
     from mtplx.nax_verify import configure_qwen38_m6_barrier_free_kp1
 
     assert configure_qwen38_m6_barrier_free_kp1(active=True) == {"active": True}
     assert configure_qwen38_m6_barrier_free_kp1(active=False) == {"active": False}
+
+
+def test_qwen38_m5_m6_kconst_configuration() -> None:
+    from mtplx.nax_verify import configure_qwen38_m56_kconst
+
+    assert configure_qwen38_m56_kconst(active=True) == {
+        "active": True,
+        "m5_shapes": [[5120, 48], [5120, 10240]],
+        "m6_shapes": [[5120, 10240]],
+    }
+    assert configure_qwen38_m56_kconst(active=False) == {
+        "active": False,
+        "m5_shapes": [],
+        "m6_shapes": [],
+    }
 
 
 def test_m8_output_can_be_removed_without_removing_m7_or_mlp() -> None:

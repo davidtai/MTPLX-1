@@ -73,6 +73,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m6-partition-v2", action="store_true")
     parser.add_argument("--control-m6-barrier-free-kp1", action="store_true")
     parser.add_argument("--candidate-m6-barrier-free-kp1", action="store_true")
+    parser.add_argument("--control-m56-kconst", action="store_true")
+    parser.add_argument("--candidate-m56-kconst", action="store_true")
     parser.add_argument("--control-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--candidate-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--control-disable-row24-decode-ladder", action="store_true")
@@ -135,6 +137,9 @@ def _variant_environment(
     )
     environment["MTPLX_QWEN38_M6_BARRIER_FREE_KP1"] = (
         "1" if bool(getattr(args, f"{prefix}_m6_barrier_free_kp1", False)) else "0"
+    )
+    environment["MTPLX_QWEN38_M56_KCONST"] = (
+        "1" if bool(getattr(args, f"{prefix}_m56_kconst", False)) else "0"
     )
     return environment
 
@@ -421,6 +426,28 @@ def _engagement_exact(
                 "m6_ksplit_kp1_direct_k5120_n17408",
             )
             return all((int(counters.get(key, 0)) > 0) == active for key in direct)
+
+        return all(matches(row, False) for row in by_variant["control"]) and all(
+            matches(row, True) for row in by_variant["candidate"]
+        )
+    if args.candidate_label == "m56_kconst":
+        def matches(row: dict[str, Any], active: bool) -> bool:
+            report = row.get("feature_receipt", {}).get("dflash_m56_kconst", {})
+            if bool(report.get("active")) != active:
+                return False
+            expected_m5 = [[5120, 48], [5120, 10240]] if active else []
+            expected_m6 = [[5120, 10240]] if active else []
+            if report.get("m5_shapes") != expected_m5 or report.get(
+                "m6_shapes"
+            ) != expected_m6:
+                return False
+            counters = row.get("engagement", {}).get("nax_verify", {})
+            keys = (
+                "m5_ksplit_kconst_k5120_n48",
+                "m5_ksplit_kconst_k5120_n10240",
+                "m6_ksplit_kconst_k5120_n10240",
+            )
+            return all((int(counters.get(key, 0)) > 0) == active for key in keys)
 
         return all(matches(row, False) for row in by_variant["control"]) and all(
             matches(row, True) for row in by_variant["candidate"]
@@ -1091,6 +1118,8 @@ def _aggregate(
             "candidate_m6_partition_v2": bool(args.candidate_m6_partition_v2),
             "control_m6_barrier_free_kp1": bool(args.control_m6_barrier_free_kp1),
             "candidate_m6_barrier_free_kp1": bool(args.candidate_m6_barrier_free_kp1),
+            "control_m56_kconst": bool(args.control_m56_kconst),
+            "candidate_m56_kconst": bool(args.candidate_m56_kconst),
             "control_disable_row24_prefill_ladder": bool(
                 args.control_disable_row24_prefill_ladder
             ),

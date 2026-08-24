@@ -296,6 +296,11 @@ def _install_dflash_route(
     m6_barrier_free_report = configure_qwen38_m6_barrier_free_kp1(
         active=os.environ.get("MTPLX_QWEN38_M6_BARRIER_FREE_KP1", "0") == "1"
     )
+    from mtplx.nax_verify import configure_qwen38_m56_kconst
+
+    m56_kconst_report = configure_qwen38_m56_kconst(
+        active=os.environ.get("MTPLX_QWEN38_M56_KCONST", "0") == "1"
+    )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
         feature_receipt["r21_qk_rms_rope"] = row21_report
@@ -313,6 +318,7 @@ def _install_dflash_route(
         feature_receipt["dflash_nax_split_tuning"] = nax_split_report
         feature_receipt["dflash_m56_partition_tuning"] = m56_partition_report
         feature_receipt["dflash_m6_barrier_free_kp1"] = m6_barrier_free_report
+        feature_receipt["dflash_m56_kconst"] = m56_kconst_report
     runtime.qwen38_feature_receipt = feature_receipt
     return SimpleNamespace(
         route_id="+".join(

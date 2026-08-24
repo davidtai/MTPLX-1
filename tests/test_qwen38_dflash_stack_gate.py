@@ -787,6 +787,8 @@ def test_nax_split_candidate_flags_are_isolated_per_arm() -> None:
         candidate_m6_partition_v2=True,
         control_m6_barrier_free_kp1=False,
         candidate_m6_barrier_free_kp1=True,
+        control_m56_kconst=False,
+        candidate_m56_kconst=True,
     )
     control = stack_gate._variant_environment(args, "control", {})
     candidate = stack_gate._variant_environment(args, "candidate", {})
@@ -804,6 +806,8 @@ def test_nax_split_candidate_flags_are_isolated_per_arm() -> None:
     assert candidate["MTPLX_QWEN38_M6_PARTITION_V2"] == "1"
     assert control["MTPLX_QWEN38_M6_BARRIER_FREE_KP1"] == "0"
     assert candidate["MTPLX_QWEN38_M6_BARRIER_FREE_KP1"] == "1"
+    assert control["MTPLX_QWEN38_M56_KCONST"] == "0"
+    assert candidate["MTPLX_QWEN38_M56_KCONST"] == "1"
 
 
 def test_m7_linear_z_nsg4_engagement_requires_exact_shape_counter() -> None:
@@ -898,6 +902,41 @@ def test_m6_barrier_free_engagement_requires_both_retained_shapes() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is True
     by_variant["candidate"][0]["engagement"]["nax_verify"].pop(
         "m6_ksplit_kp1_direct_k5120_n17408"
+    )
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_m56_kconst_engagement_requires_all_three_selected_routes() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m56_kconst")
+
+    def arm(active):
+        calls = 1 if active else 0
+        return {
+            "feature_receipt": {
+                "dflash_m56_kconst": {
+                    "active": active,
+                    "m5_shapes": [[5120, 48], [5120, 10240]] if active else [],
+                    "m6_shapes": [[5120, 10240]] if active else [],
+                }
+            },
+            "engagement": {
+                "nax_verify": {
+                    "m5_ksplit_kconst_k5120_n48": calls,
+                    "m5_ksplit_kconst_k5120_n10240": calls,
+                    "m6_ksplit_kconst_k5120_n10240": calls,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(False), arm(False)],
+        "candidate": [arm(True), arm(True)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0]["engagement"]["nax_verify"].pop(
+        "m5_ksplit_kconst_k5120_n48"
     )
     assert stack_gate._engagement_exact(args, by_variant) is False
 
