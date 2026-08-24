@@ -101,23 +101,23 @@ cumulative control before that later decision can remain authoritative.
 | 63 corrected | retained rows 8, 10, 18, 20, 21, 24, 26, 36, 48, 50, 53, 61 | 754.687 | 57.141 | 32.72812 | 39.698 | - | corrected cumulative control | `chrono-r63-full-on-r08-r10-r18-r20-r21-r24-r26-r36-r48-r50-r53-r61-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 63 corrected | replace separate row-61 kernel with fused Q8 embedding/norm/concat | 768.177 | 55.700 | 32.72812 | 39.773 | **-0.1895%** | REJECTED, row 61 retained | same |
 | 55 base | retained fixed MTP D3 stack | 742.781 | 55.441 | 32.72811 | 40.604 | - | replacement control | `item55-dflash2-static8-on-full-fixed-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 base | DFlash2 fixed depth 8, before survivor-specific ports | 733.786 | 65.858 | 34.81407 | 37.917 | **+7.0860%** | **RETAINED as the replacement base**; not the final merged item 55 | same |
-| 55 target-only | DFlash2 with native MTP still constructed | 732.129 | 68.140 | 34.30132 | 37.444 | - | DFlash replacement control | `item55-dflash2-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 target-only | Optimized-Speed target plus DFlash2; native MTP never constructed | 747.429 | 66.839 | 32.73674 | 37.275 | **+0.4543%** | **RETAINED**, -1.56458 GiB peak | same |
-| 55 / row 18 | target-only DFlash2 replacement base | 736.544 | 67.051 | 32.73673 | 37.559 | - | cumulative control | `item55-dflash2-r18-gdn-decay-memo-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 / row 18 | + memoized GDN decay in DFlash recurrent rollback | 717.003 | 66.759 | 32.73675 | 38.221 | **-1.7342%** | **REJECTED, removed**; 9,120 calls/arm | same |
-| 55 / row 21 | target-only DFlash2 replacement base | 694.696 | 66.374 | 32.73673 | 39.111 | - | cumulative control | `item55-dflash2-r21-qk-rms-rope-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 / row 21 | + fused Q/K RMSNorm and partial RoPE | 729.811 | 65.775 | 32.73672 | 38.046 | **+2.8001%** | **RETAINED**; 3,184 calls/arm | same |
-| 55 / row 24 | DFlash2 + retained row 21 | 749.960 | 68.026 | 32.73674 | 36.944 | - | cumulative control | `item55-dflash2-r24-eval-ladder-on-r21-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 / row 24 | + Q/K L≤16 fence and target evaluation ladder | 770.175 | 67.199 | 35.73142 | 36.537 | **+1.1148%** | **RETAINED**; 1,664 ladder and 240 fallback calls/arm | same |
-| 55 / row 26 | DFlash2 + retained rows 21, 24 | 752.388 | 67.593 | 35.73143 | 36.965 | - | cumulative control | `item55-dflash2-r26-prefill-ladder3-on-r21-r24-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 / row 26 | + three-layer prefill evaluation cadence | 754.599 | 68.557 | 34.31398 | 36.689 | **+0.7544%** | **RETAINED**; 176 row-26 calls/arm, -1.41745 GiB peak | same |
-| 55 / row 34 | retained fixed rows 21, 24, 26, 48 + adaptive row 15 | 722.962 | 65.958 | 35.34873 | 38.221 | - | cumulative control | `item55-dflash2-c34-m6-direct-nibble-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 / row 34 | + M=6 direct-nibble W4/G64 DFlash-drafter kernel | 720.659 | 59.689 | 35.35205 | 39.924 | **-4.2634%** | **REJECTED, removed**; 926 M6 calls/arm, M9 outside DFlash cap | same |
-| 55 / row 40 | retained fixed rows 21, 24, 26, 48 + adaptive row 15 | 757.932 | 67.344 | 35.34873 | 36.868 | - | cumulative control | `item55-dflash2-c40-m6-m7-direct-nibble-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 / row 40 | + complete surviving M6+M7 direct-nibble DFlash state | 740.764 | 63.313 | 35.34725 | 38.350 | **-3.8639%** | **REJECTED, removed**; 2,655 M6 and 1,589 M7 calls/arm | same |
-| 55 / row 47 | retained fixed rows 21, 24, 26, 48 + adaptive row 15 | 770.770 | 68.374 | 35.34873 | 36.265 | - | cumulative control | `item55-dflash2-c47-final-m6-m7-m8-qmv-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
-| 55 / row 47 | + complete final M6+M7+M8 direct-nibble DFlash state | 765.495 | 58.219 | 35.34948 | 39.023 | **-7.0673%** | **REJECTED, removed**; 919/1,749/3,928 M6/M7/M8 calls per arm | same |
+| 55 base | DFlash2 fixed depth 8, before survivor-specific ports | 733.786 | 65.858 | 32.42313 | 37.917 | **+7.0860%** | **RETAINED as the replacement base**; not the final merged item 55 | same |
+| 55 target-only | DFlash2 with native MTP still constructed | 732.129 | 68.140 | 31.94559 | 37.444 | - | DFlash replacement control | `item55-dflash2-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 target-only | Optimized-Speed target plus DFlash2; native MTP never constructed | 747.429 | 66.839 | 30.48846 | 37.275 | **+0.4543%** | **RETAINED**, -1.45713 GiB peak | same |
+| 55 / row 18 | target-only DFlash2 replacement base | 736.544 | 67.051 | 30.48846 | 37.559 | - | cumulative control | `item55-dflash2-r18-gdn-decay-memo-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 18 | + memoized GDN decay in DFlash recurrent rollback | 717.003 | 66.759 | 30.48847 | 38.221 | **-1.7342%** | **REJECTED, removed**; 9,120 calls/arm | same |
+| 55 / row 21 | target-only DFlash2 replacement base | 694.696 | 66.374 | 30.48846 | 39.111 | - | cumulative control | `item55-dflash2-r21-qk-rms-rope-on-target-only-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 21 | + fused Q/K RMSNorm and partial RoPE | 729.811 | 65.775 | 30.48845 | 38.046 | **+2.8001%** | **RETAINED**; 3,184 calls/arm | same |
+| 55 / row 24 | DFlash2 + retained row 21 | 749.960 | 68.026 | 30.48846 | 36.944 | - | cumulative control | `item55-dflash2-r24-eval-ladder-on-r21-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 24 | + Q/K L≤16 fence and target evaluation ladder | 770.175 | 67.199 | 33.27748 | 36.537 | **+1.1148%** | **RETAINED**; 1,664 ladder and 240 fallback calls/arm | same |
+| 55 / row 26 | DFlash2 + retained rows 21, 24 | 752.388 | 67.593 | 33.27749 | 36.965 | - | cumulative control | `item55-dflash2-r26-prefill-ladder3-on-r21-r24-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 26 | + three-layer prefill evaluation cadence | 754.599 | 68.557 | 31.95738 | 36.689 | **+0.7544%** | **RETAINED**; 176 row-26 calls/arm, -1.32011 GiB peak | same |
+| 55 / row 34 | retained fixed rows 21, 24, 26, 48 + adaptive row 15 | 722.962 | 65.958 | 32.92107 | 38.221 | - | cumulative control | `item55-dflash2-c34-m6-direct-nibble-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 34 | + M=6 direct-nibble W4/G64 DFlash-drafter kernel | 720.659 | 59.689 | 32.92416 | 39.924 | **-4.2634%** | **REJECTED, removed**; 926 M6 calls/arm, M9 outside DFlash cap | same |
+| 55 / row 40 | retained fixed rows 21, 24, 26, 48 + adaptive row 15 | 757.932 | 67.344 | 32.92107 | 36.868 | - | cumulative control | `item55-dflash2-c40-m6-m7-direct-nibble-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 40 | + complete surviving M6+M7 direct-nibble DFlash state | 740.764 | 63.313 | 32.91969 | 38.350 | **-3.8639%** | **REJECTED, removed**; 2,655 M6 and 1,589 M7 calls/arm | same |
+| 55 / row 47 | retained fixed rows 21, 24, 26, 48 + adaptive row 15 | 770.770 | 68.374 | 32.92107 | 36.265 | - | cumulative control | `item55-dflash2-c47-final-m6-m7-m8-qmv-on-a15-python16384in-1024out-t1-isolated-abba-2026-08-23.json` |
+| 55 / row 47 | + complete final M6+M7+M8 direct-nibble DFlash state | 765.495 | 58.219 | 32.92177 | 39.023 | **-7.0673%** | **REJECTED, removed**; 919/1,749/3,928 M6/M7/M8 calls per arm | same |
 | 18 | Optimized-Speed main + retained rows 8, 10 | 742.390 | 54.957 | 25.14946 | 41.190 | - | cumulative control | `chrono-r18-gdn-decay-memo-on-r08-r10-python16384in-1024out-t1-abba-2026-08-23.json` |
 | 18 | + per-layer GDN `-exp(A_log)` memo | 758.449 | 54.816 | 25.14946 | 40.743 | **+1.0970%** | **RETAINED** | same |
 | 18 addendum | retained row-18 decay control | 720.656 | 54.118 | 32.70319 | 42.161 | - | cumulative control with packed weights resident | `chrono-r18-mlp-gate-up-addendum-on-r08-r10-r18memo-python16384in-1024out-t1-abba-2026-08-23.json` |
@@ -196,10 +196,10 @@ native MTP in the candidate process.
 | 18 | REJECTED: the memoized GDN decay engaged 9,120 times per candidate arm with exact tokens and width, but regressed wall time 1.7342%; the port was removed. |
 | 20 | REPLACED: K/V-only append is a native-MTP committed-history optimization; DFlash2 owns projected target features plus separate rollback caches. |
 | 21 | RETAINED: the DFlash target hook routed raw Q/K through the exact Qwen 3.8 fused RMSNorm plus partial-RoPE kernel, engaged 3,184 times per candidate arm with exact tokens and width, and improved wall time 2.8001%. |
-| 24 | RETAINED: the explicit DFlash Q/K L≤16 fence and target evaluation ladder engaged 240 and 1,664 times per candidate arm respectively, preserved exact tokens and width, and improved wall time 1.1148%. Peak rose 2.99468 GiB. |
-| 26 | RETAINED: the DFlash target prefill ladder moved from every fourth layer to every third, engaged 176 times per candidate arm with exact tokens and width, improved wall time 0.7544%, and reduced peak memory 1.41745 GiB. |
+| 24 | RETAINED: the explicit DFlash Q/K L≤16 fence and target evaluation ladder engaged 240 and 1,664 times per candidate arm respectively, preserved exact tokens and width, and improved wall time 1.1148%. Peak rose 2.78902 GiB. |
+| 26 | RETAINED: the DFlash target prefill ladder moved from every fourth layer to every third, engaged 176 times per candidate arm with exact tokens and width, improved wall time 0.7544%, and reduced peak memory 1.32011 GiB. |
 | 36 | REPLACED: the Q4/group-64 MTP block and BF16 Q/K/V islands belong to the removed native MTP drafter; the pinned DFlash2 checkpoint supplies its own W4/group-64 drafter. |
-| 48 | RETAINED: the adapted DFlash hidden-capture loop carried each layer's residual delta into the next layer's input RMSNorm, executed 199 forwards and 12,537 merged interior boundaries per candidate arm, preserved exact tokens and width, and improved wall time 1.9584%. Peak rose 1.03600 GiB. |
+| 48 | RETAINED: the adapted DFlash hidden-capture loop carried each layer's residual delta into the next layer's input RMSNorm, executed 199 forwards and 12,537 merged interior boundaries per candidate arm, preserved exact tokens and width, and improved wall time 1.9584%. Peak rose 0.96485 GiB. |
 | 50 | ACTIVE: the depth-8 DFlash arms recomputed the combined active footprint as 22,328,201,584 bytes and set a 22,395,310,448-byte wired limit. |
 | 53 | ACTIVE: both DFlash arms ran in fresh processes with the retained 512 MiB/50-op process-latched command-buffer profile. |
 | 61 | REPLACED: dual norm/concat feeds the removed native MTP block; DFlash2 uses its own embeddings, dynamic-conv layers, and selector. |
@@ -207,8 +207,7 @@ native MTP in the candidate process.
 ## Exact 54-row campaign state
 
 `Patch` is the SHA-256 prefix of the full binary parent diff; `Stats` is that
-same exact diff. `PENDING` means no disposition has been inferred from a later
-row or from the earlier bundle campaign.
+same exact diff. Every row below now has a final individual disposition.
 
 | Row | PR | Yukon delta | Source | Patch | Stats | Individual status |
 | ---: | ---: | ---: | --- | --- | ---: | --- |
@@ -268,5 +267,13 @@ row or from the earlier bundle campaign.
 | 82 | 1153 | 0.3733% | `eb5eadc7a165` | `3142edaa4070` | +5/-27 | CONDITIONER-COVERED/DEPENDENCY ABSENT: removes untimed folded-history warm shapes and skips construction of a fallback probe-sort factory while row 69's E87 argmax selector is active. The exact 1,024-token route conditioner already pays any live first touch before timed arms, and the argmax-only selector is absent from the required stochastic route. |
 
 All 54 rows now have a direct measured or source-causal disposition. The branch
-is not complete until the retained assembled stack passes the final test suites,
-table integrity checks, and code review.
+also ships the retained DFlash stack through the first-class bundle/runtime
+entry point: target-only Optimized-Speed, the pinned W4/group-64 DFlash draft,
+fixed target rows 21/24/26/48, active rows 50/53, and the retained row-11+15
+adaptive policy over physical blocks 1--8. The exact production verification
+completed the 16,384-token Python prompt and 1,024 output tokens at 713.394
+prefill tok/s, 60.261 decode tok/s, 39.985 s wall, and 32.921 GiB peak, with
+976 drafted and 768 accepted tokens. Its supplemental receipt is
+`final-production-dflash2-entry-python16384in-1024out-t1-2026-08-23.json`;
+individual promotion decisions remain in their row-specific four-arm ABBA
+receipts and are not inferred from this single integration run.

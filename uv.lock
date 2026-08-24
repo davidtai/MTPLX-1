@@ -732,6 +732,10 @@ dev = [
     { name = "ruff" },
     { name = "twine" },
 ]
+dflash2 = [
+    { name = "dflash-mlx" },
+    { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+]
 server = [
     { name = "fastapi" },
     { name = "llguidance" },
@@ -742,11 +746,13 @@ server = [
 requires-dist = [
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
     { name = "dflash-mlx", marker = "extra == 'competitors'", git = "https://github.com/davidtai/dflash-mlx.git?rev=c5b76ddb62bdefb6eeef1282641842edcf23a1b8" },
+    { name = "dflash-mlx", marker = "extra == 'dflash2'", git = "https://github.com/davidtai/dflash-mlx.git?rev=c5b76ddb62bdefb6eeef1282641842edcf23a1b8" },
     { name = "fastapi", specifier = ">=0.136" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.136" },
     { name = "huggingface-hub", specifier = ">=0.36" },
     { name = "llguidance", marker = "extra == 'server'", specifier = ">=1.7" },
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.32,<0.33" },
+    { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'dflash2'", specifier = "==0.32.0" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31,<0.32" },
     { name = "nanobind", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=2" },
     { name = "numpy", specifier = ">=2" },
@@ -761,7 +767,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.46" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.46" },
 ]
-provides-extras = ["competitors", "server", "dev"]
+provides-extras = ["competitors", "dflash2", "server", "dev"]
 
 [[package]]
 name = "nanobind"

@@ -554,12 +554,14 @@ def install_qwen38_route(
         route_features.append("r63_q8_embedding_dual_norm")
         kernel_ids.append("qwen38_row63_q8_g64_embedding_dual_rmsnorm_concat_v1")
         feature_receipt["r63_q8_embedding_dual_norm"] = {"active": 1}
-    qmv_report = configure_qwen38_qmv(
-        runtime.model,
-        active=bool(row70_qmv_sumtable),
-        min_width=2 if row80_qmv_m2 else 3,
-        active_groups=bool(row78_qmv_active_groups),
-    )
+    qmv_report: dict[str, int] = {"active_modules": 0, "eligible_modules": 0}
+    if row70_qmv_sumtable or row78_qmv_active_groups or row80_qmv_m2:
+        qmv_report = configure_qwen38_qmv(
+            runtime.model,
+            active=bool(row70_qmv_sumtable),
+            min_width=2 if row80_qmv_m2 else 3,
+            active_groups=bool(row78_qmv_active_groups),
+        )
     if row70_qmv_sumtable:
         if int(qmv_report.get("active_modules", 0)) <= 0:
             raise Qwen38ContractError("Qwen 3.8 row 70 QMV configured no modules")

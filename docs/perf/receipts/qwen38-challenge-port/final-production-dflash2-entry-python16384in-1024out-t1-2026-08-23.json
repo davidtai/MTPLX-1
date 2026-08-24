@@ -1,0 +1,214 @@
+{
+  "benchmark_contract": {
+    "conditioner_output_tokens": 1024,
+    "context_source": "mtplx/generation.py",
+    "intact_instruction_tail_tokens": 273,
+    "output_limit": 1024,
+    "prompt_id": "python_modules_long_high_acceptance",
+    "prompt_source": "mtplx/benchmarks/prompts/python_modules_long.jsonl",
+    "prompt_token_sha256": "ce56d0ebd7f7c4ea0982511717bde3fd5e31fa43a0e3a94c2613326fc9808ae8",
+    "prompt_tokens": 16384,
+    "seed": 42,
+    "stop_token_ids": [],
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "bundle": "/tmp/mtplx-dflash2-production.eyEGbZ",
+  "conditioner": {
+    "accepted_drafts": 768,
+    "decode_time_s": 17.525195499999995,
+    "decode_tok_s": 58.43016130690241,
+    "draft_core": {
+      "accepted_tokens": 768,
+      "adaptive_metrics": {
+        "cycles": 256,
+        "cycles_by_block": {
+          "2": 1,
+          "3": 15,
+          "4": 15,
+          "5": 225
+        },
+        "final_block_limit": 5,
+        "full_accept_streak": 1,
+        "kind": "qwen38_position_ema",
+        "last_draft_margins": [],
+        "position_accept_ema": [
+          0.9058792108914065,
+          0.8896710628188811,
+          0.9662807938747104,
+          0.8090460270833102
+        ],
+        "proposal_rows": [
+          11,
+          15
+        ],
+        "serial_cycles": 0
+      },
+      "backend": "dflash2",
+      "chunks": 256,
+      "drafted_tokens": 976,
+      "events": [],
+      "finish_reason": "length",
+      "generated_tokens": 1024,
+      "generation_tps": 58.43016130690241,
+      "peak_memory_bytes": 35273442932,
+      "prompt_tokens": 16384,
+      "prompt_tps": 809.1445349909702
+    },
+    "drafted_tokens": 976,
+    "finish_reason": "length",
+    "generated_token_sha256": "44df1eef4b30596a64682f21e69c19032cbf1532d4030dc29b7b7a6aa3488175",
+    "generated_tokens": 1024,
+    "peak_memory_bytes": 35273442932,
+    "peak_memory_gib": 32.85095368698239,
+    "prefill_time_s": 20.248545583000002,
+    "prefill_tok_s": 809.1445349909702,
+    "prefill_tokens": 16384,
+    "verify_calls": 256,
+    "wall_s": 37.82290708398796
+  },
+  "git_commit": "1f52ac4dfe9e16cfa93177335897ff0bc5d1fecf",
+  "git_worktree_dirty": true,
+  "kind": "qwen38_dflash2_production_entry_verification",
+  "recorded_at": "2026-08-24T04:42:39.627912+00:00",
+  "reporting": {
+    "candidate_decision": false,
+    "canonical_table": "docs/perf/qwen38-challenge-performance-tables.md",
+    "dflash2_rows": 54,
+    "matched_wall_delta_pct": null,
+    "native_mtp_rows": 54,
+    "reason": "production-entry integration verification only; row decisions use their recorded four-arm ABBA brackets"
+  },
+  "runtime": {
+    "backend_id": "dflash2",
+    "command_buffer_environment": {
+      "MLX_MAX_MB_PER_BUFFER": "512",
+      "MLX_MAX_OPS_PER_BUFFER": "50"
+    },
+    "external_dflash_draft": true,
+    "feature_receipt": {
+      "adaptive_policy": {
+        "active": true,
+        "base_draft_cap": 8,
+        "deep_draft_cap": 8,
+        "head_step_cost_ratio": 0.2,
+        "max_block_tokens": 8,
+        "min_block_tokens": 1,
+        "proposal_rows": [
+          11,
+          15
+        ],
+        "streak_gate": null
+      },
+      "native_mtp_release": {
+        "native_mtp_loaded": false,
+        "native_mtp_released": true
+      },
+      "r21_qk_rms_rope": {
+        "active_modules": 16,
+        "dflash_modules": 16,
+        "eligible_modules": 16,
+        "mtp_array_offset_skipped": 1
+      },
+      "r24_eval_ladder": {
+        "active": 1,
+        "prefill_stride": 3
+      },
+      "r24_qk_length_limit": {
+        "active_modules": 16,
+        "dflash_modules": 16,
+        "eligible_modules": 16,
+        "max_length": 32
+      },
+      "r26_prefill_ladder_3": {
+        "active": 1
+      },
+      "r48_boundary_fused": {
+        "active_modules": 64,
+        "eligible_modules": 64
+      },
+      "r50_wired_residency": {
+        "active": true,
+        "active_memory_bytes": 20534344712,
+        "baseline_limit_bytes": 0,
+        "installed": true,
+        "max_recommended_working_set_bytes": 107374182400,
+        "slack_bytes": 67108864,
+        "target_limit_bytes": 20601453576
+      },
+      "r53_command_buffers": {
+        "active": true,
+        "installed": true,
+        "max_mb_per_buffer": 512,
+        "max_ops_per_buffer": 50,
+        "process_latched": true
+      }
+    },
+    "native_mtp_loaded": false,
+    "physical_block_size": 8
+  },
+  "schema_version": 1,
+  "source_files_sha256": {
+    "mtplx/__init__.py": "b2d402b80fed10315920e3c97e7e339ca9c8ee0921fab7b70329576bdb24c222",
+    "mtplx/backends/dflash2.py": "879a8e8c11da5fdacf2743a1560ae257037b8a1809cfca9949ace392902d7676",
+    "mtplx/dflash2_bundle.py": "215ecee33c69b1a9f22540b29ca30bb4867472c23560269b9ba6c616fa59af59",
+    "mtplx/generation.py": "dfa72b4d7b161ef6f6105b0a635cff3bf3d112f37bdb4f0d1a4eb092ccbf5771",
+    "mtplx/runtime.py": "aa3999323e2c053ac95fa98260d56e0e75f53a46746b62429950b8ed3f93308c",
+    "pyproject.toml": "ba39455577ed08fe3862e613322008d544b3357ee3992c7b6a97156d45e2c069",
+    "uv.lock": "384d60e15c73f89212c48e3e0ab981891468277b8301497b16c9a81346f5daf0"
+  },
+  "timed_production_entry": {
+    "accepted_drafts": 768,
+    "decode_time_s": 16.992620916,
+    "decode_tok_s": 60.26145143012146,
+    "draft_core": {
+      "accepted_tokens": 768,
+      "adaptive_metrics": {
+        "cycles": 256,
+        "cycles_by_block": {
+          "2": 1,
+          "3": 15,
+          "4": 15,
+          "5": 225
+        },
+        "final_block_limit": 5,
+        "full_accept_streak": 1,
+        "kind": "qwen38_position_ema",
+        "last_draft_margins": [],
+        "position_accept_ema": [
+          0.9058792108914065,
+          0.8896710628188811,
+          0.9662807938747104,
+          0.8090460270833102
+        ],
+        "proposal_rows": [
+          11,
+          15
+        ],
+        "serial_cycles": 0
+      },
+      "backend": "dflash2",
+      "chunks": 256,
+      "drafted_tokens": 976,
+      "events": [],
+      "finish_reason": "length",
+      "generated_tokens": 1024,
+      "generation_tps": 60.26145143012146,
+      "peak_memory_bytes": 35348302608,
+      "prompt_tokens": 16384,
+      "prompt_tps": 713.394207369323
+    },
+    "drafted_tokens": 976,
+    "finish_reason": "length",
+    "generated_token_sha256": "44df1eef4b30596a64682f21e69c19032cbf1532d4030dc29b7b7a6aa3488175",
+    "generated_tokens": 1024,
+    "peak_memory_bytes": 35348302608,
+    "peak_memory_gib": 32.920672193169594,
+    "prefill_time_s": 22.966264416999998,
+    "prefill_tok_s": 713.394207369323,
+    "prefill_tokens": 16384,
+    "verify_calls": 256,
+    "wall_s": 39.98502516699955
+  }
+}

@@ -580,6 +580,7 @@ def load(
     mtp_adapter: Path | str | None = None,
     merge_mtp_adapter: bool = False,
     gemma4_draft_block_size: int | None = None,
+    dflash2_draft_block_size: int | None = None,
     gemma4_target_distribution_mode: str | None = None,
     proj_quant: str | None = None,
     proj_requant: str | None = None,
@@ -593,6 +594,25 @@ def load(
     never reduced.
     """
     path = Path(model_path)
+    from .backends.dflash2 import load_dflash2_bundle
+    from .dflash2_bundle import DFLASH2_MANIFEST, resolve_dflash2_bundle_paths
+
+    dflash2_manifest = path / DFLASH2_MANIFEST
+    dflash2_bundle = resolve_dflash2_bundle_paths(path)
+    if dflash2_manifest.is_file():
+        if dflash2_bundle is None:
+            raise ValueError(f"invalid DFlash2 bundle: {path}")
+        if mtp:
+            runtime = load_dflash2_bundle(
+                path,
+                draft_block_size=dflash2_draft_block_size,
+            )
+            runtime.model_path = path
+            runtime.path = path
+            runtime.bundle_path = path
+            return runtime
+        path = Path(dflash2_bundle["target_model"])
+
     from .gemma4_pair import resolve_gemma4_pair_paths
 
     gemma4_pair = resolve_gemma4_pair_paths(path)

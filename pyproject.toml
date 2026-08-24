@@ -70,6 +70,10 @@ Citation = "https://github.com/youssofal/mtplx/blob/main/CITATION.cff"
 competitors = [
   "dflash-mlx @ git+https://github.com/davidtai/dflash-mlx.git@c5b76ddb62bdefb6eeef1282641842edcf23a1b8",
 ]
+dflash2 = [
+  "dflash-mlx @ git+https://github.com/davidtai/dflash-mlx.git@c5b76ddb62bdefb6eeef1282641842edcf23a1b8",
+  "mlx==0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 server = [
   "fastapi>=0.136",
   "llguidance>=1.7",
