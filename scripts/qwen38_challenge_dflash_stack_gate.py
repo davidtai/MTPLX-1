@@ -71,6 +71,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m5-partition-v2", action="store_true")
     parser.add_argument("--control-m6-partition-v2", action="store_true")
     parser.add_argument("--candidate-m6-partition-v2", action="store_true")
+    parser.add_argument("--control-m6-barrier-free-kp1", action="store_true")
+    parser.add_argument("--candidate-m6-barrier-free-kp1", action="store_true")
     parser.add_argument("--control-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--candidate-disable-row24-prefill-ladder", action="store_true")
     parser.add_argument("--control-disable-row24-decode-ladder", action="store_true")
@@ -130,6 +132,9 @@ def _variant_environment(
     )
     environment["MTPLX_QWEN38_M6_PARTITION_V2"] = (
         "1" if bool(getattr(args, f"{prefix}_m6_partition_v2", False)) else "0"
+    )
+    environment["MTPLX_QWEN38_M6_BARRIER_FREE_KP1"] = (
+        "1" if bool(getattr(args, f"{prefix}_m6_barrier_free_kp1", False)) else "0"
     )
     return environment
 
@@ -402,6 +407,23 @@ def _engagement_exact(
 
         return all(matches(row, set()) for row in by_variant["control"]) and all(
             matches(row, expected_families) for row in by_variant["candidate"]
+        )
+    if args.candidate_label == "m6_barrier_free_kp1":
+        def matches(row: dict[str, Any], active: bool) -> bool:
+            report = row.get("feature_receipt", {}).get(
+                "dflash_m6_barrier_free_kp1", {}
+            )
+            if bool(report.get("active")) != active:
+                return False
+            counters = row.get("engagement", {}).get("nax_verify", {})
+            direct = (
+                "m6_ksplit_kp1_direct_k5120_n10240",
+                "m6_ksplit_kp1_direct_k5120_n17408",
+            )
+            return all((int(counters.get(key, 0)) > 0) == active for key in direct)
+
+        return all(matches(row, False) for row in by_variant["control"]) and all(
+            matches(row, True) for row in by_variant["candidate"]
         )
     if args.candidate_label == "release_native_mtp":
         return all(
@@ -1067,6 +1089,8 @@ def _aggregate(
             "candidate_m5_partition_v2": bool(args.candidate_m5_partition_v2),
             "control_m6_partition_v2": bool(args.control_m6_partition_v2),
             "candidate_m6_partition_v2": bool(args.candidate_m6_partition_v2),
+            "control_m6_barrier_free_kp1": bool(args.control_m6_barrier_free_kp1),
+            "candidate_m6_barrier_free_kp1": bool(args.candidate_m6_barrier_free_kp1),
             "control_disable_row24_prefill_ladder": bool(
                 args.control_disable_row24_prefill_ladder
             ),

@@ -269,8 +269,57 @@ def test_m6_kernel_matches_stock_within_tolerance() -> None:
             mx.eval(exact)
             assert exact.shape == (m, N)
             assert mx.array_equal(exact, y).item()
+        else:
+            kp1 = nax_qmm_m6(
+                x, w_q, scales, biases, group_size=64, k_parts=1
+            )
+            direct = nax_qmm_m6(
+                x,
+                w_q,
+                scales,
+                biases,
+                group_size=64,
+                k_parts=1,
+                barrier_free_kp1=True,
+            )
+            mx.eval(kp1, direct)
+            assert mx.array_equal(kp1, direct).item()
     assert not m6_ksplit_eligible(4, K, N, 4, 64, mx.bfloat16)
     assert not m6_ksplit_eligible(7, K, N, 4, 64, mx.bfloat16)
+
+
+def test_m6_kp1_can_select_barrier_free_kernel(monkeypatch) -> None:
+    from mtplx import nax_verify
+
+    observed = {}
+
+    class FakeKernel:
+        def __call__(self, *, output_shapes, output_dtypes, **_kwargs):
+            return [mx.zeros(output_shapes[0], dtype=output_dtypes[0])]
+
+    def build(*_args, **kwargs):
+        observed.update(kwargs)
+        return FakeKernel()
+
+    monkeypatch.setattr(nax_verify, "_build_kernel_m6_ksplit_np", build)
+    y = nax_verify.nax_qmm_m6(
+        mx.zeros((6, 32), dtype=mx.bfloat16),
+        mx.zeros((64, 4), dtype=mx.uint32),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        mx.zeros((64, 1), dtype=mx.bfloat16),
+        group_size=32,
+        k_parts=1,
+        barrier_free_kp1=True,
+    )
+    assert y.shape == (6, 64)
+    assert observed["barrier_free_kp1"] is True
+
+
+def test_qwen38_barrier_free_m6_kp1_configuration() -> None:
+    from mtplx.nax_verify import configure_qwen38_m6_barrier_free_kp1
+
+    assert configure_qwen38_m6_barrier_free_kp1(active=True) == {"active": True}
+    assert configure_qwen38_m6_barrier_free_kp1(active=False) == {"active": False}
 
 
 def test_m8_output_can_be_removed_without_removing_m7_or_mlp() -> None:

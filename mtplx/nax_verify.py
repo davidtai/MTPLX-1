@@ -698,6 +698,7 @@ def _build_kernel_m6_ksplit_np(
     *,
     k_parts: int = 2,
     rows: int = 6,
+    barrier_free_kp1: bool = False,
 ):
     """5/6-row K-split variant with exact scalar row registers.
 
@@ -709,7 +710,16 @@ def _build_kernel_m6_ksplit_np(
     """
     if int(rows) not in (5, 6):
         raise ValueError(f"M5/M6 K-split kernel requires 5 or 6 rows, got {rows}")
-    key = ("m6_ksplit_np", group_size, dtype, int(k_parts), int(rows))
+    if barrier_free_kp1 and int(k_parts) != 1:
+        raise ValueError("barrier-free M5/M6 kernel requires exactly one K part")
+    key = (
+        "m6_ksplit_np",
+        group_size,
+        dtype,
+        int(k_parts),
+        int(rows),
+        bool(barrier_free_kp1),
+    )
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
 
@@ -721,6 +731,42 @@ def _build_kernel_m6_ksplit_np(
         f"                    acc[j * M + {row}] += float(v{row}[ki]) * wv;"
         for row in range(int(rows))
     )
+    if barrier_free_kp1:
+        reduction_source = """
+        if (lane < BN * M) {
+            int j = int(lane) / M;
+            int row = int(lane) - j * M;
+            int n_global = n0 + j;
+            if (n_global < N) {
+                y[row * N + n_global] = T(acc[int(lane)]);
+            }
+        }
+        """
+    else:
+        reduction_source = """
+        threadgroup float partial[K_PARTS * BN * M];
+        if (lane == 0) {
+            _Pragma("unroll")
+            for (int i = 0; i < BN * M; ++i) {
+                partial[int(part) * BN * M + i] = acc[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (part == 0 && lane < BN * M) {
+            float total = 0.0f;
+            _Pragma("unroll")
+            for (int p = 0; p < K_PARTS; ++p) {
+                total += partial[p * BN * M + int(lane)];
+            }
+            int j = int(lane) / M;
+            int row = int(lane) - j * M;
+            int n_global = n0 + j;
+            if (n_global < N) {
+                y[row * N + n_global] = T(total);
+            }
+        }
+        """
 
     source = f"""
         using namespace metal;
@@ -772,34 +818,14 @@ def _build_kernel_m6_ksplit_np(
             acc[i] = simd_sum(acc[i]);
         }}
 
-        threadgroup float partial[K_PARTS * BN * M];
-        if (lane == 0) {{
-            _Pragma("unroll")
-            for (int i = 0; i < BN * M; ++i) {{
-                partial[int(part) * BN * M + i] = acc[i];
-            }}
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (part == 0 && lane < BN * M) {{
-            float total = 0.0f;
-            _Pragma("unroll")
-            for (int p = 0; p < K_PARTS; ++p) {{
-                total += partial[p * BN * M + int(lane)];
-            }}
-            int j = int(lane) / M;
-            int row = int(lane) - j * M;
-            int n_global = n0 + j;
-            if (n_global < N) {{
-                y[row * N + n_global] = T(total);
-            }}
-        }}
+{reduction_source}
     """
 
     dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     kernel = mx.fast.metal_kernel(
         name=(
             f"mtplx_verify_m{int(rows)}_ksplit_kp{int(k_parts)}_"
+            f"{'direct_' if barrier_free_kp1 else ''}"
             f"gs{group_size}_{dtype_tag}"
         ),
         input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
@@ -830,6 +856,7 @@ def nax_qmm_m6(
     group_size: int = 64,
     exact_m5: bool = False,
     k_parts: int = 2,
+    barrier_free_kp1: bool = False,
 ) -> mx.array:
     """Run the 5/6-row K-split verify matmul."""
     M = int(x2.shape[0])
@@ -851,11 +878,14 @@ def nax_qmm_m6(
     _count_nax_dispatch(dispatch_kind, k=K, n=N)
     if rows == 5:
         _count_nax_dispatch(f"m5_exact_ksplit_kp{int(k_parts)}", k=K, n=N)
+    elif barrier_free_kp1:
+        _count_nax_dispatch("m6_ksplit_kp1_direct", k=K, n=N)
     kernel = _build_kernel_m6_ksplit_np(
         group_size,
         x2.dtype,
         k_parts=int(k_parts),
         rows=rows,
+        barrier_free_kp1=bool(barrier_free_kp1),
     )
     (y,) = kernel(
         inputs=[x_rows, w_q, scales, biases, K, N],
@@ -921,6 +951,7 @@ _QWEN38_M7_NSG_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M8_NSG_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M5_KPARTS_BY_SHAPE: dict[tuple[int, int], int] = {}
 _QWEN38_M6_KPARTS_BY_SHAPE: dict[tuple[int, int], int] = {}
+_QWEN38_M6_BARRIER_FREE_KP1_ACTIVE = False
 _QWEN38_M8_NAX_OUTPUT_SHAPES = frozenset({(6_144, 5_120)})
 _QWEN38_M8_NAX_LINEAR_Z_SHAPES = frozenset({(5_120, 6_144)})
 _QWEN38_M8_NAX_EXPANDED_SHAPES = frozenset(
@@ -994,6 +1025,12 @@ def configure_qwen38_m56_partition_tuning(
         "m5_kparts_by_shape": receipt(_QWEN38_M5_KPARTS_BY_SHAPE),
         "m6_kparts_by_shape": receipt(_QWEN38_M6_KPARTS_BY_SHAPE),
     }
+
+
+def configure_qwen38_m6_barrier_free_kp1(*, active: bool) -> dict[str, bool]:
+    global _QWEN38_M6_BARRIER_FREE_KP1_ACTIVE
+    _QWEN38_M6_BARRIER_FREE_KP1_ACTIVE = bool(active)
+    return {"active": bool(active)}
 
 
 def configure_qwen38_m8_nax_island(
@@ -1339,6 +1376,19 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                             else _QWEN38_M6_KPARTS_BY_SHAPE.get(
                                 (k, n),
                                 1 if (k, n) in _QWEN38_M6_KP1_ACTIVE_SHAPES else 2,
+                            )
+                        ),
+                        barrier_free_kp1=bool(
+                            m == 6
+                            and _QWEN38_M6_BARRIER_FREE_KP1_ACTIVE
+                            and (
+                                _QWEN38_M6_KPARTS_BY_SHAPE.get(
+                                    (k, n),
+                                    1
+                                    if (k, n) in _QWEN38_M6_KP1_ACTIVE_SHAPES
+                                    else 2,
+                                )
+                                == 1
                             )
                         ),
                     )
