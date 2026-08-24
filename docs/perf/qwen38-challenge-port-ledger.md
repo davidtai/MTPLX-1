@@ -236,6 +236,7 @@ become the control for the next row.
 | Pre-removal phase-audit stack | Post54 DFlash control → all initially retained decode kernels | 767.024 → 759.845 | 68.728 → 70.416 | 36.294 → 36.139 | **+0.4285%** | 35.34873 → 35.34894 | INTERIM audit point; exact/deterministic variants and candidate above 70 TPS, but M8 output and M8 QKV still require decode-specific removal gates because their original isolated promotions lost decode TPS. | `post54-dflash2-final-phase-corrected-stack-vs-pre-kernel-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Remove exact-M8 `o_proj` route | + phase-audited full stack | 737.649 → 741.463 | 69.892 → 70.557 | 36.910 → 36.654 | **+0.6967%** | 35.34894 → 35.34894 | RETAINED REMOVAL: decode throughput improved 0.951% and wall improved 0.697%. Candidate arms had zero exact-M8 `o_proj` calls while M7 `o_proj`, M8 K/V, QKV, MLP, exact M5, and selected M6 routes remained live. Production now explicitly disables the M8 output route. | `post54-dflash2-remove-m8-output-on-phase-audited-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Remove exact-M8 linear-QKV route | + retained M8-output removal | 739.144 → 727.535 | 70.595 → 68.847 | 36.718 → 37.433 | **-1.9108%** | 35.34894 → 35.34894 | REJECTED: decode throughput regressed 2.477% and wall regressed 1.911%. Candidate arms correctly reduced exact-M8 QKV calls to zero while M8 K/V, MLP, exact-M5, and selected-M6 remained live, so QKV stays in the production decode stack. | `post54-dflash2-remove-m8-qkv-on-no-m8-output-phase-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| **Final phase-corrected post54 stack** | Post54 DFlash control → all surviving target-shape kernels | 774.119 → 772.201 | 68.571 → **70.045** | 36.130 → **35.869** | **+0.7286%** | 35.34873 → 35.34896 | RETAINED FINAL STACK: decode improved 2.150% and cleared 70 TPS; wall improved 0.729%. Both variants were internally deterministic with exact generated counts and fallback state. Candidate arms engaged M7 output/linear-Z, M8 K/V/QKV/MLP, exact-M5, and selected-M6 with zero exact-M8 output calls. | `final-dflash2-phase-corrected-stack-vs-post54-control-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 
 ### Prefill/decode route audit
 
@@ -313,15 +314,14 @@ same exact diff. Every row below now has a final individual disposition.
 | 82 | 1153 | 0.3733% | `eb5eadc7a165` | `3142edaa4070` | +5/-27 | CONDITIONER-COVERED/DEPENDENCY ABSENT: removes untimed folded-history warm shapes and skips construction of a fallback probe-sort factory while row 69's E87 argmax selector is active. The exact 1,024-token route conditioner already pays any live first touch before timed arms, and the argmax-only selector is absent from the required stochastic route. |
 
 All 54 rows now have a direct measured or source-causal disposition. The branch
-also ships the retained DFlash stack through the first-class bundle/runtime
-entry point: target-only Optimized-Speed, the pinned W4/group-64 DFlash draft,
-fixed target rows 21/24/26/48, active rows 50/53, and the retained row-11+15
-adaptive policy over physical blocks 1--8. The exact production verification
-completed the 16,384-token Python prompt and 1,024 output tokens at 731.314
-prefill tok/s, 69.489 decode tok/s, 37.173 s wall, and 32.921 GiB peak, with
-1,161 drafted and 823 accepted tokens over 201 cycles at blocks 4--8. This
-supersedes the invalid 60.261 tok/s integration run: that loader exposed only
-block-5 draft capabilities and omitted the pre-import Turbo profile. Its
-receipt is `final-production-dflash2-entry-python16384in-1024out-t1-2026-08-23.json`;
-individual promotion decisions remain in their row-specific four-arm ABBA
-receipts and are not inferred from this single integration run.
+ships the retained DFlash stack through the first-class bundle/runtime entry
+point: target-only Optimized-Speed, the pinned W4/group-64 DFlash draft, fixed
+target rows 21/24/26/48, active rows 50/53, the retained row-11+15 adaptive
+policy over physical blocks 1--8, and the final target-shape kernel winner set.
+The final four-arm ABBA measured the 16,384-token Python prompt plus 1,024 output
+tokens at 772.201 prefill tok/s, 70.045 decode tok/s, 35.869 s wall, and 35.349
+GB peak. Against the post54 DFlash control, decode improved 2.150% and wall
+improved 0.729%. The exact-M8 output route is intentionally absent; M7 output
+and linear-Z, M8 K/V/QKV/MLP, exact-M5, and selected-M6 routes all engaged.
+The receipt is
+`final-dflash2-phase-corrected-stack-vs-post54-control-python16384in-1024out-t1-isolated-abba-2026-08-24.json`.

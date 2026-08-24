@@ -74,15 +74,16 @@ replacement and the removal of the unused native-MTP object. Row 8 repeats the
 engine-replacement metrics only to show which original drafter optimization it
 replaces; that delta is composite and is not claimed as an isolated row-8 win.
 
-The final production-entry verification is likewise supplemental, not a 55th
-proposal row or a promotion bracket. After a 1,024-output conditioner, the
-shipped bundle path completed 16,384 Python input tokens plus 1,024 output at
+The pre-post54 production-entry verification is supplemental, not a 55th
+proposal row or a promotion bracket. After a 1,024-output conditioner, that
+historical bundle path completed 16,384 Python input tokens plus 1,024 output at
 731.314 prefill tok/s, 69.489 decode tok/s, 37.173 s wall, and 32.921 GiB peak.
 It proposed 1,161 tokens, accepted 823, and engaged the retained row-11+15
 adaptive policy for 201 cycles over physical blocks 4--8. This supersedes the
 invalid 60.261 tok/s integration measurement, whose production loader exposed
 only block-5 draft capabilities and omitted the pre-import Turbo profile. See
 `final-production-dflash2-entry-python16384in-1024out-t1-2026-08-23.json`.
+The final post54 stack is measured in the cumulative table below.
 
 | Row | Optimization / DFlash disposition | Prefill tok/s | Decode tok/s | Mean wall s | Wall delta | Peak GiB | DFlash2 result | Receipt / evidence |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
@@ -174,3 +175,4 @@ workload. DFlash memory values are decimal GB as reported by `dflash-mlx`.
 | Pre-removal phase-audit stack | Post54 DFlash control → initially retained decode-kernel stack | 767.024 → 759.845 | 68.728 → 70.416 | 36.294 → 36.139 | **+0.4285%** | 35.34873 → 35.34894 | Interim exact audit point above 70 TPS; M8 output and QKV removal gates still pending | `post54-dflash2-final-phase-corrected-stack-vs-pre-kernel-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Remove exact-M8 `o_proj` route | Phase-audited full stack → M7 `o_proj` only | 737.649 → 741.463 | 69.892 → 70.557 | 36.910 → 36.654 | **+0.6967%** | 35.34894 → 35.34894 | Retained removal; decode improved 0.951%, exact-M8 `o_proj` calls fell to zero, and M7 output plus all other M8 routes stayed live | `post54-dflash2-remove-m8-output-on-phase-audited-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Remove exact-M8 linear-QKV route | No-M8-output stack → stock QKV | 739.144 → 727.535 | 70.595 → 68.847 | 36.718 → 37.433 | **-1.9108%** | 35.34894 → 35.34894 | Rejected; decode regressed 2.477%, while M8 K/V, MLP, exact-M5, and selected-M6 routes remained live | `post54-dflash2-remove-m8-qkv-on-no-m8-output-phase-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| **Final phase-corrected post54 stack** | Post54 DFlash control → all surviving target-shape kernels | 774.119 → 772.201 | 68.571 → **70.045** | 36.130 → **35.869** | **+0.7286%** | 35.34873 → 35.34896 | Retained final stack; decode +2.150%, exact/deterministic variants, all expected routes live, exact-M8 output absent | `final-dflash2-phase-corrected-stack-vs-post54-control-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
