@@ -107,6 +107,7 @@ def test_dflash_config_marks_only_q4_group64_draft_linears() -> None:
     assert eligible._mtplx_qwen38_qmv_active is True
     assert eligible._mtplx_qwen38_qmv_allowed_widths == (6,)
     assert eligible._mtplx_qwen38_qmv_use_table is False
+    assert eligible._mtplx_qwen38_qmv_min_output_size == 0
     assert wrong_group._mtplx_qwen38_qmv_active is False
 
 

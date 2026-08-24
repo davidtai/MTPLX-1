@@ -243,6 +243,9 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
     use_sum_table = bool(
         getattr(linear, "_mtplx_qwen38_qmv_use_table", True)
     )
+    min_output_size = int(
+        getattr(linear, "_mtplx_qwen38_qmv_min_output_size", 4096)
+    )
     weight = linear.weight
     scales = linear.scales
     biases = linear.biases
@@ -266,7 +269,7 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
         or tuple(weight.shape[1:]) != (k // 8,)
         or k % 512 != 0
         or n % 8 != 0
-        or n < 4096
+        or n < min_output_size
     ):
         return None
 
@@ -343,6 +346,7 @@ def configure_qwen38_qmv(
         module._mtplx_qwen38_qmv_allowed_widths = ()
         module._mtplx_qwen38_qmv_active_groups = bool(active_groups)
         module._mtplx_qwen38_qmv_use_table = True
+        module._mtplx_qwen38_qmv_min_output_size = 4096
         eligible += int(is_eligible)
     return {
         "eligible_modules": eligible,
@@ -393,6 +397,7 @@ def configure_qwen38_dflash_qmv(
         module._mtplx_qwen38_qmv_allowed_widths = widths
         module._mtplx_qwen38_qmv_active_groups = bool(active)
         module._mtplx_qwen38_qmv_use_table = False
+        module._mtplx_qwen38_qmv_min_output_size = 0
         eligible += int(is_eligible)
     return {
         "eligible_modules": eligible,
