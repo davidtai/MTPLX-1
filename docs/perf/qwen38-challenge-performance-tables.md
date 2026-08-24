@@ -176,3 +176,26 @@ workload. DFlash memory values are decimal GB as reported by `dflash-mlx`.
 | Remove exact-M8 `o_proj` route | Phase-audited full stack → M7 `o_proj` only | 737.649 → 741.463 | 69.892 → 70.557 | 36.910 → 36.654 | **+0.6967%** | 35.34894 → 35.34894 | Retained removal; decode improved 0.951%, exact-M8 `o_proj` calls fell to zero, and M7 output plus all other M8 routes stayed live | `post54-dflash2-remove-m8-output-on-phase-audited-full-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | Remove exact-M8 linear-QKV route | No-M8-output stack → stock QKV | 739.144 → 727.535 | 70.595 → 68.847 | 36.718 → 37.433 | **-1.9108%** | 35.34894 → 35.34894 | Rejected; decode regressed 2.477%, while M8 K/V, MLP, exact-M5, and selected-M6 routes remained live | `post54-dflash2-remove-m8-qkv-on-no-m8-output-phase-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
 | **Final phase-corrected post54 stack** | Post54 DFlash control → all surviving target-shape kernels | 774.119 → 772.201 | 68.571 → **70.045** | 36.130 → **35.869** | **+0.7286%** | 35.34873 → 35.34896 | Retained final stack; decode +2.150%, exact/deterministic variants, all expected routes live, exact-M8 output absent | `final-dflash2-phase-corrected-stack-vs-post54-control-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+
+### M5--M8 exhaustion follow-up
+
+All rows use the same locked 16K Python / 1,024-output, four-arm ABBA workload.
+M5--M8 kernels are decode-only, so decode TPS is the phase decision metric;
+wall and unchanged-prefill drift remain recorded. Only barrier-free M6 K=1
+survives the final composability check.
+
+| Candidate | Prefill tok/s | Decode tok/s | Mean wall s | Wall delta | Peak GB | Result | Receipt |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Final-stack exact-M5 recheck | 771.592 → 770.174 | 68.120 → 68.551 | 36.298 → 36.243 | **+0.1534%** | 35.34683 → 35.34684 | RETAINED incumbent | `followup-m5-exact-on-final-stack-without-m6-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Final-stack selected M6 K=1 recheck | 753.081 → 749.042 | 69.026 → 71.295 | 36.635 → 36.284 | **+0.9665%** | 35.34683 → 35.34894 | RETAINED incumbent | `followup-m6-kp1-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| M7 linear-Z NSG4 | 707.882 → 722.044 | 67.692 → 65.469 | 38.350 → 38.367 | **-0.0440%** | 35.34894 → 35.35020 | REJECTED; padded M8/NSG8 stays | `followup-m7-linear-z-nsg4-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| M8 K/V NSG16 | 772.542 → 771.256 | 70.163 → 69.162 | 35.835 → 36.082 | **-0.6837%** | 35.34894 → 35.34852 | REJECTED; NSG8 stays | `followup-m8-kv-nsg16-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| M8 QKV NSG4 | 773.080 → 771.161 | 70.050 → 65.351 | 35.844 → 36.948 | **-2.9884%** | 35.34894 → 35.34599 | REJECTED; NSG8 stays | `followup-m8-qkv-nsg4-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Combined M5/M6 partition screen winners | 744.487 → 729.444 | 69.675 → 70.370 | 36.739 → 37.061 | **-0.8677%** | 35.34894 → 35.34884 | REJECTED as non-composable bundle | `followup-m56-shape-partition-v2-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| M5 partitions isolated | 743.459 → 730.014 | 69.998 → 68.115 | 36.705 → 37.517 | **-2.1666%** | 35.34894 → 35.35173 | REJECTED; exact-M5 K=2 stays | `followup-m5-shape-partition-v2-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| M6 partitions isolated | 757.202 → 754.834 | 69.499 → 66.040 | 36.405 → 37.243 | **-2.2507%** | 35.34896 → 35.35065 | REJECTED; selected QKV/MLP K=1 stays | `followup-m6-shape-partition-v2-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| **Barrier-free M6 K=1** | 712.698 → 721.119 | 68.081 → 68.304 | 38.124 → 37.765 | **+0.9521%** | 35.34894 → 35.34896 | **RETAINED**; exact output, removes redundant single-part barrier | `followup-m6-barrier-free-kp1-on-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Combined selected KCONST routes | 718.469 → 724.450 | 69.165 → 68.732 | 37.703 → 37.570 | **+0.3546%** | 35.34894 → 35.34896 | REJECTED for decode | `followup-m56-kconst-selected-shapes-on-barrier-free-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| M5 KCONST isolated | 762.890 → 745.013 | 69.395 → 69.512 | 36.267 → 36.760 | **-1.3406%** | 35.34894 → 35.34896 | REJECTED after final composability check | `followup-m5-kconst-on-barrier-free-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| M6 QKV KCONST on M5 KCONST | 768.666 → 759.304 | 69.720 → 70.305 | 36.036 → 36.182 | **-0.4033%** | 35.34894 → 35.34894 | REJECTED after final composability check | `followup-m6-kconst-on-m5-kconst-barrier-free-final-stack-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |
+| Final barrier-free + KCONST composition | 763.851 → 743.324 | 69.361 → 71.286 | 36.246 → 36.460 | **-0.5857%** | 35.34894 → 35.34896 | REJECTED; gain came from one anomalous pair, second pair tied | `final-m58-exhausted-winner-stack-vs-pre-followup-final-python16384in-1024out-t1-isolated-abba-2026-08-24.json` |

@@ -198,16 +198,16 @@ performance table, and a raw receipt.
 **Files:** `mtplx/nax_verify.py`, the Qwen3.8 DFlash gate scripts, focused
 tests, the DFlash performance table, and raw receipts.
 
-- [ ] Recheck exact-M5 and the selected M6 K-partition routes as removal gates
+- [x] Recheck exact-M5 and the selected M6 K-partition routes as removal gates
   on the final retained stack, using the locked 16K Python / 1,024-output,
   four-arm ABBA protocol.
-- [ ] Screen untested M5/M6 morphologies by live shape: barrier-free K=1,
+- [x] Screen untested M5/M6 morphologies by live shape: barrier-free K=1,
   exact-M5 K partitions, small-N K=4, and only then compile-time-K or dual-pack
   variants. A microbenchmark is only a screen; promotion requires the full
   matched gate.
-- [ ] Audit M7/M8 coverage from source and receipts. Test exact-M7 against the
+- [x] Audit M7/M8 coverage from source and receipts. Test exact-M7 against the
   retained padded-M8 route and screen any remaining shape-specific M8
   morphology; do not rerun a previously closed candidate unchanged.
-- [ ] Stack every strict wall-time winner, record prefill/decode TPS, wall time,
+- [x] Stack every strict wall-time winner, record prefill/decode TPS, wall time,
   wall delta, peak memory, engagement, and disposition, then run a final
   cumulative confirmation and update PR #335 only.
