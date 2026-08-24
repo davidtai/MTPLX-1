@@ -658,6 +658,61 @@ def test_row48_phase_removal_requires_stock_fallback_and_other_fusion() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_m8_output_removal_keeps_m7_output_and_other_m8_routes() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m8_no_output")
+
+    def arm(*, output: bool):
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {"include_m8_output": output}
+            },
+            "engagement": {
+                "nax_verify": {
+                    "m8_nax_k6144_n5120": 1056 if output else 0,
+                    "m7_to_m8_nax_k6144_n5120": 992,
+                    "m8_nax_k5120_n17408": 7392,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(output=True) for _ in range(2)],
+        "candidate": [arm(output=False) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+
+
+def test_m8_qkv_removal_keeps_kv_and_mlp_routes() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m8_no_qkv")
+
+    def arm(*, qkv: bool):
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "include_m8_qkv": qkv,
+                    "include_m8_mlp": True,
+                }
+            },
+            "engagement": {
+                "nax_verify": {
+                    "m8_nax_k5120_n10240": 3168 if qkv else 0,
+                    "m8_nax_k5120_n17408": 7392,
+                    "m8_nax_k5120_n1024": 2112,
+                }
+            },
+        }
+
+    by_variant = {
+        "control": [arm(qkv=True) for _ in range(2)],
+        "candidate": [arm(qkv=False) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

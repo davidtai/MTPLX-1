@@ -243,6 +243,24 @@ def test_m6_kernel_matches_stock_within_tolerance() -> None:
     assert not m6_ksplit_eligible(7, K, N, 4, 64, mx.bfloat16)
 
 
+def test_m8_output_can_be_removed_without_removing_m7_or_mlp() -> None:
+    from mtplx.nax_verify import configure_qwen38_m8_nax_island
+
+    report = configure_qwen38_m8_nax_island(
+        active=True,
+        include_m8_output=False,
+        include_m7_output=True,
+        include_m8_mlp=True,
+    )
+    try:
+        assert report["include_m8_output"] is False
+        assert [6144, 5120] not in report["shapes"]
+        assert report["m7_shapes"] == [[6144, 5120]]
+        assert [5120, 17408] in report["shapes"]
+    finally:
+        configure_qwen38_m8_nax_island(active=False)
+
+
 def test_vk_6bit_hexpack_ksplit_matches_stock() -> None:
     """The 9B-tier 6-bit lane (2026-07-07): MLX packs 6-bit values
     bit-contiguously little-endian; the hexpack kernels must agree with

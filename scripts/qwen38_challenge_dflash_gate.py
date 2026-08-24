@@ -199,6 +199,7 @@ def _install_dflash_route(
     survivor_rows: tuple[int, ...],
     gqa_widths: tuple[int, ...] = (),
     m8_nax_island: bool = False,
+    m8_nax_output: bool = True,
     m8_linear_z: bool = False,
     m7_nax_output: bool = False,
     m7_nax_linear_z: bool = False,
@@ -255,6 +256,7 @@ def _install_dflash_route(
     m8_nax_report = configure_qwen38_dflash_m8_nax_island(
         runtime.model,
         active=bool(m8_nax_island),
+        include_m8_output=bool(m8_nax_output),
         include_linear_z=bool(m8_linear_z),
         include_m7_output=bool(m7_nax_output),
         include_m7_linear_z=bool(m7_nax_linear_z),
@@ -287,6 +289,7 @@ def _install_dflash_route(
                 *(f"r{row:02d}" for row in survivor_rows),
                 *(("gqa678",) if gqa_widths else ()),
                 *(("m8nax",) if m8_nax_island else ()),
+                *(("m8noout",) if m8_nax_island and not m8_nax_output else ()),
                 *(("m8linearz",) if m8_linear_z else ()),
                 *(("m7naxout",) if m7_nax_output else ()),
                 *(("m7naxlinearz",) if m7_nax_linear_z else ()),
@@ -357,6 +360,7 @@ def _run_dflash_arm(
     custom_rows: tuple[int, ...],
     gqa_widths: tuple[int, ...],
     m8_nax_island: bool,
+    m8_nax_output: bool,
     m8_linear_z: bool,
     m7_nax_output: bool,
     m7_nax_linear_z: bool,
@@ -406,6 +410,7 @@ def _run_dflash_arm(
                 *(f"c{row:02d}" for row in custom_rows),
                 *(("gqa678",) if gqa_widths else ()),
                 *(("m8nax",) if m8_nax_island else ()),
+                *(("m8noout",) if m8_nax_island and not m8_nax_output else ()),
                 *(("m8linearz",) if m8_linear_z else ()),
                 *(("m7naxout",) if m7_nax_output else ()),
                 *(("m7naxlinearz",) if m7_nax_linear_z else ()),
@@ -493,6 +498,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dflash-custom-rows", default="")
     parser.add_argument("--dflash-gqa-widths", default="")
     parser.add_argument("--dflash-m8-nax-island", action="store_true")
+    parser.add_argument("--disable-dflash-m8-output", action="store_true")
     parser.add_argument("--dflash-m8-linear-z", action="store_true")
     parser.add_argument("--dflash-m7-nax-output", action="store_true")
     parser.add_argument("--dflash-m7-nax-linear-z", action="store_true")
@@ -543,10 +549,8 @@ def main() -> int:
         raise ValueError("DFlash expanded M8 route requires the M8 NAX island")
     if args.dflash_m8_nax_kv and not args.dflash_m8_nax_island:
         raise ValueError("DFlash M8 K/V route requires the M8 NAX island")
-    if args.dflash_m8_nax_qkv and not args.dflash_m8_nax_kv:
-        raise ValueError("DFlash M8 QKV route requires the retained M8 K/V route")
-    if args.dflash_m8_nax_mlp and not args.dflash_m8_nax_qkv:
-        raise ValueError("DFlash M8 MLP route requires the retained M8 QKV route")
+    if args.disable_dflash_m8_output and not args.dflash_m8_nax_island:
+        raise ValueError("Disabling DFlash M8 output requires the NAX verify route")
     if (args.dflash_m5_exact or args.dflash_m6_kp1) and not args.dflash_m8_nax_island:
         raise ValueError("DFlash M5/M6 tuning requires the NAX verify route")
     if args.dflash_m6_kp1 and not args.dflash_m5_exact:
@@ -611,6 +615,7 @@ def main() -> int:
             survivor_rows=survivor_rows,
             gqa_widths=gqa_widths,
             m8_nax_island=bool(args.dflash_m8_nax_island),
+            m8_nax_output=not bool(args.disable_dflash_m8_output),
             m8_linear_z=bool(args.dflash_m8_linear_z),
             m7_nax_output=bool(args.dflash_m7_nax_output),
             m7_nax_linear_z=bool(args.dflash_m7_nax_linear_z),
@@ -692,6 +697,7 @@ def main() -> int:
             custom_rows=custom_rows,
             gqa_widths=gqa_widths,
             m8_nax_island=bool(args.dflash_m8_nax_island),
+            m8_nax_output=not bool(args.disable_dflash_m8_output),
             m8_linear_z=bool(args.dflash_m8_linear_z),
             m7_nax_output=bool(args.dflash_m7_nax_output),
             m7_nax_linear_z=bool(args.dflash_m7_nax_linear_z),

@@ -39,6 +39,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-gqa-widths", default="")
     parser.add_argument("--control-m8-nax-island", action="store_true")
     parser.add_argument("--candidate-m8-nax-island", action="store_true")
+    parser.add_argument("--control-disable-m8-output", action="store_true")
+    parser.add_argument("--candidate-disable-m8-output", action="store_true")
     parser.add_argument("--control-m8-linear-z", action="store_true")
     parser.add_argument("--candidate-m8-linear-z", action="store_true")
     parser.add_argument("--control-m7-nax-output", action="store_true")
@@ -113,6 +115,7 @@ def _variant_config(
             args.control_custom_rows,
             args.control_gqa_widths,
             bool(args.control_m8_nax_island),
+            bool(args.control_disable_m8_output),
             bool(args.control_m8_linear_z),
             bool(args.control_m7_nax_output),
             bool(args.control_m7_nax_linear_z),
@@ -135,6 +138,7 @@ def _variant_config(
         args.candidate_custom_rows,
         args.candidate_gqa_widths,
         bool(args.candidate_m8_nax_island),
+        bool(args.candidate_disable_m8_output),
         bool(args.candidate_m8_linear_z),
         bool(args.candidate_m7_nax_output),
         bool(args.candidate_m7_nax_linear_z),
@@ -165,6 +169,7 @@ def _child_command(
         custom_rows,
         gqa_widths,
         m8_nax_island,
+        disable_m8_output,
         m8_linear_z,
         m7_nax_output,
         m7_nax_linear_z,
@@ -221,6 +226,8 @@ def _child_command(
         command.append("--dflash-cost-aligned-widths")
     if m8_nax_island:
         command.append("--dflash-m8-nax-island")
+    if disable_m8_output:
+        command.append("--disable-dflash-m8-output")
     if m8_linear_z:
         command.append("--dflash-m8-linear-z")
     if m7_nax_output:
@@ -621,6 +628,54 @@ def _engagement_exact(
             and calls(row, "m8_nax_k5120_n17408") > 0
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "m8_no_output":
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        def calls(row: dict[str, Any], key: str) -> int:
+            return int(
+                row.get("engagement", {}).get("nax_verify", {}).get(key, 0)
+            )
+
+        return all(
+            bool(route(row).get("include_m8_output"))
+            and calls(row, "m8_nax_k6144_n5120") > 0
+            and calls(row, "m7_to_m8_nax_k6144_n5120") > 0
+            for row in by_variant["control"]
+        ) and all(
+            not bool(route(row).get("include_m8_output"))
+            and calls(row, "m8_nax_k6144_n5120") == 0
+            and calls(row, "m7_to_m8_nax_k6144_n5120") > 0
+            and calls(row, "m8_nax_k5120_n17408") > 0
+            for row in by_variant["candidate"]
+        )
+    if args.candidate_label == "m8_no_qkv":
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        def calls(row: dict[str, Any], key: str) -> int:
+            return int(
+                row.get("engagement", {}).get("nax_verify", {}).get(key, 0)
+            )
+
+        return all(
+            bool(route(row).get("include_m8_qkv"))
+            and bool(route(row).get("include_m8_mlp"))
+            and calls(row, "m8_nax_k5120_n10240") > 0
+            and calls(row, "m8_nax_k5120_n17408") > 0
+            for row in by_variant["control"]
+        ) and all(
+            not bool(route(row).get("include_m8_qkv"))
+            and bool(route(row).get("include_m8_mlp"))
+            and calls(row, "m8_nax_k5120_n10240") == 0
+            and calls(row, "m8_nax_k5120_n17408") > 0
+            and calls(row, "m8_nax_k5120_n1024") > 0
+            for row in by_variant["candidate"]
+        )
     if args.candidate_label == "m5_exact":
         shapes = (
             (5120, 1024),
@@ -837,6 +892,8 @@ def _aggregate(
             ),
             "control_m8_nax_island": bool(args.control_m8_nax_island),
             "candidate_m8_nax_island": bool(args.candidate_m8_nax_island),
+            "control_disable_m8_output": bool(args.control_disable_m8_output),
+            "candidate_disable_m8_output": bool(args.candidate_disable_m8_output),
             "control_m8_linear_z": bool(args.control_m8_linear_z),
             "candidate_m8_linear_z": bool(args.candidate_m8_linear_z),
             "control_m7_nax_output": bool(args.control_m7_nax_output),
@@ -958,14 +1015,10 @@ def main() -> int:
             getattr(args, f"{prefix}_m8_nax_island")
         ):
             raise ValueError("DFlash M8 K/V route requires the M8 NAX island")
-        if bool(getattr(args, f"{prefix}_m8_nax_qkv")) and not bool(
-            getattr(args, f"{prefix}_m8_nax_kv")
+        if bool(getattr(args, f"{prefix}_disable_m8_output")) and not bool(
+            getattr(args, f"{prefix}_m8_nax_island")
         ):
-            raise ValueError("DFlash M8 QKV route requires the retained M8 K/V route")
-        if bool(getattr(args, f"{prefix}_m8_nax_mlp")) and not bool(
-            getattr(args, f"{prefix}_m8_nax_qkv")
-        ):
-            raise ValueError("DFlash M8 MLP route requires the retained M8 QKV route")
+            raise ValueError("Disabling DFlash M8 output requires the NAX verify route")
         if (
             bool(getattr(args, f"{prefix}_m5_exact"))
             or bool(getattr(args, f"{prefix}_m6_kp1"))

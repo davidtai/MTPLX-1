@@ -232,6 +232,7 @@ def configure_qwen38_dflash_m8_nax_island(
     model: Any,
     *,
     active: bool,
+    include_m8_output: bool = True,
     include_linear_z: bool = False,
     include_m7_output: bool = False,
     include_m7_linear_z: bool = False,
@@ -323,6 +324,7 @@ def configure_qwen38_dflash_m8_nax_island(
 
     report = configure_qwen38_m8_nax_island(
         active=active,
+        include_m8_output=include_m8_output,
         include_linear_z=include_linear_z,
         include_m7_output=include_m7_output,
         include_m7_linear_z=include_m7_linear_z,

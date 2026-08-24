@@ -901,6 +901,7 @@ _QWEN38_M8_NAX_EXPANDED_SHAPES = frozenset(
 def configure_qwen38_m8_nax_island(
     *,
     active: bool,
+    include_m8_output: bool = True,
     include_linear_z: bool = False,
     include_m7_output: bool = False,
     include_m7_linear_z: bool = False,
@@ -915,7 +916,7 @@ def configure_qwen38_m8_nax_island(
     global _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES
     global _QWEN38_M5_EXACT_ACTIVE
     global _QWEN38_M6_KP1_ACTIVE_SHAPES
-    shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES
+    shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES if include_m8_output else frozenset()
     if include_linear_z:
         shapes = shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
     expanded_shapes = frozenset()
@@ -942,6 +943,7 @@ def configure_qwen38_m8_nax_island(
     return {
         "active": bool(active),
         "width": 8,
+        "include_m8_output": bool(include_m8_output),
         "include_linear_z": bool(include_linear_z),
         "include_m7_output": bool(include_m7_output),
         "include_m7_linear_z": bool(include_m7_linear_z),
