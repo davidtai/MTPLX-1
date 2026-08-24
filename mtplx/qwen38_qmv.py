@@ -189,7 +189,7 @@ def _kernels() -> tuple[Any, Any, Any]:
             output_names=["y"],
             source=_qmv_source(use_table=False),
             header=_QMV_HEADER,
-            ensure_row_contiguous=True,
+            ensure_row_contiguous=False,
         )
         _QMV_TABLE_KERNEL = mx.fast.metal_kernel(
             name="mtplx_qwen38_q4_g64_qmv_wide_sums_v1",
@@ -197,7 +197,7 @@ def _kernels() -> tuple[Any, Any, Any]:
             output_names=["y"],
             source=_qmv_source(use_table=True),
             header=_QMV_HEADER,
-            ensure_row_contiguous=True,
+            ensure_row_contiguous=False,
         )
         _QMV_XSUMS_KERNEL = mx.fast.metal_kernel(
             name="mtplx_qwen38_q4_g64_xsums_v1",
@@ -222,7 +222,7 @@ def _kernels() -> tuple[Any, Any, Any]:
                 }
                 xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
             """,
-            ensure_row_contiguous=True,
+            ensure_row_contiguous=False,
         )
     return _QMV_REPLICA_KERNEL, _QMV_TABLE_KERNEL, _QMV_XSUMS_KERNEL
 
@@ -262,6 +262,13 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
     ):
         return None
 
+    # MLX Python does not expose strides. Keep these copies explicit so an
+    # enclosing mx.compile graph captures them instead of asking metal_kernel
+    # to inject an implicit row-contiguous primitive.
+    x = mx.contiguous(x)
+    weight = mx.contiguous(weight)
+    scales = mx.contiguous(scales)
+    biases = mx.contiguous(biases)
     replica, table, xsums_kernel = _kernels()
     output_shape = (*x.shape[:-1], n)
     grid_groups = qwen38_qmv_active_input_groups(m) if active_groups else m

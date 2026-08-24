@@ -17,12 +17,19 @@ def test_active_input_groups_match_rows_78_and_80_width_table() -> None:
 
 def test_row70_routes_real_mlx_arrays_without_a_strides_attribute(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
+    contiguous_inputs: list[object] = []
+    original_contiguous = mx.contiguous
+
+    def contiguous(value):
+        contiguous_inputs.append(value)
+        return original_contiguous(value)
 
     def replica(**kwargs):
         calls.append(kwargs)
         return (mx.zeros((3, 4096), dtype=mx.bfloat16),)
 
     monkeypatch.setattr(qmv, "_kernels", lambda: (replica, None, None))
+    monkeypatch.setattr(mx, "contiguous", contiguous)
     linear = SimpleNamespace(
         _mtplx_qwen38_qmv_active=True,
         _mtplx_qwen38_qmv_min_width=3,
@@ -44,3 +51,4 @@ def test_row70_routes_real_mlx_arrays_without_a_strides_attribute(monkeypatch) -
     assert result is not None
     assert result.shape == (3, 4096)
     assert len(calls) == 1
+    assert len(contiguous_inputs) == 4
