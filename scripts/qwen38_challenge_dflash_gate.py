@@ -39,7 +39,7 @@ from scripts.qwen38_challenge_port_gate import (  # noqa: E402
 
 DFLASH_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
-DFLASH_SOURCE_COMMIT = "dc49f5ac9a734ad1b69b7100043d2cbbf945b045"
+DFLASH_SOURCE_COMMIT = "c5b76ddb62bdefb6eeef1282641842edcf23a1b8"
 PROMOTION_THRESHOLD_PCT = 0.05
 STATIC_WIDTH = 8
 DFLASH_SURVIVOR_ROWS = frozenset({21, 24, 26, 48})

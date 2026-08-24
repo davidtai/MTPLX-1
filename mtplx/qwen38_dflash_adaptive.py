@@ -79,6 +79,7 @@ class Qwen38DFlashPositionEMAPolicy:
         self.full_block_tokens = int(full_block_tokens)
         self.max_draft_depth = self.full_block_tokens - 1
         self.config = config
+        self.wants_draft_top2 = bool(config.confidence_positions)
         self.position_accept_ema = [
             0.85 * (0.98**index) for index in range(self.max_draft_depth)
         ]
@@ -137,8 +138,14 @@ class Qwen38DFlashPositionEMAPolicy:
         block_len: int,
         acceptance_len: int,
         cycle_cost_ns: int | None = None,
+        draft_top2_logprobs: tuple[tuple[float, ...], ...] = (),
     ) -> None:
         del cycle_cost_ns
+        margins = []
+        for row in draft_top2_logprobs[: self.config.confidence_positions]:
+            if len(row) >= 2:
+                margins.append(float(row[0]) - float(row[1]))
+        self._last_margins = tuple(margins)
         block_len = max(1, min(int(block_len), self.full_block_tokens))
         attempted = block_len - 1
         accepted = max(0, min(int(acceptance_len), attempted))
@@ -181,6 +188,7 @@ class Qwen38DFlashPositionEMAPolicy:
             "position_accept_ema": [float(value) for value in self.position_accept_ema],
             "full_accept_streak": int(self.full_accept_streak),
             "final_block_limit": int(self.block_limit()),
+            "last_draft_margins": [float(value) for value in self._last_margins],
         }
 
 

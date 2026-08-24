@@ -60,3 +60,28 @@ def test_dflash_adaptive_rows_are_dependency_closed() -> None:
             active=True,
             proposal_rows=(15,),
         )
+
+
+def test_row24_adaptive_revision_consumes_live_draft_margin() -> None:
+    target = SimpleNamespace()
+    configure_qwen38_dflash_adaptive_policy(
+        target,
+        active=True,
+        proposal_rows=(11, 15, 18, 24),
+    )
+    policy = target._dflash_adaptive_block_policy_factory(
+        full_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=16_384,
+    )
+
+    assert policy.wants_draft_top2 is True
+    offered = policy.block_limit()
+    policy.record(
+        block_len=offered,
+        acceptance_len=offered - 1,
+        cycle_cost_ns=1_000_000,
+        draft_top2_logprobs=((0.8, 0.3), (0.7, 0.1)),
+    )
+
+    assert policy.metrics()["last_draft_margins"] == [0.5]
