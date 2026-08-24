@@ -202,6 +202,22 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
         },
     )
     monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_gqa_widths",
+        lambda model, *, active, widths: {
+            "active": active,
+            "widths": list(widths),
+        },
+    )
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge_kernels.configure_qwen38_dflash_m8_nax_island",
+        lambda model, *, active: {
+            "active": active,
+            "width": 8,
+            "shapes": [[6144, 5120]],
+            "eligible_projections": 16,
+        },
+    )
+    monkeypatch.setattr(
         "mtplx.gdn_capture.configure_qwen38_dflash_row48_boundary",
         lambda model, *, active: {"installed": active},
     )
@@ -222,6 +238,12 @@ def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(
     assert receipt["r24_qk_length_limit"]["max_length"] == 32
     assert receipt["r24_eval_ladder"]["prefill_stride"] == 3
     assert receipt["adaptive_policy"]["proposal_rows"] == [11, 15]
+    assert receipt["dflash_m8_nax_island"] == {
+        "active": True,
+        "width": 8,
+        "shapes": [[6144, 5120]],
+        "eligible_projections": 16,
+    }
     assert receipt["native_mtp_release"] == {
         "native_mtp_released": True,
         "native_mtp_loaded": False,

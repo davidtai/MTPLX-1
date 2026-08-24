@@ -365,6 +365,7 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
     from mtplx.qwen38_challenge_kernels import (
         configure_qwen38_dflash_row24_eval_ladder,
         configure_qwen38_dflash_gqa_widths,
+        configure_qwen38_dflash_m8_nax_island,
         configure_qwen38_row21_qk_rms_rope,
         configure_qwen38_row24_qk_length_limit,
     )
@@ -387,6 +388,9 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
         ),
         "dflash_gqa_widths": configure_qwen38_dflash_gqa_widths(
             model, active=True, widths=(6, 7, 8)
+        ),
+        "dflash_m8_nax_island": configure_qwen38_dflash_m8_nax_island(
+            model, active=True
         ),
         "adaptive_policy": configure_qwen38_dflash_adaptive_policy(
             model, active=True, proposal_rows=(11, 15)
