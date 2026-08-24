@@ -180,15 +180,34 @@ the ledger, raw receipts, and `NOTICE`.
 `scripts/qwen38_challenge_dflash_stack_gate.py`, focused tests, the DFlash
 performance table, and a raw receipt.
 
-- [ ] Install a construction-validated width router that keeps the existing
+- [x] Install a construction-validated width router that keeps the existing
   width-4 and width-5 routes, sends width 6--7 to asynchronous per-head GQA,
   and sends width 8 to per-head GQA at the exact Qwen3.8 target shape.
-- [ ] Expose control/candidate installation in the isolated stack gate without
+- [x] Expose control/candidate installation in the isolated stack gate without
   adding hot-path counters; prove engagement from the route receipt and the
   adaptive block histogram.
-- [ ] Run the exact guarded 16K Python / 1,024-output four-arm gate on top of
+- [x] Run the exact guarded 16K Python / 1,024-output four-arm gate on top of
   the retained production stack. Retain only a strict matched wall win.
-- [ ] If the retained candidate remains at or below 70 decode tok/s, stack and
+- [x] If the retained candidate remains at or below 70 decode tok/s, stack and
   gate the next evidence-backed candidate rather than multiplying estimates.
-- [ ] Update PR #335 in place with only the retained winner, receipt, table,
+- [x] Update PR #335 in place with only the retained winner, receipt, table,
   tests, and final production-bundle verification.
+
+## Task 6: Exhaust the live M5--M8 decode widths
+
+**Files:** `mtplx/nax_verify.py`, the Qwen3.8 DFlash gate scripts, focused
+tests, the DFlash performance table, and raw receipts.
+
+- [ ] Recheck exact-M5 and the selected M6 K-partition routes as removal gates
+  on the final retained stack, using the locked 16K Python / 1,024-output,
+  four-arm ABBA protocol.
+- [ ] Screen untested M5/M6 morphologies by live shape: barrier-free K=1,
+  exact-M5 K partitions, small-N K=4, and only then compile-time-K or dual-pack
+  variants. A microbenchmark is only a screen; promotion requires the full
+  matched gate.
+- [ ] Audit M7/M8 coverage from source and receipts. Test exact-M7 against the
+  retained padded-M8 route and screen any remaining shape-specific M8
+  morphology; do not rerun a previously closed candidate unchanged.
+- [ ] Stack every strict wall-time winner, record prefill/decode TPS, wall time,
+  wall delta, peak memory, engagement, and disposition, then run a final
+  cumulative confirmation and update PR #335 only.
