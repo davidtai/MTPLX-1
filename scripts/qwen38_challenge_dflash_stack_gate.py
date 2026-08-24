@@ -394,6 +394,12 @@ def _engagement_exact(
             "m6_partition_v2": {"m6"},
             "m56_partition_v2": {"m5", "m6"},
         }[args.candidate_label]
+        control_families = set()
+        if args.candidate_label == "m6_kconst" and bool(
+            getattr(args, "control_m5_kconst", False)
+        ):
+            control_families.add("m5")
+            expected_families.add("m5")
 
         def matches(row: dict[str, Any], families: set[str]) -> bool:
             report = row.get("feature_receipt", {}).get(
@@ -420,7 +426,7 @@ def _engagement_exact(
                         return False
             return True
 
-        return all(matches(row, set()) for row in by_variant["control"]) and all(
+        return all(matches(row, control_families) for row in by_variant["control"]) and all(
             matches(row, expected_families) for row in by_variant["candidate"]
         )
     if args.candidate_label == "m6_barrier_free_kp1":
