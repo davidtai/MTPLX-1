@@ -63,7 +63,7 @@ def test_burst_prompt_is_python_palindrome_task_and_fits_exact_budget() -> None:
 
         def apply_chat_template(self, messages, **kwargs):
             self.calls.append((messages, kwargs))
-            return list(range(100))
+            return list(range(101))
 
         def decode(self, ids):
             return "rendered prompt"
@@ -72,13 +72,14 @@ def test_burst_prompt_is_python_palindrome_task_and_fits_exact_budget() -> None:
     _text, ids = arm._build_exact_chat_prompt(
         tokenizer,
         text=arm.IS_PALINDROME_PROMPT,
-        target_tokens=100,
+        target_tokens=101,
     )
 
     assert "is_palindrome" in arm.IS_PALINDROME_PROMPT
     assert "Python" in arm.IS_PALINDROME_PROMPT
-    assert "test" in arm.IS_PALINDROME_PROMPT.lower()
-    assert len(ids) == 100
+    assert "Do not include tests" in arm.IS_PALINDROME_PROMPT
+    assert "at most four lines" in arm.IS_PALINDROME_PROMPT
+    assert len(ids) == 101
     assert tokenizer.calls == [
         (
             [{"role": "user", "content": arm.IS_PALINDROME_PROMPT}],

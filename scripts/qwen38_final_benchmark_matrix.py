@@ -41,7 +41,7 @@ class Scenario(NamedTuple):
 
 
 SCENARIOS = (
-    Scenario("burst_is_palindrome", 100, 1_024, 0.0, 1.0, 0, "is_palindrome"),
+    Scenario("burst_is_palindrome", 101, 1_024, 0.0, 1.0, 0, "is_palindrome"),
     Scenario("coding_cold_prefill_1k", 1_024, 1_024, 0.6, 0.95, 20, "coding"),
     Scenario("coding_cold_prefill_16k", 16_384, 1_024, 0.6, 0.95, 20, "coding"),
     Scenario("coding_cold_prefill_64k", 65_536, 1_024, 0.6, 0.95, 20, "coding"),

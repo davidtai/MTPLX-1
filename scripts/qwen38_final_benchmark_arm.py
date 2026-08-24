@@ -17,7 +17,7 @@ from typing import Any
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
-IS_PALINDROME_PROMPT = """Write Python code only. Implement `is_palindrome(text: str) -> bool` for a production utility. Ignore whitespace, punctuation, and letter case while preserving Unicode letters and digits. Use O(n) time, explain edge cases in docstrings, and include concise pytest tests for empty input, punctuation, mixed case, Unicode, and a clear negative case. Return only a single self-contained Python module with no prose outside the code exactly."""
+IS_PALINDROME_PROMPT = """Write only Python code. Implement `is_palindrome(text: str) -> bool`. Normalize by retaining Unicode letters and digits and applying `casefold()`, then compare the normalized text with its reverse. Treat empty and punctuation-only strings as palindromes. Do not include tests, docstrings, examples, markdown fences, explanations, helper functions, classes, imports, or command-line code. Keep the function concise and at most four lines."""
 
 
 def _sha256_tokens(tokens: list[int]) -> str:
