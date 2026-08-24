@@ -109,6 +109,8 @@ def native_arm_metrics(output: Any, *, prompt_tokens: int, wall_s: float) -> dic
         "requested_speculative_depth": int(
             getattr(stats, "requested_speculative_depth", 0) or 0
         ),
+        "finish_reason": getattr(output, "finish_reason", None),
+        "output_text": str(output.text),
         "token_sha256": _sha256_tokens(list(output.tokens)),
     }
 
@@ -193,6 +195,8 @@ def _dflash_arm_metrics(
         ),
         "fallback_ar": False,
         "adaptive_metrics": dict(telemetry.adaptive_metrics),
+        "finish_reason": getattr(output, "finish_reason", None),
+        "output_text": str(output.text),
         "token_sha256": _sha256_tokens(list(output.tokens)),
     }
 

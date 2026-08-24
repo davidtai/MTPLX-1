@@ -439,6 +439,7 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
     receipt["context_route"] = qwen38_dflash_context_route(
         1024,
         adaptive_active=runtime.config.draft_adaptive,
+        fixed_block_size=runtime.config.draft_block_size,
     )
     return receipt
 
@@ -447,6 +448,7 @@ def qwen38_dflash_context_route(
     prompt_tokens: int,
     *,
     adaptive_active: bool = True,
+    fixed_block_size: int = DEFAULT_DFLASH2_BLOCK_SIZE,
 ) -> dict[str, Any]:
     """Return the independently measured short/long DFlash phase route."""
 
@@ -464,7 +466,7 @@ def qwen38_dflash_context_route(
         "row50_active": True,
         "requested_adaptive": bool(adaptive_active),
         "effective_adaptive": bool(adaptive_active),
-        "fixed_block_size": None if adaptive_active else DEFAULT_DFLASH2_BLOCK_SIZE,
+        "fixed_block_size": None if adaptive_active else int(fixed_block_size),
     }
 
 
@@ -487,6 +489,7 @@ def _apply_measured_qwen38_dflash_context_route(
     route = qwen38_dflash_context_route(
         prompt_tokens,
         adaptive_active=runtime.config.draft_adaptive,
+        fixed_block_size=runtime.config.draft_block_size,
     )
     model = runtime.target_model
     updates = {

@@ -228,7 +228,7 @@ def test_measured_context_route_splits_only_the_supported_phase_controls() -> No
         "fixed_block_size": None,
     }
     assert backend.qwen38_dflash_context_route(
-        131_072, adaptive_active=False
+        131_072, adaptive_active=False, fixed_block_size=6
     ) == {
         "route_id": "long_ge16384",
         "adaptive_active": False,
@@ -240,7 +240,7 @@ def test_measured_context_route_splits_only_the_supported_phase_controls() -> No
         "row50_active": True,
         "requested_adaptive": False,
         "effective_adaptive": False,
-        "fixed_block_size": 8,
+        "fixed_block_size": 6,
     }
 
 
@@ -322,6 +322,7 @@ def test_fixed_runtime_disables_adaptive_at_every_context(
         target_model_path=tmp_path,
         draft_model_path=tmp_path,
         draft_adaptive=False,
+        draft_block_size=6,
     )
     runtime.qwen38_feature_receipt = {"installed": True}
     adaptive_calls: list[bool] = []
@@ -357,7 +358,7 @@ def test_fixed_runtime_disables_adaptive_at_every_context(
         )
 
     assert adaptive_calls == [False] * 4
-    assert runtime.qwen38_feature_receipt["context_route"]["fixed_block_size"] == 8
+    assert runtime.qwen38_feature_receipt["context_route"]["fixed_block_size"] == 6
 
 
 def test_measured_stack_installs_survivors_adaptive_and_releases_native_mtp(

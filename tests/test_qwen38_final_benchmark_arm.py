@@ -40,7 +40,12 @@ def test_native_metrics_prove_cold_prefill_and_preserve_all_requested_fields() -
         requested_speculative_depth=3,
         events=[],
     )
-    output = SimpleNamespace(tokens=list(range(1_024)), stats=stats)
+    output = SimpleNamespace(
+        tokens=list(range(1_024)),
+        text="def generated():\n    return True\n",
+        stats=stats,
+        finish_reason="length",
+    )
 
     metrics = arm.native_arm_metrics(output, prompt_tokens=16_384, wall_s=20.5)
 
@@ -52,6 +57,51 @@ def test_native_metrics_prove_cold_prefill_and_preserve_all_requested_fields() -
     assert metrics["cached_tokens"] == 0
     assert metrics["prefix_cache_used"] is False
     assert metrics["session_restore_mode"] == "cold"
+    assert metrics["finish_reason"] == "length"
+    assert metrics["output_text"] == "def generated():\n    return True\n"
+
+
+def test_dflash_metrics_report_actual_stop_and_effective_widths() -> None:
+    arm = _module()
+    stats = SimpleNamespace(
+        generated_tokens=102,
+        prompt_eval_time_s=0.2,
+        prompt_tps=500.0,
+        decode_elapsed_s=0.9,
+        decode_tok_s=113.0,
+        elapsed_s=1.1,
+        peak_memory_bytes=20 * 2**30,
+        accepted_drafts=87,
+        drafted_tokens=93,
+        verify_calls=15,
+    )
+    output = SimpleNamespace(
+        tokens=list(range(102)),
+        text="normalized = ''.join(c.casefold() for c in text if c.isalnum())\nreturn normalized == normalized[::-1]",
+        stats=stats,
+        finish_reason="stop",
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(draft_block_size=8),
+        telemetry=SimpleNamespace(
+            adaptive_metrics={"cycles_by_block": {5: 2, 6: 3, 8: 1}}
+        ),
+        qwen38_feature_receipt={
+            "context_route": {
+                "requested_adaptive": True,
+                "effective_adaptive": True,
+            }
+        },
+    )
+
+    metrics = arm._dflash_arm_metrics(
+        output, runtime, prompt_tokens=100, wall_s=1.12
+    )
+
+    assert metrics["finish_reason"] == "stop"
+    assert metrics["output_text"].startswith("normalized =")
+    assert metrics["requested_width"] == 8
+    assert metrics["effective_widths"] == [5, 6, 8]
 
 
 def test_burst_prompt_is_python_palindrome_task_and_fits_exact_budget() -> None:

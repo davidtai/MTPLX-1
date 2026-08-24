@@ -175,7 +175,11 @@ def aggregate_scenario(
         "scenario": scenario.name,
         "prompt_kind": scenario.prompt_kind,
         "prompt_tokens": scenario.prompt_tokens,
-        "generated_tokens": scenario.max_tokens,
+        "output_limit_tokens": scenario.max_tokens,
+        "actual_generated_tokens_by_engine": {
+            engine: [int(row["generated_tokens"]) for row in rows]
+            for engine, rows in by_engine.items()
+        },
         "temperature": scenario.temperature,
         "top_p": scenario.top_p,
         "top_k": scenario.top_k,

@@ -157,6 +157,12 @@ def test_headline_accepts_natural_eos_below_its_output_limit() -> None:
 
     result = matrix.aggregate_scenario(matrix.SCENARIOS[0], receipts)
 
+    assert result["output_limit_tokens"] == 1_024
+    assert result["actual_generated_tokens_by_engine"] == {
+        "main_native_mtp": [180, 180],
+        "pr_dflash2": [190, 190],
+    }
+    assert "generated_tokens" not in result
     assert result["correctness"]["output_limit_respected"] is True
     assert result["correctness"]["exact_prompt_and_output_counts"] is True
 
