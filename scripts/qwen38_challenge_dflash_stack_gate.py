@@ -53,6 +53,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-m8-nax-qkv", action="store_true")
     parser.add_argument("--control-m8-nax-mlp", action="store_true")
     parser.add_argument("--candidate-m8-nax-mlp", action="store_true")
+    parser.add_argument("--control-m5-exact", action="store_true")
+    parser.add_argument("--candidate-m5-exact", action="store_true")
+    parser.add_argument("--control-m6-kp1", action="store_true")
+    parser.add_argument("--candidate-m6-kp1", action="store_true")
     parser.add_argument("--control-cost-aligned-widths", action="store_true")
     parser.add_argument("--candidate-cost-aligned-widths", action="store_true")
     parser.add_argument("--control-release-native-mtp", action="store_true")
@@ -93,7 +97,7 @@ def _variant_environment(
 def _variant_config(
     args: argparse.Namespace,
     variant: str,
-) -> tuple[str, str, str, str, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool]:
+) -> tuple[str, str, str, str, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool]:
     if variant == "control":
         return (
             args.control_survivors,
@@ -108,6 +112,8 @@ def _variant_config(
             bool(args.control_m8_nax_kv),
             bool(args.control_m8_nax_qkv),
             bool(args.control_m8_nax_mlp),
+            bool(args.control_m5_exact),
+            bool(args.control_m6_kp1),
             bool(args.control_cost_aligned_widths),
             bool(args.control_release_native_mtp),
         )
@@ -124,6 +130,8 @@ def _variant_config(
         bool(args.candidate_m8_nax_kv),
         bool(args.candidate_m8_nax_qkv),
         bool(args.candidate_m8_nax_mlp),
+        bool(args.candidate_m5_exact),
+        bool(args.candidate_m6_kp1),
         bool(args.candidate_cost_aligned_widths),
         bool(args.candidate_release_native_mtp),
     )
@@ -148,6 +156,8 @@ def _child_command(
         m8_nax_kv,
         m8_nax_qkv,
         m8_nax_mlp,
+        m5_exact,
+        m6_kp1,
         cost_aligned_widths,
         release_native_mtp,
     ) = _variant_config(args, variant)
@@ -205,6 +215,10 @@ def _child_command(
         command.append("--dflash-m8-nax-qkv")
     if m8_nax_mlp:
         command.append("--dflash-m8-nax-mlp")
+    if m5_exact:
+        command.append("--dflash-m5-exact")
+    if m6_kp1:
+        command.append("--dflash-m6-kp1")
     return command
 
 
@@ -579,6 +593,71 @@ def _engagement_exact(
             and calls(row, "m8_nax_k5120_n17408") > 0
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "m5_exact":
+        shapes = (
+            (5120, 1024),
+            (5120, 6144),
+            (5120, 10240),
+            (5120, 12288),
+            (5120, 17408),
+            (6144, 5120),
+            (17408, 5120),
+        )
+
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        def calls(row: dict[str, Any], kind: str, shape: tuple[int, int]) -> int:
+            k, n = shape
+            return int(
+                row.get("engagement", {})
+                .get("nax_verify", {})
+                .get(f"{kind}_k{k}_n{n}", 0)
+            )
+
+        return all(
+            not bool(route(row).get("include_m5_exact"))
+            and all(calls(row, "m5_padded_m6_ksplit_kp2", shape) > 0 for shape in shapes)
+            and all(calls(row, "m5_exact_ksplit", shape) == 0 for shape in shapes)
+            for row in by_variant["control"]
+        ) and all(
+            bool(route(row).get("include_m5_exact"))
+            and all(calls(row, "m5_padded_m6_ksplit_kp2", shape) == 0 for shape in shapes)
+            and all(calls(row, "m5_exact_ksplit", shape) > 0 for shape in shapes)
+            for row in by_variant["candidate"]
+        )
+    if args.candidate_label == "m6_kp1":
+        selected = ((5120, 10240), (5120, 17408))
+
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        def calls(row: dict[str, Any], kind: str, shape: tuple[int, int]) -> int:
+            k, n = shape
+            return int(
+                row.get("engagement", {})
+                .get("nax_verify", {})
+                .get(f"{kind}_k{k}_n{n}", 0)
+            )
+
+        return all(
+            bool(route(row).get("include_m5_exact"))
+            and not bool(route(row).get("include_m6_kp1"))
+            and all(calls(row, "m6_ksplit_kp2", shape) > 0 for shape in selected)
+            and all(calls(row, "m6_ksplit_kp1", shape) == 0 for shape in selected)
+            for row in by_variant["control"]
+        ) and all(
+            bool(route(row).get("include_m5_exact"))
+            and bool(route(row).get("include_m6_kp1"))
+            and route(row).get("m6_kp1_shapes") == [[5120, 10240], [5120, 17408]]
+            and all(calls(row, "m6_ksplit_kp2", shape) == 0 for shape in selected)
+            and all(calls(row, "m6_ksplit_kp1", shape) > 0 for shape in selected)
+            for row in by_variant["candidate"]
+        )
     return True
 
 
@@ -682,6 +761,10 @@ def _aggregate(
             "candidate_m8_nax_qkv": bool(args.candidate_m8_nax_qkv),
             "control_m8_nax_mlp": bool(args.control_m8_nax_mlp),
             "candidate_m8_nax_mlp": bool(args.candidate_m8_nax_mlp),
+            "control_m5_exact": bool(args.control_m5_exact),
+            "candidate_m5_exact": bool(args.candidate_m5_exact),
+            "control_m6_kp1": bool(args.control_m6_kp1),
+            "candidate_m6_kp1": bool(args.candidate_m6_kp1),
             "control_cost_aligned_widths": bool(args.control_cost_aligned_widths),
             "candidate_cost_aligned_widths": bool(args.candidate_cost_aligned_widths),
             "control_release_native_mtp": bool(args.control_release_native_mtp),
@@ -769,6 +852,15 @@ def main() -> int:
             getattr(args, f"{prefix}_m8_nax_qkv")
         ):
             raise ValueError("DFlash M8 MLP route requires the retained M8 QKV route")
+        if (
+            bool(getattr(args, f"{prefix}_m5_exact"))
+            or bool(getattr(args, f"{prefix}_m6_kp1"))
+        ) and not bool(getattr(args, f"{prefix}_m8_nax_island")):
+            raise ValueError("DFlash M5/M6 tuning requires the NAX verify route")
+        if bool(getattr(args, f"{prefix}_m6_kp1")) and not bool(
+            getattr(args, f"{prefix}_m5_exact")
+        ):
+            raise ValueError("DFlash M6 tuning requires the retained exact-M5 route")
     for value in (
         args.control_max_mb_per_buffer,
         args.candidate_max_mb_per_buffer,

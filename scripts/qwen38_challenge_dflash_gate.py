@@ -206,6 +206,8 @@ def _install_dflash_route(
     m8_nax_kv: bool = False,
     m8_nax_qkv: bool = False,
     m8_nax_mlp: bool = False,
+    m5_exact: bool = False,
+    m6_kp1: bool = False,
 ) -> Any:
     """Install only survivor mechanisms that remain valid on DFlash target work."""
 
@@ -252,6 +254,8 @@ def _install_dflash_route(
         include_m8_kv=bool(m8_nax_kv),
         include_m8_qkv=bool(m8_nax_qkv),
         include_m8_mlp=bool(m8_nax_mlp),
+        include_m5_exact=bool(m5_exact),
+        include_m6_kp1=bool(m6_kp1),
     )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
@@ -282,6 +286,8 @@ def _install_dflash_route(
                 *(("m8naxkv",) if m8_nax_kv else ()),
                 *(("m8naxqkv",) if m8_nax_qkv else ()),
                 *(("m8naxmlp",) if m8_nax_mlp else ()),
+                *(("m5exact",) if m5_exact else ()),
+                *(("m6kp1",) if m6_kp1 else ()),
             )
         )
     )
@@ -346,6 +352,8 @@ def _run_dflash_arm(
     m8_nax_kv: bool,
     m8_nax_qkv: bool,
     m8_nax_mlp: bool,
+    m5_exact: bool,
+    m6_kp1: bool,
     cost_aligned_widths: bool,
     release_report: dict[str, bool],
 ) -> dict[str, Any]:
@@ -389,6 +397,8 @@ def _run_dflash_arm(
                 *(("m8naxkv",) if m8_nax_kv else ()),
                 *(("m8naxqkv",) if m8_nax_qkv else ()),
                 *(("m8naxmlp",) if m8_nax_mlp else ()),
+                *(("m5exact",) if m5_exact else ()),
+                *(("m6kp1",) if m6_kp1 else ()),
                 *(("cost_aligned",) if cost_aligned_widths else ()),
             )
         ),
@@ -470,6 +480,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dflash-m8-nax-kv", action="store_true")
     parser.add_argument("--dflash-m8-nax-qkv", action="store_true")
     parser.add_argument("--dflash-m8-nax-mlp", action="store_true")
+    parser.add_argument("--dflash-m5-exact", action="store_true")
+    parser.add_argument("--dflash-m6-kp1", action="store_true")
     parser.add_argument("--dflash-cost-aligned-widths", action="store_true")
     parser.add_argument(
         "--engine",
@@ -511,6 +523,10 @@ def main() -> int:
         raise ValueError("DFlash M8 QKV route requires the retained M8 K/V route")
     if args.dflash_m8_nax_mlp and not args.dflash_m8_nax_qkv:
         raise ValueError("DFlash M8 MLP route requires the retained M8 QKV route")
+    if (args.dflash_m5_exact or args.dflash_m6_kp1) and not args.dflash_m8_nax_island:
+        raise ValueError("DFlash M5/M6 tuning requires the NAX verify route")
+    if args.dflash_m6_kp1 and not args.dflash_m5_exact:
+        raise ValueError("DFlash M6 tuning requires the retained exact-M5 route")
 
     from scripts.qwen35b_mtp_batch_numerics_attribution import (
         _verify_parent_guard_attestation,
@@ -578,6 +594,8 @@ def main() -> int:
             m8_nax_kv=bool(args.dflash_m8_nax_kv),
             m8_nax_qkv=bool(args.dflash_m8_nax_qkv),
             m8_nax_mlp=bool(args.dflash_m8_nax_mlp),
+            m5_exact=bool(args.dflash_m5_exact),
+            m6_kp1=bool(args.dflash_m6_kp1),
         )
         if dflash_route is None:
             raise RuntimeError("DFlash2 survivor route did not install")
@@ -653,6 +671,8 @@ def main() -> int:
             m8_nax_kv=bool(args.dflash_m8_nax_kv),
             m8_nax_qkv=bool(args.dflash_m8_nax_qkv),
             m8_nax_mlp=bool(args.dflash_m8_nax_mlp),
+            m5_exact=bool(args.dflash_m5_exact),
+            m6_kp1=bool(args.dflash_m6_kp1),
             cost_aligned_widths=bool(args.dflash_cost_aligned_widths),
             release_report=release_report,
         )

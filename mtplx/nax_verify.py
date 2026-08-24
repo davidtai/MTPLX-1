@@ -664,8 +664,14 @@ def _build_kernel_m8_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
     return kernel
 
 
-def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int = 2):
-    """6-row K-split variant (24 accumulators/thread, scalar row registers).
+def _build_kernel_m6_ksplit_np(
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    k_parts: int = 2,
+    rows: int = 6,
+):
+    """5/6-row K-split variant with exact scalar row registers.
 
     Beats both stock qmm (1.14-1.80x) and the m16 NAX tile (1.03-1.15x) on all
     live shapes at M=5..6 (2026-06-12 microbench), and unlike the NAX tile it
@@ -673,13 +679,24 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
     Note: an earlier un-unrolled probe measured 0.08-0.16x — explicit unrolls
     and scalar v0..v5 registers are load-bearing, not style.
     """
-    key = ("m6_ksplit_np", group_size, dtype, int(k_parts))
+    if int(rows) not in (5, 6):
+        raise ValueError(f"M5/M6 K-split kernel requires 5 or 6 rows, got {rows}")
+    key = ("m6_ksplit_np", group_size, dtype, int(k_parts), int(rows))
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
 
+    row_loads = "\n".join(
+        f"            Vec8 v{row} = xv[({row} * K + k_base) / 8];"
+        for row in range(int(rows))
+    )
+    row_fmas = "\n".join(
+        f"                    acc[j * M + {row}] += float(v{row}[ki]) * wv;"
+        for row in range(int(rows))
+    )
+
     source = f"""
         using namespace metal;
-        constexpr int M = 6;
+        constexpr int M = {int(rows)};
         constexpr int BN = 4;
         constexpr int K_PARTS = {int(k_parts)};
         constexpr int GS = {group_size};
@@ -708,12 +725,7 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
 
         for (int pack = pack_start + int(lane); pack < pack_end; pack += 32) {{
             int k_base = pack * 8;
-            Vec8 v0 = xv[(0 * K + k_base) / 8];
-            Vec8 v1 = xv[(1 * K + k_base) / 8];
-            Vec8 v2 = xv[(2 * K + k_base) / 8];
-            Vec8 v3 = xv[(3 * K + k_base) / 8];
-            Vec8 v4 = xv[(4 * K + k_base) / 8];
-            Vec8 v5 = xv[(5 * K + k_base) / 8];
+{row_loads}
             _Pragma("unroll")
             for (int j = 0; j < BN; ++j) {{
                 uint32_t packed = w_q[(n0 + j) * K_by_8 + pack];
@@ -722,12 +734,7 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
                 _Pragma("unroll")
                 for (int ki = 0; ki < 8; ++ki) {{
                     float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
-                    acc[j * M + 0] += float(v0[ki]) * wv;
-                    acc[j * M + 1] += float(v1[ki]) * wv;
-                    acc[j * M + 2] += float(v2[ki]) * wv;
-                    acc[j * M + 3] += float(v3[ki]) * wv;
-                    acc[j * M + 4] += float(v4[ki]) * wv;
-                    acc[j * M + 5] += float(v5[ki]) * wv;
+{row_fmas}
                 }}
             }}
         }}
@@ -763,7 +770,10 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
 
     dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     kernel = mx.fast.metal_kernel(
-        name=f"mtplx_verify_m6_ksplit_kp{int(k_parts)}_gs{group_size}_{dtype_tag}",
+        name=(
+            f"mtplx_verify_m{int(rows)}_ksplit_kp{int(k_parts)}_"
+            f"gs{group_size}_{dtype_tag}"
+        ),
         input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
         output_names=["y"],
         source=source,
@@ -790,26 +800,42 @@ def nax_qmm_m6(
     biases: mx.array,
     *,
     group_size: int = 64,
+    exact_m5: bool = False,
+    k_parts: int = 2,
 ) -> mx.array:
-    """Run the 6-row K-split verify matmul. Pads M=5 to 6 rows."""
+    """Run the 5/6-row K-split verify matmul."""
     M = int(x2.shape[0])
     K = int(x2.shape[1])
     N = int(w_q.shape[0])
-    if M < 6:
-        pad = mx.zeros((6 - M, K), dtype=x2.dtype)
-        x6 = mx.contiguous(mx.concatenate([x2, pad], axis=0))
+    rows = 5 if M == 5 and exact_m5 else 6
+    if M < rows:
+        pad = mx.zeros((rows - M, K), dtype=x2.dtype)
+        x_rows = mx.contiguous(mx.concatenate([x2, pad], axis=0))
     else:
-        x6 = mx.contiguous(x2)
-    kernel = _build_kernel_m6_ksplit_np(group_size, x2.dtype, k_parts=2)
+        x_rows = mx.contiguous(x2)
+    dispatch_kind = (
+        "m5_exact_ksplit"
+        if rows == 5
+        else f"m5_padded_m6_ksplit_kp{int(k_parts)}"
+        if M == 5
+        else f"m6_ksplit_kp{int(k_parts)}"
+    )
+    _count_nax_dispatch(dispatch_kind, k=K, n=N)
+    kernel = _build_kernel_m6_ksplit_np(
+        group_size,
+        x2.dtype,
+        k_parts=int(k_parts),
+        rows=rows,
+    )
     (y,) = kernel(
-        inputs=[x6, w_q, scales, biases, K, N],
+        inputs=[x_rows, w_q, scales, biases, K, N],
         template=[("T", x2.dtype)],
-        grid=(64, N // 4, 1),
-        threadgroup=(64, 1, 1),
-        output_shapes=[(6, N)],
+        grid=(32 * int(k_parts), N // 4, 1),
+        threadgroup=(32 * int(k_parts), 1, 1),
+        output_shapes=[(rows, N)],
         output_dtypes=[x2.dtype],
     )
-    if M < 6:
+    if M < rows:
         return y[:M, :]
     return y
 
@@ -859,6 +885,8 @@ def nax_qmm_m8(
 
 _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
 _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
+_QWEN38_M5_EXACT_ACTIVE = False
+_QWEN38_M6_KP1_ACTIVE_SHAPES: frozenset[tuple[int, int]] = frozenset()
 _QWEN38_M8_NAX_OUTPUT_SHAPES = frozenset({(6_144, 5_120)})
 _QWEN38_M8_NAX_LINEAR_Z_SHAPES = frozenset({(5_120, 6_144)})
 _QWEN38_M8_NAX_EXPANDED_SHAPES = frozenset(
@@ -880,9 +908,13 @@ def configure_qwen38_m8_nax_island(
     include_m8_kv: bool = False,
     include_m8_qkv: bool = False,
     include_m8_mlp: bool = False,
+    include_m5_exact: bool = False,
+    include_m6_kp1: bool = False,
 ) -> dict[str, object]:
     global _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES
     global _QWEN38_M8_NAX_ISLAND_ACTIVE_SHAPES
+    global _QWEN38_M5_EXACT_ACTIVE
+    global _QWEN38_M6_KP1_ACTIVE_SHAPES
     shapes = _QWEN38_M8_NAX_OUTPUT_SHAPES
     if include_linear_z:
         shapes = shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
@@ -902,6 +934,11 @@ def configure_qwen38_m8_nax_island(
     if include_m7_linear_z:
         m7_shapes = m7_shapes | _QWEN38_M8_NAX_LINEAR_Z_SHAPES
     _QWEN38_M7_NAX_ISLAND_ACTIVE_SHAPES = m7_shapes if active else frozenset()
+    _QWEN38_M5_EXACT_ACTIVE = bool(active and include_m5_exact)
+    m6_kp1_shapes = frozenset({(5_120, 10_240), (5_120, 17_408)})
+    _QWEN38_M6_KP1_ACTIVE_SHAPES = (
+        m6_kp1_shapes if active and include_m6_kp1 else frozenset()
+    )
     return {
         "active": bool(active),
         "width": 8,
@@ -912,6 +949,11 @@ def configure_qwen38_m8_nax_island(
         "include_m8_kv": bool(include_m8_kv),
         "include_m8_qkv": bool(include_m8_qkv),
         "include_m8_mlp": bool(include_m8_mlp),
+        "include_m5_exact": bool(include_m5_exact),
+        "include_m6_kp1": bool(include_m6_kp1),
+        "m6_kp1_shapes": [
+            list(shape) for shape in sorted(_QWEN38_M6_KP1_ACTIVE_SHAPES)
+        ],
         "shapes": [list(shape) for shape in sorted(shapes)],
         "m7_shapes": [list(shape) for shape in sorted(m7_shapes)],
         "m8_expanded_shapes": [list(shape) for shape in sorted(expanded_shapes)],
@@ -1188,6 +1230,12 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     y = nax_qmm_m6(
                         x.reshape(m, k), w_q, self["scales"], self["biases"],
                         group_size=group_size,
+                        exact_m5=bool(m == 5 and _QWEN38_M5_EXACT_ACTIVE),
+                        k_parts=(
+                            1
+                            if m == 6 and (k, n) in _QWEN38_M6_KP1_ACTIVE_SHAPES
+                            else 2
+                        ),
                     )
                 elif (
                     m == 7

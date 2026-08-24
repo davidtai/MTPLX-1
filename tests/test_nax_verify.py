@@ -227,6 +227,18 @@ def test_m6_kernel_matches_stock_within_tolerance() -> None:
         diff = float(mx.abs(y.astype(mx.float32) - ref.astype(mx.float32)).max())
         assert y.shape == (m, N)
         assert diff < 0.25, f"m6 kernel drift too large at M={m}: {diff}"
+        if m == 5:
+            exact = nax_qmm_m6(
+                x,
+                w_q,
+                scales,
+                biases,
+                group_size=64,
+                exact_m5=True,
+            )
+            mx.eval(exact)
+            assert exact.shape == (m, N)
+            assert mx.array_equal(exact, y).item()
     assert not m6_ksplit_eligible(4, K, N, 4, 64, mx.bfloat16)
     assert not m6_ksplit_eligible(7, K, N, 4, 64, mx.bfloat16)
 

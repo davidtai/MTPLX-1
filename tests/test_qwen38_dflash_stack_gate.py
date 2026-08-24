@@ -527,6 +527,75 @@ def test_m8_mlp_engagement_requires_incremental_subgroup() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is False
 
 
+def test_exact_m5_engagement_requires_every_live_shape() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m5_exact")
+    shapes = (
+        (5120, 1024), (5120, 6144), (5120, 10240), (5120, 12288),
+        (5120, 17408), (6144, 5120), (17408, 5120),
+    )
+
+    def arm(*, exact: bool, missing: tuple[int, int] | None = None):
+        counters = {}
+        for k, n in shapes:
+            counters[f"m5_padded_m6_ksplit_kp2_k{k}_n{n}"] = (
+                0 if exact else 64
+            )
+            counters[f"m5_exact_ksplit_k{k}_n{n}"] = (
+                64 if exact and (k, n) != missing else 0
+            )
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {"include_m5_exact": exact}
+            },
+            "engagement": {"nax_verify": counters},
+        }
+
+    by_variant = {
+        "control": [arm(exact=False) for _ in range(2)],
+        "candidate": [arm(exact=True) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][0] = arm(exact=True, missing=shapes[-1])
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
+def test_m6_kp1_engagement_requires_both_selected_shapes() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="m6_kp1")
+    selected = ((5120, 10240), (5120, 17408))
+
+    def arm(*, kp1: bool, missing: tuple[int, int] | None = None):
+        counters = {}
+        for k, n in selected:
+            counters[f"m6_ksplit_kp2_k{k}_n{n}"] = 0 if kp1 else 64
+            counters[f"m6_ksplit_kp1_k{k}_n{n}"] = (
+                64 if kp1 and (k, n) != missing else 0
+            )
+        return {
+            "feature_receipt": {
+                "dflash_m8_nax_island": {
+                    "include_m5_exact": True,
+                    "include_m6_kp1": kp1,
+                    "m6_kp1_shapes": (
+                        [[5120, 10240], [5120, 17408]] if kp1 else []
+                    ),
+                }
+            },
+            "engagement": {"nax_verify": counters},
+        }
+
+    by_variant = {
+        "control": [arm(kp1=False) for _ in range(2)],
+        "candidate": [arm(kp1=True) for _ in range(2)],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+    by_variant["candidate"][1] = arm(kp1=True, missing=selected[0])
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 
