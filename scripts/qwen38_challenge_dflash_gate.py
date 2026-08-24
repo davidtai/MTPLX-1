@@ -193,6 +193,16 @@ def _dflash_target_counter_snapshot() -> dict[str, int]:
     return dflash_qwen_target_counter_snapshot()
 
 
+def _flat_counter_delta(
+    before: dict[str, int],
+    after: dict[str, int],
+) -> dict[str, int]:
+    return {
+        key: int(after.get(key, 0)) - int(before.get(key, 0))
+        for key in sorted(set(before) | set(after))
+    }
+
+
 def _run_dflash_arm(
     bundle: Any,
     prompt_ids: list[int],
@@ -237,7 +247,7 @@ def _run_dflash_arm(
         "token_hash": _token_hash(tokens),
         "tokens": list(tokens),
         "engagement": _counter_delta(counters_before, counters_after),
-        "dflash_target_engagement": _counter_delta(
+        "dflash_target_engagement": _flat_counter_delta(
             dflash_counters_before,
             dflash_counters_after,
         ),

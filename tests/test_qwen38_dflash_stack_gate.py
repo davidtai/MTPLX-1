@@ -18,3 +18,10 @@ def test_dflash_survivors_are_unique_chronological_and_dependency_closed() -> No
     for invalid in ("24", "21,18", "18,18", "17"):
         with pytest.raises(ValueError):
             gate._parse_dflash_survivors(invalid)
+
+
+def test_dflash_flat_counter_delta_tracks_only_current_arm() -> None:
+    assert gate._flat_counter_delta(
+        {"memo": 11, "qk": 3},
+        {"memo": 18, "qk": 3, "boundary": 4},
+    ) == {"boundary": 4, "memo": 7, "qk": 0}
