@@ -189,7 +189,7 @@ def _kernels() -> tuple[Any, Any, Any]:
             output_names=["y"],
             source=_qmv_source(use_table=False),
             header=_QMV_HEADER,
-            ensure_row_contiguous=False,
+            ensure_row_contiguous=True,
         )
         _QMV_TABLE_KERNEL = mx.fast.metal_kernel(
             name="mtplx_qwen38_q4_g64_qmv_wide_sums_v1",
@@ -197,7 +197,7 @@ def _kernels() -> tuple[Any, Any, Any]:
             output_names=["y"],
             source=_qmv_source(use_table=True),
             header=_QMV_HEADER,
-            ensure_row_contiguous=False,
+            ensure_row_contiguous=True,
         )
         _QMV_XSUMS_KERNEL = mx.fast.metal_kernel(
             name="mtplx_qwen38_q4_g64_xsums_v1",
@@ -222,14 +222,9 @@ def _kernels() -> tuple[Any, Any, Any]:
                 }
                 xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
             """,
-            ensure_row_contiguous=False,
+            ensure_row_contiguous=True,
         )
     return _QMV_REPLICA_KERNEL, _QMV_TABLE_KERNEL, _QMV_XSUMS_KERNEL
-
-
-def _row_contiguous(array: Any, row_stride: int) -> bool:
-    strides = tuple(array.strides)
-    return bool(len(strides) >= 2 and strides[-1] == 1 and strides[-2] == row_stride)
 
 
 def qwen38_qmv(linear: Any, x: Any) -> Any | None:
@@ -264,10 +259,6 @@ def qwen38_qmv(linear: Any, x: Any) -> Any | None:
         or k % 512 != 0
         or n % 8 != 0
         or n < 4096
-        or not _row_contiguous(x, k)
-        or not _row_contiguous(weight, k // 8)
-        or not _row_contiguous(scales, k // 64)
-        or not _row_contiguous(biases, k // 64)
     ):
         return None
 

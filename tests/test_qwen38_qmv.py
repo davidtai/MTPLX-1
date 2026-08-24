@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import mlx.core as mx
+
+import mtplx.qwen38_qmv as qmv
 from mtplx.qwen38_qmv import qwen38_qmv_active_input_groups
 
 
@@ -8,3 +13,34 @@ def test_active_input_groups_match_rows_78_and_80_width_table() -> None:
         width: qwen38_qmv_active_input_groups(width)
         for width in range(2, 10)
     } == {2: 1, 3: 1, 4: 1, 5: 1, 6: 2, 7: 2, 8: 2, 9: 3}
+
+
+def test_row70_routes_real_mlx_arrays_without_a_strides_attribute(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def replica(**kwargs):
+        calls.append(kwargs)
+        return (mx.zeros((3, 4096), dtype=mx.bfloat16),)
+
+    monkeypatch.setattr(qmv, "_kernels", lambda: (replica, None, None))
+    linear = SimpleNamespace(
+        _mtplx_qwen38_qmv_active=True,
+        _mtplx_qwen38_qmv_min_width=3,
+        _mtplx_qwen38_qmv_active_groups=False,
+        bits=4,
+        group_size=64,
+        mode="affine",
+        bias=None,
+        weight=mx.zeros((4096, 64), dtype=mx.uint32),
+        scales=mx.zeros((4096, 8), dtype=mx.bfloat16),
+        biases=mx.zeros((4096, 8), dtype=mx.bfloat16),
+    )
+
+    result = qmv.qwen38_qmv(
+        linear,
+        mx.zeros((3, 512), dtype=mx.bfloat16),
+    )
+
+    assert result is not None
+    assert result.shape == (3, 4096)
+    assert len(calls) == 1
