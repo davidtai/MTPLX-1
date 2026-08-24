@@ -392,6 +392,7 @@ def _install_measured_qwen38_dflash_stack(runtime: DFlash2Runtime) -> dict[str, 
         "dflash_m8_nax_island": configure_qwen38_dflash_m8_nax_island(
             model,
             active=True,
+            include_m8_output=False,
             include_m7_output=True,
             include_m7_linear_z=True,
             include_m8_kv=True,
