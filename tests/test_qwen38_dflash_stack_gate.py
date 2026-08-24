@@ -713,6 +713,58 @@ def test_m8_qkv_removal_keeps_kv_and_mlp_routes() -> None:
     assert stack_gate._engagement_exact(args, by_variant) is True
 
 
+def test_final_phase_stack_requires_every_retained_kernel_and_no_m8_output() -> None:
+    from scripts import qwen38_challenge_dflash_stack_gate as stack_gate
+
+    args = SimpleNamespace(candidate_label="final_phase_stack_v2")
+
+    control = {"feature_receipt": {}, "engagement": {"nax_verify": {}}}
+    candidate = {
+        "feature_receipt": {
+            "dflash_gqa_widths": {"active": True, "widths": [6, 7, 8]},
+            "dflash_m8_nax_island": {
+                "include_m8_output": False,
+                "include_m7_output": True,
+                "include_m7_linear_z": True,
+                "include_m8_kv": True,
+                "include_m8_qkv": True,
+                "include_m8_mlp": True,
+                "include_m5_exact": True,
+                "include_m6_kp1": True,
+            },
+        },
+        "engagement": {
+            "nax_verify": {
+                "m8_nax_k6144_n5120": 0,
+                "m7_to_m8_nax_k6144_n5120": 912,
+                "m7_to_m8_nax_k5120_n6144": 2736,
+                "m8_nax_k5120_n1024": 2368,
+                "m8_nax_k5120_n10240": 3552,
+                "m8_nax_k5120_n17408": 8288,
+                "m5_exact_ksplit": 13144,
+                "m6_ksplit_kp1": 4960,
+            }
+        },
+    }
+    by_variant = {
+        "control": [control, control],
+        "candidate": [candidate, candidate],
+    }
+    assert stack_gate._engagement_exact(args, by_variant) is True
+
+    missing_m6 = {
+        **candidate,
+        "engagement": {
+            "nax_verify": {
+                **candidate["engagement"]["nax_verify"],
+                "m6_ksplit_kp1": 0,
+            }
+        },
+    }
+    by_variant["candidate"][0] = missing_m6
+    assert stack_gate._engagement_exact(args, by_variant) is False
+
+
 def test_optimized_speed_dflash_target_never_constructs_native_mtp(monkeypatch) -> None:
     from mtplx import runtime as runtime_module
 

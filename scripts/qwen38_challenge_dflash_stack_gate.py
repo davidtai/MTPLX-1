@@ -803,6 +803,53 @@ def _engagement_exact(
             and calls(row, other_phase, "fused") > 0
             for row in by_variant["candidate"]
         )
+    if args.candidate_label == "final_phase_stack_v2":
+        retained_counters = (
+            "m7_to_m8_nax_k6144_n5120",
+            "m7_to_m8_nax_k5120_n6144",
+            "m8_nax_k5120_n1024",
+            "m8_nax_k5120_n10240",
+            "m8_nax_k5120_n17408",
+            "m5_exact_ksplit",
+            "m6_ksplit_kp1",
+        )
+
+        def route(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_m8_nax_island", {})
+            )
+
+        def gqa(row: dict[str, Any]) -> dict[str, Any]:
+            return dict(
+                row.get("feature_receipt", {}).get("dflash_gqa_widths", {})
+            )
+
+        def calls(row: dict[str, Any], key: str) -> int:
+            return int(
+                row.get("engagement", {}).get("nax_verify", {}).get(key, 0)
+            )
+
+        return all(
+            not route(row)
+            and not bool(gqa(row).get("active"))
+            and calls(row, "m8_nax_k6144_n5120") == 0
+            and all(calls(row, key) == 0 for key in retained_counters)
+            for row in by_variant["control"]
+        ) and all(
+            bool(gqa(row).get("active"))
+            and gqa(row).get("widths") == [6, 7, 8]
+            and not bool(route(row).get("include_m8_output"))
+            and bool(route(row).get("include_m7_output"))
+            and bool(route(row).get("include_m7_linear_z"))
+            and bool(route(row).get("include_m8_kv"))
+            and bool(route(row).get("include_m8_qkv"))
+            and bool(route(row).get("include_m8_mlp"))
+            and bool(route(row).get("include_m5_exact"))
+            and bool(route(row).get("include_m6_kp1"))
+            and calls(row, "m8_nax_k6144_n5120") == 0
+            and all(calls(row, key) > 0 for key in retained_counters)
+            for row in by_variant["candidate"]
+        )
     return True
 
 
