@@ -961,7 +961,12 @@ def configure_qwen38_nax_split_tuning(
     }
 
 
-def configure_qwen38_m56_partition_tuning(*, active: bool) -> dict[str, object]:
+def configure_qwen38_m56_partition_tuning(
+    *,
+    active: bool,
+    m5_active: bool = True,
+    m6_active: bool = True,
+) -> dict[str, object]:
     """Install the micro-screened K-partition candidate by live projection."""
 
     global _QWEN38_M5_KPARTS_BY_SHAPE, _QWEN38_M6_KPARTS_BY_SHAPE
@@ -978,8 +983,8 @@ def configure_qwen38_m56_partition_tuning(*, active: bool) -> dict[str, object]:
         (5_120, 12_288): 4,
         (5_120, 17_408): 2,
     }
-    _QWEN38_M5_KPARTS_BY_SHAPE = m5 if active else {}
-    _QWEN38_M6_KPARTS_BY_SHAPE = m6 if active else {}
+    _QWEN38_M5_KPARTS_BY_SHAPE = m5 if active and m5_active else {}
+    _QWEN38_M6_KPARTS_BY_SHAPE = m6 if active and m6_active else {}
 
     def receipt(values: dict[tuple[int, int], int]) -> dict[str, int]:
         return {f"{k}x{n}": parts for (k, n), parts in sorted(values.items())}

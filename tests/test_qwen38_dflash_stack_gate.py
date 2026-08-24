@@ -781,6 +781,10 @@ def test_nax_split_candidate_flags_are_isolated_per_arm() -> None:
         candidate_m8_qkv_nsg4=True,
         control_m56_partition_v2=False,
         candidate_m56_partition_v2=True,
+        control_m5_partition_v2=False,
+        candidate_m5_partition_v2=True,
+        control_m6_partition_v2=False,
+        candidate_m6_partition_v2=True,
     )
     control = stack_gate._variant_environment(args, "control", {})
     candidate = stack_gate._variant_environment(args, "candidate", {})
@@ -792,6 +796,10 @@ def test_nax_split_candidate_flags_are_isolated_per_arm() -> None:
     assert candidate["MTPLX_QWEN38_M8_QKV_NSG4"] == "1"
     assert control["MTPLX_QWEN38_M56_PARTITION_V2"] == "0"
     assert candidate["MTPLX_QWEN38_M56_PARTITION_V2"] == "1"
+    assert control["MTPLX_QWEN38_M5_PARTITION_V2"] == "0"
+    assert candidate["MTPLX_QWEN38_M5_PARTITION_V2"] == "1"
+    assert control["MTPLX_QWEN38_M6_PARTITION_V2"] == "0"
+    assert candidate["MTPLX_QWEN38_M6_PARTITION_V2"] == "1"
 
 
 def test_m7_linear_z_nsg4_engagement_requires_exact_shape_counter() -> None:

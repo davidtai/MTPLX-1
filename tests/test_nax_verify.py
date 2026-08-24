@@ -331,6 +331,13 @@ def test_qwen38_shape_specific_m5_m6_partition_candidate() -> None:
     finally:
         configure_qwen38_m56_partition_tuning(active=False)
 
+    m6_only = configure_qwen38_m56_partition_tuning(active=True, m5_active=False)
+    try:
+        assert m6_only["m5_kparts_by_shape"] == {}
+        assert m6_only["m6_kparts_by_shape"]
+    finally:
+        configure_qwen38_m56_partition_tuning(active=False)
+
 
 def test_vk_6bit_hexpack_ksplit_matches_stock() -> None:
     """The 9B-tier 6-bit lane (2026-07-07): MLX packs 6-bit values

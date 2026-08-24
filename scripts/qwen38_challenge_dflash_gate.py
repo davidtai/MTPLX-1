@@ -279,8 +279,17 @@ def _install_dflash_route(
     )
     from mtplx.nax_verify import configure_qwen38_m56_partition_tuning
 
+    m56_combined = os.environ.get("MTPLX_QWEN38_M56_PARTITION_V2", "0") == "1"
+    m5_partition = m56_combined or os.environ.get(
+        "MTPLX_QWEN38_M5_PARTITION_V2", "0"
+    ) == "1"
+    m6_partition = m56_combined or os.environ.get(
+        "MTPLX_QWEN38_M6_PARTITION_V2", "0"
+    ) == "1"
     m56_partition_report = configure_qwen38_m56_partition_tuning(
-        active=os.environ.get("MTPLX_QWEN38_M56_PARTITION_V2", "0") == "1"
+        active=bool(m5_partition or m6_partition),
+        m5_active=bool(m5_partition),
+        m6_active=bool(m6_partition),
     )
     feature_receipt: dict[str, dict[str, Any]] = {}
     if 21 in rows:
