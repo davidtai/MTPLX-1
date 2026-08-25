@@ -72,7 +72,11 @@ from mtplx.a3b_mtp_batch import (
     _require_mlx_lm_arrays_cache_fix,
     install_a3b_mtp_batch_lane,
 )
-from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from mtplx.adaptive import (
+    AdaptiveDepthPolicy,
+    ExpectedValueDepthPolicy,
+    PositionEMADepthPolicy,
+)
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
 from mtplx.mtp_patch import MTPContract
@@ -95,7 +99,7 @@ from mtplx.backends.descriptors import (
     sync_backend_arg_aliases,
     target_distribution_mode_from_args,
 )
-from mtplx.backends.registry import load_runtime_contract
+from mtplx.backends.registry import RuntimeContract, load_runtime_contract
 from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
 from mtplx.chat_encode_cache import GLOBAL_CHAT_ENCODE_CACHE, ChatEncodeCache
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
@@ -2107,6 +2111,19 @@ class ServerState:
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
+        runtime_contract, runtime_contract_error = load_runtime_contract(args.model)
+        if runtime_contract_error and args.adaptive_policy == "position_ema":
+            raise ValueError(
+                "position_ema requires a valid Qwen3.8 runtime contract: "
+                + runtime_contract_error
+            )
+        self.adaptive_policy_factory = _bind_adaptive_policy_factory(
+            args,
+            model_family=_model_family_for_state(self),
+            backend_descriptor=self.backend_descriptor,
+            runtime_mtp_enabled=bool(self.runtime.mtp_enabled),
+            runtime_contract=runtime_contract,
+        )
         if self.backend_descriptor.uses_draft_lm_head:
             _startup_line("[5/6] Installing native-MTP draft head")
         else:
@@ -17408,7 +17425,10 @@ def _adaptive_config(
         1,
         int(max_depth if max_depth is not None else getattr(args, "depth", 3)),
     )
-    configured_min_depth = max(1, int(args.adaptive_min_depth))
+    configured_min_depth = max(
+        0 if policy == "position_ema" else 1,
+        int(args.adaptive_min_depth),
+    )
     effective_min_depth = min(configured_min_depth, effective_max_depth)
     config: dict[str, Any] = {
         "policy": policy,
@@ -17428,6 +17448,12 @@ def _adaptive_config(
     elif policy == "cost":
         config["marginal_ms_prior"] = float(
             getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
+        )
+    elif policy == "position_ema":
+        config["depth_cap"] = min(
+            3,
+            effective_max_depth,
+            max(1, int(getattr(args, "adaptive_position_depth_cap", 4))),
         )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
@@ -17464,7 +17490,7 @@ def _make_adaptive_policy(
     args: argparse.Namespace,
     *,
     max_depth: int | None = None,
-) -> AdaptiveDepthPolicy | ExpectedValueDepthPolicy | None:
+) -> AdaptiveDepthPolicy | ExpectedValueDepthPolicy | PositionEMADepthPolicy | None:
     policy = str(getattr(args, "adaptive_policy", "none") or "none")
     if policy == "none":
         return None
@@ -17493,6 +17519,10 @@ def _make_adaptive_policy(
             marginal_ms=float(getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0)
             or None,
         )
+    if policy == "position_ema":
+        raise ValueError(
+            "position_ema requires the construction-bound Qwen3.8 native-MTP factory"
+        )
     if policy == "expected_value":
         effective_base_depth = max(
             effective_min_depth,
@@ -17517,6 +17547,62 @@ def _make_adaptive_policy(
             exploration_interval=int(args.adaptive_ev_exploration_interval),
         )
     raise ValueError(f"unknown adaptive policy: {policy}")
+
+
+def _bind_adaptive_policy_factory(
+    args: argparse.Namespace,
+    *,
+    model_family: str,
+    backend_descriptor: BackendDescriptor,
+    runtime_mtp_enabled: bool,
+    runtime_contract: RuntimeContract | None,
+) -> Callable[
+    [int],
+    AdaptiveDepthPolicy
+    | ExpectedValueDepthPolicy
+    | PositionEMADepthPolicy
+    | None,
+]:
+    """Validate invariant adaptive routing once, then bind request factories."""
+
+    policy = str(getattr(args, "adaptive_policy", "none") or "none")
+    if policy != "position_ema":
+        return lambda effective_depth: _make_adaptive_policy(
+            args,
+            max_depth=effective_depth,
+        )
+
+    valid_native_qwen38 = (
+        model_family == "qwen3_8"
+        and backend_descriptor.backend_id == "qwen3_next"
+        and backend_descriptor.uses_draft_lm_head
+        and not backend_descriptor.uses_external_assistant
+        and runtime_mtp_enabled
+        and runtime_contract is not None
+        and runtime_contract.arch_id == "qwen3-next-mtp"
+        and int(runtime_contract.mtp_depth_max) == 3
+    )
+    if not valid_native_qwen38:
+        raise ValueError(
+            "position_ema is validated only for a Qwen3.8 native-MTP "
+            "checkpoint with runtime-contract mtp_depth_max=3"
+        )
+
+    configured_min_depth = min(3, max(0, int(args.adaptive_min_depth)))
+    configured_depth_cap = min(
+        3,
+        max(1, int(getattr(args, "adaptive_position_depth_cap", 4))),
+    )
+
+    def make_position_ema(effective_depth: int):
+        installed_depth = min(3, max(1, int(effective_depth)))
+        return PositionEMADepthPolicy(
+            max_depth=installed_depth,
+            depth_cap=min(configured_depth_cap, installed_depth),
+            min_depth=min(configured_min_depth, installed_depth),
+        )
+
+    return make_position_ema
 
 
 def _store_retokenized_history_snapshot(
@@ -20784,9 +20870,7 @@ def _run_generation(
                         ),
                     )
                 else:
-                    adaptive_policy = _make_adaptive_policy(
-                        state.args, max_depth=effective_depth
-                    )
+                    adaptive_policy = state.adaptive_policy_factory(effective_depth)
                     if vision_splice is not None and vision_splice.cursor:
                         # Retries and tool-loop redispatches replay the
                         # full prompt, so the image rows must rewind.
@@ -32038,7 +32122,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value", "cost"],
+        choices=["none", "streak", "expected_value", "cost", "position_ema"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
     )
@@ -32046,6 +32130,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--adaptive-start-depth", type=int, default=1)
     parser.add_argument("--adaptive-increase-after", type=int, default=4)
     parser.add_argument("--adaptive-decrease-after", type=int, default=1)
+    parser.add_argument("--adaptive-position-depth-cap", type=int, default=4)
     parser.add_argument("--adaptive-ev-base-depth", type=int, default=2)
     parser.add_argument(
         "--adaptive-ev-accept-priors",

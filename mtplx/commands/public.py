@@ -9481,6 +9481,13 @@ def cmd_serve_public(args: Any) -> int:
                 ("adaptive_decrease_after", "--adaptive-decrease-after"),
             ):
                 cmd.extend([flag, str(getattr(args, attr))])
+        elif adaptive_policy == "position_ema":
+            cmd.extend(
+                [
+                    "--adaptive-position-depth-cap",
+                    str(getattr(args, "adaptive_position_depth_cap", 4)),
+                ]
+            )
         elif adaptive_policy == "expected_value":
             for attr, flag in (
                 ("adaptive_ev_base_depth", "--adaptive-ev-base-depth"),
@@ -11550,6 +11557,13 @@ def _adaptive_command_suffix(args: Any) -> str:
             ("adaptive_decrease_after", "--adaptive-decrease-after"),
         ):
             parts.extend([flag, shlex.quote(str(getattr(args, attr)))])
+    elif policy == "position_ema":
+        parts.extend(
+            [
+                "--adaptive-position-depth-cap",
+                shlex.quote(str(getattr(args, "adaptive_position_depth_cap", 4))),
+            ]
+        )
     elif policy == "expected_value":
         for attr, flag in (
             ("adaptive_ev_base_depth", "--adaptive-ev-base-depth"),
@@ -12466,6 +12480,7 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("adaptive_start_depth", 1),
         ("adaptive_increase_after", 4),
         ("adaptive_decrease_after", 1),
+        ("adaptive_position_depth_cap", 4),
         ("adaptive_ev_base_depth", 2),
         ("adaptive_ev_accept_priors", "0.92,0.64,0.32"),
         ("adaptive_ev_draft_cost_s", 0.0048),

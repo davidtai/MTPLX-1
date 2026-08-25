@@ -12,7 +12,9 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from mtplx.adaptive import PositionEMADepthPolicy
 from mtplx.backends.gemma4_assistant import _gemma4_draft_position
+from mtplx.backends.registry import RuntimeContract
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, get_profile
 from mtplx.server import openai
 from mtplx.server.openai import _RateLimiter, create_app, parse_args
@@ -28,6 +30,103 @@ def test_server_parser_accepts_native_app_launch_id():
     args = parse_args(["--warmup-tokens", "0", "--app-launch-id", "native-123"])
 
     assert args.app_launch_id == "native-123"
+
+
+def _qwen38_runtime_contract(*, mtp_depth_max: int = 3) -> RuntimeContract:
+    return RuntimeContract(
+        mtplx_version="2.9.2",
+        arch_id="qwen3-next-mtp",
+        mtp_depth_max=mtp_depth_max,
+        recommended_profile="turbo",
+        exactness_baseline={},
+        verified_on={},
+    )
+
+
+def _bind_qwen38_position_ema(args):
+    return openai._bind_adaptive_policy_factory(
+        args,
+        model_family="qwen3_8",
+        backend_descriptor=openai.descriptor_for_backend_id("qwen3_next"),
+        runtime_mtp_enabled=True,
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+
+def test_server_binds_position_ema_to_validated_qwen38_native_mtp_d3():
+    args = parse_args(
+        [
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-position-depth-cap",
+            "4",
+            "--depth",
+            "8",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    policy = _bind_qwen38_position_ema(args)(8)
+
+    assert isinstance(policy, PositionEMADepthPolicy)
+    assert policy.max_depth == 3
+    assert policy.depth_cap == 3
+    assert policy.current_depth == 3
+
+
+@pytest.mark.parametrize(
+    ("model_family", "backend_id", "runtime_mtp_enabled", "mtp_depth_max"),
+    [
+        ("qwen3_6", "qwen3_next", True, 3),
+        ("qwen3_8", "gemma4_assistant", True, 3),
+        ("qwen3_8", "qwen3_next", False, 3),
+        ("qwen3_8", "qwen3_next", True, 4),
+    ],
+)
+def test_position_ema_rejects_unvalidated_runtime_contracts(
+    model_family, backend_id, runtime_mtp_enabled, mtp_depth_max
+):
+    args = parse_args(["--model", "model", "--adaptive-policy", "position_ema"])
+
+    with pytest.raises(ValueError, match="position_ema"):
+        openai._bind_adaptive_policy_factory(
+            args,
+            model_family=model_family,
+            backend_descriptor=openai.descriptor_for_backend_id(backend_id),
+            runtime_mtp_enabled=runtime_mtp_enabled,
+            runtime_contract=_qwen38_runtime_contract(mtp_depth_max=mtp_depth_max),
+        )
+
+
+def test_position_ema_honors_existing_adaptive_min_depth():
+    args = parse_args(
+        [
+            "--model",
+            "model",
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-min-depth",
+            "2",
+        ]
+    )
+
+    policy = _bind_qwen38_position_ema(args)(3)
+    policy.position_accept_ema[0] = 0.0
+    policy.recompute_depth()
+
+    assert policy.min_depth == 2
+    assert policy.current_depth == 2
+
+
+def test_omitted_and_explicit_none_adaptive_policy_keep_fixed_depth() -> None:
+    omitted = parse_args(["--model", "model"])
+    explicit_none = parse_args(["--model", "model", "--adaptive-policy", "none"])
+
+    assert omitted.adaptive_policy == "none"
+    assert explicit_none.adaptive_policy == "none"
+    assert openai._make_adaptive_policy(omitted, max_depth=3) is None
+    assert openai._make_adaptive_policy(explicit_none, max_depth=3) is None
 
 
 def test_direct_server_parser_exposes_mtp_batch_numerics():
@@ -1752,7 +1851,7 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
     if api_key:
         argv.extend(["--api-key", api_key])
     args = parse_args(argv)
-    return SimpleNamespace(
+    state = SimpleNamespace(
         args=args,
         model_id="mtplx-test-model",
         lock=Lock(),
@@ -1789,6 +1888,11 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         # Dashboard primitives mirror what ServerState.__init__ allocates.
         dashboard=DashboardState(),
     )
+    state.adaptive_policy_factory = lambda effective_depth: openai._make_adaptive_policy(
+        state.args,
+        max_depth=effective_depth,
+    )
+    return state
 
 
 def _fake_streaming_session_state():

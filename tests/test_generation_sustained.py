@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+import mtplx.generation as generation
 from mtplx.generation import (
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
@@ -683,6 +684,159 @@ def test_default_qwen27b_ar_decode_trace_does_not_crash(tmp_path, monkeypatch):
     assert rows[-1]["final"] is True
     assert rows[-1]["generated_tokens_total"] == 2
     assert rows[-1]["target_distribution_materialized_rows_delta"] == 0
+
+
+class DepthSequencePolicy:
+    allows_depth_zero = True
+
+    def __init__(self, depths):
+        self.depths = iter(depths)
+        self.last_depth = 0
+
+    @property
+    def current_depth(self):
+        self.last_depth = next(self.depths, self.last_depth)
+        return self.last_depth
+
+    def observe(self, *, attempted_depth, accepted_depths):
+        return {
+            "kind": "test_depth_sequence",
+            "attempted_depth": attempted_depth,
+            "accepted_depths": accepted_depths,
+        }
+
+    def observe_serial_skip(self):
+        return {
+            "kind": "test_depth_sequence",
+            "next_depth": self.last_depth,
+            "action": "hold",
+        }
+
+
+def test_generate_mtpk_position_policy_depth_zero_uses_serial_target_path():
+    model = TinyModel()
+    policy = DepthSequencePolicy([0, 0, 0])
+
+    out = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=4,
+        adaptive_policy=policy,
+        stop_token_ids=set(),
+    )
+
+    assert out.tokens == [1, 1, 1]
+    assert [call["tokens"] for call in model.calls] == [1, 1, 1]
+    assert sum(bool(event.get("speculation_skipped")) for event in out.stats.events) == 2
+
+
+def test_position_ema_serial_history_flushes_before_next_mtp_cycle(monkeypatch):
+    events: list[tuple[str, tuple[int, ...] | None]] = []
+    original_append = generation._append_mtp_history
+
+    def tracked_append(rt, cache, hidden, tokens, **kwargs):
+        if kwargs["phase"] == "ar_decode":
+            assert hidden.shape[1] == len(tokens)
+            events.append(("append", tuple(tokens)))
+        return original_append(rt, cache, hidden, tokens, **kwargs)
+
+    model = AcceptingTinyMTPModel()
+    original_propose = model.mtp_forward
+
+    def tracked_propose(*args, **kwargs):
+        events.append(("propose", None))
+        return original_propose(*args, **kwargs)
+
+    monkeypatch.setattr(generation, "_append_mtp_history", tracked_append)
+    monkeypatch.setattr(model, "mtp_forward", tracked_propose)
+
+    out = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        adaptive_policy=DepthSequencePolicy([0, 1, 1]),
+        mtp_history_policy="committed",
+        stop_token_ids=set(),
+    )
+
+    assert out.tokens == [1, 1, 1, 1]
+    assert ("append", (1,)) in events
+    assert events.index(("append", (1,))) < events.index(("propose", None))
+    assert sum(event.get("speculation_skipped", False) for event in out.stats.events) == 1
+
+
+def test_position_ema_trailing_serial_history_is_discarded_without_draft_work(
+    monkeypatch,
+):
+    append_batches: list[tuple[int, ...]] = []
+    original_append = generation._append_mtp_history
+
+    def tracked_append(rt, cache, hidden, tokens, **kwargs):
+        if kwargs["phase"] == "ar_decode":
+            append_batches.append(tuple(tokens))
+        return original_append(rt, cache, hidden, tokens, **kwargs)
+
+    model = AcceptingTinyMTPModel()
+    proposer_calls = 0
+    original_propose = model.mtp_forward
+
+    def tracked_propose(*args, **kwargs):
+        nonlocal proposer_calls
+        proposer_calls += 1
+        return original_propose(*args, **kwargs)
+
+    monkeypatch.setattr(generation, "_append_mtp_history", tracked_append)
+    monkeypatch.setattr(model, "mtp_forward", tracked_propose)
+
+    out = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        adaptive_policy=DepthSequencePolicy([0, 0, 0]),
+        mtp_history_policy="committed",
+        stop_token_ids=set(),
+    )
+
+    assert out.tokens == [1, 1, 1]
+    assert proposer_calls == 0
+    assert append_batches == []
+
+
+def test_position_ema_serial_history_flushes_on_final_capture(monkeypatch):
+    append_batches: list[tuple[int, ...]] = []
+    original_append = generation._append_mtp_history
+
+    def tracked_append(rt, cache, hidden, tokens, **kwargs):
+        if kwargs["phase"] == "ar_decode":
+            assert hidden.shape[1] == len(tokens)
+            append_batches.append(tuple(tokens))
+        return original_append(rt, cache, hidden, tokens, **kwargs)
+
+    monkeypatch.setattr(generation, "_append_mtp_history", tracked_append)
+
+    model = TinyModel()
+    out = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        adaptive_policy=DepthSequencePolicy([0, 0, 0]),
+        mtp_history_policy="committed",
+        capture_final_state=True,
+        stop_token_ids=set(),
+    )
+
+    assert out.final_state is not None
+    assert out.final_state.safe_to_commit is True
+    assert [call["tokens"] for call in model.calls] == [1, 1, 1, 1]
+    assert [token for batch in append_batches for token in batch] == [1, 1, 1]
 
 
 def test_lazy_bonus_verify_shortens_full_accept_verify_input(monkeypatch):
