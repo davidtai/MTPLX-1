@@ -26,44 +26,62 @@ top-k 20, and seed 42. The first matrix times exactly 1,024 output tokens. The
 xhigh matrix times exactly 16,384 output tokens. All receipt invariant lists
 were empty and paired arms were token-deterministic within each candidate.
 
-Positive wall numbers mean faster than fixed K=3. Prefill and decode columns
-are throughput deltas, so positive means faster. Memory is peak-memory delta,
-so negative means less memory.
+The tables report raw throughput and timing. Positive wall deltas mean faster
+than the fixed-K3 control. Peak memory is the maximum observed arm in GiB.
 
 ## Exact 1,024-output matrix
 
-| Context | Candidate | Wall (s) | Wall | Prefill | Decode | Peak memory |
+| Context | Candidate | Prefill tok/s | Decode tok/s | Wall (s) | Wall vs control | Peak GiB |
 |---:|---|---:|---:|---:|---:|---:|
-| 1K | adaptive | 17.603 | -3.86% | -14.84% | -2.93% | +0.00% |
-| 1K | q4 adaptive | 17.681 | -4.28% | -10.00% | -3.87% | +1.04% |
-| 16K | adaptive | 40.167 | -1.71% | -0.04% | -3.44% | +0.00% |
-| 16K | q4 adaptive | 38.624 | +2.22% | -0.01% | +4.80% | +0.78% |
-| 64K | adaptive | 123.737 | -0.07% | -0.06% | -0.15% | -0.00% |
-| 64K | q4 adaptive | 121.348 | +1.90% | -0.07% | +10.65% | +0.78% |
-| 128K | adaptive | 277.224 | -0.38% | -0.06% | -2.83% | -0.00% |
-| 128K | q4 adaptive | 272.285 | +1.42% | -0.02% | +15.01% | +6.02% |
-
-Fixed-K3 control wall times were 16.923 s, 39.481 s, 123.654 s, and
-276.162 s at 1K, 16K, 64K, and 128K respectively.
+| 1K | fixed K3 control | 836.68 | 65.38 | 16.923 | baseline | 21.375 |
+| 1K | adaptive | 712.55 | 63.47 | 17.603 | -3.86% | 21.375 |
+| 1K | q4 adaptive | 753.01 | 62.85 | 17.681 | -4.28% | 21.597 |
+| 16K | fixed K3 control | 823.11 | 53.44 | 39.481 | baseline | 23.469 |
+| 16K | adaptive | 822.76 | 51.60 | 40.167 | -1.71% | 23.469 |
+| 16K | q4 adaptive | 823.00 | 56.01 | 38.624 | +2.22% | 23.652 |
+| 64K | fixed K3 control | 685.20 | 40.46 | 123.654 | baseline | 28.653 |
+| 64K | adaptive | 684.75 | 40.40 | 123.737 | -0.07% | 28.653 |
+| 64K | q4 adaptive | 684.70 | 44.77 | 121.348 | +1.90% | 28.877 |
+| 128K | fixed K3 control | 554.12 | 32.70 | 276.162 | baseline | 37.055 |
+| 128K | adaptive | 553.78 | 31.78 | 277.224 | -0.38% | 37.055 |
+| 128K | q4 adaptive | 553.98 | 37.61 | 272.285 | +1.42% | 39.285 |
 
 ## Xhigh 16,384-output matrix
 
-| Context | Candidate | Wall (s) | Wall | Prefill | Decode | Peak memory |
+| Context | Candidate | Prefill tok/s | Decode tok/s | Wall (s) | Wall vs control | Peak GiB |
 |---:|---|---:|---:|---:|---:|---:|
-| 1K | adaptive | 331.590 | -0.23% | -0.86% | -0.23% | -0.09% |
-| 1K | q4 adaptive | 320.817 | +3.12% | -2.63% | +3.15% | +0.97% |
-| 16K | adaptive | 387.691 | -0.77% | +0.83% | -0.86% | -0.00% |
-| 16K | q4 adaptive | 364.597 | +5.52% | +2.08% | +5.72% | +0.78% |
-| 64K | adaptive | 576.230 | -2.74% | +1.40% | -3.59% | -2.54% |
-| 64K | q4 adaptive | 549.620 | +1.97% | +1.41% | +2.11% | -1.76% |
-| 128K | adaptive | 822.537 | +3.60% | +0.15% | +5.05% | -0.09% |
-| 128K | q4 adaptive | 809.628 | +5.25% | -0.02% | +7.56% | +0.42% |
+| 1K | fixed K3 control | 757.21 | 49.73 | 330.841 | baseline | 21.496 |
+| 1K | adaptive | 750.70 | 49.62 | 331.590 | -0.23% | 21.476 |
+| 1K | q4 adaptive | 737.27 | 51.30 | 320.817 | +3.12% | 21.704 |
+| 1K | DFlash2 adaptive | 788.00 | 25.55 | 642.484 | -48.51% | 21.064 |
+| 16K | fixed K3 control | 806.69 | 45.01 | 384.721 | baseline | 23.469 |
+| 16K | adaptive | 813.42 | 44.63 | 387.691 | -0.77% | 23.469 |
+| 16K | q4 adaptive | 823.50 | 47.59 | 364.597 | +5.52% | 23.652 |
+| 64K | fixed K3 control | 674.32 | 35.58 | 560.455 | baseline | 29.399 |
+| 64K | adaptive | 683.78 | 34.30 | 576.230 | -2.74% | 28.653 |
+| 64K | q4 adaptive | 683.86 | 36.33 | 549.620 | +1.97% | 28.883 |
+| 128K | fixed K3 control | 552.97 | 27.00 | 852.112 | baseline | 37.121 |
+| 128K | adaptive | 553.81 | 28.37 | 822.537 | +3.60% | 37.086 |
+| 128K | q4 adaptive | 552.87 | 29.04 | 809.628 | +5.25% | 37.277 |
 
-Fixed-K3 control wall times were 330.841 s, 384.721 s, 560.455 s, and
-852.112 s. The Q4 adaptive candidate won all four xhigh wall-time rows. The
-BF16 adaptive candidate won only the single-pass 128K row and regressed the
-three paired rows, so this receipt does not support making BF16 adaptive the
-default.
+The Q4 adaptive candidate won all four xhigh wall-time rows. The BF16 adaptive
+candidate won only the single-pass 128K row and regressed the three paired
+rows, so this receipt does not support making BF16 adaptive the default.
+
+## Historical unoptimized native-MTP control from PR #335
+
+These raw decode-throughput points are copied from PR #335's published Native
+MTP versus DFlash2 chart. They are historical reference points, not matched
+arms in the MLX/Metal 0.32.2 matrix above, so no cross-table percentage is
+claimed.
+
+| Prompt context | Native MTP decode tok/s |
+|---:|---:|
+| 100 tokens | 107.58 |
+| 1K | 59.33 |
+| 16K | 54.57 |
+| 64K | 42.04 |
+| 128K | 34.01 |
 
 ## 128K adaptive-depth distribution
 
