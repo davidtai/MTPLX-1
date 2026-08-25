@@ -10796,23 +10796,34 @@ def generate_mtpk(
     # its own capture_final_state tail — F31).
     elapsed = time.perf_counter() - started_all
     final_state: GenerationFinalState | None = None
+    final_state_capture_failed = False
     if (
         capture_final_state
         and serial_skip_history_tokens
         and _mtp_history_uses_committed_cache(mtp_history_policy)
         and mtp_history_cache is not None
     ):
-        commit_started = time.perf_counter()
-        draft_time += append_mtp_history(
-            mtp_history_cache,
-            mx.concatenate(serial_skip_history_hidden, axis=1),
-            serial_skip_history_tokens,
-        )
-        commit_time += time.perf_counter() - commit_started
-        serial_skip_history_hidden.clear()
-        serial_skip_history_tokens.clear()
+        try:
+            commit_started = time.perf_counter()
+            draft_time += append_mtp_history(
+                mtp_history_cache,
+                mx.concatenate(serial_skip_history_hidden, axis=1),
+                serial_skip_history_tokens,
+            )
+            commit_time += time.perf_counter() - commit_started
+            serial_skip_history_hidden.clear()
+            serial_skip_history_tokens.clear()
+        except Exception as exc:  # capture only — never lose a finished response
+            final_state_capture_failed = True
+            events.append({"final_state_capture_error": str(exc)})
+            print(
+                f"[mtplx] MTP final-history flush failed ({exc}); response "
+                "preserved, session-bank commit skipped for this turn",
+                file=sys.stderr,
+            )
     if (
         capture_final_state
+        and not final_state_capture_failed
         and pending_primary is not None
         and tokens
         and repetition_result is None
@@ -10853,9 +10864,9 @@ def generate_mtpk(
             maybe_rebase_decode_state(len(tokens))
             maybe_eval_state_roots({"final_pending_commit": True}, len(tokens))
         except Exception as exc:  # capture only — never lose a finished response
-            # pending_primary stays set, so the final state below reports
-            # safe_to_commit=False and the bank refuses it; the completed
-            # response itself is untouched.
+            # The completed response is untouched and final_state stays absent,
+            # so the session bank cannot commit a partially mutated cache.
+            final_state_capture_failed = True
             events.append({"final_state_capture_error": str(exc)})
             print(
                 f"[mtplx] MTP final-pending commit failed ({exc}); response "
@@ -10902,7 +10913,7 @@ def generate_mtpk(
         or (constraint is not None and constraint.stopped)
         else "length"
     )
-    if capture_final_state:
+    if capture_final_state and not final_state_capture_failed:
         final_state = GenerationFinalState(
             final_trunk_cache=cache,
             final_logits=logits,

@@ -20,6 +20,7 @@ dependencies = [
   "pillow>=10",
   # Keep the MLX Python and Metal distributions on the same tested release.
   "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx-metal==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name

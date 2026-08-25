@@ -839,6 +839,36 @@ def test_position_ema_serial_history_flushes_on_final_capture(monkeypatch):
     assert [token for batch in append_batches for token in batch] == [1, 1, 1]
 
 
+def test_position_ema_final_history_failure_preserves_response(monkeypatch):
+    original_append = generation._append_mtp_history
+
+    def failing_append(rt, cache, hidden, tokens, **kwargs):
+        if kwargs["phase"] == "ar_decode":
+            raise RuntimeError("final history flush failed")
+        return original_append(rt, cache, hidden, tokens, **kwargs)
+
+    monkeypatch.setattr(generation, "_append_mtp_history", failing_append)
+
+    out = generate_mtpk(
+        _runtime(TinyModel(), mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        adaptive_policy=DepthSequencePolicy([0, 0, 0]),
+        mtp_history_policy="committed",
+        capture_final_state=True,
+        stop_token_ids=set(),
+    )
+
+    assert out.tokens == [1, 1, 1]
+    assert out.final_state is None
+    assert any(
+        event.get("final_state_capture_error") == "final history flush failed"
+        for event in out.stats.events
+    )
+
+
 def test_lazy_bonus_verify_shortens_full_accept_verify_input(monkeypatch):
     monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "1")
     monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
