@@ -8247,6 +8247,12 @@ def generate_mtpk(
     # (first observe gets the span since loop entry, later ones the span
     # since the previous observe) — real cycle cost, not inter-request gaps.
     _policy_cycle_started = time.perf_counter()
+    minimum_planned_depth = (
+        0
+        if adaptive_policy is not None
+        and getattr(adaptive_policy, "allows_depth_zero", False)
+        else 1
+    )
     # Long-context fence for the trio defaults (#313/#315c1/#318): decided
     # once per request from the prompt length, stamped through to graphbank
     # for the paged-offsets read. Receipts in _trio_max_context's docstring.
@@ -8402,12 +8408,6 @@ def generate_mtpk(
                 if len(tokens) >= late_depth_switch_after
                 else late_depth_before
             )
-        minimum_planned_depth = (
-            0
-            if adaptive_policy is not None
-            and getattr(adaptive_policy, "allows_depth_zero", False)
-            else 1
-        )
         planned_depth = max(
             minimum_planned_depth,
             min(int(planned_depth), int(speculative_depth)),
