@@ -83,7 +83,7 @@ def test_matrix_workload_contract_redoes_every_requested_context() -> None:
     assert matrix.VANITY_TEMPERATURE == 0.0
     assert matrix.VANITY_PROMPT_FILE.name == "qwen38_palindrome_vanity.jsonl"
     assert matrix.PYTHON_PROMPT_FILE.name == "python_modules_long.jsonl"
-    assert matrix.PYTHON_CONTEXT_FILE.name == "generation.py"
+    assert matrix.PYTHON_CONTEXT_MANIFEST.name == "qwen38-pr335-python-context.json"
 
 
 def test_frozen_input_artifact_hashes_match_repository_bytes() -> None:
@@ -95,7 +95,43 @@ def test_frozen_input_artifact_hashes_match_repository_bytes() -> None:
     assert matrix._sha256(matrix.PYTHON_PROMPT_FILE) == (
         matrix.PROMPT_ARTIFACT_SHA256["python"]
     )
-    assert matrix._sha256(matrix.PYTHON_CONTEXT_FILE) == matrix.PYTHON_CONTEXT_SHA256
+    manifest = json.loads(matrix.PYTHON_CONTEXT_MANIFEST.read_text(encoding="utf-8"))
+    assert manifest == {
+        "path": "mtplx/generation.py",
+        "sha256": matrix.PYTHON_CONTEXT_SHA256,
+        "source_commit": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
+        "source_pr": 335,
+    }
+
+
+def test_campaign_accepts_the_external_pr335_context_by_hash(
+    monkeypatch, tmp_path: Path
+) -> None:
+    matrix = _module()
+    context = tmp_path / "pr335-generation.py"
+    row28 = tmp_path / "row28.safetensors"
+    args = type(
+        "Args",
+        (),
+        {
+            "baseline_root": tmp_path / "baseline",
+            "candidate_root": tmp_path / "candidate",
+            "output_root": tmp_path / "receipts",
+            "workload": "low",
+            "prompt_file": matrix.PYTHON_PROMPT_FILE,
+            "context_file": context,
+            "row28_artifact": row28,
+        },
+    )()
+    monkeypatch.setattr(matrix, "_git_status", lambda root: [])
+    hashes = {
+        matrix.PYTHON_PROMPT_FILE: matrix.PROMPT_ARTIFACT_SHA256["python"],
+        context: matrix.PYTHON_CONTEXT_SHA256,
+        row28: matrix.ROW28_ARTIFACT_SHA256,
+    }
+    monkeypatch.setattr(matrix, "_sha256", hashes.__getitem__)
+
+    matrix._assert_campaign_inputs(args)
 
 
 def test_lane_specs_keep_source_and_head_changes_separate(tmp_path: Path) -> None:
@@ -240,7 +276,7 @@ def test_campaign_rejects_dirty_sources_before_entering_gpu_window(
             "output_root": tmp_path / "receipts",
             "workload": "low",
             "prompt_file": matrix.PYTHON_PROMPT_FILE,
-            "context_file": matrix.PYTHON_CONTEXT_FILE,
+            "context_file": tmp_path / "pr335-generation.py",
         },
     )()
     monkeypatch.setattr(
@@ -272,7 +308,7 @@ def test_campaign_rejects_receipt_output_inside_either_source(
             "output_root": candidate / "bench" / "results",
             "workload": "low",
             "prompt_file": matrix.PYTHON_PROMPT_FILE,
-            "context_file": matrix.PYTHON_CONTEXT_FILE,
+            "context_file": tmp_path / "pr335-generation.py",
         },
     )()
     monkeypatch.setattr(matrix, "_git_status", lambda root: [])

@@ -59,28 +59,30 @@ ARM_SCRIPT = ROOT / "scripts/qwen38_native_mtp_matrix_arm.py"
 ISOLATED_SCRIPT = ROOT / "scripts/qwen38_challenge_port_isolated_gate.py"
 VANITY_PROMPT_FILE = ROOT / "mtplx/benchmarks/prompts/qwen38_palindrome_vanity.jsonl"
 PYTHON_PROMPT_FILE = ROOT / "mtplx/benchmarks/prompts/python_modules_long.jsonl"
-PYTHON_CONTEXT_FILE = ROOT / "mtplx/generation.py"
+PYTHON_CONTEXT_MANIFEST = (
+    ROOT / "benchmarks/fixtures/qwen38-pr335-python-context.json"
+)
 PROMPT_ARTIFACT_SHA256 = {
     "vanity": "878a98fe36e5d62566b093b77d11d11bd502fb31e6d2caf7309ea71a9a79bb02",
     "python": "ca2054913c5c27c24c983ed27e3ee4eff1d01d456a73e71377fdaea3cbf8c140",
 }
-PYTHON_CONTEXT_SHA256 = "454a8d33d514456c0e1dc6dfccbff2e473e3068f601a54514e964d2b21b17751"
+PYTHON_CONTEXT_SHA256 = "dfa72b4d7b161ef6f6105b0a635cff3bf3d112f37bdb4f0d1a4eb092ccbf5771"
 ROW28_ARTIFACT_SHA256 = "c934b40f1254858425cc0b5fdfe62b6ae13d1a4aff74da9d81606e92fdcf41ee"
 PROMPT_TOKEN_SHA256 = {
     "vanity": {
         100: "94a188b7cacc378c60a6503feea97429c59f6dab3980635eaa5e35da1e6b767b",
     },
     "low": {
-        1_024: "3015401ec3e421502b1a23f18d0a6e5d53004b189fdbab0e2e3ba27802fcd7e6",
-        16_384: "af141694261c1d3c4d8aa6e36e903fa55fae08e2fc3ad21ad78ebcde213f6954",
-        65_536: "0a042777fa323cbf0304270d72bf84990aa326653170333594ba45365f0e1fda",
-        131_072: "1fba20935b8828ab480208e7bbb882aeaeaca6b5031f752962c7a488daa4699e",
+        1_024: "590c6dacd1ff65d786213a05e1843684d7b0fad3006b1ede0d52ff6ec6310bcb",
+        16_384: "ce56d0ebd7f7c4ea0982511717bde3fd5e31fa43a0e3a94c2613326fc9808ae8",
+        65_536: "8e96279816f0a088c06cffcd89cabb64982bd7082f29d810ef81f6799a942cf5",
+        131_072: "e9a26736ca9f193673d7a844ae89b42574f0f3440ee26c771ffb73be2704511b",
     },
     "xhigh": {
-        1_024: "27d46cfc472799e56283a42c9f2abfa0811ba0591b7846694ea43a11e9b79cb4",
-        16_384: "f604437b2a74a7dbfc3fd9c51acd5fb5e301e2dcea12b29587c9c738182deb12",
-        65_536: "01a9e6f1ebc8000bc5480c0bdfd593358e737afafb7502b0d64cea29bfbffe61",
-        131_072: "9651a2343f9aee2c538f581bec0115b2c215abeeb0f15ea4d140a31e8800272e",
+        1_024: "806039fe48f994aad16eda98fee9e9b64388697797c7fd620bd55eb28c2a53e9",
+        16_384: "d78595989ba63e067242f446c47f7b09682c00843376def66015add88d50b18e",
+        65_536: "9b67a17554da6586120595d724b87b83b0cfad45214c19140d9bb499f5261a4a",
+        131_072: "a9fb510a6d62511650f9dc5c0a98d72120131760644cab7835ad53cfcc73a07a",
     },
 }
 
@@ -570,8 +572,6 @@ def _assert_campaign_inputs(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"{args.workload} requires frozen prompt artifact {expected_prompt}"
         )
-    if args.context_file.resolve() != PYTHON_CONTEXT_FILE.resolve():
-        raise RuntimeError(f"matrix requires frozen Python context {PYTHON_CONTEXT_FILE}")
     expected_hashes = {
         args.prompt_file: PROMPT_ARTIFACT_SHA256[
             "vanity" if args.workload == "vanity" else "python"
