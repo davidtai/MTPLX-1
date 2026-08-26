@@ -86,6 +86,22 @@ def test_diagnostic_arm_command_uses_exact_16k_xhigh_contract(tmp_path: Path) ->
     assert "--allow-fixed-diagnostic-route" in command
 
 
+def test_gate_requires_explicit_frozen_context_artifact(tmp_path: Path) -> None:
+    gate = _module()
+    parser = gate._parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--baseline-root", str(tmp_path / "baseline"),
+                "--routes", "control",
+                "--model", str(tmp_path / "model"),
+                "--row28-artifact", str(tmp_path / "row28.safetensors"),
+                "--output-root", str(tmp_path / "output"),
+            ]
+        )
+
+
 def test_aggregate_rejects_per_lane_token_nondeterminism(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

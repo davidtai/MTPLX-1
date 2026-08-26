@@ -206,9 +206,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, default=matrix.PYTHON_PROMPT_FILE)
-    parser.add_argument(
-        "--context-file", type=Path, default=matrix.PYTHON_CONTEXT_MANIFEST
-    )
+    parser.add_argument("--context-file", type=Path, required=True)
     parser.add_argument("--row28-artifact", type=Path, required=True)
     parser.add_argument("--lock", type=Path, default=Path("/tmp/mtplx-gpu-exclusive.lock"))
     parser.add_argument("--output-root", type=Path, required=True)
