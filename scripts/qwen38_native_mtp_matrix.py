@@ -150,7 +150,7 @@ def child_command(
 ) -> list[str]:
     output_tokens, temperature, top_p, top_k = _workload_values(workload)
     command = [
-        str(python.resolve()),
+        str(python.absolute()),
         str(ARM_SCRIPT),
         "--source-root", str(lane.source_root.resolve()),
         "--source-commit", lane.source_commit,
@@ -473,7 +473,7 @@ def _interpreter_versions(python: Path) -> dict[str, str]:
         "'mlx_metal':importlib.metadata.version('mlx-metal')},sort_keys=True))"
     )
     output = subprocess.check_output(
-        [str(python.resolve()), "-c", program], text=True
+        [str(python.absolute()), "-c", program], text=True
     ).strip()
     return {str(key): str(value) for key, value in json.loads(output).items()}
 

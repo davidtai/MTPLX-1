@@ -493,6 +493,25 @@ def test_parent_preflight_reads_both_distribution_versions_from_selected_python(
     assert "mlx-metal" in observed["command"][2]
 
 
+def test_parent_preflight_does_not_dereference_virtualenv_python_symlink(
+    monkeypatch, tmp_path: Path
+) -> None:
+    matrix = _module()
+    selected_python = tmp_path / "venv" / "bin" / "python"
+    selected_python.parent.mkdir(parents=True)
+    selected_python.symlink_to(sys.executable)
+    observed: dict[str, object] = {}
+
+    def fake_check_output(command, **kwargs):
+        observed["command"] = command
+        return '{"mlx": "0.32.2", "mlx_metal": "0.32.2"}\n'
+
+    monkeypatch.setattr(matrix.subprocess, "check_output", fake_check_output)
+    matrix._interpreter_versions(selected_python)
+
+    assert observed["command"][0] == str(selected_python.absolute())
+
+
 def test_matrix_parent_accepts_direct_or_delegated_guard_ownership() -> None:
     matrix = _module()
 
