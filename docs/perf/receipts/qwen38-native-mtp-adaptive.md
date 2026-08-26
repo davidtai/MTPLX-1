@@ -15,6 +15,14 @@ the external DFlash2 drafter.
 - The 100-token greedy vanity result was effectively tied: adaptive Q4 was
   0.05% faster by wall time than current fixed K3.
 
+| Candidate | Exact-1K-output wall gate | Xhigh 16K-output wall gate | Outcome |
+|---|---|---|---|
+| Adaptive BF16 | 0/4 wins | 1/4 wins | Keep opt-in; do not make default |
+| Adaptive Q4 | 3/4 wins | 4/4 wins | Retain as experimental artifact lane |
+
+The 100-token vanity prompt is reported separately because it stops naturally
+at 102 tokens rather than using either matrix's fixed output length.
+
 ## Candidates
 
 - `control`: the Optimized-Speed model's stock BF16 native-MTP blocks at fixed
@@ -68,7 +76,8 @@ than the fixed-K3 control. Peak memory is the maximum observed arm in GiB.
 
 The PR #335 1K row is its published mean of the two additional 1K/1K ABBA
 brackets. Its 16K through 128K rows are the low-reasoning natural-stop runs
-used in the PR #335 graph. The machine-readable source for all 20 rows is
+used in the PR #335 graph. The machine-readable source for these 20 rows, the
+xhigh matrix, the DFlash2 reference, and the 128K depth distribution is
 [`qwen38-native-mtp-four-series-data.json`](qwen38-native-mtp-four-series-data.json).
 
 ## Xhigh 16,384-output matrix
