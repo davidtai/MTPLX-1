@@ -4,6 +4,17 @@ This receipt covers the native-MTP-only port of the adaptive depth work from
 [PR #335](https://github.com/youssofal/MTPLX/pull/335). It does not route through
 the external DFlash2 drafter.
 
+## Result at a glance
+
+- Ship adaptive BF16 as an opt-in policy; keep fixed BF16 K3 as the default.
+- Adaptive BF16 regressed all four exact-1K-output rows and won only the
+  single-pass 128K xhigh row.
+- Adaptive Q4 won 16K, 64K, and 128K at low reasoning and all four xhigh rows
+  by wall time. It remains experimental until its artifact is published and a
+  supported installation contract exists.
+- The 100-token greedy vanity result was effectively tied: adaptive Q4 was
+  0.05% faster by wall time than current fixed K3.
+
 ## Candidates
 
 - `control`: the Optimized-Speed model's stock BF16 native-MTP blocks at fixed
@@ -69,19 +80,19 @@ used in the PR #335 graph. The machine-readable source for all 20 rows is
 
 | Context | Candidate | Prefill tok/s | Decode tok/s | Wall (s) | Wall vs control | Peak GiB |
 |---:|---|---:|---:|---:|---:|---:|
-| 1K | fixed K3 control | 757.21 | 49.73 | 330.841 | baseline | 21.496 |
-| 1K | adaptive | 750.70 | 49.62 | 331.590 | -0.23% | 21.476 |
-| 1K | q4 adaptive | 737.27 | 51.30 | 320.817 | +3.12% | 21.704 |
+| 1K | current fixed K3 | 757.21 | 49.73 | 330.841 | baseline | 21.496 |
+| 1K | adaptive BF16 | 750.70 | 49.62 | 331.590 | -0.23% | 21.476 |
+| 1K | adaptive Q4 | 737.27 | 51.30 | 320.817 | +3.12% | 21.704 |
 | 1K | DFlash2 adaptive | 788.00 | 25.55 | 642.484 | -48.51% | 21.064 |
-| 16K | fixed K3 control | 806.69 | 45.01 | 384.721 | baseline | 23.469 |
-| 16K | adaptive | 813.42 | 44.63 | 387.691 | -0.77% | 23.469 |
-| 16K | q4 adaptive | 823.50 | 47.59 | 364.597 | +5.52% | 23.652 |
-| 64K | fixed K3 control | 674.32 | 35.58 | 560.455 | baseline | 29.399 |
-| 64K | adaptive | 683.78 | 34.30 | 576.230 | -2.74% | 28.653 |
-| 64K | q4 adaptive | 683.86 | 36.33 | 549.620 | +1.97% | 28.883 |
-| 128K | fixed K3 control | 552.97 | 27.00 | 852.112 | baseline | 37.121 |
-| 128K | adaptive | 553.81 | 28.37 | 822.537 | +3.60% | 37.086 |
-| 128K | q4 adaptive | 552.87 | 29.04 | 809.628 | +5.25% | 37.277 |
+| 16K | current fixed K3 | 806.69 | 45.01 | 384.721 | baseline | 23.469 |
+| 16K | adaptive BF16 | 813.42 | 44.63 | 387.691 | -0.77% | 23.469 |
+| 16K | adaptive Q4 | 823.50 | 47.59 | 364.597 | +5.52% | 23.652 |
+| 64K | current fixed K3 | 674.32 | 35.58 | 560.455 | baseline | 29.399 |
+| 64K | adaptive BF16 | 683.78 | 34.30 | 576.230 | -2.74% | 28.653 |
+| 64K | adaptive Q4 | 683.86 | 36.33 | 549.620 | +1.97% | 28.883 |
+| 128K | current fixed K3 | 552.97 | 27.00 | 852.112 | baseline | 37.121 |
+| 128K | adaptive BF16 | 553.81 | 28.37 | 822.537 | +3.60% | 37.086 |
+| 128K | adaptive Q4 | 552.87 | 29.04 | 809.628 | +5.25% | 37.277 |
 
 The Q4 adaptive candidate won all four xhigh wall-time rows. The BF16 adaptive
 candidate won only the single-pass 128K row and regressed the three paired
@@ -94,9 +105,9 @@ shares of wall time or the policy's requested depth.
 
 | Candidate | D0 | D1 | D2 | D3 |
 |---|---:|---:|---:|---:|
-| control | 3.17% | 0.02% | 0.00% | 96.81% |
-| adaptive | 2.53% | 1.59% | 16.57% | 79.31% |
-| q4 adaptive | 2.90% | 2.93% | 15.92% | 78.25% |
+| current fixed K3 | 3.17% | 0.02% | 0.00% | 96.81% |
+| adaptive BF16 | 2.53% | 1.59% | 16.57% | 79.31% |
+| adaptive Q4 | 2.90% | 2.93% | 15.92% | 78.25% |
 
 ## DFlash2 comparison
 
