@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import time
 import weakref
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -773,6 +774,7 @@ compiled_verify_status: dict[str, Any] = {
     "flipped_at": None,
     "flip_count": 0,
     "transient_exception_count": 0,
+    "last_exception": None,
 }
 
 _PERMANENT_EAGER_LOGGED: set[str] = set()
@@ -1066,8 +1068,6 @@ _BATCH_PAGED_OFFSETS = _batch_paged_offsets_enabled()
 # MTPLX_GREEDY_TRIO_MAX_CONTEXT fence; requests that never prebind (batch
 # lane) keep the last-set/default value — that lane pays at most the
 # pre-#318 serial-sync behavior, never a correctness change.
-from contextvars import ContextVar
-
 _PAGED_OFFSETS_CONTEXT_OK: ContextVar[bool] = ContextVar(
     "mtplx_paged_offsets_context_ok", default=True
 )
@@ -1576,9 +1576,16 @@ class CompiledVerifyBank:
                     self._held_state_refs.pop(0)
         except Exception as exc:
             self._exception_failures += 1
+            exception_detail = f"{type(exc).__name__}: {exc}"
             compiled_verify_status["transient_exception_count"] = (
                 int(compiled_verify_status.get("transient_exception_count", 0)) + 1
             )
+            compiled_verify_status["last_exception"] = exception_detail
+            if self._exception_failures == 1:
+                print(
+                    "[mtplx] compiled-verify exception: " + exception_detail,
+                    flush=True,
+                )
             if self._exception_failures >= 3:
                 self.permanent_eager = True
                 self.permanent_eager_reason = (
