@@ -62,7 +62,7 @@ PROMPT_ARTIFACT_SHA256 = {
     "vanity": "878a98fe36e5d62566b093b77d11d11bd502fb31e6d2caf7309ea71a9a79bb02",
     "python": "ca2054913c5c27c24c983ed27e3ee4eff1d01d456a73e71377fdaea3cbf8c140",
 }
-PYTHON_CONTEXT_SHA256 = "894a5b8c0eeaeffddc2431893533aab5cc22cbd2574b60e0268a6052b1764121"
+PYTHON_CONTEXT_SHA256 = "c92bc5c3861cdadc74059da5b341c84c3ef9b985b92eea2f40cdb1f2cd71a0fe"
 ROW28_ARTIFACT_SHA256 = "c934b40f1254858425cc0b5fdfe62b6ae13d1a4aff74da9d81606e92fdcf41ee"
 PROMPT_TOKEN_SHA256 = {
     "vanity": {
@@ -194,6 +194,11 @@ def receipt_errors(
         "mlx_metal_version": REQUIRED_MLX_METAL_VERSION,
         "gpu_lock_scope": "attested_parent",
         "source_import_attested": True,
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+        "speculative_depth": 3,
+        "requested_speculative_depth": 3,
+        "draft_core": "device" if lane.route_id != "control" else "stock",
     }
     for key, expected in exact.items():
         if receipt.get(key) != expected:
@@ -221,6 +226,31 @@ def receipt_errors(
     }
     if receipt.get("sampler") != expected_sampler:
         errors.append("sampler receipt does not match the frozen workload")
+    optimized_stack = receipt.get("optimized_stack") or {}
+    expected_stack = {
+        "profile": "turbo",
+        "runtime_profile": "native_mtp_turbo",
+        "draft_lm_head": {"bits": 4, "group_size": 64, "mode": "affine"},
+        "draft_sampler": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+        "mtp_hidden_variant": "post_norm",
+        "mtp_cache_policy": "persistent",
+        "mtp_history_policy": "committed",
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+    }
+    for key, expected in expected_stack.items():
+        if optimized_stack.get(key) != expected:
+            errors.append(f"optimized stack {key} mismatch")
+    required_runtime_env = {
+        "MTPLX_COMPILED_VERIFY": "1",
+        "MTPLX_DROP_EVENTS": "1",
+        "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
+        "MTPLX_MTP_HISTORY_POLICY": "committed",
+    }
+    runtime_env = optimized_stack.get("runtime_env") or {}
+    for key, expected in required_runtime_env.items():
+        if runtime_env.get(key) != expected:
+            errors.append(f"optimized stack runtime env {key} mismatch")
     if receipt.get("workload") != "vanity" and int(receipt.get("generated_tokens", -1)) != output_tokens:
         errors.append("timed output token count is not exact")
     if lane.route_id != "control":
@@ -251,8 +281,31 @@ def receipt_errors(
             and len(policy.get("final_accept_ema") or ()) == 3
             and 0 <= int(policy.get("initial_depth", -1)) <= 3
             and 0 <= int(policy.get("final_depth", -1)) <= 3
+            and int(policy.get("max_depth", -1)) == 3
+            and int(policy.get("depth_cap", -1)) == 3
         ):
             errors.append("adaptive policy state receipt is incomplete")
+        device_core = receipt.get("device_core_receipt") or {}
+        if not (
+            device_core.get("requested") == "device"
+            and int(device_core.get("device_calls", 0)) > 0
+            and int(device_core.get("device_fallbacks", -1)) == 0
+        ):
+            errors.append("adaptive device draft core did not engage without fallback")
+        compiled_verify = receipt.get("compiled_verify_receipt") or {}
+        exception_fallbacks = sum(
+            int(value)
+            for reason, value in (compiled_verify.get("fallback_reasons") or {}).items()
+            if str(reason).startswith("exception:")
+        )
+        if not (
+            compiled_verify.get("mode") == "on"
+            and int(compiled_verify.get("compiled_calls", 0)) > 0
+            and compiled_verify.get("permanent_eager") is False
+            and not compiled_verify.get("permanent_eager_reason")
+            and exception_fallbacks == 0
+        ):
+            errors.append("adaptive compiled verification did not engage cleanly")
     elif receipt.get("source_rows") or receipt.get("kernel_ids"):
         errors.append("control route unexpectedly installed candidate features")
     return errors

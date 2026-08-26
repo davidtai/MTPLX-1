@@ -256,6 +256,8 @@ def _generation_metrics(stats: Any) -> dict[str, Any]:
         "capture_commit_events": int(capture_commit_events),
         "verify_strategy": VERIFY_STRATEGY,
         "verify_core": VERIFY_CORE,
+        "speculative_depth": int(stats.speculative_depth),
+        "requested_speculative_depth": int(stats.requested_speculative_depth),
     }
 
 

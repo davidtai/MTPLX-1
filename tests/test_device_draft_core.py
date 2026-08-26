@@ -327,6 +327,8 @@ def test_device_core_installs_all_adaptive_depths_without_poisoning_live_cache()
         )
         assert len(tokens) == depth
         assert len(distributions) == depth
+        assert int(cache[0].offset) == depth
+        generation._rollback_mtp_cache(cache, 0)
 
 
 def test_device_inverse_cdf_sampling_matches_q() -> None:

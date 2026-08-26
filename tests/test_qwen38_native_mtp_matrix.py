@@ -29,6 +29,26 @@ def _arm_module():
     return module
 
 
+def _optimized_stack_receipt() -> dict[str, object]:
+    return {
+        "profile": "turbo",
+        "runtime_profile": "native_mtp_turbo",
+        "draft_lm_head": {"bits": 4, "group_size": 64, "mode": "affine"},
+        "draft_sampler": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+        "mtp_hidden_variant": "post_norm",
+        "mtp_cache_policy": "persistent",
+        "mtp_history_policy": "committed",
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+        "runtime_env": {
+            "MTPLX_COMPILED_VERIFY": "1",
+            "MTPLX_DROP_EVENTS": "1",
+            "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
+            "MTPLX_MTP_HISTORY_POLICY": "committed",
+        },
+    }
+
+
 def test_matrix_has_four_fresh_lanes_and_no_historical_pr335_lane() -> None:
     matrix = _module()
 
@@ -226,6 +246,11 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
         "mlx_metal_version": "0.32.2",
         "gpu_lock_scope": "attested_parent",
         "source_import_attested": True,
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+        "speculative_depth": 3,
+        "requested_speculative_depth": 3,
+        "optimized_stack": _optimized_stack_receipt(),
         "workload": "low",
         "sampler": {
             "target_temperature": 1.0,
@@ -253,6 +278,18 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
             )
         },
         "adaptive_policy_receipt": {"kind": "position_ema", "executed": True},
+        "device_core_receipt": {
+            "requested": "device",
+            "device_calls": 400,
+            "device_fallbacks": 0,
+        },
+        "compiled_verify_receipt": {
+            "mode": "on",
+            "compiled_calls": 400,
+            "fallback_reasons": {},
+            "permanent_eager": False,
+            "permanent_eager_reason": None,
+        },
         "history_route_receipt": {
             "route_id": "kv_only_history",
             "prompt_tokens": 16_384,
@@ -273,6 +310,8 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
             "final_accept_ema": [0.7, 0.6, 0.5],
             "initial_depth": 3,
             "final_depth": 2,
+            "max_depth": 3,
+            "depth_cap": 3,
         }
     )
 
@@ -420,6 +459,11 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
         "mlx_metal_version": "0.32.2",
         "gpu_lock_scope": "attested_parent",
         "source_import_attested": True,
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+        "speculative_depth": 3,
+        "requested_speculative_depth": 3,
+        "optimized_stack": _optimized_stack_receipt(),
         "sampler": {
             "target_temperature": 1.0,
             "draft_temperature": 1.0,
@@ -452,6 +496,21 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
             "final_accept_ema": [0.6, 0.5, 0.4],
             "initial_depth": 3,
             "final_depth": 2,
+            "max_depth": 3,
+            "depth_cap": 3,
+        },
+        "device_core_receipt": {
+            "requested": "device",
+            "device_calls": 400,
+            "device_fallbacks": 0,
+        },
+        "compiled_verify_receipt": {
+            "mode": "on",
+            "compiled_calls": 400,
+            "fallback_calls": 0,
+            "fallback_reasons": {},
+            "permanent_eager": False,
+            "permanent_eager_reason": None,
         },
         "history_route_receipt": {
             "route_id": "stock_history",
@@ -484,6 +543,22 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
         broken, lane=lane, context_tokens=1_024, output_tokens=1_024
     )
     assert "adaptive policy state receipt is incomplete" in errors
+
+    broken = json.loads(json.dumps(base))
+    broken["device_core_receipt"]["device_fallbacks"] = 1
+    errors = matrix.receipt_errors(
+        broken, lane=lane, context_tokens=1_024, output_tokens=1_024
+    )
+    assert "adaptive device draft core did not engage without fallback" in errors
+
+    broken = json.loads(json.dumps(base))
+    broken["compiled_verify_receipt"]["fallback_reasons"] = {
+        "exception:ValueError": 1
+    }
+    errors = matrix.receipt_errors(
+        broken, lane=lane, context_tokens=1_024, output_tokens=1_024
+    )
+    assert "adaptive compiled verification did not engage cleanly" in errors
 
 
 def test_parent_preflight_reads_both_distribution_versions_from_selected_python(

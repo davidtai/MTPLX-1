@@ -193,6 +193,8 @@ def _generation_metrics(
         "capture_commit_events": int(capture_commit_events),
         "verify_strategy": str(verify_strategy),
         "verify_core": str(verify_core),
+        "speculative_depth": int(stats.speculative_depth),
+        "requested_speculative_depth": int(stats.requested_speculative_depth),
     }
 
 
@@ -980,6 +982,10 @@ def _run_arm(
     )
     wall_s = time.perf_counter() - started
     stats = output.stats
+    compiled_verify_receipt = dict(
+        (dict(getattr(stats, "graphbank", {}) or {}).get("compiled_verify") or {})
+    )
+    device_core_receipt = dict(getattr(stats, "draft_core", {}) or {})
     adaptive_policy_receipt = None
     if adaptive_policy is not None and adaptive_policy_initial_state is not None:
         final_accept_ema = tuple(
@@ -993,6 +999,8 @@ def _run_arm(
             "final_accept_ema": list(final_accept_ema),
             "initial_depth": int(adaptive_policy_initial_state["depth"]),
             "final_depth": int(adaptive_policy.current_depth),
+            "max_depth": int(options["speculative_depth"]),
+            "depth_cap": int(options["adaptive_depth_cap"]),
         }
     feature_receipt = dict(
         getattr(runtime, "qwen38_feature_receipt", {}) or {}
@@ -1046,6 +1054,8 @@ def _run_arm(
             if isinstance(event.get("policy"), dict)
         ],
         "adaptive_policy_receipt": adaptive_policy_receipt,
+        "compiled_verify_receipt": compiled_verify_receipt,
+        "device_core_receipt": device_core_receipt,
         "token_hash": _token_hash(list(output.tokens)),
         "tokens": list(output.tokens),
     }

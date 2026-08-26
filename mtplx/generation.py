@@ -4934,6 +4934,45 @@ def _device_core_state_tree(cache: Any) -> list[Any]:
     return tree
 
 
+def _device_core_state_layout(cache: Any) -> tuple[tuple[int, int], ...]:
+    """Fixed slots owned by a compiled native-MTP draft route."""
+
+    layout: list[tuple[int, int]] = []
+    for entry_index, entry in enumerate(cache or ()):
+        entry_state = getattr(entry, "cache", None)
+        if not isinstance(entry_state, list):
+            raise RuntimeError(
+                "device draft route requires construction-bound cache lists"
+            )
+        for slot, leaf in enumerate(entry_state):
+            if not isinstance(leaf, mx.array):
+                raise RuntimeError(
+                    "device draft route requires materialized array cache state"
+                )
+            layout.append((entry_index, slot))
+    if not layout:
+        raise RuntimeError("device draft route requires non-empty cache state")
+    return tuple(layout)
+
+
+def _read_device_core_state(
+    cache: Any,
+    layout: tuple[tuple[int, int], ...],
+) -> tuple[mx.array, ...]:
+    return tuple(cache[entry_index].cache[slot] for entry_index, slot in layout)
+
+
+def _write_device_core_state(
+    cache: Any,
+    layout: tuple[tuple[int, int], ...],
+    state: tuple[mx.array, ...],
+) -> None:
+    if len(state) != len(layout):
+        raise RuntimeError("compiled device draft returned incomplete cache state")
+    for (entry_index, slot), leaf in zip(layout, state):
+        cache[entry_index].cache[slot] = leaf
+
+
 def _device_core_state_signature(cache: Any) -> tuple[Any, ...]:
     """Structural signature of the cache state a compiled chain depends on.
 
@@ -5056,8 +5095,15 @@ def _make_device_draft_core(
         else warm_logits.shape[-1]
     )
     _rollback_mtp_cache(mtp_cache, base_offset)
+    # Warm forwards exist only to instantiate the exact D1-D3 module/cache
+    # geometry. Their rollback snapshots are not live cycle state and must
+    # not survive installation: all depth cores share the committed cache.
+    _clear_mtp_cache_rollback_state(mtp_cache)
 
-    def chain_fn(hidden_states, first_token_ids, level_keys):
+    state_layout = _device_core_state_layout(mtp_cache)
+
+    def chain_fn(hidden_states, first_token_ids, level_keys, *state_in):
+        _write_device_core_state(mtp_cache, state_layout, state_in)
         h, tok = hidden_states, first_token_ids
         tokens: list[mx.array] = []
         q_ids: list[mx.array] = []
@@ -5096,18 +5142,19 @@ def _make_device_draft_core(
             tokens.append(next_tok)
             h = hidden_level[:, -1:, :]
             tok = next_tok
-        return tuple(tokens + q_ids + q_probs)
+        state_out = list(_read_device_core_state(mtp_cache, state_layout))
+        return tuple(tokens + q_ids + q_probs + state_out)
 
-    state_tree = _device_core_state_tree(mtp_cache)
     restore_live_containers = _snapshot_device_core_live_containers(mtp_cache)
-    compiled = mx.compile(
-        chain_fn,
-        inputs=state_tree,
-        outputs=state_tree,
-    )
+    compiled = mx.compile(chain_fn)
     try:
         smoke_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
-        smoke = compiled(hidden, token_ids, smoke_keys)
+        smoke = compiled(
+            hidden,
+            token_ids,
+            smoke_keys,
+            *_read_device_core_state(mtp_cache, state_layout),
+        )
         _eval(smoke)
     finally:
         restore_live_containers()
@@ -5119,6 +5166,8 @@ def _make_device_draft_core(
         "promoted": promoted,
         "promotion_failures": failures,
         "state_signature": _device_core_state_signature(mtp_cache),
+        "cache": mtp_cache,
+        "state_layout": state_layout,
     }
 
 
@@ -5131,15 +5180,30 @@ def _run_device_draft_core(
 ) -> tuple[list[int], list[SparseDistribution | None]]:
     depth = int(core["depth"])
     level_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
-    result = core["fn"](hidden, mx.array([[primary]]), level_keys)
+    state_in = _read_device_core_state(core["cache"], core["state_layout"])
+    result = core["fn"](
+        hidden,
+        mx.array([[primary]]),
+        level_keys,
+        *state_in,
+    )
     _eval(result)
-    tokens = [int(t.reshape(-1)[0].item()) for t in result[:depth]]
+    payload_count = depth if core["greedy"] else 3 * depth
+    payload = result[:payload_count]
+    _write_device_core_state(
+        core["cache"],
+        core["state_layout"],
+        tuple(result[payload_count:]),
+    )
+    tokens = [int(t.reshape(-1)[0].item()) for t in payload[:depth]]
     if core["greedy"]:
         return tokens, [
             SparseDistribution.one_hot(token, core["vocab_size"]) for token in tokens
         ]
     dists: list[SparseDistribution | None] = []
-    for ids, probs in zip(result[depth : 2 * depth], result[2 * depth : 3 * depth]):
+    for ids, probs in zip(
+        payload[depth : 2 * depth], payload[2 * depth : 3 * depth]
+    ):
         ids_np = np.asarray(ids, dtype=np.int64).reshape(-1)
         probs_np = np.asarray(probs, dtype=np.float64).reshape(-1)
         keep = probs_np > 0
@@ -5649,6 +5713,13 @@ def _rollback_mtp_cache(mtp_cache, offset: int) -> None:
         trim = max(0, current - offset)
         if trim and hasattr(cache, "trim"):
             cache.trim(trim)
+
+
+def _clear_mtp_cache_rollback_state(mtp_cache: Any) -> None:
+    for cache in mtp_cache or ():
+        rollback_state = getattr(cache, "rollback_state", None)
+        if isinstance(rollback_state, list):
+            rollback_state[:] = [None] * len(rollback_state)
 
 
 def _add_timing(event: dict, key: str, elapsed_s: float) -> None:
