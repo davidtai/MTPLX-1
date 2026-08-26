@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import json
+import pytest
 import subprocess
 import sys
 from typing import Any
@@ -85,6 +86,42 @@ def test_matrix_workload_contract_redoes_every_requested_context() -> None:
     assert matrix.VANITY_PROMPT_FILE.name == "qwen38_palindrome_vanity.jsonl"
     assert matrix.PYTHON_PROMPT_FILE.name == "python_modules_long.jsonl"
     assert matrix.PYTHON_CONTEXT_MANIFEST.name == "qwen38-pr335-python-context.json"
+
+
+def test_matrix_can_pair_only_the_selected_optimized_bf16_lane() -> None:
+    matrix = _module()
+
+    assert matrix.order_for_context(16_384, ("full-adaptive",)) == (
+        "full-adaptive",
+        "full-adaptive",
+    )
+    assert matrix.order_for_context(131_072, ("full-adaptive",)) == (
+        "full-adaptive",
+    )
+
+
+def test_matrix_rejects_duplicate_and_unknown_lane_selections() -> None:
+    matrix = _module()
+
+    with pytest.raises(ValueError, match="unique"):
+        matrix.order_for_context(
+            16_384,
+            ("full-adaptive", "full-adaptive"),
+        )
+    with pytest.raises(ValueError, match="unknown benchmark lanes"):
+        matrix.order_for_context(16_384, ("unknown-lane",))
+
+
+def test_matrix_cli_exposes_an_explicit_lane_selector() -> None:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--lanes" in result.stdout
+    assert "full-adaptive" in result.stdout
 
 
 def test_frozen_input_artifact_hashes_match_repository_bytes() -> None:
@@ -472,6 +509,98 @@ def test_aggregate_uses_the_renamed_full_fixed_lane_as_wall_baseline(
 
     assert result["summary"]["full-fixed-k3"]["wall_faster_vs_fixed_k3_pct"] == 0.0
     assert result["summary"]["full-adaptive"]["wall_faster_vs_fixed_k3_pct"] == 25.0
+
+
+def test_single_bf16_lane_aggregate_does_not_require_an_unmeasured_fixed_lane(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    matrix = _module()
+    specs = matrix.lane_specs(
+        baseline_root=tmp_path / "baseline",
+        baseline_commit=matrix.V292_COMMIT,
+        candidate_root=tmp_path / "candidate",
+        candidate_commit="c" * 40,
+        workload="low",
+    )
+    order = ("full-adaptive", "full-adaptive")
+    receipts = [
+        {
+            "lane_id": "full-adaptive",
+            "wall_s": wall,
+            "prefill_tok_s": 800.0,
+            "decode_tok_s": 60.0,
+            "peak_memory_gib": 22.0,
+            "token_hash": "same",
+        }
+        for wall in (20.0, 22.0)
+    ]
+    monkeypatch.setattr(matrix, "receipt_errors", lambda *args, **kwargs: [])
+
+    result = matrix.aggregate(
+        workload="low",
+        context_tokens=16_384,
+        order=order,
+        receipts=receipts,
+        specs=specs,
+    )
+
+    assert result["invariant_errors"] == []
+    assert set(result["summary"]) == {"full-adaptive"}
+    assert result["summary"]["full-adaptive"][
+        "wall_faster_vs_fixed_k3_pct"
+    ] is None
+
+
+@pytest.mark.parametrize(
+    "order",
+    (
+        ("full-adaptive",),
+        ("full-adaptive", "full-adaptive", "full-adaptive"),
+        (
+            "full-adaptive",
+            "full-fixed-k3",
+            "full-adaptive",
+            "full-fixed-k3",
+        ),
+        ("unknown-lane", "unknown-lane"),
+    ),
+)
+def test_aggregate_rejects_noncanonical_16k_lane_orders(
+    order: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    matrix = _module()
+    specs = matrix.lane_specs(
+        baseline_root=tmp_path / "baseline",
+        baseline_commit=matrix.V292_COMMIT,
+        candidate_root=tmp_path / "candidate",
+        candidate_commit="c" * 40,
+        workload="low",
+    )
+    receipts = [
+        {
+            "lane_id": lane_id,
+            "wall_s": 20.0,
+            "prefill_tok_s": 800.0,
+            "decode_tok_s": 60.0,
+            "peak_memory_gib": 22.0,
+            "token_hash": "same",
+        }
+        for lane_id in order
+    ]
+    monkeypatch.setattr(matrix, "receipt_errors", lambda *args, **kwargs: [])
+
+    result = matrix.aggregate(
+        workload="low",
+        context_tokens=16_384,
+        order=order,
+        receipts=receipts,
+        specs=specs,
+    )
+
+    assert result["invariant_errors"]
 
 
 def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -> None:

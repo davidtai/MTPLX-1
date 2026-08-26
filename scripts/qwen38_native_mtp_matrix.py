@@ -166,10 +166,30 @@ def lane_specs(
     }
 
 
-def order_for_context(context_tokens: int) -> tuple[str, ...]:
+def _selected_lanes(lane_ids: tuple[str, ...]) -> tuple[str, ...]:
+    if not lane_ids:
+        raise ValueError("at least one benchmark lane is required")
+    if len(set(lane_ids)) != len(lane_ids):
+        raise ValueError("benchmark lanes must be unique")
+    unknown = tuple(lane_id for lane_id in lane_ids if lane_id not in LANE_IDS)
+    if unknown:
+        raise ValueError(f"unknown benchmark lanes: {unknown}")
+    return lane_ids
+
+
+def _paired_order(lane_ids: tuple[str, ...]) -> tuple[str, ...]:
+    lanes = _selected_lanes(lane_ids)
+    return (*lanes, *reversed(lanes))
+
+
+def order_for_context(
+    context_tokens: int,
+    lane_ids: tuple[str, ...] = LANE_IDS,
+) -> tuple[str, ...]:
     if context_tokens not in CONTEXT_TOKENS:
         raise ValueError(f"unsupported context size: {context_tokens}")
-    return ONE_PASS_ORDER if context_tokens == 131_072 else PAIRED_ORDER
+    lanes = _selected_lanes(lane_ids)
+    return lanes if context_tokens == 131_072 else _paired_order(lanes)
 
 
 def _workload_values(workload: str) -> tuple[int, float, float, int]:
@@ -631,9 +651,31 @@ def aggregate(
 ) -> dict[str, Any]:
     output_tokens, temperature, top_p, top_k = _workload_values(workload)
     errors: list[str] = []
+    observed_lane_ids = tuple(dict.fromkeys(order))
+    try:
+        selected_lane_ids = _selected_lanes(observed_lane_ids)
+    except ValueError as exc:
+        errors.append(str(exc))
+        selected_lane_ids = tuple(
+            lane_id for lane_id in observed_lane_ids if lane_id in specs
+        )
+    expected_order = (
+        selected_lane_ids
+        if context_tokens == 131_072
+        else _paired_order(selected_lane_ids)
+        if selected_lane_ids
+        else ()
+    )
+    if order != expected_order:
+        errors.append(
+            f"noncanonical lane order: {order} != {expected_order}"
+        )
     if len(receipts) != len(order):
         errors.append(f"expected {len(order)} arms, found {len(receipts)}")
     for index, (lane_id, receipt) in enumerate(zip(order, receipts)):
+        if lane_id not in specs:
+            errors.append(f"arm {index}: unknown benchmark lane {lane_id}")
+            continue
         errors.extend(
             f"arm {index}: {error}"
             for error in receipt_errors(
@@ -658,8 +700,8 @@ def aggregate(
     fixed_rows = [
         row for row in receipts if row.get("lane_id") == "full-fixed-k3"
     ]
-    fixed_wall = _mean(fixed_rows, "wall_s") if fixed_rows else math.nan
-    for lane_id in LANE_IDS:
+    fixed_wall = _mean(fixed_rows, "wall_s") if fixed_rows else None
+    for lane_id in selected_lane_ids:
         rows = [row for row in receipts if row.get("lane_id") == lane_id]
         expected_arms = order.count(lane_id)
         if len(rows) != expected_arms:
@@ -678,7 +720,11 @@ def aggregate(
             "prefill_tok_s_mean": _mean(rows, "prefill_tok_s"),
             "decode_tok_s_mean": _mean(rows, "decode_tok_s"),
             "wall_s_mean": wall,
-            "wall_faster_vs_fixed_k3_pct": (fixed_wall / wall - 1.0) * 100.0,
+            "wall_faster_vs_fixed_k3_pct": (
+                (fixed_wall / wall - 1.0) * 100.0
+                if fixed_wall is not None
+                else None
+            ),
             "peak_memory_gib_max": max(float(row["peak_memory_gib"]) for row in rows),
             "per_lane_token_deterministic": (
                 len({row["token_hash"] for row in rows}) == 1
@@ -689,7 +735,11 @@ def aggregate(
         }
     return {
         "schema_version": 1,
-        "kind": "qwen38_native_mtp_four_lane_matrix",
+        "kind": (
+            "qwen38_native_mtp_four_lane_matrix"
+            if selected_lane_ids == LANE_IDS
+            else "qwen38_native_mtp_selected_lane_matrix"
+        ),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "workload": workload,
         "context_tokens": context_tokens,
@@ -698,6 +748,7 @@ def aggregate(
         ),
         "timed_output_tokens": output_tokens,
         "order": list(order),
+        "lanes": list(selected_lane_ids),
         "sampler": {
             "temperature": temperature,
             "draft_temperature": temperature,
@@ -833,7 +884,11 @@ def run(args: argparse.Namespace) -> int:
         _validated_parent_guard_scope(lock_scope)
         model_hashes = gate._model_artifact_hashes(args.model)
         for context_tokens in contexts:
-            order = PAIRED_ORDER if args.workload == "vanity" else order_for_context(context_tokens)
+            order = (
+                _paired_order(tuple(args.lanes))
+                if args.workload == "vanity"
+                else order_for_context(context_tokens, tuple(args.lanes))
+            )
             context_root = args.output_root / f"{args.workload}-{context_tokens}"
             context_root.mkdir(parents=True, exist_ok=True)
             receipts: list[dict[str, Any]] = []
@@ -904,7 +959,12 @@ def run(args: argparse.Namespace) -> int:
             })
             (args.output_root / "index.json").write_text(
                 json.dumps({
-                    "kind": "qwen38_native_mtp_four_lane_campaign",
+                    "kind": (
+                        "qwen38_native_mtp_four_lane_campaign"
+                        if tuple(args.lanes) == LANE_IDS
+                        else "qwen38_native_mtp_selected_lane_campaign"
+                    ),
+                    "lanes": list(args.lanes),
                     "completed": completed,
                 }, indent=2, sort_keys=True, allow_nan=False) + "\n",
                 encoding="utf-8",
@@ -916,6 +976,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", choices=("vanity", "low", "xhigh"), required=True)
     parser.add_argument("--contexts", nargs="+", type=int, default=list(CONTEXT_TOKENS))
+    parser.add_argument("--lanes", nargs="+", choices=LANE_IDS, default=list(LANE_IDS))
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--candidate-root", type=Path, default=ROOT)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
@@ -928,6 +989,7 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.workload != "vanity" and any(value not in CONTEXT_TOKENS for value in args.contexts):
         raise ValueError(f"contexts must be selected from {CONTEXT_TOKENS}")
+    _selected_lanes(tuple(args.lanes))
     return args
 
 
