@@ -271,6 +271,45 @@ def test_full_fixed_receipt_requires_bf16_kernels_features_and_no_policy() -> No
     )
 
 
+def test_adaptive_receipts_require_the_exact_shared_stack_and_q4_delta() -> None:
+    matrix = _module()
+    shared_features = {
+        key: {"active": True}
+        for key in matrix.BF16_OPTIMIZED_FEATURE_KEYS
+    }
+    bf16 = {
+        "route_id": matrix.FULL_ADAPTIVE_NATIVE_ROUTE,
+        "installed_route_id": matrix.BF16_OPTIMIZED_INSTALLED_ROUTE_ID,
+        "kernel_ids": list(matrix.BF16_OPTIMIZED_KERNEL_IDS),
+        "feature_receipt": shared_features,
+    }
+
+    assert matrix.adaptive_optimized_receipt_errors(
+        bf16, expected_route=matrix.FULL_ADAPTIVE_NATIVE_ROUTE
+    ) == []
+    bf16["kernel_ids"] = list(matrix.BF16_OPTIMIZED_KERNEL_IDS[:-1])
+    assert "adaptive BF16 kernel stack mismatch" in matrix.adaptive_optimized_receipt_errors(
+        bf16, expected_route=matrix.FULL_ADAPTIVE_NATIVE_ROUTE
+    )
+
+    q4 = {
+        "route_id": matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
+        "installed_route_id": matrix.Q4_OPTIMIZED_INSTALLED_ROUTE_ID,
+        "kernel_ids": list(matrix.Q4_OPTIMIZED_KERNEL_IDS),
+        "feature_receipt": {
+            **shared_features,
+            "r28_q4_mtp_block": {"active": True},
+        },
+    }
+    assert matrix.adaptive_optimized_receipt_errors(
+        q4, expected_route=matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
+    ) == []
+    del q4["feature_receipt"]["r28_q4_mtp_block"]
+    assert "adaptive Q4 MTP block is inactive" in matrix.adaptive_optimized_receipt_errors(
+        q4, expected_route=matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
+    )
+
+
 def test_arm_policy_contract_distinguishes_fixed_from_adaptive() -> None:
     matrix = _module()
     arm = _arm_module()
@@ -606,12 +645,14 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
         "context_artifact_sha256": matrix.PYTHON_CONTEXT_SHA256,
         "row28_artifact_sha256": matrix.ROW28_ARTIFACT_SHA256,
         "source_rows": [8, 10, 18, 20, 21, 24, 26, 48, 50, 61, 11],
-        "kernel_ids": ["row21", "row61"],
+        "installed_route_id": matrix.BF16_OPTIMIZED_INSTALLED_ROUTE_ID,
+        "kernel_ids": list(matrix.BF16_OPTIMIZED_KERNEL_IDS),
         "feature_receipt": {
             key: {"active": True}
             for key in (
                 "r10_compact_vocab",
                 "r18_gdn_decay_memo",
+                "r20_kv_only_history",
                 "r21_qk_rms_rope",
                 "r24_eval_ladder",
                 "r26_prefill_ladder_3",
@@ -674,7 +715,7 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
         context_tokens=16_384,
         output_tokens=1_024,
     )
-    receipt["kernel_ids"] = ["row21", "row61"]
+    receipt["kernel_ids"] = list(matrix.BF16_OPTIMIZED_KERNEL_IDS)
     receipt["model_artifact_hashes"] = {}
     assert "model artifact attestation is missing" in matrix.receipt_errors(
         receipt,
@@ -837,12 +878,14 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
         "context_artifact_sha256": matrix.PYTHON_CONTEXT_SHA256,
         "row28_artifact_sha256": matrix.ROW28_ARTIFACT_SHA256,
         "source_rows": [8, 10, 18, 20, 21, 24, 26, 48, 50, 61, 11],
-        "kernel_ids": ["engaged"],
+        "installed_route_id": matrix.BF16_OPTIMIZED_INSTALLED_ROUTE_ID,
+        "kernel_ids": list(matrix.BF16_OPTIMIZED_KERNEL_IDS),
         "feature_receipt": {
             key: {"active": True}
             for key in (
                 "r10_compact_vocab",
                 "r18_gdn_decay_memo",
+                "r20_kv_only_history",
                 "r21_qk_rms_rope",
                 "r24_eval_ladder",
                 "r26_prefill_ladder_3",

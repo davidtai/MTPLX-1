@@ -75,6 +75,13 @@ BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
     "r24_eval_ladder+r26_prefill_ladder_3+r48_boundary_fused+"
     "r50_wired_residency+dual_norm+r10_compact_vocab"
 )
+Q4_OPTIMIZED_KERNEL_IDS = (
+    "qwen38_row28_q4_g64_mtp_block_v1",
+    *BF16_OPTIMIZED_KERNEL_IDS,
+)
+Q4_OPTIMIZED_INSTALLED_ROUTE_ID = (
+    "r17_q4_mtp_block+r28_q4_mtp_block+" + BF16_OPTIMIZED_INSTALLED_ROUTE_ID
+)
 ONE_PASS_ORDER = LANE_IDS
 CONTEXT_TOKENS = (1_024, 16_384, 65_536, 131_072)
 CONDITIONER_OUTPUT_TOKENS = 1_024
@@ -299,6 +306,47 @@ def full_fixed_receipt_errors(
     return errors
 
 
+def adaptive_optimized_receipt_errors(
+    receipt: dict[str, Any], *, expected_route: str
+) -> list[str]:
+    errors: list[str] = []
+    features = gate._validate_route_id(expected_route)
+    if "r11_position_ema" not in features or receipt.get("route_id") != expected_route:
+        errors.append("adaptive route is not the requested optimized route")
+        return errors
+
+    uses_q4 = "r28_q4_mtp_block" in features
+    expected_installed = (
+        Q4_OPTIMIZED_INSTALLED_ROUTE_ID
+        if uses_q4
+        else BF16_OPTIMIZED_INSTALLED_ROUTE_ID
+    )
+    if receipt.get("installed_route_id") != expected_installed:
+        errors.append(
+            f"adaptive {'Q4' if uses_q4 else 'BF16'} installed route mismatch"
+        )
+
+    expected_kernels = Q4_OPTIMIZED_KERNEL_IDS if uses_q4 else BF16_OPTIMIZED_KERNEL_IDS
+    if tuple(receipt.get("kernel_ids") or ()) != expected_kernels:
+        errors.append(f"adaptive {'Q4' if uses_q4 else 'BF16'} kernel stack mismatch")
+
+    feature_receipt = receipt.get("feature_receipt") or {}
+    if any(
+        not _feature_is_active(feature_receipt.get(key))
+        for key in BF16_OPTIMIZED_FEATURE_KEYS
+    ):
+        errors.append("adaptive shared feature stack is incomplete")
+    if uses_q4:
+        if not _feature_is_active(feature_receipt.get("r28_q4_mtp_block")):
+            errors.append("adaptive Q4 MTP block is inactive")
+    elif any(
+        key in feature_receipt
+        for key in ("r17_q4_mtp_block", "r28_q4_mtp_block", "r36_qkv_islands")
+    ):
+        errors.append("adaptive BF16 unexpectedly installed a Q4 MTP block")
+    return errors
+
+
 def receipt_errors(
     receipt: dict[str, Any],
     *,
@@ -411,6 +459,12 @@ def receipt_errors(
         if is_full_fixed:
             errors.extend(
                 full_fixed_receipt_errors(receipt, expected_route=lane.route_id)
+            )
+        elif is_adaptive:
+            errors.extend(
+                adaptive_optimized_receipt_errors(
+                    receipt, expected_route=lane.route_id
+                )
             )
         if records_depth and receipt.get("depth_usage") is None:
             errors.append("128K adaptive arm is missing depth usage")
