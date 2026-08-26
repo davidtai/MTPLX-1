@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 800" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3.8 native MTP decode throughput across four fixed and adaptive lanes</title>
+  <desc id="desc">Grouped bar chart at 1024, 16384, 65536, and 131072 prompt tokens. Historical PR 335 fixed K3 values are 59.33, 54.57, 42.04, and 34.01 tokens per second. Current fixed K3 values are 65.38, 53.44, 40.46, and 32.70. Adaptive BF16 values are 63.47, 51.60, 40.40, and 31.78. Adaptive Q4 values are 62.85, 56.01, 44.77, and 37.61.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#070b12"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000000" flood-opacity="0.32"/>
+    </filter>
+  </defs>
+
+  <rect width="1400" height="800" rx="24" fill="url(#background)"/>
+
+  <text x="80" y="58" fill="#f8fafc" font-family="Inter, system-ui, sans-serif" font-size="32" font-weight="750">
+    Qwen3.8 native MTP decode throughput
+  </text>
+  <text x="80" y="91" fill="#94a3b8" font-family="Inter, system-ui, sans-serif" font-size="17">
+    Exact 1,024 output tokens · historical PR #335 K3 vs current MLX/Metal 0.32.2 lanes
+  </text>
+
+  <g transform="translate(270 118)" font-family="Inter, system-ui, sans-serif" font-size="14">
+    <rect x="0" y="0" width="22" height="15" rx="3" fill="#94a3b8"/>
+    <text x="30" y="13" fill="#cbd5e1">PR #335 fixed K3</text>
+    <rect x="190" y="0" width="22" height="15" rx="3" fill="#60a5fa"/>
+    <text x="220" y="13" fill="#cbd5e1">Current fixed K3</text>
+    <rect x="390" y="0" width="22" height="15" rx="3" fill="#fbbf24"/>
+    <text x="420" y="13" fill="#cbd5e1">Adaptive BF16</text>
+    <rect x="560" y="0" width="22" height="15" rx="3" fill="#34d399"/>
+    <text x="590" y="13" fill="#cbd5e1">Adaptive Q4</text>
+  </g>
+
+  <!-- Plot grid: 0 to 70 decode tok/s. -->
+  <g stroke="#334155" stroke-width="1">
+    <line x1="120" y1="165" x2="1320" y2="165" opacity="0.55"/>
+    <line x1="120" y1="230" x2="1320" y2="230" opacity="0.45"/>
+    <line x1="120" y1="295" x2="1320" y2="295" opacity="0.45"/>
+    <line x1="120" y1="360" x2="1320" y2="360" opacity="0.45"/>
+    <line x1="120" y1="425" x2="1320" y2="425" opacity="0.45"/>
+    <line x1="120" y1="490" x2="1320" y2="490" opacity="0.45"/>
+    <line x1="120" y1="555" x2="1320" y2="555" opacity="0.45"/>
+    <line x1="120" y1="620" x2="1320" y2="620" opacity="0.8"/>
+  </g>
+  <g fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" text-anchor="end">
+    <text x="105" y="170">70</text>
+    <text x="105" y="235">60</text>
+    <text x="105" y="300">50</text>
+    <text x="105" y="365">40</text>
+    <text x="105" y="430">30</text>
+    <text x="105" y="495">20</text>
+    <text x="105" y="560">10</text>
+    <text x="105" y="625">0</text>
+  </g>
+  <text x="34" y="392" transform="rotate(-90 34 392)" fill="#94a3b8" font-family="Inter, system-ui, sans-serif" font-size="16" text-anchor="middle">
+    Decode tokens per second
+  </text>
+
+  <!-- 1,024 tokens. -->
+  <g filter="url(#shadow)">
+    <rect x="155" y="234.36" width="45" height="385.64" rx="6" fill="#94a3b8"/>
+    <rect x="208" y="194.99" width="45" height="425.01" rx="6" fill="#60a5fa"/>
+    <rect x="261" y="207.45" width="45" height="412.55" rx="6" fill="#fbbf24"/>
+    <rect x="314" y="211.46" width="45" height="408.54" rx="6" fill="#34d399"/>
+  </g>
+  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700" text-anchor="middle">
+    <text x="177.5" y="222">59.33</text>
+    <text x="230.5" y="183">65.38</text>
+    <text x="283.5" y="195">63.47</text>
+    <text x="336.5" y="199">62.85</text>
+  </g>
+
+  <!-- 16,384 tokens. -->
+  <g filter="url(#shadow)">
+    <rect x="435" y="265.30" width="45" height="354.70" rx="6" fill="#94a3b8"/>
+    <rect x="488" y="272.64" width="45" height="347.36" rx="6" fill="#60a5fa"/>
+    <rect x="541" y="284.60" width="45" height="335.40" rx="6" fill="#fbbf24"/>
+    <rect x="594" y="255.94" width="45" height="364.06" rx="6" fill="#34d399"/>
+  </g>
+  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700" text-anchor="middle">
+    <text x="457.5" y="253">54.57</text>
+    <text x="510.5" y="260">53.44</text>
+    <text x="563.5" y="272">51.60</text>
+    <text x="616.5" y="244">56.01</text>
+  </g>
+
+  <!-- 65,536 tokens. -->
+  <g filter="url(#shadow)">
+    <rect x="715" y="346.74" width="45" height="273.26" rx="6" fill="#94a3b8"/>
+    <rect x="768" y="357.01" width="45" height="262.99" rx="6" fill="#60a5fa"/>
+    <rect x="821" y="357.40" width="45" height="262.60" rx="6" fill="#fbbf24"/>
+    <rect x="874" y="329.00" width="45" height="291.00" rx="6" fill="#34d399"/>
+  </g>
+  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700" text-anchor="middle">
+    <text x="737.5" y="334">42.04</text>
+    <text x="790.5" y="345">40.46</text>
+    <text x="843.5" y="345">40.40</text>
+    <text x="896.5" y="317">44.77</text>
+  </g>
+
+  <!-- 131,072 tokens. -->
+  <g filter="url(#shadow)">
+    <rect x="995" y="398.94" width="45" height="221.06" rx="6" fill="#94a3b8"/>
+    <rect x="1048" y="407.45" width="45" height="212.55" rx="6" fill="#60a5fa"/>
+    <rect x="1101" y="413.43" width="45" height="206.57" rx="6" fill="#fbbf24"/>
+    <rect x="1154" y="375.54" width="45" height="244.46" rx="6" fill="#34d399"/>
+  </g>
+  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700" text-anchor="middle">
+    <text x="1017.5" y="387">34.01</text>
+    <text x="1070.5" y="395">32.70</text>
+    <text x="1123.5" y="401">31.78</text>
+    <text x="1176.5" y="363">37.61</text>
+  </g>
+
+  <g fill="#e2e8f0" font-family="Inter, system-ui, sans-serif" font-size="17" font-weight="650" text-anchor="middle">
+    <text x="257" y="658">1,024</text>
+    <text x="537" y="658">16,384</text>
+    <text x="817" y="658">65,536</text>
+    <text x="1097" y="658">131,072</text>
+  </g>
+  <g fill="#64748b" font-family="Inter, system-ui, sans-serif" font-size="13" text-anchor="middle">
+    <text x="257" y="681">prompt tokens</text>
+    <text x="537" y="681">prompt tokens</text>
+    <text x="817" y="681">prompt tokens</text>
+    <text x="1097" y="681">prompt tokens</text>
+  </g>
+
+  <text x="700" y="730" fill="#94a3b8" font-family="Inter, system-ui, sans-serif" font-size="14" text-anchor="middle">
+    PR #335 chart values are historical and not matched MLX 0.32.2 arms; raw throughput is shown without cross-run deltas.
+  </text>
+  <text x="700" y="758" fill="#64748b" font-family="Inter, system-ui, sans-serif" font-size="13" text-anchor="middle">
+    DFlash2 xhigh is a separate 1K-only failure reference: 25.55 decode tok/s, 642.484 s wall.
+  </text>
+</svg>

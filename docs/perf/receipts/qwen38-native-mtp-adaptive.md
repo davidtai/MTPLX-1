@@ -31,11 +31,15 @@ than the fixed-K3 control. Peak memory is the maximum observed arm in GiB.
 
 ## Exact 1,024-output matrix
 
+![Grouped bar chart of four native-MTP decode-throughput series at 1K, 16K, 64K, and 128K prompt contexts](../qwen38-native-mtp-four-series-decode-tps.svg)
+
 | Context | Candidate | Prefill tok/s | Decode tok/s | Wall (s) | Wall vs control | Peak GiB |
 |---:|---|---:|---:|---:|---:|---:|
+| 1K | PR #335 old fixed K3 | 768.02 | 59.33 | 18.634 | historical | 24.260 |
 | 1K | fixed K3 control | 836.68 | 65.38 | 16.923 | baseline | 21.375 |
 | 1K | adaptive | 712.55 | 63.47 | 17.603 | -3.86% | 21.375 |
 | 1K | q4 adaptive | 753.01 | 62.85 | 17.681 | -4.28% | 21.597 |
+| 16K | PR #335 initial unoptimized K3 | 754.03 | 51.80 | 42.006 | historical | 25.569 |
 | 16K | fixed K3 control | 823.11 | 53.44 | 39.481 | baseline | 23.469 |
 | 16K | adaptive | 822.76 | 51.60 | 40.167 | -1.71% | 23.469 |
 | 16K | q4 adaptive | 823.00 | 56.01 | 38.624 | +2.22% | 23.652 |
@@ -47,6 +51,11 @@ than the fixed-K3 control. Peak memory is the maximum observed arm in GiB.
 | 128K | q4 adaptive | 553.98 | 37.61 | 272.285 | +1.42% | 39.285 |
 
 ## Xhigh 16,384-output matrix
+
+> **DFlash2 xhigh failure reference — 1K prompt / 1K conditioner / 16K
+> output:** 788.00 prefill tok/s, **25.55 decode tok/s**, 642.484 s wall,
+> and 21.064 GiB peak. Decode throughput is 48.62% below current fixed K3
+> and 50.19% below adaptive Q4.
 
 | Context | Candidate | Prefill tok/s | Decode tok/s | Wall (s) | Wall vs control | Peak GiB |
 |---:|---|---:|---:|---:|---:|---:|
@@ -68,14 +77,25 @@ The Q4 adaptive candidate won all four xhigh wall-time rows. The BF16 adaptive
 candidate won only the single-pass 128K row and regressed the three paired
 rows, so this receipt does not support making BF16 adaptive the default.
 
-## Historical unoptimized native-MTP control from PR #335
+## Historical fixed-MTP K3 data from PR #335
 
-These raw decode-throughput points are copied from PR #335's published Native
-MTP versus DFlash2 chart. They are historical reference points, not matched
-arms in the MLX/Metal 0.32.2 matrix above, so no cross-table percentage is
-claimed.
+PR #335 contains two separate historical datasets. Its initial unoptimized
+fixed-K3 control is the row-3 `Optimized-Speed main` arm at commit
+`bd4421567f9e16ce957c6ef97708b072dcd73937` on MLX 0.32.0. That exact 16K /
+1,024-output ABBA control is included in the main table above. PR #335's two
+additional 1K / 1K ABBA brackets are also combined above as `old fixed K3`.
 
-| Prompt context | Native MTP decode tok/s |
+| PR #335 dataset | Context | Prefill tok/s | Decode tok/s | Wall (s) | Peak GiB |
+|---|---:|---:|---:|---:|---:|
+| Initial unoptimized fixed K3, row 3 | 16K | 754.031 | 51.803 | 42.006 | 25.569 |
+| Additional 1K / 1K ABBA combined | 1K | 768.02 | 59.33 | 18.634 | 24.260 |
+
+PR #335 separately published the following fixed-K3 decode chart. The chart
+does not bind its 16K/64K/128K points to the initial row-3 receipt, and its 16K
+value is 54.57 rather than 51.803, so these points remain a distinct series.
+Only decode throughput is available from the committed chart.
+
+| Chart prompt context | Fixed-K3 decode tok/s |
 |---:|---:|
 | 100 tokens | 107.58 |
 | 1K | 59.33 |
