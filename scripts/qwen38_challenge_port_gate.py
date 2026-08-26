@@ -1060,6 +1060,12 @@ def _run_arm(
         },
         "source_rows": list(options["source_rows"]),
         "draft_core": str(options["draft_core"]),
+        "adaptive_policy_state": str(options["adaptive_policy"]),
+        "mtp_block_identity": (
+            "bf16"
+            if options["mtp_block_variant"] is None
+            else f"q4-{options['mtp_block_variant']}"
+        ),
         "history_route_receipt": history_route_receipt,
         "wall_s": wall_s,
         "generated_tokens": int(stats.generated_tokens),
