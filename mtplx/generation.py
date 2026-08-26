@@ -35,7 +35,11 @@ from .adaptive import (
     ExpectedValueDepthPolicy,
     PositionEMADepthPolicy,
 )
-from .attention_context import attention_phase, model_forward_kind
+from .attention_context import (
+    attention_phase,
+    model_forward_kind,
+    request_prompt_tokens,
+)
 from .deepseek_v4_adaptive_width import (
     validate_installed_deepseek_v4_adaptive_width_policy,
 )
@@ -75,7 +79,7 @@ from .native_mlp import set_native_mlp_context
 from .loop_guard import LoopGuard, loop_guard_config_from_env
 from .thinking_guard import ThinkingGuard, ThinkingGuardConfig
 from .profiles import resolve_long_context_mtp_depth
-from .runtime import MTPLXRuntime
+from .runtime import MTPHistoryAppendRoute, MTPLXRuntime
 from .sampling import (
     SamplerConfig,
     SparseDistribution,
@@ -2293,6 +2297,7 @@ class PromptState:
     # matches[0] before generation may skip it on achievable-boundary
     # checks, so served truth is recorded where the restore succeeds.
     restore_served: dict = field(default_factory=dict)
+    mtp_history_append_route: MTPHistoryAppendRoute | None = None
 
 
 class PostcommitAbort(RuntimeError):
@@ -2411,6 +2416,7 @@ def _prefill_restored_prompt_suffix(
     gdn_boundary_sink: list[tuple[int, Any, Any]] | None = None,
     vision_splice: Any | None = None,
     stable_prefix_len: int | None = None,
+    history_route: MTPHistoryAppendRoute | None = None,
 ) -> tuple[Any, Any, float, float]:
     """Extend a restored SessionBank prefix without one giant suffix forward.
 
@@ -2530,16 +2536,18 @@ def _prefill_restored_prompt_suffix(
         nonlocal mtp_history_time
         if not use_committed_mtp or not token_ids:
             return
-        mtp_history_time += _append_mtp_history(
-            rt,
-            restored.mtp_history_cache,
-            hidden_states,
-            token_ids,
-            phase="prefill",
-            mtp_hidden_variant=mtp_hidden_variant,
-            force_eval=True,
-            input_embeddings=_history_window_embeddings(token_ids, window_start),
-        )
+        with request_prompt_tokens(tokens_total):
+            mtp_history_time += _append_mtp_history(
+                rt,
+                restored.mtp_history_cache,
+                hidden_states,
+                token_ids,
+                phase="prefill",
+                mtp_hidden_variant=mtp_hidden_variant,
+                force_eval=True,
+                input_embeddings=_history_window_embeddings(token_ids, window_start),
+                history_route=history_route,
+            )
         _check_postcommit_abort(abort_check)
 
     if use_committed_mtp and restored.hidden is not None:
@@ -2887,6 +2895,7 @@ def _restore_near_prefix_prompt_state(
     stable_prefix_len: int | None = None,
     matched_ceiling: int | None = None,
     vision_splice: Any | None = None,
+    history_route: MTPHistoryAppendRoute | None = None,
 ) -> PromptState | None:
     """matched_ceiling: hard cap on any candidate's matched length.
 
@@ -3264,6 +3273,7 @@ def _restore_near_prefix_prompt_state(
                 gdn_boundary_sink=suffix_boundary_sink,
                 stable_prefix_len=stable_prefix_len,
                 vision_splice=vision_splice,
+                history_route=history_route,
             )
         )
         entry.hits += 1
@@ -3671,6 +3681,11 @@ def restore_or_prefill_prompt_state(
         # the trunk cache — the prefix-reuse benefit AR turns actually use.
         # MTP-enabled runtimes keep their requested committed policy.
         mtp_history_policy = "cycle"
+    history_append_route = (
+        rt.bind_mtp_history_append_route(len(prompt_ids))
+        if rt.mtp_enabled
+        else None
+    )
     mtp_history_window_tokens = (
         _mtp_history_last_window_tokens() if mtp_history_policy == "last_window" else 0
     )
@@ -3782,6 +3797,7 @@ def restore_or_prefill_prompt_state(
             }
 
     def _emit_prefill_complete(state: PromptState) -> PromptState:
+        state.mtp_history_append_route = history_append_route
         _maybe_store_prefix_snapshot(state)
         if prefill_callback is None:
             return state
@@ -4042,6 +4058,7 @@ def restore_or_prefill_prompt_state(
                     gdn_boundary_sink=suffix_boundary_sink,
                     vision_splice=vision_splice,
                     stable_prefix_len=stable_prefix_len,
+                    history_route=history_append_route,
                 )
             )
             return _emit_prefill_complete(PromptState(
@@ -4091,6 +4108,7 @@ def restore_or_prefill_prompt_state(
                 vision_restore_spans[0][0] if vision_restore_spans else None
             ),
             vision_splice=vision_splice,
+            history_route=history_append_route,
         )
         if near_prompt_state is not None:
             return _emit_prefill_complete(near_prompt_state)
@@ -4136,6 +4154,7 @@ def restore_or_prefill_prompt_state(
                 vision_splice=vision_splice,
                 stable_prefix_len=stable_prefix_len,
                 gdn_boundary_sink=gdn_boundary_sink,
+                history_route=history_append_route,
             )
             prompt_eval_time = target_time + prompt_history_time
         else:
@@ -4180,20 +4199,23 @@ def restore_or_prefill_prompt_state(
                             vision_splice,
                             rows_before=rows_before,
                         )
-                prompt_history_time = _append_mtp_history(
-                    rt,
-                    mtp_history_cache,
-                    history_hidden,
-                    history_token_ids,
-                    phase="prefill",
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    position_offset=(
-                        mtp_history_position_base
-                        if mtp_position_mode == "absolute" or mtp_history_policy == "last_window"
-                        else None
-                    ),
-                    input_embeddings=history_embeddings,
-                )
+                with request_prompt_tokens(len(prompt_ids)):
+                    prompt_history_time = _append_mtp_history(
+                        rt,
+                        mtp_history_cache,
+                        history_hidden,
+                        history_token_ids,
+                        phase="prefill",
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        position_offset=(
+                            mtp_history_position_base
+                            if mtp_position_mode == "absolute"
+                            or mtp_history_policy == "last_window"
+                            else None
+                        ),
+                        input_embeddings=history_embeddings,
+                        history_route=history_append_route,
+                    )
                 prompt_eval_time += prompt_history_time
     else:
         # Only request hidden states from a runtime that can produce them.
@@ -4721,6 +4743,178 @@ def _device_draft_q_arrays(
     return top_idx, kept / kept.sum()
 
 
+def _map_compact_draft_ids(ids: mx.array, token_map: mx.array | None) -> mx.array:
+    """Map proposal-only vocabulary rows to target tokenizer IDs lazily."""
+
+    return ids if token_map is None else mx.take(token_map, ids.astype(mx.int32))
+
+
+def _map_compact_host_draft(
+    draft_token: int,
+    draft_q: np.ndarray | SparseDistribution | None,
+    *,
+    token_map: mx.array,
+    target_vocab_size: int,
+) -> tuple[int, SparseDistribution | None]:
+    """Map the one shortened final-cycle host draft into target token space."""
+    mapped_token_array = _map_compact_draft_ids(
+        mx.array([int(draft_token)], dtype=mx.int32),
+        token_map,
+    )
+    if draft_q is None:
+        _eval(mapped_token_array)
+        return int(mapped_token_array.item()), None
+    if not isinstance(draft_q, SparseDistribution):
+        raise RuntimeError("compact D1 host fallback requires a sparse distribution")
+    mapped_ids_array = _map_compact_draft_ids(
+        mx.array(draft_q.token_ids, dtype=mx.int32),
+        token_map,
+    )
+    _eval(mapped_token_array, mapped_ids_array)
+    mapped_q = SparseDistribution(
+        np.asarray(mapped_ids_array, dtype=np.int64).reshape(-1),
+        draft_q.probs,
+        int(target_vocab_size),
+    )
+    return int(mapped_token_array.item()), mapped_q
+
+
+def _require_compact_device_core(
+    *,
+    token_map: mx.array | None,
+    draft_core: str,
+    used_device_core: bool,
+    device_core_error: Exception | None,
+    ineligibility_reasons: tuple[str, ...],
+    allow_host_fallback: bool,
+) -> None:
+    """Fail closed for compact logits while retaining the device-core cause."""
+    if (
+        token_map is None
+        or draft_core != "device"
+        or used_device_core
+        or allow_host_fallback
+    ):
+        return
+    message = "compact draft vocabulary requires the device draft core"
+    if device_core_error is not None:
+        raise RuntimeError(message) from device_core_error
+    if ineligibility_reasons:
+        message += "; ineligible contract: " + ", ".join(ineligibility_reasons)
+    raise RuntimeError(message)
+
+
+@dataclass(frozen=True)
+class _CompactDeviceDraftBinding:
+    token_map: mx.array | None
+    target_vocab_size: int | None
+
+
+def _bind_compact_device_draft(
+    rt: MTPLXRuntime,
+    *,
+    draft_core: str,
+) -> _CompactDeviceDraftBinding:
+    """Resolve and validate compact-vocabulary metadata once per request."""
+
+    text = getattr(rt.model, "language_model", rt.model)
+    token_map = getattr(text, "_mtplx_draft_token_id_map", None)
+    target_vocab_size = getattr(text, "_mtplx_draft_target_vocab_size", None)
+    if token_map is None and target_vocab_size is None:
+        return _CompactDeviceDraftBinding(None, None)
+    if token_map is None or target_vocab_size is None:
+        raise RuntimeError("compact draft vocabulary metadata is incomplete")
+    if draft_core != "device":
+        raise RuntimeError("compact draft vocabulary requires the device draft core")
+    if int(getattr(token_map, "ndim", 0)) != 1 or int(target_vocab_size) <= 0:
+        raise RuntimeError("compact draft vocabulary metadata is invalid")
+    return _CompactDeviceDraftBinding(token_map, int(target_vocab_size))
+
+
+@contextmanager
+def _qwen38_stock_row21_route(rt: MTPLXRuntime, *, selected: bool):
+    """Select stock row-21 attention at a request/phase boundary."""
+    route = getattr(rt, "qwen38_route", None)
+    row21_installed = bool(
+        selected
+        and route is not None
+        and "qwen38_qk_rms_rope_bf16_h256_r64_v1" in route.kernel_ids
+    )
+    if not row21_installed:
+        yield
+        return
+    from .qwen38_challenge_kernels import configure_qwen38_row21_qk_rms_rope
+
+    configure_qwen38_row21_qk_rms_rope(rt.model, active=False)
+    try:
+        yield
+    finally:
+        configure_qwen38_row21_qk_rms_rope(rt.model, active=True)
+
+
+def _qwen38_prefill_uses_stock_row21(rt: MTPLXRuntime, prompt_tokens: int) -> bool:
+    receipt = getattr(rt, "qwen38_feature_receipt", {}) or {}
+    row24 = receipt.get("r24_qk_length_limit") or {}
+    limit = int(row24.get("max_length", 0))
+    return limit > 0 and int(prompt_tokens) > limit
+
+
+def _device_core_cycle_depth_eligible(cycle_depth: int) -> bool:
+    """The retained native Qwen 3.8 contract installs exact D1-D3 routes."""
+    return 1 <= int(cycle_depth) <= 3
+
+
+def _device_draft_route_depths(
+    *,
+    draft_core: str,
+    speculative_depth: int,
+    mtp_cache_policy: str,
+    mtp_history_policy: str,
+    draft_margin_threshold: float | None,
+    mtp_corrector: Any | None,
+    mtp_topk_reranker: Any | None,
+    adapter_ensemble_q: bool,
+    online_hidden_enabled: bool,
+    correction_cache_enabled: bool,
+    target_prefix_verify: bool,
+    draft_sampler: SamplerConfig,
+    adaptive_policy: Any | None,
+) -> tuple[int, ...]:
+    """Validate the invariant native-device contract once per request.
+
+    Adaptive policy state is deliberately not an eligibility input. It may
+    choose among the already validated logical depths, but cannot swap the
+    installed implementation or make an enabled device lane fall back.
+    """
+
+    del adaptive_policy
+    if draft_core != "device":
+        return ()
+    contract = (
+        ("depth_d1_d3", 1 <= int(speculative_depth) <= 3),
+        ("persistent_cache", mtp_cache_policy == "persistent"),
+        ("committed_history", _mtp_history_uses_committed_cache(mtp_history_policy)),
+        ("draft_margin", draft_margin_threshold is None),
+        ("mtp_corrector", mtp_corrector is None),
+        ("mtp_topk_reranker", mtp_topk_reranker is None),
+        ("adapter_ensemble", not adapter_ensemble_q),
+        ("online_hidden", not online_hidden_enabled),
+        ("correction_cache", not correction_cache_enabled),
+        ("target_prefix_verify", not target_prefix_verify),
+        (
+            "draft_sampler_topk",
+            draft_sampler.temperature <= 0
+            or 0 < draft_sampler.top_k <= _DEVICE_CORE_MAX_TOP_K,
+        ),
+    )
+    failed = tuple(name for name, valid in contract if not valid)
+    if failed:
+        raise ValueError(
+            "device draft route installation failed: " + ", ".join(failed)
+        )
+    return tuple(range(1, int(speculative_depth) + 1))
+
+
 def _device_core_state_tree(cache: Any) -> list[Any]:
     """State arrays the compiled draft chain reads and writes.
 
@@ -4778,18 +4972,21 @@ def _make_device_draft_core(
     mtp_cache: Any,
     draft_sampler: SamplerConfig,
     seed: int,
+    compact_binding: _CompactDeviceDraftBinding,
 ) -> dict[str, Any]:
     temperature = float(draft_sampler.temperature)
     top_k = int(draft_sampler.top_k)
     top_p = float(draft_sampler.top_p)
     greedy = temperature <= 0
+    token_map = compact_binding.token_map
+    target_vocab_size = compact_binding.target_vocab_size
 
-    base_offset = _mtp_cache_offset(mtp_cache)
     promoted, failures = promote_kv_cache_offsets(
         mtp_cache,
         reserve_tokens=depth + 2,
         initial_reserve_tokens=_DEVICE_CORE_HISTORY_RESERVE,
     )
+    base_offset = _mtp_cache_offset(mtp_cache)
     # Warm one forward per level so every module and cache view is built
     # before tracing, then trim the warm entries back off the live history.
     warm_hidden, warm_tok = hidden, token_ids
@@ -4802,10 +4999,17 @@ def _make_device_draft_core(
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_depth=level,
         )
-        warm_tok = mx.argmax(warm_logits[:, -1, :], axis=-1).reshape(1, 1)
+        warm_tok = _map_compact_draft_ids(
+            mx.argmax(warm_logits[:, -1, :], axis=-1),
+            token_map,
+        ).reshape(1, 1)
         warm_hidden = warm_h[:, -1:, :]
     _eval(warm_tok, warm_hidden)
-    vocab_size = int(warm_logits.shape[-1])
+    vocab_size = int(
+        target_vocab_size
+        if token_map is not None and target_vocab_size is not None
+        else warm_logits.shape[-1]
+    )
     _rollback_mtp_cache(mtp_cache, base_offset)
 
     def chain_fn(hidden_states, first_token_ids, level_keys):
@@ -4824,14 +5028,18 @@ def _make_device_draft_core(
             )
             row = logits_level[:, -1, :].reshape(-1)
             if greedy:
-                next_tok = mx.argmax(row, axis=-1).reshape(1, 1)
+                next_tok = _map_compact_draft_ids(
+                    mx.argmax(row, axis=-1),
+                    token_map,
+                ).reshape(1, 1)
             else:
-                top_idx, q_norm = _device_draft_q_arrays(
+                compact_idx, q_norm = _device_draft_q_arrays(
                     row,
                     temperature=temperature,
-                    top_k=min(top_k, vocab_size),
+                    top_k=min(top_k, int(row.shape[0])),
                     top_p=top_p,
                 )
+                top_idx = _map_compact_draft_ids(compact_idx, token_map)
                 cdf = mx.cumsum(q_norm, axis=-1)
                 u = mx.random.uniform(key=level_keys[level - 1])
                 pick = mx.minimum(
@@ -5033,6 +5241,7 @@ def _prefill_committed_mtp_history_streaming(
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
     prefill_chunk_size: int | None = None,
+    history_route: MTPHistoryAppendRoute | None = None,
 ):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
@@ -5201,23 +5410,25 @@ def _prefill_committed_mtp_history_streaming(
                             vision_splice,
                             rows_before=pad_prefix_counts[window_start],
                         )
-                prompt_history_time += _append_mtp_history(
-                    rt,
-                    mtp_history_cache,
-                    sliced_hidden,
-                    sliced_token_ids,
-                    phase="prefill",
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    position_offset=(
-                        token_start_index + slice_start
-                        if use_absolute_positions
-                        else token_start_index + slice_start - 1
-                        if history_window_tokens is not None
-                        else None
-                    ),
-                    force_eval=True,
-                    input_embeddings=history_embeddings,
-                )
+                with request_prompt_tokens(len(prompt_ids)):
+                    prompt_history_time += _append_mtp_history(
+                        rt,
+                        mtp_history_cache,
+                        sliced_hidden,
+                        sliced_token_ids,
+                        phase="prefill",
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        position_offset=(
+                            token_start_index + slice_start
+                            if use_absolute_positions
+                            else token_start_index + slice_start - 1
+                            if history_window_tokens is not None
+                            else None
+                        ),
+                        force_eval=True,
+                        input_embeddings=history_embeddings,
+                        history_route=history_route,
+                    )
                 _check_postcommit_abort(abort_check)
         cursor += chunk_len
         boundary_hidden = (
@@ -5435,6 +5646,7 @@ def _append_mtp_history(
     position_offset: int | None = None,
     force_eval: bool = False,
     input_embeddings: mx.array | None = None,
+    history_route: MTPHistoryAppendRoute | None = None,
 ) -> float:
     if not token_ids:
         return 0.0
@@ -5452,6 +5664,7 @@ def _append_mtp_history(
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=position_offset,
             input_embeddings=input_embeddings,
+            history_route=history_route,
         )
     if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
         return time.perf_counter() - started
@@ -7024,6 +7237,44 @@ def generate_mtpk(
     counter_start = _runtime_counter_snapshot(rt)
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
     online_hidden_enabled = online_hidden_corrector_alpha > 0.0
+    compact_device_binding = _bind_compact_device_draft(
+        rt,
+        draft_core=("stock" if exact_a3b_target_prefix else draft_core),
+    )
+    device_route_depths = _device_draft_route_depths(
+        draft_core=(
+            "stock" if exact_a3b_target_prefix else draft_core
+        ),
+        speculative_depth=speculative_depth,
+        mtp_cache_policy=mtp_cache_policy,
+        mtp_history_policy=mtp_history_policy,
+        draft_margin_threshold=draft_margin_threshold,
+        mtp_corrector=mtp_corrector,
+        mtp_topk_reranker=mtp_topk_reranker,
+        adapter_ensemble_q=adapter_ensemble_q,
+        online_hidden_enabled=online_hidden_enabled,
+        correction_cache_enabled=(online_correction_cache or prompt_correction_cache),
+        target_prefix_verify=target_prefix_verify,
+        draft_sampler=draft_sampler,
+        adaptive_policy=adaptive_policy,
+    )
+    if draft_core == "device-d2":
+        device_d2_contract = {
+            "fixed_depth_2": speculative_depth == 2,
+            "persistent_cache": mtp_cache_policy == "persistent",
+            "cycle_history": mtp_history_policy == "cycle",
+            "greedy_draft": draft_sampler.temperature <= 0,
+            "draft_margin": draft_margin_threshold is None,
+            "fixed_policy": adaptive_policy is None,
+            "mtp_corrector": mtp_corrector is None,
+            "online_hidden": not online_hidden_enabled,
+            "correction_cache": not online_correction_cache,
+        }
+        failed = [name for name, valid in device_d2_contract.items() if not valid]
+        if failed:
+            raise ValueError(
+                "device-d2 route installation failed: " + ", ".join(failed)
+            )
     online_hidden_max_feed_depth = (
         max(0, speculative_depth - 1)
         if online_hidden_corrector_max_feed_depth is None
@@ -7203,28 +7454,32 @@ def generate_mtpk(
     except (TypeError, ValueError):
         _stable_prefix_len = None
     _prompt_state_started = time.perf_counter()
-    prompt_state = restore_or_prefill_prompt_state(
+    with _qwen38_stock_row21_route(
         rt,
-        prompt_ids,
-        vision_splice=vision_splice,
-        base_hidden_variant=base_hidden_variant,
-        mtp_hidden_variant=mtp_hidden_variant,
-        mtp_history_policy=mtp_history_policy,
-        session_bank=session_bank,
-        restore_mode=session_restore_mode,
-        session_id=session_id,
-        template_hash=session_template_hash,
-        draft_head_identity=session_draft_head_identity,
-        policy_fingerprint=session_policy_fingerprint,
-        prefill_callback=prefill_callback,
-        # kvcache-v2: client disconnect aborts the prefill through the same
-        # chunk-granular check the postcommit path uses — an abandoned agent
-        # request must not pin the GPU for a full long-context prefill
-        # (measured: an orphaned ~200k prefill blocked all sessions for
-        # 10+ minutes, 2026-07-03).
-        abort_check=abort_check,
-        stable_prefix_len=_stable_prefix_len,
-    )
+        selected=_qwen38_prefill_uses_stock_row21(rt, len(prompt_ids)),
+    ):
+        prompt_state = restore_or_prefill_prompt_state(
+            rt,
+            prompt_ids,
+            vision_splice=vision_splice,
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            session_bank=session_bank,
+            restore_mode=session_restore_mode,
+            session_id=session_id,
+            template_hash=session_template_hash,
+            draft_head_identity=session_draft_head_identity,
+            policy_fingerprint=session_policy_fingerprint,
+            prefill_callback=prefill_callback,
+            # kvcache-v2: client disconnect aborts the prefill through the same
+            # chunk-granular check the postcommit path uses — an abandoned agent
+            # request must not pin the GPU for a full long-context prefill
+            # (measured: an orphaned ~200k prefill blocked all sessions for
+            # 10+ minutes, 2026-07-03).
+            abort_check=abort_check,
+            stable_prefix_len=_stable_prefix_len,
+        )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     pre_first_token_setup_started = time.perf_counter()
     pre_first_token_setup_s = 0.0
@@ -7459,6 +7714,9 @@ def generate_mtpk(
     ]
     deferred_correction_repairs = 0
     pending_primary: int | None = None
+    # A target-only adaptive cycle must not run the proposal head merely to
+    # maintain committed history. Retain those (hidden, token) transitions and
+    # fold the whole backlog into the next live proposal forward.
     serial_skip_history_hidden: list[mx.array] = []
     serial_skip_history_tokens: list[int] = []
     online_hidden_deltas: dict[object, mx.array] = {}
@@ -7499,7 +7757,7 @@ def generate_mtpk(
     compiled_k2_d2_core: dict[str, Any] | None = None
     a3b_m3_rebase0_state = None
     a3b_m3_rebase1_state = None
-    device_core: dict[str, Any] | None = None
+    device_core_routes: dict[int, dict[str, Any]] = {}
     device_core_compile_time = 0.0
     device_core_calls = 0
     device_core_fallbacks = 0
@@ -7783,16 +8041,18 @@ def generate_mtpk(
             mtp_history_materialize_every > 0
             and mtp_history_tokens_since_materialize >= mtp_history_materialize_every
         )
-        elapsed = _append_mtp_history(
-            rt,
-            mtp_cache,
-            hidden_states,
-            token_ids,
-            phase="ar_decode",
-            mtp_hidden_variant=mtp_hidden_variant,
-            position_offset=mtp_position_offset_for_cache(mtp_cache),
-            force_eval=force_eval,
-        )
+        with request_prompt_tokens(len(prompt_ids)):
+            elapsed = _append_mtp_history(
+                rt,
+                mtp_cache,
+                hidden_states,
+                token_ids,
+                phase="ar_decode",
+                mtp_hidden_variant=mtp_hidden_variant,
+                position_offset=mtp_position_offset_for_cache(mtp_cache),
+                force_eval=force_eval,
+                history_route=prompt_state.mtp_history_append_route,
+            )
         if force_eval:
             mtp_history_materialize_events += 1
             mtp_history_tokens_since_materialize = 0
@@ -7860,15 +8120,19 @@ def generate_mtpk(
             # The rebase replays the full prompt, so the splice queue
             # must rewind to serve the image rows again.
             vision_splice.reset()
-        rebased = restore_or_prefill_prompt_state(
+        with _qwen38_stock_row21_route(
             rt,
-            prefix_tokens,
-            vision_splice=vision_splice,
-            base_hidden_variant=base_hidden_variant,
-            mtp_hidden_variant=mtp_hidden_variant,
-            mtp_history_policy=mtp_history_policy,
-            session_bank=None,
-        )
+            selected=_qwen38_prefill_uses_stock_row21(rt, len(prefix_tokens)),
+        ):
+            rebased = restore_or_prefill_prompt_state(
+                rt,
+                prefix_tokens,
+                vision_splice=vision_splice,
+                base_hidden_variant=base_hidden_variant,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                session_bank=None,
+            )
         state_rebase_time_s += time.perf_counter() - started_rebase
         state_rebase_events += 1
         state_rebase_tokens_since = 0
@@ -7886,6 +8150,8 @@ def generate_mtpk(
         _batched_target_tokens = None
         mtp_history_cache = rebased.committed_mtp_cache
         trace_current_mtp_cache = mtp_history_cache
+        # The replay rebuilt committed MTP history through current_tokens, so
+        # deferred serial transitions are already represented in the new cache.
         serial_skip_history_hidden.clear()
         serial_skip_history_tokens.clear()
         target_time += max(
@@ -8199,6 +8465,7 @@ def generate_mtpk(
     ccopy_active = (
         context_copy_enabled()
         and not _penalties_active
+        and draft_core != "device"
         and (_ccopy_capture_lane or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict))
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
@@ -8235,6 +8502,27 @@ def generate_mtpk(
         # continuation predictiveness and can cost more to verify than they commit,
         # while grounded re-emission matches into the prompt (see the PR benchmarks).
         ccopy_index.sync(prompt_ids)
+    if device_route_depths:
+        if mtp_history_cache is None:
+            raise RuntimeError(
+                "device draft route installation requires a committed MTP cache"
+            )
+        compile_started = time.perf_counter()
+        bootstrap_primary = mx.argmax(logits[0], axis=-1).reshape(1, 1)
+        with _qwen38_stock_row21_route(rt, selected=True):
+            for depth in device_route_depths:
+                device_core_routes[depth] = _make_device_draft_core(
+                    rt,
+                    hidden,
+                    bootstrap_primary,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    depth=depth,
+                    mtp_cache=mtp_history_cache,
+                    draft_sampler=draft_sampler,
+                    seed=int(seed) + depth,
+                    compact_binding=compact_device_binding,
+                )
+        device_core_compile_time = time.perf_counter() - compile_started
     # Close the pre-first-token setup span here: everything from the
     # restore/prefill return to this point (prompt-prefix bank commit,
     # graphbank/policy/sampler construction) is setup wall time that
@@ -8247,12 +8535,6 @@ def generate_mtpk(
     # (first observe gets the span since loop entry, later ones the span
     # since the previous observe) — real cycle cost, not inter-request gaps.
     _policy_cycle_started = time.perf_counter()
-    minimum_planned_depth = (
-        0
-        if adaptive_policy is not None
-        and getattr(adaptive_policy, "allows_depth_zero", False)
-        else 1
-    )
     # Long-context fence for the trio defaults (#313/#315c1/#318): decided
     # once per request from the prompt length, stamped through to graphbank
     # for the paged-offsets read. Receipts in _trio_max_context's docstring.
@@ -8408,6 +8690,12 @@ def generate_mtpk(
                 if len(tokens) >= late_depth_switch_after
                 else late_depth_before
             )
+        minimum_planned_depth = (
+            0
+            if adaptive_policy is not None
+            and getattr(adaptive_policy, "allows_depth_zero", False)
+            else 1
+        )
         planned_depth = max(
             minimum_planned_depth,
             min(int(planned_depth), int(speculative_depth)),
@@ -8471,6 +8759,9 @@ def generate_mtpk(
         step += 1
         if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
             if capture_final_state and planned_depth == 0:
+                # The response already owns this token, but the serial D0 path
+                # has not advanced either cache. Reuse the final pending-token
+                # commit so SessionBank never stores an epoch ahead of state.
                 pending_primary = int(primary)
             append_event(event)
             emit_trace()
@@ -8523,9 +8814,13 @@ def generate_mtpk(
             mtp_cache = mtp_history_cache
             if serial_skip_history_tokens:
                 assert mtp_cache is not None
+                backlog_hidden = mx.concatenate(
+                    serial_skip_history_hidden,
+                    axis=1,
+                )
                 draft_time += append_mtp_history(
                     mtp_cache,
-                    mx.concatenate(serial_skip_history_hidden, axis=1),
+                    backlog_hidden,
                     serial_skip_history_tokens,
                 )
                 serial_skip_history_hidden.clear()
@@ -8857,66 +9152,60 @@ def generate_mtpk(
             and not online_correction_cache
         )
         if device_d2_eligible:
-            try:
-                if device_d2_core is None:
-                    compile_started = time.perf_counter()
-                    device_d2_core = _make_device_d2_draft_core(
-                        rt,
-                        draft_hidden,
-                        mx.array([[primary]]),
-                        mtp_hidden_variant=mtp_hidden_variant,
-                    )
-                    elapsed_compile = time.perf_counter() - compile_started
-                    device_d2_compile_time += elapsed_compile
-                    draft_time += elapsed_compile
-                    _add_timing(event, "draft_core_compile", elapsed_compile)
-                    event["draft_core_compile"] = {
-                        "kind": "device-d2",
-                        "mtp_cache_promoted": int(device_d2_core["promoted"]),
-                        "promotion_failures": dict(
-                            device_d2_core["promotion_failures"]
-                        ),
-                    }
-                started = time.perf_counter()
-                draft_tokens = _run_device_d2_draft_core(
-                    device_d2_core,
+            if device_d2_core is None:
+                compile_started = time.perf_counter()
+                device_d2_core = _make_device_d2_draft_core(
+                    rt,
                     draft_hidden,
-                    int(primary),
+                    mx.array([[primary]]),
+                    mtp_hidden_variant=mtp_hidden_variant,
                 )
-                elapsed_draft = time.perf_counter() - started
-                draft_time += elapsed_draft
-                device_d2_calls += 1
-                used_device_d2_core = True
-                for depth_index, draft_token in enumerate(draft_tokens):
-                    draft_probs.append(
-                        SparseDistribution.one_hot(
-                            draft_token,
-                            int(logits.shape[-1]),
-                        )
-                        if sampler.temperature > 0
-                        else None
+                elapsed_compile = time.perf_counter() - compile_started
+                device_d2_compile_time += elapsed_compile
+                draft_time += elapsed_compile
+                _add_timing(event, "draft_core_compile", elapsed_compile)
+                event["draft_core_compile"] = {
+                    "kind": "device-d2",
+                    "mtp_cache_promoted": int(device_d2_core["promoted"]),
+                    "promotion_failures": dict(
+                        device_d2_core["promotion_failures"]
+                    ),
+                }
+            started = time.perf_counter()
+            draft_tokens = _run_device_d2_draft_core(
+                device_d2_core,
+                draft_hidden,
+                int(primary),
+            )
+            elapsed_draft = time.perf_counter() - started
+            draft_time += elapsed_draft
+            device_d2_calls += 1
+            used_device_d2_core = True
+            for depth_index, draft_token in enumerate(draft_tokens):
+                draft_probs.append(
+                    SparseDistribution.one_hot(
+                        draft_token,
+                        int(logits.shape[-1]),
                     )
-                    drafted += 1
-                    drafted_by_depth[depth_index] += 1
-                    event["drafts"].append(
-                        {
-                            "depth": depth_index + 1,
-                            "token": int(draft_token),
-                            "timing_s": {
-                                "draft": elapsed_draft
-                                if depth_index == len(draft_tokens) - 1
-                                else 0.0,
-                            },
-                            "mtp_corrector": None,
-                            "draft_core": "device-d2",
-                        }
-                    )
-                next_token = draft_tokens[-1]
-            except Exception as exc:
-                device_d2_fallbacks += 1
-                event["draft_core_error"] = repr(exc)
-                used_device_d2_core = False
-
+                    if sampler.temperature > 0
+                    else None
+                )
+                drafted += 1
+                drafted_by_depth[depth_index] += 1
+                event["drafts"].append(
+                    {
+                        "depth": depth_index + 1,
+                        "token": int(draft_token),
+                        "timing_s": {
+                            "draft": elapsed_draft
+                            if depth_index == len(draft_tokens) - 1
+                            else 0.0,
+                        },
+                        "mtp_corrector": None,
+                        "draft_core": "device-d2",
+                    }
+                )
+            next_token = draft_tokens[-1]
         if not used_device_d2_core:
             if draft_core == "device-d2" and not device_d2_eligible:
                 device_d2_fallbacks += 1
@@ -8983,119 +9272,39 @@ def generate_mtpk(
                 }
             )
         elif not used_device_core and draft_core == "device":
-            device_core_eligible = (
-                2 <= cycle_depth <= 5
-                and cycle_depth == speculative_depth
-                and mtp_cache is not None
-                and _mtp_history_uses_committed_cache(mtp_history_policy)
-                and draft_margin_threshold is None
-                and adaptive_policy is None
-                and mtp_corrector is None
-                and mtp_topk_reranker is None
-                and not adapter_ensemble_q
-                and not online_hidden_enabled
-                and not correction_cache_enabled
-                and not target_prefix_verify
-                and (
-                    draft_sampler.temperature <= 0
-                    or 0 < draft_sampler.top_k <= _DEVICE_CORE_MAX_TOP_K
-                )
+            device_core = device_core_routes[cycle_depth]
+            started = time.perf_counter()
+            core_tokens, core_qs = _run_device_draft_core(
+                device_core,
+                draft_hidden,
+                int(primary),
+                seed=int(rng.integers(0, 2**31 - 1)),
             )
-            if device_core_eligible:
-                try:
-                    live_signature = _device_core_state_signature(mtp_cache)
-                    core_current = (
-                        device_core is not None
-                        and int(device_core["depth"]) == int(cycle_depth)
-                        and device_core["state_signature"] == live_signature
-                    )
-                    if (
-                        not core_current
-                        and device_core is not None
-                        and os.environ.get("MTPLX_DEVICE_CORE_DEBUG")
-                    ):
-                        stored = device_core["state_signature"]
-                        diffs = [
-                            (i, stored[i] if i < len(stored) else None,
-                             live_signature[i] if i < len(live_signature) else None)
-                            for i in range(max(len(stored), len(live_signature)))
-                            if (stored[i] if i < len(stored) else None)
-                            != (live_signature[i] if i < len(live_signature) else None)
-                        ]
-                        print(
-                            f"[device-core] signature diff ({len(diffs)} leaves): "
-                            f"{diffs[:4]}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    if not core_current:
-                        compile_started = time.perf_counter()
-                        device_core = _make_device_draft_core(
-                            rt,
-                            draft_hidden,
-                            mx.array([[primary]]),
-                            mtp_hidden_variant=mtp_hidden_variant,
-                            depth=cycle_depth,
-                            mtp_cache=mtp_cache,
-                            draft_sampler=draft_sampler,
-                            seed=int(rng.integers(0, 2**31 - 1)),
-                        )
-                        elapsed_compile = time.perf_counter() - compile_started
-                        device_core_compile_time += elapsed_compile
-                        draft_time += elapsed_compile
-                        _add_timing(event, "draft_core_compile", elapsed_compile)
-                        event["draft_core_compile"] = {
-                            "kind": "device",
-                            "depth": int(cycle_depth),
-                            "mtp_cache_promoted": int(device_core["promoted"]),
-                            "promotion_failures": dict(
-                                device_core["promotion_failures"]
-                            ),
-                        }
-                    started = time.perf_counter()
-                    core_tokens, core_qs = _run_device_draft_core(
-                        device_core,
-                        draft_hidden,
-                        int(primary),
-                        seed=int(rng.integers(0, 2**31 - 1)),
-                    )
-                    elapsed_draft = time.perf_counter() - started
-                    draft_time += elapsed_draft
-                    device_core_calls += 1
-                    draft_tokens = list(core_tokens)
-                    for depth_index, (draft_token, draft_q) in enumerate(
-                        zip(core_tokens, core_qs)
-                    ):
-                        draft_probs.append(
-                            draft_q if sampler.temperature > 0 else None
-                        )
-                        drafted += 1
-                        drafted_by_depth[depth_index] += 1
-                        event["drafts"].append(
-                            {
-                                "depth": depth_index + 1,
-                                "token": int(draft_token),
-                                "timing_s": {
-                                    "draft": elapsed_draft
-                                    if depth_index == len(core_tokens) - 1
-                                    else 0.0,
-                                },
-                                "mtp_corrector": None,
-                                "draft_core": "device",
-                            }
-                        )
-                    next_token = draft_tokens[-1]
-                    used_device_core = True
-                except Exception as exc:
-                    device_core_fallbacks += 1
-                    event["draft_core_error"] = repr(exc)
-                    used_device_core = False
-            else:
-                device_core_fallbacks += 1
-                event["draft_core_fallback"] = {
-                    "requested": "device",
-                    "reason": "ineligible_contract",
-                }
+            elapsed_draft = time.perf_counter() - started
+            draft_time += elapsed_draft
+            device_core_calls += 1
+            draft_tokens = list(core_tokens)
+            for depth_index, (draft_token, draft_q) in enumerate(
+                zip(core_tokens, core_qs)
+            ):
+                draft_probs.append(draft_q if sampler.temperature > 0 else None)
+                drafted += 1
+                drafted_by_depth[depth_index] += 1
+                event["drafts"].append(
+                    {
+                        "depth": depth_index + 1,
+                        "token": int(draft_token),
+                        "timing_s": {
+                            "draft": elapsed_draft
+                            if depth_index == len(core_tokens) - 1
+                            else 0.0,
+                        },
+                        "mtp_corrector": None,
+                        "draft_core": "device",
+                    }
+                )
+            next_token = draft_tokens[-1]
+            used_device_core = True
         # Greedy on-device draft chain (#313 port, default OFF pending our
         # ABBA): under double-greedy (draft AND target temp<=0) with the
         # persistent committed-history cache, the per-depth host round-trip
@@ -10796,34 +11005,23 @@ def generate_mtpk(
     # its own capture_final_state tail — F31).
     elapsed = time.perf_counter() - started_all
     final_state: GenerationFinalState | None = None
-    final_state_capture_failed = False
     if (
         capture_final_state
         and serial_skip_history_tokens
         and _mtp_history_uses_committed_cache(mtp_history_policy)
         and mtp_history_cache is not None
     ):
-        try:
-            commit_started = time.perf_counter()
-            draft_time += append_mtp_history(
-                mtp_history_cache,
-                mx.concatenate(serial_skip_history_hidden, axis=1),
-                serial_skip_history_tokens,
-            )
-            commit_time += time.perf_counter() - commit_started
-            serial_skip_history_hidden.clear()
-            serial_skip_history_tokens.clear()
-        except Exception as exc:  # capture only — never lose a finished response
-            final_state_capture_failed = True
-            events.append({"final_state_capture_error": str(exc)})
-            print(
-                f"[mtplx] MTP final-history flush failed ({exc}); response "
-                "preserved, session-bank commit skipped for this turn",
-                file=sys.stderr,
-            )
+        commit_started = time.perf_counter()
+        draft_time += append_mtp_history(
+            mtp_history_cache,
+            mx.concatenate(serial_skip_history_hidden, axis=1),
+            serial_skip_history_tokens,
+        )
+        commit_time += time.perf_counter() - commit_started
+        serial_skip_history_hidden.clear()
+        serial_skip_history_tokens.clear()
     if (
         capture_final_state
-        and not final_state_capture_failed
         and pending_primary is not None
         and tokens
         and repetition_result is None
@@ -10864,9 +11062,9 @@ def generate_mtpk(
             maybe_rebase_decode_state(len(tokens))
             maybe_eval_state_roots({"final_pending_commit": True}, len(tokens))
         except Exception as exc:  # capture only — never lose a finished response
-            # The completed response is untouched and final_state stays absent,
-            # so the session bank cannot commit a partially mutated cache.
-            final_state_capture_failed = True
+            # pending_primary stays set, so the final state below reports
+            # safe_to_commit=False and the bank refuses it; the completed
+            # response itself is untouched.
             events.append({"final_state_capture_error": str(exc)})
             print(
                 f"[mtplx] MTP final-pending commit failed ({exc}); response "
@@ -10913,7 +11111,7 @@ def generate_mtpk(
         or (constraint is not None and constraint.stopped)
         else "length"
     )
-    if capture_final_state and not final_state_capture_failed:
+    if capture_final_state:
         final_state = GenerationFinalState(
             final_trunk_cache=cache,
             final_logits=logits,

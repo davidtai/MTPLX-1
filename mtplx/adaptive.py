@@ -254,7 +254,16 @@ class ExpectedValueDepthPolicy:
 
 @dataclass
 class PositionEMADepthPolicy:
-    """Choose native-MTP depth from per-position acceptance estimates."""
+    """Per-position marginal-value schedule from challenge row 11.
+
+    ``position_accept_ema[i]`` estimates the conditional probability that
+    draft position ``i`` is accepted after every earlier position was
+    accepted. The chosen depth maximizes expected committed tokens per unit
+    cost using the source's greedy marginal test. Unlike MTPLX's older
+    adaptive controllers, this policy deliberately permits depth zero: when
+    even the first proposal cannot repay one head step, generation takes the
+    target-only serial path for that cycle.
+    """
 
     max_depth: int
     depth_cap: int = 4
@@ -309,7 +318,7 @@ class PositionEMADepthPolicy:
         return self.current_depth
 
     def observe_serial_skip(self) -> dict:
-        """Schedule a bounded D1 probe so a D0 decision is not absorbing."""
+        """Schedule a bounded D1 probe so a true D0 decision is not absorbing."""
 
         previous_depth = self.current_depth
         self._serial_skip_cycles += 1
@@ -341,8 +350,10 @@ class PositionEMADepthPolicy:
 
         if accepted < attempted:
             value = self.position_accept_ema[accepted]
-            self.position_accept_ema[accepted] = value * (1.0 - alpha)
+            self.position_accept_ema[accepted] = value + alpha * (0.0 - value)
         elif accepted < self.max_depth:
+            # A full round is positive evidence about the first unoffered
+            # position, allowing a hot chain to widen beyond its current cap.
             value = self.position_accept_ema[accepted]
             self.position_accept_ema[accepted] = value + alpha * (1.0 - value)
 

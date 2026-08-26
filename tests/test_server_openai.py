@@ -67,12 +67,33 @@ def test_server_binds_position_ema_to_validated_qwen38_native_mtp_d3():
         ]
     )
 
-    policy = _bind_qwen38_position_ema(args)(8)
+    factory = _bind_qwen38_position_ema(args)
+    policy = factory(8)
+
+    assert policy.max_depth == 3
+    assert policy.depth_cap == 3
+    assert policy.current_depth == 3
+
+
+def test_position_ema_policy_cannot_exceed_installed_native_depth() -> None:
+    args = openai.parse_args(
+        [
+            "--model",
+            "model",
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-position-depth-cap",
+            "8",
+        ]
+    )
+
+    factory = _bind_qwen38_position_ema(args)
+    policy = factory(3)
 
     assert isinstance(policy, PositionEMADepthPolicy)
     assert policy.max_depth == 3
     assert policy.depth_cap == 3
-    assert policy.current_depth == 3
+    assert factory(3) is not policy
 
 
 @pytest.mark.parametrize(
@@ -87,7 +108,7 @@ def test_server_binds_position_ema_to_validated_qwen38_native_mtp_d3():
 def test_position_ema_rejects_unvalidated_runtime_contracts(
     model_family, backend_id, runtime_mtp_enabled, mtp_depth_max
 ):
-    args = parse_args(["--model", "model", "--adaptive-policy", "position_ema"])
+    args = openai.parse_args(["--model", "model", "--adaptive-policy", "position_ema"])
 
     with pytest.raises(ValueError, match="position_ema"):
         openai._bind_adaptive_policy_factory(
@@ -100,7 +121,7 @@ def test_position_ema_rejects_unvalidated_runtime_contracts(
 
 
 def test_position_ema_honors_existing_adaptive_min_depth():
-    args = parse_args(
+    args = openai.parse_args(
         [
             "--model",
             "model",
@@ -120,8 +141,10 @@ def test_position_ema_honors_existing_adaptive_min_depth():
 
 
 def test_omitted_and_explicit_none_adaptive_policy_keep_fixed_depth() -> None:
-    omitted = parse_args(["--model", "model"])
-    explicit_none = parse_args(["--model", "model", "--adaptive-policy", "none"])
+    omitted = openai.parse_args(["--model", "model"])
+    explicit_none = openai.parse_args(
+        ["--model", "model", "--adaptive-policy", "none"]
+    )
 
     assert omitted.adaptive_policy == "none"
     assert explicit_none.adaptive_policy == "none"

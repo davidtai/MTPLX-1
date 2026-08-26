@@ -5919,7 +5919,9 @@ def test_serve_forwards_position_ema_without_changing_none_default(monkeypatch):
     assert "--adaptive-policy" not in commands[0]
     assert "--adaptive-policy" not in commands[1]
     assert commands[2][commands[2].index("--adaptive-policy") + 1] == "position_ema"
-    assert commands[2][commands[2].index("--adaptive-position-depth-cap") + 1] == "8"
+    assert (
+        commands[2][commands[2].index("--adaptive-position-depth-cap") + 1] == "8"
+    )
     assert commands[2][commands[2].index("--adaptive-min-depth") + 1] == "0"
 
 

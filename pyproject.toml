@@ -18,9 +18,11 @@ dependencies = [
   # the server) and mtplx.vision.processing imports PIL at module load, so
   # Pillow must be a base dependency, not a [server] extra (#103).
   "pillow>=10",
-  # Keep the MLX Python and Metal distributions on the same tested release.
+  # Pin 0.32.2 so the MLX Python and Metal distributions remain coupled.
+  # Earlier 0.32.0 exactness and performance receipts do not transfer across
+  # this runtime change: matched correctness and benchmark receipts must be
+  # re-established on 0.32.2 before making compatibility or performance claims.
   "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "mlx-metal==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name

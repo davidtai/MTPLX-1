@@ -43,16 +43,18 @@ def test_adaptive_policy_holds_on_late_reject():
     assert decision["next_depth"] == 4
 
 
-def test_position_ema_policy_matches_initial_schedule():
+def test_position_ema_policy_matches_row11_initial_schedule():
     policy = PositionEMADepthPolicy(max_depth=8, depth_cap=4)
 
+    # Source priors 0.85 * 0.98**i and h=0.20 clear every marginal gate
+    # through the row-11 hard cap, independent of the larger offered width.
     assert policy.current_depth == 4
     assert policy.position_accept_ema == [
         0.85 * (0.98**index) for index in range(8)
     ]
 
 
-def test_position_ema_policy_updates_observed_rejection_prefix():
+def test_position_ema_policy_updates_only_observed_rejection_prefix():
     policy = PositionEMADepthPolicy(max_depth=8, depth_cap=4)
     before = list(policy.position_accept_ema)
 
