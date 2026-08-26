@@ -503,6 +503,7 @@ def _run_one(
     top_p: float,
     top_k: int,
     row28_artifact: Path,
+    record_depth_usage: bool,
 ) -> dict[str, Any]:
     if route == CONTROL_ROUTE:
         return _run_control_arm(
@@ -542,7 +543,7 @@ def _run_one(
         row28_artifact_path=row28_artifact,
         row36_artifact_path=None,
     )
-    if result.get("draft_core") == "device":
+    if record_depth_usage and result.get("draft_core") == "device":
         result["depth_usage"] = depth_usage(
             generated_tokens=int(result["generated_tokens"]),
             verify_calls=int(result["verify_calls"]),
@@ -626,6 +627,7 @@ def run(args: argparse.Namespace) -> int:
         top_p=args.top_p,
         top_k=args.top_k,
         row28_artifact=row28_artifact,
+        record_depth_usage=False,
     )
     arm = _run_one(
         runtime,
@@ -640,6 +642,7 @@ def run(args: argparse.Namespace) -> int:
         top_p=args.top_p,
         top_k=args.top_k,
         row28_artifact=row28_artifact,
+        record_depth_usage=True,
     )
     _assert_imported_from_source("mtplx.generation", source_root)
     if args.route != CONTROL_ROUTE:
