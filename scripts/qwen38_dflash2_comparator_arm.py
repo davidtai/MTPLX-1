@@ -84,6 +84,9 @@ def main() -> int:
     receipt = json.loads(output.read_text(encoding="utf-8"))
     workload = _workload(upstream._parse_args())
     receipt["kind"] = "qwen38_dflash2_frozen_matrix_arm"
+    receipt["harness_commit"] = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
     receipt["workload"]["workload"] = workload
     receipt["workload"]["enable_thinking"] = workload == "xhigh"
     receipt["workload"]["prompt_format"] = {
