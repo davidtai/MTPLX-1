@@ -89,16 +89,7 @@ def build_prompt(
                 f"found {len(token_ids)}"
             )
         return str(tokenizer.decode(token_ids)), token_ids
-    if workload == "low":
-        tail_ids = list(tokenizer.encode("\n\n" + instruction.strip()))
-        context_budget = target_tokens - len(tail_ids)
-        if context_budget <= 0:
-            raise ValueError("instruction does not fit inside the low prompt budget")
-        token_ids = _filled_context_ids(tokenizer, context, context_budget) + tail_ids
-        if len(token_ids) != target_tokens:
-            raise RuntimeError("low prompt construction missed its exact token budget")
-        return str(tokenizer.decode(token_ids)), token_ids
-    if workload == "xhigh":
+    if workload in {"low", "xhigh"}:
         sentinel = "__MTPLX_QWEN38_CONTEXT_SENTINEL_7A6E7D0C__"
         rendered = str(
             tokenizer.apply_chat_template(
@@ -106,7 +97,7 @@ def build_prompt(
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=True,
-                reasoning_effort="xhigh",
+                reasoning_effort=workload,
             )
         )
         prefix, suffix = _split_template(rendered, sentinel)
@@ -115,7 +106,9 @@ def build_prompt(
         tail_ids = list(tokenizer.encode("\n\n" + instruction.strip()))
         context_budget = target_tokens - len(prefix_ids) - len(tail_ids) - len(suffix_ids)
         if context_budget <= 0:
-            raise ValueError("instruction and xhigh framing do not fit the prompt budget")
+            raise ValueError(
+                f"instruction and {workload} framing do not fit the prompt budget"
+            )
         token_ids = (
             prefix_ids
             + _filled_context_ids(tokenizer, context, context_budget)
@@ -123,7 +116,9 @@ def build_prompt(
             + suffix_ids
         )
         if len(token_ids) != target_tokens:
-            raise RuntimeError("xhigh prompt construction missed its exact token budget")
+            raise RuntimeError(
+                f"{workload} prompt construction missed its exact token budget"
+            )
         return str(tokenizer.decode(token_ids)), token_ids
     raise ValueError(f"unknown workload: {workload}")
 

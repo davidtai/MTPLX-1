@@ -88,10 +88,10 @@ def main() -> int:
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()
     receipt["workload"]["workload"] = workload
-    receipt["workload"]["enable_thinking"] = workload == "xhigh"
+    receipt["workload"]["enable_thinking"] = workload in {"low", "xhigh"}
     receipt["workload"]["prompt_format"] = {
         "vanity": "qwen_chat_template_non_thinking",
-        "low": "raw_non_thinking_python_context",
+        "low": "qwen_chat_template_thinking_low",
         "xhigh": "qwen_chat_template_thinking_xhigh",
     }[workload]
     receipt["workload"]["prompt_artifact_sha256"] = prompt_arm._sha256(

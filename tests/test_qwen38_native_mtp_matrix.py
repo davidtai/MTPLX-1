@@ -499,6 +499,8 @@ def test_arm_builds_exact_low_and_xhigh_prompt_budgets() -> None:
 
     assert len(low_ids) == 1_024
     assert len(xhigh_ids) == 16_384
+    assert tokenizer.template_calls[0]["enable_thinking"] is True
+    assert tokenizer.template_calls[0]["reasoning_effort"] == "low"
     assert tokenizer.template_calls[-1]["enable_thinking"] is True
     assert tokenizer.template_calls[-1]["reasoning_effort"] == "xhigh"
 
