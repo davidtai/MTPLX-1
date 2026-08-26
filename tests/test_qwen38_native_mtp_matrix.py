@@ -277,6 +277,21 @@ def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -
     )
     assert "--record-depth-usage" in command_128k
 
+    vanity_command = matrix.child_command(
+        lane=lane,
+        workload="vanity",
+        context_tokens=100,
+        output=tmp_path / "vanity.json",
+        model=tmp_path / "model",
+        prompt_file=tmp_path / "prompt.jsonl",
+        context_file=tmp_path / "context.py",
+        row28_artifact=tmp_path / "mtp.safetensors",
+        python=tmp_path / "python",
+        lock=tmp_path / "gpu.lock",
+    )
+    vanity_joined = " ".join(map(str, vanity_command))
+    assert "--warmup-tokens 0" in vanity_joined
+
 
 def test_campaign_rejects_dirty_sources_before_entering_gpu_window(
     monkeypatch, tmp_path: Path

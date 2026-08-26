@@ -625,21 +625,23 @@ def run(args: argparse.Namespace) -> int:
         raise RuntimeError("prompt token count changed after construction")
     prompt_token_sha256 = _token_hash(prompt_ids)
 
-    conditioner = _run_one(
-        runtime,
-        config,
-        model,
-        prompt_ids,
-        route=args.route,
-        max_tokens=args.warmup_tokens,
-        seed=args.seed,
-        target_temperature=args.target_temperature,
-        draft_temperature=args.draft_temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        row28_artifact=row28_artifact,
-        record_depth_usage=False,
-    )
+    conditioner = None
+    if args.warmup_tokens > 0:
+        conditioner = _run_one(
+            runtime,
+            config,
+            model,
+            prompt_ids,
+            route=args.route,
+            max_tokens=args.warmup_tokens,
+            seed=args.seed,
+            target_temperature=args.target_temperature,
+            draft_temperature=args.draft_temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            row28_artifact=row28_artifact,
+            record_depth_usage=False,
+        )
     arm = _run_one(
         runtime,
         config,
@@ -675,7 +677,9 @@ def run(args: argparse.Namespace) -> int:
         "prompt_artifact_sha256": _sha256(args.prompt_file),
         "context_artifact_sha256": _sha256(args.context_file),
         "conditioner_output_tokens": args.warmup_tokens,
-        "conditioner_generated_tokens": int(conditioner["generated_tokens"]),
+        "conditioner_generated_tokens": (
+            0 if conditioner is None else int(conditioner["generated_tokens"])
+        ),
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "sampler": {

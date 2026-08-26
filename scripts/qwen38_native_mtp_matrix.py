@@ -166,6 +166,7 @@ def child_command(
     lock: Path,
 ) -> list[str]:
     output_tokens, temperature, top_p, top_k = _workload_values(workload)
+    conditioner_tokens = 0 if workload == "vanity" else CONDITIONER_OUTPUT_TOKENS
     command = [
         str(python.absolute()),
         str(ARM_SCRIPT),
@@ -179,7 +180,7 @@ def child_command(
         "--context-file", str(context_file.resolve()),
         "--prompt-tokens", str(context_tokens),
         "--max-tokens", str(output_tokens),
-        "--warmup-tokens", str(CONDITIONER_OUTPUT_TOKENS),
+        "--warmup-tokens", str(conditioner_tokens),
         "--seed", "42",
         "--target-temperature", str(temperature),
         "--draft-temperature", str(temperature),
@@ -207,7 +208,9 @@ def receipt_errors(
         "source_commit": lane.source_commit,
         "route_id": lane.route_id,
         "prompt_tokens": context_tokens,
-        "conditioner_output_tokens": CONDITIONER_OUTPUT_TOKENS,
+        "conditioner_output_tokens": (
+            0 if receipt.get("workload") == "vanity" else CONDITIONER_OUTPUT_TOKENS
+        ),
         "max_tokens": output_tokens,
         "mlx_version": REQUIRED_MLX_VERSION,
         "mlx_metal_version": REQUIRED_MLX_METAL_VERSION,
@@ -503,7 +506,9 @@ def aggregate(
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "workload": workload,
         "context_tokens": context_tokens,
-        "conditioner_output_tokens": CONDITIONER_OUTPUT_TOKENS,
+        "conditioner_output_tokens": (
+            0 if workload == "vanity" else CONDITIONER_OUTPUT_TOKENS
+        ),
         "timed_output_tokens": output_tokens,
         "order": list(order),
         "sampler": {
