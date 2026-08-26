@@ -46,10 +46,9 @@ def test_full_adaptive_benchmark_routes_share_every_safe_retained_optimization()
     gate = _module()
 
     expected_shared = (
-        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
-        "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
-        "r26_prefill_ladder_3+r48_boundary_fused+r50_wired_residency+"
-        "r61_dual_norm_concat"
+        "r08_device_draft+r10_compact_vocab+r20_kv_only_history+"
+        "r21_qk_rms_rope+r24_eval_ladder+r26_prefill_ladder_3+"
+        "r50_wired_residency+r53_command_buffers+r61_dual_norm_concat"
     )
     assert gate.FULL_ADAPTIVE_SHARED_ROUTE == expected_shared
     assert gate.FULL_ADAPTIVE_NATIVE_ROUTE == expected_shared + "+r11_position_ema"
@@ -62,19 +61,19 @@ def test_full_adaptive_benchmark_routes_share_every_safe_retained_optimization()
     assert bf16["mtp_block_variant"] is None
     assert q4["mtp_block_variant"] == "r28"
     assert bf16["adaptive_policy"] == q4["adaptive_policy"] == "position_ema"
-    assert bf16["source_rows"] == (8, 10, 18, 20, 21, 24, 26, 48, 50, 61, 11)
-    assert q4["source_rows"] == (8, 10, 18, 20, 21, 24, 26, 28, 48, 50, 61, 11)
+    assert bf16["source_rows"] == (8, 10, 20, 21, 24, 26, 50, 53, 61, 11)
+    assert q4["source_rows"] == (8, 10, 20, 21, 24, 26, 28, 50, 53, 61, 11)
 
 
-def test_full_adaptive_benchmark_routes_exclude_faulting_command_buffer_profile() -> None:
+def test_full_adaptive_benchmark_routes_include_measured_command_buffer_profile() -> None:
     gate = _module()
 
     for route in (
         gate.FULL_ADAPTIVE_NATIVE_ROUTE,
         gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
     ):
-        assert "r53_command_buffers" not in route.split("+")
-        assert gate._route_execution_options(route)["row53_command_buffers"] is False
+        assert "r53_command_buffers" in route.split("+")
+        assert gate._route_execution_options(route)["row53_command_buffers"] is True
 
 
 def test_native_gate_has_no_rejected_source_artifact_flag() -> None:

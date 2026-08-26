@@ -48,32 +48,31 @@ PAIRED_ORDER = (
 )
 BF16_OPTIMIZED_KERNEL_IDS = (
     "qwen38_mtp_kv_only_history_ge16384_v1",
-    "qwen38_row18_gdn_neg_exp_a_log_memo_v1",
     "qwen38_qk_rms_rope_bf16_h256_r64_v1",
     "qwen38_row24_qk_rms_rope_l_le16_v1",
     "qwen38_row24_target_eval_ladder_v1",
     "qwen38_row26_prefill_eval_every3_v1",
     "qwen38_row26_qk_rms_rope_l_le32_v1",
-    "qwen38_row48_boundary_fused_residual_rmsnorm_v1",
     "qwen38_row50_post_warm_wired_residency_v1",
     "qwen38_dual_rms_norm_concat_bf16_v1",
     "qwen38_row10_compact_q4_g64_vocab_v1",
 )
 BF16_OPTIMIZED_FEATURE_KEYS = (
     "r10_compact_vocab",
-    "r18_gdn_decay_memo",
     "r20_kv_only_history",
     "r21_qk_rms_rope",
+    "r24_qk_length_limit",
     "r24_eval_ladder",
     "r26_prefill_ladder_3",
-    "r48_boundary_fused",
+    "r26_qk_length_limit",
     "r50_wired_residency",
+    "r53_command_buffers",
     "dual_norm",
 )
 BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
-    "kv_only_history+r18_gdn_decay_memo+r21_qk_rms_rope+"
-    "r24_eval_ladder+r26_prefill_ladder_3+r48_boundary_fused+"
-    "r50_wired_residency+dual_norm+r10_compact_vocab"
+    "kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
+    "r26_prefill_ladder_3+r50_wired_residency+dual_norm+"
+    "r10_compact_vocab"
 )
 Q4_OPTIMIZED_KERNEL_IDS = (
     "qwen38_row28_q4_g64_mtp_block_v1",
@@ -269,6 +268,8 @@ def full_fixed_receipt_errors(
     if kernel_ids != BF16_OPTIMIZED_KERNEL_IDS:
         errors.append("optimized fixed K3 BF16 kernel stack mismatch")
     features = receipt.get("feature_receipt") or {}
+    if set(features) != set(BF16_OPTIMIZED_FEATURE_KEYS):
+        errors.append("optimized fixed K3 feature receipt mismatch")
     if any(
         not _feature_is_active(features.get(key))
         for key in BF16_OPTIMIZED_FEATURE_KEYS
@@ -331,6 +332,11 @@ def adaptive_optimized_receipt_errors(
         errors.append(f"adaptive {'Q4' if uses_q4 else 'BF16'} kernel stack mismatch")
 
     feature_receipt = receipt.get("feature_receipt") or {}
+    expected_feature_keys = set(BF16_OPTIMIZED_FEATURE_KEYS)
+    if uses_q4:
+        expected_feature_keys.add("r28_q4_mtp_block")
+    if set(feature_receipt) != expected_feature_keys:
+        errors.append("adaptive feature receipt mismatch")
     if any(
         not _feature_is_active(feature_receipt.get(key))
         for key in BF16_OPTIMIZED_FEATURE_KEYS

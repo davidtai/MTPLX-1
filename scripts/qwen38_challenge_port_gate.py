@@ -51,10 +51,9 @@ MODEL_ARTIFACT_HASHES_ENV = "MTPLX_QWEN38_MODEL_ARTIFACT_HASHES"
 FIXED_NATIVE_ROUTE = "control"
 ADAPTIVE_NATIVE_ROUTE = "r11_position_ema"
 FULL_ADAPTIVE_SHARED_ROUTE = (
-    "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
-    "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
-    "r26_prefill_ladder_3+r48_boundary_fused+r50_wired_residency+"
-    "r61_dual_norm_concat"
+    "r08_device_draft+r10_compact_vocab+r20_kv_only_history+"
+    "r21_qk_rms_rope+r24_eval_ladder+r26_prefill_ladder_3+"
+    "r50_wired_residency+r53_command_buffers+r61_dual_norm_concat"
 )
 FULL_FIXED_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE
 FULL_ADAPTIVE_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
