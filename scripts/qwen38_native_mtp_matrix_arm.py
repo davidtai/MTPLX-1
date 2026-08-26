@@ -581,7 +581,7 @@ def run(args: argparse.Namespace) -> int:
     row28_hash = _sha256(row28_artifact)
 
     runtime, optimized_stack = _load_optimized_speed_stack(model)
-    for module_name in ("mtplx", "mtplx.runtime", "mtplx.generation"):
+    for module_name in ("mtplx", "mtplx.runtime"):
         _assert_imported_from_source(module_name, source_root)
     from mtplx.artifacts import load_config
 
@@ -627,6 +627,9 @@ def run(args: argparse.Namespace) -> int:
         top_k=args.top_k,
         row28_artifact=row28_artifact,
     )
+    _assert_imported_from_source("mtplx.generation", source_root)
+    if args.route != CONTROL_ROUTE:
+        _assert_imported_from_source("scripts.qwen38_challenge_port_gate", source_root)
     receipt = {
         "schema_version": 1,
         "kind": "qwen38_native_mtp_matrix_arm",
