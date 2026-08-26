@@ -279,17 +279,22 @@ def receipt_errors(
         if not receipt.get("kernel_ids"):
             errors.append("optimized route reported no installed kernels")
         errors.extend(gate._candidate_engagement_errors(lane.route_id, [], [receipt]))
-        try:
-            expected_usage = depth_usage(
-                generated_tokens=int(receipt["generated_tokens"]),
-                drafted_by_depth=list(receipt["drafted_by_depth"]),
-                accepted_by_depth=list(receipt["accepted_by_depth"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            errors.append(f"adaptive depth usage is invalid: {exc}")
-        else:
-            if receipt.get("depth_usage") != expected_usage:
-                errors.append("adaptive depth usage does not match raw histograms")
+        expected_draft_core = str(
+            gate._route_execution_options(lane.route_id)["draft_core"]
+        )
+        if expected_draft_core == "device":
+            try:
+                expected_usage = depth_usage(
+                    generated_tokens=int(receipt["generated_tokens"]),
+                    verify_calls=int(receipt["verify_calls"]),
+                    drafted_by_depth=list(receipt["drafted_by_depth"]),
+                    accepted_by_depth=list(receipt["accepted_by_depth"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                errors.append(f"adaptive depth usage is invalid: {exc}")
+            else:
+                if receipt.get("depth_usage") != expected_usage:
+                    errors.append("adaptive depth usage does not match raw histograms")
         policy = receipt.get("adaptive_policy_receipt") or {}
         if not (
             policy.get("kind") == "position_ema"
@@ -302,9 +307,6 @@ def receipt_errors(
             and int(policy.get("depth_cap", -1)) == 3
         ):
             errors.append("adaptive policy state receipt is incomplete")
-        expected_draft_core = str(
-            gate._route_execution_options(lane.route_id)["draft_core"]
-        )
         device_core = receipt.get("device_core_receipt") or {}
         if expected_draft_core == "device" and not (
             device_core.get("requested") == "device"
@@ -341,13 +343,18 @@ def _mean(rows: list[dict[str, Any]], key: str) -> float:
 def depth_usage(
     *,
     generated_tokens: int,
+    verify_calls: int,
     drafted_by_depth: list[int],
     accepted_by_depth: list[int],
+    terminal_primary_cycles: int = 1,
 ) -> dict[str, Any]:
     drafted = ([int(value) for value in drafted_by_depth] + [0, 0, 0])[:3]
     accepted = ([int(value) for value in accepted_by_depth] + [0, 0, 0])[:3]
-    cycles = int(generated_tokens) - sum(accepted)
-    if not (cycles >= drafted[0] >= drafted[1] >= drafted[2] >= 0):
+    cycles = int(generated_tokens) - sum(accepted) - int(terminal_primary_cycles)
+    verified = int(verify_calls)
+    if verified != drafted[0]:
+        raise ValueError("verify calls contradict attempted MTP depth")
+    if not (cycles >= verified >= drafted[0] >= drafted[1] >= drafted[2] >= 0):
         raise ValueError("drafted-depth histogram contradicts generated work")
     if not (
         cycles >= accepted[0] >= accepted[1] >= accepted[2] >= 0
@@ -355,7 +362,7 @@ def depth_usage(
     ):
         raise ValueError("accepted-depth histogram contradicts drafted work")
     attempted_exact = (
-        cycles - drafted[0],
+        cycles - verified,
         drafted[0] - drafted[1],
         drafted[1] - drafted[2],
         drafted[2],
@@ -416,8 +423,10 @@ def _aggregate_depth_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
             accepted[index] += int(value)
     return depth_usage(
         generated_tokens=sum(int(row["generated_tokens"]) for row in rows),
+        verify_calls=sum(int(row["verify_calls"]) for row in rows),
         drafted_by_depth=drafted,
         accepted_by_depth=accepted,
+        terminal_primary_cycles=len(rows),
     )
 
 
@@ -464,7 +473,11 @@ def aggregate(
             errors.append(f"{lane_id} has {len(rows)} arms, expected {expected_arms}")
             continue
         wall = _mean(rows, "wall_s")
-        usage = _aggregate_depth_usage(rows)
+        usage = (
+            _aggregate_depth_usage(rows)
+            if rows and all(row.get("depth_usage") is not None for row in rows)
+            else None
+        )
         summary[lane_id] = {
             "arms": len(rows),
             "source_commit": specs[lane_id].source_commit,

@@ -162,6 +162,15 @@ def test_generation_metrics_include_prefill_decode_and_peak_memory() -> None:
         drafted_tokens=300,
         peak_memory_bytes=24 * 2**30,
         capture_commit_time_s=0.125,
+        speculative_depth=3,
+        requested_speculative_depth=3,
+        verify_calls=80,
+        bonus_tokens=60,
+        correction_tokens=20,
+        context_copy_active=False,
+        context_copy_rounds=0,
+        context_copy_drafted_tokens=0,
+        context_copy_accepted_tokens=0,
         verify_strategy="capture_commit",
         verify_core="linear-gdn-from-conv-tape",
         events=[
@@ -197,6 +206,15 @@ def test_generation_metrics_include_prefill_decode_and_peak_memory() -> None:
         "capture_commit_events": 2,
         "verify_strategy": "capture_commit",
         "verify_core": "linear-gdn-from-conv-tape",
+        "speculative_depth": 3,
+        "requested_speculative_depth": 3,
+        "verify_calls": 80,
+        "bonus_tokens": 60,
+        "correction_tokens": 20,
+        "context_copy_active": False,
+        "context_copy_rounds": 0,
+        "context_copy_drafted_tokens": 0,
+        "context_copy_accepted_tokens": 0,
     }
 
 

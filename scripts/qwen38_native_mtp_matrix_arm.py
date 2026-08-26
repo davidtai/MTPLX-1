@@ -258,6 +258,13 @@ def _generation_metrics(stats: Any) -> dict[str, Any]:
         "verify_core": VERIFY_CORE,
         "speculative_depth": int(stats.speculative_depth),
         "requested_speculative_depth": int(stats.requested_speculative_depth),
+        "verify_calls": int(stats.verify_calls),
+        "bonus_tokens": int(stats.bonus_tokens),
+        "correction_tokens": int(stats.correction_tokens),
+        "context_copy_active": bool(stats.context_copy_active),
+        "context_copy_rounds": int(stats.context_copy_rounds),
+        "context_copy_drafted_tokens": int(stats.context_copy_drafted_tokens),
+        "context_copy_accepted_tokens": int(stats.context_copy_accepted_tokens),
     }
 
 
@@ -276,6 +283,7 @@ def _history_route_receipt(runtime: Any, prompt_tokens: int) -> dict[str, Any]:
 def depth_usage(
     *,
     generated_tokens: int,
+    verify_calls: int,
     drafted_by_depth: list[int],
     accepted_by_depth: list[int],
 ) -> dict[str, Any]:
@@ -283,8 +291,13 @@ def depth_usage(
 
     drafted = ([int(value) for value in drafted_by_depth] + [0, 0, 0])[:3]
     accepted = ([int(value) for value in accepted_by_depth] + [0, 0, 0])[:3]
-    decode_cycles = int(generated_tokens) - sum(accepted)
-    if not (decode_cycles >= drafted[0] >= drafted[1] >= drafted[2] >= 0):
+    decode_cycles = int(generated_tokens) - sum(accepted) - 1
+    verified = int(verify_calls)
+    if verified != drafted[0]:
+        raise ValueError("verify calls contradict attempted MTP depth")
+    if not (
+        decode_cycles >= verified >= drafted[0] >= drafted[1] >= drafted[2] >= 0
+    ):
         raise ValueError("drafted-depth histogram contradicts generated work")
     if not (
         decode_cycles >= accepted[0] >= accepted[1] >= accepted[2] >= 0
@@ -292,7 +305,7 @@ def depth_usage(
     ):
         raise ValueError("accepted-depth histogram contradicts drafted work")
     attempted_exact = (
-        decode_cycles - drafted[0],
+        decode_cycles - verified,
         drafted[0] - drafted[1],
         drafted[1] - drafted[2],
         drafted[2],
@@ -473,11 +486,6 @@ def _run_control_arm(
         "adaptive_policy_receipt": None,
         "token_hash": _token_hash(list(output.tokens)),
         "tokens": list(output.tokens),
-        "depth_usage": depth_usage(
-            generated_tokens=generated_tokens,
-            drafted_by_depth=drafted_by_depth,
-            accepted_by_depth=accepted_by_depth,
-        ),
     }
 
 
@@ -534,11 +542,13 @@ def _run_one(
         row28_artifact_path=row28_artifact,
         row36_artifact_path=None,
     )
-    result["depth_usage"] = depth_usage(
-        generated_tokens=int(result["generated_tokens"]),
-        drafted_by_depth=list(result["drafted_by_depth"]),
-        accepted_by_depth=list(result["accepted_by_depth"]),
-    )
+    if result.get("draft_core") == "device":
+        result["depth_usage"] = depth_usage(
+            generated_tokens=int(result["generated_tokens"]),
+            verify_calls=int(result["verify_calls"]),
+            drafted_by_depth=list(result["drafted_by_depth"]),
+            accepted_by_depth=list(result["accepted_by_depth"]),
+        )
     return result
 
 

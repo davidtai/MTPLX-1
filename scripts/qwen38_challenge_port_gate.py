@@ -204,6 +204,13 @@ def _generation_metrics(
         "verify_core": str(verify_core),
         "speculative_depth": int(stats.speculative_depth),
         "requested_speculative_depth": int(stats.requested_speculative_depth),
+        "verify_calls": int(stats.verify_calls),
+        "bonus_tokens": int(stats.bonus_tokens),
+        "correction_tokens": int(stats.correction_tokens),
+        "context_copy_active": bool(stats.context_copy_active),
+        "context_copy_rounds": int(stats.context_copy_rounds),
+        "context_copy_drafted_tokens": int(stats.context_copy_drafted_tokens),
+        "context_copy_accepted_tokens": int(stats.context_copy_accepted_tokens),
     }
 
 
