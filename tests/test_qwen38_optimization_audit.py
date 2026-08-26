@@ -114,6 +114,15 @@ def test_row26_runs_only_on_its_required_row24_parent() -> None:
     )
 
 
+def test_compact_vocab_runs_only_on_its_required_device_draft_parent() -> None:
+    case = next(
+        item for item in audit.DIRECT_CASES if item.feature == "r10_compact_vocab"
+    )
+
+    assert case.control_route == "r08_device_draft"
+    assert case.candidate_route == "r08_device_draft+r10_compact_vocab"
+
+
 def test_route_contract_proves_exact_installation_and_negative_feature_state() -> None:
     for item in audit.build_execution_plan(audit.DIRECT_CASES):
         control = audit.expected_route_contract(item.control_route)

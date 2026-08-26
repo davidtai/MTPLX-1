@@ -336,6 +336,9 @@ _CANDIDATES = {
         quant_bits=4,
         group_size=64,
         packing=QWEN38_AFFINE_PACKING,
+        parent_rule=ParentRule(
+            required_control_features=frozenset({"r08_device_draft"}),
+        ),
     ),
     "r11_position_ema": NativeMTPCandidate(
         row=11,

@@ -328,7 +328,9 @@ def test_artifact_and_input_replacements_are_mutually_exclusive() -> None:
     for feature in inputs:
         assert registry.NATIVE_MTP_CANDIDATES[feature].incompatible == inputs - {feature}
     assert registry.NATIVE_MTP_CANDIDATES["r10_compact_vocab"].parent_rule == (
-        registry.ParentRule()
+        registry.ParentRule(
+            required_control_features=frozenset({"r08_device_draft"})
+        )
     )
     assert registry.NATIVE_MTP_CANDIDATES["r17_q4_mtp_block"].parent_rule == (
         registry.ParentRule(
@@ -463,10 +465,15 @@ def test_route_delta_accepts_one_candidate_addition_or_explicit_replacement() ->
     assert input_route.implicit_replaced_surface is None
 
 
-def test_row10_is_valid_on_unchanged_parent_if_row8_was_rejected() -> None:
+def test_row10_requires_the_device_draft_parent() -> None:
+    with pytest.raises(
+        registry.NativeMTPRouteError,
+        match="requires control feature r08_device_draft",
+    ):
+        registry.validate_native_mtp_route_delta("control", "r10_compact_vocab")
+
     delta = registry.validate_native_mtp_route_delta(
-        "control",
-        "r10_compact_vocab",
+        "r08_device_draft", "r08_device_draft+r10_compact_vocab"
     )
     assert delta.candidate_feature == "r10_compact_vocab"
     assert delta.replacement is False

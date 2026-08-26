@@ -92,7 +92,7 @@ class RouteContract:
 
 DIRECT_CASES: tuple[DirectCase, ...] = (
     DirectCase("r08-device-draft", "r08_device_draft", "control", "r08_device_draft", (8,), "decode"),
-    DirectCase("r10-compact-vocab", "r10_compact_vocab", "control", "r10_compact_vocab", (10,), "decode"),
+    DirectCase("r10-compact-vocab", "r10_compact_vocab", "r08_device_draft", "r08_device_draft+r10_compact_vocab", (10,), "decode"),
     DirectCase("r11-position-ema", "r11_position_ema", "control", "r11_position_ema", (11,), "adaptive-decode"),
     DirectCase("r18-gdn-decay-memo", "r18_gdn_decay_memo", "control", "r18_gdn_decay_memo", (18,), "prefill+decode", True),
     DirectCase("r20-kv-only-history", "r20_kv_only_history", "control", "r20_kv_only_history", (20,), "prefill-history"),
