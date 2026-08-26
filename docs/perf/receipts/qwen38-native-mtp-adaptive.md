@@ -20,35 +20,45 @@ Every paired matrix used a fresh process per arm under the parent GPU lock, in
 the symmetric order `control-adaptive-q4-q4-adaptive-control`. The 128K xhigh
 row is one pass per candidate, by explicit benchmark-plan decision.
 
-The PR335-derived Python workload uses the same prompt for conditioning and the
-timed arm, 1,024 conditioning output tokens, temperature 1.0, top-p 0.95,
-top-k 20, and seed 42. The first matrix times exactly 1,024 output tokens. The
-xhigh matrix times exactly 16,384 output tokens. All receipt invariant lists
-were empty and paired arms were token-deterministic within each candidate.
+The comparison includes the PR #335 100-token greedy palindrome prompt and its
+four longer Python prompt sizes. The current 1K through 128K rows time exactly
+1,024 output tokens; the 100-token rows reach the same natural stop at 102
+tokens. All paired current arms were token-deterministic within each candidate.
 
 The tables report raw throughput and timing. Positive wall deltas mean faster
 than the fixed-K3 control. Peak memory is the maximum observed arm in GiB.
 
-## Exact 1,024-output matrix
+## Low-reasoning comparison matrix
 
-![Grouped bar chart of four native-MTP decode-throughput series at 1K, 16K, 64K, and 128K prompt contexts](../qwen38-native-mtp-four-series-decode-tps.svg)
+![Grouped bar chart of four native-MTP decode-throughput series at 100, 1K, 16K, 64K, and 128K prompt contexts](../qwen38-native-mtp-four-series-decode-tps.svg)
 
-| Context | Candidate | Prefill tok/s | Decode tok/s | Wall (s) | Wall vs control | Peak GiB |
-|---:|---|---:|---:|---:|---:|---:|
-| 1K | PR #335 old fixed K3 | 768.02 | 59.33 | 18.634 | historical | 24.260 |
-| 1K | fixed K3 control | 836.68 | 65.38 | 16.923 | baseline | 21.375 |
-| 1K | adaptive | 712.55 | 63.47 | 17.603 | -3.86% | 21.375 |
-| 1K | q4 adaptive | 753.01 | 62.85 | 17.681 | -4.28% | 21.597 |
-| 16K | PR #335 initial unoptimized K3 | 754.03 | 51.80 | 42.006 | historical | 25.569 |
-| 16K | fixed K3 control | 823.11 | 53.44 | 39.481 | baseline | 23.469 |
-| 16K | adaptive | 822.76 | 51.60 | 40.167 | -1.71% | 23.469 |
-| 16K | q4 adaptive | 823.00 | 56.01 | 38.624 | +2.22% | 23.652 |
-| 64K | fixed K3 control | 685.20 | 40.46 | 123.654 | baseline | 28.653 |
-| 64K | adaptive | 684.75 | 40.40 | 123.737 | -0.07% | 28.653 |
-| 64K | q4 adaptive | 684.70 | 44.77 | 121.348 | +1.90% | 28.877 |
-| 128K | fixed K3 control | 554.12 | 32.70 | 276.162 | baseline | 37.055 |
-| 128K | adaptive | 553.78 | 31.78 | 277.224 | -0.38% | 37.055 |
-| 128K | q4 adaptive | 553.98 | 37.61 | 272.285 | +1.42% | 39.285 |
+| Prompt | Candidate | Generated | Prefill tok/s | Decode tok/s | Wall (s) | Wall vs current fixed K3 | Peak GiB |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 100 | PR #335 unoptimized fixed K3 | 102 | 502.60 | 107.58 | 1.154 | historical | 20.392 |
+| 100 | current fixed K3 | 102 | 486.91 | 117.93 | 1.076 | baseline | 20.566 |
+| 100 | adaptive BF16 | 102 | 474.36 | 114.78 | 1.106 | -2.73% | 20.565 |
+| 100 | adaptive Q4 | 102 | 475.04 | 118.53 | 1.075 | +0.05% | 20.564 |
+| 1K | PR #335 unoptimized fixed K3 | 1,024 | 768.02 | 59.33 | 18.634 | historical | 24.259 |
+| 1K | current fixed K3 | 1,024 | 836.68 | 65.38 | 16.923 | baseline | 21.375 |
+| 1K | adaptive BF16 | 1,024 | 712.55 | 63.47 | 17.603 | -3.86% | 21.375 |
+| 1K | adaptive Q4 | 1,024 | 753.01 | 62.85 | 17.681 | -4.28% | 21.597 |
+| 16K | PR #335 unoptimized fixed K3 | 4,612 | 764.49 | 54.57 | 106.419 | historical | 30.773 |
+| 16K | current fixed K3 | 1,024 | 823.11 | 53.44 | 39.481 | baseline | 23.469 |
+| 16K | adaptive BF16 | 1,024 | 822.76 | 51.60 | 40.167 | -1.71% | 23.469 |
+| 16K | adaptive Q4 | 1,024 | 823.00 | 56.01 | 38.624 | +2.22% | 23.652 |
+| 64K | PR #335 unoptimized fixed K3 | 4,342 | 587.99 | 42.04 | 218.224 | historical | 42.020 |
+| 64K | current fixed K3 | 1,024 | 685.20 | 40.46 | 123.654 | baseline | 28.653 |
+| 64K | adaptive BF16 | 1,024 | 684.75 | 40.40 | 123.737 | -0.07% | 28.653 |
+| 64K | adaptive Q4 | 1,024 | 684.70 | 44.77 | 121.348 | +1.90% | 28.877 |
+| 128K | PR #335 unoptimized fixed K3 | 3,840 | 428.09 | 34.01 | 431.269 | historical | 57.909 |
+| 128K | current fixed K3 | 1,024 | 554.12 | 32.70 | 276.162 | baseline | 37.055 |
+| 128K | adaptive BF16 | 1,024 | 553.78 | 31.78 | 277.224 | -0.38% | 37.055 |
+| 128K | adaptive Q4 | 1,024 | 553.98 | 37.61 | 272.285 | +1.42% | 39.285 |
+
+The PR #335 1K row is its published mean of the two additional 1K/1K ABBA
+brackets. Its 16K through 128K rows are the low-reasoning natural-stop runs
+used in the PR #335 graph. The machine-readable source for all 20 rows is
+[`qwen38-native-mtp-four-series-data.json`](qwen38-native-mtp-four-series-data.json).
 
 ## Xhigh 16,384-output matrix
 
@@ -76,32 +86,6 @@ than the fixed-K3 control. Peak memory is the maximum observed arm in GiB.
 The Q4 adaptive candidate won all four xhigh wall-time rows. The BF16 adaptive
 candidate won only the single-pass 128K row and regressed the three paired
 rows, so this receipt does not support making BF16 adaptive the default.
-
-## Historical fixed-MTP K3 data from PR #335
-
-PR #335 contains two separate historical datasets. Its initial unoptimized
-fixed-K3 control is the row-3 `Optimized-Speed main` arm at commit
-`bd4421567f9e16ce957c6ef97708b072dcd73937` on MLX 0.32.0. That exact 16K /
-1,024-output ABBA control is included in the main table above. PR #335's two
-additional 1K / 1K ABBA brackets are also combined above as `old fixed K3`.
-
-| PR #335 dataset | Context | Prefill tok/s | Decode tok/s | Wall (s) | Peak GiB |
-|---|---:|---:|---:|---:|---:|
-| Initial unoptimized fixed K3, row 3 | 16K | 754.031 | 51.803 | 42.006 | 25.569 |
-| Additional 1K / 1K ABBA combined | 1K | 768.02 | 59.33 | 18.634 | 24.260 |
-
-PR #335 separately published the following fixed-K3 decode chart. The chart
-does not bind its 16K/64K/128K points to the initial row-3 receipt, and its 16K
-value is 54.57 rather than 51.803, so these points remain a distinct series.
-Only decode throughput is available from the committed chart.
-
-| Chart prompt context | Fixed-K3 decode tok/s |
-|---:|---:|
-| 100 tokens | 107.58 |
-| 1K | 59.33 |
-| 16K | 54.57 |
-| 64K | 42.04 |
-| 128K | 34.01 |
 
 ## 128K adaptive-depth distribution
 
@@ -134,6 +118,9 @@ of generation text into the repository.
 
 | Workload | SHA-256 |
 |---|---|
+| Current 100-token three-lane vanity bracket | `f2ea8c8107f3d992aa466c14ac31c8de9b69944bc8ea0a7ba6779e565643b8cf` |
+| PR #335 cold-prefill matrix, including 100-token default | `2b478547deeddee8f1fe8c61d251c79f92dbe398cbcdad2071115adad1d0813a` |
+| PR #335 low-reasoning natural-EOS matrix through 128K | `e78f9422d142fcef5d6f945eec37e768cf66813606373385a62b7ad1127351ff` |
 | 1K / 1,024 output | `cf66b709b80e1cf61d4e69546b2b063c33572a3ae22f57e59db477d074a09e58` |
 | 16K / 1,024 output | `a2add44fe0888608dc9b171cdb690456bc99ba14dbd9c3d57a7255f798d2b146` |
 | 64K / 1,024 output | `9981de6997995457c08410271f20f38a41175ab3b10771653606cb8bd3c8ea90` |

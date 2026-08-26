@@ -1,0 +1,59 @@
+{
+  "kind": "qwen38_native_mtp_four_series_decode_comparison",
+  "series": [
+    {
+      "id": "pr335_fixed_k3",
+      "label": "PR #335 fixed K3",
+      "mlx_version": "0.32.0",
+      "rows": [
+        {"prompt_tokens": 100, "generated_tokens": 102, "output_contract": "natural EOS, 1024-token cap", "prefill_tok_s": 502.60460822366156, "decode_tok_s": 107.5810021805413, "wall_s": 1.1541838534903945, "peak_memory_gib": 20.39245891571045},
+        {"prompt_tokens": 1024, "generated_tokens": 1024, "output_contract": "exact 1024, mean of ABBA #1 and #2", "prefill_tok_s": 768.0185864464289, "decode_tok_s": 59.32555855026996, "wall_s": 18.63373353125644, "peak_memory_gib": 24.259413052350283},
+        {"prompt_tokens": 16384, "generated_tokens": 4612, "output_contract": "natural EOS, 16384-token cap", "prefill_tok_s": 764.4901745536629, "decode_tok_s": 54.57379313526476, "wall_s": 106.41875131247798, "peak_memory_gib": 30.772890808060765},
+        {"prompt_tokens": 65536, "generated_tokens": 4342, "output_contract": "natural EOS, 16384-token cap", "prefill_tok_s": 587.9892055890666, "decode_tok_s": 42.04118972126025, "wall_s": 218.2240038125019, "peak_memory_gib": 42.01976219564676},
+        {"prompt_tokens": 131072, "generated_tokens": 3840, "output_contract": "natural EOS, 16384-token cap", "prefill_tok_s": 428.0881988797206, "decode_tok_s": 34.00614106318646, "wall_s": 431.2690995215089, "peak_memory_gib": 57.908731665462255}
+      ]
+    },
+    {
+      "id": "current_fixed_k3",
+      "label": "Current fixed K3",
+      "mlx_version": "0.32.2",
+      "rows": [
+        {"prompt_tokens": 100, "generated_tokens": 102, "output_contract": "natural EOS, 1024-token cap", "prefill_tok_s": 486.9111038811923, "decode_tok_s": 117.9316514560067, "wall_s": 1.0756585624767467, "peak_memory_gib": 20.565546572208405},
+        {"prompt_tokens": 1024, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 836.6832014833606, "decode_tok_s": 65.38411385404612, "wall_s": 16.923429104004754, "peak_memory_gib": 21.374830335378647},
+        {"prompt_tokens": 16384, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 823.1051362865287, "decode_tok_s": 53.43981020175228, "wall_s": 39.48064735450316, "peak_memory_gib": 23.469286039471626},
+        {"prompt_tokens": 65536, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 685.1984689758913, "decode_tok_s": 40.46399248335684, "wall_s": 123.65407468748163, "peak_memory_gib": 28.653174052014947},
+        {"prompt_tokens": 131072, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 554.1152184686505, "decode_tok_s": 32.70203669266762, "wall_s": 276.161530208512, "peak_memory_gib": 37.05535610020161}
+      ]
+    },
+    {
+      "id": "current_adaptive_bf16",
+      "label": "Adaptive BF16",
+      "mlx_version": "0.32.2",
+      "rows": [
+        {"prompt_tokens": 100, "generated_tokens": 102, "output_contract": "natural EOS, 1024-token cap", "prefill_tok_s": 474.3601154198137, "decode_tok_s": 114.78182205435326, "wall_s": 1.1058719999855384, "peak_memory_gib": 20.565073240548372},
+        {"prompt_tokens": 1024, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 712.5519033869631, "decode_tok_s": 63.46923600682534, "wall_s": 17.60271370850387, "peak_memory_gib": 21.374830335378647},
+        {"prompt_tokens": 16384, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 822.7602732330763, "decode_tok_s": 51.60222236487488, "wall_s": 40.16656041648821, "peak_memory_gib": 23.469286339357495},
+        {"prompt_tokens": 65536, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 684.7542443458433, "decode_tok_s": 40.40223056801281, "wall_s": 123.73710708349245, "peak_memory_gib": 28.65317170508206},
+        {"prompt_tokens": 131072, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 553.7831927550017, "decode_tok_s": 31.778145658960206, "wall_s": 277.2241981670086, "peak_memory_gib": 37.0553389955312}
+      ]
+    },
+    {
+      "id": "current_adaptive_q4",
+      "label": "Adaptive Q4",
+      "mlx_version": "0.32.2",
+      "rows": [
+        {"prompt_tokens": 100, "generated_tokens": 102, "output_contract": "natural EOS, 1024-token cap", "prefill_tok_s": 475.0407304550738, "decode_tok_s": 118.52657439717443, "wall_s": 1.0751456250145566, "peak_memory_gib": 20.563730781897902},
+        {"prompt_tokens": 1024, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 753.0077727787199, "decode_tok_s": 62.852792049494234, "wall_s": 17.68053647899069, "peak_memory_gib": 21.597371896728873},
+        {"prompt_tokens": 16384, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 822.9975023211114, "decode_tok_s": 56.007267187064116, "wall_s": 38.623971541499486, "peak_memory_gib": 23.65155998431146},
+        {"prompt_tokens": 65536, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 684.6992269568003, "decode_tok_s": 44.77198258053821, "wall_s": 121.34773404151201, "peak_memory_gib": 28.876718021929264},
+        {"prompt_tokens": 131072, "generated_tokens": 1024, "output_contract": "exact 1024", "prefill_tok_s": 553.9796813889002, "decode_tok_s": 37.60905929101037, "wall_s": 272.2852492085076, "peak_memory_gib": 39.28540740162134}
+      ]
+    }
+  ],
+  "source_receipts": [
+    {"label": "PR #335 100/1K/16K/64K cold-prefill matrix", "sha256": "2b478547deeddee8f1fe8c61d251c79f92dbe398cbcdad2071115adad1d0813a"},
+    {"label": "PR #335 16K/64K/128K low-reasoning natural-EOS matrix", "sha256": "e78f9422d142fcef5d6f945eec37e768cf66813606373385a62b7ad1127351ff"},
+    {"label": "Current 100-token three-lane vanity bracket", "sha256": "f2ea8c8107f3d992aa466c14ac31c8de9b69944bc8ea0a7ba6779e565643b8cf"},
+    {"label": "Current 1K/16K/64K/128K exact-1024 matrix", "sha256_by_prompt_tokens": {"1024": "cf66b709b80e1cf61d4e69546b2b063c33572a3ae22f57e59db477d074a09e58", "16384": "a2add44fe0888608dc9b171cdb690456bc99ba14dbd9c3d57a7255f798d2b146", "65536": "9981de6997995457c08410271f20f38a41175ab3b10771653606cb8bd3c8ea90", "131072": "6c2d15a8826187b5434d492d33d1f20549cfdf989e18d8858bcc555c57dad81b"}}
+  ]
+}
