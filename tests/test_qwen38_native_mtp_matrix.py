@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import json
+import subprocess
+import sys
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts/qwen38_native_mtp_matrix.py"
@@ -496,3 +498,14 @@ def test_matrix_parent_accepts_direct_or_delegated_guard_ownership() -> None:
 
     assert matrix._validated_parent_guard_scope("direct") == "direct"
     assert matrix._validated_parent_guard_scope("attested_parent") == "attested_parent"
+
+
+def test_matrix_entrypoint_imports_from_outside_repository(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
