@@ -42,6 +42,41 @@ def test_final_native_route_contains_only_retained_features() -> None:
     assert "source_proposal" not in gate.ALLOWED_ROUTE_FEATURES
 
 
+def test_full_adaptive_benchmark_routes_share_every_safe_retained_optimization() -> None:
+    gate = _module()
+
+    expected_shared = (
+        "r08_device_draft+r10_compact_vocab+r18_gdn_decay_memo+"
+        "r20_kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
+        "r26_prefill_ladder_3+r48_boundary_fused+r50_wired_residency+"
+        "r61_dual_norm_concat"
+    )
+    assert gate.FULL_ADAPTIVE_SHARED_ROUTE == expected_shared
+    assert gate.FULL_ADAPTIVE_NATIVE_ROUTE == expected_shared + "+r11_position_ema"
+    assert gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE == (
+        expected_shared + "+r28_q4_mtp_block+r11_position_ema"
+    )
+
+    bf16 = gate._route_execution_options(gate.FULL_ADAPTIVE_NATIVE_ROUTE)
+    q4 = gate._route_execution_options(gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE)
+    assert bf16["mtp_block_variant"] is None
+    assert q4["mtp_block_variant"] == "r28"
+    assert bf16["adaptive_policy"] == q4["adaptive_policy"] == "position_ema"
+    assert bf16["source_rows"] == (8, 10, 18, 20, 21, 24, 26, 48, 50, 61, 11)
+    assert q4["source_rows"] == (8, 10, 18, 20, 21, 24, 26, 28, 48, 50, 61, 11)
+
+
+def test_full_adaptive_benchmark_routes_exclude_faulting_command_buffer_profile() -> None:
+    gate = _module()
+
+    for route in (
+        gate.FULL_ADAPTIVE_NATIVE_ROUTE,
+        gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
+    ):
+        assert "r53_command_buffers" not in route.split("+")
+        assert gate._route_execution_options(route)["row53_command_buffers"] is False
+
+
 def test_native_gate_has_no_rejected_source_artifact_flag() -> None:
     source = ISOLATED_SCRIPT.read_text(encoding="utf-8")
     assert "--source-artifact" not in source
