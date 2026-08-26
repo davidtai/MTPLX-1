@@ -213,7 +213,7 @@ def receipt_errors(
         "verify_core": "linear-gdn-from-conv-tape",
         "speculative_depth": 3,
         "requested_speculative_depth": 3,
-        "draft_core": "device" if lane.route_id != "control" else "stock",
+        "draft_core": str(gate._route_execution_options(lane.route_id)["draft_core"]),
     }
     for key, expected in exact.items():
         if receipt.get(key) != expected:
