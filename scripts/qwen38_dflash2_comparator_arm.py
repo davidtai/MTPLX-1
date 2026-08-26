@@ -85,6 +85,7 @@ def main() -> int:
     workload = _workload(upstream._parse_args())
     receipt["kind"] = "qwen38_dflash2_frozen_matrix_arm"
     receipt["workload"]["workload"] = workload
+    receipt["workload"]["enable_thinking"] = workload == "xhigh"
     receipt["workload"]["prompt_format"] = {
         "vanity": "qwen_chat_template_non_thinking",
         "low": "raw_non_thinking_python_context",
