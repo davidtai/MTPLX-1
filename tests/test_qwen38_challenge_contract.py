@@ -7,21 +7,25 @@ from types import SimpleNamespace
 import pytest
 
 from mtplx import qwen38_challenge
+from mtplx.generation import _qwen38_prefill_target_route
 from mtplx.mtp_patch import MTPContract
 from mtplx.qwen38_challenge import (
     DEFAULT_QWEN38_CACHE_ROUTE,
     QWEN38_FINAL_ROUTE,
     QWEN38_Q8_LINEAR_ATTN_LAYERS,
     Qwen38ContractError,
+    Qwen38PerformanceProfileConfig,
     Qwen38RouteBindings,
     build_qwen38_route,
     configure_qwen38_row50_wired_residency,
     install_qwen38_control_route,
+    install_qwen38_performance_profiles,
     install_qwen38_route,
     is_qwen38_27b_candidate,
     policy_fingerprint_with_qwen38_route,
     qwen38_final_route,
     qwen38_route_receipt,
+    select_qwen38_performance_profile,
     validate_qwen38_27b_contract,
 )
 from mtplx.runtime import MTPLXRuntime
@@ -136,6 +140,35 @@ def _route_runtime():
         contract=MTPContract(),
     )
     return runtime, stock, kv_only, stock_prepare, dual_prepare
+
+
+def _target_phase_runtime():
+    def stock(*args, **kwargs):
+        return ("stock", args, kwargs)
+
+    def row24(*args, **kwargs):
+        return ("row24", args, kwargs)
+
+    def row26(*args, **kwargs):
+        return ("row26", args, kwargs)
+
+    text = SimpleNamespace(
+        _mtplx_forward_layers_stock=stock,
+        _mtplx_forward_layers_row24=row24,
+        _mtplx_forward_layers_row26=row26,
+        _mtplx_prepare_mtp_inputs_stock=_callable,
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(
+            mtp_update_cache=_callable,
+            language_model=text,
+        ),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+    return runtime, text, stock, row26
 
 
 def test_exact_qwen38_27b_control_contract_is_accepted() -> None:
@@ -713,6 +746,175 @@ def test_enabled_target_ladder_fails_when_prebound_callable_is_missing() -> None
             MODEL_PATH,
             cache_route="control",
             row24_eval_ladder=True,
+        )
+
+
+def test_row26_without_row21_installs_prefill_only_and_stock_decode() -> None:
+    runtime, text, stock, row26 = _target_phase_runtime()
+
+    route = install_qwen38_route(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        cache_route="control",
+        row24_eval_ladder=True,
+        row26_prefill_ladder_3=True,
+    )
+
+    assert route.route_id == "r24_eval_ladder+r26_prefill_ladder_3"
+    assert text._mtplx_forward_layers is stock
+    assert text._mtplx_qwen38_prefill_forward_layers is row26
+    assert runtime.qwen38_feature_receipt["r26_prefill_ladder_3"] == {
+        "active": 1,
+        "phase_scope": "prefill",
+        "decode_route": "stock",
+    }
+
+    with _qwen38_prefill_target_route(runtime):
+        assert text._mtplx_forward_layers is row26
+    assert text._mtplx_forward_layers is stock
+
+
+def test_performance_profiles_are_prebound_and_selected_at_request_boundary(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def stock_target(*args, **kwargs):
+        return ("stock-target", args, kwargs)
+
+    def low_target(*args, **kwargs):
+        return ("low-target", args, kwargs)
+
+    def xhigh_target(*args, **kwargs):
+        return ("xhigh-target", args, kwargs)
+
+    stock_mtp = object()
+    low_mtp = object()
+    xhigh_mtp = object()
+    text = SimpleNamespace(
+        mtp=stock_mtp,
+        _mtplx_forward_layers=stock_target,
+        _mtplx_qwen38_prefill_forward_layers=None,
+        _mtplx_prepare_mtp_inputs=_callable,
+        _mtplx_draft_lm_head=object(),
+    )
+    runtime = MTPLXRuntime(
+        model=SimpleNamespace(
+            mtp=stock_mtp,
+            mtp_update_cache=_callable,
+            language_model=text,
+        ),
+        tokenizer=SimpleNamespace(),
+        model_path=MODEL_PATH,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    targets = {
+        "stock": (stock_target, stock_mtp),
+        "low": (low_target, low_mtp),
+        "xhigh": (xhigh_target, xhigh_mtp),
+    }
+
+    def fake_install(loaded_runtime, config, model_path, **options):
+        del config, model_path
+        profile = str(options.pop("test_profile"))
+        calls.append(profile)
+        target, mtp_block = targets[profile]
+        loaded_text = loaded_runtime.model.language_model
+        loaded_text._mtplx_forward_layers = target
+        loaded_text._mtplx_qwen38_prefill_forward_layers = None
+        loaded_text.mtp = mtp_block
+        loaded_runtime.model.mtp = mtp_block
+        route = build_qwen38_route(
+            _config(),
+            MODEL_PATH,
+            bindings=_bindings(),
+            route_id=f"{profile}-installed",
+            kernel_ids=(f"{profile}-kernel",) if profile != "stock" else (),
+        )
+        loaded_runtime.qwen38_route = route
+        loaded_runtime.qwen38_feature_receipt = (
+            {} if profile == "stock" else {f"{profile}-feature": {"active": 1}}
+        )
+        return route
+
+    monkeypatch.setattr(qwen38_challenge, "install_qwen38_route", fake_install)
+
+    install_qwen38_performance_profiles(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        stock=Qwen38PerformanceProfileConfig(
+            requested_route_id="control",
+            install_options={"test_profile": "stock"},
+            draft_core="stock",
+        ),
+        low=Qwen38PerformanceProfileConfig(
+            requested_route_id="low-requested",
+            install_options={"test_profile": "low"},
+            draft_core="device",
+        ),
+        xhigh=Qwen38PerformanceProfileConfig(
+            requested_route_id="xhigh-requested",
+            install_options={"test_profile": "xhigh"},
+            draft_core="stock",
+        ),
+    )
+
+    assert calls == ["stock", "low", "xhigh"]
+
+    low = select_qwen38_performance_profile(runtime, "low")
+    assert calls == ["stock", "low", "xhigh"]
+    assert low.profile_id == "low"
+    assert low.requested_route_id == "low-requested"
+    assert low.route.route_id == "low-installed"
+    assert low.draft_core == "device"
+    assert text._mtplx_forward_layers is low_target
+    assert text.mtp is low_mtp
+    assert runtime.model.mtp is low_mtp
+    assert runtime.qwen38_feature_receipt == {"low-feature": {"active": 1}}
+
+    xhigh = select_qwen38_performance_profile(runtime, "xhigh")
+    assert xhigh.profile_id == "xhigh"
+    assert xhigh.requested_route_id == "xhigh-requested"
+    assert xhigh.route.route_id == "xhigh-installed"
+    assert xhigh.draft_core == "stock"
+    assert text._mtplx_forward_layers is xhigh_target
+    assert text.mtp is xhigh_mtp
+
+    stock = select_qwen38_performance_profile(runtime, "high")
+    assert stock.profile_id == "stock"
+    assert stock.requested_route_id == "control"
+    assert stock.route.route_id == "stock-installed"
+    assert text._mtplx_forward_layers is stock_target
+    assert text.mtp is stock_mtp
+
+    receipt = qwen38_route_receipt(runtime.qwen38_route)
+    assert receipt["performance_profile"] == "stock"
+    assert receipt["requested_route_id"] == "control"
+    assert receipt["installed_route_id"] == "stock-installed"
+    assert receipt["draft_core"] == "stock"
+    assert receipt["mtp_block_identity"] == "bf16"
+
+
+def test_performance_profile_install_rejects_missing_bound_route(monkeypatch) -> None:
+    runtime, *_ = _route_runtime()
+    monkeypatch.setattr(
+        qwen38_challenge,
+        "install_qwen38_route",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(Qwen38ContractError, match="stock performance profile"):
+        install_qwen38_performance_profiles(
+            runtime,
+            _config(),
+            MODEL_PATH,
+            stock=Qwen38PerformanceProfileConfig("control", {}),
+            low=Qwen38PerformanceProfileConfig("low", {}),
+            xhigh=Qwen38PerformanceProfileConfig("xhigh", {}),
         )
 
 

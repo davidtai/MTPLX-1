@@ -41,6 +41,25 @@ GUARD_FD_ENV = "MTPLX_GUARD_ATTEST_FD"
 GUARD_NONCE_ENV = "MTPLX_GUARD_ATTEST_NONCE"
 
 
+class NativeMTPBundleDelta:
+    def __init__(
+        self,
+        *,
+        control_features: frozenset[str],
+        candidate_features_set: frozenset[str],
+        candidate_feature: str,
+        candidate_features: tuple[str, ...],
+        added: frozenset[str],
+        removed: frozenset[str],
+    ) -> None:
+        self.control_features = control_features
+        self.candidate_features_set = candidate_features_set
+        self.candidate_feature = candidate_feature
+        self.candidate_features = candidate_features
+        self.added = added
+        self.removed = removed
+
+
 def _environment_for_route(
     route_id: str,
     inherited: Mapping[str, str],
@@ -234,10 +253,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-temperature", type=float)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "xhigh"),
+        default="low",
+    )
     parser.add_argument("--order", required=True)
     parser.add_argument("--control-route", required=True)
     parser.add_argument("--candidate-route", required=True)
     parser.add_argument("--allow-frozen-candidate", action="store_true")
+    parser.add_argument(
+        "--candidate-bundle",
+        help="Ordered comma-separated atomic feature bundle added by the candidate.",
+    )
     parser.add_argument("--row17-artifact", type=Path)
     parser.add_argument("--row28-artifact", type=Path)
     parser.add_argument("--row36-artifact", type=Path)
@@ -247,6 +275,40 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _validate_route_delta(args: argparse.Namespace) -> Any:
+    raw_bundle = str(getattr(args, "candidate_bundle", None) or "").strip()
+    if raw_bundle:
+        bundle = tuple(item.strip() for item in raw_bundle.split(",") if item.strip())
+        if len(bundle) < 2 or len(bundle) != len(set(bundle)):
+            raise gate.NativeMTPRouteError(
+                "candidate bundle must contain at least two unique ordered features"
+            )
+        control = gate.canonicalize_native_mtp_route(args.control_route)
+        candidate = gate.canonicalize_native_mtp_route(args.candidate_route)
+        added = candidate - control
+        removed = control - candidate
+        if added != frozenset(bundle) or removed:
+            raise gate.NativeMTPRouteError(
+                "candidate bundle must exactly match the added route features"
+            )
+        current = set(control - {"control"})
+        for feature in bundle:
+            next_features = (*sorted(current), feature)
+            gate.validate_native_mtp_route_delta(
+                "+".join(sorted(current)) if current else "control",
+                "+".join(next_features),
+                allow_frozen_candidate=bool(
+                    getattr(args, "allow_frozen_candidate", False)
+                ),
+            )
+            current.add(feature)
+        return NativeMTPBundleDelta(
+            control_features=control,
+            candidate_features_set=candidate,
+            candidate_feature="+".join(bundle),
+            candidate_features=bundle,
+            added=added,
+            removed=removed,
+        )
     return gate.validate_native_mtp_route_delta(
         args.control_route,
         args.candidate_route,
@@ -285,6 +347,8 @@ def _child_command(
         str(args.top_p),
         "--top-k",
         str(args.top_k),
+        "--reasoning-effort",
+        str(args.reasoning_effort),
         "--order",
         route_id,
         "--lock",
@@ -331,6 +395,8 @@ def _receipt_invariant_errors(
         "draft_temperature": expected_draft_temperature,
         "top_p": float(args.top_p),
         "top_k": int(args.top_k),
+        "enable_thinking": True,
+        "reasoning_effort": str(args.reasoning_effort),
         "mlx_version": gate.REQUIRED_MLX_VERSION,
         "mlx_metal_version": gate.REQUIRED_MLX_METAL_VERSION,
         "gpu_lock_path": str(args.lock.resolve()),
@@ -435,10 +501,13 @@ def _receipt_invariant_errors(
         delta = _validate_route_delta(args)
     except gate.NativeMTPRouteError:
         return errors
-    expected_artifact = gate._expected_candidate_artifact_hashes(
-        delta.candidate_feature
+    delta_features = getattr(
+        delta, "candidate_features", (delta.candidate_feature,)
     )
-    if expected_artifact is not None:
+    for delta_feature in delta_features:
+        expected_artifact = gate._expected_candidate_artifact_hashes(delta_feature)
+        if expected_artifact is None:
+            continue
         candidate_arms = [
             (receipt.get("arms") or [{}])[0]
             for receipt in child_receipts
@@ -447,13 +516,13 @@ def _receipt_invariant_errors(
         ]
         if not candidate_arms or any(
             (arm.get("candidate_artifact_hashes") or {}).get(
-                delta.candidate_feature
+                delta_feature
             )
             != expected_artifact
             for arm in candidate_arms
         ):
             errors.append(
-                f"{delta.candidate_feature} artifact hashes do not match the registry"
+                f"{delta_feature} artifact hashes do not match the registry"
             )
     return errors
 
@@ -536,6 +605,8 @@ def _aggregate(
                 "draft_temperature",
                 "top_p",
                 "top_k",
+                "enable_thinking",
+                "reasoning_effort",
                 "optimized_speed_stack",
                 "platform",
                 "python",

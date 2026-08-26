@@ -51,9 +51,8 @@ MODEL_ARTIFACT_HASHES_ENV = "MTPLX_QWEN38_MODEL_ARTIFACT_HASHES"
 FIXED_NATIVE_ROUTE = "control"
 ADAPTIVE_NATIVE_ROUTE = "r11_position_ema"
 FULL_ADAPTIVE_SHARED_ROUTE = (
-    "r08_device_draft+r10_compact_vocab+r20_kv_only_history+"
-    "r21_qk_rms_rope+r24_eval_ladder+r26_prefill_ladder_3+"
-    "r50_wired_residency+r53_command_buffers+r61_dual_norm_concat"
+    "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+"
+    "r50_wired_residency+r53_command_buffers"
 )
 FULL_FIXED_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE
 FULL_ADAPTIVE_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
@@ -918,6 +917,7 @@ def _run_arm(
     row17_artifact_path: Path | None,
     row28_artifact_path: Path | None,
     row36_artifact_path: Path | None,
+    performance_profile: str,
     stop_token_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     import mlx.core as mx
@@ -1045,6 +1045,8 @@ def _run_arm(
             verify_core="linear-gdn-from-conv-tape",
         ),
         "route_id": route_id,
+        "performance_profile": performance_profile,
+        "requested_route_id": route_id,
         "installed_route_id": route.route_id,
         "route_fingerprint": hashlib.sha256(
             f"{route.fingerprint}:{route_id}".encode()
@@ -1097,6 +1099,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-temperature", type=float)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "xhigh"),
+        default="low",
+    )
     parser.add_argument(
         "--order",
         default="control,kv_only_history,kv_only_history,control",
@@ -1176,8 +1183,11 @@ def main() -> int:
     if args.prompt_tokens is None:
         prompt_ids = list(runtime.tokenizer.encode(prompt))
     elif args.context_file is not None:
-        prompt, prompt_ids = _context_prompt_to_token_count(
+        from scripts.qwen38_native_mtp_matrix_arm import build_prompt
+
+        prompt, prompt_ids = build_prompt(
             runtime.tokenizer,
+            workload=args.reasoning_effort,
             context=args.context_file.read_text(encoding="utf-8"),
             instruction=prompt,
             target_tokens=args.prompt_tokens,
@@ -1210,6 +1220,7 @@ def main() -> int:
             row17_artifact_path=args.row17_artifact,
             row28_artifact_path=args.row28_artifact,
             row36_artifact_path=args.row36_artifact,
+            performance_profile=args.reasoning_effort,
         )
         for route_id in conditioning_routes
     ]
@@ -1229,6 +1240,7 @@ def main() -> int:
             row17_artifact_path=args.row17_artifact,
             row28_artifact_path=args.row28_artifact,
             row36_artifact_path=args.row36_artifact,
+            performance_profile=args.reasoning_effort,
         )
         for route_id in order
     ]
@@ -1300,6 +1312,8 @@ def main() -> int:
         "prompt_tokens": len(prompt_ids),
         "prompt_token_sha256": _token_hash(prompt_ids),
         "prompt_token_target": args.prompt_tokens,
+        "enable_thinking": True,
+        "reasoning_effort": args.reasoning_effort,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "target_temperature": args.target_temperature,

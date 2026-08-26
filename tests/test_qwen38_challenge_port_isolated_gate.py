@@ -39,10 +39,12 @@ def _args(**overrides):
         "draft_temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
+        "reasoning_effort": "low",
         "order": "control,r08_device_draft,r08_device_draft,control",
         "control_route": "control",
         "candidate_route": "r08_device_draft",
         "allow_frozen_candidate": False,
+        "candidate_bundle": None,
         "row17_artifact": None,
         "row28_artifact": None,
         "row36_artifact": None,
@@ -69,6 +71,52 @@ def test_rebench_delta_flag_allows_one_frozen_feature() -> None:
     assert delta.candidate_feature == "r18_gdn_decay_memo"
 
 
+@pytest.mark.parametrize(
+    ("bundle", "candidate"),
+    [
+        (
+            "r08_device_draft,r10_compact_vocab",
+            "r20_kv_only_history+r53_command_buffers+"
+            "r08_device_draft+r10_compact_vocab",
+        ),
+        (
+            "r21_qk_rms_rope,r24_eval_ladder,r26_prefill_ladder_3",
+            "r20_kv_only_history+r53_command_buffers+"
+            "r21_qk_rms_rope+r24_eval_ladder+r26_prefill_ladder_3",
+        ),
+    ],
+)
+def test_bundle_delta_validates_each_dependency_in_order(bundle, candidate) -> None:
+    isolated = _module()
+    control = "r20_kv_only_history+r53_command_buffers"
+
+    delta = isolated._validate_route_delta(
+        _args(
+            control_route=control,
+            candidate_route=candidate,
+            candidate_bundle=bundle,
+            allow_frozen_candidate="r21_qk_rms_rope" in bundle,
+        )
+    )
+
+    assert delta.candidate_features == tuple(bundle.split(","))
+    assert delta.candidate_feature == "+".join(bundle.split(","))
+
+
+def test_bundle_delta_rejects_features_not_exactly_added() -> None:
+    isolated = _module()
+    control = "r20_kv_only_history+r53_command_buffers"
+
+    with pytest.raises(isolated.gate.NativeMTPRouteError, match="exactly match"):
+        isolated._validate_route_delta(
+            _args(
+                control_route=control,
+                candidate_route=control + "+r08_device_draft",
+                candidate_bundle="r08_device_draft,r10_compact_vocab",
+            )
+        )
+
+
 def test_frozen_rebench_accepts_stable_route_specific_substrate_fingerprints() -> None:
     isolated = _module()
     control = "control"
@@ -93,6 +141,8 @@ def test_frozen_rebench_accepts_stable_route_specific_substrate_fingerprints() -
         "draft_temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
+        "enable_thinking": True,
+        "reasoning_effort": "low",
         "mlx_version": "0.32.2",
         "mlx_metal_version": "0.32.2",
         "source_status": [],
@@ -171,6 +221,8 @@ def test_receipt_invariants_require_versions_fingerprints_and_exact_counts() -> 
         "draft_temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
+        "enable_thinking": True,
+        "reasoning_effort": "low",
         "mlx_version": "0.32.2",
         "mlx_metal_version": "0.32.2",
         "source_status": [],
@@ -219,6 +271,8 @@ def test_receipt_invariants_require_stable_installed_route_identity() -> None:
         "draft_temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
+        "enable_thinking": True,
+        "reasoning_effort": "low",
         "mlx_version": "0.32.2",
         "mlx_metal_version": "0.32.2",
         "source_status": [],

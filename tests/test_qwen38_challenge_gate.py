@@ -46,9 +46,8 @@ def test_full_adaptive_benchmark_routes_share_every_safe_retained_optimization()
     gate = _module()
 
     expected_shared = (
-        "r08_device_draft+r10_compact_vocab+r20_kv_only_history+"
-        "r21_qk_rms_rope+r24_eval_ladder+r26_prefill_ladder_3+"
-        "r50_wired_residency+r53_command_buffers+r61_dual_norm_concat"
+        "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+"
+        "r50_wired_residency+r53_command_buffers"
     )
     assert gate.FULL_ADAPTIVE_SHARED_ROUTE == expected_shared
     assert gate.FULL_ADAPTIVE_NATIVE_ROUTE == expected_shared + "+r11_position_ema"
@@ -61,8 +60,9 @@ def test_full_adaptive_benchmark_routes_share_every_safe_retained_optimization()
     assert bf16["mtp_block_variant"] is None
     assert q4["mtp_block_variant"] == "r28"
     assert bf16["adaptive_policy"] == q4["adaptive_policy"] == "position_ema"
-    assert bf16["source_rows"] == (8, 10, 20, 21, 24, 26, 50, 53, 61, 11)
-    assert q4["source_rows"] == (8, 10, 20, 21, 24, 26, 28, 50, 53, 61, 11)
+    assert bf16["source_rows"] == (20, 24, 26, 50, 53, 11)
+    assert q4["source_rows"] == (20, 24, 26, 28, 50, 53, 11)
+    assert bf16["draft_core"] == q4["draft_core"] == "stock"
 
 
 def test_full_adaptive_benchmark_routes_include_measured_command_buffer_profile() -> None:

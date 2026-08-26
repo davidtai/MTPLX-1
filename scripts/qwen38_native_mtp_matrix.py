@@ -48,31 +48,20 @@ PAIRED_ORDER = (
 )
 BF16_OPTIMIZED_KERNEL_IDS = (
     "qwen38_mtp_kv_only_history_ge16384_v1",
-    "qwen38_qk_rms_rope_bf16_h256_r64_v1",
-    "qwen38_row24_qk_rms_rope_l_le16_v1",
     "qwen38_row24_target_eval_ladder_v1",
     "qwen38_row26_prefill_eval_every3_v1",
-    "qwen38_row26_qk_rms_rope_l_le32_v1",
     "qwen38_row50_post_warm_wired_residency_v1",
-    "qwen38_dual_rms_norm_concat_bf16_v1",
-    "qwen38_row10_compact_q4_g64_vocab_v1",
 )
 BF16_OPTIMIZED_FEATURE_KEYS = (
-    "r10_compact_vocab",
     "r20_kv_only_history",
-    "r21_qk_rms_rope",
-    "r24_qk_length_limit",
     "r24_eval_ladder",
     "r26_prefill_ladder_3",
-    "r26_qk_length_limit",
     "r50_wired_residency",
     "r53_command_buffers",
-    "dual_norm",
 )
 BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
-    "kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
-    "r26_prefill_ladder_3+r50_wired_residency+dual_norm+"
-    "r10_compact_vocab"
+    "kv_only_history+r24_eval_ladder+"
+    "r26_prefill_ladder_3+r50_wired_residency"
 )
 Q4_OPTIMIZED_KERNEL_IDS = (
     "qwen38_row28_q4_g64_mtp_block_v1",
@@ -297,18 +286,24 @@ def full_fixed_receipt_errors(
         for key in BF16_OPTIMIZED_FEATURE_KEYS
     ):
         errors.append("optimized fixed K3 feature stack is incomplete")
+    row26 = features.get("r26_prefill_ladder_3") or {}
+    if (
+        row26.get("phase_scope") != "prefill"
+        or row26.get("decode_route") != "stock"
+    ):
+        errors.append("optimized fixed K3 target phase route mismatch")
     if any(key in features for key in ("r17_q4_mtp_block", "r28_q4_mtp_block", "r36_qkv_islands")):
         errors.append("optimized fixed K3 installed a Q4 MTP block")
 
     device_core = receipt.get("device_core_receipt") or {}
     if not (
-        receipt.get("draft_core") == "device"
-        and device_core.get("requested") == "device"
-        and int(device_core.get("device_calls", 0)) > 0
+        receipt.get("draft_core") == "stock"
+        and device_core.get("requested") == "stock"
+        and int(device_core.get("device_calls", -1)) == 0
     ):
-        errors.append("optimized fixed K3 device draft core did not engage")
+        errors.append("optimized fixed K3 stock draft core did not remain selected")
     if int(device_core.get("device_fallbacks", -1)) != 0:
-        errors.append("optimized fixed K3 device draft fallback occurred")
+        errors.append("optimized fixed K3 stock draft fallback occurred")
     if receipt.get("fallback_ar") is True:
         errors.append("optimized fixed K3 fell back to autoregressive decode")
 
@@ -364,6 +359,12 @@ def adaptive_optimized_receipt_errors(
         for key in BF16_OPTIMIZED_FEATURE_KEYS
     ):
         errors.append("adaptive shared feature stack is incomplete")
+    row26 = feature_receipt.get("r26_prefill_ladder_3") or {}
+    if (
+        row26.get("phase_scope") != "prefill"
+        or row26.get("decode_route") != "stock"
+    ):
+        errors.append("adaptive target phase route mismatch")
     if uses_q4:
         if not _feature_is_active(feature_receipt.get("r28_q4_mtp_block")):
             errors.append("adaptive Q4 MTP block is inactive")
@@ -562,6 +563,12 @@ def receipt_errors(
             and int(device_core.get("device_fallbacks", -1)) == 0
         ):
             errors.append("adaptive device draft core did not engage without fallback")
+        if expected_draft_core == "stock" and not (
+            device_core.get("requested") == "stock"
+            and int(device_core.get("device_calls", -1)) == 0
+            and int(device_core.get("device_fallbacks", -1)) == 0
+        ):
+            errors.append("adaptive stock draft core did not remain selected")
         compiled_verify = receipt.get("compiled_verify_receipt") or {}
         exception_fallbacks = sum(
             int(value)

@@ -2007,6 +2007,43 @@ def test_mtplx_settings_endpoint_controls_server_reasoning():
     assert state.args.reasoning_effort == "xhigh"
 
 
+def test_qwen38_performance_profile_selection_uses_resolved_request_effort(
+    monkeypatch,
+) -> None:
+    from mtplx.server import openai
+
+    selected = SimpleNamespace(profile_id="xhigh", draft_core="stock")
+    runtime = SimpleNamespace(qwen38_performance_profiles={"xhigh": selected})
+    calls: list[tuple[object, str]] = []
+
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.select_qwen38_performance_profile",
+        lambda received_runtime, effort: (
+            calls.append((received_runtime, effort)) or selected
+        ),
+    )
+
+    result = openai._select_qwen38_request_performance_profile(
+        runtime,
+        {"resolved_reasoning_effort": "xhigh"},
+    )
+
+    assert result is selected
+    assert calls == [(runtime, "xhigh")]
+
+
+def test_qwen38_performance_profile_selection_is_inert_without_registry() -> None:
+    from mtplx.server import openai
+
+    assert (
+        openai._select_qwen38_request_performance_profile(
+            SimpleNamespace(),
+            {"resolved_reasoning_effort": "low"},
+        )
+        is None
+    )
+
+
 def test_mtplx_settings_endpoint_ignores_read_only_descriptor_echoes():
     state = _fake_state(api_key="mtplx-local")
     client = TestClient(create_app(state))

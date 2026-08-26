@@ -735,6 +735,22 @@ def _qwen38_challenge_route_payload(runtime: Any) -> dict[str, Any] | None:
     return qwen38_route_receipt(getattr(runtime, "qwen38_route", None))
 
 
+def _select_qwen38_request_performance_profile(
+    runtime: Any,
+    request_observability: Mapping[str, Any] | None,
+) -> Any | None:
+    """Apply one construction-bound Qwen route before request execution."""
+
+    if getattr(runtime, "qwen38_performance_profiles", None) is None:
+        return None
+    from mtplx.qwen38_challenge import select_qwen38_performance_profile
+
+    effort = str(
+        (request_observability or {}).get("resolved_reasoning_effort") or ""
+    ).strip().lower()
+    return select_qwen38_performance_profile(runtime, effort or None)
+
+
 def _mlx_runtime_status() -> dict[str, Any]:
     """Report which MLX runtime the daemon imported.
 
@@ -20772,6 +20788,8 @@ def _run_generation(
         "generation_mode": effective_mode,
         **(request_observability or {}),
     }
+    selected_performance_profile = None
+    adaptive_policy = None
     for attempt in range(max_attempts):
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
@@ -20808,6 +20826,19 @@ def _run_generation(
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
+            selected_performance_profile = (
+                _select_qwen38_request_performance_profile(
+                    state.runtime,
+                    request_observability,
+                )
+            )
+            if (
+                selected_performance_profile is not None
+                and request_observability is not None
+            ):
+                request_observability["qwen38_performance_profile"] = (
+                    selected_performance_profile.profile_id
+                )
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
@@ -20907,7 +20938,9 @@ def _run_generation(
                         verify_strategy=state.args.verify_strategy,
                         verify_core=state.args.verify_core,
                         draft_core=str(
-                            getattr(state.args, "draft_core", None) or "stock"
+                            selected_performance_profile.draft_core
+                            if selected_performance_profile is not None
+                            else getattr(state.args, "draft_core", None) or "stock"
                         ),
                         token_callback=record_tokens,
                         session_bank=session_bank,
@@ -20992,6 +21025,13 @@ def _run_generation(
         )
         qwen38_route = _qwen38_challenge_route_payload(state.runtime)
         if qwen38_route is not None:
+            qwen38_route["feature_receipt"] = dict(
+                getattr(state.runtime, "qwen38_feature_receipt", {}) or {}
+            )
+            qwen38_route["speculative_depth"] = int(effective_depth)
+            qwen38_route["adaptive_policy_state"] = (
+                "enabled" if adaptive_policy is not None else "disabled"
+            )
             stats["qwen38_challenge_route"] = qwen38_route
         if effective_mode == "mtp":
             stats["requested_speculative_depth"] = int(requested_depth)

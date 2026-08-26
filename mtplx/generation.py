@@ -4859,6 +4859,25 @@ def _qwen38_prefill_uses_stock_row21(rt: MTPLXRuntime, prompt_tokens: int) -> bo
     return limit > 0 and int(prompt_tokens) > limit
 
 
+@contextmanager
+def _qwen38_prefill_target_route(rt: MTPLXRuntime):
+    """Select an installed target prefill callable once at the phase boundary."""
+
+    text = getattr(rt.model, "language_model", rt.model)
+    prefill_impl = getattr(text, "_mtplx_qwen38_prefill_forward_layers", None)
+    if prefill_impl is None:
+        yield
+        return
+    decode_impl = getattr(text, "_mtplx_forward_layers", None)
+    if not callable(prefill_impl) or not callable(decode_impl):
+        raise RuntimeError("Qwen 3.8 target phase route bindings are invalid")
+    text._mtplx_forward_layers = prefill_impl
+    try:
+        yield
+    finally:
+        text._mtplx_forward_layers = decode_impl
+
+
 def _device_core_cycle_depth_eligible(cycle_depth: int) -> bool:
     """The retained native Qwen 3.8 contract installs exact D1-D3 routes."""
     return 1 <= int(cycle_depth) <= 3
@@ -7579,32 +7598,33 @@ def generate_mtpk(
     except (TypeError, ValueError):
         _stable_prefix_len = None
     _prompt_state_started = time.perf_counter()
-    with _qwen38_stock_row21_route(
-        rt,
-        selected=_qwen38_prefill_uses_stock_row21(rt, len(prompt_ids)),
-    ):
-        prompt_state = restore_or_prefill_prompt_state(
+    with _qwen38_prefill_target_route(rt):
+        with _qwen38_stock_row21_route(
             rt,
-            prompt_ids,
-            vision_splice=vision_splice,
-            base_hidden_variant=base_hidden_variant,
-            mtp_hidden_variant=mtp_hidden_variant,
-            mtp_history_policy=mtp_history_policy,
-            session_bank=session_bank,
-            restore_mode=session_restore_mode,
-            session_id=session_id,
-            template_hash=session_template_hash,
-            draft_head_identity=session_draft_head_identity,
-            policy_fingerprint=session_policy_fingerprint,
-            prefill_callback=prefill_callback,
-            # kvcache-v2: client disconnect aborts the prefill through the same
-            # chunk-granular check the postcommit path uses — an abandoned agent
-            # request must not pin the GPU for a full long-context prefill
-            # (measured: an orphaned ~200k prefill blocked all sessions for
-            # 10+ minutes, 2026-07-03).
-            abort_check=abort_check,
-            stable_prefix_len=_stable_prefix_len,
-        )
+            selected=_qwen38_prefill_uses_stock_row21(rt, len(prompt_ids)),
+        ):
+            prompt_state = restore_or_prefill_prompt_state(
+                rt,
+                prompt_ids,
+                vision_splice=vision_splice,
+                base_hidden_variant=base_hidden_variant,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                session_bank=session_bank,
+                restore_mode=session_restore_mode,
+                session_id=session_id,
+                template_hash=session_template_hash,
+                draft_head_identity=session_draft_head_identity,
+                policy_fingerprint=session_policy_fingerprint,
+                prefill_callback=prefill_callback,
+                # kvcache-v2: client disconnect aborts the prefill through the same
+                # chunk-granular check the postcommit path uses — an abandoned agent
+                # request must not pin the GPU for a full long-context prefill
+                # (measured: an orphaned ~200k prefill blocked all sessions for
+                # 10+ minutes, 2026-07-03).
+                abort_check=abort_check,
+                stable_prefix_len=_stable_prefix_len,
+            )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     pre_first_token_setup_started = time.perf_counter()
     pre_first_token_setup_s = 0.0
@@ -8245,19 +8265,20 @@ def generate_mtpk(
             # The rebase replays the full prompt, so the splice queue
             # must rewind to serve the image rows again.
             vision_splice.reset()
-        with _qwen38_stock_row21_route(
-            rt,
-            selected=_qwen38_prefill_uses_stock_row21(rt, len(prefix_tokens)),
-        ):
-            rebased = restore_or_prefill_prompt_state(
+        with _qwen38_prefill_target_route(rt):
+            with _qwen38_stock_row21_route(
                 rt,
-                prefix_tokens,
-                vision_splice=vision_splice,
-                base_hidden_variant=base_hidden_variant,
-                mtp_hidden_variant=mtp_hidden_variant,
-                mtp_history_policy=mtp_history_policy,
-                session_bank=None,
-            )
+                selected=_qwen38_prefill_uses_stock_row21(rt, len(prefix_tokens)),
+            ):
+                rebased = restore_or_prefill_prompt_state(
+                    rt,
+                    prefix_tokens,
+                    vision_splice=vision_splice,
+                    base_hidden_variant=base_hidden_variant,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_history_policy=mtp_history_policy,
+                    session_bank=None,
+                )
         state_rebase_time_s += time.perf_counter() - started_rebase
         state_rebase_events += 1
         state_rebase_tokens_since = 0

@@ -511,6 +511,7 @@ def _run_one(
     row28_artifact: Path,
     record_depth_usage: bool,
     force_exact_output: bool,
+    performance_profile: str = "low",
     allow_fixed_diagnostic_route: bool = False,
 ) -> dict[str, Any]:
     if route == CONTROL_ROUTE:
@@ -567,6 +568,7 @@ def _run_one(
         row17_artifact_path=None,
         row28_artifact_path=row28_artifact,
         row36_artifact_path=None,
+        performance_profile=performance_profile,
         stop_token_ids=set() if force_exact_output else None,
     )
     if record_depth_usage and result.get("draft_core") == "device":
@@ -676,6 +678,7 @@ def run(args: argparse.Namespace) -> int:
             row28_artifact=row28_artifact,
             record_depth_usage=False,
             force_exact_output=args.force_exact_output,
+            performance_profile=args.workload,
             allow_fixed_diagnostic_route=args.allow_fixed_diagnostic_route,
         )
     arm = _run_one(
@@ -693,6 +696,7 @@ def run(args: argparse.Namespace) -> int:
         row28_artifact=row28_artifact,
         record_depth_usage=args.record_depth_usage,
         force_exact_output=args.force_exact_output,
+        performance_profile=args.workload,
         allow_fixed_diagnostic_route=args.allow_fixed_diagnostic_route,
     )
     _assert_imported_from_source("mtplx.generation", source_root)

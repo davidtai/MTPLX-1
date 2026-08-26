@@ -85,6 +85,10 @@ class Qwen38RouteSpec:
     policy_id: str = "current_mtplx"
     selfcheck_status: str = "unchecked"
     selfcheck_passed: bool = False
+    performance_profile: str | None = None
+    requested_route_id: str | None = None
+    draft_core: str = "stock"
+    mtp_block_identity: str = "bf16"
 
     @property
     def fingerprint(self) -> str:
@@ -94,12 +98,54 @@ class Qwen38RouteSpec:
             "history_route_id": self.history_route_id,
             "min_context_tokens": self.min_context_tokens,
             "policy_id": self.policy_id,
+            "performance_profile": self.performance_profile,
+            "requested_route_id": self.requested_route_id,
+            "draft_core": self.draft_core,
+            "mtp_block_identity": self.mtp_block_identity,
             "route_id": self.route_id,
             "selfcheck_passed": self.selfcheck_passed,
             "selfcheck_status": self.selfcheck_status,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class Qwen38PerformanceProfileConfig:
+    """Construction-only inputs for one prevalidated request route."""
+
+    requested_route_id: str
+    install_options: Mapping[str, Any]
+    draft_core: str = "stock"
+
+
+_MISSING_PROFILE_ATTRIBUTE = object()
+
+
+@dataclass(frozen=True)
+class Qwen38ExecutionBindings:
+    """Already-validated object bindings installed at a request boundary."""
+
+    forward_layers: Any
+    prefill_forward_layers: Any
+    prepare_mtp_inputs: Any
+    mtp_block: Any
+    model_mtp_block: Any
+    draft_lm_head: Any
+    draft_token_id_map: Any
+    draft_target_vocab_size: Any
+    row21_bindings: tuple[tuple[Any, type, Any], ...]
+
+
+@dataclass(frozen=True)
+class Qwen38PerformanceProfile:
+    profile_id: str
+    requested_route_id: str
+    route: Qwen38RouteSpec
+    bindings: Qwen38ExecutionBindings
+    feature_receipt: Mapping[str, Any]
+    draft_core: str
+    mtp_block_identity: str
 
 
 def _qwen38_identity(config: Mapping[str, Any], model_path: Path) -> bool:
@@ -589,7 +635,21 @@ def install_qwen38_route(
         raise Qwen38ContractError(
             f"Qwen 3.8 target layer route {target_layer_route!r} is unavailable"
         )
-    if callable(target_layer_impl):
+    prefill_only_target_ladder = bool(
+        row26_prefill_ladder_3 and not row21_qk_rms_rope
+    )
+    if prefill_only_target_ladder:
+        stock_target_layer_impl = getattr(
+            text, "_mtplx_forward_layers_stock", None
+        )
+        if not callable(stock_target_layer_impl):
+            raise Qwen38ContractError(
+                "Qwen 3.8 prefill-only target ladder requires the stock decode route"
+            )
+        text._mtplx_qwen38_prefill_forward_layers = target_layer_impl
+        text._mtplx_forward_layers = stock_target_layer_impl
+    elif callable(target_layer_impl):
+        text._mtplx_qwen38_prefill_forward_layers = None
         text._mtplx_forward_layers = target_layer_impl
     if row24_eval_ladder:
         route_features.append("r24_eval_ladder")
@@ -605,7 +665,15 @@ def install_qwen38_route(
         if row21_qk_rms_rope:
             kernel_ids.append("qwen38_row26_qk_rms_rope_l_le32_v1")
             feature_receipt["r26_qk_length_limit"] = row24_qk_report
-        feature_receipt["r26_prefill_ladder_3"] = {"active": 1}
+        feature_receipt["r26_prefill_ladder_3"] = (
+            {
+                "active": 1,
+                "phase_scope": "prefill",
+                "decode_route": "stock",
+            }
+            if prefill_only_target_ladder
+            else {"active": 1}
+        )
     row48_report = configure_qwen38_row48_capture(
         runtime,
         active=bool(row48_boundary_fused),
@@ -681,6 +749,168 @@ def install_qwen38_route(
     return route
 
 
+def _profile_attribute(value: Any, name: str) -> Any:
+    return getattr(value, name, _MISSING_PROFILE_ATTRIBUTE)
+
+
+def _capture_qwen38_execution_bindings(runtime: Any) -> Qwen38ExecutionBindings:
+    text = getattr(runtime.model, "language_model", runtime.model)
+    row21 = []
+    for binding in tuple(getattr(text, "_mtplx_row21_bindings", ()) or ()):
+        attention = binding[0]
+        row21.append(
+            (
+                attention,
+                attention.__class__,
+                _profile_attribute(attention, "_mtplx_prepare_explicit_qk"),
+            )
+        )
+    return Qwen38ExecutionBindings(
+        forward_layers=_profile_attribute(text, "_mtplx_forward_layers"),
+        prefill_forward_layers=_profile_attribute(
+            text, "_mtplx_qwen38_prefill_forward_layers"
+        ),
+        prepare_mtp_inputs=_profile_attribute(text, "_mtplx_prepare_mtp_inputs"),
+        mtp_block=_profile_attribute(text, "mtp"),
+        model_mtp_block=_profile_attribute(runtime.model, "mtp"),
+        draft_lm_head=_profile_attribute(text, "_mtplx_draft_lm_head"),
+        draft_token_id_map=_profile_attribute(text, "_mtplx_draft_token_id_map"),
+        draft_target_vocab_size=_profile_attribute(
+            text, "_mtplx_draft_target_vocab_size"
+        ),
+        row21_bindings=tuple(row21),
+    )
+
+
+def _apply_profile_attribute(value: Any, name: str, binding: Any) -> None:
+    if binding is _MISSING_PROFILE_ATTRIBUTE:
+        if hasattr(value, name):
+            delattr(value, name)
+        return
+    setattr(value, name, binding)
+
+
+def _apply_qwen38_execution_bindings(
+    runtime: Any,
+    bindings: Qwen38ExecutionBindings,
+) -> None:
+    text = getattr(runtime.model, "language_model", runtime.model)
+    _apply_profile_attribute(text, "_mtplx_forward_layers", bindings.forward_layers)
+    _apply_profile_attribute(
+        text,
+        "_mtplx_qwen38_prefill_forward_layers",
+        bindings.prefill_forward_layers,
+    )
+    _apply_profile_attribute(
+        text, "_mtplx_prepare_mtp_inputs", bindings.prepare_mtp_inputs
+    )
+    _apply_profile_attribute(text, "mtp", bindings.mtp_block)
+    _apply_profile_attribute(runtime.model, "mtp", bindings.model_mtp_block)
+    _apply_profile_attribute(text, "_mtplx_draft_lm_head", bindings.draft_lm_head)
+    _apply_profile_attribute(
+        text, "_mtplx_draft_token_id_map", bindings.draft_token_id_map
+    )
+    _apply_profile_attribute(
+        text,
+        "_mtplx_draft_target_vocab_size",
+        bindings.draft_target_vocab_size,
+    )
+    for attention, selected_class, explicit_qk in bindings.row21_bindings:
+        attention.__class__ = selected_class
+        _apply_profile_attribute(
+            attention, "_mtplx_prepare_explicit_qk", explicit_qk
+        )
+
+
+def _mtp_block_identity(options: Mapping[str, Any]) -> str:
+    variant = options.get("mtp_block_variant")
+    return "bf16" if variant is None else f"q4-{variant}"
+
+
+def install_qwen38_performance_profiles(
+    runtime: Any,
+    config: Mapping[str, Any],
+    model_path: Path,
+    *,
+    stock: Qwen38PerformanceProfileConfig,
+    low: Qwen38PerformanceProfileConfig,
+    xhigh: Qwen38PerformanceProfileConfig,
+) -> Mapping[str, Qwen38PerformanceProfile]:
+    """Validate and bind stock/low/xhigh routes before accepting requests."""
+
+    installed: dict[str, Qwen38PerformanceProfile] = {}
+    for profile_id, profile_config in (
+        ("stock", stock),
+        ("low", low),
+        ("xhigh", xhigh),
+    ):
+        if profile_config.draft_core not in {"stock", "device"}:
+            raise Qwen38ContractError(
+                f"{profile_id} performance profile has invalid draft core "
+                f"{profile_config.draft_core!r}"
+            )
+        route = install_qwen38_route(
+            runtime,
+            config,
+            model_path,
+            **dict(profile_config.install_options),
+        )
+        if route is None:
+            raise Qwen38ContractError(
+                f"{profile_id} performance profile did not install a bound route"
+            )
+        identity = _mtp_block_identity(profile_config.install_options)
+        selected_route = replace(
+            route,
+            performance_profile=profile_id,
+            requested_route_id=profile_config.requested_route_id,
+            draft_core=profile_config.draft_core,
+            mtp_block_identity=identity,
+        )
+        installed[profile_id] = Qwen38PerformanceProfile(
+            profile_id=profile_id,
+            requested_route_id=profile_config.requested_route_id,
+            route=selected_route,
+            bindings=_capture_qwen38_execution_bindings(runtime),
+            feature_receipt=MappingProxyType(
+                dict(getattr(runtime, "qwen38_feature_receipt", {}) or {})
+            ),
+            draft_core=profile_config.draft_core,
+            mtp_block_identity=identity,
+        )
+    runtime.qwen38_performance_profiles = MappingProxyType(installed)
+    select_qwen38_performance_profile(runtime, None)
+    return runtime.qwen38_performance_profiles
+
+
+def select_qwen38_performance_profile(
+    runtime: Any,
+    reasoning_effort: str | None,
+) -> Qwen38PerformanceProfile:
+    """Select one already-bound route once at the serialized request boundary."""
+
+    profiles = getattr(runtime, "qwen38_performance_profiles", None)
+    if not isinstance(profiles, Mapping):
+        raise Qwen38ContractError("Qwen 3.8 performance profiles are not installed")
+    profile_id = (
+        "xhigh"
+        if str(reasoning_effort or "").strip().lower() == "xhigh"
+        else "low"
+        if str(reasoning_effort or "").strip().lower() == "low"
+        else "stock"
+    )
+    profile = profiles.get(profile_id)
+    if not isinstance(profile, Qwen38PerformanceProfile):
+        raise Qwen38ContractError(
+            f"Qwen 3.8 performance profile {profile_id!r} is unavailable"
+        )
+    _apply_qwen38_execution_bindings(runtime, profile.bindings)
+    runtime.qwen38_route = profile.route
+    runtime.qwen38_feature_receipt = dict(profile.feature_receipt)
+    runtime.qwen38_selected_performance_profile = profile
+    return profile
+
+
 def policy_fingerprint_with_qwen38_route(
     fingerprint: str,
     route: Qwen38RouteSpec | None,
@@ -693,7 +923,7 @@ def policy_fingerprint_with_qwen38_route(
 def qwen38_route_receipt(route: Qwen38RouteSpec | None) -> dict[str, Any] | None:
     if route is None:
         return None
-    return {
+    receipt = {
         "route_id": route.route_id,
         "fingerprint": route.fingerprint,
         "contract_id": route.contract.contract_id,
@@ -706,3 +936,14 @@ def qwen38_route_receipt(route: Qwen38RouteSpec | None) -> dict[str, Any] | None
             "status": route.selfcheck_status,
         },
     }
+    if route.performance_profile is not None:
+        receipt.update(
+            {
+                "performance_profile": route.performance_profile,
+                "requested_route_id": route.requested_route_id,
+                "installed_route_id": route.route_id,
+                "draft_core": route.draft_core,
+                "mtp_block_identity": route.mtp_block_identity,
+            }
+        )
+    return receipt

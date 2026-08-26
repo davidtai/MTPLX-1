@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
-    from .qwen38_challenge import Qwen38RouteSpec
+    from .qwen38_challenge import Qwen38PerformanceProfile, Qwen38RouteSpec
 
 
 @dataclass(frozen=True)
@@ -107,6 +107,7 @@ class MTPLXRuntime:
     a3b_whole_moe_installed: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
     qwen38_route: Qwen38RouteSpec | None = None
+    qwen38_performance_profiles: Mapping[str, Qwen38PerformanceProfile] | None = None
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,

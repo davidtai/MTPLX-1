@@ -203,18 +203,14 @@ def test_full_fixed_k3_uses_the_complete_bf16_stack_without_adaptive_depth(
     assert matrix.FULL_FIXED_NATIVE_ROUTE == matrix.gate.FULL_ADAPTIVE_SHARED_ROUTE
     features = matrix.gate._validate_route_id(matrix.FULL_FIXED_NATIVE_ROUTE)
     assert features == {
-        "r08_device_draft",
-        "r10_compact_vocab",
         "r20_kv_only_history",
-        "r21_qk_rms_rope",
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
         "r50_wired_residency",
         "r53_command_buffers",
-        "r61_dual_norm_concat",
     }
     options = matrix.gate._route_execution_options(matrix.FULL_FIXED_NATIVE_ROUTE)
-    assert options["draft_core"] == "device"
+    assert options["draft_core"] == "stock"
     assert options["speculative_depth"] == 3
     assert options["adaptive_policy"] == "none"
     assert options["adaptive_depth_cap"] == 0
@@ -254,9 +250,8 @@ def test_full_fixed_receipt_requires_bf16_kernels_features_and_no_policy() -> No
     receipt = {
         "route_id": route,
         "installed_route_id": (
-            "kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
-            "r26_prefill_ladder_3+r50_wired_residency+dual_norm+"
-            "r10_compact_vocab"
+            "kv_only_history+r24_eval_ladder+"
+            "r26_prefill_ladder_3+r50_wired_residency"
         ),
         "speculative_depth": 3,
         "requested_speculative_depth": 3,
@@ -264,21 +259,20 @@ def test_full_fixed_receipt_requires_bf16_kernels_features_and_no_policy() -> No
         "adaptive_policy_events": [],
         "kernel_ids": list(matrix.BF16_OPTIMIZED_KERNEL_IDS),
         "feature_receipt": {
-            "r10_compact_vocab": {"active": True, "installed": True},
             "r20_kv_only_history": {"installed": True},
-            "r21_qk_rms_rope": {"active_modules": 16},
-            "r24_qk_length_limit": {"active": 1},
             "r24_eval_ladder": {"active": 1},
-            "r26_prefill_ladder_3": {"active": 1},
-            "r26_qk_length_limit": {"active": 1},
+            "r26_prefill_ladder_3": {
+                "active": 1,
+                "phase_scope": "prefill",
+                "decode_route": "stock",
+            },
             "r50_wired_residency": {"active": True, "installed": True},
             "r53_command_buffers": {"active": True, "installed": True},
-            "dual_norm": {"active": 1},
         },
-        "draft_core": "device",
+        "draft_core": "stock",
         "device_core_receipt": {
-            "requested": "device",
-            "device_calls": 8,
+            "requested": "stock",
+            "device_calls": 0,
             "device_fallbacks": 0,
         },
         "compiled_verify_receipt": {
@@ -292,11 +286,11 @@ def test_full_fixed_receipt_requires_bf16_kernels_features_and_no_policy() -> No
 
     assert matrix.full_fixed_receipt_errors(receipt, expected_route=route) == []
 
-    missing_qk = receipt["feature_receipt"].pop("r24_qk_length_limit")
+    missing_prefill = receipt["feature_receipt"].pop("r26_prefill_ladder_3")
     assert "optimized fixed K3 feature receipt mismatch" in (
         matrix.full_fixed_receipt_errors(receipt, expected_route=route)
     )
-    receipt["feature_receipt"]["r24_qk_length_limit"] = missing_qk
+    receipt["feature_receipt"]["r26_prefill_ladder_3"] = missing_prefill
     receipt["feature_receipt"]["r18_gdn_decay_memo"] = {"active": True}
     assert "optimized fixed K3 feature receipt mismatch" in (
         matrix.full_fixed_receipt_errors(receipt, expected_route=route)
@@ -314,7 +308,7 @@ def test_full_fixed_receipt_requires_bf16_kernels_features_and_no_policy() -> No
     )
     del receipt["feature_receipt"]["r28_q4_mtp_block"]
     receipt["device_core_receipt"]["device_fallbacks"] = 1
-    assert "optimized fixed K3 device draft fallback occurred" in (
+    assert "optimized fixed K3 stock draft fallback occurred" in (
         matrix.full_fixed_receipt_errors(receipt, expected_route=route)
     )
 
@@ -325,6 +319,9 @@ def test_adaptive_receipts_require_the_exact_shared_stack_and_q4_delta() -> None
         key: {"active": True}
         for key in matrix.BF16_OPTIMIZED_FEATURE_KEYS
     }
+    shared_features["r26_prefill_ladder_3"].update(
+        {"phase_scope": "prefill", "decode_route": "stock"}
+    )
     bf16 = {
         "route_id": matrix.FULL_ADAPTIVE_NATIVE_ROUTE,
         "installed_route_id": matrix.BF16_OPTIMIZED_INSTALLED_ROUTE_ID,
@@ -415,25 +412,21 @@ def test_vanity_lane_specs_keep_the_complete_optimized_native_mtp_stack(
     q4 = specs["full-q4-adaptive"].route_id
     assert bf16 == matrix.FULL_ADAPTIVE_NATIVE_ROUTE
     assert q4 == matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
-    assert matrix.gate._route_execution_options(bf16)["draft_core"] == "device"
-    assert matrix.gate._route_execution_options(q4)["draft_core"] == "device"
+    assert matrix.gate._route_execution_options(bf16)["draft_core"] == "stock"
+    assert matrix.gate._route_execution_options(q4)["draft_core"] == "stock"
     for optimized in (
-        "r08_device_draft",
-        "r10_compact_vocab",
         "r20_kv_only_history",
-        "r21_qk_rms_rope",
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
         "r50_wired_residency",
         "r53_command_buffers",
-        "r61_dual_norm_concat",
         "r11_position_ema",
     ):
         assert optimized in bf16
     assert "r28_q4_mtp_block" in q4
 
 
-def test_stochastic_lane_specs_keep_the_measured_device_draft_stack(
+def test_stochastic_lane_specs_keep_the_phase_split_stock_draft_stack(
     tmp_path: Path,
 ) -> None:
     matrix = _module()
@@ -455,7 +448,7 @@ def test_stochastic_lane_specs_keep_the_measured_device_draft_stack(
             matrix.gate._route_execution_options(
                 specs["full-adaptive"].route_id
             )["draft_core"]
-            == "device"
+            == "stock"
         )
 
 
@@ -979,28 +972,17 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
         "prompt_artifact_sha256": matrix.PROMPT_ARTIFACT_SHA256["python"],
         "context_artifact_sha256": matrix.PYTHON_CONTEXT_SHA256,
         "row28_artifact_sha256": matrix.ROW28_ARTIFACT_SHA256,
-        "source_rows": [8, 10, 20, 21, 24, 26, 50, 53, 61, 11],
+        "source_rows": [20, 24, 26, 50, 53, 11],
         "installed_route_id": matrix.BF16_OPTIMIZED_INSTALLED_ROUTE_ID,
         "kernel_ids": list(matrix.BF16_OPTIMIZED_KERNEL_IDS),
         "feature_receipt": {
             key: {"active": True}
-            for key in (
-                "r10_compact_vocab",
-                "r20_kv_only_history",
-                "r21_qk_rms_rope",
-                "r24_qk_length_limit",
-                "r24_eval_ladder",
-                "r26_prefill_ladder_3",
-                "r26_qk_length_limit",
-                "r50_wired_residency",
-                "r53_command_buffers",
-                "dual_norm",
-            )
+            for key in matrix.BF16_OPTIMIZED_FEATURE_KEYS
         },
         "adaptive_policy_receipt": {"kind": "position_ema", "executed": True},
         "device_core_receipt": {
-            "requested": "device",
-            "device_calls": 400,
+            "requested": "stock",
+            "device_calls": 0,
             "device_fallbacks": 0,
         },
         "compiled_verify_receipt": {
@@ -1015,7 +997,7 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
             "prompt_tokens": 16_384,
             "row20_engaged": True,
         },
-        "draft_core": "device",
+        "draft_core": "stock",
         "drafted_by_depth": [1, 1, 1],
         "accepted_by_depth": [1, 1, 1],
         "verify_calls": 1,
@@ -1039,6 +1021,9 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
     )
     receipt["feature_receipt"]["r53_command_buffers"].update(
         {"max_mb_per_buffer": 512, "max_ops_per_buffer": 50}
+    )
+    receipt["feature_receipt"]["r26_prefill_ladder_3"].update(
+        {"phase_scope": "prefill", "decode_route": "stock"}
     )
 
     assert matrix.receipt_errors(
@@ -1220,23 +1205,12 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
         "prompt_artifact_sha256": matrix.PROMPT_ARTIFACT_SHA256["python"],
         "context_artifact_sha256": matrix.PYTHON_CONTEXT_SHA256,
         "row28_artifact_sha256": matrix.ROW28_ARTIFACT_SHA256,
-        "source_rows": [8, 10, 20, 21, 24, 26, 50, 53, 61, 11],
+        "source_rows": [20, 24, 26, 50, 53, 11],
         "installed_route_id": matrix.BF16_OPTIMIZED_INSTALLED_ROUTE_ID,
         "kernel_ids": list(matrix.BF16_OPTIMIZED_KERNEL_IDS),
         "feature_receipt": {
             key: {"active": True}
-            for key in (
-                "r10_compact_vocab",
-                "r20_kv_only_history",
-                "r21_qk_rms_rope",
-                "r24_qk_length_limit",
-                "r24_eval_ladder",
-                "r26_prefill_ladder_3",
-                "r26_qk_length_limit",
-                "r50_wired_residency",
-                "r53_command_buffers",
-                "dual_norm",
-            )
+            for key in matrix.BF16_OPTIMIZED_FEATURE_KEYS
         },
         "adaptive_policy_receipt": {
             "kind": "position_ema",
@@ -1249,8 +1223,8 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
             "depth_cap": 3,
         },
         "device_core_receipt": {
-            "requested": "device",
-            "device_calls": 400,
+            "requested": "stock",
+            "device_calls": 0,
             "device_fallbacks": 0,
         },
         "compiled_verify_receipt": {
@@ -1266,7 +1240,7 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
             "prompt_tokens": 1_024,
             "row20_engaged": False,
         },
-        "draft_core": "device",
+        "draft_core": "stock",
         "drafted_by_depth": [500, 300, 100],
         "accepted_by_depth": [300, 150, 50],
         "verify_calls": 500,
@@ -1283,6 +1257,9 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
     )
     base["feature_receipt"]["r53_command_buffers"].update(
         {"max_mb_per_buffer": 512, "max_ops_per_buffer": 50}
+    )
+    base["feature_receipt"]["r26_prefill_ladder_3"].update(
+        {"phase_scope": "prefill", "decode_route": "stock"}
     )
     assert matrix.receipt_errors(
         base, lane=lane, context_tokens=1_024, output_tokens=1_024
@@ -1303,11 +1280,11 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
     assert "adaptive policy state receipt is incomplete" in errors
 
     broken = json.loads(json.dumps(base))
-    broken["device_core_receipt"]["device_fallbacks"] = 1
+    broken["device_core_receipt"]["device_calls"] = 1
     errors = matrix.receipt_errors(
         broken, lane=lane, context_tokens=1_024, output_tokens=1_024
     )
-    assert "adaptive device draft core did not engage without fallback" in errors
+    assert "adaptive stock draft core did not remain selected" in errors
 
     broken = json.loads(json.dumps(base))
     broken["compiled_verify_receipt"]["fallback_reasons"] = {
