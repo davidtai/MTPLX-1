@@ -640,6 +640,22 @@ def _route_execution_options(route_id: str) -> dict[str, Any]:
     }
 
 
+def _validate_process_latched_route(
+    options: dict[str, Any],
+    *,
+    environment: Any = os.environ,
+) -> None:
+    if not bool(options["row53_command_buffers"]):
+        return
+    max_mb = int(environment.get("MLX_MAX_MB_PER_BUFFER", "0") or "0")
+    max_ops = int(environment.get("MLX_MAX_OPS_PER_BUFFER", "0") or "0")
+    if (max_mb, max_ops) != (512, 50):
+        raise RuntimeError(
+            "Qwen 3.8 row 53 process contract requires "
+            "MLX_MAX_MB_PER_BUFFER=512 and MLX_MAX_OPS_PER_BUFFER=50"
+        )
+
+
 def _conditioning_order(
     order: list[str],
     *,
@@ -920,14 +936,15 @@ def _run_arm(
     performance_profile: str,
     stop_token_ids: set[int] | None = None,
 ) -> dict[str, Any]:
+    options = _route_execution_options(route_id)
+    _validate_process_latched_route(options)
+
     import mlx.core as mx
 
     from mtplx.generation import generate_mtpk
     from mtplx.adaptive import PositionEMADepthPolicy
     from mtplx.qwen38_challenge import install_qwen38_route
     from mtplx.sampling import SamplerConfig
-
-    options = _route_execution_options(route_id)
     route = install_qwen38_route(
         runtime,
         config,
@@ -1161,6 +1178,7 @@ def main() -> int:
         raise ValueError("order must contain at least one route")
     for item in order:
         _validate_route_id(item)
+        _validate_process_latched_route(_route_execution_options(item))
     frozen_substrate_fingerprint = _frozen_substrate_fingerprint(
         model_path=model_path,
         model_artifact_hashes=model_artifact_hashes,

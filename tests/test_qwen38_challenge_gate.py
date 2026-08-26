@@ -76,6 +76,24 @@ def test_full_adaptive_benchmark_routes_include_measured_command_buffer_profile(
         assert gate._route_execution_options(route)["row53_command_buffers"] is True
 
 
+def test_row53_route_rejects_missing_process_latched_environment() -> None:
+    gate = _module()
+
+    with pytest.raises(RuntimeError, match="row 53 process contract"):
+        gate._validate_process_latched_route(
+            gate._route_execution_options("r53_command_buffers"),
+            environment={},
+        )
+
+    gate._validate_process_latched_route(
+        gate._route_execution_options("r53_command_buffers"),
+        environment={
+            "MLX_MAX_MB_PER_BUFFER": "512",
+            "MLX_MAX_OPS_PER_BUFFER": "50",
+        },
+    )
+
+
 def test_native_gate_has_no_rejected_source_artifact_flag() -> None:
     source = ISOLATED_SCRIPT.read_text(encoding="utf-8")
     assert "--source-artifact" not in source
