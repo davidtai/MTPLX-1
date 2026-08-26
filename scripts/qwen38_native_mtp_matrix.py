@@ -16,11 +16,10 @@ import sys
 import time
 from typing import Any, NamedTuple
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from scripts import qwen38_challenge_port_gate as gate
+try:
+    from scripts import qwen38_challenge_port_gate as gate
+except ModuleNotFoundError:  # Direct execution places scripts/ on sys.path.
+    import qwen38_challenge_port_gate as gate  # type: ignore[no-redef]
 
 
 V292_COMMIT = "bbc67427e88288001e4b90ecb44708dc0222154c"
@@ -53,6 +52,7 @@ VANITY_TEMPERATURE = 0.0
 REQUIRED_MLX_VERSION = "0.32.2"
 REQUIRED_MLX_METAL_VERSION = "0.32.2"
 MODEL_HASHES_ENV = gate.MODEL_ARTIFACT_HASHES_ENV
+ROOT = Path(__file__).resolve().parents[1]
 ARM_SCRIPT = ROOT / "scripts/qwen38_native_mtp_matrix_arm.py"
 ISOLATED_SCRIPT = ROOT / "scripts/qwen38_challenge_port_isolated_gate.py"
 VANITY_PROMPT_FILE = ROOT / "mtplx/benchmarks/prompts/qwen38_palindrome_vanity.jsonl"
