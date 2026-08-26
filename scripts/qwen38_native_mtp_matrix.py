@@ -285,7 +285,7 @@ def receipt_errors(
         if expected_draft_core == "device":
             try:
                 expected_usage = depth_usage(
-                    generated_tokens=int(receipt["generated_tokens"]),
+                    decode_cycles=len(receipt["attempted_depth_schedule"]),
                     verify_calls=int(receipt["verify_calls"]),
                     drafted_by_depth=list(receipt["drafted_by_depth"]),
                     accepted_by_depth=list(receipt["accepted_by_depth"]),
@@ -342,15 +342,14 @@ def _mean(rows: list[dict[str, Any]], key: str) -> float:
 
 def depth_usage(
     *,
-    generated_tokens: int,
+    decode_cycles: int,
     verify_calls: int,
     drafted_by_depth: list[int],
     accepted_by_depth: list[int],
-    terminal_primary_cycles: int = 1,
 ) -> dict[str, Any]:
     drafted = ([int(value) for value in drafted_by_depth] + [0, 0, 0])[:3]
     accepted = ([int(value) for value in accepted_by_depth] + [0, 0, 0])[:3]
-    cycles = int(generated_tokens) - sum(accepted) - int(terminal_primary_cycles)
+    cycles = int(decode_cycles)
     verified = int(verify_calls)
     if verified != drafted[0]:
         raise ValueError("verify calls contradict attempted MTP depth")
@@ -422,11 +421,10 @@ def _aggregate_depth_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for index, value in enumerate((row.get("accepted_by_depth") or ())[:3]):
             accepted[index] += int(value)
     return depth_usage(
-        generated_tokens=sum(int(row["generated_tokens"]) for row in rows),
+        decode_cycles=sum(len(row.get("attempted_depth_schedule") or ()) for row in rows),
         verify_calls=sum(int(row["verify_calls"]) for row in rows),
         drafted_by_depth=drafted,
         accepted_by_depth=accepted,
-        terminal_primary_cycles=len(rows),
     )
 
 

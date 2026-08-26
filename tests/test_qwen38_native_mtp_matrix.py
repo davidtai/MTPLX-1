@@ -395,8 +395,9 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
         "drafted_by_depth": [1, 1, 1],
         "accepted_by_depth": [1, 1, 1],
         "verify_calls": 1,
+        "attempted_depth_schedule": [0] * 1_020 + [3],
         "depth_usage": matrix.depth_usage(
-            generated_tokens=1_024,
+            decode_cycles=1_021,
             verify_calls=1,
             drafted_by_depth=[1, 1, 1],
             accepted_by_depth=[1, 1, 1],
@@ -514,7 +515,7 @@ def test_depth_usage_derives_attempted_and_accepted_d0_through_d3() -> None:
     matrix = _module()
 
     usage = matrix.depth_usage(
-        generated_tokens=201,
+        decode_cycles=100,
         verify_calls=80,
         drafted_by_depth=[80, 50, 20],
         accepted_by_depth=[60, 30, 10],
@@ -620,9 +621,13 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
         "drafted_by_depth": [500, 300, 100],
         "accepted_by_depth": [300, 150, 50],
         "verify_calls": 500,
+        "attempted_depth_schedule": [0] * 24
+        + [1] * 200
+        + [2] * 200
+        + [3] * 100,
     }
     base["depth_usage"] = matrix.depth_usage(
-        generated_tokens=1_024,
+        decode_cycles=len(base["attempted_depth_schedule"]),
         verify_calls=base["verify_calls"],
         drafted_by_depth=base["drafted_by_depth"],
         accepted_by_depth=base["accepted_by_depth"],

@@ -282,7 +282,7 @@ def _history_route_receipt(runtime: Any, prompt_tokens: int) -> dict[str, Any]:
 
 def depth_usage(
     *,
-    generated_tokens: int,
+    decode_cycles: int,
     verify_calls: int,
     drafted_by_depth: list[int],
     accepted_by_depth: list[int],
@@ -291,7 +291,7 @@ def depth_usage(
 
     drafted = ([int(value) for value in drafted_by_depth] + [0, 0, 0])[:3]
     accepted = ([int(value) for value in accepted_by_depth] + [0, 0, 0])[:3]
-    decode_cycles = int(generated_tokens) - sum(accepted) - 1
+    decode_cycles = int(decode_cycles)
     verified = int(verify_calls)
     if verified != drafted[0]:
         raise ValueError("verify calls contradict attempted MTP depth")
@@ -545,7 +545,7 @@ def _run_one(
     )
     if record_depth_usage and result.get("draft_core") == "device":
         result["depth_usage"] = depth_usage(
-            generated_tokens=int(result["generated_tokens"]),
+            decode_cycles=len(result["attempted_depth_schedule"]),
             verify_calls=int(result["verify_calls"]),
             drafted_by_depth=list(result["drafted_by_depth"]),
             accepted_by_depth=list(result["accepted_by_depth"]),
