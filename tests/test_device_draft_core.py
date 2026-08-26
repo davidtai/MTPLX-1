@@ -319,6 +319,12 @@ def test_device_core_installs_all_adaptive_depths_without_poisoning_live_cache()
     }
 
     for depth, core in cores.items():
+        stale_width = max(1, depth - 1)
+        cache[0].rollback_state = [
+            mx.array(99, dtype=mx.int32),
+            mx.zeros((1, 1, stale_width, 1)),
+            mx.zeros((1, 1, stale_width, 1)),
+        ]
         tokens, distributions = _run_device_draft_core(
             core,
             mx.zeros((1, 1, 1)),
@@ -328,6 +334,9 @@ def test_device_core_installs_all_adaptive_depths_without_poisoning_live_cache()
         assert len(tokens) == depth
         assert len(distributions) == depth
         assert int(cache[0].offset) == depth
+        assert all(value is None for value in cache[0].rollback_state)
+        generation._rollback_mtp_cache(cache, min(1, depth))
+        assert int(cache[0].offset) == min(1, depth)
         generation._rollback_mtp_cache(cache, 0)
 
 

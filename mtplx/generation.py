@@ -5195,6 +5195,11 @@ def _run_device_draft_core(
         core["state_layout"],
         tuple(result[payload_count:]),
     )
+    # A compiled replay advances only the explicit array state above; Python
+    # rollback metadata from the preceding committed-history append is stale.
+    # Hand the live cache back to the decode loop in its offset-only rollback
+    # state so an accepted speculative block cannot consume that old snapshot.
+    _clear_mtp_cache_rollback_state(core["cache"])
     tokens = [int(t.reshape(-1)[0].item()) for t in payload[:depth]]
     if core["greedy"]:
         return tokens, [
