@@ -241,6 +241,8 @@ def child_command(
         "--output", str(output.resolve()),
     ]
     route_features = gate._validate_route_id(lane.route_id)
+    if workload != "vanity":
+        command.append("--force-exact-output")
     if context_tokens == 131_072 and "r11_position_ema" in route_features:
         command.append("--record-depth-usage")
     return command
@@ -373,6 +375,40 @@ def adaptive_optimized_receipt_errors(
     return errors
 
 
+def _output_contract_errors(
+    receipt: dict[str, Any],
+    *,
+    output_tokens: int,
+) -> list[str]:
+    errors: list[str] = []
+    workload = receipt.get("workload")
+    if workload == "vanity":
+        if receipt.get("stop_token_policy") != "tokenizer_default":
+            errors.append("vanity stop-token policy is not tokenizer default")
+        if receipt.get("finish_reason") != "stop":
+            errors.append("vanity arm did not stop naturally")
+        generated = int(receipt.get("generated_tokens", -1))
+        if not 0 < generated <= output_tokens:
+            errors.append("vanity output token count is invalid")
+        if int(receipt.get("conditioner_generated_tokens", -1)) != 0:
+            errors.append("vanity unexpectedly generated conditioner tokens")
+        if receipt.get("conditioner_finish_reason") is not None:
+            errors.append("vanity unexpectedly recorded a conditioner finish reason")
+        return errors
+
+    if receipt.get("stop_token_policy") != "disabled_for_exact_output":
+        errors.append("thinking stop-token policy did not force exact output")
+    if int(receipt.get("generated_tokens", -1)) != output_tokens:
+        errors.append("timed output token count is not exact")
+    if receipt.get("finish_reason") != "length":
+        errors.append("exact-output arm did not finish at the requested length")
+    if int(receipt.get("conditioner_generated_tokens", -1)) != CONDITIONER_OUTPUT_TOKENS:
+        errors.append("conditioner output token count is not exact")
+    if receipt.get("conditioner_finish_reason") != "length":
+        errors.append("conditioner did not finish at the requested length")
+    return errors
+
+
 def receipt_errors(
     receipt: dict[str, Any],
     *,
@@ -468,8 +504,7 @@ def receipt_errors(
     for key, expected in required_runtime_env.items():
         if runtime_env.get(key) != expected:
             errors.append(f"optimized stack runtime env {key} mismatch")
-    if receipt.get("workload") != "vanity" and int(receipt.get("generated_tokens", -1)) != output_tokens:
-        errors.append("timed output token count is not exact")
+    errors.extend(_output_contract_errors(receipt, output_tokens=output_tokens))
     if lane.route_id != "control":
         expected_options = gate._route_execution_options(lane.route_id)
         if tuple(receipt.get("source_rows") or ()) != tuple(

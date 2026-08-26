@@ -430,6 +430,7 @@ def _run_control_arm(
     draft_temperature: float,
     top_p: float,
     top_k: int,
+    force_exact_output: bool,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -460,6 +461,7 @@ def _run_control_arm(
         verify_strategy=VERIFY_STRATEGY,
         verify_core=VERIFY_CORE,
         mtp_history_policy="committed",
+        stop_token_ids=set() if force_exact_output else None,
     )
     wall_s = time.perf_counter() - started
     stats = output.stats
@@ -489,6 +491,7 @@ def _run_control_arm(
         "adaptive_policy_receipt": None,
         "token_hash": _token_hash(list(output.tokens)),
         "tokens": list(output.tokens),
+        "finish_reason": output.finish_reason,
     }
 
 
@@ -507,6 +510,7 @@ def _run_one(
     top_k: int,
     row28_artifact: Path,
     record_depth_usage: bool,
+    force_exact_output: bool,
 ) -> dict[str, Any]:
     if route == CONTROL_ROUTE:
         return _run_control_arm(
@@ -518,6 +522,7 @@ def _run_one(
             draft_temperature=draft_temperature,
             top_p=top_p,
             top_k=top_k,
+            force_exact_output=force_exact_output,
         )
 
     from scripts import qwen38_challenge_port_gate as source_gate
@@ -546,6 +551,7 @@ def _run_one(
         row17_artifact_path=None,
         row28_artifact_path=row28_artifact,
         row36_artifact_path=None,
+        stop_token_ids=set() if force_exact_output else None,
     )
     if record_depth_usage and result.get("draft_core") == "device":
         result["depth_usage"] = depth_usage(
@@ -591,6 +597,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, required=True)
     parser.add_argument("--row28-artifact", type=Path, required=True)
     parser.add_argument("--record-depth-usage", action="store_true")
+    parser.add_argument("--force-exact-output", action="store_true")
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -651,6 +658,7 @@ def run(args: argparse.Namespace) -> int:
             top_k=args.top_k,
             row28_artifact=row28_artifact,
             record_depth_usage=False,
+            force_exact_output=args.force_exact_output,
         )
     arm = _run_one(
         runtime,
@@ -666,6 +674,7 @@ def run(args: argparse.Namespace) -> int:
         top_k=args.top_k,
         row28_artifact=row28_artifact,
         record_depth_usage=args.record_depth_usage,
+        force_exact_output=args.force_exact_output,
     )
     _assert_imported_from_source("mtplx.generation", source_root)
     if args.route != CONTROL_ROUTE:
@@ -690,6 +699,9 @@ def run(args: argparse.Namespace) -> int:
         "conditioner_generated_tokens": (
             0 if conditioner is None else int(conditioner["generated_tokens"])
         ),
+        "conditioner_finish_reason": (
+            None if conditioner is None else conditioner["finish_reason"]
+        ),
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "sampler": {
@@ -704,6 +716,11 @@ def run(args: argparse.Namespace) -> int:
         "model_id": model.name,
         "model_artifact_hashes": model_hashes,
         "row28_artifact_sha256": row28_hash,
+        "stop_token_policy": (
+            "disabled_for_exact_output"
+            if args.force_exact_output
+            else "tokenizer_default"
+        ),
         "optimized_stack": optimized_stack,
         **arm,
     }

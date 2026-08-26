@@ -918,6 +918,7 @@ def _run_arm(
     row17_artifact_path: Path | None,
     row28_artifact_path: Path | None,
     row36_artifact_path: Path | None,
+    stop_token_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -1000,6 +1001,7 @@ def _run_arm(
         verify_strategy="capture_commit",
         verify_core="linear-gdn-from-conv-tape",
         mtp_history_policy="committed",
+        stop_token_ids=stop_token_ids,
     )
     wall_s = time.perf_counter() - started
     stats = output.stats
@@ -1079,6 +1081,7 @@ def _run_arm(
         "device_core_receipt": device_core_receipt,
         "token_hash": _token_hash(list(output.tokens)),
         "tokens": list(output.tokens),
+        "finish_reason": output.finish_reason,
     }
 
 

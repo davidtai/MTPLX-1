@@ -637,6 +637,7 @@ def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -
         "--target-temperature 1.0",
         "--top-p 0.95",
         "--top-k 20",
+        "--force-exact-output",
     ):
         assert expected in joined
     assert "--record-depth-usage" not in command
@@ -688,6 +689,79 @@ def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -
     )
     vanity_joined = " ".join(map(str, vanity_command))
     assert "--warmup-tokens 0" in vanity_joined
+    assert "--force-exact-output" not in vanity_command
+
+
+def test_matrix_arm_disables_stop_tokens_for_exact_output(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    arm = _arm_module()
+    from scripts import qwen38_challenge_port_gate as gate
+
+    observed: dict[str, object] = {}
+
+    def fake_run_arm(*args: Any, **kwargs: Any) -> dict[str, object]:
+        del args
+        observed.update(kwargs)
+        return {"draft_core": "device"}
+
+    monkeypatch.setattr(gate, "_run_arm", fake_run_arm)
+
+    arm._run_one(
+        object(),
+        {},
+        tmp_path / "model",
+        [1, 2, 3],
+        route=gate.FULL_ADAPTIVE_NATIVE_ROUTE,
+        max_tokens=16_384,
+        seed=42,
+        target_temperature=1.0,
+        draft_temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        row28_artifact=tmp_path / "row28.safetensors",
+        record_depth_usage=False,
+        force_exact_output=True,
+    )
+
+    assert observed["stop_token_ids"] == set()
+
+
+def test_output_contract_accepts_natural_vanity_and_rejects_length_cap() -> None:
+    matrix = _module()
+    receipt = {
+        "workload": "vanity",
+        "generated_tokens": 120,
+        "finish_reason": "stop",
+        "stop_token_policy": "tokenizer_default",
+        "conditioner_generated_tokens": 0,
+        "conditioner_finish_reason": None,
+    }
+
+    assert matrix._output_contract_errors(receipt, output_tokens=1_024) == []
+    receipt["finish_reason"] = "length"
+    assert "vanity arm did not stop naturally" in matrix._output_contract_errors(
+        receipt,
+        output_tokens=1_024,
+    )
+
+
+def test_output_contract_rejects_short_conditioner() -> None:
+    matrix = _module()
+    receipt = {
+        "workload": "low",
+        "generated_tokens": 1_024,
+        "finish_reason": "length",
+        "stop_token_policy": "disabled_for_exact_output",
+        "conditioner_generated_tokens": 700,
+        "conditioner_finish_reason": "stop",
+    }
+
+    errors = matrix._output_contract_errors(receipt, output_tokens=1_024)
+
+    assert "conditioner output token count is not exact" in errors
+    assert "conditioner did not finish at the requested length" in errors
 
 
 def test_campaign_rejects_dirty_sources_before_entering_gpu_window(
@@ -763,8 +837,12 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
         "route_id": lane.route_id,
         "prompt_tokens": 16_384,
         "conditioner_output_tokens": 1_024,
+        "conditioner_generated_tokens": 1_024,
+        "conditioner_finish_reason": "length",
         "max_tokens": 1_024,
         "generated_tokens": 1_024,
+        "finish_reason": "length",
+        "stop_token_policy": "disabled_for_exact_output",
         "mlx_version": "0.32.2",
         "mlx_metal_version": "0.32.2",
         "gpu_lock_scope": "attested_parent",
@@ -1001,8 +1079,12 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
         "workload": "low",
         "prompt_tokens": 1_024,
         "conditioner_output_tokens": 1_024,
+        "conditioner_generated_tokens": 1_024,
+        "conditioner_finish_reason": "length",
         "max_tokens": 1_024,
         "generated_tokens": 1_024,
+        "finish_reason": "length",
+        "stop_token_policy": "disabled_for_exact_output",
         "mlx_version": "0.32.2",
         "mlx_metal_version": "0.32.2",
         "gpu_lock_scope": "attested_parent",
