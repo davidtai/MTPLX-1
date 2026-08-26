@@ -196,3 +196,41 @@ def test_qk_rms_rope_matches_stock_qwen38_partial_rope_at_fixed_d3_width() -> No
 
     assert mx.array_equal(q_actual, q_expected).item()
     assert mx.array_equal(k_actual, k_expected).item()
+
+
+def test_qk_rms_rope_accepts_tensor_offset_inside_compiled_verify() -> None:
+    queries = mx.random.normal((1, 4, 24, 256)).astype(mx.bfloat16)
+    keys = mx.random.normal((1, 4, 4, 256)).astype(mx.bfloat16)
+    q_weight = mx.random.normal((256,)).astype(mx.bfloat16)
+    k_weight = mx.random.normal((256,)).astype(mx.bfloat16)
+    mx.eval(queries, keys, q_weight, k_weight)
+
+    compiled = mx.compile(
+        lambda q, k, offset: qwen38_qk_rms_rope(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            1e-6,
+            offset,
+        )
+    )
+
+    q_actual, k_actual = compiled(
+        queries,
+        keys,
+        mx.array(37, dtype=mx.int32),
+    )
+    mx.eval(q_actual, k_actual)
+
+    q_expected, k_expected = qwen38_qk_rms_rope(
+        queries,
+        keys,
+        q_weight,
+        k_weight,
+        1e-6,
+        37,
+    )
+    mx.eval(q_expected, k_expected)
+    assert mx.array_equal(q_actual, q_expected).item()
+    assert mx.array_equal(k_actual, k_expected).item()

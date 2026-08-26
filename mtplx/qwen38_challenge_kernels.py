@@ -159,7 +159,7 @@ def qwen38_qk_rms_rope(
             q_weight,
             k_weight,
             float(eps),
-            int(offset),
+            offset,
             23.253496664211536,
         ],
         template=[],
@@ -212,7 +212,7 @@ def _row21_attention_call(self, x, mask=None, cache=None):
         self.q_norm.weight,
         self.k_norm.weight,
         float(self.q_norm.eps),
-        int(offset),
+        offset,
     )
     if cache is not None:
         keys, values = cache.update_and_fetch(keys, values)
@@ -235,7 +235,7 @@ def _row21_explicit_qk(attention, queries, keys, position_offset):
         attention.q_norm.weight,
         attention.k_norm.weight,
         float(attention.q_norm.eps),
-        int(position_offset),
+        position_offset,
     )
 
 
