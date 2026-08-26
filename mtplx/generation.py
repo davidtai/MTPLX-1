@@ -4962,6 +4962,51 @@ def _device_core_state_signature(cache: Any) -> tuple[Any, ...]:
     return tuple(signature)
 
 
+def _snapshot_device_core_live_containers(cache: Any) -> Callable[[], None]:
+    """Restore concrete cache leaves after construction-time MLX tracing.
+
+    ``mx.compile`` traces the draft forward against the live cache containers.
+    During that trace MLX replaces list leaves with tracer arrays.  A second
+    depth trace must see the same materialized pre-trace state, not those
+    placeholders.  Preserve container identity because compiled inputs and
+    outputs are bound to it; only restore the concrete leaves afterward.
+    """
+
+    snapshots: list[tuple[Any, Any]] = []
+    seen: set[int] = set()
+
+    def visit(node: Any) -> None:
+        identity = id(node)
+        if identity in seen:
+            return
+        if isinstance(node, list):
+            seen.add(identity)
+            snapshots.append((node, list(node)))
+            for child in node:
+                visit(child)
+        elif isinstance(node, dict):
+            seen.add(identity)
+            snapshots.append((node, dict(node)))
+            for child in node.values():
+                visit(child)
+
+    visit(_device_core_state_tree(cache))
+    for entry in cache or ():
+        rollback_state = getattr(entry, "rollback_state", None)
+        if isinstance(rollback_state, list):
+            visit(rollback_state)
+
+    def restore() -> None:
+        for container, values in reversed(snapshots):
+            if isinstance(container, list):
+                container[:] = values
+            else:
+                container.clear()
+                container.update(values)
+
+    return restore
+
+
 def _make_device_draft_core(
     rt: MTPLXRuntime,
     hidden: mx.array,
@@ -5053,15 +5098,19 @@ def _make_device_draft_core(
             tok = next_tok
         return tuple(tokens + q_ids + q_probs)
 
+    state_tree = _device_core_state_tree(mtp_cache)
+    restore_live_containers = _snapshot_device_core_live_containers(mtp_cache)
     compiled = mx.compile(
         chain_fn,
-        inputs=_device_core_state_tree(mtp_cache),
-        outputs=_device_core_state_tree(mtp_cache),
+        inputs=state_tree,
+        outputs=state_tree,
     )
-    smoke_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
-    smoke = compiled(hidden, token_ids, smoke_keys)
-    _eval(smoke)
-    _rollback_mtp_cache(mtp_cache, base_offset)
+    try:
+        smoke_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
+        smoke = compiled(hidden, token_ids, smoke_keys)
+        _eval(smoke)
+    finally:
+        restore_live_containers()
     return {
         "fn": compiled,
         "depth": depth,

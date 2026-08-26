@@ -21,6 +21,7 @@ from mtplx.generation import (  # noqa: E402
     _map_compact_draft_ids,
     _map_compact_host_draft,
     _require_compact_device_core,
+    _run_device_draft_core,
 )
 from mtplx.graphbank import TensorOffsetKVCache  # noqa: E402
 from mtplx.sampling import SamplerConfig, SparseDistribution  # noqa: E402
@@ -274,6 +275,58 @@ def test_device_core_materializes_promoted_offset_before_capturing_base() -> Non
         )
 
     assert events == ["size", "ensure_capacity:10", "offset"]
+
+
+def test_device_core_installs_all_adaptive_depths_without_poisoning_live_cache() -> None:
+    class Runtime:
+        def draft_mtp(
+            self,
+            hidden,
+            token_ids,
+            *,
+            mtp_cache,
+            return_hidden,
+            mtp_hidden_variant,
+            mtp_depth,
+        ):
+            del return_hidden, mtp_hidden_variant, mtp_depth
+            values = token_ids.astype(mx.float32).reshape(1, 1, 1, 1)
+            mtp_cache[0].update_and_fetch(values, values)
+            logits = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8)
+            return logits + hidden[..., :1], hidden + 1
+
+    cache = [
+        TensorOffsetKVCache(
+            mx.zeros((1, 1, 16, 1)),
+            mx.zeros((1, 1, 16, 1)),
+            0,
+            step=16,
+        )
+    ]
+    kwargs = {
+        "rt": Runtime(),
+        "hidden": mx.zeros((1, 1, 1)),
+        "token_ids": mx.array([[1]]),
+        "mtp_hidden_variant": "post_norm",
+        "mtp_cache": cache,
+        "draft_sampler": SamplerConfig(temperature=0.0),
+        "compact_binding": generation._CompactDeviceDraftBinding(None, None),
+    }
+
+    cores = {
+        depth: _make_device_draft_core(depth=depth, seed=depth, **kwargs)
+        for depth in (1, 2, 3)
+    }
+
+    for depth, core in cores.items():
+        tokens, distributions = _run_device_draft_core(
+            core,
+            mx.zeros((1, 1, 1)),
+            1,
+            seed=depth + 10,
+        )
+        assert len(tokens) == depth
+        assert len(distributions) == depth
 
 
 def test_device_inverse_cdf_sampling_matches_q() -> None:

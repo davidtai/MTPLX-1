@@ -66,6 +66,18 @@ def test_matrix_workload_contract_redoes_every_requested_context() -> None:
     assert matrix.PYTHON_CONTEXT_FILE.name == "generation.py"
 
 
+def test_frozen_input_artifact_hashes_match_repository_bytes() -> None:
+    matrix = _module()
+
+    assert matrix._sha256(matrix.VANITY_PROMPT_FILE) == (
+        matrix.PROMPT_ARTIFACT_SHA256["vanity"]
+    )
+    assert matrix._sha256(matrix.PYTHON_PROMPT_FILE) == (
+        matrix.PROMPT_ARTIFACT_SHA256["python"]
+    )
+    assert matrix._sha256(matrix.PYTHON_CONTEXT_FILE) == matrix.PYTHON_CONTEXT_SHA256
+
+
 def test_lane_specs_keep_source_and_head_changes_separate(tmp_path: Path) -> None:
     matrix = _module()
     baseline = tmp_path / "baseline"
