@@ -82,6 +82,8 @@ xhigh matrix, the DFlash2 reference, and the 128K depth distribution is
 
 ## Xhigh 16,384-output matrix
 
+![Grouped bar chart of current fixed K3, adaptive BF16, adaptive Q4, and the 1K-only DFlash2 reference across the xhigh prompt contexts](../qwen38-native-mtp-xhigh-decode-tps.svg)
+
 > **DFlash2 xhigh failure reference — 1K prompt / 1K conditioner / 16K
 > output:** 788.00 prefill tok/s, **25.55 decode tok/s**, 642.484 s wall,
 > and 21.064 GiB peak. Decode throughput is 48.62% below current fixed K3
