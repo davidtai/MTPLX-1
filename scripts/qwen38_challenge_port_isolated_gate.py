@@ -561,6 +561,7 @@ def _aggregate(
         warmups,
         arms,
     )
+    delta = _validate_route_delta(args)
     promotion = gate._promotion_decision(
         order=order,
         control_id=args.control_route,
@@ -572,8 +573,8 @@ def _aggregate(
         allow_frozen_candidate=bool(
             getattr(args, "allow_frozen_candidate", False)
         ),
+        validated_route_delta=delta,
     )
-    delta = _validate_route_delta(args)
     receipt_invariant_errors = _receipt_invariant_errors(args, child_receipts)
     phase_summary = gate._phase_summary(
         arms,

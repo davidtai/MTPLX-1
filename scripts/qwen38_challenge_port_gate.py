@@ -689,6 +689,7 @@ def _promotion_decision(
     source_status: list[str],
     engagement_errors: list[str] | None = None,
     allow_frozen_candidate: bool = False,
+    validated_route_delta: Any | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     expected_order = (
@@ -700,6 +701,22 @@ def _promotion_decision(
         errors.append("gate requires exactly four timed ABBA arms")
     if control_id is None or candidate_id is None:
         errors.append("gate requires explicit control and candidate routes")
+    elif validated_route_delta is not None:
+        validated_control = set(validated_route_delta.control_features)
+        validated_candidate_features = getattr(
+            validated_route_delta,
+            "candidate_features_set",
+            None,
+        )
+        if validated_candidate_features is None:
+            validated_candidate_features = validated_route_delta.candidate_features
+        validated_candidate = set(validated_candidate_features)
+        if (
+            validated_control != (_validate_route_id(control_id) - {"control"})
+            or validated_candidate
+            != (_validate_route_id(candidate_id) - {"control"})
+        ):
+            errors.append("prevalidated native-MTP route delta does not match gate routes")
     else:
         try:
             validate_native_mtp_route_delta(

@@ -94,6 +94,32 @@ def test_row53_route_rejects_missing_process_latched_environment() -> None:
     )
 
 
+def test_promotion_accepts_an_already_validated_atomic_bundle() -> None:
+    gate = _module()
+    control = "r20_kv_only_history+r53_command_buffers"
+    candidate = control + "+r08_device_draft+r10_compact_vocab"
+    validated = SimpleNamespace(
+        control_features=gate._validate_route_id(control),
+        candidate_features_set=gate._validate_route_id(candidate),
+    )
+
+    result = gate._promotion_decision(
+        order=[control, candidate, candidate, control],
+        control_id=control,
+        candidate_id=candidate,
+        improvement_pct=1.2,
+        correctness={"passed": True},
+        source_status=[],
+        validated_route_delta=validated,
+    )
+
+    assert result == {
+        "passed": True,
+        "threshold_pct": gate.PROMOTION_THRESHOLD_PCT,
+        "errors": [],
+    }
+
+
 def test_native_gate_has_no_rejected_source_artifact_flag() -> None:
     source = ISOLATED_SCRIPT.read_text(encoding="utf-8")
     assert "--source-artifact" not in source
