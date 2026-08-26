@@ -34,13 +34,14 @@ from scripts.qwen38_native_mtp_campaign import (  # noqa: E402
     DEFAULT_LOCK,
     DEFAULT_PROMPT,
     EXACT_CONDITIONER_TOKENS,
-    EXACT_CONTEXT_TOKENS,
     EXACT_OUTPUT_TOKENS,
     EXACT_SEED,
     EXACT_TEMPERATURE,
     EXACT_TOP_K,
     EXACT_TOP_P,
 )
+
+COMPOSITION_CONTEXT_TOKENS = (16_384,)
 
 
 @dataclass(frozen=True)
@@ -109,7 +110,7 @@ def build_execution_plan(
             context_tokens=context_tokens,
             allow_frozen_candidate=step.allow_frozen_candidate,
         )
-        for context_tokens in EXACT_CONTEXT_TOKENS
+        for context_tokens in COMPOSITION_CONTEXT_TOKENS
     )
 
 
@@ -185,7 +186,7 @@ def campaign_payload(
         "model_artifact_hashes": model_artifact_hashes,
         "gpu_lock_scope": lock_scope,
         "protocol": {
-            "contexts": list(EXACT_CONTEXT_TOKENS),
+            "contexts": list(COMPOSITION_CONTEXT_TOKENS),
             "conditioner_tokens": EXACT_CONDITIONER_TOKENS,
             "output_tokens": EXACT_OUTPUT_TOKENS,
             "temperature": EXACT_TEMPERATURE,

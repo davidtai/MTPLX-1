@@ -19,14 +19,14 @@ def _step() -> composition.CompositionStep:
     )
 
 
-def test_composition_step_stacks_one_feature_at_both_exact_contexts() -> None:
+def test_composition_step_stacks_one_feature_at_16k_only() -> None:
     step = _step()
 
     delta = composition.validate_step(step)
     plan = composition.build_execution_plan(step)
 
     assert delta.candidate_feature == "r61_dual_norm_concat"
-    assert [item.context_tokens for item in plan] == [1024, 16_384]
+    assert [item.context_tokens for item in plan] == [16_384]
     assert all(item.control_route == step.control_route for item in plan)
     assert all(item.candidate_route == step.candidate_route for item in plan)
     assert all(item.feature == step.feature for item in plan)
@@ -127,7 +127,7 @@ def test_step_from_args_preserves_the_phase_and_routes() -> None:
     )
 
 
-def test_campaign_payload_is_complete_only_after_both_contexts() -> None:
+def test_campaign_payload_is_complete_after_the_16k_result() -> None:
     step = _step()
     plan = composition.build_execution_plan(step)
     common = {
@@ -138,16 +138,14 @@ def test_campaign_payload_is_complete_only_after_both_contexts() -> None:
         "lock_scope": "attested_parent",
     }
 
-    partial = composition.campaign_payload(results=[{"context_tokens": 1024}], **common)
     complete = composition.campaign_payload(
-        results=[{"context_tokens": 1024}, {"context_tokens": 16_384}],
+        results=[{"context_tokens": 16_384}],
         **common,
     )
 
-    assert partial["complete"] is False
     assert complete["complete"] is True
     assert complete["phase"] == "decode"
-    assert complete["protocol"]["contexts"] == [1024, 16_384]
+    assert complete["protocol"]["contexts"] == [16_384]
 
 
 def test_output_paths_require_a_filename_safe_step_id(tmp_path: Path) -> None:
@@ -170,7 +168,7 @@ def test_output_paths_reject_campaign_raw_and_temporary_collisions(
     step = _step()
     plan = composition.build_execution_plan(step)
     output_dir = tmp_path / "receipts"
-    first_raw = output_dir / "01-decode-add-r61-1024.json"
+    first_raw = output_dir / "01-decode-add-r61-16384.json"
 
     with pytest.raises(ValueError, match="distinct"):
         composition.output_paths(
