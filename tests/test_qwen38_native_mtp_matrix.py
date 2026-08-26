@@ -489,3 +489,10 @@ def test_parent_preflight_reads_both_distribution_versions_from_selected_python(
     assert versions == {"mlx": "0.32.2", "mlx_metal": "0.32.2"}
     assert observed["command"][0] == str((tmp_path / "python").resolve())
     assert "mlx-metal" in observed["command"][2]
+
+
+def test_matrix_parent_accepts_direct_or_delegated_guard_ownership() -> None:
+    matrix = _module()
+
+    assert matrix._validated_parent_guard_scope("direct") == "direct"
+    assert matrix._validated_parent_guard_scope("attested_parent") == "attested_parent"

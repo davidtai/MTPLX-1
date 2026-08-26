@@ -437,6 +437,12 @@ def _load_isolated() -> Any:
     return module
 
 
+def _validated_parent_guard_scope(scope: str) -> str:
+    if scope not in {"direct", "attested_parent"}:
+        raise RuntimeError(f"matrix parent has invalid execution guard scope: {scope}")
+    return scope
+
+
 def _git_commit(root: Path) -> str:
     return subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=root, text=True
@@ -541,8 +547,7 @@ def run(args: argparse.Namespace) -> int:
     args.output_root.mkdir(parents=True, exist_ok=True)
     completed: list[dict[str, Any]] = []
     with isolated._gpu_lock_scope(args.lock) as lock_scope:
-        if lock_scope != "direct":
-            raise RuntimeError("matrix parent must directly own the execution guard")
+        _validated_parent_guard_scope(lock_scope)
         model_hashes = gate._model_artifact_hashes(args.model)
         for context_tokens in contexts:
             order = PAIRED_ORDER if args.workload == "vanity" else order_for_context(context_tokens)
