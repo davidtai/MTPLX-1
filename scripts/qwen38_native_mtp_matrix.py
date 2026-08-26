@@ -25,6 +25,8 @@ except ModuleNotFoundError:  # Direct execution places scripts/ on sys.path.
 V292_COMMIT = "bbc67427e88288001e4b90ecb44708dc0222154c"
 FULL_ADAPTIVE_NATIVE_ROUTE = gate.FULL_ADAPTIVE_NATIVE_ROUTE
 FULL_Q4_ADAPTIVE_NATIVE_ROUTE = gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
+GREEDY_ADAPTIVE_NATIVE_ROUTE = gate.GREEDY_ADAPTIVE_NATIVE_ROUTE
+GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE = gate.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE
 
 LANE_IDS = (
     "v2.9.2-mlx0322",
@@ -96,7 +98,20 @@ def lane_specs(
     baseline_commit: str,
     candidate_root: Path,
     candidate_commit: str,
+    workload: str,
 ) -> dict[str, LaneSpec]:
+    if workload not in {"vanity", "low", "xhigh"}:
+        raise ValueError(f"unknown workload: {workload}")
+    adaptive_route = (
+        GREEDY_ADAPTIVE_NATIVE_ROUTE
+        if workload == "vanity"
+        else FULL_ADAPTIVE_NATIVE_ROUTE
+    )
+    q4_adaptive_route = (
+        GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE
+        if workload == "vanity"
+        else FULL_Q4_ADAPTIVE_NATIVE_ROUTE
+    )
     return {
         "v2.9.2-mlx0322": LaneSpec(
             "v2.9.2-mlx0322", baseline_root, baseline_commit, "control"
@@ -108,13 +123,13 @@ def lane_specs(
             "full-adaptive",
             candidate_root,
             candidate_commit,
-            FULL_ADAPTIVE_NATIVE_ROUTE,
+            adaptive_route,
         ),
         "full-q4-adaptive": LaneSpec(
             "full-q4-adaptive",
             candidate_root,
             candidate_commit,
-            FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
+            q4_adaptive_route,
         ),
     }
 
@@ -285,8 +300,11 @@ def receipt_errors(
             and int(policy.get("depth_cap", -1)) == 3
         ):
             errors.append("adaptive policy state receipt is incomplete")
+        expected_draft_core = str(
+            gate._route_execution_options(lane.route_id)["draft_core"]
+        )
         device_core = receipt.get("device_core_receipt") or {}
-        if not (
+        if expected_draft_core == "device" and not (
             device_core.get("requested") == "device"
             and int(device_core.get("device_calls", 0)) > 0
             and int(device_core.get("device_fallbacks", -1)) == 0
@@ -593,6 +611,7 @@ def run(args: argparse.Namespace) -> int:
         baseline_commit=baseline_commit,
         candidate_root=args.candidate_root,
         candidate_commit=candidate_commit,
+        workload=args.workload,
     )
     contexts = (
         (VANITY_PROMPT_TOKENS,)

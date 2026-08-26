@@ -513,6 +513,8 @@ def _run_one(
     allowed = {
         source_gate.FULL_ADAPTIVE_NATIVE_ROUTE,
         source_gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
+        source_gate.GREEDY_ADAPTIVE_NATIVE_ROUTE,
+        source_gate.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE,
     }
     if route not in allowed:
         raise RuntimeError(f"matrix arm rejected non-final optimized route: {route}")

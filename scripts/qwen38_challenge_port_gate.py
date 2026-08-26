@@ -60,6 +60,15 @@ FULL_ADAPTIVE_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
 FULL_Q4_ADAPTIVE_NATIVE_ROUTE = (
     FULL_ADAPTIVE_SHARED_ROUTE + "+r28_q4_mtp_block+r11_position_ema"
 )
+GREEDY_ADAPTIVE_SHARED_ROUTE = (
+    "r18_gdn_decay_memo+r20_kv_only_history+r21_qk_rms_rope+"
+    "r24_eval_ladder+r26_prefill_ladder_3+r48_boundary_fused+"
+    "r50_wired_residency+r61_dual_norm_concat"
+)
+GREEDY_ADAPTIVE_NATIVE_ROUTE = GREEDY_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
+GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE = (
+    GREEDY_ADAPTIVE_SHARED_ROUTE + "+r28_q4_mtp_block+r11_position_ema"
+)
 ALLOWED_ROUTE_FEATURES = frozenset(
     {
         "control",

@@ -107,6 +107,7 @@ def test_lane_specs_keep_source_and_head_changes_separate(tmp_path: Path) -> Non
         baseline_commit=matrix.V292_COMMIT,
         candidate_root=candidate,
         candidate_commit="c" * 40,
+        workload="low",
     )
 
     assert specs["v2.9.2-mlx0322"].source_root == baseline
@@ -118,6 +119,65 @@ def test_lane_specs_keep_source_and_head_changes_separate(tmp_path: Path) -> Non
     assert specs["full-q4-adaptive"].route_id == (
         matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
     )
+
+
+def test_vanity_lane_specs_keep_the_greedy_native_mtp_path(tmp_path: Path) -> None:
+    matrix = _module()
+    specs = matrix.lane_specs(
+        baseline_root=tmp_path / "baseline",
+        baseline_commit=matrix.V292_COMMIT,
+        candidate_root=tmp_path / "candidate",
+        candidate_commit="c" * 40,
+        workload="vanity",
+    )
+
+    bf16 = specs["full-adaptive"].route_id
+    q4 = specs["full-q4-adaptive"].route_id
+    assert bf16 == matrix.GREEDY_ADAPTIVE_NATIVE_ROUTE
+    assert q4 == matrix.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE
+    assert matrix.gate._route_execution_options(bf16)["draft_core"] == "stock"
+    assert matrix.gate._route_execution_options(q4)["draft_core"] == "stock"
+    assert "r08_device_draft" not in bf16
+    assert "r10_compact_vocab" not in bf16
+    for retained in (
+        "r18_gdn_decay_memo",
+        "r20_kv_only_history",
+        "r21_qk_rms_rope",
+        "r24_eval_ladder",
+        "r26_prefill_ladder_3",
+        "r48_boundary_fused",
+        "r50_wired_residency",
+        "r61_dual_norm_concat",
+        "r11_position_ema",
+    ):
+        assert retained in bf16
+    assert "r28_q4_mtp_block" in q4
+
+
+def test_stochastic_lane_specs_keep_the_measured_device_draft_stack(
+    tmp_path: Path,
+) -> None:
+    matrix = _module()
+
+    for workload in ("low", "xhigh"):
+        specs = matrix.lane_specs(
+            baseline_root=tmp_path / "baseline",
+            baseline_commit=matrix.V292_COMMIT,
+            candidate_root=tmp_path / "candidate",
+            candidate_commit="c" * 40,
+            workload=workload,
+        )
+        assert specs["full-adaptive"].route_id == matrix.FULL_ADAPTIVE_NATIVE_ROUTE
+        assert (
+            specs["full-q4-adaptive"].route_id
+            == matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
+        )
+        assert (
+            matrix.gate._route_execution_options(
+                specs["full-adaptive"].route_id
+            )["draft_core"]
+            == "device"
+        )
 
 
 def test_128k_uses_one_pass_but_shorter_contexts_use_symmetric_pairs() -> None:
