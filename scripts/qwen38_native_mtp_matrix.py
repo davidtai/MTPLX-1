@@ -189,6 +189,8 @@ def child_command(
         "--lock", str(lock.resolve()),
         "--output", str(output.resolve()),
     ]
+    if context_tokens == 131_072 and lane.route_id != "control":
+        command.append("--record-depth-usage")
     return command
 
 
@@ -258,9 +260,10 @@ def receipt_errors(
     for key, expected in expected_stack.items():
         if optimized_stack.get(key) != expected:
             errors.append(f"optimized stack {key} mismatch")
+    records_depth = context_tokens == 131_072 and lane.route_id != "control"
     required_runtime_env = {
         "MTPLX_COMPILED_VERIFY": "1",
-        "MTPLX_DROP_EVENTS": "1",
+        "MTPLX_DROP_EVENTS": "0" if records_depth else "1",
         "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
         "MTPLX_MTP_HISTORY_POLICY": "committed",
     }
@@ -282,7 +285,9 @@ def receipt_errors(
         expected_draft_core = str(
             gate._route_execution_options(lane.route_id)["draft_core"]
         )
-        if expected_draft_core == "device":
+        if records_depth and receipt.get("depth_usage") is None:
+            errors.append("128K adaptive arm is missing depth usage")
+        if receipt.get("depth_usage") is not None:
             try:
                 expected_usage = depth_usage(
                     decode_cycles=len(receipt["attempted_depth_schedule"]),

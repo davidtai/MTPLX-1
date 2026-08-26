@@ -261,6 +261,21 @@ def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -
         "--top-k 20",
     ):
         assert expected in joined
+    assert "--record-depth-usage" not in command
+
+    command_128k = matrix.child_command(
+        lane=lane,
+        workload="xhigh",
+        context_tokens=131_072,
+        output=tmp_path / "arm-128k.json",
+        model=tmp_path / "model",
+        prompt_file=tmp_path / "prompt.jsonl",
+        context_file=tmp_path / "context.py",
+        row28_artifact=tmp_path / "mtp.safetensors",
+        python=tmp_path / "python",
+        lock=tmp_path / "gpu.lock",
+    )
+    assert "--record-depth-usage" in command_128k
 
 
 def test_campaign_rejects_dirty_sources_before_entering_gpu_window(

@@ -360,7 +360,9 @@ def depth_usage(
     }
 
 
-def _load_optimized_speed_stack(model: Path) -> tuple[Any, dict[str, Any]]:
+def _load_optimized_speed_stack(
+    model: Path, *, record_depth_usage: bool
+) -> tuple[Any, dict[str, Any]]:
     from mtplx.backends.registry import load_runtime_contract
     from mtplx.draft_lm_head import (
         _install_draft_lm_head,
@@ -391,6 +393,8 @@ def _load_optimized_speed_stack(model: Path) -> tuple[Any, dict[str, Any]]:
     draft_sampler = draft_sampler_spec_from_runtime_contract(runtime_contract)
     runtime_env_overrides = runtime_env_overrides_from_contract(runtime_contract)
     apply_profile_env(profile.name, runtime_env_overrides=runtime_env_overrides)
+    if record_depth_usage:
+        os.environ["MTPLX_DROP_EVENTS"] = "0"
 
     # Env-gated runtime modules are imported only after the production profile.
     from mtplx.runtime import load
@@ -405,7 +409,11 @@ def _load_optimized_speed_stack(model: Path) -> tuple[Any, dict[str, Any]]:
     return runtime, {
         "profile": profile.name,
         "runtime_profile": profile.runtime_profile,
-        "runtime_env": {**profile.env_dict(), **runtime_env_overrides},
+        "runtime_env": {
+            **profile.env_dict(),
+            **runtime_env_overrides,
+            "MTPLX_DROP_EVENTS": os.environ["MTPLX_DROP_EVENTS"],
+        },
         "draft_lm_head": draft_head,
         "draft_lm_head_report": draft_head_report,
         "draft_sampler": draft_sampler,
@@ -572,6 +580,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
     parser.add_argument("--row28-artifact", type=Path, required=True)
+    parser.add_argument("--record-depth-usage", action="store_true")
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -595,7 +604,9 @@ def run(args: argparse.Namespace) -> int:
     row28_artifact = args.row28_artifact.resolve(strict=True)
     row28_hash = _sha256(row28_artifact)
 
-    runtime, optimized_stack = _load_optimized_speed_stack(model)
+    runtime, optimized_stack = _load_optimized_speed_stack(
+        model, record_depth_usage=args.record_depth_usage
+    )
     for module_name in ("mtplx", "mtplx.runtime"):
         _assert_imported_from_source(module_name, source_root)
     from mtplx.artifacts import load_config
@@ -642,7 +653,7 @@ def run(args: argparse.Namespace) -> int:
         top_p=args.top_p,
         top_k=args.top_k,
         row28_artifact=row28_artifact,
-        record_depth_usage=True,
+        record_depth_usage=args.record_depth_usage,
     )
     _assert_imported_from_source("mtplx.generation", source_root)
     if args.route != CONTROL_ROUTE:
