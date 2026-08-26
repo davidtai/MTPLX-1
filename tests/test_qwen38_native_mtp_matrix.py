@@ -728,6 +728,117 @@ def test_matrix_arm_disables_stop_tokens_for_exact_output(
     assert observed["stop_token_ids"] == set()
 
 
+def test_matrix_arm_requires_explicit_opt_in_for_fixed_diagnostic_route(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    arm = _arm_module()
+    from scripts import qwen38_challenge_port_gate as gate
+
+    observed: dict[str, object] = {}
+
+    def fake_run_arm(*args: Any, **kwargs: Any) -> dict[str, object]:
+        del args
+        observed.update(kwargs)
+        return {"draft_core": "device"}
+
+    monkeypatch.setattr(gate, "_run_arm", fake_run_arm)
+
+    common = {
+        "runtime": object(),
+        "config": {},
+        "model": tmp_path / "model",
+        "prompt_ids": [1, 2, 3],
+        "route": "r08_device_draft",
+        "max_tokens": 16_384,
+        "seed": 42,
+        "target_temperature": 1.0,
+        "draft_temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "row28_artifact": tmp_path / "row28.safetensors",
+        "record_depth_usage": False,
+        "force_exact_output": True,
+    }
+
+    with pytest.raises(RuntimeError, match="non-final optimized route"):
+        arm._run_one(**common)
+
+    arm._run_one(**common, allow_fixed_diagnostic_route=True)
+
+    assert observed["route_id"] == "r08_device_draft"
+    assert observed["stop_token_ids"] == set()
+
+
+@pytest.mark.parametrize(
+    "route",
+    (
+        "r11_position_ema",
+        "r28_q4_mtp_block",
+    ),
+)
+def test_matrix_arm_fixed_diagnostic_route_rejects_adaptive_and_q4(
+    route: str,
+    tmp_path: Path,
+) -> None:
+    arm = _arm_module()
+
+    with pytest.raises(RuntimeError, match="fixed BF16"):
+        arm._run_one(
+            object(),
+            {},
+            tmp_path / "model",
+            [1, 2, 3],
+            route=route,
+            max_tokens=16_384,
+            seed=42,
+            target_temperature=1.0,
+            draft_temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            row28_artifact=tmp_path / "row28.safetensors",
+            record_depth_usage=False,
+            force_exact_output=True,
+            allow_fixed_diagnostic_route=True,
+        )
+
+
+def test_matrix_arm_cli_requires_explicit_fixed_diagnostic_flag(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    arm = _arm_module()
+    argv = [
+        "qwen38_native_mtp_matrix_arm.py",
+        "--source-root", str(tmp_path / "source"),
+        "--source-commit", "a" * 40,
+        "--lane-id", "candidate-r08",
+        "--route", "r08_device_draft",
+        "--workload", "xhigh",
+        "--model", str(tmp_path / "model"),
+        "--prompt-file", str(tmp_path / "prompt.jsonl"),
+        "--context-file", str(tmp_path / "context.py"),
+        "--prompt-tokens", "16384",
+        "--max-tokens", "16384",
+        "--warmup-tokens", "1024",
+        "--seed", "42",
+        "--target-temperature", "1.0",
+        "--draft-temperature", "1.0",
+        "--top-p", "0.95",
+        "--top-k", "20",
+        "--row28-artifact", str(tmp_path / "row28.safetensors"),
+        "--force-exact-output",
+        "--allow-fixed-diagnostic-route",
+        "--lock", str(tmp_path / "gpu.lock"),
+        "--output", str(tmp_path / "receipt.json"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    args = arm._parse_args()
+
+    assert args.allow_fixed_diagnostic_route is True
+
+
 def test_output_contract_accepts_natural_vanity_and_rejects_length_cap() -> None:
     matrix = _module()
     receipt = {

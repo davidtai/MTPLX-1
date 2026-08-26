@@ -511,6 +511,7 @@ def _run_one(
     row28_artifact: Path,
     record_depth_usage: bool,
     force_exact_output: bool,
+    allow_fixed_diagnostic_route: bool = False,
 ) -> dict[str, Any]:
     if route == CONTROL_ROUTE:
         return _run_control_arm(
@@ -535,7 +536,22 @@ def _run_one(
         source_gate.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE,
     }
     if route not in allowed:
-        raise RuntimeError(f"matrix arm rejected non-final optimized route: {route}")
+        if not allow_fixed_diagnostic_route:
+            raise RuntimeError(
+                f"matrix arm rejected non-final optimized route: {route}"
+            )
+        route_features = source_gate._validate_route_id(route)
+        forbidden = route_features & {
+            "r11_position_ema",
+            "r17_q4_mtp_block",
+            "r28_q4_mtp_block",
+            "r36_qkv_islands",
+        }
+        if forbidden:
+            raise RuntimeError(
+                "fixed BF16 diagnostic route contains adaptive or Q4 features: "
+                + ", ".join(sorted(forbidden))
+            )
     result = source_gate._run_arm(
         runtime,
         config,
@@ -598,6 +614,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--row28-artifact", type=Path, required=True)
     parser.add_argument("--record-depth-usage", action="store_true")
     parser.add_argument("--force-exact-output", action="store_true")
+    parser.add_argument("--allow-fixed-diagnostic-route", action="store_true")
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -659,6 +676,7 @@ def run(args: argparse.Namespace) -> int:
             row28_artifact=row28_artifact,
             record_depth_usage=False,
             force_exact_output=args.force_exact_output,
+            allow_fixed_diagnostic_route=args.allow_fixed_diagnostic_route,
         )
     arm = _run_one(
         runtime,
@@ -675,6 +693,7 @@ def run(args: argparse.Namespace) -> int:
         row28_artifact=row28_artifact,
         record_depth_usage=args.record_depth_usage,
         force_exact_output=args.force_exact_output,
+        allow_fixed_diagnostic_route=args.allow_fixed_diagnostic_route,
     )
     _assert_imported_from_source("mtplx.generation", source_root)
     if args.route != CONTROL_ROUTE:
