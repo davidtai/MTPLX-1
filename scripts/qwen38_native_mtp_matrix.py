@@ -23,6 +23,8 @@ except ModuleNotFoundError:  # Direct execution places scripts/ on sys.path.
 
 
 V292_COMMIT = "bbc67427e88288001e4b90ecb44708dc0222154c"
+MODEL_ID = "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
+FULL_FIXED_NATIVE_ROUTE = gate.FULL_FIXED_NATIVE_ROUTE
 FULL_ADAPTIVE_NATIVE_ROUTE = gate.FULL_ADAPTIVE_NATIVE_ROUTE
 FULL_Q4_ADAPTIVE_NATIVE_ROUTE = gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
 GREEDY_ADAPTIVE_NATIVE_ROUTE = gate.GREEDY_ADAPTIVE_NATIVE_ROUTE
@@ -30,19 +32,48 @@ GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE = gate.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE
 
 LANE_IDS = (
     "v2.9.2-mlx0322",
-    "fixed-k3",
+    "full-fixed-k3",
     "full-adaptive",
     "full-q4-adaptive",
 )
 PAIRED_ORDER = (
     "v2.9.2-mlx0322",
-    "fixed-k3",
+    "full-fixed-k3",
     "full-adaptive",
     "full-q4-adaptive",
     "full-q4-adaptive",
     "full-adaptive",
-    "fixed-k3",
+    "full-fixed-k3",
     "v2.9.2-mlx0322",
+)
+BF16_OPTIMIZED_KERNEL_IDS = (
+    "qwen38_mtp_kv_only_history_ge16384_v1",
+    "qwen38_row18_gdn_neg_exp_a_log_memo_v1",
+    "qwen38_qk_rms_rope_bf16_h256_r64_v1",
+    "qwen38_row24_qk_rms_rope_l_le16_v1",
+    "qwen38_row24_target_eval_ladder_v1",
+    "qwen38_row26_prefill_eval_every3_v1",
+    "qwen38_row26_qk_rms_rope_l_le32_v1",
+    "qwen38_row48_boundary_fused_residual_rmsnorm_v1",
+    "qwen38_row50_post_warm_wired_residency_v1",
+    "qwen38_dual_rms_norm_concat_bf16_v1",
+    "qwen38_row10_compact_q4_g64_vocab_v1",
+)
+BF16_OPTIMIZED_FEATURE_KEYS = (
+    "r10_compact_vocab",
+    "r18_gdn_decay_memo",
+    "r20_kv_only_history",
+    "r21_qk_rms_rope",
+    "r24_eval_ladder",
+    "r26_prefill_ladder_3",
+    "r48_boundary_fused",
+    "r50_wired_residency",
+    "dual_norm",
+)
+BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
+    "kv_only_history+r18_gdn_decay_memo+r21_qk_rms_rope+"
+    "r24_eval_ladder+r26_prefill_ladder_3+r48_boundary_fused+"
+    "r50_wired_residency+dual_norm+r10_compact_vocab"
 )
 ONE_PASS_ORDER = LANE_IDS
 CONTEXT_TOKENS = (1_024, 16_384, 65_536, 131_072)
@@ -104,34 +135,27 @@ def lane_specs(
 ) -> dict[str, LaneSpec]:
     if workload not in {"vanity", "low", "xhigh"}:
         raise ValueError(f"unknown workload: {workload}")
-    adaptive_route = (
-        GREEDY_ADAPTIVE_NATIVE_ROUTE
-        if workload == "vanity"
-        else FULL_ADAPTIVE_NATIVE_ROUTE
-    )
-    q4_adaptive_route = (
-        GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE
-        if workload == "vanity"
-        else FULL_Q4_ADAPTIVE_NATIVE_ROUTE
-    )
     return {
         "v2.9.2-mlx0322": LaneSpec(
             "v2.9.2-mlx0322", baseline_root, baseline_commit, "control"
         ),
-        "fixed-k3": LaneSpec(
-            "fixed-k3", candidate_root, candidate_commit, "control"
+        "full-fixed-k3": LaneSpec(
+            "full-fixed-k3",
+            candidate_root,
+            candidate_commit,
+            FULL_FIXED_NATIVE_ROUTE,
         ),
         "full-adaptive": LaneSpec(
             "full-adaptive",
             candidate_root,
             candidate_commit,
-            adaptive_route,
+            FULL_ADAPTIVE_NATIVE_ROUTE,
         ),
         "full-q4-adaptive": LaneSpec(
             "full-q4-adaptive",
             candidate_root,
             candidate_commit,
-            q4_adaptive_route,
+            FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
         ),
     }
 
@@ -190,9 +214,89 @@ def child_command(
         "--lock", str(lock.resolve()),
         "--output", str(output.resolve()),
     ]
-    if context_tokens == 131_072 and lane.route_id != "control":
+    route_features = gate._validate_route_id(lane.route_id)
+    if context_tokens == 131_072 and "r11_position_ema" in route_features:
         command.append("--record-depth-usage")
     return command
+
+
+def _feature_is_active(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    active = value.get("active")
+    if (
+        active is True
+        or (
+            isinstance(active, (int, float))
+            and not isinstance(active, bool)
+            and active > 0
+        )
+        or value.get("installed") is True
+    ):
+        return True
+    return any(
+        int(value.get(key, 0)) > 0
+        for key in ("active_modules", "configured_modules", "construction_bound")
+    )
+
+
+def full_fixed_receipt_errors(
+    receipt: dict[str, Any], *, expected_route: str
+) -> list[str]:
+    errors: list[str] = []
+    if receipt.get("route_id") != expected_route or expected_route == "control":
+        errors.append("optimized fixed K3 route is not the requested optimized route")
+    installed_route = receipt.get("installed_route_id")
+    if installed_route != BF16_OPTIMIZED_INSTALLED_ROUTE_ID:
+        errors.append("optimized fixed K3 installed route mismatch")
+    if int(receipt.get("speculative_depth", -1)) != 3 or int(
+        receipt.get("requested_speculative_depth", -1)
+    ) != 3:
+        errors.append("optimized fixed K3 speculative depth is not fixed at 3")
+    if receipt.get("adaptive_policy_receipt") is not None or receipt.get(
+        "adaptive_policy_events"
+    ):
+        errors.append("optimized fixed K3 executed an adaptive policy")
+
+    kernel_ids = tuple(receipt.get("kernel_ids") or ())
+    if kernel_ids != BF16_OPTIMIZED_KERNEL_IDS:
+        errors.append("optimized fixed K3 BF16 kernel stack mismatch")
+    features = receipt.get("feature_receipt") or {}
+    if any(
+        not _feature_is_active(features.get(key))
+        for key in BF16_OPTIMIZED_FEATURE_KEYS
+    ):
+        errors.append("optimized fixed K3 feature stack is incomplete")
+    if any(key in features for key in ("r17_q4_mtp_block", "r28_q4_mtp_block", "r36_qkv_islands")):
+        errors.append("optimized fixed K3 installed a Q4 MTP block")
+
+    device_core = receipt.get("device_core_receipt") or {}
+    if not (
+        receipt.get("draft_core") == "device"
+        and device_core.get("requested") == "device"
+        and int(device_core.get("device_calls", 0)) > 0
+    ):
+        errors.append("optimized fixed K3 device draft core did not engage")
+    if int(device_core.get("device_fallbacks", -1)) != 0:
+        errors.append("optimized fixed K3 device draft fallback occurred")
+    if receipt.get("fallback_ar") is True:
+        errors.append("optimized fixed K3 fell back to autoregressive decode")
+
+    compiled_verify = receipt.get("compiled_verify_receipt") or {}
+    exception_fallbacks = sum(
+        int(value)
+        for reason, value in (compiled_verify.get("fallback_reasons") or {}).items()
+        if str(reason).startswith("exception:")
+    )
+    if not (
+        compiled_verify.get("mode") == "on"
+        and int(compiled_verify.get("compiled_calls", 0)) > 0
+        and compiled_verify.get("permanent_eager") is False
+        and not compiled_verify.get("permanent_eager_reason")
+        and exception_fallbacks == 0
+    ):
+        errors.append("optimized fixed K3 compiled verification did not engage cleanly")
+    return errors
 
 
 def receipt_errors(
@@ -216,6 +320,7 @@ def receipt_errors(
         "mlx_metal_version": REQUIRED_MLX_METAL_VERSION,
         "gpu_lock_scope": "attested_parent",
         "source_import_attested": True,
+        "model_id": MODEL_ID,
         "verify_strategy": "capture_commit",
         "verify_core": "linear-gdn-from-conv-tape",
         "speculative_depth": 3,
@@ -227,6 +332,18 @@ def receipt_errors(
             errors.append(f"{key} mismatch: {receipt.get(key)!r} != {expected!r}")
     if receipt.get("source_status"):
         errors.append("source tree is not clean")
+    model_hashes = receipt.get("model_artifact_hashes") or {}
+    if not (
+        isinstance(model_hashes, dict)
+        and {"config.json", "mtp.safetensors"} <= set(model_hashes)
+        and all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in model_hashes.values()
+        )
+    ):
+        errors.append("model artifact attestation is missing")
     workload = str(receipt.get("workload") or "")
     expected_prompt_hash = PROMPT_TOKEN_SHA256.get(workload, {}).get(context_tokens)
     if receipt.get("prompt_token_sha256") != expected_prompt_hash:
@@ -263,7 +380,10 @@ def receipt_errors(
     for key, expected in expected_stack.items():
         if optimized_stack.get(key) != expected:
             errors.append(f"optimized stack {key} mismatch")
-    records_depth = context_tokens == 131_072 and lane.route_id != "control"
+    route_features = gate._validate_route_id(lane.route_id)
+    is_adaptive = "r11_position_ema" in route_features
+    is_full_fixed = lane.route_id == FULL_FIXED_NATIVE_ROUTE
+    records_depth = context_tokens == 131_072 and is_adaptive
     required_runtime_env = {
         "MTPLX_COMPILED_VERIFY": "1",
         "MTPLX_DROP_EVENTS": "0" if records_depth else "1",
@@ -288,9 +408,13 @@ def receipt_errors(
         expected_draft_core = str(
             gate._route_execution_options(lane.route_id)["draft_core"]
         )
+        if is_full_fixed:
+            errors.extend(
+                full_fixed_receipt_errors(receipt, expected_route=lane.route_id)
+            )
         if records_depth and receipt.get("depth_usage") is None:
             errors.append("128K adaptive arm is missing depth usage")
-        if receipt.get("depth_usage") is not None:
+        if is_adaptive and receipt.get("depth_usage") is not None:
             try:
                 expected_usage = depth_usage(
                     decode_cycles=len(receipt["attempted_depth_schedule"]),
@@ -303,18 +427,19 @@ def receipt_errors(
             else:
                 if receipt.get("depth_usage") != expected_usage:
                     errors.append("adaptive depth usage does not match raw histograms")
-        policy = receipt.get("adaptive_policy_receipt") or {}
-        if not (
-            policy.get("kind") == "position_ema"
-            and policy.get("executed") is True
-            and len(policy.get("initial_accept_ema") or ()) == 3
-            and len(policy.get("final_accept_ema") or ()) == 3
-            and 0 <= int(policy.get("initial_depth", -1)) <= 3
-            and 0 <= int(policy.get("final_depth", -1)) <= 3
-            and int(policy.get("max_depth", -1)) == 3
-            and int(policy.get("depth_cap", -1)) == 3
-        ):
-            errors.append("adaptive policy state receipt is incomplete")
+        if is_adaptive:
+            policy = receipt.get("adaptive_policy_receipt") or {}
+            if not (
+                policy.get("kind") == "position_ema"
+                and policy.get("executed") is True
+                and len(policy.get("initial_accept_ema") or ()) == 3
+                and len(policy.get("final_accept_ema") or ()) == 3
+                and 0 <= int(policy.get("initial_depth", -1)) <= 3
+                and 0 <= int(policy.get("final_depth", -1)) <= 3
+                and int(policy.get("max_depth", -1)) == 3
+                and int(policy.get("depth_cap", -1)) == 3
+            ):
+                errors.append("adaptive policy state receipt is incomplete")
         device_core = receipt.get("device_core_receipt") or {}
         if expected_draft_core == "device" and not (
             device_core.get("requested") == "device"
@@ -470,7 +595,9 @@ def aggregate(
             errors.append(f"{key} changed across arms")
 
     summary: dict[str, dict[str, Any]] = {}
-    fixed_rows = [row for row in receipts if row.get("lane_id") == "fixed-k3"]
+    fixed_rows = [
+        row for row in receipts if row.get("lane_id") == "full-fixed-k3"
+    ]
     fixed_wall = _mean(fixed_rows, "wall_s") if fixed_rows else math.nan
     for lane_id in LANE_IDS:
         rows = [row for row in receipts if row.get("lane_id") == lane_id]

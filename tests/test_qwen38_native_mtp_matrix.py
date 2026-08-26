@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import subprocess
 import sys
+from typing import Any
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts/qwen38_native_mtp_matrix.py"
@@ -54,18 +55,18 @@ def test_matrix_has_four_fresh_lanes_and_no_historical_pr335_lane() -> None:
 
     assert matrix.LANE_IDS == (
         "v2.9.2-mlx0322",
-        "fixed-k3",
+        "full-fixed-k3",
         "full-adaptive",
         "full-q4-adaptive",
     )
     assert matrix.PAIRED_ORDER == (
         "v2.9.2-mlx0322",
-        "fixed-k3",
+        "full-fixed-k3",
         "full-adaptive",
         "full-q4-adaptive",
         "full-q4-adaptive",
         "full-adaptive",
-        "fixed-k3",
+        "full-fixed-k3",
         "v2.9.2-mlx0322",
     )
     assert matrix.ONE_PASS_ORDER == matrix.LANE_IDS
@@ -149,15 +150,164 @@ def test_lane_specs_keep_source_and_head_changes_separate(tmp_path: Path) -> Non
     assert specs["v2.9.2-mlx0322"].source_root == baseline
     assert specs["v2.9.2-mlx0322"].source_commit == matrix.V292_COMMIT
     assert specs["v2.9.2-mlx0322"].route_id == "control"
-    assert specs["fixed-k3"].source_root == candidate
-    assert specs["fixed-k3"].route_id == "control"
+    assert specs["full-fixed-k3"].source_root == candidate
+    assert specs["full-fixed-k3"].route_id == matrix.FULL_FIXED_NATIVE_ROUTE
     assert specs["full-adaptive"].route_id == matrix.FULL_ADAPTIVE_NATIVE_ROUTE
     assert specs["full-q4-adaptive"].route_id == (
         matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
     )
 
 
-def test_vanity_lane_specs_keep_the_greedy_native_mtp_path(tmp_path: Path) -> None:
+def test_full_fixed_k3_uses_the_complete_bf16_stack_without_adaptive_depth(
+    tmp_path: Path,
+) -> None:
+    matrix = _module()
+
+    assert matrix.FULL_FIXED_NATIVE_ROUTE == matrix.gate.FULL_ADAPTIVE_SHARED_ROUTE
+    features = matrix.gate._validate_route_id(matrix.FULL_FIXED_NATIVE_ROUTE)
+    assert features == {
+        "r08_device_draft",
+        "r10_compact_vocab",
+        "r18_gdn_decay_memo",
+        "r20_kv_only_history",
+        "r21_qk_rms_rope",
+        "r24_eval_ladder",
+        "r26_prefill_ladder_3",
+        "r48_boundary_fused",
+        "r50_wired_residency",
+        "r61_dual_norm_concat",
+    }
+    options = matrix.gate._route_execution_options(matrix.FULL_FIXED_NATIVE_ROUTE)
+    assert options["draft_core"] == "device"
+    assert options["speculative_depth"] == 3
+    assert options["adaptive_policy"] == "none"
+    assert options["adaptive_depth_cap"] == 0
+    assert options["mtp_block_variant"] is None
+
+    for workload in ("vanity", "low", "xhigh"):
+        specs = matrix.lane_specs(
+            baseline_root=tmp_path / "baseline",
+            baseline_commit=matrix.V292_COMMIT,
+            candidate_root=tmp_path / "candidate",
+            candidate_commit="c" * 40,
+            workload=workload,
+        )
+        assert specs["full-fixed-k3"].route_id == matrix.FULL_FIXED_NATIVE_ROUTE
+
+
+def test_only_v292_is_unoptimized(tmp_path: Path) -> None:
+    matrix = _module()
+    specs = matrix.lane_specs(
+        baseline_root=tmp_path / "baseline",
+        baseline_commit=matrix.V292_COMMIT,
+        candidate_root=tmp_path / "candidate",
+        candidate_commit="c" * 40,
+        workload="low",
+    )
+
+    assert specs["v2.9.2-mlx0322"].route_id == "control"
+    assert all(
+        specs[lane_id].route_id != "control"
+        for lane_id in ("full-fixed-k3", "full-adaptive", "full-q4-adaptive")
+    )
+
+
+def test_full_fixed_receipt_requires_bf16_kernels_features_and_no_policy() -> None:
+    matrix = _module()
+    route = matrix.FULL_FIXED_NATIVE_ROUTE
+    receipt = {
+        "route_id": route,
+        "installed_route_id": (
+            "kv_only_history+r18_gdn_decay_memo+r21_qk_rms_rope+"
+            "r24_eval_ladder+r26_prefill_ladder_3+r48_boundary_fused+"
+            "r50_wired_residency+dual_norm+r10_compact_vocab"
+        ),
+        "speculative_depth": 3,
+        "requested_speculative_depth": 3,
+        "adaptive_policy_receipt": None,
+        "adaptive_policy_events": [],
+        "kernel_ids": list(matrix.BF16_OPTIMIZED_KERNEL_IDS),
+        "feature_receipt": {
+            "r10_compact_vocab": {"active": True, "installed": True},
+            "r18_gdn_decay_memo": {"active_modules": 48},
+            "r20_kv_only_history": {"installed": True},
+            "r21_qk_rms_rope": {"active_modules": 16},
+            "r24_eval_ladder": {"active": 1},
+            "r26_prefill_ladder_3": {"active": 1},
+            "r48_boundary_fused": {"active": 1, "construction_bound": 1},
+            "r50_wired_residency": {"active": True, "installed": True},
+            "dual_norm": {"active": 1},
+        },
+        "draft_core": "device",
+        "device_core_receipt": {
+            "requested": "device",
+            "device_calls": 8,
+            "device_fallbacks": 0,
+        },
+        "compiled_verify_receipt": {
+            "mode": "on",
+            "compiled_calls": 8,
+            "fallback_reasons": {},
+            "permanent_eager": False,
+            "permanent_eager_reason": None,
+        },
+    }
+
+    assert matrix.full_fixed_receipt_errors(receipt, expected_route=route) == []
+
+    receipt["adaptive_policy_receipt"] = {"kind": "position_ema", "executed": True}
+    assert "optimized fixed K3 executed an adaptive policy" in (
+        matrix.full_fixed_receipt_errors(receipt, expected_route=route)
+    )
+    receipt["adaptive_policy_receipt"] = None
+    receipt["feature_receipt"]["r28_q4_mtp_block"] = {"active": True}
+    assert "optimized fixed K3 installed a Q4 MTP block" in (
+        matrix.full_fixed_receipt_errors(receipt, expected_route=route)
+    )
+    del receipt["feature_receipt"]["r28_q4_mtp_block"]
+    receipt["device_core_receipt"]["device_fallbacks"] = 1
+    assert "optimized fixed K3 device draft fallback occurred" in (
+        matrix.full_fixed_receipt_errors(receipt, expected_route=route)
+    )
+
+
+def test_arm_policy_contract_distinguishes_fixed_from_adaptive() -> None:
+    matrix = _module()
+    arm = _arm_module()
+
+    arm._assert_route_policy_contract(
+        matrix.FULL_FIXED_NATIVE_ROUTE,
+        {"adaptive_policy_receipt": None, "adaptive_policy_events": []},
+    )
+    try:
+        arm._assert_route_policy_contract(
+            matrix.FULL_FIXED_NATIVE_ROUTE,
+            {
+                "adaptive_policy_receipt": {
+                    "kind": "position_ema",
+                    "executed": True,
+                }
+            },
+        )
+    except RuntimeError as exc:
+        assert "fixed optimized route executed an adaptive policy" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("fixed optimized route accepted an adaptive policy")
+
+    arm._assert_route_policy_contract(
+        matrix.FULL_ADAPTIVE_NATIVE_ROUTE,
+        {
+            "adaptive_policy_receipt": {
+                "kind": "position_ema",
+                "executed": True,
+            }
+        },
+    )
+
+
+def test_vanity_lane_specs_keep_the_complete_optimized_native_mtp_stack(
+    tmp_path: Path,
+) -> None:
     matrix = _module()
     specs = matrix.lane_specs(
         baseline_root=tmp_path / "baseline",
@@ -169,13 +319,13 @@ def test_vanity_lane_specs_keep_the_greedy_native_mtp_path(tmp_path: Path) -> No
 
     bf16 = specs["full-adaptive"].route_id
     q4 = specs["full-q4-adaptive"].route_id
-    assert bf16 == matrix.GREEDY_ADAPTIVE_NATIVE_ROUTE
-    assert q4 == matrix.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE
-    assert matrix.gate._route_execution_options(bf16)["draft_core"] == "stock"
-    assert matrix.gate._route_execution_options(q4)["draft_core"] == "stock"
-    assert "r08_device_draft" not in bf16
-    assert "r10_compact_vocab" not in bf16
-    for retained in (
+    assert bf16 == matrix.FULL_ADAPTIVE_NATIVE_ROUTE
+    assert q4 == matrix.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
+    assert matrix.gate._route_execution_options(bf16)["draft_core"] == "device"
+    assert matrix.gate._route_execution_options(q4)["draft_core"] == "device"
+    for optimized in (
+        "r08_device_draft",
+        "r10_compact_vocab",
         "r18_gdn_decay_memo",
         "r20_kv_only_history",
         "r21_qk_rms_rope",
@@ -186,7 +336,7 @@ def test_vanity_lane_specs_keep_the_greedy_native_mtp_path(tmp_path: Path) -> No
         "r61_dual_norm_concat",
         "r11_position_ema",
     ):
-        assert retained in bf16
+        assert optimized in bf16
     assert "r28_q4_mtp_block" in q4
 
 
@@ -223,6 +373,49 @@ def test_128k_uses_one_pass_but_shorter_contexts_use_symmetric_pairs() -> None:
     assert matrix.order_for_context(16_384) == matrix.PAIRED_ORDER
     assert matrix.order_for_context(65_536) == matrix.PAIRED_ORDER
     assert matrix.order_for_context(131_072) == matrix.ONE_PASS_ORDER
+
+
+def test_aggregate_uses_the_renamed_full_fixed_lane_as_wall_baseline(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    matrix = _module()
+    specs = matrix.lane_specs(
+        baseline_root=tmp_path / "baseline",
+        baseline_commit=matrix.V292_COMMIT,
+        candidate_root=tmp_path / "candidate",
+        candidate_commit="c" * 40,
+        workload="low",
+    )
+    wall_by_lane = {
+        "v2.9.2-mlx0322": 12.0,
+        "full-fixed-k3": 10.0,
+        "full-adaptive": 8.0,
+        "full-q4-adaptive": 9.0,
+    }
+    receipts = [
+        {
+            "lane_id": lane_id,
+            "wall_s": wall_by_lane[lane_id],
+            "prefill_tok_s": 800.0,
+            "decode_tok_s": 20.0,
+            "peak_memory_gib": 40.0,
+            "token_hash": lane_id,
+        }
+        for lane_id in matrix.ONE_PASS_ORDER
+    ]
+    monkeypatch.setattr(matrix, "receipt_errors", lambda *args, **kwargs: [])
+
+    result = matrix.aggregate(
+        workload="low",
+        context_tokens=131_072,
+        order=matrix.ONE_PASS_ORDER,
+        receipts=receipts,
+        specs=specs,
+    )
+
+    assert result["summary"]["full-fixed-k3"]["wall_faster_vs_fixed_k3_pct"] == 0.0
+    assert result["summary"]["full-adaptive"]["wall_faster_vs_fixed_k3_pct"] == 25.0
 
 
 def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -> None:
@@ -276,6 +469,25 @@ def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -
         lock=tmp_path / "gpu.lock",
     )
     assert "--record-depth-usage" in command_128k
+
+    fixed_command_128k = matrix.child_command(
+        lane=matrix.LaneSpec(
+            lane_id="full-fixed-k3",
+            source_root=tmp_path / "source",
+            source_commit="d" * 40,
+            route_id=matrix.FULL_FIXED_NATIVE_ROUTE,
+        ),
+        workload="xhigh",
+        context_tokens=131_072,
+        output=tmp_path / "fixed-128k.json",
+        model=tmp_path / "model",
+        prompt_file=tmp_path / "prompt.jsonl",
+        context_file=tmp_path / "context.py",
+        row28_artifact=tmp_path / "mtp.safetensors",
+        python=tmp_path / "python",
+        lock=tmp_path / "gpu.lock",
+    )
+    assert "--record-depth-usage" not in fixed_command_128k
 
     vanity_command = matrix.child_command(
         lane=lane,
@@ -372,6 +584,11 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
         "mlx_metal_version": "0.32.2",
         "gpu_lock_scope": "attested_parent",
         "source_import_attested": True,
+        "model_id": matrix.MODEL_ID,
+        "model_artifact_hashes": {
+            "config.json": "a" * 64,
+            "mtp.safetensors": "b" * 64,
+        },
         "verify_strategy": "capture_commit",
         "verify_core": "linear-gdn-from-conv-tape",
         "speculative_depth": 3,
@@ -452,6 +669,14 @@ def test_receipt_validation_requires_exact_source_and_route_engagement() -> None
     ) == []
     receipt["kernel_ids"] = []
     assert "optimized route reported no installed kernels" in matrix.receipt_errors(
+        receipt,
+        lane=lane,
+        context_tokens=16_384,
+        output_tokens=1_024,
+    )
+    receipt["kernel_ids"] = ["row21", "row61"]
+    receipt["model_artifact_hashes"] = {}
+    assert "model artifact attestation is missing" in matrix.receipt_errors(
         receipt,
         lane=lane,
         context_tokens=16_384,
@@ -591,6 +816,11 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
         "mlx_metal_version": "0.32.2",
         "gpu_lock_scope": "attested_parent",
         "source_import_attested": True,
+        "model_id": matrix.MODEL_ID,
+        "model_artifact_hashes": {
+            "config.json": "a" * 64,
+            "mtp.safetensors": "b" * 64,
+        },
         "verify_strategy": "capture_commit",
         "verify_core": "linear-gdn-from-conv-tape",
         "speculative_depth": 3,

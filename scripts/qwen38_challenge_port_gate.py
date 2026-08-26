@@ -56,6 +56,7 @@ FULL_ADAPTIVE_SHARED_ROUTE = (
     "r26_prefill_ladder_3+r48_boundary_fused+r50_wired_residency+"
     "r61_dual_norm_concat"
 )
+FULL_FIXED_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE
 FULL_ADAPTIVE_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
 FULL_Q4_ADAPTIVE_NATIVE_ROUTE = (
     FULL_ADAPTIVE_SHARED_ROUTE + "+r28_q4_mtp_block+r11_position_ema"

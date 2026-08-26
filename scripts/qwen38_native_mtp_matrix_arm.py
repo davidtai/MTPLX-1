@@ -523,6 +523,7 @@ def _run_one(
     from scripts import qwen38_challenge_port_gate as source_gate
 
     allowed = {
+        source_gate.FULL_FIXED_NATIVE_ROUTE,
         source_gate.FULL_ADAPTIVE_NATIVE_ROUTE,
         source_gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
         source_gate.GREEDY_ADAPTIVE_NATIVE_ROUTE,
@@ -554,6 +555,20 @@ def _run_one(
             accepted_by_depth=list(result["accepted_by_depth"]),
         )
     return result
+
+
+def _assert_route_policy_contract(route: str, arm: dict[str, Any]) -> None:
+    from scripts import qwen38_challenge_port_gate as source_gate
+
+    route_features = source_gate._validate_route_id(route)
+    policy = arm.get("adaptive_policy_receipt")
+    if "r11_position_ema" in route_features:
+        policy = policy or {}
+        if policy.get("kind") != "position_ema" or not policy.get("executed"):
+            raise RuntimeError("adaptive policy did not execute in timed arm")
+        return
+    if policy is not None or arm.get("adaptive_policy_events"):
+        raise RuntimeError("fixed optimized route executed an adaptive policy")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -695,9 +710,7 @@ def run(args: argparse.Namespace) -> int:
     if receipt["route_id"] != arm["route_id"]:
         raise RuntimeError("timed arm route receipt changed")
     if args.route != CONTROL_ROUTE:
-        policy = arm.get("adaptive_policy_receipt") or {}
-        if policy.get("kind") != "position_ema" or not policy.get("executed"):
-            raise RuntimeError("adaptive policy did not execute in timed arm")
+        _assert_route_policy_contract(args.route, arm)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False) + "\n",

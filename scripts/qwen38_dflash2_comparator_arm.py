@@ -14,6 +14,22 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_ARM = ROOT / "scripts/qwen38_native_mtp_matrix_arm.py"
+PR335_SOURCE_COMMIT = "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c"
+REQUIRED_MLX_VERSION = "0.32.2"
+REQUIRED_DFLASH_FEATURES = (
+    "adaptive_policy",
+    "context_route",
+    "dflash_gqa_widths",
+    "dflash_m6_barrier_free_kp1",
+    "dflash_m8_nax_island",
+    "r21_qk_rms_rope",
+    "r24_eval_ladder",
+    "r24_qk_length_limit",
+    "r26_prefill_ladder_3",
+    "r48_boundary_fused",
+    "r50_wired_residency",
+    "r53_command_buffers",
+)
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -37,6 +53,66 @@ def _generate_or_skip(generate: Any, runtime: Any, prompt_ids: list[int], args: 
     if int(args.max_tokens) == 0:
         return None
     return generate(runtime, prompt_ids, args)
+
+
+def _dflash_feature_active(name: str, value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if name == "context_route":
+        return all(
+            value.get(key) is True
+            for key in (
+                "effective_adaptive",
+                "row21_active",
+                "row24_decode_active",
+                "row24_prefill_active",
+                "row48_decode_active",
+                "row48_prefill_active",
+                "row50_active",
+            )
+        )
+    if name == "dflash_m8_nax_island":
+        return value.get("active") is True and int(
+            value.get("validated_projections", 0)
+        ) > 0
+    if name in {"r21_qk_rms_rope", "r24_qk_length_limit"}:
+        return int(value.get("active_modules", 0)) > 0
+    if name == "r24_eval_ladder":
+        return all(int(value.get(key, 0)) > 0 for key in ("active", "decode_active", "prefill_active"))
+    if name == "r48_boundary_fused":
+        return (
+            int(value.get("active_modules", 0)) > 0
+            and int(value.get("decode_active", 0)) > 0
+            and int(value.get("prefill_active", 0)) > 0
+        )
+    if name in {"r50_wired_residency", "r53_command_buffers"}:
+        return value.get("active") is True and value.get("installed") is True
+    return value.get("active") is True or int(value.get("active", 0)) > 0
+
+
+def _optimized_stack_errors(receipt: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    exact = {
+        "engine": "pr_dflash2",
+        "source_commit": PR335_SOURCE_COMMIT,
+        "mlx_version": REQUIRED_MLX_VERSION,
+        "mlx_metal_version": REQUIRED_MLX_VERSION,
+    }
+    for key, expected in exact.items():
+        if receipt.get(key) != expected:
+            errors.append(f"DFlash2 {key} mismatch")
+    stack = receipt.get("stack") or {}
+    if stack.get("profile") != "turbo" or int(stack.get("dflash_block_size", 0)) != 8:
+        errors.append("DFlash2 turbo stack is not installed")
+    if stack.get("native_mtp_loaded") is not False:
+        errors.append("DFlash2 comparator retained the native MTP head")
+    features = stack.get("feature_receipt") or {}
+    for name in REQUIRED_DFLASH_FEATURES:
+        if not _dflash_feature_active(name, features.get(name)):
+            errors.append(f"DFlash2 optimized feature {name} is inactive")
+    if (receipt.get("arm") or {}).get("fallback_ar") is not False:
+        errors.append("DFlash2 fell back to autoregressive decode")
+    return errors
 
 
 def main() -> int:
@@ -103,6 +179,9 @@ def main() -> int:
         Path(sys.argv[sys.argv.index("--context-file") + 1])
     )
     receipt["mlx_metal_version"] = importlib.metadata.version("mlx-metal")
+    stack_errors = _optimized_stack_errors(receipt)
+    if stack_errors:
+        raise RuntimeError(f"DFlash2 optimized receipt invariant errors: {stack_errors}")
     output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     return exit_code
 
