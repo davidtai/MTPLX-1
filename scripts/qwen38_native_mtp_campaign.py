@@ -241,6 +241,7 @@ def _run_contexts(
     run_context: Callable[[int], dict[str, Any]],
     *,
     control_features: set[str] | frozenset[str] = frozenset(),
+    stop_on_failure: bool = True,
 ) -> dict[str, Any]:
     contexts: list[dict[str, Any]] = []
     aborted_after: int | None = None
@@ -252,7 +253,7 @@ def _run_contexts(
             control_features=control_features,
         )
         contexts.append({"receipt": receipt, "decision": decision})
-        if not decision["passed"]:
+        if not decision["passed"] and stop_on_failure:
             aborted_after = context_tokens
             break
     return {

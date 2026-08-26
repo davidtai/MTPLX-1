@@ -214,6 +214,35 @@ def test_campaign_aborts_after_first_completed_neutral_context() -> None:
     assert result["contexts"][0]["decision"]["passed"] is False
 
 
+def test_audit_mode_completes_both_contexts_after_a_short_context_loss() -> None:
+    campaign = _module()
+    losing = _bracket(
+        context=1024,
+        feature="r08_device_draft",
+        improvements={"wall": -1.0, "mtp_decode": -1.0, "mtp_history": 0.0},
+    )
+    winning = _bracket(
+        context=16_384,
+        feature="r08_device_draft",
+        improvements={"wall": 1.0, "mtp_decode": 1.0, "mtp_history": 0.0},
+    )
+    called = []
+
+    result = campaign._run_contexts(
+        "r08_device_draft",
+        lambda context: called.append(context)
+        or (losing if context == 1024 else winning),
+        stop_on_failure=False,
+    )
+
+    assert called == [1024, 16_384]
+    assert result["aborted_after_context"] is None
+    assert [item["decision"]["passed"] for item in result["contexts"]] == [
+        False,
+        True,
+    ]
+
+
 def test_lower_proposer_time_with_worse_throughput_is_rejected() -> None:
     campaign = _module()
     arms = []

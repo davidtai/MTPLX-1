@@ -674,6 +674,7 @@ def _promotion_decision(
     correctness: dict[str, Any],
     source_status: list[str],
     engagement_errors: list[str] | None = None,
+    allow_frozen_candidate: bool = False,
 ) -> dict[str, Any]:
     errors: list[str] = []
     expected_order = (
@@ -687,7 +688,11 @@ def _promotion_decision(
         errors.append("gate requires explicit control and candidate routes")
     else:
         try:
-            validate_native_mtp_route_delta(control_id, candidate_id)
+            validate_native_mtp_route_delta(
+                control_id,
+                candidate_id,
+                allow_frozen_candidate=allow_frozen_candidate,
+            )
         except NativeMTPRouteError as exc:
             errors.append(f"native-MTP route delta rejected: {exc}")
     if improvement_pct is None or not math.isfinite(float(improvement_pct)):

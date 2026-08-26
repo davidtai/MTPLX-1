@@ -1216,6 +1216,24 @@ def test_promotion_gate_uses_the_native_mtp_registry_for_one_delta() -> None:
     assert result == {"passed": True, "threshold_pct": 0.05, "errors": []}
 
 
+def test_rebench_promotion_gate_can_isolate_one_frozen_feature() -> None:
+    gate = _module()
+    control = "r08_device_draft+r10_compact_vocab"
+    candidate = control + "+r18_gdn_decay_memo"
+
+    result = gate._promotion_decision(
+        order=[control, candidate, candidate, control],
+        control_id=control,
+        candidate_id=candidate,
+        improvement_pct=0.1,
+        correctness={"passed": True},
+        source_status=[],
+        allow_frozen_candidate=True,
+    )
+
+    assert result == {"passed": True, "threshold_pct": 0.05, "errors": []}
+
+
 @pytest.mark.parametrize(
     ("control", "candidate", "message"),
     [

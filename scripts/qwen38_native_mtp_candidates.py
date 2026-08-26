@@ -703,6 +703,8 @@ def canonicalize_native_mtp_route(route_id: str) -> frozenset[str]:
 def validate_native_mtp_route_delta(
     control_route: str,
     candidate_route: str,
+    *,
+    allow_frozen_candidate: bool = False,
 ) -> NativeMTPRouteDelta:
     """Require one eligible native-MTP addition or one explicit replacement.
 
@@ -716,7 +718,7 @@ def validate_native_mtp_route_delta(
 
     control_frozen = control & _FROZEN_BY_FEATURE.keys()
     candidate_frozen = candidate & _FROZEN_BY_FEATURE.keys()
-    if control_frozen != candidate_frozen:
+    if control_frozen != candidate_frozen and not allow_frozen_candidate:
         raise NativeMTPRouteError(
             "frozen substrate must be identical between control and candidate"
         )
@@ -728,6 +730,25 @@ def validate_native_mtp_route_delta(
             "control/candidate routes must differ by exactly one native-MTP candidate"
         )
     candidate_feature = next(iter(added))
+    if candidate_feature in _FROZEN_BY_FEATURE:
+        if not allow_frozen_candidate:
+            raise NativeMTPRouteError(
+                "candidate delta is not an eligible native-MTP surface: "
+                f"{candidate_feature}"
+            )
+        if removed:
+            raise NativeMTPRouteError(
+                "frozen optimized feature must be an isolated addition"
+            )
+        return NativeMTPRouteDelta(
+            control_features=control,
+            candidate_features=candidate,
+            candidate_feature=candidate_feature,
+            added=added,
+            removed=removed,
+            replacement=False,
+            implicit_replaced_surface=None,
+        )
     if candidate_feature not in NATIVE_MTP_CANDIDATES:
         raise NativeMTPRouteError(
             f"candidate delta is not an eligible native-MTP surface: {candidate_feature}"

@@ -514,6 +514,25 @@ def test_row36_can_replace_row28_for_direct_winner_comparison() -> None:
     assert delta.removed == frozenset({"r28_q4_mtp_block"})
 
 
+def test_rebench_scope_can_isolate_one_frozen_optimized_feature() -> None:
+    control = "r08_device_draft+r10_compact_vocab"
+    candidate = control + "+r18_gdn_decay_memo"
+
+    with pytest.raises(registry.NativeMTPRouteError, match="frozen substrate"):
+        registry.validate_native_mtp_route_delta(control, candidate)
+
+    delta = registry.validate_native_mtp_route_delta(
+        control,
+        candidate,
+        allow_frozen_candidate=True,
+    )
+
+    assert delta.candidate_feature == "r18_gdn_decay_memo"
+    assert delta.added == frozenset({"r18_gdn_decay_memo"})
+    assert delta.removed == frozenset()
+    assert delta.replacement is False
+
+
 @pytest.mark.parametrize(
     ("control", "candidate", "message"),
     [

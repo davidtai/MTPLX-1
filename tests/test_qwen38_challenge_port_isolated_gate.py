@@ -42,6 +42,7 @@ def _args(**overrides):
         "order": "control,r08_device_draft,r08_device_draft,control",
         "control_route": "control",
         "candidate_route": "r08_device_draft",
+        "allow_frozen_candidate": False,
         "row17_artifact": None,
         "row28_artifact": None,
         "row36_artifact": None,
@@ -50,6 +51,88 @@ def _args(**overrides):
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def test_rebench_delta_flag_allows_one_frozen_feature() -> None:
+    isolated = _module()
+    control = "r08_device_draft+r10_compact_vocab"
+    candidate = control + "+r18_gdn_decay_memo"
+
+    delta = isolated._validate_route_delta(
+        _args(
+            control_route=control,
+            candidate_route=candidate,
+            allow_frozen_candidate=True,
+        )
+    )
+
+    assert delta.candidate_feature == "r18_gdn_decay_memo"
+
+
+def test_frozen_rebench_accepts_stable_route_specific_substrate_fingerprints() -> None:
+    isolated = _module()
+    control = "control"
+    candidate = "r18_gdn_decay_memo"
+    args = _args(
+        prompt_file=isolated.gate.DEFAULT_PROMPT,
+        context_file=isolated.gate.DEFAULT_CONTEXT,
+        order=f"{control},{candidate},{candidate},{control}",
+        control_route=control,
+        candidate_route=candidate,
+        allow_frozen_candidate=True,
+    )
+    base = {
+        "prompt_file": str(args.prompt_file),
+        "context_file": str(args.context_file),
+        "prompt_id": isolated.gate._read_prompt(args.prompt_file)[0],
+        "prompt_token_target": 1024,
+        "prompt_tokens": 1024,
+        "max_tokens": 1024,
+        "seed": 42,
+        "target_temperature": 1.0,
+        "draft_temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "mlx_version": "0.32.2",
+        "mlx_metal_version": "0.32.2",
+        "source_status": [],
+        "source_commit": "abc",
+        "gpu_lock_scope": "attested_parent",
+        "gpu_lock_path": str(args.lock.resolve()),
+        "model_artifact_hashes": {"config.json": "123"},
+        "warmups": [{"generated_tokens": 1024}],
+    }
+    routes = (control, candidate, candidate, control)
+    receipts = [
+        {
+            **base,
+            "frozen_substrate_fingerprint": f"frozen-{route}",
+            "arms": [
+                {
+                    "generated_tokens": 1024,
+                    "route_id": route,
+                    "route_fingerprint": f"route-{route}",
+                    "installed_route_id": f"installed-{route}",
+                    "feature_receipt": {
+                        "r18_gdn_decay_memo": {"active_modules": 48}
+                    }
+                    if route == candidate
+                    else {},
+                }
+            ],
+        }
+        for route in routes
+    ]
+
+    assert isolated._receipt_invariant_errors(args, receipts) == []
+    receipts[2] = {
+        **receipts[2],
+        "frozen_substrate_fingerprint": "candidate-drift",
+    }
+    assert any(
+        "frozen_substrate_fingerprint" in error
+        for error in isolated._receipt_invariant_errors(args, receipts)
+    )
 
 
 def test_child_command_preserves_the_exact_sampler_and_conditioner() -> None:

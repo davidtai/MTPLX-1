@@ -237,12 +237,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--order", required=True)
     parser.add_argument("--control-route", required=True)
     parser.add_argument("--candidate-route", required=True)
+    parser.add_argument("--allow-frozen-candidate", action="store_true")
     parser.add_argument("--row17-artifact", type=Path)
     parser.add_argument("--row28-artifact", type=Path)
     parser.add_argument("--row36-artifact", type=Path)
     parser.add_argument("--lock", type=Path, default=gate.DEFAULT_LOCK)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
+
+
+def _validate_route_delta(args: argparse.Namespace) -> Any:
+    return gate.validate_native_mtp_route_delta(
+        args.control_route,
+        args.candidate_route,
+        allow_frozen_candidate=bool(
+            getattr(args, "allow_frozen_candidate", False)
+        ),
+    )
 
 
 def _child_command(
@@ -356,7 +367,6 @@ def _receipt_invariant_errors(
 
     for key in (
         "source_commit",
-        "frozen_substrate_fingerprint",
         "model_artifact_hashes",
         "context_sha256",
         "prompt_token_sha256",
@@ -372,6 +382,7 @@ def _receipt_invariant_errors(
         errors.append("model artifact hashes are missing")
 
     by_route: dict[str, set[str]] = {}
+    frozen_fingerprints: dict[str, set[str]] = {}
     route_fingerprints: dict[str, set[str]] = {}
     installed_route_ids: dict[str, set[str]] = {}
     for receipt in child_receipts:
@@ -379,11 +390,17 @@ def _receipt_invariant_errors(
         route = str(arm.get("route_id") or "")
         route_fingerprint = str(arm.get("route_fingerprint") or "")
         installed_route_id = str(arm.get("installed_route_id") or "")
+        frozen_fingerprint = str(
+            receipt.get("frozen_substrate_fingerprint") or ""
+        )
+        if not frozen_fingerprint:
+            errors.append(f"{route} frozen_substrate_fingerprint is missing")
         if not route_fingerprint:
             errors.append(f"{route} route_fingerprint is missing")
         if not installed_route_id:
             errors.append(f"{route} installed_route_id is missing")
         route_fingerprints.setdefault(route, set()).add(route_fingerprint)
+        frozen_fingerprints.setdefault(route, set()).add(frozen_fingerprint)
         installed_route_ids.setdefault(route, set()).add(installed_route_id)
         by_route.setdefault(route, set()).add(
             json.dumps(
@@ -394,15 +411,28 @@ def _receipt_invariant_errors(
         )
     if any(len(values) != 1 for values in route_fingerprints.values()):
         errors.append("route_fingerprint is not identical within route")
+    if any(len(values) != 1 for values in frozen_fingerprints.values()):
+        errors.append(
+            "frozen_substrate_fingerprint is not identical within route"
+        )
+    unique_frozen = set().union(*frozen_fingerprints.values())
+    if bool(getattr(args, "allow_frozen_candidate", False)):
+        if len(unique_frozen) != 2:
+            errors.append(
+                "frozen candidate requires distinct control and candidate "
+                "frozen_substrate_fingerprint values"
+            )
+    elif len(unique_frozen) != 1:
+        errors.append(
+            "child frozen_substrate_fingerprint values are not identical"
+        )
     if any(len(values) != 1 for values in installed_route_ids.values()):
         errors.append("installed_route_id is not identical within route")
     if any(len(values) != 1 for values in by_route.values()):
         errors.append("candidate artifact hashes are not deterministic within route")
 
     try:
-        delta = gate.validate_native_mtp_route_delta(
-            args.control_route, args.candidate_route
-        )
+        delta = _validate_route_delta(args)
     except gate.NativeMTPRouteError:
         return errors
     expected_artifact = gate._expected_candidate_artifact_hashes(
@@ -470,10 +500,11 @@ def _aggregate(
         correctness=correctness,
         source_status=source_status,
         engagement_errors=engagement_errors,
+        allow_frozen_candidate=bool(
+            getattr(args, "allow_frozen_candidate", False)
+        ),
     )
-    delta = gate.validate_native_mtp_route_delta(
-        args.control_route, args.candidate_route
-    )
+    delta = _validate_route_delta(args)
     receipt_invariant_errors = _receipt_invariant_errors(args, child_receipts)
     phase_summary = gate._phase_summary(
         arms,
@@ -566,9 +597,7 @@ def main() -> int:
         raise ValueError("isolated gate requires exactly four ABBA routes")
     for route_id in order:
         gate._validate_route_id(route_id)
-    gate.validate_native_mtp_route_delta(
-        args.control_route, args.candidate_route
-    )
+    _validate_route_delta(args)
 
     child_receipts: list[dict[str, Any]] = []
     with _gpu_lock_scope(args.lock) as lock_scope:
