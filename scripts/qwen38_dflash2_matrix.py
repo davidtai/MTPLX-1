@@ -65,7 +65,7 @@ def scenario(workload: str, context_tokens: int) -> Scenario:
         if context_tokens != 1_024:
             raise ValueError("DFlash2 xhigh is restricted to 1024 input tokens")
         return Scenario(
-            workload, context_tokens, 16_384, 1_024, 1.0, 0.95, 20,
+            workload, context_tokens, 1_024, 1_024, 1.0, 0.95, 20,
             "coding", True, "xhigh",
         )
     raise ValueError(f"unknown DFlash2 workload: {workload}")

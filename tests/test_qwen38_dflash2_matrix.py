@@ -34,7 +34,7 @@ def test_scenarios_match_the_final_campaign_contract() -> None:
 
     xhigh = matrix.scenario("xhigh", 1_024)
     assert xhigh.conditioner_tokens == 1_024
-    assert xhigh.max_tokens == 16_384
+    assert xhigh.max_tokens == 1_024
     assert xhigh.reasoning_effort == "xhigh"
     assert matrix.order_for_context("xhigh", 1_024) == ("dflash2", "dflash2")
 

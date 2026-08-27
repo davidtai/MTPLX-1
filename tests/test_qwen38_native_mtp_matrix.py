@@ -80,7 +80,7 @@ def test_matrix_workload_contract_redoes_every_requested_context() -> None:
     assert matrix.CONTEXT_TOKENS == (1_024, 16_384, 65_536, 131_072)
     assert matrix.CONDITIONER_OUTPUT_TOKENS == 1_024
     assert matrix.LOW_OUTPUT_TOKENS == 1_024
-    assert matrix.XHIGH_OUTPUT_TOKENS == 16_384
+    assert matrix.XHIGH_OUTPUT_TOKENS == 1_024
     assert matrix.VANITY_PROMPT_TOKENS == 100
     assert matrix.VANITY_TEMPERATURE == 0.0
     assert matrix.VANITY_PROMPT_FILE.name == "qwen38_palindrome_vanity.jsonl"
@@ -672,7 +672,7 @@ def test_child_command_attests_source_workload_and_custom_head(tmp_path: Path) -
         f"--row17-artifact {tmp_path / 'mtp.safetensors'}",
         "--workload xhigh",
         "--prompt-tokens 16384",
-        "--max-tokens 16384",
+        "--max-tokens 1024",
         "--warmup-tokens 1024",
         "--target-temperature 1.0",
         "--top-p 0.95",
