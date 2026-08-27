@@ -137,7 +137,7 @@ def lane_specs(
 ) -> dict[str, LaneSpec]:
     if workload not in {"vanity", "low", "xhigh"}:
         raise ValueError(f"unknown workload: {workload}")
-    if workload == "xhigh":
+    if workload in {"vanity", "xhigh"}:
         fixed_route = XHIGH_FIXED_NATIVE_ROUTE
         adaptive_route = XHIGH_ADAPTIVE_NATIVE_ROUTE
         q4_route = XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE

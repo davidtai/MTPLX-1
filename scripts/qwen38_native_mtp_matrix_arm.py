@@ -599,7 +599,7 @@ def _assert_route_policy_contract(route: str, arm: dict[str, Any]) -> None:
 
 
 def _performance_profile_for_workload(workload: str) -> str:
-    return "low" if workload == "vanity" else workload
+    return "xhigh" if workload == "vanity" else workload
 
 
 def _parse_args() -> argparse.Namespace:

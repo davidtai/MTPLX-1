@@ -195,7 +195,7 @@ def test_lane_specs_keep_source_and_head_changes_separate(tmp_path: Path) -> Non
     )
 
 
-def test_lane_specs_select_low_once_for_vanity_and_low_and_xhigh_once_for_xhigh(
+def test_lane_specs_select_stock_draft_once_for_vanity_and_workload_profiles_once(
     tmp_path: Path,
 ) -> None:
     matrix = _module()
@@ -206,14 +206,18 @@ def test_lane_specs_select_low_once_for_vanity_and_low_and_xhigh_once_for_xhigh(
         "candidate_commit": "c" * 40,
     }
 
-    for workload in ("vanity", "low"):
-        specs = matrix.lane_specs(workload=workload, **common)
-        assert specs["full-fixed-k3"].route_id == matrix.LOW_FIXED_NATIVE_ROUTE
-        assert specs["full-adaptive"].route_id == matrix.LOW_ADAPTIVE_NATIVE_ROUTE
-        assert (
-            specs["full-q4-adaptive"].route_id
-            == matrix.LOW_Q4_ADAPTIVE_NATIVE_ROUTE
-        )
+    specs = matrix.lane_specs(workload="vanity", **common)
+    assert specs["full-fixed-k3"].route_id == matrix.XHIGH_FIXED_NATIVE_ROUTE
+    assert specs["full-adaptive"].route_id == matrix.XHIGH_ADAPTIVE_NATIVE_ROUTE
+    assert (
+        specs["full-q4-adaptive"].route_id
+        == matrix.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE
+    )
+
+    specs = matrix.lane_specs(workload="low", **common)
+    assert specs["full-fixed-k3"].route_id == matrix.LOW_FIXED_NATIVE_ROUTE
+    assert specs["full-adaptive"].route_id == matrix.LOW_ADAPTIVE_NATIVE_ROUTE
+    assert specs["full-q4-adaptive"].route_id == matrix.LOW_Q4_ADAPTIVE_NATIVE_ROUTE
 
     specs = matrix.lane_specs(workload="xhigh", **common)
     assert specs["full-fixed-k3"].route_id == matrix.XHIGH_FIXED_NATIVE_ROUTE
@@ -428,7 +432,7 @@ def test_arm_policy_contract_distinguishes_fixed_from_adaptive() -> None:
     )
 
 
-def test_vanity_lane_specs_keep_the_complete_optimized_native_mtp_stack(
+def test_vanity_lane_specs_keep_the_stock_draft_optimized_native_mtp_stack(
     tmp_path: Path,
 ) -> None:
     matrix = _module()
@@ -442,21 +446,21 @@ def test_vanity_lane_specs_keep_the_complete_optimized_native_mtp_stack(
 
     bf16 = specs["full-adaptive"].route_id
     q4 = specs["full-q4-adaptive"].route_id
-    assert bf16 == matrix.LOW_ADAPTIVE_NATIVE_ROUTE
-    assert q4 == matrix.LOW_Q4_ADAPTIVE_NATIVE_ROUTE
-    assert matrix.gate._route_execution_options(bf16)["draft_core"] == "device"
-    assert matrix.gate._route_execution_options(q4)["draft_core"] == "device"
+    assert bf16 == matrix.XHIGH_ADAPTIVE_NATIVE_ROUTE
+    assert q4 == matrix.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE
+    assert matrix.gate._route_execution_options(bf16)["draft_core"] == "stock"
+    assert matrix.gate._route_execution_options(q4)["draft_core"] == "stock"
     for optimized in (
-        "r08_device_draft",
-        "r10_compact_vocab",
         "r20_kv_only_history",
-        "r21_qk_rms_rope",
         "r24_eval_ladder",
         "r26_prefill_ladder_3",
+        "r50_wired_residency",
         "r53_command_buffers",
         "r11_position_ema",
     ):
         assert optimized in bf16
+    assert "r08_device_draft" not in bf16
+    assert "r10_compact_vocab" not in bf16
     assert "r17_q4_mtp_block" in q4
 
 
@@ -1155,9 +1159,9 @@ def test_arm_requires_exact_100_token_non_thinking_vanity_prompt() -> None:
 
 @pytest.mark.parametrize(
     ("workload", "expected_profile"),
-    (("vanity", "low"), ("low", "low"), ("xhigh", "xhigh")),
+    (("vanity", "xhigh"), ("low", "low"), ("xhigh", "xhigh")),
 )
-def test_arm_maps_vanity_to_the_installed_low_performance_profile(
+def test_arm_maps_vanity_to_the_installed_stock_draft_performance_profile(
     workload: str,
     expected_profile: str,
 ) -> None:
