@@ -50,14 +50,24 @@ REQUIRED_MLX_METAL_VERSION = "0.32.2"
 MODEL_ARTIFACT_HASHES_ENV = "MTPLX_QWEN38_MODEL_ARTIFACT_HASHES"
 FIXED_NATIVE_ROUTE = "control"
 ADAPTIVE_NATIVE_ROUTE = "r11_position_ema"
-FULL_ADAPTIVE_SHARED_ROUTE = (
+LOW_ADAPTIVE_SHARED_ROUTE = (
+    "r20_kv_only_history+r53_command_buffers+r08_device_draft+"
+    "r10_compact_vocab+r21_qk_rms_rope+r24_eval_ladder+"
+    "r26_prefill_ladder_3"
+)
+LOW_FIXED_NATIVE_ROUTE = LOW_ADAPTIVE_SHARED_ROUTE
+LOW_ADAPTIVE_NATIVE_ROUTE = LOW_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
+LOW_Q4_ADAPTIVE_NATIVE_ROUTE = (
+    LOW_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema+r17_q4_mtp_block"
+)
+XHIGH_ADAPTIVE_SHARED_ROUTE = (
     "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+"
     "r50_wired_residency+r53_command_buffers"
 )
-FULL_FIXED_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE
-FULL_ADAPTIVE_NATIVE_ROUTE = FULL_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
-FULL_Q4_ADAPTIVE_NATIVE_ROUTE = (
-    FULL_ADAPTIVE_SHARED_ROUTE + "+r28_q4_mtp_block+r11_position_ema"
+XHIGH_FIXED_NATIVE_ROUTE = XHIGH_ADAPTIVE_SHARED_ROUTE
+XHIGH_ADAPTIVE_NATIVE_ROUTE = XHIGH_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema"
+XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE = (
+    XHIGH_ADAPTIVE_SHARED_ROUTE + "+r11_position_ema+r17_q4_mtp_block"
 )
 GREEDY_ADAPTIVE_SHARED_ROUTE = (
     "r18_gdn_decay_memo+r20_kv_only_history+r21_qk_rms_rope+"

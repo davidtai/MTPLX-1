@@ -508,7 +508,7 @@ def _run_one(
     draft_temperature: float,
     top_p: float,
     top_k: int,
-    row28_artifact: Path,
+    row17_artifact: Path,
     record_depth_usage: bool,
     force_exact_output: bool,
     performance_profile: str = "low",
@@ -530,9 +530,12 @@ def _run_one(
     from scripts import qwen38_challenge_port_gate as source_gate
 
     allowed = {
-        source_gate.FULL_FIXED_NATIVE_ROUTE,
-        source_gate.FULL_ADAPTIVE_NATIVE_ROUTE,
-        source_gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
+        source_gate.LOW_FIXED_NATIVE_ROUTE,
+        source_gate.LOW_ADAPTIVE_NATIVE_ROUTE,
+        source_gate.LOW_Q4_ADAPTIVE_NATIVE_ROUTE,
+        source_gate.XHIGH_FIXED_NATIVE_ROUTE,
+        source_gate.XHIGH_ADAPTIVE_NATIVE_ROUTE,
+        source_gate.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE,
         source_gate.GREEDY_ADAPTIVE_NATIVE_ROUTE,
         source_gate.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE,
     }
@@ -565,8 +568,8 @@ def _run_one(
         draft_temperature=draft_temperature,
         top_p=top_p,
         top_k=top_k,
-        row17_artifact_path=None,
-        row28_artifact_path=row28_artifact,
+        row17_artifact_path=row17_artifact,
+        row28_artifact_path=None,
         row36_artifact_path=None,
         performance_profile=performance_profile,
         stop_token_ids=set() if force_exact_output else None,
@@ -613,7 +616,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-temperature", type=float, required=True)
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
-    parser.add_argument("--row28-artifact", type=Path, required=True)
+    parser.add_argument("--row17-artifact", type=Path, required=True)
     parser.add_argument("--record-depth-usage", action="store_true")
     parser.add_argument("--force-exact-output", action="store_true")
     parser.add_argument("--allow-fixed-diagnostic-route", action="store_true")
@@ -637,8 +640,8 @@ def run(args: argparse.Namespace) -> int:
     versions = _validated_versions()
     model = args.model.resolve(strict=True)
     model_hashes = _attested_model_hashes(model)
-    row28_artifact = args.row28_artifact.resolve(strict=True)
-    row28_hash = _sha256(row28_artifact)
+    row17_artifact = args.row17_artifact.resolve(strict=True)
+    row17_hash = _sha256(row17_artifact)
 
     runtime, optimized_stack = _load_optimized_speed_stack(
         model, record_depth_usage=args.record_depth_usage
@@ -675,7 +678,7 @@ def run(args: argparse.Namespace) -> int:
             draft_temperature=args.draft_temperature,
             top_p=args.top_p,
             top_k=args.top_k,
-            row28_artifact=row28_artifact,
+            row17_artifact=row17_artifact,
             record_depth_usage=False,
             force_exact_output=args.force_exact_output,
             performance_profile=args.workload,
@@ -693,7 +696,7 @@ def run(args: argparse.Namespace) -> int:
         draft_temperature=args.draft_temperature,
         top_p=args.top_p,
         top_k=args.top_k,
-        row28_artifact=row28_artifact,
+        row17_artifact=row17_artifact,
         record_depth_usage=args.record_depth_usage,
         force_exact_output=args.force_exact_output,
         performance_profile=args.workload,
@@ -738,7 +741,7 @@ def run(args: argparse.Namespace) -> int:
         "gpu_lock_scope": "attested_parent",
         "model_id": model.name,
         "model_artifact_hashes": model_hashes,
-        "row28_artifact_sha256": row28_hash,
+        "row17_artifact_sha256": row17_hash,
         "stop_token_policy": (
             "disabled_for_exact_output"
             if args.force_exact_output

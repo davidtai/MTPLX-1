@@ -42,35 +42,61 @@ def test_final_native_route_contains_only_retained_features() -> None:
     assert "source_proposal" not in gate.ALLOWED_ROUTE_FEATURES
 
 
-def test_full_adaptive_benchmark_routes_share_every_safe_retained_optimization() -> None:
+def test_low_and_xhigh_benchmark_routes_use_independently_promoted_stacks() -> None:
     gate = _module()
 
-    expected_shared = (
+    expected_low_shared = (
+        "r20_kv_only_history+r53_command_buffers+r08_device_draft+"
+        "r10_compact_vocab+r21_qk_rms_rope+r24_eval_ladder+"
+        "r26_prefill_ladder_3"
+    )
+    expected_xhigh_shared = (
         "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+"
         "r50_wired_residency+r53_command_buffers"
     )
-    assert gate.FULL_ADAPTIVE_SHARED_ROUTE == expected_shared
-    assert gate.FULL_ADAPTIVE_NATIVE_ROUTE == expected_shared + "+r11_position_ema"
-    assert gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE == (
-        expected_shared + "+r28_q4_mtp_block+r11_position_ema"
+    assert gate.LOW_ADAPTIVE_SHARED_ROUTE == expected_low_shared
+    assert gate.LOW_FIXED_NATIVE_ROUTE == expected_low_shared
+    assert gate.LOW_ADAPTIVE_NATIVE_ROUTE == (
+        expected_low_shared + "+r11_position_ema"
+    )
+    assert gate.LOW_Q4_ADAPTIVE_NATIVE_ROUTE == (
+        expected_low_shared + "+r11_position_ema+r17_q4_mtp_block"
+    )
+    assert gate.XHIGH_ADAPTIVE_SHARED_ROUTE == expected_xhigh_shared
+    assert gate.XHIGH_FIXED_NATIVE_ROUTE == expected_xhigh_shared
+    assert gate.XHIGH_ADAPTIVE_NATIVE_ROUTE == (
+        expected_xhigh_shared + "+r11_position_ema"
+    )
+    assert gate.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE == (
+        expected_xhigh_shared + "+r11_position_ema+r17_q4_mtp_block"
     )
 
-    bf16 = gate._route_execution_options(gate.FULL_ADAPTIVE_NATIVE_ROUTE)
-    q4 = gate._route_execution_options(gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE)
-    assert bf16["mtp_block_variant"] is None
-    assert q4["mtp_block_variant"] == "r28"
-    assert bf16["adaptive_policy"] == q4["adaptive_policy"] == "position_ema"
-    assert bf16["source_rows"] == (20, 24, 26, 50, 53, 11)
-    assert q4["source_rows"] == (20, 24, 26, 28, 50, 53, 11)
-    assert bf16["draft_core"] == q4["draft_core"] == "stock"
+    low_bf16 = gate._route_execution_options(gate.LOW_ADAPTIVE_NATIVE_ROUTE)
+    low_q4 = gate._route_execution_options(gate.LOW_Q4_ADAPTIVE_NATIVE_ROUTE)
+    xhigh_bf16 = gate._route_execution_options(gate.XHIGH_ADAPTIVE_NATIVE_ROUTE)
+    xhigh_q4 = gate._route_execution_options(gate.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE)
+    assert low_bf16["mtp_block_variant"] is None
+    assert low_q4["mtp_block_variant"] == "r17"
+    assert low_bf16["adaptive_policy"] == "position_ema"
+    assert low_q4["adaptive_policy"] == "position_ema"
+    assert low_bf16["source_rows"] == (8, 10, 20, 21, 24, 26, 53, 11)
+    assert low_q4["source_rows"] == (8, 10, 17, 20, 21, 24, 26, 53, 11)
+    assert low_bf16["draft_core"] == low_q4["draft_core"] == "device"
+    assert xhigh_bf16["mtp_block_variant"] is None
+    assert xhigh_q4["mtp_block_variant"] == "r17"
+    assert xhigh_bf16["source_rows"] == (20, 24, 26, 50, 53, 11)
+    assert xhigh_q4["source_rows"] == (17, 20, 24, 26, 50, 53, 11)
+    assert xhigh_bf16["draft_core"] == xhigh_q4["draft_core"] == "stock"
 
 
 def test_full_adaptive_benchmark_routes_include_measured_command_buffer_profile() -> None:
     gate = _module()
 
     for route in (
-        gate.FULL_ADAPTIVE_NATIVE_ROUTE,
-        gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
+        gate.LOW_ADAPTIVE_NATIVE_ROUTE,
+        gate.LOW_Q4_ADAPTIVE_NATIVE_ROUTE,
+        gate.XHIGH_ADAPTIVE_NATIVE_ROUTE,
+        gate.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE,
     ):
         assert "r53_command_buffers" in route.split("+")
         assert gate._route_execution_options(route)["row53_command_buffers"] is True

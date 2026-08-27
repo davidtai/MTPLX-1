@@ -24,9 +24,12 @@ except ModuleNotFoundError:  # Direct execution places scripts/ on sys.path.
 
 V292_COMMIT = "bbc67427e88288001e4b90ecb44708dc0222154c"
 MODEL_ID = "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
-FULL_FIXED_NATIVE_ROUTE = gate.FULL_FIXED_NATIVE_ROUTE
-FULL_ADAPTIVE_NATIVE_ROUTE = gate.FULL_ADAPTIVE_NATIVE_ROUTE
-FULL_Q4_ADAPTIVE_NATIVE_ROUTE = gate.FULL_Q4_ADAPTIVE_NATIVE_ROUTE
+LOW_FIXED_NATIVE_ROUTE = gate.LOW_FIXED_NATIVE_ROUTE
+LOW_ADAPTIVE_NATIVE_ROUTE = gate.LOW_ADAPTIVE_NATIVE_ROUTE
+LOW_Q4_ADAPTIVE_NATIVE_ROUTE = gate.LOW_Q4_ADAPTIVE_NATIVE_ROUTE
+XHIGH_FIXED_NATIVE_ROUTE = gate.XHIGH_FIXED_NATIVE_ROUTE
+XHIGH_ADAPTIVE_NATIVE_ROUTE = gate.XHIGH_ADAPTIVE_NATIVE_ROUTE
+XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE = gate.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE
 GREEDY_ADAPTIVE_NATIVE_ROUTE = gate.GREEDY_ADAPTIVE_NATIVE_ROUTE
 GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE = gate.GREEDY_Q4_ADAPTIVE_NATIVE_ROUTE
 
@@ -46,29 +49,59 @@ PAIRED_ORDER = (
     "full-fixed-k3",
     "v2.9.2-mlx0322",
 )
-BF16_OPTIMIZED_KERNEL_IDS = (
+LOW_BF16_OPTIMIZED_KERNEL_IDS = (
+    "qwen38_mtp_kv_only_history_ge16384_v1",
+    "qwen38_qk_rms_rope_bf16_h256_r64_v1",
+    "qwen38_row24_qk_rms_rope_l_le16_v1",
+    "qwen38_row24_target_eval_ladder_v1",
+    "qwen38_row26_prefill_eval_every3_v1",
+    "qwen38_row26_qk_rms_rope_l_le32_v1",
+    "qwen38_row10_compact_q4_g64_vocab_v1",
+)
+LOW_BF16_OPTIMIZED_FEATURE_KEYS = (
+    "r10_compact_vocab",
+    "r20_kv_only_history",
+    "r21_qk_rms_rope",
+    "r24_eval_ladder",
+    "r24_qk_length_limit",
+    "r26_prefill_ladder_3",
+    "r26_qk_length_limit",
+    "r53_command_buffers",
+)
+LOW_BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
+    "kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
+    "r26_prefill_ladder_3+r10_compact_vocab"
+)
+LOW_Q4_OPTIMIZED_KERNEL_IDS = (
+    "qwen38_row17_q4_g64_mtp_block_v1",
+    *LOW_BF16_OPTIMIZED_KERNEL_IDS,
+)
+LOW_Q4_OPTIMIZED_INSTALLED_ROUTE_ID = (
+    "r17_q4_mtp_block+" + LOW_BF16_OPTIMIZED_INSTALLED_ROUTE_ID
+)
+XHIGH_BF16_OPTIMIZED_KERNEL_IDS = (
     "qwen38_mtp_kv_only_history_ge16384_v1",
     "qwen38_row24_target_eval_ladder_v1",
     "qwen38_row26_prefill_eval_every3_v1",
     "qwen38_row50_post_warm_wired_residency_v1",
 )
-BF16_OPTIMIZED_FEATURE_KEYS = (
+XHIGH_BF16_OPTIMIZED_FEATURE_KEYS = (
     "r20_kv_only_history",
     "r24_eval_ladder",
     "r26_prefill_ladder_3",
     "r50_wired_residency",
     "r53_command_buffers",
 )
-BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
+XHIGH_BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
     "kv_only_history+r24_eval_ladder+"
     "r26_prefill_ladder_3+r50_wired_residency"
 )
-Q4_OPTIMIZED_KERNEL_IDS = (
-    "qwen38_row28_q4_g64_mtp_block_v1",
-    *BF16_OPTIMIZED_KERNEL_IDS,
+XHIGH_Q4_OPTIMIZED_KERNEL_IDS = (
+    "qwen38_row17_q4_g64_mtp_block_v1",
+    *XHIGH_BF16_OPTIMIZED_KERNEL_IDS,
 )
-Q4_OPTIMIZED_INSTALLED_ROUTE_ID = (
-    "r17_q4_mtp_block+r28_q4_mtp_block+" + BF16_OPTIMIZED_INSTALLED_ROUTE_ID
+XHIGH_Q4_OPTIMIZED_INSTALLED_ROUTE_ID = (
+    "r17_q4_mtp_block+" + XHIGH_BF16_OPTIMIZED_INSTALLED_ROUTE_ID
 )
 ONE_PASS_ORDER = LANE_IDS
 CONTEXT_TOKENS = (1_024, 16_384, 65_536, 131_072)
@@ -93,7 +126,7 @@ PROMPT_ARTIFACT_SHA256 = {
     "python": "ca2054913c5c27c24c983ed27e3ee4eff1d01d456a73e71377fdaea3cbf8c140",
 }
 PYTHON_CONTEXT_SHA256 = "dfa72b4d7b161ef6f6105b0a635cff3bf3d112f37bdb4f0d1a4eb092ccbf5771"
-ROW28_ARTIFACT_SHA256 = "c934b40f1254858425cc0b5fdfe62b6ae13d1a4aff74da9d81606e92fdcf41ee"
+ROW17_ARTIFACT_SHA256 = "0e267a482e74c2664ce41dc4c4326f480020d015372fc9f7654ea3a136d62815"
 PROMPT_TOKEN_SHA256 = {
     "vanity": {
         100: "94a188b7cacc378c60a6503feea97429c59f6dab3980635eaa5e35da1e6b767b",
@@ -130,6 +163,14 @@ def lane_specs(
 ) -> dict[str, LaneSpec]:
     if workload not in {"vanity", "low", "xhigh"}:
         raise ValueError(f"unknown workload: {workload}")
+    if workload == "xhigh":
+        fixed_route = XHIGH_FIXED_NATIVE_ROUTE
+        adaptive_route = XHIGH_ADAPTIVE_NATIVE_ROUTE
+        q4_route = XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE
+    else:
+        fixed_route = LOW_FIXED_NATIVE_ROUTE
+        adaptive_route = LOW_ADAPTIVE_NATIVE_ROUTE
+        q4_route = LOW_Q4_ADAPTIVE_NATIVE_ROUTE
     return {
         "v2.9.2-mlx0322": LaneSpec(
             "v2.9.2-mlx0322", baseline_root, baseline_commit, "control"
@@ -138,19 +179,19 @@ def lane_specs(
             "full-fixed-k3",
             candidate_root,
             candidate_commit,
-            FULL_FIXED_NATIVE_ROUTE,
+            fixed_route,
         ),
         "full-adaptive": LaneSpec(
             "full-adaptive",
             candidate_root,
             candidate_commit,
-            FULL_ADAPTIVE_NATIVE_ROUTE,
+            adaptive_route,
         ),
         "full-q4-adaptive": LaneSpec(
             "full-q4-adaptive",
             candidate_root,
             candidate_commit,
-            FULL_Q4_ADAPTIVE_NATIVE_ROUTE,
+            q4_route,
         ),
     }
 
@@ -200,7 +241,7 @@ def child_command(
     model: Path,
     prompt_file: Path,
     context_file: Path,
-    row28_artifact: Path,
+    row17_artifact: Path,
     python: Path,
     lock: Path,
 ) -> list[str]:
@@ -225,7 +266,7 @@ def child_command(
         "--draft-temperature", str(temperature),
         "--top-p", str(top_p),
         "--top-k", str(top_k),
-        "--row28-artifact", str(row28_artifact.resolve()),
+        "--row17-artifact", str(row17_artifact.resolve()),
         "--lock", str(lock.resolve()),
         "--output", str(output.resolve()),
     ]
@@ -257,15 +298,65 @@ def _feature_is_active(value: Any) -> bool:
     )
 
 
+def _optimized_route_contract(expected_route: str) -> dict[str, Any]:
+    if expected_route in {
+        LOW_FIXED_NATIVE_ROUTE,
+        LOW_ADAPTIVE_NATIVE_ROUTE,
+        LOW_Q4_ADAPTIVE_NATIVE_ROUTE,
+    }:
+        profile = "low"
+        fixed_route = LOW_FIXED_NATIVE_ROUTE
+        bf16_kernels = LOW_BF16_OPTIMIZED_KERNEL_IDS
+        bf16_features = LOW_BF16_OPTIMIZED_FEATURE_KEYS
+        bf16_installed = LOW_BF16_OPTIMIZED_INSTALLED_ROUTE_ID
+        q4_kernels = LOW_Q4_OPTIMIZED_KERNEL_IDS
+        q4_installed = LOW_Q4_OPTIMIZED_INSTALLED_ROUTE_ID
+        prefill_only = False
+    elif expected_route in {
+        XHIGH_FIXED_NATIVE_ROUTE,
+        XHIGH_ADAPTIVE_NATIVE_ROUTE,
+        XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE,
+    }:
+        profile = "xhigh"
+        fixed_route = XHIGH_FIXED_NATIVE_ROUTE
+        bf16_kernels = XHIGH_BF16_OPTIMIZED_KERNEL_IDS
+        bf16_features = XHIGH_BF16_OPTIMIZED_FEATURE_KEYS
+        bf16_installed = XHIGH_BF16_OPTIMIZED_INSTALLED_ROUTE_ID
+        q4_kernels = XHIGH_Q4_OPTIMIZED_KERNEL_IDS
+        q4_installed = XHIGH_Q4_OPTIMIZED_INSTALLED_ROUTE_ID
+        prefill_only = True
+    else:
+        raise ValueError(f"route is not a final optimized profile: {expected_route}")
+    uses_q4 = "r17_q4_mtp_block" in gate._validate_route_id(expected_route)
+    return {
+        "profile": profile,
+        "fixed_route": fixed_route,
+        "uses_q4": uses_q4,
+        "kernel_ids": q4_kernels if uses_q4 else bf16_kernels,
+        "feature_keys": (
+            (*bf16_features, "r17_q4_mtp_block")
+            if uses_q4
+            else bf16_features
+        ),
+        "installed_route_id": q4_installed if uses_q4 else bf16_installed,
+        "prefill_only": prefill_only,
+    }
+
+
 def full_fixed_receipt_errors(
     receipt: dict[str, Any], *, expected_route: str
 ) -> list[str]:
     errors: list[str] = []
+    contract = _optimized_route_contract(expected_route)
+    if expected_route != contract["fixed_route"]:
+        errors.append("optimized fixed K3 route is not the profile's fixed route")
     if receipt.get("route_id") != expected_route or expected_route == "control":
         errors.append("optimized fixed K3 route is not the requested optimized route")
     installed_route = receipt.get("installed_route_id")
-    if installed_route != BF16_OPTIMIZED_INSTALLED_ROUTE_ID:
+    if installed_route != contract["installed_route_id"]:
         errors.append("optimized fixed K3 installed route mismatch")
+    if receipt.get("performance_profile") != contract["profile"]:
+        errors.append("optimized fixed K3 performance profile mismatch")
     if int(receipt.get("speculative_depth", -1)) != 3 or int(
         receipt.get("requested_speculative_depth", -1)
     ) != 3:
@@ -276,20 +367,19 @@ def full_fixed_receipt_errors(
         errors.append("optimized fixed K3 executed an adaptive policy")
 
     kernel_ids = tuple(receipt.get("kernel_ids") or ())
-    if kernel_ids != BF16_OPTIMIZED_KERNEL_IDS:
+    if kernel_ids != contract["kernel_ids"]:
         errors.append("optimized fixed K3 BF16 kernel stack mismatch")
     features = receipt.get("feature_receipt") or {}
-    if set(features) != set(BF16_OPTIMIZED_FEATURE_KEYS):
+    if set(features) != set(contract["feature_keys"]):
         errors.append("optimized fixed K3 feature receipt mismatch")
     if any(
         not _feature_is_active(features.get(key))
-        for key in BF16_OPTIMIZED_FEATURE_KEYS
+        for key in contract["feature_keys"]
     ):
         errors.append("optimized fixed K3 feature stack is incomplete")
     row26 = features.get("r26_prefill_ladder_3") or {}
-    if (
-        row26.get("phase_scope") != "prefill"
-        or row26.get("decode_route") != "stock"
+    if contract["prefill_only"] and (
+        row26.get("phase_scope") != "prefill" or row26.get("decode_route") != "stock"
     ):
         errors.append("optimized fixed K3 target phase route mismatch")
     if any(key in features for key in ("r17_q4_mtp_block", "r28_q4_mtp_block", "r36_qkv_islands")):
@@ -297,11 +387,17 @@ def full_fixed_receipt_errors(
 
     device_core = receipt.get("device_core_receipt") or {}
     if not (
-        receipt.get("draft_core") == "stock"
-        and device_core.get("requested") == "stock"
-        and int(device_core.get("device_calls", -1)) == 0
+        receipt.get("draft_core")
+        == gate._route_execution_options(expected_route)["draft_core"]
+        and device_core.get("requested")
+        == gate._route_execution_options(expected_route)["draft_core"]
+        and (
+            int(device_core.get("device_calls", 0)) > 0
+            if receipt.get("draft_core") == "device"
+            else int(device_core.get("device_calls", -1)) == 0
+        )
     ):
-        errors.append("optimized fixed K3 stock draft core did not remain selected")
+        errors.append("optimized fixed K3 draft core did not remain selected")
     if int(device_core.get("device_fallbacks", -1)) != 0:
         errors.append("optimized fixed K3 stock draft fallback occurred")
     if receipt.get("fallback_ar") is True:
@@ -333,40 +429,33 @@ def adaptive_optimized_receipt_errors(
         errors.append("adaptive route is not the requested optimized route")
         return errors
 
-    uses_q4 = "r28_q4_mtp_block" in features
-    expected_installed = (
-        Q4_OPTIMIZED_INSTALLED_ROUTE_ID
-        if uses_q4
-        else BF16_OPTIMIZED_INSTALLED_ROUTE_ID
-    )
-    if receipt.get("installed_route_id") != expected_installed:
+    contract = _optimized_route_contract(expected_route)
+    uses_q4 = bool(contract["uses_q4"])
+    if receipt.get("performance_profile") != contract["profile"]:
+        errors.append("adaptive performance profile mismatch")
+    if receipt.get("installed_route_id") != contract["installed_route_id"]:
         errors.append(
             f"adaptive {'Q4' if uses_q4 else 'BF16'} installed route mismatch"
         )
 
-    expected_kernels = Q4_OPTIMIZED_KERNEL_IDS if uses_q4 else BF16_OPTIMIZED_KERNEL_IDS
-    if tuple(receipt.get("kernel_ids") or ()) != expected_kernels:
+    if tuple(receipt.get("kernel_ids") or ()) != contract["kernel_ids"]:
         errors.append(f"adaptive {'Q4' if uses_q4 else 'BF16'} kernel stack mismatch")
 
     feature_receipt = receipt.get("feature_receipt") or {}
-    expected_feature_keys = set(BF16_OPTIMIZED_FEATURE_KEYS)
-    if uses_q4:
-        expected_feature_keys.add("r28_q4_mtp_block")
-    if set(feature_receipt) != expected_feature_keys:
+    if set(feature_receipt) != set(contract["feature_keys"]):
         errors.append("adaptive feature receipt mismatch")
     if any(
         not _feature_is_active(feature_receipt.get(key))
-        for key in BF16_OPTIMIZED_FEATURE_KEYS
+        for key in contract["feature_keys"]
     ):
         errors.append("adaptive shared feature stack is incomplete")
     row26 = feature_receipt.get("r26_prefill_ladder_3") or {}
-    if (
-        row26.get("phase_scope") != "prefill"
-        or row26.get("decode_route") != "stock"
+    if contract["prefill_only"] and (
+        row26.get("phase_scope") != "prefill" or row26.get("decode_route") != "stock"
     ):
         errors.append("adaptive target phase route mismatch")
     if uses_q4:
-        if not _feature_is_active(feature_receipt.get("r28_q4_mtp_block")):
+        if not _feature_is_active(feature_receipt.get("r17_q4_mtp_block")):
             errors.append("adaptive Q4 MTP block is inactive")
     elif any(
         key in feature_receipt
@@ -466,8 +555,8 @@ def receipt_errors(
         errors.append("prompt artifact hash does not match the frozen workload")
     if receipt.get("context_artifact_sha256") != PYTHON_CONTEXT_SHA256:
         errors.append("Python context artifact hash does not match the frozen workload")
-    if receipt.get("row28_artifact_sha256") != ROW28_ARTIFACT_SHA256:
-        errors.append("row28 artifact hash does not match the frozen custom head")
+    if receipt.get("row17_artifact_sha256") != ROW17_ARTIFACT_SHA256:
+        errors.append("row17 artifact hash does not match the frozen custom head")
     expected_sampler = {
         "target_temperature": _workload_values(receipt.get("workload", ""))[1],
         "draft_temperature": _workload_values(receipt.get("workload", ""))[1],
@@ -493,7 +582,10 @@ def receipt_errors(
             errors.append(f"optimized stack {key} mismatch")
     route_features = gate._validate_route_id(lane.route_id)
     is_adaptive = "r11_position_ema" in route_features
-    is_full_fixed = lane.route_id == FULL_FIXED_NATIVE_ROUTE
+    is_full_fixed = lane.route_id in {
+        LOW_FIXED_NATIVE_ROUTE,
+        XHIGH_FIXED_NATIVE_ROUTE,
+    }
     records_depth = context_tokens == 131_072 and is_adaptive
     required_runtime_env = {
         "MTPLX_COMPILED_VERIFY": "1",
@@ -732,7 +824,7 @@ def aggregate(
         "prompt_artifact_sha256",
         "context_artifact_sha256",
         "model_artifact_hashes",
-        "row28_artifact_sha256",
+        "row17_artifact_sha256",
     ):
         values = {json.dumps(receipt.get(key), sort_keys=True) for receipt in receipts}
         if len(values) != 1:
@@ -878,7 +970,7 @@ def _assert_campaign_inputs(args: argparse.Namespace) -> None:
             "vanity" if args.workload == "vanity" else "python"
         ],
         args.context_file: PYTHON_CONTEXT_SHA256,
-        args.row28_artifact: ROW28_ARTIFACT_SHA256,
+        args.row17_artifact: ROW17_ARTIFACT_SHA256,
     }
     for path, expected_hash in expected_hashes.items():
         observed_hash = _sha256(path)
@@ -945,7 +1037,7 @@ def run(args: argparse.Namespace) -> int:
                     model=args.model,
                     prompt_file=args.prompt_file,
                     context_file=args.context_file,
-                    row28_artifact=args.row28_artifact,
+                    row17_artifact=args.row17_artifact,
                     python=args.python,
                     lock=args.lock,
                 )
@@ -1025,7 +1117,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--context-file", type=Path, required=True)
-    parser.add_argument("--row28-artifact", type=Path, required=True)
+    parser.add_argument("--row17-artifact", type=Path, required=True)
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     args = parser.parse_args()
