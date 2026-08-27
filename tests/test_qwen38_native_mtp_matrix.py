@@ -1153,6 +1153,19 @@ def test_arm_requires_exact_100_token_non_thinking_vanity_prompt() -> None:
     assert tokenizer.template_calls[-1]["enable_thinking"] is False
 
 
+@pytest.mark.parametrize(
+    ("workload", "expected_profile"),
+    (("vanity", "low"), ("low", "low"), ("xhigh", "xhigh")),
+)
+def test_arm_maps_vanity_to_the_installed_low_performance_profile(
+    workload: str,
+    expected_profile: str,
+) -> None:
+    arm = _arm_module()
+
+    assert arm._performance_profile_for_workload(workload) == expected_profile
+
+
 def test_arm_module_imports_no_mlx_or_mtplx_runtime() -> None:
     source = ARM_SCRIPT.read_text(encoding="utf-8")
     prefix = source.split("def _activate_source_root", maxsplit=1)[0]

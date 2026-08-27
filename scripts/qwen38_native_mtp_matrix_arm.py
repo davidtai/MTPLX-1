@@ -598,6 +598,10 @@ def _assert_route_policy_contract(route: str, arm: dict[str, Any]) -> None:
         raise RuntimeError("fixed optimized route executed an adaptive policy")
 
 
+def _performance_profile_for_workload(workload: str) -> str:
+    return "low" if workload == "vanity" else workload
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
@@ -663,6 +667,7 @@ def run(args: argparse.Namespace) -> int:
     if len(prompt_ids) != args.prompt_tokens:
         raise RuntimeError("prompt token count changed after construction")
     prompt_token_sha256 = _token_hash(prompt_ids)
+    performance_profile = _performance_profile_for_workload(args.workload)
 
     conditioner = None
     if args.warmup_tokens > 0:
@@ -681,7 +686,7 @@ def run(args: argparse.Namespace) -> int:
             row17_artifact=row17_artifact,
             record_depth_usage=False,
             force_exact_output=args.force_exact_output,
-            performance_profile=args.workload,
+            performance_profile=performance_profile,
             allow_fixed_diagnostic_route=args.allow_fixed_diagnostic_route,
         )
     arm = _run_one(
@@ -699,7 +704,7 @@ def run(args: argparse.Namespace) -> int:
         row17_artifact=row17_artifact,
         record_depth_usage=args.record_depth_usage,
         force_exact_output=args.force_exact_output,
-        performance_profile=args.workload,
+        performance_profile=performance_profile,
         allow_fixed_diagnostic_route=args.allow_fixed_diagnostic_route,
     )
     _assert_imported_from_source("mtplx.generation", source_root)
