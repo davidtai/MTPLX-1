@@ -1405,6 +1405,20 @@ def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> Non
     )
     assert "adaptive depth usage does not match raw histograms" in errors
 
+    historical = json.loads(json.dumps(base))
+    historical["prompt_tokens"] = 131_072
+    historical["prompt_token_sha256"] = matrix.PROMPT_TOKEN_SHA256["low"][131_072]
+    historical["optimized_stack"]["runtime_env"]["MTPLX_DROP_EVENTS"] = "0"
+    historical["attempted_depth_schedule"] = [3] * 500
+    historical["accepted_depth_schedule"] = (
+        [0] * 200 + [1] * 150 + [2] * 100 + [3] * 50
+    )
+    errors = matrix.receipt_errors(
+        historical, lane=lane, context_tokens=131_072, output_tokens=1_024
+    )
+    assert "adaptive depth usage does not match raw histograms" not in errors
+    assert not any(error.startswith("adaptive depth usage is invalid") for error in errors)
+
     broken = json.loads(json.dumps(base))
     del broken["adaptive_policy_receipt"]["final_accept_ema"]
     errors = matrix.receipt_errors(

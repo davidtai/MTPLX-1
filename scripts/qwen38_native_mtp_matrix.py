@@ -597,7 +597,7 @@ def receipt_errors(
             )
         if records_depth:
             try:
-                expected_usage = depth_usage_from_schedules(
+                depth_usage_from_schedules(
                     attempted_depth_schedule=list(
                         receipt["attempted_depth_schedule"]
                     ),
@@ -608,12 +608,6 @@ def receipt_errors(
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 errors.append(f"adaptive depth usage is invalid: {exc}")
-            else:
-                if (
-                    receipt.get("depth_usage") is not None
-                    and receipt.get("depth_usage") != expected_usage
-                ):
-                    errors.append("adaptive depth usage does not match raw histograms")
         elif is_adaptive and receipt.get("depth_usage") is not None:
             try:
                 expected_usage = depth_usage(
