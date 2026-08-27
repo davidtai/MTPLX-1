@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import importlib.util
 import json
@@ -594,9 +595,26 @@ def receipt_errors(
                     receipt, expected_route=lane.route_id
                 )
             )
-        if records_depth and receipt.get("depth_usage") is None:
-            errors.append("128K adaptive arm is missing depth usage")
-        if is_adaptive and receipt.get("depth_usage") is not None:
+        if records_depth:
+            try:
+                expected_usage = depth_usage_from_schedules(
+                    attempted_depth_schedule=list(
+                        receipt["attempted_depth_schedule"]
+                    ),
+                    accepted_depth_schedule=list(receipt["accepted_depth_schedule"]),
+                    verify_calls=int(receipt["verify_calls"]),
+                    drafted_by_depth=list(receipt["drafted_by_depth"]),
+                    accepted_by_depth=list(receipt["accepted_by_depth"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                errors.append(f"adaptive depth usage is invalid: {exc}")
+            else:
+                if (
+                    receipt.get("depth_usage") is not None
+                    and receipt.get("depth_usage") != expected_usage
+                ):
+                    errors.append("adaptive depth usage does not match raw histograms")
+        elif is_adaptive and receipt.get("depth_usage") is not None:
             try:
                 expected_usage = depth_usage(
                     decode_cycles=len(receipt["attempted_depth_schedule"]),
@@ -733,16 +751,89 @@ def depth_usage(
     }
 
 
+def depth_usage_from_schedules(
+    *,
+    attempted_depth_schedule: list[int],
+    accepted_depth_schedule: list[int],
+    verify_calls: int,
+    drafted_by_depth: list[int],
+    accepted_by_depth: list[int],
+) -> dict[str, Any]:
+    attempted = [int(value) for value in attempted_depth_schedule]
+    accepted = [int(value) for value in accepted_depth_schedule]
+    cycles = len(attempted)
+    if not cycles or len(accepted) != cycles:
+        raise ValueError("attempted and accepted depth schedules must align")
+    if int(verify_calls) != cycles:
+        raise ValueError("verify calls contradict recorded depth schedules")
+    if any(depth not in range(4) for depth in (*attempted, *accepted)):
+        raise ValueError("recorded speculative depth is outside D0-D3")
+    if any(accepted_depth > attempted_depth for attempted_depth, accepted_depth in zip(attempted, accepted)):
+        raise ValueError("accepted depth exceeds attempted depth")
+
+    drafted = ([int(value) for value in drafted_by_depth] + [0, 0, 0])[:3]
+    accepted_tokens = ([int(value) for value in accepted_by_depth] + [0, 0, 0])[:3]
+    if not (drafted[0] >= drafted[1] >= drafted[2] >= 0):
+        raise ValueError("drafted-depth histogram contradicts generated work")
+    if not (
+        accepted_tokens[0] >= accepted_tokens[1] >= accepted_tokens[2] >= 0
+        and all(left <= right for left, right in zip(accepted_tokens, drafted))
+    ):
+        raise ValueError("accepted-depth histogram contradicts drafted work")
+
+    attempted_counts = Counter(attempted)
+    accepted_counts = Counter(accepted)
+
+    def keyed(counts: Counter[int]) -> dict[str, int]:
+        return {f"D{depth}": counts.get(depth, 0) for depth in range(4)}
+
+    def shares(counts: Counter[int]) -> dict[str, float]:
+        return {
+            f"D{depth}": counts.get(depth, 0) / cycles * 100.0
+            for depth in range(4)
+        }
+
+    return {
+        "unit": "speculative_decode_cycles",
+        "decode_cycles": cycles,
+        "attempted_tokens_by_position": {
+            f"D{depth + 1}": drafted[depth] for depth in range(3)
+        },
+        "accepted_tokens_by_position": {
+            f"D{depth + 1}": accepted_tokens[depth] for depth in range(3)
+        },
+        "acceptance_rate_pct_by_position": {
+            f"D{depth + 1}": (
+                accepted_tokens[depth] / drafted[depth] * 100.0
+                if drafted[depth]
+                else 0.0
+            )
+            for depth in range(3)
+        },
+        "attempted_counts": keyed(attempted_counts),
+        "attempted_share_pct": shares(attempted_counts),
+        "accepted_counts": keyed(accepted_counts),
+        "accepted_share_pct": shares(accepted_counts),
+        "mean_attempted_depth": statistics.fmean(attempted),
+        "mean_accepted_depth": statistics.fmean(accepted),
+    }
+
+
 def _aggregate_depth_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     drafted = [0, 0, 0]
     accepted = [0, 0, 0]
+    attempted_schedule: list[int] = []
+    accepted_schedule: list[int] = []
     for row in rows:
+        attempted_schedule.extend(row.get("attempted_depth_schedule") or ())
+        accepted_schedule.extend(row.get("accepted_depth_schedule") or ())
         for index, value in enumerate((row.get("drafted_by_depth") or ())[:3]):
             drafted[index] += int(value)
         for index, value in enumerate((row.get("accepted_by_depth") or ())[:3]):
             accepted[index] += int(value)
-    return depth_usage(
-        decode_cycles=sum(len(row.get("attempted_depth_schedule") or ()) for row in rows),
+    return depth_usage_from_schedules(
+        attempted_depth_schedule=attempted_schedule,
+        accepted_depth_schedule=accepted_schedule,
         verify_calls=sum(int(row["verify_calls"]) for row in rows),
         drafted_by_depth=drafted,
         accepted_by_depth=accepted,
@@ -816,11 +907,16 @@ def aggregate(
             errors.append(f"{lane_id} has {len(rows)} arms, expected {expected_arms}")
             continue
         wall = _mean(rows, "wall_s")
-        usage = (
-            _aggregate_depth_usage(rows)
-            if rows and all(row.get("depth_usage") is not None for row in rows)
-            else None
+        records_depth = (
+            context_tokens == 131_072
+            and "r11_position_ema" in gate._validate_route_id(specs[lane_id].route_id)
         )
+        usage = None
+        if rows and records_depth:
+            try:
+                usage = _aggregate_depth_usage(rows)
+            except (KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{lane_id} depth usage is invalid: {exc}")
         summary[lane_id] = {
             "arms": len(rows),
             "source_commit": specs[lane_id].source_commit,

@@ -72,7 +72,7 @@ def test_diagnostic_arm_command_uses_exact_16k_xhigh_contract(tmp_path: Path) ->
         model=tmp_path / "model",
         prompt_file=tmp_path / "prompt.jsonl",
         context_file=tmp_path / "context.py",
-        row28_artifact=tmp_path / "row28.safetensors",
+        row17_artifact=tmp_path / "row17.safetensors",
         python=tmp_path / "python",
         lock=tmp_path / "gpu.lock",
     )
@@ -80,7 +80,9 @@ def test_diagnostic_arm_command_uses_exact_16k_xhigh_contract(tmp_path: Path) ->
 
     assert "--workload xhigh" in joined
     assert "--prompt-tokens 16384" in joined
-    assert "--max-tokens 16384" in joined
+    assert "--max-tokens 1024" in joined
+    assert "--row17-artifact" in command
+    assert str((tmp_path / "row17.safetensors").resolve()) in command
     assert "--warmup-tokens 1024" in joined
     assert "--force-exact-output" in command
     assert "--allow-fixed-diagnostic-route" in command
@@ -96,7 +98,7 @@ def test_gate_requires_explicit_frozen_context_artifact(tmp_path: Path) -> None:
                 "--baseline-root", str(tmp_path / "baseline"),
                 "--routes", "control",
                 "--model", str(tmp_path / "model"),
-                "--row28-artifact", str(tmp_path / "row28.safetensors"),
+                "--row17-artifact", str(tmp_path / "row17.safetensors"),
                 "--output-root", str(tmp_path / "output"),
             ]
         )
@@ -133,7 +135,7 @@ def test_aggregate_rejects_per_lane_token_nondeterminism(
                 "prompt_artifact_sha256": "artifact",
                 "context_artifact_sha256": "context",
                 "model_artifact_hashes": {"config.json": "a" * 64},
-                "row28_artifact_sha256": "row28",
+                "row17_artifact_sha256": "row17",
             }
         )
     monkeypatch.setattr(gate.matrix, "receipt_errors", lambda *args, **kwargs: [])

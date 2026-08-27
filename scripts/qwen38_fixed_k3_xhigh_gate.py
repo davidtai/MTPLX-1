@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import statistics
-import subprocess
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -98,7 +97,7 @@ def arm_command(
     model: Path,
     prompt_file: Path,
     context_file: Path,
-    row28_artifact: Path,
+    row17_artifact: Path,
     python: Path,
     lock: Path,
 ) -> list[str]:
@@ -110,7 +109,7 @@ def arm_command(
         model=model,
         prompt_file=prompt_file,
         context_file=context_file,
-        row28_artifact=row28_artifact,
+        row17_artifact=row17_artifact,
         python=python,
         lock=lock,
     )
@@ -153,7 +152,7 @@ def aggregate(
         "prompt_artifact_sha256",
         "context_artifact_sha256",
         "model_artifact_hashes",
-        "row28_artifact_sha256",
+        "row17_artifact_sha256",
     ):
         values = {json.dumps(row.get(key), sort_keys=True) for row in receipts}
         if len(values) != 1:
@@ -207,7 +206,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, default=matrix.PYTHON_PROMPT_FILE)
     parser.add_argument("--context-file", type=Path, required=True)
-    parser.add_argument("--row28-artifact", type=Path, required=True)
+    parser.add_argument("--row17-artifact", type=Path, required=True)
     parser.add_argument("--lock", type=Path, default=Path("/tmp/mtplx-gpu-exclusive.lock"))
     parser.add_argument("--output-root", type=Path, required=True)
     return parser
@@ -263,7 +262,7 @@ def run(args: argparse.Namespace) -> int:
                 model=args.model,
                 prompt_file=args.prompt_file,
                 context_file=args.context_file,
-                row28_artifact=args.row28_artifact,
+                row17_artifact=args.row17_artifact,
                 python=args.python,
                 lock=args.lock,
             )

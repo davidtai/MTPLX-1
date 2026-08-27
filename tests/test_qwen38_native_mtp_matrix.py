@@ -550,6 +550,53 @@ def test_aggregate_uses_the_renamed_full_fixed_lane_as_wall_baseline(
     assert result["summary"]["full-adaptive"]["wall_faster_vs_fixed_k3_pct"] == 25.0
 
 
+def test_128k_aggregate_derives_depth_usage_from_recorded_schedules(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    matrix = _module()
+    specs = matrix.lane_specs(
+        baseline_root=tmp_path / "baseline",
+        baseline_commit=matrix.V292_COMMIT,
+        candidate_root=tmp_path / "candidate",
+        candidate_commit="c" * 40,
+        workload="xhigh",
+    )
+    receipt = {
+        "lane_id": "full-adaptive",
+        "wall_s": 10.0,
+        "prefill_tok_s": 500.0,
+        "decode_tok_s": 25.0,
+        "peak_memory_gib": 40.0,
+        "token_hash": "single-pass",
+        "verify_calls": 4,
+        "attempted_depth_schedule": [1, 2, 2, 3],
+        "accepted_depth_schedule": [0, 1, 2, 3],
+        "drafted_by_depth": [4, 3, 1],
+        "accepted_by_depth": [3, 2, 1],
+    }
+    monkeypatch.setattr(matrix, "receipt_errors", lambda *args, **kwargs: [])
+
+    result = matrix.aggregate(
+        workload="xhigh",
+        context_tokens=131_072,
+        order=("full-adaptive",),
+        receipts=[receipt],
+        specs=specs,
+    )
+
+    assert result["invariant_errors"] == []
+    assert result["summary"]["full-adaptive"]["depth_usage"] == (
+        matrix.depth_usage_from_schedules(
+            attempted_depth_schedule=[1, 2, 2, 3],
+            accepted_depth_schedule=[0, 1, 2, 3],
+            verify_calls=4,
+            drafted_by_depth=[4, 3, 1],
+            accepted_by_depth=[3, 2, 1],
+        )
+    )
+
+
 def test_single_bf16_lane_aggregate_does_not_require_an_unmeasured_fixed_lane(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1215,6 +1262,36 @@ def test_depth_usage_derives_attempted_and_accepted_d0_through_d3() -> None:
     assert sum(usage["accepted_share_pct"].values()) == 100.0
     assert usage["mean_attempted_depth"] == 1.5
     assert usage["mean_accepted_depth"] == 1.0
+
+
+def test_depth_usage_from_schedules_uses_recorded_cycle_depths() -> None:
+    matrix = _module()
+
+    usage = matrix.depth_usage_from_schedules(
+        attempted_depth_schedule=[1, 2, 2, 3],
+        accepted_depth_schedule=[0, 1, 2, 3],
+        verify_calls=4,
+        drafted_by_depth=[4, 3, 1],
+        accepted_by_depth=[3, 2, 1],
+    )
+
+    assert usage["decode_cycles"] == 4
+    assert usage["attempted_counts"] == {"D0": 0, "D1": 1, "D2": 2, "D3": 1}
+    assert usage["accepted_counts"] == {"D0": 1, "D1": 1, "D2": 1, "D3": 1}
+    assert usage["attempted_share_pct"] == {
+        "D0": 0.0,
+        "D1": 25.0,
+        "D2": 50.0,
+        "D3": 25.0,
+    }
+    assert usage["accepted_share_pct"] == {
+        "D0": 25.0,
+        "D1": 25.0,
+        "D2": 25.0,
+        "D3": 25.0,
+    }
+    assert usage["mean_attempted_depth"] == 2.0
+    assert usage["mean_accepted_depth"] == 1.5
 
 
 def test_adaptive_receipt_rejects_missing_or_mismatched_depth_telemetry() -> None:
