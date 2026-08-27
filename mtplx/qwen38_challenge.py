@@ -39,6 +39,62 @@ QWEN38_FINAL_ROUTE: Mapping[str, Any] = MappingProxyType(
         "dual_norm": False,
     }
 )
+QWEN38_LOW_FIXED_ROUTE = (
+    "r20_kv_only_history+r53_command_buffers+r08_device_draft+"
+    "r10_compact_vocab+r21_qk_rms_rope+r24_eval_ladder+"
+    "r26_prefill_ladder_3"
+)
+QWEN38_LOW_ADAPTIVE_ROUTE = (
+    QWEN38_LOW_FIXED_ROUTE + "+r11_position_ema+r17_q4_mtp_block"
+)
+QWEN38_XHIGH_FIXED_ROUTE = (
+    "r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+"
+    "r50_wired_residency+r53_command_buffers"
+)
+QWEN38_XHIGH_ADAPTIVE_ROUTE = QWEN38_XHIGH_FIXED_ROUTE + "+r11_position_ema"
+QWEN38_LOW_BF16_INSTALLED_ROUTE = (
+    "kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
+    "r26_prefill_ladder_3+r10_compact_vocab"
+)
+QWEN38_LOW_Q4_INSTALLED_ROUTE = (
+    "r17_q4_mtp_block+" + QWEN38_LOW_BF16_INSTALLED_ROUTE
+)
+QWEN38_XHIGH_BF16_INSTALLED_ROUTE = (
+    "kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+"
+    "r50_wired_residency"
+)
+QWEN38_LOW_BF16_KERNEL_IDS = (
+    "qwen38_mtp_kv_only_history_ge16384_v1",
+    "qwen38_qk_rms_rope_bf16_h256_r64_v1",
+    "qwen38_row24_qk_rms_rope_l_le16_v1",
+    "qwen38_row24_target_eval_ladder_v1",
+    "qwen38_row26_prefill_eval_every3_v1",
+    "qwen38_row26_qk_rms_rope_l_le32_v1",
+    "qwen38_row10_compact_q4_g64_vocab_v1",
+)
+QWEN38_XHIGH_BF16_KERNEL_IDS = (
+    "qwen38_mtp_kv_only_history_ge16384_v1",
+    "qwen38_row24_target_eval_ladder_v1",
+    "qwen38_row26_prefill_eval_every3_v1",
+    "qwen38_row50_post_warm_wired_residency_v1",
+)
+QWEN38_LOW_BF16_FEATURE_KEYS = (
+    "r10_compact_vocab",
+    "r20_kv_only_history",
+    "r21_qk_rms_rope",
+    "r24_eval_ladder",
+    "r24_qk_length_limit",
+    "r26_prefill_ladder_3",
+    "r26_qk_length_limit",
+    "r53_command_buffers",
+)
+QWEN38_XHIGH_BF16_FEATURE_KEYS = (
+    "r20_kv_only_history",
+    "r24_eval_ladder",
+    "r26_prefill_ladder_3",
+    "r50_wired_residency",
+    "r53_command_buffers",
+)
 
 
 def qwen38_final_route() -> dict[str, Any]:
@@ -117,6 +173,10 @@ class Qwen38PerformanceProfileConfig:
     requested_route_id: str
     install_options: Mapping[str, Any]
     draft_core: str = "stock"
+    row53_command_buffers: bool = False
+    installed_route_id: str | None = None
+    kernel_ids: tuple[str, ...] = ()
+    feature_keys: tuple[str, ...] = ()
 
 
 _MISSING_PROFILE_ATTRIBUTE = object()
@@ -135,6 +195,8 @@ class Qwen38ExecutionBindings:
     draft_token_id_map: Any
     draft_target_vocab_size: Any
     row21_bindings: tuple[tuple[Any, type, Any], ...]
+    wired_limit_setter: Callable[[int], Any] | None = None
+    wired_limit_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +208,94 @@ class Qwen38PerformanceProfile:
     feature_receipt: Mapping[str, Any]
     draft_core: str
     mtp_block_identity: str
+
+
+def qwen38_measured_performance_profile_configs(
+    *,
+    adaptive_policy: str,
+    q4_mtp_block: Path | None,
+) -> dict[str, Qwen38PerformanceProfileConfig]:
+    """Return the independently measured low/xhigh construction profiles."""
+
+    policy = str(adaptive_policy or "none").strip().lower()
+    if policy not in {"none", "position_ema"}:
+        raise Qwen38ContractError(
+            "measured Qwen 3.8 profiles support only adaptive-policy none or "
+            "position_ema"
+        )
+    low_options: dict[str, Any] = {
+        "cache_route": "kv_only_history",
+        "row10_compact_vocab": True,
+        "row21_qk_rms_rope": True,
+        "row24_eval_ladder": True,
+        "row26_prefill_ladder_3": True,
+    }
+    low_route = QWEN38_LOW_FIXED_ROUTE
+    xhigh_route = QWEN38_XHIGH_FIXED_ROUTE
+    if policy == "position_ema":
+        if q4_mtp_block is None:
+            raise Qwen38ContractError(
+                "position_ema low profile requires a Q4 MTP block artifact"
+            )
+        try:
+            artifact = Path(q4_mtp_block).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise Qwen38ContractError(
+                "position_ema low profile Q4 MTP block artifact is unavailable: "
+                f"{q4_mtp_block}"
+            ) from exc
+        low_options.update(
+            {
+                "mtp_block_variant": "r17",
+                "mtp_block_artifact_path": artifact,
+            }
+        )
+        low_route = QWEN38_LOW_ADAPTIVE_ROUTE
+        xhigh_route = QWEN38_XHIGH_ADAPTIVE_ROUTE
+    return {
+        "stock": Qwen38PerformanceProfileConfig(
+            requested_route_id="control",
+            install_options={"cache_route": "control"},
+            draft_core="stock",
+            installed_route_id="control",
+        ),
+        "low": Qwen38PerformanceProfileConfig(
+            requested_route_id=low_route,
+            install_options=low_options,
+            draft_core="device",
+            row53_command_buffers=True,
+            installed_route_id=(
+                QWEN38_LOW_Q4_INSTALLED_ROUTE
+                if policy == "position_ema"
+                else QWEN38_LOW_BF16_INSTALLED_ROUTE
+            ),
+            kernel_ids=(
+                ("qwen38_row17_q4_g64_mtp_block_v1",)
+                + QWEN38_LOW_BF16_KERNEL_IDS
+                if policy == "position_ema"
+                else QWEN38_LOW_BF16_KERNEL_IDS
+            ),
+            feature_keys=(
+                ("r17_q4_mtp_block",) + QWEN38_LOW_BF16_FEATURE_KEYS
+                if policy == "position_ema"
+                else QWEN38_LOW_BF16_FEATURE_KEYS
+            ),
+        ),
+        "xhigh": Qwen38PerformanceProfileConfig(
+            requested_route_id=xhigh_route,
+            install_options={
+                "cache_route": "kv_only_history",
+                "row24_eval_ladder": True,
+                "row26_prefill_ladder_3": True,
+                "row50_wired_residency": True,
+            },
+            draft_core="stock",
+            row53_command_buffers=True,
+            installed_route_id=QWEN38_XHIGH_BF16_INSTALLED_ROUTE,
+            kernel_ids=QWEN38_XHIGH_BF16_KERNEL_IDS,
+            feature_keys=QWEN38_XHIGH_BF16_FEATURE_KEYS,
+        ),
+    }
 
 
 def _qwen38_identity(config: Mapping[str, Any], model_path: Path) -> bool:
@@ -439,6 +589,7 @@ def configure_qwen38_row50_wired_residency(
         return {"installed": False, "active": False}
 
     if isinstance(state, dict) and state.get("installed"):
+        runtime._qwen38_row50_set_wired_limit = mx.set_wired_limit
         mx.set_wired_limit(int(state["target_limit_bytes"]))
         return {**state, "active": True}
 
@@ -474,6 +625,7 @@ def configure_qwen38_row50_wired_residency(
         "slack_bytes": 64 * 2**20,
     }
     runtime._qwen38_row50_wired_state = state
+    runtime._qwen38_row50_set_wired_limit = mx.set_wired_limit
     return dict(state)
 
 
@@ -820,6 +972,11 @@ def _apply_qwen38_execution_bindings(
         _apply_profile_attribute(
             attention, "_mtplx_prepare_explicit_qk", explicit_qk
         )
+    if (
+        bindings.wired_limit_setter is not None
+        and bindings.wired_limit_bytes is not None
+    ):
+        bindings.wired_limit_setter(bindings.wired_limit_bytes)
 
 
 def _mtp_block_identity(options: Mapping[str, Any]) -> str:
@@ -835,8 +992,35 @@ def install_qwen38_performance_profiles(
     stock: Qwen38PerformanceProfileConfig,
     low: Qwen38PerformanceProfileConfig,
     xhigh: Qwen38PerformanceProfileConfig,
+    environment: Mapping[str, str] | None = None,
 ) -> Mapping[str, Qwen38PerformanceProfile]:
     """Validate and bind stock/low/xhigh routes before accepting requests."""
+
+    row53_receipt: dict[str, Any] | None = None
+    if any(profile.row53_command_buffers for profile in (stock, low, xhigh)):
+        if environment is None:
+            import os
+
+            environment = os.environ
+        try:
+            max_mb = int(environment.get("MLX_MAX_MB_PER_BUFFER", "0") or "0")
+            max_ops = int(environment.get("MLX_MAX_OPS_PER_BUFFER", "0") or "0")
+        except (TypeError, ValueError) as exc:
+            raise Qwen38ContractError(
+                "Qwen 3.8 command-buffer contract has non-integer settings"
+            ) from exc
+        if (max_mb, max_ops) != (512, 50):
+            raise Qwen38ContractError(
+                "Qwen 3.8 command-buffer contract requires "
+                "MLX_MAX_MB_PER_BUFFER=512 and MLX_MAX_OPS_PER_BUFFER=50"
+            )
+        row53_receipt = {
+            "installed": True,
+            "active": True,
+            "max_mb_per_buffer": max_mb,
+            "max_ops_per_buffer": max_ops,
+            "process_latched": True,
+        }
 
     installed: dict[str, Qwen38PerformanceProfile] = {}
     for profile_id, profile_config in (
@@ -867,17 +1051,69 @@ def install_qwen38_performance_profiles(
             draft_core=profile_config.draft_core,
             mtp_block_identity=identity,
         )
+        feature_receipt = dict(
+            getattr(runtime, "qwen38_feature_receipt", {}) or {}
+        )
+        if profile_config.row53_command_buffers:
+            if row53_receipt is None:  # pragma: no cover - guarded above
+                raise Qwen38ContractError(
+                    "Qwen 3.8 command-buffer contract was not validated"
+                )
+            feature_receipt["r53_command_buffers"] = dict(row53_receipt)
+        if profile_config.installed_route_id is not None:
+            if route.route_id != profile_config.installed_route_id:
+                raise Qwen38ContractError(
+                    f"{profile_id} performance profile installed route mismatch: "
+                    f"{route.route_id!r} != {profile_config.installed_route_id!r}"
+                )
+            if tuple(route.kernel_ids) != tuple(profile_config.kernel_ids):
+                raise Qwen38ContractError(
+                    f"{profile_id} performance profile kernel contract mismatch: "
+                    f"{tuple(route.kernel_ids)!r} != {profile_config.kernel_ids!r}"
+                )
+            actual_feature_keys = tuple(sorted(feature_receipt))
+            expected_feature_keys = tuple(sorted(profile_config.feature_keys))
+            if actual_feature_keys != expected_feature_keys:
+                raise Qwen38ContractError(
+                    f"{profile_id} performance profile feature contract mismatch: "
+                    f"{actual_feature_keys!r} != {expected_feature_keys!r}"
+                )
         installed[profile_id] = Qwen38PerformanceProfile(
             profile_id=profile_id,
             requested_route_id=profile_config.requested_route_id,
             route=selected_route,
             bindings=_capture_qwen38_execution_bindings(runtime),
-            feature_receipt=MappingProxyType(
-                dict(getattr(runtime, "qwen38_feature_receipt", {}) or {})
-            ),
+            feature_receipt=MappingProxyType(feature_receipt),
             draft_core=profile_config.draft_core,
             mtp_block_identity=identity,
         )
+    row50_state = getattr(runtime, "_qwen38_row50_wired_state", None)
+    row50_setter = getattr(runtime, "_qwen38_row50_set_wired_limit", None)
+    if isinstance(row50_state, Mapping) and row50_state.get("installed"):
+        if not callable(row50_setter):
+            raise Qwen38ContractError(
+                "Qwen 3.8 row 50 route has no prebound wired-limit setter"
+            )
+        for profile_id, profile_config in (
+            ("stock", stock),
+            ("low", low),
+            ("xhigh", xhigh),
+        ):
+            limit_key = (
+                "target_limit_bytes"
+                if profile_config.install_options.get("row50_wired_residency")
+                else "baseline_limit_bytes"
+            )
+            wired_limit_bytes = int(row50_state[limit_key])
+            profile = installed[profile_id]
+            installed[profile_id] = replace(
+                profile,
+                bindings=replace(
+                    profile.bindings,
+                    wired_limit_setter=row50_setter,
+                    wired_limit_bytes=wired_limit_bytes,
+                ),
+            )
     runtime.qwen38_performance_profiles = MappingProxyType(installed)
     select_qwen38_performance_profile(runtime, None)
     return runtime.qwen38_performance_profiles

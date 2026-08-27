@@ -5904,6 +5904,8 @@ def test_serve_forwards_position_ema_without_changing_none_default(monkeypatch):
             "8",
             "--adaptive-min-depth",
             "0",
+            "--qwen38-q4-mtp-block",
+            "artifacts/qwen38-r17.safetensors",
         ]
     )
 
@@ -5923,6 +5925,12 @@ def test_serve_forwards_position_ema_without_changing_none_default(monkeypatch):
         commands[2][commands[2].index("--adaptive-position-depth-cap") + 1] == "8"
     )
     assert commands[2][commands[2].index("--adaptive-min-depth") + 1] == "0"
+    assert commands[2][commands[2].index("--qwen38-q4-mtp-block") + 1] == (
+        "artifacts/qwen38-r17.safetensors"
+    )
+    assert "--qwen38-q4-mtp-block artifacts/qwen38-r17.safetensors" in (
+        public._adaptive_command_suffix(position_args)
+    )
 
 
 def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):

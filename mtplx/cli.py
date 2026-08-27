@@ -785,6 +785,15 @@ def _add_adaptive_args(parser: argparse.ArgumentParser) -> None:
         default="none",
         help="Experimental per-request native-MTP depth policy.",
     )
+    parser.add_argument(
+        "--qwen38-q4-mtp-block",
+        type=Path,
+        default=None,
+        help=(
+            "Validated r17 Q4 native-MTP block for the measured Qwen3.8 "
+            "position_ema low profile."
+        ),
+    )
     parser.add_argument("--adaptive-min-depth", type=_nonnegative_int, default=1)
     parser.add_argument("--adaptive-start-depth", type=_positive_int, default=1)
     parser.add_argument("--adaptive-increase-after", type=_positive_int, default=4)

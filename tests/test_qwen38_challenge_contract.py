@@ -12,7 +12,11 @@ from mtplx.mtp_patch import MTPContract
 from mtplx.qwen38_challenge import (
     DEFAULT_QWEN38_CACHE_ROUTE,
     QWEN38_FINAL_ROUTE,
+    QWEN38_LOW_ADAPTIVE_ROUTE,
+    QWEN38_LOW_FIXED_ROUTE,
     QWEN38_Q8_LINEAR_ATTN_LAYERS,
+    QWEN38_XHIGH_ADAPTIVE_ROUTE,
+    QWEN38_XHIGH_FIXED_ROUTE,
     Qwen38ContractError,
     Qwen38PerformanceProfileConfig,
     Qwen38RouteBindings,
@@ -24,6 +28,7 @@ from mtplx.qwen38_challenge import (
     is_qwen38_27b_candidate,
     policy_fingerprint_with_qwen38_route,
     qwen38_final_route,
+    qwen38_measured_performance_profile_configs,
     qwen38_route_receipt,
     select_qwen38_performance_profile,
     validate_qwen38_27b_contract,
@@ -471,7 +476,10 @@ def test_control_route_and_receipt_are_stable() -> None:
         "policy_id": "current_mtplx",
         "selfcheck": {"passed": True, "status": "control"},
     }
-    assert _qwen38_challenge_route_payload(runtime) == qwen38_route_receipt(route)
+    assert _qwen38_challenge_route_payload(runtime) == {
+        **qwen38_route_receipt(route),
+        "feature_receipt": {},
+    }
 
 
 def test_row10_candidate_route_names_compact_proposal_only_head(monkeypatch) -> None:
@@ -897,6 +905,213 @@ def test_performance_profiles_are_prebound_and_selected_at_request_boundary(
     assert receipt["installed_route_id"] == "stock-installed"
     assert receipt["draft_core"] == "stock"
     assert receipt["mtp_block_identity"] == "bf16"
+
+
+def test_measured_fixed_profiles_use_the_qualified_bf16_stacks() -> None:
+    profiles = qwen38_measured_performance_profile_configs(
+        adaptive_policy="none",
+        q4_mtp_block=None,
+    )
+
+    assert profiles["stock"] == Qwen38PerformanceProfileConfig(
+        requested_route_id="control",
+        install_options={"cache_route": "control"},
+        draft_core="stock",
+        installed_route_id="control",
+    )
+    low = profiles["low"]
+    assert low.requested_route_id == QWEN38_LOW_FIXED_ROUTE
+    assert low.draft_core == "device"
+    assert low.row53_command_buffers is True
+    assert low.installed_route_id == qwen38_challenge.QWEN38_LOW_BF16_INSTALLED_ROUTE
+    assert low.kernel_ids == qwen38_challenge.QWEN38_LOW_BF16_KERNEL_IDS
+    assert low.feature_keys == qwen38_challenge.QWEN38_LOW_BF16_FEATURE_KEYS
+    assert low.install_options == {
+        "cache_route": "kv_only_history",
+        "row10_compact_vocab": True,
+        "row21_qk_rms_rope": True,
+        "row24_eval_ladder": True,
+        "row26_prefill_ladder_3": True,
+    }
+    xhigh = profiles["xhigh"]
+    assert xhigh.requested_route_id == QWEN38_XHIGH_FIXED_ROUTE
+    assert xhigh.draft_core == "stock"
+    assert xhigh.row53_command_buffers is True
+    assert xhigh.installed_route_id == (
+        qwen38_challenge.QWEN38_XHIGH_BF16_INSTALLED_ROUTE
+    )
+    assert xhigh.kernel_ids == qwen38_challenge.QWEN38_XHIGH_BF16_KERNEL_IDS
+    assert xhigh.feature_keys == qwen38_challenge.QWEN38_XHIGH_BF16_FEATURE_KEYS
+    assert xhigh.install_options == {
+        "cache_route": "kv_only_history",
+        "row24_eval_ladder": True,
+        "row26_prefill_ladder_3": True,
+        "row50_wired_residency": True,
+    }
+
+
+def test_measured_adaptive_profiles_select_q4_only_for_low(tmp_path: Path) -> None:
+    artifact = tmp_path / "qwen38-r17-q4.safetensors"
+    artifact.write_bytes(b"row17")
+
+    profiles = qwen38_measured_performance_profile_configs(
+        adaptive_policy="position_ema",
+        q4_mtp_block=artifact,
+    )
+
+    low = profiles["low"]
+    assert low.requested_route_id == QWEN38_LOW_ADAPTIVE_ROUTE
+    assert low.draft_core == "device"
+    assert low.install_options["mtp_block_variant"] == "r17"
+    assert low.install_options["mtp_block_artifact_path"] == artifact.resolve()
+    assert low.installed_route_id == qwen38_challenge.QWEN38_LOW_Q4_INSTALLED_ROUTE
+    assert low.kernel_ids == (
+        "qwen38_row17_q4_g64_mtp_block_v1",
+        *qwen38_challenge.QWEN38_LOW_BF16_KERNEL_IDS,
+    )
+    xhigh = profiles["xhigh"]
+    assert xhigh.requested_route_id == QWEN38_XHIGH_ADAPTIVE_ROUTE
+    assert xhigh.draft_core == "stock"
+    assert "mtp_block_variant" not in xhigh.install_options
+    assert "mtp_block_artifact_path" not in xhigh.install_options
+
+
+def test_measured_adaptive_profiles_require_the_q4_artifact(tmp_path: Path) -> None:
+    with pytest.raises(Qwen38ContractError, match="Q4 MTP block artifact"):
+        qwen38_measured_performance_profile_configs(
+            adaptive_policy="position_ema",
+            q4_mtp_block=tmp_path / "missing.safetensors",
+        )
+
+
+def test_measured_profiles_reject_an_installed_route_that_drops_the_stack(
+    monkeypatch,
+) -> None:
+    runtime, *_ = _route_runtime()
+    profiles = qwen38_measured_performance_profile_configs(
+        adaptive_policy="none",
+        q4_mtp_block=None,
+    )
+    monkeypatch.setattr(
+        qwen38_challenge,
+        "install_qwen38_route",
+        lambda loaded_runtime, config, model_path, **options: build_qwen38_route(
+            config,
+            model_path,
+            bindings=_bindings(),
+            route_id="control",
+        ),
+    )
+
+    with pytest.raises(Qwen38ContractError, match="installed route mismatch"):
+        install_qwen38_performance_profiles(
+            runtime,
+            _config(),
+            MODEL_PATH,
+            stock=profiles["stock"],
+            low=profiles["low"],
+            xhigh=profiles["xhigh"],
+            environment={
+                "MLX_MAX_MB_PER_BUFFER": "512",
+                "MLX_MAX_OPS_PER_BUFFER": "50",
+            },
+        )
+
+
+def test_profile_install_validates_row53_once_at_construction(monkeypatch) -> None:
+    runtime, *_ = _route_runtime()
+    profile = Qwen38PerformanceProfileConfig(
+        requested_route_id=QWEN38_XHIGH_FIXED_ROUTE,
+        install_options={"cache_route": "control"},
+        row53_command_buffers=True,
+    )
+    monkeypatch.setattr(
+        qwen38_challenge,
+        "install_qwen38_route",
+        lambda loaded_runtime, config, model_path, **options: build_qwen38_route(
+            config,
+            model_path,
+            bindings=_bindings(),
+            route_id="control",
+        ),
+    )
+
+    with pytest.raises(Qwen38ContractError, match="command-buffer contract"):
+        install_qwen38_performance_profiles(
+            runtime,
+            _config(),
+            MODEL_PATH,
+            stock=Qwen38PerformanceProfileConfig("control", {}),
+            low=profile,
+            xhigh=profile,
+            environment={
+                "MLX_MAX_MB_PER_BUFFER": "128",
+                "MLX_MAX_OPS_PER_BUFFER": "50",
+            },
+        )
+
+    installed = install_qwen38_performance_profiles(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        stock=Qwen38PerformanceProfileConfig("control", {}),
+        low=profile,
+        xhigh=profile,
+        environment={
+            "MLX_MAX_MB_PER_BUFFER": "512",
+            "MLX_MAX_OPS_PER_BUFFER": "50",
+        },
+    )
+    assert installed["low"].feature_receipt["r53_command_buffers"] == {
+        "installed": True,
+        "active": True,
+        "max_mb_per_buffer": 512,
+        "max_ops_per_buffer": 50,
+        "process_latched": True,
+    }
+
+
+def test_profile_selection_does_not_leak_xhigh_wired_residency_into_low(
+    monkeypatch,
+) -> None:
+    runtime, *_ = _route_runtime()
+    wired_calls: list[int] = []
+
+    def install_route(loaded_runtime, config, model_path, **options):
+        if options.get("row50_wired_residency"):
+            loaded_runtime._qwen38_row50_wired_state = {
+                "installed": True,
+                "baseline_limit_bytes": 17,
+                "target_limit_bytes": 29,
+            }
+            loaded_runtime._qwen38_row50_set_wired_limit = wired_calls.append
+        loaded_runtime.qwen38_feature_receipt = {}
+        return build_qwen38_route(
+            config,
+            model_path,
+            bindings=_bindings(),
+            route_id=("xhigh-installed" if options.get("row50_wired_residency") else "installed"),
+        )
+
+    monkeypatch.setattr(qwen38_challenge, "install_qwen38_route", install_route)
+    install_qwen38_performance_profiles(
+        runtime,
+        _config(),
+        MODEL_PATH,
+        stock=Qwen38PerformanceProfileConfig("control", {}),
+        low=Qwen38PerformanceProfileConfig("low", {}),
+        xhigh=Qwen38PerformanceProfileConfig(
+            "xhigh",
+            {"row50_wired_residency": True},
+        ),
+    )
+
+    # Construction leaves the explicit stock profile selected.
+    assert wired_calls == [17]
+    select_qwen38_performance_profile(runtime, "xhigh")
+    assert wired_calls[-1] == 29
+    select_qwen38_performance_profile(runtime, "low")
+    assert wired_calls[-1] == 17
 
 
 def test_performance_profile_install_rejects_missing_bound_route(monkeypatch) -> None:

@@ -16,6 +16,16 @@ import sys
 import time
 from typing import Any, NamedTuple
 
+from mtplx.qwen38_challenge import (
+    QWEN38_LOW_BF16_FEATURE_KEYS,
+    QWEN38_LOW_BF16_INSTALLED_ROUTE,
+    QWEN38_LOW_BF16_KERNEL_IDS,
+    QWEN38_LOW_Q4_INSTALLED_ROUTE,
+    QWEN38_XHIGH_BF16_FEATURE_KEYS,
+    QWEN38_XHIGH_BF16_INSTALLED_ROUTE,
+    QWEN38_XHIGH_BF16_KERNEL_IDS,
+)
+
 try:
     from scripts import qwen38_challenge_port_gate as gate
 except ModuleNotFoundError:  # Direct execution places scripts/ on sys.path.
@@ -49,53 +59,17 @@ PAIRED_ORDER = (
     "full-fixed-k3",
     "v2.9.2-mlx0322",
 )
-LOW_BF16_OPTIMIZED_KERNEL_IDS = (
-    "qwen38_mtp_kv_only_history_ge16384_v1",
-    "qwen38_qk_rms_rope_bf16_h256_r64_v1",
-    "qwen38_row24_qk_rms_rope_l_le16_v1",
-    "qwen38_row24_target_eval_ladder_v1",
-    "qwen38_row26_prefill_eval_every3_v1",
-    "qwen38_row26_qk_rms_rope_l_le32_v1",
-    "qwen38_row10_compact_q4_g64_vocab_v1",
-)
-LOW_BF16_OPTIMIZED_FEATURE_KEYS = (
-    "r10_compact_vocab",
-    "r20_kv_only_history",
-    "r21_qk_rms_rope",
-    "r24_eval_ladder",
-    "r24_qk_length_limit",
-    "r26_prefill_ladder_3",
-    "r26_qk_length_limit",
-    "r53_command_buffers",
-)
-LOW_BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
-    "kv_only_history+r21_qk_rms_rope+r24_eval_ladder+"
-    "r26_prefill_ladder_3+r10_compact_vocab"
-)
+LOW_BF16_OPTIMIZED_KERNEL_IDS = QWEN38_LOW_BF16_KERNEL_IDS
+LOW_BF16_OPTIMIZED_FEATURE_KEYS = QWEN38_LOW_BF16_FEATURE_KEYS
+LOW_BF16_OPTIMIZED_INSTALLED_ROUTE_ID = QWEN38_LOW_BF16_INSTALLED_ROUTE
 LOW_Q4_OPTIMIZED_KERNEL_IDS = (
     "qwen38_row17_q4_g64_mtp_block_v1",
     *LOW_BF16_OPTIMIZED_KERNEL_IDS,
 )
-LOW_Q4_OPTIMIZED_INSTALLED_ROUTE_ID = (
-    "r17_q4_mtp_block+" + LOW_BF16_OPTIMIZED_INSTALLED_ROUTE_ID
-)
-XHIGH_BF16_OPTIMIZED_KERNEL_IDS = (
-    "qwen38_mtp_kv_only_history_ge16384_v1",
-    "qwen38_row24_target_eval_ladder_v1",
-    "qwen38_row26_prefill_eval_every3_v1",
-    "qwen38_row50_post_warm_wired_residency_v1",
-)
-XHIGH_BF16_OPTIMIZED_FEATURE_KEYS = (
-    "r20_kv_only_history",
-    "r24_eval_ladder",
-    "r26_prefill_ladder_3",
-    "r50_wired_residency",
-    "r53_command_buffers",
-)
-XHIGH_BF16_OPTIMIZED_INSTALLED_ROUTE_ID = (
-    "kv_only_history+r24_eval_ladder+"
-    "r26_prefill_ladder_3+r50_wired_residency"
-)
+LOW_Q4_OPTIMIZED_INSTALLED_ROUTE_ID = QWEN38_LOW_Q4_INSTALLED_ROUTE
+XHIGH_BF16_OPTIMIZED_KERNEL_IDS = QWEN38_XHIGH_BF16_KERNEL_IDS
+XHIGH_BF16_OPTIMIZED_FEATURE_KEYS = QWEN38_XHIGH_BF16_FEATURE_KEYS
+XHIGH_BF16_OPTIMIZED_INSTALLED_ROUTE_ID = QWEN38_XHIGH_BF16_INSTALLED_ROUTE
 XHIGH_Q4_OPTIMIZED_KERNEL_IDS = (
     "qwen38_row17_q4_g64_mtp_block_v1",
     *XHIGH_BF16_OPTIMIZED_KERNEL_IDS,

@@ -9516,6 +9516,9 @@ def cmd_serve_public(args: Any) -> int:
                 ),
             ):
                 cmd.extend([flag, str(getattr(args, attr))])
+    qwen38_q4_mtp_block = getattr(args, "qwen38_q4_mtp_block", None)
+    if qwen38_q4_mtp_block is not None:
+        cmd.extend(["--qwen38-q4-mtp-block", str(qwen38_q4_mtp_block)])
     if draft_sampler is not None:
         # Provenance for the dynamic draft-temperature curve: only a
         # user-typed CLI draft flag pins the sampler. Injected measured
@@ -11564,6 +11567,14 @@ def _adaptive_command_suffix(args: Any) -> str:
                 shlex.quote(str(getattr(args, "adaptive_position_depth_cap", 4))),
             ]
         )
+        qwen38_q4_mtp_block = getattr(args, "qwen38_q4_mtp_block", None)
+        if qwen38_q4_mtp_block is not None:
+            parts.extend(
+                [
+                    "--qwen38-q4-mtp-block",
+                    shlex.quote(str(qwen38_q4_mtp_block)),
+                ]
+            )
     elif policy == "expected_value":
         for attr, flag in (
             ("adaptive_ev_base_depth", "--adaptive-ev-base-depth"),

@@ -10,6 +10,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from mtplx.qwen38_challenge import (
+    QWEN38_LOW_ADAPTIVE_ROUTE,
+    QWEN38_LOW_FIXED_ROUTE,
+    QWEN38_XHIGH_ADAPTIVE_ROUTE,
+    QWEN38_XHIGH_FIXED_ROUTE,
+)
+
 SCRIPT = Path(__file__).parents[1] / "scripts/qwen38_challenge_port_gate.py"
 ISOLATED_SCRIPT = (
     Path(__file__).parents[1] / "scripts/qwen38_challenge_port_isolated_gate.py"
@@ -70,6 +77,10 @@ def test_low_and_xhigh_benchmark_routes_use_independently_promoted_stacks() -> N
     assert gate.XHIGH_Q4_ADAPTIVE_NATIVE_ROUTE == (
         expected_xhigh_shared + "+r11_position_ema+r17_q4_mtp_block"
     )
+    assert QWEN38_LOW_FIXED_ROUTE == gate.LOW_FIXED_NATIVE_ROUTE
+    assert QWEN38_LOW_ADAPTIVE_ROUTE == gate.LOW_Q4_ADAPTIVE_NATIVE_ROUTE
+    assert QWEN38_XHIGH_FIXED_ROUTE == gate.XHIGH_FIXED_NATIVE_ROUTE
+    assert QWEN38_XHIGH_ADAPTIVE_ROUTE == gate.XHIGH_ADAPTIVE_NATIVE_ROUTE
 
     low_bf16 = gate._route_execution_options(gate.LOW_ADAPTIVE_NATIVE_ROUTE)
     low_q4 = gate._route_execution_options(gate.LOW_Q4_ADAPTIVE_NATIVE_ROUTE)

@@ -654,6 +654,8 @@ def _fast_path_env_status() -> dict[str, dict[str, Any]]:
 def _server_runtime_env_overrides(
     args: argparse.Namespace,
     model_runtime_env_overrides: Mapping[str, str] | None,
+    *,
+    runtime_contract: RuntimeContract | None = None,
 ) -> dict[str, str]:
     overrides = dict(model_runtime_env_overrides or {})
     verify_strategy = (
@@ -688,7 +690,44 @@ def _server_runtime_env_overrides(
         and verify_strategy not in VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES
     ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if _qwen38_measured_profiles_enabled(args, runtime_contract):
+        overrides.update(
+            {
+                "MLX_MAX_MB_PER_BUFFER": "512",
+                "MLX_MAX_OPS_PER_BUFFER": "50",
+            }
+        )
     return overrides
+
+
+def _qwen38_measured_profiles_enabled(
+    args: argparse.Namespace,
+    runtime_contract: RuntimeContract | None,
+) -> bool:
+    contract_matches = bool(
+        runtime_contract is not None
+        and runtime_contract.arch_id == "qwen3-next-mtp"
+        and int(runtime_contract.mtp_depth_max) == 3
+        and int(getattr(args, "depth", 3) or 3) == 3
+        and str(getattr(args, "generation_mode", "mtp") or "mtp") == "mtp"
+        and bool(getattr(args, "load_mtp", True))
+        and str(getattr(args, "adaptive_policy", "none") or "none")
+        in {"none", "position_ema"}
+    )
+    if not contract_matches:
+        return False
+    model_ref = getattr(args, "model", None)
+    if model_ref is None:
+        return False
+    from mtplx.artifacts import load_config
+    from mtplx.qwen38_challenge import is_qwen38_27b_candidate
+
+    model_path = Path(model_ref)
+    try:
+        config = load_config(model_path)
+    except (OSError, ValueError):
+        return False
+    return is_qwen38_27b_candidate(config, model_path)
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:
@@ -732,7 +771,12 @@ def _draft_head_identity(runtime: Any) -> str | None:
 def _qwen38_challenge_route_payload(runtime: Any) -> dict[str, Any] | None:
     from mtplx.qwen38_challenge import qwen38_route_receipt
 
-    return qwen38_route_receipt(getattr(runtime, "qwen38_route", None))
+    receipt = qwen38_route_receipt(getattr(runtime, "qwen38_route", None))
+    if receipt is not None:
+        receipt["feature_receipt"] = dict(
+            getattr(runtime, "qwen38_feature_receipt", {}) or {}
+        )
+    return receipt
 
 
 def _select_qwen38_request_performance_profile(
@@ -749,6 +793,36 @@ def _select_qwen38_request_performance_profile(
         (request_observability or {}).get("resolved_reasoning_effort") or ""
     ).strip().lower()
     return select_qwen38_performance_profile(runtime, effort or None)
+
+
+def _install_qwen38_server_performance_profiles(
+    runtime: Any,
+    config: Mapping[str, Any],
+    model_path: Path,
+    args: argparse.Namespace,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> Mapping[str, Any]:
+    """Install every measured route once after the draft head is available."""
+
+    from mtplx.qwen38_challenge import (
+        install_qwen38_performance_profiles,
+        qwen38_measured_performance_profile_configs,
+    )
+
+    profiles = qwen38_measured_performance_profile_configs(
+        adaptive_policy=str(getattr(args, "adaptive_policy", "none") or "none"),
+        q4_mtp_block=getattr(args, "qwen38_q4_mtp_block", None),
+    )
+    return install_qwen38_performance_profiles(
+        runtime,
+        config,
+        model_path,
+        stock=profiles["stock"],
+        low=profiles["low"],
+        xhigh=profiles["xhigh"],
+        environment=environment,
+    )
 
 
 def _mlx_runtime_status() -> dict[str, Any]:
@@ -2055,6 +2129,7 @@ class ServerState:
             runtime_env_overrides = _server_runtime_env_overrides(
                 args,
                 self.model_runtime_env_overrides,
+                runtime_contract=contract,
             )
             clear_cache_every = getattr(args, "clear_cache_every", None)
             if clear_cache_every is not None:
@@ -2190,6 +2265,28 @@ class ServerState:
             )
         else:
             self.draft_head_identity = None
+        self.qwen38_performance_profiles = None
+        if _qwen38_measured_profiles_enabled(args, runtime_contract):
+            from mtplx.artifacts import load_config
+
+            qwen38_model_path = Path(self.runtime.model_path)
+            qwen38_config = load_config(qwen38_model_path)
+            self.qwen38_performance_profiles = self.model_scheduler.submit_foreground(
+                _install_qwen38_server_performance_profiles,
+                self.runtime,
+                qwen38_config,
+                qwen38_model_path,
+                args,
+                environment=os.environ,
+                batch_key="startup.qwen38_performance_profiles",
+            ).result()
+            _startup_line(
+                "[5/6] Qwen3.8 profiles installed: "
+                + ", ".join(
+                    f"{name}={profile.requested_route_id}"
+                    for name, profile in self.qwen38_performance_profiles.items()
+                )
+            )
         scheduler_config = _scheduler_config_from_args(args)
         self.mtp_batch_lane = None
         self.mtp_batch_lanes: dict[int, Any] = {}
@@ -32180,6 +32277,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["none", "streak", "expected_value", "cost", "position_ema"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
+    )
+    parser.add_argument(
+        "--qwen38-q4-mtp-block",
+        type=Path,
+        default=None,
+        help=(
+            "Validated r17 Q4 native-MTP block used by the measured Qwen3.8 "
+            "low profile when --adaptive-policy position_ema is enabled."
+        ),
     )
     parser.add_argument("--adaptive-min-depth", type=int, default=1)
     parser.add_argument("--adaptive-start-depth", type=int, default=1)

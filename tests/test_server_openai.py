@@ -75,6 +75,22 @@ def test_server_binds_position_ema_to_validated_qwen38_native_mtp_d3():
     assert policy.current_depth == 3
 
 
+def test_server_parser_accepts_qwen38_q4_mtp_block_artifact(tmp_path: Path) -> None:
+    artifact = tmp_path / "qwen38-r17-q4.safetensors"
+    args = parse_args(
+        [
+            "--adaptive-policy",
+            "position_ema",
+            "--qwen38-q4-mtp-block",
+            str(artifact),
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    assert args.qwen38_q4_mtp_block == artifact
+
+
 def test_position_ema_policy_cannot_exceed_installed_native_depth() -> None:
     args = openai.parse_args(
         [
@@ -956,6 +972,142 @@ def test_capture_commit_keeps_fast_snapshot_skip_override():
     )
 
     assert overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"
+
+
+def test_qwen38_measured_profiles_prebind_command_buffers_before_model_load(
+    tmp_path: Path,
+):
+    model = tmp_path / "Qwen3.8-27B-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    args = SimpleNamespace(
+        model=str(model),
+        depth=3,
+        adaptive_policy="position_ema",
+        generation_mode="mtp",
+        load_mtp=True,
+        scheduler_mode="serial",
+        verify_strategy="capture_commit",
+    )
+
+    overrides = openai._server_runtime_env_overrides(
+        args,
+        {},
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+    assert overrides["MLX_MAX_MB_PER_BUFFER"] == "512"
+    assert overrides["MLX_MAX_OPS_PER_BUFFER"] == "50"
+
+
+def test_qwen38_command_buffers_are_not_applied_to_unmeasured_policies(
+    tmp_path: Path,
+):
+    model = tmp_path / "Qwen3.8-27B-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    args = SimpleNamespace(
+        model=str(model),
+        depth=3,
+        adaptive_policy="streak",
+        generation_mode="mtp",
+        load_mtp=True,
+        scheduler_mode="serial",
+        verify_strategy="capture_commit",
+    )
+
+    overrides = openai._server_runtime_env_overrides(
+        args,
+        {},
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+    assert "MLX_MAX_MB_PER_BUFFER" not in overrides
+    assert "MLX_MAX_OPS_PER_BUFFER" not in overrides
+
+
+def test_qwen38_profiles_do_not_install_on_other_qwen3_next_models(
+    tmp_path: Path,
+):
+    model = tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    args = SimpleNamespace(
+        model=str(model),
+        depth=3,
+        adaptive_policy="none",
+        generation_mode="mtp",
+        load_mtp=True,
+        scheduler_mode="serial",
+        verify_strategy="capture_commit",
+    )
+
+    overrides = openai._server_runtime_env_overrides(
+        args,
+        {},
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+    assert "MLX_MAX_MB_PER_BUFFER" not in overrides
+    assert "MLX_MAX_OPS_PER_BUFFER" not in overrides
+
+
+def test_server_installs_measured_qwen38_profiles_once(monkeypatch, tmp_path: Path):
+    from mtplx import qwen38_challenge
+
+    artifact = tmp_path / "qwen38-r17-q4.safetensors"
+    artifact.write_bytes(b"row17")
+    args = SimpleNamespace(
+        adaptive_policy="position_ema",
+        qwen38_q4_mtp_block=artifact,
+    )
+    runtime = SimpleNamespace()
+    model_path = tmp_path / "model"
+    configs = {
+        "stock": object(),
+        "low": object(),
+        "xhigh": object(),
+    }
+    installed = {"installed": True}
+    calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        qwen38_challenge,
+        "qwen38_measured_performance_profile_configs",
+        lambda **kwargs: calls.append(("configs", kwargs)) or configs,
+    )
+    monkeypatch.setattr(
+        qwen38_challenge,
+        "install_qwen38_performance_profiles",
+        lambda *positional, **keywords: (
+            calls.append(("install", positional, keywords)) or installed
+        ),
+    )
+
+    result = openai._install_qwen38_server_performance_profiles(
+        runtime,
+        {"model_type": "qwen3_5"},
+        model_path,
+        args,
+        environment={
+            "MLX_MAX_MB_PER_BUFFER": "512",
+            "MLX_MAX_OPS_PER_BUFFER": "50",
+        },
+    )
+
+    assert result is installed
+    assert calls[0] == (
+        "configs",
+        {
+            "adaptive_policy": "position_ema",
+            "q4_mtp_block": artifact,
+        },
+    )
+    assert calls[1][0] == "install"
+    assert calls[1][1] == (runtime, {"model_type": "qwen3_5"}, model_path)
+    assert calls[1][2]["stock"] is configs["stock"]
+    assert calls[1][2]["low"] is configs["low"]
+    assert calls[1][2]["xhigh"] is configs["xhigh"]
 
 
 def test_mtp_batch_installs_qwen35b_optimized_kernel_routes_at_construction():
