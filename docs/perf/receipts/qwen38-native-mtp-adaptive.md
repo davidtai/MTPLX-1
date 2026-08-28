@@ -4,6 +4,8 @@ This receipt replaces the earlier campaign. Every measured candidate uses MLX an
 
 The optimized fixed-K3 lane uses the matched optimized route and remains pinned at K=3 without executing adaptive depth. Adaptive BF16 and Adaptive Q4 use the same workload-specific optimized profile plus the existing `--adaptive-policy position_ema` toggle. The v2.9.2 lane is exact source `bbc67427e88288001e4b90ecb44708dc0222154c` with only MLX/Metal upgraded. DFlash2 is exact source `9a6f48e69f9c8c6932d0f005c364844b2bf33e9c`.
 
+Every current native lane other than v2.9.2 uses a measured optimized shared profile. Low uses `r20_kv_only_history+r53_command_buffers+r08_device_draft+r10_compact_vocab+r21_qk_rms_rope+r24_eval_ladder+r26_prefill_ladder_3`; xhigh uses `r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+r50_wired_residency+r53_command_buffers`. Fixed K3 uses the applicable shared profile without `r11`; Adaptive BF16 adds `r11_position_ema`; Adaptive Q4 adds `r11_position_ema+r17_q4_mtp_block`. DFlash2 uses its separate PR335 optimized comparator path.
+
 The custom Q4 head is retained for further benchmarking but is not published: it wins low at 1K and 16K, then loses low at 64K and 128K and loses three of four xhigh rows. That matched evidence does not justify a supported artifact yet.
 
 ## 100-token temperature-zero vanity prompt
@@ -92,3 +94,8 @@ Attempted and accepted shares are speculative decode-cycle shares derived from t
 ## Reproducibility
 
 [`qwen38-native-mtp-four-series-data.json`](qwen38-native-mtp-four-series-data.json) is the canonical source for every number in these tables and both charts. The JSON records the SHA-256 identity of every aggregate receipt. The chart bars carry the exact canonical decode value in `data-value`, and the focused test mechanically compares every plotted bar with the JSON row.
+
+```bash
+.venv/bin/python -m pytest -q   tests/test_qwen38_native_mtp_matrix.py   tests/test_qwen38_dflash2_matrix.py   tests/test_qwen38_fixed_k3_xhigh_gate.py   tests/test_qwen38_native_mtp_report.py
+.venv/bin/python -m ruff check   scripts/qwen38_native_mtp_matrix.py   scripts/qwen38_native_mtp_report.py   tests/test_qwen38_native_mtp_matrix.py   tests/test_qwen38_native_mtp_report.py
+```
