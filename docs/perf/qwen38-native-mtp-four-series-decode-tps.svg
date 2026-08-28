@@ -1,146 +1,73 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 800" role="img" aria-labelledby="title desc">
-  <title id="title">Qwen3.8 native MTP decode throughput across four fixed and adaptive lanes</title>
-  <desc id="desc">Grouped bar chart at 100, 1024, 16384, 65536, and 131072 prompt tokens. Historical PR 335 fixed K3 values are 107.58, 59.33, 54.57, 42.04, and 34.01 tokens per second. Current fixed K3 values are 117.93, 65.38, 53.44, 40.46, and 32.70. Adaptive BF16 values are 114.78, 63.47, 51.60, 40.40, and 31.78. Adaptive Q4 values are 118.53, 62.85, 56.01, 44.77, and 37.61.</desc>
-  <defs>
-    <linearGradient id="background" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#111827"/>
-      <stop offset="1" stop-color="#070b12"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
-      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000000" flood-opacity="0.32"/>
-    </filter>
-  </defs>
-
-  <rect width="1400" height="800" rx="24" fill="url(#background)"/>
-
-  <text x="80" y="58" fill="#f8fafc" font-family="Inter, system-ui, sans-serif" font-size="32" font-weight="750">
-    Qwen3.8 native MTP decode throughput
-  </text>
-  <text x="80" y="91" fill="#94a3b8" font-family="Inter, system-ui, sans-serif" font-size="17">
-    Historical PR #335 fixed K3 vs current MLX/Metal 0.32.2 lanes
-  </text>
-
-  <g transform="translate(270 118)" font-family="Inter, system-ui, sans-serif" font-size="14">
-    <rect x="0" y="0" width="22" height="15" rx="3" fill="#94a3b8"/>
-    <text x="30" y="13" fill="#cbd5e1">PR #335 fixed K3</text>
-    <rect x="190" y="0" width="22" height="15" rx="3" fill="#60a5fa"/>
-    <text x="220" y="13" fill="#cbd5e1">Current fixed K3</text>
-    <rect x="390" y="0" width="22" height="15" rx="3" fill="#fbbf24"/>
-    <text x="420" y="13" fill="#cbd5e1">Adaptive BF16</text>
-    <rect x="560" y="0" width="22" height="15" rx="3" fill="#34d399"/>
-    <text x="590" y="13" fill="#cbd5e1">Adaptive Q4</text>
-  </g>
-
-  <!-- Plot grid: 0 to 125 decode tok/s. -->
-  <g stroke="#334155" stroke-width="1">
-    <line x1="90" y1="140" x2="1360" y2="140" opacity="0.55"/>
-    <line x1="90" y1="242" x2="1360" y2="242" opacity="0.45"/>
-    <line x1="90" y1="344" x2="1360" y2="344" opacity="0.45"/>
-    <line x1="90" y1="446" x2="1360" y2="446" opacity="0.45"/>
-    <line x1="90" y1="548" x2="1360" y2="548" opacity="0.45"/>
-    <line x1="90" y1="650" x2="1360" y2="650" opacity="0.8"/>
-  </g>
-  <g fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" text-anchor="end">
-    <text x="78" y="145">125</text>
-    <text x="78" y="247">100</text>
-    <text x="78" y="349">75</text>
-    <text x="78" y="451">50</text>
-    <text x="78" y="553">25</text>
-    <text x="78" y="655">0</text>
-  </g>
-  <text x="34" y="392" transform="rotate(-90 34 392)" fill="#94a3b8" font-family="Inter, system-ui, sans-serif" font-size="16" text-anchor="middle">
-    Decode tokens per second
-  </text>
-
-  <!-- 100 tokens. -->
-  <g filter="url(#shadow)">
-    <rect x="110" y="211.07" width="44" height="438.93" rx="6" fill="#94a3b8"/>
-    <rect x="162" y="168.84" width="44" height="481.16" rx="6" fill="#60a5fa"/>
-    <rect x="214" y="181.69" width="44" height="468.31" rx="6" fill="#fbbf24"/>
-    <rect x="266" y="166.40" width="44" height="483.60" rx="6" fill="#34d399"/>
-  </g>
-  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700" text-anchor="middle">
-    <text x="132" y="199">107.58</text>
-    <text x="184" y="157">117.93</text>
-    <text x="236" y="170">114.78</text>
-    <text x="288" y="155">118.53</text>
-  </g>
-
-  <!-- 1,024 tokens. -->
-  <g filter="url(#shadow)">
-    <rect x="360" y="407.93" width="44" height="242.07" rx="6" fill="#94a3b8"/>
-    <rect x="412" y="383.24" width="44" height="266.76" rx="6" fill="#60a5fa"/>
-    <rect x="464" y="391.04" width="44" height="258.96" rx="6" fill="#fbbf24"/>
-    <rect x="516" y="393.57" width="44" height="256.43" rx="6" fill="#34d399"/>
-  </g>
-  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700" text-anchor="middle">
-    <text x="382" y="396">59.33</text>
-    <text x="434" y="371">65.38</text>
-    <text x="486" y="379">63.47</text>
-    <text x="538" y="382">62.85</text>
-  </g>
-
-  <!-- 16,384 tokens. -->
-  <g filter="url(#shadow)">
-    <rect x="610" y="427.35" width="44" height="222.65" rx="6" fill="#94a3b8"/>
-    <rect x="662" y="431.94" width="44" height="218.06" rx="6" fill="#60a5fa"/>
-    <rect x="714" y="439.46" width="44" height="210.54" rx="6" fill="#fbbf24"/>
-    <rect x="766" y="421.48" width="44" height="228.52" rx="6" fill="#34d399"/>
-  </g>
-  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700" text-anchor="middle">
-    <text x="632" y="415">54.57</text>
-    <text x="684" y="420">53.44</text>
-    <text x="736" y="427">51.60</text>
-    <text x="788" y="409">56.01</text>
-  </g>
-
-  <!-- 65,536 tokens. -->
-  <g filter="url(#shadow)">
-    <rect x="860" y="478.48" width="44" height="171.52" rx="6" fill="#94a3b8"/>
-    <rect x="912" y="484.92" width="44" height="165.08" rx="6" fill="#60a5fa"/>
-    <rect x="964" y="485.16" width="44" height="164.84" rx="6" fill="#fbbf24"/>
-    <rect x="1016" y="467.34" width="44" height="182.66" rx="6" fill="#34d399"/>
-  </g>
-  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700" text-anchor="middle">
-    <text x="882" y="466">42.04</text>
-    <text x="934" y="473">40.46</text>
-    <text x="986" y="473">40.40</text>
-    <text x="1038" y="455">44.77</text>
-  </g>
-
-  <!-- 131,072 tokens. -->
-  <g filter="url(#shadow)">
-    <rect x="1110" y="511.24" width="44" height="138.76" rx="6" fill="#94a3b8"/>
-    <rect x="1162" y="516.58" width="44" height="133.42" rx="6" fill="#60a5fa"/>
-    <rect x="1214" y="520.34" width="44" height="129.66" rx="6" fill="#fbbf24"/>
-    <rect x="1266" y="496.55" width="44" height="153.45" rx="6" fill="#34d399"/>
-  </g>
-  <g fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700" text-anchor="middle">
-    <text x="1132" y="499">34.01</text>
-    <text x="1184" y="505">32.70</text>
-    <text x="1236" y="508">31.78</text>
-    <text x="1288" y="484">37.61</text>
-  </g>
-
-  <g fill="#e2e8f0" font-family="Inter, system-ui, sans-serif" font-size="17" font-weight="650" text-anchor="middle">
-    <text x="210" y="688">100</text>
-    <text x="460" y="688">1,024</text>
-    <text x="710" y="688">16,384</text>
-    <text x="960" y="688">65,536</text>
-    <text x="1210" y="688">131,072</text>
-  </g>
-  <g fill="#64748b" font-family="Inter, system-ui, sans-serif" font-size="13" text-anchor="middle">
-    <text x="210" y="710">prompt tokens</text>
-    <text x="460" y="710">prompt tokens</text>
-    <text x="710" y="710">prompt tokens</text>
-    <text x="960" y="710">prompt tokens</text>
-    <text x="1210" y="710">prompt tokens</text>
-  </g>
-
-  <text x="700" y="730" fill="#94a3b8" font-family="Inter, system-ui, sans-serif" font-size="14" text-anchor="middle">
-    Raw receipt means; every bar is decode tokens per second from the table in this PR.
-  </text>
-  <text x="700" y="758" fill="#64748b" font-family="Inter, system-ui, sans-serif" font-size="13" text-anchor="middle">
-    DFlash2 xhigh is a separate 1K-only failure reference: 25.55 decode tok/s, 642.484 s wall.
-  </text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+<rect width="100%" height="100%" fill="#0B1220"/>
+<text x="90" y="44" fill="#F8FAFC" font-size="24" font-family="system-ui" font-weight="700">Qwen3.8 MTP decode throughput — vanity + thinking=low</text>
+<text x="90" y="72" fill="#94A3B8" font-size="14" font-family="system-ui">100-token vanity has no conditioner and stops naturally · thinking rows: 1,024 conditioner and output</text>
+<line x1="90" y1="594.00" x2="1244" y2="594.00" stroke="#233047" stroke-width="1"/>
+<text x="78" y="599.00" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">0</text>
+<line x1="90" y1="556.31" x2="1244" y2="556.31" stroke="#233047" stroke-width="1"/>
+<text x="78" y="561.31" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">10</text>
+<line x1="90" y1="518.62" x2="1244" y2="518.62" stroke="#233047" stroke-width="1"/>
+<text x="78" y="523.62" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">20</text>
+<line x1="90" y1="480.92" x2="1244" y2="480.92" stroke="#233047" stroke-width="1"/>
+<text x="78" y="485.92" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">30</text>
+<line x1="90" y1="443.23" x2="1244" y2="443.23" stroke="#233047" stroke-width="1"/>
+<text x="78" y="448.23" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">40</text>
+<line x1="90" y1="405.54" x2="1244" y2="405.54" stroke="#233047" stroke-width="1"/>
+<text x="78" y="410.54" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">50</text>
+<line x1="90" y1="367.85" x2="1244" y2="367.85" stroke="#233047" stroke-width="1"/>
+<text x="78" y="372.85" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">60</text>
+<line x1="90" y1="330.15" x2="1244" y2="330.15" stroke="#233047" stroke-width="1"/>
+<text x="78" y="335.15" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">70</text>
+<line x1="90" y1="292.46" x2="1244" y2="292.46" stroke="#233047" stroke-width="1"/>
+<text x="78" y="297.46" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">80</text>
+<line x1="90" y1="254.77" x2="1244" y2="254.77" stroke="#233047" stroke-width="1"/>
+<text x="78" y="259.77" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">90</text>
+<line x1="90" y1="217.08" x2="1244" y2="217.08" stroke="#233047" stroke-width="1"/>
+<text x="78" y="222.08" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">100</text>
+<line x1="90" y1="179.38" x2="1244" y2="179.38" stroke="#233047" stroke-width="1"/>
+<text x="78" y="184.38" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">110</text>
+<line x1="90" y1="141.69" x2="1244" y2="141.69" stroke="#233047" stroke-width="1"/>
+<text x="78" y="146.69" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">120</text>
+<line x1="90" y1="104.00" x2="1244" y2="104.00" stroke="#233047" stroke-width="1"/>
+<text x="78" y="109.00" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">130</text>
+<rect x="106.63" y="149.81" width="35.51" height="444.19" rx="4" fill="#8B95A7" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="v2.9.2 fixed K3" data-value="117.8452791224329"/>
+<rect x="147.14" y="147.72" width="35.51" height="446.28" rx="4" fill="#2E90FA" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="Optimized fixed K3" data-value="118.40038235160236"/>
+<rect x="187.65" y="152.09" width="35.51" height="441.91" rx="4" fill="#12B76A" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="Adaptive BF16" data-value="117.24067062067999"/>
+<rect x="228.15" y="136.61" width="35.51" height="457.39" rx="4" fill="#7A5AF8" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="Adaptive Q4" data-value="121.34782772719814"/>
+<rect x="268.66" y="181.88" width="35.51" height="412.12" rx="4" fill="#F79009" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="DFlash2" data-value="109.33921091649943"/>
+<text x="205.40" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">100</text>
+<rect x="337.43" y="354.42" width="35.51" height="239.58" rx="4" fill="#8B95A7" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="v2.9.2 fixed K3" data-value="63.56214187578141"/>
+<rect x="377.94" y="361.20" width="35.51" height="232.80" rx="4" fill="#2E90FA" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="Optimized fixed K3" data-value="61.763084884623666"/>
+<rect x="418.45" y="363.60" width="35.51" height="230.40" rx="4" fill="#12B76A" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="Adaptive BF16" data-value="61.12678575801031"/>
+<rect x="458.95" y="340.80" width="35.51" height="253.20" rx="4" fill="#7A5AF8" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="Adaptive Q4" data-value="67.17458708928318"/>
+<rect x="499.46" y="321.09" width="35.51" height="272.91" rx="4" fill="#F79009" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="DFlash2" data-value="72.40515009914137"/>
+<text x="436.20" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">1K</text>
+<rect x="568.23" y="385.89" width="35.51" height="208.11" rx="4" fill="#8B95A7" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="v2.9.2 fixed K3" data-value="55.21395018342532"/>
+<rect x="608.74" y="381.35" width="35.51" height="212.65" rx="4" fill="#2E90FA" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="Optimized fixed K3" data-value="56.4167561882758"/>
+<rect x="649.25" y="384.01" width="35.51" height="209.99" rx="4" fill="#12B76A" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="Adaptive BF16" data-value="55.71106314612001"/>
+<rect x="689.75" y="373.70" width="35.51" height="220.30" rx="4" fill="#7A5AF8" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="Adaptive Q4" data-value="58.44721630263416"/>
+<rect x="730.26" y="339.02" width="35.51" height="254.98" rx="4" fill="#F79009" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="DFlash2" data-value="67.64651486950491"/>
+<text x="667.00" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">16K</text>
+<rect x="799.03" y="439.15" width="35.51" height="154.85" rx="4" fill="#8B95A7" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="v2.9.2 fixed K3" data-value="41.08152857938888"/>
+<rect x="839.54" y="440.86" width="35.51" height="153.14" rx="4" fill="#2E90FA" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="Optimized fixed K3" data-value="40.62830208602769"/>
+<rect x="880.05" y="442.25" width="35.51" height="151.75" rx="4" fill="#12B76A" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="Adaptive BF16" data-value="40.25902906367471"/>
+<rect x="920.55" y="442.31" width="35.51" height="151.69" rx="4" fill="#7A5AF8" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="Adaptive Q4" data-value="40.24508444652579"/>
+<rect x="961.06" y="391.98" width="35.51" height="202.02" rx="4" fill="#F79009" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="DFlash2" data-value="53.596218712009026"/>
+<text x="897.80" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">64K</text>
+<rect x="1029.83" y="467.88" width="35.51" height="126.12" rx="4" fill="#8B95A7" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="v2.9.2 fixed K3" data-value="33.460607313579175"/>
+<rect x="1070.34" y="480.59" width="35.51" height="113.41" rx="4" fill="#2E90FA" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="Optimized fixed K3" data-value="30.089121212635774"/>
+<rect x="1110.85" y="480.75" width="35.51" height="113.25" rx="4" fill="#12B76A" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="Adaptive BF16" data-value="30.045796114683057"/>
+<rect x="1151.35" y="486.89" width="35.51" height="107.11" rx="4" fill="#7A5AF8" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="Adaptive Q4" data-value="28.41749692781107"/>
+<rect x="1191.86" y="448.47" width="35.51" height="145.53" rx="4" fill="#F79009" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="DFlash2" data-value="38.61022665175348"/>
+<text x="1128.60" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">128K</text>
+<rect x="90" y="650" width="14" height="14" rx="3" fill="#8B95A7"/>
+<text x="112" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">v2.9.2 fixed K3</text>
+<rect x="310" y="650" width="14" height="14" rx="3" fill="#2E90FA"/>
+<text x="332" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">Optimized fixed K3</text>
+<rect x="530" y="650" width="14" height="14" rx="3" fill="#12B76A"/>
+<text x="552" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">Adaptive BF16</text>
+<rect x="750" y="650" width="14" height="14" rx="3" fill="#7A5AF8"/>
+<text x="772" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">Adaptive Q4</text>
+<rect x="970" y="650" width="14" height="14" rx="3" fill="#F79009"/>
+<text x="992" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">DFlash2</text>
 </svg>

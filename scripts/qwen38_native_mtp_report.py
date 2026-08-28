@@ -263,7 +263,11 @@ def build_data(args: argparse.Namespace) -> dict[str, Any]:
 
 def render_chart(data: dict[str, Any], workload: str) -> str:
     section = data[workload]
-    rows = section["rows"]
+    rows = (
+        [*data["vanity"]["rows"], *section["rows"]]
+        if workload == "low"
+        else section["rows"]
+    )
     contexts = sorted({int(row["input_tokens"]) for row in rows})
     width, height = 1280, 720
     left, right, top, bottom = 90, 36, 104, 126
@@ -274,12 +278,21 @@ def render_chart(data: dict[str, Any], workload: str) -> str:
     bar_w = min(42.0, group_w / 6.5)
     order = [candidate_id for candidate_id, _ in CANDIDATES]
     lookup = {(int(row["input_tokens"]), row["candidate_id"]): row for row in rows}
-    title = "Qwen3.8 MTP decode throughput — thinking=" + workload
+    title = (
+        "Qwen3.8 MTP decode throughput — vanity + thinking=low"
+        if workload == "low"
+        else "Qwen3.8 MTP decode throughput — thinking=xhigh"
+    )
+    subtitle = (
+        "100-token vanity has no conditioner and stops naturally · thinking rows: 1,024 conditioner and output"
+        if workload == "low"
+        else "1,024 conditioner · input-prefill on x-axis · 1,024 generated output"
+    )
     out = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#0B1220"/>',
         f'<text x="{left}" y="44" fill="#F8FAFC" font-size="24" font-family="system-ui" font-weight="700">{escape(title)}</text>',
-        f'<text x="{left}" y="72" fill="#94A3B8" font-size="14" font-family="system-ui">1,024 conditioner · input-prefill on x-axis · 1,024 generated output</text>',
+        f'<text x="{left}" y="72" fill="#94A3B8" font-size="14" font-family="system-ui">{subtitle}</text>',
     ]
     for tick in range(0, int(y_max) + 1, 10):
         y = top + plot_h - (tick / y_max * plot_h)
@@ -296,9 +309,15 @@ def render_chart(data: dict[str, Any], workload: str) -> str:
             x = center + (lane_index - 2) * (bar_w + 5) - bar_w / 2
             y = top + plot_h - bar_h
             out.append(
-                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_w:.2f}" height="{bar_h:.2f}" rx="4" fill="{COLOR_BY_ID[candidate_id]}" data-metric="decode_tok_s" data-context-tokens="{context}" data-candidate="{escape(LABEL_BY_ID[candidate_id])}" data-value="{value:.12g}"/>'
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_w:.2f}" height="{bar_h:.2f}" rx="4" fill="{COLOR_BY_ID[candidate_id]}" data-metric="decode_tok_s" data-context-tokens="{context}" data-candidate="{escape(LABEL_BY_ID[candidate_id])}" data-value="{value!r}"/>'
             )
-        label = {1_024: "1K", 16_384: "16K", 65_536: "64K", 131_072: "128K"}[context]
+        label = {
+            100: "100",
+            1_024: "1K",
+            16_384: "16K",
+            65_536: "64K",
+            131_072: "128K",
+        }[context]
         out.append(f'<text x="{center:.2f}" y="{top + plot_h + 28}" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">{label}</text>')
     legend_y = height - 58
     legend_x = left

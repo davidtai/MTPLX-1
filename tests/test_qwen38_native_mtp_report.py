@@ -72,7 +72,10 @@ def test_canonical_report_data_has_the_final_1024_output_contract() -> None:
 def test_charts_are_mechanically_equal_to_the_canonical_data() -> None:
     data = json.loads(DATA.read_text(encoding="utf-8"))
 
-    assert _chart_values(LOW_CHART) == _expected_chart_values(data["low"])
+    assert _chart_values(LOW_CHART) == {
+        **_expected_chart_values(data["vanity"]),
+        **_expected_chart_values(data["low"]),
+    }
     assert _chart_values(XHIGH_CHART) == _expected_chart_values(data["xhigh"])
 
 
