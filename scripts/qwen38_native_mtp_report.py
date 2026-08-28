@@ -160,6 +160,14 @@ def _add_wall_deltas(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def _mark_wall_winners(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        row["winner"] = False
+    for context in {int(row["input_tokens"]) for row in rows}:
+        context_rows = [row for row in rows if int(row["input_tokens"]) == context]
+        min(context_rows, key=lambda row: float(row["wall_s"]))["winner"] = True
+
+
 def build_data(args: argparse.Namespace) -> dict[str, Any]:
     source_receipts: list[dict[str, Any]] = []
 
@@ -211,6 +219,9 @@ def build_data(args: argparse.Namespace) -> dict[str, Any]:
     _add_wall_deltas(vanity_rows)
     _add_wall_deltas(low_rows)
     _add_wall_deltas(xhigh_rows)
+    _mark_wall_winners(vanity_rows)
+    _mark_wall_winners(low_rows)
+    _mark_wall_winners(xhigh_rows)
 
     depth: dict[str, Any] = {}
     for workload, receipt in (("low", low_128_receipt), ("xhigh", xhigh_128_receipt)):
@@ -305,11 +316,12 @@ def render_chart(data: dict[str, Any], workload: str) -> str:
             if row is None:
                 continue
             value = float(row["decode_tok_s"])
+            winner = bool(row["winner"])
             bar_h = value / y_max * plot_h
             x = center + (lane_index - 2) * (bar_w + 5) - bar_w / 2
             y = top + plot_h - bar_h
             out.append(
-                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_w:.2f}" height="{bar_h:.2f}" rx="4" fill="{COLOR_BY_ID[candidate_id]}" data-metric="decode_tok_s" data-context-tokens="{context}" data-candidate="{escape(LABEL_BY_ID[candidate_id])}" data-value="{value!r}"/>'
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_w:.2f}" height="{bar_h:.2f}" rx="4" fill="{COLOR_BY_ID[candidate_id]}" stroke="{("#FDE68A" if winner else "none")}" stroke-width="{(4 if winner else 0)}" data-metric="decode_tok_s" data-context-tokens="{context}" data-candidate="{escape(LABEL_BY_ID[candidate_id])}" data-value="{value!r}" data-winner="{str(winner).lower()}"/>'
             )
         label = {
             100: "100",
@@ -342,8 +354,11 @@ def _table(rows: list[dict[str, Any]], *, vanity: bool = False) -> str:
         delta = row["wall_vs_optimized_fixed_pct"]
         delta_text = "baseline" if row["candidate_id"] == "full-fixed-k3" else f"{delta:+.2f}%"
         output = str(row["generated_tokens"]) + (" natural" if vanity else "")
+        candidate = (
+            f'**★ {row["candidate"]}**' if row["winner"] else row["candidate"]
+        )
         lines.append(
-            f'| {_context_label(int(row["input_tokens"]))} | {row["candidate"]} | {output} | '
+            f'| {_context_label(int(row["input_tokens"]))} | {candidate} | {output} | '
             f'{row["prefill_tok_s"]:.2f} | {row["decode_tok_s"]:.2f} | {row["wall_s"]:.3f} | '
             f'{delta_text} | {row["peak_memory_gib"]:.3f} |'
         )
@@ -379,6 +394,8 @@ The optimized fixed-K3 lane uses the matched optimized route and remains pinned 
 Every current native lane other than v2.9.2 uses a measured optimized shared profile. Low uses `r20_kv_only_history+r53_command_buffers+r08_device_draft+r10_compact_vocab+r21_qk_rms_rope+r24_eval_ladder+r26_prefill_ladder_3`; xhigh uses `r20_kv_only_history+r24_eval_ladder+r26_prefill_ladder_3+r50_wired_residency+r53_command_buffers`. Fixed K3 uses the applicable shared profile without `r11`; Adaptive BF16 adds `r11_position_ema`; Adaptive Q4 adds `r11_position_ema+r17_q4_mtp_block`. DFlash2 uses its separate PR335 optimized comparator path.
 
 The custom Q4 head is retained for further benchmarking but is not published: it wins low at 1K and 16K, then loses low at 64K and 128K and loses three of four xhigh rows. That matched evidence does not justify a supported artifact yet.
+
+Winner highlights use lowest wall time at each input/prefill size. The charts still plot decode tok/s; their gold outline marks the wall-time winner.
 
 ## 100-token temperature-zero vanity prompt
 

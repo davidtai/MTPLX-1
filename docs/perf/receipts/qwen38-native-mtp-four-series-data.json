@@ -228,7 +228,8 @@
         "prefill_tok_s": 751.1559872752264,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 17.50231495799926,
-        "wall_vs_optimized_fixed_pct": 2.89953311158917
+        "wall_vs_optimized_fixed_pct": 2.89953311158917,
+        "winner": false
       },
       {
         "arms": 2,
@@ -244,7 +245,8 @@
         "prefill_tok_s": 732.7200048591853,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 18.009800375501072,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 2,
@@ -260,7 +262,8 @@
         "prefill_tok_s": 756.9091323683365,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 18.137797354000213,
-        "wall_vs_optimized_fixed_pct": -0.7056919646911353
+        "wall_vs_optimized_fixed_pct": -0.7056919646911353,
+        "winner": false
       },
       {
         "arms": 2,
@@ -276,7 +279,8 @@
         "prefill_tok_s": 780.1744811568105,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 16.58340933349973,
-        "wall_vs_optimized_fixed_pct": 8.601313597921777
+        "wall_vs_optimized_fixed_pct": 8.601313597921777,
+        "winner": false
       },
       {
         "arms": 2,
@@ -292,7 +296,8 @@
         "prefill_tok_s": 766.927087273173,
         "source_commit": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
         "wall_s": 15.517770728998585,
-        "wall_vs_optimized_fixed_pct": 16.05919877296258
+        "wall_vs_optimized_fixed_pct": 16.05919877296258,
+        "winner": true
       },
       {
         "arms": 2,
@@ -308,7 +313,8 @@
         "prefill_tok_s": 802.4031561133254,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 39.39446943749863,
-        "wall_vs_optimized_fixed_pct": -2.5929776592625076
+        "wall_vs_optimized_fixed_pct": -2.5929776592625076,
+        "winner": false
       },
       {
         "arms": 2,
@@ -324,7 +330,8 @@
         "prefill_tok_s": 815.3292797854822,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 38.372979645999294,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 2,
@@ -340,7 +347,8 @@
         "prefill_tok_s": 815.0010130258066,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 38.60574072950294,
-        "wall_vs_optimized_fixed_pct": -0.6029183201910926
+        "wall_vs_optimized_fixed_pct": -0.6029183201910926,
+        "winner": false
       },
       {
         "arms": 2,
@@ -356,7 +364,8 @@
         "prefill_tok_s": 814.7440960302833,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 37.77492074949805,
-        "wall_vs_optimized_fixed_pct": 1.5832168132588142
+        "wall_vs_optimized_fixed_pct": 1.5832168132588142,
+        "winner": false
       },
       {
         "arms": 2,
@@ -372,7 +381,8 @@
         "prefill_tok_s": 789.8582022370313,
         "source_commit": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
         "wall_s": 35.91478539599848,
-        "wall_vs_optimized_fixed_pct": 6.844518832276525
+        "wall_vs_optimized_fixed_pct": 6.844518832276525,
+        "winner": true
       },
       {
         "arms": 2,
@@ -388,7 +398,8 @@
         "prefill_tok_s": 681.5882986274155,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 123.78993837499911,
-        "wall_vs_optimized_fixed_pct": -1.140409223505312
+        "wall_vs_optimized_fixed_pct": -1.140409223505312,
+        "winner": false
       },
       {
         "arms": 2,
@@ -404,7 +415,8 @@
         "prefill_tok_s": 678.2099497894551,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 122.37822649999907,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 2,
@@ -420,7 +432,8 @@
         "prefill_tok_s": 678.6358586647293,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 122.53779420849969,
-        "wall_vs_optimized_fixed_pct": -0.13021917811667505
+        "wall_vs_optimized_fixed_pct": -0.13021917811667505,
+        "winner": false
       },
       {
         "arms": 2,
@@ -436,7 +449,8 @@
         "prefill_tok_s": 679.1756067115163,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 122.45064820799962,
-        "wall_vs_optimized_fixed_pct": -0.059143588915533396
+        "wall_vs_optimized_fixed_pct": -0.059143588915533396,
+        "winner": false
       },
       {
         "arms": 2,
@@ -452,7 +466,8 @@
         "prefill_tok_s": 661.3943986205522,
         "source_commit": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
         "wall_s": 118.28717787499772,
-        "wall_vs_optimized_fixed_pct": 3.4585731932201824
+        "wall_vs_optimized_fixed_pct": 3.4585731932201824,
+        "winner": true
       },
       {
         "arms": 1,
@@ -468,7 +483,8 @@
         "prefill_tok_s": 552.6186585794019,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 276.03469666699675,
-        "wall_vs_optimized_fixed_pct": -0.9622980491468258
+        "wall_vs_optimized_fixed_pct": -0.9622980491468258,
+        "winner": false
       },
       {
         "arms": 1,
@@ -484,7 +500,8 @@
         "prefill_tok_s": 550.4771614195517,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 273.3784201660019,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 1,
@@ -500,7 +517,8 @@
         "prefill_tok_s": 550.8713629028209,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 273.2182739999989,
-        "wall_vs_optimized_fixed_pct": 0.05861473453381283
+        "wall_vs_optimized_fixed_pct": 0.05861473453381283,
+        "winner": false
       },
       {
         "arms": 1,
@@ -516,7 +534,8 @@
         "prefill_tok_s": 548.0301789096092,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 276.3279392080003,
-        "wall_vs_optimized_fixed_pct": -1.067398052637103
+        "wall_vs_optimized_fixed_pct": -1.067398052637103,
+        "winner": false
       },
       {
         "arms": 1,
@@ -532,7 +551,8 @@
         "prefill_tok_s": 539.4257622172764,
         "source_commit": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
         "wall_s": 269.67768329100363,
-        "wall_vs_optimized_fixed_pct": 1.3722814694328456
+        "wall_vs_optimized_fixed_pct": 1.3722814694328456,
+        "winner": true
       }
     ]
   },
@@ -549,7 +569,7 @@
     },
     {
       "path_label": "combined.json",
-      "sha256": "2a2f2fb87d513309e730e7f4e65e37913c89a4df21e266894273518fca791c28",
+      "sha256": "b1524c8faceb9481b1b5c04a6b7de7a9e7b32a42f2c55b0341b3355286bbc9df",
       "workload": "vanity"
     },
     {
@@ -650,7 +670,8 @@
         "prefill_tok_s": 489.88385074376197,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 1.080886208499578,
-        "wall_vs_optimized_fixed_pct": 0.5825620636668027
+        "wall_vs_optimized_fixed_pct": 0.5825620636668027,
+        "winner": false
       },
       {
         "arms": 2,
@@ -666,7 +687,8 @@
         "prefill_tok_s": 463.6514148974795,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 1.087183041501703,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 2,
@@ -682,7 +704,8 @@
         "prefill_tok_s": 468.80194344642257,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 1.0932337079993886,
-        "wall_vs_optimized_fixed_pct": -0.5534650508314698
+        "wall_vs_optimized_fixed_pct": -0.5534650508314698,
+        "winner": false
       },
       {
         "arms": 2,
@@ -698,23 +721,25 @@
         "prefill_tok_s": 486.04782411543556,
         "source_commit": "14b6f048c7eb5c086d52fffb38b0a037748d5f30",
         "wall_s": 1.0553354165003839,
-        "wall_vs_optimized_fixed_pct": 3.017772786109041
+        "wall_vs_optimized_fixed_pct": 3.017772786109041,
+        "winner": true
       },
       {
         "arms": 2,
         "candidate": "DFlash2",
         "candidate_id": "dflash2",
         "conditioner_tokens": 0,
-        "decode_tok_s": 109.33921091649943,
+        "decode_tok_s": 112.51289698223152,
         "deterministic": true,
         "generated_tokens": 102,
         "input_tokens": 100,
         "output_contract": "natural_stop",
         "peak_memory_gib": 19.79793089721352,
-        "prefill_tok_s": 460.3574300235772,
+        "prefill_tok_s": 461.6848269049656,
         "source_commit": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
-        "wall_s": 1.1823338124995644,
-        "wall_vs_optimized_fixed_pct": -8.04770784628952
+        "wall_s": 1.1543227914989984,
+        "wall_vs_optimized_fixed_pct": -5.816375669937878,
+        "winner": false
       }
     ],
     "temperature": 0.0
@@ -738,7 +763,8 @@
         "prefill_tok_s": 713.5314657043309,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 22.584013270996365,
-        "wall_vs_optimized_fixed_pct": 1.6879758412549517
+        "wall_vs_optimized_fixed_pct": 1.6879758412549517,
+        "winner": false
       },
       {
         "arms": 2,
@@ -754,7 +780,8 @@
         "prefill_tok_s": 680.9871304560224,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 22.965225958996598,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 2,
@@ -770,7 +797,8 @@
         "prefill_tok_s": 673.7176729297547,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 22.263912479498686,
-        "wall_vs_optimized_fixed_pct": 3.1500010617796947
+        "wall_vs_optimized_fixed_pct": 3.1500010617796947,
+        "winner": true
       },
       {
         "arms": 2,
@@ -786,7 +814,8 @@
         "prefill_tok_s": 709.3208221514014,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 23.2811584580013,
-        "wall_vs_optimized_fixed_pct": -1.3570308349330595
+        "wall_vs_optimized_fixed_pct": -1.3570308349330595,
+        "winner": false
       },
       {
         "arms": 2,
@@ -802,7 +831,8 @@
         "prefill_tok_s": 703.3120354749673,
         "source_commit": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
         "wall_s": 23.895773083000677,
-        "wall_vs_optimized_fixed_pct": -3.8941913315458487
+        "wall_vs_optimized_fixed_pct": -3.8941913315458487,
+        "winner": false
       },
       {
         "arms": 2,
@@ -818,7 +848,8 @@
         "prefill_tok_s": 791.266628906475,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 45.76124749999872,
-        "wall_vs_optimized_fixed_pct": -5.393440752459567
+        "wall_vs_optimized_fixed_pct": -5.393440752459567,
+        "winner": false
       },
       {
         "arms": 2,
@@ -834,7 +865,8 @@
         "prefill_tok_s": 792.8152132339794,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 43.293141728499904,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": true
       },
       {
         "arms": 2,
@@ -850,7 +882,8 @@
         "prefill_tok_s": 792.6495763065238,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 43.66013277049933,
-        "wall_vs_optimized_fixed_pct": -0.8405632752619518
+        "wall_vs_optimized_fixed_pct": -0.8405632752619518,
+        "winner": false
       },
       {
         "arms": 2,
@@ -866,7 +899,8 @@
         "prefill_tok_s": 794.5124568118758,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 44.35812352049834,
-        "wall_vs_optimized_fixed_pct": -2.4008720556141117
+        "wall_vs_optimized_fixed_pct": -2.4008720556141117,
+        "winner": false
       },
       {
         "arms": 2,
@@ -882,7 +916,8 @@
         "prefill_tok_s": 677.2990991998926,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 129.49777818749862,
-        "wall_vs_optimized_fixed_pct": -1.378948819812842
+        "wall_vs_optimized_fixed_pct": -1.378948819812842,
+        "winner": false
       },
       {
         "arms": 2,
@@ -898,7 +933,8 @@
         "prefill_tok_s": 671.9457734447383,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 127.71207010349826,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 2,
@@ -914,7 +950,8 @@
         "prefill_tok_s": 670.3775511476456,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 127.56302199999845,
-        "wall_vs_optimized_fixed_pct": 0.1168427191226451
+        "wall_vs_optimized_fixed_pct": 0.1168427191226451,
+        "winner": true
       },
       {
         "arms": 2,
@@ -930,7 +967,8 @@
         "prefill_tok_s": 672.8263322320781,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 129.86371335399963,
-        "wall_vs_optimized_fixed_pct": -1.6568471630224568
+        "wall_vs_optimized_fixed_pct": -1.6568471630224568,
+        "winner": false
       },
       {
         "arms": 1,
@@ -946,7 +984,8 @@
         "prefill_tok_s": 548.7088732416341,
         "source_commit": "bbc67427e88288001e4b90ecb44708dc0222154c",
         "wall_s": 286.3805754999994,
-        "wall_vs_optimized_fixed_pct": -3.0567625153066436
+        "wall_vs_optimized_fixed_pct": -3.0567625153066436,
+        "winner": false
       },
       {
         "arms": 1,
@@ -962,7 +1001,8 @@
         "prefill_tok_s": 552.1851900210813,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 277.626601416996,
-        "wall_vs_optimized_fixed_pct": 0.0
+        "wall_vs_optimized_fixed_pct": 0.0,
+        "winner": false
       },
       {
         "arms": 1,
@@ -978,7 +1018,8 @@
         "prefill_tok_s": 551.566061876298,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 277.59476408400224,
-        "wall_vs_optimized_fixed_pct": 0.011468996217844918
+        "wall_vs_optimized_fixed_pct": 0.011468996217844918,
+        "winner": false
       },
       {
         "arms": 1,
@@ -994,7 +1035,8 @@
         "prefill_tok_s": 550.099803893261,
         "source_commit": "75b835c4f7e8382d9b554b5914527e5f16ec9020",
         "wall_s": 276.89400891600235,
-        "wall_vs_optimized_fixed_pct": 0.2645750638887501
+        "wall_vs_optimized_fixed_pct": 0.2645750638887501,
+        "winner": true
       }
     ]
   }
