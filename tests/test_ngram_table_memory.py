@@ -68,13 +68,14 @@ def _gather(table, ids):
 
 
 def test_sidecar_gather_matches_reference_and_hot_cache_is_value_invisible(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
+    monkeypatch.setenv("MTPLX_NGRAM_HOT_MB", "1024")
     path = tmp_path / NGRAM_TABLE_FILENAME
     ref = _write_quantized_table(path)
     table = _attached_table(path)
     sidecar = table._sidecar
-    assert sidecar._hot_cap_rows > 0  # default 1024M cap is on
+    assert sidecar._hot_cap_rows > 0  # the legacy opt-in remains value-exact
 
     ids = np.array([0, 3, 3, 17, ROWS - 1, 5], dtype=np.int64)
     ref_rows = np.asarray(ref.astype(mx.float32))[ids]
@@ -105,8 +106,8 @@ def test_hot_cache_eviction_keeps_bound_and_values(tmp_path):
     assert np.array_equal(again, np.asarray(ref.astype(mx.float32))[ids[:3]])
 
 
-def test_hot_cache_disabled_by_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("MTPLX_NGRAM_HOT_MB", "0")
+def test_mmap_only_is_the_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("MTPLX_NGRAM_HOT_MB", raising=False)
     path = tmp_path / NGRAM_TABLE_FILENAME
     ref = _write_quantized_table(path)
     table = _attached_table(path)
@@ -191,13 +192,21 @@ def test_plan_streams_table_as_note_not_commitment():
     assert not old.model_fits
 
 
-@pytest.mark.parametrize("value", ["1024", "not-a-number"])
-def test_hot_cache_env_parse_is_forgiving(tmp_path, monkeypatch, value):
+def test_hot_cache_remains_explicitly_available(tmp_path, monkeypatch):
+    value = "1024"
     monkeypatch.setenv("MTPLX_NGRAM_HOT_MB", value)
     path = tmp_path / NGRAM_TABLE_FILENAME
     _write_quantized_table(path)
     table = _attached_table(path)
-    assert table._sidecar._hot_cap_rows > 0  # bad value falls back to default
+    assert table._sidecar._hot_cap_rows > 0
+
+
+def test_invalid_hot_cache_size_falls_back_to_mmap_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_NGRAM_HOT_MB", "not-a-number")
+    path = tmp_path / NGRAM_TABLE_FILENAME
+    _write_quantized_table(path)
+    table = _attached_table(path)
+    assert table._sidecar._hot_cap_rows == 0
 
 
 @pytest.mark.parametrize("resident", [False, True])
