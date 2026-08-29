@@ -27,7 +27,7 @@ The 29.8 GiB n-gram table stays in a file-backed memory map. Production uses
 the required bounded 1 GiB hot-row cache above the memory map. All optimization
 decisions use this configuration.
 
-## Current production boundary
+## Step 1 production boundary
 
 Decode throughput excludes prefill. All runs below generated 1,024 tokens with
 the same output digest, the same 578 / 1,282 MTP acceptance path, 432 verifier
@@ -50,6 +50,32 @@ Earlier unchanged-control brackets measured 51.29 and 53.29 tok/s mean. The
 53.29 result explicitly set compiled GDN, but MTPLX 2.10 already enables that
 path. It is a baseline observation, not an optimization step.
 
+## Step 2 production boundary
+
+Step 2 installs one construction-bound compiled replay for physical M4 target
+verification. Shorter adaptive windows use the normal Qwen4 family capture
+route. The enabled M4 path does not repeat model checks or fall back silently.
+
+| Run | Decode throughput | Decode time | Verify cost | Accepted / drafted | Verify calls | Repair |
+|---|---:|---:|---:|---:|---:|---:|
+| Fresh step-1 control | 52.38 tok/s | 19.55 s | 37.25 ms/call | 578 / 1,282 | 432 | 0 s |
+| Fixed-M4 candidate 1 | 61.69 tok/s | 16.60 s | 36.82 ms/call | 605 / 1,087 | 371 | 0 s |
+| Fixed-M4 candidate 2 | 73.88 tok/s | 13.86 s | 36.78 ms/call | 659 / 888 | 307 | 0 s |
+| Fixed-M4 candidate 3 | 62.62 tok/s | 16.35 s | 36.88 ms/call | 611 / 1,071 | 365 | 0 s |
+| Candidate mean | **66.06 tok/s** | **15.60 s** | **36.83 ms/call** | 625 / 1,015 mean | 347.7 mean | **0 s** |
+| Candidate median | **62.62 tok/s** | - | - | - | - | **0 s** |
+
+All candidate runs generated exactly 1,024 tokens. Each run traced once and
+had zero fallback and zero repair. Weighted verifier cost fell by 1.13%.
+Mean decode throughput improved by 26.12% against the fresh control and by
+22.58% against the retained step-1 mean.
+
+The compiled PLE block changes bf16 operation grouping. This can change close
+sampling decisions, so the three candidate runs do not have the same output
+digest or MTP trajectory. The benchmark records every trajectory instead of
+claiming that the full TPS change comes from kernel speed. The stable direct
+execution result is 36.78 to 36.88 ms per verifier call.
+
 ## Accepted optimization hill climb
 
 This table records only changes that remain in the stack. Each new row must use
@@ -60,6 +86,7 @@ against the unchanged prior step.
 |---:|---|---|---:|---|
 | 0 | `4ce96908` | Unchanged MTPLX 2.10 | **53.46 tok/s mean** | Matched production control |
 | 1 | `ffdb8684` | Batch fixed-M4 target distributions | **53.89 tok/s mean** | +0.81% decode; +0.28% end-to-end |
+| 2 | `c5034156` | Construction-bound fixed-M4 compiled verifier | **66.06 tok/s mean; 62.62 median** | +22.58% mean vs step 1; verifier cost -1.13% |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
 experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
