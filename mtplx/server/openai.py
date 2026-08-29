@@ -829,6 +829,20 @@ def _server_runtime_env_overrides(
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
+        # Fixed-M4 target distributions (2026-08-29 production A/B/A/B):
+        # batch all four temperature-1/top-k-20 rows at one materialization
+        # boundary instead of synchronizing one row at a time during accept.
+        # Lazy mean 53.46 tok/s; batched mean 53.89 tok/s (+0.81%), with the
+        # same output digest, 578/1,282 acceptance, 432 verifier calls, and
+        # zero repair. Bind the paired strategy here so turbo's generic lazy
+        # defaults cannot leave BATCH_TARGET_ARRAYS runtime-dead. Explicit
+        # operator exports and model-pack overrides still win.
+        for key, value in (
+            ("MTPLX_BATCH_TARGET_ARRAYS", "1"),
+            ("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "0"),
+        ):
+            if os.environ.get(key) is None:
+                overrides.setdefault(key, value)
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and

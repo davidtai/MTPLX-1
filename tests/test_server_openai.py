@@ -890,12 +890,19 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
         verify_strategy="capture_commit",
         model=str(tmp_path),
     )
-    for key in (*_QWEN4_EXP_FAMILY_ENV_DEFAULTS, "MTPLX_NAX_VERIFY"):
+    for key in (
+        *_QWEN4_EXP_FAMILY_ENV_DEFAULTS,
+        "MTPLX_BATCH_TARGET_ARRAYS",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_NAX_VERIFY",
+    ):
         monkeypatch.delenv(key, raising=False)
 
     overrides = openai._server_runtime_env_overrides(args, {})
     for key in _QWEN4_EXP_FAMILY_ENV_DEFAULTS:
         assert overrides.get(key) == "1", key
+    assert overrides.get("MTPLX_BATCH_TARGET_ARRAYS") == "1"
+    assert overrides.get("MTPLX_LAZY_TARGET_DISTRIBUTIONS") == "0"
     assert overrides.get("MTPLX_NAX_VERIFY") == "0"
 
     # Every emitted key must survive the boot-time validator — the 08-27
@@ -907,10 +914,14 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
 
     # Operator env beats every family default (the launch-time export lane).
     monkeypatch.setenv("MTPLX_FUSED_GDN_STEP", "0")
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "0")
+    monkeypatch.setenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "1")
     monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
     monkeypatch.setenv("MTPLX_QSA_GATHER", "0")
     pinned = openai._server_runtime_env_overrides(args, {})
     assert "MTPLX_FUSED_GDN_STEP" not in pinned
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in pinned
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in pinned
     assert "MTPLX_NAX_VERIFY" not in pinned
     assert "MTPLX_QSA_GATHER" not in pinned
 
@@ -921,6 +932,8 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
         json.dumps({"model_type": "qwen3_next"}), encoding="utf-8"
     )
     monkeypatch.delenv("MTPLX_FUSED_GDN_STEP", raising=False)
+    monkeypatch.delenv("MTPLX_BATCH_TARGET_ARRAYS", raising=False)
+    monkeypatch.delenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", raising=False)
     monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
     other = openai._server_runtime_env_overrides(
         SimpleNamespace(
@@ -930,7 +943,12 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
         ),
         {},
     )
-    for key in (*_QWEN4_EXP_FAMILY_ENV_DEFAULTS, "MTPLX_NAX_VERIFY"):
+    for key in (
+        *_QWEN4_EXP_FAMILY_ENV_DEFAULTS,
+        "MTPLX_BATCH_TARGET_ARRAYS",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_NAX_VERIFY",
+    ):
         assert key not in other, key
 
 
