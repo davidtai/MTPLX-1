@@ -1757,14 +1757,14 @@ class _SidecarGather:
         # — and keeps its speed when macOS reclaims the file's page cache
         # under memory pressure. All access is on the single generation
         # thread (stage()/forward); the pread pool only warms pages and
-        # never touches this dict. MTPLX_NGRAM_HOT_MB is a legacy opt-in;
-        # the default is the full file-backed mmap with no second cache.
+        # never touches this dict. MTPLX_NGRAM_HOT_MB sizes it
+        # (default 1024; 0 disables).
         self._hot = OrderedDict()
         self._hot_row_bytes = max(1, sum(rb for _, rb in self._row_meta))
         try:
-            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "0"))
+            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
         except ValueError:
-            hot_mb = 0
+            hot_mb = 1024
         self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
         self.hot_hits = 0
         self.hot_misses = 0

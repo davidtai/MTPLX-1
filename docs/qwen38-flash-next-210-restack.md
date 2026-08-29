@@ -35,13 +35,13 @@ acceptance trajectory, and 432 verify calls. Repair time was zero throughout.
 | Arm | Decode tok/s | End-to-end wall | Accepted / drafted | Result |
 |---|---:|---:|---:|---|
 | 2.10 hot 1 GiB r1 | 51.0265 | 34.4313 s | 578 / 1,282 | control |
-| mmap only | **52.4803** | **33.0354 s** | 578 / 1,282 | retained |
+| mmap only | **52.4803** | **33.0354 s** | 578 / 1,282 | diagnostic |
 | 2.10 hot 1 GiB r2 | 51.5451 | 34.6328 s | 578 / 1,282 | control |
 | hot 1 GiB mean | 51.2858 | 34.5321 s | 578 / 1,282 | control mean |
 
-Mmap-only improves decode throughput by 2.33% over the bracketed 1 GiB mean
-and reduces wall time by 4.33%. It is therefore the branch default. The legacy
-hot-row cache remains available as an explicit `MTPLX_NGRAM_HOT_MB` opt-in.
+Mmap-only measured 2.33% higher decode throughput than the bracketed 1 GiB
+mean and 4.33% lower wall time. This is diagnostic evidence only: the branch
+does not alter MTPLX 2.10's n-gram table or cache behavior.
 
 Temperature-zero short-prompt results are vanity measurements only and must
 not be used to accept an optimization.
@@ -65,15 +65,8 @@ mtplx serve \
 
 This resolves to Turbo, native MTP depth 3, batched verification, xhigh
 reasoning, and the pack's temperature-1 sampler. The complete 29.8 GiB n-gram
-table stays file-backed through mmap; no cache-size flag is needed.
-
-For a diagnostic run with the legacy second-level row cache, set its size
-explicitly before launch:
-
-```bash
-MTPLX_NGRAM_HOT_MB=1024 mtplx serve \
-  --model ~/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed
-```
+table stays file-backed through mmap. This branch leaves the 2.10 cache
+defaults unchanged.
 
 ## What was already in 2.10
 
