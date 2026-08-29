@@ -12,6 +12,7 @@ import os
 import time
 import weakref
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from typing import Any
 
 import mlx.core as mx
@@ -1597,6 +1598,10 @@ class CompiledVerifyBank:
         )
         prepare_aux = getattr(runtime, "prepare_compiled_verify_aux", None)
         self._prepare_compiled_aux = prepare_aux if callable(prepare_aux) else None
+        build_fixed_aux = getattr(runtime, "build_fixed_m4_compiled_verify_aux", None)
+        self._build_fixed_m4_aux = (
+            build_fixed_aux if callable(build_fixed_aux) else None
+        )
         commit_captures = getattr(runtime, "commit_compiled_verify_captures", None)
         self._commit_compiled_captures = (
             commit_captures if callable(commit_captures) else None
@@ -1723,8 +1728,13 @@ class CompiledVerifyBank:
             capture_pos += len(names)
 
         boundary = _compiled_verify_boundary()
+        if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
+            prepare_aux = self._build_fixed_m4_aux(cache)
+        else:
+            prepare_aux = partial(self._prepare_compiled_aux, cache=cache)
         self._fixed_m4_dispatch = {
             "fn": fn,
+            "prepare_aux": prepare_aux,
             "state_plan": state_plan,
             "state_leaves": sum(n for _kind, _entry, n in state_plan),
             "capture_plan": tuple(capture_plan),
@@ -1759,7 +1769,7 @@ class CompiledVerifyBank:
             else:
                 state_in.extend(entry.cache[:n_leaves])
 
-        compiled_aux = self._prepare_compiled_aux(input_ids, cache)
+        compiled_aux = dispatch["prepare_aux"](input_ids)
         if boundary in ("both", "pre"):
             mx.async_eval(compiled_aux, *state_in)
         outputs = dispatch["fn"](input_ids, compiled_aux, *state_in)
