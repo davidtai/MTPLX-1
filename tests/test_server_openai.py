@@ -13732,6 +13732,11 @@ def _memory_plan_state_harness(monkeypatch):
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
+        openai,
+        "_apply_metal_memory_caps",
+        lambda **_kwargs: {"applied": False, "reason": "test_harness"},
+    )
+    monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
     )
     monkeypatch.setattr(
