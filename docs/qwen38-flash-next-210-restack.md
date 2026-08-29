@@ -1,10 +1,8 @@
 # Qwen3.8 Flash-Next optimization on MTPLX 2.10
 
-This branch establishes the production baseline for a clean optimization stack
-on MTPLX 2.10. It uses the official
-`Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` model. At this revision,
-the branch contains the audit and benchmark record. It does not contain a
-retained runtime optimization.
+This branch builds a clean optimization stack on MTPLX 2.10. It uses the
+official `Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` model. Each
+retained runtime change has a matched result on the production workload.
 
 The closed [PR #368](https://github.com/youssofal/MTPLX/pull/368) contains the
 old implementation history, rejected experiments, and detailed benchmark
@@ -37,15 +35,20 @@ calls, and zero repair time.
 
 | Result | Decode throughput | End-to-end time | Notes |
 |---|---:|---:|---|
-| Current control 1 | 52.73 tok/s | 34.21 s | Unchanged MTPLX 2.10 |
-| Current control 2 | 53.86 tok/s | 33.36 s | Unchanged MTPLX 2.10 |
-| Current control mean | **53.29 tok/s** | **33.78 s** | Standard production baseline |
+| Lazy control 1 | 52.89 tok/s | 33.81 s | Unchanged MTPLX 2.10 target sampling |
+| Batched candidate 1 | 53.58 tok/s | 33.59 s | Fixed-M4 target arrays |
+| Batched candidate 2 | 54.20 tok/s | 33.31 s | Fixed-M4 target arrays |
+| Lazy control 2 | 54.02 tok/s | 33.28 s | Unchanged MTPLX 2.10 target sampling |
+| Lazy control mean | **53.46 tok/s** | **33.55 s** | Matched step-0 control |
+| Batched candidate mean | **53.89 tok/s** | **33.45 s** | Retained step 1 |
 
-An earlier unchanged-control bracket measured 51.03 and 51.55 tok/s, with a
-51.29 tok/s mean. The current controls set `MTPLX_COMPILED_GDN=1` explicitly,
-but the MTPLX 2.10 `qwen4_exp` construction path already sets this value. The
-53.29 tok/s mean is therefore the current standard baseline, not a compiled-GDN
-optimization.
+The batched lane improved decode throughput by 0.81% and reduced end-to-end
+time by 0.28%. Both paired comparisons favored the candidate. The output
+digest, acceptance path, and work counts were identical in all four runs.
+
+Earlier unchanged-control brackets measured 51.29 and 53.29 tok/s mean. The
+53.29 result explicitly set compiled GDN, but MTPLX 2.10 already enables that
+path. It is a baseline observation, not an optimization step.
 
 ## Accepted optimization hill climb
 
@@ -55,7 +58,8 @@ against the unchanged prior step.
 
 | Step | Commit | Retained stack | Production evidence | Result |
 |---:|---|---|---:|---|
-| 0 | `4ce96908` | Unchanged MTPLX 2.10 | **53.29 tok/s mean** | Production baseline |
+| 0 | `4ce96908` | Unchanged MTPLX 2.10 | **53.46 tok/s mean** | Matched production control |
+| 1 | `ffdb8684` | Batch fixed-M4 target distributions | **53.89 tok/s mean** | +0.81% decode; +0.28% end-to-end |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
 experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
