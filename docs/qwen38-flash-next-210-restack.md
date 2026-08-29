@@ -20,7 +20,7 @@ that remains in the new stack.
 - Reasoning effort: `xhigh`
 - Sampler: temperature 1.0, top-p 0.95, top-k 20, min-p 0
 - Penalties: presence 0 and repetition 1
-- Seed: `20260829`
+- Seeds: `20260829`, `20260830`, and `20260831`
 - N-gram hot-row cache: bounded at 1 GiB
 
 The 29.8 GiB n-gram table stays in a file-backed memory map. Production uses
@@ -29,26 +29,20 @@ decisions use this configuration.
 
 ## Step 1 production boundary
 
-Decode throughput excludes prefill. All runs below generated 1,024 tokens with
-the same output digest, the same 578 / 1,282 MTP acceptance path, 432 verifier
-calls, and zero repair time.
+Decode throughput excludes prefill. Step 0 and Step 1 used the same three
+seeds. Each pair had the same output digest, MTP trajectory, and work counts.
 
-| Result | Decode throughput | End-to-end time | Notes |
-|---|---:|---:|---|
-| Lazy control 1 | 52.89 tok/s | 33.81 s | Unchanged MTPLX 2.10 target sampling |
-| Batched candidate 1 | 53.58 tok/s | 33.59 s | Fixed-M4 target arrays |
-| Batched candidate 2 | 54.20 tok/s | 33.31 s | Fixed-M4 target arrays |
-| Lazy control 2 | 54.02 tok/s | 33.28 s | Unchanged MTPLX 2.10 target sampling |
-| Lazy control mean | **53.46 tok/s** | **33.55 s** | Matched step-0 control |
-| Batched candidate mean | **53.89 tok/s** | **33.45 s** | Retained step 1 |
+| Seed | Step 0 lazy | Step 1 batched | Paired change | Accepted / drafted |
+|---:|---:|---:|---:|---:|
+| `20260829` | 52.27 tok/s | 52.67 tok/s | +0.76% | 578 / 1,282 |
+| `20260830` | 53.43 tok/s | 53.78 tok/s | +0.65% | 555 / 1,220 |
+| `20260831` | 60.57 tok/s | 60.96 tok/s | +0.65% | 535 / 1,057 |
+| Mean | **55.42 tok/s** | **55.80 tok/s** | **+0.68%** | 1,668 / 3,559 total |
+| Median | **53.43 tok/s** | **53.78 tok/s** | **+0.65%** | - |
 
-The batched lane improved decode throughput by 0.81% and reduced end-to-end
-time by 0.28%. Both paired comparisons favored the candidate. The output
-digest, acceptance path, and work counts were identical in all four runs.
-
-Earlier unchanged-control brackets measured 51.29 and 53.29 tok/s mean. The
-53.29 result explicitly set compiled GDN, but MTPLX 2.10 already enables that
-path. It is a baseline observation, not an optimization step.
+Weighted verifier cost fell from 38.04 to 37.64 ms per call. All six runs
+generated exactly 1,024 tokens and had zero repair. Step 1 remains a small but
+repeatable win.
 
 ## Step 2 production boundary
 
@@ -56,25 +50,42 @@ Step 2 installs one construction-bound compiled replay for physical M4 target
 verification. Shorter adaptive windows use the normal Qwen4 family capture
 route. The enabled M4 path does not repeat model checks or fall back silently.
 
-| Run | Decode throughput | Decode time | Verify cost | Accepted / drafted | Verify calls | Repair |
-|---|---:|---:|---:|---:|---:|---:|
-| Fresh step-1 control | 52.38 tok/s | 19.55 s | 37.25 ms/call | 578 / 1,282 | 432 | 0 s |
-| Fixed-M4 candidate 1 | 61.69 tok/s | 16.60 s | 36.82 ms/call | 605 / 1,087 | 371 | 0 s |
-| Fixed-M4 candidate 2 | 73.88 tok/s | 13.86 s | 36.78 ms/call | 659 / 888 | 307 | 0 s |
-| Fixed-M4 candidate 3 | 62.62 tok/s | 16.35 s | 36.88 ms/call | 611 / 1,071 | 365 | 0 s |
-| Candidate mean | **66.06 tok/s** | **15.60 s** | **36.83 ms/call** | 625 / 1,015 mean | 347.7 mean | **0 s** |
-| Candidate median | **62.62 tok/s** | - | - | - | - | **0 s** |
+| Seed | Decode throughput | Accepted / drafted | Verify calls | Repair |
+|---:|---:|---:|---:|---:|
+| `20260829` | 63.03 tok/s | 613 / 1,065 | 364 | 0 s |
+| `20260830` | 67.63 tok/s | 666 / 1,014 | 344 | 0 s |
+| `20260831` | 72.22 tok/s | 603 / 912 | 313 | 0 s |
+| Mean | **67.63 tok/s** | 1,882 / 2,991 total | 340.3 | **0 s** |
+| Median | **67.63 tok/s** | - | - | **0 s** |
+| Range | **63.03-72.22 tok/s** | - | - | **0 s** |
 
-All candidate runs generated exactly 1,024 tokens. Each run traced once and
-had zero fallback and zero repair. Weighted verifier cost fell by 1.13%.
-Mean decode throughput improved by 26.12% against the fresh control and by
-22.58% against the retained step-1 mean.
+All three runs generated exactly 1,024 tokens. Each run traced once and had
+zero fallback and zero repair. Weighted verifier cost was 36.38 ms per call.
+The three-seed Step 2 mean is 21.19% above the Step 1 mean.
 
-The compiled PLE block changes bf16 operation grouping. This can change close
-sampling decisions, so the three candidate runs do not have the same output
-digest or MTP trajectory. The benchmark records every trajectory instead of
-claiming that the full TPS change comes from kernel speed. The stable direct
-execution result is 36.78 to 36.88 ms per verifier call.
+The compiled PLE block changes bf16 operation grouping. Close sampling
+decisions can change, so Step 2 uses aggregate and per-window measurements.
+The earlier retained controls measured 70.87 and 74.93 tok/s. Their 72.90
+tok/s mean remains valid historical evidence; 74.93 is the highest single
+retained observation, not the three-seed mean.
+
+## Rejected scheduling candidate
+
+The lazy stochastic D3 candidate built all three draft depths before one
+terminal device read. It did not improve the three-seed production result.
+
+| Seed | Lazy D3 throughput | Accepted / drafted |
+|---:|---:|---:|
+| `20260829` | 68.39 tok/s | 663 / 976 |
+| `20260830` | 63.76 tok/s | 658 / 1,068 |
+| `20260831` | 62.82 tok/s | 523 / 1,023 |
+| Mean | **64.99 tok/s** | 1,844 / 3,067 total |
+| Median | **63.76 tok/s** | - |
+
+The candidate was 3.90% below the Step 2 mean. Its weighted draft cost was
+2.71 ms per drafted token versus 2.54 ms for Step 2. Its non-verifier cost was
+9.27 ms per window versus 8.25 ms. The larger lazy graph increased host work,
+so this candidate is not retained.
 
 ## Accepted optimization hill climb
 
@@ -84,9 +95,9 @@ against the unchanged prior step.
 
 | Step | Commit | Retained stack | Production evidence | Result |
 |---:|---|---|---:|---|
-| 0 | `4ce96908` | Unchanged MTPLX 2.10 | **53.46 tok/s mean** | Matched production control |
-| 1 | `ffdb8684` | Batch fixed-M4 target distributions | **53.89 tok/s mean** | +0.81% decode; +0.28% end-to-end |
-| 2 | `c5034156` | Construction-bound fixed-M4 compiled verifier | **66.06 tok/s mean; 62.62 median** | +22.58% mean vs step 1; verifier cost -1.13% |
+| 0 | `4ce96908` | Unchanged MTPLX 2.10 | **55.42 tok/s mean; 53.43 median** | Three-seed production control |
+| 1 | `ffdb8684` | Batch fixed-M4 target distributions | **55.80 tok/s mean; 53.78 median** | +0.68% mean with identical paired work |
+| 2 | `c5034156` | Construction-bound fixed-M4 compiled verifier | **67.63 tok/s mean and median** | +21.19% mean vs Step 1; 36.38 ms weighted verify cost |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
 experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
@@ -99,18 +110,19 @@ diagnostic and is not a promotion result.
 
 | Decode measurement | Result |
 |---|---:|
-| Decode wall time | 19.20 s |
-| Metal GPU work | 15.90 s |
-| Metal GPU idle | 3.30 s |
-| GPU use | 82.81% |
-| Idle gaps of at least 10 us | 4,320 gaps / 3.22 s |
-| Largest gap | 8.31 ms |
-| Explicit GPU-drain wait | 0.02 ms |
+| GPU timeline | 17.195 s |
+| Metal GPU work | 13.203 s |
+| Metal GPU idle | 3.992 s |
+| GPU use | 76.78% |
+| One-time M4 compilation gap | 0.753 s |
+| Steady idle after compilation | 3.240 s |
+| Steady GPU use | 80.30% |
+| Explicit GPU-drain wait | 0.025 ms |
 
-The 3.30 seconds consist of many small submission gaps. They are not one long
-wait. If all measured idle time disappeared and GPU work stayed unchanged, the
-ceiling would be 64.42 tok/s. A 90 tok/s result also needs less GPU work or more
-accepted work per verifier cycle.
+The steady idle time contains 2.563 seconds of host-late submission gaps and
+0.677 seconds of encoded or driver-side gaps. These are many small gaps, not
+one long wait. Removing all idle time still requires a separate GPU-compute
+win to reach 90 tok/s.
 
 ## What MTPLX 2.10 already contains
 
