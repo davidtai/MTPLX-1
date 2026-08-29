@@ -843,6 +843,17 @@ def _server_runtime_env_overrides(
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, value)
+        if _served_model_is_qwen4_fixed_m4(args):
+            # Construction-bound fixed-M4 verifier (2026-08-29 production
+            # repeats): one traced replay over the exact Flash-Next geometry.
+            # The config predicate below keeps this off every unmeasured
+            # qwen4_exp layout; explicit operator exports still win.
+            for key in (
+                "MTPLX_COMPILED_VERIFY",
+                "MTPLX_QWEN4_FIXED_M4_VERIFY",
+            ):
+                if os.environ.get(key) is None:
+                    overrides.setdefault(key, "1")
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
@@ -866,6 +877,17 @@ def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
     mt = str(cfg.get("model_type") or "").lower()
     tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
     return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
+
+
+def _served_model_is_qwen4_fixed_m4(args: argparse.Namespace) -> bool:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            config = json.load(fh)
+    except Exception:
+        return False
+    from mtplx.qwen4_fixed_verify import is_qwen4_fixed_verify_config
+
+    return is_qwen4_fixed_verify_config(config)
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:

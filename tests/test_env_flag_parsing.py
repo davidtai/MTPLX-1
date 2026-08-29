@@ -9,6 +9,7 @@ asked about the same spelling and must answer the same thing.
 from __future__ import annotations
 
 import argparse
+import json
 
 import pytest
 
@@ -268,6 +269,63 @@ def test_vetted_verify_strategies_still_skip(strategy: str) -> None:
     args = argparse.Namespace(verify_strategy=strategy, generation_mode="mtp")
     overrides = _server_runtime_env_overrides(args, {"MTPLX_SKIP_VERIFY_SNAPSHOT": "1"})
     assert overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"
+
+
+def test_flash_next_production_geometry_defaults_fixed_m4_verifier(
+    tmp_path, monkeypatch
+) -> None:
+    from mtplx.server.openai import _server_runtime_env_overrides
+
+    model = tmp_path / "flash-next"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": {
+                    "model_type": "qwen4_exp_text",
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 48,
+                    "hc_count": 4,
+                    "hc_lowrank": 320,
+                    "indexer_compress_ratio": 4,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 48,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "ple_layer_ids": [2],
+                    "ngram_size": 3,
+                    "ngram_vocab_size_base": 20_000_000,
+                    "heads_per_ngram": 8,
+                    "ple_embed_dim": 2560,
+                    "ngram_sidecar": True,
+                    "num_experts": 512,
+                    "num_experts_per_tok": 10,
+                    "moe_intermediate_size": 640,
+                    "vocab_size": 248_320,
+                },
+            }
+        )
+    )
+    for key in ("MTPLX_COMPILED_VERIFY", "MTPLX_QWEN4_FIXED_M4_VERIFY"):
+        monkeypatch.delenv(key, raising=False)
+    args = argparse.Namespace(
+        model=str(model),
+        verify_strategy="batched",
+        generation_mode="mtp",
+        scheduler_mode="serial",
+    )
+
+    overrides = _server_runtime_env_overrides(args, {})
+
+    assert overrides["MTPLX_COMPILED_VERIFY"] == "1"
+    assert overrides["MTPLX_QWEN4_FIXED_M4_VERIFY"] == "1"
+
+    config = json.loads((model / "config.json").read_text())
+    config["text_config"]["hidden_size"] = 2048
+    (model / "config.json").write_text(json.dumps(config))
+    overrides = _server_runtime_env_overrides(args, {})
+    assert "MTPLX_QWEN4_FIXED_M4_VERIFY" not in overrides
 
 
 # ---------------------------------------------------------------------------

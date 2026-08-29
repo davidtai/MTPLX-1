@@ -1073,6 +1073,9 @@ def _fuse_gate_up_sanitize(model, out: dict) -> dict:
 _VERIFY_CAPTURE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "qwen4_exp_verify_capture", default=False
 )
+_COMPILED_VERIFY_PLE: contextvars.ContextVar[Optional[mx.array]] = (
+    contextvars.ContextVar("qwen4_exp_compiled_verify_ple", default=None)
+)
 
 
 @contextlib.contextmanager
@@ -1082,6 +1085,15 @@ def verify_capture_scope():
         yield
     finally:
         _VERIFY_CAPTURE.reset(token)
+
+
+@contextlib.contextmanager
+def compiled_verify_ple_scope(embedding: Optional[mx.array]):
+    token = _COMPILED_VERIFY_PLE.set(embedding)
+    try:
+        yield
+    finally:
+        _COMPILED_VERIFY_PLE.reset(token)
 
 
 class QSACache:
@@ -1208,6 +1220,8 @@ class QSAIndexer(nn.Module):
         )
 
     def _extend_pooled(self, cache: QSACache, total: int) -> Optional[mx.array]:
+        if getattr(cache, "fixed_capacity", False):
+            return self._extend_pooled_fixed(cache, total)
         nb_total = total // self.ratio
         nb_old = min(cache.pooled_len, nb_total)
         if nb_total > nb_old:
@@ -1222,6 +1236,44 @@ class QSAIndexer(nn.Module):
         if nb_total == 0:
             return None
         return cache.pooled[:, :nb_total, :]
+
+    def _extend_pooled_fixed(self, cache: QSACache, total) -> mx.array:
+        """Update only newly completed blocks in a fixed QSA bank.
+
+        Verify width is static at trace time.  At the production M4/ratio-4
+        shape at most one block completes, so this is one gather, one pooled
+        projection, and one conditional fixed-shape slice update.
+        """
+        step_rows = int(getattr(cache, "_last_write_rows", 1))
+        nb_old = cache.offset // self.ratio
+        nb_total = total // self.ratio
+        max_new = max(1, (step_rows + self.ratio - 1) // self.ratio)
+        pooled = cache.pooled
+        pooled_capacity = int(pooled.shape[1])
+        for rel in range(max_new):
+            block = nb_old + rel
+            safe_block = mx.minimum(
+                block, mx.array(pooled_capacity - 1, dtype=block.dtype)
+            )
+            start = safe_block * self.ratio
+            fresh = mx.slice(
+                cache.raw_keys,
+                start,
+                axes=(1,),
+                slice_size=(1, self.ratio, self.head_dim),
+            )
+            fresh = fresh.reshape(1, 1, self.ratio, self.head_dim)
+            candidate = mx.mean(fresh.astype(mx.float32), axis=2).astype(fresh.dtype)
+            candidate = self.k_layernorm(candidate)
+            starts = safe_block.reshape(1).astype(mx.int32) * self.ratio
+            cos, sin = _rope_cos_sin(starts, self._inv_freq)
+            candidate = _apply_partial_rope(
+                candidate[:, :, None, :], cos, sin
+            )[:, :, 0, :]
+            updated = mx.slice_update(pooled, candidate, safe_block, axes=(1,))
+            pooled = mx.where(nb_total > block, updated, pooled)
+        cache.pooled = pooled
+        return pooled
 
     def __call__(
         self,
@@ -1240,11 +1292,13 @@ class QSAIndexer(nn.Module):
         q = q.reshape(B, S, self.n_heads, self.head_dim)
         k = k.reshape(B, S, self.head_dim)
         q = self.q_layernorm(q)
-        positions = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
+        positions = pos_start + mx.arange(S, dtype=mx.int32)
         cos, sin = _rope_cos_sin(positions, self._inv_freq)
         q = _apply_partial_rope(q, cos, sin)
 
         cache.write_raw(k)
+        if getattr(cache, "fixed_capacity", False):
+            cache._last_write_rows = int(S)
         T = pos_start + S  # == the KV length after this forward's update
         pooled = self._extend_pooled(cache, T)
         nb_total = 0 if pooled is None else pooled.shape[1]
@@ -1252,7 +1306,7 @@ class QSAIndexer(nn.Module):
         # Per-query complete-block counts. If every visible prefix fits inside
         # the budget the selection is the full causal mask — skip the work.
         last_nb = (pos_start + S) // self.ratio
-        if last_nb <= self.block_topk:
+        if not getattr(cache, "fixed_capacity", False) and last_nb <= self.block_topk:
             return None  # dense == sparse in this regime
 
         pooled_t = mx.swapaxes(pooled.astype(mx.float32), 1, 2)[:, None]  # [1,1,D,nb]
@@ -1260,7 +1314,7 @@ class QSAIndexer(nn.Module):
         scores = mx.maximum(scores, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
         scores = scores[0]  # [S, nb]
 
-        qpos = mx.arange(pos_start, pos_start + S, dtype=mx.int32)  # abs position
+        qpos = pos_start + mx.arange(S, dtype=mx.int32)  # abs position
         nb_q = (qpos + 1) // self.ratio  # complete blocks visible per query [S]
         blk = mx.arange(nb_total, dtype=mx.int32)
         valid = blk[None, :] < nb_q[:, None]  # [S, nb]
@@ -1280,7 +1334,11 @@ class QSAIndexer(nn.Module):
         )
         selected = selected & valid  # -inf padding rows never select
 
-        if S == 1 and _qsa_flash_enabled():
+        if (
+            S == 1
+            and not getattr(cache, "fixed_capacity", False)
+            and _qsa_flash_enabled()
+        ):
             # Flash-skip lane (MTPLX_QSA_FLASH): hand attention the sorted
             # selected BLOCK ids + host-side tail bounds; the block-sparse
             # flash kernel iterates exactly that visible set in place — no
@@ -1291,7 +1349,11 @@ class QSAIndexer(nn.Module):
             tail_start = ((pos_start + 1) // self.ratio) * self.ratio
             return ("flash", blk_idx, tail_start)
 
-        if S == 1 and _qsa_gather_decode_enabled():
+        if (
+            S == 1
+            and not getattr(cache, "fixed_capacity", False)
+            and _qsa_gather_decode_enabled()
+        ):
             # Decode gather lane (MTPLX_QSA_GATHER_DECODE, dormant opt-in —
             # FALSIFIED d6171d2c, clean A/B/A -5.25% at 22.9k, so the
             # rows-gather family default must never arm it): return the
@@ -1312,12 +1374,17 @@ class QSAIndexer(nn.Module):
             tail_ids = mx.arange(tail_start, T, dtype=mx.int32)
             return mx.concatenate([tok_from_blocks, tail_ids])
 
-        if (
-            S > 1
-            and _qsa_gather_enabled()
-            and S <= _qsa_gather_max_rows()
-            and T >= _qsa_gather_min_context()
-        ):
+        fixed_capacity = bool(getattr(cache, "fixed_capacity", False))
+        rows_gather = (
+            bool(getattr(cache, "fixed_rows_gather", False))
+            if fixed_capacity
+            else (
+                _qsa_gather_enabled()
+                and S <= _qsa_gather_max_rows()
+                and T >= _qsa_gather_min_context()
+            )
+        )
+        if S > 1 and rows_gather:
             # Rows-gather lane (MTPLX_QSA_GATHER at S>1), adapting the
             # per-query gather + GQA-broadcast attention from community PR
             # #380 by @maceip. Every S>1 forward previously staged a dense
@@ -1348,10 +1415,15 @@ class QSAIndexer(nn.Module):
 
         # Blocks -> tokens, plus the visible tail, intersected with causal.
         tok_sel = mx.repeat(selected, self.ratio, axis=1)  # [S, nb*ratio]
-        if nb_total * self.ratio < T:
+        if not getattr(cache, "fixed_capacity", False) and nb_total * self.ratio < T:
             pad = mx.zeros((S, T - nb_total * self.ratio), dtype=mx.bool_)
             tok_sel = mx.concatenate([tok_sel, pad], axis=1)
-        tpos = mx.arange(T, dtype=mx.int32)
+        mask_width = (
+            int(cache.raw_keys.shape[1])
+            if getattr(cache, "fixed_capacity", False)
+            else T
+        )
+        tpos = mx.arange(mask_width, dtype=mx.int32)
         tail = tpos[None, :] >= (nb_q[:, None] * self.ratio)
         causal = tpos[None, :] <= qpos[:, None]
         mask = (tok_sel | tail) & causal  # [S, T]
@@ -1480,7 +1552,7 @@ class Attention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-        positions = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
+        positions = pos_start + mx.arange(S, dtype=mx.int32)
         cos, sin = _rope_cos_sin(positions, self._inv_freq)
         q = _apply_partial_rope(q, cos, sin)
         k = _apply_partial_rope(k, cos, sin)
@@ -1533,7 +1605,7 @@ class Attention(nn.Module):
         elif sel_mask is not None:
             mask = sel_mask
         elif S > 1:
-            qpos = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
+            qpos = pos_start + mx.arange(S, dtype=mx.int32)
             tpos = mx.arange(T, dtype=mx.int32)
             mask = (tpos[None, :] <= qpos[:, None])[None, None]
         else:
@@ -2006,6 +2078,21 @@ class NGramEmbedding(nn.Module):
             self._staged = None
 
     def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache], state_idx: int):
+        compiled = _COMPILED_VERIFY_PLE.get()
+        if compiled is not None:
+            ids = input_ids.astype(mx.int64)
+            B, _S = ids.shape
+            if cache is not None and cache[state_idx] is not None:
+                prev = cache[state_idx]
+            else:
+                prev = mx.full(
+                    (B, self.context_len), self.eos_id, dtype=mx.int64
+                )
+            if cache is not None:
+                cache[state_idx] = mx.concatenate([prev, ids], axis=1)[
+                    :, -self.context_len :
+                ]
+            return compiled
         staged = getattr(self, "_staged", None)
         if staged is not None:
             self._staged = None
@@ -2211,7 +2298,7 @@ class Qwen4ExpTextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
-        if self._ple_stage_idx is not None:
+        if self._ple_stage_idx is not None and _COMPILED_VERIFY_PLE.get() is None:
             ple = self.layers[self._ple_stage_idx].ple
             ple.ple_embedding.stage(inputs, cache[self._ple_stage_idx], ple.NGRAM_IDX)
         h = mx.tile(h, (1, 1, self.args.hc_count))
