@@ -27,10 +27,12 @@ optimizations.
 
 ## Benchmark history
 
-The n-gram table is a 29.8 GiB file-backed mmap in every arm. `hot 1 GiB`
-adds the MTPLX 2.10 default `OrderedDict` row cache on top; `mmap only` does
-not add a second cache. The A/B/A runs used the same prompt, seed, output,
-acceptance trajectory, and 432 verify calls. Repair time was zero throughout.
+The n-gram table is a 29.8 GiB file-backed mmap in every arm. Mapping the file
+does not make 29.8 GiB resident: rows are faulted on demand and file-backed
+pages remain reclaimable by macOS. `hot 1 GiB` adds the bounded MTPLX 2.10
+`OrderedDict` row cache on top; `mmap only` does not add that second cache.
+The A/B/A runs used the same prompt, seed, output, acceptance trajectory, and
+432 verify calls. Repair time was zero throughout.
 
 | Arm | Decode tok/s | End-to-end wall | Accepted / drafted | Result |
 |---|---:|---:|---:|---|
@@ -65,8 +67,10 @@ mtplx serve \
 
 This resolves to Turbo, native MTP depth 3, batched verification, xhigh
 reasoning, and the pack's temperature-1 sampler. The complete 29.8 GiB n-gram
-table stays file-backed through mmap. This branch leaves the 2.10 cache
-defaults unchanged.
+table stays file-backed through mmap rather than consuming 29.8 GiB of
+resident RAM. The production 1 GiB hot-row cache remains bounded on top. Full
+table residency engages only on machines with at least 160 GiB RAM or with
+`MTPLX_NGRAM_RESIDENT=1`. This branch leaves the 2.10 cache defaults unchanged.
 
 ## What was already in 2.10
 
