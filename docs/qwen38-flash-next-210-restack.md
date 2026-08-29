@@ -40,21 +40,20 @@ The A/B/A runs used the same prompt, seed, output, acceptance trajectory, and
 | mmap only | **52.4803** | **33.0354 s** | 578 / 1,282 | diagnostic |
 | 2.10 hot 1 GiB r2 | 51.5451 | 34.6328 s | 578 / 1,282 | control |
 | hot 1 GiB mean | 51.2858 | 34.5321 s | 578 / 1,282 | control mean |
-| compiled GDN r1 | 52.7290 | 34.2076 s | 578 / 1,282 | candidate |
-| compiled GDN r2 | 53.8600 | 33.3559 s | 578 / 1,282 | candidate |
-| compiled GDN mean | **53.2945** | **33.7817 s** | 578 / 1,282 | repeatable win |
+| explicit compiled-GDN r1 | 52.7290 | 34.2076 s | 578 / 1,282 | duplicate control |
+| explicit compiled-GDN r2 | 53.8600 | 33.3559 s | 578 / 1,282 | duplicate control |
+| explicit compiled-GDN mean | 53.2945 | 33.7817 s | 578 / 1,282 | duplicate control mean |
 
 Mmap-only measured 2.33% higher decode throughput than the bracketed 1 GiB
 mean and 4.33% lower wall time. This is diagnostic evidence only: the branch
 does not alter MTPLX 2.10's n-gram table or cache behavior.
 
-MTPLX 2.10's existing `MTPLX_COMPILED_GDN=1` lane supports the official
-path's S1 autoregressive and S4 physical verifier shapes. Its two production
-runs averaged 3.92% higher decode throughput and 2.17% lower wall time than
-the bracketed control, with the same output hash, acceptance trajectory, and
-zero repair time. This is a retained candidate while construction-bound
-installation and focused parity coverage are prepared; the environment flag
-is not being made a new global default.
+The later construction-path audit found that MTPLX 2.10 already sets
+`MTPLX_COMPILED_GDN=1` for `qwen4_exp`; the explicit launch therefore
+duplicated the control. Its two-run 3.92% sample difference is machine/run
+variance, not an optimization result. The health profile's static `env`
+mapping does not include these model-specific runtime overrides, so effective
+construction routes must be audited from `_server_runtime_env_overrides`.
 
 Temperature-zero short-prompt results are vanity measurements only and must
 not be used to accept an optimization.
@@ -100,15 +99,14 @@ requires about a 28.4% reduction in GPU work after the scheduling gaps are
 removed, through verifier/kernel work reduction and/or better accepted work per
 round.
 
-The compiled-GDN profiler capture did not reduce this starvation budget. GPU
-idle was 3.3337 s versus 3.3003 s for control, gaps of at least 10 us totaled
-3.2189 s versus 3.2239 s, and the host-commit-late portion was 2.6184 s versus
-2.6561 s. It issued 93,473 command buffers versus 94,047 with essentially the
-same operation count. The instrumented lane ran at 50.4397 tok/s and is
-therefore strongly perturbed relative to its two uninstrumented wins; that
-profiler throughput is not promotion evidence. The useful conclusion is
-narrower: compiled GDN improves production throughput but does not remove the
-distributed CPU-to-GPU gaps, so scheduling remains a separate target.
+A second control profiler capture with `MTPLX_COMPILED_GDN=1` explicitly set
+left the starvation budget effectively unchanged. GPU idle was 3.3337 s
+versus 3.3003 s, gaps of at least 10 us totaled 3.2189 s versus 3.2239 s, and
+the host-commit-late portion was 2.6184 s versus 2.6561 s. It issued 93,473
+command buffers versus 94,047 with essentially the same operation count. Its
+instrumented throughput was 50.4397 tok/s; the difference between two
+equivalent controls confirms that profiler throughput itself is not promotion
+evidence. Scheduling remains a separate target.
 
 ## Use it
 
@@ -143,9 +141,9 @@ restacking:
 |---|---|---|
 | QSA/cache ownership | Pooled keys, selected-row attention, corrected row-major gather, and prefix trim/commit are already present | Do not duplicate |
 | Attention projections | Official QKV fusion is already present; the old fixed-M2 quantized hyper kernels require storage this artifact does not have | Do not transplant |
-| Generation scheduling | Old resident-loader and M2-only target-array changes do not reach D3/M4; queue-first async was previously measured slower | Reject |
+| Generation scheduling | AR pipelining and compiled contiguous GDN runs are already construction defaults; old resident-loader and M2-only target-array changes do not reach D3/M4; queue-first async was previously measured slower | Do not duplicate |
 | MoE | 2.10 already fuses gate/up in 96 modules; the old whole-MoE lane requires dense-BF16 router plus q8/g128 shared projections, while this pack is q8/g64 | Incompatible |
-| GDN | Fused input projection is already installed on 36 layers; norm/scale/sigmoid epilogue is not fused | Re-derive for BF16/M4 first |
+| GDN | Fused input projection, compiled contiguous runs, the S1 one-dispatch GDN step, and S2-S6 conv/norm verify rows are already construction defaults | Re-derive only the remaining verify epilogue/output boundary |
 | Hyper boundary | No equivalent fuses the attention residual write with the following grouped RMSNorm | Re-derive for BF16/M4 second |
 
 Nothing is transplanted by commit name or old geometry.
