@@ -91,6 +91,29 @@ def _lazy_snapshot_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
+def _snapshot_settle_enabled() -> bool:
+    """Idle-lane owner-copy settling of the lazy snapshot after a put.
+
+    Motivation: every unevaluated snapshot view holds a reference to a
+    live cache buffer, blocking donation, so the next turn's first write
+    pays a full COW divergence copy (measured: first slice_update with an
+    alias alive = 66 ms/GB + doubled memory; plain mx.eval of a
+    full-range view ALIASES and releases nothing, so only owner copies
+    decouple).
+
+    DEFAULT OFF — falsified as a default by the 2026-08-30 phase-3 A/B
+    (settle_on/settle_off x2, warm 91K turns): stall magnitude is
+    dominated by idle-lane/SSD scheduling nondeterminism (the next
+    request queues behind multi-GB cold encodes), and adding the settle
+    copy to that lane produced the worst observed stall (27.6 s) instead
+    of removing the class. Kept as an opt-in instrument; the structural
+    fix for the stall class is the #391-style fixed-capacity banks (no
+    per-turn multi-GB snapshot at all) plus a preemptible idle lane.
+    """
+    raw = str(os.environ.get("MTPLX_SESSION_SNAPSHOT_SETTLE", "0")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 def _near_prefix_tiny_gap_limit() -> int:
     """Token gap treated as tokenizer-boundary drift (long-shipped tolerance)."""
     raw = os.environ.get("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP")
@@ -277,6 +300,11 @@ class SessionBankEntry:
     # entries with the SAME token hash, and an old entry finishing its
     # encode must never report a newer lazy replacement as settled.
     cold_encode_completed_at: float | None = None
+    # Monotonic time the idle-lane settle evaluated this entry's lazy
+    # snapshot views (releasing their references to live cache buffers so
+    # the next turn's writes can donate), or None. Same exact-object
+    # contract as cold_encode_completed_at.
+    snapshot_settled_at: float | None = None
     created_at_s: float = field(default_factory=time.time)
     last_access_s: float = field(default_factory=time.time)
     hits: int = 0
@@ -836,6 +864,8 @@ class SessionBank:
         )
         if timing_out is not None:
             timing_out["entry_build_s"] = time.perf_counter() - trunk_snapshot_done
+        if lazy_kv:
+            self._schedule_snapshot_settle(entry, timing_out=timing_out)
         self._enqueue_cold_entry(entry, timing_out=timing_out)
         self._entries[tokens] = entry
         self._supersede_contained_prefixes(tokens)
@@ -1688,6 +1718,105 @@ class SessionBank:
             ],
             "eviction_log": list(self.eviction_log)[-16:],
         }
+
+    def _schedule_snapshot_settle(
+        self,
+        entry: SessionBankEntry,
+        timing_out: dict[str, Any] | None = None,
+    ) -> None:
+        """Materialize the entry's lazy snapshot views off the request tail.
+
+        Runs on the same model-owner idle lane as the cold encode, dispatched
+        FIRST so the views settle before the (much heavier, coalesced) SSD
+        serialize touches them. No dispatch lane means no settle — the lazy
+        contract stays exactly as before rather than paying a synchronous
+        eval on the response tail. Per-array evals keep any foreground
+        request that lands mid-settle waiting at most one array (~10 ms),
+        not the whole snapshot.
+        """
+        if entry.live_ref_only or not _snapshot_settle_enabled():
+            return
+        dispatch = self.cold_enqueue_dispatch
+        if dispatch is None:
+            if timing_out is not None:
+                timing_out["snapshot_settle"] = {"dispatched": False}
+            return
+
+        def _settle_job() -> None:
+            # Plain mx.eval of a full-range lazy view ALIASES the source
+            # buffer (measured 2026-08-30: eval(base[...]) allocates
+            # nothing, and mx.contiguous no-ops on already-contiguous
+            # inputs), so the donation-blocking reference survives eval.
+            # Only an owner copy (metal_copy_leaf) actually decouples the
+            # snapshot from the live buffers; each leaf is copied and
+            # evaluated individually so a foreground request that lands
+            # mid-settle waits at most one leaf.
+            try:
+                from mtplx.kernels.copy_leaf import metal_copy_leaf
+
+                def _own(value: Any) -> Any:
+                    if value is None:
+                        return None
+                    if isinstance(value, CacheSnapshot):
+                        return CacheSnapshot(
+                            states=_own(value.states),
+                            meta_states=_own(value.meta_states),
+                        )
+                    if isinstance(value, mx.array):
+                        owned = metal_copy_leaf(value)
+                        mx.eval(owned)
+                        return owned
+                    if isinstance(value, tuple):
+                        return tuple(_own(item) for item in value)
+                    if isinstance(value, list):
+                        return [_own(item) for item in value]
+                    if isinstance(value, dict):
+                        return {key: _own(item) for key, item in value.items()}
+                    return value
+
+                # Field-at-a-time rebinding: every intermediate state is
+                # valid (same values, different buffers), so a concurrent
+                # restore reading the entry mid-settle stays correct.
+                entry.cache_snapshot = _own(entry.cache_snapshot)
+                entry.mtp_history_snapshot = _own(entry.mtp_history_snapshot)
+                entry.logits = _own(entry.logits)
+                entry.hidden = _own(entry.hidden)
+                entry.snapshot_settled_at = time.monotonic()
+            except Exception as exc:
+                self.eviction_log.append(
+                    {
+                        "reason": "snapshot_settle_error",
+                        "session_id": entry.session_id,
+                        "prefix_len": entry.prefix_len,
+                        "token_hash": entry.token_hash,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+        job = _settle_job
+        # Newest-wins per session: settling a superseded entry's snapshot
+        # is pure waste, and the key namespace is disjoint from the SSD
+        # encode's so a settle never coalesces away a persist (or vice
+        # versa).
+        job.coalesce_key = (
+            f"snapshot_settle:{entry.session_id}"
+            if entry.session_id
+            else f"snapshot_settle:hash:{entry.token_hash}"
+        )
+        try:
+            dispatch(job)
+            if timing_out is not None:
+                timing_out["snapshot_settle"] = {"dispatched": True}
+        except BaseException as exc:
+            self.eviction_log.append(
+                {
+                    "reason": "snapshot_settle_dispatch_error",
+                    "session_id": entry.session_id,
+                    "prefix_len": entry.prefix_len,
+                    "token_hash": entry.token_hash,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
 
     def _enqueue_cold_entry(
         self,

@@ -1877,6 +1877,34 @@ def _set_metal_memory_limit(mx: Any, name: str, value: int) -> str:
     raise AttributeError(f"MLX memory cap API {name} is unavailable")
 
 
+def _metal_system_reserve_bytes(total_ram_bytes: int) -> int:
+    """Unwired headroom macOS keeps outside the allocator caps.
+
+    16 GiB is right on 128 GB+ machines, but as a flat constant it
+    refused the 96 GB class by exactly the release notes' own margin
+    (issue #400: 77.3 GiB weights + 6 GiB floor margin + 16 GiB = 99.3
+    > 96, while the same pack ships healthy there with ~16 GiB left
+    unwired). Scale to RAM/8 below 128 GB, floored at 8 GiB — macOS's
+    own practical working floor — and keep 128 GB+ behavior unchanged.
+    """
+    return int(min(16 * 1024**3, max(8 * 1024**3, total_ram_bytes // 8)))
+
+
+def _resident_floor_margin_bytes(total_ram_bytes: int | None) -> int:
+    """Working margin above the weight files inside the wired floor
+    (allocator transients, KV pages, MTP sidecar churn).
+
+    6 GiB carries the 2026-08-27 128 GB receipt (n-gram eviction
+    collapse fix) and stays untouched at 112 GB+. Smaller machines run
+    proportionally smaller working sets and cannot afford the flat
+    constant: issue #400's 96 GB M2 Max receipt ships healthy at +2
+    GiB, so scale to RAM/32 with a 2 GiB floor below 112 GB.
+    """
+    if not total_ram_bytes or total_ram_bytes >= 112 * 1024**3:
+        return 6 * 1024**3
+    return int(max(2 * 1024**3, total_ram_bytes // 32))
+
+
 def _apply_metal_memory_caps(
     *,
     mx_module: Any | None = None,
@@ -1941,20 +1969,17 @@ def _apply_metal_memory_caps(
             160 * 1024**3,
         )
     resident_floor = max(0, int(minimum_resident_bytes or 0))
-    if (
-        resident_floor
-        and total_ram is not None
-        and total_ram > 0
-        and resident_floor + 16 * 1024**3 > total_ram
-    ):
-        return {
-            "applied": False,
-            "reason": "insufficient_ram",
-            "total_ram_bytes": total_ram,
-            "total_ram_source": total_ram_source,
-            "minimum_resident_bytes": resident_floor,
-            "minimum_system_reserve_bytes": 16 * 1024**3,
-        }
+    if resident_floor and total_ram is not None and total_ram > 0:
+        system_reserve = _metal_system_reserve_bytes(total_ram)
+        if resident_floor + system_reserve > total_ram:
+            return {
+                "applied": False,
+                "reason": "insufficient_ram",
+                "total_ram_bytes": total_ram,
+                "total_ram_source": total_ram_source,
+                "minimum_resident_bytes": resident_floor,
+                "minimum_system_reserve_bytes": system_reserve,
+            }
     mem_limit = _parse_metal_memory_size_bytes(mem_raw, default_mem)
     wired_limit = _parse_metal_memory_size_bytes(wired_raw, default_wired)
     if resident_floor:
@@ -2340,7 +2365,10 @@ class ServerState:
                 if table_f.exists() and ngram_table_resident_policy():
                     floor += table_f.stat().st_size
                 if floor:
-                    minimum_resident_bytes = floor + 6 * 1024**3
+                    ram_bytes, _ = _detect_total_ram_bytes_for_metal_caps()
+                    minimum_resident_bytes = floor + _resident_floor_margin_bytes(
+                        ram_bytes
+                    )
                     resident_floor_label = "Qwen3.8-Flash-Next"
             except OSError:
                 minimum_resident_bytes = None
@@ -2354,10 +2382,17 @@ class ServerState:
             required_gib = (
                 int(self.metal_memory_caps.get("minimum_resident_bytes") or 0) / 1024**3
             )
+            reserve_gib = (
+                int(
+                    self.metal_memory_caps.get("minimum_system_reserve_bytes")
+                    or 16 * 1024**3
+                )
+                / 1024**3
+            )
             raise RuntimeError(
                 f"{resident_floor_label} cannot load inside the available Metal memory "
                 f"budget; at least {required_gib:.1f} GiB resident plus "
-                "16 GiB system headroom is required"
+                f"{reserve_gib:.0f} GiB system headroom is required"
             )
         _validate_backend_context_memory_budget(
             startup_backend,
@@ -2666,20 +2701,20 @@ class ServerState:
             )
         except (TypeError, ValueError):
             _plan_kv_bytes_per_token = 0
+        _plan_model_path = getattr(self.runtime, "model_path", None)
+        _plan_model_config: dict[str, Any] | None = None
+        if _plan_model_path is not None:
+            try:
+                _plan_model_config = json.loads(
+                    (Path(_plan_model_path) / "config.json").read_text()
+                )
+            except (OSError, ValueError):
+                _plan_model_config = None
         if _plan_kv_bytes_per_token <= 0:
             from mtplx.memory_plan import (
                 dense_kv_bytes_per_token_from_config as _plan_kv_from_config,
             )
 
-            _plan_model_path = getattr(self.runtime, "model_path", None)
-            _plan_model_config: dict[str, Any] | None = None
-            if _plan_model_path is not None:
-                try:
-                    _plan_model_config = json.loads(
-                        (Path(_plan_model_path) / "config.json").read_text()
-                    )
-                except (OSError, ValueError):
-                    _plan_model_config = None
             _plan_kv_bytes_per_token = (
                 _plan_kv_from_config(_plan_model_config) or 65536
             )
@@ -2689,6 +2724,31 @@ class ServerState:
             _cap_value = _caps.get("memory_limit_bytes")
             if isinstance(_cap_value, int) and _cap_value > 0:
                 _plan_metal_limit = _cap_value
+        from mtplx.memory_plan import (
+            qsa_aux_bytes_per_token_from_config as _plan_aux_from_config,
+        )
+        from mtplx.memory_plan import (
+            qsa_prefill_transient_bytes_per_token_from_config as _plan_transient_from_config,
+        )
+
+        # The context-linear transient prices the DENSE indexer lane's
+        # [S, T] mask/score chain. When the sparse prefill lane will serve
+        # this process (auto on NAX machines, or explicitly armed), those
+        # transients are crossover-bounded and the honest per-token term is
+        # zero — measured: 262K cold prefill peaked at 87.4 GB on a 128 GiB
+        # M5 Max (weights 77.3 + KV 6.4 + aux + flat reserve), against the
+        # dense-priced ~115 GB that #393 observed wedging the machine.
+        _plan_transient_per_token = _plan_transient_from_config(_plan_model_config)
+        if _plan_transient_per_token:
+            try:
+                from mtplx.models.qwen4_exp import (
+                    _qsa_prefill_enabled as _qsa_prefill_lane_resolved,
+                )
+
+                if _qsa_prefill_lane_resolved():
+                    _plan_transient_per_token = 0
+            except Exception:
+                pass
         _plan_inputs: dict[str, Any] = {
             "total_ram_bytes": _plan_detect_total_ram(),
             "model_weights_bytes": _plan_weights_bytes,
@@ -2698,6 +2758,12 @@ class ServerState:
             "model_max_context": int(self.model_context_window_max),
             "memory_budget_bytes": self.memory_budget_bytes,
             "usable_bytes_override": _plan_metal_limit,
+            # Family terms the KV number misses (QSA streams + MTP-head KV,
+            # and the context-linear QSA prefill transient) — issue #393:
+            # without them a 262K window was admitted on 128 GB with 2.4x
+            # phantom headroom and died at 119 GB with no 507.
+            "aux_bytes_per_token": _plan_aux_from_config(_plan_model_config),
+            "prefill_transient_bytes_per_token": _plan_transient_per_token,
         }
         _fit_plan = _plan_memory(**_plan_inputs)
         _machine_fit = (
@@ -4194,7 +4260,9 @@ def _expand_image_pads(
 # this, each turn re-preprocesses and re-forwards the tower for pixels that
 # cannot have changed. Row-budgeted LRU: ~28 MB per 2.7k-token screenshot at
 # 5120 bf16, so the 32k-row default caps at ~340 MB.
-_VISION_EMBED_CACHE: "OrderedDict[tuple[str, int], tuple[Any, int]]" = OrderedDict()
+_VISION_EMBED_CACHE: (
+    "OrderedDict[tuple[str, int], tuple[Any, int, tuple[int, int, int]]]"
+) = OrderedDict()
 _VISION_EMBED_CACHE_MAX_ROWS = 32768
 
 
@@ -4230,8 +4298,8 @@ def _image_content_digest(raw: bytes) -> int:
 
 def _vision_rows_for_image(
     state: Any, model_dir: Any, preprocessor_config: dict, raw: bytes, digest: int
-) -> tuple[Any, int]:
-    """Embedding rows + pad count for one image, via the digest LRU."""
+) -> tuple[Any, int, tuple[int, int, int]]:
+    """Embedding rows, pad count and (t, h, w) grid for one image (digest LRU)."""
 
     from mtplx.vision import load_vision_tower
     from mtplx.vision.processing import (
@@ -4248,20 +4316,21 @@ def _vision_rows_for_image(
             return hit
     pixel_values, grids = preprocess_images([decode_image(raw)], preprocessor_config)
     pad_count = image_pad_token_count(grids[0])
+    grid = tuple(int(x) for x in grids[0])
     tower = load_vision_tower(str(model_dir))
     rows, _deepstack = tower(pixel_values, grids)
     import mlx.core as _mx
 
     _mx.eval(rows)
     if _vision_embed_cache_enabled():
-        _VISION_EMBED_CACHE[cache_key] = (rows, pad_count)
+        _VISION_EMBED_CACHE[cache_key] = (rows, pad_count, grid)
         cached_rows = sum(entry[1] for entry in _VISION_EMBED_CACHE.values())
         while (
             cached_rows > _VISION_EMBED_CACHE_MAX_ROWS and len(_VISION_EMBED_CACHE) > 1
         ):
             _, evicted = _VISION_EMBED_CACHE.popitem(last=False)
             cached_rows -= evicted[1]
-    return rows, pad_count
+    return rows, pad_count, grid
 
 
 def _materialize_vision_splice(
@@ -4284,14 +4353,16 @@ def _materialize_vision_splice(
     digests: list[int] = []
     row_blocks: list[Any] = []
     pad_counts: list[int] = []
+    grids: list[tuple[int, int, int]] = []
     for raw in images:
         digest = _image_content_digest(raw)
-        rows, pad_count = _vision_rows_for_image(
+        rows, pad_count, grid = _vision_rows_for_image(
             state, model_dir, preprocessor_config, raw, digest
         )
         digests.append(digest)
         row_blocks.append(rows)
         pad_counts.append(pad_count)
+        grids.append(grid)
     expanded_ids = _expand_image_pads(
         prompt_ids,
         image_pad_id=int(spec.image_token_id),
@@ -4305,11 +4376,36 @@ def _materialize_vision_splice(
     # Materialize before handing off: the generation worker runs on a
     # different thread, and a pending lazy graph must not cross it.
     _mx.eval(embeddings)
+
+    # M-RoPE table for families that rope image tokens at grid positions.
+    # Pure function of (expanded ids, grids) — recomputed per request, never
+    # persisted in cache state. A None result (video pads, layout mismatch)
+    # falls back to plain sequential rope rather than a wrong table.
+    mrope_table = None
+    mrope_delta = 0
+    if spec.mrope_section and spec.model_type == "qwen4_exp":
+        from mtplx.vision.mrope import build_mrope_positions
+
+        built = build_mrope_positions(
+            expanded_ids,
+            image_token_id=int(spec.image_token_id),
+            image_grids=grids,
+            spatial_merge_size=int(spec.spatial_merge_size),
+            video_token_id=int(spec.video_token_id),
+        )
+        if built is not None:
+            table_np, mrope_delta = built
+            mrope_table = _mx.array(table_np)
+            _mx.eval(mrope_table)
+
     return expanded_ids, VisionSplice(
         image_pad_token_id=int(spec.image_token_id),
         embeddings=embeddings,
         image_digests=tuple(digests),
         pad_counts=tuple(pad_counts),
+        image_grids=tuple(grids),
+        mrope_table=mrope_table,
+        mrope_delta=mrope_delta,
     )
 
 
@@ -16366,6 +16462,60 @@ def _engine_busy_signal(state: "ServerState") -> bool:
     return False
 
 
+# Sustained-critical prefill abort (#393): this many consecutive guard ticks
+# (~30 s at the 10 s interval) at CRITICAL with the engine busy. One tick is
+# routinely survivable — the trim frees bank/retrieval weight and the
+# allocator recovers — but a deep prefill re-grows the footprint faster than
+# anything can be shed, and macOS compresses/swaps for minutes before any
+# Metal allocation error (the only prior 507 trigger) would ever fire.
+# Sustained critical means the shedding already ran and lost.
+_PRESSURE_ABORT_TICKS = 3
+
+
+def _pressure_abort_requested(state: "ServerState") -> bool:
+    """True while the guard loop has armed the sustained-pressure abort."""
+    event = getattr(state, "pressure_abort_event", None)
+    return bool(event is not None and event.is_set())
+
+
+def _note_critical_pressure_tick(
+    state: "ServerState", level: int, busy: bool, streak: int
+) -> int:
+    """One guard-loop tick of the sustained-critical tracker; returns streak.
+
+    Arms ``state.pressure_abort_event`` after ``_PRESSURE_ABORT_TICKS``
+    consecutive CRITICAL ticks with the engine busy — an idle engine cannot
+    be the cause, and aborting nothing frees nothing. Any tick that is
+    sub-critical or idle disarms and resets: the abort must never linger
+    past recovery and kill a healthy later request.
+    """
+    if level >= 4 and busy:
+        streak += 1
+        if streak >= _PRESSURE_ABORT_TICKS and not _pressure_abort_requested(
+            state
+        ):
+            event = getattr(state, "pressure_abort_event", None)
+            if event is None:
+                event = threading.Event()
+                state.pressure_abort_event = event
+            event.set()
+            _record_guard_event(
+                state,
+                {
+                    "action": "pressure_abort_armed",
+                    "level": int(level),
+                    "streak": int(streak),
+                },
+            )
+        return streak
+    if _pressure_abort_requested(state):
+        state.pressure_abort_event.clear()
+        _record_guard_event(
+            state, {"action": "pressure_abort_cleared", "level": int(level)}
+        )
+    return 0
+
+
 class _MemoryPressureGuard:
     """Decision core for :func:`_memory_pressure_loop` (testable sans asyncio).
 
@@ -16491,6 +16641,7 @@ async def _memory_pressure_loop(
     """
 
     guard = _MemoryPressureGuard()
+    abort_streak = 0
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
@@ -16561,6 +16712,16 @@ async def _memory_pressure_loop(
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
+            # The guard's own busy is deliberately not computed at CRITICAL
+            # (CRITICAL trims never defer); the abort tracker needs it there.
+            critical_busy = (
+                await asyncio.to_thread(_engine_busy_signal, state)
+                if level >= 4
+                else False
+            )
+            abort_streak = _note_critical_pressure_tick(
+                state, level, critical_busy, abort_streak
+            )
             deferred_s = guard.deferred_for_s(time.monotonic())
             if guard.decide(level, time.monotonic(), busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
@@ -19711,15 +19872,22 @@ def _schedule_idle_postcommit_snapshot(
     def _postcommit_abort_reason() -> str:
         if _stale_session_revision():
             return "stale_session_revision"
+        if _pressure_abort_requested(state):
+            return "memory_pressure_critical"
         if abort_event.is_set() or _foreground_pressure_past_grace():
             return "foreground_preempted_postcommit"
         return "postcommit_abort_requested"
 
     def _postcommit_abort_check() -> bool:
+        # The pressure arm (#393): a postcommit prefill replays the same
+        # deep forward that wedged the machine, so it must yield too. The
+        # aborted job re-arms on the idle band and retries once pressure
+        # clears.
         return bool(
             abort_event.is_set()
             or _stale_session_revision()
             or _foreground_pressure_past_grace()
+            or _pressure_abort_requested(state)
         )
 
     def _resubmit_after_yield() -> bool:
@@ -19940,30 +20108,67 @@ def _uncapped_response_lease_tokens_from_env() -> int | None:
 
 
 def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> None:
-    """400 when the prompt alone fills or overflows the context window.
+    """Refuse prompts the serve cannot hold (400) or honestly fit (507).
 
-    Without this the request would enter generation with remaining_context
-    floored to 1 and produce a single token — a silent degradation a
-    benchmark ladder charts as engine speed. OpenAI parity: error code
-    context_length_exceeded with both numbers in the message. Called early
-    in the chat/completions handlers (a real 400 before any stream starts)
-    and again inside _generation_params as the backstop for every lane.
+    400: the prompt alone fills or overflows the context window. Without
+    this the request would enter generation with remaining_context floored
+    to 1 and produce a single token — a silent degradation a benchmark
+    ladder charts as engine speed. OpenAI parity: error code
+    context_length_exceeded with both numbers in the message.
+
+    507: the served window was explicitly overcommitted past the memory
+    plan's fit (--context-window overrides the plan by design — warn-loudly
+    policy) and THIS prompt's cold cost lands beyond the fit. Admitting it
+    would not fail fast: macOS compresses and swaps for minutes before any
+    Metal allocation error (the only prior 507 trigger) would fire — #393
+    wedged a 128 GB machine at a 119 GB footprint that way. Prompts under
+    the fit still serve, so an oversized window keeps its legitimate use.
+
+    Called early in the chat/completions handlers (a real error before any
+    stream starts) and again inside _generation_params as the backstop for
+    every lane.
     """
     context_window = int(state.context_window)
-    if int(prompt_token_count) < context_window:
-        return
-    raise HTTPException(
-        status_code=400,
-        detail={
-            "message": (
-                f"This model's maximum context length is {context_window} "
-                f"tokens, but the prompt alone has {int(prompt_token_count)} "
-                "tokens, leaving no room to generate. Reduce the prompt or "
-                "serve with a larger --context-window."
-            ),
-            "code": "context_length_exceeded",
-        },
-    )
+    if int(prompt_token_count) >= context_window:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"This model's maximum context length is {context_window} "
+                    f"tokens, but the prompt alone has "
+                    f"{int(prompt_token_count)} tokens, leaving no room to "
+                    "generate. Reduce the prompt or serve with a larger "
+                    "--context-window."
+                ),
+                "code": "context_length_exceeded",
+            },
+        )
+    plan = getattr(state, "memory_plan", None)
+    if (
+        plan is not None
+        and bool(getattr(plan, "context_overcommitted", False))
+        and int(getattr(plan, "context_window_fit", 0) or 0) > 0
+        and int(prompt_token_count) >= int(plan.context_window_fit)
+    ):
+        fit = int(plan.context_window_fit)
+        resolved = int(
+            getattr(plan, "context_window_resolved", context_window)
+            or context_window
+        )
+        raise HTTPException(
+            status_code=507,
+            detail={
+                "message": (
+                    f"--context-window {resolved} exceeds this machine's "
+                    f"memory-plan fit of {fit} tokens, and this prompt "
+                    f"({int(prompt_token_count)} tokens) does not fit in "
+                    "memory. Prompts below the fit still serve; reduce the "
+                    f"prompt, serve at or below --context-window {fit}, or "
+                    "use q8 KV quantization."
+                ),
+                "code": "insufficient_memory",
+            },
+        )
 
 
 def _generation_params(
@@ -21999,9 +22204,14 @@ def _run_generation(
                         session_policy_fingerprint=session_policy_fingerprint,
                         capture_final_state=session_bank is not None,
                         abort_check=(
-                            (lambda: bool(cancel_event.is_set()))
+                            (
+                                lambda: bool(
+                                    cancel_event.is_set()
+                                    or _pressure_abort_requested(state)
+                                )
+                            )
                             if cancel_event is not None
-                            else None
+                            else (lambda: _pressure_abort_requested(state))
                         ),
                     )
                 else:
@@ -22018,9 +22228,14 @@ def _run_generation(
                         constraint=constraint,
                         vision_splice=vision_splice,
                         abort_check=(
-                            (lambda: bool(cancel_event.is_set()))
+                            (
+                                lambda: bool(
+                                    cancel_event.is_set()
+                                    or _pressure_abort_requested(state)
+                                )
+                            )
                             if cancel_event is not None
-                            else None
+                            else (lambda: _pressure_abort_requested(state))
                         ),
                         max_tokens=response_max,
                         sampler=sampler,
@@ -22093,9 +22308,22 @@ def _run_generation(
                         ),
                     )
         except PostcommitAbort:
-            # abort_check tripped inside the prefill: the client disconnected
-            # mid-prompt-processing. Reuse the exact cancellation path client
-            # disconnects already take during decode.
+            # abort_check tripped inside the prefill. Two arms share it: a
+            # client disconnect reuses the exact cancellation path decode
+            # disconnects take, while the guard loop's sustained-critical
+            # pressure abort (#393) is an engine-health refusal the client
+            # must SEE — that one maps to the honest 507 (which also sheds
+            # caches) instead of a silent cancel.
+            if _pressure_abort_requested(state) and not (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                raise _allocation_failure_http_exception(
+                    state,
+                    RuntimeError(
+                        "sustained critical memory pressure during prefill; "
+                        "aborted before the allocator wall"
+                    ),
+                )
             raise _StreamCancelled("client disconnected during prefill")
         finally:
             from mtplx.generation import set_live_decode_sink
@@ -29353,9 +29581,35 @@ def create_app(state: ServerState) -> FastAPI:
                 def maybe_repair_tool_fed_reasoning_only_completion(
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
+                    # The repair is a second-chance enhancement: its own
+                    # failure must never take down a request that already has
+                    # a servable first pass. Cancellation still propagates.
+                    try:
+                        return _repair_reasoning_only_completion_unguarded(
+                            generated
+                        )
+                    except _StreamCancelled:
+                        raise
+                    except Exception as exc:
+                        generated.setdefault("stats", {})[
+                            "reasoning_completion_repair_error"
+                        ] = f"{type(exc).__name__}: {exc}"[:200]
+                        return generated
+
+                def _repair_reasoning_only_completion_unguarded(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    # Tools-declared turns are excluded from the F3
+                    # reasoning-as-content recovery (planning prose is not an
+                    # answer), so a reasoning-only stop here would otherwise
+                    # return an EMPTY assistant message. That includes the
+                    # FIRST turn of a tools-declared conversation (app chat
+                    # with web search on, agent clients' opening message) —
+                    # not just tool-fed turns — so the continuation repair
+                    # covers both (user reports: "model responds but produces
+                    # no answer", 27B + Flash-Next, chat and API).
                     if (
                         not tools_active
-                        or not tool_result_history_present
                         or not thinking_enabled
                         or request.seed is not None
                         or _reasoning_parser_for_state(state)
@@ -29373,6 +29627,19 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     )
                     if not first_text.strip():
+                        return generated
+                    # Tool-control markup — even unclosed — belongs to the
+                    # established tool-parse fallback machinery
+                    # (orphan/unclosed_tool_call), not this repair. The
+                    # thinking splitter classifies markup after a pre-opened
+                    # <think> as reasoning, which would otherwise read here
+                    # as a reasoning-only turn.
+                    if any(
+                        marker in first_text
+                        for marker in (
+                            _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
+                        )
+                    ):
                         return generated
                     raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
                         state,
@@ -29411,6 +29678,8 @@ def create_app(state: ServerState) -> FastAPI:
                             "reasoning_completion_repair_attempted": True,
                             "reasoning_completion_repair_reason": (
                                 "tool_fed_reasoning_only_completion"
+                                if tool_result_history_present
+                                else "tools_declared_reasoning_only_completion"
                             ),
                             "reasoning_completion_repair_first_completion_tokens": int(
                                 generated.get("completion_tokens") or 0

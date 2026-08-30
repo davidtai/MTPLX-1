@@ -6071,6 +6071,88 @@ def test_pi_tool_result_reasoning_only_final_turn_repairs_without_visible_leak(
     )
 
 
+def test_tools_declared_first_turn_reasoning_only_stop_repairs_instead_of_empty(
+    monkeypatch,
+):
+    """User report class: tools declared (app web search, agent clients), model
+    stops inside the pre-opened think block on the FIRST turn — no tool-result
+    history exists yet. The F3 reasoning-as-content recovery is deliberately
+    disabled when tools are active, so before the first-turn repair this
+    returned an EMPTY assistant message ("model responds but no answer")."""
+
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    texts = [
+        "The user asks for a haiku about tides. Drafting syllables now.",
+        "Moon pulls silver seams\nsalt breath gathers on the rocks\nthe bay exhales light",
+    ]
+    calls: list[str] = []
+    prompts: list[str] = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        text = texts[len(calls)]
+        calls.append(text)
+        prompts.append(state.runtime.tokenizer.decode(prompt_ids))
+        tokens = [ord(char) for char in text]
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            for token in tokens:
+                token_callback([token])
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                **(kwargs.get("request_observability") or {}),
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+                "decode_tok_s": 24.0,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [
+                {"role": "user", "content": "Write a haiku about tides."},
+            ],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 128,
+            "enable_thinking": True,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(body)
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+
+    assert calls == texts
+    assert content.strip() == texts[1]
+    assert "</think>" in prompts[1]
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_attempted"] is True
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_succeeded"] is True
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_reason"] == (
+        "tools_declared_reasoning_only_completion"
+    )
+
+
 def test_streaming_tool_call_finishes_without_waiting_for_model_eos(monkeypatch):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
@@ -13726,7 +13808,28 @@ def test_tool_prompt_mode_off_forces_native(monkeypatch):
 def _memory_plan_state_harness(monkeypatch):
     """The standard fake-runtime ServerState harness, plus deterministic
     plan inputs: flagship-sized weights and a monkeypatched machine RAM
-    (CI runners have 7-14 GB; the plan must not depend on the host)."""
+    (CI runners have 7-14 GB; the plan must not depend on the host).
+
+    The plan consumes host RAM through TWO detectors: the seat math reads
+    ``mtplx.memory_plan.detect_total_ram_bytes`` (which each test pins),
+    and the Metal allocator caps read
+    ``openai._detect_total_ram_bytes_for_metal_caps`` whose memory limit
+    then rides into the plan as ``usable_bytes_override``. On a 7 GB CI
+    runner the unpinned second detector collapsed that override to ~5 GiB
+    and the "128G machine" test came back machine-bound at 4096 (this
+    exact set was red on the v2.10.0 release commit). Route the caps
+    detector through the same pinned source so the whole harness follows
+    one simulated seat, and clear the operator cap envs for determinism.
+    """
+    from mtplx import memory_plan as _plan_module
+
+    monkeypatch.setattr(
+        openai,
+        "_detect_total_ram_bytes_for_metal_caps",
+        lambda: (_plan_module.detect_total_ram_bytes(), "test-pin"),
+    )
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
