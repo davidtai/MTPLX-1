@@ -124,6 +124,35 @@ zero compiled-verifier fallback. Temperature-1 runs can follow different
 sampling and acceptance paths. The promotion decision therefore uses the
 three same-seed pairs, not a raw comparison with an earlier campaign mean.
 
+## Step 6 production boundary
+
+Step 6 reduces the native MTP draft-head work. Qwen4 native MTP uses the
+model's Q8 output head, not the configured Q4 draft-only head. Replacing it
+with Q4 made proposal acceptance worse. Step 6 instead keeps the original Q8,
+group-64, affine arithmetic and gathers only 65,536 code-ranked rows. It writes
+those logits into their original positions in a full-vocabulary proposal and
+sets all other proposal logits to a zero-probability sentinel. Target
+verification still uses every vocabulary row.
+
+| Seed | Step 5 control | Step 6 ranked Q8 head | Paired change | Control accepted/drafted | Candidate accepted/drafted |
+|---:|---:|---:|---:|---:|---:|
+| `20260829` | 72.26 tok/s | 75.18 tok/s | +4.04% | 632 / 937 | 648 / 948 |
+| `20260830` | 69.79 tok/s | 74.63 tok/s | +6.94% | 667 / 1,014 | 650 / 966 |
+| `20260831` | 74.51 tok/s | 76.77 tok/s | +3.04% | 604 / 910 | 601 / 919 |
+| Mean | **72.19 tok/s** | **75.53 tok/s** | **+4.63%** | 1,903 / 2,861 total | 1,899 / 2,833 total |
+
+Mean draft time fell from 2.481 to 1.893 seconds, a 23.72% reduction. Mean
+verifier time also fell slightly, from 11.460 to 11.410 seconds. Every run
+generated 1,024 tokens with zero repair and zero compiled-verifier fallback.
+
+The built-in row list comes from a generic code corpus that excludes benchmark
+fixtures and tests. It covers 99.6446% of a held-out 1,005,404-token code set.
+The packaged NPY SHA-256 is
+`922a4d0570ce0a79e03c1e1ecb25e6c8c1e9cae943b2c0d5ce11874d42d74a17`.
+Installation validates the native Q8/group-64/affine contract once and then
+binds the proposal callable directly. It does not add a per-token eligibility
+check or fallback.
+
 ## Rejected scheduling candidate
 
 The lazy stochastic D3 candidate built all three draft depths before one
@@ -156,6 +185,7 @@ against the unchanged prior step.
 | 3 | `ccf817e0` | Stage exact fixed-M4 n-gram sidecar inputs | **68.01 tok/s promotion mean** | +3.25% matched three-run mean |
 | 4 | `03bc460e` | Select fixed-M4 n-gram rows from the host token ledger | **71.42 tok/s promotion mean** | +4.65% matched three-run mean |
 | 5 | `3fe8da54` | Fuse the fixed-M4 combine tail after stock quantized matmuls | **70.66 tok/s promotion mean** | +4.19% matched three-run mean |
+| 6 | `b9e1a3dd` | Bind a full-domain proposal over 65,536 code-ranked native Q8 rows | **75.53 tok/s promotion mean** | +4.63% matched three-run mean; draft time -23.72% |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
 experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
@@ -197,6 +227,11 @@ next-gather gap fell from 0.934 to 0.810 ms per transition. The fixed-M4
 combine tail therefore reduced both GPU work and host-late starvation. The
 remaining sampling transition is still the largest named idle family.
 
+Step 6 removes 0.589 seconds of mean draft-head time in the production runs.
+It has not yet received a new MLX timeline trace, so no Step 6 GPU-idle claim
+is recorded. The next trace must measure the retained Step 6 stack and compare
+per-window GPU work, host-late submission, and the sampling-to-gather gap.
+
 ## What MTPLX 2.10 already contains
 
 The audit found these features in the MTPLX 2.10 Qwen4 path:
@@ -224,6 +259,8 @@ mtplx pull Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
 Start the server:
 
 ```bash
+MTPLX_FRSPEC_DRAFT=1 \
+MTPLX_FRSPEC_VOCAB=builtin:qwen38-code-64k \
 mtplx serve \
   --model ~/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
   --model-id mtplx-flash-next-optimized-speed
@@ -231,7 +268,8 @@ mtplx serve \
 
 The model defaults select Turbo, native MTP depth 3, batched verification,
 `xhigh` reasoning, the temperature-1 sampler, and the bounded 1 GiB hot-row
-cache.
+cache. The two environment variables enable the Step 6 ranked draft head. The
+built-in list has a fixed size of 65,536 rows.
 
 ## Review rule
 
