@@ -153,6 +153,36 @@ Installation validates the native Q8/group-64/affine contract once and then
 binds the proposal callable directly. It does not add a per-token eligibility
 check or fallback.
 
+## Step 7 production boundary
+
+Step 7 reduces the small host gaps between stochastic draft depths. It makes
+two construction-bound changes that work together:
+
+- It compiles the fixed B1/S1 stateless work before QSA and installs the graph
+  only after exact eager-versus-compiled parity. History updates remain eager,
+  and the live QSA cache keeps the same owner.
+- It selects the required top 20 proposal rows directly. The old path selected
+  80 rows only to prove deterministic ownership of exact ties at the top-k
+  cutoff. The full-vocabulary normalizer, top-p filter, support order, and
+  NumPy `rng.choice` remain unchanged. An exact cutoff tie may select a
+  different tied row.
+
+The result uses the same frozen prompt, three seeds, and production settings as
+Step 6.
+
+| Seed | Step 6 control | Step 7 reduced-gap path | Accepted / drafted |
+|---:|---:|---:|---:|
+| `20260829` | 77.54 tok/s | 79.26 tok/s | 661 / 918 |
+| `20260830` | 76.13 tok/s | 75.32 tok/s | 653 / 999 |
+| `20260831` | 76.47 tok/s | 78.73 tok/s | 604 / 910 |
+| Mean | **76.71 tok/s** | **77.77 tok/s** | 1,918 / 2,827 total |
+
+The arithmetic mean improves by 1.38%. Mean draft time falls from 1.903 to
+1.679 seconds, an 11.76% reduction. All runs generated 1,024 tokens with zero
+repair and zero compiled-verifier fallback. The promotion rule allows exact
+cutoff-tie flips, so the decision uses the fixed three-seed throughput mean and
+does not require matching output digests.
+
 ## Rejected scheduling candidate
 
 The lazy stochastic D3 candidate built all three draft depths before one
@@ -186,6 +216,7 @@ against the unchanged prior step.
 | 4 | `03bc460e` | Select fixed-M4 n-gram rows from the host token ledger | **71.42 tok/s promotion mean** | +4.65% matched three-run mean |
 | 5 | `3fe8da54` | Fuse the fixed-M4 combine tail after stock quantized matmuls | **70.66 tok/s promotion mean** | +4.19% matched three-run mean |
 | 6 | `b9e1a3dd` | Bind a full-domain proposal over 65,536 code-ranked native Q8 rows | **76.71 tok/s promotion mean** | +6.27% matched three-run mean; draft time -23.32% |
+| 7 | `4f0e8604` | Compile fixed draft preparation and remove the 4k cutoff-tie proof superset | **77.77 tok/s promotion mean** | +1.38% fixed three-seed mean; draft time -11.76% |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
 experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
@@ -232,6 +263,11 @@ It has not yet received a new MLX timeline trace, so no Step 6 GPU-idle claim
 is recorded. The next trace must measure the retained Step 6 stack and compare
 per-window GPU work, host-late submission, and the sampling-to-gather gap.
 
+Step 7 directly shortens the CPU work in that sampling-to-gather transition by
+sorting 20 proposal rows instead of 80. Its production mean is confirmed, but
+it does not yet have a new MLX timeline trace. A later trace must measure the
+remaining per-transition gap before recording a new GPU-use percentage.
+
 ## What MTPLX 2.10 already contains
 
 The audit found these features in the MTPLX 2.10 Qwen4 path:
@@ -261,6 +297,8 @@ Start the server:
 ```bash
 MTPLX_FRSPEC_DRAFT=1 \
 MTPLX_FRSPEC_VOCAB=builtin:qwen38-code-64k \
+MTPLX_QWEN4_COMPILED_MTP_PREPARE=1 \
+MTPLX_QWEN4_RELAXED_DRAFT_TIES=1 \
 mtplx serve \
   --model ~/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
   --model-id mtplx-flash-next-optimized-speed
@@ -269,7 +307,8 @@ mtplx serve \
 The model defaults select Turbo, native MTP depth 3, batched verification,
 `xhigh` reasoning, the temperature-1 sampler, and the bounded 1 GiB hot-row
 cache. The two environment variables enable the Step 6 ranked draft head. The
-built-in list has a fixed size of 65,536 rows.
+built-in list has a fixed size of 65,536 rows. The two Qwen4 variables enable
+the Step 7 fixed-shape preparation graph and the relaxed cutoff-tie path.
 
 ## Review rule
 
