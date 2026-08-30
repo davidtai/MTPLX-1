@@ -2779,26 +2779,6 @@ class QSAIndexer(nn.Module):
     ) -> Optional[mx.array]:
         return self._call_rows(hidden, pos_start, cache, qk_rows, decode=False)
 
-    def update_cache_only(
-        self,
-        qk_rows: mx.array,
-        pos_start: int,
-        cache: QSACache,
-    ) -> None:
-        """Append indexer raw keys and completed pooled blocks only.
-
-        MTP history never consumes a selector result. The caller supplies the
-        construction-bound q/k projection rows, so this route omits query
-        normalization, scoring, and top-k while retaining the same raw-key and
-        pooled-block arithmetic as the eager indexer path.
-        """
-
-        B, S, _ = qk_rows.shape
-        _q, k = mx.split(qk_rows, [self.n_heads * self.head_dim], axis=-1)
-        k = k.reshape(B, S, self.head_dim)
-        cache.write_raw(k)
-        self._extend_pooled(cache, pos_start + S)
-
     def __call__(
         self,
         hidden: mx.array,
@@ -3027,62 +3007,6 @@ class Attention(nn.Module):
             and sum(args.mrope_section) == int(args.rotary_dim) // 2
             else None
         )
-
-    def update_cache_only(self, x: mx.array, cache: QSACache) -> list[mx.array]:
-        """Append QSA indexer and attention K/V state without producing output.
-
-        This is the construction-bound MTP-history lane. It deliberately ends
-        before attention query normalization, attention, the output projection,
-        hyper writeback, and the decoder MLP. The retained operations mirror
-        ``__call__`` exactly: the installed input projections, indexer raw and
-        pooled maintenance, K normalization, RoPE, layout, and KV append.
-        """
-
-        B, S, _ = x.shape
-        pos_start = cache.offset
-        vrope = vision_rope_state()
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        index_qk = self.indexer.index_qk_proj(x)
-        self.indexer.update_cache_only(index_qk, pos_start, cache)
-
-        k = k.reshape(B, S, self.n_kv_heads, -1)
-        v = v.reshape(B, S, self.n_kv_heads, -1)
-        k = self.k_norm(k)
-        if vrope is not None and self._mrope_axes is not None:
-            table, delta = vrope
-            end = pos_start + S
-            if table is not None and end <= int(table.shape[1]):
-                cos, sin = _mrope_cos_sin(
-                    table[:, pos_start:end], self._inv_freq, self._mrope_axes
-                )
-            else:
-                positions = mx.arange(
-                    pos_start + delta, pos_start + delta + S, dtype=mx.int32
-                )
-                cos, sin = _rope_cos_sin(
-                    positions, self._inv_freq, self._rope_attention_scaling
-                )
-        else:
-            positions = pos_start + mx.arange(S, dtype=mx.int32)
-            cos, sin = _rope_cos_sin(
-                positions, self._inv_freq, self._rope_attention_scaling
-            )
-        k = _apply_partial_rope(k, cos, sin)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
-        cache.kv.update_and_fetch(k, v)
-        return [
-            leaf
-            for leaf in (
-                cache.kv.keys,
-                cache.kv.values,
-                cache.raw_keys,
-                cache.pooled,
-                cache.pooled_f32_t,
-            )
-            if leaf is not None
-        ]
 
     def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
         B, S, _ = x.shape
@@ -4371,11 +4295,7 @@ class TextModel(nn.Module):
             emb = input_embeddings
         else:
             emb = self.model.embed_tokens(next_token_ids)
-        return self.mtp.append_history(
-            hidden_states,
-            emb,
-            mtp_cache,
-        )
+        return self.mtp.fuse_and_run_history(hidden_states, emb, mtp_cache)
 
     def make_mtp_cache(self):
         return [QSACache(self.model.args.indexer_compress_ratio or 4)]
@@ -4426,11 +4346,6 @@ class Qwen4ExpMTP(nn.Module):
         self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
         self._hc = args.hc_count
         object.__setattr__(self, "_mtp_prepare_inputs_impl", self._prepare_inputs_eager)
-        object.__setattr__(
-            self,
-            "_mtp_history_append_impl",
-            self.fuse_and_run_history,
-        )
 
     def _prepare_inputs_eager(
         self,
@@ -4491,90 +4406,6 @@ class Qwen4ExpMTP(nn.Module):
         h = self._prepare_inputs_eager(widened, tok_emb)
         layer_cache = cache[0] if cache is not None else None
         return self.layers[0](h, input_ids=None, ssm_mask=None, cache=layer_cache)
-
-    def append_history(
-        self,
-        widened: mx.array,
-        tok_emb: mx.array,
-        cache,
-    ) -> mx.array:
-        """Run the construction-selected MTP history implementation."""
-
-        return self._mtp_history_append_impl(widened, tok_emb, cache)
-
-    def install_cache_only_history(self) -> dict[str, Any]:
-        """Validate and install the direct cache-only history route once.
-
-        Installation runs after the sidecar has been quantized and loaded.
-        The enabled append path therefore contains no topology checks,
-        environment reads, or fallback to the full decoder.
-        """
-
-        if len(self.layers) != 1:
-            raise RuntimeError(
-                "cache-only Qwen4 MTP history requires exactly one decoder layer"
-            )
-        layer = self.layers[0]
-        if layer.is_linear or layer.layer_type != "full_attention":
-            raise RuntimeError(
-                "cache-only Qwen4 MTP history requires one full-attention layer"
-            )
-        if "self_attn" not in layer or type(layer.self_attn) is not Attention:
-            raise RuntimeError(
-                "cache-only Qwen4 MTP history requires the native QSA attention"
-            )
-        attn = layer.self_attn
-        if "qkv_fused" in attn:
-            raise RuntimeError(
-                "cache-only Qwen4 MTP history requires separate k/v/indexer projections"
-            )
-        if "indexer" not in attn or type(attn.indexer) is not QSAIndexer:
-            raise RuntimeError(
-                "cache-only Qwen4 MTP history requires the native QSA indexer"
-            )
-        required = {
-            "MTP preparation": self._prepare_inputs_eager,
-            "attention hyper-read": getattr(layer, "attn_hyper_connection", None),
-            "QSA cache update": getattr(attn, "update_cache_only", None),
-            "attention k projection": getattr(attn, "k_proj", None),
-            "attention v projection": getattr(attn, "v_proj", None),
-            "attention k normalization": getattr(attn, "k_norm", None),
-            "indexer qk projection": getattr(attn.indexer, "index_qk_proj", None),
-            "indexer cache update": getattr(attn.indexer, "update_cache_only", None),
-        }
-        missing = [name for name, operation in required.items() if not callable(operation)]
-        if missing:
-            raise RuntimeError(
-                "cache-only Qwen4 MTP history has unsupported loaded callables: "
-                + ", ".join(missing)
-            )
-        object.__setattr__(
-            self,
-            "_mtp_history_append_impl",
-            self.fuse_and_update_history_cache,
-        )
-        return {"installed": True, "layer_type": layer.layer_type}
-
-    def fuse_and_update_history_cache(
-        self,
-        widened: mx.array,
-        tok_emb: mx.array,
-        cache,
-    ) -> mx.array:
-        """Append MTP history through QSA cache state and stop before output.
-
-        The MTP input preparation and attention hyper-read remain identical to
-        ``fuse_and_run_history``. The returned prepared row is only an eval
-        root; ``mx.depends`` anchors every mutated cache leaf without running
-        attention output, hyper writeback, MoE, or the mixer.
-        """
-
-        h = self._prepare_inputs_eager(widened, tok_emb)
-        layer = self.layers[0]
-        mixed = layer.attn_hyper_connection(h)[0]
-        layer_cache = cache[0] if cache is not None else None
-        cache_roots = layer.self_attn.update_cache_only(mixed, layer_cache)
-        return mx.depends(h, cache_roots)
 
     def __call__(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
         return self.hyper_connection_mixer(self.fuse_and_run(widened, tok_emb, cache))
@@ -4695,14 +4526,6 @@ class Model(nn.Module):
         nn.quantize(mtp, group_size=64, bits=8, class_predicate=predicate)
         mtp.load_weights(list(stripped.items()), strict=True)
         mtp.eval()
-        cache_only_history = (
-            os.environ.get("MTPLX_QWEN4_CACHE_ONLY_MTP_HISTORY", "")
-            .strip()
-            .lower()
-            in {"1", "true", "yes", "on"}
-        )
-        if cache_only_history:
-            mtp.install_cache_only_history()
         # publish on the text model — mtp_patch._text_model() resolves
         # language_model, and registering the module on BOTH trees would
         # double-count its parameters
