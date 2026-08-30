@@ -14,6 +14,7 @@ from .sampling import (
     PENALTY_MIN,
     SamplerConfig,
     SparseDistribution,
+    WeightedChoiceRNG,
     apply_top_p_top_k,
     softmax,
 )
@@ -117,7 +118,7 @@ class BatchedSparseDistributions:
             self.vocab_size,
         )
 
-    def sample(self, row: int, rng: np.random.Generator) -> int:
+    def sample(self, row: int, rng: WeightedChoiceRNG) -> int:
         row = int(row)
         keep = self.probs[row] > 0
         return int(rng.choice(self.token_ids[row, keep], p=self.probs[row, keep]))
