@@ -626,6 +626,7 @@ class TensorOffsetQSACache:
         rows_gather_enabled: bool = False,
         rows_gather_min_context: int = 0,
         fused_rows_gather_kv_m4: bool = False,
+        fixed_m4_direct_pooled: bool = False,
     ) -> None:
         self.kv = kv
         self.raw_keys = raw_keys
@@ -637,6 +638,7 @@ class TensorOffsetQSACache:
         self.rows_gather_enabled = bool(rows_gather_enabled)
         self.rows_gather_min_context = max(0, int(rows_gather_min_context))
         self.fused_rows_gather_kv_m4 = bool(fused_rows_gather_kv_m4)
+        self.fixed_m4_direct_pooled = bool(fixed_m4_direct_pooled)
 
     @staticmethod
     def _fixed_bank(value: mx.array, capacity: int, axis: int) -> mx.array:
@@ -1855,6 +1857,9 @@ class CompiledVerifyBank:
             raise ValueError("fixed-M4 installation requires the Qwen4 runtime route")
         if self.parity or self.parity2:
             raise ValueError("fixed-M4 direct replay is disabled in parity modes")
+        if self._fixed_m4_dispatch is not None:
+            raise RuntimeError("qwen4 fixed-M4 replay is already installed")
+        prior_compiled = dict(self._compiled)
 
         class _M4Shape:
             shape = (1, 4)
@@ -1882,72 +1887,120 @@ class CompiledVerifyBank:
         )
         if not qsa_entries:
             raise RuntimeError("qwen4 fixed-M4 installation found no QSA state")
-        route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
-        key = (4, str(hidden_variant or ""), route_key)
-        fn = self._compiled.get(key)
-        if fn is None:
-            fn = self._shared_or_new_verify_step(key, 4, hidden_variant)
-            self._compiled[key] = fn
-        pending_route_thresholds = tuple(
-            entry.rows_gather_min_context
+        if any(
+            not isinstance(entry, TensorOffsetQSACache)
             for entry in qsa_entries
-            if entry.rows_gather_enabled and not entry.fixed_rows_gather
+        ):
+            raise RuntimeError("qwen4 fixed-M4 installation found invalid QSA state")
+        qsa_plan = tuple(
+            (idx, cache[idx])
+            for idx, kind, _n in self._spec or ()
+            if kind == VERIFY_SPEC_KIND_QSA
         )
-
-        capture_plan = []
-        capture_pos = 0
-        for idx, names in self._extra_capture_layout:
-            capture_plan.append((cache[idx], capture_pos, len(names)))
-            capture_pos += len(names)
-
-        boundary = _compiled_verify_boundary()
-        if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
-            prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
-        else:
-            prepare_aux = partial(
-                _prepare_fixed_m4_materialized,
-                self._prepare_compiled_aux,
-                cache,
+        owned_qsa_pairs = []
+        for idx, entry in qsa_plan:
+            shadow_entry = self._shadow[idx]
+            if not isinstance(shadow_entry, TensorOffsetQSACache):
+                raise RuntimeError(
+                    "qwen4 fixed-M4 installation found invalid QSA shadow state"
+                )
+            owned_qsa_pairs.append((entry, shadow_entry))
+        prior_markers = tuple(
+            (
+                entry,
+                entry.fixed_m4_direct_pooled,
+                shadow_entry,
+                shadow_entry.fixed_m4_direct_pooled,
             )
-        initial_growth_tokens = max(
-            self.max_verify_len,
-            self.growth_reserve_tokens,
+            for entry, shadow_entry in owned_qsa_pairs
         )
-        capacity_limit = (
-            None
-            if self.request_max_tokens is None
-            else (
-                len(prompt_ids)
-                + self.request_max_tokens
-                + self.speculative_headroom
+        try:
+            pending_route_thresholds = tuple(
+                entry.rows_gather_min_context
+                for entry in qsa_entries
+                if entry.rows_gather_enabled and not entry.fixed_rows_gather
             )
-        )
-        self._fixed_m4_dispatch = {
-            "fn": fn,
-            "prepare_aux": prepare_aux,
-            "state_plan": state_plan,
-            "state_leaves": sum(n for _kind, _entry, n in state_plan),
-            "capture_plan": tuple(capture_plan),
-            "capture_leaves": capture_pos,
-            "boundary": boundary,
-            "base_offset": len(prompt_ids),
-            "capacity": min(entry.capacity for entry in qsa_entries),
-            "growth_tokens": _next_fixed_m4_growth_tokens(
-                initial_growth_tokens
-            ),
-            "capacity_limit": capacity_limit,
-            "hidden_variant": hidden_variant,
-            "qsa_entries": qsa_entries,
-            "route_transition_at": (
+            capture_plan = []
+            capture_pos = 0
+            for idx, names in self._extra_capture_layout:
+                capture_plan.append((cache[idx], capture_pos, len(names)))
+                capture_pos += len(names)
+
+            boundary = _compiled_verify_boundary()
+            if (
+                self._build_fixed_m4_aux is not None
+                and boundary in ("both", "pre")
+            ):
+                prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
+            else:
+                prepare_aux = partial(
+                    _prepare_fixed_m4_materialized,
+                    self._prepare_compiled_aux,
+                    cache,
+                )
+            prompt_length = len(prompt_ids)
+            initial_growth_tokens = max(
+                self.max_verify_len,
+                self.growth_reserve_tokens,
+            )
+            capacity_limit = (
+                None
+                if self.request_max_tokens is None
+                else (
+                    prompt_length
+                    + self.request_max_tokens
+                    + self.speculative_headroom
+                )
+            )
+            route_transition_at = (
                 min(pending_route_thresholds)
                 if pending_route_thresholds
                 else None
-            ),
-            "donate": (
-                _compiled_verify_donation_enabled()
-                and boundary in ("both", "post")
-            ),
-        }
+            )
+            dispatch = {
+                "prepare_aux": prepare_aux,
+                "state_plan": state_plan,
+                "state_leaves": sum(n for _kind, _entry, n in state_plan),
+                "capture_plan": tuple(capture_plan),
+                "capture_leaves": capture_pos,
+                "boundary": boundary,
+                "base_offset": prompt_length,
+                "capacity": min(entry.capacity for entry in qsa_entries),
+                "growth_tokens": _next_fixed_m4_growth_tokens(
+                    initial_growth_tokens
+                ),
+                "capacity_limit": capacity_limit,
+                "hidden_variant": hidden_variant,
+                "qsa_entries": qsa_entries,
+                "route_transition_at": route_transition_at,
+                "donate": (
+                    _compiled_verify_donation_enabled()
+                    and boundary in ("both", "post")
+                ),
+            }
+
+            for entry, shadow_entry in owned_qsa_pairs:
+                entry.fixed_m4_direct_pooled = True
+                shadow_entry.fixed_m4_direct_pooled = True
+            # A bank installed after any generic warmup must not retain a
+            # callable whose trace captured the marker-off route.
+            self._compiled.clear()
+            route_key = int(
+                all(entry.fixed_rows_gather for entry in qsa_entries)
+            )
+            key = (4, str(hidden_variant or ""), route_key)
+            fn = self._shared_or_new_verify_step(key, 4, hidden_variant)
+            self._compiled[key] = fn
+            dispatch["fn"] = fn
+            self._fixed_m4_dispatch = dispatch
+        except Exception:
+            for entry, live_marker, shadow_entry, shadow_marker in prior_markers:
+                entry.fixed_m4_direct_pooled = live_marker
+                shadow_entry.fixed_m4_direct_pooled = shadow_marker
+            self._compiled.clear()
+            self._compiled.update(prior_compiled)
+            self._fixed_m4_dispatch = None
+            raise
 
     def _transition_fixed_m4_generation(
         self,
@@ -3054,6 +3107,7 @@ class CompiledVerifyBank:
                     rows_gather_enabled=entry.rows_gather_enabled,
                     rows_gather_min_context=entry.rows_gather_min_context,
                     fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
+                    fixed_m4_direct_pooled=entry.fixed_m4_direct_pooled,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
@@ -3113,9 +3167,24 @@ class CompiledVerifyBank:
         request's containers.
         """
 
+        spec_sig = tuple(self._spec or [])
+        shadow = self._shadow
+        assert shadow is not None
+        qsa_direct_pooled = tuple(
+            bool(shadow[idx].fixed_m4_direct_pooled)
+            for idx, kind, _n in self._spec or ()
+            if kind == VERIFY_SPEC_KIND_QSA
+        )
+        if qsa_direct_pooled and any(
+            marker != qsa_direct_pooled[0]
+            for marker in qsa_direct_pooled[1:]
+        ):
+            raise RuntimeError("mixed QSA direct-pooled ownership")
+        fixed_m4_direct_pooled = (
+            qsa_direct_pooled[0] if qsa_direct_pooled else False
+        )
         if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
             return mx.compile(self._make_verify_step(length, hidden_variant))
-        spec_sig = tuple(self._spec or [])
         from .attention_context import exact_verify_required
 
         global_key = (
@@ -3128,6 +3197,7 @@ class CompiledVerifyBank:
             int(length),
             str(hidden_variant or ""),
             int(key[2]),
+            fixed_m4_direct_pooled,
             # Kernel-route dimension: a trace compiled under the sampled
             # (vk/nax) verify route bakes those kernels into the graph; a
             # greedy (t<=0, stock-route) request must never replay it, and
