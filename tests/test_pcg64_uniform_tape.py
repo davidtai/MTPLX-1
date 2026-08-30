@@ -18,8 +18,31 @@ def _inverse_cdf_choice(
     probabilities: np.ndarray,
     uniform: float,
 ) -> int:
-    cdf = np.cumsum(probabilities) / np.sum(probabilities)
+    cdf = np.cumsum(probabilities)
+    cdf /= cdf[-1]
     return int(values[np.searchsorted(cdf, uniform, side="right")])
+
+
+def test_inverse_cdf_matches_numpy_choice_cumulative_normalization() -> None:
+    probabilities = np.array(
+        [
+            0.2927264538460277,
+            0.05644252671156259,
+            0.11093093277275656,
+            0.009337598431672221,
+            0.06682097159765857,
+            0.043447601838550544,
+            0.2068876536160516,
+            0.21340626118572034,
+        ],
+        dtype=np.float64,
+    )
+    uniform = 4_144_211_596_455_494 / 2**53
+    values = np.arange(8)
+    legacy_cdf = np.cumsum(probabilities) / np.sum(probabilities)
+
+    assert int(values[np.searchsorted(legacy_cdf, uniform, side="right")]) == 2
+    assert _inverse_cdf_choice(values, probabilities, uniform) == 3
 
 
 @pytest.mark.parametrize("support", range(1, 41))
