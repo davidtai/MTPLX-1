@@ -1876,6 +1876,15 @@ class _SidecarGather:
         self.hot_hits = 0
         self.hot_misses = 0
 
+    def clear_hot_cache(self) -> int:
+        """Drop every RAM-held row between independent benchmark runs."""
+
+        cleared = len(self._hot)
+        self._hot.clear()
+        self.hot_hits = 0
+        self.hot_misses = 0
+        return cleared
+
     def _warm(self, rows) -> None:
         fd = self._fd
         metas = self._row_meta
@@ -2986,6 +2995,21 @@ class Model(nn.Module):
                 "resident only at >=160G RAM or MTPLX_NGRAM_RESIDENT=1",
                 flush=True,
             )
+
+    def clear_ngram_hot_cache(self) -> int:
+        """Clear all file-backed n-gram hot rows owned by this model."""
+
+        cleared = 0
+        seen: set[int] = set()
+        for layer in self.layers:
+            if "ple" not in layer:
+                continue
+            sidecar = layer.ple.ple_embedding.ngram_embedding._sidecar
+            if sidecar is None or id(sidecar) in seen:
+                continue
+            seen.add(id(sidecar))
+            cleared += sidecar.clear_hot_cache()
+        return cleared
 
     def set_ar_pipeline_mode(self, enabled: bool) -> bool:
         """Flip the family into (or out of) the pipelined-AR decode contract:

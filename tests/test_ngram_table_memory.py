@@ -105,6 +105,24 @@ def test_hot_cache_eviction_keeps_bound_and_values(tmp_path):
     assert np.array_equal(again, np.asarray(ref.astype(mx.float32))[ids[:3]])
 
 
+def test_hot_cache_clear_drops_rows_and_resets_receipts(tmp_path):
+    path = tmp_path / NGRAM_TABLE_FILENAME
+    _write_quantized_table(path)
+    table = _attached_table(path)
+    sidecar = table._sidecar
+
+    _gather(table, np.array([1, 2, 2, 9], dtype=np.int64))
+    assert sidecar._hot
+    assert sidecar.hot_misses == 3
+
+    cleared = sidecar.clear_hot_cache()
+
+    assert cleared == 3
+    assert not sidecar._hot
+    assert sidecar.hot_hits == 0
+    assert sidecar.hot_misses == 0
+
+
 def test_hot_cache_disabled_by_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MTPLX_NGRAM_HOT_MB", "0")
     path = tmp_path / NGRAM_TABLE_FILENAME
