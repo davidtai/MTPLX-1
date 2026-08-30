@@ -9,7 +9,7 @@ Build four independent Qwen3.8 Flash-Next candidates on the Step 8 control:
 3. Expose the existing masked QSA attention kernel as an isolated Step 8 candidate.
 4. Make the n-gram `pread` worker count construction-time configurable for a 16/32/48 sweep.
 
-Each candidate gets its own commit and construction-time route. A combined stack is built only after each candidate beats the unchanged control on the exact 1024-output, 16K-prefill production workload.
+Each candidate gets its own commit and construction-time route. A combined stack is built only after each candidate beats the unchanged control on the exact 1024-output, 16K-prefill comparison workload. That fixed output is an A/B control, not a claim that production responses have a canonical length; production output remains variable and stop-driven.
 
 ## Non-goals
 
@@ -42,7 +42,7 @@ For each candidate:
 
 1. Run a focused parity test against its unchanged operation chain at the exact production geometry.
 2. Spot-check generated output for finite values, valid text, zero repair, and zero verifier fallback.
-3. Run the guarded 16K/1K, temperature-1, xhigh benchmark three times against an interleaved unchanged control.
+3. Run the guarded 16K/1K, temperature-1, xhigh comparison cell three times against an interleaved unchanged control, then separately prove variable-length stopping and capacity growth.
 4. Keep the candidate only if mean wall time improves repeatably without a memory or correctness regression. Report decode TPS as a secondary metric.
 5. Record confirmed wins on PR #391; do not publish failed experiments as wins.
 
@@ -63,7 +63,7 @@ The comparison used official `ddalcu/mlx-serve` source at
 `cd93a2b00253218dff96fdb42d457bfb190b12de`. Each applicable technique was
 adapted to Qwen3.8 arithmetic in an isolated worktree; no mlx-serve candidate
 was stacked into the production branch because none beat the unchanged route
-on the guarded 16K/1K workload.
+on the guarded 16K/1K comparison cell.
 
 | Candidate | Correctness result | Production result | Decision |
 | --- | --- | --- | --- |

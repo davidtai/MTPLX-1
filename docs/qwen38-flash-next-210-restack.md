@@ -1,6 +1,6 @@
-# Qwen3.8 Flash-Next optimization on MTPLX 2.10
+# Qwen3.8 Flash-Next optimization on MTPLX 2.10.1
 
-This branch builds a clean optimization stack on MTPLX 2.10. It uses the
+This branch builds a clean optimization stack on MTPLX 2.10.1. It uses the
 official `Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` model. Each
 retained runtime change has a matched result on the production workload.
 
@@ -9,19 +9,24 @@ old implementation history, rejected experiments, and detailed benchmark
 notes. This document records the new production baseline and each optimization
 that remains in the new stack.
 
-## Production configuration
+## Controlled comparison configuration
 
-- Runtime base: MTPLX 2.10.0, commit `4ce96908`
+- Runtime base for the recorded hill climb: MTPLX 2.10.0, commit `4ce96908`
+- Integrated release base: MTPLX 2.10.1, commit `557e637a`
 - Model revision: `29ba90f82124961d0d902a9ea9bbb1034972af2f`
 - MLX: 0.32.2
 - Decode mode: native MTP, depth 3
-- Workload: 16,384 prompt tokens and exactly 1,024 generated tokens
+- Comparison cell: 16,384 prompt tokens and exactly 1,024 generated tokens
 - Prompt: natural Python programming task
 - Reasoning effort: `xhigh`
 - Sampler: temperature 1.0, top-p 0.95, top-k 20, min-p 0
 - Penalties: presence 0 and repetition 1
 - Seeds: `20260829`, `20260830`, and `20260831`
 - N-gram hot-row cache: bounded at 1 GiB
+
+The fixed 1,024-token output makes candidate A/Bs comparable; it is not a
+canonical production response length. Serving remains stop-driven and supports
+arbitrary output lengths with bounded verifier growth.
 
 The 29.8 GiB n-gram table stays in a file-backed memory map. Production uses
 the required bounded 1 GiB hot-row cache above the memory map. All optimization

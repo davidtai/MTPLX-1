@@ -7,6 +7,7 @@ fresh sqlite connection.
 """
 
 from mtplx.cache_bank import SessionBankColdTier
+from mtplx.cache_bank import cold_tier
 
 
 def _tier(tmp_path) -> SessionBankColdTier:
@@ -30,6 +31,11 @@ def _count_connects(tier, monkeypatch) -> list:
 
 
 def test_repeated_stats_polls_reuse_cached_aggregate(tmp_path, monkeypatch):
+    # This test is about mutation-free cache reuse, not whether a loaded test
+    # runner can finish ten SQLite polls inside the production five-second
+    # staleness window. Keep expiry out of this assertion; mutation and TTL
+    # invalidation have their own focused coverage.
+    monkeypatch.setattr(cold_tier, "MANIFEST_STATS_TTL_S", 3600.0)
     tier = _tier(tmp_path)
     try:
         calls = _count_connects(tier, monkeypatch)
