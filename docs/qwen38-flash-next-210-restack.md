@@ -183,6 +183,28 @@ repair and zero compiled-verifier fallback. The promotion rule allows exact
 cutoff-tie flips, so the decision uses the fixed three-seed throughput mean and
 does not require matching output digests.
 
+## Step 8 production boundary
+
+Step 8 fuses the fixed-M4 QSA key and value row gathers. The old path launched
+one gather for keys and another for values. The new Metal kernel reads each
+selected token index once and copies four BF16 values per thread into both
+outputs. The exact cache shape and kernel are bound when the compiled cache is
+installed. Only physical M4 uses this kernel; other row counts use their
+explicit stock route.
+
+| Seed | Step 7 control | Step 8 fused K/V gather | Accepted / drafted |
+|---:|---:|---:|---:|
+| `20260829` | 79.26 tok/s | 81.62 tok/s | 656 / 895 |
+| `20260830` | 75.32 tok/s | 79.41 tok/s | 660 / 978 |
+| `20260831` | 78.73 tok/s | 80.30 tok/s | 601 / 918 |
+| Mean | **77.77 tok/s** | **80.44 tok/s** | 1,917 / 2,791 total |
+
+The arithmetic mean improves by 3.44%. Mean decode time falls from 13.174 to
+12.731 seconds. Weighted verifier-forward cost falls from 31.84 to 31.01 ms
+per compiled window. The exact production-shape kernel test matches both stock
+gathers element for element. All runs generated 1,024 tokens with zero repair
+and zero compiled-verifier fallback.
+
 ## Rejected scheduling candidate
 
 The lazy stochastic D3 candidate built all three draft depths before one
@@ -217,6 +239,7 @@ against the unchanged prior step.
 | 5 | `3fe8da54` | Fuse the fixed-M4 combine tail after stock quantized matmuls | **70.66 tok/s promotion mean** | +4.19% matched three-run mean |
 | 6 | `b9e1a3dd` | Bind a full-domain proposal over 65,536 code-ranked native Q8 rows | **76.71 tok/s promotion mean** | +6.27% matched three-run mean; draft time -23.32% |
 | 7 | `4f0e8604` | Compile fixed draft preparation and remove the 4k cutoff-tie proof superset | **77.77 tok/s promotion mean** | +1.38% fixed three-seed mean; draft time -11.76% |
+| 8 | `876bdeba` | Fuse fixed-M4 QSA key and value row gathers with vector-width 4 | **80.44 tok/s promotion mean** | +3.44% fixed three-seed mean; verifier forward -2.58% per window |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
 experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
@@ -268,6 +291,11 @@ sorting 20 proposal rows instead of 80. Its production mean is confirmed, but
 it does not yet have a new MLX timeline trace. A later trace must measure the
 remaining per-transition gap before recording a new GPU-use percentage.
 
+Step 8 removes one QSA gather dispatch in each of the 12 QSA layers for every
+fixed-M4 verifier window. Its production mean and per-window verifier cost are
+confirmed, but it does not yet have a new MLX timeline trace. No new GPU-use
+percentage is claimed for this step.
+
 ## What MTPLX 2.10 already contains
 
 The audit found these features in the MTPLX 2.10 Qwen4 path:
@@ -308,7 +336,9 @@ The model defaults select Turbo, native MTP depth 3, batched verification,
 `xhigh` reasoning, the temperature-1 sampler, and the bounded 1 GiB hot-row
 cache. The two environment variables enable the Step 6 ranked draft head. The
 built-in list has a fixed size of 65,536 rows. The two Qwen4 variables enable
-the Step 7 fixed-shape preparation graph and the relaxed cutoff-tie path.
+the Step 7 fixed-shape preparation graph and the relaxed cutoff-tie path. The
+validated fixed-M4 model geometry enables the Step 8 fused QSA gather by
+default; `MTPLX_QSA_M4_FUSED_KV_GATHER=0` is its operator kill switch.
 
 ## Review rule
 
