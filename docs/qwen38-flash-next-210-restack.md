@@ -178,8 +178,24 @@ diagnostic and is not a promotion result.
 
 These are many small gaps, not one long wait. The largest named transition is
 stochastic draft sampling into the next embedding gather: 0.926 seconds across
-992 transitions. This profile is from retained Step 4. Step 5 still needs a
-fresh profile before the next optimization is selected.
+992 transitions.
+
+Step 5 was then traced with the same MLX 0.32.2 profiler. Its temperature-1
+path used 362 compiled windows, compared with 328 in the Step 4 trace. The
+comparison must therefore use cost per compiled window.
+
+| Decode profile per compiled window | Step 4 | Step 5 | Change |
+|---|---:|---:|---:|
+| GPU timeline | 46.24 ms | 45.22 ms | **-2.19%** |
+| GPU busy | 37.98 ms | 37.32 ms | **-1.74%** |
+| GPU idle | 8.26 ms | 7.90 ms | **-4.29%** |
+| Host-late submission | 6.62 ms | 6.27 ms | **-5.22%** |
+| Command buffers | 172.2 | 160.9 | **-6.60%** |
+
+Raw GPU use also rose from 82.14% to 82.53%. The largest draft-sampling to
+next-gather gap fell from 0.934 to 0.810 ms per transition. The fixed-M4
+combine tail therefore reduced both GPU work and host-late starvation. The
+remaining sampling transition is still the largest named idle family.
 
 ## What MTPLX 2.10 already contains
 
