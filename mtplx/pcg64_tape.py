@@ -63,7 +63,7 @@ class PCG64UniformTape:
         self.cursor += 1
         return value
 
-    def choice(self, values: np.ndarray, *, p: np.ndarray):
+    def choice(self, values: np.ndarray, /, *, p: np.ndarray):
         value = self.rng.choice(values, p=p)
         self.cursor += 1
         return value
