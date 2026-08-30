@@ -307,7 +307,11 @@ def test_flash_next_production_geometry_defaults_fixed_m4_verifier(
             }
         )
     )
-    for key in ("MTPLX_COMPILED_VERIFY", "MTPLX_QWEN4_FIXED_M4_VERIFY"):
+    for key in (
+        "MTPLX_COMPILED_VERIFY",
+        "MTPLX_QWEN4_FIXED_M4_VERIFY",
+        "MTPLX_QWEN4_M4_STAGE3",
+    ):
         monkeypatch.delenv(key, raising=False)
     args = argparse.Namespace(
         model=str(model),
@@ -320,12 +324,22 @@ def test_flash_next_production_geometry_defaults_fixed_m4_verifier(
 
     assert overrides["MTPLX_COMPILED_VERIFY"] == "1"
     assert overrides["MTPLX_QWEN4_FIXED_M4_VERIFY"] == "1"
+    assert overrides["MTPLX_QWEN4_M4_STAGE3"] == "1"
+
+    monkeypatch.setenv("MTPLX_QWEN4_M4_STAGE3", "0")
+    overrides = _server_runtime_env_overrides(
+        args,
+        {"MTPLX_QWEN4_M4_STAGE3": "1"},
+    )
+    assert "MTPLX_QWEN4_M4_STAGE3" not in overrides
+    monkeypatch.delenv("MTPLX_QWEN4_M4_STAGE3")
 
     config = json.loads((model / "config.json").read_text())
     config["text_config"]["hidden_size"] = 2048
     (model / "config.json").write_text(json.dumps(config))
     overrides = _server_runtime_env_overrides(args, {})
     assert "MTPLX_QWEN4_FIXED_M4_VERIFY" not in overrides
+    assert "MTPLX_QWEN4_M4_STAGE3" not in overrides
 
 
 # ---------------------------------------------------------------------------

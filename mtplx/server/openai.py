@@ -844,15 +844,22 @@ def _server_runtime_env_overrides(
             if os.environ.get(key) is None:
                 overrides.setdefault(key, value)
         if _served_model_is_qwen4_fixed_m4(args):
-            # Construction-bound fixed-M4 verifier (2026-08-29 production
-            # repeats): one traced replay over the exact Flash-Next geometry.
-            # The config predicate below keeps this off every unmeasured
-            # qwen4_exp layout; explicit operator exports still win.
+            # Construction-bound fixed-M4 verifier and stock-QMM combine tail.
+            # The combine tail keeps both optimized quantized matmuls and
+            # replaces routed weighting/reduction plus shared gating/final add
+            # with one dispatch. Three paired 16K/1K production seeds on
+            # 2026-08-29 improved mean decode 67.82 -> 70.66 tok/s (+4.19%).
+            # The config predicate below keeps both routes off every
+            # unmeasured qwen4_exp layout; explicit operator exports still win.
             for key in (
                 "MTPLX_COMPILED_VERIFY",
                 "MTPLX_QWEN4_FIXED_M4_VERIFY",
+                "MTPLX_QWEN4_M4_STAGE3",
             ):
-                if os.environ.get(key) is None:
+                operator_value = str(os.environ.get(key) or "").strip()
+                if operator_value:
+                    overrides.pop(key, None)
+                else:
                     overrides.setdefault(key, "1")
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
