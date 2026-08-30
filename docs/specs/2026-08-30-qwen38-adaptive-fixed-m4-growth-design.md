@@ -44,8 +44,9 @@ avoid allocating capacity the request cannot address. The ordinary compiled
 replay remains branch-free within each capacity generation; only the existing
 boundary transition performs this calculation.
 
-For a 32K output, the expected large-request grants are 1K, 1K, 2K, 4K, 8K,
-8K, and 8K, reducing capacity transitions from 63 to about 6. Maximum unused
+For a 32K output, the expected large-request grants are an initial 1K followed
+by 2K, 4K, 8K, 8K, and 8K growth steps, reducing capacity transitions from 63
+to about 6. Maximum unused
 target-QSA capacity after an overrun is below one 8K grant, approximately
 0.217 GiB for the measured 12-cache geometry.
 
