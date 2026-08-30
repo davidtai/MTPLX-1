@@ -28,6 +28,13 @@ The fixed 1,024-token output makes candidate A/Bs comparable; it is not a
 canonical production response length. Serving remains stop-driven and supports
 arbitrary output lengths with bounded verifier growth.
 
+The final 2.10.1 integration completed actual 16,384- and 32,768-token outputs
+from the 16K prompt. The runs crossed 31 and 63 fixed-M4 capacity boundaries
+with zero fallback, demotion, growth demotion, route change, or repair. The 32K
+run sustained 72.60 decode tok/s and peaked at 81.39 GiB. Its total active-memory
+increase over the loaded model was 3.60 GiB; extending the output from 16K to
+32K added 0.434 GiB of active memory.
+
 The 29.8 GiB n-gram table stays in a file-backed memory map. Production uses
 the required bounded 1 GiB hot-row cache above the memory map. All optimization
 decisions use this configuration.

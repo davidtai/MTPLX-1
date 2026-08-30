@@ -89,3 +89,15 @@ only the seven-token suffix, and then generated the requested 97 tokens. Both
 requests stayed on compiled M4 with zero fallback, demotion, growth demotion, or
 repair. The receipt is
 `.benchmark-artifacts/pr391/pr391-variable-length-production-proof.json`.
+
+The final 2.10.1 integration also completed forced 16,384- and 32,768-token
+outputs from the same 16K prompt. They crossed 31 and 63 capacity boundaries,
+respectively, while retaining a 512-token initial reserve. Both stayed compiled
+for every M4 call with zero fallback, demotion, growth demotion, route change,
+or repair. The 32K run measured 72.60 decode tok/s. Its active-memory increase
+over the loaded model was 3.60 GiB, while the second 16K of output added only
+0.434 GiB; the absolute 81.39 GiB peak was unchanged from the 16K-output run.
+Receipts:
+
+- `.benchmark-artifacts/pr391/rebench3-1788117400-fixed-m4-variable-max16k-natural-stop-variable-16k-max16384.json`
+- `.benchmark-artifacts/pr391/rebench3-1788117500-fixed-m4-output32k-fixed-16k-output32768.json`
