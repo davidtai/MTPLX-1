@@ -21,6 +21,19 @@ from .attention_context import attention_phase
 from .gdn_capture import resolve_gdn_capture_backend
 
 
+def _prepare_fixed_m4_materialized(
+    prepare_aux,
+    cache,
+    input_ids,
+    _host_input_ids,
+    _completion_tokens,
+    _committed_count,
+):
+    """Adapt the materialized PLE route to the fixed-M4 host-input contract."""
+
+    return prepare_aux(input_ids, cache)
+
+
 @dataclass
 class GraphBankStats:
     calls: int = 0
@@ -1684,6 +1697,7 @@ class CompiledVerifyBank:
         self,
         cache: Any,
         *,
+        prompt_ids,
         hidden_variant: str | None,
     ) -> None:
         """Install the exact Qwen4 physical-M4 replay once after prefill."""
@@ -1729,9 +1743,13 @@ class CompiledVerifyBank:
 
         boundary = _compiled_verify_boundary()
         if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
-            prepare_aux = self._build_fixed_m4_aux(cache)
+            prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
         else:
-            prepare_aux = partial(self._prepare_compiled_aux, cache=cache)
+            prepare_aux = partial(
+                _prepare_fixed_m4_materialized,
+                self._prepare_compiled_aux,
+                cache,
+            )
         self._fixed_m4_dispatch = {
             "fn": fn,
             "prepare_aux": prepare_aux,
@@ -1746,7 +1764,14 @@ class CompiledVerifyBank:
             ),
         }
 
-    def _forward_installed_fixed_m4(self, input_ids, cache: Any):
+    def _forward_installed_fixed_m4(
+        self,
+        input_ids,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache: Any,
+    ):
         dispatch = self._fixed_m4_dispatch
         assert dispatch is not None
         boundary = dispatch["boundary"]
@@ -1769,7 +1794,12 @@ class CompiledVerifyBank:
             else:
                 state_in.extend(entry.cache[:n_leaves])
 
-        compiled_aux = dispatch["prepare_aux"](input_ids)
+        compiled_aux = dispatch["prepare_aux"](
+            input_ids,
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+        )
         if boundary in ("both", "pre"):
             mx.async_eval(compiled_aux, *state_in)
         outputs = dispatch["fn"](input_ids, compiled_aux, *state_in)
@@ -1818,6 +1848,29 @@ class CompiledVerifyBank:
         self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
         return logits, hidden, {}
 
+    def forward_fixed_m4(
+        self,
+        input_ids,
+        *,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
+        """Run the installed physical-M4 route with host-owned n-gram inputs."""
+
+        del return_hidden, hidden_variant
+        self.stats["calls"] += 1
+        return self._forward_installed_fixed_m4(
+            input_ids,
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+            cache,
+        )
+
     def forward_ar_capture(
         self,
         input_ids,
@@ -1847,7 +1900,9 @@ class CompiledVerifyBank:
         if self._fixed_m4_dispatch is not None:
             self.stats["calls"] += 1
             if _decode_length(input_ids) == 4:
-                return self._forward_installed_fixed_m4(input_ids, cache)
+                raise RuntimeError(
+                    "installed fixed-M4 replay requires forward_fixed_m4 host inputs"
+                )
             return self._runtime_forward(
                 input_ids,
                 cache=cache,
