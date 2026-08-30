@@ -385,6 +385,10 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_QWEN4_M4_STAGE3",
         "MTPLX_QWEN4_COMPILED_MTP_PREPARE",
         "MTPLX_QWEN4_RELAXED_DRAFT_TIES",
+        # Construction-bound QSA-aware MTP history append candidate. The
+        # default stays the complete decoder layer until an exact workload
+        # parity/performance receipt earns the cache-only route.
+        "MTPLX_QWEN4_CACHE_ONLY_MTP_HISTORY",
         "MTPLX_FUSE_GDN_POST_CONV",
         "MTPLX_A3B_GDN_POSTCONV_IMPL",
         "MTPLX_LINEAR_GDN_FROM_CONV_TGY",
