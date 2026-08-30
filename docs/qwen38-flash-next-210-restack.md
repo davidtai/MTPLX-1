@@ -69,6 +69,61 @@ The earlier retained controls measured 70.87 and 74.93 tok/s. Their 72.90
 tok/s mean remains valid historical evidence; 74.93 is the highest single
 retained observation, not the three-seed mean.
 
+## Step 3 production boundary
+
+Step 3 prepares the exact fixed-M4 n-gram row IDs on the host. It starts the
+file-backed row gather before the compiled verifier needs the embedding. This
+removes one forced auxiliary-graph wait. The 29.8 GiB table remains mapped and
+the hot-row cache remains bounded at 1 GiB.
+
+| Seed | Control | Staged n-gram | Paired change |
+|---:|---:|---:|---:|
+| `20260829` | 59.84 tok/s | 61.46 tok/s | +2.70% |
+| `20260830` | 66.06 tok/s | 68.66 tok/s | +3.95% |
+| `20260831` | 71.69 tok/s | 73.89 tok/s | +3.08% |
+| Mean | **65.86 tok/s** | **68.01 tok/s** | **+3.25%** |
+
+The candidate won all three pairs. Every run generated 1,024 tokens with zero
+repair and zero compiled-verifier fallback.
+
+## Step 4 production boundary
+
+Step 4 selects fixed-M4 n-gram rows from the authoritative host token ledger.
+It no longer materializes pending device history back to the CPU before each
+verification window. The device history remains the source for capture,
+commit, and rollback.
+
+| Seed | Control | Host-owned selection | Paired change |
+|---:|---:|---:|---:|
+| `20260829` | 63.69 tok/s | 72.28 tok/s | +13.49% |
+| `20260830` | 68.55 tok/s | 68.77 tok/s | +0.32% |
+| `20260831` | 72.50 tok/s | 73.20 tok/s | +0.97% |
+| Mean | **68.25 tok/s** | **71.42 tok/s** | **+4.65%** |
+
+The candidate won all three pairs. Every run generated 1,024 tokens with zero
+repair and zero compiled-verifier fallback.
+
+## Step 5 production boundary
+
+Step 5 keeps the routed q4/g32 and shared q8/g64 down projections on the tuned
+MLX quantized-matmul path. One small Metal kernel then combines routed scores,
+the exact ten-row BF16 reduction, the shared gate, and the final add. It
+removes dispatches without replacing the efficient quantized matmuls.
+
+| Seed | Step 4 control | Step 5 combine tail | Paired change | Control accepted/drafted | Candidate accepted/drafted |
+|---:|---:|---:|---:|---:|---:|
+| `20260829` | 64.62 tok/s | 70.32 tok/s | +8.82% | 615 / 1,062 | 641 / 979 |
+| `20260830` | 66.70 tok/s | 67.57 tok/s | +1.31% | 657 / 1,044 | 654 / 1,053 |
+| `20260831` | 72.14 tok/s | 74.10 tok/s | +2.71% | 590 / 921 | 602 / 915 |
+| Mean | **67.82 tok/s** | **70.66 tok/s** | **+4.19%** | 1,862 / 3,027 total | 1,897 / 2,947 total |
+
+The candidate won all three pairs. Mean decode time fell from 15.131 to 14.512
+seconds. Normalized verifier-forward cost fell from 32.04 to 31.20 ms per
+call. Every run generated 1,024 tokens, traced once, and had zero repair and
+zero compiled-verifier fallback. Temperature-1 runs can follow different
+sampling and acceptance paths. The promotion decision therefore uses the
+three same-seed pairs, not a raw comparison with an earlier campaign mean.
+
 ## Rejected scheduling candidate
 
 The lazy stochastic D3 candidate built all three draft depths before one
@@ -98,6 +153,9 @@ against the unchanged prior step.
 | 0 | `4ce96908` | Unchanged MTPLX 2.10 | **55.42 tok/s mean; 53.43 median** | Three-seed production control |
 | 1 | `ffdb8684` | Batch fixed-M4 target distributions | **55.80 tok/s mean; 53.78 median** | +0.68% mean with identical paired work |
 | 2 | `c5034156` | Construction-bound fixed-M4 compiled verifier | **67.63 tok/s mean and median** | +21.19% mean vs Step 1; 36.38 ms weighted verify cost |
+| 3 | `ccf817e0` | Stage exact fixed-M4 n-gram sidecar inputs | **68.01 tok/s promotion mean** | +3.25% matched three-run mean |
+| 4 | `03bc460e` | Select fixed-M4 n-gram rows from the host token ledger | **71.42 tok/s promotion mean** | +4.65% matched three-run mean |
+| 5 | `3fe8da54` | Fuse the fixed-M4 combine tail after stock quantized matmuls | **70.66 tok/s promotion mean** | +4.19% matched three-run mean |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
 experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
@@ -110,19 +168,18 @@ diagnostic and is not a promotion result.
 
 | Decode measurement | Result |
 |---|---:|
-| GPU timeline | 17.195 s |
-| Metal GPU work | 13.203 s |
-| Metal GPU idle | 3.992 s |
-| GPU use | 76.78% |
-| One-time M4 compilation gap | 0.753 s |
-| Steady idle after compilation | 3.240 s |
-| Steady GPU use | 80.30% |
+| GPU timeline | 15.165 s |
+| Metal GPU work | 12.457 s |
+| Metal GPU idle | 2.708 s |
+| GPU use | 82.14% |
+| Host-late submission | 2.170 s |
+| Encoded or driver-side gaps | 0.502 s |
 | Explicit GPU-drain wait | 0.025 ms |
 
-The steady idle time contains 2.563 seconds of host-late submission gaps and
-0.677 seconds of encoded or driver-side gaps. These are many small gaps, not
-one long wait. Removing all idle time still requires a separate GPU-compute
-win to reach 90 tok/s.
+These are many small gaps, not one long wait. The largest named transition is
+stochastic draft sampling into the next embedding gather: 0.926 seconds across
+992 transitions. This profile is from retained Step 4. Step 5 still needs a
+fresh profile before the next optimization is selected.
 
 ## What MTPLX 2.10 already contains
 
