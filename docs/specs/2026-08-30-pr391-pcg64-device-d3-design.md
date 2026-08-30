@@ -51,8 +51,11 @@ tape_draws = 7 * (max_output_tokens + 1)
 Three draws cover the fixed D3 proposal chain.  At most four more cover three
 accept tests plus either correction or bonus selection.  Every completed cycle
 commits at least one token, so this bound covers a 16K request.  It occupies
-917,560 bytes for 16,384 output tokens, plus the same device allocation: less
-than 1 MiB on each side.
+917,560 bytes for 16,384 output tokens.  Before device installation, reinterpret
+the float64 tape on the CPU as its exact `uint64` bit patterns and create a
+`uint64` MLX array of the same size.  The Metal graph never constructs or casts
+an unsupported float64 value.  Host and device copies remain less than 1 MiB
+each.
 
 The cloned generator advances only to populate the tape.  The authoritative
 request generator remains at its initial state.  A request-owned tape cursor
@@ -108,17 +111,73 @@ The graph returns the three tokens and their proposal distributions for the
 unchanged host target-verification stage.  It evaluates once after the third
 level rather than materializing each level's support and token separately.
 
-The existing `_device_draft_q_arrays` route is not presumed correct for this
-lane: its float32 normalization is only approximately equal to the current
-host path.  Before the strategy can be installed, a guarded feasibility test
-must prove that Metal-backed arithmetic reproduces the host support, cumulative
-probabilities, and selected token on captured production rows.  Exposing
-`float64` in the MLX API is not proof that the Metal graph supports it or that
-it matches NumPy.
+The existing `_device_draft_q_arrays` route is not correct for this lane.  It
+normalizes and accumulates in float32, does not explicitly impose ascending
+token-ID order for equal selected logits, and consumes `mx.random`.  Existing
+tolerance and empirical-distribution tests cannot promote it.
 
-If native device arithmetic cannot meet this contract, Stage 1 stops without a
-fallback.  A custom two-word integer or fixed-point CDF would be a separately
-designed experiment; silently casting to float32 is prohibited.
+A guarded feasibility probe established the actual device boundary on the M5
+Max with MLX 0.32.2:
+
+- constructing or evaluating `mx.float64` fails with `ValueError: float64 is
+  not supported on the GPU`;
+- native and compiled `uint64` arithmetic, comparisons, bitwise operations,
+  shifts, division, and remainder pass exact host parity;
+- custom Metal `uint32` carry, 32-bit and 64-bit `mulhi`, and `ulong`
+  round-trips pass exact host parity; and
+- a custom-kernel token can feed a compiled downstream gather with one terminal
+  evaluation and no intermediate host materialization.
+
+Therefore native float64 is rejected, while a fixed-width positive-finite
+software-binary64 selector remains feasible.  Feasibility is not a performance
+result: selector parity and isolated latency must pass before D3 integration.
+
+## Division-Minimized Exact Selector
+
+The exact selector consumes the pre-top-p top-20 token IDs, scaled-logit bits,
+float32 probability bits, and one PCG64 uniform bit pattern.  One 32-lane SIMD
+group performs the two required support-order stages and the pinned NumPy 2.4.4
+arithmetic.  The reachable values are positive finite probabilities, so this
+is a bounded selector rather than a general software floating-point library.
+
+The literal host path appears to require three binary64 division passes, but
+only the first is unconditional:
+
+1. Compute the retained-mass total in NumPy's exact small-array reduction order
+   while the retained probabilities are still in rank order.  Then permute the
+   retained IDs/probabilities into ascending token-ID order and produce the
+   first normalized probabilities with the pre-permutation total.  This literal
+   order matches `_serial_row_distribution` and costs at most 20 independent
+   divisions, evaluated in parallel lanes.
+2. Sum those normalized values in the same NumPy order.  If the sum is exactly
+   binary64 `1.0`, reuse them directly.  Otherwise perform one exceptional
+   second parallel division pass.  A 200,000-row synthetic screen observed the
+   exact-`1.0` case in 157,887 rows (78.94 percent); captured production rows,
+   not this screen, determine the real rate.
+3. Build the sequential choice CDF.  Do not evaluate every `cdf / cdf[-1]`
+   quotient, but also do not compare the raw exact ratio directly.  NumPy first
+   rounds that quotient to binary64 and then applies the strict `side="right"`
+   comparison.  For a PCG64 uniform `u = R / 2**53`, compare the exact ratio
+   against the exact midpoint between `u` and `nextafter(u, +inf)`, resolving
+   equality with binary64 ties-to-even.  A high/low integer cross-product can
+   implement this predicate without division while remaining equivalent to
+   `RN64(cdf / cdf[-1]) > u`.
+
+The kernel returns the selected token plus retained support and first-normalized
+binary64 bit patterns.  After all three dependent draft levels complete, the
+host reinterprets those bits and invokes the unchanged `SparseDistribution`
+constructor.  This preserves the proposal probabilities used by target
+acceptance without inserting a host boundary between draft depths.
+
+After the division-minimized exact kernel has passed its isolated parity and
+latency gate, a diagnostic-only float32 arm measures the practical drift on the
+same captured production rows.  It reports actual token mismatches, continuous
+boundary-disagreement mass, and the exact count of PCG64 numerators
+`R in [0, 2**53)` that select different token labels.  It also isolates drift
+from casting the uniform to float32 versus drift from float32 probability
+arithmetic.  A zero mismatch on the three benchmark seeds is useful performance
+research, but it does not prove arbitrary-request parity and does not by itself
+relax the only-cutoff-ties semantic contract.
 
 ## Implementation Boundaries
 
