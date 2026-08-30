@@ -129,8 +129,14 @@ Max with MLX 0.32.2:
   evaluation and no intermediate host materialization.
 
 Therefore native float64 is rejected, while a fixed-width positive-finite
-software-binary64 selector remains feasible.  Feasibility is not a performance
-result: selector parity and isolated latency must pass before D3 integration.
+software-binary64 selector remains technically feasible.  It is not the next
+implementation step.  First implement the division-minimized schedule as a
+distinct NumPy float64 reference and prove bit and token equality against the
+literal NumPy 2.4.4 pipeline.  Then convert that proven schedule to NumPy
+float32 and measure its exact drift and CPU work.  Only after production-row
+capture and an explicit arithmetic-contract decision may the selected schedule
+be ported to Metal.  Capability is not a performance result: the eventual
+Metal candidate still needs isolated latency and D3 A/B gates.
 
 ## Division-Minimized Exact Selector
 
@@ -169,15 +175,26 @@ host reinterprets those bits and invokes the unchanged `SparseDistribution`
 constructor.  This preserves the proposal probabilities used by target
 acceptance without inserting a host boundary between draft depths.
 
-After the division-minimized exact kernel has passed its isolated parity and
-latency gate, a diagnostic-only float32 arm measures the practical drift on the
-same captured production rows.  It reports actual token mismatches, continuous
+Before any selector is ported to Metal, implement the division-minimized
+schedule in NumPy float64 and prove it equivalent to the literal host path,
+including the exceptional second normalization, `cdf[-1]` normalization, and
+the midpoint/ties-to-even final predicate.  Then apply that proven schedule in
+NumPy float32.  Report actual token mismatches, continuous
 boundary-disagreement mass, and the exact count of PCG64 numerators
-`R in [0, 2**53)` that select different token labels.  It also isolates drift
-from casting the uniform to float32 versus drift from float32 probability
-arithmetic.  A zero mismatch on the three benchmark seeds is useful performance
-research, but it does not prove arbitrary-request parity and does not by itself
-relax the only-cutoff-ties semantic contract.
+`R in [0, 2**53)` that select different token labels.  Also isolate drift from
+casting the uniform to float32 versus drift from float32 probability arithmetic,
+and measure diagnostic CPU operation counts/timing for the literal float64,
+reduced float64, and reduced float32 schedules.  These CPU timings do not
+predict GPU TPS; they decide which schedule is worth porting.
+
+Porting to Metal is the last selector step.  If float32 has any non-tie grid
+drift, it remains ineligible under the current semantic contract unless the
+user explicitly changes that contract; in that case the reduced exact schedule
+is the Metal candidate.  If float32 is explicitly authorized after its drift
+receipt, the reduced float32 schedule may instead be ported.  Either route must
+show an isolated kernel advantage and a corrected end-to-end D3 A/B win.  A
+zero mismatch on the three benchmark seeds does not prove arbitrary-request
+parity.
 
 ## Implementation Boundaries
 
