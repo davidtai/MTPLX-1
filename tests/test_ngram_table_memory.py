@@ -26,6 +26,7 @@ from mtplx.memory_plan import (
     plan_memory,
 )
 from mtplx.models.qwen4_exp import NGramTable, _ngram_resident_policy
+from mtplx.profiles import normalize_runtime_env_overrides
 
 ROWS, DIM, GROUP, BITS = 64, 64, 32, 4
 
@@ -147,6 +148,98 @@ def test_big_gathers_bypass_hot_cache(tmp_path):
     out = _gather(table, ids)
     assert np.array_equal(out, np.asarray(ref.astype(mx.float32))[ids])
     assert not sidecar._hot  # bypassed: nothing cached, values still exact
+
+
+def test_decode_prefetch_uses_one_job_per_row_and_region(tmp_path, monkeypatch):
+    path = tmp_path / NGRAM_TABLE_FILENAME
+    _write_quantized_table(path)
+    sidecar = _attached_table(path)._sidecar
+
+    scheduled = []
+
+    class ImmediatePool:
+        def map(self, fn, jobs):
+            jobs = list(jobs)
+            scheduled.extend(jobs)
+            return [fn(job) for job in jobs]
+
+    preads = []
+
+    def record_pread(fd, size, offset):
+        preads.append((fd, size, offset))
+        return b"\0" * size
+
+    sidecar._pool = ImmediatePool()
+    monkeypatch.setattr("mtplx.models.qwen4_exp.os.pread", record_pread)
+    rows = np.arange(16, dtype=np.int64)
+
+    sidecar._warm(rows)
+
+    expected_reads = [
+        (sidecar._fd, row_bytes, base + int(row) * row_bytes)
+        for row in rows
+        for base, row_bytes in sidecar._row_meta
+    ]
+    assert len(scheduled) == 48
+    assert preads == expected_reads
+
+
+def test_prefill_prefetch_keeps_chunk_jobs_above_decode_boundary(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / NGRAM_TABLE_FILENAME
+    _write_quantized_table(path)
+    sidecar = _attached_table(path)._sidecar
+
+    scheduled = []
+
+    class ImmediatePool:
+        def map(self, fn, jobs):
+            jobs = list(jobs)
+            scheduled.extend(jobs)
+            return [fn(job) for job in jobs]
+
+    preads = []
+
+    def record_pread(fd, size, offset):
+        preads.append((fd, size, offset))
+        return b"\0" * size
+
+    sidecar._pool = ImmediatePool()
+    monkeypatch.setattr("mtplx.models.qwen4_exp.os.pread", record_pread)
+    rows = np.arange(17, dtype=np.int64)
+
+    sidecar._warm(rows)
+
+    assert len(scheduled) == 17
+    assert all(isinstance(chunk, np.ndarray) for chunk in scheduled)
+    assert len(preads) == len(rows) * len(sidecar._row_meta)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 16), ("0", 1), ("1", 1), ("23", 23), ("65", 64), ("bad", 16)],
+)
+def test_prefetch_worker_count_is_construction_bound_and_bounded(
+    tmp_path, monkeypatch, value, expected
+):
+    if value is None:
+        monkeypatch.delenv("MTPLX_NGRAM_PREFETCH_WORKERS", raising=False)
+    else:
+        monkeypatch.setenv("MTPLX_NGRAM_PREFETCH_WORKERS", value)
+    path = tmp_path / NGRAM_TABLE_FILENAME
+    _write_quantized_table(path)
+
+    sidecar = _attached_table(path)._sidecar
+
+    assert sidecar.prefetch_workers == expected
+    assert sidecar._pool._max_workers == expected
+
+
+def test_prefetch_worker_count_is_allowed_in_model_runtime_contract():
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_NGRAM_PREFETCH_WORKERS": 32}
+    ) == {"MTPLX_NGRAM_PREFETCH_WORKERS": "32"}
 
 
 def test_raw_bf16_sidecar_mode(tmp_path):

@@ -366,6 +366,9 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # (2026-08-28, default 1024; 0 disables) — registered ahead per the
         # boot-trap law so packs/profiles may stamp it.
         "MTPLX_NGRAM_HOT_MB",
+        # Construction-time SSD prefetch pool width. The sidecar bounds model
+        # contract values to 1..64 and keeps 16 as the production default.
+        "MTPLX_NGRAM_PREFETCH_WORKERS",
         # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
         # NAX verify patch OFF under turbo until it earns a family receipt.
         "MTPLX_NAX_VERIFY",

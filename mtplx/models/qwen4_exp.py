@@ -3381,8 +3381,10 @@ class _SidecarGather:
     warm-up pass first (QD16, ~12.6us effective) then the numpy fancy-index
     hits page-cache-warm rows (~1.2us). Measured 2026-08-26: without this,
     a cold 100k-token prefill pays ~36s of serial faults; with it, ~7.5s of
-    parallel IO that overlaps page-cache warming. MTPLX_NGRAM_PREFETCH=0
-    disables it (A/B arm); prefetch_batches is the engagement receipt.
+    parallel IO that overlaps page-cache warming. The construction-time
+    MTPLX_NGRAM_PREFETCH_WORKERS knob bounds the pool to 1..64 workers and
+    defaults to 16. MTPLX_NGRAM_PREFETCH=0 disables it (A/B arm);
+    prefetch_batches is the engagement receipt.
     """
 
     # Decode-step gathers are a few dozen rows; the LRU serves those. A
@@ -3390,6 +3392,7 @@ class _SidecarGather:
     # would cost more than the IO, so big gathers bypass to the vectorized
     # memmap path (which still warms the page cache for later decode).
     _HOT_PATH_MAX_ROWS = 4096
+    _ROW_REGION_PREFETCH_MAX_ROWS = 16
 
     def __init__(self, path: Path, entries, bits: int, group_size: int):
         import mmap as _mmap
@@ -3417,11 +3420,19 @@ class _SidecarGather:
             self._row_meta.append((offset, int(shape[1]) * itemsize))
         self._pool = None
         self.prefetch_batches = 0
+        try:
+            requested_workers = int(
+                os.environ.get("MTPLX_NGRAM_PREFETCH_WORKERS", "16")
+            )
+        except ValueError:
+            requested_workers = 16
+        self.prefetch_workers = max(1, min(64, requested_workers))
         if os.environ.get("MTPLX_NGRAM_PREFETCH", "1") != "0":
             from concurrent.futures import ThreadPoolExecutor
 
             self._pool = ThreadPoolExecutor(
-                max_workers=16, thread_name_prefix="ngram-prefetch"
+                max_workers=self.prefetch_workers,
+                thread_name_prefix="ngram-prefetch",
             )
         # Hot-row LRU: raw row bytes per map, keyed by row id. Row
         # popularity is Zipf (common n-grams recur constantly) even though
@@ -3454,6 +3465,21 @@ class _SidecarGather:
     def _warm(self, rows) -> None:
         fd = self._fd
         metas = self._row_meta
+
+        if len(rows) <= self._ROW_REGION_PREFETCH_MAX_ROWS:
+
+            def touch_region(job):
+                row, base, row_bytes = job
+                os.pread(fd, row_bytes, base + row * row_bytes)
+
+            jobs = (
+                (int(row), base, row_bytes)
+                for row in rows
+                for base, row_bytes in metas
+            )
+            list(self._pool.map(touch_region, jobs))
+            self.prefetch_batches += 1
+            return
 
         def touch(chunk):
             for r in chunk:
