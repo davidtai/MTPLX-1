@@ -28,12 +28,20 @@ The fixed 1,024-token output makes candidate A/Bs comparable; it is not a
 canonical production response length. Serving remains stop-driven and supports
 arbitrary output lengths with bounded verifier growth.
 
-The final 2.10.1 integration completed actual 16,384- and 32,768-token outputs
-from the 16K prompt. The runs crossed 31 and 63 fixed-M4 capacity boundaries
-with zero fallback, demotion, growth demotion, route change, or repair. The 32K
-run sustained 72.60 decode tok/s and peaked at 81.39 GiB. Its total active-memory
-increase over the loaded model was 3.60 GiB; extending the output from 16K to
-32K added 0.434 GiB of active memory.
+The final adaptive schedule completed actual 16,384- and 32,768-token outputs
+from the 16K prompt. Starting at 1K, the 16K production-cap run doubled through
+2K, 4K, 8K, and 16K in four transitions and five compiled traces. The 32K
+diagnostic added one capped 16K chunk, for five transitions and six traces.
+Both runs had zero fallback, demotion, growth demotion, route change, or repair.
+The 16K and 32K runs sustained 70.05 and 75.52 decode tok/s respectively and
+shared the same 81.39 GiB peak. Extending the output from 16K to 32K added
+0.4335 GiB of active memory. The 32K run is a diagnostic beyond the production
+16K output cap, not a change to that cap.
+
+Final adaptive receipts:
+
+- `.benchmark-artifacts/pr391/rebench3-1788129100-corrected-adaptive1k-output16k-final-fixed-16k-output16384.json`
+- `.benchmark-artifacts/pr391/rebench3-1788129110-corrected-adaptive1k-output32k-diagnostic-fixed-16k-output32768.json`
 
 The 29.8 GiB n-gram table stays in a file-backed memory map. Production uses
 the required bounded 1 GiB hot-row cache above the memory map. All optimization
