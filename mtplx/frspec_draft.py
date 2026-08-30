@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 _BUILTIN_VOCABS = {
     "qwen38-code-64k": Path(__file__).with_name("data")
-    / "qwen38_code_ranked_64k.npy",
+    / "qwen38_code_ranked_64k.json",
 }
 
 

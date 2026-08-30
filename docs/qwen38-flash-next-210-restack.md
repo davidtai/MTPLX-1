@@ -147,8 +147,8 @@ generated 1,024 tokens with zero repair and zero compiled-verifier fallback.
 
 The built-in row list comes from a generic code corpus that excludes benchmark
 fixtures and tests. It covers 99.6446% of a held-out 1,005,404-token code set.
-The packaged NPY SHA-256 is
-`922a4d0570ce0a79e03c1e1ecb25e6c8c1e9cae943b2c0d5ce11874d42d74a17`.
+The packaged JSON SHA-256 is
+`950adfea038612e28a3839c98c9be73f76f422fcde0596bb4588ac774e7c1fba`.
 Installation validates the native Q8/group-64/affine contract once and then
 binds the proposal callable directly. It does not add a per-token eligibility
 check or fallback.
