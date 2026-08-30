@@ -291,10 +291,23 @@ sorting 20 proposal rows instead of 80. Its production mean is confirmed, but
 it does not yet have a new MLX timeline trace. A later trace must measure the
 remaining per-transition gap before recording a new GPU-use percentage.
 
-Step 8 removes one QSA gather dispatch in each of the 12 QSA layers for every
-fixed-M4 verifier window. Its production mean and per-window verifier cost are
-confirmed, but it does not yet have a new MLX timeline trace. No new GPU-use
-percentage is claimed for this step.
+Step 8 was traced with the same MLX 0.32.2 profiler. The Step 7 and Step 8
+traces used 320 and 378 compiled windows, so this table compares cost per
+window.
+
+| Decode profile per compiled window | Step 7 | Step 8 | Change |
+|---|---:|---:|---:|
+| GPU timeline | 44.31 ms | 41.75 ms | **-5.79%** |
+| GPU busy | 35.28 ms | 33.84 ms | **-4.07%** |
+| GPU idle | 9.03 ms | 7.91 ms | **-12.48%** |
+| Host-late submission | 7.26 ms | 6.24 ms | **-14.12%** |
+| Encoded or driver-side gaps | 1.67 ms | 1.57 ms | **-5.97%** |
+| Command buffers | 161.83 | 159.72 | **-1.30%** |
+
+Raw GPU use rose from 79.62% to 81.06%. The largest sampling-to-next-gather
+gap fell from 1.112 to 0.806 ms per transition. This confirms that the fused
+gather reduces GPU work and the scheduling gap around that work. The trace is
+diagnostic and is not used as a throughput promotion result.
 
 ## What MTPLX 2.10 already contains
 
