@@ -311,6 +311,7 @@ def test_flash_next_production_geometry_defaults_fixed_m4_verifier(
         "MTPLX_COMPILED_VERIFY",
         "MTPLX_QWEN4_FIXED_M4_VERIFY",
         "MTPLX_QWEN4_M4_STAGE3",
+        "MTPLX_QSA_M4_FUSED_KV_GATHER",
     ):
         monkeypatch.delenv(key, raising=False)
     args = argparse.Namespace(
@@ -325,6 +326,7 @@ def test_flash_next_production_geometry_defaults_fixed_m4_verifier(
     assert overrides["MTPLX_COMPILED_VERIFY"] == "1"
     assert overrides["MTPLX_QWEN4_FIXED_M4_VERIFY"] == "1"
     assert overrides["MTPLX_QWEN4_M4_STAGE3"] == "1"
+    assert overrides["MTPLX_QSA_M4_FUSED_KV_GATHER"] == "1"
 
     monkeypatch.setenv("MTPLX_QWEN4_M4_STAGE3", "0")
     overrides = _server_runtime_env_overrides(
@@ -340,6 +342,7 @@ def test_flash_next_production_geometry_defaults_fixed_m4_verifier(
     overrides = _server_runtime_env_overrides(args, {})
     assert "MTPLX_QWEN4_FIXED_M4_VERIFY" not in overrides
     assert "MTPLX_QWEN4_M4_STAGE3" not in overrides
+    assert "MTPLX_QSA_M4_FUSED_KV_GATHER" not in overrides
 
 
 # ---------------------------------------------------------------------------

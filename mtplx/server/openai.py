@@ -844,17 +844,23 @@ def _server_runtime_env_overrides(
             if os.environ.get(key) is None:
                 overrides.setdefault(key, value)
         if _served_model_is_qwen4_fixed_m4(args):
-            # Construction-bound fixed-M4 verifier and stock-QMM combine tail.
+            # Construction-bound fixed-M4 verifier, stock-QMM combine tail,
+            # and one-dispatch QSA K/V rows gather. The gather reads each
+            # selected token index once and copies four BF16 values per
+            # thread; non-M4 physical widths keep the explicit stock route.
             # The combine tail keeps both optimized quantized matmuls and
             # replaces routed weighting/reduction plus shared gating/final add
             # with one dispatch. Three paired 16K/1K production seeds on
             # 2026-08-29 improved mean decode 67.82 -> 70.66 tok/s (+4.19%).
+            # The fused QSA gather improved the retained 3-seed 16K/1K mean
+            # 77.77 -> 80.44 tok/s (+3.44%) on 2026-08-30.
             # The config predicate below keeps both routes off every
             # unmeasured qwen4_exp layout; explicit operator exports still win.
             for key in (
                 "MTPLX_COMPILED_VERIFY",
                 "MTPLX_QWEN4_FIXED_M4_VERIFY",
                 "MTPLX_QWEN4_M4_STAGE3",
+                "MTPLX_QSA_M4_FUSED_KV_GATHER",
             ):
                 operator_value = str(os.environ.get(key) or "").strip()
                 if operator_value:
