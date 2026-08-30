@@ -1871,52 +1871,11 @@ class QSAIndexer(nn.Module):
         return cache.pooled[:, :nb_total, :]
 
     def _extend_pooled_fixed(self, cache: QSACache, total) -> mx.array:
-        """Route the trace-static production M4 shape to one direct update."""
-
-        step_rows = int(getattr(cache, "_last_write_rows", 1))
-        if cache.fixed_m4_direct_pooled and step_rows == self.ratio == 4:
-            return self._extend_pooled_fixed_m4(cache, total)
-        return self._extend_pooled_fixed_generic(cache, total)
-
-    def _extend_pooled_fixed_m4(self, cache: QSACache, total) -> mx.array:
-        """Append the one block proven complete by a fixed M4/ratio-4 step.
-
-        The fixed cache owner reserves the whole output span before tracing,
-        so ``block`` is in bounds. Four added rows advance every offset
-        residue by exactly one complete block, making a conditional write
-        unnecessary.
-        """
-
-        del total
-        block = cache.offset // self.ratio
-        start = block * self.ratio
-        fresh = mx.slice(
-            cache.raw_keys,
-            start,
-            axes=(1,),
-            slice_size=(1, self.ratio, self.head_dim),
-        )
-        fresh = fresh.reshape(1, 1, self.ratio, self.head_dim)
-        candidate = mx.mean(fresh.astype(mx.float32), axis=2).astype(fresh.dtype)
-        candidate = self.k_layernorm(candidate)
-        starts = block.reshape(1).astype(mx.int32) * self.ratio
-        cos, sin = _rope_cos_sin(
-            starts,
-            self._inv_freq,
-            self._rope_attention_scaling,
-        )
-        candidate = _apply_partial_rope(
-            candidate[:, :, None, :], cos, sin
-        )[:, :, 0, :]
-        pooled = mx.slice_update(cache.pooled, candidate, block, axes=(1,))
-        cache.pooled = pooled
-        return pooled
-
-    def _extend_pooled_fixed_generic(self, cache: QSACache, total) -> mx.array:
         """Update only newly completed blocks in a fixed QSA bank.
 
-        Verify width is static at trace time. Shapes outside the direct
-        M4/ratio-4 route retain the conditional fixed-shape update loop.
+        Verify width is static at trace time.  At the production M4/ratio-4
+        shape at most one block completes, so this is one gather, one pooled
+        projection, and one conditional fixed-shape slice update.
         """
         step_rows = int(getattr(cache, "_last_write_rows", 1))
         nb_old = cache.offset // self.ratio
