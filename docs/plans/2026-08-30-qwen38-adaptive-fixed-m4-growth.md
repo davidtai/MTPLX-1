@@ -4,7 +4,7 @@
 
 **Goal:** Reduce capacity-transition overhead on the 16K-prefill/1K-output TPS cell while preserving variable-output correctness through 32K.
 
-**Architecture:** Keep physical verification width M=4 and all acceptance arithmetic unchanged. Change only the construction-owned fixed-M4 capacity policy: large requests initially reserve 1,024 tokens; after an overrun, subsequent grants grow through 2K, 4K, and a capped 8K. The existing host-owned boundary transition grows every QSA leaf, rebinds the capacity-owned gather, and reinstalls the compiled graph.
+**Architecture:** Keep physical verification width M=4 and all acceptance arithmetic unchanged. Change only the construction-owned fixed-M4 capacity policy: large requests initially reserve 1,024 tokens; after an overrun, subsequent grants double through 2K, 4K, 8K, and a capped 16K. The existing host-owned boundary transition grows every QSA leaf, rebinds the capacity-owned gather, and reinstalls the compiled graph.
 
 **Tech Stack:** Python, MLX, pytest, guarded Apple Metal benchmarks.
 
@@ -34,7 +34,7 @@
 ```python
 @pytest.mark.parametrize(
     ("current", "expected"),
-    [(1024, 2048), (2048, 4096), (4096, 8192), (8192, 8192), (16384, 16384)],
+    [(1024, 2048), (2048, 4096), (4096, 8192), (8192, 16384), (16384, 16384)],
 )
 def test_fixed_m4_growth_grant_doubles_to_8k_cap(current, expected):
     from mtplx.graphbank import _next_fixed_m4_growth_tokens
@@ -84,7 +84,7 @@ Expected: failures because the helpers do not exist and the default remains 512.
 - [ ] **Step 1: Implement the grant helpers and 1K default**
 
 ```python
-_FIXED_M4_MAX_GROWTH_TOKENS = 8192
+_FIXED_M4_MAX_GROWTH_TOKENS = 16384
 
 
 def _next_fixed_m4_growth_tokens(current: int) -> int:
@@ -102,8 +102,9 @@ def _fixed_m4_capacity_growth(
     return next_capacity, _next_fixed_m4_growth_tokens(growth_tokens)
 ```
 
-Change `_compiled_verify_growth_reserve()` default and invalid-value fallback
-from 512 to 1024.
+Add a fixed-M4-only initial-reserve resolver that defaults to 1024 while
+leaving `_compiled_verify_growth_reserve()` at 512 for generic banks. An
+explicit `MTPLX_COMPILED_VERIFY_GROWTH_RESERVE` remains authoritative.
 
 - [ ] **Step 2: Install and advance the fixed-M4 grant**
 

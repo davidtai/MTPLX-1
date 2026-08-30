@@ -4,8 +4,8 @@
 
 Improve long-output TPS by reducing fixed-M4 cache-capacity transitions. For a
 large request, reserve 1,024 output tokens at first promotion, then grow the
-capacity grant through 2,048, 4,096, and 8,192 tokens. Further overruns grow in
-8,192-token chunks. Small declared output budgets remain sized to their actual
+capacity grant through 2,048, 4,096, 8,192, and 16,384 tokens. Further
+overruns grow in 16,384-token chunks. Small declared output budgets remain sized to their actual
 budget plus the speculative window rather than being rounded up to 1,024.
 
 The unchanged production policy is the benchmark control. It starts large
@@ -25,9 +25,10 @@ output required 63 capacity transitions and measured 465.253 seconds wall,
 
 ## Capacity Policy
 
-Construction resolves the initial reserve once. The default ceiling changes
-from 512 to 1,024 tokens, while explicit smaller request budgets still tighten
-the allocation to `request_max_tokens + speculative_headroom`.
+Construction resolves the initial reserve once. The strict Qwen4 fixed-M4
+ceiling changes from 512 to 1,024 tokens; the generic compiled verifier remains
+at 512. Explicit smaller request budgets still tighten the allocation to
+`request_max_tokens + speculative_headroom`.
 
 An installed Qwen4 fixed-M4 dispatch owns a `growth_tokens` grant. When the
 host-owned committed-token boundary shows that the next four-row window cannot
@@ -35,20 +36,19 @@ fit, it grows every QSA state leaf by the current grant, then advances the
 grant using:
 
 ```text
-next_growth = min(current_growth * 2, 8192)
+next_growth = min(current_growth * 2, 16384)
 ```
 
-An explicit operator reserve larger than 8,192 remains authoritative and is
+An explicit operator reserve larger than 16,384 remains authoritative and is
 never reduced. Growth may be capped at the request's reachable logical end to
 avoid allocating capacity the request cannot address. The ordinary compiled
 replay remains branch-free within each capacity generation; only the existing
 boundary transition performs this calculation.
 
 For a 32K output, the expected large-request grants are an initial 1K followed
-by 2K, 4K, 8K, 8K, and 8K growth steps, reducing capacity transitions from 63
-to about 6. Maximum unused
-target-QSA capacity after an overrun is below one 8K grant, approximately
-0.217 GiB for the measured 12-cache geometry.
+by 2K, 4K, 8K, and 16K growth steps, reducing capacity transitions from 63 to
+about 5. Maximum unused target-QSA capacity after an overrun is below one 16K
+grant, approximately 0.434 GiB for the measured 12-cache geometry.
 
 ## Correctness and Failure Handling
 
@@ -65,7 +65,7 @@ identical token digests, acceptance counts, and verifier work relative to the
 ## Verification
 
 1. Add focused tests before implementation for the 1,024 default, the
-   1K/2K/4K/8K grant sequence, request-end clamping, explicit operator
+   1K/2K/4K/8K/16K grant sequence, request-end clamping, explicit operator
    overrides, and compact final demotion.
 2. Run the fixed-M4, graph-bank, QSA, profile, and server suites under the
    exclusive GPU guard.
@@ -90,4 +90,4 @@ wall-time gain is noise, keep the proven 512-token policy.
   binding.** Grow all entries first and reinstall the capacity-owned route as
   one boundary transition; focused tests must fail on partial ownership.
 - **Minor: long grants waste memory when output stops just after an overrun.**
-  Cap grants at 8K and enforce the 0.5 GiB peak-memory promotion limit.
+  Cap grants at 16K and enforce the 0.5 GiB peak-memory promotion limit.
