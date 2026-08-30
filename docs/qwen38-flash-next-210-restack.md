@@ -39,6 +39,31 @@ The 29.8 GiB n-gram table stays in a file-backed memory map. Production uses
 the required bounded 1 GiB hot-row cache above the memory map. All optimization
 decisions use this configuration.
 
+## Verifier-overflow correction
+
+The original Step 8 headline is not valid current throughput evidence. That
+campaign generated 1,024 tokens while the installed fixed-M4 state bank had
+only 512 tokens of output headroom. Replaying beyond that fixed backing changed
+the stochastic proposal and acceptance trajectory. The retained kernels did
+not fail, but the run was no longer measuring the requested verifier state.
+
+The corrected fixed-M4 lifecycle starts with 1,024 tokens of headroom and grows
+before replay can cross the installed capacity. On the unchanged 16,384-token
+prompt, 1,024-token output, temperature-1 sampler, and three fixed seeds, the
+corrected stack measures:
+
+| Seed | Corrected decode | Compiled M4 calls | Fallback / repair |
+|---:|---:|---:|---:|
+| `20260829` | 65.002 tok/s | 382 | 0 / 0 s |
+| `20260830` | 64.559 tok/s | 389 | 0 / 0 s |
+| `20260831` | 70.005 tok/s | 341 | 0 / 0 s |
+| Mean | **66.522 tok/s** | **370.7** | **0 / 0 s** |
+
+All three corrected runs generated exactly 1,024 tokens. The valid response
+digests, acceptance counts, and verifier-call counts are the acceptance gate
+for later optimizations; only the documented exact cutoff tie-break may change.
+The old 80.44 tok/s mean is retained below only as a superseded audit record.
+
 ## Step 1 production boundary
 
 Decode throughput excludes prefill. Step 0 and Step 1 used the same three
@@ -195,7 +220,7 @@ repair and zero compiled-verifier fallback. The promotion rule allows exact
 cutoff-tie flips, so the decision uses the fixed three-seed throughput mean and
 does not require matching output digests.
 
-## Step 8 production boundary
+## Step 8 historical measurement (superseded)
 
 Step 8 fuses the fixed-M4 QSA key and value row gathers. The old path launched
 one gather for keys and another for values. The new Metal kernel reads each
@@ -211,11 +236,12 @@ explicit stock route.
 | `20260831` | 78.73 tok/s | 80.30 tok/s | 601 / 918 |
 | Mean | **77.77 tok/s** | **80.44 tok/s** | 1,917 / 2,791 total |
 
-The arithmetic mean improves by 3.44%. Mean decode time falls from 13.174 to
-12.731 seconds. Weighted verifier-forward cost falls from 31.84 to 31.01 ms
-per compiled window. The exact production-shape kernel test matches both stock
-gathers element for element. All runs generated 1,024 tokens with zero repair
-and zero compiled-verifier fallback.
+This historical arithmetic mean improved by 3.44%, and the exact
+production-shape kernel test matched both stock gathers element for element.
+However, these full-generation numbers used the undersized fixed state bank
+described above. They are not promotion evidence for the corrected verifier.
+The fused gather remains retained because its operator-level exactness still
+holds; current full-stack throughput is the corrected three-seed result above.
 
 ## Rejected scheduling candidate
 
@@ -235,7 +261,7 @@ The candidate was 3.90% below the Step 2 mean. Its weighted draft cost was
 9.27 ms per window versus 8.25 ms. The larger lazy graph increased host work,
 so this candidate is not retained.
 
-## Accepted optimization hill climb
+## Historical optimization hill climb
 
 This table records only changes that remain in the stack. Each new row must use
 the production configuration above and must show a matched, repeatable win
@@ -251,11 +277,12 @@ against the unchanged prior step.
 | 5 | `3fe8da54` | Fuse the fixed-M4 combine tail after stock quantized matmuls | **70.66 tok/s promotion mean** | +4.19% matched three-run mean |
 | 6 | `b9e1a3dd` | Bind a full-domain proposal over 65,536 code-ranked native Q8 rows | **76.71 tok/s promotion mean** | +6.27% matched three-run mean; draft time -23.32% |
 | 7 | `4f0e8604` | Compile fixed draft preparation and remove the 4k cutoff-tie proof superset | **77.77 tok/s promotion mean** | +1.38% fixed three-seed mean; draft time -11.76% |
-| 8 | `876bdeba` | Fuse fixed-M4 QSA key and value row gathers with vector-width 4 | **80.44 tok/s promotion mean** | +3.44% fixed three-seed mean; verifier forward -2.58% per window |
+| 8 | `876bdeba` | Fuse fixed-M4 QSA key and value row gathers with vector-width 4 | **80.44 tok/s superseded; corrected full stack 66.52 tok/s** | Operator parity retained; old full-run result invalidated by fixed-bank overflow |
 
 Invalid cache settings, duplicate defaults, profiler-only runs, rejected
-experiments, and unconfirmed samples do not become hill-climb rows. A confirmed
-optimization is added here after it is committed.
+experiments, and unconfirmed samples do not become hill-climb rows. Step 8 is
+kept in this historical table to make the invalidated claim explicit; it is no
+longer a confirmed 80+ tok/s result.
 
 ## Remaining GPU idle time
 
