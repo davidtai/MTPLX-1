@@ -799,6 +799,18 @@ class TensorOffsetQSACache:
             self.pooled, blocks, nb_start, axes=(1,)
         )
 
+    def pooled_f32_view(self, nb: int) -> mx.array:
+        """Return the fixed pooled backing in the selector's fp32 layout.
+
+        The ordinary QSA cache maintains a mutable mirror to avoid rebuilding
+        it during eager decode.  This adapter is an explicit compiled-graph
+        state carrier: deriving the view from its tracked pooled leaf keeps
+        every replay self-contained and prevents an untracked mirror from
+        becoming stale after a fixed-shape slice update.
+        """
+
+        return mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[:, None, :, :nb]
+
     def size(self) -> int:
         return self.kv.size()
 
