@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from dataclasses import dataclass
+from fractions import Fraction
 import json
 from pathlib import Path
 import time
@@ -15,7 +16,9 @@ import numpy as np
 
 
 PCG64_GRID_SIZE = 1 << 53
+REQUIRED_NUMPY_VERSION = "2.4.4"
 CANDIDATE_SCHEDULE_ID = "pr391_rn32_norm1_norm2_if_sum_ne_one_cdf_midpoint_v1"
+REDUCED_EXACT_SCHEDULE_ID = "pr391_rn64_norm1_norm2_if_sum_ne_one_midpoint_v1"
 
 
 @dataclass(frozen=True)
@@ -27,11 +30,39 @@ class PreparedRow:
     cdf: np.ndarray
 
 
+@dataclass(frozen=True)
+class ReducedExactRow:
+    """Exact float64 probabilities plus an unnormalized sequential CDF."""
+
+    token_ids: np.ndarray
+    probabilities: np.ndarray
+    raw_cdf: np.ndarray
+    second_normalization_skipped: bool
+
+
+@dataclass(frozen=True)
+class ReducedFloat32Row:
+    """Reduced float32 probabilities plus an unnormalized sequential CDF."""
+
+    token_ids: np.ndarray
+    probabilities: np.ndarray
+    raw_cdf: np.ndarray
+    second_normalization_skipped: bool
+
+
 def _validate_top_p(top_p: float) -> float:
     top_p = float(top_p)
     if not np.isfinite(top_p) or not 0.0 < top_p <= 1.0:
         raise ValueError("top_p must be finite and in (0, 1]")
     return top_p
+
+
+def _require_numpy_version() -> None:
+    if np.__version__ != REQUIRED_NUMPY_VERSION:
+        raise RuntimeError(
+            f"PR391 drift analysis requires exact NumPy {REQUIRED_NUMPY_VERSION}; "
+            f"found {np.__version__}"
+        )
 
 
 def _validate_row_inputs(
@@ -61,7 +92,9 @@ def _validate_row_inputs(
     if not np.all(np.isfinite(probs)):
         raise ValueError("candidate_probs must be finite")
     if np.any(probs < 0.0):
-        raise ValueError("candidate_probs must be non-negative")
+        raise ValueError("candidate_probs must be in [0, 1]")
+    if np.any(probs > 1.0):
+        raise ValueError("candidate_probs must be in [0, 1]")
     if not float(np.sum(probs, dtype=np.float64)) > 0.0:
         raise ValueError("each candidate_probs row must have positive mass")
     return ids, values, probs
@@ -150,6 +183,52 @@ def prepare_exact_host_row(
     return _normalize_and_cdf(retained_ids, retained_probs, dtype=np.dtype(np.float64))
 
 
+def prepare_reduced_exact_row(
+    candidate_ids: np.ndarray,
+    candidate_values: np.ndarray,
+    candidate_probs: np.ndarray,
+    *,
+    top_p: float = 0.95,
+) -> ReducedExactRow:
+    """Prepare literal float64 probabilities without final CDF division."""
+
+    ids, values, probs = _validate_row_inputs(
+        candidate_ids, candidate_values, candidate_probs
+    )
+    top_p = _validate_top_p(top_p)
+    retained_ids, retained_probs = _rank_and_filter(
+        ids,
+        values,
+        probs.astype(np.float64),
+        top_p=top_p,
+        dtype=np.dtype(np.float64),
+    )
+    first_total = np.sum(retained_probs, dtype=np.float64)
+    token_order = np.argsort(retained_ids)
+    retained_ids = retained_ids[token_order]
+    retained_probs = retained_probs[token_order]
+    normalized_once = (retained_probs / first_total).astype(np.float64, copy=False)
+    sanitized = np.where(
+        np.isfinite(normalized_once) & (normalized_once > 0.0),
+        normalized_once,
+        np.float64(0.0),
+    )
+    sparse_total = np.sum(sanitized, dtype=np.float64)
+    skip_second = bool(sparse_total.view(np.uint64) == np.float64(1.0).view(np.uint64))
+    probabilities = (
+        sanitized
+        if skip_second
+        else (sanitized / sparse_total).astype(np.float64, copy=False)
+    )
+    raw_cdf = np.cumsum(probabilities, dtype=np.float64)
+    return ReducedExactRow(
+        token_ids=retained_ids,
+        probabilities=probabilities,
+        raw_cdf=raw_cdf,
+        second_normalization_skipped=skip_second,
+    )
+
+
 def prepare_float32_row(
     candidate_ids: np.ndarray,
     candidate_values: np.ndarray,
@@ -178,6 +257,52 @@ def prepare_float32_row(
     )
 
 
+def prepare_reduced_float32_row(
+    candidate_ids: np.ndarray,
+    candidate_values: np.ndarray,
+    candidate_probs: np.ndarray,
+    *,
+    top_p: float = 0.95,
+) -> ReducedFloat32Row:
+    """Prepare reduced float32 probabilities without final CDF division."""
+
+    ids, values, probs = _validate_row_inputs(
+        candidate_ids, candidate_values, candidate_probs
+    )
+    top_p = _validate_top_p(top_p)
+    retained_ids, retained_probs = _rank_and_filter(
+        ids,
+        values,
+        probs,
+        top_p=top_p,
+        dtype=np.dtype(np.float32),
+    )
+    first_total = np.sum(retained_probs, dtype=np.float32)
+    token_order = np.argsort(retained_ids)
+    retained_ids = retained_ids[token_order]
+    retained_probs = retained_probs[token_order]
+    normalized_once = (retained_probs / first_total).astype(np.float32, copy=False)
+    sanitized = np.where(
+        np.isfinite(normalized_once) & (normalized_once > 0.0),
+        normalized_once,
+        np.float32(0.0),
+    )
+    sparse_total = np.sum(sanitized, dtype=np.float32)
+    skip_second = bool(sparse_total.view(np.uint32) == np.float32(1.0).view(np.uint32))
+    probabilities = (
+        sanitized
+        if skip_second
+        else (sanitized / sparse_total).astype(np.float32, copy=False)
+    )
+    raw_cdf = np.cumsum(probabilities, dtype=np.float32)
+    return ReducedFloat32Row(
+        token_ids=retained_ids,
+        probabilities=probabilities,
+        raw_cdf=raw_cdf,
+        second_normalization_skipped=skip_second,
+    )
+
+
 def select_token(row: PreparedRow, uniform: float, *, cast_uniform: bool) -> int:
     """Select with right-sided search, safely mapping rounded 1.0 to the tail."""
 
@@ -193,6 +318,119 @@ def select_token(row: PreparedRow, uniform: float, *, cast_uniform: bool) -> int
     index = int(np.searchsorted(search_cdf, search_uniform, side="right"))
     index = min(index, int(row.token_ids.size) - 1)
     return int(row.token_ids[index])
+
+
+def _pcg64_grid_integer(uniform: float) -> int:
+    uniform = float(uniform)
+    if not np.isfinite(uniform) or not 0.0 <= uniform < 1.0:
+        raise ValueError("uniform must be finite and in [0, 1)")
+    scaled = uniform * PCG64_GRID_SIZE
+    integer = int(scaled)
+    if float(integer / PCG64_GRID_SIZE) != uniform:
+        raise ValueError("uniform must lie on the exact PCG64 53-bit grid")
+    return integer
+
+
+def _fraction_from_float(value: float) -> Fraction:
+    return Fraction(*float(value).as_integer_ratio())
+
+
+def _rounded_ratio_greater_than_grid(
+    numerator: float,
+    denominator: float,
+    integer: int,
+) -> bool:
+    """Test RN64(numerator/denominator) > integer/2**53 sans division."""
+
+    ratio = _fraction_from_float(numerator) / _fraction_from_float(denominator)
+    return _rounded_fraction_greater_than_grid(ratio, integer)
+
+
+def _rounded_fraction_greater_than_grid(ratio: Fraction, integer: int) -> bool:
+    """Apply the RN-even midpoint predicate to an exact rational value."""
+
+    uniform = np.float64(integer / PCG64_GRID_SIZE)
+    successor = np.nextafter(uniform, np.float64(np.inf))
+    midpoint = (_fraction_from_float(uniform) + _fraction_from_float(successor)) / 2
+    if ratio != midpoint:
+        return ratio > midpoint
+    # At the exact midpoint, IEEE round-to-nearest-even chooses the endpoint
+    # whose significand has an even low bit. Positive adjacent float bit
+    # patterns differ by one, so successor's low bit identifies that winner.
+    successor_bits = int(successor.view(np.uint64))
+    return successor_bits & 1 == 0
+
+
+def select_reduced_exact_token(row: ReducedExactRow, uniform: float) -> int:
+    """Select exactly like final RN64 CDF division plus side-right search."""
+
+    integer = _pcg64_grid_integer(uniform)
+    final = float(row.raw_cdf[-1])
+    for index, boundary in enumerate(row.raw_cdf[:-1]):
+        if _rounded_ratio_greater_than_grid(float(boundary), final, integer):
+            return int(row.token_ids[index])
+    return int(row.token_ids[-1])
+
+
+def _rounded_fraction_float32_greater_than_grid(
+    ratio: Fraction,
+    integer: int,
+    *,
+    cast_uniform: bool,
+) -> bool:
+    """Test RN32(ratio) against an exact or float32-cast PCG64 uniform."""
+
+    uniform_fraction = Fraction(integer, PCG64_GRID_SIZE)
+    rounded_uniform = np.float32(integer / PCG64_GRID_SIZE)
+    if cast_uniform:
+        predecessor = rounded_uniform
+        threshold = np.nextafter(rounded_uniform, np.float32(np.inf), dtype=np.float32)
+    elif _fraction_from_float(rounded_uniform) > uniform_fraction:
+        threshold = rounded_uniform
+        predecessor = np.nextafter(
+            rounded_uniform, np.float32(-np.inf), dtype=np.float32
+        )
+    else:
+        predecessor = rounded_uniform
+        threshold = np.nextafter(rounded_uniform, np.float32(np.inf), dtype=np.float32)
+    midpoint = (_fraction_from_float(predecessor) + _fraction_from_float(threshold)) / 2
+    if ratio != midpoint:
+        return ratio > midpoint
+    return int(threshold.view(np.uint32)) & 1 == 0
+
+
+def _rounded_ratio_float32_greater_than_grid(
+    numerator: float,
+    denominator: float,
+    integer: int,
+    *,
+    cast_uniform: bool,
+) -> bool:
+    ratio = _fraction_from_float(numerator) / _fraction_from_float(denominator)
+    return _rounded_fraction_float32_greater_than_grid(
+        ratio, integer, cast_uniform=cast_uniform
+    )
+
+
+def select_reduced_float32_token(
+    row: ReducedFloat32Row,
+    uniform: float,
+    *,
+    cast_uniform: bool,
+) -> int:
+    """Select like RN32 final division without evaluating that division."""
+
+    integer = _pcg64_grid_integer(uniform)
+    final = float(row.raw_cdf[-1])
+    for index, boundary in enumerate(row.raw_cdf[:-1]):
+        if _rounded_ratio_float32_greater_than_grid(
+            float(boundary),
+            final,
+            integer,
+            cast_uniform=cast_uniform,
+        ):
+            return int(row.token_ids[index])
+    return int(row.token_ids[-1])
 
 
 def _cdf_at_token_boundaries(row: PreparedRow, tokens: np.ndarray) -> np.ndarray:
@@ -276,22 +514,92 @@ def _grid_transitions(row: PreparedRow, *, cast_uniform: bool) -> tuple[int, ...
     return tuple(transition(float(boundary)) for boundary in row.cdf[:-1])
 
 
-def _grid_token(row: PreparedRow, transitions: tuple[int, ...], value: int) -> int:
+def _reduced_exact_grid_transition(boundary: float, final: float) -> int:
+    """First PCG64 integer not kept below one reduced-exact boundary."""
+
+    lower = 0
+    upper = PCG64_GRID_SIZE
+    while lower < upper:
+        midpoint = (lower + upper) // 2
+        if _rounded_ratio_greater_than_grid(boundary, final, midpoint):
+            lower = midpoint + 1
+        else:
+            upper = midpoint
+    return lower
+
+
+def _reduced_exact_grid_transitions(row: ReducedExactRow) -> tuple[int, ...]:
+    final = float(row.raw_cdf[-1])
+    return tuple(
+        _reduced_exact_grid_transition(float(boundary), final)
+        for boundary in row.raw_cdf[:-1]
+    )
+
+
+def _reduced_float32_grid_transition(
+    boundary: float,
+    final: float,
+    *,
+    cast_uniform: bool,
+) -> int:
+    lower = 0
+    upper = PCG64_GRID_SIZE
+    while lower < upper:
+        midpoint = (lower + upper) // 2
+        if _rounded_ratio_float32_greater_than_grid(
+            boundary,
+            final,
+            midpoint,
+            cast_uniform=cast_uniform,
+        ):
+            lower = midpoint + 1
+        else:
+            upper = midpoint
+    return lower
+
+
+def _reduced_float32_grid_transitions(
+    row: ReducedFloat32Row,
+    *,
+    cast_uniform: bool,
+) -> tuple[int, ...]:
+    final = float(row.raw_cdf[-1])
+    return tuple(
+        _reduced_float32_grid_transition(
+            float(boundary), final, cast_uniform=cast_uniform
+        )
+        for boundary in row.raw_cdf[:-1]
+    )
+
+
+def _grid_token(
+    row: PreparedRow | ReducedExactRow | ReducedFloat32Row,
+    transitions: tuple[int, ...],
+    value: int,
+) -> int:
     index = bisect_right(transitions, value)
     return int(row.token_ids[min(index, int(row.token_ids.size) - 1)])
 
 
 def pcg64_grid_disagreement_count(
-    exact: PreparedRow,
-    candidate: PreparedRow,
+    exact: PreparedRow | ReducedExactRow,
+    candidate: PreparedRow | ReducedFloat32Row,
     *,
     candidate_cast_uniform: bool,
 ) -> int:
     """Count exact PCG64 R values producing different selected token IDs."""
 
-    exact_transitions = _grid_transitions(exact, cast_uniform=False)
-    candidate_transitions = _grid_transitions(
-        candidate, cast_uniform=candidate_cast_uniform
+    exact_transitions = (
+        _reduced_exact_grid_transitions(exact)
+        if isinstance(exact, ReducedExactRow)
+        else _grid_transitions(exact, cast_uniform=False)
+    )
+    candidate_transitions = (
+        _reduced_float32_grid_transitions(
+            candidate, cast_uniform=candidate_cast_uniform
+        )
+        if isinstance(candidate, ReducedFloat32Row)
+        else _grid_transitions(candidate, cast_uniform=candidate_cast_uniform)
     )
     endpoints = sorted(
         {
@@ -310,6 +618,79 @@ def pcg64_grid_disagreement_count(
         if exact_token != candidate_token:
             disagreement += upper - lower
     return disagreement
+
+
+def _cross_check_reduced_exact(
+    literal: PreparedRow,
+    reduced: ReducedExactRow,
+    *,
+    row_index: int,
+) -> None:
+    """Fail closed unless reduced preparation and all grid transitions agree."""
+
+    if not np.array_equal(literal.token_ids, reduced.token_ids):
+        raise RuntimeError(
+            f"reduced exact token support diverged from literal host at row {row_index}"
+        )
+    if not np.array_equal(
+        literal.probabilities.view(np.uint64),
+        reduced.probabilities.view(np.uint64),
+    ):
+        raise RuntimeError(
+            f"reduced exact probability bits diverged from literal host at row {row_index}"
+        )
+    literal_raw_cdf = np.cumsum(literal.probabilities, dtype=np.float64)
+    if not np.array_equal(
+        literal_raw_cdf.view(np.uint64), reduced.raw_cdf.view(np.uint64)
+    ):
+        raise RuntimeError(
+            f"reduced exact raw CDF bits diverged from literal host at row {row_index}"
+        )
+    literal_transitions = _grid_transitions(literal, cast_uniform=False)
+    reduced_transitions = _reduced_exact_grid_transitions(reduced)
+    if literal_transitions != reduced_transitions:
+        raise RuntimeError(
+            f"reduced exact PCG64 transitions diverged from literal host at row {row_index}"
+        )
+
+
+def _cross_check_reduced_float32(
+    reference: PreparedRow,
+    reduced: ReducedFloat32Row,
+    *,
+    row_index: int,
+) -> None:
+    """Fail closed unless reduced float32 and divided-CDF reference agree."""
+
+    if not np.array_equal(reference.token_ids, reduced.token_ids):
+        raise RuntimeError(
+            f"reduced float32 token support diverged from divided reference at row {row_index}"
+        )
+    if not np.array_equal(
+        reference.probabilities.view(np.uint32),
+        reduced.probabilities.view(np.uint32),
+    ):
+        raise RuntimeError(
+            f"reduced float32 probability bits diverged from divided reference at row {row_index}"
+        )
+    reference_raw_cdf = np.cumsum(reference.probabilities, dtype=np.float32)
+    if not np.array_equal(
+        reference_raw_cdf.view(np.uint32), reduced.raw_cdf.view(np.uint32)
+    ):
+        raise RuntimeError(
+            f"reduced float32 raw CDF bits diverged from divided reference at row {row_index}"
+        )
+    for cast_uniform in (False, True):
+        reference_transitions = _grid_transitions(reference, cast_uniform=cast_uniform)
+        reduced_transitions = _reduced_float32_grid_transitions(
+            reduced, cast_uniform=cast_uniform
+        )
+        if reference_transitions != reduced_transitions:
+            variant = "float32" if cast_uniform else "exact"
+            raise RuntimeError(
+                f"reduced float32 {variant}-uniform PCG64 transitions diverged "
+                f"from divided reference at row {row_index}"
+            )
 
 
 def _float32_division_accounting(
@@ -340,9 +721,9 @@ def _float32_division_accounting(
     )
     sparse_total = np.sum(sanitized, dtype=np.float32)
     skip_second = bool(sparse_total.view(np.uint32) == np.float32(1.0).view(np.uint32))
-    # First normalization and final RN32 boundary-reference division always
-    # run. SparseDistribution normalization runs only for a non-unit RN32 sum.
-    passes = 2 + int(not skip_second)
+    # This counts probability-array divisions only. The RN32 final-boundary
+    # reference is recorded separately from midpoint-equivalent selection.
+    passes = 1 + int(not skip_second)
     return int(retained_ids.size), passes, skip_second
 
 
@@ -355,7 +736,7 @@ def benchmark_prepared_rows(
     warmups: int,
     repeats: int,
 ) -> dict[str, object]:
-    """Interleaved CPU timing of the two row functions; never a GPU/TPS claim."""
+    """Interleaved CPU timing of all row preparers; never a GPU/TPS claim."""
 
     if isinstance(warmups, bool) or int(warmups) < 0:
         raise ValueError("timing warmups must be a non-negative integer")
@@ -365,8 +746,9 @@ def benchmark_prepared_rows(
     repeats = int(repeats)
     rows = int(candidate_ids.shape[0])
     schedules = (
-        ("literal_host", prepare_exact_host_row),
-        ("reduced_float32", prepare_float32_row),
+        ("literal_float64", prepare_exact_host_row),
+        ("reduced_exact_float64", prepare_reduced_exact_row),
+        ("reduced_float32", prepare_reduced_float32_row),
     )
 
     def run(schedule) -> None:
@@ -392,6 +774,7 @@ def benchmark_prepared_rows(
 
     report: dict[str, object] = {
         "label": "diagnostic_cpu_python_numpy_not_gpu_or_tps",
+        "scope": "prepared_row_functions_only_selection_predicates_not_timed",
         "warmups": warmups,
         "repeats": repeats,
         "rows_per_repeat": rows,
@@ -441,7 +824,9 @@ def _validate_arrays(
     if not np.all(np.isfinite(probs)):
         raise ValueError("candidate_probs must be finite")
     if np.any(probs < 0.0):
-        raise ValueError("candidate_probs must be non-negative")
+        raise ValueError("candidate_probs must be in [0, 1]")
+    if np.any(probs > 1.0):
+        raise ValueError("candidate_probs must be in [0, 1]")
     row_mass = np.sum(probs, axis=1, dtype=np.float64)
     if np.any(row_mass <= 0.0):
         raise ValueError("each candidate_probs row must have positive mass")
@@ -467,6 +852,7 @@ def analyze_arrays(
 ) -> dict[str, object]:
     """Analyze captured pre-top-p rows and return a stable JSON-ready receipt."""
 
+    _require_numpy_version()
     ids, values, probs, uniforms = _validate_arrays(
         candidate_ids, candidate_values, candidate_probs, uniforms
     )
@@ -481,22 +867,54 @@ def analyze_arrays(
     grid_disagreement_counts = {"float32_uniform": 0, "exact_uniform": 0}
     max_boundary_shift = 0.0
     support_mismatches = 0
-    literal_passes_per_row: list[int] = []
+    literal_normalization_passes: list[int] = []
+    literal_selection_passes: list[int] = []
     literal_divisions_per_row: list[int] = []
-    candidate_passes_per_row: list[int] = []
+    reduced_exact_normalization_passes: list[int] = []
+    reduced_exact_selection_passes: list[int] = []
+    reduced_exact_divisions_per_row: list[int] = []
+    reduced_exact_second_skips = 0
+    candidate_normalization_passes: list[int] = []
+    candidate_selection_passes: list[int] = []
+    candidate_numpy_boundary_passes: list[int] = []
     candidate_divisions_per_row: list[int] = []
+    candidate_reference_divisions_per_row: list[int] = []
     candidate_second_skips = 0
 
     for row_index in range(ids.shape[0]):
-        exact = prepare_exact_host_row(
+        literal = prepare_exact_host_row(
             ids[row_index], values[row_index], probs[row_index], top_p=top_p
         )
-        candidate = prepare_float32_row(
+        reduced_exact = prepare_reduced_exact_row(
             ids[row_index], values[row_index], probs[row_index], top_p=top_p
         )
-        literal_support = int(exact.token_ids.size)
-        literal_passes_per_row.append(3)
+        candidate_reference = prepare_float32_row(
+            ids[row_index], values[row_index], probs[row_index], top_p=top_p
+        )
+        candidate = prepare_reduced_float32_row(
+            ids[row_index], values[row_index], probs[row_index], top_p=top_p
+        )
+        _cross_check_reduced_exact(
+            literal,
+            reduced_exact,
+            row_index=row_index,
+        )
+        _cross_check_reduced_float32(
+            candidate_reference,
+            candidate,
+            row_index=row_index,
+        )
+
+        literal_support = int(literal.token_ids.size)
+        literal_normalization_passes.append(2)
+        literal_selection_passes.append(1)
         literal_divisions_per_row.append(3 * literal_support)
+        reduced_support = int(reduced_exact.token_ids.size)
+        reduced_passes = 1 + int(not reduced_exact.second_normalization_skipped)
+        reduced_exact_normalization_passes.append(reduced_passes)
+        reduced_exact_selection_passes.append(0)
+        reduced_exact_divisions_per_row.append(reduced_passes * reduced_support)
+        reduced_exact_second_skips += int(reduced_exact.second_normalization_skipped)
         candidate_support, candidate_passes, candidate_skipped = (
             _float32_division_accounting(
                 ids[row_index],
@@ -505,15 +923,20 @@ def analyze_arrays(
                 top_p=top_p,
             )
         )
-        candidate_passes_per_row.append(candidate_passes)
+        candidate_normalization_passes.append(candidate_passes)
+        candidate_selection_passes.append(0)
+        candidate_numpy_boundary_passes.append(1)
         candidate_divisions_per_row.append(candidate_passes * candidate_support)
+        candidate_reference_divisions_per_row.append(
+            (candidate_passes + 1) * candidate_support
+        )
         candidate_second_skips += int(candidate_skipped)
-        expected = select_token(exact, float(uniforms[row_index]), cast_uniform=False)
+        expected = select_reduced_exact_token(reduced_exact, float(uniforms[row_index]))
         variants = {
-            "float32_uniform": select_token(
+            "float32_uniform": select_reduced_float32_token(
                 candidate, float(uniforms[row_index]), cast_uniform=True
             ),
-            "exact_uniform": select_token(
+            "exact_uniform": select_reduced_float32_token(
                 candidate, float(uniforms[row_index]), cast_uniform=False
             ),
         }
@@ -522,27 +945,44 @@ def analyze_arrays(
                 mismatch_counts[name] += 1
                 if len(mismatch_indices[name]) < max_mismatch_indices:
                     mismatch_indices[name].append(row_index)
-        if not np.array_equal(exact.token_ids, candidate.token_ids):
+        if not np.array_equal(reduced_exact.token_ids, candidate.token_ids):
             support_mismatches += 1
-        disagreement, boundary_shift = row_disagreement(exact, candidate)
+        # Continuous measure is a literal-boundary proxy only. Actual samples
+        # and exact grid counts below use the reduced-exact midpoint selector.
+        disagreement, boundary_shift = row_disagreement(literal, candidate_reference)
         disagreement_measures.append(disagreement)
         max_boundary_shift = max(max_boundary_shift, boundary_shift)
         grid_disagreement_counts["exact_uniform"] += pcg64_grid_disagreement_count(
-            exact, candidate, candidate_cast_uniform=False
+            reduced_exact, candidate, candidate_cast_uniform=False
         )
         grid_disagreement_counts["float32_uniform"] += pcg64_grid_disagreement_count(
-            exact, candidate, candidate_cast_uniform=True
+            reduced_exact, candidate, candidate_cast_uniform=True
         )
 
     measures = np.asarray(disagreement_measures, dtype=np.float64)
     aggregate_grid_denominator = int(ids.shape[0]) * PCG64_GRID_SIZE
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "rows": int(ids.shape[0]),
         "top_p": top_p,
+        "comparison_baseline": {
+            "schedule_id": REDUCED_EXACT_SCHEDULE_ID,
+            "selection": "reduced_exact_float64",
+        },
+        "reference_cross_checks": {
+            "required": True,
+            "literal_float64": {
+                "rows_checked": int(ids.shape[0]),
+                "status": "pass",
+            },
+            "divided_float32": {
+                "rows_checked": int(ids.shape[0]),
+                "status": "pass",
+            },
+        },
         "actual_mismatches": mismatch_counts,
         "mismatch_indices": mismatch_indices,
-        "continuous_exact_uniform_disagreement": {
+        "continuous_literal_boundary_proxy": {
             "sum": float(np.sum(measures)),
             "mean": float(np.mean(measures)),
             "max": float(np.max(measures)),
@@ -568,21 +1008,50 @@ def analyze_arrays(
         "max_boundary_shift": max_boundary_shift,
         "support_top_p_membership_mismatch_count": support_mismatches,
         "division_accounting": {
-            "label": "numpy_reference_elementwise_divisions_not_gpu_instructions",
-            "literal_host": {
-                "passes_per_row": literal_passes_per_row,
+            "label": (
+                "rn_probability_array_divisions_only_excludes_fraction_midpoint_"
+                "work_not_gpu_instructions"
+            ),
+            "literal_float64": {
+                "normalization_passes_per_row": literal_normalization_passes,
+                "selection_passes_per_row": literal_selection_passes,
                 "division_count_per_row": literal_divisions_per_row,
-                "aggregate_passes": sum(literal_passes_per_row),
+                "aggregate_normalization_passes": sum(literal_normalization_passes),
+                "aggregate_selection_passes": sum(literal_selection_passes),
                 "aggregate_division_count": sum(literal_divisions_per_row),
             },
+            "reduced_exact_float64": {
+                "normalization_passes_per_row": reduced_exact_normalization_passes,
+                "selection_passes_per_row": reduced_exact_selection_passes,
+                "division_count_per_row": reduced_exact_divisions_per_row,
+                "aggregate_normalization_passes": sum(
+                    reduced_exact_normalization_passes
+                ),
+                "aggregate_selection_passes": 0,
+                "aggregate_division_count": sum(reduced_exact_divisions_per_row),
+                "second_normalization_skip_count": reduced_exact_second_skips,
+                "second_normalization_skip_rate": reduced_exact_second_skips
+                / int(ids.shape[0]),
+            },
             "reduced_float32": {
-                "passes_per_row": candidate_passes_per_row,
+                "normalization_passes_per_row": candidate_normalization_passes,
+                "selection_passes_per_row": candidate_selection_passes,
                 "division_count_per_row": candidate_divisions_per_row,
-                "aggregate_passes": sum(candidate_passes_per_row),
+                "aggregate_normalization_passes": sum(candidate_normalization_passes),
+                "aggregate_selection_passes": 0,
                 "aggregate_division_count": sum(candidate_divisions_per_row),
                 "second_normalization_skip_count": candidate_second_skips,
                 "second_normalization_skip_rate": candidate_second_skips
                 / int(ids.shape[0]),
+            },
+            "divided_float32_reference": {
+                "normalization_passes_per_row": candidate_normalization_passes,
+                "selection_passes_per_row": candidate_numpy_boundary_passes,
+                "division_count_per_row": candidate_reference_divisions_per_row,
+                "aggregate_normalization_passes": sum(candidate_normalization_passes),
+                "aggregate_selection_passes": sum(candidate_numpy_boundary_passes),
+                "aggregate_division_count": sum(candidate_reference_divisions_per_row),
+                "purpose": "required_fail_closed_cross_check_only",
             },
         },
         "contract": {
@@ -591,16 +1060,30 @@ def analyze_arrays(
             "candidate_probs_dtype": "float32",
             "uniforms_dtype": "float64",
             "max_candidates": 20,
+            "numpy_version": REQUIRED_NUMPY_VERSION,
         },
         "arithmetic": {
             "exact_host": "float64",
+            "reduced_exact_schedule": {
+                "id": REDUCED_EXACT_SCHEDULE_ID,
+                "first_normalization": "always_divide_by_rank_order_rn64_sum",
+                "second_normalization": ("divide_iff_rn64_sum_bits_not_positive_one"),
+                "raw_cdf": "sequential_rn64_cumsum",
+                "selection": "nextafter_midpoint_ties_to_even",
+                "final_cdf_division": "not_evaluated_on_selection_path",
+                "raw_ratio_shortcut": False,
+            },
             "candidate": "float32",
             "candidate_schedule": {
                 "id": CANDIDATE_SCHEDULE_ID,
                 "first_normalization": "always_divide_by_rank_order_rn32_sum",
                 "second_normalization": "divide_iff_rn32_sum_bits_not_one",
-                "final_boundary_reference": "rn32_cumsum_then_rn32_divide",
-                "selection_equivalence": "future_midpoint_predicate",
+                "raw_cdf": "sequential_rn32_cumsum",
+                "selection": "rn32_nextafter_midpoint_ties_to_even",
+                "final_cdf_division": "not_evaluated_on_selection_path",
+                "divided_cdf_reference": ("required_fail_closed_cross_check_only"),
+                "evaluation_scope": "benchmark_experiment_only",
+                "retention_eligible": False,
                 "raw_q_collapse": False,
             },
             "uniform_variants": ["float32_uniform", "exact_uniform"],
@@ -619,6 +1102,7 @@ def load_and_analyze(
 ) -> dict[str, object]:
     """Load the fixed NPZ contract without coercing any input dtype."""
 
+    _require_numpy_version()
     required = ("candidate_ids", "candidate_values", "candidate_probs", "uniforms")
     with np.load(path, allow_pickle=False) as capture:
         missing = [name for name in required if name not in capture]
