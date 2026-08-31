@@ -207,7 +207,7 @@ def transform_capture_driver(source: str, *, capture_path: Path) -> str:
                     "driver_sha256": (
                         "0ae20c7c4028cea83d9b9084d29067925d6dca08ff0ca2ce5a4ea9d73b9bb7d0"
                     ),
-                    "source_commit": source_commit,
+                    "source_commit": args.expected_source,
                     "numpy_version": __import__("numpy").__version__,
                     "float32_policy": "benchmark_experiment_only_not_retainable",
                     "response_token_sha256": [

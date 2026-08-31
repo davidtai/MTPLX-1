@@ -58,6 +58,8 @@ def test_transform_installs_after_construction_and_finalizes_after_runs() -> Non
         in transformed
     )
     assert "capture baseline row drifted" in transformed
+    assert '"source_commit": args.expected_source' in transformed
+    assert '"source_commit": source_commit' not in transformed
     assert transformed.count("ChoiceRowCapture.install") == 1
     assert transformed.count("_choice_capture.finalize") == 1
 
