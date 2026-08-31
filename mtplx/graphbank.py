@@ -2579,25 +2579,15 @@ class CompiledVerifyBank:
         accepted_count,
         snapshot_states,
         verify_hidden,
-        split: FixedM4Split,
     ):
         """Queue the construction-bound target state selection on device."""
 
-        try:
-            selected_hidden, commit_plan, state_roots = self._fixed_m4_dispatch[
-                "device_commit"
-            ](
-                accepted_count,
-                snapshot_states,
-                verify_hidden,
-                split,
-            )
-            mx.async_eval(selected_hidden, *state_roots)
-        except Exception:
-            self._held_fixed_m4_split_refs.clear()
-            raise
-        self._publish_fixed_m4_selected_state(commit_plan)
-        self._held_fixed_m4_split_refs.clear()
+        selected_hidden, state_roots = self._fixed_m4_dispatch["device_commit"](
+            accepted_count,
+            snapshot_states,
+            verify_hidden,
+        )
+        mx.async_eval(selected_hidden, *state_roots)
         return selected_hidden
 
     def forward_ar_capture(

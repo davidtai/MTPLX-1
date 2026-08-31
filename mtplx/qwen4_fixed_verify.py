@@ -726,45 +726,22 @@ def _bind_fixed_m4_device_commit(self: Any, cache):
     if ple_rows != (binding.ple_layer_index,):
         raise ValueError("fixed-M4 device commit PLE topology changed")
 
-    def commit(accepted_count, snapshot_states, verify_hidden, split):
+    def commit(accepted_count, snapshot_states, verify_hidden):
         accepted = accepted_count.reshape(-1)[0].astype(mx.int32)
         keep = accepted + 1
         conv_indices = keep + mx.arange(
             QWEN4_M4_GDN_CONV_ROWS, dtype=mx.int32
         )
 
-        physical_states = {0: tuple(split.prefix.state_out)}
-        state_pos = 0
-        for kind, index, entry, _gdn, _ple in plan[1:]:
-            leaf_count = 5 if kind == "qsa" else len(entry.cache)
-            physical_states[index] = tuple(
-                split.state_out[state_pos : state_pos + leaf_count]
-            )
-            state_pos += leaf_count
-
-        captures = {0: tuple(split.prefix.captures)}
-        capture_pos = 0
-        for kind, index, _entry, _gdn, ple in plan[1:]:
-            if kind != "gdn":
-                continue
-            capture_count = len(_GDN_ROW_NAMES) + (
-                len(_PLE_ROW_NAMES) if ple is not None else 0
-            )
-            captures[index] = tuple(
-                split.captures[capture_pos : capture_pos + capture_count]
-            )
-            capture_pos += capture_count
-
         ple_entry = cache[binding.ple_layer_index]
         ple_pre = snapshot_states[binding.ple_layer_index]
-        ple_capture = captures[binding.ple_layer_index]
-        ple_qkv, *_ple_gdn_rows = ple_capture[: len(_GDN_ROW_NAMES)]
+        ple_qkv, *_ple_gdn_rows = ple_entry._mtplx_verify_rows
         (
             ple_hidden,
             ple_ids,
             ple_conv_rows,
-        ) = ple_capture[len(_GDN_ROW_NAMES) :]
-        compiled_aux = split.returned_aux
+        ) = ple_entry._mtplx_verify_ple
+        compiled_aux = ple_entry._mtplx_verify_compiled_aux
         ple_layer = inner.layers[binding.ple_layer_index]
         logical_states = []
         # Build the three exact-width PLE cache candidates outside the outer
@@ -808,31 +785,18 @@ def _bind_fixed_m4_device_commit(self: Any, cache):
             verify_hidden,
         )
 
-        commit_plan = []
         for kind, index, entry, gdn, ple in plan:
             if kind == "qsa":
                 # The fixed buffers already contain all four verify rows.
                 # Only their device-owned logical frontier changes.
-                physical = physical_states[index]
-                commit_plan.append(
-                    (
-                        kind,
-                        entry,
-                        (
-                            physical[0],
-                            physical[1],
-                            physical[2] - (QWEN4_M4_VERIFY_WIDTH - keep),
-                            physical[3],
-                            physical[4],
-                        ),
-                    )
+                entry.kv.cache[2] = entry.kv.cache[2] - (
+                    QWEN4_M4_VERIFY_WIDTH - keep
                 )
+                entry.kv.rollback_state[:] = [None, None, None]
                 continue
 
             pre = snapshot_states[index]
-            qkv, q, k, v, a, b = captures[index][
-                : len(_GDN_ROW_NAMES)
-            ]
+            qkv, q, k, v, a, b = entry._mtplx_verify_rows
             next_conv = (
                 ple_gdn_conv
                 if ple is not None
@@ -864,19 +828,24 @@ def _bind_fixed_m4_device_commit(self: Any, cache):
                         )
                     return selected
 
-                selected_state = (
-                    select_logical(0, next_conv),
-                    select_logical(1, next_delta),
-                    select_logical(2, selected_ple_conv),
-                    select_logical(3, selected_ple_history),
-                )
+                entry[0] = select_logical(0, next_conv)
+                entry[1] = select_logical(1, next_delta)
             else:
-                selected_state = (next_conv, next_delta)
-            commit_plan.append((kind, entry, selected_state))
+                entry[0] = next_conv
+                entry[1] = next_delta
+            entry._mtplx_verify_rows = None
+            if ple is not None:
+                entry[2] = select_logical(2, selected_ple_conv)
+                entry[3] = select_logical(3, selected_ple_history)
+                entry._mtplx_verify_ple = None
+                entry._mtplx_verify_compiled_aux = None
         state_roots = []
-        for _kind, _entry, selected_state in commit_plan:
-            state_roots.extend(selected_state)
-        return selected_hidden, tuple(commit_plan), tuple(state_roots)
+        for kind, _index, entry, _gdn, _ple in plan:
+            if kind == "qsa":
+                state_roots.extend(entry.state_leaves)
+            else:
+                state_roots.extend(entry.cache)
+        return selected_hidden, tuple(state_roots)
 
     return commit
 

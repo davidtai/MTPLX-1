@@ -226,13 +226,15 @@ def test_d3_chain_materializes_only_packed_tokens(monkeypatch) -> None:
         preserve_paged=True,
     )
 
-    assert len(fake_mx.compile_calls) == 1
+    # The retained exact D3 route deliberately keeps the already optimized
+    # model/selector chain bare. An added outer compile changed the production
+    # trajectory even when the target verifier remained monolithic.
+    assert fake_mx.compile_calls == []
     assert promote.kwargs == {
         "reserve_tokens": 16388,
         "initial_reserve_tokens": 16388,
         "preserve_paged": True,
     }
-    assert fake_mx.compile_calls[0][1] is fake_mx.compile_calls[0][2]
 
     generation._pr391_prewarm_float32_d3_core(
         core,
@@ -249,12 +251,12 @@ def test_d3_chain_materializes_only_packed_tokens(monkeypatch) -> None:
     result = generation._pr391_run_float32_d3_core(
         core,
         _FakeArray("live-hidden", (1, 1, 10240)),
-        _FakeArray("live-primary", (1, 1), "uint32"),
+        17,
         _FakeArray("uniform-bit-tape", (3,), "uint64"),
     )
 
     assert [depth for depth, _token in runtime.calls] == [1, 2, 3]
-    assert runtime.calls[0][1] == "live-primary"
+    assert runtime.calls[0][1] == "array"
     assert runtime.calls[1][1] == "reshape(selected-1)"
     assert runtime.calls[2][1] == "reshape(selected-2)"
     assert [call[3].label for call in choice_calls] == [
@@ -262,7 +264,7 @@ def test_d3_chain_materializes_only_packed_tokens(monkeypatch) -> None:
         "uniform-bit-tape[1:2]",
         "uniform-bit-tape[2:3]",
     ]
-    assert fake_mx.eval_calls == []
+    assert fake_mx.eval_calls == [(result[0],)]
     assert cache[0].kv.rollback_state == [None, None, None]
     assert len(result) == 4
     assert result[0].shape == (1, 3)
@@ -375,7 +377,8 @@ def test_stage_a_source_has_one_packed_eval_and_no_rng_fallback_or_env() -> None
     assert "os.environ" not in make_source
     assert "fallback" not in make_source.lower()
     assert "_eval(" not in make_source + run_source
-    assert "mx.eval(" not in run_source
+    assert run_source.count("mx.eval(") == 1
+    assert "mx.eval(result[0])" in run_source
     assert "_device_draft_q_arrays(" not in make_source
     assert "_deterministic_mlx_top_k_support(" in make_source
     assert "_order_bounded_mlx_top_k_support(" in make_source
@@ -391,42 +394,28 @@ def test_stage_a_source_has_one_packed_eval_and_no_rng_fallback_or_env() -> None
     assert not any(isinstance(node, ast.Try) for node in ast.walk(make_tree))
 
 
-def test_post_d3_fixed_m4_prefix_is_queued_before_host_decode() -> None:
+def test_d3_packed_decode_precedes_host_built_fixed_m4_input() -> None:
     import mtplx.generation as generation
 
     source = inspect.getsource(generation.generate_mtpk)
     run = source.index("_pr391_run_float32_d3_core(")
-    prefix = source.index("enqueue_fixed_m4_prefix(", run)
     decode = source.index("_pr391_decode_float32_d3_tokens(")
-    suffix = source.index("compiled_verify_bank.forward_fixed_m4_suffix(")
+    fixed_m4 = source.index("compiled_verify_bank.forward_fixed_m4(")
     verifier = source.index("_pr391_apply_softfloat64_decision(")
 
-    assert run < prefix < decode < suffix < verifier
-    assert "mx.eval(_pr391_joint_result[0])" in source[prefix:decode]
-    assert "verify_input_array = _pr391_fixed_m4_prefix.input_ids" in source
-
-    queue = source.index("_pr391_queue_device_canonical_d3(", verifier)
-    carried_prefix = source.index("enqueue_fixed_m4_prefix(", queue)
-    carried_record = source.index("_pr391_carried_d3 = {", carried_prefix)
-    assert queue < carried_prefix < carried_record
-    assert '"fixed_m4_prefix": _pr391_queued_prefix' in source[
-        carried_prefix:carried_record + 500
-    ]
-    assert "_pr391_fallback_primary_ids" not in source
-    assert "_pr391_queue_canonical_d3(" not in source
+    assert run < decode < fixed_m4 < verifier
+    assert "verify_input = [int(primary), *draft_tokens]" in source
+    assert "verify_input_array = mx.array([verify_input])" in source
+    assert "_pr391_verify_input_array" not in source
 
 
-def test_pr391_split_and_ordinary_fixed_m4_routes_remain_distinct() -> None:
+def test_pr391_uses_only_the_retained_monolithic_fixed_m4_route() -> None:
     import mtplx.generation as generation
 
     source = inspect.getsource(generation.generate_mtpk)
-    split_guard = source.index("elif (\n                _pr391_joint_result is not None")
-    split_call = source.index("forward_fixed_m4_suffix(", split_guard)
-    ordinary_guard = source.index("elif (\n                qwen4_fixed_m4_compiled_verify", split_call)
-    ordinary_call = source.index("forward_fixed_m4(", ordinary_guard)
-
-    assert split_guard < split_call < ordinary_guard < ordinary_call
-    assert source.count("forward_fixed_m4_suffix(") == 1
+    assert "install_fixed_m4_split(" not in source
+    assert "enqueue_fixed_m4_prefix(" not in source
+    assert "forward_fixed_m4_suffix(" not in source
     assert source.count("forward_fixed_m4(") == 1
 
 
@@ -602,7 +591,7 @@ def test_active_pr391_route_uses_device_replay_not_host_selected_reference() -> 
     decode = source.index("_pr391_decode_float32_verifier_decision(", replay)
 
     assert verifier < target_commit < replay < decode
-    assert "_pr391_fixed_m4_split," in source[target_commit:replay]
+    assert "_pr391_fixed_m4_split" not in source[target_commit:replay]
     replay_call = source[replay:decode]
     assert "accepted_count=verifier_result[0]," in replay_call
     assert "verify_hidden=verify_hidden," in replay_call
@@ -746,7 +735,7 @@ def test_host_canonical_d3_is_not_retained_as_a_carried_path() -> None:
     assert "_pr391_queue_verifier_mtp_replay(" not in source
 
 
-def test_context_copy_discards_isolated_lookahead_without_live_cache_repair() -> None:
+def test_context_copy_drops_carried_d3_without_live_cache_repair() -> None:
     import mtplx.generation as generation
 
     source = inspect.getsource(generation.generate_mtpk)
@@ -759,7 +748,7 @@ def test_context_copy_discards_isolated_lookahead_without_live_cache_repair() ->
     for branch in (capture_branch, batched_branch):
         assert "_pr391_abandon_canonical_d3(" not in branch
         assert "_rollback_mtp_cache(" not in branch
-        assert "discard_fixed_m4_prefix(" in branch
+        assert "discard_fixed_m4_prefix(" not in branch
         assert "_pr391_carried_d3 = None" in branch
         assert "_pr391_queue_device_verifier_mtp_replay(" not in branch
         assert "_pr391_queue_device_canonical_d3(" not in branch
@@ -772,19 +761,17 @@ def test_context_copy_discards_isolated_lookahead_without_live_cache_repair() ->
     assert "rt.forward_ar(" in batched_branch
 
 
-def test_terminal_or_rejected_lookahead_releases_fixed_m4_prefix_roots() -> None:
+def test_terminal_lookahead_drops_the_isolated_carried_d3() -> None:
     import mtplx.generation as generation
 
     source = inspect.getsource(generation.generate_mtpk)
     decode = source.index("_pr391_decode_float32_verifier_decision(")
     carried = source.index("_pr391_carried_d3 = {", decode)
-    report = source.index("elapsed_target_distribution_eval", carried)
-    rejected = source[carried:report]
     final = source[source.rindex("if _pr391_carried_d3 is not None:") :]
 
-    assert "elif _pr391_queued_prefix is not None:" in rejected
-    assert "discard_fixed_m4_prefix(" in rejected
-    assert "discard_fixed_m4_prefix(" in final
+    assert "fixed_m4_prefix" not in source[decode:carried]
+    assert "_pr391_carried_d3 = None" in final
+    assert "discard_fixed_m4_prefix(" not in final
 
 
 def test_d3_core_is_installed_only_after_fixed_m4_admission() -> None:

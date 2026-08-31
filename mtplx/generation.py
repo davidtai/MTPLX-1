@@ -5566,14 +5566,8 @@ def _pr391_make_float32_d3_core(
             mx.concatenate(raw_probs_by_depth, axis=0),
         )
 
-    compiled = mx.compile(
-        chain_fn,
-        inputs=state_tree,
-        outputs=state_tree,
-    )
-
     return {
-        "fn": compiled,
+        "fn": chain_fn,
         "cache": mtp_cache,
         "depth": _PR391_FLOAT32_D3_DEPTH,
         "state_tree": state_tree,
@@ -5586,19 +5580,20 @@ def _pr391_make_float32_d3_core(
 def _pr391_run_float32_d3_core(
     core: dict[str, Any],
     hidden: mx.array,
-    primary_token_ids: mx.array,
+    primary: int,
     uniform_bit_rows: mx.array,
 ) -> tuple[Any, ...]:
-    """Queue one D3 chain while retaining its device primary-token root."""
+    """Run one D3 chain and materialize only its host-required token vector."""
 
     result = tuple(
         core["fn"](
             hidden,
-            primary_token_ids,
+            mx.array([[primary]], dtype=mx.uint32),
             uniform_bit_rows,
         )
     )
     _pr391_clear_float32_d3_rollback(core)
+    mx.eval(result[0])
     return result
 
 
@@ -8608,7 +8603,6 @@ def generate_mtpk(
         )
     if _pr391_route is not None:
         _pr391_require_fixed_m4_async_enqueue(compiled_verify_bank)
-        compiled_verify_bank.install_fixed_m4_split()
         if _skip_verify_snapshot():
             raise RuntimeError(
                 "PR391 device state commit requires the pre-verify recurrent state"
@@ -9941,7 +9935,6 @@ def generate_mtpk(
         draft_tokens: list[int | None] = []
         draft_probs: list[np.ndarray | None] = []
         _pr391_joint_result: tuple[Any, ...] | None = None
-        _pr391_fixed_m4_prefix: Any | None = None
         # Parallel to draft_tokens when _draft_conf_trace: p(drafted) per
         # depth, None where a lane has no draft logits (device cores, cc).
         draft_confidences: list[float | None] = []
@@ -10133,9 +10126,6 @@ def generate_mtpk(
                     )
             if _cc_block:
                 if _pr391_carried_d3 is not None:
-                    compiled_verify_bank.discard_fixed_m4_prefix(
-                        _pr391_carried_d3["fixed_m4_prefix"]
-                    )
                     _pr391_carried_d3 = None
                 _cc_T = 1 + len(_cc_block)
                 if qsa_mtp_precompute_active:
@@ -10447,9 +10437,6 @@ def generate_mtpk(
                     _cb_block = _cb_block[: constraint.validate_prefix(_cb_block)]
             if _cb_block:
                 if _pr391_carried_d3 is not None:
-                    compiled_verify_bank.discard_fixed_m4_prefix(
-                        _pr391_carried_d3["fixed_m4_prefix"]
-                    )
                     _pr391_carried_d3 = None
                 _cb_T = 1 + len(_cb_block)
                 if qsa_mtp_precompute_active:
@@ -10776,7 +10763,6 @@ def generate_mtpk(
                     "future_offset"
                 ]
                 joint_result = tuple(_pr391_carry["result"])
-                _pr391_fixed_m4_prefix = _pr391_carry["fixed_m4_prefix"]
                 _pr391_carried_d3 = None
             else:
                 compiled_verify_bank.prefetch_fixed_m4_primary(
@@ -10789,27 +10775,13 @@ def generate_mtpk(
                 joint_uniform_bits = uniform_bit_rows[
                     reservation.offset : reservation.offset + 3
                 ]
-                _pr391_primary_token_ids = mx.array(
-                    [[int(primary)]], dtype=mx.uint32
-                )
                 joint_result = _pr391_run_float32_d3_core(
                     _pr391_device_core,
                     draft_hidden,
-                    _pr391_primary_token_ids,
+                    int(primary),
                     joint_uniform_bits,
                 )
-                _pr391_verify_input_array = mx.concatenate(
-                    (_pr391_primary_token_ids, joint_result[0]),
-                    axis=1,
-                )
-                _pr391_fixed_m4_prefix = (
-                    compiled_verify_bank.enqueue_fixed_m4_prefix(
-                        _pr391_verify_input_array,
-                        cache=cache,
-                    )
-                )
             _pr391_joint_result = joint_result
-            mx.eval(_pr391_joint_result[0])
             core_tokens = _pr391_decode_float32_d3_tokens(joint_result)
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
@@ -11536,7 +11508,7 @@ def generate_mtpk(
                 bonus_distribution_row_needed
             )
             verify_input = [int(primary), *draft_tokens]
-            verify_input_array = _pr391_fixed_m4_prefix.input_ids
+            verify_input_array = mx.array([verify_input])
             verified_token_count = 4
         else:
             lazy_bonus_verify = (
@@ -11688,26 +11660,6 @@ def generate_mtpk(
                         a3b_target_prefix_route.verify_m2(verify_input_array)
                     )
             elif (
-                _pr391_joint_result is not None
-                and qwen4_fixed_m4_compiled_verify
-                and compiled_verify_bank is not None
-                and verified_token_count == 4
-            ):
-                (
-                    verify_logits,
-                    verify_hidden,
-                    captures,
-                    _pr391_fixed_m4_split,
-                ) = compiled_verify_bank.forward_fixed_m4_suffix(
-                    _pr391_fixed_m4_prefix,
-                    host_input_ids=verify_input,
-                    completion_tokens=tokens,
-                    committed_count=len(tokens) - 1,
-                    cache=cache,
-                    return_hidden=True,
-                    hidden_variant=base_hidden_variant,
-                )
-            elif (
                 qwen4_fixed_m4_compiled_verify
                 and compiled_verify_bank is not None
                 and verified_token_count == 4
@@ -11789,7 +11741,6 @@ def generate_mtpk(
                     verifier_result[0],
                     before_verify.states,
                     verify_hidden,
-                    _pr391_fixed_m4_split,
                 )
             )
             _pr391_target_state_device_committed = True
@@ -11801,7 +11752,6 @@ def generate_mtpk(
             )
             _pr391_mtp_handoff_owns_cycle = True
             _pr391_device_prequeued_d3 = None
-            _pr391_queued_prefix = None
             if max_tokens - (len(tokens) + 4) >= _PR391_FLOAT32_D3_DEPTH:
                 _pr391_device_prequeued_d3 = _pr391_queue_device_canonical_d3(
                     _pr391_device_core,
@@ -11812,19 +11762,6 @@ def generate_mtpk(
                         mx.array(verifier_reservation.offset, dtype=mx.int32)
                         + verifier_result[5].reshape(-1)[0].astype(mx.int32)
                     ),
-                )
-                _pr391_next_verify_input = mx.concatenate(
-                    (
-                        verifier_result[2].reshape(1, 1).astype(mx.uint32),
-                        _pr391_device_prequeued_d3[0][0],
-                    ),
-                    axis=1,
-                )
-                _pr391_queued_prefix = (
-                    compiled_verify_bank.enqueue_fixed_m4_prefix(
-                        _pr391_next_verify_input,
-                        cache=cache,
-                    )
                 )
             else:
                 mx.async_eval(*_pr391_device_core["cache"][0].state_leaves)
@@ -11841,7 +11778,6 @@ def generate_mtpk(
             _pr391_lookahead_accepted = int(_pr391_verifier_decision[0])
             if (
                 _pr391_device_prequeued_d3 is not None
-                and _pr391_queued_prefix is not None
                 and bool(_pr391_verifier_decision[4])
                 and not _is_stop(_pr391_lookahead_primary, stop_token_ids)
                 and max_tokens
@@ -11861,18 +11797,12 @@ def generate_mtpk(
                 )
                 _pr391_carried_d3 = {
                     "result": _pr391_queued_d3[0],
-                    "fixed_m4_prefix": _pr391_queued_prefix,
                     "future_offset": _pr391_queued_d3[1],
                     "descriptor_offset": _pr391_next_descriptor_offset,
                     "cycle_offset": (
                         int(cycle_mtp_offset) + 1 + _pr391_lookahead_accepted
                     ),
                 }
-            elif _pr391_queued_prefix is not None:
-                compiled_verify_bank.discard_fixed_m4_prefix(
-                    _pr391_queued_prefix
-                )
-                _pr391_queued_prefix = None
             elapsed_target_distribution_eval = (
                 time.perf_counter() - started_distribution
             )
@@ -13149,9 +13079,6 @@ def generate_mtpk(
         # ends before consuming it, discard that state; the live history still
         # reflects only the authoritative replay and the normal final commit
         # below remains responsible for any pending primary.
-        compiled_verify_bank.discard_fixed_m4_prefix(
-            _pr391_carried_d3["fixed_m4_prefix"]
-        )
         _pr391_carried_d3 = None
 
     if token_callback is not None and _stream_gate.window > 0:
