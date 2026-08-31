@@ -21,7 +21,7 @@ merges candidates by the boundary they actually change, rather than by PR name.
 | 7 | fixed-M4 QSA BM8 native score/mask | oMLX #3320 | low single-digit ceiling | medium/high | Shape-compatible score primitive, but oMLX's direct verify route starts at 65K and evidence is around 150K/D5. Requires native ABI work and replaces only an already-accelerated matmul. Skipped at 16K. |
 | 8 | direct PLE `pread` row delivery | oMLX #3287; MLXServe worker sweep | negative | medium | PR391 already tested exact synchronous all-miss and early-window direct payload delivery: 64.35 and 64.62 versus 64.88 control. Worker counts 16/32/48 also lost. Deduplicated and rejected. |
 | 9 | exact native QSA top-k | oMLX #3244 | <2% ceiling | high | Do not transplant: oMLX cutoff ties prefer higher ids, while PR391 must preserve adjusted-score plus stable eager ordering. A bespoke selector is unjustified without a score/top-k profile. |
-| 10 | remaining stock GDN recurrence/conv geometry | mlx-lm #1559/#1741; MLX #4409 | likely 0 | high | PR391 already installs fixed-M4 GDN kernels. Audit for remaining stock recurrence time before adapting another packed kernel. |
+| 10 | remaining stock GDN recurrence/conv geometry | mlx-lm #1559/#1741; MLX #4409 | 0 decode gain | high | Closed for M4: PR391's target uses `linear_gdn_from_conv_tape` plus its own fixed-shape recurrence/state kernels, not the stock scalar-gate recurrence optimized by #1559. Prefill-only work remains separate. |
 | 11 | compile trace-node retention | MLX #4440 | 0 tok/s | dependency/core | Soak-memory fix only. Revisit only after reproducing multi-output trace growth. |
 
 ## Do not integrate into the canonical exact lane
@@ -51,6 +51,17 @@ already active. The exact artifact declares the shared target `lm_head` as
 Consequently its production geometry is M4/K2560/N248320 and directly selects
 the new BM32 kernel. This upstream gain is already included in every recent
 control and cannot be integrated a second time.
+
+## Packed GDN engagement audit
+
+mlx-lm #1559 packs eight Dv rows per SIMD group for the stock unmasked,
+scalar-gate Dk128 recurrence and reports its primary gains on long prefill.
+The installed mlx-lm 0.31.3 predates that merge, but PR391's fixed-M4 target
+does not call that stock recurrence: its compiled receipt is
+`linear_gdn_from_conv_tape`, backed by MTPLX's fixed-shape convolution,
+recurrence, replay, and state-handoff kernels. The Qwen3.8 MTP head is a QSA
+layer, so the draft D1-D3 chain supplies no hidden GDN consumer either. This is
+therefore a separate prefill optimization, not missing decode work.
 
 ## Net assessment
 
