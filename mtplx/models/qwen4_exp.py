@@ -1496,6 +1496,17 @@ def verify_capture_scope():
 
 
 @contextlib.contextmanager
+def verify_capture_disabled_scope():
+    """Temporarily run exact non-capture arithmetic inside an outer capture."""
+
+    token = _VERIFY_CAPTURE.set(False)
+    try:
+        yield
+    finally:
+        _VERIFY_CAPTURE.reset(token)
+
+
+@contextlib.contextmanager
 def compiled_verify_ple_scope(embedding: Optional[mx.array]):
     token = _COMPILED_VERIFY_PLE.set(embedding)
     try:
@@ -2072,10 +2083,11 @@ class QSAIndexer(nn.Module):
                 and total >= _qsa_gather_min_context()
             )
         )
-        if S > 1 and not (0 < tile < S) and rows_gather:
-            # Rows-gather lane (MTPLX_QSA_GATHER at S>1), adapting the
+        if (S > 1 or fixed_capacity) and not (0 < tile < S) and rows_gather:
+            # Rows-gather lane (MTPLX_QSA_GATHER at S>1, or the
+            # construction-owned fixed-capacity S=1 D3 route), adapting the
             # per-query gather + GQA-broadcast attention from community PR
-            # #380 by @maceip. Every S>1 forward previously staged a dense
+            # #380 by @maceip. Every eligible forward previously staged a dense
             # [S, T] bool mask and read the FULL KV through fused SDPA in
             # each of the 12 QSA layers, an O(T)-per-round chain that grows
             # with the generation. Here each row hands attention its own
@@ -3452,6 +3464,11 @@ class _SidecarGather:
         return cleared
 
     def _warm(self, rows) -> None:
+        for future in self.submit_warm(rows):
+            future.result()
+
+    def submit_warm(self, rows):
+        """Submit page-warming reads without waiting for their completion."""
         fd = self._fd
         metas = self._row_meta
 
@@ -3462,8 +3479,9 @@ class _SidecarGather:
 
         step = max(1, min(64, (len(rows) + 31) // 32))
         chunks = [rows[i : i + step] for i in range(0, len(rows), step)]
-        list(self._pool.map(touch, chunks))
+        futures = tuple(self._pool.submit(touch, chunk) for chunk in chunks)
         self.prefetch_batches += 1
+        return futures
 
     def _rows_matrices(self, flat, names):
         """Raw row matrices (one per map, flat order) — through the hot-row
@@ -3505,6 +3523,22 @@ class _SidecarGather:
             name: np.stack([row[j] for row in rows])[inverse]
             for j, name in enumerate(names)
         }
+
+    def gather_raw_np(self, flat) -> tuple[mx.array, mx.array, mx.array]:
+        """Gather the exact packed q4 row payload without dequantizing it."""
+
+        names = ("weight", "scales", "biases")
+        mats = self._rows_matrices(flat, names)
+        parts = []
+        for name in names:
+            dt = self._maps[name][1]
+            rows = mx.array(mats[name])
+            if dt == "BF16":
+                rows = rows.view(mx.bfloat16)
+            elif dt == "F16":
+                rows = rows.view(mx.float16)
+            parts.append(rows)
+        return tuple(parts)
 
     def gather_np(self, flat) -> mx.array:
         """Gather+dequantize rows for MATERIALIZED numpy int64 ids — the
@@ -3834,6 +3868,11 @@ class PLELayer(nn.Module):
             state = cache[self.CONV_IDX]
         else:
             state = mx.zeros((B, self.conv_state_len, C), dtype=x.dtype)
+        if cache is not None and _VERIFY_CAPTURE.get():
+            # Fixed-M4 device commit needs the exact rows entering the PLE
+            # convolution.  The layer input captured by the older host replay
+            # is not interchangeable with these post-gating/post-norm rows.
+            cache._mtplx_verify_ple_conv_rows = x
         window = mx.concatenate([state, x], axis=1)
         if cache is not None:
             cache[self.CONV_IDX] = window[:, -self.conv_state_len :, :]
@@ -4062,7 +4101,12 @@ class Qwen4ExpTextModel(nn.Module):
         for entry in cache:
             if entry is None:
                 continue
-            for attr in ("_mtplx_verify_rows", "_mtplx_verify_ple"):
+            for attr in (
+                "_mtplx_verify_rows",
+                "_mtplx_verify_ple",
+                "_mtplx_verify_ple_conv_rows",
+                "_mtplx_verify_compiled_aux",
+            ):
                 if getattr(entry, attr, None) is not None:
                     setattr(entry, attr, None)
 
@@ -4178,7 +4222,7 @@ class Qwen4ExpTextModel(nn.Module):
                 entry[1] = new_state
                 entry._mtplx_verify_rows = None
             else:  # ple
-                h_in, ids = payload
+                h_in, ids = payload[:2]
                 for j in range(len(pre)):
                     entry[j] = pre[j]
                 ple = layer.ple

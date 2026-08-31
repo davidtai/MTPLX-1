@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import time
 import weakref
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any
@@ -32,6 +33,74 @@ def _prepare_fixed_m4_materialized(
     """Adapt the materialized PLE route to the fixed-M4 host-input contract."""
 
     return prepare_aux(input_ids, cache)
+
+
+def _fixed_m4_materialized_prefetch(
+    _primary,
+    _completion_tokens,
+    _committed_count,
+) -> None:
+    """Construction-bound no-op for materialized fixed-M4 auxiliaries."""
+
+
+def _fixed_m4_materialized_window_prefetch(
+    _host_input_ids,
+    _completion_tokens,
+    _committed_count,
+) -> None:
+    """Construction-bound no-op for inline fixed-M4 window preparation."""
+
+
+def _format_compiled_verify_key(key) -> str:
+    """Render the generic or fixed-M4 compiled graph key for receipts."""
+
+    if len(key) == 3:
+        length, variant, bucket = key
+        return f"m{length}:{variant or 'default'}:b{bucket}"
+    if len(key) == 4:
+        length, variant, bucket, aux_contract = key
+        return f"m{length}:{variant or 'default'}:b{bucket}:{aux_contract}"
+    raise ValueError(f"unsupported compiled verify key: {key!r}")
+
+
+def _unpack_fixed_m4_outputs(outputs, *, capture_leaves: int, returns_aux: bool):
+    """Split the construction-selected fixed-M4 compiled output contract."""
+
+    aux_offset = int(returns_aux)
+    capture_start = 2 + aux_offset
+    capture_end = capture_start + capture_leaves
+    returned_aux = outputs[2] if returns_aux else None
+    return (
+        outputs[0],
+        outputs[1],
+        returned_aux,
+        outputs[capture_start:capture_end],
+        outputs[capture_end:],
+    )
+
+
+@dataclass(frozen=True)
+class FixedM4Prefix:
+    """Rooted construction-bound layer-0 result awaiting the suffix join."""
+
+    input_ids: Any
+    hidden: Any
+    captures: tuple[Any, ...]
+    state_in: tuple[Any, ...]
+    state_out: tuple[Any, ...]
+    outputs: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class FixedM4Split:
+    """Rooted split verifier outputs awaiting authoritative frontier commit."""
+
+    prefix: FixedM4Prefix
+    returned_aux: Any
+    captures: tuple[Any, ...]
+    state_in: tuple[Any, ...]
+    state_out: tuple[Any, ...]
+    outputs: tuple[Any, ...]
 
 
 @dataclass
@@ -628,8 +697,8 @@ class TensorOffsetQSACache:
         fused_rows_gather_kv_m4: bool = False,
     ) -> None:
         self.kv = kv
-        self.raw_keys = raw_keys
-        self.pooled = pooled
+        self.aux = [raw_keys, pooled]
+        self._compile_state = [self.kv.cache, self.aux]
         self.ratio = max(1, int(compress_ratio))
         self.step = int(getattr(kv, "step", 256))
         self.fixed_rows_gather = bool(rows_gather)
@@ -728,6 +797,26 @@ class TensorOffsetQSACache:
         )
 
     @property
+    def compile_state(self) -> list[list[mx.array]]:
+        return self._compile_state
+
+    @property
+    def raw_keys(self):
+        return self.aux[0]
+
+    @raw_keys.setter
+    def raw_keys(self, value):
+        self.aux[0] = value
+
+    @property
+    def pooled(self):
+        return self.aux[1]
+
+    @pooled.setter
+    def pooled(self, value):
+        self.aux[1] = value
+
+    @property
     def capacity(self) -> int:
         return int(self.raw_keys.shape[1])
 
@@ -786,7 +875,7 @@ class TensorOffsetQSACache:
 
     @property
     def state_leaves(self) -> list[mx.array]:
-        return [*self.kv.cache, self.raw_keys, self.pooled]
+        return [*self.kv.cache, *self.aux]
 
     def write_raw(self, keys: mx.array) -> None:
         self.raw_keys = mx.slice_update(
@@ -1405,7 +1494,6 @@ _BATCH_PAGED_OFFSETS = _batch_paged_offsets_enabled()
 # MTPLX_GREEDY_TRIO_MAX_CONTEXT fence; requests that never prebind (batch
 # lane) keep the last-set/default value — that lane pays at most the
 # pre-#318 serial-sync behavior, never a correctness change.
-from contextvars import ContextVar
 
 _PAGED_OFFSETS_CONTEXT_OK: ContextVar[bool] = ContextVar(
     "mtplx_paged_offsets_context_ok", default=True
@@ -1774,6 +1862,12 @@ class CompiledVerifyBank:
         self._build_fixed_m4_aux = (
             build_fixed_aux if callable(build_fixed_aux) else None
         )
+        graph_fixed_aux = getattr(
+            runtime, "dequantize_fixed_m4_compiled_verify_aux", None
+        )
+        self._graph_fixed_m4_aux = (
+            graph_fixed_aux if callable(graph_fixed_aux) else None
+        )
         commit_captures = getattr(runtime, "commit_compiled_verify_captures", None)
         self._commit_compiled_captures = (
             commit_captures if callable(commit_captures) else None
@@ -1792,6 +1886,8 @@ class CompiledVerifyBank:
         self._gdn_meta_cache: dict[int, dict[str, int] | None] = {}
         self._exception_failures = 0
         self._held_state_refs: list = []
+        self._held_aux_refs: list = []
+        self._held_fixed_m4_split_refs: list = []
         # The Qwen4 fixed-M4 lane installs one construction-owned replay plan
         # after prompt prefill.  Production calls then bypass the generic
         # eligibility, promotion, bucket, shadow, and fallback machinery.
@@ -1883,11 +1979,6 @@ class CompiledVerifyBank:
         if not qsa_entries:
             raise RuntimeError("qwen4 fixed-M4 installation found no QSA state")
         route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
-        key = (4, str(hidden_variant or ""), route_key)
-        fn = self._compiled.get(key)
-        if fn is None:
-            fn = self._shared_or_new_verify_step(key, 4, hidden_variant)
-            self._compiled[key] = fn
         pending_route_thresholds = tuple(
             entry.rows_gather_min_context
             for entry in qsa_entries
@@ -1903,12 +1994,39 @@ class CompiledVerifyBank:
         boundary = _compiled_verify_boundary()
         if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
             prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
+            graph_aux = self._graph_fixed_m4_aux
+            if graph_aux is None:
+                returns_aux = False
+                aux_contract = "materialized"
+            else:
+                returns_aux = True
+                aux_contract = "raw_q4"
         else:
             prepare_aux = partial(
                 _prepare_fixed_m4_materialized,
                 self._prepare_compiled_aux,
                 cache,
             )
+            graph_aux = None
+            returns_aux = False
+            aux_contract = "materialized"
+        key = (4, str(hidden_variant or ""), route_key, aux_contract)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._shared_or_new_verify_step(
+                key,
+                4,
+                hidden_variant,
+                graph_aux=graph_aux,
+                return_compiled_aux=returns_aux,
+            )
+            self._compiled[key] = fn
+        bind_device_commit = getattr(
+            self.runtime, "bind_fixed_m4_device_commit", None
+        )
+        device_commit = (
+            bind_device_commit(cache) if callable(bind_device_commit) else None
+        )
         initial_growth_tokens = max(
             self.max_verify_len,
             self.growth_reserve_tokens,
@@ -1922,13 +2040,24 @@ class CompiledVerifyBank:
                 + self.speculative_headroom
             )
         )
+        prefetch_aux = _fixed_m4_materialized_prefetch
+        if getattr(prepare_aux, "_submit_warm", None) is not None:
+            prefetch_aux = prepare_aux.prefetch_primary
+        prefetch_window_aux = _fixed_m4_materialized_window_prefetch
+        if getattr(prepare_aux, "_prefetch_window_rows", None) is not None:
+            prefetch_window_aux = prepare_aux.prefetch_window
         self._fixed_m4_dispatch = {
             "fn": fn,
             "prepare_aux": prepare_aux,
+            "prefetch_aux": prefetch_aux,
+            "prefetch_window_aux": prefetch_window_aux,
             "state_plan": state_plan,
             "state_leaves": sum(n for _kind, _entry, n in state_plan),
             "capture_plan": tuple(capture_plan),
             "capture_leaves": capture_pos,
+            "returns_aux": returns_aux,
+            "aux_contract": aux_contract,
+            "graph_aux": graph_aux,
             "boundary": boundary,
             "base_offset": len(prompt_ids),
             "capacity": min(entry.capacity for entry in qsa_entries),
@@ -1947,7 +2076,141 @@ class CompiledVerifyBank:
                 _compiled_verify_donation_enabled()
                 and boundary in ("both", "post")
             ),
+            "device_commit": device_commit,
         }
+
+    def _make_fixed_m4_prefix_step(self):
+        bank = self
+
+        def prefix_step(input_ids, *state_in):
+            entry = bank._shadow[0]
+            for slot, leaf in enumerate(state_in):
+                entry.cache[slot] = leaf
+            hidden, captures = bank.runtime.forward_fixed_m4_prefix(
+                input_ids,
+                cache=bank._shadow,
+            )
+            return (hidden, *captures, *entry.cache[: len(state_in)])
+
+        return prefix_step
+
+    def _make_fixed_m4_suffix_step(self, dispatch):
+        bank = self
+        suffix_plan = dispatch["state_plan"][1:]
+        suffix_capture = self._extra_capture_layout[1:]
+        returns_aux = bool(dispatch["returns_aux"])
+        graph_aux = dispatch["graph_aux"]
+
+        def suffix_step(layer0_hidden, input_ids, compiled_aux, *state_in):
+            pos = 0
+            for (index, _spec_kind, _spec_leaves), (
+                kind,
+                _entry,
+                n_leaves,
+            ) in zip(bank._spec[1:], suffix_plan):
+                shadow_entry = bank._shadow[index]
+                if kind == VERIFY_SPEC_KIND_QSA:
+                    shadow_entry.kv.cache[0] = state_in[pos]
+                    shadow_entry.kv.cache[1] = state_in[pos + 1]
+                    shadow_entry.kv.cache[2] = state_in[pos + 2]
+                    shadow_entry.raw_keys = state_in[pos + 3]
+                    shadow_entry.pooled = state_in[pos + 4]
+                    for slot in range(len(shadow_entry.kv.rollback_state)):
+                        shadow_entry.kv.rollback_state[slot] = None
+                else:
+                    for slot in range(n_leaves):
+                        shadow_entry.cache[slot] = state_in[pos + slot]
+                pos += n_leaves
+            if graph_aux is not None:
+                compiled_aux = graph_aux(compiled_aux)
+            logits, hidden, captures = bank.runtime.forward_fixed_m4_suffix(
+                layer0_hidden,
+                input_ids,
+                cache=bank._shadow,
+                compiled_aux=compiled_aux,
+            )
+            captures_flat = []
+            for index, names in suffix_capture:
+                layer_capture = captures[index]
+                captures_flat.extend(layer_capture[name] for name in names)
+            state_out = []
+            for (index, _kind, _spec_leaves), (
+                _plan_kind,
+                _entry,
+                n_leaves,
+            ) in zip(bank._spec[1:], suffix_plan):
+                shadow_entry = bank._shadow[index]
+                if _plan_kind == VERIFY_SPEC_KIND_QSA:
+                    state_out.extend(shadow_entry.state_leaves)
+                else:
+                    state_out.extend(shadow_entry.cache[:n_leaves])
+            if returns_aux:
+                return (logits, hidden, compiled_aux, *captures_flat, *state_out)
+            return (logits, hidden, *captures_flat, *state_out)
+
+        return suffix_step
+
+    def install_fixed_m4_split(self) -> None:
+        """Install the PR391 layer-0 prefix and layers-1..47 suffix graphs."""
+
+        dispatch = self._fixed_m4_dispatch
+        assert dispatch is not None
+        layer_indices = tuple(index for index, _kind, _n in self._spec or ())
+        if layer_indices != tuple(range(len(layer_indices))) or len(layer_indices) < 2:
+            raise RuntimeError("fixed-M4 split requires one contiguous state plan")
+        prefix_kind, prefix_entry, prefix_state_leaves = dispatch["state_plan"][0]
+        if (
+            prefix_kind != VERIFY_SPEC_KIND_GDN
+            or prefix_state_leaves != 2
+        ):
+            raise RuntimeError("fixed-M4 split requires two layer-0 state leaves")
+        prefix_capture_entry, prefix_start, prefix_capture_leaves = dispatch[
+            "capture_plan"
+        ][0]
+        if (
+            prefix_capture_entry is not dispatch["state_plan"][0][1]
+            or prefix_start != 0
+            or prefix_capture_leaves != 6
+        ):
+            raise RuntimeError("fixed-M4 split state or capture census changed")
+        if len(layer_indices) == 48 and (
+            dispatch["state_leaves"] - prefix_state_leaves != 132
+            or dispatch["capture_leaves"] - prefix_capture_leaves != 213
+        ):
+            raise RuntimeError("fixed-M4 split production census changed")
+        dispatch["split"] = {
+            "prefix_fn": mx.compile(self._make_fixed_m4_prefix_step()),
+            "suffix_fn": mx.compile(self._make_fixed_m4_suffix_step(dispatch)),
+            "prefix_state_leaves": prefix_state_leaves,
+            "prefix_capture_leaves": prefix_capture_leaves,
+            "suffix_capture_leaves": dispatch["capture_leaves"]
+            - prefix_capture_leaves,
+        }
+
+    def prefetch_fixed_m4_primary(
+        self,
+        primary,
+        completion_tokens,
+        committed_count: int,
+    ) -> None:
+        self._fixed_m4_dispatch["prefetch_aux"](
+            primary,
+            completion_tokens,
+            committed_count,
+        )
+
+    def prefetch_fixed_m4_window(
+        self,
+        *,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+    ) -> None:
+        self._fixed_m4_dispatch["prefetch_window_aux"](
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+        )
 
     def _transition_fixed_m4_generation(
         self,
@@ -2017,13 +2280,20 @@ class CompiledVerifyBank:
         self._shadow_signature = None
         self._ensure_shadow(cache)
         route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
-        key = (4, str(dispatch["hidden_variant"] or ""), route_key)
+        key = (
+            4,
+            str(dispatch["hidden_variant"] or ""),
+            route_key,
+            dispatch["aux_contract"],
+        )
         fn = self._compiled.get(key)
         if fn is None:
             fn = self._shared_or_new_verify_step(
                 key,
                 4,
                 dispatch["hidden_variant"],
+                graph_aux=dispatch["graph_aux"],
+                return_compiled_aux=dispatch["returns_aux"],
             )
             self._compiled[key] = fn
         dispatch["fn"] = fn
@@ -2075,19 +2345,31 @@ class CompiledVerifyBank:
             committed_count,
         )
         if boundary in ("both", "pre"):
-            mx.async_eval(compiled_aux, *state_in)
+            if dispatch["returns_aux"]:
+                mx.async_eval(*state_in)
+            else:
+                mx.async_eval(compiled_aux, *state_in)
         outputs = dispatch["fn"](input_ids, compiled_aux, *state_in)
 
-        capture_end = 2 + dispatch["capture_leaves"]
-        logits, hidden = outputs[:2]
-        captures_flat = outputs[2:capture_end]
-        state_out = outputs[capture_end:]
+        logits, hidden, returned_aux, captures_flat, state_out = (
+            _unpack_fixed_m4_outputs(
+                outputs,
+                capture_leaves=dispatch["capture_leaves"],
+                returns_aux=dispatch["returns_aux"],
+            )
+        )
+        if not dispatch["returns_aux"]:
+            returned_aux = compiled_aux
+        else:
+            self._held_aux_refs.append((compiled_aux, returned_aux))
+            if len(self._held_aux_refs) > 3:
+                self._held_aux_refs.pop(0)
 
         if not donate and boundary in ("both", "post"):
             mx.async_eval(*outputs)
             self._held_state_refs.clear()
         elif not donate:
-            self._held_state_refs.append(state_in)
+            self._held_state_refs.append((state_in, compiled_aux))
             if len(self._held_state_refs) > 3:
                 self._held_state_refs.pop(0)
 
@@ -2112,6 +2394,7 @@ class CompiledVerifyBank:
                 entry._mtplx_verify_ple = tuple(
                     captures_flat[start + 6 : start + count]
                 )
+                entry._mtplx_verify_compiled_aux = returned_aux
 
         if donate:
             state_in = None
@@ -2121,6 +2404,132 @@ class CompiledVerifyBank:
         self.stats["compiled_calls"] += 1
         self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
         return logits, hidden, {}
+
+    @staticmethod
+    def _fixed_m4_state_inputs(state_plan) -> tuple[Any, ...]:
+        leaves = []
+        for kind, entry, n_leaves in state_plan:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                leaves.extend(
+                    (
+                        entry.kv.cache[0],
+                        entry.kv.cache[1],
+                        entry.kv.cache[2],
+                        entry.raw_keys,
+                        entry.pooled,
+                    )
+                )
+            else:
+                leaves.extend(entry.cache[:n_leaves])
+        return tuple(leaves)
+
+    def discard_fixed_m4_prefix(self, prefix: FixedM4Prefix) -> None:
+        """Release exactly one abandoned split transaction without publishing it."""
+
+        self._held_fixed_m4_split_refs[:] = [
+            held
+            for held in self._held_fixed_m4_split_refs
+            if held is not prefix
+            and not (
+                isinstance(held, FixedM4Split)
+                and held.prefix is prefix
+            )
+        ]
+
+    def enqueue_fixed_m4_prefix(
+        self,
+        input_ids,
+        *,
+        cache,
+    ) -> FixedM4Prefix:
+        """Queue the fixed-M4 embedding/layer-0 graph without rebinding cache."""
+
+        dispatch = self._fixed_m4_dispatch
+        split = dispatch["split"]
+        state_in = self._fixed_m4_state_inputs(dispatch["state_plan"][:1])
+        outputs = tuple(split["prefix_fn"](input_ids, *state_in))
+        mx.async_eval(*outputs)
+        capture_end = 1 + split["prefix_capture_leaves"]
+        prefix = FixedM4Prefix(
+            input_ids=input_ids,
+            hidden=outputs[0],
+            captures=tuple(outputs[1:capture_end]),
+            state_in=state_in,
+            state_out=tuple(outputs[capture_end:]),
+            outputs=outputs,
+        )
+        self._held_fixed_m4_split_refs.append(prefix)
+        return prefix
+
+    def forward_fixed_m4_suffix(
+        self,
+        prefix: FixedM4Prefix,
+        *,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
+        """Join the queued layer-0 result with PLE and layers 1..47."""
+
+        del return_hidden, hidden_variant
+        try:
+            dispatch = self._fixed_m4_dispatch
+            split = dispatch["split"]
+            self._transition_fixed_m4_generation(
+                cache,
+                committed_count=committed_count,
+            )
+            suffix_plan = dispatch["state_plan"][1:]
+            state_in = self._fixed_m4_state_inputs(suffix_plan)
+            compiled_aux = dispatch["prepare_aux"](
+                prefix.input_ids,
+                host_input_ids,
+                completion_tokens,
+                committed_count,
+            )
+            if dispatch["boundary"] in ("both", "pre"):
+                if dispatch["returns_aux"]:
+                    mx.async_eval(*state_in)
+                else:
+                    mx.async_eval(compiled_aux, *state_in)
+            outputs = tuple(
+                split["suffix_fn"](
+                    prefix.hidden,
+                    prefix.input_ids,
+                    compiled_aux,
+                    *state_in,
+                )
+            )
+            logits, hidden, returned_aux, captures_flat, state_out = (
+                _unpack_fixed_m4_outputs(
+                    outputs,
+                    capture_leaves=split["suffix_capture_leaves"],
+                    returns_aux=dispatch["returns_aux"],
+                )
+            )
+            if not dispatch["returns_aux"]:
+                returned_aux = compiled_aux
+
+            mx.async_eval(*prefix.outputs, *outputs)
+            split_result = FixedM4Split(
+                prefix=prefix,
+                returned_aux=returned_aux,
+                captures=tuple(captures_flat),
+                state_in=state_in,
+                state_out=tuple(state_out),
+                outputs=outputs,
+            )
+            self._held_fixed_m4_split_refs.append(split_result)
+            self.stats["calls"] += 1
+            self.stats["compiled_calls"] += 1
+            self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
+            return logits, hidden, {}, split_result
+        except Exception:
+            self.discard_fixed_m4_prefix(prefix)
+            raise
 
     def forward_fixed_m4(
         self,
@@ -2144,6 +2553,52 @@ class CompiledVerifyBank:
             committed_count,
             cache,
         )
+
+    def _publish_fixed_m4_selected_state(self, commit_plan) -> None:
+        """Publish only the successfully enqueued authoritative frontier."""
+
+        for kind, entry, selected_state in commit_plan:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = selected_state[0]
+                entry.kv.cache[1] = selected_state[1]
+                entry.kv.cache[2] = selected_state[2]
+                entry.raw_keys = selected_state[3]
+                entry.pooled = selected_state[4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            else:
+                for slot, leaf in enumerate(selected_state):
+                    entry.cache[slot] = leaf
+                entry._mtplx_verify_rows = None
+                if len(entry.cache) > 2:
+                    entry._mtplx_verify_ple = None
+                    entry._mtplx_verify_compiled_aux = None
+
+    def commit_fixed_m4_device_window(
+        self,
+        accepted_count,
+        snapshot_states,
+        verify_hidden,
+        split: FixedM4Split,
+    ):
+        """Queue the construction-bound target state selection on device."""
+
+        try:
+            selected_hidden, commit_plan, state_roots = self._fixed_m4_dispatch[
+                "device_commit"
+            ](
+                accepted_count,
+                snapshot_states,
+                verify_hidden,
+                split,
+            )
+            mx.async_eval(selected_hidden, *state_roots)
+        except Exception:
+            self._held_fixed_m4_split_refs.clear()
+            raise
+        self._publish_fixed_m4_selected_state(commit_plan)
+        self._held_fixed_m4_split_refs.clear()
+        return selected_hidden
 
     def forward_ar_capture(
         self,
@@ -2785,6 +3240,7 @@ class CompiledVerifyBank:
             # shadow, which no longer mirrors the cache list.
             self._clear_shadow_leaf_refs()
             self._held_state_refs.clear()
+            self._held_fixed_m4_split_refs.clear()
             self._shadow = None
             self._shadow_signature = None
             self._spec = None
@@ -2814,8 +3270,7 @@ class CompiledVerifyBank:
         )
         data["compiled_entry_count"] = len(self._compiled)
         data["compiled_keys"] = [
-            f"m{length}:{variant or 'default'}:b{bucket}"
-            for length, variant, bucket in sorted(self._compiled)
+            _format_compiled_verify_key(key) for key in sorted(self._compiled)
         ]
         return data
 
@@ -3096,7 +3551,15 @@ class CompiledVerifyBank:
 
     # -- compiled function ------------------------------------------------------
 
-    def _shared_or_new_verify_step(self, key, length: int, hidden_variant: str | None):
+    def _shared_or_new_verify_step(
+        self,
+        key,
+        length: int,
+        hidden_variant: str | None,
+        *,
+        graph_aux=None,
+        return_compiled_aux: bool = False,
+    ):
         """Reuse one compiled verify callable per process for a logical key.
 
         The bank is constructed per generation, so a per-instance compile dict
@@ -3114,7 +3577,14 @@ class CompiledVerifyBank:
         """
 
         if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
-            return mx.compile(self._make_verify_step(length, hidden_variant))
+            return mx.compile(
+                self._make_verify_step(
+                    length,
+                    hidden_variant,
+                    graph_aux=graph_aux,
+                    return_compiled_aux=return_compiled_aux,
+                )
+            )
         spec_sig = tuple(self._spec or [])
         from .attention_context import exact_verify_required
 
@@ -3128,6 +3598,7 @@ class CompiledVerifyBank:
             int(length),
             str(hidden_variant or ""),
             int(key[2]),
+            str(key[3]) if len(key) > 3 else "materialized",
             # Kernel-route dimension: a trace compiled under the sampled
             # (vk/nax) verify route bakes those kernels into the graph; a
             # greedy (t<=0, stock-route) request must never replay it, and
@@ -3146,7 +3617,13 @@ class CompiledVerifyBank:
             _SHARED_VERIFY_STEPS.pop(global_key, None)
         host = {"bank": self}
         fn = mx.compile(
-            self._make_verify_step(length, hidden_variant, trace_host=host)
+            self._make_verify_step(
+                length,
+                hidden_variant,
+                trace_host=host,
+                graph_aux=graph_aux,
+                return_compiled_aux=return_compiled_aux,
+            )
         )
         _SHARED_VERIFY_STEPS[global_key] = (fn, host, weakref.ref(self.runtime))
         return fn
@@ -3156,6 +3633,9 @@ class CompiledVerifyBank:
         length: int,
         hidden_variant: str | None,
         trace_host: dict[str, Any] | None = None,
+        *,
+        graph_aux=None,
+        return_compiled_aux: bool = False,
     ):
         spec = list(self._spec or [])
         layout = self._capture_layout()
@@ -3174,6 +3654,8 @@ class CompiledVerifyBank:
             else:
                 compiled_aux = None
                 state_in = args
+            if graph_aux is not None:
+                compiled_aux = graph_aux(compiled_aux)
             live.stats["traces"] += 1
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
@@ -3231,6 +3713,8 @@ class CompiledVerifyBank:
                     state_out.extend(entry.cache[slot] for slot in range(_n))
                 else:
                     state_out.extend(entry.cache[slot] for slot in range(_n))
+            if return_compiled_aux:
+                return (logits, hidden, compiled_aux, *captures_flat, *state_out)
             return (logits, hidden, *captures_flat, *state_out)
 
         return verify_step

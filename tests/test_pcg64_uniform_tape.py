@@ -5,7 +5,12 @@ import json
 import numpy as np
 import pytest
 
-from mtplx.pcg64_tape import PCG64UniformTape
+from mtplx.pcg64_tape import (
+    DRAWS_PER_CYCLE,
+    PCG64UniformTape,
+    UniformTapeExhausted,
+    _select_weighted_choice_index,
+)
 from mtplx.sampling import SparseDistribution, sample_from_distribution
 
 
@@ -13,17 +18,7 @@ def _state(rng: np.random.Generator) -> str:
     return json.dumps(rng.bit_generator.state, sort_keys=True)
 
 
-def _inverse_cdf_choice(
-    values: np.ndarray,
-    probabilities: np.ndarray,
-    uniform: float,
-) -> int:
-    cdf = np.cumsum(probabilities)
-    cdf /= cdf[-1]
-    return int(values[np.searchsorted(cdf, uniform, side="right")])
-
-
-def test_inverse_cdf_matches_numpy_choice_cumulative_normalization() -> None:
+def test_choice_uses_numpy_sum_normalization_at_known_boundary() -> None:
     probabilities = np.array(
         [
             0.2927264538460277,
@@ -37,12 +32,8 @@ def test_inverse_cdf_matches_numpy_choice_cumulative_normalization() -> None:
         ],
         dtype=np.float64,
     )
-    uniform = 4_144_211_596_455_494 / 2**53
-    values = np.arange(8)
-    legacy_cdf = np.cumsum(probabilities) / np.sum(probabilities)
-
-    assert int(values[np.searchsorted(legacy_cdf, uniform, side="right")]) == 2
-    assert _inverse_cdf_choice(values, probabilities, uniform) == 3
+    uniform = np.float64(4_144_211_596_455_494 / 2**53)
+    assert _select_weighted_choice_index(probabilities, uniform) == 2
 
 
 @pytest.mark.parametrize("support", range(1, 41))
@@ -58,7 +49,8 @@ def test_reserved_uniform_matches_weighted_choice_and_state(support: int) -> Non
 
         expected = int(reference.choice(values, p=probabilities))
         offset = tape.reserve_device_choices(1)
-        actual = _inverse_cdf_choice(values, probabilities, tape.values[offset])
+        index = _select_weighted_choice_index(probabilities, float(tape.values[offset]))
+        actual = int(values[index])
 
         assert actual == expected
         assert tape.cursor == 1
@@ -80,7 +72,8 @@ def test_zero_mass_filtered_support_matches_weighted_choice(seed: int) -> None:
 
     expected = int(reference.choice(all_values, p=all_probabilities))
     offset = tape.reserve_device_choices(1)
-    actual = _inverse_cdf_choice(values, probabilities, tape.values[offset])
+    index = _select_weighted_choice_index(probabilities, float(tape.values[offset]))
+    actual = int(values[index])
 
     assert actual == expected
     assert _state(authoritative) == _state(reference)
@@ -97,8 +90,66 @@ def test_build_exposes_initial_tape_without_advancing_authoritative_rng() -> Non
     assert tape.rng is authoritative
     assert tape.cursor == 0
     assert tape.values.dtype == np.float64
+    assert tape.values.flags.c_contiguous
+    assert tape.values.flags.writeable is False
+    assert tape.device_values.flags.writeable is False
     np.testing.assert_array_equal(tape.values, expected_values)
     assert _state(authoritative) == initial_state
+    with pytest.raises(ValueError, match="read-only"):
+        tape.values[0] = 0.0
+    with pytest.raises(ValueError):
+        tape.values.setflags(write=True)
+
+
+def test_device_reservation_exposes_offset_values_and_legacy_indexing() -> None:
+    reference = np.random.default_rng(391)
+    authoritative = np.random.default_rng(391)
+    tape = PCG64UniformTape.build(authoritative, max_output_tokens=1)
+
+    reservation = tape.reserve_device_choices(3)
+
+    assert reservation.offset == 0
+    assert reservation.values.flags.writeable is False
+    np.testing.assert_array_equal(reservation.values, reference.random(3))
+    assert tape.values[reservation] == reservation.values[0]
+    assert _state(authoritative) == _state(reference)
+
+
+@pytest.mark.parametrize("committed", [1, 2, 3, 4])
+def test_peek_then_commit_advances_only_device_reported_draws(committed: int) -> None:
+    reference = np.random.default_rng(391 + committed)
+    authoritative = np.random.default_rng(391 + committed)
+    tape = PCG64UniformTape.build(authoritative, max_output_tokens=4)
+
+    reservation = tape.peek_device_choices(4)
+
+    assert reservation.offset == 0
+    np.testing.assert_array_equal(
+        reservation.values,
+        np.random.default_rng(391 + committed).random(4),
+    )
+    assert tape.cursor == 0
+    assert _state(authoritative) == _state(reference)
+
+    tape.commit_device_choices(reservation, committed)
+    reference.random(committed)
+
+    assert tape.cursor == committed
+    assert _state(authoritative) == _state(reference)
+
+
+def test_peek_commit_rejects_stale_or_oversized_device_report() -> None:
+    tape = PCG64UniformTape.build(np.random.default_rng(391), max_output_tokens=4)
+    reservation = tape.peek_device_choices(4)
+
+    with pytest.raises(ValueError, match="reported draw count"):
+        tape.commit_device_choices(reservation, 0)
+    with pytest.raises(ValueError, match="reported draw count"):
+        tape.commit_device_choices(reservation, 5)
+
+    tape.commit_device_choices(reservation, 2)
+    with pytest.raises(RuntimeError, match="stale"):
+        tape.commit_device_choices(reservation, 1)
 
 
 def test_random_and_choice_delegate_to_authoritative_generator() -> None:
@@ -200,6 +251,9 @@ def test_exact_pcg64_and_numpy_version_are_required(monkeypatch) -> None:
     class DerivedPCG64(np.random.PCG64):
         pass
 
+    class DerivedGenerator(np.random.Generator):
+        pass
+
     with pytest.raises(TypeError, match="numpy.random.PCG64"):
         PCG64UniformTape.build(
             np.random.Generator(np.random.Philox(0)), max_output_tokens=8
@@ -208,6 +262,10 @@ def test_exact_pcg64_and_numpy_version_are_required(monkeypatch) -> None:
         PCG64UniformTape.build(
             np.random.Generator(DerivedPCG64(0)), max_output_tokens=8
         )
+    with pytest.raises(TypeError, match="numpy.random.Generator"):
+        PCG64UniformTape.build(
+            DerivedGenerator(np.random.PCG64(0)), max_output_tokens=8
+        )
 
     monkeypatch.setattr(np, "__version__", "2.4.5")
     with pytest.raises(RuntimeError, match="2.4.4"):
@@ -215,9 +273,7 @@ def test_exact_pcg64_and_numpy_version_are_required(monkeypatch) -> None:
 
 
 def test_output_bound_accepts_zero_and_non_boolean_integrals() -> None:
-    zero_tape = PCG64UniformTape.build(
-        np.random.default_rng(0), max_output_tokens=0
-    )
+    zero_tape = PCG64UniformTape.build(np.random.default_rng(0), max_output_tokens=0)
     numpy_integer_tape = PCG64UniformTape.build(
         np.random.default_rng(0), max_output_tokens=np.int64(2)
     )
@@ -249,17 +305,73 @@ def test_direct_construction_cannot_bypass_build_validation() -> None:
 
 
 def test_16k_bound_is_under_one_mib_and_oversize_is_rejected() -> None:
-    tape = PCG64UniformTape.build(
-        np.random.default_rng(0), max_output_tokens=16_384
-    )
+    tape = PCG64UniformTape.build(np.random.default_rng(0), max_output_tokens=16_384)
 
     assert tape.values.shape == (7 * 16_385,)
     assert tape.values.nbytes == 917_560
     with pytest.raises(ValueError, match="16,384"):
-        PCG64UniformTape.build(
-            np.random.default_rng(0), max_output_tokens=-1
-        )
+        PCG64UniformTape.build(np.random.default_rng(0), max_output_tokens=-1)
     with pytest.raises(ValueError, match="16,384"):
-        PCG64UniformTape.build(
-            np.random.default_rng(0), max_output_tokens=16_385
-        )
+        PCG64UniformTape.build(np.random.default_rng(0), max_output_tokens=16_385)
+
+
+def test_exhaustion_fails_before_rng_or_cursor_mutation() -> None:
+    tape = PCG64UniformTape.build(np.random.default_rng(7), max_output_tokens=0)
+    tape.reserve_device_choices(DRAWS_PER_CYCLE)
+    state = _state(tape.rng)
+
+    with pytest.raises(UniformTapeExhausted, match="requested 1"):
+        tape.random()
+    with pytest.raises(UniformTapeExhausted, match="requested 1"):
+        tape.choice(np.array([1]), p=np.array([1.0]))
+    with pytest.raises(UniformTapeExhausted, match="requested 2"):
+        tape.reserve_device_choices(2)
+
+    assert tape.cursor == DRAWS_PER_CYCLE
+    assert _state(tape.rng) == state
+
+
+@pytest.mark.parametrize(
+    "values, probabilities",
+    [
+        (np.array([1, 2]), np.array([0.5])),
+        (np.array([1, 2]), np.array([[0.5, 0.5]])),
+        (np.array([1, 2]), np.array([0.5, -0.5])),
+        (np.array([1, 2]), np.array([0.5, np.nan])),
+        (np.array([1, 2]), np.array([0.4, 0.5])),
+        (np.array([], dtype=np.int64), np.array([], dtype=np.float64)),
+    ],
+)
+def test_manual_choice_rejects_the_same_malformed_probabilities_as_numpy(
+    values: np.ndarray, probabilities: np.ndarray
+) -> None:
+    reference = np.random.default_rng(13)
+    tape = PCG64UniformTape.build(np.random.default_rng(13), max_output_tokens=0)
+    with pytest.raises(ValueError):
+        reference.choice(values, p=probabilities)
+    state = _state(tape.rng)
+    with pytest.raises(ValueError):
+        tape.choice(values, p=probabilities)
+    assert tape.cursor == 0
+    assert _state(tape.rng) == state
+
+
+def test_choice_uses_numpy_probability_tolerance_for_original_float32_dtype() -> None:
+    values = np.array([11, 22], dtype=np.int64)
+    accepted = np.array([0.5, 0.4999], dtype=np.float32)
+    rejected = np.array([0.5, 0.499], dtype=np.float32)
+    reference = np.random.default_rng(391)
+    authoritative = np.random.default_rng(391)
+    tape = PCG64UniformTape.build(authoritative, max_output_tokens=0)
+
+    assert tape.choice(values, p=accepted) == reference.choice(values, p=accepted)
+    assert tape.cursor == 1
+    assert _state(authoritative) == _state(reference)
+
+    with pytest.raises(ValueError, match="sum to 1"):
+        reference.choice(values, p=rejected)
+    state = _state(authoritative)
+    with pytest.raises(ValueError, match="sum to 1"):
+        tape.choice(values, p=rejected)
+    assert tape.cursor == 1
+    assert _state(authoritative) == state

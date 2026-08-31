@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 
@@ -17,6 +19,7 @@ def main():
         reset_receipt = reset_run_caches(runtime, mx)
         mx.reset_peak_memory()
         sampler = cell["sampler"]
+        max_tokens = int(cell["max_tokens"])
         started = time.perf_counter()
         output = generate_mtpk(
             runtime,
@@ -43,9 +46,11 @@ def test_transform_prewarms_before_load_receipt_and_installs_each_request() -> N
     transformed = transform_metal_choice_driver(FAKE_DRIVER)
     prebind = transformed.index("prebind_metal_float32_choice_kernel()")
     prewarm = transformed.index("_metal_choice_prebound.prewarm_b1()")
+    verifier_bind = transformed.index("bind_pr391_float32_verifier_decision()")
+    verifier_prewarm = transformed.index("_metal_choice_verifier_prewarm")
     after_load = transformed.index("after_load_memory")
     reset = transformed.index("reset_run_caches")
-    install = transformed.index("MetalFloat32ChoiceRoute.install")
+    install = transformed.index("PR391DirectFloat32D3Route.install")
     started = transformed.index("started = time.perf_counter()")
     generate = transformed.index("output = generate_mtpk")
     row = transformed.index("row = stats_receipt")
@@ -53,14 +58,201 @@ def test_transform_prewarms_before_load_receipt_and_installs_each_request() -> N
     finish = transformed.index("_metal_choice_route.finish_receipt")
     attach = transformed.index('row["metal_float32_choice_route"]')
 
-    assert prebind < prewarm < after_load
+    assert prebind < prewarm < verifier_bind < verifier_prewarm < after_load
     assert reset < install < started < generate < row < close < finish < attach
+    assert "thermal_receipt = wait_for_temperature()" not in transformed
+    assert '"reason": "user_requested"' in transformed
     assert "expected_seed=seed" in transformed
+    assert "max_output_tokens=max_tokens" in transformed
     assert "kernel_module=_metal_choice_prebound" in transformed
-    assert 'sampler=cell.get("draft_sampler", sampler)' in transformed
-    assert transformed.count("MetalFloat32ChoiceRoute.install") == 1
+    assert "verifier_kernel=_metal_choice_verifier" in transformed
+    assert "verifier_prewarm=_metal_choice_verifier_prewarm" in transformed
+    assert "target_sampler=sampler" in transformed
+    assert 'draft_sampler=cell.get("draft_sampler", sampler)' in transformed
+    assert transformed.count("PR391DirectFloat32D3Route.install") == 1
     assert "draft-choice-arm" not in transformed
     assert ROUTE_ARM == "metal-float32-test-only"
+
+
+def test_direct_route_builds_one_request_tape_and_one_descriptor_array() -> None:
+    from scripts.pr391_metal_choice_benchmark_launcher import (
+        PR391DirectFloat32D3Route,
+    )
+    from scripts.pr391_metal_choice_route import PreboundMetalFloat32ChoiceKernel
+
+    class FakeMX:
+        uint32 = "uint32"
+        float32 = "float32"
+
+        def __init__(self):
+            self.arrays = []
+
+        def array(self, value, *, dtype):
+            result = np.asarray(value)
+            self.arrays.append((result, dtype))
+            return result
+
+    class FakeKernel:
+        @staticmethod
+        def build_pcg64_midpoint_descriptors(uniforms):
+            return np.zeros((len(uniforms), 5), dtype=np.uint32)
+
+    class FakeGeneration:
+        def __init__(self):
+            self.installed = None
+
+        def _pr391_install_float32_d3_request_route(self, route):
+            self.installed = route
+
+        def _pr391_uninstall_float32_d3_request_route(self, route):
+            assert self.installed is route
+            self.installed = None
+
+    fake_mx = FakeMX()
+    prebound = PreboundMetalFloat32ChoiceKernel(
+        mx=fake_mx,
+            kernel_module=FakeKernel(),
+            selector=object(),
+            selfcheck={"schedule_id": "test"},
+        source_sha256={"kernel": "1" * 64},
+        _prewarm_receipt={
+            "status": "passed",
+            "rows": 1,
+            "raw_passthrough_bit_exact": True,
+            "selected_token_match": True,
+            "peak_memory_bytes": 0,
+            "schedule_id": "test",
+        },
+    )
+    generation = FakeGeneration()
+    target_sampler = SimpleNamespace(temperature=1.0, top_k=20, top_p=0.95)
+    draft_sampler = SimpleNamespace(temperature=1.0, top_k=20, top_p=0.95)
+
+    route = PR391DirectFloat32D3Route.install(
+        generation,
+        expected_seed=391,
+        max_output_tokens=8,
+        kernel_module=prebound,
+        verifier_kernel=lambda *_args: (),
+        verifier_prewarm={
+            "status": "passed",
+            "case_count": 6,
+            "cases": [
+                "reject_d0",
+                "reject_d1",
+                "reject_d2",
+                "all_accept_bonus",
+                "accepted_stop",
+                "bonus_disabled",
+            ],
+        },
+        target_sampler=target_sampler,
+        draft_sampler=draft_sampler,
+    )
+
+    assert generation.installed is route
+    assert route.uniform_tape.cursor == 0
+    assert route.descriptor_rows.shape == (7 * 9, 5)
+    assert route.uniform_rows.shape == (7 * 9,)
+    assert len(fake_mx.arrays) == 4
+    assert route.verifier_kernel is not None
+    assert route.preserve_paged is True
+    assert route.sampler is target_sampler
+    assert route.draft_sampler is draft_sampler
+    route.claimed = True
+    route.close()
+    receipt = route.finish_receipt(
+        stats={
+            "drafted_tokens": 6,
+            "drafted_by_depth": [2, 2, 2],
+            "accepted_drafts": 0,
+            "verify_calls": 2,
+            "correction_tokens": 2,
+            "bonus_tokens": 0,
+            "context_copy_rounds": 0,
+            "context_copy_drafted_tokens": 0,
+        },
+    )
+    assert receipt["schedule"]["descriptor_device_installs"] == 1
+    assert generation.installed is None
+
+
+def test_verifier_prewarm_proves_all_device_outcomes_against_reference() -> None:
+    from mtplx.kernels.pr391_float32_verifier_decision import (
+        reference_pr391_float32_verifier_decision,
+    )
+    from scripts.pr391_metal_choice_benchmark_launcher import (
+        prewarm_float32_verifier_decision,
+    )
+
+    class FakeMX:
+        uint32 = np.uint32
+        int32 = np.int32
+        float32 = np.float32
+
+        @staticmethod
+        def array(value, *, dtype):
+            return np.asarray(value, dtype=dtype)
+
+        @staticmethod
+        def eval(*_values):
+            return None
+
+    def verifier(*values):
+        return reference_pr391_float32_verifier_decision(
+            *values[:7],
+            stop_count=int(values[7][0]),
+            bonus_allowed=bool(values[8][0]),
+        )
+
+    receipt = prewarm_float32_verifier_decision(FakeMX(), verifier)
+
+    assert receipt["status"] == "passed"
+    assert receipt["case_count"] == 6
+    assert receipt["cases"] == [
+        "reject_d0",
+        "reject_d1",
+        "reject_d2",
+        "all_accept_bonus",
+        "accepted_stop",
+        "bonus_disabled",
+    ]
+
+
+def test_verifier_prewarm_fails_closed_on_device_drift() -> None:
+    from mtplx.kernels.pr391_float32_verifier_decision import (
+        reference_pr391_float32_verifier_decision,
+    )
+    from scripts.pr391_metal_choice_benchmark_launcher import (
+        prewarm_float32_verifier_decision,
+    )
+
+    class FakeMX:
+        uint32 = np.uint32
+        int32 = np.int32
+        float32 = np.float32
+
+        @staticmethod
+        def array(value, *, dtype):
+            return np.asarray(value, dtype=dtype)
+
+        @staticmethod
+        def eval(*_values):
+            return None
+
+    def corrupt_verifier(*values):
+        outputs = list(
+            reference_pr391_float32_verifier_decision(
+                *values[:7],
+                stop_count=int(values[7][0]),
+                bonus_allowed=bool(values[8][0]),
+            )
+        )
+        outputs[5] = outputs[5] + np.uint32(1)
+        return tuple(outputs)
+
+    with pytest.raises(RuntimeError, match="parity mismatch"):
+        prewarm_float32_verifier_decision(FakeMX(), corrupt_verifier)
 
 
 @pytest.mark.parametrize(
@@ -96,6 +288,11 @@ def test_route_receipt_requires_full_engagement_and_passthrough() -> None:
             "raw_passthrough_rows": 1146,
             "pending": 0,
             "failures": 0,
+            "d3_cycles": 382,
+            "d3_rows": 1146,
+            "context_copy_substitutions": 0,
+            "context_copy_block_rounds": 0,
+            "other_draft_rows": 0,
         },
         "prebound": {
             "status": "passed",
@@ -105,8 +302,13 @@ def test_route_receipt_requires_full_engagement_and_passthrough() -> None:
             "peak_memory_bytes": 1024,
             "schedule_id": "fixed-k20-test",
         },
+        "verifier_prebound": {
+            "status": "passed",
+            "case_count": 6,
+        },
+        "stats": {"drafted_tokens": 1146},
     }
-    validate_metal_choice_receipt(receipt, drafted_tokens=1146)
+    validate_metal_choice_receipt(receipt)
 
     for field, value in (
         ("calls", 1145),
@@ -118,11 +320,11 @@ def test_route_receipt_requires_full_engagement_and_passthrough() -> None:
         changed = {**receipt, "route_counts": dict(receipt["route_counts"])}
         changed["route_counts"][field] = value
         with pytest.raises(RuntimeError, match="contract"):
-            validate_metal_choice_receipt(changed, drafted_tokens=1146)
+            validate_metal_choice_receipt(changed)
 
     with pytest.raises(RuntimeError, match="arm"):
         validate_metal_choice_receipt(
-            {**receipt, "arm": "control"}, drafted_tokens=1146
+            {**receipt, "arm": "control"}
         )
 
     for field, value in (
@@ -135,7 +337,51 @@ def test_route_receipt_requires_full_engagement_and_passthrough() -> None:
         changed = {**receipt, "prebound": dict(receipt["prebound"])}
         changed["prebound"][field] = value
         with pytest.raises(RuntimeError, match="contract"):
-            validate_metal_choice_receipt(changed, drafted_tokens=1146)
+            validate_metal_choice_receipt(changed)
+
+    aggregate_mismatch = {**receipt, "stats": {"drafted_tokens": 1145}}
+    with pytest.raises(RuntimeError, match="contract"):
+        validate_metal_choice_receipt(aggregate_mismatch)
+
+
+def test_route_receipt_uses_fixed_d3_depth_ledger_without_events() -> None:
+    from scripts.pr391_metal_choice_benchmark_launcher import build_d3_route_counts
+
+    assert build_d3_route_counts(
+        {
+            "drafted_tokens": 1146,
+            "drafted_by_depth": [382, 382, 382],
+            "context_copy_rounds": 8,
+            "context_copy_drafted_tokens": 112,
+        }
+    ) == {
+        "d3_cycles": 382,
+        "d3_rows": 1146,
+        "shortened_d2_cycles": 0,
+        "shortened_d1_cycles": 0,
+        "context_copy_rounds": 8,
+        "context_copy_drafted_tokens": 112,
+        "other_draft_rows": 0,
+        "count_source": "construction_claim_plus_stats.drafted_by_depth",
+    }
+
+    assert build_d3_route_counts(
+        {
+            "drafted_tokens": 1125,
+            "drafted_by_depth": [376, 375, 374],
+            "context_copy_rounds": 8,
+            "context_copy_drafted_tokens": 112,
+        }
+    ) == {
+        "d3_cycles": 374,
+        "d3_rows": 1122,
+        "shortened_d2_cycles": 1,
+        "shortened_d1_cycles": 1,
+        "context_copy_rounds": 8,
+        "context_copy_drafted_tokens": 112,
+        "other_draft_rows": 3,
+        "count_source": "construction_claim_plus_stats.drafted_by_depth",
+    }
 
 
 def test_output_drift_receipt_quantifies_digest_counters_and_depths() -> None:

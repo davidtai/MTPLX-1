@@ -55,6 +55,8 @@ from .forkev_telemetry import ForkEVRecorder
 from .fast_sampling import (
     MAX_DEVICE_TOP_K_ORDER,
     BatchedSparseDistributions,
+    _deterministic_mlx_top_k_support,
+    _order_bounded_mlx_top_k_support,
     apply_penalties_mlx,
     batched_sparse_distributions_from_mlx_logits,
     sample_token_ids_from_mlx_logits,
@@ -63,9 +65,14 @@ from .fast_sampling import (
     sparse_distributions_from_mlx_logits,
 )
 from .gdn_capture import resolve_gdn_capture_backend
+from .kernels.pr391_softfloat64_verifier_decision import (
+    SELECTED_BONUS as _PR391_SELECTED_BONUS,
+    SELECTED_CORRECTION as _PR391_SELECTED_CORRECTION,
+)
 from .graphbank import (
     CompiledVerifyBank,
     SpecDecodeGraphBank,
+    TensorOffsetQSACache,
     cache_array_tree,
     compiled_verify_mode,
     paged_offsets_context_ok as _paged_offsets_context_ok,
@@ -5294,6 +5301,565 @@ def _run_device_draft_core(
     return tokens, dists
 
 
+_PR391_FLOAT32_D3_DEPTH = 3
+_PR391_FLOAT32_D3_TOP_K = 20
+_PR391_FLOAT32_D3_TOP_P = 0.95
+_PR391_FLOAT32_D3_MAX_OUTPUT_TOKENS = 16_384
+_pr391_float32_d3_request_route: Any | None = None
+
+
+def _pr391_install_float32_d3_request_route(route: Any) -> None:
+    """Install one benchmark-owned direct route before request timing."""
+
+    global _pr391_float32_d3_request_route
+    if _pr391_float32_d3_request_route is not None:
+        raise RuntimeError("a PR391 float32 D3 request route is already installed")
+    _pr391_float32_d3_request_route = route
+
+
+def _pr391_uninstall_float32_d3_request_route(route: Any) -> None:
+    """Remove exactly the benchmark-owned route installed for this request."""
+
+    global _pr391_float32_d3_request_route
+    if _pr391_float32_d3_request_route is not route:
+        raise RuntimeError("PR391 float32 D3 request route ownership changed")
+    _pr391_float32_d3_request_route = None
+
+
+def _pr391_claim_float32_d3_request_route(
+    *,
+    seed: int,
+    max_tokens: int,
+    sampler: SamplerConfig,
+    draft_sampler: SamplerConfig,
+    speculative_depth: int,
+    mtp_cache_policy: str,
+    mtp_history_policy: str,
+    draft_core: str,
+    constraint: Any,
+    adaptive_policy: Any,
+    mtp_corrector: Any,
+    adaptive_width_policy: Any,
+    mtp_position_mode: str,
+    draft_margin_threshold: float | None,
+    online_hidden_corrector_alpha: float,
+    online_correction_cache: bool,
+    prompt_correction_cache: bool,
+    adapter_ensemble_q: bool,
+    mtp_topk_reranker: Any,
+    loop_guard: bool,
+    thinking_guard: Any,
+    late_depth_switch_after: int,
+) -> Any | None:
+    """Bind the installed test route to one exact generation construction."""
+
+    route = _pr391_float32_d3_request_route
+    if route is None:
+        return None
+    if route.claimed:
+        raise RuntimeError("PR391 float32 D3 request route was already claimed")
+    if int(seed) != route.expected_seed or int(max_tokens) != route.max_output_tokens:
+        raise RuntimeError("PR391 float32 D3 seed or maximum output changed")
+    if sampler is not route.sampler or draft_sampler is not route.draft_sampler:
+        raise RuntimeError("PR391 float32 D3 sampler ownership changed")
+    if int(speculative_depth) != _PR391_FLOAT32_D3_DEPTH:
+        raise RuntimeError("PR391 float32 D3 route requires speculative_depth=3")
+    if int(late_depth_switch_after) != 0:
+        raise RuntimeError("PR391 float32 D3 route does not admit late-depth switching")
+    if mtp_cache_policy != "persistent" or mtp_history_policy != "committed":
+        raise RuntimeError("PR391 float32 D3 route requires committed persistent MTP")
+    if draft_core != "stock":
+        raise RuntimeError("PR391 float32 D3 route requires the stock route selector")
+    if sampler.presence_penalty != 0.0 or sampler.frequency_penalty != 0.0:
+        raise RuntimeError("PR391 float32 D3 route does not admit sampler penalties")
+    if draft_sampler.presence_penalty != 0.0 or draft_sampler.frequency_penalty != 0.0:
+        raise RuntimeError("PR391 float32 D3 route does not admit draft penalties")
+    if mtp_position_mode not in {"cache", "default"}:
+        raise RuntimeError("PR391 float32 D3 route requires cache position mode")
+    if any(
+        (
+            constraint is not None,
+            adaptive_policy is not None,
+            mtp_corrector is not None,
+            adaptive_width_policy is not None,
+            draft_margin_threshold is not None,
+            online_hidden_corrector_alpha != 0.0,
+            online_correction_cache,
+            prompt_correction_cache,
+            adapter_ensemble_q,
+            mtp_topk_reranker is not None,
+            loop_guard,
+            thinking_guard is not None,
+        )
+    ):
+        raise RuntimeError("PR391 float32 D3 route received an unsupported feature")
+    if route.preserve_paged is not True:
+        raise RuntimeError("PR391 float32 D3 route requires preserve_paged=True")
+    route.claimed = True
+    return route
+
+
+def _pr391_require_fixed_m4_async_enqueue(compiled_verify_bank: Any) -> None:
+    """Prove the installed target dispatch queues work before D3 construction."""
+
+    dispatch = getattr(compiled_verify_bank, "_fixed_m4_dispatch", None)
+    if not isinstance(dispatch, dict) or not (
+        dispatch.get("donate") is True
+        or dispatch.get("boundary") in {"both", "post"}
+    ):
+        raise RuntimeError(
+            "PR391 float32 D3 requires an async-enqueue fixed-M4 dispatch"
+        )
+    if not callable(dispatch.get("device_commit")):
+        raise RuntimeError(
+            "PR391 float32 D3 requires a construction-bound device state commit"
+        )
+    if not callable(dispatch.get("prefetch_aux")):
+        raise RuntimeError(
+            "PR391 float32 D3 requires construction-bound PLE prefetch"
+        )
+    if not callable(dispatch.get("prefetch_window_aux")):
+        raise RuntimeError(
+            "PR391 float32 D3 requires construction-bound PLE window prefetch"
+        )
+
+
+def _pr391_tensor_leaves(value: Any) -> list[Any]:
+    """Flatten one construction-owned cache tree without materializing it."""
+
+    leaves: list[Any] = []
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            leaves.extend(_pr391_tensor_leaves(child))
+    elif isinstance(value, dict):
+        for child in value.values():
+            leaves.extend(_pr391_tensor_leaves(child))
+    elif value is not None:
+        leaves.append(value)
+    return leaves
+
+
+def _pr391_make_float32_d3_core(
+    rt: MTPLXRuntime,
+    *,
+    depth: int,
+    mtp_hidden_variant: str,
+    mtp_cache: Any,
+    draft_sampler: SamplerConfig,
+    request_max_tokens: int,
+    prebound_kernel: Any,
+    preserve_paged: bool,
+) -> dict[str, Any]:
+    """Construct the isolated PR391 float32 D3 experiment.
+
+    This is deliberately not generation-loop routing. The caller owns a
+    prebound K20 selector self-check and installs its exact midpoint descriptor
+    tape before the measured request.
+    """
+
+    if int(depth) != _PR391_FLOAT32_D3_DEPTH:
+        raise ValueError("PR391 float32 device core requires depth=3")
+    if float(draft_sampler.temperature) != 1.0:
+        raise ValueError("PR391 float32 device core requires temperature=1")
+    if int(draft_sampler.top_k) != _PR391_FLOAT32_D3_TOP_K:
+        raise ValueError("PR391 float32 device core requires top_k=20")
+    if float(draft_sampler.top_p) != _PR391_FLOAT32_D3_TOP_P:
+        raise ValueError("PR391 float32 device core requires top_p=0.95")
+    if preserve_paged is not True:
+        raise ValueError("PR391 float32 device core requires preserve_paged=True")
+    selector = getattr(prebound_kernel, "selector", None)
+    if not callable(selector):
+        raise TypeError("PR391 float32 device core requires a prebound selector")
+    if isinstance(request_max_tokens, bool):
+        raise TypeError("request_max_tokens must be a non-boolean integer")
+    output_tokens = int(request_max_tokens)
+    if not 0 < output_tokens <= _PR391_FLOAT32_D3_MAX_OUTPUT_TOKENS:
+        raise ValueError("request_max_tokens must be in [1, 16384]")
+
+    fixed_reserve = output_tokens + 4
+    promoted, failures = promote_kv_cache_offsets(
+        mtp_cache,
+        reserve_tokens=fixed_reserve,
+        preserve_paged=True,
+        initial_reserve_tokens=fixed_reserve,
+    )
+    if failures:
+        raise RuntimeError(f"PR391 D3 cache promotion failures: {failures}")
+    if promoted != 1 or len(mtp_cache or ()) != 1:
+        raise RuntimeError("PR391 D3 requires exactly one promoted QSA cache")
+    if not isinstance(mtp_cache[0], TensorOffsetQSACache):
+        raise RuntimeError("PR391 D3 promotion did not install TensorOffsetQSACache")
+
+    state_tree = _device_core_state_tree(mtp_cache)
+    state_leaves = _pr391_tensor_leaves(state_tree)
+    if len(state_leaves) != 5 or any(
+        not hasattr(leaf, "shape") or not hasattr(leaf, "dtype")
+        for leaf in state_leaves
+    ):
+        raise RuntimeError("PR391 D3 QSA compile state requires five tensor leaves")
+
+    text_model = getattr(rt.model, "language_model", rt.model)
+    frspec_ids = getattr(text_model, "_mtplx_frspec_ids", None)
+    from .pr391_mtp_handoff import bind_pr391_mtp_device_replay
+
+    def append_replay_rows(hidden_rows, token_rows):
+        return rt.update_mtp_cache(
+            hidden_rows,
+            token_rows,
+            mtp_cache=mtp_cache,
+            mtp_hidden_variant=mtp_hidden_variant,
+        )
+
+    device_replay = bind_pr391_mtp_device_replay(
+        mtp_cache,
+        append_rows=append_replay_rows,
+    )
+
+    def chain_fn(hidden_states, first_token_ids, uniform_bit_rows):
+        next_hidden = hidden_states
+        next_token = first_token_ids
+        selected_tokens: list[mx.array] = []
+        raw_ids_by_depth: list[mx.array] = []
+        raw_values_by_depth: list[mx.array] = []
+        raw_probs_by_depth: list[mx.array] = []
+        for level in range(1, _PR391_FLOAT32_D3_DEPTH + 1):
+            logits, produced_hidden = rt.draft_mtp(
+                next_hidden,
+                next_token,
+                mtp_cache=mtp_cache,
+                return_hidden=True,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_depth=level,
+            )
+            row = logits[:, -1, :].reshape(-1)
+            flat = row.astype(mx.float32)
+            local_ids, q_values = _deterministic_mlx_top_k_support(
+                flat,
+                _PR391_FLOAT32_D3_TOP_K,
+            )
+            local_ids, q_values = _order_bounded_mlx_top_k_support(
+                local_ids,
+                q_values,
+            )
+            q_probs = mx.exp(q_values - mx.logsumexp(flat, axis=-1, keepdims=True))
+            if frspec_ids is not None and int(row.shape[0]) == int(frspec_ids.shape[0]):
+                real_ids = mx.take(frspec_ids, local_ids)
+            else:
+                real_ids = local_ids
+            selected, raw_ids, raw_values, raw_probs = selector(
+                real_ids.astype(mx.uint32).reshape(1, _PR391_FLOAT32_D3_TOP_K),
+                q_values.astype(mx.float32).reshape(1, _PR391_FLOAT32_D3_TOP_K),
+                q_probs.astype(mx.float32).reshape(1, _PR391_FLOAT32_D3_TOP_K),
+                uniform_bit_rows[level - 1 : level],
+            )
+            selected = selected.reshape(1, 1)
+            selected_tokens.append(selected)
+            raw_ids_by_depth.append(raw_ids)
+            raw_values_by_depth.append(raw_values)
+            raw_probs_by_depth.append(raw_probs)
+            next_hidden = produced_hidden[:, -1:, :]
+            next_token = selected
+        return (
+            mx.concatenate(selected_tokens, axis=1),
+            mx.concatenate(raw_ids_by_depth, axis=0),
+            mx.concatenate(raw_values_by_depth, axis=0),
+            mx.concatenate(raw_probs_by_depth, axis=0),
+        )
+
+    compiled = mx.compile(
+        chain_fn,
+        inputs=state_tree,
+        outputs=state_tree,
+    )
+
+    return {
+        "fn": compiled,
+        "cache": mtp_cache,
+        "depth": _PR391_FLOAT32_D3_DEPTH,
+        "state_tree": state_tree,
+        "state_signature": _device_core_state_signature(mtp_cache),
+        "selector_policy": "softfloat64-exact-raw-k20-top-p-0.95",
+        "device_replay": device_replay,
+    }
+
+
+def _pr391_run_float32_d3_core(
+    core: dict[str, Any],
+    hidden: mx.array,
+    primary_token_ids: mx.array,
+    uniform_bit_rows: mx.array,
+) -> tuple[Any, ...]:
+    """Queue one D3 chain while retaining its device primary-token root."""
+
+    result = tuple(
+        core["fn"](
+            hidden,
+            primary_token_ids,
+            uniform_bit_rows,
+        )
+    )
+    _pr391_clear_float32_d3_rollback(core)
+    return result
+
+
+def _pr391_prewarm_float32_d3_core(
+    core: dict[str, Any],
+    hidden: mx.array,
+    primary_token_ids: mx.array,
+    uniform_bit_rows: mx.array,
+) -> None:
+    """Compile one D3 graph, then restore its logical MTP history exactly."""
+
+    base_offset = _mtp_cache_offset(core["cache"])
+    result = tuple(core["fn"](hidden, primary_token_ids, uniform_bit_rows[:3]))
+    mx.eval(*result)
+    _pr391_clear_float32_d3_rollback(core)
+    _rollback_mtp_cache(core["cache"], base_offset)
+    if _mtp_cache_offset(core["cache"]) != base_offset:
+        raise RuntimeError("PR391 float32 D3 prewarm did not restore MTP history")
+
+
+def _pr391_demote_float32_d3_core(
+    core: dict[str, Any],
+    compiled_verify_bank: Any,
+) -> None:
+    """Restore the construction-promoted MTP history to its exact stock type."""
+
+    if compiled_verify_bank.demote(core["cache"]) != 1:
+        raise RuntimeError("PR391 float32 D3 history demotion was not exact")
+
+
+def _pr391_decode_float32_d3_tokens(
+    result: tuple[Any, ...],
+) -> list[int]:
+    """Decode only the packed tokens; K20 arrays remain verifier-resident."""
+
+    token_rows = np.asarray(result[0], dtype=np.uint32).reshape(
+        _PR391_FLOAT32_D3_DEPTH
+    )
+    return [int(token) for token in token_rows]
+
+
+def _pr391_float32_target_support(
+    verify_logits: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Return raw deterministic target K20 rows for exact softfloat shaping."""
+
+    rows = verify_logits.reshape(-1, verify_logits.shape[-1]).astype(mx.float32)
+    target_ids, target_values = _deterministic_mlx_top_k_support(
+        rows,
+        _PR391_FLOAT32_D3_TOP_K,
+    )
+    target_ids, target_values = _order_bounded_mlx_top_k_support(
+        target_ids,
+        target_values,
+    )
+    target_probs = mx.exp(
+        target_values - mx.logsumexp(rows, axis=-1, keepdims=True)
+    )
+    return (
+        target_ids.astype(mx.uint32),
+        target_values.astype(mx.float32),
+        target_probs.astype(mx.float32),
+    )
+
+
+def _pr391_apply_softfloat64_decision(
+    *,
+    verifier_kernel: Any,
+    draft_result: tuple[Any, ...],
+    target_support: tuple[Any, Any, Any],
+    uniform_bits: Any,
+    stop_ids: Any,
+    stop_count: Any,
+    bonus_allowed: Any,
+) -> tuple[Any, ...]:
+    """Apply the construction-bound production decision ABI."""
+
+    return tuple(
+        verifier_kernel(
+            draft_result[0].reshape(_PR391_FLOAT32_D3_DEPTH),
+            draft_result[1],
+            draft_result[2],
+            draft_result[3],
+            *target_support,
+            uniform_bits,
+            stop_ids,
+            stop_count,
+            bonus_allowed,
+        )
+    )
+
+
+def _pr391_decode_float32_verifier_decision(
+    result: tuple[Any, ...],
+    *,
+    uniform_tape: Any,
+    reservation: Any,
+) -> tuple[int, int, int, int, bool, int, list[float]]:
+    """Materialize one compact decision and advance only its consumed draws."""
+
+    mx.eval(*result)
+    accepted_count = int(np.asarray(result[0], dtype=np.uint32).reshape(-1)[0])
+    first_reject = int(np.asarray(result[1], dtype=np.int32).reshape(-1)[0])
+    selected_token = int(np.asarray(result[2], dtype=np.uint32).reshape(-1)[0])
+    selected_kind = int(np.asarray(result[3], dtype=np.uint32).reshape(-1)[0])
+    selected_present = bool(
+        np.asarray(result[4], dtype=np.uint32).reshape(-1)[0]
+    )
+    draws_used = int(np.asarray(result[5], dtype=np.uint32).reshape(-1)[0])
+    accept_probability_bits = np.asarray(result[6], dtype=np.uint64).reshape(
+        _PR391_FLOAT32_D3_DEPTH
+    )
+    accept_probs = [
+        float(value) for value in accept_probability_bits.view(np.float64)
+    ]
+    uniform_tape.commit_device_choices(reservation, draws_used)
+    return (
+        accepted_count,
+        first_reject,
+        selected_token,
+        selected_kind,
+        selected_present,
+        draws_used,
+        accept_probs,
+    )
+
+
+def _pr391_queue_verifier_mtp_replay(
+    *,
+    rt: MTPLXRuntime,
+    core: dict[str, Any],
+    accepted_count: int,
+    verify_hidden: mx.array,
+    draft_token_ids: mx.array,
+    mtp_hidden_variant: str,
+) -> None:
+    """Run the host-selected exact-width MTP replay parity reference."""
+
+    from .pr391_mtp_handoff import stage_pr391_mtp_authoritative_replay
+
+    mtp_cache = core["cache"]
+
+    def append_row(hidden_row, token_row):
+        return rt.update_mtp_cache(
+            hidden_row,
+            token_row,
+            mtp_cache=mtp_cache,
+            mtp_hidden_variant=mtp_hidden_variant,
+        )
+
+    with attention_phase("ar_decode"):
+        state = stage_pr391_mtp_authoritative_replay(
+            mtp_cache,
+            accepted_count=accepted_count,
+            authoritative_hidden=verify_hidden[:, :_PR391_FLOAT32_D3_DEPTH, :],
+            draft_token_ids=draft_token_ids.reshape(
+                1, _PR391_FLOAT32_D3_DEPTH
+            ),
+            append_row=append_row,
+        )
+    mx.async_eval(*state)
+
+
+def _pr391_queue_device_verifier_mtp_replay(
+    *,
+    core: dict[str, Any],
+    accepted_count: Any,
+    verify_hidden: mx.array,
+    draft_token_ids: mx.array,
+) -> None:
+    """Queue all exact MTP replay widths behind the device verifier result."""
+
+    core["device_replay"](
+        accepted_count,
+        verify_hidden[:, :_PR391_FLOAT32_D3_DEPTH, :],
+        draft_token_ids,
+    )
+
+
+def _pr391_finish_canonical_d3_queue(
+    core: dict[str, Any], result: tuple[Any, ...]
+) -> tuple[tuple[Any, ...], Any]:
+    """Root future D3 while exposing its replay frontier as the live state."""
+
+    entry = core["cache"][0]
+    future_offset = entry.kv.cache[2]
+    _pr391_clear_float32_d3_rollback(core)
+    entry.kv.cache[2] = future_offset - _PR391_FLOAT32_D3_DEPTH
+    mx.async_eval(*result, *entry.state_leaves)
+    return result, future_offset
+
+
+def _pr391_queue_canonical_d3(
+    core: dict[str, Any],
+    *,
+    hidden: mx.array,
+    primary: int,
+    uniform_bit_rows: mx.array,
+    descriptor_offset: int,
+) -> tuple[tuple[Any, ...], Any]:
+    """Queue D3 with one physical bank owner and a logical replay frontier."""
+
+    result = tuple(
+        core["fn"](
+            hidden,
+            mx.array([[primary]], dtype=mx.uint32),
+            uniform_bit_rows[
+                descriptor_offset : descriptor_offset + _PR391_FLOAT32_D3_DEPTH
+            ],
+        )
+    )
+    return _pr391_finish_canonical_d3_queue(core, result)
+
+
+def _pr391_queue_device_canonical_d3(
+    core: dict[str, Any],
+    *,
+    hidden: mx.array,
+    primary: mx.array,
+    uniform_bit_rows: mx.array,
+    descriptor_offset: mx.array,
+) -> tuple[tuple[Any, ...], Any]:
+    """Queue canonical D3 directly from the device verifier decision."""
+
+    offset = descriptor_offset.reshape(-1)[0].astype(mx.int32)
+    indices = offset + mx.arange(_PR391_FLOAT32_D3_DEPTH, dtype=mx.int32)
+    result = tuple(
+        core["fn"](
+            hidden,
+            primary.reshape(1, 1).astype(mx.uint32),
+            mx.take(uniform_bit_rows, indices, axis=0),
+        )
+    )
+    return _pr391_finish_canonical_d3_queue(core, result)
+
+
+def _pr391_float32_d3_state(core: dict[str, Any]) -> tuple[Any, ...]:
+    """Retain functional state leaves around an uncompiled future D3."""
+
+    entry = core["cache"][0]
+    leaves = tuple(entry.state_leaves)
+    return leaves, tuple(entry.kv.rollback_state)
+
+
+def _pr391_clear_float32_d3_rollback(core: dict[str, Any]) -> None:
+    """Clear host-only rollback metadata after a compiled D3 transition."""
+
+    core["cache"][0].kv.rollback_state[:] = [None, None, None]
+
+
+def _pr391_install_float32_d3_state(
+    core: dict[str, Any], state: tuple[Any, ...]
+) -> None:
+    """Install one captured D3 state without evaluating a device offset."""
+
+    entry = core["cache"][0]
+    leaves, rollback_state = state
+    entry.kv.cache[:] = leaves[:3]
+    entry.aux[:] = leaves[3:]
+    entry.kv.rollback_state[:] = rollback_state
+
 def _draft_confidence_metrics(logits: mx.array, *, topk: int = 8) -> dict[str, float]:
     k = max(2, min(int(topk), int(logits.shape[-1])))
     top_values = mx.topk(logits.astype(mx.float32), k)
@@ -7501,6 +8067,41 @@ def generate_mtpk(
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
     draft_sampler = _effective_draft_sampler(sampler, draft_sampler)
+    mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
+    late_depth_switch_after = max(
+        0,
+        int(os.environ.get("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS") or 0),
+    )
+    late_depth_before = int(
+        os.environ.get("MTPLX_LATE_DEPTH_BEFORE") or speculative_depth
+    )
+    late_depth_after = int(
+        os.environ.get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
+    )
+    _pr391_route = _pr391_claim_float32_d3_request_route(
+        seed=seed,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        draft_sampler=draft_sampler,
+        speculative_depth=speculative_depth,
+        mtp_cache_policy=mtp_cache_policy,
+        mtp_history_policy=mtp_history_policy,
+        draft_core=draft_core,
+        constraint=constraint,
+        adaptive_policy=adaptive_policy,
+        mtp_corrector=mtp_corrector,
+        adaptive_width_policy=adaptive_width_policy,
+        mtp_position_mode=mtp_position_mode,
+        draft_margin_threshold=draft_margin_threshold,
+        online_hidden_corrector_alpha=online_hidden_corrector_alpha,
+        online_correction_cache=online_correction_cache,
+        prompt_correction_cache=prompt_correction_cache,
+        adapter_ensemble_q=adapter_ensemble_q,
+        mtp_topk_reranker=mtp_topk_reranker,
+        loop_guard=bool(loop_guard),
+        thinking_guard=thinking_guard,
+        late_depth_switch_after=late_depth_switch_after,
+    )
     _loop_guard_config = loop_guard_config_from_env(
         bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
     )
@@ -7594,7 +8195,11 @@ def generate_mtpk(
         else int(online_hidden_corrector_max_feed_depth)
     )
 
-    rng = np.random.default_rng(seed)
+    rng = (
+        _pr391_route.uniform_tape
+        if _pr391_route is not None
+        else np.random.default_rng(seed)
+    )
 
     def _default_cycle_draft_reader(
         draft_logits: mx.array,
@@ -7744,6 +8349,24 @@ def generate_mtpk(
     stop_token_ids = (
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     )
+    if _pr391_route is not None:
+        _pr391_stop_ids_host = np.asarray(
+            tuple(sorted(int(token) for token in stop_token_ids)),
+            dtype=np.uint32,
+        )
+        _pr391_stop_count = mx.array(
+            np.asarray([_pr391_stop_ids_host.size], dtype=np.uint32),
+            dtype=mx.uint32,
+        )
+        _pr391_stop_ids = mx.array(
+            _pr391_stop_ids_host
+            if _pr391_stop_ids_host.size
+            else np.zeros(1, dtype=np.uint32),
+            dtype=mx.uint32,
+        )
+    else:
+        _pr391_stop_ids = None
+        _pr391_stop_count = None
     started_all = time.perf_counter()
     if constraint is not None:
         # The repetition trimmer retracts committed tokens, which would
@@ -7974,6 +8597,45 @@ def generate_mtpk(
             prompt_ids=prompt_ids,
             hidden_variant=base_hidden_variant,
         )
+    if _pr391_route is not None and (
+        not qwen4_fixed_m4_compiled_verify
+        or compiled_verify_bank is None
+        or _compiled_verify_mode != "on"
+        or _lazy_bonus_verify_enabled()
+    ):
+        raise RuntimeError(
+            "PR391 float32 verifier requires an installed physical-M4 verifier"
+        )
+    if _pr391_route is not None:
+        _pr391_require_fixed_m4_async_enqueue(compiled_verify_bank)
+        compiled_verify_bank.install_fixed_m4_split()
+        if _skip_verify_snapshot():
+            raise RuntimeError(
+                "PR391 device state commit requires the pre-verify recurrent state"
+            )
+    _pr391_device_core = (
+        _pr391_make_float32_d3_core(
+            rt,
+            depth=_PR391_FLOAT32_D3_DEPTH,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_cache=mtp_history_cache,
+            draft_sampler=draft_sampler,
+            request_max_tokens=max_tokens,
+            prebound_kernel=_pr391_route.prebound_kernel,
+            preserve_paged=True,
+        )
+        if _pr391_route is not None
+        else None
+    )
+    if _pr391_device_core is not None:
+        _pr391_prewarm_float32_d3_core(
+            _pr391_device_core,
+            hidden,
+            mx.argmax(logits[0], axis=-1).astype(mx.uint32).reshape(1, 1),
+            _pr391_route.uniform_bit_rows,
+        )
+    _pr391_carried_d3: dict[str, Any] | None = None
+    _pr391_pending_mtp_already_staged = False
     a3b_target_prefix_route = None
     a3b_rebase_state = None  # stashed post-primary state for a deferred correction
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
@@ -8121,17 +8783,6 @@ def generate_mtpk(
         0,
         int(os.environ.get("MTPLX_MTP_HISTORY_MATERIALIZE_EVERY") or 0),
     )
-    late_depth_switch_after = max(
-        0,
-        int(os.environ.get("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS") or 0),
-    )
-    late_depth_before = int(
-        os.environ.get("MTPLX_LATE_DEPTH_BEFORE") or speculative_depth
-    )
-    late_depth_after = int(
-        os.environ.get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
-    )
-    mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
     mtp_position_cap = max(
         0,
         int(os.environ.get("MTPLX_MTP_POSITION_CAP") or 4096),
@@ -9289,16 +9940,20 @@ def generate_mtpk(
         adaptive_width_decision_margins: list[float] = []
         draft_tokens: list[int | None] = []
         draft_probs: list[np.ndarray | None] = []
+        _pr391_joint_result: tuple[Any, ...] | None = None
+        _pr391_fixed_m4_prefix: Any | None = None
         # Parallel to draft_tokens when _draft_conf_trace: p(drafted) per
         # depth, None where a lane has no draft logits (device cores, cc).
         draft_confidences: list[float | None] = []
         draft_cache_keys: list[tuple[int, ...]] = []
         draft_hidden_for_update: list[mx.array] = []
         draft_hidden_update_keys: list[object] = []
+        _pr391_mtp_handoff_owns_cycle = False
         if _mtp_history_uses_committed_cache(mtp_history_policy):
             if (
                 mtp_history_live_reset_threshold > 0
                 and mtp_history_cache is not None
+                and _pr391_carried_d3 is None
                 and mtp_history_live_appended >= mtp_history_live_reset_threshold
             ):
                 # This generation grew the draft-history cache past the live
@@ -9311,7 +9966,11 @@ def generate_mtpk(
                 mtp_history_live_resets += 1
                 mtp_history_live_appended = 0
             mtp_cache = mtp_history_cache
-            cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
+            cycle_mtp_offset = (
+                int(_pr391_carried_d3["cycle_offset"])
+                if _pr391_carried_d3 is not None
+                else _mtp_cache_offset(mtp_cache)
+            )
         else:
             mtp_cache = (
                 rt.make_mtp_cache() if mtp_cache_policy == "persistent" else None
@@ -9473,6 +10132,11 @@ def generate_mtpk(
                         cache, _cc_ladder, hidden_variant=base_hidden_variant
                     )
             if _cc_block:
+                if _pr391_carried_d3 is not None:
+                    compiled_verify_bank.discard_fixed_m4_prefix(
+                        _pr391_carried_d3["fixed_m4_prefix"]
+                    )
+                    _pr391_carried_d3 = None
                 _cc_T = 1 + len(_cc_block)
                 if qsa_mtp_precompute_active:
                     started_indexer_stage = time.perf_counter()
@@ -9782,6 +10446,11 @@ def generate_mtpk(
                 if constraint is not None:
                     _cb_block = _cb_block[: constraint.validate_prefix(_cb_block)]
             if _cb_block:
+                if _pr391_carried_d3 is not None:
+                    compiled_verify_bank.discard_fixed_m4_prefix(
+                        _pr391_carried_d3["fixed_m4_prefix"]
+                    )
+                    _pr391_carried_d3 = None
                 _cb_T = 1 + len(_cb_block)
                 if qsa_mtp_precompute_active:
                     started_indexer_stage = time.perf_counter()
@@ -10088,6 +10757,82 @@ def generate_mtpk(
                 }
 
         used_device_core = used_device_d2_core
+        if (
+            _pr391_device_core is not None
+            and cycle_depth == _PR391_FLOAT32_D3_DEPTH
+        ):
+            started = time.perf_counter()
+            if _pr391_carried_d3 is not None:
+                _pr391_carry = _pr391_carried_d3
+                _pr391_carry_reservation = rng.reserve_device_choices(
+                    _PR391_FLOAT32_D3_DEPTH
+                )
+                if (
+                    int(_pr391_carry_reservation.offset)
+                    != int(_pr391_carry["descriptor_offset"])
+                ):
+                    raise RuntimeError("PR391 carried D3 RNG cursor changed")
+                _pr391_device_core["cache"][0].kv.cache[2] = _pr391_carry[
+                    "future_offset"
+                ]
+                joint_result = tuple(_pr391_carry["result"])
+                _pr391_fixed_m4_prefix = _pr391_carry["fixed_m4_prefix"]
+                _pr391_carried_d3 = None
+            else:
+                compiled_verify_bank.prefetch_fixed_m4_primary(
+                    int(primary),
+                    tokens,
+                    len(tokens) - 1,
+                )
+                reservation = rng.reserve_device_choices(3)
+                uniform_bit_rows = _pr391_route.uniform_bit_rows
+                joint_uniform_bits = uniform_bit_rows[
+                    reservation.offset : reservation.offset + 3
+                ]
+                _pr391_primary_token_ids = mx.array(
+                    [[int(primary)]], dtype=mx.uint32
+                )
+                joint_result = _pr391_run_float32_d3_core(
+                    _pr391_device_core,
+                    draft_hidden,
+                    _pr391_primary_token_ids,
+                    joint_uniform_bits,
+                )
+                _pr391_verify_input_array = mx.concatenate(
+                    (_pr391_primary_token_ids, joint_result[0]),
+                    axis=1,
+                )
+                _pr391_fixed_m4_prefix = (
+                    compiled_verify_bank.enqueue_fixed_m4_prefix(
+                        _pr391_verify_input_array,
+                        cache=cache,
+                    )
+                )
+            _pr391_joint_result = joint_result
+            mx.eval(_pr391_joint_result[0])
+            core_tokens = _pr391_decode_float32_d3_tokens(joint_result)
+            elapsed_draft = time.perf_counter() - started
+            draft_time += elapsed_draft
+            draft_tokens = list(core_tokens)
+            draft_probs = [None] * _PR391_FLOAT32_D3_DEPTH
+            for depth_index, draft_token in enumerate(core_tokens):
+                drafted += 1
+                drafted_by_depth[depth_index] += 1
+                event["drafts"].append(
+                    {
+                        "depth": depth_index + 1,
+                        "token": int(draft_token),
+                        "timing_s": {
+                            "draft": elapsed_draft
+                            if depth_index == _PR391_FLOAT32_D3_DEPTH - 1
+                            else 0.0,
+                        },
+                        "mtp_corrector": None,
+                        "draft_core": "pr391-float32-d3-test-only",
+                    }
+                )
+            next_token = draft_tokens[-1]
+            used_device_core = True
         a3b_k2 = (
             a3b_target_prefix_route is not None
             and int(getattr(a3b_target_prefix_route, "speculative_depth", 1)) == 2
@@ -10780,6 +11525,19 @@ def generate_mtpk(
                 (mx.array([[primary]]), device_draft_token.reshape(1, 1)),
                 axis=1,
             )
+        elif _pr391_joint_result is not None:
+            lazy_bonus_verify = False
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus
+                and len(tokens) + _PR391_FLOAT32_D3_DEPTH < max_tokens
+                and not any(_is_stop(token, stop_token_ids) for token in draft_tokens)
+            )
+            target_distribution_rows_needed = _PR391_FLOAT32_D3_DEPTH + int(
+                bonus_distribution_row_needed
+            )
+            verify_input = [int(primary), *draft_tokens]
+            verify_input_array = _pr391_fixed_m4_prefix.input_ids
+            verified_token_count = 4
         else:
             lazy_bonus_verify = (
                 lazy_bonus_verify_requested
@@ -10930,6 +11688,26 @@ def generate_mtpk(
                         a3b_target_prefix_route.verify_m2(verify_input_array)
                     )
             elif (
+                _pr391_joint_result is not None
+                and qwen4_fixed_m4_compiled_verify
+                and compiled_verify_bank is not None
+                and verified_token_count == 4
+            ):
+                (
+                    verify_logits,
+                    verify_hidden,
+                    captures,
+                    _pr391_fixed_m4_split,
+                ) = compiled_verify_bank.forward_fixed_m4_suffix(
+                    _pr391_fixed_m4_prefix,
+                    host_input_ids=verify_input,
+                    completion_tokens=tokens,
+                    committed_count=len(tokens) - 1,
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=base_hidden_variant,
+                )
+            elif (
                 qwen4_fixed_m4_compiled_verify
                 and compiled_verify_bank is not None
                 and verified_token_count == 4
@@ -10979,8 +11757,143 @@ def generate_mtpk(
         target_prefix_tokens: list[int] | None = None
         target_distribution_precomputed = False
         elapsed_target_distribution_eval = 0.0
+        _pr391_verifier_decision: tuple[
+            int, int, int, int, bool, int, list[float]
+        ] | None = None
+        _pr391_bonus_token: int | None = None
+        _pr391_next_descriptor_offset: int | None = None
+        _pr391_selected_target_hidden: Any | None = None
+        _pr391_target_state_device_committed = False
         started_eval = time.perf_counter()
-        if target_prefix_verify:
+        if _pr391_joint_result is not None:
+            started_distribution = time.perf_counter()
+            target_ids, target_values, target_probs = (
+                _pr391_float32_target_support(verify_logits)
+            )
+            verifier_reservation = rng.peek_device_choices(4)
+            verifier_result = _pr391_apply_softfloat64_decision(
+                verifier_kernel=_pr391_route.verifier_kernel,
+                draft_result=_pr391_joint_result,
+                target_support=(target_ids, target_values, target_probs),
+                uniform_bits=_pr391_route.uniform_bit_rows[
+                    verifier_reservation.offset : verifier_reservation.offset + 4
+                ],
+                stop_ids=_pr391_stop_ids,
+                stop_count=_pr391_stop_count,
+                bonus_allowed=_pr391_route.bonus_allowed_rows[
+                    int(bonus_distribution_row_needed)
+                ],
+            )
+            _pr391_selected_target_hidden = (
+                compiled_verify_bank.commit_fixed_m4_device_window(
+                    verifier_result[0],
+                    before_verify.states,
+                    verify_hidden,
+                    _pr391_fixed_m4_split,
+                )
+            )
+            _pr391_target_state_device_committed = True
+            _pr391_queue_device_verifier_mtp_replay(
+                core=_pr391_device_core,
+                accepted_count=verifier_result[0],
+                verify_hidden=verify_hidden,
+                draft_token_ids=_pr391_joint_result[0],
+            )
+            _pr391_mtp_handoff_owns_cycle = True
+            _pr391_device_prequeued_d3 = None
+            _pr391_queued_prefix = None
+            if max_tokens - (len(tokens) + 4) >= _PR391_FLOAT32_D3_DEPTH:
+                _pr391_device_prequeued_d3 = _pr391_queue_device_canonical_d3(
+                    _pr391_device_core,
+                    hidden=_pr391_selected_target_hidden,
+                    primary=verifier_result[2],
+                    uniform_bit_rows=_pr391_route.uniform_bit_rows,
+                    descriptor_offset=(
+                        mx.array(verifier_reservation.offset, dtype=mx.int32)
+                        + verifier_result[5].reshape(-1)[0].astype(mx.int32)
+                    ),
+                )
+                _pr391_next_verify_input = mx.concatenate(
+                    (
+                        verifier_result[2].reshape(1, 1).astype(mx.uint32),
+                        _pr391_device_prequeued_d3[0][0],
+                    ),
+                    axis=1,
+                )
+                _pr391_queued_prefix = (
+                    compiled_verify_bank.enqueue_fixed_m4_prefix(
+                        _pr391_next_verify_input,
+                        cache=cache,
+                    )
+                )
+            else:
+                mx.async_eval(*_pr391_device_core["cache"][0].state_leaves)
+            _pr391_verifier_decision = _pr391_decode_float32_verifier_decision(
+                verifier_result,
+                uniform_tape=rng,
+                reservation=verifier_reservation,
+            )
+            _pr391_next_descriptor_offset = (
+                int(verifier_reservation.offset)
+                + int(_pr391_verifier_decision[5])
+            )
+            _pr391_lookahead_primary = int(_pr391_verifier_decision[2])
+            _pr391_lookahead_accepted = int(_pr391_verifier_decision[0])
+            if (
+                _pr391_device_prequeued_d3 is not None
+                and _pr391_queued_prefix is not None
+                and bool(_pr391_verifier_decision[4])
+                and not _is_stop(_pr391_lookahead_primary, stop_token_ids)
+                and max_tokens
+                - (len(tokens) + _pr391_lookahead_accepted + 1)
+                >= _PR391_FLOAT32_D3_DEPTH
+            ):
+                _pr391_queued_d3 = _pr391_device_prequeued_d3
+                _pr391_next_completion = (
+                    *tokens,
+                    *draft_tokens[:_pr391_lookahead_accepted],
+                    _pr391_lookahead_primary,
+                )
+                compiled_verify_bank.prefetch_fixed_m4_primary(
+                    _pr391_lookahead_primary,
+                    _pr391_next_completion,
+                    len(_pr391_next_completion) - 1,
+                )
+                _pr391_carried_d3 = {
+                    "result": _pr391_queued_d3[0],
+                    "fixed_m4_prefix": _pr391_queued_prefix,
+                    "future_offset": _pr391_queued_d3[1],
+                    "descriptor_offset": _pr391_next_descriptor_offset,
+                    "cycle_offset": (
+                        int(cycle_mtp_offset) + 1 + _pr391_lookahead_accepted
+                    ),
+                }
+            elif _pr391_queued_prefix is not None:
+                compiled_verify_bank.discard_fixed_m4_prefix(
+                    _pr391_queued_prefix
+                )
+                _pr391_queued_prefix = None
+            elapsed_target_distribution_eval = (
+                time.perf_counter() - started_distribution
+            )
+            target_distribution_materialized_rows += 4
+            target_distribution_materialized_windows += 1
+            verify_target_distribution_time += elapsed_target_distribution_eval
+            target_distribution_precomputed = True
+            event["target_distribution_materialized"] = {
+                "mode": "pr391_softfloat64_device_decision_test_only",
+                "exact": True,
+                "p_q_residual": True,
+                "rows": 4,
+                "time_s": float(elapsed_target_distribution_eval),
+                "top_k": _PR391_FLOAT32_D3_TOP_K,
+            }
+            verify_eval_timings = {
+                "verify_logits_eval_time_s": elapsed_target_distribution_eval,
+                "verify_hidden_eval_time_s": 0.0,
+                "verify_joint_eval_time_s": 0.0,
+            }
+        elif target_prefix_verify:
             target_distribution_rows = min(
                 int(verify_logits.shape[1]),
                 target_distribution_rows_needed,
@@ -11161,6 +12074,8 @@ def generate_mtpk(
         rejection_correction: int | None = None
         started_accept = time.perf_counter()
         if (
+            _pr391_verifier_decision is None
+            and
             sampler.temperature > 0
             and not target_distribution_precomputed
             and not lazy_target_distributions
@@ -11208,6 +12123,60 @@ def generate_mtpk(
             # pre-sample above already carried the overlay (and its lane has
             # no draft distributions to fall back on).
             target_distribution_batch = None
+        if _pr391_verifier_decision is not None:
+            (
+                accepted_count,
+                _pr391_first_reject,
+                _pr391_selected_token,
+                _pr391_selected_kind,
+                _pr391_selected_present,
+                _pr391_draws_used,
+                _pr391_accept_probs,
+            ) = _pr391_verifier_decision
+            del _pr391_draws_used
+            if (
+                _pr391_selected_present
+                and _pr391_selected_kind == _PR391_SELECTED_CORRECTION
+            ):
+                rejection_correction = int(_pr391_selected_token)
+                correction = rejection_correction
+            elif (
+                _pr391_selected_present
+                and _pr391_selected_kind == _PR391_SELECTED_BONUS
+            ):
+                _pr391_bonus_token = int(_pr391_selected_token)
+            _pr391_evaluated = (
+                _pr391_first_reject + 1
+                if _pr391_first_reject >= 0
+                else accepted_count
+            )
+            for _pr391_depth in range(_pr391_evaluated):
+                _pr391_accepted_now = _pr391_depth < accepted_count
+                _pr391_accept_probability = float(
+                    _pr391_accept_probs[_pr391_depth]
+                )
+                _pr391_correction = (
+                    int(draft_tokens[_pr391_depth])
+                    if _pr391_accepted_now
+                    else int(_pr391_selected_token)
+                )
+                event["drafts"][_pr391_depth]["accepted"] = _pr391_accepted_now
+                event["drafts"][_pr391_depth]["accept_probability"] = (
+                    _pr391_accept_probability
+                )
+                event["drafts"][_pr391_depth]["correction"] = _pr391_correction
+                accept_probability_sum_by_depth[_pr391_depth] += (
+                    _pr391_accept_probability
+                )
+                if _pr391_accepted_now:
+                    accepted += 1
+                    accepted_by_depth[_pr391_depth] += 1
+                else:
+                    rejected += 1
+                    event["rejected_at_depth"] = _pr391_depth + 1
+        _host_accept_drafts = (
+            () if _pr391_verifier_decision is not None else draft_tokens
+        )
         # Grammar clamp (#186 phase 3): drafts are proposed unmasked, so the
         # committed window must stop at the grammar's legal prefix. One
         # stateless validate call per cycle; the matcher itself only advances
@@ -11245,7 +12214,7 @@ def generate_mtpk(
             _batched_target_tokens = mx.argmax(
                 verify_logits[0, : len(draft_tokens), :], axis=-1
             ).tolist()
-        for depth_index, draft_token in enumerate(draft_tokens):
+        for depth_index, draft_token in enumerate(_host_accept_drafts):
             target_logits_for_draft = verify_logits[:, depth_index, :]
             if _steer_active:
                 _row_guard_overlay = _steer_overlay(
@@ -11627,7 +12596,10 @@ def generate_mtpk(
         if accepted_count == len(draft_tokens):
             committed = [primary] + draft_tokens
             tokens.extend(draft_tokens)
-            if _mtp_history_uses_committed_cache(mtp_history_policy):
+            if (
+                _mtp_history_uses_committed_cache(mtp_history_policy)
+                and not _pr391_mtp_handoff_owns_cycle
+            ):
                 assert mtp_cache is not None and cycle_mtp_offset is not None
                 if qsa_mtp_precompute_active:
                     draft_time += reconcile_mtp_indexer_history(
@@ -11696,7 +12668,11 @@ def generate_mtpk(
             else:
                 logits, hidden = own_live_logits_hidden(
                     verify_logits[:, len(draft_tokens), :],
-                    verify_hidden[:, -1:, :],
+                    (
+                        _pr391_selected_target_hidden
+                        if _pr391_selected_target_hidden is not None
+                        else verify_hidden[:, -1:, :]
+                    ),
                 )
             if any(_is_stop(token, stop_token_ids) for token in draft_tokens):
                 tokens = _truncate_after_first_stop(tokens, stop_token_ids)
@@ -11719,7 +12695,9 @@ def generate_mtpk(
                     continue
                 started_bonus = time.perf_counter()
                 bonus_target_distribution_time = 0.0
-                if (
+                if _pr391_bonus_token is not None:
+                    bonus = _pr391_bonus_token
+                elif (
                     target_prefix_tokens is not None
                     and len(target_prefix_tokens) > len(draft_tokens)
                 ):
@@ -11898,7 +12876,7 @@ def generate_mtpk(
         tokens.extend(committed[1:])
 
         committed_prefix_len = 1 + accepted_count
-        committed_from_capture = False
+        committed_from_capture = _pr391_target_state_device_committed
         committed_from_trim = False
         cache_committed_token_count = len(tokens)
         if rejection_correction is not None:
@@ -11907,6 +12885,8 @@ def generate_mtpk(
             cache_committed_token_count
         )
         if (
+            not committed_from_capture
+            and
             verify_strategy in {"capture_commit", "graphbank_capture_commit"}
             and captures is not None
         ):
@@ -11990,23 +12970,26 @@ def generate_mtpk(
 
         if committed_from_capture:
             event["capture_repair"] = "captured_prefix_commit"
+            _committed_target_hidden = (
+                _pr391_selected_target_hidden
+                if _pr391_selected_target_hidden is not None
+                else verify_hidden[
+                    :, committed_prefix_len - 1 : committed_prefix_len, :
+                ]
+            )
             if rejection_correction is None:
                 repair_logits, repair_hidden = own_live_logits_hidden(
                     verify_logits[
                         :, committed_prefix_len - 1 : committed_prefix_len, :
                     ],
-                    verify_hidden[
-                        :, committed_prefix_len - 1 : committed_prefix_len, :
-                    ],
+                    _committed_target_hidden,
                 )
             else:
                 repair_logits, repair_hidden = own_live_logits_hidden(
                     verify_logits[
                         :, committed_prefix_len - 1 : committed_prefix_len, :
                     ],
-                    verify_hidden[
-                        :, committed_prefix_len - 1 : committed_prefix_len, :
-                    ],
+                    _committed_target_hidden,
                 )
                 pending_primary = int(rejection_correction)
                 deferred_correction_repairs += 1
@@ -12093,7 +13076,10 @@ def generate_mtpk(
             target_time += elapsed_repair
             repair_time += elapsed_repair
             _add_timing(event, "repair_forward", elapsed_repair)
-        if _mtp_history_uses_committed_cache(mtp_history_policy):
+        if (
+            _mtp_history_uses_committed_cache(mtp_history_policy)
+            and not _pr391_mtp_handoff_owns_cycle
+        ):
             assert mtp_cache is not None and cycle_mtp_offset is not None
             if qsa_mtp_precompute_active:
                 if committed_from_capture or committed_from_trim:
@@ -12158,6 +13144,16 @@ def generate_mtpk(
         emit_new_tokens()
         emit_trace()
 
+    if _pr391_carried_d3 is not None:
+        # Canonical lookahead owns an isolated future state.  If generation
+        # ends before consuming it, discard that state; the live history still
+        # reflects only the authoritative replay and the normal final commit
+        # below remains responsible for any pending primary.
+        compiled_verify_bank.discard_fixed_m4_prefix(
+            _pr391_carried_d3["fixed_m4_prefix"]
+        )
+        _pr391_carried_d3 = None
+
     if token_callback is not None and _stream_gate.window > 0:
         # Armed-stream reconcile (F35): the trim decision is known here —
         # flush the held tail in full (no trim) or the post-trim remainder.
@@ -12202,6 +13198,7 @@ def generate_mtpk(
                 _mtp_history_uses_committed_cache(mtp_history_policy)
                 and mtp_history_cache is not None
                 and hidden is not None
+                and not _pr391_pending_mtp_already_staged
             ):
                 commit_started = time.perf_counter()
                 draft_time += append_mtp_history(
@@ -12268,6 +13265,11 @@ def generate_mtpk(
         # other downstream cache consumer must never see promoted
         # tensor-offset adapters.
         compiled_verify_bank.demote(cache)
+    if _pr391_device_core is not None:
+        _pr391_demote_float32_d3_core(
+            _pr391_device_core,
+            compiled_verify_bank,
+        )
     if constraint is not None:
         # Final sync so `completed` reflects every committed token (the loop
         # may exit between the per-cycle sync and the last commit).

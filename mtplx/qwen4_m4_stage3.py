@@ -7,7 +7,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from .kernels.qwen4_m4_stage3 import bind
+from .kernels.qwen4_m4_stage3 import bind, bind_residual_tail
 from .models.qwen4_exp import (
     SparseMoeBlock,
     _FusedGateUpMLP,
@@ -219,6 +219,36 @@ def _validate_input_contract(layer: Any, *, index: int) -> None:
         )
 
 
+def _validate_residual_tail_contract(layer: Any, *, index: int) -> None:
+    """Admit only the exact BF16 hyper geometry consumed by the fused store."""
+
+    label = f"qwen4 M4 residual tail layer {index}"
+    connection = getattr(layer, "mlp_hyper_connection", None)
+    if (
+        connection is None
+        or int(getattr(connection, "hc_count", -1)) != 4
+        or int(getattr(connection, "hidden_size", -1)) != 2560
+    ):
+        raise ValueError(f"{label} requires exactly four hyper streams")
+    inject_projection = getattr(connection, "block_inject_weight", None)
+    inject_weight = getattr(inject_projection, "weight", None)
+    if (
+        inject_weight is None
+        or tuple(inject_weight.shape) != (4, 4 * 2560)
+        or inject_weight.dtype != mx.bfloat16
+    ):
+        raise ValueError(f"{label} requires BF16 inject ownership")
+
+
+def bind_qwen4_m4_residual_tail(layer: Any, *, index: int):
+    """Validate and bind the optional M4 residual tail at construction."""
+
+    _validate_input_contract(layer, index=index)
+    _validate_residual_tail_contract(layer, index=index)
+    _validate_block_contract(layer.mlp, index=index)
+    return bind_residual_tail()
+
+
 def install_qwen4_m4_stage3(runtime: Any) -> dict[str, Any]:
     """Validate every owner, self-check the kernel, then install M4 directly."""
 
@@ -268,6 +298,7 @@ def install_qwen4_m4_stage3(runtime: Any) -> dict[str, Any]:
 
 
 __all__ = [
+    "bind_qwen4_m4_residual_tail",
     "install_qwen4_m4_stage3",
     "qwen4_m4_stage3_enabled",
 ]
