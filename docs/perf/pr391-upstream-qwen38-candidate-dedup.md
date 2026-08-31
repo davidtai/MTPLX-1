@@ -13,7 +13,7 @@ merges candidates by the boundary they actually change, rather than by PR name.
 | rank | deduplicated boundary | upstream source | credible 16K/M4 gain | integration difficulty | evidence and disposition |
 | ---: | --- | --- | ---: | --- | --- |
 | 1 | QSA incomplete-block/padding semantics | mlx-lm #1788 | 0 | test-only | PR391 B1 already intersects selected complete blocks plus the visible tail with per-row causality. Retain focused parity tests; no transplant. |
-| 2 | small-M wide quantized matmul routing | MLX #4171 | unknown, bounded by actual engagement | easy audit | M<=32/N>8192 BM32 kernel is already in recent MLX. Audit installed core and trace whether PR391 uses the affected qmm; benchmark only if engaged. **Next.** |
+| 2 | small-M wide quantized matmul routing | MLX #4171 | already in baseline | easy audit | Closed: installed MLX 0.32.2 contains the merged BM32 route, and the exact q8/group-64 target `lm_head` executes at M4, K2560, N248320. No integration or candidate A/B remains. |
 | 3 | fixed-M4 QSA score layout | oMLX #3244 | none measured | easy | Flattened exact FP32 score GEMM was tested at 64.3626 tok/s versus 65.1364 same-commit control. Parked. |
 | 4 | QSA prefill score/gather | MLXServe QSA adaptation; mlx-lm #1454 | no decode gain | easy/medium | 16K candidate changed the digest and reduced prefill from a recent 1232.9 to 1085.4 tok/s. Rejected; separate prefill lane only. |
 | 5 | fixed-M4 GDN norm/gate epilogue | MLXServe GDN split | unproven under thermal drift | medium | Exact A/B/A was 63.67, 61.66, then 51.33 tok/s with the 40 C wait disabled. No repeatable gain; parked. |
@@ -40,6 +40,17 @@ merges candidates by the boundary they actually change, rather than by PR name.
   flat (34.78 versus 34.76 tok/s).
 - MTP, n-gram drafting, batching, tensor/pipeline-parallel, and cache-ABI PRs:
   they change a different workload or replace PR391's exact D3 state contract.
+
+## MLX #4171 engagement audit
+
+The worktree has MLX 0.32.2 installed. Its release tag is 20 commits ahead of
+the #4171 merge, so the `M <= 32 ? BM32 : BM64` quantized-matmul dispatch is
+already active. The exact artifact declares the shared target `lm_head` as
+8-bit affine/group-64 with hidden size 2560 and vocabulary size 248320.
+`_forward_fixed_m4_suffix` sends all four verifier rows through that head.
+Consequently its production geometry is M4/K2560/N248320 and directly selects
+the new BM32 kernel. This upstream gain is already included in every recent
+control and cannot be integrated a second time.
 
 ## Net assessment
 
