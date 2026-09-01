@@ -147,6 +147,31 @@ def fable_hc_m4_enabled() -> bool:
     return _FABLE_HC_M4
 
 
+#: Reduced-dispatch QSA indexer lane for the fixed-M4 verifier
+#: (mtplx/kernels/qwen4_qsa_m4_indexer.py + the transposed-key gather).
+#:
+#: Read ONCE at import, same reasoning as the two flags above: the hot path
+#: must not touch ``os.environ``, and two traces of the same compiled verify
+#: graph must not disagree about which QSA chain they contain. Off by default.
+#:
+#: Eligibility is decided at CONSTRUCTION (graphbank installs the fixed QSA
+#: cache) and RAISES on a mismatch -- it never silently reverts to the stock
+#: chain, because a silently inert flag is how MTPLX_FUSED_HC_V3 came to be
+#: armed-but-dead at M=4. The one deliberate non-error narrowing is verify
+#: width: a fixed cache also serves the S=1 D3 route, which keeps the stock
+#: chain because the fused kernels are wired for the 4-row shape.
+_FABLE_QSA_M4 = env_bool("MTPLX_FABLE_QSA_M4", default=False)
+
+#: Verify width the QSA M4 lane is wired for.
+FABLE_QSA_M4_ROWS = 4
+
+
+def fable_qsa_m4_enabled() -> bool:
+    """True when ``MTPLX_FABLE_QSA_M4`` armed this process at import."""
+
+    return _FABLE_QSA_M4
+
+
 @dataclass(frozen=True)
 class ResolvedAPIKey:
     value: str | None
