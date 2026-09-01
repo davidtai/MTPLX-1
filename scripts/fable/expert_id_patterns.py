@@ -142,3 +142,125 @@ def load_census_id_sets(
     rng = np.random.default_rng(seed)
     picks = rng.integers(0, len(census), size=layers)
     return [census[int(p)] for p in picks]
+
+
+# ---------------------------------------------------------------------------
+# expert-major plan
+# ---------------------------------------------------------------------------
+#
+# The expert-major routed-GLU kernel (mtplx/kernels/qwen4_m4_expert_major_glu.py)
+# does NOT take a precomputed plan tensor: it recomputes the plan below inside
+# every threadgroup from the same ``[ROWS, TOP_K]`` id array the row-major kernel
+# already binds, which costs two 40-iteration scalar scans over 160 L1-resident
+# bytes and zero extra dispatches.  This function is the executable statement of
+# what that in-kernel scan computes, so the contract can be argued about (and
+# unit tested) with no MLX and no Metal.
+#
+# Plan ABI, for a flattened lane index ``i = row * TOP_K + slot``:
+#
+#   entry i is a LEADER  iff  i is the (n * MEMBERS_PER_ENTRY)-th occurrence of
+#                             ``ids[i]`` in ascending lane order, for some n >= 0
+#   member[i, m]         =    the m-th lane (ascending) in that occurrence run,
+#                             or -1 when the run is shorter, or -1 for every m
+#                             when i is not a leader
+#   expert[i]            =    ids[i], always a legal expert id (so a non-leader
+#                             threadgroup's address arithmetic can never go out
+#                             of range before it masks itself off)
+#
+# Every lane appears in exactly one leader's member list, so the union of the
+# leaders' work is exactly the 40 (row, expert) products the row-major kernel
+# computes -- while the weight tile of a duplicated expert is streamed once per
+# leader instead of once per lane.  The ``n * MEMBERS_PER_ENTRY`` rule (rather
+# than "first occurrence only") keeps that true even if a run were ever longer
+# than MEMBERS_PER_ENTRY, which top-k rows being internally distinct already
+# forbids -- it removes the silent-corruption branch rather than relying on the
+# invariant.
+
+MEMBERS_PER_ENTRY = ROWS
+
+
+def expert_major_plan(
+    ids: np.ndarray,
+    *,
+    rows: int = ROWS,
+    top_k: int = TOP_K,
+    members: int = MEMBERS_PER_ENTRY,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(expert[slots], member[slots, members])`` for one routing decision."""
+
+    flat = np.asarray(ids, dtype=np.int64).reshape(-1)
+    slots = rows * top_k
+    if flat.size != slots:
+        raise ValueError(f"expert ids must hold {slots} slots, got {flat.size}")
+
+    expert = flat.astype(np.int32)
+    member = np.full((slots, members), -1, dtype=np.int32)
+    for i in range(slots):
+        e = int(flat[i])
+        position = int(np.count_nonzero(flat[:i] == e))
+        if position % members:
+            continue
+        run = [int(j) for j in range(i, slots) if int(flat[j]) == e][:members]
+        member[i, : len(run)] = run
+    return expert, member
+
+
+def validate_expert_major_plan(
+    ids: np.ndarray,
+    expert: np.ndarray,
+    member: np.ndarray,
+    *,
+    rows: int = ROWS,
+    top_k: int = TOP_K,
+) -> None:
+    """Raise unless the plan covers every lane exactly once with the right expert."""
+
+    flat = np.asarray(ids, dtype=np.int64).reshape(-1)
+    slots = rows * top_k
+    expert = np.asarray(expert).reshape(-1)
+    member = np.asarray(member).reshape(slots, -1)
+
+    if not np.array_equal(expert, flat.astype(expert.dtype)):
+        raise ValueError("plan expert column must mirror the flattened ids")
+
+    covered: list[int] = []
+    for entry in range(slots):
+        lanes = [int(v) for v in member[entry] if int(v) >= 0]
+        if lanes != sorted(lanes):
+            raise ValueError(f"entry {entry} lists members out of lane order")
+        if len(set(lanes)) != len(lanes):
+            raise ValueError(f"entry {entry} repeats a lane")
+        for lane in lanes:
+            if not 0 <= lane < slots:
+                raise ValueError(f"entry {entry} names lane {lane} out of range")
+            if int(flat[lane]) != int(flat[entry]):
+                raise ValueError(
+                    f"entry {entry} claims lane {lane} with a different expert"
+                )
+        if len({lane // top_k for lane in lanes}) != len(lanes):
+            raise ValueError(f"entry {entry} claims two lanes from one row")
+        # A trailing -1 may only follow real members, never precede one.
+        seen_hole = False
+        for value in member[entry]:
+            if int(value) < 0:
+                seen_hole = True
+            elif seen_hole:
+                raise ValueError(f"entry {entry} has a hole before a member")
+        covered.extend(lanes)
+
+    if sorted(covered) != list(range(slots)):
+        raise ValueError("plan does not cover every lane exactly once")
+
+    active = int(sum(1 for entry in range(slots) if int(member[entry, 0]) >= 0))
+    expected = int(np.unique(flat).size)
+    if active != expected:
+        raise ValueError(
+            f"plan activated {active} entries for {expected} distinct experts"
+        )
+
+
+def expert_major_active_entries(ids: np.ndarray) -> int:
+    """Leader count for one routing decision (== distinct experts, top-k rows)."""
+
+    _, member = expert_major_plan(ids)
+    return int(np.count_nonzero(member[:, 0] >= 0))

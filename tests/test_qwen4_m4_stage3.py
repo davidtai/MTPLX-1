@@ -443,6 +443,104 @@ def test_m4_residual_report_records_all_48_exact_layers() -> None:
     assert report["reference_boundary"] == "retained_m4_routed_down_then_stock_residual"
     assert report["exact_layers"] == 48
     assert report["combined_residual_tail_layers"] == 48
+    assert report["moe_expert_major_glu"] is False
+    assert report["moe_expert_major_glu_layers"] == 0
+
+
+def test_m4_expert_major_flag_is_read_once_and_defaults_off(monkeypatch) -> None:
+    from mtplx import qwen4_m4_stage3 as stage3_module
+
+    stage3_module.reset_fable_moe_expert_major_cache()
+    try:
+        monkeypatch.delenv(
+            stage3_module.FABLE_MOE_EXPERT_MAJOR_ENV, raising=False
+        )
+        assert not stage3_module.fable_moe_expert_major_enabled()
+
+        # Read once: arming it after the first read does not retroactively
+        # change the answer a construction already took.
+        monkeypatch.setenv(stage3_module.FABLE_MOE_EXPERT_MAJOR_ENV, "enabled")
+        assert not stage3_module.fable_moe_expert_major_enabled()
+        stage3_module.reset_fable_moe_expert_major_cache()
+        assert stage3_module.fable_moe_expert_major_enabled()
+
+        stage3_module.reset_fable_moe_expert_major_cache()
+        monkeypatch.setenv(stage3_module.FABLE_MOE_EXPERT_MAJOR_ENV, "disabled")
+        assert not stage3_module.fable_moe_expert_major_enabled()
+
+        stage3_module.reset_fable_moe_expert_major_cache()
+        monkeypatch.setenv(stage3_module.FABLE_MOE_EXPERT_MAJOR_ENV, "maybe")
+        with pytest.raises(ValueError, match="is not a boolean"):
+            stage3_module.fable_moe_expert_major_enabled()
+    finally:
+        stage3_module.reset_fable_moe_expert_major_cache()
+
+
+def test_m4_expert_major_requires_the_paired_routed_glu() -> None:
+    from mtplx import qwen4_m4_stage3 as stage3_module
+
+    stage3_module._validate_feature_combination(
+        routed_down_reduce_enabled=True,
+        routed_down_residual_tail_enabled=True,
+        routed_glu_enabled=True,
+        moe_expert_major_enabled=True,
+    )
+    with pytest.raises(ValueError, match="MTPLX_QWEN4_M4_ROUTED_GLU"):
+        stage3_module._validate_feature_combination(
+            routed_down_reduce_enabled=True,
+            routed_down_residual_tail_enabled=True,
+            routed_glu_enabled=False,
+            moe_expert_major_enabled=True,
+        )
+
+
+def test_m4_expert_major_report_names_its_own_boundary() -> None:
+    from mtplx import qwen4_m4_stage3 as stage3_module
+
+    report = stage3_module._installation_report(
+        layer_count=48,
+        max_delta=0.0,
+        routed_down_reduce_enabled=True,
+        routed_down_residual_tail_enabled=True,
+        routed_glu_enabled=True,
+        moe_expert_major_enabled=True,
+    )
+    assert report["boundary"] == (
+        "expert_major_routed_q4g32_glu_reduce_shared_add_mlp_residual"
+    )
+    assert report["moe_expert_major_glu"] is True
+    assert report["moe_expert_major_glu_layers"] == 48
+
+    off = stage3_module._installation_report(
+        layer_count=48,
+        max_delta=0.0,
+        routed_down_reduce_enabled=True,
+        routed_down_residual_tail_enabled=True,
+        routed_glu_enabled=True,
+    )
+    assert off["boundary"] == (
+        "paired_routed_q4g32_glu_reduce_shared_add_mlp_residual"
+    )
+    assert off["moe_expert_major_glu"] is False
+    assert off["moe_expert_major_glu_layers"] == 0
+
+
+def test_m4_expert_major_install_asserts_bit_exactness_per_layer() -> None:
+    """The arm's whole claim is bit-exactness, so install must prove it.
+
+    Not a tolerance check: the retained kernel stays bound purely as the
+    reference, and every layer's expert-major output has to be array_equal with
+    it or construction raises.
+    """
+
+    import inspect
+
+    from mtplx import qwen4_m4_stage3 as stage3_module
+
+    install_source = inspect.getsource(stage3_module.install_qwen4_m4_stage3)
+    assert "bind_expert_major_routed_glu()" in install_source
+    assert "mx.array_equal(candidate, expert_major_candidate)" in install_source
+    assert "bit-exact with the retained paired routed GLU" in install_source
 
 
 @pytest.mark.parametrize(

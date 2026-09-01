@@ -20,6 +20,7 @@ if str(FABLE) not in sys.path:
 
 import expert_id_patterns as eip  # noqa: E402
 import micro_dispatch_overhead as mdo  # noqa: E402
+import micro_expert_major as mem  # noqa: E402
 import micro_moe_dedup as mmd  # noqa: E402
 
 
@@ -31,8 +32,9 @@ def test_microbenchmarks_import_without_mlx():
         "import sys;"
         f"sys.path.insert(0, {str(FABLE)!r});"
         "import expert_id_patterns, micro_dispatch_overhead, micro_moe_dedup;"
+        "import micro_expert_major;"
         "leaked=[m for m in sys.modules if m == 'mlx' or m.startswith('mlx.')];"
-        "print(leaked, micro_moe_dedup.mx)"
+        "print(leaked, micro_moe_dedup.mx, micro_expert_major.mx)"
     )
     out = subprocess.run(
         [sys.executable, "-c", probe],
@@ -40,8 +42,9 @@ def test_microbenchmarks_import_without_mlx():
         text=True,
         check=True,
     ).stdout.strip()
-    assert out == "[] None", out
+    assert out == "[] None None", out
     assert mmd.mx is None
+    assert mem.mx is None
 
 
 def test_moe_dedup_defaults():
@@ -164,3 +167,66 @@ def test_mixed_delta_sign_is_positive_when_slower():
 
     assert mdo.mixed_delta_vs_baseline(1.240, 1.240) == (0.0, 0.0)
     assert mdo.mixed_delta_vs_baseline(0.0, 1.0) == (1.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# micro_expert_major.py
+# ---------------------------------------------------------------------------
+
+
+def test_expert_major_defaults():
+    args = mem.build_parser().parse_args([])
+    assert args.unique == 28, "the census mean is the interesting operating point"
+    assert args.layers == 48
+    assert args.reps == 20
+    assert args.warmup == 3
+    assert args.variants == "a,b4,b2,c"
+    assert args.from_census is None
+    assert args.skip_adversarial is False
+    assert args.out is None
+
+
+def test_expert_major_rejects_unsupported_unique():
+    with pytest.raises(SystemExit):
+        mem.build_parser().parse_args(["--unique", "37"])
+
+
+def test_expert_major_dispatch_table_covers_every_variant():
+    default = mem.build_parser().parse_args([]).variants.split(",")
+    assert set(default) == set(mem.DISPATCHES) == set(mem.VARIANTS)
+
+
+def test_expert_major_kernel_variants_cost_no_extra_dispatches():
+    # The whole point of recomputing the plan inside the threadgroup: a
+    # stock-op plan builder would have made b4/b2 cost ~17 dispatches/layer.
+    assert mem.DISPATCHES["b4"] == mem.DISPATCHES["a"] == 1
+    assert mem.DISPATCHES["b2"] == 1
+
+
+def test_expert_major_byte_model_matches_the_q4_g32_recipe():
+    # 1280x2560 fused gate+up at 4 bits + one bf16 scale and bias per 32.
+    assert mem.gu_bytes_per_expert() == 1280 * 2560 // 2 + 2 * 1280 * 80 * 2
+    assert mem.gu_bytes_per_expert() == 2_048_000
+
+
+def test_expert_major_only_the_kernel_variants_claim_the_dedup():
+    uniques = [28] * 48
+    assert mem.tiles_streamed("a", uniques) == float(eip.SLOTS)
+    assert mem.tiles_streamed("c", uniques) == float(eip.SLOTS)
+    assert mem.tiles_streamed("b4", uniques) == 28.0
+    assert mem.tiles_streamed("b2", uniques) == 28.0
+
+
+def test_expert_major_adversarial_sets_are_legal_and_hit_the_edges():
+    sets = mem.adversarial_id_sets()
+    assert set(sets) == {"all-distinct", "all-same", "one-expert-in-four-rows"}
+    for ids in sets.values():
+        eip.validate_ids(ids)
+        expert, member = eip.expert_major_plan(ids)
+        eip.validate_expert_major_plan(ids, expert, member)
+    assert eip.unique_count(sets["all-distinct"]) == eip.SLOTS
+    assert eip.unique_count(sets["all-same"]) == eip.TOP_K
+    shared = sets["one-expert-in-four-rows"]
+    assert eip.unique_count(shared) == eip.SLOTS - 3
+    _, member = eip.expert_major_plan(shared)
+    assert list(member[0]) == [0, 10, 20, 30]
