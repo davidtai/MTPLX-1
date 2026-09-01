@@ -67,6 +67,27 @@ def fable_opdiet_enabled() -> bool:
     return _FABLE_OPDIET
 
 
+#: Verify-width fused hyper-connection read (mtplx/kernels/qwen4_m4_hyper_read).
+#:
+#: Read ONCE at import, same reasoning as ``MTPLX_FABLE_OPDIET``: the hot path
+#: must not touch ``os.environ``, and two traces of the same compiled verify
+#: graph must not disagree about which read they contain. Off by default.
+#:
+#: This flag is NOT a "try the kernel" switch. When it is armed and a
+#: GatedResidual with 2..8 rows does not match the family contract (hc_count 4,
+#: hidden 2560, unquantized mix weights whose dtype matches the activation,
+#: down weight [320, 10240]), the read RAISES. A silent fallback to the eager
+#: chain would hide the arming failure behind a performance mystery -- which is
+#: exactly how MTPLX_FUSED_HC_V3 came to be armed-but-inert at M=4.
+_FABLE_HC_M4 = env_bool("MTPLX_FABLE_HC_M4", default=False)
+
+
+def fable_hc_m4_enabled() -> bool:
+    """True when ``MTPLX_FABLE_HC_M4`` armed this process at import."""
+
+    return _FABLE_HC_M4
+
+
 @dataclass(frozen=True)
 class ResolvedAPIKey:
     value: str | None

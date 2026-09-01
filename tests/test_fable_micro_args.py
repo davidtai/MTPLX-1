@@ -21,6 +21,7 @@ if str(FABLE) not in sys.path:
 import expert_id_patterns as eip  # noqa: E402
 import micro_dispatch_overhead as mdo  # noqa: E402
 import micro_expert_major as mem  # noqa: E402
+import micro_hc_read as mhr  # noqa: E402
 import micro_moe_dedup as mmd  # noqa: E402
 
 
@@ -32,9 +33,10 @@ def test_microbenchmarks_import_without_mlx():
         "import sys;"
         f"sys.path.insert(0, {str(FABLE)!r});"
         "import expert_id_patterns, micro_dispatch_overhead, micro_moe_dedup;"
-        "import micro_expert_major;"
-        "leaked=[m for m in sys.modules if m == 'mlx' or m.startswith('mlx.')];"
-        "print(leaked, micro_moe_dedup.mx, micro_expert_major.mx)"
+        "import micro_expert_major, micro_hc_read;"
+        "leaked=[m for m in sys.modules if m == 'mlx' or m.startswith('mlx.')"
+        "        or m == 'mtplx' or m.startswith('mtplx.')];"
+        "print(leaked, micro_moe_dedup.mx, micro_expert_major.mx, micro_hc_read.mx)"
     )
     out = subprocess.run(
         [sys.executable, "-c", probe],
@@ -42,9 +44,10 @@ def test_microbenchmarks_import_without_mlx():
         text=True,
         check=True,
     ).stdout.strip()
-    assert out == "[] None None", out
+    assert out == "[] None None None", out
     assert mmd.mx is None
     assert mem.mx is None
+    assert mhr.mx is None
 
 
 def test_moe_dedup_defaults():
@@ -230,3 +233,61 @@ def test_expert_major_adversarial_sets_are_legal_and_hit_the_edges():
     assert eip.unique_count(shared) == eip.SLOTS - 3
     _, member = eip.expert_major_plan(shared)
     assert list(member[0]) == [0, 10, 20, 30]
+
+
+# ---------------------------------------------------------------------------
+# micro_hc_read.py
+# ---------------------------------------------------------------------------
+
+
+def test_hc_read_defaults():
+    args = mhr.build_parser().parse_args([])
+    assert args.rows == 4, "the fixed-M4 verifier's physical width"
+    assert args.calls == 97, "2 reads per layer x 48 + the trunk mixer"
+    assert args.noncombine == 1, "only the trunk mixer is use_combine=False"
+    assert args.reps == 20
+    assert args.warmup == 3
+    assert args.variants == "a,bn,bd,b,c"
+    assert args.shared_weights is False, (
+        "the real cycle streams 1.28 GB of PRIVATE weights; a shared-weight "
+        "default would measure an L2 hit that does not exist"
+    )
+    assert args.sweep is None and args.out is None
+    assert args.out_per_tg is None and args.d_per_block is None
+
+
+def test_hc_read_dispatch_table_covers_every_variant():
+    default = mhr.build_parser().parse_args([]).variants.split(",")
+    assert set(default) == set(mhr.DISPATCHES)
+    assert mhr.DISPATCHES["a"] == 11, "the census counts 11 x 97 = 1,067/cycle"
+    assert mhr.DISPATCHES["b"] == 3
+    assert mhr.DISPATCHES["bn"] < mhr.DISPATCHES["bd"] < mhr.DISPATCHES["b"]
+
+
+def test_hc_read_byte_model_matches_the_census():
+    """The census correction: down is [320, 10240] = 6.55 MB, not 320x2560."""
+
+    per = mhr.weight_bytes(True)
+    assert per["down"] == 320 * 10240 * 2 == 6_553_600
+    assert per["up"] == per["down"]
+    assert per["inject"] == 4 * 10240 * 2
+    assert per["total"] == 13_209_600
+    assert mhr.weight_bytes(False)["inject"] == 0
+
+    cyc = mhr.cycle_bytes(97, 1)
+    assert cyc["total"] == 96 * 13_209_600 + 13_127_680
+    assert cyc["total"] == 1_281_249_280, "~1.28 GB of mix weights per cycle"
+
+
+def test_hc_read_sweep_parsing():
+    assert mhr.parse_sweep("4:256:8, 6:512:16") == [(4, 256, 8), (6, 512, 16)]
+    assert mhr.parse_sweep("") == []
+    with pytest.raises(ValueError):
+        mhr.parse_sweep("4:256")
+
+
+def test_hc_read_rows_and_calls_are_overridable():
+    args = mhr.build_parser().parse_args(
+        ["--rows", "8", "--calls", "4", "--variants", "a,b", "--out-per-tg", "6"]
+    )
+    assert args.rows == 8 and args.calls == 4 and args.out_per_tg == 6
