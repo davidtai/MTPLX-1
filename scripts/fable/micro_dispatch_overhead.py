@@ -49,6 +49,20 @@ OPS_PER_BUFFER_SWEEP = (50, 100, 200, 500, 1000)
 MIXED_OPS_PER_LAYER = 9  # rms_norm, qmm, sigmoid, mul, mul, 2x cast, add, cast
 
 
+def mixed_delta_vs_baseline(base_ms: float, value_ms: float) -> tuple[float, float]:
+    """Signed delta of one mixed-chain eval time against the baseline setting.
+
+    Sign convention: POSITIVE means this setting is SLOWER than the baseline.
+    It used to be computed as ``base - value``, which printed a *negative*
+    percentage for a setting that got slower -- 1.240 -> 1.661 ms was reported
+    as -33.97% instead of +33.95%.
+    """
+
+    delta = float(value_ms) - float(base_ms)
+    pct = 100.0 * delta / float(base_ms) if base_ms else 0.0
+    return delta, pct
+
+
 def _percentiles(samples):
     samples = sorted(samples)
     return {
@@ -200,9 +214,9 @@ def run_parent(args) -> int:
               f"{m['build_ms']:>10.3f}{m['est_command_buffers']:>9}")
     baseline = results[0]["ops_per_buffer"]
     for r in results:
-        delta = base - r["mixed"]["median_ms"]
+        delta, pct = mixed_delta_vs_baseline(base, r["mixed"]["median_ms"])
         print(f"  ops/buf={r['ops_per_buffer']:<5} delta vs {baseline}: "
-              f"{delta:+.3f} ms ({100.0 * delta / base:+.2f}%)")
+              f"{delta:+.3f} ms ({pct:+.2f}%)")
 
     summary = {
         "rows": ROWS, "hidden": HIDDEN, "layers": args.layers,

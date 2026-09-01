@@ -7,6 +7,7 @@ these two scripts be argued about without holding /tmp/mtplx-gpu-exclusive.lock.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,7 +24,23 @@ import micro_moe_dedup as mmd  # noqa: E402
 
 
 def test_microbenchmarks_import_without_mlx():
-    assert not any(m == "mlx" or m.startswith("mlx.") for m in sys.modules)
+    # In a clean interpreter, not "in whatever interpreter pytest has already
+    # dragged MLX into": any earlier test module in the session imports MLX,
+    # which used to make this assertion order-dependent.
+    probe = (
+        "import sys;"
+        f"sys.path.insert(0, {str(FABLE)!r});"
+        "import expert_id_patterns, micro_dispatch_overhead, micro_moe_dedup;"
+        "leaked=[m for m in sys.modules if m == 'mlx' or m.startswith('mlx.')];"
+        "print(leaked, micro_moe_dedup.mx)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert out == "[] None", out
     assert mmd.mx is None
 
 
@@ -131,3 +148,19 @@ def test_census_rejects_empty_and_malformed(tmp_path):
     bad.write_text(json.dumps([[[0] * 10] * 4]))
     with pytest.raises(ValueError):
         eip.load_census_id_sets(bad, 4)
+
+
+def test_mixed_delta_sign_is_positive_when_slower():
+    """Regression: the report printed `base - value`, so a run that got
+    SLOWER (1.240 -> 1.661 ms) came out as -33.97% instead of +33.95%."""
+
+    delta, pct = mdo.mixed_delta_vs_baseline(1.240, 1.661)
+    assert delta == pytest.approx(0.421)
+    assert pct == pytest.approx(100.0 * 0.421 / 1.240)
+    assert pct > 0
+
+    delta, pct = mdo.mixed_delta_vs_baseline(1.240, 0.930)
+    assert delta < 0 and pct < 0
+
+    assert mdo.mixed_delta_vs_baseline(1.240, 1.240) == (0.0, 0.0)
+    assert mdo.mixed_delta_vs_baseline(0.0, 1.0) == (1.0, 0.0)
