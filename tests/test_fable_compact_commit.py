@@ -14,19 +14,34 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
-mx.set_default_device(mx.cpu)
-
-import pytest  # noqa: E402
-
-from mtplx.kernels.qwen4_m4_state_handoff import (  # noqa: E402
+from mtplx.kernels.qwen4_m4_state_handoff import (
     QWEN4_M4_VERIFY_WIDTH,
     bind_qwen4_m4_state_handoff,
 )
-from mtplx.qwen4_fixed_verify import (  # noqa: E402
+from mtplx.qwen4_fixed_verify import (
     _bind_fixed_m4_device_commit,
     fable_compact_commit_enabled,
 )
+
+
+@pytest.fixture(autouse=True)
+def _cpu_stream():
+    """Pin every op in this module to the CPU stream, then put it back.
+
+    ``gated_delta_update(use_kernel=True)`` dispatches its Metal kernel only
+    when the default device is the GPU; on CPU it takes the ops reference.
+    Restoring the previous device keeps this module from changing the device
+    for any other test that shares the process.
+    """
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous)
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATION = ROOT / "mtplx" / "generation.py"
