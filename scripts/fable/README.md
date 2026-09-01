@@ -29,9 +29,11 @@ Arm A defaults to the retained 67.818 tok/s "paired routed GLU" arm from
 --candidate-env MTPLX_QWEN4_M4_ROUTED_GLU=1
 ```
 
-Arm B is arm A plus whatever you add with `--candidate-flag` / `--candidate-env`
-/ `--candidate-extra-env`. `--control-env` and `--control-flag` change *both*
-arms (use them to move the shared baseline).
+`--control-flag` / `--control-env` / `--control-extra-env` move the shared
+baseline: they land on *both* arms. Arm B is then arm A plus whatever you add
+with `--candidate-flag` / `--candidate-env` / `--candidate-extra-env`. A
+candidate setting that repeats a control key replaces it on arm B rather than
+being passed twice.
 
 ## 1. Control-only smoke, one seed
 
@@ -159,10 +161,11 @@ in-flight edit elsewhere in the worktree aborts the arm. Pass
 `--expected-file <path>=<sha256>` if you need to run against a working tree.
 
 Move the shared baseline for both arms with `--control-env` / `--control-flag`
-/ `--control-extra-env`. Flags the window supplies itself (`--label`,
-`--sequence`, `--seed`, `--receipt-path`, `--guard-mode`, `--source`,
-`--expected-source`, `--candidate-env`, `--env`, `--thermal-gate-max-c`) are
-rejected as arm flags.
+/ `--control-extra-env`; all three land on arm A *and* arm B, so what the
+bracket measures stays the candidate-only difference. Flags the window supplies
+itself (`--label`, `--sequence`, `--seed`, `--receipt-path`, `--guard-mode`,
+`--source`, `--expected-source`, `--candidate-env`, `--env`,
+`--thermal-gate-max-c`) are rejected as arm flags.
 
 Other window options worth knowing:
 

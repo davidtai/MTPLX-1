@@ -162,16 +162,16 @@ class TestArgvBuilding(unittest.TestCase):
         self.assertEqual(argv[argv.index("--env") + 1], "MLX_MAX_OPS_PER_BUFFER=8")
         self.assertIn("--m4-stage3", argv)
 
-    def test_merge_candidate_env_overrides_by_key(self):
-        merged = window.merge_candidate_env(
+    def test_merge_env_settings_overrides_by_key(self):
+        merged = window.merge_env_settings(
             ("MTPLX_X=1", "MTPLX_Y=1"), ["MTPLX_Y=2", "MTPLX_Z=3"]
         )
         self.assertEqual(merged, ["MTPLX_X=1", "MTPLX_Y=2", "MTPLX_Z=3"])
 
-    def test_merge_candidate_env_rejects_bad_pairs(self):
+    def test_merge_env_settings_rejects_bad_pairs(self):
         for bad in ("NOEQUALS", "=1", "KEY="):
             with self.assertRaises(ValueError):
-                window.merge_candidate_env((), [bad])
+                window.merge_env_settings((), [bad])
 
     def test_control_arm_matches_the_retained_paired_routed_glu_arm(self):
         self.assertEqual(
@@ -230,6 +230,102 @@ class TestArgvBuilding(unittest.TestCase):
         specs = window.arm_specification(args)
         self.assertIn("MTPLX_QWEN4_M4_ROUTED_GLU=0", specs["A"]["candidate_env"])
         self.assertIn("MTPLX_QWEN4_M4_ROUTED_GLU=0", specs["B"]["candidate_env"])
+
+    def test_control_flag_applies_to_both_arms(self):
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--control-flag=--nax-verify",
+            ]
+        )
+        specs = window.arm_specification(args)
+        expected = [*window.CONTROL_FLAGS, "--nax-verify"]
+        self.assertEqual(specs["A"]["flags"], expected)
+        self.assertEqual(specs["B"]["flags"], expected)
+
+    def test_candidate_flag_extends_the_control_flags(self):
+        """Arm B is arm A plus the candidate flags, in that order."""
+
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--control-flag=--frspec-n",
+                "--control-flag=32768",
+                "--candidate-flag=--nax-verify",
+            ]
+        )
+        specs = window.arm_specification(args)
+        self.assertEqual(
+            specs["A"]["flags"], [*window.CONTROL_FLAGS, "--frspec-n", "32768"]
+        )
+        self.assertEqual(
+            specs["B"]["flags"],
+            [*window.CONTROL_FLAGS, "--frspec-n", "32768", "--nax-verify"],
+        )
+
+    def test_control_extra_env_applies_to_both_arms(self):
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--control-extra-env",
+                "MLX_MAX_OPS_PER_BUFFER=8",
+                "--candidate-extra-env",
+                "MTPLX_FABLE_MOE_SORTED=1",
+            ]
+        )
+        specs = window.arm_specification(args)
+        self.assertEqual(specs["A"]["extra_env"], ["MLX_MAX_OPS_PER_BUFFER=8"])
+        self.assertEqual(
+            specs["B"]["extra_env"],
+            ["MLX_MAX_OPS_PER_BUFFER=8", "MTPLX_FABLE_MOE_SORTED=1"],
+        )
+
+    def test_candidate_extra_env_overrides_control_without_duplicating(self):
+        """The driver refuses a repeated --env key, so the merge must collapse."""
+
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--control-extra-env",
+                "MLX_MAX_OPS_PER_BUFFER=8",
+                "--candidate-extra-env",
+                "MLX_MAX_OPS_PER_BUFFER=16",
+            ]
+        )
+        specs = window.arm_specification(args)
+        self.assertEqual(specs["A"]["extra_env"], ["MLX_MAX_OPS_PER_BUFFER=8"])
+        self.assertEqual(specs["B"]["extra_env"], ["MLX_MAX_OPS_PER_BUFFER=16"])
+
+    def test_control_options_reach_both_arm_command_lines(self):
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--control-flag=--nax-verify",
+                "--control-extra-env",
+                "MTPLX_FABLE_MOE_SORTED=1",
+            ]
+        )
+        specs = window.arm_specification(args)
+        runs = window.plan_runs([20260829], "AB", 1)
+        for run in runs:
+            argv = window.build_arm_argv(
+                run,
+                python="/py",
+                driver="/d.py",
+                label_prefix="p",
+                receipt_dir="/out",
+                common_flags=[],
+                arm_flags=specs[run["arm"]]["flags"],
+                candidate_env=specs[run["arm"]]["candidate_env"],
+                extra_env=specs[run["arm"]]["extra_env"],
+            )
+            self.assertIn("--nax-verify", argv)
+            self.assertIn("MTPLX_FABLE_MOE_SORTED=1", argv)
 
     def test_reserved_arm_flags_are_rejected(self):
         for reserved in ("--label", "--seed", "--receipt-path=x", "--guard-mode"):

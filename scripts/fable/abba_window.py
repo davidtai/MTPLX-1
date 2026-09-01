@@ -169,10 +169,17 @@ def build_arm_argv(
     return argv
 
 
-def merge_candidate_env(
+def merge_env_settings(
     base: Sequence[str], overrides: Sequence[str]
 ) -> list[str]:
-    """Later KEY=VALUE settings replace earlier ones with the same KEY."""
+    """Later KEY=VALUE settings replace earlier ones with the same KEY.
+
+    Used for both ``--candidate-env`` and the raw ``--env`` passthrough. The
+    de-duplication matters on arm B, which now carries the control settings as
+    well: the driver's ``parse_key_values`` refuses a repeated key outright, so
+    a candidate override of a control setting has to collapse here rather than
+    reach the command line twice.
+    """
 
     merged: dict[str, str] = {}
     for setting in [*base, *overrides]:
@@ -533,9 +540,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FLAG",
         help=(
-            "Extra raw driver flag for arm A (repeatable). Use the '=' form "
-            "so argparse does not eat the leading dashes: "
-            "--control-flag=--nax-verify"
+            "Extra raw driver flag for BOTH arms -- this moves the shared "
+            "baseline (repeatable). Use the '=' form so argparse does not eat "
+            "the leading dashes: --control-flag=--nax-verify"
         ),
     )
     parser.add_argument(
@@ -554,7 +561,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="MTPLX_KEY=VALUE",
-        help="Override a control construction-time MTPLX_* setting.",
+        help=(
+            "Override a construction-time MTPLX_* setting on BOTH arms "
+            "(moves the shared baseline)."
+        ),
     )
     parser.add_argument(
         "--candidate-env",
@@ -568,14 +578,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Non-MTPLX process env for arm A (e.g. MLX_MAX_OPS_PER_BUFFER=...).",
+        help=(
+            "Non-MTPLX process env for BOTH arms "
+            "(e.g. MLX_MAX_OPS_PER_BUFFER=...)."
+        ),
     )
     parser.add_argument(
         "--candidate-extra-env",
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Non-MTPLX process env for arm B.",
+        help="Non-MTPLX process env for arm B only (adds to --control-extra-env).",
     )
     parser.add_argument(
         "--dry-run",
@@ -634,22 +647,33 @@ def check_arm_flags(flags: Sequence[str]) -> None:
 
 
 def arm_specification(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
+    """Build both arms: control is the shared baseline, candidate adds to it.
+
+    The ``--control-*`` options move the baseline for *both* arms; only the
+    ``--candidate-*`` options separate arm B from arm A. Arm B taking the
+    control flags too is what makes the comparison matched: a control flag
+    that landed on arm A alone would be measured as a candidate difference
+    with the opposite sign.
+    """
+
     check_arm_flags(args.control_flag)
     check_arm_flags(args.candidate_flag)
     return {
         "A": {
             "flags": [*CONTROL_FLAGS, *args.control_flag],
-            "candidate_env": merge_candidate_env(
+            "candidate_env": merge_env_settings(
                 CONTROL_CANDIDATE_ENV, args.control_env
             ),
-            "extra_env": list(args.control_extra_env),
+            "extra_env": merge_env_settings((), args.control_extra_env),
         },
         "B": {
-            "flags": [*CONTROL_FLAGS, *args.candidate_flag],
-            "candidate_env": merge_candidate_env(
+            "flags": [*CONTROL_FLAGS, *args.control_flag, *args.candidate_flag],
+            "candidate_env": merge_env_settings(
                 CONTROL_CANDIDATE_ENV, [*args.control_env, *args.candidate_env]
             ),
-            "extra_env": list(args.candidate_extra_env),
+            "extra_env": merge_env_settings(
+                args.control_extra_env, args.candidate_extra_env
+            ),
         },
     }
 
