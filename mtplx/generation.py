@@ -51,6 +51,7 @@ from .cache_state import (
     tail_owned_attention_kv_stats,
     trim_verified_window_to_prefix,
 )
+from .fable_compiled_draft import maybe_build_compiled_draft_chain
 from .forkev_telemetry import ForkEVRecorder
 from .fast_sampling import (
     MAX_DEVICE_TOP_K_ORDER,
@@ -5566,14 +5567,30 @@ def _pr391_make_float32_d3_core(
             mx.concatenate(raw_probs_by_depth, axis=0),
         )
 
+    # MTPLX_FABLE_COMPILED_DRAFT (default off): replay the D1..D3 chain from one
+    # compiled per-depth trace instead of re-tracing it on the host every cycle.
+    # Returns None when the gate is unarmed, so the eager chain above stays the
+    # byte-identical default; an armed gate that cannot be served raises.
+    compiled_draft = maybe_build_compiled_draft_chain(
+        rt=rt,
+        mtp_cache=mtp_cache,
+        state_tree=state_tree,
+        mtp_hidden_variant=mtp_hidden_variant,
+        selector=selector,
+        frspec_ids=frspec_ids,
+        depth=_PR391_FLOAT32_D3_DEPTH,
+        top_k=_PR391_FLOAT32_D3_TOP_K,
+        request_max_tokens=output_tokens,
+    )
     return {
-        "fn": chain_fn,
+        "fn": chain_fn if compiled_draft is None else compiled_draft["chain_fn"],
         "cache": mtp_cache,
         "depth": _PR391_FLOAT32_D3_DEPTH,
         "state_tree": state_tree,
         "state_signature": _device_core_state_signature(mtp_cache),
         "selector_policy": "softfloat64-exact-raw-k20-top-p-0.95",
         "device_replay": device_replay,
+        "compiled_draft": compiled_draft,
     }
 
 
