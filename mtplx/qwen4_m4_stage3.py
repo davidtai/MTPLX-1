@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import mlx.core as mx
@@ -21,6 +22,79 @@ from .models.qwen4_exp import (
     _FusedGateUpSwitchGLU,
 )
 from .runtime_options import env_bool
+
+
+ROWS = 4
+TOP_K = 10
+HIDDEN = 2560
+INTERMEDIATE = 640
+
+FABLE_MOE_SORTED_ENV = "MTPLX_FABLE_MOE_SORTED"
+
+_MOE_SORTED_CACHE: bool | None = None
+
+
+def fable_moe_sorted_enabled() -> bool:
+    """Return the ``MTPLX_FABLE_MOE_SORTED`` gate; read once, default off.
+
+    Resolved lazily rather than at import so a serving profile that arms the
+    flag after this module is imported is still observed, then memoized so the
+    decode cycle never repeats the environment lookup.  The gate is a pure
+    permutation of the routed gathers (see ``_routed_gather_plan``), so it can
+    be flipped without changing any numeric contract.
+    """
+
+    global _MOE_SORTED_CACHE
+    if _MOE_SORTED_CACHE is None:
+        _MOE_SORTED_CACHE = env_bool(
+            FABLE_MOE_SORTED_ENV,
+            default=False,
+            env=os.environ,
+        )
+    return _MOE_SORTED_CACHE
+
+
+def reset_fable_moe_sorted_cache() -> None:
+    """Drop the memoized gate.  Test-support only."""
+
+    global _MOE_SORTED_CACHE
+    _MOE_SORTED_CACHE = None
+
+
+def _routed_gather_plan(
+    x: mx.array,
+    expert_ids: mx.array,
+) -> tuple[mx.array, mx.array, mx.array | None]:
+    """Return ``(routed_input, gather_ids, inverse)`` for the routed gathers.
+
+    With the gate off this is the historical layout: the hidden row broadcast
+    over its ten slots by ``expand_dims``, the ``[1, 4, 10]`` ids exactly as
+    routed, and no un-permute.
+
+    With the gate on the forty ``(row, expert)`` pairs are argsorted by expert
+    id, so the duplicates -- the census puts the real overlap at a mean of 28
+    distinct experts per 40-pair layer cycle -- land in adjacent gather rows and
+    the weight tile each pair needs is already in cache for its neighbour.  That
+    is the same permutation ``mlx_lm``'s ``_gather_sort`` applies at large M,
+    inlined here so it is part of the compiled verify graph.  It is a pure
+    reorder of independent M=1 rows: every pair still does its own dot product
+    against its own expert, so the result is bit-identical once un-permuted.
+
+    ``sorted_indices`` deliberately stays ``False`` at every call site.  MLX
+    only takes its sorted-rhs fast path when the batch-to-expert ratio is at
+    least four; at 40 pairs over 512 experts it would not engage, and claiming
+    sortedness we do not benefit from only risks a different kernel.
+
+    ``inverse`` is ``None`` when the gate is off, which is the signal to skip
+    the un-permute entirely rather than pay an identity take.
+    """
+
+    if not fable_moe_sorted_enabled():
+        return mx.expand_dims(x, (-2, -3)), expert_ids, None
+    flat = expert_ids.reshape(ROWS * TOP_K)
+    order = mx.argsort(flat)
+    routed_input = x.reshape(ROWS, 1, HIDDEN)[order // TOP_K]
+    return routed_input, flat[order], mx.argsort(order)
 
 
 def qwen4_m4_stage3_enabled() -> bool:
@@ -97,18 +171,21 @@ def _m4_forward(block: SparseMoeBlock, x: mx.array, stage3) -> mx.array:
         route_scores = route_scores / route_scores.sum(axis=-1, keepdims=True)
 
     routed = block.switch_mlp
-    routed_input = mx.expand_dims(x, (-2, -3))
+    routed_input, gather_ids, inverse = _routed_gather_plan(x, expert_ids)
     routed_gate, routed_up = routed._gu(
         routed_input,
-        expert_ids,
+        gather_ids,
         sorted_indices=False,
     )
     routed_h = nn.silu(routed_gate) * routed_up
     routed_down = routed.down_proj(
         routed_h,
-        expert_ids,
+        gather_ids,
         sorted_indices=False,
-    ).squeeze(-2).reshape(4, 10, 2560)
+    )
+    if inverse is not None:
+        routed_down = routed_down[inverse]
+    routed_down = routed_down.squeeze(-2).reshape(ROWS, TOP_K, HIDDEN)
 
     shared = block.shared_expert
     shared_gu = mx.quantized_matmul(
@@ -151,13 +228,19 @@ def _m4_routed_down_reduce_forward(
         route_scores = route_scores / route_scores.sum(axis=-1, keepdims=True)
 
     routed = block.switch_mlp
-    routed_input = mx.expand_dims(x, (-2, -3))
+    routed_input, gather_ids, inverse = _routed_gather_plan(x, expert_ids)
     routed_gate, routed_up = routed._gu(
         routed_input,
-        expert_ids,
+        gather_ids,
         sorted_indices=False,
     )
-    routed_h = (nn.silu(routed_gate) * routed_up).reshape(4, 10, 640)
+    routed_h = nn.silu(routed_gate) * routed_up
+    # Un-permute before the routed-down kernel: it indexes routed_h and
+    # expert_ids by the same flat (row * TOP_K + slot), so it must see the
+    # original slot order.
+    if inverse is not None:
+        routed_h = routed_h[inverse]
+    routed_h = routed_h.reshape(ROWS, TOP_K, INTERMEDIATE)
 
     shared = block.shared_expert
     shared_gu = mx.quantized_matmul(
@@ -206,13 +289,19 @@ def _m4_routed_down_residual_tail_forward(
         route_scores = route_scores / route_scores.sum(axis=-1, keepdims=True)
 
     routed = block.switch_mlp
-    routed_input = mx.expand_dims(x, (-2, -3))
+    routed_input, gather_ids, inverse = _routed_gather_plan(x, expert_ids)
     routed_gate, routed_up = routed._gu(
         routed_input,
-        expert_ids,
+        gather_ids,
         sorted_indices=False,
     )
-    routed_h = (nn.silu(routed_gate) * routed_up).reshape(4, 10, 640)
+    routed_h = nn.silu(routed_gate) * routed_up
+    # Un-permute before the routed-down kernel: it indexes routed_h and
+    # expert_ids by the same flat (row * TOP_K + slot), so it must see the
+    # original slot order.
+    if inverse is not None:
+        routed_h = routed_h[inverse]
+    routed_h = routed_h.reshape(ROWS, TOP_K, INTERMEDIATE)
 
     shared = block.shared_expert
     shared_gu = mx.quantized_matmul(
@@ -252,6 +341,20 @@ def _m4_paired_routed_glu_residual_tail_forward(
     hyper: mx.array,
     inject: mx.array,
 ) -> mx.array:
+    """Retained lane: paired routed GLU producer plus the fused residual tail.
+
+    ``MTPLX_FABLE_MOE_SORTED`` deliberately does not apply here.  Both routed
+    gathers on this lane happen *inside* Metal kernels -- the paired GLU kernel
+    resolves ``expert = expert_ids[selected]`` and walks the fused pack itself,
+    and the routed-down kernel does the same over its fixed ``SLOT_ORDER``
+    reduction tree.  There is no ``mx.gather_qmm`` left to reorder, so the
+    sorted-adjacent win has to be taken kernel-side (order the ``selected``
+    threadgroups by expert id, or hoist the sort into the kernel's own indexing)
+    rather than by permuting tensors in this forward.  Permuting the ids handed
+    to these kernels without matching the reduction tree would break the
+    bit-exact accumulation order they are validated against.
+    """
+
     gates = mx.softmax(block.gate(x), axis=-1, precise=True)
     expert_ids = mx.argpartition(gates, kth=-block.top_k, axis=-1)[
         ..., -block.top_k :
@@ -800,11 +903,14 @@ def install_qwen4_m4_stage3(
 
 
 __all__ = [
+    "FABLE_MOE_SORTED_ENV",
     "bind_qwen4_m4_residual_tail",
+    "fable_moe_sorted_enabled",
     "install_qwen4_m4_stage3",
     "qwen4_m4_routed_down_reduce_enabled",
     "qwen4_m4_routed_down_residual_tail_enabled",
     "qwen4_m4_routed_glu_enabled",
     "qwen4_m4_stage3_enabled",
     "qwen4_m4_stage3_flags",
+    "reset_fable_moe_sorted_cache",
 ]

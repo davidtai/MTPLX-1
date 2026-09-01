@@ -121,6 +121,23 @@ Non-MTPLX process environment applied before the mlx import (arm B only):
     --candidate-extra-env MLX_MAX_OPS_PER_BUFFER=8
 ```
 
+`MTPLX_FABLE_*` is the fable namespace and rides this same raw passthrough --
+`parse_key_values` exempts it from the `--candidate-env` MTPLX check, so it must
+go on `--candidate-extra-env` / `--control-extra-env`:
+
+```
+    --candidate-extra-env MTPLX_FABLE_MOE_SORTED=1
+```
+
+`MTPLX_FABLE_MOE_SORTED=1` argsorts the forty routed `(row, expert)` pairs by
+expert id before the M4 routed gathers, so the ~12 duplicate pairs per layer
+cycle land adjacent, then un-permutes the results. It is a pure permutation of
+independent M=1 rows: bit-identical, worth 5-8% on the MoE in
+`micro_moe_dedup.py` variant `b1`. It only bites on the `_m4_forward` and
+routed-down-reduce routes, which still issue `mx.gather_qmm`; the retained
+paired-routed-GLU arm gathers inside its Metal kernels, so on that arm the gate
+is a no-op and the win needs the kernel-level equivalent.
+
 `--candidate-env` keys must be members of
 `mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, or `apply_profile_env`
 refuses the arm with `runtime_env_overrides has unsupported key: <KEY>`. That
