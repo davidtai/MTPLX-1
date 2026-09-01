@@ -77,7 +77,6 @@ RUN_GUARDED = Path(
 QWEN_PLIST = Path("/Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist")
 
 EVALPLUS_ROOT = Path("/Users/davidtai/projects/evalplus")
-EVALPLUS_PYTHON = EVALPLUS_ROOT / ".venv" / "bin" / "python"
 EVALPLUS_EVALUATE = EVALPLUS_ROOT / ".venv" / "bin" / "evalplus.evaluate"
 EVALPLUS_SITE = EVALPLUS_ROOT / ".venv" / "lib" / "python3.12" / "site-packages"
 EVALPLUS_VERSION = "0.3.1"
@@ -585,6 +584,54 @@ def load_evalplus() -> tuple[Callable[[], dict[str, Any]], Callable[..., str]]:
     return get_human_eval_plus, sanitize
 
 
+def arm_identity(
+    candidate_env: Mapping[str, str],
+    server_argv: Sequence[str],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Everything that must match for a resumed run to still be ONE arm."""
+
+    return {
+        "candidate_env": dict(candidate_env),
+        "control_family_env": dict(CONTROL_FAMILY_ENV),
+        "server_argv": list(server_argv),
+        "max_tokens": int(args.max_tokens),
+        "temperature": float(args.temperature),
+        "top_p": float(args.top_p),
+        "model_id": str(args.model_id),
+    }
+
+
+def claim_arm_identity(run_dir: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Write the arm identity, or refuse to append to a DIFFERENT arm.
+
+    Resume is on by default, and ``--label`` is the only thing choosing the
+    output directory. Without this, re-running a label with a different --env
+    would silently append candidate completions to a control's samples.jsonl
+    and score the mixture.
+    """
+
+    path = run_dir / "arm.json"
+    if path.is_file():
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if previous != dict(identity):
+            drift = {
+                key: (previous.get(key), dict(identity).get(key))
+                for key in set(previous) | set(identity)
+                if previous.get(key) != dict(identity).get(key)
+            }
+            raise RuntimeError(
+                f"{path} already describes a DIFFERENT arm; use a new --label "
+                f"or delete {run_dir}. Drift: {json.dumps(drift, sort_keys=True)}"
+            )
+        return {"claimed": "resumed", "path": str(path)}
+    path.write_text(
+        json.dumps(dict(identity), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {"claimed": "new", "path": str(path)}
+
+
 def existing_task_ids(path: Path) -> set[str]:
     if not path.is_file():
         return set()
@@ -970,6 +1017,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "server.log"
     receipt_path = run_dir.parent / f"{args.label}.json"
+    arm_claim = claim_arm_identity(
+        run_dir, arm_identity(candidate_env, server_argv, args)
+    )
+    print(f"[humaneval-screen] arm identity {arm_claim['claimed']}", flush=True)
 
     get_humaneval, sanitize = load_evalplus()
     dataset = get_humaneval()
@@ -1109,6 +1160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         warmup=warmup,
     )
     receipt["scoring"] = {"eval_results": str(result_path)}
+    receipt["arm_identity"] = dict(arm_claim)
     receipt_path.write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

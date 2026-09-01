@@ -414,6 +414,39 @@ class ReceiptShape(unittest.TestCase):
         self.assertEqual(args.port, 8091)
 
 
+class ArmIdentity(unittest.TestCase):
+    def _identity(self, env):
+        args = screen.build_parser().parse_args(["--label", "x"])
+        return screen.arm_identity(env, screen.build_server_argv(), args)
+
+    def test_first_claim_writes_the_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw)
+            claim = screen.claim_arm_identity(run_dir, self._identity({}))
+            self.assertEqual(claim["claimed"], "new")
+            written = json.loads((run_dir / "arm.json").read_text())
+            self.assertEqual(written["candidate_env"], {})
+
+    def test_same_arm_resumes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw)
+            identity = self._identity({"MTPLX_FABLE_HC_M4": "1"})
+            screen.claim_arm_identity(run_dir, identity)
+            claim = screen.claim_arm_identity(run_dir, identity)
+            self.assertEqual(claim["claimed"], "resumed")
+
+    def test_a_different_arm_under_the_same_label_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw)
+            screen.claim_arm_identity(run_dir, self._identity({}))
+            with self.assertRaises(RuntimeError) as caught:
+                screen.claim_arm_identity(
+                    run_dir, self._identity({"MTPLX_FABLE_HC_M4": "1"})
+                )
+            self.assertIn("DIFFERENT arm", str(caught.exception))
+            self.assertIn("candidate_env", str(caught.exception))
+
+
 class DryRun(unittest.TestCase):
     def test_dry_run_prints_the_guarded_outer_command_and_exits_clean(self):
         completed = subprocess.run(
