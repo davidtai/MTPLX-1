@@ -292,6 +292,20 @@ class Scoring(unittest.TestCase):
             {"task_id": "HumanEval/1", "base_pass": True, "plus_pass": False},
         )
 
+    def test_plus_requires_the_base_tests_too(self):
+        """evalplus counts base_status == plus_status == pass for HumanEval+.
+
+        The plus tests are the EXTRA inputs only, so plus_status alone can be
+        "pass" on a solution that fails a base test. Counting plus_status alone
+        scored the 2026-08-24 native-MTP samples 149/164 where the evalplus CLI
+        reports 148 -- one task, HumanEval/92, is exactly this shape.
+        """
+        results = _eval_results({"HumanEval/92": ("fail", "pass")})
+        summary = screen.summarize_scores(results, ["HumanEval/92"])
+        self.assertEqual(summary["humaneval"]["passed"], 0)
+        self.assertEqual(summary["humaneval_plus"]["passed"], 0)
+        self.assertEqual(summary["plus_failures"], ["HumanEval/92"])
+
     def test_padding_rows_are_never_counted(self):
         results = _eval_results(
             {

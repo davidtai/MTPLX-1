@@ -336,6 +336,14 @@ def summarize_scores(
 ) -> dict[str, Any]:
     """pass@1 over exactly the scored subset, plus the per-problem pass list.
 
+    HumanEval+ pass@1 is ``base_status == plus_status == pass``, NOT
+    ``plus_status == pass``: the plus tests are the EXTRA inputs only, so a
+    solution can pass them while failing a base test. Counting plus_status
+    alone reported 149/164 for the 2026-08-24 native-MTP samples where
+    evalplus's own CLI reports 148 -- see
+    ``evalplus/evaluate.py`` (``new_correct``) and the validation in
+    ``tests/test_fable_humaneval_screen.py``.
+
     ``evalplus.evaluate`` insists on a samples file that covers all 164
     problems, so a ``--n 20`` run pads the other 144 with an empty solution and
     this function then ignores them. Padding rows are never counted.
@@ -355,7 +363,7 @@ def summarize_scores(
             )
         row = completions[0]
         base_ok = str(row.get("base_status")) == "pass"
-        plus_ok = str(row.get("plus_status")) == "pass"
+        plus_ok = base_ok and str(row.get("plus_status")) == "pass"
         base_passed += int(base_ok)
         plus_passed += int(plus_ok)
         rows.append(
@@ -745,6 +753,10 @@ def score_samples(scoring_path: Path, *, parallel: int, timeout: float) -> Path:
         cwd=str(EVALPLUS_ROOT),
         timeout=timeout,
         check=False,
+        # evalplus prompts on stdin when the results file already exists. The
+        # unlink above is what prevents that; DEVNULL turns a surprise into an
+        # immediate EOFError instead of a hang inside the guarded window.
+        stdin=subprocess.DEVNULL,
     )
     if completed.returncode != 0:
         raise RuntimeError(
