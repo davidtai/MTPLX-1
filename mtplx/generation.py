@@ -52,6 +52,7 @@ from .cache_state import (
     trim_verified_window_to_prefix,
 )
 from .fable_compiled_draft import maybe_build_compiled_draft_chain
+from .fable_k20_log import is_enabled as _fable_k20_log_enabled, k20_log
 from .forkev_telemetry import ForkEVRecorder
 from .fast_sampling import (
     MAX_DEVICE_TOP_K_ORDER,
@@ -322,6 +323,14 @@ def _env_falsey(name: str) -> bool:
 #
 # See the trim sites for what each one skips.
 _FABLE_HOST_TRIMS = _env_truthy("MTPLX_FABLE_HOST_TRIMS")
+
+# MTPLX_FABLE_K20_LOG -- read ONCE at import (in ``mtplx.fable_k20_log``),
+# default OFF.  When off this constant is False and both decision call sites
+# pass ``k20_capture=None`` through a conditional expression, so nothing is
+# built and ``_pr391_decode_float32_verifier_decision`` keeps its exact
+# ``mx.eval(*result)`` sync.  See ``mtplx/fable_k20_log.py`` for what an
+# armed run records and what it costs.
+_FABLE_K20_LOG = _fable_k20_log_enabled()
 
 
 def _family_capture_commit_enabled() -> bool:
@@ -5765,10 +5774,30 @@ def _pr391_decode_float32_verifier_decision(
     *,
     uniform_tape: Any,
     reservation: Any,
+    k20_capture: tuple[Any, Any, int, int] | None = None,
 ) -> tuple[int, int, int, int, bool, int, list[float]]:
-    """Materialize one compact decision and advance only its consumed draws."""
+    """Materialize one compact decision and advance only its consumed draws.
 
-    mx.eval(*result)
+    ``k20_capture`` is the opt-in ``MTPLX_FABLE_K20_LOG`` diagnostic
+    (``mtplx/fable_k20_log.py``).  It is ``None`` on the retained lane, and
+    then this function is byte-for-byte what it was: one ``mx.eval(*result)``
+    sync and six host decodes.
+
+    When armed it carries ``(draft_result, target_support, primary,
+    bonus_allowed)``.  The six K20 row arrays inside the first two entries are
+    already inputs to ``result``'s graph, so folding them into the *same*
+    ``mx.eval`` schedules no new GPU work and adds no second sync -- it only
+    retains buffers this decision had to compute anyway.  The cost is then one
+    1,680-byte device-to-host copy per cycle, taken after the sync, on the
+    critical path between the decision and the commit.  Small, but not free:
+    an instrumented run is a data run, not a timing run.
+    """
+
+    if k20_capture is None:
+        mx.eval(*result)
+    else:
+        _k20_draft_result, _k20_target_support = k20_capture[0], k20_capture[1]
+        mx.eval(*result, *_k20_draft_result, *_k20_target_support)
     accepted_count = int(np.asarray(result[0], dtype=np.uint32).reshape(-1)[0])
     first_reject = int(np.asarray(result[1], dtype=np.int32).reshape(-1)[0])
     selected_token = int(np.asarray(result[2], dtype=np.uint32).reshape(-1)[0])
@@ -5783,8 +5812,7 @@ def _pr391_decode_float32_verifier_decision(
     accept_probs = [
         float(value) for value in accept_probability_bits.view(np.float64)
     ]
-    uniform_tape.commit_device_choices(reservation, draws_used)
-    return (
+    decision = (
         accepted_count,
         first_reject,
         selected_token,
@@ -5793,6 +5821,18 @@ def _pr391_decode_float32_verifier_decision(
         draws_used,
         accept_probs,
     )
+    if k20_capture is not None:
+        k20_log.record(
+            draft_result=_k20_draft_result,
+            target_support=_k20_target_support,
+            uniform_tape=uniform_tape,
+            reservation=reservation,
+            primary=k20_capture[2],
+            bonus_allowed=k20_capture[3],
+            decision=decision,
+        )
+    uniform_tape.commit_device_choices(reservation, draws_used)
+    return decision
 
 
 def _pr391_stage_verifier_mtp_replay(
@@ -8463,6 +8503,8 @@ def generate_mtpk(
             else np.zeros(1, dtype=np.uint32),
             dtype=mx.uint32,
         )
+        if _FABLE_K20_LOG:
+            k20_log.set_stop_ids(_pr391_stop_ids_host)
     else:
         _pr391_stop_ids = None
         _pr391_stop_count = None
@@ -11846,6 +11888,20 @@ def generate_mtpk(
                 _pr391_float32_target_support(verify_logits)
             )
             verifier_reservation = rng.peek_device_choices(4)
+            # MTPLX_FABLE_K20_LOG (default off): the seven prepared K20 rows
+            # this decision already holds, handed to the decode so they ride
+            # its existing materialization sync. Off, this is a global load
+            # and a None; the conditional expression builds nothing.
+            _pr391_k20_capture = (
+                None
+                if not _FABLE_K20_LOG
+                else (
+                    _pr391_joint_result,
+                    (target_ids, target_values, target_probs),
+                    int(primary),
+                    int(bonus_distribution_row_needed),
+                )
+            )
             verifier_result = _pr391_apply_softfloat64_decision(
                 verifier_kernel=_pr391_route.verifier_kernel,
                 draft_result=_pr391_joint_result,
@@ -11870,6 +11926,7 @@ def generate_mtpk(
                         verifier_result,
                         uniform_tape=rng,
                         reservation=verifier_reservation,
+                        k20_capture=_pr391_k20_capture,
                     )
                 )
                 _pr391_accepted_width = int(_pr391_verifier_decision[0])
@@ -11955,6 +12012,7 @@ def generate_mtpk(
                         verifier_result,
                         uniform_tape=rng,
                         reservation=verifier_reservation,
+                        k20_capture=_pr391_k20_capture,
                     )
                 )
             _pr391_next_descriptor_offset = (
@@ -13277,6 +13335,11 @@ def generate_mtpk(
         # reflects only the authoritative replay and the normal final commit
         # below remains responsible for any pending primary.
         _pr391_carried_d3 = None
+
+    if _FABLE_K20_LOG and _pr391_route is not None:
+        # Explicit K20-row flush at end of generation; the atexit hook in
+        # mtplx.fable_k20_log is only the backstop for an aborted run.
+        k20_log.flush()
 
     if token_callback is not None and _stream_gate.window > 0:
         # Armed-stream reconcile (F35): the trim decision is known here —
