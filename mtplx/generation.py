@@ -5579,7 +5579,7 @@ def _pr391_make_float32_d3_core(
             )
             row = logits[:, -1, :].reshape(-1)
             flat = row.astype(mx.float32)
-            if fable_opdiet_enabled():
+            if fable_opdiet_enabled("k20"):
                 local_ids, q_values = _opdiet_ordered_top_k_support(
                     flat,
                     _PR391_FLOAT32_D3_TOP_K,
@@ -5709,7 +5709,7 @@ def _pr391_float32_target_support(
     """Return raw deterministic target K20 rows for exact softfloat shaping."""
 
     rows = verify_logits.reshape(-1, verify_logits.shape[-1]).astype(mx.float32)
-    if fable_opdiet_enabled():
+    if fable_opdiet_enabled("k20"):
         target_ids, target_values = _opdiet_ordered_top_k_support(
             rows,
             _PR391_FLOAT32_D3_TOP_K,

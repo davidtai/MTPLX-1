@@ -202,6 +202,76 @@ Healthy means: `/v1/models` lists exactly `mtplx-flash-next-optimized-speed`,
 `active_requests == 0`, the chat call returns `READY`, and the flock has no
 owner.
 
+## Op diet: per-item A/B and the microbench
+
+`MTPLX_FABLE_OPDIET=1` arms four independently written, bitwise-exact
+rewrites of the compiled fixed-M4 verify graph. Together they remove ~300
+dispatches/cycle — and together they measured **-2.9% tok/s** on seed
+20260829 (66.46 vs 68.42 control), verify_forward +0.4 s over 1,024 tokens.
+Dispatch count is not GPU time: a rewrite can swap contiguous vectorized
+kernels for broadcast/general ones and lose more than it saves.
+
+`MTPLX_FABLE_OPDIET_ITEMS` selects which rewrites are live, so the regression
+can be attributed to one item instead of the whole flag. Unset means all four.
+
+| item | what it changes |
+| --- | --- |
+| `bank` | QSA fixed pooled-bank conditional write (`_extend_pooled_fixed`) |
+| `rope` | half-width RoPE tables, shared per forward, split-half rotation |
+| `resid` | hyper-connection residual write fused into one kernel |
+| `k20` | eager K20 target/draft support (fused deterministic+ordered pair) |
+
+`MTPLX_FABLE_*` is the diagnostic namespace, so both ride the raw
+passthrough, **not** `--candidate-env`:
+
+```
+    --candidate-extra-env MTPLX_FABLE_OPDIET=1 \
+    --candidate-extra-env MTPLX_FABLE_OPDIET_ITEMS=resid
+```
+
+An unknown item name raises at import rather than being dropped — a typo that
+silently disabled the item under test would make the arm measure the control
+twice.
+
+### micro_opdiet.py
+
+Before spending an ABBA window per item, price the three compiled-graph
+rewrites directly. `micro_opdiet.py` times one verify cycle's worth of each
+(12 QSA layers for `bank`/`rope`, 96 sites for `resid`) at the production
+shapes, stock vs rewrite, **both eager and under `mx.compile`** — the compiled
+lane is the one that matters, because the real verify step is one compiled
+graph and MLX only fuses elementwise chains under compile. It prints per
+variant: median/p10/p90 eval ms, us per layer/site, delta% vs stock, the
+dispatch count of the built graph, and max-abs-diff against stock (every
+shipped rewrite must print 0).
+
+It also times `bank_rowsel`, a third spelling of the bank write that keeps
+the single full-bank pass but leaves it a contiguous copy — the fix if the
+broadcast-select hypothesis holds.
+
+~30 s of GPU. Still a guarded window: it issues Metal work.
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/agent-a228fc55ff545c481 \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/agent-a228fc55ff545c481/scripts/fable/micro_opdiet.py \
+    --out /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-opdiet.json
+```
+
+(`PYTHONPATH` and the script path point at whichever checkout carries the
+branch; the script itself imports no `mtplx`.)
+
+Do **not** read `--donatable-bank` as the production number: it threads one
+bank through all 12 updates so `mx.slice_update` can donate its input, which
+the real graph — where the verifier bank holds every pooled leaf — cannot do.
+It exists only to show how much of the stock spelling's cost is that copy.
+
 ## PYTHONPATH
 
 Always export
