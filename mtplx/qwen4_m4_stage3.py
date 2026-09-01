@@ -10,6 +10,9 @@ import mlx.nn as nn
 
 from .fable_expert_census import census as _census
 from .kernels.qwen4_m4_stage3 import bind
+from .kernels.qwen4_m4_expert_major_glu import (
+    bind as bind_expert_major_routed_glu,
+)
 from .kernels.qwen4_m4_routed_down import (
     bind as bind_routed_down_reduce,
     bind_residual_tail,
@@ -113,6 +116,39 @@ def qwen4_m4_routed_glu_enabled() -> bool:
     return env_bool("MTPLX_QWEN4_M4_ROUTED_GLU", default=False)
 
 
+#: Swap the lane-major paired routed GLU for the expert-major one, which reads
+#: one q4 weight tile per DISTINCT expert instead of one per (row, expert) lane.
+#: Off by default; it is a strict drop-in (same signature, same grid extent,
+#: same output layout) whose bit-exactness with the retained kernel is asserted
+#: per layer at construction, so an arm that is not exact fails loudly rather
+#: than quietly invalidating whatever is being measured under it.
+FABLE_MOE_EXPERT_MAJOR_ENV = "MTPLX_FABLE_MOE_EXPERT_MAJOR"
+
+_MOE_EXPERT_MAJOR_CACHE: bool | None = None
+
+
+def fable_moe_expert_major_enabled() -> bool:
+    """Return the ``MTPLX_FABLE_MOE_EXPERT_MAJOR`` gate; read once, default off.
+
+    Resolved lazily rather than at import so a serving profile that arms env
+    flags after this module is imported is still observed, then cached.
+    """
+
+    global _MOE_EXPERT_MAJOR_CACHE
+    if _MOE_EXPERT_MAJOR_CACHE is None:
+        _MOE_EXPERT_MAJOR_CACHE = env_bool(
+            FABLE_MOE_EXPERT_MAJOR_ENV, default=False
+        )
+    return _MOE_EXPERT_MAJOR_CACHE
+
+
+def reset_fable_moe_expert_major_cache() -> None:
+    """Drop the memoized gate. Test-support only."""
+
+    global _MOE_EXPERT_MAJOR_CACHE
+    _MOE_EXPERT_MAJOR_CACHE = None
+
+
 def qwen4_m4_stage3_flags() -> tuple[bool, bool, bool, bool]:
     """Capture and validate the complete construction-time feature route."""
 
@@ -132,6 +168,7 @@ def qwen4_m4_stage3_flags() -> tuple[bool, bool, bool, bool]:
         routed_down_reduce_enabled=routed_down_reduce_enabled,
         routed_down_residual_tail_enabled=routed_down_residual_tail_enabled,
         routed_glu_enabled=routed_glu_enabled,
+        moe_expert_major_enabled=fable_moe_expert_major_enabled(),
     )
     return (
         stage3_enabled,
@@ -146,6 +183,7 @@ def _validate_feature_combination(
     routed_down_reduce_enabled: bool,
     routed_down_residual_tail_enabled: bool,
     routed_glu_enabled: bool = False,
+    moe_expert_major_enabled: bool = False,
 ) -> None:
     if routed_down_residual_tail_enabled and not routed_down_reduce_enabled:
         raise ValueError(
@@ -153,6 +191,11 @@ def _validate_feature_combination(
         )
     if routed_glu_enabled and not routed_down_residual_tail_enabled:
         raise ValueError("qwen4 M4 routed GLU requires routed residual tail")
+    if moe_expert_major_enabled and not routed_glu_enabled:
+        raise ValueError(
+            f"{FABLE_MOE_EXPERT_MAJOR_ENV} replaces the paired routed GLU and "
+            "requires MTPLX_QWEN4_M4_ROUTED_GLU"
+        )
 
 
 def _text_model(runtime: Any):
@@ -724,6 +767,7 @@ def _installation_report(
     routed_down_reduce_enabled: bool,
     routed_down_residual_tail_enabled: bool,
     routed_glu_enabled: bool = False,
+    moe_expert_major_enabled: bool = False,
 ) -> dict[str, Any]:
     return {
         "installed": True,
@@ -731,7 +775,9 @@ def _installation_report(
         "rows": 4,
         "max_abs_diff": max_delta,
         "boundary": (
-            "paired_routed_q4g32_glu_reduce_shared_add_mlp_residual"
+            "expert_major_routed_q4g32_glu_reduce_shared_add_mlp_residual"
+            if routed_glu_enabled and moe_expert_major_enabled
+            else "paired_routed_q4g32_glu_reduce_shared_add_mlp_residual"
             if routed_glu_enabled
             else "routed_q4g32_reduce_shared_add_mlp_residual"
             if routed_down_residual_tail_enabled
@@ -748,6 +794,10 @@ def _installation_report(
         "routed_down_residual_tail": routed_down_residual_tail_enabled,
         "paired_routed_glu": routed_glu_enabled,
         "paired_routed_glu_layers": layer_count if routed_glu_enabled else 0,
+        "moe_expert_major_glu": moe_expert_major_enabled,
+        "moe_expert_major_glu_layers": (
+            layer_count if moe_expert_major_enabled else 0
+        ),
         "exact_layers": layer_count,
         "combined_residual_tail_layers": (
             layer_count if routed_down_residual_tail_enabled else 0
@@ -798,10 +848,12 @@ def install_qwen4_m4_stage3(
     if len(layers) != 48:
         raise ValueError(f"qwen4 M4 stage3 requires 48 layers, got {len(layers)}")
 
+    expert_major_enabled = fable_moe_expert_major_enabled()
     _validate_feature_combination(
         routed_down_reduce_enabled=routed_down_reduce_enabled,
         routed_down_residual_tail_enabled=routed_down_residual_tail_enabled,
         routed_glu_enabled=routed_glu_enabled,
+        moe_expert_major_enabled=expert_major_enabled,
     )
     validated_plans = _build_install_plans(
         layers,
@@ -818,6 +870,11 @@ def install_qwen4_m4_stage3(
         else None
     )
     routed_glu = bind_routed_glu() if routed_glu_enabled else None
+    # Both are bound when the expert-major arm is on: the retained kernel stays
+    # live purely as the per-layer bit-exactness reference below.
+    expert_major_glu = (
+        bind_expert_major_routed_glu() if expert_major_enabled else None
+    )
     plans = tuple(
         (layer, block, stage3, routed_down_reduce)
         for layer, block, _, _ in validated_plans
@@ -854,6 +911,25 @@ def install_qwen4_m4_stage3(
                     inject,
                 )
             )
+            if expert_major_glu is not None:
+                expert_major_candidate = (
+                    _m4_paired_routed_glu_residual_tail_forward(
+                        block,
+                        sample,
+                        expert_major_glu,
+                        routed_down_reduce,
+                        hyper,
+                        inject,
+                    )
+                )
+                exact = mx.array_equal(candidate, expert_major_candidate)
+                mx.eval(exact)
+                if not bool(exact.item()):
+                    raise ValueError(
+                        f"{FABLE_MOE_EXPERT_MAJOR_ENV} layer {index} is not "
+                        "bit-exact with the retained paired routed GLU"
+                    )
+                candidate = expert_major_candidate
             reference = hyper + (
                 reference[..., None, :] * inject[..., :, None]
             ).reshape(*hyper.shape)
@@ -889,7 +965,7 @@ def install_qwen4_m4_stage3(
         routed_down_reduce_enabled=routed_down_reduce_enabled,
         routed_down_residual_tail_enabled=routed_down_residual_tail_enabled,
         routed_glu_enabled=routed_glu_enabled,
-        routed_glu=routed_glu,
+        routed_glu=expert_major_glu if expert_major_glu is not None else routed_glu,
     )
     report = _installation_report(
         layer_count=len(plans),
@@ -897,6 +973,7 @@ def install_qwen4_m4_stage3(
         routed_down_reduce_enabled=routed_down_reduce_enabled,
         routed_down_residual_tail_enabled=routed_down_residual_tail_enabled,
         routed_glu_enabled=routed_glu_enabled,
+        moe_expert_major_enabled=expert_major_enabled,
     )
     runtime.qwen4_m4_stage3_report = report
     return report
@@ -904,8 +981,10 @@ def install_qwen4_m4_stage3(
 
 __all__ = [
     "FABLE_MOE_SORTED_ENV",
+    "FABLE_MOE_EXPERT_MAJOR_ENV",
     "bind_qwen4_m4_residual_tail",
     "fable_moe_sorted_enabled",
+    "fable_moe_expert_major_enabled",
     "install_qwen4_m4_stage3",
     "qwen4_m4_routed_down_reduce_enabled",
     "qwen4_m4_routed_down_residual_tail_enabled",
@@ -913,4 +992,5 @@ __all__ = [
     "qwen4_m4_stage3_enabled",
     "qwen4_m4_stage3_flags",
     "reset_fable_moe_sorted_cache",
+    "reset_fable_moe_expert_major_cache",
 ]
