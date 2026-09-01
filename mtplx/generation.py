@@ -298,6 +298,27 @@ def _env_falsey(name: str) -> bool:
     }
 
 
+# MTPLX_FABLE_HOST_TRIMS -- read ONCE at import, default OFF.
+#
+# Drops per-cycle event *decoration* that nothing on the fixed-M4 / PR391-D3
+# lane reads back.  What it must never touch, and does not:
+#
+#   * every counter and timer that feeds GenerationStats -- `accepted`,
+#     `rejected`, `drafted`, `accepted_by_depth`, `drafted_by_depth`,
+#     `accept_probability_sum_by_depth`, `verify_calls`,
+#     `target_distribution_materialized_rows/_windows`, `draft_time`,
+#     `verify_*_time` -- all plain locals, never event fields;
+#   * `event["step"]` and the TOP-LEVEL `event["timing_s"]` written by
+#     `_add_timing`, which is what `scripts/fable/abba_driver.py`
+#     `per_cycle_receipt` reads (`step`, `accepted`, `timing_s`);
+#   * `event["rejected_at_depth"]` + `timing_s["repair_forward"]`, the two
+#     fields `_reject_repair_breakdown` turns into
+#     `stats.reject_path_counts` / `stats.repair_time_by_reject_depth`.
+#
+# See the trim sites for what each one skips.
+_FABLE_HOST_TRIMS = _env_truthy("MTPLX_FABLE_HOST_TRIMS")
+
+
 def _family_capture_commit_enabled() -> bool:
     """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
 
@@ -8247,6 +8268,8 @@ def generate_mtpk(
             _validate_target_prefix_sampler_request(sampler)
     counter_start = _runtime_counter_snapshot(rt)
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
+    # Loop-invariant: hoisted out of the per-cycle event dict below.
+    verify_core_event_label = verify_core_backend.replace("_", "-")
     online_hidden_enabled = online_hidden_corrector_alpha > 0.0
     online_hidden_max_feed_depth = (
         max(0, speculative_depth - 1)
@@ -9946,7 +9969,7 @@ def generate_mtpk(
             "gated_stop_depth": None,
             "mtp_history_policy": mtp_history_policy,
             "verify_strategy": verify_strategy,
-            "verify_core": verify_core_backend.replace("_", "-"),
+            "verify_core": verify_core_event_label,
             "draft_core": draft_core,
         }
         if late_depth_switch_after > 0:
@@ -10857,6 +10880,22 @@ def generate_mtpk(
             for depth_index, draft_token in enumerate(core_tokens):
                 drafted += 1
                 drafted_by_depth[depth_index] += 1
+                if _FABLE_HOST_TRIMS:
+                    # HOST TRIM 1 -- per-depth draft decoration.
+                    # Skipped: the nested "timing_s" dict (the whole D3 chain
+                    # is one host sync, so it only ever carried `elapsed_draft`
+                    # on the last depth and 0.0 on the others -- and the
+                    # per-cycle receipt reads the TOP-LEVEL timing_s, never a
+                    # draft's), plus the two constants "mtp_corrector": None
+                    # and "draft_core". `draft_time` still accumulates
+                    # `elapsed_draft` above, so stats.draft_time_s is
+                    # unchanged. The dict itself must stay: the accept
+                    # bookkeeping writes accepted/accept_probability/
+                    # correction into event["drafts"][depth] by index.
+                    event["drafts"].append(
+                        {"depth": depth_index + 1, "token": int(draft_token)}
+                    )
+                    continue
                 event["drafts"].append(
                     {
                         "depth": depth_index + 1,
@@ -11941,14 +11980,24 @@ def generate_mtpk(
             target_distribution_materialized_windows += 1
             verify_target_distribution_time += elapsed_target_distribution_eval
             target_distribution_precomputed = True
-            event["target_distribution_materialized"] = {
-                "mode": "pr391_softfloat64_device_decision_test_only",
-                "exact": True,
-                "p_q_residual": True,
-                "rows": 4,
-                "time_s": float(elapsed_target_distribution_eval),
-                "top_k": _PR391_FLOAT32_D3_TOP_K,
-            }
+            if not _FABLE_HOST_TRIMS:
+                # HOST TRIM 2 -- the whole `target_distribution_materialized`
+                # sub-dict. Its five constants plus one float duplicate state
+                # that already reaches the receipts through
+                # `target_distribution_materialized_rows` (+4 above),
+                # `..._windows` (+1 above) and
+                # `verify_target_distribution_time` -- all incremented outside
+                # this branch. Nothing in generate_mtpk reads the key back;
+                # `scripts/fable/abba_driver.py::per_cycle_receipt` reads only
+                # `step` / `accepted` / `timing_s`.
+                event["target_distribution_materialized"] = {
+                    "mode": "pr391_softfloat64_device_decision_test_only",
+                    "exact": True,
+                    "p_q_residual": True,
+                    "rows": 4,
+                    "time_s": float(elapsed_target_distribution_eval),
+                    "top_k": _PR391_FLOAT32_D3_TOP_K,
+                }
             verify_eval_timings = {
                 "verify_logits_eval_time_s": elapsed_target_distribution_eval,
                 "verify_hidden_eval_time_s": 0.0,

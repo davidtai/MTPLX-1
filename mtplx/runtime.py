@@ -10,9 +10,11 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from .artifacts import (
@@ -33,6 +35,74 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+
+
+# ---------------------------------------------------------------------------
+# Memoized `inspect.signature(...).parameters`
+#
+# The MTP fan-out calls `signature()` on the *same* bound methods on every
+# decode cycle (`draft_mtp` 3x, `update_mtp_cache` 3x on the fixed-M4 lane).
+# Each call walks the callable's `__wrapped__` chain and builds a fresh
+# `Signature` object -- pure host time, identical answer every cycle.
+#
+# The cache is keyed on the callable's *underlying* function object (bound
+# methods are rebuilt on every attribute access, so the bound object itself is
+# useless as a key) and is weak, so a discarded model frees its entries.  Bound
+# and plain callables get separate tables: `signature()` drops `self` for a
+# bound method, so the two views of one function do NOT share an answer.
+# Callables that cannot be weak-referenced fall back to an id-keyed table that
+# also retains a strong reference, which is what keeps the id from being reused
+# by a later object.
+# ---------------------------------------------------------------------------
+_EMPTY_PARAMETERS: Mapping[str, Any] = MappingProxyType({})
+_BOUND_SIGNATURE_PARAMETERS: "weakref.WeakKeyDictionary[Any, Mapping[str, Any]]" = (
+    weakref.WeakKeyDictionary()
+)
+_PLAIN_SIGNATURE_PARAMETERS: "weakref.WeakKeyDictionary[Any, Mapping[str, Any]]" = (
+    weakref.WeakKeyDictionary()
+)
+_SIGNATURE_PARAMETERS_FALLBACK: dict[int, tuple[Any, Mapping[str, Any]]] = {}
+_SIGNATURE_PARAMETERS_FALLBACK_LIMIT = 512
+
+
+def _signature_parameters(func: Any) -> Mapping[str, Any]:
+    """`inspect.signature(func).parameters`, memoized per callable identity.
+
+    Behaviour-identical to the inline `try: signature(func).parameters /
+    except: {}` it replaces: same value, same `{}` on failure (returned as an
+    immutable empty mapping so a caller can never poison the cache).
+    """
+
+    key = getattr(func, "__func__", None)
+    if key is None:
+        key, table = func, _PLAIN_SIGNATURE_PARAMETERS
+    else:
+        table = _BOUND_SIGNATURE_PARAMETERS
+    try:
+        cached = table.get(key)
+    except TypeError:  # unhashable or not weak-referenceable
+        table = None
+        cached = None
+        slot = _SIGNATURE_PARAMETERS_FALLBACK.get(id(key))
+        if slot is not None:
+            cached = slot[1]
+    if cached is not None:
+        return cached
+    try:
+        params: Mapping[str, Any] = py_inspect.signature(func).parameters
+    except Exception:
+        params = _EMPTY_PARAMETERS
+    if table is not None:
+        try:
+            table[key] = params
+        except TypeError:
+            table = None
+    if table is None:
+        if len(_SIGNATURE_PARAMETERS_FALLBACK) >= _SIGNATURE_PARAMETERS_FALLBACK_LIMIT:
+            _SIGNATURE_PARAMETERS_FALLBACK.clear()
+        # The retained strong reference is what makes the id key safe.
+        _SIGNATURE_PARAMETERS_FALLBACK[id(key)] = (key, params)
+    return params
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -128,10 +198,7 @@ class MTPLXRuntime:
             self._forward_ar_supports_emit_logits is None
             or self._forward_ar_supports_logits_keep is None
         ):
-            try:
-                params = py_inspect.signature(self.model.__call__).parameters
-            except Exception:
-                params = {}
+            params = _signature_parameters(self.model.__call__)
             accepts_kwargs = any(
                 param.kind == py_inspect.Parameter.VAR_KEYWORD
                 for param in params.values()
@@ -355,10 +422,7 @@ class MTPLXRuntime:
                 "mtp_hidden_variant": resolved_hidden_variant,
                 "position_offset": position_offset,
             }
-            try:
-                params = py_inspect.signature(self.model.mtp_forward).parameters
-            except Exception:
-                params = {}
+            params = _signature_parameters(self.model.mtp_forward)
             if "mtp_depth" in params:
                 kwargs["mtp_depth"] = mtp_depth
             return self.model.mtp_forward(hidden_states, next_token_ids, **kwargs)
@@ -386,10 +450,7 @@ class MTPLXRuntime:
         )
         update = getattr(self.model, "mtp_update_cache", None)
         if update is not None:
-            try:
-                params = py_inspect.signature(update).parameters
-            except Exception:
-                params = {}
+            params = _signature_parameters(update)
             accepts_kwargs = any(
                 param.kind == py_inspect.Parameter.VAR_KEYWORD
                 for param in params.values()

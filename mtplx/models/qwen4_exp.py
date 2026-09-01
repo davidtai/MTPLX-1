@@ -3384,6 +3384,25 @@ class NGramTable(nn.Module):
         return self.weight[ids]
 
 
+def _stack_hot_rows(rows, j):
+    """``np.stack([row[j] for row in rows])`` without ``np.stack``'s per-row
+    ``expand_dims`` + concatenate.
+
+    Bit-identical: every hot row for one map has that map's dtype and row
+    shape, so the pre-allocated buffer carries exactly the dtype and shape
+    ``np.stack`` would have produced, and the copies are the same bytes.
+    Pure host-time: at M=4 this runs on 64 PLE rows every decode cycle.
+    """
+
+    import numpy as np
+
+    first = rows[0][j]
+    out = np.empty((len(rows), *first.shape), dtype=first.dtype)
+    for i, row in enumerate(rows):
+        out[i] = row[j]
+    return out
+
+
 class _SidecarGather:
     """Row gather over the SSD-resident table.
 
@@ -3499,7 +3518,12 @@ class _SidecarGather:
                 for name in names
             }
         hot = self._hot
-        miss = [int(r) for r in uniq if int(r) not in hot]
+        # `uniq.tolist()` once, then plain-int bookkeeping: iterating the
+        # ndarray yields np.int64 scalars and pays a per-element Python object
+        # construction twice over (`int(r)` in both loops).  Same keys, same
+        # LRU order, same eviction — decode-path host time only.
+        uniq_ids = [int(r) for r in uniq.tolist()]
+        miss = [r for r in uniq_ids if r not in hot]
         if miss:
             miss_np = np.asarray(miss, dtype=np.int64)
             if self._pool is not None:
@@ -3513,14 +3537,14 @@ class _SidecarGather:
         self.hot_hits += len(uniq) - len(miss)
         self.hot_misses += len(miss)
         rows = []
-        for r in uniq:
-            key = int(r)
+        move_to_end = hot.move_to_end
+        for key in uniq_ids:
             rows.append(hot[key])
-            hot.move_to_end(key)
+            move_to_end(key)
         while len(hot) > self._hot_cap_rows:
             hot.popitem(last=False)
         return {
-            name: np.stack([row[j] for row in rows])[inverse]
+            name: _stack_hot_rows(rows, j)[inverse]
             for j, name in enumerate(names)
         }
 
@@ -3605,23 +3629,30 @@ def _ngram_rows_np(
 
     hist = np.concatenate([prev_np, ids_np], axis=1)
 
-    def shift(h, s):
+    # `pos` / `pos_in_seg` (the EOS segment-start scan) do NOT depend on the
+    # shift amount, so the original per-`s` recomputation was a pure common
+    # subexpression — hoisting it changes no value, only how many tiny NumPy
+    # calls the decode cycle issues (ngram_size-1 fewer segment scans).
+    b, ln = hist.shape
+    pos = np.arange(ln, dtype=np.int64)[None, :]
+    eos_pos = np.where(hist == eos, pos, np.int64(-1))
+    prev_incl = np.maximum.accumulate(eos_pos, axis=1)
+    prev = np.concatenate(
+        [np.full((b, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1
+    )
+    pos_in_seg = pos - (prev + 1)
+
+    def shift(s):
+        # Closes over `hist`'s own scan, so it is only valid for `hist` -- the
+        # one array the original was ever called with.
         if s == 0:
-            return h
-        b, ln = h.shape
-        pos = np.arange(ln, dtype=np.int64)[None, :]
-        eos_pos = np.where(h == eos, pos, np.int64(-1))
-        prev_incl = np.maximum.accumulate(eos_pos, axis=1)
-        prev = np.concatenate(
-            [np.full((b, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1
-        )
-        pos_in_seg = pos - (prev + 1)
+            return hist
         src = np.maximum(pos - s, 0)
-        shifted = np.take_along_axis(h, src, axis=1)
+        shifted = np.take_along_axis(hist, src, axis=1)
         valid = (pos_in_seg >= s) & (pos - s >= 0)
         return np.where(valid, shifted, np.int64(eos))
 
-    shifted = [shift(hist, s) for s in range(ngram_size)]
+    shifted = [shift(s) for s in range(ngram_size)]
     blocks = []
     for ngram in range(2, ngram_size + 1):
         start = (ngram - 2) * heads_per_ngram
