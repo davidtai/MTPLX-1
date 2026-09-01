@@ -44,3 +44,6 @@ benchmark_outputs/
 .hf-home/
 .claude/
 .devspace/
+
+# Benchmark receipts (fable ABBA harness and friends)
+/.benchmark-artifacts/
