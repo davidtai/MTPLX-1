@@ -63,6 +63,13 @@ recurrence, replay, and state-handoff kernels. The Qwen3.8 MTP head is a QSA
 layer, so the draft D1-D3 chain supplies no hidden GDN consumer either. This is
 therefore a separate prefill optimization, not missing decode work.
 
+## Post-survey exact-M4 closures
+
+| boundary | measured ceiling or gain | disposition |
+| --- | ---: | --- |
+| Shared-expert scalar gate packed into shared gate/up q8 projection | one deleted q8 dispatch per layer; 18,336 occurrences in the saved trace | Exact, but 64.8881 tok/s versus 65.0383 same-commit control. The odd 1,281-row projection and strided tail lost 36.46 ms; parked on `experiments/pr391-m4-shared-gate-pack`. |
+| Per-dispatch Metal timestamps inside existing command buffers | diagnostic only | Accurate timestamp samples require dispatch barriers and alter the scheduling under investigation. Barrier-free samples are non-repeatable. The stock Metal System Trace exported command-buffer intervals but no shader rows, so it cannot subdivide the saved 1.887-second MoE family. |
+
 ## Net assessment
 
 The recent upstream work supplies correctness oracles and long-context/prefill
