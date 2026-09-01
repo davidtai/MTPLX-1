@@ -33,6 +33,15 @@ def _cpu_residual_tail(block_out, hyper, inject):
     return _bf16(hyper + products).reshape(hyper.shape[0], -1)
 
 
+def _cpu_combined_tail(reduced_routed, shared_down, shared_factor, hyper, inject):
+    reduced_routed = _bf16(reduced_routed)
+    shared_down = _bf16(shared_down)
+    shared_factor = _bf16(shared_factor)
+    gated_shared = _bf16(shared_factor[:, None] * shared_down)
+    block_out = _bf16(reduced_routed + gated_shared)
+    return _cpu_residual_tail(block_out, hyper, inject)
+
+
 def _valid_layer():
     return SimpleNamespace(
         mlp=object(),
@@ -221,3 +230,164 @@ def test_residual_tail_construction_admission_returns_prebound_callable(
 
     assert stage3_module.bind_qwen4_m4_residual_tail(layer, index=7) is candidate
     assert seen == [(layer.mlp, 7)]
+
+
+def test_routed_residual_tail_source_preserves_every_bf16_boundary() -> None:
+    from mtplx.kernels.qwen4_m4_routed_down import residual_tail_source, source
+
+    routed = source()
+    tail = residual_tail_source()
+
+    assert "shared_down" not in routed
+    assert "shared_factor" not in routed
+    assert "hyper" not in routed
+    assert "inject" not in routed
+    assert "bfloat gated_shared = bfloat(" in tail
+    assert "float(shared_factor[row]) * float(shared_down[index])" in tail
+    assert "bfloat block_out = bfloat(" in tail
+    assert "float(routed_down[index]) + float(gated_shared)" in tail
+    assert "bfloat product = bfloat(" in tail
+    assert "float(block_out) * float(inject_value)" in tail
+    assert "output[hidden_index] = bfloat(" in tail
+    assert "float(hyper[hidden_index]) + float(product)" in tail
+    assert tail.index("bfloat gated_shared") < tail.index("bfloat block_out")
+    assert tail.index("bfloat block_out") < tail.index("bfloat product")
+    assert tail.index("bfloat product") < tail.index("output[hidden_index]")
+
+
+def test_cpu_combined_tail_oracle_detects_omitted_bf16_narrowing() -> None:
+    routed = np.array([[3.2917359]], dtype=np.float32)
+    shared = np.array([[9.159982]], dtype=np.float32)
+    factor = np.array([-29.321726], dtype=np.float32)
+    inject = np.array([[-3.3585732, 0.5, -1.0, 2.0]], dtype=np.float32)
+    hyper = np.array(
+        [[[14.509214], [0.0], [0.0], [0.0]]],
+        dtype=np.float32,
+    )
+
+    exact = _cpu_combined_tail(routed, shared, factor, hyper, inject)
+    gated_shared = _bf16(_bf16(factor)[:, None] * _bf16(shared))
+    without_block_narrowing = _bf16(
+        _bf16(hyper)
+        + _bf16(
+            (_bf16(routed) + gated_shared)[:, None, :]
+            * _bf16(inject)[:, :, None]
+        )
+    ).reshape(1, -1)
+    reassociated = _bf16(
+        hyper
+        + (
+            routed[:, None, :]
+            + shared[:, None, :] * factor[:, None, None]
+        )
+        * inject[:, :, None]
+    ).reshape(1, -1)
+
+    assert exact[0, 0] == np.float32(908.0)
+    assert without_block_narrowing[0, 0] == np.float32(912.0)
+    assert not np.array_equal(exact, without_block_narrowing)
+    assert not np.array_equal(exact, reassociated)
+
+
+def test_routed_residual_binding_uses_exactly_two_dispatches(monkeypatch) -> None:
+    from mtplx.kernels import qwen4_m4_routed_down as kernel_module
+
+    definitions = []
+    launches = []
+    outputs = []
+
+    def fake_metal_kernel(**kwargs):
+        definitions.append(kwargs)
+
+        def run(**launch):
+            launches.append(launch)
+            output = _ArraySpec(
+                launch["output_shapes"][0],
+                launch["output_dtypes"][0],
+            )
+            outputs.append(output)
+            return (output,)
+
+        return run
+
+    monkeypatch.setattr(kernel_module, "_ROUTED_KERNEL", None)
+    monkeypatch.setattr(kernel_module, "_RESIDUAL_TAIL_KERNEL", None, raising=False)
+    monkeypatch.setattr(kernel_module.mx.fast, "metal_kernel", fake_metal_kernel)
+    combined = kernel_module.bind_residual_tail()
+    routed_inputs = tuple(object() for _ in range(6))
+    shared_down = object()
+    shared_factor = object()
+    hyper = _ArraySpec((1, 4, 4 * 2560), mx.bfloat16)
+    inject = _ArraySpec((1, 4, 4), mx.bfloat16)
+
+    output = combined(
+        *routed_inputs,
+        shared_down,
+        shared_factor,
+        hyper,
+        inject,
+    )
+
+    assert len(definitions) == 2
+    assert definitions[0]["input_names"] == [
+        "routed_h",
+        "weights",
+        "scales",
+        "biases",
+        "expert_ids",
+        "route_scores",
+    ]
+    assert definitions[1]["input_names"] == [
+        "routed_down",
+        "shared_down",
+        "shared_factor",
+        "hyper",
+        "inject",
+    ]
+    assert len(launches) == 2
+    assert launches[1]["inputs"] == [
+        outputs[0],
+        shared_down,
+        shared_factor,
+        hyper,
+        inject,
+    ]
+    assert output.shape == hyper.shape
+    assert output.dtype == mx.bfloat16
+
+
+def test_routed_residual_route_is_physical_m4_only(monkeypatch) -> None:
+    from mtplx import qwen4_m4_stage3 as stage3_module
+
+    candidate = object()
+    stock = object()
+    layer = stage3_module._M4RoutedDownResidualTailDecoderLayer.__new__(
+        stage3_module._M4RoutedDownResidualTailDecoderLayer
+    )
+    monkeypatch.setattr(
+        stage3_module,
+        "_m4_routed_down_residual_tail_layer_forward",
+        lambda *_args, **_kwargs: candidate,
+    )
+    monkeypatch.setattr(
+        stage3_module.DecoderLayer,
+        "__call__",
+        lambda *_args, **_kwargs: stock,
+    )
+
+    assert layer(
+        SimpleNamespace(size=4 * 4 * 2560, shape=(1, 4, 4 * 2560)),
+        input_ids=object(),
+        ssm_mask=object(),
+        cache=object(),
+    ) is candidate
+    for rows in (1, 2, 3):
+        assert layer(
+            SimpleNamespace(
+                size=rows * 4 * 2560,
+                shape=(1, rows, 4 * 2560),
+            ),
+            input_ids=object(),
+            ssm_mask=object(),
+            cache=object(),
+        ) is stock
