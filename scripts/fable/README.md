@@ -321,6 +321,40 @@ verbatim; it travels to the arms in `MTPLX_DSV4_GUARD_WINDOW_PATH` and
 `abba_driver.py` also accepts `--guard-mode attestation` if you ever want to
 run a single arm as the guard's direct child.
 
+## Microbenchmarks
+
+`micro_dispatch_overhead.py`, `micro_moe_dedup.py`, `micro_expert_major.py` and
+`micro_hc_read.py` price one site at the fixed-M4 verifier's shapes without
+loading the model. They import MLX and therefore need the SAME guarded window
+as an ABBA arm; none of them touch `com.tea.qwen`, so they can share a window.
+
+`micro_hc_read.py` prices the gated-residual read (`GatedResidual.__call__`,
+97 reads/cycle, 11 dispatches and 13.21 MB of bf16 mix weights each). Variant
+`a` is the eager chain the compiled verifier runs today, `b` is
+`kernels/qwen4_m4_hyper_read.py` (`MTPLX_FABLE_HC_M4`), `c` is the existing
+`(1024, S, 1)` `fused_hyper_read` for reference. `bn`/`bd` are stage prefixes
+of `b`, so the printed down/up GB/s are differences of measured cycles.
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 1800 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/micro_hc_read.py \
+    --rows 4 --calls 97 --reps 20 \
+    --sweep 4:256:8,4:512:8,6:256:8,12:256:8,4:256:16 \
+    --out /tmp/micro-hc-read.json
+```
+
+Adoption bar: `b` at least 40% under `a` in ms/cycle, `down_gbps` >= 500, and
+the numerics block a rounding-only class (the kernel docstring names the three
+sources and why bit-equality is not reachable). Then confirm on the verifier
+with an ABBA arm carrying `--candidate-env MTPLX_FABLE_HC_M4=1`; the gate is
+acceptance parity, not a digest.
+
 ## Tests
 
 ```

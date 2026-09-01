@@ -59,7 +59,7 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
-from mtplx.runtime_options import fable_opdiet_enabled
+from mtplx.runtime_options import fable_hc_m4_enabled, fable_opdiet_enabled
 
 
 @dataclass
@@ -855,6 +855,72 @@ class GatedResidual(nn.Module):
         self.input_mix_weight_up = nn.Linear(args.hc_lowrank, hc_hidden, bias=False)
         if use_combine:
             self.block_inject_weight = nn.Linear(hc_hidden, self.hc_count, bias=False)
+        # Construction-time half of the MTPLX_FABLE_HC_M4 eligibility check:
+        # the config-level geometry the kernel hardcodes is knowable now, so a
+        # mis-armed flag fails at model build rather than mid-forward. The
+        # weight-level half (dtype, quantization, shapes) needs loaded weights
+        # and runs on the first verify-width read.
+        if fable_hc_m4_enabled() and (
+            self.hc_count != 4 or self.hidden_size != 2560
+        ):
+            raise RuntimeError(
+                "MTPLX_FABLE_HC_M4 is armed but this GatedResidual is not the "
+                f"Flash-Next family shape: hc_count={self.hc_count} (want 4), "
+                f"hidden_size={self.hidden_size} (want 2560). Unset the flag "
+                "for this model; the kernel has no other geometry."
+            )
+
+    def _hc_m4_applies(self, hyper_input: mx.array) -> bool:
+        """Verify-width fused read gate (MTPLX_FABLE_HC_M4).
+
+        Rows 2..8 only -- rows == 1 keeps whatever the draft path already
+        uses (v3, or the eager chain). Returns True or RAISES: there is no
+        silent fallback once the flag is armed and the width matches.
+        """
+
+        if not fable_hc_m4_enabled():
+            return False
+        from mtplx.kernels import qwen4_m4_hyper_read as hcm4
+
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        if rows < hcm4.MIN_ROWS or rows > hcm4.MAX_ROWS:
+            return False
+        down = self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        for name, proj in (("input_mix_weight_down", down), ("input_mix_weight_up", up)):
+            if hasattr(proj, "scales"):
+                raise RuntimeError(
+                    f"MTPLX_FABLE_HC_M4: {name} is quantized; the kernel reads "
+                    "unquantized bf16 mix weights. Unset the flag for this pack."
+                )
+        wi = self.block_inject_weight.weight if "block_inject_weight" in self else None
+        # Raises with the offending shape/dtype named. Takes the unreshaped
+        # hyper state so validation adds no node to the traced graph.
+        hcm4.check_shapes(
+            hyper_input, self.hc_norm.weight, down.weight, up.weight, wi
+        )
+        return True
+
+    def _hc_m4_read(self, hyper_input: mx.array):
+        from mtplx.kernels.qwen4_m4_hyper_read import fused_hc_read_m4
+
+        combine = "block_inject_weight" in self
+        x2 = hyper_input.reshape(-1, self.hc_count * self.hidden_size)
+        mixed, inject = fused_hc_read_m4(
+            x2,
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.block_inject_weight.weight if combine else None,
+            eps=float(self.hc_norm.eps),
+        )
+        mixed = mixed.reshape(*hyper_input.shape[:-1], self.hidden_size)
+        if not combine:
+            return mixed
+        inject = inject.reshape(*hyper_input.shape[:-1], self.hc_count)
+        return mixed, hyper_input, inject
 
     def _fused_read_applies(self, hyper_input: mx.array) -> bool:
         # The fused kernel hardcodes the family geometry and reads bf16
@@ -904,6 +970,12 @@ class GatedResidual(nn.Module):
         return True
 
     def __call__(self, hyper_input: mx.array):
+        # Verify-width (2..8 rows) fused read first: it is the only one of the
+        # three fused paths laid out as a multi-threadgroup GEMV, and it is
+        # gated to widths the others handle badly (the (1024, S, 1) v1 kernel
+        # re-reads every weight once per row and runs 4 threadgroups at S=4).
+        if self._hc_m4_applies(hyper_input):
+            return self._hc_m4_read(hyper_input)
         if self._v3_read_applies(hyper_input):
             from mtplx.kernels.hyper_connection_v3 import fused_hyper_read_v3
 
