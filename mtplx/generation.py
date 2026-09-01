@@ -57,6 +57,7 @@ from .fast_sampling import (
     MAX_DEVICE_TOP_K_ORDER,
     BatchedSparseDistributions,
     _deterministic_mlx_top_k_support,
+    _opdiet_ordered_top_k_support,
     _order_bounded_mlx_top_k_support,
     apply_penalties_mlx,
     batched_sparse_distributions_from_mlx_logits,
@@ -100,7 +101,11 @@ from .sampling import (
     sample_from_distribution,
 )
 from .session_bank import _boundary_true_restore_enabled
-from .runtime_options import block_prefix_restore_enabled, env_bool
+from .runtime_options import (
+    block_prefix_restore_enabled,
+    env_bool,
+    fable_opdiet_enabled,
+)
 
 Mode = Literal["ar", "mtp1", "mtpk", "mtpa"]
 VerifyStrategy = Literal[
@@ -5574,14 +5579,20 @@ def _pr391_make_float32_d3_core(
             )
             row = logits[:, -1, :].reshape(-1)
             flat = row.astype(mx.float32)
-            local_ids, q_values = _deterministic_mlx_top_k_support(
-                flat,
-                _PR391_FLOAT32_D3_TOP_K,
-            )
-            local_ids, q_values = _order_bounded_mlx_top_k_support(
-                local_ids,
-                q_values,
-            )
+            if fable_opdiet_enabled():
+                local_ids, q_values = _opdiet_ordered_top_k_support(
+                    flat,
+                    _PR391_FLOAT32_D3_TOP_K,
+                )
+            else:
+                local_ids, q_values = _deterministic_mlx_top_k_support(
+                    flat,
+                    _PR391_FLOAT32_D3_TOP_K,
+                )
+                local_ids, q_values = _order_bounded_mlx_top_k_support(
+                    local_ids,
+                    q_values,
+                )
             q_probs = mx.exp(q_values - mx.logsumexp(flat, axis=-1, keepdims=True))
             if frspec_ids is not None and int(row.shape[0]) == int(frspec_ids.shape[0]):
                 real_ids = mx.take(frspec_ids, local_ids)
@@ -5698,14 +5709,20 @@ def _pr391_float32_target_support(
     """Return raw deterministic target K20 rows for exact softfloat shaping."""
 
     rows = verify_logits.reshape(-1, verify_logits.shape[-1]).astype(mx.float32)
-    target_ids, target_values = _deterministic_mlx_top_k_support(
-        rows,
-        _PR391_FLOAT32_D3_TOP_K,
-    )
-    target_ids, target_values = _order_bounded_mlx_top_k_support(
-        target_ids,
-        target_values,
-    )
+    if fable_opdiet_enabled():
+        target_ids, target_values = _opdiet_ordered_top_k_support(
+            rows,
+            _PR391_FLOAT32_D3_TOP_K,
+        )
+    else:
+        target_ids, target_values = _deterministic_mlx_top_k_support(
+            rows,
+            _PR391_FLOAT32_D3_TOP_K,
+        )
+        target_ids, target_values = _order_bounded_mlx_top_k_support(
+            target_ids,
+            target_values,
+        )
     target_probs = mx.exp(
         target_values - mx.logsumexp(rows, axis=-1, keepdims=True)
     )
