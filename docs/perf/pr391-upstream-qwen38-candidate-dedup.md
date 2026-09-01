@@ -68,6 +68,7 @@ therefore a separate prefill optimization, not missing decode work.
 | boundary | measured ceiling or gain | disposition |
 | --- | ---: | --- |
 | Shared-expert scalar gate packed into shared gate/up q8 projection | one deleted q8 dispatch per layer; 18,336 occurrences in the saved trace | Exact, but 64.8881 tok/s versus 65.0383 same-commit control. The odd 1,281-row projection and strided tail lost 36.46 ms; parked on `experiments/pr391-m4-shared-gate-pack`. |
+| Raw shared-gate BF16 sigmoid folded into the existing M4 combine tail | one tiny dispatch and four-element materialization removed per layer/cycle | Exact after replacing the naive per-output sigmoid with one MLX-equivalent BF16 sigmoid per threadgroup. It measured 65.2159 tok/s versus 65.0469 same-commit control, only a 40.82 ms/0.26% lead. Parked on `experiments/pr391-m4-shared-gate-sigmoid-tail`; do not spend more seeds or reduce the combine to four row-owned groups merely to reshuffle occupancy. |
 | Per-dispatch Metal timestamps inside existing command buffers | diagnostic only | Accurate timestamp samples require dispatch barriers and alter the scheduling under investigation. Barrier-free samples are non-repeatable. The stock Metal System Trace exported command-buffer intervals but no shader rows, so it cannot subdivide the saved 1.887-second MoE family. |
 
 ## Net assessment
