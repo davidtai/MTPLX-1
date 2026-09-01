@@ -8,6 +8,7 @@ prompt, 1,024 output tokens, temperature 1 / top-p 0.95 / top-k 20, reasoning
 | --- | --- |
 | `abba_driver.py` | One arm. Loads the model once, runs the requested seeds, writes a receipt JSON. |
 | `abba_window.py` | The bracket. Runs as the guard's direct child and spawns one `abba_driver.py` per arm. |
+| `humaneval_screen.py` | The quality gate. One guarded window = one server on :8091 + full HumanEval pass@1 + a receipt. |
 
 Ported from the reviewed PR391 driver `/private/tmp/pr391_fixed_d3_abba.py`
 (SHA-256 `0ae20c7c4028cea83d9b9084d29067925d6dca08ff0ca2ce5a4ea9d73b9bb7d0`).
@@ -365,7 +366,114 @@ Adoption bar: `b` at least 40% under `a` in ms/cycle, `down_gbps` >= 500, and
 the numerics block a rounding-only class (the kernel docstring names the three
 sources and why bit-equality is not reachable). Then confirm on the verifier
 with an ABBA arm carrying `--candidate-env MTPLX_FABLE_HC_M4=1`; the gate is
-acceptance parity, not a digest.
+acceptance parity, not a digest. Quality is a separate window: see the
+HumanEval quality screen below.
+
+## HumanEval quality screen (non-bit-exact kernels)
+
+`humaneval_screen.py` is the quality half of the harness. ABBA measures speed;
+a candidate whose numerics are a rounding class away from the eager chain
+(`MTPLX_FABLE_HC_M4=1` is the first — see the NUMERICS section of
+`mtplx/kernels/qwen4_m4_hyper_read.py`) cannot be gated on an output digest,
+so the gate is David's rule instead: the **full HumanEval, 164 problems**,
+pass@1 looking decent and within noise of the control. `--n 20` is a smoke,
+never a verdict.
+
+One guarded window per arm. The child starts ONE MTPLX server on **:8091**
+from this worktree's venv (never :8080 — the guard has that one stopped and
+restores it on exit), waits for `/health` + background warmup + a READY chat,
+generates greedily, stops the server, and only then scores on CPU.
+
+Control (no `--env`):
+
+```
+/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 --timeout-seconds 900 --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/humaneval_screen.py \
+    --label control --n 164 --port 8091
+```
+
+Candidate (`MTPLX_FABLE_HC_M4=1`):
+
+```
+/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 --timeout-seconds 900 --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/humaneval_screen.py \
+    --label hc-m4 --n 164 --port 8091 --env MTPLX_FABLE_HC_M4=1
+```
+
+`--dry-run` prints both the outer command and the server argv without touching
+the GPU. Run the two arms as two windows and compare the receipts; the two
+`--env` sets are the ONLY difference between them (there is a test for that).
+
+Expected runtime, per arm: model load + warmup ~5-10 min, 164 greedy
+completions at ~70 tok/s ~10-20 min, CPU scoring ~1 min. Budget 25-45 min and
+keep `--child-timeout-seconds 5400`. `--n 20` is roughly 8-12 min, almost all
+of it model load.
+
+### Sampler
+
+Greedy, `temperature 0`, `n=1` — the pass@1 standard, and this lane accepts it.
+The only temperature-1 requirement in the tree is the PR391 float32 D3 core
+(`generation.py:_pr391_make_float32_d3_core`), which is opt-in through
+`abba_driver.py --d3-softfloat64-route` and is not reachable from the server.
+The server's own MTP path handles `temperature <= 0` throughout and even
+couples the draft sampler to greedy (`_couple_draft_sampler_to_greedy_target`),
+and the fixed-M4 verifier still runs its 4-row verify, so the kernel under test
+is exercised either way. Reasoning is off (`--reasoning-mode off`, plus
+`enable_thinking: false` on every request, asserted against
+`/v1/mtplx/settings` before the first problem) so 164 problems do not each burn
+a thousand thinking tokens.
+
+### Environment
+
+The lane is `CONTROL_FAMILY_ENV` in the script: the ABBA control arm's family
+overrides, stated in full. Most of them the server family-defaults itself
+(`_server_runtime_env_overrides`); the four it does not — `COMPILED_MTP_PREPARE`,
+the frspec pair, and the three routed-down/GLU keys — come from
+`abba_window.CONTROL_FLAGS` / `CONTROL_CANDIDATE_ENV`. The server env starts by
+**stripping every inherited `MTPLX_*`**, so a leftover export from a previous
+arm cannot move the control's lane.
+
+`MTPLX_NAX_VERIFY` is deliberately never exported. Turbo sets it to `1` and it
+is not operator-overridable, so an exported `0` gets stomped back to `1`;
+leaving it unset is what lets the server's own override (applied after the
+profile) set it to `0`, which is what production serves.
+`test_turbo_profile_cannot_stomp_the_family_env` runs the real
+`apply_profile_env` to keep that true.
+
+### Scoring
+
+`evalplus.evaluate` 0.3.1 from `/Users/davidtai/projects/evalplus/.venv`,
+dataset hash `fe585eb4df8c88d844eeb463ea4d0302`, ground truth already cached in
+`~/Library/Caches/evalplus`. It runs after the server is stopped, so no model
+is resident. It insists on a samples file covering all 164 problems, so a
+`--n 20` run pads the rest with an empty solution into `samples_scored.jsonl`;
+padding rows are never counted.
+
+HumanEval+ pass@1 is `base_status == plus_status == pass`, not `plus_status`
+alone — the plus tests are the extra inputs only. Feeding the retained
+2026-08-24 native-MTP samples through this path reproduces that receipt exactly:
+151/164 base (0.9207) and 148/164 plus (0.9024).
+
+Receipts land in `.benchmark-artifacts/fable/evals/<label>.json` with the flag
+sets, the model revision from `mtplx_runtime.json` / `.mtplx-source.json`, the
+sampler, pass@1, the per-problem pass list, timings and a server log tail;
+samples and per-request receipts sit in `evals/<label>/`.
+
+### Caveat on `--n 20`
+
+On this model the first 20 HumanEval problems all pass, so the smoke has no
+discriminating power at the top of the range — it proves the pipe works, not
+that the kernel is safe. Only the 164 run is a verdict.
 
 ## Tests
 
