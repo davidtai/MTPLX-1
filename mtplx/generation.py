@@ -5306,6 +5306,18 @@ _PR391_FLOAT32_D3_TOP_K = 20
 _PR391_FLOAT32_D3_TOP_P = 0.95
 _PR391_FLOAT32_D3_MAX_OUTPUT_TOKENS = 16_384
 _pr391_float32_d3_request_route: Any | None = None
+_pr391_compact_commit: bool | None = None
+
+
+def _pr391_compact_commit_enabled() -> bool:
+    """Read ``MTPLX_FABLE_COMPACT_COMMIT`` once and cache it per process."""
+
+    global _pr391_compact_commit
+    if _pr391_compact_commit is None:
+        from .qwen4_fixed_verify import fable_compact_commit_enabled
+
+        _pr391_compact_commit = fable_compact_commit_enabled()
+    return _pr391_compact_commit
 
 
 def _pr391_install_float32_d3_request_route(route: Any) -> None:
@@ -5413,6 +5425,13 @@ def _pr391_require_fixed_m4_async_enqueue(compiled_verify_bank: Any) -> None:
     if not callable(dispatch.get("device_commit")):
         raise RuntimeError(
             "PR391 float32 D3 requires a construction-bound device state commit"
+        )
+    if _pr391_compact_commit_enabled() and not callable(
+        dispatch.get("device_commit_width")
+    ):
+        raise RuntimeError(
+            "PR391 compact commit requires a construction-bound width-selected "
+            "state commit"
         )
     if not callable(dispatch.get("prefetch_aux")):
         raise RuntimeError(
@@ -5721,7 +5740,7 @@ def _pr391_decode_float32_verifier_decision(
     )
 
 
-def _pr391_queue_verifier_mtp_replay(
+def _pr391_stage_verifier_mtp_replay(
     *,
     rt: MTPLXRuntime,
     core: dict[str, Any],
@@ -5729,8 +5748,15 @@ def _pr391_queue_verifier_mtp_replay(
     verify_hidden: mx.array,
     draft_token_ids: mx.array,
     mtp_hidden_variant: str,
-) -> None:
-    """Run the host-selected exact-width MTP replay parity reference."""
+) -> tuple[Any, ...]:
+    """Trim the two speculative rows and append exactly the accepted width.
+
+    One MTP-module append instead of the device replay's three candidates.
+    The returned leaves are left unrooted so the caller keeps the cycle's
+    existing ``async_eval`` boundaries: the lookahead D3 queue (or the
+    no-lookahead ``async_eval`` on the same leaves) schedules this append
+    along with everything built on top of it.
+    """
 
     from .pr391_mtp_handoff import stage_pr391_mtp_authoritative_replay
 
@@ -5745,7 +5771,7 @@ def _pr391_queue_verifier_mtp_replay(
         )
 
     with attention_phase("ar_decode"):
-        state = stage_pr391_mtp_authoritative_replay(
+        return stage_pr391_mtp_authoritative_replay(
             mtp_cache,
             accepted_count=accepted_count,
             authoritative_hidden=verify_hidden[:, :_PR391_FLOAT32_D3_DEPTH, :],
@@ -5754,6 +5780,27 @@ def _pr391_queue_verifier_mtp_replay(
             ),
             append_row=append_row,
         )
+
+
+def _pr391_queue_verifier_mtp_replay(
+    *,
+    rt: MTPLXRuntime,
+    core: dict[str, Any],
+    accepted_count: int,
+    verify_hidden: mx.array,
+    draft_token_ids: mx.array,
+    mtp_hidden_variant: str,
+) -> None:
+    """Run the host-selected exact-width MTP replay parity reference."""
+
+    state = _pr391_stage_verifier_mtp_replay(
+        rt=rt,
+        core=core,
+        accepted_count=accepted_count,
+        verify_hidden=verify_hidden,
+        draft_token_ids=draft_token_ids,
+        mtp_hidden_variant=mtp_hidden_variant,
+    )
     mx.async_eval(*state)
 
 
@@ -8629,6 +8676,9 @@ def generate_mtpk(
             _pr391_route.uniform_bit_rows,
         )
     _pr391_carried_d3: dict[str, Any] | None = None
+    # Read once per request; the switch is a process constant so control and
+    # candidate arms run the same binary.
+    _pr391_compact_commit = _pr391_compact_commit_enabled()
     _pr391_pending_mtp_already_staged = False
     a3b_target_prefix_route = None
     a3b_rebase_state = None  # stashed post-primary state for a deferred correction
@@ -11736,40 +11786,104 @@ def generate_mtpk(
                     int(bonus_distribution_row_needed)
                 ],
             )
-            _pr391_selected_target_hidden = (
-                compiled_verify_bank.commit_fixed_m4_device_window(
-                    verifier_result[0],
-                    before_verify.states,
-                    verify_hidden,
+            if _pr391_compact_commit:
+                # Compact width-a commit: the decision sync that used to close
+                # this block moves ahead of every commit, so the accepted width
+                # is a Python int before any candidate is built. Nothing
+                # between the two positions touches the RNG tape, so the
+                # PCG64 cursor and draw accounting are unchanged.
+                _pr391_verifier_decision = (
+                    _pr391_decode_float32_verifier_decision(
+                        verifier_result,
+                        uniform_tape=rng,
+                        reservation=verifier_reservation,
+                    )
                 )
-            )
-            _pr391_target_state_device_committed = True
-            _pr391_queue_device_verifier_mtp_replay(
-                core=_pr391_device_core,
-                accepted_count=verifier_result[0],
-                verify_hidden=verify_hidden,
-                draft_token_ids=_pr391_joint_result[0],
-            )
-            _pr391_mtp_handoff_owns_cycle = True
-            _pr391_device_prequeued_d3 = None
-            if max_tokens - (len(tokens) + 4) >= _PR391_FLOAT32_D3_DEPTH:
-                _pr391_device_prequeued_d3 = _pr391_queue_device_canonical_d3(
-                    _pr391_device_core,
-                    hidden=_pr391_selected_target_hidden,
-                    primary=verifier_result[2],
-                    uniform_bit_rows=_pr391_route.uniform_bit_rows,
-                    descriptor_offset=(
-                        mx.array(verifier_reservation.offset, dtype=mx.int32)
-                        + verifier_result[5].reshape(-1)[0].astype(mx.int32)
-                    ),
+                _pr391_accepted_width = int(_pr391_verifier_decision[0])
+                _pr391_selected_target_hidden = (
+                    compiled_verify_bank.commit_fixed_m4_host_window(
+                        _pr391_accepted_width,
+                        before_verify.states,
+                        verify_hidden,
+                    )
                 )
+                _pr391_target_state_device_committed = True
+                _pr391_stage_verifier_mtp_replay(
+                    rt=rt,
+                    core=_pr391_device_core,
+                    accepted_count=_pr391_accepted_width,
+                    verify_hidden=verify_hidden,
+                    draft_token_ids=_pr391_joint_result[0],
+                    mtp_hidden_variant=mtp_hidden_variant,
+                )
+                _pr391_mtp_handoff_owns_cycle = True
+                _pr391_device_prequeued_d3 = None
+                if max_tokens - (len(tokens) + 4) >= _PR391_FLOAT32_D3_DEPTH:
+                    _pr391_device_prequeued_d3 = (
+                        _pr391_queue_device_canonical_d3(
+                            _pr391_device_core,
+                            hidden=_pr391_selected_target_hidden,
+                            primary=verifier_result[2],
+                            uniform_bit_rows=_pr391_route.uniform_bit_rows,
+                            descriptor_offset=(
+                                mx.array(
+                                    verifier_reservation.offset, dtype=mx.int32
+                                )
+                                + verifier_result[5]
+                                .reshape(-1)[0]
+                                .astype(mx.int32)
+                            ),
+                        )
+                    )
+                else:
+                    mx.async_eval(
+                        *_pr391_device_core["cache"][0].state_leaves
+                    )
             else:
-                mx.async_eval(*_pr391_device_core["cache"][0].state_leaves)
-            _pr391_verifier_decision = _pr391_decode_float32_verifier_decision(
-                verifier_result,
-                uniform_tape=rng,
-                reservation=verifier_reservation,
-            )
+                _pr391_selected_target_hidden = (
+                    compiled_verify_bank.commit_fixed_m4_device_window(
+                        verifier_result[0],
+                        before_verify.states,
+                        verify_hidden,
+                    )
+                )
+                _pr391_target_state_device_committed = True
+                _pr391_queue_device_verifier_mtp_replay(
+                    core=_pr391_device_core,
+                    accepted_count=verifier_result[0],
+                    verify_hidden=verify_hidden,
+                    draft_token_ids=_pr391_joint_result[0],
+                )
+                _pr391_mtp_handoff_owns_cycle = True
+                _pr391_device_prequeued_d3 = None
+                if max_tokens - (len(tokens) + 4) >= _PR391_FLOAT32_D3_DEPTH:
+                    _pr391_device_prequeued_d3 = (
+                        _pr391_queue_device_canonical_d3(
+                            _pr391_device_core,
+                            hidden=_pr391_selected_target_hidden,
+                            primary=verifier_result[2],
+                            uniform_bit_rows=_pr391_route.uniform_bit_rows,
+                            descriptor_offset=(
+                                mx.array(
+                                    verifier_reservation.offset, dtype=mx.int32
+                                )
+                                + verifier_result[5]
+                                .reshape(-1)[0]
+                                .astype(mx.int32)
+                            ),
+                        )
+                    )
+                else:
+                    mx.async_eval(
+                        *_pr391_device_core["cache"][0].state_leaves
+                    )
+                _pr391_verifier_decision = (
+                    _pr391_decode_float32_verifier_decision(
+                        verifier_result,
+                        uniform_tape=rng,
+                        reservation=verifier_reservation,
+                    )
+                )
             _pr391_next_descriptor_offset = (
                 int(verifier_reservation.offset)
                 + int(_pr391_verifier_decision[5])

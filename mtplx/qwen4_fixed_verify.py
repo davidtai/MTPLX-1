@@ -80,6 +80,24 @@ def qwen4_fixed_verify_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+_FABLE_COMPACT_COMMIT: bool | None = None
+
+
+def fable_compact_commit_enabled() -> bool:
+    """Read the compact width-a commit switch exactly once per process.
+
+    The control and candidate arms must be the same binary, so the switch is
+    an environment read that is cached at first use and never re-read inside a
+    measured cycle.
+    """
+
+    global _FABLE_COMPACT_COMMIT
+    if _FABLE_COMPACT_COMMIT is None:
+        raw = os.environ.get("MTPLX_FABLE_COMPACT_COMMIT", "0").strip().lower()
+        _FABLE_COMPACT_COMMIT = raw in {"1", "true", "yes", "on"}
+    return _FABLE_COMPACT_COMMIT
+
+
 def _text_model(runtime: Any):
     return getattr(runtime.model, "language_model", runtime.model)
 
@@ -698,6 +716,8 @@ def _bind_fixed_m4_device_commit(self: Any, cache):
 
     from .kernels.qwen4_m4_state_handoff import (
         QWEN4_M4_GDN_CONV_ROWS,
+        QWEN4_M4_PLE_CONV_ROWS,
+        QWEN4_M4_PLE_HISTORY_ROWS,
         QWEN4_M4_VERIFY_WIDTH,
         replay_qwen4_m4_gdn_state,
     )
@@ -725,6 +745,18 @@ def _bind_fixed_m4_device_commit(self: Any, cache):
     ple_rows = tuple(index for _kind, index, _entry, _gdn, ple in plan if ple)
     if ple_rows != (binding.ple_layer_index,):
         raise ValueError("fixed-M4 device commit PLE topology changed")
+
+    # One constant GDN keep mask per accepted width. The all-width commit
+    # rebuilds this from the device ``accepted_count`` every cycle; the
+    # compact commit already owns the width on the host, so the four masks
+    # are bound once and reused.
+    keep_masks = tuple(
+        mx.array(
+            [[column < width for column in range(QWEN4_M4_VERIFY_WIDTH)]],
+            dtype=mx.bool_,
+        )
+        for width in range(1, QWEN4_M4_VERIFY_WIDTH + 1)
+    )
 
     def commit(accepted_count, snapshot_states, verify_hidden):
         accepted = accepted_count.reshape(-1)[0].astype(mx.int32)
@@ -847,6 +879,130 @@ def _bind_fixed_m4_device_commit(self: Any, cache):
                 state_roots.extend(entry.cache)
         return selected_hidden, tuple(state_roots)
 
+    def commit_width(accepted_width, snapshot_states, verify_hidden):
+        """Commit exactly the accepted width once the host owns the decision.
+
+        Same committed state as ``commit`` for the accepted width, reached
+        without building the three unselected candidates.  The caller has
+        already materialized the verifier decision, so every window index is a
+        Python constant: the PLE replay runs at one width (or not at all when
+        the whole M4 window is accepted), the 12 ``mx.where`` selections are
+        gone, and the GDN conv windows are static slices instead of a device
+        ``take``.  The bf16 arithmetic order of the GDN recurrence is
+        unchanged; the selection order is not, so a receipt digest may move.
+
+        Still eager on purpose.  Folding the 48-layer loop into one
+        ``mx.compile``'d function per width would need the ~300 per-cycle
+        capture and snapshot leaves re-expressed as positional arguments
+        (they arrive here as mutable cache attributes), a four-width prewarm
+        on synthetic captures at every bank install, and a GPU run to
+        establish that ``gated_delta_update(use_kernel=True)`` composes with
+        ``mx.compile``.  The eager width-a form already removes the
+        candidate construction, which is where the host ops are.
+        """
+
+        accepted = int(accepted_width)
+        if not 0 <= accepted < QWEN4_M4_VERIFY_WIDTH:
+            raise ValueError(
+                "fixed-M4 compact commit requires an accepted width in [0, 3]"
+            )
+        keep = accepted + 1
+        whole_window = keep == QWEN4_M4_VERIFY_WIDTH
+        gdn_keep_mask = keep_masks[accepted]
+
+        ple_entry = cache[binding.ple_layer_index]
+        ple_pre = snapshot_states[binding.ple_layer_index]
+        (
+            ple_hidden,
+            ple_ids,
+            ple_conv_rows,
+        ) = ple_entry._mtplx_verify_ple
+        compiled_aux = ple_entry._mtplx_verify_compiled_aux
+        ple_layer = inner.layers[binding.ple_layer_index]
+
+        # Below the whole window the PLE layer's four slots come entirely from
+        # one exact-width logical replay, so neither its GDN windows nor its
+        # recurrence are built at all.
+        ple_logical_state = None
+        if not whole_window:
+            logical_cache = type(ple_entry)(len(ple_entry.cache))
+            for slot, leaf in enumerate(ple_pre):
+                logical_cache[slot] = leaf
+            with (
+                verify_capture_disabled_scope(),
+                compiled_verify_ple_scope(compiled_aux[:, :keep]),
+            ):
+                logical_hidden = ple_hidden[:, :keep] + ple_layer.ple(
+                    ple_hidden[:, :keep],
+                    ple_ids[:, :keep],
+                    logical_cache,
+                )
+                logical_mixed, _logical_hyper, _logical_inject = (
+                    ple_layer.attn_hyper_connection(logical_hidden)
+                )
+                ple_layer.linear_attn(logical_mixed, None, logical_cache)
+            ple_logical_state = tuple(logical_cache.cache)
+
+        selected_hidden = verify_hidden[:, accepted : accepted + 1, :]
+
+        for kind, index, entry, gdn, ple in plan:
+            if kind == "qsa":
+                # The fixed buffers already contain all four verify rows.
+                # Only their device-owned logical frontier changes, and the
+                # whole window moves it by nothing at all.
+                if not whole_window:
+                    entry.kv.cache[2] = entry.kv.cache[2] - (
+                        QWEN4_M4_VERIFY_WIDTH - keep
+                    )
+                entry.kv.rollback_state[:] = [None, None, None]
+                continue
+
+            if ple is not None and ple_logical_state is not None:
+                entry[0] = ple_logical_state[0]
+                entry[1] = ple_logical_state[1]
+                entry[2] = ple_logical_state[2]
+                entry[3] = ple_logical_state[3]
+                entry._mtplx_verify_rows = None
+                entry._mtplx_verify_ple = None
+                entry._mtplx_verify_compiled_aux = None
+                continue
+
+            pre = snapshot_states[index]
+            qkv, q, k, v, a, b = entry._mtplx_verify_rows
+            entry[0] = mx.concatenate((pre[0], qkv), axis=1)[
+                :, keep : keep + QWEN4_M4_GDN_CONV_ROWS
+            ]
+            entry[1] = replay_qwen4_m4_gdn_state(
+                q,
+                k,
+                v,
+                a,
+                b,
+                gdn.A_log,
+                gdn.dt_bias,
+                pre[1],
+                gdn_keep_mask,
+            )
+            entry._mtplx_verify_rows = None
+            if ple is not None:
+                entry[2] = mx.concatenate((pre[2], ple_conv_rows), axis=1)[
+                    :, keep : keep + QWEN4_M4_PLE_CONV_ROWS
+                ]
+                entry[3] = mx.concatenate(
+                    (pre[3], ple_ids.astype(mx.int32).astype(mx.int64)),
+                    axis=1,
+                )[:, keep : keep + QWEN4_M4_PLE_HISTORY_ROWS]
+                entry._mtplx_verify_ple = None
+                entry._mtplx_verify_compiled_aux = None
+        state_roots = []
+        for kind, _index, entry, _gdn, _ple in plan:
+            if kind == "qsa":
+                state_roots.extend(entry.state_leaves)
+            else:
+                state_roots.extend(entry.cache)
+        return selected_hidden, tuple(state_roots)
+
+    commit.commit_width = commit_width
     return commit
 
 

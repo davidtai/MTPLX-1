@@ -2078,6 +2078,9 @@ class CompiledVerifyBank:
                 and boundary in ("both", "post")
             ),
             "device_commit": device_commit,
+            "device_commit_width": getattr(
+                device_commit, "commit_width", None
+            ),
         }
 
     def _make_fixed_m4_prefix_step(self):
@@ -2587,6 +2590,28 @@ class CompiledVerifyBank:
 
         selected_hidden, state_roots = self._fixed_m4_dispatch["device_commit"](
             accepted_count,
+            snapshot_states,
+            verify_hidden,
+        )
+        mx.async_eval(selected_hidden, *state_roots)
+        return selected_hidden
+
+    def commit_fixed_m4_host_window(
+        self,
+        accepted_width,
+        snapshot_states,
+        verify_hidden,
+    ):
+        """Queue the same state selection for one host-known accepted width."""
+
+        commit_width = self._fixed_m4_dispatch["device_commit_width"]
+        if not callable(commit_width):
+            raise RuntimeError(
+                "fixed-M4 compact commit requires a construction-bound "
+                "width-selected state commit"
+            )
+        selected_hidden, state_roots = commit_width(
+            accepted_width,
             snapshot_states,
             verify_hidden,
         )

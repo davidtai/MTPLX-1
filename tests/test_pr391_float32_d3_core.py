@@ -579,25 +579,44 @@ def test_stage_b_route_reserves_joint_d3_and_keeps_tail_on_shared_tape() -> None
     assert "qsa_mtp_outer_device_core_supported" not in claim_source
 
 
+def _pr391_control_branch_source(source: str) -> str:
+    """Return the flag-off arm of the PR391 post-verify commit block.
+
+    ``MTPLX_FABLE_COMPACT_COMMIT`` adds a second arm that materializes the
+    verifier decision before committing at the accepted width. The default
+    lane is the ``else`` arm, and these ordering contracts describe it.
+    """
+
+    guard = source.index("if _pr391_compact_commit:")
+    start = source.index("\n            else:\n", guard)
+    end = source.index("_pr391_next_descriptor_offset = (", start)
+    return source[start:end]
+
+
 def test_active_pr391_route_uses_device_replay_not_host_selected_reference() -> None:
     import mtplx.generation as generation
 
     source = inspect.getsource(generation.generate_mtpk)
     verifier = source.index("verifier_result = _pr391_apply_softfloat64_decision(")
-    target_commit = source.index(
-        "compiled_verify_bank.commit_fixed_m4_device_window(", verifier
+    control = _pr391_control_branch_source(source)
+    control_at = source.index(control)
+    target_commit = control.index(
+        "compiled_verify_bank.commit_fixed_m4_device_window("
     )
-    replay = source.index("_pr391_queue_device_verifier_mtp_replay(", target_commit)
-    decode = source.index("_pr391_decode_float32_verifier_decision(", replay)
+    replay = control.index("_pr391_queue_device_verifier_mtp_replay(", target_commit)
+    decode = control.index("_pr391_decode_float32_verifier_decision(", replay)
 
-    assert verifier < target_commit < replay < decode
-    assert "_pr391_fixed_m4_split" not in source[target_commit:replay]
-    replay_call = source[replay:decode]
+    assert verifier < control_at
+    assert target_commit < replay < decode
+    assert "_pr391_fixed_m4_split" not in control[target_commit:replay]
+    replay_call = control[replay:decode]
     assert "accepted_count=verifier_result[0]," in replay_call
     assert "verify_hidden=verify_hidden," in replay_call
     assert "draft_token_ids=_pr391_joint_result[0]," in replay_call
     assert "_pr391_mtp_handoff_owns_cycle = True" in replay_call
-    assert "_pr391_queue_verifier_mtp_replay(" not in source
+    # The host-selected parity reference stays out of the default lane; it is
+    # reachable only from the compact-commit arm.
+    assert "_pr391_queue_verifier_mtp_replay(" not in control
 
 
 def test_device_mtp_replay_is_queued_before_host_decision_decode() -> None:
@@ -605,10 +624,13 @@ def test_device_mtp_replay_is_queued_before_host_decision_decode() -> None:
 
     source = inspect.getsource(generation.generate_mtpk)
     verifier = source.index("verifier_result = _pr391_apply_softfloat64_decision(")
-    replay = source.index("_pr391_queue_device_verifier_mtp_replay(", verifier)
-    decode = source.index("_pr391_decode_float32_verifier_decision(", replay)
+    control = _pr391_control_branch_source(source)
+    control_at = source.index(control)
+    replay = control.index("_pr391_queue_device_verifier_mtp_replay(")
+    decode = control.index("_pr391_decode_float32_verifier_decision(", replay)
 
-    assert verifier < replay < decode
+    assert verifier < control_at
+    assert replay < decode
 
 
 def test_device_next_d3_is_queued_before_host_decision_decode() -> None:
@@ -725,14 +747,18 @@ def test_host_canonical_d3_is_not_retained_as_a_carried_path() -> None:
     import mtplx.generation as generation
 
     source = inspect.getsource(generation.generate_mtpk)
-    device_queue = source.index("_pr391_queue_device_canonical_d3(")
-    decode = source.index("_pr391_decode_float32_verifier_decision(")
+    control = _pr391_control_branch_source(source)
+    control_at = source.index(control)
+    device_queue = control_at + control.index("_pr391_queue_device_canonical_d3(")
+    decode = control_at + control.index(
+        "_pr391_decode_float32_verifier_decision(", device_queue - control_at
+    )
     carried = source.index("_pr391_carried_d3 = {", decode)
 
     assert device_queue < decode < carried
     assert "_pr391_device_prequeued_d3 is not None" in source[decode:carried]
     assert "_pr391_queue_canonical_d3(" not in source
-    assert "_pr391_queue_verifier_mtp_replay(" not in source
+    assert "_pr391_queue_verifier_mtp_replay(" not in control
 
 
 def test_context_copy_drops_carried_d3_without_live_cache_repair() -> None:
