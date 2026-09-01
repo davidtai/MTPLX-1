@@ -1058,7 +1058,9 @@ def parse_key_values(
             key, value = setting.split("=", 1)
         except ValueError as exc:
             raise RuntimeError(f"invalid {flag} value: {setting!r}") from exc
-        is_mtplx = key.startswith("MTPLX_")
+        # MTPLX_FABLE_* is the diagnostic namespace (census etc.); it is not a
+        # model-runtime override, so it rides the raw --env passthrough.
+        is_mtplx = key.startswith("MTPLX_") and not key.startswith("MTPLX_FABLE_")
         if not key or not value or key in parsed:
             raise RuntimeError(f"invalid or duplicate {flag} value: {setting!r}")
         if require_mtplx and not is_mtplx:
