@@ -283,11 +283,29 @@ def _stock_bank_update(pooled, candidate, safe_block, condition):
 
 
 def _diet_bank_update(pooled, candidate, safe_block, condition):
-    write_row = mx.logical_and(
-        qwen4_exp._bank_row_ids(pooled.shape[1], safe_block.dtype) == safe_block,
-        condition,
+    """The shipped rowsel form: resolve the condition on the touched ROW."""
+
+    old_row = mx.slice(
+        pooled, safe_block, axes=(1,), slice_size=(1, 1, pooled.shape[2])
     )
-    return mx.where(write_row[..., None], candidate, pooled)
+    merged = mx.where(condition, candidate.astype(pooled.dtype), old_row)
+    return mx.slice_update(pooled, merged, safe_block, axes=(1,))
+
+
+def _select_bank_update(pooled, candidate, safe_block, condition):
+    """The row-id select form: fewer dispatches, but measured SLOWER.
+
+    Kept as a third value-identical spelling so the choice stays visible --
+    scripts/fable/micro_opdiet.py timed it at -20% against stock where the
+    shipped rowsel form reached -49%, because both of its operands broadcast
+    and MLX must emit a general (strided) select over the whole bank.
+    """
+
+    row_ids = mx.arange(pooled.shape[1], dtype=safe_block.dtype).reshape(
+        1, pooled.shape[1]
+    )
+    write_row = mx.logical_and(row_ids == safe_block, condition)
+    return mx.where(write_row[..., None], candidate.astype(pooled.dtype), pooled)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
@@ -303,11 +321,24 @@ def test_bank_update_is_bitwise_identical_for_every_row_and_condition(dtype):
             flag = mx.array(condition)
             mx.eval(block, flag)
             stock = _stock_bank_update(pooled, candidate, block, flag)
-            diet = _diet_bank_update(pooled, candidate, block, flag)
-            assert _identical(stock, diet), (row, condition)
+            assert _identical(
+                stock, _diet_bank_update(pooled, candidate, block, flag)
+            ), (row, condition)
+            assert _identical(
+                stock, _select_bank_update(pooled, candidate, block, flag)
+            ), (row, condition)
 
 
-def test_bank_update_drops_one_of_the_two_full_bank_passes():
+def test_bank_update_drops_one_full_bank_pass_and_keeps_the_rest_contiguous():
+    """Dispatch count is not the objective; kernel class is.
+
+    The shipped form issues MORE primitives than the row-id select and still
+    measured twice as fast, because its one full-bank pass is a contiguous
+    copy while the select's is a general strided kernel over the whole bank.
+    This pins the shape of all three graphs so a future "cheaper" rewrite has
+    to argue against the measurement, not against the op count.
+    """
+
     capacity, head_dim = 12, 8
     args = (
         mx.zeros((1, capacity, head_dim)),
@@ -318,22 +349,17 @@ def test_bank_update_drops_one_of_the_two_full_bank_passes():
     mx.eval(*args)
     stock = _kernel_primitives(mx.compile(_stock_bank_update)(*args))
     diet = _kernel_primitives(mx.compile(_diet_bank_update)(*args))
+    select = _kernel_primitives(mx.compile(_select_bank_update)(*args))
 
     # Stock: copy the whole bank (DynamicSliceUpdate cannot donate a leaf the
     # caller still holds) and then select over the whole bank a second time.
     assert stock == ["DynamicSliceUpdate", "CompiledBroadcastSelect"]
-    # Diet: one read-modify-write, plus a row-id compare over the row axis.
-    assert "DynamicSliceUpdate" not in diet
-    assert diet[-1] == "CompiledBroadcastBroadcastSelect"
-
-
-def test_bank_row_ids_are_a_materialized_constant():
-    rows = qwen4_exp._bank_row_ids(9, mx.int32)
-    assert rows is qwen4_exp._bank_row_ids(9, mx.int32)
-    assert rows.shape == (1, 9)
-    # Already evaluated -> a graph constant, not an Arange re-emitted per layer.
-    assert _primitives(rows) == []
-    assert rows.tolist() == [list(range(9))]
+    # Shipped: read the row, select head_dim wide, write the row back. The
+    # only full-bank pass left is the slice_update's contiguous copy.
+    assert diet == ["DynamicSlice", "CompiledBroadcastSelect", "DynamicSliceUpdate"]
+    # Rejected: one pass, but both operands broadcast across the whole bank.
+    assert select[-1] == "CompiledBroadcastBroadcastSelect"
+    assert "DynamicSliceUpdate" not in select
 
 
 # --------------------------------------------------------------------------
@@ -561,7 +587,6 @@ def test_flag_off_model_sites_keep_the_stock_expressions(monkeypatch):
     monkeypatch.setattr(qwen4_exp, "_apply_partial_rope_half", guard)
     monkeypatch.setattr(qwen4_exp, "_rope_cos_sin_half", guard)
     monkeypatch.setattr(qwen4_exp, "_shared_rope_cos_sin_half", guard)
-    monkeypatch.setattr(qwen4_exp, "_bank_row_ids", guard)
 
     hyper = mx.zeros((1, 2, 24))
     block_out = mx.zeros((1, 2, 6))
@@ -683,20 +708,38 @@ def test_prepare_queries_eager_is_bitwise_identical(monkeypatch, pos_start):
     assert _identical(stock, diet)
 
 
-def test_extend_pooled_fixed_uses_the_row_id_constant_when_armed(monkeypatch):
+def _extend_pooled_fixed_primitives(indexer, capacity_blocks=12, head_dim=32):
+    """Kernel primitives of one _extend_pooled_fixed call, unevaluated."""
+
+    ratio = indexer.ratio
+    raw_keys = mx.zeros((1, capacity_blocks * ratio, head_dim))
+    pooled = mx.zeros((1, capacity_blocks, head_dim))
+    mx.eval(raw_keys, pooled, indexer.k_layernorm.weight, indexer._inv_freq)
+    cache = _FakeFixedQSACache(
+        mx.array(8, dtype=mx.int32), ratio, raw_keys, pooled, 4
+    )
+    return _kernel_primitives(
+        indexer._extend_pooled_fixed(cache, cache.offset + 4)
+    )
+
+
+def test_extend_pooled_fixed_uses_the_rowsel_form_when_armed(monkeypatch):
+    """Armed, the bank write must read one row and write one row back.
+
+    ``_extend_pooled_fixed`` already dynamic-slices raw_keys, so the tell is
+    the SECOND DynamicSlice (the pooled row) next to the slice_update.
+    """
+
     args = _tiny_indexer_args()
     monkeypatch.setattr(runtime_options, "_FABLE_OPDIET", True)
-    indexer = qwen4_exp.QSAIndexer(args)
-    seen: list[int] = []
-    stock = qwen4_exp._bank_row_ids
+    armed = _extend_pooled_fixed_primitives(qwen4_exp.QSAIndexer(args))
+    assert armed.count("DynamicSlice") == 2
+    assert armed.count("DynamicSliceUpdate") == 1
 
-    def spy(capacity, dtype):
-        seen.append(int(capacity))
-        return stock(capacity, dtype)
-
-    monkeypatch.setattr(qwen4_exp, "_bank_row_ids", spy)
-    _run_extend_pooled_fixed(indexer, 8, 12, 32, 4, seed=1)
-    assert seen == [12]
+    monkeypatch.setattr(runtime_options, "_FABLE_OPDIET", False)
+    stock = _extend_pooled_fixed_primitives(qwen4_exp.QSAIndexer(args))
+    assert stock.count("DynamicSlice") == 1
+    assert stock.count("DynamicSliceUpdate") == 1
 
 
 def test_every_residual_write_site_goes_through_the_shared_helper():
@@ -833,13 +876,10 @@ def test_deselecting_bank_restores_the_stock_bank_write(monkeypatch):
         runtime_options, "_FABLE_OPDIET_SELECTED", frozenset({"rope", "resid", "k20"})
     )
     args = _tiny_indexer_args()
-    indexer = qwen4_exp.QSAIndexer(args)
-    monkeypatch.setattr(
-        qwen4_exp,
-        "_bank_row_ids",
-        lambda *_a: pytest.fail("bank rewrite ran while deselected"),
-    )
-    _run_extend_pooled_fixed(indexer, 8, 12, 32, 4, seed=5)
+    primitives = _extend_pooled_fixed_primitives(qwen4_exp.QSAIndexer(args))
+    # rope stays armed here; only the bank write reverts.
+    assert primitives.count("DynamicSlice") == 1
+    assert primitives.count("DynamicSliceUpdate") == 1
 
 
 def test_deselecting_rope_restores_the_stock_tables(monkeypatch):
@@ -922,24 +962,25 @@ def test_microbench_variants_match_the_production_helpers():
     bank = mx.random.normal((1, capacity, head_dim)).astype(mx.bfloat16)
     row = mx.random.normal((1, 1, head_dim)).astype(mx.bfloat16)
     mx.eval(bank, row)
-    row_ids = qwen4_exp._bank_row_ids(capacity, mx.int32)
+    row_ids = mx.arange(capacity, dtype=mx.int32).reshape(1, capacity)
+    mx.eval(row_ids)
     for index in (0, 5, capacity - 1):
         for flag in (True, False):
             blk = mx.array(index, dtype=mx.int32)
             cond = mx.array(flag)
             mx.eval(blk, cond)
-            reference = micro.bank_stock(bank, row, blk, cond)
-            production = mx.where(
-                mx.logical_and(row_ids == blk, cond)[..., None],
-                row.astype(bank.dtype),
-                bank,
-            )
-            assert _identical(reference, production)
+            # bank_rowsel is what production ships; the other two are the
+            # spellings it was chosen over, and all three must agree.
+            production = _diet_bank_update(bank, row, blk, cond)
+            assert _identical(micro.bank_stock(bank, row, blk, cond), production)
             assert _identical(
-                micro.bank_select(bank, row, blk, cond, row_ids), production
+                _stock_bank_update(bank, row, blk, cond), production
             )
             assert _identical(
                 micro.bank_rowsel(bank, row, blk, cond, row_ids), production
+            )
+            assert _identical(
+                micro.bank_select(bank, row, blk, cond, row_ids), production
             )
 
     # --- rope ------------------------------------------------------------

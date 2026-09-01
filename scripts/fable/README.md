@@ -225,14 +225,18 @@ owner.
 ## Op diet: per-item A/B and the microbench
 
 `MTPLX_FABLE_OPDIET=1` arms four independently written, bitwise-exact
-rewrites of the compiled fixed-M4 verify graph. Together they remove ~300
-dispatches/cycle — and together they measured **-2.9% tok/s** on seed
-20260829 (66.46 vs 68.42 control), verify_forward +0.4 s over 1,024 tokens.
-Dispatch count is not GPU time: a rewrite can swap contiguous vectorized
-kernels for broadcast/general ones and lose more than it saves.
+rewrites of the compiled fixed-M4 verify graph.
 
-`MTPLX_FABLE_OPDIET_ITEMS` selects which rewrites are live, so the regression
-can be attributed to one item instead of the whole flag. Unset means all four.
+Dispatch count is not GPU time: a rewrite can swap contiguous vectorized
+kernels for broadcast/general ones and lose more than it saves. The first
+shipped `bank` spelling did exactly that — it removed two dispatches per QSA
+layer and gave most of the win back to a general strided select. The 3-seed
+A/B of that set was neutral (-2.9 / +0.2 / +0.1%). `micro_opdiet.py` then
+priced the items separately and `bank` moved to the `rowsel` spelling, which
+issues *more* dispatches and runs twice as fast.
+
+`MTPLX_FABLE_OPDIET_ITEMS` selects which rewrites are live, so a result can
+be attributed to one item instead of the whole flag. Unset means all four.
 
 | item | what it changes |
 | --- | --- |
@@ -265,9 +269,17 @@ variant: median/p10/p90 eval ms, us per layer/site, delta% vs stock, the
 dispatch count of the built graph, and max-abs-diff against stock (every
 shipped rewrite must print 0).
 
-It also times `bank_rowsel`, a third spelling of the bank write that keeps
-the single full-bank pass but leaves it a contiguous copy — the fix if the
-broadcast-select hypothesis holds.
+Measured 2026-09-01, compiled lane, per verify cycle:
+
+| family | stock | rewrite | |
+| --- | --- | --- | --- |
+| bank | 0.492 ms | `bank_select` 0.392 (-20%) | `bank_rowsel` 0.253 (**-49%**, shipped) |
+| rope | 1.068 ms | `rope_half` 0.738 (**-31%**, shipped) | |
+| resid | 0.395 ms | `resid_fused` 0.366 (**-7%**, shipped) | |
+
+`bank_select` is kept in the bench as the rejected alternative: it issues the
+fewest dispatches of the three and is the slowest rewrite, which is the whole
+reason this bench exists.
 
 ~30 s of GPU. Still a guarded window: it issues Metal work.
 

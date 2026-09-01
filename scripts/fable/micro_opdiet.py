@@ -7,17 +7,23 @@
 """Price each MTPLX_FABLE_OPDIET rewrite at the verifier's real shapes.
 
 The op diet removes ~300 dispatches/cycle from the compiled fixed-M4 verify
-graph, and every rewrite is bitwise exact -- yet armed together the four items
-measured **-2.9% tok/s** against control on seed 20260829 (66.46 vs 68.42),
-with verify_forward +0.4 s over 1,024 tokens (~+1.0 ms per verify window).
-Draft and target-dist were unchanged and acceptance was identical, so the
-cost is inside the compiled verify graph: one of ``bank`` / ``rope`` /
-``resid`` costs more GPU time than the dispatches it removes.
+graph, and every rewrite is bitwise exact. This bench prices each rewrite
+separately, because dispatch count is not GPU time: a rewrite can replace
+CONTIGUOUS vectorized kernels with BROADCAST/general ones, whose per-element
+index arithmetic runs well below the copy engine's bandwidth.
 
-Removing a dispatch is not free of consequence: it can replace CONTIGUOUS
-vectorized kernels with BROADCAST/general ones, whose per-element index
-arithmetic runs well below the copy engine's bandwidth. That is the leading
-hypothesis for ``bank``, and this bench is built to confirm or kill it.
+Measured 2026-09-01, compiled lane, per verify cycle:
+
+    bank_stock  0.492 ms   bank_select  0.392 (-20%)   bank_rowsel 0.253 (-49%)
+    rope_stock  1.068 ms   rope_half    0.738 (-31%)
+    resid_stock 0.395 ms   resid_fused  0.366 (-7%)
+
+``bank_rowsel`` ships. It issues the MOST dispatches of the three bank
+spellings (6/layer against stock's 4 and bank_select's 2) and is twice as
+fast as stock, because its single full-bank pass is a contiguous copy while
+bank_select's is a general strided select over 557,056 elements -- the
+broadcast-kernel effect this bench was built to test. bank_select is kept
+here as the rejected alternative so the choice stays legible.
 
 Variants, each timed as ONE verify cycle's worth of calls:
 
@@ -28,12 +34,11 @@ Variants, each timed as ONE verify cycle's worth of calls:
     bank_select  mx.where(row_id == blk & cond, row, bank) -- ONE full-bank
                  pass (~2.2 MB/layer), 2 dispatches, but the mask [1,4352,1]
                  and the row [1,1,128] both broadcast, so MLX must emit a
-                 general (strided) select over 557,056 elements   [SHIPPED]
+                 general (strided) select over 557,056 elements  [REJECTED]
     bank_rowsel  dynamic-slice the old row, select on the ROW, slice_update --
                  one full-bank pass like bank_select, but the full-bank pass
-                 is the contiguous slice_update copy and the broadcast work
-                 is 128 elements wide. 6 dispatches. The fix, if the
-                 hypothesis holds.
+                 is the contiguous slice_update copy and the conditional work
+                 is 128 elements wide. 6 dispatches            [SHIPPED]
 
   rope (12 QSA layers: indexer q [1,4,4,128], attn q [1,4,24,256],
         attn k [1,4,2,256], pooled block [1,1,1,128]; rot 64, half 32)
