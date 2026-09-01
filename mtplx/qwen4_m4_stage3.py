@@ -7,6 +7,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from .fable_expert_census import census as _census
 from .kernels.qwen4_m4_stage3 import bind
 from .kernels.qwen4_m4_routed_down import (
     bind as bind_routed_down_reduce,
@@ -89,6 +90,8 @@ def _m4_forward(block: SparseMoeBlock, x: mx.array, stage3) -> mx.array:
     expert_ids = mx.argpartition(gates, kth=-block.top_k, axis=-1)[
         ..., -block.top_k :
     ]
+    if _census.enabled:
+        _census.record(getattr(block, "_mtplx_m4_layer_index", -1), expert_ids)
     route_scores = mx.take_along_axis(gates, expert_ids, axis=-1)
     if block.norm_topk_prob:
         route_scores = route_scores / route_scores.sum(axis=-1, keepdims=True)
@@ -141,6 +144,8 @@ def _m4_routed_down_reduce_forward(
     expert_ids = mx.argpartition(gates, kth=-block.top_k, axis=-1)[
         ..., -block.top_k :
     ]
+    if _census.enabled:
+        _census.record(getattr(block, "_mtplx_m4_layer_index", -1), expert_ids)
     route_scores = mx.take_along_axis(gates, expert_ids, axis=-1)
     if block.norm_topk_prob:
         route_scores = route_scores / route_scores.sum(axis=-1, keepdims=True)
@@ -194,6 +199,8 @@ def _m4_routed_down_residual_tail_forward(
     expert_ids = mx.argpartition(gates, kth=-block.top_k, axis=-1)[
         ..., -block.top_k :
     ]
+    if _census.enabled:
+        _census.record(getattr(block, "_mtplx_m4_layer_index", -1), expert_ids)
     route_scores = mx.take_along_axis(gates, expert_ids, axis=-1)
     if block.norm_topk_prob:
         route_scores = route_scores / route_scores.sum(axis=-1, keepdims=True)
@@ -249,6 +256,8 @@ def _m4_paired_routed_glu_residual_tail_forward(
     expert_ids = mx.argpartition(gates, kth=-block.top_k, axis=-1)[
         ..., -block.top_k :
     ]
+    if _census.enabled:
+        _census.record(getattr(block, "_mtplx_m4_layer_index", -1), expert_ids)
     route_scores = mx.take_along_axis(gates, expert_ids, axis=-1)
     if block.norm_topk_prob:
         route_scores = route_scores / route_scores.sum(axis=-1, keepdims=True)
@@ -653,8 +662,11 @@ def _install_validated_plans(
 ) -> None:
     """Mutate only the complete plan set after validation and exact self-checks."""
 
-    for layer, block, stage3, routed_down_reduce in plans:
+    for index, (layer, block, stage3, routed_down_reduce) in enumerate(plans):
         block._mtplx_m4_stage3 = stage3
+        # Plain int, so mlx's Module.__setattr__ keeps it off the parameter
+        # dict. Only the opt-in expert census reads it.
+        block._mtplx_m4_layer_index = index
         if routed_glu_enabled:
             layer._mtplx_m4_routed_glu = routed_glu
             layer._mtplx_m4_routed_down_residual_tail = routed_down_reduce

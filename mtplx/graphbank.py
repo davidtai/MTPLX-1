@@ -19,6 +19,7 @@ from typing import Any
 import mlx.core as mx
 
 from .attention_context import attention_phase
+from .fable_expert_census import census as _expert_census
 from .gdn_capture import resolve_gdn_capture_backend
 
 
@@ -2403,6 +2404,7 @@ class CompiledVerifyBank:
 
         self.stats["compiled_calls"] += 1
         self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
+        _expert_census.end_cycle()  # diagnostic: one M4 verify window closed
         return logits, hidden, {}
 
     @staticmethod
@@ -2526,6 +2528,7 @@ class CompiledVerifyBank:
             self.stats["calls"] += 1
             self.stats["compiled_calls"] += 1
             self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
+            _expert_census.end_cycle()  # diagnostic: split M4 window closed
             return logits, hidden, {}, split_result
         except Exception:
             self.discard_fixed_m4_prefix(prefix)
