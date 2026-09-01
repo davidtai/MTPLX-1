@@ -92,11 +92,32 @@ matches, with zero differing token positions and zero edit distance.
 
 ## Retention status
 
-The correctness and route gates pass, but thermal gating was explicitly
-disabled. Consequently, the recorded wall time and decode TPS are diagnostic
-only and are retention-ineligible. No performance or throughput claim is
-retained from this run.
+Retain. A later matched-order campaign restored the strict
+`max(cpu_temp_avg, gpu_temp_avg) <= 40.0 C` admission gate. Both orders won
+against the same-commit routed-down parent with exact output and state work.
 
-A matched candidate-versus-routed-down-parent A/B at 40 C remains pending
-ThermalForge NOPASSWD authority. Until that controlled comparison is complete,
-this result documents a correct candidate, not a retained performance win.
+| Seed/order | Candidate decode s | Control decode s | Candidate TPS | Control TPS | Candidate wall s | Control wall s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 20260829, candidate then control | 15.354728 | 15.499028 | 66.689556 | 66.068660 | 29.025788 | 29.214168 |
+| 20260830, control then candidate | 15.608835 | 15.718491 | 65.603872 | 65.146203 | 29.264978 | 29.345030 |
+| Mean | 15.481782 | 15.608759 | 66.146714 | 65.607431 | 29.145383 | 29.279599 |
+
+The two-pair mean saves `0.126978 s` of decode time and `0.134216 s` of wall
+time. That is a `0.8135%` decode-time reduction, `0.8220%` TPS increase, and
+`0.4584%` wall-time reduction. Both individual wall comparisons favor the
+candidate.
+
+Every timed arm recorded an initial and ready temperature. Candidate admission
+temperatures were `39.764 C` and `39.751 C`; control admissions were `39.712 C`
+and `39.532 C`. Peak memory did not increase: all retained arms stayed at or
+below `87,393,864,660` bytes.
+
+The paired receipts are:
+
+- `.benchmark-artifacts/pr391/rebench3-1788263303-m4-routed-down-residual-tail-40c-candidate-seeds-16k-1k.json`
+- `.benchmark-artifacts/pr391/rebench3-1788263304-m4-routed-down-residual-tail-40c-control-seeds-16k-1k.json`
+- `.benchmark-artifacts/pr391/rebench3-1788263305-m4-routed-down-residual-tail-40c-control-seeds-16k-1k.json`
+- `.benchmark-artifacts/pr391/rebench3-1788263306-m4-routed-down-residual-tail-40c-candidate-seeds-16k-1k.json`
+
+The interrupted/un-gated sequence `1788263301` remains diagnostic only and is
+not included in these claims.
