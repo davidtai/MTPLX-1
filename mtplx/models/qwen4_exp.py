@@ -1695,53 +1695,186 @@ def _prefill_mask_fuse_enabled() -> bool:
     exact-visible-set fused kernel exists at this geometry; only the
     heuristic declines it.
 
+    Two arms ride this one flag, both fused, chosen by what the indexer
+    returned:
+
+    * **causal** -- no selection came back, so every key a row can see IS
+      visible.  Nothing is built: the string ``"causal"`` goes to MLX, whose
+      lower-right alignment matches this lane's ``[1, 1, S, T]`` mask exactly
+      when ``T == pos_start + S`` (see ``_prefill_causal_mask_is_exact``).
+      This is the regime below the indexer's own budget --
+      ``T <= (block_topk + 1) * ratio - 1``, i.e. 2,051 tokens on the
+      production pack -- plus vision requests, where QSA is bypassed.  With
+      the retained 4,096-token prefill width it therefore fires for NO chunk
+      of a 16K or 32K prompt; the win at those cells is entirely the bool
+      arm below.
+    * **bool** -- a real top-k selection, which no string can express; the
+      array is handed to the fused kernel untouched.
+
     Off by default: it trades a materialized score tensor (and its mask
     apply and softmax passes) for a flash kernel at a head dimension MLX
     considers unfavourable.  It is also NOT bit-identical -- online softmax
     reassociates the same visible set -- so it is a quality-gated arm.
+
+    Counters (``MTPLX_QSA_PREFILL_DEBUG=1``): ``mask_causal_eligible`` (the
+    lane saw an exactly-causal visible set, flag-independent),
+    ``mask_fuse_causal``, ``mask_fuse_bool``, ``mask_fuse_unavailable``.
     """
 
     raw = (os.environ.get("MTPLX_FABLE_PREFILL_MASK_FUSE") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
-#: One-shot capability probe.  ``force_fused=True`` raises host-side (no
-#: kernel is launched) when the build has no fused kernel for the geometry;
-#: retrying per call would pay that cost 12 x 8 times a request.
-_PREFILL_MASK_FUSE_UNAVAILABLE = False
+#: MLX's only string mask mode.  ``mx.fast.scaled_dot_product_attention``
+#: documents the alignment in MLX 0.32.2 itself (``mlx/core/fast.pyi``):
+#: *"The ``causal`` mask uses lower-right alignment where the last query
+#: aligns with the last key."*  That is exactly the offset case this lane
+#: needs -- chunk k carries ``pos_start`` keys of prior context and ``S``
+#: queries, so its last query IS its last key -- which is why a chunked
+#: prefill can pass the string instead of a ``[1, 1, S, T]`` tensor.
+_CAUSAL_MASK = "causal"
+
+
+def _prefill_causal_mask_is_exact(
+    *, pos_start: int, rows: int, total_keys: int
+) -> bool:
+    """Is the dense mask this lane would build exactly MLX's ``"causal"``?
+
+    The lane builds ``tpos[None, :] <= qpos[:, None]`` over
+    ``qpos = pos_start + arange(S)`` and ``tpos = arange(T)``: query row
+    ``i`` sees keys ``0 .. pos_start + i``.  MLX's lower-right ``"causal"``
+    gives row ``i`` keys ``0 .. T - S + i``.  The two agree for every row
+    iff ``T == pos_start + S`` -- i.e. iff the KV the cache just handed back
+    ends at this chunk's last query.
+
+    That is the normal case (``T`` comes straight out of
+    ``cache.kv.update_and_fetch``), but a cache that returned padded or
+    capacity-shaped keys would break it, and there the dense mask -- which
+    masks the pad columns off -- is the correct one.  Checked, never assumed.
+    """
+
+    return int(rows) > 0 and int(total_keys) == int(pos_start) + int(rows)
+
+
+#: One-shot capability probes, keyed by mask kind.  ``force_fused=True``
+#: raises host-side (no kernel is launched) when the build has no fused
+#: kernel for the geometry; retrying per call would pay that cost 12 x 8
+#: times a request.  ``"causal"`` and a bool array drive different Metal
+#: function constants of the same ``steel_attention`` specialisation
+#: (``do_causal`` / ``has_mask``), so availability is tracked per kind
+#: rather than shared: a build may serve one and refuse the other.
+_PREFILL_MASK_FUSE_UNAVAILABLE: Dict[str, bool] = {}
+
+
+def _prefill_mask_fuse_kind(mask) -> str:
+    """``"causal"`` for the string mode, ``"bool"`` for a real selection."""
+
+    return "causal" if isinstance(mask, str) else "bool"
+
+
+def _prefill_mask_fuse_refuse(kind: str, exc: BaseException) -> None:
+    """Disarm one mask kind for the rest of the process, loudly."""
+
+    _PREFILL_MASK_FUSE_UNAVAILABLE[kind] = True
+    _qsa_prefill_count("mask_fuse_unavailable")
+    import sys as _sys
+
+    print(
+        "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE armed but no fused "
+        f"{kind}-mask SDPA is available at head_dim {_MASK_FUSE_PROBE_HD[0]} "
+        "in this MLX; falling back to the dense/unfused route for the rest "
+        f"of the process: {exc}",
+        file=_sys.stderr,
+        flush=True,
+    )
+
+
+#: Filled by the probe so the refusal message can name the geometry it asked
+#: about instead of a generic "this geometry".
+_MASK_FUSE_PROBE_HD = [0]
+
+
+@lru_cache(maxsize=16)
+def _prefill_mask_fuse_probed(kind: str, head_dim: int, dtype_name: str) -> bool:
+    """Ask MLX ONCE, at this head_dim/dtype, whether the fused kernel exists.
+
+    ``force_fused=True`` is resolved while the op is built -- before any
+    encoder is opened -- so a two-row probe answers the question without
+    dispatching Metal work: it either returns a lazy array or raises.  The
+    answer is bound per ``(kind, head_dim, dtype)`` and never re-asked, so an
+    armed flag can never degrade into a per-call try/except in the hot lane,
+    and a build without the kernel refuses loudly at the first prefill
+    instead of silently measuring the control under a candidate label.
+    """
+
+    dtype = getattr(mx, dtype_name, None)
+    if dtype is None:
+        return False
+    _MASK_FUSE_PROBE_HD[0] = int(head_dim)
+    shape = (1, 1, 2, int(head_dim))
+    zeros = mx.zeros(shape, dtype=dtype)
+    mask = (
+        _CAUSAL_MASK
+        if kind == "causal"
+        else mx.ones((1, 1, 2, 2), dtype=mx.bool_)
+    )
+    try:
+        mx.fast.scaled_dot_product_attention(
+            zeros, zeros, zeros, scale=1.0, mask=mask, force_fused=True
+        )
+    except Exception as exc:  # older MLX, or no kernel for this geometry
+        _prefill_mask_fuse_refuse(kind, exc)
+        return False
+    return True
 
 
 def _prefill_mask_fuse_sdpa(q, k, v, *, scale, mask):
-    """Masked SDPA, fused when armed and available, else stock."""
+    """Masked SDPA, fused when armed and available, else stock.
 
-    global _PREFILL_MASK_FUSE_UNAVAILABLE
+    Two arms behind one door:
+
+    * ``mask is _CAUSAL_MASK`` -- the visible set is exactly causal (proved
+      host-side by :func:`_prefill_causal_mask_is_exact`), so no tensor is
+      built at all and MLX generates the mask inside the kernel.
+    * ``mask`` is a bool array -- the real QSA block selection, which no
+      string can express; the fused kernel reads it directly
+      (``steel_attention_..._maskbool_``).
+
+    **Exactness.**  Neither arm is bit-identical to the unfused route, and
+    both are the same rounding class.  The dense path materialises bf16
+    ``QK^T``, applies the mask with ``mx.where``, runs a precise two-pass
+    softmax and contracts ``P@V`` in bf16; the fused kernel streams tiles
+    through an fp32 online softmax and accumulates in fp32.  What is
+    identical is the VISIBLE SET -- causal-string and dense-causal mask
+    admit the same keys per row by construction, and the bool arm passes the
+    selection through untouched -- so this is reassociation of the same sum,
+    not an approximation, and it is gated by the agreement screen rather
+    than by a bit-parity assert.
+    """
+
+    kind = _prefill_mask_fuse_kind(mask)
     if (
         mask is not None
         # Prefill only. At S == 1 MLX already fuses (head_dim 256 IS in the
         # sdpa_VECTOR supported set); the fallback this flag exists to
         # replace is the S > 1 one.
         and int(q.shape[2]) > 1
-        and not _PREFILL_MASK_FUSE_UNAVAILABLE
+        and not _PREFILL_MASK_FUSE_UNAVAILABLE.get(kind, False)
         and _prefill_mask_fuse_enabled()
+        and _prefill_mask_fuse_probed(
+            kind, int(q.shape[-1]), str(q.dtype).rsplit(".", 1)[-1]
+        )
     ):
         try:
             out = mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=scale, mask=mask, force_fused=True
             )
-        except Exception as exc:  # older MLX, or no kernel for this geometry
-            _PREFILL_MASK_FUSE_UNAVAILABLE = True
-            _qsa_prefill_count("mask_fuse_unavailable")
-            import sys as _sys
-
-            print(
-                "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE armed but no fused "
-                "masked SDPA is available for this geometry; falling back "
-                f"for the rest of the process: {exc}",
-                file=_sys.stderr,
-                flush=True,
-            )
+        except Exception as exc:  # a geometry the probe could not stand in for
+            _prefill_mask_fuse_refuse(kind, exc)
         else:
-            _qsa_prefill_count("mask_fuse")
+            _qsa_prefill_count(
+                "mask_fuse_causal" if kind == "causal" else "mask_fuse_bool"
+            )
             return out
     return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
@@ -1780,17 +1913,26 @@ def _qsa_dense_attention(q, k, v, *, mask, scale):
     visible set per row is unchanged.  Reduction order is not: shorter
     softmax rows and a shorter P@V contraction, the same class of difference
     as the portable gather tier.
+
+    ``mask`` may also be :data:`_CAUSAL_MASK`, the string mode.  Tiling
+    composes with it without any slicing: ``query_tile_spans`` sets a tile's
+    key bound to ``context_before + row_end``, so the tile's own last query
+    is again its last key and MLX's lower-right ``"causal"`` describes the
+    sub-problem exactly.  The string is therefore passed through unchanged
+    while the K/V slices narrow, which is the whole point -- there is no
+    ``[1, 1, S, T]`` tensor to slice in the first place.
     """
 
     S = int(q.shape[2])
     tile = _prefill_qsa_query_tile_rows() if S > 1 else 0
     total_keys = int(k.shape[2])
+    causal_string = isinstance(mask, str)
     if (
         tile <= 0
         or tile >= S
         or mask is None
-        or int(mask.shape[-1]) != total_keys
         or total_keys < S
+        or (not causal_string and int(mask.shape[-1]) != total_keys)
     ):
         return _prefill_mask_fuse_sdpa(q, k, v, scale=scale, mask=mask)
 
@@ -1806,7 +1948,7 @@ def _qsa_dense_attention(q, k, v, *, mask, scale):
             k[:, :, :keys],
             v[:, :, :keys],
             scale=scale,
-            mask=mask[..., r0:r1, :keys],
+            mask=mask if causal_string else mask[..., r0:r1, :keys],
         )
         for r0, r1, keys in spans
     ]
@@ -3989,9 +4131,23 @@ class Attention(nn.Module):
         elif sel_mask is not None:
             mask = sel_mask
         elif S > 1:
-            qpos = pos_start + mx.arange(S, dtype=mx.int32)
-            tpos = mx.arange(T, dtype=mx.int32)
-            mask = (tpos[None, :] <= qpos[:, None])[None, None]
+            # No selection came back, so every visible key is visible: either
+            # the chunk's whole history fits the indexer budget
+            # (``last_nb <= block_topk``, i.e. ``T <= (block_topk + 1) * ratio
+            # - 1`` = 2,051 tokens on the production pack, where top-512 of
+            # <= 512 candidate blocks IS all of them), or the request is a
+            # vision one where QSA is bypassed outright.  In both cases the
+            # mask below is EXACTLY causal -- so when the flag is armed, hand
+            # MLX the string and never build the tensor.
+            _qsa_prefill_count("mask_causal_eligible")
+            if _prefill_mask_fuse_enabled() and _prefill_causal_mask_is_exact(
+                pos_start=pos_start, rows=S, total_keys=T
+            ):
+                mask = _CAUSAL_MASK
+            else:
+                qpos = pos_start + mx.arange(S, dtype=mx.int32)
+                tpos = mx.arange(T, dtype=mx.int32)
+                mask = (tpos[None, :] <= qpos[:, None])[None, None]
         else:
             mask = None
 
