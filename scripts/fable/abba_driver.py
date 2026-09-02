@@ -1912,6 +1912,14 @@ def build_family_overrides(
 def main() -> int:
     args = build_parser().parse_args()
     check_prompt_tokens(args)
+    # A measured arm must FAIL CLOSED.  The fable lanes decline (stand aside
+    # and run the shipped path) when a request shape does not suit them --
+    # that is the serving contract, and it is exactly wrong for a benchmark,
+    # where a silent decline would measure the control twice and label one of
+    # them the candidate.  Setting this before MLX is imported restores the
+    # old raise-on-ineligible behaviour for every armed lane in this process.
+    # `scripts/fable/humaneval_screen.py` deliberately does NOT set it.
+    os.environ.setdefault("MTPLX_FABLE_STRICT_CLAIMS", "1")
     if args.nan_warning_error:
         warnings.filterwarnings(
             "error",

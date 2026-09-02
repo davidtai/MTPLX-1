@@ -177,8 +177,11 @@ not in :data:`DEFAULT_ITEMS`, so an A/B measures the lever alone).
 from __future__ import annotations
 
 import os
+import sys
 import time
 from functools import lru_cache
+
+from .fable_claim_contract import STRICT_ENV, strict_claims
 
 __all__ = [
     "DEFAULT_ITEMS",
@@ -355,6 +358,11 @@ _RECEIPT_ZERO: dict[str, float] = {
     "prefix_build_calls": 0,
     "suffix_build_ms": 0.0,
     "suffix_build_calls": 0,
+    # Requests the lane stood aside for because the SHAPE of the request did
+    # not offer the physical-M4 compiled verify to split (a capture_commit
+    # verify strategy, compiled verify off for this context length).  Those
+    # run the shipped verify.  See `mtplx.fable_claim_contract`.
+    "declines": 0,
 }
 
 _RECEIPT: dict[str, float] = dict(_RECEIPT_ZERO)
@@ -378,6 +386,32 @@ def bump(name: str, value: float = 1) -> None:
     if name not in _RECEIPT_ZERO:
         raise KeyError(f"unknown {ENV_FLAG} receipt counter {name!r}")
     _RECEIPT[name] = _RECEIPT[name] + value
+
+
+def decline(detail: str) -> None:
+    """Stand aside for one request that offers nothing to overlap.
+
+    The armed flag needs the installed physical-M4 compiled verify on the
+    batched verify route.  Whether a request HAS one is request-shaped
+    (``verify_strategy`` is a per-request argument, and the compiled verify
+    can be off for this context length), so a miss must not raise: that turned
+    every such request into an HTTP 500.  One warning per process, a receipt
+    counter, and the shipped verify runs.
+    """
+
+    if strict_claims():
+        raise RuntimeError(
+            f"{ENV_FLAG}: {detail} "
+            f"[{STRICT_ENV}=1 turns request-time declines into failures]"
+        )
+    _RECEIPT["declines"] = _RECEIPT["declines"] + 1
+    if _RECEIPT["declines"] == 1:
+        print(
+            f"[{ENV_FLAG}] declined: {detail} -- this request runs the "
+            f"shipped verify; set {STRICT_ENV}=1 to fail closed instead",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def note_prefix_layers(count: int) -> None:

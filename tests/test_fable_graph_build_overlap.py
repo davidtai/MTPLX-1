@@ -1653,3 +1653,87 @@ def test_prefill_split_attributes_the_span_the_way_the_w67_reduce_did():
     assert split["outside_s"] == pytest.approx(0.5376, abs=1e-3)
     assert driver.prefill_split_receipt({"prompt_eval_time_s": 1.0})["chunk0_s"] is None
     assert driver.prefill_split_receipt({"prefill_chunks": []})["outside_s"] is None
+
+
+# ---------------------------------------------------------------------------
+# Request-time decline (the 2026-09-02 serving contract)
+# ---------------------------------------------------------------------------
+
+
+def test_a_request_with_nothing_to_overlap_declines_instead_of_raising():
+    """``verify_strategy`` is a per-REQUEST argument.
+
+    An armed lane that raises when a request offers no physical-M4 compiled
+    verify to split turns that request into an HTTP 500; the shipped verify
+    serves it perfectly.  One warning per process, a receipt counter, on.
+    """
+
+    from mtplx import fable_claim_contract as contract
+    from mtplx import graph_build_overlap as gbo
+
+    gbo.reset_receipt()
+    contract._configure_for_test(False)
+    try:
+        gbo.decline("verify_strategy='capture_commit'")
+        gbo.decline("verify_strategy='capture_commit'")
+    finally:
+        contract._configure_for_test(False)
+    assert gbo.last_receipt()["declines"] == 2
+
+
+def test_strict_claims_turns_the_overlap_decline_back_into_a_failure():
+    from mtplx import fable_claim_contract as contract
+    from mtplx import graph_build_overlap as gbo
+
+    gbo.reset_receipt()
+    contract._configure_for_test(True)
+    try:
+        with pytest.raises(RuntimeError, match="STRICT_CLAIMS"):
+            gbo.decline("verify_strategy='capture_commit'")
+    finally:
+        contract._configure_for_test(False)
+    assert gbo.last_receipt()["declines"] == 0
+
+
+def test_the_generation_call_site_declines_rather_than_raising():
+    import inspect
+
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    assert "_graph_build_overlap.decline(" in source
+    assert "requires the installed \n" not in source
+    # The depth-knob-without-the-lever check is process-invariant (an env
+    # misconfiguration), so it still raises.
+    assert "is set without " in source
+
+
+def test_the_arm_condition_has_no_sampler_term():
+    """Greedy and temperature-1 requests arm this lane identically.
+
+    The overlap splits the VERIFY graph; nothing about it depends on how the
+    draft was sampled. The only per-request terms are verify-shaped
+    (`verify_strategy`, whether a compiled verify bank exists for this
+    context), and those route rather than raise.
+    """
+
+    import ast
+    import inspect
+
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    tree = ast.parse(
+        "def f():\n" + "\n".join("    " + line for line in source.splitlines())
+    )
+    condition = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        text = ast.unparse(node.test)
+        if "_graph_build_overlap.enabled()" in text and "compiled_verify_bank" in text:
+            condition = text
+            break
+    assert condition is not None, "the graph-build-overlap arm condition moved"
+    for sampler_term in ("sampler", "temperature", "top_k", "top_p", "greedy"):
+        assert sampler_term not in condition

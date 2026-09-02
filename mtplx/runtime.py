@@ -1116,6 +1116,17 @@ def load(
                 routed_glu_enabled=routed_glu_enabled,
             )
             logger.info("[qwen4-M4-stage3] %s", qwen4_m4_stage3_report)
+        # MTPLX_FABLE_HC_M4's PACK contract, checked here because the weights
+        # exist by now.  Everything it validates is process-invariant, so a
+        # miss is a deployment error: it must stop the server coming up with a
+        # precise reason rather than turn the first request that reaches
+        # verify width into an HTTP 500.  No-op when the flag is off.
+        from .models.qwen4_exp import install_hc_m4_pack_validation
+
+        hc_m4_report = install_hc_m4_pack_validation(runtime.model)
+        runtime.qwen4_hc_m4_report = hc_m4_report
+        if hc_m4_report.get("armed"):
+            logger.info("[qwen4-hc-m4] %s", hc_m4_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError

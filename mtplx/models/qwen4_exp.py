@@ -931,12 +931,51 @@ class GatedResidual(nn.Module):
                 "for this model; the kernel has no other geometry."
             )
 
+    def validate_hc_m4_pack(self, label: str = "GatedResidual") -> None:
+        """The PACK half of the MTPLX_FABLE_HC_M4 contract, at install time.
+
+        Everything here is a property of the loaded weights, so it is the same
+        answer for every request this process will ever serve.  Checking it
+        when the weights land (``install_hc_m4_pack_validation``, called from
+        the runtime's qwen4 install section) means a mis-armed flag stops the
+        server coming up with a precise reason, instead of turning the first
+        request that reaches verify width into an HTTP 500.
+
+        Not checked here: the weight/activation dtype agreement, which needs
+        an activation -- ``_hc_m4_applies`` still checks it, and it is likewise
+        process-invariant, so it cannot single out one request either.
+        """
+
+        from mtplx.kernels import qwen4_m4_hyper_read as hcm4
+
+        down = self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        for name, proj in (
+            ("input_mix_weight_down", down),
+            ("input_mix_weight_up", up),
+        ):
+            if hasattr(proj, "scales"):
+                raise RuntimeError(
+                    f"MTPLX_FABLE_HC_M4: {label}.{name} is quantized; the "
+                    "kernel reads unquantized bf16 mix weights. Unset the "
+                    "flag for this pack."
+                )
+        wi = self.block_inject_weight.weight if "block_inject_weight" in self else None
+        try:
+            hcm4.check_weight_shapes(
+                self.hc_norm.weight, down.weight, up.weight, wi
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"MTPLX_FABLE_HC_M4: {label}: {exc}") from exc
+
     def _hc_m4_applies(self, hyper_input: mx.array) -> bool:
         """Verify-width fused read gate (MTPLX_FABLE_HC_M4).
 
         Rows 2..8 only -- rows == 1 keeps whatever the draft path already
-        uses (v3, or the eager chain). Returns True or RAISES: there is no
-        silent fallback once the flag is armed and the width matches.
+        uses (v3, or the eager chain).  The row count is the one REQUEST-shaped
+        term here and it routes (returns False) rather than raising; every
+        other term is a property of the pack, re-checked here but already
+        settled at install by :meth:`validate_hc_m4_pack`.
         """
 
         if not fable_hc_m4_enabled():
@@ -1074,6 +1113,74 @@ class GatedResidual(nn.Module):
             return mixed_input
         inject = 2.0 * mx.sigmoid(self.block_inject_weight(normed) / self.hc_count)
         return mixed_input, hyper_input, inject
+
+
+def install_hc_m4_pack_validation(model: Any) -> dict[str, Any]:
+    """Validate every ``GatedResidual`` against the MTPLX_FABLE_HC_M4 contract.
+
+    Called from the runtime's qwen4 install section once the weights are
+    loaded.  A no-op (``{"armed": False}``) when the flag is off, so an
+    unarmed process pays one attribute read.
+
+    This is the INSTALL-time half of the flag's contract.  Every property it
+    checks -- quantized mix weights, weight shapes -- belongs to the pack, so
+    a failure means the flag was armed for a model the kernel cannot read.
+    That is a deployment error and it should stop the server, not fail
+    whichever request first reaches verify width.
+
+    Discovery goes through :func:`_named_gated_residuals`, which walks the
+    model the way MLX itself does.  The first cut of this function walked
+    ``dir(layer)`` instead and found NOTHING on the real pack -- an
+    ``nn.Module``'s children live in its dict and are served by
+    ``__getattr__``, so ``dir()`` does not list them -- which turned an armed
+    flag into a dead server (2026-09-02, both the HumanEval screen and the
+    ABBA lane).  Never enumerate an MLX module with ``dir()``.
+    """
+
+    if not fable_hc_m4_enabled():
+        return {"armed": False, "validated": 0}
+
+    validated = 0
+    for path, module in _named_gated_residuals(model):
+        module.validate_hc_m4_pack(path)
+        validated += 1
+    if not validated:
+        raise RuntimeError(
+            "MTPLX_FABLE_HC_M4 is armed but no GatedResidual hyper-connection "
+            "module was found anywhere in "
+            f"{type(model).__name__}.named_modules(); the flag cannot do "
+            "anything here. Unset it for this model."
+        )
+    return {"armed": True, "validated": validated}
+
+
+def _named_gated_residuals(model: Any):
+    """``(dotted path, module)`` for every GatedResidual in ``model``.
+
+    ``nn.Module.named_modules`` is the model's OWN traversal -- the one that
+    finds its parameters -- so it reaches children held directly
+    (``model.hyper_connection_mixer``), inside lists (``model.layers[i]
+    .attn_hyper_connection``) and behind a published sub-tree
+    (``language_model.mtp.hyper_connection_mixer``) alike.  If the forward can
+    reach a module, this finds it.
+
+    Sorted by path so the failure message names layers in a stable order
+    rather than MLX's dict order.
+    """
+
+    named = getattr(model, "named_modules", None)
+    if named is None:  # pragma: no cover - every qwen4 model is an nn.Module
+        raise RuntimeError(
+            "MTPLX_FABLE_HC_M4 pack validation needs an mlx.nn.Module; got "
+            f"{type(model).__name__}"
+        )
+    found = [
+        (path, module)
+        for path, module in named()
+        if isinstance(module, GatedResidual)
+    ]
+    found.sort(key=lambda item: item[0])
+    return found
 
 
 class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
