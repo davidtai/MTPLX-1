@@ -1691,6 +1691,86 @@ RAW_ENV_MTPLX_READERS = {
 RAW_ENV_MTPLX_KEYS = frozenset(RAW_ENV_MTPLX_READERS)
 
 
+def fable_verify_glue_block(
+    runtime, *, require_calls: bool, strict: bool = True
+) -> dict:
+    """Engagement proof for ``MTPLX_FABLE_VERIFY_GLUE``, for the receipt row.
+
+    The 2026-09-02 W70 ABBA ran with the flag armed and produced NO evidence
+    either way: the lane's engagement line went to ``logger.info`` (invisible
+    in a driver run -- so are ``[qwen4-fixed-M4-verify]`` and
+    ``[qwen4-compiled-MTP-prepare]``) and no counter reached the receipt. An
+    arm that cannot prove which code it ran is unreadable, so this block is
+    mandatory whenever the flag is armed, and every way of failing to engage
+    RAISES rather than reporting a delta nobody can attribute:
+
+    * the install hook never ran  -- the runtime carries no install report, so
+      the item was inert and the candidate arm silently measured the control;
+    * every selected item disabled -- the probe found the kernel not
+      bit-exact, which is a real finding but NOT a benchmark;
+    * an installed item with zero hot-path calls -- it never got into the
+      graph, the same lie with a different cause.
+
+    ``require_calls`` is False at load (nothing is traced yet) and True at
+    receipt time, which is the only point where the call counters mean
+    anything.  ``strict=False`` collects the same failures into
+    ``block["problems"]`` instead of raising, so the receipt-time call can
+    still get its evidence onto disk before the run is refused.
+    """
+
+    problems: list[str] = []
+
+    def fail(message: str) -> None:
+        if strict:
+            raise RuntimeError(message)
+        problems.append(message)
+
+    from mtplx import fable_verify_glue as glue
+
+    block = glue.receipt()
+    if not block["armed"]:
+        return block
+    block["install_report"] = getattr(runtime, "_mtplx_fable_verify_glue", None)
+    if block["install_report"] is None:
+        fail(
+            "MTPLX_FABLE_VERIFY_GLUE is armed but its install probe never "
+            "ran: install_qwen4_fixed_verify_route did not reach it, so this "
+            "arm would measure the control while claiming the candidate "
+            f"(selected={block['selected']})"
+        )
+        block["problems"] = problems
+        return block
+    if block["pending"]:
+        fail(
+            "MTPLX_FABLE_VERIFY_GLUE item(s) still pending after load: "
+            f"{block['pending']}"
+        )
+    if not block["installed"]:
+        fail(
+            "MTPLX_FABLE_VERIFY_GLUE armed but every selected item is "
+            f"disabled: {block['disabled']}"
+        )
+    if block["disabled"]:
+        # A partial arm is still measurable, but the receipt must say which
+        # half of it is the control.
+        print(
+            "[fable-abba] verify-glue DISABLED items "
+            + json.dumps(block["disabled"], sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+    if require_calls:
+        uncalled = glue.uncalled_items(block)
+        if uncalled:
+            fail(
+                "MTPLX_FABLE_VERIFY_GLUE item(s) installed but never called: "
+                f"{uncalled}; calls={block['calls']}. The lane never entered "
+                "the graph, so this arm measured the control."
+            )
+    block["problems"] = problems
+    return block
+
+
 def is_raw_env_mtplx_key(key: str) -> bool:
     """Does this MTPLX_* key belong on the raw ``--env`` passthrough?"""
 
@@ -2090,6 +2170,15 @@ def main() -> int:
             )
         print(
             "[fable-abba] M4 route " + json.dumps(m4_report, sort_keys=True),
+            flush=True,
+        )
+    # W70: prove the verify-glue lane installed BEFORE the decode run, so a
+    # broken arm dies in seconds instead of after a full window.
+    verify_glue_block = fable_verify_glue_block(runtime, require_calls=False)
+    if verify_glue_block["armed"]:
+        print(
+            "[fable-abba] verify-glue "
+            + json.dumps(verify_glue_block, sort_keys=True, default=str),
             flush=True,
         )
     if args.relaxed_draft_ties and not getattr(
@@ -2647,6 +2736,12 @@ def main() -> int:
         # (2026-09-01); the allowlisted MTPLX_* keys additionally carry
         # requested-vs-effective and the file that reads them.
         "process_environment_overrides": process_environment_overrides,
+        # W70 MTPLX_FABLE_VERIFY_GLUE engagement. Re-read AFTER the run so the
+        # hot-path call counters are populated; raises if an item installed
+        # but never entered the graph.
+        "verify_glue": fable_verify_glue_block(
+            runtime, require_calls=True, strict=False
+        ),
         "paired_routed_glu": {
             "expected": candidate_environment.get("MTPLX_QWEN4_M4_ROUTED_GLU")
             == "1",
@@ -2690,6 +2785,13 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"[fable-abba] wrote {out}", flush=True)
+    # W70: refuse AFTER the write. The evidence for why an armed arm was
+    # unreadable is more useful on disk than in a traceback alone.
+    glue_problems = (payload.get("verify_glue") or {}).get("problems") or []
+    if glue_problems:
+        raise RuntimeError(
+            "this arm cannot be read as a candidate: " + "; ".join(glue_problems)
+        )
     return 0
 
 
