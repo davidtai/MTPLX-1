@@ -332,6 +332,16 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_QSA_PREFILL_GATHER_TILE",
         # Engagement-receipt atexit print for lane A/Bs (counters law).
         "MTPLX_QSA_PREFILL_DEBUG",
+        # Worker-thread preparation of the NEXT prefill chunk's PLE n-gram
+        # rows during this chunk's forward.  Default off; the gathers it
+        # overlaps are 8 host-late stalls totalling 2,313 ms in the census.
+        "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD",
+        # Fable 16K candidate: compare the crossover against the chunk's own
+        # total_tokens instead of total_tokens - rows, so the 8 x 2,048 cut of
+        # a 16,384-token prompt can reach the sparse lane at all.  Default off;
+        # arm it WITH MTPLX_QSA_PREFILL_DEBUG=1 (mtplx/qsa_prefill_16k.py
+        # records the prior 16K loss this re-tests).
+        "MTPLX_FABLE_QSA_PREFILL_16K",
         # Capture only one canonical chunk width so arbitrary final/restored
         # suffix sizes cannot grow the mx.compile graph bank without bound.
         "MTPLX_QSA_PREFILL_COMPILE_ROWS",

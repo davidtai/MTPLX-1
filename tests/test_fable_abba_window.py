@@ -712,3 +712,59 @@ class TestOuterCommandLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrefillOnlyTest(unittest.TestCase):
+    """``--prefill-only`` / ``--max-tokens`` move the shared baseline."""
+
+    def _specs(self, extra=()):
+        args = window.build_parser().parse_args(["--sequence", "1", *extra])
+        return window.arm_specification(args)
+
+    def test_default_is_unchanged_and_equals_control_flags(self):
+        specs = self._specs()
+        self.assertEqual(specs["A"]["flags"], list(window.CONTROL_FLAGS))
+        self.assertEqual(specs["B"]["flags"], list(window.CONTROL_FLAGS))
+
+    def test_prefill_only_lowers_max_tokens_on_both_arms(self):
+        specs = self._specs(["--prefill-only"])
+        for arm in ("A", "B"):
+            flags = specs[arm]["flags"]
+            self.assertEqual(flags.count("--max-tokens"), 1)
+            self.assertEqual(
+                flags[flags.index("--max-tokens") + 1],
+                str(window.PREFILL_ONLY_MAX_TOKENS),
+            )
+
+    def test_prefill_only_changes_nothing_else_about_the_control_arm(self):
+        base = list(window.CONTROL_FLAGS)
+        base[base.index("--max-tokens") + 1] = str(
+            window.PREFILL_ONLY_MAX_TOKENS
+        )
+        self.assertEqual(self._specs(["--prefill-only"])["A"]["flags"], base)
+
+    def test_explicit_max_tokens_wins_over_prefill_only(self):
+        specs = self._specs(["--prefill-only", "--max-tokens", "256"])
+        flags = specs["A"]["flags"]
+        self.assertEqual(flags[flags.index("--max-tokens") + 1], "256")
+
+    def test_candidate_and_control_flags_still_append_after_the_baseline(self):
+        specs = self._specs(
+            ["--prefill-only", "--candidate-flag=--nax-verify"]
+        )
+        self.assertEqual(specs["B"]["flags"][-1], "--nax-verify")
+        self.assertEqual(specs["A"]["flags"], specs["B"]["flags"][:-1])
+
+    def test_max_tokens_is_reserved_against_duplicate_arm_flags(self):
+        self.assertIn("--max-tokens", window.RESERVED_ARM_FLAGS)
+        with self.assertRaises(ValueError):
+            window.check_arm_flags(["--max-tokens"])
+
+    def test_resolve_max_tokens_rejects_a_non_positive_budget(self):
+        with self.assertRaises(ValueError):
+            window.resolve_max_tokens(0, False)
+
+    def test_control_flags_never_duplicates_the_option(self):
+        flags = window.control_flags(64)
+        self.assertEqual(flags.count("--max-tokens"), 1)
+        self.assertEqual(len(flags), len(window.CONTROL_FLAGS))
