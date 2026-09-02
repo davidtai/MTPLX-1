@@ -687,10 +687,27 @@ def test_the_probe_state_is_reset_every_cycle_and_captured_per_depth():
     body = _generate_mtpk_body()
     assert body.count("_d4_probe_state: tuple[Any, int, Any, bool] | None = None") == 1
     reset = body.index("_d4_probe_state: tuple[Any, int, Any, bool] | None = None")
-    loop = body.index("for depth_index in range(", reset)
-    capture = body.index("_d4_probe_state = (", loop)
     hook = body.index("if (\n                _FABLE_DEPTH4_PROBE")
-    assert reset < loop < capture < hook
+    # TWO capture sites, because there are two ways to draft a cycle: the
+    # per-depth host loop, and the MTPLX_FABLE_DEVICE_K20 chain that replaces
+    # it (`mtplx/fable_device_k20.py`).  Both must sit between the per-cycle
+    # reset and the hook, or the probe reads a stale capture -- or, worse,
+    # silently never fires on one of the two lanes.
+    captures = [
+        index
+        for index in range(len(body))
+        if body.startswith("_d4_probe_state = (", index)
+    ]
+    assert len(captures) == 2, "one capture site per drafting lane"
+    assert all(reset < index < hook for index in captures)
+    device_chain = body.index("_device_k20_chain = _FableDeviceDraftChain(")
+    stock_loop = body.index("for depth_index in range(\n            0\n")
+    assert reset < device_chain < captures[0] < stock_loop < captures[1] < hook
+    # The device lane's capture must read the MATERIALISED token, not a lazy
+    # device scalar: the hook builds `mx.array([[_d4_token]])` from it.
+    device_capture = body[captures[0] : captures[0] + 400]
+    assert "int(_dk_result.tokens[-1])" in device_capture
+    assert body.index("_dk_result = _device_k20_chain.materialize()") < captures[0]
 
 
 def test_the_probe_self_times_outside_the_production_timers():

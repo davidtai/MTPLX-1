@@ -214,6 +214,29 @@ TOP_P = 0.95
 LAYOUT_PR391 = "pr391_raw"
 LAYOUT_STOCK = "stock_prepared"
 LAYOUT_STOCK_BV = "stock_prepared_bv"
+#: ``MTPLX_FABLE_DEVICE_K20`` twins of the two stock layouts.  That flag moves
+#: WHERE the K20 rows were selected (an exact device kernel instead of
+#: ``argpartition``-to-80 + host ``lexsort``) and HOW the drafted token was
+#: sampled (on device, from the same PCG64 double); a row still means exactly
+#: what a ``stock_prepared`` row means -- shaped, renormalised, no raw logits
+#: -- so every scorer below reads one unchanged.  Kept in sync with
+#: ``mtplx/fable_k20_log.py``'s ``STOCK_LAYOUTS`` by
+#: ``tests/test_fable_device_k20.py``; this module deliberately imports no
+#: ``mtplx``.
+LAYOUT_STOCK_DEVICE_K20 = "stock_device_k20"
+LAYOUT_STOCK_DEVICE_K20_BV = "stock_device_k20_bv"
+
+#: Layouts whose rows are already SHAPED host rows.
+STOCK_LAYOUTS = frozenset(
+    {
+        LAYOUT_STOCK,
+        LAYOUT_STOCK_BV,
+        LAYOUT_STOCK_DEVICE_K20,
+        LAYOUT_STOCK_DEVICE_K20_BV,
+    }
+)
+#: Of those, the ones whose accept decision ran the block law.
+STOCK_BV_LAYOUTS = frozenset({LAYOUT_STOCK_BV, LAYOUT_STOCK_DEVICE_K20_BV})
 
 SELECTED_NONE = 0
 SELECTED_CORRECTION = 1
@@ -461,11 +484,11 @@ def log_spec(log: dict[str, np.ndarray]) -> dict[str, Any]:
     """Read the layout and the window shape off one loaded log."""
 
     layout = str(log["layout"]) if "layout" in log else LAYOUT_PR391
-    if layout not in {LAYOUT_PR391, LAYOUT_STOCK, LAYOUT_STOCK_BV}:
+    if layout != LAYOUT_PR391 and layout not in STOCK_LAYOUTS:
         raise ValueError(f"unknown K20 log layout {layout!r}")
     return {
         "layout": layout,
-        "block_armed": layout == LAYOUT_STOCK_BV,
+        "block_armed": layout in STOCK_BV_LAYOUTS,
         "block_cap": (str(log["block_cap"]) if "block_cap" in log else None),
         "depth": int(log["draft_tokens"].shape[1]),
         "target_rows": int(log["target_ids"].shape[1]),
@@ -531,7 +554,7 @@ def build_window(
 
     spec = spec or log_spec(log)
     depth = int(spec["depth"])
-    prepared = spec["layout"] in {LAYOUT_STOCK, LAYOUT_STOCK_BV}
+    prepared = spec["layout"] in STOCK_LAYOUTS
     draft_valid = log.get("draft_valid")
     target_valid = log.get("target_valid")
     if draft_valid is not None and not np.all(draft_valid[index, :depth]):
@@ -1197,7 +1220,7 @@ def report(result: dict[str, Any], *, ms_per_window: float | None) -> str:
                 f"{result['log_block_cap']!r}, this replay used "
                 f"{result['cap_mode']!r}"
             )
-    if result["layout"] in {LAYOUT_STOCK, LAYOUT_STOCK_BV}:
+    if result["layout"] in STOCK_LAYOUTS:
         lines.append(
             "                           stock lane: accept coins past the "
             "first rejection are"

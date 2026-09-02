@@ -88,7 +88,7 @@ import numpy as np
 
 from scripts.fable.offline_block_verification import (
     LAYOUT_STOCK,
-    LAYOUT_STOCK_BV,
+    STOCK_LAYOUTS,
     load_log,
     prepared_row,
 )
@@ -140,7 +140,7 @@ def require_probe_columns(log: dict[str, np.ndarray]) -> dict[str, Any]:
     """Fail loudly and specifically when the log was not written by a probe run."""
 
     spec = log_spec(log)
-    if spec["layout"] not in {LAYOUT_STOCK, LAYOUT_STOCK_BV}:
+    if spec["layout"] not in STOCK_LAYOUTS:
         raise SystemExit(
             f"depth-4 gate: layout {spec['layout']!r} is not a stock-lane log. "
             "The probe hooks the stock native-MTP accept loop's all-accept "
