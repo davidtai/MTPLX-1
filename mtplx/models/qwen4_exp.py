@@ -44,6 +44,7 @@ import re
 import struct
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -52,6 +53,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs, create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from mtplx import qsa_prefill_16k
 from mtplx.attention_context import vision_rope_state
 from mlx_lm.models.qwen3_5 import GatedDeltaNet as _Qwen3_5GatedDeltaNet
 from mlx_lm.models.qwen3_next import (
@@ -1548,11 +1550,70 @@ def _qsa_prefill_compile_rows() -> int:
         return 2048
 
 
+@lru_cache(maxsize=1)
+def _fable_qsa_prefill_16k() -> bool:
+    """MTPLX_FABLE_QSA_PREFILL_16K: read once, no silent fallback.
+
+    Off by default.  On, the sparse-QSA prefill crossover is compared against
+    the chunk's own ``total_tokens`` instead of ``total_tokens - rows``, so a
+    16,384-token prompt cut into 8 x 2,048 chunks can reach the 2026-08-29
+    lightning lane at all -- ``total_tokens - rows`` tops out at 14,336 there
+    and the shipped 2049 floor is above chunk 1's 2,048 history, so no value
+    of MTPLX_QSA_PREFILL_MIN_CONTEXT alone engages the first two chunks.
+
+    Arming this without the lane itself is a contradiction, not a fallback:
+    it raises instead of measuring the control under a candidate label.  See
+    :mod:`mtplx.qsa_prefill_16k` for the prior 16K receipt (a 12% LOSS) that
+    this flag exists to re-test with engagement counters, not to assume away.
+    """
+
+    if not qsa_prefill_16k.flag_from_env(os.environ):
+        return False
+    if not _qsa_prefill_enabled():
+        raise RuntimeError(
+            f"{qsa_prefill_16k.ENV_FLAG}=1 needs the sparse QSA prefill lane, "
+            "but MTPLX_QSA_PREFILL resolved off on this device; set "
+            "MTPLX_QSA_PREFILL=1 or clear the Fable flag"
+        )
+    return True
+
+
+def _fable_qsa_prefill_min_context() -> int:
+    """16K-candidate selector crossover (explicit operator value still wins)."""
+
+    return qsa_prefill_16k.crossover_from_env(
+        os.environ, qsa_prefill_16k.ENV_MIN_CONTEXT, _qsa_prefill_min_context()
+    )
+
+
+def _fable_qsa_prefill_flash_min_context() -> int:
+    """16K-candidate flash-consumer crossover (explicit value still wins)."""
+
+    return qsa_prefill_16k.crossover_from_env(
+        os.environ,
+        qsa_prefill_16k.ENV_FLASH_MIN_CONTEXT,
+        _qsa_prefill_flash_min_context(),
+    )
+
+
+def _fable_qsa_large_prefill_enabled(rows: int, total_tokens: int) -> bool:
+    """The 16K-candidate selector gate: history is the chunk's own T."""
+
+    return (
+        _qsa_prefill_enabled()
+        and current_attention_phase() == "prefill"
+        and int(rows) >= _qsa_prefill_min_rows()
+        and int(total_tokens) >= _fable_qsa_prefill_min_context()
+    )
+
+
 def _qsa_large_prefill_enabled(rows: int, total_tokens: int) -> bool:
     # S>1 is not sufficient: MTP target verification also uses multiple rows.
     # The request-scoped phase signal keeps speculative verify/rollback on its
     # existing exact cache path and reserves this matrix-shaped lane for the
     # prompt/SSD-restored prefill it was designed to accelerate.
+    if _fable_qsa_prefill_16k():
+        return _fable_qsa_large_prefill_enabled(rows, total_tokens)
     return (
         _qsa_prefill_enabled()
         and current_attention_phase() == "prefill"
@@ -1568,6 +1629,11 @@ def _qsa_large_prefill_enabled(rows: int, total_tokens: int) -> bool:
 def _qsa_prefill_flash_attention_enabled(rows: int, total_tokens: int) -> bool:
     """Whether compact block selections should bypass stock dense SDPA."""
 
+    if _fable_qsa_prefill_16k():
+        return (
+            _fable_qsa_large_prefill_enabled(rows, total_tokens)
+            and int(total_tokens) >= _fable_qsa_prefill_flash_min_context()
+        )
     return (
         _qsa_large_prefill_enabled(rows, total_tokens)
         and int(total_tokens) - int(rows) >= _qsa_prefill_flash_min_context()
