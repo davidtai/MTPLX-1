@@ -602,6 +602,129 @@ bank through all 12 updates so `mx.slice_update` can donate its input, which
 the real graph — where the verifier bank holds every pooled leaf — cannot do.
 It exists only to show how much of the stock spelling's cost is that copy.
 
+## Verify glue: `MTPLX_FABLE_VERIFY_GLUE` (W70)
+
+W69's node census (`docs/perf/verify-node-census.md`) counted the compiled
+fixed-M4 verify body at ~2,750 dispatch nodes per decode cycle, half of them
+inside the twelve QSA layers and most of those pure glue. This flag fuses that
+glue, one selectable item at a time. Off by default; per-item selection, same
+shape as `MTPLX_FABLE_OPDIET`.
+
+| item | what it replaces | exactness |
+| --- | --- | --- |
+| `qsa_rope` | the attention query+key rotation: the RoPE table build plus two five-dispatch rotations -- 16 dispatches over 7 read-after-write levels per QSA layer | bit-exact, proved at install against the live stock spelling |
+| `qsa_rope_idx` | the indexer's query preparation (RMSNorm + partial RoPE) -- 12 dispatches over 8 levels per QSA layer -- through the SHIPPED `qsa_indexer_prepare_queries_metal` that the fixed-M4 lane never called | bit-exact, pinned in `tests/test_qsa_indexer_prepare_metal.py` |
+
+`hc_triple` -- W69's second-ranked group -- is deliberately **not** an item.
+`hc_norm -> hc_down -> hc_up` cannot become one dispatch: `hc_down` produces
+`mixv[R,320]` across 81 cooperating threadgroups and every one of `hc_up`'s 320
+threadgroups reads the whole vector, and `hc_norm`'s `normed[R,10240]` is
+likewise read in full by every `hc_down` threadgroup. Those are grid-wide
+read-after-write edges and Metal has no grid-wide barrier inside a dispatch.
+The one-threadgroup spelling that would avoid them is the one
+`kernels/qwen4_m4_hyper_read.py` already measured at 13.2 tok/s against 67.8.
+
+### What the levels buy, and the census correction this makes
+
+The critical-path model charges **1.83 us per DEPENDENT GPU launch removed**
+and nothing for a sibling launch, which the concurrent encoder already
+overlaps -- so the multiplier is the number of read-after-write **levels**
+removed, not the number of dispatches. W69's table priced `qsa_rope` with
+`dep = 204` of 240 removed dispatches, i.e. it treated most of the group as
+dependent. Reading the actual chain says otherwise: the stock rotation is
+~7 levels deep with WIDE sibling fans (cos and sin are siblings; the four
+half multiply-adds are siblings; the six concatenate copies are siblings).
+
+| | dispatches/cycle | of which dependent (levels) | of which sibling | G | H | total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `qsa_rope` | 180 | 72 | 108 | 0.132 | 0.068 | **0.200 ms** |
+| `qsa_rope_idx` | 132 | 84 | 48 | 0.154 | 0.050 | **0.204 ms** |
+| both | 312 | 156 | 156 | 0.286 | 0.118 | **0.404 ms** |
+
+At the route kernel's measured 1.45x over-conversion that is up to 0.59 ms,
+i.e. **+0.7 to +1.0 tok/s**. W69's 0.464 ms for the whole group landed in the
+same region for a different reason: it counted the pooled-bank rope site
+(which stays with `MTPLX_FABLE_QSA_M4`'s `bank` item) and over-counted the
+dependent share.
+
+### The gate
+
+Modelled on the route kernel and the sparse-decode lane. Contract failures
+(geometry, dtype, rotary width, a missing head norm) **raise** -- an armed flag
+on a pack the kernel is not wired for means the arm measured a different model.
+Exactness failures **disable the item and log**: rope rounding is a numerical
+verdict, not a broken contract. An item that is armed but whose probe never ran
+also raises, so a receipt can never claim a win from an inert flag. The probe
+runs inside `install_qwen4_fixed_verify_route` -- model build, outside any
+`mx.compile` trace. `mtplx.fable_verify_glue.engagement()` carries the
+counters; `qk_calls` / `prep_calls` are the line to read first.
+
+### micro_verify_glue_a.py
+
+Price the items before spending an ABBA window. One verify cycle's worth of
+each arm, built then evaluated ONCE (the queued lane -- a per-kernel eager lane
+costs more host sync than these kernels cost GPU and has inverted a verdict
+before), in both the eager and the compiled lane. **The compiled lane decides**:
+the production verify body is one `mx.compile`'d graph, and it is also the only
+lane that answers the FMA-contraction question, because MLX's own fused
+multiply-add kernel is compiled by the same Metal front end. `differing` must
+be 0 there.
+
+Arms: `rope_prediet` (op diet off), `rope_stock` (today's stack, the reference),
+`rope_scoped` (`rope_stock` inside `_rope_table_scope()` -- not an item, it
+prices the finding that the op diet's table memo is inert on the fixed-M4
+verify route, which never enters the scope), `rope_fused`; plus `prep_stock`
+and `prep_fused`.
+
+~1 minute of GPU. Still a guarded window: it issues Metal work.
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a/scripts/fable/micro_verify_glue_a.py \
+    --layers 12 \
+    --out /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-verify-glue-a.json
+```
+
+`--layers 48` amplifies the same per-layer work four-fold when 12 layers land
+inside the A/A noise floor; it is not a production count.
+
+### The ABBA
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 36000 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a/scripts/fable/abba_window.py \
+    --sequence 1788400901 \
+    --order ABBA \
+    --label-prefix fable-w70-verify-glue-a \
+    --python /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+    --control-flag=--prewarm-ngram-table \
+    --candidate-extra-env MTPLX_FABLE_VERIFY_GLUE=1 \
+    --candidate-extra-env MTPLX_FABLE_VERIFY_GLUE_ITEMS=qsa_rope
+```
+
+The queue adds the stack flags (`MTPLX_FABLE_BLOCK_VERIFY`,
+`MTPLX_FABLE_DRAFT_K20_PRESCATTER`, `MTPLX_FABLE_GRAPH_BUILD_OVERLAP`(+`_LAYERS`),
+`MTPLX_FABLE_HC_M4`, `MTPLX_FABLE_OPDIET`, `MTPLX_FABLE_ROUTE_KERNEL`) as
+`--control-extra-env` on BOTH arms from its stack file, so the candidate is the
+stack plus one item. Swap the item for `qsa_rope_idx`, or drop
+`MTPLX_FABLE_VERIFY_GLUE_ITEMS` entirely to measure both at once -- but a
+combined arm cannot attribute a win, which is the whole reason the items are
+separately selectable.
+
 ## PYTHONPATH
 
 Always export
