@@ -107,8 +107,8 @@ class PrefillChunkPlan:
     chunk_size: int
     total_tokens: int
     chunks: int
-    #: Query rows whose attention chain is simultaneously live.  Equal to
-    #: ``chunk_size`` unless the QSA query tile is armed.
+    #: Query rows whose attention chain is simultaneously live, per lane.
+    #: Equal to ``chunk_size`` unless the QSA query tile is armed.
     live_query_rows: int
     transient_bytes: int
     resident_bytes: int
@@ -118,6 +118,12 @@ class PrefillChunkPlan:
     #: sum over chunks of (rows x context) -- the attention work term, which
     #: is NOT constant in the chunk width unless the query tile is armed.
     attention_row_context_products: int
+    #: Chunks whose layer bodies are in flight at the same moment.  1 for the
+    #: shipped serial schedule; >1 only under ``fable_prefill_wavefront``,
+    #: where each live lane materializes its own attention chain.  Trails the
+    #: other fields with a default so every existing positional construction
+    #: and every stored receipt keeps its meaning.
+    live_lanes: int = 1
 
     @property
     def headroom_bytes(self) -> int | None:
@@ -136,6 +142,7 @@ class PrefillChunkPlan:
             "total_tokens": self.total_tokens,
             "chunks": self.chunks,
             "live_query_rows": self.live_query_rows,
+            "live_lanes": self.live_lanes,
             "transient_bytes": self.transient_bytes,
             "resident_bytes": self.resident_bytes,
             "projected_peak_bytes": self.projected_peak_bytes,
@@ -187,6 +194,7 @@ def plan_prefill_chunk_memory(
     budget_bytes: int | None = None,
     margin_bytes: int = DEFAULT_GUARD_MARGIN_BYTES,
     query_tile: int = 0,
+    live_lanes: int = 1,
 ) -> PrefillChunkPlan:
     """Project the peak for one geometry.
 
@@ -196,17 +204,24 @@ def plan_prefill_chunk_memory(
     returns for ``chunk_size=DEFAULT_CHUNK_SIZE``.  It is linear in the
     number of query rows simultaneously live, so a wider chunk scales it and
     an armed query tile caps it.
+
+    ``live_lanes`` (default 1 = the shipped serial schedule) multiplies the
+    transient by the number of chunks whose layer bodies are in flight at the
+    same moment.  Only ``mtplx.fable_prefill_wavefront`` passes anything
+    else; at 1 this function is byte-identical to what it was before the
+    parameter existed.
     """
 
     chunk = max(1, int(chunk_size))
     total = max(0, int(total_tokens))
     tile = max(0, int(query_tile))
+    lanes = max(1, int(live_lanes))
     live_rows = min(chunk, tile) if tile else chunk
     per_token = max(0, int(transient_bytes_per_token))
     scaled_per_token = int(
         round(per_token * (live_rows / float(DEFAULT_CHUNK_SIZE)))
     )
-    transient = scaled_per_token * total
+    transient = scaled_per_token * total * lanes
     resident = max(0, int(resident_bytes))
     chunks = (total + chunk - 1) // chunk if total else 0
     return PrefillChunkPlan(
@@ -214,6 +229,7 @@ def plan_prefill_chunk_memory(
         total_tokens=total,
         chunks=chunks,
         live_query_rows=live_rows,
+        live_lanes=lanes,
         transient_bytes=transient,
         resident_bytes=resident,
         projected_peak_bytes=resident + transient,
