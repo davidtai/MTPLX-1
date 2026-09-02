@@ -30,10 +30,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-MODULE = Path(
-    "/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/"
-    "scripts/fable/census_retained_stack.py"
-)
+MODULE = Path(__file__).resolve().parent / "census_retained_stack.py"
 spec = importlib.util.spec_from_file_location("census_retained_stack", MODULE)
 census = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(census)
