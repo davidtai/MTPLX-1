@@ -102,64 +102,58 @@ measures it directly (queued lane, under the flock) and also proves the
 split-vs-merged bit-exactness on the production shape.  Run it BEFORE any ABBA
 window: a flat T curve arms the lane, a linear one kills it.
 
-STATUS -- WHAT IS WIRED AND WHAT IS NOT (read this before arming anything)
---------------------------------------------------------------------------
-WIRED: the flag, the ring policy, the mask, the contract/install gate, the
-counters, the exact fold primitives (``mtplx/kernels/gdn_keepmask_fold.py``)
-and the guarded micro that prices them.
+STATUS -- WHAT IS WIRED (W66b, 2026-09-02)
+------------------------------------------
+Arm A of ``scripts/fable/micro_gdn_keepmask_fold.py`` answered the falsifier
+on the production shape (35 layers, ring 2, 200 reps, guarded window):
+``T = 12`` costs **+0.083 ms/cycle** over ``T = 4`` -- ``gated_delta_step`` is
+STATE-BOUND and the fold's extra rows are ~free.  Arm B priced the two forms,
+both bit-exact in every accept pattern: the KERNEL form
+(``mtplx_gated_delta_step_prefix``) runs at 0.83-0.86x of today on a
+single-window commit and 0.64-0.67x on a two-window ring, while the pure-MLX
+concatenate form is 1.4x SLOWER on single windows.  So the kernel form is what
+is wired.
 
-NOT WIRED: the compiled verify graph does not yet take a prefix.  That is a
-deliberate stop, not an omission.  The fold only pays if
-``gated_delta_step``'s wall time is flat in ``T`` -- it trades 0.499 state
-passes per cycle (110 MB, 0.28-0.35 ms at 318-394 GB/s) for
-``4 * ring_windows`` extra ``t`` iterations in all 36 verify step kernels.
-The census measures dispatch counts and command-buffer times, not per-kernel
-times, so nothing in it decides that; ``scripts/fable/micro_gdn_keepmask_fold
-.py`` arm A does, in one guarded window.  Wiring 150 lines through the
-compiled M4 graph before that number exists would be building on a coin flip.
+Wired, all behind ``MTPLX_FABLE_GDN_KEEPMASK_FOLD=1`` (default off):
 
-WIRING PLAN (once arm A says state-bound)
------------------------------------------
-The design is fail-safe: there is no flush protocol and no site that can read
-a stale state.
+1. ``CompiledVerifyBank._resolve_gdn_keepmask_fold`` (mtplx/graphbank.py) --
+   arms the lane once per fixed-M4 installation, BEFORE the verify graph is
+   traced.  Structural mismatches (layer count, head geometry, a non-f32
+   recurrent state, more than one PLE layer) RAISE; only the
+   split-vs-merged exactness probe disables-and-logs.
+2. ``CompiledVerifyBank._fold_window_prefix`` + ``_forward_installed_fixed_m4``
+   -- every window pushes ``base`` into slot 1 in place of the deferred
+   commit's lazy leaf and appends 5 padded row tensors per foldable layer plus
+   one SHARED ``[1, 4*W]`` bool mask (176 leaves at W=2) to the trailing state
+   args.  One arity, one set of shapes, on every window whatever the ring
+   holds -- a depth-0 ring passes cached all-zero pads under an all-False
+   mask, which is an exact no-op and zero dispatches.
+3. ``CompiledVerifyBank._make_verify_step`` -- ``spec`` consumes ``state_in``
+   positionally, so the prefix is ``state_in[pos:]``; it is bound into a
+   contextvar keyed by shadow-entry identity for the duration of the traced
+   forward.  ``_SHARED_VERIFY_STEPS``'s global key carries the fold dimension,
+   so a folded trace can never be served to a bank that is not passing a
+   prefix.
+4. ``GatedDeltaNet.__call__`` (mtplx/models/qwen4_exp.py) -- captures the new
+   rows first (unchanged), then runs ``prefix_gated_delta_update`` when a
+   prefix is in scope.  ``y`` is already only the window's rows, so
+   ``cache.advance(S)`` is untouched.
+5. ``Qwen4ExpTextModel.commit_verified_window`` -- a partial accept whose
+   verify was THIS window's compiled graph binds ``cache[1]`` to the lazy
+   masked replay and hangs a ``FoldPending`` off the entry instead of
+   replaying eagerly.  The conv-state commit, the PLE layer's exact-width
+   replay and the QSA trims are byte-identical.
 
-1. ``Qwen4ExpTextModel.commit_verified_window`` (mtplx/models/qwen4_exp.py):
-   for the 35 non-PLE GDN layers, instead of
-   ``gated_delta_update(q[:, :keep], ..., pre[1], None)``, bind
-   ``entry.cache[1] = masked_replay_state(ring_rows, keeps, ..., base)``
-   -- the SAME state, built lazily and left unevaluated -- and hang a
-   ``FoldPending(base, rows, keeps, state)`` off the entry.  The conv-state
-   commit, the PLE layer's exact-width replay and the QSA trims are unchanged.
-   ``pre[1]`` is itself the previous cycle's pending leaf, so
-   ``pending_for(entry)`` on it yields the base and the ring to extend;
-   ``ring_after_commit`` decides extend vs flush, and a flush is just
-   "treat the pending leaf as the new base" (MLX evaluates one masked replay
-   covering the whole ring -- one state pass for several windows).
-
-2. ``CompiledVerifyBank._forward_installed_fixed_m4`` (mtplx/graphbank.py):
-   when a GDN entry's slot-1 leaf is its own live pending leaf, push ``base``
-   in its place and append the layer's six padded prefix leaves
-   (``q, k, v, a, b`` at ``[1, 4*W, ...]`` plus the ``[1, 4*W]`` bool mask) to
-   the trailing args.  Otherwise pass the leaf as it does today.  After the
-   call, publish slot 1 as it does today; ``commit_verified_window`` (partial
-   accept) or the all-accept branch's early return (which never commits, so
-   the graph's own full-window state stays and the ring is empty by
-   definition) leaves the invariant intact.
-
-3. ``CompiledVerifyBank._make_verify_step``: ``state_in`` is consumed
-   positionally by ``spec``; the trailing prefix args are simply
-   ``state_in[pos:]``.  Install them in a contextvar keyed by
-   ``id(shadow_entry)`` before the forward.
-
-4. ``GatedDeltaNet.__call__`` (mtplx/models/qwen4_exp.py): capture
-   ``_mtplx_verify_rows`` from the NEW rows first (unchanged), then, if a
-   prefix is in scope for this cache entry, run
-   ``prefix_gated_delta_update`` (or ``folded_gated_delta_update`` on the
-   no-new-Metal route) and keep only the window rows of ``y``.
-   ``cache.advance(S)`` still advances by the window width.
-
-5. Add a ``fold`` dimension to ``_SHARED_VERIFY_STEPS``'s global key so a
-   folded trace can never be served to a bank that is not passing a prefix.
+WHY THE COMMIT CANNOT RE-DERIVE THE RING FROM THE SNAPSHOT
+----------------------------------------------------------
+The family lane snapshots LAZILY: ``snapshot_untrimmable_cache_lazy`` retains
+``leaf[...]``, a fresh view object, so ``pre[1] is pending.state`` is False
+even when the two hold the same value.  The compiled window therefore STAMPS
+the descriptor it consumed onto the entry (``set_active``) and the commit
+honours it only for its own window (``active_for``).  Everything else --
+a context-copy block round's ``forward_ar``, an eager AR round, a rollback
+re-forward, a refused commit -- leaves no stamp and takes the shipped replay,
+which is why those paths need no flush protocol of their own.
 
 FAIL-SAFE PROPERTY.  Every non-fold consumer -- a context-copy block round, a
 rollback re-forward, ``detach_cache_state``,
@@ -168,6 +162,83 @@ rollback re-forward, ``detach_cache_state``,
 it costs exactly today's replay.  ``pending_for`` drops the descriptor the
 moment anything else rebinds the leaf, so a rollback or a trim silently
 degrades the fold to today's behaviour instead of corrupting it.
+
+WHAT THE FOLD COSTS THAT TODAY DOES NOT
+---------------------------------------
+* The deferred base stays alive.  Today's ``state_in`` leaf is sole-referenced
+  by the time the graph runs and MLX may donate its buffer; under the fold the
+  descriptor holds a reference, so it is not donated.  Bound at two states per
+  foldable layer, i.e. ~220 MB at W=2 -- 0.2% of the 100 GiB wired limit.
+* One ``mx.concatenate`` per row tensor per commit at W >= 2 (175 lazy copies
+  of ~163 kB a layer, riding the next window's pre-boundary ``async_eval``).
+  At W = 1 there is none: ``padded_prefix_leaves`` returns the captured rows
+  themselves.
+* 35 cached all-zero pad tuples, one per foldable layer (~5.7 MB total,
+  allocated once).  They are per layer rather than shared so a depth-0
+  window hands the graph 175 DISTINCT arrays -- one array in 35 input
+  positions would make the traced graph's input identity depend on the ring
+  depth of whichever window happened to trace it.
+* Every window runs its 36 step kernels at ``T = 4*W + 4`` rather than 4,
+  including the ~29.5% that enter with an empty ring.  That is the +0.083
+  ms/cycle arm A priced, and it buys the removal of 0.499 state passes/cycle.
+
+THE ABBA WINDOW AND ITS RECEIPT GATE
+------------------------------------
+Run the 16K decode bracket from the merged main worktree
+(``$ROOT`` = /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps).
+``abba_window.py`` must be the guard's direct child, so it goes through
+``bench/laguna/run_guarded.py``; running it bare prints the exact outer line
+and refuses::
+
+    cd $ROOT && PYTHONPATH=$ROOT $ROOT/.venv/bin/python \
+      /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+        --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+        --lock-timeout-seconds 1800 --child-timeout-seconds 36000 \
+        -- $ROOT/.venv/bin/python $ROOT/scripts/fable/abba_window.py \
+             --sequence <N> \
+             --label-prefix w66b-gdn-keepmask-fold \
+             --prompt-tokens 16384 \
+             --order ABBA \
+             --python $ROOT/.venv/bin/python \
+             --control-flag=--prewarm-ngram-table \
+             --candidate-extra-env MTPLX_FABLE_GDN_KEEPMASK_FOLD=1
+
+Verified with ``--dry-run``: 12 arms (3 seeds x ABBA), every arm carrying the
+retained stack (``--target-mode batched --require-compiled-verify --m4-stage3
+--qsa-fused-kv-gather --full-frspec --compiled-mtp-prepare --max-tokens 1024``
+plus ``MTPLX_QWEN4_M4_ROUTED_{DOWN_REDUCE,DOWN_RESIDUAL_TAIL,GLU}=1``) and
+``--prewarm-ngram-table``, and only the six B arms carrying
+``--env MTPLX_FABLE_GDN_KEEPMASK_FOLD=1``.
+
+A ring sweep is ``--candidate-extra-env
+MTPLX_FABLE_GDN_KEEPMASK_FOLD_WINDOWS=1|3``; W=1 is the concatenate-free arm
+(0.497 flushes/cycle but no padded prefix to build at all), W=3 trades a
+deeper ring and ``T = 16`` for 0.112.
+
+``--control-flag=--prewarm-ngram-table`` moves the SHARED baseline (both arms);
+the current stack flags are the queue's, added from its own file, and
+``CONTROL_FLAGS``/``CONTROL_CANDIDATE_ENV`` in ``abba_window.py`` already carry
+the retained lane.  ``MTPLX_FABLE_*`` is the one MTPLX namespace
+``--candidate-extra-env`` accepts, which is why the flag rides there rather
+than ``--candidate-env``.
+
+Read ``row["gdn_keepmask_fold"]`` on every candidate row BEFORE reading any
+timing.  ``receipt_gate`` decides it; the arm counts as having run the lane
+only when all of:
+
+* ``installed`` is true and ``install_error`` is null (35 folded layers),
+* ``windows == compiled_m4_calls`` -- a window on the shipped route took the
+  control's commit and dilutes the delta by exactly its share,
+* ``flushes / windows ~= 0.20`` at W = 2 (the ring policy's stationary rate
+  under the census accept law; the gate allows 35%).  A rate near 0.70 means
+  something is FORCING the deferred leaf every cycle,
+* ``declines == 0``,
+* ``response_token_sha256`` identical to the control arm's on the same seed.
+
+Expected saving, from the micro: today's commit replay is 1.14-1.64 ms per
+commit event at 0.70 events/cycle = 0.8-1.1 ms/cycle; the fold leaves
+~0.20 flushes/cycle x ~1.0 ms ~= 0.2, i.e. **-0.6 to -0.9 ms/cycle** against a
+~15 ms net M4 window, less the +0.083 ms/cycle of arm A's extra rows.
 
 ENV
 ---
@@ -178,9 +249,11 @@ ENV
 
 from __future__ import annotations
 
+import contextlib
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 #: The one geometry this lane is wired for (Qwen3.8 Flash-Next 125B-A6B).
 VERIFY_WIDTH = 4
@@ -267,6 +340,29 @@ def prefix_rows() -> int:
     return VERIFY_WIDTH * fable_gdn_keepmask_fold_windows()
 
 
+#: Row tensors a folded layer contributes to the compiled graph's trailing
+#: args: ``q``, ``k``, ``v``, ``a``, ``b``.  The keep mask is NOT per layer --
+#: the ring is one shared object across the 35 foldable layers, so one
+#: ``[1, 4*W]`` bool leaf serves all of them and the graph grows by 176 inputs
+#: rather than 210.
+PREFIX_LEAVES_PER_LAYER = 5
+
+
+def prefix_leaf_count(layers: int) -> int:
+    """Trailing leaves the compiled verify carries for ``layers`` folded layers.
+
+    One number, used by the producer (``_fold_window_prefix``) and by the
+    consumer (``_make_verify_step``'s arity check) so a shape drift is a loud
+    ValueError at the graph boundary rather than a silently misaligned prefix
+    36 layers deep.
+    """
+
+    count = int(layers)
+    if count < 0:
+        raise ValueError(f"layers must be >= 0; got {layers}")
+    return PREFIX_LEAVES_PER_LAYER * count + (1 if count else 0)
+
+
 def reset_fable_gdn_keepmask_fold_cache() -> None:
     """Drop the memoised gates.  Test support only."""
 
@@ -294,6 +390,9 @@ STATS: dict[str, Any] = {
     "ring_depth_hist": {},    # ring length at window entry -> count
     "state_passes_saved": 0,  # layer-level passes not dispatched
     "state_bytes_saved": 0,
+    "declines": 0,            # windows/commits that fell back to today's path
+    "decline_reasons": {},    # reason -> count
+    "bypassed_commits": 0,    # commits from a NON-M4 round (copy/AR/re-forward)
 }
 
 _LOGGED = False
@@ -328,8 +427,12 @@ def reset_stats() -> None:
             "ring_depth_hist": {},
             "state_passes_saved": 0,
             "state_bytes_saved": 0,
+            "declines": 0,
+            "decline_reasons": {},
+            "bypassed_commits": 0,
         }
     )
+    reset_window_seq()
 
 
 def stats_snapshot() -> dict[str, Any]:
@@ -337,6 +440,7 @@ def stats_snapshot() -> dict[str, Any]:
 
     snapshot = dict(STATS)
     snapshot["ring_depth_hist"] = dict(STATS["ring_depth_hist"])
+    snapshot["decline_reasons"] = dict(STATS["decline_reasons"])
     return snapshot
 
 
@@ -636,7 +740,254 @@ def note_deferred_commit(*, layers: int, flushed: bool) -> None:
         STATS["state_bytes_saved"] += int(layers) * 2 * STATE_BYTES
 
 
+# --------------------------------------------------------------------------
+# Window sequence -- the stamp that ties a commit to ITS OWN verify
+# --------------------------------------------------------------------------
+#
+# ``commit_verified_window`` cannot re-derive the ring from the snapshot: the
+# family lane snapshots LAZILY (``snapshot_untrimmable_cache_lazy`` retains
+# ``leaf[...]``, a fresh view object), so ``pre[1] is pending.state`` is False
+# even when the two hold the same value.  Instead the compiled window stamps
+# the descriptor it consumed onto the entry, and the commit honours it only
+# when the stamp is THIS window's.  A copy round, a rollback re-forward, an
+# eager AR forward or a refused commit all leave a stale stamp that the next
+# window overwrites and that no commit can mistake for its own.
+
+_WINDOW_SEQ = 0
+ACTIVE_ATTR = "_mtplx_fold_active"
+
+
+def next_window_seq() -> int:
+    """Open a new compiled-window epoch and return its stamp."""
+
+    global _WINDOW_SEQ
+    _WINDOW_SEQ += 1
+    return _WINDOW_SEQ
+
+
+def current_window_seq() -> int:
+    """The stamp of the most recently opened window."""
+
+    return _WINDOW_SEQ
+
+
+def reset_window_seq() -> None:
+    """Test support: rewind the epoch counter."""
+
+    global _WINDOW_SEQ
+    _WINDOW_SEQ = 0
+
+
+def set_active(entry: Any, pending: "FoldPending", seq: int) -> None:
+    """Record the descriptor this window's graph consumed for ``entry``."""
+
+    entry._mtplx_fold_active = (int(seq), pending)
+
+
+def active_for(entry: Any, seq: int) -> "FoldPending | None":
+    """The descriptor stamped for window ``seq``, or ``None``.
+
+    ``None`` is always safe: the caller replays exactly as it does today.
+    """
+
+    stamped = getattr(entry, ACTIVE_ATTR, None)
+    if stamped is None:
+        return None
+    try:
+        stamp, pending = stamped
+    except Exception:
+        return None
+    return pending if int(stamp) == int(seq) else None
+
+
+def clear_active(entry: Any) -> None:
+    """Drop the window stamp so one window's commit cannot be applied twice."""
+
+    if getattr(entry, ACTIVE_ATTR, None) is not None:
+        entry._mtplx_fold_active = None
+
+
+# --------------------------------------------------------------------------
+# Prefix scope -- how the compiled body's step kernel finds its prefix
+# --------------------------------------------------------------------------
+#
+# The compiled verify's Python body runs at TRACE time only; replays bind the
+# same graph positionally.  The scope therefore exists purely so
+# ``GatedDeltaNet.__call__`` can wire the trailing prefix tracers into the
+# right layer's step while the trace is being built.  It is keyed by the
+# SHADOW entry's identity, so a layer with no prefix (the PLE-carrying GDN
+# layer, or any layer under a declined window) simply misses the map and takes
+# the stock ``gated_delta_update`` it takes today.
+
+_PREFIX_SCOPE: ContextVar[dict[int, Any] | None] = ContextVar(
+    "mtplx_gdn_keepmask_fold_prefix", default=None
+)
+
+
+@contextlib.contextmanager
+def fold_prefix_scope(mapping: dict[int, Any] | None) -> Iterator[None]:
+    """Bind ``id(cache entry) -> prefix leaves`` for one traced forward."""
+
+    token = _PREFIX_SCOPE.set(mapping)
+    try:
+        yield
+    finally:
+        _PREFIX_SCOPE.reset(token)
+
+
+def fold_prefix_for(entry: Any) -> Any:
+    """This layer's ``(q, k, v, a, b, mask)`` prefix, or ``None``."""
+
+    scope = _PREFIX_SCOPE.get()
+    if not scope:
+        return None
+    return scope.get(id(entry))
+
+
+# --------------------------------------------------------------------------
+# Ring advance -- one committed window against the descriptor its verify used
+# --------------------------------------------------------------------------
+
+
+def advance_ring(
+    pending: "FoldPending",
+    window_rows: Any,
+    accepted_keep: int,
+    *,
+    max_windows: int,
+) -> tuple[Any, list[Any], tuple[int, ...], bool]:
+    """``(base, rows, keeps, flushed)`` for the post-commit descriptor.
+
+    On a flush the OLD pending leaf becomes the new base: MLX evaluates one
+    masked replay covering the whole old ring (one state pass for several
+    windows) the next time the base is read, which is the next window's
+    ``state_in``.  That bounds the lazy chain at two levels -- the base handed
+    to a graph is always evaluated by that graph's own pre-boundary
+    ``async_eval``, so a flush can never stack a third.
+    """
+
+    decision = ring_after_commit(
+        pending.keeps, accepted_keep, max_windows=max_windows
+    )
+    if decision.flush:
+        if pending.state is None:
+            raise GdnKeepMaskFoldContractError(
+                "a ring flush needs a materialisable pending state"
+            )
+        return pending.state, [window_rows], decision.keeps, True
+    return pending.base, [*pending.rows, window_rows], decision.keeps, False
+
+
+def note_decline(reason: str) -> None:
+    """Count one window or commit that fell back to today's exact path.
+
+    A decline is never a correctness event -- it is today's answer at today's
+    cost -- but a candidate arm with declines did not measure the lane, so the
+    receipt gate fails on any non-zero count.
+    """
+
+    STATS["declines"] += 1
+    key = str(reason)
+    STATS["decline_reasons"][key] = STATS["decline_reasons"].get(key, 0) + 1
+
+
+# --------------------------------------------------------------------------
+# Receipt gate -- is a candidate ABBA arm's engagement the lane we priced?
+# --------------------------------------------------------------------------
+
+#: 112 all-accept of 374 classified cycles, W58 retained-control census.
+CENSUS_P_ALL_ACCEPT = 112 / 374
+
+
+def receipt_gate(
+    snapshot: dict[str, Any],
+    *,
+    compiled_windows: int,
+    p_all_accept: float = CENSUS_P_ALL_ACCEPT,
+    tolerance: float = 0.35,
+) -> dict[str, Any]:
+    """Decide from the receipt alone whether an arm ran the priced lane.
+
+    ``compiled_windows`` is the arm's ``compiled_verify.compiled_calls`` --
+    the number of fixed-M4 windows the bank actually replayed.  The gate is
+    deliberately about ENGAGEMENT, not speed: it answers "did this arm run the
+    fold on every window, with the flush rate the ring policy predicts, and
+    without ever falling back", so a null result can be read as a null result
+    rather than as an inert flag.
+    """
+
+    checks: list[dict[str, Any]] = []
+
+    def _check(name: str, ok: bool, detail: Any) -> None:
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+    installed = bool(snapshot.get("installed"))
+    _check("installed", installed, snapshot.get("install_status"))
+    _check("no_install_error", snapshot.get("install_error") is None,
+           snapshot.get("install_error"))
+    _check(
+        "folded_layers",
+        int(snapshot.get("folded_layers") or 0) == FOLDABLE_LAYERS,
+        snapshot.get("folded_layers"),
+    )
+    declines = int(snapshot.get("declines") or 0)
+    _check("fold_declined_zero", declines == 0, snapshot.get("decline_reasons"))
+
+    windows = int(snapshot.get("windows") or 0)
+    _check(
+        "windows_cover_compiled_calls",
+        windows == int(compiled_windows),
+        {"fold_windows": windows, "compiled_calls": int(compiled_windows)},
+    )
+
+    expected_flushes = expected_state_passes_per_cycle(
+        p_all_accept, max_windows=int(snapshot.get("max_windows") or 0) or 2
+    )
+    flushes = int(snapshot.get("flushes") or 0)
+    observed = (flushes / windows) if windows else float("nan")
+    within = (
+        windows > 0
+        and abs(observed - expected_flushes) <= tolerance * expected_flushes
+    )
+    _check(
+        "flushes_per_cycle",
+        within,
+        {
+            "observed": observed,
+            "expected": expected_flushes,
+            "tolerance_frac": tolerance,
+        },
+    )
+
+    deferred = int(snapshot.get("deferred_commits") or 0)
+    expected_commits = (1.0 - float(p_all_accept)) * windows if windows else 0.0
+    commits_ok = windows > 0 and abs(deferred - expected_commits) <= (
+        tolerance * max(1.0, expected_commits)
+    )
+    _check(
+        "deferred_commits_track_partial_accepts",
+        commits_ok,
+        {"deferred_commits": deferred, "expected": expected_commits},
+    )
+
+    hist = dict(snapshot.get("ring_depth_hist") or {})
+    max_windows = int(snapshot.get("max_windows") or 0)
+    depth_ok = bool(hist) and all(
+        0 <= int(key) <= max_windows for key in hist
+    )
+    _check("ring_depth_within_max", depth_ok, hist)
+
+    return {
+        "ok": all(item["ok"] for item in checks),
+        "checks": checks,
+        "expected_flushes_per_cycle": expected_flushes,
+        "observed_flushes_per_cycle": observed,
+    }
+
+
 __all__ = [
+    "ACTIVE_ATTR",
+    "CENSUS_P_ALL_ACCEPT",
     "DEFAULT_MAX_WINDOWS",
     "ENV_FLAG",
     "ENV_LOG",
@@ -650,18 +1001,31 @@ __all__ = [
     "STATE_BYTES",
     "STATS",
     "VERIFY_WIDTH",
+    "active_for",
+    "advance_ring",
+    "clear_active",
     "clear_pending",
+    "current_window_seq",
     "expected_state_passes_per_cycle",
     "fable_gdn_keepmask_fold_enabled",
     "fable_gdn_keepmask_fold_windows",
+    "fold_prefix_for",
+    "fold_prefix_scope",
     "install_gdn_keepmask_fold",
+    "next_window_seq",
+    "note_decline",
     "note_deferred_commit",
     "note_window",
     "pending_for",
     "prefix_mask_rows",
+    "PREFIX_LEAVES_PER_LAYER",
+    "prefix_leaf_count",
     "prefix_rows",
+    "receipt_gate",
     "reset_fable_gdn_keepmask_fold_cache",
     "reset_stats",
+    "reset_window_seq",
+    "set_active",
     "stats_snapshot",
     "validate_layer_contract",
     "validate_state_contract",

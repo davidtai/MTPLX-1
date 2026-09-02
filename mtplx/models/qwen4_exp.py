@@ -62,6 +62,7 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
+from mtplx import fable_gdn_keepmask_fold as _gdn_fold
 from mtplx.fable_indexer_reuse import (
     ENV_FLAG as FABLE_INDEXER_REUSE_ENV,
     current_draft_depth,
@@ -75,6 +76,31 @@ from mtplx.runtime_options import (
     fable_opdiet_enabled,
     fable_qsa_m4_enabled,
 )
+
+#: MTPLX_FABLE_GDN_KEEPMASK_FOLD, resolved at import for the same reason every
+#: other `MTPLX_FABLE_*` gate is: the GDN hot path must not read `os.environ`,
+#: and two traces of one compiled verify graph must not disagree about which
+#: recurrence they hold.  When it is False the fold costs one constant test
+#: per GDN forward and nothing else.
+_GDN_KEEPMASK_FOLD_ARMED = _gdn_fold.fable_gdn_keepmask_fold_enabled()
+
+_GDN_FOLD_KERNELS: Any = None
+
+
+def _gdn_fold_kernels():
+    """The fold's MLX entry points, imported once.
+
+    Kept out of the module header so an unarmed process never imports the
+    kernel module at all, and out of the per-layer loops so an armed one does
+    not pay 35 `sys.modules` lookups per commit.
+    """
+
+    global _GDN_FOLD_KERNELS
+    if _GDN_FOLD_KERNELS is None:
+        from mtplx.kernels import gdn_keepmask_fold
+
+        _GDN_FOLD_KERNELS = gdn_keepmask_fold
+    return _GDN_FOLD_KERNELS
 
 
 @dataclass
@@ -704,18 +730,53 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
             # surfaces as extra outputs.
             cache._mtplx_verify_rows = (qkv, q, k, v, a, b)
 
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
+        # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66b).  A prefix is in scope only
+        # inside the compiled physical-M4 verify's traced body, only for the
+        # 35 non-PLE GDN layers, and only when the fixed-M4 dispatch pushed
+        # this layer's padded ring in the trailing state leaves.  When it is,
+        # `state` is the ring's BASE (the dispatch substituted it for the
+        # deferred commit's lazy leaf) and the kernel runs the ring's masked
+        # rows and this window's four rows from one state read and one state
+        # write -- bit-identical to today's two passes, because the recurrence
+        # state round-trips through fp32 memory.  `y` is already only the
+        # window's rows, so nothing below changes: `cache.advance(S)` still
+        # advances by the window width.
+        prefix = (
+            _gdn_fold.fold_prefix_for(cache)
+            if (
+                _GDN_KEEPMASK_FOLD_ARMED
+                and cache is not None
+                and mask is None
+                and state is not None
+                and not self.training
+            )
+            else None
         )
+        if prefix is None:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+        else:
+            out, state = _gdn_fold_kernels().prefix_gated_delta_update(
+                *prefix[:6],
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+            )
 
         if cache is not None:
             cache[1] = state
@@ -6013,6 +6074,23 @@ class Qwen4ExpTextModel(nn.Module):
                 return self._refuse_commit(i, "gdn_snapshot_short")
             plan.append(("gdn", i, rows))
 
+        # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66b).  Decided once, for the WHOLE
+        # window, after every entry has validated and before any is mutated --
+        # so a refusal above still leaves the cache intact for the
+        # rollback + re-forward fallback, and the ring can never end up half
+        # advanced.  The fold applies only to a commit whose verify was THIS
+        # window's compiled physical-M4 graph (`active_for` matches the stamp
+        # that graph left), which is why a copy round's `forward_ar`, a
+        # rollback re-forward and an eager AR round all take the shipped
+        # replay below untouched.
+        fold_actives, fold_windows = self._gdn_keepmask_fold_plan(
+            cache, plan, keep_tokens=keep_tokens, verified_tokens=verified_tokens
+        )
+        fold_flushed = False
+        masked_replay_state = (
+            _gdn_fold_kernels().masked_replay_state if fold_actives else None
+        )
+
         for kind, i, payload in plan:
             entry = cache[i]
             layer = self.layers[i]
@@ -6030,18 +6108,54 @@ class Qwen4ExpTextModel(nn.Module):
                         (qkv.shape[0], gdn.conv_kernel_size - 1, qkv.shape[2]),
                         dtype=qkv.dtype,
                     )
-                _, new_state = gated_delta_update(
-                    q[:, :keep_tokens],
-                    k[:, :keep_tokens],
-                    v[:, :keep_tokens],
-                    a[:, :keep_tokens],
-                    b[:, :keep_tokens],
-                    gdn.A_log,
-                    gdn.dt_bias,
-                    pre[1],
-                    None,
-                    use_kernel=not gdn.training,
-                )
+                active = fold_actives.get(i)
+                if active is None:
+                    _, new_state = gated_delta_update(
+                        q[:, :keep_tokens],
+                        k[:, :keep_tokens],
+                        v[:, :keep_tokens],
+                        a[:, :keep_tokens],
+                        b[:, :keep_tokens],
+                        gdn.A_log,
+                        gdn.dt_bias,
+                        pre[1],
+                        None,
+                        use_kernel=not gdn.training,
+                    )
+                else:
+                    base, ring_rows, ring_keeps, fold_flushed = (
+                        _gdn_fold.advance_ring(
+                            active,
+                            (q, k, v, a, b),
+                            keep_tokens,
+                            max_windows=fold_windows,
+                        )
+                    )
+                    # `new_state` is the SAME state the replay above produces,
+                    # built lazily: anything that reads or evaluates
+                    # `entry[1]` -- a context-copy block round, a rollback
+                    # re-forward, `detach_cache_state`,
+                    # MTPLX_EVAL_STATE_ROOTS_ON_COMMIT, the session bank --
+                    # pays exactly today's replay and gets exactly today's
+                    # answer.  The next compiled window instead recognises the
+                    # descriptor, starts from `base`, and lets MLX drop the
+                    # unevaluated replay.
+                    new_state = masked_replay_state(
+                        ring_rows,
+                        ring_keeps,
+                        gdn.A_log,
+                        gdn.dt_bias,
+                        base,
+                    )
+                    entry._mtplx_fold_pending = _gdn_fold.FoldPending(
+                        base=base,
+                        rows=ring_rows,
+                        keeps=ring_keeps,
+                        state=new_state,
+                    )
+                if _GDN_KEEPMASK_FOLD_ARMED:
+                    # One window's stamp is consumed once.
+                    _gdn_fold.clear_active(entry)
                 conv_input = mx.concatenate(
                     [conv_pre, qkv[:, :keep_tokens]], axis=1
                 )
@@ -6064,7 +6178,66 @@ class Qwen4ExpTextModel(nn.Module):
                     cache=entry,
                 )
                 entry._mtplx_verify_ple = None
+        if fold_actives:
+            _gdn_fold.note_deferred_commit(
+                layers=len(fold_actives), flushed=fold_flushed
+            )
         return True
+
+    def _gdn_keepmask_fold_plan(
+        self,
+        cache,
+        plan,
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+    ):
+        """Which GDN layers may DEFER this commit, and at what ring depth.
+
+        Returns ``({layer_index: FoldPending}, max_windows)``; an empty map
+        means every layer takes the shipped eager replay.  All-or-nothing by
+        construction: the ring is one shared object across the 35 foldable
+        layers (one shared mask, one shared depth), so a window where any
+        layer disagrees defers none of them.
+
+        Never raises.  Every rejection is either a BYPASS (this commit did not
+        come from a compiled M4 window -- a copy round, an eager AR round, a
+        re-forward) or a DECLINE (the window was foldable and something about
+        it was not what the lane is wired for).  Both fall through to today's
+        exact replay; only the second is an anomaly, and the receipt gate
+        fails on it.
+        """
+
+        if not _GDN_KEEPMASK_FOLD_ARMED or not _gdn_fold.STATS.get("installed"):
+            return {}, 0
+        gdn_layers = [index for kind, index, _payload in plan if kind == "gdn"]
+        if not gdn_layers:
+            return {}, 0
+        seq = _gdn_fold.current_window_seq()
+        actives = {
+            index: _gdn_fold.active_for(cache[index], seq)
+            for index in gdn_layers
+        }
+        live = {index: a for index, a in actives.items() if a is not None}
+        if not live:
+            _gdn_fold.STATS["bypassed_commits"] += 1
+            return {}, 0
+        if len(live) != len(actives):
+            _gdn_fold.note_decline("partial_window_stamp")
+            return {}, 0
+        if int(verified_tokens) != _gdn_fold.VERIFY_WIDTH:
+            _gdn_fold.note_decline(f"verify_width_{int(verified_tokens)}")
+            return {}, 0
+        if not 1 <= int(keep_tokens) < _gdn_fold.VERIFY_WIDTH:
+            # A whole-window accept returns in generation.py before this
+            # method is called, so reaching here means the lane's assumption
+            # about the accept branch no longer holds.
+            _gdn_fold.note_decline(f"keep_tokens_{int(keep_tokens)}")
+            return {}, 0
+        if len({tuple(a.keeps) for a in live.values()}) != 1:
+            _gdn_fold.note_decline("ring_depth_disagreement")
+            return {}, 0
+        return live, _gdn_fold.fable_gdn_keepmask_fold_windows()
 
 
 class TextModel(nn.Module):

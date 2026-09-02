@@ -249,6 +249,13 @@ def prefix_gated_delta_update(
     kernel = prefix_gated_delta_kernel()
     if kernel is None:
         raise RuntimeError("prefix gated-delta kernel requires Metal")
+    # One template instantiation covers BOTH halves, so a prefix in a
+    # different dtype than the window would be read through the window's
+    # `InT` -- wrong bytes, silently.  Cheap host check, no dispatch.
+    if q_pre.dtype != q.dtype or k_pre.dtype != k.dtype:
+        raise ValueError(
+            f"prefix dtype {q_pre.dtype} does not match window dtype {q.dtype}"
+        )
     beta_pre = mx.sigmoid(b_pre)
     beta = mx.sigmoid(b)
     g_pre = compute_g(A_log, a_pre, dt_bias)
@@ -385,13 +392,20 @@ def masked_replay_state(
 
     from mlx_lm.models.gated_delta import gated_delta_update
 
+    if not prefix_rows_:
+        return state
     mask_list = [index < keep for keep in keeps for index in range(VERIFY_WIDTH)]
+    if len(prefix_rows_) == 1:
+        # A one-window ring is the common case; concatenating a single piece
+        # would be five pure copies on a leaf that anything may force.
+        rows = tuple(prefix_rows_[0])
+    else:
+        rows = tuple(
+            mx.concatenate([row[index] for row in prefix_rows_], axis=1)
+            for index in range(5)
+        )
     _y, state_out = gated_delta_update(
-        mx.concatenate([row[0] for row in prefix_rows_], axis=1),
-        mx.concatenate([row[1] for row in prefix_rows_], axis=1),
-        mx.concatenate([row[2] for row in prefix_rows_], axis=1),
-        mx.concatenate([row[3] for row in prefix_rows_], axis=1),
-        mx.concatenate([row[4] for row in prefix_rows_], axis=1),
+        *rows,
         A_log,
         dt_bias,
         state,
@@ -401,9 +415,257 @@ def masked_replay_state(
     return state_out
 
 
+# --------------------------------------------------------------------------
+# Fixed-shape prefix buffers -- what the compiled graph is handed every window
+# --------------------------------------------------------------------------
+#
+# The compiled physical-M4 verify traces ONCE, so the prefix it receives is one
+# fixed shape on every window whatever the ring holds: ``[1, 4*W, ...]`` rows
+# plus a ``[1, 4*W]`` bool mask.  A ring of depth ``d < W`` pads the FRONT with
+# masked slots, and a ring of depth 0 is all pad -- an exact no-op on the state
+# and, because the pad and the all-False mask are cached constants, zero
+# dispatches.  Padding cannot reorder anything: a masked row takes the stock
+# kernel's ``else`` branch, which writes ``y = 0`` and leaves the register
+# state untouched, so pad slots commute with live ones.
+
+_PAD_CACHE: dict[tuple[int, Any], tuple[Any, ...]] = {}
+_MASK_CACHE: dict[tuple[tuple[int, ...], int], Any] = {}
+
+
+def _pad_leaves(pad_rows: int, dtype) -> tuple[Any, ...]:
+    """Cached all-zero ``(q, k, v, a, b)`` filler of ``pad_rows`` rows."""
+
+    key = (int(pad_rows), dtype)
+    cached = _PAD_CACHE.get(key)
+    if cached is None:
+        cached = (
+            mx.zeros((1, pad_rows, NUM_K_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_K_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
+        )
+        # Deliberately NOT evaluated here: the first window's pre-boundary
+        # `mx.async_eval(*state_in)` materialises them with everything else,
+        # and the cached array objects hold the buffers afterwards.  An
+        # `mx.eval` here would put a host sync inside a decode cycle to build
+        # a constant.
+        _PAD_CACHE[key] = cached
+    return cached
+
+
+def prefix_mask_array(keeps: Sequence[int], *, max_windows: int):
+    """Cached ``[1, 4*max_windows]`` bool prefix mask for one ring shape.
+
+    There are at most ``3**W + ... + 1`` distinct rings (13 at W=2), so every
+    mask a run can ever need is built once and then reused as a constant --
+    no per-cycle host-to-device copy on the decode path.
+    """
+
+    key = (tuple(int(k) for k in keeps), int(max_windows))
+    cached = _MASK_CACHE.get(key)
+    if cached is None:
+        cached = mx.array(
+            [prefix_mask_rows(key[0], max_windows=key[1])], dtype=mx.bool_
+        )
+        _MASK_CACHE[key] = cached
+    return cached
+
+
+_EMPTY_CACHE: dict[tuple[int, Any, int], tuple[Any, ...]] = {}
+
+
+def empty_prefix_leaves(*, max_windows: int, dtype, slot: int = 0):
+    """The depth-0 prefix for ONE layer: all pad, all masked, all cached.
+
+    ``slot`` is the layer's position in the fold plan, and the leaves are
+    cached per slot rather than shared, so the 175 row inputs a depth-0 window
+    hands the compiled graph are 175 DISTINCT arrays.  Handing one array to 35
+    input positions would make the traced graph's input identity depend on the
+    ring depth of the window that happened to trace it, which is exactly the
+    kind of thing that works until the first depth-1 window.  The cost is 35
+    copies of a ~163 kB constant, allocated once.
+    """
+
+    key = (VERIFY_WIDTH * int(max_windows), dtype, int(slot))
+    cached = _EMPTY_CACHE.get(key)
+    if cached is None:
+        pad_rows = key[0]
+        cached = (
+            mx.zeros((1, pad_rows, NUM_K_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_K_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
+        )
+        _EMPTY_CACHE[key] = cached
+    return cached
+
+
+def padded_prefix_leaves(
+    ring_rows: Sequence[tuple[Any, Any, Any, Any, Any]],
+    keeps: Sequence[int],
+    *,
+    max_windows: int,
+    dtype,
+) -> tuple[Any, ...]:
+    """``(q, k, v, a, b)`` at ``[1, 4*max_windows, ...]`` for one layer's ring.
+
+    A full ring of exactly one window (``max_windows == 1``) returns the
+    captured rows THEMSELVES -- no pad, no concatenate, no dispatch.  Deeper
+    rings pay one ``mx.concatenate`` per tensor per commit; the concatenates
+    are lazy, so they ride the next window's pre-boundary ``async_eval``
+    rather than costing a separate submission.
+    """
+
+    if len(ring_rows) != len(keeps):
+        raise ValueError(
+            f"ring has {len(ring_rows)} row groups for {len(keeps)} keeps"
+        )
+    width = VERIFY_WIDTH * int(max_windows)
+    pad_rows = width - VERIFY_WIDTH * len(keeps)
+    if pad_rows < 0:
+        raise ValueError(
+            f"ring of {len(keeps)} windows exceeds max_windows={max_windows}"
+        )
+    if not ring_rows:
+        raise ValueError("an empty ring uses empty_prefix_leaves")
+    if pad_rows == 0 and len(ring_rows) == 1:
+        return tuple(ring_rows[0])
+    pieces: list[list[Any]] = [[] for _ in range(5)]
+    if pad_rows:
+        pad = _pad_leaves(pad_rows, dtype)
+        for index in range(5):
+            pieces[index].append(pad[index])
+    for row in ring_rows:
+        for index in range(5):
+            pieces[index].append(row[index])
+    return tuple(mx.concatenate(piece, axis=1) for piece in pieces)
+
+
+def reset_prefix_caches() -> None:
+    """Test support: drop the cached pads and masks."""
+
+    _PAD_CACHE.clear()
+    _MASK_CACHE.clear()
+    _EMPTY_CACHE.clear()
+
+
+# --------------------------------------------------------------------------
+# Install-time exactness probe (the ONE gate that disables instead of raising)
+# --------------------------------------------------------------------------
+
+
+_PROBE_CACHE: dict[tuple[int, int], tuple[bool, str]] = {}
+
+
+def default_exactness_probe(*, max_windows: int = 2, seed: int = 0):
+    """Compare the folded recurrence against the shipped two-pass one.
+
+    Runs on the production geometry with one layer's worth of synthetic rows:
+    two step dispatches for the reference, one for the candidate.  Returns
+    ``(ok, detail)``; ``install_gdn_keepmask_fold`` DISABLES the lane on a
+    False rather than raising, because a mismatch is a fact about this MLX
+    build's kernel (does its fp32 state round-trip?) rather than a
+    misconfiguration of this process.
+
+    Memoised per ``(max_windows, seed)``: the answer is a property of the MLX
+    build, and ``install_fixed_m4`` runs once per REQUEST -- a server would
+    otherwise pay three dispatches and a host sync on every one.
+    """
+
+    key = (int(max_windows), int(seed))
+    cached = _PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = _run_exactness_probe(max_windows=int(max_windows), seed=int(seed))
+    _PROBE_CACHE[key] = result
+    return result
+
+
+def reset_exactness_probe_cache() -> None:
+    """Test support: forget the memoised probe verdict."""
+
+    _PROBE_CACHE.clear()
+
+
+def _run_exactness_probe(*, max_windows: int, seed: int):
+    from mlx_lm.models.gated_delta import gated_delta_update
+
+    if not mx.metal.is_available():
+        return False, "metal unavailable"
+    state_key = mx.random.key(int(seed))
+    keeps = (2,) if int(max_windows) >= 1 else ()
+
+    def _rows(width: int, key):
+        keys = mx.random.split(key, 5)
+        return (
+            mx.random.normal(
+                (1, width, NUM_K_HEADS, HEAD_DIM), key=keys[0]
+            ).astype(mx.bfloat16),
+            mx.random.normal(
+                (1, width, NUM_K_HEADS, HEAD_DIM), key=keys[1]
+            ).astype(mx.bfloat16),
+            mx.random.normal(
+                (1, width, NUM_V_HEADS, HEAD_DIM), key=keys[2]
+            ).astype(mx.bfloat16),
+            mx.random.normal((1, width, NUM_V_HEADS), key=keys[3]).astype(
+                mx.bfloat16
+            ),
+            mx.random.normal((1, width, NUM_V_HEADS), key=keys[4]).astype(
+                mx.bfloat16
+            ),
+        )
+
+    parts = mx.random.split(state_key, 4)
+    A_log = mx.random.normal((NUM_V_HEADS,), key=parts[0]).astype(mx.float32)
+    dt_bias = mx.random.normal((NUM_V_HEADS,), key=parts[1]).astype(mx.bfloat16)
+    state = mx.random.normal(
+        (1, NUM_V_HEADS, HEAD_DIM, HEAD_DIM), key=parts[2]
+    ).astype(mx.float32)
+    ring = _rows(VERIFY_WIDTH, parts[3])
+    window = _rows(VERIFY_WIDTH, parts[0])
+
+    keep = keeps[0]
+    _y, mid = gated_delta_update(
+        *(tensor[:, :keep] for tensor in ring),
+        A_log,
+        dt_bias,
+        state,
+        None,
+        use_kernel=True,
+    )
+    reference_y, reference_state = gated_delta_update(
+        *window, A_log, dt_bias, mid, None, use_kernel=True
+    )
+
+    prefix = padded_prefix_leaves(
+        [ring], keeps, max_windows=max_windows, dtype=mx.bfloat16
+    )
+
+    mask = prefix_mask_array(keeps, max_windows=max_windows)
+    folded_y, folded_state = prefix_gated_delta_update(
+        *prefix, mask, *window, A_log, dt_bias, state
+    )
+    state_diff = int(mx.sum(reference_state != folded_state).item())
+    y_diff = int(mx.sum(reference_y != folded_y).item())
+    if state_diff or y_diff:
+        return False, (
+            f"split/merged recurrence mismatch: state={state_diff} "
+            f"y={y_diff} differing elements"
+        )
+    return True, "bit-exact on the production geometry"
+
+
 __all__ = [
+    "default_exactness_probe",
+    "reset_exactness_probe_cache",
+    "empty_prefix_leaves",
     "folded_gated_delta_update",
     "masked_replay_state",
+    "padded_prefix_leaves",
     "prefix_gated_delta_kernel",
     "prefix_gated_delta_update",
+    "prefix_mask_array",
+    "reset_prefix_caches",
 ]
