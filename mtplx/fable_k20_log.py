@@ -98,7 +98,8 @@ key                          dtype / shape               meaning
 ``decision_uniforms``        float64 ``[C, D+1]``        accept coins, then the
                                                          correction/bonus draw
 ``decision_uniforms_valid``  uint8   ``[C]``             real entries of the above
-``draft_uniforms``           float64 ``[C, D]``          draft-select draws (pr391)
+``draft_uniforms``           float64 ``[C, D]``          draft-select draws
+                                                         (pr391 + device K20)
 ``accepted``                 uint32  ``[C]``             accepted depth count
 ``first_reject``             int32   ``[C]``             -1 when none
 ``selected_token``           uint32  ``[C]``             correction or bonus
@@ -215,6 +216,19 @@ DECISION_DRAWS = DEPTH + 1
 LAYOUT_PR391 = "pr391_raw"
 LAYOUT_STOCK = "stock_prepared"
 LAYOUT_STOCK_BV = "stock_prepared_bv"
+#: The stock lane with ``MTPLX_FABLE_DEVICE_K20=1``.  Same schema, same
+#: preparation, same accept law; what changes is WHERE the K20 rows came from
+#: (an exact device top-20 kernel) and HOW the drafted token was sampled (on
+#: device, from the float32 CDF of the same shaped row, against the same PCG64
+#: double).  ``draft_uniforms`` is populated for this layout -- the stock
+#: layouts leave it NaN because the host ``rng.choice`` consumes its double
+#: inside NumPy and never surfaces it -- so an armed run can replay the draft
+#: selection offline as well as the accept decision.  See
+#: ``mtplx/fable_device_k20.py``.
+LAYOUT_STOCK_DEVICE_K20 = "stock_device_k20"
+#: Device K20 *and* block verification.  Carries the ``stock_prepared_bv``
+#: ladder columns on top of the device layout.
+LAYOUT_STOCK_DEVICE_K20_BV = "stock_device_k20_bv"
 
 SELECTED_NONE = 0
 SELECTED_CORRECTION = 1
@@ -470,6 +484,8 @@ class K20RowLog:
         rng: Any = None,
         block_verify: bool = False,
         block: Any = None,
+        device_k20: bool = False,
+        draft_uniforms: Sequence[float] | None = None,
     ) -> None:
         """Open one stock verify window and copy every row already on the host.
 
@@ -495,7 +511,17 @@ class K20RowLog:
 
         if not _ENABLED or not self.enabled:
             return
-        self._claim_layout(LAYOUT_STOCK_BV if block_verify else LAYOUT_STOCK)
+        if device_k20:
+            layout = (
+                LAYOUT_STOCK_DEVICE_K20_BV
+                if block_verify
+                else LAYOUT_STOCK_DEVICE_K20
+            )
+        elif block_verify:
+            layout = LAYOUT_STOCK_BV
+        else:
+            layout = LAYOUT_STOCK
+        self._claim_layout(layout)
         self._close_open()
 
         depth = len(draft_tokens)
@@ -524,7 +550,12 @@ class K20RowLog:
             "primary": int(primary),
             "decision_uniforms": [float("nan")] * (depth + 1),
             "decision_uniforms_valid": 0,
-            "draft_uniforms": [float("nan")] * depth,
+            "draft_uniforms": (
+                [float(value) for value in draft_uniforms[:depth]]
+                + [float("nan")] * max(0, depth - len(draft_uniforms))
+                if draft_uniforms is not None
+                else [float("nan")] * depth
+            ),
             "accepted": 0,
             "first_reject": -1,
             "selected_token": 0,
@@ -673,7 +704,7 @@ class K20RowLog:
             return np.asarray([row.get(key, 0) for row in rows], dtype=dtype)
 
         block_arrays: dict[str, np.ndarray] = {}
-        if self.layout == LAYOUT_STOCK_BV:
+        if self.layout in (LAYOUT_STOCK_BV, LAYOUT_STOCK_DEVICE_K20_BV):
             block_arrays = {
                 **block_columns,
                 "block_valid": column("block_valid", np.uint8),
@@ -849,6 +880,8 @@ __all__ = [
     "LAYOUT_PR391",
     "LAYOUT_STOCK",
     "LAYOUT_STOCK_BV",
+    "LAYOUT_STOCK_DEVICE_K20",
+    "LAYOUT_STOCK_DEVICE_K20_BV",
     "is_enabled",
     "k20_log",
 ]

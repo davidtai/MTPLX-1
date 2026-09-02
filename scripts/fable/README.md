@@ -867,3 +867,79 @@ against `mtplx/engine_session.py` and the tool names against
 `mtplx/server/openai.py` (so a rename breaks the test rather than the
 measurement), scenario prefix relationships, the re-render no-op refusal, and
 the SSE folding arithmetic. No server, no MLX, no Metal.
+
+---
+
+## micro_k20_select.py — is the K20 selector exposed, or is it graph tail?
+
+`MTPLX_FABLE_DEVICE_K20` (`mtplx/fable_device_k20.py`) replaces four per-cycle
+top-20 selections on the stock native-MTP lane — three draft rows and the
+4-row target support — with the exact device selector parked on
+`experiments/pr391-target-lmhead-top20`, and samples the drafted token on
+device so the three draft syncs collapse into one.  Whether that is worth
+anything depends on a number the receipts cannot separate:
+`verify_target_distribution_time_s` is 3.15 ms/window, but the
+`MLX_DISABLE_COMPILE` arm shows the same code at 0.70 ms with
+`verify_forward` correspondingly larger — i.e. most of the 3.15 is the
+compiled verify graph's TAIL being awaited at the first sync, not selection.
+
+This bench removes the graph.  With no model in front of it, whatever the
+selector costs here is selection.
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_k20_select.py \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-k20-select.json
+```
+
+Shapes: `[4, 248320]` (the target support), `[1, 248320]` (one draft depth on
+the FRSpec scatter) and `[1, 65536]` (the compact FRSpec domain, for sizing the
+follow-up that keeps the draft row unscattered).  Variants: `stock_serial`
+(production, host tail and sync included), `stock_deterministic` (the all-device
+selector the spill path falls back to), `device_k20`, `device_k20_host` (the
+production route: kernel + logsumexp + one sync + the float64 top-p mask) and
+`read_floor` (`mx.sum`, the bandwidth floor).
+
+`--lane queued` (default) issues `--reps` graphs and evaluates once;
+`--lane eager` evaluates each call.  Per `queued-vs-eager-metal-microbench` the
+eager lane charges every call a host sync and can invert a verdict for
+microsecond kernels, so promote on the queued number — but note that the
+production draft site really is eager, which is the whole point of the change.
+
+**Decision rule.** `stock_serial - device_k20_host` at `[4, 248320]`:
+≥ 0.5 ms means the target-side lever is real; ≤ 0.15 ms means the receipts'
+3.15 ms is graph tail and only the draft side (three `[1, V]` selections, each
+followed by a sync) is worth building.
+
+Every run also prints two parity blocks, so exactness is measured rather than
+asserted: `parity` counts rows where the device selector disagrees with the
+kernel-free NumPy oracle or with `_device_serial_support_arrays`, and
+`choice_parity` counts rows where the device draft sampler disagrees with its
+own CPU oracle, where the host mirror `prepare_draft_row_f32` disagrees with
+`_prepare_reference_row`, and where a sampled token fell outside the `q` the
+accept loop would score it against.  All five must be 0.
+
+`--self-test` runs the NumPy oracle against a brute-force sort with no MLX and
+no lock.
+
+### Tests
+
+```
+cd <branch checkout>
+PYTHONPATH=. /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  -m pytest tests/test_fable_device_k20.py -q
+```
+
+Pure host, no MLX import: the flag-off source contract by AST inspection, the
+selector oracle against brute force (ties, signed zero, NaN, compact-domain id
+remapping), the oracle and the host tail against a NumPy transcription of
+`_device_serial_support_arrays`, `prepare_draft_row_f32` bit-identical to the
+choice kernel's own CPU oracle, the draw accounting against a flag-off
+`rng.choice` chain, and the `stock_device_k20` logger round trip.
