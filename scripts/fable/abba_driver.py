@@ -650,6 +650,46 @@ def _ple_candidate_prefetch_armed() -> bool:
         return False
 
 
+def _ple_boundary_armed() -> bool:
+    """Whether MTPLX_FABLE_PLE_BOUNDARY was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign that the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.ple_boundary import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _ple_boundary_receipt() -> dict[str, float]:
+    """W62 engagement: what each armed boundary item actually did.
+
+    ``warm_skipped`` / ``warm_taken`` is the ``warm_skip`` verdict -- an arm
+    that claims the lever and shows ``warm_taken`` on every cycle probed a
+    cold table and took the shipped pread pass, so its delta is not the
+    lever.  ``primary_inline`` counts cycles whose 16 primary rows were read
+    without the pool at all.  The ``*_ms`` fields are populated only when the
+    ``timing`` item is in ``MTPLX_FABLE_PLE_BOUNDARY_ITEMS``.
+    """
+
+    try:
+        from mtplx.ple_boundary import last_receipt
+
+        return last_receipt()
+    except Exception:
+        return {}
+
+
 def _ple_candidate_prefetch_receipt() -> dict[str, float]:
     """K-P1 engagement: what the candidate row buffer actually served.
 
@@ -738,6 +778,8 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "ple_first_gather_early_armed": _ple_first_gather_early_armed(),
             "ple_candidate_prefetch": _ple_candidate_prefetch_receipt(),
             "ple_candidate_prefetch_armed": _ple_candidate_prefetch_armed(),
+            "ple_boundary": _ple_boundary_receipt(),
+            "ple_boundary_armed": _ple_boundary_armed(),
             # Which gather path each big row read actually took.  The pread
             # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
             # fancy index behind it, so an arm that claims the vectorised lane

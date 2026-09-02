@@ -20,6 +20,8 @@ import mlx.core as mx
 
 from .attention_context import attention_phase
 from .fable_expert_census import census as _expert_census
+from .ple_boundary import GRAPH_TIMING as _PLE_BOUNDARY_GRAPH_TIMING
+from .ple_boundary import note_graph_build as _note_ple_boundary_graph_build
 from .gdn_capture import resolve_gdn_capture_backend
 from .runtime_options import (
     FABLE_QSA_M4_ROWS,
@@ -2459,7 +2461,19 @@ class CompiledVerifyBank:
                 mx.async_eval(*state_in)
             else:
                 mx.async_eval(compiled_aux, *state_in)
-        outputs = dispatch["fn"](input_ids, compiled_aux, *state_in)
+        # MTPLX_FABLE_PLE_BOUNDARY item `timing` (instrument, default off).
+        # The census's gap-B host term -- the 1.64 ms/cycle the GPU idles
+        # after the PLE dequant, which is this construction and not the PLE
+        # -- measured from inside the process.  The constant is resolved at
+        # import, so the control arm's branch is a constant False.
+        if _PLE_BOUNDARY_GRAPH_TIMING:
+            _graph_build_started = time.perf_counter()
+            outputs = dispatch["fn"](input_ids, compiled_aux, *state_in)
+            _note_ple_boundary_graph_build(
+                time.perf_counter() - _graph_build_started
+            )
+        else:
+            outputs = dispatch["fn"](input_ids, compiled_aux, *state_in)
 
         logits, hidden, returned_aux, captures_flat, state_out = (
             _unpack_fixed_m4_outputs(

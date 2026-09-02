@@ -365,6 +365,14 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # verify assembles its auxiliary.  Bytes identical (rows are a pure
         # function of token ids); default off.
         "MTPLX_FABLE_PLE_CANDIDATE_PREFETCH",
+        # W62: host levers for the decode-cycle PLE boundary -- the 4.002
+        # ms/cycle of GPU idle (63% of all idle, 87% host-late) the 2410
+        # census attributes to the D3-copy -> PLE-dequant -> target-gather
+        # handoff.  Items are selectable; every one changes WHEN rows are
+        # read, never WHICH.  Default off.
+        "MTPLX_FABLE_PLE_BOUNDARY",
+        "MTPLX_FABLE_PLE_BOUNDARY_ITEMS",
+        "MTPLX_FABLE_PLE_BOUNDARY_PROBE_ROWS",
         # Fable 16K candidate: compare the crossover against the chunk's own
         # total_tokens instead of total_tokens - rows, so the 8 x 2,048 cut of
         # a 16,384-token prompt can reach the sparse lane at all.  Default off;
