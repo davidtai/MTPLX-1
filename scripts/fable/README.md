@@ -187,6 +187,74 @@ above are refused on `--*-env` with a message naming the right channel. Both
 are recorded in the arm receipt under `process_environment_overrides`, with the
 requested value alongside the value actually in force.
 
+### Recipe: start the first prefill chunk's PLE gather at request arrival
+
+```
+    --candidate-extra-env MTPLX_FABLE_PLE_FIRST_GATHER_EARLY=1
+```
+
+`MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1` hides chunks 2..n of the PLE n-gram
+gather behind the previous chunk's forward. Chunk 1 has nothing to hide behind:
+the scope submits it and `stage()` blocks on it microseconds later, which the
+w35 receipts price at `prefill_chunks[0].ple_gather_s` 0.627 s against 0.0006 s
+for chunks 2-4. On a single-chunk prompt the lookahead is inert by
+construction, so that exposed gather is the whole PLE prefill cost.
+
+This flag does three things, all off without it:
+
+1. **Starts chunk 1's gather at request arrival** -- at the top of
+   `restore_or_prefill_prompt_state`, before the session-bank lookup and the
+   prefill graph setup -- on a process-wide worker pool. The chunked prefill
+   then *adopts* that in-flight future as the lookahead's slot 0 rather than
+   preparing the span twice; a single-chunk prefill consumes it directly. Row
+   ids are a pure function of the prompt ids, so the first chunk's span is
+   predicted from the prompt and the two span planners the prefill loop
+   chooses between -- and the lane declines rather than guesses when they
+   disagree (a banked short prompt, a stable-prefix edge).
+2. **Replaces the per-row `os.pread` warm pass with the memmap fancy index**
+   for every big gather, on the worker and on the generation thread alike, when
+   `mincore(2)` says the rows' pages are already in core (~165 ms per 32,768
+   rows against 0.44 ms). A demand-faulted mmap is flat at 1.40 GiB/s against
+   pooled pread's 12.9, so the probe is what makes this safe: an unavailable or
+   below-threshold probe takes the shipped pread path, which is never wrong.
+   `vectorized_gathers` / `pread_gathers` in the receipt say which ran.
+3. **Pre-touches the rest of the prompt's rows** behind chunk 1, chained off
+   its future, so later chunks' gathers find their pages warm.
+
+The receipt records `ple_first_gather_early`:
+`started_at_ms_before_layer2` (the head start the lane bought -- submit to
+first need), `rows`, `path`, `outcome` (`adopted_hit`, `hit`, or a named miss)
+and `prefetch_rest_rows`.
+
+Two companion knobs, also `MTPLX_FABLE_*` and also off by default:
+
+| Key | Effect |
+| --- | --- |
+| `MTPLX_FABLE_NGRAM_MADVISE=random\|normal\|sequential` | Overrides the n-gram maps' `madvise`. Default is `random` (shipped) with the lane off and `normal` with it on: `MADV_RANDOM` suppresses readahead around a *mapping fault*, which under this lane is the ascending pre-touch and the vectorised gather's residual misses -- the two cases readahead helps. `pread(2)` never consulted the advice at all. |
+| `MTPLX_FABLE_NGRAM_PREWARM_AT_LOAD=1` | Reads the whole n-gram table sequentially at model load (64 MiB chunks, logs GiB/s, recorded as `prewarm_at_load`). The driver's `--prewarm-ngram-table` does this for benchmarks; the daemon has no equivalent, so production serves at the as-found page-cache rate -- which the w22 window measured as a 1.9 s vs 4.4 s first chunk. |
+
+Prefill-only ABBA window at 16K, on top of the retained prefill stack:
+
+```
+PYTHONPATH=<worktree> <venv>/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 36000 -- \
+  <venv>/bin/python <worktree>/scripts/fable/abba_window.py \
+    --sequence <seq> --order ABBA --label-prefix fable-w46-firstgather \
+    --source <worktree> --prefill-only \
+    --control-env MTPLX_GDN_BLOCKED_PREFILL=1 \
+    --control-env MTPLX_PREFILL_CHUNK_SIZE=4096 \
+    --control-env MTPLX_QSA_PREFILL_COMPILE_ROWS=4096 \
+    --control-env MTPLX_QSA_PREFILL_DEBUG=1 \
+    --control-extra-env MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1 \
+    --control-extra-env MTPLX_FABLE_PREFILL_QSA_QUERY_TILE=2048 \
+    --candidate-extra-env MTPLX_FABLE_PLE_FIRST_GATHER_EARLY=1
+```
+
+Add `--prompt-tokens 1024` for the short-prompt cell, where the lookahead is
+inert and this lane is the only thing hiding the gather.
+
 ### Recipe: open the context-copy block cap
 
 ```

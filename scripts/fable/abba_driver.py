@@ -584,6 +584,50 @@ def _ple_prefill_lookahead_scope_status() -> dict[str, Any]:
         return {}
 
 
+def _ple_first_gather_early_armed() -> bool:
+    """Whether MTPLX_FABLE_PLE_FIRST_GATHER_EARLY was set in THIS process.
+
+    Same reason as ``prefill_lookahead_armed``: the flag rides
+    ``--candidate-extra-env``, which ``candidate_environment`` does not carry,
+    so without this a receipt could show an inert lane and no sign that the
+    lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.ple_prefill_lookahead import EARLY_ENV_FLAG
+
+        return (os.environ.get(EARLY_ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _ple_first_gather_early_status() -> dict[str, Any]:
+    """What the LAST request's first-chunk gather did.
+
+    ``started_at_ms_before_layer2`` is the head start the lane actually
+    bought: milliseconds between the worker submit at request arrival and the
+    moment the owner thread first needed the rows.  ``path`` is ``vectorized``
+    when mincore found the rows' pages already in core (the fancy index alone,
+    0.44 ms) and ``pread`` when it did not (the shipped threaded warm pass).
+    ``outcome`` names the consumer -- ``adopted_hit`` through the lookahead's
+    slot 0, ``hit`` on a single-chunk prefill where the lookahead is inert,
+    and a ``miss_*``/``never_needed`` whenever the prediction did not survive
+    contact with the prefill loop.
+    """
+
+    try:
+        from mtplx.ple_prefill_lookahead import last_early_status
+
+        return last_early_status()
+    except Exception:
+        return {}
+
+
 def prefill_chunks_receipt() -> list[dict[str, float]]:
     """Per-chunk prefill wall and PLE-gather seconds, on BOTH arms.
 
@@ -649,6 +693,16 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "prefill_lookahead": _ple_prefill_lookahead_counters(),
             "prefill_lookahead_armed": _ple_prefill_lookahead_armed(),
             "prefill_lookahead_scope": _ple_prefill_lookahead_scope_status(),
+            "ple_first_gather_early": _ple_first_gather_early_status(),
+            "ple_first_gather_early_armed": _ple_first_gather_early_armed(),
+            # Which gather path each big row read actually took.  The pread
+            # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
+            # fancy index behind it, so an arm that claims the vectorised lane
+            # and shows pread_gathers is claiming a win it did not take.
+            "vectorized_gathers": int(getattr(sidecar, "vectorized_gathers", 0)),
+            "pread_gathers": int(getattr(sidecar, "pread_gathers", 0)),
+            "madvise": getattr(sidecar, "madvise_applied", None),
+            "prewarm_at_load": getattr(sidecar, "prewarm_at_load", None),
         }
     except Exception as error:  # diagnostic field, never the measurement
         print(
