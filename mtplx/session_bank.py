@@ -135,6 +135,39 @@ def _boundary_true_restore_enabled() -> bool:
     raw = str(os.environ.get("MTPLX_SESSION_BOUNDARY_TRUE_RESTORE", "1")).strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
+
+FABLE_PROTECTED_TERMINAL_ENV = "MTPLX_FABLE_PROTECTED_TERMINAL"
+
+
+def _fable_protected_terminal_enabled() -> bool:
+    """Protected-terminal eviction order (oMLX PR #3330, exact_resident.py).
+
+    Ported policy, in oMLX's words: two candidates compete under one byte
+    ceiling -- the longer *matching terminal* (a banked turn that strictly
+    extends the incoming prompt) and the shorter *input-prompt fallback* (the
+    prompt itself, being published now). Publishing the fallback must never be
+    what evicts the terminal that extends it: the terminal can serve every
+    restore the fallback can (exact hits trim; boundary-true restores pick a
+    boundary <= the matched point) plus the tail the fallback cannot, so
+    trading it for the fallback strictly loses coverage. oMLX keeps the NEWEST
+    such terminal, deliberately not letting length override insertion recency
+    (`_newest_extending_entry`, exact_resident.py:87-103), and counts the
+    deflections (`protected_rejections`, exact_resident.py:189-215).
+
+    This is an eviction ORDER change and nothing else. It adds no byte ceiling
+    (effective_max_bytes() and the per-session cap already exist and are
+    model-aware), no background work, and no idle lane -- see the phase-3
+    falsification recorded at _snapshot_settle_enabled above and in commit
+    b5fac4ac: on this box, adding work to the idle lane produced the WORST
+    observed stall (27.6 s) across a warm 91K-turn A/B.
+
+    Default OFF; read at SessionBank construction (see __init__), so one bank
+    keeps one policy for its whole life and an A/B arm cannot drift mid-run.
+    """
+    raw = str(os.environ.get(FABLE_PROTECTED_TERMINAL_ENV, "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 GIB = 1024**3
 # Tool sessions store ~3 entries per turn (prompt-prefix commit, postcommit,
 # generation-final); an 8-entry cap churned the whole bank every ~3 turns and
@@ -508,6 +541,13 @@ class SessionBank:
         self.dynamic_ceiling_fn: Callable[[], int] | None = None
         self.last_dynamic_ceiling_bytes: int | None = None
         self.dynamic_ceiling_errors: int = 0
+        # MTPLX_FABLE_PROTECTED_TERMINAL, resolved ONCE here so a bank keeps
+        # one eviction policy for its whole life (see the gate's docstring).
+        self.protect_newest_extending: bool = _fable_protected_terminal_enabled()
+        # Deflections: how many times publishing a shorter input-prompt
+        # fallback would have evicted the newest terminal extending it and
+        # took another victim instead. oMLX's `protected_rejections`.
+        self.protected_rejections: int = 0
 
     # Capability marker for generation: near_prefix_candidates accepts
     # min_restore_tokens so resident-duplicate eligibility mirrors the
@@ -1670,6 +1710,10 @@ class SessionBank:
             "effective_max_bytes": self.effective_max_bytes(),
             "dynamic_ceiling_bytes": self.last_dynamic_ceiling_bytes,
             "dynamic_ceiling_errors": self.dynamic_ceiling_errors,
+            # Engagement receipt for MTPLX_FABLE_PROTECTED_TERMINAL: a lane
+            # that reads flat in an A/B must still be able to prove it ran.
+            "protect_newest_extending": bool(self.protect_newest_extending),
+            "protected_rejections": int(self.protected_rejections),
             "per_session_max_bytes": self.per_session_max_bytes,
             "idle_ttl_s": self.idle_ttl_s,
             "entries": len(self._entries),
@@ -2344,6 +2388,29 @@ class SessionBank:
         for entry in entries[cap:]:
             self._evict_entry(entry, reason="session_entry_retention")
 
+    def _newest_extending_entry(
+        self, tokens: tuple[int, ...] | None
+    ) -> SessionBankEntry | None:
+        """The newest banked entry that STRICTLY extends ``tokens``.
+
+        Port of oMLX ``_newest_extending_entry`` (exact_resident.py:87-103):
+        insertion recency wins, deliberately NOT length -- a longer but older
+        branch of a diverged transcript is not the branch the client is on.
+        ``self._entries`` is a plain dict, so ``reversed()`` is newest-first by
+        insertion for exactly the same reason oMLX's is.
+
+        Returns None when the gate is off, so the whole rule costs one boolean
+        read on the default path.
+        """
+
+        if not self.protect_newest_extending or not tokens:
+            return None
+        width = len(tokens)
+        for key, entry in reversed(self._entries.items()):
+            if len(key) > width and key[:width] == tokens:
+                return entry
+        return None
+
     def _evict_if_needed(self, *, protected_tokens: tuple[int, ...] | None = None) -> None:
         while True:
             if not self._entries:
@@ -2406,6 +2473,24 @@ class SessionBank:
                 candidates,
                 key=lambda entry: (entry.last_access_s, -entry.nbytes, entry.created_at_s),
             )
+            terminal = self._newest_extending_entry(protected_tokens)
+            if terminal is not None and victim is terminal and len(candidates) > 1:
+                # Protected-terminal rule (see _fable_protected_terminal_enabled):
+                # the shorter fallback being published must not be what evicts
+                # the newest terminal extending it. Order only -- if the
+                # terminal is the LAST candidate standing it is still evicted,
+                # because the budget has to be met and refusing here would
+                # spin this loop forever.
+                self.protected_rejections += 1
+                candidates = [entry for entry in candidates if entry is not terminal]
+                victim = min(
+                    candidates,
+                    key=lambda entry: (
+                        entry.last_access_s,
+                        -entry.nbytes,
+                        entry.created_at_s,
+                    ),
+                )
             self._evict_entry(victim, reason=reason)
 
     def shrink_to_bytes(

@@ -622,3 +622,141 @@ cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
 flag's gating and narrowing, every eligibility raise, CPU references of each
 Metal body pinned against the stock chain it replaces, and the dispatch-map
 receipt above.
+
+## TTFT screen (multi-turn coding-agent traffic)
+
+`ttft_screen.py` is the latency half for *warm* turns. ABBA measures decode
+tok/s and `humaneval_screen.py` measures quality; neither measures the number
+an agent actually feels on turn N: how long the server takes to emit its first
+token when the conversation is long and the client re-rendered part of the
+transcript. That is the failure mode the oMLX PR #3330 audit targets, and the
+one MTPLX answers with `near_prefix_candidates` -> `restore_entry_prefix_cache`
+-> boundary-true restore -> suffix-only prefill.
+
+One guarded window per arm. The child starts ONE MTPLX server on **:8092**
+(never :8080, never :8091 — the HumanEval screen owns that one) from this
+worktree's venv, with `PYTHONPATH` pinned to the worktree so the server imports
+this checkout's `mtplx`.
+
+### The three scenarios
+
+Each repeat runs one conversation, in order, against a fresh salt:
+
+| Scenario | Prompt | What it isolates |
+| --- | --- | --- |
+| `cold` | `POST /admin/cache/clear` + a per-repeat salted ~16K-token workspace dump | Upper bound: full prefill |
+| `matching_terminal` | the same turn plus the model's own reply and one more user turn | The ordinary warm case (audit arm E) — the banked terminal is an exact prefix |
+| `rerendered_terminal` | identical, except the prior **assistant** turn is re-rendered | **The target** (audit arm D) — divergence lands *inside* the banked terminal while the opening prompt stays an exact prefix |
+
+The re-render is whitespace and markdown only: `- ` bullets become `* `, fence
+info strings are dropped, tabs expand to four spaces, non-empty lines gain a
+trailing space. Same information, different bytes. The harness **refuses to
+run** scenario 3 if the transform came out a no-op — otherwise arm D would
+silently measure arm E.
+
+### Session headers (undocumented in `docs/server.md`)
+
+This is the trap the audit names: `_session_keep_live_refs_for_request`
+(`mtplx/server/openai.py`) returns False for an anonymous session with no
+tools, so a naive `curl` harness measures the snapshot-only path and
+**understates** MTPLX's current baseline.
+
+`EngineSessionManager.resolve_session_id` (`mtplx/engine_session.py`) reads
+these headers, case-insensitively, first match wins, in this order:
+
+| Header | Notes |
+| --- | --- |
+| `x-mtplx-session-id` | MTPLX's own name; checked first |
+| `x-session-affinity` | OpenCode stamps this on every request |
+| `x-session-id` | OpenCode stamps this too |
+| `x-openwebui-chat-id` | Open WebUI |
+| `x-openwebui-user-id` | Open WebUI |
+
+Any of them resolves `session_source` to `header.<name>`, which beats
+prompt-prefix inference *and* arms the live-reference lease. Failing that, the
+lease is armed by `user` / `chat_id` / `conversation_id`, by a `tools:` array
+containing coding-agent tool names (`bash`, `edit`, `glob`, `grep`, `read`,
+`todowrite`, `write`, …), or by `MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS=1`.
+
+`--live-ref {header,tools,both,env}` picks exactly one, default `header`. It is
+pinned into the arm identity, so two arms can never differ in it. Prefer
+`header`: a `tools:` array also activates the server's tool-call contracts,
+which rewrites the prompt template and can make the model answer with a tool
+call instead of text (nothing to time).
+
+### Arms
+
+Control (no `--env`) is production: the launcher exports no `MTPLX_*` at all,
+so neither does the control arm.
+
+```
+/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 --timeout-seconds 900 --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/ttft_screen.py \
+    --label control --repeats 3 --port 8092
+```
+
+Candidates — same command with one of:
+
+```
+    --label boundary32 --gdn-boundary-max 32
+    --label qsastage   --env MTPLX_FABLE_QSA_RESTORE_STAGING=1
+    --label protterm   --env MTPLX_FABLE_PROTECTED_TERMINAL=1
+```
+
+Run `--gdn-boundary-max 32` **first**. Per the audit it is the cheapest lever
+by a wide margin: one env var, MB per boundary against ~24 GiB of headroom, and
+it attacks the actual failure (`NO_SNAPSHOT_COVERAGE`, from only 8 retained
+boundaries per entry) directly. If it closes arm D, the rest is unnecessary.
+
+`--dry-run` prints the exact outer command and the server argv without
+touching the GPU.
+
+### What the receipt records
+
+Receipts land in `.benchmark-artifacts/fable/ttft/<label>.json`; the server log
+and the arm-identity claim live in `.../ttft/<label>/`.
+
+Per request: client `first_chunk_s` / `first_token_s` (visible TTFT) **and**
+the server's own `mtplx_stats.ttft_s` (model TTFT) — the audit insists these be
+reported separately, and oMLX's own two numbers differ by ~0.4 s. Plus
+`prompt_tokens`, `cached_tokens`, `new_prefill_tokens`, `session_cache_hit`,
+`cache_miss_reason`, `session_restore_mode`, `session_restore_served` (the
+served-entry ground truth: `entry_prefix_len`, `requested_matched`,
+`actual_restore_point`, `boundary_restore`, `storage_restore_mode`),
+`peak_memory_bytes`, and `accepted_by_depth` / `drafted_by_depth`.
+
+Per scenario: median, min, max and **p95**. p95 is not decoration — the
+`b5fac4ac` phase-3 falsification was a tail result (27.6 s worst stall) that
+medians hid completely.
+
+Parity: every scenario's `output_sha256` is recorded, plus
+`output_deterministic` across repeats and `assistant_turn_sha256` for the
+cold turn. Two arms are only comparable when the cold sha matches, because
+turns 2 and 3 embed that text. Check it before reading any TTFT delta.
+
+The receipt also carries the `session_bank` block from `/v1/mtplx/snapshot`,
+which is where `protect_newest_extending` / `protected_rejections` show whether
+`MTPLX_FABLE_PROTECTED_TERMINAL` actually engaged.
+
+Add `--env MTPLX_DEBUG_PREFIX_DIVERGENCE=1` on a first pass: the server log
+then prints `boundary-miss: entry_len=… matched=… boundary_positions=[…]` and
+`near-prefix reject: … reason=…`, which tells you in one run whether the
+rerendered arm is boundary-limited or identity-limited.
+
+### Tests
+
+```
+cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
+.venv/bin/python -m pytest tests/test_fable_ttft_screen.py -q
+```
+
+Pure host tests: argv/env construction, the session-header names checked
+against `mtplx/engine_session.py` and the tool names against
+`mtplx/server/openai.py` (so a rename breaks the test rather than the
+measurement), scenario prefix relationships, the re-render no-op refusal, and
+the SSE folding arithmetic. No server, no MLX, no Metal.
