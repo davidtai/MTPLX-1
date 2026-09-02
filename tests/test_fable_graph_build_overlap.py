@@ -66,6 +66,17 @@ def prefix_census(layer_count: int) -> tuple[int, int, int]:
     return state, capture, plan_len
 
 
+class FakeRuntime:
+    """A weakref-able stand-in for the model runtime.
+
+    ``types.SimpleNamespace`` is not weakref-able, and the process-wide
+    compiled-pair cache holds a ``weakref.ref`` to the runtime exactly as the
+    shipped monolithic trace cache does, so the fake has to be too.
+    """
+
+    __slots__ = ("__weakref__",)
+
+
 class Sentinel:
     """A stand-in for one mx.array that refuses every host read."""
 
@@ -130,6 +141,7 @@ class QSAEntry:
         self.kv = QSAKV(index)
         self.raw_keys = Sentinel(f"qsa{index}.raw")
         self.pooled = Sentinel(f"qsa{index}.pooled")
+        self.fixed_rows_gather = True  # one dimension of the shared trace key
 
     def census(self):
         return (
@@ -237,6 +249,34 @@ def _make_bank(
     bank._fixed_m4_overlap_prefix = None
     bank._fixed_m4_split_generation = -1
     bank._fixed_m4_overlap_layers = int(layer_count)
+    bank._fixed_m4_overlap_first_prefix = True
+    bank._fixed_m4_overlap_first_suffix = True
+    bank.runtime = FakeRuntime()
+    bank.capture_backend = "linear_gdn_from_conv_tape"
+    bank._capture_layout_override = None
+    bank._extra_capture_layout = tuple(
+        (
+            index,
+            ("qkv", "q", "k", "v", "a", "b")
+            + (
+                ("ple_hidden", "ple_ids", "ple_conv_rows")
+                if index == PLE_INDEX
+                else ()
+            ),
+        )
+        for index in GDN_INDICES
+    )
+    bank._prepare_compiled_aux = None
+    bank._spec = [
+        (
+            index,
+            graphbank.VERIFY_SPEC_KIND_QSA
+            if index in QSA_INDICES
+            else graphbank.VERIFY_SPEC_KIND_GDN,
+            _state_leaves_of(index),
+        )
+        for index in range(48)
+    ]
     bank.stats = {
         "calls": 0,
         "compiled_calls": 0,
@@ -304,6 +344,8 @@ def _make_bank(
         "graph_aux": None,
         "boundary": boundary,
         "donate": donate,
+        "hidden_variant": None,
+        "qsa_entries": tuple(entries[index] for index in QSA_INDICES),
         "overlap_split": {
             "prefix_fn": prefix_fn,
             "suffix_fn": suffix_fn,
@@ -1040,30 +1082,12 @@ def _install_ready_bank(graphbank, *, returns_aux=False, layers=48):
     bank._fixed_m4_dispatch["returns_aux"] = returns_aux
     if returns_aux:
         bank._fixed_m4_dispatch["aux_contract"] = "raw_q4"
-    bank._spec = [
-        (
-            index,
-            graphbank.VERIFY_SPEC_KIND_QSA
-            if index in QSA_INDICES
-            else graphbank.VERIFY_SPEC_KIND_GDN,
-            _state_leaves_of(index),
-        )
-        for index in range(layers)
-    ]
-    bank._extra_capture_layout = tuple(
-        (
-            index,
-            ("qkv", "q", "k", "v", "a", "b")
-            + (
-                ("ple_hidden", "ple_ids", "ple_conv_rows")
-                if index == PLE_INDEX
-                else ()
-            ),
-        )
-        for index in GDN_INDICES
-    )
-    bank.runtime = SimpleNamespace()
+    if layers != 48:
+        bank._spec = bank._spec[:layers]
     graphbank._recorder.compile = lambda fn: fn
+    # a fresh runtime identity per bank, so the process-wide pair cache does
+    # not leak a compiled pair between two unrelated tests
+    bank.runtime = FakeRuntime()
     return bank
 
 
@@ -1094,7 +1118,7 @@ def test_install_fixed_m4_split_accepts_the_production_census(graphbank):
         )
         for index in GDN_INDICES
     )
-    bank.runtime = SimpleNamespace()
+    bank.runtime = FakeRuntime()
     graphbank._recorder.compile = lambda fn: fn
 
     bank.install_fixed_m4_split()
@@ -1397,3 +1421,235 @@ def test_the_depth_knob_alone_refuses():
     source = _generation_source()
     assert "elif _graph_build_overlap.layers() != _graph_build_overlap.DEFAULT_LAYERS:" in source
     assert "the depth knob does nothing " in source
+
+
+# --------------------------------------------------------------------------
+# W67 follow-up: construction cost, where it happens, and process-wide reuse
+# --------------------------------------------------------------------------
+def test_the_compiled_pair_is_shared_across_banks_in_one_process(graphbank):
+    """The bank is per-request; a fresh pair per request = 2 traces per request.
+
+    The shipped monolithic route shares its traced callable process-wide
+    (``_SHARED_VERIFY_STEPS``, whose docstring prices one trace at ~1 s wall
+    at 7k leaves).  Without the same sharing here, arming this lane would turn
+    that into two fresh traces on the first cycle of EVERY request.
+    """
+
+    lane = importlib.import_module("mtplx.graph_build_overlap")
+    lane.reset_receipt()
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+    runtime = FakeRuntime()
+
+    first = _install_ready_bank(graphbank)
+    first.runtime = runtime
+    first.install_fixed_m4_overlap_split(3)
+    pair_a = first._fixed_m4_dispatch["overlap_split"]
+    assert lane.last_receipt()["split_shared_hits"] == 0
+
+    second = _install_ready_bank(graphbank)
+    second.runtime = runtime  # same model, next request
+    second.install_fixed_m4_overlap_split(3)
+    pair_b = second._fixed_m4_dispatch["overlap_split"]
+
+    assert pair_b["prefix_fn"] is pair_a["prefix_fn"]
+    assert pair_b["suffix_fn"] is pair_a["suffix_fn"]
+    assert lane.last_receipt()["split_shared_hits"] == 1
+    # and the shared closures now read the LIVE bank, not the dead one
+    hosts = [
+        host
+        for (_fn_a, _fn_b, host, _ref) in graphbank._SHARED_OVERLAP_SPLITS.values()
+    ]
+    assert len(hosts) == 1 and hosts[0]["bank"] is second
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+    lane.reset_receipt()
+
+
+def test_a_different_depth_gets_a_different_compiled_pair(graphbank):
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+    runtime = FakeRuntime()
+    bank = _install_ready_bank(graphbank)
+    bank.runtime = runtime
+    bank.install_fixed_m4_overlap_split(2)
+    two = dict(bank._fixed_m4_dispatch["overlap_split"])
+    bank.install_fixed_m4_overlap_split(3)
+    three = bank._fixed_m4_dispatch["overlap_split"]
+    assert three["prefix_fn"] is not two["prefix_fn"]
+    assert three["suffix_fn"] is not two["suffix_fn"]
+    assert len(graphbank._SHARED_OVERLAP_SPLITS) == 2
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+
+
+def test_a_dead_runtime_is_never_replayed(graphbank):
+    """id() is recycled after a model swap; the weakref is what catches it."""
+
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+    bank = _install_ready_bank(graphbank)
+    bank.install_fixed_m4_overlap_split(3)
+    stale = bank._fixed_m4_dispatch["overlap_split"]["prefix_fn"]
+    # forge the id collision a recycled runtime would produce
+    (key,) = list(graphbank._SHARED_OVERLAP_SPLITS)
+    prefix_fn, suffix_fn, host, _dead = graphbank._SHARED_OVERLAP_SPLITS[key]
+    graphbank._SHARED_OVERLAP_SPLITS[key] = (
+        prefix_fn,
+        suffix_fn,
+        host,
+        lambda: None,  # the runtime it was traced against is gone
+    )
+    other = _install_ready_bank(graphbank)
+    other.runtime = bank.runtime
+    other.install_fixed_m4_overlap_split(3)
+    assert other._fixed_m4_dispatch["overlap_split"]["prefix_fn"] is not stale
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+
+
+def test_sharing_can_be_switched_off_with_the_shipped_knob(graphbank, monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_SHARED_TRACES", "0")
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+    runtime = FakeRuntime()
+    first = _install_ready_bank(graphbank)
+    first.runtime = runtime
+    first.install_fixed_m4_overlap_split(3)
+    second = _install_ready_bank(graphbank)
+    second.runtime = runtime
+    second.install_fixed_m4_overlap_split(3)
+    assert (
+        second._fixed_m4_dispatch["overlap_split"]["prefix_fn"]
+        is not first._fixed_m4_dispatch["overlap_split"]["prefix_fn"]
+    )
+    assert graphbank._SHARED_OVERLAP_SPLITS == {}
+
+
+def test_construction_time_is_recorded_separately(graphbank):
+    """The number that answers 'did arming the lane cost TTFT?'."""
+
+    lane = importlib.import_module("mtplx.graph_build_overlap")
+    lane.reset_receipt()
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+    bank = _install_ready_bank(graphbank)
+    bank.install_fixed_m4_overlap_split(3)
+    receipt = lane.last_receipt()
+    assert receipt["construction_calls"] == 1
+    assert receipt["construction_ms"] >= 0.0
+    bank.install_fixed_m4_overlap_split(3)
+    assert lane.last_receipt()["construction_calls"] == 2
+    graphbank._SHARED_OVERLAP_SPLITS.clear()
+    lane.reset_receipt()
+
+
+def test_the_first_replay_of_each_graph_is_timed_without_the_timing_item(
+    graphbank,
+):
+    """mx.compile traces on the FIRST call, and that call is in decode cycle 1.
+
+    Always on and first-call only, so a receipt can separate the one-time
+    trace from steady state without arming `timing` (which would put an
+    instrument on one arm of an A/B and not the other).
+    """
+
+    lane = importlib.import_module("mtplx.graph_build_overlap")
+    lane.reset_receipt()
+    assert graphbank._GRAPH_BUILD_OVERLAP_TIMING is False
+    entries = _build_cache()
+    bank, _calls, _aux = _make_bank(graphbank, entries=entries, layer_count=3)
+    for step in range(3):
+        _enqueue(bank, Sentinel(f"ids{step}"), committed_count=step)
+        bank.forward_fixed_m4_overlap(
+            Sentinel("unused"),
+            host_input_ids=[1, 2, 3, 4],
+            completion_tokens=(),
+            committed_count=step,
+            cache=object(),
+        )
+    receipt = lane.last_receipt()
+    assert receipt["first_prefix_build_ms"] > 0.0
+    assert receipt["first_suffix_build_ms"] > 0.0
+    # first-call ONLY: the flags are down and steady state is untimed
+    assert bank._fixed_m4_overlap_first_prefix is False
+    assert bank._fixed_m4_overlap_first_suffix is False
+    assert receipt["prefix_build_ms"] == 0.0  # the `timing` item is off
+    assert receipt["suffix_build_ms"] == 0.0
+    lane.reset_receipt()
+
+
+def test_construction_happens_after_the_prefill_span_not_inside_it():
+    """W67 follow-up gate: nothing this lane builds is inside prompt_eval.
+
+    ``prompt_eval_time_s`` is measured inside
+    ``restore_or_prefill_prompt_state``; ``pre_first_token_setup_started``
+    is stamped after it returns, and BOTH ``install_fixed_m4`` and the arm
+    sit after that stamp.  If someone moves the arm above the prefill this
+    test goes red before a benchmark blames the lane for a TTFT regression.
+    """
+
+    source = _generation_source()
+    prefill = source.rindex("prompt_state = restore_or_prefill_prompt_state(")
+    setup_start = source.index(
+        "pre_first_token_setup_started = time.perf_counter()", prefill
+    )
+    install = source.index("compiled_verify_bank.install_fixed_m4(", setup_start)
+    arm = source.index(
+        "compiled_verify_bank.arm_fixed_m4_graph_build_overlap()", install
+    )
+    setup_end = source.index(
+        "pre_first_token_setup_s = time.perf_counter() - pre_first_token_setup_started",
+        arm,
+    )
+    assert prefill < setup_start < install < arm < setup_end
+
+
+def test_no_w67_symbol_is_reachable_from_the_prefill_path():
+    """The steady-state request must not run any prefix code during prefill."""
+
+    for name in (
+        "mtplx/models/qwen4_exp.py",
+        "mtplx/fable_prefill_chunk.py",
+        "mtplx/ple_prefill_lookahead.py",
+    ):
+        path = ROOT / name
+        if not path.exists():
+            continue
+        text = path.read_text()
+        for symbol in (
+            "graph_build_overlap",
+            "GRAPH_BUILD_OVERLAP",
+            "overlap_split",
+            "forward_fixed_m4_overlap",
+        ):
+            assert symbol not in text, f"{name} references {symbol}"
+
+
+def _abba_driver():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "w67_abba_driver_probe", ROOT / "scripts/fable/abba_driver.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_prefill_split_attributes_the_span_the_way_the_w67_reduce_did():
+    driver = _abba_driver()
+    row = {
+        "prompt_eval_time_s": 17.164879580785055,
+        "prefill_chunks": [
+            {"wall_s": 5.28316695796093},
+            {"wall_s": 1.5357563329744153},
+            {"wall_s": 1.385100000014063},
+            {"wall_s": 1.6091765419696458},
+            {"wall_s": 1.6633520419709384},
+            {"wall_s": 1.629039165971335},
+            {"wall_s": 1.6947592499782331},
+            {"wall_s": 1.8268560839933343},
+        ],
+    }
+    split = driver.prefill_split_receipt(row)
+    assert split["chunks"] == 8
+    assert split["chunk0_s"] == pytest.approx(5.2832, abs=1e-3)
+    assert split["rest_s"] == pytest.approx(11.3441, abs=1e-3)
+    # the part of the prefill span that is not chunk compute -- ~0.54 s on
+    # every W67 arm, control and candidate alike
+    assert split["outside_s"] == pytest.approx(0.5376, abs=1e-3)
+    assert driver.prefill_split_receipt({"prompt_eval_time_s": 1.0})["chunk0_s"] is None
+    assert driver.prefill_split_receipt({"prefill_chunks": []})["outside_s"] is None

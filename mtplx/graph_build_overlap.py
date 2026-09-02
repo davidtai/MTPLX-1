@@ -197,6 +197,9 @@ __all__ = [
     "last_receipt",
     "layers",
     "note_aux_hoisted",
+    "note_construction",
+    "note_first_prefix_build",
+    "note_first_suffix_build",
     "note_prefix_build",
     "note_prefix_layers",
     "note_suffix_build",
@@ -325,6 +328,21 @@ _RECEIPT_ZERO: dict[str, float] = {
     "prefix_discarded": 0,
     # install_fixed_m4_overlap_split re-runs after a capacity/route transition.
     "split_rebuilds": 0,
+    # Installs that reused the PROCESS-wide compiled pair instead of tracing
+    # a fresh one.  On a served process every install after the first should
+    # be a hit; a rising `split_rebuilds` with a flat `split_shared_hits`
+    # means every request is paying two fresh mx.compile traces.
+    "split_shared_hits": 0,
+    # Host ms spent in install_fixed_m4_overlap_split itself (closure
+    # construction + mx.compile wrapping + the census assertions).  Always
+    # on: this is the number that answers "did arming the lane cost TTFT?".
+    "construction_ms": 0.0,
+    "construction_calls": 0,
+    # The FIRST replay of each graph, which is where mx.compile actually
+    # traces.  Always on and first-call only, so the one-time trace is
+    # separable from steady state without arming the `timing` item.
+    "first_prefix_build_ms": 0.0,
+    "first_suffix_build_ms": 0.0,
     # W67: the prefix depth actually INSTALLED (not the one requested).  Set
     # once, by the install; a receipt whose `prefix_layers` is not the N the
     # arm asked for measured a different partition than its label claims.
@@ -366,6 +384,25 @@ def note_prefix_layers(count: int) -> None:
     """Record the prefix depth the install actually compiled."""
 
     _RECEIPT["prefix_layers"] = int(count)
+
+
+def note_construction(seconds: float) -> None:
+    """Fold one ``install_fixed_m4_overlap_split`` into the receipt."""
+
+    _RECEIPT["construction_ms"] = _RECEIPT["construction_ms"] + seconds * 1000.0
+    _RECEIPT["construction_calls"] = _RECEIPT["construction_calls"] + 1
+
+
+def note_first_prefix_build(seconds: float) -> None:
+    """The prefix graph's first replay -- i.e. its ``mx.compile`` trace."""
+
+    _RECEIPT["first_prefix_build_ms"] = seconds * 1000.0
+
+
+def note_first_suffix_build(seconds: float) -> None:
+    """The suffix graph's first replay -- i.e. its ``mx.compile`` trace."""
+
+    _RECEIPT["first_suffix_build_ms"] = seconds * 1000.0
 
 
 def note_aux_hoisted() -> None:

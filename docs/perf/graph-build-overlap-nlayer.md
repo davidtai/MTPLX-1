@@ -202,7 +202,9 @@ W63 census (an *average* layer, not a measurement of any particular one):
 | 5 | 2.65 | 1.73 | 1.73 ms | 4.6 % |
 
 N = 4 is the crossover; past it the host build runs out before the prefix does
-and the curve turns over. Both terms are census aggregates, so the sweep is the
+and the curve turns over. **Measured** (§8): −0.33 / +0.62 / +0.78 / +0.70 ms
+at N = 1/2/3/4 — the same shape, peaking at the same place, at roughly half
+the predicted magnitude, and with N = 1 actually negative. Both terms are census aggregates, so the sweep is the
 point: `--layers 1,2,3,4` prices all four in one guarded window, and the shape
 of the curve (does it rise 1→3? does it flatten at 4?) is more informative than
 any single number. Three things eat into it: the second command buffer pays its
@@ -289,7 +291,109 @@ control), `graph_build_overlap_layers` (what the arm asked for) against
 `graph_build_overlap.prefix_layers` (what it installed), then `suffix_joined`
 vs `monolithic_windows`, `prefix_discarded`, `aux_hoisted`, `split_rebuilds`.
 
-## 8. What was NOT verified
+## 8. Measured — and the prefill question it raised
+
+Depth sweep (real model, guarded, 192-token decodes), saving per cycle:
+**N=1 −0.33 ms (worse than stock), N=2 +0.62, N=3 +0.78, N=4 +0.70**; token
+digest matched stock at every depth. N=1 losing is the seam argument in §3
+paying off exactly where it predicted: layer 0's residual→PLE-add is the one
+cut that severs a fusible elementwise chain, and the split's own overhead
+eats the 0.53 ms it buys.
+
+Stacked 16K ABBA at N=3 (seq 1788400622, on HC_M4 + OPDIET + BLOCK_VERIFY +
+ROUTE_KERNEL + PRESCATTER, max fans): cycle **36.13 → 35.57 ms (−0.558 ms,
+−1.54 %**; seeds −2.34 / −0.69 / −1.61 %), decode 76.2 → 77.35 tok/s,
+**digests identical 3/3**, `prefix_layers` 3,
+`aux_hoisted == prefix_enqueued == suffix_joined ==` window count,
+`prefix_discarded` 0, `split_rebuilds` 1 per arm. Retained for decode.
+
+### The prefill side effect, attributed
+
+The candidate arms' `prompt_eval_time_s` rose (+0.62 s mean, +0.20 s median)
+and TTFT with it. Reduced from the twelve receipts, per arm, in seconds:
+
+| | control (n=6) | candidate (n=6) | Δ mean | Δ median |
+|---|---:|---:|---:|---:|
+| prefill **chunk 0** | 2.157 | 2.719 | **+0.562** | **+0.118** |
+| prefill chunks 1–7 | 11.258 | 11.321 | +0.063 | +0.046 |
+| **`outside`** = `prompt_eval` − Σ chunk walls | **0.5364** | **0.5344** | **−0.0020** | **−0.0005** |
+| `prompt_eval_time_s` | 13.951 | 14.574 | +0.623 | +0.202 |
+| `ttft_s` − `prompt_eval_time_s` | 0.01209 | 0.01359 | +0.0015 | |
+| `pre_first_token_setup_s` | 0.00326 | 0.00367 | **+0.00041** | |
+
+**The whole regression is inside prefill chunk 0. None of it is inside the
+part of the prefill span where construction could land.** `outside_s` — the
+prefill span minus chunk compute — is identical to half a millisecond. And
+`pre_first_token_setup_s`, the span that *does* contain both
+`install_fixed_m4` and `arm_fixed_m4_graph_build_overlap`, moved by
+**+0.41 ms**: that is the lane's entire construction cost, and it is 0.07 % of
+the +0.62 s that was blamed on it.
+
+Chunk 0 is the process-cold chunk and it is noisy on **both** arms: control
+spread 1.910–2.591 s (0.68 s), candidate 1.990–5.283 s. One candidate arm
+(B1/s20260830) hit 5.283 s; drop that single excursion and the candidate's
+chunk-0 mean is 2.206 s against the control's 2.157 s (+49 ms, inside the
+control's own spread). The second-largest chunk 0 in the whole matrix,
+2.591 s, is a **control**.
+
+### Where construction actually happens
+
+`mtplx/generation.py`, in order, and pinned by
+`test_construction_happens_after_the_prefill_span_not_inside_it`:
+
+1. `restore_or_prefill_prompt_state(...)` — **`prompt_eval_time_s` is measured
+   inside this call.** Nothing in this lane is reachable from it: a test
+   asserts no W67 symbol appears in `qwen4_exp.py`, `fable_prefill_chunk.py`
+   or `ple_prefill_lookahead.py`, and the decode loop's hook is the lane's
+   only call site.
+2. `pre_first_token_setup_started = time.perf_counter()` — after the prefill.
+3. `compiled_verify_bank.install_fixed_m4(...)` — PR391's, on **both** arms.
+4. `compiled_verify_bank.arm_fixed_m4_graph_build_overlap()` → the split
+   install. **+0.41 ms**, measured.
+5. `pre_first_token_setup_s = ...` — the span closes.
+6. Decode cycle 1: the first `prefix_fn` / `suffix_fn` call. **This is where
+   `mx.compile` actually traces** — `mx.compile(f)` only wraps; it traces on
+   first call. So the trace is inside `decode_elapsed_s`, never prefill. The
+   receipts confirm it from the other side: the control shows
+   `compiled_verify.traces == 1` (it traced the monolithic graph) and the
+   candidate shows **0** in 6/6 — the monolithic graph is never traced on the
+   candidate, because every window joins the split.
+
+So construction cannot move to model load: it needs `dispatch`, which
+`install_fixed_m4(cache, prompt_ids=...)` builds from the *request's*
+prefilled cache. It is already as early as it can be, and it is already
+outside the prefill span.
+
+### The real construction bug this found
+
+The bank is constructed **per request**. `install_fixed_m4_overlap_split` was
+building two fresh closures and wrapping them in `mx.compile` each time, so
+`mx.compile` would re-trace **both graphs on the first cycle of every
+request** — where the shipped monolithic route traces once per *process* via
+`_SHARED_VERIFY_STEPS` (whose docstring prices one trace at ~1 s wall at 7k
+leaves). Invisible in a one-request-per-process A/B; two full re-traces per
+request in a served process.
+
+Fixed by giving the pair the same sharing: `_SHARED_OVERLAP_SPLITS`, keyed on
+`(runtime id, capture backend, capture layout, aux presence, spec, **depth**,
+**needs_aux**, hidden variant, QSA gather route, aux contract,
+exact-verify route)`, with the same `trace_host["bank"]` indirection so a
+shared closure always reads the live bank, the same `weakref` guard against a
+recycled runtime id after a model swap, and the same
+`MTPLX_COMPILED_VERIFY_SHARED_TRACES` off-switch. Leaf-shape changes
+(capacity growth) stay `mx.compile`'s own retrace dimension, as on the
+monolithic path.
+
+### New receipt fields
+
+| field | what it answers |
+|---|---|
+| `graph_build_overlap.construction_ms` / `_calls` | what `install_fixed_m4_overlap_split` cost (inside `pre_first_token_setup_s`) |
+| `graph_build_overlap.first_prefix_build_ms` / `first_suffix_build_ms` | the two graphs' one-time `mx.compile` traces, in decode cycle 1 — always on, first-call only, so no `timing` item is needed and no A/B carries an instrument on one arm |
+| `graph_build_overlap.split_shared_hits` | installs that reused the process-wide pair. On a served process every install after the first must be a hit |
+| `prefill_split` = `{chunk0_s, rest_s, outside_s, chunks}` | attributes any prefill delta to the cold first chunk vs the rest vs the non-chunk remainder, without a twelve-receipt hand-reduce |
+
+## 9. What was NOT verified
 
 * **Nothing was run on the GPU.** No arm, no micro, no test that evaluates an
   MLX array. The 101 tests replace `graphbank.mx` with a recorder and every
@@ -306,6 +410,17 @@ vs `monolithic_windows`, `prefix_discarded`, `aux_hoisted`, `split_rebuilds`.
   `async_eval` first — exactly what the shipped monolithic route does under
   those settings, so the risk profile is unchanged, but it has never been run
   and the ABBA does not run it.
+* **That chunk 0's excursion is unrelated to this lane.** The evidence is
+  strong (the delta is entirely in the process-cold chunk, the control's own
+  chunk-0 spread covers most of it, the second-largest chunk 0 in the matrix
+  is a control, and the non-chunk part of the prefill span is identical) but
+  it is an attribution, not a controlled experiment. A repeat ABBA now
+  carries `prefill_split` and the construction counters, so the next run
+  settles it from the receipt alone.
+* **The process-wide pair cache has never been exercised on the real
+  runtime.** Its key, its host re-pointing and its weakref guard are covered
+  pure-Python against the production census; whether MLX reuses the trace as
+  the monolithic path does first shows on a two-request process.
 * **The per-layer GPU estimate.** 0.53 ms is `verify-body GPU / 48` from the
   census aggregate. Layers are not equal: layer 1 carries the PLE block (more
   than average) and the QSA layers are a different shape from the GDN ones, so

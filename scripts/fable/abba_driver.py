@@ -720,6 +720,18 @@ def _graph_build_overlap_receipt() -> dict[str, float]:
     fraction.  ``prefix_discarded`` should stay at or near zero -- every one is
     a prefix forward computed and thrown away.
 
+    ``construction_ms`` / ``construction_calls`` price
+    ``install_fixed_m4_overlap_split`` itself, and
+    ``first_prefix_build_ms`` / ``first_suffix_build_ms`` price the two
+    graphs' one-time ``mx.compile`` traces (both always on, no item needed).
+    All of it happens AFTER the prefill span -- inside
+    ``pre_first_token_setup_s`` for the install, inside decode cycle 1 for the
+    traces -- so a TTFT delta that is not accounted for by these belongs to
+    ``prefill_split``, not to this lane.  ``split_shared_hits`` says how many
+    installs reused the process-wide compiled pair: on a served process every
+    install after the first must be a hit, or every request is paying two
+    fresh traces.
+
     ``prefix_layers`` is the depth the bank INSTALLED, and it is the first
     thing to read on a W67 arm: if it is not the N the arm's
     ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS`` asked for, the row belongs to a
@@ -774,6 +786,41 @@ def _ple_candidate_prefetch_receipt() -> dict[str, float]:
         return last_receipt()
     except Exception:
         return {}
+
+
+def prefill_split_receipt(row: dict) -> dict[str, float | None]:
+    """Split ``prompt_eval_time_s`` into first chunk / rest / non-chunk.
+
+    W67's follow-up needed this reduced by hand from twelve receipts to answer
+    "did the candidate's TTFT regression come from the lever or from the first
+    prefill chunk?".  The answer was chunk 0 -- the process-cold one, whose
+    spread is ~0.7 s on BOTH arms -- while ``outside_s`` (everything in the
+    prefill span that is not chunk compute, which is where any per-request
+    construction inside the span would land) was identical to 0.5 ms.  Any
+    lane that arms construction near the request boundary wants this split at
+    a glance, so it is a standing field rather than a one-off reduce.
+    """
+
+    chunks = row.get("prefill_chunks") or []
+    prompt_eval = row.get("prompt_eval_time_s")
+    if not chunks or prompt_eval is None:
+        return {
+            "chunk0_s": None,
+            "rest_s": None,
+            "outside_s": None,
+            "chunks": len(chunks),
+        }
+    chunk0 = float(chunks[0].get("wall_s", 0.0))
+    rest = sum(float(chunk.get("wall_s", 0.0)) for chunk in chunks[1:])
+    return {
+        "chunk0_s": chunk0,
+        "rest_s": rest,
+        # prompt_eval minus chunk compute: restore/bookkeeping inside the
+        # measured prefill span.  A lane that pushed construction into prefill
+        # would show up HERE and nowhere else.
+        "outside_s": float(prompt_eval) - chunk0 - rest,
+        "chunks": len(chunks),
+    }
 
 
 def prefill_chunks_receipt() -> list[dict[str, float]]:
@@ -2299,6 +2346,7 @@ def main() -> int:
         row["per_cycle"] = per_cycle_receipt(output.stats)
         row["ple_hot_rows"] = ple_hot_rows_receipt(runtime)
         row["prefill_chunks"] = prefill_chunks_receipt()
+        row["prefill_split"] = prefill_split_receipt(row)
         compiled = row["compiled_verify"]
         row["compiled_m4_calls"] = int(compiled.get("compiled_calls", 0))
         row["configured_max_tokens"] = max_tokens

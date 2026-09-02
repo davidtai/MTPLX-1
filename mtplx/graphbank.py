@@ -1309,6 +1309,15 @@ def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
 # containers. See CompiledVerifyBank._shared_or_new_verify_step.
 _SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
 
+# W67: the same sharing, for the graph-build-overlap pair.  Without it the
+# bank -- which is constructed per generation -- would build TWO fresh
+# closures per request and mx.compile would re-trace both on the request's
+# first cycle, where the shipped monolithic route pays that trace once per
+# PROCESS.  (The monolithic docstring prices one trace at ~1 s wall at 7k
+# leaves.)  Values are (prefix_fn, suffix_fn, trace_host, runtime weakref);
+# trace_host["bank"] is re-pointed at the live bank on every hit.
+_SHARED_OVERLAP_SPLITS: dict[tuple, tuple[Any, Any, dict[str, Any], Any]] = {}
+
 
 def _prewarm_enabled() -> bool:
     raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_PREWARM", "1")).strip().lower()
@@ -1996,6 +2005,12 @@ class CompiledVerifyBank:
         self._fixed_m4_overlap_layers: int = (
             _graph_build_overlap.DEFAULT_LAYERS
         )
+        # W67: time the FIRST replay of each graph -- where mx.compile
+        # actually traces -- always, not only under the `timing` item.  After
+        # the first cycle these are False and the sites are a bool test, so
+        # the steady state pays what it paid before.
+        self._fixed_m4_overlap_first_prefix: bool = True
+        self._fixed_m4_overlap_first_suffix: bool = True
         # The Qwen4 fixed-M4 lane installs one construction-owned replay plan
         # after prompt prefill.  Production calls then bypass the generic
         # eligibility, promotion, bucket, shadow, and fallback machinery.
@@ -2790,6 +2805,7 @@ class CompiledVerifyBank:
         layer_count: int,
         capture_len: int,
         needs_aux: bool,
+        trace_host: dict[str, Any] | None = None,
     ):
         """W67: the traced closure for layers ``0..layer_count-1``.
 
@@ -2801,11 +2817,16 @@ class CompiledVerifyBank:
         traces exactly the graph W63 traced.
         """
 
-        bank = self
+        # ``prefix_plan``'s entries are read for `kind` and `n_leaves` only --
+        # never for `_entry`, which would pin a dead request's cache -- and
+        # both are part of the shared key's `spec_sig`.  Everything live
+        # (`_spec`, `_shadow`, `runtime`) comes through the host.
+        host = {"bank": self} if trace_host is None else trace_host
         prefix_plan = dispatch["state_plan"][:layer_count]
         prefix_capture = self._extra_capture_layout[:capture_len]
 
         def _run(input_ids, compiled_aux, state_in):
+            bank = host["bank"]
             pos = 0
             for (index, _spec_kind, _spec_leaves), (
                 kind,
@@ -2866,16 +2887,18 @@ class CompiledVerifyBank:
         *,
         start_layer: int,
         capture_start: int,
+        trace_host: dict[str, Any] | None = None,
     ):
         """W67: the traced closure for layers ``start_layer..last`` + head."""
 
-        bank = self
+        host = {"bank": self} if trace_host is None else trace_host
         suffix_plan = dispatch["state_plan"][start_layer:]
         suffix_capture = self._extra_capture_layout[capture_start:]
         returns_aux = bool(dispatch["returns_aux"])
         graph_aux = dispatch["graph_aux"]
 
         def suffix_step(prefix_hidden, input_ids, compiled_aux, *state_in):
+            bank = host["bank"]
             pos = 0
             for (index, _spec_kind, _spec_leaves), (
                 kind,
@@ -2938,6 +2961,7 @@ class CompiledVerifyBank:
         the control while wearing the candidate's label.
         """
 
+        _started = time.perf_counter()
         dispatch = self._fixed_m4_dispatch
         assert dispatch is not None
         spec = tuple(self._spec or ())
@@ -3005,22 +3029,15 @@ class CompiledVerifyBank:
                 "fixed-M4 overlap split leaves no capture rows on one side: "
                 f"{prefix_capture_leaves} of {dispatch['capture_leaves']}"
             )
+        prefix_fn, suffix_fn = self._shared_or_new_overlap_split(
+            dispatch,
+            layer_count=count,
+            capture_start=capture_start,
+            needs_aux=needs_aux,
+        )
         dispatch["overlap_split"] = {
-            "prefix_fn": mx.compile(
-                self._make_fixed_m4_overlap_prefix_step(
-                    dispatch,
-                    layer_count=count,
-                    capture_len=capture_start,
-                    needs_aux=needs_aux,
-                )
-            ),
-            "suffix_fn": mx.compile(
-                self._make_fixed_m4_overlap_suffix_step(
-                    dispatch,
-                    start_layer=count,
-                    capture_start=capture_start,
-                )
-            ),
+            "prefix_fn": prefix_fn,
+            "suffix_fn": suffix_fn,
             "layer_count": count,
             "needs_aux": needs_aux,
             "ple_layer_index": ple_index,
@@ -3032,6 +3049,102 @@ class CompiledVerifyBank:
             - prefix_capture_leaves,
         }
         _graph_build_overlap.note_prefix_layers(count)
+        _graph_build_overlap.note_construction(time.perf_counter() - _started)
+
+    def _shared_or_new_overlap_split(
+        self,
+        dispatch,
+        *,
+        layer_count: int,
+        capture_start: int,
+        needs_aux: bool,
+    ):
+        """Reuse one compiled overlap pair per process for a logical key.
+
+        Mirrors ``_shared_or_new_verify_step`` exactly, and for the same
+        reason: the bank is per-generation, so building fresh closures here
+        would make ``mx.compile`` re-trace both graphs on the first cycle of
+        EVERY request, where the shipped monolithic route traces once per
+        process.  In a one-request-per-process A/B that costs nothing and is
+        invisible; in a served process it is two full re-traces per request.
+
+        The key carries everything the traced pair depends on that is not
+        already inside ``spec_sig``: the prefix depth, whether the prefix
+        takes the auxiliary, the QSA gather route, the aux contract and the
+        exact-verify kernel route.  Leaf SHAPE changes (capacity growth) are
+        ``mx.compile``'s own retrace dimension, as on the monolithic path.
+        """
+
+        if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
+            return (
+                mx.compile(
+                    self._make_fixed_m4_overlap_prefix_step(
+                        dispatch,
+                        layer_count=layer_count,
+                        capture_len=capture_start,
+                        needs_aux=needs_aux,
+                    )
+                ),
+                mx.compile(
+                    self._make_fixed_m4_overlap_suffix_step(
+                        dispatch,
+                        start_layer=layer_count,
+                        capture_start=capture_start,
+                    )
+                ),
+            )
+        from .attention_context import exact_verify_required
+
+        qsa_entries = dispatch["qsa_entries"]
+        global_key = (
+            id(self.runtime),
+            self.capture_backend,
+            self._capture_layout_override,
+            self._extra_capture_layout,
+            self._prepare_compiled_aux is not None,
+            tuple(self._spec or []),
+            int(layer_count),
+            bool(needs_aux),
+            str(dispatch["hidden_variant"] or ""),
+            int(all(entry.fixed_rows_gather for entry in qsa_entries)),
+            str(dispatch["aux_contract"]),
+            bool(exact_verify_required()),
+        )
+        entry = _SHARED_OVERLAP_SPLITS.get(global_key)
+        if entry is not None:
+            prefix_fn, suffix_fn, host, runtime_ref = entry
+            # id() can be recycled after a model swap frees the old runtime;
+            # a stale pair would replay graphs bound to freed weights.
+            if runtime_ref() is self.runtime:
+                host["bank"] = self
+                _graph_build_overlap.bump("split_shared_hits")
+                return prefix_fn, suffix_fn
+            _SHARED_OVERLAP_SPLITS.pop(global_key, None)
+        host = {"bank": self}
+        prefix_fn = mx.compile(
+            self._make_fixed_m4_overlap_prefix_step(
+                dispatch,
+                layer_count=layer_count,
+                capture_len=capture_start,
+                needs_aux=needs_aux,
+                trace_host=host,
+            )
+        )
+        suffix_fn = mx.compile(
+            self._make_fixed_m4_overlap_suffix_step(
+                dispatch,
+                start_layer=layer_count,
+                capture_start=capture_start,
+                trace_host=host,
+            )
+        )
+        _SHARED_OVERLAP_SPLITS[global_key] = (
+            prefix_fn,
+            suffix_fn,
+            host,
+            weakref.ref(self.runtime),
+        )
+        return prefix_fn, suffix_fn
 
     def _refresh_fixed_m4_split(self) -> int:
         """Recompile the overlap pair when the plan changed generation.
@@ -3166,11 +3279,11 @@ class CompiledVerifyBank:
                 # refuses that contract at any depth past the PLE layer, so
                 # the shipped route's raw-payload spelling cannot be reached.
                 mx.async_eval(compiled_aux, *state_in)
-            outputs = self._call_overlap_prefix(
+            outputs = self._replay_overlap_prefix(
                 split["prefix_fn"], input_ids, compiled_aux, state_in
             )
         else:
-            outputs = self._call_overlap_prefix(
+            outputs = self._replay_overlap_prefix(
                 split["prefix_fn"], input_ids, None, state_in
             )
         capture_end = 1 + split["prefix_capture_leaves"]
@@ -3197,24 +3310,27 @@ class CompiledVerifyBank:
         _graph_build_overlap.bump("prefix_enqueued")
         return prefix
 
-    @staticmethod
-    def _call_overlap_prefix(prefix_fn, input_ids, compiled_aux, state_in):
-        """Replay the prefix graph, timed when the ``timing`` item is armed.
+    def _replay_overlap_prefix(self, prefix_fn, input_ids, compiled_aux, state_in):
+        """Replay the prefix graph, timed on the first call and under `timing`.
 
         The two arities are the point: at depth 1 the traced closure has no
         ``compiled_aux`` parameter at all, so passing ``None`` positionally
         would change its signature and its trace.
         """
 
-        if _GRAPH_BUILD_OVERLAP_TIMING:
+        first = self._fixed_m4_overlap_first_prefix
+        if _GRAPH_BUILD_OVERLAP_TIMING or first:
             _started = time.perf_counter()
             if compiled_aux is None:
                 outputs = tuple(prefix_fn(input_ids, *state_in))
             else:
                 outputs = tuple(prefix_fn(input_ids, compiled_aux, *state_in))
-            _graph_build_overlap.note_prefix_build(
-                time.perf_counter() - _started
-            )
+            _elapsed = time.perf_counter() - _started
+            if first:
+                self._fixed_m4_overlap_first_prefix = False
+                _graph_build_overlap.note_first_prefix_build(_elapsed)
+            if _GRAPH_BUILD_OVERLAP_TIMING:
+                _graph_build_overlap.note_prefix_build(_elapsed)
             return outputs
         if compiled_aux is None:
             return tuple(prefix_fn(input_ids, *state_in))
@@ -3320,7 +3436,8 @@ class CompiledVerifyBank:
             compiled_aux = prefix.compiled_aux
             if boundary in ("both", "pre"):
                 mx.async_eval(*state_in)
-        if _GRAPH_BUILD_OVERLAP_TIMING:
+        _first_suffix = self._fixed_m4_overlap_first_suffix
+        if _GRAPH_BUILD_OVERLAP_TIMING or _first_suffix:
             _started = time.perf_counter()
             outputs = tuple(
                 split["suffix_fn"](
@@ -3330,7 +3447,12 @@ class CompiledVerifyBank:
                     *state_in,
                 )
             )
-            _graph_build_overlap.note_suffix_build(time.perf_counter() - _started)
+            _elapsed = time.perf_counter() - _started
+            if _first_suffix:
+                self._fixed_m4_overlap_first_suffix = False
+                _graph_build_overlap.note_first_suffix_build(_elapsed)
+            if _GRAPH_BUILD_OVERLAP_TIMING:
+                _graph_build_overlap.note_suffix_build(_elapsed)
         else:
             outputs = tuple(
                 split["suffix_fn"](
