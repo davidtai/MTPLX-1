@@ -118,6 +118,31 @@ And why the arithmetic folds were already measured as losses
 Both changed *arithmetic placement*.  This lane changes only *scheduling*, and
 leaves both kernels exactly as measured.
 
+NUMERICS: why a stream cannot move a value, and what the install gate does
+    and does not cover
+--------------------------------------------------------------------------
+Both arms call one definition (``_emit_branch``), so the op set, the argument
+list and the order are the same by construction.  The remaining question is
+whether ``mx.compile`` can fuse the branch DIFFERENTLY once it is on another
+stream, since a different fusion group could in principle change a rounding
+boundary.  It cannot, for two reasons:
+
+* ``mlx/compile.cpp::compile_fuse`` stops fusing on a stream mismatch
+  (``a.primitive().stream() != s``), so a group never spans streams; and
+* the branch's three elementwise ops are already their own group on the shipped
+  lane.  The census shows them as exactly one kernel,
+  ``CV2ISigmoidADV2IMultiplyACEV2OMultiplyDB...(640, 4, 1)`` = split +
+  SiLU(gate) * up, bounded on both sides by quantized matvecs, which are not
+  fusable.  There is nothing on the default stream for it to have been fused
+  with, so moving it loses no fusion and gains none.
+
+Limit worth stating: ``install_qwen4_m4_stage3``'s per-layer ``mx.array_equal``
+proves the equivalence on the EAGER graph, on the real packs, before the first
+token.  Equivalence inside the outer compiled verify graph rests on the two
+points above plus the ABBA window's response digest, which is unchanged by
+construction if they hold.  If a future MLX relaxes the stream-mismatch guard,
+the digest is the thing that catches it.
+
 What the lane costs
 -------------------
 MLX synchronises cross-stream dependencies with ``Fence`` (``mlx/fence.cpp``):

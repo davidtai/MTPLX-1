@@ -802,7 +802,11 @@ arms are on the retained lane and the lane refuses to install without it.
 Because the branch is bit-exact by construction there is no quality screen:
 acceptance and the response digest are unchanged, and
 `install_qwen4_m4_stage3` proves it per layer on the real packs before the
-first token. The install report carries `shared_lane.armed` and
+first token. That install gate covers the *eager* graph; equivalence inside
+the outer compiled verify graph rests on `mlx/compile.cpp::compile_fuse`
+refusing to fuse across streams (so the branch's one elementwise group cannot
+be regrouped) plus the window's response digest, which is the thing that would
+catch a future MLX relaxing that guard. The install report carries `shared_lane.armed` and
 `shared_lane.installed` separately, so a flat A/B can still be told apart from
 a lane that never engaged.
 
