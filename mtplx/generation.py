@@ -401,9 +401,10 @@ _FABLE_BLOCK_VERIFY = _fable_block_verify_enabled()
 # this module existed -- same selector, same syncs, same uniforms, same order.
 #
 # When on (and the request is eligible -- see
-# `fable_device_k20.claim_request_route`, which RAISES rather than falling back
-# silently) the per-cycle draft chain runs its three MTP steps without a host
-# round trip: selection is the exact device top-20 kernel and the drafted token
+# `fable_device_k20.claim_request_route`, which DECLINES to the stock selector
+# for a request shape it does not serve and raises only for an install-time
+# contract violation) the per-cycle draft chain runs its three MTP steps
+# without a host round trip: selection is the exact device top-20 kernel and the drafted token
 # is sampled on device from the same PCG64 double `rng.choice` would have
 # consumed.  Sync count per cycle drops from four (three draft selections +
 # the target support) to two (one chain materialisation + the target support).
@@ -443,9 +444,10 @@ _FABLE_DEVICE_DRAFT_CHAIN = _fable_device_draft_chain_enabled()
 # the one draft-read site below is behind `is not None`, so the retained stock
 # lane runs the code it ran before this module existed.
 #
-# When on (and the request is eligible -- the claim RAISES rather than falling
-# back) each draft step builds its K20 support from the FR-Spec head's 65,536
-# compact row instead of the 248,320 scattered one: no `put_along_axis`, a
+# When on (and the request is eligible -- the claim DECLINES to the stock draft
+# read for a request shape it does not serve, and raises only for an
+# install-time contract violation) each draft step builds its K20 support from
+# the FR-Spec head's 65,536 compact row instead of the 248,320 scattered one: no `put_along_axis`, a
 # 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
 # the same `(ids, probs)` support because the ranked id table is strictly
 # ascending.  See that module's docstring for the exactness argument.
@@ -9392,11 +9394,18 @@ def generate_mtpk(
         if _graph_overlap_engagement is not None:
             print(_graph_overlap_engagement, flush=True)
     elif _graph_build_overlap.enabled():
-        # An armed flag that quietly ran the shipped route would make the
-        # receipts lie about which code the candidate arm measured.
-        raise RuntimeError(
-            f"{_graph_build_overlap.ENV_FLAG} requires the installed "
-            "physical-M4 compiled verify on the batched verify route"
+        # Request-shaped: `verify_strategy` is a per-request argument and the
+        # compiled verify can be off for this context length, so a miss stands
+        # aside (one warning + a receipt counter) instead of raising.  Raising
+        # here made every capture_commit request a 500.  A measured arm that
+        # must prove the lane ran sets MTPLX_FABLE_STRICT_CLAIMS=1, which
+        # turns the decline back into the RuntimeError.
+        _graph_build_overlap.decline(
+            "requires the installed physical-M4 compiled verify on the "
+            f"batched verify route (verify_strategy={verify_strategy!r}, "
+            f"compiled_verify_mode={_compiled_verify_mode!r}, "
+            f"bank={'yes' if compiled_verify_bank is not None else 'no'}, "
+            f"fixed_m4={bool(qwen4_fixed_m4_compiled_verify)})"
         )
     elif _graph_build_overlap.layers() != _graph_build_overlap.DEFAULT_LAYERS:
         # W67: a depth knob without the lever is the same lie in miniature --
@@ -10577,9 +10586,11 @@ def generate_mtpk(
     # branch below preserves v2.10's original rollback/reappend behavior.
     qsa_mtp_precompute_active = qsa_mtp_precompute_enabled()
     # MTPLX_FABLE_DEVICE_K20 (default off).  Claimed ONCE, here, where every
-    # request-invariant term the route depends on already exists.  The claim
-    # raises on an unsupported request instead of falling back: an armed flag
-    # that silently ran the stock selector would make the receipts lie.
+    # request-invariant term the route depends on already exists.  A request
+    # shape this lane does not serve DECLINES to the stock selector (logged +
+    # counted in fable_claim_contract.DECLINE_COUNTS); only an install-time
+    # contract violation raises.  Every site below is behind
+    # `_device_k20_plan is not None`, so a decline runs the shipped code.
     #
     # `fused_verify_input=False` is not a placeholder.  Merging the chain's
     # materialisation into the target sync needs the verify forward to accept
@@ -10621,21 +10632,23 @@ def generate_mtpk(
             a3b_target_prefix_route=a3b_target_prefix_route,
             pr391_route=_pr391_route,
             adaptive_dtemp_active=_dtemp_controller is not None,
+            draft_core=draft_core,
         )
-        if _device_k20_plan is not None and draft_core != "stock":
-            raise DeviceK20Ineligible(
-                "device K20 requires the stock draft route selector"
-            )
     # MTPLX_FABLE_DRAFT_K20_PRESCATTER (default off).  Claimed ONCE, here,
-    # after every request-invariant term it refuses on already exists.  The
-    # claim arms the FR-Spec head's compact-row stash and raises on an
-    # unsupported request instead of falling back, so the receipt below can
-    # only say `installed: True` when the pre-scatter selector really ran.
+    # after every request-invariant term it decides on already exists.  The
+    # claim arms the FR-Spec head's compact-row stash.  A request shape this
+    # lane does not serve DECLINES to the stock draft read and stamps the
+    # receipt (`declined`); only an install-time contract violation raises.
+    # The receipt can therefore only say `installed: True` when the
+    # pre-scatter selector really ran.  Serving contract, not a benchmark one:
+    # a greedy request used to 500 the server here (2026-09-02 HumanEval).
     _draft_k20_prescatter_plan = None
     _draft_k20_prescatter_receipt: dict[str, object] = {"installed": False}
     if _FABLE_DRAFT_K20_PRESCATTER:
         _draft_k20_prescatter_plan = _fable_draft_k20_prescatter_claim(
             rt,
+            greedy_chain_enabled=_greedy_chain_eligible,
+            receipt=_draft_k20_prescatter_receipt,
             draft_sampler=draft_sampler,
             draft_core=draft_core,
             target_prefix_verify=target_prefix_verify,
@@ -10660,12 +10673,6 @@ def generate_mtpk(
             steer_active=bool(loop_guard) or thinking_guard is not None,
         )
         if _draft_k20_prescatter_plan is not None:
-            if _greedy_chain_eligible:
-                _fable_draft_k20_prescatter_release(_draft_k20_prescatter_plan)
-                raise DraftK20PrescatterIneligible(
-                    "MTPLX_FABLE_DRAFT_K20_PRESCATTER: the greedy device chain "
-                    "owns the draft read"
-                )
             _draft_k20_prescatter_receipt = _draft_k20_prescatter_plan.to_dict()
     # MTPLX_FABLE_DEVICE_DRAFT_CHAIN (default off).  Claimed ONCE, here, after
     # every request-invariant term it refuses on already exists -- including
@@ -10678,6 +10685,7 @@ def generate_mtpk(
     _device_draft_chain_receipt: dict[str, object] = {"installed": False}
     if _FABLE_DEVICE_DRAFT_CHAIN:
         _device_draft_chain_plan = _fable_device_draft_chain_claim(
+            receipt=_device_draft_chain_receipt,
             rt=rt,
             state_tree_fn=_device_core_state_tree,
             promote_fn=promote_kv_cache_offsets,

@@ -105,13 +105,24 @@ temperature and ``scaled = row.astype(float32) * (1/T)``.
    ``_greedy_draft_token_and_metrics`` (``combine_greedy_draft_read``), the
    ``_draft_conf_needed`` block, the ``mtp_topk_reranker``, the adapter
    ensemble, the correction cache, the A3B target-prefix route, and the
-   ``MTPLX_FRSPEC_LEGACY`` local-id remap -- is a construction-time REFUSAL in
-   :func:`claim_draft_route`, not a fallback.
+   ``MTPLX_FRSPEC_LEGACY`` local-id remap -- is a construction-time DECLINE in
+   :func:`claim_draft_route`, not a mid-decode fallback.
 
-Anything this lane does not implement raises
-:class:`DraftK20PrescatterIneligible` at construction.  An armed flag that
-quietly ran the stock selector would make every receipt a lie about which
-selector produced it.
+Anything this lane does not implement is settled at construction, never
+mid-decode, in one of two ways (:mod:`mtplx.fable_claim_contract`):
+
+* a request SHAPE the lane does not serve -- greedy, penalties, a competing
+  owner of the draft chain -- DECLINES: the shipped selector runs, the plan is
+  ``None``, and the receipt records ``declined`` plus the reason.  It is not a
+  silent fallback, because ``installed`` stays False and no receipt ever
+  claims this selector produced a number it did not.
+* an INSTALL-time contract violation -- FR-Spec absent, the head off the live
+  draft route, a wrong-width or unordered ranked table -- still raises
+  :class:`DraftK20PrescatterIneligible`.  No request in the process could be
+  served, so failing the first one loudly is the honest report.
+
+``MTPLX_FABLE_STRICT_CLAIMS=1`` turns declines back into raises for a measured
+arm that must prove the lane ran.
 
 NO device work happens at import.
 """
@@ -124,6 +135,11 @@ from typing import Any
 
 import numpy as np
 
+from .fable_claim_contract import (
+    ClaimDeclined,
+    decline as _decline,
+    declined_receipt,
+)
 from .sampling import SamplerConfig, SparseDistribution, sample_from_distribution
 
 
@@ -162,9 +178,17 @@ def _configure_for_test(enabled: bool) -> None:
 
 
 class DraftK20PrescatterIneligible(RuntimeError):
-    """The armed flag met a request this lane does not implement.
+    """The armed flag cannot work in THIS PROCESS at all.
 
-    Raised at construction, never mid-decode.  There is no silent fallback.
+    Reserved for install-time contract violations -- FR-Spec absent, the head
+    off the live draft route, a ranked table of the wrong width or order.
+    Every request would fail identically, so the first one fails loudly.
+
+    A request whose SHAPE this lane does not serve (greedy, penalties, a
+    competing owner of the draft chain, ...) does NOT raise: it declines to
+    the shipped draft path, which is what :mod:`mtplx.fable_claim_contract`
+    exists for.  Raising on those turned every greedy request into an HTTP
+    500 in serving (composed-decode-stack HumanEval gate, 2026-09-02).
     """
 
 
@@ -211,8 +235,14 @@ class DraftK20PrescatterPlan:
 
 
 def _refuse(reason: str) -> None:
+    """Install-time contract violation: no request here could be served.
+
+    Request-SHAPE ineligibility uses ``_decline`` instead -- see
+    :mod:`mtplx.fable_claim_contract`.
+    """
+
     raise DraftK20PrescatterIneligible(
-        f"MTPLX_FABLE_DRAFT_K20_PRESCATTER: {reason}"
+        f"{_ENV_VAR}: {reason}"
     )
 
 
@@ -300,16 +330,83 @@ def claim_draft_route(
     relaxed_draft_ties: bool,
     penalties_active: bool,
     steer_active: bool,
+    greedy_chain_enabled: bool = False,
+    receipt: dict[str, object] | None = None,
 ) -> DraftK20PrescatterPlan | None:
     """Bind the pre-scatter draft route to one generation construction.
 
-    Returns ``None`` when the flag is off.  Raises
-    :class:`DraftK20PrescatterIneligible` when the flag is ON and the request
-    is not one this route can serve bit-for-bit.
+    Returns ``None`` when the flag is off, and ``None`` again when the flag is
+    on but this REQUEST's shape is not one the route serves -- a decline, not
+    a failure: the shipped draft path runs and produces the same tokens.  When
+    ``receipt`` is passed it is filled in with why (``declined`` /
+    ``declined_detail`` / cumulative ``declines``), so a reader can always tell
+    a decline from a lane that never armed.
+
+    Raises :class:`DraftK20PrescatterIneligible` only for an INSTALL-time
+    contract violation -- something no request in this process could satisfy.
+    ``MTPLX_FABLE_STRICT_CLAIMS=1`` turns declines back into that exception for
+    a measured arm that must prove the lane ran.
     """
 
     if not _ENABLED:
         return None
+    try:
+        return _claim_draft_route(
+            rt,
+            draft_sampler=draft_sampler,
+            draft_core=draft_core,
+            target_prefix_verify=target_prefix_verify,
+            a3b_target_prefix_route=a3b_target_prefix_route,
+            pr391_route=pr391_route,
+            device_k20_route=device_k20_route,
+            frspec_legacy_ids=frspec_legacy_ids,
+            adaptive_width_policy=adaptive_width_policy,
+            combine_greedy_draft_read=combine_greedy_draft_read,
+            draft_confidence_needed=draft_confidence_needed,
+            draft_margin_threshold=draft_margin_threshold,
+            wants_policy_metrics=wants_policy_metrics,
+            correction_cache_enabled=correction_cache_enabled,
+            adapter_ensemble_q=adapter_ensemble_q,
+            mtp_topk_reranker=mtp_topk_reranker,
+            relaxed_draft_ties=relaxed_draft_ties,
+            penalties_active=penalties_active,
+            steer_active=steer_active,
+            greedy_chain_enabled=greedy_chain_enabled,
+        )
+    except ClaimDeclined as declined:
+        stamped = declined_receipt(
+            _ENV_VAR, declined, ineligible=DraftK20PrescatterIneligible
+        )
+        if receipt is not None:
+            receipt.clear()
+            receipt.update(stamped)
+        return None
+
+
+def _claim_draft_route(
+    rt: Any,
+    *,
+    draft_sampler: SamplerConfig,
+    draft_core: str,
+    target_prefix_verify: bool,
+    a3b_target_prefix_route: Any,
+    pr391_route: Any,
+    device_k20_route: Any,
+    frspec_legacy_ids: Any,
+    adaptive_width_policy: Any,
+    combine_greedy_draft_read: bool,
+    draft_confidence_needed: bool,
+    draft_margin_threshold: float | None,
+    wants_policy_metrics: bool,
+    correction_cache_enabled: bool,
+    adapter_ensemble_q: bool,
+    mtp_topk_reranker: Any,
+    relaxed_draft_ties: bool,
+    penalties_active: bool,
+    steer_active: bool,
+    greedy_chain_enabled: bool,
+) -> DraftK20PrescatterPlan:
+    """The claim body.  ``_refuse`` raises; ``_decline`` stands aside."""
 
     text = getattr(getattr(rt, "model", None), "language_model", None)
     if text is None:
@@ -352,43 +449,100 @@ def claim_draft_route(
 
     top_k = int(draft_sampler.top_k)
     if top_k <= 0:
-        _refuse("this route requires a top-k draft sampler")
+        _decline(
+            "no_top_k",
+            "this route requires a top-k draft sampler "
+            f"(draft top_k={top_k})",
+        )
     superset = min(max(_SUPERSET_MULTIPLIER * top_k, top_k), rows)
     if superset > rows:  # pragma: no cover - unreachable given the min() above
-        _refuse(f"candidate superset {superset} exceeds the ranked table")
+        _decline(
+            "superset_too_wide",
+            f"candidate superset {superset} exceeds the ranked table",
+        )
     if (
         float(draft_sampler.presence_penalty) != 0.0
         or float(draft_sampler.frequency_penalty) != 0.0
     ):
-        _refuse("draft sampler penalties index by real token id")
+        _decline(
+            "draft_sampler_penalties",
+            "draft sampler penalties index by real token id",
+        )
     if penalties_active or steer_active:
-        _refuse("steering/penalty overlays index by real token id")
+        _decline(
+            "steer_or_penalties",
+            "steering/penalty overlays index by real token id",
+        )
+    if greedy_chain_enabled:
+        _decline(
+            "greedy_chain",
+            "the greedy device chain owns the draft read",
+        )
     if str(draft_core) != "stock":
-        _refuse(f"this route requires the stock draft selector (got {draft_core!r})")
+        _decline(
+            "non_stock_draft_core",
+            f"this route requires the stock draft selector (got {draft_core!r})",
+        )
     if relaxed_draft_ties:
-        _refuse("MTPLX_QWEN4_RELAXED_DRAFT_TIES installs a different builder")
+        _decline(
+            "relaxed_draft_ties",
+            "MTPLX_QWEN4_RELAXED_DRAFT_TIES installs a different builder",
+        )
     if frspec_legacy_ids is not None:
-        _refuse("MTPLX_FRSPEC_LEGACY already remaps local draft ids")
+        _decline(
+            "frspec_legacy",
+            "MTPLX_FRSPEC_LEGACY already remaps local draft ids",
+        )
     if device_k20_route is not None:
-        _refuse("MTPLX_FABLE_DEVICE_K20 owns the draft selector")
+        _decline(
+            "device_k20_owns_selector",
+            "MTPLX_FABLE_DEVICE_K20 owns the draft selector",
+        )
     if pr391_route is not None:
-        _refuse("the PR391 float32 D3 route owns the draft chain")
+        _decline(
+            "pr391_owns_chain",
+            "the PR391 float32 D3 route owns the draft chain",
+        )
     if a3b_target_prefix_route is not None or target_prefix_verify:
-        _refuse("target-prefix verification samples drafts on device")
+        _decline(
+            "target_prefix_verify",
+            "target-prefix verification samples drafts on device",
+        )
     if adaptive_width_policy is not None:
-        _refuse("adaptive-width readers own the draft read")
+        _decline(
+            "adaptive_width",
+            "adaptive-width readers own the draft read",
+        )
     if combine_greedy_draft_read:
-        _refuse("the joint greedy confidence read materialises the dense row")
+        _decline(
+            "combined_greedy_read",
+            "the joint greedy confidence read materialises the dense row",
+        )
     if draft_confidence_needed:
-        _refuse("draft-confidence tracing materialises the dense row")
+        _decline(
+            "draft_confidence",
+            "draft-confidence tracing materialises the dense row",
+        )
     if draft_margin_threshold is not None or wants_policy_metrics:
-        _refuse("draft confidence metrics materialise the dense row")
+        _decline(
+            "draft_confidence_metrics",
+            "draft confidence metrics materialise the dense row",
+        )
     if correction_cache_enabled:
-        _refuse("the online/prompt correction cache bypasses the draft read")
+        _decline(
+            "correction_cache",
+            "the online/prompt correction cache bypasses the draft read",
+        )
     if adapter_ensemble_q:
-        _refuse("the adapter ensemble reads two dense draft rows")
+        _decline(
+            "adapter_ensemble",
+            "the adapter ensemble reads two dense draft rows",
+        )
     if mtp_topk_reranker is not None:
-        _refuse("the top-k reranker reads the dense draft row")
+        _decline(
+            "topk_reranker",
+            "the top-k reranker reads the dense draft row",
+        )
 
     head.arm_prescatter_capture(True)
     return DraftK20PrescatterPlan(

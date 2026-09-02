@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from mtplx import fable_claim_contract as contract
 from mtplx import fable_device_k20 as dk
 from mtplx import fable_k20_log as log_mod
 from mtplx.sampling import SamplerConfig
@@ -671,12 +672,53 @@ def _claim(monkeypatch, **overrides):
         {"sampler": SamplerConfig(temperature=0.6, top_p=0.95, top_k=K20,
                                   presence_penalty=0.5)},
         {"speculative_depth": 0},
-        {"rng": np.random.Generator(np.random.Philox(1))},
+        {"draft_core": "device"},
     ],
 )
-def test_unsupported_requests_raise_instead_of_falling_back(monkeypatch, override):
+def test_unsupported_requests_decline_to_the_stock_lane(monkeypatch, override):
+    """Request-shaped ineligibility stands aside; it does not raise.
+
+    Every override here is a property of ONE REQUEST.  Raising made each of
+    them an HTTP 500 in serving even though the stock selector serves them
+    perfectly (composed-stack HumanEval gate, 2026-09-02).
+    """
+
+    monkeypatch.setattr(contract, "_STRICT", False)
+    contract.reset_for_test()
+    receipt: dict[str, object] = {}
+    assert _claim(monkeypatch, receipt=receipt, **override) is None
+    assert receipt["installed"] is False
+    assert receipt["declined"]
+    assert contract.decline_counts(dk._ENV_VAR)[receipt["declined"]] == 1
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"greedy_chain_enabled": True},
+        {"sampler": SamplerConfig(temperature=0.0, top_p=0.95, top_k=K20)},
+        {"draft_core": "device"},
+    ],
+)
+def test_strict_claims_turns_a_decline_back_into_a_failure(monkeypatch, override):
+    """A measured arm still fails closed under MTPLX_FABLE_STRICT_CLAIMS."""
+
+    monkeypatch.setattr(contract, "_STRICT", True)
     with pytest.raises(dk.DeviceK20Ineligible):
         _claim(monkeypatch, **override)
+
+
+def test_install_time_contract_violations_still_raise(monkeypatch):
+    """A wrong bit generator is not a request shape -- no request could work.
+
+    The rng comes from `generate_mtpk`'s own seeding, so this can only mean
+    the process is built wrong.  Every request would fail identically, so the
+    first one fails loudly instead of silently running a slower lane forever.
+    """
+
+    monkeypatch.setattr(contract, "_STRICT", False)
+    with pytest.raises(dk.DeviceK20Ineligible, match="PCG64"):
+        _claim(monkeypatch, rng=np.random.Generator(np.random.Philox(1)))
 
 
 def test_supported_request_builds_a_plan(monkeypatch):

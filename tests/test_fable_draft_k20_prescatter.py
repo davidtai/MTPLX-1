@@ -21,8 +21,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import re
 from types import SimpleNamespace
 
+import mtplx.fable_claim_contract as contract
 import mtplx.fable_draft_k20_prescatter as prescatter
 import mtplx.fast_sampling as fast_sampling
 import mtplx.frspec_draft as frspec_draft
@@ -679,32 +681,94 @@ def test_the_real_install_legacy_swap_is_also_recognised(monkeypatch):
         ({"steer_active": True}, "real token id"),
     ],
 )
-def test_claim_refuses_every_unsupported_request_term(armed, override, match):
+def test_claim_declines_every_unsupported_request_term(armed, override, match):
+    """Request-shaped ineligibility stands aside; it does not raise.
+
+    Every override here is a property of ONE REQUEST, and the stock draft
+    reader serves all of them.  Raising made each one an HTTP 500 in serving
+    -- the greedy case took down the composed-stack HumanEval gate on its very
+    first request, 2026-09-02.
+    """
+
     rt, head, _ = _runtime()
+    contract.reset_for_test()
     kwargs = {**_ELIGIBLE, **override}
-    with pytest.raises(DraftK20PrescatterIneligible, match=match):
-        prescatter.claim_draft_route(rt, draft_sampler=_config(), **kwargs)
+    receipt: dict[str, object] = {}
+    plan = prescatter.claim_draft_route(
+        rt, draft_sampler=_config(), receipt=receipt, **kwargs
+    )
+    assert plan is None
+    assert receipt["installed"] is False
+    assert re.search(match, str(receipt["declined_detail"]))
+    assert contract.decline_counts(prescatter._ENV_VAR)[receipt["declined"]] == 1
+    # The stash stays disarmed: the stock reader owns the dense row.
     assert head._prescatter_capture is False
 
 
-def test_claim_refuses_draft_sampler_penalties(armed):
+def test_claim_declines_a_greedy_request(armed):
+    """The exact 2026-09-02 production failure, as a request contract."""
+
+    rt, head, _ = _runtime()
+    contract.reset_for_test()
+    receipt: dict[str, object] = {}
+    plan = prescatter.claim_draft_route(
+        rt,
+        draft_sampler=_config(),
+        receipt=receipt,
+        greedy_chain_enabled=True,
+        **_ELIGIBLE,
+    )
+    assert plan is None
+    assert receipt["declined"] == "greedy_chain"
+    assert receipt["declines"] == {"greedy_chain": 1}
+    assert head._prescatter_capture is False
+
+
+def test_strict_claims_turns_a_decline_back_into_a_failure(armed, monkeypatch):
+    """A measured arm still fails closed under MTPLX_FABLE_STRICT_CLAIMS."""
+
+    monkeypatch.setattr(contract, "_STRICT", True)
+    rt, head, _ = _runtime()
+    with pytest.raises(DraftK20PrescatterIneligible, match="greedy device chain"):
+        prescatter.claim_draft_route(
+            rt,
+            draft_sampler=_config(),
+            greedy_chain_enabled=True,
+            **_ELIGIBLE,
+        )
+    assert head._prescatter_capture is False
+
+
+def test_claim_declines_draft_sampler_penalties(armed):
     rt, _, _ = _runtime()
+    contract.reset_for_test()
     config = SamplerConfig(
         temperature=TEMPERATURE,
         top_p=TOP_P,
         top_k=TOP_K,
         presence_penalty=0.2,
     )
-    with pytest.raises(DraftK20PrescatterIneligible, match="penalties"):
-        prescatter.claim_draft_route(rt, draft_sampler=config, **_ELIGIBLE)
-
-
-def test_claim_refuses_without_top_k(armed):
-    rt, _, _ = _runtime()
-    with pytest.raises(DraftK20PrescatterIneligible, match="top-k"):
+    receipt: dict[str, object] = {}
+    assert (
         prescatter.claim_draft_route(
-            rt, draft_sampler=_config(top_k=0), **_ELIGIBLE
+            rt, draft_sampler=config, receipt=receipt, **_ELIGIBLE
         )
+        is None
+    )
+    assert receipt["declined"] == "draft_sampler_penalties"
+
+
+def test_claim_declines_without_top_k(armed):
+    rt, _, _ = _runtime()
+    contract.reset_for_test()
+    receipt: dict[str, object] = {}
+    assert (
+        prescatter.claim_draft_route(
+            rt, draft_sampler=_config(top_k=0), receipt=receipt, **_ELIGIBLE
+        )
+        is None
+    )
+    assert receipt["declined"] == "no_top_k"
 
 
 # ---------------------------------------------------------------------------
@@ -730,3 +794,26 @@ def test_the_draft_loop_reads_the_plan_before_the_stock_reader():
     assert "elif _draft_k20_prescatter_plan is not None:" in source
     assert "_fable_draft_k20_prescatter_read(" in source
     assert "draft_k20_prescatter=_draft_k20_prescatter_receipt," in source
+
+
+def test_the_call_site_declines_instead_of_raising_on_a_greedy_request():
+    """The 2026-09-02 outage, pinned at the call site.
+
+    The greedy-chain term is decided INSIDE the claim (so it declines like
+    every other request term) and the receipt dict is handed in, so a decline
+    is recorded rather than raised.  A `raise DraftK20PrescatterIneligible`
+    in `generate_mtpk` would put the 500 back.
+    """
+
+    import inspect
+
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    assert "greedy_chain_enabled=_greedy_chain_eligible," in source
+    assert "receipt=_draft_k20_prescatter_receipt," in source
+    assert "raise DraftK20PrescatterIneligible(" not in source
+    # The device-K20 sibling's CLAIM-site raise went too; the only
+    # DeviceK20Ineligible left in the loop is the mid-decode guard, which is
+    # a different class of failure (see the module's report).
+    assert "device K20 requires the stock draft route selector" not in source
