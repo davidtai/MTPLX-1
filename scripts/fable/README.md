@@ -526,6 +526,44 @@ the verifier with an ABBA arm carrying
 the gate is acceptance parity. Arming `MTPLX_FABLE_QSA_M4` without the fused
 K/V gather RAISES at cache install rather than running a slower stock lane.
 
+## K20 row logging and the offline acceptance scorers
+
+`MTPLX_FABLE_K20_LOG=<path.npz>` captures, per verify cycle, the seven prepared
+K20 rows the PR391 D3/M4 decision already holds — 3 draft rows and 4 target
+rows, ids + top-20 logits + full-vocabulary probabilities — plus the drafted
+tokens, the 3 draft-select and 4 decision PCG64 uniforms, and the decision
+outputs. About 0.66 MB per 1,024-token request. Read once at import, default
+off; see `mtplx/fable_k20_log.py` for the full field list and the cost note.
+
+The rows are folded into the decision's existing `mx.eval`, so an armed run
+adds no new synchronisation — but it does add a ~1.7 kB device-to-host copy per
+cycle on the critical path. **An instrumented run is a data run, not a timing
+run.** Read tok/s off an un-instrumented arm.
+
+```
+MTPLX_FABLE_K20_LOG=/tmp/rows.npz <the usual PR391 D3 benchmark command>
+
+# H §Option B — block verification vs the shipped law, same logged uniforms
+python scripts/fable/offline_block_verification.py /tmp/rows.npz \
+    --ms-per-window 37.47
+python scripts/fable/offline_block_verification.py /tmp/rows.npz --cap one
+
+# H §Option D — draft temperature / top-p / top-k sweep against sum(min(p, q))
+python scripts/fable/offline_draft_temperature.py /tmp/rows.npz --tail lump
+python scripts/fable/offline_draft_temperature.py /tmp/rows.npz --tail drop
+```
+
+Both scorers are pure NumPy and never import mlx. `offline_block_verification`
+replays the **shipped** law first and fails if it disagrees with the decision
+the device kernel logged — that check is what makes the block-law number
+trustworthy — and it fails again if block verification diverges on a window
+whose reach credit stayed at 1, where the two laws are provably identical.
+
+Quote the `E[tok/win]` column (accept coins integrated out, paired standard
+error), not the `replay` column; the replay is the exactness proof, and its
+arm-to-arm difference is noise-dominated. Per H §1.4 a live A/B cannot resolve
+either option at all.
+
 ## Tests
 
 ```
