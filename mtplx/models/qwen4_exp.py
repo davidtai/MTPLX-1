@@ -74,6 +74,7 @@ from mtplx.runtime_options import (
     fable_hc_m4_enabled,
     fable_opdiet_enabled,
     fable_qsa_m4_enabled,
+    fable_verify_glue_enabled,
 )
 
 
@@ -2745,6 +2746,25 @@ class QSAIndexer(nn.Module):
             compress_ratio=self.ratio,
         )
 
+    def _verify_glue_rope_idx(self) -> bool:
+        """True when ``MTPLX_FABLE_VERIFY_GLUE``'s ``qsa_rope_idx`` serves.
+
+        Host-only, and read from the verdict the install probe recorded at
+        model build outside any trace, so two traces of the same compiled
+        verify graph cannot disagree about which preparation they contain.
+        A False here is routing (the item is not armed, or its probe
+        disabled it); a contract miss raised at install and never gets here.
+        """
+
+        if not fable_verify_glue_enabled("qsa_rope_idx"):
+            return False
+        from mtplx import fable_verify_glue as _glue
+
+        if not _glue.qsa_rope_idx_installed():
+            return False
+        _glue.note_prep_call()
+        return True
+
     def _prepare_queries_m4(self, q: mx.array, pos_start) -> mx.array:
         """RMSNorm + partial RoPE in one dispatch, instead of twelve.
 
@@ -3843,6 +3863,11 @@ class QSAIndexer(nn.Module):
             q = None
         elif fused_m4:
             q = self._prepare_queries_m4(q, pos_start)
+        elif fixed_capacity and self._verify_glue_rope_idx():
+            # MTPLX_FABLE_VERIFY_GLUE item 'qsa_rope_idx': the same SHIPPED
+            # kernel MTPLX_FABLE_QSA_M4 uses for this one sub-chain, without
+            # that flag's three other (and less exact) rewrites.
+            q = self._prepare_queries_m4(q, pos_start)
         elif fixed_capacity:
             q = self._prepare_queries_eager(q, pos_start)
         else:
@@ -4214,6 +4239,23 @@ class Attention(nn.Module):
             else None
         )
 
+    def _verify_glue_rope(self, rows: int) -> bool:
+        """True when ``MTPLX_FABLE_VERIFY_GLUE``'s ``qsa_rope`` serves this call.
+
+        Host-only, from the verdict the install probe recorded at model build
+        outside any trace.  Width is a NARROWING, not a failure: the kernel is
+        a latency play on the 1..8-row decode/verify window and prefill is a
+        regime nothing here has measured, so prefill keeps the stock chain.
+        """
+
+        if not fable_verify_glue_enabled("qsa_rope"):
+            return False
+        from mtplx import fable_verify_glue as _glue
+
+        if not _glue.serves_rows(rows):
+            return False
+        return _glue.qsa_rope_installed()
+
     def __call__(
         self, x: mx.array, cache: QSACache, *, kv_only: bool = False
     ) -> Optional[mx.array]:
@@ -4292,6 +4334,23 @@ class Attention(nn.Module):
                 cos, sin = _rope_cos_sin(
                     positions, self._inv_freq, self._rope_attention_scaling
                 )
+        elif vrope is None and self._verify_glue_rope(int(S)):
+            # MTPLX_FABLE_VERIFY_GLUE item 'qsa_rope': the table build and
+            # both rotations as ONE dispatch. Same arithmetic, same order --
+            # the install probe proved it bit-exact against whichever stock
+            # spelling this process armed.
+            from mtplx.kernels.qwen4_m4_rope import rope_qk
+
+            rotated_q, k = rope_qk(
+                None if kv_only else q,
+                k,
+                self._inv_freq,
+                pos_start=pos_start,
+                attention_scaling=self._rope_attention_scaling,
+            )
+            if not kv_only:
+                q = rotated_q
+            cos = sin = None
         elif fable_opdiet_enabled("rope"):
             # Text rope: one half-width table per (pos_start, S) instead of a
             # full-width table per consumer. The indexer above already asked
