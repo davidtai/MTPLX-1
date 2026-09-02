@@ -329,7 +329,7 @@ def retained_stack_args() -> argparse.Namespace:
     return args
 
 
-def apply_environment(args: argparse.Namespace, source_path: Path) -> dict[str, Any]:
+def apply_environment(args: argparse.Namespace) -> dict[str, Any]:
     from mtplx.profiles import apply_profile_env, get_profile
 
     family_overrides, candidate_environment = driver.build_family_overrides(args)
@@ -561,7 +561,7 @@ def main() -> int:
 
     args = retained_stack_args()
     args.max_tokens = options.max_tokens
-    environment = apply_environment(args, ROOT)
+    environment = apply_environment(args)
 
     from mtplx.server.openai import _apply_metal_memory_caps
 
