@@ -456,9 +456,12 @@ def test_tile_flag_accepts_only_instantiated_tiles():
 
 
 def test_splits_flag_is_bounded():
-    from mtplx.runtime_options import _parse_sparse_decode_splits
+    from mtplx.runtime_options import (
+        FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS as default,
+        _parse_sparse_decode_splits,
+    )
 
-    assert _parse_sparse_decode_splits(None) == 8
+    assert _parse_sparse_decode_splits(None) == default == 17
     assert _parse_sparse_decode_splits("17") == 17
     for bad in ("0", "65", "-1", "eight"):
         with pytest.raises(ValueError):
@@ -482,9 +485,133 @@ def test_engagement_reports_a_pending_install_as_not_installed():
 
 
 def test_parity_thresholds_are_stated_not_implicit():
-    assert lane.PARITY_MAX_ABS_ULPS == 8.0
-    assert lane.PARITY_MAX_REL_L2 == 2.0e-3
+    assert lane.PARITY_FP32_MAX_ABS_ULPS == 2.0
+    assert lane.PARITY_FP32_MAX_REL_L2 == 5.0e-4
+    assert lane.PARITY_SHIPPED_MAX_REL_L2 == 5.0e-2
     assert lane.PARITY_MIN_TOP1 == 0.98
+
+
+# ---------------------------------------------------------------------------
+# 7. what the 2026-09-02 runs settled
+# ---------------------------------------------------------------------------
+def test_the_tight_gate_is_tighter_than_the_measured_shipped_delta():
+    """The fp32 gate must be able to FAIL if the attribution is wrong.
+
+    Every configuration measured rel_l2 4.78e-3 against the shipped path.  If
+    that delta really is the shipped path's own bf16 score and probability
+    casts, the same comparison against the fp32 reference collapses to output
+    rounding.  A gate set above 4.78e-3 could not tell those apart, so it
+    would certify nothing.
+    """
+
+    measured_vs_shipped = 4.78e-3
+    assert lane.PARITY_FP32_MAX_REL_L2 < measured_vs_shipped
+    # ... while the loose bar stays an order of magnitude above it, because it
+    # bounds the reference's quantisation, not the kernel's error.
+    assert lane.PARITY_SHIPPED_MAX_REL_L2 > 10 * measured_vs_shipped
+
+
+def test_the_reference_ladder_has_three_distinct_rungs():
+    import inspect
+
+    src = inspect.getsource(lane.reference_attention)
+    # The shipped rung must keep BOTH bf16 roundings...
+    assert "probs = probs.astype(queries.dtype)" in src
+    # ...and the fp32 rung must remove them by UPCASTING (exact), never by
+    # changing the operands.
+    assert "q_view = q_view.astype(mx.float32)" in src
+    assert "v_view = v_view.astype(mx.float32)" in src
+    for fn, scores, probs in (
+        (lane.stock_reference, False, False),
+        (lane.shipped_fp32_probs_reference, False, True),
+        (lane.fp32_reference, True, True),
+    ):
+        wrapped = inspect.getsource(fn)
+        assert f"fp32_scores={scores}" in wrapped
+        assert f"fp32_probs={probs}" in wrapped
+
+
+def test_every_reference_rung_returns_the_query_dtype():
+    """All three must be comparable element for element against bf16 output."""
+
+    import inspect
+
+    src = inspect.getsource(lane.reference_attention)
+    assert src.rstrip().endswith(".astype(queries.dtype)")
+
+
+def test_the_default_split_target_reaches_one_tile_per_threadgroup():
+    """17 is the tile count at BK=128, so it is the knob's saturation point."""
+
+    from mtplx.runtime_options import (
+        FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS as default,
+    )
+
+    n_tiles, per_split, n_splits = qsa_sparse_gqa_decode_split_geometry(
+        lane.SELECTED_TOKENS, 128, default
+    )
+    assert (n_tiles, per_split, n_splits) == (17, 1, 17)
+    assert lane.VERIFY_ROWS * lane.KV_HEADS * n_splits == 136
+
+
+@pytest.mark.parametrize("larger", [18, 32, 33, 64])
+def test_split_targets_above_the_tile_count_are_the_same_configuration(larger):
+    """Why the first sweep's s17 and s32 rows are one config measured twice.
+
+    Their 5.3% spread is therefore the bench's noise floor, not a result, and
+    nothing may be called a winner on a margin under it.
+    """
+
+    at_17 = qsa_sparse_gqa_decode_split_geometry(lane.SELECTED_TOKENS, 128, 17)
+    assert qsa_sparse_gqa_decode_split_geometry(
+        lane.SELECTED_TOKENS, 128, larger
+    ) == at_17
+
+
+def test_bk64_needs_33_splits_to_saturate_and_that_is_in_the_sweep():
+    """BK=64 has 33 tiles, so 17 and 32 both clamp to 17 -- 33 does not."""
+
+    at_32 = qsa_sparse_gqa_decode_split_geometry(lane.SELECTED_TOKENS, 64, 32)
+    at_33 = qsa_sparse_gqa_decode_split_geometry(lane.SELECTED_TOKENS, 64, 33)
+    assert at_32[2] == 17 and at_33[2] == 33
+    assert lane.VERIFY_ROWS * lane.KV_HEADS * at_33[2] == 264
+    harness = (ROOT / "scripts" / "fable" / "micro_qsa_sparse_decode.py").read_text()
+    assert "SPLIT_TARGETS = (4, 8, 16, 17, 32, 33, 64)" in harness
+
+
+def test_the_lane_and_the_native_wrapper_agree_on_the_default():
+    from mtplx import native
+    from mtplx.runtime_options import (
+        FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS as default,
+    )
+
+    assert native._DEFAULT_KEY_SPLITS == default
+    assert native._DEFAULT_TILE == (128, 32)
+
+
+def test_the_micro_refuses_the_production_gather_arm_off_the_m4_geometry():
+    """kernels/qwen4_qsa_m4_fused_kv_gather.py compiles _ROWS = 4.
+
+    Handing it a 1-row cell made it emit 4 rows anyway, and the crash landed
+    three arms later at the reshape, after the M=4 results were already in.
+    """
+
+    gather = (
+        ROOT / "mtplx" / "kernels" / "qwen4_qsa_m4_fused_kv_gather.py"
+    ).read_text()
+    assert "_ROWS = 4" in gather
+    harness = (ROOT / "scripts" / "fable" / "micro_qsa_sparse_decode.py").read_text()
+    assert "if rows != lane.VERIFY_ROWS:" in harness
+    # and the refusal must come BEFORE the reshape that used to raise
+    body = harness.split("def gather_kernel_arm")[1]
+    assert body.index("if rows != lane.VERIFY_ROWS:") < body.index("swapaxes(-1, -2)")
+
+
+def test_the_m1_cell_is_opt_in():
+    harness = (ROOT / "scripts" / "fable" / "micro_qsa_sparse_decode.py").read_text()
+    assert '"--include-m1"' in harness
+    assert 'cells = [("verify-m4-16k", 4, 16_380, CAPACITY)]' in harness
+    assert "if args.include_m1:" in harness
 
 
 # ---------------------------------------------------------------------------

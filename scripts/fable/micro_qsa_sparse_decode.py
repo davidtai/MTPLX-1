@@ -53,14 +53,39 @@ Arms, all over one visible set:
                               2026-09-02), which is the generic gather's
                               overhead, not the production path's.
 
-MEASURED 2026-09-02 (first guarded run, M=4, 16K, queued lane):
+MEASURED 2026-09-02, second guarded run (M=4, 16K, queued lane, 12 layers):
 
-    portable_take_reference   0.542 ms/layer   6.50 ms/cycle   131 GB/s
-    production_gather_kernel  0.230 ms/layer   2.76 ms/cycle   309 GB/s
+    portable_take_reference   0.531 ms/layer   6.38 ms/cycle   134 GB/s
+    production_gather_kernel  0.226 ms/layer   2.71 ms/cycle   315 GB/s   BASELINE
 
-    of which micro_qsa_m4.py (2026-09-01) attributes 1.501 ms/cycle to the
-    fused gather + the transposed-K copy alone -- 54% of the production
-    attention chain, and the part this kernel deletes outright.
+    native, by THREADGROUP COUNT (the whole story is occupancy):
+
+      tgs   BK:DC   splits   ms/layer   ms/cycle   x baseline
+       32   128:32     4       0.325      3.90        0.70
+       48   128:32     8       0.210      2.51        1.08
+       72   128:32    16       0.149      1.79        1.52
+      136   128:32    17       0.099      1.19        2.28
+      136   128:32    32       0.094      1.13        2.41
+      136    64:64    17       0.098      1.18        2.30
+      136    64:64    32       0.090      1.08        2.51
+
+    Time x threadgroups is 10.4 / 10.1 / 10.7 / 12.8 -- near-perfect inverse
+    scaling to 72 threadgroups and a mild falloff at 136.  This kernel is
+    OCCUPANCY-bound, not bandwidth-bound, which is exactly the risk the split
+    was built to remove: at 136 tgs it achieves 216 GB/s of 544 and still
+    wins 2.4x, because it moves 0.28x the bytes.
+
+    NOISE FLOOR, from configurations that are provably identical: at BK=128
+    there are 17 tiles, so splits 17 and 32 both clamp to a 17-split,
+    136-threadgroup grid -- the same work measured twice.  They differ by
+    5.3% (0.0992 vs 0.0939).  BK=64 s17/s32 likewise (8.2%), BK=256
+    s16/s17/s32 likewise (3.4%).  So the noise floor is 3-8%, the 2.6% gap
+    between 128:32 and 64:64 at 136 tgs is NOT a difference, and no arm may
+    be declared a winner on a margin under ~8%.
+
+    Context: micro_qsa_m4.py (2026-09-01) attributes 1.501 ms/cycle of the
+    baseline's 2.71 to the fused gather plus the transposed-K copy alone --
+    55% of the production attention chain, and the part this kernel deletes.
 
 VISIBLE-SET IDENTITY (asserted, not assumed)
 --------------------------------------------
@@ -72,15 +97,36 @@ model of the selected key set equals the shipped closed form's, for every
 row.  If that assertion ever fails the timing numbers are meaningless and the
 run aborts.
 
-PARITY IS ROUNDING CLASS, AND THAT IS THE POINT
-------------------------------------------------
-fp32 online softmax in exp2, fp32 probabilities into an fp32 P@V, Steel-MMA
-reassociation of the 256-term score contraction, and one split-K rescale.
-Reported per cell: max abs diff, the same in bf16 ulp at the reference's own
-magnitude, relative L2, and head-dim top-1 agreement.  The gates are the
-ones ``qsa_sparse_decode`` installs with (8 bf16 ulp / 2e-3 / 0.98).  They
-are a SANITY gate.  The quality gate is model-level greedy-token agreement
-plus a full HumanEval run, exactly as for MTPLX_FABLE_HC_M4.
+PARITY IS ROUNDING CLASS, MEASURED AGAINST A LADDER
+----------------------------------------------------
+The first run reported the SAME parity to four significant figures for all
+twenty configurations -- BK 64/128/256, DC 32/64, splits 4..32 -- at max_abs
+1.953e-3 (= 2**-9 exactly), rel_l2 4.78e-3, top-1 1.0000.  DC changes the fp32
+score contraction order and the split count changes the online-softmax merge
+tree, so a delta that does not move across either is not the kernel's.
+
+Three references now isolate it, differing only in where bf16 rounding is
+applied:
+
+  shipped             bf16 scores (mx.matmul on bf16 operands RETURNS bf16,
+                      so the shipped path rounds the scores before the
+                      softmax) and bf16 probabilities -- the production path
+  shipped_fp32_probs  bf16 scores, fp32 probabilities
+  fp32                fp32 scores and fp32 probabilities -- what the kernel
+                      computes, and the DECIDING reference
+
+Prediction to be confirmed or falsified by the ladder: the score cast should
+dominate.  A relative score error u = 2**-9 shifts a softmax logit by u*|x|,
+and with scaled logits of order 5 that is ~2e-2 relative on the probabilities,
+against 2e-3 for the probability cast alone.
+
+Gates (mtplx/kernels/qsa_sparse_decode.py states the derivations): TIGHT vs
+fp32 -- 2 bf16 ulp and rel_l2 5e-4, because the only differences left are fp32
+reassociation (~1e-6) and one bf16 store; LOOSE vs shipped -- rel_l2 5e-2,
+which bounds the SHIPPED path's own quantisation and cannot be tightened by
+improving this kernel.  Both are SANITY gates.  The quality gate is
+model-level greedy-token agreement plus a full HumanEval run, exactly as for
+MTPLX_FABLE_HC_M4.
 
 COMMANDS
 --------
@@ -148,7 +194,13 @@ SCALE = float(HEAD_DIM) ** -0.5
 QSA_LAYERS = 12
 CAPACITY = 17_408
 TILES = ((128, 32), (256, 32), (64, 64), (128, 64))
-SPLIT_TARGETS = (4, 8, 16, 17, 32)
+#: 17 is the tile count at BK=128, so 17/32/64 all clamp to the same 17-split
+#: grid there -- which is why the 2026-09-02 run measured s17 and s32 as
+#: separate rows with identical geometry, and why their 5% spread IS the
+#: measurement's noise floor rather than a difference.  33 and 64 are here
+#: because at BK=64 there are 33 tiles, so 33 is the first value that reaches
+#: 33 splits = 264 threadgroups, and it was NOT covered by the first sweep.
+SPLIT_TARGETS = (4, 8, 16, 17, 32, 33, 64)
 #: M5 Max measured GPU read bandwidth (TEST_MACHINES.md).
 MACHINE_GBPS = 544.0
 
@@ -250,18 +302,24 @@ def native_arm(cell, key_tile: int, dim_tile: int, key_splits: int):
     return call, None
 
 
-def stock_arm(cell):
+def reference_arm(cell, *, fp32_scores: bool, fp32_probs: bool):
     def call():
-        return lane.stock_reference(
+        return lane.reference_attention(
             cell["queries"],
             cell["keys"],
             cell["values"],
             cell["top_idx"],
             query_offset=cell["q_offset"],
             scale=SCALE,
+            fp32_scores=fp32_scores,
+            fp32_probs=fp32_probs,
         )
 
     return call
+
+
+def stock_arm(cell):
+    return reference_arm(cell, fp32_scores=False, fp32_probs=False)
 
 
 def gather_kernel_arm(cell):
@@ -271,6 +329,21 @@ def gather_kernel_arm(cell):
     time matters.  Skipped when the fused gather cannot bind.
     """
 
+    rows = cell["rows"]
+    if rows != lane.VERIFY_ROWS:
+        # kernels/qwen4_qsa_m4_fused_kv_gather.py compiles ``_ROWS = 4`` into
+        # the kernel, so it emits a 4-row [1,2,4,2052,256] pair whatever it is
+        # handed.  On 2026-09-02 that reached the reshape below and raised
+        # "Cannot reshape array of size 4202496 into shape (1,2,1,1,256,2052)"
+        # AFTER the M=4 cell had already produced its numbers.  There is no
+        # M=1 production path to baseline against anyway -- the retained-stack
+        # census shows the draft chain running the MTP block, not the twelve
+        # QSA layers -- so refuse here rather than crash three arms later.
+        return None, (
+            f"the shipped fused K/V gather is compiled for {lane.VERIFY_ROWS} "
+            f"rows (_ROWS = 4) and cannot serve M={rows}; there is no M={rows} "
+            "production attention path to baseline against"
+        )
     try:
         from mtplx.kernels.qwen4_qsa_m4_fused_kv_gather import (
             bind_qwen4_qsa_m4_fused_kv_gather,
@@ -282,7 +355,6 @@ def gather_kernel_arm(cell):
     gather = bind_qwen4_qsa_m4_fused_kv_gather(
         capacity=CAPACITY, transposed_keys=False
     )
-    rows = cell["rows"]
 
     def call():
         token_idx, token_ok = qsa_m4_row_tokens(
@@ -345,11 +417,6 @@ def compare(reference: mx.array, candidate: mx.array) -> dict:
         "top1": top1,
         "differing_elements": int(differing),
         "elements": int(reference.size),
-        "passes_install_gate": (
-            max_abs / (_BF16_REL_ULP * scale) <= lane.PARITY_MAX_ABS_ULPS
-            and l2d / max(l2r, 1e-12) <= lane.PARITY_MAX_REL_L2
-            and top1 >= lane.PARITY_MIN_TOP1
-        ),
     }
 
 
@@ -478,14 +545,37 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
         f"visible/row={identity['visible_keys_per_row']}"
     )
 
-    reference = stock_arm(cell)()
-    mx.eval(reference)
+    # The reference LADDER.  ``shipped`` is the production transcription;
+    # ``fp32`` is what the kernel computes; the middle rung removes ONLY the
+    # bf16 probability cast, so the two gaps attribute the delta between them.
+    references = {
+        "shipped": stock_arm(cell)(),
+        "shipped_fp32_probs": reference_arm(
+            cell, fp32_scores=False, fp32_probs=True
+        )(),
+        "fp32": reference_arm(cell, fp32_scores=True, fp32_probs=True)(),
+    }
+    mx.eval(*references.values())
+    reference = references["shipped"]
+    out_ladder = {
+        "fp32_vs_shipped": compare(references["shipped"], references["fp32"]),
+        "fp32_probs_vs_shipped": compare(
+            references["shipped"], references["shipped_fp32_probs"]
+        ),
+    }
+    print(
+        "  [ladder] removing ONLY the bf16 probability cast moves the "
+        f"reference by rel_l2={out_ladder['fp32_probs_vs_shipped']['rel_l2']:.3e}; "
+        "removing the bf16 SCORE cast as well moves it by "
+        f"rel_l2={out_ladder['fp32_vs_shipped']['rel_l2']:.3e}"
+    )
 
     out: dict = {
         "rows": rows,
         "q_offset": q_offset,
         "total_tokens": total_tokens,
         "identity": identity,
+        "reference_ladder": out_ladder,
         "arms": {},
         "stock_bytes": stock_bytes(rows),
     }
@@ -545,7 +635,21 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
             n_tiles, per_split, n_splits = qsa_sparse_gqa_decode_split_geometry(
                 lane.SELECTED_TOKENS, key_tile, key_splits
             )
-            parity = compare(reference, call())
+            candidate = call()
+            parity = {
+                "vs_fp32": compare(references["fp32"], candidate),
+                "vs_shipped": compare(references["shipped"], candidate),
+            }
+            parity["gate"] = (
+                parity["vs_fp32"]["max_abs_bf16_ulps"]
+                <= lane.PARITY_FP32_MAX_ABS_ULPS
+                and parity["vs_fp32"]["rel_l2"] <= lane.PARITY_FP32_MAX_REL_L2
+                and parity["vs_fp32"]["top1"] >= lane.PARITY_MIN_TOP1
+                and parity["vs_shipped"]["rel_l2"]
+                <= lane.PARITY_SHIPPED_MAX_REL_L2
+                and parity["vs_shipped"]["top1"] >= lane.PARITY_MIN_TOP1
+            )
+            del candidate
             timing = time_arm(call, args.reps, args.warmup, args.queue_depth)
             model = native_bytes(rows, key_tile, key_splits)
             timing["gbps_per_layer"] = gbps(model["total"], timing["queued_ms"])
@@ -579,11 +683,17 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
                 f"{out['arms'][arm]['bytes_ratio_vs_stock']:.2f}x bytes, "
                 f"{rows * KV_HEADS * n_splits} tgs)"
             )
+            f32, shp = parity["vs_fp32"], parity["vs_shipped"]
             print(
-                f"         parity: max_abs={parity['max_abs']:.3e} "
-                f"({parity['max_abs_bf16_ulps']:.2f} bf16 ulp), "
-                f"rel_l2={parity['rel_l2']:.3e}, top1={parity['top1']:.4f}, "
-                f"gate={'PASS' if parity['passes_install_gate'] else 'FAIL'}"
+                f"         vs fp32   : max_abs={f32['max_abs']:.3e} "
+                f"({f32['max_abs_bf16_ulps']:.2f} ulp), "
+                f"rel_l2={f32['rel_l2']:.3e}, top1={f32['top1']:.4f}"
+            )
+            print(
+                f"         vs shipped: max_abs={shp['max_abs']:.3e} "
+                f"({shp['max_abs_bf16_ulps']:.2f} ulp), "
+                f"rel_l2={shp['rel_l2']:.3e}, top1={shp['top1']:.4f}   "
+                f"gate={'PASS' if parity['gate'] else 'FAIL'}"
             )
     return out
 
@@ -603,6 +713,15 @@ def main() -> int:
         "--splits",
         default=",".join(str(s) for s in SPLIT_TARGETS),
         help="comma list of KV-split targets",
+    )
+    parser.add_argument(
+        "--include-m1",
+        action="store_true",
+        help=(
+            "also run the M=1 draft cell; off by default because the retained "
+            "stack has no M=1 QSA attention and the shipped fused gather is "
+            "compiled for 4 rows, so the cell has no baseline"
+        ),
     )
     args = parser.parse_args()
     args.tiles = [
@@ -636,11 +755,14 @@ def main() -> int:
         "cells": {},
     }
 
-    # M=4 verify first (the whole prize), M=1 draft second.
-    cells = [
-        ("verify-m4-16k", 4, 16_380, CAPACITY),
-        ("draft-m1-16k", 1, 16_383, CAPACITY),
-    ]
+    # M=4 verify is the whole prize.  The M=1 cell is OPT-IN: the retained
+    # stack has no M=1 QSA attention at all (the census shows exactly 36 GDN
+    # and 48 MoE layers per cycle, so the full stack runs once, at M=4), and
+    # the shipped fused gather is compiled for 4 rows so there is nothing to
+    # baseline it against either.
+    cells = [("verify-m4-16k", 4, 16_380, CAPACITY)]
+    if args.include_m1:
+        cells.append(("draft-m1-16k", 1, 16_383, CAPACITY))
     for name, rows, q_offset, total in cells:
         report["cells"][name] = run_cell(name, rows, q_offset, total, args)
 

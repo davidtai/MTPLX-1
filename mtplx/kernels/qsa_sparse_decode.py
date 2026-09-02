@@ -93,18 +93,75 @@ DRAFT_ROWS = 1
 #: one less than the shipped lane's 2,052 and why the visible sets still agree.
 SELECTED_TOKENS = TOP_K * COMPRESS_RATIO + (COMPRESS_RATIO - 1)
 
-#: bf16 has an 8-bit significand, so its relative spacing is 2**-8.
+#: bf16 has an 8-bit significand, so its relative spacing is 2**-8 and its
+#: unit roundoff (round to nearest) is u = 2**-9.
 _BF16_REL_ULP = 2.0**-8
-#: Install-probe gates.  Deliberately loose: this is a sanity gate on a
-#: rounding-class kernel, and the QUALITY gate is HumanEval + greedy-token
-#: agreement at the model level.  A kernel that is merely reassociated lands
-#: at a few ulp; one that is wrong lands orders of magnitude away.
-PARITY_MAX_ABS_ULPS = 8.0
-PARITY_MAX_REL_L2 = 2.0e-3
+_BF16_UNIT_ROUNDOFF = 2.0**-9
+
+# ---------------------------------------------------------------------------
+# THE GATE, AND WHY IT IS TWO GATES AGAINST TWO REFERENCES
+#
+# The 2026-09-02 micro measured the kernel against the shipped path at
+# max_abs 1.953e-3 (= 2**-9 exactly), rel_l2 4.78e-3, top-1 1.0000 -- and
+# reported the SAME four significant figures for all twenty configurations:
+# BK 64/128/256, DC 32/64, splits 4..32.  DC changes the fp32 score
+# contraction order and the split count changes the online-softmax merge
+# tree, so if any of that delta were the kernel's it would move.  It does not
+# move at all.  The delta is therefore a property of the REFERENCE.
+#
+# The shipped path carries two bf16 roundings this kernel does not:
+#
+#   1. ``mx.matmul(q_view, k_view)`` has bf16 inputs, so its output is bf16 --
+#      the SCORES are rounded to bf16 before ``.astype(float32) * scale`` and
+#      the softmax.  A relative score error u shifts a softmax logit by
+#      u*|x|, and perturbing logits by eps changes each probability by about
+#      (eps_i - <eps>).  With scaled logits of order 5 that is ~2*u*5 = 2e-2
+#      relative on the probabilities.
+#   2. ``probs.astype(bfloat16)`` before P@V: another u = 2e-3 relative.
+#
+# So (1) should dominate (2) by roughly an order of magnitude, and the
+# measured 4.78e-3 sits between the two predictions -- which is why the
+# attribution is TESTED by a reference ladder rather than asserted.
+#
+# The consequence for the gate: a threshold on kernel-vs-shipped is really a
+# threshold on how much bf16 rounding the SHIPPED path does, which is not a
+# property of this kernel and cannot be tightened by improving it.  So:
+#
+#   * the DECIDING numerical gate is against the fp32 reference, where the
+#     only differences left are fp32 reassociation and one bf16 store.  It is
+#     tight, and it FAILS if the attribution above is wrong -- which is the
+#     point of stating it this way.
+#   * kernel-vs-shipped keeps a loose SANITY bound, an order of magnitude
+#     above what the shipped path's own bf16 quantisation implies.
+#
+# Neither is a quality gate.  This kernel is rounding class; whether the
+# difference matters is answered by model-level greedy-token agreement plus a
+# full HumanEval run, exactly as for MTPLX_FABLE_HC_M4.
+# ---------------------------------------------------------------------------
+
+#: TIGHT, vs :func:`fp32_reference`.  Derivation: both sides round the same
+#: real number to bf16, so they differ by at most one bf16 ulp on any element
+#: where the underlying fp32 values straddle a rounding boundary; fp32
+#: reassociation over <= 2051 terms contributes ~sqrt(2051)*2**-24 = 2.7e-6
+#: relative, three orders below a bf16 ulp, so it can only move an element
+#: that already sits within 2.7e-6 of a boundary (about 1 in 4e4).  Hence a
+#: couple of ulp at the extreme and a relative L2 far below the 2**-9/sqrt(3)
+#: = 1.1e-3 that a uniformly re-rounded output would give.
+PARITY_FP32_MAX_ABS_ULPS = 2.0
+PARITY_FP32_MAX_REL_L2 = 5.0e-4
+
+#: LOOSE, vs :func:`stock_reference` (the shipped path).  This bounds the
+#: shipped path's OWN bf16 score and probability quantisation, derived above
+#: at ~2e-2 relative on the probabilities; 5e-2 leaves an order of magnitude
+#: over the 4.78e-3 measured on 2026-09-02.  It exists to catch a kernel that
+#: is wrong by a factor, not to certify one that is right.
+PARITY_SHIPPED_MAX_REL_L2 = 5.0e-2
+
 #: Fraction of (head, row) pairs whose argmax over the head dimension must
-#: still agree.  A coarse discrete statistic, reported for continuity with
-#: the "top-1 agreement" the program asks for at the kernel level; the
-#: DECIDING top-1 number is model-level greedy-token agreement.
+#: still agree, against BOTH references.  A coarse discrete statistic,
+#: reported for continuity with the "top-1 agreement" the program asks for at
+#: the kernel level; the DECIDING top-1 number is model-level greedy-token
+#: agreement.  Measured 1.0000 on every configuration.
 PARITY_MIN_TOP1 = 0.98
 
 #: Probe geometry: capacity only has to clear the dense/sparse crossover
@@ -276,7 +333,7 @@ def _row_tokens_mx(top_idx: mx.array, q_offset, *, topk: int) -> Tuple[mx.array,
     return token_idx, token_ok
 
 
-def stock_reference(
+def reference_attention(
     queries: mx.array,
     keys: mx.array,
     values: mx.array,
@@ -285,15 +342,31 @@ def stock_reference(
     query_offset,
     scale: float,
     topk: int = TOP_K,
+    fp32_scores: bool,
+    fp32_probs: bool,
 ) -> mx.array:
-    """The shipped rows-gather attention, over the SAME visible set.
+    """The rows-gather attention over the SAME visible set, one rung at a time.
 
     Transcribed from ``mtplx/models/qwen4_exp.py::_qsa_rows_gather_attention``
-    (score GEMM -> ``-inf`` on invalid -> fp32 softmax -> bf16 probabilities
-    -> P@V) so the probe compares against ONE definition and does not import
-    the model into a kernel module.  ``keys``/``values`` are the full
-    ``[1, 2, capacity, 256]`` backing; every gathered index is an absolute
-    row inside it, exactly as in the shipped lane.
+    so the probe compares against ONE definition and does not import the model
+    into a kernel module.  ``keys``/``values`` are the full
+    ``[1, 2, capacity, 256]`` backing; every gathered index is an absolute row
+    inside it, exactly as in the shipped lane.
+
+    The two flags are the reference LADDER, and they exist to attribute the
+    kernel-vs-shipped delta rather than assume it:
+
+    ``fp32_scores=False``  reproduces the shipped path exactly -- ``mx.matmul``
+        on bf16 operands returns bf16, so the scores are rounded to bf16
+        BEFORE the ``astype(float32) * scale`` and the softmax.  Setting it
+        True upcasts q and k first (exact, bf16 -> fp32) so only the
+        accumulation and output precision change.
+    ``fp32_probs=False``  reproduces the shipped ``probs.astype(bfloat16)``
+        before P@V.  Setting it True keeps fp32 probabilities and upcasts V
+        (also exact).
+
+    Every rung returns ``queries.dtype``, so all three are comparable element
+    for element against the kernel's own bf16 output.
     """
 
     token_idx, token_ok = _row_tokens_mx(top_idx, query_offset, topk=topk)
@@ -308,12 +381,52 @@ def stock_reference(
     neg = mx.array(-mx.inf, dtype=mx.float32)
     q_view = queries.reshape(1, KV_HEADS, GQA, rows, 1, HEAD_DIM)
     k_view = k_sel.swapaxes(-1, -2).reshape(1, KV_HEADS, 1, rows, HEAD_DIM, width)
+    if fp32_scores:
+        # Upcasting bf16 -> fp32 is exact, so this changes the GEMM's output
+        # precision and nothing about the operands.
+        q_view = q_view.astype(mx.float32)
+        k_view = k_view.astype(mx.float32)
     scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
     scores = mx.where(token_ok[None, None, None], scores, neg)
-    probs = mx.softmax(scores, axis=-1).astype(queries.dtype)
+    probs = mx.softmax(scores, axis=-1)
     v_view = v_sel.reshape(1, KV_HEADS, 1, rows, width, HEAD_DIM)
+    if fp32_probs:
+        v_view = v_view.astype(mx.float32)
+    else:
+        probs = probs.astype(queries.dtype)
     out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
-    return out.reshape(1, Q_HEADS, rows, HEAD_DIM)
+    return out.reshape(1, Q_HEADS, rows, HEAD_DIM).astype(queries.dtype)
+
+
+def stock_reference(queries, keys, values, top_idx, **kwargs) -> mx.array:
+    """The shipped path, exactly: bf16 scores AND bf16 probabilities."""
+
+    return reference_attention(
+        queries, keys, values, top_idx, fp32_scores=False, fp32_probs=False, **kwargs
+    )
+
+
+def shipped_fp32_probs_reference(queries, keys, values, top_idx, **kwargs) -> mx.array:
+    """Shipped, minus only the bf16 probability cast.  Attribution rung."""
+
+    return reference_attention(
+        queries, keys, values, top_idx, fp32_scores=False, fp32_probs=True, **kwargs
+    )
+
+
+def fp32_reference(queries, keys, values, top_idx, **kwargs) -> mx.array:
+    """What the KERNEL computes: fp32 scores and fp32 probabilities.
+
+    The deciding numerical reference.  Against this the kernel's only
+    remaining differences are fp32 reassociation (Steel MMA fragments and the
+    split-K merge, both ~1e-6 relative) and the single bf16 store, so a delta
+    here of the same size as the kernel-vs-shipped delta would falsify the
+    attribution in this module's gate note.
+    """
+
+    return reference_attention(
+        queries, keys, values, top_idx, fp32_scores=True, fp32_probs=True, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -499,12 +612,19 @@ def install(
             dimension_tile=dim_tile,
             key_splits=key_splits,
         )
-        reference = stock_reference(
-            q, k, v, top_idx, query_offset=q_offset, scale=scale
+        # Both rungs: the fp32 reference decides, the shipped one is a sanity
+        # bound on the shipped path's own bf16 quantisation.  See the gate
+        # note at the top of this module for why they are not one number.
+        vs_fp32 = _compare(
+            fp32_reference(q, k, v, top_idx, query_offset=q_offset, scale=scale),
+            candidate,
         )
-        stats = _compare(reference, candidate)
-        stats["cell"] = name
-        if not worst or stats["max_abs_ulps"] > worst.get("max_abs_ulps", 0.0):
+        vs_shipped = _compare(
+            stock_reference(q, k, v, top_idx, query_offset=q_offset, scale=scale),
+            candidate,
+        )
+        stats = {"cell": name, "vs_fp32": vs_fp32, "vs_shipped": vs_shipped}
+        if not worst or vs_fp32["max_abs_ulps"] > worst["vs_fp32"]["max_abs_ulps"]:
             worst = stats
         _PROBE_REPORT[name] = stats
 
@@ -513,18 +633,34 @@ def install(
     _PROBE_REPORT["key_splits"] = key_splits
 
     failures = []
-    if worst.get("max_abs_ulps", math.inf) > PARITY_MAX_ABS_ULPS:
+    tight = worst.get("vs_fp32", {})
+    loose = worst.get("vs_shipped", {})
+    if tight.get("max_abs_ulps", math.inf) > PARITY_FP32_MAX_ABS_ULPS:
         failures.append(
-            f"max abs diff {worst['max_abs']:.3e} = "
-            f"{worst['max_abs_ulps']:.2f} bf16 ulp (limit {PARITY_MAX_ABS_ULPS})"
+            f"vs fp32 reference: max abs diff {tight['max_abs']:.3e} = "
+            f"{tight['max_abs_ulps']:.2f} bf16 ulp "
+            f"(limit {PARITY_FP32_MAX_ABS_ULPS})"
         )
-    if worst.get("rel_l2", math.inf) > PARITY_MAX_REL_L2:
+    if tight.get("rel_l2", math.inf) > PARITY_FP32_MAX_REL_L2:
         failures.append(
-            f"relative L2 {worst['rel_l2']:.3e} (limit {PARITY_MAX_REL_L2})"
+            f"vs fp32 reference: relative L2 {tight['rel_l2']:.3e} "
+            f"(limit {PARITY_FP32_MAX_REL_L2})"
         )
-    if worst.get("top1", 0.0) < PARITY_MIN_TOP1:
+    if tight.get("top1", 0.0) < PARITY_MIN_TOP1:
         failures.append(
-            f"head-dim top-1 agreement {worst['top1']:.4f} "
+            f"vs fp32 reference: head-dim top-1 {tight['top1']:.4f} "
+            f"(limit {PARITY_MIN_TOP1})"
+        )
+    if loose.get("rel_l2", math.inf) > PARITY_SHIPPED_MAX_REL_L2:
+        failures.append(
+            f"vs shipped path: relative L2 {loose['rel_l2']:.3e} "
+            f"(limit {PARITY_SHIPPED_MAX_REL_L2}) -- this bounds the SHIPPED "
+            "path's own bf16 score and probability casts, so exceeding it "
+            "means the kernel is wrong by a factor, not merely re-rounded"
+        )
+    if loose.get("top1", 0.0) < PARITY_MIN_TOP1:
+        failures.append(
+            f"vs shipped path: head-dim top-1 {loose['top1']:.4f} "
             f"(limit {PARITY_MIN_TOP1})"
         )
 
@@ -611,9 +747,10 @@ __all__ = [
     "GQA",
     "HEAD_DIM",
     "KV_HEADS",
-    "PARITY_MAX_ABS_ULPS",
-    "PARITY_MAX_REL_L2",
+    "PARITY_FP32_MAX_ABS_ULPS",
+    "PARITY_FP32_MAX_REL_L2",
     "PARITY_MIN_TOP1",
+    "PARITY_SHIPPED_MAX_REL_L2",
     "PROBE_CAPACITY",
     "Q_HEADS",
     "SELECTED_TOKENS",
@@ -622,10 +759,13 @@ __all__ = [
     "attention",
     "check_cache_contract",
     "disabled_reason",
+    "fp32_reference",
     "engagement",
     "install",
     "kernel_row_tokens",
     "reset_for_tests",
+    "reference_attention",
+    "shipped_fp32_probs_reference",
     "shipped_row_tokens",
     "stock_reference",
     "visible_block_count",

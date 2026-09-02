@@ -279,11 +279,32 @@ _FABLE_QSA_SPARSE_DECODE_TILE = _parse_sparse_decode_tile(
 )
 
 
+#: MEASURED default (2026-09-02, guarded micro, M=4, 16K, 12 layers).  The
+#: kernel is occupancy-bound, and at the shipped tile (BK=128) there are 17
+#: BK-tiles over the 2,051 selected keys, so 17 is the smallest split target
+#: that reaches one tile per threadgroup -- a 4 x 2 x 17 = 136-threadgroup
+#: grid on a 40-core M5 Max.  Everything below it leaves cores idle:
+#:
+#:     splits   n_splits   threadgroups   ms/layer   x baseline
+#:          4          4             32      0.325         0.70
+#:          8          6             48      0.210         1.08
+#:         16          9             72      0.149         1.52
+#:         17         17            136      0.094-0.099   2.3-2.4
+#:
+#: Larger values clamp to the same 17 at BK=128, so 17 is also the point past
+#: which the knob stops doing anything -- which is why the first sweep's s17
+#: and s32 rows are the SAME configuration measured twice, and their 5.3%
+#: spread is the bench's noise floor rather than a result.
+#:
+#: The previous default of 8 was a placeholder, and it measured 2.2x slower.
+FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS = 17
+
+
 def _parse_sparse_decode_splits(raw: str | None) -> int:
     """``MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS`` -- the KV-split target."""
 
     if raw is None or not str(raw).strip():
-        return 8
+        return FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS
     try:
         value = int(str(raw).strip())
     except ValueError as exc:
