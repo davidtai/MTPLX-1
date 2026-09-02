@@ -1672,6 +1672,147 @@ def qsa_prefill_engagement() -> Dict[str, int]:
     return dict(_QSA_PREFILL_COUNTS)
 
 
+@lru_cache(maxsize=1)
+def _prefill_mask_fuse_enabled() -> bool:
+    """MTPLX_FABLE_PREFILL_MASK_FUSE: ask MLX for the fused masked SDPA.
+
+    At ``head_dim`` 256 MLX's own heuristic
+    (``ScaledDotProductAttention::use_fallback``) refuses the fused steel
+    attention kernel and takes the unfused route: QK^T into a materialized
+    ``[H, S, T]`` bf16 tensor, ``mx.where`` against the bool mask, softmax,
+    then P@V.  The census confirms it -- ``steel_attention`` appears **zero**
+    times in 2.1 M dispatches, while ``g2_Selectbfloat16`` runs at grids
+    ``2048 x T`` for every QSA layer of every chunk (337 ms of pure mask
+    apply at 687 GB/s, on a 1.61 GB transient at the last chunk).
+
+    There is nothing to fuse by hand: the unfused route is MLX's C++
+    fallback lambda, and swapping the bool mask for an additive one only
+    turns the ``where`` into an ``add`` over the same bytes.  What MLX 0.32
+    added instead is ``force_fused=True``, whose own docs say it "would
+    result in slower kernel getting used but can reduce memory
+    consumption" -- and the shipped metallib does carry
+    ``steel_attention_bfloat16_bq32_bk16_bd256_wm4_wn1_maskbool_``.  So the
+    exact-visible-set fused kernel exists at this geometry; only the
+    heuristic declines it.
+
+    Off by default: it trades a materialized score tensor (and its mask
+    apply and softmax passes) for a flash kernel at a head dimension MLX
+    considers unfavourable.  It is also NOT bit-identical -- online softmax
+    reassociates the same visible set -- so it is a quality-gated arm.
+    """
+
+    raw = (os.environ.get("MTPLX_FABLE_PREFILL_MASK_FUSE") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+#: One-shot capability probe.  ``force_fused=True`` raises host-side (no
+#: kernel is launched) when the build has no fused kernel for the geometry;
+#: retrying per call would pay that cost 12 x 8 times a request.
+_PREFILL_MASK_FUSE_UNAVAILABLE = False
+
+
+def _prefill_mask_fuse_sdpa(q, k, v, *, scale, mask):
+    """Masked SDPA, fused when armed and available, else stock."""
+
+    global _PREFILL_MASK_FUSE_UNAVAILABLE
+    if (
+        mask is not None
+        # Prefill only. At S == 1 MLX already fuses (head_dim 256 IS in the
+        # sdpa_VECTOR supported set); the fallback this flag exists to
+        # replace is the S > 1 one.
+        and int(q.shape[2]) > 1
+        and not _PREFILL_MASK_FUSE_UNAVAILABLE
+        and _prefill_mask_fuse_enabled()
+    ):
+        try:
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=mask, force_fused=True
+            )
+        except Exception as exc:  # older MLX, or no kernel for this geometry
+            _PREFILL_MASK_FUSE_UNAVAILABLE = True
+            _qsa_prefill_count("mask_fuse_unavailable")
+            import sys as _sys
+
+            print(
+                "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE armed but no fused "
+                "masked SDPA is available for this geometry; falling back "
+                f"for the rest of the process: {exc}",
+                file=_sys.stderr,
+                flush=True,
+            )
+        else:
+            _qsa_prefill_count("mask_fuse")
+            return out
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+
+def _prefill_qsa_query_tile_rows() -> int:
+    """MTPLX_FABLE_PREFILL_QSA_QUERY_TILE: rows per attention query tile.
+
+    The middle path for a wide prefill chunk.  The 36 GDN layers, the MoE
+    grouped GEMM and every projection want a WIDE chunk (better grouped-GEMM
+    tile occupancy, fewer per-chunk syncs); the 12 dense QSA layers want a
+    NARROW one (their score tensor is ``[H, rows, T]`` and their work term
+    ``rows x T`` grows with the chunk).  Splitting only the attention into
+    query tiles gives both: tile A never reads tile B's keys, so a 4,096-row
+    chunk tiled at 2,048 has exactly the peak AND exactly the
+    ``sum(rows x context)`` of an 8 x 2,048 cut, while everything outside
+    attention still sees 4,096 rows.
+
+    0 (default) = whole chunk, i.e. today's behaviour.
+    """
+
+    from mtplx.fable_prefill_chunk import resolve_query_tile_rows
+
+    return resolve_query_tile_rows()
+
+
+def _qsa_dense_attention(q, k, v, *, mask, scale):
+    """Dense masked SDPA, optionally split into query tiles.
+
+    Unarmed (the default) this is one ``mx.fast.scaled_dot_product_attention``
+    call -- byte-identical to the code it replaced.
+
+    Armed, it cuts the chunk's query rows into tiles and truncates each
+    tile's keys to that tile's last visible position.  Rows are independent
+    under attention, and the keys dropped were exactly the ones the mask
+    already set to ``finfo.min`` (whose ``exp`` is a hard zero), so the
+    visible set per row is unchanged.  Reduction order is not: shorter
+    softmax rows and a shorter P@V contraction, the same class of difference
+    as the portable gather tier.
+    """
+
+    S = int(q.shape[2])
+    tile = _prefill_qsa_query_tile_rows() if S > 1 else 0
+    total_keys = int(k.shape[2])
+    if (
+        tile <= 0
+        or tile >= S
+        or mask is None
+        or int(mask.shape[-1]) != total_keys
+        or total_keys < S
+    ):
+        return _prefill_mask_fuse_sdpa(q, k, v, scale=scale, mask=mask)
+
+    from mtplx.fable_prefill_chunk import query_tile_spans
+
+    spans = query_tile_spans(S, context_before=total_keys - S, tile=tile)
+    if not spans:
+        return _prefill_mask_fuse_sdpa(q, k, v, scale=scale, mask=mask)
+    _qsa_prefill_count("query_tile")
+    parts = [
+        _prefill_mask_fuse_sdpa(
+            q[:, :, r0:r1],
+            k[:, :, :keys],
+            v[:, :, :keys],
+            scale=scale,
+            mask=mask[..., r0:r1, :keys],
+        )
+        for r0, r1, keys in spans
+    ]
+    return mx.concatenate(parts, axis=2)
+
+
 def _qsa_prefill_gather_enabled() -> bool:
     """Portable gathered-attention tier for the flash_prefill block contract.
 
@@ -3791,9 +3932,7 @@ class Attention(nn.Module):
         else:
             mask = None
 
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=mask
-        )
+        out = _qsa_dense_attention(q, k, v, mask=mask, scale=self.scale)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 

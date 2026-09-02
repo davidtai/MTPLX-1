@@ -17,6 +17,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Literal
@@ -56,6 +57,12 @@ from .fable_block_verify import (
     is_enabled as _fable_block_verify_enabled,
 )
 from .fable_compiled_draft import maybe_build_compiled_draft_chain
+from .fable_prefill_chunk import (
+    DEFAULT_CHUNK_SIZE as _FABLE_DEFAULT_CHUNK_SIZE,
+    assert_prefill_chunk_coherent,
+    guard_prefill_chunk_geometry,
+    summarize_spans,
+)
 from .fable_k20_log import is_enabled as _fable_k20_log_enabled, k20_log
 from .forkev_telemetry import ForkEVRecorder
 from .fast_sampling import (
@@ -546,6 +553,72 @@ def prefill_chunk_records() -> list[dict[str, float]]:
 def _record_prefill_chunk(**fields: float) -> None:
     if len(_PREFILL_CHUNK_RECORDS) < _PREFILL_CHUNK_RECORD_CAP:
         _PREFILL_CHUNK_RECORDS.append(fields)
+
+
+@lru_cache(maxsize=4)
+def _prefill_chunk_transient_per_token(model_path: str) -> int:
+    """Dense QSA prefill transient per context token at the SHIPPED width.
+
+    ``mtplx.memory_plan`` owns the model (12.75 B per chunk-row x context
+    token, 4 layers live); this reads the served ``config.json`` once so the
+    chunk guard can price a width without a model handle.  Zero for families
+    the model does not cover, which makes the guard inert there.
+    """
+
+    try:
+        from mtplx.memory_plan import (
+            qsa_prefill_transient_bytes_per_token_from_config,
+        )
+
+        with open(Path(model_path) / "config.json", "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+        return int(
+            qsa_prefill_transient_bytes_per_token_from_config(
+                config, chunk_size=_FABLE_DEFAULT_CHUNK_SIZE
+            )
+        )
+    except Exception:
+        return 0
+
+
+def _guard_prefill_chunk_geometry(
+    rt: MTPLXRuntime,
+    spans: Sequence[tuple[int, int]],
+    *,
+    chunk_size: int | None = None,
+) -> None:
+    """Refuse a prefill chunk geometry that would overrun the wired limit.
+
+    Runs once per request, on the already-cut spans, before the first chunk
+    is submitted.  Inert at the shipped 2,048 width (and whenever no budget
+    is resolvable), so an unarmed process sees byte-identical behaviour.
+
+    The coherence check reads the CONFIGURED width, not the widest observed
+    span: a short prompt or a GDN-boundary tail grid legitimately cuts spans
+    below the configured chunk, and refusing those would break every
+    sub-chunk request.
+    """
+
+    chunks, widest = summarize_spans(spans)
+    if chunks <= 0 or widest <= 0:
+        return
+    total = int(spans[-1][1])
+    configured = (
+        _prefill_chunk_size() if chunk_size is None else max(1, int(chunk_size))
+    )
+    assert_prefill_chunk_coherent(configured)
+    plan = guard_prefill_chunk_geometry(
+        chunk_size=widest,
+        total_tokens=total,
+        transient_bytes_per_token=_prefill_chunk_transient_per_token(
+            str(rt.model_path)
+        ),
+    )
+    if plan is not None:
+        rt.diagnostic_counters["prefill_chunk_plan_peak_bytes"] = int(
+            plan.projected_peak_bytes
+        )
+        rt.diagnostic_counters["prefill_chunk_plan_width"] = int(plan.chunk_size)
 
 
 def _ple_stage_seconds() -> float:
@@ -6315,6 +6388,14 @@ def _prefill_committed_mtp_history_streaming(
         else _iter_prefill_chunk_spans(
             len(body), chunk_size=prefill_chunk_size
         )
+    )
+    # Construction-time chunk-geometry refusal (MTPLX_FABLE_PREFILL_CHUNK_GUARD,
+    # on but inert without a resolvable budget). The dense QSA prefill
+    # transient is linear in the chunk width, so a widened chunk raises the
+    # peak before a single kernel is submitted; refuse it here rather than
+    # discover it as a swap.
+    _guard_prefill_chunk_geometry(
+        rt, mtp_streaming_spans, chunk_size=prefill_chunk_size
     )
     # PLE n-gram prefill lookahead (MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD, off
     # by default). Every prompt token is known here, so a worker thread can
