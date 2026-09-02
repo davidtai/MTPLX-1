@@ -62,23 +62,60 @@ token agreement plus a full HumanEval run, never on a digest.  The install
 probe below is a numerical SANITY gate, not the quality gate -- it exists so
 an armed flag that is quietly wrong disables itself instead of shipping.
 
-GATE DISCIPLINE
----------------
-* CONTRACT failure RAISES.  An armed flag on a pack the kernel cannot serve
-  is a configuration error, not a reason to run the stock chain quietly --
-  that is how MTPLX_FUSED_HC_V3 came to be armed-but-dead at M=4.
-* PARITY failure DISABLES for the process, records the measured deltas, and
-  lets the stock lane serve.  A parity miss is a numerical verdict about a
-  rounding-class kernel; raising there would turn a measurement into an
-  outage.
+GATE DISCIPLINE -- REVISED 2026-09-02 AFTER AN ARMED-BUT-INERT WINDOW
+---------------------------------------------------------------------
+The 2026-09-02 16 K window armed this flag and measured the CONTROL: control
+and candidate response texts were byte-identical on both finished seeds, on a
+kernel whose arithmetic is rounding class.  Nothing in the run said so,
+because every way the lane could decline was silent.  The rule the program
+owner set afterwards is: **a flag either works on every request path the
+server accepts, or it fails loudly at install.**  Concretely:
+
+* CONTRACT failure RAISES, as before.  An armed flag on a pack the kernel
+  cannot serve is a configuration error -- that is how MTPLX_FUSED_HC_V3 came
+  to be armed-but-dead at M=4.
+* PARITY failure still DISABLES *inside this module* -- :func:`install`
+  returns False and records the measured deltas, so the numbers survive for
+  the receipt -- but the CALLER
+  (``graphbank.TensorOffsetQSACache.__init__``) then RAISES, because an armed
+  arm that runs the stock chain is worse than an outage: it is a measurement
+  that looks like a result.  Read the deltas off the stderr line and the
+  receipt, then unarm the flag deliberately.
+* ROUTE narrowing RAISES at the width the flag arms.  Widths the flag does
+  not arm (prefill rows, the S=1 D3 route under a verify-only arm) and caches
+  the lane never installed on are routing, not failure: they return False and
+  are COUNTED in :data:`_ROUTE_DECLINES` so "the flag did nothing" always has
+  a readable cause.
+* An armed lane that is not in the traced verify graph RAISES from
+  :func:`assert_traced`, called inside the compiled verify body.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
+
+
+def _emit(line: str) -> None:
+    """Put the lane's verdict where a benchmark log will actually see it.
+
+    ``logger.info`` alone is INVISIBLE in a driver run -- the 2026-09-02 W68
+    window carried no engagement evidence at all, and the same log is missing
+    ``[qwen4-fixed-M4-verify]`` and ``[qwen4-compiled-MTP-prepare]`` (both
+    ``logger.info``) while it does carry ``[MTPLX_FABLE_GRAPH_BUILD_OVERLAP]
+    armed:`` (a plain ``print``).  W70 fixed exactly this for the verify-glue
+    items; this is the same fix for this lane.
+    """
+
+    logger.info("%s", line)
+    print(line, file=sys.stderr, flush=True)
 
 #: Production Qwen3.8 Flash-Next QSA geometry -- compiled into the metallib.
 Q_HEADS = 24
@@ -175,12 +212,90 @@ _COUNTS: Dict[str, int] = {
     "draft_kernel": 0,
     "probe_runs": 0,
     "probe_failures": 0,
+    # Every ``TensorOffsetQSACache`` that bound the lane, shadow and parity
+    # twins included.  The probe runs on the FIRST one only (the verdict is
+    # per process), so a value of ZERO with the flag armed is the whole
+    # finding: no cache carried the lane and the kernel could not have run.
+    "cache_installs": 0,
+    # Every routing decision that came back True, summed over the call sites
+    # in ``_ROUTE_SITES``.  Trace-time, like ``verify_kernel``: the Python body
+    # of a compiled verify graph runs once per retrace, so read these as "did
+    # this lane get into the graph at all", never as a per-cycle count.
+    "route_hits": 0,
 }
+
+#: ``site -> hits``.  The 2026-09-02 window failed because ONE of the two call
+#: sites existed for the verify width and the other asked the draft question;
+#: a single total would not have shown that, so the sites are named.
+_ROUTE_SITES: Dict[str, int] = {}
+
+#: ``reason -> count`` for the routing narrowings that are NOT failures (a
+#: width the flag does not arm, a growable cache the lane never installed on).
+#: Recorded rather than merely returned, so "the flag did nothing" always has
+#: a readable cause in the receipt.
+_ROUTE_DECLINES: Dict[str, int] = {}
 
 #: ``None`` until the probe has run.  ``""`` once it has passed.  A non-empty
 #: string is the reason the lane is disabled for this process.
 _DISABLED_REASON: Optional[str] = None
 _PROBE_REPORT: Dict[str, Any] = {}
+
+
+class SparseDecodeContractError(RuntimeError):
+    """An armed flag met a request path it cannot serve.
+
+    Raised, never swallowed: a lane that quietly declines makes the candidate
+    arm measure the control while its receipt claims otherwise, which is the
+    exact failure the 2026-09-02 window produced.
+    """
+
+
+def armed(*, draft: bool = False) -> bool:
+    """True when this process armed the flag for the given width."""
+
+    from mtplx.runtime_options import (
+        fable_qsa_sparse_decode_enabled,
+        fable_qsa_sparse_draft_enabled,
+    )
+
+    return bool(
+        fable_qsa_sparse_draft_enabled() if draft else fable_qsa_sparse_decode_enabled()
+    )
+
+
+def pending() -> bool:
+    """True while the install probe has not run yet in this process."""
+
+    return _DISABLED_REASON is None
+
+
+def installed() -> bool:
+    """True when the probe ran and passed.  False while pending, too."""
+
+    return _DISABLED_REASON == ""
+
+
+def note_route_hit(site: str) -> None:
+    """One routing decision resolved to the kernel, at a named call site."""
+
+    _COUNTS["route_hits"] += 1
+    _ROUTE_SITES[site] = _ROUTE_SITES.get(site, 0) + 1
+
+
+def note_route_decline(reason: str) -> None:
+    """One routing narrowing that is not an error, recorded by cause."""
+
+    _ROUTE_DECLINES[reason] = _ROUTE_DECLINES.get(reason, 0) + 1
+
+
+def route_counters() -> Dict[str, Any]:
+    """Per-site hits and per-cause declines, for the receipt."""
+
+    return {
+        "route_hits": int(_COUNTS["route_hits"]),
+        "route_sites": dict(_ROUTE_SITES),
+        "route_declines": dict(_ROUTE_DECLINES),
+    }
 
 
 def engagement() -> Dict[str, Any]:
@@ -194,7 +309,102 @@ def engagement() -> Dict[str, Any]:
     report["installed"] = _DISABLED_REASON == ""
     report["disabled_reason"] = _DISABLED_REASON or None
     report["probe"] = dict(_PROBE_REPORT)
+    report["route_sites"] = dict(_ROUTE_SITES)
+    report["route_declines"] = dict(_ROUTE_DECLINES)
     return report
+
+
+def receipt() -> Dict[str, Any]:
+    """The compact engagement block a benchmark receipt stores.
+
+    Never raises: it reads ``_DISABLED_REASON`` directly rather than going
+    through a helper that treats "pending" as an error, because describing the
+    pending state IS what a receipt builder needs to do.
+    """
+
+    from mtplx.runtime_options import (
+        fable_qsa_sparse_decode_splits,
+        fable_qsa_sparse_decode_tile,
+    )
+
+    key_tile, dim_tile = fable_qsa_sparse_decode_tile()
+    block: Dict[str, Any] = {
+        "armed": armed(),
+        "armed_draft": armed(draft=True),
+        "installed": installed(),
+        "pending": pending(),
+        "disabled_reason": _DISABLED_REASON or None,
+        "tile": [int(key_tile), int(dim_tile)],
+        "splits": int(fable_qsa_sparse_decode_splits()),
+        "verify_rows": VERIFY_ROWS,
+        "draft_rows": DRAFT_ROWS,
+        "cache_installs": int(_COUNTS["cache_installs"]),
+        "probe_runs": int(_COUNTS["probe_runs"]),
+        "probe_failures": int(_COUNTS["probe_failures"]),
+        "kernel_calls": {
+            "verify_kernel": int(_COUNTS["verify_kernel"]),
+            "draft_kernel": int(_COUNTS["draft_kernel"]),
+        },
+        "probe": dict(_PROBE_REPORT),
+    }
+    block.update(route_counters())
+    return block
+
+
+def engagement_line(*, enabled: bool) -> str:
+    """The one-line install verdict, in the shape the other Fable lanes use."""
+
+    from mtplx.runtime_options import (
+        fable_qsa_sparse_decode_splits,
+        fable_qsa_sparse_decode_tile,
+    )
+
+    if not enabled:
+        reason = _DISABLED_REASON or "install probe has not run"
+        return f"[fable] qsa_sparse_decode: off ({reason})"
+    key_tile, dim_tile = fable_qsa_sparse_decode_tile()
+    worst = _PROBE_REPORT.get("worst") or {}
+    fp32 = worst.get("vs_fp32") or {}
+    shipped = worst.get("vs_shipped") or {}
+    widths = [str(VERIFY_ROWS)] if armed() else []
+    if armed(draft=True):
+        widths.append(str(DRAFT_ROWS))
+    return (
+        "[fable] qsa_sparse_decode armed: "
+        f"rows={'+'.join(widths) or '-'} "
+        f"tile={int(key_tile)}:{int(dim_tile)} "
+        f"splits={int(fable_qsa_sparse_decode_splits())} "
+        f"caches={int(_COUNTS['cache_installs'])} "
+        f"probe cell={worst.get('cell')!r} "
+        f"vs_fp32 ulps={fp32.get('max_abs_ulps', float('nan')):.3f} "
+        f"rel_l2={fp32.get('rel_l2', float('nan')):.3e} "
+        f"top1={fp32.get('top1', float('nan')):.4f} "
+        f"vs_shipped rel_l2={shipped.get('rel_l2', float('nan')):.3e} "
+        f"probe_runs={int(_COUNTS['probe_runs'])}"
+    )
+
+
+def assert_traced(rows: int, *, before: int, where: str) -> None:
+    """The armed verify lane must be IN this graph, not merely armed.
+
+    ``before`` is ``_COUNTS["route_hits"]`` sampled before the
+    traced forward.  A trace of the armed width that ends with no additional
+    route hit is an inert flag, and replaying that graph a few hundred times
+    produces a delta nobody can attribute -- which is what the 2026-09-02
+    window did.
+    """
+
+    if not armed() or int(rows) != VERIFY_ROWS:
+        return
+    gained = int(_COUNTS["route_hits"]) - int(before)
+    if gained > 0:
+        return
+    raise SparseDecodeContractError(
+        "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but the split-K kernel is not "
+        f"in the traced {where} graph at {int(rows)} rows: the QSA attention "
+        "took another path, so this arm would replay the stock chain. "
+        f"route_sites={dict(_ROUTE_SITES)} declines={dict(_ROUTE_DECLINES)}"
+    )
 
 
 def disabled_reason() -> Optional[str]:
@@ -209,6 +419,8 @@ def reset_for_tests() -> None:
     global _DISABLED_REASON
     _DISABLED_REASON = None
     _PROBE_REPORT.clear()
+    _ROUTE_SITES.clear()
+    _ROUTE_DECLINES.clear()
     for key in _COUNTS:
         _COUNTS[key] = 0
 
@@ -544,10 +756,14 @@ def install(
     """
 
     global _DISABLED_REASON
-    if _DISABLED_REASON is not None:
-        return _DISABLED_REASON == ""
     if not (verify or draft):
         return False
+    # Every cache that binds the lane counts, including the ones that reuse
+    # the process verdict: 12 QSA caches on the production pack, and a
+    # receipt showing fewer means some layers kept the stock chain.
+    _COUNTS["cache_installs"] += 1
+    if _DISABLED_REASON is not None:
+        return _DISABLED_REASON == ""
 
     check_cache_contract(keys, values, compress_ratio)
 
@@ -670,9 +886,19 @@ def install(
             f"parity probe failed on cell {worst.get('cell')!r}: "
             + "; ".join(failures)
         )
+        _emit(engagement_line(enabled=False))
+        _emit(
+            "[fable] qsa_sparse_decode install: "
+            + json.dumps(receipt(), sort_keys=True)
+        )
         return False
 
     _DISABLED_REASON = ""
+    _emit(engagement_line(enabled=True))
+    _emit(
+        "[fable] qsa_sparse_decode install: "
+        + json.dumps(receipt(), sort_keys=True)
+    )
     return True
 
 
@@ -744,6 +970,16 @@ def attention(
 __all__ = [
     "COMPRESS_RATIO",
     "DRAFT_ROWS",
+    "SparseDecodeContractError",
+    "armed",
+    "assert_traced",
+    "engagement_line",
+    "installed",
+    "note_route_decline",
+    "note_route_hit",
+    "pending",
+    "receipt",
+    "route_counters",
     "GQA",
     "HEAD_DIM",
     "KV_HEADS",

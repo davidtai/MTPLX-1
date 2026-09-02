@@ -33,7 +33,19 @@ def _tensor_offset_qsa_cache_type():
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
-    namespace: dict[str, object] = {}
+    # The class body reads two module-level names on its DEFAULT path (W68's
+    # armed-but-inert guard). Seed them with the real functions rather than
+    # stubs: ``mtplx.runtime_options`` is pure env parsing and imports no MLX,
+    # so this test still never initializes the framework.
+    from mtplx.runtime_options import (
+        fable_qsa_sparse_decode_enabled,
+        fable_qsa_sparse_draft_enabled,
+    )
+
+    namespace: dict[str, object] = {
+        "fable_qsa_sparse_decode_enabled": fable_qsa_sparse_decode_enabled,
+        "fable_qsa_sparse_draft_enabled": fable_qsa_sparse_draft_enabled,
+    }
     exec(compile(module, str(GRAPHBANK), "exec"), namespace)
     return namespace["TensorOffsetQSACache"]
 

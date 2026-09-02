@@ -1771,6 +1771,79 @@ def fable_verify_glue_block(
     return block
 
 
+def fable_qsa_sparse_decode_block(*, require_calls: bool, strict: bool = True) -> dict:
+    """Engagement proof for ``MTPLX_FABLE_QSA_SPARSE_DECODE``/``_DRAFT``.
+
+    The 2026-09-02 W68 window armed the flag on the fixed-M4 stack and
+    measured the CONTROL: control and candidate response texts were
+    byte-identical on both finished seeds, for a kernel whose arithmetic is
+    rounding class, and NOTHING in the run said so.  The lane had no stderr
+    line, no receipt block, and every way it could decline was a silent
+    ``return False``.  So the same three proofs W70 added for the verify-glue
+    items apply here, and every way of failing to engage RAISES rather than
+    reporting a delta nobody can attribute:
+
+    * the install probe never ran -- no QSA cache bound the lane, so the flag
+      was inert and the candidate arm silently measured the control;
+    * the lane installed but disabled itself on the parity probe -- a real
+      numerical finding, but NOT a benchmark;
+    * the lane installed and NO route hit was recorded -- the kernel never got
+      into the verify graph, the same lie with a different cause.
+
+    ``require_calls`` is False at load (the QSA cache is built at the first
+    verify, so nothing has installed yet and ``pending`` is expected) and True
+    at receipt time, which is the only point where the counters mean anything.
+    ``strict=False`` collects the failures into ``block["problems"]`` instead
+    of raising, so the evidence reaches disk before the run is refused.
+
+    Both the route counters and the kernel-call counters are TRACE-time: the
+    Python body of a compiled verify graph runs once per retrace and the C++
+    replay never touches it.  Read them as "did this lane get into the graph
+    at all", never as a per-cycle count.
+    """
+
+    problems: list[str] = []
+
+    def fail(message: str) -> None:
+        if strict:
+            raise RuntimeError(message)
+        problems.append(message)
+
+    from mtplx.kernels import qsa_sparse_decode as lane
+
+    block = lane.receipt()
+    if not (block["armed"] or block["armed_draft"]):
+        return block
+    if require_calls:
+        if block["pending"]:
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but its install probe "
+                "never ran: no QSA cache bound the lane, so the kernel was "
+                "inert and this arm measured the stock chain"
+            )
+        elif not block["installed"]:
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE armed but the lane disabled "
+                f"itself: {block['disabled_reason']}"
+            )
+        elif int(block["route_hits"]) <= 0:
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE installed but no routing "
+                "decision ever reached the kernel: route_sites="
+                f"{block['route_sites']} declines={block['route_declines']}. "
+                "The lane never entered the graph, so this arm measured the "
+                "control."
+            )
+        elif not any(int(v) > 0 for v in block["kernel_calls"].values()):
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE routed "
+                f"{block['route_hits']} times but issued zero kernel calls: "
+                f"{block['kernel_calls']}"
+            )
+    block["problems"] = problems
+    return block
+
+
 def is_raw_env_mtplx_key(key: str) -> bool:
     """Does this MTPLX_* key belong on the raw ``--env`` passthrough?"""
 
@@ -2179,6 +2252,17 @@ def main() -> int:
         print(
             "[fable-abba] verify-glue "
             + json.dumps(verify_glue_block, sort_keys=True, default=str),
+            flush=True,
+        )
+    # W68: the same evidence for the sparse-decode lane. Nothing has
+    # installed yet at load -- the QSA cache is built at the first verify --
+    # so this line only proves the flag is live in THIS process; the
+    # engagement check is the receipt-time one below.
+    sparse_decode_block = fable_qsa_sparse_decode_block(require_calls=False)
+    if sparse_decode_block["armed"] or sparse_decode_block["armed_draft"]:
+        print(
+            "[fable-abba] qsa-sparse-decode "
+            + json.dumps(sparse_decode_block, sort_keys=True, default=str),
             flush=True,
         )
     if args.relaxed_draft_ties and not getattr(
@@ -2742,6 +2826,12 @@ def main() -> int:
         "verify_glue": fable_verify_glue_block(
             runtime, require_calls=True, strict=False
         ),
+        # W68 MTPLX_FABLE_QSA_SPARSE_DECODE engagement. Read AFTER the run:
+        # armed / installed / disabled_reason / tile / splits / probe results
+        # / route hits per call site / kernel calls.
+        "qsa_sparse_decode": fable_qsa_sparse_decode_block(
+            require_calls=True, strict=False
+        ),
         "paired_routed_glu": {
             "expected": candidate_environment.get("MTPLX_QWEN4_M4_ROUTED_GLU")
             == "1",
@@ -2788,6 +2878,9 @@ def main() -> int:
     # W70: refuse AFTER the write. The evidence for why an armed arm was
     # unreadable is more useful on disk than in a traceback alone.
     glue_problems = (payload.get("verify_glue") or {}).get("problems") or []
+    glue_problems += (
+        (payload.get("qsa_sparse_decode") or {}).get("problems") or []
+    )
     if glue_problems:
         raise RuntimeError(
             "this arm cannot be read as a candidate: " + "; ".join(glue_problems)

@@ -1973,6 +1973,66 @@ identity check must fail.
 
 ---
 
+## Proving the sparse-decode arm ran (`MTPLX_FABLE_QSA_SPARSE_DECODE`)
+
+The 2026-09-02 W68 window armed the split-K lane on the fixed-M4 stack at 16 K
+and **measured the control**: control and candidate response texts were
+byte-identical on both finished seeds, for a kernel whose arithmetic is
+rounding class. Cycle times matched to 0.1 ms. Nothing in the run said so.
+
+The gate that declined was a routing predicate, not the install probe.
+`Indexer._call_rows` reaches `_select_m4` -- the only call site that asked the
+VERIFY question -- only when `MTPLX_FABLE_QSA_M4` is armed, and that is a
+*different* flag from the fixed-M4 verifier the window armed. A
+fixed-capacity S=4 verify therefore fell through to `_select_eager`, whose
+sparse-decode question was hard-coded `draft=True`; it read
+`fable_qsa_sparse_draft_rows` (0, the draft flag was not armed), returned
+False, and handed attention the rows-gather lane for 394 cycles.
+
+So the lane now proves itself the way W70's verify-glue items do, and every
+way of failing to engage is fatal to the arm:
+
+1. **stderr, at install.** `mtplx.kernels.qsa_sparse_decode` writes to stderr
+   as well as the logger (`logger.info` alone is invisible in a driver run):
+
+   ```
+   [fable] qsa_sparse_decode armed: rows=4 tile=128:32 splits=17 caches=12 \
+     probe cell='verify-4096' vs_fp32 ulps=0.750 rel_l2=1.200e-05 top1=1.0000 ...
+   [fable] qsa_sparse_decode install: {"armed": true, "installed": true, ...}
+   ```
+
+   A probe that failed prints `off (<reason>)` with the measured deltas.
+
+2. **Loud gates instead of silent declines.** An armed flag that cannot bind
+   raises where it cannot bind: `TensorOffsetQSACache.__init__` raises when a
+   construction site did not pass the lane through *or* when the parity probe
+   disabled it (read the deltas off the stderr line, then unarm the flag
+   deliberately); `_sparse_decode_route` raises on a geometry or budget
+   mismatch at the width the flag arms; and `Attention.__call__` raises at
+   TRACE time if the indexer handed it any lane other than `sparse_blocks`.
+   Widths the flag does not arm and growable caches stay routing, and the
+   growable case is counted in `route_declines`.
+
+3. **A `qsa_sparse_decode` block on the receipt row**, read *after* the run:
+   `armed`, `installed`, `disabled_reason`, `tile`, `splits`, `probe` (both
+   ladder rungs, per cell), `cache_installs`, `route_hits`, `route_sites`
+   (per call site), `route_declines`, `kernel_calls`. The driver refuses the
+   arm -- after writing the receipt -- when the probe never ran, the lane
+   disabled itself, `route_hits` is zero, or no kernel call was issued.
+
+Read `route_sites` first. It and `kernel_calls` count TRACES, not decode
+cycles: under `mx.compile` the Python body runs once per retrace and the C++
+replay never touches it. Read them as "did this lane get into the graph".
+
+### Tests
+
+`tests/test_fable_qsa_sparse_decode_wiring.py` — CPU-only, nothing evaluates
+an MLX array. Reproduces the 2026-09-02 decision on stub shapes, pins both
+call sites, the two kinds of "no", the construction gate, the trace-time
+assertion and every driver refusal.
+
+---
+
 ## Shadow-draft acceptance (`shadow_draft_harness.py`)
 
 Instrument I3. It exists so that a change to the **draft proposal** — indexer
