@@ -24,6 +24,7 @@ import micro_dispatch_overhead as mdo  # noqa: E402
 import micro_expert_major as mem  # noqa: E402
 import micro_hc_read as mhr  # noqa: E402
 import micro_moe_dedup as mmd  # noqa: E402
+import micro_route_kernel as mrk  # noqa: E402
 
 
 def test_microbenchmarks_import_without_mlx():
@@ -34,11 +35,12 @@ def test_microbenchmarks_import_without_mlx():
         "import sys;"
         f"sys.path.insert(0, {str(FABLE)!r});"
         "import expert_id_patterns, micro_dispatch_overhead, micro_moe_dedup;"
-        "import micro_expert_major, micro_hc_read, micro_dependent_launch;"
+        "import micro_expert_major, micro_hc_read;"
+        "import micro_dependent_launch, micro_route_kernel;"
         "leaked=[m for m in sys.modules if m == 'mlx' or m.startswith('mlx.')"
         "        or m == 'mtplx' or m.startswith('mtplx.')];"
         "print(leaked, micro_moe_dedup.mx, micro_expert_major.mx, micro_hc_read.mx,"
-        "      micro_dependent_launch.mx)"
+        "      micro_dependent_launch.mx, micro_route_kernel.mx)"
     )
     out = subprocess.run(
         [sys.executable, "-c", probe],
@@ -46,11 +48,12 @@ def test_microbenchmarks_import_without_mlx():
         text=True,
         check=True,
     ).stdout.strip()
-    assert out == "[] None None None None", out
+    assert out == "[] None None None None None", out
     assert mmd.mx is None
     assert mem.mx is None
     assert mhr.mx is None
     assert mdl.mx is None
+    assert mrk.mx is None and mrk._route is None
 
 
 def test_moe_dedup_defaults():
@@ -294,6 +297,69 @@ def test_hc_read_rows_and_calls_are_overridable():
         ["--rows", "8", "--calls", "4", "--variants", "a,b", "--out-per-tg", "6"]
     )
     assert args.rows == 8 and args.calls == 4 and args.out_per_tg == 6
+
+
+# ---------------------------------------------------------------------------
+# micro_route_kernel.py
+# ---------------------------------------------------------------------------
+
+
+def test_route_kernel_defaults():
+    args = mrk.build_parser().parse_args([])
+    assert args.layers == 48, "one MoE routing head per layer"
+    assert args.reps == 200
+    assert args.warmup == 5
+    assert args.variants == "stock,k1,k4"
+    assert args.clear_cache is False
+    assert args.out is None and args.dry_run is False
+
+
+def test_route_kernel_dispatch_table_matches_the_census():
+    """Census §2.1 rows 35-50: ten dispatches per layer for 44 numbers and 40
+    indices, of which the two kernels keep two."""
+
+    default = mrk.build_parser().parse_args([]).variants.split(",")
+    assert set(default) == set(mrk.DISPATCHES)
+    assert mrk.DISPATCHES["stock"] == 10
+    assert mrk.DISPATCHES["k1"] == mrk.DISPATCHES["k4"] == 2
+
+
+def test_route_kernel_byte_model_matches_the_census():
+    """The census's ``router 1.393 MB`` per layer, plus the folded gate."""
+
+    assert mrk.route_bytes_per_layer() == 1_392_640 + 2_720
+    assert mrk.route_bytes_per_layer() * 48 == pytest.approx(66_977_280)
+
+
+def test_route_kernel_dry_run_plan_is_gpu_free():
+    plan = mrk._plan(mrk.build_parser().parse_args([]), ["stock", "k1", "k4"])
+    assert plan["dispatches_per_cycle"] == {"stock": 480, "k1": 96, "k4": 96}
+    assert plan["dispatches_removed_per_cycle"] == 384
+    assert mrk.mx is None, "building the plan must not import MLX"
+
+
+def test_route_kernel_refuses_to_drop_the_reference_arm():
+    with pytest.raises(SystemExit):
+        mrk.main(["--variants", "k4", "--dry-run"])
+    with pytest.raises(SystemExit):
+        mrk.main(["--variants", "k8", "--dry-run"])
+
+
+def test_route_kernel_parity_bar_is_bit_exact():
+    """Every counter must be zero: a flipped near-tie changes which experts
+    run, and a permutation feeds the retained routed-down kernel a reduction
+    tree it was not validated against."""
+
+    clean = {
+        "layers_expert_set_differs": 0,
+        "layers_slot_order_differs": 0,
+        "ids_differing": 0,
+        "scores_differing": 0,
+        "shared_differing": 0,
+    }
+    assert mrk.parity_is_clean(clean)
+    for key in clean:
+        assert not mrk.parity_is_clean({**clean, key: 1})
 
 
 # ---------------------------------------------------------------------------
