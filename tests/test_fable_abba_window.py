@@ -1265,3 +1265,109 @@ class TestRawEnvironmentMtplxAllowlist(unittest.TestCase):
         self.assertNotIn(
             "MTPLX_FABLE_COMPILED_COPY_ROUND", driver.RAW_ENV_MTPLX_KEYS
         )
+
+
+class ExtraEnvRecordingTest(unittest.TestCase):
+    """MTPLX_* knobs may ride --*-extra-env; the receipt must SHOW them."""
+
+    def test_mtplx_key_on_candidate_extra_env_still_reaches_arm_b_only(self):
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--candidate-extra-env",
+                "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1",
+            ]
+        )
+        specs = window.arm_specification(args)
+        self.assertEqual(
+            specs["B"]["extra_env"], ["MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1"]
+        )
+        self.assertEqual(specs["A"]["extra_env"], [])
+
+    def test_driver_records_the_raw_env_passthrough_in_the_receipt(self):
+        text = (
+            Path(window.__file__).resolve().parent / "abba_driver.py"
+        ).read_text("utf-8")
+        self.assertIn('"process_environment_overrides"', text)
+        self.assertIn("_EXTRA_ENVIRONMENT", text)
+
+    def test_the_receipt_field_is_declared_exactly_once(self):
+        """Two branches added this key to the same dict literal.
+
+        Python keeps the LAST duplicate, so the merge silently dropped one
+        side's value. One declaration, carrying both halves.
+        """
+
+        text = (
+            Path(window.__file__).resolve().parent / "abba_driver.py"
+        ).read_text("utf-8")
+        self.assertEqual(text.count('"process_environment_overrides":'), 1)
+
+    def test_the_receipt_field_covers_every_raw_setting(self):
+        """Not just the allowlisted MTPLX_* ones.
+
+        An inert candidate armed through --candidate-extra-env is exactly the
+        case this field exists for, and MLX_* / MTPLX_FABLE_* keys are not on
+        the allowlist -- so the comprehension must iterate the whole env.
+        """
+
+        text = (
+            Path(window.__file__).resolve().parent / "abba_driver.py"
+        ).read_text("utf-8")
+        start = text.index("    process_environment_overrides = {")
+        body = text[start:text.index("\n    }", start)]
+        self.assertIn("_EXTRA_ENVIRONMENT.items()", body)
+        self.assertNotIn("if key in RAW_ENV_MTPLX_KEYS", body)
+        # ...while still carrying the allowlist detail per key.
+        for field in ('"requested"', '"effective"', '"reader"'):
+            self.assertIn(field, body)
+
+    def test_candidate_env_remains_the_validated_channel(self):
+        """A profile override on --candidate-env still reaches arm B only."""
+
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--candidate-env",
+                "MTPLX_QWEN4_M4_ROUTER_TOP10=1",
+            ]
+        )
+        specs = window.arm_specification(args)
+        self.assertIn(
+            "MTPLX_QWEN4_M4_ROUTER_TOP10=1", specs["B"]["candidate_env"]
+        )
+        self.assertNotIn(
+            "MTPLX_QWEN4_M4_ROUTER_TOP10=1", specs["A"]["candidate_env"]
+        )
+
+    def test_fable_key_on_candidate_env_fails_at_planning_not_after_the_lock(self):
+        """The window now refuses what the driver has always refused.
+
+        ``parse_key_values(require_mtplx=True)`` has rejected MTPLX_FABLE_*
+        since before either branch (it is exempt from the MTPLX_ check
+        precisely because it rides --env).  Until the window mirrored that
+        rule it would happily PLAN such an arm, which then died in driver
+        argument parsing -- after taking the GPU lock and starting the model
+        load.  Both layers now give the same verdict, and the window's names
+        the channel that works.
+        """
+
+        with self.assertRaises(RuntimeError):
+            driver.parse_key_values(
+                ["MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1"],
+                flag="--candidate-env",
+                require_mtplx=True,
+            )
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--candidate-env",
+                "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1",
+            ]
+        )
+        with self.assertRaises(ValueError) as caught:
+            window.arm_specification(args)
+        self.assertIn("--candidate-extra-env", str(caught.exception))

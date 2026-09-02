@@ -63,6 +63,15 @@ the run, not a setting here: the log records whichever fires.
     greedy lane; :meth:`flush` says so rather than writing a silently empty
     file.
 
+``stock_prepared_bv`` -- the same lane with ``MTPLX_FABLE_BLOCK_VERIFY=1``
+    Identical rows and identical schema; the decision they fed was Option B's
+    block law (``mtplx/fable_block_verify.py``) rather than the shipped
+    per-token one, so the log additionally carries the window's ladder and the
+    offline scorer replays it under the block law.  That turns an armed run
+    into an exactness *proof* of the in-loop implementation: the reference
+    recomputes ``a_d`` and ``c_{d-1}`` from the rows and must reproduce the
+    logged ladder and the logged accept decisions.
+
 What is recorded, per verify window
 -----------------------------------
 Both layouts normalise to one on-disk schema, so the offline scorers load
@@ -73,7 +82,8 @@ differ -- whether the rows still need the kernel's preparation.
 key                          dtype / shape               meaning
 ===========================  ==========================  ===================
 ``layout``                   str (0-d)                   ``pr391_raw`` /
-                                                         ``stock_prepared``
+                                                         ``stock_prepared`` /
+                                                         ``stock_prepared_bv``
 ``has_raw_logits``           uint8 (0-d)                 1 iff values are logits
 ``draft_ids``                uint32  ``[C, D, K]``       draft row support
 ``draft_values``             float32 ``[C, D, K]``       logits, or log(prob)
@@ -106,6 +116,26 @@ key                          dtype / shape               meaning
 ``draft_temperature``        float64 (0-d)
 ``top_p`` / ``top_k``        float64 / int64 (0-d)
 ===========================  ==========================  ===================
+
+``stock_prepared_bv`` adds one block of columns, written only for that layout
+(``mtplx/fable_block_verify.py``):
+
+===========================  ==========================  ===================
+key                          dtype / shape               meaning
+===========================  ==========================  ===================
+``block_valid``              uint8   ``[C]``             1 iff BV ran here
+``block_coin``               float64 ``[C, D]``          ``a_d = w_d/w_{d-1}``
+``block_scale``              float64 ``[C, D]``          ``c_{d-1}``, the
+                                                         residual scale
+``block_budget``             float64 ``[C, D]``          ``A_d``
+``block_realised``           float64 ``[C, D]``          ``w_d``
+``block_clipped``            uint8   ``[C, D]``          coin clipped at 1
+``block_cap``                str (0-d)                   water-fill cap
+===========================  ==========================  ===================
+
+A window whose ``block_valid`` is 0 ran the shipped law (a row it needed was
+not on the host), and the offline scorer replays it under that law -- so a
+mixed log is still a clean exactness proof, window by window.
 
 **alpha beyond the first rejection is not in the log, because neither lane
 computes it.**  The kernel returns as soon as a depth rejects (kernel lines
@@ -173,6 +203,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .fable_block_verify import CAP_MODE as _BLOCK_CAP_MODE
+
 _ENV_VAR = "MTPLX_FABLE_K20_LOG"
 
 K20 = 20
@@ -182,6 +214,7 @@ DECISION_DRAWS = DEPTH + 1
 
 LAYOUT_PR391 = "pr391_raw"
 LAYOUT_STOCK = "stock_prepared"
+LAYOUT_STOCK_BV = "stock_prepared_bv"
 
 SELECTED_NONE = 0
 SELECTED_CORRECTION = 1
@@ -240,6 +273,21 @@ def _row_arrays(
     )
     out_probs = np.concatenate((probs, np.zeros(padding, dtype=np.float64)))
     return out_ids, out_values, out_probs
+
+
+def _block_column(
+    block: Any, key: str, depth: int, fill: float | int
+) -> list[float] | list[int]:
+    """One ladder column, padded to ``depth``; the fill when BV did not arm.
+
+    ``scale`` fills with 1.0 and everything else with 0, so an un-armed window
+    reads back as "the shipped law ran here", which is what happened.
+    """
+
+    values = (block or {}).get(key) or ()
+    out = [type(fill)(value) for value in values[:depth]]
+    out.extend([fill] * (depth - len(out)))
+    return out
 
 
 def _distribution_rows(distribution: Any) -> tuple[Any, Any, Any] | None:
@@ -420,6 +468,8 @@ class K20RowLog:
         bonus_allowed: bool,
         greedy: bool,
         rng: Any = None,
+        block_verify: bool = False,
+        block: Any = None,
     ) -> None:
         """Open one stock verify window and copy every row already on the host.
 
@@ -433,11 +483,19 @@ class K20RowLog:
         Every array copied is one the lane already owns.  Nothing here touches
         the device.  An already-open window is closed first, so no accept-loop
         ``break`` or ``continue`` needs its own hook.
+
+        ``block_verify`` is the RUN-level ``MTPLX_FABLE_BLOCK_VERIFY`` gate and
+        selects the ``stock_prepared_bv`` layout; ``block`` is the window's own
+        ladder (``BlockVerifier.log_arrays()``) or ``None`` when that window
+        fell back to the shipped law because a row was missing.  The offline
+        scorer replays each window under the law its ``block_valid`` flag says
+        it ran, so an armed log is an exactness proof of this implementation
+        and not merely a record of it.
         """
 
         if not _ENABLED or not self.enabled:
             return
-        self._claim_layout(LAYOUT_STOCK)
+        self._claim_layout(LAYOUT_STOCK_BV if block_verify else LAYOUT_STOCK)
         self._close_open()
 
         depth = len(draft_tokens)
@@ -479,6 +537,12 @@ class K20RowLog:
             "greedy": int(bool(greedy)),
             "descriptor_offset": -1,
             "rng_state": _pcg64_state(rng),
+            "block_valid": int(block is not None),
+            "block_coin": _block_column(block, "coin", depth, 0.0),
+            "block_scale": _block_column(block, "scale", depth, 1.0),
+            "block_budget": _block_column(block, "budget", depth, 0.0),
+            "block_realised": _block_column(block, "realised", depth, 0.0),
+            "block_clipped": _block_column(block, "clipped", depth, 0),
         }
 
     def stock_depth(
@@ -567,6 +631,13 @@ class K20RowLog:
         uniforms = np.full((count, depth + 1), np.nan, dtype=np.float64)
         draft_uniforms = np.full((count, depth), np.nan, dtype=np.float64)
         accept_probability = np.zeros((count, depth), dtype=np.float64)
+        block_columns = {
+            "block_coin": np.zeros((count, depth), dtype=np.float64),
+            "block_scale": np.ones((count, depth), dtype=np.float64),
+            "block_budget": np.zeros((count, depth), dtype=np.float64),
+            "block_realised": np.zeros((count, depth), dtype=np.float64),
+            "block_clipped": np.zeros((count, depth), dtype=np.uint8),
+        }
 
         for index, row in enumerate(rows):
             for slot, entry in enumerate(row["draft_rows"][:depth]):
@@ -593,11 +664,24 @@ class K20RowLog:
             accept_probability[index, : len(alpha)] = np.asarray(
                 alpha, dtype=np.float64
             )
+            for key, array in block_columns.items():
+                ladder = row.get(key)
+                if ladder:
+                    array[index, : len(ladder)] = np.asarray(ladder, dtype=array.dtype)
 
         def column(key: str, dtype: Any) -> np.ndarray:
-            return np.asarray([row[key] for row in rows], dtype=dtype)
+            return np.asarray([row.get(key, 0) for row in rows], dtype=dtype)
+
+        block_arrays: dict[str, np.ndarray] = {}
+        if self.layout == LAYOUT_STOCK_BV:
+            block_arrays = {
+                **block_columns,
+                "block_valid": column("block_valid", np.uint8),
+                "block_cap": np.asarray(_BLOCK_CAP_MODE),
+            }
 
         return {
+            **block_arrays,
             "layout": np.asarray(self.layout or LAYOUT_STOCK),
             "has_raw_logits": np.asarray(
                 1 if self.layout == LAYOUT_PR391 else 0, dtype=np.uint8
@@ -764,6 +848,7 @@ __all__ = [
     "K20RowLog",
     "LAYOUT_PR391",
     "LAYOUT_STOCK",
+    "LAYOUT_STOCK_BV",
     "is_enabled",
     "k20_log",
 ]

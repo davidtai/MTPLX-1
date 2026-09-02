@@ -167,18 +167,33 @@ All of it is float64, from ``pr391_softfloat64_verifier_decision.py``:
 
 Self-check
 ----------
-Before scoring anything, the current-law replay is compared against the
-decision the **device kernel actually returned** for every logged cycle
-(``accepted`` / ``first_reject`` / ``selected_token`` / ``selected_kind`` /
-``draws_used``).  A single mismatch is a hard failure: it means this file no
-longer mirrors the kernel, and every number below it would be worthless.
-``--allow-replay-mismatch`` downgrades it to a warning for debugging.
+Before scoring anything, the replay is compared against the decision the run
+**actually returned** for every logged cycle (``accepted`` / ``first_reject`` /
+``selected_token`` / ``selected_kind`` / ``draws_used``).  A single mismatch is
+a hard failure: it means this file no longer mirrors the lane, and every number
+below it would be worthless.  ``--allow-replay-mismatch`` downgrades it to a
+warning for debugging.
+
+Which law that replay uses is a property of the log.  A ``pr391_raw`` or
+``stock_prepared`` log ran the shipped law, so :func:`decide_current` is the
+oracle.  A ``stock_prepared_bv`` log was produced with
+``MTPLX_FABLE_BLOCK_VERIFY=1``, so :func:`decide_block` is -- per window, since
+a window that could not arm (a row the lane never materialised) fell back to
+the shipped law and records ``block_valid = 0``.  An armed log carries the
+in-loop ladder as well, and :func:`block_ladder_columns` recomputes it here and
+demands entry-for-entry equality: that is the exactness proof that
+``mtplx/fable_block_verify.py`` implements the law in this file, and it is what
+a BV-armed run must show.
 
 Usage::
 
     python scripts/fable/offline_block_verification.py rows.npz
     python scripts/fable/offline_block_verification.py rows.npz --ms-per-window 37.47
     python scripts/fable/offline_block_verification.py rows.npz --cap one --json out.json
+
+    # exactness check of the in-loop implementation, on a BV-armed run
+    MTPLX_FABLE_BLOCK_VERIFY=1 MTPLX_FABLE_K20_LOG=/path/bv.npz <benchmark>
+    python scripts/fable/offline_block_verification.py /path/bv.npz
 """
 
 from __future__ import annotations
@@ -198,6 +213,7 @@ TOP_P = 0.95
 
 LAYOUT_PR391 = "pr391_raw"
 LAYOUT_STOCK = "stock_prepared"
+LAYOUT_STOCK_BV = "stock_prepared_bv"
 
 SELECTED_NONE = 0
 SELECTED_CORRECTION = 1
@@ -445,10 +461,12 @@ def log_spec(log: dict[str, np.ndarray]) -> dict[str, Any]:
     """Read the layout and the window shape off one loaded log."""
 
     layout = str(log["layout"]) if "layout" in log else LAYOUT_PR391
-    if layout not in {LAYOUT_PR391, LAYOUT_STOCK}:
+    if layout not in {LAYOUT_PR391, LAYOUT_STOCK, LAYOUT_STOCK_BV}:
         raise ValueError(f"unknown K20 log layout {layout!r}")
     return {
         "layout": layout,
+        "block_armed": layout == LAYOUT_STOCK_BV,
+        "block_cap": (str(log["block_cap"]) if "block_cap" in log else None),
         "depth": int(log["draft_tokens"].shape[1]),
         "target_rows": int(log["target_ids"].shape[1]),
         "cycles": int(log["draft_tokens"].shape[0]),
@@ -513,7 +531,7 @@ def build_window(
 
     spec = spec or log_spec(log)
     depth = int(spec["depth"])
-    prepared = spec["layout"] == LAYOUT_STOCK
+    prepared = spec["layout"] in {LAYOUT_STOCK, LAYOUT_STOCK_BV}
     draft_valid = log.get("draft_valid")
     target_valid = log.get("target_valid")
     if draft_valid is not None and not np.all(draft_valid[index, :depth]):
@@ -777,6 +795,49 @@ def reach_ladder_block(window: Window, *, cap_mode: str = "reach") -> np.ndarray
     return ladder
 
 
+def block_ladder_columns(
+    window: Window, *, cap_mode: str = "reach"
+) -> dict[str, np.ndarray]:
+    """The block law's per-depth ladder, unconditional on the accept coins.
+
+    This is what ``mtplx/fable_block_verify.BlockVerifier`` computes up front
+    and what an armed ``stock_prepared_bv`` log records, so comparing the two
+    is the exactness check on the in-loop implementation.  Computing every
+    depth (rather than stopping at the first rejection like :func:`decide_block`)
+    is not a different law: the recursion advances only on an accept, so depth
+    ``d``'s entry is by construction the one that is consulted when the window
+    reaches ``d`` -- and no other entry is ever read.
+    """
+
+    depth_count = window.depth
+    columns = {
+        "coin": np.zeros(depth_count, dtype=np.float64),
+        "scale": np.ones(depth_count, dtype=np.float64),
+        "budget": np.zeros(depth_count, dtype=np.float64),
+        "realised": np.zeros(depth_count, dtype=np.float64),
+        "clipped": np.zeros(depth_count, dtype=np.uint8),
+    }
+    credit = ONE
+    reach = ONE
+    for depth in range(depth_count):
+        rho = window.rho(depth, window.draft_tokens[depth])
+        budget = min(ONE, credit * rho)
+        realised = _block_realised_reach(
+            window, depth, budget=budget, reach=reach, cap_mode=cap_mode
+        )
+        coin = ONE if reach <= ZERO else np.float64(realised / reach)
+        if coin > ONE:
+            columns["clipped"][depth] = 1
+            coin = ONE
+        columns["scale"][depth] = credit
+        columns["coin"][depth] = coin
+        columns["budget"][depth] = budget
+        columns["realised"][depth] = realised
+        credit = budget
+        reach = realised if realised < reach else reach
+    return columns
+
+
 def _block_realised_reach(
     window: Window,
     depth: int,
@@ -910,14 +971,28 @@ def score(
     *,
     cap_mode: str = "reach",
     limit: int | None = None,
+    block_ladder_tol: float = 0.0,
 ) -> dict[str, Any]:
-    """Replay both laws over every logged window."""
+    """Replay both laws over every logged window.
+
+    The self-check replays **the law the device actually ran**: the shipped one
+    for a ``pr391_raw`` / ``stock_prepared`` log, and the block law for the
+    windows of a ``stock_prepared_bv`` log whose ``block_valid`` is 1 (a window
+    that could not arm fell back to the shipped law and is checked against it).
+    On an armed log the recomputed ladder is compared entry for entry against
+    the one ``mtplx/fable_block_verify.py`` wrote, which is the exactness proof
+    of the in-loop implementation rather than a smoke test of it.
+    """
 
     spec = log_spec(log)
     depth = int(spec["depth"])
     # The stock lane's correction id comes off the live generator, not a
     # logged uniform, so it is not reproducible offline; every other field is.
-    with_token = spec["layout"] != LAYOUT_STOCK
+    with_token = spec["layout"] == LAYOUT_PR391
+    armed_log = bool(spec["block_armed"])
+    block_valid = log.get("block_valid")
+    logged_coin = log.get("block_coin")
+    logged_scale = log.get("block_scale")
     stops = frozenset(int(token) for token in log.get("stop_ids", ()))
     cycles = int(log["draft_tokens"].shape[0])
     if limit is not None:
@@ -936,6 +1011,10 @@ def score(
     replay_mismatch: list[int] = []
     skipped: list[int] = []
     clipped = 0
+    block_armed_cycles = 0
+    ladder_mismatch: list[int] = []
+    max_coin_error = 0.0
+    max_scale_error = 0.0
 
     for index in range(cycles):
         window = build_window(log, index, stops, spec=spec)
@@ -944,7 +1023,23 @@ def score(
             continue
         current = decide_current(window)
         block = decide_block(window, cap_mode=cap_mode)
-        if current.key(with_token=with_token) != logged_key(
+        armed = armed_log and (block_valid is None or bool(block_valid[index]))
+        if armed:
+            block_armed_cycles += 1
+            columns = block_ladder_columns(window, cap_mode=cap_mode)
+            if logged_coin is not None and logged_scale is not None:
+                coin_error = float(
+                    np.max(np.abs(columns["coin"] - logged_coin[index, :depth]))
+                )
+                scale_error = float(
+                    np.max(np.abs(columns["scale"] - logged_scale[index, :depth]))
+                )
+                max_coin_error = max(max_coin_error, coin_error)
+                max_scale_error = max(max_scale_error, scale_error)
+                if max(coin_error, scale_error) > block_ladder_tol:
+                    ladder_mismatch.append(index)
+        device = block if armed else current
+        if device.key(with_token=with_token) != logged_key(
             log, index, with_token=with_token
         ):
             replay_mismatch.append(index)
@@ -978,6 +1073,12 @@ def score(
         "depth": depth,
         "has_raw_logits": bool(spec["has_raw_logits"]),
         "cap_mode": cap_mode,
+        "log_block_cap": spec["block_cap"],
+        "replay_law": "block" if armed_log else "current",
+        "block_armed_cycles": block_armed_cycles,
+        "block_ladder_mismatch_cycles": ladder_mismatch,
+        "block_ladder_max_coin_error": max_coin_error,
+        "block_ladder_max_scale_error": max_scale_error,
         "compares_selected_token": with_token,
         "replay_mismatch_cycles": replay_mismatch,
         "current": _summarise(
@@ -1071,14 +1172,32 @@ def report(result: dict[str, Any], *, ms_per_window: float | None) -> str:
     lines.append(f"water-fill cap             {result['cap_mode']}")
     mismatches = result["replay_mismatch_cycles"]
     lines.append(
-        "current-law replay         "
+        f"{result['replay_law']}-law replay".ljust(27)
         + (
             f"EXACT on all {result['cycles_scored']} scored decisions"
             if not mismatches
             else f"MISMATCH on {len(mismatches)} cycles {mismatches[:8]}"
         )
     )
-    if result["layout"] == LAYOUT_STOCK:
+    if result["replay_law"] == "block":
+        ladder = result["block_ladder_mismatch_cycles"]
+        lines.append(
+            "block ladder vs in-loop    "
+            + (
+                f"EXACT on {result['block_armed_cycles']} armed windows "
+                f"(max |da_d| {result['block_ladder_max_coin_error']:.3e}, "
+                f"max |dc_d| {result['block_ladder_max_scale_error']:.3e})"
+                if not ladder
+                else f"MISMATCH on {len(ladder)} windows {ladder[:8]}"
+            )
+        )
+        if result["log_block_cap"] and result["log_block_cap"] != result["cap_mode"]:
+            lines.append(
+                f"                           WARNING: the run used cap "
+                f"{result['log_block_cap']!r}, this replay used "
+                f"{result['cap_mode']!r}"
+            )
+    if result["layout"] in {LAYOUT_STOCK, LAYOUT_STOCK_BV}:
         lines.append(
             "                           stock lane: accept coins past the "
             "first rejection are"
@@ -1178,6 +1297,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "(H/cost.py calibrates the M4 baseline at 37.47)",
     )
     parser.add_argument("--limit", type=int, default=None, help="score only the first N cycles")
+    parser.add_argument(
+        "--block-ladder-tol",
+        type=float,
+        default=0.0,
+        help="tolerance for the armed-log ladder check; 0 demands bit equality "
+        "with mtplx/fable_block_verify.py, which is what the two float64 "
+        "mirrors are built to deliver",
+    )
     parser.add_argument("--json", default=None, help="also write the result as JSON")
     parser.add_argument(
         "--allow-replay-mismatch",
@@ -1188,7 +1315,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     log = load_log(args.npz)
-    result = score(log, cap_mode=args.cap, limit=args.limit)
+    result = score(
+        log,
+        cap_mode=args.cap,
+        limit=args.limit,
+        block_ladder_tol=args.block_ladder_tol,
+    )
     print(report(result, ms_per_window=args.ms_per_window))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
@@ -1203,8 +1335,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     if result["replay_mismatch_cycles"] and not args.allow_replay_mismatch:
         print(
-            "\nFAIL: the current-law replay no longer mirrors the device "
-            "kernel, so every number above is unreliable.",
+            f"\nFAIL: the {result['replay_law']}-law replay no longer mirrors "
+            "the decision the run actually made, so every number above is "
+            "unreliable.",
+            file=sys.stderr,
+        )
+        return 1
+    if result["block_ladder_mismatch_cycles"] and not args.allow_replay_mismatch:
+        print(
+            "\nFAIL: the in-loop block ladder does not match this reference. "
+            "mtplx/fable_block_verify.py and this file are mirrors of one law; "
+            "one of them has drifted.",
             file=sys.stderr,
         )
         return 1

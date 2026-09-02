@@ -626,6 +626,7 @@ hold their rows at different stages of shaping:
 |---|---|---|---|
 | `pr391_raw` | opt-in softfloat64 D3/M4 device kernel (`--d3-softfloat64-route`) | the kernel's **raw** input; top-p 0.95 and the double renormalisation happen inside it | yes |
 | `stock_prepared` | the **retained** stock native-MTP host accept loop (the default) | **already** temperature/top-p/top-k shaped and renormalised | no — `values` is `log(prob)` |
+| `stock_prepared_bv` | the same stock lane with `MTPLX_FABLE_BLOCK_VERIFY=1` | identical to `stock_prepared`, plus the window's block ladder | no |
 
 On the pr391 lane the rows ride the decision's existing `mx.eval`, so an armed
 run adds no new synchronisation — just a ~1.7 kB device-to-host copy per cycle.
@@ -674,6 +675,72 @@ Quote the `E[tok/win]` column (accept coins integrated out, paired standard
 error), not the `replay` column; the replay is the exactness proof, and its
 arm-to-arm difference is noise-dominated. Per H §1.4 a live A/B cannot resolve
 either option at all.
+
+
+## Block verification on the stock lane (`MTPLX_FABLE_BLOCK_VERIFY`)
+
+H §Option B, Sun et al. 2024 (arXiv:2403.10444). Read once at import, default
+off; when off the accept loop evaluates exactly the expressions it evaluated
+before — same acceptance probability, same residual, same uniforms, same order.
+Measured offline on 381 real windows: **+1.85% tokens/window, 2.487 → 2.533.**
+
+The shipped law decides depth `d` from `x_d` alone and is already saturated at
+depth 1. The whole M4 forward is finished before the accept loop runs, so every
+target row is on the host when depth 1 is decided, and the decision may legally
+look at `rho_2` and `rho_3`. One clip moves — the **running product** is clipped
+at 1 instead of each factor — and the resulting budget is water-filled across
+the depth `d+1` draft support, so it is spent on the realisations whose next
+drafted token the target likes:
+
+```
+c_0 = w_0 = 1
+for d in 1..D:
+    rho_d = p_d(x_d) / q_d(x_d)
+    A_d   = min(1, c_{d-1} * rho_d)                      # reach budget
+    w_d   = min(w_{d-1}, min(1, A_d*rho_{d+1}(x_{d+1})) + lam_d)   # d < D
+    w_D   = A_D
+    a_d   = w_d / w_{d-1}                                # the accept coin
+    reject -> sample from normalise((c_{d-1}*p_d - q_d)+)  # SCALED residual
+bonus ~ p_{D+1}                                          # unchanged
+```
+
+`lam_d` is the water-fill level that holds `E_{x_{d+1}~q_{d+1}}[w_d]` at `A_d`,
+which is what keeps the law exact. The cap is `w_{d-1}`, not H's literal
+`min(1, .)`: with H's cap `a_d` can exceed 1 and is not a probability. When the
+ladder never leaves 1 the two laws coincide token for token (43–47% of windows),
+which is the partial parity check.
+
+**It draws nothing extra.** Same accept coin per depth, same one `rng.choice`
+for a correction, same one for the bonus; the water-fill is deterministic. It
+adds no verifier row, no draft step, and no device work — the ladder is ~70 µs
+of NumPy on 20-wide rows against a 30 ms forward.
+
+A window arms only when all `D` draft rows and all `D` target rows are already
+on the host, so the flag never forces the lazy per-row path to materialise a row
+it meant to skip; a window that cannot arm runs the shipped law and records
+`block_valid = 0`. Both laws are exact samplers of the same target
+distribution, so mixing them per window changes nothing about the output.
+
+```
+# arm it, and log the rows so the run can be checked
+MTPLX_FABLE_BLOCK_VERIFY=1 MTPLX_FABLE_K20_LOG=/tmp/bv.npz <benchmark command>
+
+# the exactness check: must report EXACT on both lines
+python scripts/fable/offline_block_verification.py /tmp/bv.npz
+```
+
+On a `stock_prepared_bv` log the scorer replays the **block** law (per window,
+under the law that window's `block_valid` says ran) and additionally recomputes
+the ladder from the rows and demands entry-for-entry equality with the one the
+lane wrote. Both must print `EXACT`; anything else means
+`mtplx/fable_block_verify.py` and `scripts/fable/offline_block_verification.py`
+have drifted apart, and the run's numbers are worthless.
+
+Receipts change meaning in exactly one place: `drafts[].accept_probability` and
+`accept_probability_sum_by_depth` carry `a_d`, the conditional accept
+probability, which is the same operational quantity `min(1, p/q)` was but is no
+longer an estimator of the TV overlap `beta_d`. Read `alpha_uncensored` out of
+the scorer for `beta`.
 
 ## Tests
 
