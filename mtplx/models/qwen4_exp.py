@@ -1127,44 +1127,60 @@ def install_hc_m4_pack_validation(model: Any) -> dict[str, Any]:
     a failure means the flag was armed for a model the kernel cannot read.
     That is a deployment error and it should stop the server, not fail
     whichever request first reaches verify width.
+
+    Discovery goes through :func:`_named_gated_residuals`, which walks the
+    model the way MLX itself does.  The first cut of this function walked
+    ``dir(layer)`` instead and found NOTHING on the real pack -- an
+    ``nn.Module``'s children live in its dict and are served by
+    ``__getattr__``, so ``dir()`` does not list them -- which turned an armed
+    flag into a dead server (2026-09-02, both the HumanEval screen and the
+    ABBA lane).  Never enumerate an MLX module with ``dir()``.
     """
 
     if not fable_hc_m4_enabled():
         return {"armed": False, "validated": 0}
 
     validated = 0
-    text = getattr(model, "language_model", model)
-    layers = getattr(getattr(text, "model", None), "layers", None) or []
-    for index, layer in enumerate(layers):
-        for name, module in _named_gated_residuals(layer):
-            module.validate_hc_m4_pack(f"layers.{index}.{name}")
-            validated += 1
-    mtp = getattr(text, "mtp", None)
-    for mtp_index, mtp_layer in enumerate(getattr(mtp, "layers", None) or []):
-        for name, module in _named_gated_residuals(mtp_layer):
-            module.validate_hc_m4_pack(f"mtp.layers.{mtp_index}.{name}")
-            validated += 1
+    for path, module in _named_gated_residuals(model):
+        module.validate_hc_m4_pack(path)
+        validated += 1
     if not validated:
         raise RuntimeError(
-            "MTPLX_FABLE_HC_M4 is armed but this model has no GatedResidual "
-            "hyper-connection module for the kernel to replace; the flag "
-            "cannot do anything here. Unset it for this model."
+            "MTPLX_FABLE_HC_M4 is armed but no GatedResidual hyper-connection "
+            "module was found anywhere in "
+            f"{type(model).__name__}.named_modules(); the flag cannot do "
+            "anything here. Unset it for this model."
         )
     return {"armed": True, "validated": validated}
 
 
-def _named_gated_residuals(owner: Any):
-    """``(attribute name, module)`` for every GatedResidual ``owner`` holds."""
+def _named_gated_residuals(model: Any):
+    """``(dotted path, module)`` for every GatedResidual in ``model``.
 
-    for name in dir(owner):
-        if name.startswith("__"):
-            continue
-        try:
-            value = getattr(owner, name)
-        except Exception:  # pragma: no cover - defensive: properties may raise
-            continue
-        if isinstance(value, GatedResidual):
-            yield name, value
+    ``nn.Module.named_modules`` is the model's OWN traversal -- the one that
+    finds its parameters -- so it reaches children held directly
+    (``model.hyper_connection_mixer``), inside lists (``model.layers[i]
+    .attn_hyper_connection``) and behind a published sub-tree
+    (``language_model.mtp.hyper_connection_mixer``) alike.  If the forward can
+    reach a module, this finds it.
+
+    Sorted by path so the failure message names layers in a stable order
+    rather than MLX's dict order.
+    """
+
+    named = getattr(model, "named_modules", None)
+    if named is None:  # pragma: no cover - every qwen4 model is an nn.Module
+        raise RuntimeError(
+            "MTPLX_FABLE_HC_M4 pack validation needs an mlx.nn.Module; got "
+            f"{type(model).__name__}"
+        )
+    found = [
+        (path, module)
+        for path, module in named()
+        if isinstance(module, GatedResidual)
+    ]
+    found.sort(key=lambda item: item[0])
+    return found
 
 
 class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
