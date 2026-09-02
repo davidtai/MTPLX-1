@@ -404,8 +404,8 @@ run a single arm as the guard's direct child.
 ## Microbenchmarks
 
 `micro_dispatch_overhead.py`, `micro_moe_dedup.py`, `micro_expert_major.py`,
-`micro_hc_read.py` and `micro_route_kernel.py` price one site at the fixed-M4
-verifier's shapes without loading the model. They import MLX and therefore need
+`micro_hc_read.py`, `micro_dependent_launch.py` and `micro_route_kernel.py`
+price one site at the fixed-M4 verifier's shapes without loading the model. They import MLX and therefore need
 the SAME guarded window as an ABBA arm; none of them touch `com.tea.qwen`, so
 they can share a window.
 
