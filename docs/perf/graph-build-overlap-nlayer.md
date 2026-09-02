@@ -417,6 +417,13 @@ monolithic path.
   it is an attribution, not a controlled experiment. A repeat ABBA now
   carries `prefill_split` and the construction counters, so the next run
   settles it from the receipt alone.
+* **Two live banks in one process.** The shared pair's `host["bank"]` points
+  at whichever bank installed last, so two *concurrently* generating requests
+  in one process would have the first one's replays read the second's shadow.
+  This is not new: `_shared_or_new_verify_step` re-points its host the same
+  way and at the same moments, so the overlap pair inherits exactly the
+  shipped route's concurrency contract (one generation at a time behind the
+  GPU lock) and adds no new exposure. Worth stating rather than discovering.
 * **The process-wide pair cache has never been exercised on the real
   runtime.** Its key, its host re-pointing and its weakref guard are covered
   pure-Python against the production census; whether MLX reuses the trace as
