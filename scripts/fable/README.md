@@ -500,10 +500,29 @@ changes the softmax denominator's and the PV product's accumulation order.
 `micro_qsa_m4.py` prices all five families (`prep`, `bank`, `score`, `tokens`,
 `gather`) over one verify cycle (12 QSA layers) at the production shapes,
 eager and under `mx.compile`, and prints max-abs-diff AND a differing-element
-count against each stock spelling. Four families must print `0 / 0`; `score`
-is the one place a nonzero count is a finding rather than a rounding
-allowance (its 4-term fp32 head sum assumes MLX's column reduce walks the axis
-in order).
+count against each stock spelling.
+
+Measured 2026-09-01, compiled lane:
+
+| family | stock | fused | differing elements |
+| --- | ---: | ---: | ---: |
+| `prep` | 0.557 ms | 0.199 (**-64%**) | 0 |
+| `bank` | 1.153 ms | 0.251 (**-78%**) | 0 |
+| `score` | 0.500 ms | 0.283 (**-44%**) | 0 |
+| `tokens` | 0.628 ms | 0.205 (**-67%**) | 0 |
+| `gather` | 1.501 ms | 1.657 (**+10%**) | 104, max abs 0.125 — **REJECTED** |
+
+`MTPLX_FABLE_QSA_M4` is therefore the first four: bit-exact, and faster on
+every one. The transposed-key gather is quarantined behind its own
+`MTPLX_FABLE_QSA_M4_KT` (default off) and stays in the bench as the rejected
+alternative, the way `bank_select` stays in `micro_opdiet.py`. Its 0.125 is
+exactly one bf16 ulp at a score in [16,32): MLX's score GEMM takes a different
+fp32 accumulation path for a natively-transposed B operand than for a
+`swapaxes` view it has just made contiguous, so the layout is a rounding-class
+change to attention output — and the 32x32 tiled transpose that produces it is
+slower than the MLX copy it removes (a transpose cannot vectorize both sides,
+so it trades a `vec<T,4>` streaming copy for scalar 2-byte accesses through
+threadgroup memory plus a barrier).
 
 ```
 PYTHONPATH=<branch checkout> \
@@ -517,14 +536,13 @@ PYTHONPATH=<branch checkout> \
     --reps 20 --out /tmp/micro-qsa-m4.json
 ```
 
-Adoption bar, per family: the fused spelling under stock in compiled ms/cycle,
-`prep`/`bank`/`tokens`/`gather` printing 0 differing elements, and `score`
-printing 0 as well (a nonzero count there means MLX's reduce order is not what
-the kernel assumes and the kernel must change, not the bar). Then confirm on
-the verifier with an ABBA arm carrying
-`--candidate-env MTPLX_FABLE_QSA_M4=1 --candidate-env MTPLX_QSA_M4_FUSED_KV_GATHER=1`;
-the gate is acceptance parity. Arming `MTPLX_FABLE_QSA_M4` without the fused
-K/V gather RAISES at cache install rather than running a slower stock lane.
+Adoption bar, per family: the fused spelling under stock in compiled ms/cycle
+AND 0 differing elements. All four shipped families clear it. Confirm on the
+verifier with an ABBA arm carrying `--candidate-env MTPLX_FABLE_QSA_M4=1`; the
+gate is acceptance parity. The lane does NOT require
+`MTPLX_QSA_M4_FUSED_KV_GATHER` — only `MTPLX_FABLE_QSA_M4_KT` does, and arming
+KT without it RAISES at cache install rather than binding a stock gather and
+looking inert.
 
 ## K20 row logging and the offline acceptance scorers
 
@@ -574,7 +592,7 @@ cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
 (`pytest` is not installed in this venv; the test file also runs under
 `pytest tests/test_fable_abba_window.py -q` where it is available.)
 
-`tests/test_fable_qsa_m4.py` runs entirely on the CPU stream (59 cases): the
+`tests/test_fable_qsa_m4.py` runs entirely on the CPU stream (66 cases): the
 flag's gating and narrowing, every eligibility raise, CPU references of each
 Metal body pinned against the stock chain it replaces, and the dispatch-map
 receipt above.
