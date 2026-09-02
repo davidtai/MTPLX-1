@@ -914,8 +914,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="KEY=VALUE",
         help=(
-            "Non-MTPLX process env for BOTH arms "
-            "(e.g. MLX_MAX_OPS_PER_BUFFER=...)."
+            "Raw process env for BOTH arms, applied before the mlx import "
+            "(e.g. MLX_MAX_OPS_PER_BUFFER=...). MTPLX_* keys are refused here "
+            "except MTPLX_FABLE_* and the raw-environment allowlist "
+            "(MTPLX_CONTEXT_COPY_K, MTPLX_CONTEXT_COPY_PROBATION_K, "
+            "MTPLX_SESSION_BANK_MAX_BYTES), which are "
+            "read straight off os.environ and are NOT profile overrides."
         ),
     )
     parser.add_argument(
@@ -923,7 +927,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Non-MTPLX process env for arm B only (adds to --control-extra-env).",
+        help=(
+            "Raw process env for arm B only (adds to --control-extra-env); "
+            "same namespace rules. This is the channel for the block-cap "
+            "recipe: --candidate-extra-env MTPLX_CONTEXT_COPY_K=48"
+        ),
     )
     parser.add_argument(
         "--max-tokens",
@@ -1017,6 +1025,61 @@ RESERVED_ARM_FLAGS = frozenset(
 )
 
 
+#: Mirrors ``scripts/fable/abba_driver.RAW_ENV_MTPLX_KEYS``.  These MTPLX_*
+#: settings are read with a bare ``os.environ.get`` at their use site rather
+#: than through ``mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS``, so they ride
+#: ``--control-extra-env`` / ``--candidate-extra-env`` (the driver's raw
+#: ``--env``) and NOT ``--control-env`` / ``--candidate-env``.
+#:
+#: Checked here as well as in the driver so a mis-routed key fails while the
+#: window is still planning, instead of after an arm has taken the GPU lock and
+#: loaded the model.
+RAW_ENV_MTPLX_KEYS = frozenset(
+    {
+        "MTPLX_CONTEXT_COPY_K",
+        "MTPLX_CONTEXT_COPY_PROBATION_K",
+        "MTPLX_SESSION_BANK_MAX_BYTES",
+    }
+)
+
+
+def _is_raw_env_mtplx_key(key: str) -> bool:
+    return key.startswith("MTPLX_FABLE_") or key in RAW_ENV_MTPLX_KEYS
+
+
+def check_env_settings(settings: Sequence[str], *, flag: str, mtplx: bool) -> None:
+    """Reject KEY=VALUE settings the driver would refuse after model load.
+
+    ``mtplx=True`` is the construction-time override channel (``--*-env``):
+    keys must be MTPLX_* and must not be one of the raw-environment settings.
+    ``mtplx=False`` is the process-environment channel (``--*-extra-env``):
+    MTPLX_* keys are refused unless they are MTPLX_FABLE_* or allowlisted.
+    """
+
+    for setting in settings:
+        if "=" not in setting:
+            raise ValueError(f"expected KEY=VALUE, got {setting!r}")
+        key, value = setting.split("=", 1)
+        if not key or not value:
+            raise ValueError(f"expected KEY=VALUE, got {setting!r}")
+        raw = _is_raw_env_mtplx_key(key)
+        if mtplx:
+            if raw:
+                raise ValueError(
+                    f"{key} is a raw process-environment setting; pass it with "
+                    f"--control-extra-env / --candidate-extra-env, not {flag}"
+                )
+            if not key.startswith("MTPLX_"):
+                raise ValueError(f"{flag} keys must start with MTPLX_: {setting!r}")
+        elif key.startswith("MTPLX_") and not raw:
+            raise ValueError(
+                f"{key} is a construction-time override; pass it with "
+                f"--control-env / --candidate-env, not {flag} "
+                f"(raw-environment allowlist: "
+                f"{', '.join(sorted(RAW_ENV_MTPLX_KEYS))})"
+            )
+
+
 def check_arm_flags(flags: Sequence[str]) -> None:
     """Reject arm flags that collide with what the window already supplies."""
 
@@ -1040,6 +1103,14 @@ def arm_specification(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
 
     check_arm_flags(args.control_flag)
     check_arm_flags(args.candidate_flag)
+    check_env_settings(args.control_env, flag="--control-env", mtplx=True)
+    check_env_settings(args.candidate_env, flag="--candidate-env", mtplx=True)
+    check_env_settings(
+        args.control_extra_env, flag="--control-extra-env", mtplx=False
+    )
+    check_env_settings(
+        args.candidate_extra_env, flag="--candidate-extra-env", mtplx=False
+    )
     base = control_flags(
         resolve_max_tokens(args.max_tokens, args.prefill_only)
     )

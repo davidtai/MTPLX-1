@@ -7,6 +7,7 @@ Runs under pytest or ``python -m unittest``.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -1080,3 +1081,187 @@ class PrefillOnlyTest(unittest.TestCase):
         flags = window.control_flags(64)
         self.assertEqual(flags.count("--max-tokens"), 1)
         self.assertEqual(len(flags), len(window.CONTROL_FLAGS))
+
+
+class TestRawEnvironmentMtplxAllowlist(unittest.TestCase):
+    """MTPLX_* keys that are read straight off os.environ, not via the profile.
+
+    ``--candidate-env`` funnels into ``mtplx.profiles.apply_profile_env``, which
+    refuses any key outside MODEL_RUNTIME_ENV_OVERRIDE_KEYS; ``--env`` refuses
+    MTPLX_* outright.  A knob like MTPLX_CONTEXT_COPY_K -- read by
+    ``context_copy_block_k()`` with a bare ``os.environ.get`` -- was therefore
+    unreachable from the harness on BOTH channels.  A named allowlist opens the
+    raw channel for exactly those keys and keeps the loud refusal for the rest.
+    """
+
+    def test_allowlisted_keys_ride_the_raw_env_passthrough(self):
+        parsed = driver.parse_key_values(
+            ["MTPLX_CONTEXT_COPY_K=48", "MTPLX_SESSION_BANK_MAX_BYTES=4G"],
+            flag="--env",
+            require_mtplx=False,
+        )
+        self.assertEqual(
+            parsed,
+            {"MTPLX_CONTEXT_COPY_K": "48", "MTPLX_SESSION_BANK_MAX_BYTES": "4G"},
+        )
+
+    def test_unlisted_mtplx_keys_still_fail_loudly_on_raw_env(self):
+        with self.assertRaises(RuntimeError) as caught:
+            driver.parse_key_values(
+                ["MTPLX_QWEN4_M4_ROUTED_GLU=1"], flag="--env", require_mtplx=False
+            )
+        # The message names the allowlist so the fix is obvious.
+        self.assertIn("MTPLX_CONTEXT_COPY_K", str(caught.exception))
+        self.assertIn("--candidate-env", str(caught.exception))
+
+    def test_fable_diagnostic_namespace_still_rides_raw_env(self):
+        self.assertEqual(
+            driver.parse_key_values(
+                ["MTPLX_FABLE_COMPILED_COPY_ROUND=1"],
+                flag="--env",
+                require_mtplx=False,
+            ),
+            {"MTPLX_FABLE_COMPILED_COPY_ROUND": "1"},
+        )
+
+    def test_allowlisted_keys_are_refused_on_the_override_channel(self):
+        with self.assertRaises(RuntimeError) as caught:
+            driver.parse_key_values(
+                ["MTPLX_CONTEXT_COPY_K=48"],
+                flag="--candidate-env",
+                require_mtplx=True,
+            )
+        self.assertIn("--env", str(caught.exception))
+
+    def test_ordinary_override_keys_are_unaffected(self):
+        self.assertEqual(
+            driver.parse_key_values(
+                ["MTPLX_QWEN4_M4_ROUTED_GLU=1"],
+                flag="--candidate-env",
+                require_mtplx=True,
+            ),
+            {"MTPLX_QWEN4_M4_ROUTED_GLU": "1"},
+        )
+
+    def test_window_mirrors_the_driver_allowlist(self):
+        """Drift here would let the window plan an arm the driver refuses."""
+
+        self.assertEqual(window.RAW_ENV_MTPLX_KEYS, driver.RAW_ENV_MTPLX_KEYS)
+
+    def test_window_accepts_the_block_cap_recipe_on_extra_env(self):
+        window.check_env_settings(
+            ["MTPLX_CONTEXT_COPY_K=48"],
+            flag="--candidate-extra-env",
+            mtplx=False,
+        )
+
+    def test_window_refuses_a_mis_routed_override(self):
+        with self.assertRaises(ValueError) as caught:
+            window.check_env_settings(
+                ["MTPLX_QWEN4_M4_ROUTED_GLU=1"],
+                flag="--candidate-extra-env",
+                mtplx=False,
+            )
+        self.assertIn("--candidate-env", str(caught.exception))
+
+    def test_window_refuses_a_raw_key_on_the_override_channel(self):
+        with self.assertRaises(ValueError) as caught:
+            window.check_env_settings(
+                ["MTPLX_CONTEXT_COPY_K=48"], flag="--candidate-env", mtplx=True
+            )
+        self.assertIn("--candidate-extra-env", str(caught.exception))
+
+    def test_window_still_requires_the_mtplx_prefix_on_the_override_channel(self):
+        with self.assertRaises(ValueError):
+            window.check_env_settings(
+                ["MLX_MAX_OPS_PER_BUFFER=8"], flag="--candidate-env", mtplx=True
+            )
+
+    def test_arm_specification_rejects_a_mis_routed_key_before_the_gpu(self):
+        args = argparse.Namespace(
+            control_flag=[],
+            candidate_flag=[],
+            control_env=[],
+            candidate_env=["MTPLX_CONTEXT_COPY_K=48"],
+            control_extra_env=[],
+            candidate_extra_env=[],
+            max_tokens=None,
+            prefill_only=False,
+        )
+        with self.assertRaises(ValueError):
+            window.arm_specification(args)
+
+    def test_block_cap_recipe_reaches_the_driver_command_line(self):
+        """The documented recipe, end to end through the planner."""
+
+        args = argparse.Namespace(
+            control_flag=[],
+            candidate_flag=[],
+            control_env=[],
+            candidate_env=[],
+            control_extra_env=[],
+            candidate_extra_env=["MTPLX_CONTEXT_COPY_K=48"],
+            max_tokens=None,
+            prefill_only=False,
+        )
+        specs = window.arm_specification(args)
+        self.assertEqual(specs["A"]["extra_env"], [])
+        self.assertEqual(specs["B"]["extra_env"], ["MTPLX_CONTEXT_COPY_K=48"])
+        run = window.plan_runs([20260829], "AB", 900)[1]
+        argv = window.build_arm_argv(
+            run,
+            python="py",
+            driver="drv",
+            label_prefix="p",
+            receipt_dir="/tmp",
+            common_flags=[],
+            arm_flags=specs["B"]["flags"],
+            candidate_env=specs["B"]["candidate_env"],
+            extra_env=specs["B"]["extra_env"],
+        )
+        self.assertIn("--env", argv)
+        self.assertEqual(argv[argv.index("--env") + 1], "MTPLX_CONTEXT_COPY_K=48")
+        # ...and the driver accepts exactly that.
+        self.assertEqual(
+            driver.parse_key_values(
+                specs["B"]["extra_env"], flag="--env", require_mtplx=False
+            ),
+            {"MTPLX_CONTEXT_COPY_K": "48"},
+        )
+
+    def test_both_context_copy_caps_are_allowlisted(self):
+        """The documented recipe pairs them; refusing one would break it."""
+
+        self.assertEqual(
+            driver.parse_key_values(
+                [
+                    "MTPLX_CONTEXT_COPY_K=48",
+                    "MTPLX_CONTEXT_COPY_PROBATION_K=16",
+                ],
+                flag="--env",
+                require_mtplx=False,
+            ),
+            {
+                "MTPLX_CONTEXT_COPY_K": "48",
+                "MTPLX_CONTEXT_COPY_PROBATION_K": "16",
+            },
+        )
+
+    def test_every_allowlisted_key_names_its_reader(self):
+        """The receipt records where each key is read; drift would blank it."""
+
+        self.assertEqual(
+            set(driver.RAW_ENV_MTPLX_READERS), driver.RAW_ENV_MTPLX_KEYS
+        )
+        for key, reader in driver.RAW_ENV_MTPLX_READERS.items():
+            self.assertTrue(reader, key)
+
+    def test_compiled_copy_round_flag_rides_the_fable_namespace(self):
+        """MTPLX_FABLE_COMPILED_COPY_ROUND needs no allowlist entry."""
+
+        self.assertTrue(
+            driver.is_raw_env_mtplx_key("MTPLX_FABLE_COMPILED_COPY_ROUND")
+        )
+        self.assertNotIn(
+            "MTPLX_FABLE_COMPILED_COPY_ROUND", driver.RAW_ENV_MTPLX_KEYS
+        )

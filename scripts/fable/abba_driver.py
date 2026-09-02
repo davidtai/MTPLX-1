@@ -1065,6 +1065,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: MTPLX_* settings that are NOT model-runtime overrides and therefore ride the
+#: raw ``--env`` process-environment passthrough instead of ``--candidate-env``.
+#:
+#: ``--candidate-env`` funnels into ``apply_profile_env``, which refuses any key
+#: outside ``mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS``.  The keys below
+#: are read with a bare ``os.environ.get`` at their use site, never through the
+#: profile table, so that refusal would reject them even though they are
+#: perfectly legitimate knobs:
+#:
+#:   MTPLX_CONTEXT_COPY_K       mtplx/context_copy.py:context_copy_block_k()
+#:                              -- the copy-block cap (default 24)
+#:   MTPLX_CONTEXT_COPY_PROBATION_K
+#:                              mtplx/context_copy.py:context_copy_probation_k()
+#:                              -- the unproven-lane cap (default 8)
+#:   MTPLX_SESSION_BANK_MAX_BYTES
+#:                              mtplx/engine_session.py -- session bank ceiling
+#:
+#: This is an ALLOWLIST, not an escape hatch: every other MTPLX_* key on --env
+#: still fails loudly, so a typo or a genuine runtime override put on the wrong
+#: channel is caught before the model loads rather than being silently ignored.
+#: MTPLX_FABLE_* (the diagnostic namespace: census, probes) rides --env by
+#: prefix and needs no entry here.
+RAW_ENV_MTPLX_READERS = {
+    "MTPLX_CONTEXT_COPY_K": "mtplx/context_copy.py:context_copy_block_k",
+    "MTPLX_CONTEXT_COPY_PROBATION_K": (
+        "mtplx/context_copy.py:context_copy_probation_k"
+    ),
+    "MTPLX_SESSION_BANK_MAX_BYTES": "mtplx/engine_session.py",
+}
+RAW_ENV_MTPLX_KEYS = frozenset(RAW_ENV_MTPLX_READERS)
+
+
+def is_raw_env_mtplx_key(key: str) -> bool:
+    """Does this MTPLX_* key belong on the raw ``--env`` passthrough?"""
+
+    return key.startswith("MTPLX_FABLE_") or key in RAW_ENV_MTPLX_KEYS
+
+
 def parse_key_values(
     settings: list[str], *, flag: str, require_mtplx: bool
 ) -> dict[str, str]:
@@ -1074,16 +1112,24 @@ def parse_key_values(
             key, value = setting.split("=", 1)
         except ValueError as exc:
             raise RuntimeError(f"invalid {flag} value: {setting!r}") from exc
-        # MTPLX_FABLE_* is the diagnostic namespace (census etc.); it is not a
-        # model-runtime override, so it rides the raw --env passthrough.
-        is_mtplx = key.startswith("MTPLX_") and not key.startswith("MTPLX_FABLE_")
+        # MTPLX_FABLE_* is the diagnostic namespace (census etc.) and
+        # RAW_ENV_MTPLX_KEYS are read straight off os.environ; neither is a
+        # model-runtime override, so both ride the raw --env passthrough.
+        is_mtplx = key.startswith("MTPLX_") and not is_raw_env_mtplx_key(key)
         if not key or not value or key in parsed:
             raise RuntimeError(f"invalid or duplicate {flag} value: {setting!r}")
         if require_mtplx and not is_mtplx:
+            if key.startswith("MTPLX_"):
+                raise RuntimeError(
+                    f"{key} is a raw process-environment setting; put it on "
+                    f"--env, not {flag}: {setting!r}"
+                )
             raise RuntimeError(f"{flag} keys must start with MTPLX_: {setting!r}")
         if not require_mtplx and is_mtplx:
             raise RuntimeError(
-                f"MTPLX_* keys belong on --candidate-env, not {flag}: {setting!r}"
+                f"MTPLX_* keys belong on --candidate-env, not {flag} "
+                f"(raw-environment allowlist: "
+                f"{', '.join(sorted(RAW_ENV_MTPLX_KEYS))}): {setting!r}"
             )
         parsed[key] = value
     return parsed
@@ -1222,6 +1268,21 @@ def main() -> int:
         args.env, flag="--env", require_mtplx=False
     )
     os.environ.update(extra_environment)
+    # The allowlisted MTPLX_* raw-environment settings, recorded separately
+    # from the MLX_* passthrough because they change MTPLX behaviour and a
+    # reader comparing two arms must see them without diffing whole env dicts.
+    # Both the requested value and the value actually in force are captured:
+    # they differ if something later in setup overwrote the key, which is
+    # exactly the failure this field exists to expose.
+    process_environment_overrides = {
+        key: {
+            "requested": value,
+            "effective": os.environ.get(key),
+            "reader": RAW_ENV_MTPLX_READERS.get(key),
+        }
+        for key, value in sorted(extra_environment.items())
+        if key in RAW_ENV_MTPLX_KEYS
+    }
 
     family_overrides, candidate_environment = build_family_overrides(args)
 
@@ -1919,6 +1980,7 @@ def main() -> int:
         "draft_lm_head": draft_head,
         "candidate_environment": candidate_environment,
         "extra_environment": extra_environment,
+        "process_environment_overrides": process_environment_overrides,
         "paired_routed_glu": {
             "expected": candidate_environment.get("MTPLX_QWEN4_M4_ROUTED_GLU")
             == "1",

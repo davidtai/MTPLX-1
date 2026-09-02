@@ -141,6 +141,60 @@ routed-down-reduce routes, which still issue `mx.gather_qmm`; the retained
 paired-routed-GLU arm gathers inside its Metal kernels, so on that arm the gate
 is a no-op and the win needs the kernel-level equivalent.
 
+Three MTPLX settings are *neither* profile overrides *nor* `MTPLX_FABLE_*`:
+they are read with a bare `os.environ.get` at their use site, so
+`apply_profile_env` refuses them on `--candidate-env` while the raw `--env`
+namespace check used to refuse them too -- they were unreachable from the
+harness on both channels. They now ride the raw passthrough through a named
+allowlist (`abba_driver.RAW_ENV_MTPLX_KEYS`, mirrored in `abba_window.py` so a
+mis-routed key fails during planning rather than after an arm takes the GPU
+lock):
+
+| Key | Read by | Default |
+| --- | --- | --- |
+| `MTPLX_CONTEXT_COPY_K` | `mtplx/context_copy.py:context_copy_block_k()` | 24 |
+| `MTPLX_CONTEXT_COPY_PROBATION_K` | `mtplx/context_copy.py:context_copy_probation_k()` | 8 |
+| `MTPLX_SESSION_BANK_MAX_BYTES` | `mtplx/engine_session.py` | model-aware auto |
+
+Every *other* `MTPLX_*` key on `--*-extra-env` still fails loudly, and the two
+above are refused on `--*-env` with a message naming the right channel. Both
+are recorded in the arm receipt under `process_environment_overrides`, with the
+requested value alongside the value actually in force.
+
+### Recipe: open the context-copy block cap
+
+```
+    --candidate-extra-env MTPLX_CONTEXT_COPY_K=48
+```
+
+Context-copy (prompt-lookup) decoding is on by default and already supplies
+~9.4% of the output. `MTPLX_CONTEXT_COPY_K` caps how many verbatim tokens a
+round may propose; the confidence ladder (8/12/16/24/32) picks a rung under
+that cap, and `MTPLX_CONTEXT_COPY_PROBATION_K` (default 8) holds rounds short
+until the acceptance EMA proves the content pays. Six of twenty-one production
+rounds were cut by the cap with 4-8 more verbatim tokens still matching the
+prompt -- roughly 13 tokens per run left on the table, worth about +1% once
+those rows are cheaper than the M4 windows they replace.
+
+**Raising it is legal on the fixed-M4 lane.** K never enters the physical-M4
+graph: `install_fixed_m4` keys on `(4, hidden_variant, route_key, aux_contract)`
+and hard-codes four rows everywhere. The copy round is a *separate* forward, so
+changing K changes that forward's width and nothing about the M4 window.
+
+**With `MTPLX_FABLE_COMPILED_COPY_ROUND=1` it also sets the compiled copy
+round's traced width** to `1 + K` (49 rows at K=48). Two consequences worth
+planning for: the reserved KV window per round grows with K
+(`_transition_fixed_m4_generation(window=1+K)` runs at install, so the cost
+lands in setup rather than mid-decode), and every round pays that full width
+whatever rung the ladder drew -- padding is free of *correctness* cost but not
+of *time*, so a large K with a low hit rate is a worse trade than a large K with
+a high one. Judge it on `ms_per_m4_window_net` with a re-fitted
+`--copy-token-cost-s`, never on tok/s.
+
+Pair it with `--candidate-extra-env MTPLX_CONTEXT_COPY_PROBATION_K=16` to let
+proven lanes reach the wider cap sooner; run six seeds, because the effect sits
+near the corrected metric's 0.3-0.7% noise floor.
+
 `--candidate-env` keys must be members of
 `mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, or `apply_profile_env`
 refuses the arm with `runtime_env_overrides has unsupported key: <KEY>`. That
@@ -622,6 +676,15 @@ cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
 flag's gating and narrowing, every eligibility raise, CPU references of each
 Metal body pinned against the stock chain it replaces, and the dispatch-map
 receipt above.
+
+`tests/test_compiled_copy_round.py` is pure Python (`mtplx.context_copy`
+imports only `functools` and `os`): the read-once
+`MTPLX_FABLE_COMPILED_COPY_ROUND` flag, and the padding law that lets one
+traced graph serve every ladder rung -- exact width, prompt-continuation
+content, deterministic tail fill, and the invariant that the logical block is
+an untouched prefix of the padded rows, which is why acceptance cannot observe
+the padding. Compiled-vs-eager output equality is a device claim and needs a
+GPU window.
 
 ## TTFT screen (multi-turn coding-agent traffic)
 
