@@ -475,6 +475,57 @@ On this model the first 20 HumanEval problems all pass, so the smoke has no
 discriminating power at the top of the range — it proves the pipe works, not
 that the kernel is safe. Only the 164 run is a verdict.
 
+### micro_qsa_m4.py
+
+`MTPLX_FABLE_QSA_M4` collapses four QSA glue chains into Metal kernels
+(`kernels/qwen4_qsa_m4_indexer.py`, plus the transposed-key output of
+`kernels/qwen4_qsa_m4_fused_kv_gather.py`). Compiled-lane dispatch map per
+QSA layer, measured on the CPU stream by
+`tests/test_fable_qsa_m4.py::test_dispatch_map_before_after` against the
+op-diet-armed baseline:
+
+| sub-chain | stock | fused | |
+| --- | ---: | ---: | --- |
+| `_prepare_queries_eager` (RMSNorm + partial RoPE) | 12 | 1 | the SHIPPED prepare kernel; the fixed lane never called it |
+| `_extend_pooled_fixed` (bank row) | 24 | 4 | 1 kernel + the diet's `mx.slice_update` |
+| scoring epilogue (relu/sum/scale/mask/tie) | 9 | 1 | |
+| rows-gather token build | 18 | 1 | bit-exact, integers only |
+| **per QSA layer** | **63** | **7** | **-56, x12 layers = -672/cycle** |
+
+Untouched on purpose: the score GEMM, `mx.argpartition` (5 dispatches), and
+the fused K/V gather. The top-k is not fusable *equivalently* — `token_idx`
+carries `top_idx`'s ORDER into the gathered K/V rows, so any reordering
+changes the softmax denominator's and the PV product's accumulation order.
+
+`micro_qsa_m4.py` prices all five families (`prep`, `bank`, `score`, `tokens`,
+`gather`) over one verify cycle (12 QSA layers) at the production shapes,
+eager and under `mx.compile`, and prints max-abs-diff AND a differing-element
+count against each stock spelling. Four families must print `0 / 0`; `score`
+is the one place a nonzero count is a finding rather than a rounding
+allowance (its 4-term fp32 head sum assumes MLX's column reduce walks the axis
+in order).
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 1200 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_qsa_m4.py \
+    --reps 20 --out /tmp/micro-qsa-m4.json
+```
+
+Adoption bar, per family: the fused spelling under stock in compiled ms/cycle,
+`prep`/`bank`/`tokens`/`gather` printing 0 differing elements, and `score`
+printing 0 as well (a nonzero count there means MLX's reduce order is not what
+the kernel assumes and the kernel must change, not the bar). Then confirm on
+the verifier with an ABBA arm carrying
+`--candidate-env MTPLX_FABLE_QSA_M4=1 --candidate-env MTPLX_QSA_M4_FUSED_KV_GATHER=1`;
+the gate is acceptance parity. Arming `MTPLX_FABLE_QSA_M4` without the fused
+K/V gather RAISES at cache install rather than running a slower stock lane.
+
 ## Tests
 
 ```
@@ -484,3 +535,8 @@ cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
 
 (`pytest` is not installed in this venv; the test file also runs under
 `pytest tests/test_fable_abba_window.py -q` where it is available.)
+
+`tests/test_fable_qsa_m4.py` runs entirely on the CPU stream (59 cases): the
+flag's gating and narrowing, every eligibility raise, CPU references of each
+Metal body pinned against the stock chain it replaces, and the dispatch-map
+receipt above.

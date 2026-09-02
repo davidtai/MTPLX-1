@@ -59,7 +59,12 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
-from mtplx.runtime_options import fable_hc_m4_enabled, fable_opdiet_enabled
+from mtplx.runtime_options import (
+    FABLE_QSA_M4_ROWS,
+    fable_hc_m4_enabled,
+    fable_opdiet_enabled,
+    fable_qsa_m4_enabled,
+)
 
 
 @dataclass
@@ -2085,9 +2090,11 @@ class QSAIndexer(nn.Module):
             expected_ndim=expected_ndim,
         )
 
-    def _extend_pooled(self, cache: QSACache, total: int) -> Optional[mx.array]:
+    def _extend_pooled(
+        self, cache: QSACache, total: int, *, fused_m4: bool = False
+    ) -> Optional[mx.array]:
         if getattr(cache, "fixed_capacity", False):
-            return self._extend_pooled_fixed(cache, total)
+            return self._extend_pooled_fixed(cache, total, fused_m4=fused_m4)
         nb_total = total // self.ratio
         nb_old = min(cache.pooled_len, nb_total)
         if nb_total > nb_old:
@@ -2117,7 +2124,9 @@ class QSAIndexer(nn.Module):
             return None
         return cache.pooled[:, :nb_total, :]
 
-    def _extend_pooled_fixed(self, cache: QSACache, total) -> mx.array:
+    def _extend_pooled_fixed(
+        self, cache: QSACache, total, *, fused_m4: bool = False
+    ) -> mx.array:
         """Update only newly completed blocks in a fixed QSA bank.
 
         Verify width is static at trace time.  At the production M4/ratio-4
@@ -2130,6 +2139,30 @@ class QSAIndexer(nn.Module):
         max_new = max(1, (step_rows + self.ratio - 1) // self.ratio)
         pooled = cache.pooled
         pooled_capacity = int(pooled.shape[1])
+        if fused_m4:
+            # MTPLX_FABLE_QSA_M4: everything AROUND the bank write -- the
+            # dynamic raw-key slice, the fp32 mean, the RMSNorm, the RoPE
+            # table, the rotation, the old-row read, the select and the
+            # min/floor scalar chain -- collapses into one dispatch that
+            # returns the row to store and the row to store it at. The write
+            # itself stays exactly what the op diet's ``bank`` item made it:
+            # one contiguous mx.slice_update over a held state leaf.
+            from mtplx.kernels.qwen4_qsa_m4_indexer import qsa_m4_pooled_row
+
+            merged, safe_block = qsa_m4_pooled_row(
+                cache.raw_keys,
+                pooled,
+                self.k_layernorm.weight,
+                self._inv_freq,
+                cache.offset,
+                compress_ratio=self.ratio,
+                step_rows=step_rows,
+                eps=self.rms_norm_eps,
+                attention_scaling=self._rope_attention_scaling,
+            )
+            pooled = mx.slice_update(pooled, merged, safe_block, axes=(1,))
+            cache.pooled = pooled
+            return pooled
         for rel in range(max_new):
             block = nb_old + rel
             safe_block = mx.minimum(
@@ -2239,6 +2272,153 @@ class QSAIndexer(nn.Module):
             mx.eval(top_t)
             parts.append(top_t)
         return mx.concatenate(parts, axis=0)
+
+    # ------------------------------------------------------------------
+    # MTPLX_FABLE_QSA_M4 -- reduced-dispatch fixed-M4 indexer lane
+    # ------------------------------------------------------------------
+
+    def _m4_route(self, cache: QSACache, rows: int) -> bool:
+        """True when this forward takes the fused fixed-M4 indexer lane.
+
+        Three independent conditions, all decided before any work is issued:
+        the process armed the flag; the cache passed the CONSTRUCTION-time
+        geometry gate in graphbank (which raises rather than clearing itself);
+        and this forward is the verify width the kernels are wired for. The
+        last one is a narrowing, not a failure -- a fixed cache also serves
+        the S=1 D3 route, which keeps the stock chain.
+        """
+
+        if not fable_qsa_m4_enabled():
+            return False
+        if int(getattr(cache, "fable_qsa_m4_rows", 0)) <= 0:
+            return False
+        return int(rows) == int(getattr(cache, "fable_qsa_m4_rows", 0))
+
+    def _require_m4_contract(self, cache: QSACache, rows: int) -> None:
+        """Validate the module half of the lane.  Raises; never returns False.
+
+        graphbank owns the cache half (fixed-M4 verifier, ratio 4, bf16
+        [1,2,cap,256] KV, the fused K/V gather).  This is the indexer's own
+        contract, and an armed flag on a pack that does not meet it must fail
+        loudly at the call site rather than quietly running the stock chain.
+        """
+
+        from mtplx.kernels.qwen4_qsa_m4_indexer import (
+            MAX_EXACT_HEAD_DIM,
+            check_pooled_row_shapes,
+        )
+
+        if int(rows) != FABLE_QSA_M4_ROWS:
+            raise RuntimeError(
+                f"MTPLX_FABLE_QSA_M4 is wired for {FABLE_QSA_M4_ROWS} verify "
+                f"rows; got {rows} (routing should have narrowed this away)"
+            )
+        if self.kv_heads != 1:
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_M4 is wired for a single indexer KV head; got "
+                f"{self.kv_heads}"
+            )
+        if not (0 < self.head_dim <= MAX_EXACT_HEAD_DIM):
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_M4 reproduces MLX's rms_single_row reduction "
+                f"only for head_dim <= {MAX_EXACT_HEAD_DIM}; got {self.head_dim}"
+            )
+        step_rows = int(getattr(cache, "_last_write_rows", rows))
+        if (step_rows + self.ratio - 1) // self.ratio != 1:
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_M4's pooled-row kernel completes at most one "
+                f"block per step; {step_rows} rows at ratio {self.ratio} "
+                "completes more"
+            )
+        pooled = cache.pooled
+        if pooled is None or cache.raw_keys is None:
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_M4 requires a materialized fixed QSA bank"
+            )
+        if int(pooled.shape[1]) < self.block_topk:
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_M4 requires a pooled bank at least "
+                f"block_topk={self.block_topk} rows deep; got "
+                f"{int(pooled.shape[1])}"
+            )
+        if self.q_layernorm.weight.dtype != pooled.dtype:
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_M4's fused query preparation is exact only "
+                "when the query norm weight matches the activation dtype; got "
+                f"{self.q_layernorm.weight.dtype} and {pooled.dtype}"
+            )
+        # Raises on any pooled/raw/norm/inv_freq mismatch.
+        check_pooled_row_shapes(
+            cache.raw_keys,
+            pooled,
+            self.k_layernorm.weight,
+            self._inv_freq,
+            compress_ratio=self.ratio,
+        )
+
+    def _prepare_queries_m4(self, q: mx.array, pos_start) -> mx.array:
+        """RMSNorm + partial RoPE in one dispatch, instead of twelve.
+
+        This is the SHIPPED ``qsa_indexer_prepare_queries_metal``, whose
+        bit-exactness against ``_prepare_queries_eager`` is pinned for
+        bf16/f16 in tests/test_qsa_indexer_prepare_metal.py.  The fixed lane
+        skipped it only because ``_prepare_queries`` gates on
+        MTPLX_QSA_FUSED_INDEXER; the kernel itself already accepts a tensor
+        ``pos_start``, which is exactly what a tensor-offset cache needs.
+        """
+
+        from mtplx.kernels.qsa_indexer_prepare import (
+            qsa_indexer_prepare_queries_metal,
+        )
+
+        return qsa_indexer_prepare_queries_metal(
+            q,
+            self.q_layernorm.weight,
+            self._inv_freq,
+            pos_start=pos_start,
+            eps=self.rms_norm_eps,
+            attention_scaling=self._rope_attention_scaling,
+        )
+
+    def _select_m4(
+        self,
+        q: mx.array,
+        pos_start,
+        cache: QSACache,
+        pooled: mx.array,
+    ):
+        """Fixed-M4 scoring + selection with the glue folded into 2 kernels.
+
+        The score GEMM and ``mx.argpartition`` are untouched -- see the module
+        docstring of kernels/qwen4_qsa_m4_indexer.py for why the top-k cannot
+        be fused without changing attention arithmetic.  What collapses is the
+        chain on either side of it: relu / head-sum / scale / validity mask /
+        tie-break before, and take_along_axis / repeat / two concatenates /
+        where after.
+        """
+
+        from mtplx.kernels.qwen4_qsa_m4_indexer import (
+            qsa_m4_index_scores,
+            qsa_m4_row_tokens,
+        )
+
+        nb_total = int(pooled.shape[1])
+        k_eff = min(self.block_topk, nb_total)
+        pooled_t = cache.pooled_f32_view(nb_total)
+        scores = mx.matmul(q.astype(mx.float32), pooled_t)  # [1, S, H, nb]
+        masked = qsa_m4_index_scores(
+            scores,
+            pos_start,
+            compress_ratio=self.ratio,
+            head_dim=self.head_dim,
+        )
+        top_idx = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)[
+            :, nb_total - k_eff :
+        ]
+        token_idx, token_ok = qsa_m4_row_tokens(
+            top_idx, pos_start, compress_ratio=self.ratio
+        )
+        return ("gather_rows", token_idx, token_ok)
 
     def _select_eager(
         self,
@@ -2969,17 +3149,24 @@ class QSAIndexer(nn.Module):
         q, k = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
         q = q.reshape(B, S, self.n_heads, self.head_dim)
         k = k.reshape(B, S, self.head_dim)
-        q = (
-            self._prepare_queries_eager(q, pos_start)
-            if fixed_capacity
-            else self._prepare_queries(q, pos_start)
-        )
-
-        cache.write_raw(k)
         if fixed_capacity:
             cache._last_write_rows = int(S)
-        pooled = self._extend_pooled(cache, T)
+        fused_m4 = fixed_capacity and self._m4_route(cache, S)
+        if fused_m4:
+            # Raises on a module/pack mismatch -- an armed flag never reverts
+            # to the stock chain behind a performance mystery.
+            self._require_m4_contract(cache, S)
+            q = self._prepare_queries_m4(q, pos_start)
+        elif fixed_capacity:
+            q = self._prepare_queries_eager(q, pos_start)
+        else:
+            q = self._prepare_queries(q, pos_start)
+
+        cache.write_raw(k)
+        pooled = self._extend_pooled(cache, T, fused_m4=fused_m4)
         nb_total = 0 if pooled is None else pooled.shape[1]
+        if fused_m4:
+            return self._select_m4(q, pos_start, cache, pooled)
 
         # Per-query complete-block counts. If every visible prefix fits inside
         # the budget the selection is the full causal mask — skip the work.
@@ -3125,19 +3312,30 @@ def _qsa_rows_gather_attention(
     H_kv = int(k.shape[1])
     K = int(token_idx.shape[-1])
     k_sel, v_sel = gather_kv(k, v, token_idx)
+    # A gather bound with transposed_keys already emitted K as
+    # [1, H_kv, S, D, K] -- the score operand's layout. The stock
+    # swapaxes+reshape below is not a free view on Metal (the GEMM
+    # materializes it: one 8.4 MB copy per QSA layer), so when the gather
+    # did the transpose at the source all that is left is expand_dims.
+    keys_transposed = bool(getattr(gather_kv, "keys_transposed", False))
     neg = mx.array(-mx.inf, dtype=mx.float32)
     if H != H_kv:
         rep = H // H_kv
         q_view = q.reshape(1, H_kv, rep, S, 1, D)
-        k_view = k_sel.swapaxes(-1, -2).reshape(1, H_kv, 1, S, D, K)
+        k_view = (
+            mx.expand_dims(k_sel, 2)
+            if keys_transposed
+            else k_sel.swapaxes(-1, -2).reshape(1, H_kv, 1, S, D, K)
+        )
         scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
         scores = mx.where(token_ok[None, None, None], scores, neg)
         probs = mx.softmax(scores, axis=-1).astype(q.dtype)
         v_view = v_sel.reshape(1, H_kv, 1, S, K, D)
         out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
         return out.reshape(1, H, S, D)
+    k_scores = k_sel if keys_transposed else k_sel.swapaxes(-1, -2)
     scores = (
-        mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(mx.float32)
+        mx.matmul(q[..., None, :], k_scores).squeeze(-2).astype(mx.float32)
         * scale
     )
     scores = mx.where(token_ok[None, None], scores, neg)
