@@ -507,6 +507,17 @@ def stats_receipt(
     }
 
 
+def _ple_prefill_lookahead_counters() -> dict[str, int]:
+    """Engagement counters for the PLE prefill lookahead lane (may be empty)."""
+
+    try:
+        from mtplx.ple_prefill_lookahead import snapshot_counters
+
+        return snapshot_counters()
+    except Exception:
+        return {}
+
+
 def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
     """PLE hot-row cache counters, as injected by pr391_current_profile_launcher."""
 
@@ -525,6 +536,11 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "row_bytes": int(sidecar._hot_row_bytes),
             "capacity_bytes": int(sidecar._hot_cap_rows * sidecar._hot_row_bytes),
             "prefetch_batches": int(sidecar.prefetch_batches),
+            # Worker-thread warm batches (MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD).
+            # Counted apart from prefetch_batches so the candidate arm's
+            # engagement is readable without reinterpreting the control's.
+            "lookahead_batches": int(getattr(sidecar, "lookahead_batches", 0)),
+            "prefill_lookahead": _ple_prefill_lookahead_counters(),
         }
     except Exception as error:  # diagnostic field, never the measurement
         print(
