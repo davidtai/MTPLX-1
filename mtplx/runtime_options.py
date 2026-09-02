@@ -172,6 +172,32 @@ def fable_qsa_m4_enabled() -> bool:
     return _FABLE_QSA_M4
 
 
+#: Transposed-key output for the fused QSA K/V gather.
+#:
+#: SEPARATE from MTPLX_FABLE_QSA_M4 on purpose, and off by default, because
+#: the GPU microbench (2026-09-01, compiled lane, 12 QSA layers) falsified it
+#: on BOTH axes while the other four rewrites passed on both:
+#:
+#:   prep   0.557 -> 0.199 ms (-64%)   0 differing elements
+#:   bank   1.153 -> 0.251 ms (-78%)   0 differing elements
+#:   score  0.500 -> 0.283 ms (-44%)   0 differing elements
+#:   tokens 0.628 -> 0.205 ms (-67%)   0 differing elements
+#:   gather 1.501 -> 1.657 ms (+10%)   104 differing elements, max abs 0.125
+#:
+#: So ``MTPLX_FABLE_QSA_M4=1`` alone is the bit-exact, uniformly faster set.
+#: This flag keeps the transposed gather runnable as its own A/B arm (the
+#: reason it still exists: see mtplx/kernels/qwen4_qsa_m4_fused_kv_gather.py
+#: for why the layout changes the score GEMM's accumulation order and why the
+#: tiled transpose is slower than the copy it removes).
+_FABLE_QSA_M4_KT = env_bool("MTPLX_FABLE_QSA_M4_KT", default=False)
+
+
+def fable_qsa_m4_kt_enabled() -> bool:
+    """True when ``MTPLX_FABLE_QSA_M4_KT`` armed this process at import."""
+
+    return _FABLE_QSA_M4_KT
+
+
 @dataclass(frozen=True)
 class ResolvedAPIKey:
     value: str | None

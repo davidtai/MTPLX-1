@@ -64,6 +64,16 @@ accumulation order -- depend on an unspecified detail of MLX's multi-block
 partition.  Reordering the selected set is a rounding-class change to the
 attention output for a 5-dispatch saving, so the stock selector stays.
 
+NOT PART OF THIS FLAG
+---------------------
+The transposed-key output of the fused K/V gather was the byte-side idea of
+the same investigation and is gated separately as ``MTPLX_FABLE_QSA_M4_KT``:
+the GPU microbench measured it 10% SLOWER and not bit-exact (the score GEMM
+takes a different accumulation path for a natively-transposed B operand).
+``MTPLX_FABLE_QSA_M4=1`` alone is the bit-exact set, and every one of its four
+rewrites measured faster: prep -64%, bank -78%, score -44%, tokens -67%
+(2026-09-01, compiled lane, 12 QSA layers, 0 differing elements each).
+
 No silent fallback: every entry point validates and RAISES.  The model's
 construction-time gate decides whether this lane is eligible at all.
 """

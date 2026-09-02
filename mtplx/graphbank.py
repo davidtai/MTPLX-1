@@ -21,7 +21,11 @@ import mlx.core as mx
 from .attention_context import attention_phase
 from .fable_expert_census import census as _expert_census
 from .gdn_capture import resolve_gdn_capture_backend
-from .runtime_options import FABLE_QSA_M4_ROWS, fable_qsa_m4_enabled
+from .runtime_options import (
+    FABLE_QSA_M4_ROWS,
+    fable_qsa_m4_enabled,
+    fable_qsa_m4_kt_enabled,
+)
 
 
 def _prepare_fixed_m4_materialized(
@@ -698,6 +702,7 @@ class TensorOffsetQSACache:
         rows_gather_min_context: int = 0,
         fused_rows_gather_kv_m4: bool = False,
         fable_qsa_m4: bool = False,
+        fable_qsa_m4_kt: bool = False,
     ) -> None:
         self.kv = kv
         self.aux = [raw_keys, pooled]
@@ -715,6 +720,10 @@ class TensorOffsetQSACache:
         # next about which QSA chain it contains.
         self.fable_qsa_m4 = bool(fable_qsa_m4)
         self.fable_qsa_m4_rows = FABLE_QSA_M4_ROWS if fable_qsa_m4 else 0
+        # Independent of the four bit-exact rewrites above: the transposed
+        # key layout was measured slower AND not bit-exact, so it is its own
+        # arm rather than a rider on the lane.
+        self.fable_qsa_m4_kt = bool(fable_qsa_m4_kt)
 
     @staticmethod
     def _fixed_bank(value: mx.array, capacity: int, axis: int) -> mx.array:
@@ -765,15 +774,17 @@ class TensorOffsetQSACache:
         rows_gather_kv_m4 = entry.rows_gather_kv_m4
         fused_rows_gather_kv_m4 = _env_enabled("MTPLX_QSA_M4_FUSED_KV_GATHER")
         fable_qsa_m4 = fable_qsa_m4_enabled()
+        fable_qsa_m4_kt = fable_qsa_m4_kt_enabled()
+        if fable_qsa_m4_kt and not fused_rows_gather_kv_m4:
+            # No silent fallback: there is no binding to transpose without it.
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_M4_KT requires MTPLX_QSA_M4_FUSED_KV_GATHER: "
+                "the transposed key layout is an output mode of the fused "
+                "K/V gather, not a standalone lane"
+            )
         if fable_qsa_m4:
             # No silent fallback: an armed flag that cannot apply is a
             # configuration error, not a quiet revert to the stock chain.
-            if not fused_rows_gather_kv_m4:
-                raise RuntimeError(
-                    "MTPLX_FABLE_QSA_M4 requires MTPLX_QSA_M4_FUSED_KV_GATHER: "
-                    "the lane hands attention a transposed-key gather, which "
-                    "only the fused K/V gather emits"
-                )
             if ratio != 4:
                 raise RuntimeError(
                     "MTPLX_FABLE_QSA_M4 is wired for the ratio-4 QSA lane; got "
@@ -815,7 +826,7 @@ class TensorOffsetQSACache:
 
                 rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
                     capacity=raw_capacity,
-                    transposed_keys=fable_qsa_m4,
+                    transposed_keys=fable_qsa_m4_kt,
                 )
 
         return cls(
@@ -829,6 +840,7 @@ class TensorOffsetQSACache:
             rows_gather_min_context=rows_gather_min_context,
             fused_rows_gather_kv_m4=fused_rows_gather_kv_m4,
             fable_qsa_m4=fable_qsa_m4,
+            fable_qsa_m4_kt=fable_qsa_m4_kt,
         )
 
     @property
@@ -877,7 +889,7 @@ class TensorOffsetQSACache:
 
             self.rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
                 capacity=raw_capacity,
-                transposed_keys=self.fable_qsa_m4,
+                transposed_keys=self.fable_qsa_m4_kt,
             )
         return True
 
@@ -898,7 +910,7 @@ class TensorOffsetQSACache:
 
             self.rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
                 capacity=self.capacity,
-                transposed_keys=self.fable_qsa_m4,
+                transposed_keys=self.fable_qsa_m4_kt,
             )
         return True
 
@@ -3563,9 +3575,10 @@ class CompiledVerifyBank:
                     rows_gather_enabled=entry.rows_gather_enabled,
                     rows_gather_min_context=entry.rows_gather_min_context,
                     fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
-                    # A twin that dropped this would silently revert to the
-                    # stock QSA chain -- the armed-but-inert failure mode.
+                    # A twin that dropped these would silently revert to
+                    # the stock QSA chain -- the armed-but-inert failure mode.
                     fable_qsa_m4=entry.fable_qsa_m4,
+                    fable_qsa_m4_kt=entry.fable_qsa_m4_kt,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
@@ -4109,9 +4122,10 @@ class CompiledVerifyBank:
                     rows_gather_enabled=entry.rows_gather_enabled,
                     rows_gather_min_context=entry.rows_gather_min_context,
                     fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
-                    # A twin that dropped this would silently revert to the
-                    # stock QSA chain -- the armed-but-inert failure mode.
+                    # A twin that dropped these would silently revert to
+                    # the stock QSA chain -- the armed-but-inert failure mode.
                     fable_qsa_m4=entry.fable_qsa_m4,
+                    fable_qsa_m4_kt=entry.fable_qsa_m4_kt,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):

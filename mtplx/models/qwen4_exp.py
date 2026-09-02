@@ -3312,11 +3312,13 @@ def _qsa_rows_gather_attention(
     H_kv = int(k.shape[1])
     K = int(token_idx.shape[-1])
     k_sel, v_sel = gather_kv(k, v, token_idx)
-    # A gather bound with transposed_keys already emitted K as
-    # [1, H_kv, S, D, K] -- the score operand's layout. The stock
-    # swapaxes+reshape below is not a free view on Metal (the GEMM
-    # materializes it: one 8.4 MB copy per QSA layer), so when the gather
-    # did the transpose at the source all that is left is expand_dims.
+    # A gather bound with transposed_keys (MTPLX_FABLE_QSA_M4_KT, off by
+    # default) already emitted K as [1, H_kv, S, D, K] -- the score operand's
+    # layout -- so all that is left here is expand_dims. That removes the
+    # 8.4 MB copy the GEMM makes of the swapaxes view below, and MEASURED
+    # SLOWER anyway, and not bit-exact: the two layouts take different
+    # accumulation paths through the score GEMM. See
+    # kernels/qwen4_qsa_m4_fused_kv_gather.py.
     keys_transposed = bool(getattr(gather_kv, "keys_transposed", False))
     neg = mx.array(-mx.inf, dtype=mx.float32)
     if H != H_kv:

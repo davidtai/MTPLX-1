@@ -562,21 +562,22 @@ class _EagerQSAEntry:
         self.rows_gather_kv_m4 = None
 
 
-def _install(monkeypatch, *, armed, fused_gather, ratio=4):
+def _install(monkeypatch, *, armed, fused_gather, kt=False, ratio=4):
     import mtplx.graphbank as graphbank
 
     monkeypatch.setattr(graphbank, "fable_qsa_m4_enabled", lambda: armed)
+    monkeypatch.setattr(graphbank, "fable_qsa_m4_kt_enabled", lambda: kt)
     monkeypatch.setattr(
         graphbank, "_env_enabled",
         lambda name: fused_gather if name == "MTPLX_QSA_M4_FUSED_KV_GATHER" else True,
     )
+    # The pre-existing fused-gather gate also demands the rows-gather lane.
+    # Enable it, but keep its context threshold out of reach so no gather
+    # kernel is actually bound (binding needs a >=16K capacity).
+    monkeypatch.setattr(qwen4_exp, "_qsa_gather_enabled", lambda: True)
+    monkeypatch.setattr(qwen4_exp, "_qsa_gather_min_context", lambda: 1 << 30)
     entry = _EagerQSAEntry(ratio=ratio)
     return graphbank.TensorOffsetQSACache.from_qsa_cache(entry, reserve_tokens=1024)
-
-
-def test_graphbank_gate_refuses_an_armed_flag_without_the_fused_gather(monkeypatch):
-    with pytest.raises(RuntimeError, match="MTPLX_QSA_M4_FUSED_KV_GATHER"):
-        _install(monkeypatch, armed=True, fused_gather=False)
 
 
 def test_graphbank_gate_refuses_a_non_ratio_4_lane(monkeypatch):
@@ -588,6 +589,40 @@ def test_graphbank_leaves_the_lane_dark_when_the_flag_is_off(monkeypatch):
     cache = _install(monkeypatch, armed=False, fused_gather=False)
     assert cache.fable_qsa_m4 is False
     assert cache.fable_qsa_m4_rows == 0
+    assert cache.fable_qsa_m4_kt is False
+
+
+def test_the_lane_does_not_require_the_fused_gather(monkeypatch):
+    """The four bit-exact rewrites are independent of the K/V gather.
+
+    Only the (rejected, separately flagged) transposed key LAYOUT needs it;
+    the stock two-take gather serves the lane's token lists unchanged.
+    """
+
+    cache = _install(monkeypatch, armed=True, fused_gather=False)
+    assert cache.fable_qsa_m4 is True
+    assert cache.fable_qsa_m4_rows == 4
+    assert cache.fable_qsa_m4_kt is False
+
+
+def test_kt_flag_is_independent_of_the_lane(monkeypatch):
+    cache = _install(monkeypatch, armed=False, fused_gather=True, kt=True)
+    assert cache.fable_qsa_m4 is False
+    assert cache.fable_qsa_m4_kt is True
+
+
+def test_kt_flag_refuses_to_arm_without_the_fused_gather(monkeypatch):
+    with pytest.raises(RuntimeError, match="MTPLX_QSA_M4_FUSED_KV_GATHER"):
+        _install(monkeypatch, armed=True, fused_gather=False, kt=True)
+
+
+def test_kt_flag_defaults_off_and_is_read_once(monkeypatch):
+    assert runtime_options.fable_qsa_m4_kt_enabled() is runtime_options._FABLE_QSA_M4_KT
+    assert (
+        runtime_options.env_bool("MTPLX_FABLE_QSA_M4_KT", default=False) is False
+    )
+    monkeypatch.setenv("MTPLX_FABLE_QSA_M4_KT", "1")
+    assert runtime_options.env_bool("MTPLX_FABLE_QSA_M4_KT", default=False) is True
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +644,33 @@ def test_gather_binding_advertises_its_key_layout():
     assert g._DIM_TILES * g._TILE == g._HEAD_DIM
 
 
-def test_rows_gather_attention_is_identical_under_either_key_layout():
-    """The transposed gather is data movement only: same numbers, same order."""
+def test_transposed_gather_carries_identical_key_bytes():
+    """The gather's own contract: the two layouts hold the same bf16 bits.
+
+    This is all the KERNEL claims, and it is where the claim stops. The
+    microbench measured 104 differing elements after the SCORE GEMM
+    (2026-09-01, max abs 0.125 = one bf16 ulp at a score in [16,32)), because
+    MLX picks a different accumulation path for a natively-transposed B
+    operand than for a swapaxes view it has just made contiguous. That is not
+    visible from here -- the CPU stream runs one matmul path for both -- so
+    this test pins the data movement and the docstring owns the rest.
+    """
+
+    rows, h_kv, head_dim, sel = 4, 2, 8, 6
+    mx.random.seed(11)
+    k = mx.random.normal((1, h_kv, 32, head_dim)).astype(mx.bfloat16)
+    v = mx.random.normal((1, h_kv, 32, head_dim)).astype(mx.bfloat16)
+    token_idx = (mx.random.uniform(shape=(rows, sel)) * 32).astype(mx.int32)
+    mx.eval(k, v, token_idx)
+    k_sel, v_sel = qwen4_exp._qsa_stock_rows_gather_kv(k, v, token_idx)
+    k_t = mx.contiguous(mx.swapaxes(k_sel, -1, -2))
+    mx.eval(k_sel, v_sel, k_t)
+    assert tuple(k_t.shape) == (1, h_kv, rows, head_dim, sel)
+    assert mx.array_equal(mx.swapaxes(k_t, -1, -2), k_sel).item()
+
+
+def test_rows_gather_attention_reads_the_layout_off_the_binding():
+    """Either layout reaches the same expression; only the view differs."""
 
     rows, h_kv, rep, head_dim, sel = 4, 2, 3, 8, 6
     heads = h_kv * rep
@@ -639,6 +699,9 @@ def test_rows_gather_attention_is_identical_under_either_key_layout():
     )
     mx.eval(a, b)
     assert a.shape == b.shape
+    # Equal here because the CPU stream runs one matmul path for both; on
+    # Metal the operand layout selects different fp32 tiling, which is the
+    # measured 1-ulp difference the KT flag is quarantined for.
     assert mx.array_equal(a, b).item()
 
 

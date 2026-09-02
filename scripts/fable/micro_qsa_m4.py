@@ -42,6 +42,25 @@ paths, imported, not copied, so they cannot drift):
                        k.swapaxes(-1,-2).reshape(...) for the score GEMM
           gather_kt    the same gather emitting K as [1,2,4,256,2052], then
                        mx.expand_dims -- the transpose happens at the source
+                       [REJECTED, kept as its own arm: MTPLX_FABLE_QSA_M4_KT]
+
+MEASURED 2026-09-01, compiled lane, one verify cycle (12 QSA layers):
+
+    prep    0.557 -> 0.199 ms  (-64%)    0 differing elements
+    bank    1.153 -> 0.251 ms  (-78%)    0 differing elements
+    score   0.500 -> 0.283 ms  (-44%)    0 differing elements
+    tokens  0.628 -> 0.205 ms  (-67%)    0 differing elements
+    gather  1.501 -> 1.657 ms  (+10%)  104 differing elements, max abs 0.125
+
+The first four ship under MTPLX_FABLE_QSA_M4 and are bit-exact. ``gather_kt``
+lost on both axes and is quarantined behind MTPLX_FABLE_QSA_M4_KT; it stays in
+this bench as the rejected alternative, the way ``bank_select`` stays in
+micro_opdiet.py. Its 0.125 is exactly one bf16 ulp at a score magnitude in
+[16,32) -- the signature of an fp32 reassociation in the score GEMM, which
+takes a different accumulation path for a natively-transposed B operand than
+for a swapaxes view it has just made contiguous. See
+mtplx/kernels/qwen4_qsa_m4_fused_kv_gather.py for the full account, including
+why the 32x32 tiled transpose is slower than the MLX copy it removes.
 
 Both lanes are timed: eager, and wrapped in ``mx.compile``.  **The compiled
 number is the one that matters** -- the production verify step is one
@@ -49,11 +68,12 @@ mx.compile'd graph, and MLX only fuses elementwise chains under compile, so
 the eager lane systematically flatters the stock spellings.
 
 Numerics: every family prints max-abs-diff against its stock spelling AND the
-count of differing elements.  Four of the five must print 0/0.  ``score`` is
-the one place where a nonzero count would be informative rather than a bug:
-its 4-term fp32 head sum assumes MLX's column reduce walks the axis in order
-(see kernels/qwen4_qsa_m4_indexer.py).  Treat a nonzero ``score`` count as a
-finding, not a rounding allowance.
+count of differing elements.  The four shipped families must print 0/0 and did
+on 2026-09-01 -- including ``score``, whose 4-term fp32 head sum assumes MLX's
+column reduce walks the axis in order (see kernels/qwen4_qsa_m4_indexer.py); a
+nonzero count there is a finding, not a rounding allowance.  ``gather_kt`` is
+the one family expected to print nonzero, and that is why it is not in the
+shipped flag.
 
 Per-layer input leaves are DISTINCT on purpose: mx.compile runs a
 common-subexpression pass, and 12 layers fed identical arrays would collapse

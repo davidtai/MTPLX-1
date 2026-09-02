@@ -1,25 +1,73 @@
 """One-dispatch K/V row gather for the Qwen4 fixed-M4 QSA verifier.
 
-Two output layouts, same gathered values:
+Two output layouts, same gathered VALUES:
 
-``transposed_keys=False`` (default) emits K and V both as
-``[1, H_KV, ROWS, SELECTED, HEAD_DIM]`` -- the layout the stock rows-gather
+``transposed_keys=False`` (default, and the one that ships) emits K and V both
+as ``[1, H_KV, ROWS, SELECTED, HEAD_DIM]`` -- the layout the stock rows-gather
 attention takes, which then builds its score operand with
-``k_sel.swapaxes(-1, -2).reshape(...)``.  On Metal that view is not a legal
-GEMM operand, so MLX materializes it: one 8.4 MB transposed copy per QSA
-layer, 12 per verify cycle (the census counts it at qwen4_exp.py:2842).
+``k_sel.swapaxes(-1, -2).reshape(...)``.
 
-``transposed_keys=True`` (MTPLX_FABLE_QSA_M4) emits K as
-``[1, H_KV, ROWS, HEAD_DIM, SELECTED]`` instead.  The gather is already
-writing those bytes, so the transpose is free at the source and the copy
-disappears; the caller then needs only ``mx.expand_dims`` to reach the score
-operand's shape.  Bit-exact -- pure data movement, no arithmetic.
+``transposed_keys=True`` (``MTPLX_FABLE_QSA_M4_KT``, default OFF) emits K as
+``[1, H_KV, ROWS, HEAD_DIM, SELECTED]`` instead, so the caller reaches the
+score operand with ``mx.expand_dims`` and the transposed view is never
+materialized.
 
-The transposed write is staged through threadgroup memory so both the read
-of ``keys`` (consecutive threads -> consecutive head dims) and the write of
-``selected_keys`` (consecutive threads -> consecutive selected tokens) stay
-coalesced; the naive spelling would scatter 2-byte stores across a
-SELECTED-sized stride.
+FALSIFIED, AND KEPT ONLY AS ITS OWN A/B ARM
+-------------------------------------------
+The transposed layout was the byte-side idea of the QSA M4 lane: the census
+attributes an 8.4 MB transposed copy per QSA layer to ``qwen4_exp.py:2842``,
+101 MB per verify cycle, and this gather is writing those bytes anyway. The
+GPU microbench (2026-09-01, compiled lane, 12 QSA layers,
+scripts/fable/micro_qsa_m4.py) falsified it on BOTH axes, while the lane's
+other four rewrites passed on both:
+
+    gather_stock  1.501 ms      gather_kt  1.657 ms  (+10%)
+    104 differing elements, max abs 0.125
+
+so it is gated separately from ``MTPLX_FABLE_QSA_M4``, which alone is the
+bit-exact, uniformly faster set.
+
+WHY IT IS NOT BIT-EXACT (the gather itself is; the GEMM after it is not)
+------------------------------------------------------------------------
+This kernel moves data and does no arithmetic, and the two layouts hold the
+same bf16 bits -- pinned on the CPU stream in tests/test_fable_qsa_m4.py. The
+difference appears one op later, in the score GEMM that consumes K.
+
+MLX does not have one matmul: it selects a kernel and a tiling from the
+operand's layout. A ``swapaxes`` view of a contiguous ``[.., S, K, D]`` array
+reaches the GEMM as a B operand with the transpose flag set, and MLX makes it
+contiguous (that is the copy the census sees) before running its
+``no-transpose`` path over the 256-element contraction. A natively
+``[.., S, D, K]`` array is already contiguous and takes the transposed-B path
+directly. Both accumulate in fp32; they split and order the K dimension
+differently, so the fp32 partial sums are reassociated. Reassociation of 256
+products is a few fp32 ulp, which usually rounds to the same bf16 and
+sometimes does not -- 104 of 4.2 M score elements here, and max abs 0.125 is
+exactly ONE bf16 ulp at a score magnitude in [16, 32), which is the signature
+of that class rather than of a data error.
+
+Those scores feed the softmax and the PV product, so this is a rounding-class
+change to attention output on the same terms as
+kernels/qwen4_m4_hyper_read.py: it would have to be adopted on acceptance
+parity, not on a digest. It is not worth that when it also LOSES 10%.
+
+WHY IT IS SLOWER THAN THE COPY IT REMOVES
+------------------------------------------
+The untransposed gather is a pure streaming copy: one ``vec<T,4>`` load and
+one ``vec<T,4>`` store per thread, both 8-byte aligned and fully coalesced, no
+threadgroup memory and no barrier. The transposed one cannot vectorize either
+side -- a transpose needs the element that is contiguous on the read to be
+strided on the write -- so it drops to scalar 2-byte accesses staged through a
+32x32 threadgroup tile plus a barrier: 4x the memory instructions for the same
+bytes, plus the barrier and the tile traffic. It does not delete the
+transpose, it relocates it from a specialized MLX copy kernel into a hand tile
+that is worse at it. Same shape of result as ``bank_select`` in
+scripts/fable/micro_opdiet.py: fewer dispatches, more time.
+
+The tiled staging is still the right spelling for a transposed gather (the
+naive version scatters 2-byte stores across a SELECTED-sized stride and is far
+worse); the finding is that a transposed gather is the wrong thing to want
+here.
 """
 
 from __future__ import annotations
@@ -164,9 +212,11 @@ def bind_qwen4_qsa_m4_fused_kv_gather(
 ) -> Callable[[mx.array, mx.array, mx.array], tuple[mx.array, mx.array]]:
     """Bind the exact 1K/16K fixed-M4 gather geometry once at cache install.
 
-    ``transposed_keys`` selects the ``[.., HEAD_DIM, SELECTED]`` key layout;
-    the bound callable carries ``keys_transposed`` so the attention site reads
-    the contract off the binding instead of inferring it from a shape.
+    ``transposed_keys`` selects the ``[.., HEAD_DIM, SELECTED]`` key layout
+    (``MTPLX_FABLE_QSA_M4_KT``, off by default -- see the module docstring for
+    the measured verdict). The bound callable carries ``keys_transposed`` so
+    the attention site reads the contract off the binding instead of inferring
+    it from a shape.
     """
 
     capacity = int(capacity)
