@@ -83,6 +83,47 @@ ARM_NAMES = {"A": "control", "B": "candidate"}
 GUARD_WINDOW_PATH_ENV = "MTPLX_DSV4_GUARD_WINDOW_PATH"
 GUARD_WINDOW_SHA256_ENV = "MTPLX_DSV4_GUARD_WINDOW_SHA256"
 
+# --------------------------------------------------------------------------
+# Context-copy cost model (the corrected cycle-time statistic)
+# --------------------------------------------------------------------------
+#
+# ``mtplx/context_copy.py`` prompt-lookup decoding is ON BY DEFAULT and emits
+# ~9.4% of the output tokens through *block rounds* -- variable-width
+# ``forward_ar`` calls that are NOT the fixed-M4 compiled window.  Those rounds
+# are cheap per token (8.33 ms/token vs 15.13 ms/token for an M4 window) and
+# their COUNT is trajectory luck: it depends on how often the model happened to
+# quote the prompt, not on the kernel under test.  Reading ``decode_tok_s`` or
+# raw ``decode_s / compiled_m4_calls`` therefore mixes a 4.5%-noise retrieval
+# yield into a 0.5%-noise kernel measurement.
+#
+# Fitting ``decode_s = m4*C4 + rounds*C0 + block_tokens*C1`` jointly over the
+# 39 complete control runs and the HC_M4 stack arms (6 trajectory points, 4 free
+# parameters, residual 111 ms = 0.7%) gives C0 = 21.0 ms per copy round and
+# C1 = 3.636 ms per verified copy row.  Subtracting that fitted copy budget and
+# dividing by the compiled M4 calls collapses the cross-seed spread from 7.8%
+# (tok/s) to 1.1%, with a 0.3-0.7% within-seed noise floor:
+#
+#     ms_per_m4_window_net =
+#         (decode_s - rounds*C0 - accepted_tokens*C1) / compiled_m4_calls
+#
+# This is the PRIMARY cycle-time metric for every paired delta below.  Raw
+# ms/window and tok/s stay in the receipt so a window is still comparable to
+# the pre-correction ledger, but they are secondary.
+#
+# Token basis, stated because it matters for a re-fit: the subtraction uses
+# ``context_copy.accepted_tokens``, not the wider ``drafted_tokens`` (the rows
+# the block round actually verified, which is what C1 was fitted against).
+# Accepted is the stable, receipt-native quantity and the two move together, so
+# the default C1 below absorbs the difference.  A window that re-fits the cost
+# model against verified ROWS must pass the re-fitted value through
+# ``--copy-token-cost-s``; ``drafted_tokens`` is recorded on every row so the
+# re-fit can be done from the receipts alone.
+#
+#: Fitted fixed cost of one context-copy block round, seconds (C0).
+DEFAULT_COPY_ROUND_COST_S = 0.0210
+#: Fitted marginal cost of one verified context-copy row, seconds (C1).
+DEFAULT_COPY_TOKEN_COST_S = 0.003636
+
 
 # --------------------------------------------------------------------------
 # Pure planning / argv construction (unit-tested)
@@ -234,9 +275,20 @@ def merge_env_settings(
 
 
 def extract_run_row(
-    receipt: Mapping[str, Any], run: Mapping[str, Any]
+    receipt: Mapping[str, Any],
+    run: Mapping[str, Any],
+    *,
+    copy_round_cost_s: float = DEFAULT_COPY_ROUND_COST_S,
+    copy_token_cost_s: float = DEFAULT_COPY_TOKEN_COST_S,
 ) -> dict[str, Any]:
-    """Flatten one arm receipt into the summary row for the table."""
+    """Flatten one arm receipt into the summary row for the table.
+
+    ``copy_round_cost_s`` / ``copy_token_cost_s`` are the fitted C0/C1 of the
+    context-copy cost model documented at the top of this module; they define
+    ``decode_s_net`` and ``ms_per_m4_window_net``.  A receipt with no
+    ``context_copy`` block (context-copy disabled, or an older driver) reads as
+    zero rounds and zero accepted tokens, so the net metric equals the raw one.
+    """
 
     rows = receipt.get("rows") or []
     if len(rows) != 1:
@@ -249,6 +301,16 @@ def extract_run_row(
     generated = int(row["generated_tokens"])
     thermal = row.get("thermal_gate") or {}
     parity = row.get("reference_token_parity") or {}
+    context_copy = row.get("context_copy") or {}
+    copy_rounds = int(context_copy.get("rounds") or 0)
+    copy_accepted = int(context_copy.get("accepted_tokens") or 0)
+    copy_drafted = int(context_copy.get("drafted_tokens") or 0)
+    # The fitted copy budget this run spent OUTSIDE the compiled M4 windows.
+    copy_cost_s = (
+        copy_rounds * float(copy_round_cost_s)
+        + copy_accepted * float(copy_token_cost_s)
+    )
+    decode_s_net = decode_s - copy_cost_s
     return {
         "index": int(run["index"]),
         "position_in_seed": int(run["position_in_seed"]),
@@ -267,6 +329,21 @@ def extract_run_row(
         "tokens_per_window": (
             generated / compiled_calls if compiled_calls else None
         ),
+        # -- context-copy corrected cycle time (PRIMARY) -------------------
+        "context_copy_rounds": copy_rounds,
+        "context_copy_accepted_tokens": copy_accepted,
+        "context_copy_drafted_tokens": copy_drafted,
+        "context_copy_active": bool(context_copy.get("active", bool(copy_rounds))),
+        "context_copy_cost_s": copy_cost_s,
+        "decode_s_net": decode_s_net,
+        "ms_per_m4_window_net": (
+            decode_s_net * 1000.0 / compiled_calls if compiled_calls else None
+        ),
+        "tokens_per_m4_window": (
+            (generated - copy_accepted) / compiled_calls
+            if compiled_calls
+            else None
+        ),
         "accepted_by_depth": list(row["accepted_by_depth"]),
         "drafted_by_depth": list(row["drafted_by_depth"]),
         "verify_forward_s": float(row["verify_forward_time_s"]),
@@ -282,17 +359,44 @@ def extract_run_row(
 
 
 def _mean(values: Iterable[float]) -> float | None:
-    materialized = [float(value) for value in values]
+    materialized = [float(value) for value in values if value is not None]
     return statistics.fmean(materialized) if materialized else None
 
 
 def _median(values: Iterable[float]) -> float | None:
-    materialized = [float(value) for value in values]
+    materialized = [float(value) for value in values if value is not None]
     return statistics.median(materialized) if materialized else None
 
 
-def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Per-arm aggregates, per-seed paired deltas, and adjacent-pair deltas."""
+def _delta(candidate: float | None, control: float | None) -> float | None:
+    if candidate is None or control is None:
+        return None
+    return candidate - control
+
+
+def _delta_pct(candidate: float | None, control: float | None) -> float | None:
+    if candidate is None or not control:
+        return None
+    return 100.0 * (candidate - control) / control
+
+
+def summarize(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    copy_round_cost_s: float = DEFAULT_COPY_ROUND_COST_S,
+    copy_token_cost_s: float = DEFAULT_COPY_TOKEN_COST_S,
+) -> dict[str, Any]:
+    """Per-arm aggregates, per-seed paired deltas, and adjacent-pair deltas.
+
+    The PRIMARY cycle-time metric is ``ms_per_m4_window_net`` -- decode seconds
+    with the fitted context-copy budget removed, per compiled M4 window (see the
+    cost-model note at the top of this module).  It is a COST, so a negative
+    delta is the candidate winning.  Raw ``ms_per_compiled_window`` and
+    ``decode_tok_s`` deltas are kept alongside it as secondary readings.
+
+    The two cost constants are recorded in the returned summary so a receipt
+    always states the model its net numbers were computed under.
+    """
 
     if not rows:
         raise ValueError("summary needs at least one measured row")
@@ -310,6 +414,24 @@ def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "median_decode_tok_s": _median(r["decode_tok_s"] for r in arm_rows),
             "mean_decode_s": _mean(r["decode_s"] for r in arm_rows),
             "median_decode_s": _median(r["decode_s"] for r in arm_rows),
+            "mean_ms_per_m4_window_net": _mean(
+                r.get("ms_per_m4_window_net") for r in arm_rows
+            ),
+            "median_ms_per_m4_window_net": _median(
+                r.get("ms_per_m4_window_net") for r in arm_rows
+            ),
+            "mean_ms_per_compiled_window": _mean(
+                r.get("ms_per_compiled_window") for r in arm_rows
+            ),
+            "mean_tokens_per_m4_window": _mean(
+                r.get("tokens_per_m4_window") for r in arm_rows
+            ),
+            "mean_context_copy_rounds": _mean(
+                r.get("context_copy_rounds") for r in arm_rows
+            ),
+            "mean_context_copy_accepted_tokens": _mean(
+                r.get("context_copy_accepted_tokens") for r in arm_rows
+            ),
             "mean_verify_forward_s": _mean(
                 r["verify_forward_s"] for r in arm_rows
             ),
@@ -333,11 +455,30 @@ def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         control_mean = _mean(r["decode_tok_s"] for r in control)
         candidate_mean = _mean(r["decode_tok_s"] for r in candidate)
         delta = candidate_mean - control_mean
+        control_net = _mean(r.get("ms_per_m4_window_net") for r in control)
+        candidate_net = _mean(r.get("ms_per_m4_window_net") for r in candidate)
+        control_raw_ms = _mean(r.get("ms_per_compiled_window") for r in control)
+        candidate_raw_ms = _mean(
+            r.get("ms_per_compiled_window") for r in candidate
+        )
         paired.append(
             {
                 "seed": seed,
                 "control_runs": len(control),
                 "candidate_runs": len(candidate),
+                # PRIMARY: copy-corrected cycle time (lower is better).
+                "control_mean_ms_per_m4_window_net": control_net,
+                "candidate_mean_ms_per_m4_window_net": candidate_net,
+                "delta_ms_per_m4_window_net": _delta(candidate_net, control_net),
+                "delta_ms_per_m4_window_net_pct": _delta_pct(
+                    candidate_net, control_net
+                ),
+                # Secondary: raw cycle time and throughput.
+                "control_mean_ms_per_compiled_window": control_raw_ms,
+                "candidate_mean_ms_per_compiled_window": candidate_raw_ms,
+                "delta_ms_per_compiled_window": _delta(
+                    candidate_raw_ms, control_raw_ms
+                ),
                 "control_mean_decode_tok_s": control_mean,
                 "candidate_mean_decode_tok_s": candidate_mean,
                 "delta_decode_tok_s": delta,
@@ -347,6 +488,19 @@ def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "control_mean_decode_s": _mean(r["decode_s"] for r in control),
                 "candidate_mean_decode_s": _mean(
                     r["decode_s"] for r in candidate
+                ),
+                # Trajectory context: how much retrieval each arm drew.
+                "control_mean_context_copy_rounds": _mean(
+                    r.get("context_copy_rounds") for r in control
+                ),
+                "candidate_mean_context_copy_rounds": _mean(
+                    r.get("context_copy_rounds") for r in candidate
+                ),
+                "control_mean_context_copy_accepted_tokens": _mean(
+                    r.get("context_copy_accepted_tokens") for r in control
+                ),
+                "candidate_mean_context_copy_accepted_tokens": _mean(
+                    r.get("context_copy_accepted_tokens") for r in candidate
                 ),
                 "digests_match": (
                     len({str(r["digest"]) for r in (*control, *candidate)}) == 1
@@ -369,6 +523,10 @@ def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "seed": int(first["seed"]),
                 "control_index": int(control_row["index"]),
                 "candidate_index": int(candidate_row["index"]),
+                "delta_ms_per_m4_window_net": _delta(
+                    candidate_row.get("ms_per_m4_window_net"),
+                    control_row.get("ms_per_m4_window_net"),
+                ),
                 "delta_decode_tok_s": (
                     float(candidate_row["decode_tok_s"])
                     - float(control_row["decode_tok_s"])
@@ -380,7 +538,48 @@ def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     candidate_mean = arms.get("B", {}).get("mean_decode_tok_s")
     control_median = arms.get("A", {}).get("median_decode_tok_s")
     candidate_median = arms.get("B", {}).get("median_decode_tok_s")
+    control_net = arms.get("A", {}).get("mean_ms_per_m4_window_net")
+    candidate_net = arms.get("B", {}).get("mean_ms_per_m4_window_net")
+    control_net_median = arms.get("A", {}).get("median_ms_per_m4_window_net")
+    candidate_net_median = arms.get("B", {}).get("median_ms_per_m4_window_net")
+    control_raw_ms = arms.get("A", {}).get("mean_ms_per_compiled_window")
+    candidate_raw_ms = arms.get("B", {}).get("mean_ms_per_compiled_window")
     overall = {
+        # -- PRIMARY: copy-corrected cycle time, ms per compiled M4 window.
+        # A COST: negative delta = the candidate is faster.
+        "control_mean_ms_per_m4_window_net": control_net,
+        "candidate_mean_ms_per_m4_window_net": candidate_net,
+        "delta_mean_ms_per_m4_window_net": _delta(candidate_net, control_net),
+        "delta_mean_ms_per_m4_window_net_pct": _delta_pct(
+            candidate_net, control_net
+        ),
+        "control_median_ms_per_m4_window_net": control_net_median,
+        "candidate_median_ms_per_m4_window_net": candidate_net_median,
+        "delta_median_ms_per_m4_window_net": _delta(
+            candidate_net_median, control_net_median
+        ),
+        "paired_delta_mean_ms_per_m4_window_net": _mean(
+            entry["delta_ms_per_m4_window_net"] for entry in paired
+        ),
+        "paired_delta_median_ms_per_m4_window_net": _median(
+            entry["delta_ms_per_m4_window_net"] for entry in paired
+        ),
+        "paired_delta_mean_ms_per_m4_window_net_pct": _mean(
+            entry["delta_ms_per_m4_window_net_pct"] for entry in paired
+        ),
+        "adjacent_delta_mean_ms_per_m4_window_net": _mean(
+            entry["delta_ms_per_m4_window_net"] for entry in adjacent
+        ),
+        # -- Secondary: raw (uncorrected) cycle time.
+        "control_mean_ms_per_compiled_window": control_raw_ms,
+        "candidate_mean_ms_per_compiled_window": candidate_raw_ms,
+        "delta_mean_ms_per_compiled_window": _delta(
+            candidate_raw_ms, control_raw_ms
+        ),
+        "delta_mean_ms_per_compiled_window_pct": _delta_pct(
+            candidate_raw_ms, control_raw_ms
+        ),
+        # -- Secondary: throughput (contaminated by retrieval yield).
         "control_mean_decode_tok_s": control_mean,
         "candidate_mean_decode_tok_s": candidate_mean,
         "delta_mean_decode_tok_s": (
@@ -416,6 +615,17 @@ def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "per_seed": paired,
         "adjacent_pairs": adjacent,
         "overall": overall,
+        "copy_cost_model": {
+            "copy_round_cost_s": float(copy_round_cost_s),
+            "copy_token_cost_s": float(copy_token_cost_s),
+            "statistic": (
+                "ms_per_m4_window_net = (decode_elapsed_s "
+                "- context_copy.rounds * copy_round_cost_s "
+                "- context_copy.accepted_tokens * copy_token_cost_s) "
+                "/ compiled_m4_calls * 1000"
+            ),
+            "primary_metric": "ms_per_m4_window_net",
+        },
     }
 
 
@@ -431,16 +641,18 @@ def render_markdown(
     """Render the per-run table plus the paired-delta table."""
 
     lines = [
-        "| # | Arm | Seed | Decode tok/s | Decode s | ms/window | tok/window "
+        "| # | Arm | Seed | Decode tok/s | Decode s | ms/window | ms/M4win net "
+        "| tok/window | tok/M4win | ccopy rounds | ccopy accepted "
         "| Accepted by depth | Verify fwd s | Digest | Peak bytes | Ready C "
         "| Page cache |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- "
-        "| ---: | ---: | --- |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | --- | ---: | --- | ---: | ---: | --- |",
     ]
     for row in sorted(rows, key=lambda r: int(r["index"])):
         lines.append(
             "| {index} | {arm_name} ({arm}) | {seed} | {tok_s} | {decode_s} "
-            "| {ms} | {tpw} | {depths} | {vf} | {digest} | {peak:,} | {ready} "
+            "| {ms} | {ms_net} | {tpw} | {tpw_net} | {rounds} | {accepted} "
+            "| {depths} | {vf} | {digest} | {peak:,} | {ready} "
             "| {regime} |".format(
                 index=int(row["index"]),
                 arm_name=row["arm_name"],
@@ -449,7 +661,11 @@ def render_markdown(
                 tok_s=_format(row["decode_tok_s"], ".6f"),
                 decode_s=_format(row["decode_s"], ".6f"),
                 ms=_format(row["ms_per_compiled_window"], ".4f"),
+                ms_net=_format(row.get("ms_per_m4_window_net"), ".4f"),
                 tpw=_format(row["tokens_per_window"], ".4f"),
+                tpw_net=_format(row.get("tokens_per_m4_window"), ".4f"),
+                rounds=_format(row.get("context_copy_rounds"), "d"),
+                accepted=_format(row.get("context_copy_accepted_tokens"), "d"),
                 depths=",".join(str(int(v)) for v in row["accepted_by_depth"]),
                 vf=_format(row["verify_forward_s"], ".6f"),
                 digest=str(row["digest"])[:12],
@@ -459,20 +675,53 @@ def render_markdown(
             )
         )
 
+    cost_model = summary.get("copy_cost_model") or {}
     lines.append("")
     lines.append(
-        "| Seed | Control tok/s | Candidate tok/s | Delta tok/s | Delta % "
-        "| Digests match |"
+        "PRIMARY cycle-time metric: ms/M4win net = (decode_s - rounds*{c0} "
+        "- accepted*{c1}) / compiled_m4_calls. It is a COST, so a NEGATIVE "
+        "delta is the candidate winning.".format(
+            c0=_format(cost_model.get("copy_round_cost_s"), ".6g"),
+            c1=_format(cost_model.get("copy_token_cost_s"), ".6g"),
+        )
     )
-    lines.append("| ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append("")
+    lines.append(
+        "| Seed | Control ms/M4win net | Candidate ms/M4win net "
+        "| Delta ms | Delta % | Control tok/s | Candidate tok/s | Delta tok/s "
+        "| Delta % | ccopy rounds A/B | Digests match |"
+    )
+    lines.append(
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| --- | --- |"
+    )
     for entry in summary["per_seed"]:
         lines.append(
-            "| {seed} | {control} | {candidate} | {delta} | {pct} | {match} |".format(
+            "| {seed} | {cnet} | {knet} | {dnet} | {dnetpct} | {control} "
+            "| {candidate} | {delta} | {pct} | {rounds} | {match} |".format(
                 seed=entry["seed"],
+                cnet=_format(
+                    entry.get("control_mean_ms_per_m4_window_net"), ".4f"
+                ),
+                knet=_format(
+                    entry.get("candidate_mean_ms_per_m4_window_net"), ".4f"
+                ),
+                dnet=_format(entry.get("delta_ms_per_m4_window_net"), "+.4f"),
+                dnetpct=_format(
+                    entry.get("delta_ms_per_m4_window_net_pct"), "+.4f"
+                ),
                 control=_format(entry["control_mean_decode_tok_s"], ".6f"),
                 candidate=_format(entry["candidate_mean_decode_tok_s"], ".6f"),
                 delta=_format(entry["delta_decode_tok_s"], "+.6f"),
                 pct=_format(entry["delta_pct"], "+.4f"),
+                rounds="{}/{}".format(
+                    _format(
+                        entry.get("control_mean_context_copy_rounds"), ".1f"
+                    ),
+                    _format(
+                        entry.get("candidate_mean_context_copy_rounds"), ".1f"
+                    ),
+                ),
                 match="yes" if entry["digests_match"] else "NO",
             )
         )
@@ -480,8 +729,53 @@ def render_markdown(
     overall = summary["overall"]
     lines.append("")
     lines.append(
-        "Control mean {control} tok/s, candidate mean {candidate} tok/s, "
-        "delta {delta} tok/s ({pct}%).".format(
+        "PRIMARY: control {control} ms/M4win net, candidate {candidate} "
+        "ms/M4win net, delta {delta} ms ({pct}%); paired delta mean {paired} "
+        "ms, median {median} ms; adjacent-pair delta mean {adjacent} ms.".format(
+            control=_format(
+                overall.get("control_mean_ms_per_m4_window_net"), ".4f"
+            ),
+            candidate=_format(
+                overall.get("candidate_mean_ms_per_m4_window_net"), ".4f"
+            ),
+            delta=_format(
+                overall.get("delta_mean_ms_per_m4_window_net"), "+.4f"
+            ),
+            pct=_format(
+                overall.get("delta_mean_ms_per_m4_window_net_pct"), "+.4f"
+            ),
+            paired=_format(
+                overall.get("paired_delta_mean_ms_per_m4_window_net"), "+.4f"
+            ),
+            median=_format(
+                overall.get("paired_delta_median_ms_per_m4_window_net"), "+.4f"
+            ),
+            adjacent=_format(
+                overall.get("adjacent_delta_mean_ms_per_m4_window_net"), "+.4f"
+            ),
+        )
+    )
+    lines.append(
+        "Secondary raw cycle time: control {control} ms/window, candidate "
+        "{candidate} ms/window, delta {delta} ms ({pct}%).".format(
+            control=_format(
+                overall.get("control_mean_ms_per_compiled_window"), ".4f"
+            ),
+            candidate=_format(
+                overall.get("candidate_mean_ms_per_compiled_window"), ".4f"
+            ),
+            delta=_format(
+                overall.get("delta_mean_ms_per_compiled_window"), "+.4f"
+            ),
+            pct=_format(
+                overall.get("delta_mean_ms_per_compiled_window_pct"), "+.4f"
+            ),
+        )
+    )
+    lines.append(
+        "Secondary throughput (contaminated by how often the model quoted the "
+        "prompt): control mean {control} tok/s, candidate mean {candidate} "
+        "tok/s, delta {delta} tok/s ({pct}%).".format(
             control=_format(overall["control_mean_decode_tok_s"], ".6f"),
             candidate=_format(overall["candidate_mean_decode_tok_s"], ".6f"),
             delta=_format(overall["delta_mean_decode_tok_s"], "+.6f"),
@@ -650,6 +944,29 @@ def build_parser() -> argparse.ArgumentParser:
             "prefill_tok_s, prompt_eval_time_s and ttft_s per row; decode_tok_s "
             "from such a short window is diagnostic only. An explicit "
             "--max-tokens still wins."
+        ),
+    )
+    parser.add_argument(
+        "--copy-round-cost-s",
+        type=float,
+        default=DEFAULT_COPY_ROUND_COST_S,
+        metavar="SECONDS",
+        help=(
+            "C0: fitted fixed cost of one context-copy block round, subtracted "
+            "from decode_elapsed_s before the per-M4-window cycle time "
+            f"(default {DEFAULT_COPY_ROUND_COST_S}). Re-fit and override this "
+            "when a window changes the copy round's cost (e.g. a compiled copy "
+            "round, or MTPLX_CONTEXT_COPY_K)."
+        ),
+    )
+    parser.add_argument(
+        "--copy-token-cost-s",
+        type=float,
+        default=DEFAULT_COPY_TOKEN_COST_S,
+        metavar="SECONDS",
+        help=(
+            "C1: fitted marginal cost of one verified context-copy row "
+            f"(default {DEFAULT_COPY_TOKEN_COST_S})."
         ),
     )
     parser.add_argument(
@@ -832,12 +1149,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         receipt = json.loads(Path(record["receipt_path"]).read_text())
         record["status"] = "measured"
-        rows.append(extract_run_row(receipt, run))
+        rows.append(
+            extract_run_row(
+                receipt,
+                run,
+                copy_round_cost_s=args.copy_round_cost_s,
+                copy_token_cost_s=args.copy_token_cost_s,
+            )
+        )
 
     summary: dict[str, Any] | None = None
     table = ""
     if rows:
-        summary = summarize(rows)
+        summary = summarize(
+            rows,
+            copy_round_cost_s=args.copy_round_cost_s,
+            copy_token_cost_s=args.copy_token_cost_s,
+        )
         table = render_markdown(rows, summary)
         print(table, flush=True)
 
@@ -863,6 +1191,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             for arm, spec in specs.items()
         },
         "common_driver_flags": common,
+        # The cost model every ``ms_per_m4_window_net`` in this receipt was
+        # computed under, so a re-fit never silently reinterprets old numbers.
+        "copy_cost_model": {
+            "copy_round_cost_s": float(args.copy_round_cost_s),
+            "copy_token_cost_s": float(args.copy_token_cost_s),
+            "defaults": {
+                "copy_round_cost_s": DEFAULT_COPY_ROUND_COST_S,
+                "copy_token_cost_s": DEFAULT_COPY_TOKEN_COST_S,
+            },
+            "primary_metric": "ms_per_m4_window_net",
+        },
         "arms": arm_records,
         "rows": rows,
         "summary": summary,

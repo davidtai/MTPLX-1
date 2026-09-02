@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import re
+import statistics
 import sys
 import unittest
 from pathlib import Path
@@ -61,6 +63,21 @@ def make_row(index, arm, seed, decode_tok_s, **overrides):
         "compiled_m4_calls": 382,
         "ms_per_compiled_window": (1024.0 / decode_tok_s) * 1000.0 / 382,
         "tokens_per_window": 1024 / 382,
+        "context_copy_rounds": 10,
+        "context_copy_accepted_tokens": 66,
+        "context_copy_drafted_tokens": 133,
+        "context_copy_active": True,
+        "context_copy_cost_s": 10 * window.DEFAULT_COPY_ROUND_COST_S
+        + 66 * window.DEFAULT_COPY_TOKEN_COST_S,
+        "decode_s_net": (1024.0 / decode_tok_s)
+        - (10 * window.DEFAULT_COPY_ROUND_COST_S
+           + 66 * window.DEFAULT_COPY_TOKEN_COST_S),
+        "ms_per_m4_window_net": (
+            (1024.0 / decode_tok_s)
+            - (10 * window.DEFAULT_COPY_ROUND_COST_S
+               + 66 * window.DEFAULT_COPY_TOKEN_COST_S)
+        ) * 1000.0 / 382,
+        "tokens_per_m4_window": (1024 - 66) / 382,
         "accepted_by_depth": [259, 187, 120],
         "drafted_by_depth": [382, 382, 382],
         "verify_forward_s": 11.5,
@@ -370,6 +387,16 @@ class TestExtractRunRow(unittest.TestCase):
             "reference_token_parity": {"status": "match"},
             "ple_hot_rows": {"available": True},
             "per_cycle": {"available": False},
+            "context_copy": {
+                "accepted_blocks": 8,
+                "accepted_tokens": 66,
+                "active": True,
+                "disabled_reason": None,
+                "drafted_tokens": 133,
+                "probes": 364,
+                "rounds": 10,
+                "suspensions": 1,
+            },
         }
         row.update(row_overrides)
         return {"rows": [row]}
@@ -399,6 +426,153 @@ class TestExtractRunRow(unittest.TestCase):
         receipt["rows"] = receipt["rows"] * 2
         with self.assertRaises(ValueError):
             window.extract_run_row(receipt, run)
+
+    # -- context-copy corrected cycle time --------------------------------
+
+    def test_context_copy_stats_are_surfaced(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        row = window.extract_run_row(self._receipt(), run)
+        self.assertEqual(row["context_copy_rounds"], 10)
+        self.assertEqual(row["context_copy_accepted_tokens"], 66)
+        self.assertEqual(row["context_copy_drafted_tokens"], 133)
+        self.assertTrue(row["context_copy_active"])
+
+    def test_net_cycle_time_removes_the_fitted_copy_budget(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        row = window.extract_run_row(self._receipt(), run)
+        expected_cost = (
+            10 * window.DEFAULT_COPY_ROUND_COST_S
+            + 66 * window.DEFAULT_COPY_TOKEN_COST_S
+        )
+        self.assertAlmostEqual(row["context_copy_cost_s"], expected_cost)
+        self.assertAlmostEqual(
+            row["decode_s_net"], 15.099174540984677 - expected_cost
+        )
+        self.assertAlmostEqual(
+            row["ms_per_m4_window_net"],
+            (15.099174540984677 - expected_cost) * 1000.0 / 382,
+        )
+        # The net cycle time is strictly cheaper than the raw one whenever a
+        # copy round fired -- the copy budget only ever comes off the top.
+        self.assertLess(
+            row["ms_per_m4_window_net"], row["ms_per_compiled_window"]
+        )
+
+    def test_tokens_per_m4_window_excludes_copied_tokens(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        row = window.extract_run_row(self._receipt(), run)
+        self.assertAlmostEqual(row["tokens_per_m4_window"], (1024 - 66) / 382)
+        self.assertAlmostEqual(row["tokens_per_window"], 1024 / 382)
+
+    def test_cost_constants_are_overridable(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        row = window.extract_run_row(
+            self._receipt(), run, copy_round_cost_s=0.0, copy_token_cost_s=0.0
+        )
+        self.assertEqual(row["context_copy_cost_s"], 0.0)
+        self.assertAlmostEqual(row["decode_s_net"], row["decode_s"])
+        self.assertAlmostEqual(
+            row["ms_per_m4_window_net"], row["ms_per_compiled_window"]
+        )
+
+    def test_missing_context_copy_block_reads_as_zero(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        receipt = self._receipt()
+        del receipt["rows"][0]["context_copy"]
+        row = window.extract_run_row(receipt, run)
+        self.assertEqual(row["context_copy_rounds"], 0)
+        self.assertEqual(row["context_copy_accepted_tokens"], 0)
+        self.assertFalse(row["context_copy_active"])
+        self.assertAlmostEqual(
+            row["ms_per_m4_window_net"], row["ms_per_compiled_window"]
+        )
+        self.assertAlmostEqual(row["tokens_per_m4_window"], 1024 / 382)
+
+    def test_zero_compiled_calls_do_not_divide_net_metrics(self):
+        run = window.plan_runs([1], "AB", 0)[0]
+        row = window.extract_run_row(self._receipt(compiled_m4_calls=0), run)
+        self.assertIsNone(row["ms_per_m4_window_net"])
+        self.assertIsNone(row["tokens_per_m4_window"])
+        # The cost model itself is still recorded on the row.
+        self.assertEqual(row["context_copy_rounds"], 10)
+
+
+class TestProductionReceiptCostModel(unittest.TestCase):
+    """Check the corrected statistic against the real w10-stack receipts.
+
+    The receipts live outside the repo (``.benchmark-artifacts`` is not
+    tracked), so this skips when they are not on the box.
+    """
+
+    RECEIPT_DIRS = (
+        Path(
+            "/Users/davidtai/projects/OpenSourceWTF/.worktrees/"
+            "qwen38-fable-80tps/.benchmark-artifacts/fable"
+        ),
+        ROOT / ".benchmark-artifacts" / "fable",
+    )
+
+    def _receipt_paths(self):
+        for directory in self.RECEIPT_DIRS:
+            paths = sorted(directory.glob("fable-w10-stack-*.json"))
+            if paths:
+                return paths
+        return []
+
+    def test_real_receipts_produce_a_finite_net_cycle_time(self):
+        import json
+
+        paths = self._receipt_paths()
+        if not paths:
+            self.skipTest("fable-w10-stack receipts are not on this box")
+        rows = []
+        for index, path in enumerate(paths):
+            receipt = json.loads(path.read_text())
+            arm = "B" if "candidate" in path.name else "A"
+            match = re.search(r"-s(\d+)-", path.name)
+            assert match is not None, path.name
+            seed = int(match.group(1))
+            run = {
+                "index": index,
+                "position_in_seed": index,
+                "arm": arm,
+                "arm_name": window.ARM_NAMES[arm],
+                "seed": seed,
+                "sequence": 1788400081 + index,
+            }
+            row = window.extract_run_row(receipt, run)
+            rows.append(row)
+            source = receipt["rows"][0]["context_copy"]
+            self.assertEqual(row["context_copy_rounds"], source["rounds"])
+            self.assertEqual(
+                row["context_copy_accepted_tokens"], source["accepted_tokens"]
+            )
+            # Every production run spends real time on copy rounds, so the
+            # correction is never a no-op and never eats the whole window.
+            self.assertGreater(row["context_copy_cost_s"], 0.0)
+            self.assertLess(
+                row["context_copy_cost_s"], 0.25 * row["decode_s"]
+            )
+            # 30-45 ms per compiled M4 window is the physical band for this
+            # lane; anything outside it means the statistic is mis-wired.
+            self.assertGreater(row["ms_per_m4_window_net"], 30.0)
+            self.assertLess(row["ms_per_m4_window_net"], 45.0)
+
+        summary = window.summarize(rows)
+        self.assertEqual(
+            summary["copy_cost_model"]["copy_round_cost_s"],
+            window.DEFAULT_COPY_ROUND_COST_S,
+        )
+        # The corrected metric is the point: its cross-run spread must be
+        # tighter than raw tok/s across the same runs.
+        def spread(values):
+            values = [float(v) for v in values]
+            return (max(values) - min(values)) / statistics.fmean(values)
+
+        self.assertLess(
+            spread(r["ms_per_m4_window_net"] for r in rows),
+            spread(r["decode_tok_s"] for r in rows),
+        )
 
 
 class TestSummary(unittest.TestCase):
@@ -471,6 +645,118 @@ class TestSummary(unittest.TestCase):
         with self.assertRaises(ValueError):
             window.summarize([])
 
+    # -- corrected cycle time is the PRIMARY paired statistic --------------
+
+    def _net_rows(self):
+        """One seed, ABBA, where tok/s and the net cycle time DISAGREE.
+
+        The candidate draws twice the retrieval yield of the control, which is
+        trajectory luck, not speed: on tok/s it looks faster, on the corrected
+        per-M4-window cycle time it is slower.
+        """
+
+        def row(index, arm, tok_s, rounds, accepted):
+            decode_s = 1024.0 / tok_s
+            cost = (
+                rounds * window.DEFAULT_COPY_ROUND_COST_S
+                + accepted * window.DEFAULT_COPY_TOKEN_COST_S
+            )
+            # Tokens the copy lane emitted are tokens the M4 lane did not have
+            # to produce, so a higher retrieval yield means FEWER compiled
+            # windows for the same 1,024-token answer (2.49 tok/window is the
+            # measured production constant).
+            calls = round((1024 - accepted) / 2.49)
+            return make_row(
+                index,
+                arm,
+                20260829,
+                tok_s,
+                compiled_m4_calls=calls,
+                ms_per_compiled_window=decode_s * 1000.0 / calls,
+                tokens_per_window=1024 / calls,
+                context_copy_rounds=rounds,
+                context_copy_accepted_tokens=accepted,
+                context_copy_cost_s=cost,
+                decode_s_net=decode_s - cost,
+                ms_per_m4_window_net=(decode_s - cost) * 1000.0 / calls,
+                tokens_per_m4_window=(1024 - accepted) / calls,
+            )
+
+        return [
+            row(0, "A", 67.0, 9, 50),
+            row(1, "B", 69.0, 20, 160),
+            row(2, "B", 69.0, 20, 160),
+            row(3, "A", 67.0, 9, 50),
+        ]
+
+    def test_arm_aggregates_carry_the_net_cycle_time(self):
+        summary = window.summarize(self._net_rows())
+        for arm in ("A", "B"):
+            self.assertIsNotNone(summary["arms"][arm]["mean_ms_per_m4_window_net"])
+            self.assertIsNotNone(summary["arms"][arm]["mean_tokens_per_m4_window"])
+        self.assertAlmostEqual(
+            summary["arms"]["A"]["mean_context_copy_rounds"], 9.0
+        )
+        self.assertAlmostEqual(
+            summary["arms"]["B"]["mean_context_copy_accepted_tokens"], 160.0
+        )
+
+    def test_net_delta_disagrees_with_tok_s_when_retrieval_yield_differs(self):
+        summary = window.summarize(self._net_rows())
+        entry = summary["per_seed"][0]
+        # tok/s says the candidate won...
+        self.assertGreater(entry["delta_decode_tok_s"], 0.0)
+        # ...the corrected cycle time (a cost) says it lost.
+        self.assertGreater(entry["delta_ms_per_m4_window_net"], 0.0)
+        self.assertGreater(entry["delta_ms_per_m4_window_net_pct"], 0.0)
+        overall = summary["overall"]
+        self.assertGreater(overall["delta_mean_ms_per_m4_window_net"], 0.0)
+        self.assertGreater(overall["paired_delta_mean_ms_per_m4_window_net"], 0.0)
+        self.assertGreater(
+            overall["adjacent_delta_mean_ms_per_m4_window_net"], 0.0
+        )
+        # The raw cycle time stays available alongside it.
+        self.assertIsNotNone(overall["delta_mean_ms_per_compiled_window"])
+        self.assertIsNotNone(entry["delta_ms_per_compiled_window"])
+
+    def test_per_seed_reports_each_arm_retrieval_yield(self):
+        entry = window.summarize(self._net_rows())["per_seed"][0]
+        self.assertAlmostEqual(entry["control_mean_context_copy_rounds"], 9.0)
+        self.assertAlmostEqual(entry["candidate_mean_context_copy_rounds"], 20.0)
+        self.assertAlmostEqual(
+            entry["control_mean_context_copy_accepted_tokens"], 50.0
+        )
+        self.assertAlmostEqual(
+            entry["candidate_mean_context_copy_accepted_tokens"], 160.0
+        )
+
+    def test_summary_records_the_cost_model_it_used(self):
+        summary = window.summarize(
+            self._net_rows(), copy_round_cost_s=0.05, copy_token_cost_s=0.001
+        )
+        model = summary["copy_cost_model"]
+        self.assertEqual(model["copy_round_cost_s"], 0.05)
+        self.assertEqual(model["copy_token_cost_s"], 0.001)
+        self.assertEqual(model["primary_metric"], "ms_per_m4_window_net")
+
+    def test_net_metrics_tolerate_rows_without_them(self):
+        rows = [
+            make_row(0, "A", 1, 60.0, ms_per_m4_window_net=None),
+            make_row(1, "B", 1, 66.0, ms_per_m4_window_net=None),
+        ]
+        summary = window.summarize(rows)
+        self.assertIsNone(summary["arms"]["A"]["mean_ms_per_m4_window_net"])
+        self.assertIsNone(
+            summary["per_seed"][0]["delta_ms_per_m4_window_net"]
+        )
+        self.assertIsNone(
+            summary["overall"]["delta_mean_ms_per_m4_window_net"]
+        )
+        # tok/s still resolves.
+        self.assertAlmostEqual(
+            summary["overall"]["delta_mean_decode_tok_s"], 6.0
+        )
+
 
 class TestMarkdown(unittest.TestCase):
     def test_table_has_one_row_per_run_and_all_columns(self):
@@ -485,7 +771,11 @@ class TestMarkdown(unittest.TestCase):
             "Decode tok/s",
             "Decode s",
             "ms/window",
+            "ms/M4win net",
             "tok/window",
+            "tok/M4win",
+            "ccopy rounds",
+            "ccopy accepted",
             "Accepted by depth",
             "Verify fwd s",
             "Digest",
@@ -501,6 +791,24 @@ class TestMarkdown(unittest.TestCase):
         self.assertIn("as-found", body[0])
         self.assertIn("+6.000000", text)
         self.assertIn("Every arm produced the same response-token digest: yes", text)
+        # The corrected statistic leads, tok/s is labelled secondary.
+        self.assertIn("PRIMARY cycle-time metric: ms/M4win net", text)
+        self.assertIn("PRIMARY: control ", text)
+        self.assertIn("Secondary raw cycle time:", text)
+        self.assertIn("Secondary throughput", text)
+        self.assertIn(str(window.DEFAULT_COPY_ROUND_COST_S), text)
+
+    def test_overridden_cost_constants_are_printed(self):
+        rows = [
+            make_row(0, "A", 20260829, 60.0),
+            make_row(1, "B", 20260829, 66.0),
+        ]
+        summary = window.summarize(
+            rows, copy_round_cost_s=0.05, copy_token_cost_s=0.002
+        )
+        text = window.render_markdown(rows, summary)
+        self.assertIn("rounds*0.05", text)
+        self.assertIn("accepted*0.002", text)
 
     def test_missing_values_render_as_na_not_a_crash(self):
         rows = [
@@ -510,7 +818,11 @@ class TestMarkdown(unittest.TestCase):
                 1,
                 60.0,
                 ms_per_compiled_window=None,
+                ms_per_m4_window_net=None,
                 tokens_per_window=None,
+                tokens_per_m4_window=None,
+                context_copy_rounds=None,
+                context_copy_accepted_tokens=None,
                 ready_c=None,
                 page_cache_regime=None,
             )
