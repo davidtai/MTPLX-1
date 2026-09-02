@@ -19,6 +19,7 @@ from typing import Any
 import mlx.core as mx
 
 from .attention_context import attention_phase
+from . import fable_gdn_keepmask_fold as _gdn_fold
 from .fable_expert_census import census as _expert_census
 from . import graph_build_overlap as _graph_build_overlap
 from .graph_build_overlap import TIMING as _GRAPH_BUILD_OVERLAP_TIMING
@@ -1350,6 +1351,15 @@ def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
 # containers. See CompiledVerifyBank._shared_or_new_verify_step.
 _SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
 
+# W67: the same sharing, for the graph-build-overlap pair.  Without it the
+# bank -- which is constructed per generation -- would build TWO fresh
+# closures per request and mx.compile would re-trace both on the request's
+# first cycle, where the shipped monolithic route pays that trace once per
+# PROCESS.  (The monolithic docstring prices one trace at ~1 s wall at 7k
+# leaves.)  Values are (prefix_fn, suffix_fn, trace_host, runtime weakref);
+# trace_host["bank"] is re-pointed at the live bank on every hit.
+_SHARED_OVERLAP_SPLITS: dict[tuple, tuple[Any, Any, dict[str, Any], Any]] = {}
+
 
 def _prewarm_enabled() -> bool:
     raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_PREWARM", "1")).strip().lower()
@@ -2015,6 +2025,12 @@ class CompiledVerifyBank:
                 "compiled verify auxiliary preparation requires a compiled_aux input"
             )
         self._compiled: dict[tuple[int, str, int], Any] = {}
+        # MTPLX_FABLE_GDN_KEEPMASK_FOLD state, all resolved once by
+        # `_resolve_gdn_keepmask_fold` at fixed-M4 install and never after.
+        self._fold_layer_indices: tuple[int, ...] = ()
+        self._fold_entries: tuple[Any, ...] = ()
+        self._fold_windows: int = 0
+        self._fold_dtype: Any = None
         self._spec: list[tuple[int, str, int]] | None = None
         self._shadow: list[Any] | None = None
         self._shadow_signature: tuple[Any, ...] | None = None
@@ -2037,6 +2053,12 @@ class CompiledVerifyBank:
         self._fixed_m4_overlap_layers: int = (
             _graph_build_overlap.DEFAULT_LAYERS
         )
+        # W67: time the FIRST replay of each graph -- where mx.compile
+        # actually traces -- always, not only under the `timing` item.  After
+        # the first cycle these are False and the sites are a bool test, so
+        # the steady state pays what it paid before.
+        self._fixed_m4_overlap_first_prefix: bool = True
+        self._fixed_m4_overlap_first_suffix: bool = True
         # The Qwen4 fixed-M4 lane installs one construction-owned replay plan
         # after prompt prefill.  Production calls then bypass the generic
         # eligibility, promotion, bucket, shadow, and fallback machinery.
@@ -2147,6 +2169,15 @@ class CompiledVerifyBank:
             capture_plan.append((cache[idx], capture_pos, len(names)))
             capture_pos += len(names)
 
+        # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66b).  Resolved here, once, BEFORE
+        # `_shared_or_new_verify_step` traces: the trace bakes in whether the
+        # step kernels take a prefix, and the shared-trace key below carries
+        # the same dimension so a folded trace can never be served to a bank
+        # that is not passing one.  Contract failures raise; this is the
+        # construction path, and an armed-but-inert flag would masquerade as a
+        # neutral A/B result.
+        self._resolve_gdn_keepmask_fold(cache)
+
         boundary = _compiled_verify_boundary()
         if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
             prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
@@ -2175,6 +2206,7 @@ class CompiledVerifyBank:
                 hidden_variant,
                 graph_aux=graph_aux,
                 return_compiled_aux=returns_aux,
+                fold_indices=self._fold_layer_indices,
             )
             self._compiled[key] = fn
         bind_device_commit = getattr(
@@ -2222,6 +2254,9 @@ class CompiledVerifyBank:
             "state_leaves": sum(n for _kind, _entry, n in state_plan),
             "capture_plan": tuple(capture_plan),
             "capture_leaves": capture_pos,
+            "fold_entries": self._fold_entries,
+            "fold_dtype": self._fold_dtype,
+            "fold_windows": self._fold_windows,
             "returns_aux": returns_aux,
             "aux_contract": aux_contract,
             "graph_aux": graph_aux,
@@ -2248,6 +2283,166 @@ class CompiledVerifyBank:
                 device_commit, "commit_width", None
             ),
         }
+
+    # -- MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66b) -------------------------------
+
+    def _fold_text_layers(self):
+        """The production text model's layer list, or ``None``."""
+
+        model = getattr(self.runtime, "model", None)
+        text_model = getattr(model, "language_model", model)
+        inner = getattr(text_model, "model", None)
+        layers = getattr(inner, "layers", None)
+        return None if layers is None else tuple(layers)
+
+    def _resolve_gdn_keepmask_fold(self, cache: Any) -> None:
+        """Arm (or leave disarmed) the keep-mask fold for this installation.
+
+        The lane is decided ONCE per fixed-M4 installation, before the verify
+        graph is traced, and every failure mode is loud:
+
+        * flag off               -> no prefix leaves, byte-identical to today.
+        * structural mismatch    -> ``GdnKeepMaskFoldContractError`` (raises).
+        * non-f32 recurrent state-> raises; splitting the T loop is the
+          identity only while the state round-trips through fp32 memory.
+        * split/merged mismatch  -> DISABLED + logged (a property of this MLX
+          build's kernel, not of this configuration).
+        """
+
+        self._fold_layer_indices = ()
+        self._fold_entries = ()
+        self._fold_windows = 0
+        self._fold_dtype = None
+        if not _gdn_fold.fable_gdn_keepmask_fold_enabled():
+            return
+
+        gdn_indices = tuple(
+            int(idx) for idx, _names in self._extra_capture_layout
+        )
+        foldable = tuple(
+            int(idx)
+            for idx, names in self._extra_capture_layout
+            if len(names) == 6
+        )
+        ple_candidates = tuple(
+            int(idx)
+            for idx, names in self._extra_capture_layout
+            if len(names) != 6
+        )
+        if len(ple_candidates) != 1:
+            raise _gdn_fold.GdnKeepMaskFoldContractError(
+                "keep-mask fold expects exactly one PLE-carrying GDN layer; "
+                f"got {len(ple_candidates)}"
+            )
+        layers = self._fold_text_layers()
+        if layers is None:
+            raise _gdn_fold.GdnKeepMaskFoldContractError(
+                "keep-mask fold could not reach the text model's layer list"
+            )
+
+        entries = tuple(cache[idx] for idx in foldable)
+        for idx, entry in zip(foldable, entries):
+            leaf = entry.cache[1]
+            if leaf is None:
+                raise _gdn_fold.GdnKeepMaskFoldContractError(
+                    f"{_gdn_fold.ENV_FLAG} layer {idx}: no recurrent state"
+                )
+            _gdn_fold.validate_state_contract(
+                leaf, label=f"{_gdn_fold.ENV_FLAG} layer {idx}"
+            )
+
+        # The prefix rows are `q`/`k`/`v` straight out of the conv, so their
+        # dtype is the conv weight's.  One template instantiation covers the
+        # prefix and the window halves, so a mismatch would read the prefix
+        # through the window's `InT` -- resolved here and asserted again on
+        # every kernel call.
+        first = layers[foldable[0]].linear_attn
+        dtype = getattr(getattr(first, "conv1d", None), "weight", None)
+        dtype = getattr(dtype, "dtype", None)
+        if dtype is None:
+            raise _gdn_fold.GdnKeepMaskFoldContractError(
+                "keep-mask fold could not resolve the GDN row dtype"
+            )
+
+        from .kernels.gdn_keepmask_fold import default_exactness_probe
+
+        windows = _gdn_fold.fable_gdn_keepmask_fold_windows()
+        report = _gdn_fold.install_gdn_keepmask_fold(
+            gdn_layer_indices=gdn_indices,
+            ple_layer_index=ple_candidates[0],
+            layer_modules=layers,
+            exactness_probe=partial(
+                default_exactness_probe, max_windows=windows
+            ),
+        )
+        if not report.get("installed"):
+            return
+        self._fold_layer_indices = foldable
+        self._fold_entries = entries
+        self._fold_windows = int(windows)
+        self._fold_dtype = dtype
+
+    def _fold_window_prefix(self, dispatch) -> tuple[list[Any], int, int]:
+        """Per-window prefix leaves, and the bases the graph must run from.
+
+        Returns ``(leaves, ring_depth, seq)``.  ``leaves`` is always the same
+        length and the same shapes -- ``5`` row tensors per foldable layer plus
+        one shared mask -- so the compiled graph traces exactly once whatever
+        the ring holds.  A ring the layers do not agree on (something outside
+        the fold rebound one state leaf) DECLINES: every base becomes the
+        entry's own leaf, which is the correct state, and the all-pad prefix
+        makes the extra rows exact no-ops.  That is today's answer at today's
+        cost, with the graph shape unchanged.
+        """
+
+        from .kernels.gdn_keepmask_fold import (
+            empty_prefix_leaves,
+            padded_prefix_leaves,
+            prefix_mask_array,
+        )
+
+        entries = dispatch["fold_entries"]
+        windows = int(dispatch["fold_windows"])
+        dtype = dispatch["fold_dtype"]
+        seq = _gdn_fold.next_window_seq()
+
+        pendings = [_gdn_fold.pending_for(entry) for entry in entries]
+        rings = {() if p is None else tuple(p.keeps) for p in pendings}
+        if len(rings) != 1:
+            _gdn_fold.note_decline("ring_depth_disagreement")
+            pendings = [None] * len(entries)
+            keeps: tuple[int, ...] = ()
+        else:
+            keeps = rings.pop()
+
+        leaves: list[Any] = []
+        for slot, (entry, pending) in enumerate(zip(entries, pendings)):
+            if pending is None or not pending.keeps:
+                base = entry.cache[1]
+                rows = empty_prefix_leaves(
+                    max_windows=windows, dtype=dtype, slot=slot
+                )
+                pending = _gdn_fold.FoldPending(
+                    base=base, rows=[], keeps=(), state=base
+                )
+            else:
+                rows = padded_prefix_leaves(
+                    pending.rows,
+                    pending.keeps,
+                    max_windows=windows,
+                    dtype=dtype,
+                )
+            leaves.extend(rows)
+            _gdn_fold.set_active(entry, pending, seq)
+        leaves.append(prefix_mask_array(keeps, max_windows=windows))
+        expected = _gdn_fold.prefix_leaf_count(len(entries))
+        if len(leaves) != expected:
+            raise _gdn_fold.GdnKeepMaskFoldContractError(
+                f"keep-mask fold built {len(leaves)} prefix leaves, "
+                f"expected {expected}"
+            )
+        _gdn_fold.note_window(len(keeps), folded=bool(keeps))
+        return leaves, len(keeps), seq
 
     def _make_fixed_m4_prefix_step(self):
         bank = self
@@ -2491,6 +2686,7 @@ class CompiledVerifyBank:
                 dispatch["hidden_variant"],
                 graph_aux=dispatch["graph_aux"],
                 return_compiled_aux=dispatch["returns_aux"],
+                fold_indices=getattr(self, "_fold_layer_indices", ()),
             )
             self._compiled[key] = fn
         dispatch["fn"] = fn
@@ -2532,6 +2728,24 @@ class CompiledVerifyBank:
         if donate:
             self._clear_shadow_leaf_refs()
 
+        # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66b): the ring's rows, at one fixed
+        # shape, plus the base each folded layer's recurrence must start from.
+        # Resolved BEFORE `state_in` is built so slot 1 can carry the base in
+        # place of the deferred commit's lazy leaf; the leaf itself stays on
+        # `entry.cache[1]` for every other consumer, which forces it and gets
+        # exactly today's state at exactly today's cost.
+        fold_leaves: list[Any] = []
+        fold_bases: dict[int, Any] = {}
+        fold_entries = dispatch.get("fold_entries") or ()
+        if fold_entries:
+            fold_leaves, _fold_depth, fold_seq = self._fold_window_prefix(
+                dispatch
+            )
+            for entry in fold_entries:
+                active = _gdn_fold.active_for(entry, fold_seq)
+                if active is not None:
+                    fold_bases[id(entry)] = active.base
+
         state_in: list[Any] = []
         for kind, entry, n_leaves in dispatch["state_plan"]:
             if kind == VERIFY_SPEC_KIND_QSA:
@@ -2545,7 +2759,14 @@ class CompiledVerifyBank:
                     )
                 )
             else:
-                state_in.extend(entry.cache[:n_leaves])
+                base = fold_bases.get(id(entry))
+                if base is None:
+                    state_in.extend(entry.cache[:n_leaves])
+                else:
+                    leaves = list(entry.cache[:n_leaves])
+                    leaves[1] = base
+                    state_in.extend(leaves)
+        state_in.extend(fold_leaves)
 
         if compiled_aux is None:
             compiled_aux = dispatch["prepare_aux"](
@@ -2617,6 +2838,15 @@ class CompiledVerifyBank:
                     captures_flat[start + 6 : start + count]
                 )
                 entry._mtplx_verify_compiled_aux = returned_aux
+
+        # Slot 1 now holds the graph's own post-window state, so the deferred
+        # descriptor no longer owns the leaf and `pending_for` would drop it
+        # anyway; clearing here releases the previous ring's base (3.1 MB a
+        # layer) at the window that superseded it rather than at the next
+        # commit.  `_mtplx_fold_active` is a DIFFERENT attribute and survives:
+        # it is what this cycle's commit reads.
+        for entry in fold_entries:
+            _gdn_fold.clear_pending(entry)
 
         if donate:
             state_in = None
@@ -2831,6 +3061,7 @@ class CompiledVerifyBank:
         layer_count: int,
         capture_len: int,
         needs_aux: bool,
+        trace_host: dict[str, Any] | None = None,
     ):
         """W67: the traced closure for layers ``0..layer_count-1``.
 
@@ -2842,11 +3073,16 @@ class CompiledVerifyBank:
         traces exactly the graph W63 traced.
         """
 
-        bank = self
+        # ``prefix_plan``'s entries are read for `kind` and `n_leaves` only --
+        # never for `_entry`, which would pin a dead request's cache -- and
+        # both are part of the shared key's `spec_sig`.  Everything live
+        # (`_spec`, `_shadow`, `runtime`) comes through the host.
+        host = {"bank": self} if trace_host is None else trace_host
         prefix_plan = dispatch["state_plan"][:layer_count]
         prefix_capture = self._extra_capture_layout[:capture_len]
 
         def _run(input_ids, compiled_aux, state_in):
+            bank = host["bank"]
             pos = 0
             for (index, _spec_kind, _spec_leaves), (
                 kind,
@@ -2907,16 +3143,18 @@ class CompiledVerifyBank:
         *,
         start_layer: int,
         capture_start: int,
+        trace_host: dict[str, Any] | None = None,
     ):
         """W67: the traced closure for layers ``start_layer..last`` + head."""
 
-        bank = self
+        host = {"bank": self} if trace_host is None else trace_host
         suffix_plan = dispatch["state_plan"][start_layer:]
         suffix_capture = self._extra_capture_layout[capture_start:]
         returns_aux = bool(dispatch["returns_aux"])
         graph_aux = dispatch["graph_aux"]
 
         def suffix_step(prefix_hidden, input_ids, compiled_aux, *state_in):
+            bank = host["bank"]
             pos = 0
             for (index, _spec_kind, _spec_leaves), (
                 kind,
@@ -2979,6 +3217,7 @@ class CompiledVerifyBank:
         the control while wearing the candidate's label.
         """
 
+        _started = time.perf_counter()
         dispatch = self._fixed_m4_dispatch
         assert dispatch is not None
         spec = tuple(self._spec or ())
@@ -3046,22 +3285,15 @@ class CompiledVerifyBank:
                 "fixed-M4 overlap split leaves no capture rows on one side: "
                 f"{prefix_capture_leaves} of {dispatch['capture_leaves']}"
             )
+        prefix_fn, suffix_fn = self._shared_or_new_overlap_split(
+            dispatch,
+            layer_count=count,
+            capture_start=capture_start,
+            needs_aux=needs_aux,
+        )
         dispatch["overlap_split"] = {
-            "prefix_fn": mx.compile(
-                self._make_fixed_m4_overlap_prefix_step(
-                    dispatch,
-                    layer_count=count,
-                    capture_len=capture_start,
-                    needs_aux=needs_aux,
-                )
-            ),
-            "suffix_fn": mx.compile(
-                self._make_fixed_m4_overlap_suffix_step(
-                    dispatch,
-                    start_layer=count,
-                    capture_start=capture_start,
-                )
-            ),
+            "prefix_fn": prefix_fn,
+            "suffix_fn": suffix_fn,
             "layer_count": count,
             "needs_aux": needs_aux,
             "ple_layer_index": ple_index,
@@ -3073,6 +3305,102 @@ class CompiledVerifyBank:
             - prefix_capture_leaves,
         }
         _graph_build_overlap.note_prefix_layers(count)
+        _graph_build_overlap.note_construction(time.perf_counter() - _started)
+
+    def _shared_or_new_overlap_split(
+        self,
+        dispatch,
+        *,
+        layer_count: int,
+        capture_start: int,
+        needs_aux: bool,
+    ):
+        """Reuse one compiled overlap pair per process for a logical key.
+
+        Mirrors ``_shared_or_new_verify_step`` exactly, and for the same
+        reason: the bank is per-generation, so building fresh closures here
+        would make ``mx.compile`` re-trace both graphs on the first cycle of
+        EVERY request, where the shipped monolithic route traces once per
+        process.  In a one-request-per-process A/B that costs nothing and is
+        invisible; in a served process it is two full re-traces per request.
+
+        The key carries everything the traced pair depends on that is not
+        already inside ``spec_sig``: the prefix depth, whether the prefix
+        takes the auxiliary, the QSA gather route, the aux contract and the
+        exact-verify kernel route.  Leaf SHAPE changes (capacity growth) are
+        ``mx.compile``'s own retrace dimension, as on the monolithic path.
+        """
+
+        if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
+            return (
+                mx.compile(
+                    self._make_fixed_m4_overlap_prefix_step(
+                        dispatch,
+                        layer_count=layer_count,
+                        capture_len=capture_start,
+                        needs_aux=needs_aux,
+                    )
+                ),
+                mx.compile(
+                    self._make_fixed_m4_overlap_suffix_step(
+                        dispatch,
+                        start_layer=layer_count,
+                        capture_start=capture_start,
+                    )
+                ),
+            )
+        from .attention_context import exact_verify_required
+
+        qsa_entries = dispatch["qsa_entries"]
+        global_key = (
+            id(self.runtime),
+            self.capture_backend,
+            self._capture_layout_override,
+            self._extra_capture_layout,
+            self._prepare_compiled_aux is not None,
+            tuple(self._spec or []),
+            int(layer_count),
+            bool(needs_aux),
+            str(dispatch["hidden_variant"] or ""),
+            int(all(entry.fixed_rows_gather for entry in qsa_entries)),
+            str(dispatch["aux_contract"]),
+            bool(exact_verify_required()),
+        )
+        entry = _SHARED_OVERLAP_SPLITS.get(global_key)
+        if entry is not None:
+            prefix_fn, suffix_fn, host, runtime_ref = entry
+            # id() can be recycled after a model swap frees the old runtime;
+            # a stale pair would replay graphs bound to freed weights.
+            if runtime_ref() is self.runtime:
+                host["bank"] = self
+                _graph_build_overlap.bump("split_shared_hits")
+                return prefix_fn, suffix_fn
+            _SHARED_OVERLAP_SPLITS.pop(global_key, None)
+        host = {"bank": self}
+        prefix_fn = mx.compile(
+            self._make_fixed_m4_overlap_prefix_step(
+                dispatch,
+                layer_count=layer_count,
+                capture_len=capture_start,
+                needs_aux=needs_aux,
+                trace_host=host,
+            )
+        )
+        suffix_fn = mx.compile(
+            self._make_fixed_m4_overlap_suffix_step(
+                dispatch,
+                start_layer=layer_count,
+                capture_start=capture_start,
+                trace_host=host,
+            )
+        )
+        _SHARED_OVERLAP_SPLITS[global_key] = (
+            prefix_fn,
+            suffix_fn,
+            host,
+            weakref.ref(self.runtime),
+        )
+        return prefix_fn, suffix_fn
 
     def _refresh_fixed_m4_split(self) -> int:
         """Recompile the overlap pair when the plan changed generation.
@@ -3107,6 +3435,15 @@ class CompiledVerifyBank:
         if self._fixed_m4_dispatch is None:
             raise RuntimeError(
                 "graph-build overlap requires an installed fixed-M4 verify"
+            )
+        if getattr(self, "_fold_layer_indices", ()):
+            # The overlap pair compiles its own prefix/suffix closures, which
+            # take no keep-mask prefix.  Running both would leave the fold
+            # armed and inert -- a null A/B that looks like a null result.
+            raise RuntimeError(
+                f"{_gdn_fold.ENV_FLAG} and MTPLX_FABLE_GRAPH_BUILD_OVERLAP "
+                "cannot be armed together: the overlap pair does not carry a "
+                "keep-mask prefix"
             )
         requested = int(
             _graph_build_overlap.layers() if layer_count is None else layer_count
@@ -3207,11 +3544,11 @@ class CompiledVerifyBank:
                 # refuses that contract at any depth past the PLE layer, so
                 # the shipped route's raw-payload spelling cannot be reached.
                 mx.async_eval(compiled_aux, *state_in)
-            outputs = self._call_overlap_prefix(
+            outputs = self._replay_overlap_prefix(
                 split["prefix_fn"], input_ids, compiled_aux, state_in
             )
         else:
-            outputs = self._call_overlap_prefix(
+            outputs = self._replay_overlap_prefix(
                 split["prefix_fn"], input_ids, None, state_in
             )
         capture_end = 1 + split["prefix_capture_leaves"]
@@ -3238,24 +3575,27 @@ class CompiledVerifyBank:
         _graph_build_overlap.bump("prefix_enqueued")
         return prefix
 
-    @staticmethod
-    def _call_overlap_prefix(prefix_fn, input_ids, compiled_aux, state_in):
-        """Replay the prefix graph, timed when the ``timing`` item is armed.
+    def _replay_overlap_prefix(self, prefix_fn, input_ids, compiled_aux, state_in):
+        """Replay the prefix graph, timed on the first call and under `timing`.
 
         The two arities are the point: at depth 1 the traced closure has no
         ``compiled_aux`` parameter at all, so passing ``None`` positionally
         would change its signature and its trace.
         """
 
-        if _GRAPH_BUILD_OVERLAP_TIMING:
+        first = self._fixed_m4_overlap_first_prefix
+        if _GRAPH_BUILD_OVERLAP_TIMING or first:
             _started = time.perf_counter()
             if compiled_aux is None:
                 outputs = tuple(prefix_fn(input_ids, *state_in))
             else:
                 outputs = tuple(prefix_fn(input_ids, compiled_aux, *state_in))
-            _graph_build_overlap.note_prefix_build(
-                time.perf_counter() - _started
-            )
+            _elapsed = time.perf_counter() - _started
+            if first:
+                self._fixed_m4_overlap_first_prefix = False
+                _graph_build_overlap.note_first_prefix_build(_elapsed)
+            if _GRAPH_BUILD_OVERLAP_TIMING:
+                _graph_build_overlap.note_prefix_build(_elapsed)
             return outputs
         if compiled_aux is None:
             return tuple(prefix_fn(input_ids, *state_in))
@@ -3361,7 +3701,8 @@ class CompiledVerifyBank:
             compiled_aux = prefix.compiled_aux
             if boundary in ("both", "pre"):
                 mx.async_eval(*state_in)
-        if _GRAPH_BUILD_OVERLAP_TIMING:
+        _first_suffix = self._fixed_m4_overlap_first_suffix
+        if _GRAPH_BUILD_OVERLAP_TIMING or _first_suffix:
             _started = time.perf_counter()
             outputs = tuple(
                 split["suffix_fn"](
@@ -3371,7 +3712,12 @@ class CompiledVerifyBank:
                     *state_in,
                 )
             )
-            _graph_build_overlap.note_suffix_build(time.perf_counter() - _started)
+            _elapsed = time.perf_counter() - _started
+            if _first_suffix:
+                self._fixed_m4_overlap_first_suffix = False
+                _graph_build_overlap.note_first_suffix_build(_elapsed)
+            if _GRAPH_BUILD_OVERLAP_TIMING:
+                _graph_build_overlap.note_suffix_build(_elapsed)
         else:
             outputs = tuple(
                 split["suffix_fn"](
@@ -4755,6 +5101,7 @@ class CompiledVerifyBank:
         *,
         graph_aux=None,
         return_compiled_aux: bool = False,
+        fold_indices: tuple[int, ...] = (),
     ):
         """Reuse one compiled verify callable per process for a logical key.
 
@@ -4779,6 +5126,7 @@ class CompiledVerifyBank:
                     hidden_variant,
                     graph_aux=graph_aux,
                     return_compiled_aux=return_compiled_aux,
+                    fold_indices=fold_indices,
                 )
             )
         spec_sig = tuple(self._spec or [])
@@ -4801,6 +5149,16 @@ class CompiledVerifyBank:
             # vice versa. Without this key a t=0.6 request's shared trace
             # would silently serve a t=0 request with non-exact kernels.
             bool(exact_verify_required()),
+            # Keep-mask fold dimension (W66b): a trace whose GDN steps take a
+            # prefix has a different input arity AND a different recurrence
+            # from one that does not.  Without this key an armed bank could be
+            # served the control's trace (silently inert) or, worse, an
+            # unarmed bank could replay a folded graph with no prefix bound.
+            # It is per-CALLER, not per-bank: only the fixed-M4 length-4
+            # installation passes a prefix, so the fallback/other-length
+            # traces on the SAME bank stay exactly what they are today.
+            tuple(fold_indices),
+            int(getattr(self, "_fold_windows", 0)) if fold_indices else 0,
         )
         entry = _SHARED_VERIFY_STEPS.get(global_key)
         if entry is not None:
@@ -4819,6 +5177,7 @@ class CompiledVerifyBank:
                 trace_host=host,
                 graph_aux=graph_aux,
                 return_compiled_aux=return_compiled_aux,
+                fold_indices=fold_indices,
             )
         )
         _SHARED_VERIFY_STEPS[global_key] = (fn, host, weakref.ref(self.runtime))
@@ -4832,12 +5191,21 @@ class CompiledVerifyBank:
         *,
         graph_aux=None,
         return_compiled_aux: bool = False,
+        fold_indices: tuple[int, ...] = (),
     ):
         spec = list(self._spec or [])
         layout = self._capture_layout()
         bank = self
         static_host = {"bank": self}
         host = trace_host if trace_host is not None else static_host
+        # W66b: closure-captured like `spec` and `layout`, and keyed into the
+        # shared-trace key beside them, so a retrace under a different bank can
+        # never disagree about whether the graph carries a prefix.  Only the
+        # fixed-M4 length-4 installation asks for it -- the fallback and
+        # other-length traces built on the same bank keep an empty tuple and
+        # are byte-identical to today.
+        fold_indices = tuple(fold_indices)
+        fold_prefix_leaves = _gdn_fold.prefix_leaf_count(len(fold_indices))
 
         del bank
 
@@ -4878,15 +5246,39 @@ class CompiledVerifyBank:
                     for slot in range(n_leaves):
                         entry.cache[slot] = state_in[pos + slot]
                 pos += n_leaves
+            # (1b) W66b keep-mask fold: `spec` consumes `state_in`
+            # positionally, so the padded prefix is simply everything after
+            # it -- 5 row tensors per foldable GDN layer plus one shared
+            # `[1, 4*W]` mask, all at fixed shapes.  The scope is trace-time
+            # scaffolding only: it exists so each layer's step wires the right
+            # prefix tracers into the graph.  Replays bind the same graph
+            # positionally and never run this body.
+            fold_scope = None
+            if fold_indices:
+                trailing = state_in[pos:]
+                if len(trailing) != fold_prefix_leaves:
+                    raise ValueError(
+                        f"compiled verify got {len(trailing)} keep-mask fold "
+                        f"leaves, expected {fold_prefix_leaves}"
+                    )
+                mask_leaf = trailing[-1]
+                fold_scope = {
+                    id(shadow[layer_index]): (
+                        *trailing[position * 5 : position * 5 + 5],
+                        mask_leaf,
+                    )
+                    for position, layer_index in enumerate(fold_indices)
+                }
             # (2) The existing runtime forward, on shadow containers only.
-            with attention_phase("decode_verify"):
-                result = live._runtime_forward(
-                    input_ids,
-                    cache=shadow,
-                    return_hidden=True,
-                    hidden_variant=hidden_variant,
-                    compiled_aux=compiled_aux,
-                )
+            with _gdn_fold.fold_prefix_scope(fold_scope):
+                with attention_phase("decode_verify"):
+                    result = live._runtime_forward(
+                        input_ids,
+                        cache=shadow,
+                        return_hidden=True,
+                        hidden_variant=hidden_variant,
+                        compiled_aux=compiled_aux,
+                    )
             logits, hidden, captures = result
             # (3) Read every leaf back out and return it explicitly.
             captures_flat: list[Any] = []

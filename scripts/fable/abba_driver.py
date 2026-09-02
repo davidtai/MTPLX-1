@@ -729,6 +729,18 @@ def _graph_build_overlap_receipt() -> dict[str, float]:
     fraction.  ``prefix_discarded`` should stay at or near zero -- every one is
     a prefix forward computed and thrown away.
 
+    ``construction_ms`` / ``construction_calls`` price
+    ``install_fixed_m4_overlap_split`` itself, and
+    ``first_prefix_build_ms`` / ``first_suffix_build_ms`` price the two
+    graphs' one-time ``mx.compile`` traces (both always on, no item needed).
+    All of it happens AFTER the prefill span -- inside
+    ``pre_first_token_setup_s`` for the install, inside decode cycle 1 for the
+    traces -- so a TTFT delta that is not accounted for by these belongs to
+    ``prefill_split``, not to this lane.  ``split_shared_hits`` says how many
+    installs reused the process-wide compiled pair: on a served process every
+    install after the first must be a hit, or every request is paying two
+    fresh traces.
+
     ``prefix_layers`` is the depth the bank INSTALLED, and it is the first
     thing to read on a W67 arm: if it is not the N the arm's
     ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS`` asked for, the row belongs to a
@@ -785,6 +797,41 @@ def _ple_candidate_prefetch_receipt() -> dict[str, float]:
         return {}
 
 
+def prefill_split_receipt(row: dict) -> dict[str, float | None]:
+    """Split ``prompt_eval_time_s`` into first chunk / rest / non-chunk.
+
+    W67's follow-up needed this reduced by hand from twelve receipts to answer
+    "did the candidate's TTFT regression come from the lever or from the first
+    prefill chunk?".  The answer was chunk 0 -- the process-cold one, whose
+    spread is ~0.7 s on BOTH arms -- while ``outside_s`` (everything in the
+    prefill span that is not chunk compute, which is where any per-request
+    construction inside the span would land) was identical to 0.5 ms.  Any
+    lane that arms construction near the request boundary wants this split at
+    a glance, so it is a standing field rather than a one-off reduce.
+    """
+
+    chunks = row.get("prefill_chunks") or []
+    prompt_eval = row.get("prompt_eval_time_s")
+    if not chunks or prompt_eval is None:
+        return {
+            "chunk0_s": None,
+            "rest_s": None,
+            "outside_s": None,
+            "chunks": len(chunks),
+        }
+    chunk0 = float(chunks[0].get("wall_s", 0.0))
+    rest = sum(float(chunk.get("wall_s", 0.0)) for chunk in chunks[1:])
+    return {
+        "chunk0_s": chunk0,
+        "rest_s": rest,
+        # prompt_eval minus chunk compute: restore/bookkeeping inside the
+        # measured prefill span.  A lane that pushed construction into prefill
+        # would show up HERE and nowhere else.
+        "outside_s": float(prompt_eval) - chunk0 - rest,
+        "chunks": len(chunks),
+    }
+
+
 def prefill_chunks_receipt() -> list[dict[str, float]]:
     """Per-chunk prefill wall and PLE-gather seconds, on BOTH arms.
 
@@ -825,6 +872,58 @@ def first_chunk_cold_s(row: Mapping[str, Any] | None) -> float | None:
         return None
 
 
+def _gdn_keepmask_fold_armed() -> bool:
+    """Whether MTPLX_FABLE_GDN_KEEPMASK_FOLD was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.fable_gdn_keepmask_fold import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _gdn_keepmask_fold_receipt(compiled_m4_calls: int) -> dict[str, Any]:
+    """W66b engagement: did the fold run on every window, and how often did
+    the ring flush?
+
+    The verdict fields are ``windows`` (must equal the arm's compiled M4
+    calls -- a window on the shipped route took the control's commit and
+    dilutes the delta by exactly that fraction), ``flushes`` per window (the
+    ring policy predicts 0.206 at W=2 under the census accept law; a much
+    higher rate means something is forcing the deferred leaf, and the FIRST
+    thing to check is which consumer), and ``declines`` (must be 0: a decline
+    is today's answer at today's cost, so an arm with declines measured a
+    blend).  ``bypassed_commits`` counts commits from a non-M4 round -- copy
+    rounds mostly -- and is expected to be small and non-zero.
+    """
+
+    try:
+        from mtplx.fable_gdn_keepmask_fold import receipt_gate, stats_snapshot
+
+        snapshot = stats_snapshot()
+        compiled = int(compiled_m4_calls)
+        snapshot["compiled_calls"] = compiled
+        if snapshot.get("windows"):
+            snapshot["flushes_per_window"] = float(
+                snapshot["flushes"] / snapshot["windows"]
+            )
+        snapshot["gate"] = receipt_gate(snapshot, compiled_windows=compiled)
+        return snapshot
+    except Exception as error:  # diagnostic field, never the measurement
+        return {"available": False, "reason": repr(error)}
+
+
 def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
     """PLE hot-row cache counters, as injected by pr391_current_profile_launcher."""
 
@@ -862,6 +961,9 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "graph_build_overlap": _graph_build_overlap_receipt(),
             "graph_build_overlap_armed": _graph_build_overlap_armed(),
             "graph_build_overlap_layers": _graph_build_overlap_layers(),
+            # W66b.  Rides the same block for the same reason: it is measured
+            # against the same retained-control census.
+            "gdn_keepmask_fold_armed": _gdn_keepmask_fold_armed(),
             # Which gather path each big row read actually took.  The pread
             # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
             # fancy index behind it, so an arm that claims the vectorised lane
@@ -2321,8 +2423,15 @@ def main() -> int:
         row["per_cycle"] = per_cycle_receipt(output.stats)
         row["ple_hot_rows"] = ple_hot_rows_receipt(runtime)
         row["prefill_chunks"] = prefill_chunks_receipt()
+        row["prefill_split"] = prefill_split_receipt(row)
         compiled = row["compiled_verify"]
         row["compiled_m4_calls"] = int(compiled.get("compiled_calls", 0))
+        # W66b keep-mask fold engagement + its own pass/fail gate, so a
+        # candidate arm can be read as "ran the lane" or "did not" without
+        # re-deriving the ring policy from the timings.
+        row["gdn_keepmask_fold"] = _gdn_keepmask_fold_receipt(
+            row["compiled_m4_calls"]
+        )
         row["configured_max_tokens"] = max_tokens
         row["finish_reason"] = output.finish_reason
         row["natural_stop"] = bool(args.natural_stop)
