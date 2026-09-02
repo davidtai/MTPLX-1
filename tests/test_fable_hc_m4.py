@@ -398,3 +398,101 @@ def test_driver_rejects_bad_tuning(kwargs, match):
 def test_dispatch_budget_is_three():
     assert hcm4.DISPATCHES_PER_READ == 3
     assert hcm4.EAGER_DISPATCHES_PER_READ == 11
+
+
+# --------------------------------------------------------------------------
+# 5. the PACK contract moves to install time
+# --------------------------------------------------------------------------
+#
+# Every term below is a property of the loaded weights, so it is the same
+# answer for every request the process will ever serve. Checking it when the
+# weights land means a mis-armed flag stops the server coming up with a
+# precise reason, instead of turning the first request that happens to reach
+# verify width into an HTTP 500.
+
+
+class _Layer:
+    """A decoder layer stand-in that owns one hyper-connection module."""
+
+    def __init__(self, module):
+        self.hyper_connection_mixer = module
+
+
+def _model(*modules, mtp_modules=()):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(layers=[_Layer(m) for m in modules]),
+            mtp=SimpleNamespace(layers=[_Layer(m) for m in mtp_modules]),
+        )
+    )
+
+
+def test_pack_validation_is_a_no_op_when_the_flag_is_off():
+    report = qwen4_exp.install_hc_m4_pack_validation(_model(_family_module()))
+    assert report == {"armed": False, "validated": 0}
+
+
+def test_pack_validation_accepts_the_family_pack(armed):
+    report = qwen4_exp.install_hc_m4_pack_validation(
+        _model(_family_module(), _family_module(use_combine=False))
+    )
+    assert report == {"armed": True, "validated": 2}
+
+
+def test_pack_validation_walks_the_mtp_layers_too(armed):
+    report = qwen4_exp.install_hc_m4_pack_validation(
+        _model(_family_module(), mtp_modules=(_family_module(),))
+    )
+    assert report["validated"] == 2
+
+
+def test_pack_validation_names_the_quantized_layer(armed):
+    bad = _family_module()
+    bad.input_mix_weight_down.scales = mx.zeros((LOWRANK, HCD // 64), mx.bfloat16)
+    with pytest.raises(RuntimeError, match=r"layers\.1\..*is quantized"):
+        qwen4_exp.install_hc_m4_pack_validation(_model(_family_module(), bad))
+
+
+def test_pack_validation_names_the_wrong_weight_shape(armed):
+    bad = _family_module()
+    bad.input_mix_weight_down.weight = mx.zeros((256, HCD), dtype=mx.bfloat16)
+    with pytest.raises(RuntimeError, match="input_mix_weight_down.weight"):
+        qwen4_exp.install_hc_m4_pack_validation(_model(bad))
+
+
+def test_pack_validation_refuses_a_model_with_nothing_to_replace(armed):
+    """An armed flag that can never do anything is a deployment error."""
+
+    with pytest.raises(RuntimeError, match="no GatedResidual"):
+        qwen4_exp.install_hc_m4_pack_validation(_model())
+
+
+def test_pack_validation_does_not_check_the_activation_dtype(armed):
+    """That term needs an activation; `_hc_m4_applies` still owns it.
+
+    It is process-invariant too (one pack, one activation dtype), so it cannot
+    single out one request either -- but it cannot be answered without a
+    forward, so it stays where the forward is.
+    """
+
+    report = qwen4_exp.install_hc_m4_pack_validation(
+        _model(_family_module(dtype=mx.float32))
+    )
+    assert report["validated"] == 1
+    with pytest.raises(ValueError, match="dtype"):
+        _family_module(dtype=mx.float32)._hc_m4_applies(
+            mx.zeros((1, 4, HCD), dtype=mx.bfloat16)
+        )
+
+
+def test_the_runtime_validates_the_pack_at_install(armed):
+    """The install hook is wired into the runtime's qwen4 section."""
+
+    import inspect
+
+    from mtplx import runtime
+
+    source = inspect.getsource(runtime)
+    assert "install_hc_m4_pack_validation(runtime.model)" in source

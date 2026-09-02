@@ -951,3 +951,46 @@ def test_stock_layout_still_leaves_the_draft_uniforms_nan(tmp_path):
 
     assert layout == log_mod.LAYOUT_STOCK
     assert np.all(np.isnan(uniforms))
+
+
+# --------------------------------------------------------------------------
+# Greedy vs temperature-1: which shape gets which path
+# --------------------------------------------------------------------------
+
+
+def test_a_greedy_request_is_routed_to_the_greedy_chain(monkeypatch):
+    """This is a SAMPLED-lane route; greedy has its own optimised path.
+
+    A greedy request consumes no PCG64 uniform and builds no top-20 support,
+    so there is nothing here for it to use. It is not left unoptimised
+    either: `generate_mtpk`'s one-sync greedy chain serves it, and with
+    MTPLX_FABLE_DRAFT_K20_PRESCATTER armed that chain reads the same
+    65,536-row pre-scatter output this route would have.
+    """
+
+    monkeypatch.setattr(contract, "_STRICT", False)
+    contract.reset_for_test()
+    greedy = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
+    receipt: dict[str, object] = {}
+    assert (
+        _claim(monkeypatch, receipt=receipt, sampler=greedy, draft_sampler=greedy)
+        is None
+    )
+    assert receipt["declined"] == "greedy_request"
+    assert "temperature > 0" in str(receipt["declined_detail"])
+
+
+def test_a_temperature_one_request_still_claims(monkeypatch):
+    monkeypatch.setattr(contract, "_STRICT", False)
+    monkeypatch.setattr(dk, "_ENABLED", True)
+    import sys
+    import types
+
+    stub = types.ModuleType("mtplx.kernels.qwen4_frspec_k20_float32_choice")
+    stub.bind_qwen4_frspec_k20_float32_choice = lambda **_kw: (lambda *a: a)
+    monkeypatch.setitem(
+        sys.modules, "mtplx.kernels.qwen4_frspec_k20_float32_choice", stub
+    )
+    sampled = SamplerConfig(temperature=1.0, top_p=0.95, top_k=K20)
+    plan = _claim(monkeypatch, sampler=sampled, draft_sampler=sampled)
+    assert isinstance(plan, dk.DeviceK20Plan)

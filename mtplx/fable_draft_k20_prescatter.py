@@ -31,12 +31,30 @@ when 73.6% of those lanes are a constant sentinel that cannot win any of it.
 
 What this module does
 ---------------------
-It builds the SAME K20 support from the 65,536-row head output, maps the
-selected LOCAL rows back to real token ids through the ranked id table, and
-hands the stock draft reader's caller the same ``(token, SparseDistribution)``
-pair.  Nothing evaluates the scattered array, and because MLX is lazy the
-scatter graph node is therefore never executed -- ``put_along_axis`` is built
-and dropped, not run.
+It reads the draft from the 65,536-row head output and maps the selected LOCAL
+rows back to real token ids through the ranked id table.  Nothing evaluates
+the scattered array, and because MLX is lazy the scatter graph node is
+therefore never executed -- ``put_along_axis`` is built and dropped, not run.
+
+There are TWO reads, because ``generate_mtpk`` has two draft readers, and this
+lane serves both:
+
+* **sampled** (``draft_sampler.temperature > 0``) -- :func:`read_draft`
+  builds the SAME K20 support the stock reader would and hands its caller the
+  same ``(token, SparseDistribution)`` pair.  Costs one host sync per draft
+  step, exactly as the stock reader does.
+* **greedy** (``temperature <= 0``) -- :func:`greedy_chain_step` returns the
+  SAME ``argmax`` token the stock greedy chain would, as an unevaluated device
+  array, with the local->real map done by one 1-element ``mx.take``.  It adds
+  no sync: the chain's single ``mx.eval`` per cycle still covers it.  Cycles
+  that fall out of the greedy chain (a copy streak, a mid-generation steering
+  arm, ``cycle_depth == 0``) land in :func:`read_draft`'s own
+  ``temperature <= 0`` branch, which is the same argmax on the host.
+
+Greedy is where this matters most: the stock greedy chain's per-depth work is
+one ``mx.full`` + ``put_along_axis`` + ``argmax`` over 248,320 lanes, of which
+73.6% are a sentinel that cannot win.  A greedy request is not an edge case --
+HumanEval, and every ``temperature: 0`` API call, is one.
 
 Exactness argument
 ------------------
@@ -99,30 +117,48 @@ temperature and ``scaled = row.astype(float32) * (1/T)``.
 5. **No consumer needs the dense draft row.**  Under this route the only
    readers of ``draft_logits`` in ``generation.generate_mtpk``'s draft loop are
    ``int(draft_logits.shape[-1])`` (a static shape, forces no evaluation) and
-   ``_tree_nbytes(draft_logits)`` under ``trace.enabled`` (also static).  Every
-   reader that would materialise the row -- ``_draft_confidence_metrics`` /
-   ``_top2_margin`` (``draft_margin_threshold`` or the policy metrics),
-   ``_greedy_draft_token_and_metrics`` (``combine_greedy_draft_read``), the
-   ``_draft_conf_needed`` block, the ``mtp_topk_reranker``, the adapter
-   ensemble, the correction cache, the A3B target-prefix route, and the
-   ``MTPLX_FRSPEC_LEGACY`` local-id remap -- is a construction-time DECLINE in
-   :func:`claim_draft_route`, not a mid-decode fallback.
+   ``_tree_nbytes(draft_logits)`` under ``trace.enabled`` (also static).
 
-Anything this lane does not implement is settled at construction, never
-mid-decode, in one of two ways (:mod:`mtplx.fable_claim_contract`):
+The greedy read's own exactness argument -- the argmax tie-break under the
+strictly increasing id map, and the traced confidence -- is on
+:func:`greedy_chain_step`.
 
-* a request SHAPE the lane does not serve -- greedy, penalties, a competing
-  owner of the draft chain -- DECLINES: the shipped selector runs, the plan is
-  ``None``, and the receipt records ``declined`` plus the reason.  It is not a
-  silent fallback, because ``installed`` stays False and no receipt ever
-  claims this selector produced a number it did not.
-* an INSTALL-time contract violation -- FR-Spec absent, the head off the live
-  draft route, a wrong-width or unordered ranked table -- still raises
-  :class:`DraftK20PrescatterIneligible`.  No request in the process could be
-  served, so failing the first one loudly is the honest report.
+Which request shape gets which path
+-----------------------------------
+======================================  ==============================
+request                                 draft read
+======================================  ==============================
+temperature 0 (greedy chain running)    pre-scatter, on device, no sync
+temperature 0 (chain skipped: ccopy,    pre-scatter, host argmax
+mid-generation steer, depth-0 cycle)
+temperature > 0 with ``top_k > 0``      pre-scatter K20 support
+temperature > 0 with ``top_k <= 0``     stock reader (top-p-only builder;
+                                        a different selector, not a
+                                        narrower one)
+a competing owner of the draft chain    that owner's reader
+(PR391 D3, DEVICE_K20, target-prefix,
+adapter ensemble, top-k reranker,
+adaptive width, correction cache)
+penalties / steering overlays           stock reader (they index by real
+                                        token id)
+``MTPLX_FRSPEC_LEGACY``                 stock reader (already remaps ids)
+======================================  ==============================
 
-``MTPLX_FABLE_STRICT_CLAIMS=1`` turns declines back into raises for a measured
-arm that must prove the lane ran.
+The rows that do not say "pre-scatter" are ROUTING, decided once at
+construction and never mid-decode: those readers are different selectors with
+their own contracts, not this one refusing to work.  The lane stands aside
+(:mod:`mtplx.fable_claim_contract`), the plan is ``None``, the shipped reader
+runs, and the receipt records ``declined`` with the reason and a per-process
+tally -- ``installed`` stays False, so no receipt ever claims this selector
+produced a number it did not.
+
+Separately, an INSTALL-time contract violation -- FR-Spec absent, the head off
+the live draft route, a wrong-width or unordered ranked table -- raises
+:class:`DraftK20PrescatterIneligible`.  No request in the process could be
+served, so failing the first one loudly is the honest report.
+
+``MTPLX_FABLE_STRICT_CLAIMS=1`` turns the routing declines into raises for a
+measured arm that must prove the lane ran.
 
 NO device work happens at import.
 """
@@ -207,6 +243,14 @@ class DraftK20PrescatterPlan:
     ids_np: np.ndarray
     """The ranked table as int64, strictly ascending, shape ``[rows]``."""
 
+    ids_mx: Any
+    """The SAME table as the head's own device array (``head._ids``).
+
+    The greedy route maps local rows to real ids on device with one
+    ``mx.take``, so nothing about the greedy chain leaves the GPU until the
+    single ``mx.eval`` the chain already does.
+    """
+
     rows: int
     """Ranked-table width (the pruned head's output domain)."""
 
@@ -220,6 +264,15 @@ class DraftK20PrescatterPlan:
     route: str
     """Which binding makes ``head`` live -- see :func:`_live_draft_route`."""
 
+    greedy: bool
+    """True when the draft sampler is greedy (``temperature <= 0``).
+
+    A greedy request reads the row with ``argmax`` and never builds a K20
+    support, so ``top_k``/``top_p`` are not part of its contract -- see
+    :func:`greedy_chain_step` and the ``temperature <= 0`` branch of
+    :func:`read_draft`.
+    """
+
     def to_dict(self) -> dict[str, object]:
         """The receipt this route writes."""
 
@@ -231,6 +284,7 @@ class DraftK20PrescatterPlan:
             "temperature": float(self.temperature),
             "top_p": float(self.top_p),
             "route": str(self.route),
+            "read": "greedy_argmax" if self.greedy else "sampled_k20",
         }
 
 
@@ -447,19 +501,28 @@ def _claim_draft_route(
     if vocab_rows <= rows or int(ids_np[-1]) >= vocab_rows:
         _refuse(f"full vocabulary width {vocab_rows} does not admit the table")
 
+    # Greedy and sampled are two ROUTES through this lane, not eligible and
+    # ineligible.  A greedy request reads the row with `argmax` (device-side
+    # inside the greedy chain, host-side in the stock loop) and never builds a
+    # K20 support, so the top-k/top-p terms below are not part of its
+    # contract; requiring them would have refused every temperature-0 request
+    # the server accepts.
+    greedy = float(draft_sampler.temperature) <= 0.0
     top_k = int(draft_sampler.top_k)
-    if top_k <= 0:
-        _decline(
-            "no_top_k",
-            "this route requires a top-k draft sampler "
-            f"(draft top_k={top_k})",
-        )
-    superset = min(max(_SUPERSET_MULTIPLIER * top_k, top_k), rows)
-    if superset > rows:  # pragma: no cover - unreachable given the min() above
-        _decline(
-            "superset_too_wide",
-            f"candidate superset {superset} exceeds the ranked table",
-        )
+    if not greedy:
+        if top_k <= 0:
+            _decline(
+                "no_top_k",
+                "the sampled route builds a top-k support; this request is "
+                f"temperature {float(draft_sampler.temperature)!r} with "
+                f"top_k={top_k}",
+            )
+        superset = min(max(_SUPERSET_MULTIPLIER * top_k, top_k), rows)
+        if superset > rows:  # pragma: no cover - unreachable given the min()
+            _decline(
+                "superset_too_wide",
+                f"candidate superset {superset} exceeds the ranked table",
+            )
     if (
         float(draft_sampler.presence_penalty) != 0.0
         or float(draft_sampler.frequency_penalty) != 0.0
@@ -473,10 +536,14 @@ def _claim_draft_route(
             "steer_or_penalties",
             "steering/penalty overlays index by real token id",
         )
-    if greedy_chain_enabled:
+    if greedy_chain_enabled and not greedy:  # pragma: no cover - unreachable
+        # `generation._greedy_chain_eligible` already requires draft
+        # temperature <= 0, so this cannot fire; it is here so a future change
+        # to that predicate cannot silently hand the greedy chain a plan whose
+        # read is the sampled one.
         _decline(
-            "greedy_chain",
-            "the greedy device chain owns the draft read",
+            "greedy_chain_without_greedy_sampler",
+            "the greedy device chain was enabled for a sampled draft sampler",
         )
     if str(draft_core) != "stock":
         _decline(
@@ -548,12 +615,14 @@ def _claim_draft_route(
     return DraftK20PrescatterPlan(
         head=head,
         ids_np=ids_np,
+        ids_mx=ids,
         rows=rows,
         vocab_rows=vocab_rows,
         top_k=top_k,
         temperature=float(draft_sampler.temperature),
         top_p=float(draft_sampler.top_p),
         route=route,
+        greedy=greedy,
     )
 
 
@@ -593,6 +662,79 @@ def take_compact_row(
             f"pre-scatter row is {int(row.shape[0])} wide, expected {plan.rows}"
         )
     return row
+
+
+def greedy_chain_step(
+    plan: DraftK20PrescatterPlan,
+    draft_logits: Any,
+    *,
+    want_confidence: bool,
+) -> tuple[Any, Any]:
+    """One depth of ``generation``'s greedy draft chain, pre-scatter.
+
+    Returns ``(token_id, confidence_or_None)`` as UNEVALUATED device arrays,
+    exactly like the stock chain's ``mx.argmax`` / ``mx.exp(...)`` nodes, so
+    the chain's single ``mx.eval`` at the end still costs one sync per cycle
+    and the local->real id map is one 1-element ``mx.take`` on device.  The
+    248,320-lane ``mx.full`` + ``put_along_axis`` behind ``draft_logits`` is
+    built and dropped, never run.
+
+    Exactness of the token
+    ----------------------
+    Write ``sub`` for the compact row, ``ids`` for the strictly ascending
+    ranked table (re-proved at claim time), and ``dense`` for the scattered
+    row: ``dense[ids[i]] == sub[i]`` and ``dense[j] == -1e30`` on every lane
+    ``j`` no id occupies.
+
+    ``mx.argmax`` returns the LOWEST index attaining the maximum.  Let
+    ``M = max(sub)``.  Every occupied lane holds a real logit and every
+    unoccupied one holds ``-1e30`` (``-9.9964e29`` after a bfloat16 head
+    output widens), so as long as ``M > -1e30`` -- true for ANY finite head
+    output; the alternative is a head that emitted no distribution at all, on
+    which the stock lane is equally undefined -- ``max(dense) == M`` and the
+    lanes attaining it are exactly ``{ids[i] : sub[i] == M}``.  Because
+    ``ids`` is strictly increasing it is order-preserving, so
+
+        min {ids[i] : sub[i] == M} == ids[ min {i : sub[i] == M} ]
+                                   == ids[argmax(sub)]
+
+    which is ``argmax(dense)``.  The tie-break is the same tie-break, not an
+    equivalent one.
+
+    The traced confidence, and why the claim routes it away
+    -------------------------------------------------------
+    ``want_confidence`` mirrors the stock chain's
+    ``exp(max(row) - logsumexp(row))``.  ``max`` is bit-identical (it is the
+    same real number, and ``max`` is exact).  ``logsumexp`` is
+    ``M + log(sum(exp(x - M)))``, and each sentinel lane contributes
+    ``exp(-1e30 - M)``, which underflows to *exactly* ``+0.0`` in float32
+    below about ``-103.97`` -- 28 orders of magnitude of headroom -- and
+    ``x + 0.0 == x`` exactly for finite ``x``.  So the two rows' logsumexps
+    are equal as REAL NUMBERS computed from the same terms.
+
+    They are NOT bit-identical.  Floating-point addition is not associative
+    and the two reductions partition their partial sums differently: measured
+    at the production shape the pair differs by about 2 ULP
+    (``17.241907119750977`` vs ``17.24190902709961``), which is ~2e-6 relative
+    on the confidence.  It cannot move a token -- the token is settled by the
+    argmax above, and ``max`` agrees to the bit -- but it WOULD move a number
+    two arms print, so :func:`claim_draft_route` routes any request that needs
+    draft-confidence telemetry (``draft_confidence_needed``, i.e.
+    ``MTPLX_DRAFT_CONFIDENCE_TRACE`` or a width threshold) to the stock reader
+    rather than shave a step and change a receipt.  With tracing off -- the
+    default, and what the server runs -- ``want_confidence`` is False and this
+    branch is not taken.  It is kept so that relaxing that routing later
+    cannot silently drop the number.
+    """
+
+    import mlx.core as mx
+
+    row = take_compact_row(plan, draft_logits)
+    local = mx.argmax(row, axis=-1)
+    token = mx.take(plan.ids_mx, local)
+    if not want_confidence:
+        return token, None
+    return token, mx.exp(mx.max(row) - mx.logsumexp(row))
 
 
 def prescatter_serial_support_arrays(

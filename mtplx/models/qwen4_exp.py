@@ -931,12 +931,51 @@ class GatedResidual(nn.Module):
                 "for this model; the kernel has no other geometry."
             )
 
+    def validate_hc_m4_pack(self, label: str = "GatedResidual") -> None:
+        """The PACK half of the MTPLX_FABLE_HC_M4 contract, at install time.
+
+        Everything here is a property of the loaded weights, so it is the same
+        answer for every request this process will ever serve.  Checking it
+        when the weights land (``install_hc_m4_pack_validation``, called from
+        the runtime's qwen4 install section) means a mis-armed flag stops the
+        server coming up with a precise reason, instead of turning the first
+        request that reaches verify width into an HTTP 500.
+
+        Not checked here: the weight/activation dtype agreement, which needs
+        an activation -- ``_hc_m4_applies`` still checks it, and it is likewise
+        process-invariant, so it cannot single out one request either.
+        """
+
+        from mtplx.kernels import qwen4_m4_hyper_read as hcm4
+
+        down = self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        for name, proj in (
+            ("input_mix_weight_down", down),
+            ("input_mix_weight_up", up),
+        ):
+            if hasattr(proj, "scales"):
+                raise RuntimeError(
+                    f"MTPLX_FABLE_HC_M4: {label}.{name} is quantized; the "
+                    "kernel reads unquantized bf16 mix weights. Unset the "
+                    "flag for this pack."
+                )
+        wi = self.block_inject_weight.weight if "block_inject_weight" in self else None
+        try:
+            hcm4.check_weight_shapes(
+                self.hc_norm.weight, down.weight, up.weight, wi
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"MTPLX_FABLE_HC_M4: {label}: {exc}") from exc
+
     def _hc_m4_applies(self, hyper_input: mx.array) -> bool:
         """Verify-width fused read gate (MTPLX_FABLE_HC_M4).
 
         Rows 2..8 only -- rows == 1 keeps whatever the draft path already
-        uses (v3, or the eager chain). Returns True or RAISES: there is no
-        silent fallback once the flag is armed and the width matches.
+        uses (v3, or the eager chain).  The row count is the one REQUEST-shaped
+        term here and it routes (returns False) rather than raising; every
+        other term is a property of the pack, re-checked here but already
+        settled at install by :meth:`validate_hc_m4_pack`.
         """
 
         if not fable_hc_m4_enabled():
@@ -1074,6 +1113,58 @@ class GatedResidual(nn.Module):
             return mixed_input
         inject = 2.0 * mx.sigmoid(self.block_inject_weight(normed) / self.hc_count)
         return mixed_input, hyper_input, inject
+
+
+def install_hc_m4_pack_validation(model: Any) -> dict[str, Any]:
+    """Validate every ``GatedResidual`` against the MTPLX_FABLE_HC_M4 contract.
+
+    Called from the runtime's qwen4 install section once the weights are
+    loaded.  A no-op (``{"armed": False}``) when the flag is off, so an
+    unarmed process pays one attribute read.
+
+    This is the INSTALL-time half of the flag's contract.  Every property it
+    checks -- quantized mix weights, weight shapes -- belongs to the pack, so
+    a failure means the flag was armed for a model the kernel cannot read.
+    That is a deployment error and it should stop the server, not fail
+    whichever request first reaches verify width.
+    """
+
+    if not fable_hc_m4_enabled():
+        return {"armed": False, "validated": 0}
+
+    validated = 0
+    text = getattr(model, "language_model", model)
+    layers = getattr(getattr(text, "model", None), "layers", None) or []
+    for index, layer in enumerate(layers):
+        for name, module in _named_gated_residuals(layer):
+            module.validate_hc_m4_pack(f"layers.{index}.{name}")
+            validated += 1
+    mtp = getattr(text, "mtp", None)
+    for mtp_index, mtp_layer in enumerate(getattr(mtp, "layers", None) or []):
+        for name, module in _named_gated_residuals(mtp_layer):
+            module.validate_hc_m4_pack(f"mtp.layers.{mtp_index}.{name}")
+            validated += 1
+    if not validated:
+        raise RuntimeError(
+            "MTPLX_FABLE_HC_M4 is armed but this model has no GatedResidual "
+            "hyper-connection module for the kernel to replace; the flag "
+            "cannot do anything here. Unset it for this model."
+        )
+    return {"armed": True, "validated": validated}
+
+
+def _named_gated_residuals(owner: Any):
+    """``(attribute name, module)`` for every GatedResidual ``owner`` holds."""
+
+    for name in dir(owner):
+        if name.startswith("__"):
+            continue
+        try:
+            value = getattr(owner, name)
+        except Exception:  # pragma: no cover - defensive: properties may raise
+            continue
+        if isinstance(value, GatedResidual):
+            yield name, value
 
 
 class SparseMoeBlock(_Qwen3NextSparseMoeBlock):

@@ -1706,3 +1706,34 @@ def test_the_generation_call_site_declines_rather_than_raising():
     # The depth-knob-without-the-lever check is process-invariant (an env
     # misconfiguration), so it still raises.
     assert "is set without " in source
+
+
+def test_the_arm_condition_has_no_sampler_term():
+    """Greedy and temperature-1 requests arm this lane identically.
+
+    The overlap splits the VERIFY graph; nothing about it depends on how the
+    draft was sampled. The only per-request terms are verify-shaped
+    (`verify_strategy`, whether a compiled verify bank exists for this
+    context), and those route rather than raise.
+    """
+
+    import ast
+    import inspect
+
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    tree = ast.parse(
+        "def f():\n" + "\n".join("    " + line for line in source.splitlines())
+    )
+    condition = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        text = ast.unparse(node.test)
+        if "_graph_build_overlap.enabled()" in text and "compiled_verify_bank" in text:
+            condition = text
+            break
+    assert condition is not None, "the graph-build-overlap arm condition moved"
+    for sampler_term in ("sampler", "temperature", "top_k", "top_p", "greedy"):
+        assert sampler_term not in condition

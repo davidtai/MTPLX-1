@@ -113,6 +113,17 @@ host shaping: it measures the model, not the selector.  The
 offline scorers read a device log unchanged.
 
 NO device work happens at import.
+
+Which request shape gets which path
+-----------------------------------
+This route is a SAMPLED-lane route: it consumes PCG64 uniforms and a fixed
+top-k support, both of which a greedy request has none of.  Greedy is not an
+unserved shape here, it is a different shape with its own optimised path --
+``generate_mtpk``'s one-sync greedy chain -- and with
+``MTPLX_FABLE_DRAFT_K20_PRESCATTER`` armed that chain reads the same 65,536-row
+pre-scatter output this route does, so a temperature-0 request loses nothing by
+not coming through here.  The claim therefore ROUTES a greedy request away
+(recorded, never raised); it does not refuse to serve it.
 """
 
 from __future__ import annotations

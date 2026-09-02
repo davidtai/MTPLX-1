@@ -22,25 +22,42 @@ every ineligible request into an outage.
 
 The contract
 ------------
-Split the checks by whether ANY request could be served:
+In order:
 
-* **Install-time contract violation -> RAISE.**  The armed flag cannot work in
-  this process at all: FR-Spec is not installed, the head is not on the live
-  draft route, the ranked table is the wrong width or not ascending, the head
-  has no capture surface, the pinned NumPy is missing.  Every request would
-  fail identically, so failing the first one loudly is the honest report --
-  this is a deployment error, not a request.
-* **Request-time ineligibility -> DECLINE.**  This particular request's shape
-  is not served: greedy, penalties, a steering guard, a correction cache, a
-  reranker, adaptive width, target-prefix verify, a competing owner of the
-  same chain.  The shipped path serves it correctly and by construction
-  produces the same tokens, so the lane stands aside, logs one line, counts
-  it, and stamps the receipt.
+1. **Make it work.**  A request shape the lane could serve is not a reason to
+   stand aside.  Greedy was the motivating case: it looked like an unservable
+   shape and it was not -- ``argmax`` over the pre-scattered rows is the same
+   ``argmax`` as over the full-vocabulary row, so
+   ``MTPLX_FABLE_DRAFT_K20_PRESCATTER`` now serves temperature-0 requests on
+   the greedy chain instead of refusing them.  Reach for the two outcomes
+   below only after establishing the lane genuinely cannot serve the shape.
+2. **Install-time contract violation -> RAISE.**  The armed flag cannot work
+   in this process at all: FR-Spec is not installed, the head is not on the
+   live draft route, the ranked table is the wrong width or not ascending, the
+   pinned NumPy is missing, the pack's weights are the wrong shape.  Every
+   request would fail identically, so this belongs at startup with a precise
+   reason -- it is a deployment error, not a request.  Raise it where the
+   thing being validated exists (model build, weight load, route install),
+   NOT on whichever request happens to reach the check first.
+3. **A genuinely different selector -> ROUTE.**  Some lanes only exist for one
+   kind of request: the device draft chain and device K20 consume PCG64
+   uniforms and a fixed top-k support, which a greedy request has none of;
+   block verification is a speculative-sampling acceptance ladder, and a
+   greedy window has no draft distributions to build one from.  The request is
+   served -- by the shipped path, or by that shape's own optimised path -- and
+   the lane records that it stood aside.  This is routing, not refusal, and it
+   is only correct when the shape has no analogue in this lane AND the
+   optimisation is not lost where it does apply.
 
-A decline is NOT a silent fallback.  ``installed`` stays False, the receipt
-carries ``declined`` (a stable key) and ``declined_detail`` (the sentence),
-and :data:`DECLINE_COUNTS` accumulates per flag and reason for the life of the
-process, so an operator can see how often a flag stood aside and why.
+Each lane's module docstring carries a table saying which request shape gets
+which path.
+
+A routing decline is NOT a silent fallback.  ``installed`` stays False, the
+receipt carries ``declined`` (a stable key) and ``declined_detail`` (the
+sentence), one line per reason per process goes to stderr beside the lanes'
+own install receipts, and :data:`DECLINE_COUNTS` accumulates per flag and
+reason for the life of the process, so an operator can see how often a flag
+stood aside and why.
 
 Benchmarks keep their fail-closed guarantee
 -------------------------------------------

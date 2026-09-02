@@ -1331,3 +1331,50 @@ def test_the_call_site_supplies_exactly_the_claim_body_signature():
     assert supplied is not None, "the device-draft-chain claim call site moved"
     supplied.discard("receipt")
     assert supplied == inner
+
+
+# --------------------------------------------------------------------------
+# Greedy vs temperature-1: which shape gets which path
+# --------------------------------------------------------------------------
+
+
+def test_a_greedy_request_is_routed_to_the_greedy_chain(monkeypatch):
+    """A SAMPLED-lane route: the compiled body bakes one temperature and a
+    top-p route and consumes PCG64 uniforms, none of which a greedy request
+    has. Greedy keeps its own one-sync chain, which reads the same
+    pre-scatter row under MTPLX_FABLE_DRAFT_K20_PRESCATTER, so nothing is
+    lost by routing it there."""
+
+    monkeypatch.setattr(ddc, "_MODE", ddc.MODE_CHAIN)
+    monkeypatch.setattr(contract, "_STRICT", False)
+    contract.reset_for_test()
+    greedy = SamplerConfig(temperature=0.0, top_k=20)
+    receipt: dict[str, object] = {}
+    plan = ddc.claim_request_route(
+        receipt=receipt,
+        **_claim_kwargs(sampler=greedy, draft_sampler=greedy),
+    )
+    assert plan is None
+    assert receipt["declined"] == "greedy_request"
+    assert "temperature > 0" in str(receipt["declined_detail"])
+
+
+def test_a_temperature_one_request_still_claims(monkeypatch):
+    monkeypatch.setattr(ddc, "_MODE", ddc.MODE_CHAIN)
+    monkeypatch.setattr(contract, "_STRICT", False)
+    # Stub the chain builder and the choice binder: building the real ones
+    # compiles a Metal kernel, which these CPU-only tests must never do (and
+    # its lru_cache would then outlive this test).
+    fake_fcd = types.ModuleType("mtplx.fable_compiled_draft")
+    fake_fcd.build_compiled_draft_chain = lambda **kwargs: {}
+    monkeypatch.setitem(sys.modules, "mtplx.fable_compiled_draft", fake_fcd)
+    fake_kernel = types.ModuleType("mtplx.kernels.qwen4_frspec_k20_float32_choice")
+    fake_kernel.bind_qwen4_frspec_k20_float32_choice = lambda *, top_p: "selector"
+    monkeypatch.setitem(
+        sys.modules,
+        "mtplx.kernels.qwen4_frspec_k20_float32_choice",
+        fake_kernel,
+    )
+    plan = ddc.claim_request_route(**_claim_kwargs())
+    assert plan is not None
+    ddc.release(plan)
