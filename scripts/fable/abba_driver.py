@@ -546,6 +546,25 @@ def _ple_prefill_lookahead_counters() -> dict[str, int]:
         return {}
 
 
+def _ple_prefill_lookahead_scope_status() -> dict[str, Any]:
+    """Whether the LAST prefill actually ran the lane, and if not, why.
+
+    ``prefill_lookahead_armed`` above answers a different question -- was the
+    environment flag set in this process -- and must keep answering it, since
+    that is the 2026-09-01 blind spot.  This answers the per-request one: a
+    prefill of one chunk has nothing to look ahead from, so the scope skips
+    the worker and records ``{"armed": False, "reason": "single_span"}``
+    rather than reporting a non-engagement.
+    """
+
+    try:
+        from mtplx.ple_prefill_lookahead import last_scope_status
+
+        return last_scope_status()
+    except Exception:
+        return {}
+
+
 def prefill_chunks_receipt() -> list[dict[str, float]]:
     """Per-chunk prefill wall and PLE-gather seconds, on BOTH arms.
 
@@ -610,6 +629,7 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "lookahead_batches": int(getattr(sidecar, "lookahead_batches", 0)),
             "prefill_lookahead": _ple_prefill_lookahead_counters(),
             "prefill_lookahead_armed": _ple_prefill_lookahead_armed(),
+            "prefill_lookahead_scope": _ple_prefill_lookahead_scope_status(),
         }
     except Exception as error:  # diagnostic field, never the measurement
         print(
