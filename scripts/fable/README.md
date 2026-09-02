@@ -8,6 +8,7 @@ prompt, 1,024 output tokens, temperature 1 / top-p 0.95 / top-k 20, reasoning
 | --- | --- |
 | `abba_driver.py` | One arm. Loads the model once, runs the requested seeds, writes a receipt JSON. |
 | `abba_window.py` | The bracket. Runs as the guard's direct child and spawns one `abba_driver.py` per arm. |
+| `micro_shared_lane.py` | Prices the M4 shared expert and the `MTPLX_FABLE_SHARED_LANE` second-stream lane. Falsifier for program row 9. |
 | `humaneval_screen.py` | The quality gate. One guarded window = one server on :8091 + full HumanEval pass@1 + a receipt. |
 
 Ported from the reviewed PR391 driver `/private/tmp/pr391_fixed_d3_abba.py`
@@ -704,6 +705,110 @@ paired routed-GLU lane's head and refuses to install without it). Because the
 tuple is bit-exact there is no quality screen: acceptance and the digest are
 unchanged by construction, and `install_qwen4_m4_stage3` proves that per layer
 on the real packs before the first token.
+
+### micro_shared_lane.py
+
+Prices the physical-M4 **shared expert** and the second-stream lane that hides
+it (`MTPLX_FABLE_SHARED_LANE=1`).
+
+Read the premise correction first, because it changes the size of the prize.
+The retained-stack census reports `MoE shared` at 251.7 MB/cycle and
+**135-203 GB/s**, and that rate is *not a measurement*: the instrumented MLX
+build times command buffers, not kernels, so `census_retained_stack.py` fits
+four global coefficients by NNLS and then splits each buffer's measured
+duration across its ops in proportion to their *modelled* cost. The GB/s column
+is therefore monotone in bytes-per-dispatch, not in memory efficiency -- and
+the control and composed censuses report this family with identical dispatch
+counts (144.0/cyc) and identical bytes (251.7 MB/cyc) but 203 vs 135 GB/s. The
+classifier also has no entry for the three retained custom MoE kernels
+(`paired_routed_glu`, `routed_down_reduce`, `routed_shared_residual_tail`), so
+their real time -- the routed-down reduce alone measures **79.1 us/layer** in
+the 18,333 three-op buffers that isolate it, i.e. 3.8 ms/cycle -- is booked as
+zero-byte `Norm/elementwise` and smeared over everything else in the buffer.
+
+The capture cannot bracket the shared branch either: exactly one buffer shape
+in the whole census isolates any of it (381 occurrences, 1.0/cycle, 139.62 us
+median) and it holds the shared **down** matvec *and* the paired routed GLU,
+whose own byte-driven spread (p10 115.88, p90 158.12) is wider than the matvec
+being solved for. The shared down projection is somewhere in **0-35 us/layer**
+and nothing on disk narrows it. That is what this micro is for.
+
+Arms: `shared_gu`, `shared_down`, `shared_branch` (the three-dispatch chain
+isolated), `routed` (paired GLU + routed-down reduce + residual tail with a
+resident constant `shared_down`, so no shared branch is in the graph at all),
+`stock` (routed + the branch on the default stream = today), `lane` (routed +
+the branch on a second `mx.gpu` stream).
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 3600 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/micro_shared_lane.py \
+    --layers 48 --reps 200 \
+    --out /tmp/micro-shared-lane.json
+```
+
+`--plan` prints the byte/memory model and exits without importing MLX
+(resident footprint 1.82 GB: one 512-expert q4 bank plus 48 distinct shared
+packs).
+
+Read it as:
+
+* `stock - routed` = what the shared branch costs the window **today**. This is
+  the ceiling on anything program row 9 can win. The byte floor is
+  8.7 us/layer (0.418 ms/cycle at 600 GB/s); if the measured cost is within
+  about 2x of that, **close row 9** -- the census's 1.24-1.86 ms/cycle claim
+  was an apportionment artifact and there is nothing to take.
+* `lane - stock` = the number an ABBA window should reproduce, once per verify
+  cycle. MLX charges two cross-stream fences per layer (a `barrier()` plus a
+  one-thread `fence_update` on the producer, a spinning `fence_wait` on the
+  consumer -- `mlx/backend/metal/fence.cpp`), roughly four extra tiny
+  dispatches per layer, ~0.25 ms/cycle at this program's measured 1.83 us
+  dependent launch. The overlap has to beat that.
+
+Known bias: all 48 harness layers share ONE 512-expert routed bank (48
+distinct banks would be ~67 GB), so the routed kernels run warmer than
+production and the window the branch can hide inside is **smaller** here than
+in the model. A win is real; a loss is not conclusive on its own.
+
+Adoption bar: `parity.bit_exact` must be true -- the lane emits identical ops
+with identical arguments and only changes the stream they are recorded on, so
+any difference at all is a defect and the script exits non-zero. Then the
+verifier window:
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 5400 --child-timeout-seconds 9000 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/abba_window.py \
+    --sequence 16384:1024 \
+    --order ABBA \
+    --python /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+    --control-flag=--prewarm-ngram-table \
+    --candidate-extra-env MTPLX_FABLE_SHARED_LANE=1 \
+    --out-dir /Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/fable/w65-shared-lane
+```
+
+`MTPLX_QWEN4_M4_ROUTED_GLU=1` is already in `CONTROL_CANDIDATE_ENV`, so both
+arms are on the retained lane and the lane refuses to install without it.
+Because the branch is bit-exact by construction there is no quality screen:
+acceptance and the response digest are unchanged, and
+`install_qwen4_m4_stage3` proves it per layer on the real packs before the
+first token. That install gate covers the *eager* graph; equivalence inside
+the outer compiled verify graph rests on `mlx/compile.cpp::compile_fuse`
+refusing to fuse across streams (so the branch's one elementwise group cannot
+be regrouped) plus the window's response digest, which is the thing that would
+catch a future MLX relaxing that guard. The install report carries `shared_lane.armed` and
+`shared_lane.installed` separately, so a flat A/B can still be told apart from
+a lane that never engaged.
 
 ## HumanEval quality screen (non-bit-exact kernels)
 

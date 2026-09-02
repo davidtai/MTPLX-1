@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -19,6 +20,7 @@ from .kernels.qwen4_m4_routed_down import (
 )
 from .kernels.qwen4_m4_routed_glu import bind as bind_routed_glu
 from .kernels import qwen4_m4_route as _route_kernel
+from .kernels import qwen4_m4_shared_lane as _shared_lane
 from .models.qwen4_exp import (
     DecoderLayer,
     SparseMoeBlock,
@@ -28,6 +30,8 @@ from .models.qwen4_exp import (
 )
 from .runtime_options import env_bool
 
+
+logger = logging.getLogger(__name__)
 
 ROWS = 4
 TOP_K = 10
@@ -218,6 +222,46 @@ def reset_fable_route_kernel_cache() -> None:
     _ROUTE_KERNEL_VEC_LANES_CACHE = None
 
 
+#: Runs the physical-M4 shared-expert branch (q8/g64 gate/up GEMV, the fused
+#: split + SiLU * up, and the q8/g64 down GEMV) on a SECOND ``mx.gpu`` stream so
+#: those three dispatches overlap the paired routed GLU and the routed-down
+#: reduce instead of occupying barrier waves of their own.  Off by default.
+#:
+#: Bit-exactness is a property of construction: the ops, their arguments and
+#: their order are byte-for-byte the shipped ones (``_shared_lane._emit_branch``
+#: is the single definition both arms call), and only the ``Stream`` they are
+#: recorded on differs.  Install still proves it per layer with
+#: ``mx.array_equal``; unlike the route kernel -- where a flipped near-tie would
+#: change WHICH experts run -- a mismatch here means the stream changed a value
+#: it cannot change, so the lane disables itself and logs rather than raising.
+#: Contract failures (a shared expert this lane is not contracted for) always
+#: raise: they mean the arm measured a different pack.
+#:
+#: See ``mtplx/kernels/qwen4_m4_shared_lane.py`` for the measured per-layer
+#: dispatch anatomy this lane is derived from, why the shared rows cannot join
+#: the paired routed GLU's q4/group-32 grid, and the fence cost the overlap has
+#: to beat.
+FABLE_SHARED_LANE_ENV = "MTPLX_FABLE_SHARED_LANE"
+
+_SHARED_LANE_CACHE: bool | None = None
+
+
+def fable_shared_lane_enabled() -> bool:
+    """Return the ``MTPLX_FABLE_SHARED_LANE`` gate; read once, default off."""
+
+    global _SHARED_LANE_CACHE
+    if _SHARED_LANE_CACHE is None:
+        _SHARED_LANE_CACHE = env_bool(FABLE_SHARED_LANE_ENV, default=False)
+    return _SHARED_LANE_CACHE
+
+
+def reset_fable_shared_lane_cache() -> None:
+    """Drop the memoized shared-lane gate.  Test-support only."""
+
+    global _SHARED_LANE_CACHE
+    _SHARED_LANE_CACHE = None
+
+
 def qwen4_m4_stage3_flags() -> tuple[bool, bool, bool, bool]:
     """Capture and validate the complete construction-time feature route."""
 
@@ -228,11 +272,13 @@ def qwen4_m4_stage3_flags() -> tuple[bool, bool, bool, bool]:
     )
     routed_glu_enabled = qwen4_m4_routed_glu_enabled()
     route_kernel_enabled = fable_route_kernel_enabled()
+    shared_lane_enabled = fable_shared_lane_enabled()
     if not stage3_enabled and (
         routed_down_reduce_enabled
         or routed_down_residual_tail_enabled
         or routed_glu_enabled
         or route_kernel_enabled
+        or shared_lane_enabled
     ):
         raise ValueError("qwen4 M4 child routes require M4 stage3")
     _validate_feature_combination(
@@ -241,6 +287,7 @@ def qwen4_m4_stage3_flags() -> tuple[bool, bool, bool, bool]:
         routed_glu_enabled=routed_glu_enabled,
         moe_expert_major_enabled=fable_moe_expert_major_enabled(),
         route_kernel_enabled=route_kernel_enabled,
+        shared_lane_enabled=shared_lane_enabled,
     )
     if route_kernel_enabled:
         # Read now so a typo'd sweep value fails at flag capture, before any
@@ -261,6 +308,7 @@ def _validate_feature_combination(
     routed_glu_enabled: bool = False,
     moe_expert_major_enabled: bool = False,
     route_kernel_enabled: bool = False,
+    shared_lane_enabled: bool = False,
 ) -> None:
     if routed_down_residual_tail_enabled and not routed_down_reduce_enabled:
         raise ValueError(
@@ -277,6 +325,11 @@ def _validate_feature_combination(
         raise ValueError(
             f"{FABLE_ROUTE_KERNEL_ENV} replaces the routing head of the paired "
             "routed-GLU lane and requires MTPLX_QWEN4_M4_ROUTED_GLU"
+        )
+    if shared_lane_enabled and not routed_glu_enabled:
+        raise ValueError(
+            f"{FABLE_SHARED_LANE_ENV} re-homes the shared-expert branch of the "
+            "paired routed-GLU lane and requires MTPLX_QWEN4_M4_ROUTED_GLU"
         )
 
 
@@ -466,6 +519,7 @@ def _m4_paired_routed_glu_residual_tail_forward(
     hyper: mx.array,
     inject: mx.array,
     route=None,
+    shared_lane: bool = False,
 ) -> mx.array:
     """Retained lane: paired routed GLU producer plus the fused residual tail.
 
@@ -520,20 +574,17 @@ def _m4_paired_routed_glu_residual_tail_forward(
         expert_ids,
     )
 
-    shared = block.shared_expert
-    shared_gu = mx.quantized_matmul(
-        x,
-        shared.gu_weight,
-        shared.gu_scales,
-        shared.gu_biases,
-        transpose=True,
-        group_size=shared.group_size,
-        bits=shared.bits,
-        mode=shared.mode,
+    # MTPLX_FABLE_SHARED_LANE: identical ops, identical arguments, identical
+    # order -- only the stream they are recorded on differs, so the result is
+    # bit-exact by construction (and proved per layer at install).  On the
+    # second stream the three shared dispatches overlap the paired routed GLU
+    # and the routed-down reduce instead of sitting in barrier waves of their
+    # own; MLX pays for that with one fence crossing in each direction.
+    shared_down = (
+        _shared_lane.shared_branch(block, x)
+        if shared_lane
+        else _shared_lane.stock_shared_branch(block, x)
     )
-    shared_gate, shared_up = mx.split(shared_gu, 2, axis=-1)
-    shared_h = nn.silu(shared_gate) * shared_up
-    shared_down = shared.down_proj(shared_h).reshape(4, 2560)
 
     return routed_down_residual_tail(
         routed_h,
@@ -604,6 +655,7 @@ def _m4_paired_routed_glu_residual_tail_layer_forward(
         hyper,
         inject,
         route=getattr(layer, "_mtplx_m4_route", None),
+        shared_lane=getattr(layer, "_mtplx_m4_shared_lane", False),
     )
 
 
@@ -869,6 +921,8 @@ def _installation_report(
     moe_expert_major_enabled: bool = False,
     route_kernel_enabled: bool = False,
     route_kernel_vec_lanes: int | None = None,
+    shared_lane_enabled: bool = False,
+    shared_lane_layers: int = 0,
 ) -> dict[str, Any]:
     return {
         "installed": True,
@@ -909,6 +963,25 @@ def _installation_report(
                 else _route_kernel.EAGER_DISPATCHES_PER_LAYER
             ),
         },
+        "shared_lane": {
+            # "armed" and "installed" are deliberately separate: a lane whose
+            # per-layer exactness check failed disables itself, and an A/B that
+            # read flat must be able to tell "ran and did nothing" from "never
+            # ran".
+            "armed": bool(shared_lane_enabled),
+            "installed": bool(shared_lane_enabled and shared_lane_layers > 0),
+            "layers": shared_lane_layers,
+            "branch_dispatches_per_layer": (
+                _shared_lane.BRANCH_DISPATCHES_PER_LAYER
+            ),
+            "fence_dispatches_per_layer": (
+                _shared_lane.FENCE_DISPATCHES_PER_LAYER
+                if shared_lane_layers
+                else 0
+            ),
+            "weight_bytes_per_layer": _shared_lane.BYTES_PER_LAYER,
+            "exactness_failures": _shared_lane.COUNTERS["exactness_failures"],
+        },
         "exact_layers": layer_count,
         "combined_residual_tail_layers": (
             layer_count if routed_down_residual_tail_enabled else 0
@@ -924,6 +997,7 @@ def _install_validated_plans(
     routed_glu_enabled: bool = False,
     routed_glu=None,
     route=None,
+    shared_lane: bool = False,
 ) -> None:
     """Mutate only the complete plan set after validation and exact self-checks."""
 
@@ -939,6 +1013,9 @@ def _install_validated_plans(
             # parameter dict, and the forward reads it with getattr so an
             # un-armed layer never pays a branch on a missing attribute.
             layer._mtplx_m4_route = route
+            # Plain bool; read with getattr in the forward so an un-armed layer
+            # never pays a branch on a missing attribute.
+            layer._mtplx_m4_shared_lane = bool(shared_lane)
             layer.__class__ = _M4PairedRoutedGluResidualTailDecoderLayer
         elif routed_down_residual_tail_enabled:
             layer._mtplx_m4_routed_down_residual_tail = routed_down_reduce
@@ -969,12 +1046,18 @@ def install_qwen4_m4_stage3(
     route_kernel_vec_lanes = (
         fable_route_kernel_vec_lanes() if route_kernel_enabled else None
     )
+    # Read before validation, not next to its first use: an install reached
+    # directly (rather than through qwen4_m4_stage3_flags) with the lane armed
+    # and the paired routed-GLU lane off would otherwise install nothing and
+    # report a flat A/B as "the lane did not help".
+    shared_lane_enabled = fable_shared_lane_enabled()
     _validate_feature_combination(
         routed_down_reduce_enabled=routed_down_reduce_enabled,
         routed_down_residual_tail_enabled=routed_down_residual_tail_enabled,
         routed_glu_enabled=routed_glu_enabled,
         moe_expert_major_enabled=expert_major_enabled,
         route_kernel_enabled=route_kernel_enabled,
+        shared_lane_enabled=shared_lane_enabled,
     )
     validated_plans = _build_install_plans(
         layers,
@@ -988,6 +1071,12 @@ def install_qwen4_m4_stage3(
         # _build_install_plans so an owner-type problem reports as one.
         for index, (_, block, _, _) in enumerate(validated_plans):
             _route_kernel.check_contract(block, index=index)
+    if shared_lane_enabled:
+        # Contract failures RAISE: the lane's whole justification is the
+        # measured dispatch anatomy of the q8/group-64 shared expert, so a
+        # different pack means the arm is measuring something else.
+        for index, (_, block, _, _) in enumerate(validated_plans):
+            _shared_lane.check_contract(block, index=index)
     stage3 = bind()
     routed_down_reduce = (
         bind_residual_tail()
@@ -1043,6 +1132,26 @@ def install_qwen4_m4_stage3(
                         f"{FABLE_ROUTE_KERNEL_ENV} layer {index}: {name} is "
                         "not bit-exact with the stock routing scaffold"
                     )
+        if shared_lane_enabled:
+            # The lane re-homes three dispatches onto a second stream without
+            # touching an operand, so this can only fail if a stream changed a
+            # value it cannot change.  That is a defect in the runtime, not a
+            # rounding-class trade, so the lane disables itself and says so
+            # rather than raising and taking the whole model down with it.
+            want = _shared_lane.stock_shared_branch(block, sample)
+            got = _shared_lane.shared_branch(block, sample)
+            same = mx.array_equal(want, got)
+            mx.eval(same)
+            if not bool(same.item()):
+                _shared_lane.COUNTERS["exactness_failures"] += 1
+                shared_lane_enabled = False
+                logger.warning(
+                    "%s layer %d: the second-stream shared branch is not "
+                    "bit-exact with the stock branch; disabling the lane for "
+                    "every layer (this arm now measures the stock path)",
+                    FABLE_SHARED_LANE_ENV,
+                    index,
+                )
         stock = None if routed_down_residual_tail_enabled else block(sample)
         reference = _m4_forward(block, sample, stage3)
         if routed_down_residual_tail_enabled:
@@ -1126,7 +1235,10 @@ def install_qwen4_m4_stage3(
         routed_glu_enabled=routed_glu_enabled,
         routed_glu=expert_major_glu if expert_major_glu is not None else routed_glu,
         route=route,
+        shared_lane=shared_lane_enabled,
     )
+    if shared_lane_enabled:
+        _shared_lane.COUNTERS["installed_layers"] += len(plans)
     report = _installation_report(
         layer_count=len(plans),
         max_delta=max_delta,
@@ -1136,6 +1248,15 @@ def install_qwen4_m4_stage3(
         moe_expert_major_enabled=expert_major_enabled,
         route_kernel_enabled=route_kernel_enabled,
         route_kernel_vec_lanes=route_kernel_vec_lanes,
+        shared_lane_enabled=shared_lane_enabled,
+        shared_lane_layers=len(plans) if shared_lane_enabled else 0,
+    )
+    logger.info(
+        "%s",
+        _shared_lane.engagement_line(
+            installed_layers=len(plans) if shared_lane_enabled else 0,
+            enabled=shared_lane_enabled,
+        ),
     )
     runtime.qwen4_m4_stage3_report = report
     return report
@@ -1146,11 +1267,13 @@ __all__ = [
     "FABLE_MOE_EXPERT_MAJOR_ENV",
     "FABLE_ROUTE_KERNEL_ENV",
     "FABLE_ROUTE_KERNEL_VEC_LANES_ENV",
+    "FABLE_SHARED_LANE_ENV",
     "bind_qwen4_m4_residual_tail",
     "fable_moe_sorted_enabled",
     "fable_moe_expert_major_enabled",
     "fable_route_kernel_enabled",
     "fable_route_kernel_vec_lanes",
+    "fable_shared_lane_enabled",
     "install_qwen4_m4_stage3",
     "qwen4_m4_routed_down_reduce_enabled",
     "qwen4_m4_routed_down_residual_tail_enabled",
@@ -1160,4 +1283,5 @@ __all__ = [
     "reset_fable_moe_sorted_cache",
     "reset_fable_moe_expert_major_cache",
     "reset_fable_route_kernel_cache",
+    "reset_fable_shared_lane_cache",
 ]
