@@ -403,10 +403,11 @@ run a single arm as the guard's direct child.
 
 ## Microbenchmarks
 
-`micro_dispatch_overhead.py`, `micro_moe_dedup.py`, `micro_expert_major.py` and
-`micro_hc_read.py` price one site at the fixed-M4 verifier's shapes without
-loading the model. They import MLX and therefore need the SAME guarded window
-as an ABBA arm; none of them touch `com.tea.qwen`, so they can share a window.
+`micro_dispatch_overhead.py`, `micro_moe_dedup.py`, `micro_expert_major.py`,
+`micro_hc_read.py` and `micro_route_kernel.py` price one site at the fixed-M4
+verifier's shapes without loading the model. They import MLX and therefore need
+the SAME guarded window as an ABBA arm; none of them touch `com.tea.qwen`, so
+they can share a window.
 
 `micro_hc_read.py` prices the gated-residual read (`GatedResidual.__call__`,
 97 reads/cycle, 11 dispatches and 13.21 MB of bf16 mix weights each). Variant
@@ -435,6 +436,45 @@ sources and why bit-equality is not reachable). Then confirm on the verifier
 with an ABBA arm carrying `--candidate-env MTPLX_FABLE_HC_M4=1`; the gate is
 acceptance parity, not a digest. Quality is a separate window: see the
 HumanEval quality screen below.
+
+### micro_route_kernel.py
+
+Prices the MoE routing head (census item 4 plus the two GEMVs around it):
+`block.gate` q8 GEMV, precise softmax, `argpartition` top-10,
+`take_along_axis`, the bf16 renormalise, the shared-gate GEMV and its sigmoid
+-- **ten dispatches per layer, 480 per cycle, for 44 numbers and 40 indices**.
+`mtplx/kernels/qwen4_m4_route.py` emits the same
+`(expert_ids, route_scores, shared_factor)` tuple in two.
+
+Arms: `stock` (the shipped head), `k1` (the kernel at MLX's own `qmv_wide`
+thread layout, 4,160 threads), `k4` (each verifier vector on its own lane
+octet, 16,640 threads -- bit-identical to `k1` by construction, since the
+per-vector accumulation sequence is untouched). The script is a `VEC_LANES`
+decision, not a go/no-go: the -8 dispatches/layer land either way.
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 3600 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/micro_route_kernel.py \
+    --layers 48 --reps 200 \
+    --out /tmp/micro-route-kernel.json
+```
+
+Adoption bar: **parity must print `EXACT` on every arm** -- the routing head
+decides which experts run, so `set_diff`, `order_diff`, `ids`, `scores` and
+`shared` must all be 0, and the script exits non-zero otherwise. With that
+clean, arm the winning `VEC_LANES` on the verifier through an ABBA window
+carrying `--candidate-env MTPLX_QWEN4_M4_ROUTED_GLU=1
+--candidate-env MTPLX_FABLE_ROUTE_KERNEL=1` (the route kernel replaces the
+paired routed-GLU lane's head and refuses to install without it). Because the
+tuple is bit-exact there is no quality screen: acceptance and the digest are
+unchanged by construction, and `install_qwen4_m4_stage3` proves that per layer
+on the real packs before the first token.
 
 ## HumanEval quality screen (non-bit-exact kernels)
 
@@ -756,6 +796,15 @@ cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
 flag's gating and narrowing, every eligibility raise, CPU references of each
 Metal body pinned against the stock chain it replaces, and the dispatch-map
 receipt above.
+
+`tests/test_fable_route_kernel.py` runs entirely on the CPU stream (51 cases):
+the routing head's tie rule derived from MLX 0.32.2's `sort.h` and proved
+against `mx.argsort` on constructed exact ties, the four rounding boundaries
+the Metal source transcribes (bf16 sum order, bf16 divide, the bf16 sigmoid
+decomposition, precise-softmax dtype), the geometry invariants that pin
+`k_lanes = 8`, source tripwires on the load-bearing spellings, and every
+construction-time refusal. It cannot execute the kernel; the bit-exactness
+claim itself is gated per layer inside `install_qwen4_m4_stage3`.
 
 `tests/test_compiled_copy_round.py` is pure Python (`mtplx.context_copy`
 imports only `functools` and `os`): the read-once
