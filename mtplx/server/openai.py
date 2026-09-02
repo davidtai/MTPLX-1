@@ -2738,7 +2738,20 @@ class ServerState:
         # zero — measured: 262K cold prefill peaked at 87.4 GB on a 128 GiB
         # M5 Max (weights 77.3 + KV 6.4 + aux + flat reserve), against the
         # dense-priced ~115 GB that #393 observed wedging the machine.
-        _plan_transient_per_token = _plan_transient_from_config(_plan_model_config)
+        # The transient is LINEAR in the prefill chunk width, and the width
+        # is operator-settable (MTPLX_PREFILL_CHUNK_SIZE). Reading the
+        # function's 2048 default here under-priced any widened geometry by
+        # exactly that ratio, which is the one number a chunk-width A/B must
+        # not get wrong.
+        try:
+            from mtplx.generation import _prefill_chunk_size as _plan_chunk_size
+
+            _plan_prefill_chunk = int(_plan_chunk_size())
+        except Exception:
+            _plan_prefill_chunk = 2048
+        _plan_transient_per_token = _plan_transient_from_config(
+            _plan_model_config, chunk_size=_plan_prefill_chunk
+        )
         if _plan_transient_per_token:
             try:
                 from mtplx.models.qwen4_exp import (

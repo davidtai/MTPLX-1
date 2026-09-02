@@ -316,6 +316,29 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # preparation/cache staging/selection. Independently gated so the
         # Metal selector can be A/B tested without graph capture.
         "MTPLX_COMPILED_QSA_INDEXER",
+        # Prefill chunk width. Already an operator-overridable PROFILE key,
+        # but the A/B harness routes construction-time overrides through
+        # MODEL_RUNTIME_ENV_OVERRIDE_KEYS (--candidate-env) and refuses
+        # non-MTPLX_FABLE_* keys on the raw --env passthrough, so before this
+        # the width was unreachable from a window. Set it WITH
+        # MTPLX_QSA_PREFILL_COMPILE_ROWS: the QSA prefill graph bank only
+        # captures its own row width, and mtplx.fable_prefill_chunk refuses
+        # the mismatch rather than let every full chunk fall back silently.
+        "MTPLX_PREFILL_CHUNK_SIZE",
+        "MTPLX_PREFILL_CHUNK_SIZE_DENSE",
+        "MTPLX_PREFILL_CHUNK_SIZE_REPAGE",
+        # Blocked-sequential GDN prefill (omlx port, kernels/gdn_blocked_
+        # prefill.py). Microbenched 1.89x at T=2048 on real GDN shapes
+        # (11d1b1a8); default off "pending the live TTFT A/B", which the tree
+        # has no record of ever completing -- every earlier serve-level
+        # reading was stock-vs-stock until 42952d43 fixed the module-binding
+        # sweep. Registered so a window can arm it without patching env.
+        "MTPLX_GDN_BLOCKED_PREFILL",
+        "MTPLX_GDN_BLOCKED_PREFILL_MIN_T",
+        "MTPLX_GDN_BLOCKED_PREFILL_TB",
+        "MTPLX_GDN_BLOCKED_PREFILL_DEBUG",
+        "MTPLX_GDN_BLOCKED_PREFILL_FORCE_STOCK",
+        "MTPLX_GDN_PREFILL_COMPONENT_TIMING",
         # Matrix-shaped QSA prefill pipeline: byte-bounded tiled MLX scoring,
         # dedicated Metal top-k, and direct block-sparse attention.  All
         # shipped profiles keep it off until numeric and production A/B gates.
