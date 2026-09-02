@@ -1248,6 +1248,59 @@ choice kernel's own CPU oracle, the draw accounting against a flag-off
 
 ---
 
+## micro_draft_k20.py — the FR-Spec draft row, scattered vs compact
+
+`MTPLX_FABLE_DRAFT_K20_PRESCATTER` (`mtplx/fable_draft_k20_prescatter.py`)
+builds each draft step's K20 support from the FR-Spec head's 65,536-row output
+instead of the 248,320-wide scatter it is padded into, and maps the selected
+LOCAL rows back to real token ids through the ranked table. Because MLX is
+lazy and nothing under this route evaluates the scattered array, the
+`put_along_axis` is built and dropped rather than run — so the step loses the
+scatter AND shrinks both device passes (`argpartition` to 80, full-vocabulary
+`logsumexp`) by 3.79x.
+
+This bench prices that with no model in front of it, and re-measures on the
+Metal stream the one exactness claim the CPU tests cannot settle: whether the
+two DIFFERENT-WIDTH `logsumexp` reductions associate their float32 partials
+identically. The sentinel terms are exactly `+0.0` (float32 `exp` underflows
+below ~-103.97 and the pad is `-1.67e30` after the temperature divide), so the
+sums are equal as real numbers; only the reduction tree is in question, and a
+residual ULP there cannot change the SUPPORT.
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_draft_k20.py \
+    --lane queued --reps 200 --parity-rows 32 \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-draft-k20.json
+```
+
+Default shape: `65536x248320`, the production FR-Spec pair. Variants:
+`stock_scatter_serial` (what the lane pays: scatter + the shipped builder over
+248,320, host tail and sync included), `stock_serial_only` (the builder alone,
+on an already-materialised row), `scatter_only` (`mx.full` + `put_along_axis`,
+device-terminated), `prescatter_serial`, `stock_read` / `prescatter_read` (the
+whole draft read including `_serial_row_distribution` and the one `rng.choice`
+draw) and two `read_floor`s.
+
+**Decision rule.** The draft chain is three sync-terminated steps per window.
+`stock_read - prescatter_read` in 0.3–0.6 ms/step (1.0–1.8 ms/window) is the
+expectation; below ~0.15 ms the gate is not worth carrying.
+
+Parity is counted, never asserted: `support_ids_differing`,
+`support_prob_bits_differing` and `draw_rows_differing` must be 0, while
+`logsumexp_ulp_nonzero_rows` / `logsumexp_ulp_max_abs` bound the reduction-tree
+residual rather than gating on it. `--self-test` runs the ranked-table and ULP
+helpers with no MLX and no lock.
+
+---
+
 ## Confidence-gated depth 4: the probe (`MTPLX_FABLE_DEPTH4_PROBE`)
 
 L §D. H killed adaptive depth from *history* (acceptance is memoryless across
