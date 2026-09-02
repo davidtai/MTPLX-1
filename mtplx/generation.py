@@ -774,6 +774,190 @@ def _guard_prefill_chunk_geometry(
         rt.diagnostic_counters["prefill_chunk_plan_width"] = int(plan.chunk_size)
 
 
+def _text_model_args(rt: MTPLXRuntime):
+    """The served ``TextArgs``, or None for a family that has none."""
+
+    node = getattr(rt, "model", None)
+    for _ in range(4):
+        if node is None:
+            return None
+        args = getattr(node, "args", None)
+        if args is not None and hasattr(args, "num_experts_per_tok"):
+            return args
+        node = getattr(node, "language_model", None) or getattr(node, "model", None)
+    return None
+
+
+def _expert_major_groups(
+    rt: MTPLXRuntime,
+    spans: Sequence[tuple[int, int]],
+    *,
+    chunk_size: int | None,
+    capture_boundaries: bool,
+    vision_splice: Any | None,
+) -> tuple[list[list[tuple[int, int]]], Any]:
+    """Partition prefill spans into expert-major groups (or one span each).
+
+    ``MTPLX_FABLE_PREFILL_EXPERT_MAJOR``, off by default and decided ONCE per
+    request, before any kernel is submitted -- the same construction-time
+    contract as ``mtplx.fable_prefill_chunk``.  Returns
+    ``(groups, plan_or_None)``; ``plan is None`` means the shipped chunk-major
+    loop runs and the process is byte-identical to an unarmed one.
+
+    Every way this can decline bumps a counter.  A lane that quietly serves
+    the control while wearing the candidate's label is the one failure an A/B
+    cannot survive.
+    """
+
+    from mtplx import fable_prefill_expert_major as expert_major
+
+    singles = [[span] for span in spans]
+    if not expert_major.enabled():
+        return singles, None
+    if not spans:
+        expert_major.count("declined_no_spans")
+        return singles, None
+    if vision_splice is not None:
+        raise expert_major.ExpertMajorRefusal(
+            f"{expert_major.ENV_FLAG}=1 does not compose with a vision splice"
+        )
+    policy = expert_major.boundary_policy()
+    if capture_boundaries and policy == "refuse":
+        # Layer-major never holds all 48 layers' recurrent state at an
+        # interior chunk end, so per-chunk GDN boundary capture and grouping
+        # are mutually exclusive.  Default is to keep the boundaries.
+        expert_major.count("refused_boundary_capture")
+        return singles, None
+    args = _text_model_args(rt)
+    if args is None:
+        expert_major.count("declined_no_model_args")
+        return singles, None
+    if getattr(rt, "model", None) is None or not hasattr(
+        rt.model, "forward_prefill_group"
+    ):
+        raise expert_major.ExpertMajorRefusal(
+            f"{expert_major.ENV_FLAG}=1 on a model with no group schedule"
+        )
+
+    from mtplx.fable_prefill_chunk import (
+        _default_resident_bytes,
+        resolve_budget_bytes,
+    )
+
+    configured = (
+        _prefill_chunk_size() if chunk_size is None else max(1, int(chunk_size))
+    )
+    plan = expert_major.plan_group(
+        chunk_rows=configured,
+        top_k=int(args.num_experts_per_tok),
+        num_experts=int(args.num_experts),
+        hidden=int(args.hidden_size),
+        moe_intermediate=int(args.moe_intermediate_size),
+        hc_count=int(args.hc_count),
+        budget_bytes=resolve_budget_bytes(),
+        resident_bytes=int(_default_resident_bytes() or 0),
+        policy=policy,
+    )
+    rt.diagnostic_counters["prefill_expert_major_group"] = int(plan.group)
+    rt.diagnostic_counters["prefill_expert_major_rows_per_expert"] = int(
+        plan.rows_per_expert
+    )
+    rt.diagnostic_counters["prefill_expert_major_delta_bytes"] = int(
+        plan.delta_bytes
+    )
+    if not plan.engaged:
+        expert_major.count("declined_budget")
+        return singles, plan
+    groups = expert_major.group_spans(spans, plan.group, chunk_rows=configured)
+    expert_major.count("groups", len(groups))
+    expert_major.count("grouped_chunks", sum(len(g) for g in groups if len(g) > 1))
+    if capture_boundaries:
+        expert_major.count(
+            "boundaries_coarsened", len(spans) - len(groups)
+        )
+    return groups, plan
+
+
+def _prefill_group_forward(
+    rt: MTPLXRuntime,
+    body_array,
+    group: Sequence[tuple[int, int]],
+    cache,
+    *,
+    base_hidden_variant: str,
+    final_logits_only: bool,
+    history_window_tokens: int | None,
+    history_start_token_index: int,
+    cursor: int,
+    vision_splice: Any | None,
+) -> list[tuple[Any, Any]]:
+    """One forward for a group of chunks; ``[(logits, hidden)]`` in order.
+
+    A one-span group is the shipped chunk-major call, expression for
+    expression -- including the cache-only route for a chunk whose hidden the
+    history window does not need, and the same three-way eval.  Only a
+    multi-span group takes the layer-major schedule, which always returns
+    hidden (it is the ``_last_widened`` the trunk already built).
+    """
+
+    if len(group) == 1:
+        start, end = group[0]
+        chunk_array = body_array[:, start:end]
+        chunk_len = end - start
+        token_end_index = cursor + 1 + chunk_len
+        needs_history_hidden = (
+            history_window_tokens is None
+            or token_end_index > history_start_token_index
+        )
+        chunk_embeddings = None
+        if vision_splice is not None:
+            from mtplx.vision.splice import spliced_chunk_embeddings
+
+            chunk_embeddings = spliced_chunk_embeddings(
+                rt.embed_tokens, chunk_array, vision_splice
+            )
+        with attention_phase("prefill"):
+            if needs_history_hidden:
+                logits_chunk, hidden_chunk = rt.forward_ar(
+                    chunk_array,
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=base_hidden_variant,
+                    emit_logits=not final_logits_only,
+                    input_embeddings=chunk_embeddings,
+                )
+            else:
+                hidden_chunk = None
+                logits_chunk = _prefill_cache_only_forward(
+                    rt, chunk_array, cache, input_embeddings=chunk_embeddings
+                )
+        if hidden_chunk is None:
+            if logits_chunk is None:
+                _eval_cache_roots(cache)
+            else:
+                _eval(logits_chunk)
+        elif logits_chunk is None:
+            _eval(hidden_chunk)
+        else:
+            _eval(logits_chunk, hidden_chunk)
+        return [(logits_chunk, hidden_chunk)]
+
+    with attention_phase("prefill"):
+        outputs = rt.forward_ar_prefill_group(
+            [body_array[:, start:end] for start, end in group],
+            cache=cache,
+            return_hidden=True,
+            hidden_variant=base_hidden_variant,
+            emit_logits=not final_logits_only,
+        )
+    leaves = [leaf for pair in outputs for leaf in pair if leaf is not None]
+    if leaves:
+        _eval(*leaves)
+    else:
+        _eval_cache_roots(cache)
+    return [tuple(pair) for pair in outputs]
+
+
 def _ple_stage_seconds() -> float:
     """Cumulative host time inside the PLE n-gram stage gather, or 0.0."""
 
@@ -6717,164 +6901,172 @@ def _prefill_committed_mtp_history_streaming(
     _guard_prefill_chunk_geometry(
         rt, mtp_streaming_spans, chunk_size=prefill_chunk_size
     )
+    # Expert-major grouping (MTPLX_FABLE_PREFILL_EXPERT_MAJOR, off by
+    # default). Unarmed this is one group per span and every expression below
+    # is the shipped one; armed, a group's chunks share one layer-major
+    # forward so the routed MoE GEMM sees the whole group's rows at once.
+    prefill_groups, _ = _expert_major_groups(
+        rt,
+        mtp_streaming_spans,
+        chunk_size=prefill_chunk_size,
+        capture_boundaries=capture_boundaries,
+        vision_splice=vision_splice,
+    )
     # PLE n-gram prefill lookahead (MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD, off
     # by default). Every prompt token is known here, so a worker thread can
     # hash and page-warm chunk k+1's 32,768 sidecar rows while chunk k's
     # forward owns the GPU. The census measures those gathers as 8 host-late
-    # stalls totalling 2,313 ms with the GPU fully idle.
+    # stalls totalling 2,313 ms with the GPU fully idle. It stays keyed on
+    # CHUNK spans: the group stages its chunks one at a time, at the PLE
+    # layer, in chunk order.
     with _ple_prefill_lookahead_scope(rt, body, mtp_streaming_spans):
-        for start, end in mtp_streaming_spans:
+        for group_spans_ in prefill_groups:
             _check_postcommit_abort(abort_check)
-            chunk_array = body_array[:, start:end]
-            chunk_len = end - start
-            token_start_index = cursor + 1
-            token_end_index = token_start_index + chunk_len
-            needs_history_hidden = (
-                history_window_tokens is None or token_end_index > history_start_token_index
+            group_started = time.perf_counter()
+            group_gather_before = _ple_stage_seconds()
+            group_outputs = _prefill_group_forward(
+                rt,
+                body_array,
+                group_spans_,
+                cache,
+                base_hidden_variant=base_hidden_variant,
+                final_logits_only=final_logits_only,
+                history_window_tokens=history_window_tokens,
+                history_start_token_index=history_start_token_index,
+                cursor=cursor,
+                vision_splice=vision_splice,
             )
-            chunk_embeddings = None
-            if vision_splice is not None:
-                from mtplx.vision.splice import spliced_chunk_embeddings
-
-                chunk_embeddings = spliced_chunk_embeddings(
-                    rt.embed_tokens, chunk_array, vision_splice
+            group_wall_s = time.perf_counter() - group_started
+            group_gather_s = _ple_stage_seconds() - group_gather_before
+            for group_index, ((start, end), (logits_chunk, hidden_chunk)) in enumerate(
+                zip(group_spans_, group_outputs)
+            ):
+                _check_postcommit_abort(abort_check)
+                chunk_len = end - start
+                token_start_index = cursor + 1
+                token_end_index = token_start_index + chunk_len
+                started = group_started
+                # A group's chunks share one forward, so the whole wall is charged
+                # to the chunk that opened it (nothing in the group is available
+                # before the group finishes) and the rest record 0.  ``group_chunks``
+                # is on every record so a reader cannot mistake a 0 for a fast chunk.
+                chunk_wall_s = group_wall_s if group_index == 0 else 0.0
+                target_forward_time += chunk_wall_s
+                # Cheap: two perf_counter reads and one dict per chunk.  The PLE
+                # gather is a host stall INSIDE the chunk's wall, so recording both
+                # separates "the GPU was slow" from "the host was late".
+                _record_prefill_chunk(
+                    start=float(start),
+                    end=float(end),
+                    wall_s=chunk_wall_s,
+                    ple_gather_s=group_gather_s if group_index == 0 else 0.0,
+                    group_chunks=float(len(group_spans_)),
                 )
-            started = time.perf_counter()
-            gather_before = _ple_stage_seconds()
-            with attention_phase("prefill"):
-                if needs_history_hidden:
-                    logits_chunk, hidden_chunk = rt.forward_ar(
-                        chunk_array,
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                        emit_logits=not final_logits_only,
-                        input_embeddings=chunk_embeddings,
-                    )
-                else:
-                    hidden_chunk = None
-                    logits_chunk = _prefill_cache_only_forward(
-                        rt, chunk_array, cache, input_embeddings=chunk_embeddings
-                    )
-            if hidden_chunk is None:
-                if logits_chunk is None:
-                    _eval_cache_roots(cache)
-                else:
-                    _eval(logits_chunk)
-            elif logits_chunk is None:
-                _eval(hidden_chunk)
-            else:
-                _eval(logits_chunk, hidden_chunk)
-            chunk_wall_s = time.perf_counter() - started
-            target_forward_time += chunk_wall_s
-            # Cheap: two perf_counter reads and one dict per chunk.  The PLE
-            # gather is a host stall INSIDE the chunk's wall, so recording both
-            # separates "the GPU was slow" from "the host was late".
-            _record_prefill_chunk(
-                start=float(start),
-                end=float(end),
-                wall_s=chunk_wall_s,
-                ple_gather_s=_ple_stage_seconds() - gather_before,
-            )
-            _runtime_count(rt, "prefill_chunks")
-            if chunk_callback is not None:
-                try:
-                    now = time.perf_counter()
-                    phase_start = chunk_started_s if chunk_started_s is not None else started
-                    chunk_elapsed = max(0.0, now - started)
-                    elapsed = max(0.0, now - phase_start)
-                    tokens_done = int(cursor + chunk_len)
-                    chunk_tok_s = (
-                        float(chunk_len) / chunk_elapsed
-                        if chunk_elapsed > 0.0
-                        else None
-                    )
-                    cumulative_tok_s = (
-                        float(tokens_done) / elapsed
-                        if elapsed > 0.0 and tokens_done > 0
-                        else None
-                    )
-                    chunk_callback(
-                        {
-                            "phase": "chunk",
-                            "tokens_done": tokens_done,
-                            "tokens_total": int(len(prompt_ids)),
-                            "cached_tokens": int(cached_tokens),
-                            "elapsed_s": elapsed,
-                            "prefill_tok_s": cumulative_tok_s,
-                            "cumulative_prefill_tok_s": cumulative_tok_s,
-                            "prefill_wall_tok_s": cumulative_tok_s,
-                            "live_prefill_tok_s": (
-                                chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
-                            ),
-                            "chunk_size": int(chunk_len),
-                            "chunk_elapsed_s": chunk_elapsed,
-                            "chunk_prefill_tok_s": chunk_tok_s,
-                        }
-                    )
-                except Exception:
-                    pass
-            _check_postcommit_abort(abort_check)
-
-            if hidden_chunk is not None:
-                token_ids = prompt_ids[token_start_index : token_start_index + chunk_len]
-                slice_start = max(0, history_start_token_index - token_start_index)
-                if slice_start < len(token_ids):
-                    sliced_token_ids = token_ids[slice_start:]
-                    sliced_hidden = hidden_chunk[
-                        :,
-                        slice_start : slice_start + len(sliced_token_ids),
-                        :,
-                    ]
-                    history_embeddings = None
-                    if vision_splice is not None and pad_prefix_counts is not None:
-                        window_start = token_start_index + slice_start
-                        window_end = window_start + len(sliced_token_ids)
-                        if (
-                            pad_prefix_counts[window_end]
-                            > pad_prefix_counts[window_start]
-                        ):
-                            from mtplx.vision.splice import (
-                                spliced_embeddings_for_window,
-                            )
-
-                            history_embeddings = spliced_embeddings_for_window(
-                                rt.embed_tokens,
-                                prompt_array[:, window_start:window_end],
-                                vision_splice,
-                                rows_before=pad_prefix_counts[window_start],
-                            )
-                    prompt_history_time += _append_mtp_history(
-                        rt,
-                        mtp_history_cache,
-                        sliced_hidden,
-                        sliced_token_ids,
-                        phase="prefill",
-                        mtp_hidden_variant=mtp_hidden_variant,
-                        position_offset=(
-                            token_start_index + slice_start
-                            if use_absolute_positions
-                            else token_start_index + slice_start - 1
-                            if history_window_tokens is not None
+                _runtime_count(rt, "prefill_chunks")
+                if chunk_callback is not None:
+                    try:
+                        now = time.perf_counter()
+                        phase_start = chunk_started_s if chunk_started_s is not None else started
+                        chunk_elapsed = max(0.0, now - started)
+                        elapsed = max(0.0, now - phase_start)
+                        tokens_done = int(cursor + chunk_len)
+                        chunk_tok_s = (
+                            float(chunk_len) / chunk_elapsed
+                            if chunk_elapsed > 0.0
                             else None
-                        ),
-                        force_eval=True,
-                        input_embeddings=history_embeddings,
-                    )
-                    _check_postcommit_abort(abort_check)
-            cursor += chunk_len
-            boundary_hidden = (
-                hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
-            )
-            del hidden_chunk
-            del logits_chunk
-            target_forward_time += _prefill_chunk_cache_cleanup(rt)
-            if capture_boundaries:
-                _capture_gdn_boundary(
-                    gdn_boundary_sink, cursor, cache, hidden_last=boundary_hidden
+                        )
+                        cumulative_tok_s = (
+                            float(tokens_done) / elapsed
+                            if elapsed > 0.0 and tokens_done > 0
+                            else None
+                        )
+                        chunk_callback(
+                            {
+                                "phase": "chunk",
+                                "tokens_done": tokens_done,
+                                "tokens_total": int(len(prompt_ids)),
+                                "cached_tokens": int(cached_tokens),
+                                "elapsed_s": elapsed,
+                                "prefill_tok_s": cumulative_tok_s,
+                                "cumulative_prefill_tok_s": cumulative_tok_s,
+                                "prefill_wall_tok_s": cumulative_tok_s,
+                                "live_prefill_tok_s": (
+                                    chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
+                                ),
+                                "chunk_size": int(chunk_len),
+                                "chunk_elapsed_s": chunk_elapsed,
+                                "chunk_prefill_tok_s": chunk_tok_s,
+                            }
+                        )
+                    except Exception:
+                        pass
+                _check_postcommit_abort(abort_check)
+
+                if hidden_chunk is not None:
+                    token_ids = prompt_ids[token_start_index : token_start_index + chunk_len]
+                    slice_start = max(0, history_start_token_index - token_start_index)
+                    if slice_start < len(token_ids):
+                        sliced_token_ids = token_ids[slice_start:]
+                        sliced_hidden = hidden_chunk[
+                            :,
+                            slice_start : slice_start + len(sliced_token_ids),
+                            :,
+                        ]
+                        history_embeddings = None
+                        if vision_splice is not None and pad_prefix_counts is not None:
+                            window_start = token_start_index + slice_start
+                            window_end = window_start + len(sliced_token_ids)
+                            if (
+                                pad_prefix_counts[window_end]
+                                > pad_prefix_counts[window_start]
+                            ):
+                                from mtplx.vision.splice import (
+                                    spliced_embeddings_for_window,
+                                )
+
+                                history_embeddings = spliced_embeddings_for_window(
+                                    rt.embed_tokens,
+                                    prompt_array[:, window_start:window_end],
+                                    vision_splice,
+                                    rows_before=pad_prefix_counts[window_start],
+                                )
+                        prompt_history_time += _append_mtp_history(
+                            rt,
+                            mtp_history_cache,
+                            sliced_hidden,
+                            sliced_token_ids,
+                            phase="prefill",
+                            mtp_hidden_variant=mtp_hidden_variant,
+                            position_offset=(
+                                token_start_index + slice_start
+                                if use_absolute_positions
+                                else token_start_index + slice_start - 1
+                                if history_window_tokens is not None
+                                else None
+                            ),
+                            force_eval=True,
+                            input_embeddings=history_embeddings,
+                        )
+                        _check_postcommit_abort(abort_check)
+                cursor += chunk_len
+                boundary_hidden = (
+                    hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
                 )
-            del boundary_hidden
-            _check_postcommit_abort(abort_check)
+                del hidden_chunk
+                del logits_chunk
+                target_forward_time += _prefill_chunk_cache_cleanup(rt)
+                # A GROUP is the boundary granularity, never a chunk inside
+                # one: layer-major leaves ``cache`` holding the state after
+                # the WHOLE group at every layer, so a snapshot taken at an
+                # interior chunk end would be labelled with a position it does
+                # not describe.  Ungrouped (the default) this is every chunk,
+                # exactly as before.
+                if capture_boundaries and group_index == len(group_spans_) - 1:
+                    _capture_gdn_boundary(
+                        gdn_boundary_sink, cursor, cache, hidden_last=boundary_hidden
+                    )
+                del boundary_hidden
+                _check_postcommit_abort(abort_check)
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)

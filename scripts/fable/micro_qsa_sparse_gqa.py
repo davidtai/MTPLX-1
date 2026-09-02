@@ -812,11 +812,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rope-theta", type=float, default=10_000_000.0)
     p.add_argument("--seed", type=int, default=20260902)
     p.add_argument("--out", type=str, default=None)
+    p.add_argument("--allow-unlocked", action="store_true")
     return p
+
+
+#: Evidence that ``bench/laguna/run_guarded.py`` launched this process.  The
+#: lock FILE always exists and is normally held by whoever owns the box, so
+#: checking for it proves nothing and a flock probe only says "somebody" -- it
+#: cannot say "this run's guard".  ``abba_driver.acquire_guard(mode="auto")``
+#: keys on exactly these two env vars, and so does this.  (Added by w53 after
+#: an unguarded smoke run of a sibling micro landed on a live battery.)
+GUARD_ENV_VARS = ("MTPLX_DSV4_GUARD_WINDOW_PATH", "MTPLX_GUARD_ATTEST_FD")
+
+
+def require_guard_window(allow_unlocked: bool) -> None:
+    """Refuse to issue Metal work outside a guarded window."""
+
+    if allow_unlocked:
+        return
+    if any(os.environ.get(name) for name in GUARD_ENV_VARS):
+        return
+    raise SystemExit(
+        "no GPU guard evidence ("
+        + " / ".join(GUARD_ENV_VARS)
+        + " unset): run this under bench/laguna/run_guarded.py.  The lock file "
+        "existing is NOT evidence -- it is normally held by another job, and "
+        "starting Metal work here interrupts it.  --allow-unlocked overrides."
+    )
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    require_guard_window(args.allow_unlocked)
     names = [c.strip() for c in args.cells.split(",") if c.strip()]
     for name in names:
         if name not in CELLS:
