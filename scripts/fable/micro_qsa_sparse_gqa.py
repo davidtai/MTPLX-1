@@ -618,14 +618,25 @@ def run_cell(cell: dict, args) -> dict:
         "pos_start": cell["pos_start"],
     }
 
-    report["identity"] = check_identity(
+    identity = check_identity(
         cell, args.identity_sample_rows, not args.no_strict_identity
     )
-    print(
-        f"  [identity] OK on {report['identity']['rows_checked']} rows "
-        f"({report['identity']['rows_token_sampled']} token-sampled)",
-        flush=True,
-    )
+    report["identity"] = identity
+    # Never print OK over a failure list: with --no-strict-identity the check
+    # is downgraded to a warning, and a receipt that still said OK would be
+    # the most misleading line in the file.
+    if identity["failures"]:
+        print(
+            f"  [identity] FAILED on {identity['rows_checked']} rows "
+            f"(--no-strict-identity): {identity['failures'][0]}",
+            flush=True,
+        )
+    else:
+        print(
+            f"  [identity] OK on {identity['rows_checked']} rows "
+            f"({identity['rows_token_sampled']} token-sampled)",
+            flush=True,
+        )
 
     # ---- parity, on row windows ----
     windows = parity_windows(cell["rows"], args.parity_window, args.parity_windows)
@@ -859,6 +870,8 @@ def main(argv=None) -> int:
             )
         report = run_cell(cell, args)
         results["cells"][name] = report
+        for line in report["identity"]["failures"]:
+            failures.append(f"{name}/identity: {line}")
         for arm, entry in report["parity"].items():
             for line in entry["tolerance_failures"]:
                 failures.append(f"{name}/{arm}: {line}")
@@ -872,7 +885,7 @@ def main(argv=None) -> int:
         print(f"\n[out] {path}", flush=True)
 
     if failures:
-        print("\n[TOLERANCE FAILURES]", flush=True)
+        print("\n[FAILURES]", flush=True)
         for line in failures:
             print(f"  {line}", flush=True)
         if not args.no_fail_on_tolerance:
