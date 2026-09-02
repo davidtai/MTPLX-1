@@ -3313,8 +3313,19 @@ class QSAIndexer(nn.Module):
         qk_rows: Optional[mx.array],
         *,
         decode: bool,
+        write_only: bool = False,
     ) -> Optional[mx.array]:
-        """Shared arithmetic behind the explicit prefill/decode entry points."""
+        """Shared arithmetic behind the explicit prefill/decode entry points.
+
+        ``write_only`` (MTPLX_FABLE_MTP_KV_ONLY_APPEND) keeps every cache
+        write -- the raw index keys and the pooled block bank -- and skips
+        ONLY the selection the caller is about to discard: the query half's
+        norm/rope preparation and the scorer.  The compiled route expresses
+        exactly this as its existing ``update_only`` mode, whose graph shares
+        ``raw_next``/``pooled_next`` with every selecting mode (see
+        ``kernels/qsa_indexer_compile.py::_make_compiled``), so the cache
+        contents are bit-identical either way.
+        """
 
         B, S, _ = hidden.shape
         if decode != (S == 1):
@@ -3325,11 +3336,15 @@ class QSAIndexer(nn.Module):
         last_nb = T // self.ratio
         fixed_capacity = bool(getattr(cache, "fixed_capacity", False))
         if not fixed_capacity:
-            compiled_mode = self._compiled_mode(
-                decode=decode,
-                rows=S,
-                total=T,
-                last_nb=last_nb,
+            compiled_mode = (
+                "update_only"
+                if write_only
+                else self._compiled_mode(
+                    decode=decode,
+                    rows=S,
+                    total=T,
+                    last_nb=last_nb,
+                )
             )
             compiled_source = hidden if qk_rows is None else qk_rows
             if self._compiled_route_supported(
@@ -3363,6 +3378,12 @@ class QSAIndexer(nn.Module):
             # Raises on a module/pack mismatch -- an armed flag never reverts
             # to the stock chain behind a performance mystery.
             self._require_m4_contract(cache, S)
+        if write_only:
+            # The query half of index_qk_proj is already computed (one shared
+            # GEMV); only its norm+rope preparation is skipped, along with
+            # every scorer below.
+            q = None
+        elif fused_m4:
             q = self._prepare_queries_m4(q, pos_start)
         elif fixed_capacity:
             q = self._prepare_queries_eager(q, pos_start)
@@ -3371,6 +3392,8 @@ class QSAIndexer(nn.Module):
 
         cache.write_raw(k)
         pooled = self._extend_pooled(cache, T, fused_m4=fused_m4)
+        if write_only:
+            return None
         nb_total = 0 if pooled is None else pooled.shape[1]
         if fused_m4:
             return self._select_m4(q, pos_start, cache, pooled)
@@ -3463,8 +3486,11 @@ class QSAIndexer(nn.Module):
         pos_start: int,
         cache: QSACache,
         qk_rows: Optional[mx.array],
+        write_only: bool = False,
     ) -> Optional[mx.array]:
-        return self._call_rows(hidden, pos_start, cache, qk_rows, decode=True)
+        return self._call_rows(
+            hidden, pos_start, cache, qk_rows, decode=True, write_only=write_only
+        )
 
     def _call_prefill(
         self,
@@ -3472,8 +3498,11 @@ class QSAIndexer(nn.Module):
         pos_start: int,
         cache: QSACache,
         qk_rows: Optional[mx.array],
+        write_only: bool = False,
     ) -> Optional[mx.array]:
-        return self._call_rows(hidden, pos_start, cache, qk_rows, decode=False)
+        return self._call_rows(
+            hidden, pos_start, cache, qk_rows, decode=False, write_only=write_only
+        )
 
     def __call__(
         self,
@@ -3481,13 +3510,15 @@ class QSAIndexer(nn.Module):
         pos_start: int,
         cache: QSACache,
         qk_rows: Optional[mx.array] = None,
+        *,
+        write_only: bool = False,
     ) -> Optional[mx.array]:
         B, S, _ = hidden.shape
         if B != 1:
             raise NotImplementedError("qwen4_exp QSA serves single sequences (B=1)")
         if S == 1:
-            return self._call_decode(hidden, pos_start, cache, qk_rows)
-        return self._call_prefill(hidden, pos_start, cache, qk_rows)
+            return self._call_decode(hidden, pos_start, cache, qk_rows, write_only)
+        return self._call_prefill(hidden, pos_start, cache, qk_rows, write_only)
 
 
 def _qsa_rows_gather_attention(
@@ -3717,7 +3748,20 @@ class Attention(nn.Module):
             else None
         )
 
-    def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
+    def __call__(
+        self, x: mx.array, cache: QSACache, *, kv_only: bool = False
+    ) -> Optional[mx.array]:
+        """Gated GQA over the QSA-selected visible set.
+
+        ``kv_only`` (MTPLX_FABLE_MTP_KV_ONLY_APPEND) computes ONLY what the
+        caches consume for these rows -- the indexer's raw/pooled writes and
+        the attention K/V write -- and returns None.  ``q_proj``, ``q_norm``,
+        the query rope, the output gate, the attention product and ``o_proj``
+        never run, because the caller discards the hidden output.  Every
+        expression that feeds a cache write is the one the full path
+        evaluates, in the same order, so the written state is bit-identical.
+        """
+
         B, S, _ = x.shape
         pos_start = cache.offset
         vrope = vision_rope_state()
@@ -3735,24 +3779,33 @@ class Attention(nn.Module):
                 q, k, v = outs
                 idx_rows = None
             sel_mask = (
-                self.indexer(x, pos_start, cache, qk_rows=idx_rows)
+                self.indexer(
+                    x, pos_start, cache, qk_rows=idx_rows, write_only=kv_only
+                )
                 if self.indexer is not None
                 else None
             )
         else:
             sel_mask = None
             if self.indexer is not None:
-                sel_mask = self.indexer(x, pos_start, cache)
-            q = self.q_proj(x)
+                sel_mask = self.indexer(x, pos_start, cache, write_only=kv_only)
+            # The row-concat fusion above pops q_proj/k_proj/v_proj, so a
+            # fused pack cannot skip the query GEMV; an unfused one can, and
+            # q_proj is this layer's largest weight.
+            q = None if kv_only else self.q_proj(x)
             k = self.k_proj(x)
             v = self.v_proj(x)
 
-        q, gate = mx.split(q.reshape(B, S, self.n_heads, -1), 2, axis=-1)
-        gate = gate.reshape(B, S, -1)
+        if kv_only:
+            gate = None
+        else:
+            q, gate = mx.split(q.reshape(B, S, self.n_heads, -1), 2, axis=-1)
+            gate = gate.reshape(B, S, -1)
         k = k.reshape(B, S, self.n_kv_heads, -1)
         v = v.reshape(B, S, self.n_kv_heads, -1)
 
-        q = self.q_norm(q)
+        if not kv_only:
+            q = self.q_norm(q)
         k = self.k_norm(k)
         if vrope is not None and self._mrope_axes is not None:
             # Vision request: image tokens rope at (t, h, w) grid positions
@@ -3780,7 +3833,8 @@ class Attention(nn.Module):
             cos, sin = _shared_rope_cos_sin_half(
                 pos_start, int(S), self._inv_freq, self._rope_attention_scaling
             )
-            q = _apply_partial_rope_half(q, cos, sin)
+            if not kv_only:
+                q = _apply_partial_rope_half(q, cos, sin)
             k = _apply_partial_rope_half(k, cos, sin)
             cos = sin = None
         else:
@@ -3789,12 +3843,21 @@ class Attention(nn.Module):
                 positions, self._inv_freq, self._rope_attention_scaling
             )
         if cos is not None:
-            q = _apply_partial_rope(q, cos, sin)
+            if not kv_only:
+                q = _apply_partial_rope(q, cos, sin)
             k = _apply_partial_rope(k, cos, sin)
 
-        q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
+        if kv_only:
+            # The KV write is the whole point of the call; the fetched slices
+            # feed an attention product nobody reads.  ``update_and_fetch``
+            # mutates the cache in place (stock KVCache) or reassigns its
+            # leaves (TensorOffsetKVCache), so dropping the return keeps the
+            # written state and the advanced offset.
+            cache.kv.update_and_fetch(k, v)
+            return None
+        q = q.transpose(0, 2, 1, 3)
         k, v = cache.kv.update_and_fetch(k, v)
         T = k.shape[2]
 
@@ -4817,11 +4880,25 @@ class DecoderLayer(nn.Module):
             self.ple = PLELayer(args, args.ple_layer_ids.index(layer_idx + 1))
         self._hc = args.hc_count
 
-    def __call__(self, hidden, *, input_ids, ssm_mask, cache):
+    def __call__(self, hidden, *, input_ids, ssm_mask, cache, kv_only=False):
         if "ple" in self:
             hidden = hidden + self.ple(hidden, input_ids, cache)
 
         mixed, hyper, inject = self.attn_hyper_connection(hidden)
+        if kv_only:
+            # MTPLX_FABLE_MTP_KV_ONLY_APPEND: the caller wants this layer's
+            # cache writes and nothing else.  ``mixed`` is the attention
+            # input the full path builds, so the K/V and indexer rows are
+            # bit-identical; ``hyper``/``inject`` stay unevaluated (lazy) and
+            # the residual writes, the MLP hyper read and the 512-expert MoE
+            # never run.
+            if self.is_linear:
+                raise RuntimeError(
+                    "kv_only is a QSA-attention route; this layer is linear "
+                    "attention and owns recurrent state, not a KV cache"
+                )
+            self.self_attn(mixed, cache, kv_only=True)
+            return None
         if self.is_linear:
             block_out = self.linear_attn(mixed, ssm_mask, cache)
         else:
@@ -5278,16 +5355,22 @@ class TextModel(nn.Module):
         mtp_hidden_variant: str | None = None,
         position_offset: int | None = None,
         input_embeddings=None,
+        kv_only: bool = False,
     ):
         """Append committed history to the head's cache (no lm_head cost).
 
         ``input_embeddings`` (vision splice) supplies exact embedding rows in
         place of ``embed_tokens(next_token_ids)`` when provided.
+
+        ``kv_only`` (MTPLX_FABLE_MTP_KV_ONLY_APPEND) returns None and computes
+        only the cache writes -- see :meth:`Qwen4ExpMTP.append_kv_only`.
         """
         if input_embeddings is not None:
             emb = input_embeddings
         else:
             emb = self.model.embed_tokens(next_token_ids)
+        if kv_only:
+            return self.mtp.append_kv_only(hidden_states, emb, mtp_cache)
         return self.mtp.fuse_and_run_history(hidden_states, emb, mtp_cache)
 
     def make_mtp_cache(self):
@@ -5399,6 +5482,26 @@ class Qwen4ExpMTP(nn.Module):
         h = self._prepare_inputs_eager(widened, tok_emb)
         layer_cache = cache[0] if cache is not None else None
         return self.layers[0](h, input_ids=None, ssm_mask=None, cache=layer_cache)
+
+    def append_kv_only(self, widened: mx.array, tok_emb: mx.array, cache) -> None:
+        """History append that computes only what the MTP cache consumes.
+
+        ``fuse_and_run_history`` runs the whole head layer -- QSA attention,
+        the indexer's top-512 selection, ``o_proj``, both hyper-connection
+        residual writes and the 512-expert MoE -- and every caller throws the
+        returned hidden away: the append exists for the layer's K/V and
+        indexer writes alone (``mtplx/generation.py::_append_mtp_history``).
+        This route keeps the fused input preparation and the writes and drops
+        the rest.  Returns None, so a caller that starts reading the hidden
+        fails loudly instead of silently consuming a stale value.
+        """
+
+        h = self._prepare_inputs_eager(widened, tok_emb)
+        layer_cache = cache[0] if cache is not None else None
+        self.layers[0](
+            h, input_ids=None, ssm_mask=None, cache=layer_cache, kv_only=True
+        )
+        return None
 
     def __call__(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
         return self.hyper_connection_mixer(self.fuse_and_run(widened, tok_emb, cache))

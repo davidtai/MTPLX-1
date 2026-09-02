@@ -436,6 +436,7 @@ class MTPLXRuntime:
         mtp_hidden_variant: str | None = None,
         position_offset: int | None = None,
         input_embeddings=None,
+        kv_only: bool = False,
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
@@ -462,11 +463,21 @@ class MTPLXRuntime:
                 "position_offset": position_offset,
                 "input_embeddings": input_embeddings,
             }
+            if kv_only:
+                # Offered ONLY when armed: a backend that takes **kwargs but
+                # has no KV-only route would otherwise be handed a keyword it
+                # cannot honour on every ordinary append.
+                candidates["kv_only"] = True
             kwargs = {
                 key: value
                 for key, value in candidates.items()
                 if accepts_kwargs or key in params
             }
+            if kv_only and "kv_only" not in kwargs:
+                raise RuntimeError(
+                    "this MTP backend does not accept kv_only; "
+                    "MTPLX_FABLE_MTP_KV_ONLY_APPEND is unsupported for it"
+                )
             if input_embeddings is not None and "input_embeddings" not in kwargs:
                 # Silently dropping the spliced vision rows would rebuild the
                 # exact draft-history corruption this parameter fixes (#103).
@@ -481,6 +492,11 @@ class MTPLXRuntime:
             raise RuntimeError(
                 "mtp_forward fallback does not accept input_embeddings; "
                 "vision history append is unsupported for it"
+            )
+        if kv_only:
+            raise RuntimeError(
+                "the mtp_forward fallback has no KV-only route; "
+                "MTPLX_FABLE_MTP_KV_ONLY_APPEND is unsupported for it"
             )
         _logits, hidden = self.model.mtp_forward(
             hidden_states,

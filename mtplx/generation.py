@@ -57,6 +57,15 @@ from .fable_block_verify import (
     is_enabled as _fable_block_verify_enabled,
 )
 from .fable_compiled_draft import maybe_build_compiled_draft_chain
+from .fable_device_k20 import (
+    DeviceDraftChain as _FableDeviceDraftChain,
+    DeviceK20Ineligible,
+    claim_request_route as _fable_device_k20_claim,
+    draw_draft_uniforms as _fable_device_k20_uniforms,
+    finalize_target_support as _fable_device_k20_finalize_target,
+    is_enabled as _fable_device_k20_enabled,
+    target_support_device as _fable_device_k20_target,
+)
 from .fable_prefill_chunk import (
     DEFAULT_CHUNK_SIZE as _FABLE_DEFAULT_CHUNK_SIZE,
     assert_prefill_chunk_coherent,
@@ -64,6 +73,14 @@ from .fable_prefill_chunk import (
     summarize_spans,
 )
 from .fable_k20_log import is_enabled as _fable_k20_log_enabled, k20_log
+from .fable_mtp_kv_only import (
+    claim_model_route as _fable_mtp_kv_only_claim,
+    is_enabled as _fable_mtp_kv_only_enabled,
+)
+from .fable_depth4_probe import (
+    is_enabled as _fable_depth4_probe_enabled,
+    run_probe as _fable_run_depth4_probe,
+)
 from .forkev_telemetry import ForkEVRecorder
 from .fast_sampling import (
     MAX_DEVICE_TOP_K_ORDER,
@@ -356,6 +373,53 @@ _FABLE_K20_LOG = _fable_k20_log_enabled()
 # more often (+1.85% tokens/window measured offline on 381 real windows) and
 # draws exactly the same number of uniforms.  See ``mtplx/fable_block_verify.py``.
 _FABLE_BLOCK_VERIFY = _fable_block_verify_enabled()
+
+# MTPLX_FABLE_DEVICE_K20 -- read ONCE at import (in ``mtplx.fable_device_k20``),
+# default OFF.  When off this constant is False, no request route is claimed,
+# `_device_k20_plan` stays None, and every site below is behind
+# `_device_k20_plan is not None`, so the stock lane runs the code it ran before
+# this module existed -- same selector, same syncs, same uniforms, same order.
+#
+# When on (and the request is eligible -- see
+# `fable_device_k20.claim_request_route`, which RAISES rather than falling back
+# silently) the per-cycle draft chain runs its three MTP steps without a host
+# round trip: selection is the exact device top-20 kernel and the drafted token
+# is sampled on device from the same PCG64 double `rng.choice` would have
+# consumed.  Sync count per cycle drops from four (three draft selections +
+# the target support) to two (one chain materialisation + the target support).
+# The last merge is blocked by the fixed-M4 verify needing `host_input_ids`
+# (`generation.py` -> `graphbank.forward_fixed_m4`), which is a separate lever.
+_FABLE_DEVICE_K20 = _fable_device_k20_enabled()
+
+# MTPLX_FABLE_DEPTH4_PROBE -- read ONCE at import (in
+# ``mtplx.fable_depth4_probe``), default OFF.  Pure diagnostic: on an
+# all-accept M4 window it runs ONE extra `rt.draft_mtp(..., mtp_depth=4)` from
+# the d3 hidden/token, shapes the row with the draft sampler, and logs it
+# through `fable_k20_log` next to the bonus target row -- which IS the
+# distribution a fourth draft would be verified against, so `sum min(p_3, q_4)`
+# is alpha_4 and `scripts/fable/offline_depth4_gate.py` scores L Sec.D's gate
+# offline with NO M=5 verify graph.  It samples nothing, draws no uniform,
+# commits no token, and restores the MTP cache offset in a `finally`, so the
+# emitted stream and the RNG stream are bit-identical to an unarmed run.  It
+# costs ~1.6 ms on the ~31% of windows that accept all three drafts: an armed
+# run is a DATA run, not a timing run.  See ``mtplx/fable_depth4_probe.py``.
+_FABLE_DEPTH4_PROBE = _fable_depth4_probe_enabled()
+
+# MTPLX_FABLE_MTP_KV_ONLY_APPEND -- read ONCE at import (in
+# ``mtplx.fable_mtp_kv_only``), default OFF.  When off this constant is False,
+# no route is claimed, `_mtp_kv_only_append` stays False, and every append
+# passes `kv_only=False`, which `runtime.update_mtp_cache` does not even put in
+# its kwargs -- so the flag-off lane runs the code it ran before this module
+# existed.  When on (and the model is eligible -- `claim_model_route` RAISES
+# rather than reverting silently) the per-cycle history append computes only
+# what the MTP cache consumes: the indexer's raw/pooled writes and the
+# attention K/V write.  The QSA attention product, `q_proj`, `o_proj`, both
+# hyper-connection residual writes and the 512-expert MoE are skipped because
+# nothing reads the layer's hidden output -- `_append_mtp_history` binds it
+# only to feed `_eval`, which `MTPLX_LAZY_MTP_HISTORY_APPEND=1` (the turbo
+# profile) already skips.  Cache contents stay bit-identical; see
+# ``mtplx/fable_mtp_kv_only.py``.
+_FABLE_MTP_KV_ONLY_APPEND = _fable_mtp_kv_only_enabled()
 
 # MTPLX_FABLE_QSA_RESTORE_STAGING -- read once (lazily, then memoized), default
 # OFF. See ``mtplx/fable_qsa_restore_stage.py``: it promotes the three restored
@@ -4794,8 +4858,42 @@ def _distributions_from_mlx_logits(
 def _batched_distributions_from_mlx_logits(
     logits: mx.array,
     config: SamplerConfig,
+    *,
+    device_k20_plan: Any = None,
 ) -> BatchedSparseDistributions | None:
-    return batched_sparse_distributions_from_mlx_logits(logits, config)
+    """Batched target K20 support.
+
+    ``device_k20_plan`` (MTPLX_FABLE_DEVICE_K20) swaps the selector only:
+    ``_device_serial_support_arrays``'s ``argpartition``-to-80 plus host
+    ``np.lexsort`` becomes the exact device top-20 kernel, and the SAME
+    float32 ``exp(v - logsumexp(full row))`` probabilities cross the SAME
+    single boundary into the SAME float64 top-p mask.  Bit-identical to the
+    stock hot path; see ``mtplx/fable_device_k20.py`` for the one divergence
+    (the stock *spill* fallback's probability-descending order).
+    """
+
+    if device_k20_plan is None:
+        return batched_sparse_distributions_from_mlx_logits(logits, config)
+
+    ids, values, probs = _fable_device_k20_target(logits, device_k20_plan)
+    # THE sync for the target rows -- one, exactly where stock has one.
+    mx.eval(*[leaf for leaf in (ids, values, probs) if leaf is not None])
+    token_rows, prob_rows = _fable_device_k20_finalize_target(
+        np.asarray(ids, dtype=np.int64),
+        np.asarray(values, dtype=np.float32),
+        None if probs is None else np.asarray(probs, dtype=np.float64),
+        device_k20_plan,
+    )
+    try:
+        return BatchedSparseDistributions._from_execution_arrays(
+            token_rows, prob_rows, vocab_size=int(logits.shape[-1])
+        )
+    except FloatingPointError:
+        # Non-finite / zero-mass row (NaN or inf logits). Stock's builder has
+        # the same escape hatch; take its dense host reference rather than
+        # inventing a second one. This is a CORRECTNESS fallback on a row the
+        # device support cannot describe, not a silent route change.
+        return batched_sparse_distributions_from_mlx_logits(logits, config)
 
 
 def _validate_target_prefix_sampler_request(config: SamplerConfig) -> None:
@@ -6785,6 +6883,7 @@ def _append_mtp_history(
     position_offset: int | None = None,
     force_eval: bool = False,
     input_embeddings: mx.array | None = None,
+    kv_only: bool = False,
 ) -> float:
     if not token_ids:
         return 0.0
@@ -6807,8 +6906,15 @@ def _append_mtp_history(
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=position_offset,
             input_embeddings=input_embeddings,
+            kv_only=kv_only,
         )
     if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
+        return time.perf_counter() - started
+    if kv_only:
+        # MTPLX_FABLE_MTP_KV_ONLY_APPEND returns no hidden -- there is no
+        # layer output any more. The materialization this eval exists for is
+        # the cache state, which is now the append's only product.
+        _eval_cache_roots(mtp_cache)
         return time.perf_counter() - started
     _eval(hidden)
     return time.perf_counter() - started
@@ -9199,6 +9305,13 @@ def generate_mtpk(
         0,
         int(os.environ.get("MTPLX_MTP_HISTORY_MATERIALIZE_EVERY") or 0),
     )
+    # MTPLX_FABLE_MTP_KV_ONLY_APPEND (default off).  Claimed ONCE, here, before
+    # the first append: the decision is a property of the loaded model, not of
+    # any cycle, and an armed flag on an ineligible model raises instead of
+    # running the full append while wearing the candidate's label.
+    _mtp_kv_only_append = (
+        _fable_mtp_kv_only_claim(rt.model) if _FABLE_MTP_KV_ONLY_APPEND else False
+    )
     mtp_position_cap = max(
         0,
         int(os.environ.get("MTPLX_MTP_POSITION_CAP") or 4096),
@@ -9527,6 +9640,7 @@ def generate_mtpk(
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=mtp_position_offset_for_cache(mtp_cache),
             force_eval=force_eval,
+            kv_only=_mtp_kv_only_append,
         )
         if force_eval:
             mtp_history_materialize_events += 1
@@ -10170,6 +10284,56 @@ def generate_mtpk(
     # and compiled indexer pass their deferred model/MTP gates.  The disabled
     # branch below preserves v2.10's original rollback/reappend behavior.
     qsa_mtp_precompute_active = qsa_mtp_precompute_enabled()
+    # MTPLX_FABLE_DEVICE_K20 (default off).  Claimed ONCE, here, where every
+    # request-invariant term the route depends on already exists.  The claim
+    # raises on an unsupported request instead of falling back: an armed flag
+    # that silently ran the stock selector would make the receipts lie.
+    #
+    # `fused_verify_input=False` is not a placeholder.  Merging the chain's
+    # materialisation into the target sync needs the verify forward to accept
+    # DEVICE draft ids, and the lane's own verify does not: the fixed-M4
+    # dispatch below takes `host_input_ids=verify_input` and feeds it to
+    # `graphbank.forward_fixed_m4` -> `dispatch["prepare_aux"]` for the n-gram
+    # / PLE aux.  The `_is_stop(...)` gate on `bonus_distribution_row_needed`
+    # is the second host reader.  Both are separate levers; until they move,
+    # this route materialises before the verify and the cycle holds two syncs.
+    _device_k20_plan = None
+    if _FABLE_DEVICE_K20:
+        _device_k20_plan = _fable_device_k20_claim(
+            sampler=sampler,
+            draft_sampler=draft_sampler,
+            speculative_depth=speculative_depth,
+            rng=rng,
+            fused_verify_input=False,
+            target_prefix_verify=target_prefix_verify,
+            lazy_target_distributions=lazy_target_distributions,
+            lazy_bonus_verify_requested=_lazy_bonus_verify_enabled(),
+            batch_target_arrays=_batch_target_arrays_enabled(),
+            steer_active=bool(loop_guard) or thinking_guard is not None,
+            penalties_active=_penalties_active,
+            constraint=constraint,
+            adaptive_policy=adaptive_policy,
+            adaptive_width_policy=adaptive_width_policy,
+            mtp_corrector=mtp_corrector,
+            mtp_topk_reranker=mtp_topk_reranker,
+            draft_margin_threshold=draft_margin_threshold,
+            online_hidden_corrector_alpha=online_hidden_corrector_alpha,
+            online_correction_cache=online_correction_cache,
+            prompt_correction_cache=prompt_correction_cache,
+            adapter_ensemble_q=adapter_ensemble_q,
+            combine_greedy_draft_read=combine_greedy_draft_read,
+            greedy_chain_enabled=_greedy_chain_eligible,
+            draft_confidence_needed=_draft_conf_needed,
+            frspec_legacy_ids=_frspec_legacy_ids,
+            late_depth_switch_after=late_depth_switch_after,
+            a3b_target_prefix_route=a3b_target_prefix_route,
+            pr391_route=_pr391_route,
+            adaptive_dtemp_active=_dtemp_controller is not None,
+        )
+        if _device_k20_plan is not None and draft_core != "stock":
+            raise DeviceK20Ineligible(
+                "device K20 requires the stock draft route selector"
+            )
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -11509,8 +11673,148 @@ def generate_mtpk(
             draft_hidden = _chain_hidden
             next_token = _chain_tokens[-1]
             _greedy_chain_used = True
+        # MTPLX_FABLE_DEPTH4_PROBE (default off): what a 4th draft step would
+        # consume, captured per depth so the last completed depth survives.
+        # Reset every cycle -- a stale capture must never reach the hook.
+        _d4_probe_state: tuple[Any, int, Any, bool] | None = None
+        # MTPLX_FABLE_DEVICE_K20: the whole draft chain on device, one sync.
+        #
+        # Stock runs `cycle_depth` iterations of the loop below, and each one
+        # ends in `_device_serial_support_arrays` -> `mx.eval` + `np.asarray`
+        # -> `rng.choice` (fast_sampling.py:420-428, sampling.py:303).  Three
+        # GPU drains per cycle, all on the dependent chain.  Here the K20 is
+        # the exact device selector and the token is sampled on device from
+        # the same PCG64 double, so depth d+1 consumes depth d's token as a
+        # `[1, 1] int32` array and nothing crosses the host boundary until
+        # `materialize()`.
+        #
+        # Every host-side product of the loop below is reconstructed after
+        # that single sync, in the same order, with the same values:
+        # `draft_tokens`, `draft_probs`, `drafted`, `drafted_by_depth`,
+        # `event["drafts"]`, `next_token`, `draft_hidden`,
+        # `draft_hidden_for_update` / `_update_keys`.  `draft_cache_keys` is
+        # left empty on purpose -- its only reader
+        # (`depth_index < len(draft_cache_keys)`) is inside the correction
+        # cache, which the route refuses at construction.
+        #
+        # `used_device_core` here is the CONTEXT-COPY streak substitution
+        # (`_cc_draft_source_token`): that cycle proposes the prompt's next
+        # token as a point mass and runs no MTP draft and no `rng.choice`, so
+        # skipping the chain leaves the uniform stream exactly where the stock
+        # lane leaves it.  Every OTHER way into this branch is refused at
+        # construction, so anything unexpected raises instead of quietly
+        # taking the host path.
+        _device_k20_chain = None
+        if (
+            _device_k20_plan is not None
+            and not used_device_core
+            and not _greedy_chain_used
+        ):
+            if _steer_active:
+                raise DeviceK20Ineligible(
+                    "device K20 met a mid-generation steering arm"
+                )
+            if not 1 <= cycle_depth <= _device_k20_plan.depth:
+                raise DeviceK20Ineligible(
+                    f"device K20 met cycle_depth={cycle_depth}, "
+                    f"route depth={_device_k20_plan.depth}"
+                )
+            _dk_started = time.perf_counter()
+            _device_k20_chain = _FableDeviceDraftChain(
+                _device_k20_plan,
+                _fable_device_k20_uniforms(rng, cycle_depth),
+            )
+            _dk_hidden = draft_hidden
+            _dk_next = mx.array([[int(next_token)]])
+            _dk_offsets: list[int | None] = []
+            for depth_index in range(cycle_depth):
+                step_mtp_cache = (
+                    mtp_cache
+                    if mtp_cache_policy == "persistent"
+                    else rt.make_mtp_cache()
+                )
+                _dk_offset = mtp_position_offset_for_cache(step_mtp_cache)
+                _dk_offsets.append(_dk_offset)
+                _dk_logits, _dk_hidden_next = rt.draft_mtp(
+                    _dk_hidden,
+                    _dk_next,
+                    mtp_cache=step_mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_depth=depth_index + 1,
+                    position_offset=_dk_offset,
+                )
+                _dk_next = _device_k20_chain.step(_dk_logits)
+                _dk_hidden = _dk_hidden_next[:, -1:, :]
+                draft_hidden_for_update.append(_dk_hidden)
+                draft_hidden_update_keys.append(depth_index + 1)
+            _dk_result = _device_k20_chain.materialize()
+            _dk_elapsed = time.perf_counter() - _dk_started
+            draft_time += _dk_elapsed
+            draft_hidden = _dk_hidden
+            for _dk_index, _dk_token in enumerate(_dk_result.tokens):
+                draft_tokens.append(int(_dk_token))
+                draft_probs.append(_dk_result.distributions[_dk_index])
+                drafted += 1
+                drafted_by_depth[_dk_index] += 1
+                _dk_event = {
+                    "depth": _dk_index + 1,
+                    "token": int(_dk_token),
+                    "timing_s": {
+                        "draft": _dk_elapsed
+                        if _dk_index == cycle_depth - 1
+                        else 0.0
+                    },
+                    "mtp_corrector": None,
+                    "draft_core": "device-k20",
+                }
+                if _dk_offsets[_dk_index] is not None:
+                    _dk_event["position_offset"] = int(_dk_offsets[_dk_index])
+                event["drafts"].append(_dk_event)
+            next_token = int(_dk_result.tokens[-1])
+            if _FABLE_DEPTH4_PROBE:
+                # The device chain skips the per-depth loop below, so the
+                # depth-4 probe's capture hook (see the identical block after
+                # `next_token = draft_token`) never runs on this path. Capture
+                # the SAME four inputs here, from the MATERIALISED chain --
+                # this is after the single sync, so the token is a host int
+                # like the stock hook's.
+                #
+                # `draft_hidden` is depth `cycle_depth`'s post-forward hidden,
+                # which is also its post-corrector hidden: the online hidden
+                # corrector that would otherwise sit between the two is
+                # refused by `claim_request_route`. `step_mtp_cache` and
+                # `_dk_logits` are the last iteration's, exactly as the stock
+                # hook reads them. The remap guard is kept literal rather than
+                # hard-coded False (the route refuses the frspec-legacy lane,
+                # so it always evaluates False) so the two capture sites
+                # cannot drift apart.
+                _d4_probe_state = (
+                    draft_hidden,
+                    int(_dk_result.tokens[-1]),
+                    step_mtp_cache,
+                    bool(
+                        _frspec_legacy_ids is not None
+                        and int(_dk_logits.shape[-1])
+                        == int(_frspec_legacy_ids.shape[0])
+                    ),
+                )
+            if not _FABLE_HOST_TRIMS:
+                # Route stamp + the cycle's draft draws. The uniforms are the
+                # audit trail for the draw accounting (the one thing here that
+                # could desync the PCG64 stream), so they are worth three
+                # floats per cycle unless the run is explicitly trimming host
+                # work; `fable_k20_log` carries them either way when armed.
+                event["device_k20"] = {
+                    **_device_k20_plan.to_dict(),
+                    "depth": int(cycle_depth),
+                    "draft_uniforms": [float(u) for u in _dk_result.uniforms],
+                    "syncs": 1,
+                }
         for depth_index in range(
-            0 if (used_device_core or _greedy_chain_used) else cycle_depth
+            0
+            if (used_device_core or _greedy_chain_used or _device_k20_chain is not None)
+            else cycle_depth
         ):
             source_token = int(next_token)
             step_mtp_cache = (
@@ -11837,6 +12141,24 @@ def generate_mtpk(
                     }
                 online_hidden_corrector_time += time.perf_counter() - started_online
             next_token = draft_token
+            if _FABLE_DEPTH4_PROBE and draft_token is not None:
+                # The 4th step's inputs are this depth's own post-corrector
+                # hidden, its (already frspec-remapped) token, and the MTP
+                # cache it drafted against -- the same three the loop would
+                # feed a depth_index+1 iteration. The position offset is NOT
+                # captured: a real 4th step would read it AFTER this depth's
+                # append, so the hook recomputes it. The remap flag mirrors
+                # the guard the block above uses, on the same draft_logits.
+                _d4_probe_state = (
+                    draft_hidden,
+                    int(draft_token),
+                    step_mtp_cache,
+                    bool(
+                        _frspec_legacy_ids is not None
+                        and int(draft_logits.shape[-1])
+                        == int(_frspec_legacy_ids.shape[0])
+                    ),
+                )
             drafted += 1
             drafted_by_depth[depth_index] += 1
             draft_event = {
@@ -12445,6 +12767,7 @@ def generate_mtpk(
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
                     target_distribution_logits,
                     sampler,
+                    device_k20_plan=_device_k20_plan,
                 )
             else:
                 target_distributions = _distributions_from_mlx_logits(
@@ -12548,6 +12871,7 @@ def generate_mtpk(
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
                     target_distribution_logits,
                     sampler,
+                    device_k20_plan=_device_k20_plan,
                 )
             elif _batch_target_distributions_enabled():
                 target_distributions = _distributions_from_mlx_logits(
@@ -12686,6 +13010,12 @@ def generate_mtpk(
                 rng=rng,
                 block_verify=_FABLE_BLOCK_VERIFY,
                 block=None if _bv is None else _bv.log_arrays(),
+                device_k20=_device_k20_chain is not None,
+                draft_uniforms=(
+                    None
+                    if _device_k20_chain is None
+                    else _device_k20_chain.uniforms
+                ),
             )
         # Grammar clamp (#186 phase 3): drafts are proposed unmasked, so the
         # committed window must stop at the grammar's legal prefix. One
@@ -13151,6 +13481,74 @@ def generate_mtpk(
                 _add_timing(event, "online_hidden_corrector_update", elapsed_online)
 
         if accepted_count == len(draft_tokens):
+            if (
+                _FABLE_DEPTH4_PROBE
+                and _FABLE_K20_LOG
+                and _d4_probe_state is not None
+                # The persistent-MTP policy only: `step_mtp_cache is mtp_cache`
+                # is exactly the branch where the captured cache carries the
+                # window's real draft history. Under the per-step throwaway
+                # policy a 4th step would build its own cache, so drafting from
+                # depth 3's would not be the row that lane would verify.
+                and _d4_probe_state[2] is mtp_cache
+                and not _pr391_mtp_handoff_owns_cycle
+                and _host_accept_drafts
+                and sampler.temperature > 0
+                and target_prefix_tokens is None
+                and len(draft_tokens) == cycle_depth
+            ):
+                # MTPLX_FABLE_DEPTH4_PROBE (default off), L Sec.D go/no-go.
+                # Placed HERE and nowhere else: the verify decision is known
+                # (all `cycle_depth` drafts accepted, so the target's bonus row
+                # p(.|primary,d1..d3) exists and IS the distribution a 4th
+                # draft would be verified against), and the production MTP
+                # history has not been touched yet -- the commit below rolls
+                # back to cycle_mtp_offset + 1 and re-appends, and it must see
+                # the offset it would have seen. `run_probe` restores that
+                # offset in a `finally`.
+                #
+                # Diagnostic ONLY. The row goes to the K20 log and nowhere
+                # else: no token is sampled from it, no uniform is drawn for
+                # it (`_distribution_from_mlx_logits` takes no generator), and
+                # nothing below reads `_d4_*`. The emitted stream and the RNG
+                # stream are bit-identical to an unarmed run.
+                #
+                # ~1.6 ms (one MTP-layer forward + one full-vocab K20) on the
+                # ~31% of windows that reach here: a DATA run, not a timing
+                # run. Self-timed into `event["timing_s"]` so it is visible
+                # rather than folded into draft_time.
+                _d4_started = time.perf_counter()
+                _d4_hidden, _d4_token, _d4_cache, _d4_remap = _d4_probe_state
+                _d4_ids, _d4_probs, _d4_trimmed = _fable_run_depth4_probe(
+                    draft_step=lambda: rt.draft_mtp(
+                        _d4_hidden,
+                        mx.array([[_d4_token]]),
+                        mtp_cache=_d4_cache,
+                        return_hidden=False,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        mtp_depth=len(draft_tokens) + 1,
+                        position_offset=mtp_position_offset_for_cache(_d4_cache),
+                    )[:, -1, :][0],
+                    shape_row=lambda row: _distribution_from_mlx_logits(
+                        row, draft_sampler
+                    ),
+                    mtp_cache=_d4_cache,
+                    read_offset=_mtp_cache_offset,
+                    rollback=_rollback_mtp_cache,
+                    remap_ids=(
+                        (lambda ids: np.asarray(_frspec_legacy_ids[ids]))
+                        if _d4_remap
+                        else None
+                    ),
+                )
+                k20_log.stock_depth4(
+                    ids=_d4_ids, probs=_d4_probs, trimmed=_d4_trimmed
+                )
+                _add_timing(
+                    event,
+                    "fable_depth4_probe",
+                    time.perf_counter() - _d4_started,
+                )
             committed = [primary] + draft_tokens
             tokens.extend(draft_tokens)
             if (
