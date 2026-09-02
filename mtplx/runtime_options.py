@@ -198,6 +198,123 @@ def fable_qsa_m4_kt_enabled() -> bool:
     return _FABLE_QSA_M4_KT
 
 
+#: Split-K (KV-split) native sparse-GQA attention for the DECODE geometries
+#: (native_extensions/qsa_sparse_gqa, mtplx/kernels/qsa_sparse_decode.py).
+#:
+#: TWO flags, deliberately, because the two geometries are independently
+#: gated and have very different expected value:
+#:
+#:   MTPLX_FABLE_QSA_SPARSE_DECODE  -- the M=4 fixed verify, all 12 QSA
+#:       layers, once per verify cycle.  This is where the bytes are: the
+#:       shipped lane materialises a [1, 2, 4, 2052, 256] gathered K/V pair
+#:       per layer (16.8 MB written, then re-read by the score and P@V
+#:       GEMMs), plus MLX's own 8.4 MB contiguous copy of the transposed key
+#:       view.  The kernel reads the cache rows once and never writes them.
+#:
+#:   MTPLX_FABLE_QSA_SPARSE_DRAFT   -- the M=1 single-row path.  Today's
+#:       retained-stack dispatch census shows ZERO QSA attention dispatches
+#:       at M=1: the draft chain runs the MTP block, not the twelve QSA
+#:       layers (the census's once-per-cycle counts are exactly 36 GDN and
+#:       48 MoE layers, i.e. the full stack runs once per cycle, at M=4).
+#:       So this flag exists for the non-speculative decode path and for a
+#:       future draft that runs the full stack; it is NOT expected to move
+#:       the 16K speculative ABBA, and claiming otherwise from a microbench
+#:       would repeat W16 (an isolated -1.9 ms that was 0 end-to-end).
+#:
+#: Both off by default.  Both RAISE on a contract failure rather than
+#: silently reverting -- a silently inert flag is how MTPLX_FUSED_HC_V3 came
+#: to be armed-but-dead at M=4.  The one thing that does NOT raise is a
+#: PARITY failure at install: this kernel is rounding-class, so a parity
+#: miss is a numerical verdict, and the lane disables itself for the process
+#: and reports the measured deltas.
+_FABLE_QSA_SPARSE_DECODE = env_bool("MTPLX_FABLE_QSA_SPARSE_DECODE", default=False)
+_FABLE_QSA_SPARSE_DRAFT = env_bool("MTPLX_FABLE_QSA_SPARSE_DRAFT", default=False)
+
+
+def fable_qsa_sparse_decode_enabled() -> bool:
+    """True when ``MTPLX_FABLE_QSA_SPARSE_DECODE`` armed this process."""
+
+    return _FABLE_QSA_SPARSE_DECODE
+
+
+def fable_qsa_sparse_draft_enabled() -> bool:
+    """True when ``MTPLX_FABLE_QSA_SPARSE_DRAFT`` armed this process."""
+
+    return _FABLE_QSA_SPARSE_DRAFT
+
+
+def _parse_sparse_decode_tile(raw: str | None) -> tuple[int, int]:
+    """``"BK:DC"`` -> the compiled tile pair; unset means the default."""
+
+    if raw is None or not str(raw).strip():
+        return (128, 32)
+    token = str(raw).strip()
+    parts = token.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        )
+    try:
+        tile = (int(parts[0]), int(parts[1]))
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        ) from exc
+    if tile not in FABLE_QSA_SPARSE_DECODE_TILES:
+        accepted = ", ".join(f"{a}:{b}" for a, b in FABLE_QSA_SPARSE_DECODE_TILES)
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_TILE={raw!r} is not instantiated; "
+            f"expected one of: {accepted}"
+        )
+    return tile
+
+
+#: The (BK, DC) pairs the metallib instantiates.  Anything else raises rather
+#: than falling back, so a typo in a sweep cannot quietly measure the default.
+FABLE_QSA_SPARSE_DECODE_TILES = ((128, 32), (256, 32), (64, 64), (128, 64))
+FABLE_QSA_SPARSE_DECODE_MAX_SPLITS = 64
+
+_FABLE_QSA_SPARSE_DECODE_TILE = _parse_sparse_decode_tile(
+    os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_TILE")
+)
+
+
+def _parse_sparse_decode_splits(raw: str | None) -> int:
+    """``MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS`` -- the KV-split target."""
+
+    if raw is None or not str(raw).strip():
+        return 8
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS={raw!r} must be an integer"
+        ) from exc
+    if not 1 <= value <= FABLE_QSA_SPARSE_DECODE_MAX_SPLITS:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS={raw!r} must be in "
+            f"[1, {FABLE_QSA_SPARSE_DECODE_MAX_SPLITS}]"
+        )
+    return value
+
+
+_FABLE_QSA_SPARSE_DECODE_SPLITS = _parse_sparse_decode_splits(
+    os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS")
+)
+
+
+def fable_qsa_sparse_decode_tile() -> tuple[int, int]:
+    """The armed ``(key_tile, dimension_tile)`` for the decode kernel."""
+
+    return _FABLE_QSA_SPARSE_DECODE_TILE
+
+
+def fable_qsa_sparse_decode_splits() -> int:
+    """The armed KV-split target for the decode kernel."""
+
+    return _FABLE_QSA_SPARSE_DECODE_SPLITS
+
+
 @dataclass(frozen=True)
 class ResolvedAPIKey:
     value: str | None

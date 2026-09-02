@@ -1897,6 +1897,10 @@ def main() -> int:
     mx.reset_peak_memory()
 
     from mtplx.draft_lm_head import _install_draft_lm_head
+    from mtplx.fable_indexer_reuse import (
+        indexer_reuse_counters,
+        reset_indexer_reuse_counters,
+    )
     from mtplx.generation import generate_mtpk
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
@@ -2160,6 +2164,9 @@ def main() -> int:
     ) -> dict[str, Any]:
         thermal_receipt = wait_for_temperature(args.thermal_gate_max_c)
         reset_receipt = reset_run_caches(runtime, mx)
+        # Per-seed, so a shortfall against (depth-1) * cycles is attributable
+        # to the run that produced it rather than smeared over the arm.
+        reset_indexer_reuse_counters()
         mx.reset_peak_memory()
         prompt_ids = cell["prompt_ids"]
         max_tokens = int(cell["max_tokens"])
@@ -2244,6 +2251,12 @@ def main() -> int:
             time.perf_counter() - started,
         )
         row["pre_run_reset"] = reset_receipt
+        # MTPLX_FABLE_INDEXER_REUSE engagement. On an unarmed arm both are 0,
+        # which is what "the control really was the control" looks like.
+        row["indexer_reuse"] = {
+            "armed": os.environ.get("MTPLX_FABLE_INDEXER_REUSE") == "1",
+            **indexer_reuse_counters(),
+        }
 
         # PR391 D3 attach block (ported injection).
         if d3_route is not None:

@@ -119,6 +119,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .fable_indexer_reuse import ENV_FLAG as INDEXER_REUSE_ENV
+from .fable_indexer_reuse import indexer_reuse_enabled
 from .fast_sampling import (
     _deterministic_mlx_top_k_support,
     _order_bounded_mlx_top_k_support,
@@ -340,6 +342,15 @@ def build_compiled_draft_chain(
 
     depth = int(depth)
     top_k = int(top_k)
+    if indexer_reuse_enabled():
+        # The reuse anchor is host state consulted once per draft call; under
+        # one compiled body the depth-1 branch is baked into the trace and
+        # depths 2/3 would replay it, so the flag would be silently inert.
+        raise CompiledDraftUnsupported(
+            f"{FABLE_COMPILED_DRAFT_ENV} and {INDEXER_REUSE_ENV} are mutually "
+            "exclusive: the per-depth trace cannot observe the host-side "
+            "reuse anchor, so an armed reuse flag would never fire"
+        )
     if depth < 1:
         raise CompiledDraftUnsupported("compiled draft depth must be >= 1")
     if top_k < 1:

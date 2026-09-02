@@ -29,6 +29,8 @@ from .runtime_options import (
     FABLE_QSA_M4_ROWS,
     fable_qsa_m4_enabled,
     fable_qsa_m4_kt_enabled,
+    fable_qsa_sparse_decode_enabled,
+    fable_qsa_sparse_draft_enabled,
 )
 
 
@@ -748,6 +750,8 @@ class TensorOffsetQSACache:
         fused_rows_gather_kv_m4: bool = False,
         fable_qsa_m4: bool = False,
         fable_qsa_m4_kt: bool = False,
+        fable_qsa_sparse_decode: bool = False,
+        fable_qsa_sparse_draft: bool = False,
     ) -> None:
         self.kv = kv
         self.aux = [raw_keys, pooled]
@@ -769,6 +773,39 @@ class TensorOffsetQSACache:
         # key layout was measured slower AND not bit-exact, so it is its own
         # arm rather than a rider on the lane.
         self.fable_qsa_m4_kt = bool(fable_qsa_m4_kt)
+        # MTPLX_FABLE_QSA_SPARSE_DECODE / _DRAFT: the native split-K
+        # sparse-GQA attention lane.  Validated ONCE, here, at cache install:
+        # this is model-build time and outside any mx.compile trace, which is
+        # what lets the install run a real parity probe.  The indexer reads
+        # the row counts below and never re-derives the decision, so one
+        # trace of the verify graph cannot disagree with the next about which
+        # attention it contains.
+        #
+        # The gate is asymmetric on purpose.  install() RAISES when the
+        # contract cannot be met (an armed flag that cannot apply is a
+        # configuration error) and DISABLES when the numerical probe fails
+        # (this kernel is rounding-class; a parity miss is a measurement, and
+        # turning a measurement into an outage helps nobody).
+        self.fable_qsa_sparse_decode = bool(fable_qsa_sparse_decode)
+        self.fable_qsa_sparse_draft = bool(fable_qsa_sparse_draft)
+        self.fable_qsa_sparse_decode_rows = 0
+        self.fable_qsa_sparse_draft_rows = 0
+        if fable_qsa_sparse_decode or fable_qsa_sparse_draft:
+            from .kernels import qsa_sparse_decode as _qsa_sparse
+
+            if _qsa_sparse.install(
+                self.kv.keys,
+                self.kv.values,
+                compress_ratio=self.ratio,
+                verify=bool(fable_qsa_sparse_decode),
+                draft=bool(fable_qsa_sparse_draft),
+            ):
+                self.fable_qsa_sparse_decode_rows = (
+                    _qsa_sparse.VERIFY_ROWS if fable_qsa_sparse_decode else 0
+                )
+                self.fable_qsa_sparse_draft_rows = (
+                    _qsa_sparse.DRAFT_ROWS if fable_qsa_sparse_draft else 0
+                )
 
     @staticmethod
     def _fixed_bank(value: mx.array, capacity: int, axis: int) -> mx.array:
@@ -820,6 +857,8 @@ class TensorOffsetQSACache:
         fused_rows_gather_kv_m4 = _env_enabled("MTPLX_QSA_M4_FUSED_KV_GATHER")
         fable_qsa_m4 = fable_qsa_m4_enabled()
         fable_qsa_m4_kt = fable_qsa_m4_kt_enabled()
+        fable_qsa_sparse_decode = fable_qsa_sparse_decode_enabled()
+        fable_qsa_sparse_draft = fable_qsa_sparse_draft_enabled()
         if fable_qsa_m4_kt and not fused_rows_gather_kv_m4:
             # No silent fallback: there is no binding to transpose without it.
             raise RuntimeError(
@@ -886,6 +925,8 @@ class TensorOffsetQSACache:
             fused_rows_gather_kv_m4=fused_rows_gather_kv_m4,
             fable_qsa_m4=fable_qsa_m4,
             fable_qsa_m4_kt=fable_qsa_m4_kt,
+            fable_qsa_sparse_decode=fable_qsa_sparse_decode,
+            fable_qsa_sparse_draft=fable_qsa_sparse_draft,
         )
 
     @property
@@ -4658,6 +4699,12 @@ class CompiledVerifyBank:
                     # the stock QSA chain -- the armed-but-inert failure mode.
                     fable_qsa_m4=entry.fable_qsa_m4,
                     fable_qsa_m4_kt=entry.fable_qsa_m4_kt,
+                    fable_qsa_sparse_decode=getattr(
+                        entry, "fable_qsa_sparse_decode", False
+                    ),
+                    fable_qsa_sparse_draft=getattr(
+                        entry, "fable_qsa_sparse_draft", False
+                    ),
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
@@ -5205,6 +5252,12 @@ class CompiledVerifyBank:
                     # the stock QSA chain -- the armed-but-inert failure mode.
                     fable_qsa_m4=entry.fable_qsa_m4,
                     fable_qsa_m4_kt=entry.fable_qsa_m4_kt,
+                    fable_qsa_sparse_decode=getattr(
+                        entry, "fable_qsa_sparse_decode", False
+                    ),
+                    fable_qsa_sparse_draft=getattr(
+                        entry, "fable_qsa_sparse_draft", False
+                    ),
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
