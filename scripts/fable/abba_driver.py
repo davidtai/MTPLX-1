@@ -513,6 +513,15 @@ def stats_receipt(
         ).hexdigest(),
         "compiled_verify": dict((stats.graphbank or {}).get("compiled_verify") or {}),
         "draft_core": dict(stats.draft_core or {}),
+        # MTPLX_FABLE_DEVICE_DRAFT_CHAIN engagement.  `{"installed": False}` on
+        # a control arm; on an armed arm it carries `mode`, `readbacks_per_cycle`,
+        # `body_traces` (must be 1 -- a climbing count means the mx.compile
+        # trace signature moves and the flag is paying for a retrace every
+        # cycle), `chain_builds`/`cache_rebinds`, `short_cycles` and the
+        # construction `prewarm_s` that `pre_first_token_setup_s` now carries.
+        "device_draft_chain": dict(
+            getattr(stats, "device_draft_chain", None) or {}
+        ),
         "online_correction_cache": dict(stats.online_correction_cache or {}),
         "context_copy": {
             "active": bool(stats.context_copy_active),
@@ -1935,6 +1944,10 @@ def main() -> int:
     mx.reset_peak_memory()
 
     from mtplx.draft_lm_head import _install_draft_lm_head
+    from mtplx.fable_indexer_reuse import (
+        indexer_reuse_counters,
+        reset_indexer_reuse_counters,
+    )
     from mtplx.generation import generate_mtpk
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
@@ -2198,6 +2211,9 @@ def main() -> int:
     ) -> dict[str, Any]:
         thermal_receipt = wait_for_temperature(args.thermal_gate_max_c)
         reset_receipt = reset_run_caches(runtime, mx)
+        # Per-seed, so a shortfall against (depth-1) * cycles is attributable
+        # to the run that produced it rather than smeared over the arm.
+        reset_indexer_reuse_counters()
         mx.reset_peak_memory()
         prompt_ids = cell["prompt_ids"]
         max_tokens = int(cell["max_tokens"])
@@ -2282,6 +2298,12 @@ def main() -> int:
             time.perf_counter() - started,
         )
         row["pre_run_reset"] = reset_receipt
+        # MTPLX_FABLE_INDEXER_REUSE engagement. On an unarmed arm both are 0,
+        # which is what "the control really was the control" looks like.
+        row["indexer_reuse"] = {
+            "armed": os.environ.get("MTPLX_FABLE_INDEXER_REUSE") == "1",
+            **indexer_reuse_counters(),
+        }
 
         # PR391 D3 attach block (ported injection).
         if d3_route is not None:
