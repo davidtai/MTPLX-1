@@ -37,9 +37,15 @@ Two phases, deliberately split so the expensive one runs once:
 **capture** (needs the GPU; ``--capture-to``)
     Replays a ``MTPLX_FABLE_K20_LOG`` trajectory through the model.  The log
     records, per verify window, the window's ``primary``, the full draft chain
-    ``draft_tokens``, how many of them were accepted, and the correction/bonus
-    token that was emitted -- which is the whole committed stream, so the
-    trajectory is reconstructible from the log alone (:func:`segment_windows`).
+    ``draft_tokens``, how many of them were accepted, the correction/bonus
+    token that was emitted, and -- since 2026-09-02 -- the ``carry``: the
+    tokens a lane with no verify window of its own (a ``context_copy`` block
+    round) committed between two windows.  Together those are the whole
+    committed stream, so the trajectory is reconstructible from the log alone
+    (:func:`segment_windows`).  A log written before the carry accounting is
+    NOT reconstructible whenever the copy lane fired, and
+    :func:`segment_windows` refuses it rather than replaying a stream with
+    holes in it.
     The replay re-runs the prompt, then walks that committed stream window by
     window, and at every window runs the draft chain **once per variant** from
     the identical hidden state, **teacher-forced to the logged draft tokens**.
@@ -339,51 +345,171 @@ class Segment:
         return self.stop - self.start
 
 
+class TrajectoryGapError(RuntimeError):
+    """The log is missing tokens the run committed; it cannot be replayed.
+
+    Raised when the emitted stream reconstructed from the rows of ONE request
+    does not join up: window ``c + 1``'s ``primary`` is not the token window
+    ``c`` left at the end of the stream, and no ``carry`` accounts for the
+    difference.  That is a hole in the log, not a request boundary, and a
+    replay teacher-forced on the truncated stream would run the model from the
+    wrong hidden state at every window after it.
+    """
+
+
+def window_carry(log: Mapping[str, np.ndarray], index: int) -> list[int]:
+    """Tokens committed AFTER window ``index`` by a lane that wrote no row.
+
+    ``mtplx/context_copy.py`` block rounds commit a verbatim slice of the
+    prompt (plus the residual correction, plus the freshly sampled primary when
+    the block was accepted whole) in their own verify forward, with no K20 row.
+    ``carry_len`` / ``carry_tokens`` are the logger's record of them; an older
+    log has neither column and this returns ``[]`` for every window.
+    """
+
+    lengths = log.get("carry_len")
+    if lengths is None:
+        return []
+    count = int(lengths[index])
+    if count <= 0:
+        return []
+    return [int(token) for token in log["carry_tokens"][index][:count]]
+
+
+def request_ids(log: Mapping[str, np.ndarray]) -> np.ndarray | None:
+    """Per-window request id from the PCG64 stream, or ``None`` when unusable.
+
+    A stock log records the window's PCG64 state as four uint64 words --
+    ``state`` high/low then ``inc`` high/low.  ``inc`` is the *stream* id, a
+    property of the ``Generator`` and therefore of the request: every window of
+    one ``generate_mtpk`` call carries the same one, and a second request
+    through the same process gets a different one from its own seeding.  That
+    is an exact request marker, and it does not care what the emitted stream
+    does -- which is the whole point, because a lane that commits without a row
+    breaks the emitted stream's continuity without ending the request.
+
+    ``None`` only when the column is not there at all: the PR391 lane and the
+    test stubs leave it zero.  A **constant** stream is an answer, not a
+    refusal -- it says "one request" -- and that is the safe reading: were a
+    driver ever to reuse one ``Generator`` across requests, the segments would
+    merge and the continuity check would then raise at the join, which is loud,
+    where guessing from the token stream is silent and wrong.  A stream id that
+    reappears after a different one is not a request id (interleaved requests),
+    so that is refused.
+    """
+
+    state = log.get("rng_state")
+    if state is None:
+        return None
+    words = np.asarray(state)
+    if words.ndim != 2 or words.shape[1] < 4:
+        return None
+    stream = words[:, 2:4]
+    if not stream.any():
+        return None
+    changed = np.zeros(len(stream), dtype=bool)
+    changed[0] = True
+    changed[1:] = (stream[1:] != stream[:-1]).any(axis=1)
+    firsts = stream[changed]
+    if len(np.unique(firsts, axis=0)) != len(firsts):
+        return None
+    return (np.cumsum(changed) - 1).astype(np.int64)
+
+
 def segment_windows(log: Mapping[str, np.ndarray]) -> list[Segment]:
     """Split a multi-request log into per-request segments.
 
     A K20 log written by a driver that runs three seeds in one process holds
-    all three trajectories concatenated, with no seed column.  Two things end a
-    request, and both are visible in the log:
+    all three trajectories concatenated.  Where the request boundary is is a
+    property of the *run*, not of the emitted stream, and the stock layout
+    records it: :func:`request_ids` reads the window's PCG64 stream id, which
+    changes exactly at a request boundary and nowhere else.  That is the split.
 
-    * ``selected_present`` is 0 -- the window hit a stop token, so nothing was
-      emitted after the accepted prefix and generation ended.  A hard boundary.
-    * the next window's ``primary`` is not this window's ``selected_token`` --
-      the carry-in broke, so the next window belongs to a different request.
-      A soft boundary; it is the one that catches a max-tokens end.
+    Only when that column cannot answer -- the PR391 lane and the test stubs
+    leave it zero -- does this fall back to reading the emitted stream, ending
+    a request where ``selected_present`` is 0 (a stop token) or where the next
+    window's ``primary`` is not this window's ``selected_token``.
 
-    A coincidental match at a max-tokens boundary would merge two segments.
-    That costs the replay one wrong prefill, which the fidelity gate then fails
-    loudly on -- it cannot silently corrupt a comparison.  Pass
-    ``--expect-segments`` to assert the count you know you ran.
+    Either way the reconstructed stream is then **checked**, per segment: every
+    window's ``primary`` must be the token the previous window left at the end
+    of the stream, or the gap must be accounted for by a logged
+    :func:`window_carry`.  An unexplained break is a hole in the log --
+    :class:`TrajectoryGapError` -- and never a segment boundary.  Pass
+    ``--expect-segments`` to assert the count you know you ran on top of that.
     """
 
     cycles = int(log["draft_tokens"].shape[0])
+    if not cycles:
+        return []
     primary = np.asarray(log["primary"], dtype=np.int64)
     selected = np.asarray(log["selected_token"], dtype=np.int64)
     present = np.asarray(log["selected_present"], dtype=np.uint8)
 
-    segments: list[Segment] = []
-    start = 0
-    tokens: list[int] = [int(primary[0])] if cycles else []
-    for index in range(cycles):
-        tokens.extend(window_emission(log, index))
-        last = index + 1 == cycles
-        broke = (not last) and (
-            not bool(present[index]) or int(primary[index + 1]) != int(selected[index])
+    ids = request_ids(log)
+    bounds: list[int] = [0]
+    if ids is not None:
+        bounds.extend(index for index in range(1, cycles) if ids[index] != ids[index - 1])
+    else:
+        bounds.extend(
+            index
+            for index in range(1, cycles)
+            if not bool(present[index - 1])
+            or int(primary[index]) != int(selected[index - 1])
         )
-        if last or broke:
-            segments.append(
-                Segment(
-                    index=len(segments),
-                    start=start,
-                    stop=index + 1,
-                    tokens=tuple(tokens),
-                )
-            )
-            start = index + 1
-            tokens = [int(primary[start])] if start < cycles else []
+    bounds.append(cycles)
+
+    segments: list[Segment] = []
+    breaks: list[tuple[int, int, int]] = []
+    for position in range(len(bounds) - 1):
+        start, stop = bounds[position], bounds[position + 1]
+        tokens: list[int] = [int(primary[start])]
+        for index in range(start, stop):
+            if index > start and int(primary[index]) != tokens[-1]:
+                breaks.append((index, tokens[-1], int(primary[index])))
+            tokens.extend(window_emission(log, index))
+            tokens.extend(window_carry(log, index))
+        segments.append(
+            Segment(index=len(segments), start=start, stop=stop, tokens=tuple(tokens))
+        )
+    if breaks:
+        raise TrajectoryGapError(_gap_message(log, breaks, len(segments)))
     return segments
+
+
+def _gap_message(
+    log: Mapping[str, np.ndarray],
+    breaks: Sequence[tuple[int, int, int]],
+    segments: int,
+) -> str:
+    shown = ", ".join(
+        f"window {index} expects {expected} but its primary is {found}"
+        for index, expected, found in breaks[:5]
+    )
+    if len(breaks) > 5:
+        shown += f", ... ({len(breaks)} in all)"
+    if log.get("carry_len") is None:
+        cause = (
+            "This log has no `carry_len` column, so it was written before the "
+            "logger accounted for lanes that commit tokens WITHOUT a K20 row "
+            "-- mtplx/context_copy.py block rounds are one, and they commit "
+            "the accepted slice, the residual correction and the next freshly "
+            "sampled primary between two windows. Those tokens are simply not "
+            "in this file and no reconstruction can recover them. Re-record "
+            "the log with a build that carries mtplx/fable_k20_log.py's "
+            "`carry` accounting, or with the copy lane off "
+            "(MTPLX_CONTEXT_COPY=0)."
+        )
+    else:
+        cause = (
+            "This log DOES carry `carry_len`, so an unaccounted break means "
+            "the record itself is inconsistent -- a lane committed tokens "
+            "without calling K20RowLog.carry, or the rows were reordered. Do "
+            "not replay it."
+        )
+    return (
+        f"{len(breaks)} window(s) of {segments} reconstructed request "
+        f"segment(s) do not join up: {shown}. {cause}"
+    )
 
 
 def segment_of_window(segments: Sequence[Segment], index: int) -> int:
@@ -542,8 +668,10 @@ class ReplayHooks:
         first.
     ``advance(window=...)``
         run the window's verify forward over ``[primary] + draft_tokens``,
-        commit ``accepted`` of them plus the emitted selection, and leave the
-        state on the next window.
+        commit ``accepted`` of them plus the emitted selection, then commit
+        ``window['carry']`` -- the tokens a lane with no K20 row of its own
+        (a context-copy block round) put in the stream before the next
+        window's primary -- and leave the state on the next window.
     """
 
     def start_segment(self, segment: Segment) -> None:  # pragma: no cover - iface
@@ -573,6 +701,10 @@ def window_record(log: Mapping[str, np.ndarray], index: int) -> dict[str, Any]:
         "selected_token": int(log["selected_token"][index]),
         "selected_present": bool(log["selected_present"][index]),
         "emission": window_emission(log, index),
+        # Tokens a lane committed after this window with no row of its own
+        # (context-copy block rounds).  They belong to the stream BEFORE the
+        # next window's primary, so `advance` must commit them too.
+        "carry": window_carry(log, index),
     }
 
 
@@ -840,6 +972,35 @@ def build_replay_hooks(
                 mtp_hidden_variant=mtp_hidden_variant,
                 position_offset=_position_offset(self.mtp_cache),
             )
+            carry = [int(token) for token in window.get("carry", ())]
+            if carry:
+                # A lane with no K20 row of its own -- a context-copy block
+                # round -- put these tokens in the stream between this window
+                # and the next.  The last of them IS the next window's primary
+                # and stays deferred exactly like a selection does; the rest
+                # (starting with this window's selection) are committed here,
+                # by the same forward/trim/restage the window path uses.
+                fed_carry = [int(self.primary), *carry[:-1]]
+                _carry_logits, carry_hidden = runtime.forward_ar(
+                    mx.array([fed_carry]), cache=self.cache, return_hidden=True
+                )
+                mx.eval(carry_hidden)
+                self.hidden = carry_hidden[:, -1:, :]
+                self.primary = int(carry[-1])
+                self.committed += len(fed_carry)
+                if not _trim_cache_to_offset(self.cache, self.committed):
+                    raise RuntimeError(
+                        f"target cache would not trim to {self.committed} "
+                        f"after the carry of window {window['index']}"
+                    )
+                _rollback_mtp_cache(self.mtp_cache, 0)
+                runtime.update_mtp_cache(
+                    carry_hidden,
+                    mx.array([fed_carry]),
+                    mtp_cache=self.mtp_cache,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    position_offset=_position_offset(self.mtp_cache),
+                )
 
         def close(self) -> None:
             self.cache = None
@@ -1635,7 +1796,15 @@ def _production_prompt(runtime: Any) -> list[int]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     log = load_log(args.npz)
-    segments = segment_windows(log)
+    try:
+        segments = segment_windows(log)
+    except TrajectoryGapError as error:
+        print(
+            f"FAIL: {args.npz} does not hold the whole committed stream. "
+            f"{error}",
+            file=sys.stderr,
+        )
+        return 1
     if args.expect_segments is not None and len(segments) != args.expect_segments:
         print(
             f"FAIL: reconstructed {len(segments)} request segments from "

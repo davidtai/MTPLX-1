@@ -9073,6 +9073,10 @@ def generate_mtpk(
         _pr391_stop_ids = None
         _pr391_stop_count = None
     if _FABLE_K20_LOG:
+        # One process serves many requests and they all append to one buffer;
+        # the committed stream does not run across the join, so the carry
+        # accounting is reset here (mtplx/fable_k20_log.py:begin_request).
+        k20_log.begin_request()
         # The stock lane's rows arrive ALREADY shaped, so an offline
         # re-temperature needs the temperature that shaped them.
         k20_log.set_sampler(sampler=sampler, draft_sampler=draft_sampler)
@@ -10866,6 +10870,11 @@ def generate_mtpk(
                     time.perf_counter() - decode_loop_entered_s
                 )
             tokens.append(primary)
+            if _FABLE_K20_LOG:
+                # No-op unless a context-copy round has committed tokens since
+                # the last logged window: then this primary sits inside that
+                # gap and is nowhere else in the log.
+                k20_log.carry_primary(int(primary))
             emit_new_tokens()
             if constraint is not None:
                 # Everything later this cycle (copy-block truncation, the
@@ -11161,6 +11170,11 @@ def generate_mtpk(
                         cache, _cc_ladder, hidden_variant=base_hidden_variant
                     )
             if _cc_block:
+                if _FABLE_K20_LOG:
+                    # This cycle consumes a primary that no K20 window will
+                    # claim; open the gap so the log stays a complete record of
+                    # the emitted stream (mtplx/fable_k20_log.py:carry_round).
+                    k20_log.carry_round()
                 if _pr391_carried_d3 is not None:
                     _pr391_carried_d3 = None
                 _cc_T = 1 + len(_cc_block)
@@ -11367,6 +11381,11 @@ def generate_mtpk(
                 if _cc_stop_idx is not None:
                     _cc_acc = _cc_acc[:_cc_stop_idx + 1]
                 tokens.extend(_cc_acc)
+                if _FABLE_K20_LOG:
+                    # This round commits without a K20 row; record what it put
+                    # in the emitted stream or the trajectory cannot be
+                    # reconstructed from the log.
+                    k20_log.carry(_cc_acc)
                 _cc_finished = _cc_stop_idx is not None
                 if constraint is not None and _cc_correction is not None and (
                     constraint.validate_prefix([*_cc_acc, int(_cc_correction)])
@@ -11383,6 +11402,8 @@ def generate_mtpk(
                     # its forward exactly like an MTP rejection: the pending
                     # primary's KV is computed by whichever forward runs next.
                     tokens.append(int(_cc_correction))
+                    if _FABLE_K20_LOG:
+                        k20_log.carry((int(_cc_correction),))
                     correction_tokens += 1
                     pending_primary = int(_cc_correction)
                     if _is_stop(int(_cc_correction), stop_token_ids):
@@ -11472,6 +11493,11 @@ def generate_mtpk(
                 if constraint is not None:
                     _cb_block = _cb_block[: constraint.validate_prefix(_cb_block)]
             if _cb_block:
+                if _FABLE_K20_LOG:
+                    # This cycle consumes a primary that no K20 window will
+                    # claim; open the gap so the log stays a complete record of
+                    # the emitted stream (mtplx/fable_k20_log.py:carry_round).
+                    k20_log.carry_round()
                 if _pr391_carried_d3 is not None:
                     _pr391_carried_d3 = None
                 _cb_T = 1 + len(_cb_block)
@@ -11662,6 +11688,9 @@ def generate_mtpk(
                 if _cb_stop_idx is not None:
                     _cb_acc = _cb_acc[: _cb_stop_idx + 1]
                 tokens.extend(_cb_acc)
+                if _FABLE_K20_LOG:
+                    # Same contract as the eager round above.
+                    k20_log.carry(_cb_acc)
                 _cb_finished = _cb_stop_idx is not None
                 if constraint is not None and _cb_correction is not None and (
                     constraint.validate_prefix([*_cb_acc, int(_cb_correction)])
@@ -11670,6 +11699,8 @@ def generate_mtpk(
                     _cb_correction = None
                 if _cb_correction is not None and not _cb_finished:
                     tokens.append(int(_cb_correction))
+                    if _FABLE_K20_LOG:
+                        k20_log.carry((int(_cb_correction),))
                     correction_tokens += 1
                     pending_primary = int(_cb_correction)
                     if _is_stop(int(_cb_correction), stop_token_ids):
