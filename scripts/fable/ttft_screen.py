@@ -111,6 +111,13 @@ CHARS_PER_TOKEN = 3.4
 
 SCENARIOS = ("cold", "matching_terminal", "rerendered_terminal")
 
+#: Fixed, NOT a timestamp. The salt seeds the synthetic prompt, so a per-run
+#: seed makes two arms measure two different prompts and destroys output-SHA
+#: parity (the 2026-09-01 control receipt shows exactly that: every scenario
+#: reported three different shas). The per-repeat salt stays unique WITHIN a
+#: run via the "-r<n>" suffix, which is what keeps each repeat's cold row cold.
+DEFAULT_SALT_SEED = "fable-ttft-v1"
+
 #: Session-identity headers, in the order ``EngineSessionManager.resolve_session_id``
 #: checks them (mtplx/engine_session.py). Header identity beats prompt-prefix
 #: inference and arms the live-reference lease (``source.startswith("header.")``
@@ -665,7 +672,13 @@ def summarize_scenarios(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             for row in subset
             if (row.get("server") or {}).get("ttft_s") is not None
         ]
-        shas = sorted({str(row["output_sha256"]) for row in subset})
+        # Ordered by repeat: THIS is the cross-arm parity key. A set is not,
+        # because each repeat carries its own salt and therefore its own
+        # prompt, so shas legitimately differ between repeats within one arm.
+        by_repeat = [
+            str(row["output_sha256"])
+            for row in sorted(subset, key=lambda item: int(item["repeat"]))
+        ]
         summary[scenario] = {
             "repeats": len(subset),
             "visible_ttft_s": {
@@ -695,8 +708,7 @@ def summarize_scenarios(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "cache_miss_reason": sorted(
                 {str((row["server"] or {}).get("cache_miss_reason") or "") for row in subset}
             ),
-            "output_sha256": shas,
-            "output_deterministic": len(shas) == 1,
+            "output_sha256_by_repeat": by_repeat,
         }
     return summary
 
@@ -864,7 +876,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--ssd-session-cache", choices=("on", "off"), default="on")
-    parser.add_argument("--salt-seed", default=None)
+    parser.add_argument(
+        "--salt-seed",
+        default=None,
+        help=(
+            f"Prompt salt seed (default {DEFAULT_SALT_SEED!r}). It must be "
+            "IDENTICAL across arms or the arms run different prompts and no "
+            "output SHA can be compared. Change it only to force genuinely "
+            "cold SSD rows, and then change it for every arm."
+        ),
+    )
     parser.add_argument("--request-timeout", type=float, default=900.0)
     parser.add_argument("--server-ready-timeout", type=float, default=1200.0)
     parser.add_argument("--warmup-timeout", type=float, default=900.0)
@@ -889,7 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.model_id is None:
         args.model_id = screen.MODEL_ID
     if args.salt_seed is None:
-        args.salt_seed = time.strftime("%Y%m%dT%H%M%S")
+        args.salt_seed = DEFAULT_SALT_SEED
     if args.repeats < 1:
         raise SystemExit("--repeats must be >= 1")
 
@@ -1105,7 +1126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"model median={model['median']!r}s p95={model['p95']!r}s; "
             f"cached={block['cached_tokens']} hit={block['session_cache_hit']} "
             f"restore={block['session_restore_mode']} "
-            f"sha={block['output_sha256']}",
+            f"sha={block['output_sha256_by_repeat']}",
             flush=True,
         )
     print(f"wrote {receipt_path}", flush=True)
