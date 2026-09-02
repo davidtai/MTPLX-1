@@ -231,7 +231,7 @@ Two companion knobs, also `MTPLX_FABLE_*` and also off by default:
 | Key | Effect |
 | --- | --- |
 | `MTPLX_FABLE_NGRAM_MADVISE=random\|normal\|sequential` | Overrides the n-gram maps' `madvise`. Default is `random` (shipped) with the lane off and `normal` with it on: `MADV_RANDOM` suppresses readahead around a *mapping fault*, which under this lane is the ascending pre-touch and the vectorised gather's residual misses -- the two cases readahead helps. `pread(2)` never consulted the advice at all. |
-| `MTPLX_FABLE_NGRAM_PREWARM_AT_LOAD=1` | Reads the whole n-gram table sequentially at model load (64 MiB chunks, logs GiB/s, recorded as `prewarm_at_load`). The driver's `--prewarm-ngram-table` does this for benchmarks; the daemon has no equivalent, so production serves at the as-found page-cache rate -- which the w22 window measured as a 1.9 s vs 4.4 s first chunk. |
+| `MTPLX_NGRAM_PREWARM=0` | Opts OUT of the n-gram table's sequential pre-read at model load, which is now **on by default** (64 MiB chunks, logs `[mtplx] n-gram table pre-read 29.8 GiB in 2.5 s (12.1 GiB/s)`, recorded as `prewarm_at_load` with `{bytes, seconds, gib_per_s, skipped_reason, enabled, source}`). It is a first-class option -- `mtplx serve --no-ngram-prewarm`, and the CLI wins over the env. `MTPLX_FABLE_NGRAM_PREWARM_AT_LOAD` is a deprecated alias. The driver's `--prewarm-ngram-table` did this for benchmarks only; the daemon had no equivalent, so production served at the as-found page-cache rate -- a 1.9 s vs 4.4 s first chunk in the w22 window, and 56 vs 68.8 tok/s on decode. |
 
 Prefill-only ABBA window at 16K, on top of the retained prefill stack:
 
