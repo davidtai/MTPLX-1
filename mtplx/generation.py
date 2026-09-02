@@ -66,6 +66,13 @@ from .fable_device_k20 import (
     is_enabled as _fable_device_k20_enabled,
     target_support_device as _fable_device_k20_target,
 )
+from .fable_draft_k20_prescatter import (
+    DraftK20PrescatterIneligible,
+    claim_draft_route as _fable_draft_k20_prescatter_claim,
+    is_enabled as _fable_draft_k20_prescatter_enabled,
+    read_draft as _fable_draft_k20_prescatter_read,
+    release_draft_route as _fable_draft_k20_prescatter_release,
+)
 from .fable_prefill_chunk import (
     DEFAULT_CHUNK_SIZE as _FABLE_DEFAULT_CHUNK_SIZE,
     assert_prefill_chunk_coherent,
@@ -390,6 +397,20 @@ _FABLE_BLOCK_VERIFY = _fable_block_verify_enabled()
 # The last merge is blocked by the fixed-M4 verify needing `host_input_ids`
 # (`generation.py` -> `graphbank.forward_fixed_m4`), which is a separate lever.
 _FABLE_DEVICE_K20 = _fable_device_k20_enabled()
+
+# MTPLX_FABLE_DRAFT_K20_PRESCATTER -- read ONCE at import (in
+# ``mtplx.fable_draft_k20_prescatter``), default OFF.  When off this constant
+# is False, no plan is claimed, `_draft_k20_prescatter_plan` stays None, and
+# the one draft-read site below is behind `is not None`, so the retained stock
+# lane runs the code it ran before this module existed.
+#
+# When on (and the request is eligible -- the claim RAISES rather than falling
+# back) each draft step builds its K20 support from the FR-Spec head's 65,536
+# compact row instead of the 248,320 scattered one: no `put_along_axis`, a
+# 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
+# the same `(ids, probs)` support because the ranked id table is strictly
+# ascending.  See that module's docstring for the exactness argument.
+_FABLE_DRAFT_K20_PRESCATTER = _fable_draft_k20_prescatter_enabled()
 
 # MTPLX_FABLE_DEPTH4_PROBE -- read ONCE at import (in
 # ``mtplx.fable_depth4_probe``), default OFF.  Pure diagnostic: on an
@@ -722,7 +743,7 @@ def _ple_stage_seconds() -> float:
         return 0.0
 
 
-def _resolve_ple_lookahead_hook(rt):
+def _resolve_ple_lookahead_hook(rt, attribute: str = "ple_prefill_lookahead"):
     """Find the object that owns ``ple_prefill_lookahead``.
 
     The PLE stage lives on the INNER text model, two wrappers below the
@@ -740,7 +761,7 @@ def _resolve_ple_lookahead_hook(rt):
         if node is None or any(node is other for other in seen):
             break
         seen.append(node)
-        hook = getattr(node, "ple_prefill_lookahead", None)
+        hook = getattr(node, attribute, None)
         if callable(hook):
             return hook
         node = getattr(node, "language_model", None) or getattr(
@@ -786,6 +807,132 @@ def _ple_prefill_lookahead_scope(rt, body, spans):
 
     with prefill_lookahead_scope(hook(body, list(spans))) as lookahead:
         yield lookahead
+
+
+def _predicted_first_prefill_span(
+    prompt_ids,
+    *,
+    stable_prefix_len=None,
+    session_bank=None,
+    vision_splice=None,
+):
+    """The span ``_prefill_committed_mtp_history_streaming`` will open with.
+
+    Predicted from the prompt alone, at request arrival, because that is the
+    only place where there is still host work left to hide the gather behind.
+    It is derived from the SAME two helpers the prefill loop chooses between,
+    never a restatement of their arithmetic, and it declines rather than
+    guesses:
+
+    * the plain chunk grid is what runs whenever boundary capture is off, and
+      ``gdn_boundary_sink is None`` settles that without a cache (the extra
+      ``_cache_has_recurrent_entries`` term can only turn capture OFF);
+    * when capture is possible, the tail grid may cut the first chunk too --
+      it does on a single-chunk prompt -- so both plans are built and the span
+      is returned only if they agree on chunk 1.
+
+    A wrong prediction is not an exactness risk (the payload is accepted only
+    after its token ids compare equal to the ones `stage` was called with), but
+    it is wasted worker time, so it is worth being exact here.
+    """
+
+    body_len = len(prompt_ids) - 1
+    if body_len <= 0:
+        return None
+    if not _sustained_prefill_enabled():
+        # The non-streaming prefill takes a different loop entirely and the
+        # lane is not wired to it.
+        return None
+    plain = _iter_prefill_chunk_spans(body_len)
+    if not plain:
+        return None
+    may_capture = (
+        session_bank is not None
+        and vision_splice is None
+        and _gdn_boundary_capture_enabled()
+    )
+    if not may_capture:
+        return plain[0]
+    cold_edges: tuple[int, ...] = ()
+    if stable_prefix_len is not None and 0 < int(stable_prefix_len) < body_len:
+        cold_edges = (int(stable_prefix_len),)
+    grid = _prefill_spans_with_tail_grid(
+        body_len,
+        tail_interval=_gdn_boundary_tail_interval(),
+        mandatory_edges=cold_edges,
+    )
+    if grid and tuple(grid[0]) == tuple(plain[0]):
+        return plain[0]
+    return None
+
+
+def _with_ple_first_gather_early(fn):
+    """Start the first prefill chunk's PLE gather at request arrival.
+
+    A decorator rather than a ``with`` inside the body because
+    ``restore_or_prefill_prompt_state`` returns from a dozen places (every
+    session-bank restore lane is one), and every one of them must release the
+    worker.  Off by default; with MTPLX_FABLE_PLE_FIRST_GATHER_EARLY unset this
+    is one contextvar set and a ``None`` yield.
+    """
+
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        rt = args[0] if args else kwargs.get("rt")
+        prompt_ids = args[1] if len(args) > 1 else kwargs.get("prompt_ids")
+        with _ple_first_gather_early_scope(
+            rt,
+            prompt_ids,
+            stable_prefix_len=kwargs.get("stable_prefix_len"),
+            session_bank=kwargs.get("session_bank"),
+            vision_splice=kwargs.get("vision_splice"),
+        ):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def _ple_first_gather_early_scope(
+    rt, prompt_ids, *, stable_prefix_len=None, session_bank=None, vision_splice=None
+):
+    """Arm the model's first-chunk PLE gather for this request."""
+
+    from mtplx.ple_prefill_lookahead import (
+        early_enabled as _early_enabled,
+        first_gather_early_scope,
+    )
+
+    if not _early_enabled() or not prompt_ids:
+        with first_gather_early_scope(
+            None, None if prompt_ids else "empty_prompt"
+        ):
+            yield None
+        return
+    hook = _resolve_ple_lookahead_hook(rt, "ple_first_gather_early")
+    if hook is None:
+        raise RuntimeError(
+            "MTPLX_FABLE_PLE_FIRST_GATHER_EARLY=1 but nothing under "
+            f"{type(getattr(rt, 'model', None)).__name__} exposes "
+            "ple_first_gather_early; this architecture cannot serve the lane"
+        )
+    span = _predicted_first_prefill_span(
+        prompt_ids,
+        stable_prefix_len=stable_prefix_len,
+        session_bank=session_bank,
+        vision_splice=vision_splice,
+    )
+    if span is None:
+        with first_gather_early_scope(None, "unpredictable_first_span"):
+            yield None
+        return
+    early = hook(list(prompt_ids)[:-1], span)
+    with first_gather_early_scope(
+        early, None if early is not None else "model_declined_span"
+    ):
+        yield early
 
 
 def _runtime_count(rt: MTPLXRuntime, key: str, amount: int = 1) -> None:
@@ -2523,6 +2670,8 @@ class GenerationStats:
     adapter_ensemble_q: dict[str, object] = field(default_factory=dict)
     mtp_topk_reranker: dict[str, object] = field(default_factory=dict)
     draft_core: dict[str, object] = field(default_factory=dict)
+    #: MTPLX_FABLE_DRAFT_K20_PRESCATTER receipt: ``{installed, rows, ...}``.
+    draft_k20_prescatter: dict[str, object] = field(default_factory=dict)
     owned_recurrent_state: dict[str, object] = field(default_factory=dict)
     owned_attn_kv: dict[str, object] = field(default_factory=dict)
     repetition_stop_triggered: bool = False
@@ -4134,6 +4283,7 @@ def _with_vision_rope(fn):
     return wrapper
 
 
+@_with_ple_first_gather_early
 @_with_vision_rope
 def restore_or_prefill_prompt_state(
     rt: MTPLXRuntime,
@@ -9154,6 +9304,20 @@ def generate_mtpk(
             _pr391_route.uniform_bit_rows,
         )
     _pr391_carried_d3: dict[str, Any] | None = None
+    # MTPLX_FABLE_PLE_CANDIDATE_PREFETCH (K-P1, default off).  Resolved ONCE
+    # here, to a bound method or to None -- the draft hooks below then cost a
+    # single `is not None` per depth on the control arm, and no flag read, no
+    # getattr walk and no exception handler ever runs inside the cycle.  The
+    # lane arms itself at aux construction (qwen4_fixed_verify), so a bank
+    # without it hands back the construction-bound no-op and this stays None.
+    _ple_candidate_submit = None
+    if compiled_verify_bank is not None and qwen4_fixed_m4_compiled_verify:
+        _ple_candidate_dispatch = (
+            getattr(compiled_verify_bank, "_fixed_m4_dispatch", None) or {}
+        )
+        _ple_candidate_aux = _ple_candidate_dispatch.get("prepare_aux")
+        if getattr(_ple_candidate_aux, "candidate_prefetch", None) is not None:
+            _ple_candidate_submit = compiled_verify_bank.submit_fixed_m4_candidates
     # Read once per request; the switch is a process constant so control and
     # candidate arms run the same binary.
     _pr391_compact_commit = _pr391_compact_commit_enabled()
@@ -10374,6 +10538,47 @@ def generate_mtpk(
             raise DeviceK20Ineligible(
                 "device K20 requires the stock draft route selector"
             )
+    # MTPLX_FABLE_DRAFT_K20_PRESCATTER (default off).  Claimed ONCE, here,
+    # after every request-invariant term it refuses on already exists.  The
+    # claim arms the FR-Spec head's compact-row stash and raises on an
+    # unsupported request instead of falling back, so the receipt below can
+    # only say `installed: True` when the pre-scatter selector really ran.
+    _draft_k20_prescatter_plan = None
+    _draft_k20_prescatter_receipt: dict[str, object] = {"installed": False}
+    if _FABLE_DRAFT_K20_PRESCATTER:
+        _draft_k20_prescatter_plan = _fable_draft_k20_prescatter_claim(
+            rt,
+            draft_sampler=draft_sampler,
+            draft_core=draft_core,
+            target_prefix_verify=target_prefix_verify,
+            a3b_target_prefix_route=a3b_target_prefix_route,
+            pr391_route=_pr391_route,
+            device_k20_route=_device_k20_plan,
+            frspec_legacy_ids=_frspec_legacy_ids,
+            adaptive_width_policy=adaptive_width_policy,
+            combine_greedy_draft_read=combine_greedy_draft_read,
+            draft_confidence_needed=_draft_conf_needed,
+            draft_margin_threshold=draft_margin_threshold,
+            wants_policy_metrics=wants_policy_metrics,
+            correction_cache_enabled=bool(
+                online_correction_cache or prompt_correction_cache
+            ),
+            adapter_ensemble_q=adapter_ensemble_q,
+            mtp_topk_reranker=mtp_topk_reranker,
+            relaxed_draft_ties=bool(
+                getattr(rt, "qwen4_relaxed_draft_ties", False)
+            ),
+            penalties_active=_penalties_active,
+            steer_active=bool(loop_guard) or thinking_guard is not None,
+        )
+        if _draft_k20_prescatter_plan is not None:
+            if _greedy_chain_eligible:
+                _fable_draft_k20_prescatter_release(_draft_k20_prescatter_plan)
+                raise DraftK20PrescatterIneligible(
+                    "MTPLX_FABLE_DRAFT_K20_PRESCATTER: the greedy device chain "
+                    "owns the draft read"
+                )
+            _draft_k20_prescatter_receipt = _draft_k20_prescatter_plan.to_dict()
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -11449,6 +11654,26 @@ def generate_mtpk(
                 )
             _pr391_joint_result = joint_result
             core_tokens = _pr391_decode_float32_d3_tokens(joint_result)
+            if _ple_candidate_submit is not None:
+                # The joint core keeps its per-depth K20 arrays
+                # verifier-resident (only result[0] is synced), so the
+                # SPECULATIVE form of K-P1 has no host hook on this lane --
+                # see mtplx/ple_candidate_prefetch's module docstring and the
+                # phase-2 note.  What IS available is the exact window: the
+                # three tokens are on the host here, one depth earlier than
+                # the aux needs their rows, so the read goes to the pool and
+                # overlaps the verify's remaining host prep instead of
+                # blocking it.  Same buffer, same resolve, one candidate per
+                # depth.
+                _ple_prefix = [int(primary)]
+                for _ple_token in core_tokens:
+                    _ple_candidate_submit(
+                        prefix_tokens=tuple(_ple_prefix),
+                        candidate_ids=(int(_ple_token),),
+                        completion_tokens=tokens,
+                        committed_count=len(tokens) - 1,
+                    )
+                    _ple_prefix.append(int(_ple_token))
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
             draft_tokens = list(core_tokens)
@@ -12095,6 +12320,18 @@ def generate_mtpk(
                     if prepared_greedy_draft is not None:
                         draft_token, draft_q = prepared_greedy_draft
                         greedy_confidence_token_reuses += 1
+                    elif _draft_k20_prescatter_plan is not None:
+                        # MTPLX_FABLE_DRAFT_K20_PRESCATTER: the same read the
+                        # fixed-width reader does, on the FR-Spec head's
+                        # compact row.  `draft_logits` is never evaluated on
+                        # this branch, so the scatter behind it is never run.
+                        draft_token, draft_q = _fable_draft_k20_prescatter_read(
+                            _draft_k20_prescatter_plan,
+                            draft_logits,
+                            draft_sampler,
+                            rng,
+                            need_distribution=need_draft_distribution,
+                        )
                     else:
                         draft_token, draft_q, adaptive_width_stop = cycle_draft_reader(
                             draft_logits,
@@ -12164,6 +12401,37 @@ def generate_mtpk(
                         probs=np.asarray(draft_q, dtype=np.float64),
                         vocab_size=_frspec_legacy_full,
                     )
+            if _ple_candidate_submit is not None and draft_token is not None:
+                # THE speculative hook.  `draft_q` is this depth's K20 support
+                # -- the 20 ids the sampler drew from -- and every window token
+                # ahead of this position is already fixed, so the 16 rows for
+                # each candidate are known exactly.  Submitting here puts the
+                # 320-row read on the pool while the loop goes on to enqueue
+                # depth d+1's MTP forward.  frspec remapping happened above,
+                # so both the token and the support are in the target's id
+                # space, which is what `_ngram_rows_np` hashes.
+                if not draft_tokens:
+                    # First depth of a cycle the PR391 core did not run: the
+                    # primary's own window position has no candidates and no
+                    # `prefetch_fixed_m4_primary` seeded it here, so seed it
+                    # now or every window in this cycle resolves as a miss.
+                    _ple_candidate_submit(
+                        prefix_tokens=(),
+                        candidate_ids=(int(primary),),
+                        completion_tokens=tokens,
+                        committed_count=len(tokens) - 1,
+                    )
+                _ple_candidates = (
+                    draft_q.token_ids
+                    if isinstance(draft_q, SparseDistribution)
+                    else (int(draft_token),)
+                )
+                _ple_candidate_submit(
+                    prefix_tokens=(int(primary), *draft_tokens),
+                    candidate_ids=_ple_candidates,
+                    completion_tokens=tokens,
+                    committed_count=len(tokens) - 1,
+                )
             draft_tokens.append(draft_token)
             draft_probs.append(draft_q)
             draft_cache_keys.append(cache_key)
@@ -14311,6 +14579,12 @@ def generate_mtpk(
             _pr391_device_core,
             compiled_verify_bank,
         )
+    # Disarm the FR-Spec head's compact-row stash.  The head is model-scoped,
+    # not request-scoped, so leaving it armed would keep one unevaluated
+    # scatter graph alive between requests.  A raise before this point leaves
+    # it armed with at most one stale entry, which the next claim clears and
+    # which `take_prescatter_row`'s identity check can never mis-consume.
+    _fable_draft_k20_prescatter_release(_draft_k20_prescatter_plan)
     if constraint is not None:
         # Final sync so `completed` reflects every committed token (the loop
         # may exit between the per-cycle sync and the last commit).
@@ -14601,6 +14875,7 @@ def generate_mtpk(
             "greedy_confidence_sync_calls": greedy_confidence_sync_calls,
             "greedy_confidence_token_reuses": greedy_confidence_token_reuses,
         },
+        draft_k20_prescatter=_draft_k20_prescatter_receipt,
         owned_recurrent_state=owned_recurrent_state_stats(cache),
         owned_attn_kv=tail_owned_attention_kv_stats(cache),
         repetition_stop_triggered=repetition_result is not None,

@@ -67,6 +67,23 @@ DEFAULT_MAX_TOKENS = 1024
 #: for a prefill-only question.
 PREFILL_ONLY_MAX_TOKENS = 64
 
+#: ``--prompt-tokens``: the measured cell's prompt length on BOTH arms.
+#: Mirrors ``abba_driver.DEFAULT_PROMPT_TOKENS`` /
+#: ``abba_driver.PROMPT_TOKEN_CHOICES``; checked here so a bad value fails
+#: while the window is still planning rather than after an arm has taken
+#: the GPU lock.  Only the prompt moves -- labels, receipt paths and the
+#: summary table are identical at every length.
+DEFAULT_PROMPT_TOKENS = 16_384
+PROMPT_TOKEN_CHOICES = (
+    1_024,
+    8_192,
+    16_384,
+    32_768,
+    65_536,
+    131_072,
+    262_144,
+)
+
 CONTROL_CANDIDATE_ENV: tuple[str, ...] = (
     "MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE=1",
     "MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL=1",
@@ -944,6 +961,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        choices=PROMPT_TOKEN_CHOICES,
+        default=DEFAULT_PROMPT_TOKENS,
+        metavar="N",
+        help=(
+            "Prompt length of the measured cell on BOTH arms, in tokens "
+            f"(default {DEFAULT_PROMPT_TOKENS}; one of "
+            f"{', '.join(str(value) for value in PROMPT_TOKEN_CHOICES)}). "
+            "The default reproduces the pinned production prompt byte for "
+            "byte; any other value is built to exactly N tokens from the "
+            "same SHA-pinned fixtures. Labels, receipt paths and the "
+            "summary table are unchanged. The warm-up cell that "
+            "--prefill-only implies uses the same N."
+        ),
+    )
+    parser.add_argument(
         "--prefill-only",
         action="store_true",
         help=(
@@ -1004,7 +1038,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def common_driver_flags(args: argparse.Namespace) -> list[str]:
-    flags = ["--source", str(args.source)]
+    flags = [
+        "--source",
+        str(args.source),
+        # Always explicit, on every arm, even at the default: a window
+        # whose printed command line omits the prompt length is a window
+        # whose receipts cannot be re-run from what it recorded.
+        "--prompt-tokens",
+        str(int(args.prompt_tokens)),
+    ]
     if args.expected_source:
         flags.extend(["--expected-source", args.expected_source])
     if args.allow_dirty_source:
@@ -1027,9 +1069,11 @@ def common_driver_flags(args: argparse.Namespace) -> list[str]:
 def warm_graph_enabled(args: argparse.Namespace) -> bool:
     """Whether the arms run the driver's unmeasured graph warm-up cell.
 
-    ``--prefill-only`` implies it.  A prefill-only arm measures ONE 16,384
-    token prefill in a fresh process, and on 2026-09-01 that first chunk was
-    bimodal -- ~1.9 s or ~4.4 s -- on control and candidate alike, in lockstep
+    ``--prefill-only`` implies it.  A prefill-only arm measures ONE prefill
+    of ``--prompt-tokens`` tokens in a fresh process (the warm-up cell is
+    the same cell, so it is the same length), and on 2026-09-01 that
+    first chunk was bimodal -- ~1.9 s or ~4.4 s -- on control and
+    candidate alike, in lockstep
     with the throughput of the driver's own 29.8 GiB ``--prewarm-ngram-table``
     read (12/12 arms in the w22 window; +2.2 s median on prompt_eval_time_s
     across 20 window-arm groups).  That is residency state left by the
@@ -1065,6 +1109,9 @@ RESERVED_ARM_FLAGS = frozenset(
         # / --no-warm-graph, and store_true repeated is a silent no-op that
         # would make the printed command line disagree with the receipt.
         "--warm-graph",
+        # The window owns the prompt length too (--prompt-tokens): both
+        # arms must measure the same prompt or the pairing is void.
+        "--prompt-tokens",
     }
 )
 
@@ -1124,6 +1171,31 @@ def check_env_settings(settings: Sequence[str], *, flag: str, mtplx: bool) -> No
             )
 
 
+def check_prompt_tokens(args: argparse.Namespace) -> None:
+    """Mirror the driver's ``--prompt-tokens`` fail-closed rule, at plan time.
+
+    The PR391 reference rows were recorded against the pinned 16,384-token
+    production prompt, so token parity at any other length is a guaranteed
+    false drift.  Catching it here means the window never takes the GPU.
+    """
+
+    prompt_tokens = int(getattr(args, "prompt_tokens", DEFAULT_PROMPT_TOKENS))
+    if prompt_tokens not in PROMPT_TOKEN_CHOICES:
+        raise ValueError(
+            f"--prompt-tokens must be one of "
+            f"{', '.join(str(value) for value in PROMPT_TOKEN_CHOICES)}, "
+            f"got {prompt_tokens}"
+        )
+    if prompt_tokens != DEFAULT_PROMPT_TOKENS and getattr(
+        args, "require_reference_token_parity", False
+    ):
+        raise ValueError(
+            "--require-reference-token-parity is only defined at "
+            f"--prompt-tokens {DEFAULT_PROMPT_TOKENS}; the reference rows "
+            "were recorded against the pinned production prompt"
+        )
+
+
 def check_arm_flags(flags: Sequence[str]) -> None:
     """Reject arm flags that collide with what the window already supplies."""
 
@@ -1145,6 +1217,7 @@ def arm_specification(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     with the opposite sign.
     """
 
+    check_prompt_tokens(args)
     check_arm_flags(args.control_flag)
     check_arm_flags(args.candidate_flag)
     check_env_settings(args.control_env, flag="--control-env", mtplx=True)
@@ -1306,6 +1379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for arm, spec in specs.items()
         },
         "common_driver_flags": common,
+        "prompt_tokens": int(args.prompt_tokens),
         # The cost model every ``ms_per_m4_window_net`` in this receipt was
         # computed under, so a re-fit never silently reinterprets old numbers.
         "copy_cost_model": {

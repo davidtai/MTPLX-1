@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
+import json
 import re
 import statistics
 import sys
@@ -1468,3 +1470,392 @@ class ExtraEnvRecordingTest(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             window.arm_specification(args)
         self.assertIn("--candidate-extra-env", str(caught.exception))
+
+
+# --------------------------------------------------------------------------
+# --prompt-tokens: one measured cell, resized
+# --------------------------------------------------------------------------
+
+
+#: SHA-256 of the comma-joined default prompt ids, as produced by the builder
+#: BEFORE ``--prompt-tokens`` existed:
+#:
+#:     list(tokenizer.apply_chat_template(
+#:         [{"role": "user", "content": production_prompt_content()}],
+#:         tokenize=True, add_generation_prompt=True,
+#:         enable_thinking=True, reasoning_effort="xhigh"))
+#:
+#: Pinned so the default can never drift: every retained receipt was measured
+#: on these exact ids, and a window at ``--prompt-tokens 16384`` has to stay
+#: comparable to them.
+PRODUCTION_PROMPT_IDS_SHA256 = (
+    "049ea1d936455ae5f439113372317a2088b8e26dbdf25091e1cb1b1fe90a92cb"
+)
+
+
+def prompt_ids_sha256(prompt_ids):
+    return hashlib.sha256(
+        ",".join(str(int(value)) for value in prompt_ids).encode()
+    ).hexdigest()
+
+
+def fixtures_present():
+    return all(
+        (driver.FIXTURES / name).exists()
+        for name in (
+            "qwen38_generation_context.py",
+            "qwen38_naturalistic_generation_patch.jsonl",
+        )
+    )
+
+
+_REAL_TOKENIZER = []
+
+
+def real_tokenizer():
+    """The model pack's own tokenizer: CPU only, no MLX, no weights.
+
+    Same tokenizer-only build ``longprompt_agreement_screen.load_tokenizer``
+    does.  Skips rather than fails wherever transformers, the fixtures or the
+    model pack are absent, so the rest of the file stays runnable anywhere.
+    """
+
+    if not fixtures_present():
+        raise unittest.SkipTest(f"prompt fixtures not present: {driver.FIXTURES}")
+    if not driver.MODEL.exists():
+        raise unittest.SkipTest(f"model pack not present: {driver.MODEL}")
+    if not _REAL_TOKENIZER:
+        try:
+            from transformers import AutoTokenizer
+        except Exception as exc:  # pragma: no cover - environment dependent
+            raise unittest.SkipTest(f"transformers not importable: {exc}") from exc
+        _REAL_TOKENIZER.append(
+            AutoTokenizer.from_pretrained(
+                str(driver.MODEL), trust_remote_code=False
+            )
+        )
+    return _REAL_TOKENIZER[0]
+
+
+class CharTokenizer:
+    """One id per character, plus a fixed chat-template overhead.
+
+    Enough for both prompt builders without transformers: the length-targeting
+    path only needs ``encode`` to be additive and the template to preserve the
+    sentinel.  ``templated_length`` drives the ``tokenize=True`` path, so a
+    test can hand the builder a wrong-length prompt on purpose.
+    """
+
+    PREFIX = "<|im_start|>user\n"
+    SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
+
+    def __init__(self, templated_length=16_384):
+        self.templated_length = int(templated_length)
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking,
+        reasoning_effort=None,
+    ):
+        if tokenize:
+            return list(range(self.templated_length))
+        return self.PREFIX + messages[0]["content"] + self.SUFFIX
+
+    def encode(self, text):
+        return [ord(character) % 1000 for character in text]
+
+
+class PromptTokenFlagTest(unittest.TestCase):
+    def test_driver_default_is_the_production_prompt_length(self):
+        args = driver.build_parser().parse_args(
+            ["--label", "x", "--sequence", "1", "--seed", "1"]
+        )
+        self.assertEqual(args.prompt_tokens, driver.DEFAULT_PROMPT_TOKENS)
+        self.assertEqual(driver.DEFAULT_PROMPT_TOKENS, 16_384)
+
+    def test_window_default_is_the_production_prompt_length(self):
+        args = window.build_parser().parse_args(["--sequence", "1"])
+        self.assertEqual(args.prompt_tokens, window.DEFAULT_PROMPT_TOKENS)
+        self.assertEqual(
+            window.DEFAULT_PROMPT_TOKENS, driver.DEFAULT_PROMPT_TOKENS
+        )
+
+    def test_window_and_driver_accept_the_same_lengths(self):
+        self.assertEqual(
+            tuple(window.PROMPT_TOKEN_CHOICES), tuple(driver.PROMPT_TOKEN_CHOICES)
+        )
+        self.assertEqual(
+            tuple(driver.PROMPT_TOKEN_CHOICES),
+            (1_024, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144),
+        )
+
+    def test_an_unlisted_length_is_refused_by_both_parsers(self):
+        for parser, argv in (
+            (window.build_parser(), ["--sequence", "1", "--prompt-tokens", "4096"]),
+            (
+                driver.build_parser(),
+                [
+                    "--label",
+                    "x",
+                    "--sequence",
+                    "1",
+                    "--seed",
+                    "1",
+                    "--prompt-tokens",
+                    "4096",
+                ],
+            ),
+        ):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(argv)
+
+    def test_every_arm_carries_the_requested_length(self):
+        for requested in ("8192", "16384", "262144"):
+            args = window.build_parser().parse_args(
+                ["--sequence", "1", "--prompt-tokens", requested]
+            )
+            common = window.common_driver_flags(args)
+            self.assertIn("--prompt-tokens", common)
+            self.assertEqual(
+                common[common.index("--prompt-tokens") + 1], requested
+            )
+            specs = window.arm_specification(args)
+            runs = window.plan_runs((20260829,), "ABBA", 1)
+            for run in runs:
+                argv = window.build_arm_argv(
+                    run,
+                    python="py",
+                    driver="drv",
+                    label_prefix="p",
+                    receipt_dir="/tmp/nope",
+                    common_flags=common,
+                    arm_flags=specs[run["arm"]]["flags"],
+                    candidate_env=specs[run["arm"]]["candidate_env"],
+                    extra_env=specs[run["arm"]]["extra_env"],
+                )
+                self.assertEqual(argv.count("--prompt-tokens"), 1)
+                self.assertEqual(
+                    argv[argv.index("--prompt-tokens") + 1], requested
+                )
+
+    def test_the_length_is_recorded_even_at_the_default(self):
+        """The default is printed, not implied.
+
+        A receipt whose ``common_driver_flags`` omits the length cannot be
+        re-run from what it recorded.
+        """
+
+        args = window.build_parser().parse_args(["--sequence", "1"])
+        self.assertIn("--prompt-tokens", window.common_driver_flags(args))
+
+    def test_prompt_tokens_is_reserved_as_an_arm_flag(self):
+        self.assertIn("--prompt-tokens", window.RESERVED_ARM_FLAGS)
+        args = window.build_parser().parse_args(
+            ["--sequence", "1", "--candidate-flag=--prompt-tokens"]
+        )
+        with self.assertRaises(ValueError) as caught:
+            window.arm_specification(args)
+        self.assertIn("--prompt-tokens", str(caught.exception))
+
+    def test_reference_parity_is_refused_away_from_the_default_length(self):
+        """Both layers refuse it, and the window refuses it before the lock."""
+
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--prompt-tokens",
+                "8192",
+                "--require-reference-token-parity",
+            ]
+        )
+        with self.assertRaises(ValueError) as caught:
+            window.arm_specification(args)
+        self.assertIn("--require-reference-token-parity", str(caught.exception))
+
+        driver_args = driver.build_parser().parse_args(
+            [
+                "--label",
+                "x",
+                "--sequence",
+                "1",
+                "--seed",
+                "1",
+                "--prompt-tokens",
+                "8192",
+                "--require-reference-token-parity",
+            ]
+        )
+        with self.assertRaises(RuntimeError) as driver_caught:
+            driver.check_prompt_tokens(driver_args)
+        self.assertIn("16384", str(driver_caught.exception))
+
+    def test_reference_parity_is_still_allowed_at_the_default_length(self):
+        args = window.build_parser().parse_args(
+            ["--sequence", "1", "--require-reference-token-parity"]
+        )
+        window.check_prompt_tokens(args)
+        driver_args = driver.build_parser().parse_args(
+            [
+                "--label",
+                "x",
+                "--sequence",
+                "1",
+                "--seed",
+                "1",
+                "--require-reference-token-parity",
+            ]
+        )
+        driver.check_prompt_tokens(driver_args)
+
+    def test_prompt_tokens_is_refused_with_the_benchmark_matrix(self):
+        args = driver.build_parser().parse_args(
+            [
+                "--label",
+                "x",
+                "--sequence",
+                "1",
+                "--seed",
+                "1",
+                "--benchmark-matrix",
+                "--prompt-tokens",
+                "8192",
+            ]
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            driver.check_prompt_tokens(args)
+        self.assertIn("--benchmark-matrix", str(caught.exception))
+
+    def test_prefill_only_budget_does_not_depend_on_the_length(self):
+        for requested in ("1024", "16384", "262144"):
+            args = window.build_parser().parse_args(
+                ["--sequence", "1", "--prefill-only", "--prompt-tokens", requested]
+            )
+            self.assertEqual(
+                window.resolve_max_tokens(args.max_tokens, args.prefill_only),
+                window.PREFILL_ONLY_MAX_TOKENS,
+            )
+            self.assertTrue(window.warm_graph_enabled(args))
+            self.assertIn("--warm-graph", window.common_driver_flags(args))
+
+
+class PromptConstructionTest(unittest.TestCase):
+    def setUp(self):
+        if not fixtures_present():
+            self.skipTest(f"prompt fixtures not present: {driver.FIXTURES}")
+
+    def test_the_warm_up_cell_prefills_the_same_prompt(self):
+        cell = {"label": "arm", "prompt_ids": [1, 2, 3], "max_tokens": 64}
+        warm = driver.graph_warmup_cell(cell)
+        self.assertEqual(warm["label"], "arm-unmeasured-graph-warmup")
+        self.assertIs(warm["prompt_ids"], cell["prompt_ids"])
+        self.assertEqual(len(warm["prompt_ids"]), len(cell["prompt_ids"]))
+        self.assertEqual(cell["label"], "arm")
+
+    def test_the_length_assertion_names_the_requested_length(self):
+        tokenizer = CharTokenizer(templated_length=16_000)
+        with self.assertRaises(RuntimeError) as caught:
+            driver.build_production_prompt_ids(tokenizer, prompt_tokens=16_384)
+        self.assertEqual(
+            str(caught.exception), "prompt has 16000 tokens, expected 16384"
+        )
+
+    def test_an_unlisted_length_is_refused_by_the_builder(self):
+        with self.assertRaises(ValueError) as caught:
+            driver.build_production_prompt_ids(
+                CharTokenizer(), prompt_tokens=4_096
+            )
+        self.assertIn("4096", str(caught.exception))
+
+    def test_every_length_is_exact_without_a_real_tokenizer(self):
+        tokenizer = CharTokenizer()
+        for target in driver.PROMPT_TOKEN_CHOICES:
+            if target == driver.DEFAULT_PROMPT_TOKENS:
+                continue
+            prompt_ids = driver.build_production_prompt_ids(
+                tokenizer, prompt_tokens=target
+            )
+            self.assertEqual(len(prompt_ids), target)
+
+    def test_the_fixture_hashes_are_recorded(self):
+        hashes = driver.prompt_fixture_sha256()
+        self.assertEqual(
+            sorted(hashes),
+            [
+                "qwen38_generation_context.py",
+                "qwen38_naturalistic_generation_patch.jsonl",
+            ],
+        )
+        self.assertEqual(
+            hashes["qwen38_generation_context.py"],
+            driver.EXPECTED_CONTEXT_SHA256,
+        )
+        for digest in hashes.values():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+
+class RealTokenizerPromptTest(unittest.TestCase):
+    """Lengths and bytes against the model pack's own tokenizer (no MLX)."""
+
+    def test_the_default_prompt_bytes_are_unchanged(self):
+        tokenizer = real_tokenizer()
+        prompt_ids = driver.build_production_prompt_ids(tokenizer)
+        self.assertEqual(len(prompt_ids), 16_384)
+        self.assertEqual(
+            prompt_ids_sha256(prompt_ids), PRODUCTION_PROMPT_IDS_SHA256
+        )
+
+    def test_the_default_matches_the_pre_flag_builder_exactly(self):
+        """Not just the pinned hash: the same expression, re-evaluated."""
+
+        tokenizer = real_tokenizer()
+        before = driver.templated_ids(
+            tokenizer.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": driver.production_prompt_content(),
+                    }
+                ],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+                reasoning_effort="xhigh",
+            )
+        )
+        self.assertEqual(driver.build_production_prompt_ids(tokenizer), before)
+
+    def test_short_lengths_land_exactly(self):
+        tokenizer = real_tokenizer()
+        for target in (1_024, 8_192, 32_768):
+            prompt_ids = driver.build_production_prompt_ids(
+                tokenizer, prompt_tokens=target
+            )
+            self.assertEqual(len(prompt_ids), target)
+
+    def test_a_resized_prompt_is_the_matrix_cell_at_that_length(self):
+        """``--prompt-tokens 65536`` reproduces ``coding-64k-1k-xhigh-t1``."""
+
+        tokenizer = real_tokenizer()
+        context = (driver.FIXTURES / "qwen38_generation_context.py").read_text()
+        instruction = json.loads(
+            (driver.FIXTURES / "qwen38_naturalistic_generation_patch.jsonl")
+            .read_text()
+            .splitlines()[0]
+        )["prompt"]
+        matrix = driver.build_exact_coding_prompt_ids(
+            tokenizer,
+            context=context,
+            instruction=instruction,
+            target_tokens=65_536,
+            reasoning_effort="xhigh",
+        )
+        self.assertEqual(
+            driver.build_production_prompt_ids(tokenizer, prompt_tokens=65_536),
+            matrix,
+        )

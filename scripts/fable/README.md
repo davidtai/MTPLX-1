@@ -71,6 +71,32 @@ PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps 
     --sequence 1788400001 --dry-run
 ```
 
+### Measuring a different prompt length
+
+`--prompt-tokens N` resizes the measured cell's prompt on **both** arms.
+Accepted values are 1024, 8192, 16384 (default), 32768, 65536, 131072 and
+262144. Only the prompt moves: the labels, the receipt paths, the sampler and
+the summary table are identical at every length, so a window at another length
+is read exactly like a 16K one -- it is just not comparable to a 16K receipt.
+
+The default reproduces the pinned production prompt byte for byte. Every other
+value is built to exactly N tokens by `abba_driver.build_exact_coding_prompt_ids`
+from the same SHA-pinned fixture pair, which is how the benchmark matrix already
+builds its 64K and 128K cells -- so `--prompt-tokens 65536` is the matrix's
+`coding-64k-1k-xhigh-t1` prompt. The arm receipt records `prompt_tokens` and
+`prompt_fixture_sha256`; `prompt_content_sha256` stays pinned only at 16384,
+where the prompt bytes themselves are pinned.
+
+`--require-reference-token-parity` is refused away from 16384 (the PR391
+reference rows were recorded against the production prompt), and the window
+refuses it while planning, before it takes the GPU lock.
+
+Pair it with `--prefill-only` for a prefill-attribution window: `--max-tokens`
+drops to 64 and the driver's unmeasured graph warm-up cell runs first at the
+**same** N, so the measured run's first prefill chunk is not the cold one.
+Per-chunk wall and PLE-gather seconds land on every row as `prefill_chunks`,
+on control and candidate alike.
+
 ## 2. Full ABBA, three production seeds
 
 Twelve arms (4 per seed x 3 seeds), each a fresh model load plus a thermal
@@ -161,6 +187,163 @@ above are refused on `--*-env` with a message naming the right channel. Both
 are recorded in the arm receipt under `process_environment_overrides`, with the
 requested value alongside the value actually in force.
 
+### Recipe: start the first prefill chunk's PLE gather at request arrival
+
+```
+    --candidate-extra-env MTPLX_FABLE_PLE_FIRST_GATHER_EARLY=1
+```
+
+`MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1` hides chunks 2..n of the PLE n-gram
+gather behind the previous chunk's forward. Chunk 1 has nothing to hide behind:
+the scope submits it and `stage()` blocks on it microseconds later, which the
+w35 receipts price at `prefill_chunks[0].ple_gather_s` 0.627 s against 0.0006 s
+for chunks 2-4. On a single-chunk prompt the lookahead is inert by
+construction, so that exposed gather is the whole PLE prefill cost.
+
+This flag does three things, all off without it:
+
+1. **Starts chunk 1's gather at request arrival** -- at the top of
+   `restore_or_prefill_prompt_state`, before the session-bank lookup and the
+   prefill graph setup -- on a process-wide worker pool. The chunked prefill
+   then *adopts* that in-flight future as the lookahead's slot 0 rather than
+   preparing the span twice; a single-chunk prefill consumes it directly. Row
+   ids are a pure function of the prompt ids, so the first chunk's span is
+   predicted from the prompt and the two span planners the prefill loop
+   chooses between -- and the lane declines rather than guesses when they
+   disagree (a banked short prompt, a stable-prefix edge).
+2. **Replaces the per-row `os.pread` warm pass with the memmap fancy index**
+   for every big gather, on the worker and on the generation thread alike, when
+   `mincore(2)` says the rows' pages are already in core (~165 ms per 32,768
+   rows against 0.44 ms). A demand-faulted mmap is flat at 1.40 GiB/s against
+   pooled pread's 12.9, so the probe is what makes this safe: an unavailable or
+   below-threshold probe takes the shipped pread path, which is never wrong.
+   `vectorized_gathers` / `pread_gathers` in the receipt say which ran.
+3. **Pre-touches the rest of the prompt's rows** behind chunk 1, chained off
+   its future, so later chunks' gathers find their pages warm.
+
+The receipt records `ple_first_gather_early`:
+`started_at_ms_before_layer2` (the head start the lane bought -- submit to
+first need), `rows`, `path`, `outcome` (`adopted_hit`, `hit`, or a named miss)
+and `prefetch_rest_rows`.
+
+Two companion knobs, also `MTPLX_FABLE_*` and also off by default:
+
+| Key | Effect |
+| --- | --- |
+| `MTPLX_FABLE_NGRAM_MADVISE=random\|normal\|sequential` | Overrides the n-gram maps' `madvise`. Default is `random` (shipped) with the lane off and `normal` with it on: `MADV_RANDOM` suppresses readahead around a *mapping fault*, which under this lane is the ascending pre-touch and the vectorised gather's residual misses -- the two cases readahead helps. `pread(2)` never consulted the advice at all. |
+| `MTPLX_NGRAM_PREWARM=auto\|all\|off\|<GiB>` | How much of the n-gram table to pre-read at model load. **On by default in `auto`** = `min(table, free - KV reservation - 6 GiB margin)`; `all` reads all 29.8 GiB (~2.5 s at ~12 GiB/s), `off` serves at the as-found page-cache rate. First-class option: `mtplx serve --ngram-prewarm ...`, and the CLI wins over the env. `--ngram-prewarm-order` / `<model>/ngram-hotness.npy` (built by `scripts/fable/ngram_row_hotness.py`) decides WHICH rows a partial budget warms. `MTPLX_FABLE_NGRAM_PREWARM_AT_LOAD` is a deprecated boolean alias. See `docs/server.md`. The driver's `--prewarm-ngram-table` did this for benchmarks only; the daemon had no equivalent -- a 1.9 s vs 4.4 s first chunk in the w22 window, and 56 vs 68.8 tok/s on decode. |
+
+Prefill-only ABBA window at 16K, on top of the retained prefill stack:
+
+```
+PYTHONPATH=<worktree> <venv>/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 36000 -- \
+  <venv>/bin/python <worktree>/scripts/fable/abba_window.py \
+    --sequence <seq> --order ABBA --label-prefix fable-w46-firstgather \
+    --source <worktree> --prefill-only \
+    --control-env MTPLX_GDN_BLOCKED_PREFILL=1 \
+    --control-env MTPLX_PREFILL_CHUNK_SIZE=4096 \
+    --control-env MTPLX_QSA_PREFILL_COMPILE_ROWS=4096 \
+    --control-env MTPLX_QSA_PREFILL_DEBUG=1 \
+    --control-extra-env MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1 \
+    --control-extra-env MTPLX_FABLE_PREFILL_QSA_QUERY_TILE=2048 \
+    --candidate-extra-env MTPLX_FABLE_PLE_FIRST_GATHER_EARLY=1
+```
+
+Add `--prompt-tokens 1024` for the short-prompt cell, where the lookahead is
+inert and this lane is the only thing hiding the gather.
+
+### Recipe: prefetch the draft chain's candidate PLE rows (K-P1)
+
+```
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+Decode reads 16 n-gram rows x 100 B per token out of the 32 GB memory-mapped
+table.  The rows are 85-93 % novel so no LRU covers them, and the table cannot
+go resident next to ~85 GB of wired weights.  This lane predicts instead: the
+row ids are a pure function of the token ids, so the moment a draft depth's
+K20 support exists on the host, the 16 rows for each of its 20 candidates are
+known (320 rows = 32 KB/depth) and a worker gathers them while the GPU runs
+the next depth.  When the sampled token is chosen its rows are already in a
+host buffer, and `_FixedM4CandidateSidecarAux` hands them to `gather_np(prepared=...)`
+instead of reading the table on the critical path.
+
+Bytes are identical by construction, not by comparison: the buffer is
+content-addressed by table row id and every payload in it is a literal read of
+the same three memmaps the shipped gather reads.  A window with one uncovered
+row falls back whole.
+
+Read the receipt's `ple_hot_rows.ple_candidate_prefetch`:
+
+| field | means |
+| --- | --- |
+| `depths` | candidate buckets submitted (primary + one per draft depth) |
+| `candidate_rows` / `bytes` | rows and bytes the lane actually read |
+| `hits` / `misses` | verify WINDOWS served from the buffer / fell back whole |
+| `rows_served` / `rows_missing` | the row detail behind those |
+| `vectorized_buckets` / `pread_buckets` / `cold_declines` | which read the worker took |
+| `worker_wait_ms` | owner time blocked joining the workers |
+
+`worker_wait_ms` is the honest half of the receipt: if it is not far below the
+gather it replaced, the lane bought nothing.  `cold_declines` is the other
+one -- a 320-row bucket on cold pages is 960 GIL-contended `os.pread` calls
+(~4.8 ms) against a ~12 us warm fancy index, so a cold bucket is DECLINED and
+the shipped gather runs.  A run with `cold_declines` high has no candidate
+lane, whatever the flag says.
+
+Two caveats worth stating before the window runs:
+
+* The retained PR391 joint-D3 core keeps its per-depth K20 arrays
+  verifier-resident (only the packed token vector is synced), so on that lane
+  the *speculative* hook has nothing to read.  The lane still runs there, with
+  the three resolved tokens as one-candidate depths, which only moves the read
+  into the pool -- a smaller win than the speculative form.  The stock serial
+  draft loop is where the 20-candidate hook fires.
+* Removing the draft -> target sync itself is phase 2 and is NOT built; see
+  `docs/perf/ple-candidate-prefetch-phase2.md`.
+
+Full ABBA, prewarmed table on both arms (the regime the retained stack serves):
+
+```
+PYTHONPATH=<worktree> <venv>/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 36000 -- \
+  <venv>/bin/python <worktree>/scripts/fable/abba_window.py \
+    --sequence <seq> --order ABBA --label-prefix fable-w56-candprefetch \
+    --source <worktree> --prewarm-ngram-table --warm-graph --retain-events \
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+And the as-found page-cache regime, where the lane should matter most -- the
+same window with `--prewarm-ngram-table` dropped from BOTH arms, so neither
+arm gets the driver's 29.8 GiB pre-read and the control pays real faults on
+the critical path:
+
+```
+    ... --warm-graph --retain-events \
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+`MTPLX_NGRAM_PREWARM` is on by default at model *load*, and it is a profile
+override key (`mtplx/profiles.py`), so the as-found cell needs it turned off on
+BOTH arms through `--control-env` / `--candidate-env`, not `--extra-env`:
+
+```
+    --control-env MTPLX_NGRAM_PREWARM=0 --candidate-env MTPLX_NGRAM_PREWARM=0 \
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+Without that, both arms are prewarmed by the load path and the two cells
+measure the same thing.  Expect `cold_declines` to dominate in the cold cell
+unless the lane is paired with `MTPLX_FABLE_PLE_FIRST_GATHER_EARLY=1` on both
+arms, which is what warms the pages the candidate buckets then read -- so the
+cold cell is really a THREE-way question (cold control, cold candidate, cold
+candidate + pre-touch) and the third arm is the one that can win.
+
 ### Recipe: open the context-copy block cap
 
 ```
@@ -207,6 +390,52 @@ rate. Judge it on `ms_per_m4_window_net` with a re-fitted
 Pair it with `--candidate-extra-env MTPLX_CONTEXT_COPY_PROBATION_K=16` to let
 proven lanes reach the wider cap sooner; run six seeds, because the effect sits
 near the corrected metric's 0.3-0.7% noise floor.
+
+### Recipe: fuse the dense QSA prefill attention
+
+```
+    --candidate-extra-env MTPLX_FABLE_PREFILL_MASK_FUSE=1 \
+    --candidate-env MTPLX_QSA_PREFILL_DEBUG=1
+```
+
+At `head_dim` 256 MLX's own heuristic declines the fused `steel_attention`
+kernel, so every dense QSA prefill layer materializes an `[H, S, T]` bf16
+score tensor, masks it, softmaxes it twice and re-reads it for `P@V`. The
+flag passes `force_fused=True` instead. Two arms, one flag, both counted by
+`MTPLX_QSA_PREFILL_DEBUG=1`:
+
+* `mask_fuse_causal` — the indexer returned **no** selection, which happens
+  exactly when the chunk's post-update context is inside the block budget
+  (`T <= (block_topk + 1) * ratio - 1` = **2,051** tokens on the production
+  pack) or on a vision request. The visible set is then exactly causal, so
+  the lane passes MLX the string `"causal"` (documented lower-right aligned:
+  the last query is the last key, which is precisely the chunked-prefill
+  offset case) and builds no tensor at all.
+* `mask_fuse_bool` — a real top-k selection, handed to the fused kernel as
+  the bool array it already is.
+* `mask_fuse_unavailable` — the one-shot probe found no fused kernel for
+  this `(mask kind, head_dim, dtype)`; the arm says so on stderr and stays
+  on the dense route for the rest of the process instead of quietly
+  measuring the control under a candidate label.
+
+`mask_causal_eligible` counts the exactly-causal regime whether or not the
+flag is armed. **At the retained prefill width (4,096) it is zero at 16K and
+at 32K** — no chunk's context is under 2,051 — so at those cells the flag's
+whole effect is `mask_fuse_bool`, and `mask_fuse_causal` is expected to read
+0. It is chunk 0 and only chunk 0 at the shipped 2,048 width.
+
+Neither arm is bit-identical: the fused kernel runs an fp32 online softmax
+over the same visible set, so this is the rounding class the long-prompt
+agreement screen gates, not an approximation.
+
+The sparse-QSA crossover is a documented knob and is **not** touched by any
+of this: `MTPLX_QSA_PREFILL_MIN_CONTEXT` (default 32,768, floor 2,049,
+compared against `total_tokens - rows`) and
+`MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT` are both in
+`MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, i.e. reachable from `--candidate-env`.
+At 16K and at 32K the gate is unreachable at any chunk width (its maximum
+`total_tokens - rows` is 30,720 at 32K), which is why both cells are wholly
+dense and why the mask-fuse arm applies to every chunk of them.
 
 `--candidate-env` keys must be members of
 `mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, or `apply_profile_env`
@@ -403,10 +632,11 @@ run a single arm as the guard's direct child.
 
 ## Microbenchmarks
 
-`micro_dispatch_overhead.py`, `micro_moe_dedup.py`, `micro_expert_major.py` and
-`micro_hc_read.py` price one site at the fixed-M4 verifier's shapes without
-loading the model. They import MLX and therefore need the SAME guarded window
-as an ABBA arm; none of them touch `com.tea.qwen`, so they can share a window.
+`micro_dispatch_overhead.py`, `micro_moe_dedup.py`, `micro_expert_major.py`,
+`micro_hc_read.py`, `micro_dependent_launch.py` and `micro_route_kernel.py`
+price one site at the fixed-M4 verifier's shapes without loading the model. They import MLX and therefore need
+the SAME guarded window as an ABBA arm; none of them touch `com.tea.qwen`, so
+they can share a window.
 
 `micro_hc_read.py` prices the gated-residual read (`GatedResidual.__call__`,
 97 reads/cycle, 11 dispatches and 13.21 MB of bf16 mix weights each). Variant
@@ -435,6 +665,45 @@ sources and why bit-equality is not reachable). Then confirm on the verifier
 with an ABBA arm carrying `--candidate-env MTPLX_FABLE_HC_M4=1`; the gate is
 acceptance parity, not a digest. Quality is a separate window: see the
 HumanEval quality screen below.
+
+### micro_route_kernel.py
+
+Prices the MoE routing head (census item 4 plus the two GEMVs around it):
+`block.gate` q8 GEMV, precise softmax, `argpartition` top-10,
+`take_along_axis`, the bf16 renormalise, the shared-gate GEMV and its sigmoid
+-- **ten dispatches per layer, 480 per cycle, for 44 numbers and 40 indices**.
+`mtplx/kernels/qwen4_m4_route.py` emits the same
+`(expert_ids, route_scores, shared_factor)` tuple in two.
+
+Arms: `stock` (the shipped head), `k1` (the kernel at MLX's own `qmv_wide`
+thread layout, 4,160 threads), `k4` (each verifier vector on its own lane
+octet, 16,640 threads -- bit-identical to `k1` by construction, since the
+per-vector accumulation sequence is untouched). The script is a `VEC_LANES`
+decision, not a go/no-go: the -8 dispatches/layer land either way.
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 3600 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/micro_route_kernel.py \
+    --layers 48 --reps 200 \
+    --out /tmp/micro-route-kernel.json
+```
+
+Adoption bar: **parity must print `EXACT` on every arm** -- the routing head
+decides which experts run, so `set_diff`, `order_diff`, `ids`, `scores` and
+`shared` must all be 0, and the script exits non-zero otherwise. With that
+clean, arm the winning `VEC_LANES` on the verifier through an ABBA window
+carrying `--candidate-env MTPLX_QWEN4_M4_ROUTED_GLU=1
+--candidate-env MTPLX_FABLE_ROUTE_KERNEL=1` (the route kernel replaces the
+paired routed-GLU lane's head and refuses to install without it). Because the
+tuple is bit-exact there is no quality screen: acceptance and the digest are
+unchanged by construction, and `install_qwen4_m4_stage3` proves that per layer
+on the real packs before the first token.
 
 ## HumanEval quality screen (non-bit-exact kernels)
 
@@ -756,6 +1025,15 @@ cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
 flag's gating and narrowing, every eligibility raise, CPU references of each
 Metal body pinned against the stock chain it replaces, and the dispatch-map
 receipt above.
+
+`tests/test_fable_route_kernel.py` runs entirely on the CPU stream (51 cases):
+the routing head's tie rule derived from MLX 0.32.2's `sort.h` and proved
+against `mx.argsort` on constructed exact ties, the four rounding boundaries
+the Metal source transcribes (bf16 sum order, bf16 divide, the bf16 sigmoid
+decomposition, precise-softmax dtype), the geometry invariants that pin
+`k_lanes = 8`, source tripwires on the load-bearing spellings, and every
+construction-time refusal. It cannot execute the kernel; the bit-exactness
+claim itself is gated per layer inside `install_qwen4_m4_stage3`.
 
 `tests/test_compiled_copy_round.py` is pure Python (`mtplx.context_copy`
 imports only `functools` and `os`): the read-once
@@ -1245,6 +1523,59 @@ remapping), the oracle and the host tail against a NumPy transcription of
 `_device_serial_support_arrays`, `prepare_draft_row_f32` bit-identical to the
 choice kernel's own CPU oracle, the draw accounting against a flag-off
 `rng.choice` chain, and the `stock_device_k20` logger round trip.
+
+---
+
+## micro_draft_k20.py — the FR-Spec draft row, scattered vs compact
+
+`MTPLX_FABLE_DRAFT_K20_PRESCATTER` (`mtplx/fable_draft_k20_prescatter.py`)
+builds each draft step's K20 support from the FR-Spec head's 65,536-row output
+instead of the 248,320-wide scatter it is padded into, and maps the selected
+LOCAL rows back to real token ids through the ranked table. Because MLX is
+lazy and nothing under this route evaluates the scattered array, the
+`put_along_axis` is built and dropped rather than run — so the step loses the
+scatter AND shrinks both device passes (`argpartition` to 80, full-vocabulary
+`logsumexp`) by 3.79x.
+
+This bench prices that with no model in front of it, and re-measures on the
+Metal stream the one exactness claim the CPU tests cannot settle: whether the
+two DIFFERENT-WIDTH `logsumexp` reductions associate their float32 partials
+identically. The sentinel terms are exactly `+0.0` (float32 `exp` underflows
+below ~-103.97 and the pad is `-1.67e30` after the temperature divide), so the
+sums are equal as real numbers; only the reduction tree is in question, and a
+residual ULP there cannot change the SUPPORT.
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_draft_k20.py \
+    --lane queued --reps 200 --parity-rows 32 \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-draft-k20.json
+```
+
+Default shape: `65536x248320`, the production FR-Spec pair. Variants:
+`stock_scatter_serial` (what the lane pays: scatter + the shipped builder over
+248,320, host tail and sync included), `stock_serial_only` (the builder alone,
+on an already-materialised row), `scatter_only` (`mx.full` + `put_along_axis`,
+device-terminated), `prescatter_serial`, `stock_read` / `prescatter_read` (the
+whole draft read including `_serial_row_distribution` and the one `rng.choice`
+draw) and two `read_floor`s.
+
+**Decision rule.** The draft chain is three sync-terminated steps per window.
+`stock_read - prescatter_read` in 0.3–0.6 ms/step (1.0–1.8 ms/window) is the
+expectation; below ~0.15 ms the gate is not worth carrying.
+
+Parity is counted, never asserted: `support_ids_differing`,
+`support_prob_bits_differing` and `draw_rows_differing` must be 0, while
+`logsumexp_ulp_nonzero_rows` / `logsumexp_ulp_max_abs` bound the reduction-tree
+residual rather than gating on it. `--self-test` runs the ranked-table and ULP
+helpers with no MLX and no lock.
 
 ---
 

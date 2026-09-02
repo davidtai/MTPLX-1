@@ -359,6 +359,12 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # rows during this chunk's forward.  Default off; the gathers it
         # overlaps are 8 host-late stalls totalling 2,313 ms in the census.
         "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD",
+        # K-P1: worker-thread gather of the 16 PLE rows for each of a draft
+        # depth's 20 K20 candidates, while the GPU runs the next depth, so the
+        # sampled token's rows are already in a host buffer when the fixed-M4
+        # verify assembles its auxiliary.  Bytes identical (rows are a pure
+        # function of token ids); default off.
+        "MTPLX_FABLE_PLE_CANDIDATE_PREFETCH",
         # Fable 16K candidate: compare the crossover against the chunk's own
         # total_tokens instead of total_tokens - rows, so the 8 x 2,048 cut of
         # a 16,384-token prompt can reach the sparse lane at all.  Default off;
@@ -399,6 +405,13 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # (2026-08-28, default 1024; 0 disables) — registered ahead per the
         # boot-trap law so packs/profiles may stamp it.
         "MTPLX_NGRAM_HOT_MB",
+        # Sequential pre-read of the streamed n-gram table at model load
+        # (default ON; 0 opts out). `mtplx serve --ngram-prewarm /
+        # --no-ngram-prewarm` stamps this key, so the CLI wins over a
+        # shell-set value. Cold sidecar rows are demand faults at 1.40 GiB/s
+        # against 12.9 for the read itself: ~2.5 s at load buys 56 -> 68.8
+        # tok/s decode and removes the 1.9 s vs 4.4 s first-chunk bimodality.
+        "MTPLX_NGRAM_PREWARM",
         # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
         # NAX verify patch OFF under turbo until it earns a family receipt.
         "MTPLX_NAX_VERIFY",

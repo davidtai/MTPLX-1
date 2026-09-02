@@ -10,6 +10,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from . import ple_candidate_prefetch
 from .models.qwen4_exp import (
     _ngram_rows_np,
     compiled_verify_ple_scope,
@@ -324,6 +325,113 @@ class _FixedM4SidecarAux:
         )
 
 
+class _FixedM4CandidateSidecarAux:
+    """MTPLX_FABLE_PLE_CANDIDATE_PREFETCH's aux (K-P1).  Default off.
+
+    A SEPARATE class rather than a branch inside ``_FixedM4SidecarAux``: the
+    retained aux's ``__call__`` is deliberately monomorphic (see
+    ``test_retained_materialized_aux_is_monomorphic_in_the_hot_path``), and an
+    A/B whose control arm's hot path has been edited is not a control.  The
+    lane's own call is monomorphic too -- the miss branch takes exactly the
+    shipped expression.
+    """
+
+    __slots__ = (
+        "_candidates",
+        "_gather",
+        "_install_owned_rows",
+        "_output_dim",
+        "_pending_warm",
+        "_prompt_tail",
+        "_rows",
+        "_submit_warm",
+    )
+
+    def __init__(
+        self,
+        *,
+        prompt_tail,
+        rows,
+        gather,
+        output_dim,
+        submit_warm,
+        install_owned_rows,
+        candidates,
+    ):
+        self._prompt_tail = prompt_tail
+        self._rows = rows
+        self._gather = gather
+        self._output_dim = int(output_dim)
+        self._submit_warm = submit_warm
+        self._install_owned_rows = install_owned_rows
+        self._pending_warm = ()
+        self._candidates = candidates
+
+    @property
+    def candidate_prefetch(self):
+        """The armed K-P1 buffer.  The draft loop's hook reaches it here."""
+
+        return self._candidates
+
+    def prefetch_primary(
+        self,
+        primary,
+        completion_tokens,
+        committed_count,
+    ) -> None:
+        previous = _fixed_m4_previous_tokens(
+            self._prompt_tail,
+            completion_tokens,
+            committed_count,
+        )
+        ids_np = np.asarray(((int(primary),),), dtype=np.int64)
+        prev_np = np.asarray((previous,), dtype=np.int64)
+        rows, _new_history = self._rows(ids_np, prev_np)
+        self._pending_warm = self._submit_warm(rows.reshape(-1))
+        # A cycle boundary: join and drop the previous cycle's buffer, then
+        # seed it with the one window position that is not a candidate.  The
+        # `_submit_warm` above still runs, so the hot-row LRU fallback keeps
+        # exactly the coverage it has today.
+        self._candidates.begin_cycle()
+        self._candidates.submit(
+            prefix_tokens=(),
+            candidate_ids=(int(primary),),
+            completion_tokens=completion_tokens,
+            committed_count=committed_count,
+        )
+
+    def __call__(
+        self,
+        _input_ids,
+        host_input_ids,
+        completion_tokens,
+        committed_count,
+    ) -> mx.array:
+        pending_warm = self._pending_warm
+        self._pending_warm = ()
+        self._install_owned_rows(pending_warm)
+        ids_np = np.asarray((host_input_ids,), dtype=np.int64)
+        previous = _fixed_m4_previous_tokens(
+            self._prompt_tail,
+            completion_tokens,
+            committed_count,
+        )
+        prev_np = np.asarray((previous,), dtype=np.int64)
+        rows, _new_history = self._rows(ids_np, prev_np)
+        flat = rows.reshape(-1)
+        prepared = self._candidates.resolve(flat)
+        if prepared is None:
+            return self._gather(flat).reshape(1, 4, self._output_dim)
+        # The same `prepared` contract the prefill lookahead uses: row matrices
+        # this lane already read out of the same three memmaps, so the only
+        # thing that changed is WHEN they were read.
+        return self._gather(flat, prepared=prepared).reshape(
+            1,
+            4,
+            self._output_dim,
+        )
+
+
 class _FixedM4ExperimentalSidecarAux:
     """Construction-bound raw/window gather retained for composition tests."""
 
@@ -547,6 +655,20 @@ def _build_fixed_m4_compiled_verify_aux(
             output_dim=int(inner.args.ple_embed_dim),
         )
     if not raw_q4_aux and not owned_all_miss_rows and not early_window_prefetch:
+        if ple_candidate_prefetch.enabled():
+            return _FixedM4CandidateSidecarAux(
+                prompt_tail=prompt_tail,
+                rows=rows,
+                gather=sidecar.gather_np,
+                output_dim=int(inner.args.ple_embed_dim),
+                submit_warm=submit_owned_rows,
+                install_owned_rows=install_owned_rows,
+                candidates=ple_candidate_prefetch.CandidateRowPrefetch(
+                    rows=rows,
+                    sidecar=sidecar,
+                    prompt_tail=prompt_tail,
+                ),
+            )
         return _FixedM4SidecarAux(
             prompt_tail=prompt_tail,
             rows=rows,
@@ -554,6 +676,16 @@ def _build_fixed_m4_compiled_verify_aux(
             output_dim=int(inner.args.ple_embed_dim),
             submit_warm=submit_owned_rows,
             install_owned_rows=install_owned_rows,
+        )
+    if ple_candidate_prefetch.enabled():
+        # The lane's consumer lives on the retained monomorphic route only.
+        # Arming it against a raw/window-prefetch aux would silently measure
+        # the control while wearing the candidate's label -- the exact failure
+        # the 2026-09-01 lookahead arm hit -- so refuse at construction.
+        raise RuntimeError(
+            f"{ple_candidate_prefetch.ENV_FLAG} requires the retained "
+            "materialized fixed-M4 aux (raw_q4_aux / owned_all_miss_rows / "
+            "early_window_prefetch must all be off)"
         )
     return _FixedM4ExperimentalSidecarAux(
         prompt_tail=prompt_tail,
