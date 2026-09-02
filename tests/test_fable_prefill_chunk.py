@@ -467,6 +467,10 @@ def test_generation_guards_the_streaming_prefill_geometry():
     }
     assert "_guard_prefill_chunk_geometry" in names
     assert "_prefill_chunk_transient_per_token" in names
+    # The dense transient must not be charged to a geometry the block-sparse
+    # consumer serves -- otherwise the guard refuses working 262K prefills.
+    assert "_prefill_dense_transient_per_token" in names
+    assert "_qsa_large_prefill_enabled" in text
 
 
 def test_qsa_dense_attention_is_the_only_dense_sdpa_call_site():

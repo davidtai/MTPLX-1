@@ -581,6 +581,32 @@ def _prefill_chunk_transient_per_token(model_path: str) -> int:
         return 0
 
 
+def _prefill_dense_transient_per_token(
+    rt: MTPLXRuntime, rows: int, total_tokens: int
+) -> int:
+    """Zero when the sparse QSA prefill lane will serve this geometry.
+
+    ``mtplx/server/openai.py`` already prices the memory plan this way: the
+    ``[S, T]`` score/mask chain only exists on the DENSE lane, so charging it
+    to a 262K prefill that the block-sparse consumer serves would refuse a
+    geometry that works today.  The lane's own predicate decides -- it is
+    request-phase-scoped, so ask it inside the prefill phase.
+    """
+
+    per_token = _prefill_chunk_transient_per_token(str(rt.model_path))
+    if per_token <= 0:
+        return 0
+    try:
+        from mtplx.models.qwen4_exp import _qsa_large_prefill_enabled
+
+        with attention_phase("prefill"):
+            if _qsa_large_prefill_enabled(int(rows), int(total_tokens)):
+                return 0
+    except Exception:
+        pass
+    return per_token
+
+
 def _guard_prefill_chunk_geometry(
     rt: MTPLXRuntime,
     spans: Sequence[tuple[int, int]],
@@ -610,8 +636,8 @@ def _guard_prefill_chunk_geometry(
     plan = guard_prefill_chunk_geometry(
         chunk_size=widest,
         total_tokens=total,
-        transient_bytes_per_token=_prefill_chunk_transient_per_token(
-            str(rt.model_path)
+        transient_bytes_per_token=_prefill_dense_transient_per_token(
+            rt, widest, total
         ),
     )
     if plan is not None:
