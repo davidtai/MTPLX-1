@@ -9,6 +9,9 @@ checked:
 * the flag-off source contract -- every new call site in ``generation.py`` is
   behind the module constant or ``_device_draft_chain_plan is not None``
   (AST inspection, the shape ``tests/test_fable_device_k20.py`` uses);
+* that the construction prewarm is charged to ``pre_first_token_setup_s`` and
+  not to the decode span (window 1788400641 measured 0.021 s steady state and
+  1.159 s on the first process ever to compile the body);
 * :func:`fast_midpoint_descriptors` bit-identical to the shipped
   ``build_pcg64_midpoint_descriptors``, word for word, on random and
   adversarial uniforms (this is the ``Fraction``-free hot path);
@@ -552,8 +555,20 @@ def test_body_mode_does_one_readback_per_depth(stub_mx, monkeypatch):
     assert ddc.COUNTERS["tape_draws"] == DEPTH
 
 
-def test_body_mode_token_matches_the_stock_host_sampler(stub_mx, monkeypatch):
-    """body mode is the bit-identical arm: same tail, same draw, same token."""
+def test_body_mode_tail_matches_the_stock_host_sampler(stub_mx, monkeypatch):
+    """GIVEN THE SAME SUPPORT ROW, body mode draws the stock token.
+
+    This pins the tail and only the tail: float32 probabilities widened to
+    float64, the float64 `cumulative_before` nucleus mask,
+    `_serial_row_distribution`'s renormalisation and `rng.choice`.
+
+    It does NOT make the lane bit-identical, and an earlier version of this
+    file's docstring wrongly said it did.  The support row itself comes out of
+    an `mx.compile`d MTP forward, whose fusion regroups the arithmetic --
+    `fable_compiled_draft` documents that "bit-for-bit digest parity is not a
+    goal of this flag" -- and out of a 65,536-lane `logsumexp` where stock uses
+    248,320.  Window 1788400641 measured differing digests on 3/3 seeds.
+    """
 
     rng_rows = np.random.default_rng(21)
     ids = np.sort(rng_rows.choice(VOCAB_ROWS, size=K20, replace=False)).astype(
@@ -889,6 +904,39 @@ def test_prewarm_happens_before_the_decode_loop():
     loop_at = source.index("\n    while len(tokens) < max_tokens:", prewarm_at)
     run_at = source.index("_fable_device_draft_chain_run(")
     assert prewarm_at < loop_at < run_at
+
+
+def test_prewarm_is_charged_to_setup_not_to_decode():
+    """The trace and the promotion must leave `decode_elapsed_s` alone.
+
+    `pre_first_token_setup_s` closes at generation.py's
+    "Close the pre-first-token setup span here" before this route's claim
+    inputs exist, and `decode_loop_entered_s` starts on the next line -- so a
+    prewarm placed at the claim lands inside the decode span.  Window
+    1788400641 measured exactly that: `first_primary_sample_time_s`
+    (`perf_counter() - decode_loop_entered_s`) 0.003 -> 0.024 s steady state,
+    and 1.159 s on arm 1, the first process ever to compile the body's Metal
+    kernels -- 1.132 s / 387 windows = 2.93 ms/M4win against a measured
+    arm1-vs-arm2 gap of 2.90 ms/M4win.
+    """
+
+    source = (REPO_ROOT / "mtplx" / "generation.py").read_text()
+    call_at = source.index("_fable_device_draft_chain_prewarm(")
+    tail = source[call_at : call_at + 2000]
+    assert "_ddc_prewarm_s = time.perf_counter() - _ddc_prewarm_started" in tail
+    assert "pre_first_token_setup_s += _ddc_prewarm_s" in tail
+    assert "decode_loop_entered_s += _ddc_prewarm_s" in tail
+    assert 'receipt_extra["prewarm_s"]' in tail
+    # `non_decode_extra_s` is what turns a setup span into a decode exclusion.
+    assert "+ float(pre_first_token_setup_s)" in source
+
+
+def test_driver_receipt_surfaces_the_engagement_block():
+    """`body_traces` has to reach a receipt or nobody can see a retrace."""
+
+    driver = (REPO_ROOT / "scripts" / "fable" / "abba_driver.py").read_text()
+    assert '"device_draft_chain": dict(' in driver
+    assert 'getattr(stats, "device_draft_chain", None) or {}' in driver
 
 
 def test_prewarm_restores_the_mtp_history_offset(stub_mx):

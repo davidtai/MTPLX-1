@@ -68,9 +68,16 @@ Over ``--parity-rows`` independent rows, against the shipped stock lane:
   ``rng``: the stock ``rng.choice`` on the float64 row versus the device
   kernel's exact-rational walk of the float32 CDF, over the SAME uniform.
   This is the number that says how often a real run's digest could move.
-* ``body_mode_token_rows_differing`` -- the same comparison for ``body`` mode,
-  which runs the stock host tail on the exact support and must therefore be
-  **zero**.  A nonzero count here is a bug, not a tradeoff.
+* ``body_mode_token_rows_differing`` -- the same comparison for ``body`` mode.
+  Zero here means the HOST TAIL is exact; it does NOT mean the lane is
+  bit-identical.  This script feeds both paths the same synthetic compact row,
+  so it cannot see the two rounding sources that actually move a real run's
+  digest: the `mx.compile` fusion inside the MTP DecoderLayer forward (which
+  `fable_compiled_draft` documents as expected) and, through
+  ``logsumexp_ulp``, the 65,536-vs-248,320 reduction width.  Window
+  1788400641 measured differing digests on 3/3 seeds in ``body`` mode.  Both
+  modes are ROUNDING CLASS and are judged on HumanEval / the long-prompt
+  agreement screen, never on digest equality.
 
 Decision rule
 -------------
@@ -81,10 +88,10 @@ Per cycle at depth 3 the lane's own arithmetic is
             + (descriptor_fraction - descriptor_fast)
 
 The census leaves 2.62 ms/cycle in those three gaps and the target is >= 1.5
-ms/cycle removed.  ``body_mode_token_rows_differing`` must be 0 before the
-``body`` ABBA arm is worth running; ``token_rows_differing`` is a rate to
-report, not a gate (W28b's ABBA digests matched 3/3 seeds with the same
-sampler).
+ms/cycle removed.  ``body_mode_token_rows_differing`` must be 0 (it checks the host tail on an
+identical row); ``token_rows_differing`` is a rate to report, not a gate.
+Neither number gates the lane: both modes are rounding class, so the gate is a
+task eval.
 """
 
 from __future__ import annotations
@@ -622,8 +629,10 @@ def main() -> int:
     print(f"\n  parity: {report['parity']}")
     if report["parity"]["body_mode_token_rows_differing"]:
         print(
-            "  !! body mode is NOT bit-identical -- that is a bug, not a "
-            "tradeoff; do not run the body ABBA arm"
+            "  !! the body-mode HOST TAIL disagrees with the stock sampler on "
+            "an identical support row -- that IS a bug (the lane's overall "
+            "rounding-class divergence lives upstream, in the compiled "
+            "forward, and this arm cannot see it)"
         )
     report["summary"] = {
         "select_delta_ms_per_cycle": select_delta,

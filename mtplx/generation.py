@@ -422,6 +422,12 @@ _FABLE_DEVICE_K20 = _fable_device_k20_enabled()
 # `MTPLX_FABLE_DEVICE_DRAFT_CHAIN=body` keeps the stock host sampler and its
 # per-depth readback: the attribution arm that prices the compiled body alone.
 #
+# NEITHER mode is bit-identical.  The compiled body is a ROUNDING-CLASS change
+# by `fable_compiled_draft`'s own contract ("bit-for-bit digest parity is not a
+# goal of this flag"), so both modes are judged the way HC_M4 and the prefill
+# levers are -- HumanEval / the long-prompt agreement screen -- not by digest.
+# Window 1788400641 measured differing digests on 3/3 seeds, as expected.
+#
 # This is the first thing that puts a compiled draft body on the SERVING lane:
 # `MTPLX_FABLE_COMPILED_DRAFT` builds one only inside
 # `_pr391_make_float32_d3_core`, and the PR391 route is installed only by
@@ -10673,17 +10679,37 @@ def generate_mtpk(
         )
         if _device_draft_chain_plan is not None:
             # Promote the MTP cache, build the compiled body and trace it ONCE,
-            # here, outside the measured loop -- the same reason
+            # here, outside the loop -- the same reason
             # `_pr391_prewarm_float32_d3_core` exists.  `mtp_history_cache` is
             # the container the committed-history lane drafts into; if a live
             # reset or a prefix rebase replaces it mid-request, `run_cycle`
             # rebinds (and says so on stderr).
+            _ddc_prewarm_started = time.perf_counter()
             _fable_device_draft_chain_prewarm(
                 _device_draft_chain_plan,
                 hidden,
                 mtp_cache=mtp_history_cache,
                 rollback=_rollback_mtp_cache,
                 cache_offset=_mtp_cache_offset,
+            )
+            _ddc_prewarm_s = time.perf_counter() - _ddc_prewarm_started
+            # CHARGE IT TO SETUP, NOT TO DECODE.  `pre_first_token_setup_s`
+            # closed above, before this claim's inputs existed, so a prewarm
+            # placed here lands inside `decode_elapsed_s` -- which is what
+            # window 1788400641 measured: `first_primary_sample_time_s`
+            # (`perf_counter() - decode_loop_entered_s`) went 0.003 -> 0.024 s
+            # steady state, and 1.159 s on arm 1, the FIRST process ever to
+            # compile this body's Metal kernels.  1.132 s / 387 windows =
+            # 2.93 ms/M4win, and arm 1 measured exactly +2.90 ms/M4win against
+            # its own twin arm 2.  The cache promotion, the `mx.compile` trace
+            # and the shader compilation are construction, so they belong in
+            # the bucket the comment at the top of this span describes --
+            # `non_decode_extra_s` subtracts it from `decode_elapsed_s` and
+            # `ttft_s` adds it, which is where a reader should find it.
+            pre_first_token_setup_s += _ddc_prewarm_s
+            decode_loop_entered_s += _ddc_prewarm_s
+            _device_draft_chain_plan.receipt_extra["prewarm_s"] = float(
+                _ddc_prewarm_s
             )
             _device_draft_chain_receipt = _device_draft_chain_plan.to_dict()
     while len(tokens) < max_tokens:

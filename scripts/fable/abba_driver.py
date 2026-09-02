@@ -513,6 +513,15 @@ def stats_receipt(
         ).hexdigest(),
         "compiled_verify": dict((stats.graphbank or {}).get("compiled_verify") or {}),
         "draft_core": dict(stats.draft_core or {}),
+        # MTPLX_FABLE_DEVICE_DRAFT_CHAIN engagement.  `{"installed": False}` on
+        # a control arm; on an armed arm it carries `mode`, `readbacks_per_cycle`,
+        # `body_traces` (must be 1 -- a climbing count means the mx.compile
+        # trace signature moves and the flag is paying for a retrace every
+        # cycle), `chain_builds`/`cache_rebinds`, `short_cycles` and the
+        # construction `prewarm_s` that `pre_first_token_setup_s` now carries.
+        "device_draft_chain": dict(
+            getattr(stats, "device_draft_chain", None) or {}
+        ),
         "online_correction_cache": dict(stats.online_correction_cache or {}),
         "context_copy": {
             "active": bool(stats.context_copy_active),
