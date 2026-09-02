@@ -38,12 +38,29 @@ is exactly the bug this kernel must not have.
 
 Arms, all over one visible set:
   native_bk{BK}_dc{DC}_s{N}   the split-K kernel, per tile and split target
-  stock                       ``qsa_sparse_decode.stock_reference`` -- the
-                              shipped rows-gather lane (gathered K/V, score
-                              GEMM, fp32 softmax, bf16 P@V), transcribed
-  gather_kernel               the same, but with the SHIPPED fused K/V gather
-                              (MTPLX_QSA_M4_FUSED_KV_GATHER) in front of it,
-                              which is what actually runs in production
+  production_gather_kernel    THE BASELINE.  The shipped fused K/V gather
+                              (MTPLX_QSA_M4_FUSED_KV_GATHER, one dispatch)
+                              plus the score GEMM / mask / fp32 softmax /
+                              bf16 cast / P@V that follow it.  This is what
+                              the ABBA replaces and the only arm a speedup
+                              may be quoted against.
+  portable_take_reference     ``qsa_sparse_decode.stock_reference``: the SAME
+                              math and the same bytes, but gathering through
+                              two generic ``mx.take`` calls instead of the
+                              fused kernel.  It is the numerics reference for
+                              parity and NOT a baseline -- measured 2.35x
+                              slower than production (0.542 vs 0.230 ms/layer,
+                              2026-09-02), which is the generic gather's
+                              overhead, not the production path's.
+
+MEASURED 2026-09-02 (first guarded run, M=4, 16K, queued lane):
+
+    portable_take_reference   0.542 ms/layer   6.50 ms/cycle   131 GB/s
+    production_gather_kernel  0.230 ms/layer   2.76 ms/cycle   309 GB/s
+
+    of which micro_qsa_m4.py (2026-09-01) attributes 1.501 ms/cycle to the
+    fused gather + the transposed-K copy alone -- 54% of the production
+    attention chain, and the part this kernel deletes outright.
 
 VISIBLE-SET IDENTITY (asserted, not assumed)
 --------------------------------------------
@@ -72,11 +89,18 @@ CPU/disk load does not land in the middle of someone's arm)::
 
     W=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w68-qsa-sparse-decode
     PY=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python
+    # nanobind MUST match the one mlx.core was built with (internals v21 for
+    # mlx 0.32.2); the venv ships 2.12.0 = v19, which builds and imports fine
+    # and then makes every call raise TypeError.  CMake now refuses that, and
+    # scripts/fable/check_native_qsa_abi.py diagnoses it without building.
+    NB=/Users/davidtai/.local/share/uv/tools/mtplx/lib/python3.13/site-packages/nanobind
+    $PY $W/scripts/fable/check_native_qsa_abi.py --python $PY --nanobind $NB
+    rm -rf $W/native_extensions/qsa_sparse_gqa/build   # stale v19 cache
     cd $W/native_extensions/qsa_sparse_gqa && \
       cmake -S . -B build \
         -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$PWD/mtplx_native_qsa/ \
         -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-        -DPython_EXECUTABLE=$PY && \
+        -DPython_EXECUTABLE=$PY -DMTPLX_NANOBIND_DIR=$NB && \
       cmake --build build -j4
 
 This bench (one guarded window)::
@@ -471,9 +495,10 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
         out["stock_bytes"]["total"], stock_time["queued_ms"]
     )
     stock_time["ms_per_cycle_12_layers"] = stock_time["queued_ms"] * QSA_LAYERS
-    out["arms"]["stock"] = {"time": stock_time}
+    out["arms"]["portable_take_reference"] = {"time": stock_time}
     print(
-        f"  [time] stock: queued={stock_time['queued_ms']:.4f} ms/layer  "
+        f"  [time] portable_take_reference (NOT the baseline): "
+        f"queued={stock_time['queued_ms']:.4f} ms/layer  "
         f"({stock_time['ms_per_cycle_12_layers']:.3f} ms/cycle over "
         f"{QSA_LAYERS} layers, {stock_time['gbps_per_layer']:.0f} GB/s of "
         f"{MACHINE_GBPS:.0f})"
@@ -481,27 +506,33 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
 
     gather_call, gather_reason = gather_kernel_arm(cell)
     if gather_call is None:
-        out["arms"]["gather_kernel"] = {"skipped": gather_reason}
-        print(f"  [skip] gather_kernel: {gather_reason}")
+        out["arms"]["production_gather_kernel"] = {"skipped": gather_reason}
+        print(
+            f"  [SKIP] production_gather_kernel: {gather_reason} -- without it "
+            "there is NO valid baseline and no speedup may be quoted"
+        )
     else:
         gtime = time_arm(gather_call, args.reps, args.warmup, args.queue_depth)
         gtime["gbps_per_layer"] = gbps(
             out["stock_bytes"]["total"], gtime["queued_ms"]
         )
         gtime["ms_per_cycle_12_layers"] = gtime["queued_ms"] * QSA_LAYERS
-        out["arms"]["gather_kernel"] = {
+        out["arms"]["production_gather_kernel"] = {
             "time": gtime,
-            "parity_vs_stock": compare(reference, gather_call()),
+            "parity_vs_portable_reference": compare(reference, gather_call()),
         }
         print(
-            f"  [time] gather_kernel: queued={gtime['queued_ms']:.4f} ms/layer  "
+            f"  [time] production_gather_kernel (BASELINE): "
+            f"queued={gtime['queued_ms']:.4f} ms/layer  "
             f"({gtime['ms_per_cycle_12_layers']:.3f} ms/cycle, "
             f"{gtime['gbps_per_layer']:.0f} GB/s)"
         )
 
-    baseline_ms = out["arms"].get("gather_kernel", {}).get(
-        "time", stock_time
-    )["queued_ms"]
+    baseline = out["arms"].get("production_gather_kernel", {}).get("time")
+    out["baseline_arm"] = (
+        "production_gather_kernel" if baseline else "portable_take_reference"
+    )
+    baseline_ms = (baseline or stock_time)["queued_ms"]
 
     for key_tile, dim_tile in args.tiles:
         for key_splits in args.splits:
@@ -530,6 +561,7 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
                     "threadgroups": rows * KV_HEADS * n_splits,
                     "merge_threadgroups": Q_HEADS * rows,
                 },
+                "baseline_arm": out["baseline_arm"],
                 "speedup_vs_baseline": (
                     baseline_ms / timing["queued_ms"]
                     if timing["queued_ms"] > 0

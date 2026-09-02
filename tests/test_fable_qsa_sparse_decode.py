@@ -485,3 +485,111 @@ def test_parity_thresholds_are_stated_not_implicit():
     assert lane.PARITY_MAX_ABS_ULPS == 8.0
     assert lane.PARITY_MAX_REL_L2 == 2.0e-3
     assert lane.PARITY_MIN_TOP1 == 0.98
+
+
+# ---------------------------------------------------------------------------
+# 6. the nanobind ABI guard
+#
+# W68's first guarded run built the extension cleanly and then failed at the
+# first call with "incompatible function arguments ... queries:
+# mlx::core::array" while invoking with mlx.core.array.  The cause was not the
+# stream kwarg: the extension was built against nanobind internals v19 while
+# mlx.core uses v21, so the two got separate __nb_internals_<tag>_mlx__
+# capsules and no array could ever be cast.  These pin the detector.
+# ---------------------------------------------------------------------------
+import importlib.util  # noqa: E402
+
+
+def _load_abi_checker():
+    path = ROOT / "scripts" / "fable" / "check_native_qsa_abi.py"
+    spec = importlib.util.spec_from_file_location("check_native_qsa_abi", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+abi = _load_abi_checker()
+
+
+def test_internals_version_is_read_from_nb_abi_h(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "nb_abi.h").write_text(
+        "#ifndef NB_INTERNALS_VERSION\n#  define NB_INTERNALS_VERSION 21\n#endif\n"
+    )
+    assert abi.internals_version_of_nanobind(tmp_path) == 21
+
+
+def test_internals_version_falls_back_to_nb_internals_h(tmp_path):
+    """Older nanobind releases keep the macro in the other header."""
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "nb_internals.h").write_text(
+        "#define NB_INTERNALS_VERSION 17\n"
+    )
+    assert abi.internals_version_of_nanobind(tmp_path) == 17
+
+
+def test_missing_nanobind_tree_reports_none(tmp_path):
+    assert abi.internals_version_of_nanobind(tmp_path) is None
+
+
+def test_abi_tag_is_extracted_from_binary_bytes(tmp_path):
+    blob = tmp_path / "fake.so"
+    blob.write_bytes(b"\x00junk\x00v21_system_libcpp_abi1\x00more\x00")
+    assert abi.abi_tags_in_binary(blob) == {"v21_system_libcpp_abi1"}
+    assert abi.abi_version_of_binary(blob) == 21
+
+
+def test_two_different_tags_refuse_to_guess(tmp_path):
+    blob = tmp_path / "fake.so"
+    blob.write_bytes(b"v19_system_libcpp_abi1\x00v21_system_libcpp_abi1\x00")
+    assert abi.abi_version_of_binary(blob) is None
+
+
+def test_a_binary_with_no_tag_reports_none(tmp_path):
+    blob = tmp_path / "fake.so"
+    blob.write_bytes(b"nothing to see here")
+    assert abi.abi_tags_in_binary(blob) == set()
+    assert abi.abi_version_of_binary(blob) is None
+
+
+def test_the_native_wrapper_uses_the_same_tag_regex():
+    """One definition of "what a nanobind ABI tag looks like", two readers."""
+
+    from mtplx import native
+
+    blob = b"\x00v21_system_libcpp_abi1\x00"
+    assert [m.group(1) for m in native._NB_ABI_TAG_RE.finditer(blob)] == [b"21"]
+
+
+def test_the_native_wrapper_reads_a_versions_from_a_binary(tmp_path):
+    from mtplx import native
+
+    blob = tmp_path / "fake.so"
+    blob.write_bytes(b"v19_system_libcpp_abi1\x00")
+    assert native._nanobind_internals_version(blob) == 19
+    blob.write_bytes(b"nothing")
+    assert native._nanobind_internals_version(blob) is None
+
+
+def test_the_cmake_guard_is_a_fatal_error_not_a_warning():
+    cmake = (
+        ROOT / "native_extensions" / "qsa_sparse_gqa" / "CMakeLists.txt"
+    ).read_text()
+    assert "MTPLX_NANOBIND_DIR" in cmake
+    assert "NB_INTERNALS_VERSION" in cmake
+    guard = cmake.split("if(MTPLX_NB_INTERNALS AND MTPLX_MLX_NB_INTERNALS)")[1]
+    assert "FATAL_ERROR" in guard
+    assert "check_native_qsa_abi.py" in guard
+    # The one wrong fix must stay called out where someone would reach for it.
+    assert "NEVER \"fix\" a mismatch by defining NB_INTERNALS_VERSION" in cmake
+
+
+def test_the_wrappers_omit_a_none_stream():
+    """Passing an explicit None was not the bug, but it is one fewer variable."""
+
+    source = (ROOT / "mtplx" / "native" / "__init__.py").read_text()
+    assert source.count("if stream is None:") == 2
+    assert "stream=stream)" in source
+    assert "stream=stream,\n    )" not in source
