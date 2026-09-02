@@ -5,7 +5,7 @@ Runtime only, no code path changed, no GPU touched: this is an inventory the nex
 funded from.
 
 Tool: `scripts/fable/census_verify_nodes.py`. Tests: `tests/test_fable_verify_node_census.py`
-(36, pure python on a synthetic census).
+(37, pure python on a synthetic census).
 
 ```
 python scripts/fable/census_verify_nodes.py \
@@ -28,7 +28,8 @@ host cost.
 `mx.compile`'d graph: `install_fixed_m4_split`'s prefix/suffix partition exists in `graphbank.py`
 but is **not on the retained decode route**, so there is no separate layer-0 prefix to subtract.
 The "~5,090-node suffix" the W63 doc carries is an estimate inherited from the pre-OPDIET
-2410 census's *whole-cycle* dispatch count; it is superseded here by a measurement.
+2410 census's *whole-cycle* dispatch count; it is superseded here by **2,751 measured dispatch
+nodes plus ~1,684 source-counted view nodes ≈ 4,400 tape nodes per cycle** (§5).
 
 ## 1. How the body is located — measured, with a falsifier
 
@@ -185,7 +186,7 @@ removed dispatches that sit on a read-after-write chain and therefore also retur
 | 1 | `qsa_rope` | 288 | 240 | 204 | 0.091 | 0.373 | **0.464** | 0.81 | **FUND** |
 | 2 | `hc_triple` | 291 | 194 | 194 | 0.074 | 0.355 | **0.429** | 0.75 | **FUND** |
 | 3 | `gdn_gate_glue` | 180 | 180 | 180 | 0.068 | 0.329 | **0.398** | 0.70 | **FUND** |
-| 4 | `qsa_mask` | 204 | 198 | 158 | 0.075 | 0.289 | **0.364** | 0.64 | **FUND** |
+| 4 | `qsa_row_list` | 204 | 198 | 158 | 0.075 | 0.289 | **0.364** | 0.64 | **FUND** |
 | 5 | `qsa_indexer_select` | 156 | 144 | 130 | 0.055 | 0.238 | 0.292 | 0.51 | marginal |
 | 6 | `qsa_head_layout` | 156 | 132 | 132 | 0.050 | 0.242 | 0.292 | 0.51 | marginal |
 | 7 | `qsa_cache_offset` | 180 | 108 | 108 | 0.041 | 0.198 | 0.239 | 0.42 | marginal |
@@ -227,12 +228,18 @@ next to `gated_delta_step`, 108 next to `gdn_conv_norm_rows`.
 the intermediate is read by nothing else. The only group here where that is true.
 *Coordinate with W66* (GDN keep-mask fold) — adjacent kernels, different dispatches.
 
-**4. `qsa_mask` — 198 nodes, 0.36 ms.** Seventeen dispatches per QSA layer rebuild the same
-window mask: `arange`, broadcast compares, bool copies, a select. For a fixed four-row M4 window
-**the mask is layer-invariant**.
-*Mechanism:* build it once in the prologue and let all 12 layers read it (or fold the comparison
-into the fused KV gather's index math).
-*Exactness:* **exact** — the same bool tensor, hoisted. Structurally the safest group in the table.
+**4. `qsa_row_list` — 198 nodes, 0.36 ms.** Seventeen dispatches per QSA layer build the
+per-row token list the fused KV gather consumes: `arange`, the `tok_blocks` index arithmetic,
+`blocks_ok`/`tail_ok`, two `concatenate`s (four bool/int32 copies) and one `where`
+(`qwen4_exp.py:2912-2925`, the fixed-capacity rows-gather branch).
+*Mechanism:* fold the build into `qsa_m4_fused_kv_gather`'s index math — it already consumes
+`(token_idx, token_ok)`, so hand it `top_idx` and `qpos` instead. Separately, the layer-invariant
+half (`arange(ratio)`, `tail_tok`, `tail_ok`) hoists to the prologue: twelve rebuilds become one.
+*Exactness:* **exact** — identical int32 indices and bool validity. Structurally the safest group
+in the table.
+*Correction to an obvious-looking claim:* this is **not** a causal-mask hoist. `tok_blocks` and
+`blocks_ok` depend on **this layer's own `top_idx`** and are not layer-invariant; only the
+tail/causal half is. A worker that assumes otherwise will build the wrong thing.
 
 ### 4.2 The marginal four, and why they are not first
 
@@ -274,7 +281,58 @@ count predicted.
 
 ### 5.1 Per-block view-only node counts
 
-*(pending — filled from the source read; see the note at the end of this section)*
+Counted from the decode path the composed flags actually take:
+`graphbank._make_fixed_m4_suffix_step` → `qwen4_fixed_verify._forward_fixed_m4_suffix` →
+`qwen4_m4_stage3._m4_paired_routed_glu_residual_tail_layer_forward` →
+`qwen4_exp.GatedDeltaNet` / `Attention` / `SparseMoeBlock`.
+
+| block | view-only nodes each | × | subtotal | confidence | dominant sites |
+| --- | ---: | ---: | ---: | --- | --- |
+| QSA (own math) | ~38 | 12 | **456** | med | rope `_rope_cos_sin` / `_apply_partial_rope` = **14 of the 38** (`qwen4_exp.py:292,336,341-356`, called at `:3971-3990`); `_select_m4`'s `pooled_f32_view` transpose+expand+slice (`graphbank.py:965`); `_qsa_rows_gather_attention`'s 3 reshapes + 2 squeezes + 2 expand_dims (`qwen4_exp.py:3706-3725`) |
+| MoE (own math) | ~9 | 48 | **432** | med | `rows = x.reshape(ROWS, HIDDEN)`, in-source comment "one metadata-only view" (`qwen4_m4_stage3.py:484`); the `route is None` branch's slice + 3 reshapes (`:488-498`); `mx.split(shared_gu, 2, -1)` (`:534`) |
+| GDN (own math) | ~10 | 36 | **360** | med-high | `mx.split` in `_FusedGDNInProj` (`qwen4_exp.py:1176`); 6 reshapes bracketing `fused_gdn_conv_norm_rows` (`:647-654`); `out.reshape(B,S,-1)` before `out_proj` (`:732`) |
+| hyper-connection read | 3 (2 at the head) | 97 | **290** | high | `x2 = hyper_input.reshape(-1, hc*hidden)`, `mixed.reshape(...)`, `inject.reshape(...)` (`qwen4_exp.py:901,910,913`). **Zero** inside `fused_hc_read_m4` itself |
+| attention-side residual write | 3 | 48 | **144** | high | two `ExpandDims` + one reshape in `_hyper_residual_write` (`qwen4_exp.py:511-513`). The **MoE-side** residual write is fused into `routed_down_residual_tail`'s kernel and contributes **0** |
+| prologue | ~2 | 1 | 2 | low | `mx.tile` → expand_dims + broadcast_to, then a forced merge copy already in the census |
+| | | | **~1,684** | | |
+
+**So the compiled body is ~2,751 dispatch nodes + ~1,684 view nodes ≈ 4,400 tape nodes per
+cycle.** (The W63 doc's "~5,090" was a whole-cycle *dispatch* count from the pre-OPDIET census
+reused as a node count; it landed in the right region for the wrong reason.)
+
+Three findings from the source read that change what the ranking means:
+
+* **`_hyper_residual_write` costs 3 view nodes at all 48 attention blocks but 0 at the 48 MoE
+  blocks**, because `routed_down_residual_tail` already absorbed the MoE side. That is the exact
+  shape `attn_residual_add` (§4, row 10) proposes and evidence that it works.
+* **The cache-commit machinery is graph-free.** `TensorOffsetKVCache.update_and_fetch` /
+  `TensorOffsetQSACache.write_raw` / `write_pooled` are exactly the six dynamic-slice pairs the
+  census already shows; the rollback and `state_leaves` plumbing around them
+  (`graphbank.py:941-953`) is Python list and attribute bookkeeping over existing tracer arrays
+  and adds **zero** graph nodes. `qsa_cache_offset`'s ceiling is therefore its census count and
+  no more.
+* **Three "views" are forced copies and are already counted in §2** — do not add them again:
+  `k_sel.swapaxes(-1,-2)` (the fused-KV-gather module's own docstring says "that is the copy the
+  census sees", `kernels/qwen4_qsa_m4_fused_kv_gather.py:33-42`); `out.transpose(0,2,1,3)
+  .reshape(B,S,-1)` before `o_proj` (`qwen4_exp.py:4155` — the axis merge needs
+  `stride_H == D·stride_D`, true only at `S==1`, and the verify width is 4); and
+  `gate.reshape(B,S,-1)` (`:3945`, a last-axis half-slice of a wider fused tensor). All three sit
+  in `qsa_head_layout`.
+
+**How to use the view counts.** Calibration B's 0.30-0.33 µs *per dispatch* was fitted on a change
+(HC_M4 + OPDIET) that removed dispatches **and** the view glue around them, so a typical view/
+dispatch ratio is already inside the price. A group with a **higher** ratio than that baseline
+converts better than its row says; a lower one, worse. `qsa_rope` is the standout: 20 removed
+dispatches per QSA layer come with ~14 removed view nodes, so it should over-deliver — which is
+also the direction the route kernel over-delivered in Calibration A.
+
+**Two source-side uncertainties, stated rather than hidden.** (1) Whether MLX's `Reshape` does
+generalised per-axis-split view detection or requires full C-contiguity: the QSA count assumes
+the former, and under the latter several of the ~38 become forced copies that are already in the
+census, so the total moves *down*, never up. (2) Multi-`None` index expressions
+(`token_ok[None,None,None]`) are counted as one node each; if MLX lowers each axis separately the
+QSA and residual-write rows rise by up to 2-3×. Neither moves the §4 ranking, because §4 is
+priced on dispatches.
 
 ## 6. Uncertainty
 
@@ -296,7 +354,10 @@ count predicted.
    394 cycles within the file, so the *inventory* is exact for that configuration; a different
    context length changes the QSA indexer's grids (`c17408` is in the kernel name) but not the
    node counts, which are shape-independent.
-6. **The composed census predates the route kernel.** Today's body is 2,751 − 288 = **~2,463
+6. **`MTPLX_FABLE_QSA_M4` is armed** in the measured stack — the source read could only infer
+   it from the six cache-offset pairs, but the census settles it: the body contains
+   `custom_kernel_mtplx_qwen4_qsa_m4_fused_kv_gather_c17408`, twelve of them, one per QSA layer.
+7. **The composed census predates the route kernel.** Today's body is 2,751 − 288 = **~2,463
    dispatches**; every group above except `moe_router_glue` is unaffected, and the totals in §2
    should be read as "the body as captured", not "the body today".
 
@@ -311,9 +372,11 @@ python scripts/fable/census_verify_nodes.py \
 python scripts/fable/census_verify_nodes.py \
   .benchmark-artifacts/pr391/w58-retained-control-census-1788370322.jsonl
 
-# calibration B (W63's tool, body length + 1)
-python scripts/fable/census_verify_opener.py <census.jsonl> 2752   # composed
-python scripts/fable/census_verify_opener.py <census.jsonl> 3670   # control
+# calibration B — W63's tool, which lives on worker/w63-graph-build-overlap:
+#   git show worker/w63-graph-build-overlap:scripts/fable/census_verify_opener.py > /tmp/o.py
+# then, with this worktree's census_retained_stack.py beside it, body length + 1:
+python /tmp/o.py <composed census.jsonl> 2752
+python /tmp/o.py <control census.jsonl>  3670
 
 # tests
 python -m pytest tests/test_fable_verify_node_census.py -q

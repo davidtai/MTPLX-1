@@ -507,8 +507,8 @@ GROUPS: tuple[Group, ...] = (
         ),
     ),
     Group(
-        key="qsa_mask",
-        title="QSA per-layer mask rebuild (arange, compare, bool copies, select)",
+        key="qsa_row_list",
+        title="QSA gather row-list build: index arithmetic, two concatenates, one select",
         blocks=("QSA",),
         patterns=_p(
             ("arangeint32", (4, 1, 1)),
@@ -526,11 +526,20 @@ GROUPS: tuple[Group, ...] = (
         chain_fraction=0.8,
         replacement_fraction=1 / 34,  # the window mask, built once instead of per layer
         mechanism=(
-            "the mask is layer-INVARIANT for a fixed 4-row window: build it "
-            "once in the prologue and let all 12 QSA layers read it, or fold "
-            "the comparison into qsa_m4_fused_kv_gather's index math"
+            "fold the row-list build into qsa_m4_fused_kv_gather's index math: "
+            "it already consumes (token_idx, token_ok), so hand it top_idx and "
+            "qpos instead and let it compute tok_blocks / tail_tok / the two "
+            "concatenates / the where itself.  The layer-INVARIANT part "
+            "(arange(ratio), tail_tok, tail_ok, qwen4_exp.py:2917-2921) hoists "
+            "to the prologue on its own: 12 rebuilds become 1."
         ),
-        exactness="exact (same bool tensor, hoisted)",
+        exactness="exact (identical int32 indices and bool validity)",
+        note=(
+            "NOT a causal-mask hoist.  qwen4_exp.py:2912-2925 is the fixed-"
+            "capacity rows-gather branch; tok_blocks and blocks_ok depend on "
+            "this layer's own top_idx and are NOT layer-invariant.  Only the "
+            "tail/causal half is."
+        ),
     ),
     Group(
         key="qsa_indexer_select",
