@@ -139,6 +139,61 @@ def test_every_generation_call_site_is_gated_on_the_plan():
     assert "or _device_k20_chain is not None" in body
 
 
+def test_the_device_chain_feeds_the_depth4_probe():
+    """MTPLX_FABLE_DEPTH4_PROBE must still fire when the device chain drafts.
+
+    The chain skips the per-depth loop that normally captures the probe's
+    inputs, so it captures them itself -- from the MATERIALISED result, after
+    its single sync, so the token the hook wraps in `mx.array([[...]])` is a
+    host int exactly as on the stock lane.
+    """
+
+    source = _generation_source()
+    tree = ast.parse(source)
+    generate = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "generate_mtpk"
+    )
+    body = ast.get_source_segment(source, generate)
+
+    reset = body.index("_d4_probe_state: tuple[Any, int, Any, bool] | None = None")
+    chain = body.index("_device_k20_chain = _FableDeviceDraftChain(")
+    materialize = body.index("_dk_result = _device_k20_chain.materialize()")
+    capture = body.index("_d4_probe_state = (", materialize)
+    stock_loop = body.index("for depth_index in range(\n            0\n")
+    # Reset, then the chain, then its capture -- all before the stock loop, so
+    # the stock lane's own capture still wins when it is the one that ran.
+    assert reset < chain < materialize < capture < stock_loop
+    block = body[capture : capture + 400]
+    assert "int(_dk_result.tokens[-1])" in block   # materialised, not lazy
+    assert "step_mtp_cache" in block               # the hook checks `is mtp_cache`
+    assert "draft_hidden" in block
+    assert "_frspec_legacy_ids" in block
+
+
+def test_the_device_layouts_are_stock_layouts_for_every_consumer():
+    """`gate_q` / `probe_*` and both offline scorers must accept a device log.
+
+    ``MTPLX_FABLE_DEVICE_K20`` changes where a K20 row was selected and how the
+    drafted token was sampled -- not what a row MEANS.  A device log is a stock
+    log, and the two offline scorers keep their own copy of the layout names
+    (they import no ``mtplx``), so the two lists are pinned to each other here.
+    """
+
+    from scripts.fable.offline_block_verification import (
+        STOCK_BV_LAYOUTS as SCORER_BV,
+        STOCK_LAYOUTS as SCORER_STOCK,
+    )
+
+    assert log_mod.LAYOUT_STOCK_DEVICE_K20 in log_mod.STOCK_LAYOUTS
+    assert log_mod.LAYOUT_STOCK_DEVICE_K20_BV in log_mod.STOCK_LAYOUTS
+    assert log_mod.LAYOUT_STOCK_DEVICE_K20 not in log_mod.STOCK_BV_LAYOUTS
+    assert log_mod.LAYOUT_STOCK_DEVICE_K20_BV in log_mod.STOCK_BV_LAYOUTS
+    assert set(SCORER_STOCK) == set(log_mod.STOCK_LAYOUTS)
+    assert set(SCORER_BV) == set(log_mod.STOCK_BV_LAYOUTS)
+
+
 def test_batched_builder_delegates_to_stock_when_no_plan():
     source = _generation_source()
     start = source.index("def _batched_distributions_from_mlx_logits(")
@@ -722,6 +777,70 @@ def test_device_k20_layout_round_trips_with_the_draft_uniforms(tmp_path):
     assert data["target_ids"].shape == (1, DEPTH + 1, K20)
     # The device layout is NOT the block-verify layout: no ladder columns.
     assert "block_valid" not in data
+    # ...but it IS a stock layout, so the depth-4 gate feature rides it, and
+    # it is `q(x_d)` under the law the DEVICE sampled from (the rows handed to
+    # `stock_open` are the device chain's own `draft_distribution` output).
+    np.testing.assert_allclose(data["gate_q"][0], [0.7, 0.6, 0.9])
+    # No probe ran, so the optional probe block is absent.
+    assert "probe_valid" not in data
+
+
+def test_the_depth4_probe_columns_ride_a_device_k20_log(tmp_path):
+    """A probed device-lane window must carry the same probe block as stock."""
+
+    log_mod._configure_for_test(str(tmp_path / "rows.npz"))
+    try:
+        logger = log_mod.k20_log
+        logger.set_sampler(
+            sampler=_SimpleSampler(0.6, 0.95, K20),
+            draft_sampler=_SimpleSampler(0.6, 0.95, K20),
+        )
+        logger.stock_open(
+            primary=7,
+            draft_tokens=[11, 22, 33],
+            draft_probs=[
+                _Sparse([11, 12], [0.7, 0.3]),
+                _Sparse([22, 23], [0.6, 0.4]),
+                _Sparse([33, 34], [0.9, 0.1]),
+            ],
+            target_batch=_Batched(
+                [
+                    _Sparse([11, 12], [0.7, 0.3]),
+                    _Sparse([22, 23], [0.5, 0.5]),
+                    _Sparse([33, 34], [0.8, 0.2]),
+                    _Sparse([44, 45], [0.6, 0.4]),
+                ]
+            ),
+            bonus_allowed=True,
+            greedy=False,
+            rng=np.random.default_rng(1),
+            device_k20=True,
+            draft_uniforms=[0.1, 0.2, 0.3],
+        )
+        for depth in range(DEPTH):
+            logger.stock_depth(
+                depth,
+                accept_prob=1.0,
+                coin=0.0,
+                accepted=True,
+                correction=[11, 22, 33][depth],
+            )
+        # The all-accept branch's hook, on the device lane.
+        logger.stock_depth4(ids=[44, 45], probs=[0.55, 0.45], trimmed=False)
+        logger.stock_bonus(44)
+        logger.stock_close()
+        out = logger.flush()
+        with np.load(out) as handle:
+            data = {key: handle[key] for key in handle.files}
+    finally:
+        log_mod._configure_for_test(None)
+
+    assert str(data["layout"]) == log_mod.LAYOUT_STOCK_DEVICE_K20
+    assert int(data["probe_valid"][0]) == 1
+    assert list(data["probe_ids"][0][:2]) == [44, 45]
+    np.testing.assert_allclose(data["probe_probs"][0][:2], [0.55, 0.45])
+    assert int(data["probe_trimmed"][0]) == 0
+    np.testing.assert_allclose(data["gate_q"][0], [0.7, 0.6, 0.9])
 
 
 def test_device_k20_and_block_verify_compose_into_one_layout(tmp_path):

@@ -929,6 +929,21 @@ accept loop would score it against.  All five must be 0.
 `--self-test` runs the NumPy oracle against a brute-force sort with no MLX and
 no lock.
 
+### With `MTPLX_FABLE_DEPTH4_PROBE`
+
+The two compose. The device chain skips the per-depth loop that normally
+captures the probe's inputs, so it captures them itself, from the materialised
+result after its single sync — the probe still fires on all-accept windows and
+still reads depth 3's own hidden, token and MTP cache. The probe's own `q_4`
+row keeps going through the stock host shaping (`_distribution_from_mlx_logits`)
+on purpose: it is measuring the MODEL, not the selector, so its rows stay
+directly comparable between an armed and an unarmed device run.
+
+The log layouts `stock_device_k20` / `stock_device_k20_bv` are stock layouts
+for every consumer — they carry `gate_q` and the optional `probe_*` block, and
+both offline scorers accept them. `gate_q` is then `q(x_d)` under the law the
+device sampled from, which is the right gate feature for L §D.
+
 ### Tests
 
 ```
@@ -943,3 +958,73 @@ remapping), the oracle and the host tail against a NumPy transcription of
 `_device_serial_support_arrays`, `prepare_draft_row_f32` bit-identical to the
 choice kernel's own CPU oracle, the draw accounting against a flag-off
 `rng.choice` chain, and the `stock_device_k20` logger round trip.
+
+---
+
+## Confidence-gated depth 4: the probe (`MTPLX_FABLE_DEPTH4_PROBE`)
+
+L §D. H killed adaptive depth from *history* (acceptance is memoryless across
+windows). Within a window it is not: the drafter's own probability of the token
+it drafted predicts the target's acceptance strongly — `q(x_d) >= 0.95` gives
+`a` of 0.96/0.91/0.89, `q(x_d) < 0.2` gives 0.54/0.46/0.43. Gating a 4th draft
+step on `q(x_3) > 0.8` fires on 30% of windows, 52% of which accepted all three
+drafts, and is worth **+0.147 tok/window for +0.89 ms (+3.5%)** — *if* `alpha_4`
+on the gated windows is at least 0.75. Ungated depth 4 is −0.5%, exactly as H
+found. The whole 5–8 day M=5 program hangs off one number nobody has measured.
+
+**The measurement needs no M=5 verify graph.** After a normal M4 cycle whose
+three drafts were all accepted, the target's bonus row is
+`p(. | primary, d1, d2, d3)` — which *is* the distribution a fourth draft would
+be verified against. So the probe runs one extra `rt.draft_mtp(..., mtp_depth=4)`
+from the d3 hidden/token, shapes it with the draft sampler, and logs the row
+(`q_4`) next to that bonus row; the scorer pairs them and reports
+`alpha_4 = sum_x min(p_3(x), q_4(x))`, which is `E_{x~q}[min(1, p/q)]` with the
+accept coin integrated out. The depth 1..3 ladder is reported in the same form
+so the four columns are comparable.
+
+The probe is a **pure read**: it samples nothing, draws no uniform, commits no
+token, and restores the MTP cache offset in a `finally`, so the emitted stream
+and the RNG stream are bit-identical to an unarmed run. `mtplx/generation.py`
+runs it inside the all-accept branch, after the verify decision and before the
+MTP history commit; it is gated on the stock host accept lane, `temperature > 0`,
+no target prefix, a full-depth window, and the persistent MTP cache.
+
+It costs ~1.6 ms on the ~31% of windows that reach it, self-timed into
+`event["timing_s"]["fable_depth4_probe"]`. **An armed run is a data run, not a
+timing run** — read tok/s off an unarmed arm.
+
+The log gains `gate_q` (`q(x_d)` for every depth of *every* window — the
+denominator of every gate) and, only when the probe recorded something, the
+optional `probe_valid` / `probe_ids` / `probe_values` / `probe_probs` /
+`probe_trimmed` columns. An unprobed log keeps exactly the schema the existing
+scorers were written against.
+
+```
+# 3 seeds in ONE driver process, under the guard, from this worktree
+python scripts/fable/abba_driver.py \
+    --source $PWD --label fable-w25-depth4probe --sequence <seq> \
+    --seed 20260829 --seed 20260830 --seed 20260831 \
+    --target-mode batched --require-compiled-verify --m4-stage3 \
+    --qsa-fused-kv-gather --full-frspec --compiled-mtp-prepare --max-tokens 1024 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE=1 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL=1 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_GLU=1 \
+    --env MTPLX_FABLE_DEPTH4_PROBE=1 \
+    --env MTPLX_FABLE_K20_LOG=$PWD/.benchmark-artifacts/fable/k20-depth4-3seeds.npz
+
+# the go/no-go
+python scripts/fable/offline_depth4_gate.py \
+    .benchmark-artifacts/fable/k20-depth4-3seeds.npz --ms-per-window 38.7
+```
+
+`MTPLX_FABLE_*` rides `--env`, not `--candidate-env` (`abba_driver.parse_key_values`
+enforces that split). The arm is the retained control stack, unchanged, so the
+`gate_q` / `P(all 3 | G)` columns are directly comparable to `L_gate_out.txt`.
+
+The scorer prints one line of verdict: **GO** when
+`alpha_4 | q(x_3) > 0.8 >= 0.75` on the probed windows, **NO-GO** otherwise, and
+`NO-GO (undetermined)` when no probed window reached that gate. It reports the
+projection under both marginal row costs the ledger holds — 1.8 ms (H §2.4, what
+L's table used) and 1.4 ms (K's fit for a *compiled* fixed-width row) — because
+neither is measured on an M=5 graph, and deciding whether to build one is the
+entire point.

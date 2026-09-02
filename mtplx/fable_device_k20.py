@@ -100,6 +100,18 @@ unchanged.  The stream position after a cycle is therefore identical to
 flag-off's.  The uniforms are handed to ``fable_k20_log`` (layout
 ``stock_device_k20``) so an armed run can replay the selection offline.
 
+Composing with MTPLX_FABLE_DEPTH4_PROBE
+--------------------------------------
+The chain replaces the per-depth loop that normally captures the probe's
+inputs, so ``generation.py``'s device branch captures them itself -- after
+``materialize()``, so the token is a host int exactly as on the stock lane --
+and the probe still fires from the all-accept branch on depth 3's own hidden,
+token and MTP cache.  The probe's own ``q_4`` row deliberately keeps the stock
+host shaping: it measures the model, not the selector.  The
+``stock_device_k20`` / ``stock_device_k20_bv`` layouts are members of
+``fable_k20_log.STOCK_LAYOUTS``, so ``gate_q``, the ``probe_*`` block and both
+offline scorers read a device log unchanged.
+
 NO device work happens at import.
 """
 

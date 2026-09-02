@@ -138,6 +138,39 @@ A window whose ``block_valid`` is 0 ran the shipped law (a row it needed was
 not on the host), and the offline scorer replays it under that law -- so a
 mixed log is still a clean exactness proof, window by window.
 
+Every stock layout -- the two host ones and their two
+``MTPLX_FABLE_DEVICE_K20`` twins -- also carries the gate feature of ``L`` §D, and -- only when
+``MTPLX_FABLE_DEPTH4_PROBE`` recorded at least one window -- the depth-4 probe
+block.  ``gate_q`` is always written for a stock log (it is a host lookup on
+rows the accept loop already owns); the four ``probe_*`` arrays are **optional
+columns**, absent from an unprobed log, so every existing scorer loads either
+file unchanged:
+
+===========================  ==========================  ===================
+key                          dtype / shape               meaning
+===========================  ==========================  ===================
+``gate_q``                   float64 ``[C, D]``          ``q(x_d)``, the
+                                                         drafter's own
+                                                         probability of the
+                                                         token it drafted;
+                                                         ``q(x_3)`` is the gate
+``probe_valid``              uint8   ``[C]``             1 iff the depth-4
+                                                         probe ran here (all
+                                                         three drafts accepted)
+``probe_ids``                uint32  ``[C, K]``          ``q_4`` support, in
+                                                         the target id space
+``probe_values``             float32 ``[C, K]``          ``log(q_4)``
+``probe_probs``              float64 ``[C, K]``          ``q_4``
+``probe_trimmed``            uint8   ``[C]``             1 iff the shaped row
+                                                         was wider than ``K``
+                                                         and was cut
+===========================  ==========================  ===================
+
+The probe row pairs with **target row 3** -- the bonus row
+``p(. | primary, d_1, d_2, d_3)``, which is exactly the distribution a fourth
+draft would be verified against.  ``scripts/fable/offline_depth4_gate.py``
+scores ``alpha_4 = sum min(p_3, q_4)`` from that pair.
+
 **alpha beyond the first rejection is not in the log, because neither lane
 computes it.**  The kernel returns as soon as a depth rejects (kernel lines
 289-320); the stock accept loop ``break``s.  ``accept_probability_valid``
@@ -205,6 +238,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .fable_block_verify import CAP_MODE as _BLOCK_CAP_MODE
+from .fable_depth4_probe import gate_feature as _gate_feature
 
 _ENV_VAR = "MTPLX_FABLE_K20_LOG"
 
@@ -229,6 +263,23 @@ LAYOUT_STOCK_DEVICE_K20 = "stock_device_k20"
 #: Device K20 *and* block verification.  Carries the ``stock_prepared_bv``
 #: ladder columns on top of the device layout.
 LAYOUT_STOCK_DEVICE_K20_BV = "stock_device_k20_bv"
+
+#: Every layout whose rows are already SHAPED host rows (temperature, top-p,
+#: top-k, renormalised) rather than the PR391 kernel's raw ones.  The device
+#: twins belong here: MTPLX_FABLE_DEVICE_K20 changes WHERE the rows were
+#: selected and HOW the drafted token was sampled, not what a row means, so
+#: every consumer of a stock log reads a device log unchanged -- including the
+#: depth-4 probe's ``gate_q`` / ``probe_*`` columns and both offline scorers.
+STOCK_LAYOUTS = frozenset(
+    {
+        LAYOUT_STOCK,
+        LAYOUT_STOCK_BV,
+        LAYOUT_STOCK_DEVICE_K20,
+        LAYOUT_STOCK_DEVICE_K20_BV,
+    }
+)
+#: Of those, the ones whose accept decision ran the block law.
+STOCK_BV_LAYOUTS = frozenset({LAYOUT_STOCK_BV, LAYOUT_STOCK_DEVICE_K20_BV})
 
 SELECTED_NONE = 0
 SELECTED_CORRECTION = 1
@@ -574,6 +625,19 @@ class K20RowLog:
             "block_budget": _block_column(block, "budget", depth, 0.0),
             "block_realised": _block_column(block, "realised", depth, 0.0),
             "block_clipped": _block_column(block, "clipped", depth, 0),
+            # L §D gate feature, for EVERY window (not just probed ones): the
+            # denominator of every conditional the offline scorer reports is
+            # P(gate) over all windows, so it must be recorded where the gate
+            # does not fire too.  A pure host lookup on the rows just copied.
+            "gate_q": [
+                0.0
+                if rows[index] is None
+                else _gate_feature(rows[index][0], rows[index][2], draft_tokens[index])
+                for index in range(depth)
+            ],
+            "probe_valid": 0,
+            "probe_row": None,
+            "probe_trimmed": 0,
         }
 
     def stock_depth(
@@ -624,6 +688,34 @@ class K20RowLog:
         window["selected_present"] = True
         window["draws_used"] = len(window["draft_tokens"]) + 1
 
+    def stock_depth4(
+        self, *, ids: Any, probs: Any, trimmed: bool = False
+    ) -> None:
+        """Record the depth-4 probe row (``q_4``) for the open stock window.
+
+        Called from the all-accept branch of ``generate_mtpk`` only, and only
+        under ``MTPLX_FABLE_DEPTH4_PROBE``.  The row is a diagnostic: nothing
+        downstream of this log reads it, no token was sampled from it, and no
+        uniform was drawn for it.  ``mtplx/fable_depth4_probe.py`` is the
+        contract.
+
+        A window that never gets this call keeps ``probe_valid = 0``, which is
+        how the offline scorer separates "the gate did not fire / the window
+        rejected" from "``q_4`` is here".
+        """
+
+        if not _ENABLED or not self.enabled or self._open is None:
+            return
+        window = self._open
+        if window["first_reject"] >= 0:
+            raise RuntimeError(
+                "K20 log: depth-4 probe recorded on a window that rejected; "
+                "the bonus target row it pairs with does not exist there"
+            )
+        window["probe_row"] = (np.asarray(ids), None, np.asarray(probs))
+        window["probe_valid"] = 1
+        window["probe_trimmed"] = int(bool(trimmed))
+
     def stock_close(self) -> None:
         """Close the open stock window.  Idempotent; safe on every path."""
 
@@ -662,6 +754,10 @@ class K20RowLog:
         uniforms = np.full((count, depth + 1), np.nan, dtype=np.float64)
         draft_uniforms = np.full((count, depth), np.nan, dtype=np.float64)
         accept_probability = np.zeros((count, depth), dtype=np.float64)
+        gate_q = np.zeros((count, depth), dtype=np.float64)
+        probe_ids = np.zeros((count, K20), dtype=np.uint32)
+        probe_values = np.zeros((count, K20), dtype=np.float32)
+        probe_probs = np.zeros((count, K20), dtype=np.float64)
         block_columns = {
             "block_coin": np.zeros((count, depth), dtype=np.float64),
             "block_scale": np.ones((count, depth), dtype=np.float64),
@@ -699,12 +795,41 @@ class K20RowLog:
                 ladder = row.get(key)
                 if ladder:
                     array[index, : len(ladder)] = np.asarray(ladder, dtype=array.dtype)
+            gates = row.get("gate_q")
+            if gates:
+                gate_q[index, : len(gates)] = np.asarray(gates, dtype=np.float64)
+            probe = row.get("probe_row")
+            if probe is not None:
+                packed = _row_arrays(*probe)
+                probe_ids[index] = packed[0]
+                probe_values[index] = packed[1]
+                probe_probs[index] = packed[2]
 
         def column(key: str, dtype: Any) -> np.ndarray:
             return np.asarray([row.get(key, 0) for row in rows], dtype=dtype)
 
+        # Optional columns.  `gate_q` rides every stock log (it costs D
+        # floats/window and is the denominator of every gate the depth-4 scorer
+        # reports); the `probe_*` block is written ONLY when the probe actually
+        # recorded a window, so an unprobed log keeps exactly the schema every
+        # existing scorer was written against.
+        stock_extra: dict[str, np.ndarray] = {}
+        if self.layout in STOCK_LAYOUTS:
+            stock_extra["gate_q"] = gate_q
+        probe_valid = column("probe_valid", np.uint8)
+        if int(np.sum(probe_valid)):
+            stock_extra.update(
+                {
+                    "probe_valid": probe_valid,
+                    "probe_ids": probe_ids,
+                    "probe_values": probe_values,
+                    "probe_probs": probe_probs,
+                    "probe_trimmed": column("probe_trimmed", np.uint8),
+                }
+            )
+
         block_arrays: dict[str, np.ndarray] = {}
-        if self.layout in (LAYOUT_STOCK_BV, LAYOUT_STOCK_DEVICE_K20_BV):
+        if self.layout in STOCK_BV_LAYOUTS:
             block_arrays = {
                 **block_columns,
                 "block_valid": column("block_valid", np.uint8),
@@ -713,6 +838,7 @@ class K20RowLog:
 
         return {
             **block_arrays,
+            **stock_extra,
             "layout": np.asarray(self.layout or LAYOUT_STOCK),
             "has_raw_logits": np.asarray(
                 1 if self.layout == LAYOUT_PR391 else 0, dtype=np.uint8
@@ -797,6 +923,15 @@ class K20RowLog:
                 "windows carry no distributions, so neither the block-"
                 "verification nor the draft-temperature scorer applies."
             )
+        probed = int(np.sum(arrays["probe_valid"])) if "probe_valid" in arrays else 0
+        if probed:
+            trimmed = int(np.sum(arrays["probe_trimmed"]))
+            note += f" depth4_probe={probed} windows"
+            if trimmed:
+                note += (
+                    f" ({trimmed} shaped wider than {K20} and were trimmed; "
+                    "offline_depth4_gate.py reports this)"
+                )
         print(
             f"[fable-k20-log] wrote {out} layout={self.layout} "
             f"cycles={len(self._rows)}{note}",
@@ -882,6 +1017,8 @@ __all__ = [
     "LAYOUT_STOCK_BV",
     "LAYOUT_STOCK_DEVICE_K20",
     "LAYOUT_STOCK_DEVICE_K20_BV",
+    "STOCK_BV_LAYOUTS",
+    "STOCK_LAYOUTS",
     "is_enabled",
     "k20_log",
 ]
