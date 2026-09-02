@@ -40,6 +40,10 @@ import mlx.core as mx
 __all__ = [
     "native_qsa_available",
     "qsa_sparse_gqa",
+    "qsa_sparse_gqa_decode",
+    "qsa_sparse_gqa_decode_split_geometry",
+    "qsa_sparse_gqa_decode_supported",
+    "qsa_sparse_gqa_decode_unsupported_reason",
     "qsa_sparse_gqa_supported",
     "qsa_sparse_gqa_unsupported_reason",
 ]
@@ -307,5 +311,335 @@ def qsa_sparse_gqa(
         int(total_tokens),
         int(key_tile),
         int(dimension_tile),
+        stream=stream,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split-K (KV-split) DECODE variant -- M=4 fixed verify and M=1 draft.
+#
+# Separate entry points, not a rows argument on the prefill one, because the
+# two differ in more than the row count:
+#
+#   * the grid's z axis is the KV SPLIT here, and the kernel is two dispatches
+#     (split + merge) rather than one;
+#   * validity is decided PER SLOT rather than by a leading-prefix cut,
+#     because the decode selector (``QSAIndexer._select_m4``) hands
+#     ``mx.argpartition``'s raw, UNSORTED output straight through, while the
+#     prefill selector sorts;
+#   * the query offset is a device buffer, so a tensor-valued cache offset
+#     never has to be read on the host.
+# ---------------------------------------------------------------------------
+
+#: The kernel's own selected-token width: 512 blocks x 4 tokens plus the at
+#: most three causal tail tokens of the incomplete block.  The shipped lane
+#: builds 2,052 slots; its 2,052nd is invalid for every query position (see
+#: the note in ``qsa_sparse_gqa_decode``), so the two visible sets agree.
+_SELECTED_TOKENS = _TOP_K_BLOCKS * _COMPRESS_RATIO + (_COMPRESS_RATIO - 1)
+#: Partial rows are [O(head_dim) | m | l] in fp32.
+_PARTIAL_LD = _HEAD_DIM + 2
+_MAX_KEY_SPLITS = 64
+_DEFAULT_KEY_SPLITS = 8
+_INTEGER_DTYPES = (
+    mx.int8,
+    mx.int16,
+    mx.int32,
+    mx.int64,
+    mx.uint8,
+    mx.uint16,
+    mx.uint32,
+    mx.uint64,
+)
+
+
+def qsa_sparse_gqa_decode_split_geometry(
+    selected_tokens: int = _SELECTED_TOKENS,
+    key_tile: int = _DEFAULT_TILE[0],
+    key_splits: int = _DEFAULT_KEY_SPLITS,
+) -> tuple[int, int, int]:
+    """``(n_tiles, tiles_per_split, n_splits)`` for the split-K decode grid.
+
+    A pure-host mirror of the C++ ``qsa_sparse_gqa_decode_split_geometry`` so
+    the harness, the tests and the partial-buffer sizing never restate the
+    arithmetic.  ``tests/test_fable_qsa_sparse_decode.py`` pins the two
+    against each other whenever the extension is built.
+
+    The rounding is deliberate: ``n_splits`` is recomputed from
+    ``tiles_per_split`` so the LAST split always has work.  With 17 tiles and
+    8 requested splits, ``tiles_per_split`` is 3 and six splits cover the
+    range -- dispatching eight would leave two threadgroups writing an empty
+    online-softmax state that the merge then has to skip.
+    """
+
+    if int(selected_tokens) <= 0:
+        raise ValueError(f"selected_tokens must be positive; got {selected_tokens}")
+    if int(key_tile) <= 0:
+        raise ValueError(f"key_tile must be positive; got {key_tile}")
+    tiles = -(-int(selected_tokens) // int(key_tile))
+    splits = min(int(key_splits), tiles)
+    if splits < 1:
+        splits = 1
+    per_split = -(-tiles // splits)
+    exact_splits = -(-tiles // per_split)
+    return tiles, per_split, exact_splits
+
+
+def qsa_sparse_gqa_decode_partial_shape(
+    rows: int,
+    key_tile: int = _DEFAULT_TILE[0],
+    key_splits: int = _DEFAULT_KEY_SPLITS,
+) -> tuple[int, int, int, int]:
+    """Shape of the fp32 partial-state buffer the split pass writes."""
+
+    _, _, n_splits = qsa_sparse_gqa_decode_split_geometry(
+        _SELECTED_TOKENS, key_tile, key_splits
+    )
+    return (n_splits, _Q_HEADS, int(rows), _PARTIAL_LD)
+
+
+def _normalized_query_offset(query_offset: Any) -> mx.array | None:
+    """Accept a host int or a one-element int32 array; emit the ABI's ``[1]``.
+
+    A host int becomes a one-element array rather than a params-block scalar
+    so the two spellings take the SAME kernel path, and so a tensor-valued
+    cache offset (``TensorOffsetKVCache``) never forces a graph sync just to
+    read a position the kernel is about to read anyway.
+    """
+
+    if isinstance(query_offset, mx.array):
+        if query_offset.size != 1:
+            return None
+        # A ``TensorOffsetKVCache`` offset is a 0-d int32 array; accept every
+        # exact integer width and narrow, because a one-element astype costs
+        # nothing and a refusal here would raise on a perfectly valid cache.
+        if query_offset.dtype not in _INTEGER_DTYPES:
+            return None
+        return query_offset.reshape(1).astype(mx.int32)
+    if isinstance(query_offset, bool):
+        return None
+    try:
+        value = operator.index(query_offset)
+    except TypeError:
+        return None
+    if value < 0:
+        return None
+    return mx.array([value], dtype=mx.int32)
+
+
+def qsa_sparse_gqa_decode_unsupported_reason(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_ids: mx.array,
+    *,
+    query_offset: Any,
+    total_tokens: int,
+    scale: float,
+    key_tile: int = _DEFAULT_TILE[0],
+    dimension_tile: int = _DEFAULT_TILE[1],
+    key_splits: int = _DEFAULT_KEY_SPLITS,
+) -> str | None:
+    """``None`` when the decode call is on contract, else the precise reason."""
+
+    extension = _load_extension()
+    if isinstance(extension, Exception):
+        return f"the native QSA extension is not built ({extension})"
+    if not _on_metal_device():
+        return "the active MLX device is not an available Metal GPU"
+
+    arrays = (queries, keys, values, block_ids)
+    if any(not isinstance(array, mx.array) for array in arrays):
+        return "all tensor inputs must be MLX arrays"
+    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
+        return "Q, K, and V must be rank four"
+    if block_ids.ndim not in (2, 4):
+        return "block ids must be rank two [M, 512] or rank four [1, 1, M, 512]"
+
+    batch, query_heads, rows, head_dim = (int(x) for x in queries.shape)
+    if (batch, query_heads, head_dim) != (_BATCH, _Q_HEADS, _HEAD_DIM):
+        return "Q must have production shape [1, 24, M, 256]"
+    if rows <= 0:
+        return "Q must carry at least one query row"
+
+    key_batch, kv_heads, capacity, key_dim = (int(x) for x in keys.shape)
+    if (key_batch, kv_heads, key_dim) != (_BATCH, _KV_HEADS, _HEAD_DIM):
+        return "K must have production shape [1, 2, capacity, 256]"
+    if tuple(int(x) for x in values.shape) != tuple(int(x) for x in keys.shape):
+        return "V must have the same full-backing shape as K"
+
+    if queries.dtype not in _SUPPORTED_DTYPES:
+        return "Q must be float16 or bfloat16"
+    if keys.dtype != queries.dtype or values.dtype != queries.dtype:
+        return "Q, K, and V dtypes must match"
+    if block_ids.dtype not in _SUPPORTED_ID_DTYPES:
+        return "block ids must be int32 or uint32"
+    if _normalized_block_ids(block_ids, rows) is None:
+        return "block ids must have shape [M, 512] or [1, 1, M, 512]"
+    if _normalized_query_offset(query_offset) is None:
+        return (
+            "query_offset must be a non-negative host int or a one-element "
+            "int32 array"
+        )
+
+    if isinstance(total_tokens, mx.array):
+        return "total_tokens must be a host integer"
+    if isinstance(scale, mx.array):
+        return "scale must be a host float"
+    if isinstance(total_tokens, bool):
+        return "total_tokens cannot be bool"
+    try:
+        total_tokens_i = operator.index(total_tokens)
+    except TypeError:
+        return "total_tokens must be an exact host integer"
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        return "scale must be a numeric host scalar"
+    scale_f = float(scale)
+
+    if total_tokens_i <= 0:
+        return "total_tokens must describe a non-empty context"
+    if rows > total_tokens_i:
+        return "the query rows must fit inside total_tokens"
+    if total_tokens_i > capacity:
+        return "the logical token count exceeds the full K/V backing capacity"
+    if total_tokens_i > _MAX_CONTEXT:
+        return "the logical token count exceeds the production context limit"
+    if total_tokens_i // _COMPRESS_RATIO <= _TOP_K_BLOCKS:
+        return "the context has not crossed the dense/sparse boundary"
+    if not math.isfinite(scale_f):
+        return "scale must be finite"
+
+    if (int(key_tile), int(dimension_tile)) not in _SUPPORTED_TILES:
+        return (
+            "(key_tile, dimension_tile) must be one of "
+            + ", ".join(str(t) for t in _SUPPORTED_TILES)
+        )
+    if not 1 <= int(key_splits) <= _MAX_KEY_SPLITS:
+        return f"key_splits must be in [1, {_MAX_KEY_SPLITS}]"
+    return None
+
+
+def qsa_sparse_gqa_decode_supported(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_ids: mx.array,
+    *,
+    query_offset: Any,
+    total_tokens: int,
+    scale: float,
+    key_tile: int = _DEFAULT_TILE[0],
+    dimension_tile: int = _DEFAULT_TILE[1],
+    key_splits: int = _DEFAULT_KEY_SPLITS,
+) -> bool:
+    """Whether the exact production-only decode contract is met."""
+
+    return (
+        qsa_sparse_gqa_decode_unsupported_reason(
+            queries,
+            keys,
+            values,
+            block_ids,
+            query_offset=query_offset,
+            total_tokens=total_tokens,
+            scale=scale,
+            key_tile=key_tile,
+            dimension_tile=dimension_tile,
+            key_splits=key_splits,
+        )
+        is None
+    )
+
+
+def qsa_sparse_gqa_decode(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_ids: mx.array,
+    *,
+    query_offset: Any,
+    total_tokens: int,
+    scale: float,
+    key_tile: int = _DEFAULT_TILE[0],
+    dimension_tile: int = _DEFAULT_TILE[1],
+    key_splits: int = _DEFAULT_KEY_SPLITS,
+    stream: Any = None,
+) -> mx.array:
+    """Split-K direct-index sparse GQA attention for the decode geometries.
+
+    ``queries``  ``[1, 24, M, 256]`` fp16/bf16 -- the ``[B,H,M,D]`` transposed
+                 view the Attention module already builds.  M is 4 for the
+                 fixed-M4 verify and 1 for a single-row draft/decode step.
+    ``keys``/``values``  ``[1, 2, capacity, 256]``, the FULL KV cache backing,
+                 read in place at its allocation stride.
+    ``block_ids``  ``[M, 512]`` or ``[1, 1, M, 512]``, int32 or uint32 --
+                 ``mx.argpartition``'s output IN ITS OWN ORDER.  Unlike the
+                 prefill entry point this one makes NO ordering assumption and
+                 reads no ``block_valid``: it applies the shipped lane's own
+                 per-slot predicate ``block < (pos + 1) // 4`` to every slot.
+                 So the visible set is identical whether or not the selector
+                 sorts.
+    ``query_offset``  absolute position of query row 0, as a host int or a
+                 one-element int32 array (a tensor-valued cache offset never
+                 has to be read on the host).
+    ``total_tokens``  logical tokens in the cache (NOT ``capacity``).
+    ``key_splits``  target KV splits; see
+                 :func:`qsa_sparse_gqa_decode_split_geometry` for how it is
+                 clamped and rounded.
+
+    Returns ``[1, 24, M, 256]``, same dtype as ``queries``.
+
+    NUMERICS -- this is a ROUNDING-CLASS change, HumanEval-gated
+    -----------------------------------------------------------
+    Against the shipped rows-gather lane, over an IDENTICAL visible set:
+
+      * scores accumulate through Steel MMA fp32 fragments, not MLX's gemv
+        tiling, so the 256-term contraction is reassociated;
+      * the softmax is an fp32 ONLINE softmax in ``exp2`` with the scale
+        pre-multiplied by ``M_LOG2E``, not an fp32 ``exp`` over a
+        materialised score row;
+      * probabilities stay fp32 instead of being cast to bf16 before P@V,
+        and P@V runs fp32 x fp32 instead of bf16 x bf16 with fp32 accumulate;
+      * the split-K merge adds one more rescale per query row.
+
+    None of that is bit-exact and none of it can be made so.  Adopt this lane
+    on the same terms as ``MTPLX_FABLE_HC_M4``: greedy-token agreement plus a
+    full HumanEval gate, never on a digest comparison.
+
+    The shipped lane builds ``topk*ratio + ratio`` = 2,052 token slots; this
+    kernel walks ``topk*ratio + ratio - 1`` = 2,051.  The dropped slot is the
+    tail's fourth, whose token is ``((pos+1)//4)*4 + 3``; that is ``> pos``
+    for every ``pos``, so the shipped lane always masks it.  The visible sets
+    are equal.
+    """
+
+    reason = qsa_sparse_gqa_decode_unsupported_reason(
+        queries,
+        keys,
+        values,
+        block_ids,
+        query_offset=query_offset,
+        total_tokens=total_tokens,
+        scale=scale,
+        key_tile=key_tile,
+        dimension_tile=dimension_tile,
+        key_splits=key_splits,
+    )
+    if reason is not None:
+        raise ValueError(f"[mtplx.native.qsa_sparse_gqa_decode] {reason}.")
+
+    extension = _load_extension()
+    selected = _normalized_block_ids(block_ids, int(queries.shape[2]))
+    offset = _normalized_query_offset(query_offset)
+    return extension.qsa_sparse_gqa_decode(
+        queries,
+        keys,
+        values,
+        selected,
+        offset,
+        float(scale),
+        int(total_tokens),
+        int(key_tile),
+        int(dimension_tile),
+        int(key_splits),
         stream=stream,
     )

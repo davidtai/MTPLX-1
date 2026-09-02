@@ -2654,6 +2654,35 @@ class QSAIndexer(nn.Module):
             return False
         return int(rows) == int(getattr(cache, "fable_qsa_m4_rows", 0))
 
+    def _sparse_decode_route(
+        self, cache: QSACache, *, rows: int, k_eff: int, draft: bool = False
+    ) -> bool:
+        """True when the native split-K sparse-GQA kernel serves this call.
+
+        Host-only, and read from state the CACHE validated once at install
+        (graphbank ran the contract check and the numerical parity probe
+        there, at model build, outside any mx.compile trace).  The indexer
+        never re-derives the decision, so two traces of the same verify graph
+        cannot disagree about which attention they contain.
+
+        Three narrowings, all of which are routing rather than failure: the
+        flag has to be armed for THIS width (verify M=4 and draft M=1 are
+        separately gated), the selection has to be a full budget (a short
+        context selects fewer than 512 blocks and the kernel's ABI is a fixed
+        [M, 512]), and the pack has to be the ratio-4 top-512 QSA geometry
+        the metallib is instantiated for.
+        """
+
+        attribute = (
+            "fable_qsa_sparse_draft_rows" if draft else "fable_qsa_sparse_decode_rows"
+        )
+        wired = int(getattr(cache, attribute, 0))
+        if wired <= 0 or int(rows) != wired:
+            return False
+        if int(self.ratio) != 4 or int(self.block_topk) != 512:
+            return False
+        return int(k_eff) == int(self.block_topk)
+
     def _require_m4_contract(self, cache: QSACache, rows: int) -> None:
         """Validate the module half of the lane.  Raises; never returns False.
 
@@ -2775,6 +2804,15 @@ class QSAIndexer(nn.Module):
         top_idx = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)[
             :, nb_total - k_eff :
         ]
+        if self._sparse_decode_route(cache, rows=int(top_idx.shape[0]), k_eff=k_eff):
+            # MTPLX_FABLE_QSA_SPARSE_DECODE: the native split-K kernel walks
+            # ``top_idx`` directly, so the token list below is dead work --
+            # one dispatch per layer on top of the five the kernel replaces.
+            # Its order is irrelevant to the kernel, which applies the SAME
+            # per-slot predicate ``block < (pos+1)//4`` that qsa_m4_row_tokens
+            # applies, so argpartition's raw output goes straight through and
+            # the visible set is identical.
+            return ("sparse_blocks", top_idx)
         token_idx, token_ok = qsa_m4_row_tokens(
             top_idx, pos_start, compress_ratio=self.ratio
         )
@@ -3056,6 +3094,15 @@ class QSAIndexer(nn.Module):
             self._indexer_reuse_stash(
                 cache, rows=S, nb_q=nb_q, top_idx=top_idx, k_eff=k_eff
             )
+
+        if self._sparse_decode_route(cache, rows=S, k_eff=k_eff, draft=True):
+            # MTPLX_FABLE_QSA_SPARSE_DRAFT: same kernel, M=1 geometry.  See
+            # the flag's note in runtime_options -- today's retained-stack
+            # census shows the draft chain running the MTP block rather than
+            # the twelve QSA layers, so this width exists for non-speculative
+            # decode and for a future full-stack draft, and must not be
+            # credited with a speculative-ABBA win it cannot produce.
+            return ("sparse_blocks", top_idx)
 
         if S > 1 and _qsa_large_prefill_enabled(S, total):
             # Preserve the eager score/top-k expression as an independently
@@ -4377,6 +4424,35 @@ class Attention(nn.Module):
                 total_tokens=T,
                 compress_ratio=self.indexer.ratio,
             )
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "sparse_blocks":
+            # MTPLX_FABLE_QSA_SPARSE_DECODE / _DRAFT: split-K direct-index
+            # sparse GQA over exactly the visible set the rows-gather lane
+            # attends, reading the cache BACKING in place.  No gathered K/V
+            # tensor is written, no transposed copy is made for the score
+            # operand, and no score tensor is materialized -- which is the
+            # whole point: the shipped lane's ~70 MB per layer is bytes, not
+            # bandwidth (see mtplx/kernels/qsa_sparse_decode.py).
+            #
+            # ROUNDING CLASS, not exact: fp32 online softmax in exp2, fp32
+            # probabilities into an fp32 P@V, Steel-MMA reassociation, and a
+            # split-K rescale.  Adopted on greedy-token agreement plus a full
+            # HumanEval run, exactly like MTPLX_FABLE_HC_M4.
+            from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+            _, sparse_top_idx = sel_mask
+            out = _qsa_sparse.attention(
+                q,
+                cache.kv.keys,
+                cache.kv.values,
+                sparse_top_idx,
+                query_offset=pos_start,
+                total_tokens=T,
+                scale=self.scale,
+                draft=(S == 1),
+            )
+            out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+            return self.o_proj(out * mx.sigmoid(gate))
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "gather_rows":
             # Rows-gather lane (S>1): each verify/pipeline row reads only
