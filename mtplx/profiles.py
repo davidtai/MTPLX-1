@@ -925,9 +925,9 @@ TURBO_FULL_STACK_PROFILE = RuntimeProfile(
         "report (expects n=65536 from builtin:qwen38-code-64k), the runtime's "
         "[qwen4-fixed-M4-verify], [qwen4-M4-stage3] and "
         "[qwen4-compiled-MTP-prepare] install reports, and the background "
-        "warmup ladder. Those three runtime reports are logger.info and "
-        "invisible under `python -m mtplx.server.openai`, so the self-check "
-        "prints their contents rather than pointing at them.",
+        "warmup ladder. Those receipts are printed to stderr at install time "
+        "on every profile, and the reports are readable at GET /health under "
+        "engagement_reports.",
         "Same verify-kernel exactness caveats as turbo; additionally the "
         "fused GDN/MoE/hyper-connection lanes and the QSA rows-gather are "
         "self-fenced and bail to the stock chain on any contract miss.",

@@ -20,28 +20,34 @@ not new ones:
                        ``frspec`` section of the draft-head report the server
                        keeps on ``state.draft_lm_head``.
 ``qwen4_fixed_m4_verify``
-                       ``mtplx/runtime.py`` logs ``[qwen4-fixed-M4-verify]``
+                       ``mtplx/runtime.py`` prints ``[qwen4-fixed-M4-verify]``
                        with the ``install_qwen4_fixed_verify_route`` report,
                        kept as ``runtime.qwen4_fixed_verify_report``
                        (``{"installed": True, "linear_layers": n, "rows": 4}``).
-``qwen4_m4_stage3``    ``mtplx/runtime.py`` logs ``[qwen4-M4-stage3]`` with the
-                       ``install_qwen4_m4_stage3`` report, kept as
+``qwen4_m4_stage3``    ``mtplx/runtime.py`` prints ``[qwen4-M4-stage3]`` with
+                       the ``install_qwen4_m4_stage3`` report, kept as
                        ``runtime.qwen4_m4_stage3_report``.
 ``qwen4_compiled_mtp_prepare``
-                       ``mtplx/runtime.py`` logs
+                       ``mtplx/runtime.py`` prints
                        ``[qwen4-compiled-MTP-prepare]`` with the
                        ``install_compiled_prepare`` report, kept as
                        ``runtime.qwen4_compiled_mtp_prepare_report``.
 ``ladder_all_ok``      every ``{"kind": "ladder"}`` step of the server's
                        background warmup plan in state ``ok``.
 
-Those three ``logger.info`` lines are invisible under ``python -m
-mtplx.server.openai`` (no handler is configured), which is part of why the
-lanes could be off without anyone noticing. The self-check therefore prints
-each report's contents on stdout rather than pointing at a log line the
-operator cannot see. It does NOT re-emit the driver's ``M4 route {...}``
-spelling: that line belongs to ``scripts/fable/abba_driver.py``, and a
-summary must not be mistakable for the receipt it summarizes.
+Those three ``[qwen4-*]`` receipts are also printed to stderr at install
+time by ``mtplx/runtime.py:_print_install_receipt``, exactly the way
+``[frspec] install report`` always was. Before that they existed only as
+``logger.info`` under a server that configures no handler, so the lanes
+could be off with nothing in the log either way -- which is the failure this
+self-check exists to end. The self-check still prints each report's contents
+so the verdict and its evidence sit on one line. It does NOT re-emit the
+driver's ``M4 route {...}`` spelling: that line belongs to
+``scripts/fable/abba_driver.py``, and a summary must not be mistakable for
+the receipt it summarizes.
+
+The same reports are readable after boot at ``GET /health`` under
+``engagement_reports``.
 
 Pure functions over plain dicts: the server passes what it has, nothing here
 touches MLX, the model, or the GPU.
@@ -49,15 +55,16 @@ touches MLX, the model, or the GPU.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TextIO
 
 #: The row count ``builtin:qwen38-code-64k`` installs, and the number
 #: ``require_full_stack`` demands. A smaller ``n`` means MTPLX_FRSPEC_N
 #: truncated the table or a different vocabulary was selected.
 EXPECTED_FRSPEC_N = 65536
 
-#: Marker name -> the env key that arms it and the receipt the runtime logs.
+#: Marker name -> the env key that arms it and the receipt it is read from.
 MARKER_SOURCES: dict[str, tuple[str, str]] = {
     "frspec_installed": ("MTPLX_FRSPEC_DRAFT", "[frspec] install report"),
     "qwen4_fixed_m4_verify": (
@@ -80,6 +87,32 @@ MARKER_NAMES = tuple(MARKER_SOURCES)
 #: spellings are the receipts themselves (and what the bench's log scanner
 #: matches), and a summary line must not be mistaken for one.
 LINE_PREFIX = "[full-stack]"
+
+
+def print_install_receipt(
+    tag: str,
+    report: Any,
+    *,
+    stream: TextIO | None = None,
+) -> None:
+    """Print one install-time engagement receipt, the way frspec always did.
+
+    ``mtplx/runtime.py`` logs ``[qwen4-fixed-M4-verify]`` and friends through
+    ``logger.info``, and ``mtplx/server/openai.py`` installs no logging
+    handler -- so on a real ``mtplx serve`` log those lines appeared zero
+    times while ``[frspec] install report`` (a plain print) appeared once.
+    Lanes could therefore install, or silently fail to install, with nothing
+    to show either way.
+
+    Called at INSTALL time only, once per model load: no per-request logging
+    is enabled and nothing is printed from a timed request path. Never
+    raises -- a receipt must not be able to fail a model load.
+    """
+
+    try:
+        print(f"[{tag}] {report}", file=stream or sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -289,6 +322,7 @@ def selfcheck_payload(
 
 __all__ = [
     "EXPECTED_FRSPEC_N",
+    "print_install_receipt",
     "LINE_PREFIX",
     "MARKER_NAMES",
     "MARKER_SOURCES",

@@ -24,6 +24,12 @@ from .artifacts import (
     text_config,
 )
 from .backends.registry import ARCHITECTURE_DECLARED_MODULES
+# Install-time engagement receipts on stderr, once per model load. The
+# [qwen4-*] logger.info lines in load() reach no handler under
+# `python -m mtplx.server.openai`, so this prints the same text the way
+# `[frspec] install report` always did. INSTALL time only -- no
+# per-request logging is enabled and nothing prints from a timed path.
+from .full_stack_selfcheck import print_install_receipt as _print_install_receipt
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -1078,6 +1084,10 @@ def load(
                 "[qwen4-compiled-MTP-prepare] %s",
                 runtime.qwen4_compiled_mtp_prepare_report,
             )
+            _print_install_receipt(
+                "qwen4-compiled-MTP-prepare",
+                runtime.qwen4_compiled_mtp_prepare_report,
+            )
         from .qwen4_fixed_verify import (
             install_qwen4_fixed_verify_route,
             qwen4_fixed_verify_enabled,
@@ -1087,6 +1097,7 @@ def load(
             qwen4_verify_report = install_qwen4_fixed_verify_route(runtime)
             runtime.qwen4_fixed_verify_report = qwen4_verify_report
             logger.info("[qwen4-fixed-M4-verify] %s", qwen4_verify_report)
+            _print_install_receipt("qwen4-fixed-M4-verify", qwen4_verify_report)
         from .qwen4_m4_stage3 import (
             install_qwen4_m4_stage3,
             qwen4_m4_stage3_flags,
@@ -1106,6 +1117,7 @@ def load(
                 routed_glu_enabled=routed_glu_enabled,
             )
             logger.info("[qwen4-M4-stage3] %s", qwen4_m4_stage3_report)
+            _print_install_receipt("qwen4-M4-stage3", qwen4_m4_stage3_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError

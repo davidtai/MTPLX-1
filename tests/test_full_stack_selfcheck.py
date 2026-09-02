@@ -276,3 +276,58 @@ def test_payload_carries_the_phase_env_key_and_receipt_per_marker() -> None:
     for row in payload["markers"]:
         assert row["env_key"] == MARKER_SOURCES[row["marker"]][0]
         assert row["receipt"] == MARKER_SOURCES[row["marker"]][1]
+
+
+# ---------------------------------------------------------------------------
+# Install-time receipts: the [qwen4-*] lines a real `mtplx serve` log shows
+# ---------------------------------------------------------------------------
+
+
+def test_install_receipt_prints_the_same_text_the_logger_would() -> None:
+    import io
+
+    from mtplx.full_stack_selfcheck import print_install_receipt
+
+    stream = io.StringIO()
+    print_install_receipt("qwen4-fixed-M4-verify", GOOD_FIXED_VERIFY, stream=stream)
+
+    assert stream.getvalue() == f"[qwen4-fixed-M4-verify] {GOOD_FIXED_VERIFY}\n"
+
+
+def test_install_receipt_never_raises() -> None:
+    from mtplx.full_stack_selfcheck import print_install_receipt
+
+    class _Broken:
+        def write(self, _data):
+            raise OSError("closed")
+
+        def flush(self):
+            raise OSError("closed")
+
+    # Must not propagate: a receipt cannot be allowed to fail a model load.
+    print_install_receipt("qwen4-M4-stage3", GOOD_M4_STAGE3, stream=_Broken())
+
+
+def test_runtime_prints_a_receipt_for_every_qwen4_install_report() -> None:
+    """Each report the self-check reads must also reach a plain server log.
+
+    mtplx/server/openai.py installs no logging handler, so a logger.info-only
+    receipt appears zero times in a real `mtplx serve` log. Read the source
+    rather than importing mtplx.runtime (which pulls MLX in).
+    """
+
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "mtplx" / "runtime.py").read_text()
+
+    assert "from .full_stack_selfcheck import print_install_receipt" in source
+    for name, (_env_key, receipt) in MARKER_SOURCES.items():
+        if not name.startswith("qwen4_"):
+            continue
+        tag = receipt.strip("[]")
+        assert f'logger.info(\n                "[{tag}]' in source or (
+            f'logger.info("[{tag}]' in source
+        ), tag
+        assert f'_print_install_receipt(\n                "{tag}"' in source or (
+            f'_print_install_receipt("{tag}"' in source
+        ), tag

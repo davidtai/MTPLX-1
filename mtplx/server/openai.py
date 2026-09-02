@@ -1617,6 +1617,37 @@ def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[st
         return {}
 
 
+#: ``/health`` name -> the runtime attribute the install function publishes.
+#: The same dicts the ``[qwen4-*]`` stderr receipts print at model load
+#: (mtplx/runtime.py:_print_install_receipt). Absent/None means the lane did
+#: not install -- because its env key was not set, or because the model is
+#: not the family it belongs to.
+_ENGAGEMENT_REPORT_ATTRS: tuple[tuple[str, str], ...] = (
+    ("qwen4_fixed_m4_verify", "qwen4_fixed_verify_report"),
+    ("qwen4_m4_stage3", "qwen4_m4_stage3_report"),
+    ("qwen4_compiled_mtp_prepare", "qwen4_compiled_mtp_prepare_report"),
+    ("laguna_fused", "laguna_fused_report"),
+)
+
+
+def _engagement_reports_payload(state: Any) -> dict[str, Any]:
+    """Read-only install-time engagement reports for ``/health``.
+
+    Read once per request off attributes the install functions set at model
+    load; nothing here computes, installs, or measures anything.
+    """
+
+    runtime = getattr(state, "runtime", None)
+    payload: dict[str, Any] = {
+        name: getattr(runtime, attr, None) for name, attr in _ENGAGEMENT_REPORT_ATTRS
+    }
+    payload["full_stack_selfcheck"] = getattr(state, "full_stack_selfcheck", None)
+    payload["unknown_family_env_keys"] = list(
+        getattr(state, "unknown_family_env_keys", []) or []
+    )
+    return payload
+
+
 def _laguna_fused_startup_line(runtime: Any) -> str | None:
     """Engagement receipt for the env-gated fused stack (grep: [laguna-fused])."""
 
@@ -27045,6 +27076,9 @@ def create_app(state: ServerState) -> FastAPI:
             "reasoning_parser": state.args.reasoning_parser,
             "load_time_s": getattr(state, "load_time_s", None),
             "draft_lm_head": state.draft_lm_head,
+            # The install-time engagement reports the runtime published, in
+            # the same place /health already carries the draft-head report.
+            "engagement_reports": _engagement_reports_payload(state),
             "draft_sampler": (
                 asdict(getattr(state, "draft_sampler", None))
                 if is_dataclass(getattr(state, "draft_sampler", None))

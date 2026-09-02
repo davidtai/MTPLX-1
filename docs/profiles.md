@@ -73,9 +73,31 @@ warmup ladder finishes:
 | `qwen4_compiled_mtp_prepare` | `[qwen4-compiled-MTP-prepare]` | `MTPLX_QWEN4_COMPILED_MTP_PREPARE` |
 | `ladder_all_ok` | background warmup ladder steps | `MTPLX_WARMUP_LADDER` |
 
-The three `[qwen4-…]` reports are `logger.info` in `mtplx/runtime.py` and are
-invisible under `python -m mtplx.server.openai`, so the self-check prints
-their contents rather than pointing at a line you cannot see.
+The three `[qwen4-…]` receipts are printed to stderr at install time on
+**every** profile (`mtplx/runtime.py`), the same way `[frspec] install
+report` always was — before that they were `logger.info` under a server that
+configures no handler, so they appeared zero times in a real server log. The
+self-check prints their contents too, so the verdict and its evidence sit on
+one line.
+
+After boot the same reports are readable at `GET /health` under
+`engagement_reports`, next to `draft_lm_head`:
+
+```json
+{
+  "engagement_reports": {
+    "qwen4_fixed_m4_verify": {"installed": true, "linear_layers": 36, "rows": 4},
+    "qwen4_m4_stage3": {"installed": true, "layers": 48, "...": "..."},
+    "qwen4_compiled_mtp_prepare": {"installed": true, "...": "..."},
+    "laguna_fused": null,
+    "full_stack_selfcheck": {"phase": "post-warmup", "ok": true, "markers": []},
+    "unknown_family_env_keys": []
+  }
+}
+```
+
+`null` means the lane did not install — its env key was not set, or the model
+is not the family it belongs to.
 
 ### Typo protection
 
