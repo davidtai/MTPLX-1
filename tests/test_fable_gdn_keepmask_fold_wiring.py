@@ -1291,6 +1291,8 @@ def test_the_bases_are_keyed_by_layer_index_not_fold_position(monkeypatch):
     for index, entry in zip(order, entries):
         pending = fold.active_for(entry, window.seq)
         assert window.bases[index] is pending.base
+        # W66d: the substitution itself is addressed by entry identity.
+        assert window.bases_by_entry[id(entry)] is pending.base
 
 
 def test_an_empty_ring_uses_each_layers_own_leaf_as_its_base(monkeypatch):
@@ -1310,21 +1312,23 @@ def test_fold_state_in_substitutes_only_the_folded_slot_one(monkeypatch):
         def __init__(self):
             self.cache = ["conv", "state"]
 
+    first, second = _Gdn(), _Gdn()
     plan = [
-        (module.VERIFY_SPEC_KIND_GDN, _Gdn(), 2),
-        (module.VERIFY_SPEC_KIND_GDN, _Gdn(), 2),
+        (module.VERIFY_SPEC_KIND_GDN, first, 2),
+        (module.VERIFY_SPEC_KIND_GDN, second, 2),
     ]
-    leaves = module.CompiledVerifyBank._fold_state_in(plan, {1: "BASE"})
+    # W66d: keyed by ENTRY IDENTITY.  The state plan skips `None` cache
+    # entries, so a plan position is the layer index only by convention, and
+    # a base substituted into the wrong layer's slot 1 would be silent.
+    leaves = module.CompiledVerifyBank._fold_state_in(plan, {id(second): "BASE"})
     assert leaves == ["conv", "state", "conv", "BASE"]
-    # With a layer offset, the bases key by TRUE layer index: the suffix's
-    # first plan entry is layer `layer_offset`, not layer 0.
-    leaves = module.CompiledVerifyBank._fold_state_in(
-        plan, {40: "BASE"}, layer_offset=40
-    )
+    leaves = module.CompiledVerifyBank._fold_state_in(plan, {id(first): "BASE"})
     assert leaves == ["conv", "BASE", "conv", "state"]
-    leaves = module.CompiledVerifyBank._fold_state_in(
-        plan, {1: "BASE"}, layer_offset=40
-    )
+    leaves = module.CompiledVerifyBank._fold_state_in(plan, {})
+    assert leaves == ["conv", "state", "conv", "state"]
+    # A base for an entry that is not in THIS half's plan is ignored, which is
+    # how the W67 split hands each half only the layers it owns.
+    leaves = module.CompiledVerifyBank._fold_state_in(plan, {id(_Gdn()): "BASE"})
     assert leaves == ["conv", "state", "conv", "state"]
 
 

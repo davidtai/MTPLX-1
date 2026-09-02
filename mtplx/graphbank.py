@@ -207,6 +207,12 @@ class FoldWindow:
     order: tuple[int, ...]
     rows: dict[int, tuple[Any, ...]]
     bases: dict[int, Any]
+    #: The same bases keyed by ``id(cache entry)``.  ``_fold_state_in`` walks
+    #: the STATE PLAN, whose position equals the layer index only while no
+    #: cache entry is ``None`` -- ``build_verify_state_spec`` skips those.
+    #: Substituting a base into the wrong layer's slot 1 would be silent, so
+    #: the substitution is addressed by the entry it belongs to.
+    bases_by_entry: dict[int, Any]
     mask: Any
     entries: tuple[Any, ...]
     seen: tuple[Any, ...]
@@ -2520,6 +2526,7 @@ class CompiledVerifyBank:
 
         rows_by_layer: dict[int, tuple[Any, ...]] = {}
         bases: dict[int, Any] = {}
+        bases_by_entry: dict[int, Any] = {}
         seen: list[Any] = []
         for slot, (index, entry, pending) in enumerate(
             zip(order, entries, pendings)
@@ -2542,6 +2549,7 @@ class CompiledVerifyBank:
                 )
             rows_by_layer[int(index)] = tuple(rows)
             bases[int(index)] = pending.base
+            bases_by_entry[id(entry)] = pending.base
             _gdn_fold.set_active(entry, pending, seq)
 
         window = FoldWindow(
@@ -2550,6 +2558,7 @@ class CompiledVerifyBank:
             order=order,
             rows=rows_by_layer,
             bases=bases,
+            bases_by_entry=bases_by_entry,
             mask=prefix_mask_array(keeps, max_windows=windows),
             entries=entries,
             seen=tuple(seen),
@@ -2597,16 +2606,21 @@ class CompiledVerifyBank:
         _gdn_fold.note_window(window.depth, folded=bool(window.keeps))
 
     @staticmethod
-    def _fold_state_in(plan, bases: dict[int, Any], layer_offset: int = 0):
+    def _fold_state_in(plan, bases_by_entry: dict[int, Any]):
         """``state_in`` for one state-plan slice, with folded bases in slot 1.
 
         The deferred commit's lazy leaf stays on ``entry.cache[1]`` for every
         other consumer; only the graph that is about to re-derive the ring
         from ``base`` is handed the base instead.
+
+        Keyed by ``id(entry)`` rather than by the plan position: the state
+        plan skips ``None`` cache entries, so a position is the layer index
+        only by convention, and a base substituted into the wrong layer's
+        slot 1 would be silently wrong.
         """
 
         leaves: list[Any] = []
-        for offset, (kind, entry, n_leaves) in enumerate(plan):
+        for kind, entry, n_leaves in plan:
             if kind == VERIFY_SPEC_KIND_QSA:
                 leaves.extend(
                     (
@@ -2618,7 +2632,7 @@ class CompiledVerifyBank:
                     )
                 )
                 continue
-            base = bases.get(layer_offset + offset)
+            base = bases_by_entry.get(id(entry))
             if base is None:
                 leaves.extend(entry.cache[:n_leaves])
             else:
@@ -2919,7 +2933,7 @@ class CompiledVerifyBank:
         # exactly today's state at exactly today's cost.
         fold_entries = dispatch.get("fold_entries") or ()
         fold_window = self._fold_window_open(dispatch) if fold_entries else None
-        bases = {} if fold_window is None else fold_window.bases
+        bases = {} if fold_window is None else fold_window.bases_by_entry
 
         state_in = self._fold_state_in(dispatch["state_plan"], bases)
         if fold_window is not None:
@@ -3745,7 +3759,7 @@ class CompiledVerifyBank:
         )
         state_in = self._fold_state_in(
             dispatch["state_plan"][:layer_count],
-            {} if fold_window is None else fold_window.bases,
+            {} if fold_window is None else fold_window.bases_by_entry,
         )
         if fold_window is not None:
             state_in.extend(fold_window.leaves(0, layer_count))
@@ -3893,8 +3907,7 @@ class CompiledVerifyBank:
         )
         state_in = self._fold_state_in(
             suffix_plan,
-            {} if fold_window is None else fold_window.bases,
-            layer_offset=layer_count,
+            {} if fold_window is None else fold_window.bases_by_entry,
         )
         if fold_window is not None:
             state_in.extend(fold_window.leaves(layer_count, None))
