@@ -9882,6 +9882,10 @@ def generate_mtpk(
     # MTPLX_CONTEXT_COPY=0); any temperature, no repetition penalties, on
     # capture-commit verify strategies ----
     from .context_copy import (NgramIndex, block_for_ext,
+                               compiled_copy_round_enabled
+                               as _compiled_copy_round_enabled,
+                               copy_round_max_block,
+                               copy_round_pad_tokens,
                                context_copy_batched_enabled,
                                context_copy_block_k,
                                context_copy_enabled, context_copy_min_ext,
@@ -10077,6 +10081,42 @@ def generate_mtpk(
         and callable(getattr(rt.model, "commit_verified_window", None))
         and callable(getattr(rt.model, "verify_capture_scope", None))
     )
+    # Compiled context-copy block round (MTPLX_FABLE_COMPILED_COPY_ROUND,
+    # default off).  The block round's target forward is the one remaining
+    # eager forward on this lane; install a fixed-width compiled replay for it
+    # here, where every gate it depends on is already resolved.  Eligibility is
+    # decided ONCE, right now: install() raises rather than degrading, and a
+    # round never falls back per call, so an A/B arm is wholly compiled-copy or
+    # wholly eager.
+    #
+    # The physical width is the block cap K plus the primary row.  Every round
+    # runs at that width and pads its proposal up to it; acceptance still walks
+    # only the LOGICAL block, and the commit passes the padded width as
+    # verified_tokens (see install_copy_round for why that is exact).
+    ccopy_compiled_round_width = 0
+    if (
+        _compiled_copy_round_enabled()
+        and ccopy_active
+        and _ccopy_batched_lane
+        and compiled_verify_bank is not None
+        and qwen4_fixed_m4_compiled_verify
+        and _compiled_verify_mode == "on"
+    ):
+        if not family_capture_commit_active:
+            # The non-family commit skips its trim on a full accept, which is
+            # only sound when the forward's width equals the proposal's.
+            raise RuntimeError(
+                "compiled copy round requires the family capture-commit path"
+            )
+        # NOT 1 + ccopy_k: the confidence ladder tops out at 32, so a cap
+        # above that proposes no longer block and the extra rows would be
+        # dead MoE traffic on every round.
+        ccopy_compiled_round_width = 1 + copy_round_max_block(ccopy_k)
+        compiled_verify_bank.install_copy_round(
+            cache,
+            width=ccopy_compiled_round_width,
+            hidden_variant=base_hidden_variant,
+        )
     # Phase-3 QSA/MTP staging stays explicitly dark until the fused selector
     # and compiled indexer pass their deferred model/MTP gates.  The disabled
     # branch below preserves v2.10's original rollback/reappend behavior.
@@ -10772,11 +10812,27 @@ def generate_mtpk(
                 if _pr391_carried_d3 is not None:
                     _pr391_carried_d3 = None
                 _cb_T = 1 + len(_cb_block)
+                # Logical vs PHYSICAL width.  The compiled copy round runs one
+                # fixed row count, so a shorter ladder block is padded up to it
+                # with the prompt's own continuation past the proposal (the
+                # tokens a full-K block would have proposed) and, when the
+                # prompt runs out, with the last proposed token.  The pad rows
+                # are causally AFTER the proposal, so rows 0..T-1 -- the only
+                # rows acceptance reads -- are untouched by them; the commit
+                # then trims/replays against the physical width.  Eager rounds
+                # keep physical == logical.
+                _cb_pad = copy_round_pad_tokens(
+                    _cb_block,
+                    prompt_ids,
+                    _cb_pos,
+                    ccopy_compiled_round_width,
+                )
+                _cb_phys = _cb_T + len(_cb_pad)
                 if qsa_mtp_precompute_active:
                     started_indexer_stage = time.perf_counter()
                     target_indexer_plans = precompute_and_stage_qsa_replay_caches(
                         cache,
-                        window_tokens=_cb_T,
+                        window_tokens=_cb_phys,
                     )
                     if target_indexer_plans:
                         _add_timing(
@@ -10805,12 +10861,30 @@ def generate_mtpk(
                     model_forward_kind("target_verify"),
                     _cb_scope,
                 ):
-                    _cb_logits, _cb_hidden = rt.forward_ar(
-                        mx.array([[int(primary), *_cb_block]]),
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                    )
+                    _cb_ids = mx.array([[int(primary), *_cb_block, *_cb_pad]])
+                    if ccopy_compiled_round_width:
+                        _cb_logits, _cb_hidden = (
+                            compiled_verify_bank.forward_copy_round(
+                                _cb_ids,
+                                cache=cache,
+                                committed_count=len(tokens) - 1,
+                                return_hidden=True,
+                                hidden_variant=base_hidden_variant,
+                            )
+                        )
+                        # Everything downstream indexes the LOGICAL window;
+                        # slicing here keeps the accept loop, the greedy
+                        # argmax and the MTP-history append byte-identical to
+                        # the eager path instead of paying for pad rows.
+                        _cb_logits = _cb_logits[:, :_cb_T, :]
+                        _cb_hidden = _cb_hidden[:, :_cb_T, :]
+                    else:
+                        _cb_logits, _cb_hidden = rt.forward_ar(
+                            _cb_ids,
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                        )
                 if sampler.temperature <= 0:
                     _cb_g = [int(x) for x in mx.argmax(_cb_logits[0], axis=-1).tolist()]
                 else:
@@ -10868,18 +10942,20 @@ def generate_mtpk(
                         cache,
                         _cb_before.states if _cb_before is not None else None,
                         keep_tokens=_cb_m,
-                        verified_tokens=_cb_T,
+                        verified_tokens=_cb_phys,
                     )
                     elapsed_commit = time.perf_counter() - started_commit
                     if _cb_ok:
                         capture_commit_time += elapsed_commit
                         _add_timing(event, "family_capture_commit", elapsed_commit)
-                elif _cb_nacc < len(_cb_block):
+                elif _cb_nacc < len(_cb_block) or _cb_phys > _cb_T:
+                    # A padded round always has rows to trim, even on a full
+                    # accept: the pad rows are in the cache and are not output.
                     started_trim_commit = time.perf_counter()
                     _cb_ok = trim_verified_window_to_prefix(
                         cache,
                         _cb_before,
-                        verified_tokens=_cb_T,
+                        verified_tokens=_cb_phys,
                         keep_tokens=_cb_m,
                     )
                     if _cb_ok:
@@ -10889,7 +10965,9 @@ def generate_mtpk(
                     # roll the whole block back, restore the primary's row,
                     # and stop proposing copies (mirrors the capture lane).
                     started_rollback = time.perf_counter()
-                    rollback_after_verify(cache, _cb_before, verified_tokens=_cb_T)
+                    rollback_after_verify(
+                        cache, _cb_before, verified_tokens=_cb_phys
+                    )
                     rollback_time += time.perf_counter() - started_rollback
                     started = time.perf_counter()
                     with attention_phase("decode_verify"):
@@ -10952,6 +11030,8 @@ def generate_mtpk(
                     "block": len(_cb_block),
                     "accepted": _cb_nacc,
                     "extension": int(_cb_ext),
+                    "compiled": bool(ccopy_compiled_round_width),
+                    "physical_rows": int(_cb_phys),
                     "time_s": float(elapsed_verify),
                     "correction": (
                         int(_cb_correction) if _cb_correction is not None else None
