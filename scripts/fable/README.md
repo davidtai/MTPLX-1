@@ -1315,3 +1315,56 @@ projection under both marginal row costs the ledger holds — 1.8 ms (H §2.4, w
 L's table used) and 1.4 ms (K's fit for a *compiled* fixed-width row) — because
 neither is measured on an M=5 graph, and deciding whether to build one is the
 entire point.
+
+## micro_qsa_sparse_gqa.py — the native direct-index sparse-GQA kernel (B3)
+
+Standalone parity + timing for `mtplx.native.qsa_sparse_gqa`, MTPLX's port of
+oMLX's Steel-MMA `qwen4_qsa_sparse_gqa` (Jonathan Spangler, jundot/omlx
+`7467dce8`, Apache-2.0). Nothing in the model calls the kernel yet; this is the
+phase-1 falsifier from `scratchpad/M-holistic-tps-program.md` §B3, and the same
+kernel at M=4 / M=1 is K-Q2 / K-D6, so those cells are in the sweep too.
+
+Cells: `prefill-{16k,32k,64k}` at 4,096 rows, `decode-m4-16k`, `decode-m1-16k`.
+Arms, all fed one selection: the ported kernel per `(BK, DC)` tile, the shipped
+NAX `qsa_prefill_flash`, the portable `_qsa_prefill_gather_attention`, and the
+dense lane (`_qsa_blocks_to_dense_mask` + `_qsa_dense_attention`), which is
+also the numerics reference.
+
+Selection is the production `QSAIndexer._select_eager`, imported, not copied.
+The kernel derives per-slot validity in-kernel instead of reading `block_valid`,
+so the bench **asserts** the selector invariant that makes those identical
+(ascending ids, prefix validity, count `min(512, (pos+1)//4)`) on every row, and
+materialises both token lists in full on sampled rows, before it trusts a parity
+number. Tolerance is a stated bf16-ULP bar, not "looks close": this is a
+rounding-class change (fp32 online softmax vs bf16 scores + precise softmax).
+
+The extension has to be built first — CPU-only cmake, see
+`mtplx/native/__init__.py`. Phase-2 wiring plan:
+`docs/perf/qsa-sparse-gqa-phase2-wiring.md`.
+
+Guarded window (the default sweep is minutes of GPU, dominated by the dense arm;
+transient estimate per cell and refuses anything over `--max-transient-gb`):
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w50-qsa-sparse-gqa \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 \
+  --child-timeout-seconds 3600 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w50-qsa-sparse-gqa/scripts/fable/micro_qsa_sparse_gqa.py \
+    --out /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-qsa-sparse-gqa.json
+```
+
+GO bar (the program note's own falsifier): parity inside the ULP bar on every
+cell, identity assertions clean, and >=3x faster than `qsa_prefill_flash` on the
+queued lane at 4,096 rows. Then, and only then, the 32K ABBA.
+
+### Tests
+
+`tests/test_qsa_sparse_gqa_native.py` — CPU-only. Covers the binding's
+shape/dtype/position contract (MLX arrays are built but never evaluated) and
+the harness's own scoring logic on numpy inputs, including the cases where the
+identity check must fail.
