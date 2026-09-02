@@ -51,6 +51,10 @@ from .cache_state import (
     tail_owned_attention_kv_stats,
     trim_verified_window_to_prefix,
 )
+from .fable_block_verify import (
+    build_verifier as _fable_build_block_verifier,
+    is_enabled as _fable_block_verify_enabled,
+)
 from .fable_compiled_draft import maybe_build_compiled_draft_chain
 from .fable_k20_log import is_enabled as _fable_k20_log_enabled, k20_log
 from .forkev_telemetry import ForkEVRecorder
@@ -331,6 +335,20 @@ _FABLE_HOST_TRIMS = _env_truthy("MTPLX_FABLE_HOST_TRIMS")
 # ``mx.eval(*result)`` sync.  See ``mtplx/fable_k20_log.py`` for what an
 # armed run records and what it costs.
 _FABLE_K20_LOG = _fable_k20_log_enabled()
+
+# MTPLX_FABLE_BLOCK_VERIFY -- read ONCE at import (in
+# ``mtplx.fable_block_verify``), default OFF.  When off this constant is False,
+# no verifier is built, and the stock accept loop evaluates exactly the
+# expressions it evaluated before -- same acceptance probability, same
+# residual, same uniforms, same order.  When on, the loop runs block
+# verification (H §Option B / Sun et al. 2024, arXiv:2403.10444) instead of the
+# per-token Leviathan-Chen law: it clips the RUNNING reach product at 1 rather
+# than clipping each factor, water-fills the resulting budget across the depth
+# d+1 draft support, and corrects from the SCALED residual (c*p - q)+.  Both
+# laws are exact samplers of the same target distribution; BV accepts deeper
+# more often (+1.85% tokens/window measured offline on 381 real windows) and
+# draws exactly the same number of uniforms.  See ``mtplx/fable_block_verify.py``.
+_FABLE_BLOCK_VERIFY = _fable_block_verify_enabled()
 
 # MTPLX_FABLE_QSA_RESTORE_STAGING -- read once (lazily, then memoized), default
 # OFF. See ``mtplx/fable_qsa_restore_stage.py``: it promotes the three restored
@@ -12424,6 +12442,35 @@ def generate_mtpk(
         _host_accept_drafts = (
             () if _pr391_verifier_decision is not None else draft_tokens
         )
+        # MTPLX_FABLE_BLOCK_VERIFY (default off): build the window's block
+        # ladder BEFORE the accept loop. It is a deterministic function of the
+        # rows and the drafted tokens -- it consults no uniform and draws
+        # nothing -- and the M4 verify has already produced every target row,
+        # so the whole ladder is available up front and the loop only reads it.
+        # `build_verifier` returns None (keep the shipped law for this window)
+        # unless all D draft rows and all D target rows are already on the
+        # host, so arming the flag never forces the lazy path to materialise a
+        # row it meant to skip. Greedy and target-prefix windows have no
+        # distributions at all and are excluded here.
+        _bv = None
+        if (
+            _FABLE_BLOCK_VERIFY
+            and _host_accept_drafts
+            and sampler.temperature > 0
+            and target_prefix_tokens is None
+        ):
+            _bv = _fable_build_block_verifier(
+                draft_tokens=draft_tokens,
+                draft_probs=draft_probs,
+                target_batch=target_distribution_batch,
+                target_list=(
+                    target_distributions
+                    if target_distributions is not None
+                    and not _penalties_active
+                    and not _steer_active
+                    else None
+                ),
+            )
         if _FABLE_K20_LOG and _host_accept_drafts:
             # MTPLX_FABLE_K20_LOG (default off): the stock native-MTP lane's
             # own K20 rows. Everything copied here is an array this lane has
@@ -12444,6 +12491,8 @@ def generate_mtpk(
                 bonus_allowed=bool(bonus_distribution_row_needed),
                 greedy=bool(sampler.temperature <= 0),
                 rng=rng,
+                block_verify=_FABLE_BLOCK_VERIFY,
+                block=None if _bv is None else _bv.log_arrays(),
             )
         # Grammar clamp (#186 phase 3): drafts are proposed unmasked, so the
         # committed window must stop at the grammar's legal prefix. One
@@ -12537,6 +12586,11 @@ def generate_mtpk(
                 accept_prob = (
                     1.0 if q <= 0 and p > 0 else (0.0 if q <= 0 else min(1.0, p / q))
                 )
+                if _bv is not None:
+                    # Block verification: the CONDITIONAL accept probability
+                    # a_d = w_d / w_{d-1}, precomputed from the same rows.
+                    # Reduces to min(1, p/q) whenever the ladder is still at 1.
+                    accept_prob = _bv.accept_probability[depth_index]
                 _k20_coin = float(rng.random())
                 accepted_now = _k20_coin <= accept_prob
                 target_p_for_cache = (
@@ -12545,10 +12599,16 @@ def generate_mtpk(
                     and depth_index + 1 >= online_correction_cache_min_depth
                     else None
                 )
-                correction = (
-                    draft_token
-                    if accepted_now
-                    else sample_from_distribution(
+                if accepted_now:
+                    correction = draft_token
+                elif _bv is not None:
+                    # The block law's SCALED residual (c_{d-1}*p - q)+, one
+                    # rng.choice exactly as the shipped residual takes.
+                    correction = sample_from_distribution(
+                        _bv.scaled_residual(depth_index), rng
+                    )
+                else:
+                    correction = sample_from_distribution(
                         residual_distribution(
                             target_p_for_cache
                             if target_p_for_cache is not None
@@ -12557,7 +12617,6 @@ def generate_mtpk(
                         ),
                         rng,
                     )
-                )
             else:
                 target_p = (
                     target_distributions[depth_index]
@@ -12594,17 +12653,26 @@ def generate_mtpk(
                 accept_prob = compute_acceptance_probability(
                     target_p, draft_q, draft_token
                 )
+                if _bv is not None:
+                    # Block verification: see the batched branch above. `_bv`
+                    # is only ever built when every target row was already
+                    # materialised, so it is None on the lazy path that just
+                    # built `target_p` here.
+                    accept_prob = _bv.accept_probability[depth_index]
                 _k20_coin = float(rng.random())
                 accepted_now = _k20_coin <= accept_prob
                 _k20_target_row = target_p
                 target_p_for_cache = target_p
-                correction = (
-                    draft_token
-                    if accepted_now
-                    else sample_from_distribution(
+                if accepted_now:
+                    correction = draft_token
+                elif _bv is not None:
+                    correction = sample_from_distribution(
+                        _bv.scaled_residual(depth_index), rng
+                    )
+                else:
+                    correction = sample_from_distribution(
                         residual_distribution(target_p, draft_q), rng
                     )
-                )
                 if not accepted_now and _env_truthy("MTPLX_DELTA_TELEMETRY"):
                     # Tree Stage-0 pricing (2026-08-25): would a sibling branch
                     # have caught this rejection? Record the rank of the
@@ -12663,6 +12731,15 @@ def generate_mtpk(
                     accepted=bool(accepted_now),
                     correction=int(correction),
                 )
+            # Under MTPLX_FABLE_BLOCK_VERIFY this sum (and the per-draft
+            # `accept_probability` above) carries a_d = w_d / w_{d-1}, the
+            # CONDITIONAL probability that depth's coin accepts given the
+            # window reached it -- the same operational meaning min(1, p/q)
+            # has, and it still equals min(1, p/q) whenever the reach ladder
+            # is at 1. What it stops being is an estimator of the TV overlap
+            # beta_d: E[alpha] = beta is a property of min(1, rho) and does
+            # not survive the water-fill. Read `alpha_uncensored` out of
+            # scripts/fable/offline_block_verification.py for beta.
             accept_probability_sum_by_depth[depth_index] += float(accept_prob)
             if _draft_conf_trace:
                 # After the constraint clamp: attribute to the COMMITTED
