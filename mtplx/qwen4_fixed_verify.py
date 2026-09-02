@@ -10,7 +10,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from . import ple_candidate_prefetch
+from . import ple_boundary, ple_candidate_prefetch
 from .models.qwen4_exp import (
     _ngram_rows_np,
     compiled_verify_ple_scope,
@@ -585,6 +585,13 @@ def _build_fixed_m4_compiled_verify_aux(
         raise ValueError(
             f"qwen4 fixed-M4 sidecar auxiliary geometry mismatch: {observed}"
         )
+    # MTPLX_FABLE_PLE_BOUNDARY items `warm_skip` / `hot_block` / `timing`
+    # (default off).  Bound once per request, AFTER the geometry gate above:
+    # an unvalidated sidecar must never get a replaced gather.  Returns None
+    # and touches nothing when no item is armed.
+    _boundary_engagement = ple_boundary.bind_sidecar(sidecar)
+    if _boundary_engagement is not None:
+        print(_boundary_engagement, flush=True)
     mult, sizes, offs = embedding._np_consts()
     const_shapes = tuple(tuple(value.shape) for value in (mult, sizes, offs))
     if const_shapes != ((3,), (2 * observed[2],), (2 * observed[2],)):
@@ -640,6 +647,22 @@ def _build_fixed_m4_compiled_verify_aux(
             all_miss=owned_all_miss_rows,
         )
     )
+    # MTPLX_FABLE_PLE_BOUNDARY item `primary_vectorized` (default off).  The
+    # swap is here and not inside `_bind_fixed_m4_owned_row_prefetch` so that
+    # the shipped binder stays a closed function of `(sidecar, all_miss)` --
+    # `tests/test_qwen4_fixed_host_tokens_static.py` executes its SOURCE, and
+    # a lane reference in it would break that check on the control arm.  With
+    # the item disarmed the two names below are rebound to the same objects.
+    submit_owned_rows, install_owned_rows, _boundary_prefetch_engagement = (
+        ple_boundary.bind_owned_row_prefetch(
+            sidecar,
+            submit_primary=submit_owned_rows,
+            install=install_owned_rows,
+            names=("weight", "scales", "biases"),
+        )
+    )
+    if _boundary_prefetch_engagement is not None:
+        print(_boundary_prefetch_engagement, flush=True)
     prefetch_window_rows, resolve_window_rows = _bind_fixed_m4_window_prefetch(
         prompt_tail=prompt_tail,
         rows=rows,
