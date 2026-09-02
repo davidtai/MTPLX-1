@@ -66,6 +66,10 @@ from .fable_device_k20 import (
     target_support_device as _fable_device_k20_target,
 )
 from .fable_k20_log import is_enabled as _fable_k20_log_enabled, k20_log
+from .fable_mtp_kv_only import (
+    claim_model_route as _fable_mtp_kv_only_claim,
+    is_enabled as _fable_mtp_kv_only_enabled,
+)
 from .fable_depth4_probe import (
     is_enabled as _fable_depth4_probe_enabled,
     run_probe as _fable_run_depth4_probe,
@@ -393,6 +397,22 @@ _FABLE_DEVICE_K20 = _fable_device_k20_enabled()
 # costs ~1.6 ms on the ~31% of windows that accept all three drafts: an armed
 # run is a DATA run, not a timing run.  See ``mtplx/fable_depth4_probe.py``.
 _FABLE_DEPTH4_PROBE = _fable_depth4_probe_enabled()
+
+# MTPLX_FABLE_MTP_KV_ONLY_APPEND -- read ONCE at import (in
+# ``mtplx.fable_mtp_kv_only``), default OFF.  When off this constant is False,
+# no route is claimed, `_mtp_kv_only_append` stays False, and every append
+# passes `kv_only=False`, which `runtime.update_mtp_cache` does not even put in
+# its kwargs -- so the flag-off lane runs the code it ran before this module
+# existed.  When on (and the model is eligible -- `claim_model_route` RAISES
+# rather than reverting silently) the per-cycle history append computes only
+# what the MTP cache consumes: the indexer's raw/pooled writes and the
+# attention K/V write.  The QSA attention product, `q_proj`, `o_proj`, both
+# hyper-connection residual writes and the 512-expert MoE are skipped because
+# nothing reads the layer's hidden output -- `_append_mtp_history` binds it
+# only to feed `_eval`, which `MTPLX_LAZY_MTP_HISTORY_APPEND=1` (the turbo
+# profile) already skips.  Cache contents stay bit-identical; see
+# ``mtplx/fable_mtp_kv_only.py``.
+_FABLE_MTP_KV_ONLY_APPEND = _fable_mtp_kv_only_enabled()
 
 # MTPLX_FABLE_QSA_RESTORE_STAGING -- read once (lazily, then memoized), default
 # OFF. See ``mtplx/fable_qsa_restore_stage.py``: it promotes the three restored
@@ -6756,6 +6776,7 @@ def _append_mtp_history(
     position_offset: int | None = None,
     force_eval: bool = False,
     input_embeddings: mx.array | None = None,
+    kv_only: bool = False,
 ) -> float:
     if not token_ids:
         return 0.0
@@ -6778,8 +6799,15 @@ def _append_mtp_history(
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=position_offset,
             input_embeddings=input_embeddings,
+            kv_only=kv_only,
         )
     if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
+        return time.perf_counter() - started
+    if kv_only:
+        # MTPLX_FABLE_MTP_KV_ONLY_APPEND returns no hidden -- there is no
+        # layer output any more. The materialization this eval exists for is
+        # the cache state, which is now the append's only product.
+        _eval_cache_roots(mtp_cache)
         return time.perf_counter() - started
     _eval(hidden)
     return time.perf_counter() - started
@@ -9170,6 +9198,13 @@ def generate_mtpk(
         0,
         int(os.environ.get("MTPLX_MTP_HISTORY_MATERIALIZE_EVERY") or 0),
     )
+    # MTPLX_FABLE_MTP_KV_ONLY_APPEND (default off).  Claimed ONCE, here, before
+    # the first append: the decision is a property of the loaded model, not of
+    # any cycle, and an armed flag on an ineligible model raises instead of
+    # running the full append while wearing the candidate's label.
+    _mtp_kv_only_append = (
+        _fable_mtp_kv_only_claim(rt.model) if _FABLE_MTP_KV_ONLY_APPEND else False
+    )
     mtp_position_cap = max(
         0,
         int(os.environ.get("MTPLX_MTP_POSITION_CAP") or 4096),
@@ -9498,6 +9533,7 @@ def generate_mtpk(
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=mtp_position_offset_for_cache(mtp_cache),
             force_eval=force_eval,
+            kv_only=_mtp_kv_only_append,
         )
         if force_eval:
             mtp_history_materialize_events += 1
