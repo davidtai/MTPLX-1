@@ -1316,6 +1316,326 @@ L's table used) and 1.4 ms (K's fit for a *compiled* fixed-width row) — becaus
 neither is measured on an M=5 graph, and deciding whether to build one is the
 entire point.
 
+## micro_qsa_sparse_gqa.py — the native direct-index sparse-GQA kernel (B3)
+
+Standalone parity + timing for `mtplx.native.qsa_sparse_gqa`, MTPLX's port of
+oMLX's Steel-MMA `qwen4_qsa_sparse_gqa` (Jonathan Spangler, jundot/omlx
+`7467dce8`, Apache-2.0). Nothing in the model calls the kernel yet; this is the
+phase-1 falsifier from `scratchpad/M-holistic-tps-program.md` §B3, and the same
+kernel at M=4 / M=1 is K-Q2 / K-D6, so those cells are in the sweep too.
+
+Cells: `prefill-{16k,32k,64k}` at 4,096 rows, `decode-m4-16k`, `decode-m1-16k`.
+Arms, all fed one selection: the ported kernel per `(BK, DC)` tile, the shipped
+NAX `qsa_prefill_flash`, the portable `_qsa_prefill_gather_attention`, and the
+dense lane (`_qsa_blocks_to_dense_mask` + `_qsa_dense_attention`), which is
+also the numerics reference.
+
+Selection is the production `QSAIndexer._select_eager`, imported, not copied.
+The kernel derives per-slot validity in-kernel instead of reading `block_valid`,
+so the bench **asserts** the selector invariant that makes those identical
+(ascending ids, prefix validity, count `min(512, (pos+1)//4)`) on every row, and
+materialises both token lists in full on sampled rows, before it trusts a parity
+number. Tolerance is a stated bf16-ULP bar, not "looks close": this is a
+rounding-class change (fp32 online softmax vs bf16 scores + precise softmax).
+
+The extension has to be built first — CPU-only cmake, see
+`mtplx/native/__init__.py`. Phase-2 wiring plan:
+`docs/perf/qsa-sparse-gqa-phase2-wiring.md`.
+
+Guarded window (the default sweep is minutes of GPU, dominated by the dense arm;
+transient estimate per cell and refuses anything over `--max-transient-gb`):
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w50-qsa-sparse-gqa \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 \
+  --child-timeout-seconds 3600 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w50-qsa-sparse-gqa/scripts/fable/micro_qsa_sparse_gqa.py \
+    --out /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-qsa-sparse-gqa.json
+```
+
+GO bar (the program note's own falsifier): parity inside the ULP bar on every
+cell, identity assertions clean, and >=3x faster than `qsa_prefill_flash` on the
+queued lane at 4,096 rows. Then, and only then, the 32K ABBA.
+
+### Tests
+
+`tests/test_qsa_sparse_gqa_native.py` — CPU-only. Covers the binding's
+shape/dtype/position contract (MLX arrays are built but never evaluated) and
+the harness's own scoring logic on numpy inputs, including the cases where the
+identity check must fail.
+
+---
+
+## Shadow-draft acceptance (`shadow_draft_harness.py`)
+
+Instrument I3. It exists so that a change to the **draft proposal** — indexer
+reuse across depths, row K-D2, any cheaper way to compute the same draft step —
+is judged on acceptance from rows on disk instead of by a live A/B. The per-run
+acceptance spread is ±4.2 % (1σ, H §7): a 3-seed A/B cannot see a +2 % proposal
+effect, and every attempt to look for one costs two guarded windows.
+
+The number it produces, per depth, is the accept probability with **both** noise
+sources integrated out — the accept coin and the draw of the drafted token:
+
+```
+alpha_d = sum_y min(p_d(y), q_d(y))  =  E_{x~q_d}[min(1, p_d(x)/q_d(x))]
+```
+
+the same estimator `offline_depth4_gate.py` reports, so the columns line up.
+
+### How it runs: capture once, score forever
+
+**capture** (GPU, guarded) replays a `MTPLX_FABLE_K20_LOG` trajectory. The log
+carries `primary`, `draft_tokens`, `accepted` and `selected_token` per window,
+which *is* the committed stream, so the trajectory — and the request boundaries
+of a 3-seed log — reconstruct from the log alone. At every window the replay
+runs the draft chain **once per variant from the identical hidden state**,
+teacher-forced to the logged draft tokens, and writes each chain's rows.
+
+**score** (pure NumPy, no GPU, no lock) pairs each variant's rows against the
+same logged `p` rows and reports α₁..₃, the reach ladder, E[tokens/window] and
+the realised accept count under the logged uniform tape, with paired standard
+errors — i.i.d. and a moving-block bootstrap that keeps blocks inside a request,
+because windows within one request are serially correlated and the i.i.d. SE is
+a floor, not the interval.
+
+### Teacher forcing is the definition, not a shortcut
+
+`p_d` is `p(· | primary, x_1..x_{d-1})`: the logged target row at depth `d` is
+conditioned on the tokens the **logged** chain drafted. A free-running candidate
+that drafts a different token at depth 1 would be verified at depth 2 against
+the wrong distribution, and every number past that point would be fiction. So
+the candidate is forced onto the logged tokens: only `q_d` moves, `p_d` stays
+exactly the row it is verified against, every depth is scored exactly.
+
+Forcing isolates the divergence rather than hiding it. The report prints
+`P(diverge)` per depth — how often the candidate would have drafted a different
+token — from the logged draft tape on the `stock_device_k20` / `pr391_raw`
+layouts, and from the row's argmax (a weaker question, labelled as such) on the
+host stock layouts, which consume the draw inside `rng.choice` and never surface
+it. Near zero means measured; 0.3 means the depth-2 and depth-3 numbers describe
+a chain the model would often not have taken.
+
+### What it can and cannot judge
+
+**Can** — anything that alters only the draft proposal `q`: the drafter's
+arithmetic, fusion, caching or scheduling (`MTPLX_FABLE_INDEXER_REUSE`, row
+K-D2, compiled draft support, a cheaper QSA indexer, a different MTP hidden
+variant); draft-side shaping; anything whose whole claim is "same output law,
+cheaper or better `q`".
+
+**Cannot**, and it does not pretend to:
+
+- anything that changes **`p`** — the target model, its quantisation, its
+  shaping, the verify graph's numerics. The logged rows would no longer be the
+  rows the candidate faces and nothing here would notice.
+- anything that changes the **accept law** — block verification, a different
+  clip, a residual change. That is `offline_block_verification.py`, which
+  replays laws against fixed rows: the mirror image of this harness.
+- anything that changes the **window shape** — depth, adaptive width, gated
+  stop, a 4th draft step. That is `offline_depth4_gate.py`.
+- **wall time.** Acceptance is not tok/s. A candidate that wins α and costs
+  2 ms/window loses. This prices nothing; multiply E[tok/win] by the ledger's
+  ms/window yourself.
+- a change that only fires **off** the logged trajectory — a different prompt,
+  sampler or context length.
+- a **greedy** run: `temperature <= 0` builds no distributions, so those windows
+  are skipped and counted.
+
+`offline_draft_temperature.py` already answers the draft-temperature question
+from the log alone, with no replay and no GPU at all. Prefer it for that one.
+
+### The gate that makes the rest trustworthy
+
+Variant 0 is always `stock`: the same proposal path the logged run used,
+re-drafted through the replay. Its rows must reproduce the logged `q` rows. The
+scorer measures that as a total-variation distance per row and **withholds the
+verdict** above `--fidelity-tol` (default 1e-6). A wrong hidden state, cache
+offset, shaping or id space moves that distance far above the tolerance, so a
+broken replay reports FAIL rather than a number. `build_replay_hooks` — the one
+function in the file that touches MLX — was written without a GPU, and this gate
+is what validates it on first run; the piece most likely to need adjustment is
+the MTP-history restage in `advance`, which production does through
+`generate_mtpk`'s nested `reconcile_mtp_indexer_history` (`generation.py:9650`).
+
+The same gate catches the opposite failure. A candidate whose rows are
+bit-identical to stock on every window reports **DID NOT ARM**: its flag is read
+at import or at runtime construction, not per draft call, so the env scope
+around the chain did nothing. Those need `--variant-module dotted:factory` (a
+`ProposalVariant` with a `call` context manager) or two capture processes scored
+against one log.
+
+### Running it
+
+Capture is a GPU job and rides the same guard as everything else here. Score is
+pure NumPy — re-run it as often as you like, anywhere, off the lock.
+
+```
+# 1. capture the trajectory (the usual 3-seed ABBA run, with the K20 log armed)
+python scripts/fable/abba_driver.py \
+    --source $PWD --label fable-w47-shadow --sequence <seq> \
+    --seed 20260829 --seed 20260830 --seed 20260831 \
+    --target-mode batched --require-compiled-verify --m4-stage3 \
+    --qsa-fused-kv-gather --full-frspec --compiled-mtp-prepare --max-tokens 1024 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE=1 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL=1 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_GLU=1 \
+    --env MTPLX_FABLE_K20_LOG=$PWD/.benchmark-artifacts/fable/k20-shadow-3seeds.npz
+
+# 2. price the shadow capture before you book the window (no GPU)
+python scripts/fable/shadow_draft_harness.py \
+    .benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --variant indexer-reuse=MTPLX_FABLE_INDEXER_REUSE=1 --budget
+```
+
+The guarded capture-and-score, 3 seeds, with a placeholder variant env — the
+flag does not have to exist yet; `DID NOT ARM` is the answer you get if it is
+not read per draft call:
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/shadow_draft_harness.py \
+    /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --capture-to /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-3seeds.npz \
+    --model /Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
+    --variant indexer-reuse=MTPLX_FABLE_INDEXER_REUSE=1 \
+    --expect-segments 3 \
+    --budget \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-3seeds.json
+```
+
+`--expect-segments 3` asserts the reconstruction found three requests; if it
+finds two the trajectory does not match the run and the harness refuses to
+replay it. Re-scoring afterwards needs no GPU and no guard:
+
+```
+python scripts/fable/shadow_draft_harness.py \
+    .benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --rows .benchmark-artifacts/fable/shadow-3seeds.npz --budget
+```
+
+Budget, at the defaults (38.7 ms/window verify forward from L §3, 5 ms/draft
+chain, 4 s prefill) over ~1,110 windows in 3 segments: ~22 s of GPU per seed for
+stock + one candidate, ~66 s total, of which the *marginal* cost of adding a
+second candidate is ~5.6 s. All three numbers are assumptions, printed with the
+estimate; `--ms-per-window` / `--chain-ms` / `--prefill-s` move them.
+
+### Tests
+
+`tests/test_fable_shadow_draft_harness.py`, pure host, no MLX import — and one
+test proves none is possible: every device-side import in the module lives
+inside `build_replay_hooks`, checked by AST. It covers the segment
+reconstruction (carry-in break, stop-token end, three seeds), the acceptance law
+(exact match, disjoint support, a hand-computed Σ min, exact ties), the
+depth-conditional reach ladder against the marginal α, `E[tokens/window]` with
+and without a bonus, the realised accept count against a uniform tape, the
+fidelity gate in both directions (PASS, FAIL → verdict withheld, DID NOT ARM),
+the zero-variance paired delta a uniform candidate shift must produce, the
+bootstrap's determinism, the budget arithmetic, the replay's call ordering under
+a stub hook, and the report's rendering.
+
+---
+
+## Indexer reuse across the draft chain (`MTPLX_FABLE_INDEXER_REUSE`)
+
+Row K-D2. Every depth of the 3-step MTP draft chain re-derives the QSA block
+selection for a single query row — query norm + partial RoPE, a score GEMM over
+all ~4,352 pooled blocks at 16K, relu/head-sum/mask/tie-break, `argpartition` to
+top-512, blocks→tokens, the K/V gather. ~40 dependent dispatches, three times a
+cycle, on a chain where nothing overlaps. Depths 2 and 3 pay it in full to
+re-rank a history that grew by one token.
+
+Armed, depth 1 selects normally and depths 2..3 are handed
+`S_d = S_1 ∪ {b : nb_1 ≤ b < nb_d}` — the depth-1 block set plus the block the
+chain's own tokens completed — and skip the preparation, the GEMM and the top-k.
+`nb_d = (pos_start_d + 1) // ratio`; with `ratio = 4` and depth 3 at most one
+block can complete inside a cycle, so one extra slot is exact rather than an
+approximation, and the flag raises past `depth - 1 ≤ ratio`. The raw-key write
+and the pooled-block bank update still run at every depth, so the cache the
+verifier and the next cycle read is unchanged. Design and the causal /
+valid / superset argument: `mtplx/fable_indexer_reuse.py`.
+
+This moves the draft proposal `q` only — not `p`, not the verify graph, not the
+accept law — so exact speculative sampling still holds and the output
+distribution is unchanged. **Output digests WILL differ between the ABBA arms.**
+A different `q` draws different tokens from the same law; a digest mismatch here
+is the expected result, not a defect, and it is the reason the acceptance
+question is answered offline instead of by reading tok/s alone.
+
+An armed flag that meets a lane it cannot serve (`MTPLX_QSA_FLASH`,
+`MTPLX_QSA_GATHER_DECODE`, the compiled or legacy-fused indexer,
+`MTPLX_FABLE_COMPILED_DRAFT`) **raises**. It never reverts to the stock chain,
+because a silent revert would put a stock number under the flag's label.
+
+### (a) Acceptance — the guarded shadow capture, 3 seeds
+
+`--variant NAME=KEY=VAL` arms the env around each draft-chain call, and the gate
+is read per call precisely so that works; a `DID NOT ARM` verdict here would
+mean the flag had been cached at import or at construction. Capture the
+trajectory first (step 1 of the shadow-draft section above), then:
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/shadow_draft_harness.py \
+    /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --capture-to /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-indexer-reuse-3seeds.npz \
+    --model /Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
+    --variant indexer-reuse=MTPLX_FABLE_INDEXER_REUSE=1 \
+    --expect-segments 3 \
+    --budget \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-indexer-reuse-3seeds.json
+```
+
+Read the fidelity line first: above `--fidelity-tol` the verdict is withheld and
+the α numbers mean nothing. Re-scoring needs no GPU and no guard.
+
+### (b) Cycle time — ABBA
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 36000 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/abba_window.py \
+    --sequence 1788500001 \
+    --order ABBA \
+    --label-prefix fable-indexer-reuse \
+    --candidate-extra-env MTPLX_FABLE_INDEXER_REUSE=1
+```
+
+Each arm receipt row carries `indexer_reuse: {armed, cycles, steps_reused}`.
+On the candidate `steps_reused` must be `2 * cycles` (depth 3, two reusing
+depths); a shortfall means some cycles re-anchored and the ms/window delta is
+not the lane's full effect. On the control both counters are 0, which is what
+"the control really was the control" looks like.
+
+Expected: **−0.5..−0.8 ms/window** if acceptance holds within noise. Acceptance
+is not tok/s: a candidate that wins ms/window and loses α can still lose
+end-to-end, so read (a) and (b) together — E[tokens/window] × ms/window.
+
 ## B1 — expert-major (super-chunk) prefill MoE
 
 The prefill census (`scratchpad/J-prefill-attribution.md` §2.2) puts the routed
