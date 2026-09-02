@@ -56,6 +56,17 @@ CONTROL_FLAGS: tuple[str, ...] = (
     "--max-tokens",
     "1024",
 )
+#: ``--max-tokens`` inside :data:`CONTROL_FLAGS`.  Both arms always carry the
+#: same value, so it belongs to the shared baseline rather than either arm.
+DEFAULT_MAX_TOKENS = 1024
+
+#: ``--prefill-only``: enough decode to produce a real first token and a
+#: non-degenerate ``decode_tok_s``, few enough that the arm is dominated by
+#: prefill.  ``prefill_tok_s`` / ``prompt_eval_time_s`` / ``ttft_s`` are
+#: recorded per row either way; this just stops paying 1,024 tokens of decode
+#: for a prefill-only question.
+PREFILL_ONLY_MAX_TOKENS = 64
+
 CONTROL_CANDIDATE_ENV: tuple[str, ...] = (
     "MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE=1",
     "MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL=1",
@@ -167,6 +178,36 @@ def build_arm_argv(
     for setting in extra_env:
         argv.extend(["--env", setting])
     return argv
+
+
+def resolve_max_tokens(
+    max_tokens: int | None, prefill_only: bool
+) -> int:
+    """The generated-token budget both arms carry.
+
+    ``--max-tokens`` always wins, so ``--prefill-only --max-tokens 256`` is a
+    coherent request rather than a silently ignored one.
+    """
+
+    if max_tokens is not None:
+        if max_tokens < 1:
+            raise ValueError(f"--max-tokens must be >= 1, got {max_tokens}")
+        return int(max_tokens)
+    return PREFILL_ONLY_MAX_TOKENS if prefill_only else DEFAULT_MAX_TOKENS
+
+
+def control_flags(max_tokens: int) -> list[str]:
+    """:data:`CONTROL_FLAGS` with its ``--max-tokens`` value replaced.
+
+    Replaced, never appended: the driver's parser would take the last of two
+    ``--max-tokens`` and the receipt would disagree with the command line the
+    window printed.
+    """
+
+    flags = list(CONTROL_FLAGS)
+    index = flags.index("--max-tokens")
+    flags[index + 1] = str(int(max_tokens))
+    return flags
 
 
 def merge_env_settings(
@@ -591,6 +632,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Non-MTPLX process env for arm B only (adds to --control-extra-env).",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Generated tokens per arm on BOTH arms "
+            f"(default {DEFAULT_MAX_TOKENS}; "
+            f"{PREFILL_ONLY_MAX_TOKENS} under --prefill-only)."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-only",
+        action="store_true",
+        help=(
+            "Measure prefill cheaply: drop --max-tokens to "
+            f"{PREFILL_ONLY_MAX_TOKENS} on both arms. The driver still records "
+            "prefill_tok_s, prompt_eval_time_s and ttft_s per row; decode_tok_s "
+            "from such a short window is diagnostic only. An explicit "
+            "--max-tokens still wins."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the planned arm command lines and exit without the GPU.",
@@ -631,6 +693,9 @@ RESERVED_ARM_FLAGS = frozenset(
         "--candidate-env",
         "--env",
         "--thermal-gate-max-c",
+        # The window owns this one now (--max-tokens / --prefill-only); an arm
+        # flag repeating it would put two values on the driver command line.
+        "--max-tokens",
     }
 )
 
@@ -658,16 +723,19 @@ def arm_specification(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
 
     check_arm_flags(args.control_flag)
     check_arm_flags(args.candidate_flag)
+    base = control_flags(
+        resolve_max_tokens(args.max_tokens, args.prefill_only)
+    )
     return {
         "A": {
-            "flags": [*CONTROL_FLAGS, *args.control_flag],
+            "flags": [*base, *args.control_flag],
             "candidate_env": merge_env_settings(
                 CONTROL_CANDIDATE_ENV, args.control_env
             ),
             "extra_env": merge_env_settings((), args.control_extra_env),
         },
         "B": {
-            "flags": [*CONTROL_FLAGS, *args.control_flag, *args.candidate_flag],
+            "flags": [*base, *args.control_flag, *args.candidate_flag],
             "candidate_env": merge_env_settings(
                 CONTROL_CANDIDATE_ENV, [*args.control_env, *args.candidate_env]
             ),
