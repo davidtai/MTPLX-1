@@ -946,6 +946,217 @@ the SSE folding arithmetic. No server, no MLX, no Metal.
 
 ---
 
+## Long-prompt agreement screen (prefill numerics)
+
+`longprompt_agreement_screen.py` is the quality gate for changes to the
+**prefill** path — the chunk width (`MTPLX_PREFILL_CHUNK_SIZE`), the blocked
+GDN prefill (`MTPLX_GDN_BLOCKED_PREFILL`), the QSA query tile
+(`MTPLX_FABLE_PREFILL_QSA_QUERY_TILE`), mask fusion. The HumanEval screen
+cannot gate any of them: every HumanEval prompt is a few hundred tokens, so it
+fits inside ONE prefill chunk and never crosses a boundary. HumanEval passing
+says nothing about a chunk-boundary bug.
+
+The measurement is greedy agreement. At `temperature 0` the server takes a bare
+`mx.argmax` (`_make_sampler`), so the continuation is a deterministic function
+of the prefill: numeric drift big enough to flip one argmax shows up as a
+divergence, and everything after it is permanently different. The metric is
+therefore the **exact-match prefix length**, not "agreement over 256
+positions" — after the first mismatch the two arms are answering different
+questions.
+
+### The prompts
+
+Eight per run by default, built by the same generator and from the same pinned
+fixture as the ABBA `coding-16k-1k-xhigh-t1` cell
+(`abba_driver.production_prompt_content`, SHA-256 pinned; the screen calls it
+purely as the drift gate before building its own):
+
+| name | seed | target tokens | at 2,048 | at 4,096 |
+| --- | --- | --- | --- | --- |
+| `long-16k-s20260829`..`s20260834` | 20260829..20260834 | 16,384 | 8 chunks | 4 chunks |
+| `mid-9k` | 20260835 | 9,216 | 4 + 1,024 | 2 + 1,024 |
+| `short-4k5` | 20260836 | 4,608 | 2 + 512 | 1 + 512 |
+
+`abba_window.PRODUCTION_SEEDS` are **sampler** seeds and the ABBA cell is one
+fixed prompt; greedy decoding has no sampler seed, so this screen reuses those
+integers as **prompt** seeds — each rotates the pinned coding context by a
+different number of lines before the length-targeting builder cuts it. Same
+material, same builder, six distinct 16K prompts, so one divergence cannot be
+a single prompt's fluke. Seven of the eight land exactly on their target
+(`--dry-run` prints the real counts, tokenizer only, no GPU); `short-4k5`
+oscillates between 4,607 and 4,609 because one context token can be worth two
+at the seam, which `PROMPT_TOKEN_TOLERANCE = 8` accepts.
+
+Both short prompts end in a ragged chunk, which the 16K cell — a multiple of
+both widths — never exercises. What these sizes do NOT give is a final chunk
+of a different WIDTH in the two layouts: both tails are 512-aligned, so the
+last chunk starts at the same offset either way. That needs `n % 4096 >= 2048`
+(7,168, say: a 1,024 tail at 2,048 against a 3,072 tail at 4,096) and is a
+reasonable thing to add to `SHORT_PROMPTS` if a boundary bug is suspected.
+
+### The three arms
+
+One guarded window per arm, ONE MTPLX server on **:8093** (8091 is the
+HumanEval screen, 8092 the TTFT screen; never :8080). `--print-commands`
+prints these verbatim:
+
+```
+# control
+/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 --timeout-seconds 900 --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/longprompt_agreement_screen.py \
+    --label control --n 6 --port 8093
+
+# candidate: prefill chunk 4,096
+/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 --timeout-seconds 900 --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/longprompt_agreement_screen.py \
+    --label chunk4096 --n 6 --port 8093 \
+    --env MTPLX_PREFILL_CHUNK_SIZE=4096 --env MTPLX_QSA_PREFILL_COMPILE_ROWS=4096
+
+# candidate: blocked GDN prefill
+/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 --timeout-seconds 900 --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/longprompt_agreement_screen.py \
+    --label gdnblocked --n 6 --port 8093 --env MTPLX_GDN_BLOCKED_PREFILL=1
+```
+
+Run the control TWICE (`--label control` and `--label control-2`) if you want
+the noise floor; see the scoring section.
+
+`MTPLX_PREFILL_CHUNK_SIZE` and `MTPLX_QSA_PREFILL_COMPILE_ROWS` **must move
+together**. `mtplx/models/qwen4_exp.py` only serves the compiled QSA prefill
+graph when `rows == _qsa_prefill_compile_rows()`, so moving the width alone
+demotes every full chunk to the eager selector and the arm scores a lane
+nobody proposed. `assert_candidate_env_coherent` refuses the pair before the
+model loads (`mtplx.fable_prefill_chunk.assert_prefill_chunk_coherent` refuses
+it again inside the server).
+
+### Environment and memory
+
+The lane is `humaneval_screen.CONTROL_FAMILY_ENV` — the ABBA control family,
+stated in full — because these candidates are ABBA candidates and
+`abba_window` measures their SPEED against exactly that lane. `--env` keys
+must start with `MTPLX_` (`humaneval_screen.parse_env_settings`); there is no
+`MTPLX_FABLE_*`-only restriction to work around, and all three keys used here
+are registered in `mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS`.
+`MTPLX_PREFILL_CHUNK_SIZE` is also in `PROFILE_ENV_USER_OVERRIDE_KEYS`, so the
+turbo profile's `auto` cannot stomp the candidate's `4096`; the other two are
+absent from the turbo profile entirely.
+
+On top of the family the screen exports the **Metal allocator caps**, the same
+values `abba_driver` uses:
+
+```
+MTPLX_MEMORY_LIMIT_BYTES = 96 GiB
+MTPLX_WIRED_LIMIT_BYTES  = 90 GiB
+```
+
+Neither `humaneval_screen` nor `ttft_screen` sets these, which is safe at their
+prompt sizes and **not** safe here. Unset, `_apply_metal_memory_caps` lands on
+60% of 128 GiB = 76.8 GiB, raised to the qwen4_exp resident floor (~83.3 GiB),
+while a 16K prefill at chunk 4,096 peaks around 92.7 GB (~86.3 GiB) — over the
+cap, and Metal's forced eviction is the documented ~10x serve collapse. The
+candidate arm would have been scored on a machine that was swapping. Setting
+the wired limit also ARMS `mtplx.fable_prefill_chunk`'s construction-time
+geometry guard, whose budget is exactly `MTPLX_WIRED_LIMIT_BYTES` when no
+explicit budget is set: 90 GiB minus the 2 GiB margin = 88 GiB, which the
+projected peak clears. Unset, that guard is inert.
+
+`--ssd-session-cache off` matters more here than in the other screens: a
+cross-request session cache could serve arm B's 16K prefill out of arm A's KV,
+which is the one thing that would make a broken prefill look identical.
+
+### logprobs: not available on this build, and why not faked
+
+`/v1/chat/completions` **rejects** `logprobs`/`top_logprobs` with a 400
+("support is planned" — `mtplx/server/openai.py`), so the screen requests
+`n=1` greedy tokens only and records that fact in the receipt's `logprobs`
+block. It probes once per run, so the day chat logprobs land the screen starts
+recording top-5 without an edit.
+
+The one endpoint that does emit per-position top-K is `/v1/completions` with
+`echo=true, logprobs=k, max_tokens=0`. It is the **wrong instrument here**:
+`mtplx/generation.py:score_prompt_logprobs` teacher-forces the prompt in its
+own fixed 256-token chunks, so it never reaches the prefill chunker or the
+4,096-row QSA graph this screen exists to gate (and it caps out at
+`MTPLX_PROMPT_SCORE_MAX_TOKENS`, 8,192, well under a 16K prompt). Wiring it in
+would have produced confident-looking numbers about code that did not run.
+
+### Scoring and the verdict rule
+
+Pure Python, no GPU, no MLX, no tokenizer:
+
+```
+.venv/bin/python scripts/fable/longprompt_agreement_screen.py \
+  --score .benchmark-artifacts/fable/longprompt/control.json \
+          .benchmark-artifacts/fable/longprompt/chunk4096.json \
+          [.benchmark-artifacts/fable/longprompt/control-2.json]
+```
+
+Per prompt: exact-match prefix length, whether the two arms are identical, and
+— when the divergence position has logprobs behind it — the control's **top-2
+margin** there, which is the rounding-class signature (two candidates the model
+could not separate, so which one wins is decided by the last bit of the
+reduction). Aggregate: median / min prefix length, the fraction of prompts with
+full agreement, and the mean per-position top-1 logprob |Δ| over the agreeing
+prefixes.
+
+**VERDICT**
+
+- With logprobs: **PASS** if every divergence sits at a near-tie (control top-2
+  margin `< 0.05` nats, `--near-tie-nats`) **AND** the mean top-1 logprob |Δ|
+  over the agreeing prefixes is `< 0.02` (`--max-logprob-delta`). Otherwise
+  **FLAG**, naming the prompt and position.
+- Without logprobs (this build): **PASS** only when every prompt agrees for its
+  full length. A divergence with no margin behind it cannot be shown to be a
+  near-tie, so it is FLAGged for human review rather than excused. The FLAG
+  carries the character window around the split — shared tail, then each arm's
+  next 80 characters — so the reviewer can see what actually changed.
+
+Exit code is 0 on PASS and 1 on FLAG. `--json` prints the full report.
+
+A third receipt is read as a **second control** and reported as the run-to-run
+noise floor. Greedy decoding is deterministic, so control-vs-control that is
+not 100% identical means the lane itself is nondeterministic and the candidate
+comparison above it is void — the scorer says exactly that.
+
+Receipts land in `.benchmark-artifacts/fable/longprompt/<label>.json`: the flag
+sets (candidate, family, Metal caps), the model revision, the guard receipt,
+the prompt table with per-prompt SHA-256, the per-prompt completions with the
+server's `usage`, and a server log tail. `results.jsonl` in
+`longprompt/<label>/` is the resume file; `--label` plus `arm.json` refuses to
+append one arm's completions to another's.
+
+### Tests
+
+```
+cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps
+.venv/bin/python -m pytest tests/test_fable_longprompt_screen.py -q
+```
+
+Pure host tests (73): argv/env construction, the chunk-width/compile-rows
+coherence rule, the Metal caps checked against `abba_driver.py`, the candidate
+keys checked against `mtplx/profiles.py` (so a rename breaks the test rather
+than the measurement), the chunk-boundary arithmetic that justifies the prompt
+sizes, prompt sizing against a fake tokenizer, the logprobs probe in all three
+outcomes, and every branch of the scorer and the verdict rule. No server, no
+MLX, no Metal, no network.
+
+---
+
 ## micro_k20_select.py — is the K20 selector exposed, or is it graph tail?
 
 `MTPLX_FABLE_DEVICE_K20` (`mtplx/fable_device_k20.py`) replaces four per-cycle
