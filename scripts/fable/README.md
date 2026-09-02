@@ -677,15 +677,39 @@ so neither does the control arm.
 Candidates — same command with one of:
 
 ```
-    --label boundary32 --gdn-boundary-max 32
+    --label nearprefix --env MTPLX_FABLE_NEAR_PREFIX_RESTORE=1
     --label qsastage   --env MTPLX_FABLE_QSA_RESTORE_STAGING=1
     --label protterm   --env MTPLX_FABLE_PROTECTED_TERMINAL=1
+    --label boundary32 --gdn-boundary-max 32
 ```
 
-Run `--gdn-boundary-max 32` **first**. Per the audit it is the cheapest lever
-by a wide margin: one env var, MB per boundary against ~24 GiB of headroom, and
-it attacks the actual failure (`NO_SNAPSHOT_COVERAGE`, from only 8 retained
-boundaries per entry) directly. If it closes arm D, the rest is unnecessary.
+**Run `nearprefix` first.** The 2026-09-01 control receipt
+(`.benchmark-artifacts/fable/ttft/control.json`) measured
+`rerendered_terminal` at **15.79 s against `matching_terminal`'s 0.217 s**, on
+all three repeats, with `cached=0` and `session_restore_mode: "cold"`. Root
+cause, from that receipt's own `session_bank` block:
+
+* the bank auto-sized to its **1 GiB floor** (`session-bank budget: 1.0G total
+  (auto: machine memory plan...), model weights 107.1G` — production's
+  resolution on this box too);
+* a 19K-token entry's base snapshot is ~711 MB and each GDN boundary record
+  ~87–101 MB, so an 8-record payload is ~700–810 MB;
+* `SessionBank.put` counts that payload into `entry_nbytes` and then refuses
+  the **entire** entry — `skipped_oversized_snapshot` at 1,398,321,776 and
+  1,520,850,304 bytes against a 1,073,741,824 budget — while the same turn's
+  boundary-**less** commit (710,255,120) was admitted;
+* so the bank only ever held boundary-less entries (the survivor reports
+  `gdn_boundaries: []`), `recurrent_boundary_at_or_below()` returned None, the
+  near-prefix lane rejected every candidate with `boundary_not_better:0`, and
+  the turn fell through to a cold prefill.
+
+`MTPLX_FABLE_NEAR_PREFIX_RESTORE=1` sheds boundary records until the entry
+fits instead of dropping it. Watch `session_bank.boundary_shed_puts` in the
+receipt: > 0 means entries that used to be refused are now being admitted.
+
+`--gdn-boundary-max 32` is the audit's suggested "cheapest lever", and under
+that bug it makes things **worse** — a bigger payload triggers the refusal
+harder. Only run it *after* `nearprefix`, on top of it.
 
 `--dry-run` prints the exact outer command and the server argv without
 touching the GPU.
@@ -708,14 +732,30 @@ Per scenario: median, min, max and **p95**. p95 is not decoration — the
 `b5fac4ac` phase-3 falsification was a tail result (27.6 s worst stall) that
 medians hid completely.
 
-Parity: every scenario's `output_sha256` is recorded, plus
-`output_deterministic` across repeats and `assistant_turn_sha256` for the
-cold turn. Two arms are only comparable when the cold sha matches, because
-turns 2 and 3 embed that text. Check it before reading any TTFT delta.
+Parity: `output_sha256_by_repeat` is the cross-arm key — ordered by repeat,
+never a set, because each repeat carries its own salt and therefore its own
+prompt. `assistant_turn_sha256` is recorded for the cold turn as well: turns 2
+and 3 embed that text, so two arms are only comparable when it matches. Check
+both before reading any TTFT delta.
 
-The receipt also carries the `session_bank` block from `/v1/mtplx/snapshot`,
-which is where `protect_newest_extending` / `protected_rejections` show whether
-`MTPLX_FABLE_PROTECTED_TERMINAL` actually engaged.
+`--salt-seed` must be **identical across arms** (it defaults to the fixed
+`fable-ttft-v1`, deliberately not a timestamp — a per-run seed makes two arms
+measure two different prompts). Change it only to force genuinely cold SSD
+rows, and then change it for every arm.
+
+The receipt also carries the `session_bank` block from `/v1/mtplx/snapshot` —
+`prefixes[].gdn_boundaries` (the field that read `[]` in the control run),
+`recent_evictions` (where `skipped_oversized_snapshot` and `shed_gdn_boundaries`
+appear), `protect_newest_extending` / `protected_rejections` for
+`MTPLX_FABLE_PROTECTED_TERMINAL`, and `boundary_shed_puts` /
+`boundary_shed_records` for `MTPLX_FABLE_NEAR_PREFIX_RESTORE`.
+
+One reporting trap to know: `cache_miss_reason` on a missed warm turn reads
+`ssd_prefix_miss`, which is stamped by the SSD lookup inside
+`session_bank.restore()` — that runs *after* the RAM near-prefix lane has
+already returned None (generation.py tries near-prefix first). The SSD reason
+therefore MASKS the real RAM-lane verdict. Use
+`--env MTPLX_DEBUG_PREFIX_DIVERGENCE=1` to see it.
 
 Add `--env MTPLX_DEBUG_PREFIX_DIVERGENCE=1` on a first pass: the server log
 then prints `boundary-miss: entry_len=… matched=… boundary_positions=[…]` and

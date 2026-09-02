@@ -404,8 +404,9 @@ def test_summary_reports_median_and_p95_and_parity():
             },
             "usage": {"prompt_tokens": 16_384},
             "output_sha256": "abc",
+            "repeat": repeat,
         }
-        for value in (0.5, 0.6, 2.9)
+        for repeat, value in enumerate((0.5, 0.6, 2.9), start=1)
     ]
     summary = ttft.summarize_scenarios(rows)["rerendered_terminal"]
     assert summary["repeats"] == 3
@@ -413,11 +414,13 @@ def test_summary_reports_median_and_p95_and_parity():
     assert summary["visible_ttft_s"]["max"] == 2.9
     assert summary["visible_ttft_s"]["p95"] > summary["visible_ttft_s"]["median"]
     assert summary["model_ttft_s"]["median"] == pytest.approx(0.55)
-    assert summary["output_deterministic"] is True
+    assert summary["output_sha256_by_repeat"] == ["abc", "abc", "abc"]
     assert summary["cached_tokens"] == [16_000]
 
 
-def test_summary_flags_non_deterministic_output():
+def test_summary_orders_shas_by_repeat_for_cross_arm_parity():
+    """A set would be useless: each repeat has its own salt, so shas differ."""
+
     rows = [
         {
             "scenario": "cold",
@@ -425,10 +428,21 @@ def test_summary_flags_non_deterministic_output():
             "server": {"ttft_s": 1.0},
             "usage": {"prompt_tokens": 10},
             "output_sha256": sha,
+            "repeat": repeat,
         }
-        for sha in ("abc", "def")
+        # Deliberately out of order: the summary must sort by repeat.
+        for repeat, sha in ((2, "def"), (1, "abc"))
     ]
-    assert ttft.summarize_scenarios(rows)["cold"]["output_deterministic"] is False
+    summary = ttft.summarize_scenarios(rows)["cold"]
+    assert summary["output_sha256_by_repeat"] == ["abc", "def"]
+
+
+def test_salt_seed_default_is_stable_across_arms():
+    """A timestamped default made two arms run two different prompts."""
+
+    assert ttft.DEFAULT_SALT_SEED == "fable-ttft-v1"
+    parsed = ttft.build_parser().parse_args(["--label", "x"])
+    assert parsed.salt_seed is None  # resolved to the constant in main()
 
 
 # --------------------------------------------------------------------------
