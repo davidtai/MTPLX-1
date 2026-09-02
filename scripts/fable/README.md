@@ -659,6 +659,49 @@ runs inside `install_qwen4_fixed_verify_route` -- model build, outside any
 `mx.compile` trace. `mtplx.fable_verify_glue.engagement()` carries the
 counters; `qk_calls` / `prep_calls` are the line to read first.
 
+### Proving the arm ran
+
+The 2026-09-02 W70 ABBA came back with the flag armed and **no evidence either
+way**: no engagement line, no contract error, no counters. The cause was not
+the lane -- it was that `logger.info` is invisible in a driver run.
+`[qwen4-fixed-M4-verify]` and `[qwen4-compiled-MTP-prepare]` are missing from
+that same log for the same reason, while
+`[MTPLX_FABLE_GRAPH_BUILD_OVERLAP] armed:` (a plain `print`) is there.
+
+So the lane now proves itself three ways, and the driver refuses to report an
+arm that cannot:
+
+1. **stderr, at install.** One line per item plus a JSON summary:
+
+   ```
+   [fable] verify-glue qsa_rope: on, layers=12, dispatches/layer 16->1, ...
+   [fable] verify-glue qsa_rope_idx: on, layers=12, dispatches/layer 12->1, ...
+   [fable] verify-glue install: {"installed": ["qsa_rope", ...], "layers": 12, ...}
+   ```
+
+   An item that disabled itself prints `off (<reason>)` instead.
+
+2. **A construction-time assertion**, before the decode run, so a broken arm
+   dies in seconds rather than after a full window.
+
+3. **A `verify_glue` block on the receipt row**, re-read *after* the run so
+   the hot-path call counters are populated: `selected`, `installed`,
+   `disabled` (with reasons), `pending`, `layers`, `rows`, `calls`
+   (`qk_calls` / `k_only_calls` / `prep_calls`), `probe_runs`,
+   `probe_failures`, `install_report`.
+
+Every way of failing to engage is fatal to the arm: the install hook never ran
+(inert flag), every selected item disabled (a real finding, not a benchmark),
+or an installed item with **zero calls** (it never entered the graph). The
+receipt-time check is deliberately lenient so the block still lands on disk,
+and the driver raises immediately after writing it -- the evidence for why an
+arm was unreadable is more useful on disk than in a traceback alone.
+
+Read `calls` first. `qk_calls` and `prep_calls` count TRACES, not decode
+cycles (under `mx.compile` the Python body runs once per retrace and the C++
+replay never touches it), so read them as "did this lane get into the graph",
+never as a cycle count.
+
 ### micro_verify_glue_a.py
 
 Price the items before spending an ABBA window. One verify cycle's worth of
