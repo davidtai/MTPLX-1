@@ -234,6 +234,52 @@ Pair it with `--candidate-extra-env MTPLX_CONTEXT_COPY_PROBATION_K=16` to let
 proven lanes reach the wider cap sooner; run six seeds, because the effect sits
 near the corrected metric's 0.3-0.7% noise floor.
 
+### Recipe: fuse the dense QSA prefill attention
+
+```
+    --candidate-extra-env MTPLX_FABLE_PREFILL_MASK_FUSE=1 \
+    --candidate-env MTPLX_QSA_PREFILL_DEBUG=1
+```
+
+At `head_dim` 256 MLX's own heuristic declines the fused `steel_attention`
+kernel, so every dense QSA prefill layer materializes an `[H, S, T]` bf16
+score tensor, masks it, softmaxes it twice and re-reads it for `P@V`. The
+flag passes `force_fused=True` instead. Two arms, one flag, both counted by
+`MTPLX_QSA_PREFILL_DEBUG=1`:
+
+* `mask_fuse_causal` — the indexer returned **no** selection, which happens
+  exactly when the chunk's post-update context is inside the block budget
+  (`T <= (block_topk + 1) * ratio - 1` = **2,051** tokens on the production
+  pack) or on a vision request. The visible set is then exactly causal, so
+  the lane passes MLX the string `"causal"` (documented lower-right aligned:
+  the last query is the last key, which is precisely the chunked-prefill
+  offset case) and builds no tensor at all.
+* `mask_fuse_bool` — a real top-k selection, handed to the fused kernel as
+  the bool array it already is.
+* `mask_fuse_unavailable` — the one-shot probe found no fused kernel for
+  this `(mask kind, head_dim, dtype)`; the arm says so on stderr and stays
+  on the dense route for the rest of the process instead of quietly
+  measuring the control under a candidate label.
+
+`mask_causal_eligible` counts the exactly-causal regime whether or not the
+flag is armed. **At the retained prefill width (4,096) it is zero at 16K and
+at 32K** — no chunk's context is under 2,051 — so at those cells the flag's
+whole effect is `mask_fuse_bool`, and `mask_fuse_causal` is expected to read
+0. It is chunk 0 and only chunk 0 at the shipped 2,048 width.
+
+Neither arm is bit-identical: the fused kernel runs an fp32 online softmax
+over the same visible set, so this is the rounding class the long-prompt
+agreement screen gates, not an approximation.
+
+The sparse-QSA crossover is a documented knob and is **not** touched by any
+of this: `MTPLX_QSA_PREFILL_MIN_CONTEXT` (default 32,768, floor 2,049,
+compared against `total_tokens - rows`) and
+`MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT` are both in
+`MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, i.e. reachable from `--candidate-env`.
+At 16K and at 32K the gate is unreachable at any chunk width (its maximum
+`total_tokens - rows` is 30,720 at 32K), which is why both cells are wholly
+dense and why the mask-fuse arm applies to every chunk of them.
+
 `--candidate-env` keys must be members of
 `mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, or `apply_profile_env`
 refuses the arm with `runtime_env_overrides has unsupported key: <KEY>`. That
