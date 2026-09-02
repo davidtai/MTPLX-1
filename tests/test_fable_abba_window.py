@@ -768,3 +768,46 @@ class PrefillOnlyTest(unittest.TestCase):
         flags = window.control_flags(64)
         self.assertEqual(flags.count("--max-tokens"), 1)
         self.assertEqual(len(flags), len(window.CONTROL_FLAGS))
+
+
+class ExtraEnvRecordingTest(unittest.TestCase):
+    """MTPLX_* knobs may ride --*-extra-env; the receipt must SHOW them."""
+
+    def test_mtplx_key_on_candidate_extra_env_still_reaches_arm_b_only(self):
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--candidate-extra-env",
+                "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1",
+            ]
+        )
+        specs = window.arm_specification(args)
+        self.assertEqual(
+            specs["B"]["extra_env"], ["MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1"]
+        )
+        self.assertEqual(specs["A"]["extra_env"], [])
+
+    def test_driver_records_the_raw_env_passthrough_in_the_receipt(self):
+        text = (
+            Path(window.__file__).resolve().parent / "abba_driver.py"
+        ).read_text("utf-8")
+        self.assertIn('"process_environment_overrides"', text)
+        self.assertIn("_EXTRA_ENVIRONMENT", text)
+
+    def test_candidate_env_remains_the_validated_channel(self):
+        args = window.build_parser().parse_args(
+            [
+                "--sequence",
+                "1",
+                "--candidate-env",
+                "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1",
+            ]
+        )
+        specs = window.arm_specification(args)
+        self.assertIn(
+            "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1", specs["B"]["candidate_env"]
+        )
+        self.assertNotIn(
+            "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD=1", specs["A"]["candidate_env"]
+        )

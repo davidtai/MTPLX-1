@@ -507,6 +507,33 @@ def stats_receipt(
     }
 
 
+#: Raw ``--env`` passthrough settings, recorded into every receipt.
+_EXTRA_ENVIRONMENT: dict[str, str] = {}
+
+
+def _ple_prefill_lookahead_armed() -> bool:
+    """Whether the candidate lane was actually armed in THIS process.
+
+    Recorded next to its counters so a receipt can never again show an
+    inert lane without also showing that it was asked to run: on
+    2026-09-01 the flag arrived through --candidate-extra-env, which the
+    receipt's `candidate_environment` does not carry, and the arm read as
+    a plain 2 s regression.
+    """
+
+    try:
+        from mtplx.ple_prefill_lookahead import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
 def _ple_prefill_lookahead_counters() -> dict[str, int]:
     """Engagement counters for the PLE prefill lookahead lane (may be empty)."""
 
@@ -516,6 +543,23 @@ def _ple_prefill_lookahead_counters() -> dict[str, int]:
         return snapshot_counters()
     except Exception:
         return {}
+
+
+def prefill_chunks_receipt() -> list[dict[str, float]]:
+    """Per-chunk prefill wall and PLE-gather seconds, on BOTH arms.
+
+    Recorded by the chunked prefill loop itself, so a control arm carries it
+    too.  This is what shows whether a run-to-run prefill swing lives in GPU
+    work or in the host-late PLE gathers -- the 2026-09-01 window had a
+    control spread of 13.76-15.61 s with no code difference at all.
+    """
+
+    try:
+        from mtplx.generation import prefill_chunk_records
+
+        return prefill_chunk_records()
+    except Exception:
+        return []
 
 
 def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
@@ -541,6 +585,7 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             # engagement is readable without reinterpreting the control's.
             "lookahead_batches": int(getattr(sidecar, "lookahead_batches", 0)),
             "prefill_lookahead": _ple_prefill_lookahead_counters(),
+            "prefill_lookahead_armed": _ple_prefill_lookahead_armed(),
         }
     except Exception as error:  # diagnostic field, never the measurement
         print(
@@ -1222,6 +1267,12 @@ def main() -> int:
         args.env, flag="--env", require_mtplx=False
     )
     os.environ.update(extra_environment)
+    # Record it. The 2026-09-01 PLE-lookahead window armed its candidate
+    # through --candidate-extra-env, which lands here and NOT in
+    # `candidate_environment`; both arms' receipts therefore looked identical
+    # and an inert lane read as a 2 s regression. A receipt has to show
+    # everything the process was told, not only the validated overrides.
+    globals()["_EXTRA_ENVIRONMENT"] = dict(extra_environment)
 
     family_overrides, candidate_environment = build_family_overrides(args)
 
@@ -1737,6 +1788,7 @@ def main() -> int:
         row["reference_token_parity"] = reference_token_parity(row)
         row["per_cycle"] = per_cycle_receipt(output.stats)
         row["ple_hot_rows"] = ple_hot_rows_receipt(runtime)
+        row["prefill_chunks"] = prefill_chunks_receipt()
         compiled = row["compiled_verify"]
         row["compiled_m4_calls"] = int(compiled.get("compiled_calls", 0))
         row["configured_max_tokens"] = max_tokens
@@ -1918,6 +1970,9 @@ def main() -> int:
         "memory": {"after_load": after_load_memory, "after_run": after_run_memory},
         "draft_lm_head": draft_head,
         "candidate_environment": candidate_environment,
+        # The raw --env passthrough. Without it a candidate armed through
+        # --candidate-extra-env is invisible in the receipt (2026-09-01).
+        "process_environment_overrides": dict(_EXTRA_ENVIRONMENT),
         "extra_environment": extra_environment,
         "paired_routed_glu": {
             "expected": candidate_environment.get("MTPLX_QWEN4_M4_ROUTED_GLU")
