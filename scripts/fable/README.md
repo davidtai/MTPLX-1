@@ -1315,3 +1315,180 @@ projection under both marginal row costs the ledger holds — 1.8 ms (H §2.4, w
 L's table used) and 1.4 ms (K's fit for a *compiled* fixed-width row) — because
 neither is measured on an M=5 graph, and deciding whether to build one is the
 entire point.
+
+---
+
+## Shadow-draft acceptance (`shadow_draft_harness.py`)
+
+Instrument I3. It exists so that a change to the **draft proposal** — indexer
+reuse across depths, row K-D2, any cheaper way to compute the same draft step —
+is judged on acceptance from rows on disk instead of by a live A/B. The per-run
+acceptance spread is ±4.2 % (1σ, H §7): a 3-seed A/B cannot see a +2 % proposal
+effect, and every attempt to look for one costs two guarded windows.
+
+The number it produces, per depth, is the accept probability with **both** noise
+sources integrated out — the accept coin and the draw of the drafted token:
+
+```
+alpha_d = sum_y min(p_d(y), q_d(y))  =  E_{x~q_d}[min(1, p_d(x)/q_d(x))]
+```
+
+the same estimator `offline_depth4_gate.py` reports, so the columns line up.
+
+### How it runs: capture once, score forever
+
+**capture** (GPU, guarded) replays a `MTPLX_FABLE_K20_LOG` trajectory. The log
+carries `primary`, `draft_tokens`, `accepted` and `selected_token` per window,
+which *is* the committed stream, so the trajectory — and the request boundaries
+of a 3-seed log — reconstruct from the log alone. At every window the replay
+runs the draft chain **once per variant from the identical hidden state**,
+teacher-forced to the logged draft tokens, and writes each chain's rows.
+
+**score** (pure NumPy, no GPU, no lock) pairs each variant's rows against the
+same logged `p` rows and reports α₁..₃, the reach ladder, E[tokens/window] and
+the realised accept count under the logged uniform tape, with paired standard
+errors — i.i.d. and a moving-block bootstrap that keeps blocks inside a request,
+because windows within one request are serially correlated and the i.i.d. SE is
+a floor, not the interval.
+
+### Teacher forcing is the definition, not a shortcut
+
+`p_d` is `p(· | primary, x_1..x_{d-1})`: the logged target row at depth `d` is
+conditioned on the tokens the **logged** chain drafted. A free-running candidate
+that drafts a different token at depth 1 would be verified at depth 2 against
+the wrong distribution, and every number past that point would be fiction. So
+the candidate is forced onto the logged tokens: only `q_d` moves, `p_d` stays
+exactly the row it is verified against, every depth is scored exactly.
+
+Forcing isolates the divergence rather than hiding it. The report prints
+`P(diverge)` per depth — how often the candidate would have drafted a different
+token — from the logged draft tape on the `stock_device_k20` / `pr391_raw`
+layouts, and from the row's argmax (a weaker question, labelled as such) on the
+host stock layouts, which consume the draw inside `rng.choice` and never surface
+it. Near zero means measured; 0.3 means the depth-2 and depth-3 numbers describe
+a chain the model would often not have taken.
+
+### What it can and cannot judge
+
+**Can** — anything that alters only the draft proposal `q`: the drafter's
+arithmetic, fusion, caching or scheduling (`MTPLX_FABLE_INDEXER_REUSE`, row
+K-D2, compiled draft support, a cheaper QSA indexer, a different MTP hidden
+variant); draft-side shaping; anything whose whole claim is "same output law,
+cheaper or better `q`".
+
+**Cannot**, and it does not pretend to:
+
+- anything that changes **`p`** — the target model, its quantisation, its
+  shaping, the verify graph's numerics. The logged rows would no longer be the
+  rows the candidate faces and nothing here would notice.
+- anything that changes the **accept law** — block verification, a different
+  clip, a residual change. That is `offline_block_verification.py`, which
+  replays laws against fixed rows: the mirror image of this harness.
+- anything that changes the **window shape** — depth, adaptive width, gated
+  stop, a 4th draft step. That is `offline_depth4_gate.py`.
+- **wall time.** Acceptance is not tok/s. A candidate that wins α and costs
+  2 ms/window loses. This prices nothing; multiply E[tok/win] by the ledger's
+  ms/window yourself.
+- a change that only fires **off** the logged trajectory — a different prompt,
+  sampler or context length.
+- a **greedy** run: `temperature <= 0` builds no distributions, so those windows
+  are skipped and counted.
+
+`offline_draft_temperature.py` already answers the draft-temperature question
+from the log alone, with no replay and no GPU at all. Prefer it for that one.
+
+### The gate that makes the rest trustworthy
+
+Variant 0 is always `stock`: the same proposal path the logged run used,
+re-drafted through the replay. Its rows must reproduce the logged `q` rows. The
+scorer measures that as a total-variation distance per row and **withholds the
+verdict** above `--fidelity-tol` (default 1e-6). A wrong hidden state, cache
+offset, shaping or id space moves that distance far above the tolerance, so a
+broken replay reports FAIL rather than a number. `build_replay_hooks` — the one
+function in the file that touches MLX — was written without a GPU, and this gate
+is what validates it on first run; the piece most likely to need adjustment is
+the MTP-history restage in `advance`, which production does through
+`generate_mtpk`'s nested `reconcile_mtp_indexer_history` (`generation.py:9650`).
+
+The same gate catches the opposite failure. A candidate whose rows are
+bit-identical to stock on every window reports **DID NOT ARM**: its flag is read
+at import or at runtime construction, not per draft call, so the env scope
+around the chain did nothing. Those need `--variant-module dotted:factory` (a
+`ProposalVariant` with a `call` context manager) or two capture processes scored
+against one log.
+
+### Running it
+
+Capture is a GPU job and rides the same guard as everything else here. Score is
+pure NumPy — re-run it as often as you like, anywhere, off the lock.
+
+```
+# 1. capture the trajectory (the usual 3-seed ABBA run, with the K20 log armed)
+python scripts/fable/abba_driver.py \
+    --source $PWD --label fable-w47-shadow --sequence <seq> \
+    --seed 20260829 --seed 20260830 --seed 20260831 \
+    --target-mode batched --require-compiled-verify --m4-stage3 \
+    --qsa-fused-kv-gather --full-frspec --compiled-mtp-prepare --max-tokens 1024 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE=1 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL=1 \
+    --candidate-env MTPLX_QWEN4_M4_ROUTED_GLU=1 \
+    --env MTPLX_FABLE_K20_LOG=$PWD/.benchmark-artifacts/fable/k20-shadow-3seeds.npz
+
+# 2. price the shadow capture before you book the window (no GPU)
+python scripts/fable/shadow_draft_harness.py \
+    .benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --variant indexer-reuse=MTPLX_FABLE_INDEXER_REUSE=1 --budget
+```
+
+The guarded capture-and-score, 3 seeds, with a placeholder variant env — the
+flag does not have to exist yet; `DID NOT ARM` is the answer you get if it is
+not read per draft call:
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/shadow_draft_harness.py \
+    /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --capture-to /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-3seeds.npz \
+    --model /Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
+    --variant indexer-reuse=MTPLX_FABLE_INDEXER_REUSE=1 \
+    --expect-segments 3 \
+    --budget \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-3seeds.json
+```
+
+`--expect-segments 3` asserts the reconstruction found three requests; if it
+finds two the trajectory does not match the run and the harness refuses to
+replay it. Re-scoring afterwards needs no GPU and no guard:
+
+```
+python scripts/fable/shadow_draft_harness.py \
+    .benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --rows .benchmark-artifacts/fable/shadow-3seeds.npz --budget
+```
+
+Budget, at the defaults (38.7 ms/window verify forward from L §3, 5 ms/draft
+chain, 4 s prefill) over ~1,110 windows in 3 segments: ~22 s of GPU per seed for
+stock + one candidate, ~66 s total, of which the *marginal* cost of adding a
+second candidate is ~5.6 s. All three numbers are assumptions, printed with the
+estimate; `--ms-per-window` / `--chain-ms` / `--prefill-s` move them.
+
+### Tests
+
+`tests/test_fable_shadow_draft_harness.py`, pure host, no MLX import — and one
+test proves none is possible: every device-side import in the module lives
+inside `build_replay_hooks`, checked by AST. It covers the segment
+reconstruction (carry-in break, stop-token end, three seeds), the acceptance law
+(exact match, disjoint support, a hand-computed Σ min, exact ties), the
+depth-conditional reach ladder against the marginal α, `E[tokens/window]` with
+and without a bonus, the realised accept count against a uniform tape, the
+fidelity gate in both directions (PASS, FAIL → verdict withheld, DID NOT ARM),
+the zero-variance paired delta a uniform candidate shift must produce, the
+bootstrap's determinism, the budget arithmetic, the replay's call ordering under
+a stub hook, and the report's rendering.
