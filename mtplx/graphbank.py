@@ -1943,6 +1943,11 @@ class CompiledVerifyBank:
         # Parity modes intentionally stay on the generic dispatcher because
         # they need its eager comparison paths.
         self._fixed_m4_dispatch: dict[str, Any] | None = None
+        # Context-copy block rounds run a SECOND, wider forward on the same
+        # cache. On the fixed-M4 lane they were eager (see
+        # ``install_copy_round``); this holds the construction-bound compiled
+        # replay for them at one fixed physical width.
+        self._copy_round_dispatch: dict[str, Any] | None = None
         # Generic lanes demote when dense leaves outgrow the initial grant.
         # The fixed-M4 lane instead performs explicit capacity-generation
         # transitions while keeping its installed direct route.
@@ -1983,6 +1988,8 @@ class CompiledVerifyBank:
             "growth_handoff_materialize_time_s": 0.0,
             "fixed_m4_capacity_transitions": 0,
             "fixed_m4_route_transitions": 0,
+            "copy_round_compiled_calls": 0,
+            "copy_round_width": None,
         }
 
     # -- public API ---------------------------------------------------------
@@ -2269,12 +2276,18 @@ class CompiledVerifyBank:
         cache: Any,
         *,
         committed_count: int,
+        window: int = 4,
     ) -> None:
         """Grow or reroute one installed fixed-M4 capacity generation.
 
         The decision is host-owned: ``committed_count`` advances with the
         accepted completion prefix, so this boundary check never evaluates a
         device offset. Within a generation, replay stays branch-free.
+
+        ``window`` is the number of rows the imminent forward will append. It
+        is 4 for the physical-M4 verify and the compiled copy round's fixed
+        physical width for a block round, which appends more rows than an M4
+        window and must therefore reserve for them BEFORE dispatch.
         """
 
         dispatch = self._fixed_m4_dispatch
@@ -2282,7 +2295,7 @@ class CompiledVerifyBank:
         required_end = (
             int(dispatch["base_offset"])
             + max(0, int(committed_count))
-            + 4
+            + max(4, int(window))
         )
         capacity_needed = required_end > int(dispatch["capacity"])
         route_transition_at = dispatch["route_transition_at"]
@@ -2607,6 +2620,256 @@ class CompiledVerifyBank:
             committed_count,
             cache,
         )
+
+    # -- compiled context-copy block round ---------------------------------
+
+    def install_copy_round(
+        self,
+        cache: Any,
+        *,
+        width: int,
+        hidden_variant: str | None,
+    ) -> None:
+        """Install one fixed-width compiled replay for context-copy rounds.
+
+        WHY THIS EXISTS.  ``mtplx/context_copy.py`` block rounds forward
+        ``[primary, *block]`` through the target once per round; on the batched
+        (qwen4_exp / Flash-Next) lane that call is
+        ``rt.forward_ar(...)`` — the EAGER model path — while the fixed-M4
+        verify next to it replays a compiled graph.  Two independent reasons,
+        both removed here:
+
+        1.  The batched lane never routed the block round through this bank at
+            all.  The capture lane has an opt-in bank route
+            (``MTPLX_CCOPY_BANK_ROUTE`` + ``extended_window=True``); the
+            batched lane's block simply called the runtime.
+        2.  Even routed, it would not have compiled: ``forward_ar_capture``
+            short-circuits at its top whenever ``_fixed_m4_dispatch`` is
+            installed — which is exactly this lane's state — and returns
+            ``_runtime_forward``.  The installed physical-M4 replay makes the
+            generic compiled dispatcher unreachable for every length but 4.
+
+        The receipts show it: ``compiled_verify.calls == compiled_calls == 382``
+        against ``verify_calls == 392`` with ``extended_calls == 0`` — the ten
+        missing calls are the ten copy rounds, all eager.
+
+        WIDTH IS FIXED AND THE BLOCK IS PADDED TO IT.  ``width`` is one physical
+        row count (the block cap K plus the primary), and every round runs at
+        that width regardless of the ladder length it proposed: the caller pads
+        the proposal's rows and keeps its acceptance loop over the LOGICAL
+        block only.  This is exact, not approximate, and for the same reason a
+        physical-M4 window that accepts one token is exact:
+
+          * the forward is causal, so rows 0..L-1 (the proposed block) cannot
+            be influenced by the pad rows that follow them — same logits, same
+            acceptance draws, same emitted stream;
+          * ``commit_verified_window`` replays each GDN recurrence over
+            ``rows[:, :keep_tokens]`` and restages PLE from
+            ``ids[:, :keep_tokens]``, so the committed state reads only the
+            accepted prefix, and trimmable (QSA) entries trim
+            ``verified_tokens - keep_tokens`` rows — which is why the caller
+            MUST pass the PADDED width as ``verified_tokens``, and why the
+            "no trim needed on a full accept" shortcut on the non-family
+            commit path stops being valid once rows are padded.
+
+        The alternative — a small bank of graphs, one per ladder length
+        (8/12/16/24/32 → widths 9/13/17/25/33) — was rejected: five extra
+        traces cost five sets of graph buffers against an 87.4 GB peak under a
+        90 GB wired limit, and the whole point of the ladder (spend less on a
+        weak match) is worth little once a row is compiled-cheap.  One width,
+        one trace.
+
+        Construction-time eligibility only: everything that could refuse is
+        checked HERE and raises.  There is no per-call fallback, so a round
+        never silently reverts to the eager forward mid-generation and the
+        A/B arm cannot be half-compiled.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is None:
+            raise RuntimeError(
+                "compiled copy round requires an installed physical-M4 verifier"
+            )
+        if self.parity or self.parity2:
+            raise ValueError("compiled copy round is disabled in parity modes")
+        width = int(width)
+        if width < 2:
+            raise ValueError(f"compiled copy round width must be >= 2, got {width}")
+        if width == 4:
+            # (4,...) is the fixed-M4 verifier's own compiled key; a copy round
+            # sharing it would inherit the raw-q4 sidecar aux contract.
+            raise ValueError("compiled copy round width must differ from the M4 window")
+        if self._prepare_compiled_aux is None:
+            raise RuntimeError(
+                "compiled copy round requires the length-generic PLE auxiliary"
+            )
+        if not self._extra_capture_layout:
+            raise RuntimeError(
+                "compiled copy round requires the family capture layout"
+            )
+        capacity_limit = dispatch["capacity_limit"]
+        if capacity_limit is not None and (
+            int(dispatch["base_offset"]) + width > int(capacity_limit)
+        ):
+            raise RuntimeError(
+                f"compiled copy round width {width} exceeds the request's "
+                f"KV capacity limit {capacity_limit}"
+            )
+        self._copy_round_dispatch = {
+            "width": width,
+            "hidden_variant": hidden_variant,
+            "state_plan": dispatch["state_plan"],
+            "capture_plan": dispatch["capture_plan"],
+            "capture_leaves": dispatch["capture_leaves"],
+            "qsa_entries": dispatch["qsa_entries"],
+            "boundary": _compiled_verify_boundary(),
+        }
+        self.stats["copy_round_width"] = width
+        # Reserve for the wider window NOW.  Without this the first copy round
+        # of a generation trips the capacity transition, which rebuilds the
+        # shadow and re-keys the compiled callables -- a one-off spike landing
+        # inside a measured decode window instead of in setup.
+        self._transition_fixed_m4_generation(
+            cache, committed_count=0, window=width
+        )
+
+    def _copy_round_step(self, hidden_variant: str | None):
+        """Resolve (compiling on first use) this width's verify callable.
+
+        Re-resolved per call rather than pinned at install: a capacity or
+        rows-gather transition re-keys the fixed-M4 callable the same way, and
+        a stale copy-round callable would replay a graph bound to the previous
+        generation's route.  The lookup is a dict hit on the steady state.
+        """
+
+        dispatch = self._copy_round_dispatch
+        assert dispatch is not None
+        route_key = int(
+            all(entry.fixed_rows_gather for entry in dispatch["qsa_entries"])
+        )
+        key = (int(dispatch["width"]), str(hidden_variant or ""), route_key, "materialized")
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._shared_or_new_verify_step(
+                key, int(dispatch["width"]), hidden_variant
+            )
+            self._compiled[key] = fn
+        return fn
+
+    def forward_copy_round(
+        self,
+        input_ids,
+        *,
+        cache,
+        committed_count: int,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
+        """Replay one context-copy block round through the compiled graph.
+
+        ``input_ids`` must already be padded to the installed width; the
+        caller owns the padding and the logical/physical split (see
+        ``install_copy_round``).  Returns ``(logits, hidden)`` shaped to the
+        PADDED width -- the caller slices to its logical rows.
+        """
+
+        dispatch = self._copy_round_dispatch
+        if dispatch is None:
+            raise RuntimeError("compiled copy round is not installed")
+        if not return_hidden:
+            raise ValueError("compiled copy round always returns hidden states")
+        width = int(dispatch["width"])
+        length = _decode_length(input_ids)
+        if length != width:
+            raise ValueError(
+                f"compiled copy round expects {width} padded rows, got {length}"
+            )
+        if hidden_variant is None:
+            hidden_variant = dispatch["hidden_variant"]
+        elif hidden_variant != dispatch["hidden_variant"]:
+            raise ValueError(
+                "compiled copy round hidden variant changed after installation"
+            )
+
+        self.stats["calls"] += 1
+        # Reserve for the FULL padded window before dispatch: a block round
+        # appends `width` rows, not 4.
+        self._transition_fixed_m4_generation(
+            cache,
+            committed_count=committed_count,
+            window=width,
+        )
+        fn = self._copy_round_step(hidden_variant)
+        boundary = dispatch["boundary"]
+        donate = (
+            _compiled_verify_donation_enabled() and boundary in ("both", "post")
+        )
+        if donate:
+            self._clear_shadow_leaf_refs()
+
+        state_in = self._fixed_m4_state_inputs(dispatch["state_plan"])
+        compiled_aux = self._prepare_compiled_aux(input_ids, cache)
+        if boundary in ("both", "pre"):
+            mx.async_eval(compiled_aux, *state_in)
+        outputs = fn(input_ids, compiled_aux, *state_in)
+        logits, hidden, _returned_aux, captures_flat, state_out = (
+            _unpack_fixed_m4_outputs(
+                outputs,
+                capture_leaves=dispatch["capture_leaves"],
+                returns_aux=False,
+            )
+        )
+        if not donate and boundary in ("both", "post"):
+            mx.async_eval(*outputs)
+            self._held_state_refs.clear()
+        elif not donate:
+            # Same 3-generation input hold the generic dispatcher uses: a
+            # pending graph must keep its input buffers alive.
+            self._held_state_refs.append((state_in, compiled_aux))
+            if len(self._held_state_refs) > 3:
+                self._held_state_refs.pop(0)
+
+        state_pos = 0
+        for kind, entry, n_leaves in dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = state_out[state_pos]
+                entry.kv.cache[1] = state_out[state_pos + 1]
+                entry.kv.cache[2] = state_out[state_pos + 2]
+                entry.raw_keys = state_out[state_pos + 3]
+                entry.pooled = state_out[state_pos + 4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            else:
+                for slot in range(n_leaves):
+                    entry.cache[slot] = state_out[state_pos + slot]
+            state_pos += n_leaves
+
+        # The capture rows are what commit_verified_window replays from, so
+        # they are published exactly as the fixed-M4 route publishes them --
+        # at the PADDED width, which is the width the commit validates.
+        for entry, start, count in dispatch["capture_plan"]:
+            entry._mtplx_verify_rows = tuple(captures_flat[start : start + 6])
+            if count > 6:
+                entry._mtplx_verify_ple = tuple(
+                    captures_flat[start + 6 : start + count]
+                )
+                entry._mtplx_verify_compiled_aux = compiled_aux
+
+        if donate:
+            # Commit-first ownership handoff, exactly as the fixed-M4 route:
+            # the real cache now holds the output leaves, so dropping the
+            # dispatcher's inputs lets MLX donate their buffers in-graph
+            # instead of copying every KV leaf. (A pre-verify snapshot -- which
+            # a block round always takes, because it is the only way to repair
+            # a partial accept -- also references them, so donation degrades to
+            # one COW rather than being unsafe.)
+            state_in = None
+            self._held_state_refs.clear()
+            mx.async_eval(*outputs)
+
+        self.stats["compiled_calls"] += 1
+        self.stats["copy_round_compiled_calls"] += 1
+        return logits, hidden
 
     def _publish_fixed_m4_selected_state(self, commit_plan) -> None:
         """Publish only the successfully enqueued authoritative frontier."""
@@ -3338,6 +3601,7 @@ class CompiledVerifyBank:
         data["compiled_keys"] = [
             _format_compiled_verify_key(key) for key in sorted(self._compiled)
         ]
+        data["copy_round_installed"] = self._copy_round_dispatch is not None
         return data
 
     # -- dispatch preconditions ----------------------------------------------

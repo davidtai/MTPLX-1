@@ -32,7 +32,85 @@ it stays an explicit opt-in rather than a new default. Both proposer entry
 points are shared, so the batched (qwen4_exp) copy lane inherits the policy
 through the same two functions.
 """
+import functools
 import os
+
+
+@functools.lru_cache(maxsize=1)
+def compiled_copy_round_enabled() -> bool:
+    """Run the batched lane's copy-round forward on the COMPILED graph (OFF).
+
+    A block round forwards ``[primary, *block]`` through the target once.  On
+    the batched (qwen4_exp / Flash-Next) lane that call is
+    ``rt.forward_ar(...)`` -- the eager model path -- sitting right beside a
+    fixed-M4 verify that replays a compiled graph.  The receipts show it
+    directly: ``compiled_verify.calls == compiled_calls == 382`` against
+    ``verify_calls == 392`` with ``extended_calls == 0``; the ten missing calls
+    are the ten copy rounds.  Compiling them (see
+    ``CompiledVerifyBank.install_copy_round``) is worth roughly the measured
+    uncompiled penalty on the same forward.
+
+    Read ONCE per process (``lru_cache``): eligibility is decided at
+    construction time and there is no per-round fallback, so a generation is
+    either wholly compiled-copy or wholly eager -- never half, which would make
+    an A/B arm unmeasurable.  Tests flip it with
+    ``compiled_copy_round_enabled.cache_clear()``.
+    """
+
+    return (
+        os.environ.get("MTPLX_FABLE_COMPILED_COPY_ROUND") or ""
+    ).strip() in {"1", "true", "on"}
+
+
+def copy_round_pad_tokens(
+    block: list[int],
+    prompt_ids,
+    block_pos: int,
+    physical_rows: int,
+) -> list[int]:
+    """Rows that extend one copy block up to the compiled round's fixed width.
+
+    The compiled copy round traces ONE graph, so every round forwards the same
+    physical row count whatever length the confidence ladder proposed.  This
+    returns the extra token ids for that forward; the caller appends them to
+    ``[primary, *block]`` and still runs acceptance over ``block`` alone.
+
+    Why padding is exact rather than approximate: the forward is causal, so the
+    proposal's rows cannot see the pad rows that follow them -- identical
+    logits, identical acceptance draws, identical emitted stream -- and
+    ``commit_verified_window`` replays each recurrence over
+    ``rows[:, :keep_tokens]`` while trimming ``physical_rows - keep_tokens``
+    attention rows.  A padded round is structurally the same object as a
+    physical-M4 window that accepts one of its four rows.
+
+    Pad content is the prompt's OWN continuation past the proposal -- the
+    tokens a full-cap block would have proposed -- because those rows are
+    already in hand, are representative of what the round would route to, and
+    make the round's cost independent of the ladder rung it drew.  When the
+    prompt runs out (a match near its tail), the block's last token repeats:
+    the value is irrelevant to correctness, but it must be deterministic or
+    two runs of the same seed would trace different content.
+
+    ``physical_rows`` of 0 means the eager lane (no compiled round installed),
+    where physical width always equals logical width and there is no pad.
+    """
+
+    if not block:
+        raise ValueError("a copy round always proposes at least one token")
+    logical_rows = 1 + len(block)
+    if physical_rows <= 0 or physical_rows == logical_rows:
+        return []
+    if physical_rows < logical_rows:
+        raise ValueError(
+            f"copy block needs {logical_rows} rows, compiled copy round is "
+            f"{physical_rows} wide"
+        )
+    needed = physical_rows - logical_rows
+    start = int(block_pos) + len(block)
+    pad = [int(token) for token in prompt_ids[start:start + needed]]
+    if len(pad) < needed:
+        pad.extend([int(block[-1])] * (needed - len(pad)))
+    return pad
 
 
 def context_copy_enabled() -> bool:
