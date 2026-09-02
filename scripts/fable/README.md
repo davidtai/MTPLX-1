@@ -176,19 +176,32 @@ rounds were cut by the cap with 4-8 more verbatim tokens still matching the
 prompt -- roughly 13 tokens per run left on the table, worth about +1% once
 those rows are cheaper than the M4 windows they replace.
 
+**K=48 and K=32 are the same experiment.** `block_for_ext` picks a rung of the
+ladder and only *then* clamps to the cap, so the cap binds only below the top
+rung: any K above 32 proposes exactly the blocks K=32 does. Against the default
+24 it is still a real change -- it unlocks that top rung, which is the 4-8
+tokens the cap was cutting off the strongest matches -- but do not expect
+48-token blocks. For those you need RAMP (`MTPLX_RAMP_ENABLED=1
+MTPLX_RAMP_BLOCK=48`), which replaces the ladder with a fixed length and is a
+different, larger change.
+
 **Raising it is legal on the fixed-M4 lane.** K never enters the physical-M4
 graph: `install_fixed_m4` keys on `(4, hidden_variant, route_key, aux_contract)`
 and hard-codes four rows everywhere. The copy round is a *separate* forward, so
 changing K changes that forward's width and nothing about the M4 window.
 
 **With `MTPLX_FABLE_COMPILED_COPY_ROUND=1` it also sets the compiled copy
-round's traced width** to `1 + K` (49 rows at K=48). Two consequences worth
-planning for: the reserved KV window per round grows with K
-(`_transition_fixed_m4_generation(window=1+K)` runs at install, so the cost
-lands in setup rather than mid-decode), and every round pays that full width
-whatever rung the ladder drew -- padding is free of *correctness* cost but not
-of *time*, so a large K with a low hit rate is a worse trade than a large K with
-a high one. Judge it on `ms_per_m4_window_net` with a re-fitted
+round's traced width**, to `1 + copy_round_max_block(K)` -- 33 rows at K=32 *or*
+K=48, not 49, precisely because of the ladder ceiling above. Sizing the graph
+from the raw K instead would pad every round out to 49 rows for a block that
+can never exceed 33: sixteen dead rows of MoE traffic per round, more than
+compiling the round is worth. Two consequences still worth planning for: the
+reserved KV window per round grows with the width
+(`_transition_fixed_m4_generation` runs at install, so the cost lands in setup
+rather than mid-decode), and every round pays the full width whatever rung the
+ladder drew -- padding is free of *correctness* cost but not of *time*, so a
+wide graph with a low hit rate is a worse trade than a wide one with a high hit
+rate. Judge it on `ms_per_m4_window_net` with a re-fitted
 `--copy-token-cost-s`, never on tok/s.
 
 Pair it with `--candidate-extra-env MTPLX_CONTEXT_COPY_PROBATION_K=16` to let

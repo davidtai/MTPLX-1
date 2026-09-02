@@ -24,7 +24,9 @@ from __future__ import annotations
 import pytest
 
 from mtplx.context_copy import (
+    block_for_ext,
     compiled_copy_round_enabled,
+    copy_round_max_block,
     copy_round_pad_tokens,
 )
 
@@ -177,3 +179,58 @@ def test_pad_tokens_are_plain_ints():
     block = PROMPT[10:14]
     pad = copy_round_pad_tokens(block, PROMPT, 10, 25)
     assert all(type(token) is int for token in pad)
+
+
+# ---------------------------------------------------------------------------
+# The cap does not mean what its name suggests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cap", "expected"),
+    [
+        (4, 4),
+        (8, 8),
+        (16, 16),
+        (24, 24),
+        (32, 32),
+        # Above the ladder's top rung the cap stops binding entirely.
+        (48, 32),
+        (128, 32),
+    ],
+)
+def test_max_block_is_capped_by_the_ladder_not_just_by_k(monkeypatch, cap, expected):
+    monkeypatch.delenv("MTPLX_RAMP_ENABLED", raising=False)
+    assert copy_round_max_block(cap) == expected
+
+
+def test_max_block_bounds_every_rung_of_the_ladder(monkeypatch):
+    """The compiled width is sized from this, so it must be a true bound."""
+
+    monkeypatch.delenv("MTPLX_RAMP_ENABLED", raising=False)
+    for cap in (4, 8, 12, 16, 24, 32, 48):
+        bound = copy_round_max_block(cap)
+        for ext in range(0, 8):
+            assert block_for_ext(ext, cap) <= bound
+
+
+def test_ramp_fixed_block_raises_the_bound(monkeypatch):
+    """RAMP replaces the ladder outright, so its fixed length IS the bound."""
+
+    monkeypatch.setenv("MTPLX_RAMP_ENABLED", "1")
+    monkeypatch.setenv("MTPLX_RAMP_BLOCK", "48")
+    assert copy_round_max_block(48) == 48
+    assert block_for_ext(0, 48) == 48
+
+
+def test_compiled_width_never_truncates_a_proposal(monkeypatch):
+    """End to end: no reachable block can overflow the installed width."""
+
+    monkeypatch.delenv("MTPLX_RAMP_ENABLED", raising=False)
+    prompt = list(range(2000, 2200))
+    for cap in (8, 16, 24, 32, 48):
+        width = 1 + copy_round_max_block(cap)
+        for ext in range(0, 8):
+            block = prompt[10:10 + block_for_ext(ext, cap)]
+            pad = copy_round_pad_tokens(block, prompt, 10, width)
+            assert 1 + len(block) + len(pad) == width

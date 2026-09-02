@@ -9762,6 +9762,7 @@ def generate_mtpk(
     from .context_copy import (NgramIndex, block_for_ext,
                                compiled_copy_round_enabled
                                as _compiled_copy_round_enabled,
+                               copy_round_max_block,
                                copy_round_pad_tokens,
                                context_copy_batched_enabled,
                                context_copy_block_k,
@@ -9985,7 +9986,10 @@ def generate_mtpk(
             raise RuntimeError(
                 "compiled copy round requires the family capture-commit path"
             )
-        ccopy_compiled_round_width = 1 + ccopy_k
+        # NOT 1 + ccopy_k: the confidence ladder tops out at 32, so a cap
+        # above that proposes no longer block and the extra rows would be
+        # dead MoE traffic on every round.
+        ccopy_compiled_round_width = 1 + copy_round_max_block(ccopy_k)
         compiled_verify_bank.install_copy_round(
             cache,
             width=ccopy_compiled_round_width,

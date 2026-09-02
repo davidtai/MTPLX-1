@@ -347,6 +347,29 @@ def block_for_ext(ext: int, k_cap: int) -> int:
     return min(_BLOCK_LADDER[idx], max(4, k_cap))
 
 
+def copy_round_max_block(k_cap: int) -> int:
+    """The longest block any round can propose under this cap.
+
+    NOT simply ``k_cap``.  With RAMP off, ``block_for_ext`` picks a rung of
+    ``_BLOCK_LADDER`` and only then clamps to the cap, so the cap binds solely
+    below the ladder's top rung (32): ``MTPLX_CONTEXT_COPY_K=48`` proposes
+    exactly the same blocks as ``=32``, and raising it past 32 buys nothing.
+    (Against the default 24 it does buy the ladder's top rung, which is the
+    4-8 tokens the cap was cutting off the strongest matches.)
+
+    This is the number the compiled copy round must size its graph to.  Using
+    the raw cap instead would pad every round out to 49 rows for a block that
+    can never exceed 33 -- sixteen dead rows of MoE traffic per round, which
+    is larger than the win compiling the round is worth.
+    """
+
+    if ramp_enabled():
+        fixed = ramp_block()
+        if fixed is not None:
+            return int(fixed)
+    return min(max(_BLOCK_LADDER), max(4, int(k_cap)))
+
+
 class NgramIndex:
     """ng_min-gram index, built once over the prompt at setup: gram -> continuation
     positions. find() is O(candidates) instead of an O(L) backward scan, which
