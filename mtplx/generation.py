@@ -103,6 +103,7 @@ from .fast_sampling import (
     sparse_distributions_from_mlx_logits,
 )
 from .gdn_capture import resolve_gdn_capture_backend
+from . import graph_build_overlap as _graph_build_overlap
 from .kernels.pr391_softfloat64_verifier_decision import (
     SELECTED_BONUS as _PR391_SELECTED_BONUS,
     SELECTED_CORRECTION as _PR391_SELECTED_CORRECTION,
@@ -9318,6 +9319,39 @@ def generate_mtpk(
         _ple_candidate_aux = _ple_candidate_dispatch.get("prepare_aux")
         if getattr(_ple_candidate_aux, "candidate_prefetch", None) is not None:
             _ple_candidate_submit = compiled_verify_bank.submit_fixed_m4_candidates
+    # MTPLX_FABLE_GRAPH_BUILD_OVERLAP (W63, default off).  Resolved ONCE here
+    # into two bound methods, so the cycle costs one `is not None` and one
+    # local call -- no flag read, no getattr walk, no branch on the bank.  The
+    # control arm keeps the shipped monolithic verify object in
+    # `_fixed_m4_verify` and never sees this module again.
+    _graph_overlap_enqueue = None
+    _fixed_m4_verify = (
+        compiled_verify_bank.forward_fixed_m4
+        if compiled_verify_bank is not None and qwen4_fixed_m4_compiled_verify
+        else None
+    )
+    if (
+        _graph_build_overlap.enabled()
+        and compiled_verify_bank is not None
+        and qwen4_fixed_m4_compiled_verify
+        and _compiled_verify_mode == "on"
+        and verify_strategy not in {"capture_commit", "graphbank_capture_commit"}
+    ):
+        compiled_verify_bank.arm_fixed_m4_graph_build_overlap()
+        _graph_overlap_enqueue = (
+            compiled_verify_bank.enqueue_fixed_m4_overlap_prefix
+        )
+        _fixed_m4_verify = compiled_verify_bank.forward_fixed_m4_overlap
+        _graph_overlap_engagement = _graph_build_overlap.engagement_line()
+        if _graph_overlap_engagement is not None:
+            print(_graph_overlap_engagement, flush=True)
+    elif _graph_build_overlap.enabled():
+        # An armed flag that quietly ran the shipped route would make the
+        # receipts lie about which code the candidate arm measured.
+        raise RuntimeError(
+            f"{_graph_build_overlap.ENV_FLAG} requires the installed "
+            "physical-M4 compiled verify on the batched verify route"
+        )
     # Read once per request; the switch is a process constant so control and
     # candidate arms run the same binary.
     _pr391_compact_commit = _pr391_compact_commit_enabled()
@@ -12644,6 +12678,31 @@ def generate_mtpk(
             )
             verified_token_count = len(verify_input)
             verify_input_array = mx.array([verify_input])
+        # MTPLX_FABLE_GRAPH_BUILD_OVERLAP (W63).  The earliest statement at
+        # which this window's four ids exist -- the drafts have just come
+        # across (the retained stack's draft loop syncs once per depth, so
+        # the last depth's sync is what `verify_input` is waiting on) and
+        # nothing between here and the verify reads them again.
+        #
+        # Queueing target-embedding + layer 0 HERE, on the same
+        # `verify_input_array` the monolithic route would pass, gives the GPU
+        # ~0.5-0.6 ms of work to run under the host's PLE row read and the
+        # ~1.9 ms/cycle the retained-stack census measures the GPU idling
+        # while the compiled verify graph is replayed on the host
+        # (w58-retained-control-census-1788370322: 382/382 cycles, 86.9 %
+        # host-late, median 1.690 ms).  Layer 0 is exactly the part of the
+        # window that does not read the PLE auxiliary: the production config
+        # has ONE PLE layer, at index 1.
+        if (
+            _graph_overlap_enqueue is not None
+            and verified_token_count == 4
+            and a3b_target_prefix_route is None
+        ):
+            _graph_overlap_enqueue(
+                verify_input_array,
+                committed_count=len(tokens) - 1,
+                cache=cache,
+            )
         if lazy_bonus_verify:
             lazy_bonus_verify_calls += 1
         event["lazy_bonus_verify"] = {
@@ -12773,7 +12832,7 @@ def generate_mtpk(
                 and verified_token_count == 4
             ):
                 verify_logits, verify_hidden, captures = (
-                    compiled_verify_bank.forward_fixed_m4(
+                    _fixed_m4_verify(
                         verify_input_array,
                         host_input_ids=verify_input,
                         completion_tokens=tokens,

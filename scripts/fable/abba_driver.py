@@ -671,6 +671,49 @@ def _ple_boundary_armed() -> bool:
         return False
 
 
+def _graph_build_overlap_armed() -> bool:
+    """Whether MTPLX_FABLE_GRAPH_BUILD_OVERLAP was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign that the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _graph_build_overlap_receipt() -> dict[str, float]:
+    """W63 engagement: how many windows actually ran the split submission.
+
+    ``prefix_enqueued`` counts windows whose layer-0 graph was queued ahead of
+    the D3 host sync and ``suffix_joined`` those that then ran the layers-1..47
+    graph on it.  The verdict gate is ``monolithic_windows``: an arm that
+    claims the lever and shows windows on the shipped monolithic route took
+    the control's code for them, so its delta is diluted by exactly that
+    fraction.  ``prefix_discarded`` should stay at or near zero -- every one is
+    a layer-0 forward computed and thrown away.  The ``*_ms`` fields are
+    populated only when ``timing`` is in
+    ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_ITEMS``.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import last_receipt
+
+        return last_receipt()
+    except Exception:
+        return {}
+
+
 def _ple_boundary_receipt() -> dict[str, float]:
     """W62 engagement: what each armed boundary item actually did.
 
@@ -780,6 +823,11 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "ple_candidate_prefetch_armed": _ple_candidate_prefetch_armed(),
             "ple_boundary": _ple_boundary_receipt(),
             "ple_boundary_armed": _ple_boundary_armed(),
+            # W63.  Not a PLE counter, but it rides the same block because it
+            # is measured against the same census gap and every consumer of
+            # these rows already reads `ple_hot_rows`.
+            "graph_build_overlap": _graph_build_overlap_receipt(),
+            "graph_build_overlap_armed": _graph_build_overlap_armed(),
             # Which gather path each big row read actually took.  The pread
             # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
             # fancy index behind it, so an arm that claims the vectorised lane

@@ -20,6 +20,8 @@ import mlx.core as mx
 
 from .attention_context import attention_phase
 from .fable_expert_census import census as _expert_census
+from . import graph_build_overlap as _graph_build_overlap
+from .graph_build_overlap import TIMING as _GRAPH_BUILD_OVERLAP_TIMING
 from .ple_boundary import GRAPH_TIMING as _PLE_BOUNDARY_GRAPH_TIMING
 from .ple_boundary import note_graph_build as _note_ple_boundary_graph_build
 from .gdn_capture import resolve_gdn_capture_backend
@@ -122,6 +124,26 @@ class FixedM4Split:
     state_in: tuple[Any, ...]
     state_out: tuple[Any, ...]
     outputs: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class FixedM4OverlapPrefix:
+    """W63: one layer-0 result queued ahead of this window's D3 host sync.
+
+    Deliberately does NOT retain ``state_in``.  ``FixedM4Prefix`` (the PR391
+    split lane's own transaction object) keeps the layer-0 input leaves alive
+    for the whole transaction, which is the shape that defeats MLX donation --
+    the same failure ``TensorOffsetKVCache.update_and_fetch``'s rollback slice
+    has.  The join needs only the rooted results.
+    """
+
+    input_ids: Any
+    hidden: Any
+    captures: tuple[Any, ...]
+    state_out: tuple[Any, ...]
+    outputs: tuple[Any, ...]
+    generation: int
+    committed_count: int
 
 
 @dataclass
@@ -1952,6 +1974,14 @@ class CompiledVerifyBank:
         self._held_state_refs: list = []
         self._held_aux_refs: list = []
         self._held_fixed_m4_split_refs: list = []
+        # MTPLX_FABLE_GRAPH_BUILD_OVERLAP (W63, default off).  One slot, not a
+        # list: exactly one layer-0 prefix can be in flight, it is consumed by
+        # the same cycle's verify, and an unconsumed one is discarded rather
+        # than accumulated (``_held_fixed_m4_split_refs`` has no such trim and
+        # would pin one layer-0 state + capture set per window for the whole
+        # generation).
+        self._fixed_m4_overlap_prefix: FixedM4OverlapPrefix | None = None
+        self._fixed_m4_split_generation: int = -1
         # The Qwen4 fixed-M4 lane installs one construction-owned replay plan
         # after prompt prefill.  Production calls then bypass the generic
         # eligibility, promotion, bucket, shadow, and fallback machinery.
@@ -2679,6 +2709,301 @@ class CompiledVerifyBank:
             committed_count,
             cache,
         )
+
+    # -- W63 graph-build overlap (MTPLX_FABLE_GRAPH_BUILD_OVERLAP) ---------
+    #
+    # Same two compiled graphs as the PR391 split lane above
+    # (``install_fixed_m4_split``), a different transaction shape.  The lane
+    # above is a device-committed transaction that stays unpublished until
+    # ``commit_fixed_m4_device_window`` selects the authoritative frontier;
+    # this one is a pure SUBMISSION-TIMING change to the retained route --
+    # it publishes exactly what ``_forward_installed_fixed_m4`` publishes, in
+    # the same order, so the unchanged host/device commit sees an unchanged
+    # cache census.  The two do not share state and neither is on the other's
+    # path.
+
+    def _fixed_m4_generation(self) -> int:
+        """Capacity/route generation of the installed fixed-M4 plan."""
+
+        return int(self.stats["fixed_m4_capacity_transitions"]) + int(
+            self.stats["fixed_m4_route_transitions"]
+        )
+
+    def _refresh_fixed_m4_split(self) -> int:
+        """Recompile the split pair when the plan changed generation.
+
+        ``_transition_fixed_m4_generation`` rebuilds the shadow and recompiles
+        ``dispatch["fn"]`` on a capacity or route transition, but knows nothing
+        about ``dispatch["split"]``.  Recompiling here keeps the pair on the
+        same generation as the monolithic graph without editing the shared
+        transition (whose source ``tests/test_qwen4_fixed_host_tokens_static``
+        pins for the PR391 lane).
+        """
+
+        generation = self._fixed_m4_generation()
+        if generation != self._fixed_m4_split_generation:
+            self.install_fixed_m4_split()
+            self._fixed_m4_split_generation = generation
+            _graph_build_overlap.bump("split_rebuilds")
+        return generation
+
+    def arm_fixed_m4_graph_build_overlap(self) -> None:
+        """Compile the layer-0/layers-1..47 pair once, at request setup.
+
+        Called only when ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP`` is armed.  Doing
+        it here rather than lazily on the first cycle means an unsupported
+        state/capture census raises at the request boundary, where the arm is
+        readable, instead of mid-window.
+        """
+
+        if self._fixed_m4_dispatch is None:
+            raise RuntimeError(
+                "graph-build overlap requires an installed fixed-M4 verify"
+            )
+        self._refresh_fixed_m4_split()
+
+    def discard_fixed_m4_overlap_prefix(self) -> None:
+        """Drop an unjoined layer-0 prefix.  Idempotent."""
+
+        if self._fixed_m4_overlap_prefix is None:
+            return
+        self._fixed_m4_overlap_prefix = None
+        _graph_build_overlap.bump("prefix_discarded")
+
+    def enqueue_fixed_m4_overlap_prefix(
+        self,
+        input_ids,
+        *,
+        committed_count: int,
+        cache,
+    ) -> FixedM4OverlapPrefix:
+        """Queue target embedding + layer 0 ahead of the rest of the window.
+
+        ``input_ids`` is the SAME ``[1,4]`` array the monolithic route is
+        handed, passed at the earliest statement that owns it -- ahead of
+        ``prepare_aux``'s PLE row read and ahead of the ~1.9 ms/cycle of
+        suffix replay the retained-stack census measures the GPU idling
+        through (382/382 cycles, 86.9 % host-late).  Nothing
+        here reads it on the host, so an unevaluated array is fine:
+        ``mx.compile``'s replay substitutes inputs into the traced graph by
+        shape and dtype and never evaluates them.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        assert dispatch is not None
+        # A prefix still in the slot belonged to a window that never reached
+        # the verify.  Count it rather than overwriting it silently: the
+        # receipt's `prefix_discarded` is how a reader learns the lane is
+        # computing layer-0 forwards it throws away.
+        self.discard_fixed_m4_overlap_prefix()
+        self._transition_fixed_m4_generation(
+            cache,
+            committed_count=committed_count,
+        )
+        generation = self._refresh_fixed_m4_split()
+        split = dispatch["split"]
+        if dispatch["donate"]:
+            # Once per cycle, here rather than in the join: the traced prefix
+            # re-seeds the layer-0 shadow slots from its explicit inputs, and
+            # the suffix does the same for 1..47, so clearing before the FIRST
+            # of the two submissions is what the monolithic route does before
+            # its single one.
+            self._clear_shadow_leaf_refs()
+        state_in = self._fixed_m4_state_inputs(dispatch["state_plan"][:1])
+        if _GRAPH_BUILD_OVERLAP_TIMING:
+            _started = time.perf_counter()
+            outputs = tuple(split["prefix_fn"](input_ids, *state_in))
+            _graph_build_overlap.note_prefix_build(time.perf_counter() - _started)
+        else:
+            outputs = tuple(split["prefix_fn"](input_ids, *state_in))
+        capture_end = 1 + split["prefix_capture_leaves"]
+        prefix = FixedM4OverlapPrefix(
+            input_ids=input_ids,
+            hidden=outputs[0],
+            captures=tuple(outputs[1:capture_end]),
+            state_out=tuple(outputs[capture_end:]),
+            outputs=outputs,
+            generation=generation,
+            committed_count=int(committed_count),
+        )
+        state_in = None
+        # NOT rebinding `entry.cache[:2]` here, unlike the monolithic route's
+        # pre-``async_eval`` commit: a window that falls back after this point
+        # must find layer 0's PRE-verify state on the live cache.  Layer 0's
+        # two GDN leaves are ~1.65 MB, and `before_verify`'s snapshot pins
+        # them for the whole cycle anyway, so no donation is lost by waiting.
+        mx.async_eval(*outputs)
+        self._fixed_m4_overlap_prefix = prefix
+        _graph_build_overlap.bump("prefix_enqueued")
+        return prefix
+
+    def forward_fixed_m4_overlap(
+        self,
+        input_ids,
+        *,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
+        """Join a queued layer-0 prefix with layers 1..47 and the head.
+
+        Falls back to the shipped monolithic route -- same call, same graph --
+        whenever no usable prefix is queued, so the lane can never run a stale
+        layer 0 against a regrown capacity generation.
+        """
+
+        del return_hidden, hidden_variant
+        self.stats["calls"] += 1
+        dispatch = self._fixed_m4_dispatch
+        assert dispatch is not None
+        self._transition_fixed_m4_generation(
+            cache,
+            committed_count=committed_count,
+        )
+        prefix = self._fixed_m4_overlap_prefix
+        self._fixed_m4_overlap_prefix = None
+        if (
+            prefix is None
+            or prefix.generation != self._fixed_m4_generation()
+            or prefix.committed_count != int(committed_count)
+        ):
+            if prefix is not None:
+                _graph_build_overlap.bump("prefix_discarded")
+            _graph_build_overlap.bump("monolithic_windows")
+            return self._forward_installed_fixed_m4(
+                input_ids,
+                host_input_ids,
+                completion_tokens,
+                committed_count,
+                cache,
+            )
+        split = dispatch["split"]
+        boundary = dispatch["boundary"]
+        donate = dispatch["donate"]
+
+        suffix_plan = dispatch["state_plan"][1:]
+        state_in: list[Any] = []
+        for kind, entry, n_leaves in suffix_plan:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                state_in.extend(
+                    (
+                        entry.kv.cache[0],
+                        entry.kv.cache[1],
+                        entry.kv.cache[2],
+                        entry.raw_keys,
+                        entry.pooled,
+                    )
+                )
+            else:
+                state_in.extend(entry.cache[:n_leaves])
+
+        compiled_aux = dispatch["prepare_aux"](
+            prefix.input_ids,
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+        )
+        if boundary in ("both", "pre"):
+            if dispatch["returns_aux"]:
+                mx.async_eval(*state_in)
+            else:
+                mx.async_eval(compiled_aux, *state_in)
+        if _GRAPH_BUILD_OVERLAP_TIMING:
+            _started = time.perf_counter()
+            outputs = tuple(
+                split["suffix_fn"](
+                    prefix.hidden,
+                    prefix.input_ids,
+                    compiled_aux,
+                    *state_in,
+                )
+            )
+            _graph_build_overlap.note_suffix_build(time.perf_counter() - _started)
+        else:
+            outputs = tuple(
+                split["suffix_fn"](
+                    prefix.hidden,
+                    prefix.input_ids,
+                    compiled_aux,
+                    *state_in,
+                )
+            )
+
+        logits, hidden, returned_aux, captures_flat, state_out = (
+            _unpack_fixed_m4_outputs(
+                outputs,
+                capture_leaves=split["suffix_capture_leaves"],
+                returns_aux=dispatch["returns_aux"],
+            )
+        )
+        if not dispatch["returns_aux"]:
+            returned_aux = compiled_aux
+        else:
+            self._held_aux_refs.append((compiled_aux, returned_aux))
+            if len(self._held_aux_refs) > 3:
+                self._held_aux_refs.pop(0)
+
+        if not donate and boundary in ("both", "post"):
+            mx.async_eval(*outputs)
+            self._held_state_refs.clear()
+        elif not donate:
+            self._held_state_refs.append((state_in, compiled_aux))
+            if len(self._held_state_refs) > 3:
+                self._held_state_refs.pop(0)
+
+        # Layer 0's leaves come from the prefix, layers 1..47's from the
+        # suffix; together they are byte-for-byte the census
+        # ``_forward_installed_fixed_m4`` publishes from its single output
+        # tuple, in the same order.
+        prefix_entry = dispatch["state_plan"][0][1]
+        for slot in range(split["prefix_state_leaves"]):
+            prefix_entry.cache[slot] = prefix.state_out[slot]
+        state_pos = 0
+        for kind, entry, n_leaves in suffix_plan:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = state_out[state_pos]
+                entry.kv.cache[1] = state_out[state_pos + 1]
+                entry.kv.cache[2] = state_out[state_pos + 2]
+                entry.raw_keys = state_out[state_pos + 3]
+                entry.pooled = state_out[state_pos + 4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            else:
+                for slot in range(n_leaves):
+                    entry.cache[slot] = state_out[state_pos + slot]
+            state_pos += n_leaves
+
+        capture_shift = split["prefix_capture_leaves"]
+        for plan_index, (entry, start, count) in enumerate(
+            dispatch["capture_plan"]
+        ):
+            if plan_index == 0:
+                # install_fixed_m4_split refuses unless capture_plan[0] IS the
+                # layer-0 state entry at offset 0 with exactly the six GDN
+                # rows, so this is the prefix's own capture, not a guess.
+                entry._mtplx_verify_rows = tuple(prefix.captures)
+                continue
+            offset = start - capture_shift
+            entry._mtplx_verify_rows = tuple(captures_flat[offset : offset + 6])
+            if count > 6:
+                entry._mtplx_verify_ple = tuple(
+                    captures_flat[offset + 6 : offset + count]
+                )
+                entry._mtplx_verify_compiled_aux = returned_aux
+
+        if donate:
+            state_in = None
+            self._held_state_refs.clear()
+            mx.async_eval(*outputs)
+
+        self.stats["compiled_calls"] += 1
+        self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
+        _graph_build_overlap.bump("suffix_joined")
+        _expert_census.end_cycle()  # diagnostic: one M4 verify window closed
+        return logits, hidden, {}
 
     # -- compiled context-copy block round ---------------------------------
 
@@ -3629,6 +3954,11 @@ class CompiledVerifyBank:
             self._clear_shadow_leaf_refs()
             self._held_state_refs.clear()
             self._held_fixed_m4_split_refs.clear()
+            # W63: a queued layer-0 prefix was traced against the shadow that
+            # is about to stop mirroring the cache; its generation stamp would
+            # still match, so drop it explicitly.
+            self.discard_fixed_m4_overlap_prefix()
+            self._fixed_m4_split_generation = -1
             self._shadow = None
             self._shadow_signature = None
             self._spec = None
