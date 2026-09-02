@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -19,19 +21,27 @@ from mtplx import fable_k20_log as log_mod
 
 from scripts.fable.offline_block_verification import (
     DEPTH,
+    LAYOUT_PR391,
+    LAYOUT_STOCK,
     ONE,
     Window,
     _block_realised_reach,
     alpha_by_depth,
+    build_window,
     decide_block,
     decide_current,
+    load_log,
+    log_spec,
+    main as block_main,
     prepare_batched_row,
     prepare_row,
+    prepared_row,
     reach_ladder_block,
     reach_ladder_current,
     report,
     score,
     water_fill_lambda,
+    window_uniforms,
 )
 from scripts.fable import offline_draft_temperature as temp_mod
 
@@ -132,6 +142,8 @@ def test_record_captures_every_row_and_the_two_uniform_windows(k20):
     with np.load(out) as handle:
         data = {key: handle[key] for key in handle.files}
 
+    assert str(data["layout"]) == LAYOUT_PR391
+    assert int(data["has_raw_logits"]) == 1
     assert data["draft_ids"].shape == (1, DEPTH, K20)
     assert data["draft_values"].shape == (1, DEPTH, K20)
     assert data["draft_probs"].shape == (1, DEPTH, K20)
@@ -186,6 +198,375 @@ def test_flush_is_idempotent_and_accepts_a_json_path(k20):
     assert path.exists()
     with np.load(first) as handle:
         assert handle["draft_ids"].shape[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# The stock native-MTP host lane
+# ---------------------------------------------------------------------------
+
+
+class _Sparse:
+    """The two attributes the logger reads off a SparseDistribution."""
+
+    def __init__(self, ids, probs):
+        self.token_ids = np.asarray(ids, dtype=np.int64)
+        probs = np.asarray(probs, dtype=np.float64)
+        self.probs = probs / probs.sum()
+
+
+class _Batched:
+    """The two attributes the logger reads off BatchedSparseDistributions."""
+
+    def __init__(self, rows):
+        width = max(row.token_ids.size for row in rows)
+        self.token_ids = np.zeros((len(rows), width), dtype=np.int64)
+        self.probs = np.zeros((len(rows), width), dtype=np.float64)
+        for index, row in enumerate(rows):
+            size = int(row.token_ids.size)
+            self.token_ids[index, :size] = row.token_ids
+            self.probs[index, :size] = row.probs
+
+
+def _stock_window(logger, *, tokens=(11, 22, 33), reject_at=None, rng=None):
+    draft = [
+        _Sparse([11, 12, 13], [0.5, 0.3, 0.2]),
+        _Sparse([22, 23], [0.6, 0.4]),
+        _Sparse([33, 34, 35, 36], [0.4, 0.3, 0.2, 0.1]),
+    ]
+    target = _Batched(
+        [
+            _Sparse([11, 12], [0.7, 0.3]),
+            _Sparse([22, 23, 24], [0.5, 0.3, 0.2]),
+            _Sparse([33, 34], [0.8, 0.2]),
+            _Sparse([44, 45], [0.6, 0.4]),
+        ]
+    )
+    logger.stock_open(
+        primary=7,
+        draft_tokens=list(tokens),
+        draft_probs=draft,
+        target_batch=target,
+        bonus_allowed=True,
+        greedy=False,
+        rng=rng,
+    )
+    for depth in range(DEPTH):
+        rejected = reject_at is not None and depth == reject_at
+        logger.stock_depth(
+            depth,
+            accept_prob=0.25 * (depth + 1),
+            coin=0.1 * (depth + 1),
+            accepted=not rejected,
+            correction=999 if rejected else int(tokens[depth]),
+        )
+        if rejected:
+            return
+    logger.stock_bonus(555)
+
+
+def test_stock_window_writes_the_normalised_schema(k20):
+    logger, path = k20()
+    logger.set_sampler(
+        sampler=SimpleSampler(0.8, 0.95, 20), draft_sampler=SimpleSampler(0.9, 0.95, 20)
+    )
+    _stock_window(logger, rng=np.random.default_rng(7))
+    logger.stock_close()
+    out = logger.flush()
+
+    with np.load(out) as handle:
+        data = {key: handle[key] for key in handle.files}
+    assert str(data["layout"]) == LAYOUT_STOCK
+    assert int(data["has_raw_logits"]) == 0
+    assert data["draft_ids"].shape == (1, DEPTH, K20)
+    assert data["target_ids"].shape == (1, DEPTH + 1, K20)
+    # Every row present; the narrower supports are padded with sentinel ids
+    # whose probability is zero, so no consumer can mistake them for tokens.
+    assert list(data["draft_valid"][0]) == [1, 1, 1]
+    assert list(data["target_valid"][0]) == [1, 1, 1, 1]
+    assert list(data["draft_ids"][0, 1][:2]) == [22, 23]
+    assert data["draft_probs"][0, 1, 2] == 0.0
+    assert int(data["draft_ids"][0, 1, 2]) == 0xFFFFFFFF
+    # Values stand in for logits as log(prob): monotone, and what a
+    # re-temperature consumes.
+    np.testing.assert_allclose(
+        data["draft_values"][0, 1, :2], np.log([0.6, 0.4]), rtol=1e-5
+    )
+    np.testing.assert_allclose(data["decision_uniforms"][0][:DEPTH], [0.1, 0.2, 0.3])
+    assert int(data["decision_uniforms_valid"][0]) == DEPTH
+    assert int(data["accepted"][0]) == DEPTH
+    assert int(data["selected_token"][0]) == 555
+    assert int(data["selected_kind"][0]) == 2
+    assert int(data["draws_used"][0]) == DEPTH + 1
+    assert int(data["greedy"][0]) == 0
+    assert float(data["temperature"]) == 0.8
+    assert float(data["draft_temperature"]) == 0.9
+    # A real PCG64 generator's state is captured for the counterfactual stream.
+    assert any(int(word) for word in data["rng_state"][0])
+
+
+class SimpleSampler:
+    def __init__(self, temperature, top_p, top_k):
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+
+
+def test_stock_rejection_records_the_correction_and_truncates_alpha(k20):
+    logger, _ = k20()
+    _stock_window(logger, reject_at=1)
+    logger.stock_close()
+    with np.load(logger.flush()) as handle:
+        data = {key: handle[key] for key in handle.files}
+    assert int(data["accepted"][0]) == 1
+    assert int(data["first_reject"][0]) == 1
+    assert int(data["selected_token"][0]) == 999
+    assert int(data["selected_kind"][0]) == 1
+    assert int(data["draws_used"][0]) == 3
+    # The lane breaks at the first rejection, so alpha and the coins stop
+    # there -- but every ROW is still present, which is the point.
+    assert int(data["accept_probability_valid"][0]) == 2
+    assert int(data["decision_uniforms_valid"][0]) == 2
+    assert list(data["draft_valid"][0]) == [1, 1, 1]
+    assert list(data["target_valid"][0]) == [1, 1, 1, 1]
+
+
+def test_stock_open_closes_the_previous_window(k20):
+    """No accept-loop break or continue needs a hook of its own."""
+
+    logger, _ = k20()
+    _stock_window(logger, reject_at=0)  # left open: the loop "broke"
+    assert logger.cycles == 1
+    _stock_window(logger, reject_at=2)
+    logger.stock_close()
+    with np.load(logger.flush()) as handle:
+        first_reject = handle["first_reject"]
+    assert list(first_reject) == [0, 2]
+
+
+def test_greedy_stock_window_is_recorded_with_no_rows(k20):
+    logger, _ = k20()
+    logger.stock_open(
+        primary=1,
+        draft_tokens=[5, 6, 7],
+        draft_probs=[None, None, None],
+        bonus_allowed=False,
+        greedy=True,
+    )
+    logger.stock_depth(
+        0, accept_prob=1.0, coin=None, accepted=True, correction=5
+    )
+    logger.stock_close()
+    with np.load(logger.flush()) as handle:
+        data = {key: handle[key] for key in handle.files}
+    assert int(data["greedy"][0]) == 1
+    assert not data["draft_valid"][0].any()
+    assert not data["target_valid"][0].any()
+    # A greedy window has no accept coin at all.
+    assert int(data["decision_uniforms_valid"][0]) == 0
+
+
+def test_the_log_refuses_to_mix_the_two_lanes(k20):
+    logger, _ = k20()
+    _record_one(logger)
+    with pytest.raises(RuntimeError, match="One lane per file"):
+        _stock_window(logger)
+
+
+def test_prepared_row_does_not_re_apply_top_p():
+    """The stock lane already cut top-p; cutting again would be a bug.
+
+    A row whose head already exceeds 0.95 would lose its tail to a second
+    ``cumulative_before < top_p`` pass.  ``prepared_row`` keeps it.
+    """
+
+    ids = np.array([3, 1, 2], dtype=np.uint32)
+    probs = np.array([0.03, 0.96, 0.01], dtype=np.float64)
+    values = np.log(probs).astype(np.float32)
+    kept_ids, kept_probs = prepared_row(ids, values, probs)
+    np.testing.assert_array_equal(kept_ids, [1, 2, 3])
+    assert float(kept_probs.sum()) == pytest.approx(1.0)
+    assert kept_probs[np.nonzero(kept_ids == 3)[0][0]] > 0.0
+
+    # The raw-layout preparation, on the same row, drops everything after the
+    # 0.96 entry -- correct there, wrong here.
+    raw_ids, raw_probs = prepare_batched_row(ids, values, probs.astype(np.float32))
+    assert set(raw_ids.tolist()) == {1}
+    del raw_probs
+
+
+def test_prepared_row_drops_zero_probability_padding():
+    ids = np.array([5, 9, 0xFFFFFFFF], dtype=np.uint32)
+    probs = np.array([0.25, 0.75, 0.0], dtype=np.float64)
+    kept_ids, kept_probs = prepared_row(ids, None, probs)
+    np.testing.assert_array_equal(kept_ids, [5, 9])
+    np.testing.assert_allclose(kept_probs, [0.25, 0.75])
+
+
+def test_window_uniforms_fill_is_deterministic_and_shared(k20):
+    logger, _ = k20()
+    _stock_window(logger, reject_at=0)
+    logger.stock_close()
+    log = load_log(logger.flush())
+    # Depth 1 rejected, so depths 2 and 3 and the bonus draw were never made.
+    assert int(log["decision_uniforms_valid"][0]) == 1
+    assert not np.all(np.isfinite(log["decision_uniforms"][0]))
+    first = window_uniforms(log, 0, DEPTH)
+    second = window_uniforms(log, 0, DEPTH)
+    assert np.all(np.isfinite(first))
+    np.testing.assert_array_equal(first, second)
+    # The logged draw is preserved exactly; only the missing ones are filled.
+    assert first[0] == log["decision_uniforms"][0, 0]
+    assert np.all((first >= 0.0) & (first < 1.0))
+
+
+def test_stock_log_scores_and_skips_the_greedy_window(k20, tmp_path):
+    logger, _ = k20()
+    _stock_window(logger, rng=np.random.default_rng(3))
+    logger.stock_open(
+        primary=1,
+        draft_tokens=[5, 6, 7],
+        draft_probs=[None, None, None],
+        bonus_allowed=False,
+        greedy=True,
+    )
+    logger.stock_close()
+    log = load_log(logger.flush())
+    spec = log_spec(log)
+    assert spec["layout"] == LAYOUT_STOCK
+    assert spec["has_raw_logits"] is False
+    assert build_window(log, 1, frozenset(), spec=spec) is None
+
+    result = score(log, cap_mode="reach")
+    assert result["cycles"] == 2
+    assert result["cycles_scored"] == 1
+    assert result["cycles_skipped_incomplete"] == 1
+    # The stock lane's correction id is drawn off the live generator, so the
+    # replay check cannot compare it.
+    assert result["compares_selected_token"] is False
+    assert "stock_prepared" in report(result, ms_per_window=None)
+
+
+def test_block_scorer_exits_non_zero_when_nothing_is_scoreable(k20, capsys):
+    logger, path = k20()
+    for _ in range(2):
+        logger.stock_open(
+            primary=1,
+            draft_tokens=[5, 6, 7],
+            draft_probs=[None, None, None],
+            bonus_allowed=False,
+            greedy=True,
+        )
+    logger.stock_close()
+    logger.flush()
+    assert block_main([str(path)]) == 1
+    assert "no window in this log carries a complete set of rows" in (
+        capsys.readouterr().err
+    )
+
+
+def test_stock_replay_reproduces_the_lane_decision_exactly(k20):
+    """The strongest check: replay the SHIPPED law against the real helpers.
+
+    ``mtplx.sampling`` is pure NumPy (no MLX), so the accept probability and
+    the residual the stock accept loop actually uses can be driven here
+    directly.  If the offline mirror ever stops matching them, this fails.
+    """
+
+    from mtplx.sampling import (
+        SparseDistribution,
+        acceptance_probability,
+        residual_distribution,
+        sample_from_distribution,
+    )
+
+    logger, _ = k20()
+    source = np.random.default_rng(391)
+    rng = np.random.default_rng(20260901)
+    logger.set_sampler(
+        sampler=SimpleSampler(1.0, 0.95, 20), draft_sampler=SimpleSampler(1.0, 0.95, 20)
+    )
+
+    def row(support, sharpness):
+        weights = source.random(support.size) ** sharpness
+        weights /= weights.sum()
+        order = np.argsort(support)
+        return SparseDistribution(support[order], weights[order], 50000)
+
+    for _ in range(40):
+        supports = [source.choice(400, size=8, replace=False) for _ in range(DEPTH + 1)]
+        target = [row(supports[r], 2.0) for r in range(DEPTH + 1)]
+        draft = [row(supports[d], 1.0) for d in range(DEPTH)]
+        tokens = [int(source.choice(q.token_ids, p=q.probs)) for q in draft]
+        logger.stock_open(
+            primary=1,
+            draft_tokens=tokens,
+            draft_probs=draft,
+            target_list=target,
+            bonus_allowed=True,
+            greedy=False,
+            rng=rng,
+        )
+        full = True
+        for depth in range(DEPTH):
+            probability = acceptance_probability(
+                target[depth], draft[depth], tokens[depth]
+            )
+            coin = float(rng.random())
+            accepted = coin <= probability
+            correction = (
+                tokens[depth]
+                if accepted
+                else sample_from_distribution(
+                    residual_distribution(target[depth], draft[depth]), rng
+                )
+            )
+            logger.stock_depth(
+                depth,
+                accept_prob=float(probability),
+                coin=coin,
+                accepted=bool(accepted),
+                correction=int(correction),
+            )
+            if not accepted:
+                full = False
+                break
+        if full:
+            logger.stock_bonus(
+                int(sample_from_distribution(target[DEPTH], rng))
+            )
+    logger.stock_close()
+
+    result = score(load_log(logger.flush()), cap_mode="reach")
+    assert result["cycles_scored"] == 40
+    assert result["replay_mismatch_cycles"] == []
+    if result["ladder_all_one_cycles"]:
+        assert result["ladder_all_one_agree_fraction"] == 1.0
+
+
+def test_armed_log_that_captures_nothing_fails_the_process(tmp_path):
+    """Guard: an armed run that records nothing must not exit 0."""
+
+    script = tmp_path / "arm.py"
+    script.write_text(
+        "import mtplx.fable_k20_log as m\n"
+        "assert m.is_enabled()\n"
+        "print('ran')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(REPO_ROOT),
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(REPO_ROOT),
+            "MTPLX_FABLE_K20_LOG": str(tmp_path / "never.npz"),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, result
+    assert "nothing recorded" in result.stderr
+    assert "stock native-MTP accept loop" in result.stderr
+    assert not (tmp_path / "never.npz").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -257,10 +638,48 @@ def test_the_gate_is_read_once_at_import():
     assert module.count('_ENV_VAR = "MTPLX_FABLE_K20_LOG"') == 1
 
 
+def test_stock_lane_hooks_are_gated_and_sit_where_the_rows_already_exist():
+    source = _generation_source()
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "generate_mtpk"
+    )
+    body = ast.get_source_segment(source, function)
+
+    # Every stock hook is behind the module-level gate.
+    for call in ("k20_log.stock_open(", "k20_log.stock_depth(", "k20_log.stock_bonus("):
+        index = body.index(call)
+        assert "_FABLE_K20_LOG" in body[max(0, index - 900) : index], call
+
+    # The window opens once the full-depth draft chain and whichever target
+    # support was materialised are both in hand, and before the accept loop.
+    opened = body.index("k20_log.stock_open(")
+    loop = body.index("for depth_index, draft_token in enumerate(_host_accept_drafts):")
+    assert opened < loop
+    call = body[opened : opened + 500]
+    assert "draft_probs=draft_probs," in call
+    assert "target_batch=target_distribution_batch," in call
+    assert "target_list=target_distributions," in call
+    assert "rng=rng," in call
+
+    # The per-depth record is AFTER the grammar clamp, so it carries the
+    # committed outcome, not the pre-clamp one.
+    clamp = body.index("event[\"drafts\"][depth_index][\"constraint_clamped\"] = True")
+    assert clamp < body.index("k20_log.stock_depth(")
+
+    # The accept coin is drawn exactly once per depth and reused, so arming
+    # the log cannot shift the RNG stream.
+    assert "accepted_now = float(rng.random()) <= accept_prob" not in body
+    assert body.count("_k20_coin = float(rng.random())") == 2
+    assert body.count("accepted_now = _k20_coin <= accept_prob") == 2
+
+
 def test_generation_flushes_explicitly_and_the_module_registers_atexit():
     source = _generation_source()
     assert "k20_log.flush()" in source
-    assert "atexit.register(k20_log.flush)" in (
+    assert "atexit.register(_atexit_flush)" in (
         REPO_ROOT / "mtplx" / "fable_k20_log.py"
     ).read_text()
 

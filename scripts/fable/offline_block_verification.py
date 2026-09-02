@@ -17,10 +17,14 @@ reported, and they are not interchangeable:
 **``E[tok/win]`` -- the one to quote.**  ``1 + sum_d w_d``, where ``w_d`` is the
 probability the window accepts through depth ``d`` given the rows and the
 drafted tokens.  No uniform is consulted, so the accept-coin variance is
-integrated out analytically and the only noise left is the drafted-row
-sampling -- which is *identical* for both arms.  The reported ``delta`` is the
-paired per-cycle difference with its own standard error, and that interval is
-several times tighter than either arm's own.
+integrated out analytically; and the block law's ladder reports the closed-form
+``E[w_d | x_{1:d}] = min(A_d, w_{d-1})`` rather than the realisation, which
+integrates out the look-ahead draw as well.  What is left is the drafted-row
+sampling, which is *identical* for both arms -- and at depth 1 the two ladders
+are then provably equal entry for entry, which is the theorem (H §3.1: depth-1
+acceptance is already saturated at ``min(1, rho_1)`` and no law can raise it).
+The reported ``delta`` is the paired per-cycle difference with its own standard
+error, and that interval is several times tighter than either arm's own.
 
 **``replay`` -- the exactness proof.**  The full emission simulation, driven by
 the four **logged PCG64 uniforms**, so it reproduces the token the device
@@ -29,10 +33,37 @@ device kernel's own logged output and what verifies the ``c = 1`` identity.
 Its arm-to-arm difference is noisy (the two laws' coins land differently on
 the same uniform), so read it for correctness, not for magnitude.
 
+Two lanes, one loader
+---------------------
+``MTPLX_FABLE_K20_LOG`` writes one normalised schema from either of the two
+lanes that make an accept decision, and this script loads both.  The only
+place they differ is how far the rows have already been shaped, which
+:func:`build_window` branches on and nothing else does:
+
+``pr391_raw``
+    Rows are the softfloat64 kernel's **raw** input -- top-20 ids, raw logits,
+    full-vocabulary softmax.  Top-p 0.95 and the double renormalisation are the
+    kernel's, so this script re-runs them (:func:`prepare_row`,
+    :func:`prepare_batched_row`), mirroring
+    ``pr391_softfloat64_verifier_decision.py`` line by line.
+``stock_prepared``
+    Rows are the stock native-MTP lane's host-side ``SparseDistribution`` /
+    ``BatchedSparseDistributions`` objects, which are **already** shaped and
+    renormalised (``sampling.py:122-176``).  Re-running the kernel's
+    preparation would apply top-p a second time, so :func:`prepared_row` takes
+    them as they are.  Two further consequences:
+
+    * the correction id is sampled with ``rng.choice`` straight off the live
+      generator, so it is not reproducible offline -- the replay self-check
+      compares everything *except* the selected token;
+    * an accept coin exists only for the depths the lane actually reached, so
+      :func:`window_uniforms` fills the rest from a deterministic stream seeded
+      by the window's own logged PCG64 state.  Both laws get the same stream.
+
 What is replayed, and what is not
 ---------------------------------
-Each logged cycle carries the exact seven prepared K20 rows and the four
-decision uniforms of one verify window.  This script re-decides **that window**
+Each logged cycle carries one verify window's prepared K20 rows and its
+decision uniforms.  This script re-decides **that window**
 under each law.  It does **not** re-run the model: under the block law a
 window can accept a different number of tokens, which in production would
 change every subsequent window's rows.  So the number reported here is a
@@ -159,9 +190,14 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+#: Defaults for the PR391 D3/M4 lane.  A stock-lane log carries its own
+#: depth and target-row count, read off the arrays by :func:`log_spec`.
 DEPTH = 3
 TARGET_ROWS = DEPTH + 1
 TOP_P = 0.95
+
+LAYOUT_PR391 = "pr391_raw"
+LAYOUT_STOCK = "stock_prepared"
 
 SELECTED_NONE = 0
 SELECTED_CORRECTION = 1
@@ -231,6 +267,38 @@ def prepare_row(
 
     prepared_ids, once = prepare_batched_row(ids, values, probs, top_p=top_p)
     return prepared_ids, renormalize_sparse(once)
+
+
+def prepared_row(
+    ids: np.ndarray, values: np.ndarray, probs: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Take an ALREADY-shaped host row as-is (``stock_prepared`` layout).
+
+    The stock native-MTP lane hands its decision ``SparseDistribution`` /
+    ``BatchedSparseDistributions`` rows that have already had temperature,
+    top-p and top-k applied and been renormalised (``sampling.py:122-176``,
+    ``sampling.py:48-59``).  Re-running the kernel's ``_prepare_candidate_row``
+    on those would apply top-p 0.95 a *second* time to an already-truncated,
+    already-renormalised row and cut mass the lane never cut.  So this is the
+    right preparation for that layout: drop the zero-probability padding, sort
+    by token id (the order every lookup here assumes), and renormalise once --
+    which is a no-op on a row that already sums to 1, and the kernel's own
+    second normalisation for one that does not.
+
+    ``values`` is unused: for this layout it carries ``log(probs)``, which
+    ranks identically, and the ordering is by id regardless.
+    """
+
+    del values
+    ids = np.asarray(ids, dtype=np.uint32)
+    probs = np.asarray(probs, dtype=np.float64)
+    keep = probs > ZERO
+    kept_ids = ids[keep]
+    kept_probs = probs[keep]
+    if kept_ids.size == 0:
+        raise ValueError("prepared row must retain positive finite mass")
+    order = np.argsort(kept_ids)
+    return kept_ids[order], renormalize_sparse(kept_probs[order])
 
 
 def lookup(token_ids: np.ndarray, probabilities: np.ndarray, token: int) -> np.float64:
@@ -327,6 +395,7 @@ class Window:
         "uniforms",
         "bonus_allowed",
         "stops",
+        "depth",
     )
 
     def __init__(
@@ -341,6 +410,7 @@ class Window:
     ) -> None:
         self.draft_tokens = [int(token) for token in draft_tokens]
         self.draft = list(draft_rows)
+        self.depth = len(self.draft)
         self.target_single = list(target_rows)
         self.target_double = [
             (ids, renormalize_sparse(probs)) for ids, probs in target_rows
@@ -348,6 +418,10 @@ class Window:
         self.uniforms = np.asarray(uniforms, dtype=np.float64)
         self.bonus_allowed = bool(bonus_allowed)
         self.stops = stops
+        if len(self.target_single) <= self.depth:
+            raise ValueError("a window needs one target row per depth plus a bonus row")
+        if self.uniforms.size <= self.depth or not np.all(np.isfinite(self.uniforms)):
+            raise ValueError("a window needs one finite uniform per depth plus one")
 
     def rho(self, depth: int, token: int) -> np.float64:
         """``p_d(token) / q_d(token)`` on the prepared rows, kernel-style.
@@ -367,26 +441,112 @@ class Window:
         return np.float64(p_value / q_value)
 
 
-def build_window(log: dict[str, np.ndarray], index: int, stops: frozenset[int]) -> Window:
-    return Window(
-        draft_tokens=log["draft_tokens"][index],
-        draft_rows=[
-            prepare_row(
-                log["draft_ids"][index, depth],
-                log["draft_values"][index, depth],
-                log["draft_probs"][index, depth],
+def log_spec(log: dict[str, np.ndarray]) -> dict[str, Any]:
+    """Read the layout and the window shape off one loaded log."""
+
+    layout = str(log["layout"]) if "layout" in log else LAYOUT_PR391
+    if layout not in {LAYOUT_PR391, LAYOUT_STOCK}:
+        raise ValueError(f"unknown K20 log layout {layout!r}")
+    return {
+        "layout": layout,
+        "depth": int(log["draft_tokens"].shape[1]),
+        "target_rows": int(log["target_ids"].shape[1]),
+        "cycles": int(log["draft_tokens"].shape[0]),
+        "has_raw_logits": bool(log.get("has_raw_logits", np.uint8(1))),
+        "temperature": float(log["temperature"]) if "temperature" in log else 1.0,
+        "draft_temperature": (
+            float(log["draft_temperature"]) if "draft_temperature" in log else 1.0
+        ),
+        "top_p": float(log["top_p"]) if "top_p" in log else TOP_P,
+        "top_k": int(log["top_k"]) if "top_k" in log else 0,
+    }
+
+
+def window_uniforms(
+    log: dict[str, np.ndarray], index: int, depth: int
+) -> np.ndarray:
+    """The window's accept coins, with the undrawn ones filled deterministically.
+
+    The PR391 lane reserves all ``depth + 1`` draws up front, so every entry is
+    real.  The **stock** lane draws an accept coin only for the depths it
+    actually reaches -- once a depth rejects the loop breaks -- so a
+    counterfactual law that accepts deeper has no logged draw to use.  Those
+    slots arrive as NaN and are filled from a deterministic stream seeded by
+    the window's own logged PCG64 state (``rng_state``) and its index.
+
+    Every law scored on this window gets the *same* filled array, so the
+    comparison stays paired; and because the fill is a pure function of the
+    log, re-running the scorer reproduces it exactly.
+    """
+
+    uniforms = np.asarray(log["decision_uniforms"][index], dtype=np.float64).copy()
+    missing = ~np.isfinite(uniforms)
+    if not missing.any():
+        return uniforms
+    state = (
+        [int(word) for word in np.asarray(log["rng_state"][index]).reshape(-1)]
+        if "rng_state" in log
+        else [0, 0, 0, 0]
+    )
+    stream = np.random.default_rng(
+        np.random.SeedSequence(entropy=[*state, int(index), int(depth)])
+    )
+    uniforms[missing] = stream.random(int(missing.sum()))
+    return uniforms
+
+
+def build_window(
+    log: dict[str, np.ndarray],
+    index: int,
+    stops: frozenset[int],
+    *,
+    spec: dict[str, Any] | None = None,
+) -> Window | None:
+    """One scoreable window, or ``None`` when the log did not capture it whole.
+
+    A window is skipped when any draft row or any of the ``depth + 1`` target
+    rows is absent -- the greedy stock lane builds no distributions at all, and
+    the lazy per-row target path builds only the rows it reaches.  Skipping is
+    reported by :func:`score` rather than papered over, because scoring a
+    partial window would bias ``E[l]`` downward for both laws.
+    """
+
+    spec = spec or log_spec(log)
+    depth = int(spec["depth"])
+    prepared = spec["layout"] == LAYOUT_STOCK
+    draft_valid = log.get("draft_valid")
+    target_valid = log.get("target_valid")
+    if draft_valid is not None and not np.all(draft_valid[index, :depth]):
+        return None
+    if target_valid is not None and not np.all(target_valid[index, : depth + 1]):
+        return None
+
+    make_draft = prepared_row if prepared else prepare_row
+    make_target = prepared_row if prepared else prepare_batched_row
+    try:
+        draft_rows = [
+            make_draft(
+                log["draft_ids"][index, position],
+                log["draft_values"][index, position],
+                log["draft_probs"][index, position],
             )
-            for depth in range(DEPTH)
-        ],
-        target_rows=[
-            prepare_batched_row(
+            for position in range(depth)
+        ]
+        target_rows = [
+            make_target(
                 log["target_ids"][index, row],
                 log["target_values"][index, row],
                 log["target_probs"][index, row],
             )
-            for row in range(TARGET_ROWS)
-        ],
-        uniforms=log["decision_uniforms"][index],
+            for row in range(depth + 1)
+        ]
+    except ValueError:
+        return None
+    return Window(
+        draft_tokens=log["draft_tokens"][index][:depth],
+        draft_rows=draft_rows,
+        target_rows=target_rows,
+        uniforms=window_uniforms(log, index, depth),
         bonus_allowed=bool(log["bonus_allowed"][index]),
         stops=stops,
     )
@@ -410,14 +570,14 @@ class Outcome:
         "clipped_depths",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, depth: int = DEPTH) -> None:
         self.accepted = 0
         self.first_reject = -1
         self.selected_token = 0
         self.selected_kind = SELECTED_NONE
         self.selected_present = False
         self.draws_used = 0
-        self.accept_probability = [0.0] * DEPTH
+        self.accept_probability = [0.0] * int(depth)
         self.ladder_all_one = True
         self.clipped_depths = 0
 
@@ -427,30 +587,36 @@ class Outcome:
 
         return self.accepted + (1 if self.selected_present else 0)
 
-    def key(self) -> tuple[int, int, int, int, int, int]:
-        return (
-            self.accepted,
-            self.first_reject,
-            self.selected_token,
-            self.selected_kind,
-            int(self.selected_present),
-            self.draws_used,
-        )
+    def key(self, *, with_token: bool = True) -> tuple[int, ...]:
+        """The decision, for comparing two laws or a law against the log.
+
+        ``with_token=False`` drops the correction/bonus id.  That is required
+        for the ``stock_prepared`` layout: the stock lane samples its
+        correction with ``rng.choice`` straight off the live generator
+        (``sampling.py:298-306``) rather than from a logged uniform, so the id
+        it emitted is not reproducible offline -- but the accept decisions,
+        which are what both laws are being scored on, are.
+        """
+
+        head = (self.accepted, self.first_reject)
+        tail = (self.selected_kind, int(self.selected_present), self.draws_used)
+        return (*head, self.selected_token, *tail) if with_token else (*head, *tail)
 
 
 def _finish_bonus(window: Window, out: Outcome) -> Outcome:
     """Kernel lines 333-343: full accept, then the optional bonus."""
 
-    out.accepted = DEPTH
-    out.draws_used = DEPTH
+    depth = window.depth
+    out.accepted = depth
+    out.draws_used = depth
     if window.bonus_allowed:
-        bonus_ids, bonus_probs = window.target_single[DEPTH]
+        bonus_ids, bonus_probs = window.target_single[depth]
         out.selected_token = sample_prepared(
-            bonus_ids, bonus_probs, window.uniforms[DEPTH]
+            bonus_ids, bonus_probs, window.uniforms[depth]
         )
         out.selected_kind = SELECTED_BONUS
         out.selected_present = True
-        out.draws_used = DEPTH + 1
+        out.draws_used = depth + 1
     return out
 
 
@@ -480,8 +646,8 @@ def _emit_correction(
 def decide_current(window: Window) -> Outcome:
     """The shipped law -- kernel lines 265-345, in float64."""
 
-    out = Outcome()
-    for depth in range(DEPTH):
+    out = Outcome(window.depth)
+    for depth in range(window.depth):
         token = window.draft_tokens[depth]
         alpha = min(ONE, window.rho(depth, token))
         out.accept_probability[depth] = float(alpha)
@@ -554,7 +720,7 @@ def alpha_by_depth(window: Window) -> np.ndarray:
     return np.array(
         [
             min(ONE, window.rho(depth, window.draft_tokens[depth]))
-            for depth in range(DEPTH)
+            for depth in range(window.depth)
         ],
         dtype=np.float64,
     )
@@ -569,11 +735,15 @@ def reach_ladder_current(window: Window) -> np.ndarray:
     but with the coin noise integrated out.  Both laws are evaluated on the
     same drafted tokens, so the paired difference is a common-random-numbers
     estimator with a far tighter interval than the replay's.
+
+    The shipped law's ladder is already a deterministic function of
+    ``x_{1:d}``; :func:`reach_ladder_block` matches that conditioning, so the
+    two are directly comparable entry for entry.
     """
 
-    ladder = np.zeros(DEPTH, dtype=np.float64)
+    ladder = np.zeros(window.depth, dtype=np.float64)
     credit = ONE
-    for depth in range(DEPTH):
+    for depth in range(window.depth):
         credit = credit * min(ONE, window.rho(depth, window.draft_tokens[depth]))
         ladder[depth] = credit
     return ladder
@@ -582,19 +752,28 @@ def reach_ladder_current(window: Window) -> np.ndarray:
 def reach_ladder_block(window: Window, *, cap_mode: str = "reach") -> np.ndarray:
     """``w_d`` for block verification, on the same drafted tokens."""
 
-    ladder = np.zeros(DEPTH, dtype=np.float64)
+    ladder = np.zeros(window.depth, dtype=np.float64)
     credit = ONE
     reach = ONE
-    for depth in range(DEPTH):
+    for depth in range(window.depth):
         rho = window.rho(depth, window.draft_tokens[depth])
         budget = min(ONE, credit * rho)
+        # E[w_d | x_{1:d}] in closed form.  The water-fill sets lambda so that
+        # E_{x_{d+1} ~ q_{d+1}}[w_d] is exactly the budget A_d whenever that is
+        # feasible, and the cap w_{d-1} otherwise -- i.e. min(A_d, w_{d-1}),
+        # verified to 2e-16 on real rows.  Reporting the conditional
+        # expectation instead of the realisation Rao-Blackwellises the
+        # look-ahead draw out of the estimator: at depth 1 the two laws are
+        # then *provably* equal entry-for-entry (both are min(1, rho_1)), so
+        # the paired delta contains only the effect and none of the x_{d+1}
+        # sampling noise.  The recursion still advances on the REALISED reach,
+        # because that is what actually caps the next depth.
+        ladder[depth] = min(budget, reach)
         realised = _block_realised_reach(
             window, depth, budget=budget, reach=reach, cap_mode=cap_mode
         )
-        realised = min(realised, reach)
-        ladder[depth] = realised
         credit = budget
-        reach = realised
+        reach = min(realised, reach)
     return ladder
 
 
@@ -608,7 +787,7 @@ def _block_realised_reach(
 ) -> np.float64:
     """``w_d`` at one depth: the water-filled look-ahead, or the raw budget."""
 
-    if depth + 1 >= DEPTH:
+    if depth + 1 >= window.depth:
         return budget
     cap = ONE if cap_mode == "one" else reach
     if budget >= cap:
@@ -644,10 +823,10 @@ def decide_block(window: Window, *, cap_mode: str = "reach") -> Outcome:
 
     if cap_mode not in {"reach", "one"}:
         raise ValueError("cap_mode must be 'reach' or 'one'")
-    out = Outcome()
+    out = Outcome(window.depth)
     credit = ONE  # c_{d-1}: the reach budget entering this depth
     reach = ONE  # w_{d-1}: the probability this depth was reached at all
-    for depth in range(DEPTH):
+    for depth in range(window.depth):
         token = window.draft_tokens[depth]
         rho = window.rho(depth, token)
         budget = min(ONE, credit * rho)  # A_d
@@ -657,7 +836,7 @@ def decide_block(window: Window, *, cap_mode: str = "reach") -> Outcome:
         # also 1, because otherwise the water-fill redistributes it.
         if credit != ONE or reach != ONE:
             out.ladder_all_one = False
-        elif depth + 1 < DEPTH and budget != ONE:
+        elif depth + 1 < window.depth and budget != ONE:
             out.ladder_all_one = False
         realised = _block_realised_reach(
             window, depth, budget=budget, reach=reach, cap_mode=cap_mode
@@ -709,18 +888,21 @@ def load_log(path: str) -> dict[str, np.ndarray]:
     missing = [key for key in required if key not in log]
     if missing:
         raise KeyError(f"K20 log is missing {missing}; was it written by fable_k20_log?")
+    log.setdefault("layout", np.asarray(LAYOUT_PR391))
     return log
 
 
-def logged_key(log: dict[str, np.ndarray], index: int) -> tuple[int, ...]:
-    return (
-        int(log["accepted"][index]),
-        int(log["first_reject"][index]),
-        int(log["selected_token"][index]),
+def logged_key(
+    log: dict[str, np.ndarray], index: int, *, with_token: bool = True
+) -> tuple[int, ...]:
+    head = (int(log["accepted"][index]), int(log["first_reject"][index]))
+    tail = (
         int(log["selected_kind"][index]),
         int(log["selected_present"][index]),
         int(log["draws_used"][index]),
     )
+    token = (int(log["selected_token"][index]),)
+    return (*head, *token, *tail) if with_token else (*head, *tail)
 
 
 def score(
@@ -731,6 +913,11 @@ def score(
 ) -> dict[str, Any]:
     """Replay both laws over every logged window."""
 
+    spec = log_spec(log)
+    depth = int(spec["depth"])
+    # The stock lane's correction id comes off the live generator, not a
+    # logged uniform, so it is not reproducible offline; every other field is.
+    with_token = spec["layout"] != LAYOUT_STOCK
     stops = frozenset(int(token) for token in log.get("stop_ids", ()))
     cycles = int(log["draft_tokens"].shape[0])
     if limit is not None:
@@ -740,41 +927,58 @@ def score(
     block_tokens: list[int] = []
     current_accepted: list[int] = []
     block_accepted: list[int] = []
-    current_ladder = np.zeros((cycles, DEPTH), dtype=np.float64)
-    block_ladder = np.zeros((cycles, DEPTH), dtype=np.float64)
-    alpha = np.zeros((cycles, DEPTH), dtype=np.float64)
+    current_rows: list[np.ndarray] = []
+    block_rows: list[np.ndarray] = []
+    alpha_rows: list[np.ndarray] = []
     agree = 0
     ladder_one = 0
     ladder_one_agree = 0
     replay_mismatch: list[int] = []
+    skipped: list[int] = []
     clipped = 0
 
     for index in range(cycles):
-        window = build_window(log, index, stops)
+        window = build_window(log, index, stops, spec=spec)
+        if window is None:
+            skipped.append(index)
+            continue
         current = decide_current(window)
         block = decide_block(window, cap_mode=cap_mode)
-        if current.key() != logged_key(log, index):
+        if current.key(with_token=with_token) != logged_key(
+            log, index, with_token=with_token
+        ):
             replay_mismatch.append(index)
         current_tokens.append(current.tokens)
         block_tokens.append(block.tokens)
         current_accepted.append(current.accepted)
         block_accepted.append(block.accepted)
-        current_ladder[index] = reach_ladder_current(window)
-        block_ladder[index] = reach_ladder_block(window, cap_mode=cap_mode)
-        alpha[index] = alpha_by_depth(window)
+        current_rows.append(reach_ladder_current(window))
+        block_rows.append(reach_ladder_block(window, cap_mode=cap_mode))
+        alpha_rows.append(alpha_by_depth(window))
         clipped += block.clipped_depths
-        same = current.key() == block.key()
+        same = current.key(with_token=with_token) == block.key(with_token=with_token)
         agree += int(same)
         if block.ladder_all_one:
             ladder_one += 1
             ladder_one_agree += int(same)
 
+    scored = len(current_rows)
+    empty = np.zeros((0, depth), dtype=np.float64)
+    current_ladder = np.stack(current_rows) if scored else empty
+    block_ladder = np.stack(block_rows) if scored else empty
+    alpha = np.stack(alpha_rows) if scored else empty
     current_length = current_ladder.sum(axis=1)
     block_length = block_ladder.sum(axis=1)
     paired = block_length - current_length
     return {
         "cycles": cycles,
+        "cycles_scored": scored,
+        "cycles_skipped_incomplete": len(skipped),
+        "layout": spec["layout"],
+        "depth": depth,
+        "has_raw_logits": bool(spec["has_raw_logits"]),
         "cap_mode": cap_mode,
+        "compares_selected_token": with_token,
         "replay_mismatch_cycles": replay_mismatch,
         "current": _summarise(
             np.asarray(current_tokens, dtype=np.float64),
@@ -785,19 +989,28 @@ def score(
             np.asarray(block_tokens, dtype=np.float64), block_accepted, block_ladder
         ),
         "paired_delta_tokens_per_window": (
-            float(np.mean(paired)) if cycles else float("nan")
+            float(np.mean(paired)) if scored else float("nan")
         ),
         "paired_delta_sem": (
-            float(np.std(paired, ddof=1) / np.sqrt(cycles))
-            if cycles > 1
+            float(np.std(paired, ddof=1) / np.sqrt(scored))
+            if scored > 1
             else float("nan")
         ),
         "alpha_uncensored": {
-            "mean": [float(np.mean(alpha[:, d])) for d in range(DEPTH)],
-            "p_zero": [float(np.mean(alpha[:, d] <= 0.0)) for d in range(DEPTH)],
-            "p_one": [float(np.mean(alpha[:, d] >= 1.0)) for d in range(DEPTH)],
+            "mean": [
+                float(np.mean(alpha[:, d])) if scored else float("nan")
+                for d in range(depth)
+            ],
+            "p_zero": [
+                float(np.mean(alpha[:, d] <= 0.0)) if scored else float("nan")
+                for d in range(depth)
+            ],
+            "p_one": [
+                float(np.mean(alpha[:, d] >= 1.0)) if scored else float("nan")
+                for d in range(depth)
+            ],
         },
-        "agree_fraction": (agree / cycles) if cycles else float("nan"),
+        "agree_fraction": (agree / scored) if scored else float("nan"),
         "ladder_all_one_cycles": ladder_one,
         "ladder_all_one_agree_fraction": (
             (ladder_one_agree / ladder_one) if ladder_one else float("nan")
@@ -831,29 +1044,53 @@ def _summarise(
             float(np.std(length, ddof=1) / np.sqrt(size)) if size > 1 else float("nan")
         ),
         "reach_by_depth": [
-            float(np.mean(ladder[:, depth])) if size else float("nan")
-            for depth in range(DEPTH)
+            float(np.mean(ladder[:, position])) if size else float("nan")
+            for position in range(int(ladder.shape[1]))
         ],
         "accepted_mean": float(np.mean(accepted_arr)) if size else float("nan"),
         "full_accept_fraction": (
-            float(np.mean(accepted_arr == DEPTH)) if size else float("nan")
+            float(np.mean(accepted_arr == int(ladder.shape[1])))
+            if size
+            else float("nan")
         ),
     }
 
 
 def report(result: dict[str, Any], *, ms_per_window: float | None) -> str:
+    depth = int(result["depth"])
     lines: list[str] = []
-    lines.append(f"cycles                     {result['cycles']}")
+    lines.append(
+        f"layout                     {result['layout']}   depth={depth}   "
+        f"raw logits={'yes' if result['has_raw_logits'] else 'no'}"
+    )
+    lines.append(
+        f"cycles                     {result['cycles']} "
+        f"({result['cycles_scored']} scored, "
+        f"{result['cycles_skipped_incomplete']} skipped as incomplete)"
+    )
     lines.append(f"water-fill cap             {result['cap_mode']}")
     mismatches = result["replay_mismatch_cycles"]
     lines.append(
         "current-law replay         "
         + (
-            f"EXACT on all {result['cycles']} logged decisions"
+            f"EXACT on all {result['cycles_scored']} scored decisions"
             if not mismatches
             else f"MISMATCH on {len(mismatches)} cycles {mismatches[:8]}"
         )
     )
+    if result["layout"] == LAYOUT_STOCK:
+        lines.append(
+            "                           stock lane: accept coins past the "
+            "first rejection are"
+        )
+        lines.append(
+            "                           filled from the window's logged PCG64 "
+            "state -- the same"
+        )
+        lines.append(
+            "                           stream for both laws, so the pairing "
+            "holds."
+        )
     lines.append("")
     lines.append(
         "E[tokens/window] = 1 + sum_d w_d, with the accept coins integrated "
@@ -862,17 +1099,17 @@ def report(result: dict[str, Any], *, ms_per_window: float | None) -> str:
         "exactness."
     )
     lines.append("")
+    reach_header = "".join(f"{f'w{position + 1}':>9}" for position in range(depth))
     lines.append(
-        f"{'':12}{'E[tok/win]':>12}{'+-sem':>9}"
-        f"{'w1':>9}{'w2':>9}{'w3':>9}{'replay':>9}{'+-sem':>8}"
+        f"{'':12}{'E[tok/win]':>12}{'+-sem':>9}{reach_header}"
+        f"{'replay':>9}{'+-sem':>8}"
     )
     for name in ("current", "block"):
         row = result[name]
-        reach = row["reach_by_depth"]
+        reach = "".join(f"{value:>9.4f}" for value in row["reach_by_depth"])
         lines.append(
             f"{name:12}{row['tokens_per_window_e']:>12.4f}"
-            f"{row['tokens_per_window_e_sem']:>9.4f}"
-            f"{reach[0]:>9.4f}{reach[1]:>9.4f}{reach[2]:>9.4f}"
+            f"{row['tokens_per_window_e_sem']:>9.4f}{reach}"
             f"{row['tokens_per_window']:>9.4f}{row['tokens_per_window_sem']:>8.4f}"
         )
     delta = result["paired_delta_tokens_per_window"]
@@ -890,11 +1127,15 @@ def report(result: dict[str, Any], *, ms_per_window: float | None) -> str:
         "receipts stop\nat the first rejection):"
     )
     lines.append(
-        f"{'':12}{'d1':>9}{'d2':>9}{'d3':>9}"
+        f"{'':12}" + "".join(f"{f'd{i + 1}':>9}" for i in range(depth))
     )
-    for label, key in (("E[alpha]", "mean"), ("P(alpha=0)", "p_zero"), ("P(alpha=1)", "p_one")):
+    for label, key in (
+        ("E[alpha]", "mean"),
+        ("P(alpha=0)", "p_zero"),
+        ("P(alpha=1)", "p_one"),
+    ):
         row = alpha[key]
-        lines.append(f"{label:12}{row[0]:>9.4f}{row[1]:>9.4f}{row[2]:>9.4f}")
+        lines.append(f"{label:12}" + "".join(f"{value:>9.4f}" for value in row))
     lines.append("")
     lines.append(
         f"laws agree on              {result['agree_fraction'] * 100:.2f}% of windows"
@@ -952,6 +1193,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2)
+    if not result["cycles_scored"]:
+        print(
+            "\nFAIL: no window in this log carries a complete set of rows. "
+            "A greedy run (temperature <= 0) builds no distributions at all, "
+            "and the lazy per-row target path builds only the rows it reaches.",
+            file=sys.stderr,
+        )
+        return 1
     if result["replay_mismatch_cycles"] and not args.allow_replay_mismatch:
         print(
             "\nFAIL: the current-law replay no longer mirrors the device "

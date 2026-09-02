@@ -25,6 +25,28 @@ so ``beta`` -- the total-variation overlap of the prepared rows -- *is* the
 per-depth acceptance probability, computed in closed form with no sampling.
 Nothing in this script draws a random number.
 
+Two lanes, two ceilings on what a sweep can see
+-----------------------------------------------
+``pr391_raw`` logs carry **raw logits** and the full-vocabulary softmax, so the
+sweep can move the top-p boundary in both directions and the only unknown is
+the truncated tail's tempered mass (bracketed below).
+
+``stock_prepared`` logs cannot.  The stock native-MTP lane shapes its rows
+before the host ever sees them -- temperature, top-p, top-k, then two
+renormalisations (``sampling.py:122-176``) -- so:
+
+* ``values`` is ``log(probs)``, not a logit.  It ranks identically and is
+  exactly what the re-temperature consumes, so the sweep is still exact **on
+  the retained support**;
+* the truncated tail is gone, so ``--tail lump`` has nothing to lump and the
+  script forces ``--tail drop``.  A sweep can shrink the support, never grow
+  it: the acceptance a warmer proposal would have bought from tokens the
+  shaping dropped is invisible here, and the reported gain is a **lower
+  bound** for T > 1;
+* the run's own draft temperature is already baked in, so the swept ``T`` is a
+  *multiplier* on it.  The report prints ``T_eff`` -- the absolute temperature
+  each arm corresponds to -- whenever the two differ.
+
 Re-temperaturing, and the one thing the log cannot give
 -------------------------------------------------------
 A tempered softmax is a power of the original: ``exp(v/T) = exp(v)^(1/T)``, so
@@ -102,26 +124,30 @@ import numpy as np
 
 try:  # pragma: no cover - import shim, exercised both ways in practice
     from scripts.fable.offline_block_verification import (
-        DEPTH,
+        LAYOUT_STOCK,
         TOP_P,
         ZERO,
         load_log,
+        log_spec,
         lookup,
         lookup_many,
         prepare_batched_row,
         prepare_row,
+        prepared_row,
     )
 except ImportError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from offline_block_verification import (  # type: ignore[no-redef]
-        DEPTH,
+        LAYOUT_STOCK,
         TOP_P,
         ZERO,
         load_log,
+        log_spec,
         lookup,
         lookup_many,
         prepare_batched_row,
         prepare_row,
+        prepared_row,
     )
 
 DEFAULT_TEMPERATURES = (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2)
@@ -213,58 +239,122 @@ def score_arm(
 ) -> dict[str, Any]:
     """Per-depth beta and the implied chain, for one proposal shaping."""
 
+    spec = log_spec(log)
+    depth_count = int(spec["depth"])
+    prepared = spec["layout"] == LAYOUT_STOCK
+    draft_valid = log.get("draft_valid")
+    target_valid = log.get("target_valid")
     cycles = int(log["draft_tokens"].shape[0])
     if limit is not None:
         cycles = min(cycles, int(limit))
-    betas = np.zeros((cycles, DEPTH), dtype=np.float64)
-    zero_alpha = np.zeros((cycles, DEPTH), dtype=bool)
+    rows: list[np.ndarray] = []
+    zeros: list[np.ndarray] = []
+    skipped = 0
 
     for index in range(cycles):
-        for depth in range(DEPTH):
-            target_ids, target_probs = prepare_batched_row(
-                log["target_ids"][index, depth],
-                log["target_values"][index, depth],
-                log["target_probs"][index, depth],
-            )
+        if draft_valid is not None and not np.all(draft_valid[index, :depth_count]):
+            skipped += 1
+            continue
+        if target_valid is not None and not np.all(target_valid[index, :depth_count]):
+            skipped += 1
+            continue
+        beta_row = np.zeros(depth_count, dtype=np.float64)
+        zero_row = np.zeros(depth_count, dtype=bool)
+        for depth in range(depth_count):
+            if prepared:
+                target_ids, target_probs = prepared_row(
+                    log["target_ids"][index, depth],
+                    log["target_values"][index, depth],
+                    log["target_probs"][index, depth],
+                )
+            else:
+                target_ids, target_probs = prepare_batched_row(
+                    log["target_ids"][index, depth],
+                    log["target_values"][index, depth],
+                    log["target_probs"][index, depth],
+                )
             ids, values, probs = restrict_top_k(
                 np.asarray(log["draft_ids"][index, depth], dtype=np.uint32),
                 np.asarray(log["draft_values"][index, depth], dtype=np.float32),
-                np.asarray(log["draft_probs"][index, depth], dtype=np.float32),
+                np.asarray(log["draft_probs"][index, depth], dtype=np.float64),
                 top_k,
             )
+            keep = probs > 0.0
+            ids, values, probs = ids[keep], values[keep], probs[keep]
+            if ids.size == 0:
+                skipped += 1
+                beta_row = None
+                break
             tempered = temper_row(probs, temperature=temperature, tail=tail)
-            draft_ids, draft_probs = prepare_row(
-                ids, values, tempered.astype(np.float32), top_p=top_p
-            )
-            betas[index, depth] = overlap(
+            if prepared:
+                draft_ids, draft_probs = prepared_row(ids, values, tempered)
+            else:
+                draft_ids, draft_probs = prepare_row(
+                    ids, values, tempered.astype(np.float32), top_p=top_p
+                )
+            beta_row[depth] = overlap(
                 target_ids, target_probs, draft_ids, draft_probs
             )
             # P(alpha = 0) is a property of the drafted token, which a
             # re-shaped proposal would not have drawn.  Reported for the
             # logged token only, i.e. it is a T = 1 diagnostic.
             token = int(log["draft_tokens"][index, depth])
-            zero_alpha[index, depth] = (
-                lookup(target_ids, target_probs, token) <= ZERO
-            )
+            zero_row[depth] = lookup(target_ids, target_probs, token) <= ZERO
+        if beta_row is None:
+            continue
+        rows.append(beta_row)
+        zeros.append(zero_row)
 
-    chain = betas[:, 0] + betas[:, 0] * betas[:, 1] + (
-        betas[:, 0] * betas[:, 1] * betas[:, 2]
-    )
+    if not rows:
+        raise ValueError(
+            "no window in this log carries a complete set of draft and target "
+            "rows; a greedy run (temperature <= 0) builds no distributions."
+        )
+    betas = np.stack(rows)
+    zero_alpha = np.stack(zeros)
+    cycles = int(betas.shape[0])
+
+    # E[l] = sum_d prod_{j<=d} beta_j: the accept coins are independent given
+    # the rows, so the per-cycle product is the right estimator and the
+    # product of the per-depth means is only the same thing under an extra
+    # independence-across-cycles assumption.  Both are reported.
+    running = np.ones(int(betas.shape[0]), dtype=np.float64)
+    chain = np.zeros(int(betas.shape[0]), dtype=np.float64)
+    for depth in range(depth_count):
+        running = running * betas[:, depth]
+        chain = chain + running
     means = betas.mean(axis=0)
-    product_of_means = means[0] + means[0] * means[1] + means[0] * means[1] * means[2]
+    running_mean = 1.0
+    product_of_means = 0.0
+    for depth in range(depth_count):
+        running_mean *= float(means[depth])
+        product_of_means += running_mean
     expected_length = float(chain.mean())
     return {
         "temperature": float(temperature),
         "tail": tail,
         "top_p": float(top_p),
         "top_k": int(top_k),
+        "layout": spec["layout"],
+        # On the stock layout the logged row already carries the run's own
+        # draft temperature, so the swept T is a MULTIPLIER on it, not an
+        # absolute temperature: p ∝ exp(l / T_run) and p**(1/T) ∝
+        # exp(l / (T_run * T)).  On pr391_raw the rows are raw logits at T = 1
+        # and the two coincide.
+        "base_temperature": float(spec["draft_temperature"]),
+        "effective_temperature": float(spec["draft_temperature"]) * float(temperature),
         "cycles": cycles,
+        "cycles_skipped_incomplete": skipped,
         "beta": [float(value) for value in means],
         "beta_sem": [
-            float(betas[:, depth].std(ddof=1) / np.sqrt(cycles)) if cycles > 1 else float("nan")
-            for depth in range(DEPTH)
+            float(betas[:, depth].std(ddof=1) / np.sqrt(cycles))
+            if cycles > 1
+            else float("nan")
+            for depth in range(depth_count)
         ],
-        "zero_alpha": [float(zero_alpha[:, depth].mean()) for depth in range(DEPTH)],
+        "zero_alpha": [
+            float(zero_alpha[:, depth].mean()) for depth in range(depth_count)
+        ],
         "expected_length": expected_length,
         "expected_length_product_of_means": float(product_of_means),
         "tokens_per_window": expected_length + 1.0,
@@ -298,15 +388,32 @@ def report(rows: Sequence[dict[str, Any]], *, ms_per_window: float | None) -> st
         return "no arms scored"
     lines: list[str] = []
     first = rows[0]
+    depth_count = len(first["beta"])
     lines.append(
-        f"cycles {first['cycles']}   tail model {first['tail']}   "
+        f"layout {first['layout']}   cycles {first['cycles']} "
+        f"({first['cycles_skipped_incomplete']} skipped)   "
+        f"tail model {first['tail']}   "
         f"draft top-p {first['top_p']}   draft top-k {first['top_k']}"
     )
-    lines.append("")
-    header = (
-        f"{'T':>6}{'beta1':>9}{'beta2':>9}{'beta3':>9}"
-        f"{'E[l]':>10}{'tok/win':>10}{'vs T=1':>9}"
+    show_effective = (
+        first["layout"] == LAYOUT_STOCK
+        and np.isfinite(first["base_temperature"])
+        and abs(first["base_temperature"] - 1.0) > 1e-12
     )
+    if first["layout"] == LAYOUT_STOCK:
+        lines.append(
+            "NOTE: stock-lane rows are already shaped -- no raw logits, no "
+            "truncated tail.\n      The sweep re-tempers the RETAINED support "
+            "only (p' prop p**(1/T)), so it\n      can shrink the support but "
+            "never recover mass the shaping dropped. T is a\n      MULTIPLIER "
+            f"on the run's own draft temperature "
+            f"({first['base_temperature']:.3f}); T_eff is the\n      absolute "
+            "temperature it corresponds to."
+        )
+    lines.append("")
+    header = f"{'T':>6}" + (f"{'T_eff':>8}" if show_effective else "")
+    header += "".join(f"{f'beta{i + 1}':>9}" for i in range(depth_count))
+    header += f"{'E[l]':>10}{'tok/win':>10}{'vs T=1':>9}"
     if ms_per_window:
         header += f"{'tok/s':>10}"
     lines.append(header)
@@ -315,10 +422,12 @@ def report(rows: Sequence[dict[str, Any]], *, ms_per_window: float | None) -> st
     )
     for row in rows:
         delta = row["tokens_per_window"] / base["tokens_per_window"] - 1.0
-        line = (
-            f"{row['temperature']:>6.2f}"
-            f"{row['beta'][0]:>9.4f}{row['beta'][1]:>9.4f}{row['beta'][2]:>9.4f}"
-            f"{row['expected_length']:>10.4f}{row['tokens_per_window']:>10.4f}"
+        line = f"{row['temperature']:>6.2f}"
+        if show_effective:
+            line += f"{row['effective_temperature']:>8.3f}"
+        line += (
+            "".join(f"{value:>9.4f}" for value in row["beta"])
+            + f"{row['expected_length']:>10.4f}{row['tokens_per_window']:>10.4f}"
             f"{delta * 100:>8.2f}%"
         )
         if ms_per_window:
@@ -369,13 +478,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     log = load_log(args.npz)
-    if "draft_values" not in log:
+    spec = log_spec(log)
+    if spec["layout"] == LAYOUT_STOCK and args.tail == "lump":
+        # The stock lane's rows were renormalised over the retained support
+        # before the host ever saw them, so there is no tail mass to lump.
         print(
-            "FAIL: this log has no draft logits, so it cannot be "
-            "re-temperatured.",
+            "[offline-draft-temperature] stock_prepared layout: forcing "
+            "--tail drop (the truncated tail is not in the log).",
             file=sys.stderr,
         )
-        return 1
+        args.tail = "drop"
     rows = sweep(
         log,
         temperatures=args.temperatures,

@@ -546,20 +546,35 @@ looking inert.
 
 ## K20 row logging and the offline acceptance scorers
 
-`MTPLX_FABLE_K20_LOG=<path.npz>` captures, per verify cycle, the seven prepared
-K20 rows the PR391 D3/M4 decision already holds — 3 draft rows and 4 target
-rows, ids + top-20 logits + full-vocabulary probabilities — plus the drafted
-tokens, the 3 draft-select and 4 decision PCG64 uniforms, and the decision
-outputs. About 0.66 MB per 1,024-token request. Read once at import, default
-off; see `mtplx/fable_k20_log.py` for the full field list and the cost note.
+`MTPLX_FABLE_K20_LOG=<path.npz>` captures, per verify window, the K20 rows the
+accept decision holds — draft rows for every depth and target rows for every
+position — plus the drafted tokens, the primary, the PCG64 draws, and the
+decision outputs. About 0.66 MB per 1,024-token request. Read once at import,
+default off; see `mtplx/fable_k20_log.py` for the field list and the cost note.
 
-The rows are folded into the decision's existing `mx.eval`, so an armed run
-adds no new synchronisation — but it does add a ~1.7 kB device-to-host copy per
-cycle on the critical path. **An instrumented run is a data run, not a timing
-run.** Read tok/s off an un-instrumented arm.
+**It captures whichever lane the run uses**, and records which — the two lanes
+hold their rows at different stages of shaping:
+
+| layout | lane | rows are | raw logits |
+|---|---|---|---|
+| `pr391_raw` | opt-in softfloat64 D3/M4 device kernel (`--d3-softfloat64-route`) | the kernel's **raw** input; top-p 0.95 and the double renormalisation happen inside it | yes |
+| `stock_prepared` | the **retained** stock native-MTP host accept loop (the default) | **already** temperature/top-p/top-k shaped and renormalised | no — `values` is `log(prob)` |
+
+On the pr391 lane the rows ride the decision's existing `mx.eval`, so an armed
+run adds no new synchronisation — just a ~1.7 kB device-to-host copy per cycle.
+On the stock lane there is no device work at all: every array copied is one the
+host already built for its own decision. Either way the copies sit on the
+critical path, so **an instrumented run is a data run, not a timing run.** Read
+tok/s off an un-instrumented arm.
+
+An armed run that captures nothing **exits non-zero** and says why — a silent
+empty file is the failure this instrumentation exists to prevent. A greedy run
+(`temperature <= 0`) builds no distributions at all, so its windows are recorded
+with `greedy = 1` and no rows, and the scorers skip them and say so.
 
 ```
-MTPLX_FABLE_K20_LOG=/tmp/rows.npz <the usual PR391 D3 benchmark command>
+# Either lane; the log records which one fired.
+MTPLX_FABLE_K20_LOG=/tmp/rows.npz <the usual ABBA / benchmark command>
 
 # H §Option B — block verification vs the shipped law, same logged uniforms
 python scripts/fable/offline_block_verification.py /tmp/rows.npz \
@@ -571,11 +586,22 @@ python scripts/fable/offline_draft_temperature.py /tmp/rows.npz --tail lump
 python scripts/fable/offline_draft_temperature.py /tmp/rows.npz --tail drop
 ```
 
-Both scorers are pure NumPy and never import mlx. `offline_block_verification`
-replays the **shipped** law first and fails if it disagrees with the decision
-the device kernel logged — that check is what makes the block-law number
-trustworthy — and it fails again if block verification diverges on a window
-whose reach credit stayed at 1, where the two laws are provably identical.
+Both scorers are pure NumPy, never import mlx, and load either layout through
+one path — they branch only on whether the rows still need the kernel's
+preparation. `offline_block_verification` replays the **shipped** law first and
+fails if it disagrees with the decision the lane logged (on the stock layout,
+every field except the correction id, which is drawn off the live generator and
+so is not reproducible offline) — that check is what makes the block-law number
+trustworthy. It fails again if block verification diverges on a window whose
+reach credit stayed at 1, where the two laws are provably identical, or if no
+window in the log is complete enough to score.
+
+Two stock-lane caveats the scorers print rather than hide: accept coins past
+the first rejection were never drawn, so a counterfactual that accepts deeper
+uses a stream seeded from the window's own logged PCG64 state (the same stream
+for both laws); and the temperature sweep can only re-temper the **retained**
+support, since the shaping dropped the tail before the host saw it — so for
+T > 1 its number is a lower bound.
 
 Quote the `E[tok/win]` column (accept coins integrated out, paired standard
 error), not the `replay` column; the replay is the exactness proof, and its

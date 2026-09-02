@@ -8508,6 +8508,17 @@ def generate_mtpk(
     else:
         _pr391_stop_ids = None
         _pr391_stop_count = None
+    if _FABLE_K20_LOG:
+        # The stock lane's rows arrive ALREADY shaped, so an offline
+        # re-temperature needs the temperature that shaped them.
+        k20_log.set_sampler(sampler=sampler, draft_sampler=draft_sampler)
+        if _pr391_route is None:
+            k20_log.set_stop_ids(
+                np.asarray(
+                    tuple(sorted(int(token) for token in stop_token_ids)),
+                    dtype=np.uint32,
+                )
+            )
     started_all = time.perf_counter()
     if constraint is not None:
         # The repetition trimmer retracts committed tokens, which would
@@ -12362,6 +12373,27 @@ def generate_mtpk(
         _host_accept_drafts = (
             () if _pr391_verifier_decision is not None else draft_tokens
         )
+        if _FABLE_K20_LOG and _host_accept_drafts:
+            # MTPLX_FABLE_K20_LOG (default off): the stock native-MTP lane's
+            # own K20 rows. Everything copied here is an array this lane has
+            # ALREADY built on the host for its own accept decision -- the
+            # full-depth draft chain in `draft_probs` and whichever target
+            # support was materialised (`target_distribution_batch`, the
+            # per-row `target_distributions` list, or neither on the lazy
+            # path, which fills rows in through stock_depth below). No device
+            # work, no mx.eval, no new sync. `stock_open` closes any window
+            # still open, so no `break`/`continue` in the accept loop needs a
+            # hook of its own.
+            k20_log.stock_open(
+                primary=int(primary),
+                draft_tokens=draft_tokens,
+                draft_probs=draft_probs,
+                target_batch=target_distribution_batch,
+                target_list=target_distributions,
+                bonus_allowed=bool(bonus_distribution_row_needed),
+                greedy=bool(sampler.temperature <= 0),
+                rng=rng,
+            )
         # Grammar clamp (#186 phase 3): drafts are proposed unmasked, so the
         # committed window must stop at the grammar's legal prefix. One
         # stateless validate call per cycle; the matcher itself only advances
@@ -12401,6 +12433,10 @@ def generate_mtpk(
             ).tolist()
         for depth_index, draft_token in enumerate(_host_accept_drafts):
             target_logits_for_draft = verify_logits[:, depth_index, :]
+            # Two unconditional local stores, so the K20 log never reads a
+            # value that leaked from the previous iteration. Nothing else.
+            _k20_coin: float | None = None
+            _k20_target_row: Any = None
             if _steer_active:
                 _row_guard_overlay = _steer_overlay(
                     [*tokens, *draft_tokens[:depth_index]]
@@ -12450,7 +12486,8 @@ def generate_mtpk(
                 accept_prob = (
                     1.0 if q <= 0 and p > 0 else (0.0 if q <= 0 else min(1.0, p / q))
                 )
-                accepted_now = float(rng.random()) <= accept_prob
+                _k20_coin = float(rng.random())
+                accepted_now = _k20_coin <= accept_prob
                 target_p_for_cache = (
                     target_distribution_batch.to_distribution(depth_index)
                     if online_correction_cache
@@ -12506,7 +12543,9 @@ def generate_mtpk(
                 accept_prob = compute_acceptance_probability(
                     target_p, draft_q, draft_token
                 )
-                accepted_now = float(rng.random()) <= accept_prob
+                _k20_coin = float(rng.random())
+                accepted_now = _k20_coin <= accept_prob
+                _k20_target_row = target_p
                 target_p_for_cache = target_p
                 correction = (
                     draft_token
@@ -12561,6 +12600,18 @@ def generate_mtpk(
             event["drafts"][depth_index]["accepted"] = accepted_now
             event["drafts"][depth_index]["accept_probability"] = float(accept_prob)
             event["drafts"][depth_index]["correction"] = int(correction)
+            if _FABLE_K20_LOG:
+                # After the grammar clamp, so the log carries the COMMITTED
+                # outcome. `_k20_target_row` is set only on the lazy per-row
+                # path; the batched and list paths were copied at stock_open.
+                k20_log.stock_depth(
+                    depth_index,
+                    target_p=_k20_target_row,
+                    accept_prob=float(accept_prob),
+                    coin=_k20_coin,
+                    accepted=bool(accepted_now),
+                    correction=int(correction),
+                )
             accept_probability_sum_by_depth[depth_index] += float(accept_prob)
             if _draft_conf_trace:
                 # After the constraint clamp: attribute to the COMMITTED
@@ -12974,6 +13025,8 @@ def generate_mtpk(
                 pending_primary = bonus
                 bonus_tokens += 1
                 event["bonus_token"] = int(bonus)
+                if _FABLE_K20_LOG:
+                    k20_log.stock_bonus(int(bonus))
                 emit_new_tokens()
                 if _is_stop(bonus, stop_token_ids):
                     maybe_eval_state_roots(event, len(tokens))
@@ -13336,9 +13389,11 @@ def generate_mtpk(
         # below remains responsible for any pending primary.
         _pr391_carried_d3 = None
 
-    if _FABLE_K20_LOG and _pr391_route is not None:
-        # Explicit K20-row flush at end of generation; the atexit hook in
-        # mtplx.fable_k20_log is only the backstop for an aborted run.
+    if _FABLE_K20_LOG:
+        # Explicit K20-row flush at end of generation, for either lane. The
+        # atexit hook in mtplx.fable_k20_log is the backstop for an aborted
+        # run, and the one that fails the process when nothing was captured.
+        k20_log.stock_close()
         k20_log.flush()
 
     if token_callback is not None and _stream_gate.window > 0:
