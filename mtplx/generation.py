@@ -63,7 +63,9 @@ from .fable_device_draft_chain import (
     claim_request_route as _fable_device_draft_chain_claim,
     is_enabled as _fable_device_draft_chain_enabled,
     mode as _fable_device_draft_chain_mode,
+    device_cycle_offset as _fable_device_draft_chain_offset,
     prewarm as _fable_device_draft_chain_prewarm,
+    rollback_to_device_offset as _fable_device_draft_chain_rollback,
     release as _fable_device_draft_chain_release,
     run_cycle as _fable_device_draft_chain_run,
 )
@@ -10969,9 +10971,24 @@ def generate_mtpk(
                 mtp_history_live_resets += 1
                 mtp_history_live_appended = 0
             mtp_cache = mtp_history_cache
+            # MTPLX_FABLE_DEVICE_DRAFT_CHAIN: the compiled body needs a
+            # fixed-capacity MTP cache, and promoting to `TensorOffsetQSACache`
+            # turns this free python-int read into `int(mx.array)` -- an eval
+            # that flushes the command queue and waits for the GPU, once per
+            # cycle, inside no timer.  Windows 1788400641/2 measured the pair
+            # of them (this and the rollback below) at +0.41..0.44 ms/cycle in
+            # the unattributed span: six arms, two modes, spread 0.03 ms.  On
+            # this route the only consumer of `cycle_mtp_offset` is that
+            # rollback, so keep the whole quantity lazy and on device.  `None`
+            # means no device path and the stock read runs.
+            _ddc_cycle_offset = _fable_device_draft_chain_offset(
+                _device_draft_chain_plan, mtp_cache
+            )
             cycle_mtp_offset = (
                 int(_pr391_carried_d3["cycle_offset"])
                 if _pr391_carried_d3 is not None
+                else _ddc_cycle_offset
+                if _ddc_cycle_offset is not None
                 else _mtp_cache_offset(mtp_cache)
             )
         else:
@@ -14239,7 +14256,15 @@ def generate_mtpk(
                         ],
                     )
                 else:
-                    _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                    # Same two-sync story as the offset read above: the stock
+                    # rollback opens with `int(getattr(cache, 'offset', 0))`.
+                    # `trim to target` is exactly `min(current, target)` on a
+                    # cleared rollback_state, so the route does it in-graph; a
+                    # False return means it declined and the stock path runs.
+                    if not _fable_device_draft_chain_rollback(
+                        _device_draft_chain_plan, mtp_cache, cycle_mtp_offset + 1
+                    ):
+                        _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                     draft_time += append_mtp_history(
                         mtp_cache,
                         verify_hidden[:, : max(0, len(committed) - 1), :],
@@ -14469,7 +14494,15 @@ def generate_mtpk(
                         authoritative_after_primary=verify_hidden[:, 0:1, :],
                     )
                 else:
-                    _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                    # Same two-sync story as the offset read above: the stock
+                    # rollback opens with `int(getattr(cache, 'offset', 0))`.
+                    # `trim to target` is exactly `min(current, target)` on a
+                    # cleared rollback_state, so the route does it in-graph; a
+                    # False return means it declined and the stock path runs.
+                    if not _fable_device_draft_chain_rollback(
+                        _device_draft_chain_plan, mtp_cache, cycle_mtp_offset + 1
+                    ):
+                        _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                     draft_time += append_mtp_history(
                         mtp_cache,
                         verify_hidden[:, 0:1, :],
@@ -14733,7 +14766,15 @@ def generate_mtpk(
                     authoritative_after_primary=authoritative_history,
                 )
             else:
-                _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                # Same two-sync story as the offset read above: the stock
+                # rollback opens with `int(getattr(cache, 'offset', 0))`.
+                # `trim to target` is exactly `min(current, target)` on a
+                # cleared rollback_state, so the route does it in-graph; a
+                # False return means it declined and the stock path runs.
+                if not _fable_device_draft_chain_rollback(
+                    _device_draft_chain_plan, mtp_cache, cycle_mtp_offset + 1
+                ):
+                    _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                 history_tokens = committed[1:]
                 if committed_from_capture or committed_from_trim:
                     history_hidden = verify_hidden[

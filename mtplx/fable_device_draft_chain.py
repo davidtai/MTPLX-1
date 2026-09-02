@@ -227,6 +227,13 @@ COUNTERS: dict[str, int] = {
     # depth the body was traced at (the last cycle of a request, when
     # `max_tokens - len(tokens) < planned_depth`).  Those run the stock loop.
     "short_cycles": 0,
+    # The two per-cycle MTP-offset reads the cache promotion would otherwise
+    # turn into command-queue drains (see the section at the bottom of this
+    # module).  `declined` counts the cycles that fell back to the stock
+    # host-read rollback because `rollback_state` held row snapshots.
+    "offset_reads_kept_on_device": 0,
+    "offset_rollbacks_on_device": 0,
+    "offset_rollback_declined": 0,
     "refusals": 0,
 }
 
@@ -1082,6 +1089,7 @@ __all__ = [
     "MODE_OFF",
     "TOP_K",
     "claim_request_route",
+    "device_cycle_offset",
     "fast_midpoint_descriptors",
     "host_support_tail",
     "is_enabled",
@@ -1089,5 +1097,123 @@ __all__ = [
     "prewarm",
     "release",
     "reset_counters",
+    "rollback_to_device_offset",
     "run_cycle",
 ]
+
+
+# ---------------------------------------------------------------------------
+# The MTP-offset syncs the promotion introduces
+# ---------------------------------------------------------------------------
+#
+# Measured on windows 1788400641 (body) and 1788400642 (chain): the candidate
+# arms carry +0.41..+0.44 ms/cycle in the part of the decode loop that NO timer
+# covers -- six arms, two modes, three seeds, spread 0.03 ms -- while every
+# named span (verify, accept, snapshot, capture_commit) is flat and
+# `draft_time_s` falls by 0.34..0.42 ms/cycle.  The saving and the cost are the
+# same size, which is why the cycle barely moved.
+#
+# The cause is the cache promotion this route needs.  `mx.compile` re-traces
+# when a captured leaf changes shape, so the compiled body requires a
+# fixed-capacity MTP cache, and `promote_kv_cache_offsets` supplies one by
+# swapping `QSACache` (whose `offset` is `kv.offset`, a plain python int) for
+# `TensorOffsetQSACache` (whose `offset` is `cache[2]`, an `mx.array`).  Two
+# per-cycle reads then stop being free:
+#
+#   generation.py  `cycle_mtp_offset = _mtp_cache_offset(mtp_cache)`
+#   generation.py  `_rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)`
+#                  -> `current = int(getattr(cache, "offset", 0))`
+#
+# Neither is inside a span, and neither is a cheap scalar readback: `int()` on
+# a lazy `mx.array` evaluates it, which flushes the command queue and waits for
+# the GPU -- once at the top of the cycle and once right after the verify, at
+# two points where the stock lane never stalls.  ~0.21 ms each.
+#
+# The fix keeps the whole quantity ON DEVICE.  On this route
+# `cycle_mtp_offset`'s only consumer is the rollback (`reconcile_mtp_indexer_history`
+# is refused with `qsa_mtp_precompute`, and the `int(cycle_mtp_offset)`
+# lookahead site is PR391's), so nothing ever needs its host value.
+#
+# Equivalence.  `_rollback_mtp_cache(cache, target)` computes
+# `trim = max(0, current - target)` and calls `cache.trim(trim)`, which -- on a
+# cleared `rollback_state`, which this route guarantees -- is
+# `cache[2] = max(cache[2] - trim, 0)`.  Substituting:
+#
+#     max(current - max(0, current - target), 0)
+#         == max(min(current, target), 0)
+#         == min(current, target)                     for target >= 0
+#
+# so the whole operation is one in-graph `mx.minimum`.  No host read, no
+# host-side offset arithmetic to drift, and no tracking state to get wrong --
+# which is why this is preferred over carrying a python int the way
+# `_pr391_carried_d3["cycle_offset"]` does.
+
+
+def _tensor_offset_entry(mtp_cache: Any) -> Any:
+    """The promoted KV entry whose ``cache[2]`` is a device offset, else None."""
+
+    if not mtp_cache:
+        return None
+    entry = mtp_cache[0]
+    kv = getattr(entry, "kv", entry)
+    slots = getattr(kv, "cache", None)
+    if not isinstance(slots, list) or len(slots) < 3:
+        return None
+    if not hasattr(slots[2], "dtype"):
+        return None  # a stock python-int offset: the reads are already free
+    return kv
+
+
+def device_cycle_offset(plan: DeviceDraftChainPlan | None, mtp_cache: Any) -> Any:
+    """This cycle's MTP offset as a LAZY device array, or None.
+
+    None means "no device path here" and the caller keeps
+    ``_mtp_cache_offset``.  Nothing is evaluated.
+    """
+
+    if plan is None or plan.released or plan.chain is None:
+        return None
+    if mtp_cache is not plan.mtp_cache:
+        return None
+    kv = _tensor_offset_entry(mtp_cache)
+    if kv is None:
+        return None
+    COUNTERS["offset_reads_kept_on_device"] += 1
+    return kv.cache[2]
+
+
+def rollback_to_device_offset(
+    plan: DeviceDraftChainPlan | None,
+    mtp_cache: Any,
+    target: Any,
+) -> bool:
+    """Trim the MTP history to ``target`` in-graph.  True when it applied.
+
+    False means the caller must fall back to ``_rollback_mtp_cache``: either
+    this is not the route's promoted cache, or ``rollback_state`` holds the
+    row-restoring snapshot whose fast path is NOT equivalent to moving the
+    offset.  Fail-open to the stock path, never to a wrong trim.
+    """
+
+    if plan is None or plan.released or plan.chain is None:
+        return False
+    if mtp_cache is not plan.mtp_cache:
+        return False
+    kv = _tensor_offset_entry(mtp_cache)
+    if kv is None or not hasattr(target, "dtype"):
+        return False
+    rollback_state = getattr(kv, "rollback_state", None)
+    if rollback_state is not None and any(
+        slot is not None for slot in rollback_state
+    ):
+        # The row-restoring fast path in `TensorOffsetKVCache.trim` puts KEYS
+        # and VALUES back, not just the offset.  Equivalence does not hold; let
+        # the stock rollback run.
+        COUNTERS["offset_rollback_declined"] += 1
+        return False
+
+    import mlx.core as mx
+
+    kv.cache[2] = mx.minimum(kv.cache[2], target.astype(kv.cache[2].dtype))
+    COUNTERS["offset_rollbacks_on_device"] += 1
+    return True
