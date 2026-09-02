@@ -166,6 +166,10 @@ def _overlap_fold_scope(bank, fold_indices, state_in, pos, expected):
     their own copy of that mask because they are two graphs.  Returns ``None``
     when this half owns no folded layer, which is the same thing as the fold
     being off for it.
+
+    The returned scope is keyed BOTH by layer index and by shadow-entry
+    identity -- see ``fable_gdn_keepmask_fold.FoldPrefixScope`` for why the
+    entry key alone is not enough under ``MTPLX_COMPILED_GDN``.
     """
 
     if not fold_indices:
@@ -176,14 +180,9 @@ def _overlap_fold_scope(bank, fold_indices, state_in, pos, expected):
             f"split verify half got {len(trailing)} keep-mask fold leaves, "
             f"expected {expected}"
         )
-    mask_leaf = trailing[-1]
-    return {
-        id(bank._shadow[layer_index]): (
-            *trailing[position * 5 : position * 5 + 5],
-            mask_leaf,
-        )
-        for position, layer_index in enumerate(fold_indices)
-    }
+    return _gdn_fold.make_prefix_scope(
+        fold_indices, trailing, lambda index: bank._shadow[index]
+    )
 
 
 @dataclass(frozen=True)
@@ -3277,6 +3276,9 @@ class CompiledVerifyBank:
                     layer_count=layer_count,
                     compiled_aux=compiled_aux,
                 )
+            _gdn_fold.assert_prefix_consumed(
+                fold_scope, label="fixed-M4 overlap prefix half"
+            )
             captures_flat = []
             for index, names in prefix_capture:
                 layer_capture = captures[index]
@@ -3361,6 +3363,9 @@ class CompiledVerifyBank:
                         start=start_layer,
                     )
                 )
+            _gdn_fold.assert_prefix_consumed(
+                fold_scope, label="fixed-M4 overlap suffix half"
+            )
             captures_flat = []
             for index, names in suffix_capture:
                 layer_capture = captures[index]
@@ -5492,14 +5497,9 @@ class CompiledVerifyBank:
                         f"compiled verify got {len(trailing)} keep-mask fold "
                         f"leaves, expected {fold_prefix_leaves}"
                     )
-                mask_leaf = trailing[-1]
-                fold_scope = {
-                    id(shadow[layer_index]): (
-                        *trailing[position * 5 : position * 5 + 5],
-                        mask_leaf,
-                    )
-                    for position, layer_index in enumerate(fold_indices)
-                }
+                fold_scope = _gdn_fold.make_prefix_scope(
+                    fold_indices, trailing, lambda index: shadow[index]
+                )
             # (2) The existing runtime forward, on shadow containers only.
             with _gdn_fold.fold_prefix_scope(fold_scope):
                 with attention_phase("decode_verify"):
@@ -5510,6 +5510,14 @@ class CompiledVerifyBank:
                         hidden_variant=hidden_variant,
                         compiled_aux=compiled_aux,
                     )
+            # W66d: the fold is only exact because the step kernel that was
+            # handed the ring's BASE also replayed the ring.  A layer that
+            # missed its prefix does not decline -- it runs the stock
+            # recurrence from that base and silently drops committed windows,
+            # which no downstream counter can see.  Checked once, at trace.
+            _gdn_fold.assert_prefix_consumed(
+                fold_scope, label="compiled fixed-M4 verify"
+            )
             logits, hidden, captures = result
             # (3) Read every leaf back out and return it explicitly.
             captures_flat: list[Any] = []

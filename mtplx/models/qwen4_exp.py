@@ -5977,15 +5977,27 @@ class Qwen4ExpTextModel(nn.Module):
 
     def _compiled_run_fn(self, idxs, capture: bool = False):
         layers = [self.layers[i] for i in idxs]
+        indices = tuple(int(i) for i in idxs)
 
         def step(h, *flat):
             out_states = []
             rows = []
             k = 0
-            for layer in layers:
+            for layer, layer_index in zip(layers, indices):
                 c = ArraysCache(size=2)
                 c[0], c[1] = flat[k], flat[k + 1]
                 k += 2
+                if _GDN_KEEPMASK_FOLD_ARMED:
+                    # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66d).  This run hands
+                    # the layer a THROWAWAY container, not the compiled
+                    # verify's shadow entry, so the fold's entry-identity
+                    # lookup would miss — and a miss is not a decline: the
+                    # dispatch has already substituted the ring's BASE into
+                    # state slot 1, so the step would run the stock
+                    # recurrence from a state missing one or two committed
+                    # windows.  Re-point the entry key at this layer's
+                    # prefix.  A no-op outside a traced folded forward.
+                    _gdn_fold.bind_fold_alias(layer_index, c)
                 h = layer(h, input_ids=None, ssm_mask=None, cache=c)
                 out_states.extend((c[0], c[1]))
                 if capture:

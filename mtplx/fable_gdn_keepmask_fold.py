@@ -130,14 +130,53 @@ Wired, all behind ``MTPLX_FABLE_GDN_KEEPMASK_FOLD=1`` (default off):
    mask, which is an exact no-op and zero dispatches.
 3. ``CompiledVerifyBank._make_verify_step`` -- ``spec`` consumes ``state_in``
    positionally, so the prefix is ``state_in[pos:]``; it is bound into a
-   contextvar keyed by shadow-entry identity for the duration of the traced
-   forward.  ``_SHARED_VERIFY_STEPS``'s global key carries the fold dimension,
-   so a folded trace can never be served to a bank that is not passing a
-   prefix.
+   contextvar (``FoldPrefixScope``) keyed BOTH by layer index and by
+   shadow-entry identity for the duration of the traced forward, and the
+   trace ends with ``assert_prefix_consumed``.
+   ``_SHARED_VERIFY_STEPS``'s global key carries the fold dimension, so a
+   folded trace can never be served to a bank that is not passing a prefix.
 4. ``GatedDeltaNet.__call__`` (mtplx/models/qwen4_exp.py) -- captures the new
    rows first (unchanged), then runs ``prefix_gated_delta_update`` when a
    prefix is in scope.  ``y`` is already only the window's rows, so
    ``cache.advance(S)`` is untouched.
+4b. ``Qwen4ExpTextModel._compiled_run_fn`` (same file) -- binds each layer's
+   throwaway ``ArraysCache`` to that layer's prefix before calling it.  See
+   W66d below; without this the layer takes the stock recurrence FROM THE
+   RING'S BASE and drops committed windows.
+
+W66d -- THE DEFECT THE FIRST ABBA WINDOW MEASURED
+-------------------------------------------------
+The 2026-09-02 fold-alone bracket (``fable-w66b-gdn-fold-alone-*``, receipts
+``...1788400662..1788400673``) came back with every engagement counter exactly
+as predicted -- installed, 35 folded layers, ``windows == compiled_calls``
+(385/369/349), flushes 0.16-0.21/window, ring depths inside the max -- and
+three seeds of DIFFERENT TEXT, diverging by token ~10.
+
+The cause was a lookup, not arithmetic.  ``MTPLX_COMPILED_GDN=1`` is a family
+default (``abba_driver._arm_environment``, ``server/openai.py``'s runtime
+overrides), so ``Qwen4ExpTextModel._forward`` routes every ``S <= 4`` decode
+-- the M4 verify included -- through ``_decode_layers_compiled``, which runs
+each contiguous run of non-PLE GDN layers inside ``_compiled_run_fn``.  That
+body builds a fresh ``ArraysCache(size=2)`` per layer and passes IT as
+``cache``.  ALL 35 foldable layers sit in such runs, so the fold's
+entry-identity lookup missed every one of them: the layer ran the stock
+``gated_delta_update`` on ``state = cache[1]``, which ``_fold_state_in`` had
+already replaced with the ring's BASE.  Every window at ring depth >= 1
+therefore ran its recurrence from a state missing one or two committed
+windows.
+
+Nothing could see it.  Every counter in ``STATS`` is host-side ring
+bookkeeping -- a miss is not a decline, and the ring accounting stays
+perfectly self-consistent (the receipts' depth histogram, flush rate and
+deferred-commit count all reconcile to within one window).  The install-time
+exactness probe calls ``prefix_gated_delta_update`` directly, and the wiring
+tests are pure-Python simulations, so neither touched the scope lookup.
+
+Two things changed: the scope is keyed by layer index as well as by entry
+identity (``make_prefix_scope`` / ``bind_fold_alias``), and the traced forward
+now ends in ``assert_prefix_consumed`` -- a must-have-happened consequence
+that turns any future re-wrap of the GDN cache container into a loud
+trace-time raise instead of silently wrong logits.
 5. ``Qwen4ExpTextModel.commit_verified_window`` -- a partial accept whose
    verify was THIS window's compiled graph binds ``cache[1]`` to the lazy
    masked replay and hangs a ``FoldPending`` off the entry instead of
@@ -855,34 +894,155 @@ def clear_active(entry: Any) -> None:
 # The compiled verify's Python body runs at TRACE time only; replays bind the
 # same graph positionally.  The scope therefore exists purely so
 # ``GatedDeltaNet.__call__`` can wire the trailing prefix tracers into the
-# right layer's step while the trace is being built.  It is keyed by the
-# SHADOW entry's identity, so a layer with no prefix (the PLE-carrying GDN
-# layer, or any layer under a declined window) simply misses the map and takes
-# the stock ``gated_delta_update`` it takes today.
+# right layer's step while the trace is being built.
+#
+# W66d -- WHY THE SCOPE NEEDS TWO KEYS.  ``GatedDeltaNet.__call__`` can only
+# look a prefix up by the cache container it was handed, but that container is
+# NOT always the bank's shadow entry.  With ``MTPLX_COMPILED_GDN=1`` -- a
+# family default, set on every ABBA arm and by the server's own runtime
+# overrides -- ``Qwen4ExpTextModel._decode_layers_compiled`` runs each
+# contiguous run of non-PLE GDN layers through ``_compiled_run_fn``, whose
+# body builds a THROWAWAY ``ArraysCache(size=2)`` per layer and passes that.
+# Every foldable layer is inside such a run, so an entry-identity-only scope
+# missed all 35 of them: the layer took the stock ``gated_delta_update`` while
+# the dispatch had already substituted the ring's BASE into state slot 1, and
+# the recurrence silently ran from a state missing one or two committed
+# windows.  ``by_layer`` is therefore the authoritative map and
+# ``bind_fold_alias`` re-points the entry key at it on the way in.
+#
+# ``consumed`` is the must-have-happened consequence.  Every counter in
+# ``STATS`` is host-side ring bookkeeping and looked perfect on the run that
+# never dispatched a single prefix kernel; this one is incremented by the
+# layer itself and checked at the end of the trace.
 
-_PREFIX_SCOPE: ContextVar[dict[int, Any] | None] = ContextVar(
+_PREFIX_SCOPE: ContextVar["FoldPrefixScope | None"] = ContextVar(
     "mtplx_gdn_keepmask_fold_prefix", default=None
 )
 
 
-@contextlib.contextmanager
-def fold_prefix_scope(mapping: dict[int, Any] | None) -> Iterator[None]:
-    """Bind ``id(cache entry) -> prefix leaves`` for one traced forward."""
+@dataclass(slots=True)
+class FoldPrefixScope:
+    """One traced forward's prefix binding, addressable two ways.
 
-    token = _PREFIX_SCOPE.set(mapping)
+    ``by_layer`` maps a text-model layer index to that layer's
+    ``(q, k, v, a, b, mask)`` prefix leaves; ``by_entry`` maps
+    ``id(cache container)`` to the same tuple.  A layer with no prefix -- the
+    PLE-carrying GDN layer, or any layer on a half of the W67 split that does
+    not own it -- misses both maps and takes the stock recurrence.
+    """
+
+    by_layer: dict[int, Any] = field(default_factory=dict)
+    by_entry: dict[int, Any] = field(default_factory=dict)
+    consumed: int = 0
+
+    def __len__(self) -> int:  # pragma: no cover - convenience only
+        return len(self.by_layer)
+
+
+def _coerce_prefix_scope(scope: Any) -> "FoldPrefixScope | None":
+    """Accept a ``FoldPrefixScope``, a bare ``id(entry) -> leaves`` map, or None."""
+
+    if scope is None:
+        return None
+    if isinstance(scope, FoldPrefixScope):
+        return scope
+    if isinstance(scope, dict):
+        return FoldPrefixScope(by_layer={}, by_entry=dict(scope))
+    raise TypeError(f"unsupported keep-mask fold prefix scope: {type(scope)!r}")
+
+
+@contextlib.contextmanager
+def fold_prefix_scope(scope: Any) -> Iterator[None]:
+    """Bind one traced forward's prefix leaves (see :class:`FoldPrefixScope`)."""
+
+    token = _PREFIX_SCOPE.set(_coerce_prefix_scope(scope))
     try:
         yield
     finally:
         _PREFIX_SCOPE.reset(token)
 
 
+def make_prefix_scope(
+    fold_indices: Sequence[int], trailing: Sequence[Any], entry_for: Any
+) -> "FoldPrefixScope | None":
+    """Bind ``trailing`` -- 5 rows a layer plus one shared mask -- to layers.
+
+    ``entry_for(layer_index)`` returns the cache container the graph's own
+    re-seed loop assigned for that layer, which is the container a forward
+    that does NOT re-wrap the cache will hand to the step.  Returns ``None``
+    when this graph (or this half of the W67 split) owns no folded layer.
+    """
+
+    indices = tuple(int(index) for index in fold_indices)
+    expected = prefix_leaf_count(len(indices))
+    if len(trailing) != expected:
+        raise ValueError(
+            f"compiled verify got {len(trailing)} keep-mask fold leaves, "
+            f"expected {expected}"
+        )
+    if not indices:
+        return None
+    mask_leaf = trailing[-1]
+    by_layer: dict[int, Any] = {}
+    by_entry: dict[int, Any] = {}
+    for position, layer_index in enumerate(indices):
+        leaves = (*trailing[position * 5 : position * 5 + 5], mask_leaf)
+        by_layer[layer_index] = leaves
+        by_entry[id(entry_for(layer_index))] = leaves
+    return FoldPrefixScope(by_layer=by_layer, by_entry=by_entry)
+
+
+def bind_fold_alias(layer_index: int, entry: Any) -> None:
+    """Point ``entry`` at ``layer_index``'s prefix for the rest of this trace.
+
+    Called by every forward that hands a GDN layer a container other than the
+    one the compiled verify re-seeded -- today that is
+    ``Qwen4ExpTextModel._compiled_run_fn``'s per-layer ``ArraysCache``.  A
+    no-op outside a traced folded forward, and a REMOVAL when the layer owns
+    no prefix, so a recycled ``id()`` can never inherit another layer's rows.
+    """
+
+    scope = _PREFIX_SCOPE.get()
+    if scope is None:
+        return
+    leaves = scope.by_layer.get(int(layer_index))
+    if leaves is None:
+        scope.by_entry.pop(id(entry), None)
+    else:
+        scope.by_entry[id(entry)] = leaves
+
+
+def assert_prefix_consumed(scope: Any, *, label: str) -> None:
+    """Raise unless every folded layer actually took its prefix in the trace.
+
+    The fold is only exact because the deferred ring is replayed by the step
+    kernel that the dispatch handed the ring's BASE to.  A layer that misses
+    its prefix does not decline -- it runs the stock recurrence from that base
+    and silently drops one or two committed windows.  Nothing downstream can
+    see that, so it is checked here, at trace time, once.
+    """
+
+    scope = _coerce_prefix_scope(scope)
+    if scope is None:
+        return
+    if scope.consumed != len(scope.by_layer):
+        raise GdnKeepMaskFoldContractError(
+            f"{label}: {scope.consumed} of {len(scope.by_layer)} folded GDN "
+            "layers took the keep-mask prefix during the trace; the rest ran "
+            "the stock recurrence from a base whose ring was never replayed"
+        )
+
+
 def fold_prefix_for(entry: Any) -> Any:
     """This layer's ``(q, k, v, a, b, mask)`` prefix, or ``None``."""
 
     scope = _PREFIX_SCOPE.get()
-    if not scope:
+    if scope is None:
         return None
-    return scope.get(id(entry))
+    leaves = scope.by_entry.get(id(entry))
+    if leaves is not None:
+        scope.consumed += 1
+    return leaves
 
 
 # --------------------------------------------------------------------------
@@ -1074,6 +1234,7 @@ __all__ = [
     "ENV_WINDOWS",
     "FOLDABLE_LAYERS",
     "FoldPending",
+    "FoldPrefixScope",
     "GDN_LAYERS",
     "GdnKeepMaskFoldContractError",
     "MAX_WINDOWS_CHOICES",
@@ -1083,6 +1244,8 @@ __all__ = [
     "VERIFY_WIDTH",
     "active_for",
     "advance_ring",
+    "assert_prefix_consumed",
+    "bind_fold_alias",
     "clear_active",
     "clear_pending",
     "current_window_seq",
@@ -1092,6 +1255,7 @@ __all__ = [
     "fold_prefix_for",
     "fold_prefix_scope",
     "install_gdn_keepmask_fold",
+    "make_prefix_scope",
     "next_window_seq",
     "note_decline",
     "note_deferred_commit",

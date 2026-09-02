@@ -1342,8 +1342,13 @@ def test_overlap_fold_scope_maps_each_half_to_its_own_layers():
     trailing = [*rows, "MASK"]
     state_in = ["s0", "s1", *trailing]
     scope = module._overlap_fold_scope(bank, (0, 4), state_in, 2, 11)
-    assert scope[id(shadow[0])] == ("r0", "r1", "r2", "r3", "r4", "MASK")
-    assert scope[id(shadow[4])] == ("r5", "r6", "r7", "r8", "r9", "MASK")
+    assert scope.by_entry[id(shadow[0])] == ("r0", "r1", "r2", "r3", "r4", "MASK")
+    assert scope.by_entry[id(shadow[4])] == ("r5", "r6", "r7", "r8", "r9", "MASK")
+    # W66d: the same leaves are reachable by LAYER index, which is the key a
+    # forward that re-wraps the cache container (MTPLX_COMPILED_GDN) can use.
+    assert scope.by_layer[0] == ("r0", "r1", "r2", "r3", "r4", "MASK")
+    assert scope.by_layer[4] == ("r5", "r6", "r7", "r8", "r9", "MASK")
+    assert len(scope.by_entry) == 2
     assert len(scope) == 2
 
 
