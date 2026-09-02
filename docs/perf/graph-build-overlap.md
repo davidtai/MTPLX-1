@@ -302,4 +302,16 @@ Under each row's `ple_hot_rows` block:
 * `tests/test_graphbank_compiled_verify.py` and `tests/test_runtime_obs_graphbank.py` touch
   `mtplx/graphbank.py` and were **not** run — they build and evaluate MLX arrays.
   `tests/test_qwen4_fixed_host_tokens_static.py` was run: 5 failures, byte-identical to the
-  base branch's 5 (the PR391 split lane in flight), none new.
+  base branch's 5 (the PR391 split lane in flight), none new. Full pure-Python set after the
+  merge with the main tip: **166 passed, 5 pre-existing failed**.
+* `install_fixed_m4_split`'s four census assertions **are** covered — one test drives the real
+  method against the production geometry (48 layers, 36 linear / 12 full attention, PLE at
+  index 1) with `mx.compile` stubbed to identity, so an arm cannot fail at request setup on a
+  census drift without that test going red first. What is *not* covered is whether MLX's
+  tracer accepts the two closures on the real runtime; that first happens on the first cycle
+  of a real arm.
+* **Non-default `MTPLX_COMPILED_VERIFY_BOUNDARY`.** The join keeps the aux submission under
+  the same `boundary in ("both", "pre")` condition as the shipped route, but the prefix roots
+  its own outputs unconditionally. Under `boundary=none` with donation off — a combination
+  the ABBA never runs — that schedules work the monolithic route would have left lazy. Still
+  exact (`async_eval` only schedules), but untested.

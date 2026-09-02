@@ -667,3 +667,46 @@ def test_an_armed_flag_on_an_unsupported_route_refuses():
         or "requires the installed " in source
     )
     assert "elif _graph_build_overlap.enabled():" in source
+
+
+def test_install_fixed_m4_split_accepts_the_production_census(graphbank):
+    """The one path that would raise at request setup, on the real geometry.
+
+    ``install_fixed_m4_split`` is PR391's, and its four census assertions
+    (2 layer-0 state leaves, 6 layer-0 capture leaves, 132 / 213 for the rest)
+    are exactly what ``arm_fixed_m4_graph_build_overlap`` runs into at the
+    request boundary.  Checked against the production shape -- 48 layers,
+    36 linear / 12 full attention, one PLE layer at index 1 -- so a drift in
+    either census fails here instead of in a benchmark window.
+    """
+
+    entries = _build_cache()
+    bank, _calls, _aux = _make_bank(graphbank, entries=entries)
+    del bank.install_fixed_m4_split  # use the real method
+    bank._spec = [
+        (
+            index,
+            graphbank.VERIFY_SPEC_KIND_QSA
+            if index in QSA_INDICES
+            else graphbank.VERIFY_SPEC_KIND_GDN,
+            5 if index in QSA_INDICES else (4 if index == PLE_INDEX else 2),
+        )
+        for index in range(48)
+    ]
+    bank._extra_capture_layout = tuple(
+        (
+            index,
+            ("qkv", "q", "k", "v", "a", "b")
+            + (("ple_hidden", "ple_ids", "ple_conv_rows") if index == PLE_INDEX else ()),
+        )
+        for index in GDN_INDICES
+    )
+    bank.runtime = SimpleNamespace()
+    graphbank._recorder.compile = lambda fn: fn
+
+    bank.install_fixed_m4_split()
+
+    split = bank._fixed_m4_dispatch["split"]
+    assert split["prefix_state_leaves"] == PREFIX_STATE_LEAVES
+    assert split["prefix_capture_leaves"] == PREFIX_CAPTURE_LEAVES
+    assert split["suffix_capture_leaves"] == CAPTURE_LEAVES - PREFIX_CAPTURE_LEAVES
