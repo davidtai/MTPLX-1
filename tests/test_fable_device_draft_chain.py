@@ -364,6 +364,14 @@ class _StubArray:
     def reshape(self, *shape):
         return _StubArray(self.value.reshape(*shape), self.dtype)
 
+    def astype(self, dtype):
+        return _StubArray(self.value, dtype)
+
+    def __add__(self, other):
+        out = _StubArray(self.value + other, self.dtype)
+        out.evaluated = self.evaluated
+        return out
+
 
 class _StubMX(types.ModuleType):
     def __init__(self):
@@ -388,6 +396,12 @@ class _StubMX(types.ModuleType):
         for array in arrays:
             array.evaluated = True
         self.evals.append(len(arrays))
+
+    def minimum(self, left, right):
+        self.minimums = getattr(self, "minimums", 0) + 1
+        out = _StubArray(np.minimum(left.value, right.value), left.dtype)
+        out.evaluated = left.evaluated and right.evaluated
+        return out
 
 
 @pytest.fixture()
@@ -1053,3 +1067,196 @@ def test_body_mode_receipt_reports_three_readbacks(monkeypatch):
     plan = ddc.claim_request_route(**_claim_kwargs())
     assert plan.readbacks_per_cycle == DEPTH
     assert plan.to_dict()["mode"] == ddc.MODE_BODY
+
+
+# ---------------------------------------------------------------------------
+# The MTP-offset syncs the cache promotion introduces
+# ---------------------------------------------------------------------------
+
+
+def test_offset_rollback_algebra_matches_the_stock_trim():
+    """`min(current, target)` IS what `_rollback_mtp_cache` computes.
+
+    Stock: `trim = max(0, current - target)`, then
+    `TensorOffsetKVCache.trim` (cleared rollback_state) does
+    `cache[2] = max(cache[2] - trim, 0)`.  This is the whole equivalence
+    argument the in-graph path rests on, so it is checked exhaustively rather
+    than asserted in a comment.
+    """
+
+    for current in range(0, 300):
+        for target in range(0, 300):
+            trim = max(0, current - target)
+            stock = max(current - trim, 0)
+            assert stock == min(current, target), (current, target)
+
+
+class _FakeKV:
+    def __init__(self, offset, *, tensor=True, rollback=None):
+        self.cache = [
+            "keys",
+            "values",
+            _StubArray(np.int32(offset), "int32") if tensor else int(offset),
+        ]
+        if tensor:
+            self.cache[2].evaluated = True
+        self.rollback_state = list(rollback or [None, None, None])
+
+
+def _bound_plan(cache, *, mode=ddc.MODE_CHAIN):
+    plan = _fake_plan(mode, chain_fn=_fake_chain_fn({}))
+    plan.mtp_cache = cache
+    plan.chain = {"entry_kv": cache[0].kv if hasattr(cache[0], "kv") else None}
+    return plan
+
+
+class _FakeEntry:
+    def __init__(self, kv):
+        self.kv = kv
+
+
+def test_device_cycle_offset_returns_the_lazy_leaf_without_evaluating():
+    kv = _FakeKV(1234)
+    cache = [_FakeEntry(kv)]
+    plan = _bound_plan(cache)
+    ddc.reset_counters()
+    got = ddc.device_cycle_offset(plan, cache)
+    assert got is kv.cache[2]
+    assert ddc.COUNTERS["offset_reads_kept_on_device"] == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda plan, cache: setattr(plan, "released", True),
+        lambda plan, cache: setattr(plan, "chain", None),
+        lambda plan, cache: setattr(plan, "mtp_cache", [object()]),
+    ],
+)
+def test_device_cycle_offset_declines_when_the_route_is_not_live(mutate):
+    kv = _FakeKV(7)
+    cache = [_FakeEntry(kv)]
+    plan = _bound_plan(cache)
+    mutate(plan, cache)
+    assert ddc.device_cycle_offset(plan, cache) is None
+    assert ddc.device_cycle_offset(None, cache) is None
+
+
+def test_device_cycle_offset_declines_a_stock_python_int_offset():
+    """An unpromoted cache already reads for free; leave it alone."""
+
+    kv = _FakeKV(11, tensor=False)
+    cache = [_FakeEntry(kv)]
+    plan = _bound_plan(cache)
+    assert ddc.device_cycle_offset(plan, cache) is None
+
+
+def test_rollback_to_device_offset_trims_in_graph(stub_mx):
+    kv = _FakeKV(500)
+    cache = [_FakeEntry(kv)]
+    plan = _bound_plan(cache)
+    ddc.reset_counters()
+    target = _StubArray(np.int32(321), "int32")
+    target.evaluated = True
+    assert ddc.rollback_to_device_offset(plan, cache, target) is True
+    assert int(np.asarray(kv.cache[2].value)) == 321
+    assert ddc.COUNTERS["offset_rollbacks_on_device"] == 1
+    # Nothing was read back to the host: no eval was issued at all.
+    assert stub_mx.evals == []
+
+
+def test_rollback_to_device_offset_is_a_noop_past_the_target(stub_mx):
+    """`min` never grows the history, which `max(0, current-target)` also can't."""
+
+    kv = _FakeKV(100)
+    cache = [_FakeEntry(kv)]
+    plan = _bound_plan(cache)
+    target = _StubArray(np.int32(400), "int32")
+    target.evaluated = True
+    assert ddc.rollback_to_device_offset(plan, cache, target) is True
+    assert int(np.asarray(kv.cache[2].value)) == 100
+
+
+def test_rollback_declines_when_rollback_state_holds_rows(stub_mx):
+    """The row-restoring fast path is NOT equivalent to moving the offset."""
+
+    kv = _FakeKV(500, rollback=[_StubArray(np.int32(3)), "keys", "values"])
+    cache = [_FakeEntry(kv)]
+    plan = _bound_plan(cache)
+    ddc.reset_counters()
+    target = _StubArray(np.int32(321), "int32")
+    assert ddc.rollback_to_device_offset(plan, cache, target) is False
+    assert ddc.COUNTERS["offset_rollback_declined"] == 1
+    assert ddc.COUNTERS["offset_rollbacks_on_device"] == 0
+    assert int(np.asarray(kv.cache[2].value)) == 500
+
+
+def test_rollback_declines_a_foreign_cache(stub_mx):
+    kv = _FakeKV(500)
+    cache = [_FakeEntry(kv)]
+    plan = _bound_plan(cache)
+    target = _StubArray(np.int32(1), "int32")
+    assert ddc.rollback_to_device_offset(plan, [object()], target) is False
+    assert ddc.rollback_to_device_offset(None, cache, target) is False
+
+
+def test_every_rollback_site_keeps_the_stock_call_as_the_fallback():
+    """Three sites, each guarded, each still able to run the stock rollback."""
+
+    source = (REPO_ROOT / "mtplx" / "generation.py").read_text()
+    guarded = source.count("if not _fable_device_draft_chain_rollback(")
+    stock = source.count("_rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)")
+    assert guarded == 3
+    assert stock == 3, "every guarded site must keep the stock fallback"
+
+
+def test_the_cycle_offset_read_prefers_the_device_path():
+    source = (REPO_ROOT / "mtplx" / "generation.py").read_text()
+    start = source.index("_ddc_cycle_offset = _fable_device_draft_chain_offset(")
+    block = source[start : start + 600]
+    assert "else _ddc_cycle_offset" in block
+    assert "if _ddc_cycle_offset is not None" in block
+    assert "else _mtp_cache_offset(mtp_cache)" in block
+
+
+def test_no_unguarded_host_consumer_of_the_now_lazy_cycle_offset():
+    """`cycle_mtp_offset` is an mx.array on this route -- who reads it?
+
+    Making it lazy is only safe because on this route the ONLY consumer is the
+    rollback.  `int(cycle_mtp_offset)` belongs to PR391 (refused here) and
+    `cycle_offset=cycle_mtp_offset` goes to `reconcile_mtp_indexer_history`,
+    which sits inside `if qsa_mtp_precompute_active:` (also refused).  A new
+    host consumer would silently receive an array, so it is pinned here rather
+    than left to a comment.
+    """
+
+    lines = (REPO_ROOT / "mtplx" / "generation.py").read_text().split("\n")
+    unexplained = []
+    for index, line in enumerate(lines):
+        if "cycle_mtp_offset" not in line:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if "cycle_mtp_offset = " in line or "_ddc_cycle_offset" in line:
+            continue                                   # the assignment itself
+        if stripped.startswith("assert "):
+            continue                                   # identity, not value
+        if "_pr391" in line:
+            continue                                   # PR391 route, refused
+        if "cycle_mtp_offset + 1" in line:
+            continue                                   # the rollback argument
+        if "cycle_offset=cycle_mtp_offset" in line:
+            # The third site's gate is 17 lines up (the capture/trim branch
+            # sits between them), so the search window has to clear that.
+            window = "\n".join(lines[max(0, index - 40) : index])
+            assert "qsa_mtp_precompute_active" in window, (
+                f"line {index + 1}: reconcile site is no longer gated on "
+                "qsa_mtp_precompute_active, which this route refuses"
+            )
+            continue
+        unexplained.append((index + 1, stripped))
+    assert not unexplained, (
+        "new host consumer(s) of cycle_mtp_offset; it is a lazy mx.array when "
+        f"MTPLX_FABLE_DEVICE_DRAFT_CHAIN is bound: {unexplained}"
+    )
