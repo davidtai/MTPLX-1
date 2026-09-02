@@ -17,7 +17,10 @@ branch:
   with the same fail-closed "effective construction environment drifted" check,
 * the production benchmark cell (16,384-token coding prompt, 1,024 output
   tokens, temperature 1 / top-p 0.95 / top-k 20, reasoning ``xhigh``), which is
-  byte-identical to ``build_benchmark_cells``' ``coding-16k-1k-xhigh-t1`` cell,
+  byte-identical to ``build_benchmark_cells``' ``coding-16k-1k-xhigh-t1`` cell.
+  ``--prompt-tokens`` resizes that prompt (the label, the receipt path and
+  every other cell parameter are unchanged); the default reproduces the
+  pinned 16,384-token prompt byte for byte,
 * ``reset_run_caches`` between measured runs.
 
 D3 softfloat64 route
@@ -87,6 +90,22 @@ OUT_DIR = ROOT / ".benchmark-artifacts/fable"
 EXPECTED_MODEL = "29ba90f82124961d0d902a9ea9bbb1034972af2f"
 EXPECTED_PROMPT = "b9e9acf190a37eb12bad2171dea6bbfa4e13a8f1053ce4888e5c3cb3fadfdd20"
 PRODUCTION_CELL_LABEL = "coding-16k-1k-xhigh-t1"
+# The measured cell's prompt length.  16,384 is the production cell and the
+# only value whose prompt bytes are pinned by ``EXPECTED_PROMPT``; every
+# other value is built by ``build_exact_coding_prompt_ids`` from the same
+# SHA-pinned fixture pair, which is also how ``build_benchmark_cells``
+# builds its 64K/128K cells -- so ``--prompt-tokens 65536`` is the same
+# prompt as the matrix's ``coding-64k-1k-xhigh-t1``.
+DEFAULT_PROMPT_TOKENS = 16_384
+PROMPT_TOKEN_CHOICES = (
+    1_024,
+    8_192,
+    16_384,
+    32_768,
+    65_536,
+    131_072,
+    262_144,
+)
 MIN_AVAILABLE_BYTES = 90 * 1024**3
 MINIMUM_RESIDENT_BYTES = 89_480_048_859
 MEMORY_LIMIT_BYTES = 96 * 1024**3
@@ -840,24 +859,118 @@ def production_prompt_content() -> str:
     return content
 
 
-def build_production_cell(
-    runtime: Any, sampler_type: Any, *, label: str, max_tokens: int
-) -> dict[str, Any]:
-    """The ``coding-16k-1k-xhigh-t1`` cell, constructed identically."""
+def prompt_fixture_sha256() -> dict[str, str]:
+    """SHA-256 of both prompt fixtures, for the receipt.
 
-    prompt_ids = list(
-        runtime.tokenizer.apply_chat_template(
-            [{"role": "user", "content": production_prompt_content()}],
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
+    ``EXPECTED_PROMPT`` only pins the 16,384-token *content* string; a prompt
+    built at any other ``--prompt-tokens`` comes from the same two files, so
+    the receipt carries their hashes instead of a content hash that would only
+    describe the default.
+    """
+
+    return {
+        name: hashlib.sha256((FIXTURES / name).read_bytes()).hexdigest()
+        for name in (
+            "qwen38_generation_context.py",
+            "qwen38_naturalistic_generation_patch.jsonl",
+        )
+    }
+
+
+def templated_ids(result: Any) -> list[int]:
+    """Normalise ``apply_chat_template(tokenize=True)`` across tokenizers.
+
+    The runtime tokenizer returns a flat id list, for which this is a no-op.
+    A bare ``transformers`` 5.x tokenizer -- what the pure-Python tests use to
+    rebuild the same prompt without MLX -- returns a ``BatchEncoding`` whose
+    ``len()`` is the number of KEYS, and either flavour can return a batch of
+    one.  Mirrors ``longprompt_agreement_screen.templated_ids``.
+    """
+
+    if isinstance(result, Mapping):
+        result = result["input_ids"]
+    values = list(result)
+    if values and isinstance(values[0], (list, tuple)):
+        if len(values) != 1:
+            raise RuntimeError(
+                f"chat template returned {len(values)} sequences, expected 1"
+            )
+        values = list(values[0])
+    return [int(value) for value in values]
+
+
+def build_production_prompt_ids(
+    tokenizer: Any, *, prompt_tokens: int = DEFAULT_PROMPT_TOKENS
+) -> list[int]:
+    """The measured cell's prompt, exactly ``prompt_tokens`` tokens long.
+
+    At the default 16,384 this is the pinned production prompt, built exactly
+    as it always was, so existing receipts stay comparable byte for byte.  At
+    any other length it is ``build_exact_coding_prompt_ids`` over the same
+    SHA-pinned fixture pair -- the driver's own length-targeting path, the one
+    ``build_benchmark_cells`` already uses for its 64K and 128K cells -- so
+    ``--prompt-tokens 65536`` reproduces ``coding-64k-1k-xhigh-t1``.
+    ``production_prompt_content`` is called either way: it is the fixture
+    drift gate.
+    """
+
+    target = int(prompt_tokens)
+    if target not in PROMPT_TOKEN_CHOICES:
+        raise ValueError(
+            f"--prompt-tokens must be one of "
+            f"{', '.join(str(value) for value in PROMPT_TOKEN_CHOICES)}, "
+            f"got {target}"
+        )
+    content = production_prompt_content()
+    if target == DEFAULT_PROMPT_TOKENS:
+        prompt_ids = templated_ids(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+                reasoning_effort="xhigh",
+            )
+        )
+    else:
+        context = (FIXTURES / "qwen38_generation_context.py").read_text()
+        case = json.loads(
+            (FIXTURES / "qwen38_naturalistic_generation_patch.jsonl")
+            .read_text()
+            .splitlines()[0]
+        )
+        prompt_ids = build_exact_coding_prompt_ids(
+            tokenizer,
+            context=context,
+            instruction=case["prompt"],
+            target_tokens=target,
             reasoning_effort="xhigh",
         )
-    )
-    if len(prompt_ids) != 16_384:
+    if len(prompt_ids) != target:
         raise RuntimeError(
-            f"prompt has {len(prompt_ids)} tokens, expected 16384"
+            f"prompt has {len(prompt_ids)} tokens, expected {target}"
         )
+    return prompt_ids
+
+
+def build_production_cell(
+    runtime: Any,
+    sampler_type: Any,
+    *,
+    label: str,
+    max_tokens: int,
+    prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
+) -> dict[str, Any]:
+    """The ``coding-16k-1k-xhigh-t1`` cell, constructed identically.
+
+    ``prompt_tokens`` resizes only the prompt; the label, the production-cell
+    name, the sampler and the reasoning effort are untouched, so the receipt
+    path and the summary table are the same at any length.
+    """
+
+    prompt_ids = build_production_prompt_ids(
+        runtime.tokenizer, prompt_tokens=prompt_tokens
+    )
     return {
         "label": label,
         "production_cell": PRODUCTION_CELL_LABEL,
@@ -881,6 +994,21 @@ def build_production_cell(
             "repetition_penalty": 1.0,
         },
     }
+
+
+def graph_warmup_cell(cell: Mapping[str, Any]) -> dict[str, Any]:
+    """The unmeasured warm-up copy of ``cell``.
+
+    A shallow copy with a different label and nothing else: the warm-up
+    prefills the SAME prompt ids -- so the same ``--prompt-tokens`` length
+    and the same chunk layout -- as the run it is warming.  A warm-up at a
+    different length would leave the measured first chunk cold, which is
+    the entire thing ``--warm-graph`` exists to prevent.
+    """
+
+    warm = dict(cell)
+    warm["label"] = f"{cell['label']}-unmeasured-graph-warmup"
+    return warm
 
 
 def build_benchmark_cells(runtime: Any, sampler_type: Any) -> list[dict[str, Any]]:
@@ -994,6 +1122,31 @@ def build_benchmark_cells(runtime: Any, sampler_type: Any) -> list[dict[str, Any
 # --------------------------------------------------------------------------
 # Argument parsing
 # --------------------------------------------------------------------------
+
+
+def check_prompt_tokens(args: argparse.Namespace) -> None:
+    """Refuse ``--prompt-tokens`` combinations that would measure nothing.
+
+    Both are fail-closed rather than silently ignored: the matrix carries
+    its own per-cell lengths, and the PR391 reference rows were recorded
+    against the 16,384-token production prompt, so parity at any other
+    length is a guaranteed false drift.
+    """
+
+    prompt_tokens = int(getattr(args, "prompt_tokens", DEFAULT_PROMPT_TOKENS))
+    if prompt_tokens == DEFAULT_PROMPT_TOKENS:
+        return
+    if getattr(args, "benchmark_matrix", False):
+        raise RuntimeError(
+            "--prompt-tokens does not apply to --benchmark-matrix, which "
+            "carries its own per-cell prompt lengths"
+        )
+    if getattr(args, "require_reference_token_parity", False):
+        raise RuntimeError(
+            "--require-reference-token-parity is only defined at "
+            f"--prompt-tokens {DEFAULT_PROMPT_TOKENS}; the reference rows "
+            "were recorded against the pinned production prompt"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1128,6 +1281,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        choices=PROMPT_TOKEN_CHOICES,
+        default=DEFAULT_PROMPT_TOKENS,
+        metavar="N",
+        help=(
+            "Prompt length of the measured cell, in tokens (default "
+            f"{DEFAULT_PROMPT_TOKENS}; one of "
+            f"{', '.join(str(value) for value in PROMPT_TOKEN_CHOICES)}). "
+            "The default is the pinned production prompt; any other value "
+            "is built to exactly N tokens from the same SHA-pinned "
+            "fixtures. Label, receipt path and sampler are unchanged. "
+            "Refused with --benchmark-matrix, which carries its own "
+            "per-cell lengths, and with "
+            "--require-reference-token-parity, whose reference rows "
+            "were recorded against the pinned production prompt."
+        ),
+    )
     parser.add_argument("--natural-stop", action="store_true")
     parser.add_argument(
         "--compiled-verify-mode",
@@ -1336,6 +1508,7 @@ def build_family_overrides(
 
 def main() -> int:
     args = build_parser().parse_args()
+    check_prompt_tokens(args)
     if args.nan_warning_error:
         warnings.filterwarnings(
             "error",
@@ -1725,6 +1898,7 @@ def main() -> int:
             SamplerConfig,
             label=args.label,
             max_tokens=args.max_tokens,
+            prompt_tokens=args.prompt_tokens,
         )
         cells = [base_cell]
         if args.draft_temperature:
@@ -1975,8 +2149,7 @@ def main() -> int:
     for cell in cells:
         cold_s: float | None = None
         if args.warm_graph:
-            warm_cell = dict(cell)
-            warm_cell["label"] = f"{cell['label']}-unmeasured-graph-warmup"
+            warm_cell = graph_warmup_cell(cell)
             warm_row = run(warm_cell, sequence - 1, args.seed[0])
             cold_s = first_chunk_cold_s(warm_row)
             graph_warmup_cells.append(
@@ -2043,9 +2216,18 @@ def main() -> int:
         "candidate_files": source_receipt["candidate_files"],
         "model_path": str(model_path),
         "model_revision": EXPECTED_MODEL,
+        # Only the default length has pinned prompt BYTES; at any other
+        # length the identity of the prompt is the fixture pair plus N.
         "prompt_content_sha256": (
-            None if args.benchmark_matrix else EXPECTED_PROMPT
+            EXPECTED_PROMPT
+            if not args.benchmark_matrix
+            and args.prompt_tokens == DEFAULT_PROMPT_TOKENS
+            else None
         ),
+        "prompt_tokens": (
+            None if args.benchmark_matrix else int(args.prompt_tokens)
+        ),
+        "prompt_fixture_sha256": prompt_fixture_sha256(),
         "production_cell": (
             None if args.benchmark_matrix else PRODUCTION_CELL_LABEL
         ),

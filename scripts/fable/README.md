@@ -71,6 +71,32 @@ PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps 
     --sequence 1788400001 --dry-run
 ```
 
+### Measuring a different prompt length
+
+`--prompt-tokens N` resizes the measured cell's prompt on **both** arms.
+Accepted values are 1024, 8192, 16384 (default), 32768, 65536, 131072 and
+262144. Only the prompt moves: the labels, the receipt paths, the sampler and
+the summary table are identical at every length, so a window at another length
+is read exactly like a 16K one -- it is just not comparable to a 16K receipt.
+
+The default reproduces the pinned production prompt byte for byte. Every other
+value is built to exactly N tokens by `abba_driver.build_exact_coding_prompt_ids`
+from the same SHA-pinned fixture pair, which is how the benchmark matrix already
+builds its 64K and 128K cells -- so `--prompt-tokens 65536` is the matrix's
+`coding-64k-1k-xhigh-t1` prompt. The arm receipt records `prompt_tokens` and
+`prompt_fixture_sha256`; `prompt_content_sha256` stays pinned only at 16384,
+where the prompt bytes themselves are pinned.
+
+`--require-reference-token-parity` is refused away from 16384 (the PR391
+reference rows were recorded against the production prompt), and the window
+refuses it while planning, before it takes the GPU lock.
+
+Pair it with `--prefill-only` for a prefill-attribution window: `--max-tokens`
+drops to 64 and the driver's unmeasured graph warm-up cell runs first at the
+**same** N, so the measured run's first prefill chunk is not the cold one.
+Per-chunk wall and PLE-gather seconds land on every row as `prefill_chunks`,
+on control and candidate alike.
+
 ## 2. Full ABBA, three production seeds
 
 Twelve arms (4 per seed x 3 seeds), each a fresh model load plus a thermal
