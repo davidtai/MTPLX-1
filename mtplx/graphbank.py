@@ -3067,10 +3067,16 @@ class CompiledVerifyBank:
             raise RuntimeError(
                 "graph-build overlap requires an installed fixed-M4 verify"
             )
-        self._fixed_m4_overlap_layers = int(
+        requested = int(
             _graph_build_overlap.layers() if layer_count is None else layer_count
         )
-        self._fixed_m4_split_generation = -1
+        if requested != self._fixed_m4_overlap_layers:
+            # A bank reused across requests (or a bench sweeping depths in one
+            # process) must retrace the pair; one that is not asked for a new
+            # depth must NOT, because `mx.compile` would retrace ~5,200 nodes
+            # for nothing.
+            self._fixed_m4_overlap_layers = requested
+            self._fixed_m4_split_generation = -1
         self._refresh_fixed_m4_split()
         return int(self._fixed_m4_overlap_layers)
 
@@ -3156,7 +3162,9 @@ class CompiledVerifyBank:
                 # must cross the materialization boundary before it becomes an
                 # mx.compile input.  With the PLE layer in the prefix, the
                 # FIRST graph to consume it is the prefix, so the submission
-                # moves here with it.
+                # moves here with it.  No ``returns_aux`` branch: the install
+                # refuses that contract at any depth past the PLE layer, so
+                # the shipped route's raw-payload spelling cannot be reached.
                 mx.async_eval(compiled_aux, *state_in)
             outputs = self._call_overlap_prefix(
                 split["prefix_fn"], input_ids, compiled_aux, state_in

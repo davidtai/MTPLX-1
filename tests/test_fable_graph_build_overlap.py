@@ -1362,3 +1362,38 @@ def test_the_join_refuses_a_prefix_whose_aux_contract_disagrees(graphbank):
             committed_count=0,
             cache=object(),
         )
+
+
+def test_arm_only_retraces_when_the_depth_changes(graphbank, monkeypatch):
+    lane = importlib.import_module("mtplx.graph_build_overlap")
+    monkeypatch.setenv(lane.ENV_FLAG, "1")
+    lane.enabled.cache_clear()
+    lane.layers.cache_clear()
+    try:
+        entries = _build_cache()
+        bank, _calls, _aux = _make_bank(graphbank, entries=entries)
+        rebuilds = []
+        bank.install_fixed_m4_overlap_split = lambda count: rebuilds.append(count)
+        monkeypatch.setenv(lane.LAYERS_ENV, "1")
+        lane.layers.cache_clear()
+        assert bank.arm_fixed_m4_graph_build_overlap() == 1
+        assert rebuilds == [1]
+        # re-arming the SAME depth on the same bank must not retrace
+        assert bank.arm_fixed_m4_graph_build_overlap() == 1
+        assert rebuilds == [1]
+        monkeypatch.setenv(lane.LAYERS_ENV, "3")
+        lane.layers.cache_clear()
+        assert bank.arm_fixed_m4_graph_build_overlap() == 3
+        assert rebuilds == [1, 3]
+    finally:
+        lane.enabled.cache_clear()
+        lane.layers.cache_clear()
+        lane.reset_receipt()
+
+
+def test_the_depth_knob_alone_refuses():
+    """A LAYERS knob with the lever off would label an arm it did not run."""
+
+    source = _generation_source()
+    assert "elif _graph_build_overlap.layers() != _graph_build_overlap.DEFAULT_LAYERS:" in source
+    assert "the depth knob does nothing " in source

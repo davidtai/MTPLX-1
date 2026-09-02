@@ -171,6 +171,13 @@ chosen at install time, not at call time.
   directly: a promoted-cache demotion discards the prefix, counts it, and
   resets `_fixed_m4_split_generation` so the pair recompiles against the new
   shadow.
+* **A depth knob without the lever refuses.**
+  `MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS` set while
+  `MTPLX_FABLE_GRAPH_BUILD_OVERLAP` is off raises at request setup — an arm
+  labelled "N=3" that measured the control is the same lie the existing
+  unsupported-route refusal exists to prevent. Re-arming the *same* depth on
+  the same bank does not retrace; only a depth change forces the pair to
+  recompile.
 * **Install gate raises.** Depth outside `[1, layers-1]`, a drifted 134/219
   production census, more than one PLE layer in the capture layout, and the
   `raw_q4` aux contract at any depth past the PLE layer all raise from
@@ -245,6 +252,15 @@ window that ran the control's code or a prefix computed and thrown away);
 `aux_hoisted` must equal the window count at N ≥ 2 and 0 at N = 1;
 `measured_saving_ms` is read against `predicted_saving_ms`.
 
+`prefix_discarded` matters slightly more at N ≥ 2 than it did at N = 1: a
+discarded prefix at those depths also throws away an auxiliary whose
+`_install_owned_rows` and candidate-prefetch `resolve` have already been
+consumed, so the *next* window's hot-row lookup misses. Still correct — the
+sidecar gather is the fallback — but it is a quiet quality-of-prefetch
+regression that only `prefix_discarded > 0` would reveal. The hook and the
+verify site are guarded identically and sit in the same loop iteration with no
+`tokens` mutation between them, so the count should be 0.
+
 ### ABBA — 16K decode, the verdict
 
 Substitute the best N from the micro sweep. Control carries the prewarm so the
@@ -285,6 +301,11 @@ vs `monolithic_windows`, `prefix_discarded`, `aux_hoisted`, `split_rebuilds`.
   with `mx.compile` stubbed to identity; the tracer first sees the real
   closures on the first cycle of a real arm. In particular the two-arity prefix
   (`compiled_aux` as an explicit compiled input at N ≥ 2) has never been traced.
+* **Non-default `MTPLX_COMPILED_VERIFY_BOUNDARY`.** Under `post` or `none` the
+  hoisted auxiliary is handed to the prefix graph without crossing
+  `async_eval` first — exactly what the shipped monolithic route does under
+  those settings, so the risk profile is unchanged, but it has never been run
+  and the ABBA does not run it.
 * **The per-layer GPU estimate.** 0.53 ms is `verify-body GPU / 48` from the
   census aggregate. Layers are not equal: layer 1 carries the PLE block (more
   than average) and the QSA layers are a different shape from the GDN ones, so

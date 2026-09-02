@@ -9390,6 +9390,14 @@ def generate_mtpk(
             f"{_graph_build_overlap.ENV_FLAG} requires the installed "
             "physical-M4 compiled verify on the batched verify route"
         )
+    elif _graph_build_overlap.layers() != _graph_build_overlap.DEFAULT_LAYERS:
+        # W67: a depth knob without the lever is the same lie in miniature --
+        # an arm labelled "N=3" that measured the control.
+        raise RuntimeError(
+            f"{_graph_build_overlap.LAYERS_ENV} is set without "
+            f"{_graph_build_overlap.ENV_FLAG}=1; the depth knob does nothing "
+            "on its own"
+        )
     # Read once per request; the switch is a process constant so control and
     # candidate arms run the same binary.
     _pr391_compact_commit = _pr391_compact_commit_enabled()
