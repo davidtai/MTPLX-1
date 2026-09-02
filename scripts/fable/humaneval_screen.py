@@ -511,6 +511,132 @@ def wait_for_health(
         time.sleep(poll)
 
 
+#: What an honest server publishes when the plan finished but a ladder step
+#: raised (``mtplx/server/openai.py warmup_aggregate_state``). The daemon is
+#: up and serving; it just did not get its warm coverage.
+WARMUP_DEGRADED_STATES = ("degraded",)
+
+#: Whole-plan aborts. ``run_guarded.wait_for_background_warmup`` raises on
+#: these, and it keeps doing so: a plan that died outright is not something
+#: a screen should shrug off.
+WARMUP_HARD_FAIL_STATES = ("failed", "error")
+
+
+class _WarmupDegraded(RuntimeError):
+    """Raised by the polling shim the moment /health shows a broken plan."""
+
+    def __init__(self, health: Mapping[str, Any], report: Mapping[str, Any]):
+        super().__init__(str(report.get("first_error") or report.get("state")))
+        self.health = dict(health)
+        self.report = dict(report)
+
+
+def warmup_background_report(health: Mapping[str, Any]) -> dict[str, Any]:
+    """Read ``/health``'s background warm-up block honestly.
+
+    Derives ``failed_steps`` from the steps themselves when the server does
+    not publish the list, so a build that reports ``state: "done"`` over
+    failed children (every build before 2026-09-01) is still caught.
+    """
+
+    background: Any = None
+    if isinstance(health, Mapping):
+        warmup = health.get("warmup")
+        if isinstance(warmup, Mapping):
+            background = warmup.get("background")
+    if not isinstance(background, Mapping):
+        return {
+            "present": False,
+            "state": None,
+            "degraded": False,
+            "hard_failure": False,
+            "failed_steps": [],
+            "first_error": None,
+        }
+    failed = background.get("failed_steps")
+    if not isinstance(failed, list):
+        steps = background.get("steps")
+        failed = [
+            dict(step)
+            for step in (steps if isinstance(steps, list) else [])
+            if isinstance(step, Mapping) and step.get("state") == "failed"
+        ]
+    state = str(background.get("state") or "") or None
+    first_error = background.get("first_error")
+    if not first_error and failed:
+        first_error = (failed[0] or {}).get("error")
+    return {
+        "present": True,
+        "state": state,
+        "degraded": bool(failed) or state in WARMUP_DEGRADED_STATES,
+        "hard_failure": state in WARMUP_HARD_FAIL_STATES,
+        "failed_steps": [dict(step) for step in failed],
+        "first_error": first_error,
+    }
+
+
+def wait_for_background_warmup_reporting(
+    base_url: str,
+    *,
+    timeout: float,
+    fetch: Callable[[str], dict[str, Any]],
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``run_guarded``'s wait, plus a warning for a degraded plan.
+
+    ``run_guarded.wait_for_background_warmup`` returns only on
+    ``state == "done"``, so a server that honestly publishes ``degraded``
+    would be waited on until the timeout. The fetch shim short-circuits the
+    moment a poll shows a degraded plan: the daemon is up and serving, it
+    just did not get the warm coverage it planned, and the screen should say
+    so and keep going rather than hang for the full timeout or pretend the
+    eval started warm. A whole-plan abort (``failed`` / ``error``) is left
+    to the guarded runner, which still raises on it.
+
+    Returns ``(health, warmup_receipt)``.
+    """
+
+    def _degraded_stop(report: Mapping[str, Any]) -> bool:
+        return bool(report["degraded"]) and not report["hard_failure"]
+
+    def _fetch(url: str) -> dict[str, Any]:
+        health = fetch(url)
+        report = warmup_background_report(health)
+        if _degraded_stop(report):
+            raise _WarmupDegraded(health, report)
+        return health
+
+    # Poll once here so an already-degraded plan never even loads the
+    # guarded runner, then hand the loop over with the same shim in place
+    # for a plan that degrades while we wait.
+    health = fetch(base_url)
+    report = warmup_background_report(health)
+    if not _degraded_stop(report):
+        try:
+            health = load_run_guarded().wait_for_background_warmup(
+                base_url, timeout=timeout, fetch=_fetch
+            )
+            report = warmup_background_report(health)
+        except _WarmupDegraded as degraded:
+            health, report = degraded.health, degraded.report
+    receipt = {
+        "waited": True,
+        "state": report["state"],
+        "degraded": bool(report["degraded"]),
+        "failed_steps": report["failed_steps"],
+        "first_error": report["first_error"],
+    }
+    if receipt["degraded"]:
+        print(
+            f"[{label}] WARNING: background warmup {report['state']!r} with "
+            f"{len(report['failed_steps'])} failed step(s); first error: "
+            f"{report['first_error']!r}. Continuing UNWARMED -- treat the "
+            "first rows as cold.",
+            flush=True,
+        )
+    return health, receipt
+
+
 def assert_server_contract(health: Mapping[str, Any], settings: Mapping[str, Any]) -> None:
     """Refuse to score a server that is not the configuration we asked for."""
 
@@ -1067,18 +1193,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             # pretending we waited. A warmup that actually FAILED still raises.
             background = ((health.get("warmup") or {}).get("background"))
             if isinstance(background, dict):
-                warmup_health = load_run_guarded().wait_for_background_warmup(
+                _, warmup = wait_for_background_warmup_reporting(
                     base_url,
                     timeout=args.warmup_timeout,
                     fetch=lambda url: http_get(f"{url}/health", timeout=15.0),
+                    label="humaneval-screen",
                 )
-                warmup = {
-                    "waited": True,
-                    "state": (
-                        ((warmup_health.get("warmup") or {}).get("background") or {})
-                        .get("state")
-                    ),
-                }
             else:
                 warmup = {
                     "waited": False,
