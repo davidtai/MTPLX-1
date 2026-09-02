@@ -14,7 +14,10 @@ TWO ITEMS, both off by default:
                   read-after-write levels per QSA layer.
                   ``kernels/qwen4_m4_rope.rope_qk`` issues the identical
                   arithmetic as ONE dispatch, one level.
-``qsa_rope_idx``  The indexer's query preparation (RMSNorm + partial RoPE).
+``qsa_rope_idx``  The indexer's query preparation (RMSNorm + partial RoPE) --
+                  12 dispatches over 8 read-after-write levels per QSA layer
+                  (rms; arange + add; two fused table ops; cos and sin; the
+                  two half multiply-adds; three concatenate copies).
                   Runs the SHIPPED ``qsa_indexer_prepare_queries_metal``,
                   whose bit-exactness against ``_prepare_queries_eager`` is
                   pinned in ``tests/test_qsa_indexer_prepare_metal.py``.  The
@@ -326,8 +329,8 @@ def idx_engagement_line(*, layers: int, enabled: bool) -> str:
         return f"[fable] verify-glue qsa_rope_idx: off{suffix}"
     return (
         "[fable] verify-glue qsa_rope_idx: on, "
-        f"layers={layers}, dispatches/layer 10->1, "
-        f"dependent_levels/layer 7->1, "
+        f"layers={layers}, dispatches/layer 12->1, "
+        f"dependent_levels/layer 8->1, "
         f"prep_calls={_IDX_COUNTS['prep_calls']}, "
         f"probe_failures={_IDX_COUNTS['probe_failures']}"
     )

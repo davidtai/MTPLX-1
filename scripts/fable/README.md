@@ -612,8 +612,8 @@ shape as `MTPLX_FABLE_OPDIET`.
 
 | item | what it replaces | exactness |
 | --- | --- | --- |
-| `qsa_rope` | the attention query+key rotation: the RoPE table build plus two five-dispatch rotations, per QSA layer | bit-exact, proved at install against the live stock spelling |
-| `qsa_rope_idx` | the indexer's query preparation (RMSNorm + partial RoPE), through the SHIPPED `qsa_indexer_prepare_queries_metal` that the fixed-M4 lane never called | bit-exact, pinned in `tests/test_qsa_indexer_prepare_metal.py` |
+| `qsa_rope` | the attention query+key rotation: the RoPE table build plus two five-dispatch rotations -- 16 dispatches over 7 read-after-write levels per QSA layer | bit-exact, proved at install against the live stock spelling |
+| `qsa_rope_idx` | the indexer's query preparation (RMSNorm + partial RoPE) -- 12 dispatches over 8 levels per QSA layer -- through the SHIPPED `qsa_indexer_prepare_queries_metal` that the fixed-M4 lane never called | bit-exact, pinned in `tests/test_qsa_indexer_prepare_metal.py` |
 
 `hc_triple` -- W69's second-ranked group -- is deliberately **not** an item.
 `hc_norm -> hc_down -> hc_up` cannot become one dispatch: `hc_down` produces
@@ -623,6 +623,29 @@ likewise read in full by every `hc_down` threadgroup. Those are grid-wide
 read-after-write edges and Metal has no grid-wide barrier inside a dispatch.
 The one-threadgroup spelling that would avoid them is the one
 `kernels/qwen4_m4_hyper_read.py` already measured at 13.2 tok/s against 67.8.
+
+### What the levels buy, and the census correction this makes
+
+The critical-path model charges **1.83 us per DEPENDENT GPU launch removed**
+and nothing for a sibling launch, which the concurrent encoder already
+overlaps -- so the multiplier is the number of read-after-write **levels**
+removed, not the number of dispatches. W69's table priced `qsa_rope` with
+`dep = 204` of 240 removed dispatches, i.e. it treated most of the group as
+dependent. Reading the actual chain says otherwise: the stock rotation is
+~7 levels deep with WIDE sibling fans (cos and sin are siblings; the four
+half multiply-adds are siblings; the six concatenate copies are siblings).
+
+| | dispatches/cycle | of which dependent (levels) | of which sibling | G | H | total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `qsa_rope` | 180 | 72 | 108 | 0.132 | 0.068 | **0.200 ms** |
+| `qsa_rope_idx` | 132 | 84 | 48 | 0.154 | 0.050 | **0.204 ms** |
+| both | 312 | 156 | 156 | 0.286 | 0.118 | **0.404 ms** |
+
+At the route kernel's measured 1.45x over-conversion that is up to 0.59 ms,
+i.e. **+0.7 to +1.0 tok/s**. W69's 0.464 ms for the whole group landed in the
+same region for a different reason: it counted the pooled-bank rope site
+(which stays with `MTPLX_FABLE_QSA_M4`'s `bank` item) and over-counted the
+dependent share.
 
 ### The gate
 
