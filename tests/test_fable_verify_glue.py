@@ -23,6 +23,7 @@ What IS falsifiable without a GPU, and is tested here:
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -557,3 +558,361 @@ def test_micro_rejects_an_unknown_family_rather_than_measuring_the_default():
     micro = _load_micro()
     with pytest.raises(SystemExit):
         micro.main(["--families", "hc_triple"])
+
+
+# --------------------------------------------------------------------------
+# micro_verify_glue_a.compare / arm_order
+#
+# The first guarded run of the micro died here: ``FAMILIES["rope"]`` lists
+# ``rope_prediet`` first but the reference arm is ``rope_stock``, so the very
+# first comparison ran with ``ref_out`` still None and ``zip(got, None)``
+# raised. These tests drive every branch of ``compare`` with DUCK-TYPED arrays
+# and a stub ``mx``, so they prove the arithmetic and the guards without
+# evaluating a single MLX array.
+# --------------------------------------------------------------------------
+class _StubScalar:
+    def __init__(self, value):
+        self._value = value
+
+    def item(self):
+        return self._value
+
+
+class _StubArray:
+    """The slice of the mx.array surface ``compare`` actually touches."""
+
+    def __init__(self, values):
+        self._values = list(values)
+
+    @property
+    def size(self):
+        return len(self._values)
+
+    def astype(self, _dtype):
+        return self
+
+    def __sub__(self, other):
+        return _StubArray(
+            [a - b for a, b in zip(self._values, other._values)]
+        )
+
+    def __ne__(self, other):
+        return _StubArray(
+            [a != b for a, b in zip(self._values, other._values)]
+        )
+
+
+class _StubMx:
+    float32 = object()
+
+    @staticmethod
+    def abs(array):
+        return _StubArray([abs(v) for v in array._values])
+
+    @staticmethod
+    def max(array):
+        return _StubScalar(max(array._values) if array._values else 0.0)
+
+    @staticmethod
+    def sum(array):
+        return _StubScalar(sum(1 for v in array._values if v))
+
+
+@pytest.fixture()
+def micro_with_stub_mx(monkeypatch):
+    micro = _load_micro()
+    monkeypatch.setattr(micro, "mx", _StubMx)
+    return micro
+
+
+def test_compare_on_identical_outputs_is_exact(micro_with_stub_mx):
+    micro = micro_with_stub_mx
+    got = [_StubArray([1.0, 2.0, 3.0])]
+    ref = [_StubArray([1.0, 2.0, 3.0])]
+    assert micro.compare(got, ref) == (0.0, 0, 3)
+
+
+def test_compare_counts_every_differing_element_not_just_the_worst(
+    micro_with_stub_mx,
+):
+    micro = micro_with_stub_mx
+    got = [_StubArray([1.0, 2.5, 3.0, 9.0])]
+    ref = [_StubArray([1.0, 2.0, 3.0, 8.5])]
+    worst, differing, total = micro.compare(got, ref)
+    assert worst == pytest.approx(0.5)
+    assert differing == 2
+    assert total == 4
+
+
+def test_compare_accumulates_across_several_output_tensors(
+    micro_with_stub_mx,
+):
+    micro = micro_with_stub_mx
+    got = [_StubArray([1.0, 2.0]), _StubArray([5.0, 5.0, 5.0])]
+    ref = [_StubArray([1.0, 2.0]), _StubArray([5.0, 1.0, 5.0])]
+    worst, differing, total = micro.compare(got, ref)
+    assert worst == pytest.approx(4.0)
+    assert differing == 1
+    assert total == 5
+
+
+def test_compare_handles_no_outputs(micro_with_stub_mx):
+    micro = micro_with_stub_mx
+    assert micro.compare([], []) == (0.0, 0, 0)
+
+
+def test_compare_raises_on_a_missing_reference(micro_with_stub_mx):
+    """The exact failure the first guarded run hit, now named."""
+
+    micro = micro_with_stub_mx
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.compare([_StubArray([1.0])], None)
+    message = str(excinfo.value)
+    assert "no reference" in message
+    assert "ordering bug" in message
+
+
+def test_compare_raises_on_a_length_mismatch_instead_of_truncating(
+    micro_with_stub_mx,
+):
+    """``zip`` would silently score parity on the prefix."""
+
+    micro = micro_with_stub_mx
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.compare(
+            [_StubArray([1.0])],
+            [_StubArray([1.0]), _StubArray([2.0])],
+        )
+    assert "1 outputs against 2 reference" in str(excinfo.value)
+
+
+def test_arm_order_puts_the_reference_first_for_every_family():
+    micro = _load_micro()
+    for family in micro.FAMILIES:
+        order = micro.arm_order(family)
+        assert order[0] == micro.STOCK[family]
+        # ...and runs exactly the same arms as the print order.
+        assert sorted(order) == sorted(micro.FAMILIES[family])
+
+
+def test_arm_order_is_not_the_print_order_and_that_is_the_whole_point():
+    micro = _load_micro()
+    # If this ever becomes equal, the reorder is load-bearing for nothing --
+    # but today the rope table PRINTS pre-diet first and must EXECUTE stock
+    # first, which is precisely the bug that killed the first guarded run.
+    assert micro.FAMILIES["rope"][0] != micro.STOCK["rope"]
+    assert micro.arm_order("rope") != micro.FAMILIES["rope"]
+
+
+def test_arm_order_raises_when_a_family_has_no_stock_arm(monkeypatch):
+    micro = _load_micro()
+    monkeypatch.setitem(micro.FAMILIES, "rope", ("rope_fused",))
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.arm_order("rope")
+    assert "no stock arm" in str(excinfo.value)
+
+
+def test_every_family_is_reachable_from_the_default_cli():
+    micro = _load_micro()
+    args = micro.build_parser().parse_args([])
+    named = {f.strip() for f in args.families.split(",")}
+    assert named == set(micro.FAMILIES)
+
+
+# --------------------------------------------------------------------------
+# The whole micro, end to end, on a stubbed backend.
+#
+# The parity guards above pin ``compare``; this pins the CONTROL FLOW around
+# it. The first guarded run spent a GPU window to discover an ordering bug
+# that costs nothing to catch here, so the harness now runs to completion --
+# build, dispatch count, parity, timing, table, receipt -- against a fake
+# ``mx``/``mtplx`` on the CPU, with no MLX array evaluated anywhere.
+# --------------------------------------------------------------------------
+import contextlib  # noqa: E402
+import math  # noqa: E402
+
+
+class _FakeArray(_StubArray):
+    def __add__(self, other):
+        # Broadcast the shorter operand, which is all the harness needs
+        # (``pos_start`` is a scalar-ish leaf added to ``arange(S)``).
+        values = other._values if len(other._values) >= len(self._values) else self._values
+        return _FakeArray(list(values))
+
+    __radd__ = __add__
+
+    def __truediv__(self, other):
+        return _FakeArray([v / other for v in self._values])
+
+    def __rtruediv__(self, other):
+        return _FakeArray([other / v for v in self._values])
+
+    def __rpow__(self, base):
+        return _FakeArray([base ** v for v in self._values])
+
+    def astype(self, _dtype):
+        return self
+
+
+class _FakeRandom:
+    @staticmethod
+    def seed(_value):
+        return None
+
+    @staticmethod
+    def normal(shape):
+        return _FakeArray([0.5] * max(1, math.prod(shape)))
+
+
+class _FakeFast:
+    @staticmethod
+    def rms_norm(values, _weight, _eps):
+        return values
+
+
+class _FakeMx(_StubMx):
+    bfloat16 = object()
+    int32 = object()
+    random = _FakeRandom
+    fast = _FakeFast
+
+    @staticmethod
+    def arange(start, stop=None, step=1, dtype=None):
+        if stop is None:
+            start, stop = 0, start
+        return _FakeArray(list(range(int(start), int(stop), int(step))))
+
+    @staticmethod
+    def array(values, dtype=None):
+        return _FakeArray(values)
+
+    @staticmethod
+    def zeros(shape, dtype=None):
+        return _FakeArray([0.0] * max(1, math.prod(shape)))
+
+    @staticmethod
+    def eval(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_cache():
+        return None
+
+    @staticmethod
+    def compile(fn):
+        return fn
+
+    @staticmethod
+    def export_to_dot(buffer, *_outputs):
+        buffer.write('{ 1 [label ="Multiply"] }\n{ 2 [label ="Cos"] }\n')
+
+
+class _FakeModel:
+    @staticmethod
+    def _rope_cos_sin(_positions, _inv_freq, _scaling):
+        return _FakeArray([0.0]), _FakeArray([0.0])
+
+    @staticmethod
+    def _rope_cos_sin_half(_positions, _inv_freq, _scaling):
+        return _FakeArray([0.0]), _FakeArray([0.0])
+
+    @staticmethod
+    def _shared_rope_cos_sin_half(_pos, _length, _inv_freq, _scaling):
+        return _FakeArray([0.0]), _FakeArray([0.0])
+
+    @staticmethod
+    def _apply_partial_rope(values, _cos, _sin):
+        return values
+
+    @staticmethod
+    def _apply_partial_rope_half(values, _cos, _sin):
+        return values
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _rope_table_scope():
+        yield
+
+
+class _FakeRopeKernel:
+    @staticmethod
+    def rope_qk(queries, keys, _inv_freq, *, pos_start, attention_scaling):
+        del pos_start, attention_scaling
+        return queries, keys
+
+
+class _FakePrepare:
+    @staticmethod
+    def qsa_indexer_prepare_queries_metal(
+        values, _weight, _inv_freq, *, pos_start, eps, attention_scaling
+    ):
+        del pos_start, eps, attention_scaling
+        return values
+
+
+def _stub_micro(monkeypatch):
+    micro = _load_micro()
+
+    def _install():
+        micro.mx = _FakeMx
+        micro._model = _FakeModel
+        micro._rope = _FakeRopeKernel
+        micro._prepare = _FakePrepare
+
+    monkeypatch.setattr(micro, "_require_mlx", _install)
+    return micro
+
+
+def test_micro_runs_to_completion_on_a_stubbed_backend(monkeypatch, tmp_path, capsys):
+    micro = _stub_micro(monkeypatch)
+    receipt = tmp_path / "micro.json"
+
+    assert micro.main(["--layers", "2", "--reps", "2", "--warmup", "1",
+                       "--out", str(receipt)]) == 0
+
+    payload = json.loads(receipt.read_text())
+    # Every arm timed in every lane...
+    for family, arms in micro.FAMILIES.items():
+        for arm in arms:
+            for lane in ("eager", "compiled"):
+                assert f"{arm}/{lane}" in payload["variants"], (family, arm, lane)
+    # ...and every NON-stock arm scored for parity in every lane, which is
+    # exactly what the first guarded run never reached.
+    for family, arms in micro.FAMILIES.items():
+        for arm in arms:
+            for lane in ("eager", "compiled"):
+                key = f"{arm}/{lane}"
+                if arm == micro.STOCK[family]:
+                    assert key not in payload["numerics"]
+                else:
+                    assert key in payload["numerics"], key
+                    assert payload["numerics"][key]["differing"] == 0
+    assert payload["shapes"]["layers"] == 2
+    out = capsys.readouterr().out
+    assert "rope_fused" in out and "prep_fused" in out
+
+
+def test_micro_would_still_die_if_the_arm_order_were_reverted(monkeypatch):
+    """Pin the regression: table order really does break the parity pass."""
+
+    micro = _stub_micro(monkeypatch)
+    monkeypatch.setattr(micro, "arm_order", lambda family: micro.FAMILIES[family])
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.main(["--layers", "1", "--reps", "1", "--warmup", "0"])
+    assert "no reference" in str(excinfo.value)
+
+
+def test_micro_single_family_and_single_lane_still_score_parity(
+    monkeypatch, tmp_path
+):
+    micro = _stub_micro(monkeypatch)
+    receipt = tmp_path / "one.json"
+    assert micro.main([
+        "--families", "rope", "--lanes", "compiled",
+        "--layers", "1", "--reps", "1", "--warmup", "0",
+        "--out", str(receipt),
+    ]) == 0
+    payload = json.loads(receipt.read_text())
+    assert set(payload["numerics"]) == {
+        "rope_prediet/compiled", "rope_scoped/compiled", "rope_fused/compiled"
+    }
