@@ -292,6 +292,42 @@ class MTPLXRuntime:
             **kwargs,
         )
 
+    def forward_ar_prefill_group(
+        self,
+        chunk_inputs,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+    ):
+        """Layer-major prefill over a group of chunks (expert-major MoE).
+
+        ``MTPLX_FABLE_PREFILL_EXPERT_MAJOR``.  Returns one
+        ``(logits_or_None, widened_or_None)`` per chunk, in chunk order.  A
+        model without the schedule raises rather than silently serving the
+        chunk-major path under the candidate's label.
+        """
+
+        from mtplx.fable_prefill_expert_major import ExpertMajorRefusal
+
+        group = getattr(self.model, "forward_prefill_group", None)
+        if group is None:
+            raise ExpertMajorRefusal(
+                f"{type(self.model).__name__} has no expert-major prefill schedule"
+            )
+        if not self.mtp_enabled and return_hidden:
+            raise RuntimeError("return_hidden requires an MTP-patched runtime")
+        self._count("forward_ar_prefill_group_calls")
+        self._count("forward_ar_prefill_group_chunks", len(chunk_inputs))
+        return group(
+            list(chunk_inputs),
+            cache,
+            None,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+            emit_logits=emit_logits,
+        )
+
     def _compiled_ar_forward(self, cache):
         """Compiled target forward (MTPLX_COMPILE_AR_FORWARD).
 

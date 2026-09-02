@@ -1315,3 +1315,122 @@ projection under both marginal row costs the ledger holds — 1.8 ms (H §2.4, w
 L's table used) and 1.4 ms (K's fit for a *compiled* fixed-width row) — because
 neither is measured on an M=5 graph, and deciding whether to build one is the
 entire point.
+
+## B1 — expert-major (super-chunk) prefill MoE
+
+The prefill census (`scratchpad/J-prefill-attribution.md` §2.2) puts the routed
+MoE grouped GEMM at **3,391.6 ms, 31.6 % of GPU busy, 78.72 TFLOP at
+23.2 TFLOP/s — 45 % of the rate the same q4/g32 kernel reaches dense**.  M §B1
+claims that is a *schedule* problem: 2,048 tokens x top-10 over 512 experts is
+**40 rows per expert**, and MLX's sorted grouped kernel tiles rows at `BM = 32`
+and re-streams a weight tile for every expert boundary that lands inside a
+tile.  Two scripts settle it, and neither needs the runtime change.
+
+### `micro_moe_prefill_rows.py` — the rows/expert curve (the whole case)
+
+Sorted `mx.gather_qmm` at the served shapes (hidden 2560, fused gate+up 1280,
+down 2560x640, 512 experts, top-10, q4/g32) at 40 / 80 / 160 / 320 rows per
+expert — the chunk-2048, chunk-4096, 2-chunk and 4-chunk geometries.  The
+tile-straddle multiplier `runs / tiles` is computed exactly in NumPy from the
+sorted index array and printed next to the clock, so the TF/s curve can be read
+against a mechanism rather than a guess:
+
+```
+R=40  (2,048 tok)  tiles   640  runs  1,129  ->  1.76 passes/tile
+R=80  (4,096 tok)  tiles 1,280  runs  1,773  ->  1.39
+R=160 (8,192 tok)  tiles 2,560  runs  3,051  ->  1.19
+R=320 (16,384 tok) tiles 5,120  runs  5,615  ->  1.10
+```
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_moe_prefill_rows.py \
+    --rows-per-expert 40,80,160,320 \
+    --lane queued --reps 10 \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-moe-prefill-rows.json
+```
+
+`gemm` (the two `gather_qmm` calls on pre-sorted inputs) is the census family —
+J §2.2's "MoE routed grouped GEMM", 789 dispatches — and carries the verdict.
+`chain` adds the sort/gather/scatter, which the census counts as three separate
+families and which cost far more standalone than inside the model's fused
+48-layer chunk graph; it is printed as context, marked as such, and must not be
+read as the MoE number.
+
+Both scripts refuse to start unless `MTPLX_DSV4_GUARD_WINDOW_PATH` or
+`MTPLX_GUARD_ATTEST_FD` is set, i.e. unless `run_guarded.py` launched them. The
+lock *file* always exists and is normally held by somebody else, so its
+presence is not evidence of owning the window.
+
+**Decision rule.** `gemm` TF/s at R=320 vs R=40: **>= 1.5x** = schedule-bound,
+B1's -0.9..-1.1 s of MoE at 16K is real; **1.15-1.5x** = partial (M's "plateau
+by 160" floor of ~-0.4 s); **<= 1.15x** = the 45 % is inside the kernel and B1
+dies.  `--routing balanced` is the aligned bound (every boundary on a tile
+edge, factor exactly 1.0 at R=160 and R=320) and must not be read as the
+production curve; `--routing dirichlet` is the skew sensitivity.
+
+Every run also prints an **exactness** block: 2,048 probe rows run alone, then
+as the head of a 16,384-row batch, compared bitwise after the unsort.
+`differing` must be 0 — that is B1's bit-exactness claim measured rather than
+argued.  `--self-test` runs the NumPy accounting with no MLX and no lock.
+
+### `micro_prefill_memory_census.py` — what the +3.5 GB at chunk 4096 is
+
+W32 measured chunk 4096 at **12.53 s / 92.22 GB peak** against a 2048 control
+at 13.53 s / 88.69 GB, and showed the extra bytes are **not** the QSA score
+tensor: the query-tile arm (`MTPLX_FABLE_PREFILL_QSA_QUERY_TILE=2048`, which
+caps the score chain at the 2,048-row value) recorded the same peak to five
+significant figures.  The guard's own model predicts only +1.7 GB.  This runs a
+real prefill with `mx.get_active_memory` / `mx.get_peak_memory` bracketed
+around every block of every layer, at both widths, and prints the per-family
+delta plus the `lazy - serialized` gap (the part of the peak that is scheduler
+concurrency rather than any one block).
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 \
+  --child-timeout-seconds 2400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_prefill_memory_census.py \
+    --chunk-sizes 2048,4096 --modes lazy,serialized \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/prefill-memory-census-4096.json
+```
+
+The arithmetic to check the answer against, per layer at `R` chunk rows: the
+routed chain holds `R x 192,000 B` (sorted x, fused gate+up, silu*up, down,
+unsorted — all `top_k x R` rows), i.e. **393 MB at R=2048 and 786 MB at
+R=4096**.  A +3.5 GB delta therefore means roughly **eight layers' worth of MoE
+transient are alive at once**, which is a scheduler fact, not a geometry fact —
+and it is exactly the number `MTPLX_FABLE_PREFILL_EXPERT_MAJOR`'s group budget
+needs.  It also unblocks B9 (chunk 8192).
+
+### The lane itself (`MTPLX_FABLE_PREFILL_EXPERT_MAJOR`, off by default)
+
+`mtplx/fable_prefill_expert_major.py` (design, planner, byte model),
+`Qwen4ExpTextModel.forward_prefill_group` (the layer-major schedule) and
+`mtplx.generation._expert_major_groups` (the construction-time gate).  Group
+size defaults to 4 chunks and is capped by
+`MTPLX_FABLE_PREFILL_EXPERT_MAJOR_BUDGET_BYTES` / `MTPLX_WIRED_LIMIT_BYTES`; a
+request that cannot afford 4 gets 2, and one that cannot afford 2 runs
+chunk-major.  Per-chunk GDN boundary capture and grouping are mutually
+exclusive (layer-major never holds all 48 layers' state at an interior chunk
+end): the default `MTPLX_FABLE_PREFILL_EXPERT_MAJOR_BOUNDARIES=refuse` keeps
+the boundaries and runs chunk-major; `=group` takes the group as the boundary
+granularity and counts `boundaries_coarsened`.
+
+```
+cd <branch checkout>
+PYTHONPATH=. /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  -m pytest tests/test_fable_prefill_expert_major.py -q
+```

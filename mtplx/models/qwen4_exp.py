@@ -1052,6 +1052,42 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
             return (y + shared).astype(x.dtype)
         return super().__call__(x)
 
+    # ---- expert-major prefill seam ---------------------------------------
+    # MTPLX_FABLE_PREFILL_EXPERT_MAJOR (mtplx/fable_prefill_expert_major.py)
+    # needs the routed grouped GEMM to see a whole GROUP of chunks' rows while
+    # everything else keeps running per chunk.  These two halves are the stock
+    # ``Qwen3NextSparseMoeBlock.__call__`` cut either side of
+    # ``self.switch_mlp(x, inds)``, expression for expression, so the caller
+    # can batch that ONE call and nothing else.  ``__call__`` above is left
+    # untouched on purpose -- flag-off has to be byte-identical, and
+    # ``tests/test_fable_prefill_expert_major.py`` pins
+    # ``prefill_combine(switch_mlp(...), ...) == __call__`` bitwise rather
+    # than trusting that this copy stays in step.
+
+    def prefill_route(self, x: mx.array):
+        """Router half: ``(inds, scores)`` for ``x``, no expert GEMM."""
+
+        if self.sharding_group is not None:
+            raise RuntimeError(
+                "expert-major prefill does not compose with a sharding group"
+            )
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+        return inds, scores
+
+    def prefill_combine(self, y: mx.array, scores: mx.array, x: mx.array):
+        """Everything after the routed GEMM: weighted sum + shared expert."""
+
+        y = (y * scores[..., None]).sum(axis=-2)
+        shared_y = self.shared_expert(x)
+        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        return y + shared_y
+
 
 class _FusedGateUpSwitchGLU(nn.Module):
     """SwitchGLU with gate_proj and up_proj concatenated into ONE
@@ -4910,6 +4946,37 @@ class DecoderLayer(nn.Module):
         hidden = _hyper_residual_write(hyper, block_out, inject)
         return hidden
 
+    # ---- expert-major prefill seam ---------------------------------------
+    # ``__call__`` cut at the MoE.  The attention half carries every
+    # sequence-dependent piece (PLE history, KV append, GDN recurrence) and so
+    # must still run once per chunk in chunk order; the MoE half is per-token
+    # and is what the group schedule batches.  Kept as a separate copy rather
+    # than a refactor of ``__call__`` so flag-off is provably untouched;
+    # ``tests/test_fable_prefill_expert_major.py`` asserts the two spellings
+    # agree bitwise.
+
+    def prefill_attn_half(self, hidden, *, input_ids, ssm_mask, cache):
+        """PLE injection + attention/GDN + its residual write."""
+
+        if "ple" in self:
+            hidden = hidden + self.ple(hidden, input_ids, cache)
+        mixed, hyper, inject = self.attn_hyper_connection(hidden)
+        if self.is_linear:
+            block_out = self.linear_attn(mixed, ssm_mask, cache)
+        else:
+            block_out = self.self_attn(mixed, cache)
+        return _hyper_residual_write(hyper, block_out, inject)
+
+    def prefill_moe_read(self, hidden):
+        """``mlp_hyper_connection`` read -- ``(mixed, hyper, inject)``."""
+
+        return self.mlp_hyper_connection(hidden)
+
+    def prefill_moe_write(self, hyper, block_out, inject):
+        """The MoE residual write."""
+
+        return _hyper_residual_write(hyper, block_out, inject)
+
 
 class Qwen4ExpTextModel(nn.Module):
     def __init__(self, args: TextArgs):
@@ -5040,6 +5107,97 @@ class Qwen4ExpTextModel(nn.Module):
         # one reachable (lazy ref, freed on the next step).
         self._last_widened = h
         return self.hyper_connection_mixer(h)
+
+    # ---- expert-major (super-chunk) prefill -------------------------------
+
+    def forward_prefill_group(self, chunk_inputs, cache, *, input_embeddings=None):
+        """Layer-major forward over a group of consecutive prefill chunks.
+
+        ``MTPLX_FABLE_PREFILL_EXPERT_MAJOR``.  Runs every chunk of the group
+        through layer L before any chunk enters layer L+1, and batches the
+        layer's routed MoE GEMM across the group's rows.  Returns
+        ``(mixer_outputs, widened)`` -- one entry per chunk, in chunk order.
+
+        Why this ordering is the only correct one, and why it is exact, is in
+        ``mtplx/fable_prefill_expert_major.py``'s module docstring.  The two
+        invariants this method is responsible for:
+
+        * **chunk order inside every layer.**  ``cache[L]`` is appended by
+          chunk 0, then 1, ... so when chunk k runs at layer L the cache holds
+          exactly chunks < k at that layer -- byte-identical to chunk-major.
+          The same holds for the GDN recurrent state and for the PLE n-gram
+          history, which is staged and consumed per chunk at the PLE layer.
+        * **only ``switch_mlp`` sees a different M.**  Router, shared expert,
+          hyper reads, residual writes, attention and GDN all run on
+          unchanged per-chunk tensors.
+        """
+
+        from mtplx import fable_prefill_expert_major as expert_major
+
+        chunks = list(chunk_inputs)
+        if not chunks:
+            raise ValueError("forward_prefill_group needs at least one chunk")
+        if cache is None:
+            raise expert_major.ExpertMajorRefusal(
+                "the group schedule needs a real per-layer cache"
+            )
+        if input_embeddings is not None:
+            raise expert_major.ExpertMajorRefusal(
+                "vision splice is not wired into the group schedule"
+            )
+        if _COMPILED_VERIFY_PLE.get() is not None or _VERIFY_CAPTURE.get():
+            raise expert_major.ExpertMajorRefusal(
+                "compiled-verify / capture scopes are decode lanes"
+            )
+        hs = [
+            mx.tile(self.embed_tokens(ids), (1, 1, self.args.hc_count))
+            for ids in chunks
+        ]
+        # ``_forward`` builds the SSM mask once per chunk from the GDN cache's
+        # state at the time that chunk starts.  The group cannot: at the top
+        # of the group every chunk would read the same (group-start) state.
+        # For the shipped caches ``create_ssm_mask`` is None -- padding/left-
+        # padded batches are the only shape that returns one, and none of them
+        # reach this lane -- so refuse the moment one is not, rather than
+        # feed a mask built against the wrong offset.
+        ssm_entry = cache[self.ssm_idx]
+        if any(create_ssm_mask(h, ssm_entry) is not None for h in hs):
+            raise expert_major.ExpertMajorRefusal(
+                "this GDN cache builds an SSM mask, whose offset the group "
+                "schedule cannot reproduce"
+            )
+        ple_idx = self._ple_stage_idx
+        for idx, (layer, entry) in enumerate(zip(self.layers, cache)):
+            for k, ids in enumerate(chunks):
+                if idx == ple_idx:
+                    ple = layer.ple
+                    ple.ple_embedding.stage(ids, entry, ple.NGRAM_IDX)
+                hs[k] = layer.prefill_attn_half(
+                    hs[k], input_ids=ids, ssm_mask=None, cache=entry
+                )
+            reads = [layer.prefill_moe_read(h) for h in hs]
+            mixed = [read[0] for read in reads]
+            routes = [layer.mlp.prefill_route(m) for m in mixed]
+            widths = [int(m.shape[1]) for m in mixed]
+            if len(chunks) == 1:
+                routed = [layer.mlp.switch_mlp(mixed[0], routes[0][0])]
+            else:
+                batched = layer.mlp.switch_mlp(
+                    mx.concatenate(mixed, axis=1),
+                    mx.concatenate([route[0] for route in routes], axis=1),
+                )
+                routed = []
+                offset = 0
+                for width in widths:
+                    routed.append(batched[:, offset : offset + width])
+                    offset += width
+            for k in range(len(chunks)):
+                block_out = layer.mlp.prefill_combine(
+                    routed[k], routes[k][1], mixed[k]
+                )
+                hs[k] = layer.prefill_moe_write(reads[k][1], block_out, reads[k][2])
+        self._last_widened = hs[-1]
+        return [self.hyper_connection_mixer(h) for h in hs], hs
 
     # ---- compiled GDN decode runs ----------------------------------------
     # The qL=1 decode step is CPU-dispatch-bound: ~20.8ms of Python graph
@@ -5315,6 +5473,42 @@ class TextModel(nn.Module):
             return logits, self.model._last_widened
         return logits
 
+    def forward_prefill_group(
+        self,
+        chunk_inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int = 0,
+    ):
+        """``__call__``'s contract, once per chunk, over a layer-major group.
+
+        Returns a list of ``(logits_or_None, widened_or_None)`` in chunk
+        order.  The per-chunk tail is the same head/emit_logits arithmetic
+        ``__call__`` does -- the group changes the trunk schedule, not what a
+        chunk yields.
+        """
+
+        outs, widened = self.model.forward_prefill_group(
+            chunk_inputs, cache, input_embeddings=input_embeddings
+        )
+        results = []
+        for out, wide in zip(outs, widened):
+            if not emit_logits:
+                results.append((None, wide) if return_hidden else (None, None))
+                continue
+            row = out
+            if logits_keep:
+                row = row[:, -max(1, int(logits_keep)) :]
+            if self.args.tie_word_embeddings:
+                logits = self.model.embed_tokens.as_linear(row)
+            else:
+                logits = self.lm_head(row)
+            results.append((logits, wide if return_hidden else None))
+        return results
+
     def _head_logits(self, h):
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(h)
@@ -5568,6 +5762,28 @@ class Model(nn.Module):
         # implemented (cache-only prefill chunks skip the vocab head).
         return self.language_model(
             inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+            emit_logits=emit_logits,
+            logits_keep=logits_keep,
+        )
+
+    def forward_prefill_group(
+        self,
+        chunk_inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int = 0,
+    ):
+        """Expert-major group prefill; see ``TextModel.forward_prefill_group``."""
+
+        return self.language_model.forward_prefill_group(
+            chunk_inputs,
             cache,
             input_embeddings,
             return_hidden=return_hidden,
