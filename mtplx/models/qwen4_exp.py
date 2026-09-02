@@ -43,6 +43,7 @@ import os
 import re
 import struct
 import time
+import weakref
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -61,6 +62,13 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
+from mtplx.fable_indexer_reuse import (
+    ENV_FLAG as FABLE_INDEXER_REUSE_ENV,
+    current_draft_depth,
+    indexer_reuse_enabled,
+    note_cycle,
+    note_step_reused,
+)
 from mtplx.runtime_options import (
     FABLE_QSA_M4_ROWS,
     fable_hc_m4_enabled,
@@ -2257,6 +2265,9 @@ class QSAIndexer(nn.Module):
         # and sanitize-time projection fusion have finalized every weight.
         object.__setattr__(self, "_compiled_indexer_core", None)
         object.__setattr__(self, "_compiled_indexer_parameter_signature", None)
+        # MTPLX_FABLE_INDEXER_REUSE anchor (row K-D2), outside the parameter
+        # tree: the depth-1 block ids of the draft cycle in flight, or None.
+        object.__setattr__(self, "_indexer_reuse_anchor", None)
 
     def _pool_keys_eager(
         self,
@@ -2627,23 +2638,210 @@ class QSAIndexer(nn.Module):
         )
         return ("gather_rows", token_idx, token_ok)
 
+    # ------------------------------------------------------------------
+    # MTPLX_FABLE_INDEXER_REUSE (row K-D2).  See mtplx/fable_indexer_reuse.py
+    # for the contract; the arithmetic that implements it is here because it
+    # is the selection's own, and only the selector knows the block frontier.
+    # ------------------------------------------------------------------
+
+    def _indexer_reuse_armed(self, rows: int) -> bool:
+        """True when this forward is a reuse-eligible MTP draft step.
+
+        Three conditions, all cheap and all host-side: the process armed the
+        flag (read now, not at import -- the shadow harness scopes it around a
+        single chain call), this call is inside ``rt.draft_mtp`` at a numbered
+        chain depth, and it is the single-row decode the chain issues.  A
+        history append, a prefill, a verify width or any non-draft decode is
+        not eligible and keeps the stock selection untouched.
+        """
+
+        if int(rows) != 1:
+            return False
+        depth = current_draft_depth()
+        if depth is None or int(depth) < 1:
+            return False
+        return indexer_reuse_enabled()
+
+    def _indexer_reuse_refuse(self, lane: str) -> None:
+        """An armed flag met a lane it cannot serve: raise, never revert."""
+
+        raise RuntimeError(
+            f"{FABLE_INDEXER_REUSE_ENV}=1 cannot serve the QSA {lane} decode "
+            "lane; its selection contract carries no per-slot validity, so a "
+            "reused block set could double-count the tokens of a block that "
+            "did not complete. Unset one of the two flags rather than letting "
+            "an armed run report a stock number."
+        )
+
+    def _indexer_reuse_pooled_width(self, cache: QSACache, total: int) -> int:
+        """``nb_total`` this forward's selector will see, without a sync.
+
+        Mirrors ``_extend_pooled``: the fixed bank hands the selector its whole
+        capacity, the growable one hands it the logical complete-block count.
+        Read before the pooled update so the query preparation can be skipped
+        along with the scorer rather than after it.
+        """
+
+        if getattr(cache, "fixed_capacity", False):
+            pooled = getattr(cache, "pooled", None)
+            return 0 if pooled is None else int(pooled.shape[1])
+        return int(total) // self.ratio
+
+    def _indexer_reuse_decision(
+        self, cache: QSACache, *, rows: int, nb_total: int
+    ) -> bool:
+        """Pure: will this depth be served from the anchor? No mutation.
+
+        Called twice per draft step -- once by ``_call_rows`` to decide whether
+        the query norm/RoPE preparation is dead work, once by
+        ``_indexer_reuse_take`` to act on it.  Both see the same host state, so
+        they cannot disagree about whether ``q`` is needed.
+        """
+
+        if not self._indexer_reuse_armed(rows):
+            return False
+        depth = int(current_draft_depth())
+        if depth < 2:
+            return False
+        if depth - 1 > self.ratio:
+            # nb_d - nb_1 = (P+d)//r - (P+1)//r <= ceil((d-1)/r), so past this
+            # bound two or more blocks can complete inside one cycle and the
+            # single extra slot below would DROP one. Refuse rather than
+            # quietly serve a set that is no longer a superset of the tail.
+            raise RuntimeError(
+                f"{FABLE_INDEXER_REUSE_ENV}=1 extends the depth-1 block set by "
+                "one slot, which is exact only while depth - 1 <= ratio; got "
+                f"depth {depth} at ratio {self.ratio}"
+            )
+        anchor = self._indexer_reuse_anchor
+        if anchor is None:
+            return False
+        # A cycle is a contiguous 1,2,..,D run of draft steps against ONE cache
+        # object.  Anything else -- a different cache, a repeated depth, a gap,
+        # or a bank that crossed block_topk mid-cycle and changed the width the
+        # anchor was taken at -- means the anchor does not describe this chain.
+        # A weakref, not an id(): a collected cache's address can be reused,
+        # and a stale anchor whose block ids outran a fresher, shorter history
+        # would index past the pooled bank.
+        return (
+            anchor["cache"]() is cache
+            and anchor["next_depth"] == depth
+            and anchor["k_eff"] == min(self.block_topk, int(nb_total))
+        )
+
+    def _indexer_reuse_take(
+        self,
+        cache: QSACache,
+        *,
+        rows: int,
+        nb_q: mx.array,
+        valid: mx.array,
+        k_eff: int,
+        nb_total: int,
+    ):
+        """The depth-``d>=2`` block set, or None to score this depth normally.
+
+        Returns ``(top_idx, blk_ok)``: ids ``[1, k_eff + 1]`` and their
+        per-slot validity.  ``blk_ok`` is returned rather than re-derived by
+        the caller because the trailing slot is a *masked duplicate* whenever
+        no block completed, and ``valid`` alone cannot tell that slot apart
+        from a genuine selection of the same block.
+
+        Every operand is a device array, so nothing here synchronises: the
+        fixed-capacity MTP cache keeps its offset on the GPU and
+        ``nb_1 < nb_d`` is resolved in the graph, not on the host.
+        """
+
+        if not self._indexer_reuse_decision(cache, rows=rows, nb_total=nb_total):
+            if self._indexer_reuse_armed(rows) and int(current_draft_depth()) >= 2:
+                # Declined mid-chain: drop the anchor so depth 3 scores itself
+                # too rather than becoming a superset of depth 1 but not of
+                # depth 2.
+                object.__setattr__(self, "_indexer_reuse_anchor", None)
+            return None
+        anchor = self._indexer_reuse_anchor
+        anchor_ids = anchor["ids"]  # [1, k_eff] int32
+        anchor_nb = anchor["nb"]  # [1], the depth-1 complete-block count
+        # One slot is exact, not an approximation: with `depth - 1 <= ratio`
+        # (checked in _indexer_reuse_decision) at most one block can complete
+        # between depth 1 and depth d.
+        extra_ok = (anchor_nb < nb_q)[:, None]  # [1, 1] bool
+        extra_id = mx.where(
+            extra_ok,
+            anchor_nb[:, None].astype(mx.int32),
+            anchor_ids[:, :1],
+        )
+        top_idx = mx.concatenate([anchor_ids, extra_id], axis=-1)
+        # Validity is taken from THIS depth's causal mask, never carried over:
+        # a slot invalid at depth 1 may have become visible since.
+        anchor_ok = mx.take_along_axis(
+            valid, anchor_ids.astype(mx.int64), axis=-1
+        )
+        blk_ok = mx.concatenate([anchor_ok, extra_ok], axis=-1)
+        anchor["next_depth"] = int(current_draft_depth()) + 1
+        note_step_reused()
+        return top_idx, blk_ok
+
+    def _indexer_reuse_stash(
+        self,
+        cache: QSACache,
+        *,
+        rows: int,
+        nb_q: mx.array,
+        top_idx: mx.array,
+        k_eff: int,
+    ) -> None:
+        """Anchor a freshly scored depth-1 selection for depths 2..D."""
+
+        if not self._indexer_reuse_armed(rows):
+            return
+        if int(current_draft_depth()) != 1:
+            # Depth >= 2 reaching the scorer means the anchor was declined;
+            # re-anchoring mid-chain would make depth 3 a superset of depth 2
+            # rather than of depth 1, so leave it dropped.
+            return
+        if self.ratio < 2:
+            raise RuntimeError(
+                f"{FABLE_INDEXER_REUSE_ENV}=1 needs compress_ratio >= 2 so at "
+                "most one pooled block completes per draft step; this indexer "
+                f"has ratio {self.ratio}"
+            )
+        object.__setattr__(
+            self,
+            "_indexer_reuse_anchor",
+            {
+                "cache": weakref.ref(cache),
+                "next_depth": 2,
+                # int32 once, here, so the concatenate at depth 2/3 needs no
+                # cast and cannot disagree with argpartition's index dtype.
+                "ids": top_idx.astype(mx.int32),
+                "nb": nb_q,
+                "k_eff": int(k_eff),
+            },
+        )
+        note_cycle()
+
     def _select_eager(
         self,
-        q: mx.array,
+        q: Optional[mx.array],
         pos_start: int,
         cache: QSACache,
         pooled: mx.array,
         total: int,
+        *,
+        rows: Optional[int] = None,
     ):
-        """Stock MLX selector kept as the correctness oracle and kill-switch."""
+        """Stock MLX selector kept as the correctness oracle and kill-switch.
 
-        S = q.shape[1]
+        ``q`` is None exactly when MTPLX_FABLE_INDEXER_REUSE will serve this
+        depth from the cycle's anchor: the query's norm + partial RoPE is dead
+        work there, so ``_call_rows`` never computes it and passes ``rows``
+        instead.  Every other caller passes a prepared ``q`` and this reads
+        the same as before the flag existed.
+        """
+
+        S = int(rows) if rows is not None else int(q.shape[1])
         nb_total = pooled.shape[1]
-        # Cached fp32-transposed pooled view: same values as the old per-call
-        # astype+swapaxes of the whole table (astype of the same bf16 blocks
-        # -> bit-identical scores), without re-materializing 33.5 MB per
-        # layer per token at 262K (#393).
-        pooled_t = cache.pooled_f32_view(nb_total)  # [1,1,D,nb]
 
         qpos = pos_start + mx.arange(S, dtype=mx.int32)  # abs position
         nb_q = (qpos + 1) // self.ratio  # complete blocks visible per query [S]
@@ -2651,15 +2849,54 @@ class QSAIndexer(nn.Module):
         valid = blk[None, :] < nb_q[:, None]  # [S, nb]
         neg = mx.array(-mx.inf, dtype=mx.float32)
         k_eff = min(self.block_topk, nb_total)
-
         tile = _qsa_score_tile_rows()
-        if S > 1 and 0 < tile < S:
+
+        # MTPLX_FABLE_INDEXER_REUSE, row K-D2: depths 2..D of one MTP draft
+        # chain are handed the depth-1 block set plus the block the chain's
+        # own tokens completed, and the whole query preparation / score GEMM /
+        # top-k below is skipped. Off (the default) this is one host-side
+        # `int(rows) != 1` and the path is bit-identical to before the flag.
+        reuse_blk_ok: Optional[mx.array] = None
+        reused = self._indexer_reuse_take(
+            cache,
+            rows=S,
+            nb_q=nb_q,
+            valid=valid,
+            k_eff=k_eff,
+            nb_total=nb_total,
+        )
+        if reused is not None:
+            top_idx, reuse_blk_ok = reused
+        elif q is None:
+            # _call_rows dropped the query preparation because
+            # _indexer_reuse_decision said the anchor would serve, and
+            # _indexer_reuse_take then declined. The two read the same host
+            # state, so this cannot happen -- assert it rather than fail on an
+            # attribute of None several lines below.
+            raise RuntimeError(
+                f"{FABLE_INDEXER_REUSE_ENV}: the reuse decision and the reuse "
+                "itself disagreed; the prepared query was skipped but the "
+                "anchor did not serve this depth"
+            )
+        elif S > 1 and 0 < tile < S:
             # Tiled scoring (see _qsa_score_tile_rows): bounds the live fp32
             # score transient at one tile; per-row selection math identical.
+            # Cached fp32-transposed pooled view: same values as the old
+            # per-call astype+swapaxes of the whole table (astype of the same
+            # bf16 blocks -> bit-identical scores), without re-materializing
+            # 33.5 MB per layer per token at 262K (#393).
             top_idx = self._tiled_topk(
-                q, pooled_t, nb_q, blk, neg, k_eff, nb_total, tile
+                q,
+                cache.pooled_f32_view(nb_total),
+                nb_q,
+                blk,
+                neg,
+                k_eff,
+                nb_total,
+                tile,
             )
         else:
+            pooled_t = cache.pooled_f32_view(nb_total)  # [1,1,D,nb]
             scores = mx.matmul(q.astype(mx.float32), pooled_t)  # [1,S,H,nb]
             scores = (
                 mx.maximum(scores, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
@@ -2673,6 +2910,10 @@ class QSAIndexer(nn.Module):
             top_idx = mx.argpartition(masked_scores, kth=nb_total - k_eff, axis=-1)[
                 :, nb_total - k_eff :
             ]
+        if reused is None:
+            self._indexer_reuse_stash(
+                cache, rows=S, nb_q=nb_q, top_idx=top_idx, k_eff=k_eff
+            )
 
         if S > 1 and _qsa_large_prefill_enabled(S, total):
             # Preserve the eager score/top-k expression as an independently
@@ -2711,6 +2952,8 @@ class QSAIndexer(nn.Module):
             # dense mask staged, no gathered copies (both measured slower:
             # dense = full-context reads, gather = -5.25% from two
             # materialized copies per layer per token, d6171d2c).
+            if self._indexer_reuse_armed(S):
+                self._indexer_reuse_refuse("flash-skip")
             _qsa_prefill_count("decode_flash_skip")
             blk_idx = mx.sort(top_idx[0].astype(mx.int32))
             tail_start = ((pos_start + 1) // self.ratio) * self.ratio
@@ -2730,6 +2973,8 @@ class QSAIndexer(nn.Module):
             # are < the tail start; the tail runs to the current position),
             # so the gathered SDPA needs no mask — identical math to the
             # masked dense product over the same visible set.
+            if self._indexer_reuse_armed(S):
+                self._indexer_reuse_refuse("decode-gather")
             blk_idx = mx.sort(top_idx[0].astype(mx.int32))
             tok_from_blocks = (
                 blk_idx[:, None] * self.ratio + mx.arange(self.ratio, dtype=mx.int32)
@@ -2767,7 +3012,16 @@ class QSAIndexer(nn.Module):
             # tail start, so the lists never double-count a token; invalid
             # slots carry valid=False and are re-pointed at token 0 for the
             # take.
-            blk_ok = mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
+            # Under MTPLX_FABLE_INDEXER_REUSE the trailing slot is a masked
+            # DUPLICATE of an already-selected block whenever no block
+            # completed this step, and `valid` would call that duplicate
+            # visible -- gathering its four tokens twice and double-counting
+            # them in the softmax. The reuse hands down the right mask.
+            blk_ok = (
+                reuse_blk_ok
+                if reuse_blk_ok is not None
+                else mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
+            )
             tok_blocks = (
                 top_idx.astype(mx.int32)[:, :, None] * self.ratio
                 + mx.arange(self.ratio, dtype=mx.int32)
@@ -3355,6 +3609,12 @@ class QSAIndexer(nn.Module):
                 decode=decode,
                 mode=compiled_mode,
             ):
+                if compiled_mode != "update_only" and self._indexer_reuse_armed(S):
+                    # The compiled graph fuses the cache writes and the
+                    # selection into one trace; there is no seam at which a
+                    # reused block set could replace the scorer without
+                    # re-tracing per depth.
+                    self._indexer_reuse_refuse("compiled-indexer")
                 return self._call_rows_compiled(
                     hidden,
                     pos_start,
@@ -3378,7 +3638,16 @@ class QSAIndexer(nn.Module):
             # Raises on a module/pack mismatch -- an armed flag never reverts
             # to the stock chain behind a performance mystery.
             self._require_m4_contract(cache, S)
-        if write_only:
+        # MTPLX_FABLE_INDEXER_REUSE decides BEFORE the query preparation: when
+        # the anchor will serve this depth, the norm + partial RoPE below is
+        # dead work exactly as it is under write_only. Both leave the k half
+        # -- the raw-key and pooled-bank writes -- untouched.
+        reuse_serves = self._indexer_reuse_decision(
+            cache,
+            rows=S,
+            nb_total=self._indexer_reuse_pooled_width(cache, T),
+        )
+        if write_only or reuse_serves:
             # The query half of index_qk_proj is already computed (one shared
             # GEMV); only its norm+rope preparation is skipped, along with
             # every scorer below.
@@ -3396,6 +3665,8 @@ class QSAIndexer(nn.Module):
             return None
         nb_total = 0 if pooled is None else pooled.shape[1]
         if fused_m4:
+            if self._indexer_reuse_armed(S):
+                self._indexer_reuse_refuse("fused-M4")
             return self._select_m4(q, pos_start, cache, pooled)
 
         # Per-query complete-block counts. If every visible prefix fits inside
@@ -3431,7 +3702,8 @@ class QSAIndexer(nn.Module):
         # threadgroup.  Keep it for decode/small verify only; large-S prefill
         # either takes the tiled scorer above or the stock vectorized oracle.
         legacy_fused = (
-            not fixed_capacity
+            not reuse_serves
+            and not fixed_capacity
             and _fused_qsa_indexer_enabled()
             and pooled_backing is not None
             and (decode or S < _qsa_prefill_min_rows())
@@ -3441,8 +3713,13 @@ class QSAIndexer(nn.Module):
             and self._fused_selector_supported(q, pooled_backing)
         )
         if not legacy_fused:
-            return self._select_eager(q, pos_start, cache, pooled, T)
+            return self._select_eager(q, pos_start, cache, pooled, T, rows=S)
 
+        if self._indexer_reuse_armed(S):
+            # `legacy_fused` is True here: the one-threadgroup-per-row Metal
+            # scorer owns preparation, scoring and top-k behind a single
+            # dispatch, so the anchor has nothing to substitute for.
+            self._indexer_reuse_refuse("legacy-fused")
         if decode and _qsa_flash_enabled():
             block_ids, _, _ = self._select_fused(
                 q,
