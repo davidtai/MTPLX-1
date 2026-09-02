@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 import operator
+import re
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -74,19 +75,79 @@ def _extension_path() -> Path:
     )
 
 
+#: nanobind writes its ABI tag as one literal, e.g. ``v21_system_libcpp_abi1``.
+_NB_ABI_TAG_RE = re.compile(
+    rb"v(\d+)(?:[0-9a-zA-Z.\-]*)_[0-9a-zA-Z_]*(?:libcpp|libstdcpp|ms)[0-9a-zA-Z_]*"
+)
+
+
+def _nanobind_internals_version(binary: Path) -> int | None:
+    """The nanobind internals version a shared object was built against."""
+
+    try:
+        data = binary.read_bytes()
+    except OSError:
+        return None
+    versions = {int(m.group(1)) for m in _NB_ABI_TAG_RE.finditer(data)}
+    return versions.pop() if len(versions) == 1 else None
+
+
+@lru_cache(maxsize=1)
+def _nanobind_abi_mismatch() -> str | None:
+    """Precise reason when the extension cannot see mlx.core's type registry.
+
+    Two nanobind modules share a type registry only when they agree on the
+    capsule key ``__nb_internals_<abi_tag>_<domain>__``.  The domain is
+    ``NB_DOMAIN=mlx`` on both sides; the tag carries ``NB_INTERNALS_VERSION``,
+    which moves between nanobind releases.  A mismatch does not stop the build
+    or the import -- it makes every call that takes an ``mx::array`` raise a
+    bare ``TypeError`` whose signature line prints ``mlx::core::array`` instead
+    of ``array``.  Diagnosing that from the TypeError alone cost W68 a guarded
+    GPU window, so it is named here instead.
+
+    ``None`` when the tags match or cannot be read; a reason string otherwise.
+    """
+
+    ours = sorted(_extension_path().glob("mtplx_native_qsa/_ext*.so"))
+    if not ours:
+        return None
+    core = sorted(Path(mx.__file__).parent.glob("core*.so")) if mx.__file__ else []
+    if not core:
+        return None
+    ext_version = _nanobind_internals_version(ours[0])
+    mlx_version = _nanobind_internals_version(core[0])
+    if ext_version is None or mlx_version is None or ext_version == mlx_version:
+        return None
+    return (
+        f"the built extension uses nanobind internals v{ext_version} but "
+        f"mlx.core uses v{mlx_version}, so it cannot resolve mlx::core::array "
+        "and every call raises TypeError; rebuild with "
+        "-DMTPLX_NANOBIND_DIR=<nanobind whose src/nb_abi.h says "
+        f"NB_INTERNALS_VERSION {mlx_version}> (diagnose with "
+        "scripts/fable/check_native_qsa_abi.py)"
+    )
+
+
 @lru_cache(maxsize=1)
 def _load_extension() -> Any:
-    """Import the built extension, or return the import error."""
+    """Import the built extension, or return the import error.
+
+    A successful import is not enough: the module can import cleanly and still
+    be unable to cast a single array (see :func:`_nanobind_abi_mismatch`), so
+    that check is folded in here rather than left to fail at the first call.
+    """
 
     native_path = str(_extension_path())
     if native_path not in sys.path:
         sys.path.insert(0, native_path)
     try:
         import mtplx_native_qsa  # noqa: PLC0415
-
-        return mtplx_native_qsa
     except Exception as exc:  # pragma: no cover - depends on build state
         return exc
+    mismatch = _nanobind_abi_mismatch()
+    if mismatch is not None:  # pragma: no cover - depends on build state
+        return RuntimeError(mismatch)
+    return mtplx_native_qsa
 
 
 def native_qsa_available() -> bool:
@@ -301,7 +362,7 @@ def qsa_sparse_gqa(
 
     extension = _load_extension()
     selected = _normalized_block_ids(block_ids, int(queries.shape[2]))
-    return extension.qsa_sparse_gqa_attention(
+    args = (
         queries,
         keys,
         values,
@@ -311,8 +372,14 @@ def qsa_sparse_gqa(
         int(total_tokens),
         int(key_tile),
         int(dimension_tile),
-        stream=stream,
     )
+    # Omit the kwarg entirely when no stream was asked for, rather than
+    # passing an explicit None: the binding's default is applied by nanobind
+    # without going through the StreamOrDevice caster at all, which is one
+    # fewer thing to be wrong about in an extension module.
+    if stream is None:
+        return extension.qsa_sparse_gqa_attention(*args)
+    return extension.qsa_sparse_gqa_attention(*args, stream=stream)
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +697,7 @@ def qsa_sparse_gqa_decode(
     extension = _load_extension()
     selected = _normalized_block_ids(block_ids, int(queries.shape[2]))
     offset = _normalized_query_offset(query_offset)
-    return extension.qsa_sparse_gqa_decode(
+    args = (
         queries,
         keys,
         values,
@@ -641,5 +708,8 @@ def qsa_sparse_gqa_decode(
         int(key_tile),
         int(dimension_tile),
         int(key_splits),
-        stream=stream,
     )
+    # See qsa_sparse_gqa: omit rather than pass an explicit None.
+    if stream is None:
+        return extension.qsa_sparse_gqa_decode(*args)
+    return extension.qsa_sparse_gqa_decode(*args, stream=stream)

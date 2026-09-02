@@ -155,16 +155,36 @@ encoder, so there is no host sync between them.
 
 **3.9x fewer bytes, 637 MB/cycle removed, 48 fewer dispatches/cycle.**
 
-### What that is worth, honestly
+### What that is worth, against a MEASURED baseline
 
-At the 403 GB/s the measured gather arm actually achieves, 637 MB is **1.58
-ms/cycle**; at the machine's 544 GB/s it is 1.17 ms. Plus 48 dispatches at the
-census fit's 2.2 µs = 0.11 ms. Against a 39.7 ms cycle (32.4 busy + 7.3 idle)
-that is **3.0-4.3 %**, or roughly +2.0 to +2.9 tok/s at 68 tok/s.
+The 2026-09-02 guarded run timed the production attention chain end to end at
+M=4 / 16K on the queued lane:
 
-The floor on the win is firmer than the ceiling: the gather + transpose arm is
-a **measured** 1.501 ms/cycle and the kernel deletes all of it, while adding
-back no K/V read the score and P@V GEMMs were not already paying.
+| arm | ms/layer | ms/cycle (12 layers) | GB/s of 544 |
+| --- | ---: | ---: | ---: |
+| `production_gather_kernel` — fused gather + score + mask + softmax + cast + P@V | **0.230** | **2.764** | 309 |
+| `portable_take_reference` — same math and bytes, gathering via two `mx.take` | 0.542 | 6.504 | 131 |
+
+**`production_gather_kernel` is the baseline; the 6.5 ms figure is not.** The
+portable arm exists only as the numerics reference for parity: it moves the
+same bytes but through MLX's generic gather instead of the one-dispatch fused
+kernel, and is 2.35x slower for that reason alone. Quoting a speedup against it
+would inflate the result by more than the result.
+
+Cross-check: `micro_qsa_m4.py` attributes 1.501 ms/cycle of that 2.764 to the
+fused gather plus the transposed-K copy — **54 % of the production attention
+chain is the materialisation this kernel deletes outright.**
+
+Scaling the measured baseline by the byte ratio (217 vs 852 MB/cycle):
+
+| if the kernel achieves | its ms/cycle | saving vs 2.764 | share of a 39.7 ms cycle |
+| --- | ---: | ---: | ---: |
+| 309 GB/s (the baseline's own rate) | 0.70 | 2.06 ms | 5.2 % |
+| 200 GB/s | 1.09 | 1.68 ms | 4.2 % |
+| 150 GB/s | 1.45 | 1.32 ms | 3.3 % |
+
+So roughly **+2.2 to +3.6 tok/s at 68 tok/s**, and the 54 % that is pure
+materialisation is a firm floor on the opportunity.
 
 The risk is the other direction. At M=4 with 6 splits the grid is 48
 threadgroups of 64 threads on 40 cores — better than 8, still thin. If the
@@ -174,6 +194,62 @@ do not convert. That is what the split sweep in
 may be reported as a win before the 16K ABBA: W16 turned an isolated -1.9 ms
 into 0 end-to-end, and W19's lightning lane lost to dense at 16K after looking
 good in isolation.
+
+## 3a. The nanobind ABI defect (found 2026-09-02, inherited from W50)
+
+The first guarded run built the extension cleanly, timed both baseline arms,
+and then died at the first call of the new kernel:
+
+```
+TypeError: qsa_sparse_gqa_decode(): incompatible function arguments.
+  1. qsa_sparse_gqa_decode(queries: mlx::core::array, ...)
+  Invoked with types: mlx.core.array, mlx.core.array, ...
+```
+
+The initial reading — that nanobind rejected the explicit `stream=None` — is
+wrong, and checking it mattered: the same failure reproduces with `stream`
+omitted, and on **W50's** `qsa_sparse_gqa_unsupported_reason`, which is a pure
+host predicate taking no stream at all. W50's kernel had never been callable
+either; its phase-1 micro never reached a call.
+
+The tell is in the signature: nanobind printed the raw C++ name
+`mlx::core::array` where `mlx.core`'s own bindings print `array` (compare
+`mx.take`'s error, which reads `a: array` and `stream: StreamOrDevice`). That
+means the type was never resolved. Two nanobind modules share a type registry
+only when they agree on the capsule key `__nb_internals_<abi_tag>_<domain>__`
+(nanobind `src/nb_internals.cpp`, `nb_module_exec`). The domain is right on
+both sides (`NB_DOMAIN=mlx`). The tag is not:
+
+| | nanobind | `NB_INTERNALS_VERSION` | ABI tag |
+| --- | --- | ---: | --- |
+| `mlx.core` (wheel 0.32.2) | — | 21 | `v21_system_libcpp_abi1` |
+| `_ext` (qwen38 venv) | 2.12.0 | 19 | `v19_system_libcpp_abi1` |
+
+Separate capsules, separate registries, so every function taking an
+`mx::array` rejects every call. The build succeeds and the module imports,
+which is what makes it expensive: it costs a whole guarded GPU window to find.
+
+**Remedy, no install required.** nanobind 2.15.0 (internals v21) is already on
+this box at
+`/Users/davidtai/.local/share/uv/tools/mtplx/lib/python3.13/site-packages/nanobind`.
+Pass it as `-DMTPLX_NANOBIND_DIR=$NB` and delete the stale `build/` first.
+
+**Do not** define `NB_INTERNALS_VERSION=21` on the v19 sources to force the tag
+to match. That macro guards the layout of the shared `nb_internals` struct;
+forcing agreement while the struct differs makes two modules write through one
+capsule into each other's memory.
+
+Three things now stop this recurring:
+
+* `CMakeLists.txt` reads `NB_INTERNALS_VERSION` from the nanobind it is about
+  to use and the ABI tag out of `mlx.core`'s `.so`, and `FATAL_ERROR`s on a
+  mismatch with the remedy in the message — a configure-time error instead of
+  a runtime one.
+* `scripts/fable/check_native_qsa_abi.py` answers the same question with no
+  build and no GPU, and can be run before queueing a window.
+* `mtplx/native/__init__.py` checks the built artifact against `mlx.core` at
+  load and reports the mismatch as the lane's unsupported reason, so the
+  install gate raises a diagnosis rather than a bare `TypeError`.
 
 ## 4. The correctness difference from the prefill kernel
 
