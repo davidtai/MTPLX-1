@@ -8294,6 +8294,8 @@ def test_profiles_command_lists_default_without_mlx(capsys):
         "turbo",
         "exact",
         "max-diagnostic",
+        # Opt-in Flash-Next decode restack; appended, never a default.
+        "turbo-full-stack",
     ]
 
 

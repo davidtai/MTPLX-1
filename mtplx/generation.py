@@ -2403,12 +2403,12 @@ def _batch_target_distributions_enabled() -> bool:
 
 
 def _batch_target_arrays_enabled() -> bool:
-    return os.environ.get("MTPLX_BATCH_TARGET_ARRAYS", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    # Routed through the typed registry (mtplx/full_stack_env.py). The
+    # registry records this site's parse as "lenient_nostrip" because it
+    # lowercases WITHOUT stripping -- preserved exactly, not "fixed".
+    from .full_stack_env import flag_enabled
+
+    return flag_enabled("MTPLX_BATCH_TARGET_ARRAYS")
 
 
 def _lazy_target_distributions_enabled() -> bool:

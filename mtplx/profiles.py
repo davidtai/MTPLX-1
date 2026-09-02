@@ -11,6 +11,11 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping
 
+from .full_stack_env import (
+    FULL_STACK_PROFILE_NAME,
+    FULL_STACK_RESTACK_ENV,
+)
+
 ProfileName = str
 
 DEFAULT_PROFILE_NAME = "sustained"
@@ -21,6 +26,7 @@ PROFILE_CHOICES = (
     "turbo",
     "exact",
     "max-diagnostic",
+    FULL_STACK_PROFILE_NAME,
 )
 PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
     {
@@ -859,6 +865,82 @@ TURBO_PROFILE = RuntimeProfile(
     product_claim_eligible=False,
 )
 
+TURBO_FULL_STACK_PROFILE = RuntimeProfile(
+    name=FULL_STACK_PROFILE_NAME,
+    runtime_profile="native_mtp_turbo_full_stack",
+    summary=(
+        "Turbo plus the Qwen3.8 Flash-Next decode restack the in-process "
+        "benchmark drivers arm (FR-Spec draft head, compiled fixed-M4 verify "
+        "and M4 stage-3 tail, fused GDN/MoE/hyper-connection lanes, QSA "
+        "rows-gather, pipelined AR + compiled GDN, batched target arrays). "
+        "Opt-in: no default changes, and no other profile is affected."
+    ),
+    env=_merge_env(
+        TURBO_PROFILE.env_dict(),
+        # Driver-wins on every key the two disagree about. The block is
+        # generated from mtplx.full_stack_env.FULL_STACK_KEYS, which records
+        # each key's reader, parse and unset default. It is byte-identical to
+        # the FULL_STACK_ENV dict in scripts/fable/server_cell_bench.py, which
+        # is in turn what scripts/fable/abba_driver.py:build_family_overrides
+        # sets from its own default flags (verified 2026-09-02).
+        #
+        # Exactly THREE keys conflict with turbo, and the driver value wins:
+        #
+        #   MTPLX_BATCH_TARGET_ARRAYS        turbo 0 -> 1
+        #   MTPLX_LAZY_TARGET_DISTRIBUTIONS  turbo 1 -> 0
+        #   MTPLX_SKIP_VERIFY_SNAPSHOT       turbo 1 -> 0
+        #
+        # The first two are one decision, not two: generation.py consults
+        # BATCH_TARGET_ARRAYS only where the lazy strategy is OFF
+        # (RUNTIME_GATED_ENV_PAIRS above), so turbo's pair leaves the batched
+        # arm runtime-dead. The third is a correctness requirement on this
+        # family, not a speed knob -- Flash-Next rejection rollback replays
+        # from the recurrent-state snapshot, and the server already forces it
+        # to 0 for mtp + qwen4_exp. This profile states it instead of
+        # inheriting it by accident.
+        #
+        # Two keys the driver also sets are deliberately NOT in the block,
+        # matching FULL_STACK_ENV:
+        #
+        #   MTPLX_COMPILED_VERIFY  turbo's "1" already covers the driver's
+        #                          default "on".
+        #   MTPLX_NAX_VERIFY       the driver defaults it to 0; the server
+        #                          already forces 0 on qwen4_exp via
+        #                          _server_runtime_env_overrides, which is
+        #                          applied AFTER the profile env and so wins.
+        #                          On any other family this profile therefore
+        #                          keeps turbo's 1 -- see the caveats.
+        FULL_STACK_RESTACK_ENV,
+    ),
+    caveats=(
+        "Opt-in only. Nothing selects this profile automatically: turbo "
+        "stays the flagship default and its env is unchanged.",
+        "Scoped to the Qwen3.8 Flash-Next (qwen4_exp) family. The "
+        "MTPLX_QWEN4_*/MTPLX_QSA_M4_* keys are read only under that "
+        "model_type, but MTPLX_FRSPEC_DRAFT is family-agnostic and will "
+        "raise at load if the FR-Spec head cannot install -- do not select "
+        "this profile for another model.",
+        "Selecting it turns on a startup self-check that prints one "
+        "satisfied/missing line per engagement receipt: the FR-Spec install "
+        "report (expects n=65536 from builtin:qwen38-code-64k), the runtime's "
+        "[qwen4-fixed-M4-verify], [qwen4-M4-stage3] and "
+        "[qwen4-compiled-MTP-prepare] install reports, and the background "
+        "warmup ladder. Those three runtime reports are logger.info and "
+        "invisible under `python -m mtplx.server.openai`, so the self-check "
+        "prints their contents rather than pointing at them.",
+        "Same verify-kernel exactness caveats as turbo; additionally the "
+        "fused GDN/MoE/hyper-connection lanes and the QSA rows-gather are "
+        "self-fenced and bail to the stock chain on any contract miss.",
+        "MTPLX_BATCH_TARGET_ARRAYS, MTPLX_LAZY_TARGET_DISTRIBUTIONS, "
+        "MTPLX_SKIP_VERIFY_SNAPSHOT and MTPLX_FAMILY_CAPTURE_COMMIT stay "
+        "operator-overridable (PROFILE_ENV_USER_OVERRIDE_KEYS); an explicit "
+        "export still beats this profile and is announced at startup.",
+        "Runs on stock PyPI MLX; no custom MLX fork or build is required.",
+    ),
+    draft_lm_head=DraftLMHeadRequirement(bits=4, group_size=64, mode="affine"),
+    product_claim_eligible=False,
+)
+
 EXACT_PROFILE = RuntimeProfile(
     name="exact",
     runtime_profile="exact",
@@ -891,6 +973,7 @@ PROFILES: dict[ProfileName, RuntimeProfile] = {
     TURBO_PROFILE.name: TURBO_PROFILE,
     EXACT_PROFILE.name: EXACT_PROFILE,
     MAX_DIAGNOSTIC_PROFILE.name: MAX_DIAGNOSTIC_PROFILE,
+    TURBO_FULL_STACK_PROFILE.name: TURBO_FULL_STACK_PROFILE,
 }
 
 PROFILE_ALIASES = {
@@ -908,6 +991,13 @@ PROFILE_ALIASES = {
     "auto": DEFAULT_PROFILE_NAME,
     "sustained-max": "sustained",
     "sustained_max": "sustained",
+    # The opt-in Flash-Next restack. "full-stack" is the name the benchmark
+    # harness uses for the same env block (server_cell_bench's
+    # --require-full-stack / "branch (full stack)" cells).
+    "full-stack": FULL_STACK_PROFILE_NAME,
+    "full_stack": FULL_STACK_PROFILE_NAME,
+    "turbo_full_stack": FULL_STACK_PROFILE_NAME,
+    "native_mtp_turbo_full_stack": FULL_STACK_PROFILE_NAME,
 }
 
 

@@ -1049,22 +1049,18 @@ def load(
         "qwen4_exp",
         "qwen4_exp_text",
     }:
-        relaxed_draft_ties = (
-            os.environ.get("MTPLX_QWEN4_RELAXED_DRAFT_TIES", "").strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        # Routed through the typed registry (mtplx/full_stack_env.py):
+        # same parse, same default, one place that knows the key exists.
+        from .full_stack_env import flag_enabled
+
+        relaxed_draft_ties = flag_enabled("MTPLX_QWEN4_RELAXED_DRAFT_TIES")
         if relaxed_draft_ties:
             if not mtp_enabled:
                 raise RuntimeError("relaxed Qwen4 draft ties require native MTP")
             if adapter_path is not None:
                 raise RuntimeError("relaxed Qwen4 draft ties do not accept adapters")
             runtime.qwen4_relaxed_draft_ties = True
-        compiled_mtp_prepare = (
-            os.environ.get("MTPLX_QWEN4_COMPILED_MTP_PREPARE", "")
-            .strip()
-            .lower()
-            in {"1", "true", "yes", "on"}
-        )
+        compiled_mtp_prepare = flag_enabled("MTPLX_QWEN4_COMPILED_MTP_PREPARE")
         if compiled_mtp_prepare:
             if adapter_path is not None:
                 raise RuntimeError(

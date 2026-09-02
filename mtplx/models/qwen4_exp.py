@@ -61,6 +61,7 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
+from mtplx.full_stack_env import flag_enabled
 from mtplx.runtime_options import (
     FABLE_QSA_M4_ROWS,
     fable_hc_m4_enabled,
@@ -1341,8 +1342,9 @@ def _fuse_qsa_qkv_sanitize(model, out: dict) -> dict:
 
 
 def _fused_gate_up_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_FUSED_GATE_UP") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py):
+    # same parse, same default, one place that knows the key exists.
+    return flag_enabled("MTPLX_FUSED_GATE_UP")
 
 
 def _fused_qsa_qkv_enabled() -> bool:
@@ -1351,8 +1353,9 @@ def _fused_qsa_qkv_enabled() -> bool:
 
 
 def _fused_gdn_in_proj_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_FUSED_GDN_INPROJ") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py):
+    # same parse, same default, one place that knows the key exists.
+    return flag_enabled("MTPLX_FUSED_GDN_INPROJ")
 
 
 def _fused_gdn_out_enabled() -> bool:
@@ -1361,23 +1364,27 @@ def _fused_gdn_out_enabled() -> bool:
 
 
 def _fused_gdn_conv_norm_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_FUSED_GDN_CONVNORM") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py):
+    # same parse, same default, one place that knows the key exists.
+    return flag_enabled("MTPLX_FUSED_GDN_CONVNORM")
 
 
 def _fused_gdn_step_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_FUSED_GDN_STEP") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py):
+    # same parse, same default, one place that knows the key exists.
+    return flag_enabled("MTPLX_FUSED_GDN_STEP")
 
 
 def _fused_conv_norm_rows_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_FUSED_CONVNORM_VERIFY") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py):
+    # same parse, same default, one place that knows the key exists.
+    return flag_enabled("MTPLX_FUSED_CONVNORM_VERIFY")
 
 
 def _qsa_gather_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_QSA_GATHER") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py):
+    # same parse, same default, one place that knows the key exists.
+    return flag_enabled("MTPLX_QSA_GATHER")
 
 
 def _qsa_gather_decode_enabled() -> bool:
@@ -1843,8 +1850,9 @@ def _fused_hc_enabled() -> bool:
 
 
 def _fused_hc_v3_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_FUSED_HC_V3") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py):
+    # same parse, same default, one place that knows the key exists.
+    return flag_enabled("MTPLX_FUSED_HC_V3")
 
 
 def _fused_moe_decode_enabled() -> bool:
@@ -5150,10 +5158,9 @@ class Qwen4ExpTextModel(nn.Module):
             (i for i, t in enumerate(args.layer_types) if t != "linear_attention"),
             self.ssm_idx,
         )
-        self._gdn_compiled_env = (
-            os.environ.get("MTPLX_COMPILED_GDN", "0").strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        # Routed through the typed registry (mtplx/full_stack_env.py):
+        # same parse, same default, one place that knows the key exists.
+        self._gdn_compiled_env = flag_enabled("MTPLX_COMPILED_GDN")
         self._gdn_compiled_lane = False
         self._decode_runs = None
         self._decode_run_fns = {}

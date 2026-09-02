@@ -292,6 +292,8 @@ def test_list_profiles_includes_all_public_modes() -> None:
         "turbo",
         "exact",
         "max-diagnostic",
+        # Opt-in Flash-Next decode restack; appended, never a default.
+        "turbo-full-stack",
     ]
 
 

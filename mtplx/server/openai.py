@@ -138,6 +138,15 @@ from mtplx.profiles import (
     profile_env_status,
     resolve_long_context_mtp_depth,
 )
+from mtplx.full_stack_env import (
+    FULL_STACK_PROFILE_NAME,
+    warn_unknown_family_keys,
+)
+from mtplx.full_stack_selfcheck import (
+    format_marker_lines,
+    markers_from_runtime,
+    selfcheck_payload,
+)
 from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
     block_prefix_restore_enabled,
@@ -1541,6 +1550,73 @@ def _ngram_prewarm_health_payload() -> dict[str, Any]:
     }
 
 
+def _warn_unknown_family_env_keys() -> list[str]:
+    """One WARNING per family-prefixed env key nothing in mtplx reads.
+
+    Advisory only: never raises, never changes a default, and never touches
+    the value. It exists because most MTPLX_QWEN4_*/MTPLX_QSA_*/MTPLX_FRSPEC_*
+    keys are read by a single bare ``os.environ.get`` with a default, so a
+    misspelling is silence rather than an error -- see mtplx/full_stack_env.py.
+    """
+
+    def _warn(line: str) -> None:
+        LOGGER.warning("%s", line)
+        # logger.warning alone is invisible under `python -m
+        # mtplx.server.openai` (no handler configured), and this is exactly
+        # the line an operator needs to see at boot.
+        _safe_stdout_print(line)
+
+    try:
+        return warn_unknown_family_keys(warn=_warn)
+    except Exception:  # a diagnostic must never break startup
+        return []
+
+
+def _full_stack_profile_selected(args: Any) -> bool:
+    try:
+        from mtplx.profiles import resolve_profile_name
+
+        return resolve_profile_name(getattr(args, "profile", None)) == (
+            FULL_STACK_PROFILE_NAME
+        )
+    except Exception:
+        return False
+
+
+def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[str, Any]:
+    """Print each engagement marker as satisfied/missing.
+
+    Only when the opt-in full-stack profile was selected: on every other
+    profile this is a no-op and the server's output is unchanged.
+
+    The evidence is the install reports the runtime already publishes --
+    ``qwen4_fixed_verify_report``, ``qwen4_m4_stage3_report``,
+    ``qwen4_compiled_mtp_prepare_report`` (logged by mtplx/runtime.py as
+    ``[qwen4-fixed-M4-verify]`` / ``[qwen4-M4-stage3]`` /
+    ``[qwen4-compiled-MTP-prepare]``, which are ``logger.info`` and therefore
+    invisible under ``python -m mtplx.server.openai``), the FR-Spec section of
+    the draft-head report, and the background warmup ladder. Nothing new is
+    installed or measured here; this only says whether each one is there.
+    """
+
+    if not _full_stack_profile_selected(getattr(state, "args", None)):
+        return {}
+    try:
+        statuses = markers_from_runtime(
+            getattr(state, "runtime", None),
+            draft_lm_head=getattr(state, "draft_lm_head", None),
+            warmup_status=getattr(state, "warmup_status", None),
+        )
+        for line in format_marker_lines(statuses, phase=phase):
+            _safe_stdout_print(line)
+        payload = selfcheck_payload(statuses, phase=phase)
+        state.full_stack_selfcheck = payload
+        return payload
+    except Exception as error:  # a self-check must never break startup
+        LOGGER.warning("[full-stack] self-check unavailable: %r", error)
+        return {}
+
+
 def _laguna_fused_startup_line(runtime: Any) -> str | None:
     """Engagement receipt for the env-gated fused stack (grep: [laguna-fused])."""
 
@@ -2535,6 +2611,10 @@ class ServerState:
                         + json.dumps(bad_profile_env, sort_keys=True)
                     )
             self.fast_path_env_status = _fast_path_env_status()
+        # Advisory, every profile: a family-prefixed key nothing reads is a
+        # typo that would otherwise no-op in silence. Runs against the FINAL
+        # environment, after the profile and the runtime overrides.
+        self.unknown_family_env_keys = _warn_unknown_family_env_keys()
         _startup_line("[4/6] Checking local acceleration runtime")
         _startup_line("      This may take a few seconds.")
         self.mlx_runtime_status = _mlx_runtime_status()
@@ -3012,6 +3092,10 @@ class ServerState:
             else None
         )
         self.warmup_status = _run_startup_warmup(self)
+        # Opt-in profile only; a no-op on every shipped default. The ladder
+        # marker is re-reported by _BackgroundWarmup._finish once the rungs
+        # have actually run.
+        self.full_stack_selfcheck = _emit_full_stack_selfcheck(self)
 
     def _smart_fan_activity_probe(self) -> bool:
         """True while any model work is executing, queued, or recently active.
@@ -23154,6 +23238,13 @@ class _BackgroundWarmup:
                     ensure_ascii=False,
                 )
             )
+        except BaseException:
+            pass
+        # The ladder rungs have now run (or been abandoned), so the
+        # full-stack self-check's third marker finally has an answer.
+        # No-op on every profile but the opt-in one.
+        try:
+            _emit_full_stack_selfcheck(self.state, phase="post-warmup")
         except BaseException:
             pass
 

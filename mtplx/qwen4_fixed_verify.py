@@ -77,8 +77,11 @@ def is_qwen4_fixed_verify_config(config: dict[str, Any]) -> bool:
 
 
 def qwen4_fixed_verify_enabled() -> bool:
-    raw = os.environ.get("MTPLX_QWEN4_FIXED_M4_VERIFY", "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Routed through the typed registry (mtplx/full_stack_env.py): same
+    # parse, same default, one place that knows the key exists.
+    from .full_stack_env import flag_enabled
+
+    return flag_enabled("MTPLX_QWEN4_FIXED_M4_VERIFY")
 
 
 _FABLE_COMPACT_COMMIT: bool | None = None

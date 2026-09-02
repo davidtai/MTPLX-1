@@ -105,12 +105,17 @@ def _full_vocab_head(head: Any, ids: Any, vocab_rows: int) -> Any:
 
 
 def frspec_enabled() -> bool:
-    return (os.environ.get("MTPLX_FRSPEC_DRAFT", "").strip().lower()
-            in {"1", "true", "yes", "on"})
+    # Routed through the typed registry (mtplx/full_stack_env.py): same
+    # parse, same default, one place that knows the key exists.
+    from .full_stack_env import flag_enabled
+
+    return flag_enabled("MTPLX_FRSPEC_DRAFT")
 
 
 def _vocab_path() -> Path | None:
-    raw = (os.environ.get("MTPLX_FRSPEC_VOCAB") or "").strip()
+    from .full_stack_env import text_value
+
+    raw = text_value("MTPLX_FRSPEC_VOCAB")
     if not raw:
         return None
     if raw.startswith("builtin:"):
