@@ -62,6 +62,7 @@ import subprocess
 import sys
 import time
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -560,6 +561,29 @@ def prefill_chunks_receipt() -> list[dict[str, float]]:
         return prefill_chunk_records()
     except Exception:
         return []
+
+
+def first_chunk_cold_s(row: Mapping[str, Any] | None) -> float | None:
+    """Chunk-1 wall from an unmeasured graph-warm-up row, or ``None``.
+
+    The 2026-09-01 finding: on a fresh process the FIRST prefill chunk is
+    bimodal (~1.9 s or ~4.4 s) while chunks 2-8 hold +-0.02 s, and the mode
+    is perfectly concordant with the throughput of the driver's own 29.8 GiB
+    ``--prewarm-ngram-table`` read (12.7 GiB/s vs ~6.5 GiB/s, 12/12 arms in
+    the w22 window).  That is memory-residency state, not the candidate.
+    ``--warm-graph`` moves it out of the measured run; this keeps the raw
+    cold number so TTFT-after-restart stays trackable.
+    """
+
+    if not row:
+        return None
+    chunks = row.get("prefill_chunks") or []
+    if not chunks:
+        return None
+    try:
+        return float(chunks[0]["wall_s"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
@@ -1072,7 +1096,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-temperature", type=float, action="append")
     parser.add_argument("--ramp", action="store_true")
     parser.add_argument("--ramp-block", type=int)
-    parser.add_argument("--warm-graph", action="store_true")
+    parser.add_argument(
+        "--warm-graph",
+        action="store_true",
+        help=(
+            "Run one UNMEASURED copy of every cell first, so the measured run "
+            "does not pay the cold first prefill chunk (bimodal ~1.9 s / "
+            "~4.4 s on a fresh process). The cold chunk survives in the "
+            "receipt as graph_warmup.cells[].first_chunk_cold_s and on each "
+            "measured row as first_chunk_cold_s."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--natural-stop", action="store_true")
     parser.add_argument(
@@ -1702,7 +1736,13 @@ def main() -> int:
         "peak_bytes": int(mx.get_peak_memory()),
     }
 
-    def run(cell: dict[str, Any], sequence: int, seed: int) -> dict[str, Any]:
+    def run(
+        cell: dict[str, Any],
+        sequence: int,
+        seed: int,
+        *,
+        cold_first_chunk_s: float | None = None,
+    ) -> dict[str, Any]:
         thermal_receipt = wait_for_temperature(args.thermal_gate_max_c)
         reset_receipt = reset_run_caches(runtime, mx)
         mx.reset_peak_memory()
@@ -1869,6 +1909,9 @@ def main() -> int:
         row["page_cache_regime"] = (
             "prewarmed" if args.prewarm_ngram_table else "as-found"
         )
+        # None on a run that was itself the cold one (no --warm-graph, or the
+        # warm-up cell): then row["prefill_chunks"][0] IS the cold chunk.
+        row["first_chunk_cold_s"] = cold_first_chunk_s
         decoded = runtime.tokenizer.decode(output.tokens)
         row["response_text_chars"] = len(decoded)
         row["response_text_head"] = decoded[:600]
@@ -1907,14 +1950,27 @@ def main() -> int:
         return row
 
     rows = []
+    graph_warmup_cells: list[dict[str, Any]] = []
     sequence = args.sequence
     for cell in cells:
+        cold_s: float | None = None
         if args.warm_graph:
             warm_cell = dict(cell)
             warm_cell["label"] = f"{cell['label']}-unmeasured-graph-warmup"
-            run(warm_cell, sequence - 1, args.seed[0])
+            warm_row = run(warm_cell, sequence - 1, args.seed[0])
+            cold_s = first_chunk_cold_s(warm_row)
+            graph_warmup_cells.append(
+                {
+                    "label": warm_cell["label"],
+                    "measured_label": cell["label"],
+                    "first_chunk_cold_s": cold_s,
+                    "prefill_chunks": warm_row.get("prefill_chunks") or [],
+                    "prompt_eval_time_s": warm_row.get("prompt_eval_time_s"),
+                    "ttft_s": warm_row.get("ttft_s"),
+                }
+            )
         for seed in args.seed:
-            rows.append(run(cell, sequence, seed))
+            rows.append(run(cell, sequence, seed, cold_first_chunk_s=cold_s))
             sequence += 1
     after_run_memory = {
         "active_bytes": int(mx.get_active_memory()),
@@ -2029,6 +2085,12 @@ def main() -> int:
         "compiled_mtp_mlp": bool(args.compiled_mtp_mlp),
         "compiled_routed_mtp_mlp": bool(args.compiled_routed_mtp_mlp),
         "graph_warmed_before_measurement": bool(args.warm_graph),
+        # The unmeasured warm-up run's own first chunk: the cold number, kept
+        # for TTFT-after-restart tracking now that the measured run is warm.
+        "graph_warmup": {
+            "enabled": bool(args.warm_graph),
+            "cells": graph_warmup_cells,
+        },
         "fixed_d3_exclusions": fixed_d3_exclusions,
         "memory_caps": memory_caps,
         "memory": {"after_load": after_load_memory, "after_run": after_run_memory},

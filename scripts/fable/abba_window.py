@@ -948,10 +948,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Measure prefill cheaply: drop --max-tokens to "
-            f"{PREFILL_ONLY_MAX_TOKENS} on both arms. The driver still records "
-            "prefill_tok_s, prompt_eval_time_s and ttft_s per row; decode_tok_s "
-            "from such a short window is diagnostic only. An explicit "
-            "--max-tokens still wins."
+            f"{PREFILL_ONLY_MAX_TOKENS} on both arms, and run the driver's "
+            "unmeasured graph warm-up cell first (--warm-graph) so the cold "
+            "first prefill chunk does not land inside the measurement. The "
+            "driver still records prefill_tok_s, prompt_eval_time_s and ttft_s "
+            "per row; decode_tok_s from such a short window is diagnostic "
+            "only. An explicit --max-tokens still wins."
+        ),
+    )
+    parser.add_argument(
+        "--warm-graph",
+        action="store_true",
+        help=(
+            "Force the driver's unmeasured graph warm-up cell on every arm "
+            "(implied by --prefill-only)."
+        ),
+    )
+    parser.add_argument(
+        "--no-warm-graph",
+        action="store_true",
+        help=(
+            "Suppress the warm-up cell that --prefill-only otherwise implies, "
+            "e.g. to measure the cold first chunk on purpose."
         ),
     )
     parser.add_argument(
@@ -1001,7 +1019,29 @@ def common_driver_flags(args: argparse.Namespace) -> list[str]:
         flags.append("--d3-softfloat64-route")
     if args.require_reference_token_parity:
         flags.append("--require-reference-token-parity")
+    if warm_graph_enabled(args):
+        flags.append("--warm-graph")
     return flags
+
+
+def warm_graph_enabled(args: argparse.Namespace) -> bool:
+    """Whether the arms run the driver's unmeasured graph warm-up cell.
+
+    ``--prefill-only`` implies it.  A prefill-only arm measures ONE 16,384
+    token prefill in a fresh process, and on 2026-09-01 that first chunk was
+    bimodal -- ~1.9 s or ~4.4 s -- on control and candidate alike, in lockstep
+    with the throughput of the driver's own 29.8 GiB ``--prewarm-ngram-table``
+    read (12/12 arms in the w22 window; +2.2 s median on prompt_eval_time_s
+    across 20 window-arm groups).  That is residency state left by the
+    prewarm, not the candidate, and a +-2.4 s term on a single measured chunk
+    swamps the effects these windows look for.  The unmeasured cell pays it
+    first; the cold number survives as ``first_chunk_cold_s``.
+    ``--no-warm-graph`` opts back out.
+    """
+
+    if args.no_warm_graph:
+        return False
+    return bool(args.warm_graph or args.prefill_only)
 
 
 # Flags the window supplies itself; a user-supplied arm flag that repeats one
@@ -1021,6 +1061,10 @@ RESERVED_ARM_FLAGS = frozenset(
         # The window owns this one now (--max-tokens / --prefill-only); an arm
         # flag repeating it would put two values on the driver command line.
         "--max-tokens",
+        # Ditto: the window decides warm-up from --prefill-only / --warm-graph
+        # / --no-warm-graph, and store_true repeated is a silent no-op that
+        # would make the printed command line disagree with the receipt.
+        "--warm-graph",
     }
 )
 
