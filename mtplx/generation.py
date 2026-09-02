@@ -57,6 +57,16 @@ from .fable_block_verify import (
     is_enabled as _fable_block_verify_enabled,
 )
 from .fable_compiled_draft import maybe_build_compiled_draft_chain
+from .fable_device_draft_chain import (
+    COUNTERS as _fable_device_draft_chain_counters,
+    DeviceDraftChainIneligible,
+    claim_request_route as _fable_device_draft_chain_claim,
+    is_enabled as _fable_device_draft_chain_enabled,
+    mode as _fable_device_draft_chain_mode,
+    prewarm as _fable_device_draft_chain_prewarm,
+    release as _fable_device_draft_chain_release,
+    run_cycle as _fable_device_draft_chain_run,
+)
 from .fable_device_k20 import (
     DeviceDraftChain as _FableDeviceDraftChain,
     DeviceK20Ineligible,
@@ -398,6 +408,26 @@ _FABLE_BLOCK_VERIFY = _fable_block_verify_enabled()
 # The last merge is blocked by the fixed-M4 verify needing `host_input_ids`
 # (`generation.py` -> `graphbank.forward_fixed_m4`), which is a separate lever.
 _FABLE_DEVICE_K20 = _fable_device_k20_enabled()
+
+# MTPLX_FABLE_DEVICE_DRAFT_CHAIN -- read ONCE at import (in
+# ``mtplx.fable_device_draft_chain``), default OFF.  When off this constant is
+# False, no plan is claimed, `_device_draft_chain_plan` stays None, and every
+# site below is behind `is not None`, so the stock lane runs the code it ran
+# before this module existed.
+#
+# When on (and the request is eligible -- the claim RAISES rather than falling
+# back) the three draft depths run from ONE compiled `mx.compile` body, select
+# their K20 support on the FR-Spec head's 65,536 pre-scatter row, and -- in the
+# default `chain` mode -- sample on device from the same PCG64 doubles
+# `rng.choice` would have consumed, so the whole chain costs ONE `mx.eval`.
+# `MTPLX_FABLE_DEVICE_DRAFT_CHAIN=body` keeps the stock host sampler and its
+# per-depth readback: the attribution arm that prices the compiled body alone.
+#
+# This is the first thing that puts a compiled draft body on the SERVING lane:
+# `MTPLX_FABLE_COMPILED_DRAFT` builds one only inside
+# `_pr391_make_float32_d3_core`, and the PR391 route is installed only by
+# `scripts/pr391_metal_choice_benchmark_launcher.py`.
+_FABLE_DEVICE_DRAFT_CHAIN = _fable_device_draft_chain_enabled()
 
 # MTPLX_FABLE_DRAFT_K20_PRESCATTER -- read ONCE at import (in
 # ``mtplx.fable_draft_k20_prescatter``), default OFF.  When off this constant
@@ -2673,6 +2703,10 @@ class GenerationStats:
     draft_core: dict[str, object] = field(default_factory=dict)
     #: MTPLX_FABLE_DRAFT_K20_PRESCATTER receipt: ``{installed, rows, ...}``.
     draft_k20_prescatter: dict[str, object] = field(default_factory=dict)
+    # MTPLX_FABLE_DEVICE_DRAFT_CHAIN engagement: `{"installed": False}` on
+    # every flag-off run; on an armed run the plan's mode, depth, readbacks per
+    # cycle, compiled-body trace count and engagement counters.
+    device_draft_chain: dict[str, object] = field(default_factory=dict)
     owned_recurrent_state: dict[str, object] = field(default_factory=dict)
     owned_attn_kv: dict[str, object] = field(default_factory=dict)
     repetition_stop_triggered: bool = False
@@ -10617,6 +10651,79 @@ def generate_mtpk(
                     "owns the draft read"
                 )
             _draft_k20_prescatter_receipt = _draft_k20_prescatter_plan.to_dict()
+    # MTPLX_FABLE_DEVICE_DRAFT_CHAIN (default off).  Claimed ONCE, here, after
+    # every request-invariant term it refuses on already exists -- including
+    # the prescatter plan, which owns the same FR-Spec stash.  The compiled
+    # body is bound lazily to the MTP cache container the loop actually drafts
+    # into (see `DeviceDraftChainPlan.ensure_bound`): that container is chosen
+    # per cycle and can be replaced mid-request by the committed-history live
+    # reset or a prefix rebase.
+    _device_draft_chain_plan = None
+    _device_draft_chain_receipt: dict[str, object] = {"installed": False}
+    if _FABLE_DEVICE_DRAFT_CHAIN:
+        _device_draft_chain_plan = _fable_device_draft_chain_claim(
+            rt=rt,
+            state_tree_fn=_device_core_state_tree,
+            promote_fn=promote_kv_cache_offsets,
+            mtp_hidden_variant=mtp_hidden_variant,
+            sampler=sampler,
+            draft_sampler=draft_sampler,
+            speculative_depth=speculative_depth,
+            request_max_tokens=max_tokens,
+            rng=rng,
+            draft_core=draft_core,
+            mtp_cache_policy=mtp_cache_policy,
+            mtp_history_policy=mtp_history_policy,
+            mtp_position_mode=mtp_position_mode,
+            target_prefix_verify=target_prefix_verify,
+            lazy_target_distributions=lazy_target_distributions,
+            lazy_bonus_verify_requested=_lazy_bonus_verify_enabled(),
+            batch_target_arrays=_batch_target_arrays_enabled(),
+            steer_active=bool(loop_guard) or thinking_guard is not None,
+            penalties_active=_penalties_active,
+            relaxed_draft_ties=bool(getattr(rt, "qwen4_relaxed_draft_ties", False)),
+            qsa_mtp_precompute_active=qsa_mtp_precompute_active,
+            constraint=constraint,
+            adaptive_policy=adaptive_policy,
+            adaptive_width_policy=adaptive_width_policy,
+            mtp_corrector=mtp_corrector,
+            mtp_topk_reranker=mtp_topk_reranker,
+            draft_margin_threshold=draft_margin_threshold,
+            wants_policy_metrics=wants_policy_metrics,
+            draft_confidence_needed=_draft_conf_needed,
+            online_hidden_corrector_alpha=online_hidden_corrector_alpha,
+            online_correction_cache=online_correction_cache,
+            prompt_correction_cache=prompt_correction_cache,
+            adapter_ensemble_q=adapter_ensemble_q,
+            combine_greedy_draft_read=combine_greedy_draft_read,
+            greedy_chain_enabled=_greedy_chain_eligible,
+            adaptive_dtemp_active=_dtemp_controller is not None,
+            frspec_legacy_ids=_frspec_legacy_ids,
+            late_depth_switch_after=late_depth_switch_after,
+            a3b_target_prefix_route=a3b_target_prefix_route,
+            pr391_route=_pr391_route,
+            device_k20_route=_device_k20_plan,
+            draft_k20_prescatter_route=_draft_k20_prescatter_plan,
+            depth4_probe_active=_FABLE_DEPTH4_PROBE,
+            k20_log_active=bool(_fable_k20_log_enabled())
+            or bool(getattr(k20_log, "enabled", False)),
+            ple_candidate_submit=_ple_candidate_submit,
+        )
+        if _device_draft_chain_plan is not None:
+            # Promote the MTP cache, build the compiled body and trace it ONCE,
+            # here, outside the measured loop -- the same reason
+            # `_pr391_prewarm_float32_d3_core` exists.  `mtp_history_cache` is
+            # the container the committed-history lane drafts into; if a live
+            # reset or a prefix rebase replaces it mid-request, `run_cycle`
+            # rebinds (and says so on stderr).
+            _fable_device_draft_chain_prewarm(
+                _device_draft_chain_plan,
+                hidden,
+                mtp_cache=mtp_history_cache,
+                rollback=_rollback_mtp_cache,
+                cache_offset=_mtp_cache_offset,
+            )
+            _device_draft_chain_receipt = _device_draft_chain_plan.to_dict()
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -12154,9 +12261,118 @@ def generate_mtpk(
                     "draft_uniforms": [float(u) for u in _dk_result.uniforms],
                     "syncs": 1,
                 }
+        # MTPLX_FABLE_DEVICE_DRAFT_CHAIN: the whole draft chain from ONE
+        # compiled per-depth body.
+        #
+        # Stock runs `cycle_depth` iterations of the loop below.  Each one
+        # issues ~300 MLX ops from PYTHON (the MTP DecoderLayer forward: QSA
+        # attention + indexer, the 512-expert MoE, both gated-residual mixers,
+        # the FR-Spec head and its 248,320-lane scatter) and then ends in
+        # `_device_serial_support_arrays` -> `mx.eval` + `np.asarray` ->
+        # `rng.choice`.  The census sees the sum of the two as one gap per
+        # depth: `v_Exp -> gather_front`, 3.01 events/cycle, 2.62 ms/cycle.
+        # W24/W28b removed only the readback half and lost 1.14%; the restack's
+        # lazy-D3 moved the graph building to the front of the cycle without
+        # removing it and lost 3.9%.  Here the body is COMPILED, so the ~300
+        # host ops per depth become one replay call, and the K20 support is
+        # built on the FR-Spec head's 65,536 pre-scatter row so the scatter is
+        # never executed.
+        #
+        # Every host-side product of the loop below is reconstructed after the
+        # chain, in the same order, with the same values: `draft_tokens`,
+        # `draft_probs`, `drafted`, `drafted_by_depth`, `event["drafts"]`,
+        # `next_token`.  `draft_cache_keys` and `draft_hidden_for_update` are
+        # left empty on purpose -- their only readers are the correction cache
+        # and the online hidden corrector, both construction-time REFUSALS.
+        #
+        # `used_device_core` is the CONTEXT-COPY streak substitution: that
+        # cycle proposes the prompt's next token as a point mass and runs no
+        # MTP draft and no `rng.choice`, so skipping the chain leaves the
+        # uniform stream exactly where the stock lane leaves it.  Every OTHER
+        # way into this branch is refused at construction.
+        _device_draft_chain_used = False
+        _device_draft_chain_eligible = (
+            _device_draft_chain_plan is not None
+            and not used_device_core
+            and not _greedy_chain_used
+            and _device_k20_chain is None
+        )
+        if (
+            _device_draft_chain_eligible
+            and cycle_depth != _device_draft_chain_plan.depth
+        ):
+            # The compiled body is traced at ONE depth, so a short final cycle
+            # (`cycle_depth = min(planned_depth, max_tokens - len(tokens))`)
+            # runs the stock loop below instead.  That is a SHAPE fallback, not
+            # a correctness one: the loop below IS the reference the chain
+            # reproduces, and it draws its own uniforms in the same order, so
+            # the tape stays aligned either way.  At most the last cycle of a
+            # request takes it; `short_cycles` counts them in the receipt.
+            _fable_device_draft_chain_counters["short_cycles"] += 1
+            _device_draft_chain_eligible = False
+        if _device_draft_chain_eligible:
+            if _steer_active:
+                raise DeviceDraftChainIneligible(
+                    "MTPLX_FABLE_DEVICE_DRAFT_CHAIN met a mid-generation "
+                    "steering arm"
+                )
+            if online_hidden_enabled:
+                raise DeviceDraftChainIneligible(
+                    "MTPLX_FABLE_DEVICE_DRAFT_CHAIN leaves "
+                    "draft_hidden_for_update empty; the online hidden "
+                    "corrector reads it"
+                )
+            _ddc_started = time.perf_counter()
+            _ddc_result = _fable_device_draft_chain_run(
+                _device_draft_chain_plan,
+                hidden=draft_hidden,
+                primary=int(next_token),
+                rng=rng,
+                cycle_depth=cycle_depth,
+                live_mtp_cache=mtp_cache,
+            )
+            _ddc_elapsed = time.perf_counter() - _ddc_started
+            draft_time += _ddc_elapsed
+            _device_draft_chain_used = True
+            for _ddc_index, _ddc_token in enumerate(_ddc_result.tokens):
+                draft_tokens.append(int(_ddc_token))
+                draft_probs.append(_ddc_result.distributions[_ddc_index])
+                drafted += 1
+                drafted_by_depth[_ddc_index] += 1
+                event["drafts"].append(
+                    {
+                        "depth": _ddc_index + 1,
+                        "token": int(_ddc_token),
+                        "timing_s": {
+                            "draft": _ddc_elapsed
+                            if _ddc_index == cycle_depth - 1
+                            else 0.0
+                        },
+                        "mtp_corrector": None,
+                        "draft_core": "device-draft-chain",
+                    }
+                )
+            next_token = int(_ddc_result.tokens[-1])
+            # `draft_hidden` is deliberately NOT advanced: the chain keeps every
+            # depth's hidden on device and its only reader past this loop is the
+            # depth-4 probe's capture hook, which `claim_request_route` refuses.
+            if not _FABLE_HOST_TRIMS:
+                event["device_draft_chain"] = {
+                    "mode": _fable_device_draft_chain_mode(),
+                    "depth": int(cycle_depth),
+                    "readbacks": int(_ddc_result.readbacks),
+                    "draft_uniforms": [
+                        float(value) for value in _ddc_result.uniforms
+                    ],
+                }
         for depth_index in range(
             0
-            if (used_device_core or _greedy_chain_used or _device_k20_chain is not None)
+            if (
+                used_device_core
+                or _greedy_chain_used
+                or _device_k20_chain is not None
+                or _device_draft_chain_used
+            )
             else cycle_depth
         ):
             source_token = int(next_token)
@@ -14659,6 +14875,15 @@ def generate_mtpk(
     # it armed with at most one stale entry, which the next claim clears and
     # which `take_prescatter_row`'s identity check can never mis-consume.
     _fable_draft_k20_prescatter_release(_draft_k20_prescatter_plan)
+    # Same contract for the compiled draft chain: disarm the head stash and
+    # demote the MTP cache it promoted, so postcommit / session-bank capture
+    # never sees a tensor-offset adapter.
+    if _device_draft_chain_plan is not None:
+        _device_draft_chain_receipt = _device_draft_chain_plan.to_dict()
+        _fable_device_draft_chain_release(
+            _device_draft_chain_plan,
+            compiled_verify_bank=compiled_verify_bank,
+        )
     if constraint is not None:
         # Final sync so `completed` reflects every committed token (the loop
         # may exit between the per-cycle sync and the last commit).
@@ -14950,6 +15175,7 @@ def generate_mtpk(
             "greedy_confidence_token_reuses": greedy_confidence_token_reuses,
         },
         draft_k20_prescatter=_draft_k20_prescatter_receipt,
+        device_draft_chain=_device_draft_chain_receipt,
         owned_recurrent_state=owned_recurrent_state_stats(cache),
         owned_attn_kv=tail_owned_attention_kv_stats(cache),
         repetition_stop_triggered=repetition_result is not None,

@@ -11,8 +11,12 @@ With ``MTPLX_FRSPEC_DRAFT=1`` the draft head is
 ``frspec_draft._FullVocabDraftHead``: it runs the pruned q8 head over the
 65,536 frequency-ranked rows and then *scatters* those logits into a
 248,320-wide row padded with ``-1e30``
-(``mtplx/frspec_draft.py`` ``_FullVocabDraftHead.__call__``).  The stock draft
-reader then builds its K20 support over that padded row
+(``mtplx/frspec_draft.py`` ``_FullVocabDraftHead.__call__``).  Which binding
+makes that wrapper the LIVE draft head differs by lane -- see
+:func:`_live_draft_route`; on the shipped Qwen4 native-MTP lane
+``_mtplx_draft_lm_head`` keeps the unpruned head and says nothing about it.
+
+The stock draft reader then builds its K20 support over that padded row
 (``generation._fixed_width_draft_reader`` -> ``_sample_draft_from_logits`` ->
 ``_sample_from_logits`` -> ``_distribution_from_mlx_logits`` ->
 ``fast_sampling.sparse_distribution_from_mlx_logits`` ->
@@ -189,6 +193,9 @@ class DraftK20PrescatterPlan:
     temperature: float
     top_p: float
 
+    route: str
+    """Which binding makes ``head`` live -- see :func:`_live_draft_route`."""
+
     def to_dict(self) -> dict[str, object]:
         """The receipt this route writes."""
 
@@ -199,6 +206,7 @@ class DraftK20PrescatterPlan:
             "top_k": int(self.top_k),
             "temperature": float(self.temperature),
             "top_p": float(self.top_p),
+            "route": str(self.route),
         }
 
 
@@ -206,6 +214,69 @@ def _refuse(reason: str) -> None:
     raise DraftK20PrescatterIneligible(
         f"MTPLX_FABLE_DRAFT_K20_PRESCATTER: {reason}"
     )
+
+
+#: The draft-head hook the Qwen4 native MTP forward projects through.
+#: ``models/qwen4_exp.TextModel.mtp_forward`` calls
+#: ``self._mtp_draft_head_logits(...)``, and
+#: ``TextModel._mtplx_bind_draft_lm_head`` rebinds that attribute to
+#: ``head.__call__`` -- so on this route the live head is the ``__self__`` of a
+#: bound method, not the value of an attribute.
+_NATIVE_MTP_HOOK = "_mtp_draft_head_logits"
+
+#: The draft head the generic ``mtp_patch`` forward projects through.
+_CONFIGURED_HEAD = "_mtplx_draft_lm_head"
+
+
+def _describe(obj: Any) -> str:
+    """A short, honest name for whatever a liveness probe actually found."""
+
+    if obj is None:
+        return "absent"
+    owner = getattr(obj, "__self__", None)
+    if owner is not None:
+        name = getattr(obj, "__name__", None) or "callable"
+        return f"{type(owner).__name__}.{name}"
+    name = getattr(obj, "__qualname__", None) or getattr(obj, "__name__", None)
+    if name is not None and not isinstance(obj, type):
+        return str(name)
+    return type(obj).__name__
+
+
+def _live_draft_route(text: Any, head: Any) -> str | None:
+    """Name the binding that makes ``head`` the live draft head, else ``None``.
+
+    ``frspec_draft.install_frspec_draft_head`` publishes the full-vocabulary
+    wrapper at ``text._mtplx_frspec_draft_head`` and then makes it live in
+    exactly one of two ways:
+
+    * ``"native_mtp_head"`` -- the Qwen4 native MTP route (the shipped
+      ``--full-frspec`` lane, install report ``source: native_mtp_head``,
+      ``legacy_swap: False``).  The install calls
+      ``text._mtplx_bind_draft_lm_head(full_head)``, which rebinds
+      ``text._mtp_draft_head_logits`` to ``full_head.__call__``; that hook is
+      what ``TextModel.mtp_forward`` projects through, so the array this
+      module reads (``draft_logits``) is exactly the wrapper's own return
+      value.  ``text._mtplx_draft_lm_head`` is deliberately LEFT holding the
+      unpruned configured head "for legacy consumers" -- it is a
+      ``QuantizedLinear`` on this route and says nothing about liveness.
+    * ``"legacy_swap"`` -- ``MTPLX_FRSPEC_LEGACY=1``.  The generic
+      ``mtp_patch`` draft forward reads ``self._mtplx_draft_lm_head``
+      directly, so the install swaps the wrapper in there globally.
+
+    Both bindings hand the wrapper the same argument and return its output
+    unchanged, so ``head.take_prescatter_row(draft_logits)`` identity-matches
+    on either.  Anything else -- no FR-Spec install, an install whose bind
+    hook never fired, or a third party that has since taken the hook over --
+    is not a route this module has proven and returns ``None``.
+    """
+
+    native = getattr(text, _NATIVE_MTP_HOOK, None)
+    if native is not None and getattr(native, "__self__", None) is head:
+        return "native_mtp_head"
+    if getattr(text, _CONFIGURED_HEAD, None) is head:
+        return "legacy_swap"
+    return None
 
 
 def claim_draft_route(
@@ -246,11 +317,14 @@ def claim_draft_route(
     head = getattr(text, "_mtplx_frspec_draft_head", None)
     if head is None:
         _refuse("no FR-Spec draft head is installed (need MTPLX_FRSPEC_DRAFT=1)")
-    live = getattr(text, "_mtplx_draft_lm_head", None)
-    if live is not head:
+    route = _live_draft_route(text, head)
+    if route is None:
         _refuse(
-            "the FR-Spec full-vocabulary head is not the live draft head "
-            f"(live={type(live).__name__})"
+            "the FR-Spec full-vocabulary head is installed but is not on the "
+            "live draft route "
+            f"({_NATIVE_MTP_HOOK}={_describe(getattr(text, _NATIVE_MTP_HOOK, None))}, "
+            f"{_CONFIGURED_HEAD}={_describe(getattr(text, _CONFIGURED_HEAD, None))}, "
+            f"head={type(head).__name__})"
         )
     ids = getattr(head, "_ids", None)
     if ids is None:
@@ -325,6 +399,7 @@ def claim_draft_route(
         top_k=top_k,
         temperature=float(draft_sampler.temperature),
         top_p=float(draft_sampler.top_p),
+        route=route,
     )
 
 

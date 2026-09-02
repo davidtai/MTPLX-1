@@ -69,6 +69,7 @@ def _plan(rows: int, vocab_rows: int, seed: int, head=None) -> DraftK20Prescatte
         top_k=TOP_K,
         temperature=TEMPERATURE,
         top_p=TOP_P,
+        route="native_mtp_head",
     )
 
 
@@ -421,15 +422,75 @@ _ELIGIBLE = dict(
 )
 
 
-def _runtime(rows=prescatter.FRSPEC_ROWS, vocab_rows=248_320, *, ascending=True):
+class _TextModelStandIn:
+    """``models/qwen4_exp.TextModel``'s draft surface, on a plain object.
+
+    Only the three members the FR-Spec install and this module's liveness
+    probe touch: the draft-head hook ``mtp_forward`` projects through, the
+    default binding ``TextModel.__init__`` puts there, and the bind hook the
+    install calls.  Nothing here evaluates.
+    """
+
+    def __init__(self) -> None:
+        # qwen4_exp.TextModel.__init__
+        self._mtp_draft_head_logits = self._head_logits
+
+    def _head_logits(self, h):  # pragma: no cover - never called in these tests
+        raise AssertionError("the unpruned full-vocab projection was called")
+
+    def _mtplx_bind_draft_lm_head(self, head) -> None:
+        # qwen4_exp.TextModel._mtplx_bind_draft_lm_head
+        self._mtp_draft_head_logits = head.__call__
+
+
+def _configured_head():
+    """The unpruned quantized head the install leaves at the legacy stamp."""
+
+    import mlx.nn as nn
+
+    return nn.QuantizedLinear(64, 32, bias=False, group_size=64, bits=8)
+
+
+def _installed_text_model(head, *, route="native_mtp_head"):
+    """A text model shaped exactly as ``install_frspec_draft_head`` leaves it.
+
+    ``native_mtp_head`` is the shipped ``--full-frspec`` lane (install report
+    ``source: native_mtp_head``, ``legacy_swap: False``): the wrapper is
+    published at ``_mtplx_frspec_draft_head`` and bound onto the native MTP
+    draft-head hook, while ``_mtplx_draft_lm_head`` KEEPS the unpruned
+    ``QuantizedLinear`` for legacy consumers.  ``legacy_swap`` is
+    ``MTPLX_FRSPEC_LEGACY=1`` on a generic ``mtp_patch`` model: no bind hook,
+    the wrapper swapped in globally.  ``none`` is an install whose wrapper
+    never reached either route.
+    """
+
+    text = _TextModelStandIn()
+    text._mtplx_frspec_draft_head = head
+    text._mtplx_frspec_full_vocab = int(head._vocab_rows)
+    text._mtplx_frspec_ids = head._ids
+    text._mtplx_draft_lm_head = _configured_head()
+    if route == "native_mtp_head":
+        text._mtplx_bind_draft_lm_head(head)
+    elif route == "legacy_swap":
+        text._mtplx_frspec_saved_head = text._mtplx_draft_lm_head
+        text._mtplx_draft_lm_head = head
+    elif route != "none":  # pragma: no cover - test typo guard
+        raise AssertionError(f"unknown route {route!r}")
+    return text
+
+
+def _runtime(
+    rows=prescatter.FRSPEC_ROWS,
+    vocab_rows=248_320,
+    *,
+    ascending=True,
+    route="native_mtp_head",
+):
     head, ids = _full_vocab_head(rows, vocab_rows, 4242)
     if not ascending:
         shuffled = np.asarray(ids, dtype=np.int64)[::-1].copy()
         object.__setattr__(head, "_ids", mx.array(shuffled, dtype=mx.int32))
-    text = SimpleNamespace(
-        _mtplx_frspec_draft_head=head,
-        _mtplx_draft_lm_head=head,
-    )
+    text = _installed_text_model(head, route=route)
     return SimpleNamespace(model=SimpleNamespace(language_model=text)), head, text
 
 
@@ -445,18 +506,39 @@ def test_claim_returns_none_when_the_flag_is_off():
     assert head._prescatter_capture is False
 
 
-def test_claim_installs_and_arms_at_the_production_width(armed):
-    rt, head, _ = _runtime()
+@pytest.mark.parametrize("route", ["native_mtp_head", "legacy_swap"])
+def test_claim_installs_and_arms_at_the_production_width(armed, route):
+    rt, head, text = _runtime(route=route)
     plan = prescatter.claim_draft_route(rt, draft_sampler=_config(), **_ELIGIBLE)
     assert plan is not None
     assert plan.rows == prescatter.FRSPEC_ROWS
     assert plan.vocab_rows == 248_320
+    assert plan.head is head
+    assert plan.route == route
     assert head._prescatter_capture is True
     receipt = plan.to_dict()
     assert receipt["installed"] is True
     assert receipt["rows"] == prescatter.FRSPEC_ROWS
+    assert receipt["route"] == route
     prescatter.release_draft_route(plan)
     assert head._prescatter_capture is False
+
+
+def test_claim_succeeds_while_the_legacy_stamp_holds_a_quantized_head(armed):
+    """The shipped lane's shape: live via the bind hook, legacy stamp unpruned.
+
+    This is the exact structure the 2026-09-02 ABBA candidate arm refused on
+    (``live=QuantizedLinear``) while its own load log said the FR-Spec head was
+    installed in full-vocabulary output mode.
+    """
+
+    rt, head, text = _runtime(route="native_mtp_head")
+    assert type(text._mtplx_draft_lm_head).__name__ == "QuantizedLinear"
+    assert text._mtplx_draft_lm_head is not head
+    assert text._mtp_draft_head_logits.__self__ is head
+    plan = prescatter.claim_draft_route(rt, draft_sampler=_config(), **_ELIGIBLE)
+    assert plan is not None and plan.route == "native_mtp_head"
+    prescatter.release_draft_route(plan)
 
 
 def test_claim_refuses_a_non_frspec_width(armed):
@@ -478,11 +560,101 @@ def test_claim_refuses_without_an_frspec_head(armed):
 
 
 def test_claim_refuses_when_the_frspec_head_is_not_live(armed):
-    rt, head, text = _runtime()
-    text._mtplx_draft_lm_head = object()
-    with pytest.raises(DraftK20PrescatterIneligible, match="not the live draft head"):
+    """Published but on neither route: no bind hook fired, no legacy swap."""
+
+    rt, head, text = _runtime(route="none")
+    with pytest.raises(
+        DraftK20PrescatterIneligible, match="not on the live draft route"
+    ) as excinfo:
         prescatter.claim_draft_route(rt, draft_sampler=_config(), **_ELIGIBLE)
+    message = str(excinfo.value)
+    # The refusal names what each probe actually saw.
+    assert "_mtp_draft_head_logits=_TextModelStandIn._head_logits" in message
+    assert "_mtplx_draft_lm_head=QuantizedLinear" in message
     assert head._prescatter_capture is False
+
+
+def test_claim_refuses_when_another_head_owns_the_native_hook(armed):
+    """The hook is live, but bound to somebody else's head."""
+
+    rt, head, text = _runtime(route="none")
+    other, _ = _full_vocab_head(256, 1_024, 99)
+    text._mtplx_bind_draft_lm_head(other)
+    with pytest.raises(
+        DraftK20PrescatterIneligible, match="not on the live draft route"
+    ) as excinfo:
+        prescatter.claim_draft_route(rt, draft_sampler=_config(), **_ELIGIBLE)
+    assert "_FullVocabDraftHead.__call__" in str(excinfo.value)
+    assert head._prescatter_capture is False
+    assert other._prescatter_capture is False
+
+
+def test_the_real_install_produces_the_route_the_claim_probes():
+    """Pin the probe to ``install_frspec_draft_head``'s ACTUAL output.
+
+    Runs the shipped install at a toy width against the qwen4 draft surface,
+    so a future change to how the wrapper is made live fails here rather than
+    at the next benchmark.  No model, no Metal: a 1,024-row toy head on the
+    CPU stream.
+    """
+
+    import mlx.nn as nn
+
+    ids = sorted(int(i) for i in _ranked_ids(256, 1_024, 77))
+    text = _TextModelStandIn()
+    native = nn.QuantizedLinear(
+        64, 1_024, bias=False, group_size=64, bits=8, mode="affine"
+    )
+    text._mtplx_native_mtp_draft_head = lambda: native
+    # draft_lm_head._install_draft_lm_head stamps the configured draft head
+    # here before it calls the FR-Spec install.
+    text._mtplx_draft_lm_head = _configured_head()
+
+    saved = frspec_draft.load_frspec_ids
+    frspec_draft.load_frspec_ids = lambda: list(ids)
+    try:
+        report = frspec_draft.install_frspec_draft_head(text)
+    finally:
+        frspec_draft.load_frspec_ids = saved
+
+    assert report["installed"] is True
+    assert report["source"] == "native_mtp_head"
+    assert report["output_mode"] == "full"
+    assert report["legacy_swap"] is False
+
+    head = text._mtplx_frspec_draft_head
+    # The install leaves the unpruned head at the legacy stamp -- probing THAT
+    # for liveness is the bug this test guards against.
+    assert text._mtplx_draft_lm_head is not head
+    assert isinstance(text._mtplx_draft_lm_head, nn.QuantizedLinear)
+    assert prescatter._live_draft_route(text, head) == "native_mtp_head"
+    # And the array the wrapper returns is the one the forward hands the
+    # reader, so the stash identity check holds on this route.
+    head.arm_prescatter_capture(True)
+    dense = text._mtp_draft_head_logits(mx.zeros((1, 1, 64)))
+    row = head.take_prescatter_row(dense)
+    assert row is not None and int(row.reshape(-1).shape[0]) == 256
+    head.arm_prescatter_capture(False)
+
+
+def test_the_real_install_legacy_swap_is_also_recognised(monkeypatch):
+    """``MTPLX_FRSPEC_LEGACY=1`` swaps the wrapper in globally instead."""
+
+    import mlx.nn as nn
+
+    ids = sorted(int(i) for i in _ranked_ids(256, 1_024, 78))
+    text = SimpleNamespace()  # no bind hook: the generic mtp_patch surface
+    text._mtplx_draft_lm_head = nn.QuantizedLinear(
+        64, 1_024, bias=False, group_size=64, bits=8, mode="affine"
+    )
+    monkeypatch.setattr(frspec_draft, "load_frspec_ids", lambda: list(ids))
+    monkeypatch.setattr(frspec_draft, "frspec_legacy_enabled", lambda: True)
+
+    report = frspec_draft.install_frspec_draft_head(text)
+    assert report["installed"] is True
+    assert report["legacy_swap"] is True
+    head = text._mtplx_frspec_draft_head
+    assert prescatter._live_draft_route(text, head) == "legacy_swap"
 
 
 @pytest.mark.parametrize(
