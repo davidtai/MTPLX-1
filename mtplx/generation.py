@@ -332,6 +332,17 @@ _FABLE_HOST_TRIMS = _env_truthy("MTPLX_FABLE_HOST_TRIMS")
 # armed run records and what it costs.
 _FABLE_K20_LOG = _fable_k20_log_enabled()
 
+# MTPLX_FABLE_QSA_RESTORE_STAGING -- read once (lazily, then memoized), default
+# OFF. See ``mtplx/fable_qsa_restore_stage.py``: it promotes the three restored
+# QSA backings to their end-of-suffix capacity before the first suffix chunk,
+# instead of paying the lazy reallocate-and-copy inside it. Imported here (not
+# at the call site) so the wiring is one name, and re-exported under private
+# aliases so the gate + stager can be monkeypatched as a pair in tests.
+from .fable_qsa_restore_stage import (  # noqa: E402
+    qsa_restore_staging_enabled as _fable_qsa_restore_staging_enabled,
+    stage_restored_suffix as _fable_stage_restored_suffix,
+)
+
 
 def _family_capture_commit_enabled() -> bool:
     """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
@@ -2633,6 +2644,16 @@ def _prefill_restored_prompt_suffix(
     if not suffix:
         raise ValueError("suffix must not be empty")
     _check_postcommit_abort(abort_check)
+    # MTPLX_FABLE_QSA_RESTORE_STAGING (default off): promote the restored QSA
+    # backings to their end-of-suffix capacity ONCE, here, instead of letting
+    # raw_keys / pooled / KV each reallocate-and-copy lazily inside the first
+    # suffix chunks — the cost a warm agent turn otherwise pays straight on the
+    # TTFT path. Construction-time eligibility, and no silent fallback: an
+    # armed flag that cannot stage raises. Both restored-suffix callers
+    # (_restore_near_prefix_prompt_state and restore_or_prefill_prompt_state)
+    # funnel through here, so this is the single wiring point.
+    if _fable_qsa_restore_staging_enabled():
+        _fable_stage_restored_suffix(restored.cache, suffix_tokens=len(suffix))
     target_forward_time = 0.0
     mtp_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
