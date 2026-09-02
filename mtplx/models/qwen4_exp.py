@@ -84,6 +84,24 @@ from mtplx.runtime_options import (
 #: per GDN forward and nothing else.
 _GDN_KEEPMASK_FOLD_ARMED = _gdn_fold.fable_gdn_keepmask_fold_enabled()
 
+_GDN_FOLD_KERNELS: Any = None
+
+
+def _gdn_fold_kernels():
+    """The fold's MLX entry points, imported once.
+
+    Kept out of the module header so an unarmed process never imports the
+    kernel module at all, and out of the per-layer loops so an armed one does
+    not pay 35 `sys.modules` lookups per commit.
+    """
+
+    global _GDN_FOLD_KERNELS
+    if _GDN_FOLD_KERNELS is None:
+        from mtplx.kernels import gdn_keepmask_fold
+
+        _GDN_FOLD_KERNELS = gdn_keepmask_fold
+    return _GDN_FOLD_KERNELS
+
 
 @dataclass
 class TextArgs(BaseModelArgs):
@@ -748,11 +766,7 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
                 use_kernel=not self.training,
             )
         else:
-            from mtplx.kernels.gdn_keepmask_fold import (
-                prefix_gated_delta_update,
-            )
-
-            out, state = prefix_gated_delta_update(
+            out, state = _gdn_fold_kernels().prefix_gated_delta_update(
                 *prefix[:6],
                 q,
                 k,
@@ -6073,6 +6087,9 @@ class Qwen4ExpTextModel(nn.Module):
             cache, plan, keep_tokens=keep_tokens, verified_tokens=verified_tokens
         )
         fold_flushed = False
+        masked_replay_state = (
+            _gdn_fold_kernels().masked_replay_state if fold_actives else None
+        )
 
         for kind, i, payload in plan:
             entry = cache[i]
@@ -6106,10 +6123,6 @@ class Qwen4ExpTextModel(nn.Module):
                         use_kernel=not gdn.training,
                     )
                 else:
-                    from mtplx.kernels.gdn_keepmask_fold import (
-                        masked_replay_state,
-                    )
-
                     base, ring_rows, ring_keeps, fold_flushed = (
                         _gdn_fold.advance_ring(
                             active,

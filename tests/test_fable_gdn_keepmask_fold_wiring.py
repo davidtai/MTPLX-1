@@ -712,8 +712,8 @@ def _stub_prefix_kernels(monkeypatch):
     monkeypatch.setattr(
         kernels,
         "empty_prefix_leaves",
-        lambda *, max_windows, dtype: tuple(
-            ("pad", name, max_windows) for name in "qkvab"
+        lambda *, max_windows, dtype, slot=0: tuple(
+            ("pad", name, max_windows, slot) for name in "qkvab"
         ),
     )
     monkeypatch.setattr(
@@ -771,8 +771,17 @@ def test_window_prefix_is_one_fixed_arity_at_every_ring_depth(monkeypatch):
         assert leaves[-1] == ("mask", keeps, 2)
         assert fold.active_for(entries[0], seq) is not None
     assert arities == {fold.prefix_leaf_count(fold.FOLDABLE_LAYERS)}
-    assert fold.STATS["windows"] == 3
-    assert fold.STATS["ring_depth_hist"] == {"0": 1, "1": 1, "2": 1}
+    # A depth-0 window's 175 row leaves must be 175 DISTINCT objects: one
+    # array in 35 input positions would make the traced graph's input
+    # identity depend on the ring depth of whichever window traced it.
+    for entry in entries:
+        fold.clear_pending(entry)
+    empty_leaves, _depth, _seq = module.CompiledVerifyBank._fold_window_prefix(
+        bank, dispatch
+    )
+    assert len({id(leaf) for leaf in empty_leaves}) == len(empty_leaves)
+    assert fold.STATS["windows"] == 4
+    assert fold.STATS["ring_depth_hist"] == {"0": 2, "1": 1, "2": 1}
     assert fold.STATS["folded_windows"] == 2
     assert fold.STATS["declines"] == 0
 

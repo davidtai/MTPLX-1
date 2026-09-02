@@ -2401,10 +2401,12 @@ class CompiledVerifyBank:
             keeps = rings.pop()
 
         leaves: list[Any] = []
-        for entry, pending in zip(entries, pendings):
+        for slot, (entry, pending) in enumerate(zip(entries, pendings)):
             if pending is None or not pending.keeps:
                 base = entry.cache[1]
-                rows = empty_prefix_leaves(max_windows=windows, dtype=dtype)
+                rows = empty_prefix_leaves(
+                    max_windows=windows, dtype=dtype, slot=slot
+                )
                 pending = _gdn_fold.FoldPending(
                     base=base, rows=[], keeps=(), state=base
                 )
@@ -2426,7 +2428,6 @@ class CompiledVerifyBank:
             )
         _gdn_fold.note_window(len(keeps), folded=bool(keeps))
         return leaves, len(keeps), seq
-
 
     def _make_fixed_m4_prefix_step(self):
         bank = self

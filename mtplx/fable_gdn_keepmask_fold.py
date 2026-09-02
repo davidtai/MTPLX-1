@@ -173,25 +173,47 @@ WHAT THE FOLD COSTS THAT TODAY DOES NOT
   of ~163 kB a layer, riding the next window's pre-boundary ``async_eval``).
   At W = 1 there is none: ``padded_prefix_leaves`` returns the captured rows
   themselves.
+* 35 cached all-zero pad tuples, one per foldable layer (~5.7 MB total,
+  allocated once).  They are per layer rather than shared so a depth-0
+  window hands the graph 175 DISTINCT arrays -- one array in 35 input
+  positions would make the traced graph's input identity depend on the ring
+  depth of whichever window happened to trace it.
 * Every window runs its 36 step kernels at ``T = 4*W + 4`` rather than 4,
   including the ~29.5% that enter with an empty ring.  That is the +0.083
   ms/cycle arm A priced, and it buys the removal of 0.499 state passes/cycle.
 
 THE ABBA WINDOW AND ITS RECEIPT GATE
 ------------------------------------
-Run the 16K decode bracket from the merged main worktree::
+Run the 16K decode bracket from the merged main worktree
+(``$ROOT`` = /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps).
+``abba_window.py`` must be the guard's direct child, so it goes through
+``bench/laguna/run_guarded.py``; running it bare prints the exact outer line
+and refuses::
 
-    /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
-      /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py -- \
-      /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
-      scripts/fable/abba_window.py \
-        --sequence <N> \
-        --label-prefix w66b-gdn-keepmask-fold \
-        --prompt-tokens 16384 \
-        --order ABBA \
-        --python /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
-        --control-flag=--prewarm-ngram-table \
-        --candidate-extra-env MTPLX_FABLE_GDN_KEEPMASK_FOLD=1
+    cd $ROOT && PYTHONPATH=$ROOT $ROOT/.venv/bin/python \
+      /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+        --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+        --lock-timeout-seconds 1800 --child-timeout-seconds 36000 \
+        -- $ROOT/.venv/bin/python $ROOT/scripts/fable/abba_window.py \
+             --sequence <N> \
+             --label-prefix w66b-gdn-keepmask-fold \
+             --prompt-tokens 16384 \
+             --order ABBA \
+             --python $ROOT/.venv/bin/python \
+             --control-flag=--prewarm-ngram-table \
+             --candidate-extra-env MTPLX_FABLE_GDN_KEEPMASK_FOLD=1
+
+Verified with ``--dry-run``: 12 arms (3 seeds x ABBA), every arm carrying the
+retained stack (``--target-mode batched --require-compiled-verify --m4-stage3
+--qsa-fused-kv-gather --full-frspec --compiled-mtp-prepare --max-tokens 1024``
+plus ``MTPLX_QWEN4_M4_ROUTED_{DOWN_REDUCE,DOWN_RESIDUAL_TAIL,GLU}=1``) and
+``--prewarm-ngram-table``, and only the six B arms carrying
+``--env MTPLX_FABLE_GDN_KEEPMASK_FOLD=1``.
+
+A ring sweep is ``--candidate-extra-env
+MTPLX_FABLE_GDN_KEEPMASK_FOLD_WINDOWS=1|3``; W=1 is the concatenate-free arm
+(0.497 flushes/cycle but no padded prefix to build at all), W=3 trades a
+deeper ring and ``T = 16`` for 0.112.
 
 ``--control-flag=--prewarm-ngram-table`` moves the SHARED baseline (both arms);
 the current stack flags are the queue's, added from its own file, and

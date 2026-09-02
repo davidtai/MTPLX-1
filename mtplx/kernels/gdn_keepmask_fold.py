@@ -445,7 +445,11 @@ def _pad_leaves(pad_rows: int, dtype) -> tuple[Any, ...]:
             mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
             mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
         )
-        mx.eval(*cached)
+        # Deliberately NOT evaluated here: the first window's pre-boundary
+        # `mx.async_eval(*state_in)` materialises them with everything else,
+        # and the cached array objects hold the buffers afterwards.  An
+        # `mx.eval` here would put a host sync inside a decode cycle to build
+        # a constant.
         _PAD_CACHE[key] = cached
     return cached
 
@@ -464,15 +468,38 @@ def prefix_mask_array(keeps: Sequence[int], *, max_windows: int):
         cached = mx.array(
             [prefix_mask_rows(key[0], max_windows=key[1])], dtype=mx.bool_
         )
-        mx.eval(cached)
         _MASK_CACHE[key] = cached
     return cached
 
 
-def empty_prefix_leaves(*, max_windows: int, dtype):
-    """The depth-0 prefix: all pad, all masked, all cached."""
+_EMPTY_CACHE: dict[tuple[int, Any, int], tuple[Any, ...]] = {}
 
-    return _pad_leaves(VERIFY_WIDTH * int(max_windows), dtype)
+
+def empty_prefix_leaves(*, max_windows: int, dtype, slot: int = 0):
+    """The depth-0 prefix for ONE layer: all pad, all masked, all cached.
+
+    ``slot`` is the layer's position in the fold plan, and the leaves are
+    cached per slot rather than shared, so the 175 row inputs a depth-0 window
+    hands the compiled graph are 175 DISTINCT arrays.  Handing one array to 35
+    input positions would make the traced graph's input identity depend on the
+    ring depth of the window that happened to trace it, which is exactly the
+    kind of thing that works until the first depth-1 window.  The cost is 35
+    copies of a ~163 kB constant, allocated once.
+    """
+
+    key = (VERIFY_WIDTH * int(max_windows), dtype, int(slot))
+    cached = _EMPTY_CACHE.get(key)
+    if cached is None:
+        pad_rows = key[0]
+        cached = (
+            mx.zeros((1, pad_rows, NUM_K_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_K_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS, HEAD_DIM), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
+            mx.zeros((1, pad_rows, NUM_V_HEADS), dtype=dtype),
+        )
+        _EMPTY_CACHE[key] = cached
+    return cached
 
 
 def padded_prefix_leaves(
@@ -502,7 +529,7 @@ def padded_prefix_leaves(
             f"ring of {len(keeps)} windows exceeds max_windows={max_windows}"
         )
     if not ring_rows:
-        return empty_prefix_leaves(max_windows=max_windows, dtype=dtype)
+        raise ValueError("an empty ring uses empty_prefix_leaves")
     if pad_rows == 0 and len(ring_rows) == 1:
         return tuple(ring_rows[0])
     pieces: list[list[Any]] = [[] for _ in range(5)]
@@ -521,6 +548,7 @@ def reset_prefix_caches() -> None:
 
     _PAD_CACHE.clear()
     _MASK_CACHE.clear()
+    _EMPTY_CACHE.clear()
 
 
 # --------------------------------------------------------------------------
@@ -614,6 +642,7 @@ def _run_exactness_probe(*, max_windows: int, seed: int):
     prefix = padded_prefix_leaves(
         [ring], keeps, max_windows=max_windows, dtype=mx.bfloat16
     )
+
     mask = prefix_mask_array(keeps, max_windows=max_windows)
     folded_y, folded_state = prefix_gated_delta_update(
         *prefix, mask, *window, A_log, dt_bias, state
