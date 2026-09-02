@@ -513,6 +513,15 @@ def stats_receipt(
         ).hexdigest(),
         "compiled_verify": dict((stats.graphbank or {}).get("compiled_verify") or {}),
         "draft_core": dict(stats.draft_core or {}),
+        # MTPLX_FABLE_DEVICE_DRAFT_CHAIN engagement.  `{"installed": False}` on
+        # a control arm; on an armed arm it carries `mode`, `readbacks_per_cycle`,
+        # `body_traces` (must be 1 -- a climbing count means the mx.compile
+        # trace signature moves and the flag is paying for a retrace every
+        # cycle), `chain_builds`/`cache_rebinds`, `short_cycles` and the
+        # construction `prewarm_s` that `pre_first_token_setup_s` now carries.
+        "device_draft_chain": dict(
+            getattr(stats, "device_draft_chain", None) or {}
+        ),
         "online_correction_cache": dict(stats.online_correction_cache or {}),
         "context_copy": {
             "active": bool(stats.context_copy_active),
@@ -650,6 +659,113 @@ def _ple_candidate_prefetch_armed() -> bool:
         return False
 
 
+def _ple_boundary_armed() -> bool:
+    """Whether MTPLX_FABLE_PLE_BOUNDARY was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign that the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.ple_boundary import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _graph_build_overlap_armed() -> bool:
+    """Whether MTPLX_FABLE_GRAPH_BUILD_OVERLAP was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign that the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _graph_build_overlap_layers() -> int | None:
+    """The prefix depth this process was ASKED for, straight from the env.
+
+    Paired with the receipt's ``prefix_layers`` (the depth the bank actually
+    installed): a row where they disagree measured a partition its label does
+    not name.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import LAYERS_ENV
+
+        raw = (os.environ.get(LAYERS_ENV) or "").strip()
+        return int(raw, 10) if raw else None
+    except Exception:
+        return None
+
+
+def _graph_build_overlap_receipt() -> dict[str, float]:
+    """W63/W67 engagement: how many windows actually ran the split submission.
+
+    ``prefix_enqueued`` counts windows whose ``0..N-1`` graph was queued ahead
+    of the D3 host sync and ``suffix_joined`` those that then ran the
+    ``N..47`` graph on it.  The verdict gate is ``monolithic_windows``: an arm
+    that claims the lever and shows windows on the shipped monolithic route
+    took the control's code for them, so its delta is diluted by exactly that
+    fraction.  ``prefix_discarded`` should stay at or near zero -- every one is
+    a prefix forward computed and thrown away.
+
+    ``prefix_layers`` is the depth the bank INSTALLED, and it is the first
+    thing to read on a W67 arm: if it is not the N the arm's
+    ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS`` asked for, the row belongs to a
+    different partition.  ``aux_hoisted`` counts windows whose PLE auxiliary
+    was built at the enqueue rather than in the join; it is 0 at depth 1 and
+    should equal ``prefix_enqueued`` at any depth past the PLE layer.  The
+    ``*_ms`` fields are populated only when ``timing`` is in
+    ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_ITEMS``.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import last_receipt
+
+        return last_receipt()
+    except Exception:
+        return {}
+
+
+def _ple_boundary_receipt() -> dict[str, float]:
+    """W62 engagement: what each armed boundary item actually did.
+
+    ``warm_skipped`` / ``warm_taken`` is the ``warm_skip`` verdict -- an arm
+    that claims the lever and shows ``warm_taken`` on every cycle probed a
+    cold table and took the shipped pread pass, so its delta is not the
+    lever.  ``primary_inline`` counts cycles whose 16 primary rows were read
+    without the pool at all.  The ``*_ms`` fields are populated only when the
+    ``timing`` item is in ``MTPLX_FABLE_PLE_BOUNDARY_ITEMS``.
+    """
+
+    try:
+        from mtplx.ple_boundary import last_receipt
+
+        return last_receipt()
+    except Exception:
+        return {}
+
+
 def _ple_candidate_prefetch_receipt() -> dict[str, float]:
     """K-P1 engagement: what the candidate row buffer actually served.
 
@@ -738,6 +854,14 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "ple_first_gather_early_armed": _ple_first_gather_early_armed(),
             "ple_candidate_prefetch": _ple_candidate_prefetch_receipt(),
             "ple_candidate_prefetch_armed": _ple_candidate_prefetch_armed(),
+            "ple_boundary": _ple_boundary_receipt(),
+            "ple_boundary_armed": _ple_boundary_armed(),
+            # W63.  Not a PLE counter, but it rides the same block because it
+            # is measured against the same census gap and every consumer of
+            # these rows already reads `ple_hot_rows`.
+            "graph_build_overlap": _graph_build_overlap_receipt(),
+            "graph_build_overlap_armed": _graph_build_overlap_armed(),
+            "graph_build_overlap_layers": _graph_build_overlap_layers(),
             # Which gather path each big row read actually took.  The pread
             # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
             # fancy index behind it, so an arm that claims the vectorised lane

@@ -63,7 +63,9 @@ from .fable_device_draft_chain import (
     claim_request_route as _fable_device_draft_chain_claim,
     is_enabled as _fable_device_draft_chain_enabled,
     mode as _fable_device_draft_chain_mode,
+    device_cycle_offset as _fable_device_draft_chain_offset,
     prewarm as _fable_device_draft_chain_prewarm,
+    rollback_to_device_offset as _fable_device_draft_chain_rollback,
     release as _fable_device_draft_chain_release,
     run_cycle as _fable_device_draft_chain_run,
 )
@@ -113,6 +115,7 @@ from .fast_sampling import (
     sparse_distributions_from_mlx_logits,
 )
 from .gdn_capture import resolve_gdn_capture_backend
+from . import graph_build_overlap as _graph_build_overlap
 from .kernels.pr391_softfloat64_verifier_decision import (
     SELECTED_BONUS as _PR391_SELECTED_BONUS,
     SELECTED_CORRECTION as _PR391_SELECTED_CORRECTION,
@@ -421,6 +424,12 @@ _FABLE_DEVICE_K20 = _fable_device_k20_enabled()
 # `rng.choice` would have consumed, so the whole chain costs ONE `mx.eval`.
 # `MTPLX_FABLE_DEVICE_DRAFT_CHAIN=body` keeps the stock host sampler and its
 # per-depth readback: the attribution arm that prices the compiled body alone.
+#
+# NEITHER mode is bit-identical.  The compiled body is a ROUNDING-CLASS change
+# by `fable_compiled_draft`'s own contract ("bit-for-bit digest parity is not a
+# goal of this flag"), so both modes are judged the way HC_M4 and the prefill
+# levers are -- HumanEval / the long-prompt agreement screen -- not by digest.
+# Window 1788400641 measured differing digests on 3/3 seeds, as expected.
 #
 # This is the first thing that puts a compiled draft body on the SERVING lane:
 # `MTPLX_FABLE_COMPILED_DRAFT` builds one only inside
@@ -9352,6 +9361,51 @@ def generate_mtpk(
         _ple_candidate_aux = _ple_candidate_dispatch.get("prepare_aux")
         if getattr(_ple_candidate_aux, "candidate_prefetch", None) is not None:
             _ple_candidate_submit = compiled_verify_bank.submit_fixed_m4_candidates
+    # MTPLX_FABLE_GRAPH_BUILD_OVERLAP (W63, default off).  Resolved ONCE here
+    # into two bound methods, so the cycle costs one `is not None` and one
+    # local call -- no flag read, no getattr walk, no branch on the bank.  The
+    # control arm keeps the shipped monolithic verify object in
+    # `_fixed_m4_verify` and never sees this module again.
+    _graph_overlap_enqueue = None
+    _fixed_m4_verify = (
+        compiled_verify_bank.forward_fixed_m4
+        if compiled_verify_bank is not None and qwen4_fixed_m4_compiled_verify
+        else None
+    )
+    if (
+        _graph_build_overlap.enabled()
+        and compiled_verify_bank is not None
+        and qwen4_fixed_m4_compiled_verify
+        and _compiled_verify_mode == "on"
+        and verify_strategy not in {"capture_commit", "graphbank_capture_commit"}
+    ):
+        _graph_overlap_layers = (
+            compiled_verify_bank.arm_fixed_m4_graph_build_overlap()
+        )
+        _graph_overlap_enqueue = (
+            compiled_verify_bank.enqueue_fixed_m4_overlap_prefix
+        )
+        _fixed_m4_verify = compiled_verify_bank.forward_fixed_m4_overlap
+        _graph_overlap_engagement = _graph_build_overlap.engagement_line(
+            _graph_overlap_layers
+        )
+        if _graph_overlap_engagement is not None:
+            print(_graph_overlap_engagement, flush=True)
+    elif _graph_build_overlap.enabled():
+        # An armed flag that quietly ran the shipped route would make the
+        # receipts lie about which code the candidate arm measured.
+        raise RuntimeError(
+            f"{_graph_build_overlap.ENV_FLAG} requires the installed "
+            "physical-M4 compiled verify on the batched verify route"
+        )
+    elif _graph_build_overlap.layers() != _graph_build_overlap.DEFAULT_LAYERS:
+        # W67: a depth knob without the lever is the same lie in miniature --
+        # an arm labelled "N=3" that measured the control.
+        raise RuntimeError(
+            f"{_graph_build_overlap.LAYERS_ENV} is set without "
+            f"{_graph_build_overlap.ENV_FLAG}=1; the depth knob does nothing "
+            "on its own"
+        )
     # Read once per request; the switch is a process constant so control and
     # candidate arms run the same binary.
     _pr391_compact_commit = _pr391_compact_commit_enabled()
@@ -10673,17 +10727,37 @@ def generate_mtpk(
         )
         if _device_draft_chain_plan is not None:
             # Promote the MTP cache, build the compiled body and trace it ONCE,
-            # here, outside the measured loop -- the same reason
+            # here, outside the loop -- the same reason
             # `_pr391_prewarm_float32_d3_core` exists.  `mtp_history_cache` is
             # the container the committed-history lane drafts into; if a live
             # reset or a prefix rebase replaces it mid-request, `run_cycle`
             # rebinds (and says so on stderr).
+            _ddc_prewarm_started = time.perf_counter()
             _fable_device_draft_chain_prewarm(
                 _device_draft_chain_plan,
                 hidden,
                 mtp_cache=mtp_history_cache,
                 rollback=_rollback_mtp_cache,
                 cache_offset=_mtp_cache_offset,
+            )
+            _ddc_prewarm_s = time.perf_counter() - _ddc_prewarm_started
+            # CHARGE IT TO SETUP, NOT TO DECODE.  `pre_first_token_setup_s`
+            # closed above, before this claim's inputs existed, so a prewarm
+            # placed here lands inside `decode_elapsed_s` -- which is what
+            # window 1788400641 measured: `first_primary_sample_time_s`
+            # (`perf_counter() - decode_loop_entered_s`) went 0.003 -> 0.024 s
+            # steady state, and 1.159 s on arm 1, the FIRST process ever to
+            # compile this body's Metal kernels.  1.132 s / 387 windows =
+            # 2.93 ms/M4win, and arm 1 measured exactly +2.90 ms/M4win against
+            # its own twin arm 2.  The cache promotion, the `mx.compile` trace
+            # and the shader compilation are construction, so they belong in
+            # the bucket the comment at the top of this span describes --
+            # `non_decode_extra_s` subtracts it from `decode_elapsed_s` and
+            # `ttft_s` adds it, which is where a reader should find it.
+            pre_first_token_setup_s += _ddc_prewarm_s
+            decode_loop_entered_s += _ddc_prewarm_s
+            _device_draft_chain_plan.receipt_extra["prewarm_s"] = float(
+                _ddc_prewarm_s
             )
             _device_draft_chain_receipt = _device_draft_chain_plan.to_dict()
     while len(tokens) < max_tokens:
@@ -10897,9 +10971,24 @@ def generate_mtpk(
                 mtp_history_live_resets += 1
                 mtp_history_live_appended = 0
             mtp_cache = mtp_history_cache
+            # MTPLX_FABLE_DEVICE_DRAFT_CHAIN: the compiled body needs a
+            # fixed-capacity MTP cache, and promoting to `TensorOffsetQSACache`
+            # turns this free python-int read into `int(mx.array)` -- an eval
+            # that flushes the command queue and waits for the GPU, once per
+            # cycle, inside no timer.  Windows 1788400641/2 measured the pair
+            # of them (this and the rollback below) at +0.41..0.44 ms/cycle in
+            # the unattributed span: six arms, two modes, spread 0.03 ms.  On
+            # this route the only consumer of `cycle_mtp_offset` is that
+            # rollback, so keep the whole quantity lazy and on device.  `None`
+            # means no device path and the stock read runs.
+            _ddc_cycle_offset = _fable_device_draft_chain_offset(
+                _device_draft_chain_plan, mtp_cache
+            )
             cycle_mtp_offset = (
                 int(_pr391_carried_d3["cycle_offset"])
                 if _pr391_carried_d3 is not None
+                else _ddc_cycle_offset
+                if _ddc_cycle_offset is not None
                 else _mtp_cache_offset(mtp_cache)
             )
         else:
@@ -12860,6 +12949,42 @@ def generate_mtpk(
             )
             verified_token_count = len(verify_input)
             verify_input_array = mx.array([verify_input])
+        # MTPLX_FABLE_GRAPH_BUILD_OVERLAP (W63; depth from
+        # MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS, W67).  The earliest
+        # statement at which this window's four ids exist -- the drafts have
+        # just come across (the retained stack's draft loop syncs once per
+        # depth, so the last depth's sync is what `verify_input` is waiting
+        # on) and nothing between here and the verify reads them again.
+        #
+        # Queueing target-embedding + layers 0..N-1 HERE, on the same
+        # `verify_input_array` the monolithic route would pass, gives the GPU
+        # ~0.53 ms per prefix layer to run under the ~1.9 ms/cycle the
+        # retained-stack census measures the GPU idling while the compiled
+        # verify graph is replayed on the host
+        # (w58-retained-control-census-1788370322: 382/382 cycles, 86.9 %
+        # host-late, median 1.690 ms).
+        #
+        # `host_input_ids` / `completion_tokens` ride along for W67's aux
+        # hoist: at depth > 1 the prefix contains the PLE layer (the
+        # production config has ONE, at index 1), so the bank builds this
+        # window's PLE auxiliary here -- it needs only the drafted token
+        # VALUES, which arrived with the window -- and carries it to the
+        # join.  `tokens` is not mutated between here and the verify, and the
+        # verify passes the same three arguments.  At depth 1 the bank
+        # ignores them and the join builds the auxiliary where the shipped
+        # route builds it.
+        if (
+            _graph_overlap_enqueue is not None
+            and verified_token_count == 4
+            and a3b_target_prefix_route is None
+        ):
+            _graph_overlap_enqueue(
+                verify_input_array,
+                committed_count=len(tokens) - 1,
+                cache=cache,
+                host_input_ids=verify_input,
+                completion_tokens=tokens,
+            )
         if lazy_bonus_verify:
             lazy_bonus_verify_calls += 1
         event["lazy_bonus_verify"] = {
@@ -12989,7 +13114,7 @@ def generate_mtpk(
                 and verified_token_count == 4
             ):
                 verify_logits, verify_hidden, captures = (
-                    compiled_verify_bank.forward_fixed_m4(
+                    _fixed_m4_verify(
                         verify_input_array,
                         host_input_ids=verify_input,
                         completion_tokens=tokens,
@@ -14131,7 +14256,15 @@ def generate_mtpk(
                         ],
                     )
                 else:
-                    _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                    # Same two-sync story as the offset read above: the stock
+                    # rollback opens with `int(getattr(cache, 'offset', 0))`.
+                    # `trim to target` is exactly `min(current, target)` on a
+                    # cleared rollback_state, so the route does it in-graph; a
+                    # False return means it declined and the stock path runs.
+                    if not _fable_device_draft_chain_rollback(
+                        _device_draft_chain_plan, mtp_cache, cycle_mtp_offset + 1
+                    ):
+                        _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                     draft_time += append_mtp_history(
                         mtp_cache,
                         verify_hidden[:, : max(0, len(committed) - 1), :],
@@ -14361,7 +14494,15 @@ def generate_mtpk(
                         authoritative_after_primary=verify_hidden[:, 0:1, :],
                     )
                 else:
-                    _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                    # Same two-sync story as the offset read above: the stock
+                    # rollback opens with `int(getattr(cache, 'offset', 0))`.
+                    # `trim to target` is exactly `min(current, target)` on a
+                    # cleared rollback_state, so the route does it in-graph; a
+                    # False return means it declined and the stock path runs.
+                    if not _fable_device_draft_chain_rollback(
+                        _device_draft_chain_plan, mtp_cache, cycle_mtp_offset + 1
+                    ):
+                        _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                     draft_time += append_mtp_history(
                         mtp_cache,
                         verify_hidden[:, 0:1, :],
@@ -14625,7 +14766,15 @@ def generate_mtpk(
                     authoritative_after_primary=authoritative_history,
                 )
             else:
-                _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                # Same two-sync story as the offset read above: the stock
+                # rollback opens with `int(getattr(cache, 'offset', 0))`.
+                # `trim to target` is exactly `min(current, target)` on a
+                # cleared rollback_state, so the route does it in-graph; a
+                # False return means it declined and the stock path runs.
+                if not _fable_device_draft_chain_rollback(
+                    _device_draft_chain_plan, mtp_cache, cycle_mtp_offset + 1
+                ):
+                    _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                 history_tokens = committed[1:]
                 if committed_from_capture or committed_from_trim:
                     history_hidden = verify_hidden[
