@@ -14,12 +14,19 @@ import pytest
 
 from mtplx import full_stack_env
 from mtplx.full_stack_env import (
+    FULL_STACK_PROFILE_ENV,
     FULL_STACK_PROFILE_NAME,
     FULL_STACK_RESTACK_ENV,
+    OWNER_PROFILE,
+    OWNER_SERVER_AUTO,
+    OWNER_SERVER_FORCED,
     TRUE_TOKENS,
     flag_enabled,
+    keys_owned_by,
     known_family_keys,
     registered_names,
+    resolved_stack,
+    stack_summary_line,
     text_value,
     unknown_family_keys,
     warn_unknown_family_keys,
@@ -66,12 +73,63 @@ DRIVER_FULL_STACK_ENV = {
     "MTPLX_SKIP_VERIFY_SNAPSHOT": "0",  # turbo sets 1
 }
 
-#: The only keys on which the driver stack and turbo disagree.
+#: The only keys on which the driver stack and turbo disagree. All three are
+#: SERVER-owned: mtplx/server/openai.py already resolves them driver-wins for
+#: a qwen4_exp mtp serve, under turbo too. The profile introduces no conflict
+#: of its own.
 EXPECTED_CONFLICTS = {
     "MTPLX_BATCH_TARGET_ARRAYS": ("0", "1"),
     "MTPLX_LAZY_TARGET_DISTRIBUTIONS": ("1", "0"),
     "MTPLX_SKIP_VERIFY_SNAPSHOT": ("1", "0"),
 }
+
+#: The gap: driver-stack keys NO server path sets. Verified against
+#: mtplx/server/openai.py:_server_runtime_env_overrides on 2026-09-02 --
+#: these are the only four the profile is allowed to stamp.
+EXPECTED_GAP = {
+    "MTPLX_QWEN4_COMPILED_MTP_PREPARE": "1",
+    "MTPLX_FRSPEC_DRAFT": "1",
+    "MTPLX_FRSPEC_VOCAB": "builtin:qwen38-code-64k",
+    "MTPLX_QWEN4_RELAXED_DRAFT_TIES": "1",
+}
+
+#: Armed by _server_runtime_env_overrides with
+#: ``if os.environ.get(key) is None: setdefault(...)`` (or the pop-on-operator
+#: form), i.e. an operator export wins. The profile must not restate these.
+EXPECTED_SERVER_AUTO = {
+    "MTPLX_QWEN4_FIXED_M4_VERIFY",
+    "MTPLX_QWEN4_M4_STAGE3",
+    "MTPLX_QSA_M4_FUSED_KV_GATHER",
+    "MTPLX_QSA_GATHER",
+    "MTPLX_COMPILED_GDN",
+    "MTPLX_AR_PIPELINE",
+    "MTPLX_FAMILY_CAPTURE_COMMIT",
+    "MTPLX_FUSED_HC_V3",
+    "MTPLX_FUSED_GDN_INPROJ",
+    "MTPLX_FUSED_GATE_UP",
+    "MTPLX_FUSED_GDN_CONVNORM",
+    "MTPLX_FUSED_GDN_STEP",
+    "MTPLX_FUSED_CONVNORM_VERIFY",
+    "MTPLX_BATCH_TARGET_ARRAYS",
+    "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+}
+
+#: Assigned unconditionally by the server (beats profile AND operator).
+EXPECTED_SERVER_FORCED = {"MTPLX_SKIP_VERIFY_SNAPSHOT"}
+
+def _server_auto_arm() -> dict[str, str]:
+    """What mtplx/server/openai.py adds for a qwen4_exp fixed-M4 mtp serve.
+
+    Modelled from _server_runtime_env_overrides: every server-owned key at
+    its stack value. Applied AFTER the profile env by apply_profile_env, so
+    updating the dict last is the right order.
+    """
+
+    return {
+        key: DRIVER_FULL_STACK_ENV[key]
+        for key in EXPECTED_SERVER_AUTO | EXPECTED_SERVER_FORCED
+    }
+
 
 GOLDEN_PRE_CHANGE_ENV = (
     Path(__file__).parent / "golden" / "profiles" / "pre_full_stack_profile_env.json"
@@ -95,31 +153,78 @@ def test_profile_is_selectable_by_name_and_by_harness_alias() -> None:
         assert resolve_profile_name(alias) == FULL_STACK_PROFILE_NAME
 
 
-def test_profile_env_is_turbo_plus_the_driver_block() -> None:
+def test_the_registry_records_who_sets_every_stack_key() -> None:
+    assert set(keys_owned_by(OWNER_PROFILE)) == set(EXPECTED_GAP)
+    assert set(keys_owned_by(OWNER_SERVER_AUTO)) == EXPECTED_SERVER_AUTO
+    assert set(keys_owned_by(OWNER_SERVER_FORCED)) == EXPECTED_SERVER_FORCED
+    # Every key is accounted for exactly once.
+    owned = (
+        set(keys_owned_by(OWNER_PROFILE))
+        | EXPECTED_SERVER_AUTO
+        | EXPECTED_SERVER_FORCED
+    )
+    assert owned == set(DRIVER_FULL_STACK_ENV)
+    for entry in full_stack_env.FULL_STACK_KEYS:
+        assert entry.owner_site.strip(), entry.name
+        assert entry.owner_predicate.strip(), entry.name
+
+
+def test_the_profile_stamps_exactly_the_keys_no_server_path_sets() -> None:
+    assert FULL_STACK_PROFILE_ENV == EXPECTED_GAP
+
     turbo = get_profile("turbo").env_dict()
     full = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
 
-    expected = dict(turbo)
-    expected.update(DRIVER_FULL_STACK_ENV)
-    assert full == expected
-
-    # Every driver key is present at the driver's value, none dropped.
-    for key, value in DRIVER_FULL_STACK_ENV.items():
-        assert full[key] == value, key
+    assert full == {**turbo, **EXPECTED_GAP}
+    added = {key: value for key, value in full.items() if turbo.get(key) != value}
+    assert added == EXPECTED_GAP
 
 
-def test_apply_profile_env_stamps_the_whole_block_on_a_clean_environ() -> None:
+def test_the_profile_does_not_restate_a_server_armed_key() -> None:
+    """Restating one would take the A/B switch away from the operator.
+
+    The server arms those keys only when the environment left them unset, so
+    an operator export beats it. A profile-owned key is the opposite: it
+    stomps whatever is in the environment (apply_profile_env yields only on
+    PROFILE_ENV_USER_OVERRIDE_KEYS). Putting a server-armed key in the
+    profile would silently win those A/Bs.
+    """
+
+    full = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
+    turbo = get_profile("turbo").env_dict()
+
+    for key in EXPECTED_SERVER_AUTO | EXPECTED_SERVER_FORCED:
+        # Present only if turbo already had it, and then at turbo's value.
+        assert full.get(key) == turbo.get(key), key
+
+
+def test_an_operator_export_survives_the_profile_on_server_owned_keys() -> None:
+    # The operator's A/B arm: force a server-armed lane off for one launch.
+    environ = {
+        "MTPLX_QWEN4_M4_STAGE3": "0",
+        "MTPLX_QSA_GATHER": "0",
+        "MTPLX_FUSED_GDN_STEP": "0",
+    }
+
+    apply_profile_env(FULL_STACK_PROFILE_NAME, environ=environ)
+
+    assert environ["MTPLX_QWEN4_M4_STAGE3"] == "0"
+    assert environ["MTPLX_QSA_GATHER"] == "0"
+    assert environ["MTPLX_FUSED_GDN_STEP"] == "0"
+
+
+def test_apply_profile_env_stamps_the_gap_on_a_clean_environ() -> None:
     environ: dict[str, str] = {}
 
     apply_profile_env(FULL_STACK_PROFILE_NAME, environ=environ)
 
-    for key, value in DRIVER_FULL_STACK_ENV.items():
+    for key, value in EXPECTED_GAP.items():
         assert environ[key] == value, key
     status = profile_env_status(FULL_STACK_PROFILE_NAME, environ=environ)
     assert all(entry["ok"] for entry in status.values())
 
 
-def test_frspec_is_armed_where_turbo_leaves_it_unset() -> None:
+def test_frspec_is_armed_where_nothing_else_arms_it() -> None:
     # The reported symptom: `[frspec] disabled (MTPLX_FRSPEC_DRAFT=None)`.
     assert "MTPLX_FRSPEC_DRAFT" not in get_profile("turbo").env_dict()
     full = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
@@ -128,11 +233,11 @@ def test_frspec_is_armed_where_turbo_leaves_it_unset() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (2) conflicts resolve driver-wins
+# (2) the turbo conflicts are SERVER-owned, and the stack check proves it
 # ---------------------------------------------------------------------------
 
 
-def test_exactly_three_keys_conflict_with_turbo() -> None:
+def test_exactly_three_keys_conflict_with_turbo_and_all_are_server_owned() -> None:
     turbo = get_profile("turbo").env_dict()
 
     conflicts = {
@@ -141,34 +246,78 @@ def test_exactly_three_keys_conflict_with_turbo() -> None:
         if key in turbo and turbo[key] != value
     }
     assert conflicts == EXPECTED_CONFLICTS
+    # None of them is the profile's to resolve.
+    assert set(conflicts) & set(FULL_STACK_PROFILE_ENV) == set()
+    for key in conflicts:
+        assert full_stack_env.spec(key).owner in (
+            OWNER_SERVER_AUTO,
+            OWNER_SERVER_FORCED,
+        )
 
 
-def test_conflicts_resolve_driver_wins() -> None:
-    full = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
+def test_todays_turbo_serve_is_short_exactly_the_gap() -> None:
+    """What `mtplx serve --profile turbo` resolves on a Flash-Next pack.
 
-    for key, (turbo_value, driver_value) in EXPECTED_CONFLICTS.items():
-        assert full[key] == driver_value, key
-        assert full[key] != turbo_value, key
+    Turbo's env plus the server's auto-arm for a qwen4_exp fixed-M4 pack in
+    mtp mode: 16 of the 20 driver-stack keys, missing exactly the four the
+    profile exists to supply.
+    """
+
+    environ: dict[str, str] = {}
+    apply_profile_env("turbo", environ=environ)
+    environ.update(_server_auto_arm())
+
+    rows = {row["name"]: row for row in resolved_stack(environ)}
+    missing = {name for name, row in rows.items() if not row["ok"]}
+
+    assert missing == set(EXPECTED_GAP)
+    assert "16/20 driver-stack keys armed" in stack_summary_line(environ)
 
 
-def test_batched_target_arrays_is_not_runtime_dead_under_this_profile() -> None:
-    # profiles.RUNTIME_GATED_ENV_PAIRS: BATCH_TARGET_ARRAYS has no effect
-    # while LAZY_TARGET_DISTRIBUTIONS is truthy. Turbo ships exactly that
-    # dead pair; the point of the driver-wins resolution is to undo it.
-    from mtplx.profiles import RUNTIME_GATED_ENV_PAIRS, announce_runtime_gated_env
+def test_the_profile_plus_the_server_auto_arm_completes_the_stack() -> None:
+    environ: dict[str, str] = {}
+    apply_profile_env(FULL_STACK_PROFILE_NAME, environ=environ)
+    environ.update(_server_auto_arm())
 
+    assert all(row["ok"] for row in resolved_stack(environ))
+    line = stack_summary_line(environ)
+    assert "20/20 driver-stack keys armed" in line
+    assert "profile 4" in line
+    assert "server_auto_arm 15" in line
+    assert "server_forced 1" in line
+
+
+def test_a_predicate_that_did_not_hold_reads_as_unarmed() -> None:
+    # Profile selected, but the served pack is not qwen4_exp, so the server
+    # armed nothing. The stack line has to say so, naming the predicate.
     environ: dict[str, str] = {}
     apply_profile_env(FULL_STACK_PROFILE_NAME, environ=environ)
 
-    gated = announce_runtime_gated_env(environ, profile_name=FULL_STACK_PROFILE_NAME)
-    dead = {entry["var"] for entry in gated}
-    assert "MTPLX_BATCH_TARGET_ARRAYS" not in dead
-    assert any(pair[0] == "MTPLX_BATCH_TARGET_ARRAYS" for pair in RUNTIME_GATED_ENV_PAIRS)
+    line = stack_summary_line(environ)
+    assert "4/20 driver-stack keys armed" in line
+    assert "_served_model_type_is_qwen4_exp(args)" in line
+    assert "MTPLX_FRSPEC_DRAFT" not in line  # the profile did arm that one
 
-    turbo_environ: dict[str, str] = {}
-    apply_profile_env("turbo", environ=turbo_environ)
-    assert turbo_environ["MTPLX_BATCH_TARGET_ARRAYS"] == "0"
-    assert turbo_environ["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
+
+def test_batched_target_arrays_is_not_runtime_dead_once_the_server_arms_it():
+    # profiles.RUNTIME_GATED_ENV_PAIRS: BATCH_TARGET_ARRAYS has no effect
+    # while LAZY_TARGET_DISTRIBUTIONS is truthy. Turbo ships exactly that
+    # dead pair; the server's auto-arm is what undoes it for this family.
+    from mtplx.profiles import RUNTIME_GATED_ENV_PAIRS, announce_runtime_gated_env
+
+    turbo_only: dict[str, str] = {}
+    apply_profile_env("turbo", environ=turbo_only)
+    assert turbo_only["MTPLX_BATCH_TARGET_ARRAYS"] == "0"
+    assert turbo_only["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
+    assert any(
+        pair[0] == "MTPLX_BATCH_TARGET_ARRAYS" for pair in RUNTIME_GATED_ENV_PAIRS
+    )
+
+    served: dict[str, str] = {}
+    apply_profile_env(FULL_STACK_PROFILE_NAME, environ=served)
+    served.update(_server_auto_arm())
+    gated = announce_runtime_gated_env(served, profile_name=FULL_STACK_PROFILE_NAME)
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in {entry["var"] for entry in gated}
 
 
 def test_operator_env_still_beats_the_profile_on_overridable_keys() -> None:
@@ -184,11 +333,12 @@ def test_operator_env_still_beats_the_profile_on_overridable_keys() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_every_registered_key_names_its_reader_and_its_profile() -> None:
-    for spec in full_stack_env.FULL_STACK_KEYS:
-        assert spec.set_by == (FULL_STACK_PROFILE_NAME,), spec.name
-        assert ":" in spec.reader or "/" in spec.reader, spec.name
-        assert spec.profile_value == DRIVER_FULL_STACK_ENV[spec.name], spec.name
+def test_every_registered_key_names_its_reader_owner_and_stack_value() -> None:
+    for entry in full_stack_env.FULL_STACK_KEYS:
+        assert ":" in entry.reader or "/" in entry.reader, entry.name
+        assert entry.stack_value == DRIVER_FULL_STACK_ENV[entry.name], entry.name
+        assert entry.owner in full_stack_env.OWNERS, entry.name
+        assert entry.stamped_by_profile is (entry.owner == OWNER_PROFILE), entry.name
 
 
 def test_registered_names_are_exactly_the_block() -> None:
@@ -362,17 +512,22 @@ def test_the_new_profile_is_appended_and_displaces_nothing() -> None:
     assert len(PROFILE_CHOICES) == 7
 
 
-def test_no_shipped_profile_gained_a_full_stack_key() -> None:
+def test_no_shipped_profile_gained_a_gap_key() -> None:
     for name in PROFILE_CHOICES:
         if name == FULL_STACK_PROFILE_NAME:
             continue
         env = get_profile(name).env_dict()
-        leaked = {
-            key
-            for key, value in DRIVER_FULL_STACK_ENV.items()
-            if env.get(key) == value and key not in EXPECTED_CONFLICTS
-        }
+        leaked = set(EXPECTED_GAP) & set(env)
         assert not leaked, f"{name} gained {sorted(leaked)}"
+
+
+def test_the_new_profile_touches_only_the_gap_and_nothing_else() -> None:
+    turbo = get_profile("turbo").env_dict()
+    full = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
+
+    assert set(full) - set(turbo) == set(EXPECTED_GAP)
+    for key, value in turbo.items():
+        assert full[key] == value, key
 
 
 def test_the_default_profile_is_still_sustained() -> None:

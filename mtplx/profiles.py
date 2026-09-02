@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping
 
 from .full_stack_env import (
+    FULL_STACK_PROFILE_ENV,
     FULL_STACK_PROFILE_NAME,
-    FULL_STACK_RESTACK_ENV,
 )
 
 ProfileName = str
@@ -869,72 +869,83 @@ TURBO_FULL_STACK_PROFILE = RuntimeProfile(
     name=FULL_STACK_PROFILE_NAME,
     runtime_profile="native_mtp_turbo_full_stack",
     summary=(
-        "Turbo plus the Qwen3.8 Flash-Next decode restack the in-process "
-        "benchmark drivers arm (FR-Spec draft head, compiled fixed-M4 verify "
-        "and M4 stage-3 tail, fused GDN/MoE/hyper-connection lanes, QSA "
-        "rows-gather, pipelined AR + compiled GDN, batched target arrays). "
-        "Opt-in: no default changes, and no other profile is affected."
+        "Turbo plus the four Qwen3.8 Flash-Next decode switches the "
+        "in-process benchmark drivers arm and no server path sets: the "
+        "FR-Spec draft head and its 64k code vocabulary, compiled Qwen4 MTP "
+        "preparation, and relaxed Qwen4 draft ties. Opt-in: no default "
+        "changes, and no other profile is affected."
     ),
     env=_merge_env(
         TURBO_PROFILE.env_dict(),
-        # Driver-wins on every key the two disagree about. The block is
-        # generated from mtplx.full_stack_env.FULL_STACK_KEYS, which records
-        # each key's reader, parse and unset default. It is byte-identical to
-        # the FULL_STACK_ENV dict in scripts/fable/server_cell_bench.py, which
-        # is in turn what scripts/fable/abba_driver.py:build_family_overrides
-        # sets from its own default flags (verified 2026-09-02).
+        # EXACTLY the gap, and nothing else. The rest of the driver stack is
+        # already armed by _server_runtime_env_overrides in
+        # mtplx/server/openai.py for the served pack:
         #
-        # Exactly THREE keys conflict with turbo, and the driver value wins:
+        #   15 keys  server auto-arm  (`if os.environ.get(key) is None:
+        #            setdefault`, predicates _served_model_type_is_qwen4_exp
+        #            / _served_model_is_qwen4_fixed_m4) -- AR_PIPELINE,
+        #            COMPILED_GDN, FAMILY_CAPTURE_COMMIT, FUSED_HC_V3,
+        #            FUSED_GDN_INPROJ, FUSED_GATE_UP, FUSED_GDN_CONVNORM,
+        #            FUSED_GDN_STEP, FUSED_CONVNORM_VERIFY, QSA_GATHER,
+        #            BATCH_TARGET_ARRAYS=1, LAZY_TARGET_DISTRIBUTIONS=0,
+        #            QWEN4_FIXED_M4_VERIFY, QWEN4_M4_STAGE3,
+        #            QSA_M4_FUSED_KV_GATHER
+        #    1 key   server FORCED    SKIP_VERIFY_SNAPSHOT=0 (plain
+        #            assignment for mtp on this family)
         #
-        #   MTPLX_BATCH_TARGET_ARRAYS        turbo 0 -> 1
-        #   MTPLX_LAZY_TARGET_DISTRIBUTIONS  turbo 1 -> 0
-        #   MTPLX_SKIP_VERIFY_SNAPSHOT       turbo 1 -> 0
+        # Restating those here would be worse than redundant. Server
+        # overrides are applied AFTER the profile env, so the value would not
+        # change -- but a profile-owned key STOMPS an operator's explicit
+        # export (apply_profile_env only yields on
+        # PROFILE_ENV_USER_OVERRIDE_KEYS), while the server's auto-arm
+        # deliberately steps aside for one. Putting them in the profile would
+        # take the A/B switch away from the operator on exactly the keys the
+        # server chose to leave them.
         #
-        # The first two are one decision, not two: generation.py consults
-        # BATCH_TARGET_ARRAYS only where the lazy strategy is OFF
-        # (RUNTIME_GATED_ENV_PAIRS above), so turbo's pair leaves the batched
-        # arm runtime-dead. The third is a correctness requirement on this
-        # family, not a speed knob -- Flash-Next rejection rollback replays
-        # from the recurrent-state snapshot, and the server already forces it
-        # to 0 for mtp + qwen4_exp. This profile states it instead of
-        # inheriting it by accident.
+        # That also means this profile has NO turbo conflicts of its own.
+        # The three keys where turbo and the drivers disagree --
+        # BATCH_TARGET_ARRAYS (turbo 0), LAZY_TARGET_DISTRIBUTIONS (turbo 1)
+        # and SKIP_VERIFY_SNAPSHOT (turbo 1) -- are already resolved
+        # driver-wins by the server for a qwen4_exp mtp serve, under turbo
+        # too. The startup stack line reports whether that actually happened
+        # rather than assuming it.
         #
-        # Two keys the driver also sets are deliberately NOT in the block,
-        # matching FULL_STACK_ENV:
-        #
-        #   MTPLX_COMPILED_VERIFY  turbo's "1" already covers the driver's
-        #                          default "on".
-        #   MTPLX_NAX_VERIFY       the driver defaults it to 0; the server
-        #                          already forces 0 on qwen4_exp via
-        #                          _server_runtime_env_overrides, which is
-        #                          applied AFTER the profile env and so wins.
-        #                          On any other family this profile therefore
-        #                          keeps turbo's 1 -- see the caveats.
-        FULL_STACK_RESTACK_ENV,
+        # Two driver keys are deliberately absent from the stack entirely,
+        # matching FULL_STACK_ENV in scripts/fable/server_cell_bench.py:
+        # MTPLX_COMPILED_VERIFY (turbo's "1" covers the driver's default
+        # "on") and MTPLX_NAX_VERIFY (the driver defaults it to 0 and the
+        # server already forces 0 on qwen4_exp).
+        FULL_STACK_PROFILE_ENV,
     ),
     caveats=(
         "Opt-in only. Nothing selects this profile automatically: turbo "
         "stays the flagship default and its env is unchanged.",
-        "Scoped to the Qwen3.8 Flash-Next (qwen4_exp) family. The "
-        "MTPLX_QWEN4_*/MTPLX_QSA_M4_* keys are read only under that "
-        "model_type, but MTPLX_FRSPEC_DRAFT is family-agnostic and will "
-        "raise at load if the FR-Spec head cannot install -- do not select "
-        "this profile for another model.",
-        "Selecting it turns on a startup self-check that prints one "
-        "satisfied/missing line per engagement receipt: the FR-Spec install "
-        "report (expects n=65536 from builtin:qwen38-code-64k), the runtime's "
-        "[qwen4-fixed-M4-verify], [qwen4-M4-stage3] and "
+        "It adds exactly four keys to turbo -- MTPLX_FRSPEC_DRAFT, "
+        "MTPLX_FRSPEC_VOCAB, MTPLX_QWEN4_COMPILED_MTP_PREPARE and "
+        "MTPLX_QWEN4_RELAXED_DRAFT_TIES -- because those are the only ones "
+        "of the driver stack that no server path sets. The other 16 are "
+        "armed by mtplx/server/openai.py for a qwen4_exp / fixed-M4 pack, "
+        "and this profile deliberately does not restate them so an operator "
+        "export keeps beating them.",
+        "Scoped to the Qwen3.8 Flash-Next (qwen4_exp) family. The server's "
+        "auto-arm is predicated on the served config, so on any other model "
+        "this profile arms FR-Spec and the two Qwen4 keys and nothing else "
+        "-- and MTPLX_FRSPEC_DRAFT is family-agnostic and RAISES at load if "
+        "the FR-Spec head cannot install. Do not select it for another "
+        "model.",
+        "Selecting it turns on a startup self-check: one line saying how "
+        "many of the 20 driver-stack keys are armed and by whom (so a "
+        "server predicate that did not hold is visible), then one "
+        "satisfied/missing line per engagement receipt -- the FR-Spec "
+        "install report (expects n=65536 from builtin:qwen38-code-64k), the "
+        "runtime's [qwen4-fixed-M4-verify], [qwen4-M4-stage3] and "
         "[qwen4-compiled-MTP-prepare] install reports, and the background "
-        "warmup ladder. Those receipts are printed to stderr at install time "
-        "on every profile, and the reports are readable at GET /health under "
-        "engagement_reports.",
+        "warmup ladder. Those receipts are printed to stderr at install "
+        "time on every profile, and the reports are readable at GET /health "
+        "under engagement_reports.",
         "Same verify-kernel exactness caveats as turbo; additionally the "
         "fused GDN/MoE/hyper-connection lanes and the QSA rows-gather are "
         "self-fenced and bail to the stock chain on any contract miss.",
-        "MTPLX_BATCH_TARGET_ARRAYS, MTPLX_LAZY_TARGET_DISTRIBUTIONS, "
-        "MTPLX_SKIP_VERIFY_SNAPSHOT and MTPLX_FAMILY_CAPTURE_COMMIT stay "
-        "operator-overridable (PROFILE_ENV_USER_OVERRIDE_KEYS); an explicit "
-        "export still beats this profile and is announced at startup.",
         "Runs on stock PyPI MLX; no custom MLX fork or build is required.",
     ),
     draft_lm_head=DraftLMHeadRequirement(bits=4, group_size=64, mode="affine"),

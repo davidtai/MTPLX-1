@@ -10,9 +10,10 @@ mtplx serve --host 127.0.0.1 --port 8000 --no-stats-footer
 See [Concurrency modes](concurrency.md) for scheduler selection, ownership
 rules, and model/backend-specific implementations.
 
-On Qwen3.8 Flash-Next the fastest decode path is **opt-in**: `--profile
-turbo` does not arm the stack the in-process benchmark drivers measure.
-Select `--profile turbo-full-stack` for it, and see
+On Qwen3.8 Flash-Next the fastest decode path is **opt-in**: the server arms
+16 of the 20 switches the in-process benchmark drivers use, but nothing sets
+the other four — FR-Spec among them. Select `--profile turbo-full-stack` for
+those, and see
 [Profiles](profiles.md#the-flash-next-fast-decode-path-is-opt-in-turbo-full-stack)
 for what it changes and how to confirm it engaged.
 

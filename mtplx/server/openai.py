@@ -140,6 +140,8 @@ from mtplx.profiles import (
 )
 from mtplx.full_stack_env import (
     FULL_STACK_PROFILE_NAME,
+    resolved_stack,
+    stack_summary_line,
     warn_unknown_family_keys,
 )
 from mtplx.full_stack_selfcheck import (
@@ -1602,6 +1604,11 @@ def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[st
     if not _full_stack_profile_selected(getattr(state, "args", None)):
         return {}
     try:
+        # Env level first: the profile stamps only the four keys nothing else
+        # sets, so the other 16 depend on the server's own auto-arm and its
+        # model predicates. A predicate that did not hold shows up here as an
+        # unarmed key, which is the thing that explains a missing lane below.
+        _safe_stdout_print(f"[full-stack] {phase} {stack_summary_line()}")
         statuses = markers_from_runtime(
             getattr(state, "runtime", None),
             draft_lm_head=getattr(state, "draft_lm_head", None),
@@ -1610,6 +1617,7 @@ def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[st
         for line in format_marker_lines(statuses, phase=phase):
             _safe_stdout_print(line)
         payload = selfcheck_payload(statuses, phase=phase)
+        payload["stack"] = resolved_stack()
         state.full_stack_selfcheck = payload
         return payload
     except Exception as error:  # a self-check must never break startup
