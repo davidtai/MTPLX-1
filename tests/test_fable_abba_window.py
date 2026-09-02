@@ -710,6 +710,103 @@ class TestOuterCommandLine(unittest.TestCase):
         self.assertIn("run_guarded.py", epilog)
 
 
+class WarmGraphTest(unittest.TestCase):
+    """``--prefill-only`` pays the cold first prefill chunk unmeasured.
+
+    2026-09-01 w22: chunk 1 of a fresh process is bimodal (~1.9 s / ~4.4 s)
+    on control and candidate alike, in lockstep with the throughput of the
+    driver's own 29.8 GiB ``--prewarm-ngram-table`` read.  A prefill-only arm
+    measures exactly one prefill, so that term has to move out of it.
+    """
+
+    def _flags(self, extra=()):
+        args = window.build_parser().parse_args(["--sequence", "1", *extra])
+        return window.common_driver_flags(args)
+
+    def test_default_window_does_not_warm_the_graph(self):
+        self.assertNotIn("--warm-graph", self._flags())
+
+    def test_prefill_only_warms_the_graph(self):
+        self.assertIn("--warm-graph", self._flags(["--prefill-only"]))
+
+    def test_explicit_warm_graph_works_without_prefill_only(self):
+        self.assertIn("--warm-graph", self._flags(["--warm-graph"]))
+
+    def test_no_warm_graph_opts_back_out_of_prefill_only(self):
+        flags = self._flags(["--prefill-only", "--no-warm-graph"])
+        self.assertNotIn("--warm-graph", flags)
+
+    def test_no_warm_graph_beats_an_explicit_warm_graph(self):
+        flags = self._flags(["--warm-graph", "--no-warm-graph"])
+        self.assertNotIn("--warm-graph", flags)
+
+    def test_the_flag_appears_exactly_once_on_the_arm_command_line(self):
+        args = window.build_parser().parse_args(
+            ["--sequence", "1", "--prefill-only"]
+        )
+        specs = window.arm_specification(args)
+        run = window.plan_runs([20260829], "ABBA", 1)[0]
+        argv = window.build_arm_argv(
+            run,
+            python="py",
+            driver="drv",
+            label_prefix="p",
+            receipt_dir="/out",
+            common_flags=window.common_driver_flags(args),
+            arm_flags=specs["A"]["flags"],
+            candidate_env=specs["A"]["candidate_env"],
+            extra_env=specs["A"]["extra_env"],
+        )
+        self.assertEqual(argv.count("--warm-graph"), 1)
+
+    def test_warm_graph_is_reserved_against_duplicate_arm_flags(self):
+        self.assertIn("--warm-graph", window.RESERVED_ARM_FLAGS)
+        with self.assertRaises(ValueError):
+            window.check_arm_flags(["--warm-graph"])
+
+    def test_warm_graph_does_not_disturb_the_arm_flags(self):
+        args = window.build_parser().parse_args(
+            ["--sequence", "1", "--prefill-only"]
+        )
+        base = list(window.CONTROL_FLAGS)
+        base[base.index("--max-tokens") + 1] = str(
+            window.PREFILL_ONLY_MAX_TOKENS
+        )
+        self.assertEqual(window.arm_specification(args)["A"]["flags"], base)
+
+
+class FirstChunkColdTest(unittest.TestCase):
+    """The cold chunk stays in the receipt after the warm-up moves it."""
+
+    def test_reads_the_first_chunk_wall(self):
+        row = {
+            "prefill_chunks": [
+                {"start": 0.0, "end": 2048.0, "wall_s": 4.526, "ple_gather_s": 0.378},
+                {"start": 2048.0, "end": 4096.0, "wall_s": 1.191, "ple_gather_s": 0.0},
+            ]
+        }
+        self.assertAlmostEqual(driver.first_chunk_cold_s(row), 4.526)
+
+    def test_missing_or_empty_is_none_not_an_error(self):
+        self.assertIsNone(driver.first_chunk_cold_s(None))
+        self.assertIsNone(driver.first_chunk_cold_s({}))
+        self.assertIsNone(driver.first_chunk_cold_s({"prefill_chunks": []}))
+
+    def test_malformed_chunk_is_none_not_an_error(self):
+        self.assertIsNone(
+            driver.first_chunk_cold_s({"prefill_chunks": [{"start": 0.0}]})
+        )
+        self.assertIsNone(
+            driver.first_chunk_cold_s({"prefill_chunks": [{"wall_s": None}]})
+        )
+
+    def test_the_driver_parser_accepts_warm_graph(self):
+        args = driver.build_parser().parse_args(
+            ["--label", "x", "--sequence", "1", "--seed", "1", "--warm-graph"]
+        )
+        self.assertTrue(args.warm_graph)
+
+
 if __name__ == "__main__":
     unittest.main()
 
