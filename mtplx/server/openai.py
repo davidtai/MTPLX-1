@@ -1585,6 +1585,62 @@ def _full_stack_profile_selected(args: Any) -> bool:
         return False
 
 
+def _serve_shape(state: Any) -> str:
+    """The serve shape the stack line is read against.
+
+    The registry knows which predicate owns a key; only the server knows
+    whether that predicate held. Naming the shape is what turns "MTPLX_QSA_
+    GATHER not armed" into "of course -- this is not a qwen4_exp pack".
+    """
+
+    args = getattr(state, "args", None)
+    parts = [str(getattr(args, "generation_mode", "") or "?").strip().lower()]
+    try:
+        if _served_model_is_qwen4_fixed_m4(args):
+            parts.append("qwen4_exp fixed-M4 pack")
+        elif _served_model_type_is_qwen4_exp(args):
+            parts.append("qwen4_exp pack, not fixed-M4")
+        else:
+            parts.append("not a qwen4_exp pack")
+    except Exception:
+        parts.append("model shape unknown")
+    return ", ".join(parts)
+
+
+def _assert_full_stack_profile_is_servable(args: Any) -> None:
+    """Refuse turbo-full-stack where its own keys would raise at model load.
+
+    mtplx/runtime.py:load raises -- unrecoverably, after the weights are
+    already mapped -- when MTPLX_QWEN4_COMPILED_MTP_PREPARE is set with an
+    MTP adapter, and FR-Spec's installer raises when the head cannot be
+    pruned. Both need native MTP. Catching it at profile selection turns a
+    late traceback into one sentence before anything is loaded.
+
+    Only the profile is refused, never a knob: an operator who wants the
+    lanes off keeps MTPLX_FRSPEC_DRAFT=0 and friends (the profile's keys are
+    in PROFILE_ENV_USER_OVERRIDE_KEYS), and every other profile is unaffected.
+    """
+
+    if not _full_stack_profile_selected(args):
+        return
+    generation_mode = str(getattr(args, "generation_mode", "") or "").strip().lower()
+    if generation_mode != "mtp":
+        raise ValueError(
+            f"--profile {FULL_STACK_PROFILE_NAME} requires --generation-mode mtp "
+            f"(got {generation_mode or 'unset'!r}): the profile arms the FR-Spec "
+            "draft head and compiled Qwen4 MTP preparation, which have no "
+            "meaning without native MTP and raise at model load. Use "
+            "--profile turbo for a non-MTP serve."
+        )
+    if getattr(args, "mtp_adapter", None):
+        raise ValueError(
+            f"--profile {FULL_STACK_PROFILE_NAME} does not accept --mtp-adapter: "
+            "compiled Qwen4 MTP preparation requires the native draft head and "
+            "raises at model load with an adapter installed. Use --profile turbo, "
+            "or drop the adapter."
+        )
+
+
 def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[str, Any]:
     """Print each engagement marker as satisfied/missing.
 
@@ -1604,11 +1660,17 @@ def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[st
     if not _full_stack_profile_selected(getattr(state, "args", None)):
         return {}
     try:
-        # Env level first: the profile stamps only the four keys nothing else
-        # sets, so the other 16 depend on the server's own auto-arm and its
-        # model predicates. A predicate that did not hold shows up here as an
-        # unarmed key, which is the thing that explains a missing lane below.
-        _safe_stdout_print(f"[full-stack] {phase} {stack_summary_line()}")
+        # Env level first, and only once: the profile stamps only the three
+        # keys nothing else sets, so the rest of the stack depends on the
+        # server's own auto-arm and its model predicates. A predicate that
+        # did not hold shows up here as an unarmed key, which is the thing
+        # that explains a missing lane below. The env cannot change between
+        # startup and post-warmup, so the re-run skips this line.
+        if phase == "startup":
+            _safe_stdout_print(
+                f"[full-stack] {phase} "
+                f"{stack_summary_line(shape=_serve_shape(state))}"
+            )
         statuses = markers_from_runtime(
             getattr(state, "runtime", None),
             draft_lm_head=getattr(state, "draft_lm_head", None),
@@ -2600,6 +2662,10 @@ class ServerState:
             getattr(args, "context_window", None),
         )
         self.profile = get_profile(args.profile)
+        # Before anything is loaded: this profile's own keys raise inside
+        # runtime.load on a non-MTP or adapter launch, and a traceback after
+        # the weights are mapped is a bad way to learn it.
+        _assert_full_stack_profile_is_servable(args)
         runtime_label = _health_runtime_mode_label(
             self.profile.name,
             getattr(args, "generation_mode", None),

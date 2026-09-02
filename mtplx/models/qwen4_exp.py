@@ -61,7 +61,7 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
-from mtplx.full_stack_env import flag_enabled
+from mtplx.full_stack_env import flag_enabled, flag_reader
 from mtplx.runtime_options import (
     FABLE_QSA_M4_ROWS,
     fable_hc_m4_enabled,
@@ -1344,6 +1344,8 @@ def _fuse_qsa_qkv_sanitize(model, out: dict) -> dict:
 def _fused_gate_up_enabled() -> bool:
     # Routed through the typed registry (mtplx/full_stack_env.py):
     # same parse, same default, one place that knows the key exists.
+    # Sanitize-time only (once per model), so the plain call is fine;
+    # the per-forward gates bind flag_reader instead.
     return flag_enabled("MTPLX_FUSED_GATE_UP")
 
 
@@ -1355,6 +1357,8 @@ def _fused_qsa_qkv_enabled() -> bool:
 def _fused_gdn_in_proj_enabled() -> bool:
     # Routed through the typed registry (mtplx/full_stack_env.py):
     # same parse, same default, one place that knows the key exists.
+    # Sanitize-time only (once per model), so the plain call is fine;
+    # the per-forward gates bind flag_reader instead.
     return flag_enabled("MTPLX_FUSED_GDN_INPROJ")
 
 
@@ -1363,28 +1367,40 @@ def _fused_gdn_out_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _fused_gdn_conv_norm_enabled() -> bool:
-    # Routed through the typed registry (mtplx/full_stack_env.py):
-    # same parse, same default, one place that knows the key exists.
-    return flag_enabled("MTPLX_FUSED_GDN_CONVNORM")
+#: GatedDeltaNet._fused_conv_norm_applies, per forward. Bound once at import via the typed registry so the gate
+#: costs what the bare expression cost -- flag_enabled() would add a
+#: frame and a registry lookup (+53 ns) to a per-forward read, i.e. a
+#: control-vs-candidate delta in a decode measurement. The env is
+#: still read on every call: an in-process A/B flips these between
+#: arms on an already-constructed module.
+_fused_gdn_conv_norm_enabled = flag_reader("MTPLX_FUSED_GDN_CONVNORM")
 
 
-def _fused_gdn_step_enabled() -> bool:
-    # Routed through the typed registry (mtplx/full_stack_env.py):
-    # same parse, same default, one place that knows the key exists.
-    return flag_enabled("MTPLX_FUSED_GDN_STEP")
+#: GatedDeltaNet._fused_step_applies, per forward. Bound once at import via the typed registry so the gate
+#: costs what the bare expression cost -- flag_enabled() would add a
+#: frame and a registry lookup (+53 ns) to a per-forward read, i.e. a
+#: control-vs-candidate delta in a decode measurement. The env is
+#: still read on every call: an in-process A/B flips these between
+#: arms on an already-constructed module.
+_fused_gdn_step_enabled = flag_reader("MTPLX_FUSED_GDN_STEP")
 
 
-def _fused_conv_norm_rows_enabled() -> bool:
-    # Routed through the typed registry (mtplx/full_stack_env.py):
-    # same parse, same default, one place that knows the key exists.
-    return flag_enabled("MTPLX_FUSED_CONVNORM_VERIFY")
+#: GatedDeltaNet._fused_conv_norm_rows_applies, per forward. Bound once at import via the typed registry so the gate
+#: costs what the bare expression cost -- flag_enabled() would add a
+#: frame and a registry lookup (+53 ns) to a per-forward read, i.e. a
+#: control-vs-candidate delta in a decode measurement. The env is
+#: still read on every call: an in-process A/B flips these between
+#: arms on an already-constructed module.
+_fused_conv_norm_rows_enabled = flag_reader("MTPLX_FUSED_CONVNORM_VERIFY")
 
 
-def _qsa_gather_enabled() -> bool:
-    # Routed through the typed registry (mtplx/full_stack_env.py):
-    # same parse, same default, one place that knows the key exists.
-    return flag_enabled("MTPLX_QSA_GATHER")
+#: QSAIndexer._select_eager/_compiled_mode/_call_rows, per forward. Bound once at import via the typed registry so the gate
+#: costs what the bare expression cost -- flag_enabled() would add a
+#: frame and a registry lookup (+53 ns) to a per-forward read, i.e. a
+#: control-vs-candidate delta in a decode measurement. The env is
+#: still read on every call: an in-process A/B flips these between
+#: arms on an already-constructed module.
+_qsa_gather_enabled = flag_reader("MTPLX_QSA_GATHER")
 
 
 def _qsa_gather_decode_enabled() -> bool:
@@ -1849,10 +1865,13 @@ def _fused_hc_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _fused_hc_v3_enabled() -> bool:
-    # Routed through the typed registry (mtplx/full_stack_env.py):
-    # same parse, same default, one place that knows the key exists.
-    return flag_enabled("MTPLX_FUSED_HC_V3")
+#: GatedResidual._v3_read_applies, per forward. Bound once at import via the typed registry so the gate
+#: costs what the bare expression cost -- flag_enabled() would add a
+#: frame and a registry lookup (+53 ns) to a per-forward read, i.e. a
+#: control-vs-candidate delta in a decode measurement. The env is
+#: still read on every call: an in-process A/B flips these between
+#: arms on an already-constructed module.
+_fused_hc_v3_enabled = flag_reader("MTPLX_FUSED_HC_V3")
 
 
 def _fused_moe_decode_enabled() -> bool:

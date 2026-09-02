@@ -51,11 +51,11 @@ The same reports are readable after boot at ``GET /health`` under
 
 These markers are the LANE level. The env level -- is each of the 20
 driver-stack keys armed, and by whom -- is
-``mtplx.full_stack_env.stack_summary_line``, which the server prints just
-above these lines. The two answer different questions: the profile stamps
-only the four keys nothing else sets, so a lane can be missing because the
-server's own auto-arm predicate did not match the served pack, and only the
-env line can say that.
+``mtplx.full_stack_env.stack_summary_line``, which the server prints once,
+just above these lines. The two answer different questions: the profile
+stamps only the three keys nothing else sets, so a lane can be missing
+because the server's own auto-arm predicate did not match the served pack,
+and only the env line can say that.
 
 Pure functions over plain dicts: the server passes what it has, nothing here
 touches MLX, the model, or the GPU.

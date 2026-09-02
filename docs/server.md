@@ -11,9 +11,9 @@ See [Concurrency modes](concurrency.md) for scheduler selection, ownership
 rules, and model/backend-specific implementations.
 
 On Qwen3.8 Flash-Next the fastest decode path is **opt-in**: the server arms
-16 of the 20 switches the in-process benchmark drivers use, but nothing sets
-the other four — FR-Spec among them. Select `--profile turbo-full-stack` for
-those, and see
+18 of the 21 switches the ABBA control arm uses, but nothing sets the other
+three — FR-Spec among them. Select `--profile turbo-full-stack` for those
+(it requires `--generation-mode mtp`), and see
 [Profiles](profiles.md#the-flash-next-fast-decode-path-is-opt-in-turbo-full-stack)
 for what it changes and how to confirm it engaged.
 

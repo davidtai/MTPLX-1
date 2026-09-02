@@ -16,6 +16,11 @@ from .full_stack_env import (
     FULL_STACK_PROFILE_NAME,
 )
 
+#: Named before PROFILE_ENV_USER_OVERRIDE_KEYS so the profile's own keys can
+#: be spliced into it: an operator export must beat this profile, exactly as
+#: it beats the server's auto-arm of the rest of the stack.
+_FULL_STACK_PROFILE_KEYS = tuple(FULL_STACK_PROFILE_ENV)
+
 ProfileName = str
 
 DEFAULT_PROFILE_NAME = "sustained"
@@ -94,6 +99,14 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         "MTPLX_DROP_EVENTS",
         "MTPLX_SKIP_VERIFY_SNAPSHOT",
         "MTPLX_FAMILY_CAPTURE_COMMIT",
+        # The turbo-full-stack profile's own keys (mtplx/full_stack_env.py).
+        # Operator-overridable for the same reason the server's auto-arm of
+        # the other stack keys steps aside for an explicit export: these are
+        # the A/B switches, and MTPLX_FRSPEC_DRAFT=0 in particular is the
+        # only kill switch for a lane whose installer RAISES on a contract
+        # miss. Without this entry the profile stomped the export and the
+        # operator had no way out but to stop using the profile.
+        *_FULL_STACK_PROFILE_KEYS,
     }
 )
 
@@ -869,80 +882,82 @@ TURBO_FULL_STACK_PROFILE = RuntimeProfile(
     name=FULL_STACK_PROFILE_NAME,
     runtime_profile="native_mtp_turbo_full_stack",
     summary=(
-        "Turbo plus the four Qwen3.8 Flash-Next decode switches the "
-        "in-process benchmark drivers arm and no server path sets: the "
-        "FR-Spec draft head and its 64k code vocabulary, compiled Qwen4 MTP "
-        "preparation, and relaxed Qwen4 draft ties. Opt-in: no default "
-        "changes, and no other profile is affected."
+        "Turbo plus the three Qwen3.8 Flash-Next decode switches the ABBA "
+        "control arm sets and no server path does: the FR-Spec draft head, "
+        "its 64k code vocabulary, and compiled Qwen4 MTP preparation. "
+        "Requires --generation-mode mtp and no MTP adapter. Opt-in: no "
+        "default changes, and no other profile is affected."
     ),
     env=_merge_env(
         TURBO_PROFILE.env_dict(),
-        # EXACTLY the gap, and nothing else. The rest of the driver stack is
-        # already armed by _server_runtime_env_overrides in
+        # EXACTLY the gap, and nothing else. See mtplx/full_stack_env.py for
+        # the per-key ownership table; the rest of the 21-key control stack is
+        # already supplied by _server_runtime_env_overrides in
         # mtplx/server/openai.py for the served pack:
         #
-        #   15 keys  server auto-arm  (`if os.environ.get(key) is None:
-        #            setdefault`, predicates _served_model_type_is_qwen4_exp
-        #            / _served_model_is_qwen4_fixed_m4) -- AR_PIPELINE,
-        #            COMPILED_GDN, FAMILY_CAPTURE_COMMIT, FUSED_HC_V3,
-        #            FUSED_GDN_INPROJ, FUSED_GATE_UP, FUSED_GDN_CONVNORM,
-        #            FUSED_GDN_STEP, FUSED_CONVNORM_VERIFY, QSA_GATHER,
-        #            BATCH_TARGET_ARRAYS=1, LAZY_TARGET_DISTRIBUTIONS=0,
-        #            QWEN4_FIXED_M4_VERIFY, QWEN4_M4_STAGE3,
-        #            QSA_M4_FUSED_KV_GATHER
-        #    1 key   server FORCED    SKIP_VERIFY_SNAPSHOT=0 (plain
-        #            assignment for mtp on this family)
+        #   17 keys  server auto-arm (`if os.environ.get(key) is None:
+        #            setdefault`, predicates _served_model_type_is_qwen4_exp /
+        #            _served_model_is_qwen4_fixed_m4)
+        #    1 key   server FORCED   SKIP_VERIFY_SNAPSHOT=0 (plain assignment
+        #            for mtp on this family)
         #
         # Restating those here would be worse than redundant. Server
         # overrides are applied AFTER the profile env, so the value would not
-        # change -- but a profile-owned key STOMPS an operator's explicit
-        # export (apply_profile_env only yields on
-        # PROFILE_ENV_USER_OVERRIDE_KEYS), while the server's auto-arm
-        # deliberately steps aside for one. Putting them in the profile would
-        # take the A/B switch away from the operator on exactly the keys the
-        # server chose to leave them.
+        # change -- but a profile-owned key stomps an operator's explicit
+        # export unless it is in PROFILE_ENV_USER_OVERRIDE_KEYS, while the
+        # server's auto-arm deliberately steps aside for one. Putting them in
+        # the profile would take the A/B switch away from the operator on
+        # exactly the keys the server chose to leave them.
         #
-        # That also means this profile has NO turbo conflicts of its own.
-        # The three keys where turbo and the drivers disagree --
+        # This profile's own three keys ARE in
+        # PROFILE_ENV_USER_OVERRIDE_KEYS, for the same reason: an operator
+        # export must beat the profile. MTPLX_FRSPEC_DRAFT=0 in particular is
+        # the only kill switch for a lane whose installer raises rather than
+        # falling back.
+        #
+        # That also means this profile has NO turbo conflicts of its own. The
+        # three keys where turbo and the control arm disagree --
         # BATCH_TARGET_ARRAYS (turbo 0), LAZY_TARGET_DISTRIBUTIONS (turbo 1)
-        # and SKIP_VERIFY_SNAPSHOT (turbo 1) -- are already resolved
-        # driver-wins by the server for a qwen4_exp mtp serve, under turbo
-        # too. The startup stack line reports whether that actually happened
-        # rather than assuming it.
-        #
-        # Two driver keys are deliberately absent from the stack entirely,
-        # matching FULL_STACK_ENV in scripts/fable/server_cell_bench.py:
-        # MTPLX_COMPILED_VERIFY (turbo's "1" covers the driver's default
-        # "on") and MTPLX_NAX_VERIFY (the driver defaults it to 0 and the
-        # server already forces 0 on qwen4_exp).
+        # and SKIP_VERIFY_SNAPSHOT (turbo 1) -- plus NAX_VERIFY (turbo 1,
+        # control 0) are all already resolved control-wins by the server for a
+        # qwen4_exp mtp serve, under turbo too. The startup stack line reports
+        # whether that actually happened rather than assuming it.
         FULL_STACK_PROFILE_ENV,
     ),
     caveats=(
         "Opt-in only. Nothing selects this profile automatically: turbo "
         "stays the flagship default and its env is unchanged.",
-        "It adds exactly four keys to turbo -- MTPLX_FRSPEC_DRAFT, "
-        "MTPLX_FRSPEC_VOCAB, MTPLX_QWEN4_COMPILED_MTP_PREPARE and "
-        "MTPLX_QWEN4_RELAXED_DRAFT_TIES -- because those are the only ones "
-        "of the driver stack that no server path sets. The other 16 are "
-        "armed by mtplx/server/openai.py for a qwen4_exp / fixed-M4 pack, "
-        "and this profile deliberately does not restate them so an operator "
-        "export keeps beating them.",
+        "REQUIRES --generation-mode mtp and no --mtp-adapter. Both of its "
+        "Qwen4 lanes raise inside runtime.load otherwise (compiled MTP "
+        "preparation needs the native draft head; FR-Spec's installer raises "
+        "rather than falling back), so the server refuses the profile at "
+        "selection with that reason instead of failing after the weights are "
+        "mapped. Use turbo for a non-MTP or adapter serve.",
+        "It adds exactly three keys to turbo -- MTPLX_FRSPEC_DRAFT, "
+        "MTPLX_FRSPEC_VOCAB and MTPLX_QWEN4_COMPILED_MTP_PREPARE -- because "
+        "those are the only ones of the ABBA control stack that no server "
+        "path sets. All three are operator-overridable: exporting "
+        "MTPLX_FRSPEC_DRAFT=0 turns the lane off and the profile announces "
+        "that the operator won.",
+        "MTPLX_QWEN4_RELAXED_DRAFT_TIES is deliberately NOT included: "
+        "--relaxed-draft-ties is absent from abba_window.CONTROL_FLAGS and "
+        "--compiled-mtp-prepare does not imply it, so the control arm never "
+        "measured it.",
         "Scoped to the Qwen3.8 Flash-Next (qwen4_exp) family. The server's "
         "auto-arm is predicated on the served config, so on any other model "
-        "this profile arms FR-Spec and the two Qwen4 keys and nothing else "
-        "-- and MTPLX_FRSPEC_DRAFT is family-agnostic and RAISES at load if "
-        "the FR-Spec head cannot install. Do not select it for another "
-        "model.",
-        "Selecting it turns on a startup self-check: one line saying how "
-        "many of the 20 driver-stack keys are armed and by whom (so a "
-        "server predicate that did not hold is visible), then one "
-        "satisfied/missing line per engagement receipt -- the FR-Spec "
-        "install report (expects n=65536 from builtin:qwen38-code-64k), the "
-        "runtime's [qwen4-fixed-M4-verify], [qwen4-M4-stage3] and "
-        "[qwen4-compiled-MTP-prepare] install reports, and the background "
-        "warmup ladder. Those receipts are printed to stderr at install "
-        "time on every profile, and the reports are readable at GET /health "
-        "under engagement_reports.",
+        "this profile arms FR-Spec and one Qwen4 key and nothing else -- and "
+        "MTPLX_FRSPEC_DRAFT is family-agnostic and raises at load if the "
+        "FR-Spec head cannot install. Do not select it for another model.",
+        "Selecting it turns on a startup self-check: one line saying how many "
+        "of the 21 control-stack keys are armed, by whom, and against which "
+        "serve shape (so a server predicate that did not hold is visible), "
+        "then one satisfied/missing line per engagement receipt -- the "
+        "FR-Spec install report (expects n=65536 from "
+        "builtin:qwen38-code-64k), the runtime's [qwen4-fixed-M4-verify], "
+        "[qwen4-M4-stage3] and [qwen4-compiled-MTP-prepare] install reports, "
+        "and the background warmup ladder. Those receipts are printed to "
+        "stderr at install time on every profile, and the reports are "
+        "readable at GET /health under engagement_reports.",
         "Same verify-kernel exactness caveats as turbo; additionally the "
         "fused GDN/MoE/hyper-connection lanes and the QSA rows-gather are "
         "self-fenced and bail to the stock chain on any contract miss.",
@@ -1008,7 +1023,6 @@ PROFILE_ALIASES = {
     "full-stack": FULL_STACK_PROFILE_NAME,
     "full_stack": FULL_STACK_PROFILE_NAME,
     "turbo_full_stack": FULL_STACK_PROFILE_NAME,
-    "native_mtp_turbo_full_stack": FULL_STACK_PROFILE_NAME,
 }
 
 

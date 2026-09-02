@@ -2,13 +2,47 @@
 
 Why this module exists
 ----------------------
-The in-process benchmark drivers (``scripts/fable/abba_driver.py`` and the
-bench-tune drivers) arm a stack of decode switches. ``mtplx serve`` reaches
-most of them on its own -- ``mtplx/server/openai.py`` auto-arms them for the
-served pack -- but not all, and the ones it misses are env-gated and
-default-off, so they simply do not happen. The visible symptom is
-``[frspec] disabled (MTPLX_FRSPEC_DRAFT=None)`` in the server log while the
+The in-process benchmark drivers arm a stack of decode switches. ``mtplx
+serve`` reaches most of them on its own -- ``mtplx/server/openai.py``
+auto-arms them for the served pack -- but not all, and the ones it misses are
+env-gated and default-off, so they simply do not happen. The visible symptom
+is ``[frspec] disabled (MTPLX_FRSPEC_DRAFT=None)`` in the server log while the
 same code measures faster in-process.
+
+Where the reference stack comes from
+------------------------------------
+:data:`FULL_STACK_KEYS` is the RETAINED-STACK CONTROL ARM -- the configuration
+every ABBA window measures its candidate against, i.e. exactly one invocation
+of ``scripts/fable/abba_driver.py`` carrying
+``scripts/fable/abba_window.py:CONTROL_FLAGS``::
+
+    python scripts/fable/abba_driver.py \
+        --label <arm> --sequence <n> --seed <s> \
+        --receipt-path <path> --guard-mode window \
+        --target-mode batched --require-compiled-verify --m4-stage3 \
+        --qsa-fused-kv-gather --full-frspec --compiled-mtp-prepare \
+        --max-tokens 1024
+
+which resolves to ``build_family_overrides(args)`` (19 keys) plus the
+``--full-frspec`` block at ``abba_driver.py:1717-1733`` (2 keys) = the 21 keys
+below. ``tests/test_full_stack_profile.py`` imports both modules -- they are
+pure Python, no MLX -- parses that argv with the driver's own parser and
+asserts equality, so the reference has two real sides rather than a copied
+literal.
+
+Two consequences of deriving it from the real control arm rather than from a
+transcribed block:
+
+* ``MTPLX_QWEN4_RELAXED_DRAFT_TIES`` is NOT in it. ``--relaxed-draft-ties`` is
+  absent from ``CONTROL_FLAGS`` and ``--compiled-mtp-prepare`` does not imply
+  it (``args.relaxed_draft_ties`` is False for this invocation), so it is a
+  CANDIDATE-arm flag, never part of the measured control. An earlier draft of
+  this registry carried it; shipping it would have armed a lane the control
+  never measured.
+* ``MTPLX_COMPILED_VERIFY=on`` and ``MTPLX_NAX_VERIFY=0`` ARE in it. Both are
+  already supplied by the server for this family, so neither changes what the
+  profile stamps -- but leaving them out understated the stack the check is
+  against.
 
 The second half of the problem is spelling. Most of these keys are read by a
 bare ``os.environ.get(name, default)`` at one call site, so a misspelled key
@@ -19,13 +53,18 @@ So this module is the ONE place that names each key of the stack, its type,
 the value a reader sees when it is unset, the call site that reads it, and --
 critically -- **who sets it**. Four things hang off that:
 
-* :data:`FULL_STACK_PROFILE_ENV`, the keys the ``turbo-full-stack`` profile
-  stamps: exactly the ones nothing else sets. The profile does not restate a
+* :data:`FULL_STACK_PROFILE_ENV`, the three keys the ``turbo-full-stack``
+  profile stamps: exactly the ones nothing else sets. The profile does not
+  restate a
   key the server already arms, because restating it would also STOMP an
-  operator's explicit export (a profile-owned key beats the environment,
-  while the server's auto-arm deliberately yields to it);
-* :data:`FULL_STACK_RESTACK_ENV`, the full 20-key driver block, kept as the
-  reference the whole stack is checked against;
+  operator's explicit export (a profile-owned key beats the environment
+  unless it is in ``PROFILE_ENV_USER_OVERRIDE_KEYS``, while the server's
+  auto-arm deliberately yields to one). The profile's own three keys ARE in
+  that set, so an operator export still beats them -- ``MTPLX_FRSPEC_DRAFT=0``
+  is the kill switch for a lane whose installer raises rather than falling
+  back;
+* :data:`FULL_STACK_RESTACK_ENV`, the full 21-key control-arm block, kept as
+  the reference the whole stack is checked against;
 * :func:`resolved_stack`, which answers "is the stack actually armed, and by
   whom" against a live environment; and
 * :func:`warn_unknown_family_keys`, which says at startup that an
@@ -60,9 +99,12 @@ to the byte. Each entry records the parse its call site actually performs
 ``strict``           ``mtplx.runtime_options.env_bool`` (raises on an unknown
                      spelling; accepts ``enable``/``enabled``)
 ``text``             the raw string, read with :func:`text_value`
+``mode``             a multi-valued string knob, compared on its resolved
+                     mode rather than its spelling (``MTPLX_COMPILED_VERIFY``
+                     reads ``1`` and ``on`` as the same mode)
 
-``tests/test_full_stack_env.py`` pins each routed key's parse against the
-expression the call site used before it was routed.
+``tests/test_full_stack_profile.py`` pins EVERY routed key's parse against
+the expression its call site used before it was routed.
 """
 
 from __future__ import annotations
@@ -87,7 +129,7 @@ FAMILY_PREFIXES = ("MTPLX_QWEN4_", "MTPLX_QSA_", "MTPLX_FRSPEC_")
 #: the single place the stack is described.
 FULL_STACK_PROFILE_NAME = "turbo-full-stack"
 
-PARSE_KINDS = ("lenient", "lenient_nostrip", "strict", "text")
+PARSE_KINDS = ("lenient", "lenient_nostrip", "strict", "text", "mode")
 
 #: Nothing sets it. Serving gets the reader's own unset default.
 OWNER_DEFAULT = "default"
@@ -126,14 +168,18 @@ class EnvKeySpec:
     reader: str
     note: str
     routed: bool = False
+    #: Part of the measured control arm. A key can be registered (so its
+    #: reads are typed and it is a known spelling) without being part of the
+    #: stack the self-check scores -- see MTPLX_QWEN4_RELAXED_DRAFT_TIES.
+    in_stack: bool = True
 
     def __post_init__(self) -> None:
         if self.kind not in ("bool", "str"):
             raise ValueError(f"{self.name}: kind must be 'bool' or 'str'")
         if self.parse not in PARSE_KINDS:
             raise ValueError(f"{self.name}: parse must be one of {PARSE_KINDS}")
-        if self.kind == "str" and self.parse != "text":
-            raise ValueError(f"{self.name}: str keys must use parse='text'")
+        if self.kind == "str" and self.parse not in ("text", "mode"):
+            raise ValueError(f"{self.name}: str keys must use parse='text'/'mode'")
         if self.owner not in OWNERS:
             raise ValueError(f"{self.name}: owner must be one of {OWNERS}")
         if not self.reader.strip():
@@ -159,7 +205,7 @@ _NOBODY = "nobody"
 #: ``FULL_STACK_ENV`` lists it (which is the order the ABBA driver's
 #: ``build_family_overrides`` builds it in). Ownership verified against
 #: mtplx/server/openai.py:730-890 on 2026-09-02.
-FULL_STACK_KEYS: tuple[EnvKeySpec, ...] = (
+REGISTERED_KEYS: tuple[EnvKeySpec, ...] = (
     EnvKeySpec(
         name="MTPLX_QWEN4_FIXED_M4_VERIFY",
         kind="bool",
@@ -443,26 +489,71 @@ FULL_STACK_KEYS: tuple[EnvKeySpec, ...] = (
         routed=True,
     ),
     EnvKeySpec(
+        name="MTPLX_COMPILED_VERIFY",
+        kind="str",
+        parse="mode",
+        default="",
+        stack_value="on",
+        owner=OWNER_SERVER_AUTO,
+        owner_site=_SERVER,
+        owner_predicate=_FIXED_M4,
+        reader="mtplx/graphbank.py:_compiled_verify_mode",
+        note=(
+            "Compiled verify. The control arm sets the string 'on' and turbo "
+            "sets '1'; graphbank resolves anything outside "
+            "{'', 0, false, no, off, parity, parity2} to the SAME 'on' mode, "
+            "so the two spellings agree and this key is compared on the "
+            "resolved mode, not the literal."
+        ),
+    ),
+    EnvKeySpec(
+        name="MTPLX_NAX_VERIFY",
+        kind="bool",
+        parse="lenient",
+        default="",
+        stack_value="0",
+        owner=OWNER_SERVER_AUTO,
+        owner_site=_SERVER,
+        owner_predicate=_QWEN4_EXP,
+        reader="mtplx/nax_verify.py:nax_verify_enabled",
+        note=(
+            "27B NAX verify patch. Turbo sets 1; the control arm and the "
+            "server's family override both set 0 (unmeasured and mostly "
+            "bypassed on this family), and the server's override is applied "
+            "after the profile env, so turbo already resolves to 0 here."
+        ),
+    ),
+    # --- registered, but NOT part of the measured control arm -------------
+    EnvKeySpec(
         name="MTPLX_QWEN4_RELAXED_DRAFT_TIES",
         kind="bool",
         parse="lenient",
         default="",
-        stack_value="1",
-        owner=OWNER_PROFILE,
-        owner_site=_PROFILE_SITE,
-        owner_predicate="profile selected",
+        stack_value="0",
+        owner=OWNER_DEFAULT,
+        owner_site=_NOBODY,
+        owner_predicate="never armed by default",
         reader="mtplx/runtime.py:load",
         note=(
-            "Relaxed Qwen4 draft ties (driver flag: --relaxed-draft-ties). "
-            "GAP: no server path sets it."
+            "Relaxed Qwen4 draft ties. Registered so its read is typed and "
+            "its spelling is known, but NOT in the stack: "
+            "--relaxed-draft-ties is absent from abba_window.CONTROL_FLAGS "
+            "and --compiled-mtp-prepare does not imply it, so the control "
+            "arm never measured it. It stays a candidate-arm flag."
         ),
         routed=True,
+        in_stack=False,
     ),
 )
 
-_BY_NAME: dict[str, EnvKeySpec] = {spec.name: spec for spec in FULL_STACK_KEYS}
+#: The measured control arm, in registry order.
+FULL_STACK_KEYS: tuple[EnvKeySpec, ...] = tuple(
+    entry for entry in REGISTERED_KEYS if entry.in_stack
+)
 
-if len(_BY_NAME) != len(FULL_STACK_KEYS):  # pragma: no cover - construction check
+_BY_NAME: dict[str, EnvKeySpec] = {spec.name: spec for spec in REGISTERED_KEYS}
+
+if len(_BY_NAME) != len(REGISTERED_KEYS):  # pragma: no cover - construction check
     raise RuntimeError("full-stack env registry has duplicate key names")
 
 #: The complete driver stack: what a fully armed serve must resolve to,
@@ -550,6 +641,56 @@ def flag_enabled(name: str, *, env: Mapping[str, str] | None = None) -> bool:
     return str(source.get(name) or entry.default).strip().lower() in TRUE_TOKENS
 
 
+def flag_reader(name: str) -> Callable[[], bool]:
+    """A zero-overhead per-call reader for a HOT-PATH gate.
+
+    :func:`flag_enabled` is the right call almost everywhere, but it costs an
+    extra stack frame plus a registry lookup and a parse branch per call --
+    measured +53 ns (206 vs 153) against the bare expression it replaced,
+    which is ~0.08% of a token across 48 layers x 4 per-forward reads. That is
+    small, but it is a control-vs-candidate delta in a decode measurement, and
+    a measurement tool must not move the thing it measures.
+
+    So the per-forward gates bind this instead: the key, the default and the
+    token set are baked in at import, and the closure body is the same work
+    the original in-line expression did, in the same single frame.
+
+    The env is still read on EVERY call, deliberately. These gates live on
+    modules that are constructed once and then A/B'd by flipping the env
+    between arms in one process (tests/test_gdn_step_fused.py and friends do
+    exactly that on a shared fixture), so caching at construction -- the
+    pattern Qwen4ExpTextModel.__init__ uses for MTPLX_COMPILED_GDN, which is
+    read once per model -- would silently change that behaviour.
+    """
+
+    entry = _require(name)
+    if entry.kind != "bool":
+        raise TypeError(f"{name} is a {entry.kind} key; use text_value()")
+    default = entry.default
+    tokens = TRUE_TOKENS
+    environ = os.environ  # the mapping itself: setenv/delenv mutate in place
+
+    if entry.parse == "lenient":
+
+        def _read() -> bool:
+            return str(environ.get(name) or default).strip().lower() in tokens
+
+    elif entry.parse == "lenient_nostrip":
+
+        def _read() -> bool:
+            return str(environ.get(name, default)).lower() in tokens
+
+    else:  # "strict" -- keep the raising parse, no fast path worth the risk
+
+        def _read() -> bool:
+            return flag_enabled(name)
+
+    _read.__name__ = f"read_{name.lower()}"
+    _read.__qualname__ = _read.__name__
+    _read.__doc__ = f"Read {name} exactly as {entry.reader} always did."
+    return _read
+
+
 def text_value(name: str, *, env: Mapping[str, str] | None = None) -> str:
     """Read a registered string key, stripped, falling back to its default."""
 
@@ -558,25 +699,59 @@ def text_value(name: str, *, env: Mapping[str, str] | None = None) -> str:
     return str(source.get(name) or entry.default).strip()
 
 
+#: ``mtplx/graphbank.py:_compiled_verify_mode`` off-spellings. Mirrored here
+#: so this module compares the resolved mode, not the literal, without
+#: importing graphbank (which pulls MLX).
+_MODE_OFF_TOKENS = frozenset({"", "0", "false", "no", "off"})
+_MODE_NAMED = frozenset({"parity", "parity2"})
+
+
+def resolved_mode(name: str, *, env: Mapping[str, str] | None = None) -> str:
+    """Resolve a ``parse="mode"`` key the way its reader does."""
+
+    entry = _require(name)
+    if entry.parse != "mode":
+        raise TypeError(f"{name} is not a mode key")
+    source = os.environ if env is None else env
+    raw = str(source.get(name) or entry.default).strip().lower()
+    if raw in _MODE_OFF_TOKENS:
+        return "off"
+    if raw in _MODE_NAMED:
+        return raw
+    return "on"
+
+
 def resolved_stack(env: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Is the whole driver stack armed in ``env``, and who was responsible?
 
     One row per key: the value the stack needs, the value present, whether
-    they agree, and the owner that was supposed to supply it. Comparison is
-    on the PARSED value for booleans, so ``"true"`` and ``"1"`` agree.
+    the runtime will behave as the stack requires, and who was supposed to
+    supply it. Comparison is on the PARSED value, so ``"true"`` and ``"1"``
+    agree and ``MTPLX_COMPILED_VERIFY`` reads ``1`` and ``on`` as one mode.
+
+    ``present``/``supplied_by`` are reported separately from ``ok`` because a
+    want-"0" key (LAZY_TARGET_DISTRIBUTIONS, NAX_VERIFY, SKIP_VERIFY_SNAPSHOT)
+    also reads as satisfied when it is simply ABSENT and the reader's own
+    default happens to match. That is a real distinction: nobody armed it, so
+    nothing holds it there if a default or a launcher lane later moves.
     """
 
     source = os.environ if env is None else env
     rows: list[dict[str, Any]] = []
     for entry in FULL_STACK_KEYS:
         observed = source.get(entry.name)
-        if entry.kind == "bool":
+        present = bool(str(observed or "").strip())
+        if entry.parse == "mode":
+            wanted_mode = entry.stack_value.strip().lower()
+            ok = resolved_mode(entry.name, env=source) == (
+                wanted_mode if wanted_mode not in _MODE_OFF_TOKENS else "off"
+            )
+        elif entry.kind == "bool":
             try:
                 actual = flag_enabled(entry.name, env=source)
             except ValueError:  # an unparseable operator spelling
                 actual = None
-            wanted = entry.stack_value.strip().lower() in TRUE_TOKENS
-            ok = actual is wanted
+            ok = actual is (entry.stack_value.strip().lower() in TRUE_TOKENS)
         else:
             ok = text_value(entry.name, env=source) == entry.stack_value
         rows.append(
@@ -584,7 +759,9 @@ def resolved_stack(env: Mapping[str, str] | None = None) -> list[dict[str, Any]]
                 "name": entry.name,
                 "wanted": entry.stack_value,
                 "observed": observed,
+                "present": present,
                 "ok": bool(ok),
+                "supplied_by": entry.owner if present else "reader default",
                 "owner": entry.owner,
                 "owner_predicate": entry.owner_predicate,
             }
@@ -592,31 +769,41 @@ def resolved_stack(env: Mapping[str, str] | None = None) -> list[dict[str, Any]]
     return rows
 
 
-def stack_summary_line(env: Mapping[str, str] | None = None) -> str:
+def stack_summary_line(
+    env: Mapping[str, str] | None = None,
+    *,
+    shape: str | None = None,
+) -> str:
     """One line saying how much of the driver stack is armed, and by whom.
 
     Not a receipt for any lane -- the lanes have their own install reports
     (see mtplx/full_stack_selfcheck.py). This is the env-level answer, which
     is the one that explains a missing lane: a key the server's auto-arm
     skipped because its model predicate did not hold reads as unarmed here.
+    ``shape`` is the serve shape the caller knows and this module does not
+    (generation mode, model family), so a partial stack can be read against
+    the predicates that produced it.
     """
 
     rows = resolved_stack(env)
     missing = [row for row in rows if not row["ok"]]
-    by_owner: dict[str, int] = {}
+    by_source: dict[str, int] = {}
     for row in rows:
         if row["ok"]:
-            by_owner[row["owner"]] = by_owner.get(row["owner"], 0) + 1
-    supplied = ", ".join(f"{owner} {count}" for owner, count in sorted(by_owner.items()))
+            key = row["supplied_by"]
+            by_source[key] = by_source.get(key, 0) + 1
+    supplied = ", ".join(f"{name} {count}" for name, count in sorted(by_source.items()))
     head = f"{len(rows) - len(missing)}/{len(rows)} driver-stack keys armed"
+    if shape:
+        head = f"{head} ({shape})"
     if not missing:
-        return f"{head} ({supplied})"
+        return f"{head} [{supplied}]"
     detail = ", ".join(
         f"{row['name']}={row['observed']!r} want {row['wanted']!r} "
         f"[{row['owner']}: {row['owner_predicate']}]"
         for row in missing
     )
-    return f"{head} ({supplied}); NOT armed: {detail}"
+    return f"{head} [{supplied}]; NOT armed: {detail}"
 
 
 def known_family_keys() -> frozenset[str]:
@@ -722,9 +909,10 @@ def registry_rows() -> list[dict[str, object]]:
             "owner_predicate": entry.owner_predicate,
             "reader": entry.reader,
             "routed": entry.routed,
+            "in_stack": entry.in_stack,
             "note": entry.note,
         }
-        for entry in FULL_STACK_KEYS
+        for entry in REGISTERED_KEYS
     ]
 
 
@@ -732,6 +920,7 @@ __all__ = [
     "EnvKeySpec",
     "FAMILY_PREFIXES",
     "FULL_STACK_KEYS",
+    "REGISTERED_KEYS",
     "FULL_STACK_PROFILE_ENV",
     "FULL_STACK_PROFILE_NAME",
     "FULL_STACK_RESTACK_ENV",
@@ -743,10 +932,12 @@ __all__ = [
     "OWNER_SERVER_FORCED",
     "TRUE_TOKENS",
     "flag_enabled",
+    "flag_reader",
     "keys_owned_by",
     "known_family_keys",
     "registered_names",
     "registry_rows",
+    "resolved_mode",
     "resolved_stack",
     "spec",
     "stack_summary_line",

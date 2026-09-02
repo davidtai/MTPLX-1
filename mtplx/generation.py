@@ -5627,7 +5627,15 @@ def _make_device_draft_core(
     frspec_text = getattr(rt.model, "language_model", rt.model)
     frspec_head = getattr(frspec_text, "_mtplx_frspec_draft_head", None)
     if frspec_head is None:
-        if os.environ.get("MTPLX_FRSPEC_DRAFT"):
+        # Routed through the typed registry rather than left as a bare
+        # truthy read: `MTPLX_FRSPEC_DRAFT=0` is the operator kill switch
+        # (it is in PROFILE_ENV_USER_OVERRIDE_KEYS), and a bare read treats
+        # "0" as "asked for" -- so turning frspec OFF would have printed
+        # "core swap NOT engaged" on every draft-core build. Now the
+        # diagnostic fires only when frspec was actually requested.
+        from .full_stack_env import flag_enabled as _frspec_requested
+
+        if _frspec_requested("MTPLX_FRSPEC_DRAFT"):
             print(
                 "[frspec] core swap NOT engaged: no _mtplx_frspec_draft_head "
                 f"stamp on {type(frspec_text).__name__}",
