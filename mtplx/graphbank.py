@@ -57,6 +57,19 @@ def _fixed_m4_materialized_window_prefetch(
     """Construction-bound no-op for inline fixed-M4 window preparation."""
 
 
+def _fixed_m4_no_candidate_prefetch(
+    *,
+    prefix_tokens,
+    candidate_ids,
+    completion_tokens,
+    committed_count,
+) -> int:
+    """Construction-bound no-op when the K-P1 candidate lane is unarmed."""
+
+    del prefix_tokens, candidate_ids, completion_tokens, committed_count
+    return 0
+
+
 def _format_compiled_verify_key(key) -> str:
     """Render the generic or fixed-M4 compiled graph key for receipts."""
 
@@ -2102,11 +2115,22 @@ class CompiledVerifyBank:
         prefetch_window_aux = _fixed_m4_materialized_window_prefetch
         if getattr(prepare_aux, "_prefetch_window_rows", None) is not None:
             prefetch_window_aux = prepare_aux.prefetch_window
+        # MTPLX_FABLE_PLE_CANDIDATE_PREFETCH (default off): a bound `submit`
+        # when the aux armed the lane, the no-op above otherwise.  Resolved
+        # once here so the draft loop's hook is a plain call with no flag read
+        # and no attribute walk per depth.
+        candidate_prefetch = getattr(prepare_aux, "candidate_prefetch", None)
+        submit_candidates_aux = (
+            _fixed_m4_no_candidate_prefetch
+            if candidate_prefetch is None
+            else candidate_prefetch.submit
+        )
         self._fixed_m4_dispatch = {
             "fn": fn,
             "prepare_aux": prepare_aux,
             "prefetch_aux": prefetch_aux,
             "prefetch_window_aux": prefetch_window_aux,
+            "submit_candidates_aux": submit_candidates_aux,
             "state_plan": state_plan,
             "state_leaves": sum(n for _kind, _entry, n in state_plan),
             "capture_plan": tuple(capture_plan),
@@ -2269,6 +2293,27 @@ class CompiledVerifyBank:
             host_input_ids,
             completion_tokens,
             committed_count,
+        )
+
+    def submit_fixed_m4_candidates(
+        self,
+        *,
+        prefix_tokens,
+        candidate_ids,
+        completion_tokens,
+        committed_count: int,
+    ) -> int:
+        """Queue one window position's candidate PLE rows (K-P1).
+
+        A no-op returning 0 unless ``MTPLX_FABLE_PLE_CANDIDATE_PREFETCH``
+        armed the lane at aux construction.
+        """
+
+        return self._fixed_m4_dispatch["submit_candidates_aux"](
+            prefix_tokens=prefix_tokens,
+            candidate_ids=candidate_ids,
+            completion_tokens=completion_tokens,
+            committed_count=committed_count,
         )
 
     def _transition_fixed_m4_generation(

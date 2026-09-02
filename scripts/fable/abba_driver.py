@@ -628,6 +628,47 @@ def _ple_first_gather_early_status() -> dict[str, Any]:
         return {}
 
 
+def _ple_candidate_prefetch_armed() -> bool:
+    """Whether MTPLX_FABLE_PLE_CANDIDATE_PREFETCH was set in THIS process.
+
+    Same reason as the two lanes above: the flag rides
+    ``--candidate-extra-env``, which ``candidate_environment`` does not carry,
+    so without this a receipt could show an inert lane with no sign that the
+    lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.ple_candidate_prefetch import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _ple_candidate_prefetch_receipt() -> dict[str, float]:
+    """K-P1 engagement: what the candidate row buffer actually served.
+
+    ``hits`` / ``misses`` count WINDOWS (one verify each), not rows:
+    ``resolve`` is all-or-nothing, so a window with one uncovered row takes
+    the shipped gather whole.  ``rows_served`` / ``rows_missing`` are the row
+    detail behind that.  ``worker_wait_ms`` is the owner thread's time blocked
+    joining the workers -- if that is not far below the gather it replaced,
+    the lane bought nothing and the receipt says so.
+    """
+
+    try:
+        from mtplx.ple_candidate_prefetch import last_receipt
+
+        return last_receipt()
+    except Exception:
+        return {}
+
+
 def prefill_chunks_receipt() -> list[dict[str, float]]:
     """Per-chunk prefill wall and PLE-gather seconds, on BOTH arms.
 
@@ -695,6 +736,8 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "prefill_lookahead_scope": _ple_prefill_lookahead_scope_status(),
             "ple_first_gather_early": _ple_first_gather_early_status(),
             "ple_first_gather_early_armed": _ple_first_gather_early_armed(),
+            "ple_candidate_prefetch": _ple_candidate_prefetch_receipt(),
+            "ple_candidate_prefetch_armed": _ple_candidate_prefetch_armed(),
             # Which gather path each big row read actually took.  The pread
             # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
             # fancy index behind it, so an arm that claims the vectorised lane

@@ -359,6 +359,12 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # rows during this chunk's forward.  Default off; the gathers it
         # overlaps are 8 host-late stalls totalling 2,313 ms in the census.
         "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD",
+        # K-P1: worker-thread gather of the 16 PLE rows for each of a draft
+        # depth's 20 K20 candidates, while the GPU runs the next depth, so the
+        # sampled token's rows are already in a host buffer when the fixed-M4
+        # verify assembles its auxiliary.  Bytes identical (rows are a pure
+        # function of token ids); default off.
+        "MTPLX_FABLE_PLE_CANDIDATE_PREFETCH",
         # Fable 16K candidate: compare the crossover against the chunk's own
         # total_tokens instead of total_tokens - rows, so the 8 x 2,048 cut of
         # a 16,384-token prompt can reach the sparse lane at all.  Default off;
