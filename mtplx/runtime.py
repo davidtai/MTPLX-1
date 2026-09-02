@@ -24,6 +24,7 @@ from .artifacts import (
     text_config,
 )
 from .backends.registry import ARCHITECTURE_DECLARED_MODULES
+from .fable_indexer_reuse import draft_depth_scope
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -414,7 +415,12 @@ class MTPLXRuntime:
         resolved_concat_order = (
             self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
         )
-        with mtp_adapter_depth(self.model, mtp_depth):
+        # `mtp_depth` is the chain position this call occupies, and this is the
+        # only place that knows it: `model.mtp_forward` does not take it on
+        # this architecture (see fable_compiled_draft._require_inert_mtp_depth).
+        # MTPLX_FABLE_INDEXER_REUSE needs it to tell the cycle's anchoring
+        # depth-1 draft from the depths that may reuse that anchor.
+        with mtp_adapter_depth(self.model, mtp_depth), draft_depth_scope(mtp_depth):
             kwargs = {
                 "mtp_cache": mtp_cache,
                 "concat_order": resolved_concat_order,

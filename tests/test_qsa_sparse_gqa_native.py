@@ -409,3 +409,47 @@ def test_every_declared_cell_has_a_causal_suffix():
         assert rows <= total, name
         assert (total - rows) >= 0, name
         assert total // RATIO > TOP_K, f"{name} never crosses the sparse boundary"
+
+
+# ---------------------------------------------------------------------------
+# 3. the seam with W51's depth-scoped indexer reuse (row K-D2)
+# ---------------------------------------------------------------------------
+# Both lanes read one `_select_eager`.  W51 can substitute `top_idx` from a
+# cached anchor; this kernel's correctness rests on the contract the
+# `flash_prefill` branch builds out of `top_idx` (ascending ids, prefix
+# validity, count `min(512, (pos+1)//4)`).  The two are disjoint by row width
+# -- reuse is single-row draft decode, `flash_prefill` needs >= 2 rows -- and
+# that disjointness is load-bearing, so pin it from both sides.
+def test_indexer_reuse_cannot_arm_at_the_widths_this_kernel_serves():
+    qwen4_exp = pytest.importorskip("mtplx.models.qwen4_exp")
+    armed = qwen4_exp.QSAIndexer._indexer_reuse_armed
+    for rows in (2, 4, 32, 4096):
+        # rows != 1 is the first check and touches no instance state, so an
+        # unbound call is enough and needs no model, cache, or GPU.
+        assert armed(None, rows) is False, rows
+
+
+def test_the_flash_prefill_selector_gate_never_admits_a_single_row():
+    qwen4_exp = pytest.importorskip("mtplx.models.qwen4_exp")
+    assert qwen4_exp._qsa_prefill_min_rows() >= 2
+
+
+def test_the_flash_prefill_branch_still_builds_the_prefix_contract():
+    """W51 rewrote the scoring branches around it; the contract must survive.
+
+    Reading the source is deliberate: the branch's value is a GPU expression,
+    but the three operations that establish the invariant (sort ascending,
+    gather validity along the SORTED ids, blank invalid ids) are structural
+    and a future edit that drops one would be silent wrong attention.
+    """
+
+    import inspect
+
+    qwen4_exp = pytest.importorskip("mtplx.models.qwen4_exp")
+    source = inspect.getsource(qwen4_exp.QSAIndexer._select_eager)
+    branch = source[source.index("_qsa_large_prefill_enabled(S, total)") :]
+    branch = branch[: branch.index('return ("flash_prefill"')]
+    assert "mx.sort(top_idx" in branch  # chronological
+    assert "mx.take_along_axis(" in branch  # validity gathered by SORTED id
+    assert "block_ids.astype(mx.int64)" in branch
+    assert "mx.where(" in branch  # invalid slots blanked, flag kept separately
