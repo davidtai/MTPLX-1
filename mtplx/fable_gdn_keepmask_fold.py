@@ -144,6 +144,33 @@ Wired, all behind ``MTPLX_FABLE_GDN_KEEPMASK_FOLD=1`` (default off):
    replaying eagerly.  The conv-state commit, the PLE layer's exact-width
    replay and the QSA trims are byte-identical.
 
+COMPOSING WITH THE W67 GRAPH-BUILD OVERLAP (MTPLX_FABLE_GRAPH_BUILD_OVERLAP)
+---------------------------------------------------------------------------
+W67 splits the compiled verify into a ``0..N-1`` prefix ENQUEUED ahead of the
+window and an ``N..last`` suffix joined at the verify.  It is retained
+(-0.56 ms/cycle, exact) and part of the stack, so the fold composes with it
+rather than refusing it.
+
+The fold's 35 layers partition on the SAME boundary as the state and capture
+plans: whichever half owns a layer carries that layer's five padded row
+tensors, and each half that owns any carries its own copy of the shared
+``[1, 4*W]`` mask -- 177 leaves across the pair against 176 on the monolithic
+body, one extra bool input.  The PLE-carrying GDN layer (index 1) is never
+folded, so at ``N >= 2`` it sits in the prefix without contributing a leaf.
+``_SHARED_OVERLAP_SPLITS``'s key carries BOTH halves' partitions, because the
+boundary decides which side owns which layer and a pair traced with a prefix
+has a different arity and a different recurrence on each side.
+
+The two halves must see ONE ring.  ``FoldWindow`` is that record: built by
+whichever of the enqueue and the join runs first, reused by the other, and
+valid exactly while every folded layer still holds the state leaf it was built
+from -- a commit, a rollback and a published state output all move those
+leaves and force a rebuild.  A refused prefix leaves it live (nothing
+committed in between), so the monolithic fallback reuses it rather than
+stamping a second window for one verify.  The window is COUNTED at close, once
+its state has actually been published, so ``windows`` tracks ``compiled_calls``
+even when a prefix is discarded.
+
 WHY THE COMMIT CANNOT RE-DERIVE THE RING FROM THE SNAPSHOT
 ----------------------------------------------------------
 The family lane snapshots LAZILY: ``snapshot_untrimmable_cache_lazy`` retains
@@ -209,6 +236,18 @@ retained stack (``--target-mode batched --require-compiled-verify --m4-stage3
 plus ``MTPLX_QWEN4_M4_ROUTED_{DOWN_REDUCE,DOWN_RESIDUAL_TAIL,GLU}=1``) and
 ``--prewarm-ngram-table``, and only the six B arms carrying
 ``--env MTPLX_FABLE_GDN_KEEPMASK_FOLD=1``.
+
+To measure the fold ON TOP of the retained W67 lane, add its flags to the
+SHARED baseline so both arms carry them and only the fold moves::
+
+        --control-extra-env MTPLX_FABLE_GRAPH_BUILD_OVERLAP=1 \
+        --control-extra-env MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS=3 \
+        --candidate-extra-env MTPLX_FABLE_GDN_KEEPMASK_FOLD=1
+
+The receipt then has to show BOTH engaged: ``graph_build_overlap.suffix_joined
+== compiled_m4_calls`` with ``monolithic_windows`` at 0, and
+``gdn_keepmask_fold.overlap_split.prefix_layers + .suffix_layers == 35``.  A
+row where the partition does not add up folded only half its recurrence.
 
 A ring sweep is ``--candidate-extra-env
 MTPLX_FABLE_GDN_KEEPMASK_FOLD_WINDOWS=1|3``; W=1 is the concatenate-free arm
@@ -393,6 +432,7 @@ STATS: dict[str, Any] = {
     "declines": 0,            # windows/commits that fell back to today's path
     "decline_reasons": {},    # reason -> count
     "bypassed_commits": 0,    # commits from a NON-M4 round (copy/AR/re-forward)
+    "overlap_split": None,    # W67 partition, when the split pair carries it
 }
 
 _LOGGED = False
@@ -430,6 +470,7 @@ def reset_stats() -> None:
             "declines": 0,
             "decline_reasons": {},
             "bypassed_commits": 0,
+            "overlap_split": None,
         }
     )
     reset_window_seq()
@@ -878,6 +919,34 @@ def advance_ring(
     return pending.base, [*pending.rows, window_rows], decision.keeps, False
 
 
+def note_overlap_split(
+    *, layer_count: int, prefix_layers: int, suffix_layers: int
+) -> None:
+    """Record how the W67 split pair partitioned the fold's layers.
+
+    ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP`` splits the compiled verify into a
+    ``0..N-1`` prefix enqueued ahead of the window and an ``N..last`` suffix
+    joined at the verify.  The fold's layers ride whichever half owns them, so
+    a receipt that shows both lanes engaged has to show this partition adding
+    up -- an arm where it does not measured a window that folded only half its
+    recurrence.  Raises on a partition that does not cover every layer.
+    """
+
+    total = int(prefix_layers) + int(suffix_layers)
+    if total != FOLDABLE_LAYERS:
+        raise GdnKeepMaskFoldContractError(
+            f"overlap split covers {total} folded layers, expected "
+            f"{FOLDABLE_LAYERS}"
+        )
+    STATS["overlap_split"] = {
+        "layer_count": int(layer_count),
+        "prefix_layers": int(prefix_layers),
+        "suffix_layers": int(suffix_layers),
+        "prefix_leaves": prefix_leaf_count(int(prefix_layers)),
+        "suffix_leaves": prefix_leaf_count(int(suffix_layers)),
+    }
+
+
 def note_decline(reason: str) -> None:
     """Count one window or commit that fell back to today's exact path.
 
@@ -970,6 +1039,17 @@ def receipt_gate(
         {"deferred_commits": deferred, "expected": expected_commits},
     )
 
+    split = snapshot.get("overlap_split")
+    if split is not None:
+        covered = int(split.get("prefix_layers", 0)) + int(
+            split.get("suffix_layers", 0)
+        )
+        _check(
+            "overlap_split_covers_every_folded_layer",
+            covered == FOLDABLE_LAYERS,
+            split,
+        )
+
     hist = dict(snapshot.get("ring_depth_hist") or {})
     max_windows = int(snapshot.get("max_windows") or 0)
     depth_ok = bool(hist) and all(
@@ -1015,6 +1095,7 @@ __all__ = [
     "next_window_seq",
     "note_decline",
     "note_deferred_commit",
+    "note_overlap_split",
     "note_window",
     "pending_for",
     "prefix_mask_rows",

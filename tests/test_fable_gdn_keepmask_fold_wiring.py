@@ -730,12 +730,20 @@ def _stub_prefix_kernels(monkeypatch):
     )
 
 
-def _dispatch(entries, windows=2):
+def _dispatch(entries, windows=2, order=None):
     return {
         "fold_entries": tuple(entries),
+        "fold_layer_indices": tuple(
+            FOLDABLE_ORDER[: len(entries)] if order is None else order
+        ),
         "fold_windows": windows,
         "fold_dtype": "bf16-stub",
     }
+
+
+FOLDABLE_ORDER = tuple(
+    index for index in GDN_INDICES if index != PLE_INDEX
+)
 
 
 def test_window_prefix_is_one_fixed_arity_at_every_ring_depth(monkeypatch):
@@ -752,9 +760,9 @@ def test_window_prefix_is_one_fixed_arity_at_every_ring_depth(monkeypatch):
     arities = set()
     for keeps in [(), (2,), (2, 1)]:
         for entry in entries:
+            leaf = object()
+            entry.cache[1] = leaf
             if keeps:
-                leaf = object()
-                entry.cache[1] = leaf
                 entry._mtplx_fold_pending = fold.FoldPending(
                     base=object(),
                     rows=[object() for _ in keeps],
@@ -763,23 +771,24 @@ def test_window_prefix_is_one_fixed_arity_at_every_ring_depth(monkeypatch):
                 )
             else:
                 fold.clear_pending(entry)
-        leaves, depth, seq = module.CompiledVerifyBank._fold_window_prefix(
-            bank, dispatch
-        )
+        window = module.CompiledVerifyBank._fold_window_open(bank, dispatch)
+        leaves = window.leaves()
         arities.add(len(leaves))
-        assert depth == len(keeps)
+        assert window.depth == len(keeps)
         assert leaves[-1] == ("mask", keeps, 2)
-        assert fold.active_for(entries[0], seq) is not None
+        assert fold.active_for(entries[0], window.seq) is not None
+        module.CompiledVerifyBank._fold_window_close(bank)
     assert arities == {fold.prefix_leaf_count(fold.FOLDABLE_LAYERS)}
     # A depth-0 window's 175 row leaves must be 175 DISTINCT objects: one
     # array in 35 input positions would make the traced graph's input
     # identity depend on the ring depth of whichever window traced it.
     for entry in entries:
+        entry.cache[1] = object()
         fold.clear_pending(entry)
-    empty_leaves, _depth, _seq = module.CompiledVerifyBank._fold_window_prefix(
-        bank, dispatch
-    )
+    empty = module.CompiledVerifyBank._fold_window_open(bank, dispatch)
+    empty_leaves = empty.leaves()
     assert len({id(leaf) for leaf in empty_leaves}) == len(empty_leaves)
+    module.CompiledVerifyBank._fold_window_close(bank)
     assert fold.STATS["windows"] == 4
     assert fold.STATS["ring_depth_hist"] == {"0": 2, "1": 1, "2": 1}
     assert fold.STATS["folded_windows"] == 2
@@ -805,9 +814,11 @@ def test_a_ring_the_layers_disagree_on_declines_to_todays_path(monkeypatch):
 
     from mtplx import graphbank as module
 
-    leaves, depth, seq = module.CompiledVerifyBank._fold_window_prefix(
+    bank._fold_window = None
+    window = module.CompiledVerifyBank._fold_window_open(
         bank, _dispatch(entries)
     )
+    leaves, depth, seq = window.leaves(), window.depth, window.seq
     assert depth == 0
     assert leaves[-1] == ("mask", (), 2)
     assert fold.STATS["declines"] == 1
@@ -960,3 +971,613 @@ def test_commit_plan_ignores_a_window_with_no_gdn_layers(monkeypatch):
     )
     assert (actives, windows) == ({}, 0)
     assert fold.STATS["bypassed_commits"] == 0
+
+
+# --------------------------------------------------------------------------
+# W67 graph-build overlap: the fold rides whichever half owns the layer
+# --------------------------------------------------------------------------
+#
+# Reuses `tests/test_fable_graph_build_overlap.py`'s harness -- its `RecorderMX`
+# stands in for `mx`, so `install_fixed_m4_overlap_split` and
+# `arm_fixed_m4_graph_build_overlap` run end to end on the production census
+# (48 layers, 134 state leaves, 219 capture leaves, PLE at index 1) with no
+# array created and nothing evaluated.
+
+import importlib
+
+overlap = importlib.import_module("test_fable_graph_build_overlap")
+
+#: The fold's 35 layers: every GDN layer except the PLE-carrying one.
+FOLD_INDICES = tuple(
+    index for index in overlap.GDN_INDICES if index != overlap.PLE_INDEX
+)
+
+
+@pytest.fixture()
+def graphbank(monkeypatch):
+    """The overlap harness's recorder bank, so nothing here touches MLX."""
+
+    from types import SimpleNamespace
+
+    module = importlib.import_module("mtplx.graphbank")
+    recorder = overlap.RecorderMX()
+    monkeypatch.setattr(module, "mx", recorder)
+    monkeypatch.setattr(
+        module, "_expert_census", SimpleNamespace(end_cycle=lambda: None)
+    )
+    module._recorder = recorder
+    yield module
+    del module._recorder
+
+
+def _fold_ready_bank(graphbank, monkeypatch, *, windows=2):
+    """An install-ready overlap bank with the keep-mask fold armed."""
+
+    monkeypatch.setenv(fold.ENV_FLAG, "1")
+    fold.reset_fable_gdn_keepmask_fold_cache()
+    bank = overlap._install_ready_bank(graphbank)
+    entries = tuple(_Entry(object()) for _ in FOLD_INDICES)
+    bank._fold_layer_indices = FOLD_INDICES
+    bank._fold_entries = entries
+    bank._fold_windows = int(windows)
+    bank._fold_dtype = "bf16-stub"
+    bank._fold_window = None
+    dispatch = bank._fixed_m4_dispatch
+    dispatch["fold_layer_indices"] = FOLD_INDICES
+    dispatch["fold_entries"] = entries
+    dispatch["fold_windows"] = int(windows)
+    dispatch["fold_dtype"] = "bf16-stub"
+    return bank
+
+
+@pytest.mark.parametrize("depth", overlap.DEPTHS)
+def test_the_split_pair_partitions_the_folds_layers_on_its_own_boundary(
+    graphbank, monkeypatch, depth
+):
+    bank = _fold_ready_bank(graphbank, monkeypatch)
+    bank.install_fixed_m4_overlap_split(depth)
+
+    split = bank._fixed_m4_dispatch["overlap_split"]
+    expected_prefix = tuple(index for index in FOLD_INDICES if index < depth)
+    expected_suffix = tuple(index for index in FOLD_INDICES if index >= depth)
+    assert split["prefix_fold_layers"] == expected_prefix
+    assert split["suffix_fold_layers"] == expected_suffix
+    # Every folded layer lands on exactly one side.
+    assert len(expected_prefix) + len(expected_suffix) == fold.FOLDABLE_LAYERS
+    assert not set(expected_prefix) & set(expected_suffix)
+    # 5 row tensors a layer, plus one mask on each side that owns any.
+    assert split["prefix_fold_leaves"] == fold.prefix_leaf_count(
+        len(expected_prefix)
+    )
+    assert split["suffix_fold_leaves"] == fold.prefix_leaf_count(
+        len(expected_suffix)
+    )
+    assert (
+        split["prefix_fold_leaves"] + split["suffix_fold_leaves"]
+        == fold.prefix_leaf_count(fold.FOLDABLE_LAYERS) + 1
+    ), "the pair carries exactly one extra mask leaf over the monolithic body"
+
+
+@pytest.mark.parametrize("depth", overlap.DEPTHS)
+def test_the_ple_layer_sits_in_the_prefix_without_contributing_a_leaf(
+    graphbank, monkeypatch, depth
+):
+    """The PLE-carrying GDN layer (index 1) is never folded."""
+
+    bank = _fold_ready_bank(graphbank, monkeypatch)
+    bank.install_fixed_m4_overlap_split(depth)
+    split = bank._fixed_m4_dispatch["overlap_split"]
+    assert overlap.PLE_INDEX not in split["prefix_fold_layers"]
+    assert overlap.PLE_INDEX not in split["suffix_fold_layers"]
+    if depth >= 2:
+        # It IS in the prefix's layer range, and the prefix still owns layer 0.
+        assert split["needs_aux"] is True
+        assert 0 in split["prefix_fold_layers"]
+
+
+@pytest.mark.parametrize("depth", overlap.DEPTHS)
+def test_both_flags_armed_no_longer_raises(graphbank, monkeypatch, depth):
+    lane = importlib.import_module("mtplx.graph_build_overlap")
+    monkeypatch.setenv(lane.ENV_FLAG, "1")
+    monkeypatch.setenv(lane.LAYERS_ENV, str(depth))
+    lane.enabled.cache_clear()
+    lane.layers.cache_clear()
+    try:
+        bank = _fold_ready_bank(graphbank, monkeypatch)
+        assert bank.arm_fixed_m4_graph_build_overlap() == depth
+        split = bank._fixed_m4_dispatch["overlap_split"]
+        assert len(split["prefix_fold_layers"]) + len(
+            split["suffix_fold_layers"]
+        ) == fold.FOLDABLE_LAYERS
+    finally:
+        lane.enabled.cache_clear()
+        lane.layers.cache_clear()
+        lane.reset_receipt()
+
+
+@pytest.mark.parametrize("depth", overlap.DEPTHS)
+def test_the_receipt_shows_both_lanes_engaged(graphbank, monkeypatch, depth):
+    lane = importlib.import_module("mtplx.graph_build_overlap")
+    monkeypatch.setenv(lane.ENV_FLAG, "1")
+    monkeypatch.setenv(lane.LAYERS_ENV, str(depth))
+    lane.enabled.cache_clear()
+    lane.layers.cache_clear()
+    try:
+        bank = _fold_ready_bank(graphbank, monkeypatch)
+        bank.arm_fixed_m4_graph_build_overlap()
+        assert lane.last_receipt()["prefix_layers"] == depth
+        split = fold.stats_snapshot()["overlap_split"]
+        assert split is not None
+        assert split["layer_count"] == depth
+        assert (
+            split["prefix_layers"] + split["suffix_layers"]
+            == fold.FOLDABLE_LAYERS
+        )
+        # And the gate accepts the partition.
+        snapshot = _engaged_snapshot(overlap_split=split)
+        assert fold.receipt_gate(snapshot, compiled_windows=1000)["ok"] is True
+    finally:
+        lane.enabled.cache_clear()
+        lane.layers.cache_clear()
+        lane.reset_receipt()
+
+
+def test_an_unarmed_fold_leaves_the_split_pair_exactly_as_it_was(graphbank):
+    """No fold indices -> no prefix leaves, no partition, no stats."""
+
+    fold.reset_stats()
+    bank = overlap._install_ready_bank(graphbank)
+    bank._fold_layer_indices = ()
+    bank._fold_window = None
+    bank.install_fixed_m4_overlap_split(3)
+    split = bank._fixed_m4_dispatch["overlap_split"]
+    assert split["prefix_fold_layers"] == ()
+    assert split["suffix_fold_layers"] == ()
+    assert split["prefix_fold_leaves"] == 0
+    assert split["suffix_fold_leaves"] == 0
+    assert fold.STATS["overlap_split"] is None
+
+
+def test_the_gate_fails_a_partition_that_loses_a_layer():
+    report = fold.receipt_gate(
+        _engaged_snapshot(
+            overlap_split={
+                "layer_count": 3,
+                "prefix_layers": 2,
+                "suffix_layers": 32,
+            }
+        ),
+        compiled_windows=1000,
+    )
+    assert report["ok"] is False
+    assert any(
+        item["check"] == "overlap_split_covers_every_folded_layer"
+        and not item["ok"]
+        for item in report["checks"]
+    )
+
+
+def test_note_overlap_split_refuses_an_incomplete_partition():
+    with pytest.raises(fold.GdnKeepMaskFoldContractError, match="covers 34"):
+        fold.note_overlap_split(layer_count=3, prefix_layers=2, suffix_layers=32)
+
+
+# --------------------------------------------------------------------------
+# One frozen ring, shared by both halves of the split
+# --------------------------------------------------------------------------
+
+
+def _window_bank(monkeypatch, keeps=(2,)):
+    """A minimal bank with a live fold ring, for the record's lifecycle."""
+
+    monkeypatch.setenv(fold.ENV_FLAG, "1")
+    fold.reset_fable_gdn_keepmask_fold_cache()
+    fold.reset_stats()
+    _stub_prefix_kernels(monkeypatch)
+    from mtplx import graphbank as module
+
+    bank = module.CompiledVerifyBank.__new__(module.CompiledVerifyBank)
+    bank._fold_window = None
+    order = (0, 2, 4)
+    entries = []
+    for _index in order:
+        leaf = object()
+        entry = _Entry(leaf)
+        if keeps:
+            entry._mtplx_fold_pending = fold.FoldPending(
+                base=object(),
+                rows=[object() for _ in keeps],
+                keeps=keeps,
+                state=leaf,
+            )
+        entries.append(entry)
+    dispatch = {
+        "fold_entries": tuple(entries),
+        "fold_layer_indices": order,
+        "fold_windows": 2,
+        "fold_dtype": "bf16-stub",
+    }
+    return module, bank, dispatch, order, tuple(entries)
+
+
+def test_one_window_is_built_once_and_shared_by_both_halves(monkeypatch):
+    module, bank, dispatch, order, entries = _window_bank(monkeypatch)
+    first = bank._fold_window_open(dispatch)
+    second = bank._fold_window_open(dispatch)
+    assert second is first
+    assert fold.STATS["windows"] == 0, "not counted until its state publishes"
+    bank._fold_window_close()
+    assert fold.STATS["windows"] == 1, "the enqueue and the join are one window"
+    # The two halves partition the SAME record; together they are the
+    # monolithic body's leaves plus one repeated mask.
+    prefix = first.leaves(0, 3)
+    suffix = first.leaves(3, None)
+    assert first.layers_in(0, 3) == (0, 2)
+    assert first.layers_in(3, None) == (4,)
+    assert len(prefix) == fold.prefix_leaf_count(2)
+    assert len(suffix) == fold.prefix_leaf_count(1)
+    assert prefix[-1] is suffix[-1] is first.mask
+    assert len(prefix) + len(suffix) == len(first.leaves()) + 1
+    # Same stamp on both sides.
+    for entry in entries:
+        assert fold.active_for(entry, first.seq) is not None
+
+
+def test_a_half_that_owns_no_folded_layer_carries_nothing(monkeypatch):
+    _module, bank, dispatch, _order, _entries = _window_bank(monkeypatch)
+    window = bank._fold_window_open(dispatch)
+    assert window.leaves(5, None) == []
+    assert window.layers_in(5, None) == ()
+
+
+def test_the_record_is_rebuilt_when_a_folded_leaf_moves(monkeypatch):
+    _module, bank, dispatch, _order, entries = _window_bank(monkeypatch)
+    first = bank._fold_window_open(dispatch)
+    assert bank._fold_window_open(dispatch) is first
+    # A commit / rollback / published state output rebinds slot 1.
+    entries[0].cache[1] = object()
+    second = bank._fold_window_open(dispatch)
+    assert second is not first
+    assert second.seq != first.seq
+
+
+def test_closing_the_record_forces_the_next_window_to_build(monkeypatch):
+    _module, bank, dispatch, _order, _entries = _window_bank(monkeypatch)
+    first = bank._fold_window_open(dispatch)
+    bank._fold_window_close()
+    assert bank._fold_window is None
+    second = bank._fold_window_open(dispatch)
+    assert second is not first
+
+
+def test_a_refused_prefix_reuses_the_ring_it_already_froze(monkeypatch):
+    """The enqueue freezes; the join refuses; the monolithic fallback reuses.
+
+    Nothing commits between the enqueue and the fallback, so the ring is
+    unchanged -- rebuilding would stamp a second window for one verify and
+    make `windows == compiled_m4_calls` false in the receipt.
+    """
+
+    _module, bank, dispatch, _order, _entries = _window_bank(monkeypatch)
+    enqueued = bank._fold_window_open(dispatch)      # enqueue
+    fallback = bank._fold_window_open(dispatch)      # monolithic fallback
+    assert fallback is enqueued
+    bank._fold_window_close()                        # the fallback publishes
+    assert fold.STATS["windows"] == 1
+
+
+def test_a_window_that_never_reaches_its_verify_is_not_counted(monkeypatch):
+    """An enqueue whose window never verified must not inflate `windows`.
+
+    The receipt gate reads `windows == compiled_m4_calls`, and a prefix
+    computed for a window that never joined produced no compiled call.
+    """
+
+    _module, bank, dispatch, _order, entries = _window_bank(monkeypatch)
+    bank._fold_window_open(dispatch)                 # enqueue, then nothing
+    for entry in entries:                            # a later commit moves on
+        entry.cache[1] = object()
+        fold.clear_pending(entry)
+    bank._fold_window_open(dispatch)                 # a real, later window
+    bank._fold_window_close()
+    assert fold.STATS["windows"] == 1
+
+
+def test_the_bases_are_keyed_by_layer_index_not_fold_position(monkeypatch):
+    _module, bank, dispatch, order, entries = _window_bank(monkeypatch)
+    window = bank._fold_window_open(dispatch)
+    assert set(window.bases) == set(order)
+    assert set(window.rows) == set(order)
+    for index, entry in zip(order, entries):
+        pending = fold.active_for(entry, window.seq)
+        assert window.bases[index] is pending.base
+
+
+def test_an_empty_ring_uses_each_layers_own_leaf_as_its_base(monkeypatch):
+    _module, bank, dispatch, order, entries = _window_bank(
+        monkeypatch, keeps=()
+    )
+    window = bank._fold_window_open(dispatch)
+    assert window.keeps == () and window.depth == 0
+    for index, entry in zip(order, entries):
+        assert window.bases[index] is entry.cache[1]
+
+
+def test_fold_state_in_substitutes_only_the_folded_slot_one(monkeypatch):
+    from mtplx import graphbank as module
+
+    class _Gdn:
+        def __init__(self):
+            self.cache = ["conv", "state"]
+
+    plan = [
+        (module.VERIFY_SPEC_KIND_GDN, _Gdn(), 2),
+        (module.VERIFY_SPEC_KIND_GDN, _Gdn(), 2),
+    ]
+    leaves = module.CompiledVerifyBank._fold_state_in(plan, {1: "BASE"})
+    assert leaves == ["conv", "state", "conv", "BASE"]
+    # With a layer offset, the bases key by TRUE layer index: the suffix's
+    # first plan entry is layer `layer_offset`, not layer 0.
+    leaves = module.CompiledVerifyBank._fold_state_in(
+        plan, {40: "BASE"}, layer_offset=40
+    )
+    assert leaves == ["conv", "BASE", "conv", "state"]
+    leaves = module.CompiledVerifyBank._fold_state_in(
+        plan, {1: "BASE"}, layer_offset=40
+    )
+    assert leaves == ["conv", "state", "conv", "state"]
+
+
+# --------------------------------------------------------------------------
+# The per-half trace scope
+# --------------------------------------------------------------------------
+
+
+def test_overlap_fold_scope_maps_each_half_to_its_own_layers():
+    from mtplx import graphbank as module
+
+    shadow = {index: _Entry(object()) for index in range(6)}
+    bank = SimpleNamespaceShadow(shadow)
+    rows = [f"r{i}" for i in range(10)]
+    trailing = [*rows, "MASK"]
+    state_in = ["s0", "s1", *trailing]
+    scope = module._overlap_fold_scope(bank, (0, 4), state_in, 2, 11)
+    assert scope[id(shadow[0])] == ("r0", "r1", "r2", "r3", "r4", "MASK")
+    assert scope[id(shadow[4])] == ("r5", "r6", "r7", "r8", "r9", "MASK")
+    assert len(scope) == 2
+
+
+def test_overlap_fold_scope_is_none_for_a_half_with_no_folded_layer():
+    from mtplx import graphbank as module
+
+    assert module._overlap_fold_scope(None, (), ["a"], 1, 0) is None
+
+
+def test_overlap_fold_scope_refuses_a_mismatched_arity():
+    from mtplx import graphbank as module
+
+    shadow = {0: _Entry(object())}
+    bank = SimpleNamespaceShadow(shadow)
+    with pytest.raises(ValueError, match="keep-mask fold leaves"):
+        module._overlap_fold_scope(bank, (0,), ["s", "r0", "MASK"], 1, 6)
+
+
+class SimpleNamespaceShadow:
+    def __init__(self, shadow):
+        self._shadow = shadow
+
+
+# --------------------------------------------------------------------------
+# End to end through the split pair: enqueue -> join, with the fold armed
+# --------------------------------------------------------------------------
+
+
+def _armed_split_bank(graphbank, monkeypatch, *, depth, keeps=(2,)):
+    """A W67 split bank whose GDN layers carry a live keep-mask ring.
+
+    Uses the overlap harness's recording ``prefix_fn`` / ``suffix_fn``, so the
+    exact leaves each half is handed are readable without any MLX.
+    """
+
+    monkeypatch.setenv(fold.ENV_FLAG, "1")
+    fold.reset_fable_gdn_keepmask_fold_cache()
+    fold.reset_stats()
+    _stub_prefix_kernels(monkeypatch)
+    entries = overlap._build_cache()
+    bank, calls, _aux_calls = overlap._make_bank(
+        graphbank, entries=entries, layer_count=depth
+    )
+    fold_entries = tuple(entries[index] for index in FOLD_INDICES)
+    bases = {}
+    for entry in fold_entries:
+        if not keeps:
+            continue
+        leaf = entry.cache[1]
+        base = overlap.Sentinel(f"base{entry.index}")
+        bases[entry.index] = base
+        entry._mtplx_fold_pending = fold.FoldPending(
+            base=base,
+            rows=[object() for _ in keeps],
+            keeps=keeps,
+            state=leaf,
+        )
+    dispatch = bank._fixed_m4_dispatch
+    dispatch["fold_entries"] = fold_entries
+    dispatch["fold_layer_indices"] = FOLD_INDICES
+    dispatch["fold_windows"] = 2
+    dispatch["fold_dtype"] = "bf16-stub"
+    split = dispatch["overlap_split"]
+    split["prefix_fold_layers"] = tuple(i for i in FOLD_INDICES if i < depth)
+    split["suffix_fold_layers"] = tuple(i for i in FOLD_INDICES if i >= depth)
+    bank._fold_window = None
+    return bank, calls, entries, bases
+
+
+@pytest.mark.parametrize("depth", overlap.DEPTHS)
+def test_both_halves_are_handed_their_own_share_of_the_prefix(
+    graphbank, monkeypatch, depth
+):
+    bank, calls, _entries, _bases = _armed_split_bank(
+        graphbank, monkeypatch, depth=depth
+    )
+    bank.enqueue_fixed_m4_overlap_prefix(
+        overlap.Sentinel("input_ids"),
+        committed_count=7,
+        cache=None,
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+    )
+    bank.forward_fixed_m4_overlap(
+        overlap.Sentinel("input_ids"),
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+        committed_count=7,
+        cache=None,
+    )
+
+    prefix_state_leaves, _cap, _plan = overlap.prefix_census(depth)
+    prefix_fold = tuple(i for i in FOLD_INDICES if i < depth)
+    suffix_fold = tuple(i for i in FOLD_INDICES if i >= depth)
+
+    prefix_in = calls["prefix"][0][2]
+    suffix_in = calls["suffix"][0][3]
+    assert len(prefix_in) == prefix_state_leaves + fold.prefix_leaf_count(
+        len(prefix_fold)
+    )
+    assert len(suffix_in) == (
+        overlap.STATE_LEAVES - prefix_state_leaves
+    ) + fold.prefix_leaf_count(len(suffix_fold))
+    # The mask is ONE object, repeated on both sides because they are two
+    # graphs: the two halves of one recurrence must not disagree about which
+    # ring rows are live.
+    assert prefix_in[-1] is suffix_in[-1]
+    assert prefix_in[-1] == ("mask", (2,), 2)
+    assert not calls["monolithic"], "the join must not fall back"
+
+
+@pytest.mark.parametrize("depth", overlap.DEPTHS)
+def test_each_half_runs_its_folded_layers_from_the_ring_base(
+    graphbank, monkeypatch, depth
+):
+    """Slot 1 carries the BASE for a folded layer, its own leaf otherwise."""
+
+    bank, calls, entries, bases = _armed_split_bank(
+        graphbank, monkeypatch, depth=depth
+    )
+    # The join publishes state_out over every slot, so read the PLE layer's
+    # pre-forward leaf now.
+    ple_leaf = entries[overlap.PLE_INDEX].cache[1]
+    bank.enqueue_fixed_m4_overlap_prefix(
+        overlap.Sentinel("input_ids"),
+        committed_count=7,
+        cache=None,
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+    )
+    bank.forward_fixed_m4_overlap(
+        overlap.Sentinel("input_ids"),
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+        committed_count=7,
+        cache=None,
+    )
+    prefix_in = calls["prefix"][0][2]
+    suffix_in = calls["suffix"][0][3]
+
+    def _slot_one(state_in, plan_slice):
+        """Walk one half's state plan and pull each GDN layer's slot 1."""
+
+        seen = {}
+        pos = 0
+        for index, kind, n_leaves in plan_slice:
+            if kind == "qsa":
+                pos += 5
+                continue
+            seen[index] = state_in[pos + 1]
+            pos += n_leaves
+        return seen
+
+    plan = [
+        (
+            index,
+            "qsa" if index in overlap.QSA_INDICES else "gdn",
+            overlap._state_leaves_of(index),
+        )
+        for index in range(48)
+    ]
+    prefix_slots = _slot_one(prefix_in, plan[:depth])
+    suffix_slots = _slot_one(suffix_in, plan[depth:])
+    for index, base in bases.items():
+        got = prefix_slots.get(index, suffix_slots.get(index))
+        assert got is base, f"layer {index} did not start from its ring base"
+    # The PLE-carrying GDN layer is not folded: it keeps its own leaf.
+    unfolded = prefix_slots.get(
+        overlap.PLE_INDEX, suffix_slots.get(overlap.PLE_INDEX)
+    )
+    assert unfolded is ple_leaf
+
+
+@pytest.mark.parametrize("depth", overlap.DEPTHS)
+def test_the_join_counts_one_window_and_clears_the_descriptors(
+    graphbank, monkeypatch, depth
+):
+    bank, _calls, entries, _bases = _armed_split_bank(
+        graphbank, monkeypatch, depth=depth
+    )
+    bank.enqueue_fixed_m4_overlap_prefix(
+        overlap.Sentinel("input_ids"),
+        committed_count=7,
+        cache=None,
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+    )
+    assert fold.STATS["windows"] == 0, "not a window until its state publishes"
+    bank.forward_fixed_m4_overlap(
+        overlap.Sentinel("input_ids"),
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+        committed_count=7,
+        cache=None,
+    )
+    assert fold.STATS["windows"] == 1
+    assert fold.STATS["ring_depth_hist"] == {"1": 1}
+    assert fold.STATS["folded_windows"] == 1
+    assert fold.STATS["declines"] == 0
+    assert bank._fold_window is None
+    for index in FOLD_INDICES:
+        assert getattr(entries[index], "_mtplx_fold_pending", None) is None
+
+
+def test_a_refused_prefix_falls_back_with_the_same_ring(graphbank, monkeypatch):
+    """The join refuses (wrong committed_count) and the monolithic body runs.
+
+    It must reuse the ring the enqueue froze -- one window, one stamp -- and
+    hand the whole 176-leaf prefix to the single graph.
+    """
+
+    bank, calls, _entries, _bases = _armed_split_bank(
+        graphbank, monkeypatch, depth=3
+    )
+    bank.enqueue_fixed_m4_overlap_prefix(
+        overlap.Sentinel("input_ids"),
+        committed_count=7,
+        cache=None,
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+    )
+    frozen = bank._fold_window
+    bank.forward_fixed_m4_overlap(
+        overlap.Sentinel("input_ids"),
+        host_input_ids=[1, 2, 3, 4],
+        completion_tokens=[1, 2, 3, 4],
+        committed_count=9,          # a different window: refuse the prefix
+        cache=None,
+    )
+    assert calls["monolithic"], "the join must fall back"
+    assert not calls["suffix"]
+    mono_state_in = calls["monolithic"][0][2]
+    assert len(mono_state_in) == overlap.STATE_LEAVES + fold.prefix_leaf_count(
+        fold.FOLDABLE_LAYERS
+    )
+    assert mono_state_in[-1] is frozen.mask
+    assert fold.STATS["windows"] == 1, "one verify is one window"

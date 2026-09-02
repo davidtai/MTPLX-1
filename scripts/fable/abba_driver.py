@@ -906,6 +906,13 @@ def _gdn_keepmask_fold_receipt(compiled_m4_calls: int) -> dict[str, Any]:
     is today's answer at today's cost, so an arm with declines measured a
     blend).  ``bypassed_commits`` counts commits from a non-M4 round -- copy
     rounds mostly -- and is expected to be small and non-zero.
+
+    ``overlap_split`` is populated only when the W67 graph-build overlap is
+    armed alongside the fold.  It is the partition of the fold's 35 layers
+    across the split's boundary, and ``prefix_layers + suffix_layers`` must be
+    35: a row where it is not folded only half its recurrence.  Read it beside
+    ``ple_hot_rows.graph_build_overlap`` -- either both lanes are engaged or
+    the arm measured neither.
     """
 
     try:
