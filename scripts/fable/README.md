@@ -255,6 +255,95 @@ PYTHONPATH=<worktree> <venv>/bin/python \
 Add `--prompt-tokens 1024` for the short-prompt cell, where the lookahead is
 inert and this lane is the only thing hiding the gather.
 
+### Recipe: prefetch the draft chain's candidate PLE rows (K-P1)
+
+```
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+Decode reads 16 n-gram rows x 100 B per token out of the 32 GB memory-mapped
+table.  The rows are 85-93 % novel so no LRU covers them, and the table cannot
+go resident next to ~85 GB of wired weights.  This lane predicts instead: the
+row ids are a pure function of the token ids, so the moment a draft depth's
+K20 support exists on the host, the 16 rows for each of its 20 candidates are
+known (320 rows = 32 KB/depth) and a worker gathers them while the GPU runs
+the next depth.  When the sampled token is chosen its rows are already in a
+host buffer, and `_FixedM4CandidateSidecarAux` hands them to `gather_np(prepared=...)`
+instead of reading the table on the critical path.
+
+Bytes are identical by construction, not by comparison: the buffer is
+content-addressed by table row id and every payload in it is a literal read of
+the same three memmaps the shipped gather reads.  A window with one uncovered
+row falls back whole.
+
+Read the receipt's `ple_hot_rows.ple_candidate_prefetch`:
+
+| field | means |
+| --- | --- |
+| `depths` | candidate buckets submitted (primary + one per draft depth) |
+| `candidate_rows` / `bytes` | rows and bytes the lane actually read |
+| `hits` / `misses` | verify WINDOWS served from the buffer / fell back whole |
+| `rows_served` / `rows_missing` | the row detail behind those |
+| `vectorized_buckets` / `pread_buckets` / `cold_declines` | which read the worker took |
+| `worker_wait_ms` | owner time blocked joining the workers |
+
+`worker_wait_ms` is the honest half of the receipt: if it is not far below the
+gather it replaced, the lane bought nothing.  `cold_declines` is the other
+one -- a 320-row bucket on cold pages is 960 GIL-contended `os.pread` calls
+(~4.8 ms) against a ~12 us warm fancy index, so a cold bucket is DECLINED and
+the shipped gather runs.  A run with `cold_declines` high has no candidate
+lane, whatever the flag says.
+
+Two caveats worth stating before the window runs:
+
+* The retained PR391 joint-D3 core keeps its per-depth K20 arrays
+  verifier-resident (only the packed token vector is synced), so on that lane
+  the *speculative* hook has nothing to read.  The lane still runs there, with
+  the three resolved tokens as one-candidate depths, which only moves the read
+  into the pool -- a smaller win than the speculative form.  The stock serial
+  draft loop is where the 20-candidate hook fires.
+* Removing the draft -> target sync itself is phase 2 and is NOT built; see
+  `docs/perf/ple-candidate-prefetch-phase2.md`.
+
+Full ABBA, prewarmed table on both arms (the regime the retained stack serves):
+
+```
+PYTHONPATH=<worktree> <venv>/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 36000 -- \
+  <venv>/bin/python <worktree>/scripts/fable/abba_window.py \
+    --sequence <seq> --order ABBA --label-prefix fable-w56-candprefetch \
+    --source <worktree> --prewarm-ngram-table --warm-graph --retain-events \
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+And the as-found page-cache regime, where the lane should matter most -- the
+same window with `--prewarm-ngram-table` dropped from BOTH arms, so neither
+arm gets the driver's 29.8 GiB pre-read and the control pays real faults on
+the critical path:
+
+```
+    ... --warm-graph --retain-events \
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+`MTPLX_NGRAM_PREWARM` is on by default at model *load*, and it is a profile
+override key (`mtplx/profiles.py`), so the as-found cell needs it turned off on
+BOTH arms through `--control-env` / `--candidate-env`, not `--extra-env`:
+
+```
+    --control-env MTPLX_NGRAM_PREWARM=0 --candidate-env MTPLX_NGRAM_PREWARM=0 \
+    --candidate-extra-env MTPLX_FABLE_PLE_CANDIDATE_PREFETCH=1
+```
+
+Without that, both arms are prewarmed by the load path and the two cells
+measure the same thing.  Expect `cold_declines` to dominate in the cold cell
+unless the lane is paired with `MTPLX_FABLE_PLE_FIRST_GATHER_EARLY=1` on both
+arms, which is what warms the pages the candidate buckets then read -- so the
+cold cell is really a THREE-way question (cold control, cold candidate, cold
+candidate + pre-touch) and the third arm is the one that can win.
+
 ### Recipe: open the context-copy block cap
 
 ```

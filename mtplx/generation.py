@@ -9281,6 +9281,20 @@ def generate_mtpk(
             _pr391_route.uniform_bit_rows,
         )
     _pr391_carried_d3: dict[str, Any] | None = None
+    # MTPLX_FABLE_PLE_CANDIDATE_PREFETCH (K-P1, default off).  Resolved ONCE
+    # here, to a bound method or to None -- the draft hooks below then cost a
+    # single `is not None` per depth on the control arm, and no flag read, no
+    # getattr walk and no exception handler ever runs inside the cycle.  The
+    # lane arms itself at aux construction (qwen4_fixed_verify), so a bank
+    # without it hands back the construction-bound no-op and this stays None.
+    _ple_candidate_submit = None
+    if compiled_verify_bank is not None and qwen4_fixed_m4_compiled_verify:
+        _ple_candidate_dispatch = (
+            getattr(compiled_verify_bank, "_fixed_m4_dispatch", None) or {}
+        )
+        _ple_candidate_aux = _ple_candidate_dispatch.get("prepare_aux")
+        if getattr(_ple_candidate_aux, "candidate_prefetch", None) is not None:
+            _ple_candidate_submit = compiled_verify_bank.submit_fixed_m4_candidates
     # Read once per request; the switch is a process constant so control and
     # candidate arms run the same binary.
     _pr391_compact_commit = _pr391_compact_commit_enabled()
@@ -11576,6 +11590,26 @@ def generate_mtpk(
                 )
             _pr391_joint_result = joint_result
             core_tokens = _pr391_decode_float32_d3_tokens(joint_result)
+            if _ple_candidate_submit is not None:
+                # The joint core keeps its per-depth K20 arrays
+                # verifier-resident (only result[0] is synced), so the
+                # SPECULATIVE form of K-P1 has no host hook on this lane --
+                # see mtplx/ple_candidate_prefetch's module docstring and the
+                # phase-2 note.  What IS available is the exact window: the
+                # three tokens are on the host here, one depth earlier than
+                # the aux needs their rows, so the read goes to the pool and
+                # overlaps the verify's remaining host prep instead of
+                # blocking it.  Same buffer, same resolve, one candidate per
+                # depth.
+                _ple_prefix = [int(primary)]
+                for _ple_token in core_tokens:
+                    _ple_candidate_submit(
+                        prefix_tokens=tuple(_ple_prefix),
+                        candidate_ids=(int(_ple_token),),
+                        completion_tokens=tokens,
+                        committed_count=len(tokens) - 1,
+                    )
+                    _ple_prefix.append(int(_ple_token))
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
             draft_tokens = list(core_tokens)
@@ -12291,6 +12325,37 @@ def generate_mtpk(
                         probs=np.asarray(draft_q, dtype=np.float64),
                         vocab_size=_frspec_legacy_full,
                     )
+            if _ple_candidate_submit is not None and draft_token is not None:
+                # THE speculative hook.  `draft_q` is this depth's K20 support
+                # -- the 20 ids the sampler drew from -- and every window token
+                # ahead of this position is already fixed, so the 16 rows for
+                # each candidate are known exactly.  Submitting here puts the
+                # 320-row read on the pool while the loop goes on to enqueue
+                # depth d+1's MTP forward.  frspec remapping happened above,
+                # so both the token and the support are in the target's id
+                # space, which is what `_ngram_rows_np` hashes.
+                if not draft_tokens:
+                    # First depth of a cycle the PR391 core did not run: the
+                    # primary's own window position has no candidates and no
+                    # `prefetch_fixed_m4_primary` seeded it here, so seed it
+                    # now or every window in this cycle resolves as a miss.
+                    _ple_candidate_submit(
+                        prefix_tokens=(),
+                        candidate_ids=(int(primary),),
+                        completion_tokens=tokens,
+                        committed_count=len(tokens) - 1,
+                    )
+                _ple_candidates = (
+                    draft_q.token_ids
+                    if isinstance(draft_q, SparseDistribution)
+                    else (int(draft_token),)
+                )
+                _ple_candidate_submit(
+                    prefix_tokens=(int(primary), *draft_tokens),
+                    candidate_ids=_ple_candidates,
+                    completion_tokens=tokens,
+                    committed_count=len(tokens) - 1,
+                )
             draft_tokens.append(draft_token)
             draft_probs.append(draft_q)
             draft_cache_keys.append(cache_key)
