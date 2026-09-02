@@ -84,14 +84,55 @@ Nor does it reach the rest of the 1.93 ms.  Layers 1..47 are dataflow
 descendants of ``compiled_aux``, which cannot exist before the host knows the
 drafted token values, so their ~5,090 nodes cannot be replayed early.
 
-The bigger prize this lane deliberately does not take is an N-layer prefix.
-Saving is ``min(N x 0.53, (48-N)/48 x 1.93)``, which peaks near **N = 3-4 at
-~1.7-1.8 ms/cycle (~4.5 %)** -- but a prefix past layer 0 contains the PLE
-layer, so it needs ``compiled_aux`` (i.e. ``prepare_aux`` hoisted ahead of the
-prefix, which is a further host reordering) AND a generalized split, which
-``install_fixed_m4_split``'s hard-coded layer-0 census does not provide.  It
-also adds one more ``mx.compile`` fusion seam.  Recorded as the follow-on, not
-built here.
+W67: the N-layer prefix
+-----------------------
+W63 stopped at layer 0 because layer 0 is the only layer that reads no PLE
+auxiliary.  ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS=N`` (default 1, i.e.
+W63's partition) moves the seam to layer ``N-1 / N``.  Saving is
+``min(N x 0.53, (48-N)/48 x 1.93)``, which peaks near **N = 3-4 at
+~1.7-1.8 ms/cycle (~4.5 %)**.
+
+Three things make N > 1 legal:
+
+1. **The aux hoist.**  ``prepare_aux`` needs only ``host_input_ids`` (the
+   window's four token VALUES, a Python list), ``completion_tokens`` and
+   ``committed_count`` -- all three exist at the enqueue statement, and none
+   of them is produced by any layer.  So for N > 1 the auxiliary is built at
+   the ENQUEUE, before the prefix, and carried on the prefix object to the
+   join.  It is built exactly once per window either way.
+2. **A generalized split.**  ``install_fixed_m4_split`` (PR391's, whose
+   layer-0 census ``tests/test_qwen4_fixed_host_tokens_static`` pins by
+   source) is left alone; ``install_fixed_m4_overlap_split`` partitions the
+   state plan, the capture layout and the layer range at an arbitrary N and
+   RAISES at the request boundary on any census it does not recognise.
+3. **One more fusion seam.**  See "Exactness" below.
+
+At N = 1 the prefix takes no auxiliary at all (its ``mx.compile`` closure has
+no ``compiled_aux`` parameter) and the aux is prepared in the join exactly
+where W63 prepared it, so the default arm is W63's schedule.
+
+Where the seam sits, per N (production geometry: 48 layers,
+``full_attention_interval=4`` so layers 3, 7, ... are QSA; ``ple_layer_ids ==
+[2]`` one-indexed, i.e. the single PLE layer is index 1):
+
+======  ===========================  =================================
+N       last prefix layer            first suffix op reading the seam
+======  ===========================  =================================
+1       0  (GDN, no PLE)             ``hidden + ple(hidden, ids)``
+2       1  (GDN, **the PLE layer**)  ``attn_hyper_connection(hidden)``
+3       2  (GDN)                     ``attn_hyper_connection(hidden)``
+4       3  (**QSA**)                 ``attn_hyper_connection(hidden)``
+======  ===========================  =================================
+
+Every producer is ``_hyper_residual_write`` (the MLP hyper-connection write,
+an elementwise multiply-add ending in a reshape).  At N = 1 the consumer is
+another elementwise add, so the seam cuts an elementwise chain that MLX could
+have fused.  At N >= 2 the consumer is ``GatedResidual``, whose first
+operation is a ``GroupedRMSNorm`` (``mx.fast.rms_norm``) or, under
+``MTPLX_FABLE_HC_M4``, a hand-written Metal kernel -- neither of which fuses
+with an elementwise producer.  **N >= 2 therefore cuts at a cleaner seam than
+N = 1 does.**  That is an argument, not a proof; the ABBA's token digest is
+still the gate.
 
 Exactness
 ---------
@@ -130,6 +171,7 @@ monolithic route with a constant-``None`` hook in the decode loop.
 ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_ITEMS=timing`` additionally records the host
 seconds spent in each of the two replays (an instrument, not a lever -- it is
 not in :data:`DEFAULT_ITEMS`, so an A/B measures the lever alone).
+``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS=N`` (default 1) sets the prefix depth.
 """
 
 from __future__ import annotations
@@ -139,10 +181,13 @@ import time
 from functools import lru_cache
 
 __all__ = [
-    "ENV_FLAG",
-    "ITEMS_ENV",
-    "ITEMS",
     "DEFAULT_ITEMS",
+    "DEFAULT_LAYERS",
+    "ENV_FLAG",
+    "ITEMS",
+    "ITEMS_ENV",
+    "LAYERS_ENV",
+    "MAX_LAYERS",
     "TIMING",
     "bump",
     "enabled",
@@ -150,7 +195,10 @@ __all__ = [
     "item",
     "items",
     "last_receipt",
+    "layers",
+    "note_aux_hoisted",
     "note_prefix_build",
+    "note_prefix_layers",
     "note_suffix_build",
     "reset_receipt",
     "timing_enabled",
@@ -158,6 +206,15 @@ __all__ = [
 
 ENV_FLAG = "MTPLX_FABLE_GRAPH_BUILD_OVERLAP"
 ITEMS_ENV = "MTPLX_FABLE_GRAPH_BUILD_OVERLAP_ITEMS"
+#: W67: how many leading target layers the prefix graph carries.  ``1`` is
+#: W63's layer-0 prefix, i.e. the default is exactly the shipped behaviour.
+LAYERS_ENV = "MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS"
+DEFAULT_LAYERS = 1
+#: A ceiling, not a recommendation.  ``min(N x per-layer GPU, (L-N)/L x host
+#: build)`` peaks at N = 3-4 on the production geometry and falls off after,
+#: and a prefix that swallows most of the window has no host build left to
+#: hide under; refuse an obviously-wrong N at the flag rather than compile it.
+MAX_LAYERS = 8
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
@@ -206,6 +263,32 @@ def items() -> frozenset[str]:
     return frozenset(names)
 
 
+@lru_cache(maxsize=1)
+def layers() -> int:
+    """Resolve :data:`LAYERS_ENV` once.  Unset means ``DEFAULT_LAYERS``.
+
+    This is the requested prefix depth, not the installed one: whether the
+    fixed-M4 plan can actually be partitioned there is
+    ``CompiledVerifyBank.install_fixed_m4_overlap_split``'s question, and it
+    raises at the request boundary rather than degrading silently.
+    """
+
+    raw = (os.environ.get(LAYERS_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_LAYERS
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        raise ValueError(
+            f"{LAYERS_ENV} must be an integer in [1, {MAX_LAYERS}], got {raw!r}"
+        ) from None
+    if not 1 <= value <= MAX_LAYERS:
+        raise ValueError(
+            f"{LAYERS_ENV} must be an integer in [1, {MAX_LAYERS}], got {value}"
+        )
+    return value
+
+
 def item(name: str) -> bool:
     """Whether one item is armed.  Unknown names raise."""
 
@@ -240,8 +323,15 @@ _RECEIPT_ZERO: dict[str, float] = {
     # A queued prefix abandoned without a join (capacity/route generation
     # moved under it, or the cycle never reached the M4 verify).
     "prefix_discarded": 0,
-    # install_fixed_m4_split re-runs after a capacity/route transition.
+    # install_fixed_m4_overlap_split re-runs after a capacity/route transition.
     "split_rebuilds": 0,
+    # W67: the prefix depth actually INSTALLED (not the one requested).  Set
+    # once, by the install; a receipt whose `prefix_layers` is not the N the
+    # arm asked for measured a different partition than its label claims.
+    "prefix_layers": 0,
+    # W67: windows whose PLE auxiliary was built at the ENQUEUE (the hoist),
+    # i.e. windows whose prefix contains the PLE layer.  Zero at N=1.
+    "aux_hoisted": 0,
     # timing item (ms, cumulative over the request).
     "prefix_build_ms": 0.0,
     "prefix_build_calls": 0,
@@ -272,30 +362,50 @@ def bump(name: str, value: float = 1) -> None:
     _RECEIPT[name] = _RECEIPT[name] + value
 
 
+def note_prefix_layers(count: int) -> None:
+    """Record the prefix depth the install actually compiled."""
+
+    _RECEIPT["prefix_layers"] = int(count)
+
+
+def note_aux_hoisted() -> None:
+    """Record one window whose PLE auxiliary was built before the prefix."""
+
+    _RECEIPT["aux_hoisted"] = _RECEIPT["aux_hoisted"] + 1
+
+
 def note_prefix_build(seconds: float) -> None:
-    """Fold one layer-0 prefix host replay into the receipt."""
+    """Fold one N-layer prefix host replay into the receipt."""
 
     _RECEIPT["prefix_build_ms"] = _RECEIPT["prefix_build_ms"] + seconds * 1000.0
     _RECEIPT["prefix_build_calls"] = _RECEIPT["prefix_build_calls"] + 1
 
 
 def note_suffix_build(seconds: float) -> None:
-    """Fold one layers-1..47 suffix host replay into the receipt."""
+    """Fold one layers-N..47 suffix host replay into the receipt."""
 
     _RECEIPT["suffix_build_ms"] = _RECEIPT["suffix_build_ms"] + seconds * 1000.0
     _RECEIPT["suffix_build_calls"] = _RECEIPT["suffix_build_calls"] + 1
 
 
-def engagement_line() -> str | None:
-    """The one line a request prints when this lane is armed, else ``None``."""
+def engagement_line(installed_layers: int | None = None) -> str | None:
+    """The one line a request prints when this lane is armed, else ``None``.
+
+    ``installed_layers`` is what the bank actually compiled; when it differs
+    from :func:`layers` the line says both, because a reader who sees only the
+    requested N would attribute the arm's number to the wrong partition.
+    """
 
     if not enabled():
         return None
     armed = ",".join(sorted(items())) or "-"
+    requested = layers()
+    depth = requested if installed_layers is None else int(installed_layers)
+    mismatch = "" if depth == requested else f" (requested {requested})"
     return (
-        f"[{ENV_FLAG}] armed: fixed-M4 verify split at layer 0/1; "
-        f"layer-0 prefix queued at verify_input_array, ahead of the PLE aux "
-        f"and the suffix replay; items={armed}"
+        f"[{ENV_FLAG}] armed: fixed-M4 verify split at layer {depth - 1}/{depth}"
+        f"{mismatch}; layers 0..{depth - 1} queued at verify_input_array, "
+        f"ahead of the suffix replay; items={armed}"
     )
 
 

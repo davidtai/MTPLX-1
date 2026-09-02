@@ -9337,12 +9337,16 @@ def generate_mtpk(
         and _compiled_verify_mode == "on"
         and verify_strategy not in {"capture_commit", "graphbank_capture_commit"}
     ):
-        compiled_verify_bank.arm_fixed_m4_graph_build_overlap()
+        _graph_overlap_layers = (
+            compiled_verify_bank.arm_fixed_m4_graph_build_overlap()
+        )
         _graph_overlap_enqueue = (
             compiled_verify_bank.enqueue_fixed_m4_overlap_prefix
         )
         _fixed_m4_verify = compiled_verify_bank.forward_fixed_m4_overlap
-        _graph_overlap_engagement = _graph_build_overlap.engagement_line()
+        _graph_overlap_engagement = _graph_build_overlap.engagement_line(
+            _graph_overlap_layers
+        )
         if _graph_overlap_engagement is not None:
             print(_graph_overlap_engagement, flush=True)
     elif _graph_build_overlap.enabled():
@@ -12678,21 +12682,30 @@ def generate_mtpk(
             )
             verified_token_count = len(verify_input)
             verify_input_array = mx.array([verify_input])
-        # MTPLX_FABLE_GRAPH_BUILD_OVERLAP (W63).  The earliest statement at
-        # which this window's four ids exist -- the drafts have just come
-        # across (the retained stack's draft loop syncs once per depth, so
-        # the last depth's sync is what `verify_input` is waiting on) and
-        # nothing between here and the verify reads them again.
+        # MTPLX_FABLE_GRAPH_BUILD_OVERLAP (W63; depth from
+        # MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS, W67).  The earliest
+        # statement at which this window's four ids exist -- the drafts have
+        # just come across (the retained stack's draft loop syncs once per
+        # depth, so the last depth's sync is what `verify_input` is waiting
+        # on) and nothing between here and the verify reads them again.
         #
-        # Queueing target-embedding + layer 0 HERE, on the same
+        # Queueing target-embedding + layers 0..N-1 HERE, on the same
         # `verify_input_array` the monolithic route would pass, gives the GPU
-        # ~0.5-0.6 ms of work to run under the host's PLE row read and the
-        # ~1.9 ms/cycle the retained-stack census measures the GPU idling
-        # while the compiled verify graph is replayed on the host
+        # ~0.53 ms per prefix layer to run under the ~1.9 ms/cycle the
+        # retained-stack census measures the GPU idling while the compiled
+        # verify graph is replayed on the host
         # (w58-retained-control-census-1788370322: 382/382 cycles, 86.9 %
-        # host-late, median 1.690 ms).  Layer 0 is exactly the part of the
-        # window that does not read the PLE auxiliary: the production config
-        # has ONE PLE layer, at index 1.
+        # host-late, median 1.690 ms).
+        #
+        # `host_input_ids` / `completion_tokens` ride along for W67's aux
+        # hoist: at depth > 1 the prefix contains the PLE layer (the
+        # production config has ONE, at index 1), so the bank builds this
+        # window's PLE auxiliary here -- it needs only the drafted token
+        # VALUES, which arrived with the window -- and carries it to the
+        # join.  `tokens` is not mutated between here and the verify, and the
+        # verify passes the same three arguments.  At depth 1 the bank
+        # ignores them and the join builds the auxiliary where the shipped
+        # route builds it.
         if (
             _graph_overlap_enqueue is not None
             and verified_token_count == 4
@@ -12702,6 +12715,8 @@ def generate_mtpk(
                 verify_input_array,
                 committed_count=len(tokens) - 1,
                 cache=cache,
+                host_input_ids=verify_input,
+                completion_tokens=tokens,
             )
         if lazy_bonus_verify:
             lazy_bonus_verify_calls += 1

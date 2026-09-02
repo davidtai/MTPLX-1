@@ -176,6 +176,12 @@ command buffer pays its own commit→start latency (the census measures 0.25 ms 
 as driver, and gap A's one-kernel buffer paid 362.8 µs on census D), and the split costs a
 second tree-flatten and a second `async_eval` of host time.
 
+> **Built as W67.** `docs/perf/graph-build-overlap-nlayer.md` takes the
+> follow-on below: `MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS=N` (default 1, i.e.
+> this partition unchanged) with `prepare_aux` hoisted ahead of the prefix at
+> N > 1, a generalized `install_fixed_m4_overlap_split`, and the per-layer
+> dependency table this section guesses at derived from the code.
+
 **The bigger prize, as design, not code.** Nothing forces the prefix to stop at layer 0 — only
 the aux dependency does, and `prepare_aux` could be hoisted ahead of the prefix (it is host
 work the cycle already pays). With an N-layer prefix the saving is

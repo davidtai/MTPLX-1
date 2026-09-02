@@ -692,17 +692,41 @@ def _graph_build_overlap_armed() -> bool:
         return False
 
 
-def _graph_build_overlap_receipt() -> dict[str, float]:
-    """W63 engagement: how many windows actually ran the split submission.
+def _graph_build_overlap_layers() -> int | None:
+    """The prefix depth this process was ASKED for, straight from the env.
 
-    ``prefix_enqueued`` counts windows whose layer-0 graph was queued ahead of
-    the D3 host sync and ``suffix_joined`` those that then ran the layers-1..47
-    graph on it.  The verdict gate is ``monolithic_windows``: an arm that
-    claims the lever and shows windows on the shipped monolithic route took
-    the control's code for them, so its delta is diluted by exactly that
+    Paired with the receipt's ``prefix_layers`` (the depth the bank actually
+    installed): a row where they disagree measured a partition its label does
+    not name.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import LAYERS_ENV
+
+        raw = (os.environ.get(LAYERS_ENV) or "").strip()
+        return int(raw, 10) if raw else None
+    except Exception:
+        return None
+
+
+def _graph_build_overlap_receipt() -> dict[str, float]:
+    """W63/W67 engagement: how many windows actually ran the split submission.
+
+    ``prefix_enqueued`` counts windows whose ``0..N-1`` graph was queued ahead
+    of the D3 host sync and ``suffix_joined`` those that then ran the
+    ``N..47`` graph on it.  The verdict gate is ``monolithic_windows``: an arm
+    that claims the lever and shows windows on the shipped monolithic route
+    took the control's code for them, so its delta is diluted by exactly that
     fraction.  ``prefix_discarded`` should stay at or near zero -- every one is
-    a layer-0 forward computed and thrown away.  The ``*_ms`` fields are
-    populated only when ``timing`` is in
+    a prefix forward computed and thrown away.
+
+    ``prefix_layers`` is the depth the bank INSTALLED, and it is the first
+    thing to read on a W67 arm: if it is not the N the arm's
+    ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS`` asked for, the row belongs to a
+    different partition.  ``aux_hoisted`` counts windows whose PLE auxiliary
+    was built at the enqueue rather than in the join; it is 0 at depth 1 and
+    should equal ``prefix_enqueued`` at any depth past the PLE layer.  The
+    ``*_ms`` fields are populated only when ``timing`` is in
     ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_ITEMS``.
     """
 
@@ -828,6 +852,7 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             # these rows already reads `ple_hot_rows`.
             "graph_build_overlap": _graph_build_overlap_receipt(),
             "graph_build_overlap_armed": _graph_build_overlap_armed(),
+            "graph_build_overlap_layers": _graph_build_overlap_layers(),
             # Which gather path each big row read actually took.  The pread
             # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
             # fancy index behind it, so an arm that claims the vectorised lane

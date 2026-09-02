@@ -848,6 +848,133 @@ def _forward_fixed_m4_suffix(
     return logits, hidden, captures
 
 
+def _collect_fixed_m4_captures(
+    inner: Any, cache, indices, where: str
+) -> dict[int, dict[str, mx.array]]:
+    """Harvest one contiguous layer range's capture rows off the cache.
+
+    Byte-for-byte the harvest ``_forward_fixed_m4_suffix`` does, factored out
+    so the W67 N-layer prefix and suffix agree with it and with each other.
+    ``_forward_fixed_m4_prefix`` / ``_forward_fixed_m4_suffix`` themselves are
+    PR391's and are NOT routed through this (their source is pinned).
+    """
+
+    captures: dict[int, dict[str, mx.array]] = {}
+    for index in indices:
+        layer = inner.layers[index]
+        if not layer.is_linear:
+            continue
+        entry = cache[index]
+        rows = getattr(entry, "_mtplx_verify_rows", None)
+        if rows is None or len(rows) != len(_GDN_ROW_NAMES):
+            raise RuntimeError(
+                f"qwen4 fixed-M4 {where} missing GDN rows at layer {index}"
+            )
+        layer_capture = dict(zip(_GDN_ROW_NAMES, rows))
+        if getattr(layer, "ple", None) is not None:
+            ple_rows = getattr(entry, "_mtplx_verify_ple", None)
+            if ple_rows is None or len(ple_rows) != len(_PLE_ROW_NAMES):
+                ple_base = getattr(entry, "_mtplx_verify_ple", None)
+                ple_conv_rows = getattr(entry, "_mtplx_verify_ple_conv_rows", None)
+                if ple_base is None or len(ple_base) != 2 or ple_conv_rows is None:
+                    raise RuntimeError(
+                        f"qwen4 fixed-M4 {where} missing PLE rows at layer {index}"
+                    )
+                ple_rows = (*ple_base, ple_conv_rows)
+            layer_capture.update(zip(_PLE_ROW_NAMES, ple_rows))
+        captures[index] = layer_capture
+    return captures
+
+
+def _forward_fixed_m4_overlap_prefix(
+    self: Any,
+    input_ids,
+    *,
+    cache,
+    layer_count: int,
+    compiled_aux=None,
+):
+    """W67: run target embedding and layers ``0..layer_count-1``.
+
+    The generalization of ``_forward_fixed_m4_prefix``, which stays wired to
+    layer 0 for PR391's device-committed split lane.  ``compiled_aux`` is
+    required exactly when the single PLE layer falls inside the prefix, and
+    it is then the SAME object the suffix and the monolithic route are handed
+    -- the prefix does not build its own.
+    """
+
+    inner = _inner(self)
+    count = int(layer_count)
+    if not 1 <= count < len(inner.layers):
+        raise ValueError(
+            f"qwen4 fixed-M4 overlap prefix depth {count} is outside "
+            f"[1, {len(inner.layers) - 1}]"
+        )
+    hidden = inner.embed_tokens(input_ids)
+    hidden = mx.tile(hidden, (1, 1, int(inner.args.hc_count)))
+    with verify_capture_scope(), compiled_verify_ple_scope(compiled_aux):
+        for index in range(count):
+            layer = inner.layers[index]
+            entry = cache[index]
+            if getattr(layer, "ple", None) is not None:
+                if compiled_aux is None:
+                    raise RuntimeError(
+                        "qwen4 fixed-M4 overlap prefix reaches the PLE layer "
+                        f"at index {index} without a compiled auxiliary"
+                    )
+                entry._mtplx_verify_ple = (hidden, input_ids)
+            hidden = layer(
+                hidden,
+                input_ids=input_ids,
+                ssm_mask=None,
+                cache=entry,
+            )
+    captures = _collect_fixed_m4_captures(
+        inner, cache, range(count), "overlap prefix"
+    )
+    return hidden, captures
+
+
+def _forward_fixed_m4_overlap_suffix(
+    self: Any,
+    prefix_hidden,
+    input_ids,
+    *,
+    cache,
+    compiled_aux,
+    start: int,
+):
+    """W67: run layers ``start..47`` and the target head on a prefix hidden."""
+
+    text = _text_model(self)
+    inner = text.model
+    first = int(start)
+    if not 1 <= first < len(inner.layers):
+        raise ValueError(
+            f"qwen4 fixed-M4 overlap suffix start {first} is outside "
+            f"[1, {len(inner.layers) - 1}]"
+        )
+    hidden = prefix_hidden
+    with verify_capture_scope(), compiled_verify_ple_scope(compiled_aux):
+        for index in range(first, len(inner.layers)):
+            layer = inner.layers[index]
+            entry = cache[index]
+            if getattr(layer, "ple", None) is not None:
+                entry._mtplx_verify_ple = (hidden, input_ids)
+            hidden = layer(
+                hidden,
+                input_ids=input_ids,
+                ssm_mask=None,
+                cache=entry,
+            )
+
+    captures = _collect_fixed_m4_captures(
+        inner, cache, range(first, len(inner.layers)), "overlap suffix"
+    )
+    logits = text._head_logits(inner.hyper_connection_mixer(hidden))
+    return logits, hidden, captures
+
+
 def _commit_compiled_verify_captures(
     self: Any, cache, captures: dict[int, dict[str, mx.array]]
 ) -> None:
@@ -1218,6 +1345,15 @@ def install_qwen4_fixed_verify_route(
     )
     runtime.forward_fixed_m4_suffix = MethodType(
         _forward_fixed_m4_suffix, runtime
+    )
+    # W67 (MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS): the N-layer pair.  Bound
+    # alongside PR391's layer-0 pair, never in place of it -- the two lanes
+    # compile different closures and neither is on the other's path.
+    runtime.forward_fixed_m4_overlap_prefix = MethodType(
+        _forward_fixed_m4_overlap_prefix, runtime
+    )
+    runtime.forward_fixed_m4_overlap_suffix = MethodType(
+        _forward_fixed_m4_overlap_suffix, runtime
     )
     runtime.prepare_compiled_verify_aux = MethodType(
         _prepare_compiled_verify_aux, runtime

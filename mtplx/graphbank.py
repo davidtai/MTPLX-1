@@ -144,6 +144,14 @@ class FixedM4OverlapPrefix:
     outputs: tuple[Any, ...]
     generation: int
     committed_count: int
+    #: W67.  ``None`` at depth 1, where the prefix reads no PLE auxiliary and
+    #: the join builds it exactly where the shipped route builds it.  At depth
+    #: > 1 the prefix CONTAINS the PLE layer, so the auxiliary is built at the
+    #: enqueue and carried here -- built once per window either way, and
+    #: reused (not rebuilt) even when the join refuses the prefix.
+    compiled_aux: Any = None
+    #: The prefix depth this object was produced at, for the receipt.
+    layer_count: int = 1
 
 
 @dataclass
@@ -1982,6 +1990,12 @@ class CompiledVerifyBank:
         # generation).
         self._fixed_m4_overlap_prefix: FixedM4OverlapPrefix | None = None
         self._fixed_m4_split_generation: int = -1
+        # W67: the prefix depth this bank compiled its overlap pair at.  Set
+        # by ``arm_fixed_m4_graph_build_overlap`` from
+        # ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS``; 1 is W63's partition.
+        self._fixed_m4_overlap_layers: int = (
+            _graph_build_overlap.DEFAULT_LAYERS
+        )
         # The Qwen4 fixed-M4 lane installs one construction-owned replay plan
         # after prompt prefill.  Production calls then bypass the generic
         # eligibility, promotion, bucket, shadow, and fallback machinery.
@@ -2453,7 +2467,19 @@ class CompiledVerifyBank:
         completion_tokens,
         committed_count: int,
         cache: Any,
+        *,
+        compiled_aux=None,
     ):
+        """Run the installed monolithic physical-M4 verify graph.
+
+        ``compiled_aux`` is W67's only concession: when the graph-build
+        overlap lane already built THIS window's auxiliary at its enqueue and
+        then refused its prefix, the fallback reuses that object rather than
+        running ``prepare_aux`` a second time in one cycle (which would repeat
+        its owned-row install and candidate resolve).  Left ``None`` -- as
+        every shipped caller leaves it -- this method is unchanged.
+        """
+
         dispatch = self._fixed_m4_dispatch
         assert dispatch is not None
         self._transition_fixed_m4_generation(
@@ -2480,12 +2506,13 @@ class CompiledVerifyBank:
             else:
                 state_in.extend(entry.cache[:n_leaves])
 
-        compiled_aux = dispatch["prepare_aux"](
-            input_ids,
-            host_input_ids,
-            completion_tokens,
-            committed_count,
-        )
+        if compiled_aux is None:
+            compiled_aux = dispatch["prepare_aux"](
+                input_ids,
+                host_input_ids,
+                completion_tokens,
+                committed_count,
+            )
         if boundary in ("both", "pre"):
             if dispatch["returns_aux"]:
                 mx.async_eval(*state_in)
@@ -2710,10 +2737,13 @@ class CompiledVerifyBank:
             cache,
         )
 
-    # -- W63 graph-build overlap (MTPLX_FABLE_GRAPH_BUILD_OVERLAP) ---------
+    # -- W63/W67 graph-build overlap (MTPLX_FABLE_GRAPH_BUILD_OVERLAP) -----
     #
-    # Same two compiled graphs as the PR391 split lane above
-    # (``install_fixed_m4_split``), a different transaction shape.  The lane
+    # The SAME partition idea as the PR391 split lane above
+    # (``install_fixed_m4_split``) but its own compiled pair
+    # (``install_fixed_m4_overlap_split``, depth
+    # ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS``, default 1) and its own
+    # transaction shape.  PR391's pair is left byte-identical.  The lane
     # above is a device-committed transaction that stays unpublished until
     # ``commit_fixed_m4_device_window`` selects the authoritative frontier;
     # this one is a pure SUBMISSION-TIMING change to the retained route --
@@ -2729,38 +2759,320 @@ class CompiledVerifyBank:
             self.stats["fixed_m4_route_transitions"]
         )
 
+    def _fixed_m4_ple_layer_index(self) -> int:
+        """Index of the single PLE layer, read off the capture layout.
+
+        The capture layout is the runtime's own census
+        (``_mtplx_capture_extra_layout``): every linear layer contributes the
+        six GDN row names, and exactly one of them additionally contributes
+        the three PLE names.  Deriving the index from it rather than from the
+        model means a config with the PLE somewhere else partitions correctly
+        and a config with more than one PLE layer RAISES here instead of
+        producing a prefix that silently reads an auxiliary it was not given.
+        """
+
+        ple = tuple(
+            int(index)
+            for index, names in self._extra_capture_layout
+            if "ple_hidden" in names
+        )
+        if len(ple) != 1:
+            raise RuntimeError(
+                "fixed-M4 overlap split requires exactly one PLE layer in the "
+                f"capture layout; found {ple}"
+            )
+        return ple[0]
+
+    def _make_fixed_m4_overlap_prefix_step(
+        self,
+        dispatch,
+        *,
+        layer_count: int,
+        capture_len: int,
+        needs_aux: bool,
+    ):
+        """W67: the traced closure for layers ``0..layer_count-1``.
+
+        Structurally the suffix step's mirror image -- it seeds the shadow
+        slots for its own layer range from its explicit inputs, runs the
+        range, and returns ``(hidden, *captures, *state_out)`` in the layout
+        the join unpacks.  ``needs_aux`` selects the arity: at depth 1 the
+        prefix has no ``compiled_aux`` parameter at all, so ``mx.compile``
+        traces exactly the graph W63 traced.
+        """
+
+        bank = self
+        prefix_plan = dispatch["state_plan"][:layer_count]
+        prefix_capture = self._extra_capture_layout[:capture_len]
+
+        def _run(input_ids, compiled_aux, state_in):
+            pos = 0
+            for (index, _spec_kind, _spec_leaves), (
+                kind,
+                _entry,
+                n_leaves,
+            ) in zip(bank._spec[:layer_count], prefix_plan):
+                shadow_entry = bank._shadow[index]
+                if kind == VERIFY_SPEC_KIND_QSA:
+                    shadow_entry.kv.cache[0] = state_in[pos]
+                    shadow_entry.kv.cache[1] = state_in[pos + 1]
+                    shadow_entry.kv.cache[2] = state_in[pos + 2]
+                    shadow_entry.raw_keys = state_in[pos + 3]
+                    shadow_entry.pooled = state_in[pos + 4]
+                    for slot in range(len(shadow_entry.kv.rollback_state)):
+                        shadow_entry.kv.rollback_state[slot] = None
+                else:
+                    for slot in range(n_leaves):
+                        shadow_entry.cache[slot] = state_in[pos + slot]
+                pos += n_leaves
+            hidden, captures = bank.runtime.forward_fixed_m4_overlap_prefix(
+                input_ids,
+                cache=bank._shadow,
+                layer_count=layer_count,
+                compiled_aux=compiled_aux,
+            )
+            captures_flat = []
+            for index, names in prefix_capture:
+                layer_capture = captures[index]
+                captures_flat.extend(layer_capture[name] for name in names)
+            state_out = []
+            for (index, _spec_kind, _spec_leaves), (
+                plan_kind,
+                _entry,
+                n_leaves,
+            ) in zip(bank._spec[:layer_count], prefix_plan):
+                shadow_entry = bank._shadow[index]
+                if plan_kind == VERIFY_SPEC_KIND_QSA:
+                    state_out.extend(shadow_entry.state_leaves)
+                else:
+                    state_out.extend(shadow_entry.cache[:n_leaves])
+            return (hidden, *captures_flat, *state_out)
+
+        if needs_aux:
+
+            def prefix_step(input_ids, compiled_aux, *state_in):
+                return _run(input_ids, compiled_aux, state_in)
+
+        else:
+
+            def prefix_step(input_ids, *state_in):
+                return _run(input_ids, None, state_in)
+
+        return prefix_step
+
+    def _make_fixed_m4_overlap_suffix_step(
+        self,
+        dispatch,
+        *,
+        start_layer: int,
+        capture_start: int,
+    ):
+        """W67: the traced closure for layers ``start_layer..last`` + head."""
+
+        bank = self
+        suffix_plan = dispatch["state_plan"][start_layer:]
+        suffix_capture = self._extra_capture_layout[capture_start:]
+        returns_aux = bool(dispatch["returns_aux"])
+        graph_aux = dispatch["graph_aux"]
+
+        def suffix_step(prefix_hidden, input_ids, compiled_aux, *state_in):
+            pos = 0
+            for (index, _spec_kind, _spec_leaves), (
+                kind,
+                _entry,
+                n_leaves,
+            ) in zip(bank._spec[start_layer:], suffix_plan):
+                shadow_entry = bank._shadow[index]
+                if kind == VERIFY_SPEC_KIND_QSA:
+                    shadow_entry.kv.cache[0] = state_in[pos]
+                    shadow_entry.kv.cache[1] = state_in[pos + 1]
+                    shadow_entry.kv.cache[2] = state_in[pos + 2]
+                    shadow_entry.raw_keys = state_in[pos + 3]
+                    shadow_entry.pooled = state_in[pos + 4]
+                    for slot in range(len(shadow_entry.kv.rollback_state)):
+                        shadow_entry.kv.rollback_state[slot] = None
+                else:
+                    for slot in range(n_leaves):
+                        shadow_entry.cache[slot] = state_in[pos + slot]
+                pos += n_leaves
+            if graph_aux is not None:
+                compiled_aux = graph_aux(compiled_aux)
+            logits, hidden, captures = (
+                bank.runtime.forward_fixed_m4_overlap_suffix(
+                    prefix_hidden,
+                    input_ids,
+                    cache=bank._shadow,
+                    compiled_aux=compiled_aux,
+                    start=start_layer,
+                )
+            )
+            captures_flat = []
+            for index, names in suffix_capture:
+                layer_capture = captures[index]
+                captures_flat.extend(layer_capture[name] for name in names)
+            state_out = []
+            for (index, _spec_kind, _spec_leaves), (
+                plan_kind,
+                _entry,
+                n_leaves,
+            ) in zip(bank._spec[start_layer:], suffix_plan):
+                shadow_entry = bank._shadow[index]
+                if plan_kind == VERIFY_SPEC_KIND_QSA:
+                    state_out.extend(shadow_entry.state_leaves)
+                else:
+                    state_out.extend(shadow_entry.cache[:n_leaves])
+            if returns_aux:
+                return (logits, hidden, compiled_aux, *captures_flat, *state_out)
+            return (logits, hidden, *captures_flat, *state_out)
+
+        return suffix_step
+
+    def install_fixed_m4_overlap_split(self, layer_count: int) -> None:
+        """W67: compile the ``0..N-1`` / ``N..last`` pair for THIS lane.
+
+        Separate from ``install_fixed_m4_split``, which is PR391's and whose
+        hard-coded layer-0 census ``tests/test_qwen4_fixed_host_tokens_static``
+        pins by source.  Every check below RAISES: it runs at the request
+        boundary (``arm_fixed_m4_graph_build_overlap``), where an arm that
+        cannot honour its own flag must fail loudly rather than quietly run
+        the control while wearing the candidate's label.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        assert dispatch is not None
+        spec = tuple(self._spec or ())
+        layer_indices = tuple(index for index, _kind, _n in spec)
+        if layer_indices != tuple(range(len(layer_indices))) or (
+            len(layer_indices) < 2
+        ):
+            raise RuntimeError(
+                "fixed-M4 overlap split requires one contiguous state plan"
+            )
+        if len(dispatch["state_plan"]) != len(layer_indices):
+            raise RuntimeError(
+                "fixed-M4 overlap split requires one state-plan entry per layer"
+            )
+        count = int(layer_count)
+        if not 1 <= count < len(layer_indices):
+            raise RuntimeError(
+                f"{_graph_build_overlap.LAYERS_ENV}={count} is outside "
+                f"[1, {len(layer_indices) - 1}] for this "
+                f"{len(layer_indices)}-layer verify plan"
+            )
+        if len(layer_indices) == 48 and (
+            dispatch["state_leaves"] != 134
+            or dispatch["capture_leaves"] != 219
+        ):
+            # 35*2 GDN + 1*4 PLE-GDN + 12*5 QSA = 134; 36*6 + 3 = 219.  The
+            # partition arithmetic below is exact for any census, but a drift
+            # here means the geometry this lane was priced on is gone.
+            raise RuntimeError(
+                "fixed-M4 overlap split production census changed: "
+                f"{dispatch['state_leaves']} state / "
+                f"{dispatch['capture_leaves']} capture leaves (want 134 / 219)"
+            )
+        ple_index = self._fixed_m4_ple_layer_index()
+        needs_aux = ple_index < count
+        if needs_aux and dispatch["returns_aux"]:
+            # The raw-q4 contract dequantizes the auxiliary INSIDE the graph
+            # that consumes it and returns the expanded array as the census's
+            # `_mtplx_verify_compiled_aux`.  With the PLE layer in the prefix
+            # that dequantization and that output would have to move to the
+            # prefix, which is a second aux contract this lane has never run.
+            raise RuntimeError(
+                f"{_graph_build_overlap.LAYERS_ENV}={count} puts the PLE layer "
+                f"(index {ple_index}) in the prefix, which requires the "
+                "materialized auxiliary contract; this request is on "
+                f"{dispatch['aux_contract']!r}"
+            )
+        capture_start = sum(
+            1 for index, _names in self._extra_capture_layout if index < count
+        )
+        prefix_state_leaves = sum(
+            n for _kind, _entry, n in dispatch["state_plan"][:count]
+        )
+        prefix_capture_leaves = sum(
+            len(names)
+            for _index, names in self._extra_capture_layout[:capture_start]
+        )
+        if not 0 < prefix_state_leaves < int(dispatch["state_leaves"]):
+            raise RuntimeError(
+                "fixed-M4 overlap split leaves no state on one side: "
+                f"{prefix_state_leaves} of {dispatch['state_leaves']}"
+            )
+        if not 0 < prefix_capture_leaves < int(dispatch["capture_leaves"]):
+            raise RuntimeError(
+                "fixed-M4 overlap split leaves no capture rows on one side: "
+                f"{prefix_capture_leaves} of {dispatch['capture_leaves']}"
+            )
+        dispatch["overlap_split"] = {
+            "prefix_fn": mx.compile(
+                self._make_fixed_m4_overlap_prefix_step(
+                    dispatch,
+                    layer_count=count,
+                    capture_len=capture_start,
+                    needs_aux=needs_aux,
+                )
+            ),
+            "suffix_fn": mx.compile(
+                self._make_fixed_m4_overlap_suffix_step(
+                    dispatch,
+                    start_layer=count,
+                    capture_start=capture_start,
+                )
+            ),
+            "layer_count": count,
+            "needs_aux": needs_aux,
+            "ple_layer_index": ple_index,
+            "prefix_plan_len": count,
+            "prefix_capture_plan_len": capture_start,
+            "prefix_state_leaves": prefix_state_leaves,
+            "prefix_capture_leaves": prefix_capture_leaves,
+            "suffix_capture_leaves": int(dispatch["capture_leaves"])
+            - prefix_capture_leaves,
+        }
+        _graph_build_overlap.note_prefix_layers(count)
+
     def _refresh_fixed_m4_split(self) -> int:
-        """Recompile the split pair when the plan changed generation.
+        """Recompile the overlap pair when the plan changed generation.
 
         ``_transition_fixed_m4_generation`` rebuilds the shadow and recompiles
         ``dispatch["fn"]`` on a capacity or route transition, but knows nothing
-        about ``dispatch["split"]``.  Recompiling here keeps the pair on the
-        same generation as the monolithic graph without editing the shared
+        about ``dispatch["overlap_split"]``.  Recompiling here keeps the pair on
+        the same generation as the monolithic graph without editing the shared
         transition (whose source ``tests/test_qwen4_fixed_host_tokens_static``
         pins for the PR391 lane).
         """
 
         generation = self._fixed_m4_generation()
         if generation != self._fixed_m4_split_generation:
-            self.install_fixed_m4_split()
+            self.install_fixed_m4_overlap_split(self._fixed_m4_overlap_layers)
             self._fixed_m4_split_generation = generation
             _graph_build_overlap.bump("split_rebuilds")
         return generation
 
-    def arm_fixed_m4_graph_build_overlap(self) -> None:
-        """Compile the layer-0/layers-1..47 pair once, at request setup.
+    def arm_fixed_m4_graph_build_overlap(
+        self, layer_count: int | None = None
+    ) -> int:
+        """Compile the ``0..N-1`` / ``N..last`` pair once, at request setup.
 
         Called only when ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP`` is armed.  Doing
         it here rather than lazily on the first cycle means an unsupported
-        state/capture census raises at the request boundary, where the arm is
-        readable, instead of mid-window.
+        state/capture census, an out-of-range depth or an aux contract the
+        prefix cannot carry raises at the request boundary, where the arm is
+        readable, instead of mid-window.  Returns the installed depth.
         """
 
         if self._fixed_m4_dispatch is None:
             raise RuntimeError(
                 "graph-build overlap requires an installed fixed-M4 verify"
             )
+        self._fixed_m4_overlap_layers = int(
+            _graph_build_overlap.layers() if layer_count is None else layer_count
+        )
+        self._fixed_m4_split_generation = -1
         self._refresh_fixed_m4_split()
+        return int(self._fixed_m4_overlap_layers)
 
     def discard_fixed_m4_overlap_prefix(self) -> None:
         """Drop an unjoined layer-0 prefix.  Idempotent."""
@@ -2776,17 +3088,28 @@ class CompiledVerifyBank:
         *,
         committed_count: int,
         cache,
+        host_input_ids=None,
+        completion_tokens=None,
     ) -> FixedM4OverlapPrefix:
-        """Queue target embedding + layer 0 ahead of the rest of the window.
+        """Queue target embedding + layers ``0..N-1`` ahead of the window.
 
         ``input_ids`` is the SAME ``[1,4]`` array the monolithic route is
-        handed, passed at the earliest statement that owns it -- ahead of
-        ``prepare_aux``'s PLE row read and ahead of the ~1.9 ms/cycle of
-        suffix replay the retained-stack census measures the GPU idling
-        through (382/382 cycles, 86.9 % host-late).  Nothing
-        here reads it on the host, so an unevaluated array is fine:
-        ``mx.compile``'s replay substitutes inputs into the traced graph by
-        shape and dtype and never evaluates them.
+        handed, passed at the earliest statement that owns it -- ahead of the
+        ~1.9 ms/cycle of suffix replay the retained-stack census measures the
+        GPU idling through (382/382 cycles, 86.9 % host-late).  Nothing here
+        reads it on the host, so an unevaluated array is fine: ``mx.compile``'s
+        replay substitutes inputs into the traced graph by shape and dtype and
+        never evaluates them.
+
+        **The W67 hoist.**  At depth 1 the prefix reads no PLE auxiliary and
+        this method never touches ``prepare_aux`` -- the join builds it where
+        the shipped route builds it.  At depth > 1 the prefix CONTAINS the PLE
+        layer, so the auxiliary is built HERE, from ``host_input_ids`` /
+        ``completion_tokens`` / ``committed_count``, none of which any layer
+        produces: the drafted token VALUES are all it needs and they arrived
+        with the window.  It is built exactly once per window either way, and
+        carried on the returned prefix so that even a window whose prefix the
+        join refuses reuses it instead of paying for a second one.
         """
 
         dispatch = self._fixed_m4_dispatch
@@ -2794,28 +3117,54 @@ class CompiledVerifyBank:
         # A prefix still in the slot belonged to a window that never reached
         # the verify.  Count it rather than overwriting it silently: the
         # receipt's `prefix_discarded` is how a reader learns the lane is
-        # computing layer-0 forwards it throws away.
+        # computing prefix forwards it throws away.
         self.discard_fixed_m4_overlap_prefix()
         self._transition_fixed_m4_generation(
             cache,
             committed_count=committed_count,
         )
         generation = self._refresh_fixed_m4_split()
-        split = dispatch["split"]
+        split = dispatch["overlap_split"]
+        layer_count = int(split["layer_count"])
+        needs_aux = bool(split["needs_aux"])
         if dispatch["donate"]:
             # Once per cycle, here rather than in the join: the traced prefix
-            # re-seeds the layer-0 shadow slots from its explicit inputs, and
-            # the suffix does the same for 1..47, so clearing before the FIRST
+            # re-seeds its own shadow slots from its explicit inputs, and the
+            # suffix does the same for the rest, so clearing before the FIRST
             # of the two submissions is what the monolithic route does before
             # its single one.
             self._clear_shadow_leaf_refs()
-        state_in = self._fixed_m4_state_inputs(dispatch["state_plan"][:1])
-        if _GRAPH_BUILD_OVERLAP_TIMING:
-            _started = time.perf_counter()
-            outputs = tuple(split["prefix_fn"](input_ids, *state_in))
-            _graph_build_overlap.note_prefix_build(time.perf_counter() - _started)
+        state_in = self._fixed_m4_state_inputs(
+            dispatch["state_plan"][:layer_count]
+        )
+        compiled_aux = None
+        if needs_aux:
+            if host_input_ids is None:
+                raise RuntimeError(
+                    "graph-build overlap past the PLE layer needs the "
+                    "window's host token ids at the enqueue"
+                )
+            compiled_aux = dispatch["prepare_aux"](
+                input_ids,
+                host_input_ids,
+                completion_tokens,
+                committed_count,
+            )
+            _graph_build_overlap.note_aux_hoisted()
+            if dispatch["boundary"] in ("both", "pre"):
+                # ``_prepare_compiled_verify_aux``'s contract: the auxiliary
+                # must cross the materialization boundary before it becomes an
+                # mx.compile input.  With the PLE layer in the prefix, the
+                # FIRST graph to consume it is the prefix, so the submission
+                # moves here with it.
+                mx.async_eval(compiled_aux, *state_in)
+            outputs = self._call_overlap_prefix(
+                split["prefix_fn"], input_ids, compiled_aux, state_in
+            )
         else:
-            outputs = tuple(split["prefix_fn"](input_ids, *state_in))
+            outputs = self._call_overlap_prefix(
+                split["prefix_fn"], input_ids, None, state_in
+            )
         capture_end = 1 + split["prefix_capture_leaves"]
         prefix = FixedM4OverlapPrefix(
             input_ids=input_ids,
@@ -2825,17 +3174,43 @@ class CompiledVerifyBank:
             outputs=outputs,
             generation=generation,
             committed_count=int(committed_count),
+            compiled_aux=compiled_aux,
+            layer_count=layer_count,
         )
         state_in = None
-        # NOT rebinding `entry.cache[:2]` here, unlike the monolithic route's
-        # pre-``async_eval`` commit: a window that falls back after this point
-        # must find layer 0's PRE-verify state on the live cache.  Layer 0's
-        # two GDN leaves are ~1.65 MB, and `before_verify`'s snapshot pins
-        # them for the whole cycle anyway, so no donation is lost by waiting.
+        # NOT rebinding the prefix layers' live cache slots here, unlike the
+        # monolithic route's pre-``async_eval`` commit: a window that falls
+        # back after this point must find those layers' PRE-verify state on
+        # the live cache.  They are a few MB, and `before_verify`'s snapshot
+        # pins them for the whole cycle anyway, so no donation is lost by
+        # waiting.
         mx.async_eval(*outputs)
         self._fixed_m4_overlap_prefix = prefix
         _graph_build_overlap.bump("prefix_enqueued")
         return prefix
+
+    @staticmethod
+    def _call_overlap_prefix(prefix_fn, input_ids, compiled_aux, state_in):
+        """Replay the prefix graph, timed when the ``timing`` item is armed.
+
+        The two arities are the point: at depth 1 the traced closure has no
+        ``compiled_aux`` parameter at all, so passing ``None`` positionally
+        would change its signature and its trace.
+        """
+
+        if _GRAPH_BUILD_OVERLAP_TIMING:
+            _started = time.perf_counter()
+            if compiled_aux is None:
+                outputs = tuple(prefix_fn(input_ids, *state_in))
+            else:
+                outputs = tuple(prefix_fn(input_ids, compiled_aux, *state_in))
+            _graph_build_overlap.note_prefix_build(
+                time.perf_counter() - _started
+            )
+            return outputs
+        if compiled_aux is None:
+            return tuple(prefix_fn(input_ids, *state_in))
+        return tuple(prefix_fn(input_ids, compiled_aux, *state_in))
 
     def forward_fixed_m4_overlap(
         self,
@@ -2848,11 +3223,11 @@ class CompiledVerifyBank:
         return_hidden: bool = True,
         hidden_variant: str | None = None,
     ):
-        """Join a queued layer-0 prefix with layers 1..47 and the head.
+        """Join a queued ``0..N-1`` prefix with ``N..last`` and the head.
 
         Falls back to the shipped monolithic route -- same call, same graph --
         whenever no usable prefix is queued, so the lane can never run a stale
-        layer 0 against a regrown capacity generation.
+        prefix against a regrown capacity generation.
         """
 
         del return_hidden, hidden_variant
@@ -2879,12 +3254,18 @@ class CompiledVerifyBank:
                 completion_tokens,
                 committed_count,
                 cache,
+                # W67: a refused prefix may already have paid for this
+                # window's auxiliary (the hoist).  Reuse it -- building a
+                # second one would run `prepare_aux`'s owned-row install and
+                # candidate resolve twice in one cycle.
+                compiled_aux=None if prefix is None else prefix.compiled_aux,
             )
-        split = dispatch["split"]
+        split = dispatch["overlap_split"]
         boundary = dispatch["boundary"]
         donate = dispatch["donate"]
+        layer_count = int(split["layer_count"])
 
-        suffix_plan = dispatch["state_plan"][1:]
+        suffix_plan = dispatch["state_plan"][layer_count:]
         state_in: list[Any] = []
         for kind, entry, n_leaves in suffix_plan:
             if kind == VERIFY_SPEC_KIND_QSA:
@@ -2900,17 +3281,37 @@ class CompiledVerifyBank:
             else:
                 state_in.extend(entry.cache[:n_leaves])
 
-        compiled_aux = dispatch["prepare_aux"](
-            prefix.input_ids,
-            host_input_ids,
-            completion_tokens,
-            committed_count,
-        )
-        if boundary in ("both", "pre"):
-            if dispatch["returns_aux"]:
+        if bool(split["needs_aux"]) is not (prefix.compiled_aux is not None):
+            # The prefix graph either consumes the auxiliary or it does not,
+            # and the enqueue and the join must agree about which -- a prefix
+            # that reached the PLE layer without one would have raised in the
+            # runtime forward, and one carrying an auxiliary the join then
+            # rebuilds would run `prepare_aux`'s side effects twice.
+            raise RuntimeError(
+                "graph-build overlap prefix/join auxiliary contract disagree: "
+                f"needs_aux={split['needs_aux']!r}, "
+                f"carried={prefix.compiled_aux is not None}"
+            )
+        if prefix.compiled_aux is None:
+            compiled_aux = dispatch["prepare_aux"](
+                prefix.input_ids,
+                host_input_ids,
+                completion_tokens,
+                committed_count,
+            )
+            if boundary in ("both", "pre"):
+                if dispatch["returns_aux"]:
+                    mx.async_eval(*state_in)
+                else:
+                    mx.async_eval(compiled_aux, *state_in)
+        else:
+            # Hoisted: the enqueue built it AND (under the same boundary
+            # condition) already put it across the materialization boundary,
+            # because the prefix graph consumed it.  Only the suffix's own
+            # state leaves are left to root here.
+            compiled_aux = prefix.compiled_aux
+            if boundary in ("both", "pre"):
                 mx.async_eval(*state_in)
-            else:
-                mx.async_eval(compiled_aux, *state_in)
         if _GRAPH_BUILD_OVERLAP_TIMING:
             _started = time.perf_counter()
             outputs = tuple(
@@ -2954,13 +3355,24 @@ class CompiledVerifyBank:
             if len(self._held_state_refs) > 3:
                 self._held_state_refs.pop(0)
 
-        # Layer 0's leaves come from the prefix, layers 1..47's from the
+        # Layers 0..N-1's leaves come from the prefix, N..last's from the
         # suffix; together they are byte-for-byte the census
         # ``_forward_installed_fixed_m4`` publishes from its single output
         # tuple, in the same order.
-        prefix_entry = dispatch["state_plan"][0][1]
-        for slot in range(split["prefix_state_leaves"]):
-            prefix_entry.cache[slot] = prefix.state_out[slot]
+        prefix_pos = 0
+        for kind, entry, n_leaves in dispatch["state_plan"][:layer_count]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = prefix.state_out[prefix_pos]
+                entry.kv.cache[1] = prefix.state_out[prefix_pos + 1]
+                entry.kv.cache[2] = prefix.state_out[prefix_pos + 2]
+                entry.raw_keys = prefix.state_out[prefix_pos + 3]
+                entry.pooled = prefix.state_out[prefix_pos + 4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            else:
+                for slot in range(n_leaves):
+                    entry.cache[slot] = prefix.state_out[prefix_pos + slot]
+            prefix_pos += n_leaves
         state_pos = 0
         for kind, entry, n_leaves in suffix_plan:
             if kind == VERIFY_SPEC_KIND_QSA:
@@ -2977,20 +3389,26 @@ class CompiledVerifyBank:
             state_pos += n_leaves
 
         capture_shift = split["prefix_capture_leaves"]
+        prefix_plan_len = int(split["prefix_capture_plan_len"])
         for plan_index, (entry, start, count) in enumerate(
             dispatch["capture_plan"]
         ):
-            if plan_index == 0:
-                # install_fixed_m4_split refuses unless capture_plan[0] IS the
-                # layer-0 state entry at offset 0 with exactly the six GDN
-                # rows, so this is the prefix's own capture, not a guess.
-                entry._mtplx_verify_rows = tuple(prefix.captures)
-                continue
-            offset = start - capture_shift
-            entry._mtplx_verify_rows = tuple(captures_flat[offset : offset + 6])
+            # ``install_fixed_m4_overlap_split`` splits the capture PLAN on
+            # the same layer boundary it splits the state plan, and the plan's
+            # offsets are cumulative over the whole layout, so `start` indexes
+            # the prefix's flat tuple directly below the shift and the
+            # suffix's above it.  Neither side is a guess about which entry
+            # owns which rows.
+            if plan_index < prefix_plan_len:
+                rows = prefix.captures
+                offset = start
+            else:
+                rows = captures_flat
+                offset = start - capture_shift
+            entry._mtplx_verify_rows = tuple(rows[offset : offset + 6])
             if count > 6:
                 entry._mtplx_verify_ple = tuple(
-                    captures_flat[offset + 6 : offset + count]
+                    rows[offset + 6 : offset + count]
                 )
                 entry._mtplx_verify_compiled_aux = returned_aux
 

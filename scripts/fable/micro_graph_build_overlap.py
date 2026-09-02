@@ -27,12 +27,27 @@ Two arms, in ONE process, on the same loaded runtime and the same prompt:
              host seconds -- the census's gap-B host term, measured from
              inside the process.
 
-``overlap``  Flag on.  The window is two compiled calls: a ~110-node layer-0
-             prefix, queued the statement after ``verify_input_array`` so the
-             GPU has ~0.53 ms of work to run under the host's snapshot, PLE
-             row read and suffix replay; then the ~5,090-node suffix.
+``overlap@N`` Flag on at prefix depth N (``--layers``, default ``1,2,3,4``).
+             The window is two compiled calls: an N-layer prefix, queued the
+             statement after ``verify_input_array`` so the GPU has ~0.53 ms
+             per prefix layer to run under the host's snapshot, PLE row read
+             and suffix replay; then the (48-N)-layer suffix.
              ``prefix_build_ms`` + ``suffix_build_ms`` per window is the same
              host work, split.
+
+             At N = 1 the prefix reads no PLE auxiliary (the single PLE layer
+             is index 1) and the auxiliary is built in the join, exactly where
+             the shipped route builds it.  At N > 1 the prefix CONTAINS the
+             PLE layer, so the auxiliary is hoisted to the enqueue -- built
+             once per window either way; ``aux_hoisted`` in the receipt should
+             equal the window count on those arms and be 0 at N = 1.
+
+             The predicted ceiling is ``min(N x 0.53, (48-N)/48 x 1.93)``
+             ms/cycle -- 0.53 / 1.06 / 1.59 / 1.77 at N = 1/2/3/4 -- so a
+             sweep that does not rise from N=1 to N=3 is telling you the
+             per-layer GPU estimate (verify-body GPU / 48) is wrong, and one
+             that rises and then falls at N=4 is telling you the host build
+             left to hide under has run out.
 
 The host columns answer "did the split move the host cost, or only the GPU
 work?" -- the honest expectation is that the host total is UNCHANGED or
@@ -60,7 +75,7 @@ RUN IT (guarded)::
     env PYTHONPATH=$W $PY $RG --plist $PLIST --lock-timeout-seconds 3600 \\
         --child-timeout-seconds 3600 \\
       -- env PYTHONPATH=$W $PY $W/scripts/fable/micro_graph_build_overlap.py \\
-           --prompt-tokens 16384 --max-tokens 192 --reps 2 \\
+           --prompt-tokens 16384 --max-tokens 192 --reps 2 --layers 1,2,3,4 \\
            --json $W/.benchmark-artifacts/fable/micro-graph-build-overlap.json
 
 Read ``windows`` first: an arm whose ``overlap.suffix_build_calls`` is not
@@ -176,15 +191,23 @@ def _arm_host_timers() -> None:
     graphbank._GRAPH_BUILD_OVERLAP_TIMING = True
 
 
-def _set_lane(enabled: bool) -> None:
-    """Arm or disarm the W63 lane for the NEXT ``generate_mtpk`` call."""
+def _set_lane(enabled: bool, layer_count: int = 1) -> None:
+    """Arm or disarm the lane, at one prefix depth, for the NEXT generate.
+
+    ``arm_fixed_m4_graph_build_overlap`` forces a recompile of the pair at
+    every request setup, so changing ``layer_count`` between arms really does
+    change the graph the next arm replays -- it does not reuse the previous
+    arm's partition.
+    """
 
     from mtplx import graph_build_overlap as lane
 
     os.environ["MTPLX_FABLE_GRAPH_BUILD_OVERLAP"] = "1" if enabled else "0"
+    os.environ["MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS"] = str(int(layer_count))
     lane.enabled.cache_clear()
     lane.items.cache_clear()
     lane.timing_enabled.cache_clear()
+    lane.layers.cache_clear()
     lane.reset_receipt()
 
 
@@ -195,6 +218,7 @@ def _run_arm(
     seed: int,
     enabled: bool,
     driver_args: Any,
+    layer_count: int = 1,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -203,7 +227,7 @@ def _run_arm(
     from mtplx.generation import generate_mtpk
     from scripts.fable import abba_driver
 
-    _set_lane(enabled)
+    _set_lane(enabled, layer_count)
     ple_boundary.reset_receipt()
     abba_driver.reset_run_caches(runtime, mx)
     mx.reset_peak_memory()
@@ -240,8 +264,14 @@ def _run_arm(
     import hashlib
 
     return {
-        "arm": "overlap" if enabled else "stock",
+        "arm": f"overlap@{int(layer_count)}" if enabled else "stock",
         "armed": bool(enabled),
+        "layers": int(layer_count) if enabled else 0,
+        # The depth the bank actually INSTALLED.  A row whose `arm` says 3 and
+        # whose `installed_layers` says 1 measured a different partition than
+        # its label claims and its delta belongs to no arm.
+        "installed_layers": int(overlap["prefix_layers"]),
+        "aux_hoisted": int(overlap["aux_hoisted"]),
         "wall_s": wall_s,
         "decode_elapsed_s": float(stats.decode_elapsed_s),
         "decode_tok_s": float(stats.decode_tok_s),
@@ -267,6 +297,14 @@ def _run_arm(
     }
 
 
+#: ``min(N x 0.53, (48-N)/48 x 1.93)`` -- the W63 census's per-layer GPU
+#: estimate (verify-body GPU / 48) against the host build it can hide under.
+#: Printed beside the measurement so an arm that lands nowhere near its own
+#: prediction is visible without arithmetic.
+def _predicted_saving_ms(layer_count: int) -> float:
+    return min(layer_count * 0.53, (48 - layer_count) / 48 * 1.934)
+
+
 def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     def _median(arm: str, field: str) -> float | None:
         values = [
@@ -276,7 +314,13 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ]
         return statistics.median(values) if values else None
 
-    summary: dict[str, Any] = {}
+    arms = []
+    for row in rows:
+        if row["arm"] not in arms:
+            arms.append(row["arm"])
+    overlap_arms = [arm for arm in arms if arm != "stock"]
+
+    summary: dict[str, Any] = {"arms": arms}
     for field in (
         "ms_per_window",
         "decode_tok_s",
@@ -286,21 +330,70 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "suffix_build_ms",
     ):
         stock = _median("stock", field)
-        overlap = _median("overlap", field)
-        summary[field] = {
-            "stock": stock,
-            "overlap": overlap,
-            "delta": None
-            if stock is None or overlap is None
-            else overlap - stock,
-        }
-    digests = {row["arm"]: row["response_token_sha256"] for row in rows}
+        entry: dict[str, Any] = {"stock": stock}
+        for arm in overlap_arms:
+            value = _median(arm, field)
+            entry[arm] = value
+            entry[f"{arm}_delta"] = (
+                None if stock is None or value is None else value - stock
+            )
+        summary[field] = entry
+
+    # The verdict table: one row per depth, measured against its own ceiling.
+    by_depth = []
+    stock_ms = _median("stock", "ms_per_window")
+    for arm in overlap_arms:
+        depth = int(arm.split("@")[1]) if "@" in arm else 1
+        measured = _median(arm, "ms_per_window")
+        arm_rows = [row for row in rows if row["arm"] == arm]
+        by_depth.append(
+            {
+                "arm": arm,
+                "layers": depth,
+                "installed_layers": sorted(
+                    {row["installed_layers"] for row in arm_rows}
+                ),
+                "predicted_saving_ms": round(_predicted_saving_ms(depth), 3),
+                "measured_saving_ms": None
+                if stock_ms is None or measured is None
+                else stock_ms - measured,
+                "monolithic_windows": sum(
+                    int(row["graph_build_overlap"]["monolithic_windows"])
+                    for row in arm_rows
+                ),
+                "prefix_discarded": sum(
+                    int(row["graph_build_overlap"]["prefix_discarded"])
+                    for row in arm_rows
+                ),
+                "aux_hoisted": sum(int(row["aux_hoisted"]) for row in arm_rows),
+                "windows": sum(int(row["windows"]) for row in arm_rows),
+                "token_digest_matches_stock": all(
+                    row["response_token_sha256"]
+                    == next(
+                        r["response_token_sha256"]
+                        for r in rows
+                        if r["arm"] == "stock"
+                    )
+                    for row in arm_rows
+                )
+                if any(row["arm"] == "stock" for row in rows)
+                else None,
+            }
+        )
+    summary["by_depth"] = by_depth
+
+    digests: dict[str, set] = {}
+    for row in rows:
+        digests.setdefault(row["arm"], set()).add(row["response_token_sha256"])
+    summary["token_digests"] = {
+        arm: sorted(values) for arm, values in digests.items()
+    }
+    stock_digests = digests.get("stock")
     summary["token_digest_match"] = (
-        digests.get("stock") == digests.get("overlap")
-        if len(digests) == 2
-        else None
+        None
+        if not stock_digests or len(overlap_arms) == 0
+        else all(digests[arm] == stock_digests for arm in overlap_arms)
     )
-    summary["token_digests"] = digests
     return summary
 
 
@@ -315,10 +408,26 @@ def main(argv: list[str] | None = None) -> int:
         default=2,
         help="ABBA-ordered arm pairs (stock, overlap, overlap, stock, ...).",
     )
+    parser.add_argument(
+        "--layers",
+        default="1,2,3,4",
+        help=(
+            "Prefix depths to price, comma separated "
+            "(MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS).  Each depth gets its "
+            "own overlap arm, ABBA-ordered against one shared stock arm per "
+            "rep, so one guarded window prices the whole sweep."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260829)
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--allow-unguarded", action="store_true")
     args = parser.parse_args(argv)
+
+    depths = tuple(
+        int(part.strip()) for part in str(args.layers).split(",") if part.strip()
+    )
+    if not depths or any(depth < 1 for depth in depths):
+        parser.error(f"--layers must be one or more positive integers, got {args.layers!r}")
 
     if not args.allow_unguarded and not os.environ.get(GUARD_ATTEST_FD_ENV):
         print(BANNER, file=sys.stderr)
@@ -373,16 +482,23 @@ def main(argv: list[str] | None = None) -> int:
         driver_args=driver_args,
     )
 
+    # One stock arm plus one overlap arm per depth, per rep.  The order is
+    # reversed on odd reps so no depth sits permanently on the warm or the
+    # cold side of the stock arm (the same reason the two-arm version was
+    # ABBA-ordered).
+    plan: list[tuple[bool, int]] = [(False, 0)] + [(True, d) for d in depths]
+
     rows: list[dict[str, Any]] = []
     for rep in range(int(args.reps)):
-        order = (False, True) if rep % 2 == 0 else (True, False)
-        for enabled in order:
+        order = plan if rep % 2 == 0 else list(reversed(plan))
+        for enabled, depth in order:
             row = _run_arm(
                 runtime=runtime,
                 cell=cell,
                 seed=args.seed,
                 enabled=enabled,
                 driver_args=driver_args,
+                layer_count=max(1, depth),
             )
             row["rep"] = rep
             rows.append(row)
@@ -393,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
                         key: row[key]
                         for key in (
                             "arm",
+                            "installed_layers",
+                            "aux_hoisted",
                             "windows",
                             "ms_per_window",
                             "decode_tok_s",
@@ -412,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
         "prompt_tokens": int(args.prompt_tokens),
         "max_tokens": int(args.max_tokens),
         "reps": int(args.reps),
+        "layers": list(depths),
         "seed": int(args.seed),
         "source": str(source_path),
         "rows": rows,
@@ -423,13 +542,28 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     if summary["token_digest_match"] is False:
+        diverged = [
+            entry["arm"]
+            for entry in summary["by_depth"]
+            if entry["token_digest_matches_stock"] is False
+        ]
         print(
-            "[micro_graph_build_overlap] WARNING: the two arms produced "
-            "different tokens -- the layer-0/layer-1 compile seam is NOT "
-            "bit-neutral here and no timing number below is a lever",
+            "[micro_graph_build_overlap] WARNING: these arms produced "
+            f"different tokens than stock: {diverged} -- the compile seam is "
+            "NOT bit-neutral at those depths and no timing number above is a "
+            "lever for them",
             file=sys.stderr,
             flush=True,
         )
+    for entry in summary["by_depth"]:
+        if entry["installed_layers"] not in ([entry["layers"]], []):
+            print(
+                "[micro_graph_build_overlap] WARNING: "
+                f"{entry['arm']} installed depth(s) {entry['installed_layers']} "
+                "-- this row measured a partition its label does not name",
+                file=sys.stderr,
+                flush=True,
+            )
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(payload, indent=2, sort_keys=True))
