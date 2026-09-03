@@ -2178,6 +2178,41 @@ PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps 
     --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-3seeds.json
 ```
 
+#### The log must hold the WHOLE committed stream
+
+One K20 row per verify window is not one row per committed token.
+`mtplx/context_copy.py` block rounds run their own verify forward over a
+verbatim slice of the prompt and commit the accepted prefix, the residual
+correction, and the next freshly sampled primary **without a K20 row**. Those
+tokens sit between one row's emission and the next row's `primary`.
+
+Measured on `k20-shadow-3seeds.npz` (2026-09-02, `fable-w51-k20-shadow`,
+sequence 1788400511): 1,113 windows over 3 requests of 1,024 tokens, but the
+rows account for only 948 / 966 / 856 of them — **302 of 3,072 tokens (9.8%)
+committed by the copy lane and absent from the file** (`context_copy.rounds`
+10 / 9 / 14, `verify_calls − compiled_m4_calls` = the same 10 / 9 / 14). The old
+reconstruction read each of the 21 resulting carry-in breaks as a request
+boundary and reported **24 segments for 3 requests**.
+
+The fix is in two places and both are needed:
+
+* `mtplx/fable_k20_log.py` records the gap — `carry_len` (every log) and
+  `carry_tokens` (when something carried), written by `K20RowLog.carry` /
+  `carry_round` / `carry_primary` from the copy round's own commit sites.
+  `flush` prints `carry=<tokens> in <gaps> gaps` so an armed run says so.
+* `segment_windows` no longer infers the boundary from the token stream at
+  all. It reads the window's PCG64 **stream id** (`rng_state[:, 2:4]`), which
+  is a property of the request's `Generator` and changes exactly at a request
+  boundary — on the file above it gives 382 / 390 / 341 windows, matching the
+  receipt's per-seed `compiled_m4_calls` exactly. It then *checks* the
+  reconstructed stream per segment and raises `TrajectoryGapError` on any break
+  a logged carry does not explain.
+
+So a log recorded before this accounting exists cannot be replayed if the copy
+lane fired, and the harness says so instead of inventing segments. Re-record it
+(either with a build that carries the accounting, or with `MTPLX_CONTEXT_COPY=0
+MTPLX_CONTEXT_COPY_BATCHED=0` so the lane never runs).
+
 `--expect-segments 3` asserts the reconstruction found three requests; if it
 finds two the trajectory does not match the run and the harness refuses to
 replay it. Re-scoring afterwards needs no GPU and no guard:
@@ -2199,7 +2234,9 @@ estimate; `--ms-per-window` / `--chain-ms` / `--prefill-s` move them.
 `tests/test_fable_shadow_draft_harness.py`, pure host, no MLX import — and one
 test proves none is possible: every device-side import in the module lives
 inside `build_replay_hooks`, checked by AST. It covers the segment
-reconstruction (carry-in break, stop-token end, three seeds), the acceptance law
+reconstruction (PCG64 stream id, carry-in break, stop-token end, three seeds,
+a recorded context-copy gap and the refusal of an unrecorded one), the
+acceptance law
 (exact match, disjoint support, a hand-computed Σ min, exact ties), the
 depth-conditional reach ladder against the marginal α, `E[tokens/window]` with
 and without a bonus, the realised accept count against a uniform tape, the
