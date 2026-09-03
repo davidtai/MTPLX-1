@@ -62,6 +62,7 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
+from mtplx import cache_identity as _cache_identity
 from mtplx import fable_gdn_keepmask_fold as _gdn_fold
 from mtplx.fable_indexer_reuse import (
     ENV_FLAG as FABLE_INDEXER_REUSE_ENV,
@@ -3218,8 +3219,17 @@ class QSAIndexer(nn.Module):
         # A weakref, not an id(): a collected cache's address can be reused,
         # and a stale anchor whose block ids outran a fresher, shorter history
         # would index past the pooled bank.
+        #
+        # W73: both ends of the identity compare go through
+        # `resolve_cache_entry`, so a forward that hands this layer a stand-in
+        # container (`_compiled_run_fn` does exactly that for the GDN layers)
+        # still matches the anchor.  A no-op today -- QSA layers are the
+        # `eager` half of `_build_decode_runs` and are never re-wrapped -- but
+        # the slab/graphbank arc is what puts them inside a compiled run, and
+        # a miss here is a silent DECLINE, which no counter distinguishes from
+        # a genuinely ineligible cycle.
         return (
-            anchor["cache"]() is cache
+            anchor["cache"]() is _cache_identity.resolve_cache_entry(cache)
             and anchor["next_depth"] == depth
             and anchor["k_eff"] == min(self.block_topk, int(nb_total))
         )
@@ -3305,7 +3315,9 @@ class QSAIndexer(nn.Module):
             self,
             "_indexer_reuse_anchor",
             {
-                "cache": weakref.ref(cache),
+                # W73: anchor the REAL entry, so a later depth that is handed
+                # a stand-in container still resolves to the same object.
+                "cache": weakref.ref(_cache_identity.resolve_cache_entry(cache)),
                 "next_depth": 2,
                 # int32 once, here, so the concatenate at depth 2/3 needs no
                 # cast and cannot disagree with argpartition's index dtype.
@@ -6441,6 +6453,11 @@ class Qwen4ExpTextModel(nn.Module):
     def _compiled_run_fn(self, idxs, capture: bool = False):
         layers = [self.layers[i] for i in idxs]
         indices = tuple(int(i) for i in idxs)
+        # W73.  The ONE per-layer stash this run reads back off the throwaway
+        # container.  Anything else a layer hangs on it dies with the
+        # container; `assert_no_dropped_stash` refuses that at trace time
+        # rather than letting the reader downstream keep the stale value.
+        forwarded_stash = ("_mtplx_verify_rows",) if capture else ()
 
         def step(h, *flat):
             out_states = []
@@ -6450,6 +6467,16 @@ class Qwen4ExpTextModel(nn.Module):
                 c = ArraysCache(size=2)
                 c[0], c[1] = flat[k], flat[k + 1]
                 k += 2
+                # W73.  This container is a stand-in for `cache[layer_index]`,
+                # and a lane that keys per-layer state by the identity of the
+                # container it is handed would miss it -- silently, and not
+                # always as a decline (see mtplx/cache_identity.py, and W66d
+                # below for the one that measured wrong logits for hours).
+                # Stamp the alias so `resolve_cache_entry` can see through the
+                # re-wrap, and so `_decode_layers_compiled` can assert that no
+                # declared lane was hidden by it.  Trace-time only: replays
+                # bind this graph positionally and never re-enter this body.
+                _cache_identity.bind_rewrapped_entry(c, layer_index)
                 if _GDN_KEEPMASK_FOLD_ARMED:
                     # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66d).  This run hands
                     # the layer a THROWAWAY container, not the compiled
@@ -6462,6 +6489,12 @@ class Qwen4ExpTextModel(nn.Module):
                     # prefix.  A no-op outside a traced folded forward.
                     _gdn_fold.bind_fold_alias(layer_index, c)
                 h = layer(h, input_ids=None, ssm_mask=None, cache=c)
+                _cache_identity.assert_no_dropped_stash(
+                    c,
+                    layer_index,
+                    forwarded=forwarded_stash,
+                    label="qwen4_exp compiled GDN decode run",
+                )
                 out_states.extend((c[0], c[1]))
                 if capture:
                     # __call__ ran under the capture scope during THIS trace,
@@ -6484,41 +6517,58 @@ class Qwen4ExpTextModel(nn.Module):
         if self._decode_runs is None:
             self._decode_runs = self._build_decode_runs()
         capture = _VERIFY_CAPTURE.get()
-        for kind, payload in self._decode_runs:
-            if kind == "eager":
-                i = payload
-                if capture and getattr(self.layers[i], "ple", None) is not None:
-                    cache[i]._mtplx_verify_ple = (h, inputs)
-                h = self.layers[i](
-                    h, input_ids=inputs, ssm_mask=None, cache=cache[i]
-                )
-                continue
-            idxs = payload
-            flat = []
-            usable = True
-            for i in idxs:
-                s0, s1 = cache[i][0], cache[i][1]
-                if s0 is None or s1 is None:
-                    usable = False
-                    break
-                flat.extend((s0, s1))
-            if not usable:
-                for i in idxs:
+        # W73.  `_compiled_run_fn` hands each layer a THROWAWAY container;
+        # publish the real cache so the traced body can stamp the alias back
+        # to `cache[i]`.  One ContextVar set/reset per forward -- the body
+        # that reads it runs only on a retrace.
+        rewrap_token = _cache_identity.push_rewrap_source(cache)
+        try:
+            for kind, payload in self._decode_runs:
+                if kind == "eager":
+                    i = payload
+                    if capture and getattr(self.layers[i], "ple", None) is not None:
+                        cache[i]._mtplx_verify_ple = (h, inputs)
                     h = self.layers[i](
                         h, input_ids=inputs, ssm_mask=None, cache=cache[i]
                     )
-                continue
-            out = self._get_run_fn(idxs, capture)(h, *flat)
-            h = out[0]
-            k = 1
-            for i in idxs:
-                cache[i][0] = out[k]
-                cache[i][1] = out[k + 1]
-                k += 2
-            if capture:
+                    continue
+                idxs = payload
+                flat = []
+                usable = True
                 for i in idxs:
-                    cache[i]._mtplx_verify_rows = tuple(out[k : k + 6])
-                    k += 6
+                    s0, s1 = cache[i][0], cache[i][1]
+                    if s0 is None or s1 is None:
+                        usable = False
+                        break
+                    flat.extend((s0, s1))
+                if not usable:
+                    for i in idxs:
+                        h = self.layers[i](
+                            h, input_ids=inputs, ssm_mask=None, cache=cache[i]
+                        )
+                    continue
+                out = self._get_run_fn(idxs, capture)(h, *flat)
+                # W73.  Checked HERE, while the trace that built this run is
+                # still on the stack: any lane that declared an expectation
+                # for a layer this run actually re-wrapped must have resolved
+                # it.  A no-op when no lane declared anything, and it cannot
+                # fire on a replay -- a replay re-enters no Python body, so it
+                # re-wraps nothing.
+                _cache_identity.assert_satisfied(
+                    idxs, label="qwen4_exp compiled GDN decode run"
+                )
+                h = out[0]
+                k = 1
+                for i in idxs:
+                    cache[i][0] = out[k]
+                    cache[i][1] = out[k + 1]
+                    k += 2
+                if capture:
+                    for i in idxs:
+                        cache[i]._mtplx_verify_rows = tuple(out[k : k + 6])
+                        k += 6
+        finally:
+            _cache_identity.pop_rewrap_source(rewrap_token)
         return h
 
     def clear_verify_capture(self, cache) -> None:
