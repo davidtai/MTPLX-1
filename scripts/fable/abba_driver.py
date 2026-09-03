@@ -567,6 +567,18 @@ def stats_receipt(
     first_primary_sample_time_s = float(
         getattr(stats, "first_primary_sample_time_s", 0.0)
     )
+    accept_probability_sums = getattr(
+        stats, "accept_probability_sum_by_depth", None
+    )
+    accept_probability_block: dict[str, Any] = (
+        {}
+        if accept_probability_sums is None
+        else {
+            "accept_probability_sum_by_depth": [
+                float(value) for value in accept_probability_sums
+            ]
+        }
+    )
     return {
         "sequence": sequence,
         "seed": seed,
@@ -589,6 +601,13 @@ def stats_receipt(
         "drafted_tokens": int(stats.drafted_tokens),
         "accepted_by_depth": list(stats.accepted_by_depth),
         "drafted_by_depth": list(stats.drafted_by_depth),
+        # The conditional expectation of the same accept coin
+        # ``accepted_by_depth`` counts: generate_mtpk sums the per-draft accept
+        # PROBABILITY at each depth, so sum/drafted is the same acceptance the
+        # counter estimates with the coin-flip variance taken out.  Omitted
+        # entirely (not zero-filled) when the runtime did not record it, so a
+        # receipt can never claim an unobserved acceptance of 0.
+        **accept_probability_block,
         "bonus_tokens": int(stats.bonus_tokens),
         "correction_tokens": int(stats.correction_tokens),
         "verify_calls": int(stats.verify_calls),

@@ -52,6 +52,14 @@ driver = _load_driver_module()
 
 
 def make_row(index, arm, seed, decode_tok_s, **overrides):
+    accepted_by_depth = overrides.pop("accepted_by_depth", [259, 187, 120])
+    drafted_by_depth = overrides.pop("drafted_by_depth", [382, 382, 382])
+    # ``None`` = the receipt never recorded the accept-probability sums, which
+    # is every receipt written before the driver carried them.  Pass a list to
+    # model a receipt that did.
+    accept_sums = overrides.pop("accept_probability_sum_by_depth", None)
+    accept_rate = window.per_depth_rates(accepted_by_depth, drafted_by_depth)
+    accept_prob = window.per_depth_rates(accept_sums, drafted_by_depth)
     row = {
         "index": index,
         "position_in_seed": index % 4,
@@ -81,8 +89,18 @@ def make_row(index, arm, seed, decode_tok_s, **overrides):
                + 66 * window.DEFAULT_COPY_TOKEN_COST_S)
         ) * 1000.0 / 382,
         "tokens_per_m4_window": (1024 - 66) / 382,
-        "accepted_by_depth": [259, 187, 120],
-        "drafted_by_depth": [382, 382, 382],
+        "accepted_by_depth": accepted_by_depth,
+        "drafted_by_depth": drafted_by_depth,
+        "accept_probability_sum_by_depth": accept_sums,
+        "accept_probability_recorded": accept_sums is not None,
+        "accept_rate_by_depth": accept_rate,
+        "mean_accept_probability_by_depth": accept_prob,
+        "conditional_accept_rate_by_depth": window.conditional_depth_ratios(
+            accept_rate
+        ),
+        "conditional_accept_probability_by_depth": (
+            window.conditional_depth_ratios(accept_prob)
+        ),
         "verify_forward_s": 11.5,
         "draft_s": 1.5,
         "digest": "e632b62c52044f544d00bed5f64350cc09806283bb19a473fe53db91157e1fdc",
@@ -500,6 +518,121 @@ class TestExtractRunRow(unittest.TestCase):
         self.assertEqual(row["context_copy_rounds"], 10)
 
 
+    # -- acceptance: the realised coin and its expectation ----------------
+
+    def test_realised_accept_rate_and_conditional_ratios(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        row = window.extract_run_row(self._receipt(), run)
+        self.assertEqual(row["accepted_by_depth"], [259, 187, 120])
+        self.assertEqual(row["drafted_by_depth"], [382, 382, 382])
+        for observed, expected in zip(
+            row["accept_rate_by_depth"], [259 / 382, 187 / 382, 120 / 382]
+        ):
+            self.assertAlmostEqual(observed, expected)
+        # d2|d1 first, then d3|d2.
+        for observed, expected in zip(
+            row["conditional_accept_rate_by_depth"], [187 / 259, 120 / 187]
+        ):
+            self.assertAlmostEqual(observed, expected)
+
+    def test_accept_probability_sums_are_carried_and_divided_by_drafted(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        receipt = self._receipt(
+            accept_probability_sum_by_depth=[286.5, 210.1, 133.4]
+        )
+        row = window.extract_run_row(receipt, run)
+        self.assertTrue(row["accept_probability_recorded"])
+        self.assertEqual(
+            row["accept_probability_sum_by_depth"], [286.5, 210.1, 133.4]
+        )
+        for observed, expected in zip(
+            row["mean_accept_probability_by_depth"],
+            [286.5 / 382, 210.1 / 382, 133.4 / 382],
+        ):
+            self.assertAlmostEqual(observed, expected)
+        for observed, expected in zip(
+            row["conditional_accept_probability_by_depth"],
+            [210.1 / 286.5, 133.4 / 210.1],
+        ):
+            self.assertAlmostEqual(observed, expected)
+
+    def test_an_old_receipt_has_no_expected_acceptance_not_a_zero_one(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        receipt = self._receipt()
+        self.assertNotIn(
+            "accept_probability_sum_by_depth", receipt["rows"][0]
+        )
+        row = window.extract_run_row(receipt, run)
+        self.assertFalse(row["accept_probability_recorded"])
+        self.assertIsNone(row["accept_probability_sum_by_depth"])
+        self.assertIsNone(row["mean_accept_probability_by_depth"])
+        self.assertIsNone(row["conditional_accept_probability_by_depth"])
+        # The realised coin is unaffected -- an old receipt still reports it.
+        self.assertIsNotNone(row["accept_rate_by_depth"])
+        self.assertIsNotNone(row["conditional_accept_rate_by_depth"])
+
+    def test_conditional_ratios_divide_rates_not_raw_counts(self):
+        """Depths drafted a different number of times still divide correctly.
+
+        Counts alone would say d2|d1 = 120/200 = 0.6; the depths were drafted
+        400 and 200 times, so the acceptance actually ROSE from 0.50 to 0.60.
+        """
+
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        row = window.extract_run_row(
+            self._receipt(
+                accepted_by_depth=[200, 120, 40],
+                drafted_by_depth=[400, 200, 100],
+                accept_probability_sum_by_depth=[180.0, 108.0, 45.0],
+            ),
+            run,
+        )
+        self.assertAlmostEqual(row["accept_rate_by_depth"][0], 0.50)
+        self.assertAlmostEqual(row["accept_rate_by_depth"][1], 0.60)
+        self.assertAlmostEqual(
+            row["conditional_accept_rate_by_depth"][0], 0.60 / 0.50
+        )
+        self.assertAlmostEqual(
+            row["conditional_accept_rate_by_depth"][1], 0.40 / 0.60
+        )
+        self.assertAlmostEqual(
+            row["conditional_accept_probability_by_depth"][0], 0.54 / 0.45
+        )
+
+    def test_a_depth_that_drafted_nothing_reads_none_not_zero(self):
+        run = window.plan_runs([20260829], "ABBA", 900)[0]
+        row = window.extract_run_row(
+            self._receipt(
+                accepted_by_depth=[259, 187, 0],
+                drafted_by_depth=[382, 382, 0],
+                accept_probability_sum_by_depth=[286.5, 210.1, 0.0],
+            ),
+            run,
+        )
+        self.assertIsNone(row["accept_rate_by_depth"][2])
+        self.assertIsNone(row["mean_accept_probability_by_depth"][2])
+        self.assertIsNone(row["conditional_accept_rate_by_depth"][1])
+        self.assertIsNone(row["conditional_accept_probability_by_depth"][1])
+
+
+class TestAcceptanceHelpers(unittest.TestCase):
+    def test_per_depth_rates_without_a_numerator_is_none(self):
+        self.assertIsNone(window.per_depth_rates(None, [1, 2, 3]))
+        self.assertIsNone(window.per_depth_rates([1, 2, 3], None))
+
+    def test_per_depth_rates_truncate_to_the_shorter_vector(self):
+        self.assertEqual(window.per_depth_rates([1, 2, 3], [2, 4]), [0.5, 0.5])
+
+    def test_conditional_ratios_of_a_single_depth_are_empty(self):
+        self.assertEqual(window.conditional_depth_ratios([0.7]), [])
+        self.assertIsNone(window.conditional_depth_ratios(None))
+
+    def test_conditional_ratios_skip_an_undefined_earlier_depth(self):
+        self.assertEqual(
+            window.conditional_depth_ratios([None, 0.5, 0.25]), [None, 0.5]
+        )
+
+
 class TestProductionReceiptCostModel(unittest.TestCase):
     """Check the corrected statistic against the real w10-stack receipts.
 
@@ -768,6 +901,303 @@ class TestSummary(unittest.TestCase):
         )
 
 
+class TestAcceptanceSummary(unittest.TestCase):
+    """The acceptance headline and the acceptance term behind it."""
+
+    def _rows(self, **overrides):
+        # Control accepts more per depth than the candidate; both receipts
+        # carry the accept-probability sums, so both readings resolve.
+        control = dict(
+            accepted_by_depth=[259, 187, 120],
+            drafted_by_depth=[382, 382, 382],
+            accept_probability_sum_by_depth=[286.5, 210.1, 133.4],
+        )
+        candidate = dict(
+            accepted_by_depth=[249, 177, 110],
+            drafted_by_depth=[382, 382, 382],
+            accept_probability_sum_by_depth=[276.5, 200.1, 123.4],
+        )
+        control.update(overrides)
+        return [
+            make_row(0, "A", 20260829, 60.0, **control),
+            make_row(1, "B", 20260829, 66.0, **candidate),
+            make_row(2, "B", 20260830, 64.0, **candidate),
+            make_row(3, "A", 20260830, 62.0, **control),
+        ]
+
+    def test_arm_aggregates_carry_both_acceptance_readings(self):
+        arms = window.summarize(self._rows())["arms"]
+        self.assertTrue(arms["A"]["accept_probability_recorded"])
+        for observed, expected in zip(
+            arms["A"]["mean_accept_rate_by_depth"],
+            [259 / 382, 187 / 382, 120 / 382],
+        ):
+            self.assertAlmostEqual(observed, expected)
+        for observed, expected in zip(
+            arms["B"]["mean_accept_probability_by_depth"],
+            [276.5 / 382, 200.1 / 382, 123.4 / 382],
+        ):
+            self.assertAlmostEqual(observed, expected)
+        self.assertAlmostEqual(
+            arms["A"]["conditional_accept_rate_by_depth"][0], 187 / 259
+        )
+        self.assertAlmostEqual(
+            arms["A"]["conditional_accept_probability_by_depth"][0],
+            210.1 / 286.5,
+        )
+        self.assertEqual(arms["A"]["mean_accepted_by_depth"], [259, 187, 120])
+
+    def test_per_seed_and_overall_carry_the_acceptance_deltas(self):
+        summary = window.summarize(self._rows())
+        entry = summary["per_seed"][0]
+        self.assertAlmostEqual(
+            entry["control_mean_accept_rate_by_depth"][0], 259 / 382
+        )
+        self.assertAlmostEqual(
+            entry["candidate_mean_accept_probability_by_depth"][0], 276.5 / 382
+        )
+        self.assertAlmostEqual(
+            entry["delta_mean_accept_probability_by_depth"][0],
+            (276.5 - 286.5) / 382,
+        )
+        overall = summary["overall"]
+        self.assertTrue(overall["accept_probability_recorded"])
+        self.assertAlmostEqual(
+            overall["delta_mean_accept_rate_by_depth"][0], (249 - 259) / 382
+        )
+        self.assertAlmostEqual(
+            overall["candidate_conditional_accept_probability_by_depth"][0],
+            200.1 / 276.5,
+        )
+
+    def test_rows_without_the_sums_leave_the_expected_reading_unrecorded(self):
+        rows = [
+            make_row(0, "A", 20260829, 60.0),
+            make_row(1, "B", 20260829, 66.0),
+        ]
+        summary = window.summarize(rows)
+        self.assertFalse(summary["overall"]["accept_probability_recorded"])
+        self.assertIsNone(
+            summary["overall"]["control_mean_accept_probability_by_depth"]
+        )
+        self.assertIsNone(
+            summary["overall"]["delta_mean_accept_probability_by_depth"]
+        )
+        self.assertIsNone(
+            summary["per_seed"][0][
+                "candidate_mean_accept_probability_by_depth"
+            ]
+        )
+        # The realised coin still aggregates.
+        self.assertIsNotNone(
+            summary["overall"]["control_mean_accept_rate_by_depth"]
+        )
+
+    def test_a_half_upgraded_window_is_not_silently_averaged_away(self):
+        """One arm from the new driver, one from the old.
+
+        The expected reading exists only where it was recorded; the window
+        still says, at the top level, that it was not recorded everywhere.
+        """
+
+        rows = [
+            make_row(
+                0,
+                "A",
+                20260829,
+                60.0,
+                accept_probability_sum_by_depth=[286.5, 210.1, 133.4],
+            ),
+            make_row(1, "B", 20260829, 66.0),
+        ]
+        summary = window.summarize(rows)
+        self.assertTrue(summary["arms"]["A"]["accept_probability_recorded"])
+        self.assertFalse(summary["arms"]["B"]["accept_probability_recorded"])
+        self.assertFalse(summary["overall"]["accept_probability_recorded"])
+        self.assertIsNotNone(
+            summary["overall"]["control_mean_accept_probability_by_depth"]
+        )
+        self.assertIsNone(
+            summary["overall"]["candidate_mean_accept_probability_by_depth"]
+        )
+
+
+class TestAcceptanceHeadline(unittest.TestCase):
+    """``tok/M4win`` gets the same paired treatment as the other metrics."""
+
+    def _rows(self):
+        # Candidate emits more tokens per compiled M4 window than the control
+        # at the same 1,024-token answer: a real acceptance win.
+        def row(index, arm, seed, tok_s, calls):
+            decode_s = 1024.0 / tok_s
+            cost = (
+                10 * window.DEFAULT_COPY_ROUND_COST_S
+                + 66 * window.DEFAULT_COPY_TOKEN_COST_S
+            )
+            return make_row(
+                index,
+                arm,
+                seed,
+                tok_s,
+                compiled_m4_calls=calls,
+                ms_per_compiled_window=decode_s * 1000.0 / calls,
+                tokens_per_window=1024 / calls,
+                context_copy_cost_s=cost,
+                decode_s_net=decode_s - cost,
+                ms_per_m4_window_net=(decode_s - cost) * 1000.0 / calls,
+                tokens_per_m4_window=(1024 - 66) / calls,
+            )
+
+        return [
+            row(0, "A", 20260829, 60.0, 400),
+            row(1, "B", 20260829, 66.0, 380),
+            row(2, "B", 20260830, 64.0, 380),
+            row(3, "A", 20260830, 62.0, 400),
+        ]
+
+    def test_per_seed_entry_carries_the_acceptance_headline(self):
+        entry = window.summarize(self._rows())["per_seed"][0]
+        self.assertAlmostEqual(
+            entry["control_mean_tokens_per_m4_window"], 958 / 400
+        )
+        self.assertAlmostEqual(
+            entry["candidate_mean_tokens_per_m4_window"], 958 / 380
+        )
+        self.assertAlmostEqual(
+            entry["delta_tokens_per_m4_window"], 958 / 380 - 958 / 400
+        )
+        self.assertAlmostEqual(
+            entry["delta_tokens_per_m4_window_pct"],
+            100.0 * (958 / 380 - 958 / 400) / (958 / 400),
+        )
+
+    def test_overall_gets_the_same_statistics_as_the_other_metrics(self):
+        overall = window.summarize(self._rows())["overall"]
+        expected = 958 / 380 - 958 / 400
+        for key in (
+            "delta_mean_tokens_per_m4_window",
+            "delta_median_tokens_per_m4_window",
+            "paired_delta_mean_tokens_per_m4_window",
+            "paired_delta_median_tokens_per_m4_window",
+            "adjacent_delta_mean_tokens_per_m4_window",
+        ):
+            self.assertAlmostEqual(overall[key], expected, msg=key)
+        self.assertAlmostEqual(
+            overall["delta_mean_tokens_per_m4_window_pct"],
+            100.0 * expected / (958 / 400),
+        )
+        self.assertAlmostEqual(
+            overall["paired_delta_mean_tokens_per_m4_window_pct"],
+            100.0 * expected / (958 / 400),
+        )
+        self.assertAlmostEqual(
+            overall["control_median_tokens_per_m4_window"], 958 / 400
+        )
+
+    def test_adjacent_pairs_carry_the_acceptance_delta(self):
+        adjacent = window.summarize(self._rows())["adjacent_pairs"]
+        self.assertTrue(adjacent)
+        for entry in adjacent:
+            self.assertAlmostEqual(
+                entry["delta_tokens_per_m4_window"], 958 / 380 - 958 / 400
+            )
+
+    def test_rows_without_the_acceptance_headline_stay_none(self):
+        rows = [
+            make_row(0, "A", 1, 60.0, tokens_per_m4_window=None),
+            make_row(1, "B", 1, 66.0, tokens_per_m4_window=None),
+        ]
+        summary = window.summarize(rows)
+        self.assertIsNone(
+            summary["overall"]["delta_mean_tokens_per_m4_window"]
+        )
+        self.assertIsNone(
+            summary["per_seed"][0]["delta_tokens_per_m4_window"]
+        )
+        self.assertAlmostEqual(
+            summary["overall"]["delta_mean_decode_tok_s"], 6.0
+        )
+
+
+class TestHeadlineAgreement(unittest.TestCase):
+    """Which arm each of the three headlines favours."""
+
+    def test_all_three_favour_the_candidate(self):
+        agreement = window.headline_agreement(
+            {
+                "delta_mean_ms_per_m4_window_net": -0.42,
+                "delta_mean_ms_per_m4_window_net_pct": -1.2,
+                "delta_mean_tokens_per_m4_window": 0.03,
+                "delta_mean_tokens_per_m4_window_pct": 1.1,
+                "delta_mean_decode_tok_s": 0.9,
+                "delta_mean_pct": 1.4,
+            }
+        )
+        self.assertEqual(agreement["cost"]["favours"], "candidate")
+        self.assertEqual(agreement["acceptance"]["favours"], "candidate")
+        self.assertEqual(agreement["throughput"]["favours"], "candidate")
+        self.assertTrue(agreement["agree"])
+        self.assertFalse(agreement["throughput_disagrees_with_m4_headlines"])
+
+    def test_tok_s_can_point_the_other_way_from_both_m4_headlines(self):
+        agreement = window.headline_agreement(
+            {
+                "delta_mean_ms_per_m4_window_net": -0.42,
+                "delta_mean_ms_per_m4_window_net_pct": -1.2,
+                "delta_mean_tokens_per_m4_window": 0.03,
+                "delta_mean_tokens_per_m4_window_pct": 1.1,
+                "delta_mean_decode_tok_s": -0.24,
+                "delta_mean_pct": -0.3,
+            }
+        )
+        self.assertEqual(agreement["throughput"]["favours"], "control")
+        self.assertFalse(agreement["agree"])
+        self.assertTrue(agreement["m4_headlines_agree"])
+        self.assertTrue(agreement["throughput_disagrees_with_m4_headlines"])
+
+    def test_cost_and_acceptance_can_split(self):
+        agreement = window.headline_agreement(
+            {
+                "delta_mean_ms_per_m4_window_net": -1.89,
+                "delta_mean_ms_per_m4_window_net_pct": -5.3,
+                "delta_mean_tokens_per_m4_window": -0.09,
+                "delta_mean_tokens_per_m4_window_pct": -3.3,
+                "delta_mean_decode_tok_s": -0.24,
+                "delta_mean_pct": -0.3,
+            }
+        )
+        self.assertEqual(agreement["cost"]["favours"], "candidate")
+        self.assertEqual(agreement["acceptance"]["favours"], "control")
+        self.assertFalse(agreement["agree"])
+        self.assertFalse(agreement["m4_headlines_agree"])
+        self.assertFalse(agreement["throughput_disagrees_with_m4_headlines"])
+
+    def test_a_missing_or_zero_headline_never_manufactures_a_verdict(self):
+        agreement = window.headline_agreement(
+            {
+                "delta_mean_ms_per_m4_window_net": None,
+                "delta_mean_tokens_per_m4_window": 0.0,
+                "delta_mean_decode_tok_s": 0.9,
+                "delta_mean_pct": 1.4,
+            }
+        )
+        self.assertIsNone(agreement["cost"]["favours"])
+        self.assertEqual(agreement["acceptance"]["favours"], "tie")
+        self.assertEqual(agreement["throughput"]["favours"], "candidate")
+        self.assertTrue(agreement["agree"])
+
+    def test_the_summary_carries_the_verdict(self):
+        rows = [
+            make_row(0, "A", 20260829, 60.0),
+            make_row(1, "B", 20260829, 66.0),
+        ]
+        summary = window.summarize(rows)
+        self.assertIn("headline_agreement", summary)
+        self.assertEqual(
+            summary["headline_agreement"]["throughput"]["favours"], "candidate"
+        )
+
+
 class TestMarkdown(unittest.TestCase):
     def test_table_has_one_row_per_run_and_all_columns(self):
         rows = [
@@ -843,6 +1273,253 @@ class TestMarkdown(unittest.TestCase):
         ]
         text = window.render_markdown(rows, window.summarize(rows))
         self.assertIn("n/a", text)
+
+
+class TestMarkdownAcceptance(unittest.TestCase):
+    """The acceptance columns, the two headlines, and the disagreement note."""
+
+    def _agreeing_rows(self):
+        """Candidate wins all three headlines: cheaper, more accepted, faster."""
+
+        def row(index, arm, seed, tok_s, calls, sums):
+            decode_s = 1024.0 / tok_s
+            cost = (
+                10 * window.DEFAULT_COPY_ROUND_COST_S
+                + 66 * window.DEFAULT_COPY_TOKEN_COST_S
+            )
+            return make_row(
+                index,
+                arm,
+                seed,
+                tok_s,
+                compiled_m4_calls=calls,
+                ms_per_compiled_window=decode_s * 1000.0 / calls,
+                tokens_per_window=1024 / calls,
+                context_copy_cost_s=cost,
+                decode_s_net=decode_s - cost,
+                ms_per_m4_window_net=(decode_s - cost) * 1000.0 / calls,
+                tokens_per_m4_window=(1024 - 66) / calls,
+                accept_probability_sum_by_depth=sums,
+            )
+
+        return [
+            row(0, "A", 20260829, 60.0, 400, [286.5, 210.1, 133.4]),
+            row(1, "B", 20260829, 66.0, 380, [296.5, 220.1, 143.4]),
+        ]
+
+    def _disagreeing_rows(self):
+        """tok/s favours the candidate; both M4 headlines favour the control.
+
+        The candidate drew twice the retrieval yield, which is trajectory luck:
+        the copy lane emitted tokens the compiled windows did not have to.
+        """
+
+        def row(index, arm, tok_s, rounds, accepted):
+            decode_s = 1024.0 / tok_s
+            cost = (
+                rounds * window.DEFAULT_COPY_ROUND_COST_S
+                + accepted * window.DEFAULT_COPY_TOKEN_COST_S
+            )
+            calls = round((1024 - accepted) / 2.49)
+            return make_row(
+                index,
+                arm,
+                20260829,
+                tok_s,
+                compiled_m4_calls=calls,
+                ms_per_compiled_window=decode_s * 1000.0 / calls,
+                tokens_per_window=1024 / calls,
+                context_copy_rounds=rounds,
+                context_copy_accepted_tokens=accepted,
+                context_copy_cost_s=cost,
+                decode_s_net=decode_s - cost,
+                ms_per_m4_window_net=(decode_s - cost) * 1000.0 / calls,
+                tokens_per_m4_window=(1024 - accepted) / calls,
+            )
+
+        return [row(0, "A", 67.0, 9, 50), row(1, "B", 69.0, 20, 160)]
+
+    def test_per_run_table_carries_both_acceptance_readings(self):
+        rows = [
+            make_row(
+                0,
+                "A",
+                20260829,
+                60.0,
+                accept_probability_sum_by_depth=[286.5, 210.1, 133.4],
+            )
+        ]
+        text = window.render_markdown(rows, window.summarize(rows))
+        header = text.splitlines()[0]
+        for column in (
+            "Accepted by depth",
+            "Accept rate by depth",
+            "Mean accept prob by depth",
+            "Cond accept realised",
+            "Cond accept expected",
+        ):
+            self.assertIn(column, header)
+        body = [
+            line for line in text.splitlines()[2:] if line.startswith("| 0 ")
+        ]
+        self.assertEqual(len(body), 1)
+        # realised rates, expected probabilities, and both conditionals.
+        self.assertIn("0.6780,0.4895,0.3141", body[0])
+        self.assertIn("0.7500,0.5500,0.3492", body[0])
+        self.assertIn("0.7220,0.6417", body[0])
+        self.assertIn("0.7333,0.6349", body[0])
+
+    def test_an_old_row_renders_the_expected_columns_as_na(self):
+        rows = [make_row(0, "A", 20260829, 60.0)]
+        text = window.render_markdown(rows, window.summarize(rows))
+        body = [
+            line for line in text.splitlines()[2:] if line.startswith("| 0 ")
+        ][0]
+        # Realised acceptance still renders; the expected reading is n/a, not
+        # a fabricated 0.0000.
+        self.assertIn("0.6780,0.4895,0.3141", body)
+        self.assertIn("| n/a |", body)
+        self.assertIn("Acceptance by depth: control realised", text)
+        self.assertIn("(expected n/a)", text)
+
+    def test_paired_table_gains_the_tok_per_m4win_group(self):
+        rows = self._agreeing_rows()
+        text = window.render_markdown(rows, window.summarize(rows))
+        paired_header = next(
+            line
+            for line in text.splitlines()
+            if line.startswith("| Seed | Control ms/M4win net")
+        )
+        for column in (
+            "Control ms/M4win net",
+            "Candidate ms/M4win net",
+            "Control tok/M4win",
+            "Candidate tok/M4win",
+            "Delta tok/M4win",
+            "Control tok/s",
+            "Candidate tok/s",
+            "Delta tok/s",
+            "ccopy rounds A/B",
+            "Digests match",
+        ):
+            self.assertIn(column, paired_header)
+        self.assertEqual(paired_header.count("Delta %"), 3)
+        seed_row = next(
+            line for line in text.splitlines() if line.startswith("| 20260829 |")
+        )
+        cells = [cell.strip() for cell in seed_row.strip("|").split("|")]
+        self.assertEqual(len(cells), len(paired_header.strip("|").split("|")))
+        # Columns 5-8 are the acceptance group: control, candidate, delta, %.
+        self.assertAlmostEqual(float(cells[5]), 958 / 400, places=4)
+        self.assertAlmostEqual(float(cells[6]), 958 / 380, places=4)
+        self.assertAlmostEqual(
+            float(cells[7]), 958 / 380 - 958 / 400, places=4
+        )
+        # The digest column stays last: scripts read it off the end of the row.
+        self.assertEqual(cells[-1], "yes")
+
+    def test_primary_line_states_all_three_headlines(self):
+        rows = self._agreeing_rows()
+        text = window.render_markdown(rows, window.summarize(rows))
+        primary = next(
+            line for line in text.splitlines() if line.startswith("PRIMARY: ")
+        )
+        self.assertIn("ms/M4win net", primary)
+        self.assertIn("ACCEPTANCE:", primary)
+        self.assertIn("tok/M4win", primary)
+        self.assertIn("THROUGHPUT:", primary)
+        self.assertIn("tok/s", primary)
+        self.assertIn("PRIMARY acceptance metric: tok/M4win", text)
+
+    def test_agreeing_headlines_print_no_disagreement_note(self):
+        rows = self._agreeing_rows()
+        summary = window.summarize(rows)
+        self.assertTrue(summary["headline_agreement"]["agree"])
+        text = window.render_markdown(rows, summary)
+        self.assertNotIn("HEADLINES DISAGREE", text)
+
+    def test_disagreeing_headlines_print_one_note_naming_each(self):
+        rows = self._disagreeing_rows()
+        summary = window.summarize(rows)
+        self.assertFalse(summary["headline_agreement"]["agree"])
+        self.assertTrue(
+            summary["headline_agreement"][
+                "throughput_disagrees_with_m4_headlines"
+            ]
+        )
+        text = window.render_markdown(rows, summary)
+        notes = [
+            line
+            for line in text.splitlines()
+            if line.startswith("HEADLINES DISAGREE")
+        ]
+        self.assertEqual(len(notes), 1)
+        note = notes[0]
+        self.assertIn("ms/M4win net favours control", note)
+        self.assertIn("tok/M4win favours control", note)
+        self.assertIn("tok/s favours candidate", note)
+        self.assertIn("retrieval yield", note)
+
+    def test_a_cost_acceptance_split_says_so_instead(self):
+        # Cheaper per window but accepting less per window: the two M4
+        # headlines split, so the note must not blame the retrieval yield.
+        rows = [
+            make_row(
+                0,
+                "A",
+                20260829,
+                60.0,
+                ms_per_m4_window_net=35.5,
+                tokens_per_m4_window=2.67,
+            ),
+            make_row(
+                1,
+                "B",
+                20260829,
+                60.0,
+                ms_per_m4_window_net=33.6,
+                tokens_per_m4_window=2.58,
+            ),
+        ]
+        summary = window.summarize(rows)
+        self.assertFalse(summary["headline_agreement"]["m4_headlines_agree"])
+        text = window.render_markdown(rows, summary)
+        note = next(
+            line
+            for line in text.splitlines()
+            if line.startswith("HEADLINES DISAGREE")
+        )
+        self.assertIn("ms/M4win net favours candidate", note)
+        self.assertIn("tok/M4win favours control", note)
+        self.assertIn("opposite directions", note)
+        self.assertNotIn("retrieval yield", note)
+
+    def test_acceptance_line_reports_both_readings_per_arm(self):
+        rows = self._agreeing_rows()
+        text = window.render_markdown(rows, window.summarize(rows))
+        line = next(
+            l
+            for l in text.splitlines()
+            if l.startswith("Acceptance by depth: ")
+        )
+        self.assertIn("control realised 0.6780,0.4895,0.3141", line)
+        self.assertIn("expected 0.7500,0.5500,0.3492", line)
+        self.assertIn("conditional d2|d1,d3|d2 realised", line)
+
+    def test_report_scraper_regex_still_finds_every_seed(self):
+        r"""``scratchpad/abba_report.py`` reads the seed rows off this table.
+
+        Its fallback digest check is
+        ``re.findall(r"\| (\d{8}) \|.*\| (yes|no|NO) \|\s*$", text, re.M)``:
+        the seed must stay the first column and the digest verdict the last.
+        """
+
+        rows = self._agreeing_rows()
+        text = window.render_markdown(rows, window.summarize(rows))
+        found = re.findall(
+            r"\| (\d{8}) \|.*\| (yes|no|NO) \|\s*$", text, re.M
+        )
+        self.assertEqual(found, [("20260829", "yes")])
 
 
 class TestControlArmEnvironmentContract(unittest.TestCase):
@@ -971,6 +1648,127 @@ class TestDriverReceiptHelpers(unittest.TestCase):
             )["status"],
             "depth_shape_mismatch",
         )
+
+    def _stats_output(self, **stats_overrides):
+        """The smallest ``output`` ``stats_receipt`` will accept.
+
+        Every unset counter reads 0.0 through ``__getattr__``, so this stays a
+        two-field test of the acceptance carry rather than a transcription of
+        the whole stats dataclass.
+        """
+
+        class Stats:
+            graphbank: dict = {}
+            draft_core: dict = {}
+            online_correction_cache: dict = {}
+            context_copy_disabled_reason = None
+            accepted_by_depth = [259, 187, 120]
+            drafted_by_depth = [382, 382, 382]
+
+            def __init__(self, **overrides):
+                for key, value in overrides.items():
+                    setattr(self, key, value)
+
+            def __getattr__(self, name):
+                return 0.0
+
+        class Output:
+            tokens = [11, 22, 33]
+
+            def __init__(self, stats):
+                self.stats = stats
+
+        return Output(Stats(**stats_overrides))
+
+    def test_stats_receipt_carries_the_accept_probability_sums(self):
+        receipt = driver.stats_receipt(
+            self._stats_output(
+                accept_probability_sum_by_depth=[286.5, 210.1, 133.4]
+            ),
+            "arm-A1",
+            1788400081,
+            20260829,
+            28.9,
+        )
+        self.assertEqual(
+            receipt["accept_probability_sum_by_depth"], [286.5, 210.1, 133.4]
+        )
+        # The realised coin and its denominator stay on the receipt too --
+        # the expected reading is sum/drafted, so it needs both.
+        self.assertEqual(receipt["accepted_by_depth"], [259, 187, 120])
+        self.assertEqual(receipt["drafted_by_depth"], [382, 382, 382])
+        # JSON-safe: this is what the driver writes to disk.
+        json.loads(json.dumps(receipt["accept_probability_sum_by_depth"]))
+
+    def test_a_runtime_without_the_sums_omits_the_field_entirely(self):
+        class Stats:
+            graphbank: dict = {}
+            draft_core: dict = {}
+            online_correction_cache: dict = {}
+            context_copy_disabled_reason = None
+            accepted_by_depth = [259, 187, 120]
+            drafted_by_depth = [382, 382, 382]
+            accept_probability_sum_by_depth = None
+
+            def __getattr__(self, name):
+                return 0.0
+
+        class Output:
+            tokens = [11, 22, 33]
+            stats = Stats()
+
+        receipt = driver.stats_receipt(
+            Output(), "arm-A1", 1788400081, 20260829, 28.9
+        )
+        # Absent, never zero-filled: the window reads a missing key as "not
+        # observed" and a zero list as "observed to be zero".
+        self.assertNotIn("accept_probability_sum_by_depth", receipt)
+
+    def test_the_driver_receipt_feeds_the_window_expected_columns(self):
+        """End to end: what the driver writes is what the window divides.
+
+        The two halves of this change are in different files; this is the
+        test that fails if the field is renamed on one side only.
+        """
+
+        run = window.plan_runs([20260829], "AB", 1788400081)[0]
+        stats_row = driver.stats_receipt(
+            self._stats_output(
+                accept_probability_sum_by_depth=[286.5, 210.1, 133.4],
+                decode_elapsed_s=15.1,
+                generated_tokens=1024,
+            ),
+            "arm-A1",
+            run["sequence"],
+            run["seed"],
+            28.9,
+        )
+        receipt = {
+            "rows": [
+                dict(
+                    stats_row,
+                    compiled_m4_calls=382,
+                    peak_memory_bytes=87_393_848_312,
+                    thermal_gate={"ready_c": 39.5},
+                    page_cache_regime="as-found",
+                    reference_token_parity={"status": "match"},
+                    ple_hot_rows={"available": True},
+                    per_cycle={"available": False},
+                )
+            ]
+        }
+        row = window.extract_run_row(receipt, run)
+        self.assertTrue(row["accept_probability_recorded"])
+        self.assertAlmostEqual(
+            row["mean_accept_probability_by_depth"][0], 286.5 / 382
+        )
+        self.assertAlmostEqual(
+            row["conditional_accept_probability_by_depth"][0], 210.1 / 286.5
+        )
+        summary = window.summarize([row])
+        self.assertTrue(summary["arms"]["A"]["accept_probability_recorded"])
+        text = window.render_markdown([row], summary)
+        self.assertIn("0.7500,0.5500,0.3492", text)
 
     def test_per_cycle_receipt_from_events(self):
         class Stats:

@@ -141,6 +141,36 @@ DEFAULT_COPY_ROUND_COST_S = 0.0210
 #: Fitted marginal cost of one verified context-copy row, seconds (C1).
 DEFAULT_COPY_TOKEN_COST_S = 0.003636
 
+# --------------------------------------------------------------------------
+# Acceptance model (the MTP accept coin and its conditional expectation)
+# --------------------------------------------------------------------------
+#
+# ``accepted_by_depth`` is the REALISED accept coin: one Bernoulli draw per
+# drafted token per depth.  Its per-window spread is the spread of a few
+# hundred coin flips, which is wide enough to swamp the sub-percent effects
+# this harness is trying to resolve.  ``generate_mtpk`` also accumulates
+# ``accept_probability_sum_by_depth`` (``mtplx/generation.py``) -- the
+# conditional expectation of that same coin, summed over the same draws.
+# Divided by ``drafted_by_depth`` it is the mean accept PROBABILITY per depth:
+# the same acceptance the counter estimates, with the coin-flip variance taken
+# out, and therefore the lower-variance reading of the acceptance term.
+#
+# Both readings are carried on every row:
+#
+#     accept_rate_by_depth[d]               = accepted[d] / drafted[d]   (realised)
+#     mean_accept_probability_by_depth[d]   = prob_sum[d] / drafted[d]   (expected)
+#
+# with the conditional ratios ``d2|d1`` and ``d3|d2`` -- how much of a depth's
+# acceptance survives to the next depth -- as the RATIO OF RATES,
+# ``rate[d+1] / rate[d]``, for each.  Ratio of rates, not of raw counts:
+# ``drafted_by_depth`` is not identical across depths (the last cycle of a run
+# routinely drafts one fewer at the deepest position), and the rate ratio stays
+# the conditional continuation probability when it is not.
+#
+# A receipt written before the driver carried the sums has no expected reading
+# at all.  It stays ``None`` and renders ``n/a``; it is never zero-filled, so
+# "not observed" can never be read as "observed to be zero".
+
 #: A primary-metric delta smaller than this, in per cent of the control, is
 #: inside the noise this harness can resolve -- the "rounding class".  A
 #: candidate that lands in it AND reproduces the control's exact token stream
@@ -299,6 +329,56 @@ def merge_env_settings(
     return [f"{key}={value}" for key, value in sorted(merged.items())]
 
 
+def _safe_ratio(
+    numerator: float | None, denominator: float | None
+) -> float | None:
+    """``numerator / denominator``.
+
+    ``None`` when either side was not recorded or the denominator is zero --
+    an acceptance nothing was drafted for has no rate, and calling it 0.0
+    would drag every aggregate that reads it toward zero.
+    """
+
+    if numerator is None or denominator is None or float(denominator) == 0.0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def per_depth_rates(
+    numerators: Sequence[Any] | None, denominators: Sequence[Any] | None
+) -> list[float | None] | None:
+    """Per-depth ``numerator/denominator`` (acceptance rate or probability).
+
+    ``None`` when the numerator was never recorded -- an unobserved acceptance
+    is not an acceptance of zero.  Individual depths read ``None`` when nothing
+    was drafted there.
+    """
+
+    if numerators is None or denominators is None:
+        return None
+    return [
+        _safe_ratio(numerator, denominator)
+        for numerator, denominator in zip(numerators, denominators)
+    ]
+
+
+def conditional_depth_ratios(
+    rates: Sequence[float | None] | None,
+) -> list[float | None] | None:
+    """``[rate1/rate0, rate2/rate1, ...]`` -- the d2|d1, d3|d2 ratios.
+
+    Entry 0 is ``d2|d1``, entry 1 is ``d3|d2``: the share of one depth's
+    acceptance that survives into the next.
+    """
+
+    if rates is None:
+        return None
+    return [
+        _safe_ratio(later, earlier)
+        for earlier, later in zip(rates, list(rates)[1:])
+    ]
+
+
 def extract_run_row(
     receipt: Mapping[str, Any],
     run: Mapping[str, Any],
@@ -313,6 +393,13 @@ def extract_run_row(
     ``decode_s_net`` and ``ms_per_m4_window_net``.  A receipt with no
     ``context_copy`` block (context-copy disabled, or an older driver) reads as
     zero rounds and zero accepted tokens, so the net metric equals the raw one.
+
+    The acceptance term is carried in both of its readings: the realised
+    ``accepted_by_depth`` coin and, when the receipt has it, the driver's
+    ``accept_probability_sum_by_depth`` -- the conditional expectation of the
+    same coin, which is the lower-variance estimate of the same acceptance (see
+    the acceptance-model note at the top of this module).  A receipt without
+    the sums keeps every expected field at ``None``.
     """
 
     rows = receipt.get("rows") or []
@@ -358,6 +445,17 @@ def extract_run_row(
         + copy_accepted * float(copy_token_cost_s)
     )
     decode_s_net = decode_s - copy_cost_s
+    # -- acceptance: the realised coin and its conditional expectation ------
+    accepted_by_depth = list(row["accepted_by_depth"])
+    drafted_by_depth = list(row["drafted_by_depth"])
+    prob_sums_raw = row.get("accept_probability_sum_by_depth")
+    accept_probability_sum_by_depth = (
+        None if prob_sums_raw is None else [float(value) for value in prob_sums_raw]
+    )
+    accept_rate_by_depth = per_depth_rates(accepted_by_depth, drafted_by_depth)
+    mean_accept_probability_by_depth = per_depth_rates(
+        accept_probability_sum_by_depth, drafted_by_depth
+    )
     return {
         "index": int(run["index"]),
         "position_in_seed": int(run["position_in_seed"]),
@@ -391,8 +489,21 @@ def extract_run_row(
             if compiled_calls
             else None
         ),
-        "accepted_by_depth": list(row["accepted_by_depth"]),
-        "drafted_by_depth": list(row["drafted_by_depth"]),
+        # -- acceptance (realised coin + lower-variance expectation) -------
+        "accepted_by_depth": accepted_by_depth,
+        "drafted_by_depth": drafted_by_depth,
+        "accept_probability_sum_by_depth": accept_probability_sum_by_depth,
+        # False on a receipt written before the driver carried the sums: the
+        # expected columns are unobserved, not observed-and-zero.
+        "accept_probability_recorded": accept_probability_sum_by_depth is not None,
+        "accept_rate_by_depth": accept_rate_by_depth,
+        "mean_accept_probability_by_depth": mean_accept_probability_by_depth,
+        "conditional_accept_rate_by_depth": conditional_depth_ratios(
+            accept_rate_by_depth
+        ),
+        "conditional_accept_probability_by_depth": conditional_depth_ratios(
+            mean_accept_probability_by_depth
+        ),
         "verify_forward_s": float(row["verify_forward_time_s"]),
         "draft_s": float(row["draft_time_s"]),
         "digest": str(row["response_token_sha256"]),
@@ -422,6 +533,49 @@ def _mean(values: Iterable[float]) -> float | None:
 def _median(values: Iterable[float]) -> float | None:
     materialized = [float(value) for value in values if value is not None]
     return statistics.median(materialized) if materialized else None
+
+
+def _mean_by_depth(
+    sequences: Iterable[Sequence[float | None] | None],
+) -> list[float | None] | None:
+    """Element-wise mean of per-depth vectors across runs.
+
+    ``None`` when no run recorded the vector at all; a depth reads ``None``
+    when no run recorded a value there.  Ragged vectors are tolerated (a run
+    that stopped at a shallower depth contributes only the depths it has).
+    """
+
+    materialized = [list(seq) for seq in sequences if seq is not None]
+    if not materialized:
+        return None
+    width = max((len(seq) for seq in materialized), default=0)
+    result: list[float | None] = []
+    for depth in range(width):
+        values = [
+            float(seq[depth])
+            for seq in materialized
+            if depth < len(seq) and seq[depth] is not None
+        ]
+        result.append(statistics.fmean(values) if values else None)
+    return result
+
+
+def _delta_by_depth(
+    candidate: Sequence[float | None] | None,
+    control: Sequence[float | None] | None,
+) -> list[float | None] | None:
+    """Element-wise ``candidate - control`` over two per-depth vectors."""
+
+    if candidate is None or control is None:
+        return None
+    width = max(len(candidate), len(control))
+    return [
+        _delta(
+            candidate[depth] if depth < len(candidate) else None,
+            control[depth] if depth < len(control) else None,
+        )
+        for depth in range(width)
+    ]
 
 
 def _delta(candidate: float | None, control: float | None) -> float | None:
@@ -526,6 +680,89 @@ def output_identity(
     }
 
 
+#: The three window headlines, as ``(name, label, overall delta key, overall
+#: pct key, higher-is-better)``.  ``ms_per_m4_window_net`` is a COST; the
+#: acceptance yield and tok/s are the other way up.
+HEADLINES: tuple[tuple[str, str, str, str, bool], ...] = (
+    (
+        "cost",
+        "ms/M4win net",
+        "delta_mean_ms_per_m4_window_net",
+        "delta_mean_ms_per_m4_window_net_pct",
+        False,
+    ),
+    (
+        "acceptance",
+        "tok/M4win",
+        "delta_mean_tokens_per_m4_window",
+        "delta_mean_tokens_per_m4_window_pct",
+        True,
+    ),
+    (
+        "throughput",
+        "tok/s",
+        "delta_mean_decode_tok_s",
+        "delta_mean_pct",
+        True,
+    ),
+)
+
+
+def headline_agreement(overall: Mapping[str, Any]) -> dict[str, Any]:
+    """Which arm each headline favours, and whether they point the same way.
+
+    Three readings of one window: the copy-corrected cycle time (a COST, so a
+    negative delta is the candidate winning), the copy-corrected acceptance
+    yield ``tok/M4win``, and raw ``tok/s``.  tok/s carries the retrieval yield
+    -- how often the trajectory happened to quote the prompt -- that the two
+    M4 headlines subtract out, so tok/s pointing the other way is the normal
+    signature of trajectory luck rather than a contradiction.  A window whose
+    headlines disagree has to say so on its own summary.
+    """
+
+    entries: dict[str, Any] = {}
+    for name, label, delta_key, pct_key, higher_is_better in HEADLINES:
+        delta = overall.get(delta_key)
+        if delta is None:
+            favours = None
+        elif float(delta) == 0.0:
+            favours = "tie"
+        else:
+            favours = (
+                "candidate"
+                if (float(delta) > 0.0) == higher_is_better
+                else "control"
+            )
+        entries[name] = {
+            "label": label,
+            "metric": delta_key,
+            "delta": None if delta is None else float(delta),
+            "delta_pct": overall.get(pct_key),
+            "higher_is_better": higher_is_better,
+            "favours": favours,
+        }
+    resolved = {
+        entry["favours"]
+        for entry in entries.values()
+        if entry["favours"] not in (None, "tie")
+    }
+    m4_verdicts = {
+        entries["cost"]["favours"],
+        entries["acceptance"]["favours"],
+    } - {None, "tie"}
+    throughput = entries["throughput"]["favours"]
+    return {
+        **entries,
+        "agree": len(resolved) <= 1,
+        "m4_headlines_agree": len(m4_verdicts) <= 1,
+        "throughput_disagrees_with_m4_headlines": bool(
+            throughput not in (None, "tie")
+            and len(m4_verdicts) == 1
+            and throughput not in m4_verdicts
+        ),
+    }
+
+
 def summarize(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -553,6 +790,12 @@ def summarize(
 
     arms: dict[str, Any] = {}
     for arm, arm_rows in by_arm.items():
+        arm_accept_rate = _mean_by_depth(
+            r.get("accept_rate_by_depth") for r in arm_rows
+        )
+        arm_accept_probability = _mean_by_depth(
+            r.get("mean_accept_probability_by_depth") for r in arm_rows
+        )
         arms[arm] = {
             "arm": arm,
             "arm_name": ARM_NAMES.get(arm, arm),
@@ -572,6 +815,27 @@ def summarize(
             ),
             "mean_tokens_per_m4_window": _mean(
                 r.get("tokens_per_m4_window") for r in arm_rows
+            ),
+            "median_tokens_per_m4_window": _median(
+                r.get("tokens_per_m4_window") for r in arm_rows
+            ),
+            # -- acceptance: realised coin and its expectation -------------
+            "mean_accepted_by_depth": _mean_by_depth(
+                r.get("accepted_by_depth") for r in arm_rows
+            ),
+            "mean_drafted_by_depth": _mean_by_depth(
+                r.get("drafted_by_depth") for r in arm_rows
+            ),
+            "mean_accept_rate_by_depth": arm_accept_rate,
+            "mean_accept_probability_by_depth": arm_accept_probability,
+            "conditional_accept_rate_by_depth": conditional_depth_ratios(
+                arm_accept_rate
+            ),
+            "conditional_accept_probability_by_depth": conditional_depth_ratios(
+                arm_accept_probability
+            ),
+            "accept_probability_recorded": all(
+                bool(r.get("accept_probability_recorded")) for r in arm_rows
             ),
             "mean_context_copy_rounds": _mean(
                 r.get("context_copy_rounds") for r in arm_rows
@@ -608,6 +872,24 @@ def summarize(
         candidate_raw_ms = _mean(
             r.get("ms_per_compiled_window") for r in candidate
         )
+        # The acceptance headline: copy-corrected tokens per compiled M4
+        # window.  Higher is better -- it is the yield the accept coin buys.
+        control_tok_win = _mean(r.get("tokens_per_m4_window") for r in control)
+        candidate_tok_win = _mean(
+            r.get("tokens_per_m4_window") for r in candidate
+        )
+        control_accept_rate = _mean_by_depth(
+            r.get("accept_rate_by_depth") for r in control
+        )
+        candidate_accept_rate = _mean_by_depth(
+            r.get("accept_rate_by_depth") for r in candidate
+        )
+        control_accept_prob = _mean_by_depth(
+            r.get("mean_accept_probability_by_depth") for r in control
+        )
+        candidate_accept_prob = _mean_by_depth(
+            r.get("mean_accept_probability_by_depth") for r in candidate
+        )
         paired.append(
             {
                 "seed": seed,
@@ -619,6 +901,40 @@ def summarize(
                 "delta_ms_per_m4_window_net": _delta(candidate_net, control_net),
                 "delta_ms_per_m4_window_net_pct": _delta_pct(
                     candidate_net, control_net
+                ),
+                # PRIMARY: copy-corrected acceptance yield (higher is better).
+                "control_mean_tokens_per_m4_window": control_tok_win,
+                "candidate_mean_tokens_per_m4_window": candidate_tok_win,
+                "delta_tokens_per_m4_window": _delta(
+                    candidate_tok_win, control_tok_win
+                ),
+                "delta_tokens_per_m4_window_pct": _delta_pct(
+                    candidate_tok_win, control_tok_win
+                ),
+                # The acceptance term itself, in both readings.
+                "control_mean_accept_rate_by_depth": control_accept_rate,
+                "candidate_mean_accept_rate_by_depth": candidate_accept_rate,
+                "delta_mean_accept_rate_by_depth": _delta_by_depth(
+                    candidate_accept_rate, control_accept_rate
+                ),
+                "control_mean_accept_probability_by_depth": control_accept_prob,
+                "candidate_mean_accept_probability_by_depth": (
+                    candidate_accept_prob
+                ),
+                "delta_mean_accept_probability_by_depth": _delta_by_depth(
+                    candidate_accept_prob, control_accept_prob
+                ),
+                "control_conditional_accept_rate_by_depth": (
+                    conditional_depth_ratios(control_accept_rate)
+                ),
+                "candidate_conditional_accept_rate_by_depth": (
+                    conditional_depth_ratios(candidate_accept_rate)
+                ),
+                "control_conditional_accept_probability_by_depth": (
+                    conditional_depth_ratios(control_accept_prob)
+                ),
+                "candidate_conditional_accept_probability_by_depth": (
+                    conditional_depth_ratios(candidate_accept_prob)
                 ),
                 # Secondary: raw cycle time and throughput.
                 "control_mean_ms_per_compiled_window": control_raw_ms,
@@ -674,6 +990,10 @@ def summarize(
                     candidate_row.get("ms_per_m4_window_net"),
                     control_row.get("ms_per_m4_window_net"),
                 ),
+                "delta_tokens_per_m4_window": _delta(
+                    candidate_row.get("tokens_per_m4_window"),
+                    control_row.get("tokens_per_m4_window"),
+                ),
                 "delta_decode_tok_s": (
                     float(candidate_row["decode_tok_s"])
                     - float(control_row["decode_tok_s"])
@@ -691,6 +1011,22 @@ def summarize(
     candidate_net_median = arms.get("B", {}).get("median_ms_per_m4_window_net")
     control_raw_ms = arms.get("A", {}).get("mean_ms_per_compiled_window")
     candidate_raw_ms = arms.get("B", {}).get("mean_ms_per_compiled_window")
+    control_tok_win = arms.get("A", {}).get("mean_tokens_per_m4_window")
+    candidate_tok_win = arms.get("B", {}).get("mean_tokens_per_m4_window")
+    control_tok_win_median = arms.get("A", {}).get(
+        "median_tokens_per_m4_window"
+    )
+    candidate_tok_win_median = arms.get("B", {}).get(
+        "median_tokens_per_m4_window"
+    )
+    control_accept_rate = arms.get("A", {}).get("mean_accept_rate_by_depth")
+    candidate_accept_rate = arms.get("B", {}).get("mean_accept_rate_by_depth")
+    control_accept_prob = arms.get("A", {}).get(
+        "mean_accept_probability_by_depth"
+    )
+    candidate_accept_prob = arms.get("B", {}).get(
+        "mean_accept_probability_by_depth"
+    )
     overall = {
         # -- PRIMARY: copy-corrected cycle time, ms per compiled M4 window.
         # A COST: negative delta = the candidate is faster.
@@ -716,6 +1052,62 @@ def summarize(
         ),
         "adjacent_delta_mean_ms_per_m4_window_net": _mean(
             entry["delta_ms_per_m4_window_net"] for entry in adjacent
+        ),
+        # -- PRIMARY: copy-corrected acceptance yield, tokens per compiled
+        # M4 window.  A YIELD: a positive delta is the candidate winning.
+        "control_mean_tokens_per_m4_window": control_tok_win,
+        "candidate_mean_tokens_per_m4_window": candidate_tok_win,
+        "delta_mean_tokens_per_m4_window": _delta(
+            candidate_tok_win, control_tok_win
+        ),
+        "delta_mean_tokens_per_m4_window_pct": _delta_pct(
+            candidate_tok_win, control_tok_win
+        ),
+        "control_median_tokens_per_m4_window": control_tok_win_median,
+        "candidate_median_tokens_per_m4_window": candidate_tok_win_median,
+        "delta_median_tokens_per_m4_window": _delta(
+            candidate_tok_win_median, control_tok_win_median
+        ),
+        "paired_delta_mean_tokens_per_m4_window": _mean(
+            entry["delta_tokens_per_m4_window"] for entry in paired
+        ),
+        "paired_delta_median_tokens_per_m4_window": _median(
+            entry["delta_tokens_per_m4_window"] for entry in paired
+        ),
+        "paired_delta_mean_tokens_per_m4_window_pct": _mean(
+            entry["delta_tokens_per_m4_window_pct"] for entry in paired
+        ),
+        "adjacent_delta_mean_tokens_per_m4_window": _mean(
+            entry["delta_tokens_per_m4_window"] for entry in adjacent
+        ),
+        # -- The acceptance term behind that yield, in both readings.  The
+        # expected one (accept_probability_sum_by_depth / drafted) is the same
+        # acceptance without the coin-flip variance; it is None on receipts
+        # written before the driver carried the sums.
+        "control_mean_accept_rate_by_depth": control_accept_rate,
+        "candidate_mean_accept_rate_by_depth": candidate_accept_rate,
+        "delta_mean_accept_rate_by_depth": _delta_by_depth(
+            candidate_accept_rate, control_accept_rate
+        ),
+        "control_mean_accept_probability_by_depth": control_accept_prob,
+        "candidate_mean_accept_probability_by_depth": candidate_accept_prob,
+        "delta_mean_accept_probability_by_depth": _delta_by_depth(
+            candidate_accept_prob, control_accept_prob
+        ),
+        "control_conditional_accept_rate_by_depth": conditional_depth_ratios(
+            control_accept_rate
+        ),
+        "candidate_conditional_accept_rate_by_depth": conditional_depth_ratios(
+            candidate_accept_rate
+        ),
+        "control_conditional_accept_probability_by_depth": (
+            conditional_depth_ratios(control_accept_prob)
+        ),
+        "candidate_conditional_accept_probability_by_depth": (
+            conditional_depth_ratios(candidate_accept_prob)
+        ),
+        "accept_probability_recorded": all(
+            bool(row.get("accept_probability_recorded")) for row in rows
         ),
         # -- Secondary: raw (uncorrected) cycle time.
         "control_mean_ms_per_compiled_window": control_raw_ms,
@@ -768,6 +1160,7 @@ def summarize(
         "adjacent_pairs": adjacent,
         "overall": overall,
         "output_identity": identity,
+        "headline_agreement": headline_agreement(overall),
         "copy_cost_model": {
             "copy_round_cost_s": float(copy_round_cost_s),
             "copy_token_cost_s": float(copy_token_cost_s),
@@ -778,6 +1171,8 @@ def summarize(
                 "/ compiled_m4_calls * 1000"
             ),
             "primary_metric": "ms_per_m4_window_net",
+            "primary_cost_metric": "ms_per_m4_window_net",
+            "primary_acceptance_metric": "tokens_per_m4_window",
         },
     }
 
@@ -786,6 +1181,16 @@ def _format(value: Any, spec: str) -> str:
     if value is None:
         return "n/a"
     return format(value, spec)
+
+
+def _format_by_depth(values: Sequence[Any] | None, spec: str) -> str:
+    """A per-depth vector as ``d1,d2,d3``; ``n/a`` when it was not recorded."""
+
+    if values is None:
+        return "n/a"
+    if not values:
+        return "-"
+    return ",".join(_format(value, spec) for value in values)
 
 
 def render_markdown(
@@ -797,10 +1202,14 @@ def render_markdown(
         "| # | Seq | Arm | Seed | Decode tok/s | Decode s | ms/window "
         "| ms/M4win net "
         "| tok/window | tok/M4win | ccopy rounds | ccopy accepted "
-        "| Accepted by depth | Verify fwd s | Output ids sha256 | Peak bytes "
+        "| Accepted by depth | Accept rate by depth "
+        "| Mean accept prob by depth | Cond accept realised "
+        "| Cond accept expected "
+        "| Verify fwd s | Output ids sha256 | Peak bytes "
         "| Ready C | Page cache |",
         "| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-        "| ---: | ---: | --- | ---: | --- | ---: | ---: | --- |",
+        "| ---: | ---: | --- | --- | --- | --- | --- "
+        "| ---: | --- | ---: | ---: | --- |",
     ]
     # Keyed by SEQUENCE, not label: an arm label repeats on every attempt at
     # that arm, and reading the wrong attempt's row is exactly the failure
@@ -810,7 +1219,8 @@ def render_markdown(
             "| {index} | {sequence} | {arm_name} ({arm}) | {seed} | {tok_s} "
             "| {decode_s} "
             "| {ms} | {ms_net} | {tpw} | {tpw_net} | {rounds} | {accepted} "
-            "| {depths} | {vf} | {digest} | {peak:,} | {ready} "
+            "| {depths} | {rates} | {probs} | {cond_real} | {cond_exp} "
+            "| {vf} | {digest} | {peak:,} | {ready} "
             "| {regime} |".format(
                 index=int(row["index"]),
                 sequence=int(row["sequence"]),
@@ -826,6 +1236,16 @@ def render_markdown(
                 rounds=_format(row.get("context_copy_rounds"), "d"),
                 accepted=_format(row.get("context_copy_accepted_tokens"), "d"),
                 depths=",".join(str(int(v)) for v in row["accepted_by_depth"]),
+                rates=_format_by_depth(row.get("accept_rate_by_depth"), ".4f"),
+                probs=_format_by_depth(
+                    row.get("mean_accept_probability_by_depth"), ".4f"
+                ),
+                cond_real=_format_by_depth(
+                    row.get("conditional_accept_rate_by_depth"), ".4f"
+                ),
+                cond_exp=_format_by_depth(
+                    row.get("conditional_accept_probability_by_depth"), ".4f"
+                ),
                 vf=_format(row["verify_forward_s"], ".6f"),
                 digest=row_output_digest(row)[:12],
                 peak=int(row["peak_bytes"]),
@@ -844,19 +1264,33 @@ def render_markdown(
             c1=_format(cost_model.get("copy_token_cost_s"), ".6g"),
         )
     )
+    lines.append(
+        "PRIMARY acceptance metric: tok/M4win = (generated_tokens - ccopy "
+        "accepted) / compiled_m4_calls -- the copy-corrected yield of the "
+        "accept coin. It is a YIELD, so a POSITIVE delta is the candidate "
+        "winning. Mean accept prob by depth is that same coin's conditional "
+        "expectation (accept_probability_sum_by_depth / drafted_by_depth), "
+        "the lower-variance reading; n/a on receipts written before the "
+        "driver carried the sums."
+    )
     lines.append("")
     lines.append(
         "| Seed | Control ms/M4win net | Candidate ms/M4win net "
-        "| Delta ms | Delta % | Control tok/s | Candidate tok/s | Delta tok/s "
+        "| Delta ms | Delta % "
+        "| Control tok/M4win | Candidate tok/M4win | Delta tok/M4win "
+        "| Delta % "
+        "| Control tok/s | Candidate tok/s | Delta tok/s "
         "| Delta % | ccopy rounds A/B | Digests match |"
     )
     lines.append(
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | ---: | ---: "
         "| --- | --- |"
     )
     for entry in summary["per_seed"]:
         lines.append(
-            "| {seed} | {cnet} | {knet} | {dnet} | {dnetpct} | {control} "
+            "| {seed} | {cnet} | {knet} | {dnet} | {dnetpct} "
+            "| {ctok} | {ktok} | {dtok} | {dtokpct} | {control} "
             "| {candidate} | {delta} | {pct} | {rounds} | {match} |".format(
                 seed=entry["seed"],
                 cnet=_format(
@@ -868,6 +1302,16 @@ def render_markdown(
                 dnet=_format(entry.get("delta_ms_per_m4_window_net"), "+.4f"),
                 dnetpct=_format(
                     entry.get("delta_ms_per_m4_window_net_pct"), "+.4f"
+                ),
+                ctok=_format(
+                    entry.get("control_mean_tokens_per_m4_window"), ".4f"
+                ),
+                ktok=_format(
+                    entry.get("candidate_mean_tokens_per_m4_window"), ".4f"
+                ),
+                dtok=_format(entry.get("delta_tokens_per_m4_window"), "+.4f"),
+                dtokpct=_format(
+                    entry.get("delta_tokens_per_m4_window_pct"), "+.4f"
                 ),
                 control=_format(entry["control_mean_decode_tok_s"], ".6f"),
                 candidate=_format(entry["candidate_mean_decode_tok_s"], ".6f"),
@@ -887,10 +1331,17 @@ def render_markdown(
 
     overall = summary["overall"]
     lines.append("")
+    # One line, three readings: the cost headline (ms/M4win net), the
+    # acceptance headline (tok/M4win) and raw tok/s.  Reading only the third
+    # is what made a real cycle-time win look like nothing on 2026-09-02.
     lines.append(
         "PRIMARY: control {control} ms/M4win net, candidate {candidate} "
         "ms/M4win net, delta {delta} ms ({pct}%); paired delta mean {paired} "
-        "ms, median {median} ms; adjacent-pair delta mean {adjacent} ms.".format(
+        "ms, median {median} ms; adjacent-pair delta mean {adjacent} ms. "
+        "ACCEPTANCE: control {ctok} tok/M4win, candidate {ktok} tok/M4win, "
+        "delta {dtok} tok ({tokpct}%); paired delta mean {ptok} tok, median "
+        "{mtok} tok; adjacent-pair delta mean {atok} tok. THROUGHPUT: delta "
+        "{dtoks} tok/s ({tokspct}%).".format(
             control=_format(
                 overall.get("control_mean_ms_per_m4_window_net"), ".4f"
             ),
@@ -911,6 +1362,93 @@ def render_markdown(
             ),
             adjacent=_format(
                 overall.get("adjacent_delta_mean_ms_per_m4_window_net"), "+.4f"
+            ),
+            ctok=_format(
+                overall.get("control_mean_tokens_per_m4_window"), ".4f"
+            ),
+            ktok=_format(
+                overall.get("candidate_mean_tokens_per_m4_window"), ".4f"
+            ),
+            dtok=_format(overall.get("delta_mean_tokens_per_m4_window"), "+.4f"),
+            tokpct=_format(
+                overall.get("delta_mean_tokens_per_m4_window_pct"), "+.4f"
+            ),
+            ptok=_format(
+                overall.get("paired_delta_mean_tokens_per_m4_window"), "+.4f"
+            ),
+            mtok=_format(
+                overall.get("paired_delta_median_tokens_per_m4_window"), "+.4f"
+            ),
+            atok=_format(
+                overall.get("adjacent_delta_mean_tokens_per_m4_window"), "+.4f"
+            ),
+            dtoks=_format(overall.get("delta_mean_decode_tok_s"), "+.6f"),
+            tokspct=_format(overall.get("delta_mean_pct"), "+.4f"),
+        )
+    )
+    agreement = summary.get("headline_agreement") or headline_agreement(overall)
+    if not agreement.get("agree", True):
+        lines.append(
+            "HEADLINES DISAGREE: {readings}{tail}".format(
+                readings="; ".join(
+                    "{label} favours {favours} ({delta}{unit}, {pct}%)".format(
+                        label=agreement[name]["label"],
+                        favours=agreement[name]["favours"] or "n/a",
+                        delta=_format(agreement[name]["delta"], "+.4f"),
+                        unit=unit,
+                        pct=_format(agreement[name]["delta_pct"], "+.4f"),
+                    )
+                    for name, unit in (
+                        ("cost", " ms"),
+                        ("acceptance", " tok"),
+                        ("throughput", " tok/s"),
+                    )
+                ),
+                tail=(
+                    " -- tok/s carries the retrieval yield (how often the "
+                    "trajectory quoted the prompt) that both M4 headlines "
+                    "subtract out, so read the M4 headlines."
+                    if agreement.get("throughput_disagrees_with_m4_headlines")
+                    else " -- the cost and acceptance headlines split, so "
+                    "this arm moved cycle time and accepted yield in "
+                    "opposite directions."
+                ),
+            )
+        )
+    lines.append(
+        "Acceptance by depth: control realised {crate} (expected {cprob}), "
+        "candidate realised {krate} (expected {kprob}); conditional "
+        "d2|d1,d3|d2 realised {ccond} vs {kcond}, expected {cpcond} vs "
+        "{kpcond}.".format(
+            crate=_format_by_depth(
+                overall.get("control_mean_accept_rate_by_depth"), ".4f"
+            ),
+            cprob=_format_by_depth(
+                overall.get("control_mean_accept_probability_by_depth"), ".4f"
+            ),
+            krate=_format_by_depth(
+                overall.get("candidate_mean_accept_rate_by_depth"), ".4f"
+            ),
+            kprob=_format_by_depth(
+                overall.get("candidate_mean_accept_probability_by_depth"),
+                ".4f",
+            ),
+            ccond=_format_by_depth(
+                overall.get("control_conditional_accept_rate_by_depth"), ".4f"
+            ),
+            kcond=_format_by_depth(
+                overall.get("candidate_conditional_accept_rate_by_depth"),
+                ".4f",
+            ),
+            cpcond=_format_by_depth(
+                overall.get("control_conditional_accept_probability_by_depth"),
+                ".4f",
+            ),
+            kpcond=_format_by_depth(
+                overall.get(
+                    "candidate_conditional_accept_probability_by_depth"
+                ),
+                ".4f",
             ),
         )
     )
