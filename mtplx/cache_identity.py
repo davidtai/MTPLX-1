@@ -42,6 +42,19 @@ hidden by the same re-wrap:
    :class:`CacheIdentityContractError` at trace time, naming the lane and the
    layer index.
 
+3. **No ragged metadata across the re-wrap** (W77).  The throwaway carries
+   neither ``lengths`` nor ``left_padding``, and neither is an input to the
+   traced step, so a layer that branches on them -- ``GatedDeltaNet``'s ragged
+   conv-state write, and all three ``_fused_*_applies`` refusals -- reads
+   ``None`` inside a compiled run whatever the real entry holds.
+   :func:`assert_no_ragged_metadata` refuses that at the compiled entry
+   (once per run, on the run's head entry) and at trace time (per layer, on
+   every real entry the run re-wraps).  It cannot fire today: ``_forward``
+   only takes the compiled path when the ssm entry's ``make_mask`` returns
+   ``None``, which it does only when both fields are unset there, and every
+   producer sets them uniformly across the cache list.  That is a coincidence,
+   not a contract, which is exactly what the guard is for.
+
 Cost.  Both context variables default to ``None``.  With no lane registered,
 :func:`assert_satisfied` and :func:`note_resolved` are a single
 ``ContextVar.get()`` and a return, and :func:`bind_rewrapped_entry` is one
@@ -64,8 +77,11 @@ __all__ = [
     "ALIAS_ATTR",
     "CacheIdentityContractError",
     "CacheIdentityExpectations",
+    "RAGGED_METADATA_FIELDS",
+    "RaggedCacheInCompiledRunError",
     "STASH_PREFIX",
     "assert_no_dropped_stash",
+    "assert_no_ragged_metadata",
     "assert_satisfied",
     "bind_rewrapped_entry",
     "current_expectations",
@@ -75,6 +91,7 @@ __all__ = [
     "note_resolved_index",
     "pop_rewrap_source",
     "push_rewrap_source",
+    "ragged_metadata_fields",
     "real_entry_for",
     "resolve_cache_entry",
     "rewrap_scope",
@@ -84,6 +101,16 @@ __all__ = [
 
 class CacheIdentityContractError(RuntimeError):
     """A compiled run re-wrapped a layer whose declared lane never resolved."""
+
+
+class RaggedCacheInCompiledRunError(CacheIdentityContractError):
+    """A compiled run was handed a cache entry carrying ragged-batch metadata.
+
+    The throwaway container ``_compiled_run_fn`` builds carries neither
+    ``lengths`` nor ``left_padding``, so inside a compiled run every predicate
+    that reads them sees ``None`` and the layer takes a DIFFERENT branch from
+    the eager path -- see :func:`assert_no_ragged_metadata`.
+    """
 
 
 #: Attribute the throwaway container carries back to the real cache entry.
@@ -366,6 +393,90 @@ def assert_no_dropped_stash(
         "the previous window's. Surface it as a compiled output (as "
         "_mtplx_verify_rows is), or write it to the real entry via "
         "mtplx.cache_identity.resolve_cache_entry."
+    )
+
+
+#: The ragged-batch metadata a cache entry can carry.  Both are set by the
+#: batch lanes (mlx-lm's ``ArraysCache.merge`` seeds ``left_padding`` on every
+#: all-empty merge; ``PromptProcessingBatch.prompt`` sets ``lengths`` around a
+#: right-padded prefill; ``restore_cache(..., restore_meta_state=True)``
+#: reinstalls whatever a snapshot captured), and both are read by
+#: ``GatedDeltaNet`` OUTSIDE the mask: the ragged conv-state write branches on
+#: ``cache.lengths``, and all three ``_fused_*_applies`` predicates refuse on it.
+RAGGED_METADATA_FIELDS = ("lengths", "left_padding")
+
+
+def ragged_metadata_fields(entry: Any) -> tuple[str, ...]:
+    """The ragged-batch metadata fields ``entry`` carries, in field order.
+
+    ``()`` for the plain decode cache, which is every entry outside a padded
+    or ragged batch.  Cold path: the hot callers inline the two ``getattr``
+    tests and only call in here to build the message.
+    """
+
+    if entry is None:
+        return ()
+    return tuple(
+        name
+        for name in RAGGED_METADATA_FIELDS
+        if getattr(entry, name, None) is not None
+    )
+
+
+def assert_no_ragged_metadata(entry: Any, layer_index: int, *, label: str) -> None:
+    """Raise if a compiled run would drop ``entry``'s ragged-batch metadata.
+
+    THE THIRD HALF of the re-wrap hazard (after the identity lookup and the
+    dropped stash).  ``_compiled_run_fn``'s throwaway ``ArraysCache(size=2)``
+    carries no ``lengths`` and no ``left_padding``, and neither field is an
+    input to the traced step, so inside a compiled run:
+
+    * ``GatedDeltaNet.__call__``'s conv-state write takes the DENSE tail
+      (``conv_input[:, -n_keep:, :]``) instead of the ragged
+      ``take_along_axis`` gather keyed on ``cache.lengths``; and
+    * ``_fused_step_applies`` / ``_fused_conv_norm_applies`` /
+      ``_fused_conv_norm_rows_applies`` stop refusing, so a padded batch can
+      reach a kernel written for dense rows.
+
+    Neither is a decline.  Both are silently different arithmetic from what
+    the eager path would have run on the same cache -- W66d's failure mode.
+
+    Today this cannot happen, and it is blocked by ONE coincidence rather than
+    by a contract: ``Qwen4ExpTextModel._forward`` enters the compiled path only
+    when ``create_ssm_mask(h, cache[self.ssm_idx])`` is ``None``, and
+    ``make_mask`` returns an array whenever EITHER field is set on that one
+    entry.  Every producer sets the fields uniformly across the cache list, so
+    the ssm entry stands in for all of them.  The coincidence dies the moment
+    a lane sets the metadata non-uniformly, hands the model a container that
+    carries the fields without a ``make_mask``, or re-wraps the cache in a twin
+    that drops the metadata (``graphbank._ensure_shadow`` already builds its
+    GDN twins as ``type(entry)(len(entry.cache))``, which copies the state
+    leaves and nothing else).  So the check is here, at the compiled entry, to
+    fail loudly on the day it becomes reachable instead of diverging.
+    """
+
+    # The two fields are spelled out rather than looped over
+    # RAGGED_METADATA_FIELDS because this is the hot path: one call, two
+    # attribute loads and two identity tests per compiled run per decode
+    # step.  Both are plain instance attributes on stock ArraysCache and
+    # `_lengths is None` / `_left_padding is None` fast-path properties on the
+    # vendored FixedArraysCache, so neither load folds or schedules anything
+    # unless it is actually set -- and if it is set, this call raises.
+    if (
+        getattr(entry, "lengths", None) is None
+        and getattr(entry, "left_padding", None) is None
+    ):
+        return
+    fields = ragged_metadata_fields(entry)
+    raise RaggedCacheInCompiledRunError(
+        f"{label}: layer {int(layer_index)}'s cache entry carries "
+        f"{' and '.join(fields)}, and the throwaway container a compiled run "
+        "hands the layer carries neither -- the run would take the dense "
+        "conv-state write and stop refusing the fused GDN kernels, which is "
+        "not a decline but different arithmetic from the eager path on the "
+        "same cache. Route ragged/left-padded forwards to the eager path "
+        "(the ssm mask normally does this), or thread the metadata through "
+        "the compiled step as an explicit input."
     )
 
 
