@@ -673,12 +673,16 @@ def _ple_prefill_lookahead_verdict(context: Mapping[str, Any]) -> Verdict:
         keys=(key,),
         state=STATE_ARMED,
         engages_at=(
-            "a prefill cut into 2+ chunks whose spans exceed the sidecar "
-            "hot-row threshold"
+            "any prefill cut into 2+ chunks whose spans exceed the sidecar "
+            "hot-row threshold -- a cold prompt's chunked prefill and a "
+            "session-bank restore's suffix prefill alike"
         ),
         detail=(
             f"{stage_detail}; worker-thread preparation of chunk k+1's n-gram "
-            "rows during chunk k's forward"
+            "rows during chunk k's forward.  A prefill with only one chunk "
+            "(a short prompt, a small restored suffix, the fused small-suffix "
+            "lane) has nothing to look ahead to and declines as "
+            "`single_span`; no request path raises"
         ),
         decided_at=decided_at,
         readers=readers,
@@ -752,7 +756,13 @@ def _ple_first_gather_early_verdict(context: Mapping[str, Any]) -> Verdict:
         ),
         detail=(
             f"{stage_detail}; also selects the vectorised sidecar gather "
-            f"(resident_fraction >= {ple_row_gather.RESIDENT_FRACTION_THRESHOLD})"
+            f"(resident_fraction >= {ple_row_gather.RESIDENT_FRACTION_THRESHOLD})."
+            "  The span is predicted from the prompt alone, before the "
+            "session-bank lookup, so a request the bank restores prefills a "
+            "SUFFIX whose first chunk is not that span: the payload is "
+            "refused on the span/plan comparison (`early_span_mismatch`, "
+            "`early_miss_wrong_span`) and the owner pays the ordinary "
+            "gather -- counted, never a raise"
         ),
         decided_at=decided_at,
         readers=readers,
