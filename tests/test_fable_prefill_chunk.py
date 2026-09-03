@@ -18,6 +18,11 @@ import pytest
 from mtplx.fable_prefill_chunk import (
     ALLOW_COMPILE_ROWS_MISMATCH_ENV,
     BUDGET_ENV,
+    CHUNK_SIZE_DENSE_ENV,
+    CHUNK_SIZE_ENV,
+    CHUNK_SIZE_REPAGE_ENV,
+    COHERENCE_COMPILED,
+    COHERENCE_NARROW_EAGER,
     COMPILE_ROWS_ENV,
     DEFAULT_CHUNK_SIZE,
     GUARD_ENV,
@@ -29,6 +34,7 @@ from mtplx.fable_prefill_chunk import (
     PrefillChunkMemoryError,
     assert_prefill_chunk_coherent,
     attention_row_context_products,
+    configured_full_chunk_widths,
     guard_prefill_chunk_geometry,
     plan_prefill_chunk_memory,
     query_tile_spans,
@@ -267,9 +273,15 @@ def test_plan_receipt_is_json_shaped():
 
 
 def test_shipped_width_is_coherent():
-    assert_prefill_chunk_coherent(DEFAULT_CHUNK_SIZE, {})
-    assert_prefill_chunk_coherent(
-        DEFAULT_CHUNK_SIZE, {COMPILE_ROWS_ENV: str(DEFAULT_CHUNK_SIZE)}
+    assert (
+        assert_prefill_chunk_coherent(DEFAULT_CHUNK_SIZE, {})
+        == COHERENCE_COMPILED
+    )
+    assert (
+        assert_prefill_chunk_coherent(
+            DEFAULT_CHUNK_SIZE, {COMPILE_ROWS_ENV: str(DEFAULT_CHUNK_SIZE)}
+        )
+        == COHERENCE_COMPILED
     )
 
 
@@ -280,20 +292,102 @@ def test_widening_without_the_compile_rows_knob_is_refused():
 
 
 def test_widening_both_knobs_together_is_accepted():
-    assert_prefill_chunk_coherent(4096, {COMPILE_ROWS_ENV: "4096"})
+    assert (
+        assert_prefill_chunk_coherent(
+            4096, {COMPILE_ROWS_ENV: "4096", CHUNK_SIZE_ENV: "4096"}
+        )
+        == COHERENCE_COMPILED
+    )
 
 
-def test_coherence_is_about_the_configured_width_not_the_observed_span():
-    """Pins why the generation.py call site passes ``prefill_chunk_size``.
+def test_narrow_chunks_take_the_eager_selector_without_a_refusal():
+    """The W57 bug: warm-up rungs and tails are NOT mis-paired serves.
 
-    A 100-token prompt, or a GDN-boundary tail grid, legitimately produces
-    spans narrower than the configured chunk.  Checking the OBSERVED widest
-    span would refuse every one of them.
+    ``qwen4_exp._qsa_prefill_compile_rows`` gates the compiled QSA prefill
+    on ``rows == compile_rows``, so a narrower chunk already falls back by
+    design.  A 100-token prompt, a GDN-boundary tail grid, and the server's
+    256-token warm-up ladder chunks are all in that class.
     """
 
+    assert assert_prefill_chunk_coherent(100, {}) == COHERENCE_NARROW_EAGER
+    assert (
+        assert_prefill_chunk_coherent(256, {COMPILE_ROWS_ENV: "4096"})
+        == COHERENCE_NARROW_EAGER
+    )
+    assert (
+        assert_prefill_chunk_coherent(DEFAULT_CHUNK_SIZE, {})
+        == COHERENCE_COMPILED
+    )
+
+
+def test_warmup_ladder_chunk_passes_under_pinned_compile_rows():
+    """The exact server geometry that refused on 2026-09-01.
+
+    ``MTPLX_QSA_PREFILL_COMPILE_ROWS=4096`` pinned for real prompts, the
+    background warm-up ladder passing its 256-token chunk: both rungs died
+    instantly on ``PrefillChunkGeometryError``.
+    """
+
+    environ = {
+        COMPILE_ROWS_ENV: "4096",
+        CHUNK_SIZE_ENV: "4096",
+    }
+    assert (
+        assert_prefill_chunk_coherent(256, environ) == COHERENCE_NARROW_EAGER
+    )
+    assert assert_prefill_chunk_coherent(4096, environ) == COHERENCE_COMPILED
+
+
+def test_full_width_narrower_than_the_compiled_rows_is_still_refused():
+    """The mis-pairing the guard exists for, in its other direction.
+
+    ``MTPLX_QSA_PREFILL_COMPILE_ROWS=4096`` with the width left at the
+    shipped 2,048 is a FULL chunk the graph bank will not serve -- every
+    chunk of every real prompt demoted to the eager selector.
+    """
+
+    with pytest.raises(PrefillChunkGeometryError) as excinfo:
+        assert_prefill_chunk_coherent(
+            DEFAULT_CHUNK_SIZE, {COMPILE_ROWS_ENV: "4096"}
+        )
+    assert COMPILE_ROWS_ENV in str(excinfo.value)
+    # ... and explicitly, with the width knob spelled out.
     with pytest.raises(PrefillChunkGeometryError):
-        assert_prefill_chunk_coherent(100, {})
-    assert_prefill_chunk_coherent(DEFAULT_CHUNK_SIZE, {})
+        assert_prefill_chunk_coherent(
+            2048, {COMPILE_ROWS_ENV: "4096", CHUNK_SIZE_ENV: "2048"}
+        )
+
+
+def test_narrower_full_width_under_auto_is_refused_for_both_layouts():
+    """``auto`` resolves per KV layout, so BOTH per-layout keys are full."""
+
+    environ = {
+        COMPILE_ROWS_ENV: "4096",
+        CHUNK_SIZE_ENV: "auto",
+        CHUNK_SIZE_DENSE_ENV: "2048",
+        CHUNK_SIZE_REPAGE_ENV: "1024",
+    }
+    assert configured_full_chunk_widths(environ) == frozenset({2048, 1024})
+    for width in (2048, 1024):
+        with pytest.raises(PrefillChunkGeometryError):
+            assert_prefill_chunk_coherent(width, environ)
+    assert (
+        assert_prefill_chunk_coherent(256, environ) == COHERENCE_NARROW_EAGER
+    )
+
+
+def test_configured_full_chunk_widths_defaults_and_garbage():
+    assert configured_full_chunk_widths({}) == frozenset({DEFAULT_CHUNK_SIZE})
+    assert configured_full_chunk_widths({CHUNK_SIZE_ENV: "4096"}) == frozenset(
+        {4096}
+    )
+    # ``_prefill_chunk_size`` falls back to 2,048 on an unparsable knob.
+    assert configured_full_chunk_widths(
+        {CHUNK_SIZE_ENV: "wide"}
+    ) == frozenset({DEFAULT_CHUNK_SIZE})
+    assert configured_full_chunk_widths({CHUNK_SIZE_ENV: "auto"}) == frozenset(
+        {DEFAULT_CHUNK_SIZE}
+    )
 
 
 def test_short_prompt_geometry_is_admitted():
@@ -308,8 +402,18 @@ def test_short_prompt_geometry_is_admitted():
 
 
 def test_compile_rows_mismatch_can_be_waived():
-    assert_prefill_chunk_coherent(
-        4096, {ALLOW_COMPILE_ROWS_MISMATCH_ENV: "1"}
+    assert (
+        assert_prefill_chunk_coherent(
+            4096, {ALLOW_COMPILE_ROWS_MISMATCH_ENV: "1"}
+        )
+        == COHERENCE_COMPILED
+    )
+    assert (
+        assert_prefill_chunk_coherent(
+            DEFAULT_CHUNK_SIZE,
+            {COMPILE_ROWS_ENV: "4096", ALLOW_COMPILE_ROWS_MISMATCH_ENV: "1"},
+        )
+        == COHERENCE_NARROW_EAGER
     )
 
 
@@ -471,6 +575,9 @@ def test_generation_guards_the_streaming_prefill_geometry():
     # consumer serves -- otherwise the guard refuses working 262K prefills.
     assert "_prefill_dense_transient_per_token" in names
     assert "_qsa_large_prefill_enabled" in text
+    # The narrow-chunk eager fallback is counted, not silently dropped.
+    assert "COHERENCE_NARROW_EAGER" in text
+    assert "rt.diagnostic_counters[NARROW_EAGER_COUNTER]" in text
 
 
 def test_qsa_dense_attention_is_the_only_dense_sdpa_call_site():

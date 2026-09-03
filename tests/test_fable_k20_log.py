@@ -330,6 +330,93 @@ def test_stock_rejection_records_the_correction_and_truncates_alpha(k20):
     assert list(data["target_valid"][0]) == [1, 1, 1, 1]
 
 
+def test_carry_len_rides_every_log_even_when_nothing_carried(k20):
+    logger, _ = k20()
+    _stock_window(logger)
+    with np.load(logger.flush()) as handle:
+        data = {key: handle[key] for key in handle.files}
+    # A positive assertion: this writer accounted for lanes that commit
+    # without a row, and none fired.  That is a different statement from a
+    # log written before the column existed, which has neither key.
+    assert list(data["carry_len"]) == [0]
+    assert "carry_tokens" not in data
+
+
+def test_carry_records_the_tokens_a_lane_committed_without_a_row(k20):
+    logger, _ = k20()
+    logger.begin_request()
+    _stock_window(logger)
+    # A context-copy block round: no K20 row, but it commits the accepted
+    # slice, its residual correction, and (here) nothing else.
+    logger.carry_round()
+    logger.carry([901, 902])
+    logger.carry((903,))
+    _stock_window(logger, tokens=(41, 42, 43))
+    with np.load(logger.flush()) as handle:
+        data = {key: handle[key] for key in handle.files}
+    assert list(data["carry_len"]) == [3, 0]
+    np.testing.assert_array_equal(data["carry_tokens"][0], [901, 902, 903])
+    np.testing.assert_array_equal(data["carry_tokens"][1], [0, 0, 0])
+
+
+def test_carry_primary_closes_a_gap_that_emitted_no_correction(k20):
+    logger, _ = k20()
+    logger.begin_request()
+    _stock_window(logger)
+    # The round accepted its whole block, so it emitted no correction and the
+    # next cycle sampled a fresh primary.  That token is the gap's last one and
+    # is nowhere else in the log.
+    logger.carry_round()
+    logger.carry([901, 902])
+    logger.carry_primary(777)
+    _stock_window(logger)
+    with np.load(logger.flush()) as handle:
+        carry_len = handle["carry_len"]
+        carry_tokens = handle["carry_tokens"]
+    assert list(carry_len) == [3, 0]
+    np.testing.assert_array_equal(carry_tokens[0], [901, 902, 777])
+
+
+def test_carry_primary_is_a_no_op_outside_a_gap(k20):
+    logger, _ = k20()
+    logger.begin_request()
+    _stock_window(logger)
+    logger.carry_primary(777)  # no lane committed anything: this IS a primary
+    _stock_window(logger)
+    with np.load(logger.flush()) as handle:
+        assert list(handle["carry_len"]) == [0, 0]
+        assert "carry_tokens" not in handle.files
+
+
+def test_a_gap_that_opened_before_this_request_had_a_row_is_refused(k20):
+    logger, _ = k20()
+    logger.begin_request()
+    _stock_window(logger)
+    logger.carry_round()
+    logger.carry([901])
+    # Second request through the same process: its rows start here, so a carry
+    # arriving before its first window would silently attach to the PREVIOUS
+    # request's last row and corrupt both trajectories.
+    logger.begin_request()
+    logger.carry_round()
+    with pytest.raises(RuntimeError, match="before the first verify window"):
+        logger.carry([911])
+
+
+def test_begin_request_does_not_carry_a_gap_across_the_boundary(k20):
+    logger, _ = k20()
+    logger.begin_request()
+    _stock_window(logger)
+    logger.carry_round()  # a round the first request ended inside
+    logger.begin_request()
+    _stock_window(logger)
+    # The trailing gap belongs to request 1 and has no successor window; the
+    # fresh primary of request 2 is that request's own first `primary`.
+    logger.carry_primary(777)
+    with np.load(logger.flush()) as handle:
+        assert list(handle["carry_len"]) == [0, 0]
+
+
 def test_stock_open_closes_the_previous_window(k20):
     """No accept-loop break or continue needs a hook of its own."""
 

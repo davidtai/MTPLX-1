@@ -53,6 +53,18 @@ ALLOW_COMPILE_ROWS_MISMATCH_ENV = (
     "MTPLX_FABLE_PREFILL_CHUNK_ALLOW_COMPILE_ROWS_MISMATCH"
 )
 QUERY_TILE_ENV = "MTPLX_FABLE_PREFILL_QSA_QUERY_TILE"
+CHUNK_SIZE_ENV = "MTPLX_PREFILL_CHUNK_SIZE"
+CHUNK_SIZE_DENSE_ENV = "MTPLX_PREFILL_CHUNK_SIZE_DENSE"
+CHUNK_SIZE_REPAGE_ENV = "MTPLX_PREFILL_CHUNK_SIZE_REPAGE"
+
+#: ``assert_prefill_chunk_coherent`` verdicts.  ``COHERENCE_COMPILED`` means
+#: the graph bank serves this width; ``COHERENCE_NARROW_EAGER`` means a
+#: partial/tail/warm-up chunk was admitted and takes the eager selector.
+COHERENCE_COMPILED = "compiled"
+COHERENCE_NARROW_EAGER = "narrow_eager"
+
+#: Receipt counter the caller bumps on a ``COHERENCE_NARROW_EAGER`` verdict.
+NARROW_EAGER_COUNTER = "prefill_chunk_narrow_eager_fallbacks"
 
 #: Headroom left unclaimed by the projected peak.  2 GiB is the smallest
 #: slack the box has survived: the census peak (87.39 GB) sits 9.2 GB under
@@ -350,13 +362,44 @@ def chunk_size_env_name() -> str:
     per-layout ``_DENSE`` / ``_REPAGE`` keys only apply under ``auto``.
     """
 
-    return "MTPLX_PREFILL_CHUNK_SIZE"
+    return CHUNK_SIZE_ENV
+
+
+def configured_full_chunk_widths(
+    environ: Mapping[str, str] | None = None,
+) -> frozenset[int]:
+    """Widths a FULL serving chunk can have, from the environment alone.
+
+    Mirrors ``mtplx.generation._prefill_chunk_size`` minus its request-local
+    ContextVar override -- deliberately.  The override is how a caller asks
+    for a NARROWER chunk than the serve is configured for (the background
+    warm-up ladder passes 256 so a warming prefill releases the model lock
+    every ~0.4 s), and honouring it here would make every such chunk look
+    like the serve's own full width and be refused.
+
+    ``auto`` resolves per KV layout at request time, so both per-layout keys
+    count as full widths; a numeric knob pins exactly one.
+    """
+
+    raw = _env(CHUNK_SIZE_ENV, environ).lower() or str(DEFAULT_CHUNK_SIZE)
+    if raw == "auto":
+        dense = _env_int(CHUNK_SIZE_DENSE_ENV, DEFAULT_CHUNK_SIZE, environ)
+        repage = _env_int(CHUNK_SIZE_REPAGE_ENV, DEFAULT_CHUNK_SIZE, environ)
+        return frozenset(
+            max(1, int(value))
+            for value in (dense, repage)
+            if value is not None
+        )
+    try:
+        return frozenset({max(1, int(raw))})
+    except ValueError:
+        return frozenset({DEFAULT_CHUNK_SIZE})
 
 
 def assert_prefill_chunk_coherent(
     chunk_size: int, environ: Mapping[str, str] | None = None
-) -> None:
-    """Refuse a width the QSA prefill graph bank would silently stop serving.
+) -> str:
+    """Refuse a FULL width the QSA prefill graph bank would stop serving.
 
     ``mtplx/models/qwen4_exp.py`` gates the fused/compiled QSA prefill
     indexer on ``rows == _qsa_prefill_compile_rows()`` so that arbitrary
@@ -364,19 +407,51 @@ def assert_prefill_chunk_coherent(
     bound.  Both that gate and the chunk width default to 2,048, so moving
     one and not the other demotes every full chunk to the eager selector --
     a quiet regression that would be scored as "4,096 lost".
+
+    The gate is ``==``, so a chunk NARROWER than the compiled width already
+    falls back by design: partial tails, GDN-boundary sub-spans, and the
+    server's background warm-up ladder (256-token chunks, ``openai.py``
+    ``_BackgroundWarmup.WARMUP_PREFILL_CHUNK_TOKENS``) are all legitimate
+    eager-selector work, not a mis-paired serve.  Refusing them is what
+    made both ladder rungs fail instantly under
+    ``MTPLX_QSA_PREFILL_COMPILE_ROWS=4096``.
+
+    The rule, given a width ``W`` and ``MTPLX_QSA_PREFILL_COMPILE_ROWS=C``:
+
+    * ``W == C`` -> accept, ``COHERENCE_COMPILED``: the bank serves it.
+    * ``W > C`` -> refuse: only a full chunk can exceed the compiled width,
+      and the bank cannot serve it.
+    * ``W < C`` and ``W`` is a configured FULL chunk width
+      (``configured_full_chunk_widths``) -> refuse: this is the W27 case,
+      an operator who moved ``C`` without moving the serving width.
+    * ``W < C`` otherwise -> accept, ``COHERENCE_NARROW_EAGER``: a
+      partial/tail/warm-up chunk on the eager selector.  Callers bump
+      ``NARROW_EAGER_COUNTER`` so the fallback is on the receipt.
+
+    ``MTPLX_FABLE_PREFILL_CHUNK_ALLOW_COMPILE_ROWS_MISMATCH=1`` waives every
+    refusal.
     """
 
-    compile_rows = _env_int(COMPILE_ROWS_ENV, DEFAULT_CHUNK_SIZE, environ)
-    if compile_rows is None or compile_rows == int(chunk_size):
-        return
+    width = int(chunk_size)
+    raw_rows = _env_int(COMPILE_ROWS_ENV, DEFAULT_CHUNK_SIZE, environ)
+    compile_rows = (
+        DEFAULT_CHUNK_SIZE if raw_rows is None else max(2, int(raw_rows))
+    )
+    if compile_rows == width:
+        return COHERENCE_COMPILED
+    narrow = width < compile_rows
+    if narrow and width not in configured_full_chunk_widths(environ):
+        return COHERENCE_NARROW_EAGER
     if _env_truthy(ALLOW_COMPILE_ROWS_MISMATCH_ENV, False, environ):
-        return
+        return COHERENCE_COMPILED if not narrow else COHERENCE_NARROW_EAGER
     raise PrefillChunkGeometryError(
-        f"prefill chunk width {int(chunk_size)} does not match "
+        f"prefill chunk width {width} does not match "
         f"{COMPILE_ROWS_ENV}={compile_rows}: the QSA prefill graph bank only "
         "captures its own row width, so every full chunk would fall back to "
-        f"the eager selector. Set {COMPILE_ROWS_ENV}={int(chunk_size)} "
-        f"alongside the width, or {ALLOW_COMPILE_ROWS_MISMATCH_ENV}=1."
+        f"the eager selector. Set {COMPILE_ROWS_ENV}={width} "
+        f"alongside the width, or {ALLOW_COMPILE_ROWS_MISMATCH_ENV}=1. "
+        "(A chunk narrower than the compiled width is a partial/warm-up "
+        "chunk and is admitted; this one is a full serving width.)"
     )
 
 

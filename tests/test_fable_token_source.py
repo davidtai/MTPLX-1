@@ -294,11 +294,23 @@ class TestDriverReceiptBlock(unittest.TestCase):
     """``abba_driver.token_provenance`` -- what actually lands on the receipt."""
 
     def setUp(self):
-        self.previous = ts.token_source.enabled
-        ts.token_source.enabled = True
+        # addCleanup, not tearDown: the recorder is a process-global, and a
+        # leaked `enabled = True` would arm it for every later test in the
+        # run.  Registered before the mutation so it fires even if setUp
+        # itself raises after this point.
+        previous, spans, recorded = (
+            ts.token_source.enabled,
+            list(ts.token_source.spans),
+            ts.token_source.recorded_tokens,
+        )
 
-    def tearDown(self):
-        ts.token_source.enabled = self.previous
+        def restore():
+            ts.token_source.enabled = previous
+            ts.token_source._spans = spans
+            ts.token_source._recorded = recorded
+
+        self.addCleanup(restore)
+        ts.token_source.enabled = True
 
     def test_block_carries_ids_digest_and_sources(self):
         tokens = stub_accept_loop(ts.token_source, FULL_SCRIPT)
