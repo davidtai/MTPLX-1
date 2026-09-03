@@ -513,6 +513,15 @@ def stats_receipt(
         ).hexdigest(),
         "compiled_verify": dict((stats.graphbank or {}).get("compiled_verify") or {}),
         "draft_core": dict(stats.draft_core or {}),
+        # MTPLX_FABLE_DEVICE_DRAFT_CHAIN engagement.  `{"installed": False}` on
+        # a control arm; on an armed arm it carries `mode`, `readbacks_per_cycle`,
+        # `body_traces` (must be 1 -- a climbing count means the mx.compile
+        # trace signature moves and the flag is paying for a retrace every
+        # cycle), `chain_builds`/`cache_rebinds`, `short_cycles` and the
+        # construction `prewarm_s` that `pre_first_token_setup_s` now carries.
+        "device_draft_chain": dict(
+            getattr(stats, "device_draft_chain", None) or {}
+        ),
         "online_correction_cache": dict(stats.online_correction_cache or {}),
         "context_copy": {
             "active": bool(stats.context_copy_active),
@@ -650,6 +659,125 @@ def _ple_candidate_prefetch_armed() -> bool:
         return False
 
 
+def _ple_boundary_armed() -> bool:
+    """Whether MTPLX_FABLE_PLE_BOUNDARY was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign that the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.ple_boundary import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _graph_build_overlap_armed() -> bool:
+    """Whether MTPLX_FABLE_GRAPH_BUILD_OVERLAP was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign that the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _graph_build_overlap_layers() -> int | None:
+    """The prefix depth this process was ASKED for, straight from the env.
+
+    Paired with the receipt's ``prefix_layers`` (the depth the bank actually
+    installed): a row where they disagree measured a partition its label does
+    not name.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import LAYERS_ENV
+
+        raw = (os.environ.get(LAYERS_ENV) or "").strip()
+        return int(raw, 10) if raw else None
+    except Exception:
+        return None
+
+
+def _graph_build_overlap_receipt() -> dict[str, float]:
+    """W63/W67 engagement: how many windows actually ran the split submission.
+
+    ``prefix_enqueued`` counts windows whose ``0..N-1`` graph was queued ahead
+    of the D3 host sync and ``suffix_joined`` those that then ran the
+    ``N..47`` graph on it.  The verdict gate is ``monolithic_windows``: an arm
+    that claims the lever and shows windows on the shipped monolithic route
+    took the control's code for them, so its delta is diluted by exactly that
+    fraction.  ``prefix_discarded`` should stay at or near zero -- every one is
+    a prefix forward computed and thrown away.
+
+    ``construction_ms`` / ``construction_calls`` price
+    ``install_fixed_m4_overlap_split`` itself, and
+    ``first_prefix_build_ms`` / ``first_suffix_build_ms`` price the two
+    graphs' one-time ``mx.compile`` traces (both always on, no item needed).
+    All of it happens AFTER the prefill span -- inside
+    ``pre_first_token_setup_s`` for the install, inside decode cycle 1 for the
+    traces -- so a TTFT delta that is not accounted for by these belongs to
+    ``prefill_split``, not to this lane.  ``split_shared_hits`` says how many
+    installs reused the process-wide compiled pair: on a served process every
+    install after the first must be a hit, or every request is paying two
+    fresh traces.
+
+    ``prefix_layers`` is the depth the bank INSTALLED, and it is the first
+    thing to read on a W67 arm: if it is not the N the arm's
+    ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS`` asked for, the row belongs to a
+    different partition.  ``aux_hoisted`` counts windows whose PLE auxiliary
+    was built at the enqueue rather than in the join; it is 0 at depth 1 and
+    should equal ``prefix_enqueued`` at any depth past the PLE layer.  The
+    ``*_ms`` fields are populated only when ``timing`` is in
+    ``MTPLX_FABLE_GRAPH_BUILD_OVERLAP_ITEMS``.
+    """
+
+    try:
+        from mtplx.graph_build_overlap import last_receipt
+
+        return last_receipt()
+    except Exception:
+        return {}
+
+
+def _ple_boundary_receipt() -> dict[str, float]:
+    """W62 engagement: what each armed boundary item actually did.
+
+    ``warm_skipped`` / ``warm_taken`` is the ``warm_skip`` verdict -- an arm
+    that claims the lever and shows ``warm_taken`` on every cycle probed a
+    cold table and took the shipped pread pass, so its delta is not the
+    lever.  ``primary_inline`` counts cycles whose 16 primary rows were read
+    without the pool at all.  The ``*_ms`` fields are populated only when the
+    ``timing`` item is in ``MTPLX_FABLE_PLE_BOUNDARY_ITEMS``.
+    """
+
+    try:
+        from mtplx.ple_boundary import last_receipt
+
+        return last_receipt()
+    except Exception:
+        return {}
+
+
 def _ple_candidate_prefetch_receipt() -> dict[str, float]:
     """K-P1 engagement: what the candidate row buffer actually served.
 
@@ -667,6 +795,41 @@ def _ple_candidate_prefetch_receipt() -> dict[str, float]:
         return last_receipt()
     except Exception:
         return {}
+
+
+def prefill_split_receipt(row: dict) -> dict[str, float | None]:
+    """Split ``prompt_eval_time_s`` into first chunk / rest / non-chunk.
+
+    W67's follow-up needed this reduced by hand from twelve receipts to answer
+    "did the candidate's TTFT regression come from the lever or from the first
+    prefill chunk?".  The answer was chunk 0 -- the process-cold one, whose
+    spread is ~0.7 s on BOTH arms -- while ``outside_s`` (everything in the
+    prefill span that is not chunk compute, which is where any per-request
+    construction inside the span would land) was identical to 0.5 ms.  Any
+    lane that arms construction near the request boundary wants this split at
+    a glance, so it is a standing field rather than a one-off reduce.
+    """
+
+    chunks = row.get("prefill_chunks") or []
+    prompt_eval = row.get("prompt_eval_time_s")
+    if not chunks or prompt_eval is None:
+        return {
+            "chunk0_s": None,
+            "rest_s": None,
+            "outside_s": None,
+            "chunks": len(chunks),
+        }
+    chunk0 = float(chunks[0].get("wall_s", 0.0))
+    rest = sum(float(chunk.get("wall_s", 0.0)) for chunk in chunks[1:])
+    return {
+        "chunk0_s": chunk0,
+        "rest_s": rest,
+        # prompt_eval minus chunk compute: restore/bookkeeping inside the
+        # measured prefill span.  A lane that pushed construction into prefill
+        # would show up HERE and nowhere else.
+        "outside_s": float(prompt_eval) - chunk0 - rest,
+        "chunks": len(chunks),
+    }
 
 
 def prefill_chunks_receipt() -> list[dict[str, float]]:
@@ -709,6 +872,65 @@ def first_chunk_cold_s(row: Mapping[str, Any] | None) -> float | None:
         return None
 
 
+def _gdn_keepmask_fold_armed() -> bool:
+    """Whether MTPLX_FABLE_GDN_KEEPMASK_FOLD was set in THIS process.
+
+    Same reason as the lanes above: the flag rides ``--candidate-extra-env``,
+    which ``candidate_environment`` does not carry, so without this a receipt
+    could show an inert lane with no sign the lane was ever asked to run.
+    """
+
+    try:
+        from mtplx.fable_gdn_keepmask_fold import ENV_FLAG
+
+        return (os.environ.get(ENV_FLAG) or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    except Exception:
+        return False
+
+
+def _gdn_keepmask_fold_receipt(compiled_m4_calls: int) -> dict[str, Any]:
+    """W66b engagement: did the fold run on every window, and how often did
+    the ring flush?
+
+    The verdict fields are ``windows`` (must equal the arm's compiled M4
+    calls -- a window on the shipped route took the control's commit and
+    dilutes the delta by exactly that fraction), ``flushes`` per window (the
+    ring policy predicts 0.206 at W=2 under the census accept law; a much
+    higher rate means something is forcing the deferred leaf, and the FIRST
+    thing to check is which consumer), and ``declines`` (must be 0: a decline
+    is today's answer at today's cost, so an arm with declines measured a
+    blend).  ``bypassed_commits`` counts commits from a non-M4 round -- copy
+    rounds mostly -- and is expected to be small and non-zero.
+
+    ``overlap_split`` is populated only when the W67 graph-build overlap is
+    armed alongside the fold.  It is the partition of the fold's 35 layers
+    across the split's boundary, and ``prefix_layers + suffix_layers`` must be
+    35: a row where it is not folded only half its recurrence.  Read it beside
+    ``ple_hot_rows.graph_build_overlap`` -- either both lanes are engaged or
+    the arm measured neither.
+    """
+
+    try:
+        from mtplx.fable_gdn_keepmask_fold import receipt_gate, stats_snapshot
+
+        snapshot = stats_snapshot()
+        compiled = int(compiled_m4_calls)
+        snapshot["compiled_calls"] = compiled
+        if snapshot.get("windows"):
+            snapshot["flushes_per_window"] = float(
+                snapshot["flushes"] / snapshot["windows"]
+            )
+        snapshot["gate"] = receipt_gate(snapshot, compiled_windows=compiled)
+        return snapshot
+    except Exception as error:  # diagnostic field, never the measurement
+        return {"available": False, "reason": repr(error)}
+
+
 def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
     """PLE hot-row cache counters, as injected by pr391_current_profile_launcher."""
 
@@ -738,6 +960,17 @@ def ple_hot_rows_receipt(runtime: Any) -> dict[str, Any]:
             "ple_first_gather_early_armed": _ple_first_gather_early_armed(),
             "ple_candidate_prefetch": _ple_candidate_prefetch_receipt(),
             "ple_candidate_prefetch_armed": _ple_candidate_prefetch_armed(),
+            "ple_boundary": _ple_boundary_receipt(),
+            "ple_boundary_armed": _ple_boundary_armed(),
+            # W63.  Not a PLE counter, but it rides the same block because it
+            # is measured against the same census gap and every consumer of
+            # these rows already reads `ple_hot_rows`.
+            "graph_build_overlap": _graph_build_overlap_receipt(),
+            "graph_build_overlap_armed": _graph_build_overlap_armed(),
+            "graph_build_overlap_layers": _graph_build_overlap_layers(),
+            # W66b.  Rides the same block for the same reason: it is measured
+            # against the same retained-control census.
+            "gdn_keepmask_fold_armed": _gdn_keepmask_fold_armed(),
             # Which gather path each big row read actually took.  The pread
             # warm pass costs ~165 ms per 32,768 rows against 0.44 ms for the
             # fancy index behind it, so an arm that claims the vectorised lane
@@ -1465,6 +1698,168 @@ RAW_ENV_MTPLX_READERS = {
 RAW_ENV_MTPLX_KEYS = frozenset(RAW_ENV_MTPLX_READERS)
 
 
+def fable_verify_glue_block(
+    runtime, *, require_calls: bool, strict: bool = True
+) -> dict:
+    """Engagement proof for ``MTPLX_FABLE_VERIFY_GLUE``, for the receipt row.
+
+    The 2026-09-02 W70 ABBA ran with the flag armed and produced NO evidence
+    either way: the lane's engagement line went to ``logger.info`` (invisible
+    in a driver run -- so are ``[qwen4-fixed-M4-verify]`` and
+    ``[qwen4-compiled-MTP-prepare]``) and no counter reached the receipt. An
+    arm that cannot prove which code it ran is unreadable, so this block is
+    mandatory whenever the flag is armed, and every way of failing to engage
+    RAISES rather than reporting a delta nobody can attribute:
+
+    * the install hook never ran  -- the runtime carries no install report, so
+      the item was inert and the candidate arm silently measured the control;
+    * every selected item disabled -- the probe found the kernel not
+      bit-exact, which is a real finding but NOT a benchmark;
+    * an installed item with zero hot-path calls -- it never got into the
+      graph, the same lie with a different cause.
+
+    ``require_calls`` is False at load (nothing is traced yet) and True at
+    receipt time, which is the only point where the call counters mean
+    anything.  ``strict=False`` collects the same failures into
+    ``block["problems"]`` instead of raising, so the receipt-time call can
+    still get its evidence onto disk before the run is refused.
+    """
+
+    problems: list[str] = []
+
+    def fail(message: str) -> None:
+        if strict:
+            raise RuntimeError(message)
+        problems.append(message)
+
+    from mtplx import fable_verify_glue as glue
+
+    block = glue.receipt()
+    if not block["armed"]:
+        return block
+    block["install_report"] = getattr(runtime, "_mtplx_fable_verify_glue", None)
+    if block["install_report"] is None:
+        fail(
+            "MTPLX_FABLE_VERIFY_GLUE is armed but its install probe never "
+            "ran: install_qwen4_fixed_verify_route did not reach it, so this "
+            "arm would measure the control while claiming the candidate "
+            f"(selected={block['selected']})"
+        )
+        block["problems"] = problems
+        return block
+    if block["pending"]:
+        fail(
+            "MTPLX_FABLE_VERIFY_GLUE item(s) still pending after load: "
+            f"{block['pending']}"
+        )
+    if not block["installed"]:
+        fail(
+            "MTPLX_FABLE_VERIFY_GLUE armed but every selected item is "
+            f"disabled: {block['disabled']}"
+        )
+    if block["disabled"]:
+        # A partial arm is still measurable, but the receipt must say which
+        # half of it is the control.
+        print(
+            "[fable-abba] verify-glue DISABLED items "
+            + json.dumps(block["disabled"], sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+    if require_calls:
+        uncalled = glue.uncalled_items(block)
+        if uncalled:
+            fail(
+                "MTPLX_FABLE_VERIFY_GLUE item(s) installed but never called: "
+                f"{uncalled}; calls={block['calls']}. The lane never entered "
+                "the graph, so this arm measured the control."
+            )
+    block["problems"] = problems
+    return block
+
+
+def fable_qsa_sparse_decode_block(*, require_calls: bool, strict: bool = True) -> dict:
+    """Engagement proof for ``MTPLX_FABLE_QSA_SPARSE_DECODE``/``_DRAFT``.
+
+    The 2026-09-02 W68 window armed the flag on the fixed-M4 stack and
+    measured the CONTROL: control and candidate response texts were
+    byte-identical on both finished seeds, for a kernel whose arithmetic is
+    rounding class, and NOTHING in the run said so.  The lane had no stderr
+    line, no receipt block, and every way it could decline was a silent
+    ``return False``.  So the same three proofs W70 added for the verify-glue
+    items apply here, and every way of failing to engage RAISES rather than
+    reporting a delta nobody can attribute:
+
+    * the install probe never ran -- no QSA cache bound the lane, so the flag
+      was inert and the candidate arm silently measured the control;
+    * the lane installed but disabled itself on the parity probe -- a real
+      numerical finding, but NOT a benchmark;
+    * the lane installed and NO route hit was recorded -- the kernel never got
+      into the verify graph, the same lie with a different cause.
+
+    ``require_calls`` is False at load (the QSA cache is built at the first
+    verify, so nothing has installed yet and ``pending`` is expected) and True
+    at receipt time, which is the only point where the counters mean anything.
+    ``strict=False`` collects the failures into ``block["problems"]`` instead
+    of raising, so the evidence reaches disk before the run is refused.
+
+    Both the route counters and the kernel-call counters are TRACE-time: the
+    Python body of a compiled verify graph runs once per retrace and the C++
+    replay never touches it.  Read them as "did this lane get into the graph
+    at all", never as a per-cycle count.
+    """
+
+    problems: list[str] = []
+
+    def fail(message: str) -> None:
+        if strict:
+            raise RuntimeError(message)
+        problems.append(message)
+
+    from mtplx.kernels import qsa_sparse_decode as lane
+
+    block = lane.receipt()
+    if not (block["armed"] or block["armed_draft"]):
+        return block
+    if require_calls:
+        if block["pending"]:
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but its install probe "
+                "never ran: no QSA cache bound the lane, so the kernel was "
+                "inert and this arm measured the stock chain"
+            )
+        elif not block["installed"]:
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE armed but the lane disabled "
+                f"itself: {block['disabled_reason']}"
+            )
+        elif int(block["route_hits"]) <= 0 and int(block["short_context"]) > 0:
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE installed but EVERY forward "
+                "declined for short context: this cell's context never "
+                f"reached {block['short_context_tokens']} tokens (blocks "
+                f"{block['short_context_blocks']}), so the kernel has no "
+                "analogue to run and the arm is the control by construction. "
+                "Measure this lane on a long-context cell."
+            )
+        elif int(block["route_hits"]) <= 0:
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE installed but no routing "
+                "decision ever reached the kernel: route_sites="
+                f"{block['route_sites']} declines={block['route_declines']}. "
+                "The lane never entered the graph, so this arm measured the "
+                "control."
+            )
+        elif not any(int(v) > 0 for v in block["kernel_calls"].values()):
+            fail(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE routed "
+                f"{block['route_hits']} times but issued zero kernel calls: "
+                f"{block['kernel_calls']}"
+            )
+    block["problems"] = problems
+    return block
+
+
 def is_raw_env_mtplx_key(key: str) -> bool:
     """Does this MTPLX_* key belong on the raw ``--env`` passthrough?"""
 
@@ -1606,6 +2001,14 @@ def build_family_overrides(
 def main() -> int:
     args = build_parser().parse_args()
     check_prompt_tokens(args)
+    # A measured arm must FAIL CLOSED.  The fable lanes decline (stand aside
+    # and run the shipped path) when a request shape does not suit them --
+    # that is the serving contract, and it is exactly wrong for a benchmark,
+    # where a silent decline would measure the control twice and label one of
+    # them the candidate.  Setting this before MLX is imported restores the
+    # old raise-on-ineligible behaviour for every armed lane in this process.
+    # `scripts/fable/humaneval_screen.py` deliberately does NOT set it.
+    os.environ.setdefault("MTPLX_FABLE_STRICT_CLAIMS", "1")
     if args.nan_warning_error:
         warnings.filterwarnings(
             "error",
@@ -1773,6 +2176,10 @@ def main() -> int:
     mx.reset_peak_memory()
 
     from mtplx.draft_lm_head import _install_draft_lm_head
+    from mtplx.fable_indexer_reuse import (
+        indexer_reuse_counters,
+        reset_indexer_reuse_counters,
+    )
     from mtplx.generation import generate_mtpk
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
@@ -1860,6 +2267,26 @@ def main() -> int:
             )
         print(
             "[fable-abba] M4 route " + json.dumps(m4_report, sort_keys=True),
+            flush=True,
+        )
+    # W70: prove the verify-glue lane installed BEFORE the decode run, so a
+    # broken arm dies in seconds instead of after a full window.
+    verify_glue_block = fable_verify_glue_block(runtime, require_calls=False)
+    if verify_glue_block["armed"]:
+        print(
+            "[fable-abba] verify-glue "
+            + json.dumps(verify_glue_block, sort_keys=True, default=str),
+            flush=True,
+        )
+    # W68: the same evidence for the sparse-decode lane. Nothing has
+    # installed yet at load -- the QSA cache is built at the first verify --
+    # so this line only proves the flag is live in THIS process; the
+    # engagement check is the receipt-time one below.
+    sparse_decode_block = fable_qsa_sparse_decode_block(require_calls=False)
+    if sparse_decode_block["armed"] or sparse_decode_block["armed_draft"]:
+        print(
+            "[fable-abba] qsa-sparse-decode "
+            + json.dumps(sparse_decode_block, sort_keys=True, default=str),
             flush=True,
         )
     if args.relaxed_draft_ties and not getattr(
@@ -2036,6 +2463,9 @@ def main() -> int:
     ) -> dict[str, Any]:
         thermal_receipt = wait_for_temperature(args.thermal_gate_max_c)
         reset_receipt = reset_run_caches(runtime, mx)
+        # Per-seed, so a shortfall against (depth-1) * cycles is attributable
+        # to the run that produced it rather than smeared over the arm.
+        reset_indexer_reuse_counters()
         mx.reset_peak_memory()
         prompt_ids = cell["prompt_ids"]
         max_tokens = int(cell["max_tokens"])
@@ -2120,6 +2550,12 @@ def main() -> int:
             time.perf_counter() - started,
         )
         row["pre_run_reset"] = reset_receipt
+        # MTPLX_FABLE_INDEXER_REUSE engagement. On an unarmed arm both are 0,
+        # which is what "the control really was the control" looks like.
+        row["indexer_reuse"] = {
+            "armed": os.environ.get("MTPLX_FABLE_INDEXER_REUSE") == "1",
+            **indexer_reuse_counters(),
+        }
 
         # PR391 D3 attach block (ported injection).
         if d3_route is not None:
@@ -2184,8 +2620,15 @@ def main() -> int:
         row["per_cycle"] = per_cycle_receipt(output.stats)
         row["ple_hot_rows"] = ple_hot_rows_receipt(runtime)
         row["prefill_chunks"] = prefill_chunks_receipt()
+        row["prefill_split"] = prefill_split_receipt(row)
         compiled = row["compiled_verify"]
         row["compiled_m4_calls"] = int(compiled.get("compiled_calls", 0))
+        # W66b keep-mask fold engagement + its own pass/fail gate, so a
+        # candidate arm can be read as "ran the lane" or "did not" without
+        # re-deriving the ring policy from the timings.
+        row["gdn_keepmask_fold"] = _gdn_keepmask_fold_receipt(
+            row["compiled_m4_calls"]
+        )
         row["configured_max_tokens"] = max_tokens
         row["finish_reason"] = output.finish_reason
         row["natural_stop"] = bool(args.natural_stop)
@@ -2401,6 +2844,18 @@ def main() -> int:
         # (2026-09-01); the allowlisted MTPLX_* keys additionally carry
         # requested-vs-effective and the file that reads them.
         "process_environment_overrides": process_environment_overrides,
+        # W70 MTPLX_FABLE_VERIFY_GLUE engagement. Re-read AFTER the run so the
+        # hot-path call counters are populated; raises if an item installed
+        # but never entered the graph.
+        "verify_glue": fable_verify_glue_block(
+            runtime, require_calls=True, strict=False
+        ),
+        # W68 MTPLX_FABLE_QSA_SPARSE_DECODE engagement. Read AFTER the run:
+        # armed / installed / disabled_reason / tile / splits / probe results
+        # / route hits per call site / kernel calls.
+        "qsa_sparse_decode": fable_qsa_sparse_decode_block(
+            require_calls=True, strict=False
+        ),
         "paired_routed_glu": {
             "expected": candidate_environment.get("MTPLX_QWEN4_M4_ROUTED_GLU")
             == "1",
@@ -2444,6 +2899,16 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"[fable-abba] wrote {out}", flush=True)
+    # W70: refuse AFTER the write. The evidence for why an armed arm was
+    # unreadable is more useful on disk than in a traceback alone.
+    glue_problems = (payload.get("verify_glue") or {}).get("problems") or []
+    glue_problems += (
+        (payload.get("qsa_sparse_decode") or {}).get("problems") or []
+    )
+    if glue_problems:
+        raise RuntimeError(
+            "this arm cannot be read as a candidate: " + "; ".join(glue_problems)
+        )
     return 0
 
 

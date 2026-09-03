@@ -24,6 +24,8 @@ from .artifacts import (
     text_config,
 )
 from .backends.registry import ARCHITECTURE_DECLARED_MODULES
+from .fable_indexer_reuse import draft_depth_scope
+
 # Install-time engagement receipts on stderr, once per model load. The
 # [qwen4-*] logger.info lines in load() reach no handler under
 # `python -m mtplx.server.openai`, so this prints the same text the way
@@ -298,6 +300,42 @@ class MTPLXRuntime:
             **kwargs,
         )
 
+    def forward_ar_prefill_group(
+        self,
+        chunk_inputs,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+    ):
+        """Layer-major prefill over a group of chunks (expert-major MoE).
+
+        ``MTPLX_FABLE_PREFILL_EXPERT_MAJOR``.  Returns one
+        ``(logits_or_None, widened_or_None)`` per chunk, in chunk order.  A
+        model without the schedule raises rather than silently serving the
+        chunk-major path under the candidate's label.
+        """
+
+        from mtplx.fable_prefill_expert_major import ExpertMajorRefusal
+
+        group = getattr(self.model, "forward_prefill_group", None)
+        if group is None:
+            raise ExpertMajorRefusal(
+                f"{type(self.model).__name__} has no expert-major prefill schedule"
+            )
+        if not self.mtp_enabled and return_hidden:
+            raise RuntimeError("return_hidden requires an MTP-patched runtime")
+        self._count("forward_ar_prefill_group_calls")
+        self._count("forward_ar_prefill_group_chunks", len(chunk_inputs))
+        return group(
+            list(chunk_inputs),
+            cache,
+            None,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+            emit_logits=emit_logits,
+        )
+
     def _compiled_ar_forward(self, cache):
         """Compiled target forward (MTPLX_COMPILE_AR_FORWARD).
 
@@ -420,7 +458,12 @@ class MTPLXRuntime:
         resolved_concat_order = (
             self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
         )
-        with mtp_adapter_depth(self.model, mtp_depth):
+        # `mtp_depth` is the chain position this call occupies, and this is the
+        # only place that knows it: `model.mtp_forward` does not take it on
+        # this architecture (see fable_compiled_draft._require_inert_mtp_depth).
+        # MTPLX_FABLE_INDEXER_REUSE needs it to tell the cycle's anchoring
+        # depth-1 draft from the depths that may reuse that anchor.
+        with mtp_adapter_depth(self.model, mtp_depth), draft_depth_scope(mtp_depth):
             kwargs = {
                 "mtp_cache": mtp_cache,
                 "concat_order": resolved_concat_order,
@@ -1118,6 +1161,17 @@ def load(
             )
             logger.info("[qwen4-M4-stage3] %s", qwen4_m4_stage3_report)
             _print_install_receipt("qwen4-M4-stage3", qwen4_m4_stage3_report)
+        # MTPLX_FABLE_HC_M4's PACK contract, checked here because the weights
+        # exist by now.  Everything it validates is process-invariant, so a
+        # miss is a deployment error: it must stop the server coming up with a
+        # precise reason rather than turn the first request that reaches
+        # verify width into an HTTP 500.  No-op when the flag is off.
+        from .models.qwen4_exp import install_hc_m4_pack_validation
+
+        hc_m4_report = install_hc_m4_pack_validation(runtime.model)
+        runtime.qwen4_hc_m4_report = hc_m4_report
+        if hc_m4_report.get("armed"):
+            logger.info("[qwen4-hc-m4] %s", hc_m4_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError

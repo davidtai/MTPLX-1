@@ -119,6 +119,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .fable_indexer_reuse import ENV_FLAG as INDEXER_REUSE_ENV
+from .fable_indexer_reuse import indexer_reuse_enabled
 from .fast_sampling import (
     _deterministic_mlx_top_k_support,
     _order_bounded_mlx_top_k_support,
@@ -313,11 +315,12 @@ def build_compiled_draft_chain(
     depth: int,
     top_k: int,
     request_max_tokens: int,
+    compact_row_fn: Callable[[Any], Any] | None = None,
 ) -> dict[str, Any]:
     """Build the compiled D1->D3 replacement for the eager draft chain.
 
-    Returns ``{"chain_fn", "compiled_body", "state_slots", "state_shapes",
-    "trace_stats", "depth", "top_k"}``.  ``chain_fn`` matches the eager chain's
+    Returns ``{"chain_fn", "compiled_body", "entry_kv", "state_slots",
+    "state_shapes", "trace_stats", "depth", "top_k"}``.  ``chain_fn`` matches the eager chain's
     ABI exactly (see the module docstring); the caller installs it as
     ``core["fn"]``.  ``trace_stats["body_traces"]`` is an exact count of how
     many times the graph was traced -- 1 for a healthy prewarmed request.
@@ -326,10 +329,28 @@ def build_compiled_draft_chain(
     first call to ``chain_fn`` performs the trace, so callers must prewarm --
     ``_pr391_prewarm_float32_d3_core`` already does, at construction, outside
     the measured loop.
+
+    ``compact_row_fn`` (default ``None`` -- the PR391 route's byte-identical
+    behaviour) is applied to the draft-head output INSIDE the traced body, and
+    its result is what the K20 support is built from.  It exists so
+    ``fable_device_draft_chain`` can hand the body the FR-Spec head's 65,536
+    pre-scatter row: the compiled graph is then wired to the compact row and
+    the 248,320-lane ``mx.full`` + ``put_along_axis`` behind the dense output
+    is never reachable from an output, so it is built and dropped rather than
+    run.  It runs only while ``mx.compile`` traces.
     """
 
     depth = int(depth)
     top_k = int(top_k)
+    if indexer_reuse_enabled():
+        # The reuse anchor is host state consulted once per draft call; under
+        # one compiled body the depth-1 branch is baked into the trace and
+        # depths 2/3 would replay it, so the flag would be silently inert.
+        raise CompiledDraftUnsupported(
+            f"{FABLE_COMPILED_DRAFT_ENV} and {INDEXER_REUSE_ENV} are mutually "
+            "exclusive: the per-depth trace cannot observe the host-side "
+            "reuse anchor, so an armed reuse flag would never fire"
+        )
     if depth < 1:
         raise CompiledDraftUnsupported("compiled draft depth must be >= 1")
     if top_k < 1:
@@ -379,7 +400,8 @@ def build_compiled_draft_chain(
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_depth=None,
         )
-        row = logits[:, -1, :].reshape(-1)
+        source = logits if compact_row_fn is None else compact_row_fn(logits)
+        row = source[:, -1, :].reshape(-1)
         flat = row.astype(mx.float32)
         local_ids, q_values = _deterministic_mlx_top_k_support(flat, top_k)
         local_ids, q_values = _order_bounded_mlx_top_k_support(local_ids, q_values)
@@ -444,6 +466,7 @@ def build_compiled_draft_chain(
     return {
         "chain_fn": chain_fn,
         "compiled_body": compiled_body,
+        "entry_kv": entry_kv,
         "state_slots": state_slots,
         "state_shapes": traced_shapes,
         "trace_stats": trace_stats,
@@ -463,6 +486,7 @@ def maybe_build_compiled_draft_chain(
     depth: int,
     top_k: int,
     request_max_tokens: int,
+    compact_row_fn: Callable[[Any], Any] | None = None,
 ) -> dict[str, Any] | None:
     """Build the compiled chain when the gate is armed, else ``None``.
 
@@ -483,6 +507,7 @@ def maybe_build_compiled_draft_chain(
         depth=depth,
         top_k=top_k,
         request_max_tokens=request_max_tokens,
+        compact_row_fn=compact_row_fn,
     )
 
 

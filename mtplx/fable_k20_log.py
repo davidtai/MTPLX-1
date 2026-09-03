@@ -113,10 +113,26 @@ key                          dtype / shape               meaning
 ``descriptor_offset``        int64   ``[C]``             PCG64 tape offset (pr391)
 ``rng_state``                uint64  ``[C, 4]``          PCG64 state/inc (stock)
 ``stop_ids``                 uint32  ``[S]``             request's stop set
+``carry_len``                uint32  ``[C]``             unlogged commits after
+                                                         this window
+``carry_tokens``             uint32  ``[C, M]``          those tokens (omitted
+                                                         when nothing carried)
 ``temperature``              float64 (0-d)
 ``draft_temperature``        float64 (0-d)
 ``top_p`` / ``top_k``        float64 / int64 (0-d)
 ===========================  ==========================  ===================
+
+**One row per verify window is NOT one row per committed token.**
+``mtplx/context_copy.py`` block rounds run their own verify forward over a
+verbatim slice of the prompt and commit the accepted prefix plus the residual
+correction without ever entering the accept loop this module hooks, so their
+tokens sit between one row's emission and the next row's ``primary``.
+``carry_len`` / ``carry_tokens`` (:meth:`K20RowLog.carry`) record them, in
+commit order, against the row they follow.  ``carry_len`` is written for every
+log, so an all-zero column positively asserts "no unlogged lane fired" and an
+*absent* column marks a log written before this accounting existed -- on which
+a trajectory reconstruction cannot tell a copy-lane gap from a request
+boundary and must refuse rather than guess.
 
 ``stock_prepared_bv`` adds one block of columns, written only for that layout
 (``mtplx/fable_block_verify.py``):
@@ -387,6 +403,12 @@ class K20RowLog:
         self._stop_ids = np.zeros(0, dtype=np.uint32)
         self._meta: dict[str, Any] = {}
         self._written: str | None = None
+        #: Index of the first row of the CURRENT request; a carry may never
+        #: attach to a row belonging to an earlier one.
+        self._carry_anchor = 0
+        #: True while a lane that writes no K20 row has committed tokens since
+        #: the last logged window.  Gates :meth:`carry_primary`.
+        self._carry_open = False
 
     def set_stop_ids(self, stop_ids: Any) -> None:
         """Record the request's stop-token set once, for exact replay.
@@ -398,6 +420,104 @@ class K20RowLog:
         if not _ENABLED or not self.enabled:
             return
         self._stop_ids = np.asarray(stop_ids, dtype=np.uint32).reshape(-1).copy()
+
+    def begin_request(self) -> None:
+        """A new request starts; nothing carries across the boundary.
+
+        One process can serve many requests (the three-seed fable drivers do),
+        and every one of them appends to the same buffer.  The committed stream
+        does NOT run across the join, so a carry left pending when a request
+        ended is that request's trailing tail and must never be attached to the
+        next request's first window.  Called once per ``generate_mtpk``, next to
+        :meth:`set_sampler`.
+        """
+
+        if not _ENABLED or not self.enabled:
+            return
+        self._close_open()
+        self._carry_anchor = len(self._rows)
+        self._carry_open = False
+
+    def carry_round(self) -> None:
+        """A lane that commits without a K20 row is about to run this cycle.
+
+        Opens the gap even when the round ends up committing nothing: the
+        cycle consumed a ``primary`` that no logged window will claim, so the
+        next cycle samples a fresh one, and :meth:`carry_primary` has to know
+        that that token belongs to the gap rather than to a window.
+        """
+
+        if not _ENABLED or not self.enabled:
+            return
+        self._close_open()
+        self._carry_open = True
+
+    def _carry_row(self) -> list[int]:
+        if len(self._rows) <= self._carry_anchor:
+            raise RuntimeError(
+                "K20 log: a lane committed tokens before the first verify "
+                "window of this request, so the emitted stream could not be "
+                "reconstructed from the log. Refusing to write one that would "
+                "look complete."
+            )
+        return self._rows[-1].setdefault("carry", [])
+
+    def carry(self, tokens: Sequence[Any]) -> None:
+        """Record tokens a lane committed to the emitted stream with NO row.
+
+        The K20 log holds one row per native-MTP verify window, and for a long
+        time that was assumed to be the whole committed stream.  It is not:
+        ``mtplx/context_copy.py`` block rounds verify a verbatim slice of the
+        prompt in their own forward and commit the accepted prefix (plus the
+        residual correction) without ever reaching the accept loop this module
+        hooks.  Those tokens sit between one row's emission and the next row's
+        ``primary``, so a reconstruction that walks row-to-row silently loses
+        them -- and reads the resulting carry-in break as a request boundary.
+        (2026-09-02: 302 of 3,072 tokens and 21 phantom request boundaries in a
+        1,113-window three-seed log.)
+
+        The tokens attach to the LAST closed row, in commit order, and land in
+        the optional ``carry_tokens`` / ``carry_len`` columns.  Because a gap
+        always ends on the token that becomes the next window's ``primary`` --
+        the round's own correction (carried as ``pending_primary``), or the
+        freshly sampled primary that :meth:`carry_primary` records -- the
+        invariant a reconstruction may rely on is::
+
+            carry_len[c] > 0  =>  carry_tokens[c][-1] == primary[c + 1]
+
+        except on the last row of a request, where the gap has no successor.
+        """
+
+        if not _ENABLED or not self.enabled:
+            return
+        committed = [int(token) for token in tokens]
+        if not committed:
+            return
+        self._close_open()
+        self._carry_row().extend(committed)
+        self._carry_open = True
+
+    def carry_primary(self, token: Any) -> None:
+        """The cycle's freshly sampled primary, when it lands INSIDE a gap.
+
+        A copy round that emits no correction leaves the next cycle to sample a
+        fresh primary.  That token is the gap's last token -- or, when another
+        copy round follows, one in its middle -- and it is nowhere else in the
+        log unless it is recorded here.  Recording it is what makes the
+        ``carry_tokens[c][-1] == primary[c + 1]`` invariant hold for every gap.
+
+        A no-op outside a gap: every other freshly sampled primary IS the next
+        row's ``primary`` column.  Also a no-op for a gap that opened before
+        this request had any row -- there the primary is the first window's own
+        ``primary`` and nothing is lost.
+        """
+
+        if not _ENABLED or not self.enabled or not self._carry_open:
+            return
+        if len(self._rows) <= self._carry_anchor:
+            self._carry_open = False
+            return
+        self._carry_row().append(int(token))
 
     def set_sampler(self, *, sampler: Any, draft_sampler: Any) -> None:
         """Record the shaping the rows were produced under.
@@ -574,6 +694,7 @@ class K20RowLog:
             layout = LAYOUT_STOCK
         self._claim_layout(layout)
         self._close_open()
+        self._carry_open = False
 
         depth = len(draft_tokens)
         rows: list[tuple[Any, Any, Any] | None] = []
@@ -828,6 +949,25 @@ class K20RowLog:
                 }
             )
 
+        # Unlogged commits.  `carry_len` rides EVERY log (C uint32s) as the
+        # positive assertion "this writer accounted for lanes that commit
+        # without a row"; an all-zero column means no such lane fired, which is
+        # a different statement from a log written before the column existed.
+        # `carry_tokens` is written only when something actually carried.
+        carries = [list(row.get("carry", ())) for row in rows]
+        carry_arrays: dict[str, np.ndarray] = {
+            "carry_len": np.asarray([len(c) for c in carries], dtype=np.uint32)
+        }
+        carry_width = max((len(c) for c in carries), default=0)
+        if carry_width:
+            carry_tokens = np.zeros((count, carry_width), dtype=np.uint32)
+            for index, tokens_out in enumerate(carries):
+                if tokens_out:
+                    carry_tokens[index, : len(tokens_out)] = np.asarray(
+                        tokens_out, dtype=np.uint32
+                    )
+            carry_arrays["carry_tokens"] = carry_tokens
+
         block_arrays: dict[str, np.ndarray] = {}
         if self.layout in STOCK_BV_LAYOUTS:
             block_arrays = {
@@ -839,6 +979,7 @@ class K20RowLog:
         return {
             **block_arrays,
             **stock_extra,
+            **carry_arrays,
             "layout": np.asarray(self.layout or LAYOUT_STOCK),
             "has_raw_logits": np.asarray(
                 1 if self.layout == LAYOUT_PR391 else 0, dtype=np.uint8
@@ -922,6 +1063,14 @@ class K20RowLog:
                 "(temperature <= 0): acceptance is argmax equality and those "
                 "windows carry no distributions, so neither the block-"
                 "verification nor the draft-temperature scorer applies."
+            )
+        carried = int(np.sum(arrays["carry_len"]))
+        if carried:
+            gaps = int(np.count_nonzero(arrays["carry_len"]))
+            note += (
+                f" carry={carried} tokens in {gaps} gaps (committed by a lane "
+                "with no verify window of its own -- context-copy block "
+                "rounds; recorded, so the trajectory is still complete)"
             )
         probed = int(np.sum(arrays["probe_valid"])) if "probe_valid" in arrays else 0
         if probed:

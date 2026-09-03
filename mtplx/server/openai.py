@@ -1696,6 +1696,15 @@ _ENGAGEMENT_REPORT_ATTRS: tuple[tuple[str, str], ...] = (
     ("qwen4_fixed_m4_verify", "qwen4_fixed_verify_report"),
     ("qwen4_m4_stage3", "qwen4_m4_stage3_report"),
     ("qwen4_compiled_mtp_prepare", "qwen4_compiled_mtp_prepare_report"),
+    # W42c's install-time MTPLX_FABLE_HC_M4 pack validation
+    # (mtplx/models/qwen4_exp.py:install_hc_m4_pack_validation, published on
+    # the runtime by mtplx/runtime.py). Shape-compatible with the rows above:
+    # a plain dict set once at model load, read here by getattr only. It is
+    # NOT one of the turbo-full-stack profile's own lanes, so it is not a
+    # full_stack_selfcheck marker -- it reports {"armed": bool,
+    # "validated": int} rather than {"installed": ...}, and its lane already
+    # logs itself. Adding it here changes no lane's output.
+    ("qwen4_hc_m4", "qwen4_hc_m4_report"),
     ("laguna_fused", "laguna_fused_report"),
 )
 
@@ -23028,6 +23037,57 @@ def _warmup_ladder_contexts(state: Any) -> list[int]:
     return sorted(contexts)
 
 
+def warmup_failed_steps(steps: Any) -> list[dict[str, Any]]:
+    """The warm-up steps that raised, as compact ``/health`` rows.
+
+    Each row carries the step index, its kind, the ladder context (when the
+    step has one) and the error string the step recorded. Only ``failed``
+    counts: ``skipped`` is a prewarm switched off and ``abandoned`` a step
+    the plan gave up on under sustained load -- neither is a broken warm
+    path.
+    """
+
+    failed: list[dict[str, Any]] = []
+    if not isinstance(steps, (list, tuple)):
+        return failed
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("state") or "") != "failed":
+            continue
+        row: dict[str, Any] = {
+            "index": index,
+            "kind": str(step.get("kind") or ""),
+            "error": str(step.get("error") or ""),
+        }
+        if step.get("context") is not None:
+            row["context"] = int(step["context"])
+        failed.append(row)
+    return failed
+
+
+def warmup_aggregate_state(steps: Any, *, abandoned: bool = False) -> str:
+    """The honest plan-level state for a finished warm-up plan.
+
+    ``done`` used to be published unconditionally at the end of the plan, so
+    a ladder whose every rung raised still reported ``warmup.background
+    .state: "done"`` with ``"state": "failed"`` children -- the branch
+    server's ``/health`` on 2026-09-01, where both rungs died on the prefill
+    chunk coherence refusal and nothing upstream noticed.
+
+    A failed step dominates: ``degraded`` says the daemon is up and serving
+    but did NOT get the warm coverage it planned, which is exactly what a
+    benchmark reading ``/health`` needs to know. ``abandoned_busy`` (the
+    plan gave up under sustained foreground load) is reported only when no
+    step actually failed, and ``done`` only when none did and the plan ran
+    to the end.
+    """
+
+    if warmup_failed_steps(steps):
+        return "degraded"
+    return "abandoned_busy" if abandoned else "done"
+
+
 class _ForegroundYield:
     """Duck-typed cancel event that trips when foreground work is queued.
 
@@ -23103,10 +23163,17 @@ class _BackgroundWarmup:
         if self.started_at_s is not None:
             end = self.finished_at_s if self.finished_at_s is not None else time.time()
             elapsed_s = round(max(0.0, end - self.started_at_s), 3)
+        # Additive, never renamed: existing readers keep using "state" and
+        # "steps"; "failed_steps"/"first_error" are always present (empty
+        # list / None on a healthy plan) so a reader can branch on them
+        # without probing for the key.
+        failed = warmup_failed_steps(self.steps)
         return {
             "mode": "background",
             "state": self.state_label,
             "steps": [dict(step) for step in self.steps],
+            "failed_steps": failed,
+            "first_error": (failed[0]["error"] if failed else None),
             "started_at_s": self.started_at_s,
             "finished_at_s": self.finished_at_s,
             "elapsed_s": elapsed_s,
@@ -23314,7 +23381,7 @@ class _BackgroundWarmup:
                 ):
                     step["state"] = "abandoned"
         self.finished_at_s = time.time()
-        self.state_label = "abandoned_busy" if abandoned else "done"
+        self.state_label = warmup_aggregate_state(self.steps, abandoned=abandoned)
         self._publish()
         snapshot = self.snapshot()
         try:
@@ -23325,6 +23392,8 @@ class _BackgroundWarmup:
                         "state": snapshot["state"],
                         "elapsed_s": snapshot["elapsed_s"],
                         "resubmits": snapshot["resubmits"],
+                        "failed_steps": snapshot["failed_steps"],
+                        "first_error": snapshot["first_error"],
                         "steps": [
                             {
                                 key: step.get(key)

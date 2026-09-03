@@ -20,11 +20,14 @@ import pytest
 
 from scripts.fable import shadow_draft_harness as harness
 from scripts.fable.shadow_draft_harness import (
+    CommitStep,
     ProposalVariant,
     Segment,
     ShadowRows,
+    TrajectoryGapError,
     block_bootstrap_se,
     budget,
+    commit_steps,
     empty_shadow_rows,
     expected_tokens,
     load_variant_module,
@@ -35,10 +38,14 @@ from scripts.fable.shadow_draft_harness import (
     realised_accepts,
     replay_windows,
     report,
+    request_ids,
     score,
     segment_windows,
     total_variation,
+    trimmable_offsets,
+    untrimmable_entries,
     variant_env_scope,
+    window_carry,
     window_emission,
     window_record,
 )
@@ -111,6 +118,29 @@ def make_log(windows, *, depth=DEPTH, width=WIDTH, layout="stock_prepared"):
         "top_p": np.float64(0.95),
         "top_k": np.int64(20),
     }
+    # A PCG64 stream id per request, written into the `inc` half of
+    # `rng_state` exactly as `_pcg64_state` does.  Opt-in: a window dict with
+    # no "stream" leaves the column zero, which is what the PR391 lane and the
+    # older stock logs look like, so the emitted-stream fallback stays covered.
+    if any("stream" in window for window in windows):
+        for index, window in enumerate(windows):
+            stream = int(window.get("stream", 0))
+            log["rng_state"][index] = (
+                index + 1,
+                index + 7,
+                0xA5A5_0000 + stream,
+                0x5A5A_0000 + stream,
+            )
+    # Unlogged commits.  Opt-in for the same reason: a log written before the
+    # logger accounted for them has neither column.
+    carries = [list(window.get("carry", ())) for window in windows]
+    if any(carries):
+        log["carry_len"] = np.asarray([len(c) for c in carries], dtype=np.uint32)
+        carry_width = max(len(c) for c in carries)
+        carry_tokens = np.zeros((count, carry_width), dtype=np.uint32)
+        for index, tokens in enumerate(carries):
+            carry_tokens[index, : len(tokens)] = np.asarray(tokens, dtype=np.uint32)
+        log["carry_tokens"] = carry_tokens
     for index, window in enumerate(windows):
         log["primary"][index] = window["primary"]
         log["draft_tokens"][index] = window["draft_tokens"]
@@ -283,6 +313,318 @@ def test_segment_windows_handles_three_seeds():
         )
     segments = segment_windows(make_log(windows))
     assert [s.windows for s in segments] == [2, 2, 2]
+
+
+def test_request_ids_reads_a_constant_stream_as_one_request():
+    one = [simple_window(7, [11, 12, 13], 20), simple_window(20, [21, 22, 23], 30)]
+    constant = [dict(window, stream=4) for window in one]
+    assert list(request_ids(make_log(constant))) == [0, 0]
+
+
+def test_request_ids_reads_the_pcg64_stream_id():
+    windows = []
+    for request in range(3):
+        base = 1000 * (request + 1)
+        windows.append(
+            simple_window(base, [base + 1, base + 2, base + 3], base + 9, stream=request)
+        )
+        windows.append(
+            simple_window(
+                base + 9, [base + 4, base + 5, base + 6], base + 8, stream=request
+            )
+        )
+    assert list(request_ids(make_log(windows))) == [0, 0, 1, 1, 2, 2]
+
+
+def test_request_ids_declines_a_column_that_cannot_carry_the_answer():
+    one = [simple_window(7, [11, 12, 13], 20), simple_window(20, [21, 22, 23], 30)]
+    # All zero: the PR391 lane and every pre-stream test stub.
+    assert request_ids(make_log(one)) is None
+    # Interleaved: a stream that comes back is not a request id.
+    interleaved = [
+        simple_window(7, [11, 12, 13], 20, stream=0),
+        simple_window(20, [21, 22, 23], 30, stream=1),
+        simple_window(30, [31, 32, 33], 40, stream=0),
+    ]
+    assert request_ids(make_log(interleaved)) is None
+
+
+def test_window_carry_is_empty_on_a_log_without_the_column():
+    log = make_log([simple_window(7, [11, 12, 13], 20)])
+    assert "carry_len" not in log
+    assert window_carry(log, 0) == []
+
+
+# The pattern that over-segmented the W51 shadow log (2026-09-02): a
+# context-copy block round commits a slice of the prompt, its residual
+# correction, and -- when it accepted the whole block -- the next freshly
+# sampled primary, all WITHOUT a K20 row.  Three shapes occur, and all three
+# are here: a gap that ends on a correction, a gap that ends on a fresh
+# primary, and two adjacent rounds inside one gap.  The real log held 21 of
+# them across 3 requests and the reconstruction read every one as a request
+# boundary, reporting 24 segments.
+def _copy_gap_log(*, record_carry):
+    def gap(tokens):
+        return {"carry": list(tokens)} if record_carry else {}
+
+    windows = [
+        # Request 0: a gap that ends on the round's own correction.  This
+        # window also REJECTS at depth 1, so its drafts 12 and 13 ride the
+        # verify forward and never reach the emitted stream -- the distinction
+        # between `fed` and `keep` that a full-accept-only log cannot test.
+        simple_window(
+            7, [11, 12, 13], 20, accepted=1, stream=0, **gap([901, 902, 903])
+        ),
+        simple_window(903, [31, 32, 33], 40, stream=0),
+        # Request 0 again: two adjacent copy rounds inside one gap.
+        simple_window(
+            40, [41, 42, 43], 50, stream=0, **gap([911, 912, 921, 922, 923])
+        ),
+        simple_window(923, [61, 62, 63], 70, stream=0),
+        # Request 1 starts.  Its first gap ends on a freshly sampled primary
+        # (the round accepted its whole block and emitted no correction).
+        simple_window(100, [101, 102, 103], 120, stream=1, **gap([931, 932, 933])),
+        simple_window(933, [141, 142, 143], 150, stream=1),
+        # ... and request 1 is cut by max tokens: nothing is emitted after the
+        # accepted prefix, which is the only genuine boundary in this log.
+        simple_window(
+            150, [151, 152, 153], 0, accepted=3, selected_present=0, stream=1
+        ),
+        # Request 2.
+        simple_window(200, [201, 202, 203], 220, stream=2),
+        simple_window(220, [241, 242, 243], 250, stream=2),
+    ]
+    return make_log(windows)
+
+
+def test_segment_windows_keeps_one_request_across_a_recorded_copy_lane_gap():
+    segments = segment_windows(_copy_gap_log(record_carry=True))
+    assert [(s.start, s.stop) for s in segments] == [(0, 4), (4, 7), (7, 9)]
+    # The gap's tokens are in the reconstructed stream, in commit order,
+    # between the window's emission and the next window's primary.
+    assert segments[0].tokens == (
+        7, 11, 20, 901, 902, 903,          # depth-1 reject, then the copy gap
+        31, 32, 33, 40,
+        41, 42, 43, 50, 911, 912, 921, 922, 923,
+        61, 62, 63, 70,
+    )
+    assert segments[1].tokens[:9] == (100, 101, 102, 103, 120, 931, 932, 933, 141)
+
+
+def test_segment_windows_refuses_a_copy_lane_gap_the_log_never_recorded():
+    log = _copy_gap_log(record_carry=False)
+    with pytest.raises(TrajectoryGapError) as raised:
+        segment_windows(log)
+    message = str(raised.value)
+    # It reports the holes, not a pile of phantom requests.
+    assert "3 window(s) of 3 reconstructed request segment(s)" in message
+    assert "carry_len" in message
+    assert "context_copy" in message
+
+
+def test_a_single_request_with_a_gap_raises_instead_of_splitting_in_two():
+    # The hazard the stream id closes: ONE request whose copy round the log
+    # never recorded.  Reading the token stream would call the gap a second
+    # request and replay both halves from the wrong prefill, silently.
+    log = make_log(
+        [
+            simple_window(7, [11, 12, 13], 20, stream=0),
+            simple_window(903, [31, 32, 33], 40, stream=0),
+        ]
+    )
+    with pytest.raises(TrajectoryGapError, match="1 window\\(s\\) of 1 reconstructed"):
+        segment_windows(log)
+
+
+def test_segment_windows_still_reads_the_stream_when_no_request_id_exists():
+    # No stream column: the PR391 lane and the older stock logs.  The
+    # emitted-stream heuristic is the only thing left, and it is unchanged.
+    log = make_log(
+        [
+            simple_window(7, [11, 12, 13], 20),
+            simple_window(99, [21, 22, 23], 30),
+        ]
+    )
+    assert [(s.start, s.stop) for s in segment_windows(log)] == [(0, 1), (1, 2)]
+
+
+def test_main_fails_loudly_on_a_log_that_lost_committed_tokens(tmp_path, capsys):
+    log = _copy_gap_log(record_carry=False)
+    path = tmp_path / "rows.npz"
+    np.savez_compressed(path, **log)
+    assert harness.main([str(path), "--expect-segments", "3", "--budget"]) == 1
+    error = capsys.readouterr().err
+    assert "does not hold the whole committed stream" in error
+    assert "MTPLX_CONTEXT_COPY=0" in error
+
+
+def test_main_accepts_the_same_log_once_the_carry_is_recorded(tmp_path, capsys):
+    log = _copy_gap_log(record_carry=True)
+    path = tmp_path / "rows.npz"
+    np.savez_compressed(path, **log)
+    assert harness.main([str(path), "--expect-segments", "3", "--budget"]) == 0
+    assert json.loads(capsys.readouterr().out)["segments"] == 3
+
+
+def test_window_record_hands_the_replay_the_carry_to_commit():
+    log = _copy_gap_log(record_carry=True)
+    assert window_record(log, 0)["carry"] == [901, 902, 903]
+    assert window_record(log, 1)["carry"] == []
+
+
+# ---------------------------------------------------------------------------
+# Replay bookkeeping: what advance owes the model, window by window
+# ---------------------------------------------------------------------------
+
+
+class _FakeKV:
+    """A trimmable attention entry: an offset that a trim moves."""
+
+    def __init__(self, offset=0):
+        self.offset = int(offset)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        self.offset -= int(n)
+        return int(n)
+
+
+class _FakeRecurrent:
+    """A GDN entry: state, no offset, no trim, and it says so."""
+
+    def __init__(self):
+        self.state = [0, 0]
+
+    def is_trimmable(self):
+        return False
+
+
+def test_untrimmable_entries_names_the_recurrent_layers():
+    # The Flash-Next shape: QSACache per full-attention layer, ArraysCache per
+    # linear layer.  This is the predicate the old offset-trim commit lacked.
+    cache = [_FakeKV(), _FakeRecurrent(), _FakeKV(), _FakeRecurrent()]
+    assert untrimmable_entries(cache) == [1, 3]
+    assert untrimmable_entries([_FakeKV(), _FakeKV()]) == []
+    # An entry that does not answer the question at all counts as untrimmable.
+    assert untrimmable_entries([object()]) == [0]
+
+
+def test_trimmable_offsets_ignores_the_recurrent_entries():
+    cache = [_FakeKV(16388), _FakeRecurrent(), _FakeKV(16388)]
+    assert trimmable_offsets(cache) == [16388, 16388]
+
+
+def test_commit_steps_for_a_plain_window():
+    window = window_record(
+        make_log([simple_window(7, [11, 12, 13], 20, accepted=1)]), 0
+    )
+    steps = commit_steps(window, offset=16384, primary=7)
+    assert steps == [
+        CommitStep(
+            kind="window",
+            fed=(7, 11, 12, 13),
+            keep=2,  # the primary plus the one accepted draft
+            offset=16386,
+            hidden_row=1,  # the row that produced the emitted correction
+            primary=20,  # deferred: its KV is the next forward's job
+        )
+    ]
+
+
+def test_commit_steps_across_a_window_followed_by_a_carry():
+    # The pattern the W51 log holds 21 times: the window commits its accepted
+    # prefix, then a context-copy round put [901, 902, 903] in the stream and
+    # 903 is the next window's primary.
+    log = make_log(
+        [
+            simple_window(7, [11, 12, 13], 20, accepted=3, carry=[901, 902, 903]),
+            simple_window(903, [31, 32, 33], 40, accepted=3),
+        ]
+    )
+    steps = commit_steps(window_record(log, 0), offset=16384, primary=7)
+    assert [step.kind for step in steps] == ["window", "carry"]
+    window_step, carry_step = steps
+    assert window_step.fed == (7, 11, 12, 13)
+    assert window_step.keep == 4 and window_step.offset == 16388
+    assert window_step.primary == 20
+    # The carry forward starts with the selection the window step deferred,
+    # and stops before 903, which the NEXT window's forward will consume.
+    assert carry_step.fed == (20, 901, 902)
+    assert carry_step.keep == 3 and carry_step.offset == 16391
+    assert carry_step.hidden_row == 2
+    assert carry_step.primary == 903
+
+    # The offset the window after the gap starts from, and the invariant that
+    # ties the two together: exactly one token is ever left uncommitted.
+    stream = (7, 11, 12, 13, 20, 901, 902, 903)
+    assert carry_step.offset == 16384 + len(stream) - 1
+    assert carry_step.primary == int(log["primary"][1])
+    following = commit_steps(
+        window_record(log, 1), offset=carry_step.offset, primary=carry_step.primary
+    )
+    assert following[0].fed[0] == carry_step.primary
+    assert following[0].offset == carry_step.offset + 4
+
+
+def test_commit_steps_drops_a_trailing_carry_when_the_request_ended():
+    # selected_present 0: nothing was emitted after the accepted prefix, so
+    # there is no selection to lead a carry forward and nothing follows it.
+    log = make_log(
+        [
+            simple_window(
+                7, [11, 12, 13], 0, accepted=2, selected_present=0, carry=[901, 902]
+            ),
+        ]
+    )
+    steps = commit_steps(window_record(log, 0), offset=16384, primary=7)
+    assert [step.kind for step in steps] == ["window"]
+    assert steps[0].keep == 3 and steps[0].offset == 16387
+    # Nothing is deferred: the request is over.
+    assert steps[0].primary == CommitStep.NONE
+
+
+def test_commit_steps_refuses_a_window_that_accepted_more_than_it_drafted():
+    window = dict(
+        window_record(make_log([simple_window(7, [11, 12, 13], 20)]), 0), accepted=9
+    )
+    with pytest.raises(ValueError, match="accepted 9 of 3"):
+        commit_steps(window, offset=0, primary=7)
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_commit_steps_walk_the_whole_w51_gap_pattern_in_order(index):
+    # Every window and every gap shape, driven exactly the way `advance`
+    # drives them: each step's offset and deferred primary feed the next.
+    log = _copy_gap_log(record_carry=True)
+    prompt = 16384
+    segment = segment_windows(log)[index]
+    offset, primary = prompt, int(log["primary"][segment.start])
+    fed_stream: list[int] = [primary]
+    steps_run = 0
+    for window_index in range(segment.start, segment.stop):
+        window = window_record(log, window_index)
+        assert window["primary"] == primary
+        for step in commit_steps(window, offset=offset, primary=primary):
+            # Every step's forward starts on the token the previous step
+            # deferred, and commits everything but its own last token.
+            assert step.fed[0] == primary
+            assert 0 <= step.hidden_row < step.keep <= len(step.fed)
+            # Only the KEPT rows enter the emitted stream: the rejected drafts
+            # ride the forward and are trimmed off by the prefix commit.
+            fed_stream.extend(step.fed[1 : step.keep])
+            if step.primary != CommitStep.NONE:
+                fed_stream.append(step.primary)
+            offset, primary = step.offset, step.primary
+            steps_run += 1
+    assert steps_run >= segment.windows
+    # The stream the replay walks IS the segment's token stream, and the cache
+    # ends exactly one token short of it -- the deferred primary -- or level
+    # with it when the request ended with nothing deferred.
+    assert tuple(fed_stream) == segment.tokens
+    deferred = 0 if primary == CommitStep.NONE else 1
+    assert offset == prompt + len(segment.tokens) - deferred
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +1126,7 @@ def test_window_record_carries_what_the_replay_needs():
         "selected_token": 20,
         "selected_present": True,
         "emission": [11, 12, 20],
+        "carry": [],
     }
 
 

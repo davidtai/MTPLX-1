@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from mtplx import fable_claim_contract as contract
 from mtplx import fable_device_k20 as dk
 from mtplx import fable_k20_log as log_mod
 from mtplx.sampling import SamplerConfig
@@ -671,12 +672,53 @@ def _claim(monkeypatch, **overrides):
         {"sampler": SamplerConfig(temperature=0.6, top_p=0.95, top_k=K20,
                                   presence_penalty=0.5)},
         {"speculative_depth": 0},
-        {"rng": np.random.Generator(np.random.Philox(1))},
+        {"draft_core": "device"},
     ],
 )
-def test_unsupported_requests_raise_instead_of_falling_back(monkeypatch, override):
+def test_unsupported_requests_decline_to_the_stock_lane(monkeypatch, override):
+    """Request-shaped ineligibility stands aside; it does not raise.
+
+    Every override here is a property of ONE REQUEST.  Raising made each of
+    them an HTTP 500 in serving even though the stock selector serves them
+    perfectly (composed-stack HumanEval gate, 2026-09-02).
+    """
+
+    monkeypatch.setattr(contract, "_STRICT", False)
+    contract.reset_for_test()
+    receipt: dict[str, object] = {}
+    assert _claim(monkeypatch, receipt=receipt, **override) is None
+    assert receipt["installed"] is False
+    assert receipt["declined"]
+    assert contract.decline_counts(dk._ENV_VAR)[receipt["declined"]] == 1
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"greedy_chain_enabled": True},
+        {"sampler": SamplerConfig(temperature=0.0, top_p=0.95, top_k=K20)},
+        {"draft_core": "device"},
+    ],
+)
+def test_strict_claims_turns_a_decline_back_into_a_failure(monkeypatch, override):
+    """A measured arm still fails closed under MTPLX_FABLE_STRICT_CLAIMS."""
+
+    monkeypatch.setattr(contract, "_STRICT", True)
     with pytest.raises(dk.DeviceK20Ineligible):
         _claim(monkeypatch, **override)
+
+
+def test_install_time_contract_violations_still_raise(monkeypatch):
+    """A wrong bit generator is not a request shape -- no request could work.
+
+    The rng comes from `generate_mtpk`'s own seeding, so this can only mean
+    the process is built wrong.  Every request would fail identically, so the
+    first one fails loudly instead of silently running a slower lane forever.
+    """
+
+    monkeypatch.setattr(contract, "_STRICT", False)
+    with pytest.raises(dk.DeviceK20Ineligible, match="PCG64"):
+        _claim(monkeypatch, rng=np.random.Generator(np.random.Philox(1)))
 
 
 def test_supported_request_builds_a_plan(monkeypatch):
@@ -909,3 +951,46 @@ def test_stock_layout_still_leaves_the_draft_uniforms_nan(tmp_path):
 
     assert layout == log_mod.LAYOUT_STOCK
     assert np.all(np.isnan(uniforms))
+
+
+# --------------------------------------------------------------------------
+# Greedy vs temperature-1: which shape gets which path
+# --------------------------------------------------------------------------
+
+
+def test_a_greedy_request_is_routed_to_the_greedy_chain(monkeypatch):
+    """This is a SAMPLED-lane route; greedy has its own optimised path.
+
+    A greedy request consumes no PCG64 uniform and builds no top-20 support,
+    so there is nothing here for it to use. It is not left unoptimised
+    either: `generate_mtpk`'s one-sync greedy chain serves it, and with
+    MTPLX_FABLE_DRAFT_K20_PRESCATTER armed that chain reads the same
+    65,536-row pre-scatter output this route would have.
+    """
+
+    monkeypatch.setattr(contract, "_STRICT", False)
+    contract.reset_for_test()
+    greedy = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
+    receipt: dict[str, object] = {}
+    assert (
+        _claim(monkeypatch, receipt=receipt, sampler=greedy, draft_sampler=greedy)
+        is None
+    )
+    assert receipt["declined"] == "greedy_request"
+    assert "temperature > 0" in str(receipt["declined_detail"])
+
+
+def test_a_temperature_one_request_still_claims(monkeypatch):
+    monkeypatch.setattr(contract, "_STRICT", False)
+    monkeypatch.setattr(dk, "_ENABLED", True)
+    import sys
+    import types
+
+    stub = types.ModuleType("mtplx.kernels.qwen4_frspec_k20_float32_choice")
+    stub.bind_qwen4_frspec_k20_float32_choice = lambda **_kw: (lambda *a: a)
+    monkeypatch.setitem(
+        sys.modules, "mtplx.kernels.qwen4_frspec_k20_float32_choice", stub
+    )
+    sampled = SamplerConfig(temperature=1.0, top_p=0.95, top_k=K20)
+    plan = _claim(monkeypatch, sampler=sampled, draft_sampler=sampled)
+    assert isinstance(plan, dk.DeviceK20Plan)

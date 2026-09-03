@@ -274,10 +274,17 @@ def test_background_warmup_step_failure_does_not_stop_the_plan(monkeypatch):
     warming.submit(0)
     scheduler.drain()
     snapshot = status_host["background"]
-    assert snapshot["state"] == "done"
+    # The plan runs on, but it does NOT get to call itself done: a rung that
+    # raised is the whole reason /health carries this block.
+    assert snapshot["state"] == "degraded"
     assert snapshot["steps"][1]["state"] == "failed"
     assert "RuntimeError" in snapshot["steps"][1]["error"]
     assert snapshot["steps"][2]["state"] == "ok"
+    assert [row["index"] for row in snapshot["failed_steps"]] == [1]
+    assert snapshot["failed_steps"][0]["kind"] == "ladder"
+    assert snapshot["failed_steps"][0]["context"] == 16
+    assert "metal exploded" in snapshot["first_error"]
+    json.dumps(snapshot)
 
 
 def test_run_startup_warmup_background_mode_returns_without_extended_block(
@@ -442,3 +449,92 @@ def test_background_warmup_still_warms_a_genuinely_idle_fresh_daemon(monkeypatch
     generations, status_host, _ = _deferral_probe(monkeypatch, state, scheduler)
     assert generations == [16]
     assert status_host["background"]["state"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Honest aggregate state (W57)
+# ---------------------------------------------------------------------------
+
+
+def test_warmup_aggregate_state_over_step_lists():
+    ok = [
+        {"kind": "gqa_packed_pipelines", "state": "ok"},
+        {"kind": "ladder", "context": 512, "state": "ok"},
+    ]
+    assert server.warmup_aggregate_state(ok) == "done"
+    # A prewarm that is switched off, or a rung the plan gave up on under
+    # load, is not a failure.
+    skipped = [{"kind": "gqa_packed_pipelines", "state": "skipped"}]
+    assert server.warmup_aggregate_state(skipped) == "done"
+    assert (
+        server.warmup_aggregate_state(
+            [{"kind": "ladder", "context": 512, "state": "abandoned"}],
+            abandoned=True,
+        )
+        == "abandoned_busy"
+    )
+    failed = ok + [
+        {
+            "kind": "ladder",
+            "context": 2560,
+            "state": "failed",
+            "error": "PrefillChunkGeometryError: prefill chunk width 256 ...",
+        }
+    ]
+    assert server.warmup_aggregate_state(failed) == "degraded"
+    # A failure outranks abandonment: the operator needs the error, not the
+    # news that the box was busy.
+    assert server.warmup_aggregate_state(failed, abandoned=True) == "degraded"
+    # Junk never raises out of a /health serialization path.
+    assert server.warmup_aggregate_state(None) == "done"
+    assert server.warmup_failed_steps("nope") == []
+
+
+def test_health_fixture_with_a_failed_step_is_degraded():
+    """The 2026-09-01 branch-server /health block, verbatim in shape.
+
+    Both ladder rungs died on the prefill chunk coherence refusal and the
+    plan still published ``done``.
+    """
+
+    steps = [
+        {"kind": "gqa_packed_pipelines", "state": "ok", "elapsed_s": 0.2},
+        {
+            "kind": "ladder",
+            "context": 512,
+            "state": "failed",
+            "elapsed_s": 0.01,
+            "error": (
+                "PrefillChunkGeometryError: prefill chunk width 256 does not "
+                "match MTPLX_QSA_PREFILL_COMPILE_ROWS=4096"
+            ),
+        },
+        {
+            "kind": "ladder",
+            "context": 2560,
+            "state": "failed",
+            "elapsed_s": 0.01,
+            "error": "PrefillChunkGeometryError: prefill chunk width 256 ...",
+        },
+    ]
+    assert server.warmup_aggregate_state(steps) == "degraded"
+    failed = server.warmup_failed_steps(steps)
+    assert [row["context"] for row in failed] == [512, 2560]
+    assert failed[0]["error"].startswith("PrefillChunkGeometryError")
+    json.dumps(failed)
+
+
+def test_background_warmup_publishes_failed_steps_from_the_first_snapshot(
+    monkeypatch,
+):
+    """The added keys are always present, so a reader never probes."""
+
+    scheduler = FakeScheduler()
+    state = make_state(scheduler)
+    monkeypatch.setenv("MTPLX_WARMUP_LADDER", "16")
+    warming = server._BackgroundWarmup(state, {}, [1])
+    snapshot = warming.snapshot()
+    assert snapshot["state"] == "pending"
+    assert snapshot["failed_steps"] == []
+    assert snapshot["first_error"] is None
+    assert set(snapshot) >= {"mode", "state", "steps", "elapsed_s", "resubmits"}

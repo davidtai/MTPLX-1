@@ -113,6 +113,17 @@ host shaping: it measures the model, not the selector.  The
 offline scorers read a device log unchanged.
 
 NO device work happens at import.
+
+Which request shape gets which path
+-----------------------------------
+This route is a SAMPLED-lane route: it consumes PCG64 uniforms and a fixed
+top-k support, both of which a greedy request has none of.  Greedy is not an
+unserved shape here, it is a different shape with its own optimised path --
+``generate_mtpk``'s one-sync greedy chain -- and with
+``MTPLX_FABLE_DRAFT_K20_PRESCATTER`` armed that chain reads the same 65,536-row
+pre-scatter output this route does, so a temperature-0 request loses nothing by
+not coming through here.  The claim therefore ROUTES a greedy request away
+(recorded, never raised); it does not refuse to serve it.
 """
 
 from __future__ import annotations
@@ -123,6 +134,11 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .fable_claim_contract import (
+    ClaimDeclined,
+    decline as _decline,
+    declined_receipt,
+)
 from .sampling import SamplerConfig, SparseDistribution
 
 
@@ -161,11 +177,17 @@ def _configure_for_test(enabled: bool) -> None:
 
 
 class DeviceK20Ineligible(RuntimeError):
-    """The armed flag met a request this lane does not implement.
+    """The armed flag cannot work in THIS PROCESS at all.
 
-    Raised at construction, never mid-decode.  There is no silent fallback:
-    arming the flag and then quietly running the stock path would make every
-    receipt a lie about which selector produced it.
+    Reserved for install-time contract violations -- the pinned NumPy is
+    missing, the rng is not the PCG64 tape this route replays, the runtime
+    published a draft id map without a compact width.  Every request would
+    fail identically.
+
+    A request whose SHAPE this lane does not serve (greedy, top_k != 20,
+    penalties, a competing owner of the draft chain, ...) DECLINES to the
+    stock selector instead -- see :mod:`mtplx.fable_claim_contract`.  Raising
+    on those turns every ineligible request into an HTTP 500 in serving.
     """
 
 
@@ -248,16 +270,103 @@ def claim_request_route(
     vocab_size: int = 0,
     draft_id_map: Any = None,
     draft_vocab_size: int | None = None,
+    draft_core: str = "stock",
+    receipt: dict[str, object] | None = None,
 ) -> DeviceK20Plan | None:
-    """Bind the device-K20 route to one generation, or refuse loudly.
+    """Bind the device-K20 route to one generation.
 
-    Returns ``None`` when the flag is off.  Otherwise every unsupported
-    feature raises :class:`DeviceK20Ineligible` -- the same fail-closed shape
-    ``_pr391_claim_float32_d3_request_route`` uses.
+    Returns ``None`` when the flag is off, and ``None`` again when the flag is
+    on but this REQUEST's shape is not one the route serves -- a decline, not
+    a failure: the stock selector runs and produces the same tokens.  Only an
+    INSTALL-time contract violation raises :class:`DeviceK20Ineligible`.
+    ``MTPLX_FABLE_STRICT_CLAIMS=1`` turns declines back into that exception.
     """
 
     if not _ENABLED:
         return None
+    try:
+        return _claim_request_route(
+            sampler=sampler,
+            draft_sampler=draft_sampler,
+            speculative_depth=speculative_depth,
+            rng=rng,
+            fused_verify_input=fused_verify_input,
+            target_prefix_verify=target_prefix_verify,
+            lazy_target_distributions=lazy_target_distributions,
+            lazy_bonus_verify_requested=lazy_bonus_verify_requested,
+            batch_target_arrays=batch_target_arrays,
+            steer_active=steer_active,
+            penalties_active=penalties_active,
+            constraint=constraint,
+            adaptive_policy=adaptive_policy,
+            adaptive_width_policy=adaptive_width_policy,
+            mtp_corrector=mtp_corrector,
+            mtp_topk_reranker=mtp_topk_reranker,
+            draft_margin_threshold=draft_margin_threshold,
+            online_hidden_corrector_alpha=online_hidden_corrector_alpha,
+            online_correction_cache=online_correction_cache,
+            prompt_correction_cache=prompt_correction_cache,
+            adapter_ensemble_q=adapter_ensemble_q,
+            combine_greedy_draft_read=combine_greedy_draft_read,
+            greedy_chain_enabled=greedy_chain_enabled,
+            draft_confidence_needed=draft_confidence_needed,
+            frspec_legacy_ids=frspec_legacy_ids,
+            late_depth_switch_after=late_depth_switch_after,
+            a3b_target_prefix_route=a3b_target_prefix_route,
+            pr391_route=pr391_route,
+            adaptive_dtemp_active=adaptive_dtemp_active,
+            vocab_size=vocab_size,
+            draft_id_map=draft_id_map,
+            draft_vocab_size=draft_vocab_size,
+            draft_core=draft_core,
+        )
+    except ClaimDeclined as declined:
+        stamped = declined_receipt(
+            _ENV_VAR, declined, ineligible=DeviceK20Ineligible
+        )
+        if receipt is not None:
+            receipt.clear()
+            receipt.update(stamped)
+        return None
+
+
+def _claim_request_route(
+    *,
+    sampler: SamplerConfig,
+    draft_sampler: SamplerConfig,
+    speculative_depth: int,
+    rng: Any,
+    fused_verify_input: bool,
+    target_prefix_verify: bool,
+    lazy_target_distributions: bool,
+    lazy_bonus_verify_requested: bool,
+    batch_target_arrays: bool,
+    steer_active: bool,
+    penalties_active: bool,
+    constraint: Any,
+    adaptive_policy: Any,
+    adaptive_width_policy: Any,
+    mtp_corrector: Any,
+    mtp_topk_reranker: Any,
+    draft_margin_threshold: float | None,
+    online_hidden_corrector_alpha: float,
+    online_correction_cache: bool,
+    prompt_correction_cache: bool,
+    adapter_ensemble_q: bool,
+    combine_greedy_draft_read: bool,
+    greedy_chain_enabled: bool,
+    draft_confidence_needed: bool,
+    frspec_legacy_ids: Any,
+    late_depth_switch_after: int,
+    a3b_target_prefix_route: Any,
+    pr391_route: Any,
+    adaptive_dtemp_active: bool,
+    vocab_size: int,
+    draft_id_map: Any,
+    draft_vocab_size: int | None,
+    draft_core: str,
+) -> DeviceK20Plan:
+    """The claim body.  ``raise`` is install-time; ``_decline`` is per request."""
 
     if np.__version__ != REQUIRED_NUMPY_VERSION:
         raise DeviceK20Ineligible(
@@ -269,44 +378,68 @@ def claim_request_route(
     if type(rng.bit_generator) is not np.random.PCG64:
         raise DeviceK20Ineligible("device K20 requires a PCG64 bit generator")
 
+    if str(draft_core) != "stock":
+        _decline(
+            "non_stock_draft_core",
+            "device K20 requires the stock draft route selector "
+            f"(got {draft_core!r})",
+        )
     if a3b_target_prefix_route is not None or pr391_route is not None:
-        raise DeviceK20Ineligible("device K20 owns the stock lane only")
+        _decline("competing_owner", "device K20 owns the stock lane only")
     if target_prefix_verify:
-        raise DeviceK20Ineligible("device K20 does not admit target_prefix verify")
+        _decline(
+            "target_prefix_verify",
+            "device K20 does not admit target_prefix verify",
+        )
     if not batch_target_arrays:
-        raise DeviceK20Ineligible(
-            "device K20 requires the batched target-array support route"
+        _decline(
+            "eager_target_arrays",
+            "device K20 requires the batched target-array support route",
         )
     if lazy_target_distributions:
-        raise DeviceK20Ineligible("device K20 requires eager target support rows")
+        _decline(
+            "lazy_target_distributions",
+            "device K20 requires eager target support rows",
+        )
     if lazy_bonus_verify_requested:
-        raise DeviceK20Ineligible(
-            "device K20 cannot decide lazy-bonus width without host draft ids"
+        _decline(
+            "lazy_bonus_verify",
+            "device K20 cannot decide lazy-bonus width without host draft ids",
         )
     if steer_active or penalties_active:
-        raise DeviceK20Ineligible(
-            "device K20 does not admit steering or sampler penalties"
+        _decline(
+            "steer_or_penalties",
+            "device K20 does not admit steering or sampler penalties",
         )
 
     if float(sampler.temperature) <= 0.0 or float(draft_sampler.temperature) <= 0.0:
-        raise DeviceK20Ineligible("device K20 is a sampled-lane route (temperature > 0)")
+        _decline(
+            "greedy_request",
+            "device K20 is a sampled-lane route (temperature > 0); this "
+            f"request is target t={float(sampler.temperature)!r} / draft "
+            f"t={float(draft_sampler.temperature)!r}",
+        )
     if int(sampler.top_k) != TOP_K or int(draft_sampler.top_k) != TOP_K:
-        raise DeviceK20Ineligible("device K20 is fixed at top_k=20")
+        _decline("top_k_not_20", "device K20 is fixed at top_k=20")
     for value in (sampler.top_p, draft_sampler.top_p):
         if not 0.0 < float(value) <= 1.0:
-            raise DeviceK20Ineligible("device K20 requires 0 < top_p <= 1")
+            _decline("top_p_range", "device K20 requires 0 < top_p <= 1")
     if (
         sampler.presence_penalty
         or sampler.frequency_penalty
         or draft_sampler.presence_penalty
         or draft_sampler.frequency_penalty
     ):
-        raise DeviceK20Ineligible("device K20 does not admit sampler penalties")
+        _decline(
+            "sampler_penalties", "device K20 does not admit sampler penalties"
+        )
 
     if int(speculative_depth) <= 0:
-        raise DeviceK20Ineligible("device K20 requires a positive draft depth")
+        _decline("non_positive_depth", "device K20 requires a positive draft depth")
     if int(late_depth_switch_after) != 0:
-        raise DeviceK20Ineligible("device K20 does not admit late-depth switching")
+        _decline(
+            "late_depth_switch", "device K20 does not admit late-depth switching"
+        )
 
     unsupported = {
         "constraint": constraint is not None,
@@ -331,8 +464,9 @@ def claim_request_route(
     }
     named = sorted(name for name, active in unsupported.items() if active)
     if named:
-        raise DeviceK20Ineligible(
-            "device K20 received unsupported features: " + ", ".join(named)
+        _decline(
+            "unsupported_features",
+            "device K20 received unsupported features: " + ", ".join(named),
         )
 
     draft_width = int(draft_vocab_size or vocab_size or 0)

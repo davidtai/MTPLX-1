@@ -156,6 +156,7 @@ After boot the same reports are readable at `GET /health` under
     "qwen4_fixed_m4_verify": {"installed": true, "linear_layers": 36, "rows": 4},
     "qwen4_m4_stage3": {"installed": true, "layers": 48, "...": "..."},
     "qwen4_compiled_mtp_prepare": {"installed": true, "...": "..."},
+    "qwen4_hc_m4": {"armed": true, "validated": 49},
     "laguna_fused": null,
     "full_stack_selfcheck": {"phase": "post-warmup", "ok": true, "markers": []},
     "unknown_family_env_keys": []
@@ -165,6 +166,16 @@ After boot the same reports are readable at `GET /health` under
 
 `null` means the lane did not install — its env key was not set, or the model
 is not the family it belongs to.
+
+`engagement_reports` is a read-only pass-through of the install reports the
+runtime publishes: one row per lane in `_ENGAGEMENT_REPORT_ATTRS`
+(`mtplx/server/openai.py`), each a `(health name, runtime attribute)` pair
+read with `getattr`. Registering a lane there adds it to `/health` and
+changes nothing the lane itself prints, so it is the entry point for a new
+install-time lane — `qwen4_hc_m4` (`MTPLX_FABLE_HC_M4`'s pack validation)
+came in that way. Only the five markers in the table above are
+`turbo-full-stack` self-check markers; other lanes appear at `/health`
+without joining the self-check verdict.
 
 ### Typo protection
 

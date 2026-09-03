@@ -43,6 +43,7 @@ import os
 import re
 import struct
 import time
+import weakref
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -61,13 +62,57 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
+from mtplx import fable_gdn_keepmask_fold as _gdn_fold
+from mtplx.fable_indexer_reuse import (
+    ENV_FLAG as FABLE_INDEXER_REUSE_ENV,
+    current_draft_depth,
+    indexer_reuse_enabled,
+    note_cycle,
+    note_step_reused,
+)
 from mtplx.full_stack_env import flag_enabled, flag_reader
 from mtplx.runtime_options import (
     FABLE_QSA_M4_ROWS,
     fable_hc_m4_enabled,
     fable_opdiet_enabled,
     fable_qsa_m4_enabled,
+    fable_qsa_sparse_decode_enabled,
+    fable_qsa_sparse_draft_enabled,
+    fable_verify_glue_enabled,
 )
+
+#: W68 widths, imported rather than re-spelled so the routing predicate and
+#: the kernel cannot drift apart.  ``kernels.qsa_sparse_decode`` imports only
+#: mlx.core at module scope, so this is not a cycle and costs nothing.
+from mtplx.kernels.qsa_sparse_decode import (
+    DRAFT_ROWS as _SPARSE_DRAFT_ROWS,
+    VERIFY_ROWS as _SPARSE_VERIFY_ROWS,
+)
+
+#: MTPLX_FABLE_GDN_KEEPMASK_FOLD, resolved at import for the same reason every
+#: other `MTPLX_FABLE_*` gate is: the GDN hot path must not read `os.environ`,
+#: and two traces of one compiled verify graph must not disagree about which
+#: recurrence they hold.  When it is False the fold costs one constant test
+#: per GDN forward and nothing else.
+_GDN_KEEPMASK_FOLD_ARMED = _gdn_fold.fable_gdn_keepmask_fold_enabled()
+
+_GDN_FOLD_KERNELS: Any = None
+
+
+def _gdn_fold_kernels():
+    """The fold's MLX entry points, imported once.
+
+    Kept out of the module header so an unarmed process never imports the
+    kernel module at all, and out of the per-layer loops so an armed one does
+    not pay 35 `sys.modules` lookups per commit.
+    """
+
+    global _GDN_FOLD_KERNELS
+    if _GDN_FOLD_KERNELS is None:
+        from mtplx.kernels import gdn_keepmask_fold
+
+        _GDN_FOLD_KERNELS = gdn_keepmask_fold
+    return _GDN_FOLD_KERNELS
 
 
 @dataclass
@@ -697,18 +742,53 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
             # surfaces as extra outputs.
             cache._mtplx_verify_rows = (qkv, q, k, v, a, b)
 
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
+        # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66b).  A prefix is in scope only
+        # inside the compiled physical-M4 verify's traced body, only for the
+        # 35 non-PLE GDN layers, and only when the fixed-M4 dispatch pushed
+        # this layer's padded ring in the trailing state leaves.  When it is,
+        # `state` is the ring's BASE (the dispatch substituted it for the
+        # deferred commit's lazy leaf) and the kernel runs the ring's masked
+        # rows and this window's four rows from one state read and one state
+        # write -- bit-identical to today's two passes, because the recurrence
+        # state round-trips through fp32 memory.  `y` is already only the
+        # window's rows, so nothing below changes: `cache.advance(S)` still
+        # advances by the window width.
+        prefix = (
+            _gdn_fold.fold_prefix_for(cache)
+            if (
+                _GDN_KEEPMASK_FOLD_ARMED
+                and cache is not None
+                and mask is None
+                and state is not None
+                and not self.training
+            )
+            else None
         )
+        if prefix is None:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+        else:
+            out, state = _gdn_fold_kernels().prefix_gated_delta_update(
+                *prefix[:6],
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+            )
 
         if cache is not None:
             cache[1] = state
@@ -862,12 +942,51 @@ class GatedResidual(nn.Module):
                 "for this model; the kernel has no other geometry."
             )
 
+    def validate_hc_m4_pack(self, label: str = "GatedResidual") -> None:
+        """The PACK half of the MTPLX_FABLE_HC_M4 contract, at install time.
+
+        Everything here is a property of the loaded weights, so it is the same
+        answer for every request this process will ever serve.  Checking it
+        when the weights land (``install_hc_m4_pack_validation``, called from
+        the runtime's qwen4 install section) means a mis-armed flag stops the
+        server coming up with a precise reason, instead of turning the first
+        request that reaches verify width into an HTTP 500.
+
+        Not checked here: the weight/activation dtype agreement, which needs
+        an activation -- ``_hc_m4_applies`` still checks it, and it is likewise
+        process-invariant, so it cannot single out one request either.
+        """
+
+        from mtplx.kernels import qwen4_m4_hyper_read as hcm4
+
+        down = self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        for name, proj in (
+            ("input_mix_weight_down", down),
+            ("input_mix_weight_up", up),
+        ):
+            if hasattr(proj, "scales"):
+                raise RuntimeError(
+                    f"MTPLX_FABLE_HC_M4: {label}.{name} is quantized; the "
+                    "kernel reads unquantized bf16 mix weights. Unset the "
+                    "flag for this pack."
+                )
+        wi = self.block_inject_weight.weight if "block_inject_weight" in self else None
+        try:
+            hcm4.check_weight_shapes(
+                self.hc_norm.weight, down.weight, up.weight, wi
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"MTPLX_FABLE_HC_M4: {label}: {exc}") from exc
+
     def _hc_m4_applies(self, hyper_input: mx.array) -> bool:
         """Verify-width fused read gate (MTPLX_FABLE_HC_M4).
 
         Rows 2..8 only -- rows == 1 keeps whatever the draft path already
-        uses (v3, or the eager chain). Returns True or RAISES: there is no
-        silent fallback once the flag is armed and the width matches.
+        uses (v3, or the eager chain).  The row count is the one REQUEST-shaped
+        term here and it routes (returns False) rather than raising; every
+        other term is a property of the pack, re-checked here but already
+        settled at install by :meth:`validate_hc_m4_pack`.
         """
 
         if not fable_hc_m4_enabled():
@@ -1007,6 +1126,74 @@ class GatedResidual(nn.Module):
         return mixed_input, hyper_input, inject
 
 
+def install_hc_m4_pack_validation(model: Any) -> dict[str, Any]:
+    """Validate every ``GatedResidual`` against the MTPLX_FABLE_HC_M4 contract.
+
+    Called from the runtime's qwen4 install section once the weights are
+    loaded.  A no-op (``{"armed": False}``) when the flag is off, so an
+    unarmed process pays one attribute read.
+
+    This is the INSTALL-time half of the flag's contract.  Every property it
+    checks -- quantized mix weights, weight shapes -- belongs to the pack, so
+    a failure means the flag was armed for a model the kernel cannot read.
+    That is a deployment error and it should stop the server, not fail
+    whichever request first reaches verify width.
+
+    Discovery goes through :func:`_named_gated_residuals`, which walks the
+    model the way MLX itself does.  The first cut of this function walked
+    ``dir(layer)`` instead and found NOTHING on the real pack -- an
+    ``nn.Module``'s children live in its dict and are served by
+    ``__getattr__``, so ``dir()`` does not list them -- which turned an armed
+    flag into a dead server (2026-09-02, both the HumanEval screen and the
+    ABBA lane).  Never enumerate an MLX module with ``dir()``.
+    """
+
+    if not fable_hc_m4_enabled():
+        return {"armed": False, "validated": 0}
+
+    validated = 0
+    for path, module in _named_gated_residuals(model):
+        module.validate_hc_m4_pack(path)
+        validated += 1
+    if not validated:
+        raise RuntimeError(
+            "MTPLX_FABLE_HC_M4 is armed but no GatedResidual hyper-connection "
+            "module was found anywhere in "
+            f"{type(model).__name__}.named_modules(); the flag cannot do "
+            "anything here. Unset it for this model."
+        )
+    return {"armed": True, "validated": validated}
+
+
+def _named_gated_residuals(model: Any):
+    """``(dotted path, module)`` for every GatedResidual in ``model``.
+
+    ``nn.Module.named_modules`` is the model's OWN traversal -- the one that
+    finds its parameters -- so it reaches children held directly
+    (``model.hyper_connection_mixer``), inside lists (``model.layers[i]
+    .attn_hyper_connection``) and behind a published sub-tree
+    (``language_model.mtp.hyper_connection_mixer``) alike.  If the forward can
+    reach a module, this finds it.
+
+    Sorted by path so the failure message names layers in a stable order
+    rather than MLX's dict order.
+    """
+
+    named = getattr(model, "named_modules", None)
+    if named is None:  # pragma: no cover - every qwen4 model is an nn.Module
+        raise RuntimeError(
+            "MTPLX_FABLE_HC_M4 pack validation needs an mlx.nn.Module; got "
+            f"{type(model).__name__}"
+        )
+    found = [
+        (path, module)
+        for path, module in named()
+        if isinstance(module, GatedResidual)
+    ]
+    found.sort(key=lambda item: item[0])
+    return found
+
+
 class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
     def __call__(self, x: mx.array) -> mx.array:
         # Fused decode path (MTPLX_FUSED_MOE_DECODE=1 + sanitize-fused gu
@@ -1052,6 +1239,42 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
             shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
             return (y + shared).astype(x.dtype)
         return super().__call__(x)
+
+    # ---- expert-major prefill seam ---------------------------------------
+    # MTPLX_FABLE_PREFILL_EXPERT_MAJOR (mtplx/fable_prefill_expert_major.py)
+    # needs the routed grouped GEMM to see a whole GROUP of chunks' rows while
+    # everything else keeps running per chunk.  These two halves are the stock
+    # ``Qwen3NextSparseMoeBlock.__call__`` cut either side of
+    # ``self.switch_mlp(x, inds)``, expression for expression, so the caller
+    # can batch that ONE call and nothing else.  ``__call__`` above is left
+    # untouched on purpose -- flag-off has to be byte-identical, and
+    # ``tests/test_fable_prefill_expert_major.py`` pins
+    # ``prefill_combine(switch_mlp(...), ...) == __call__`` bitwise rather
+    # than trusting that this copy stays in step.
+
+    def prefill_route(self, x: mx.array):
+        """Router half: ``(inds, scores)`` for ``x``, no expert GEMM."""
+
+        if self.sharding_group is not None:
+            raise RuntimeError(
+                "expert-major prefill does not compose with a sharding group"
+            )
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+        return inds, scores
+
+    def prefill_combine(self, y: mx.array, scores: mx.array, x: mx.array):
+        """Everything after the routed GEMM: weighted sum + shared expert."""
+
+        y = (y * scores[..., None]).sum(axis=-2)
+        shared_y = self.shared_expert(x)
+        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        return y + shared_y
 
 
 class _FusedGateUpSwitchGLU(nn.Module):
@@ -1718,53 +1941,186 @@ def _prefill_mask_fuse_enabled() -> bool:
     exact-visible-set fused kernel exists at this geometry; only the
     heuristic declines it.
 
+    Two arms ride this one flag, both fused, chosen by what the indexer
+    returned:
+
+    * **causal** -- no selection came back, so every key a row can see IS
+      visible.  Nothing is built: the string ``"causal"`` goes to MLX, whose
+      lower-right alignment matches this lane's ``[1, 1, S, T]`` mask exactly
+      when ``T == pos_start + S`` (see ``_prefill_causal_mask_is_exact``).
+      This is the regime below the indexer's own budget --
+      ``T <= (block_topk + 1) * ratio - 1``, i.e. 2,051 tokens on the
+      production pack -- plus vision requests, where QSA is bypassed.  With
+      the retained 4,096-token prefill width it therefore fires for NO chunk
+      of a 16K or 32K prompt; the win at those cells is entirely the bool
+      arm below.
+    * **bool** -- a real top-k selection, which no string can express; the
+      array is handed to the fused kernel untouched.
+
     Off by default: it trades a materialized score tensor (and its mask
     apply and softmax passes) for a flash kernel at a head dimension MLX
     considers unfavourable.  It is also NOT bit-identical -- online softmax
     reassociates the same visible set -- so it is a quality-gated arm.
+
+    Counters (``MTPLX_QSA_PREFILL_DEBUG=1``): ``mask_causal_eligible`` (the
+    lane saw an exactly-causal visible set, flag-independent),
+    ``mask_fuse_causal``, ``mask_fuse_bool``, ``mask_fuse_unavailable``.
     """
 
     raw = (os.environ.get("MTPLX_FABLE_PREFILL_MASK_FUSE") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
-#: One-shot capability probe.  ``force_fused=True`` raises host-side (no
-#: kernel is launched) when the build has no fused kernel for the geometry;
-#: retrying per call would pay that cost 12 x 8 times a request.
-_PREFILL_MASK_FUSE_UNAVAILABLE = False
+#: MLX's only string mask mode.  ``mx.fast.scaled_dot_product_attention``
+#: documents the alignment in MLX 0.32.2 itself (``mlx/core/fast.pyi``):
+#: *"The ``causal`` mask uses lower-right alignment where the last query
+#: aligns with the last key."*  That is exactly the offset case this lane
+#: needs -- chunk k carries ``pos_start`` keys of prior context and ``S``
+#: queries, so its last query IS its last key -- which is why a chunked
+#: prefill can pass the string instead of a ``[1, 1, S, T]`` tensor.
+_CAUSAL_MASK = "causal"
+
+
+def _prefill_causal_mask_is_exact(
+    *, pos_start: int, rows: int, total_keys: int
+) -> bool:
+    """Is the dense mask this lane would build exactly MLX's ``"causal"``?
+
+    The lane builds ``tpos[None, :] <= qpos[:, None]`` over
+    ``qpos = pos_start + arange(S)`` and ``tpos = arange(T)``: query row
+    ``i`` sees keys ``0 .. pos_start + i``.  MLX's lower-right ``"causal"``
+    gives row ``i`` keys ``0 .. T - S + i``.  The two agree for every row
+    iff ``T == pos_start + S`` -- i.e. iff the KV the cache just handed back
+    ends at this chunk's last query.
+
+    That is the normal case (``T`` comes straight out of
+    ``cache.kv.update_and_fetch``), but a cache that returned padded or
+    capacity-shaped keys would break it, and there the dense mask -- which
+    masks the pad columns off -- is the correct one.  Checked, never assumed.
+    """
+
+    return int(rows) > 0 and int(total_keys) == int(pos_start) + int(rows)
+
+
+#: One-shot capability probes, keyed by mask kind.  ``force_fused=True``
+#: raises host-side (no kernel is launched) when the build has no fused
+#: kernel for the geometry; retrying per call would pay that cost 12 x 8
+#: times a request.  ``"causal"`` and a bool array drive different Metal
+#: function constants of the same ``steel_attention`` specialisation
+#: (``do_causal`` / ``has_mask``), so availability is tracked per kind
+#: rather than shared: a build may serve one and refuse the other.
+_PREFILL_MASK_FUSE_UNAVAILABLE: Dict[str, bool] = {}
+
+
+def _prefill_mask_fuse_kind(mask) -> str:
+    """``"causal"`` for the string mode, ``"bool"`` for a real selection."""
+
+    return "causal" if isinstance(mask, str) else "bool"
+
+
+def _prefill_mask_fuse_refuse(kind: str, exc: BaseException) -> None:
+    """Disarm one mask kind for the rest of the process, loudly."""
+
+    _PREFILL_MASK_FUSE_UNAVAILABLE[kind] = True
+    _qsa_prefill_count("mask_fuse_unavailable")
+    import sys as _sys
+
+    print(
+        "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE armed but no fused "
+        f"{kind}-mask SDPA is available at head_dim {_MASK_FUSE_PROBE_HD[0]} "
+        "in this MLX; falling back to the dense/unfused route for the rest "
+        f"of the process: {exc}",
+        file=_sys.stderr,
+        flush=True,
+    )
+
+
+#: Filled by the probe so the refusal message can name the geometry it asked
+#: about instead of a generic "this geometry".
+_MASK_FUSE_PROBE_HD = [0]
+
+
+@lru_cache(maxsize=16)
+def _prefill_mask_fuse_probed(kind: str, head_dim: int, dtype_name: str) -> bool:
+    """Ask MLX ONCE, at this head_dim/dtype, whether the fused kernel exists.
+
+    ``force_fused=True`` is resolved while the op is built -- before any
+    encoder is opened -- so a two-row probe answers the question without
+    dispatching Metal work: it either returns a lazy array or raises.  The
+    answer is bound per ``(kind, head_dim, dtype)`` and never re-asked, so an
+    armed flag can never degrade into a per-call try/except in the hot lane,
+    and a build without the kernel refuses loudly at the first prefill
+    instead of silently measuring the control under a candidate label.
+    """
+
+    dtype = getattr(mx, dtype_name, None)
+    if dtype is None:
+        return False
+    _MASK_FUSE_PROBE_HD[0] = int(head_dim)
+    shape = (1, 1, 2, int(head_dim))
+    zeros = mx.zeros(shape, dtype=dtype)
+    mask = (
+        _CAUSAL_MASK
+        if kind == "causal"
+        else mx.ones((1, 1, 2, 2), dtype=mx.bool_)
+    )
+    try:
+        mx.fast.scaled_dot_product_attention(
+            zeros, zeros, zeros, scale=1.0, mask=mask, force_fused=True
+        )
+    except Exception as exc:  # older MLX, or no kernel for this geometry
+        _prefill_mask_fuse_refuse(kind, exc)
+        return False
+    return True
 
 
 def _prefill_mask_fuse_sdpa(q, k, v, *, scale, mask):
-    """Masked SDPA, fused when armed and available, else stock."""
+    """Masked SDPA, fused when armed and available, else stock.
 
-    global _PREFILL_MASK_FUSE_UNAVAILABLE
+    Two arms behind one door:
+
+    * ``mask is _CAUSAL_MASK`` -- the visible set is exactly causal (proved
+      host-side by :func:`_prefill_causal_mask_is_exact`), so no tensor is
+      built at all and MLX generates the mask inside the kernel.
+    * ``mask`` is a bool array -- the real QSA block selection, which no
+      string can express; the fused kernel reads it directly
+      (``steel_attention_..._maskbool_``).
+
+    **Exactness.**  Neither arm is bit-identical to the unfused route, and
+    both are the same rounding class.  The dense path materialises bf16
+    ``QK^T``, applies the mask with ``mx.where``, runs a precise two-pass
+    softmax and contracts ``P@V`` in bf16; the fused kernel streams tiles
+    through an fp32 online softmax and accumulates in fp32.  What is
+    identical is the VISIBLE SET -- causal-string and dense-causal mask
+    admit the same keys per row by construction, and the bool arm passes the
+    selection through untouched -- so this is reassociation of the same sum,
+    not an approximation, and it is gated by the agreement screen rather
+    than by a bit-parity assert.
+    """
+
+    kind = _prefill_mask_fuse_kind(mask)
     if (
         mask is not None
         # Prefill only. At S == 1 MLX already fuses (head_dim 256 IS in the
         # sdpa_VECTOR supported set); the fallback this flag exists to
         # replace is the S > 1 one.
         and int(q.shape[2]) > 1
-        and not _PREFILL_MASK_FUSE_UNAVAILABLE
+        and not _PREFILL_MASK_FUSE_UNAVAILABLE.get(kind, False)
         and _prefill_mask_fuse_enabled()
+        and _prefill_mask_fuse_probed(
+            kind, int(q.shape[-1]), str(q.dtype).rsplit(".", 1)[-1]
+        )
     ):
         try:
             out = mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=scale, mask=mask, force_fused=True
             )
-        except Exception as exc:  # older MLX, or no kernel for this geometry
-            _PREFILL_MASK_FUSE_UNAVAILABLE = True
-            _qsa_prefill_count("mask_fuse_unavailable")
-            import sys as _sys
-
-            print(
-                "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE armed but no fused "
-                "masked SDPA is available for this geometry; falling back "
-                f"for the rest of the process: {exc}",
-                file=_sys.stderr,
-                flush=True,
-            )
+        except Exception as exc:  # a geometry the probe could not stand in for
+            _prefill_mask_fuse_refuse(kind, exc)
         else:
-            _qsa_prefill_count("mask_fuse")
+            _qsa_prefill_count(
+                "mask_fuse_causal" if kind == "causal" else "mask_fuse_bool"
+            )
             return out
     return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
@@ -1803,17 +2159,26 @@ def _qsa_dense_attention(q, k, v, *, mask, scale):
     visible set per row is unchanged.  Reduction order is not: shorter
     softmax rows and a shorter P@V contraction, the same class of difference
     as the portable gather tier.
+
+    ``mask`` may also be :data:`_CAUSAL_MASK`, the string mode.  Tiling
+    composes with it without any slicing: ``query_tile_spans`` sets a tile's
+    key bound to ``context_before + row_end``, so the tile's own last query
+    is again its last key and MLX's lower-right ``"causal"`` describes the
+    sub-problem exactly.  The string is therefore passed through unchanged
+    while the K/V slices narrow, which is the whole point -- there is no
+    ``[1, 1, S, T]`` tensor to slice in the first place.
     """
 
     S = int(q.shape[2])
     tile = _prefill_qsa_query_tile_rows() if S > 1 else 0
     total_keys = int(k.shape[2])
+    causal_string = isinstance(mask, str)
     if (
         tile <= 0
         or tile >= S
         or mask is None
-        or int(mask.shape[-1]) != total_keys
         or total_keys < S
+        or (not causal_string and int(mask.shape[-1]) != total_keys)
     ):
         return _prefill_mask_fuse_sdpa(q, k, v, scale=scale, mask=mask)
 
@@ -1829,7 +2194,7 @@ def _qsa_dense_attention(q, k, v, *, mask, scale):
             k[:, :, :keys],
             v[:, :, :keys],
             scale=scale,
-            mask=mask[..., r0:r1, :keys],
+            mask=mask if causal_string else mask[..., r0:r1, :keys],
         )
         for r0, r1, keys in spans
     ]
@@ -2284,6 +2649,9 @@ class QSAIndexer(nn.Module):
         # and sanitize-time projection fusion have finalized every weight.
         object.__setattr__(self, "_compiled_indexer_core", None)
         object.__setattr__(self, "_compiled_indexer_parameter_signature", None)
+        # MTPLX_FABLE_INDEXER_REUSE anchor (row K-D2), outside the parameter
+        # tree: the depth-1 block ids of the draft cycle in flight, or None.
+        object.__setattr__(self, "_indexer_reuse_anchor", None)
 
     def _pool_keys_eager(
         self,
@@ -2528,6 +2896,114 @@ class QSAIndexer(nn.Module):
             return False
         return int(rows) == int(getattr(cache, "fable_qsa_m4_rows", 0))
 
+    def _sparse_decode_route(
+        self,
+        cache: QSACache,
+        *,
+        rows: int,
+        k_eff: int,
+        draft: bool = False,
+        site: str,
+    ) -> bool:
+        """True when the native split-K sparse-GQA kernel serves this call.
+
+        Host-only, and read from state the CACHE validated once at install
+        (graphbank ran the contract check and the numerical parity probe
+        there, at model build, outside any mx.compile trace).  The indexer
+        never re-derives the decision, so two traces of the same verify graph
+        cannot disagree about which attention they contain.
+
+        TWO KINDS OF "NO", AND THE 2026-09-02 WINDOW IS WHY THEY ARE SPLIT.
+
+        That window armed MTPLX_FABLE_QSA_SPARSE_DECODE at 16 K and measured
+        the control on both seeds.  The cause was one silent narrowing: the
+        only call site that could reach the verify width asked this predicate
+        with ``draft=True`` hard-coded, so it read ``fable_qsa_sparse_draft_rows``
+        (0, because the draft flag was not armed), returned False, and fell
+        through to the rows-gather lane.  Nothing said so.  So:
+
+        * ROUTING (returns False): the flag is off for this width, or the
+          selection is a width it does not arm -- a 16 K prefill row count is
+          not a 4-row verify.  A growable cache is routing too, and IS
+          recorded in the lane's ``route_declines``: the lane installs on the
+          fixed-capacity compiled-verify cache, so an armed run that only ever
+          saw growable caches has a readable cause in its receipt rather than
+          a silent zero.
+        * FAILURE (raises): the flag is armed, this IS the width it arms, and
+          the cache is the one it installs on -- but the geometry or the
+          budget does not match.  An armed flag that reverts here would make
+          the arm measure the stock chain again.
+
+        ``site`` names the call site in the receipt.  The two sites are not
+        interchangeable: ``_select_m4`` only exists under MTPLX_FABLE_QSA_M4,
+        and ``_select_eager`` is what the fixed-M4 verify actually takes when
+        that flag is off.
+        """
+
+        # The unarmed path is ONE cached-bool test, exactly like ``_m4_route``:
+        # this predicate runs twice per QSA layer per forward, and a decode
+        # cycle that pays for a flag nobody armed is a cost with no lever.
+        if not (
+            fable_qsa_sparse_draft_enabled()
+            if draft
+            else fable_qsa_sparse_decode_enabled()
+        ):
+            return False
+        expected = _SPARSE_DRAFT_ROWS if draft else _SPARSE_VERIFY_ROWS
+        if int(rows) != int(expected):
+            return False
+
+        from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+        if not bool(getattr(cache, "fixed_capacity", False)):
+            # The lane's install probe needs the materialized fixed bank, so a
+            # growable cache never carried it.  Construction owns this gate:
+            # TensorOffsetQSACache.__init__ raises when the flag is armed and
+            # the cache was built without the lane.
+            _qsa_sparse.note_route_decline(f"{site}: growable cache")
+            return False
+        attribute = (
+            "fable_qsa_sparse_draft_rows" if draft else "fable_qsa_sparse_decode_rows"
+        )
+        wired = int(getattr(cache, attribute, 0))
+        lane = (
+            "MTPLX_FABLE_QSA_SPARSE_DRAFT"
+            if draft
+            else "MTPLX_FABLE_QSA_SPARSE_DECODE"
+        )
+        if wired <= 0:
+            raise RuntimeError(
+                f"{lane} is armed and this is its {int(rows)}-row width, but "
+                f"the fixed QSA cache carries {attribute}={wired}: it was "
+                "built without the lane, or the install probe disabled it"
+            )
+        if int(rows) != wired:
+            raise RuntimeError(
+                f"{lane} bound {wired} rows but this selection is "
+                f"{int(rows)}; the cache and the module disagree about the "
+                "width the kernel serves"
+            )
+        if int(self.ratio) != 4 or int(self.block_topk) != 512:
+            raise RuntimeError(
+                f"{lane} is wired for the ratio-4 top-512 QSA geometry the "
+                f"metallib is instantiated for; got ratio={int(self.ratio)}, "
+                f"block_topk={int(self.block_topk)}"
+            )
+        if int(k_eff) != int(self.block_topk):
+            # ROUTING, and the one decline that is a property of the REQUEST.
+            # The kernel's ABI is a fixed [M, 512] selection and 512 complete
+            # blocks exist only from (block_topk + 1) * ratio = 2,052 tokens;
+            # below that there is no analogue to fall to, and padding the
+            # selection would attend keys the shipped lane does not. Context
+            # length is a per-request shape the server must accept, so the
+            # stock chain serves it. Counted, never printed -- this is once
+            # per QSA layer per short request, and a 500 here took the
+            # HumanEval fullset down on 2026-09-02.
+            _qsa_sparse.note_short_context(site, k_eff)
+            return False
+        _qsa_sparse.note_route_hit(site)
+        return True
+
     def _require_m4_contract(self, cache: QSACache, rows: int) -> None:
         """Validate the module half of the lane.  Raises; never returns False.
 
@@ -2590,6 +3066,25 @@ class QSAIndexer(nn.Module):
             compress_ratio=self.ratio,
         )
 
+    def _verify_glue_rope_idx(self) -> bool:
+        """True when ``MTPLX_FABLE_VERIFY_GLUE``'s ``qsa_rope_idx`` serves.
+
+        Host-only, and read from the verdict the install probe recorded at
+        model build outside any trace, so two traces of the same compiled
+        verify graph cannot disagree about which preparation they contain.
+        A False here is routing (the item is not armed, or its probe
+        disabled it); a contract miss raised at install and never gets here.
+        """
+
+        if not fable_verify_glue_enabled("qsa_rope_idx"):
+            return False
+        from mtplx import fable_verify_glue as _glue
+
+        if not _glue.qsa_rope_idx_installed():
+            return False
+        _glue.note_prep_call()
+        return True
+
     def _prepare_queries_m4(self, q: mx.array, pos_start) -> mx.array:
         """RMSNorm + partial RoPE in one dispatch, instead of twelve.
 
@@ -2649,28 +3144,226 @@ class QSAIndexer(nn.Module):
         top_idx = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)[
             :, nb_total - k_eff :
         ]
+        if self._sparse_decode_route(
+            cache, rows=int(top_idx.shape[0]), k_eff=k_eff, site="select_m4_verify"
+        ):
+            # MTPLX_FABLE_QSA_SPARSE_DECODE: the native split-K kernel walks
+            # ``top_idx`` directly, so the token list below is dead work --
+            # one dispatch per layer on top of the five the kernel replaces.
+            # Its order is irrelevant to the kernel, which applies the SAME
+            # per-slot predicate ``block < (pos+1)//4`` that qsa_m4_row_tokens
+            # applies, so argpartition's raw output goes straight through and
+            # the visible set is identical.
+            return ("sparse_blocks", top_idx)
         token_idx, token_ok = qsa_m4_row_tokens(
             top_idx, pos_start, compress_ratio=self.ratio
         )
         return ("gather_rows", token_idx, token_ok)
 
+    # ------------------------------------------------------------------
+    # MTPLX_FABLE_INDEXER_REUSE (row K-D2).  See mtplx/fable_indexer_reuse.py
+    # for the contract; the arithmetic that implements it is here because it
+    # is the selection's own, and only the selector knows the block frontier.
+    # ------------------------------------------------------------------
+
+    def _indexer_reuse_armed(self, rows: int) -> bool:
+        """True when this forward is a reuse-eligible MTP draft step.
+
+        Three conditions, all cheap and all host-side: the process armed the
+        flag (read now, not at import -- the shadow harness scopes it around a
+        single chain call), this call is inside ``rt.draft_mtp`` at a numbered
+        chain depth, and it is the single-row decode the chain issues.  A
+        history append, a prefill, a verify width or any non-draft decode is
+        not eligible and keeps the stock selection untouched.
+        """
+
+        if int(rows) != 1:
+            return False
+        depth = current_draft_depth()
+        if depth is None or int(depth) < 1:
+            return False
+        return indexer_reuse_enabled()
+
+    def _indexer_reuse_refuse(self, lane: str) -> None:
+        """An armed flag met a lane it cannot serve: raise, never revert."""
+
+        raise RuntimeError(
+            f"{FABLE_INDEXER_REUSE_ENV}=1 cannot serve the QSA {lane} decode "
+            "lane; its selection contract carries no per-slot validity, so a "
+            "reused block set could double-count the tokens of a block that "
+            "did not complete. Unset one of the two flags rather than letting "
+            "an armed run report a stock number."
+        )
+
+    def _indexer_reuse_pooled_width(self, cache: QSACache, total: int) -> int:
+        """``nb_total`` this forward's selector will see, without a sync.
+
+        Mirrors ``_extend_pooled``: the fixed bank hands the selector its whole
+        capacity, the growable one hands it the logical complete-block count.
+        Read before the pooled update so the query preparation can be skipped
+        along with the scorer rather than after it.
+        """
+
+        if getattr(cache, "fixed_capacity", False):
+            pooled = getattr(cache, "pooled", None)
+            return 0 if pooled is None else int(pooled.shape[1])
+        return int(total) // self.ratio
+
+    def _indexer_reuse_decision(
+        self, cache: QSACache, *, rows: int, nb_total: int
+    ) -> bool:
+        """Pure: will this depth be served from the anchor? No mutation.
+
+        Called twice per draft step -- once by ``_call_rows`` to decide whether
+        the query norm/RoPE preparation is dead work, once by
+        ``_indexer_reuse_take`` to act on it.  Both see the same host state, so
+        they cannot disagree about whether ``q`` is needed.
+        """
+
+        if not self._indexer_reuse_armed(rows):
+            return False
+        depth = int(current_draft_depth())
+        if depth < 2:
+            return False
+        if depth - 1 > self.ratio:
+            # nb_d - nb_1 = (P+d)//r - (P+1)//r <= ceil((d-1)/r), so past this
+            # bound two or more blocks can complete inside one cycle and the
+            # single extra slot below would DROP one. Refuse rather than
+            # quietly serve a set that is no longer a superset of the tail.
+            raise RuntimeError(
+                f"{FABLE_INDEXER_REUSE_ENV}=1 extends the depth-1 block set by "
+                "one slot, which is exact only while depth - 1 <= ratio; got "
+                f"depth {depth} at ratio {self.ratio}"
+            )
+        anchor = self._indexer_reuse_anchor
+        if anchor is None:
+            return False
+        # A cycle is a contiguous 1,2,..,D run of draft steps against ONE cache
+        # object.  Anything else -- a different cache, a repeated depth, a gap,
+        # or a bank that crossed block_topk mid-cycle and changed the width the
+        # anchor was taken at -- means the anchor does not describe this chain.
+        # A weakref, not an id(): a collected cache's address can be reused,
+        # and a stale anchor whose block ids outran a fresher, shorter history
+        # would index past the pooled bank.
+        return (
+            anchor["cache"]() is cache
+            and anchor["next_depth"] == depth
+            and anchor["k_eff"] == min(self.block_topk, int(nb_total))
+        )
+
+    def _indexer_reuse_take(
+        self,
+        cache: QSACache,
+        *,
+        rows: int,
+        nb_q: mx.array,
+        valid: mx.array,
+        k_eff: int,
+        nb_total: int,
+    ):
+        """The depth-``d>=2`` block set, or None to score this depth normally.
+
+        Returns ``(top_idx, blk_ok)``: ids ``[1, k_eff + 1]`` and their
+        per-slot validity.  ``blk_ok`` is returned rather than re-derived by
+        the caller because the trailing slot is a *masked duplicate* whenever
+        no block completed, and ``valid`` alone cannot tell that slot apart
+        from a genuine selection of the same block.
+
+        Every operand is a device array, so nothing here synchronises: the
+        fixed-capacity MTP cache keeps its offset on the GPU and
+        ``nb_1 < nb_d`` is resolved in the graph, not on the host.
+        """
+
+        if not self._indexer_reuse_decision(cache, rows=rows, nb_total=nb_total):
+            if self._indexer_reuse_armed(rows) and int(current_draft_depth()) >= 2:
+                # Declined mid-chain: drop the anchor so depth 3 scores itself
+                # too rather than becoming a superset of depth 1 but not of
+                # depth 2.
+                object.__setattr__(self, "_indexer_reuse_anchor", None)
+            return None
+        anchor = self._indexer_reuse_anchor
+        anchor_ids = anchor["ids"]  # [1, k_eff] int32
+        anchor_nb = anchor["nb"]  # [1], the depth-1 complete-block count
+        # One slot is exact, not an approximation: with `depth - 1 <= ratio`
+        # (checked in _indexer_reuse_decision) at most one block can complete
+        # between depth 1 and depth d.
+        extra_ok = (anchor_nb < nb_q)[:, None]  # [1, 1] bool
+        extra_id = mx.where(
+            extra_ok,
+            anchor_nb[:, None].astype(mx.int32),
+            anchor_ids[:, :1],
+        )
+        top_idx = mx.concatenate([anchor_ids, extra_id], axis=-1)
+        # Validity is taken from THIS depth's causal mask, never carried over:
+        # a slot invalid at depth 1 may have become visible since.
+        anchor_ok = mx.take_along_axis(
+            valid, anchor_ids.astype(mx.int64), axis=-1
+        )
+        blk_ok = mx.concatenate([anchor_ok, extra_ok], axis=-1)
+        anchor["next_depth"] = int(current_draft_depth()) + 1
+        note_step_reused()
+        return top_idx, blk_ok
+
+    def _indexer_reuse_stash(
+        self,
+        cache: QSACache,
+        *,
+        rows: int,
+        nb_q: mx.array,
+        top_idx: mx.array,
+        k_eff: int,
+    ) -> None:
+        """Anchor a freshly scored depth-1 selection for depths 2..D."""
+
+        if not self._indexer_reuse_armed(rows):
+            return
+        if int(current_draft_depth()) != 1:
+            # Depth >= 2 reaching the scorer means the anchor was declined;
+            # re-anchoring mid-chain would make depth 3 a superset of depth 2
+            # rather than of depth 1, so leave it dropped.
+            return
+        if self.ratio < 2:
+            raise RuntimeError(
+                f"{FABLE_INDEXER_REUSE_ENV}=1 needs compress_ratio >= 2 so at "
+                "most one pooled block completes per draft step; this indexer "
+                f"has ratio {self.ratio}"
+            )
+        object.__setattr__(
+            self,
+            "_indexer_reuse_anchor",
+            {
+                "cache": weakref.ref(cache),
+                "next_depth": 2,
+                # int32 once, here, so the concatenate at depth 2/3 needs no
+                # cast and cannot disagree with argpartition's index dtype.
+                "ids": top_idx.astype(mx.int32),
+                "nb": nb_q,
+                "k_eff": int(k_eff),
+            },
+        )
+        note_cycle()
+
     def _select_eager(
         self,
-        q: mx.array,
+        q: Optional[mx.array],
         pos_start: int,
         cache: QSACache,
         pooled: mx.array,
         total: int,
+        *,
+        rows: Optional[int] = None,
     ):
-        """Stock MLX selector kept as the correctness oracle and kill-switch."""
+        """Stock MLX selector kept as the correctness oracle and kill-switch.
 
-        S = q.shape[1]
+        ``q`` is None exactly when MTPLX_FABLE_INDEXER_REUSE will serve this
+        depth from the cycle's anchor: the query's norm + partial RoPE is dead
+        work there, so ``_call_rows`` never computes it and passes ``rows``
+        instead.  Every other caller passes a prepared ``q`` and this reads
+        the same as before the flag existed.
+        """
+
+        S = int(rows) if rows is not None else int(q.shape[1])
         nb_total = pooled.shape[1]
-        # Cached fp32-transposed pooled view: same values as the old per-call
-        # astype+swapaxes of the whole table (astype of the same bf16 blocks
-        # -> bit-identical scores), without re-materializing 33.5 MB per
-        # layer per token at 262K (#393).
-        pooled_t = cache.pooled_f32_view(nb_total)  # [1,1,D,nb]
 
         qpos = pos_start + mx.arange(S, dtype=mx.int32)  # abs position
         nb_q = (qpos + 1) // self.ratio  # complete blocks visible per query [S]
@@ -2678,15 +3371,54 @@ class QSAIndexer(nn.Module):
         valid = blk[None, :] < nb_q[:, None]  # [S, nb]
         neg = mx.array(-mx.inf, dtype=mx.float32)
         k_eff = min(self.block_topk, nb_total)
-
         tile = _qsa_score_tile_rows()
-        if S > 1 and 0 < tile < S:
+
+        # MTPLX_FABLE_INDEXER_REUSE, row K-D2: depths 2..D of one MTP draft
+        # chain are handed the depth-1 block set plus the block the chain's
+        # own tokens completed, and the whole query preparation / score GEMM /
+        # top-k below is skipped. Off (the default) this is one host-side
+        # `int(rows) != 1` and the path is bit-identical to before the flag.
+        reuse_blk_ok: Optional[mx.array] = None
+        reused = self._indexer_reuse_take(
+            cache,
+            rows=S,
+            nb_q=nb_q,
+            valid=valid,
+            k_eff=k_eff,
+            nb_total=nb_total,
+        )
+        if reused is not None:
+            top_idx, reuse_blk_ok = reused
+        elif q is None:
+            # _call_rows dropped the query preparation because
+            # _indexer_reuse_decision said the anchor would serve, and
+            # _indexer_reuse_take then declined. The two read the same host
+            # state, so this cannot happen -- assert it rather than fail on an
+            # attribute of None several lines below.
+            raise RuntimeError(
+                f"{FABLE_INDEXER_REUSE_ENV}: the reuse decision and the reuse "
+                "itself disagreed; the prepared query was skipped but the "
+                "anchor did not serve this depth"
+            )
+        elif S > 1 and 0 < tile < S:
             # Tiled scoring (see _qsa_score_tile_rows): bounds the live fp32
             # score transient at one tile; per-row selection math identical.
+            # Cached fp32-transposed pooled view: same values as the old
+            # per-call astype+swapaxes of the whole table (astype of the same
+            # bf16 blocks -> bit-identical scores), without re-materializing
+            # 33.5 MB per layer per token at 262K (#393).
             top_idx = self._tiled_topk(
-                q, pooled_t, nb_q, blk, neg, k_eff, nb_total, tile
+                q,
+                cache.pooled_f32_view(nb_total),
+                nb_q,
+                blk,
+                neg,
+                k_eff,
+                nb_total,
+                tile,
             )
         else:
+            pooled_t = cache.pooled_f32_view(nb_total)  # [1,1,D,nb]
             scores = mx.matmul(q.astype(mx.float32), pooled_t)  # [1,S,H,nb]
             scores = (
                 mx.maximum(scores, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
@@ -2700,6 +3432,39 @@ class QSAIndexer(nn.Module):
             top_idx = mx.argpartition(masked_scores, kth=nb_total - k_eff, axis=-1)[
                 :, nb_total - k_eff :
             ]
+        if reused is None:
+            self._indexer_reuse_stash(
+                cache, rows=S, nb_q=nb_q, top_idx=top_idx, k_eff=k_eff
+            )
+
+        # BOTH widths, and this is the fix for the 2026-09-02 window.  This
+        # selector -- not ``_select_m4`` -- is what a fixed-capacity forward
+        # reaches whenever MTPLX_FABLE_QSA_M4 is OFF, which is every arm of
+        # the retained fixed-M4 stack: ``_call_rows`` only takes the fused-M4
+        # branch when that separate flag is armed (see ``_m4_route``), and the
+        # fixed-capacity path then falls through ``legacy_fused=False`` to
+        # here.  Asking only the DRAFT question here made the verify lane
+        # unreachable on the shipped stack: the flag armed, the cache
+        # installed, and the kernel never ran.
+        #
+        # MTPLX_FABLE_QSA_SPARSE_DRAFT is the M=1 geometry of the same kernel.
+        # Today's retained-stack census shows the draft chain running the MTP
+        # block rather than the twelve QSA layers, so that width exists for
+        # non-speculative decode and for a future full-stack draft, and must
+        # not be credited with a speculative-ABBA win it cannot produce.
+        sparse_verify = self._sparse_decode_route(
+            cache, rows=S, k_eff=k_eff, draft=False, site="select_eager_verify"
+        )
+        sparse_draft = not sparse_verify and self._sparse_decode_route(
+            cache, rows=S, k_eff=k_eff, draft=True, site="select_eager_draft"
+        )
+        if sparse_verify or sparse_draft:
+            if self._indexer_reuse_armed(S):
+                # The kernel applies its OWN per-slot predicate to `top_idx`
+                # and never sees `reuse_blk_ok`, so a reused block set whose
+                # trailing slot is a masked duplicate would be attended twice.
+                self._indexer_reuse_refuse("sparse-blocks")
+            return ("sparse_blocks", top_idx)
 
         if S > 1 and _qsa_large_prefill_enabled(S, total):
             # Preserve the eager score/top-k expression as an independently
@@ -2738,6 +3503,8 @@ class QSAIndexer(nn.Module):
             # dense mask staged, no gathered copies (both measured slower:
             # dense = full-context reads, gather = -5.25% from two
             # materialized copies per layer per token, d6171d2c).
+            if self._indexer_reuse_armed(S):
+                self._indexer_reuse_refuse("flash-skip")
             _qsa_prefill_count("decode_flash_skip")
             blk_idx = mx.sort(top_idx[0].astype(mx.int32))
             tail_start = ((pos_start + 1) // self.ratio) * self.ratio
@@ -2757,6 +3524,8 @@ class QSAIndexer(nn.Module):
             # are < the tail start; the tail runs to the current position),
             # so the gathered SDPA needs no mask — identical math to the
             # masked dense product over the same visible set.
+            if self._indexer_reuse_armed(S):
+                self._indexer_reuse_refuse("decode-gather")
             blk_idx = mx.sort(top_idx[0].astype(mx.int32))
             tok_from_blocks = (
                 blk_idx[:, None] * self.ratio + mx.arange(self.ratio, dtype=mx.int32)
@@ -2794,7 +3563,16 @@ class QSAIndexer(nn.Module):
             # tail start, so the lists never double-count a token; invalid
             # slots carry valid=False and are re-pointed at token 0 for the
             # take.
-            blk_ok = mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
+            # Under MTPLX_FABLE_INDEXER_REUSE the trailing slot is a masked
+            # DUPLICATE of an already-selected block whenever no block
+            # completed this step, and `valid` would call that duplicate
+            # visible -- gathering its four tokens twice and double-counting
+            # them in the softmax. The reuse hands down the right mask.
+            blk_ok = (
+                reuse_blk_ok
+                if reuse_blk_ok is not None
+                else mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
+            )
             tok_blocks = (
                 top_idx.astype(mx.int32)[:, :, None] * self.ratio
                 + mx.arange(self.ratio, dtype=mx.int32)
@@ -3382,6 +4160,12 @@ class QSAIndexer(nn.Module):
                 decode=decode,
                 mode=compiled_mode,
             ):
+                if compiled_mode != "update_only" and self._indexer_reuse_armed(S):
+                    # The compiled graph fuses the cache writes and the
+                    # selection into one trace; there is no seam at which a
+                    # reused block set could replace the scorer without
+                    # re-tracing per depth.
+                    self._indexer_reuse_refuse("compiled-indexer")
                 return self._call_rows_compiled(
                     hidden,
                     pos_start,
@@ -3405,12 +4189,26 @@ class QSAIndexer(nn.Module):
             # Raises on a module/pack mismatch -- an armed flag never reverts
             # to the stock chain behind a performance mystery.
             self._require_m4_contract(cache, S)
-        if write_only:
+        # MTPLX_FABLE_INDEXER_REUSE decides BEFORE the query preparation: when
+        # the anchor will serve this depth, the norm + partial RoPE below is
+        # dead work exactly as it is under write_only. Both leave the k half
+        # -- the raw-key and pooled-bank writes -- untouched.
+        reuse_serves = self._indexer_reuse_decision(
+            cache,
+            rows=S,
+            nb_total=self._indexer_reuse_pooled_width(cache, T),
+        )
+        if write_only or reuse_serves:
             # The query half of index_qk_proj is already computed (one shared
             # GEMV); only its norm+rope preparation is skipped, along with
             # every scorer below.
             q = None
         elif fused_m4:
+            q = self._prepare_queries_m4(q, pos_start)
+        elif fixed_capacity and self._verify_glue_rope_idx():
+            # MTPLX_FABLE_VERIFY_GLUE item 'qsa_rope_idx': the same SHIPPED
+            # kernel MTPLX_FABLE_QSA_M4 uses for this one sub-chain, without
+            # that flag's three other (and less exact) rewrites.
             q = self._prepare_queries_m4(q, pos_start)
         elif fixed_capacity:
             q = self._prepare_queries_eager(q, pos_start)
@@ -3423,6 +4221,8 @@ class QSAIndexer(nn.Module):
             return None
         nb_total = 0 if pooled is None else pooled.shape[1]
         if fused_m4:
+            if self._indexer_reuse_armed(S):
+                self._indexer_reuse_refuse("fused-M4")
             return self._select_m4(q, pos_start, cache, pooled)
 
         # Per-query complete-block counts. If every visible prefix fits inside
@@ -3458,7 +4258,8 @@ class QSAIndexer(nn.Module):
         # threadgroup.  Keep it for decode/small verify only; large-S prefill
         # either takes the tiled scorer above or the stock vectorized oracle.
         legacy_fused = (
-            not fixed_capacity
+            not reuse_serves
+            and not fixed_capacity
             and _fused_qsa_indexer_enabled()
             and pooled_backing is not None
             and (decode or S < _qsa_prefill_min_rows())
@@ -3468,8 +4269,13 @@ class QSAIndexer(nn.Module):
             and self._fused_selector_supported(q, pooled_backing)
         )
         if not legacy_fused:
-            return self._select_eager(q, pos_start, cache, pooled, T)
+            return self._select_eager(q, pos_start, cache, pooled, T, rows=S)
 
+        if self._indexer_reuse_armed(S):
+            # `legacy_fused` is True here: the one-threadgroup-per-row Metal
+            # scorer owns preparation, scoring and top-k behind a single
+            # dispatch, so the anchor has nothing to substitute for.
+            self._indexer_reuse_refuse("legacy-fused")
         if decode and _qsa_flash_enabled():
             block_ids, _, _ = self._select_fused(
                 q,
@@ -3731,6 +4537,14 @@ def _qsa_blocks_to_dense_mask(
     return ((token_selected | tail) & causal)[None, None]
 
 
+def _sparse_route_snapshot():
+    """``qsa_sparse_decode.route_snapshot()``, imported only when armed."""
+
+    from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+    return _qsa_sparse.route_snapshot()
+
+
 class Attention(nn.Module):
     """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
     per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
@@ -3775,6 +4589,90 @@ class Attention(nn.Module):
             else None
         )
 
+    def _sparse_decode_required(self, cache: QSACache, rows: int) -> bool:
+        """True when the armed split-K lane MUST have served this selection.
+
+        Narrow on purpose, and every narrowing is a place the lane genuinely
+        cannot be: no indexer at all (a dense layer), a growable cache (the
+        lane installs on the fixed-capacity compiled-verify cache, and
+        construction owns that gate), or a width this process did not arm.
+        Everything else is the contract, and failing it is fatal -- see the
+        call site in ``__call__``.
+        """
+
+        if self.indexer is None:
+            return False
+        rows = int(rows)
+        if rows == _SPARSE_VERIFY_ROWS:
+            if not fable_qsa_sparse_decode_enabled():
+                return False
+        elif rows == _SPARSE_DRAFT_ROWS:
+            if not fable_qsa_sparse_draft_enabled():
+                return False
+        else:
+            return False
+        return bool(getattr(cache, "fixed_capacity", False))
+
+    def _require_sparse_decode_lane(self, sel_mask, *, rows: int, before) -> None:
+        """The armed lane is IN this graph, or this forward legitimately isn't.
+
+        W68 -- the trace-time proof.  Every ``sel_mask`` branch below is a
+        DIFFERENT attention, and the 2026-09-02 window took one of them
+        (rows-gather) for 394 cycles with the flag armed and nothing saying
+        so.  The selection is decided in this Python body, which under
+        ``mx.compile`` runs at TRACE time, so this raises while the graph is
+        being built rather than after a window.
+
+        TWO ways to pass.  The selection is ``sparse_blocks``; or the indexer
+        declined because this request's context is below
+        ``SHORT_CONTEXT_TOKENS``, where the kernel's fixed ``[M, 512]`` ABI
+        has no analogue and the stock chain is the correct lane.  A full-budget
+        forward that got any other lane still raises -- that is the armed-but-
+        inert failure this guard exists for.
+        """
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "sparse_blocks":
+            return
+        from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+        now = _qsa_sparse.route_snapshot()
+        if now["short_context"] > int(before["short_context"]):
+            return
+        lane = (
+            "MTPLX_FABLE_QSA_SPARSE_DECODE"
+            if int(rows) != 1
+            else "MTPLX_FABLE_QSA_SPARSE_DRAFT"
+        )
+        took = (
+            sel_mask[0]
+            if isinstance(sel_mask, tuple) and sel_mask
+            else ("dense_mask" if sel_mask is not None else "no_selection")
+        )
+        raise RuntimeError(
+            f"{lane} is armed and this is its {int(rows)}-row width on the "
+            f"fixed QSA cache with a full {_qsa_sparse.TOP_K}-block budget, "
+            f"but the indexer handed attention the {took!r} lane: the split-K "
+            "kernel is not in this graph and the arm would replay the stock "
+            "chain"
+        )
+
+    def _verify_glue_rope(self, rows: int) -> bool:
+        """True when ``MTPLX_FABLE_VERIFY_GLUE``'s ``qsa_rope`` serves this call.
+
+        Host-only, from the verdict the install probe recorded at model build
+        outside any trace.  Width is a NARROWING, not a failure: the kernel is
+        a latency play on the 1..8-row decode/verify window and prefill is a
+        regime nothing here has measured, so prefill keeps the stock chain.
+        """
+
+        if not fable_verify_glue_enabled("qsa_rope"):
+            return False
+        from mtplx import fable_verify_glue as _glue
+
+        if not _glue.serves_rows(rows):
+            return False
+        return _glue.qsa_rope_installed()
+
     def __call__(
         self, x: mx.array, cache: QSACache, *, kv_only: bool = False
     ) -> Optional[mx.array]:
@@ -3792,6 +4690,13 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         pos_start = cache.offset
         vrope = vision_rope_state()
+        # W68: the armed lane's per-layer proof. Sampled BEFORE the indexer,
+        # because the routing decision is taken inside it -- and a forward can
+        # prove engagement two ways: it routed to the kernel, or it declined
+        # for a context below SHORT_CONTEXT_TOKENS, where the kernel has no
+        # analogue and the stock chain is correct.
+        sparse_required = self._sparse_decode_required(cache, S)
+        sparse_before = _sparse_route_snapshot() if sparse_required else None
 
         fused = getattr(self, "qkv_fused", None)
         if fused is not None:
@@ -3853,6 +4758,23 @@ class Attention(nn.Module):
                 cos, sin = _rope_cos_sin(
                     positions, self._inv_freq, self._rope_attention_scaling
                 )
+        elif vrope is None and self._verify_glue_rope(int(S)):
+            # MTPLX_FABLE_VERIFY_GLUE item 'qsa_rope': the table build and
+            # both rotations as ONE dispatch. Same arithmetic, same order --
+            # the install probe proved it bit-exact against whichever stock
+            # spelling this process armed.
+            from mtplx.kernels.qwen4_m4_rope import rope_qk
+
+            rotated_q, k = rope_qk(
+                None if kv_only else q,
+                k,
+                self._inv_freq,
+                pos_start=pos_start,
+                attention_scaling=self._rope_attention_scaling,
+            )
+            if not kv_only:
+                q = rotated_q
+            cos = sin = None
         elif fable_opdiet_enabled("rope"):
             # Text rope: one half-width table per (pos_start, S) instead of a
             # full-width table per consumer. The indexer above already asked
@@ -3897,6 +4819,11 @@ class Attention(nn.Module):
             # bank state keeps one format. Masks key on sequence order,
             # which remains correct under M-RoPE; only rope reads the axes.
             sel_mask = None
+
+        if vrope is None and sparse_required:
+            self._require_sparse_decode_lane(
+                sel_mask, rows=int(S), before=sparse_before
+            )
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash":
             # Block-sparse flash attention over the indexer's exact visible
@@ -3986,6 +4913,35 @@ class Attention(nn.Module):
                 compress_ratio=self.indexer.ratio,
             )
 
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "sparse_blocks":
+            # MTPLX_FABLE_QSA_SPARSE_DECODE / _DRAFT: split-K direct-index
+            # sparse GQA over exactly the visible set the rows-gather lane
+            # attends, reading the cache BACKING in place.  No gathered K/V
+            # tensor is written, no transposed copy is made for the score
+            # operand, and no score tensor is materialized -- which is the
+            # whole point: the shipped lane's ~70 MB per layer is bytes, not
+            # bandwidth (see mtplx/kernels/qsa_sparse_decode.py).
+            #
+            # ROUNDING CLASS, not exact: fp32 online softmax in exp2, fp32
+            # probabilities into an fp32 P@V, Steel-MMA reassociation, and a
+            # split-K rescale.  Adopted on greedy-token agreement plus a full
+            # HumanEval run, exactly like MTPLX_FABLE_HC_M4.
+            from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+            _, sparse_top_idx = sel_mask
+            out = _qsa_sparse.attention(
+                q,
+                cache.kv.keys,
+                cache.kv.values,
+                sparse_top_idx,
+                query_offset=pos_start,
+                total_tokens=T,
+                scale=self.scale,
+                draft=(S == 1),
+            )
+            out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+            return self.o_proj(out * mx.sigmoid(gate))
+
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "gather_rows":
             # Rows-gather lane (S>1): each verify/pipeline row reads only
             # its own selected blocks + tail instead of the full context
@@ -4016,9 +4972,23 @@ class Attention(nn.Module):
         elif sel_mask is not None:
             mask = sel_mask
         elif S > 1:
-            qpos = pos_start + mx.arange(S, dtype=mx.int32)
-            tpos = mx.arange(T, dtype=mx.int32)
-            mask = (tpos[None, :] <= qpos[:, None])[None, None]
+            # No selection came back, so every visible key is visible: either
+            # the chunk's whole history fits the indexer budget
+            # (``last_nb <= block_topk``, i.e. ``T <= (block_topk + 1) * ratio
+            # - 1`` = 2,051 tokens on the production pack, where top-512 of
+            # <= 512 candidate blocks IS all of them), or the request is a
+            # vision one where QSA is bypassed outright.  In both cases the
+            # mask below is EXACTLY causal -- so when the flag is armed, hand
+            # MLX the string and never build the tensor.
+            _qsa_prefill_count("mask_causal_eligible")
+            if _prefill_mask_fuse_enabled() and _prefill_causal_mask_is_exact(
+                pos_start=pos_start, rows=S, total_keys=T
+            ):
+                mask = _CAUSAL_MASK
+            else:
+                qpos = pos_start + mx.arange(S, dtype=mx.int32)
+                tpos = mx.arange(T, dtype=mx.int32)
+                mask = (tpos[None, :] <= qpos[:, None])[None, None]
         else:
             mask = None
 
@@ -5156,6 +6126,37 @@ class DecoderLayer(nn.Module):
         hidden = _hyper_residual_write(hyper, block_out, inject)
         return hidden
 
+    # ---- expert-major prefill seam ---------------------------------------
+    # ``__call__`` cut at the MoE.  The attention half carries every
+    # sequence-dependent piece (PLE history, KV append, GDN recurrence) and so
+    # must still run once per chunk in chunk order; the MoE half is per-token
+    # and is what the group schedule batches.  Kept as a separate copy rather
+    # than a refactor of ``__call__`` so flag-off is provably untouched;
+    # ``tests/test_fable_prefill_expert_major.py`` asserts the two spellings
+    # agree bitwise.
+
+    def prefill_attn_half(self, hidden, *, input_ids, ssm_mask, cache):
+        """PLE injection + attention/GDN + its residual write."""
+
+        if "ple" in self:
+            hidden = hidden + self.ple(hidden, input_ids, cache)
+        mixed, hyper, inject = self.attn_hyper_connection(hidden)
+        if self.is_linear:
+            block_out = self.linear_attn(mixed, ssm_mask, cache)
+        else:
+            block_out = self.self_attn(mixed, cache)
+        return _hyper_residual_write(hyper, block_out, inject)
+
+    def prefill_moe_read(self, hidden):
+        """``mlp_hyper_connection`` read -- ``(mixed, hyper, inject)``."""
+
+        return self.mlp_hyper_connection(hidden)
+
+    def prefill_moe_write(self, hyper, block_out, inject):
+        """The MoE residual write."""
+
+        return _hyper_residual_write(hyper, block_out, inject)
+
 
 class Qwen4ExpTextModel(nn.Module):
     def __init__(self, args: TextArgs):
@@ -5348,6 +6349,97 @@ class Qwen4ExpTextModel(nn.Module):
         self._last_widened = h
         return self.hyper_connection_mixer(h)
 
+    # ---- expert-major (super-chunk) prefill -------------------------------
+
+    def forward_prefill_group(self, chunk_inputs, cache, *, input_embeddings=None):
+        """Layer-major forward over a group of consecutive prefill chunks.
+
+        ``MTPLX_FABLE_PREFILL_EXPERT_MAJOR``.  Runs every chunk of the group
+        through layer L before any chunk enters layer L+1, and batches the
+        layer's routed MoE GEMM across the group's rows.  Returns
+        ``(mixer_outputs, widened)`` -- one entry per chunk, in chunk order.
+
+        Why this ordering is the only correct one, and why it is exact, is in
+        ``mtplx/fable_prefill_expert_major.py``'s module docstring.  The two
+        invariants this method is responsible for:
+
+        * **chunk order inside every layer.**  ``cache[L]`` is appended by
+          chunk 0, then 1, ... so when chunk k runs at layer L the cache holds
+          exactly chunks < k at that layer -- byte-identical to chunk-major.
+          The same holds for the GDN recurrent state and for the PLE n-gram
+          history, which is staged and consumed per chunk at the PLE layer.
+        * **only ``switch_mlp`` sees a different M.**  Router, shared expert,
+          hyper reads, residual writes, attention and GDN all run on
+          unchanged per-chunk tensors.
+        """
+
+        from mtplx import fable_prefill_expert_major as expert_major
+
+        chunks = list(chunk_inputs)
+        if not chunks:
+            raise ValueError("forward_prefill_group needs at least one chunk")
+        if cache is None:
+            raise expert_major.ExpertMajorRefusal(
+                "the group schedule needs a real per-layer cache"
+            )
+        if input_embeddings is not None:
+            raise expert_major.ExpertMajorRefusal(
+                "vision splice is not wired into the group schedule"
+            )
+        if _COMPILED_VERIFY_PLE.get() is not None or _VERIFY_CAPTURE.get():
+            raise expert_major.ExpertMajorRefusal(
+                "compiled-verify / capture scopes are decode lanes"
+            )
+        hs = [
+            mx.tile(self.embed_tokens(ids), (1, 1, self.args.hc_count))
+            for ids in chunks
+        ]
+        # ``_forward`` builds the SSM mask once per chunk from the GDN cache's
+        # state at the time that chunk starts.  The group cannot: at the top
+        # of the group every chunk would read the same (group-start) state.
+        # For the shipped caches ``create_ssm_mask`` is None -- padding/left-
+        # padded batches are the only shape that returns one, and none of them
+        # reach this lane -- so refuse the moment one is not, rather than
+        # feed a mask built against the wrong offset.
+        ssm_entry = cache[self.ssm_idx]
+        if any(create_ssm_mask(h, ssm_entry) is not None for h in hs):
+            raise expert_major.ExpertMajorRefusal(
+                "this GDN cache builds an SSM mask, whose offset the group "
+                "schedule cannot reproduce"
+            )
+        ple_idx = self._ple_stage_idx
+        for idx, (layer, entry) in enumerate(zip(self.layers, cache)):
+            for k, ids in enumerate(chunks):
+                if idx == ple_idx:
+                    ple = layer.ple
+                    ple.ple_embedding.stage(ids, entry, ple.NGRAM_IDX)
+                hs[k] = layer.prefill_attn_half(
+                    hs[k], input_ids=ids, ssm_mask=None, cache=entry
+                )
+            reads = [layer.prefill_moe_read(h) for h in hs]
+            mixed = [read[0] for read in reads]
+            routes = [layer.mlp.prefill_route(m) for m in mixed]
+            widths = [int(m.shape[1]) for m in mixed]
+            if len(chunks) == 1:
+                routed = [layer.mlp.switch_mlp(mixed[0], routes[0][0])]
+            else:
+                batched = layer.mlp.switch_mlp(
+                    mx.concatenate(mixed, axis=1),
+                    mx.concatenate([route[0] for route in routes], axis=1),
+                )
+                routed = []
+                offset = 0
+                for width in widths:
+                    routed.append(batched[:, offset : offset + width])
+                    offset += width
+            for k in range(len(chunks)):
+                block_out = layer.mlp.prefill_combine(
+                    routed[k], routes[k][1], mixed[k]
+                )
+                hs[k] = layer.prefill_moe_write(reads[k][1], block_out, reads[k][2])
+        self._last_widened = hs[-1]
+        return [self.hyper_connection_mixer(h) for h in hs], hs
+
     # ---- compiled GDN decode runs ----------------------------------------
     # The qL=1 decode step is CPU-dispatch-bound: ~20.8ms of Python graph
     # construction per token against <=14ms of GPU work (measured 2026-08-27,
@@ -5374,15 +6466,27 @@ class Qwen4ExpTextModel(nn.Module):
 
     def _compiled_run_fn(self, idxs, capture: bool = False):
         layers = [self.layers[i] for i in idxs]
+        indices = tuple(int(i) for i in idxs)
 
         def step(h, *flat):
             out_states = []
             rows = []
             k = 0
-            for layer in layers:
+            for layer, layer_index in zip(layers, indices):
                 c = ArraysCache(size=2)
                 c[0], c[1] = flat[k], flat[k + 1]
                 k += 2
+                if _GDN_KEEPMASK_FOLD_ARMED:
+                    # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66d).  This run hands
+                    # the layer a THROWAWAY container, not the compiled
+                    # verify's shadow entry, so the fold's entry-identity
+                    # lookup would miss — and a miss is not a decline: the
+                    # dispatch has already substituted the ring's BASE into
+                    # state slot 1, so the step would run the stock
+                    # recurrence from a state missing one or two committed
+                    # windows.  Re-point the entry key at this layer's
+                    # prefix.  A no-op outside a traced folded forward.
+                    _gdn_fold.bind_fold_alias(layer_index, c)
                 h = layer(h, input_ids=None, ssm_mask=None, cache=c)
                 out_states.extend((c[0], c[1]))
                 if capture:
@@ -5530,6 +6634,23 @@ class Qwen4ExpTextModel(nn.Module):
                 return self._refuse_commit(i, "gdn_snapshot_short")
             plan.append(("gdn", i, rows))
 
+        # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66b).  Decided once, for the WHOLE
+        # window, after every entry has validated and before any is mutated --
+        # so a refusal above still leaves the cache intact for the
+        # rollback + re-forward fallback, and the ring can never end up half
+        # advanced.  The fold applies only to a commit whose verify was THIS
+        # window's compiled physical-M4 graph (`active_for` matches the stamp
+        # that graph left), which is why a copy round's `forward_ar`, a
+        # rollback re-forward and an eager AR round all take the shipped
+        # replay below untouched.
+        fold_actives, fold_windows = self._gdn_keepmask_fold_plan(
+            cache, plan, keep_tokens=keep_tokens, verified_tokens=verified_tokens
+        )
+        fold_flushed = False
+        masked_replay_state = (
+            _gdn_fold_kernels().masked_replay_state if fold_actives else None
+        )
+
         for kind, i, payload in plan:
             entry = cache[i]
             layer = self.layers[i]
@@ -5547,18 +6668,54 @@ class Qwen4ExpTextModel(nn.Module):
                         (qkv.shape[0], gdn.conv_kernel_size - 1, qkv.shape[2]),
                         dtype=qkv.dtype,
                     )
-                _, new_state = gated_delta_update(
-                    q[:, :keep_tokens],
-                    k[:, :keep_tokens],
-                    v[:, :keep_tokens],
-                    a[:, :keep_tokens],
-                    b[:, :keep_tokens],
-                    gdn.A_log,
-                    gdn.dt_bias,
-                    pre[1],
-                    None,
-                    use_kernel=not gdn.training,
-                )
+                active = fold_actives.get(i)
+                if active is None:
+                    _, new_state = gated_delta_update(
+                        q[:, :keep_tokens],
+                        k[:, :keep_tokens],
+                        v[:, :keep_tokens],
+                        a[:, :keep_tokens],
+                        b[:, :keep_tokens],
+                        gdn.A_log,
+                        gdn.dt_bias,
+                        pre[1],
+                        None,
+                        use_kernel=not gdn.training,
+                    )
+                else:
+                    base, ring_rows, ring_keeps, fold_flushed = (
+                        _gdn_fold.advance_ring(
+                            active,
+                            (q, k, v, a, b),
+                            keep_tokens,
+                            max_windows=fold_windows,
+                        )
+                    )
+                    # `new_state` is the SAME state the replay above produces,
+                    # built lazily: anything that reads or evaluates
+                    # `entry[1]` -- a context-copy block round, a rollback
+                    # re-forward, `detach_cache_state`,
+                    # MTPLX_EVAL_STATE_ROOTS_ON_COMMIT, the session bank --
+                    # pays exactly today's replay and gets exactly today's
+                    # answer.  The next compiled window instead recognises the
+                    # descriptor, starts from `base`, and lets MLX drop the
+                    # unevaluated replay.
+                    new_state = masked_replay_state(
+                        ring_rows,
+                        ring_keeps,
+                        gdn.A_log,
+                        gdn.dt_bias,
+                        base,
+                    )
+                    entry._mtplx_fold_pending = _gdn_fold.FoldPending(
+                        base=base,
+                        rows=ring_rows,
+                        keeps=ring_keeps,
+                        state=new_state,
+                    )
+                if _GDN_KEEPMASK_FOLD_ARMED:
+                    # One window's stamp is consumed once.
+                    _gdn_fold.clear_active(entry)
                 conv_input = mx.concatenate(
                     [conv_pre, qkv[:, :keep_tokens]], axis=1
                 )
@@ -5581,7 +6738,66 @@ class Qwen4ExpTextModel(nn.Module):
                     cache=entry,
                 )
                 entry._mtplx_verify_ple = None
+        if fold_actives:
+            _gdn_fold.note_deferred_commit(
+                layers=len(fold_actives), flushed=fold_flushed
+            )
         return True
+
+    def _gdn_keepmask_fold_plan(
+        self,
+        cache,
+        plan,
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+    ):
+        """Which GDN layers may DEFER this commit, and at what ring depth.
+
+        Returns ``({layer_index: FoldPending}, max_windows)``; an empty map
+        means every layer takes the shipped eager replay.  All-or-nothing by
+        construction: the ring is one shared object across the 35 foldable
+        layers (one shared mask, one shared depth), so a window where any
+        layer disagrees defers none of them.
+
+        Never raises.  Every rejection is either a BYPASS (this commit did not
+        come from a compiled M4 window -- a copy round, an eager AR round, a
+        re-forward) or a DECLINE (the window was foldable and something about
+        it was not what the lane is wired for).  Both fall through to today's
+        exact replay; only the second is an anomaly, and the receipt gate
+        fails on it.
+        """
+
+        if not _GDN_KEEPMASK_FOLD_ARMED or not _gdn_fold.STATS.get("installed"):
+            return {}, 0
+        gdn_layers = [index for kind, index, _payload in plan if kind == "gdn"]
+        if not gdn_layers:
+            return {}, 0
+        seq = _gdn_fold.current_window_seq()
+        actives = {
+            index: _gdn_fold.active_for(cache[index], seq)
+            for index in gdn_layers
+        }
+        live = {index: a for index, a in actives.items() if a is not None}
+        if not live:
+            _gdn_fold.STATS["bypassed_commits"] += 1
+            return {}, 0
+        if len(live) != len(actives):
+            _gdn_fold.note_decline("partial_window_stamp")
+            return {}, 0
+        if int(verified_tokens) != _gdn_fold.VERIFY_WIDTH:
+            _gdn_fold.note_decline(f"verify_width_{int(verified_tokens)}")
+            return {}, 0
+        if not 1 <= int(keep_tokens) < _gdn_fold.VERIFY_WIDTH:
+            # A whole-window accept returns in generation.py before this
+            # method is called, so reaching here means the lane's assumption
+            # about the accept branch no longer holds.
+            _gdn_fold.note_decline(f"keep_tokens_{int(keep_tokens)}")
+            return {}, 0
+        if len({tuple(a.keeps) for a in live.values()}) != 1:
+            _gdn_fold.note_decline("ring_depth_disagreement")
+            return {}, 0
+        return live, _gdn_fold.fable_gdn_keepmask_fold_windows()
 
 
 class TextModel(nn.Module):
@@ -5621,6 +6837,42 @@ class TextModel(nn.Module):
         if return_hidden:
             return logits, self.model._last_widened
         return logits
+
+    def forward_prefill_group(
+        self,
+        chunk_inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int = 0,
+    ):
+        """``__call__``'s contract, once per chunk, over a layer-major group.
+
+        Returns a list of ``(logits_or_None, widened_or_None)`` in chunk
+        order.  The per-chunk tail is the same head/emit_logits arithmetic
+        ``__call__`` does -- the group changes the trunk schedule, not what a
+        chunk yields.
+        """
+
+        outs, widened = self.model.forward_prefill_group(
+            chunk_inputs, cache, input_embeddings=input_embeddings
+        )
+        results = []
+        for out, wide in zip(outs, widened):
+            if not emit_logits:
+                results.append((None, wide) if return_hidden else (None, None))
+                continue
+            row = out
+            if logits_keep:
+                row = row[:, -max(1, int(logits_keep)) :]
+            if self.args.tie_word_embeddings:
+                logits = self.model.embed_tokens.as_linear(row)
+            else:
+                logits = self.lm_head(row)
+            results.append((logits, wide if return_hidden else None))
+        return results
 
     def _head_logits(self, h):
         if self.args.tie_word_embeddings:
@@ -5875,6 +7127,28 @@ class Model(nn.Module):
         # implemented (cache-only prefill chunks skip the vocab head).
         return self.language_model(
             inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+            emit_logits=emit_logits,
+            logits_keep=logits_keep,
+        )
+
+    def forward_prefill_group(
+        self,
+        chunk_inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int = 0,
+    ):
+        """Expert-major group prefill; see ``TextModel.forward_prefill_group``."""
+
+        return self.language_model.forward_prefill_group(
+            chunk_inputs,
             cache,
             input_embeddings,
             return_hidden=return_hidden,

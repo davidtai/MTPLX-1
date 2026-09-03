@@ -37,9 +37,15 @@ Two phases, deliberately split so the expensive one runs once:
 **capture** (needs the GPU; ``--capture-to``)
     Replays a ``MTPLX_FABLE_K20_LOG`` trajectory through the model.  The log
     records, per verify window, the window's ``primary``, the full draft chain
-    ``draft_tokens``, how many of them were accepted, and the correction/bonus
-    token that was emitted -- which is the whole committed stream, so the
-    trajectory is reconstructible from the log alone (:func:`segment_windows`).
+    ``draft_tokens``, how many of them were accepted, the correction/bonus
+    token that was emitted, and -- since 2026-09-02 -- the ``carry``: the
+    tokens a lane with no verify window of its own (a ``context_copy`` block
+    round) committed between two windows.  Together those are the whole
+    committed stream, so the trajectory is reconstructible from the log alone
+    (:func:`segment_windows`).  A log written before the carry accounting is
+    NOT reconstructible whenever the copy lane fired, and
+    :func:`segment_windows` refuses it rather than replaying a stream with
+    holes in it.
     The replay re-runs the prompt, then walks that committed stream window by
     window, and at every window runs the draft chain **once per variant** from
     the identical hidden state, **teacher-forced to the logged draft tokens**.
@@ -339,51 +345,171 @@ class Segment:
         return self.stop - self.start
 
 
+class TrajectoryGapError(RuntimeError):
+    """The log is missing tokens the run committed; it cannot be replayed.
+
+    Raised when the emitted stream reconstructed from the rows of ONE request
+    does not join up: window ``c + 1``'s ``primary`` is not the token window
+    ``c`` left at the end of the stream, and no ``carry`` accounts for the
+    difference.  That is a hole in the log, not a request boundary, and a
+    replay teacher-forced on the truncated stream would run the model from the
+    wrong hidden state at every window after it.
+    """
+
+
+def window_carry(log: Mapping[str, np.ndarray], index: int) -> list[int]:
+    """Tokens committed AFTER window ``index`` by a lane that wrote no row.
+
+    ``mtplx/context_copy.py`` block rounds commit a verbatim slice of the
+    prompt (plus the residual correction, plus the freshly sampled primary when
+    the block was accepted whole) in their own verify forward, with no K20 row.
+    ``carry_len`` / ``carry_tokens`` are the logger's record of them; an older
+    log has neither column and this returns ``[]`` for every window.
+    """
+
+    lengths = log.get("carry_len")
+    if lengths is None:
+        return []
+    count = int(lengths[index])
+    if count <= 0:
+        return []
+    return [int(token) for token in log["carry_tokens"][index][:count]]
+
+
+def request_ids(log: Mapping[str, np.ndarray]) -> np.ndarray | None:
+    """Per-window request id from the PCG64 stream, or ``None`` when unusable.
+
+    A stock log records the window's PCG64 state as four uint64 words --
+    ``state`` high/low then ``inc`` high/low.  ``inc`` is the *stream* id, a
+    property of the ``Generator`` and therefore of the request: every window of
+    one ``generate_mtpk`` call carries the same one, and a second request
+    through the same process gets a different one from its own seeding.  That
+    is an exact request marker, and it does not care what the emitted stream
+    does -- which is the whole point, because a lane that commits without a row
+    breaks the emitted stream's continuity without ending the request.
+
+    ``None`` only when the column is not there at all: the PR391 lane and the
+    test stubs leave it zero.  A **constant** stream is an answer, not a
+    refusal -- it says "one request" -- and that is the safe reading: were a
+    driver ever to reuse one ``Generator`` across requests, the segments would
+    merge and the continuity check would then raise at the join, which is loud,
+    where guessing from the token stream is silent and wrong.  A stream id that
+    reappears after a different one is not a request id (interleaved requests),
+    so that is refused.
+    """
+
+    state = log.get("rng_state")
+    if state is None:
+        return None
+    words = np.asarray(state)
+    if words.ndim != 2 or words.shape[1] < 4:
+        return None
+    stream = words[:, 2:4]
+    if not stream.any():
+        return None
+    changed = np.zeros(len(stream), dtype=bool)
+    changed[0] = True
+    changed[1:] = (stream[1:] != stream[:-1]).any(axis=1)
+    firsts = stream[changed]
+    if len(np.unique(firsts, axis=0)) != len(firsts):
+        return None
+    return (np.cumsum(changed) - 1).astype(np.int64)
+
+
 def segment_windows(log: Mapping[str, np.ndarray]) -> list[Segment]:
     """Split a multi-request log into per-request segments.
 
     A K20 log written by a driver that runs three seeds in one process holds
-    all three trajectories concatenated, with no seed column.  Two things end a
-    request, and both are visible in the log:
+    all three trajectories concatenated.  Where the request boundary is is a
+    property of the *run*, not of the emitted stream, and the stock layout
+    records it: :func:`request_ids` reads the window's PCG64 stream id, which
+    changes exactly at a request boundary and nowhere else.  That is the split.
 
-    * ``selected_present`` is 0 -- the window hit a stop token, so nothing was
-      emitted after the accepted prefix and generation ended.  A hard boundary.
-    * the next window's ``primary`` is not this window's ``selected_token`` --
-      the carry-in broke, so the next window belongs to a different request.
-      A soft boundary; it is the one that catches a max-tokens end.
+    Only when that column cannot answer -- the PR391 lane and the test stubs
+    leave it zero -- does this fall back to reading the emitted stream, ending
+    a request where ``selected_present`` is 0 (a stop token) or where the next
+    window's ``primary`` is not this window's ``selected_token``.
 
-    A coincidental match at a max-tokens boundary would merge two segments.
-    That costs the replay one wrong prefill, which the fidelity gate then fails
-    loudly on -- it cannot silently corrupt a comparison.  Pass
-    ``--expect-segments`` to assert the count you know you ran.
+    Either way the reconstructed stream is then **checked**, per segment: every
+    window's ``primary`` must be the token the previous window left at the end
+    of the stream, or the gap must be accounted for by a logged
+    :func:`window_carry`.  An unexplained break is a hole in the log --
+    :class:`TrajectoryGapError` -- and never a segment boundary.  Pass
+    ``--expect-segments`` to assert the count you know you ran on top of that.
     """
 
     cycles = int(log["draft_tokens"].shape[0])
+    if not cycles:
+        return []
     primary = np.asarray(log["primary"], dtype=np.int64)
     selected = np.asarray(log["selected_token"], dtype=np.int64)
     present = np.asarray(log["selected_present"], dtype=np.uint8)
 
-    segments: list[Segment] = []
-    start = 0
-    tokens: list[int] = [int(primary[0])] if cycles else []
-    for index in range(cycles):
-        tokens.extend(window_emission(log, index))
-        last = index + 1 == cycles
-        broke = (not last) and (
-            not bool(present[index]) or int(primary[index + 1]) != int(selected[index])
+    ids = request_ids(log)
+    bounds: list[int] = [0]
+    if ids is not None:
+        bounds.extend(index for index in range(1, cycles) if ids[index] != ids[index - 1])
+    else:
+        bounds.extend(
+            index
+            for index in range(1, cycles)
+            if not bool(present[index - 1])
+            or int(primary[index]) != int(selected[index - 1])
         )
-        if last or broke:
-            segments.append(
-                Segment(
-                    index=len(segments),
-                    start=start,
-                    stop=index + 1,
-                    tokens=tuple(tokens),
-                )
-            )
-            start = index + 1
-            tokens = [int(primary[start])] if start < cycles else []
+    bounds.append(cycles)
+
+    segments: list[Segment] = []
+    breaks: list[tuple[int, int, int]] = []
+    for position in range(len(bounds) - 1):
+        start, stop = bounds[position], bounds[position + 1]
+        tokens: list[int] = [int(primary[start])]
+        for index in range(start, stop):
+            if index > start and int(primary[index]) != tokens[-1]:
+                breaks.append((index, tokens[-1], int(primary[index])))
+            tokens.extend(window_emission(log, index))
+            tokens.extend(window_carry(log, index))
+        segments.append(
+            Segment(index=len(segments), start=start, stop=stop, tokens=tuple(tokens))
+        )
+    if breaks:
+        raise TrajectoryGapError(_gap_message(log, breaks, len(segments)))
     return segments
+
+
+def _gap_message(
+    log: Mapping[str, np.ndarray],
+    breaks: Sequence[tuple[int, int, int]],
+    segments: int,
+) -> str:
+    shown = ", ".join(
+        f"window {index} expects {expected} but its primary is {found}"
+        for index, expected, found in breaks[:5]
+    )
+    if len(breaks) > 5:
+        shown += f", ... ({len(breaks)} in all)"
+    if log.get("carry_len") is None:
+        cause = (
+            "This log has no `carry_len` column, so it was written before the "
+            "logger accounted for lanes that commit tokens WITHOUT a K20 row "
+            "-- mtplx/context_copy.py block rounds are one, and they commit "
+            "the accepted slice, the residual correction and the next freshly "
+            "sampled primary between two windows. Those tokens are simply not "
+            "in this file and no reconstruction can recover them. Re-record "
+            "the log with a build that carries mtplx/fable_k20_log.py's "
+            "`carry` accounting, or with the copy lane off "
+            "(MTPLX_CONTEXT_COPY=0)."
+        )
+    else:
+        cause = (
+            "This log DOES carry `carry_len`, so an unaccounted break means "
+            "the record itself is inconsistent -- a lane committed tokens "
+            "without calling K20RowLog.carry, or the rows were reordered. Do "
+            "not replay it."
+        )
+    return (
+        f"{len(breaks)} window(s) of {segments} reconstructed request "
+        f"segment(s) do not join up: {shown}. {cause}"
+    )
 
 
 def segment_of_window(segments: Sequence[Segment], index: int) -> int:
@@ -515,6 +641,130 @@ def empty_shadow_rows(
 
 
 # ---------------------------------------------------------------------------
+# Replay bookkeeping -- pure, and the reason the commit protocol is testable.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CommitStep:
+    """One forward-and-commit the replay owes the model.
+
+    A window is one step; a window followed by a ``carry`` is two, because the
+    carried tokens went through their own verify forward in the logged run and
+    the replay has to advance the cache over them before the next window's
+    primary means anything.
+
+    ``fed`` is what the forward consumes, ``keep`` how many of its rows stay
+    committed, ``offset`` the absolute cache offset afterwards, ``hidden_row``
+    which row becomes the next chain's starting hidden, and ``primary`` the
+    token left DEFERRED -- its KV is computed by whichever forward runs next,
+    exactly as ``generate_mtpk`` defers a correction.  So ``offset`` counts
+    every emitted token except that one.
+
+    ``primary`` is ``-1`` when the request ENDED in this step (the window
+    emitted nothing after its accepted prefix): no token is deferred, nothing
+    follows, and a ``-1`` fed to a forward is a loud failure rather than a
+    plausible-looking wrong token.
+    """
+
+    NONE = -1
+
+    kind: str
+    fed: tuple[int, ...]
+    keep: int
+    offset: int
+    hidden_row: int
+    primary: int
+
+
+def commit_steps(
+    window: Mapping[str, Any], *, offset: int, primary: int
+) -> list[CommitStep]:
+    """The steps ``advance`` owes for ``window``, in order.
+
+    ``primary`` is the deferred token the replay is holding when the window
+    starts -- ``window['primary']`` on a sound trajectory, and the carry step
+    below is why it has to be threaded rather than re-read.
+    """
+
+    fed = (int(window["primary"]), *(int(token) for token in window["draft_tokens"]))
+    accepted = int(window["accepted"])
+    keep = accepted + 1  # the primary plus the accepted drafts
+    if keep > len(fed):
+        raise ValueError(
+            f"window {window['index']} accepted {accepted} of {len(fed) - 1} drafts"
+        )
+    present = bool(window["selected_present"])
+    steps = [
+        CommitStep(
+            kind="window",
+            fed=fed,
+            keep=keep,
+            offset=offset + keep,
+            hidden_row=accepted,
+            primary=int(window["selected_token"]) if present else CommitStep.NONE,
+        )
+    ]
+    carry = [int(token) for token in window.get("carry", ())]
+    if not carry or not present:
+        # No carry, or the request ended in this window (nothing was emitted
+        # after the accepted prefix, so there is no selection to feed and
+        # nothing follows the gap).
+        return steps
+    # The carry's last token is the NEXT window's primary and stays deferred
+    # like a selection; the rest are committed here, led by this window's own
+    # selection, which the window step deferred.
+    carry_fed = (steps[0].primary, *carry[:-1])
+    steps.append(
+        CommitStep(
+            kind="carry",
+            fed=carry_fed,
+            keep=len(carry_fed),
+            offset=steps[0].offset + len(carry_fed),
+            hidden_row=len(carry_fed) - 1,
+            primary=carry[-1],
+        )
+    )
+    return steps
+
+
+def untrimmable_entries(cache: Sequence[Any]) -> list[int]:
+    """Indices of cache entries that cannot roll back by trimming an offset.
+
+    A hybrid model's recurrent (GDN) state is one of these: ``mtplx`` builds
+    ``ArraysCache`` for every linear layer of ``qwen4_exp`` and ``QSACache``
+    for every full-attention layer, and only the latter trims.  A replay that
+    commits a verified prefix by trimming offsets therefore works on a
+    KV-only model and cannot work here -- which is what
+    ``_trim_cache_to_offset`` refusing a NO-OP trim after window 0 of the W51
+    capture meant.  The commit has to go through
+    ``gdn_capture.commit_captured_prefix`` instead, and this is the predicate
+    that says so.
+    """
+
+    out: list[int] = []
+    for index, entry in enumerate(cache):
+        is_trimmable = getattr(entry, "is_trimmable", None)
+        if not callable(is_trimmable) or not bool(is_trimmable()):
+            out.append(index)
+    return out
+
+
+def trimmable_offsets(cache: Sequence[Any]) -> list[int]:
+    """``offset`` of every trimmable entry -- the replay's commit postcondition."""
+
+    out: list[int] = []
+    for entry in cache:
+        is_trimmable = getattr(entry, "is_trimmable", None)
+        if not callable(is_trimmable) or not bool(is_trimmable()):
+            continue
+        offset = getattr(entry, "offset", None)
+        if offset is not None:
+            out.append(int(offset))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Replay orchestration -- pure, every device-touching piece injected.
 # ---------------------------------------------------------------------------
 
@@ -541,9 +791,12 @@ class ReplayHooks:
         MTP cache offset it found, or the second call is not paired with the
         first.
     ``advance(window=...)``
-        run the window's verify forward over ``[primary] + draft_tokens``,
-        commit ``accepted`` of them plus the emitted selection, and leave the
-        state on the next window.
+        run the window's verify forward over ``[primary] + draft_tokens`` and
+        commit the primary plus ``accepted`` drafts, then do the same for
+        ``window['carry']`` -- the tokens a lane with no K20 row of its own
+        (a context-copy block round) put in the stream before the next
+        window's primary -- and leave the state on the next window.
+        :func:`commit_steps` is that schedule, and is pure.
     """
 
     def start_segment(self, segment: Segment) -> None:  # pragma: no cover - iface
@@ -573,6 +826,10 @@ def window_record(log: Mapping[str, np.ndarray], index: int) -> dict[str, Any]:
         "selected_token": int(log["selected_token"][index]),
         "selected_present": bool(log["selected_present"][index]),
         "emission": window_emission(log, index),
+        # Tokens a lane committed after this window with no row of its own
+        # (context-copy block rounds).  They belong to the stream BEFORE the
+        # next window's primary, so `advance` must commit them too.
+        "carry": window_carry(log, index),
     }
 
 
@@ -674,18 +931,40 @@ def build_replay_hooks(
         drafted.  The MTP cache offset is read before the chain and restored in
         a ``finally``, so variant 2 starts where variant 1 started.
     ``advance``
-        ``rt.forward_ar([primary] + draft_tokens, cache, return_hidden=True)``
-        -- the verify forward -- then the commit: trim the target cache back to
-        ``primary`` plus the accepted drafts, take the next window's starting
-        hidden from row ``accepted`` of this forward (the row that produced the
-        emitted selection), and re-stage the MTP history over the committed
-        tokens.
+        ``rt.forward_ar_capture([primary] + draft_tokens, cache,
+        return_hidden=True, capture_backend=...)`` -- the verify forward --
+        then ``gdn_capture.commit_captured_prefix`` to keep ``primary`` plus
+        the accepted drafts, take the next window's starting hidden from row
+        ``accepted`` of this forward (the row that produced the emitted
+        selection), and re-stage the MTP history over the committed tokens.
+        A carry runs the same step again over the tokens the copy lane
+        committed.
+
+    Why the commit is a capture and not a trim
+    ------------------------------------------
+    The first hardware run (2026-09-02) died on window 0 with "target cache
+    would not trim to 16388", on a **full accept** where nothing needed
+    trimming.  ``_trim_cache_to_offset`` walks every cache entry and refuses
+    the whole cache if any one of them has no ``trim``, before it ever looks at
+    how much is being trimmed.  Flash-Next's ``make_cache`` builds a
+    ``QSACache`` per full-attention layer (trimmable) and an ``ArraysCache``
+    per linear layer -- the GDN recurrent state, which ``cache_state`` marks
+    untrimmable on purpose: "Attention KV caches can roll back by trimming
+    their offset. GDN recurrent caches cannot."  So an offset trim is not a
+    prefix commit on any hybrid model, and never was; it only ever worked
+    because nothing had run this on one.
+
+    ``generate_mtpk`` never trims that cache either.  It captures the
+    recurrence during the verify forward and rebuilds each recurrent leaf at
+    the kept row (``gdn_capture.commit_captured_prefix``), trimming the
+    trimmable entries in the same pass, with rollback + re-forward as the
+    fallback.  ``advance`` now does exactly that, and asserts the resulting
+    offset rather than assuming it.
 
     Not verified on hardware
     ------------------------
-    This function was written without a GPU, and the piece most likely to need
-    adjustment on its first run is the MTP-history restage in ``advance``:
-    production does it through ``generate_mtpk``'s nested
+    The piece most likely to need adjustment next is the MTP-history restage in
+    ``advance``: production does it through ``generate_mtpk``'s nested
     ``reconcile_mtp_indexer_history`` (``generation.py:9650``), which keeps the
     QSA indexer's raw and pooled frontiers in lockstep with the rollback.  What
     is here is the same intent expressed through the public
@@ -703,12 +982,13 @@ def build_replay_hooks(
 
     import mlx.core as mx
 
+    from mtplx.cache_state import rollback_after_verify, snapshot_untrimmable_cache
+    from mtplx.gdn_capture import commit_captured_prefix, resolve_gdn_capture_backend
     from mtplx.generation import (
         _distribution_from_mlx_logits,
         _mtp_cache_offset,
         _mtp_position_offset,
         _rollback_mtp_cache,
-        _trim_cache_to_offset,
     )
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
@@ -720,6 +1000,12 @@ def build_replay_hooks(
     # The stock run's draft-side RoPE policy, read from the same env keys
     # `generate_mtpk` reads. "default" returns None, which is what the shipped
     # lane passes and what leaves the offset with the KV cache.
+    # The GDN capture backend, from the same env key `generate_mtpk` reads
+    # (`MTPLX_CAPTURE_CUSTOM_KERNEL`); unset resolves to "stock", which is the
+    # capture path every hybrid family supports.  A uniform full-attention
+    # model has no recurrent state and `forward_ar_capture` degrades to the
+    # plain forward with empty captures, so this is family-generic.
+    capture_backend = resolve_gdn_capture_backend(None)
     position_mode = os.environ.get("MTPLX_MTP_POSITION_MODE", "default")
     position_cap = int(os.environ.get("MTPLX_MTP_POSITION_CAP", "0") or 0)
     position_period = int(os.environ.get("MTPLX_MTP_POSITION_PERIOD", "0") or 0)
@@ -810,23 +1096,63 @@ def build_replay_hooks(
             return rows
 
         def advance(self, *, window: Mapping[str, Any]) -> None:
-            fed = [int(window["primary"]), *window["draft_tokens"]]
-            _logits, hidden = runtime.forward_ar(
-                mx.array([fed]), cache=self.cache, return_hidden=True
+            for step in commit_steps(
+                window, offset=self.committed, primary=int(self.primary)
+            ):
+                self._commit_step(step, index=int(window["index"]))
+
+        def _commit_step(self, step: CommitStep, *, index: int) -> None:
+            """One verify forward and its prefix commit, the way production does it.
+
+            NOT a trim.  ``_trim_cache_to_offset`` only commits a prefix on an
+            all-trimmable (KV-only) cache; a hybrid model's recurrent layers
+            hold state that cannot be trimmed at all, so on Flash-Next it
+            refuses even a no-op.  The prefix commit that works on both is the
+            one ``generate_mtpk`` uses: capture the recurrence during the
+            verify forward and rebuild each recurrent leaf at the kept row
+            (``commit_captured_prefix``), trimming the trimmable entries in the
+            same pass.  The pre-verify snapshot pays for the fallback, which is
+            the copy round's: roll the whole window back and re-forward the
+            kept prefix.
+            """
+
+            fed = list(step.fed)
+            before = snapshot_untrimmable_cache(self.cache)
+            _logits, hidden, captures = runtime.forward_ar_capture(
+                mx.array([fed]),
+                cache=self.cache,
+                return_hidden=True,
+                capture_backend=capture_backend,
             )
             mx.eval(hidden)
-            accepted = int(window["accepted"])
-            # Row `accepted` produced the emitted selection; rows 0..accepted-1
-            # produced the accepted drafts.
-            self.hidden = hidden[:, accepted : accepted + 1, :]
-            self.primary = int(window["selected_token"])
-            keep = accepted + 1  # primary plus the accepted drafts
-            self.committed += keep
-            if not _trim_cache_to_offset(self.cache, self.committed):
-                raise RuntimeError(
-                    f"target cache would not trim to {self.committed} after "
-                    f"window {window['index']}"
+            kept = fed[: step.keep]
+            if not commit_captured_prefix(
+                self.cache,
+                captures,
+                keep_tokens=step.keep,
+                verified_tokens=len(fed),
+            ):
+                # Same fallback the context-copy round takes when its capture
+                # commit refuses: undo the whole verify window and re-forward
+                # the committed prefix.  `hidden` is still the authoritative
+                # target hidden for those rows -- it was evaluated above, and
+                # the re-forward recomputes the same rows.
+                rollback_after_verify(self.cache, before, verified_tokens=len(fed))
+                _repair_logits, repair_hidden = runtime.forward_ar(
+                    mx.array([kept]), cache=self.cache, return_hidden=True
                 )
+                mx.eval(repair_hidden)
+            offsets = trimmable_offsets(self.cache)
+            if any(offset != step.offset for offset in offsets):
+                raise RuntimeError(
+                    f"after the {step.kind} step of window {index} the target "
+                    f"cache sits at {sorted(set(offsets))}, not {step.offset}; "
+                    f"the prefix commit did not land "
+                    f"(untrimmable entries: {untrimmable_entries(self.cache)})"
+                )
+            self.hidden = hidden[:, step.hidden_row : step.hidden_row + 1, :]
+            self.primary = step.primary
+            self.committed = step.offset
             # Restage the MTP history over exactly the committed tokens, from
             # authoritative target hidden. Production does this through
             # `reconcile_mtp_indexer_history` (generation.py:9650); this is the
@@ -834,8 +1160,8 @@ def build_replay_hooks(
             # proves it right.
             _rollback_mtp_cache(self.mtp_cache, 0)
             runtime.update_mtp_cache(
-                hidden[:, :keep, :],
-                mx.array([fed[:keep]]),
+                hidden[:, : step.keep, :],
+                mx.array([kept]),
                 mtp_cache=self.mtp_cache,
                 mtp_hidden_variant=mtp_hidden_variant,
                 position_offset=_position_offset(self.mtp_cache),
@@ -1635,7 +1961,15 @@ def _production_prompt(runtime: Any) -> list[int]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     log = load_log(args.npz)
-    segments = segment_windows(log)
+    try:
+        segments = segment_windows(log)
+    except TrajectoryGapError as error:
+        print(
+            f"FAIL: {args.npz} does not hold the whole committed stream. "
+            f"{error}",
+            file=sys.stderr,
+        )
+        return 1
     if args.expect_segments is not None and len(segments) != args.expect_segments:
         print(
             f"FAIL: reconstructed {len(segments)} request segments from "

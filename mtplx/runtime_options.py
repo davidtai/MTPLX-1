@@ -126,6 +126,103 @@ def fable_opdiet_enabled(item: str | None = None) -> bool:
     return item in _FABLE_OPDIET_SELECTED
 
 
+#: W70 -- fused glue inside the compiled fixed-M4 verify body.
+#:
+#: One flag, per-item selection, same shape as ``MTPLX_FABLE_OPDIET``: a
+#: result must be attributable to ONE rewrite, because "fewer dispatches" and
+#: "faster" are different claims (the op diet's first ``bank`` spelling issued
+#: the fewest dispatches of three and was the slowest of three).
+#:
+#: ``qsa_rope``      the attention query/key rotation of a QSA layer -- the
+#:                   RoPE table build plus two 5-dispatch rotations -- as ONE
+#:                   ``mtplx/kernels/qwen4_m4_rope`` dispatch per layer.
+#: ``qsa_rope_idx``  the indexer's query preparation (RMSNorm + partial RoPE)
+#:                   through the SHIPPED ``qsa_indexer_prepare_queries_metal``,
+#:                   which the fixed-M4 lane never called because
+#:                   ``_prepare_queries`` gates on MTPLX_QSA_FUSED_INDEXER.
+#:
+#: Read ONCE at import, same reasoning as the flags above: the hot path must
+#: not touch ``os.environ``, and two traces of the same compiled verify graph
+#: must not disagree about which chain they contain.  Off by default.
+#:
+#: NOT AN ITEM, and the reason is structural rather than a matter of effort:
+#: ``hc_triple`` (W69 §4, 194 nodes).  ``hc_norm -> hc_down -> hc_up`` cannot
+#: become one dispatch.  ``hc_down`` produces ``mixv[R, 320]`` across 81
+#: cooperating threadgroups and every one of ``hc_up``'s 320 threadgroups
+#: reads the WHOLE vector; ``hc_norm``'s ``normed[R, 10240]`` is likewise read
+#: in full by every ``hc_down`` threadgroup.  Those are grid-wide
+#: read-after-write edges, and Metal has no grid-wide barrier inside a
+#: dispatch.  The single-threadgroup spelling that would avoid them is the one
+#: ``kernels/qwen4_m4_hyper_read`` already measured at 13.2 tok/s against 67.8.
+FABLE_VERIFY_GLUE_ITEMS = ("qsa_rope", "qsa_rope_idx")
+
+_FABLE_VERIFY_GLUE = env_bool("MTPLX_FABLE_VERIFY_GLUE", default=False)
+
+
+def parse_verify_glue_items(
+    raw: str | None,
+    *,
+    known: tuple[str, ...] = FABLE_VERIFY_GLUE_ITEMS,
+) -> frozenset[str]:
+    """Parse ``MTPLX_FABLE_VERIFY_GLUE_ITEMS``; unset/empty selects everything.
+
+    An unknown name raises rather than being dropped: a typo that silently
+    disabled the item under test would make the arm measure the control twice.
+    """
+
+    if raw is None:
+        return frozenset(known)
+    tokens = {token.strip().lower() for token in str(raw).split(",")}
+    tokens.discard("")
+    if not tokens:
+        return frozenset(known)
+    if tokens == {"all"}:
+        return frozenset(known)
+    unknown = sorted(tokens - set(known))
+    if unknown:
+        raise ValueError(
+            f"MTPLX_FABLE_VERIFY_GLUE_ITEMS={raw!r} has unknown item(s) "
+            f"{', '.join(unknown)}; expected a comma list from: "
+            f"{', '.join(known)}"
+        )
+    return frozenset(tokens)
+
+
+_FABLE_VERIFY_GLUE_SELECTED = parse_verify_glue_items(
+    os.environ.get("MTPLX_FABLE_VERIFY_GLUE_ITEMS")
+)
+
+
+def fable_verify_glue_enabled(item: str | None = None) -> bool:
+    """True when the verify-glue flag is armed, and this item is selected."""
+
+    if not _FABLE_VERIFY_GLUE:
+        return False
+    if item is None:
+        return True
+    if item not in FABLE_VERIFY_GLUE_ITEMS:
+        raise ValueError(f"unknown verify-glue item {item!r}")
+    return item in _FABLE_VERIFY_GLUE_SELECTED
+
+
+def reset_fable_verify_glue_cache(env: Mapping[str, str] | None = None) -> None:
+    """Re-read the verify-glue gates from the environment.  Tests only.
+
+    The hot path reads these once at import on purpose; this exists so a test
+    can arm one item without a subprocess, and it is never called by the
+    runtime.
+    """
+
+    global _FABLE_VERIFY_GLUE, _FABLE_VERIFY_GLUE_SELECTED
+    source = os.environ if env is None else env
+    _FABLE_VERIFY_GLUE = env_bool(
+        "MTPLX_FABLE_VERIFY_GLUE", default=False, env=source
+    )
+    _FABLE_VERIFY_GLUE_SELECTED = parse_verify_glue_items(
+        source.get("MTPLX_FABLE_VERIFY_GLUE_ITEMS")
+    )
+
+
 #: Verify-width fused hyper-connection read (mtplx/kernels/qwen4_m4_hyper_read).
 #:
 #: Read ONCE at import, same reasoning as ``MTPLX_FABLE_OPDIET``: the hot path
@@ -196,6 +293,144 @@ def fable_qsa_m4_kt_enabled() -> bool:
     """True when ``MTPLX_FABLE_QSA_M4_KT`` armed this process at import."""
 
     return _FABLE_QSA_M4_KT
+
+
+#: Split-K (KV-split) native sparse-GQA attention for the DECODE geometries
+#: (native_extensions/qsa_sparse_gqa, mtplx/kernels/qsa_sparse_decode.py).
+#:
+#: TWO flags, deliberately, because the two geometries are independently
+#: gated and have very different expected value:
+#:
+#:   MTPLX_FABLE_QSA_SPARSE_DECODE  -- the M=4 fixed verify, all 12 QSA
+#:       layers, once per verify cycle.  This is where the bytes are: the
+#:       shipped lane materialises a [1, 2, 4, 2052, 256] gathered K/V pair
+#:       per layer (16.8 MB written, then re-read by the score and P@V
+#:       GEMMs), plus MLX's own 8.4 MB contiguous copy of the transposed key
+#:       view.  The kernel reads the cache rows once and never writes them.
+#:
+#:   MTPLX_FABLE_QSA_SPARSE_DRAFT   -- the M=1 single-row path.  Today's
+#:       retained-stack dispatch census shows ZERO QSA attention dispatches
+#:       at M=1: the draft chain runs the MTP block, not the twelve QSA
+#:       layers (the census's once-per-cycle counts are exactly 36 GDN and
+#:       48 MoE layers, i.e. the full stack runs once per cycle, at M=4).
+#:       So this flag exists for the non-speculative decode path and for a
+#:       future draft that runs the full stack; it is NOT expected to move
+#:       the 16K speculative ABBA, and claiming otherwise from a microbench
+#:       would repeat W16 (an isolated -1.9 ms that was 0 end-to-end).
+#:
+#: Both off by default.  Both RAISE on a contract failure rather than
+#: silently reverting -- a silently inert flag is how MTPLX_FUSED_HC_V3 came
+#: to be armed-but-dead at M=4.  The one thing that does NOT raise is a
+#: PARITY failure at install: this kernel is rounding-class, so a parity
+#: miss is a numerical verdict, and the lane disables itself for the process
+#: and reports the measured deltas.
+_FABLE_QSA_SPARSE_DECODE = env_bool("MTPLX_FABLE_QSA_SPARSE_DECODE", default=False)
+_FABLE_QSA_SPARSE_DRAFT = env_bool("MTPLX_FABLE_QSA_SPARSE_DRAFT", default=False)
+
+
+def fable_qsa_sparse_decode_enabled() -> bool:
+    """True when ``MTPLX_FABLE_QSA_SPARSE_DECODE`` armed this process."""
+
+    return _FABLE_QSA_SPARSE_DECODE
+
+
+def fable_qsa_sparse_draft_enabled() -> bool:
+    """True when ``MTPLX_FABLE_QSA_SPARSE_DRAFT`` armed this process."""
+
+    return _FABLE_QSA_SPARSE_DRAFT
+
+
+def _parse_sparse_decode_tile(raw: str | None) -> tuple[int, int]:
+    """``"BK:DC"`` -> the compiled tile pair; unset means the default."""
+
+    if raw is None or not str(raw).strip():
+        return (128, 32)
+    token = str(raw).strip()
+    parts = token.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        )
+    try:
+        tile = (int(parts[0]), int(parts[1]))
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        ) from exc
+    if tile not in FABLE_QSA_SPARSE_DECODE_TILES:
+        accepted = ", ".join(f"{a}:{b}" for a, b in FABLE_QSA_SPARSE_DECODE_TILES)
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_TILE={raw!r} is not instantiated; "
+            f"expected one of: {accepted}"
+        )
+    return tile
+
+
+#: The (BK, DC) pairs the metallib instantiates.  Anything else raises rather
+#: than falling back, so a typo in a sweep cannot quietly measure the default.
+FABLE_QSA_SPARSE_DECODE_TILES = ((128, 32), (256, 32), (64, 64), (128, 64))
+FABLE_QSA_SPARSE_DECODE_MAX_SPLITS = 64
+
+_FABLE_QSA_SPARSE_DECODE_TILE = _parse_sparse_decode_tile(
+    os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_TILE")
+)
+
+
+#: MEASURED default (2026-09-02, guarded micro, M=4, 16K, 12 layers).  The
+#: kernel is occupancy-bound, and at the shipped tile (BK=128) there are 17
+#: BK-tiles over the 2,051 selected keys, so 17 is the smallest split target
+#: that reaches one tile per threadgroup -- a 4 x 2 x 17 = 136-threadgroup
+#: grid on a 40-core M5 Max.  Everything below it leaves cores idle:
+#:
+#:     splits   n_splits   threadgroups   ms/layer   x baseline
+#:          4          4             32      0.325         0.70
+#:          8          6             48      0.210         1.08
+#:         16          9             72      0.149         1.52
+#:         17         17            136      0.094-0.099   2.3-2.4
+#:
+#: Larger values clamp to the same 17 at BK=128, so 17 is also the point past
+#: which the knob stops doing anything -- which is why the first sweep's s17
+#: and s32 rows are the SAME configuration measured twice, and their 5.3%
+#: spread is the bench's noise floor rather than a result.
+#:
+#: The previous default of 8 was a placeholder, and it measured 2.2x slower.
+FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS = 17
+
+
+def _parse_sparse_decode_splits(raw: str | None) -> int:
+    """``MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS`` -- the KV-split target."""
+
+    if raw is None or not str(raw).strip():
+        return FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS={raw!r} must be an integer"
+        ) from exc
+    if not 1 <= value <= FABLE_QSA_SPARSE_DECODE_MAX_SPLITS:
+        raise ValueError(
+            f"MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS={raw!r} must be in "
+            f"[1, {FABLE_QSA_SPARSE_DECODE_MAX_SPLITS}]"
+        )
+    return value
+
+
+_FABLE_QSA_SPARSE_DECODE_SPLITS = _parse_sparse_decode_splits(
+    os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS")
+)
+
+
+def fable_qsa_sparse_decode_tile() -> tuple[int, int]:
+    """The armed ``(key_tile, dimension_tile)`` for the decode kernel."""
+
+    return _FABLE_QSA_SPARSE_DECODE_TILE
+
+
+def fable_qsa_sparse_decode_splits() -> int:
+    """The armed KV-split target for the decode kernel."""
+
+    return _FABLE_QSA_SPARSE_DECODE_SPLITS
 
 
 @dataclass(frozen=True)

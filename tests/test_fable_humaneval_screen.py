@@ -474,5 +474,173 @@ class DryRun(unittest.TestCase):
         self.assertNotIn("8080", out)
 
 
+class WarmupReadiness(unittest.TestCase):
+    """/health's background warm-up block, read honestly (W57)."""
+
+    HEALTHY = {
+        "warmup": {
+            "background": {
+                "state": "done",
+                "steps": [
+                    {"kind": "gqa_packed_pipelines", "state": "ok"},
+                    {"kind": "ladder", "context": 512, "state": "ok"},
+                ],
+                "failed_steps": [],
+                "first_error": None,
+            }
+        }
+    }
+    #: The 2026-09-01 branch server: both ladder rungs refused by the
+    #: prefill chunk coherence guard.
+    DEGRADED = {
+        "warmup": {
+            "background": {
+                "state": "degraded",
+                "steps": [
+                    {"kind": "gqa_packed_pipelines", "state": "ok"},
+                    {
+                        "kind": "ladder",
+                        "context": 512,
+                        "state": "failed",
+                        "error": (
+                            "PrefillChunkGeometryError: prefill chunk width "
+                            "256 does not match "
+                            "MTPLX_QSA_PREFILL_COMPILE_ROWS=4096"
+                        ),
+                    },
+                ],
+                "failed_steps": [
+                    {
+                        "index": 1,
+                        "kind": "ladder",
+                        "context": 512,
+                        "error": "PrefillChunkGeometryError: ...",
+                    }
+                ],
+                "first_error": "PrefillChunkGeometryError: ...",
+            }
+        }
+    }
+
+    def test_healthy_health_is_not_degraded(self):
+        report = screen.warmup_background_report(self.HEALTHY)
+        self.assertTrue(report["present"])
+        self.assertEqual(report["state"], "done")
+        self.assertFalse(report["degraded"])
+        self.assertEqual(report["failed_steps"], [])
+
+    def test_failed_step_yields_degraded(self):
+        report = screen.warmup_background_report(self.DEGRADED)
+        self.assertTrue(report["degraded"])
+        self.assertEqual(report["state"], "degraded")
+        self.assertEqual(len(report["failed_steps"]), 1)
+        self.assertIn("PrefillChunkGeometryError", report["first_error"])
+
+    def test_old_server_reporting_done_over_failed_children_is_caught(self):
+        """A build without the honest aggregate must not slip through."""
+
+        health = {
+            "warmup": {
+                "background": {
+                    "state": "done",
+                    "steps": [
+                        {"kind": "ladder", "state": "failed", "error": "boom"}
+                    ],
+                }
+            }
+        }
+        report = screen.warmup_background_report(health)
+        self.assertTrue(report["degraded"])
+        self.assertEqual(report["first_error"], "boom")
+
+    def test_missing_block_is_absent_not_degraded(self):
+        report = screen.warmup_background_report({"ok": True})
+        self.assertFalse(report["present"])
+        self.assertFalse(report["degraded"])
+        self.assertIsNone(report["state"])
+
+    def test_wait_short_circuits_and_warns_on_a_degraded_plan(self):
+        """The wait must not spin to its timeout on an honest 'degraded'.
+
+        ``run_guarded.wait_for_background_warmup`` returns only on "done";
+        the shim raises out of the fetch as soon as a poll shows a broken
+        plan, so the screen warns and keeps going.
+        """
+
+        polls = []
+
+        def fetch(url):
+            polls.append(url)
+            return self.DEGRADED
+
+        health, receipt = screen.wait_for_background_warmup_reporting(
+            "http://127.0.0.1:8091",
+            timeout=900.0,
+            fetch=fetch,
+            label="humaneval-screen",
+        )
+        # One poll, no guarded-runner load, no 900 s spin.
+        self.assertEqual(len(polls), 1)
+        self.assertEqual(health, self.DEGRADED)
+        self.assertTrue(receipt["degraded"])
+        self.assertEqual(receipt["state"], "degraded")
+        self.assertTrue(receipt["waited"])
+        self.assertIn("PrefillChunkGeometryError", receipt["first_error"])
+
+    def test_hard_plan_failure_is_not_a_mere_warning(self):
+        """A whole-plan abort still raises out of the guarded runner."""
+
+        health = {"warmup": {"background": {"state": "failed", "steps": []}}}
+        report = screen.warmup_background_report(health)
+        self.assertTrue(report["hard_failure"])
+        if not screen.RUN_GUARDED.exists():
+            self.skipTest("guarded runner not on this box")
+        with self.assertRaises(RuntimeError):
+            screen.wait_for_background_warmup_reporting(
+                "http://127.0.0.1:8091",
+                timeout=30.0,
+                fetch=lambda url: health,
+                label="humaneval-screen",
+            )
+
+    @unittest.skipUnless(
+        screen.RUN_GUARDED.exists(), "guarded runner not on this box"
+    )
+    def test_wait_returns_the_healthy_receipt_unchanged(self):
+        health = dict(self.HEALTHY)
+        health["active_requests"] = 0
+        _, receipt = screen.wait_for_background_warmup_reporting(
+            "http://127.0.0.1:8091",
+            timeout=30.0,
+            fetch=lambda url: health,
+            label="humaneval-screen",
+        )
+        self.assertEqual(
+            receipt,
+            {
+                "waited": True,
+                "state": "done",
+                "degraded": False,
+                "failed_steps": [],
+                "first_error": None,
+            },
+        )
+
+    def test_degraded_report_keys_are_stable(self):
+        for health in (self.HEALTHY, self.DEGRADED, {"ok": True}):
+            report = screen.warmup_background_report(health)
+            self.assertEqual(
+                set(report),
+                {
+                    "present",
+                    "state",
+                    "degraded",
+                    "hard_failure",
+                    "failed_steps",
+                    "first_error",
+                },
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

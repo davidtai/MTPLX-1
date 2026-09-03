@@ -8,6 +8,7 @@ prompt, 1,024 output tokens, temperature 1 / top-p 0.95 / top-k 20, reasoning
 | --- | --- |
 | `abba_driver.py` | One arm. Loads the model once, runs the requested seeds, writes a receipt JSON. |
 | `abba_window.py` | The bracket. Runs as the guard's direct child and spawns one `abba_driver.py` per arm. |
+| `micro_shared_lane.py` | Prices the M4 shared expert and the `MTPLX_FABLE_SHARED_LANE` second-stream lane. Falsifier for program row 9. |
 | `humaneval_screen.py` | The quality gate. One guarded window = one server on :8091 + full HumanEval pass@1 + a receipt. |
 
 Ported from the reviewed PR391 driver `/private/tmp/pr391_fixed_d3_abba.py`
@@ -391,6 +392,52 @@ Pair it with `--candidate-extra-env MTPLX_CONTEXT_COPY_PROBATION_K=16` to let
 proven lanes reach the wider cap sooner; run six seeds, because the effect sits
 near the corrected metric's 0.3-0.7% noise floor.
 
+### Recipe: fuse the dense QSA prefill attention
+
+```
+    --candidate-extra-env MTPLX_FABLE_PREFILL_MASK_FUSE=1 \
+    --candidate-env MTPLX_QSA_PREFILL_DEBUG=1
+```
+
+At `head_dim` 256 MLX's own heuristic declines the fused `steel_attention`
+kernel, so every dense QSA prefill layer materializes an `[H, S, T]` bf16
+score tensor, masks it, softmaxes it twice and re-reads it for `P@V`. The
+flag passes `force_fused=True` instead. Two arms, one flag, both counted by
+`MTPLX_QSA_PREFILL_DEBUG=1`:
+
+* `mask_fuse_causal` — the indexer returned **no** selection, which happens
+  exactly when the chunk's post-update context is inside the block budget
+  (`T <= (block_topk + 1) * ratio - 1` = **2,051** tokens on the production
+  pack) or on a vision request. The visible set is then exactly causal, so
+  the lane passes MLX the string `"causal"` (documented lower-right aligned:
+  the last query is the last key, which is precisely the chunked-prefill
+  offset case) and builds no tensor at all.
+* `mask_fuse_bool` — a real top-k selection, handed to the fused kernel as
+  the bool array it already is.
+* `mask_fuse_unavailable` — the one-shot probe found no fused kernel for
+  this `(mask kind, head_dim, dtype)`; the arm says so on stderr and stays
+  on the dense route for the rest of the process instead of quietly
+  measuring the control under a candidate label.
+
+`mask_causal_eligible` counts the exactly-causal regime whether or not the
+flag is armed. **At the retained prefill width (4,096) it is zero at 16K and
+at 32K** — no chunk's context is under 2,051 — so at those cells the flag's
+whole effect is `mask_fuse_bool`, and `mask_fuse_causal` is expected to read
+0. It is chunk 0 and only chunk 0 at the shipped 2,048 width.
+
+Neither arm is bit-identical: the fused kernel runs an fp32 online softmax
+over the same visible set, so this is the rounding class the long-prompt
+agreement screen gates, not an approximation.
+
+The sparse-QSA crossover is a documented knob and is **not** touched by any
+of this: `MTPLX_QSA_PREFILL_MIN_CONTEXT` (default 32,768, floor 2,049,
+compared against `total_tokens - rows`) and
+`MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT` are both in
+`MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, i.e. reachable from `--candidate-env`.
+At 16K and at 32K the gate is unreachable at any chunk width (its maximum
+`total_tokens - rows` is 30,720 at 32K), which is why both cells are wholly
+dense and why the mask-fuse arm applies to every chunk of them.
+
 `--candidate-env` keys must be members of
 `mtplx.profiles.MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, or `apply_profile_env`
 refuses the arm with `runtime_env_overrides has unsupported key: <KEY>`. That
@@ -555,6 +602,172 @@ bank through all 12 updates so `mx.slice_update` can donate its input, which
 the real graph — where the verifier bank holds every pooled leaf — cannot do.
 It exists only to show how much of the stock spelling's cost is that copy.
 
+## Verify glue: `MTPLX_FABLE_VERIFY_GLUE` (W70)
+
+W69's node census (`docs/perf/verify-node-census.md`) counted the compiled
+fixed-M4 verify body at ~2,750 dispatch nodes per decode cycle, half of them
+inside the twelve QSA layers and most of those pure glue. This flag fuses that
+glue, one selectable item at a time. Off by default; per-item selection, same
+shape as `MTPLX_FABLE_OPDIET`.
+
+| item | what it replaces | exactness |
+| --- | --- | --- |
+| `qsa_rope` | the attention query+key rotation: the RoPE table build plus two five-dispatch rotations -- 16 dispatches over 7 read-after-write levels per QSA layer | bit-exact, proved at install against the live stock spelling |
+| `qsa_rope_idx` | the indexer's query preparation (RMSNorm + partial RoPE) -- 12 dispatches over 8 levels per QSA layer -- through the SHIPPED `qsa_indexer_prepare_queries_metal` that the fixed-M4 lane never called | bit-exact, pinned in `tests/test_qsa_indexer_prepare_metal.py` |
+
+`hc_triple` -- W69's second-ranked group -- is deliberately **not** an item.
+`hc_norm -> hc_down -> hc_up` cannot become one dispatch: `hc_down` produces
+`mixv[R,320]` across 81 cooperating threadgroups and every one of `hc_up`'s 320
+threadgroups reads the whole vector, and `hc_norm`'s `normed[R,10240]` is
+likewise read in full by every `hc_down` threadgroup. Those are grid-wide
+read-after-write edges and Metal has no grid-wide barrier inside a dispatch.
+The one-threadgroup spelling that would avoid them is the one
+`kernels/qwen4_m4_hyper_read.py` already measured at 13.2 tok/s against 67.8.
+
+### What the levels buy, and the census correction this makes
+
+The critical-path model charges **1.83 us per DEPENDENT GPU launch removed**
+and nothing for a sibling launch, which the concurrent encoder already
+overlaps -- so the multiplier is the number of read-after-write **levels**
+removed, not the number of dispatches. W69's table priced `qsa_rope` with
+`dep = 204` of 240 removed dispatches, i.e. it treated most of the group as
+dependent. Reading the actual chain says otherwise: the stock rotation is
+~7 levels deep with WIDE sibling fans (cos and sin are siblings; the four
+half multiply-adds are siblings; the six concatenate copies are siblings).
+
+| | dispatches/cycle | of which dependent (levels) | of which sibling | G | H | total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `qsa_rope` | 180 | 72 | 108 | 0.132 | 0.068 | **0.200 ms** |
+| `qsa_rope_idx` | 132 | 84 | 48 | 0.154 | 0.050 | **0.204 ms** |
+| both | 312 | 156 | 156 | 0.286 | 0.118 | **0.404 ms** |
+
+At the route kernel's measured 1.45x over-conversion that is up to 0.59 ms,
+i.e. **+0.7 to +1.0 tok/s**. W69's 0.464 ms for the whole group landed in the
+same region for a different reason: it counted the pooled-bank rope site
+(which stays with `MTPLX_FABLE_QSA_M4`'s `bank` item) and over-counted the
+dependent share.
+
+### The gate
+
+Modelled on the route kernel and the sparse-decode lane. Contract failures
+(geometry, dtype, rotary width, a missing head norm) **raise** -- an armed flag
+on a pack the kernel is not wired for means the arm measured a different model.
+Exactness failures **disable the item and log**: rope rounding is a numerical
+verdict, not a broken contract. An item that is armed but whose probe never ran
+also raises, so a receipt can never claim a win from an inert flag. The probe
+runs inside `install_qwen4_fixed_verify_route` -- model build, outside any
+`mx.compile` trace. `mtplx.fable_verify_glue.engagement()` carries the
+counters; `qk_calls` / `prep_calls` are the line to read first.
+
+### Proving the arm ran
+
+The 2026-09-02 W70 ABBA came back with the flag armed and **no evidence either
+way**: no engagement line, no contract error, no counters. The cause was not
+the lane -- it was that `logger.info` is invisible in a driver run.
+`[qwen4-fixed-M4-verify]` and `[qwen4-compiled-MTP-prepare]` are missing from
+that same log for the same reason, while
+`[MTPLX_FABLE_GRAPH_BUILD_OVERLAP] armed:` (a plain `print`) is there.
+
+So the lane now proves itself three ways, and the driver refuses to report an
+arm that cannot:
+
+1. **stderr, at install.** One line per item plus a JSON summary:
+
+   ```
+   [fable] verify-glue qsa_rope: on, layers=12, dispatches/layer 16->1, ...
+   [fable] verify-glue qsa_rope_idx: on, layers=12, dispatches/layer 12->1, ...
+   [fable] verify-glue install: {"installed": ["qsa_rope", ...], "layers": 12, ...}
+   ```
+
+   An item that disabled itself prints `off (<reason>)` instead.
+
+2. **A construction-time assertion**, before the decode run, so a broken arm
+   dies in seconds rather than after a full window.
+
+3. **A `verify_glue` block on the receipt row**, re-read *after* the run so
+   the hot-path call counters are populated: `selected`, `installed`,
+   `disabled` (with reasons), `pending`, `layers`, `rows`, `calls`
+   (`qk_calls` / `k_only_calls` / `prep_calls`), `probe_runs`,
+   `probe_failures`, `install_report`.
+
+Every way of failing to engage is fatal to the arm: the install hook never ran
+(inert flag), every selected item disabled (a real finding, not a benchmark),
+or an installed item with **zero calls** (it never entered the graph). The
+receipt-time check is deliberately lenient so the block still lands on disk,
+and the driver raises immediately after writing it -- the evidence for why an
+arm was unreadable is more useful on disk than in a traceback alone.
+
+Read `calls` first. `qk_calls` and `prep_calls` count TRACES, not decode
+cycles (under `mx.compile` the Python body runs once per retrace and the C++
+replay never touches it), so read them as "did this lane get into the graph",
+never as a cycle count.
+
+### micro_verify_glue_a.py
+
+Price the items before spending an ABBA window. One verify cycle's worth of
+each arm, built then evaluated ONCE (the queued lane -- a per-kernel eager lane
+costs more host sync than these kernels cost GPU and has inverted a verdict
+before), in both the eager and the compiled lane. **The compiled lane decides**:
+the production verify body is one `mx.compile`'d graph, and it is also the only
+lane that answers the FMA-contraction question, because MLX's own fused
+multiply-add kernel is compiled by the same Metal front end. `differing` must
+be 0 there.
+
+Arms: `rope_prediet` (op diet off), `rope_stock` (today's stack, the reference),
+`rope_scoped` (`rope_stock` inside `_rope_table_scope()` -- not an item, it
+prices the finding that the op diet's table memo is inert on the fixed-M4
+verify route, which never enters the scope), `rope_fused`; plus `prep_stock`
+and `prep_fused`.
+
+~1 minute of GPU. Still a guarded window: it issues Metal work.
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a/scripts/fable/micro_verify_glue_a.py \
+    --layers 12 \
+    --out /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-verify-glue-a.json
+```
+
+`--layers 48` amplifies the same per-layer work four-fold when 12 layers land
+inside the A/A noise floor; it is not a production count.
+
+### The ABBA
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 36000 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w70-verify-glue-a/scripts/fable/abba_window.py \
+    --sequence 1788400901 \
+    --order ABBA \
+    --label-prefix fable-w70-verify-glue-a \
+    --python /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+    --control-flag=--prewarm-ngram-table \
+    --candidate-extra-env MTPLX_FABLE_VERIFY_GLUE=1 \
+    --candidate-extra-env MTPLX_FABLE_VERIFY_GLUE_ITEMS=qsa_rope
+```
+
+The queue adds the stack flags (`MTPLX_FABLE_BLOCK_VERIFY`,
+`MTPLX_FABLE_DRAFT_K20_PRESCATTER`, `MTPLX_FABLE_GRAPH_BUILD_OVERLAP`(+`_LAYERS`),
+`MTPLX_FABLE_HC_M4`, `MTPLX_FABLE_OPDIET`, `MTPLX_FABLE_ROUTE_KERNEL`) as
+`--control-extra-env` on BOTH arms from its stack file, so the candidate is the
+stack plus one item. Swap the item for `qsa_rope_idx`, or drop
+`MTPLX_FABLE_VERIFY_GLUE_ITEMS` entirely to measure both at once -- but a
+combined arm cannot attribute a win, which is the whole reason the items are
+separately selectable.
+
 ## PYTHONPATH
 
 Always export
@@ -658,6 +871,110 @@ paired routed-GLU lane's head and refuses to install without it). Because the
 tuple is bit-exact there is no quality screen: acceptance and the digest are
 unchanged by construction, and `install_qwen4_m4_stage3` proves that per layer
 on the real packs before the first token.
+
+### micro_shared_lane.py
+
+Prices the physical-M4 **shared expert** and the second-stream lane that hides
+it (`MTPLX_FABLE_SHARED_LANE=1`).
+
+Read the premise correction first, because it changes the size of the prize.
+The retained-stack census reports `MoE shared` at 251.7 MB/cycle and
+**135-203 GB/s**, and that rate is *not a measurement*: the instrumented MLX
+build times command buffers, not kernels, so `census_retained_stack.py` fits
+four global coefficients by NNLS and then splits each buffer's measured
+duration across its ops in proportion to their *modelled* cost. The GB/s column
+is therefore monotone in bytes-per-dispatch, not in memory efficiency -- and
+the control and composed censuses report this family with identical dispatch
+counts (144.0/cyc) and identical bytes (251.7 MB/cyc) but 203 vs 135 GB/s. The
+classifier also has no entry for the three retained custom MoE kernels
+(`paired_routed_glu`, `routed_down_reduce`, `routed_shared_residual_tail`), so
+their real time -- the routed-down reduce alone measures **79.1 us/layer** in
+the 18,333 three-op buffers that isolate it, i.e. 3.8 ms/cycle -- is booked as
+zero-byte `Norm/elementwise` and smeared over everything else in the buffer.
+
+The capture cannot bracket the shared branch either: exactly one buffer shape
+in the whole census isolates any of it (381 occurrences, 1.0/cycle, 139.62 us
+median) and it holds the shared **down** matvec *and* the paired routed GLU,
+whose own byte-driven spread (p10 115.88, p90 158.12) is wider than the matvec
+being solved for. The shared down projection is somewhere in **0-35 us/layer**
+and nothing on disk narrows it. That is what this micro is for.
+
+Arms: `shared_gu`, `shared_down`, `shared_branch` (the three-dispatch chain
+isolated), `routed` (paired GLU + routed-down reduce + residual tail with a
+resident constant `shared_down`, so no shared branch is in the graph at all),
+`stock` (routed + the branch on the default stream = today), `lane` (routed +
+the branch on a second `mx.gpu` stream).
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 --child-timeout-seconds 3600 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/micro_shared_lane.py \
+    --layers 48 --reps 200 \
+    --out /tmp/micro-shared-lane.json
+```
+
+`--plan` prints the byte/memory model and exits without importing MLX
+(resident footprint 1.82 GB: one 512-expert q4 bank plus 48 distinct shared
+packs).
+
+Read it as:
+
+* `stock - routed` = what the shared branch costs the window **today**. This is
+  the ceiling on anything program row 9 can win. The byte floor is
+  8.7 us/layer (0.418 ms/cycle at 600 GB/s); if the measured cost is within
+  about 2x of that, **close row 9** -- the census's 1.24-1.86 ms/cycle claim
+  was an apportionment artifact and there is nothing to take.
+* `lane - stock` = the number an ABBA window should reproduce, once per verify
+  cycle. MLX charges two cross-stream fences per layer (a `barrier()` plus a
+  one-thread `fence_update` on the producer, a spinning `fence_wait` on the
+  consumer -- `mlx/backend/metal/fence.cpp`), roughly four extra tiny
+  dispatches per layer, ~0.25 ms/cycle at this program's measured 1.83 us
+  dependent launch. The overlap has to beat that.
+
+Known bias: all 48 harness layers share ONE 512-expert routed bank (48
+distinct banks would be ~67 GB), so the routed kernels run warmer than
+production and the window the branch can hide inside is **smaller** here than
+in the model. A win is real; a loss is not conclusive on its own.
+
+Adoption bar: `parity.bit_exact` must be true -- the lane emits identical ops
+with identical arguments and only changes the stream they are recorded on, so
+any difference at all is a defect and the script exits non-zero. Then the
+verifier window:
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 5400 --child-timeout-seconds 9000 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/abba_window.py \
+    --sequence 16384:1024 \
+    --order ABBA \
+    --python /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+    --control-flag=--prewarm-ngram-table \
+    --candidate-extra-env MTPLX_FABLE_SHARED_LANE=1 \
+    --out-dir /Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/fable/w65-shared-lane
+```
+
+`MTPLX_QWEN4_M4_ROUTED_GLU=1` is already in `CONTROL_CANDIDATE_ENV`, so both
+arms are on the retained lane and the lane refuses to install without it.
+Because the branch is bit-exact by construction there is no quality screen:
+acceptance and the response digest are unchanged, and
+`install_qwen4_m4_stage3` proves it per layer on the real packs before the
+first token. That install gate covers the *eager* graph; equivalence inside
+the outer compiled verify graph rests on `mlx/compile.cpp::compile_fuse`
+refusing to fuse across streams (so the branch's one elementwise group cannot
+be regrouped) plus the window's response digest, which is the thing that would
+catch a future MLX relaxing that guard. The install report carries `shared_lane.armed` and
+`shared_lane.installed` separately, so a flat A/B can still be told apart from
+a lane that never engaged.
 
 ## HumanEval quality screen (non-bit-exact kernels)
 
@@ -1601,6 +1918,135 @@ L's table used) and 1.4 ms (K's fit for a *compiled* fixed-width row) — becaus
 neither is measured on an M=5 graph, and deciding whether to build one is the
 entire point.
 
+## micro_qsa_sparse_gqa.py — the native direct-index sparse-GQA kernel (B3)
+
+Standalone parity + timing for `mtplx.native.qsa_sparse_gqa`, MTPLX's port of
+oMLX's Steel-MMA `qwen4_qsa_sparse_gqa` (Jonathan Spangler, jundot/omlx
+`7467dce8`, Apache-2.0). Nothing in the model calls the kernel yet; this is the
+phase-1 falsifier from `scratchpad/M-holistic-tps-program.md` §B3, and the same
+kernel at M=4 / M=1 is K-Q2 / K-D6, so those cells are in the sweep too.
+
+Cells: `prefill-{16k,32k,64k}` at 4,096 rows, `decode-m4-16k`, `decode-m1-16k`.
+Arms, all fed one selection: the ported kernel per `(BK, DC)` tile, the shipped
+NAX `qsa_prefill_flash`, the portable `_qsa_prefill_gather_attention`, and the
+dense lane (`_qsa_blocks_to_dense_mask` + `_qsa_dense_attention`), which is
+also the numerics reference.
+
+Selection is the production `QSAIndexer._select_eager`, imported, not copied.
+The kernel derives per-slot validity in-kernel instead of reading `block_valid`,
+so the bench **asserts** the selector invariant that makes those identical
+(ascending ids, prefix validity, count `min(512, (pos+1)//4)`) on every row, and
+materialises both token lists in full on sampled rows, before it trusts a parity
+number. Tolerance is a stated bf16-ULP bar, not "looks close": this is a
+rounding-class change (fp32 online softmax vs bf16 scores + precise softmax).
+
+The extension has to be built first — CPU-only cmake, see
+`mtplx/native/__init__.py`. Phase-2 wiring plan:
+`docs/perf/qsa-sparse-gqa-phase2-wiring.md`.
+
+Guarded window (the default sweep is minutes of GPU, dominated by the dense arm;
+transient estimate per cell and refuses anything over `--max-transient-gb`):
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w50-qsa-sparse-gqa \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 \
+  --child-timeout-seconds 3600 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/w50-qsa-sparse-gqa/scripts/fable/micro_qsa_sparse_gqa.py \
+    --out /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-qsa-sparse-gqa.json
+```
+
+GO bar (the program note's own falsifier): parity inside the ULP bar on every
+cell, identity assertions clean, and >=3x faster than `qsa_prefill_flash` on the
+queued lane at 4,096 rows. Then, and only then, the 32K ABBA.
+
+### Tests
+
+`tests/test_qsa_sparse_gqa_native.py` — CPU-only. Covers the binding's
+shape/dtype/position contract (MLX arrays are built but never evaluated) and
+the harness's own scoring logic on numpy inputs, including the cases where the
+identity check must fail.
+
+---
+
+## Proving the sparse-decode arm ran (`MTPLX_FABLE_QSA_SPARSE_DECODE`)
+
+The 2026-09-02 W68 window armed the split-K lane on the fixed-M4 stack at 16 K
+and **measured the control**: control and candidate response texts were
+byte-identical on both finished seeds, for a kernel whose arithmetic is
+rounding class. Cycle times matched to 0.1 ms. Nothing in the run said so.
+
+The gate that declined was a routing predicate, not the install probe.
+`Indexer._call_rows` reaches `_select_m4` -- the only call site that asked the
+VERIFY question -- only when `MTPLX_FABLE_QSA_M4` is armed, and that is a
+*different* flag from the fixed-M4 verifier the window armed. A
+fixed-capacity S=4 verify therefore fell through to `_select_eager`, whose
+sparse-decode question was hard-coded `draft=True`; it read
+`fable_qsa_sparse_draft_rows` (0, the draft flag was not armed), returned
+False, and handed attention the rows-gather lane for 394 cycles.
+
+So the lane now proves itself the way W70's verify-glue items do, and every
+way of failing to engage is fatal to the arm:
+
+1. **stderr, at install.** `mtplx.kernels.qsa_sparse_decode` writes to stderr
+   as well as the logger (`logger.info` alone is invisible in a driver run):
+
+   ```
+   [fable] qsa_sparse_decode armed: rows=4 tile=128:32 splits=17 caches=12 \
+     probe cell='verify-4096' vs_fp32 ulps=0.750 rel_l2=1.200e-05 top1=1.0000 ...
+   [fable] qsa_sparse_decode install: {"armed": true, "installed": true, ...}
+   ```
+
+   A probe that failed prints `off (<reason>)` with the measured deltas.
+
+2. **Loud gates for configuration, routing for request shape.** An armed flag
+   that cannot bind raises where it cannot bind: `TensorOffsetQSACache.__init__`
+   raises when a construction site did not pass the lane through *or* when the
+   parity probe disabled it (read the deltas off the stderr line, then unarm
+   the flag deliberately); `_sparse_decode_route` raises on a wrong ratio,
+   top-k or wired row count; and `Attention.__call__` raises at TRACE time if
+   a **full-budget** forward was handed any lane other than `sparse_blocks`.
+   Widths the flag does not arm, growable caches and short contexts stay
+   routing, counted in `route_declines`.
+
+   **The lane engages only above 2,052 tokens, by design.** The kernel's ABI
+   is a fixed `[M, 512]` selection, and 512 complete pooled blocks exist only
+   from `(512 + 1) * 4` tokens. Below that the indexer selects a partial
+   budget and there is no smaller kernel to fall to -- padding would attend
+   keys the shipped lane does not. Context length is a per-request shape the
+   server must accept, so a short request routes to the stock attention,
+   counts as `short_context` in the receipt (with `short_context_blocks`
+   min/max), and prints nothing. A HumanEval prompt is served, not refused;
+   an armed 16 K decode still has to bind or the assertions fire. Raising
+   here instead took the 2026-09-02 composed fullset down with HTTP 500s at
+   7 and 33 blocks.
+
+3. **A `qsa_sparse_decode` block on the receipt row**, read *after* the run:
+   `armed`, `installed`, `disabled_reason`, `tile`, `splits`, `probe` (both
+   ladder rungs, per cell), `cache_installs`, `route_hits`, `route_sites`
+   (per call site), `route_declines`, `short_context` +
+   `short_context_blocks` + `short_context_tokens`, `kernel_calls`. The driver
+   refuses the arm -- after writing the receipt -- when the probe never ran,
+   the lane disabled itself, `route_hits` is zero, or no kernel call was
+   issued. A cell whose every forward declined for short context is refused
+   with that named reason: it is the control by construction, so measure this
+   lane on a long-context cell.
+
+Read `route_sites` first. It and `kernel_calls` count TRACES, not decode
+cycles: under `mx.compile` the Python body runs once per retrace and the C++
+replay never touches it. Read them as "did this lane get into the graph".
+
+### Tests
+
+`tests/test_fable_qsa_sparse_decode_wiring.py` — CPU-only, nothing evaluates
+an MLX array. Reproduces the 2026-09-02 decision on stub shapes, pins both
+call sites, the two kinds of "no", the construction gate, the trace-time
+assertion and every driver refusal.
+
 ---
 
 ## Shadow-draft acceptance (`shadow_draft_harness.py`)
@@ -1748,6 +2194,61 @@ PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps 
     --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-3seeds.json
 ```
 
+#### The log must hold the WHOLE committed stream
+
+One K20 row per verify window is not one row per committed token.
+`mtplx/context_copy.py` block rounds run their own verify forward over a
+verbatim slice of the prompt and commit the accepted prefix, the residual
+correction, and the next freshly sampled primary **without a K20 row**. Those
+tokens sit between one row's emission and the next row's `primary`.
+
+Measured on `k20-shadow-3seeds.npz` (2026-09-02, `fable-w51-k20-shadow`,
+sequence 1788400511): 1,113 windows over 3 requests of 1,024 tokens, but the
+rows account for only 948 / 966 / 856 of them — **302 of 3,072 tokens (9.8%)
+committed by the copy lane and absent from the file** (`context_copy.rounds`
+10 / 9 / 14, `verify_calls − compiled_m4_calls` = the same 10 / 9 / 14). The old
+reconstruction read each of the 21 resulting carry-in breaks as a request
+boundary and reported **24 segments for 3 requests**.
+
+The fix is in two places and both are needed:
+
+* `mtplx/fable_k20_log.py` records the gap — `carry_len` (every log) and
+  `carry_tokens` (when something carried), written by `K20RowLog.carry` /
+  `carry_round` / `carry_primary` from the copy round's own commit sites.
+  `flush` prints `carry=<tokens> in <gaps> gaps` so an armed run says so.
+* `segment_windows` no longer infers the boundary from the token stream at
+  all. It reads the window's PCG64 **stream id** (`rng_state[:, 2:4]`), which
+  is a property of the request's `Generator` and changes exactly at a request
+  boundary — on the file above it gives 382 / 390 / 341 windows, matching the
+  receipt's per-seed `compiled_m4_calls` exactly. It then *checks* the
+  reconstructed stream per segment and raises `TrajectoryGapError` on any break
+  a logged carry does not explain.
+
+So a log recorded before this accounting exists cannot be replayed if the copy
+lane fired, and the harness says so instead of inventing segments. Re-record it
+(either with a build that carries the accounting, or with `MTPLX_CONTEXT_COPY=0
+MTPLX_CONTEXT_COPY_BATCHED=0` so the lane never runs).
+
+#### The prefix commit is a capture, not an offset trim
+
+The first hardware replay (2026-09-02) died on window 0 with `target cache would
+not trim to 16388` — on a **full accept**, where nothing needed trimming.
+`_trim_cache_to_offset` refuses the whole cache if any entry has no `trim`,
+before it looks at how much is being trimmed, and Flash-Next's `make_cache`
+builds a `QSACache` per full-attention layer (trimmable) and an `ArraysCache`
+per linear layer — the GDN recurrent state, which `cache_state` marks
+untrimmable on purpose ("Attention KV caches can roll back by trimming their
+offset. GDN recurrent caches cannot"). An offset trim is not a prefix commit on
+any hybrid model.
+
+`generate_mtpk` never trims that cache either: it captures the recurrence during
+the verify forward and rebuilds each recurrent leaf at the kept row
+(`gdn_capture.commit_captured_prefix`), trimming the trimmable entries in the
+same pass, with rollback + re-forward as the fallback. `advance` now does the
+same, and asserts the resulting offset instead of assuming it. The schedule it
+follows — one forward per window plus one per carry, what each commits, and
+which token stays deferred — is `commit_steps`, a pure function with CPU tests.
+
 `--expect-segments 3` asserts the reconstruction found three requests; if it
 finds two the trajectory does not match the run and the harness refuses to
 replay it. Re-scoring afterwards needs no GPU and no guard:
@@ -1769,7 +2270,9 @@ estimate; `--ms-per-window` / `--chain-ms` / `--prefill-s` move them.
 `tests/test_fable_shadow_draft_harness.py`, pure host, no MLX import — and one
 test proves none is possible: every device-side import in the module lives
 inside `build_replay_hooks`, checked by AST. It covers the segment
-reconstruction (carry-in break, stop-token end, three seeds), the acceptance law
+reconstruction (PCG64 stream id, carry-in break, stop-token end, three seeds,
+a recorded context-copy gap and the refusal of an unrecorded one), the
+acceptance law
 (exact match, disjoint support, a hand-computed Σ min, exact ties), the
 depth-conditional reach ladder against the marginal α, `E[tokens/window]` with
 and without a bonus, the realised accept count against a uniform tape, the
@@ -1777,3 +2280,212 @@ fidelity gate in both directions (PASS, FAIL → verdict withheld, DID NOT ARM),
 the zero-variance paired delta a uniform candidate shift must produce, the
 bootstrap's determinism, the budget arithmetic, the replay's call ordering under
 a stub hook, and the report's rendering.
+
+---
+
+## Indexer reuse across the draft chain (`MTPLX_FABLE_INDEXER_REUSE`)
+
+Row K-D2. Every depth of the 3-step MTP draft chain re-derives the QSA block
+selection for a single query row — query norm + partial RoPE, a score GEMM over
+all ~4,352 pooled blocks at 16K, relu/head-sum/mask/tie-break, `argpartition` to
+top-512, blocks→tokens, the K/V gather. ~40 dependent dispatches, three times a
+cycle, on a chain where nothing overlaps. Depths 2 and 3 pay it in full to
+re-rank a history that grew by one token.
+
+Armed, depth 1 selects normally and depths 2..3 are handed
+`S_d = S_1 ∪ {b : nb_1 ≤ b < nb_d}` — the depth-1 block set plus the block the
+chain's own tokens completed — and skip the preparation, the GEMM and the top-k.
+`nb_d = (pos_start_d + 1) // ratio`; with `ratio = 4` and depth 3 at most one
+block can complete inside a cycle, so one extra slot is exact rather than an
+approximation, and the flag raises past `depth - 1 ≤ ratio`. The raw-key write
+and the pooled-block bank update still run at every depth, so the cache the
+verifier and the next cycle read is unchanged. Design and the causal /
+valid / superset argument: `mtplx/fable_indexer_reuse.py`.
+
+This moves the draft proposal `q` only — not `p`, not the verify graph, not the
+accept law — so exact speculative sampling still holds and the output
+distribution is unchanged. **Output digests WILL differ between the ABBA arms.**
+A different `q` draws different tokens from the same law; a digest mismatch here
+is the expected result, not a defect, and it is the reason the acceptance
+question is answered offline instead of by reading tok/s alone.
+
+An armed flag that meets a lane it cannot serve (`MTPLX_QSA_FLASH`,
+`MTPLX_QSA_GATHER_DECODE`, the compiled or legacy-fused indexer,
+`MTPLX_FABLE_COMPILED_DRAFT`) **raises**. It never reverts to the stock chain,
+because a silent revert would put a stock number under the flag's label.
+
+### (a) Acceptance — the guarded shadow capture, 3 seeds
+
+`--variant NAME=KEY=VAL` arms the env around each draft-chain call, and the gate
+is read per call precisely so that works; a `DID NOT ARM` verdict here would
+mean the flag had been cached at import or at construction. Capture the
+trajectory first (step 1 of the shadow-draft section above), then:
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 5400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/shadow_draft_harness.py \
+    /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/k20-shadow-3seeds.npz \
+    --capture-to /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-indexer-reuse-3seeds.npz \
+    --model /Users/davidtai/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
+    --variant indexer-reuse=MTPLX_FABLE_INDEXER_REUSE=1 \
+    --expect-segments 3 \
+    --budget \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/shadow-indexer-reuse-3seeds.json
+```
+
+Read the fidelity line first: above `--fidelity-tol` the verdict is withheld and
+the α numbers mean nothing. Re-scoring needs no GPU and no guard.
+
+### (b) Cycle time — ABBA
+
+```
+PYTHONPATH=/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 36000 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/scripts/fable/abba_window.py \
+    --sequence 1788500001 \
+    --order ABBA \
+    --label-prefix fable-indexer-reuse \
+    --candidate-extra-env MTPLX_FABLE_INDEXER_REUSE=1
+```
+
+Each arm receipt row carries `indexer_reuse: {armed, cycles, steps_reused}`.
+On the candidate `steps_reused` must be `2 * cycles` (depth 3, two reusing
+depths); a shortfall means some cycles re-anchored and the ms/window delta is
+not the lane's full effect. On the control both counters are 0, which is what
+"the control really was the control" looks like.
+
+Expected: **−0.5..−0.8 ms/window** if acceptance holds within noise. Acceptance
+is not tok/s: a candidate that wins ms/window and loses α can still lose
+end-to-end, so read (a) and (b) together — E[tokens/window] × ms/window.
+
+## B1 — expert-major (super-chunk) prefill MoE
+
+The prefill census (`scratchpad/J-prefill-attribution.md` §2.2) puts the routed
+MoE grouped GEMM at **3,391.6 ms, 31.6 % of GPU busy, 78.72 TFLOP at
+23.2 TFLOP/s — 45 % of the rate the same q4/g32 kernel reaches dense**.  M §B1
+claims that is a *schedule* problem: 2,048 tokens x top-10 over 512 experts is
+**40 rows per expert**, and MLX's sorted grouped kernel tiles rows at `BM = 32`
+and re-streams a weight tile for every expert boundary that lands inside a
+tile.  Two scripts settle it, and neither needs the runtime change.
+
+### `micro_moe_prefill_rows.py` — the rows/expert curve (the whole case)
+
+Sorted `mx.gather_qmm` at the served shapes (hidden 2560, fused gate+up 1280,
+down 2560x640, 512 experts, top-10, q4/g32) at 40 / 80 / 160 / 320 rows per
+expert — the chunk-2048, chunk-4096, 2-chunk and 4-chunk geometries.  The
+tile-straddle multiplier `runs / tiles` is computed exactly in NumPy from the
+sorted index array and printed next to the clock, so the TF/s curve can be read
+against a mechanism rather than a guess:
+
+```
+R=40  (2,048 tok)  tiles   640  runs  1,129  ->  1.76 passes/tile
+R=80  (4,096 tok)  tiles 1,280  runs  1,773  ->  1.39
+R=160 (8,192 tok)  tiles 2,560  runs  3,051  ->  1.19
+R=320 (16,384 tok) tiles 5,120  runs  5,615  ->  1.10
+```
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 1800 \
+  --child-timeout-seconds 900 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_moe_prefill_rows.py \
+    --rows-per-expert 40,80,160,320 \
+    --lane queued --reps 10 \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/micro-moe-prefill-rows.json
+```
+
+`gemm` (the two `gather_qmm` calls on pre-sorted inputs) is the census family —
+J §2.2's "MoE routed grouped GEMM", 789 dispatches — and carries the verdict.
+`chain` adds the sort/gather/scatter, which the census counts as three separate
+families and which cost far more standalone than inside the model's fused
+48-layer chunk graph; it is printed as context, marked as such, and must not be
+read as the MoE number.
+
+Both scripts refuse to start unless `MTPLX_DSV4_GUARD_WINDOW_PATH` or
+`MTPLX_GUARD_ATTEST_FD` is set, i.e. unless `run_guarded.py` launched them. The
+lock *file* always exists and is normally held by somebody else, so its
+presence is not evidence of owning the window.
+
+**Decision rule.** `gemm` TF/s at R=320 vs R=40: **>= 1.5x** = schedule-bound,
+B1's -0.9..-1.1 s of MoE at 16K is real; **1.15-1.5x** = partial (M's "plateau
+by 160" floor of ~-0.4 s); **<= 1.15x** = the 45 % is inside the kernel and B1
+dies.  `--routing balanced` is the aligned bound (every boundary on a tile
+edge, factor exactly 1.0 at R=160 and R=320) and must not be read as the
+production curve; `--routing dirichlet` is the skew sensitivity.
+
+Every run also prints an **exactness** block: 2,048 probe rows run alone, then
+as the head of a 16,384-row batch, compared bitwise after the unsort.
+`differing` must be 0 — that is B1's bit-exactness claim measured rather than
+argued.  `--self-test` runs the NumPy accounting with no MLX and no lock.
+
+### `micro_prefill_memory_census.py` — what the +3.5 GB at chunk 4096 is
+
+W32 measured chunk 4096 at **12.53 s / 92.22 GB peak** against a 2048 control
+at 13.53 s / 88.69 GB, and showed the extra bytes are **not** the QSA score
+tensor: the query-tile arm (`MTPLX_FABLE_PREFILL_QSA_QUERY_TILE=2048`, which
+caps the score chain at the 2,048-row value) recorded the same peak to five
+significant figures.  The guard's own model predicts only +1.7 GB.  This runs a
+real prefill with `mx.get_active_memory` / `mx.get_peak_memory` bracketed
+around every block of every layer, at both widths, and prints the per-family
+delta plus the `lazy - serialized` gap (the part of the peak that is scheduler
+concurrency rather than any one block).
+
+```
+PYTHONPATH=<branch checkout> \
+/Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --lock-timeout-seconds 3600 \
+  --child-timeout-seconds 2400 \
+  -- \
+  /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  <branch checkout>/scripts/fable/micro_prefill_memory_census.py \
+    --chunk-sizes 2048,4096 --modes lazy,serialized \
+    --json /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.benchmark-artifacts/fable/prefill-memory-census-4096.json
+```
+
+The arithmetic to check the answer against, per layer at `R` chunk rows: the
+routed chain holds `R x 192,000 B` (sorted x, fused gate+up, silu*up, down,
+unsorted — all `top_k x R` rows), i.e. **393 MB at R=2048 and 786 MB at
+R=4096**.  A +3.5 GB delta therefore means roughly **eight layers' worth of MoE
+transient are alive at once**, which is a scheduler fact, not a geometry fact —
+and it is exactly the number `MTPLX_FABLE_PREFILL_EXPERT_MAJOR`'s group budget
+needs.  It also unblocks B9 (chunk 8192).
+
+### The lane itself (`MTPLX_FABLE_PREFILL_EXPERT_MAJOR`, off by default)
+
+`mtplx/fable_prefill_expert_major.py` (design, planner, byte model),
+`Qwen4ExpTextModel.forward_prefill_group` (the layer-major schedule) and
+`mtplx.generation._expert_major_groups` (the construction-time gate).  Group
+size defaults to 4 chunks and is capped by
+`MTPLX_FABLE_PREFILL_EXPERT_MAJOR_BUDGET_BYTES` / `MTPLX_WIRED_LIMIT_BYTES`; a
+request that cannot afford 4 gets 2, and one that cannot afford 2 runs
+chunk-major.  Per-chunk GDN boundary capture and grouping are mutually
+exclusive (layer-major never holds all 48 layers' state at an interior chunk
+end): the default `MTPLX_FABLE_PREFILL_EXPERT_MAJOR_BOUNDARIES=refuse` keeps
+the boundaries and runs chunk-major; `=group` takes the group as the boundary
+granularity and counts `boundaries_coarsened`.
+
+```
+cd <branch checkout>
+PYTHONPATH=. /Users/davidtai/projects/OpenSourceWTF/.worktrees/qwen38-fable-80tps/.venv/bin/python \
+  -m pytest tests/test_fable_prefill_expert_major.py -q
+```

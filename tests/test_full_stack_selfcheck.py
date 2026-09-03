@@ -331,3 +331,51 @@ def test_runtime_prints_a_receipt_for_every_qwen4_install_report() -> None:
         assert f'_print_install_receipt(\n                "{tag}"' in source or (
             f'_print_install_receipt("{tag}"' in source
         ), tag
+
+
+def test_health_engagement_reports_registry_covers_every_runtime_report() -> None:
+    """``/health`` must publish every install report the runtime publishes.
+
+    ``_ENGAGEMENT_REPORT_ATTRS`` in mtplx/server/openai.py is the single
+    registration point: one ``(health name, runtime attribute)`` row per
+    lane, read with ``getattr`` only, so adding a row cannot change what the
+    lane itself prints. A new install-time lane that sets
+    ``runtime.<something>_report`` and is not registered here is invisible at
+    ``/health`` -- which is the failure this registry exists to end.
+
+    Both files are read as source: importing mtplx.runtime pulls MLX in.
+    """
+
+    from pathlib import Path
+    import re
+
+    root = Path(__file__).resolve().parents[1] / "mtplx"
+    published = set(
+        re.findall(r"runtime\.([a-z0-9_]+_report)\s*=", (root / "runtime.py").read_text())
+    )
+    registered = set(
+        re.findall(
+            r'\(\s*"[a-z0-9_]+"\s*,\s*"([a-z0-9_]+_report)"\s*\)',
+            (root / "server" / "openai.py").read_text(),
+        )
+    )
+
+    assert published, "the runtime scan found no install reports; the pattern rotted"
+    assert published <= registered, sorted(published - registered)
+
+
+def test_hc_m4_install_report_reaches_health() -> None:
+    """W42c's MTPLX_FABLE_HC_M4 pack validation is a registered lane."""
+
+    from mtplx.server.openai import _engagement_reports_payload
+
+    class _Runtime:
+        qwen4_hc_m4_report = {"armed": True, "validated": 49}
+
+    class _State:
+        runtime = _Runtime()
+
+    payload = _engagement_reports_payload(_State())
+    assert payload["qwen4_hc_m4"] == {"armed": True, "validated": 49}
+    # Unset lanes stay None rather than disappearing.
+    assert payload["qwen4_m4_stage3"] is None

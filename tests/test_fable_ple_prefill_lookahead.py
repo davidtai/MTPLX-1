@@ -812,9 +812,19 @@ def test_scope_raises_rather_than_running_an_armed_lane_it_cannot_serve():
 
 
 def test_prefill_loop_records_chunk_wall_and_gather_time():
-    assert "gather_before = _ple_stage_seconds()" in GENERATION_TEXT
+    # The loop is now group-major (MTPLX_FABLE_PREFILL_EXPERT_MAJOR): the
+    # bracket is around the GROUP's forward, which is one chunk unless the
+    # expert-major lane is armed.  Same instrumentation, group-aware names.
+    assert "group_gather_before = _ple_stage_seconds()" in GENERATION_TEXT
     assert "_record_prefill_chunk(" in GENERATION_TEXT
-    assert "ple_gather_s=_ple_stage_seconds() - gather_before" in GENERATION_TEXT
+    assert (
+        "group_gather_s = _ple_stage_seconds() - group_gather_before"
+        in GENERATION_TEXT
+    )
+    assert (
+        "ple_gather_s=group_gather_s if group_index == 0 else 0.0"
+        in GENERATION_TEXT
+    )
     assert "wall_s=chunk_wall_s" in GENERATION_TEXT
 
 
