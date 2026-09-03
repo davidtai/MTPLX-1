@@ -293,6 +293,42 @@ class MTPLXRuntime:
             **kwargs,
         )
 
+    def forward_ar_prefill_group(
+        self,
+        chunk_inputs,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+    ):
+        """Layer-major prefill over a group of chunks (expert-major MoE).
+
+        ``MTPLX_FABLE_PREFILL_EXPERT_MAJOR``.  Returns one
+        ``(logits_or_None, widened_or_None)`` per chunk, in chunk order.  A
+        model without the schedule raises rather than silently serving the
+        chunk-major path under the candidate's label.
+        """
+
+        from mtplx.fable_prefill_expert_major import ExpertMajorRefusal
+
+        group = getattr(self.model, "forward_prefill_group", None)
+        if group is None:
+            raise ExpertMajorRefusal(
+                f"{type(self.model).__name__} has no expert-major prefill schedule"
+            )
+        if not self.mtp_enabled and return_hidden:
+            raise RuntimeError("return_hidden requires an MTP-patched runtime")
+        self._count("forward_ar_prefill_group_calls")
+        self._count("forward_ar_prefill_group_chunks", len(chunk_inputs))
+        return group(
+            list(chunk_inputs),
+            cache,
+            None,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+            emit_logits=emit_logits,
+        )
+
     def _compiled_ar_forward(self, cache):
         """Compiled target forward (MTPLX_COMPILE_AR_FORWARD).
 
@@ -1116,6 +1152,17 @@ def load(
                 routed_glu_enabled=routed_glu_enabled,
             )
             logger.info("[qwen4-M4-stage3] %s", qwen4_m4_stage3_report)
+        # MTPLX_FABLE_HC_M4's PACK contract, checked here because the weights
+        # exist by now.  Everything it validates is process-invariant, so a
+        # miss is a deployment error: it must stop the server coming up with a
+        # precise reason rather than turn the first request that reaches
+        # verify width into an HTTP 500.  No-op when the flag is off.
+        from .models.qwen4_exp import install_hc_m4_pack_validation
+
+        hc_m4_report = install_hc_m4_pack_validation(runtime.model)
+        runtime.qwen4_hc_m4_report = hc_m4_report
+        if hc_m4_report.get("armed"):
+            logger.info("[qwen4-hc-m4] %s", hc_m4_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError

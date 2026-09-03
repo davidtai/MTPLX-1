@@ -150,6 +150,17 @@ Speculative sampling admits a different ``q`` for free -- it costs acceptance,
 not correctness -- which is why the gate is a task eval and not a digest.
 
 NO device work happens at import.
+
+Which request shape gets which path
+-----------------------------------
+This route is a SAMPLED-lane route: it consumes PCG64 uniforms and a fixed
+top-k support, both of which a greedy request has none of.  Greedy is not an
+unserved shape here, it is a different shape with its own optimised path --
+``generate_mtpk``'s one-sync greedy chain -- and with
+``MTPLX_FABLE_DRAFT_K20_PRESCATTER`` armed that chain reads the same 65,536-row
+pre-scatter output this route does, so a temperature-0 request loses nothing by
+not coming through here.  The claim therefore ROUTES a greedy request away
+(recorded, never raised); it does not refuse to serve it.
 """
 
 from __future__ import annotations
@@ -164,6 +175,11 @@ import numpy as np
 from .fable_device_k20 import (
     draft_distribution as _draft_distribution,
     draw_draft_uniforms as _draw_draft_uniforms,
+)
+from .fable_claim_contract import (
+    ClaimDeclined,
+    decline as _decline,
+    declined_receipt,
 )
 from .sampling import SamplerConfig, SparseDistribution
 
@@ -235,6 +251,11 @@ COUNTERS: dict[str, int] = {
     "offset_rollbacks_on_device": 0,
     "offset_rollback_declined": 0,
     "refusals": 0,
+    # Requests this lane stood aside for because their SHAPE is not one it
+    # serves (greedy, penalties, a competing owner).  Those run the stock
+    # draft loop; `refusals` counts only install-time contract violations,
+    # which raise.  See `mtplx.fable_claim_contract`.
+    "declines": 0,
 }
 
 
@@ -267,15 +288,23 @@ def _configure_for_test(mode_name: str) -> None:
 
 
 class DeviceDraftChainIneligible(RuntimeError):
-    """The armed flag met a request this lane does not implement.
+    """The armed flag cannot work in THIS PROCESS at all.
 
-    Raised at construction, never mid-decode.  There is no silent fallback:
-    arming the flag and then quietly running the stock draft loop would make
-    every receipt a lie about which chain produced it.
+    Reserved for install-time contract violations -- the pinned NumPy, the
+    PCG64 tape, the FR-Spec head's presence/shape/liveness -- plus the
+    mid-decode guards that arm after a claim already succeeded.  Every request
+    would fail identically on the first class.
+
+    A request whose SHAPE this lane does not serve (greedy, penalties, a
+    competing owner of the draft chain, ...) DECLINES to the stock draft loop
+    instead -- see :mod:`mtplx.fable_claim_contract`.  Raising on those turns
+    every ineligible request into an HTTP 500 in serving.
     """
 
 
 def _refuse(reason: str) -> None:
+    """Install-time contract violation: no request here could be served."""
+
     COUNTERS["refusals"] += 1
     raise DeviceDraftChainIneligible(f"{_ENV_VAR}: {reason}")
 
@@ -532,6 +561,40 @@ class DeviceDraftChainPlan:
 
 def claim_request_route(
     *,
+    receipt: dict[str, object] | None = None,
+    **request: Any,
+) -> DeviceDraftChainPlan | None:
+    """Bind the compiled draft chain to one generation.
+
+    Returns ``None`` when the flag is off, and ``None`` again when the flag is
+    on but this REQUEST's shape is not one the route serves -- a decline, not
+    a failure: the stock draft loop runs and produces the same tokens.  When
+    ``receipt`` is passed it is filled in with why.  Only an INSTALL-time
+    contract violation raises :class:`DeviceDraftChainIneligible`.
+    ``MTPLX_FABLE_STRICT_CLAIMS=1`` turns declines back into that exception
+    for a measured arm that must prove the lane ran.
+
+    The request terms are spelled out on :func:`_claim_request_route`; this
+    wrapper forwards them untouched so there is exactly one list of them.
+    """
+
+    if _MODE == MODE_OFF:
+        return None
+    try:
+        return _claim_request_route(**request)
+    except ClaimDeclined as declined:
+        COUNTERS["declines"] += 1
+        stamped = declined_receipt(
+            _ENV_VAR, declined, ineligible=DeviceDraftChainIneligible
+        )
+        if receipt is not None:
+            receipt.clear()
+            receipt.update(stamped)
+        return None
+
+
+def _claim_request_route(
+    *,
     rt: Any,
     state_tree_fn: Callable[[Any], Any],
     promote_fn: Callable[..., tuple[int, dict[str, int]]],
@@ -578,12 +641,7 @@ def claim_request_route(
     k20_log_active: bool,
     ple_candidate_submit: Any,
 ) -> DeviceDraftChainPlan | None:
-    """Bind the compiled draft chain to one generation, or refuse loudly.
-
-    Returns ``None`` when the flag is off.  Otherwise every unsupported
-    feature raises :class:`DeviceDraftChainIneligible` -- the same fail-closed
-    shape ``fable_device_k20.claim_request_route`` uses.
-    """
+    """The claim body.  ``_refuse`` raises; ``_decline`` stands aside."""
 
     if _MODE == MODE_OFF:
         return None
@@ -601,72 +659,105 @@ def claim_request_route(
 
     # -- competing owners of the draft chain -------------------------------
     if pr391_route is not None:
-        _refuse("the PR391 float32 D3 route already owns the draft chain")
+        _decline(
+            "pr391_owns_chain",
+            "the PR391 float32 D3 route already owns the draft chain",
+        )
     if a3b_target_prefix_route is not None or target_prefix_verify:
-        _refuse("target-prefix verification samples drafts on device")
+        _decline(
+            "target_prefix_verify",
+            "target-prefix verification samples drafts on device",
+        )
     if device_k20_route is not None:
-        _refuse("MTPLX_FABLE_DEVICE_K20 owns the draft selector")
+        _decline(
+            "device_k20_owns_selector",
+            "MTPLX_FABLE_DEVICE_K20 owns the draft selector",
+        )
     if draft_k20_prescatter_route is not None:
-        _refuse(
+        _decline(
+            "prescatter_owns_stash",
             "MTPLX_FABLE_DRAFT_K20_PRESCATTER owns the FR-Spec pre-scatter "
-            "stash; this route consumes it inside the compiled body"
+            "stash; this route consumes it inside the compiled body",
         )
     if str(draft_core) != "stock":
-        _refuse(f"this route requires the stock draft selector (got {draft_core!r})")
+        _decline(
+            "non_stock_draft_core",
+            f"this route requires the stock draft selector (got {draft_core!r})",
+        )
     if greedy_chain_enabled or combine_greedy_draft_read:
-        _refuse("the greedy draft chain owns the per-depth read")
+        _decline(
+            "greedy_chain", "the greedy draft chain owns the per-depth read"
+        )
 
     # -- sampler contract ---------------------------------------------------
     if float(sampler.temperature) <= 0.0 or float(draft_sampler.temperature) <= 0.0:
-        _refuse("this is a sampled-lane route (temperature > 0)")
+        _decline(
+            "greedy_request",
+            "this is a sampled-lane route (temperature > 0); this request is "
+            f"target t={float(sampler.temperature)!r} / draft "
+            f"t={float(draft_sampler.temperature)!r}",
+        )
     if int(draft_sampler.top_k) != TOP_K:
-        _refuse(f"this route is fixed at top_k={TOP_K}")
+        _decline("top_k_mismatch", f"this route is fixed at top_k={TOP_K}")
     if not 0.0 < float(draft_sampler.top_p) <= 1.0:
-        _refuse("this route requires 0 < draft top_p <= 1")
+        _decline("top_p_range", "this route requires 0 < draft top_p <= 1")
     if (
         float(draft_sampler.presence_penalty) != 0.0
         or float(draft_sampler.frequency_penalty) != 0.0
         or penalties_active
         or steer_active
     ):
-        _refuse("steering/penalty overlays index by real token id")
+        _decline(
+            "steer_or_penalties",
+            "steering/penalty overlays index by real token id",
+        )
     if adaptive_dtemp_active:
-        _refuse(
+        _decline(
+            "adaptive_dtemp",
             "MTPLX_ADAPTIVE_DTEMP rebinds the draft sampler mid-generation; "
-            "the compiled body and the choice kernel bake one temperature"
+            "the compiled body and the choice kernel bake one temperature",
         )
     if relaxed_draft_ties:
-        _refuse("MTPLX_QWEN4_RELAXED_DRAFT_TIES installs a different builder")
+        _decline(
+            "relaxed_draft_ties",
+            "MTPLX_QWEN4_RELAXED_DRAFT_TIES installs a different builder",
+        )
 
     # -- loop shape ---------------------------------------------------------
     depth = int(speculative_depth)
     if depth < 1:
-        _refuse("this route requires a positive draft depth")
+        _decline("non_positive_depth", "this route requires a positive draft depth")
     if int(late_depth_switch_after) != 0:
-        _refuse("this route does not admit late-depth switching")
+        _decline(
+            "late_depth_switch", "this route does not admit late-depth switching"
+        )
     if str(mtp_cache_policy) != "persistent":
-        _refuse(
+        _decline(
+            "mtp_cache_policy",
             "the compiled body captures ONE MTP cache; "
-            f"mtp_cache_policy={mtp_cache_policy!r} makes a fresh one per depth"
+            f"mtp_cache_policy={mtp_cache_policy!r} makes a fresh one per depth",
         )
     if str(mtp_history_policy) != "committed":
-        _refuse(
+        _decline(
+            "mtp_history_policy",
             "this route requires the committed MTP history policy "
-            f"(got {mtp_history_policy!r})"
+            f"(got {mtp_history_policy!r})",
         )
     if str(mtp_position_mode or "default").strip().lower().replace("-", "_") not in {
         "",
         "default",
         "cache",
     }:
-        _refuse(
+        _decline(
+            "mtp_position_mode",
             "the compiled body forwards no position_offset; "
-            f"MTPLX_MTP_POSITION_MODE={mtp_position_mode!r} needs one"
+            f"MTPLX_MTP_POSITION_MODE={mtp_position_mode!r} needs one",
         )
     if qsa_mtp_precompute_active:
-        _refuse(
+        _decline(
+            "qsa_mtp_precompute",
             "the QSA MTP indexer precompute stages replay caches per cycle; "
-            "the compiled trace captures a fixed state tree"
+            "the compiled trace captures a fixed state tree",
         )
     # Deliberately NOT refused: `batch_target_arrays`, `lazy_target_distributions`
     # and `lazy_bonus_verify_requested`.  All three are TARGET-side, and this
@@ -704,7 +795,9 @@ def claim_request_route(
     }
     named = sorted(name for name, active in unsupported.items() if active)
     if named:
-        _refuse("unsupported features: " + ", ".join(named))
+        _decline(
+            "unsupported_features", "unsupported features: " + ", ".join(named)
+        )
 
     # -- the FR-Spec head ---------------------------------------------------
     from .fable_draft_k20_prescatter import _live_draft_route
@@ -750,7 +843,10 @@ def claim_request_route(
     # -- the compiled body --------------------------------------------------
     max_tokens = int(request_max_tokens)
     if max_tokens <= 0:
-        _refuse("request_max_tokens must be positive")
+        _decline(
+            "non_positive_max_tokens",
+            f"request_max_tokens must be positive (got {max_tokens})",
+        )
     reserve = max_tokens + depth + _RESERVE_SLACK
 
     from .fable_compiled_draft import build_compiled_draft_chain

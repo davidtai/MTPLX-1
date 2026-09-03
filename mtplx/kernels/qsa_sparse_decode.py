@@ -62,23 +62,60 @@ token agreement plus a full HumanEval run, never on a digest.  The install
 probe below is a numerical SANITY gate, not the quality gate -- it exists so
 an armed flag that is quietly wrong disables itself instead of shipping.
 
-GATE DISCIPLINE
----------------
-* CONTRACT failure RAISES.  An armed flag on a pack the kernel cannot serve
-  is a configuration error, not a reason to run the stock chain quietly --
-  that is how MTPLX_FUSED_HC_V3 came to be armed-but-dead at M=4.
-* PARITY failure DISABLES for the process, records the measured deltas, and
-  lets the stock lane serve.  A parity miss is a numerical verdict about a
-  rounding-class kernel; raising there would turn a measurement into an
-  outage.
+GATE DISCIPLINE -- REVISED 2026-09-02 AFTER AN ARMED-BUT-INERT WINDOW
+---------------------------------------------------------------------
+The 2026-09-02 16 K window armed this flag and measured the CONTROL: control
+and candidate response texts were byte-identical on both finished seeds, on a
+kernel whose arithmetic is rounding class.  Nothing in the run said so,
+because every way the lane could decline was silent.  The rule the program
+owner set afterwards is: **a flag either works on every request path the
+server accepts, or it fails loudly at install.**  Concretely:
+
+* CONTRACT failure RAISES, as before.  An armed flag on a pack the kernel
+  cannot serve is a configuration error -- that is how MTPLX_FUSED_HC_V3 came
+  to be armed-but-dead at M=4.
+* PARITY failure still DISABLES *inside this module* -- :func:`install`
+  returns False and records the measured deltas, so the numbers survive for
+  the receipt -- but the CALLER
+  (``graphbank.TensorOffsetQSACache.__init__``) then RAISES, because an armed
+  arm that runs the stock chain is worse than an outage: it is a measurement
+  that looks like a result.  Read the deltas off the stderr line and the
+  receipt, then unarm the flag deliberately.
+* ROUTE narrowing RAISES at the width the flag arms.  Widths the flag does
+  not arm (prefill rows, the S=1 D3 route under a verify-only arm) and caches
+  the lane never installed on are routing, not failure: they return False and
+  are COUNTED in :data:`_ROUTE_DECLINES` so "the flag did nothing" always has
+  a readable cause.
+* An armed lane that is not in the traced verify graph RAISES from
+  :func:`assert_traced`, called inside the compiled verify body.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
+
+
+def _emit(line: str) -> None:
+    """Put the lane's verdict where a benchmark log will actually see it.
+
+    ``logger.info`` alone is INVISIBLE in a driver run -- the 2026-09-02 W68
+    window carried no engagement evidence at all, and the same log is missing
+    ``[qwen4-fixed-M4-verify]`` and ``[qwen4-compiled-MTP-prepare]`` (both
+    ``logger.info``) while it does carry ``[MTPLX_FABLE_GRAPH_BUILD_OVERLAP]
+    armed:`` (a plain ``print``).  W70 fixed exactly this for the verify-glue
+    items; this is the same fix for this lane.
+    """
+
+    logger.info("%s", line)
+    print(line, file=sys.stderr, flush=True)
 
 #: Production Qwen3.8 Flash-Next QSA geometry -- compiled into the metallib.
 Q_HEADS = 24
@@ -93,18 +130,75 @@ DRAFT_ROWS = 1
 #: one less than the shipped lane's 2,052 and why the visible sets still agree.
 SELECTED_TOKENS = TOP_K * COMPRESS_RATIO + (COMPRESS_RATIO - 1)
 
-#: bf16 has an 8-bit significand, so its relative spacing is 2**-8.
+#: bf16 has an 8-bit significand, so its relative spacing is 2**-8 and its
+#: unit roundoff (round to nearest) is u = 2**-9.
 _BF16_REL_ULP = 2.0**-8
-#: Install-probe gates.  Deliberately loose: this is a sanity gate on a
-#: rounding-class kernel, and the QUALITY gate is HumanEval + greedy-token
-#: agreement at the model level.  A kernel that is merely reassociated lands
-#: at a few ulp; one that is wrong lands orders of magnitude away.
-PARITY_MAX_ABS_ULPS = 8.0
-PARITY_MAX_REL_L2 = 2.0e-3
+_BF16_UNIT_ROUNDOFF = 2.0**-9
+
+# ---------------------------------------------------------------------------
+# THE GATE, AND WHY IT IS TWO GATES AGAINST TWO REFERENCES
+#
+# The 2026-09-02 micro measured the kernel against the shipped path at
+# max_abs 1.953e-3 (= 2**-9 exactly), rel_l2 4.78e-3, top-1 1.0000 -- and
+# reported the SAME four significant figures for all twenty configurations:
+# BK 64/128/256, DC 32/64, splits 4..32.  DC changes the fp32 score
+# contraction order and the split count changes the online-softmax merge
+# tree, so if any of that delta were the kernel's it would move.  It does not
+# move at all.  The delta is therefore a property of the REFERENCE.
+#
+# The shipped path carries two bf16 roundings this kernel does not:
+#
+#   1. ``mx.matmul(q_view, k_view)`` has bf16 inputs, so its output is bf16 --
+#      the SCORES are rounded to bf16 before ``.astype(float32) * scale`` and
+#      the softmax.  A relative score error u shifts a softmax logit by
+#      u*|x|, and perturbing logits by eps changes each probability by about
+#      (eps_i - <eps>).  With scaled logits of order 5 that is ~2*u*5 = 2e-2
+#      relative on the probabilities.
+#   2. ``probs.astype(bfloat16)`` before P@V: another u = 2e-3 relative.
+#
+# So (1) should dominate (2) by roughly an order of magnitude, and the
+# measured 4.78e-3 sits between the two predictions -- which is why the
+# attribution is TESTED by a reference ladder rather than asserted.
+#
+# The consequence for the gate: a threshold on kernel-vs-shipped is really a
+# threshold on how much bf16 rounding the SHIPPED path does, which is not a
+# property of this kernel and cannot be tightened by improving it.  So:
+#
+#   * the DECIDING numerical gate is against the fp32 reference, where the
+#     only differences left are fp32 reassociation and one bf16 store.  It is
+#     tight, and it FAILS if the attribution above is wrong -- which is the
+#     point of stating it this way.
+#   * kernel-vs-shipped keeps a loose SANITY bound, an order of magnitude
+#     above what the shipped path's own bf16 quantisation implies.
+#
+# Neither is a quality gate.  This kernel is rounding class; whether the
+# difference matters is answered by model-level greedy-token agreement plus a
+# full HumanEval run, exactly as for MTPLX_FABLE_HC_M4.
+# ---------------------------------------------------------------------------
+
+#: TIGHT, vs :func:`fp32_reference`.  Derivation: both sides round the same
+#: real number to bf16, so they differ by at most one bf16 ulp on any element
+#: where the underlying fp32 values straddle a rounding boundary; fp32
+#: reassociation over <= 2051 terms contributes ~sqrt(2051)*2**-24 = 2.7e-6
+#: relative, three orders below a bf16 ulp, so it can only move an element
+#: that already sits within 2.7e-6 of a boundary (about 1 in 4e4).  Hence a
+#: couple of ulp at the extreme and a relative L2 far below the 2**-9/sqrt(3)
+#: = 1.1e-3 that a uniformly re-rounded output would give.
+PARITY_FP32_MAX_ABS_ULPS = 2.0
+PARITY_FP32_MAX_REL_L2 = 5.0e-4
+
+#: LOOSE, vs :func:`stock_reference` (the shipped path).  This bounds the
+#: shipped path's OWN bf16 score and probability quantisation, derived above
+#: at ~2e-2 relative on the probabilities; 5e-2 leaves an order of magnitude
+#: over the 4.78e-3 measured on 2026-09-02.  It exists to catch a kernel that
+#: is wrong by a factor, not to certify one that is right.
+PARITY_SHIPPED_MAX_REL_L2 = 5.0e-2
+
 #: Fraction of (head, row) pairs whose argmax over the head dimension must
-#: still agree.  A coarse discrete statistic, reported for continuity with
-#: the "top-1 agreement" the program asks for at the kernel level; the
-#: DECIDING top-1 number is model-level greedy-token agreement.
+#: still agree, against BOTH references.  A coarse discrete statistic,
+#: reported for continuity with the "top-1 agreement" the program asks for at
+#: the kernel level; the DECIDING top-1 number is model-level greedy-token
+#: agreement.  Measured 1.0000 on every configuration.
 PARITY_MIN_TOP1 = 0.98
 
 #: Probe geometry: capacity only has to clear the dense/sparse crossover
@@ -118,12 +212,90 @@ _COUNTS: Dict[str, int] = {
     "draft_kernel": 0,
     "probe_runs": 0,
     "probe_failures": 0,
+    # Every ``TensorOffsetQSACache`` that bound the lane, shadow and parity
+    # twins included.  The probe runs on the FIRST one only (the verdict is
+    # per process), so a value of ZERO with the flag armed is the whole
+    # finding: no cache carried the lane and the kernel could not have run.
+    "cache_installs": 0,
+    # Every routing decision that came back True, summed over the call sites
+    # in ``_ROUTE_SITES``.  Trace-time, like ``verify_kernel``: the Python body
+    # of a compiled verify graph runs once per retrace, so read these as "did
+    # this lane get into the graph at all", never as a per-cycle count.
+    "route_hits": 0,
 }
+
+#: ``site -> hits``.  The 2026-09-02 window failed because ONE of the two call
+#: sites existed for the verify width and the other asked the draft question;
+#: a single total would not have shown that, so the sites are named.
+_ROUTE_SITES: Dict[str, int] = {}
+
+#: ``reason -> count`` for the routing narrowings that are NOT failures (a
+#: width the flag does not arm, a growable cache the lane never installed on).
+#: Recorded rather than merely returned, so "the flag did nothing" always has
+#: a readable cause in the receipt.
+_ROUTE_DECLINES: Dict[str, int] = {}
 
 #: ``None`` until the probe has run.  ``""`` once it has passed.  A non-empty
 #: string is the reason the lane is disabled for this process.
 _DISABLED_REASON: Optional[str] = None
 _PROBE_REPORT: Dict[str, Any] = {}
+
+
+class SparseDecodeContractError(RuntimeError):
+    """An armed flag met a request path it cannot serve.
+
+    Raised, never swallowed: a lane that quietly declines makes the candidate
+    arm measure the control while its receipt claims otherwise, which is the
+    exact failure the 2026-09-02 window produced.
+    """
+
+
+def armed(*, draft: bool = False) -> bool:
+    """True when this process armed the flag for the given width."""
+
+    from mtplx.runtime_options import (
+        fable_qsa_sparse_decode_enabled,
+        fable_qsa_sparse_draft_enabled,
+    )
+
+    return bool(
+        fable_qsa_sparse_draft_enabled() if draft else fable_qsa_sparse_decode_enabled()
+    )
+
+
+def pending() -> bool:
+    """True while the install probe has not run yet in this process."""
+
+    return _DISABLED_REASON is None
+
+
+def installed() -> bool:
+    """True when the probe ran and passed.  False while pending, too."""
+
+    return _DISABLED_REASON == ""
+
+
+def note_route_hit(site: str) -> None:
+    """One routing decision resolved to the kernel, at a named call site."""
+
+    _COUNTS["route_hits"] += 1
+    _ROUTE_SITES[site] = _ROUTE_SITES.get(site, 0) + 1
+
+
+def note_route_decline(reason: str) -> None:
+    """One routing narrowing that is not an error, recorded by cause."""
+
+    _ROUTE_DECLINES[reason] = _ROUTE_DECLINES.get(reason, 0) + 1
+
+
+def route_counters() -> Dict[str, Any]:
+    """Per-site hits and per-cause declines, for the receipt."""
+
+    return {
+        "route_hits": int(_COUNTS["route_hits"]),
+        "route_sites": dict(_ROUTE_SITES),
+        "route_declines": dict(_ROUTE_DECLINES),
+    }
 
 
 def engagement() -> Dict[str, Any]:
@@ -137,7 +309,102 @@ def engagement() -> Dict[str, Any]:
     report["installed"] = _DISABLED_REASON == ""
     report["disabled_reason"] = _DISABLED_REASON or None
     report["probe"] = dict(_PROBE_REPORT)
+    report["route_sites"] = dict(_ROUTE_SITES)
+    report["route_declines"] = dict(_ROUTE_DECLINES)
     return report
+
+
+def receipt() -> Dict[str, Any]:
+    """The compact engagement block a benchmark receipt stores.
+
+    Never raises: it reads ``_DISABLED_REASON`` directly rather than going
+    through a helper that treats "pending" as an error, because describing the
+    pending state IS what a receipt builder needs to do.
+    """
+
+    from mtplx.runtime_options import (
+        fable_qsa_sparse_decode_splits,
+        fable_qsa_sparse_decode_tile,
+    )
+
+    key_tile, dim_tile = fable_qsa_sparse_decode_tile()
+    block: Dict[str, Any] = {
+        "armed": armed(),
+        "armed_draft": armed(draft=True),
+        "installed": installed(),
+        "pending": pending(),
+        "disabled_reason": _DISABLED_REASON or None,
+        "tile": [int(key_tile), int(dim_tile)],
+        "splits": int(fable_qsa_sparse_decode_splits()),
+        "verify_rows": VERIFY_ROWS,
+        "draft_rows": DRAFT_ROWS,
+        "cache_installs": int(_COUNTS["cache_installs"]),
+        "probe_runs": int(_COUNTS["probe_runs"]),
+        "probe_failures": int(_COUNTS["probe_failures"]),
+        "kernel_calls": {
+            "verify_kernel": int(_COUNTS["verify_kernel"]),
+            "draft_kernel": int(_COUNTS["draft_kernel"]),
+        },
+        "probe": dict(_PROBE_REPORT),
+    }
+    block.update(route_counters())
+    return block
+
+
+def engagement_line(*, enabled: bool) -> str:
+    """The one-line install verdict, in the shape the other Fable lanes use."""
+
+    from mtplx.runtime_options import (
+        fable_qsa_sparse_decode_splits,
+        fable_qsa_sparse_decode_tile,
+    )
+
+    if not enabled:
+        reason = _DISABLED_REASON or "install probe has not run"
+        return f"[fable] qsa_sparse_decode: off ({reason})"
+    key_tile, dim_tile = fable_qsa_sparse_decode_tile()
+    worst = _PROBE_REPORT.get("worst") or {}
+    fp32 = worst.get("vs_fp32") or {}
+    shipped = worst.get("vs_shipped") or {}
+    widths = [str(VERIFY_ROWS)] if armed() else []
+    if armed(draft=True):
+        widths.append(str(DRAFT_ROWS))
+    return (
+        "[fable] qsa_sparse_decode armed: "
+        f"rows={'+'.join(widths) or '-'} "
+        f"tile={int(key_tile)}:{int(dim_tile)} "
+        f"splits={int(fable_qsa_sparse_decode_splits())} "
+        f"caches={int(_COUNTS['cache_installs'])} "
+        f"probe cell={worst.get('cell')!r} "
+        f"vs_fp32 ulps={fp32.get('max_abs_ulps', float('nan')):.3f} "
+        f"rel_l2={fp32.get('rel_l2', float('nan')):.3e} "
+        f"top1={fp32.get('top1', float('nan')):.4f} "
+        f"vs_shipped rel_l2={shipped.get('rel_l2', float('nan')):.3e} "
+        f"probe_runs={int(_COUNTS['probe_runs'])}"
+    )
+
+
+def assert_traced(rows: int, *, before: int, where: str) -> None:
+    """The armed verify lane must be IN this graph, not merely armed.
+
+    ``before`` is ``_COUNTS["route_hits"]`` sampled before the
+    traced forward.  A trace of the armed width that ends with no additional
+    route hit is an inert flag, and replaying that graph a few hundred times
+    produces a delta nobody can attribute -- which is what the 2026-09-02
+    window did.
+    """
+
+    if not armed() or int(rows) != VERIFY_ROWS:
+        return
+    gained = int(_COUNTS["route_hits"]) - int(before)
+    if gained > 0:
+        return
+    raise SparseDecodeContractError(
+        "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but the split-K kernel is not "
+        f"in the traced {where} graph at {int(rows)} rows: the QSA attention "
+        "took another path, so this arm would replay the stock chain. "
+        f"route_sites={dict(_ROUTE_SITES)} declines={dict(_ROUTE_DECLINES)}"
+    )
 
 
 def disabled_reason() -> Optional[str]:
@@ -152,6 +419,8 @@ def reset_for_tests() -> None:
     global _DISABLED_REASON
     _DISABLED_REASON = None
     _PROBE_REPORT.clear()
+    _ROUTE_SITES.clear()
+    _ROUTE_DECLINES.clear()
     for key in _COUNTS:
         _COUNTS[key] = 0
 
@@ -276,7 +545,7 @@ def _row_tokens_mx(top_idx: mx.array, q_offset, *, topk: int) -> Tuple[mx.array,
     return token_idx, token_ok
 
 
-def stock_reference(
+def reference_attention(
     queries: mx.array,
     keys: mx.array,
     values: mx.array,
@@ -285,15 +554,31 @@ def stock_reference(
     query_offset,
     scale: float,
     topk: int = TOP_K,
+    fp32_scores: bool,
+    fp32_probs: bool,
 ) -> mx.array:
-    """The shipped rows-gather attention, over the SAME visible set.
+    """The rows-gather attention over the SAME visible set, one rung at a time.
 
     Transcribed from ``mtplx/models/qwen4_exp.py::_qsa_rows_gather_attention``
-    (score GEMM -> ``-inf`` on invalid -> fp32 softmax -> bf16 probabilities
-    -> P@V) so the probe compares against ONE definition and does not import
-    the model into a kernel module.  ``keys``/``values`` are the full
-    ``[1, 2, capacity, 256]`` backing; every gathered index is an absolute
-    row inside it, exactly as in the shipped lane.
+    so the probe compares against ONE definition and does not import the model
+    into a kernel module.  ``keys``/``values`` are the full
+    ``[1, 2, capacity, 256]`` backing; every gathered index is an absolute row
+    inside it, exactly as in the shipped lane.
+
+    The two flags are the reference LADDER, and they exist to attribute the
+    kernel-vs-shipped delta rather than assume it:
+
+    ``fp32_scores=False``  reproduces the shipped path exactly -- ``mx.matmul``
+        on bf16 operands returns bf16, so the scores are rounded to bf16
+        BEFORE the ``astype(float32) * scale`` and the softmax.  Setting it
+        True upcasts q and k first (exact, bf16 -> fp32) so only the
+        accumulation and output precision change.
+    ``fp32_probs=False``  reproduces the shipped ``probs.astype(bfloat16)``
+        before P@V.  Setting it True keeps fp32 probabilities and upcasts V
+        (also exact).
+
+    Every rung returns ``queries.dtype``, so all three are comparable element
+    for element against the kernel's own bf16 output.
     """
 
     token_idx, token_ok = _row_tokens_mx(top_idx, query_offset, topk=topk)
@@ -308,12 +593,52 @@ def stock_reference(
     neg = mx.array(-mx.inf, dtype=mx.float32)
     q_view = queries.reshape(1, KV_HEADS, GQA, rows, 1, HEAD_DIM)
     k_view = k_sel.swapaxes(-1, -2).reshape(1, KV_HEADS, 1, rows, HEAD_DIM, width)
+    if fp32_scores:
+        # Upcasting bf16 -> fp32 is exact, so this changes the GEMM's output
+        # precision and nothing about the operands.
+        q_view = q_view.astype(mx.float32)
+        k_view = k_view.astype(mx.float32)
     scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
     scores = mx.where(token_ok[None, None, None], scores, neg)
-    probs = mx.softmax(scores, axis=-1).astype(queries.dtype)
+    probs = mx.softmax(scores, axis=-1)
     v_view = v_sel.reshape(1, KV_HEADS, 1, rows, width, HEAD_DIM)
+    if fp32_probs:
+        v_view = v_view.astype(mx.float32)
+    else:
+        probs = probs.astype(queries.dtype)
     out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
-    return out.reshape(1, Q_HEADS, rows, HEAD_DIM)
+    return out.reshape(1, Q_HEADS, rows, HEAD_DIM).astype(queries.dtype)
+
+
+def stock_reference(queries, keys, values, top_idx, **kwargs) -> mx.array:
+    """The shipped path, exactly: bf16 scores AND bf16 probabilities."""
+
+    return reference_attention(
+        queries, keys, values, top_idx, fp32_scores=False, fp32_probs=False, **kwargs
+    )
+
+
+def shipped_fp32_probs_reference(queries, keys, values, top_idx, **kwargs) -> mx.array:
+    """Shipped, minus only the bf16 probability cast.  Attribution rung."""
+
+    return reference_attention(
+        queries, keys, values, top_idx, fp32_scores=False, fp32_probs=True, **kwargs
+    )
+
+
+def fp32_reference(queries, keys, values, top_idx, **kwargs) -> mx.array:
+    """What the KERNEL computes: fp32 scores and fp32 probabilities.
+
+    The deciding numerical reference.  Against this the kernel's only
+    remaining differences are fp32 reassociation (Steel MMA fragments and the
+    split-K merge, both ~1e-6 relative) and the single bf16 store, so a delta
+    here of the same size as the kernel-vs-shipped delta would falsify the
+    attribution in this module's gate note.
+    """
+
+    return reference_attention(
+        queries, keys, values, top_idx, fp32_scores=True, fp32_probs=True, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -431,10 +756,14 @@ def install(
     """
 
     global _DISABLED_REASON
-    if _DISABLED_REASON is not None:
-        return _DISABLED_REASON == ""
     if not (verify or draft):
         return False
+    # Every cache that binds the lane counts, including the ones that reuse
+    # the process verdict: 12 QSA caches on the production pack, and a
+    # receipt showing fewer means some layers kept the stock chain.
+    _COUNTS["cache_installs"] += 1
+    if _DISABLED_REASON is not None:
+        return _DISABLED_REASON == ""
 
     check_cache_contract(keys, values, compress_ratio)
 
@@ -499,12 +828,19 @@ def install(
             dimension_tile=dim_tile,
             key_splits=key_splits,
         )
-        reference = stock_reference(
-            q, k, v, top_idx, query_offset=q_offset, scale=scale
+        # Both rungs: the fp32 reference decides, the shipped one is a sanity
+        # bound on the shipped path's own bf16 quantisation.  See the gate
+        # note at the top of this module for why they are not one number.
+        vs_fp32 = _compare(
+            fp32_reference(q, k, v, top_idx, query_offset=q_offset, scale=scale),
+            candidate,
         )
-        stats = _compare(reference, candidate)
-        stats["cell"] = name
-        if not worst or stats["max_abs_ulps"] > worst.get("max_abs_ulps", 0.0):
+        vs_shipped = _compare(
+            stock_reference(q, k, v, top_idx, query_offset=q_offset, scale=scale),
+            candidate,
+        )
+        stats = {"cell": name, "vs_fp32": vs_fp32, "vs_shipped": vs_shipped}
+        if not worst or vs_fp32["max_abs_ulps"] > worst["vs_fp32"]["max_abs_ulps"]:
             worst = stats
         _PROBE_REPORT[name] = stats
 
@@ -513,18 +849,34 @@ def install(
     _PROBE_REPORT["key_splits"] = key_splits
 
     failures = []
-    if worst.get("max_abs_ulps", math.inf) > PARITY_MAX_ABS_ULPS:
+    tight = worst.get("vs_fp32", {})
+    loose = worst.get("vs_shipped", {})
+    if tight.get("max_abs_ulps", math.inf) > PARITY_FP32_MAX_ABS_ULPS:
         failures.append(
-            f"max abs diff {worst['max_abs']:.3e} = "
-            f"{worst['max_abs_ulps']:.2f} bf16 ulp (limit {PARITY_MAX_ABS_ULPS})"
+            f"vs fp32 reference: max abs diff {tight['max_abs']:.3e} = "
+            f"{tight['max_abs_ulps']:.2f} bf16 ulp "
+            f"(limit {PARITY_FP32_MAX_ABS_ULPS})"
         )
-    if worst.get("rel_l2", math.inf) > PARITY_MAX_REL_L2:
+    if tight.get("rel_l2", math.inf) > PARITY_FP32_MAX_REL_L2:
         failures.append(
-            f"relative L2 {worst['rel_l2']:.3e} (limit {PARITY_MAX_REL_L2})"
+            f"vs fp32 reference: relative L2 {tight['rel_l2']:.3e} "
+            f"(limit {PARITY_FP32_MAX_REL_L2})"
         )
-    if worst.get("top1", 0.0) < PARITY_MIN_TOP1:
+    if tight.get("top1", 0.0) < PARITY_MIN_TOP1:
         failures.append(
-            f"head-dim top-1 agreement {worst['top1']:.4f} "
+            f"vs fp32 reference: head-dim top-1 {tight['top1']:.4f} "
+            f"(limit {PARITY_MIN_TOP1})"
+        )
+    if loose.get("rel_l2", math.inf) > PARITY_SHIPPED_MAX_REL_L2:
+        failures.append(
+            f"vs shipped path: relative L2 {loose['rel_l2']:.3e} "
+            f"(limit {PARITY_SHIPPED_MAX_REL_L2}) -- this bounds the SHIPPED "
+            "path's own bf16 score and probability casts, so exceeding it "
+            "means the kernel is wrong by a factor, not merely re-rounded"
+        )
+    if loose.get("top1", 0.0) < PARITY_MIN_TOP1:
+        failures.append(
+            f"vs shipped path: head-dim top-1 {loose['top1']:.4f} "
             f"(limit {PARITY_MIN_TOP1})"
         )
 
@@ -534,9 +886,19 @@ def install(
             f"parity probe failed on cell {worst.get('cell')!r}: "
             + "; ".join(failures)
         )
+        _emit(engagement_line(enabled=False))
+        _emit(
+            "[fable] qsa_sparse_decode install: "
+            + json.dumps(receipt(), sort_keys=True)
+        )
         return False
 
     _DISABLED_REASON = ""
+    _emit(engagement_line(enabled=True))
+    _emit(
+        "[fable] qsa_sparse_decode install: "
+        + json.dumps(receipt(), sort_keys=True)
+    )
     return True
 
 
@@ -608,12 +970,23 @@ def attention(
 __all__ = [
     "COMPRESS_RATIO",
     "DRAFT_ROWS",
+    "SparseDecodeContractError",
+    "armed",
+    "assert_traced",
+    "engagement_line",
+    "installed",
+    "note_route_decline",
+    "note_route_hit",
+    "pending",
+    "receipt",
+    "route_counters",
     "GQA",
     "HEAD_DIM",
     "KV_HEADS",
-    "PARITY_MAX_ABS_ULPS",
-    "PARITY_MAX_REL_L2",
+    "PARITY_FP32_MAX_ABS_ULPS",
+    "PARITY_FP32_MAX_REL_L2",
     "PARITY_MIN_TOP1",
+    "PARITY_SHIPPED_MAX_REL_L2",
     "PROBE_CAPACITY",
     "Q_HEADS",
     "SELECTED_TOKENS",
@@ -622,10 +995,13 @@ __all__ = [
     "attention",
     "check_cache_contract",
     "disabled_reason",
+    "fp32_reference",
     "engagement",
     "install",
     "kernel_row_tokens",
     "reset_for_tests",
+    "reference_attention",
+    "shipped_fp32_probs_reference",
     "shipped_row_tokens",
     "stock_reference",
     "visible_block_count",

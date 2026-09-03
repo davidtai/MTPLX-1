@@ -23,6 +23,7 @@ What IS falsifiable without a GPU, and is tested here:
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -557,3 +558,623 @@ def test_micro_rejects_an_unknown_family_rather_than_measuring_the_default():
     micro = _load_micro()
     with pytest.raises(SystemExit):
         micro.main(["--families", "hc_triple"])
+
+
+# --------------------------------------------------------------------------
+# micro_verify_glue_a.compare / arm_order
+#
+# The first guarded run of the micro died here: ``FAMILIES["rope"]`` lists
+# ``rope_prediet`` first but the reference arm is ``rope_stock``, so the very
+# first comparison ran with ``ref_out`` still None and ``zip(got, None)``
+# raised. These tests drive every branch of ``compare`` with DUCK-TYPED arrays
+# and a stub ``mx``, so they prove the arithmetic and the guards without
+# evaluating a single MLX array.
+# --------------------------------------------------------------------------
+class _StubScalar:
+    def __init__(self, value):
+        self._value = value
+
+    def item(self):
+        return self._value
+
+
+class _StubArray:
+    """The slice of the mx.array surface ``compare`` actually touches."""
+
+    def __init__(self, values):
+        self._values = list(values)
+
+    @property
+    def size(self):
+        return len(self._values)
+
+    def astype(self, _dtype):
+        return self
+
+    def __sub__(self, other):
+        return _StubArray(
+            [a - b for a, b in zip(self._values, other._values)]
+        )
+
+    def __ne__(self, other):
+        return _StubArray(
+            [a != b for a, b in zip(self._values, other._values)]
+        )
+
+
+class _StubMx:
+    float32 = object()
+
+    @staticmethod
+    def abs(array):
+        return _StubArray([abs(v) for v in array._values])
+
+    @staticmethod
+    def max(array):
+        return _StubScalar(max(array._values) if array._values else 0.0)
+
+    @staticmethod
+    def sum(array):
+        return _StubScalar(sum(1 for v in array._values if v))
+
+
+@pytest.fixture()
+def micro_with_stub_mx(monkeypatch):
+    micro = _load_micro()
+    monkeypatch.setattr(micro, "mx", _StubMx)
+    return micro
+
+
+def test_compare_on_identical_outputs_is_exact(micro_with_stub_mx):
+    micro = micro_with_stub_mx
+    got = [_StubArray([1.0, 2.0, 3.0])]
+    ref = [_StubArray([1.0, 2.0, 3.0])]
+    assert micro.compare(got, ref) == (0.0, 0, 3)
+
+
+def test_compare_counts_every_differing_element_not_just_the_worst(
+    micro_with_stub_mx,
+):
+    micro = micro_with_stub_mx
+    got = [_StubArray([1.0, 2.5, 3.0, 9.0])]
+    ref = [_StubArray([1.0, 2.0, 3.0, 8.5])]
+    worst, differing, total = micro.compare(got, ref)
+    assert worst == pytest.approx(0.5)
+    assert differing == 2
+    assert total == 4
+
+
+def test_compare_accumulates_across_several_output_tensors(
+    micro_with_stub_mx,
+):
+    micro = micro_with_stub_mx
+    got = [_StubArray([1.0, 2.0]), _StubArray([5.0, 5.0, 5.0])]
+    ref = [_StubArray([1.0, 2.0]), _StubArray([5.0, 1.0, 5.0])]
+    worst, differing, total = micro.compare(got, ref)
+    assert worst == pytest.approx(4.0)
+    assert differing == 1
+    assert total == 5
+
+
+def test_compare_handles_no_outputs(micro_with_stub_mx):
+    micro = micro_with_stub_mx
+    assert micro.compare([], []) == (0.0, 0, 0)
+
+
+def test_compare_raises_on_a_missing_reference(micro_with_stub_mx):
+    """The exact failure the first guarded run hit, now named."""
+
+    micro = micro_with_stub_mx
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.compare([_StubArray([1.0])], None)
+    message = str(excinfo.value)
+    assert "no reference" in message
+    assert "ordering bug" in message
+
+
+def test_compare_raises_on_a_length_mismatch_instead_of_truncating(
+    micro_with_stub_mx,
+):
+    """``zip`` would silently score parity on the prefix."""
+
+    micro = micro_with_stub_mx
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.compare(
+            [_StubArray([1.0])],
+            [_StubArray([1.0]), _StubArray([2.0])],
+        )
+    assert "1 outputs against 2 reference" in str(excinfo.value)
+
+
+def test_arm_order_puts_the_reference_first_for_every_family():
+    micro = _load_micro()
+    for family in micro.FAMILIES:
+        order = micro.arm_order(family)
+        assert order[0] == micro.STOCK[family]
+        # ...and runs exactly the same arms as the print order.
+        assert sorted(order) == sorted(micro.FAMILIES[family])
+
+
+def test_arm_order_is_not_the_print_order_and_that_is_the_whole_point():
+    micro = _load_micro()
+    # If this ever becomes equal, the reorder is load-bearing for nothing --
+    # but today the rope table PRINTS pre-diet first and must EXECUTE stock
+    # first, which is precisely the bug that killed the first guarded run.
+    assert micro.FAMILIES["rope"][0] != micro.STOCK["rope"]
+    assert micro.arm_order("rope") != micro.FAMILIES["rope"]
+
+
+def test_arm_order_raises_when_a_family_has_no_stock_arm(monkeypatch):
+    micro = _load_micro()
+    monkeypatch.setitem(micro.FAMILIES, "rope", ("rope_fused",))
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.arm_order("rope")
+    assert "no stock arm" in str(excinfo.value)
+
+
+def test_every_family_is_reachable_from_the_default_cli():
+    micro = _load_micro()
+    args = micro.build_parser().parse_args([])
+    named = {f.strip() for f in args.families.split(",")}
+    assert named == set(micro.FAMILIES)
+
+
+# --------------------------------------------------------------------------
+# The whole micro, end to end, on a stubbed backend.
+#
+# The parity guards above pin ``compare``; this pins the CONTROL FLOW around
+# it. The first guarded run spent a GPU window to discover an ordering bug
+# that costs nothing to catch here, so the harness now runs to completion --
+# build, dispatch count, parity, timing, table, receipt -- against a fake
+# ``mx``/``mtplx`` on the CPU, with no MLX array evaluated anywhere.
+# --------------------------------------------------------------------------
+import contextlib  # noqa: E402
+import math  # noqa: E402
+
+
+class _FakeArray(_StubArray):
+    def __add__(self, other):
+        # Broadcast the shorter operand, which is all the harness needs
+        # (``pos_start`` is a scalar-ish leaf added to ``arange(S)``).
+        values = other._values if len(other._values) >= len(self._values) else self._values
+        return _FakeArray(list(values))
+
+    __radd__ = __add__
+
+    def __truediv__(self, other):
+        return _FakeArray([v / other for v in self._values])
+
+    def __rtruediv__(self, other):
+        return _FakeArray([other / v for v in self._values])
+
+    def __rpow__(self, base):
+        return _FakeArray([base ** v for v in self._values])
+
+    def astype(self, _dtype):
+        return self
+
+
+class _FakeRandom:
+    @staticmethod
+    def seed(_value):
+        return None
+
+    @staticmethod
+    def normal(shape):
+        return _FakeArray([0.5] * max(1, math.prod(shape)))
+
+
+class _FakeFast:
+    @staticmethod
+    def rms_norm(values, _weight, _eps):
+        return values
+
+
+class _FakeMx(_StubMx):
+    bfloat16 = object()
+    int32 = object()
+    random = _FakeRandom
+    fast = _FakeFast
+
+    @staticmethod
+    def arange(start, stop=None, step=1, dtype=None):
+        if stop is None:
+            start, stop = 0, start
+        return _FakeArray(list(range(int(start), int(stop), int(step))))
+
+    @staticmethod
+    def array(values, dtype=None):
+        return _FakeArray(values)
+
+    @staticmethod
+    def zeros(shape, dtype=None):
+        return _FakeArray([0.0] * max(1, math.prod(shape)))
+
+    @staticmethod
+    def eval(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_cache():
+        return None
+
+    @staticmethod
+    def compile(fn):
+        return fn
+
+    @staticmethod
+    def export_to_dot(buffer, *_outputs):
+        buffer.write('{ 1 [label ="Multiply"] }\n{ 2 [label ="Cos"] }\n')
+
+
+class _FakeModel:
+    @staticmethod
+    def _rope_cos_sin(_positions, _inv_freq, _scaling):
+        return _FakeArray([0.0]), _FakeArray([0.0])
+
+    @staticmethod
+    def _rope_cos_sin_half(_positions, _inv_freq, _scaling):
+        return _FakeArray([0.0]), _FakeArray([0.0])
+
+    @staticmethod
+    def _shared_rope_cos_sin_half(_pos, _length, _inv_freq, _scaling):
+        return _FakeArray([0.0]), _FakeArray([0.0])
+
+    @staticmethod
+    def _apply_partial_rope(values, _cos, _sin):
+        return values
+
+    @staticmethod
+    def _apply_partial_rope_half(values, _cos, _sin):
+        return values
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _rope_table_scope():
+        yield
+
+
+class _FakeRopeKernel:
+    @staticmethod
+    def rope_qk(queries, keys, _inv_freq, *, pos_start, attention_scaling):
+        del pos_start, attention_scaling
+        return queries, keys
+
+
+class _FakePrepare:
+    @staticmethod
+    def qsa_indexer_prepare_queries_metal(
+        values, _weight, _inv_freq, *, pos_start, eps, attention_scaling
+    ):
+        del pos_start, eps, attention_scaling
+        return values
+
+
+def _stub_micro(monkeypatch):
+    micro = _load_micro()
+
+    def _install():
+        micro.mx = _FakeMx
+        micro._model = _FakeModel
+        micro._rope = _FakeRopeKernel
+        micro._prepare = _FakePrepare
+
+    monkeypatch.setattr(micro, "_require_mlx", _install)
+    return micro
+
+
+def test_micro_runs_to_completion_on_a_stubbed_backend(monkeypatch, tmp_path, capsys):
+    micro = _stub_micro(monkeypatch)
+    receipt = tmp_path / "micro.json"
+
+    assert micro.main(["--layers", "2", "--reps", "2", "--warmup", "1",
+                       "--out", str(receipt)]) == 0
+
+    payload = json.loads(receipt.read_text())
+    # Every arm timed in every lane...
+    for family, arms in micro.FAMILIES.items():
+        for arm in arms:
+            for lane in ("eager", "compiled"):
+                assert f"{arm}/{lane}" in payload["variants"], (family, arm, lane)
+    # ...and every NON-stock arm scored for parity in every lane, which is
+    # exactly what the first guarded run never reached.
+    for family, arms in micro.FAMILIES.items():
+        for arm in arms:
+            for lane in ("eager", "compiled"):
+                key = f"{arm}/{lane}"
+                if arm == micro.STOCK[family]:
+                    assert key not in payload["numerics"]
+                else:
+                    assert key in payload["numerics"], key
+                    assert payload["numerics"][key]["differing"] == 0
+    assert payload["shapes"]["layers"] == 2
+    out = capsys.readouterr().out
+    assert "rope_fused" in out and "prep_fused" in out
+
+
+def test_micro_would_still_die_if_the_arm_order_were_reverted(monkeypatch):
+    """Pin the regression: table order really does break the parity pass."""
+
+    micro = _stub_micro(monkeypatch)
+    monkeypatch.setattr(micro, "arm_order", lambda family: micro.FAMILIES[family])
+    with pytest.raises(RuntimeError) as excinfo:
+        micro.main(["--layers", "1", "--reps", "1", "--warmup", "0"])
+    assert "no reference" in str(excinfo.value)
+
+
+def test_micro_single_family_and_single_lane_still_score_parity(
+    monkeypatch, tmp_path
+):
+    micro = _stub_micro(monkeypatch)
+    receipt = tmp_path / "one.json"
+    assert micro.main([
+        "--families", "rope", "--lanes", "compiled",
+        "--layers", "1", "--reps", "1", "--warmup", "0",
+        "--out", str(receipt),
+    ]) == 0
+    payload = json.loads(receipt.read_text())
+    assert set(payload["numerics"]) == {
+        "rope_prediet/compiled", "rope_scoped/compiled", "rope_fused/compiled"
+    }
+
+
+# --------------------------------------------------------------------------
+# Engagement evidence: the receipt block, and the driver's refusal to read an
+# arm that cannot prove which code it ran.
+#
+# The 2026-09-02 W70 ABBA produced NO evidence either way -- the lane's line
+# went to logger.info (invisible in a driver run: [qwen4-fixed-M4-verify] and
+# [qwen4-compiled-MTP-prepare] are missing from the same log) and no counter
+# reached the receipt. These tests pin both halves of the fix.
+# --------------------------------------------------------------------------
+from mtplx import fable_verify_glue as glue  # noqa: E402
+
+
+@pytest.fixture()
+def armed_glue(monkeypatch):
+    from mtplx import runtime_options
+
+    glue.reset_for_tests()
+    runtime_options.reset_fable_verify_glue_cache(
+        env={"MTPLX_FABLE_VERIFY_GLUE": "1"}
+    )
+    yield glue
+    runtime_options.reset_fable_verify_glue_cache(env={})
+    glue.reset_for_tests()
+
+
+def test_receipt_is_readable_while_unarmed_and_never_raises():
+    glue.reset_for_tests()
+    block = glue.receipt()
+    assert block["armed"] is False
+    assert block["selected"] == []
+    assert block["installed"] == []
+    assert glue.uncalled_items(block) == []
+
+
+def test_receipt_reports_pending_instead_of_raising(armed_glue):
+    """``qsa_rope_installed`` raises while pending; a receipt must not."""
+
+    block = armed_glue.receipt()
+    assert block["armed"] is True
+    assert sorted(block["selected"]) == ["qsa_rope", "qsa_rope_idx"]
+    assert sorted(block["pending"]) == ["qsa_rope", "qsa_rope_idx"]
+    assert block["installed"] == []
+
+
+def test_receipt_carries_the_per_item_call_counters(armed_glue, monkeypatch):
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    monkeypatch.setattr(rope_mod, "_DISABLED_REASON", "")
+    monkeypatch.setitem(rope_mod._COUNTS, "qk_calls", 12)
+    monkeypatch.setattr(glue, "_IDX_DISABLED_REASON", "")
+    monkeypatch.setitem(glue._IDX_COUNTS, "prep_calls", 12)
+
+    block = armed_glue.receipt()
+    assert sorted(block["installed"]) == ["qsa_rope", "qsa_rope_idx"]
+    assert block["calls"]["qsa_rope"]["qk_calls"] == 12
+    assert block["calls"]["qsa_rope_idx"]["prep_calls"] == 12
+    assert glue.uncalled_items(block) == []
+
+
+def test_uncalled_items_names_an_installed_lane_that_never_ran(
+    armed_glue, monkeypatch
+):
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    monkeypatch.setattr(rope_mod, "_DISABLED_REASON", "")
+    monkeypatch.setattr(glue, "_IDX_DISABLED_REASON", "")
+    monkeypatch.setitem(glue._IDX_COUNTS, "prep_calls", 12)
+    # qsa_rope installed but never entered the graph.
+    block = armed_glue.receipt()
+    assert glue.uncalled_items(block) == ["qsa_rope"]
+
+
+def test_receipt_records_a_disabled_item_with_its_reason(armed_glue, monkeypatch):
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    monkeypatch.setattr(rope_mod, "_DISABLED_REASON", "layer 0: not bit-exact")
+    monkeypatch.setattr(glue, "_IDX_DISABLED_REASON", "")
+    block = armed_glue.receipt()
+    assert block["installed"] == ["qsa_rope_idx"]
+    assert block["disabled"] == {"qsa_rope": "layer 0: not bit-exact"}
+
+
+def test_engagement_lines_reach_stderr_not_only_the_logger(capsys):
+    glue._emit("[fable] verify-glue probe: hello")
+    captured = capsys.readouterr()
+    assert "[fable] verify-glue probe: hello" in captured.err
+
+
+# --- the driver's side of the contract -------------------------------------
+DRIVER_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "fable" / "abba_driver.py"
+)
+
+
+def _load_driver():
+    spec = importlib.util.spec_from_file_location("abba_driver", DRIVER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Runtime:
+    def __init__(self, report=None):
+        if report is not None:
+            self._mtplx_fable_verify_glue = report
+
+
+def test_driver_block_is_a_noop_when_the_flag_is_unarmed():
+    glue.reset_for_tests()
+    driver = _load_driver()
+    block = driver.fable_verify_glue_block(_Runtime(), require_calls=True)
+    assert block["armed"] is False
+    assert "problems" not in block
+
+
+def test_driver_raises_when_the_install_hook_never_ran(armed_glue):
+    """The exact silence the 2026-09-02 ABBA could not distinguish."""
+
+    driver = _load_driver()
+    with pytest.raises(RuntimeError) as excinfo:
+        driver.fable_verify_glue_block(_Runtime(), require_calls=False)
+    message = str(excinfo.value)
+    assert "install probe never" in message
+    assert "measure the control" in message
+
+
+def test_driver_raises_when_every_selected_item_is_disabled(
+    armed_glue, monkeypatch
+):
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    monkeypatch.setattr(rope_mod, "_DISABLED_REASON", "not bit-exact")
+    monkeypatch.setattr(glue, "_IDX_DISABLED_REASON", "not bit-exact")
+    driver = _load_driver()
+    with pytest.raises(RuntimeError) as excinfo:
+        driver.fable_verify_glue_block(
+            _Runtime({"armed": True}), require_calls=False
+        )
+    assert "every selected item is" in str(excinfo.value)
+
+
+def test_driver_raises_when_an_installed_item_never_entered_the_graph(
+    armed_glue, monkeypatch
+):
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    monkeypatch.setattr(rope_mod, "_DISABLED_REASON", "")
+    monkeypatch.setattr(glue, "_IDX_DISABLED_REASON", "")
+    driver = _load_driver()
+    # Fine at load, because nothing is traced yet...
+    driver.fable_verify_glue_block(
+        _Runtime({"armed": True}), require_calls=False
+    )
+    # ...and fatal at receipt time, which is when the counters mean something.
+    with pytest.raises(RuntimeError) as excinfo:
+        driver.fable_verify_glue_block(
+            _Runtime({"armed": True}), require_calls=True
+        )
+    assert "never called" in str(excinfo.value)
+
+
+def test_driver_lenient_mode_collects_problems_so_evidence_still_lands(
+    armed_glue, monkeypatch
+):
+    """strict=False must not raise: the receipt has to reach disk first."""
+
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    monkeypatch.setattr(rope_mod, "_DISABLED_REASON", "")
+    monkeypatch.setattr(glue, "_IDX_DISABLED_REASON", "")
+    driver = _load_driver()
+    block = driver.fable_verify_glue_block(
+        _Runtime({"armed": True}), require_calls=True, strict=False
+    )
+    assert block["problems"], "a lenient call must still record the failure"
+    assert any("never called" in p for p in block["problems"])
+    assert block["installed"], "the evidence itself must survive"
+
+
+def test_driver_passes_a_fully_engaged_arm(armed_glue, monkeypatch):
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    monkeypatch.setattr(rope_mod, "_DISABLED_REASON", "")
+    monkeypatch.setitem(rope_mod._COUNTS, "qk_calls", 12)
+    monkeypatch.setattr(glue, "_IDX_DISABLED_REASON", "")
+    monkeypatch.setitem(glue._IDX_COUNTS, "prep_calls", 12)
+    driver = _load_driver()
+    block = driver.fable_verify_glue_block(
+        _Runtime({"armed": True}), require_calls=True, strict=False
+    )
+    assert block["problems"] == []
+    assert sorted(block["installed"]) == ["qsa_rope", "qsa_rope_idx"]
+
+
+def test_install_prints_an_engagement_line_per_item_and_a_summary(
+    armed_glue, monkeypatch, capsys
+):
+    """End to end: install() must leave proof on stderr, not just in a logger."""
+
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    class _Same:
+        def item(self):
+            return True
+
+    monkeypatch.setattr(rope_mod, "stock_reference", lambda q, k, f, **kw: (q, k))
+    monkeypatch.setattr(rope_mod, "rope_qk", lambda q, k, f, **kw: (q, k))
+    monkeypatch.setattr(rope_mod.mx, "array_equal", lambda a, b: _Same())
+    monkeypatch.setattr(rope_mod.mx, "eval", lambda *a, **k: None)
+    # The indexer item's probe needs a module; stub it out entirely -- its
+    # arithmetic is pinned by tests/test_qsa_indexer_prepare_metal.py.
+    monkeypatch.setattr(glue, "_probe_indexer", lambda indexer, **kw: None)
+
+    shared = mx.zeros((32,), dtype=mx.float32)
+    layers = []
+    for index in range(0, 48, 4):
+        attention = _FakeAttention()
+        attention._inv_freq = shared
+        attention.indexer = object()
+        layers.append((index, attention))
+
+    report = glue.install(tuple(layers), rows=4)
+    assert report["armed"] is True
+
+    err = capsys.readouterr().err
+    assert "[fable] verify-glue qsa_rope: on, layers=12" in err
+    assert "[fable] verify-glue qsa_rope_idx: on, layers=12" in err
+    assert "[fable] verify-glue install: " in err
+    summary = json.loads(err.split("[fable] verify-glue install: ")[1].split("\n")[0])
+    assert sorted(summary["installed"]) == ["qsa_rope", "qsa_rope_idx"]
+    assert summary["layers"] == 12
+    assert summary["disabled"] == {}
+
+
+def test_install_says_off_and_why_when_an_item_disables_itself(
+    armed_glue, monkeypatch, capsys
+):
+    from mtplx.kernels import qwen4_m4_rope as rope_mod
+
+    class _Different:
+        def item(self):
+            return False
+
+    monkeypatch.setattr(rope_mod, "stock_reference", lambda q, k, f, **kw: (q, k))
+    monkeypatch.setattr(rope_mod, "rope_qk", lambda q, k, f, **kw: (q, k))
+    monkeypatch.setattr(rope_mod.mx, "array_equal", lambda a, b: _Different())
+    monkeypatch.setattr(rope_mod.mx, "eval", lambda *a, **k: None)
+    monkeypatch.setattr(glue, "_probe_indexer", lambda indexer, **kw: None)
+
+    attention = _FakeAttention()
+    attention.indexer = object()
+    glue.install(((0, attention),), rows=4)
+
+    err = capsys.readouterr().err
+    assert "[fable] verify-glue qsa_rope: off (" in err
+    assert "not bit-exact" in err
+    summary = json.loads(err.split("[fable] verify-glue install: ")[1].split("\n")[0])
+    assert summary["installed"] == ["qsa_rope_idx"]
+    assert "qsa_rope" in summary["disabled"]

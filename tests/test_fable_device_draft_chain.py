@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 import sys
 import types
 from pathlib import Path
@@ -42,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from mtplx import fable_claim_contract as contract
 from mtplx import fable_device_draft_chain as ddc
 from mtplx.sampling import SamplerConfig, SparseDistribution
 
@@ -831,8 +833,48 @@ def test_claim_returns_none_when_the_flag_is_off(monkeypatch):
         ({"request_max_tokens": 0}, "request_max_tokens"),
     ],
 )
-def test_claim_refuses_by_name(monkeypatch, overrides, match):
+def test_claim_declines_by_name(monkeypatch, overrides, match):
+    """Request-shaped ineligibility stands aside; it does not raise.
+
+    Every override here is a property of ONE REQUEST, so raising turned a
+    request the stock loop serves perfectly into an HTTP 500 (composed-stack
+    HumanEval gate, 2026-09-02).  The lane declines: plan is None, the stock
+    draft loop runs, and the receipt says why.
+    """
+
     monkeypatch.setattr(ddc, "_MODE", ddc.MODE_CHAIN)
+    monkeypatch.setattr(contract, "_STRICT", False)
+    contract.reset_for_test()
+    ddc.reset_counters()
+    receipt: dict[str, object] = {}
+    plan = ddc.claim_request_route(receipt=receipt, **_claim_kwargs(**overrides))
+    assert plan is None
+    assert receipt["installed"] is False
+    assert re.search(match, str(receipt["declined_detail"]))
+    assert receipt["declined"]
+    assert ddc.COUNTERS["declines"] == 1
+    assert ddc.COUNTERS["refusals"] == 0
+    assert contract.decline_counts(ddc._ENV_VAR)[receipt["declined"]] == 1
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"draft_core": "device"}, "stock draft selector"),
+        ({"greedy_chain_enabled": True}, "greedy draft chain"),
+        (
+            {"draft_sampler": SamplerConfig(temperature=0.0, top_k=20)},
+            "sampled-lane route",
+        ),
+    ],
+)
+def test_strict_claims_turns_a_decline_back_into_a_failure(
+    monkeypatch, overrides, match
+):
+    """A measured arm still fails closed under MTPLX_FABLE_STRICT_CLAIMS."""
+
+    monkeypatch.setattr(ddc, "_MODE", ddc.MODE_CHAIN)
+    monkeypatch.setattr(contract, "_STRICT", True)
     with pytest.raises(ddc.DeviceDraftChainIneligible, match=match):
         ddc.claim_request_route(**_claim_kwargs(**overrides))
 
@@ -1260,3 +1302,79 @@ def test_no_unguarded_host_consumer_of_the_now_lazy_cycle_offset():
         "new host consumer(s) of cycle_mtp_offset; it is a lazy mx.array when "
         f"MTPLX_FABLE_DEVICE_DRAFT_CHAIN is bound: {unexplained}"
     )
+
+
+def test_the_call_site_supplies_exactly_the_claim_body_signature():
+    """``claim_request_route(**request)`` loses static keyword checking.
+
+    The wrapper forwards an opaque ``**request`` so the 45-term list lives in
+    one place, which means a typo at the call site would only surface as a
+    TypeError on the first armed request.  Pin it here instead.
+    """
+
+    import inspect
+
+    from mtplx import generation
+
+    inner = set(inspect.signature(ddc._claim_request_route).parameters)
+    source = inspect.getsource(generation.generate_mtpk)
+    tree = ast.parse(
+        "def f():\n" + "\n".join("    " + line for line in source.splitlines())
+    )
+    supplied = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "_fable_device_draft_chain_claim"
+        ):
+            supplied = {kw.arg for kw in node.keywords}
+    assert supplied is not None, "the device-draft-chain claim call site moved"
+    supplied.discard("receipt")
+    assert supplied == inner
+
+
+# --------------------------------------------------------------------------
+# Greedy vs temperature-1: which shape gets which path
+# --------------------------------------------------------------------------
+
+
+def test_a_greedy_request_is_routed_to_the_greedy_chain(monkeypatch):
+    """A SAMPLED-lane route: the compiled body bakes one temperature and a
+    top-p route and consumes PCG64 uniforms, none of which a greedy request
+    has. Greedy keeps its own one-sync chain, which reads the same
+    pre-scatter row under MTPLX_FABLE_DRAFT_K20_PRESCATTER, so nothing is
+    lost by routing it there."""
+
+    monkeypatch.setattr(ddc, "_MODE", ddc.MODE_CHAIN)
+    monkeypatch.setattr(contract, "_STRICT", False)
+    contract.reset_for_test()
+    greedy = SamplerConfig(temperature=0.0, top_k=20)
+    receipt: dict[str, object] = {}
+    plan = ddc.claim_request_route(
+        receipt=receipt,
+        **_claim_kwargs(sampler=greedy, draft_sampler=greedy),
+    )
+    assert plan is None
+    assert receipt["declined"] == "greedy_request"
+    assert "temperature > 0" in str(receipt["declined_detail"])
+
+
+def test_a_temperature_one_request_still_claims(monkeypatch):
+    monkeypatch.setattr(ddc, "_MODE", ddc.MODE_CHAIN)
+    monkeypatch.setattr(contract, "_STRICT", False)
+    # Stub the chain builder and the choice binder: building the real ones
+    # compiles a Metal kernel, which these CPU-only tests must never do (and
+    # its lru_cache would then outlive this test).
+    fake_fcd = types.ModuleType("mtplx.fable_compiled_draft")
+    fake_fcd.build_compiled_draft_chain = lambda **kwargs: {}
+    monkeypatch.setitem(sys.modules, "mtplx.fable_compiled_draft", fake_fcd)
+    fake_kernel = types.ModuleType("mtplx.kernels.qwen4_frspec_k20_float32_choice")
+    fake_kernel.bind_qwen4_frspec_k20_float32_choice = lambda *, top_p: "selector"
+    monkeypatch.setitem(
+        sys.modules,
+        "mtplx.kernels.qwen4_frspec_k20_float32_choice",
+        fake_kernel,
+    )
+    plan = ddc.claim_request_route(**_claim_kwargs())
+    assert plan is not None
+    ddc.release(plan)
