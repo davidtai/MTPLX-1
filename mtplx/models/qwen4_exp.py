@@ -6439,7 +6439,20 @@ class Qwen4ExpTextModel(nn.Module):
                 # re-wrap, and so `_decode_layers_compiled` can assert that no
                 # declared lane was hidden by it.  Trace-time only: replays
                 # bind this graph positionally and never re-enter this body.
-                _cache_identity.bind_rewrapped_entry(c, layer_index)
+                real = _cache_identity.bind_rewrapped_entry(c, layer_index)
+                # W77.  The same re-wrap drops `lengths` / `left_padding`:
+                # this container has neither, and neither is an input to the
+                # traced step, so the ragged conv-state write and the three
+                # `_fused_*_applies` refusals all read None inside the run
+                # whatever the real entry holds.  Checked per layer HERE
+                # because a trace runs once per shape and a replay re-enters
+                # no Python -- the per-forward half of the same guard is in
+                # `_decode_layers_compiled`, on the run's head entry.
+                _cache_identity.assert_no_ragged_metadata(
+                    real,
+                    layer_index,
+                    label="qwen4_exp compiled GDN decode run (trace)",
+                )
                 if _GDN_KEEPMASK_FOLD_ARMED:
                     # MTPLX_FABLE_GDN_KEEPMASK_FOLD (W66d).  This run hands
                     # the layer a THROWAWAY container, not the compiled
@@ -6510,6 +6523,18 @@ class Qwen4ExpTextModel(nn.Module):
                             h, input_ids=inputs, ssm_mask=None, cache=cache[i]
                         )
                     continue
+                # W77.  A compiled run drops `lengths` / `left_padding` (see
+                # cache_identity.assert_no_ragged_metadata).  `_forward` only
+                # reaches here when `cache[self.ssm_idx].make_mask()` returned
+                # None, which today implies both fields are unset on EVERY
+                # entry -- but only because the producers set them uniformly.
+                # Two attribute loads per run keep that an assertion instead
+                # of an assumption; the per-layer half runs at trace time.
+                _cache_identity.assert_no_ragged_metadata(
+                    cache[idxs[0]],
+                    idxs[0],
+                    label="qwen4_exp compiled GDN decode run",
+                )
                 out = self._get_run_fn(idxs, capture)(h, *flat)
                 # W73.  Checked HERE, while the trace that built this run is
                 # still on the stack: any lane that declared an expectation
