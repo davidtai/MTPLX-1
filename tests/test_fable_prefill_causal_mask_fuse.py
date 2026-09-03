@@ -72,20 +72,24 @@ def _clean_lane_state(monkeypatch):
     monkeypatch.delenv(MASK_FUSE_ENV, raising=False)
     monkeypatch.delenv(QUERY_TILE_ENV, raising=False)
     qwen4_exp._prefill_mask_fuse_enabled.cache_clear()
-    qwen4_exp._prefill_mask_fuse_probed.cache_clear()
     saved_counts = dict(qwen4_exp._QSA_PREFILL_COUNTS)
     saved_unavailable = dict(qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE)
+    saved_printed = qwen4_exp._MASK_FUSE_REFUSALS_PRINTED[0]
+    saved_engaged = qwen4_exp._MASK_FUSE_ENGAGED[0]
     qwen4_exp._QSA_PREFILL_COUNTS.clear()
     qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE.clear()
+    qwen4_exp._MASK_FUSE_REFUSALS_PRINTED[0] = 0
+    qwen4_exp._MASK_FUSE_ENGAGED[0] = False
     try:
         yield
     finally:
         qwen4_exp._prefill_mask_fuse_enabled.cache_clear()
-        qwen4_exp._prefill_mask_fuse_probed.cache_clear()
         qwen4_exp._QSA_PREFILL_COUNTS.clear()
         qwen4_exp._QSA_PREFILL_COUNTS.update(saved_counts)
         qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE.clear()
         qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE.update(saved_unavailable)
+        qwen4_exp._MASK_FUSE_REFUSALS_PRINTED[0] = saved_printed
+        qwen4_exp._MASK_FUSE_ENGAGED[0] = saved_engaged
 
 
 def _arm(monkeypatch, value: str = "1") -> None:
@@ -322,18 +326,55 @@ def test_tiled_causal_string_matches_untiled_and_tiled_dense(monkeypatch):
 
 
 class _FakeSdpa:
-    """Stand-in for a build that DOES have the fused kernels."""
+    """Stand-in for a build that DOES have the fused kernels.
 
-    def __init__(self, fail_on=()):
+    ``fail_on`` refuses a whole mask kind.  ``refuse`` is the interesting
+    one: a predicate over the call's own geometry, because that is how MLX
+    actually refuses -- ``use_fallback`` reads the query length, the GQA
+    factor and the head dims, so one build serves a 4,096-row prefill chunk
+    and refuses a 4-row verify step at the very same head dim and mask kind.
+    """
+
+    def __init__(self, fail_on=(), refuse=None):
         self.calls = []
+        self.geoms = []
         self.fail_on = set(fail_on)
+        self.refuse = refuse
 
     def __call__(self, q, k, v, *, scale, mask=None, force_fused=False, **kw):
         kind = "causal" if isinstance(mask, str) else "bool"
         self.calls.append((kind, bool(force_fused)))
-        if force_fused and kind in self.fail_on:
-            raise ValueError(f"no fused kernel for {kind}")
+        self.geoms.append((kind, bool(force_fused), int(q.shape[2])))
+        if force_fused and (
+            kind in self.fail_on
+            or (self.refuse is not None and self.refuse(kind, q, k))
+        ):
+            raise ValueError(
+                f"no fused kernel for {kind} at query length {int(q.shape[2])}"
+            )
         return mx.zeros(q.shape, dtype=q.dtype)
+
+
+#: The served geometry: 24 query heads over 2 kv heads at head_dim 256.
+PROD_Q_HEADS, PROD_KV_HEADS, PROD_HEAD_DIM = 24, 2, 256
+#: MLX's vector kernel caps ``q_len * gqa_factor`` at 32 and its full kernel
+#: wants ``q_len > 8``; at GQA 12 that is a dead band at q_len 3..8, which is
+#: where an MTP verify step (4 rows) lands and a prefill chunk never does.
+VERIFY_ROWS, CHUNK_ROWS = 4, 64
+
+
+def _prod_qkv(rows: int, total: int):
+    q = mx.zeros((1, PROD_Q_HEADS, rows, PROD_HEAD_DIM), dtype=mx.bfloat16)
+    kv = mx.zeros((1, PROD_KV_HEADS, total, PROD_HEAD_DIM), dtype=mx.bfloat16)
+    return q, kv
+
+
+def _refuse_short_queries(kind, q, k):
+    """The installed MLX's rule, in one line: the vector kernel is the only
+    one offered below ``q_len`` 9, and it caps ``q_len * gqa`` at 32."""
+
+    gqa = int(q.shape[1]) // int(k.shape[1])
+    return int(q.shape[2]) <= 8 and int(q.shape[2]) * gqa > 32
 
 
 def _install(monkeypatch, fake):
@@ -365,13 +406,47 @@ def test_counters_split_causal_and_bool(monkeypatch):
     assert counts.get("mask_fuse_causal") == 1
     assert counts.get("mask_fuse_bool") == 1
     assert "mask_fuse_unavailable" not in counts
-    # probe (2) + real call (2), all force_fused.
-    assert fake.calls == [
-        ("causal", True),
-        ("causal", True),
-        ("bool", True),
-        ("bool", True),
-    ]
+    assert "mask_fuse_dense_causal" not in counts
+    assert "mask_fuse_dense_bool" not in counts
+    # ONE forced call per arm: the capability question is the real call, at
+    # the real geometry, so there is no synthetic probe to answer it wrong.
+    assert fake.calls == [("causal", True), ("bool", True)]
+
+
+def test_engagement_is_announced_once_naming_the_class(monkeypatch):
+    """A serving process has no MTPLX_QSA_PREFILL_DEBUG receipt, and the
+    absence of a refusal line is not evidence of engagement -- so the first
+    class that fuses says so, once, on stderr."""
+
+    _arm(monkeypatch)
+    fake = _FakeSdpa(refuse=_refuse_short_queries)
+    _install(monkeypatch, fake)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        q_small, kv_small = _prod_qkv(VERIFY_ROWS, VERIFY_ROWS)
+        qwen4_exp._qsa_dense_attention(
+            q_small, kv_small, kv_small, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
+        )
+        q_big, kv_big = _prod_qkv(CHUNK_ROWS, CHUNK_ROWS)
+        for _ in range(3):
+            qwen4_exp._qsa_dense_attention(
+                q_big, kv_big, kv_big, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
+            )
+            qwen4_exp._qsa_dense_attention(
+                q_big,
+                kv_big,
+                kv_big,
+                mask=_lane_mask(0, CHUNK_ROWS, CHUNK_ROWS),
+                scale=1.0,
+            )
+    lines = [line for line in err.getvalue().splitlines() if line.strip()]
+    engaged = [line for line in lines if "engaged" in line]
+    assert len(engaged) == 1, lines
+    assert f"causal-mask q_len {CHUNK_ROWS}" in engaged[0]
+    assert f"head_dim {PROD_HEAD_DIM} bfloat16" in engaged[0]
+    # The refused verify class is reported too, and separately.
+    assert len(lines) == 2, lines
+    assert f"q_len {VERIFY_ROWS}" in lines[0]
 
 
 def test_s1_decode_rows_never_take_the_forced_route(monkeypatch):
@@ -400,43 +475,227 @@ def test_refusal_is_loud_one_shot_and_per_kind(monkeypatch):
             q, kv, kv, mask=_lane_mask(0, 4, 4), scale=1.0
         )
     message = err.getvalue()
-    assert message.count(MASK_FUSE_ENV) == 1, message
-    assert "causal-mask SDPA is available" in message
-    assert "head_dim 256" in message
+    refusals = [line for line in message.splitlines() if "armed but" in line]
+    assert len(refusals) == 1, message
+    assert "causal-mask q_len 4" in refusals[0]
+    assert "head_dim 256" in refusals[0]
     counts = qwen4_exp._QSA_PREFILL_COUNTS
     assert counts.get("mask_fuse_unavailable") == 1
     assert "mask_fuse_causal" not in counts
-    # The bool arm is unaffected: availability is tracked per kind.
+    # All three causal calls went dense, and only the first paid a raise.
+    assert counts.get("mask_fuse_dense_causal") == 3
+    # The bool arm is unaffected: its class was never asked about.
     assert counts.get("mask_fuse_bool") == 1
-    # One probe for causal (refused, sticky) + three fallbacks, then the bool
-    # probe and its real call.  Never a second forced causal attempt.
+    assert "mask_fuse_dense_bool" not in counts
+    # One forced causal attempt (refused, sticky for THAT class) + three
+    # dense fallbacks, then the bool call.  Never a second forced attempt.
     assert fake.calls == [
         ("causal", True),
         ("causal", False),
         ("causal", False),
         ("causal", False),
         ("bool", True),
-        ("bool", True),
     ]
 
 
-def test_probe_refuses_natively_on_a_build_without_fused_kernels(monkeypatch):
-    """No monkeypatch: the CPU stream has no fused kernel, so MLX raises."""
+def test_refusal_is_native_on_a_build_without_fused_kernels(monkeypatch):
+    """No stub: the CPU stream has no fused kernel at all, so MLX raises."""
 
     _arm(monkeypatch)
+    rows, total = 4, 8
+    q, kv = _prod_qkv(rows, total)
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
-        assert (
-            qwen4_exp._prefill_mask_fuse_probed("causal", 256, "bfloat16") is False
+        qwen4_exp._qsa_dense_attention(
+            q, kv, kv, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
         )
-        assert qwen4_exp._prefill_mask_fuse_probed("bool", 256, "bfloat16") is False
+        qwen4_exp._qsa_dense_attention(
+            q, kv, kv, mask=_lane_mask(total - rows, rows, total), scale=1.0
+        )
     message = err.getvalue()
     assert "require a GPU (Metal) stream" in message
-    assert qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE == {
-        "causal": True,
-        "bool": True,
+    # Two classes learned -- one per mask kind at this one geometry -- and
+    # nothing said about any other shape.
+    assert set(qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE) == {
+        (
+            "causal",
+            PROD_HEAD_DIM,
+            PROD_HEAD_DIM,
+            "bfloat16",
+            rows,
+            PROD_Q_HEADS // PROD_KV_HEADS,
+            True,
+        ),
+        (
+            "bool",
+            PROD_HEAD_DIM,
+            PROD_HEAD_DIM,
+            "bfloat16",
+            rows,
+            PROD_Q_HEADS // PROD_KV_HEADS,
+            True,
+        ),
     }
     assert qwen4_exp._QSA_PREFILL_COUNTS.get("mask_fuse_unavailable") == 2
+
+
+def test_a_short_query_refusal_never_disarms_the_prefill_chunk(monkeypatch):
+    """The served-process defect, pinned.
+
+    MLX offers only the VECTOR kernel below query length 9, and that kernel
+    caps ``q_len * gqa_factor`` at 32 -- so at this model's GQA 12 a 4-row
+    MTP verify step is refused while a prefill chunk of the very same head
+    dim, dtype and mask kind is served.  The server's warmup ladder runs a
+    verify step before its first wide chunk; the benchmark driver does not.
+    A capability keyed by mask kind therefore measured the win in one
+    process and silently the control in the other.  Keyed by shape class,
+    the verify refusal says nothing about the chunk.
+    """
+
+    _arm(monkeypatch)
+    fake = _FakeSdpa(refuse=_refuse_short_queries)
+    _install(monkeypatch, fake)
+
+    # 1. The verify step goes first, exactly as the warmup ladder runs it.
+    q_small, kv_small = _prod_qkv(VERIFY_ROWS, VERIFY_ROWS)
+    with contextlib.redirect_stderr(io.StringIO()):
+        for _ in range(3):
+            qwen4_exp._qsa_dense_attention(
+                q_small, kv_small, kv_small, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
+            )
+
+    # 2. Then the wide chunk the flag is actually armed for.
+    q_big, kv_big = _prod_qkv(CHUNK_ROWS, CHUNK_ROWS)
+    qwen4_exp._qsa_dense_attention(
+        q_big, kv_big, kv_big, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
+    )
+    qwen4_exp._qsa_dense_attention(
+        q_big,
+        kv_big,
+        kv_big,
+        mask=_lane_mask(0, CHUNK_ROWS, CHUNK_ROWS),
+        scale=1.0,
+    )
+
+    counts = qwen4_exp._QSA_PREFILL_COUNTS
+    assert counts.get("mask_fuse_causal") == 1
+    assert counts.get("mask_fuse_bool") == 1
+    assert counts.get("mask_fuse_dense_causal") == 3
+    assert counts.get("mask_fuse_unavailable") == 1
+    # One forced attempt at the refused class, never a second; both chunk
+    # classes forced and fused.
+    assert fake.geoms == [
+        ("causal", True, VERIFY_ROWS),
+        ("causal", False, VERIFY_ROWS),
+        ("causal", False, VERIFY_ROWS),
+        ("causal", False, VERIFY_ROWS),
+        ("causal", True, CHUNK_ROWS),
+        ("bool", True, CHUNK_ROWS),
+    ]
+
+
+def test_a_prefill_chunk_refusal_routes_only_that_class(monkeypatch):
+    """The other direction: a class MLX genuinely cannot serve goes dense
+    per call, and the classes it can serve stay fused."""
+
+    _arm(monkeypatch)
+    fake = _FakeSdpa(refuse=lambda kind, q, k: int(q.shape[2]) >= CHUNK_ROWS)
+    _install(monkeypatch, fake)
+    q_big, kv_big = _prod_qkv(CHUNK_ROWS, CHUNK_ROWS)
+    q_small, kv_small = _prod_qkv(VERIFY_ROWS, VERIFY_ROWS)
+    with contextlib.redirect_stderr(io.StringIO()):
+        for _ in range(3):
+            qwen4_exp._qsa_dense_attention(
+                q_big, kv_big, kv_big, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
+            )
+        qwen4_exp._qsa_dense_attention(
+            q_small, kv_small, kv_small, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
+        )
+    counts = qwen4_exp._QSA_PREFILL_COUNTS
+    assert counts.get("mask_fuse_dense_causal") == 3
+    assert counts.get("mask_fuse_unavailable") == 1
+    # The short class is a different class and is still fused.
+    assert counts.get("mask_fuse_causal") == 1
+    assert fake.geoms == [
+        ("causal", True, CHUNK_ROWS),
+        ("causal", False, CHUNK_ROWS),
+        ("causal", False, CHUNK_ROWS),
+        ("causal", False, CHUNK_ROWS),
+        ("causal", True, VERIFY_ROWS),
+    ]
+
+
+def test_the_refusal_line_names_the_class_and_scopes_itself(monkeypatch):
+    _arm(monkeypatch)
+    fake = _FakeSdpa(refuse=_refuse_short_queries)
+    _install(monkeypatch, fake)
+    q, kv = _prod_qkv(VERIFY_ROWS, VERIFY_ROWS)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        qwen4_exp._qsa_dense_attention(
+            q, kv, kv, mask=_lane_mask(0, VERIFY_ROWS, VERIFY_ROWS), scale=1.0
+        )
+    message = err.getvalue()
+    assert message.count(MASK_FUSE_ENV) == 1, message
+    assert "engaged" not in message
+    # WHICH class.
+    assert f"bool-mask q_len {VERIFY_ROWS}" in message
+    assert f"GQA {PROD_Q_HEADS // PROD_KV_HEADS}" in message
+    assert f"head_dim {PROD_HEAD_DIM} bfloat16" in message
+    # And that it is per-class, not the process-wide disarm it used to be.
+    assert "THAT shape class only" in message
+    assert "NOT " in message and "process-wide" in message
+    # MLX's own reason survives into the line.
+    assert "no fused kernel for bool at query length 4" in message
+
+
+def test_shape_class_reads_what_mlx_reads_and_nothing_else(monkeypatch):
+    """A class is the geometry MLX's rules look at -- key length beyond the
+    ``q_len <= k_len`` test is not one of them, and the query length is."""
+
+    kind = "causal"
+    q, kv = _prod_qkv(CHUNK_ROWS, 4096)
+    q2, kv2 = _prod_qkv(CHUNK_ROWS, 8192)
+    assert qwen4_exp._prefill_mask_fuse_class(
+        kind, q, kv, kv
+    ) == qwen4_exp._prefill_mask_fuse_class(kind, q2, kv2, kv2)
+    q3, kv3 = _prod_qkv(VERIFY_ROWS, 4096)
+    assert qwen4_exp._prefill_mask_fuse_class(
+        kind, q3, kv3, kv3
+    ) != qwen4_exp._prefill_mask_fuse_class(kind, q, kv, kv)
+    # Mask kind, dtype and the GQA factor all split classes too.
+    assert qwen4_exp._prefill_mask_fuse_class(
+        "bool", q, kv, kv
+    ) != qwen4_exp._prefill_mask_fuse_class(kind, q, kv, kv)
+    wide_kv = mx.zeros((1, PROD_Q_HEADS, 4096, PROD_HEAD_DIM), dtype=mx.bfloat16)
+    assert qwen4_exp._prefill_mask_fuse_class(
+        kind, q, wide_kv, wide_kv
+    ) != qwen4_exp._prefill_mask_fuse_class(kind, q, kv, kv)
+
+
+def test_refusal_printing_is_capped_but_counting_is_not(monkeypatch):
+    """A build that refuses everything must not own stderr for the life of
+    the process; the counters keep the full tally."""
+
+    _arm(monkeypatch)
+    fake = _FakeSdpa(fail_on={"causal"})
+    _install(monkeypatch, fake)
+    classes = qwen4_exp._MASK_FUSE_REFUSAL_PRINT_LIMIT + 3
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        for i in range(classes):
+            rows = CHUNK_ROWS + i  # a new shape class each time
+            q, kv = _prod_qkv(rows, rows)
+            qwen4_exp._qsa_dense_attention(
+                q, kv, kv, mask=qwen4_exp._CAUSAL_MASK, scale=1.0
+            )
+    message = err.getvalue()
+    refusals = [line for line in message.splitlines() if "armed but" in line]
+    assert len(refusals) == qwen4_exp._MASK_FUSE_REFUSAL_PRINT_LIMIT, message
+    assert "further shape-class refusals are counted but not printed" in message
+    counts = qwen4_exp._QSA_PREFILL_COUNTS
+    assert counts.get("mask_fuse_unavailable") == classes
+    assert counts.get("mask_fuse_dense_causal") == classes
 
 
 def test_armed_flag_on_an_unavailable_build_still_returns_the_dense_answer(
@@ -596,10 +855,10 @@ def test_flag_off_keeps_the_dense_causal_tensor_and_the_same_answer(monkeypatch)
         on = layer(x, qwen4_exp.QSACache(compress_ratio=layer.indexer.ratio))
         mx.eval(on)
     # The recorder stands in for a build that HAS the fused kernel, so the
-    # probe passes and the real call is forced -- both with the STRING and
-    # never a tensor.  Its return value is real MLX math, so the equality
-    # below is the visible-set claim, evaluated end to end through the layer.
-    assert recorder2.calls == [("causal", True), ("causal", True)]
+    # one forced call is the real one -- with the STRING and never a tensor.
+    # Its return value is real MLX math, so the equality below is the
+    # visible-set claim, evaluated end to end through the layer.
+    assert recorder2.calls == [("causal", True)]
     assert np.array_equal(
         np.array(off.astype(mx.float32)), np.array(on.astype(mx.float32))
     )

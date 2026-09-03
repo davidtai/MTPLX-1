@@ -465,10 +465,39 @@ flag passes `force_fused=True` instead. Two arms, one flag, both counted by
   offset case) and builds no tensor at all.
 * `mask_fuse_bool` — a real top-k selection, handed to the fused kernel as
   the bool array it already is.
-* `mask_fuse_unavailable` — the one-shot probe found no fused kernel for
-  this `(mask kind, head_dim, dtype)`; the arm says so on stderr and stays
-  on the dense route for the rest of the process instead of quietly
-  measuring the control under a candidate label.
+* `mask_fuse_unavailable` — one per SHAPE CLASS this MLX has no fused
+  kernel for. The arm says so on stderr, naming the class, and routes that
+  class — and only that class — to the dense route for the rest of the
+  process instead of quietly measuring the control under a candidate label.
+* `mask_fuse_dense_causal` / `mask_fuse_dense_bool` — armed calls that went
+  dense because their own shape class was refused. Nonzero here with a
+  healthy `mask_fuse_bool` is the normal served picture: the chunks fuse,
+  the 4-row MTP verify steps cannot.
+
+The class is `(mask kind, query head dim, value head dim, dtype, query
+length, GQA factor, q_len <= k_len)` — precisely what MLX's
+`ScaledDotProductAttention::use_fallback` reads. It has to be the whole
+geometry, not just the head dim: MLX offers only its **vector** kernel below
+query length 9, and that kernel caps `q_len * gqa_factor` at 32, so at this
+model's GQA 12 (24 q heads / 2 kv heads) a **4-row MTP verify step is
+refused while a 4,096-row prefill chunk at the same head dim and mask kind
+is served**. A capability keyed by mask kind alone let the server's warmup
+ladder — which runs a verify step before its first wide chunk — disarm the
+flag for the whole process, while the benchmark driver, whose first call is
+a wide chunk, kept the win. That is the shape of a receipt that says
+`mask_fuse_bool` in one process and nothing in the other; check the counters
+in **both**.
+
+A serving process runs without `MTPLX_QSA_PREFILL_DEBUG`, so it has no
+counters at all — and the absence of a refusal line is not evidence the lane
+engaged. The first shape class that MLX does fuse therefore prints one line:
+
+```
+[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE engaged: fused SDPA for shape class
+[bool-mask q_len 4096 x GQA 12 at head_dim 256 bfloat16]; ...
+```
+
+That line, not the silence, is the served receipt.
 
 `mask_causal_eligible` counts the exactly-causal regime whether or not the
 flag is armed. **At the retained prefill width (4,096) it is zero at 16K and

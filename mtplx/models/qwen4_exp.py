@@ -1965,7 +1965,14 @@ def _prefill_mask_fuse_enabled() -> bool:
 
     Counters (``MTPLX_QSA_PREFILL_DEBUG=1``): ``mask_causal_eligible`` (the
     lane saw an exactly-causal visible set, flag-independent),
-    ``mask_fuse_causal``, ``mask_fuse_bool``, ``mask_fuse_unavailable``.
+    ``mask_fuse_causal``, ``mask_fuse_bool``, ``mask_fuse_unavailable``
+    (one per SHAPE CLASS this MLX has no fused kernel for -- see
+    :data:`_PREFILL_MASK_FUSE_UNAVAILABLE`; it is NOT a process-wide
+    disarm), and ``mask_fuse_dense_causal`` / ``mask_fuse_dense_bool``
+    (calls sent to the dense route because their own class was refused,
+    while every other class stays fused).  A serving process runs without
+    that debug flag, so the first class MLX fuses also prints one
+    ``engaged:`` line -- the absence of a refusal is not a receipt.
     """
 
     raw = (os.environ.get("MTPLX_FABLE_PREFILL_MASK_FUSE") or "0").strip().lower()
@@ -2003,14 +2010,61 @@ def _prefill_causal_mask_is_exact(
     return int(rows) > 0 and int(total_keys) == int(pos_start) + int(rows)
 
 
-#: One-shot capability probes, keyed by mask kind.  ``force_fused=True``
-#: raises host-side (no kernel is launched) when the build has no fused
-#: kernel for the geometry; retrying per call would pay that cost 12 x 8
-#: times a request.  ``"causal"`` and a bool array drive different Metal
-#: function constants of the same ``steel_attention`` specialisation
-#: (``do_causal`` / ``has_mask``), so availability is tracked per kind
-#: rather than shared: a build may serve one and refuse the other.
-_PREFILL_MASK_FUSE_UNAVAILABLE: Dict[str, bool] = {}
+#: Fused-SDPA capability, keyed by SHAPE CLASS -- never by mask kind alone.
+#:
+#: MLX admits the fused route through two different kernels with two
+#: different rule sets, and it picks between them on the QUERY LENGTH
+#: (``ScaledDotProductAttention::use_fallback``,
+#: ``mlx/backend/metal/scaled_dot_product_attention.cpp``; the installed
+#: 0.32.2 dylib carries exactly these refusal reasons as strings, with the
+#: head-dim sets below):
+#:
+#: * the **full** kernel (``steel_attention``) takes the long query --
+#:   ``query_sequence_length > 8`` -- with a head dim in
+#:   ``{64, 72, 80, 96, 128, 192, 256}`` shared by q and v and, when the
+#:   mask is the causal string, ``q_len <= k_len``;
+#: * the **vector** kernel (``sdpa_vector``) takes the short query --
+#:   ``q_len <= 8`` -- with a head dim in ``{64, 96, 128, 192, 256}``,
+#:   ``q_len <= k_len``, AND ``q_len * gqa_factor <= 32``.
+#:
+#: (The ``> 8`` split is read off MLX's own source; what this key relies on
+#: is only that SOME such split exists, which the served refusal proves --
+#: MLX answered a 5-row query with the VECTOR kernel's reason at a head dim
+#: the full kernel accepts.  ``q_len`` is therefore kept exact below, so the
+#: constant itself is never baked in.)
+#:
+#: This model is 24 q heads over 2 kv heads (GQA 12) at ``head_dim`` 256,
+#: which leaves a DEAD BAND at ``q_len`` 3..8: too long for the vector
+#: kernel (``3 * 12 = 36 > 32``), too short for the full one.  A 4,096-row
+#: prefill chunk is far above the band and IS fused; an MTP verify step (4
+#: rows, 5 with the extra) sits inside it and is not.  Keying availability
+#: by mask kind alone therefore let the FIRST verify step of the process
+#: disarm the flag for every prefill chunk after it -- which is exactly
+#: what the served process did (warmup ladder: verify before any wide
+#: chunk) while the benchmark driver, whose first call IS a wide chunk,
+#: kept the win.  So the capability is keyed by the geometry MLX's own
+#: rules read, and a negative learned at one class says nothing about any
+#: other.
+_PREFILL_MASK_FUSE_UNAVAILABLE: Dict[tuple, bool] = {}
+
+#: Cap on the class table.  Distinct classes are structurally few (mask
+#: kind x chunk width), but a build with no fused kernel at all would learn
+#: one negative per distinct prefill width forever; evicting the oldest
+#: costs one more host-side refusal, never a wrong answer.
+_MASK_FUSE_CLASS_CACHE_MAX = 1024
+
+#: stderr is a shared log, and a build that refuses everything would
+#: otherwise print one line per prefill width for the life of the process.
+_MASK_FUSE_REFUSAL_PRINT_LIMIT = 8
+_MASK_FUSE_REFUSALS_PRINTED = [0]
+
+#: One positive receipt per process, printed by the first class that MLX
+#: actually fuses.  ABSENCE of a refusal line is not evidence of engagement:
+#: the served process printed two refusals (the 4- and 5-row verify steps)
+#: and nothing at all for its chunks, which is exactly the log a process
+#: with the flag unset writes.  A serving process has no
+#: ``MTPLX_QSA_PREFILL_DEBUG`` receipt to fall back on, so it needs this.
+_MASK_FUSE_ENGAGED = [False]
 
 
 def _prefill_mask_fuse_kind(mask) -> str:
@@ -2019,60 +2073,98 @@ def _prefill_mask_fuse_kind(mask) -> str:
     return "causal" if isinstance(mask, str) else "bool"
 
 
-def _prefill_mask_fuse_refuse(kind: str, exc: BaseException) -> None:
-    """Disarm one mask kind for the rest of the process, loudly."""
+def _prefill_mask_fuse_class(kind: str, q, k, v) -> tuple:
+    """The geometry MLX's fused-SDPA admission rules actually read.
 
-    _PREFILL_MASK_FUSE_UNAVAILABLE[kind] = True
-    _qsa_prefill_count("mask_fuse_unavailable")
+    Everything in the tuple appears in one of MLX's own refusal reasons:
+    the query and value head dims, the query length (which selects the
+    kernel and, in the vector kernel, is multiplied by the GQA factor
+    against its 32 cap), the GQA factor, and whether the query is no longer
+    than the key sequence.  ``dtype`` rides along because the fused kernels
+    are per-dtype specialisations.  Two calls with the same class get the
+    same answer from MLX by construction -- which is what makes caching one
+    call's refusal safe for the others in it, and only for those.
+    """
+
+    kv_heads = max(int(k.shape[1]), 1)
+    q_len = int(q.shape[2])
+    return (
+        kind,
+        int(q.shape[-1]),
+        int(v.shape[-1]),
+        str(q.dtype).rsplit(".", 1)[-1],
+        q_len,
+        int(q.shape[1]) // kv_heads,
+        q_len <= int(k.shape[2]),
+    )
+
+
+def _prefill_mask_fuse_class_text(cls: tuple) -> str:
+    """The class as a log line reads it."""
+
+    kind, q_head_dim, v_head_dim, dtype, q_len, gqa, q_fits = cls
+    head_dim = (
+        f"head_dim {q_head_dim}"
+        if q_head_dim == v_head_dim
+        else f"head_dim {q_head_dim} (value {v_head_dim})"
+    )
+    return (
+        f"{kind}-mask q_len {q_len} x GQA {gqa} at {head_dim} {dtype}"
+        + ("" if q_fits else ", query longer than the key sequence")
+    )
+
+
+def _prefill_mask_fuse_announce(cls: tuple) -> None:
+    """Say ONCE, on the first fused call, which shape class engaged."""
+
+    _MASK_FUSE_ENGAGED[0] = True
     import sys as _sys
 
     print(
-        "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE armed but no fused "
-        f"{kind}-mask SDPA is available at head_dim {_MASK_FUSE_PROBE_HD[0]} "
-        "in this MLX; falling back to the dense/unfused route for the rest "
-        f"of the process: {exc}",
+        "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE engaged: fused SDPA for "
+        f"shape class [{_prefill_mask_fuse_class_text(cls)}]; every other "
+        "shape class is asked on its first call and reported here only if "
+        "it is refused",
         file=_sys.stderr,
         flush=True,
     )
 
 
-#: Filled by the probe so the refusal message can name the geometry it asked
-#: about instead of a generic "this geometry".
-_MASK_FUSE_PROBE_HD = [0]
+def _prefill_mask_fuse_refuse(cls: tuple, exc: BaseException) -> None:
+    """Route ONE shape class to the dense path for the rest of the process.
 
-
-@lru_cache(maxsize=16)
-def _prefill_mask_fuse_probed(kind: str, head_dim: int, dtype_name: str) -> bool:
-    """Ask MLX ONCE, at this head_dim/dtype, whether the fused kernel exists.
-
-    ``force_fused=True`` is resolved while the op is built -- before any
-    encoder is opened -- so a two-row probe answers the question without
-    dispatching Metal work: it either returns a lazy array or raises.  The
-    answer is bound per ``(kind, head_dim, dtype)`` and never re-asked, so an
-    armed flag can never degrade into a per-call try/except in the hot lane,
-    and a build without the kernel refuses loudly at the first prefill
-    instead of silently measuring the control under a candidate label.
+    Loud, because an armed flag that silently measured the control under a
+    candidate label is the failure this receipt exists to prevent -- but
+    scoped, because the class that refused is usually not the class the
+    lane is armed for.
     """
 
-    dtype = getattr(mx, dtype_name, None)
-    if dtype is None:
-        return False
-    _MASK_FUSE_PROBE_HD[0] = int(head_dim)
-    shape = (1, 1, 2, int(head_dim))
-    zeros = mx.zeros(shape, dtype=dtype)
-    mask = (
-        _CAUSAL_MASK
-        if kind == "causal"
-        else mx.ones((1, 1, 2, 2), dtype=mx.bool_)
-    )
-    try:
-        mx.fast.scaled_dot_product_attention(
-            zeros, zeros, zeros, scale=1.0, mask=mask, force_fused=True
+    if len(_PREFILL_MASK_FUSE_UNAVAILABLE) >= _MASK_FUSE_CLASS_CACHE_MAX:
+        _PREFILL_MASK_FUSE_UNAVAILABLE.pop(
+            next(iter(_PREFILL_MASK_FUSE_UNAVAILABLE)), None
         )
-    except Exception as exc:  # older MLX, or no kernel for this geometry
-        _prefill_mask_fuse_refuse(kind, exc)
-        return False
-    return True
+    _PREFILL_MASK_FUSE_UNAVAILABLE[cls] = True
+    _qsa_prefill_count("mask_fuse_unavailable")
+    if _MASK_FUSE_REFUSALS_PRINTED[0] >= _MASK_FUSE_REFUSAL_PRINT_LIMIT:
+        return
+    _MASK_FUSE_REFUSALS_PRINTED[0] += 1
+    import sys as _sys
+
+    tail = (
+        "; further shape-class refusals are counted but not printed"
+        if _MASK_FUSE_REFUSALS_PRINTED[0] == _MASK_FUSE_REFUSAL_PRINT_LIMIT
+        else ""
+    )
+    print(
+        "[mtplx] MTPLX_FABLE_PREFILL_MASK_FUSE armed but this MLX has no "
+        "fused SDPA for shape class "
+        f"[{_prefill_mask_fuse_class_text(cls)}]; falling back to the "
+        "dense/unfused route for THAT shape class only -- per-class, NOT "
+        "process-wide: every other shape class (a wide prefill chunk "
+        f"included) is still asked and still fused{tail}: {exc}",
+        file=_sys.stderr,
+        flush=True,
+    )
 
 
 def _prefill_mask_fuse_sdpa(q, k, v, *, scale, mask):
@@ -2106,23 +2198,38 @@ def _prefill_mask_fuse_sdpa(q, k, v, *, scale, mask):
         # sdpa_VECTOR supported set); the fallback this flag exists to
         # replace is the S > 1 one.
         and int(q.shape[2]) > 1
-        and not _PREFILL_MASK_FUSE_UNAVAILABLE.get(kind, False)
         and _prefill_mask_fuse_enabled()
-        and _prefill_mask_fuse_probed(
-            kind, int(q.shape[-1]), str(q.dtype).rsplit(".", 1)[-1]
-        )
     ):
-        try:
-            out = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=scale, mask=mask, force_fused=True
-            )
-        except Exception as exc:  # a geometry the probe could not stand in for
-            _prefill_mask_fuse_refuse(kind, exc)
-        else:
-            _qsa_prefill_count(
-                "mask_fuse_causal" if kind == "causal" else "mask_fuse_bool"
-            )
-            return out
+        # The capability question is asked AT THE CALL, with the call's own
+        # operands -- there is no synthetic stand-in that can be wrong about
+        # the geometry, because it IS the geometry.  ``force_fused=True`` is
+        # resolved while the op is BUILT (no encoder is opened, nothing is
+        # evaluated), so a class MLX refuses costs one host-side raise, once,
+        # and never a dispatch.  The answer is then bound to that shape class
+        # alone: the hot lane never retries a class it has been refused, and
+        # a refusal at one class never touches another.
+        cls = _prefill_mask_fuse_class(kind, q, k, v)
+        if not _PREFILL_MASK_FUSE_UNAVAILABLE.get(cls, False):
+            try:
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask=mask, force_fused=True
+                )
+            except Exception as exc:  # no fused kernel for THIS shape class
+                _prefill_mask_fuse_refuse(cls, exc)
+            else:
+                if not _MASK_FUSE_ENGAGED[0]:
+                    _prefill_mask_fuse_announce(cls)
+                _qsa_prefill_count(
+                    "mask_fuse_causal" if kind == "causal" else "mask_fuse_bool"
+                )
+                return out
+        # Armed, and this call still went dense: its own shape class has no
+        # fused kernel in this MLX.  Counted per call so a receipt can tell
+        # "the flag never fired" from "the flag fired for the chunks and not
+        # for the 4-row verify steps".
+        _qsa_prefill_count(
+            "mask_fuse_dense_causal" if kind == "causal" else "mask_fuse_dense_bool"
+        )
     return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
 
