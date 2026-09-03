@@ -1956,14 +1956,16 @@ def fable_qsa_sparse_decode_block(*, require_calls: bool, strict: bool = True) -
                 "MTPLX_FABLE_QSA_SPARSE_DECODE armed but the lane disabled "
                 f"itself: {block['disabled_reason']}"
             )
-        elif int(block["route_hits"]) <= 0 and int(block["short_context"]) > 0:
+        elif int(block["route_hits"]) <= 0 and int(block["request_declines"]) > 0:
             fail(
                 "MTPLX_FABLE_QSA_SPARSE_DECODE installed but EVERY forward "
-                "declined for short context: this cell's context never "
-                f"reached {block['short_context_tokens']} tokens (blocks "
-                f"{block['short_context_blocks']}), so the kernel has no "
-                "analogue to run and the arm is the control by construction. "
-                "Measure this lane on a long-context cell."
+                "declined on its request shape: this cell never presented one "
+                "the lane can serve (needs a K/V bank above "
+                f"{block['short_context_tokens']} tokens; observed "
+                f"{block['request_decline_extremes']}, reasons "
+                f"{block['route_declines']}), so the kernel has no analogue to "
+                "run and the arm is the control by construction. Measure this "
+                "lane on a long-context cell."
             )
         elif int(block["route_hits"]) <= 0:
             fail(

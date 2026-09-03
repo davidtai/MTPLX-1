@@ -58,13 +58,31 @@ def armed_verify(monkeypatch):
     return runtime_options
 
 
-def fixed_cache(*, decode_rows: int = 4, draft_rows: int = 0) -> SimpleNamespace:
-    """The state a ``TensorOffsetQSACache`` hands the routing predicate."""
+#: A 16 K prompt reserves 1,024 decode tokens and rounds to ratio: the bank
+#: the 2026-09-02 window ran on.  ``17408 // 4 = 4352 > 512`` -- servable.
+LONG_BANK = 17408
+#: The 1 K cell of the served battery: a 1,024-token prompt plus the same
+#: 1,024-token reserve.  ``2048 // 4 == 512``, NOT > 512, so the kernel's own
+#: dense/sparse boundary refuses it -- while ``k_eff`` is a full 512.
+DENSE_BANK = 2048
+
+
+def fixed_cache(
+    *, decode_rows: int = 4, draft_rows: int = 0, bank: int = LONG_BANK
+) -> SimpleNamespace:
+    """The state a ``TensorOffsetQSACache`` hands the routing predicate.
+
+    ``kv.keys`` is the fixed K/V backing.  Its token dimension is what
+    ``update_and_fetch`` returns and therefore what the attention call site
+    passes as ``total_tokens`` -- the predicate must read the same number, so
+    the stub carries it.
+    """
 
     return SimpleNamespace(
         fixed_capacity=True,
         fable_qsa_sparse_decode_rows=int(decode_rows),
         fable_qsa_sparse_draft_rows=int(draft_rows),
+        kv=SimpleNamespace(keys=SimpleNamespace(shape=(1, 2, int(bank), 256))),
     )
 
 
@@ -221,39 +239,134 @@ def test_a_geometry_the_metallib_is_not_built_for_raises(armed_verify):
 
 
 # ---------------------------------------------------------------------------
-# Short context: ROUTING, not failure.  A HumanEval prompt must be served.
+# REQUEST SHAPE: routing, not failure.  Two production 500s live here.
 # ---------------------------------------------------------------------------
-def test_a_short_context_routes_to_stock_instead_of_returning_500(armed_verify):
-    """The 2026-09-02 fullset regression, as a unit.
-
-    The server saw ``selects 7 blocks`` at warmup and ``selects 33 blocks`` on
-    a chat completion, and raised both times.  Context length is a per-request
-    shape the server must accept and the kernel has no analogue below a full
-    budget, so this is the routing case in the contract.
-    """
+def test_a_partial_budget_routes_to_stock_instead_of_returning_500(armed_verify):
+    """The first regression: HumanEval prompts, a few hundred tokens."""
 
     assert not indexer()._sparse_decode_route(
-        fixed_cache(), rows=4, k_eff=33, draft=False, site="select_eager_verify"
+        fixed_cache(bank=LONG_BANK), rows=4, k_eff=33, draft=False,
+        site="select_eager_verify",
     )
     counters = lane.route_counters()
     assert counters["route_hits"] == 0
-    assert counters["short_context"] == 1
+    assert counters["request_declines"] == 1
+    assert counters["route_declines"] == {"select_eager_verify: partial_budget": 1}
+
+
+def test_a_1k_prompt_in_the_dense_regime_routes_to_stock(armed_verify):
+    """The second regression, and the one a full budget hides.
+
+    The 1 K cell of the 2026-09-02 served battery: a 1,024-token prompt in a
+    2,048-token fixed bank. ``k_eff`` is a FULL 512 -- the budget gate passes
+    -- but ``2048 // 4 == 512`` is not ``> 512``, so the kernel refused the
+    call from inside ``attention()`` and the server returned 500. The two
+    questions are different and the predicate must ask both.
+    """
+
+    assert not indexer()._sparse_decode_route(
+        fixed_cache(bank=DENSE_BANK), rows=4, k_eff=512, draft=False,
+        site="select_eager_verify",
+    )
+    counters = lane.route_counters()
+    assert counters["route_hits"] == 0
+    assert counters["request_declines"] == 1
     assert counters["route_declines"] == {"select_eager_verify: short_context": 1}
+    assert counters["request_decline_extremes"]["tokens_min"] == DENSE_BANK
 
 
-def test_the_short_context_decline_key_stays_bounded(armed_verify):
-    """One key per site, never one per context length; blocks ride min/max."""
+def test_the_dense_regime_boundary_is_the_kernels_own(armed_verify):
+    """One token of bank either side of the native contract's boundary."""
+
+    route = indexer()._sparse_decode_route
+    assert not route(
+        fixed_cache(bank=2048), rows=4, k_eff=512, draft=False, site="s"
+    )
+    assert not route(
+        fixed_cache(bank=2051), rows=4, k_eff=512, draft=False, site="s"
+    )
+    assert route(
+        fixed_cache(bank=2052), rows=4, k_eff=512, draft=False, site="s"
+    )
+    assert lane.route_counters()["route_hits"] == 1
+    assert lane.SHORT_CONTEXT_TOKENS == 2052
+
+
+def test_the_crossover_inside_one_request_declines_then_binds(armed_verify):
+    """Context growing from below the boundary to above it, one cache.
+
+    A fixed bank grows by capacity transition, and each transition re-traces
+    and re-asks. Before the boundary the stock chain is correct; after it the
+    kernel must bind -- and the earlier declines must not have poisoned it.
+    """
+
+    cache = fixed_cache(bank=DENSE_BANK)
+    route = indexer()._sparse_decode_route
+    assert not route(cache, rows=4, k_eff=512, draft=False, site="select_eager_verify")
+    # The capacity transition: same cache object, a wider bank.
+    cache.kv.keys.shape = (1, 2, 4096, 256)
+    assert route(cache, rows=4, k_eff=512, draft=False, site="select_eager_verify")
+    counters = lane.route_counters()
+    assert counters["route_hits"] == 1
+    assert counters["request_declines"] == 1
+
+
+def test_a_full_budget_forward_still_binds_after_either_decline(armed_verify):
+    """Short requests must not poison the long-context arm."""
+
+    route = indexer()._sparse_decode_route
+    assert not route(
+        fixed_cache(bank=LONG_BANK), rows=4, k_eff=33, draft=False, site="s"
+    )
+    assert not route(
+        fixed_cache(bank=DENSE_BANK), rows=4, k_eff=512, draft=False, site="s"
+    )
+    assert route(
+        fixed_cache(bank=LONG_BANK), rows=4, k_eff=512, draft=False, site="s"
+    )
+    counters = lane.route_counters()
+    assert counters["route_hits"] == 1
+    assert counters["request_declines"] == 2
+
+
+def test_every_request_shape_reason_routes_rather_than_raises(armed_verify):
+    """No branch of the mirror may be a raise."""
+
+    route = indexer()._sparse_decode_route
+    cases = {
+        "short_context": dict(bank=DENSE_BANK, k_eff=512),
+        "partial_budget": dict(bank=LONG_BANK, k_eff=33),
+        "rows_exceed_context": dict(bank=2, k_eff=512),
+        "empty_context": dict(bank=0, k_eff=512),
+    }
+    for reason, kwargs in cases.items():
+        lane.reset_for_tests()
+        assert not route(
+            fixed_cache(bank=kwargs["bank"]), rows=4, k_eff=kwargs["k_eff"],
+            draft=False, site="s",
+        ), reason
+        assert lane.route_counters()["route_declines"] == {f"s: {reason}": 1}
+
+
+def test_the_decline_key_stays_bounded_while_the_numbers_track(armed_verify):
+    """One key per (site, reason); the tokens and blocks ride as min/max.
+
+    A server sees every context length there is, so a key carrying the count
+    would grow without bound.
+    """
 
     route = indexer()._sparse_decode_route
     for blocks in (7, 33, 511, 33):
         assert not route(
-            fixed_cache(), rows=4, k_eff=blocks, draft=False,
+            fixed_cache(bank=LONG_BANK), rows=4, k_eff=blocks, draft=False,
             site="select_eager_verify",
         )
     counters = lane.route_counters()
-    assert counters["route_declines"] == {"select_eager_verify: short_context": 4}
-    assert counters["short_context"] == 4
-    assert counters["short_context_blocks"] == {"min": 7, "max": 511}
+    assert counters["route_declines"] == {"select_eager_verify: partial_budget": 4}
+    assert counters["request_declines"] == 4
+    extremes = counters["request_decline_extremes"]
+    assert extremes["blocks_min"] == 7 and extremes["blocks_max"] == 511
+    assert extremes["tokens_min"] == extremes["tokens_max"] == LONG_BANK
     assert counters["short_context_tokens"] == 2052
 
 
@@ -261,30 +374,95 @@ def test_the_threshold_is_the_full_budget_the_abi_needs():
     assert lane.SHORT_CONTEXT_TOKENS == (lane.TOP_K + 1) * lane.COMPRESS_RATIO == 2052
 
 
-def test_a_full_budget_forward_still_binds_after_a_short_one(armed_verify):
-    """Short requests must not poison the long-context arm."""
-
-    route = indexer()._sparse_decode_route
-    assert not route(
-        fixed_cache(), rows=4, k_eff=33, draft=False, site="select_eager_verify"
-    )
-    assert route(
-        fixed_cache(), rows=4, k_eff=512, draft=False, site="select_eager_verify"
-    )
-    counters = lane.route_counters()
-    assert counters["route_hits"] == 1
-    assert counters["short_context"] == 1
-
-
-def test_a_short_context_prints_nothing(armed_verify, capsys):
-    """Once per QSA layer per short request: a print here is a log flood."""
+def test_a_request_shape_decline_prints_nothing(armed_verify, capsys):
+    """Once per QSA layer per request: a print here is a log flood."""
 
     indexer()._sparse_decode_route(
-        fixed_cache(), rows=4, k_eff=33, draft=False, site="select_eager_verify"
+        fixed_cache(bank=DENSE_BANK), rows=4, k_eff=512, draft=False,
+        site="select_eager_verify",
     )
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+# ---------------------------------------------------------------------------
+# The mirror against the native contract
+# ---------------------------------------------------------------------------
+NATIVE = (ROOT / "mtplx" / "native" / "__init__.py").read_text()
+
+
+def native_decode_reasons():
+    """Every string ``qsa_sparse_gqa_decode_unsupported_reason`` can return."""
+
+    tree = ast.parse(NATIVE)
+    fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "qsa_sparse_gqa_decode_unsupported_reason"
+    )
+    out = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            out.append(value.value)
+    return out
+
+
+def test_every_request_shape_reason_the_kernel_can_return_is_mirrored():
+    """The 1 K regression was a PARTIAL mirror; this is what closes it."""
+
+    native = native_decode_reasons()
+    for reason in lane.REQUEST_SHAPE_REASONS:
+        assert reason in native, reason
+
+
+def test_the_context_branches_of_the_native_contract_are_all_claimed():
+    """Any native reason mentioning the request's own size must be mirrored.
+
+    A new context-dependent branch upstream fails this test instead of
+    reaching a served request as a 500.
+    """
+
+    request_words = ("total_tokens", "context", "query rows")
+    unclaimed = [
+        reason
+        for reason in native_decode_reasons()
+        if any(word in reason for word in request_words)
+        and reason not in lane.REQUEST_SHAPE_REASONS
+        and "must be a host integer" not in reason
+        and "must be an exact host integer" not in reason
+        and "cannot be bool" not in reason
+    ]
+    assert unclaimed == [], unclaimed
+
+
+def test_the_kernel_wrapper_names_a_mirror_bug_rather_than_blaming_the_request():
+    source = inspect.getsource(lane.attention)
+    assert "REQUEST_SHAPE_REASONS" in source
+    assert "did not mirror the" in source
+
+
+def test_context_decline_is_none_only_for_a_servable_shape():
+    assert lane.context_decline(
+        total_tokens=LONG_BANK, rows=4, k_eff=512, capacity=LONG_BANK
+    ) is None
+    assert lane.context_decline(
+        total_tokens=DENSE_BANK, rows=4, k_eff=512, capacity=DENSE_BANK
+    ) == "short_context"
+    assert lane.context_decline(
+        total_tokens=LONG_BANK, rows=4, k_eff=511, capacity=LONG_BANK
+    ) == "partial_budget"
+    assert lane.context_decline(
+        total_tokens=LONG_BANK + 8, rows=4, k_eff=512, capacity=LONG_BANK
+    ) == "context_exceeds_capacity"
+    assert lane.context_decline(
+        total_tokens=lane.MAX_CONTEXT + 4, rows=4, k_eff=512,
+        capacity=lane.MAX_CONTEXT + 4,
+    ) == "context_above_limit"
 
 
 def test_nothing_raises_when_the_flag_is_off():
@@ -330,7 +508,7 @@ def guard(sel_mask, *, rows=4, before=None):
         stub,
         sel_mask,
         rows=rows,
-        before=before or {"route_hits": 0, "short_context": 0},
+        before=before or {"route_hits": 0, "request_declines": 0},
     )
 
 
@@ -342,7 +520,9 @@ def test_the_guard_accepts_a_forward_that_routed_for_short_context(armed_verify)
     """The HumanEval case: the indexer declined, and that is correct."""
 
     before = lane.route_snapshot()
-    lane.note_short_context("select_eager_verify", 33)
+    lane.note_request_decline(
+        "select_eager_verify", "short_context", total_tokens=2048, blocks=512
+    )
     guard(("gather_rows", object(), object()), before=before)
 
 
@@ -390,7 +570,7 @@ def test_the_guard_skips_vision_requests():
 # ---------------------------------------------------------------------------
 # The graph-level proof
 # ---------------------------------------------------------------------------
-ZERO = {"route_hits": 0, "short_context": 0}
+ZERO = {"route_hits": 0, "request_declines": 0}
 
 
 def test_assert_traced_raises_when_the_armed_lane_missed_the_graph(armed_verify):
@@ -408,7 +588,9 @@ def test_assert_traced_accepts_a_forward_that_routed_for_short_context(
 ):
     """The stock lane IS correct below 2,052 tokens; the assertion says so."""
 
-    lane.note_short_context("select_eager_verify", 33)
+    lane.note_request_decline(
+        "select_eager_verify", "short_context", total_tokens=2048, blocks=512
+    )
     lane.assert_traced(4, before=ZERO, where="compiled verify")
 
 
@@ -417,9 +599,13 @@ def test_assert_traced_still_raises_on_an_unbound_full_budget_forward(
 ):
     """A short forward earlier in the run must not vouch for this one."""
 
-    lane.note_short_context("select_eager_verify", 33)
+    lane.note_request_decline(
+        "select_eager_verify", "short_context", total_tokens=2048, blocks=512
+    )
     before = lane.route_snapshot()
-    with pytest.raises(lane.SparseDecodeContractError, match="at or above 2052"):
+    with pytest.raises(
+        lane.SparseDecodeContractError, match="shape is one the lane can serve"
+    ):
         lane.assert_traced(4, before=before, where="compiled verify")
 
 
@@ -429,7 +615,7 @@ def test_assert_traced_measures_the_delta_not_the_total(armed_verify):
     lane.note_route_hit("select_eager_verify")
     with pytest.raises(lane.SparseDecodeContractError):
         lane.assert_traced(
-            4, before={"route_hits": 1, "short_context": 0}, where="compiled verify"
+            4, before={"route_hits": 1, "request_declines": 0}, where="compiled verify"
         )
 
 
@@ -443,10 +629,10 @@ def test_assert_traced_is_silent_when_nothing_is_armed():
 
 
 def test_the_snapshot_carries_both_ways_a_forward_can_prove_engagement():
-    assert lane.route_snapshot() == {"route_hits": 0, "short_context": 0}
+    assert lane.route_snapshot() == {"route_hits": 0, "request_declines": 0}
     lane.note_route_hit("x")
-    lane.note_short_context("x", 9)
-    assert lane.route_snapshot() == {"route_hits": 1, "short_context": 1}
+    lane.note_request_decline("x", "short_context", total_tokens=2048, blocks=9)
+    assert lane.route_snapshot() == {"route_hits": 1, "request_declines": 1}
 
 
 def test_the_compiled_verify_body_samples_and_asserts_across_the_forward():
@@ -596,14 +782,14 @@ def test_route_hits_and_kernel_calls_are_separate_counters(armed_verify):
 def test_reset_clears_the_route_state_too():
     lane.note_route_hit("a")
     lane.note_route_decline("b")
-    lane.note_short_context("a", 9)
+    lane.note_request_decline("a", "short_context", total_tokens=2048, blocks=9)
     lane.reset_for_tests()
     assert lane.route_counters() == {
         "route_hits": 0,
         "route_sites": {},
         "route_declines": {},
-        "short_context": 0,
-        "short_context_blocks": {},
+        "request_declines": 0,
+        "request_decline_extremes": {},
         "short_context_tokens": 2052,
     }
 
@@ -657,15 +843,17 @@ def test_a_route_hit_with_no_kernel_call_is_refused(armed_verify, monkeypatch):
         driver.fable_qsa_sparse_decode_block(require_calls=True)
 
 
-def test_a_short_context_only_cell_is_refused_with_the_reason(
+def test_a_request_shape_only_cell_is_refused_with_the_reason(
     armed_verify, monkeypatch
 ):
     """Not an inert flag -- a cell measured below the lane's own threshold."""
 
     monkeypatch.setattr(lane, "_DISABLED_REASON", "")
-    lane.note_short_context("select_eager_verify", 33)
+    lane.note_request_decline(
+        "select_eager_verify", "short_context", total_tokens=2048, blocks=512
+    )
     driver = load_driver()
-    with pytest.raises(RuntimeError, match="never reached 2052 tokens"):
+    with pytest.raises(RuntimeError, match="never presented one the lane can serve"):
         driver.fable_qsa_sparse_decode_block(require_calls=True)
 
 
@@ -673,13 +861,15 @@ def test_a_long_cell_that_also_served_short_requests_passes(
     armed_verify, monkeypatch
 ):
     monkeypatch.setattr(lane, "_DISABLED_REASON", "")
-    lane.note_short_context("select_eager_verify", 33)
+    lane.note_request_decline(
+        "select_eager_verify", "short_context", total_tokens=2048, blocks=512
+    )
     lane.note_route_hit("select_eager_verify")
     lane._COUNTS["verify_kernel"] += 12
     driver = load_driver()
     block = driver.fable_qsa_sparse_decode_block(require_calls=True)
     assert block["problems"] == []
-    assert block["short_context"] == 1
+    assert block["request_declines"] == 1
     assert block["route_hits"] == 1
 
 

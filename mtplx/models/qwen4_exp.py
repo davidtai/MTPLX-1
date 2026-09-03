@@ -3097,17 +3097,32 @@ class QSAIndexer(nn.Module):
                 f"metallib is instantiated for; got ratio={int(self.ratio)}, "
                 f"block_topk={int(self.block_topk)}"
             )
-        if int(k_eff) != int(self.block_topk):
-            # ROUTING, and the one decline that is a property of the REQUEST.
-            # The kernel's ABI is a fixed [M, 512] selection and 512 complete
-            # blocks exist only from (block_topk + 1) * ratio = 2,052 tokens;
-            # below that there is no analogue to fall to, and padding the
-            # selection would attend keys the shipped lane does not. Context
-            # length is a per-request shape the server must accept, so the
-            # stock chain serves it. Counted, never printed -- this is once
-            # per QSA layer per short request, and a 500 here took the
-            # HumanEval fullset down on 2026-09-02.
-            _qsa_sparse.note_short_context(site, k_eff)
+        # REQUEST SHAPE -- routing, never failure, and this is the LAST point
+        # at which the stock chain is still reachable: once the selection
+        # returns ("sparse_blocks", top_idx) the rows-gather token list was
+        # never built and attention has nothing to fall back to.
+        #
+        # ``total_tokens`` is read from the K/V BACKING, because that is what
+        # the attention call site passes: ``update_and_fetch`` returns the
+        # whole fixed bank, so its ``T`` is the capacity, not the logical
+        # context. A 1,024-token prompt in a 2,048-token bank has a FULL
+        # 512-block budget (k_eff == 512) and a context that has not crossed
+        # the kernel's dense/sparse boundary -- two different questions, and
+        # asking only the budget one took the 1 K served cell down on
+        # 2026-09-02 with an HTTP 500 from inside the kernel wrapper.
+        backing = getattr(cache.kv, "keys", None)
+        total_tokens = 0 if backing is None else int(backing.shape[2])
+        decline = _qsa_sparse.context_decline(
+            total_tokens=total_tokens,
+            rows=int(rows),
+            k_eff=int(k_eff),
+            capacity=total_tokens,
+        )
+        if decline is not None:
+            # Counted, never printed: once per QSA layer per request.
+            _qsa_sparse.note_request_decline(
+                site, decline, total_tokens=total_tokens, blocks=int(k_eff)
+            )
             return False
         _qsa_sparse.note_route_hit(site)
         return True
@@ -4743,11 +4758,11 @@ class Attention(nn.Module):
         being built rather than after a window.
 
         TWO ways to pass.  The selection is ``sparse_blocks``; or the indexer
-        declined because this request's context is below
-        ``SHORT_CONTEXT_TOKENS``, where the kernel's fixed ``[M, 512]`` ABI
-        has no analogue and the stock chain is the correct lane.  A full-budget
-        forward that got any other lane still raises -- that is the armed-but-
-        inert failure this guard exists for.
+        declined for this request's own SHAPE -- context length, row count,
+        block budget -- where the kernel has no analogue and the stock chain
+        is the correct lane (see ``qsa_sparse_decode.context_decline``).  A
+        servable forward that got any other lane still raises -- that is the
+        armed-but-inert failure this guard exists for.
         """
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "sparse_blocks":
@@ -4755,7 +4770,7 @@ class Attention(nn.Module):
         from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
 
         now = _qsa_sparse.route_snapshot()
-        if now["short_context"] > int(before["short_context"]):
+        if now["request_declines"] > int(before["request_declines"]):
             return
         lane = (
             "MTPLX_FABLE_QSA_SPARSE_DECODE"
@@ -4768,11 +4783,10 @@ class Attention(nn.Module):
             else ("dense_mask" if sel_mask is not None else "no_selection")
         )
         raise RuntimeError(
-            f"{lane} is armed and this is its {int(rows)}-row width on the "
-            f"fixed QSA cache with a full {_qsa_sparse.TOP_K}-block budget, "
-            f"but the indexer handed attention the {took!r} lane: the split-K "
-            "kernel is not in this graph and the arm would replay the stock "
-            "chain"
+            f"{lane} is armed and this is its {int(rows)}-row width on a "
+            "fixed QSA cache whose shape the lane can serve, but the indexer "
+            f"handed attention the {took!r} lane: the split-K kernel is not "
+            "in this graph and the arm would replay the stock chain"
         )
 
     def _verify_glue_rope(self, rows: int) -> bool:
@@ -4812,8 +4826,8 @@ class Attention(nn.Module):
         # W68: the armed lane's per-layer proof. Sampled BEFORE the indexer,
         # because the routing decision is taken inside it -- and a forward can
         # prove engagement two ways: it routed to the kernel, or it declined
-        # for a context below SHORT_CONTEXT_TOKENS, where the kernel has no
-        # analogue and the stock chain is correct.
+        # for its own request SHAPE (context length, rows, budget), where the
+        # kernel has no analogue and the stock chain is correct.
         sparse_required = self._sparse_decode_required(cache, S)
         sparse_before = _sparse_route_snapshot() if sparse_required else None
 

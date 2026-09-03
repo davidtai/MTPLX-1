@@ -99,14 +99,20 @@ THE LANE ENGAGES ONLY ABOVE 2,052 TOKENS, AND THAT IS THE DESIGN
 -----------------------------------------------------------------
 The kernel's ABI is a fixed ``[M, 512]`` block selection, and 512 complete
 pooled blocks exist only from ``(512 + 1) * 4 = 2,052`` tokens
-(:data:`SHORT_CONTEXT_TOKENS`).  Below that the indexer selects fewer than a
-full budget and there is no smaller kernel to fall to -- padding the selection
-would attend keys the shipped lane does not.  Context length is a per-REQUEST
-shape the server must accept, so a short request routes to the stock
-attention, is counted as ``short_context``, and prints nothing.  A HumanEval
-prompt of a few hundred tokens is served, not refused; an armed 16 K decode
+(:data:`SHORT_CONTEXT_TOKENS`).  Below that there is no smaller kernel to fall
+to -- padding the selection would attend keys the shipped lane does not.
+Context length is a per-REQUEST shape the server must accept, so a short
+request routes to the stock attention, is counted, and prints nothing.  A
+HumanEval prompt or a 1 K cell is served, not refused; an armed 16 K decode
 still has to bind or the assertions fire.  This is the documented behaviour of
 the flag, not a fallback.
+
+The threshold is on the value ATTENTION passes as ``total_tokens``, which on a
+fixed-capacity cache is the BANK CAPACITY -- ``update_and_fetch`` returns the
+whole backing.  A 1,024-token prompt in a 2,048-token bank therefore has a
+full 512-block budget and a context that has NOT crossed the boundary; the two
+questions are different, and :func:`context_decline` asks both.  Asking only
+the first cost the 1 K cell of the 2026-09-02 served battery.
 """
 
 from __future__ import annotations
@@ -241,11 +247,11 @@ _COUNTS: Dict[str, int] = {
     # of a compiled verify graph runs once per retrace, so read these as "did
     # this lane get into the graph at all", never as a per-cycle count.
     "route_hits": 0,
-    # Forwards that routed to the stock chain because the context is below
-    # SHORT_CONTEXT_TOKENS.  This is the ONE decline that is a property of the
-    # REQUEST rather than of the configuration (see SHORT_CONTEXT_TOKENS), so
-    # it is counted separately and the engagement assertions accept it.
-    "short_context": 0,
+    # Forwards that routed to the stock chain because of the REQUEST's own
+    # shape -- its context length, its row count, its block budget -- rather
+    # than the configuration.  Counted separately because the engagement
+    # assertions accept these and only these: see :func:`context_decline`.
+    "request_declines": 0,
 }
 
 #: Smallest context the lane can serve, in tokens.  The kernel's ABI is a
@@ -254,11 +260,21 @@ _COUNTS: Dict[str, int] = {
 #: ``(TOP_K + 1) * COMPRESS_RATIO`` = 2,052 tokens.  Below that there is no
 #: analogue -- not a smaller kernel, not a padded one -- so the stock chain
 #: serves the request and the receipt says how often.
+#:
+#: This is exactly ``mtplx.native``'s
+#: ``total_tokens // _COMPRESS_RATIO <= _TOP_K_BLOCKS`` boundary, restated in
+#: tokens.  ``tests/test_fable_qsa_sparse_decode_wiring.py`` pins the two
+#: together.
 SHORT_CONTEXT_TOKENS = (TOP_K + 1) * COMPRESS_RATIO
 
-#: Widest and narrowest short-context budget observed, so the receipt carries
-#: the block counts without giving ``_ROUTE_DECLINES`` an unbounded key space.
-_SHORT_CONTEXT_BLOCKS: Dict[str, int] = {}
+#: Largest context the kernel is instantiated for; mirrors
+#: ``mtplx.native._MAX_CONTEXT``.
+MAX_CONTEXT = 1_048_576
+
+#: Observed extremes for the request-shape declines, so the receipt carries
+#: the numbers without giving ``_ROUTE_DECLINES`` an unbounded key space (one
+#: key per distinct context length would grow without bound in a server).
+_DECLINE_EXTREMES: Dict[str, int] = {}
 
 #: ``site -> hits``.  The 2026-09-02 window failed because ONE of the two call
 #: sites existed for the verify width and the other asked the draft question;
@@ -324,41 +340,118 @@ def note_route_decline(reason: str) -> None:
     _ROUTE_DECLINES[reason] = _ROUTE_DECLINES.get(reason, 0) + 1
 
 
-def note_short_context(site: str, blocks: int) -> None:
-    """This forward's context is below :data:`SHORT_CONTEXT_TOKENS`.
+#: THE MIRROR.  Every branch of
+#: ``mtplx.native.qsa_sparse_gqa_decode_unsupported_reason`` that depends on
+#: the REQUEST -- its context length, its row count, its block budget -- paired
+#: with the stable key :func:`context_decline` reports it under.  Everything
+#: else in that function is CONFIGURATION (dtypes, shapes, the tile, the split
+#: count, the device, the build) and raises.
+#:
+#: Two request-shape raises reached production before this list existed. The
+#: first was ``k_eff != TOP_K`` (2026-09-02, HTTP 500 on every HumanEval
+#: prompt). The second was the one this list is named for: a 1,024-token
+#: prompt whose FIXED bank is 2,048 tokens has a full 512-block budget --
+#: ``k_eff`` is 512, so the first gate passed -- while the kernel's own
+#: boundary is ``total_tokens // 4 > 512``, i.e. 2,052 tokens, so the call
+#: died inside ``attention()`` with "the context has not crossed the
+#: dense/sparse boundary". A partial mirror is how that happens, so
+#: ``tests/test_fable_qsa_sparse_decode_wiring.py`` pins this list against the
+#: native source.
+REQUEST_SHAPE_DECLINES = (
+    ("empty_context", "total_tokens must describe a non-empty context"),
+    ("rows_exceed_context", "the query rows must fit inside total_tokens"),
+    (
+        "context_exceeds_capacity",
+        "the logical token count exceeds the full K/V backing capacity",
+    ),
+    (
+        "context_above_limit",
+        "the logical token count exceeds the production context limit",
+    ),
+    ("short_context", "the context has not crossed the dense/sparse boundary"),
+    # Not a native branch: the indexer's own budget, which the kernel's fixed
+    # [M, TOP_K] ABI requires and which a short context cannot fill.
+    ("partial_budget", None),
+)
 
-    Routing, not failure, and the ONLY decline that is a property of the
-    request rather than of the configuration: a server accepts whatever
-    context length it is sent, and the kernel has no analogue below a full
-    budget.  Counted (never printed -- this is per request) and accepted by
-    :func:`assert_traced`, so a short prompt runs the stock chain instead of
-    returning a 500.
+#: The native reason strings the mirror above claims.  A reason in this set
+#: reaching :func:`attention` means the routing predicate did not mirror the
+#: kernel, which is a wiring bug and says so.
+REQUEST_SHAPE_REASONS = frozenset(
+    reason for _key, reason in REQUEST_SHAPE_DECLINES if reason is not None
+)
 
-    The block count rides in :data:`_SHORT_CONTEXT_BLOCKS` as a min/max pair
-    rather than in the decline key, which would otherwise grow one key per
-    distinct context length.
+
+def context_decline(
+    *, total_tokens: int, rows: int, k_eff: int, capacity: int
+) -> Optional[str]:
+    """The request-shape verdict, from host ints alone.  ``None`` = servable.
+
+    Mirrors :data:`REQUEST_SHAPE_DECLINES` in the native contract's own order.
+    Called by the indexer BEFORE it commits the forward to this lane, because
+    that is the last point at which the stock chain is still reachable: once
+    the selection returns ``("sparse_blocks", top_idx)`` the rows-gather token
+    list was never built and there is nothing to fall back to.
+
+    ``total_tokens`` must be the value the ATTENTION call site will pass, not
+    the logical context. On a fixed-capacity cache ``update_and_fetch``
+    returns the whole backing, so attention's ``T`` is the bank capacity --
+    which is exactly how a 1,024-token prompt (2,048-token bank, 512 complete
+    blocks, full budget) reached the kernel and was refused by it.
     """
 
-    blocks = int(blocks)
-    _COUNTS["short_context"] += 1
-    note_route_decline(f"{site}: short_context")
-    low = _SHORT_CONTEXT_BLOCKS.get("min")
-    high = _SHORT_CONTEXT_BLOCKS.get("max")
-    _SHORT_CONTEXT_BLOCKS["min"] = blocks if low is None else min(low, blocks)
-    _SHORT_CONTEXT_BLOCKS["max"] = blocks if high is None else max(high, blocks)
+    total_tokens = int(total_tokens)
+    if total_tokens <= 0:
+        return "empty_context"
+    if int(rows) > total_tokens:
+        return "rows_exceed_context"
+    if total_tokens > int(capacity):
+        return "context_exceeds_capacity"
+    if total_tokens > MAX_CONTEXT:
+        return "context_above_limit"
+    if total_tokens // COMPRESS_RATIO <= TOP_K:
+        return "short_context"
+    if int(k_eff) != TOP_K:
+        return "partial_budget"
+    return None
+
+
+def note_request_decline(
+    site: str, reason: str, *, total_tokens: int, blocks: int
+) -> None:
+    """This forward's own SHAPE is outside the lane.  Routing, not failure.
+
+    A server accepts whatever context length it is sent, and the kernel has no
+    analogue below a full budget -- not a smaller kernel, not a padded one.
+    Counted (never printed: this runs once per QSA layer per request) and
+    accepted by :func:`assert_traced`, so a short prompt runs the stock chain
+    instead of returning a 500.
+
+    The numbers ride in :data:`_DECLINE_EXTREMES` as min/max pairs rather than
+    in the decline key, which would otherwise grow one key per distinct
+    context length.
+    """
+
+    _COUNTS["request_declines"] += 1
+    note_route_decline(f"{site}: {reason}")
+    for name, value in (("blocks", int(blocks)), ("tokens", int(total_tokens))):
+        low = _DECLINE_EXTREMES.get(f"{name}_min")
+        high = _DECLINE_EXTREMES.get(f"{name}_max")
+        _DECLINE_EXTREMES[f"{name}_min"] = value if low is None else min(low, value)
+        _DECLINE_EXTREMES[f"{name}_max"] = value if high is None else max(high, value)
 
 
 def route_snapshot() -> Dict[str, int]:
     """The two counters to sample around a forward, for :func:`assert_traced`.
 
     A forward proves the armed lane engaged either by ROUTING to the kernel
-    (``route_hits``) or by declining for a reason the contract allows
-    (``short_context``).  Anything else is an inert flag.
+    (``route_hits``) or by declining for a REQUEST SHAPE the contract cannot
+    serve (``request_declines``).  Anything else is an inert flag.
     """
 
     return {
         "route_hits": int(_COUNTS["route_hits"]),
-        "short_context": int(_COUNTS["short_context"]),
+        "request_declines": int(_COUNTS["request_declines"]),
     }
 
 
@@ -369,8 +462,8 @@ def route_counters() -> Dict[str, Any]:
         "route_hits": int(_COUNTS["route_hits"]),
         "route_sites": dict(_ROUTE_SITES),
         "route_declines": dict(_ROUTE_DECLINES),
-        "short_context": int(_COUNTS["short_context"]),
-        "short_context_blocks": dict(_SHORT_CONTEXT_BLOCKS),
+        "request_declines": int(_COUNTS["request_declines"]),
+        "request_decline_extremes": dict(_DECLINE_EXTREMES),
         "short_context_tokens": SHORT_CONTEXT_TOKENS,
     }
 
@@ -469,11 +562,10 @@ def assert_traced(rows: int, *, before: Dict[str, int], where: str) -> None:
     inert flag, and replaying that graph a few hundred times produces a delta
     nobody can attribute -- which is what the 2026-09-02 window did.
 
-    A forward that declined for SHORT CONTEXT satisfies this: the request's
-    own context is below :data:`SHORT_CONTEXT_TOKENS`, the kernel has no
-    analogue there, and the stock chain is the correct lane.  That is the one
-    decline the assertion accepts, and it is why a HumanEval prompt does not
-    take the server down with the flag armed.
+    A forward that declined for its own REQUEST SHAPE satisfies this -- see
+    :func:`context_decline`.  Those are the only declines the assertion
+    accepts, and they are why a 1 K prompt does not take the server down with
+    the flag armed.
     """
 
     if not armed() or int(rows) != VERIFY_ROWS:
@@ -481,15 +573,15 @@ def assert_traced(rows: int, *, before: Dict[str, int], where: str) -> None:
     now = route_snapshot()
     if now["route_hits"] > int(before["route_hits"]):
         return
-    if now["short_context"] > int(before["short_context"]):
+    if now["request_declines"] > int(before["request_declines"]):
         return
     raise SparseDecodeContractError(
         "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but the split-K kernel is not "
         f"in the traced {where} graph at {int(rows)} rows, and this forward's "
-        f"context is at or above {SHORT_CONTEXT_TOKENS} tokens so the lane "
-        "should have served it: the QSA attention took another path, and this "
-        "arm would replay the stock chain. "
-        f"route_sites={dict(_ROUTE_SITES)} declines={dict(_ROUTE_DECLINES)}"
+        "shape is one the lane can serve, so it should have: the QSA "
+        "attention took another path, and this arm would replay the stock "
+        f"chain. route_sites={dict(_ROUTE_SITES)} "
+        f"declines={dict(_ROUTE_DECLINES)}"
     )
 
 
@@ -507,7 +599,7 @@ def reset_for_tests() -> None:
     _PROBE_REPORT.clear()
     _ROUTE_SITES.clear()
     _ROUTE_DECLINES.clear()
-    _SHORT_CONTEXT_BLOCKS.clear()
+    _DECLINE_EXTREMES.clear()
     for key in _COUNTS:
         _COUNTS[key] = 0
 
@@ -1035,6 +1127,20 @@ def attention(
         key_splits=key_splits,
     )
     if reason is not None:
+        if reason in REQUEST_SHAPE_REASONS:
+            # Unreachable when the mirror is complete, and that is the point of
+            # saying so: the INDEXER owns every request-shape decision, because
+            # by the time a forward reaches here the rows-gather token list was
+            # never built and there is nothing to fall back to.  A 1,024-token
+            # prompt died exactly here on 2026-09-02.
+            raise SparseDecodeContractError(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE routing did not mirror the "
+                f"kernel contract: the kernel refused this call because {reason!r}, "
+                "which is a REQUEST shape that "
+                "kernels/qsa_sparse_decode.context_decline must have declined "
+                "before the selection committed to this lane. Fix the mirror "
+                "in REQUEST_SHAPE_DECLINES; do not make the request fail"
+            )
         raise RuntimeError(
             "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but this call is off "
             f"contract: {reason}"
@@ -1062,10 +1168,14 @@ __all__ = [
     "assert_traced",
     "engagement_line",
     "installed",
+    "MAX_CONTEXT",
+    "REQUEST_SHAPE_DECLINES",
+    "REQUEST_SHAPE_REASONS",
     "SHORT_CONTEXT_TOKENS",
+    "context_decline",
+    "note_request_decline",
     "note_route_decline",
     "note_route_hit",
-    "note_short_context",
     "route_snapshot",
     "pending",
     "receipt",

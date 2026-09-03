@@ -2124,25 +2124,36 @@ way of failing to engage is fatal to the arm:
 
    **The lane engages only above 2,052 tokens, by design.** The kernel's ABI
    is a fixed `[M, 512]` selection, and 512 complete pooled blocks exist only
-   from `(512 + 1) * 4` tokens. Below that the indexer selects a partial
-   budget and there is no smaller kernel to fall to -- padding would attend
-   keys the shipped lane does not. Context length is a per-request shape the
-   server must accept, so a short request routes to the stock attention,
-   counts as `short_context` in the receipt (with `short_context_blocks`
-   min/max), and prints nothing. A HumanEval prompt is served, not refused;
-   an armed 16 K decode still has to bind or the assertions fire. Raising
-   here instead took the 2026-09-02 composed fullset down with HTTP 500s at
-   7 and 33 blocks.
+   from `(512 + 1) * 4` tokens. Below that there is no smaller kernel to fall
+   to -- padding would attend keys the shipped lane does not. Context length
+   is a per-request shape the server must accept, so a short request routes to
+   the stock attention, is counted, and prints nothing. A HumanEval prompt or
+   a 1 K cell is served, not refused; an armed 16 K decode still has to bind
+   or the assertions fire.
+
+   `qsa_sparse_decode.context_decline` is the single request-shape gate, and
+   it MIRRORS every request-dependent branch of
+   `mtplx.native.qsa_sparse_gqa_decode_unsupported_reason`
+   (`REQUEST_SHAPE_DECLINES`) — because a partial mirror is how both
+   production 500s happened. The first was `k_eff != 512` (HumanEval prompts).
+   The second was subtler: a 1,024-token prompt sits in a **2,048-token fixed
+   bank**, and `update_and_fetch` hands attention the whole backing, so
+   `total_tokens` is 2,048 — a *full* 512-block budget whose context has not
+   crossed `total // 4 > 512`. The budget gate passed and the kernel refused
+   the call. The predicate now reads the same number attention will pass and
+   asks both questions. A reason from that mirror still reaching
+   `attention()` reports itself as a mirror bug, not as a bad request.
 
 3. **A `qsa_sparse_decode` block on the receipt row**, read *after* the run:
    `armed`, `installed`, `disabled_reason`, `tile`, `splits`, `probe` (both
    ladder rungs, per cell), `cache_installs`, `route_hits`, `route_sites`
-   (per call site), `route_declines`, `short_context` +
-   `short_context_blocks` + `short_context_tokens`, `kernel_calls`. The driver
-   refuses the arm -- after writing the receipt -- when the probe never ran,
-   the lane disabled itself, `route_hits` is zero, or no kernel call was
-   issued. A cell whose every forward declined for short context is refused
-   with that named reason: it is the control by construction, so measure this
+   (per call site), `route_declines` (keyed `<site>: <reason>`),
+   `request_declines` + `request_decline_extremes` (token and block min/max) +
+   `short_context_tokens`, `kernel_calls`. The driver refuses the arm -- after
+   writing the receipt -- when the probe never ran, the lane disabled itself,
+   `route_hits` is zero, or no kernel call was issued. A cell whose every
+   forward declined on its request shape is refused with that named reason and
+   the observed extremes: it is the control by construction, so measure this
    lane on a long-context cell.
 
 Read `route_sites` first. It and `kernel_calls` count TRACES, not decode
