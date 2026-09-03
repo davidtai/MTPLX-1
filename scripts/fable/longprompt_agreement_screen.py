@@ -1570,18 +1570,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             background = (health.get("warmup") or {}).get("background")
             if isinstance(background, dict):
-                warmup_health = screen.load_run_guarded().wait_for_background_warmup(
+                _, warmup = screen.wait_for_background_warmup_reporting(
                     base_url,
                     timeout=args.warmup_timeout,
                     fetch=lambda url: screen.http_get(f"{url}/health", timeout=15.0),
+                    label="longprompt-screen",
                 )
-                warmup = {
-                    "waited": True,
-                    "state": (
-                        ((warmup_health.get("warmup") or {}).get("background") or {})
-                        .get("state")
-                    ),
-                }
             else:
                 warmup = {
                     "waited": False,

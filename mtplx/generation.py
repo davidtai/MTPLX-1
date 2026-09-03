@@ -87,7 +87,9 @@ from .fable_draft_k20_prescatter import (
     release_draft_route as _fable_draft_k20_prescatter_release,
 )
 from .fable_prefill_chunk import (
+    COHERENCE_NARROW_EAGER,
     DEFAULT_CHUNK_SIZE as _FABLE_DEFAULT_CHUNK_SIZE,
+    NARROW_EAGER_COUNTER,
     assert_prefill_chunk_coherent,
     guard_prefill_chunk_geometry,
     summarize_spans,
@@ -748,8 +750,9 @@ def _guard_prefill_chunk_geometry(
 
     The coherence check reads the CONFIGURED width, not the widest observed
     span: a short prompt or a GDN-boundary tail grid legitimately cuts spans
-    below the configured chunk, and refusing those would break every
-    sub-chunk request.
+    below the configured chunk, and only the configured width tells the
+    mis-paired serve (refused) apart from a partial chunk (admitted, and
+    counted as an eager-selector fallback).
     """
 
     chunks, widest = summarize_spans(spans)
@@ -759,7 +762,14 @@ def _guard_prefill_chunk_geometry(
     configured = (
         _prefill_chunk_size() if chunk_size is None else max(1, int(chunk_size))
     )
-    assert_prefill_chunk_coherent(configured)
+    if assert_prefill_chunk_coherent(configured) == COHERENCE_NARROW_EAGER:
+        # A chunk narrower than MTPLX_QSA_PREFILL_COMPILE_ROWS (a warm-up
+        # ladder rung, a restored suffix) is served by the eager selector by
+        # design. Legal, but it is not the compiled lane, so put it on the
+        # receipt instead of leaving the demotion invisible.
+        rt.diagnostic_counters[NARROW_EAGER_COUNTER] = (
+            int(rt.diagnostic_counters.get(NARROW_EAGER_COUNTER, 0)) + 1
+        )
     plan = guard_prefill_chunk_geometry(
         chunk_size=widest,
         total_tokens=total,
