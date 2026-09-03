@@ -75,7 +75,17 @@ from mtplx.runtime_options import (
     fable_hc_m4_enabled,
     fable_opdiet_enabled,
     fable_qsa_m4_enabled,
+    fable_qsa_sparse_decode_enabled,
+    fable_qsa_sparse_draft_enabled,
     fable_verify_glue_enabled,
+)
+
+#: W68 widths, imported rather than re-spelled so the routing predicate and
+#: the kernel cannot drift apart.  ``kernels.qsa_sparse_decode`` imports only
+#: mlx.core at module scope, so this is not a cycle and costs nothing.
+from mtplx.kernels.qsa_sparse_decode import (
+    DRAFT_ROWS as _SPARSE_DRAFT_ROWS,
+    VERIFY_ROWS as _SPARSE_VERIFY_ROWS,
 )
 
 #: MTPLX_FABLE_GDN_KEEPMASK_FOLD, resolved at import for the same reason every
@@ -2860,7 +2870,13 @@ class QSAIndexer(nn.Module):
         return int(rows) == int(getattr(cache, "fable_qsa_m4_rows", 0))
 
     def _sparse_decode_route(
-        self, cache: QSACache, *, rows: int, k_eff: int, draft: bool = False
+        self,
+        cache: QSACache,
+        *,
+        rows: int,
+        k_eff: int,
+        draft: bool = False,
+        site: str,
     ) -> bool:
         """True when the native split-K sparse-GQA kernel serves this call.
 
@@ -2870,23 +2886,92 @@ class QSAIndexer(nn.Module):
         never re-derives the decision, so two traces of the same verify graph
         cannot disagree about which attention they contain.
 
-        Three narrowings, all of which are routing rather than failure: the
-        flag has to be armed for THIS width (verify M=4 and draft M=1 are
-        separately gated), the selection has to be a full budget (a short
-        context selects fewer than 512 blocks and the kernel's ABI is a fixed
-        [M, 512]), and the pack has to be the ratio-4 top-512 QSA geometry
-        the metallib is instantiated for.
+        TWO KINDS OF "NO", AND THE 2026-09-02 WINDOW IS WHY THEY ARE SPLIT.
+
+        That window armed MTPLX_FABLE_QSA_SPARSE_DECODE at 16 K and measured
+        the control on both seeds.  The cause was one silent narrowing: the
+        only call site that could reach the verify width asked this predicate
+        with ``draft=True`` hard-coded, so it read ``fable_qsa_sparse_draft_rows``
+        (0, because the draft flag was not armed), returned False, and fell
+        through to the rows-gather lane.  Nothing said so.  So:
+
+        * ROUTING (returns False): the flag is off for this width, or the
+          selection is a width it does not arm -- a 16 K prefill row count is
+          not a 4-row verify.  A growable cache is routing too, and IS
+          recorded in the lane's ``route_declines``: the lane installs on the
+          fixed-capacity compiled-verify cache, so an armed run that only ever
+          saw growable caches has a readable cause in its receipt rather than
+          a silent zero.
+        * FAILURE (raises): the flag is armed, this IS the width it arms, and
+          the cache is the one it installs on -- but the geometry or the
+          budget does not match.  An armed flag that reverts here would make
+          the arm measure the stock chain again.
+
+        ``site`` names the call site in the receipt.  The two sites are not
+        interchangeable: ``_select_m4`` only exists under MTPLX_FABLE_QSA_M4,
+        and ``_select_eager`` is what the fixed-M4 verify actually takes when
+        that flag is off.
         """
 
+        # The unarmed path is ONE cached-bool test, exactly like ``_m4_route``:
+        # this predicate runs twice per QSA layer per forward, and a decode
+        # cycle that pays for a flag nobody armed is a cost with no lever.
+        if not (
+            fable_qsa_sparse_draft_enabled()
+            if draft
+            else fable_qsa_sparse_decode_enabled()
+        ):
+            return False
+        expected = _SPARSE_DRAFT_ROWS if draft else _SPARSE_VERIFY_ROWS
+        if int(rows) != int(expected):
+            return False
+
+        from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+        if not bool(getattr(cache, "fixed_capacity", False)):
+            # The lane's install probe needs the materialized fixed bank, so a
+            # growable cache never carried it.  Construction owns this gate:
+            # TensorOffsetQSACache.__init__ raises when the flag is armed and
+            # the cache was built without the lane.
+            _qsa_sparse.note_route_decline(f"{site}: growable cache")
+            return False
         attribute = (
             "fable_qsa_sparse_draft_rows" if draft else "fable_qsa_sparse_decode_rows"
         )
         wired = int(getattr(cache, attribute, 0))
-        if wired <= 0 or int(rows) != wired:
-            return False
+        lane = (
+            "MTPLX_FABLE_QSA_SPARSE_DRAFT"
+            if draft
+            else "MTPLX_FABLE_QSA_SPARSE_DECODE"
+        )
+        if wired <= 0:
+            raise RuntimeError(
+                f"{lane} is armed and this is its {int(rows)}-row width, but "
+                f"the fixed QSA cache carries {attribute}={wired}: it was "
+                "built without the lane, or the install probe disabled it"
+            )
+        if int(rows) != wired:
+            raise RuntimeError(
+                f"{lane} bound {wired} rows but this selection is "
+                f"{int(rows)}; the cache and the module disagree about the "
+                "width the kernel serves"
+            )
         if int(self.ratio) != 4 or int(self.block_topk) != 512:
-            return False
-        return int(k_eff) == int(self.block_topk)
+            raise RuntimeError(
+                f"{lane} is wired for the ratio-4 top-512 QSA geometry the "
+                f"metallib is instantiated for; got ratio={int(self.ratio)}, "
+                f"block_topk={int(self.block_topk)}"
+            )
+        if int(k_eff) != int(self.block_topk):
+            raise RuntimeError(
+                f"{lane} needs a full {int(self.block_topk)}-block budget -- "
+                f"the kernel's ABI is a fixed [M, {int(self.block_topk)}] "
+                f"selection -- but this forward selects {int(k_eff)} blocks. "
+                "A context below (block_topk + 1) * ratio tokens cannot "
+                "produce one; unarm the flag for short-context serving"
+            )
+        _qsa_sparse.note_route_hit(site)
+        return True
 
     def _require_m4_contract(self, cache: QSACache, rows: int) -> None:
         """Validate the module half of the lane.  Raises; never returns False.
@@ -3028,7 +3113,9 @@ class QSAIndexer(nn.Module):
         top_idx = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)[
             :, nb_total - k_eff :
         ]
-        if self._sparse_decode_route(cache, rows=int(top_idx.shape[0]), k_eff=k_eff):
+        if self._sparse_decode_route(
+            cache, rows=int(top_idx.shape[0]), k_eff=k_eff, site="select_m4_verify"
+        ):
             # MTPLX_FABLE_QSA_SPARSE_DECODE: the native split-K kernel walks
             # ``top_idx`` directly, so the token list below is dead work --
             # one dispatch per layer on top of the five the kernel replaces.
@@ -3319,13 +3406,33 @@ class QSAIndexer(nn.Module):
                 cache, rows=S, nb_q=nb_q, top_idx=top_idx, k_eff=k_eff
             )
 
-        if self._sparse_decode_route(cache, rows=S, k_eff=k_eff, draft=True):
-            # MTPLX_FABLE_QSA_SPARSE_DRAFT: same kernel, M=1 geometry.  See
-            # the flag's note in runtime_options -- today's retained-stack
-            # census shows the draft chain running the MTP block rather than
-            # the twelve QSA layers, so this width exists for non-speculative
-            # decode and for a future full-stack draft, and must not be
-            # credited with a speculative-ABBA win it cannot produce.
+        # BOTH widths, and this is the fix for the 2026-09-02 window.  This
+        # selector -- not ``_select_m4`` -- is what a fixed-capacity forward
+        # reaches whenever MTPLX_FABLE_QSA_M4 is OFF, which is every arm of
+        # the retained fixed-M4 stack: ``_call_rows`` only takes the fused-M4
+        # branch when that separate flag is armed (see ``_m4_route``), and the
+        # fixed-capacity path then falls through ``legacy_fused=False`` to
+        # here.  Asking only the DRAFT question here made the verify lane
+        # unreachable on the shipped stack: the flag armed, the cache
+        # installed, and the kernel never ran.
+        #
+        # MTPLX_FABLE_QSA_SPARSE_DRAFT is the M=1 geometry of the same kernel.
+        # Today's retained-stack census shows the draft chain running the MTP
+        # block rather than the twelve QSA layers, so that width exists for
+        # non-speculative decode and for a future full-stack draft, and must
+        # not be credited with a speculative-ABBA win it cannot produce.
+        sparse_verify = self._sparse_decode_route(
+            cache, rows=S, k_eff=k_eff, draft=False, site="select_eager_verify"
+        )
+        sparse_draft = not sparse_verify and self._sparse_decode_route(
+            cache, rows=S, k_eff=k_eff, draft=True, site="select_eager_draft"
+        )
+        if sparse_verify or sparse_draft:
+            if self._indexer_reuse_armed(S):
+                # The kernel applies its OWN per-slot predicate to `top_idx`
+                # and never sees `reuse_blk_ok`, so a reused block set whose
+                # trailing slot is a masked duplicate would be attended twice.
+                self._indexer_reuse_refuse("sparse-blocks")
             return ("sparse_blocks", top_idx)
 
         if S > 1 and _qsa_large_prefill_enabled(S, total):
@@ -4443,6 +4550,30 @@ class Attention(nn.Module):
             else None
         )
 
+    def _sparse_decode_required(self, cache: QSACache, rows: int) -> bool:
+        """True when the armed split-K lane MUST have served this selection.
+
+        Narrow on purpose, and every narrowing is a place the lane genuinely
+        cannot be: no indexer at all (a dense layer), a growable cache (the
+        lane installs on the fixed-capacity compiled-verify cache, and
+        construction owns that gate), or a width this process did not arm.
+        Everything else is the contract, and failing it is fatal -- see the
+        call site in ``__call__``.
+        """
+
+        if self.indexer is None:
+            return False
+        rows = int(rows)
+        if rows == _SPARSE_VERIFY_ROWS:
+            if not fable_qsa_sparse_decode_enabled():
+                return False
+        elif rows == _SPARSE_DRAFT_ROWS:
+            if not fable_qsa_sparse_draft_enabled():
+                return False
+        else:
+            return False
+        return bool(getattr(cache, "fixed_capacity", False))
+
     def _verify_glue_rope(self, rows: int) -> bool:
         """True when ``MTPLX_FABLE_VERIFY_GLUE``'s ``qsa_rope`` serves this call.
 
@@ -4599,6 +4730,36 @@ class Attention(nn.Module):
             # bank state keeps one format. Masks key on sequence order,
             # which remains correct under M-RoPE; only rope reads the axes.
             sel_mask = None
+
+        if vrope is None and self._sparse_decode_required(cache, int(S)):
+            # W68 -- the construction-time proof that the armed lane is IN
+            # this graph.  Every branch below is a DIFFERENT attention, and
+            # the 2026-09-02 window took one of them (rows-gather) for 394
+            # cycles with the flag armed and nothing saying so.  The selection
+            # is decided in this Python body, which under mx.compile runs at
+            # TRACE time -- so this raises while the graph is being built, not
+            # after a window.
+            if not (
+                isinstance(sel_mask, tuple)
+                and sel_mask
+                and sel_mask[0] == "sparse_blocks"
+            ):
+                lane = (
+                    "MTPLX_FABLE_QSA_SPARSE_DECODE"
+                    if int(S) != 1
+                    else "MTPLX_FABLE_QSA_SPARSE_DRAFT"
+                )
+                took = (
+                    sel_mask[0]
+                    if isinstance(sel_mask, tuple) and sel_mask
+                    else ("dense_mask" if sel_mask is not None else "no_selection")
+                )
+                raise RuntimeError(
+                    f"{lane} is armed and this is its {int(S)}-row width on "
+                    f"the fixed QSA cache, but the indexer handed attention "
+                    f"the {took!r} lane: the split-K kernel is not in this "
+                    "graph and the arm would replay the stock chain"
+                )
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash":
             # Block-sparse flash attention over the indexer's exact visible

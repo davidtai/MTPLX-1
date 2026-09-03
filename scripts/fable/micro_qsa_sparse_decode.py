@@ -128,6 +128,16 @@ improving this kernel.  Both are SANITY gates.  The quality gate is
 model-level greedy-token agreement plus a full HumanEval run, exactly as for
 MTPLX_FABLE_HC_M4.
 
+The thresholds are never copied into this script: every gate names the lane
+module constant it reads and reads it at call time, so a rename in the ladder
+fails tests/test_fable_qsa_sparse_decode.py rather than this script's
+startup.  The JSON reports both rungs -- ``parity_ladder`` for the thresholds
+the run is judged by, and per arm ``parity.gates[<gate>]`` with the
+threshold, the observed value and pass/fail -- and the EXIT CODE is the
+verdict: 0 every gate held on every measured arm, 1 a gate failed (the arms
+and the failing gates are named on stderr), 3 no arm produced parity numbers
+so there is no verdict at all, 2 the environment could not run the bench.
+
 COMMANDS
 --------
 Build (CPU only, no Metal execution -- but still take the lock so the build's
@@ -166,6 +176,7 @@ import math
 import statistics
 import sys
 import time
+from collections import namedtuple
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -421,6 +432,204 @@ def compare(reference: mx.array, candidate: mx.array) -> dict:
 
 
 # --------------------------------------------------------------------------
+# the two-rung parity ladder
+# --------------------------------------------------------------------------
+# The gate is NOT one number.  ``qsa_sparse_decode`` states the reason at
+# length: the kernel-vs-shipped delta is a property of the SHIPPED path's own
+# bf16 score and probability casts, so a threshold on it bounds the reference
+# rather than the kernel.  The ladder is therefore two rungs, and this bench
+# reports BOTH by the lane module's own constant names:
+#
+#   * TIGHT, vs ``fp32_reference`` -- the DECIDING rung.  Only fp32
+#     reassociation and one bf16 store are left, so it fails if the
+#     attribution above is wrong.
+#   * LOOSE, vs ``stock_reference`` (the shipped path) -- a SANITY bound an
+#     order of magnitude above the shipped path's own quantisation.  It
+#     catches a kernel wrong by a factor; it certifies nothing.
+#
+# Thresholds are read off ``lane`` by NAME at call time and never copied
+# here, so renaming one in the lane module fails this bench's unit test
+# (tests/test_fable_qsa_sparse_decode.py) instead of at GPU time -- which is
+# the drift that broke this script when the ladder grew its second rung.
+#
+# ``statistics`` is a tuple because the two ``compare`` implementations spell
+# the ulp column differently (``lane._compare`` says ``max_abs_ulps``, this
+# script says ``max_abs_bf16_ulps``); the first name present is used and a
+# miss is a hard error, never a silently skipped gate.
+GateSpec = namedtuple(
+    "GateSpec", "name reference statistics threshold_name comparison"
+)
+
+#: The five checks ``qsa_sparse_decode.install`` runs, in its order.  Note
+#: there is deliberately NO ulp gate on the loose rung: the shipped path's
+#: bf16 casts move individual elements by many ulp by construction.
+GATE_SPECS = (
+    GateSpec(
+        "fp32_max_abs_ulps",
+        "vs_fp32",
+        ("max_abs_bf16_ulps", "max_abs_ulps"),
+        "PARITY_FP32_MAX_ABS_ULPS",
+        "<=",
+    ),
+    GateSpec(
+        "fp32_rel_l2", "vs_fp32", ("rel_l2",), "PARITY_FP32_MAX_REL_L2", "<="
+    ),
+    GateSpec("fp32_top1", "vs_fp32", ("top1",), "PARITY_MIN_TOP1", ">="),
+    GateSpec(
+        "shipped_rel_l2",
+        "vs_shipped",
+        ("rel_l2",),
+        "PARITY_SHIPPED_MAX_REL_L2",
+        "<=",
+    ),
+    GateSpec("shipped_top1", "vs_shipped", ("top1",), "PARITY_MIN_TOP1", ">="),
+)
+
+#: How each rung is described in the JSON, so a reader of the summary alone
+#: knows which reference a threshold is against and which one decides.
+REFERENCES = {
+    "vs_fp32": {
+        "reference": "qsa_sparse_decode.fp32_reference",
+        "rung": "tight",
+        "role": "deciding",
+    },
+    "vs_shipped": {
+        "reference": "qsa_sparse_decode.stock_reference (the shipped path)",
+        "rung": "loose",
+        "role": "sanity bound on the shipped path's own bf16 casts",
+    },
+}
+
+
+def gate_threshold(spec: "GateSpec") -> float:
+    """The live threshold, read off the lane module by name.
+
+    Deliberately not cached and not duplicated: a rename in the lane module
+    must raise here.
+    """
+
+    return float(getattr(lane, spec.threshold_name))
+
+
+def parity_gate_ladder() -> dict:
+    """The thresholds this run is judged by, before any measurement."""
+
+    return {
+        "source": "mtplx.kernels.qsa_sparse_decode.install",
+        "verdict_rule": (
+            "every gate must pass for every arm that produced parity "
+            "numbers; the lane module applies the same five checks to its "
+            "worst probe cell"
+        ),
+        "gates": {
+            spec.name: {
+                **REFERENCES[spec.reference],
+                "statistic": spec.statistics[0],
+                "threshold_name": spec.threshold_name,
+                "threshold": gate_threshold(spec),
+                "comparison": spec.comparison,
+            }
+            for spec in GATE_SPECS
+        },
+    }
+
+
+def _observed(stats: dict, spec: "GateSpec") -> float:
+    for key in spec.statistics:
+        if key in stats:
+            return float(stats[key])
+    raise KeyError(
+        f"parity gate {spec.name!r} needs one of {list(spec.statistics)} in "
+        f"the comparison statistics; got {sorted(stats)}"
+    )
+
+
+def parity_gates(vs_fp32: dict, vs_shipped: dict) -> dict:
+    """Evaluate the ladder over one arm.  Threshold, observed, pass, per gate."""
+
+    by_reference = {"vs_fp32": vs_fp32, "vs_shipped": vs_shipped}
+    gates = {}
+    for spec in GATE_SPECS:
+        observed = _observed(by_reference[spec.reference], spec)
+        threshold = gate_threshold(spec)
+        passed = (
+            observed <= threshold
+            if spec.comparison == "<="
+            else observed >= threshold
+        )
+        gates[spec.name] = {
+            **REFERENCES[spec.reference],
+            "statistic": spec.statistics[0],
+            "threshold_name": spec.threshold_name,
+            "threshold": threshold,
+            "comparison": spec.comparison,
+            "observed": observed,
+            "pass": bool(passed),
+        }
+    return gates
+
+
+def gate_failures(gates: dict) -> list:
+    """Human-readable one-liners for the gates that did not hold."""
+
+    return [
+        f"{name}: {g['observed']:.4g} {'>' if g['comparison'] == '<=' else '<'} "
+        f"{g['threshold_name']}={g['threshold']:.4g} "
+        f"(vs {g['reference']}, {g['rung']} rung)"
+        for name, g in gates.items()
+        if not g["pass"]
+    ]
+
+
+def gate_verdict(gates: dict) -> bool:
+    return all(g["pass"] for g in gates.values())
+
+
+def cell_verdict(arms: dict) -> dict:
+    """Roll one cell's arms up.  A SKIPPED arm contributes no verdict."""
+
+    measured = {
+        arm: body["parity"] for arm, body in arms.items() if "parity" in body
+    }
+    return {
+        "arms_measured": sorted(measured),
+        "arms_failed": sorted(a for a, p in measured.items() if not p["gate"]),
+        "failures": {
+            a: p["gate_failures"] for a, p in measured.items() if not p["gate"]
+        },
+        "pass": bool(measured) and all(p["gate"] for p in measured.values()),
+    }
+
+
+def roll_up_verdict(cells: dict) -> dict:
+    """Every measured arm of every cell, qualified by cell name."""
+
+    measured, failed = [], []
+    for name, cell in cells.items():
+        verdict = cell["parity_verdict"]
+        measured.extend(f"{name}/{a}" for a in verdict["arms_measured"])
+        failed.extend(f"{name}/{a}" for a in verdict["arms_failed"])
+    return {
+        "arms_measured": measured,
+        "arms_failed": failed,
+        "pass": bool(measured) and not failed,
+    }
+
+
+def verdict_exit_code(verdict: dict) -> int:
+    """The process status the ladder implies.
+
+    0 every gate held on every measured arm; 1 at least one gate failed; 3 no
+    arm produced parity numbers, so there is no verdict to quote.  (2 is
+    reserved for an environment that could not run the bench at all.)
+    """
+
+    if not verdict["arms_measured"]:
+        return 3
+    return 1 if verdict["arms_failed"] else 0
+
+
+# --------------------------------------------------------------------------
 # timing
 # --------------------------------------------------------------------------
 def time_arm(call, reps: int, warmup: int, queue_depth: int) -> dict:
@@ -640,15 +849,11 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
                 "vs_fp32": compare(references["fp32"], candidate),
                 "vs_shipped": compare(references["shipped"], candidate),
             }
-            parity["gate"] = (
-                parity["vs_fp32"]["max_abs_bf16_ulps"]
-                <= lane.PARITY_FP32_MAX_ABS_ULPS
-                and parity["vs_fp32"]["rel_l2"] <= lane.PARITY_FP32_MAX_REL_L2
-                and parity["vs_fp32"]["top1"] >= lane.PARITY_MIN_TOP1
-                and parity["vs_shipped"]["rel_l2"]
-                <= lane.PARITY_SHIPPED_MAX_REL_L2
-                and parity["vs_shipped"]["top1"] >= lane.PARITY_MIN_TOP1
+            parity["gates"] = parity_gates(
+                parity["vs_fp32"], parity["vs_shipped"]
             )
+            parity["gate"] = gate_verdict(parity["gates"])
+            parity["gate_failures"] = gate_failures(parity["gates"])
             del candidate
             timing = time_arm(call, args.reps, args.warmup, args.queue_depth)
             model = native_bytes(rows, key_tile, key_splits)
@@ -695,6 +900,10 @@ def run_cell(name: str, rows: int, q_offset: int, total_tokens: int, args) -> di
                 f"rel_l2={shp['rel_l2']:.3e}, top1={shp['top1']:.4f}   "
                 f"gate={'PASS' if parity['gate'] else 'FAIL'}"
             )
+            for line in parity["gate_failures"]:
+                print(f"         [GATE FAIL] {line}")
+
+    out["parity_verdict"] = cell_verdict(out["arms"])
     return out
 
 
@@ -747,11 +956,7 @@ def main() -> int:
         "qsa_layers": QSA_LAYERS,
         "capacity": CAPACITY,
         "selected_tokens": lane.SELECTED_TOKENS,
-        "parity_gates": {
-            "max_abs_bf16_ulps": lane.PARITY_MAX_ABS_ULPS,
-            "rel_l2": lane.PARITY_MAX_REL_L2,
-            "top1": lane.PARITY_MIN_TOP1,
-        },
+        "parity_ladder": parity_gate_ladder(),
         "cells": {},
     }
 
@@ -766,11 +971,35 @@ def main() -> int:
     for name, rows, q_offset, total in cells:
         report["cells"][name] = run_cell(name, rows, q_offset, total, args)
 
+    report["parity_verdict"] = roll_up_verdict(report["cells"])
+    measured = report["parity_verdict"]["arms_measured"]
+    failed = report["parity_verdict"]["arms_failed"]
+
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=1))
         print(f"wrote {args.out}")
-    return 0
+
+    status = verdict_exit_code(report["parity_verdict"])
+    if status == 3:
+        print(
+            "no arm produced parity numbers, so the two-rung ladder returned "
+            "NO verdict -- nothing here may be quoted",
+            file=sys.stderr,
+        )
+    elif status:
+        print(
+            f"parity ladder FAILED on {len(failed)} of {len(measured)} arms: "
+            + ", ".join(failed),
+            file=sys.stderr,
+        )
+        for name, cell in report["cells"].items():
+            for arm, lines in cell["parity_verdict"]["failures"].items():
+                for line in lines:
+                    print(f"  {name}/{arm}: {line}", file=sys.stderr)
+    else:
+        print(f"parity ladder PASSED on all {len(measured)} measured arms")
+    return status
 
 
 if __name__ == "__main__":
