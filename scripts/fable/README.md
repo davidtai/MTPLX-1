@@ -2229,6 +2229,26 @@ lane fired, and the harness says so instead of inventing segments. Re-record it
 (either with a build that carries the accounting, or with `MTPLX_CONTEXT_COPY=0
 MTPLX_CONTEXT_COPY_BATCHED=0` so the lane never runs).
 
+#### The prefix commit is a capture, not an offset trim
+
+The first hardware replay (2026-09-02) died on window 0 with `target cache would
+not trim to 16388` — on a **full accept**, where nothing needed trimming.
+`_trim_cache_to_offset` refuses the whole cache if any entry has no `trim`,
+before it looks at how much is being trimmed, and Flash-Next's `make_cache`
+builds a `QSACache` per full-attention layer (trimmable) and an `ArraysCache`
+per linear layer — the GDN recurrent state, which `cache_state` marks
+untrimmable on purpose ("Attention KV caches can roll back by trimming their
+offset. GDN recurrent caches cannot"). An offset trim is not a prefix commit on
+any hybrid model.
+
+`generate_mtpk` never trims that cache either: it captures the recurrence during
+the verify forward and rebuilds each recurrent leaf at the kept row
+(`gdn_capture.commit_captured_prefix`), trimming the trimmable entries in the
+same pass, with rollback + re-forward as the fallback. `advance` now does the
+same, and asserts the resulting offset instead of assuming it. The schedule it
+follows — one forward per window plus one per carry, what each commits, and
+which token stays deferred — is `commit_steps`, a pure function with CPU tests.
+
 `--expect-segments 3` asserts the reconstruction found three requests; if it
 finds two the trajectory does not match the run and the harness refuses to
 replay it. Re-scoring afterwards needs no GPU and no guard:
