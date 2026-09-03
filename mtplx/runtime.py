@@ -10,9 +10,11 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from .artifacts import (
@@ -22,6 +24,13 @@ from .artifacts import (
     text_config,
 )
 from .backends.registry import ARCHITECTURE_DECLARED_MODULES
+
+# Install-time engagement receipts on stderr, once per model load. The
+# [qwen4-*] logger.info lines in load() reach no handler under
+# `python -m mtplx.server.openai`, so this prints the same text the way
+# `[frspec] install report` always did. INSTALL time only -- no
+# per-request logging is enabled and nothing prints from a timed path.
+from .full_stack_selfcheck import print_install_receipt as _print_install_receipt
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -33,6 +42,74 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+
+
+# ---------------------------------------------------------------------------
+# Memoized `inspect.signature(...).parameters`
+#
+# The MTP fan-out calls `signature()` on the *same* bound methods on every
+# decode cycle (`draft_mtp` 3x, `update_mtp_cache` 3x on the fixed-M4 lane).
+# Each call walks the callable's `__wrapped__` chain and builds a fresh
+# `Signature` object -- pure host time, identical answer every cycle.
+#
+# The cache is keyed on the callable's *underlying* function object (bound
+# methods are rebuilt on every attribute access, so the bound object itself is
+# useless as a key) and is weak, so a discarded model frees its entries.  Bound
+# and plain callables get separate tables: `signature()` drops `self` for a
+# bound method, so the two views of one function do NOT share an answer.
+# Callables that cannot be weak-referenced fall back to an id-keyed table that
+# also retains a strong reference, which is what keeps the id from being reused
+# by a later object.
+# ---------------------------------------------------------------------------
+_EMPTY_PARAMETERS: Mapping[str, Any] = MappingProxyType({})
+_BOUND_SIGNATURE_PARAMETERS: "weakref.WeakKeyDictionary[Any, Mapping[str, Any]]" = (
+    weakref.WeakKeyDictionary()
+)
+_PLAIN_SIGNATURE_PARAMETERS: "weakref.WeakKeyDictionary[Any, Mapping[str, Any]]" = (
+    weakref.WeakKeyDictionary()
+)
+_SIGNATURE_PARAMETERS_FALLBACK: dict[int, tuple[Any, Mapping[str, Any]]] = {}
+_SIGNATURE_PARAMETERS_FALLBACK_LIMIT = 512
+
+
+def _signature_parameters(func: Any) -> Mapping[str, Any]:
+    """`inspect.signature(func).parameters`, memoized per callable identity.
+
+    Behaviour-identical to the inline `try: signature(func).parameters /
+    except: {}` it replaces: same value, same `{}` on failure (returned as an
+    immutable empty mapping so a caller can never poison the cache).
+    """
+
+    key = getattr(func, "__func__", None)
+    if key is None:
+        key, table = func, _PLAIN_SIGNATURE_PARAMETERS
+    else:
+        table = _BOUND_SIGNATURE_PARAMETERS
+    try:
+        cached = table.get(key)
+    except TypeError:  # unhashable or not weak-referenceable
+        table = None
+        cached = None
+        slot = _SIGNATURE_PARAMETERS_FALLBACK.get(id(key))
+        if slot is not None:
+            cached = slot[1]
+    if cached is not None:
+        return cached
+    try:
+        params: Mapping[str, Any] = py_inspect.signature(func).parameters
+    except Exception:
+        params = _EMPTY_PARAMETERS
+    if table is not None:
+        try:
+            table[key] = params
+        except TypeError:
+            table = None
+    if table is None:
+        if len(_SIGNATURE_PARAMETERS_FALLBACK) >= _SIGNATURE_PARAMETERS_FALLBACK_LIMIT:
+            _SIGNATURE_PARAMETERS_FALLBACK.clear()
+        # The retained strong reference is what makes the id key safe.
+        _SIGNATURE_PARAMETERS_FALLBACK[id(key)] = (key, params)
+    return params
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -97,6 +174,7 @@ class MTPLXRuntime:
     deepseek_v4_attention_island_report: dict[str, Any] | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
+    qwen4_relaxed_draft_ties: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
@@ -127,10 +205,7 @@ class MTPLXRuntime:
             self._forward_ar_supports_emit_logits is None
             or self._forward_ar_supports_logits_keep is None
         ):
-            try:
-                params = py_inspect.signature(self.model.__call__).parameters
-            except Exception:
-                params = {}
+            params = _signature_parameters(self.model.__call__)
             accepts_kwargs = any(
                 param.kind == py_inspect.Parameter.VAR_KEYWORD
                 for param in params.values()
@@ -354,10 +429,7 @@ class MTPLXRuntime:
                 "mtp_hidden_variant": resolved_hidden_variant,
                 "position_offset": position_offset,
             }
-            try:
-                params = py_inspect.signature(self.model.mtp_forward).parameters
-            except Exception:
-                params = {}
+            params = _signature_parameters(self.model.mtp_forward)
             if "mtp_depth" in params:
                 kwargs["mtp_depth"] = mtp_depth
             return self.model.mtp_forward(hidden_states, next_token_ids, **kwargs)
@@ -385,10 +457,7 @@ class MTPLXRuntime:
         )
         update = getattr(self.model, "mtp_update_cache", None)
         if update is not None:
-            try:
-                params = py_inspect.signature(update).parameters
-            except Exception:
-                params = {}
+            params = _signature_parameters(update)
             accepts_kwargs = any(
                 param.kind == py_inspect.Parameter.VAR_KEYWORD
                 for param in params.values()
@@ -562,6 +631,33 @@ def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool
     return False
 
 
+def _publish_fable_install_receipts(runtime: Any) -> None:
+    """One install-time verdict per armed flag, to stderr, once.
+
+    Nine keys (the op diet, block verification, the K20 pre-scatter, the two
+    PLE prefill lanes, the QSA query tile, and the three prefill/session-bank
+    server knobs) were read with a bare ``os.environ.get`` at request or
+    construction time and printed nothing: an arm that cannot prove which code
+    it ran is unreadable, which is the failure ``mtplx/fable_verify_glue.py``
+    and ``mtplx/kernels/qsa_sparse_decode.py`` already fixed for their lanes.
+
+    Called at INSTALL time only, once per model load, immediately before the
+    runtime is handed back -- the same point the ``[qwen4-*]`` reports publish
+    from, and the one place ``mtplx serve``, the benchmark driver and
+    ``mtplx/prefill_bench.py`` all pass through.  Every verdict OBSERVES
+    state its owning module already decided; nothing here can raise into a
+    model load, and nothing changes what the flags do.
+    """
+
+    try:
+        from .fable_install_receipts import emit_all, receipts
+
+        emit_all(context={"runtime": runtime})
+        runtime.fable_install_receipts = receipts({"runtime": runtime})
+    except Exception:  # a receipt must never be able to fail a load
+        pass
+
+
 def load(
     model_path: Path | str,
     *,
@@ -619,6 +715,7 @@ def load(
             runtime.model_path = path
             runtime.path = path
             runtime.bundle_path = path
+            _publish_fable_install_receipts(runtime)
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
@@ -967,6 +1064,84 @@ def load(
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
     )
+    if str((config or {}).get("model_type") or "").lower() in {
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }:
+        # Routed through the typed registry (mtplx/full_stack_env.py):
+        # same parse, same default, one place that knows the key exists.
+        from .full_stack_env import flag_enabled
+
+        relaxed_draft_ties = flag_enabled("MTPLX_QWEN4_RELAXED_DRAFT_TIES")
+        if relaxed_draft_ties:
+            if not mtp_enabled:
+                raise RuntimeError("relaxed Qwen4 draft ties require native MTP")
+            if adapter_path is not None:
+                raise RuntimeError("relaxed Qwen4 draft ties do not accept adapters")
+            runtime.qwen4_relaxed_draft_ties = True
+        compiled_mtp_prepare = flag_enabled("MTPLX_QWEN4_COMPILED_MTP_PREPARE")
+        if compiled_mtp_prepare:
+            if adapter_path is not None:
+                raise RuntimeError(
+                    "compiled Qwen4 MTP preparation requires the native draft head"
+                )
+            text_model = getattr(model, "language_model", model)
+            mtp_module = getattr(text_model, "mtp", None)
+            install_prepare = getattr(mtp_module, "install_compiled_prepare", None)
+            if install_prepare is None:
+                raise RuntimeError(
+                    "compiled Qwen4 MTP preparation is unavailable on this model"
+                )
+            runtime.qwen4_compiled_mtp_prepare_report = install_prepare()
+            logger.info(
+                "[qwen4-compiled-MTP-prepare] %s",
+                runtime.qwen4_compiled_mtp_prepare_report,
+            )
+            _print_install_receipt(
+                "qwen4-compiled-MTP-prepare",
+                runtime.qwen4_compiled_mtp_prepare_report,
+            )
+        from .qwen4_fixed_verify import (
+            install_qwen4_fixed_verify_route,
+            qwen4_fixed_verify_enabled,
+        )
+
+        if qwen4_fixed_verify_enabled():
+            qwen4_verify_report = install_qwen4_fixed_verify_route(runtime)
+            runtime.qwen4_fixed_verify_report = qwen4_verify_report
+            logger.info("[qwen4-fixed-M4-verify] %s", qwen4_verify_report)
+            _print_install_receipt("qwen4-fixed-M4-verify", qwen4_verify_report)
+        from .qwen4_m4_stage3 import (
+            install_qwen4_m4_stage3,
+            qwen4_m4_stage3_flags,
+        )
+
+        (
+            m4_stage3_enabled,
+            routed_reduce_enabled,
+            residual_tail_enabled,
+            routed_glu_enabled,
+        ) = qwen4_m4_stage3_flags()
+        if m4_stage3_enabled:
+            qwen4_m4_stage3_report = install_qwen4_m4_stage3(
+                runtime,
+                routed_down_reduce_enabled=routed_reduce_enabled,
+                routed_down_residual_tail_enabled=residual_tail_enabled,
+                routed_glu_enabled=routed_glu_enabled,
+            )
+            logger.info("[qwen4-M4-stage3] %s", qwen4_m4_stage3_report)
+            _print_install_receipt("qwen4-M4-stage3", qwen4_m4_stage3_report)
+        # MTPLX_FABLE_HC_M4's PACK contract, checked here because the weights
+        # exist by now.  Everything it validates is process-invariant, so a
+        # miss is a deployment error: it must stop the server coming up with a
+        # precise reason rather than turn the first request that reaches
+        # verify width into an HTTP 500.  No-op when the flag is off.
+        from .models.qwen4_exp import install_hc_m4_pack_validation
+
+        hc_m4_report = install_hc_m4_pack_validation(runtime.model)
+        runtime.qwen4_hc_m4_report = hc_m4_report
+        if hc_m4_report.get("armed"):
+            logger.info("[qwen4-hc-m4] %s", hc_m4_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError
@@ -1006,6 +1181,7 @@ def load(
             install_qwen3_next_packed_concats(model)
     except ImportError:
         pass
+    _publish_fable_install_receipts(runtime)
     return runtime
 
 

@@ -700,6 +700,56 @@ BATCHING_PRESET_CHOICES = ("solo", "latency", "agent", "throughput")
 ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value", "cost")
 
 
+def _add_ngram_prewarm_args(parser: argparse.ArgumentParser) -> None:
+    """The n-gram table pre-read, declared once for both flows.
+
+    A VALUE option, not a boolean: on a 128 GB Mac the ~85 GB of wired
+    weights and a 32 GB table do not both fit alongside the KV cache, so the
+    interesting answer is usually "as much as fits", not yes/no.  `auto` is
+    that answer.  `--no-ngram-prewarm` is kept as the spelling for `off`.
+
+    `default=None` (not `"auto"`) because the flag has an environment
+    counterpart, MTPLX_NGRAM_PREWARM: an argparse default would be
+    indistinguishable from the user typing the flag, and the CLI would
+    silently overrule every shell-set value.
+    """
+
+    parser.add_argument(
+        "--ngram-prewarm",
+        metavar="auto|all|off|GiB",
+        default=None,
+        help=(
+            "How much of the streamed n-gram table to read into the page "
+            "cache at model load. auto (default) warms as much as fits: "
+            "min(table, free - KV reservation - 6 GiB margin). all reads the "
+            "whole table (~2.5 s at ~12 GiB/s for 30 GiB); a bare number is a "
+            "budget in GiB; off serves at the as-found page-cache rate. Cold "
+            "sidecar rows are demand faults at ~1.4 GiB/s and cost 56 vs 68.8 "
+            "tok/s on decode. Environment: MTPLX_NGRAM_PREWARM, which this "
+            "flag overrides."
+        ),
+    )
+    parser.add_argument(
+        "--no-ngram-prewarm",
+        dest="ngram_prewarm",
+        action="store_const",
+        const="off",
+        help="Alias for --ngram-prewarm off.",
+    )
+    parser.add_argument(
+        "--ngram-prewarm-order",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Row-hotness file (.npy of int64 row ids, most-gathered first) "
+            "deciding WHICH rows a partial pre-read warms. Defaults to "
+            "<model>/ngram-hotness.npy when present, else the file prefix is "
+            "read sequentially. Build one with "
+            "scripts/fable/ngram_row_hotness.py."
+        ),
+    )
+
+
 def _add_batching_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--scheduler-mode",
@@ -1159,10 +1209,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_profiles(args: argparse.Namespace) -> int:
+    # The retained Flash-Next optimizations are armed by DEFAULT on that
+    # family (mtplx/full_stack_env.py), so the lane names an operator would
+    # use to turn one off belong on the same surface as the profiles. No MLX
+    # import: full_stack_env is pure Python, like profiles itself.
+    from .full_stack_env import DISABLE_ENV, LANE_KEYS
+
     payload = {
         "default": DEFAULT_PROFILE_NAME,
         "flagship_default": "turbo",
         "profiles": list_profiles(),
+        "optimization_lanes": {
+            lane: list(keys) for lane, keys in LANE_KEYS.items()
+        },
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1174,6 +1233,14 @@ def _cmd_profiles(args: argparse.Namespace) -> int:
     )
     for profile in payload["profiles"]:
         print(f"{profile['name']}: {profile['summary']}")
+    print()
+    print(
+        "Qwen3.8 Flash-Next optimization lanes (armed by default on that "
+        f"family; turn one off with --disable-optimization <lane> or "
+        f"{DISABLE_ENV}=<lane,...>, and 'all' for the stock path):"
+    )
+    for lane, keys in payload["optimization_lanes"].items():
+        print(f"  {lane}: {' '.join(keys)}")
     return 0
 
 
@@ -2249,6 +2316,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Streaming chunk size for Open WebUI server",
     )
     _add_batching_args(start_flow_p)
+    _add_ngram_prewarm_args(start_flow_p)
     _add_ssd_session_cache_args(start_flow_p)
     _add_paged_kv_quant_args(start_flow_p)
     _add_adaptive_args(start_flow_p)
@@ -3385,6 +3453,19 @@ def build_parser() -> argparse.ArgumentParser:
             "--max for Burst."
         ),
     )
+    serve_p.add_argument(
+        "--disable-optimization",
+        dest="disable_optimization",
+        action="append",
+        metavar="LANE",
+        default=None,
+        help=(
+            "Leave one retained-stack optimization unarmed on a Qwen3.8 "
+            "Flash-Next serve (repeatable); 'all' runs the stock path. The "
+            "same switch as MTPLX_FABLE_DISABLE=<lane,...>, and the two "
+            "compose. `mtplx profiles` lists the lane names."
+        ),
+    )
     serve_p.add_argument("--unsafe-force-unverified", action="store_true")
     serve_p.add_argument(
         "--agent-rewrites",
@@ -3468,6 +3549,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Committed-token batch size per chat SSE chunk.",
     )
     _add_batching_args(serve_p)
+    _add_ngram_prewarm_args(serve_p)
     _add_ssd_session_cache_args(serve_p)
     _add_paged_kv_quant_args(serve_p)
     _add_adaptive_args(serve_p)

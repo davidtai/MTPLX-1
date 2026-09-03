@@ -4,6 +4,14 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Qwen3.8 Flash-Next serving stack, armed by default (#391).** A served Flash-Next pack now gets the measured decode and prefill stack -- FR-Spec with its built-in 64k code vocabulary, compiled Qwen4 MTP preparation, the physical-M4 verify and combine kernels, the QSA sparse-decode lane and the chunked/blocked prefill set -- with nothing to export by hand.
+- Every key is a `setdefault` behind the served-config predicate, so an operator export always wins; `MTPLX_FABLE_DISABLE=<lane,...>` and `mtplx serve --disable-optimization <lane>` turn one lane off by name, and `--disable-optimization all` runs the stock path.
+- Each armed key publishes an install-time verdict on stderr and at `GET /health` (`fable_install_receipts`, `engagement_reports`), so a lane that armed but did not engage is visible rather than silent.
+
 ## [2.10.2] - 2026-09-01
 
 ### Fixed

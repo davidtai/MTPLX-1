@@ -147,6 +147,24 @@ def test_qwen_mtp_batch_construction_flags_are_validated_runtime_overrides() -> 
     }
 
 
+def test_qwen4_m4_routed_down_reduce_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE": True}
+    ) == {"MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE": "1"}
+
+
+def test_qwen4_m4_routed_down_residual_tail_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL": True}
+    ) == {"MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL": "1"}
+
+
+def test_qwen4_m4_routed_glu_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_QWEN4_M4_ROUTED_GLU": True}
+    ) == {"MTPLX_QWEN4_M4_ROUTED_GLU": "1"}
+
+
 def test_fused_qsa_indexer_is_a_validated_runtime_override() -> None:
     assert normalize_runtime_env_overrides({"MTPLX_FUSED_QSA_INDEXER": True}) == {
         "MTPLX_FUSED_QSA_INDEXER": "1"
@@ -185,7 +203,27 @@ def test_qsa_mtp_precompute_is_a_validated_runtime_override() -> None:
     }
 
 
+def test_compiled_verify_growth_reserve_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_COMPILED_VERIFY_GROWTH_RESERVE": 2048}
+    ) == {"MTPLX_COMPILED_VERIFY_GROWTH_RESERVE": "2048"}
+
+
 def test_no_shipped_profile_enables_candidate_qsa_lanes() -> None:
+    """No profile may turn ON an unvalidated QSA lane or retune its fences.
+
+    2026-09-03: MTPLX_QSA_PREFILL_COMPILE_ROWS was dropped from this set. It
+    is not an enable and it is not one of the MTPLX_QSA_PREFILL lane's
+    fences -- it is the ROW WIDTH the QSA prefill graph bank captures
+    (mtplx/models/qwen4_exp.py:_qsa_prefill_compile_rows, read at
+    qwen4_exp.py:3993 whether or not MTPLX_QSA_PREFILL is armed), and
+    mtplx/fable_prefill_chunk.py:assert_prefill_chunk_coherent REFUSES a
+    prefill chunk width that disagrees with it. So it travels with
+    MTPLX_PREFILL_CHUNK_SIZE, which every profile already sets, and pinning
+    the pair at 4096 is what the PR-391 prefill battery measured. Turning
+    the lane itself on remains forbidden: MTPLX_QSA_PREFILL is still here.
+    """
+
     candidate_flags = {
         "MTPLX_FUSED_QSA_INDEXER",
         "MTPLX_COMPILED_QSA_INDEXER",
@@ -194,7 +232,6 @@ def test_no_shipped_profile_enables_candidate_qsa_lanes() -> None:
         "MTPLX_QSA_PREFILL_MIN_CONTEXT",
         "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT",
         "MTPLX_QSA_PREFILL_SCORE_MB",
-        "MTPLX_QSA_PREFILL_COMPILE_ROWS",
         "MTPLX_QSA_MTP_PRECOMPUTE",
     }
 
@@ -204,6 +241,18 @@ def test_no_shipped_profile_enables_candidate_qsa_lanes() -> None:
             f"profile {profile['name']} enables default-off QSA candidates: "
             f"{sorted(enabled)}"
         )
+
+
+def test_the_prefill_chunk_width_and_the_qsa_capture_width_agree() -> None:
+    """A profile that sets one and not the other is refused at request time."""
+
+    from mtplx.fable_prefill_chunk import COMPILE_ROWS_ENV, CHUNK_SIZE_ENV
+
+    for profile in list_profiles():
+        env = profile["env"]
+        if COMPILE_ROWS_ENV not in env:
+            continue
+        assert env.get(CHUNK_SIZE_ENV) == env[COMPILE_ROWS_ENV], profile["name"]
 
 
 def test_apply_profile_env_preserves_mtp_history_policy_override() -> None:
@@ -268,6 +317,8 @@ def test_list_profiles_includes_all_public_modes() -> None:
         "turbo",
         "exact",
         "max-diagnostic",
+        # Opt-in Flash-Next decode restack; appended, never a default.
+        "turbo-full-stack",
     ]
 
 

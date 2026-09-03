@@ -372,6 +372,8 @@ def test_profiles_without_mlx(tmp_path: Path) -> None:
         "turbo",
         "exact",
         "max-diagnostic",
+        # Opt-in Flash-Next decode restack; appended, never a default.
+        "turbo-full-stack",
     ]
 
 

@@ -11,6 +11,17 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping
 
+from .full_stack_env import (
+    FULL_STACK_PROFILE_ALIASES,
+    FULL_STACK_PROFILE_ENV,
+    FULL_STACK_PROFILE_NAME,
+)
+
+#: Named before PROFILE_ENV_USER_OVERRIDE_KEYS so the profile's own keys can
+#: be spliced into it: an operator export must beat this profile, exactly as
+#: it beats the server's auto-arm of the rest of the stack.
+_FULL_STACK_PROFILE_KEYS = tuple(FULL_STACK_PROFILE_ENV)
+
 ProfileName = str
 
 DEFAULT_PROFILE_NAME = "sustained"
@@ -21,6 +32,7 @@ PROFILE_CHOICES = (
     "turbo",
     "exact",
     "max-diagnostic",
+    FULL_STACK_PROFILE_NAME,
 )
 PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
     {
@@ -54,6 +66,10 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # A/Bs (2026-07-17 the sweep needed a site-packages patch because the
         # profile stomped the env). Same precedent as DONATION above.
         "MTPLX_COMPILED_VERIFY_MAX_CONTEXT",
+        # Dense fixed-verify capacity ceiling: operators benchmark bounded
+        # generation sizes against graph-reinstall costs. Resolve once when
+        # the bank is constructed; never reread it in the verify hot path.
+        "MTPLX_COMPILED_VERIFY_GROWTH_RESERVE",
         # Compiled-verify mode switch: parity/parity2 exactness gates must be
         # launchable against the turbo profile itself (Gate A on the exact
         # config being shipped), not only on profiles that leave the env
@@ -84,6 +100,14 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         "MTPLX_DROP_EVENTS",
         "MTPLX_SKIP_VERIFY_SNAPSHOT",
         "MTPLX_FAMILY_CAPTURE_COMMIT",
+        # The turbo-full-stack profile's own keys (mtplx/full_stack_env.py).
+        # Operator-overridable for the same reason the server's auto-arm of
+        # the other stack keys steps aside for an explicit export: these are
+        # the A/B switches, and MTPLX_FRSPEC_DRAFT=0 in particular is the
+        # only kill switch for a lane whose installer RAISES on a contract
+        # miss. Without this entry the profile stomped the export and the
+        # operator had no way out but to stop using the profile.
+        *_FULL_STACK_PROFILE_KEYS,
     }
 )
 
@@ -296,6 +320,7 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_AR_PIPELINE",
         "MTPLX_COMPILED_GDN",
         "MTPLX_QWEN4EXP_COMPILE",
+        "MTPLX_COMPILED_VERIFY_GROWTH_RESERVE",
         "MTPLX_DEFER_REPAIR_EVAL",
         "MTPLX_FAMILY_CAPTURE_COMMIT",
         "MTPLX_NGRAM_RESIDENT",
@@ -312,6 +337,29 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # preparation/cache staging/selection. Independently gated so the
         # Metal selector can be A/B tested without graph capture.
         "MTPLX_COMPILED_QSA_INDEXER",
+        # Prefill chunk width. Already an operator-overridable PROFILE key,
+        # but the A/B harness routes construction-time overrides through
+        # MODEL_RUNTIME_ENV_OVERRIDE_KEYS (--candidate-env) and refuses
+        # non-MTPLX_FABLE_* keys on the raw --env passthrough, so before this
+        # the width was unreachable from a window. Set it WITH
+        # MTPLX_QSA_PREFILL_COMPILE_ROWS: the QSA prefill graph bank only
+        # captures its own row width, and mtplx.fable_prefill_chunk refuses
+        # the mismatch rather than let every full chunk fall back silently.
+        "MTPLX_PREFILL_CHUNK_SIZE",
+        "MTPLX_PREFILL_CHUNK_SIZE_DENSE",
+        "MTPLX_PREFILL_CHUNK_SIZE_REPAGE",
+        # Blocked-sequential GDN prefill (omlx port, kernels/gdn_blocked_
+        # prefill.py). Microbenched 1.89x at T=2048 on real GDN shapes
+        # (11d1b1a8); default off "pending the live TTFT A/B", which the tree
+        # has no record of ever completing -- every earlier serve-level
+        # reading was stock-vs-stock until 42952d43 fixed the module-binding
+        # sweep. Registered so a window can arm it without patching env.
+        "MTPLX_GDN_BLOCKED_PREFILL",
+        "MTPLX_GDN_BLOCKED_PREFILL_MIN_T",
+        "MTPLX_GDN_BLOCKED_PREFILL_TB",
+        "MTPLX_GDN_BLOCKED_PREFILL_DEBUG",
+        "MTPLX_GDN_BLOCKED_PREFILL_FORCE_STOCK",
+        "MTPLX_GDN_PREFILL_COMPONENT_TIMING",
         # Matrix-shaped QSA prefill pipeline: byte-bounded tiled MLX scoring,
         # dedicated Metal top-k, and direct block-sparse attention.  All
         # shipped profiles keep it off until numeric and production A/B gates.
@@ -328,6 +376,10 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_QSA_PREFILL_GATHER_TILE",
         # Engagement-receipt atexit print for lane A/Bs (counters law).
         "MTPLX_QSA_PREFILL_DEBUG",
+        # Worker-thread preparation of the NEXT prefill chunk's PLE n-gram
+        # rows during this chunk's forward.  Default off; the gathers it
+        # overlaps are 8 host-late stalls totalling 2,313 ms in the census.
+        "MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD",
         # Capture only one canonical chunk width so arbitrary final/restored
         # suffix sizes cannot grow the mx.compile graph bank without bound.
         "MTPLX_QSA_PREFILL_COMPILE_ROWS",
@@ -352,6 +404,9 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # Registered ahead of any default flip per the boot-trap law.
         "MTPLX_QSA_GATHER_MIN_CONTEXT",
         "MTPLX_QSA_GATHER_MAX_ROWS",
+        # Fixed-M4 QSA rows-gather candidate: read each token index once and
+        # materialize selected K and V in one prebound Metal dispatch.
+        "MTPLX_QSA_M4_FUSED_KV_GATHER",
         # QSA block-sparse flash-skip attention (2026-08-27 candidate):
         # selected blocks iterated inside the kernel, no staging/copies.
         "MTPLX_QSA_FLASH",
@@ -359,6 +414,13 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # (2026-08-28, default 1024; 0 disables) — registered ahead per the
         # boot-trap law so packs/profiles may stamp it.
         "MTPLX_NGRAM_HOT_MB",
+        # Sequential pre-read of the streamed n-gram table at model load
+        # (default ON; 0 opts out). `mtplx serve --ngram-prewarm /
+        # --no-ngram-prewarm` stamps this key, so the CLI wins over a
+        # shell-set value. Cold sidecar rows are demand faults at 1.40 GiB/s
+        # against 12.9 for the read itself: ~2.5 s at load buys 56 -> 68.8
+        # tok/s decode and removes the 1.9 s vs 4.4 s first-chunk bimodality.
+        "MTPLX_NGRAM_PREWARM",
         # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
         # NAX verify patch OFF under turbo until it earns a family receipt.
         "MTPLX_NAX_VERIFY",
@@ -374,6 +436,13 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_COMPILED_VERIFY",
         "MTPLX_COMPILED_VERIFY_MAX_LEN",
         "MTPLX_COMPILED_TARGET_PREFIX",
+        "MTPLX_QWEN4_FIXED_M4_VERIFY",
+        "MTPLX_QWEN4_M4_STAGE3",
+        "MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE",
+        "MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL",
+        "MTPLX_QWEN4_M4_ROUTED_GLU",
+        "MTPLX_QWEN4_COMPILED_MTP_PREPARE",
+        "MTPLX_QWEN4_RELAXED_DRAFT_TIES",
         "MTPLX_FUSE_GDN_POST_CONV",
         "MTPLX_A3B_GDN_POSTCONV_IMPL",
         "MTPLX_LINEAR_GDN_FROM_CONV_TGY",
@@ -381,6 +450,29 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_QWEN_COMBINE_TAIL",
         "MTPLX_QWEN_MOE_PACK_GATE_UP",
         "MTPLX_QWEN_ROW_OWNED_ROUTER",
+        # Every key of the retained Flash-Next stack (mtplx/full_stack_env.py
+        # FULL_STACK_PROFILE_ENV). Since 2026-09-03 the server DEFAULTS all of
+        # them on for a served qwen4_exp pack, so they are in the dict
+        # `_server_runtime_env_overrides` returns -- and mtplx/server/openai.py
+        # hands that dict to `apply_profile_env(runtime_env_overrides=...)`,
+        # whose FIRST statement is normalize_runtime_env_overrides. A defaulted
+        # key missing from this allowlist therefore does not merely stop a pack
+        # pinning it: it makes the boot-time validator raise on the server's
+        # own overrides, during _load, before a weight is read. (The pack's own
+        # contract is the second consumer, normalized in
+        # mtplx/backends/registry.py.)
+        #
+        # Eighteen of the twenty-six were missing until this entry: the fifteen
+        # MTPLX_FABLE_* retained keys, MTPLX_FRSPEC_DRAFT, MTPLX_FRSPEC_VOCAB
+        # and MTPLX_SESSION_BANK_MAX_BYTES. The spread closes the class, so a
+        # key joining the stack can never reopen it.
+        #
+        # Eight of the twenty-six are also listed above with their own
+        # comments. A frozenset literal de-duplicates, and the same
+        # explicit-plus-spread shape is already how PROFILE_ENV_USER_OVERRIDE_KEYS
+        # is built: the entries document WHY a key is overridable, the spread
+        # guarantees the set is COMPLETE.
+        *_FULL_STACK_PROFILE_KEYS,
     }
 )
 
@@ -799,6 +891,131 @@ TURBO_PROFILE = RuntimeProfile(
     product_claim_eligible=False,
 )
 
+TURBO_FULL_STACK_PROFILE = RuntimeProfile(
+    name=FULL_STACK_PROFILE_NAME,
+    runtime_profile="native_mtp_turbo_full_stack",
+    summary=(
+        "Turbo plus the whole retained Qwen3.8 Flash-Next stack: the FR-Spec "
+        "draft head and its 64k code vocabulary, compiled Qwen4 MTP "
+        "preparation, the fifteen retained decode keys and the eight retained "
+        "prefill keys (docs/perf/pr391-stack.flags and "
+        "docs/perf/pr391-prefill.flags). Since 2026-09-03 `mtplx serve` arms "
+        "the same 26 keys BY DEFAULT on a Flash-Next pack, so on that family "
+        "this profile is turbo plus nothing the server was not already going "
+        "to do; it stays selectable for a non-server caller (prefill_bench, "
+        "a benchmark driver) and as an explicit name for the same set. Requires "
+        "--generation-mode mtp and no MTP adapter."
+    ),
+    env=_merge_env(
+        TURBO_PROFILE.env_dict(),
+        # Every measured key nothing else sets: the ABBA control arm's
+        # three-key gap plus both retained Fable groups (15 decode + 8
+        # prefill), 26 in all. See mtplx/full_stack_env.py for the per-key
+        # ownership table and docs/perf/pr391-{stack,prefill}.flags for the
+        # committed record the registry is asserted equal to.
+        #
+        # It replaces exactly ONE turbo value: MTPLX_PREFILL_CHUNK_SIZE,
+        # turbo's 'auto' (2048 either way) against the measured stack's fixed
+        # 4096, which travels with MTPLX_QSA_PREFILL_COMPILE_ROWS=4096
+        # because the QSA prefill graph bank captures one width and
+        # fable_prefill_chunk.assert_prefill_chunk_coherent refuses the
+        # mismatched pair.
+        #
+        # The rest of the 21-key control stack is
+        # already supplied by _server_runtime_env_overrides in
+        # mtplx/server/openai.py for the served pack:
+        #
+        #   17 keys  server auto-arm (`if os.environ.get(key) is None:
+        #            setdefault`, predicates _served_model_type_is_qwen4_exp /
+        #            _served_model_is_qwen4_fixed_m4)
+        #    1 key   server FORCED   SKIP_VERIFY_SNAPSHOT=0 (plain assignment
+        #            for mtp on this family)
+        #
+        # Restating those here would be worse than redundant. Server
+        # overrides are applied AFTER the profile env, so the value would not
+        # change -- but a profile-owned key stomps an operator's explicit
+        # export unless it is in PROFILE_ENV_USER_OVERRIDE_KEYS, while the
+        # server's auto-arm deliberately steps aside for one. Putting them in
+        # the profile would take the A/B switch away from the operator on
+        # exactly the keys the server chose to leave them.
+        #
+        # All 26 of this profile's own keys ARE in
+        # PROFILE_ENV_USER_OVERRIDE_KEYS, for the same reason: an operator
+        # export must beat the profile. MTPLX_FRSPEC_DRAFT=0 in particular is
+        # the only kill switch for a lane whose installer raises rather than
+        # falling back.
+        #
+        # NINE of them are read once at module IMPORT by their call sites, so
+        # this stamp reaches them only because
+        # mtplx/full_stack_env.stamp_import_time_defaults already put them in
+        # the environment from mtplx/server/__init__.py, before openai.py's
+        # own imports ran. See BIND_IMPORT in mtplx/full_stack_env.py.
+        #
+        # That also means this profile has NO turbo conflicts of its own. The
+        # three keys where turbo and the control arm disagree --
+        # BATCH_TARGET_ARRAYS (turbo 0), LAZY_TARGET_DISTRIBUTIONS (turbo 1)
+        # and SKIP_VERIFY_SNAPSHOT (turbo 1) -- plus NAX_VERIFY (turbo 1,
+        # control 0) are all already resolved control-wins by the server for a
+        # qwen4_exp mtp serve, under turbo too. The startup stack line reports
+        # whether that actually happened rather than assuming it.
+        FULL_STACK_PROFILE_ENV,
+    ),
+    caveats=(
+        "Opt-in only. Nothing selects this profile automatically: turbo "
+        "stays the flagship default and its env is unchanged.",
+        "REQUIRES --generation-mode mtp and no --mtp-adapter. Both of its "
+        "Qwen4 lanes raise inside runtime.load otherwise (compiled MTP "
+        "preparation needs the native draft head; FR-Spec's installer raises "
+        "rather than falling back), so the server refuses the profile at "
+        "selection with that reason instead of failing after the weights are "
+        "mapped. Use turbo for a non-MTP or adapter serve.",
+        "It adds 22 keys to turbo and replaces one (MTPLX_PREFILL_CHUNK_SIZE, "
+        "turbo's 'auto' against the measured 4096): the three ABBA control-arm "
+        "keys no server path sets, plus the 15 retained decode and 8 retained "
+        "prefill keys recorded in docs/perf/pr391-stack.flags and "
+        "docs/perf/pr391-prefill.flags. All 26 are operator-overridable: "
+        "exporting MTPLX_FRSPEC_DRAFT=0 turns the lane off and the profile "
+        "announces that the operator won. MTPLX_FABLE_DISABLE=<lane,...> and "
+        "--disable-optimization <lane> turn one off by NAME instead, and "
+        "--disable-optimization all is the stock path.",
+        "MTPLX_SESSION_BANK_MAX_BYTES=8G is a serving MEMORY BUDGET, not a "
+        "speed key. Unset, the session bank auto-sizes from the machine "
+        "memory plan; the retained set pins it so two arms cannot see "
+        "different banks. Retune it per machine with "
+        "MTPLX_SESSION_BANK_MAX_BYTES=<n>G, or hand it back to the auto-sizer "
+        "with MTPLX_SESSION_BANK_MAX_BYTES=auto; either wins over the "
+        "profile.",
+        "MTPLX_QWEN4_RELAXED_DRAFT_TIES is deliberately NOT included: the "
+        "measured control arm never set it.",
+        "Scoped to the Qwen3.8 Flash-Next (qwen4_exp) family. The server's "
+        "auto-arm and the retained-stack defaults are both predicated on the "
+        "served config, so on any other model this profile arms its own 26 "
+        "keys and nothing else -- and several of them raise at load rather "
+        "than falling back (MTPLX_FABLE_HC_M4 on a family-contract miss, "
+        "MTPLX_FRSPEC_DRAFT when the FR-Spec head cannot install). Do not "
+        "select it for another model; on a Flash-Next pack you do not need "
+        "to select it at all.",
+        "A Flash-Next serve prints a startup self-check on every profile: one "
+        "line saying which of the 26 retained keys the defaults armed and "
+        "which ones the operator turned off, one line saying how many "
+        "of the 44 measured-stack keys are armed, by whom, and against which "
+        "serve shape (so a server predicate that did not hold is visible), "
+        "then one satisfied/missing line per engagement receipt -- the "
+        "FR-Spec install report (expects n=65536 from "
+        "builtin:qwen38-code-64k), the runtime's [qwen4-fixed-M4-verify], "
+        "[qwen4-M4-stage3] and [qwen4-compiled-MTP-prepare] install reports, "
+        "and the background warmup ladder. Those receipts are printed to "
+        "stderr at install time on every profile, and the reports are "
+        "readable at GET /health under engagement_reports.",
+        "Same verify-kernel exactness caveats as turbo; additionally the "
+        "fused GDN/MoE/hyper-connection lanes and the QSA rows-gather are "
+        "self-fenced and bail to the stock chain on any contract miss.",
+        "Runs on stock PyPI MLX; no custom MLX fork or build is required.",
+    ),
+    draft_lm_head=DraftLMHeadRequirement(bits=4, group_size=64, mode="affine"),
+    product_claim_eligible=False,
+)
+
 EXACT_PROFILE = RuntimeProfile(
     name="exact",
     runtime_profile="exact",
@@ -831,6 +1048,7 @@ PROFILES: dict[ProfileName, RuntimeProfile] = {
     TURBO_PROFILE.name: TURBO_PROFILE,
     EXACT_PROFILE.name: EXACT_PROFILE,
     MAX_DIAGNOSTIC_PROFILE.name: MAX_DIAGNOSTIC_PROFILE,
+    TURBO_FULL_STACK_PROFILE.name: TURBO_FULL_STACK_PROFILE,
 }
 
 PROFILE_ALIASES = {
@@ -848,6 +1066,14 @@ PROFILE_ALIASES = {
     "auto": DEFAULT_PROFILE_NAME,
     "sustained-max": "sustained",
     "sustained_max": "sustained",
+    # The Flash-Next restack. "full-stack" is the name the benchmark harness
+    # uses for the same env block (its --require-full-stack /
+    # "branch (full stack)" cells). Derived from the registry's own alias
+    # tuple so mtplx.full_stack_env.profile_name_from_argv -- which decides
+    # the pre-import stamp, before this module is importable in the serve
+    # process -- cannot disagree with this table about what the operator
+    # typed.
+    **{alias: FULL_STACK_PROFILE_NAME for alias in FULL_STACK_PROFILE_ALIASES},
 }
 
 

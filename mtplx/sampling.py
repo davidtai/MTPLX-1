@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -75,6 +76,12 @@ class SparseDistribution:
 
 
 Distribution = np.ndarray | SparseDistribution
+
+
+class WeightedChoiceRNG(Protocol):
+    def random(self) -> float: ...
+
+    def choice(self, values: np.ndarray, /, *, p: np.ndarray) -> Any: ...
 
 
 def softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
@@ -288,7 +295,9 @@ def residual_distribution(target_p: Distribution, draft_q: Distribution) -> Dist
     return residual / total
 
 
-def sample_from_distribution(probs: Distribution, rng: np.random.Generator | None = None) -> int:
+def sample_from_distribution(
+    probs: Distribution, rng: WeightedChoiceRNG | None = None
+) -> int:
     rng = rng or np.random.default_rng()
     if isinstance(probs, SparseDistribution):
         return int(rng.choice(probs.token_ids, p=probs.probs))

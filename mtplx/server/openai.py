@@ -138,6 +138,24 @@ from mtplx.profiles import (
     profile_env_status,
     resolve_long_context_mtp_depth,
 )
+from mtplx.full_stack_env import (
+    FULL_STACK_PROFILE_NAME,
+    resolved_stack,
+    stack_summary_line,
+    DISABLE_ENV,
+    LANES,
+    fable_default_env,
+    fable_defaults_report,
+    defaults_summary_line,
+    record_defaults_applied,
+    resolve_disable_lanes,
+    warn_unknown_family_keys,
+)
+from mtplx.full_stack_selfcheck import (
+    format_marker_lines,
+    markers_from_runtime,
+    selfcheck_payload,
+)
 from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
     block_prefix_restore_enabled,
@@ -837,10 +855,80 @@ def _server_runtime_env_overrides(
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
+        # Compile kill-switch precedence (PR #395): MTPLX_COMPILED_GDN and
+        # MTPLX_QWEN4EXP_COMPILE are aliases, and an explicit falsy on either
+        # beats this family default-arm — the same explicit-off precedence
+        # the model honors at init, at the decode gate, and on
+        # set_ar_pipeline_mode re-arm.
         if not (compiled_gdn_explicit_off or qwen4_compile_explicit_off):
             for key in ("MTPLX_COMPILED_GDN", "MTPLX_QWEN4EXP_COMPILE"):
                 if os.environ.get(key) is None:
                     overrides.setdefault(key, "1")
+        # Fixed-M4 target distributions (2026-08-29 production A/B/A/B):
+        # batch all four temperature-1/top-k-20 rows at one materialization
+        # boundary instead of synchronizing one row at a time during accept.
+        # Lazy mean 53.46 tok/s; batched mean 53.89 tok/s (+0.81%), with the
+        # same output digest, 578/1,282 acceptance, 432 verifier calls, and
+        # zero repair. Bind the paired strategy here so turbo's generic lazy
+        # defaults cannot leave BATCH_TARGET_ARRAYS runtime-dead. Explicit
+        # operator exports and model-pack overrides still win.
+        for key, value in (
+            ("MTPLX_BATCH_TARGET_ARRAYS", "1"),
+            ("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "0"),
+        ):
+            if os.environ.get(key) is None:
+                overrides.setdefault(key, value)
+        if _served_model_is_qwen4_fixed_m4(args):
+            # Construction-bound fixed-M4 verifier, stock-QMM combine tail,
+            # and one-dispatch QSA K/V rows gather. The gather reads each
+            # selected token index once and copies four BF16 values per
+            # thread; non-M4 physical widths keep the explicit stock route.
+            # The combine tail keeps both optimized quantized matmuls and
+            # replaces routed weighting/reduction plus shared gating/final add
+            # with one dispatch. Three paired 16K/1K production seeds on
+            # 2026-08-29 improved mean decode 67.82 -> 70.66 tok/s (+4.19%).
+            # The fused QSA gather improved the retained 3-seed 16K/1K mean
+            # 77.77 -> 80.44 tok/s (+3.44%) on 2026-08-30.
+            # The config predicate below keeps both routes off every
+            # unmeasured qwen4_exp layout; explicit operator exports still win.
+            for key in (
+                "MTPLX_COMPILED_VERIFY",
+                "MTPLX_QWEN4_FIXED_M4_VERIFY",
+                "MTPLX_QWEN4_M4_STAGE3",
+                "MTPLX_QSA_M4_FUSED_KV_GATHER",
+            ):
+                operator_value = str(os.environ.get(key) or "").strip()
+                if operator_value:
+                    overrides.pop(key, None)
+                else:
+                    overrides.setdefault(key, "1")
+        # ---- the retained Flash-Next stack, ON by default (2026-09-03) ----
+        # The fifteen decode keys, the eight prefill keys and the three
+        # FR-Spec/compiled-prepare keys the PR-391 battery measured. Until
+        # today they were an opt-in that reached a serve only by exporting
+        # docs/perf/pr391-stack.flags and docs/perf/pr391-prefill.flags by
+        # hand; the measured configuration being the one nobody actually got
+        # is how a benchmark result stops meaning anything.
+        #
+        # Armed exactly the way the sixteen keys above are armed -- setdefault
+        # behind this same served-config predicate -- which is what makes an
+        # operator export the off switch: MTPLX_FABLE_QSA_SPARSE_DECODE=0
+        # turns that one lane off and its install verdict says
+        # "off (operator: ...)". MTPLX_FABLE_DISABLE=<lane,...> and
+        # --disable-optimization <lane> do the same by NAME, and
+        # --disable-optimization all is the stock path.
+        #
+        # Nine of these keys are read at module IMPORT (mtplx.runtime_options
+        # and friends), which this function is far too late for; those are
+        # armed identically by mtplx/server/__init__.py before openai.py's
+        # own imports run, and are already in os.environ here, so
+        # fable_default_env skips them.
+        retained_defaults = fable_default_env(
+            os.environ, disabled_lanes=_disabled_optimization_lanes(args)
+        )
+        for key, value in retained_defaults.items():
+            overrides.setdefault(key, value)
+        record_defaults_applied(retained_defaults)
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
@@ -855,6 +943,24 @@ def _server_runtime_env_overrides(
     return overrides
 
 
+def _disabled_optimization_lanes(args: argparse.Namespace) -> frozenset[str]:
+    """Lanes the operator asked to leave unarmed, from the flag and the env.
+
+    ``--disable-optimization`` (repeatable) and ``MTPLX_FABLE_DISABLE`` are
+    the same switch spelled two ways and they compose. An unknown lane name
+    RAISES here rather than disabling nothing: a typo that silently left the
+    optimization on would make an A/B measure the same arm twice. ``argv=[]``
+    because the flag is already parsed onto ``args``; re-reading ``sys.argv``
+    would pick up a test runner's arguments.
+    """
+
+    return resolve_disable_lanes(
+        os.environ,
+        [],
+        extra=getattr(args, "disable_optimization", None) or (),
+    )
+
+
 def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
     try:
         with open(Path(str(args.model)) / "config.json", "rb") as fh:
@@ -864,6 +970,17 @@ def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
     mt = str(cfg.get("model_type") or "").lower()
     tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
     return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
+
+
+def _served_model_is_qwen4_fixed_m4(args: argparse.Namespace) -> bool:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            config = json.load(fh)
+    except Exception:
+        return False
+    from mtplx.qwen4_fixed_verify import is_qwen4_fixed_verify_config
+
+    return is_qwen4_fixed_verify_config(config)
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:
@@ -1417,6 +1534,315 @@ class AnthropicMessagesRequest(BaseModel):
 
 def _startup_line(text: str = "") -> None:
     _safe_stdout_print(text)
+
+
+def _apply_ngram_prewarm_choice(args: Any) -> str:
+    """Resolve --ngram-prewarm / MTPLX_NGRAM_PREWARM; return what decided.
+
+    ``None`` (the flag was not given) leaves the environment alone, so a
+    shell-set value or the on-by-default still decides.  Never fatal: a model
+    without a streamed n-gram sidecar simply never reads the key.
+    """
+
+    try:
+        from mtplx.ple_row_gather import apply_prewarm_choice
+
+        order = getattr(args, "ngram_prewarm_order", None)
+        if order:
+            os.environ["MTPLX_NGRAM_PREWARM_ORDER"] = str(order)
+        return apply_prewarm_choice(getattr(args, "ngram_prewarm", None))
+    except Exception as error:  # a startup knob must not break startup
+        return f"unavailable: {error!r}"
+
+
+def _publish_ngram_prewarm_reservation(args: Any) -> dict[str, Any]:
+    """Tell the pre-read how much memory the KV cache is about to want.
+
+    The server's own MemoryPlan is the authority, but it is built ~350 lines
+    after the model load and the pre-read happens INSIDE that load, so the
+    number cannot be read from it.  What is available here is every input the
+    plan derives it from -- `mtplx.memory_plan` is runtime-free and reads
+    bytes/token straight out of config.json -- so this is the same arithmetic
+    on the same inputs, published before the load rather than a second policy.
+
+    Unknown inputs publish zero and say so; the pre-read then leans on its
+    documented margin instead of an invented number.
+    """
+
+    try:
+        from mtplx.ple_row_gather import (
+            estimate_kv_reservation_bytes,
+            set_prewarm_reservation,
+        )
+
+        tokens = int(getattr(args, "context_window", 0) or 0)
+        if tokens <= 0:
+            from mtplx.generation import _dense_decode_max_context
+
+            tokens = int(_dense_decode_max_context() or 0)
+        reserved, source = estimate_kv_reservation_bytes(
+            getattr(args, "model", None), tokens
+        )
+        set_prewarm_reservation(reserved, source)
+        return {"bytes": int(reserved), "source": source, "tokens": tokens}
+    except Exception as error:  # a startup knob must not break startup
+        return {"bytes": 0, "source": f"unavailable: {error!r}", "tokens": 0}
+
+
+def _ngram_prewarm_health_payload() -> dict[str, Any]:
+    """What the n-gram table pre-read actually did, for ``/health``.
+
+    Read from the module-level receipt `mtplx.ple_row_gather` publishes, not
+    by walking the runtime down to the sidecar: that walk is family-specific
+    and five getattrs deep, and it is exactly the shape of walk that made the
+    PLE prefill lookahead silently inert on 2026-09-01.
+    """
+
+    try:
+        from mtplx.ple_row_gather import last_prewarm
+
+        receipt = last_prewarm()
+    except Exception as error:
+        return {"enabled": None, "reason": repr(error)}
+    return {
+        "enabled": receipt.get("enabled"),
+        "mode": receipt.get("mode"),
+        "order": receipt.get("order"),
+        "table_bytes": receipt.get("table_bytes"),
+        "budget_bytes": receipt.get("budget_bytes"),
+        "warmed_bytes": receipt.get("warmed_bytes", receipt.get("bytes")),
+        "seconds": receipt.get("seconds"),
+        "gib_per_s": receipt.get("gib_per_s"),
+        "free_bytes": receipt.get("free_bytes"),
+        "reserved_bytes": receipt.get("reserved_bytes"),
+        "margin_bytes": receipt.get("margin_bytes"),
+        "source": receipt.get("source"),
+        "skipped_reason": receipt.get("skipped_reason"),
+    }
+
+
+def _warn_unknown_family_env_keys() -> list[str]:
+    """One WARNING per family-prefixed env key nothing in mtplx reads.
+
+    Advisory only: never raises, never changes a default, and never touches
+    the value. It exists because most MTPLX_QWEN4_*/MTPLX_QSA_*/MTPLX_FRSPEC_*
+    keys are read by a single bare ``os.environ.get`` with a default, so a
+    misspelling is silence rather than an error -- see mtplx/full_stack_env.py.
+    """
+
+    def _warn(line: str) -> None:
+        LOGGER.warning("%s", line)
+        # logger.warning alone is invisible under `python -m
+        # mtplx.server.openai` (no handler configured), and this is exactly
+        # the line an operator needs to see at boot.
+        _safe_stdout_print(line)
+
+    try:
+        return warn_unknown_family_keys(warn=_warn)
+    except Exception:  # a diagnostic must never break startup
+        return []
+
+
+def _full_stack_profile_selected(args: Any) -> bool:
+    try:
+        from mtplx.profiles import resolve_profile_name
+
+        return resolve_profile_name(getattr(args, "profile", None)) == (
+            FULL_STACK_PROFILE_NAME
+        )
+    except Exception:
+        return False
+
+
+def _full_stack_selfcheck_applies(args: Any) -> bool:
+    """Is there a retained stack to check on this serve?
+
+    Until 2026-09-03 the answer was "only if the operator asked for the
+    opt-in profile". The stack is now the DEFAULT for a Flash-Next pack, so
+    the self-check has to run there too -- a default nobody can see armed is
+    the same unreadable configuration the opt-in was.
+    """
+
+    if _full_stack_profile_selected(args):
+        return True
+    try:
+        return bool(_served_model_type_is_qwen4_exp(args))
+    except Exception:
+        return False
+
+
+def _serve_shape(state: Any) -> str:
+    """The serve shape the stack line is read against.
+
+    The registry knows which predicate owns a key; only the server knows
+    whether that predicate held. Naming the shape is what turns "MTPLX_QSA_
+    GATHER not armed" into "of course -- this is not a qwen4_exp pack".
+    """
+
+    args = getattr(state, "args", None)
+    parts = [str(getattr(args, "generation_mode", "") or "?").strip().lower()]
+    try:
+        if _served_model_is_qwen4_fixed_m4(args):
+            parts.append("qwen4_exp fixed-M4 pack")
+        elif _served_model_type_is_qwen4_exp(args):
+            parts.append("qwen4_exp pack, not fixed-M4")
+        else:
+            parts.append("not a qwen4_exp pack")
+    except Exception:
+        parts.append("model shape unknown")
+    return ", ".join(parts)
+
+
+def _assert_full_stack_profile_is_servable(args: Any) -> None:
+    """Refuse turbo-full-stack where its own keys would raise at model load.
+
+    mtplx/runtime.py:load raises -- unrecoverably, after the weights are
+    already mapped -- when MTPLX_QWEN4_COMPILED_MTP_PREPARE is set with an
+    MTP adapter, and FR-Spec's installer raises when the head cannot be
+    pruned. Both need native MTP. Catching it at profile selection turns a
+    late traceback into one sentence before anything is loaded.
+
+    Only the profile is refused, never a knob: an operator who wants the
+    lanes off keeps MTPLX_FRSPEC_DRAFT=0 and friends (the profile's keys are
+    in PROFILE_ENV_USER_OVERRIDE_KEYS), and every other profile is unaffected.
+    """
+
+    if not _full_stack_profile_selected(args):
+        return
+    generation_mode = str(getattr(args, "generation_mode", "") or "").strip().lower()
+    if generation_mode != "mtp":
+        raise ValueError(
+            f"--profile {FULL_STACK_PROFILE_NAME} requires --generation-mode mtp "
+            f"(got {generation_mode or 'unset'!r}): the profile arms the FR-Spec "
+            "draft head and compiled Qwen4 MTP preparation, which have no "
+            "meaning without native MTP and raise at model load. Use "
+            "--profile turbo for a non-MTP serve."
+        )
+    if getattr(args, "mtp_adapter", None):
+        raise ValueError(
+            f"--profile {FULL_STACK_PROFILE_NAME} does not accept --mtp-adapter: "
+            "compiled Qwen4 MTP preparation requires the native draft head and "
+            "raises at model load with an adapter installed. Use --profile turbo, "
+            "or drop the adapter."
+        )
+
+
+def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[str, Any]:
+    """Print each engagement marker as satisfied/missing.
+
+    Only when the opt-in full-stack profile was selected: on every other
+    profile this is a no-op and the server's output is unchanged.
+
+    The evidence is the install reports the runtime already publishes --
+    ``qwen4_fixed_verify_report``, ``qwen4_m4_stage3_report``,
+    ``qwen4_compiled_mtp_prepare_report`` (logged by mtplx/runtime.py as
+    ``[qwen4-fixed-M4-verify]`` / ``[qwen4-M4-stage3]`` /
+    ``[qwen4-compiled-MTP-prepare]``, which are ``logger.info`` and therefore
+    invisible under ``python -m mtplx.server.openai``), the FR-Spec section of
+    the draft-head report, and the background warmup ladder. Nothing new is
+    installed or measured here; this only says whether each one is there.
+    """
+
+    args = getattr(state, "args", None)
+    if not _full_stack_selfcheck_applies(args):
+        return {}
+    try:
+        # Env level first, and only once. Two lines, because there are two
+        # questions: WHAT the retained defaults armed and what the operator
+        # turned off (the defaults line), and whether the whole 44-key stack
+        # -- ours plus the server's own M4 auto-arm -- actually resolved
+        # (the stack line). A server predicate that did not hold shows up in
+        # the second as an unarmed key, which is what explains a missing
+        # lane below. Neither can change between startup and post-warmup, so
+        # the re-run skips both.
+        if phase == "startup":
+            _safe_stdout_print(
+                f"[full-stack] {phase} "
+                + defaults_summary_line(
+                    disabled_lanes=_disabled_optimization_lanes(args),
+                    model_gate=_serve_shape(state),
+                )
+            )
+            _safe_stdout_print(
+                f"[full-stack] {phase} "
+                f"{stack_summary_line(shape=_serve_shape(state))}"
+            )
+        statuses = markers_from_runtime(
+            getattr(state, "runtime", None),
+            draft_lm_head=getattr(state, "draft_lm_head", None),
+            warmup_status=getattr(state, "warmup_status", None),
+        )
+        for line in format_marker_lines(statuses, phase=phase):
+            _safe_stdout_print(line)
+        payload = selfcheck_payload(statuses, phase=phase)
+        payload["stack"] = resolved_stack()
+        payload["fable_defaults"] = fable_defaults_report(
+            disabled_lanes=_disabled_optimization_lanes(args),
+            model_gate=_serve_shape(state),
+        )
+        state.full_stack_selfcheck = payload
+        return payload
+    except Exception as error:  # a self-check must never break startup
+        LOGGER.warning("[full-stack] self-check unavailable: %r", error)
+        return {}
+
+
+#: ``/health`` name -> the runtime attribute the install function publishes.
+#: The same dicts the ``[qwen4-*]`` stderr receipts print at model load
+#: (mtplx/runtime.py:_print_install_receipt). Absent/None means the lane did
+#: not install -- because its env key was not set, or because the model is
+#: not the family it belongs to.
+_ENGAGEMENT_REPORT_ATTRS: tuple[tuple[str, str], ...] = (
+    ("qwen4_fixed_m4_verify", "qwen4_fixed_verify_report"),
+    ("qwen4_m4_stage3", "qwen4_m4_stage3_report"),
+    ("qwen4_compiled_mtp_prepare", "qwen4_compiled_mtp_prepare_report"),
+    # The install-time MTPLX_FABLE_HC_M4 pack validation
+    # (mtplx/models/qwen4_exp.py:install_hc_m4_pack_validation, published on
+    # the runtime by mtplx/runtime.py). Shape-compatible with the rows above:
+    # a plain dict set once at model load, read here by getattr only. It is
+    # NOT one of the turbo-full-stack profile's own lanes, so it is not a
+    # full_stack_selfcheck marker -- it reports {"armed": bool,
+    # "validated": int} rather than {"installed": ...}, and its lane already
+    # logs itself. Adding it here changes no lane's output.
+    ("qwen4_hc_m4", "qwen4_hc_m4_report"),
+    ("laguna_fused", "laguna_fused_report"),
+)
+
+
+def _engagement_reports_payload(state: Any) -> dict[str, Any]:
+    """Read-only install-time engagement reports for ``/health``.
+
+    Read once per request off attributes the install functions set at model
+    load; nothing here computes, installs, or measures anything.
+
+    This block reports LANES, keyed by lane, one bare ``getattr`` per row of
+    ``_ENGAGEMENT_REPORT_ATTRS``. The ``fable_install_receipts`` block sits
+    beside it at the same level of ``/health`` and reports FLAGS -- one
+    install-time verdict per armed key, re-read live so its per-request
+    engagement counters are current. The two are complementary and neither
+    subsumes the other, so an artifact belongs in exactly one of them.
+    """
+
+    runtime = getattr(state, "runtime", None)
+    payload: dict[str, Any] = {
+        name: getattr(runtime, attr, None) for name, attr in _ENGAGEMENT_REPORT_ATTRS
+    }
+    payload["full_stack_selfcheck"] = getattr(state, "full_stack_selfcheck", None)
+    # Which retained-stack optimizations this process armed by default, and
+    # which ones the operator turned off. Read live rather than off the
+    # startup snapshot, so a /health poll after a restart-free config change
+    # cannot report a stale answer.
+    try:
+        payload["fable_defaults"] = fable_defaults_report(
+            disabled_lanes=_disabled_optimization_lanes(getattr(state, "args", None)),
+            model_gate=_serve_shape(state),
+        )
+    except Exception:
+        payload["fable_defaults"] = None
+    payload["unknown_family_env_keys"] = list(
+        getattr(state, "unknown_family_env_keys", []) or []
+    )
+    return payload
 
 
 def _laguna_fused_startup_line(runtime: Any) -> str | None:
@@ -2363,6 +2789,10 @@ class ServerState:
             getattr(args, "context_window", None),
         )
         self.profile = get_profile(args.profile)
+        # Before anything is loaded: this profile's own keys raise inside
+        # runtime.load on a non-MTP or adapter launch, and a traceback after
+        # the weights are mapped is a bad way to learn it.
+        _assert_full_stack_profile_is_servable(args)
         runtime_label = _health_runtime_mode_label(
             self.profile.name,
             getattr(args, "generation_mode", None),
@@ -2413,6 +2843,10 @@ class ServerState:
                         + json.dumps(bad_profile_env, sort_keys=True)
                     )
             self.fast_path_env_status = _fast_path_env_status()
+        # Advisory, every profile: a family-prefixed key nothing reads is a
+        # typo that would otherwise no-op in silence. Runs against the FINAL
+        # environment, after the profile and the runtime overrides.
+        self.unknown_family_env_keys = _warn_unknown_family_env_keys()
         _startup_line("[4/6] Checking local acceleration runtime")
         _startup_line("      This may take a few seconds.")
         self.mlx_runtime_status = _mlx_runtime_status()
@@ -2422,6 +2856,13 @@ class ServerState:
             # CLI flag is the public surface, the env is the plumbing.
             os.environ["MTPLX_MEMORY_BUDGET"] = str(int(self.memory_budget_bytes))
         self.mlx_cache_limit_status = _configure_mlx_cache_limit(args)
+        # The n-gram table pre-read: the CLI flag is the public surface, the
+        # env is the plumbing (same contract as MTPLX_MEMORY_BUDGET above).
+        # Stamped AFTER apply_profile_env so an explicit --ngram-prewarm /
+        # --no-ngram-prewarm also wins over a model contract's override, and
+        # BEFORE the load below, which is what performs the read.
+        self.ngram_prewarm_source = _apply_ngram_prewarm_choice(args)
+        self.ngram_prewarm_reservation = _publish_ngram_prewarm_reservation(args)
         _startup_line("[4/6] Runtime checks complete")
         started = time.perf_counter()
         _startup_line(f"[5/6] Loading model weights: {args.model}")
@@ -2701,7 +3142,20 @@ class ServerState:
         # zero — measured: 262K cold prefill peaked at 87.4 GB on a 128 GiB
         # M5 Max (weights 77.3 + KV 6.4 + aux + flat reserve), against the
         # dense-priced ~115 GB that #393 observed wedging the machine.
-        _plan_transient_per_token = _plan_transient_from_config(_plan_model_config)
+        # The transient is LINEAR in the prefill chunk width, and the width
+        # is operator-settable (MTPLX_PREFILL_CHUNK_SIZE). Reading the
+        # function's 2048 default here under-priced any widened geometry by
+        # exactly that ratio, which is the one number a chunk-width A/B must
+        # not get wrong.
+        try:
+            from mtplx.generation import _prefill_chunk_size as _plan_chunk_size
+
+            _plan_prefill_chunk = int(_plan_chunk_size())
+        except Exception:
+            _plan_prefill_chunk = 2048
+        _plan_transient_per_token = _plan_transient_from_config(
+            _plan_model_config, chunk_size=_plan_prefill_chunk
+        )
         if _plan_transient_per_token:
             try:
                 from mtplx.models.qwen4_exp import (
@@ -2870,6 +3324,10 @@ class ServerState:
             else None
         )
         self.warmup_status = _run_startup_warmup(self)
+        # Opt-in profile only; a no-op on every shipped default. The ladder
+        # marker is re-reported by _BackgroundWarmup._finish once the rungs
+        # have actually run.
+        self.full_stack_selfcheck = _emit_full_stack_selfcheck(self)
 
     def _smart_fan_activity_probe(self) -> bool:
         """True while any model work is executing, queued, or recently active.
@@ -15817,6 +16275,27 @@ def _mtplx_apply_settings_payload(
     return applied
 
 
+def _fable_install_receipts_payload(state: Any) -> dict[str, Any]:
+    """Install-time flag verdicts for ``/health``.
+
+    Read-only.  ``mtplx/runtime.py`` publishes the block on the runtime at
+    model load (and prints one ``[fable] <lane> ...`` line per lane to
+    stderr); this re-reads it live so the per-request engagement counters are
+    current.  Nothing here installs, decides or measures anything.
+
+    When ``worker/w61-restack-profile`` merges, this belongs inside its
+    ``engagement_reports`` payload -- the two are the same idea at two levels
+    (that one reports LANES, this one reports FLAGS).
+    """
+
+    try:
+        from mtplx.fable_install_receipts import receipts
+
+        return receipts({"runtime": getattr(state, "runtime", None)})
+    except Exception:
+        return {}
+
+
 def _env_bool_setting(name: str, *, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -23332,6 +23811,13 @@ class _BackgroundWarmup:
             )
         except BaseException:
             pass
+        # The ladder rungs have now run (or been abandoned), so the
+        # full-stack self-check's third marker finally has an answer.
+        # No-op on every profile but the opt-in one.
+        try:
+            _emit_full_stack_selfcheck(self.state, phase="post-warmup")
+        except BaseException:
+            pass
 
 
 def _prewarm_gqa_packed_pipelines() -> bool:
@@ -27130,6 +27616,15 @@ def create_app(state: ServerState) -> FastAPI:
             "reasoning_parser": state.args.reasoning_parser,
             "load_time_s": getattr(state, "load_time_s", None),
             "draft_lm_head": state.draft_lm_head,
+            # The install-time engagement reports the runtime published, in
+            # the same place /health already carries the draft-head report.
+            # Lane-level install reports keyed by lane; the per-FLAG
+            # verdicts sit beside it under "fable_install_receipts". The two
+            # answer different questions and neither subsumes the other.
+            "engagement_reports": _engagement_reports_payload(state),
+            # one install-time verdict per armed flag, in the same place
+            # /health already carries the draft-head install report.
+            "fable_install_receipts": _fable_install_receipts_payload(state),
             "draft_sampler": (
                 asdict(getattr(state, "draft_sampler", None))
                 if is_dataclass(getattr(state, "draft_sampler", None))
@@ -27302,6 +27797,11 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
             "mlx_runtime": state.mlx_runtime_status,
+            # Page-cache residency of the streamed n-gram table decides 56 vs
+            # 68.8 tok/s on decode, so it belongs in the same truth block as
+            # the other clamps: a warm-looking box that skipped the pre-read
+            # is a slow box with no other symptom.
+            "ngram_prewarm": _ngram_prewarm_health_payload(),
             # Hardware fields surfaced for the dashboard's HardwareBanner
             # and MemoryStackedBar. Cached after the first lookup.
             **_machine_info(),
@@ -34032,6 +34532,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME
     )
+    parser.add_argument(
+        "--disable-optimization",
+        dest="disable_optimization",
+        action="append",
+        metavar="LANE",
+        choices=(*LANES, "all"),
+        default=None,
+        help=(
+            "Leave one retained-stack optimization unarmed on a Qwen3.8 "
+            "Flash-Next serve (repeatable). 'all' runs the stock path. Same "
+            f"switch as {DISABLE_ENV}=<lane,...>; the two compose. Lanes: "
+            + ", ".join(LANES)
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -34168,6 +34682,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Load and inject the native MTP sidecar. Disable only for stock AR diagnostics.",
+    )
+    parser.add_argument(
+        "--ngram-prewarm",
+        metavar="auto|all|off|GiB",
+        # Not a boolean, and default=None rather than "auto": the flag has an
+        # environment counterpart (MTPLX_NGRAM_PREWARM), and a default would
+        # be indistinguishable from the user typing it -- so the CLI would
+        # silently overrule every shell-set value.  None means "not given".
+        default=None,
+        help=(
+            "How much of the streamed n-gram table to read into the page "
+            "cache at model load. auto (default) warms min(table, free - KV "
+            "reservation - 6 GiB margin); all reads the whole table (~2.5 s "
+            "at ~12 GiB/s for 30 GiB); a bare number is a budget in GiB; off "
+            "serves at the as-found page-cache rate. Cold sidecar rows are "
+            "demand faults at ~1.4 GiB/s and cost 56 vs 68.8 tok/s on decode. "
+            "Environment: MTPLX_NGRAM_PREWARM, which this flag overrides."
+        ),
+    )
+    parser.add_argument(
+        "--no-ngram-prewarm",
+        dest="ngram_prewarm",
+        action="store_const",
+        const="off",
+        help="Alias for --ngram-prewarm off.",
+    )
+    parser.add_argument(
+        "--ngram-prewarm-order",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Row-hotness file (.npy of int64 row ids, most-gathered first) "
+            "deciding WHICH rows a partial pre-read warms. Defaults to "
+            "<model>/ngram-hotness.npy when present, else the file prefix is "
+            "read sequentially."
+        ),
     )
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument(

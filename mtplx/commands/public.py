@@ -9617,6 +9617,12 @@ def cmd_serve_public(args: Any) -> int:
     if bool(getattr(args, "experimental_mtp_cohorts", False)):
         cmd.append("--experimental-mtp-cohorts")
     ssd_session_cache = str(getattr(args, "ssd_session_cache", "on") or "on")
+    # One `--disable-optimization <lane>` per requested lane. The daemon is a
+    # separate process, so a lane chosen here has to travel on argv --
+    # MTPLX_FABLE_DISABLE is inherited through the environment and needs no
+    # forwarding, which is why only the flag is repeated here.
+    for lane in getattr(args, "disable_optimization", None) or ():
+        cmd.extend(["--disable-optimization", str(lane)])
     cmd.extend(["--ssd-session-cache", ssd_session_cache])
     ssd_dir = getattr(args, "ssd_session_cache_dir", None)
     if ssd_dir:
@@ -9743,6 +9749,14 @@ def cmd_serve_public(args: Any) -> int:
         cmd.append("--stock-ar")
     elif getattr(args, "load_mtp", True) is False:
         cmd.append("--no-load-mtp")
+    # Tri-state: only an explicit choice is forwarded, so the child's own
+    # MTPLX_NGRAM_PREWARM (and the on-by-default) still decide otherwise.
+    ngram_prewarm = getattr(args, "ngram_prewarm", None)
+    if ngram_prewarm is not None:
+        cmd.extend(["--ngram-prewarm", str(ngram_prewarm)])
+    ngram_prewarm_order = getattr(args, "ngram_prewarm_order", None)
+    if ngram_prewarm_order:
+        cmd.extend(["--ngram-prewarm-order", str(ngram_prewarm_order)])
     api_key_source = str(getattr(args, "api_key_source", "none") or "none")
     api_key_file = getattr(args, "api_key_file", None)
     if api_key and api_key_source == "flag":
@@ -12779,6 +12793,11 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("default_presence_penalty", 0.0),
         ("default_frequency_penalty", 0.0),
         ("paged_kv_quantization", "off"),
+        # None = "the flag was not given", so the child falls back to
+        # MTPLX_NGRAM_PREWARM / the default. Forwarding it as True here would
+        # make every `mtplx start` overrule a shell-set value.
+        ("ngram_prewarm", None),
+        ("ngram_prewarm_order", None),
         ("tool_prompt_mode", "hybrid"),
         ("chat_template_profile", "local_qwen36"),
         ("chat_template_path", None),

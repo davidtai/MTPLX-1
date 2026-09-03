@@ -1,0 +1,407 @@
+# Qwen3.8 Flash-Next optimization on MTPLX 2.10.1
+
+This branch builds a clean optimization stack on MTPLX 2.10.1. It uses the
+official `Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` model. Each
+retained runtime change has a matched result on the production workload.
+
+The closed [PR #368](https://github.com/youssofal/MTPLX/pull/368) contains the
+old implementation history, rejected experiments, and detailed benchmark
+notes. This document records the new production baseline and each optimization
+that remains in the new stack.
+
+## Controlled comparison configuration
+
+- Runtime base for the recorded hill climb: MTPLX 2.10.0, commit `4ce96908`
+- Integrated release base: MTPLX 2.10.1, commit `557e637a`
+- Model revision: `29ba90f82124961d0d902a9ea9bbb1034972af2f`
+- MLX: 0.32.2
+- Decode mode: native MTP, depth 3
+- Comparison cell: 16,384 prompt tokens and exactly 1,024 generated tokens
+- Prompt: natural Python programming task
+- Reasoning effort: `xhigh`
+- Sampler: temperature 1.0, top-p 0.95, top-k 20, min-p 0
+- Penalties: presence 0 and repetition 1
+- Seeds: `20260829`, `20260830`, and `20260831`
+- N-gram hot-row cache: bounded at 1 GiB
+
+The fixed 1,024-token output makes candidate A/Bs comparable; it is not a
+canonical production response length. Serving remains stop-driven and supports
+arbitrary output lengths with bounded verifier growth.
+
+The final adaptive schedule completed actual 16,384- and 32,768-token outputs
+from the 16K prompt. Starting at 1K, the 16K production-cap run doubled through
+2K, 4K, 8K, and 16K in four transitions and five compiled traces. The 32K
+diagnostic added one capped 16K chunk, for five transitions and six traces.
+Both runs had zero fallback, demotion, growth demotion, route change, or repair.
+The 16K and 32K runs sustained 70.05 and 75.52 decode tok/s respectively and
+shared the same 81.39 GiB peak. Extending the output from 16K to 32K added
+0.4335 GiB of active memory. The 32K run is a diagnostic beyond the production
+16K output cap, not a change to that cap.
+
+Final adaptive receipts:
+
+- the corrected adaptive-1K / 16K-output rebench receipt
+- the corrected adaptive-1K / 32K-output diagnostic receipt
+
+The 29.8 GiB n-gram table stays in a file-backed memory map. Production uses
+the required bounded 1 GiB hot-row cache above the memory map. All optimization
+decisions use this configuration.
+
+## Verifier-overflow correction
+
+The original Step 8 headline is not valid current throughput evidence. That
+campaign generated 1,024 tokens while the installed fixed-M4 state bank had
+only 512 tokens of output headroom. Replaying beyond that fixed backing changed
+the stochastic proposal and acceptance trajectory. The retained kernels did
+not fail, but the run was no longer measuring the requested verifier state.
+
+The corrected fixed-M4 lifecycle starts with 1,024 tokens of headroom and grows
+before replay can cross the installed capacity. On the unchanged 16,384-token
+prompt, 1,024-token output, temperature-1 sampler, and three fixed seeds, the
+corrected stack measures:
+
+| Seed | Corrected decode | Compiled M4 calls | Fallback / repair |
+|---:|---:|---:|---:|
+| `20260829` | 65.002 tok/s | 382 | 0 / 0 s |
+| `20260830` | 64.559 tok/s | 389 | 0 / 0 s |
+| `20260831` | 70.005 tok/s | 341 | 0 / 0 s |
+| Mean | **66.522 tok/s** | **370.7** | **0 / 0 s** |
+
+All three corrected runs generated exactly 1,024 tokens. The valid response
+digests, acceptance counts, and verifier-call counts are the acceptance gate
+for later optimizations; only the documented exact cutoff tie-break may change.
+The old 80.44 tok/s mean is retained below only as a superseded audit record.
+
+## Step 1 production boundary
+
+Decode throughput excludes prefill. Step 0 and Step 1 used the same three
+seeds. Each pair had the same output digest, MTP trajectory, and work counts.
+
+| Seed | Step 0 lazy | Step 1 batched | Paired change | Accepted / drafted |
+|---:|---:|---:|---:|---:|
+| `20260829` | 52.27 tok/s | 52.67 tok/s | +0.76% | 578 / 1,282 |
+| `20260830` | 53.43 tok/s | 53.78 tok/s | +0.65% | 555 / 1,220 |
+| `20260831` | 60.57 tok/s | 60.96 tok/s | +0.65% | 535 / 1,057 |
+| Mean | **55.42 tok/s** | **55.80 tok/s** | **+0.68%** | 1,668 / 3,559 total |
+| Median | **53.43 tok/s** | **53.78 tok/s** | **+0.65%** | - |
+
+Weighted verifier cost fell from 38.04 to 37.64 ms per call. All six runs
+generated exactly 1,024 tokens and had zero repair. Step 1 remains a small but
+repeatable win.
+
+## Step 2 production boundary
+
+Step 2 installs one construction-bound compiled replay for physical M4 target
+verification. Shorter adaptive windows use the normal Qwen4 family capture
+route. The enabled M4 path does not repeat model checks or fall back silently.
+
+| Seed | Decode throughput | Accepted / drafted | Verify calls | Repair |
+|---:|---:|---:|---:|---:|
+| `20260829` | 63.03 tok/s | 613 / 1,065 | 364 | 0 s |
+| `20260830` | 67.63 tok/s | 666 / 1,014 | 344 | 0 s |
+| `20260831` | 72.22 tok/s | 603 / 912 | 313 | 0 s |
+| Mean | **67.63 tok/s** | 1,882 / 2,991 total | 340.3 | **0 s** |
+| Median | **67.63 tok/s** | - | - | **0 s** |
+| Range | **63.03-72.22 tok/s** | - | - | **0 s** |
+
+All three runs generated exactly 1,024 tokens. Each run traced once and had
+zero fallback and zero repair. Weighted verifier cost was 36.38 ms per call.
+The three-seed Step 2 mean is 21.19% above the Step 1 mean.
+
+The compiled PLE block changes bf16 operation grouping. Close sampling
+decisions can change, so Step 2 uses aggregate and per-window measurements.
+The earlier retained controls measured 70.87 and 74.93 tok/s. Their 72.90
+tok/s mean remains valid historical evidence; 74.93 is the highest single
+retained observation, not the three-seed mean.
+
+## Step 3 production boundary
+
+Step 3 prepares the exact fixed-M4 n-gram row IDs on the host. It starts the
+file-backed row gather before the compiled verifier needs the embedding. This
+removes one forced auxiliary-graph wait. The 29.8 GiB table remains mapped and
+the hot-row cache remains bounded at 1 GiB.
+
+| Seed | Control | Staged n-gram | Paired change |
+|---:|---:|---:|---:|
+| `20260829` | 59.84 tok/s | 61.46 tok/s | +2.70% |
+| `20260830` | 66.06 tok/s | 68.66 tok/s | +3.95% |
+| `20260831` | 71.69 tok/s | 73.89 tok/s | +3.08% |
+| Mean | **65.86 tok/s** | **68.01 tok/s** | **+3.25%** |
+
+The candidate won all three pairs. Every run generated 1,024 tokens with zero
+repair and zero compiled-verifier fallback.
+
+## Step 4 production boundary
+
+Step 4 selects fixed-M4 n-gram rows from the authoritative host token ledger.
+It no longer materializes pending device history back to the CPU before each
+verification window. The device history remains the source for capture,
+commit, and rollback.
+
+| Seed | Control | Host-owned selection | Paired change |
+|---:|---:|---:|---:|
+| `20260829` | 63.69 tok/s | 72.28 tok/s | +13.49% |
+| `20260830` | 68.55 tok/s | 68.77 tok/s | +0.32% |
+| `20260831` | 72.50 tok/s | 73.20 tok/s | +0.97% |
+| Mean | **68.25 tok/s** | **71.42 tok/s** | **+4.65%** |
+
+The candidate won all three pairs. Every run generated 1,024 tokens with zero
+repair and zero compiled-verifier fallback.
+
+## Step 5 production boundary
+
+Step 5 keeps the routed q4/g32 and shared q8/g64 down projections on the tuned
+MLX quantized-matmul path. One small Metal kernel then combines routed scores,
+the exact ten-row BF16 reduction, the shared gate, and the final add. It
+removes dispatches without replacing the efficient quantized matmuls.
+
+| Seed | Step 4 control | Step 5 combine tail | Paired change | Control accepted/drafted | Candidate accepted/drafted |
+|---:|---:|---:|---:|---:|---:|
+| `20260829` | 64.62 tok/s | 70.32 tok/s | +8.82% | 615 / 1,062 | 641 / 979 |
+| `20260830` | 66.70 tok/s | 67.57 tok/s | +1.31% | 657 / 1,044 | 654 / 1,053 |
+| `20260831` | 72.14 tok/s | 74.10 tok/s | +2.71% | 590 / 921 | 602 / 915 |
+| Mean | **67.82 tok/s** | **70.66 tok/s** | **+4.19%** | 1,862 / 3,027 total | 1,897 / 2,947 total |
+
+The candidate won all three pairs. Mean decode time fell from 15.131 to 14.512
+seconds. Normalized verifier-forward cost fell from 32.04 to 31.20 ms per
+call. Every run generated 1,024 tokens, traced once, and had zero repair and
+zero compiled-verifier fallback. Temperature-1 runs can follow different
+sampling and acceptance paths. The promotion decision therefore uses the
+three same-seed pairs, not a raw comparison with an earlier campaign mean.
+
+## Step 6 production boundary
+
+Step 6 reduces the native MTP draft-head work. Qwen4 native MTP uses the
+model's Q8 output head, not the configured Q4 draft-only head. Replacing it
+with Q4 made proposal acceptance worse. Step 6 instead keeps the original Q8,
+group-64, affine arithmetic and gathers only 65,536 code-ranked rows. It writes
+those logits into their original positions in a full-vocabulary proposal and
+sets all other proposal logits to a zero-probability sentinel. Target
+verification still uses every vocabulary row.
+
+| Seed | Step 5 control | Step 6 ranked Q8 head | Paired change | Control accepted/drafted | Candidate accepted/drafted |
+|---:|---:|---:|---:|---:|---:|
+| `20260829` | 72.26 tok/s | 77.54 tok/s | +7.30% | 632 / 937 | 660 / 921 |
+| `20260830` | 69.79 tok/s | 76.13 tok/s | +9.09% | 667 / 1,014 | 662 / 972 |
+| `20260831` | 74.51 tok/s | 76.47 tok/s | +2.63% | 604 / 910 | 605 / 907 |
+| Mean | **72.19 tok/s** | **76.71 tok/s** | **+6.27%** | 1,903 / 2,861 total | 1,927 / 2,800 total |
+
+Mean draft time fell from 2.481 to 1.903 seconds, a 23.32% reduction. Mean
+verifier time also fell from 11.460 to 11.198 seconds. Every run
+generated 1,024 tokens with zero repair and zero compiled-verifier fallback.
+
+The built-in row list comes from a generic code corpus that excludes benchmark
+fixtures and tests. It covers 99.6446% of a held-out 1,005,404-token code set.
+The packaged JSON SHA-256 is
+`950adfea038612e28a3839c98c9be73f76f422fcde0596bb4588ac774e7c1fba`.
+Installation validates the native Q8/group-64/affine contract once and then
+binds the proposal callable directly. It does not add a per-token eligibility
+check or fallback.
+
+## Step 7 production boundary
+
+Step 7 reduces the small host gaps between stochastic draft depths. It makes
+two construction-bound changes that work together:
+
+- It compiles the fixed B1/S1 stateless work before QSA and installs the graph
+  only after exact eager-versus-compiled parity. History updates remain eager,
+  and the live QSA cache keeps the same owner.
+- It selects the required top 20 proposal rows directly. The old path selected
+  80 rows only to prove deterministic ownership of exact ties at the top-k
+  cutoff. The full-vocabulary normalizer, top-p filter, support order, and
+  NumPy `rng.choice` remain unchanged. An exact cutoff tie may select a
+  different tied row.
+
+The result uses the same frozen prompt, three seeds, and production settings as
+Step 6.
+
+| Seed | Step 6 control | Step 7 reduced-gap path | Accepted / drafted |
+|---:|---:|---:|---:|
+| `20260829` | 77.54 tok/s | 79.26 tok/s | 661 / 918 |
+| `20260830` | 76.13 tok/s | 75.32 tok/s | 653 / 999 |
+| `20260831` | 76.47 tok/s | 78.73 tok/s | 604 / 910 |
+| Mean | **76.71 tok/s** | **77.77 tok/s** | 1,918 / 2,827 total |
+
+The arithmetic mean improves by 1.38%. Mean draft time falls from 1.903 to
+1.679 seconds, an 11.76% reduction. All runs generated 1,024 tokens with zero
+repair and zero compiled-verifier fallback. The promotion rule allows exact
+cutoff-tie flips, so the decision uses the fixed three-seed throughput mean and
+does not require matching output digests.
+
+## Step 8 historical measurement (superseded)
+
+Step 8 fuses the fixed-M4 QSA key and value row gathers. The old path launched
+one gather for keys and another for values. The new Metal kernel reads each
+selected token index once and copies four BF16 values per thread into both
+outputs. The exact cache shape and kernel are bound when the compiled cache is
+installed. Only physical M4 uses this kernel; other row counts use their
+explicit stock route.
+
+| Seed | Step 7 control | Step 8 fused K/V gather | Accepted / drafted |
+|---:|---:|---:|---:|
+| `20260829` | 79.26 tok/s | 81.62 tok/s | 656 / 895 |
+| `20260830` | 75.32 tok/s | 79.41 tok/s | 660 / 978 |
+| `20260831` | 78.73 tok/s | 80.30 tok/s | 601 / 918 |
+| Mean | **77.77 tok/s** | **80.44 tok/s** | 1,917 / 2,791 total |
+
+This historical arithmetic mean improved by 3.44%, and the exact
+production-shape kernel test matched both stock gathers element for element.
+However, these full-generation numbers used the undersized fixed state bank
+described above. They are not promotion evidence for the corrected verifier.
+The fused gather remains retained because its operator-level exactness still
+holds; current full-stack throughput is the corrected three-seed result above.
+
+## Rejected scheduling candidate
+
+The lazy stochastic D3 candidate built all three draft depths before one
+terminal device read. It did not improve the three-seed production result.
+
+| Seed | Lazy D3 throughput | Accepted / drafted |
+|---:|---:|---:|
+| `20260829` | 68.39 tok/s | 663 / 976 |
+| `20260830` | 63.76 tok/s | 658 / 1,068 |
+| `20260831` | 62.82 tok/s | 523 / 1,023 |
+| Mean | **64.99 tok/s** | 1,844 / 3,067 total |
+| Median | **63.76 tok/s** | - |
+
+The candidate was 3.90% below the Step 2 mean. Its weighted draft cost was
+2.71 ms per drafted token versus 2.54 ms for Step 2. Its non-verifier cost was
+9.27 ms per window versus 8.25 ms. The larger lazy graph increased host work,
+so this candidate is not retained.
+
+## Historical optimization hill climb
+
+This table records only changes that remain in the stack. Each new row must use
+the production configuration above and must show a matched, repeatable win
+against the unchanged prior step.
+
+| Step | Commit | Retained stack | Production evidence | Result |
+|---:|---|---|---:|---|
+| 0 | `4ce96908` | Unchanged MTPLX 2.10 | **55.42 tok/s mean; 53.43 median** | Three-seed production control |
+| 1 | `ffdb8684` | Batch fixed-M4 target distributions | **55.80 tok/s mean; 53.78 median** | +0.68% mean with identical paired work |
+| 2 | `c5034156` | Construction-bound fixed-M4 compiled verifier | **67.63 tok/s mean and median** | +21.19% mean vs Step 1; 36.38 ms weighted verify cost |
+| 3 | `ccf817e0` | Stage exact fixed-M4 n-gram sidecar inputs | **68.01 tok/s promotion mean** | +3.25% matched three-run mean |
+| 4 | `03bc460e` | Select fixed-M4 n-gram rows from the host token ledger | **71.42 tok/s promotion mean** | +4.65% matched three-run mean |
+| 5 | `3fe8da54` | Fuse the fixed-M4 combine tail after stock quantized matmuls | **70.66 tok/s promotion mean** | +4.19% matched three-run mean |
+| 6 | `b9e1a3dd` | Bind a full-domain proposal over 65,536 code-ranked native Q8 rows | **76.71 tok/s promotion mean** | +6.27% matched three-run mean; draft time -23.32% |
+| 7 | `4f0e8604` | Compile fixed draft preparation and remove the 4k cutoff-tie proof superset | **77.77 tok/s promotion mean** | +1.38% fixed three-seed mean; draft time -11.76% |
+| 8 | `876bdeba` | Fuse fixed-M4 QSA key and value row gathers with vector-width 4 | **80.44 tok/s superseded; corrected full stack 66.52 tok/s** | Operator parity retained; old full-run result invalidated by fixed-bank overflow |
+
+Invalid cache settings, duplicate defaults, profiler-only runs, rejected
+experiments, and unconfirmed samples do not become hill-climb rows. Step 8 is
+kept in this historical table to make the invalidated claim explicit; it is no
+longer a confirmed 80+ tok/s result.
+
+## Remaining GPU idle time
+
+The MLX profiler measured the same production path. The profiler run is a
+diagnostic and is not a promotion result.
+
+| Decode measurement | Result |
+|---|---:|
+| GPU timeline | 15.165 s |
+| Metal GPU work | 12.457 s |
+| Metal GPU idle | 2.708 s |
+| GPU use | 82.14% |
+| Host-late submission | 2.170 s |
+| Encoded or driver-side gaps | 0.502 s |
+| Explicit GPU-drain wait | 0.025 ms |
+
+These are many small gaps, not one long wait. The largest named transition is
+stochastic draft sampling into the next embedding gather: 0.926 seconds across
+992 transitions.
+
+Step 5 was then traced with the same MLX 0.32.2 profiler. Its temperature-1
+path used 362 compiled windows, compared with 328 in the Step 4 trace. The
+comparison must therefore use cost per compiled window.
+
+| Decode profile per compiled window | Step 4 | Step 5 | Change |
+|---|---:|---:|---:|
+| GPU timeline | 46.24 ms | 45.22 ms | **-2.19%** |
+| GPU busy | 37.98 ms | 37.32 ms | **-1.74%** |
+| GPU idle | 8.26 ms | 7.90 ms | **-4.29%** |
+| Host-late submission | 6.62 ms | 6.27 ms | **-5.22%** |
+| Command buffers | 172.2 | 160.9 | **-6.60%** |
+
+Raw GPU use also rose from 82.14% to 82.53%. The largest draft-sampling to
+next-gather gap fell from 0.934 to 0.810 ms per transition. The fixed-M4
+combine tail therefore reduced both GPU work and host-late starvation. The
+remaining sampling transition is still the largest named idle family.
+
+Step 6 removes 0.579 seconds of mean draft-head time in the production runs.
+It has not yet received a new MLX timeline trace, so no Step 6 GPU-idle claim
+is recorded. The next trace must measure the retained Step 6 stack and compare
+per-window GPU work, host-late submission, and the sampling-to-gather gap.
+
+Step 7 directly shortens the CPU work in that sampling-to-gather transition by
+sorting 20 proposal rows instead of 80. Its production mean is confirmed, but
+it does not yet have a new MLX timeline trace. A later trace must measure the
+remaining per-transition gap before recording a new GPU-use percentage.
+
+Step 8 was traced with the same MLX 0.32.2 profiler. The Step 7 and Step 8
+traces used 320 and 378 compiled windows, so this table compares cost per
+window.
+
+| Decode profile per compiled window | Step 7 | Step 8 | Change |
+|---|---:|---:|---:|
+| GPU timeline | 44.31 ms | 41.75 ms | **-5.79%** |
+| GPU busy | 35.28 ms | 33.84 ms | **-4.07%** |
+| GPU idle | 9.03 ms | 7.91 ms | **-12.48%** |
+| Host-late submission | 7.26 ms | 6.24 ms | **-14.12%** |
+| Encoded or driver-side gaps | 1.67 ms | 1.57 ms | **-5.97%** |
+| Command buffers | 161.83 | 159.72 | **-1.30%** |
+
+Raw GPU use rose from 79.62% to 81.06%. The largest sampling-to-next-gather
+gap fell from 1.112 to 0.806 ms per transition. This confirms that the fused
+gather reduces GPU work and the scheduling gap around that work. The trace is
+diagnostic and is not used as a throughput promotion result.
+
+## What MTPLX 2.10 already contains
+
+The audit found these features in the MTPLX 2.10 Qwen4 path:
+
+- Selected-row QSA gathering and accepted-prefix state commit
+- Fused attention projections
+- AR pipelining
+- Construction-bound compiled GDN
+- Fused GDN input, decode, and verify operations
+- Fused MoE gate and up projections
+- Captured-prefix state commit
+
+The new stack does not copy these features again. New work must preserve the
+target path's arithmetic, ownership, shapes, data layout, and compile behavior.
+
+## Use it
+
+Pull the exact model revision:
+
+```bash
+mtplx pull Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
+  --revision 29ba90f82124961d0d902a9ea9bbb1034972af2f
+```
+
+Start the server:
+
+```bash
+MTPLX_FRSPEC_DRAFT=1 \
+MTPLX_FRSPEC_VOCAB=builtin:qwen38-code-64k \
+MTPLX_QWEN4_COMPILED_MTP_PREPARE=1 \
+MTPLX_QWEN4_RELAXED_DRAFT_TIES=1 \
+mtplx serve \
+  --model ~/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
+  --model-id mtplx-flash-next-optimized-speed
+```
+
+The model defaults select Turbo, native MTP depth 3, batched verification,
+`xhigh` reasoning, the temperature-1 sampler, and the bounded 1 GiB hot-row
+cache. The two environment variables enable the Step 6 ranked draft head. The
+built-in list has a fixed size of 65,536 rows. The two Qwen4 variables enable
+the Step 7 fixed-shape preparation graph and the relaxed cutoff-tie path. The
+validated fixed-M4 model geometry enables the Step 8 fused QSA gather by
+default; `MTPLX_QSA_M4_FUSED_KV_GATHER=0` is its operator kill switch.
+
+## Review rule
+
+Restack one optimization at a time. Check construction-time invariants and
+focused parity before the production benchmark. Keep and commit only matched
+wins. Record each retained win in the hill-climb table and in the pull request.
