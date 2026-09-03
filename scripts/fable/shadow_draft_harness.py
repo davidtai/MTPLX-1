@@ -641,6 +641,130 @@ def empty_shadow_rows(
 
 
 # ---------------------------------------------------------------------------
+# Replay bookkeeping -- pure, and the reason the commit protocol is testable.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CommitStep:
+    """One forward-and-commit the replay owes the model.
+
+    A window is one step; a window followed by a ``carry`` is two, because the
+    carried tokens went through their own verify forward in the logged run and
+    the replay has to advance the cache over them before the next window's
+    primary means anything.
+
+    ``fed`` is what the forward consumes, ``keep`` how many of its rows stay
+    committed, ``offset`` the absolute cache offset afterwards, ``hidden_row``
+    which row becomes the next chain's starting hidden, and ``primary`` the
+    token left DEFERRED -- its KV is computed by whichever forward runs next,
+    exactly as ``generate_mtpk`` defers a correction.  So ``offset`` counts
+    every emitted token except that one.
+
+    ``primary`` is ``-1`` when the request ENDED in this step (the window
+    emitted nothing after its accepted prefix): no token is deferred, nothing
+    follows, and a ``-1`` fed to a forward is a loud failure rather than a
+    plausible-looking wrong token.
+    """
+
+    NONE = -1
+
+    kind: str
+    fed: tuple[int, ...]
+    keep: int
+    offset: int
+    hidden_row: int
+    primary: int
+
+
+def commit_steps(
+    window: Mapping[str, Any], *, offset: int, primary: int
+) -> list[CommitStep]:
+    """The steps ``advance`` owes for ``window``, in order.
+
+    ``primary`` is the deferred token the replay is holding when the window
+    starts -- ``window['primary']`` on a sound trajectory, and the carry step
+    below is why it has to be threaded rather than re-read.
+    """
+
+    fed = (int(window["primary"]), *(int(token) for token in window["draft_tokens"]))
+    accepted = int(window["accepted"])
+    keep = accepted + 1  # the primary plus the accepted drafts
+    if keep > len(fed):
+        raise ValueError(
+            f"window {window['index']} accepted {accepted} of {len(fed) - 1} drafts"
+        )
+    present = bool(window["selected_present"])
+    steps = [
+        CommitStep(
+            kind="window",
+            fed=fed,
+            keep=keep,
+            offset=offset + keep,
+            hidden_row=accepted,
+            primary=int(window["selected_token"]) if present else CommitStep.NONE,
+        )
+    ]
+    carry = [int(token) for token in window.get("carry", ())]
+    if not carry or not present:
+        # No carry, or the request ended in this window (nothing was emitted
+        # after the accepted prefix, so there is no selection to feed and
+        # nothing follows the gap).
+        return steps
+    # The carry's last token is the NEXT window's primary and stays deferred
+    # like a selection; the rest are committed here, led by this window's own
+    # selection, which the window step deferred.
+    carry_fed = (steps[0].primary, *carry[:-1])
+    steps.append(
+        CommitStep(
+            kind="carry",
+            fed=carry_fed,
+            keep=len(carry_fed),
+            offset=steps[0].offset + len(carry_fed),
+            hidden_row=len(carry_fed) - 1,
+            primary=carry[-1],
+        )
+    )
+    return steps
+
+
+def untrimmable_entries(cache: Sequence[Any]) -> list[int]:
+    """Indices of cache entries that cannot roll back by trimming an offset.
+
+    A hybrid model's recurrent (GDN) state is one of these: ``mtplx`` builds
+    ``ArraysCache`` for every linear layer of ``qwen4_exp`` and ``QSACache``
+    for every full-attention layer, and only the latter trims.  A replay that
+    commits a verified prefix by trimming offsets therefore works on a
+    KV-only model and cannot work here -- which is what
+    ``_trim_cache_to_offset`` refusing a NO-OP trim after window 0 of the W51
+    capture meant.  The commit has to go through
+    ``gdn_capture.commit_captured_prefix`` instead, and this is the predicate
+    that says so.
+    """
+
+    out: list[int] = []
+    for index, entry in enumerate(cache):
+        is_trimmable = getattr(entry, "is_trimmable", None)
+        if not callable(is_trimmable) or not bool(is_trimmable()):
+            out.append(index)
+    return out
+
+
+def trimmable_offsets(cache: Sequence[Any]) -> list[int]:
+    """``offset`` of every trimmable entry -- the replay's commit postcondition."""
+
+    out: list[int] = []
+    for entry in cache:
+        is_trimmable = getattr(entry, "is_trimmable", None)
+        if not callable(is_trimmable) or not bool(is_trimmable()):
+            continue
+        offset = getattr(entry, "offset", None)
+        if offset is not None:
+            out.append(int(offset))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Replay orchestration -- pure, every device-touching piece injected.
 # ---------------------------------------------------------------------------
 
@@ -667,11 +791,12 @@ class ReplayHooks:
         MTP cache offset it found, or the second call is not paired with the
         first.
     ``advance(window=...)``
-        run the window's verify forward over ``[primary] + draft_tokens``,
-        commit ``accepted`` of them plus the emitted selection, then commit
+        run the window's verify forward over ``[primary] + draft_tokens`` and
+        commit the primary plus ``accepted`` drafts, then do the same for
         ``window['carry']`` -- the tokens a lane with no K20 row of its own
         (a context-copy block round) put in the stream before the next
         window's primary -- and leave the state on the next window.
+        :func:`commit_steps` is that schedule, and is pure.
     """
 
     def start_segment(self, segment: Segment) -> None:  # pragma: no cover - iface
@@ -806,18 +931,40 @@ def build_replay_hooks(
         drafted.  The MTP cache offset is read before the chain and restored in
         a ``finally``, so variant 2 starts where variant 1 started.
     ``advance``
-        ``rt.forward_ar([primary] + draft_tokens, cache, return_hidden=True)``
-        -- the verify forward -- then the commit: trim the target cache back to
-        ``primary`` plus the accepted drafts, take the next window's starting
-        hidden from row ``accepted`` of this forward (the row that produced the
-        emitted selection), and re-stage the MTP history over the committed
-        tokens.
+        ``rt.forward_ar_capture([primary] + draft_tokens, cache,
+        return_hidden=True, capture_backend=...)`` -- the verify forward --
+        then ``gdn_capture.commit_captured_prefix`` to keep ``primary`` plus
+        the accepted drafts, take the next window's starting hidden from row
+        ``accepted`` of this forward (the row that produced the emitted
+        selection), and re-stage the MTP history over the committed tokens.
+        A carry runs the same step again over the tokens the copy lane
+        committed.
+
+    Why the commit is a capture and not a trim
+    ------------------------------------------
+    The first hardware run (2026-09-02) died on window 0 with "target cache
+    would not trim to 16388", on a **full accept** where nothing needed
+    trimming.  ``_trim_cache_to_offset`` walks every cache entry and refuses
+    the whole cache if any one of them has no ``trim``, before it ever looks at
+    how much is being trimmed.  Flash-Next's ``make_cache`` builds a
+    ``QSACache`` per full-attention layer (trimmable) and an ``ArraysCache``
+    per linear layer -- the GDN recurrent state, which ``cache_state`` marks
+    untrimmable on purpose: "Attention KV caches can roll back by trimming
+    their offset. GDN recurrent caches cannot."  So an offset trim is not a
+    prefix commit on any hybrid model, and never was; it only ever worked
+    because nothing had run this on one.
+
+    ``generate_mtpk`` never trims that cache either.  It captures the
+    recurrence during the verify forward and rebuilds each recurrent leaf at
+    the kept row (``gdn_capture.commit_captured_prefix``), trimming the
+    trimmable entries in the same pass, with rollback + re-forward as the
+    fallback.  ``advance`` now does exactly that, and asserts the resulting
+    offset rather than assuming it.
 
     Not verified on hardware
     ------------------------
-    This function was written without a GPU, and the piece most likely to need
-    adjustment on its first run is the MTP-history restage in ``advance``:
-    production does it through ``generate_mtpk``'s nested
+    The piece most likely to need adjustment next is the MTP-history restage in
+    ``advance``: production does it through ``generate_mtpk``'s nested
     ``reconcile_mtp_indexer_history`` (``generation.py:9650``), which keeps the
     QSA indexer's raw and pooled frontiers in lockstep with the rollback.  What
     is here is the same intent expressed through the public
@@ -835,12 +982,13 @@ def build_replay_hooks(
 
     import mlx.core as mx
 
+    from mtplx.cache_state import rollback_after_verify, snapshot_untrimmable_cache
+    from mtplx.gdn_capture import commit_captured_prefix, resolve_gdn_capture_backend
     from mtplx.generation import (
         _distribution_from_mlx_logits,
         _mtp_cache_offset,
         _mtp_position_offset,
         _rollback_mtp_cache,
-        _trim_cache_to_offset,
     )
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
@@ -852,6 +1000,12 @@ def build_replay_hooks(
     # The stock run's draft-side RoPE policy, read from the same env keys
     # `generate_mtpk` reads. "default" returns None, which is what the shipped
     # lane passes and what leaves the offset with the KV cache.
+    # The GDN capture backend, from the same env key `generate_mtpk` reads
+    # (`MTPLX_CAPTURE_CUSTOM_KERNEL`); unset resolves to "stock", which is the
+    # capture path every hybrid family supports.  A uniform full-attention
+    # model has no recurrent state and `forward_ar_capture` degrades to the
+    # plain forward with empty captures, so this is family-generic.
+    capture_backend = resolve_gdn_capture_backend(None)
     position_mode = os.environ.get("MTPLX_MTP_POSITION_MODE", "default")
     position_cap = int(os.environ.get("MTPLX_MTP_POSITION_CAP", "0") or 0)
     position_period = int(os.environ.get("MTPLX_MTP_POSITION_PERIOD", "0") or 0)
@@ -942,23 +1096,63 @@ def build_replay_hooks(
             return rows
 
         def advance(self, *, window: Mapping[str, Any]) -> None:
-            fed = [int(window["primary"]), *window["draft_tokens"]]
-            _logits, hidden = runtime.forward_ar(
-                mx.array([fed]), cache=self.cache, return_hidden=True
+            for step in commit_steps(
+                window, offset=self.committed, primary=int(self.primary)
+            ):
+                self._commit_step(step, index=int(window["index"]))
+
+        def _commit_step(self, step: CommitStep, *, index: int) -> None:
+            """One verify forward and its prefix commit, the way production does it.
+
+            NOT a trim.  ``_trim_cache_to_offset`` only commits a prefix on an
+            all-trimmable (KV-only) cache; a hybrid model's recurrent layers
+            hold state that cannot be trimmed at all, so on Flash-Next it
+            refuses even a no-op.  The prefix commit that works on both is the
+            one ``generate_mtpk`` uses: capture the recurrence during the
+            verify forward and rebuild each recurrent leaf at the kept row
+            (``commit_captured_prefix``), trimming the trimmable entries in the
+            same pass.  The pre-verify snapshot pays for the fallback, which is
+            the copy round's: roll the whole window back and re-forward the
+            kept prefix.
+            """
+
+            fed = list(step.fed)
+            before = snapshot_untrimmable_cache(self.cache)
+            _logits, hidden, captures = runtime.forward_ar_capture(
+                mx.array([fed]),
+                cache=self.cache,
+                return_hidden=True,
+                capture_backend=capture_backend,
             )
             mx.eval(hidden)
-            accepted = int(window["accepted"])
-            # Row `accepted` produced the emitted selection; rows 0..accepted-1
-            # produced the accepted drafts.
-            self.hidden = hidden[:, accepted : accepted + 1, :]
-            self.primary = int(window["selected_token"])
-            keep = accepted + 1  # primary plus the accepted drafts
-            self.committed += keep
-            if not _trim_cache_to_offset(self.cache, self.committed):
-                raise RuntimeError(
-                    f"target cache would not trim to {self.committed} after "
-                    f"window {window['index']}"
+            kept = fed[: step.keep]
+            if not commit_captured_prefix(
+                self.cache,
+                captures,
+                keep_tokens=step.keep,
+                verified_tokens=len(fed),
+            ):
+                # Same fallback the context-copy round takes when its capture
+                # commit refuses: undo the whole verify window and re-forward
+                # the committed prefix.  `hidden` is still the authoritative
+                # target hidden for those rows -- it was evaluated above, and
+                # the re-forward recomputes the same rows.
+                rollback_after_verify(self.cache, before, verified_tokens=len(fed))
+                _repair_logits, repair_hidden = runtime.forward_ar(
+                    mx.array([kept]), cache=self.cache, return_hidden=True
                 )
+                mx.eval(repair_hidden)
+            offsets = trimmable_offsets(self.cache)
+            if any(offset != step.offset for offset in offsets):
+                raise RuntimeError(
+                    f"after the {step.kind} step of window {index} the target "
+                    f"cache sits at {sorted(set(offsets))}, not {step.offset}; "
+                    f"the prefix commit did not land "
+                    f"(untrimmable entries: {untrimmable_entries(self.cache)})"
+                )
+            self.hidden = hidden[:, step.hidden_row : step.hidden_row + 1, :]
+            self.primary = step.primary
+            self.committed = step.offset
             # Restage the MTP history over exactly the committed tokens, from
             # authoritative target hidden. Production does this through
             # `reconcile_mtp_indexer_history` (generation.py:9650); this is the
@@ -966,41 +1160,12 @@ def build_replay_hooks(
             # proves it right.
             _rollback_mtp_cache(self.mtp_cache, 0)
             runtime.update_mtp_cache(
-                hidden[:, :keep, :],
-                mx.array([fed[:keep]]),
+                hidden[:, : step.keep, :],
+                mx.array([kept]),
                 mtp_cache=self.mtp_cache,
                 mtp_hidden_variant=mtp_hidden_variant,
                 position_offset=_position_offset(self.mtp_cache),
             )
-            carry = [int(token) for token in window.get("carry", ())]
-            if carry:
-                # A lane with no K20 row of its own -- a context-copy block
-                # round -- put these tokens in the stream between this window
-                # and the next.  The last of them IS the next window's primary
-                # and stays deferred exactly like a selection does; the rest
-                # (starting with this window's selection) are committed here,
-                # by the same forward/trim/restage the window path uses.
-                fed_carry = [int(self.primary), *carry[:-1]]
-                _carry_logits, carry_hidden = runtime.forward_ar(
-                    mx.array([fed_carry]), cache=self.cache, return_hidden=True
-                )
-                mx.eval(carry_hidden)
-                self.hidden = carry_hidden[:, -1:, :]
-                self.primary = int(carry[-1])
-                self.committed += len(fed_carry)
-                if not _trim_cache_to_offset(self.cache, self.committed):
-                    raise RuntimeError(
-                        f"target cache would not trim to {self.committed} "
-                        f"after the carry of window {window['index']}"
-                    )
-                _rollback_mtp_cache(self.mtp_cache, 0)
-                runtime.update_mtp_cache(
-                    carry_hidden,
-                    mx.array([fed_carry]),
-                    mtp_cache=self.mtp_cache,
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    position_offset=_position_offset(self.mtp_cache),
-                )
 
         def close(self) -> None:
             self.cache = None
