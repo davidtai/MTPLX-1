@@ -183,6 +183,23 @@ trace-time raise instead of silently wrong logits.
    replaying eagerly.  The conv-state commit, the PLE layer's exact-width
    replay and the QSA trims are byte-identical.
 
+W73 -- THE SAME TRAP, GENERICALLY (``mtplx/cache_identity.py``)
+--------------------------------------------------------------
+W66d fixed THIS lane.  Nothing stopped the next lane that reads a cache
+container by identity inside a compiled run from being hidden the same way,
+so the re-wrap now carries a generic guard: ``_compiled_run_fn`` stamps each
+throwaway with an alias back to ``cache[layer_index]``
+(``cache_identity.bind_rewrapped_entry``), every identity-keyed lane resolves
+through ``cache_identity.resolve_cache_entry``, and
+``_decode_layers_compiled`` asserts once per compiled run that every
+``(lane, layer)`` an expectation was declared for and that the run actually
+re-wrapped was resolved.  This fold declares one such expectation per folded
+layer (``CACHE_IDENTITY_LANE``), so a future re-wrap that hides it now names
+the lane AND the layer index at trace time; ``fold_prefix_for`` also falls
+back to the generic alias, so the fold resolves even if a new re-wrap site
+forgets ``bind_fold_alias``.  ``assert_prefix_consumed`` is unchanged and
+still the lane's own must-have-happened check.
+
 COMPOSING WITH THE W67 GRAPH-BUILD OVERLAP (MTPLX_FABLE_GRAPH_BUILD_OVERLAP)
 ---------------------------------------------------------------------------
 W67 splits the compiled verify into a ``0..N-1`` prefix ENQUEUED ahead of the
@@ -332,6 +349,11 @@ import os
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Sequence
+
+from mtplx import cache_identity as _cache_identity
+
+#: Lane name this fold declares to the generic cache-identity guard (W73).
+CACHE_IDENTITY_LANE = "gdn_keepmask_fold"
 
 #: The one geometry this lane is wired for (Qwen3.8 Flash-Next 125B-A6B).
 VERIFY_WIDTH = 4
@@ -934,6 +956,10 @@ class FoldPrefixScope:
     by_layer: dict[int, Any] = field(default_factory=dict)
     by_entry: dict[int, Any] = field(default_factory=dict)
     consumed: int = 0
+    #: ``id(container) -> layer index`` for every key in ``by_entry``, so a
+    #: resolve can be reported to the generic cache-identity guard (W73) by
+    #: layer index whichever container the layer was handed.
+    entry_ids: dict[int, int] = field(default_factory=dict)
 
     def __len__(self) -> int:  # pragma: no cover - convenience only
         return len(self.by_layer)
@@ -953,11 +979,26 @@ def _coerce_prefix_scope(scope: Any) -> "FoldPrefixScope | None":
 
 @contextlib.contextmanager
 def fold_prefix_scope(scope: Any) -> Iterator[None]:
-    """Bind one traced forward's prefix leaves (see :class:`FoldPrefixScope`)."""
+    """Bind one traced forward's prefix leaves (see :class:`FoldPrefixScope`).
 
-    token = _PREFIX_SCOPE.set(_coerce_prefix_scope(scope))
+    W73: the same forward opens the generic cache-identity expectations scope
+    and declares one ``(lane, layer)`` obligation per folded layer.  That is
+    what makes ``_decode_layers_compiled``'s per-run assertion name the layer
+    that a container re-wrap hid, and it fires whether or not this lane
+    remembered to call :func:`bind_fold_alias`.
+    """
+
+    coerced = _coerce_prefix_scope(scope)
+    token = _PREFIX_SCOPE.set(coerced)
     try:
-        yield
+        if coerced is None or not coerced.by_layer:
+            yield
+            return
+        expectations = _cache_identity.CacheIdentityExpectations()
+        for layer_index in coerced.by_layer:
+            expectations.expect(CACHE_IDENTITY_LANE, layer_index)
+        with _cache_identity.expectations_scope(expectations):
+            yield
     finally:
         _PREFIX_SCOPE.reset(token)
 
@@ -985,11 +1026,14 @@ def make_prefix_scope(
     mask_leaf = trailing[-1]
     by_layer: dict[int, Any] = {}
     by_entry: dict[int, Any] = {}
+    entry_ids: dict[int, int] = {}
     for position, layer_index in enumerate(indices):
         leaves = (*trailing[position * 5 : position * 5 + 5], mask_leaf)
         by_layer[layer_index] = leaves
-        by_entry[id(entry_for(layer_index))] = leaves
-    return FoldPrefixScope(by_layer=by_layer, by_entry=by_entry)
+        entry_key = id(entry_for(layer_index))
+        by_entry[entry_key] = leaves
+        entry_ids[entry_key] = layer_index
+    return FoldPrefixScope(by_layer=by_layer, by_entry=by_entry, entry_ids=entry_ids)
 
 
 def bind_fold_alias(layer_index: int, entry: Any) -> None:
@@ -1008,8 +1052,10 @@ def bind_fold_alias(layer_index: int, entry: Any) -> None:
     leaves = scope.by_layer.get(int(layer_index))
     if leaves is None:
         scope.by_entry.pop(id(entry), None)
+        scope.entry_ids.pop(id(entry), None)
     else:
         scope.by_entry[id(entry)] = leaves
+        scope.entry_ids[id(entry)] = int(layer_index)
 
 
 def assert_prefix_consumed(scope: Any, *, label: str) -> None:
@@ -1034,14 +1080,32 @@ def assert_prefix_consumed(scope: Any, *, label: str) -> None:
 
 
 def fold_prefix_for(entry: Any) -> Any:
-    """This layer's ``(q, k, v, a, b, mask)`` prefix, or ``None``."""
+    """This layer's ``(q, k, v, a, b, mask)`` prefix, or ``None``.
+
+    W73: a container the lane was never told about is resolved through
+    ``cache_identity.real_entry_for`` before giving up, so a forward that
+    re-wraps the cache and stamps the generic alias resolves here even if it
+    never called :func:`bind_fold_alias`.  A hit is reported to the generic
+    guard by layer index, which is what lets a MISS name this lane and that
+    layer at trace time instead of running the stock recurrence from a base
+    whose ring was never replayed.
+    """
 
     scope = _PREFIX_SCOPE.get()
     if scope is None:
         return None
-    leaves = scope.by_entry.get(id(entry))
+    key = id(entry)
+    leaves = scope.by_entry.get(key)
+    if leaves is None:
+        real = _cache_identity.real_entry_for(entry)
+        if real is not None:
+            key = id(real)
+            leaves = scope.by_entry.get(key)
     if leaves is not None:
         scope.consumed += 1
+        layer_index = scope.entry_ids.get(key)
+        if layer_index is not None:
+            _cache_identity.note_resolved_index(CACHE_IDENTITY_LANE, layer_index)
     return leaves
 
 
@@ -1227,6 +1291,7 @@ def receipt_gate(
 
 __all__ = [
     "ACTIVE_ATTR",
+    "CACHE_IDENTITY_LANE",
     "CENSUS_P_ALL_ACCEPT",
     "DEFAULT_MAX_WINDOWS",
     "ENV_FLAG",
